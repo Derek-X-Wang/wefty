@@ -1146,19 +1146,35 @@ further submits, links the job by the public dispatch-key lookup, and delivers
 cancellation to `POST /v1/jobs/{job_id}/cancel` through the public L1 client
 contract, as the ledger's own originating-submitter identity. Intent survives
 ledger restart; transient delivery failures are retried with durable exponential
-backoff: 30 seconds, doubling to a 30-minute cap. Repeated HTTP calls honor the
-same backoff. Ambiguous-dispatch lookups use this schedule and share the existing
-per-pass dispatch-recovery budget (five seconds by default); ordinary recovery
-does not also look up a Run with cancellation intent. A late first dispatch
+backoff: 30 seconds, doubling to a 30-minute cap. An explicit repeat HTTP cancel
+resets the failure count and retry time for pending delivery and immediately
+attempts delivery again; automatic recovery still honors backoff. Ambiguous-dispatch lookups use this schedule and share the
+existing per-pass dispatch-recovery budget (five seconds by default); ordinary
+recovery does not also look up a Run with cancellation intent. A late first dispatch
 acknowledgement wakes cancellation delivery immediately. A dispatch-key
 absence remains provisional until the existing one-hour dispatch settlement
 horizon has passed since the last attempt; only then, with no acknowledgement
 recorded meanwhile, can the Run settle locally as canceled before dispatch.
+A legacy terminal Run whose outbox already has the acknowledged job ID is
+linked before cancellation takes over recovery, preserving its outcome and
+timestamps. It cancels that job without an empty-ID call or a new dispatch.
 An ambiguous dispatch is never replayed to create work after cancellation.
 
 A typed non-retryable L1 cancel refusal ends delivery and is retained with its
-reason in the ledger's cancellation record; reconciliation and repeated cancel
-calls do not send it again. A cancel `not_found` alone can hide an ownership
+reason on the Run read as `cancel_status=refused` and `cancel_reason`. A
+pending delivery reports `cancel_status=pending` and, when present, the last
+delivery error as `cancel_reason`; a local cancellation or terminal L1 response
+reports `cancel_status=settled` without a reason. These fields are absent before
+intent is recorded and do not change the Run outcome or prove runtime termination.
+Older completed delivery rows retained both refusal reasons and transient errors
+preceding successful delivery. Those rows report `cancel_status=completed` and
+the retained reason, because their outcome cannot be inferred from that error.
+New refusals have an explicit durable marker; successful settlement clears the
+last error.
+Authentication/identity failures (including any HTTP 401, `unauthorized` or
+`person_identity_required`) remain transient even when L1 marks them non-retryable.
+For permanent refusals, reconciliation and repeated cancel calls do not send
+it again. A cancel `not_found` alone can hide an ownership
 refusal, so only an authoritative `GetJob` absence fails an active Run through
 the existing L1-regression settlement. Other refusals leave its real state intact.
 An existing terminal Run always returns HTTP 200 with that recorded outcome,
@@ -1284,8 +1300,9 @@ there are no exact preconditions; it is never `null`. Copy these field/value
 pairs directly into the request body. For `drain`, `claims_enabled: false` is
 an exact value; for `set-claims`, that boolean is a caller choice.
 
-`inputs` lists caller-chosen request fields as `{name, type, required}`. `name`
-is the literal JSON request field, `type` is its JSON type (`string`, `boolean`,
+`inputs` lists caller-chosen request fields as `{name, type, required, in?}`.
+`in` defaults to `body`; `path` names a URL parameter. `name`
+is the literal request field or parameter, `type` is its JSON type (`string`, `boolean`,
 `integer`, `number`, `object`, or `array`), and `required` says whether the caller
 must supply it. A field appears in either `requires` or `inputs`, never both.
 `inputs` is omitted or `[]` when there are no caller-chosen fields; it is never
@@ -1300,8 +1317,9 @@ exact preconditions. It uses the same APIError conversion, internal-error
 scrubbing, and retryability as a write refusal; any decision error refuses the
 action. The write rechecks the same actor-aware decision in its transaction.
 A listed action does not reserve authority or guarantee that a later write wins.
-Services and Computers reuse this shape unchanged, with their own request field
-names and person, administrator, and grant predicates in their decisions.
+Services and Computers reuse this shape with their own request field names and
+actual caller predicates. The Computer client projection omits person-only
+verbs, as documented below.
 
 Node client reads and writes compute actions at the route using the request's
 real Fabric identity and configured client principal policy, never in a store
@@ -1366,8 +1384,11 @@ closed as scrubbed internal errors. Client-tag authority is checked from the
 actual request identity, including custom configured tags. An attempt credential
 has no service mutation authority even if its holding node has a client tag.
 Services have no desired-state revision field or service-scoped grant/revoke
-endpoint. Active Computer-owned Jobs refuse these verbs with `computer_resource_required`;
-the Computer endpoints remain their sole lifecycle and grant authority.
+endpoint. Active and retired Computer-owned Job projections refuse these verbs
+with `computer_resource_required`. During Computer removal, `start`, `stop` and
+`restart` refuse with `not_found` because the mutable service row is absent;
+`remove` and `forget` still refuse with `computer_resource_required`. The
+Computer endpoints remain their sole lifecycle and grant authority.
 
 | Verb | Endpoint | Exact `requires` | Caller `inputs` | Enforced rules |
 | --- | --- | --- | --- | --- |
@@ -1383,6 +1404,10 @@ exact value. The server rechecks the shared actor-aware decision in the mutation
 transaction. Read projections use read-only transactions, avoiding the store's
 default immediate writer lock. State and actions share a fresh read snapshot;
 collection membership and filters retain their existing paging semantics.
+Child pages select membership, read Job rows and compute per-caller operator
+facts in one read-only transaction, so concurrent row deletion cannot break a
+selected page. For operator facts, ownership and failure evidence are read once
+per service; node capacity counts and removal roots are shared within each page snapshot.
 
 `last_condition` is the **closest existing state-machine fact**, rather than a
 new event history. It is null when no policy stop, failure or removal condition
@@ -1394,8 +1419,10 @@ is retained. It uses the shared `contract.Condition` shape:
   stop does not advance that completion time.
 - `failure_latched` or `never_automatic_restart_suppressed`, scope
   `service_restart`: the failed Job snapshot, restart streak/limit and any
-  controller failure reason. `since` is the existing Job update time; an intent
-  mutation may update that snapshot, while reads never do.
+  controller failure reason. `since` is the current attempt's recorded update
+  time, when an attempt is retained; otherwise the existing Job timestamp.
+  Unrelated Job updates, including an explicit stop, do not advance the
+  retained attempt's condition time.
 - The persisted removal state (for example `removal_pending`, `agent_cleaned`,
   `removed_verified`, `forgotten_cleanup_unverified`, or
   `stalled_cleanup_unverified`), scope `service_removal`: cleanup status, outcome,
@@ -1407,3 +1434,82 @@ Start/restart clearing policy/failure state clears its closest condition; health
 services do not invent a past event. Repeated reads preserve timestamps. This
 projection does not infer runtime presence from a service binding or recommend
 an operator decision.
+
+### Computer operator facts (#690)
+
+Every HTTP response containing a Computer uses one per-caller projection,
+including creation, mutations, list/detail reads, and agent acknowledgements
+(the Backup acknowledgement nests the same projection). `allowed_actions` is
+always an array. Client verbs are evaluated using the client middleware's
+actual Fabric identity and configured principal tag. Agent-only callers see
+those verbs refused, including on successful agent acknowledgements. Unknown
+decision errors fail closed through the ordinary scrubbed APIError conversion.
+
+This client-principal surface omits **person-only** grants, take-over and
+submission verbs. Those remain on their existing person-authorized policy,
+submission and take-over routes; no client principal is advertised authority
+it can never exercise. Computer actions do not include creation of unrelated
+resources or Custody import/deletion attestation, whose target is a Custody
+export, not this Computer.
+
+The advertised verbs map to existing client endpoints:
+
+| Verb | Endpoint suffix under `/v1/computers/{computer_id}` |
+| --- | --- |
+| `start`, `stop` | `PUT /desired-state` with exact `desired_state` |
+| `restart`, `remove`, `reimage` | `POST /restart`, `/remove`, `/reimage` |
+| `reset`, `resize` | `POST /storage-reset`, `/grow` |
+| `backup`, `backup-cap` | `POST /backups`, `PUT /backup-cap` |
+| `restore`, `clone`, `prune`, `custody-export` | `POST /backups/{backup_id}/restore`, `/clone`, `/prune`, `/export` |
+| `projections`, `reconfiguration-abort` | `POST /projections`, `/reconfiguration-abort` |
+
+All use exact top-level `intent_revision`, `storage_id`, and
+`storage_generation` in `requires`. Required session termination or power-off
+consent is an exact `true`; otherwise the flag is a typed caller input.
+Restore requires `keep_old_as_backup: false` when retention cannot admit the
+old generation; otherwise it is a caller choice. `idempotency_key`, digest-pinned
+`image`, grow-only `disk_bytes`, fresh clone `name`, confined absolute
+`external_path`, and a valid new projection `spec` remain endpoint-constrained
+caller inputs. These are **new-operation** decisions: existing idempotency
+replays and same-image reimage no-ops retain their existing semantics and are
+not new actions. A later write rechecks state atomically; the projection
+reserves nothing and reports no recommendations.
+
+`ActionInput` adds optional `in`: omitted (or `body`) means a JSON body field;
+`path` means a URL parameter. The four Backup verbs advertise a required string
+`backup_id` with `in: "path"`. Allowed means at least one valid Backup choice
+exists for that operation; the caller selects one from the Computer's
+`status=available` Backup records satisfying the endpoint's copy, size,
+placement, and root-identity constraints. Pruned and still-pruning records
+cannot supply a new action, even when an explicit prune request can replay.
+With no available record, the enforcing predicate reports `not_found` after
+caller and resource checks. A corrupt available record cannot authorize an
+action, but evaluation continues through the other available records; if none
+succeeds, an internal refusal takes precedence over other choice refusals.
+Allowed never means any arbitrary Backup ID works. With no valid choice, the
+action carries the enforcing predicate's refusal. No field appears
+in both `requires` and `inputs`, and neither collection is emitted as null.
+
+`last_condition` reuses `{code, scope, since, details}` and is the latest of
+existing recorded intent, grow completion, Backup completion, or removal-stall
+evidence. It is null when none exists. `since` is that record's timestamp,
+never the read time; the fact does not claim a historical failure still holds.
+Reads neither change state nor synthesize health, advice, or an event timestamp.
+Computer detail, including selected clone/restore operations, and each listing
+page use read-only transactions. Listing seeks through the existing
+`computers_created_id` index in `(created_ns, computer_id)` order. Backup
+choice and retention-count queries seek by Computer and live status, and copy
+reads seek by Backup ID through an unconditional index that includes removed
+copies. These additive indexes are installed on database reopen, after any
+Backup table migration; pruned history does not add choice evaluations or
+rows visited by retention counts.
+
+Projection and reimage writes preserve refusal precedence: after replay,
+resource and request preconditions, dispatch-key conflicts are checked before
+bound-node root lookup, Job quiescence or failed-Job publication checks. Reads
+also evaluate those later predicates before advertising a new operation.
+
+`wefty computers list` emits these facts in both JSON and the table's
+`LAST CONDITION` and `ALLOWED ACTIONS` columns; the latter preserves the exact
+preconditions, typed inputs, and typed refusal rather than reducing them to a
+recommendation.

@@ -220,14 +220,18 @@ func RequiredCapabilities(spec contract.JobSpec) []string {
 }
 
 func (s *Store) projectQueuedJobCapabilities(ctx context.Context, job Job) (Job, error) {
+	return s.projectQueuedJobCapabilitiesWithQueryer(ctx, s.db, job)
+}
+
+func (s *Store) projectQueuedJobCapabilitiesWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
 	if job.State != contract.JobQueued {
 		return job, nil
 	}
-	required, err := storedRequiredCapabilities(ctx, s.db, job.JobID)
+	required, err := storedRequiredCapabilities(ctx, q, job.JobID)
 	if err != nil {
 		return Job{}, internalError(err, "read required job capabilities")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT nodes.capabilities_json
+	rows, err := q.QueryContext(ctx, `SELECT nodes.capabilities_json
 		FROM nodes
 		WHERE NOT EXISTS (
 		 SELECT 1 FROM job_tags

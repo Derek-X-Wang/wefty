@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 
@@ -308,45 +307,12 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, internalError(err, "check cross-verb Storage copy idempotency")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	if err := validateStoppedDetachedComputer(computer, "restore"); err != nil {
-		return Computer{}, false, err
-	}
-	if computer.StorageGeneration == math.MaxInt64 {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q exhausted Storage generation space", computerID)
-	}
-	backup, copy, err := readAvailableBackupCopy(ctx, tx, request.BackupID)
+	backup, copy, err := computerRestoreDecision(ctx, tx, computer, request)
 	if err != nil {
 		return Computer{}, false, err
-	}
-	if backup.ComputerID != computerID || backup.SourceStorageID != computer.StorageID {
-		return Computer{}, false, protocolError(contract.ErrorStorageReferenceConflict, "Backup %q does not belong to Computer %q Storage", backup.BackupID, computerID)
-	}
-	if backup.AllocatedSize > computer.DesiredDiskBytes {
-		return Computer{}, false, protocolErrorWithDetails(contract.ErrorConflict, map[string]any{
-			"backup_bytes": backup.AllocatedSize, "destination_budget_bytes": computer.DesiredDiskBytes,
-		}, "restore Backup is larger than the Computer disk budget; grow the Computer first")
-	}
-	if copy.NodeID != computer.BoundNodeID || copy.RootInstanceID == "" {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "restore Backup copy is not on the Computer's bound Node")
-	}
-	var currentRootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, copy.NodeID).Scan(&currentRootInstanceID); err != nil {
-		return Computer{}, false, internalError(err, "read restore detachment managed-root authority")
-	}
-	if currentRootInstanceID == "" || currentRootInstanceID != copy.RootInstanceID {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "restore requires an identity-bound current detachment receipt")
-	}
-	if request.KeepOldBackup {
-		var retained int64
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status<>'pruned'`, computerID).Scan(&retained); err != nil {
-			return Computer{}, false, internalError(err, "count retained Backups before restore")
-		}
-		if computer.BackupCap == 0 || retained >= computer.BackupCap {
-			return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q is at its Backup cap", computerID)
-		}
 	}
 	revision := computer.IntentRevision + 1
 	generation := computer.StorageGeneration + 1
@@ -416,9 +382,13 @@ func (s *Store) ComputerRestoreOperationForKey(ctx context.Context, computerID, 
 
 // ComputerRestoreOperation reads one restore's own observed state.
 func (s *Store) ComputerRestoreOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerRestoreOperation, error) {
+	return readComputerRestoreOperation(ctx, s.db, computerID, operationRevision)
+}
+
+func readComputerRestoreOperation(ctx context.Context, q queryer, computerID string, operationRevision int64) (ComputerRestoreOperation, error) {
 	var outcome ComputerRestoreOperation
 	var completedNS sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT operation_revision, backup_id, status, failure_code, completed_ns
+	err := q.QueryRowContext(ctx, `SELECT operation_revision, backup_id, status, failure_code, completed_ns
 		FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='restore'`,
 		computerID, operationRevision).Scan(&outcome.OperationRevision, &outcome.BackupID, &outcome.Status,
 		&outcome.FailureCode, &completedNS)
@@ -562,17 +532,7 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 	if err != nil {
 		return Computer{}, false, internalError(err, "read clone source Computer")
 	}
-	if source.DesiredState == contract.ServiceDesiredRemoved || copy.NodeID != source.PlacementNodeID {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "clone source is not available on its Pinned Node")
-	}
-	var currentRootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, copy.NodeID).Scan(&currentRootInstanceID); err != nil {
-		return Computer{}, false, internalError(err, "read clone source managed-root authority")
-	}
-	if currentRootInstanceID == "" || currentRootInstanceID != copy.RootInstanceID {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "clone source Backup copy belongs to a stale managed-root instance")
-	}
-	if err := validateComputerPrecondition(source, request.ComputerMutationPrecondition); err != nil {
+	if err := computerCloneDecision(ctx, tx, source, copy, request); err != nil {
 		return Computer{}, false, err
 	}
 	computerID, storageID := newID("computer"), newID("storage")

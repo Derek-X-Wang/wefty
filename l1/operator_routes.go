@@ -368,14 +368,22 @@ func neverAutomaticFailureCause(ctx context.Context, q queryer, job Job) (string
 }
 
 func (s *Store) projectJob(ctx context.Context, job Job) (Job, error) {
+	return s.projectJobWithQueryer(ctx, s.db, job)
+}
+
+func (s *Store) projectJobWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
 	if job.ServiceJob != nil || job.Removal != nil {
-		return s.projectServiceJob(ctx, job)
+		return s.projectServiceJobWithQueryer(ctx, q, job)
 	}
 	job.Status = string(job.State)
-	return s.projectQueuedJobCapabilities(ctx, job)
+	return s.projectQueuedJobCapabilitiesWithQueryer(ctx, q, job)
 }
 
 func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
+	return s.projectServiceJobWithQueryer(ctx, s.db, job)
+}
+
+func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
 	if job.Removal != nil {
 		job.Status = string(job.State)
 		return job, nil
@@ -402,7 +410,7 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 			service.RestartSuppressed = "policy stop: never payload ended; use start or restart"
 		}
 	} else if job.State == contract.JobFailed {
-		cause, resumable, err := neverAutomaticFailureCause(ctx, s.db, job)
+		cause, resumable, err := neverAutomaticFailureCause(ctx, q, job)
 		if err != nil {
 			return Job{}, err
 		}
@@ -416,7 +424,7 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 	}
 	if job.Status != "restart-pending" {
 		var err error
-		job, err = s.projectQueuedJobCapabilities(ctx, job)
+		job, err = s.projectQueuedJobCapabilitiesWithQueryer(ctx, q, job)
 		if err != nil {
 			return Job{}, err
 		}
@@ -424,7 +432,7 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 	if service.BoundNodeID != "" {
 		var claimsEnabled bool
 		var capabilitiesJSON []byte
-		err := s.db.QueryRowContext(ctx, "SELECT state, claims_enabled, capabilities_json FROM nodes WHERE node_id=?", service.BoundNodeID).
+		err := q.QueryRowContext(ctx, "SELECT state, claims_enabled, capabilities_json FROM nodes WHERE node_id=?", service.BoundNodeID).
 			Scan(&service.NodeState, &claimsEnabled, &capabilitiesJSON)
 		if errors.Is(err, sql.ErrNoRows) {
 			if job.State == contract.JobQueued && job.Status != "restart-pending" {
@@ -443,7 +451,7 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 				if err := json.Unmarshal(capabilitiesJSON, &advertised); err != nil {
 					return Job{}, internalError(err, "decode bound node capabilities")
 				}
-				required, err := storedRequiredCapabilities(ctx, s.db, job.JobID)
+				required, err := storedRequiredCapabilities(ctx, q, job.JobID)
 				if err != nil {
 					return Job{}, internalError(err, "read required job capabilities")
 				}
@@ -453,7 +461,7 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 			}
 		}
 	} else if job.State == contract.JobQueued && job.Status != "restart-pending" {
-		reason, err := s.unboundServiceUnschedulableReason(ctx, job.JobID)
+		reason, err := unboundServiceUnschedulableReasonWithQueryer(ctx, q, job.JobID)
 		if err != nil {
 			return Job{}, err
 		}
@@ -465,12 +473,12 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 	return job, nil
 }
 
-func (s *Store) unboundServiceUnschedulableReason(ctx context.Context, jobID string) (string, error) {
-	required, err := storedRequiredCapabilities(ctx, s.db, jobID)
+func unboundServiceUnschedulableReasonWithQueryer(ctx context.Context, q queryer, jobID string) (string, error) {
+	required, err := storedRequiredCapabilities(ctx, q, jobID)
 	if err != nil {
 		return "", internalError(err, "read required job capabilities")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT nodes.node_id, nodes.state, nodes.claims_enabled,
+	rows, err := q.QueryContext(ctx, `SELECT nodes.node_id, nodes.state, nodes.claims_enabled,
 		nodes.capabilities_json, nodes.max_service_slots,
 		(SELECT COUNT(*) FROM service_jobs occupied_service
 		 JOIN jobs occupied_job ON occupied_job.job_id=occupied_service.job_id

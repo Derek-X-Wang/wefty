@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"math"
 	"strings"
 	"time"
 
@@ -203,30 +202,10 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	} else if !errors.Is(replayErr, sql.ErrNoRows) {
 		return Computer{}, false, internalError(replayErr, "read Computer Storage reset replay")
 	}
-	if err := validateComputerPrecondition(computer, request.ComputerMutationPrecondition); err != nil {
+	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	if computer.DesiredState == contract.ServiceDesiredRemoved {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
-	}
-	active := computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning ||
-		computer.CurrentJob.State == contract.JobStopping
-	if active && !request.TerminateSessions {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"running Computer reset requires explicit take-over session termination")
-	}
-	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
-	}
-	if computer.StorageGeneration == math.MaxInt64 {
-		return Computer{}, false, protocolError(contract.ErrorConflict, "Computer %q exhausted Storage generation space", computerID)
-	}
-	// Reset publishes a successor by retiring a `current` predecessor. A
-	// Computer whose generation was never published has no predecessor to
-	// retire, so admitting one would reserve a successor that can never be
-	// published.
-	if err := requireCurrentComputerStorage(ctx, tx, computer, "reset"); err != nil {
+	if err := computerResetDecision(ctx, tx, computer, request); err != nil {
 		return Computer{}, false, err
 	}
 	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
@@ -244,23 +223,9 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 		boundNodeID = computer.PlacementNodeID
 	}
 	cleanupFence := newID("storage-reset")
-	var rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Computer{}, false, protocolError(contract.ErrorConflict, "bound node %q was not found", boundNodeID)
-		}
-		return Computer{}, false, internalError(err, "read Computer Storage reset managed-root authority")
-	}
-	if strings.TrimSpace(rootInstanceID) == "" {
-		return Computer{}, false, protocolError(contract.ErrorConflict,
-			"bound node %q has no registered managed-root instance", boundNodeID)
-	}
-	// The successor reserves its service Slot before any node-local allocation.
-	// Publication cannot fail after preparation because capacity changed later.
-	if !computer.CurrentJob.HoldsSlot(computer.CurrentJob.State) {
-		if err := ensureBoundServiceCapacity(ctx, tx, computer.CurrentJob); err != nil {
-			return Computer{}, false, err
-		}
+	rootInstanceID, err := computerResetCapacityDecision(ctx, tx, computer, boundNodeID)
+	if err != nil {
+		return Computer{}, false, err
 	}
 	if _, err := quiesceComputerProjectionTx(ctx, tx, computer.CurrentJob, now); err != nil {
 		return Computer{}, false, err

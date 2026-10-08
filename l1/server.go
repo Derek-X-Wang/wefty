@@ -871,24 +871,13 @@ func (s *Server) listChildJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	parentJobID := r.PathValue("job_id")
-	// Distinguish "no children" from "no such job": an unknown parent is a
-	// 404, not an empty page.
-	if _, err := s.store.GetJob(r.Context(), parentJobID); err != nil {
-		writeError(w, err)
-		return
-	}
-	page, err := s.store.ListChildJobs(r.Context(), parentJobID, r.URL.Query().Get("cursor"), limit)
+	page, err := s.store.listChildJobsForCaller(r.Context(), parentJobID, r.URL.Query().Get("cursor"), limit, s.serviceActionActor(r))
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	for index := range page.Jobs {
-		projected, projectErr := s.projectServiceForCaller(r, page.Jobs[index])
-		if projectErr != nil {
-			writeError(w, projectErr)
-			return
-		}
-		page.Jobs[index] = redactJob(projected)
+		page.Jobs[index] = redactJob(page.Jobs[index])
 	}
 	writeJSON(w, http.StatusOK, page)
 }
@@ -939,6 +928,7 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			}
 		}
 		ctx := context.WithValue(r.Context(), identityContextKey{}, identity)
+		ctx = context.WithValue(ctx, computerActionActorContextKey{}, computerActionActor{Identity: identity, ClientPrincipalTag: s.clientPrincipalTag})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -1222,7 +1212,7 @@ func (s *Server) createComputer(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeComputerMutationHeaders(w, !replayed, replayed)
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func writeComputerMutationHeaders(w http.ResponseWriter, applied, replayed bool) {
@@ -1242,31 +1232,21 @@ func (s *Server) getComputer(w http.ResponseWriter, r *http.Request) {
 		}
 		cloneRevision = revision
 	}
-	var computer Computer
-	var err error
-	if cloneRevision > 0 {
-		computer, err = s.store.GetComputerWithCloneOperation(r.Context(), r.PathValue("computer_id"), cloneRevision)
-	} else {
-		computer, err = s.store.GetComputer(r.Context(), r.PathValue("computer_id"))
-	}
-	if err != nil {
-		writeError(w, err)
-		return
-	}
+	var restoreRevision int64
 	if raw := strings.TrimSpace(r.URL.Query().Get("restore_operation_revision")); raw != "" {
 		revision, parseErr := strconv.ParseInt(raw, 10, 64)
 		if parseErr != nil || revision < 1 {
 			writeError(w, protocolError(contract.ErrorInvalidRequest, "restore_operation_revision must be a positive integer"))
 			return
 		}
-		operation, err := s.store.ComputerRestoreOperation(r.Context(), computer.ComputerID, revision)
-		if err != nil {
-			writeError(w, err)
-			return
-		}
-		computer.RestoreOperation = &operation
+		restoreRevision = revision
 	}
-	writeJSON(w, http.StatusOK, redactComputer(computer))
+	computer, err := s.getComputerForCaller(r, cloneRevision, restoreRevision)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, computer)
 }
 
 func (s *Server) listComputers(w http.ResponseWriter, r *http.Request) {
@@ -1275,13 +1255,11 @@ func (s *Server) listComputers(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	page, err := s.store.ListComputers(r.Context(), r.URL.Query().Get("cursor"), limit)
+	actor := computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag}
+	page, err := s.store.listComputersForCaller(r.Context(), r.URL.Query().Get("cursor"), limit, &actor)
 	if err != nil {
 		writeError(w, err)
 		return
-	}
-	for index := range page.Computers {
-		page.Computers[index] = redactComputer(page.Computers[index])
 	}
 	writeJSON(w, http.StatusOK, page)
 }
@@ -1320,7 +1298,7 @@ func (s *Server) setComputerDesiredState(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	writeComputerMutationHeaders(w, computer.IntentRevision > request.IntentRevision, false)
-	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusAccepted, computer)
 }
 
 func (s *Server) setComputerBackupCap(w http.ResponseWriter, r *http.Request) {
@@ -1335,7 +1313,7 @@ func (s *Server) setComputerBackupCap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {
@@ -1362,7 +1340,7 @@ func (s *Server) restartComputer(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeComputerMutationHeaders(w, !replayed, replayed)
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func (s *Server) resetComputerStorage(w http.ResponseWriter, r *http.Request) {
@@ -1389,7 +1367,7 @@ func (s *Server) resetComputerStorage(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeComputerMutationHeaders(w, !replayed, replayed)
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func (s *Server) growComputer(w http.ResponseWriter, r *http.Request) {
@@ -1410,7 +1388,7 @@ func (s *Server) growComputer(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeComputerMutationHeaders(w, !replayed, replayed)
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func (s *Server) abortComputerReconfiguration(w http.ResponseWriter, r *http.Request) {
@@ -1431,7 +1409,7 @@ func (s *Server) abortComputerReconfiguration(w http.ResponseWriter, r *http.Req
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeComputerMutationHeaders(w, !replayed, replayed)
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func (s *Server) listComputerStorageGenerations(w http.ResponseWriter, r *http.Request) {
@@ -1476,7 +1454,7 @@ func (s *Server) createComputerBackup(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func (s *Server) listComputerBackups(w http.ResponseWriter, r *http.Request) {
@@ -1541,7 +1519,7 @@ func (s *Server) restoreComputerBackup(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func (s *Server) cloneComputerBackup(w http.ResponseWriter, r *http.Request) {
@@ -1571,7 +1549,7 @@ func (s *Server) cloneComputerBackup(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func (s *Server) exportComputerBackup(w http.ResponseWriter, r *http.Request) {
@@ -1667,7 +1645,7 @@ func (s *Server) installComputerProjection(w http.ResponseWriter, r *http.Reques
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusAccepted, computer)
 }
 
 func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
@@ -1692,7 +1670,7 @@ func (s *Server) reimageComputer(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replay", "true")
 	}
 	writeComputerMutationHeaders(w, !replayed && computer.IntentRevision > request.IntentRevision, replayed)
-	writeJSON(w, status, redactComputer(computer))
+	s.writeComputerForCaller(w, r, status, computer)
 }
 
 func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
@@ -1712,7 +1690,7 @@ func (s *Server) removeComputer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeComputerMutationHeaders(w, computer.IntentRevision > request.IntentRevision, false)
-	writeJSON(w, http.StatusAccepted, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusAccepted, computer)
 }
 
 // withoutUnrevokedRestores drops the copy directives for restores whose
@@ -2525,7 +2503,7 @@ func (s *Server) acknowledgeComputerStorageReset(w http.ResponseWriter, r *http.
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerStorageGrow(w http.ResponseWriter, r *http.Request) {
@@ -2546,7 +2524,7 @@ func (s *Server) acknowledgeComputerStorageGrow(w http.ResponseWriter, r *http.R
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerReimagePreflight(w http.ResponseWriter, r *http.Request) {
@@ -2561,7 +2539,7 @@ func (s *Server) acknowledgeComputerReimagePreflight(w http.ResponseWriter, r *h
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerStorageRetirement(w http.ResponseWriter, r *http.Request) {
@@ -2576,7 +2554,7 @@ func (s *Server) acknowledgeComputerStorageRetirement(w http.ResponseWriter, r *
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerBackup(w http.ResponseWriter, r *http.Request) {
@@ -2591,7 +2569,12 @@ func (s *Server) acknowledgeComputerBackup(w http.ResponseWriter, r *http.Reques
 		writeError(w, err)
 		return
 	}
-	response := ComputerBackupAcknowledgementResponse{Computer: redactComputer(computer)}
+	projection, err := s.projectComputerForCaller(r, computer)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	response := ComputerBackupAcknowledgementResponse{Computer: projection}
 	if backup.BackupID != "" {
 		response.Backup = &backup
 	}
@@ -2629,7 +2612,7 @@ func (s *Server) acknowledgeComputerStorageCopy(w http.ResponseWriter, r *http.R
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerCustodyExport(w http.ResponseWriter, r *http.Request) {
@@ -2659,7 +2642,7 @@ func (s *Server) acknowledgeComputerRestoreRetirement(w http.ResponseWriter, r *
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, redactComputer(computer))
+	s.writeComputerForCaller(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) drainNode(w http.ResponseWriter, r *http.Request) {
