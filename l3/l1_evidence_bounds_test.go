@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,7 +12,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 func TestDispatchL1EvidenceBounds(t *testing.T) {
@@ -27,7 +31,7 @@ func TestDispatchL1EvidenceBounds(t *testing.T) {
 					value := strings.Repeat(character, length)
 					want := value
 					if length > 128 {
-						want = strings.Repeat(character, 127) + "…"
+						want = strings.Repeat(character, 125) + "..."
 					}
 					code, requestID, headerID := "future_code", "short-request", "header-request"
 					switch field {
@@ -86,6 +90,263 @@ func TestDispatchL1EvidenceBounds(t *testing.T) {
 					if length > 128 && strings.Contains(logs.String(), value) {
 						t.Fatalf("length %d: log retained oversized evidence", length)
 					}
+				}
+			})
+		}
+	}
+}
+
+// Exercise dispatch persistence, the actual reconciler logger callback, and
+// the caller-facing error writer for each kind of submission answer.
+func TestDispatchClassifiedL1EvidenceBounds(t *testing.T) {
+	for _, tt := range []struct {
+		name, code string
+		status     int
+		retry      bool
+		kind       l1AnswerKind
+	}{
+		{"unavailable", "unavailable", 503, true, l1Transient},
+		{"internal", "internal", 500, true, l1Transient},
+		{"work refused", "conflict", 409, false, l1WorkRefused},
+		{"ledger not admitted", "unauthorized", 401, false, l1LedgerNotAdmitted},
+		{"protocol violation", strings.Repeat("c", 10000), 409, false, l1ProtocolViolation},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHoldHTTPHarness(t)
+			ctx := context.Background()
+			run := h.submit(inlineRunRequest("exit 0\n"), "classified-evidence")
+			requestID := strings.Repeat("r", 10000)
+			message := strings.Repeat("m", 10000)
+			reason := strings.Repeat("s", 10000)
+			body, err := json.Marshal(contract.ErrorResponse{Error: contract.APIError{
+				Code: contract.ErrorCode(tt.code), RequestID: requestID, Message: message,
+				Retryable: tt.retry, Details: map[string]any{"reason": reason},
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.l1Client.client.Transport = recoveryRoundTripper(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: tt.status, Header: http.Header{"X-Request-Id": {requestID}}, Body: io.NopCloser(bytes.NewReader(body))}, nil
+			})
+			// Check classification at the same seam used by the reconciler.
+			_, seamErr := h.l1Client.SubmitJob(ctx, contract.JobSpec{})
+			answer := classifyL1Answer(seamErr)
+			if answer.Kind != tt.kind {
+				t.Fatalf("kind=%d want %d", answer.Kind, tt.kind)
+			}
+			assertL1StringBound(t, "seam code", string(answer.Response.protocol.Code), boundedTestValue(tt.code))
+			assertL1StringBound(t, "seam message", answer.Response.protocol.Message, boundedTestValue(message))
+			assertL1StringBound(t, "seam reason", answer.Response.protocol.Details["reason"].(string), boundedTestValue(reason))
+			var logs bytes.Buffer
+			logger := log.New(&logs, "", 0)
+			var reported error
+			reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{OnError: func(err error) {
+				reported = err
+				logger.Printf("reconcile: %v", err)
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reconciler.reconcileAndReport(ctx)
+			execution, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if execution.DispatchError == nil || reported == nil {
+				t.Fatal("missing stored/logged error")
+			}
+			assertL1StringBound(t, "stored request_id", execution.DispatchError.RequestID, strings.Repeat("r", 125)+"...")
+			if tt.kind == l1Transient || tt.kind == l1WorkRefused {
+				assertL1StringBound(t, "stored message", execution.DispatchError.Message, strings.Repeat("m", 125)+"...")
+				assertL1StringBound(t, "stored reason", execution.DispatchError.Details["reason"].(string), strings.Repeat("s", 125)+"...")
+			}
+			if tt.kind == l1LedgerNotAdmitted {
+				if execution.DispatchHold == nil {
+					t.Fatal("missing hold")
+				}
+				assertL1StringBound(t, "hold reason", execution.DispatchHold.Reason, strings.Repeat("s", 125)+"...")
+				assertL1StringBound(t, "stored reason", execution.DispatchError.Details["reason"].(string), strings.Repeat("s", 125)+"...")
+			}
+			if tt.kind == l1ProtocolViolation {
+				assertL1StringBound(t, "stored code", execution.DispatchError.Details["l1_code"].(string), strings.Repeat("c", 125)+"...")
+			}
+			for _, raw := range []string{requestID, message, reason, strings.Repeat("c", 10000)} {
+				if strings.Contains(logs.String(), raw) {
+					t.Error("logger retained oversized L1 string")
+				}
+			}
+			if tt.kind == l1Transient || tt.kind == l1WorkRefused {
+				if !strings.Contains(logs.String(), strings.Repeat("m", 125)+"...") {
+					t.Error("logger lost bounded message")
+				}
+			}
+			w := httptest.NewRecorder()
+			w.Header().Set("X-L3-Request-Id", "local-request")
+			writeError(w, reported)
+			assertL1StringBound(t, "relayed header", w.Header().Get("X-Request-Id"), strings.Repeat("r", 125)+"...")
+			for _, b := range []byte(w.Header().Get("X-Request-Id")) {
+				if b < 32 || b > 126 {
+					t.Error("truncated ASCII request ID contains non-visible-ASCII byte")
+				}
+			}
+			var relayed contract.ErrorResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &relayed); err != nil {
+				t.Fatal(err)
+			}
+			assertL1StringBound(t, "relayed request_id", relayed.Error.RequestID, strings.Repeat("r", 125)+"...")
+			if tt.kind == l1WorkRefused || tt.name == "unavailable" {
+				assertL1StringBound(t, "relayed message", relayed.Error.Message, strings.Repeat("m", 125)+"...")
+			}
+			if tt.kind == l1WorkRefused || tt.name == "unavailable" || tt.kind == l1LedgerNotAdmitted {
+				assertL1StringBound(t, "relayed reason", relayed.Error.Details["reason"].(string), strings.Repeat("s", 125)+"...")
+			}
+		})
+	}
+}
+
+func boundedTestValue(value string) string {
+	runes := []rune(value)
+	if len(runes) <= 128 {
+		return value
+	}
+	return string(runes[:125]) + "..."
+}
+
+func assertL1StringBound(t *testing.T, field, got, want string) {
+	t.Helper()
+	if got != want || !utf8.ValidString(got) {
+		t.Errorf("%s: got %d runes, want %d with expected prefix and ASCII marker", field, utf8.RuneCountInString(got), utf8.RuneCountInString(want))
+	}
+}
+
+// Authoritative absence must keep its typed identity and classification while
+// bounding the envelope before any consumer can inspect or relay it.
+func TestL1AbsenceEvidenceBounds(t *testing.T) {
+	for _, lookup := range []bool{false, true} {
+		for _, character := range []string{"x", "界"} {
+			t.Run(fmt.Sprintf("lookup=%t/%s", lookup, character), func(t *testing.T) {
+				value := strings.Repeat(character, 10000)
+				want := strings.Repeat(character, 125) + "..."
+				body, err := json.Marshal(contract.ErrorResponse{Error: contract.APIError{
+					Code: contract.ErrorNotFound, Message: value, RequestID: value,
+					Details: map[string]any{"reason": value, "nested": []any{map[string]any{value: value}}, "flag": true, "count": 7},
+				}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				c := &L1Client{operationTimeout: time.Second, client: &http.Client{Transport: recoveryRoundTripper(func(*http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: 404, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+				})}}
+				var failure error
+				if lookup {
+					_, failure = c.LookupJobByDispatchKey(context.Background(), "key")
+				} else {
+					_, failure = c.GetJob(context.Background(), "job")
+				}
+				if classifyL1Answer(failure).Kind != l1AuthoritativeAbsence ||
+					(lookup && !isMissingDispatch(failure, "key")) || (!lookup && !isMissingL1Job(failure, "job")) {
+					t.Fatal("absence lost authority or requested identity")
+				}
+				var protocol *Error
+				if !errors.As(failure, &protocol) {
+					t.Fatal("missing envelope")
+				}
+				assertL1StringBound(t, "absence message", protocol.Message, want)
+				assertL1StringBound(t, "absence request_id", protocol.RequestID, want)
+				assertL1StringBound(t, "absence reason", protocol.Details["reason"].(string), want)
+				nested := protocol.Details["nested"].([]any)[0].(map[string]any)
+				nestedValue, ok := nested[want].(string)
+				if !ok {
+					t.Error("nested detail key was not bounded")
+				}
+				assertL1StringBound(t, "nested detail value", nestedValue, want)
+				if protocol.Details["flag"] != true || protocol.Details["count"] != float64(7) {
+					t.Error("non-string details changed")
+				}
+				w := httptest.NewRecorder()
+				w.Header().Set("X-L3-Request-Id", "local-request")
+				writeError(w, failure)
+				assertL1StringBound(t, "absence relayed header", w.Header().Get("X-Request-Id"), want)
+				var relayed contract.ErrorResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &relayed); err != nil {
+					t.Fatal(err)
+				}
+				assertL1StringBound(t, "absence relayed message", relayed.Error.Message, want)
+				assertL1StringBound(t, "absence relayed reason", relayed.Error.Details["reason"].(string), want)
+			})
+		}
+	}
+}
+
+// Use real L3 HTTP middleware and its logger, so oversized IDs cannot sneak
+// into the upstream_request_id field even when a read reports absence.
+func TestL3RelayedClassifiedL1EvidenceBounds(t *testing.T) {
+	for _, tt := range []struct {
+		name, code            string
+		status, relayedStatus int
+		retry                 bool
+	}{
+		{"transient", "unavailable", 503, 503, true},
+		{"ledger not admitted", "unauthorized", 401, 503, false},
+		{"work refused", "conflict", 409, 409, false},
+		{"absence", "not_found", 404, 404, false},
+		{"protocol violation", "future_code", 409, 503, false},
+	} {
+		for _, requestID := range []string{"short-request", strings.Repeat("r", 10000)} {
+			t.Run(fmt.Sprintf("%s/id-runes=%d", tt.name, len(requestID)), func(t *testing.T) {
+				h := newHoldHTTPHarness(t)
+				ctx := context.Background()
+				run := h.submit(inlineRunRequest("exit 0\n"), "relay-evidence")
+				reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := reconciler.ReconcileOnce(ctx); err != nil {
+					t.Fatal(err)
+				}
+				message, reason := strings.Repeat("m", 10000), strings.Repeat("s", 10000)
+				body, err := json.Marshal(contract.ErrorResponse{Error: contract.APIError{
+					Code: contract.ErrorCode(tt.code), Message: message, RequestID: requestID,
+					Retryable: tt.retry, Details: map[string]any{"reason": reason},
+				}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				h.l1Client.client.Transport = recoveryRoundTripper(func(*http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: tt.status, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+				})
+				logs := &requestLog{}
+				h.l3Server.logf = log.New(logs, "", 0).Printf
+				status, headers, responseBody := h.do(h.caller, http.MethodGet, "/v1/runs/"+run.RunID+"/logs", nil, nil)
+				if status != tt.relayedStatus {
+					t.Fatalf("status=%d want=%d", status, tt.relayedStatus)
+				}
+				wantID := boundedTestValue(requestID)
+				assertL1StringBound(t, "HTTP request_id", headers.Get("X-Request-Id"), wantID)
+				if !logs.contains("upstream_request_id=" + fmt.Sprintf("%q", wantID)) {
+					t.Error("HTTP log lost bounded upstream ID")
+				}
+				if len(requestID) > 128 && logs.contains(requestID) {
+					t.Error("HTTP log retained oversized upstream ID")
+				}
+				if logs.contains(message) || logs.contains(reason) {
+					t.Error("HTTP log retained oversized message/reason")
+				}
+				localID := headers.Get("X-L3-Request-Id")
+				if localID == "" || localID == wantID {
+					t.Error("local request correlation changed")
+				}
+				var relayed contract.ErrorResponse
+				if err := json.Unmarshal(responseBody, &relayed); err != nil {
+					t.Fatal(err)
+				}
+				assertL1StringBound(t, "HTTP envelope request_id", relayed.Error.RequestID, wantID)
+				if relayed.Error.Details["l3_request_id"] != localID {
+					t.Error("local envelope correlation changed")
+				}
+				if tt.name == "transient" || tt.name == "work refused" || tt.name == "absence" {
+					assertL1StringBound(t, "HTTP message", relayed.Error.Message, boundedTestValue(message))
+					assertL1StringBound(t, "HTTP reason", relayed.Error.Details["reason"].(string), boundedTestValue(reason))
 				}
 			})
 		}
