@@ -120,7 +120,7 @@ func apiErrorFromDecision(err error) *contract.APIError {
 		return nil
 	}
 	code := errorCode(err)
-	result := &contract.APIError{Code: code, Message: err.Error(), Retryable: code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted || code == contract.ErrorRunLedgerUnavailable}
+	result := &contract.APIError{Code: code, Message: err.Error(), Retryable: code == contract.ErrorInternal || code == contract.ErrorCapacityExhausted || code == contract.ErrorRunLedgerUnavailable || code == contract.ErrorUnavailable}
 	var protocolErr *Error
 	if errors.As(err, &protocolErr) {
 		result.Details = protocolErr.Details

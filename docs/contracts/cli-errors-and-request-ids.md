@@ -27,6 +27,15 @@ remain unchanged in JSON. Non-retryable `internal` and
 `run_ledger_unavailable` remain exit 1. Retryability alone never changes an
 authority refusal or an unknown protocol code's exit.
 
+An L1 identity lookup that fails operationally returns `503 unavailable`,
+`retryable:true`, `details.reason="identity_unverifiable"`; the CLI preserves
+that server envelope and exits 13. Genuine Fabric identity absence remains
+`401 unauthorized` and exits 3. Node agents classify `unavailable` as
+transient without treating it as lost attempt or node-session authority.
+Ledger-only admission refusals remain `403 forbidden` and exit 3, adding
+`details.reason="run_ledger_not_admitted"`; per-Computer and per-host
+authority refusals carry no ledger-admission reason.
+
 `--json` and `--json=true` are global wherever they appear in the argument list,
 including after the command or its operands, except when consumed as another
 flag's value or after the `--` argument terminator. `--json=false` disables JSON;

@@ -498,7 +498,7 @@ func (s *Server) proveServiceBinding(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) proveComputerTokenScope(w http.ResponseWriter, r *http.Request) {
 	if identityFromRequest(r).NodeID != s.runLedgerNodeID {
-		writeError(w, protocolError(contract.ErrorForbidden, "only the L3 run ledger may request Computer token scope proof"))
+		writeError(w, protocolErrorWithDetails(contract.ErrorForbidden, map[string]any{"reason": "run_ledger_not_admitted"}, "only the L3 run ledger may request Computer token scope proof"))
 		return
 	}
 	var request struct {
@@ -521,7 +521,7 @@ func (s *Server) proveComputerTokenScope(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) proveHostBootSession(w http.ResponseWriter, r *http.Request) {
 	if identityFromRequest(r).NodeID != s.runLedgerNodeID {
-		writeError(w, protocolError(contract.ErrorForbidden, "only the L3 run ledger may request host boot session proof"))
+		writeError(w, protocolErrorWithDetails(contract.ErrorForbidden, map[string]any{"reason": "run_ledger_not_admitted"}, "only the L3 run ledger may request host boot session proof"))
 		return
 	}
 	var proof HostBootSessionProof
@@ -767,9 +767,9 @@ func presentedAttemptCredential(r *http.Request) string {
 // route.
 func (s *Server) authorizeAttemptCredential(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		identity, err := s.fabric.WhoIs(r.Context(), r.RemoteAddr)
+		identity, err := s.authenticatedIdentity(w, r)
 		if err != nil {
-			writeError(w, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated"))
+			writeError(w, err)
 			return
 		}
 		if !slices.Contains(NormalizeTags(identity.Tags), s.agentPrincipalTag) {
@@ -889,11 +889,38 @@ func taggedIdentityDecision(identity fabric.Identity, tag string) error {
 	return nil
 }
 
+// authenticatedIdentity distinguishes absence from a lookup that could not
+// establish identity. Fabric error text may contain credentials or private
+// addresses, so the cause diagnostic logs only its type and a safe category.
+func (s *Server) authenticatedIdentity(w http.ResponseWriter, r *http.Request) (fabric.Identity, error) {
+	identity, err := s.fabric.WhoIs(r.Context(), r.RemoteAddr)
+	if err == nil {
+		return identity, nil
+	}
+	if errors.Is(err, fabric.ErrIdentityNotFound) {
+		return fabric.Identity{}, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated")
+	}
+	if s.logf != nil {
+		cause := "lookup_failed"
+		var networkError net.Error
+		if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() {
+			cause = "timeout"
+		} else if errors.Is(err, context.Canceled) {
+			cause = "canceled"
+		}
+		s.logf("event=l1_identity_unverifiable request_id=%s class=%s cause=%s",
+			w.Header().Get(contract.RequestIDHeader), scrubbedClass(err), cause)
+	}
+	return fabric.Identity{}, &Error{Code: contract.ErrorUnavailable,
+		Message: "fabric identity could not be verified", Cause: err,
+		Details: map[string]any{"reason": "identity_unverifiable"}}
+}
+
 func (s *Server) authorize(principal principal, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		identity, err := s.fabric.WhoIs(r.Context(), r.RemoteAddr)
+		identity, err := s.authenticatedIdentity(w, r)
 		if err != nil {
-			writeError(w, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated"))
+			writeError(w, err)
 			return
 		}
 		if principal == personPrincipal || principal == cancelPrincipal && !slices.Contains(NormalizeTags(identity.Tags), s.clientPrincipalTag) {
@@ -2099,7 +2126,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) lookupJobByDispatchKey(w http.ResponseWriter, r *http.Request) {
 	if identityFromRequest(r).NodeID != s.runLedgerNodeID {
-		writeError(w, protocolError(contract.ErrorForbidden, "only the L3 run ledger may look up a dispatch"))
+		writeError(w, protocolErrorWithDetails(contract.ErrorForbidden, map[string]any{"reason": "run_ledger_not_admitted"}, "only the L3 run ledger may look up a dispatch"))
 		return
 	}
 	dispatchKey := r.PathValue("dispatch_key")
@@ -2985,7 +3012,7 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusUnprocessableEntity
 	case contract.ErrorNotImplemented:
 		status = http.StatusNotImplemented
-	case contract.ErrorRunLedgerUnavailable:
+	case contract.ErrorRunLedgerUnavailable, contract.ErrorUnavailable:
 		status = http.StatusServiceUnavailable
 	case contract.ErrorInternal:
 		status = http.StatusInternalServerError
