@@ -21,12 +21,38 @@ type detachedHandoffDirectory interface {
 // freeDetachedHandoffRoot opens and frees a previously detached tree, then
 // removes its root. Concurrent collectors may already have removed it.
 func freeDetachedHandoffRoot(ctx context.Context, root string, freeChild func(string) error) error {
+	info, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// A detached name is deletion authority for this entry only. In
+	// particular, never open a symlink and walk the target's children.
+	if !info.IsDir() {
+		if ctx != nil && ctx.Err() != nil {
+			log.Printf("handoff retention: %s stays detached and the next pass frees it: %v", filepath.Base(root), ctx.Err())
+			return nil
+		}
+		if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
 	directory, err := os.Open(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	opened, err := directory.Stat()
+	if err != nil {
+		return errors.Join(err, directory.Close())
+	}
+	if !os.SameFile(info, opened) {
+		return errors.Join(errors.New("detached handoff directory changed before opening"), directory.Close())
 	}
 	complete, err := freeDetachedHandoffContents(ctx, filepath.Base(root), directory, freeChild)
 	if err != nil || !complete {

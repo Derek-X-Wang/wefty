@@ -1451,6 +1451,7 @@
           },
           "capability_reason_code": {
             "type": "string",
+            "description": "Closed capability restriction reason. Lima helper readiness classification uses typed errors and reason codes, never diagnostic text or private resource inventory. Namespace residue is boot_sweep_failed regardless of resource names; dial and handshake failures use helper_unreachable and helper_handshake_failed, while typed takeover, version/checksum and peer-authentication failures retain their distinct reasons.",
             "enum": [
               "oci_intent_disabled", "prerequisite_missing", "runtime_version_unsupported",
               "helper_unreachable", "helper_unit_unavailable", "helper_handshake_stalled", "helper_handshake_stalled_persistent",

@@ -978,12 +978,11 @@ func classifyHelperBarrierError(err error) contract.CapabilityReasonCode {
 			return contract.CapabilityReasonLocalPermissionDenied
 		}
 	}
-	message := strings.ToLower(err.Error())
-	if strings.Contains(message, "dial oci helper") {
-		return contract.CapabilityReasonHelperUnreachable
+	var reason interface {
+		CapabilityReasonCode() contract.CapabilityReasonCode
 	}
-	if strings.Contains(message, "handshake") {
-		return contract.CapabilityReasonHelperHandshakeFailed
+	if errors.As(err, &reason) {
+		return reason.CapabilityReasonCode()
 	}
 	return contract.CapabilityReasonBootSweepFailed
 }

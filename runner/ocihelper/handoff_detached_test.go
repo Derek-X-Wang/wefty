@@ -76,6 +76,78 @@ func TestDetachedHandoffFreeRemovesNonDirectory(t *testing.T) {
 	}
 }
 
+func TestDetachedHandoffFreeUnlinksSymlinkWithoutTouchingTarget(t *testing.T) {
+	for _, targetKind := range []string{"directory", "file", "missing"} {
+		t.Run(targetKind, func(t *testing.T) {
+			base := t.TempDir()
+			root := filepath.Join(base, ".removing-wefty-handoff-volume-test")
+			target := filepath.Join(base, "outside-handoffs")
+			payload := target
+			if targetKind == "directory" {
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				payload = filepath.Join(target, "result.json")
+			}
+			if targetKind != "missing" {
+				if err := os.WriteFile(payload, []byte("keep"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(target, root); err != nil {
+				t.Fatal(err)
+			}
+			walked := false
+			err := freeDetachedHandoffRoot(t.Context(), root, func(child string) error {
+				walked = true
+				return os.RemoveAll(filepath.Join(root, child))
+			})
+			if err != nil || walked {
+				t.Errorf("free symlink: walked=%t err=%v", walked, err)
+			}
+			if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("detached symlink remains: %v", err)
+			}
+			if targetKind != "missing" {
+				if content, err := os.ReadFile(payload); err != nil || string(content) != "keep" {
+					t.Errorf("symlink target changed: content=%q err=%v", content, err)
+				}
+			}
+		})
+	}
+}
+
+// RemoveAll must unlink a child symlink rather than walking its target. This
+// exercises the same child-removal operation used by freeDetachedHandoffChild.
+func TestDetachedHandoffFreeDoesNotFollowChildSymlink(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, ".removing-wefty-handoff-volume-test")
+	target := filepath.Join(base, "outside-handoffs")
+	for _, directory := range []string{root, target} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payload := filepath.Join(target, "result.json")
+	if err := os.WriteFile(payload, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "child")); err != nil {
+		t.Fatal(err)
+	}
+	if err := freeDetachedHandoffRoot(t.Context(), root, func(child string) error {
+		return os.RemoveAll(filepath.Join(root, child))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("detached root remains: %v", err)
+	}
+	if content, err := os.ReadFile(payload); err != nil || string(content) != "keep" {
+		t.Errorf("child symlink target changed: content=%q err=%v", content, err)
+	}
+}
+
 type vanishedHandoffDirectory struct {
 	file     *os.File
 	names    []string

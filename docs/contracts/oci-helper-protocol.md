@@ -412,10 +412,11 @@ Handoff deletion detaches the volume and unlinks its paired terminal receipt
 under the retention lock before freeing the detached `.removing-*` tree.
 Concurrent authorized deletion and collection may free that same tree: ENOENT
 while opening or reading the detached directory means it is already deleted,
-even when a read also returned buffered child names. A non-directory detached
-entry is unlinked without walking children. Cancellation before the walk or
-between children leaves the detached root for the next pass; only a completed
-free removes the root. Other read and close failures remain errors. Success
+even when a read also returned buffered child names. A regular-file or symlink
+entry is unlinked without walking children or following its target. Child
+symlinks are likewise unlinked without following their targets. Cancellation
+before the walk or between children leaves the detached root for the next pass;
+only a completed free removes the root. Other read and close failures remain errors. Success
 still independently verifies absence of both the original volume and its
 receipt; a racing repair cannot publish a receipt
 for a volume that was detached under that lock.
@@ -612,6 +613,14 @@ kill-to-verified-ready success bound is 30 seconds. An earlier caller deadline
 or cancellation remains distinct.
 The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
+
+Lima classifies helper readiness failures by typed errors and capability reason
+codes, never by diagnostic text or private resource inventory. A dial failure
+is `helper_unreachable`; a failed handshake is `helper_handshake_failed`.
+Typed unavailable-unit, stalled-handshake, persistent-stall, version/checksum,
+and peer-authentication failures retain their existing reasons. Namespace
+residue and other sweep failures are `boot_sweep_failed`, even when a resource
+path contains words such as "handshake" or "dial OCI helper".
 
 Successful verification produces an immutable receipt retained by the client
 barrier, including across loss of the session that produced it. An unavailable
