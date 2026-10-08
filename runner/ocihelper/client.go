@@ -10,17 +10,34 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 type DialFunc func(context.Context) (net.Conn, error)
 
-// helperDialError keeps transport establishment failures distinct from
+// HelperDialError keeps transport establishment failures distinct from
 // handshake and protocol failures. The boot barrier may retry only this
 // class while systemd is replacing a socket-activated helper.
-type helperDialError struct{ cause error }
+type HelperDialError struct{ Cause error }
 
-func (err *helperDialError) Error() string { return fmt.Sprintf("dial OCI helper: %v", err.cause) }
-func (err *helperDialError) Unwrap() error { return err.cause }
+func (err *HelperDialError) Error() string { return fmt.Sprintf("dial OCI helper: %v", err.Cause) }
+func (err *HelperDialError) Unwrap() error { return err.Cause }
+func (*HelperDialError) CapabilityReasonCode() contract.CapabilityReasonCode {
+	return contract.CapabilityReasonHelperUnreachable
+}
+
+// HelperHandshakeError identifies a failed handshake without requiring a
+// caller to inspect private transport or protocol diagnostic text.
+type HelperHandshakeError struct{ Cause error }
+
+func (err *HelperHandshakeError) Error() string {
+	return fmt.Sprintf("OCI helper handshake: %v", err.Cause)
+}
+func (err *HelperHandshakeError) Unwrap() error { return err.Cause }
+func (*HelperHandshakeError) CapabilityReasonCode() contract.CapabilityReasonCode {
+	return contract.CapabilityReasonHelperHandshakeFailed
+}
 
 type sessionAdmissionTransportError struct{ cause error }
 
@@ -121,7 +138,7 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 	connection, err := client.Dial(dialContext)
 	if err != nil {
 		cancelDial()
-		return nil, &helperDialError{cause: err}
+		return nil, &HelperDialError{Cause: err}
 	}
 	defer cancelDial()
 	if connected != nil {
@@ -131,7 +148,7 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 	defer stopCancellation()
 	if err := applyConnectionDeadline(ctx, connection, initialDeadline); err != nil {
 		_ = connection.Close()
-		return nil, err
+		return nil, &HelperHandshakeError{Cause: err}
 	}
 	wire := newFramedConn(connection)
 	body, err := marshalBody(request)
@@ -141,12 +158,16 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 	}
 	if err := wire.write(frame{Version: client.protocolVersion(), Method: MethodAcquireSession, Body: body}); err != nil {
 		_ = connection.Close()
-		return nil, fmt.Errorf("send OCI helper handshake: %w", err)
+		return nil, &HelperHandshakeError{Cause: err}
 	}
 	var handshake AcquireSessionResponse
 	if err := decodeResponse(wire, &handshake); err != nil {
 		_ = connection.Close()
-		return nil, err
+		var rpcErr *RPCError
+		if errors.As(err, &rpcErr) {
+			return nil, err
+		}
+		return nil, &HelperHandshakeError{Cause: err}
 	}
 	if err := validateSessionHandshake(client, handshake, false); err != nil {
 		_ = connection.Close()
@@ -181,7 +202,7 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 			response.HeartbeatTimeout != handshake.HeartbeatTimeout || response.MaximumAttemptDeadman != handshake.MaximumAttemptDeadman ||
 			response.ReapTimeout != handshake.ReapTimeout || response.StartupInProgress != handshake.StartupInProgress {
 			_ = connection.Close()
-			return nil, errors.New("OCI helper changed handshake facts before session admission")
+			return nil, &HelperHandshakeError{Cause: errors.New("OCI helper changed handshake facts before session admission")}
 		}
 	} else if err := validateSessionHandshake(client, response, true); err != nil {
 		_ = connection.Close()
@@ -205,13 +226,13 @@ func (client *Client) openSession(ctx context.Context, request AcquireSessionReq
 
 func validateSessionHandshake(client *Client, response AcquireSessionResponse, requireAuthority bool) error {
 	if response.ProtocolVersion != client.protocolVersion() || response.HelperInstanceID == "" || response.ReapTimeout <= 0 {
-		return errors.New("OCI helper returned an invalid handshake")
+		return &HelperHandshakeError{Cause: errors.New("OCI helper returned an invalid handshake")}
 	}
 	if requireAuthority && (response.SessionCapability == "" || response.SessionGeneration == 0) {
-		return errors.New("OCI helper returned an invalid session admission")
+		return &HelperHandshakeError{Cause: errors.New("OCI helper returned an invalid session admission")}
 	}
 	if !requireAuthority && (response.SessionCapability == "") != (response.SessionGeneration == 0) {
-		return errors.New("OCI helper returned partial session authority")
+		return &HelperHandshakeError{Cause: errors.New("OCI helper returned partial session authority")}
 	}
 	if client.ExpectedChecksum != "" && response.HelperChecksum != client.ExpectedChecksum {
 		return &RPCError{Code: CodeChecksumMismatch, Message: "helper checksum does not match local expectation"}
@@ -1284,7 +1305,7 @@ func (session *Session) dialRequestInternal(ctx context.Context, method Method, 
 	}
 	connection, err := session.client.Dial(ctx)
 	if err != nil {
-		err = fmt.Errorf("dial OCI helper RPC: %w", err)
+		err = &HelperDialError{Cause: err}
 		if classifyTransportLoss {
 			err = session.markOperationFailure(ctx, err)
 		}

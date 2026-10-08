@@ -390,7 +390,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	}()
 	handshake := session.Handshake()
 	if handshake.HelperInstanceID == "" || handshake.SessionGeneration == 0 || handshake.ReapTimeout <= 0 {
-		return errors.New("OCI helper handshake omitted barrier authority")
+		return &HelperHandshakeError{Cause: errors.New("OCI helper handshake omitted barrier authority")}
 	}
 	barrierContext, barrierCancel := context.WithTimeout(ctx, handshake.ReapTimeout)
 	defer barrierCancel()
@@ -635,7 +635,7 @@ func (barrier *BootBarrier) takeExclusiveSession(ctx context.Context, takeoverSt
 			return nil, 0, 0, takeoverError(errors.Join(errTakeoverWindowExpired, context.DeadlineExceeded), true)
 		}
 		var rpcErr *RPCError
-		var dialErr *helperDialError
+		var dialErr *HelperDialError
 		if errors.As(err, &rpcErr) && rpcErr.Code == CodeStartupBoundTripped {
 			// The helper completed the handshake and then refused admission
 			// because its startup barrier already burned its bound. That

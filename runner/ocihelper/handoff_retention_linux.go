@@ -435,22 +435,12 @@ func (engine *ContainerdEngine) freeDetachedHandoffTree(ctx context.Context, det
 	}
 	root := filepath.Join(engine.handoffVolumeRoot(), detached)
 	return freeDetachedHandoffRoot(ctx, root, func(child string) error {
-		return engine.freeDetachedHandoffChild(detached, child)
-	})
-}
-
-func (engine *ContainerdEngine) freeDetachedHandoffChild(detached, child string) error {
-	if engine.handoffFreeChild != nil {
-		// A test makes one child's removal fail, to prove the rest of the
-		// tree is left for the next pass rather than half-freed and forgotten.
-		if err := engine.handoffFreeChild(detached, child); err != nil {
-			return err
+		if engine.handoffFreeChild != nil {
+			// A test makes one child's removal fail before it is freed.
+			return engine.handoffFreeChild(detached, child)
 		}
-	}
-	if err := os.RemoveAll(filepath.Join(engine.handoffVolumeRoot(), detached, child)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+		return nil
+	})
 }
 
 // detachedHandoffVolumeName is the name a volume wears between being detached
