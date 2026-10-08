@@ -1164,8 +1164,10 @@ most 128 runes are unchanged. This applies to transient answers, ledger
 non-admission, work refusal, authoritative absence and protocol violations.
 These same bounded strings reach stored errors, reconcile and HTTP logs,
 relayed errors and `X-Request-Id`; the Dispatch hold reason inherits the same
-bound from the answer. The ASCII marker keeps truncated ASCII request IDs
-visible ASCII; Unicode strings retain their UTF-8 prefix. Protocol violations
+bound from the answer. The ASCII marker keeps a truncated visible-ASCII
+request ID visible ASCII; Unicode strings retain their UTF-8 prefix. The bound
+is per string: the number of detail entries is limited only by the 2 MiB L1
+response read limit. Protocol violations
 still exclude response messages, details and raw bodies from their diagnostics,
 and caller-facing internal errors still scrub messages and details.
 
