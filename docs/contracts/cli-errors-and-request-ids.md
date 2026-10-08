@@ -20,12 +20,14 @@ typed result.
 | 13 | Transport or service unavailable (`unavailable`, or retryable server-unavailable envelope) |
 | 14 | Accepted-mutation observation timeout (`wait_timeout` or `revocation_wait_timeout`) |
 
-The protocol-code membership of the exit map remains authoritative. HTTP 5xx
-error envelopes with `code=internal` or `code=run_ledger_unavailable` and
+The protocol-code membership of the exit map remains authoritative. L1/L3 HTTP
+5xx error envelopes with `code=internal` or `code=run_ledger_unavailable` and
 `retryable=true` exit 13; their server code, details, retryability, and request ID
 remain unchanged in JSON. Non-retryable `internal` and
 `run_ledger_unavailable` remain exit 1. Retryability alone never changes an
-authority refusal or an unknown protocol code's exit.
+authority refusal or an unknown protocol code's exit. Structured take-over
+refusals map by server code for every HTTP status, including on take and release
+as on view open.
 
 An L1 identity lookup that fails operationally returns `503 unavailable`,
 `retryable:true`, `details.reason="identity_unverifiable"`; the CLI preserves
@@ -56,9 +58,15 @@ WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
 `retryable=true`,
 exit 13. This includes non-envelope 5xx from the Computer take-over front door
 on `services takeover view`, `take`, and `release`, such as a plain-text 503
-when the display is not ready or Fabric identity cannot be verified. Structured
-take-over refusals keep their existing classification; a plain-text or structured
-401 authentication refusal exits 3. An unavailable result advises the operator to check reachability and
+when the display is not ready or Fabric identity cannot be verified. The
+unavailable message retains the front door's plain-text reason after bounding
+the response to 4096 bytes, dropping any split UTF-8 rune and non-printable
+characters except tab. Structured take-over refusals, including HTTP 5xx on view
+open, take, and release, retain the server's code, message, retryability, details,
+request ID, and any receipt; view open also adds the HTTP status to the message.
+The CLI exit map still applies: `tenure_unavailable` exits 1 even when retryable,
+and is never rewritten to `internal` or transport `unavailable`. A plain-text or
+structured 401 authentication refusal exits 3. An unavailable result advises the operator to check reachability and
 retry with backoff within its authority. A bare `context.DeadlineExceeded` is
 not evidence of unavailability: only a typed transport/service availability
 failure or the named server-envelope cases map to exit 13. Caller cancellation

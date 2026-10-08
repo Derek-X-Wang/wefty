@@ -135,7 +135,7 @@ All commands share these typed exits:
 | 8 | Custody import failed; read its result document |
 | 9 | Custody import superseded; read its result document |
 | 12 | Cluster not ready; read the readiness reasons and stop submitting |
-| 13 | Transport/service availability: `unavailable` for connection/dial/request-deadline failure, a stalled take-over display banner after WebSocket upgrade, or non-envelope HTTP 5xx; also HTTP 5xx envelopes with retryable `internal` or `run_ledger_unavailable`. JSON preserves the server code. Check reachability and retry with backoff within your authority |
+| 13 | Transport/service availability: `unavailable` for connection/dial/request-deadline failure, a stalled take-over display banner after WebSocket upgrade, or non-envelope HTTP 5xx; also L1/L3 HTTP 5xx envelopes with retryable `internal` or `run_ledger_unavailable`. JSON preserves the server code. Structured take-over refusals map by server code for every HTTP status. Check reachability and retry with backoff within your authority |
 | 14 | Accepted-mutation observation timed out (`wait_timeout`, `retryable=false`, or the existing `revocation_wait_timeout`); read or wait again. `details.mutation_applied` matches the Computer receipt (false for replay/no-op), and is always null for service lifecycle/removal because L1 provides no applied receipt for these mutations. Do not infer the mutation failed |
 
 With `--json`, errors use the shared `error` envelope on stderr. Typed outcome

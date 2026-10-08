@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -73,6 +74,9 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 			if readErr == nil && json.Unmarshal(body, &failure) == nil && failure.Error.Code != "" {
 				failure.Error.Message = fmt.Sprintf("%s (HTTP %d)", failure.Error.Message, response.StatusCode)
 				return nil, &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
+			}
+			if response.StatusCode >= 500 && response.StatusCode < 600 && readErr == nil {
+				err = fmt.Errorf("%w (%s)", err, responseFailureMessage("view", response.StatusCode, body))
 			}
 			if response.StatusCode == http.StatusUnauthorized {
 				return nil, &ActionError{APIError: contract.APIError{Code: contract.ErrorUnauthorized,
@@ -176,31 +180,43 @@ func Perform(
 		return receipt, nil
 	}
 	var failure contract.ComputerControlErrorResponse
-	if err := json.Unmarshal(body, &failure); err != nil || failure.Error.Code == "" {
-		if response.StatusCode >= 500 && response.StatusCode < 600 {
-			return contract.ComputerControlReceipt{}, &TransportError{cause: fmt.Errorf("Computer %s returned HTTP %d", action, response.StatusCode)}
-		}
-		failure.Error = contract.APIError{Code: contract.ErrorInternal,
-			Message: fmt.Sprintf("Computer %s returned HTTP %d", action, response.StatusCode)}
+	if json.Unmarshal(body, &failure) == nil && failure.Error.Code != "" {
+		return receiptOrZero(failure.Receipt), &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
 	}
-	failure.Error.Retryable = false
+	if response.StatusCode >= 500 && response.StatusCode < 600 {
+		return contract.ComputerControlReceipt{}, &TransportError{cause: errors.New(responseFailureMessage(action, response.StatusCode, body))}
+	}
+	failure = contract.ComputerControlErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal,
+		Message: fmt.Sprintf("Computer %s returned HTTP %d", action, response.StatusCode)}}
 	switch response.StatusCode {
 	case http.StatusUnauthorized:
 		failure.Error.Code = contract.ErrorUnauthorized
 	case http.StatusForbidden:
 		failure.Error.Code = contract.ErrorControlNotAuthorized
 	case http.StatusConflict:
-		if failure.Error.Code != contract.ErrorControllerAlreadyHeld {
-			failure.Error.Code = contract.ErrorControllerBusy
-		}
-		failure.Error.Retryable = failure.Error.Code == contract.ErrorControllerBusy
+		failure.Error.Code = contract.ErrorControllerBusy
+		failure.Error.Retryable = true
 	case http.StatusGone:
 		failure.Error.Code = contract.ErrorTakeoverSessionEnded
-	default:
-		failure.Error = contract.APIError{Code: contract.ErrorInternal,
-			Message: fmt.Sprintf("Computer %s returned HTTP %d", action, response.StatusCode), Retryable: false}
 	}
 	return receiptOrZero(failure.Receipt), &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
+}
+
+// Callers bound the response read to 4096 bytes before retaining a refusal reason.
+func responseFailureMessage(action string, status int, body []byte) string {
+	message := fmt.Sprintf("Computer %s returned HTTP %d", action, status)
+	// Drop invalid UTF-8, including a rune cut by the bounded response read.
+	reason := strings.ToValidUTF8(string(body), "")
+	reason = strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) || r == '\t' {
+			return r
+		}
+		return -1
+	}, reason)
+	if reason = strings.TrimSpace(reason); reason != "" {
+		message += ": " + reason
+	}
+	return message
 }
 
 func parseEndpoint(endpoint string) (*url.URL, error) {

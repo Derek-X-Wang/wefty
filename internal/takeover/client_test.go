@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -80,7 +82,7 @@ func TestOpenAcceptsAndRetainsRawConnectHost(t *testing.T) {
 	}
 }
 
-func TestPerformUsesStructuredControlCodesAndUnknownStatusesAreNotRetryable(t *testing.T) {
+func TestPerformPreservesStructuredControlErrors(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		status    int
@@ -90,13 +92,13 @@ func TestPerformUsesStructuredControlCodesAndUnknownStatusesAreNotRetryable(t *t
 	}{
 		{name: "already held", status: http.StatusConflict, code: contract.ErrorControllerAlreadyHeld, want: contract.ErrorControllerAlreadyHeld},
 		{name: "busy", status: http.StatusConflict, code: contract.ErrorControllerBusy, want: contract.ErrorControllerBusy, retryable: true},
-		{name: "unknown", status: http.StatusBadGateway, code: contract.ErrorTenureUnavailable, want: contract.ErrorInternal},
+		{name: "unavailable", status: http.StatusServiceUnavailable, code: contract.ErrorTenureUnavailable, want: contract.ErrorTenureUnavailable, retryable: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 				writer.WriteHeader(test.status)
 				_ = json.NewEncoder(writer).Encode(contract.ComputerControlErrorResponse{Error: contract.APIError{
-					Code: test.code, Message: "injected", Retryable: true,
+					Code: test.code, Message: "injected", Retryable: test.retryable,
 				}})
 			}))
 			defer server.Close()
@@ -141,3 +143,53 @@ func (*routedFabric) WhoIs(context.Context, string) (fabric.Identity, error) {
 	return fabric.Identity{}, errors.New("unused")
 }
 func (*routedFabric) ConnectHost() string { return "unused" }
+
+func TestOpenStructured5xxIsActionRefusal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(contract.ComputerControlErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorTenureUnavailable, Message: "structured refusal", Retryable: true,
+		}})
+	}))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	_, err := Open(t.Context(), directFabric{}, endpoint)
+	var action *ActionError
+	var transport *TransportError
+	if !errors.As(err, &action) || errors.As(err, &transport) || action.APIError.Code != contract.ErrorTenureUnavailable || !action.APIError.Retryable {
+		t.Fatalf("structured 503 must remain an action refusal: %v", err)
+	}
+}
+
+func TestNonEnvelope5xxReasonSanitized(t *testing.T) {
+	const body = "\x1b[31mComputer\r\n display\x00\x01\x7f\u0085\u200b is\t not ready: 世界"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	for _, action := range []string{"view", "take", "release"} {
+		t.Run(action, func(t *testing.T) {
+			var err error
+			if action == "view" {
+				_, err = Open(t.Context(), directFabric{}, endpoint)
+			} else {
+				_, err = Perform(t.Context(), directFabric{}, endpoint, "session-token", action)
+			}
+			var transport *TransportError
+			if !errors.As(err, &transport) {
+				t.Fatalf("expected transport failure: %v", err)
+			}
+			message := err.Error()
+			for _, r := range message {
+				if !unicode.IsPrint(r) && r != '\t' {
+					t.Fatalf("non-printable rune %U retained in message: %q", r, message)
+				}
+			}
+			if !utf8.ValidString(message) || !strings.Contains(message, "[31mComputer display is\t not ready: 世界") {
+				t.Fatalf("printable reason not preserved: %q", message)
+			}
+		})
+	}
+}
