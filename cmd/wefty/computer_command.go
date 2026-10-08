@@ -643,6 +643,10 @@ func computerGrowOutcomeMismatch(operationRevision int64, message string) error 
 }
 
 func writeComputerProjectionThenError(writer io.Writer, projection computerOperatorProjection, jsonOutput bool, err error) error {
+	var timeout *mutationWaitTimeoutError
+	if errors.As(err, &timeout) && projection.MutationApplied != nil {
+		timeout.mutationApplied = *projection.MutationApplied
+	}
 	if writeErr := writeComputerProjection(writer, projection, jsonOutput); writeErr != nil {
 		return errors.Join(err, writeErr)
 	}

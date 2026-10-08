@@ -766,13 +766,13 @@ func waitForService(
 			if ctx.Err() != nil {
 				return l1.Job{}, ctx.Err()
 			}
-			return l1.Job{}, fmt.Errorf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)
+			return l1.Job{}, &mutationWaitTimeoutError{mutationApplied: true, message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
 		case <-timer.C:
 		}
 		job, err := clients.getService(waitCtx, initial.JobID)
 		if err != nil {
 			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded {
-				return l1.Job{}, fmt.Errorf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)
+				return l1.Job{}, &mutationWaitTimeoutError{mutationApplied: true, message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
 			}
 			return l1.Job{}, err
 		}

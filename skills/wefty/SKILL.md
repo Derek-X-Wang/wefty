@@ -118,7 +118,7 @@ Each of those proves something different, and the difference matters:
 | Exit | Meaning |
 | --- | --- |
 | 0 | the run succeeded |
-| 10 | the run reached a terminal state that is not success; plain mode names why on stderr; `--json` writes the RunRecord on stdout, including any recorded `failure_reason`, with no extra error document |
+| 10 | the run reached a terminal state that is not success; plain mode names why on stderr; `--json` writes the RunRecord on stdout, including its recorded `failure_reason` or a reason derived from execution evidence when none was recorded, with no extra error document |
 | 11 | `--timeout` elapsed; `--json` writes `timed_out=true`, the last observed `status`, and `waited_seconds` on stdout; you may wait again |
 
 All commands share these typed exits:
@@ -135,11 +135,18 @@ All commands share these typed exits:
 | 8 | Custody import failed; read its result document |
 | 9 | Custody import superseded; read its result document |
 | 12 | Cluster not ready; read the readiness reasons and stop submitting |
-| 13 | `unavailable`, `retryable=true`: connection/dial/deadline failure or a non-envelope HTTP 5xx; check reachability and retry with backoff within your authority |
+| 13 | Transport/service availability: `unavailable` for connection/dial/request-deadline failure or non-envelope HTTP 5xx; also HTTP 5xx envelopes with retryable `internal` or `run_ledger_unavailable`. JSON preserves the server code. Check reachability and retry with backoff within your authority |
+| 14 | Accepted-mutation observation timed out (`wait_timeout`, `retryable=false`); read or wait again. `details.mutation_applied` matches the mutation result (false for replay/no-op). Do not infer the mutation failed |
 
 With `--json`, errors use the shared `error` envelope on stderr. Typed outcome
 exits 6–12 use their result document on stdout with no extra error envelope. A
-not-ready status is a readiness verdict, not an internal error. An API error
+not-ready status is a readiness verdict, not an internal error. Exit 14 applies
+to Computer storage/resize/removal and service start/stop/removal `--wait`;
+Computer commands keep their mutation result on stdout and add the timeout
+error on stderr. Run `wait --timeout` keeps exit 11. Grant revocation keeps its
+existing `revocation_wait_timeout` refusal. A bare local deadline is not
+`unavailable`. Non-retryable `internal` or `run_ledger_unavailable` stays exit 1;
+retryability alone cannot change an authority refusal or unknown code. An API error
 with `details.reason="no_route"` means the route or method is unavailable (check
 client/server versions), rather than proving that a resource is absent.
 `--json` can appear before or after the command, but another flag's value (such

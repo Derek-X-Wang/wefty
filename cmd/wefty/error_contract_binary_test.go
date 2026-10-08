@@ -37,7 +37,7 @@ func TestEveryCommandErrorContractFromRealBinary(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(c.status)
 			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
-				Code: c.code, Message: "contract refusal", Retryable: c.code == contract.ErrorInternal || c.code == contract.ErrorUnavailable,
+				Code: c.code, Message: "contract refusal", Retryable: c.code == contract.ErrorUnavailable,
 				Details: map[string]any{"reason": "test"}, RequestID: "upstream-test-id",
 			}})
 		})
