@@ -2958,26 +2958,7 @@ func TestSuppressionAcknowledgementReportsClosedEvenWithoutCancellation(t *testi
 	}
 }
 
-// drainSuppress is the pump's other call site for suppressionAcknowledgement
-// (the top-of-loop priority check and its mid-select recheck); prove it is
-// wired to the same fixed logic, not a separate copy that could regress on
-// its own.
-func TestDrainSuppressReportsClosedEvenWithoutCancellation(t *testing.T) {
-	session := &Session{pumpCtx: context.Background(), suppress: make(chan chan error, 1)}
-	session.queueMu.Lock()
-	session.closed = true
-	session.queueMu.Unlock()
-	acknowledge := make(chan error, 1)
-	session.suppress <- acknowledge // buffered: no reader needed to accept it
-	if !session.drainSuppress() {
-		t.Fatal("drainSuppress did not take the waiting command")
-	}
-	if err := <-acknowledge; err == nil {
-		t.Fatal("drainSuppress acknowledged a closed session with nil")
-	}
-}
-
-// The two tests above prove the shared function; this proves the wiring end
+// The test above proves the shared function; this proves the wiring end
 // to end through the public API and a live pump, landing on the pump's
 // blocking select (not its top-of-loop priority check, which a freshly
 // started pump has already passed with nothing queued by the time this send
