@@ -56,9 +56,14 @@ WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
 `retryable=true`,
 exit 13. This includes non-envelope 5xx from the Computer take-over front door
 on `services takeover view`, `take`, and `release`, such as a plain-text 503
-when the display is not ready or Fabric identity cannot be verified. Structured
-take-over refusals keep their existing classification; a plain-text or structured
-401 authentication refusal exits 3. An unavailable result advises the operator to check reachability and
+when the display is not ready or Fabric identity cannot be verified. The
+unavailable message retains the front door's plain-text reason (bounded to
+4096 response bytes). Structured take-over refusals, including HTTP 5xx on view
+open, take, and release, retain the server's code, message, retryability, details,
+request ID, and any receipt; view open also adds the HTTP status to the message.
+The CLI exit map still applies: `tenure_unavailable` exits 1 even when retryable,
+and is never rewritten to `internal` or transport `unavailable`. A plain-text or
+structured 401 authentication refusal exits 3. An unavailable result advises the operator to check reachability and
 retry with backoff within its authority. A bare `context.DeadlineExceeded` is
 not evidence of unavailability: only a typed transport/service availability
 failure or the named server-envelope cases map to exit 13. Caller cancellation

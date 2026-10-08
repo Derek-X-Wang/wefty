@@ -80,7 +80,7 @@ func TestOpenAcceptsAndRetainsRawConnectHost(t *testing.T) {
 	}
 }
 
-func TestPerformUsesStructuredControlCodesAndUnknownStatusesAreNotRetryable(t *testing.T) {
+func TestPerformPreservesStructuredControlErrors(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		status    int
@@ -90,13 +90,13 @@ func TestPerformUsesStructuredControlCodesAndUnknownStatusesAreNotRetryable(t *t
 	}{
 		{name: "already held", status: http.StatusConflict, code: contract.ErrorControllerAlreadyHeld, want: contract.ErrorControllerAlreadyHeld},
 		{name: "busy", status: http.StatusConflict, code: contract.ErrorControllerBusy, want: contract.ErrorControllerBusy, retryable: true},
-		{name: "unknown", status: http.StatusBadGateway, code: contract.ErrorTenureUnavailable, want: contract.ErrorInternal},
+		{name: "unavailable", status: http.StatusServiceUnavailable, code: contract.ErrorTenureUnavailable, want: contract.ErrorTenureUnavailable, retryable: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 				writer.WriteHeader(test.status)
 				_ = json.NewEncoder(writer).Encode(contract.ComputerControlErrorResponse{Error: contract.APIError{
-					Code: test.code, Message: "injected", Retryable: true,
+					Code: test.code, Message: "injected", Retryable: test.retryable,
 				}})
 			}))
 			defer server.Close()
@@ -141,3 +141,20 @@ func (*routedFabric) WhoIs(context.Context, string) (fabric.Identity, error) {
 	return fabric.Identity{}, errors.New("unused")
 }
 func (*routedFabric) ConnectHost() string { return "unused" }
+
+func TestOpenStructured5xxIsActionRefusal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(contract.ComputerControlErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorTenureUnavailable, Message: "structured refusal", Retryable: true,
+		}})
+	}))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	_, err := Open(t.Context(), directFabric{}, endpoint)
+	var action *ActionError
+	var transport *TransportError
+	if !errors.As(err, &action) || errors.As(err, &transport) || action.APIError.Code != contract.ErrorTenureUnavailable || !action.APIError.Retryable {
+		t.Fatalf("structured 503 must remain an action refusal: %v", err)
+	}
+}
