@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -38,6 +39,12 @@ type apiClient struct {
 	client  *http.Client
 }
 
+// unavailableError preserves the cause for deadline and cancellation checks.
+type unavailableError struct{ cause error }
+
+func (e *unavailableError) Error() string { return e.cause.Error() }
+func (e *unavailableError) Unwrap() error { return e.cause }
+
 type apiResponseError struct {
 	Service    string
 	StatusCode int
@@ -65,7 +72,7 @@ func newAPIClients(participant fabric.Fabric, l1Address, l3Address string) (*api
 		return nil, fmt.Errorf("fabric is required")
 	}
 	if strings.TrimSpace(l1Address) == "" {
-		return nil, fmt.Errorf("--l1 is required (or set %s)", l1AddressEnv)
+		return nil, usageError(fmt.Sprintf("--l1 is required (or set %s)", l1AddressEnv))
 	}
 	l3Client := &apiClient{name: "L3", flag: "l3", address: strings.TrimSpace(l3Address)}
 	if strings.TrimSpace(l3Address) != "" {
@@ -726,7 +733,7 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 
 func (c *apiClient) doWithResponse(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) (http.Header, error) {
 	if c.client == nil {
-		return nil, fmt.Errorf("this command requires --%s, which is not configured", c.flag)
+		return nil, usageError(fmt.Sprintf("this command requires --%s, which is not configured", c.flag))
 	}
 	var reader io.Reader
 	if body != nil {
@@ -748,17 +755,17 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	}
 	response, err := c.client.Do(request)
 	if err != nil {
-		if ctx.Err() != nil {
+		if errors.Is(err, context.Canceled) {
 			return nil, fmt.Errorf("call %s: %w", c.name, err)
 		}
 		// A transport failure is almost always the wrong address or a
 		// service that is not running, and the fix is to say where to look.
-		return nil, fmt.Errorf("call %s at %s: %w (%s)", c.name, c.address, err, c.addressHint())
+		return nil, &unavailableError{cause: fmt.Errorf("call %s at %s: %w (%s)", c.name, c.address, err, c.addressHint())}
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
-		return nil, fmt.Errorf("read %s response: %w", c.name, err)
+		return nil, &unavailableError{cause: fmt.Errorf("read %s response: %w", c.name, err)}
 	}
 	for _, status := range success {
 		if response.StatusCode == status {
@@ -775,5 +782,9 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	if err := json.Unmarshal(responseBody, &responseError); err == nil && responseError.Error.Code != "" {
 		return response.Header.Clone(), &apiResponseError{Service: c.name, StatusCode: response.StatusCode, APIError: responseError.Error}
 	}
-	return response.Header.Clone(), fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
+	failure := fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
+	if response.StatusCode >= 500 {
+		return response.Header.Clone(), &unavailableError{cause: failure}
+	}
+	return response.Header.Clone(), failure
 }

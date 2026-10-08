@@ -219,9 +219,9 @@ func executeComputerBackups(ctx context.Context, clients *apiClients, jsonOutput
 	}
 }
 
-func newStorageFlagSet(name string, stderr io.Writer) *flag.FlagSet {
+func newStorageFlagSet(name string, stderr io.Writer, jsonOutput bool) *flag.FlagSet {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	return flags
 }
 
@@ -236,7 +236,7 @@ func parseStorageFlags(flags *flag.FlagSet, args []string, leadingPositionals in
 }
 
 func executeComputerBackupCreate(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := newStorageFlagSet("services backup create", stderr)
+	flags := newStorageFlagSet("services backup create", stderr, jsonOutput)
 	var mutation storageMutationFlags
 	var wait storageWaitFlags
 	var allowPowerOff bool
@@ -291,7 +291,7 @@ func executeComputerBackupCreate(ctx context.Context, clients *apiClients, jsonO
 }
 
 func executeComputerBackupPrune(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := newStorageFlagSet("services backup prune", stderr)
+	flags := newStorageFlagSet("services backup prune", stderr, jsonOutput)
 	var mutation storageMutationFlags
 	var wait storageWaitFlags
 	mutation.bind(flags, true)
@@ -337,7 +337,7 @@ func executeComputerBackupPrune(ctx context.Context, clients *apiClients, jsonOu
 }
 
 func executeComputerBackupSetCap(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := newStorageFlagSet("services backup set-cap", stderr)
+	flags := newStorageFlagSet("services backup set-cap", stderr, jsonOutput)
 	var mutation storageMutationFlags
 	var capValue optionalRevisionFlag
 	mutation.bind(flags, false)
@@ -370,7 +370,7 @@ func executeComputerBackupSetCap(ctx context.Context, clients *apiClients, jsonO
 }
 
 func executeComputerRestore(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := newStorageFlagSet("services restore", stderr)
+	flags := newStorageFlagSet("services restore", stderr, jsonOutput)
 	var mutation storageMutationFlags
 	var wait storageWaitFlags
 	var keepOld, retireOld bool
@@ -427,7 +427,7 @@ func executeComputerRestore(ctx context.Context, clients *apiClients, jsonOutput
 }
 
 func executeComputerClone(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := newStorageFlagSet("services clone", stderr)
+	flags := newStorageFlagSet("services clone", stderr, jsonOutput)
 	var mutation storageMutationFlags
 	var wait storageWaitFlags
 	var name string
@@ -610,7 +610,7 @@ func executeComputerCustody(ctx context.Context, clients *apiClients, jsonOutput
 }
 
 func executeComputerCustodyExport(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := newStorageFlagSet("services custody export", stderr)
+	flags := newStorageFlagSet("services custody export", stderr, jsonOutput)
 	var mutation storageMutationFlags
 	var wait storageWaitFlags
 	var externalPath string
@@ -664,7 +664,7 @@ func executeComputerCustodyExport(ctx context.Context, clients *apiClients, json
 }
 
 func executeComputerCustodyImport(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := newStorageFlagSet("services custody import", stderr)
+	flags := newStorageFlagSet("services custody import", stderr, jsonOutput)
 	var wait storageWaitFlags
 	var name, nodeID, externalPath, manifestPath, manifestDigest, idempotencyKey string
 	var diskBytes optionalRevisionFlag
@@ -728,7 +728,7 @@ func executeComputerCustodyImport(ctx context.Context, clients *apiClients, json
 }
 
 func executeComputerCustodyAttest(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
-	flags := newStorageFlagSet("services custody attest", stderr)
+	flags := newStorageFlagSet("services custody attest", stderr, jsonOutput)
 	var idempotencyKey string
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable immutable attestation key")
 	if err := parseStorageFlags(flags, args, 1); err != nil {

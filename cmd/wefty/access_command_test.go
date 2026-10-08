@@ -542,8 +542,8 @@ func TestAccessCLIErrorProjectionAndScopedExitCodes(t *testing.T) {
 	if got := commandExitCodeForArgs(usage, []string{"services", "takeover", "view"}); got != exitUsage {
 		t.Fatalf("access usage exit = %d", got)
 	}
-	if got := commandExitCodeForArgs(usage, []string{"services", "status"}); got != exitFailure {
-		t.Fatalf("pre-existing command exit = %d, want historical %d", got, exitFailure)
+	if got := commandExitCodeForArgs(usage, []string{"services", "status"}); got != exitUsage {
+		t.Fatalf("pre-existing command exit = %d, want %d", got, exitUsage)
 	}
 	for _, code := range []contract.ErrorCode{contract.ErrorPersonIdentityRequired, contract.ErrorPrincipalForbidden} {
 		err := &apiResponseError{APIError: contract.APIError{Code: code}}

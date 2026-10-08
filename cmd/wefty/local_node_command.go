@@ -74,7 +74,7 @@ func executeLocalDoctor(ctx context.Context, client *ocicontrol.Client, jsonOutp
 
 func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("node setup-oci", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	defaults, err := lima.HostDefaultSizing()
 	if err != nil {
 		return err
@@ -83,7 +83,7 @@ func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOu
 	applyRestart := flags.Bool("apply-restart", false, "apply restart-required Lima template changes")
 	recreate := flags.Bool("recreate", false, "apply recreate-required Lima template changes with zero live OCI attempts")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 0 {
 		return usageError("wefty node setup-oci does not accept positional arguments")
@@ -178,7 +178,7 @@ func executeLocalOCIRemovals(ctx context.Context, client *ocicontrol.Client, jso
 func executeLocalLoadImage(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("node load-image", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	// An archive exported by digest alone carries no name the import can be
 	// keyed by. Naming it here is what lets two variants of one repository be
 	// imported offline side by side instead of colliding (#418).

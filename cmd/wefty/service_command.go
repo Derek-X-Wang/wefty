@@ -83,7 +83,7 @@ func executeServiceCreate(
 	stdout, stderr io.Writer,
 ) error {
 	flags := flag.NewFlagSet("services create", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var scriptPath, idempotencyKey, restart, instanceKey string
 	var computer bool
 	var computerName string
@@ -107,7 +107,7 @@ func executeServiceCreate(
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable service creation idempotency key")
 	flags.StringVar(&instanceKey, "instance-key", "", "reserve this instance key in the authenticated app namespace")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 0 {
 		return usageError("services create does not accept positional arguments")
@@ -292,13 +292,13 @@ func executeServiceList(
 	stdout, stderr io.Writer,
 ) error {
 	flags := flag.NewFlagSet("services list", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var cursor string
 	var limit int
 	flags.StringVar(&cursor, "cursor", "", "opaque cursor from the previous page")
 	flags.IntVar(&limit, "limit", l1.DefaultJobPageLimit, "services per page")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 0 {
 		return usageError("services list does not accept positional arguments")
@@ -401,14 +401,14 @@ func executeServiceDesiredState(
 		verb = "stop"
 	}
 	flags := flag.NewFlagSet("services "+verb, flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var wait, pollInterval time.Duration
 	var mutation computerMutationFlags
 	flags.DurationVar(&wait, "wait", 0, "wait up to this duration for observed completion")
 	flags.DurationVar(&pollInterval, "poll-interval", defaultServicePollInterval, "wait polling interval")
 	mutation.bind(flags, false)
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services " + verb + " JOB_ID [--wait DURATION]")
@@ -479,11 +479,11 @@ func executeServiceRestart(
 ) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services restart", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var mutation computerMutationFlags
 	mutation.bind(flags, true)
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services restart JOB_ID --idempotency-key KEY")
@@ -543,14 +543,14 @@ func executeServiceRemove(
 ) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services remove", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var wait storageWaitFlags
 	var mutation computerMutationFlags
 	wait.pollInterval = defaultServicePollInterval
 	wait.bind(flags)
 	mutation.bind(flags, false)
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services remove JOB_ID [--wait DURATION]")
@@ -631,11 +631,11 @@ func executeServiceForget(
 ) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services forget", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var force bool
 	flags.BoolVar(&force, "force", false, "waive cleanup proof without cancelling the deletion directive")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services forget JOB_ID --force")
@@ -659,7 +659,7 @@ func executeServiceLogs(
 ) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services logs", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var follow bool
 	var followFor, pollInterval time.Duration
 	var limit int
@@ -668,7 +668,7 @@ func executeServiceLogs(
 	flags.DurationVar(&pollInterval, "poll-interval", defaultServicePollInterval, "follow polling interval")
 	flags.IntVar(&limit, "limit", l1.DefaultLogPageLimit, "events per poll")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services logs JOB_ID [--follow]")

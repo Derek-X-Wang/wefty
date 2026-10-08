@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -20,6 +21,8 @@ import (
 )
 
 type ServerConfig struct {
+	// Logf receives error request completion events; nil uses log.Printf.
+	Logf               func(string, ...any)
 	CallerPrincipalTag string
 	ControlPlaneNodeID string
 	Reconciler         *Reconciler
@@ -31,6 +34,7 @@ type ServerConfig struct {
 }
 
 type Server struct {
+	logf                func(string, ...any)
 	fabric              fabric.Fabric
 	store               *Store
 	callerPrincipalTag  string
@@ -84,7 +88,15 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, controlPlaneNodeID: controlPlaneNodeID,
 		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, results: results, computerGrants: computerGrants,
 		hostBootSessions: hostBootSessions}
-	server.handler = server.routes()
+	server.logf = config.Logf
+	if server.logf == nil {
+		server.logf = log.Printf
+	}
+	server.handler = contract.ObserveHTTPRequests("l3", func(format string, args ...any) {
+		if server.logf != nil {
+			server.logf(format, args...)
+		}
+	}, server.routes())
 	return server, nil
 }
 
@@ -1089,5 +1101,5 @@ func writeError(w http.ResponseWriter, err error) {
 		apiError.Message = "internal server error"
 		apiError.Details = nil
 	}
-	writeJSON(w, status, contract.ErrorResponse{Error: apiError})
+	writeJSON(w, status, contract.ErrorResponse{Error: contract.AttachRequestID(w, apiError)})
 }

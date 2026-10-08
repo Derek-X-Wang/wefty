@@ -69,7 +69,9 @@ const (
 	// had a bug and told node agents to retry a call that could never succeed
 	// until a human changed the deployment (wefty #548).
 	ErrorRunLedgerUnavailable ErrorCode = "run_ledger_unavailable"
-	ErrorInternal             ErrorCode = "internal"
+	// ErrorUnavailable names transport or service availability failures.
+	ErrorUnavailable ErrorCode = "unavailable"
+	ErrorInternal    ErrorCode = "internal"
 )
 
 // APIError is the single error shape shared by every HTTP protocol. Retryable

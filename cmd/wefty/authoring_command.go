@@ -29,8 +29,7 @@ func executeAuthoringCommand(options globalOptions, args []string, stdout, stder
 
 // asUsageError gives an authoring mistake wefty's ordinary usage-error shape,
 // so `--json` renders it as an invalid_request error like any other. The
-// process exits 1: exit 2 is a typed contract only on the Computer, access and
-// Storage surfaces, and this surface does not claim one.
+// process exits 2, like usage errors on every other command surface.
 func asUsageError(err error) error {
 	var usage workflowhelper.UsageError
 	if errors.As(err, &usage) {

@@ -465,11 +465,12 @@ func TestAttemptCredentialCannotActOnAnotherJob(t *testing.T) {
 		t.Fatalf("cross-job children status = %d body=%s, want %d", status, body, http.StatusForbidden)
 	}
 
-	// An absent job answers byte-for-byte like a foreign one, so the read route
+	// Apart from its independent request ID, an absent job answers like a
+	// foreign one, so the read route
 	// is not an existence probe over the whole job collection.
 	absentStatus, absentBody := h.credentialRequest(agentOne, http.MethodGet, "/v1/jobs/job_does_not_exist", claimA.AttemptToken, nil)
-	if absentStatus != foreignStatus || !bytes.Equal(absentBody, foreignBody) {
-		t.Fatalf("absent job answered %d %s but a foreign job answered %d %s; they must be identical",
+	if absentStatus != foreignStatus || !bytes.Equal(errorBodyWithoutRequestID(t, absentBody), errorBodyWithoutRequestID(t, foreignBody)) {
+		t.Fatalf("absent job answered %d %s but a foreign job answered %d %s; they must be identical apart from request IDs",
 			absentStatus, absentBody, foreignStatus, foreignBody)
 	}
 

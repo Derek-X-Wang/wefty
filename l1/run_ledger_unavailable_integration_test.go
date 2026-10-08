@@ -235,7 +235,7 @@ func TestTypedErrorsAreNotLoggedAsScrubbedCauses(t *testing.T) {
 	}))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/v1/computers/computer-1/desired-state", nil))
-	if logs.text() != "" {
+	if strings.Contains(logs.text(), "event=l1_internal_error_scrubbed") {
 		t.Fatalf("a typed refusal was logged as a scrubbed cause: %s", logs.text())
 	}
 }

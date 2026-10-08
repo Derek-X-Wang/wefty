@@ -99,7 +99,7 @@ func newComputerProjection(computer l1.Computer, mutationApplied, replay *bool) 
 
 func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("services create", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var name, idempotencyKey string
 	var backupCap int64
 	var diskBytes optionalInt64Flag
@@ -110,7 +110,7 @@ func executeComputerCreate(ctx context.Context, clients *apiClients, jsonOutput 
 	flags.Var(&diskBytes, "disk-bytes", "fully allocated Computer disk budget")
 	imageFlags.bind(flags)
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 0 || strings.TrimSpace(name) == "" || strings.TrimSpace(imageFlags.reference) == "" || strings.TrimSpace(imageFlags.nodeID) == "" || backupCap < 0 {
 		return usageError("usage: wefty services create --computer --name NAME --image IMAGE --node NODE_ID [--argv ARG] [--working-directory PATH] [--mount NODE_PATH:CONTAINER_PATH[:ro]] [--memory-bytes BYTES] [--cpu-millicores VALUE] [--runtime-handler NAME] [--disk-bytes BYTES] [--backup-cap COUNT] [--idempotency-key KEY]")
@@ -308,7 +308,7 @@ func writeComputerMutation(stdout io.Writer, computer l1.Computer, receipt mutat
 func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services reimage", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var mutation computerMutationFlags
 	var image string
 	var chown, terminateSessions bool
@@ -317,7 +317,7 @@ func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput
 	flags.BoolVar(&chown, "chown", false, "authorize the crash-resumable ownership migration")
 	flags.BoolVar(&terminateSessions, "terminate-sessions", false, "close live take-over sessions before reimage")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(image) == "" {
 		return usageError("usage: wefty services reimage COMPUTER --image IMAGE --idempotency-key KEY [CAS flags | --expect-current]")
@@ -366,13 +366,13 @@ func executeComputerReimage(ctx context.Context, clients *apiClients, jsonOutput
 func executeComputerReset(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services reset", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var mutation computerMutationFlags
 	var terminateSessions bool
 	mutation.bind(flags, true)
 	flags.BoolVar(&terminateSessions, "terminate-sessions", false, "close live take-over sessions before reset")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services reset COMPUTER --idempotency-key KEY [CAS flags | --expect-current]")
@@ -404,7 +404,7 @@ func executeComputerReset(ctx context.Context, clients *apiClients, jsonOutput b
 func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services resize", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var mutation computerMutationFlags
 	var diskBytes optionalInt64Flag
 	var wait storageWaitFlags
@@ -412,7 +412,7 @@ func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput 
 	wait.bind(flags)
 	flags.Var(&diskBytes, "disk-bytes", "new fully allocated disk budget")
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 || !diskBytes.set {
 		return usageError("usage: wefty services resize COMPUTER --disk-bytes BYTES --idempotency-key KEY [CAS flags | --expect-current] [--wait DURATION]")
@@ -652,11 +652,11 @@ func writeComputerProjectionThenError(writer io.Writer, projection computerOpera
 func executeComputerAbort(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services abort", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var mutation computerMutationFlags
 	mutation.bind(flags, true)
 	if err := flags.Parse(args); err != nil {
-		return err
+		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services abort COMPUTER --idempotency-key KEY [CAS flags | --expect-current]")

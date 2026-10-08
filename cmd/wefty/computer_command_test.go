@@ -832,8 +832,8 @@ func assertComputerCLIUsageForeignIDAndRoutePaginationErrors(t *testing.T) {
 
 	plainArgs := []string{"services", "status", "job-foreign"}
 	err = execute(ctx, harness.clients, true, plainArgs, &stdout, &stderr)
-	if err == nil || commandExitCodeForArgs(err, plainArgs) != exitFailure {
-		t.Fatalf("pre-existing service exit changed = %T %v exit=%d", err, err, commandExitCodeForArgs(err, plainArgs))
+	if err == nil || commandExitCodeForArgs(err, plainArgs) != exitNotFound {
+		t.Fatalf("service not-found exit = %T %v exit=%d", err, err, commandExitCodeForArgs(err, plainArgs))
 	}
 }
 

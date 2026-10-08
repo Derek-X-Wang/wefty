@@ -109,7 +109,9 @@ func TestStatusExitsTwelveFromTheRealBinary(t *testing.T) {
 		t.Fatalf("`wefty --json status` exited %d, want %d:\n%s", code, exitNotReady, output)
 	}
 	var status clusterStatus
-	if err := json.Unmarshal([]byte(firstJSONDocument(output)), &status); err != nil {
+	// The status verdict is stdout; a JSON error envelope on stderr may follow
+	// it in this helper's combined output. Decode the verdict document alone.
+	if err := json.NewDecoder(strings.NewReader(output)).Decode(&status); err != nil {
 		t.Fatalf("status --json is not JSON: %v\n%s", err, output)
 	}
 	if status.Ready {

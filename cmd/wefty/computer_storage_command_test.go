@@ -675,8 +675,8 @@ func TestComputerStorageCLIUsageIsTypedJSONAndWaitReportsAcceptedMutation(t *tes
 			t.Fatalf("typed JSON usage = %s", encoded.String())
 		}
 	}
-	if got := commandExitCodeForArgs(usageError("bad"), []string{"services", "status"}); got != exitFailure {
-		t.Fatalf("pre-existing services status exit = %d, want %d", got, exitFailure)
+	if got := commandExitCodeForArgs(usageError("bad"), []string{"services", "status"}); got != exitUsage {
+		t.Fatalf("pre-existing services status exit = %d, want %d", got, exitUsage)
 	}
 
 	output := storageMutationOutput{MutationApplied: true, Observation: &storageWaitObservation{Status: "failed", Error: "context deadline exceeded"}}

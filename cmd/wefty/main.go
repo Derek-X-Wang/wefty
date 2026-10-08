@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"slices"
 	"strings"
 	"syscall"
 
@@ -28,88 +27,10 @@ func main() {
 	}
 }
 
-// commandExitCodeForArgs keeps exit 1 for commands without a published typed
-// exit contract. Service creation, Computer lifecycle/access/Storage, and the
-// explicitly listed operator surfaces publish typed exits. Keep this dispatch
-// and the documented codes in step; real-binary tests verify the process result.
-func commandExitCodeForArgs(err error, args []string) int {
-	if !isTypedExitCLIArgs(args) {
-		return exitFailure
-	}
+// Every command publishes the same typed exit map. Keep this process boundary
+// unconditional so new command surfaces cannot silently collapse typed exits.
+func commandExitCodeForArgs(err error, _ []string) int {
 	return commandExitCode(err)
-}
-
-// typedExitCommands are the single-word commands whose exit code is part of
-// what they promise. `status` answers with 12 when a cluster cannot take work
-// and `wait` with 10 or 11; both are useless if the process exits 1 instead.
-var typedExitCommands = []string{"whoami", "status", "wait", "cancel"}
-
-func isTypedExitCLIArgs(args []string) bool {
-	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
-		len(commandArgs) >= 1 && (commandArgs[0] == "jobs" || commandArgs[0] == "computers") {
-		return true
-	}
-	// Reuse the global parser so both --l1=ADDR and --l1 ADDR select
-	// the service creation exit contract.
-	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil && len(commandArgs) > 0 && (commandArgs[0] == "drain" || commandArgs[0] == "nodes") {
-		return true
-	}
-	if _, commandArgs, err := parseGlobalOptions(args, io.Discard); err == nil &&
-		len(commandArgs) >= 2 && commandArgs[0] == "services" && commandArgs[1] == "create" {
-		return true
-	}
-	for _, arg := range args {
-		if !strings.HasPrefix(arg, "-") {
-			if slices.Contains(typedExitCommands, arg) {
-				return true
-			}
-			break
-		}
-	}
-	if isComputerCLIArgs(args) {
-		return true
-	}
-	positionals := []string{}
-	for _, arg := range args {
-		if !strings.HasPrefix(arg, "-") {
-			positionals = append(positionals, arg)
-		}
-	}
-	if len(positionals) >= 2 && positionals[0] == "admin" && positionals[1] == "policy" {
-		return true
-	}
-	if len(positionals) >= 1 && positionals[0] == "admins" {
-		return true
-	}
-	return len(positionals) >= 2 && positionals[0] == "services" &&
-		(positionals[1] == "grant" || positionals[1] == "grants" || positionals[1] == "revoke" || positionals[1] == "takeover" ||
-			positionals[1] == "backup" || positionals[1] == "restore" || positionals[1] == "clone" || positionals[1] == "custody")
-}
-
-func isComputerCLIArgs(args []string) bool {
-	positionals := make([]string, 0, 3)
-	for _, arg := range args {
-		if !strings.HasPrefix(arg, "-") {
-			positionals = append(positionals, arg)
-		}
-	}
-	if len(positionals) < 2 || positionals[0] != "services" {
-		return false
-	}
-	switch positionals[1] {
-	case "reimage", "reset", "resize", "abort", "submission":
-		return true
-	case "create":
-		return hasArg(args, "--computer")
-	case "status", "start", "stop", "restart", "remove":
-		// These shared verbs return typed exits only when Computer-specific CAS
-		// flags identify the new authority surface. Plain Job behavior remains 1.
-		target := positionals[len(positionals)-1]
-		return strings.HasPrefix(target, "computer_") || strings.HasPrefix(target, "computer-") || hasArg(args, "--expect-current") ||
-			hasArg(args, "--intent-revision") || hasArg(args, "--storage-id") || hasArg(args, "--storage-generation")
-	default:
-		return false
-	}
 }
 
 func hasArg(args []string, name string) bool {
@@ -140,6 +61,8 @@ const (
 	// cluster cannot take work, which is a different thing from the command
 	// failing and gets its own code so a script can tell them apart.
 	exitNotReady = 12
+	// exitUnavailable tells an operator that the transport or service may recover.
+	exitUnavailable = 13
 )
 
 func commandExitCode(err error) int {
@@ -172,6 +95,10 @@ func commandExitCode(err error) int {
 	if errors.As(err, &waitTimeout) {
 		return exitWaitTimeout
 	}
+	var unavailable *unavailableError
+	if errors.As(err, &unavailable) || errors.Is(err, context.DeadlineExceeded) {
+		return exitUnavailable
+	}
 	var apiError contract.APIError
 	var localErr *ocicontrol.ResponseError
 	var responseErr *apiResponseError
@@ -187,6 +114,8 @@ func commandExitCode(err error) int {
 		return exitFailure
 	}
 	switch apiError.Code {
+	case contract.ErrorUnavailable:
+		return exitUnavailable
 	case contract.ErrorInvalidRequest:
 		return exitUsage
 	case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorPrincipalForbidden,
@@ -206,6 +135,24 @@ func commandExitCode(err error) int {
 }
 
 func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
+	// These typed outcomes have already written their result document to stdout.
+	// A second error document would mislabel the verdict and corrupt JSON output.
+	if jsonOutput {
+		var custody *custodyImportOutcomeError
+		var outcome *runOutcomeError
+		var notReady *notReadyError
+		var timeout *waitTimeoutError
+		if errors.As(err, &custody) || errors.As(err, &outcome) || errors.As(err, &notReady) || errors.As(err, &timeout) {
+			return
+		}
+		var unavailable *unavailableError
+		if errors.As(err, &unavailable) || errors.Is(err, context.DeadlineExceeded) {
+			_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
+				Code: contract.ErrorUnavailable, Message: err.Error(), Retryable: true,
+			}})
+			return
+		}
+	}
 	var usage usageError
 	if jsonOutput && errors.As(err, &usage) {
 		_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
@@ -235,16 +182,27 @@ func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
 		}
 		return
 	}
+	if jsonOutput {
+		_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorInternal, Message: err.Error(), Retryable: false,
+		}})
+		return
+	}
 	_, _ = fmt.Fprintf(writer, "wefty: %v\n", err)
 }
 
-func hasJSONFlag(args []string) bool {
-	for _, arg := range args {
-		if arg == "--json" {
-			return true
-		}
+// Only flag diagnostics are suppressed: command warnings retain their normal
+// stderr path, while usage failures get one machine-readable error document.
+func flagErrorOutput(stderr io.Writer, jsonOutput bool) io.Writer {
+	if jsonOutput {
+		return io.Discard
 	}
-	return false
+	return stderr
+}
+
+func hasJSONFlag(args []string) bool {
+	_, enabled, err := removeBoolFlag(args, "--json")
+	return enabled || err != nil
 }
 
 type globalOptions struct {
@@ -355,9 +313,13 @@ func requiresPersonCommand(args []string) bool {
 
 func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []string, error) {
 	options := globalOptions{}
-	args, options.jsonOutput = removeBoolFlag(args, "--json")
+	var err error
+	args, options.jsonOutput, err = removeBoolFlag(args, "--json")
+	if err != nil {
+		return options, nil, err
+	}
 	flags := flag.NewFlagSet("wefty", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	flags.StringVar(&options.fabricMode, "fabric", "plain", "fabric implementation: plain or tsnet")
 	// The addresses default from the environment so a shell that exported
 	// them once -- as the README and the acceptance docs do -- does not have
@@ -382,7 +344,7 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
 	flags.BoolVar(&options.printEnrollmentURL, "fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
 	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by singular node commands")
-	flags.Usage = func() { fmt.Fprint(stderr, rootUsage) }
+	flags.Usage = func() { fmt.Fprint(flags.Output(), rootUsage) }
 	if err := flags.Parse(args); err != nil {
 		return globalOptions{}, nil, err
 	}
@@ -422,20 +384,11 @@ func defaultNodeConfigPath() string {
 	return path
 }
 
-func removeBoolFlag(args []string, name string) ([]string, bool) {
-	filtered := make([]string, 0, len(args))
-	found := false
-	for _, arg := range args {
-		if arg == name {
-			found = true
-			continue
-		}
-		filtered = append(filtered, arg)
-	}
-	return filtered, found
-}
-
 const rootUsage = `Usage: wefty [global flags] <command>
+
+--json[=true|false] is accepted before or after a command and its arguments.
+Every command uses typed exits: usage 2, unauthorized 3, not found 4,
+conflict 5, unavailable 13, other failure 1. JSON errors go to stderr.
 
 Commands:
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
