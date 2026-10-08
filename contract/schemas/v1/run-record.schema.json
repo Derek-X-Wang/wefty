@@ -16,6 +16,17 @@
     "updated_at"
   ],
   "properties": {
+    "dispatch_hold": {
+        "description": "Ledger-wide admission condition, projected only onto Runs waiting to submit. Never a Run outcome.",
+        "type": "object", "additionalProperties": false,
+        "required": ["generation", "reason", "since", "next_probe_at"],
+        "properties": {
+          "generation": { "type": "integer", "minimum": 1 },
+          "reason": { "type": "string" },
+          "since": { "type": "string", "format": "date-time" },
+          "next_probe_at": { "type": "string", "format": "date-time" }
+        }
+      },
     "schema_version": { "const": 1 },
     "run_id": { "$ref": "#/$defs/id" },
     "l1_job_id": { "$ref": "#/$defs/id" },

@@ -391,3 +391,18 @@ func stepBracketEnvelope(id, name, status string, created time.Time) contract.En
 		Extensions: extensions, CreatedAt: created,
 	}
 }
+
+func TestRunListingShowsDispatchHold(t *testing.T) {
+	since := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
+	var out bytes.Buffer
+	page := runListingPage{Runs: []runListingRow{{RunSummary: l3.RunSummary{RunID: "held", Status: contract.RunPending, CreatedAt: since, DispatchHold: &contract.DispatchHold{Generation: 1, Reason: "run_identity_not_entitled", Since: since, NextProbeAt: since.Add(time.Second)}}}}}
+	clients := ledgerStub(t, map[string]any{"/v1/runs": l3.RunListPage{Runs: []l3.RunSummary{page.Runs[0].RunSummary}}})
+	if err := executeRuns(t.Context(), clients, false, []string{"list"}, &out, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"pending", "dispatch held", "run_identity_not_entitled", since.Format(time.RFC3339)} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("hold not visible (%s): %s", want, out.String())
+		}
+	}
+}

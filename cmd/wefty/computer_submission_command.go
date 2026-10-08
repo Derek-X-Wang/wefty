@@ -319,6 +319,9 @@ func writeRunListing(writer io.Writer, page runListingPage, now time.Time) error
 	var unschedulable []runListingRow
 	for _, run := range page.Runs {
 		status := string(run.Status)
+		if run.DispatchHold != nil {
+			status += " (dispatch held: " + run.DispatchHold.Reason + " since " + run.DispatchHold.Since.Format(time.RFC3339) + ")"
+		}
 		if run.UnschedulableReason != "" {
 			status += " (no eligible node)"
 			unschedulable = append(unschedulable, run)

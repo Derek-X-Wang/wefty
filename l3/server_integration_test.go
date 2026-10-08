@@ -305,7 +305,7 @@ type permanentSubmitErrorClient struct {
 
 func (c *permanentSubmitErrorClient) SubmitJob(ctx context.Context, spec contract.JobSpec) (l1.Job, error) {
 	if spec.Labels["run_id"] == c.runID {
-		return l1.Job{}, &Error{Code: contract.ErrorDispatchKeyConflict, Message: "dispatch key conflict", Retryable: false}
+		return l1.Job{}, &l1ResponseError{status: http.StatusConflict, method: http.MethodPost, path: "/v1/jobs", validEnvelope: true, protocol: &Error{Code: contract.ErrorDispatchKeyConflict, Message: "dispatch key conflict", Retryable: false}}
 	}
 	return c.JobClient.SubmitJob(ctx, spec)
 }
@@ -357,6 +357,7 @@ func TestDispatchRecoveryCreatesExactlyOneL1JobAndPreservesScript(t *testing.T) 
 	// never recorded the response. A fresh process must replay the same key.
 	h.restartLedger()
 
+	h.l3Store.clock = &mutableClock{now: time.Now().Add(time.Second)}
 	restarted, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
 	if err != nil {
 		t.Fatal(err)

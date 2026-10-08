@@ -213,7 +213,7 @@ func TestCancelRound2Ledger401HTTP(t *testing.T) {
 			if strings.Contains(string(body), "ledger unknown") {
 				t.Fatalf("internal cause leaked: %s", body)
 			}
-			assertAPIError(t, status, body, http.StatusServiceUnavailable, contract.ErrorInternal)
+			assertAPIError(t, status, body, http.StatusServiceUnavailable, contract.ErrorUnavailable)
 			var response contract.ErrorResponse
 			_ = json.Unmarshal(body, &response)
 			if !response.Error.Retryable {

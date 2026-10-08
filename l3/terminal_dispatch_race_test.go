@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -65,6 +66,7 @@ func TestRetryForARunThatEndedBeforeItsAttemptDoesNotSubmit(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	h.l3Store.clock = &mutableClock{now: time.Now().Add(time.Second)}
 	client.failAll = false
 	if err := reconciler.ReconcileOnce(ctx); err != nil {
 		t.Fatalf("an abandoned attempt is not a pass error: %v", err)

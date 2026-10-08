@@ -7,6 +7,19 @@
   },
   "servers": [{ "url": "wefty://run-ledger" }],
   "paths": {
+    "/v1/health": {
+      "get": {
+        "operationId": "getLedgerHealth",
+        "summary": "Read ledger dispatch admission independently of Run acceptance",
+        "security": [{ "fabricIdentity": [] }],
+        "responses": {
+          "200": { "description": "Ledger dispatch condition; an absent hold means no admission hold is recorded.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DispatchHealth" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
+        }
+      }
+    },
     "/v1/computer-token/mint": {
       "post": {
         "operationId": "mintComputerToken",
@@ -19,7 +32,8 @@
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -35,7 +49,8 @@
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -50,7 +65,8 @@
           "200": { "description": "Current count across every Storage generation.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerInflightState" } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -64,7 +80,8 @@
           "204": { "description": "The exact host-bound attempt grant is revoked." },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
-          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -79,7 +96,8 @@
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -91,7 +109,8 @@
         "responses": {
           "200": { "description": "Bound identity, current Storage generation, grant revision, and permissions only.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ComputerSelf" } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
-          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -125,7 +144,8 @@
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -158,7 +178,8 @@
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -183,7 +204,8 @@
           },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
-          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       },
       "post": {
@@ -312,7 +334,8 @@
           },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "422": { "$ref": "./common.v1.json#/components/responses/UnprocessableEntity" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -336,7 +359,8 @@
           },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -358,7 +382,8 @@
           },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -381,7 +406,8 @@
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -421,7 +447,8 @@
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
-          "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
+          "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -449,7 +476,8 @@
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
-          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }
+          "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -487,7 +515,8 @@
           },
           "404": {
             "$ref": "./common.v1.json#/components/responses/NotFound"
-          }
+          },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -532,7 +561,8 @@
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
-          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -577,7 +607,8 @@
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
-          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" }
+          "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
         }
       }
     },
@@ -610,6 +641,10 @@
   },
   "components": {
     "schemas": {
+      "DispatchHealth": {
+        "type": "object", "additionalProperties": false,
+        "properties": { "dispatch_hold": { "$ref": "./common.v1.json#/components/schemas/DispatchHold" } }
+      },
       "WorkflowVersionInput": {
         "type": "object",
         "additionalProperties": false,
@@ -837,6 +872,7 @@
         "additionalProperties": false,
         "required": ["run_id", "dispatch_attempts"],
         "properties": {
+          "dispatch_hold": { "$ref": "./common.v1.json#/components/schemas/DispatchHold" },
           "run_id": { "type": "string" },
           "l1_job_id": { "type": "string" },
           "dispatch_attempts": { "type": "integer", "minimum": 0 },
