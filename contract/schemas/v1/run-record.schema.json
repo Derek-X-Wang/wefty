@@ -26,6 +26,16 @@
     "status": {
       "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"]
     },
+    "cancel_status": {
+      "type": "string",
+      "enum": ["pending", "settled", "refused", "completed"],
+      "description": "Recorded cancellation delivery status, independent of the Run outcome. Absent until intent is recorded. settled includes local cancellation or a terminal L1 response; it does not prove runtime termination. completed identifies a legacy completed delivery whose retained error cannot distinguish settlement from refusal."
+    },
+    "cancel_reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Last cancellation delivery error, or permanent refusal reason. Absent after new successful settlement; legacy completed rows may retain earlier error evidence."
+    },
     "failure_reason": {
       "type": "string",
       "minLength": 1,
