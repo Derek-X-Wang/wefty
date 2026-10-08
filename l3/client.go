@@ -31,6 +31,11 @@ type JobCancelClient interface {
 	CancelJob(context.Context, string) (l1.Job, error)
 }
 
+// PersonAdminClient reads current L1 authority on each admin cancel request.
+type PersonAdminClient interface {
+	CheckPersonAdmin(context.Context, l1.PersonAdminCheckRequest) (l1.PersonAdminCheck, error)
+}
+
 // JobDispatchLookupClient is the lookup-only recovery seam for a dispatch L1
 // accepted before L3 recorded its job ID. It stays separate from JobClient so
 // existing clients and test fakes do not acquire another required method.
@@ -115,6 +120,21 @@ func (c *L1Client) SubmitJob(ctx context.Context, spec contract.JobSpec) (l1.Job
 		return l1.Job{}, err
 	}
 	return job, nil
+}
+
+func (c *L1Client) CheckPersonAdmin(ctx context.Context, request l1.PersonAdminCheckRequest) (l1.PersonAdminCheck, error) {
+	// Missing fields cannot become a false refusal or unversioned authority.
+	var answer struct {
+		CurrentAdmin   *bool  `json:"current_admin"`
+		PolicyRevision *int64 `json:"policy_revision"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/v1/person-admin-check", request, &answer, http.StatusOK); err != nil {
+		return l1.PersonAdminCheck{}, err
+	}
+	if answer.CurrentAdmin == nil || answer.PolicyRevision == nil || *answer.PolicyRevision < 0 {
+		return l1.PersonAdminCheck{}, internalError(errors.New("L1 returned incomplete admin authority evidence"), "validate L1 admin check")
+	}
+	return l1.PersonAdminCheck{CurrentAdmin: *answer.CurrentAdmin, PolicyRevision: *answer.PolicyRevision}, nil
 }
 
 func (c *L1Client) CancelJob(ctx context.Context, jobID string) (l1.Job, error) {

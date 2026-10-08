@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -16,6 +17,10 @@ import (
 // attempt. A never-attempted run can settle locally. Once an attempt began,
 // even without an acknowledgement, L1 is the authority on the job's outcome.
 func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string) error {
+	return s.requestAuthorizedRunCancellation(ctx, runID, actor, false)
+}
+
+func (s *Store) requestAuthorizedRunCancellation(ctx context.Context, runID, actor string, admin bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return internalError(err, "begin run cancellation")
@@ -34,22 +39,16 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	if err != nil {
 		return internalError(err, "read run cancellation target")
 	}
-	if actor != submitter {
-		// Follow parent links only: a rerun starts a new lineage with its own
-		// submitter. Bound the walk and refuse corrupt or incomplete lineage.
-		var rootActor string
-		err := tx.QueryRowContext(ctx, `WITH RECURSIVE ancestors(run_id, parent_run_id, depth) AS (
- SELECT run_id, parent_run_id, 0 FROM runs WHERE run_id=?
- UNION ALL
- SELECT r.run_id, r.parent_run_id, a.depth+1 FROM runs r JOIN ancestors a ON r.run_id=a.parent_run_id WHERE a.depth<?
-) SELECT t.actor FROM ancestors a JOIN run_triggers t ON t.run_id=a.run_id WHERE a.parent_run_id IS NULL`, runID, maxLineageTraversalDepth).Scan(&rootActor)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return internalError(err, "read cancellation lineage root")
+	if actor != submitter && !admin {
+		allowed, err := cancellationRootActorAllowed(ctx, tx, runID, actor)
+		if err != nil {
+			return err
 		}
-		if err != nil || actor != rootActor {
+		if !allowed {
 			return protocolError(contract.ErrorForbidden, "only the submitting actor or lineage root's submitting actor may cancel a run")
 		}
 	}
+
 	if (state == contract.RunSucceeded || state == contract.RunFailed) && !jobID.Valid && !attempted.Valid {
 		return nil
 	}
@@ -81,14 +80,58 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	return nil
 }
 
+// Read lineage without acquiring SQLite's immediate writer lock or holding
+// a transaction across the L1 authority check. Parent and trigger links are immutable.
+func (s *Store) cancellationActorAllowed(ctx context.Context, runID, actor string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, internalError(err, "begin cancel authority read")
+	}
+	defer tx.Rollback()
+	var submitter string
+	err = tx.QueryRowContext(ctx, `SELECT actor FROM run_triggers WHERE run_id=?`, runID).Scan(&submitter)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, protocolError(contract.ErrorNotFound, "run was not found")
+	}
+	if err != nil {
+		return false, internalError(err, "read cancel submitter")
+	}
+	allowed := actor == submitter
+	if !allowed {
+		allowed, err = cancellationRootActorAllowed(ctx, tx, runID, actor)
+		if err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, internalError(err, "commit cancel authority read")
+	}
+	return allowed, nil
+}
+
+func cancellationRootActorAllowed(ctx context.Context, tx *sql.Tx, runID, actor string) (bool, error) {
+	// Reruns start new lineages. Refuse corrupt or incomplete parent chains.
+	var rootActor string
+	err := tx.QueryRowContext(ctx, `WITH RECURSIVE ancestors(run_id, parent_run_id, depth) AS (
+ SELECT run_id, parent_run_id, 0 FROM runs WHERE run_id=?
+ UNION ALL
+ SELECT r.run_id, r.parent_run_id, a.depth+1 FROM runs r JOIN ancestors a ON r.run_id=a.parent_run_id WHERE a.depth<?
+) SELECT t.actor FROM ancestors a JOIN run_triggers t ON t.run_id=a.run_id WHERE a.parent_run_id IS NULL`, runID, maxLineageTraversalDepth).Scan(&rootActor)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, internalError(err, "read cancellation lineage root")
+	}
+	return err == nil && actor == rootActor, nil
+}
+
 type runCancellation struct {
 	projectedRun
 	DispatchKey string
 }
 
 func (s *Store) pendingRunCancellations(ctx context.Context, runID string) ([]runCancellation, error) {
-	query := `SELECT r.run_id, COALESCE(r.l1_job_id, ''), r.status, r.required_envelope, r.dispatch_key
+	query := `SELECT r.run_id, COALESCE(r.l1_job_id, o.job_id, ''), r.status, r.required_envelope, r.dispatch_key
  FROM run_cancellations c JOIN runs r ON r.run_id=c.run_id
+ LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id
  WHERE c.completed_ns IS NULL AND c.retry_ns<=?`
 	args := []any{s.recoveryNow().UnixNano()}
 	if runID != "" {
@@ -201,7 +244,28 @@ func (s *Server) cancelRun(w http.ResponseWriter, req *http.Request) {
 	}
 	ctx := req.Context()
 	runID := req.PathValue("run_id")
-	if err := s.store.requestRunCancellation(ctx, runID, actorFromIdentity(identityFromRequest(req))); err != nil {
+	identity := identityFromRequest(req)
+	actor := actorFromIdentity(identity)
+	allowed, err := s.store.cancellationActorAllowed(ctx, runID, actor)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	admin := false
+	if !allowed && identity.Kind != fabric.IdentityKindMachine && identity.UserID != "" && identity.FabricID != "" && identity.DeviceID != "" {
+		checker, ok := s.jobs.(PersonAdminClient)
+		if !ok {
+			writeError(w, &Error{Code: contract.ErrorUnavailable, Message: "L1 admin check is unavailable", Retryable: true})
+			return
+		}
+		answer, checkErr := checker.CheckPersonAdmin(ctx, l1.PersonAdminCheckRequest{FabricID: identity.FabricID, UserID: identity.UserID, DeviceID: identity.DeviceID})
+		if checkErr != nil {
+			writeError(w, &Error{Code: contract.ErrorUnavailable, Message: "L1 admin check is unavailable", Retryable: true, Cause: checkErr})
+			return
+		}
+		admin = answer.CurrentAdmin
+	}
+	if err := s.store.requestAuthorizedRunCancellation(ctx, runID, actor, admin); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -276,6 +340,9 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 			return r.store.deferRunCancellation(ctx, run.RunID, err)
 		}
 		if err != nil {
+			if isL1CancellationIdentityFailure(err) {
+				return internalError(err, "L1 could not authenticate the run ledger")
+			}
 			return err
 		}
 		if err := r.store.completeDispatch(ctx, run.RunID, job.JobID); err != nil {
@@ -288,6 +355,20 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		run.JobID, run.State = record.L1JobID, record.Status
 	}
 
+	// Link legacy outbox acknowledgements before sending any cancellation.
+	// A mismatched dispatch lookup must never become authority over another job.
+	if err := r.store.completeDispatch(ctx, run.RunID, run.JobID); err != nil {
+		return err
+	}
+	record, err := r.store.GetRun(ctx, run.RunID)
+	if err != nil {
+		return err
+	}
+	if record.L1JobID != run.JobID || run.JobID == "" {
+		return internalError(errors.New("canceled dispatch acknowledgement conflicts with run association"), "link canceled dispatch")
+	}
+	run.State = record.Status
+
 	canceler, ok := r.jobs.(JobCancelClient)
 	if !ok {
 		return internalError(errors.New("L1 cancellation client is not configured"), "cancel run job")
@@ -298,13 +379,10 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		var response *l1ResponseError
 		hasProtocol := errors.As(err, &refusal)
 		hasResponse := errors.As(err, &response)
-		if hasProtocol && (refusal.Code == contract.ErrorUnauthorized || refusal.Code == contract.ErrorPersonIdentityRequired ||
-			(hasResponse && response.status == http.StatusUnauthorized)) {
+		if isL1CancellationIdentityFailure(err) {
 			// Identity lookup failure is not a decision about this Run's cancel.
 			// Retain intent and advertise the same retryability to the caller.
-			retry := *refusal
-			retry.Retryable = true
-			return &retry
+			return internalError(err, "L1 could not authenticate the run ledger")
 		}
 		typedRefusal := hasProtocol && !refusal.Retryable
 		if hasResponse && !response.validEnvelope {
@@ -325,6 +403,9 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		}
 		return r.store.refuseRunCancellation(ctx, run.RunID, err)
 	}
+	if _, err := r.store.db.ExecContext(ctx, `UPDATE run_cancellations SET last_error=NULL, failures=0, retry_ns=0 WHERE run_id=? AND completed_ns IS NULL`, run.RunID); err != nil {
+		return internalError(err, "clear cancellation delivery failure")
+	}
 	if err := r.projectObservedJob(ctx, run, job); err != nil {
 		return err
 	}
@@ -342,6 +423,15 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		return r.store.finishRunCancellation(ctx, run.RunID)
 	}
 	return nil
+}
+
+// Authentication of the ledger is a dependency failure on both dispatch
+// lookup and job cancel, never a refusal of the authenticated person's request.
+func isL1CancellationIdentityFailure(err error) bool {
+	var protocol *Error
+	var response *l1ResponseError
+	return (errors.As(err, &protocol) && (protocol.Code == contract.ErrorUnauthorized || protocol.Code == contract.ErrorPersonIdentityRequired)) ||
+		(errors.As(err, &response) && response.status == http.StatusUnauthorized)
 }
 
 // projectObservedJob preserves ordinary reconciliation's image evidence,

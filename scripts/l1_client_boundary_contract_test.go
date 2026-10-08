@@ -57,6 +57,8 @@ var allowedL1Identifiers = map[string]bool{
 	"DefaultLogPageLimit":     true,
 	"MaxLogPageLimit":         true,
 	"ComputerTokenScopeProof": true,
+	"PersonAdminCheckRequest": true,
+	"PersonAdminCheck":        true,
 }
 
 // l1BoundaryViolation is one place a non-test l3 file crosses the ADR-0006

@@ -2125,7 +2125,14 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 		return internalError(err, "begin dispatch completion")
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`, jobID, now.UnixNano(), runID)
+	var outboxJob sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT job_id FROM dispatch_outbox WHERE run_id=?`, runID).Scan(&outboxJob); err != nil {
+		return internalError(err, "read dispatch acknowledgement")
+	}
+	if outboxJob.Valid && outboxJob.String != jobID {
+		return internalError(errors.New("dispatch acknowledgement conflicts with recorded outbox job"), "complete dispatch")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL AND (job_id IS NULL OR job_id=?)`, jobID, now.UnixNano(), runID, jobID)
 	if err != nil {
 		return internalError(err, "complete dispatch outbox")
 	}

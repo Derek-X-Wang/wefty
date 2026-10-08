@@ -34,7 +34,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "Stable machine-readable error code."
+            "description": "Stable machine-readable error code. Additive unavailable indicates a retryable dependency outage."
           },
           "message": { "type": "string" },
           "retryable": {

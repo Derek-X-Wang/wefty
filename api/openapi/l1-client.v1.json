@@ -8,6 +8,85 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/person-admin-check": {
+      "post": {
+        "operationId": "checkPersonAdmin",
+        "summary": "Read current person administrator membership (run ledger only)",
+        "description": "Only the configured run ledger with the L1 client principal may call. Read-only transaction using the same current-admin predicate as job cancel. Fabric evidence is vouched for by the ledger; no roster, cache, or cancel-on-behalf authority. Every admin-authorized Run cancel must check again.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "fabric_id",
+                  "user_id",
+                  "device_id"
+                ],
+                "properties": {
+                  "fabric_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "user_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "device_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Current membership and revision from one read-only snapshot. A non-admin is a successful false answer.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "current_admin",
+                    "policy_revision"
+                  ],
+                  "properties": {
+                    "current_admin": {
+                      "type": "boolean"
+                    },
+                    "policy_revision": {
+                      "type": "integer",
+                      "format": "int64",
+                      "minimum": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          }
+        }
+      }
+    },
     "/v1/computer-handle-resolutions/{computer}": {
       "parameters": [
         { "name": "computer", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },

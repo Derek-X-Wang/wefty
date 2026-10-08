@@ -45,7 +45,7 @@ func newIntegrationHarness(t *testing.T) *integrationHarness {
 	return newIntegrationHarnessWithL1Options(t, l1.StoreOptions{})
 }
 
-func newIntegrationHarnessWithL1Options(t *testing.T, l1Options l1.StoreOptions) *integrationHarness {
+func newIntegrationHarnessWithL1Options(t *testing.T, l1Options l1.StoreOptions, allowPersons ...bool) *integrationHarness {
 	t.Helper()
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
@@ -55,7 +55,7 @@ func newIntegrationHarnessWithL1Options(t *testing.T, l1Options l1.StoreOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
-	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
+	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AllowSelfAssertedPersonIdentities: len(allowPersons) > 0 && allowPersons[0], NodePolicies: map[string]l1.NodePolicy{
 		"node-1": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-1"),
 	}})
 	if err != nil {
