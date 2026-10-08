@@ -1165,9 +1165,19 @@ non-admission, work refusal, authoritative absence and protocol violations.
 These same bounded strings reach stored errors, reconcile and HTTP logs,
 relayed errors and `X-Request-Id`; the Dispatch hold reason inherits the same
 bound from the answer. The ASCII marker keeps a truncated visible-ASCII
-request ID visible ASCII; Unicode strings retain their UTF-8 prefix. The bound
-is per string: the number of detail entries is limited only by the 2 MiB L1
-response read limit. Protocol violations
+request ID visible ASCII; Unicode strings retain their UTF-8 prefix. The kept
+L1 `details` object is also capped at 4 KiB of encoded JSON, counting keys,
+values, nested containers, delimiters and escaping. `details.reason`, the only
+detail read by classification, is retained first with its decoded type intact;
+an oversized non-string reason keeps a bounded container prefix and remains a
+protocol violation. Other object entries are considered in sorted original-key
+order, and arrays in their original order, using the remaining shared budget;
+the first entry that cannot fit and the remaining entries are dropped. Nested
+containers keep a prefix within that same budget. If keys collide after
+128-rune truncation, the first sorted original key wins. The 2 MiB L1 response
+read limit remains unchanged. Envelope metadata and L3's local
+`details.l3_request_id` correlation are additional to the L1 details budget.
+Protocol violations
 still exclude response messages, details and raw bodies from their diagnostics,
 and caller-facing internal errors still scrub messages and details.
 
