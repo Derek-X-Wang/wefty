@@ -954,35 +954,9 @@ func (barrier *SupervisedBootBarrier) setReason(reason contract.CapabilityReason
 }
 
 func classifyHelperBarrierError(err error) contract.CapabilityReasonCode {
-	if err == nil {
-		return ""
-	}
 	var persistent *helperHandshakeStalledPersistentError
 	if errors.As(err, &persistent) {
 		return contract.CapabilityReasonHelperHandshakeStalledPersistent
 	}
-	var unavailable *ocihelper.HelperUnitUnavailableError
-	if errors.As(err, &unavailable) {
-		return contract.CapabilityReasonHelperUnitUnavailable
-	}
-	var stalled *ocihelper.HelperHandshakeStalledError
-	if errors.As(err, &stalled) {
-		return contract.CapabilityReasonHelperHandshakeStalled
-	}
-	var rpcErr *ocihelper.RPCError
-	if errors.As(err, &rpcErr) {
-		switch rpcErr.Code {
-		case ocihelper.CodeChecksumMismatch, ocihelper.CodeVersionMismatch:
-			return contract.CapabilityReasonHelperVersionMismatch
-		case ocihelper.CodePeerUnauthenticated:
-			return contract.CapabilityReasonLocalPermissionDenied
-		}
-	}
-	var reason interface {
-		CapabilityReasonCode() contract.CapabilityReasonCode
-	}
-	if errors.As(err, &reason) {
-		return reason.CapabilityReasonCode()
-	}
-	return contract.CapabilityReasonBootSweepFailed
+	return ocihelper.ClassifyBarrierError(err)
 }

@@ -614,8 +614,9 @@ or cancellation remains distinct.
 The takeover retry timer uses the injected helper clock. The heartbeat pump
 notifies the barrier synchronously when control authority is lost.
 
-Lima classifies helper readiness failures by typed errors and capability reason
-codes, never by diagnostic text or private resource inventory. A dial failure
+Native Linux and Lima boot barriers share the classification of helper readiness
+failures by typed errors and capability reason codes, never by diagnostic text
+or private resource inventory. A dial failure
 is `helper_unreachable`, including refusal of the separate Sweep or Verify RPC
 connection after successful session admission. The RPC dial carries
 `HelperDialError` through the unwrapping `RuntimeLossError`; diagnostic wrappers
