@@ -6,6 +6,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"syscall"
 )
 
 // handoffReadChunk bounds the allocation for each directory read.
@@ -16,23 +18,43 @@ type detachedHandoffDirectory interface {
 	Close() error
 }
 
+// freeDetachedHandoffRoot opens and frees a previously detached tree, then
+// removes its root. Concurrent collectors may already have removed it.
+func freeDetachedHandoffRoot(ctx context.Context, root string, freeChild func(string) error) error {
+	directory, err := os.Open(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	complete, err := freeDetachedHandoffContents(ctx, filepath.Base(root), directory, freeChild)
+	if err != nil || !complete {
+		return err
+	}
+	if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // freeDetachedHandoffContents shares the directory-reading path with portable
 // tests. The caller has already detached the volume and removed its receipt
 // under the retention lock; concurrent collectors may now free the same tree.
-func freeDetachedHandoffContents(ctx context.Context, detached string, directory detachedHandoffDirectory, freeChild func(string) error) error {
+func freeDetachedHandoffContents(ctx context.Context, detached string, directory detachedHandoffDirectory, freeChild func(string) error) (complete bool, err error) {
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			log.Printf("handoff retention: %s stays detached and the next pass frees it: %v", detached, ctx.Err())
-			return directory.Close()
+			return false, directory.Close()
 		}
 		children, readErr := directory.Readdirnames(handoffReadChunk)
 		for _, child := range children {
 			if ctx != nil && ctx.Err() != nil {
 				log.Printf("handoff retention: %s stays detached and the next pass frees it: %v", detached, ctx.Err())
-				return directory.Close()
+				return false, directory.Close()
 			}
 			if err := freeChild(child); err != nil {
-				return errors.Join(err, directory.Close())
+				return false, errors.Join(err, directory.Close())
 			}
 		}
 		// Linux may report ENOENT after returning buffered names when another
@@ -40,15 +62,20 @@ func freeDetachedHandoffContents(ctx context.Context, detached string, directory
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, os.ErrNotExist) {
 			break
 		}
+		// A non-directory detached entry has no children to free. Close it
+		// cleanly and let the caller unlink the entry itself.
+		if len(children) == 0 && errors.Is(readErr, syscall.ENOTDIR) {
+			break
+		}
 		if readErr != nil {
-			return errors.Join(readErr, directory.Close())
+			return false, errors.Join(readErr, directory.Close())
 		}
 		if len(children) == 0 {
 			break
 		}
 	}
 	if err := directory.Close(); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }

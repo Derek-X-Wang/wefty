@@ -412,9 +412,12 @@ Handoff deletion detaches the volume and unlinks its paired terminal receipt
 under the retention lock before freeing the detached `.removing-*` tree.
 Concurrent authorized deletion and collection may free that same tree: ENOENT
 while opening or reading the detached directory means it is already deleted,
-even when a read also returned buffered child names. Other read and close
-failures remain errors. Success still independently verifies absence of both
-the original volume and its receipt; a racing repair cannot publish a receipt
+even when a read also returned buffered child names. A non-directory detached
+entry is unlinked without walking children. Cancellation before the walk or
+between children leaves the detached root for the next pass; only a completed
+free removes the root. Other read and close failures remain errors. Success
+still independently verifies absence of both the original volume and its
+receipt; a racing repair cannot publish a receipt
 for a volume that was detached under that lock.
 
 `computer_storage_busy` and `computer_storage_retired` are definitive

@@ -566,7 +566,7 @@
       "post": {
         "operationId": "removeService",
         "summary": "Irreversibly request service removal",
-        "description": "Idempotent and asynchronous in every service state. The controller transaction revokes execution authority and scrubs SensitiveEnv plus controller logs before returning. A never-bound service finalizes immediately because no managed resource could exist. Concurrent authorized handoff cleanup converges when another pass has already deleted the same volume; successful cleanup still verifies that both the volume and its paired retention receipt are absent.",
+        "description": "Idempotent and asynchronous in every service state. The controller transaction revokes execution authority and scrubs SensitiveEnv plus controller logs before returning. A never-bound service finalizes immediately because no managed resource could exist. Removal finalization is idempotent under concurrent node cleanup.",
         "parameters": [
           { "name": "class", "in": "query", "required": true, "schema": { "const": "service" } }
         ],

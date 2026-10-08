@@ -434,22 +434,9 @@ func (engine *ContainerdEngine) freeDetachedHandoffTree(ctx context.Context, det
 		engine.handoffDetachedRemoving(detached)
 	}
 	root := filepath.Join(engine.handoffVolumeRoot(), detached)
-	directory, err := os.Open(root)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if err := freeDetachedHandoffContents(ctx, detached, directory, func(child string) error {
+	return freeDetachedHandoffRoot(ctx, root, func(child string) error {
 		return engine.freeDetachedHandoffChild(detached, child)
-	}); err != nil {
-		return err
-	}
-	if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	})
 }
 
 func (engine *ContainerdEngine) freeDetachedHandoffChild(detached, child string) error {

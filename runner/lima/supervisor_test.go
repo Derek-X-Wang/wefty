@@ -206,6 +206,25 @@ func TestRunningLimaWithUnreadyHelperIsBoundedAndForceStoppedOnce(t *testing.T) 
 
 type readyLimaHelperEngine struct{ ocihelper.UnavailableEngine }
 
+type residueLimaHelperEngine struct {
+	readyLimaHelperEngine
+	mu              sync.Mutex
+	verifiedStartup bool
+	residue         ocihelper.ResourceInventory
+}
+
+func (engine *residueLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	// Let the server's startup barrier admit sessions, then expose residue
+	// when the agent's readiness barrier verifies the namespace over RPC.
+	if !engine.verifiedStartup {
+		engine.verifiedStartup = true
+		return ocihelper.VerifyResponse{Absent: true}, nil
+	}
+	return ocihelper.VerifyResponse{Inventory: engine.residue, RuntimeResidue: engine.residue}, nil
+}
+
 type helperServeObservation struct {
 	done chan struct{}
 	err  error
@@ -310,6 +329,58 @@ func TestSupervisedBarrierReadinessDiagnosticDoesNotExposeResidueInventory(t *te
 		if !strings.Contains(logs[0], field) {
 			t.Errorf("readiness diagnostic missing %q: %q", field, logs[0])
 		}
+	}
+}
+
+func TestSupervisedBarrierReadinessPathDoesNotExposeResidueInventory(t *testing.T) {
+	const sentinel = "wefty-cgroup-readiness-private-sentinel"
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	supervisor.config.RecoveryTimeout = 30 * time.Second
+	var logMu sync.Mutex
+	var logs []string
+	supervisor.config.Logf = func(format string, arguments ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	}
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	socketPath, _ := startLimaHelper(t, checksum, &residueLimaHelperEngine{
+		residue: ocihelper.ResourceInventory{Cgroups: []string{sentinel}},
+	})
+	client := &ocihelper.Client{Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client,
+		ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"},
+		ocihelper.BootBarrierConfig{TakeoverTimeout: 10 * time.Second},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	t.Cleanup(func() { _ = barrier.Close() })
+	err = barrier.Ensure(t.Context())
+	var residue *ocihelper.NamespaceResidueError
+	if !errors.As(err, &residue) || !strings.Contains(residue.Error(), sentinel) || barrier.Ready() {
+		t.Fatalf("readiness did not encounter the sentinel residue: err=%v ready=%t", err, barrier.Ready())
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	sawResidueType := false
+	for _, line := range logs {
+		if strings.Contains(line, sentinel) {
+			t.Errorf("readiness path exposed runtime inventory: %q", line)
+		}
+		if strings.Contains(line, "error_type=*ocihelper.NamespaceResidueError") {
+			sawResidueType = true
+		}
+	}
+	if !sawResidueType {
+		t.Fatalf("readiness path never logged the residue error type: %q", logs)
 	}
 }
 

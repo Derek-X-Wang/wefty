@@ -1,6 +1,7 @@
 package ocihelper
 
 import (
+	"context"
 	"errors"
 	"io"
 	"os"
@@ -8,6 +9,72 @@ import (
 	"reflect"
 	"testing"
 )
+
+func TestDetachedHandoffCancelledFreeResumesOnNextPass(t *testing.T) {
+	for _, midTree := range []bool{false, true} {
+		name := "before_walk"
+		if midTree {
+			name = "mid_tree"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), ".removing-wefty-handoff-volume-test")
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			for _, child := range []string{"first", "second", "third"} {
+				if err := os.WriteFile(filepath.Join(root, child), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if !midTree {
+				cancel()
+			}
+			freed := 0
+			err := freeDetachedHandoffRoot(ctx, root, func(child string) error {
+				freed++
+				cancel()
+				return os.RemoveAll(filepath.Join(root, child))
+			})
+			if err != nil {
+				t.Fatalf("cancelled free must leave its detached root for the next pass: %v", err)
+			}
+			wantFreed := 0
+			if midTree {
+				wantFreed = 1
+			}
+			remaining, err := os.ReadDir(root)
+			if err != nil || freed != wantFreed || len(remaining) != 3-wantFreed {
+				t.Fatalf("cancelled free: freed=%d remaining=%d err=%v", freed, len(remaining), err)
+			}
+			if err := freeDetachedHandoffRoot(t.Context(), root, func(child string) error {
+				return os.RemoveAll(filepath.Join(root, child))
+			}); err != nil {
+				t.Fatalf("next pass: %v", err)
+			}
+			if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("next pass retained detached root: %v", err)
+			}
+		})
+	}
+}
+
+func TestDetachedHandoffFreeRemovesNonDirectory(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".removing-wefty-handoff-volume-test")
+	if err := os.WriteFile(root, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := freeDetachedHandoffRoot(t.Context(), root, func(string) error {
+		t.Fatal("non-directory root has no children")
+		return nil
+	}); err != nil {
+		t.Fatalf("free non-directory detached root: %v", err)
+	}
+	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("non-directory detached root remains: %v", err)
+	}
+}
 
 type vanishedHandoffDirectory struct {
 	file     *os.File
@@ -56,12 +123,12 @@ func TestDetachedHandoffReadToleratesConcurrentDeletion(t *testing.T) {
 		err:   &os.PathError{Op: "readdirent", Path: root, Err: os.ErrNotExist},
 	}
 	var removed []string
-	err = freeDetachedHandoffContents(t.Context(), filepath.Base(root), directory, func(child string) error {
+	complete, err := freeDetachedHandoffContents(t.Context(), filepath.Base(root), directory, func(child string) error {
 		removed = append(removed, child)
 		return os.RemoveAll(filepath.Join(root, child))
 	})
-	if err != nil {
-		t.Fatalf("free concurrently deleted tree: %v", err)
+	if err != nil || !complete {
+		t.Fatalf("free concurrently deleted tree: complete=%t err=%v", complete, err)
 	}
 	if !directory.closed || !reflect.DeepEqual(removed, directory.names) {
 		t.Fatalf("closed=%t removed=%v", directory.closed, removed)
@@ -74,17 +141,17 @@ func TestDetachedHandoffReadToleratesConcurrentDeletion(t *testing.T) {
 func TestDetachedHandoffReadPreservesOtherFailures(t *testing.T) {
 	for _, names := range [][]string{nil, {"result.json"}} {
 		directory := &vanishedHandoffDirectory{names: names, err: os.ErrPermission}
-		err := freeDetachedHandoffContents(t.Context(), "detached", directory, func(string) error { return nil })
-		if !errors.Is(err, os.ErrPermission) || !directory.closed {
-			t.Fatalf("names=%v err=%v closed=%t", names, err, directory.closed)
+		complete, err := freeDetachedHandoffContents(t.Context(), "detached", directory, func(string) error { return nil })
+		if complete || !errors.Is(err, os.ErrPermission) || !directory.closed {
+			t.Fatalf("names=%v complete=%t err=%v closed=%t", names, complete, err, directory.closed)
 		}
 	}
 }
 
 func TestDetachedHandoffReadPreservesCloseFailureAfterVanish(t *testing.T) {
 	directory := &vanishedHandoffDirectory{names: []string{"result.json"}, err: os.ErrNotExist, closeErr: io.ErrClosedPipe}
-	err := freeDetachedHandoffContents(t.Context(), "detached", directory, func(string) error { return nil })
-	if !errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrNotExist) || !directory.closed {
-		t.Fatalf("close failure: %v", err)
+	complete, err := freeDetachedHandoffContents(t.Context(), "detached", directory, func(string) error { return nil })
+	if complete || !errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrNotExist) || !directory.closed {
+		t.Fatalf("close failure: complete=%t err=%v", complete, err)
 	}
 }
