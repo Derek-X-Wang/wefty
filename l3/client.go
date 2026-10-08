@@ -362,10 +362,11 @@ func invalidL1Success(method, path, what string) error {
 
 // Retain only typed diagnostic fields, including an explicitly false retryable.
 // An incomplete envelope cannot establish refusal, but can still supply evidence.
+// Bound strings before they reach persisted errors, reconcile logs or headers.
 func l1ErrorEvidence(body []byte, requestID string) map[string]any {
 	evidence := make(map[string]any)
 	if requestID != "" {
-		evidence["request_id"] = requestID
+		evidence["request_id"] = boundedL1Evidence(requestID)
 	}
 	var envelope struct {
 		Error map[string]json.RawMessage `json:"error"`
@@ -386,9 +387,26 @@ func l1ErrorEvidence(body []byte, requestID string) map[string]any {
 		} else {
 			var value string
 			if json.Unmarshal(raw, &value) == nil {
-				evidence[field] = value
+				evidence[field] = boundedL1Evidence(value)
 			}
 		}
 	}
 	return evidence
+}
+
+// The ellipsis occupies the last of 128 runes. Iterate only far enough to
+// find the boundary, preserving UTF-8 without copying a large rune slice.
+func boundedL1Evidence(value string) string {
+	const limit = 128
+	var runes, cutoff int
+	for i := range value {
+		if runes == limit-1 {
+			cutoff = i
+		}
+		if runes == limit {
+			return value[:cutoff] + "…"
+		}
+		runes++
+	}
+	return value
 }

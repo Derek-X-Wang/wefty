@@ -877,7 +877,7 @@
           "run_id": { "type": "string" },
           "l1_job_id": { "type": "string" },
           "dispatch_attempts": { "type": "integer", "minimum": 0 },
-          "dispatch_error": { "$ref": "./common.v1.json#/components/schemas/Error", "description": "Unrecognised L1 answers remain retryable internal errors. Diagnostics retain only L1 HTTP status (details.l1_status), code (details.l1_code), retryable flag (details.l1_retryable), and request_id when available; response messages, details and raw bodies are excluded. Caller-facing HTTP internal errors scrub the diagnostic message and details." },
+          "dispatch_error": { "$ref": "./common.v1.json#/components/schemas/Error", "description": "Unrecognised L1 answers remain retryable internal errors. Diagnostics retain only L1 HTTP status (details.l1_status), code (details.l1_code), retryable flag (details.l1_retryable), and request_id when available; response messages, details and raw bodies are excluded. Diagnostic code and request_id strings, including request IDs from response headers, are capped at 128 Unicode runes: longer strings retain the first 127 followed by an ellipsis (…). The same bounded evidence is stored, logged and used for the relayed X-Request-Id header. Caller-facing HTTP internal errors scrub the diagnostic message and details." },
           "job": { "$ref": "./common.v1.json#/components/schemas/Job" }
         }
       },
