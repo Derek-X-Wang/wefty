@@ -1155,3 +1155,52 @@ func TestSupervisorDoesNotReinspectAStoppedInstanceWithoutAFault(t *testing.T) {
 		t.Fatalf("commands = %v, want no extra inspection without a fault", got)
 	}
 }
+
+func TestHelperBarrierRefusedSweepRPCIsUnreachable(t *testing.T) {
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	helperPath, _ := startLimaHelper(t, checksum, &readyLimaHelperEngine{})
+	temporary, err := os.CreateTemp("/tmp", "wefty-refused-rpc-*.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusedPath := temporary.Name()
+	t.Cleanup(func() { _ = os.Remove(refusedPath) })
+	if err := temporary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(refusedPath); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: refusedPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dials := 0
+	client := &ocihelper.Client{ExpectedChecksum: checksum, Dial: func(ctx context.Context) (net.Conn, error) {
+		dials++
+		path := helperPath
+		if dials > 1 {
+			path = refusedPath
+		}
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
+	}}
+	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = barrier.Close() })
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = barrier.Ensure(ctx)
+	var loss *ocihelper.RuntimeLossError
+	if dials != 2 || !errors.Is(err, syscall.ECONNREFUSED) || !errors.As(err, &loss) || barrier.Ready() {
+		t.Fatalf("did not reach refused sweep RPC after session admission: dials=%d err=%v ready=%t", dials, err, barrier.Ready())
+	}
+	if reason := classifyHelperBarrierError(err); reason != contract.CapabilityReasonHelperUnreachable {
+		t.Fatalf("refused sweep RPC reason = %q, want helper_unreachable: %v", reason, err)
+	}
+}

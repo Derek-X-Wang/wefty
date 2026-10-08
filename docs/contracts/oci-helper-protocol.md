@@ -616,7 +616,13 @@ notifies the barrier synchronously when control authority is lost.
 
 Lima classifies helper readiness failures by typed errors and capability reason
 codes, never by diagnostic text or private resource inventory. A dial failure
-is `helper_unreachable`; a failed handshake is `helper_handshake_failed`.
+is `helper_unreachable`, including refusal of the separate Sweep or Verify RPC
+connection after successful session admission. The RPC dial carries
+`HelperDialError` through the unwrapping `RuntimeLossError`; diagnostic wrappers
+do not change its classification. A failed handshake is
+`helper_handshake_failed`, including omitted barrier authority, invalid session
+admission or partial authority, failure to apply the first connection deadline,
+and an untyped first-frame decode or write failure.
 Typed unavailable-unit, stalled-handshake, persistent-stall, version/checksum,
 and peer-authentication failures retain their existing reasons. Namespace
 residue and other sweep failures are `boot_sweep_failed`, even when a resource
@@ -1340,8 +1346,13 @@ receipt unlinked second, so a concurrent accounting repair, which reopens the
 volume by name under that same lock before it publishes, finds nothing to bind
 to and cannot leave an orphan behind; the detached tree is then freed outside
 the lock, so no other attempt's finalization waits on the size of a workload's
-tree. That free checks its caller's cancellation between the detached tree's
-top-level children, so a caller that runs out of time stops within one child
+tree. The free retains an `os.OpenRoot` handle, proves that its `Stat(".")`
+identity matches the detached entry observed by `Lstat`, and removes children
+through that root. A detached name replaced by a symlink before opening is
+refused; a replacement after the identity check cannot redirect child removal
+outside the opened tree. Non-directory detached entries are unlinked without
+following symlinks. That free checks its caller's cancellation between the
+detached tree's top-level children, so a caller that runs out of time stops within one child
 rather than after the whole tree; whatever a crash, a cancelled caller or a
 filesystem failure leaves detached is finished by the next pass over this root,
 which is every sweep and every retained-handoff inventory. Absence is verified over the volume

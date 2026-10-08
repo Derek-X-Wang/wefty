@@ -44,6 +44,15 @@ func TestOpenSessionFailuresCarryCapabilityReason(t *testing.T) {
 			want: contract.CapabilityReasonHelperHandshakeFailed,
 		},
 		{
+			name: "write_first_frame",
+			client: &Client{ExpectedChecksum: "checksum-test", Dial: func(context.Context) (net.Conn, error) {
+				agent, helper := net.Pipe()
+				t.Cleanup(func() { _ = helper.Close() })
+				return &firstFrameWriteFailureConn{Conn: agent, cause: cause}, nil
+			}},
+			want: contract.CapabilityReasonHelperHandshakeFailed, cause: cause,
+		},
+		{
 			name: "receive_preface",
 			client: &Client{ExpectedChecksum: "checksum-test", Dial: func(context.Context) (net.Conn, error) {
 				agent, helper := net.Pipe()
@@ -91,4 +100,14 @@ func TestOpenSessionFailuresCarryCapabilityReason(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The deadline succeeds, so the failure is specifically the first frame write.
+type firstFrameWriteFailureConn struct {
+	net.Conn
+	cause error
+}
+
+func (connection *firstFrameWriteFailureConn) Write([]byte) (int, error) {
+	return 0, connection.cause
 }

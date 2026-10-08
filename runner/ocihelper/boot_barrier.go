@@ -390,7 +390,7 @@ func (barrier *BootBarrier) Ensure(ctx context.Context) (ensureErr error) {
 	}()
 	handshake := session.Handshake()
 	if handshake.HelperInstanceID == "" || handshake.SessionGeneration == 0 || handshake.ReapTimeout <= 0 {
-		return errors.New("OCI helper handshake omitted barrier authority")
+		return &HelperHandshakeError{Cause: errors.New("OCI helper handshake omitted barrier authority")}
 	}
 	barrierContext, barrierCancel := context.WithTimeout(ctx, handshake.ReapTimeout)
 	defer barrierCancel()

@@ -1305,7 +1305,7 @@ func (session *Session) dialRequestInternal(ctx context.Context, method Method, 
 	}
 	connection, err := session.client.Dial(ctx)
 	if err != nil {
-		err = fmt.Errorf("dial OCI helper RPC: %w", err)
+		err = &HelperDialError{Cause: err}
 		if classifyTransportLoss {
 			err = session.markOperationFailure(ctx, err)
 		}
