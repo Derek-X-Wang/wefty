@@ -122,7 +122,9 @@ func TestCancelRunStates(t *testing.T) {
 				t.Fatalf("cancel = %+v want %s / %q", got, want, reason)
 			}
 			if state == "succeeded" || state == "failed" {
-				if !reflect.DeepEqual(before, got) {
+				outcome := got
+				outcome.CancelStatus, outcome.CancelReason = "", ""
+				if !reflect.DeepEqual(before, outcome) {
 					t.Fatalf("rewrote terminal run: before=%+v after=%+v", before, got)
 				}
 			}

@@ -688,6 +688,11 @@ type RunRecord struct {
 	ParentRunID   string   `json:"parent_run_id,omitempty"`
 	DispatchKey   string   `json:"dispatch_key"`
 	Status        RunState `json:"status"`
+	// CancelStatus describes recorded cancellation delivery, independently of
+	// the Run outcome. It is absent until cancellation intent is recorded.
+	CancelStatus string `json:"cancel_status,omitempty"` // pending, settled, refused, completed (legacy)
+	// CancelReason is the last delivery error or permanent refusal, if any.
+	CancelReason string `json:"cancel_reason,omitempty"`
 	// FailureReason is one line saying why a failed run failed: the job's
 	// exit code or signal, a dispatch L1 refused, or the ledger gate that
 	// failed a job that exited 0 (a gate, a rejected write, a failed child,

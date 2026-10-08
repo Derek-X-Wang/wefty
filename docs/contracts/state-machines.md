@@ -1146,19 +1146,35 @@ further submits, links the job by the public dispatch-key lookup, and delivers
 cancellation to `POST /v1/jobs/{job_id}/cancel` through the public L1 client
 contract, as the ledger's own originating-submitter identity. Intent survives
 ledger restart; transient delivery failures are retried with durable exponential
-backoff: 30 seconds, doubling to a 30-minute cap. Repeated HTTP calls honor the
-same backoff. Ambiguous-dispatch lookups use this schedule and share the existing
-per-pass dispatch-recovery budget (five seconds by default); ordinary recovery
-does not also look up a Run with cancellation intent. A late first dispatch
+backoff: 30 seconds, doubling to a 30-minute cap. An explicit repeat HTTP cancel
+resets the failure count and retry time for pending delivery and immediately
+attempts delivery again; automatic recovery still honors backoff. Ambiguous-dispatch lookups use this schedule and share the
+existing per-pass dispatch-recovery budget (five seconds by default); ordinary
+recovery does not also look up a Run with cancellation intent. A late first dispatch
 acknowledgement wakes cancellation delivery immediately. A dispatch-key
 absence remains provisional until the existing one-hour dispatch settlement
 horizon has passed since the last attempt; only then, with no acknowledgement
 recorded meanwhile, can the Run settle locally as canceled before dispatch.
+A legacy terminal Run whose outbox already has the acknowledged job ID is
+linked before cancellation takes over recovery, preserving its outcome and
+timestamps. It cancels that job without an empty-ID call or a new dispatch.
 An ambiguous dispatch is never replayed to create work after cancellation.
 
 A typed non-retryable L1 cancel refusal ends delivery and is retained with its
-reason in the ledger's cancellation record; reconciliation and repeated cancel
-calls do not send it again. A cancel `not_found` alone can hide an ownership
+reason on the Run read as `cancel_status=refused` and `cancel_reason`. A
+pending delivery reports `cancel_status=pending` and, when present, the last
+delivery error as `cancel_reason`; a local cancellation or terminal L1 response
+reports `cancel_status=settled` without a reason. These fields are absent before
+intent is recorded and do not change the Run outcome or prove runtime termination.
+Older completed delivery rows retained both refusal reasons and transient errors
+preceding successful delivery. Those rows report `cancel_status=completed` and
+the retained reason, because their outcome cannot be inferred from that error.
+New refusals have an explicit durable marker; successful settlement clears the
+last error.
+Authentication/identity failures (including any HTTP 401, `unauthorized` or
+`person_identity_required`) remain transient even when L1 marks them non-retryable.
+For permanent refusals, reconciliation and repeated cancel calls do not send
+it again. A cancel `not_found` alone can hide an ownership
 refusal, so only an authoritative `GetJob` absence fails an active Run through
 the existing L1-regression settlement. Other refusals leave its real state intact.
 An existing terminal Run always returns HTTP 200 with that recorded outcome,

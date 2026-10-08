@@ -151,7 +151,8 @@ CREATE TABLE IF NOT EXISTS run_cancellations (
   failures INTEGER NOT NULL DEFAULT 0,
   retry_ns INTEGER NOT NULL DEFAULT 0,
   completed_ns INTEGER,
-  last_error TEXT
+  last_error TEXT,
+  refused INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS runs_projection ON runs(status, l1_job_id, created_ns);
 CREATE INDEX IF NOT EXISTS runs_created ON runs(created_ns, run_id);
@@ -366,6 +367,7 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 		{"retry_ns", "INTEGER NOT NULL DEFAULT 0"},
 		{"completed_ns", "INTEGER"},
 		{"last_error", "TEXT"},
+		{"refused", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := ensureSQLiteColumn(ctx, s.db, "run_cancellations", column.name, column.definition); err != nil {
 			return fmt.Errorf("l3: migrate run cancellation delivery: %w", err)
@@ -1345,6 +1347,14 @@ func normalizeTags(tags []string) ([]string, error) {
 // GetRun returns the public contract record reconstructed from its immutable
 // typed program and trigger rows.
 func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return contract.RunRecord{}, internalError(err, "begin run read")
+	}
+	defer tx.Rollback()
+	var cancelRequested, cancelCompleted sql.NullInt64
+	var cancelError sql.NullString
+	var cancelRefused sql.NullBool
 	var record contract.RunRecord
 	var parent, l1JobID, nodeID, failureReason, sourceRun, workflowRef sql.NullString
 	var computerID, computerAttemptID sql.NullString
@@ -1356,23 +1366,48 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 	var sha sql.NullString
 	var createdNS, updatedNS int64
 	var startedNS, finishedNS sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 SELECT r.run_id, r.parent_run_id, r.l1_job_id, r.node_id, r.failure_reason, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
        r.dispatch_authority, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
 	       s.content, s.sha256, i.program_json, w.workflow_ref, t.actor, t.source, t.source_run_id,
-	       t.computer_id, t.computer_attempt_id, t.computer_storage_generation, t.submit_intent_revision
+	       t.computer_id, t.computer_attempt_id, t.computer_storage_generation, t.submit_intent_revision, c.requested_ns, c.completed_ns, c.last_error, c.refused
 FROM runs r LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
+LEFT JOIN run_cancellations c ON c.run_id=r.run_id
 WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &failureReason, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
 		&record.DispatchAuthority, &createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &imageJSON, &workflowRef, &actor, &source, &sourceRun,
-		&computerID, &computerAttemptID, &computerStorageGeneration, &submitIntentRevision)
+		&computerID, &computerAttemptID, &computerStorageGeneration, &submitIntentRevision, &cancelRequested, &cancelCompleted, &cancelError, &cancelRefused)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
 	}
 	if err != nil {
 		return contract.RunRecord{}, internalError(err, "read run")
+	}
+	if err := tx.Commit(); err != nil {
+		return contract.RunRecord{}, internalError(err, "commit run read")
+	}
+	if cancelRequested.Valid {
+		record.CancelStatus = "pending"
+		if cancelCompleted.Valid {
+			record.CancelStatus = "settled"
+			if cancelRefused.Bool {
+				record.CancelStatus = "refused"
+			} else if cancelError.Valid {
+				// Older successful deliveries kept their last transient error,
+				// just as older refusals did. Report completion and the evidence
+				// without inventing which delivery outcome that row represents.
+				record.CancelStatus = "completed"
+			}
+		}
+		if cancelError.Valid {
+			var reason contract.APIError
+			if err := json.Unmarshal([]byte(cancelError.String), &reason); err != nil {
+				return contract.RunRecord{}, internalError(err, "decode cancellation reason")
+			}
+			record.CancelReason = reason.Message
+		}
 	}
 	record.SchemaVersion = contract.SchemaVersionV1
 	record.ParentRunID = parent.String
@@ -2110,11 +2145,13 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 	if acknowledged == 1 {
 		// A late first acknowledgement ends lookup backoff immediately. It
 		// can also supersede a provisional absence settled before it arrived.
-		if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET failures=0, retry_ns=0, completed_ns=NULL, last_error=NULL WHERE run_id=?`, runID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET failures=0, retry_ns=0, completed_ns=NULL, last_error=NULL, refused=0 WHERE run_id=?`, runID); err != nil {
 			return internalError(err, "wake cancellation after dispatch acknowledgement")
 		}
 	}
-	if acknowledged == 1 && queued == 0 {
+	// Also repair a legacy outbox-only acknowledgement: it is already
+	// dispatched, but the terminal Run may still lack its association.
+	if queued == 0 {
 		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID); err != nil {
 			return err
 		}
