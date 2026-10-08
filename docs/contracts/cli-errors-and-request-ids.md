@@ -41,12 +41,16 @@ with optional `details` and `request_id`. This includes global and command flag
 errors and failures raised inside the CLI. Parser usage text is suppressed in JSON
 mode. Existing take-over refusals may also include their `receipt`. Unknown
 CLI-local failures use `code=internal`, `retryable=false`; they have no server
-request ID. Connection failures (including dial timeouts and request deadlines)
-and non-envelope HTTP 5xx responses use `code=unavailable`, `retryable=true`,
+request ID. Connection failures (including dial timeouts, request deadlines,
+and a deadline or timeout waiting for the display banner after a take-over
+WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
+`retryable=true`,
 exit 13. An unavailable result advises the operator to check reachability and
 retry with backoff within its authority. A bare `context.DeadlineExceeded` is
 not evidence of unavailability: only a typed transport/service availability
-failure or the named server-envelope cases map to exit 13.
+failure or the named server-envelope cases map to exit 13. Caller cancellation
+(including Ctrl-C during take-over or registry requests) remains a local failure
+(exit 1), not `unavailable`.
 
 A Computer storage, resize, or removal `--wait` that expires after acceptance
 exits 14 and emits a CLI-local `error.code=wait_timeout`, `retryable=false` on
@@ -57,12 +61,11 @@ If no Computer projection was observed, no result document is emitted, but the
 error still carries the known receipt value. Otherwise the mutation result and
 failed observation remain on stdout. Service start, stop,
 and removal observation timeouts also exit 14 with the same error code. For
-services, `mutation_applied` is derived from the target already read to resolve
-ownership: a repeated desired state is false, except starting a failed or
-stopped service applies a new start; an existing removal is false. Missing
-prior lifecycle evidence yields null. This uses the observed target, without
-an additional read, rather than a server mutation receipt. Read or wait for
-completion; do not assume the mutation failed or repeat it to recover observation.
+services, `mutation_applied` is always `null`: L1 provides no applied receipt
+for desired-state or removal mutations. A prior read cannot prove whether a
+mutation applied under a concurrent change, even for a repeated request.
+Read or wait for completion; do not assume the mutation failed or repeat it to
+recover observation.
 Caller cancellation is a separate local failure. Grant revocation
 (`services revoke --wait`) also exits 14 on an accepted-mutation
 observation timeout. It retains `revocation_wait_timeout`, its existing

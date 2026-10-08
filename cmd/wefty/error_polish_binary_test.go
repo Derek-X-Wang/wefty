@@ -112,8 +112,15 @@ func TestPolishMutationWaitTimeoutFromRealBinary(t *testing.T) {
 			var envelope contract.ErrorResponse
 			wantReplay := hasArg(args, "--idempotency-key=replay")
 			wantApplied := !wantReplay
-			if err := json.Unmarshal(stderr, &envelope); err != nil || code != 14 || envelope.Error.Code != "wait_timeout" || envelope.Error.Details["mutation_applied"] != wantApplied || envelope.Error.Retryable || envelope.Error.RequestID != "" {
+			var wantEvidence any
+			if args[1] == "backup" {
+				wantEvidence = wantApplied
+			}
+			if err := json.Unmarshal(stderr, &envelope); err != nil || code != 14 || envelope.Error.Code != "wait_timeout" || envelope.Error.Details["mutation_applied"] != wantEvidence || envelope.Error.Retryable || envelope.Error.RequestID != "" {
 				t.Errorf("exit=%d stdout=%s stderr=%s decode=%v", code, stdout, stderr, err)
+			}
+			if _, present := envelope.Error.Details["mutation_applied"]; !present {
+				t.Errorf("mutation_applied omitted: %s", stderr)
 			}
 			if args[1] == "backup" {
 				var result storageMutationOutput

@@ -251,6 +251,9 @@ func (c *apiClients) performComputerTakeoverAction(ctx context.Context, endpoint
 }
 
 func classifyTakeoverTransportError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
 	var transport *takeover.TransportError
 	if errors.As(err, &transport) {
 		return &unavailableError{cause: err}

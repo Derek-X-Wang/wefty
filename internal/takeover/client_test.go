@@ -9,12 +9,37 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/coder/websocket"
 )
+
+func TestOpenSilentAfterUpgradeIsTransportFailure(t *testing.T) {
+	var upgraded atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(contract.ComputerControlTokenHeader, "test-token")
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol}})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		upgraded.Store(true)
+		_, _, _ = conn.Read(r.Context())
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	_, err := Open(ctx, directFabric{}, endpoint)
+	var transport *TransportError
+	if !upgraded.Load() || !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &transport) {
+		t.Fatalf("expected banner transport deadline after upgrade: upgraded=%t err=%v", upgraded.Load(), err)
+	}
+}
 
 func TestOpenAcceptsAndRetainsRawConnectHost(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

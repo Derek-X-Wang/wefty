@@ -210,8 +210,11 @@ func TestReviewServiceNoOpWaitFromRealBinary(t *testing.T) {
 			})
 			code, stdout, stderr := runPolishBinary(t, binary, "--json", "--l1="+address, "services", test.verb, "job-1", "--wait=20ms", "--poll-interval=1ms")
 			var envelope contract.ErrorResponse
-			if err := json.Unmarshal(stderr, &envelope); err != nil || code != 14 || envelope.Error.Details["mutation_applied"] != false {
+			if err := json.Unmarshal(stderr, &envelope); err != nil || code != 14 || envelope.Error.Code != "wait_timeout" {
 				t.Fatalf("exit=%d stdout=%s stderr=%s decode=%v", code, stdout, stderr, err)
+			}
+			if applied, present := envelope.Error.Details["mutation_applied"]; !present || applied != nil {
+				t.Fatalf("service timeout must carry mutation_applied=null: %s", stderr)
 			}
 		})
 	}

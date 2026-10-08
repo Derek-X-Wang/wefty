@@ -3,6 +3,7 @@ package takeover
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,7 +16,8 @@ import (
 	"github.com/coder/websocket"
 )
 
-// TransportError marks a failed exchange before an HTTP response was received.
+// TransportError marks a failed exchange before an HTTP response was received
+// or a deadline or timeout waiting for the upgraded view admission banner.
 // Callers can classify availability without mistaking a local validation error
 // or a server refusal for a connection failure.
 type TransportError struct{ cause error }
@@ -88,7 +90,13 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 	if err != nil {
 		_ = connection.CloseNow()
 		transport.CloseIdleConnections()
-		return nil, fmt.Errorf("read Computer view admission banner: %w", err)
+		failure := fmt.Errorf("read Computer view admission banner: %w", err)
+		var timeout net.Error
+		if !errors.Is(err, context.Canceled) && (errors.Is(err, context.DeadlineExceeded) ||
+			(errors.As(err, &timeout) && timeout.Timeout())) {
+			return nil, &TransportError{cause: failure}
+		}
+		return nil, failure
 	}
 	if len(banner) != contract.ComputerRFBVersionBannerBytes || !contract.ValidComputerRFBVersionBanner(banner) {
 		_ = connection.CloseNow()

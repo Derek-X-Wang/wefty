@@ -241,7 +241,7 @@ func auditJSONFlagSource(file string, source *ast.File, valueFlags map[string]bo
 		registration := true
 		switch method {
 		case "Bool", "String", "Int", "Int64", "Uint", "Uint64", "Float64", "Duration", "Func", "BoolFunc":
-		case "BoolVar", "StringVar", "IntVar", "Int64Var", "UintVar", "Uint64Var", "Float64Var", "DurationVar":
+		case "BoolVar", "StringVar", "IntVar", "Int64Var", "UintVar", "Uint64Var", "Float64Var", "DurationVar", "TextVar":
 			index, arity = 1, 4
 		case "Var":
 			index = 1
@@ -310,6 +310,31 @@ func TestJSONValueFlagGuardRejectsHoles(t *testing.T) {
 			auditJSONFlagSource(fixture.file, source, map[string]bool{"wait": true}, func(string) {}, func(string, ...any) { rejected = true })
 			if !rejected {
 				t.Fatal("guard accepted the hole")
+			}
+		})
+	}
+}
+
+func TestJSONValueFlagGuardTextVar(t *testing.T) {
+	for _, test := range []struct {
+		name, source string
+		wantRejected bool
+	}{
+		{"flags receiver", `package main; import "flag"; func command(flags *flag.FlagSet) { flags.TextVar(&value, "text", value, "") }`, false},
+		{"inferred field receiver", `package main; func command() { holder.other.TextVar(&value, "text", value, "") }`, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			source, err := parser.ParseFile(token.NewFileSet(), "command.go", test.source, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var visited []string
+			rejected := false
+			auditJSONFlagSource("command.go", source, map[string]bool{"text": true}, func(name string) {
+				visited = append(visited, name)
+			}, func(string, ...any) { rejected = true })
+			if rejected != test.wantRejected || (!rejected && !reflect.DeepEqual(visited, []string{"text"})) {
+				t.Fatalf("TextVar audit: visited=%v rejected=%t, want rejected=%t", visited, rejected, test.wantRejected)
 			}
 		})
 	}
