@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -164,6 +165,11 @@ func TestPolishDerivedFailureReasonFromRealBinary(t *testing.T) {
 }
 
 func TestPolishLimaJSONFlagValuesFromRealBinary(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		// Linux setup-oci registers its own flags and no Lima sizing flags;
+		// the parser's value-flag list is covered on every OS by json_flags_test.
+		t.Skip("Lima sizing flags are registered only by the macOS node setup")
+	}
 	binary := buildWefty(t)
 	missing := filepath.Join(t.TempDir(), "absent-config.json")
 	for _, name := range []string{"vm-memory", "vm-cpus", "vm-disk"} {
