@@ -144,7 +144,7 @@ func (s *Store) initialize(ctx context.Context) error {
 	if !strings.EqualFold(mode, "wal") {
 		return fmt.Errorf("l3: SQLite did not enable WAL (mode %q)", mode)
 	}
-	const schema = runTableSchema + `
+	const schema = runTableSchema + dispatchHoldSchema + `
 CREATE TABLE IF NOT EXISTS run_cancellations (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
   requested_ns INTEGER NOT NULL,
@@ -1385,6 +1385,10 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &failu
 	if err != nil {
 		return contract.RunRecord{}, internalError(err, "read run")
 	}
+	record.DispatchHold, err = runDispatchHold(ctx, tx, runID)
+	if err != nil {
+		return contract.RunRecord{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return contract.RunRecord{}, internalError(err, "commit run read")
 	}
@@ -1464,10 +1468,15 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &failu
 // GetRunExecution returns the durable L3 half of the run-keyed execution
 // projection. The server resolves L1JobID through the L1 client when present.
 func (s *Store) GetRunExecution(ctx context.Context, runID string) (RunExecution, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return RunExecution{}, internalError(err, "begin execution read")
+	}
+	defer tx.Rollback()
 	var projection RunExecution
 	var l1JobID sql.NullString
 	var dispatchErrorJSON []byte
-	err := s.db.QueryRowContext(ctx, `SELECT r.run_id, r.l1_job_id, o.attempt_count, o.last_error
+	err = tx.QueryRowContext(ctx, `SELECT r.run_id, r.l1_job_id, o.attempt_count, o.last_error
 		FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).
 		Scan(&projection.RunID, &l1JobID, &projection.DispatchAttempts, &dispatchErrorJSON)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1482,6 +1491,13 @@ func (s *Store) GetRunExecution(ctx context.Context, runID string) (RunExecution
 		if err := json.Unmarshal(dispatchErrorJSON, projection.DispatchError); err != nil {
 			return RunExecution{}, internalError(err, "decode dispatch error")
 		}
+	}
+	projection.DispatchHold, err = runDispatchHold(ctx, tx, runID)
+	if err != nil {
+		return RunExecution{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return RunExecution{}, internalError(err, "commit execution read")
 	}
 	return projection, nil
 }
@@ -1936,12 +1952,22 @@ WHERE run_id=? AND status NOT IN (?, ?)`,
 	return clearStagedTokenDelivery(ctx, tx, runID)
 }
 
+func clearDispatchRetry(ctx context.Context, tx *sql.Tx, runID string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dispatch_retry WHERE run_id=?`, runID); err != nil {
+		return internalError(err, "clear dispatch retry")
+	}
+	return nil
+}
+
 // clearStagedTokenDelivery drops a terminal run's staged run-token bearer. A
 // terminal run is never dispatched again, so a bearer still staged for a
 // dispatch L3 never recorded -- L1 accepted the job, L3 crashed before
 // completeDispatch, and the run then ended -- would otherwise stay in the
 // outbox in plaintext forever (#52).
 func clearStagedTokenDelivery(ctx context.Context, tx *sql.Tx, runID string) error {
+	if err := clearDispatchRetry(ctx, tx, runID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET token_delivery=NULL WHERE run_id=? AND token_delivery IS NOT NULL`, runID); err != nil {
 		return internalError(err, "clear terminal run's staged token delivery")
 	}
@@ -1983,7 +2009,9 @@ LEFT JOIN run_images i ON i.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
 WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?)
 AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)
-ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching)
+AND NOT EXISTS (SELECT 1 FROM dispatch_hold WHERE since_ns IS NOT NULL)
+AND NOT EXISTS (SELECT 1 FROM dispatch_retry d WHERE d.run_id=r.run_id AND d.retry_ns>?)
+ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching, s.recoveryNow().UnixNano())
 	if err != nil {
 		return nil, internalError(err, "list pending dispatches")
 	}
@@ -2029,7 +2057,7 @@ ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching)
 }
 
 // errDispatchAbandoned reports that a terminal transition or cancellation
-// request won before this dispatch attempt began. The caller must not submit:
+// request won, or admission/retry is deferred. The caller must not submit:
 // replay could create new work after the run ended or was told to stop.
 var errDispatchAbandoned = errors.New("l3: dispatch attempt abandoned")
 
@@ -2047,8 +2075,10 @@ func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error)
 	defer tx.Rollback()
 	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=?, dispatch_attempt_ns=?
 WHERE run_id=? AND status IN (?, ?)
-AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=runs.run_id)`,
-		contract.RunPending, contract.RunDispatching, now.UnixNano(), now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)
+AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=runs.run_id)
+AND NOT EXISTS (SELECT 1 FROM dispatch_hold WHERE since_ns IS NOT NULL)
+AND NOT EXISTS (SELECT 1 FROM dispatch_retry d WHERE d.run_id=runs.run_id AND d.retry_ns>?)`,
+		contract.RunPending, contract.RunDispatching, now.UnixNano(), now.UnixNano(), runID, contract.RunPending, contract.RunDispatching, now.UnixNano())
 	if err != nil {
 		return "", internalError(err, "mark dispatch attempt")
 	}
@@ -2073,18 +2103,39 @@ AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=runs.run_id)`,
 }
 
 func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchErr error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin dispatch retry")
+	}
+	defer tx.Rollback()
 	payload, err := json.Marshal(apiErrorFrom(dispatchErr))
 	if err != nil {
 		return internalError(err, "encode dispatch error")
 	}
 	// A submit error that returns after recovery settled the run must not
 	// replace the settled diagnostic.
-	_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL
+	_, err = tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL
   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.run_id=dispatch_outbox.run_id AND r.job_link_settled=1)`, string(payload), runID)
 	if err != nil {
 		return internalError(err, "record dispatch error")
 	}
-	return nil
+	var waiting bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE r.run_id=? AND r.status IN ('pending','dispatching') AND o.dispatched_ns IS NULL AND r.job_link_settled=0
+ AND NOT EXISTS(SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id))`, runID).Scan(&waiting); err != nil {
+		return internalError(err, "read dispatch retry eligibility")
+	}
+	if !waiting {
+		return tx.Commit()
+	}
+	var failures int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT failures FROM dispatch_retry WHERE run_id=?),0)`, runID).Scan(&failures); err != nil {
+		return internalError(err, "read dispatch retries")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO dispatch_retry(run_id,failures,retry_ns) VALUES(?,?,?) ON CONFLICT(run_id) DO UPDATE SET failures=excluded.failures,retry_ns=excluded.retry_ns`, runID, failures+1, s.recoveryNow().Add(dispatchRetryBackoff(failures)).UnixNano()); err != nil {
+		return internalError(err, "schedule dispatch retry")
+	}
+	return tx.Commit()
 }
 
 func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr error) error {
@@ -2165,6 +2216,9 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID); err != nil {
 			return err
 		}
+	}
+	if err := clearDispatchRetry(ctx, tx, runID); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return internalError(err, "commit dispatch completion")
@@ -2476,6 +2530,9 @@ func (s *Store) failMissingL1Job(ctx context.Context, run projectedRun) (bool, e
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, canonicalTime(now.Add(s.tokenGrace)).UnixNano(), run.RunID); err != nil {
 		return false, internalError(err, "expire L1-regressed run token")
+	}
+	if err := clearDispatchRetry(ctx, tx, run.RunID); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, internalError(err, "commit L1 regression")

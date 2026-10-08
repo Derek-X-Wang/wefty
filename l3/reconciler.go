@@ -67,6 +67,9 @@ func NewReconciler(store *Store, jobs JobClient, config ReconcilerConfig) (*Reco
 // from making progress.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	var passErrors []error
+	if err := r.probeDispatchHold(ctx); err != nil {
+		passErrors = append(passErrors, err)
+	}
 	intents, err := r.store.pendingDispatches(ctx)
 	if err != nil {
 		return err
@@ -74,7 +77,8 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	for _, intent := range intents {
 		runToken, err := r.store.beginDispatch(ctx, intent.RunID)
 		if errors.Is(err, errDispatchAbandoned) {
-			// The run ended or was canceled after this pass listed it. A job
+			// The run ended, was canceled, or dispatch was deferred after
+			// this pass listed it. A job
 			// created by an earlier attempt is linked by lookup recovery,
 			// never by a new submit.
 			continue
@@ -89,6 +93,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 			if !retryableDispatchError(err) {
 				record = r.store.failDispatch
 			}
+			err = r.store.observeL1Error(ctx, err)
 			if recordErr := record(ctx, intent.RunID, err); recordErr != nil {
 				passErrors = append(passErrors, errors.Join(err, recordErr))
 			} else {
@@ -118,11 +123,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 				}
 				continue
 			}
-			passErrors = append(passErrors, err)
+			passErrors = append(passErrors, r.store.observeL1Error(ctx, err))
 			continue
 		}
 		if err := r.projectObservedJob(ctx, run, job); err != nil {
-			passErrors = append(passErrors, err)
+			passErrors = append(passErrors, r.store.observeL1Error(ctx, err))
 		}
 	}
 	passErrors = append(passErrors, r.settlePendingNodeAttributions(ctx)...)
@@ -246,7 +251,7 @@ func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item
 	case isMissingDispatch(err, item.DispatchKey):
 		absence = err
 	default:
-		return recoveryTransient, err
+		return recoveryTransient, r.store.observeL1Error(ctx, err)
 	}
 	if item.OutboxJobID != "" {
 		// L1 acknowledged this job, so only its authoritative absence by ID
@@ -258,7 +263,7 @@ func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item
 			return recoveryDone, r.store.linkUnrecordedDispatch(ctx, item, item.OutboxJobID)
 		}
 		if !isMissingL1Job(err, item.OutboxJobID) {
-			return recoveryTransient, errors.Join(absence, err)
+			return recoveryTransient, errors.Join(absence, r.store.observeL1Error(ctx, err))
 		}
 		absence = errors.Join(absence, err)
 	}
@@ -293,7 +298,7 @@ func (r *Reconciler) settlePendingNodeAttributions(ctx context.Context) []error 
 				}
 				continue
 			}
-			passErrors = append(passErrors, err)
+			passErrors = append(passErrors, r.store.observeL1Error(ctx, err))
 			continue
 		}
 		nodeID, settled := jobNodeID(job)
@@ -308,13 +313,8 @@ func (r *Reconciler) settlePendingNodeAttributions(ctx context.Context) []error 
 }
 
 func retryableDispatchError(err error) bool {
-	var dispatchErr *Error
-	if errors.As(err, &dispatchErr) {
-		return dispatchErr.Retryable
-	}
-	// Unknown failures include injected crashes and transport wrappers. They
-	// are ambiguous, so keep the stable dispatch key eligible for replay.
-	return true
+	a := classifyL1Answer(err)
+	return a.Kind != l1WorkRefused || a.Method != "POST" || a.Target != "/v1/jobs"
 }
 
 // Run reconciles immediately and then on a fixed cadence until cancellation.

@@ -1001,3 +1001,42 @@ endpoint retains its existing creation-time/ID cursor semantics. Both commands
 work with only `--l1` configured and publish the existing typed exit codes;
 usage errors, including invalid paging arguments, are `invalid_request` (exit 2)
 and honour `--json`.
+
+
+## Ledger dispatch admission (#721)
+
+L3 classifies L1 answers at its client seam, retaining operation, target,
+status and response provenance: transient, ledger not admitted, work refused,
+authoritative absence, or protocol violation. Complete error envelopes and
+endpoint-bound resource 404s establish absence; `details.reason=no_route`
+and redirects never do. An old L1's credential-free 401 `unauthorized` or
+403 `principal_forbidden` is ledger admission evidence, as is operational
+503 `unavailable` / `identity_unverifiable`. A root submit's
+`run_identity_not_entitled` and ledger-only gate `forbidden` /
+`run_ledger_not_admitted` hold the ledger. A reasonless resource proof
+`forbidden` refuses that Computer or host alone.
+
+One SQLite-persisted hold records generation, onset, reason and next probe
+schedule. The submission transaction consults it alongside cancellation and
+terminal guards. Admission probes reserve one dispatch-key lookup at a time,
+with a bounded request and durable expiry after a restart. Validated 200 or
+resource 404 clears only the reserved generation. A late success cannot clear
+a newer hold. Probe backoff and other per-Run transient submission retries
+start at one second and cap at one minute. A submit replay is never admission
+proof: L1 resolves replay before run-identity entitlement. `whoami` proves a
+person and cannot prove ledger admission either.
+
+A held dispatch retains its exact staged bearer: rotating `SensitiveEnv`
+changes the request hash and causes `dispatch_key_conflict`. Acknowledgement
+and terminal scrubbing keep their existing rules. L3 acceptance and idempotent
+replay remain available and neither reset the hold nor enqueue extra work.
+Projection and cancellation stay independent; unrecorded-dispatch recovery
+retains its one-hour ambiguous horizon, 30-second to 30-minute retry schedule
+and five-second pass budget. Cancel never recreates work after intent commits.
+
+The hold is projected on waiting Run detail, summary/list and execution, and
+once through `GET /v1/health`, which reads ledger state without an L1 request.
+Computer-submitted Runs held before their L1 Job exists cannot be cancelled
+until admission recovers; this gap is accepted. Authorized submitting actors
+can locally cancel never-attempted Runs through L3. Previously failed Runs
+are not revived.

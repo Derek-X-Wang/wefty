@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"reflect"
 	"testing"
 	"time"
@@ -23,6 +24,22 @@ type reviewCancelClient struct {
 func (c *reviewCancelClient) CancelJob(ctx context.Context, id string) (l1.Job, error) {
 	c.calls++
 	if c.err != nil {
+		// This alternate client supplies an affirmative complete wire refusal,
+		// including its operation and response provenance, just like L1Client.
+		if e, ok := c.err.(*Error); ok {
+			status := http.StatusConflict
+			switch e.Code {
+			case contract.ErrorNotFound:
+				status = 404
+			case contract.ErrorForbidden:
+				status = 403
+			case contract.ErrorUnauthorized:
+				status = 401
+			case contract.ErrorInternal:
+				status = 500
+			}
+			return l1.Job{}, &l1ResponseError{status: status, method: http.MethodPost, path: "/v1/jobs/" + url.PathEscape(id) + "/cancel", validEnvelope: true, protocol: e}
+		}
 		return l1.Job{}, c.err
 	}
 	return c.L1Client.CancelJob(ctx, id)

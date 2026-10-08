@@ -169,6 +169,10 @@ var driftRows = []driftRow{
 	{component(commonDoc, "Envelope"), typeOf[contract.Envelope]()},
 	{component(commonDoc, "GateResult"), typeOf[contract.GateResult]()},
 
+	// Hold projections are checked alongside RunSummary, RunRecord and RunExecution.
+	{component(commonDoc, "DispatchHold"), typeOf[contract.DispatchHold]()},
+	{component(l3Doc, "DispatchHealth"), typeOf[l3.DispatchHealth]()},
+	{responseBody(l3Doc, "get", "/v1/health", "200"), typeOf[l3.DispatchHealth]()},
 	// L3 components.
 	{component(l3Doc, "WorkflowVersionInput"), typeOf[l3.WorkflowVersionInput]()},
 	{component(l3Doc, "ImageProgram"), typeOf[contract.ImageProgram]()},

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,7 +18,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// JobClient is the only L1 dependency of the ledger reconciler.
+// JobClient is the submission and job-read dependency of the ledger reconciler.
+// Only classified L1 submission answers can express a work refusal. Every
+// other submission error, including errors from alternate clients without
+// classified HTTP evidence, is transient and never fails a Run.
 type JobClient interface {
 	SubmitJob(context.Context, contract.JobSpec) (l1.Job, error)
 	GetJob(context.Context, string) (l1.Job, error)
@@ -104,7 +106,7 @@ func newL1Client(f fabric.Fabric, address string, operationTimeout, dialTimeout,
 		defer cancel()
 		return f.Dial(dialCtx, network, address)
 	}}
-	return &L1Client{client: &http.Client{Transport: transport}, operationTimeout: operationTimeout}, nil
+	return &L1Client{client: &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, operationTimeout: operationTimeout}, nil
 }
 
 func (c *L1Client) CloseIdleConnections() { c.client.CloseIdleConnections() }
@@ -114,6 +116,9 @@ func (c *L1Client) SubmitJob(ctx context.Context, spec contract.JobSpec) (l1.Job
 	if err := c.do(ctx, http.MethodPost, "/v1/jobs", spec, &job, http.StatusCreated, http.StatusOK); err != nil {
 		return l1.Job{}, err
 	}
+	if job.JobID == "" || job.Spec.DispatchKey != spec.DispatchKey {
+		return l1.Job{}, invalidL1Success(http.MethodPost, "/v1/jobs", "submission acknowledgement")
+	}
 	return job, nil
 }
 
@@ -121,6 +126,9 @@ func (c *L1Client) CancelJob(ctx context.Context, jobID string) (l1.Job, error) 
 	var job l1.Job
 	if err := c.do(ctx, http.MethodPost, "/v1/jobs/"+url.PathEscape(jobID)+"/cancel", nil, &job, http.StatusOK); err != nil {
 		return l1.Job{}, err
+	}
+	if job.JobID != jobID {
+		return l1.Job{}, invalidL1Success(http.MethodPost, "/v1/jobs/"+url.PathEscape(jobID)+"/cancel", "cancel acknowledgement")
 	}
 	return job, nil
 }
@@ -134,6 +142,9 @@ func (c *L1Client) GetJob(ctx context.Context, jobID string) (l1.Job, error) {
 		}
 		return l1.Job{}, err
 	}
+	if job.JobID != jobID {
+		return l1.Job{}, invalidL1Success(http.MethodGet, path, "job projection")
+	}
 	return job, nil
 }
 
@@ -146,8 +157,8 @@ func (c *L1Client) LookupJobByDispatchKey(ctx context.Context, dispatchKey strin
 		}
 		return l1.Job{}, err
 	}
-	if job.JobID == "" || job.Spec.DispatchKey != dispatchKey {
-		return l1.Job{}, internalError(fmt.Errorf("L1 returned job %q for dispatch key %q", job.JobID, job.Spec.DispatchKey), "validate L1 dispatch lookup response")
+	if _, known := contract.JobTransitions[job.State]; job.JobID == "" || job.Spec.DispatchKey != dispatchKey || !known || job.CreatedAt.IsZero() || job.UpdatedAt.IsZero() {
+		return l1.Job{}, &l1ResponseError{status: http.StatusOK, method: http.MethodGet, path: path, protocol: &Error{Code: contract.ErrorInternal, Message: "invalid L1 dispatch lookup response", Retryable: true}}
 	}
 	return job, nil
 }
@@ -249,38 +260,55 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 	}
 	response, err := c.client.Do(request)
 	if err != nil {
-		return &Error{Code: contract.ErrorInternal, Message: "call L1 control plane", Retryable: true, Cause: err}
+		return &l1ResponseError{transportFailure: true, requestMethod: method, requestPath: path, method: method, path: path, protocol: &Error{Code: contract.ErrorInternal, Message: "call L1 control plane", Retryable: true, Cause: err}}
 	}
 	defer response.Body.Close()
 	// A redirected response belongs to its final endpoint, not the original
 	// GetJob request. Preserve that origin before classifying absence.
+	redirected := response.StatusCode >= 300 && response.StatusCode < 400
+	if response.Request != nil && (response.Request.Method != method || response.Request.URL.RequestURI() != path || response.Request.URL.Host != request.URL.Host) {
+		redirected = true
+	}
 	if response.Request != nil {
 		method, path = response.Request.Method, response.Request.URL.RequestURI()
 	}
+	evidence := l1ErrorEvidence(nil, response.Header.Get("X-Request-Id"))
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
 	if err != nil {
-		return &Error{Code: contract.ErrorInternal, Message: "read L1 response", Retryable: true, Cause: err}
+		return &l1ResponseError{transportFailure: true, requestMethod: request.Method, requestPath: request.URL.RequestURI(), status: response.StatusCode, method: method, path: path, protocol: &Error{Code: contract.ErrorInternal, Message: "read L1 response", Retryable: true, Cause: err}}
 	}
 	// Read one extra byte so a truncated JSON prefix cannot establish absence.
 	if len(responseBody) > 2<<20 {
-		return &l1ResponseError{status: response.StatusCode, method: method, path: path, protocol: &Error{
+		return &l1ResponseError{requestMethod: request.Method, requestPath: request.URL.RequestURI(), status: response.StatusCode, method: method, path: path, redirected: redirected, evidence: evidence, protocol: &Error{
 			Code: contract.ErrorInternal, Message: "L1 response exceeds size limit",
 			Retryable: response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests,
 		}}
 	}
+	if redirected {
+		evidence = l1ErrorEvidence(responseBody, response.Header.Get("X-Request-Id"))
+		return &l1ResponseError{requestMethod: request.Method, requestPath: request.URL.RequestURI(), status: response.StatusCode, method: method, path: path, redirected: true, evidence: evidence, protocol: &Error{Code: contract.ErrorInternal, Message: "L1 redirected the request", Retryable: true}}
+	}
 	for _, status := range success {
 		if response.StatusCode == status {
 			if err := json.Unmarshal(responseBody, target); err != nil {
-				return internalError(err, "decode L1 response")
+				return &l1ResponseError{requestMethod: request.Method, requestPath: request.URL.RequestURI(), status: response.StatusCode, method: method, path: path, redirected: redirected, evidence: evidence, protocol: &Error{Code: contract.ErrorInternal, Message: "decode L1 response", Retryable: true, Cause: err}}
+			}
+			if job, ok := target.(*l1.Job); ok {
+				_, knownOneShot := contract.JobTransitions[job.State]
+				_, knownService := contract.ServiceJobTransitions[job.State]
+				if job.JobID == "" || (!knownOneShot && !knownService) {
+					return invalidL1Success(method, path, "job response")
+				}
 			}
 			return nil
 		}
 	}
+	evidence = l1ErrorEvidence(responseBody, response.Header.Get("X-Request-Id"))
 	var responseError contract.ErrorResponse
 	if err := json.Unmarshal(responseBody, &responseError); err != nil || responseError.Error.Code == "" {
-		return &l1ResponseError{status: response.StatusCode, method: method, path: path, protocol: &Error{Code: contract.ErrorInternal, Message: fmt.Sprintf("L1 returned HTTP %d", response.StatusCode), Retryable: response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests}}
+		return &l1ResponseError{requestMethod: request.Method, requestPath: request.URL.RequestURI(), status: response.StatusCode, method: method, path: path, redirected: redirected, evidence: evidence, protocol: &Error{Code: contract.ErrorInternal, Message: fmt.Sprintf("L1 returned HTTP %d", response.StatusCode), Retryable: response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests}}
 	}
-	return &l1ResponseError{status: response.StatusCode, method: method, path: path, validEnvelope: validL1ErrorEnvelope(responseBody), protocol: &Error{
+	return &l1ResponseError{requestMethod: request.Method, requestPath: request.URL.RequestURI(), status: response.StatusCode, method: method, path: path, redirected: redirected, validEnvelope: validL1ErrorEnvelope(responseBody), evidence: evidence, protocol: &Error{
 		Code: responseError.Error.Code, Message: responseError.Error.Message,
 		Retryable: responseError.Error.Retryable, Details: responseError.Error.Details,
 		RequestID: responseError.Error.RequestID,
@@ -297,19 +325,22 @@ var _ HostBootSessionVerifier = (*L1Client)(nil)
 
 // Keep the response origin internal while preserving errors.As(*Error).
 type l1ResponseError struct {
-	status        int
-	method, path  string
-	validEnvelope bool
-	protocol      *Error
+	transportFailure           bool
+	requestMethod, requestPath string
+	status                     int
+	method, path               string
+	validEnvelope              bool
+	redirected                 bool
+	protocol                   *Error
+	evidence                   map[string]any
 }
 
 func (e *l1ResponseError) Error() string { return e.protocol.Error() }
 func (e *l1ResponseError) Unwrap() error { return e.protocol }
 
 func authoritativeL1NotFound(err error, method, path string) bool {
-	var remote *l1ResponseError
-	return errors.As(err, &remote) && remote.status == http.StatusNotFound && remote.method == method && remote.path == path &&
-		remote.protocol.Code == contract.ErrorNotFound && remote.validEnvelope
+	a := classifyL1Answer(err)
+	return a.Kind == l1AuthoritativeAbsence && a.Method == method && a.Target == path
 }
 
 // Absence is destructive evidence: require all mandatory envelope fields rather
@@ -323,4 +354,41 @@ func validL1ErrorEnvelope(body []byte) bool {
 		} `json:"error"`
 	}
 	return json.Unmarshal(body, &envelope) == nil && envelope.Error != nil && envelope.Error.Code != nil && *envelope.Error.Code != "" && envelope.Error.Message != nil && envelope.Error.Retryable != nil
+}
+
+func invalidL1Success(method, path, what string) error {
+	return &l1ResponseError{status: http.StatusOK, method: method, path: path, protocol: &Error{Code: contract.ErrorInternal, Message: "invalid L1 " + what, Retryable: true}}
+}
+
+// Retain only typed diagnostic fields, including an explicitly false retryable.
+// An incomplete envelope cannot establish refusal, but can still supply evidence.
+func l1ErrorEvidence(body []byte, requestID string) map[string]any {
+	evidence := make(map[string]any)
+	if requestID != "" {
+		evidence["request_id"] = requestID
+	}
+	var envelope struct {
+		Error map[string]json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return evidence
+	}
+	for _, field := range []string{"code", "retryable", "request_id"} {
+		raw, ok := envelope.Error[field]
+		if !ok || string(raw) == "null" {
+			continue
+		}
+		if field == "retryable" {
+			var value bool
+			if json.Unmarshal(raw, &value) == nil {
+				evidence[field] = value
+			}
+		} else {
+			var value string
+			if json.Unmarshal(raw, &value) == nil {
+				evidence[field] = value
+			}
+		}
+	}
+	return evidence
 }

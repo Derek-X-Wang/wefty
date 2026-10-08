@@ -1120,6 +1120,60 @@ L1 queued one-shot cancellation records `state=failed`, `outcome=canceled`; it
 does not add a job state. L3 projects this job-level outcome as "the L1 job was
 canceled" ahead of any earlier attempt exit, spawn failure or lease loss.
 
+### Dispatch hold (#721)
+
+Ledger admission failure is one persisted ledger-wide Dispatch hold, not a
+Run transition. Waiting Runs remain `pending` or `dispatching`. `RunRecord`,
+`RunSummary` and `RunExecution` expose `dispatch_hold` with generation, reason,
+since and next probe time; `wefty runs list` prints the reason and onset,
+and human `wefty inspect` shows the hold reason, onset and next probe time.
+`GET /v1/health` exposes the same condition once for the ledger. Health is
+chosen because it can be read without an L1 call, even during an identity
+outage, while accepting new Runs remains available. Health requires the L3
+caller principal; Run and Computer bearers are refused locally before any L1
+scope proof.
+
+Only affirmative L1 evidence of ledger non-admission starts the hold:
+operational identity failure, credential-free authentication/principal refusal,
+root submission's `run_identity_not_entitled`, or `run_ledger_not_admitted` on
+ledger-only proofs and dispatch lookup. A reasonless Computer or host proof
+`forbidden` is that resource's refusal. Only a submission work refusal fails a
+Run; cancellation refusal ends cancellation delivery alone. Unknown answers,
+incomplete envelopes and mux `no_route` never prove refusal or absence.
+Unrecognised answers remain transient. Their `dispatch_error` and reconcile
+log retain only L1 HTTP status, code, retryable flag and request ID when
+available, never response messages, details or raw bodies. The stored error
+is retryable `internal`, with `details.l1_status`, `details.l1_code` and
+`details.l1_retryable`; the L1 request ID is `request_id`. Caller-facing HTTP
+errors continue to scrub internal messages and details.
+
+The hold gates submission atomically with the existing cancellation and
+terminal guards. Projection, cancellation and terminal dispatch recovery
+retain their schedules and budgets. One reserved dispatch-key lookup probes
+admission with exponential backoff from one second to one minute. Validated
+200 or resource 404 clears only the probed generation; redirects, malformed
+answers, `no_route`, submit replay and person `whoami` cannot clear it.
+Reservations expire after the bounded request so a restart resumes probing.
+Probe keys are opaque non-bearer IDs. Repeated refusals with the same reason
+perform no hold write unless a probe is in flight; only an in-flight probe
+requires a generation bump to fence a late admission answer. A pass without
+a due probe checks the hold read-only before taking any write lock.
+Other transient submission errors use persisted per-Run backoff capped at one
+minute; its retry row is removed when dispatch is acknowledged or the Run
+ends, and a late submit error cannot restart that backoff. A held Run retains
+its exact staged bearer until acknowledgement or terminal scrubbing. Idempotent Run submission replay neither adds an outbox
+entry nor changes the hold. Previously failed Runs are never revived.
+
+An operational WhoIs failure on L3's own front door is retryable 503
+`unavailable` with `details.reason=identity_unverifiable`; identity absence is
+401. Proxy routes report L1 ledger admission failure as retryable 503, never
+as the caller's 401 or an invalid Computer scope.
+
+Accepted gap: a Computer-submitted Run held before it has an L1 Job cannot be
+cancelled until the hold clears. Computer tokens cannot cancel, and the
+person-admin cancellation route needs the L1 Job. An authorized submitting
+actor can locally cancel a never-attempted held Run through L3.
+
 ### Run cancellation (#691)
 
 `POST /v1/runs/{run_id}/cancel` requires the existing L3 caller principal.

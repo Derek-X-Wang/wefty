@@ -7,6 +7,17 @@
   "paths": {},
   "components": {
     "schemas": {
+      "DispatchHold": {
+        "description": "Ledger-wide admission condition, projected only onto Runs waiting to submit. Never a Run outcome.",
+        "type": "object", "additionalProperties": false,
+        "required": ["generation", "reason", "since", "next_probe_at"],
+        "properties": {
+          "generation": { "type": "integer", "minimum": 1 },
+          "reason": { "type": "string" },
+          "since": { "type": "string", "format": "date-time" },
+          "next_probe_at": { "type": "string", "format": "date-time" }
+        }
+      },
       "ComputerTokenRevocationReceipt": {
         "type": "object", "additionalProperties": false,
         "required": ["computer_id", "submit_intent_revision", "revoked_grant_count", "committed_at"],
@@ -1358,6 +1369,7 @@
         "additionalProperties": false,
         "required": ["run_id", "status", "trigger", "created_at", "updated_at"],
         "properties": {
+          "dispatch_hold": { "$ref": "#/components/schemas/DispatchHold" },
           "run_id": { "type": "string" },
           "parent_run_id": { "type": "string" },
           "status": { "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"], "description": "The run's status, from the same vocabulary as RunRecord.status." },

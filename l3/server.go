@@ -162,6 +162,7 @@ func (s *Server) routes() http.Handler {
 	workflows.HandleFunc("GET /v1/workflows/{workflow_id}/versions/{version}", s.getWorkflowVersion)
 
 	root := http.NewServeMux()
+	root.Handle("GET /v1/health", s.authenticateFabric(s.requireHealthCaller(s.authorize(http.HandlerFunc(s.getDispatchHealth)))))
 	root.Handle("/v1/computer-token/mint", s.authenticateFabric(http.HandlerFunc(s.mintComputerToken)))
 	root.Handle("/v1/computer-token/revoke", s.authenticateFabric(http.HandlerFunc(s.revokeComputerTokens)))
 	root.Handle("/v1/computer-token/revoke-attempt", s.authenticateFabric(http.HandlerFunc(s.revokeComputerAttemptTokens)))
@@ -179,7 +180,7 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 	if scope, ok := runTokenFromRequest(r); ok {
 		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		if !allowed {
@@ -193,7 +194,7 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 	}
 	projection, err := s.store.GetRunExecution(r.Context(), runID)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	if projection.L1JobID != "" {
@@ -204,16 +205,16 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 		job, err := s.jobs.GetJob(r.Context(), projection.L1JobID)
 		if err != nil {
 			if !isMissingL1Job(err, projection.L1JobID) || !isL1Regression(projection.DispatchError, projection.L1JobID) {
-				writeError(w, err)
+				s.writeError(w, r, err)
 				return
 			}
 			run, readErr := s.store.GetRun(r.Context(), runID)
 			if readErr != nil {
-				writeError(w, readErr)
+				s.writeError(w, r, readErr)
 				return
 			}
 			if run.Status != contract.RunFailed || run.L1JobID != projection.L1JobID {
-				writeError(w, err)
+				s.writeError(w, r, err)
 				return
 			}
 		} else {
@@ -228,6 +229,10 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authenticateFabric(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		identity, err := s.fabric.WhoIs(r.Context(), r.RemoteAddr)
+		if err != nil && !errors.Is(err, fabric.ErrIdentityNotFound) {
+			writeError(w, &Error{Code: contract.ErrorUnavailable, Message: "fabric identity could not be verified", Retryable: true, Details: map[string]any{"reason": "identity_unverifiable"}, Cause: err})
+			return
+		}
 		if err != nil || (strings.TrimSpace(identity.NodeID) == "" && strings.TrimSpace(identity.UserID) == "") {
 			writeError(w, protocolError(contract.ErrorUnauthorized, "fabric identity could not be authenticated"))
 			return
@@ -253,7 +258,7 @@ func (s *Server) authorize(next http.Handler) http.Handler {
 				return
 			}
 			if code, _ := errorDetails(err); code != contract.ErrorUnauthorized {
-				writeError(w, err)
+				s.writeError(w, r, err)
 				return
 			}
 			computerScope, computerErr := s.store.AuthenticateComputerToken(r.Context(), token)
@@ -271,7 +276,7 @@ func (s *Server) authorize(next http.Handler) http.Handler {
 				return
 			}
 			if err := s.verifyComputerScope(r.Context(), computerScope, identity.NodeID); err != nil {
-				writeError(w, err)
+				s.writeError(w, r, err)
 				return
 			}
 			ctx := context.WithValue(r.Context(), computerTokenContextKey{}, computerScope)
@@ -283,6 +288,18 @@ func (s *Server) authorize(next http.Handler) http.Handler {
 		tags, err := normalizeTags(identity.Tags)
 		if err != nil || !slices.Contains(tags, s.callerPrincipalTag) {
 			writeError(w, protocolError(contract.ErrorForbidden, "fabric identity is not authorized for the L3 caller protocol"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Health never needs L1 authority: refuse bearer access before authorize can
+// verify a Computer scope through the control plane.
+func (s *Server) requireHealthCaller(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(r.Header.Get("Authorization")) != "" {
+			writeError(w, protocolError(contract.ErrorForbidden, "bearer tokens are not authorized for ledger health"))
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -341,19 +358,19 @@ func (s *Server) mintComputerToken(w http.ResponseWriter, r *http.Request) {
 	}
 	var request ComputerTokenMintRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	proof, err := s.computerGrants.ProveComputerTokenScope(r.Context(), request.ComputerID, request.ComputerAttemptID, identity.NodeID, "")
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	grant, err := s.store.MintReprovedComputerToken(r.Context(), proof, func(ctx context.Context) (ComputerTokenScopeProof, error) {
 		return s.computerGrants.ProveComputerTokenScope(ctx, request.ComputerID, request.ComputerAttemptID, identity.NodeID, "")
 	})
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, grant)
@@ -370,12 +387,12 @@ func (s *Server) revokeComputerTokens(w http.ResponseWriter, r *http.Request) {
 	}
 	var request ComputerTokenRevocationRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	receipt, err := s.store.RevokeComputerTokens(r.Context(), request)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, receipt)
@@ -389,7 +406,7 @@ func (s *Server) getComputerInflight(w http.ResponseWriter, r *http.Request) {
 	computerID := r.PathValue("computer_id")
 	count, err := s.store.CountComputerInflight(r.Context(), computerID)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, ComputerInflightState{ComputerID: computerID, NonterminalRootLineages: count})
@@ -407,11 +424,11 @@ func (s *Server) revokeComputerAttemptTokens(w http.ResponseWriter, r *http.Requ
 	}
 	var request ComputerAttemptTokenRevocationRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	if err := s.store.RevokeComputerAttemptTokens(r.Context(), request.ComputerID, request.ComputerAttemptID, identity.NodeID, request.Reason); err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -429,7 +446,7 @@ func (s *Server) revokeHostComputerTokens(w http.ResponseWriter, r *http.Request
 	}
 	var request HostComputerTokenRevocationRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	_, err := s.store.RevokeHostComputerTokens(r.Context(), identity.NodeID, request.StableNodeID, request.BootSessionID, request.Reason, func(ctx context.Context) error {
@@ -437,13 +454,17 @@ func (s *Server) revokeHostComputerTokens(w http.ResponseWriter, r *http.Request
 			return internalError(errors.New("L1 host boot session verifier is not configured"), "revoke host Computer tokens")
 		}
 		err := s.hostBootSessions.ProveHostBootSession(ctx, identity.NodeID, request.StableNodeID, request.BootSessionID)
+		answer := classifyL1Answer(err)
+		if answer.Kind == l1LedgerNotAdmitted || answer.Kind == l1ProtocolViolation {
+			return proxyL1Error(err)
+		}
 		if code, _ := errorDetails(err); err != nil && (code == contract.ErrorForbidden || code == contract.ErrorNotFound) {
 			return protocolError(contract.ErrorForbidden, "host boot session is not current")
 		}
 		return err
 	})
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -541,7 +562,7 @@ func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
 		page, err = s.store.ListRunsByComputerOrigin(r.Context(), computerID, query.Get("cursor"), limit, includeDescendants)
 	}
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
@@ -552,10 +573,14 @@ func (s *Server) verifyComputerScope(ctx context.Context, scope ComputerTokenSco
 		return internalError(errors.New("L1 Computer grant verifier is not configured"), "verify Computer token scope")
 	}
 	proof, err := s.computerGrants.ProveComputerTokenScope(ctx, scope.ComputerID, scope.ComputerAttemptID, hostIdentityNodeID, "")
+	answer := classifyL1Answer(err)
+	if answer.Kind == l1LedgerNotAdmitted || answer.Kind == l1ProtocolViolation {
+		return proxyL1Error(err)
+	}
 	if err != nil {
 		code, _ := errorDetails(err)
 		switch code {
-		case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorNotFound,
+		case contract.ErrorForbidden, contract.ErrorNotFound,
 			contract.ErrorConflict, contract.ErrorStalePolicyRevision:
 			return protocolError(contract.ErrorUnauthorized, "Computer token scope is no longer authoritative")
 		default:
@@ -574,7 +599,7 @@ func (s *Server) verifyComputerScope(ctx context.Context, scope ComputerTokenSco
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	var request CreateRunRequest
 	if err := decodeJSON(r, &request); err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	identity := identityFromRequest(r)
@@ -598,7 +623,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		writeRunAccepted(w, record, replayed)
@@ -610,7 +635,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		Request:        request,
 	})
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeRunAccepted(w, record, replayed)
@@ -658,7 +683,7 @@ func (s *Server) listRecentRuns(w http.ResponseWriter, r *http.Request, query ur
 	}
 	page, err := s.store.ListRuns(r.Context(), filter)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
@@ -669,7 +694,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	if scope, ok := runTokenFromRequest(r); ok {
 		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		if !allowed {
@@ -679,7 +704,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	} else if scope, ok := computerTokenFromRequest(r); ok {
 		allowed, err := s.store.CanComputerReadRun(r.Context(), scope, runID)
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		if !allowed {
@@ -689,7 +714,7 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 	}
 	record, err := s.store.GetRun(r.Context(), runID)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, record)
@@ -702,7 +727,7 @@ func (s *Server) getRunLineage(w http.ResponseWriter, r *http.Request) {
 	if scope, scoped = runTokenFromRequest(r); scoped {
 		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		if !allowed {
@@ -712,7 +737,7 @@ func (s *Server) getRunLineage(w http.ResponseWriter, r *http.Request) {
 	} else if computerScope, computerScoped := computerTokenFromRequest(r); computerScoped {
 		allowed, err := s.store.CanComputerReadRun(r.Context(), computerScope, runID)
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		if !allowed {
@@ -722,7 +747,7 @@ func (s *Server) getRunLineage(w http.ResponseWriter, r *http.Request) {
 	}
 	lineage, err := s.store.GetLineage(r.Context(), runID)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	if scoped {
@@ -737,11 +762,11 @@ func (s *Server) getRunLineage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	if err := s.annotateLineageSteps(r.Context(), &lineage); err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, lineage)
@@ -756,7 +781,7 @@ func (s *Server) getRunLogs(w http.ResponseWriter, r *http.Request) {
 	if scope, ok := runTokenFromRequest(r); ok {
 		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		if !allowed {
@@ -766,7 +791,7 @@ func (s *Server) getRunLogs(w http.ResponseWriter, r *http.Request) {
 	} else if scope, ok := computerTokenFromRequest(r); ok {
 		allowed, err := s.store.CanComputerReadRun(r.Context(), scope, runID)
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		if !allowed {
@@ -776,12 +801,12 @@ func (s *Server) getRunLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	limit, err := parseRunLogLimit(r.URL.Query().Get("limit"))
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	jobID, dispatched, err := s.store.runJobID(r.Context(), runID)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	cursor := r.URL.Query().Get("cursor")
@@ -791,7 +816,7 @@ func (s *Server) getRunLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := s.logs.GetJobLogs(r.Context(), jobID, cursor, limit)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
@@ -811,7 +836,7 @@ func (s *Server) getRunResult(w http.ResponseWriter, r *http.Request) {
 	if scope, ok := runTokenFromRequest(r); ok {
 		allowed, err := s.store.CanReadRun(r.Context(), scope.RunID, runID)
 		if err != nil {
-			writeError(w, err)
+			s.writeError(w, r, err)
 			return
 		}
 		if !allowed {
@@ -828,7 +853,7 @@ func (s *Server) getRunResult(w http.ResponseWriter, r *http.Request) {
 	}
 	jobID, dispatched, err := s.store.runJobID(r.Context(), runID)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	if !dispatched {
@@ -837,7 +862,7 @@ func (s *Server) getRunResult(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.results.GetJobResult(r.Context(), jobID)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, RunResult{
@@ -920,12 +945,12 @@ func (s *Server) appendEnvelope(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, err := decodeRawJSON(r)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	value, replayed, err := s.store.AppendEnvelope(r.Context(), scope, raw)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeProtocolAppend(w, value, replayed)
@@ -943,12 +968,12 @@ func (s *Server) appendGateResult(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, err := decodeRawJSON(r)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	value, replayed, err := s.store.AppendGateResult(r.Context(), scope, raw)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeProtocolAppend(w, value, replayed)
@@ -970,7 +995,7 @@ func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
 		SourceRunID:    r.PathValue("run_id"),
 	})
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeRunAccepted(w, record, replayed)
@@ -987,12 +1012,12 @@ func (s *Server) notImplemented(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createWorkflowVersion(w http.ResponseWriter, r *http.Request) {
 	var input WorkflowVersionInput
 	if err := decodeJSON(r, &input); err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	record, err := s.store.CreateWorkflowVersion(r.Context(), r.PathValue("workflow_id"), input)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, record)
@@ -1011,7 +1036,7 @@ func (s *Server) getWorkflowVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	record, err := s.store.GetWorkflowVersion(r.Context(), r.PathValue("workflow_id"), version)
 	if err != nil {
-		writeError(w, err)
+		s.writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, record)
@@ -1077,7 +1102,7 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, err error) {
-	apiError := apiErrorFrom(err)
+	apiError := apiErrorFrom(proxyL1Error(err))
 	code := apiError.Code
 	status := http.StatusConflict
 	switch code {
@@ -1089,6 +1114,8 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusForbidden
 	case contract.ErrorNotFound:
 		status = http.StatusNotFound
+	case contract.ErrorUnavailable:
+		status = http.StatusServiceUnavailable
 	case contract.ErrorNotImplemented:
 		status = http.StatusNotImplemented
 	case contract.ErrorInternal:
@@ -1102,4 +1129,19 @@ func writeError(w http.ResponseWriter, err error) {
 		apiError.Details = nil
 	}
 	writeJSON(w, status, contract.ErrorResponse{Error: contract.AttachRequestID(w, apiError)})
+}
+
+// Observe only after storage callbacks have returned: opening another immediate
+// write transaction inside a proof callback would deadlock its caller.
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err error) {
+	writeError(w, s.store.observeL1Error(r.Context(), err))
+}
+
+func (s *Server) getDispatchHealth(w http.ResponseWriter, r *http.Request) {
+	health, err := s.store.DispatchHealth(r.Context())
+	if err != nil {
+		s.writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, health)
 }
