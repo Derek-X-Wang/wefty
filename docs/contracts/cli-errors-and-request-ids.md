@@ -54,7 +54,11 @@ request ID. Connection failures (including dial timeouts, request deadlines,
 and a deadline or timeout waiting for the display banner after a take-over
 WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
 `retryable=true`,
-exit 13. An unavailable result advises the operator to check reachability and
+exit 13. This includes non-envelope 5xx from the Computer take-over front door
+on `services takeover view`, `take`, and `release`, such as a plain-text 503
+when the display is not ready or Fabric identity cannot be verified. Structured
+take-over refusals keep their existing classification; a plain-text or structured
+401 authentication refusal exits 3. An unavailable result advises the operator to check reachability and
 retry with backoff within its authority. A bare `context.DeadlineExceeded` is
 not evidence of unavailability: only a typed transport/service availability
 failure or the named server-envelope cases map to exit 13. Caller cancellation
