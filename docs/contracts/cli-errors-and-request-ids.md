@@ -18,7 +18,7 @@ typed result.
 | 11 | Wait timeout (`wait`) |
 | 12 | Cluster not ready (`status`) |
 | 13 | Transport or service unavailable (`unavailable`, or retryable server-unavailable envelope) |
-| 14 | Accepted-mutation observation timeout (`wait_timeout`) |
+| 14 | Accepted-mutation observation timeout (`wait_timeout` or `revocation_wait_timeout`) |
 
 The protocol-code membership of the exit map remains authoritative. HTTP 5xx
 error envelopes with `code=internal` or `code=run_ledger_unavailable` and
@@ -51,13 +51,23 @@ failure or the named server-envelope cases map to exit 13.
 A Computer storage, resize, or removal `--wait` that expires after acceptance
 exits 14 and emits a CLI-local `error.code=wait_timeout`, `retryable=false` on
 stderr. `error.details.mutation_applied` matches the mutation result on stdout
-(true for a newly applied change, false for a replay or no-op). The existing
-mutation result and failed observation remain on stdout. Service start, stop,
-and removal observation timeouts also exit 14 with the same error code and
-`mutation_applied=true`. Read or wait for completion; do not assume the mutation
-failed or repeat it to recover observation. Caller cancellation is a separate
-local failure. Grant revocation retains its existing `revocation_wait_timeout`
-protocol refusal, which is not transport unavailability.
+(true for a newly applied change, false for a replay or no-op).
+The field is always present; `null` means the applied evidence is unknown.
+If no Computer projection was observed, no result document is emitted, but the
+error still carries the known receipt value. Otherwise the mutation result and
+failed observation remain on stdout. Service start, stop,
+and removal observation timeouts also exit 14 with the same error code. For
+services, `mutation_applied` is derived from the target already read to resolve
+ownership: a repeated desired state is false, except starting a failed or
+stopped service applies a new start; an existing removal is false. Missing
+prior lifecycle evidence yields null. This uses the observed target, without
+an additional read, rather than a server mutation receipt. Read or wait for
+completion; do not assume the mutation failed or repeat it to recover observation.
+Caller cancellation is a separate local failure. Grant revocation
+(`services revoke --wait`) also exits 14 on an accepted-mutation
+observation timeout. It retains `revocation_wait_timeout`, its existing
+retryability, and receipt-derived `details.mutation_applied`; it is not
+transport unavailability. `services grant` does not accept `--wait`.
 
 Typed outcomes (custody exits 6–9,
 failed run 10, wait timeout 11, not-ready status 12) already write their result

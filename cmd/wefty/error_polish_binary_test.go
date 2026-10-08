@@ -77,7 +77,7 @@ func TestPolishMutationWaitTimeoutFromRealBinary(t *testing.T) {
 			if r.Method != http.MethodGet {
 				w.WriteHeader(http.StatusAccepted)
 			}
-			_ = json.NewEncoder(w).Encode(l1.Job{JobID: "starting-service", State: contract.JobStopped})
+			_ = json.NewEncoder(w).Encode(l1.Job{JobID: "starting-service", State: contract.JobStopped, ServiceJob: &l1.ServiceJob{DesiredState: contract.ServiceDesiredStopped}})
 		case "/v1/jobs/slow-service", "/v1/jobs/slow-service/desired-state":
 			if r.Method == http.MethodGet && slowReads.Add(1) > 1 {
 				<-r.Context().Done()
@@ -86,12 +86,12 @@ func TestPolishMutationWaitTimeoutFromRealBinary(t *testing.T) {
 			if r.Method != http.MethodGet {
 				w.WriteHeader(http.StatusAccepted)
 			}
-			_ = json.NewEncoder(w).Encode(l1.Job{JobID: "slow-service", State: contract.JobRunning})
+			_ = json.NewEncoder(w).Encode(l1.Job{JobID: "slow-service", State: contract.JobRunning, ServiceJob: &l1.ServiceJob{DesiredState: contract.ServiceDesiredRunning}})
 		case "/v1/jobs/service-1", "/v1/jobs/service-1/desired-state", "/v1/jobs/service-1/remove":
 			if r.Method != http.MethodGet {
 				w.WriteHeader(http.StatusAccepted)
 			}
-			_ = json.NewEncoder(w).Encode(l1.Job{JobID: "service-1", State: contract.JobRunning})
+			_ = json.NewEncoder(w).Encode(l1.Job{JobID: "service-1", State: contract.JobRunning, ServiceJob: &l1.ServiceJob{DesiredState: contract.ServiceDesiredRunning}})
 		default:
 			t.Errorf("unexpected request %s %s", r.Method, r.URL)
 			http.Error(w, "unexpected request", 404)

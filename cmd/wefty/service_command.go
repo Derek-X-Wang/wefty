@@ -462,7 +462,7 @@ func executeServiceDesiredState(
 			predicate = serviceIsQuiescent
 			description = "stopped"
 		}
-		job, err = waitForService(ctx, clients, job, wait, pollInterval, description, predicate)
+		job, err = waitForService(ctx, clients, job, serviceDesiredMutationApplied(*jobTarget, desired), wait, pollInterval, description, predicate)
 		if err != nil {
 			return err
 		}
@@ -584,6 +584,10 @@ func executeServiceRemove(
 		if wait.timeout > 0 {
 			observed, observation, waitErr := waitForComputerRemoval(ctx, clients, computer.ComputerID, wait)
 			if waitErr != nil && observed.ComputerID == "" {
+				var timeout *mutationWaitTimeoutError
+				if errors.As(waitErr, &timeout) {
+					timeout.mutationApplied = &receipt.Applied
+				}
 				return waitErr
 			}
 			projection = newComputerProjection(observed, &receipt.Applied, &receipt.Replay)
@@ -605,7 +609,7 @@ func executeServiceRemove(
 		return err
 	}
 	if wait.timeout > 0 {
-		job, err = waitForService(ctx, clients, job, wait.timeout, wait.pollInterval, "removed", serviceRemovalComplete)
+		job, err = waitForService(ctx, clients, job, serviceRemovalMutationApplied(*prior), wait.timeout, wait.pollInterval, "removed", serviceRemovalComplete)
 		if err != nil {
 			return err
 		}
@@ -745,10 +749,33 @@ func executeServiceLogs(
 	}
 }
 
+// The target is already read to resolve Computer ownership. Use that evidence
+// to distinguish a repeat request from a lifecycle change without another read.
+func serviceDesiredMutationApplied(prior l1.Job, desired contract.ServiceDesiredState) *bool {
+	if prior.ServiceJob == nil {
+		return nil
+	}
+	applied := prior.DesiredState != desired || (desired == contract.ServiceDesiredRunning &&
+		(prior.State == contract.JobFailed || prior.State == contract.JobStopped))
+	return &applied
+}
+
+func serviceRemovalMutationApplied(prior l1.Job) *bool {
+	if prior.ServiceJob == nil && prior.Removal == nil {
+		return nil
+	}
+	applied := false
+	if prior.Removal == nil {
+		applied = prior.DesiredState != contract.ServiceDesiredRemoved
+	}
+	return &applied
+}
+
 func waitForService(
 	ctx context.Context,
 	clients *apiClients,
 	initial l1.Job,
+	mutationApplied *bool,
 	wait, pollInterval time.Duration,
 	description string,
 	predicate func(l1.Job) bool,
@@ -766,13 +793,13 @@ func waitForService(
 			if ctx.Err() != nil {
 				return l1.Job{}, ctx.Err()
 			}
-			return l1.Job{}, &mutationWaitTimeoutError{mutationApplied: true, message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
+			return l1.Job{}, &mutationWaitTimeoutError{mutationApplied: mutationApplied, message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
 		case <-timer.C:
 		}
 		job, err := clients.getService(waitCtx, initial.JobID)
 		if err != nil {
-			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded {
-				return l1.Job{}, &mutationWaitTimeoutError{mutationApplied: true, message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
+			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
+				return l1.Job{}, &mutationWaitTimeoutError{mutationApplied: mutationApplied, message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
 			}
 			return l1.Job{}, err
 		}

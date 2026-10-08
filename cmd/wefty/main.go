@@ -67,6 +67,8 @@ const (
 	exitMutationWaitTimeout = 14
 )
 
+const errorWaitTimeout contract.ErrorCode = "wait_timeout"
+
 func commandExitCode(err error) int {
 	var usage usageError
 	if errors.As(err, &usage) {
@@ -124,6 +126,8 @@ func commandExitCode(err error) int {
 		return exitFailure
 	}
 	switch apiError.Code {
+	case contract.ErrorRevocationWaitTimeout:
+		return exitMutationWaitTimeout
 	case contract.ErrorUnavailable:
 		return exitUnavailable
 	case contract.ErrorInvalidRequest:
@@ -158,7 +162,7 @@ func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
 		var mutationTimeout *mutationWaitTimeoutError
 		if errors.As(err, &mutationTimeout) {
 			_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
-				Code: "wait_timeout", Message: err.Error(), Retryable: false,
+				Code: errorWaitTimeout, Message: err.Error(), Retryable: false,
 				Details: map[string]any{"mutation_applied": mutationTimeout.mutationApplied},
 			}})
 			return

@@ -136,15 +136,20 @@ All commands share these typed exits:
 | 9 | Custody import superseded; read its result document |
 | 12 | Cluster not ready; read the readiness reasons and stop submitting |
 | 13 | Transport/service availability: `unavailable` for connection/dial/request-deadline failure or non-envelope HTTP 5xx; also HTTP 5xx envelopes with retryable `internal` or `run_ledger_unavailable`. JSON preserves the server code. Check reachability and retry with backoff within your authority |
-| 14 | Accepted-mutation observation timed out (`wait_timeout`, `retryable=false`); read or wait again. `details.mutation_applied` matches the mutation result (false for replay/no-op). Do not infer the mutation failed |
+| 14 | Accepted-mutation observation timed out (`wait_timeout`, `retryable=false`, or the existing `revocation_wait_timeout`); read or wait again. `details.mutation_applied` matches the Computer receipt (false for replay/no-op), or derives from the already-read service lifecycle/removal; null means unknown. Do not infer the mutation failed |
 
 With `--json`, errors use the shared `error` envelope on stderr. Typed outcome
 exits 6–12 use their result document on stdout with no extra error envelope. A
 not-ready status is a readiness verdict, not an internal error. Exit 14 applies
 to Computer storage/resize/removal and service start/stop/removal `--wait`;
 Computer commands keep their mutation result on stdout and add the timeout
-error on stderr. Run `wait --timeout` keeps exit 11. Grant revocation keeps its
-existing `revocation_wait_timeout` refusal. A bare local deadline is not
+error on stderr. If no projection was observed, only the error is emitted,
+with the known receipt value. Service repeat
+start/stop or existing removal reports false; starting a failed/stopped service
+reports true. Missing applied evidence is always present as null. Run
+`wait --timeout` keeps exit 11. Grant revocation (`services revoke --wait`)
+exits 14 while keeping `revocation_wait_timeout`, its retryability, and
+receipt-derived applied evidence. `services grant` does not accept `--wait`. A bare local deadline is not
 `unavailable`. Non-retryable `internal` or `run_ledger_unavailable` stays exit 1;
 retryability alone cannot change an authority refusal or unknown code. An API error
 with `details.reason="no_route"` means the route or method is unavailable (check

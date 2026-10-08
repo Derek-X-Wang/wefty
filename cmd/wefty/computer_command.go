@@ -462,6 +462,10 @@ func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput 
 		}
 		observed, observation, waitErr := waitForComputerGrowRevision(ctx, clients, computerID, operationRevision, wait)
 		if waitErr != nil && observed.ComputerID == "" {
+			var timeout *mutationWaitTimeoutError
+			if errors.As(waitErr, &timeout) {
+				timeout.mutationApplied = &receipt.Applied
+			}
 			return waitErr
 		}
 		projection = newComputerProjection(observed, &receipt.Applied, &receipt.Replay)
@@ -645,7 +649,7 @@ func computerGrowOutcomeMismatch(operationRevision int64, message string) error 
 func writeComputerProjectionThenError(writer io.Writer, projection computerOperatorProjection, jsonOutput bool, err error) error {
 	var timeout *mutationWaitTimeoutError
 	if errors.As(err, &timeout) && projection.MutationApplied != nil {
-		timeout.mutationApplied = *projection.MutationApplied
+		timeout.mutationApplied = projection.MutationApplied
 	}
 	if writeErr := writeComputerProjection(writer, projection, jsonOutput); writeErr != nil {
 		return errors.Join(err, writeErr)

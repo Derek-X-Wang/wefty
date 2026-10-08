@@ -963,7 +963,7 @@ func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe 
 func writeStorageMutationThenError(writer io.Writer, output storageMutationOutput, jsonOutput bool, err error) error {
 	var timeout *mutationWaitTimeoutError
 	if errors.As(err, &timeout) {
-		timeout.mutationApplied = output.MutationApplied
+		timeout.mutationApplied = &output.MutationApplied
 	}
 	if writeErr := writeStorageMutation(writer, output, jsonOutput); writeErr != nil {
 		return errors.Join(err, writeErr)

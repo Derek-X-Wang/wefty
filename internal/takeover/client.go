@@ -15,6 +15,14 @@ import (
 	"github.com/coder/websocket"
 )
 
+// TransportError marks a failed exchange before an HTTP response was received.
+// Callers can classify availability without mistaking a local validation error
+// or a server refusal for a connection failure.
+type TransportError struct{ cause error }
+
+func (failure *TransportError) Error() string { return failure.cause.Error() }
+func (failure *TransportError) Unwrap() error { return failure.cause }
+
 type ActionError struct {
 	APIError contract.APIError
 	Receipt  *contract.ComputerControlReceipt
@@ -64,7 +72,11 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 				return nil, &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
 			}
 		}
-		return nil, fmt.Errorf("open Computer view session: %w", err)
+		failure := fmt.Errorf("open Computer view session: %w", err)
+		if response == nil {
+			return nil, &TransportError{cause: failure}
+		}
+		return nil, failure
 	}
 	token := response.Header.Get(contract.ComputerControlTokenHeader)
 	if token == "" || token != strings.TrimSpace(token) {
@@ -132,7 +144,11 @@ func Perform(
 	request.Header.Set(contract.ComputerControlTokenHeader, token)
 	response, err := (&http.Client{Transport: transport}).Do(request)
 	if err != nil {
-		return contract.ComputerControlReceipt{}, fmt.Errorf("perform Computer %s: %w", action, err)
+		failure := fmt.Errorf("perform Computer %s: %w", action, err)
+		if response == nil {
+			return contract.ComputerControlReceipt{}, &TransportError{cause: failure}
+		}
+		return contract.ComputerControlReceipt{}, failure
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 4096))

@@ -34,7 +34,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "Stable machine-readable error code. CLI transport failures (including request deadlines) and non-envelope HTTP 5xx use unavailable with retryable=true and exit 13. HTTP 5xx envelopes with retryable internal or run_ledger_unavailable also exit 13 while retaining the server code; non-retryable versions remain exit 1. Bare local deadlines are not unavailable. Accepted-mutation observation timeouts use the CLI-local wait_timeout code, retryable=false, details.mutation_applied, and exit 14; this is not a server error code."
+            "description": "Stable machine-readable error code. CLI transport failures (including request deadlines) and non-envelope HTTP 5xx use unavailable with retryable=true and exit 13. HTTP 5xx envelopes with retryable internal or run_ledger_unavailable also exit 13 while retaining the server code; non-retryable versions remain exit 1. Bare local deadlines are not unavailable. Accepted-mutation observation timeouts use the CLI-local wait_timeout code, retryable=false, and exit 14; this is not a server error code. details.mutation_applied is always present: true or false from the Computer receipt (false for replay/no-op), or derived from the already-read service lifecycle/removal; null means applied evidence is unknown. services revoke --wait also exits 14 on revocation_wait_timeout, retaining that code, retryability, and receipt-derived applied evidence."
           },
           "message": { "type": "string" },
           "retryable": {

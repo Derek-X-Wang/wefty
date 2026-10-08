@@ -55,8 +55,9 @@ func (e *runOutcomeError) Error() string {
 // mutationWaitTimeoutError reports that an accepted mutation has not yet been
 // observed complete. Repeating the mutation is not advised; read or wait again.
 type mutationWaitTimeoutError struct {
-	message         string
-	mutationApplied bool
+	message string
+	// nil means the accepted mutation has no known applied evidence.
+	mutationApplied *bool
 }
 
 func (e *mutationWaitTimeoutError) Error() string { return e.message }
