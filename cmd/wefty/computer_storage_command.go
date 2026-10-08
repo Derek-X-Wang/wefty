@@ -803,6 +803,13 @@ func attachStorageProvenance(ctx context.Context, clients *apiClients, computerI
 		}
 		output.Observation.EndedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	}
+	// The operation's typed verdict is already known. A provenance miss is
+	// observation evidence only and must not replace that verdict's exit.
+	var responseErr *apiResponseError
+	var importOutcome *custodyImportOutcomeError
+	if errors.As(prior, &responseErr) || errors.As(prior, &importOutcome) {
+		return prior
+	}
 	observationErr := &storageObservationError{cause: err}
 	if prior != nil {
 		return errors.Join(prior, observationErr)
@@ -950,7 +957,7 @@ func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe 
 	fail := func(err error) (storageWaitObservation, error) {
 		if ctx.Err() != nil {
 			err = ctx.Err()
-		} else if waitCtx.Err() == context.DeadlineExceeded {
+		} else if waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
 			err = &mutationWaitTimeoutError{message: fmt.Sprintf("timed out after %s waiting for mutation completion", wait.timeout)}
 		}
 		observation.Status, observation.Error = "failed", err.Error()

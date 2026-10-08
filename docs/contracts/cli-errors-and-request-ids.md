@@ -83,6 +83,13 @@ The wait deadline bounds every observation request, including response-body
 reads and any follow-up Storage provenance read. An L1 that accepts a
 connection but never answers cannot extend the wait. Once the wait times out
 or the caller cancels, no follow-up provenance request is started.
+A missing `storage_provenance` after a timeout means "not read", not "untainted";
+`services backup list COMPUTER` reads it.
+An already-observed typed failure keeps its own exit code if a follow-up
+provenance read fails or times out; that miss is recorded in `observation.error`.
+Only an observation error caused by `context.DeadlineExceeded` becomes
+`wait_timeout`; a typed outcome or HTTP refusal arriving at the deadline keeps
+its classification.
 Caller cancellation is a separate local failure. Grant revocation
 (`services revoke --wait`) also exits 14 on an accepted-mutation
 observation timeout. It retains `revocation_wait_timeout`, its existing

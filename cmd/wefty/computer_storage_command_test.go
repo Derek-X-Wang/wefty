@@ -35,6 +35,7 @@ const (
 
 type storageCLIHarness struct {
 	ctx         context.Context
+	l1Address   string
 	store       *l1.Store
 	clients     *apiClients
 	agentFabric fabric.Fabric
@@ -255,9 +256,14 @@ func assertComputerStorageCLIAdversarialRows(t *testing.T) {
 		}
 		// A timed-out wait cannot start another provenance request. Verify
 		// export taint with a separate read before any attestation is made.
-		provenance, err := h.clients.listComputerStorageProvenance(h.ctx, h.computer.ComputerID)
-		if err != nil || !provenance.CustodyTainted || len(provenance.CustodyExports) != 1 {
-			t.Fatalf("Custody export provenance = %#v err=%v", provenance, err)
+		binary := buildWefty(t)
+		code, inventoryJSON := runWefty(t, binary, 3*time.Second, "--json", "--fabric=plain", "--plain-identity=operator",
+			"--l1="+h.l1Address, "--l3=", "services", "backup", "list", h.computer.ComputerID)
+		var inventory computerBackupInventory
+		if err := json.Unmarshal([]byte(inventoryJSON), &inventory); err != nil || code != 0 ||
+			!inventory.CustodyTainted || len(inventory.CustodyExports) != 1 || len(inventory.Provenance) == 0 ||
+			inventory.CustodyExports[0].ExportID != exportOutput.CustodyExport.ExportID {
+			t.Fatalf("Custody export recovery via backup list: exit=%d output=%s err=%v", code, inventoryJSON, err)
 		}
 		attestArgs := []string{"services", "custody", "attest", exportOutput.CustodyExport.ExportID,
 			"--idempotency-key", "operator-attested-deleted"}
@@ -842,7 +848,7 @@ func newStorageCLIHarness(t *testing.T) *storageCLIHarness {
 			t.Errorf("close L1: %v", err)
 		}
 	})
-	return &storageCLIHarness{ctx: ctx, store: store, clients: clients, agentFabric: agentFabric,
+	return &storageCLIHarness{ctx: ctx, l1Address: listener.Addr().String(), store: store, clients: clients, agentFabric: agentFabric,
 		managedRoot: managedRoot, node: node, computer: computer, claim: claim}
 }
 

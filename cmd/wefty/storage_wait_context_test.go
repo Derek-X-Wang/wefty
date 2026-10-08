@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -220,5 +221,94 @@ func TestAPICanceledResponseBodyIsLocalFailure(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A follow-up provenance miss cannot replace a failure already observed for
+// the accepted operation, either at the wait deadline or on an unavailable read.
+func TestStorageTypedFailureSurvivesProvenanceMissFromBinary(t *testing.T) {
+	binary := buildWefty(t)
+	for _, miss := range []string{"deadline", "unavailable"} {
+		t.Run(miss, func(t *testing.T) {
+			var provenanceReads atomic.Int32
+			address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v1/computers/computer-1":
+					_ = json.NewEncoder(w).Encode(l1.Computer{ComputerID: "computer-1", IntentRevision: 2, StorageID: "storage-1", StorageGeneration: 1})
+				case "/v1/computers/computer-1/backups":
+					if r.Method == http.MethodPost {
+						w.Header().Set("Backup-Id", "backup-1")
+						w.WriteHeader(http.StatusAccepted)
+						_ = json.NewEncoder(w).Encode(l1.Computer{ComputerID: "computer-1", IntentRevision: 3})
+						return
+					}
+					_ = json.NewEncoder(w).Encode(l1.BackupList{Operation: &l1.ComputerBackupOperationOutcome{
+						BackupID: "backup-1", Status: "failed", FailureCode: l1.ComputerBackupFailureInsufficientDisk,
+					}})
+				case "/v1/computers/computer-1/storage-provenance":
+					provenanceReads.Add(1)
+					if miss == "deadline" {
+						<-r.Context().Done()
+						return
+					}
+					w.WriteHeader(http.StatusServiceUnavailable)
+					_, _ = w.Write([]byte("provenance unavailable"))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			})
+			code, output := runWefty(t, binary, 3*time.Second, "--json", "--l1="+address,
+				"services", "backup", "create", "computer-1", "--idempotency-key=k",
+				"--intent-revision=2", "--storage-id=storage-1", "--storage-generation=1", "--wait=200ms")
+			decoder := json.NewDecoder(strings.NewReader(output))
+			var result storageMutationOutput
+			var envelope contract.ErrorResponse
+			if err := decoder.Decode(&result); err != nil {
+				t.Fatalf("mutation output: %v: %s", err, output)
+			}
+			if err := decoder.Decode(&envelope); err != nil {
+				t.Fatalf("error output: %v: %s", err, output)
+			}
+			if code != exitConflict || envelope.Error.Code != contract.ErrorCapacityExhausted || envelope.Error.Retryable ||
+				envelope.Error.Details["failure_code"] != string(l1.ComputerBackupFailureInsufficientDisk) ||
+				strings.Contains(envelope.Error.Message, "provenance") || !result.MutationApplied || result.Backups == nil || result.Backups.Operation == nil ||
+				result.Backups.Operation.Status != "failed" || result.Backups.Operation.FailureCode != l1.ComputerBackupFailureInsufficientDisk ||
+				result.StorageProvenance != nil || result.Observation == nil || result.Observation.Status != "failed" ||
+				result.Observation.Error == "" || provenanceReads.Load() != 1 {
+				t.Fatalf("typed failure with provenance %s: exit=%d, reads=%d, want capacity_exhausted exit 5 and recorded provenance miss: %s",
+					miss, code, provenanceReads.Load(), output)
+			}
+			if miss == "deadline" && !strings.Contains(result.Observation.Error, "timed out") {
+				t.Fatalf("provenance deadline missing from observation: %s", output)
+			}
+		})
+	}
+}
+
+func TestStorageObservationPreservesErrorAtDeadline(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		exit int
+	}{
+		{"deferred", &custodyImportOutcomeError{importID: "import-1", outcome: custodyImportDeferred}, exitCustodyImportDeferred},
+		{"quarantined", &custodyImportOutcomeError{importID: "import-1", outcome: custodyImportQuarantined}, exitCustodyImportQuarantined},
+		{"failed", &custodyImportOutcomeError{importID: "import-1", outcome: custodyImportFailed}, exitCustodyImportFailed},
+		{"superseded", &custodyImportOutcomeError{importID: "import-1", outcome: custodyImportSuperseded}, exitCustodyImportSuperseded},
+		{"forbidden", &apiResponseError{StatusCode: http.StatusForbidden, APIError: contract.APIError{Code: contract.ErrorForbidden}}, exitUnauthorized},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observation, err := pollStorageObservation(t.Context(), storageWaitFlags{timeout: 10 * time.Millisecond}, func(ctx context.Context) (bool, error) {
+				// The outcome has arrived; delay returning it until the deadline
+				// to make the race in fail() deterministic.
+				<-ctx.Done()
+				return false, test.err
+			})
+			if !errors.Is(err, test.err) || commandExitCode(err) != test.exit ||
+				observation.Status != "failed" || observation.Error != test.err.Error() {
+				t.Fatalf("outcome at deadline: exit=%d, want %d, observation=%#v, err=%v", commandExitCode(err), test.exit, observation, err)
+			}
+		})
 	}
 }
