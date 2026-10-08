@@ -601,7 +601,7 @@
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
           "503": {
-            "description": "Retryable internal failure (code internal, retryable=true), including L1 failing to authenticate the ledger during dispatch lookup or job cancellation. The dependency cause is logged on the server; if intent was recorded, reconciliation retries delivery with durable exponential backoff. An authorized terminal Run returns 200 with its recorded state despite L1 delivery failures.",
+            "description": "Retryable internal failure (code internal, retryable=true), including L1 failing to authenticate the ledger during dispatch lookup or job cancellation. For cancellation delivery failures the cause is logged on the server; if intent was recorded, reconciliation retries delivery with durable exponential backoff. An authorized terminal Run returns 200 with its recorded state despite L1 delivery failures.",
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } }
           }
         }
