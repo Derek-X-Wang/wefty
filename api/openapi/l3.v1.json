@@ -11,6 +11,7 @@
       "get": {
         "operationId": "getLedgerHealth",
         "summary": "Read ledger dispatch admission independently of Run acceptance",
+        "description": "Requires the L3 caller principal. Run and Computer bearers are refused locally before any L1 scope proof; health reads make no L1 call.",
         "security": [{ "fabricIdentity": [] }],
         "responses": {
           "200": { "description": "Ledger dispatch condition; an absent hold means no admission hold is recorded.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/DispatchHealth" } } } },
@@ -876,7 +877,7 @@
           "run_id": { "type": "string" },
           "l1_job_id": { "type": "string" },
           "dispatch_attempts": { "type": "integer", "minimum": 0 },
-          "dispatch_error": { "$ref": "./common.v1.json#/components/schemas/Error" },
+          "dispatch_error": { "$ref": "./common.v1.json#/components/schemas/Error", "description": "Unrecognised L1 answers remain retryable internal errors. Diagnostics retain only L1 HTTP status (details.l1_status), code (details.l1_code), retryable flag (details.l1_retryable), and request_id when available; response messages, details and raw bodies are excluded. Caller-facing HTTP internal errors scrub the diagnostic message and details." },
           "job": { "$ref": "./common.v1.json#/components/schemas/Job" }
         }
       },

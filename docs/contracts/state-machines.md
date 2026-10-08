@@ -1125,10 +1125,13 @@ canceled" ahead of any earlier attempt exit, spawn failure or lease loss.
 Ledger admission failure is one persisted ledger-wide Dispatch hold, not a
 Run transition. Waiting Runs remain `pending` or `dispatching`. `RunRecord`,
 `RunSummary` and `RunExecution` expose `dispatch_hold` with generation, reason,
-since and next probe time; `wefty runs list` prints the reason and onset.
+since and next probe time; `wefty runs list` prints the reason and onset,
+and human `wefty inspect` shows the hold reason, onset and next probe time.
 `GET /v1/health` exposes the same condition once for the ledger. Health is
 chosen because it can be read without an L1 call, even during an identity
-outage, while accepting new Runs remains available.
+outage, while accepting new Runs remains available. Health requires the L3
+caller principal; Run and Computer bearers are refused locally before any L1
+scope proof.
 
 Only affirmative L1 evidence of ledger non-admission starts the hold:
 operational identity failure, credential-free authentication/principal refusal,
@@ -1137,6 +1140,12 @@ ledger-only proofs and dispatch lookup. A reasonless Computer or host proof
 `forbidden` is that resource's refusal. Only a submission work refusal fails a
 Run; cancellation refusal ends cancellation delivery alone. Unknown answers,
 incomplete envelopes and mux `no_route` never prove refusal or absence.
+Unrecognised answers remain transient. Their `dispatch_error` and reconcile
+log retain only L1 HTTP status, code, retryable flag and request ID when
+available, never response messages, details or raw bodies. The stored error
+is retryable `internal`, with `details.l1_status`, `details.l1_code` and
+`details.l1_retryable`; the L1 request ID is `request_id`. Caller-facing HTTP
+errors continue to scrub internal messages and details.
 
 The hold gates submission atomically with the existing cancellation and
 terminal guards. Projection, cancellation and terminal dispatch recovery
@@ -1145,9 +1154,14 @@ admission with exponential backoff from one second to one minute. Validated
 200 or resource 404 clears only the probed generation; redirects, malformed
 answers, `no_route`, submit replay and person `whoami` cannot clear it.
 Reservations expire after the bounded request so a restart resumes probing.
+Probe keys are opaque non-bearer IDs. Repeated refusals with the same reason
+perform no hold write unless a probe is in flight; only an in-flight probe
+requires a generation bump to fence a late admission answer. A pass without
+a due probe checks the hold read-only before taking any write lock.
 Other transient submission errors use persisted per-Run backoff capped at one
-minute. A held Run retains its exact staged bearer until acknowledgement or
-terminal scrubbing. Idempotent Run submission replay neither adds an outbox
+minute; its retry row is removed when dispatch is acknowledged or the Run
+ends, and a late submit error cannot restart that backoff. A held Run retains
+its exact staged bearer until acknowledgement or terminal scrubbing. Idempotent Run submission replay neither adds an outbox
 entry nor changes the hold. Previously failed Runs are never revived.
 
 An operational WhoIs failure on L3's own front door is retryable 503

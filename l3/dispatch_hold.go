@@ -72,15 +72,23 @@ func runDispatchHold(ctx context.Context, q holdReader, runID string) (*contract
 	return readDispatchHold(ctx, q)
 }
 
-// Every affirmative refusal advances the generation. Onset and the existing
-// probe schedule survive repeated observations, and an in-flight reservation
-// survives too: no other pass can start a second probe beside it.
+// Repeated refusals preserve onset and schedule without another write. Only an
+// in-flight probe needs a generation bump to fence its eventual success.
 func (s *Store) holdDispatch(ctx context.Context, reason string) error {
+	var since sql.NullInt64
+	var previous, probeID string
+	if err := s.db.QueryRowContext(ctx, `SELECT since_ns,reason,probe_id FROM dispatch_hold WHERE singleton=1`).Scan(&since, &previous, &probeID); err != nil {
+		return internalError(err, "read dispatch hold refusal")
+	}
+	if since.Valid && previous == reason && probeID == "" {
+		return nil
+	}
 	now := s.recoveryNow().UnixNano()
-	_, err := s.db.ExecContext(ctx, `UPDATE dispatch_hold SET generation=generation+1,
+	_, err := s.db.ExecContext(ctx, `UPDATE dispatch_hold SET generation=CASE WHEN generation=0 THEN 1 WHEN probe_id<>'' THEN generation+1 ELSE generation END,
  since_ns=COALESCE(since_ns,?), reason=?,
  next_probe_ns=CASE WHEN since_ns IS NULL THEN ? ELSE next_probe_ns END,
- failures=CASE WHEN since_ns IS NULL THEN 0 ELSE failures END WHERE singleton=1`, now, reason, now+int64(time.Second))
+ failures=CASE WHEN since_ns IS NULL THEN 0 ELSE failures END
+ WHERE singleton=1 AND (since_ns IS NULL OR reason<>? OR probe_id<>'')`, now, reason, now+int64(time.Second), reason)
 	if err != nil {
 		return internalError(err, "persist dispatch hold")
 	}
@@ -105,22 +113,33 @@ type dispatchProbe struct {
 }
 
 func (s *Store) reserveDispatchProbe(ctx context.Context, budget time.Duration) (*dispatchProbe, error) {
+	var generation int64
+	var since sql.NullInt64
+	var next, until int64
+	now := s.recoveryNow()
+	readDue := func(q holdReader) (bool, error) {
+		if err := q.QueryRowContext(ctx, `SELECT generation,since_ns,next_probe_ns,probe_until_ns FROM dispatch_hold WHERE singleton=1`).Scan(&generation, &since, &next, &until); err != nil {
+			return false, internalError(err, "read admission probe")
+		}
+		return since.Valid && next <= now.UnixNano() && until <= now.UnixNano(), nil
+	}
+	due, err := readDue(s.db)
+	if err != nil || !due {
+		return nil, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, internalError(err, "reserve admission probe")
 	}
 	defer tx.Rollback()
-	var generation int64
-	var since sql.NullInt64
-	var next, until int64
-	if err := tx.QueryRowContext(ctx, `SELECT generation,since_ns,next_probe_ns,probe_until_ns FROM dispatch_hold WHERE singleton=1`).Scan(&generation, &since, &next, &until); err != nil {
-		return nil, internalError(err, "read admission probe")
+	// Another pass may have reserved, cleared or rescheduled the hold since
+	// the read-only check. Revalidate under the write lock before reserving.
+	now = s.recoveryNow()
+	due, err = readDue(tx)
+	if err != nil || !due {
+		return nil, err
 	}
-	now := s.recoveryNow()
-	if !since.Valid || next > now.UnixNano() || until > now.UnixNano() {
-		return nil, nil
-	}
-	id := newToken()
+	id := newID("probe")
 	p := &dispatchProbe{generation: generation, id: id, key: "l3-admission-" + id}
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_hold SET probe_id=?,probe_until_ns=? WHERE singleton=1`, id, now.Add(budget+time.Second).UnixNano()); err != nil {
 		return nil, internalError(err, "write admission probe")

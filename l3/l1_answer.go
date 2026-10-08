@@ -2,6 +2,7 @@ package l3
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,11 +24,12 @@ const (
 )
 
 type l1Answer struct {
-	Kind           l1AnswerKind
-	Method, Target string
-	Status         int
-	Reason         string
-	Response       *l1ResponseError
+	Kind             l1AnswerKind
+	Method, Target   string
+	Status           int
+	Reason           string
+	identityRequired bool
+	Response         *l1ResponseError
 }
 
 func classifyL1Answer(err error) l1Answer {
@@ -37,6 +39,7 @@ func classifyL1Answer(err error) l1Answer {
 		return a
 	}
 	a.Response, a.Method, a.Target, a.Status = response, response.method, response.path, response.status
+	a.identityRequired = a.Status == http.StatusUnauthorized && response.protocol.Code == contract.ErrorPersonIdentityRequired
 	if response.requestMethod != "" {
 		a.Method, a.Target = response.requestMethod, response.requestPath
 	}
@@ -72,7 +75,7 @@ func classifyL1Answer(err error) l1Answer {
 	}
 	// Older identity-routing refusals are dependency errors, but do not
 	// supply the affirmative evidence needed for a ledger-wide hold.
-	if a.Status == 401 && code == contract.ErrorPersonIdentityRequired {
+	if a.identityRequired {
 		return a
 	}
 	if a.Reason == "no_route" {
@@ -163,14 +166,29 @@ func proxyL1Error(err error) error {
 	if a.Kind == l1LedgerNotAdmitted {
 		return &Error{Code: contract.ErrorUnavailable, Message: "control plane cannot currently admit the run ledger", Retryable: true, RequestID: a.Response.protocol.RequestID, Details: map[string]any{"reason": a.Reason}, Cause: err}
 	}
-	if a.Response != nil && a.Status == 401 && a.Response.protocol.Code == contract.ErrorPersonIdentityRequired {
+	if a.identityRequired {
 		return &Error{Code: contract.ErrorUnavailable, Message: "control plane requires a different identity", Retryable: true, Cause: err}
 	}
 	if a.Kind == l1Transient && a.Response != nil {
 		return &Error{Code: a.Response.protocol.Code, Message: a.Response.protocol.Message, Retryable: true, Details: a.Response.protocol.Details, RequestID: a.Response.protocol.RequestID, Cause: err}
 	}
 	if a.Kind == l1ProtocolViolation {
-		return internalError(err, "invalid control plane response")
+		details := map[string]any{"l1_status": a.Status}
+		message := fmt.Sprintf("invalid control plane response: status=%d", a.Status)
+		evidence := a.Response.evidence
+		if code, ok := evidence["code"].(string); ok {
+			details["l1_code"] = code
+			message += fmt.Sprintf(" code=%q", code)
+		}
+		if retryable, ok := evidence["retryable"].(bool); ok {
+			details["l1_retryable"] = retryable
+			message += fmt.Sprintf(" retryable=%t", retryable)
+		}
+		requestID, _ := evidence["request_id"].(string)
+		if requestID != "" {
+			message += fmt.Sprintf(" request_id=%q", requestID)
+		}
+		return &Error{Code: contract.ErrorInternal, Message: message, Retryable: true, Details: details, RequestID: requestID, Cause: err}
 	}
 	return err
 }

@@ -1952,12 +1952,22 @@ WHERE run_id=? AND status NOT IN (?, ?)`,
 	return clearStagedTokenDelivery(ctx, tx, runID)
 }
 
+func clearDispatchRetry(ctx context.Context, tx *sql.Tx, runID string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dispatch_retry WHERE run_id=?`, runID); err != nil {
+		return internalError(err, "clear dispatch retry")
+	}
+	return nil
+}
+
 // clearStagedTokenDelivery drops a terminal run's staged run-token bearer. A
 // terminal run is never dispatched again, so a bearer still staged for a
 // dispatch L3 never recorded -- L1 accepted the job, L3 crashed before
 // completeDispatch, and the run then ended -- would otherwise stay in the
 // outbox in plaintext forever (#52).
 func clearStagedTokenDelivery(ctx context.Context, tx *sql.Tx, runID string) error {
+	if err := clearDispatchRetry(ctx, tx, runID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET token_delivery=NULL WHERE run_id=? AND token_delivery IS NOT NULL`, runID); err != nil {
 		return internalError(err, "clear terminal run's staged token delivery")
 	}
@@ -2109,6 +2119,15 @@ func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchE
 	if err != nil {
 		return internalError(err, "record dispatch error")
 	}
+	var waiting bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE r.run_id=? AND r.status IN ('pending','dispatching') AND o.dispatched_ns IS NULL AND r.job_link_settled=0
+ AND NOT EXISTS(SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id))`, runID).Scan(&waiting); err != nil {
+		return internalError(err, "read dispatch retry eligibility")
+	}
+	if !waiting {
+		return tx.Commit()
+	}
 	var failures int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT failures FROM dispatch_retry WHERE run_id=?),0)`, runID).Scan(&failures); err != nil {
 		return internalError(err, "read dispatch retries")
@@ -2197,6 +2216,9 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID); err != nil {
 			return err
 		}
+	}
+	if err := clearDispatchRetry(ctx, tx, runID); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return internalError(err, "commit dispatch completion")
@@ -2508,6 +2530,9 @@ func (s *Store) failMissingL1Job(ctx context.Context, run projectedRun) (bool, e
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, canonicalTime(now.Add(s.tokenGrace)).UnixNano(), run.RunID); err != nil {
 		return false, internalError(err, "expire L1-regressed run token")
+	}
+	if err := clearDispatchRetry(ctx, tx, run.RunID); err != nil {
+		return false, err
 	}
 	if err := tx.Commit(); err != nil {
 		return false, internalError(err, "commit L1 regression")

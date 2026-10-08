@@ -162,7 +162,7 @@ func (s *Server) routes() http.Handler {
 	workflows.HandleFunc("GET /v1/workflows/{workflow_id}/versions/{version}", s.getWorkflowVersion)
 
 	root := http.NewServeMux()
-	root.Handle("GET /v1/health", s.authenticateFabric(s.authorize(s.requireCaller(http.HandlerFunc(s.getDispatchHealth)))))
+	root.Handle("GET /v1/health", s.authenticateFabric(s.requireHealthCaller(s.authorize(http.HandlerFunc(s.getDispatchHealth)))))
 	root.Handle("/v1/computer-token/mint", s.authenticateFabric(http.HandlerFunc(s.mintComputerToken)))
 	root.Handle("/v1/computer-token/revoke", s.authenticateFabric(http.HandlerFunc(s.revokeComputerTokens)))
 	root.Handle("/v1/computer-token/revoke-attempt", s.authenticateFabric(http.HandlerFunc(s.revokeComputerAttemptTokens)))
@@ -288,6 +288,18 @@ func (s *Server) authorize(next http.Handler) http.Handler {
 		tags, err := normalizeTags(identity.Tags)
 		if err != nil || !slices.Contains(tags, s.callerPrincipalTag) {
 			writeError(w, protocolError(contract.ErrorForbidden, "fabric identity is not authorized for the L3 caller protocol"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Health never needs L1 authority: refuse bearer access before authorize can
+// verify a Computer scope through the control plane.
+func (s *Server) requireHealthCaller(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.TrimSpace(r.Header.Get("Authorization")) != "" {
+			writeError(w, protocolError(contract.ErrorForbidden, "bearer tokens are not authorized for ledger health"))
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -442,7 +454,8 @@ func (s *Server) revokeHostComputerTokens(w http.ResponseWriter, r *http.Request
 			return internalError(errors.New("L1 host boot session verifier is not configured"), "revoke host Computer tokens")
 		}
 		err := s.hostBootSessions.ProveHostBootSession(ctx, identity.NodeID, request.StableNodeID, request.BootSessionID)
-		if classifyL1Answer(err).Kind == l1LedgerNotAdmitted || classifyL1Answer(err).Kind == l1ProtocolViolation {
+		answer := classifyL1Answer(err)
+		if answer.Kind == l1LedgerNotAdmitted || answer.Kind == l1ProtocolViolation {
 			return proxyL1Error(err)
 		}
 		if code, _ := errorDetails(err); err != nil && (code == contract.ErrorForbidden || code == contract.ErrorNotFound) {
@@ -560,13 +573,14 @@ func (s *Server) verifyComputerScope(ctx context.Context, scope ComputerTokenSco
 		return internalError(errors.New("L1 Computer grant verifier is not configured"), "verify Computer token scope")
 	}
 	proof, err := s.computerGrants.ProveComputerTokenScope(ctx, scope.ComputerID, scope.ComputerAttemptID, hostIdentityNodeID, "")
-	if classifyL1Answer(err).Kind == l1LedgerNotAdmitted || classifyL1Answer(err).Kind == l1ProtocolViolation {
+	answer := classifyL1Answer(err)
+	if answer.Kind == l1LedgerNotAdmitted || answer.Kind == l1ProtocolViolation {
 		return proxyL1Error(err)
 	}
 	if err != nil {
 		code, _ := errorDetails(err)
 		switch code {
-		case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorNotFound,
+		case contract.ErrorForbidden, contract.ErrorNotFound,
 			contract.ErrorConflict, contract.ErrorStalePolicyRevision:
 			return protocolError(contract.ErrorUnauthorized, "Computer token scope is no longer authoritative")
 		default:

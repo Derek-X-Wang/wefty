@@ -446,6 +446,13 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 	if err := table.Flush(); err != nil {
 		return err
 	}
+	for _, run := range inspection.Runs {
+		if hold := run.DispatchHold; hold != nil {
+			if _, err := fmt.Fprintf(writer, "dispatch hold: %s: %s since %s; next probe %s\n", run.RunID, hold.Reason, hold.Since.Format(time.RFC3339), hold.NextProbeAt.Format(time.RFC3339)); err != nil {
+				return err
+			}
+		}
+	}
 	// Why a run failed is the first thing a reader of a failed run wants, so
 	// it follows the table rather than hiding under --execution.
 	for index, run := range inspection.Runs {
