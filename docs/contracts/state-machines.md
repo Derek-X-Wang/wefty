@@ -1153,11 +1153,21 @@ log retain only L1 HTTP status, code, retryable flag and request ID when
 available, never response messages, details or raw bodies. The stored error
 is retryable `internal`, with `details.l1_status`, `details.l1_code` and
 `details.l1_retryable`; the L1 request ID is `request_id`. Caller-facing HTTP
-errors continue to scrub internal messages and details. Diagnostic L1 code and
-request ID strings (including a request ID obtained from the response header)
-are each capped at 128 Unicode runes. Longer strings retain the first 127
-runes followed by `…`; this same bounded evidence is stored, logged and used
-when relaying the diagnostic request ID in `X-Request-Id`.
+errors continue to scrub internal messages and details.
+
+Every L1 error answer is bounded once at the L1-client seam, before
+classification: code, message, request ID (including diagnostic IDs from response
+headers), and all string detail keys and values, including nested details and
+`details.reason`. Each string is capped at 128 Unicode runes. Longer strings
+retain the first 125 runes followed by the ASCII marker `...`; strings of at
+most 128 runes are unchanged. This applies to transient answers, ledger
+non-admission, work refusal, authoritative absence and protocol violations.
+These same bounded strings reach stored errors, reconcile and HTTP logs,
+relayed errors and `X-Request-Id`; the Dispatch hold reason inherits the same
+bound from the answer. The ASCII marker keeps truncated ASCII request IDs
+visible ASCII; Unicode strings retain their UTF-8 prefix. Protocol violations
+still exclude response messages, details and raw bodies from their diagnostics,
+and caller-facing internal errors still scrub messages and details.
 
 The hold gates submission atomically with the existing cancellation and
 terminal guards. Projection, cancellation and terminal dispatch recovery

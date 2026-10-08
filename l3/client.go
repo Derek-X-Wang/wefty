@@ -308,6 +308,9 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 	if err := json.Unmarshal(responseBody, &responseError); err != nil || responseError.Error.Code == "" {
 		return &l1ResponseError{requestMethod: request.Method, requestPath: request.URL.RequestURI(), status: response.StatusCode, method: method, path: path, redirected: redirected, evidence: evidence, protocol: &Error{Code: contract.ErrorInternal, Message: fmt.Sprintf("L1 returned HTTP %d", response.StatusCode), Retryable: response.StatusCode >= 500 || response.StatusCode == http.StatusTooManyRequests}}
 	}
+	// Normalise every decoded error at the client seam, before classification
+	// or any persistence, logging, hold creation or HTTP relay can use it.
+	responseError.Error = boundedL1Error(responseError.Error)
 	return &l1ResponseError{requestMethod: request.Method, requestPath: request.URL.RequestURI(), status: response.StatusCode, method: method, path: path, redirected: redirected, validEnvelope: validL1ErrorEnvelope(responseBody), evidence: evidence, protocol: &Error{
 		Code: responseError.Error.Code, Message: responseError.Error.Message,
 		Retryable: responseError.Error.Retryable, Details: responseError.Error.Details,
@@ -394,17 +397,48 @@ func l1ErrorEvidence(body []byte, requestID string) map[string]any {
 	return evidence
 }
 
-// The ellipsis occupies the last of 128 runes. Iterate only far enough to
-// find the boundary, preserving UTF-8 without copying a large rune slice.
+// All L1 error strings use the same bound, including nested detail strings and
+// the reason that becomes a Dispatch hold. Non-string detail values retain
+// their decoded types. Raw response bodies never leave the client seam.
+func boundedL1Error(value contract.APIError) contract.APIError {
+	value.Code = contract.ErrorCode(boundedL1Evidence(string(value.Code)))
+	value.Message = boundedL1Evidence(value.Message)
+	value.RequestID = boundedL1Evidence(value.RequestID)
+	if value.Details != nil {
+		value.Details = boundedL1Details(value.Details).(map[string]any)
+	}
+	return value
+}
+
+func boundedL1Details(value any) any {
+	switch value := value.(type) {
+	case string:
+		return boundedL1Evidence(value)
+	case map[string]any:
+		details := make(map[string]any, len(value))
+		for key, item := range value {
+			details[boundedL1Evidence(key)] = boundedL1Details(item)
+		}
+		return details
+	case []any:
+		for i, item := range value {
+			value[i] = boundedL1Details(item)
+		}
+	}
+	return value
+}
+
+// The ASCII marker occupies the last three of 128 runes. Iterate only far
+// enough to find the boundary, preserving UTF-8 without a large rune slice.
 func boundedL1Evidence(value string) string {
 	const limit = 128
 	var runes, cutoff int
 	for i := range value {
-		if runes == limit-1 {
+		if runes == limit-3 {
 			cutoff = i
 		}
 		if runes == limit {
-			return value[:cutoff] + "…"
+			return value[:cutoff] + "..."
 		}
 		runes++
 	}
