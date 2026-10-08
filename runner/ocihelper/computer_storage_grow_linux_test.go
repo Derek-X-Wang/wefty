@@ -301,14 +301,25 @@ func TestComputerGrowCapacityRetryNeverDoubleReservesMaterializedDelta(t *testin
 
 func TestComputerGrowCapacityRefusalReturnsBoundUnchangedReceipt(t *testing.T) {
 	root := t.TempDir()
-	available, err := filesystemAvailableBytes(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := growTestRequest(available + (16 << 20))
-	prepareGrowTestImage(t, root, request)
+	// Pin the admission snapshot. Real free space can increase after the
+	// first statfs (another test frees its fixture), accidentally admitting a
+	// huge grow of this deliberately unformatted admission-only image.
+	const available = 4 << 20
+	request := growTestRequest(16 << 20)
+	imagePath := prepareGrowTestImage(t, root, request)
 	engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root},
-		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt)}
+		capacityReservations: make(map[string]*capacityReservation), attempts: make(map[string]*containerdAttempt),
+		computerGrowAvailableBytes: func(path string) (int64, error) {
+			if path != filepath.Dir(imagePath) {
+				t.Errorf("capacity root = %q", path)
+			}
+			return available, nil
+		},
+		computerGrowResize: func(context.Context, string, string, int64, int64) error {
+			t.Error("capacity refusal reached filesystem resize")
+			return errors.New("unexpected resize of an unformatted admission fixture")
+		},
+	}
 	response, err := engine.GrowComputerStorage(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -319,8 +330,22 @@ func TestComputerGrowCapacityRefusalReturnsBoundUnchangedReceipt(t *testing.T) {
 		receipt.StorageGeneration != request.Storage.StorageGeneration || receipt.NodeID != request.Authority.NodeID ||
 		receipt.RootInstanceID != request.Authority.RootInstanceID || receipt.OperationFence != request.Authority.OperationFence ||
 		receipt.OldDiskBytes != request.Storage.DiskBytes || receipt.NewDiskBytes != request.NewDiskBytes ||
-		receipt.HelperGeneration != request.Authority.HelperGeneration {
+		receipt.HelperGeneration != request.Authority.HelperGeneration || receipt.ObservedAvailableBytes != available {
 		t.Fatalf("capacity refusal receipt = %#v", receipt)
+	}
+	if info, err := os.Stat(imagePath); err != nil || info.Size() != request.Storage.DiskBytes {
+		t.Fatalf("refused grow changed image: %v err=%v", info, err)
+	}
+	diskRoot := filepath.Dir(imagePath)
+	manifest, present, err := readComputerDiskManifest(filepath.Join(diskRoot, "attachment.json"))
+	if err != nil || !present || manifest.Storage != request.Storage {
+		t.Fatalf("refused grow changed manifest: %+v present=%t err=%v", manifest, present, err)
+	}
+	if _, present, err := readComputerStorageGrowIntent(diskRoot); err != nil || present {
+		t.Fatalf("refused grow left durable intent: present=%t err=%v", present, err)
+	}
+	if len(engine.capacityReservations) != 0 {
+		t.Fatalf("refused grow reserved capacity: %+v", engine.capacityReservations)
 	}
 }
 

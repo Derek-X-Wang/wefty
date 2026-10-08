@@ -207,9 +207,22 @@ func TestRunningLimaWithUnreadyHelperIsBoundedAndForceStoppedOnce(t *testing.T) 
 type readyLimaHelperEngine struct{ ocihelper.UnavailableEngine }
 
 type residueLimaHelperEngine struct {
-	ocihelper.UnavailableEngine
-	mu          sync.Mutex
-	verifyCalls int
+	readyLimaHelperEngine
+	mu              sync.Mutex
+	verifiedStartup bool
+	residue         ocihelper.ResourceInventory
+}
+
+func (engine *residueLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	// Let the server's startup barrier admit sessions, then expose residue
+	// when the agent's readiness barrier verifies the namespace over RPC.
+	if !engine.verifiedStartup {
+		engine.verifiedStartup = true
+		return ocihelper.VerifyResponse{Absent: true}, nil
+	}
+	return ocihelper.VerifyResponse{Inventory: engine.residue, RuntimeResidue: engine.residue}, nil
 }
 
 type helperServeObservation struct {
@@ -232,22 +245,6 @@ func (readyLimaHelperEngine) Sweep(_ context.Context, request ocihelper.SweepReq
 
 func (readyLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
 	return ocihelper.VerifyResponse{Absent: true}, nil
-}
-
-func (engine *residueLimaHelperEngine) Sweep(_ context.Context, request ocihelper.SweepRequest) (ocihelper.SweepResponse, error) {
-	return ocihelper.SweepResponse{SweepEpoch: request.SweepEpoch}, nil
-}
-
-func (engine *residueLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	engine.verifyCalls++
-	if engine.verifyCalls == 1 {
-		return ocihelper.VerifyResponse{Absent: true}, nil
-	}
-	const sentinel = "wefty-cgroup-handshake-private-sentinel"
-	residue := ocihelper.ResourceInventory{Cgroups: []string{sentinel}}
-	return ocihelper.VerifyResponse{Inventory: residue, RuntimeResidue: residue}, nil
 }
 
 func startReadyLimaHelper(t *testing.T, checksum string) (string, *helperServeObservation) {
@@ -304,29 +301,13 @@ func TestSupervisedBarrierReadinessDiagnosticDoesNotExposeResidueInventory(t *te
 		defer logMu.Unlock()
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	}
-	supervisor.config.wait = func(context.Context, time.Duration) error {
-		return errors.New("stop after the first readiness diagnostic")
-	}
-	checksum := "sha256:" + strings.Repeat("a", 64)
-	socketPath, _ := startLimaHelper(t, checksum, &residueLimaHelperEngine{})
-	client := &ocihelper.Client{
-		Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
-		Dial: func(ctx context.Context) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
-		},
-	}
-	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
-		TakeoverTimeout: 25 * time.Millisecond,
-		TakeoverRetry:   time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = helperBarrier.Close() })
-	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
-	if err := barrier.Ensure(t.Context()); err == nil {
-		t.Fatal("residue readiness attempt unexpectedly succeeded")
-	}
+	// This test owns the diagnostic, not handshake timing. Inject the completed
+	// failure synchronously into the exact logging path used by readiness, so
+	// no takeover timer can substitute a stall for the residue error.
+	residue := ocihelper.ResourceInventory{Cgroups: []string{sentinel}}
+	supervisor.logHelperReadinessFailure(&ocihelper.NamespaceResidueError{
+		Operation: "verify OCI runtime namespace", Observed: residue, RuntimeResidue: residue,
+	}, contract.CapabilityReasonBootSweepFailed)
 	logMu.Lock()
 	defer logMu.Unlock()
 	if len(logs) != 1 {
@@ -348,6 +329,58 @@ func TestSupervisedBarrierReadinessDiagnosticDoesNotExposeResidueInventory(t *te
 		if !strings.Contains(logs[0], field) {
 			t.Errorf("readiness diagnostic missing %q: %q", field, logs[0])
 		}
+	}
+}
+
+func TestSupervisedBarrierReadinessPathDoesNotExposeResidueInventory(t *testing.T) {
+	const sentinel = "wefty-cgroup-readiness-private-sentinel"
+	intent := newMutableIntent(true)
+	runner := &supervisorRunner{states: []InstanceState{InstanceRunning}}
+	supervisor := newTestSupervisor(t, intent, runner)
+	supervisor.config.RecoveryTimeout = 30 * time.Second
+	var logMu sync.Mutex
+	var logs []string
+	supervisor.config.Logf = func(format string, arguments ...any) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		logs = append(logs, fmt.Sprintf(format, arguments...))
+	}
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	socketPath, _ := startLimaHelper(t, checksum, &residueLimaHelperEngine{
+		residue: ocihelper.ResourceInventory{Cgroups: []string{sentinel}},
+	})
+	client := &ocihelper.Client{Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+		},
+	}
+	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client,
+		ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"},
+		ocihelper.BootBarrierConfig{TakeoverTimeout: 10 * time.Second},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
+	t.Cleanup(func() { _ = barrier.Close() })
+	err = barrier.Ensure(t.Context())
+	var residue *ocihelper.NamespaceResidueError
+	if !errors.As(err, &residue) || !strings.Contains(residue.Error(), sentinel) || barrier.Ready() {
+		t.Fatalf("readiness did not encounter the sentinel residue: err=%v ready=%t", err, barrier.Ready())
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	sawResidueType := false
+	for _, line := range logs {
+		if strings.Contains(line, sentinel) {
+			t.Errorf("readiness path exposed runtime inventory: %q", line)
+		}
+		if strings.Contains(line, "error_type=*ocihelper.NamespaceResidueError") {
+			sawResidueType = true
+		}
+	}
+	if !sawResidueType {
+		t.Fatalf("readiness path never logged the residue error type: %q", logs)
 	}
 }
 

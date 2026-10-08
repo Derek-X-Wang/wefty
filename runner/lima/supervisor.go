@@ -750,6 +750,30 @@ func lockSupervisorCycle(ctx context.Context, mutex *sync.Mutex) error {
 	}
 }
 
+// logHelperReadinessFailure reports bounded classifications without rendering
+// the error, whose message may include private runtime resource inventory.
+func (supervisor *Supervisor) logHelperReadinessFailure(err error, innerReason contract.CapabilityReasonCode) {
+	reason := classifyHelperBarrierError(err)
+	if logf := supervisor.config.Logf; logf != nil {
+		var networkError net.Error
+		networkTimeout := errors.As(err, &networkError) && networkError.Timeout()
+		logf(
+			"Lima helper readiness attempt failed: reason=%s inner_reason=%s error_type=%T canceled=%t deadline=%t eof=%t timeout=%t not_exist=%t connection_refused=%t connection_reset=%t broken_pipe=%t",
+			reason,
+			innerReason,
+			err,
+			errors.Is(err, context.Canceled),
+			errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded),
+			errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe),
+			networkTimeout,
+			errors.Is(err, os.ErrNotExist),
+			errors.Is(err, syscall.ECONNREFUSED),
+			errors.Is(err, syscall.ECONNRESET),
+			errors.Is(err, syscall.EPIPE),
+		)
+	}
+}
+
 func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, expected OCIIntent) error {
 	backoff := barrier.Supervisor.config.InitialBackoff
 	lastReason := contract.CapabilityReasonCode("")
@@ -772,25 +796,7 @@ func (barrier *SupervisedBootBarrier) ensureHelperReady(ctx context.Context, exp
 			break
 		}
 		reason := classifyHelperBarrierError(err)
-		if logf := barrier.Supervisor.config.Logf; logf != nil {
-			innerReason := barrier.Barrier.CapabilityReasonCode()
-			var networkError net.Error
-			networkTimeout := errors.As(err, &networkError) && networkError.Timeout()
-			logf(
-				"Lima helper readiness attempt failed: reason=%s inner_reason=%s error_type=%T canceled=%t deadline=%t eof=%t timeout=%t not_exist=%t connection_refused=%t connection_reset=%t broken_pipe=%t",
-				reason,
-				innerReason,
-				err,
-				errors.Is(err, context.Canceled),
-				errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded),
-				errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe),
-				networkTimeout,
-				errors.Is(err, os.ErrNotExist),
-				errors.Is(err, syscall.ECONNREFUSED),
-				errors.Is(err, syscall.ECONNRESET),
-				errors.Is(err, syscall.EPIPE),
-			)
-		}
+		barrier.Supervisor.logHelperReadinessFailure(err, barrier.Barrier.CapabilityReasonCode())
 		if reason == contract.CapabilityReasonHelperHandshakeStalled {
 			barrier.Supervisor.recordStalledWindow()
 		}
