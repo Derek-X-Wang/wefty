@@ -317,7 +317,7 @@ func TestSupervisedBarrierReadinessDiagnosticDoesNotExposeResidueInventory(t *te
 		t.Fatalf("readiness diagnostic exposed runtime inventory: %q", logs[0])
 	}
 	for _, field := range []string{
-		"reason=helper_handshake_failed",
+		"reason=boot_sweep_failed",
 		"inner_reason=boot_sweep_failed",
 		"error_type=*ocihelper.NamespaceResidueError",
 		"canceled=false",
@@ -326,7 +326,7 @@ func TestSupervisedBarrierReadinessDiagnosticDoesNotExposeResidueInventory(t *te
 		"timeout=false",
 		"connection_refused=false",
 	} {
-		if !strings.Contains(logs[0], field) {
+		if !slices.Contains(strings.Fields(logs[0]), field) {
 			t.Errorf("readiness diagnostic missing %q: %q", field, logs[0])
 		}
 	}
@@ -822,19 +822,48 @@ func TestSupervisedBarrierReasonsStayInStableVocabulary(t *testing.T) {
 		err  error
 		want contract.CapabilityReasonCode
 	}{
+		{err: nil, want: ""},
+		{err: errors.Join(&helperHandshakeStalledPersistentError{}, &ocihelper.HelperHandshakeStalledError{}), want: contract.CapabilityReasonHelperHandshakeStalledPersistent},
 		{err: &ocihelper.RPCError{Code: ocihelper.CodeChecksumMismatch}, want: contract.CapabilityReasonHelperVersionMismatch},
 		{err: &ocihelper.RPCError{Code: ocihelper.CodeVersionMismatch}, want: contract.CapabilityReasonHelperVersionMismatch},
 		{err: &ocihelper.RPCError{Code: ocihelper.CodePeerUnauthenticated}, want: contract.CapabilityReasonLocalPermissionDenied},
 		{err: &ocihelper.HelperUnitUnavailableError{DialAttempts: 4, Cause: os.ErrNotExist}, want: contract.CapabilityReasonHelperUnitUnavailable},
 		{err: &ocihelper.HelperHandshakeStalledError{DialAttempts: 1, Cause: context.DeadlineExceeded}, want: contract.CapabilityReasonHelperHandshakeStalled},
-		{err: errors.New("acquire: dial OCI helper: connection refused at private path"), want: contract.CapabilityReasonHelperUnreachable},
-		{err: errors.New("send OCI helper handshake: reset"), want: contract.CapabilityReasonHelperHandshakeFailed},
+		{err: fmt.Errorf("acquire: %w", &ocihelper.HelperDialError{Cause: errors.New("private transport failure")}), want: contract.CapabilityReasonHelperUnreachable},
+		{err: fmt.Errorf("acquire: %w", &ocihelper.HelperHandshakeError{Cause: errors.New("private protocol failure")}), want: contract.CapabilityReasonHelperHandshakeFailed},
+		{err: &ocihelper.HelperHandshakeError{Cause: &ocihelper.RPCError{Code: ocihelper.CodeVersionMismatch}}, want: contract.CapabilityReasonHelperVersionMismatch},
 		{err: errors.New("verify OCI runtime namespace: residue"), want: contract.CapabilityReasonBootSweepFailed},
 	}
 	for _, test := range tests {
-		if got := classifyHelperBarrierError(test.err); got != test.want || !got.Valid() {
+		if got := classifyHelperBarrierError(test.err); got != test.want || (got != "" && !got.Valid()) {
 			t.Fatalf("classify %v = %q, want %q", test.err, got, test.want)
 		}
+	}
+}
+
+type unreadableHelperError struct{}
+
+func (unreadableHelperError) Error() string { panic("classifier must not read private error text") }
+
+func TestHelperBarrierClassifierIgnoresPrivateText(t *testing.T) {
+	for _, inventory := range []string{"handshake", "dial OCI helper", "ordinary-path"} {
+		t.Run(inventory, func(t *testing.T) {
+			residue := ocihelper.ResourceInventory{Cgroups: []string{inventory}}
+			err := fmt.Errorf("private wrapper mentioning handshake: %w", &ocihelper.NamespaceResidueError{
+				Operation: "verify", Observed: residue, RuntimeResidue: residue,
+			})
+			if got := classifyHelperBarrierError(err); got != contract.CapabilityReasonBootSweepFailed {
+				t.Fatalf("residue classification = %q, want boot_sweep_failed", got)
+			}
+		})
+	}
+	for _, message := range []string{"handshake", "dial OCI helper"} {
+		if got := classifyHelperBarrierError(errors.New(message)); got != contract.CapabilityReasonBootSweepFailed {
+			t.Errorf("untyped failure classification = %q, want boot_sweep_failed", got)
+		}
+	}
+	if got := classifyHelperBarrierError(unreadableHelperError{}); got != contract.CapabilityReasonBootSweepFailed {
+		t.Errorf("opaque failure classification = %q, want boot_sweep_failed", got)
 	}
 }
 
@@ -1124,5 +1153,54 @@ func TestSupervisorDoesNotReinspectAStoppedInstanceWithoutAFault(t *testing.T) {
 	}
 	if got := runner.commandsSnapshot(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("commands = %v, want no extra inspection without a fault", got)
+	}
+}
+
+func TestHelperBarrierRefusedSweepRPCIsUnreachable(t *testing.T) {
+	checksum := "sha256:" + strings.Repeat("a", 64)
+	helperPath, _ := startLimaHelper(t, checksum, &readyLimaHelperEngine{})
+	temporary, err := os.CreateTemp("/tmp", "wefty-refused-rpc-*.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refusedPath := temporary.Name()
+	t.Cleanup(func() { _ = os.Remove(refusedPath) })
+	if err := temporary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(refusedPath); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: refusedPath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	dials := 0
+	client := &ocihelper.Client{ExpectedChecksum: checksum, Dial: func(ctx context.Context) (net.Conn, error) {
+		dials++
+		path := helperPath
+		if dials > 1 {
+			path = refusedPath
+		}
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
+	}}
+	barrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = barrier.Close() })
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = barrier.Ensure(ctx)
+	var loss *ocihelper.RuntimeLossError
+	if dials != 2 || !errors.Is(err, syscall.ECONNREFUSED) || !errors.As(err, &loss) || barrier.Ready() {
+		t.Fatalf("did not reach refused sweep RPC after session admission: dials=%d err=%v ready=%t", dials, err, barrier.Ready())
+	}
+	if reason := classifyHelperBarrierError(err); reason != contract.CapabilityReasonHelperUnreachable {
+		t.Fatalf("refused sweep RPC reason = %q, want helper_unreachable: %v", reason, err)
 	}
 }

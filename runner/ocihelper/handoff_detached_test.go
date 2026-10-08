@@ -35,7 +35,7 @@ func TestDetachedHandoffCancelledFreeResumesOnNextPass(t *testing.T) {
 			err := freeDetachedHandoffRoot(ctx, root, func(child string) error {
 				freed++
 				cancel()
-				return os.RemoveAll(filepath.Join(root, child))
+				return nil
 			})
 			if err != nil {
 				t.Fatalf("cancelled free must leave its detached root for the next pass: %v", err)
@@ -49,7 +49,7 @@ func TestDetachedHandoffCancelledFreeResumesOnNextPass(t *testing.T) {
 				t.Fatalf("cancelled free: freed=%d remaining=%d err=%v", freed, len(remaining), err)
 			}
 			if err := freeDetachedHandoffRoot(t.Context(), root, func(child string) error {
-				return os.RemoveAll(filepath.Join(root, child))
+				return nil
 			}); err != nil {
 				t.Fatalf("next pass: %v", err)
 			}
@@ -73,6 +73,78 @@ func TestDetachedHandoffFreeRemovesNonDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(root); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("non-directory detached root remains: %v", err)
+	}
+}
+
+func TestDetachedHandoffFreeUnlinksSymlinkWithoutTouchingTarget(t *testing.T) {
+	for _, targetKind := range []string{"directory", "file", "missing"} {
+		t.Run(targetKind, func(t *testing.T) {
+			base := t.TempDir()
+			root := filepath.Join(base, ".removing-wefty-handoff-volume-test")
+			target := filepath.Join(base, "outside-handoffs")
+			payload := target
+			if targetKind == "directory" {
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				payload = filepath.Join(target, "result.json")
+			}
+			if targetKind != "missing" {
+				if err := os.WriteFile(payload, []byte("keep"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(target, root); err != nil {
+				t.Fatal(err)
+			}
+			walked := false
+			err := freeDetachedHandoffRoot(t.Context(), root, func(child string) error {
+				walked = true
+				return nil
+			})
+			if err != nil || walked {
+				t.Errorf("free symlink: walked=%t err=%v", walked, err)
+			}
+			if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("detached symlink remains: %v", err)
+			}
+			if targetKind != "missing" {
+				if content, err := os.ReadFile(payload); err != nil || string(content) != "keep" {
+					t.Errorf("symlink target changed: content=%q err=%v", content, err)
+				}
+			}
+		})
+	}
+}
+
+// RemoveAll must unlink a child symlink rather than walking its target. This
+// exercises removal through the retained root used by the helper.
+func TestDetachedHandoffFreeDoesNotFollowChildSymlink(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, ".removing-wefty-handoff-volume-test")
+	target := filepath.Join(base, "outside-handoffs")
+	for _, directory := range []string{root, target} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payload := filepath.Join(target, "result.json")
+	if err := os.WriteFile(payload, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, "child")); err != nil {
+		t.Fatal(err)
+	}
+	if err := freeDetachedHandoffRoot(t.Context(), root, func(child string) error {
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("detached root remains: %v", err)
+	}
+	if content, err := os.ReadFile(payload); err != nil || string(content) != "keep" {
+		t.Errorf("child symlink target changed: content=%q err=%v", content, err)
 	}
 }
 
@@ -153,5 +225,81 @@ func TestDetachedHandoffReadPreservesCloseFailureAfterVanish(t *testing.T) {
 	complete, err := freeDetachedHandoffContents(t.Context(), "detached", directory, func(string) error { return nil })
 	if complete || !errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrNotExist) || !directory.closed {
 		t.Fatalf("close failure: complete=%t err=%v", complete, err)
+	}
+}
+
+func TestDetachedHandoffRootSwapDuringChildRemovalStaysConfined(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "detached")
+	moved := filepath.Join(base, "moved")
+	outside := filepath.Join(base, "outside")
+	for _, directory := range []string{root, outside} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		for _, child := range []string{"first", "second"} {
+			if err := os.WriteFile(filepath.Join(directory, child), []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	freed := 0
+	err := freeDetachedHandoffRoot(t.Context(), root, func(child string) error {
+		if freed == 0 {
+			if err := os.Rename(root, moved); err != nil {
+				return err
+			}
+			if err := os.Symlink(outside, root); err != nil {
+				return err
+			}
+		}
+		freed++
+		return nil
+	})
+	if err != nil || freed != 2 {
+		t.Fatalf("free swapped root: children=%d err=%v", freed, err)
+	}
+	for _, child := range []string{"first", "second"} {
+		if content, err := os.ReadFile(filepath.Join(outside, child)); err != nil || string(content) != "keep" {
+			t.Errorf("outside child %s changed: content=%q err=%v", child, content, err)
+		}
+	}
+	if children, err := os.ReadDir(moved); err != nil || len(children) != 0 {
+		t.Errorf("original detached tree was not freed: children=%v err=%v", children, err)
+	}
+}
+
+func TestDetachedHandoffRootSwapBeforeOpenFailsIdentityCheck(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "detached")
+	moved := filepath.Join(base, "moved")
+	outside := filepath.Join(base, "outside")
+	for _, directory := range []string{root, outside} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, "child"), []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	walked := false
+	err := freeDetachedHandoffRootWithOpenHook(t.Context(), root, func(child string) error {
+		walked = true
+		return nil
+	}, func() {
+		if err := os.Rename(root, moved); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, root); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err == nil || walked {
+		t.Errorf("root replacement must fail before walking children: walked=%t err=%v", walked, err)
+	}
+	for _, directory := range []string{moved, outside} {
+		if content, err := os.ReadFile(filepath.Join(directory, "child")); err != nil || string(content) != "keep" {
+			t.Errorf("child in %s changed: content=%q err=%v", directory, content, err)
+		}
 	}
 }
