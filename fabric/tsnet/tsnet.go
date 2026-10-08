@@ -182,7 +182,7 @@ func (f *Fabric) issuingFabricID(ctx context.Context, client *local.Client) (str
 		return "", fmt.Errorf("tsnet fabric: read issuing Fabric identity: %w", err)
 	}
 	if status.CurrentTailnet == nil || status.CurrentTailnet.MagicDNSSuffix == "" {
-		return "", errors.New("tsnet fabric: issuing Fabric identity is unavailable")
+		return "", fabric.ErrIssuingFabricUnavailable
 	}
 	f.fabricID = coordinatorFabricID(f.coordinatorURL, status.CurrentTailnet.MagicDNSSuffix)
 	return f.fabricID, nil
@@ -190,7 +190,7 @@ func (f *Fabric) issuingFabricID(ctx context.Context, client *local.Client) (str
 
 func identityFromWhoIs(who *apitype.WhoIsResponse, fabricID string) (fabric.Identity, error) {
 	if who == nil || who.Node == nil || who.Node.StableID == "" {
-		return fabric.Identity{}, errors.New("tsnet fabric: WhoIs returned an incomplete identity")
+		return fabric.Identity{}, fabric.ErrIdentityIncomplete
 	}
 	identity := fabric.Identity{
 		NodeID:   string(who.Node.StableID),
@@ -203,7 +203,7 @@ func identityFromWhoIs(who *apitype.WhoIsResponse, fabricID string) (fabric.Iden
 		return identity, nil
 	}
 	if who.UserProfile == nil || who.UserProfile.ID == 0 {
-		return fabric.Identity{}, errors.New("tsnet fabric: WhoIs returned an incomplete identity")
+		return fabric.Identity{}, fabric.ErrIdentityIncomplete
 	}
 	identity.UserID = strconv.FormatInt(int64(who.UserProfile.ID), 10)
 	identity.DisplayName = who.UserProfile.DisplayName

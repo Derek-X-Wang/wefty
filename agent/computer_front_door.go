@@ -384,7 +384,11 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 	identity, err := frontDoor.config.fabric.WhoIs(request.Context(), request.RemoteAddr)
 	if err != nil {
 		frontDoor.recordPreAuthorizationDenial(fabric.Identity{}, l1.ComputerTakeoverIdentityUnavailable)
-		http.Error(writer, "Fabric identity could not be authenticated", http.StatusUnauthorized)
+		if errors.Is(err, fabric.ErrIdentityNotFound) {
+			http.Error(writer, "Fabric identity could not be authenticated", http.StatusUnauthorized)
+		} else {
+			http.Error(writer, "Fabric identity could not be verified", http.StatusServiceUnavailable)
+		}
 		return
 	}
 	if request.URL.Path == computerControlTakePath || request.URL.Path == computerControlReleasePath {

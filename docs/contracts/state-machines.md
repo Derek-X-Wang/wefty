@@ -820,6 +820,14 @@ The private Computer front door accepts only `GET /websockify` with exactly the
 helper-returned `view` endpoint, upgrades the client, and durably records
 `session_open` before forwarding any bytes. A control-authorized admission
 exposes only `CanTake` and a sealed capability bound to that live session.
+On every front-door path, including the sideband take/release actions,
+genuine Fabric identity absence (`ErrIdentityNotFound`, including wrapped
+errors) returns HTTP 401. An operational lookup failure instead returns
+HTTP 503 with the generic text `Fabric identity could not be verified`.
+The response never includes the underlying cause or diagnostic category.
+Both failures retain the `identity_unavailable` admission-denial audit
+reason, carry no asserted person identity, and stop before acquiring a
+grant, creating a session, or dialing a backend.
 Explicit `take` asks the attempt-local Controller-tenure state machine to move
 from Free to Held; the first eligible session retains the wheel and another
 nonadministrator receives typed `controller_busy`. An administrator still

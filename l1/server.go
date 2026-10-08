@@ -907,6 +907,10 @@ func (s *Server) authenticatedIdentity(w http.ResponseWriter, r *http.Request) (
 			cause = "timeout"
 		} else if errors.Is(err, context.Canceled) {
 			cause = "canceled"
+		} else if errors.Is(err, fabric.ErrIssuingFabricUnavailable) {
+			cause = "issuing_fabric_unavailable"
+		} else if errors.Is(err, fabric.ErrIdentityIncomplete) {
+			cause = "identity_incomplete"
 		}
 		s.logf("event=l1_identity_unverifiable request_id=%s class=%s cause=%s",
 			w.Header().Get(contract.RequestIDHeader), scrubbedClass(err), cause)
