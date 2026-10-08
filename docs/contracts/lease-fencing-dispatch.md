@@ -13,6 +13,26 @@ does not grant access to either existing protocol group, and client/agent tags
 do not synthesize a person. Administrator membership uses User ID; Device ID is
 audit evidence only.
 
+Every L1 authenticated path checks Fabric identity, including client, agent,
+person, cancel, and attempt-credential requests. Genuine identity absence
+(`errors.Is(err, fabric.ErrIdentityNotFound)`) returns `401 unauthorized`,
+`retryable:false`. Any other lookup failure returns `503 unavailable`,
+`retryable:true`, with `details.reason="identity_unverifiable"`. No handler
+or authority mutation runs when identity cannot be verified. L1 logs the
+cause type and a safe category (`lookup_failed`, `timeout`, or `canceled`)
+with the request ID; arbitrary Fabric error text, addresses, request bodies,
+queries, and bearer credentials are excluded from that diagnostic.
+
+The three ledger-only gates — dispatch-key lookup, Computer token-scope
+proof, and host boot-session proof — require the configured run-ledger
+Fabric Node identity in addition to the client principal. A different
+client identity receives `403 forbidden`, `retryable:false`, with
+`details.reason="run_ledger_not_admitted"`. Once the ledger is admitted,
+refusals about one Computer's or one host's authority retain their existing
+code and details without this reason. Principal-tag refusals are unchanged.
+Shared HTTP error codes remain an open vocabulary; this does not extend the
+OCI helper's closed protocol vocabulary.
+
 ## Atomic claim and eligibility
 
 A claim is one SQLite transaction that verifies durable operator intent permits
