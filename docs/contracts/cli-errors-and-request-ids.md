@@ -70,8 +70,8 @@ structured 401 authentication refusal exits 3. An unavailable result advises the
 retry with backoff within its authority. A bare `context.DeadlineExceeded` is
 not evidence of unavailability: only a typed transport/service availability
 failure or the named server-envelope cases map to exit 13. Caller cancellation
-(including Ctrl-C during take-over or registry requests) remains a local failure
-(exit 1), not `unavailable`.
+(including Ctrl-C during L1/L3 response-body reads, take-over or registry
+requests) remains a local failure (exit 1), not `unavailable`.
 
 A Computer storage, resize, or removal `--wait` that expires after acceptance
 exits 14 and emits a CLI-local `error.code=wait_timeout`, `retryable=false` on
@@ -87,6 +87,17 @@ for desired-state or removal mutations. A prior read cannot prove whether a
 mutation applied under a concurrent change, even for a repeated request.
 Read or wait for completion; do not assume the mutation failed or repeat it to
 recover observation.
+The wait deadline bounds every observation request, including response-body
+reads and any follow-up Storage provenance read. An L1 that accepts a
+connection but never answers cannot extend the wait. Once the wait times out
+or the caller cancels, no follow-up provenance request is started.
+A missing `storage_provenance` after a timeout means "not read", not "untainted";
+`services backup list COMPUTER` reads it.
+An already-observed typed failure keeps its own exit code if a follow-up
+provenance read fails or times out; that miss is recorded in `observation.error`.
+Only an observation error caused by `context.DeadlineExceeded` becomes
+`wait_timeout`; a typed outcome or HTTP refusal arriving at the deadline keeps
+its classification.
 Caller cancellation is a separate local failure. Grant revocation
 (`services revoke --wait`) also exits 14 on an accepted-mutation
 observation timeout. It retains `revocation_wait_timeout`, its existing
