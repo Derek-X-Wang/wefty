@@ -408,6 +408,15 @@ under, because a check anywhere else has a window after it, and the thing in
 that window is a running container losing the files under its mount. A node
 that meets it keeps the results and chooses again.
 
+Handoff deletion detaches the volume and unlinks its paired terminal receipt
+under the retention lock before freeing the detached `.removing-*` tree.
+Concurrent authorized deletion and collection may free that same tree: ENOENT
+while opening or reading the detached directory means it is already deleted,
+even when a read also returned buffered child names. Other read and close
+failures remain errors. Success still independently verifies absence of both
+the original volume and its receipt; a racing repair cannot publish a receipt
+for a volume that was detached under that lock.
+
 `computer_storage_busy` and `computer_storage_retired` are definitive
 attempt-scoped `Run` refusals only after the helper positively reaps the losing
 attempt and verifies no runtime remains. `computer_storage_busy` is also the

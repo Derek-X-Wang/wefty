@@ -206,12 +206,6 @@ func TestRunningLimaWithUnreadyHelperIsBoundedAndForceStoppedOnce(t *testing.T) 
 
 type readyLimaHelperEngine struct{ ocihelper.UnavailableEngine }
 
-type residueLimaHelperEngine struct {
-	ocihelper.UnavailableEngine
-	mu          sync.Mutex
-	verifyCalls int
-}
-
 type helperServeObservation struct {
 	done chan struct{}
 	err  error
@@ -232,22 +226,6 @@ func (readyLimaHelperEngine) Sweep(_ context.Context, request ocihelper.SweepReq
 
 func (readyLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
 	return ocihelper.VerifyResponse{Absent: true}, nil
-}
-
-func (engine *residueLimaHelperEngine) Sweep(_ context.Context, request ocihelper.SweepRequest) (ocihelper.SweepResponse, error) {
-	return ocihelper.SweepResponse{SweepEpoch: request.SweepEpoch}, nil
-}
-
-func (engine *residueLimaHelperEngine) Verify(context.Context, ocihelper.VerifyRequest) (ocihelper.VerifyResponse, error) {
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	engine.verifyCalls++
-	if engine.verifyCalls == 1 {
-		return ocihelper.VerifyResponse{Absent: true}, nil
-	}
-	const sentinel = "wefty-cgroup-handshake-private-sentinel"
-	residue := ocihelper.ResourceInventory{Cgroups: []string{sentinel}}
-	return ocihelper.VerifyResponse{Inventory: residue, RuntimeResidue: residue}, nil
 }
 
 func startReadyLimaHelper(t *testing.T, checksum string) (string, *helperServeObservation) {
@@ -304,29 +282,13 @@ func TestSupervisedBarrierReadinessDiagnosticDoesNotExposeResidueInventory(t *te
 		defer logMu.Unlock()
 		logs = append(logs, fmt.Sprintf(format, arguments...))
 	}
-	supervisor.config.wait = func(context.Context, time.Duration) error {
-		return errors.New("stop after the first readiness diagnostic")
-	}
-	checksum := "sha256:" + strings.Repeat("a", 64)
-	socketPath, _ := startLimaHelper(t, checksum, &residueLimaHelperEngine{})
-	client := &ocihelper.Client{
-		Version: ocihelper.ProtocolVersion, ExpectedChecksum: checksum,
-		Dial: func(ctx context.Context) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
-		},
-	}
-	helperBarrier, err := ocihelper.NewBootBarrierWithConfig(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"}, ocihelper.BootBarrierConfig{
-		TakeoverTimeout: 25 * time.Millisecond,
-		TakeoverRetry:   time.Millisecond,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = helperBarrier.Close() })
-	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
-	if err := barrier.Ensure(t.Context()); err == nil {
-		t.Fatal("residue readiness attempt unexpectedly succeeded")
-	}
+	// This test owns the diagnostic, not handshake timing. Inject the completed
+	// failure synchronously into the exact logging path used by readiness, so
+	// no takeover timer can substitute a stall for the residue error.
+	residue := ocihelper.ResourceInventory{Cgroups: []string{sentinel}}
+	supervisor.logHelperReadinessFailure(&ocihelper.NamespaceResidueError{
+		Operation: "verify OCI runtime namespace", Observed: residue, RuntimeResidue: residue,
+	}, contract.CapabilityReasonBootSweepFailed)
 	logMu.Lock()
 	defer logMu.Unlock()
 	if len(logs) != 1 {

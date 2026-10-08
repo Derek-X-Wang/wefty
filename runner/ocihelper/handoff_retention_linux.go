@@ -54,10 +54,6 @@ const (
 	// descriptor is held per level and never released while its children are
 	// being measured, so this is also the bound on descriptors in flight.
 	maxHandoffMeasureDepth = 64
-	// handoffReadChunk is how many names one directory read returns. Reading a
-	// whole directory at once would let a workload choose the helper's
-	// allocation, which is the same mistake as an unbounded walk.
-	handoffReadChunk = 256
 	// maxHandoffVolumeAnomalies bounds one volume's observations so a response
 	// cannot grow with a workload's tree.
 	maxHandoffVolumeAnomalies = 4
@@ -445,29 +441,9 @@ func (engine *ContainerdEngine) freeDetachedHandoffTree(ctx context.Context, det
 	if err != nil {
 		return err
 	}
-	for {
-		if ctx != nil && ctx.Err() != nil {
-			log.Printf("handoff retention: %s stays detached and the next pass frees it: %v", detached, ctx.Err())
-			return errors.Join(directory.Close(), nil)
-		}
-		children, readErr := directory.Readdirnames(handoffReadChunk)
-		for _, child := range children {
-			if ctx != nil && ctx.Err() != nil {
-				log.Printf("handoff retention: %s stays detached and the next pass frees it: %v", detached, ctx.Err())
-				return directory.Close()
-			}
-			if err := engine.freeDetachedHandoffChild(detached, child); err != nil {
-				return errors.Join(err, directory.Close())
-			}
-		}
-		if errors.Is(readErr, io.EOF) || len(children) == 0 {
-			break
-		}
-		if readErr != nil {
-			return errors.Join(readErr, directory.Close())
-		}
-	}
-	if err := directory.Close(); err != nil {
+	if err := freeDetachedHandoffContents(ctx, detached, directory, func(child string) error {
+		return engine.freeDetachedHandoffChild(detached, child)
+	}); err != nil {
 		return err
 	}
 	if err := os.Remove(root); err != nil && !errors.Is(err, os.ErrNotExist) {
