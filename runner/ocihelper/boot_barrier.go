@@ -526,22 +526,11 @@ func (barrier *BootBarrier) HandshakeStalledWindows() uint64 {
 }
 
 func (barrier *BootBarrier) recordCapabilityReason(err error) {
-	reason := contract.CapabilityReasonCode("")
+	reason := ClassifyBarrierError(err)
 	// A bound read from a helper describes that helper generation only. A
 	// barrier that succeeded, or one that proved no helper answered at all,
 	// leaves nothing for a stale tripped reading to describe.
-	forget := err == nil
-	if err != nil {
-		var unavailable *HelperUnitUnavailableError
-		if errors.As(err, &unavailable) {
-			reason = contract.CapabilityReasonHelperUnitUnavailable
-			forget = true
-		} else if errors.As(err, new(*HelperHandshakeStalledError)) {
-			reason = contract.CapabilityReasonHelperHandshakeStalled
-		} else {
-			reason = contract.CapabilityReasonBootSweepFailed
-		}
-	}
+	forget := err == nil || reason == contract.CapabilityReasonHelperUnitUnavailable
 	barrier.mu.Lock()
 	barrier.reason = reason
 	if reason == contract.CapabilityReasonHelperHandshakeStalled {

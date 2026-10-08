@@ -20,10 +20,11 @@ const (
 // RunSummary is one row of the listing: what a reader needs to recognise a run
 // and decide whether to open it.
 type RunSummary struct {
-	RunID       string            `json:"run_id"`
-	ParentRunID string            `json:"parent_run_id,omitempty"`
-	Status      contract.RunState `json:"status"`
-	Trigger     contract.Trigger  `json:"trigger"`
+	DispatchHold *contract.DispatchHold `json:"dispatch_hold,omitempty"`
+	RunID        string                 `json:"run_id"`
+	ParentRunID  string                 `json:"parent_run_id,omitempty"`
+	Status       contract.RunState      `json:"status"`
+	Trigger      contract.Trigger       `json:"trigger"`
 	// CurrentStep is the step the run is in now, derived from its own step
 	// envelopes. It is empty for a run that reported none and for one whose
 	// steps have all ended.
@@ -144,6 +145,11 @@ func (s *Store) ListRuns(ctx context.Context, filter RunListFilter) (RunListPage
 		if terminalRunState(page.Runs[index].Status) {
 			continue
 		}
+		hold, err := runDispatchHold(ctx, s.db, page.Runs[index].RunID)
+		if err != nil {
+			return RunListPage{}, err
+		}
+		page.Runs[index].DispatchHold = hold
 		envelopes, err := s.ListEnvelopes(ctx, page.Runs[index].RunID)
 		if err != nil {
 			return RunListPage{}, err

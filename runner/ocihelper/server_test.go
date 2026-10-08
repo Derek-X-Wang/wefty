@@ -2575,7 +2575,7 @@ func TestPriorBootEvidenceSurvivesStartupConsumptionAndSessionReapGeneration(t *
 	}
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "generation 1 session reap")
 
-	gen2, err := client.OpenSession(t.Context(), AcquireSessionRequest{NodeID: "node-1", BootSessionID: "boot-2", ExpectedHelperChecksum: "checksum-test"})
+	gen2, err := openReplacementSession(t.Context(), client, AcquireSessionRequest{NodeID: "node-1", BootSessionID: "boot-2", ExpectedHelperChecksum: "checksum-test"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2815,7 +2815,7 @@ func TestExclusiveSessionEOFAndHeartbeatBlackholeFailClosed(t *testing.T) {
 	}
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "EOF session reap")
 
-	second, err := client.OpenSession(t.Context(), AcquireSessionRequest{NodeID: "node-2", BootSessionID: "boot-2"})
+	second, err := openReplacementSession(t.Context(), client, AcquireSessionRequest{NodeID: "node-2", BootSessionID: "boot-2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3154,7 +3154,7 @@ func TestFailedSessionReapStopsHelperForFreshProcessRecovery(t *testing.T) {
 	}
 	_ = session.Close()
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "failed session reap")
-	_, err = client.OpenSession(t.Context(), AcquireSessionRequest{NodeID: "replacement", BootSessionID: "replacement-boot"})
+	_, err = openReplacementSession(t.Context(), client, AcquireSessionRequest{NodeID: "replacement", BootSessionID: "replacement-boot"})
 	if err == nil {
 		t.Fatal("failed reap left the helper accepting connections")
 	}
@@ -3231,7 +3231,7 @@ func TestHeartbeatRefreshesOnlyExactLiveAttemptDeadman(t *testing.T) {
 	}
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "stale-attempt session reap")
 
-	replacement, err := client.OpenSession(t.Context(), testSessionRequest())
+	replacement, err := openReplacementSession(t.Context(), client, testSessionRequest())
 	if err != nil {
 		t.Fatal(err)
 	}

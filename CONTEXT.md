@@ -58,6 +58,11 @@ workload dispatches child work. It is what delivers the in-job credentials to
 the workload; a run without it reports through its run mailbox and holds none.
 _Avoid_: token flag, credential flag, privileged run
 
+**Dispatch hold**:
+The run ledger has paused sending runs because the control plane won't
+currently admit it; never a property of one run.
+_Avoid_: failed run, run hold, dispatch failure, paused run
+
 **Pattern** _(reserved — does not exist yet)_:
 A future declarative plan, expressed as data, that the ledger itself would
 interpret into runs. Named for what a loom follows. Reserved so it can never

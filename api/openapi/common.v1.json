@@ -7,6 +7,17 @@
   "paths": {},
   "components": {
     "schemas": {
+      "DispatchHold": {
+        "description": "Ledger-wide admission condition, projected only onto Runs waiting to submit. Never a Run outcome.",
+        "type": "object", "additionalProperties": false,
+        "required": ["generation", "reason", "since", "next_probe_at"],
+        "properties": {
+          "generation": { "type": "integer", "minimum": 1 },
+          "reason": { "type": "string" },
+          "since": { "type": "string", "format": "date-time" },
+          "next_probe_at": { "type": "string", "format": "date-time" }
+        }
+      },
       "ComputerTokenRevocationReceipt": {
         "type": "object", "additionalProperties": false,
         "required": ["computer_id", "submit_intent_revision", "revoked_grant_count", "committed_at"],
@@ -34,7 +45,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "Stable machine-readable error code. CLI transport failures (including request deadlines and a deadline or timeout waiting for the take-over display banner after WebSocket upgrade) and non-envelope HTTP 5xx use unavailable with retryable=true and exit 13. HTTP 5xx envelopes with retryable internal or run_ledger_unavailable also exit 13 while retaining the server code; non-retryable versions remain exit 1. Bare local deadlines and caller cancellation (including Ctrl-C during L1/L3 response-body reads, take-over or registry requests) are not unavailable; cancellation remains exit 1. Accepted-mutation observation timeouts use the CLI-local wait_timeout code, retryable=false, and exit 14; this is not a server error code. Computer storage, resize and removal waits bound every observation HTTP request and response-body read by the wait deadline, including follow-up Storage provenance; no provenance read starts after timeout or caller cancellation. details.mutation_applied is always present: true or false from the Computer receipt (false for replay/no-op), and always null for service lifecycle/removal because L1 provides no applied receipt for desired-state or remove mutations; a prior read cannot prove application under a concurrent change. Null means applied evidence is unknown. services revoke --wait also exits 14 on revocation_wait_timeout, retaining that code, retryability, and receipt-derived applied evidence."
+            "description": "Stable machine-readable error code; shared HTTP codes are open vocabulary. L1 operational Fabric identity lookup failures return HTTP 503 unavailable, retryable=true, details.reason=identity_unverifiable; genuine absence remains HTTP 401 unauthorized. CLI transport failures (including request deadlines and a deadline or timeout waiting for the take-over display banner after WebSocket upgrade) and non-envelope HTTP 5xx use unavailable with retryable=true and exit 13, including Computer take-over front-door responses to view open, take, and release (such as plain-text 503 display-not-ready or identity-unverifiable failures). Structured take-over refusals retain their existing classification; a plain-text or structured 401 authentication refusal exits 3. HTTP 5xx envelopes with retryable internal or run_ledger_unavailable also exit 13 while retaining the server code; non-retryable versions remain exit 1. Bare local deadlines and caller cancellation (including Ctrl-C during L1/L3 response-body reads, take-over or registry requests) are not unavailable; cancellation remains exit 1. Accepted-mutation observation timeouts use the CLI-local wait_timeout code, retryable=false, and exit 14; this is not a server error code. Computer storage, resize and removal waits bound every observation HTTP request and response-body read by the wait deadline, including follow-up Storage provenance; no provenance read starts after timeout or caller cancellation. details.mutation_applied is always present: true or false from the Computer receipt (false for replay/no-op), and always null for service lifecycle/removal because L1 provides no applied receipt for desired-state or remove mutations; a prior read cannot prove application under a concurrent change. Null means applied evidence is unknown. services revoke --wait also exits 14 on revocation_wait_timeout, retaining that code, retryability, and receipt-derived applied evidence."
           },
           "message": { "type": "string" },
           "retryable": {
@@ -44,7 +55,7 @@
           "details": {
             "type": "object",
             "additionalProperties": true,
-            "description": "For stale_intent_revision (HTTP 409, retryable=false), expected_revision is the current stored intent revision and observed_revision is the revision supplied by the caller. Details also carry the resource identifier (node_id or computer_id). Mux 404/405 errors carry reason=no_route to distinguish missing routes or methods from resource refusals."
+            "description": "For stale_intent_revision (HTTP 409, retryable=false), expected_revision is the current stored intent revision and observed_revision is the revision supplied by the caller. Details also carry the resource identifier (node_id or computer_id). L1 operational identity lookup failures carry reason=identity_unverifiable (503 unavailable, retryable=true). On dispatch-key lookup, Computer token-scope proof, and host boot-session proof, refusal of a client that is not the configured run ledger carries reason=run_ledger_not_admitted (403 forbidden, retryable=false); per-Computer and per-host authority refusals retain their existing details without that reason. Mux 404/405 errors carry reason=no_route to distinguish missing routes or methods from resource refusals."
           },
           "request_id": { "type": "string", "description": "Server-generated HTTP request correlation ID, echoed in X-Request-Id and the server log. L3 preserves a relayed L1 error ID and adds its own ID in details.l3_request_id and X-L3-Request-Id. Omitted for CLI-local and stored decision errors that have no HTTP request." }
         }
@@ -497,7 +508,7 @@
             ]
           }
         },
-        "description": "Person-bound view-first discovery. friendly_name is the wefty-owned Computer name. The endpoint is the authorized Fabric front door, never a raw view/control backend; null means admission is not ready. Discovery is durable availability, never a live admission role: the front door always attempts view-first admission at the agent's current evaluator."
+        "description": "Person-bound view-first discovery. friendly_name is the wefty-owned Computer name. The endpoint is the authorized Fabric front door, never a raw view/control backend; null means admission is not ready. Discovery is durable availability, never a live admission role: the front door always attempts view-first admission at the agent's current evaluator. On that private endpoint and its sideband take/release paths, genuine Fabric identity absence returns HTTP 401; operational identity lookup failures return HTTP 503 with generic text, without the cause or diagnostic category, before any grant, session, or backend dial."
       },
       "ComputerHandleResolution": {
         "type": "object",
@@ -1358,6 +1369,7 @@
         "additionalProperties": false,
         "required": ["run_id", "status", "trigger", "created_at", "updated_at"],
         "properties": {
+          "dispatch_hold": { "$ref": "#/components/schemas/DispatchHold" },
           "run_id": { "type": "string" },
           "parent_run_id": { "type": "string" },
           "status": { "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"], "description": "The run's status, from the same vocabulary as RunRecord.status." },
@@ -1451,7 +1463,7 @@
           },
           "capability_reason_code": {
             "type": "string",
-            "description": "Closed capability restriction reason. helper_unreachable means a helper connection could not be established, including a sweep or verification RPC connection after session admission. helper_handshake_failed means the helper handshake or session admission failed. boot_sweep_failed means namespace residue remains or another sweep or verification failure occurred. helper_unit_unavailable means the helper socket unit remained absent or refused connections throughout takeover; helper_handshake_stalled means takeover connected but did not complete handshake or admission; helper_handshake_stalled_persistent means that stall persisted through the recovery deadline. helper_version_mismatch means the helper protocol version or checksum differs from the expected value; local_permission_denied means local permissions or helper peer authentication prevented access.",
+            "description": "Closed capability restriction reason. Native Linux and Lima boot barriers use the same typed helper failure classification. helper_unreachable means a helper connection could not be established, including a sweep or verification RPC connection after session admission. helper_handshake_failed means the helper handshake or session admission failed. boot_sweep_failed means namespace residue remains or another sweep or verification failure occurred. helper_unit_unavailable means the helper socket unit remained absent or refused connections throughout takeover; helper_handshake_stalled means takeover connected but did not complete handshake or admission; helper_handshake_stalled_persistent means that stall persisted through the recovery deadline. helper_version_mismatch means the helper protocol version or checksum differs from the expected value; local_permission_denied means local permissions or helper peer authentication prevented access.",
             "enum": [
               "oci_intent_disabled", "prerequisite_missing", "runtime_version_unsupported",
               "helper_unreachable", "helper_unit_unavailable", "helper_handshake_stalled", "helper_handshake_stalled_persistent",
@@ -1931,7 +1943,7 @@
         }
       },
       "Unauthorized": {
-        "description": "Authentication failed.",
+        "description": "Authentication failed. L1 returns 401 unauthorized with retryable=false for genuine Fabric identity absence; operational identity lookup failure is instead 503 unavailable.",
         "headers": {
           "X-Request-Id": { "$ref": "#/components/headers/RequestId" },
           "X-L3-Request-Id": { "$ref": "#/components/headers/L3RequestId" }
@@ -1995,6 +2007,17 @@
         "headers": {
           "X-Request-Id": { "$ref": "#/components/headers/RequestId" },
           "X-L3-Request-Id": { "$ref": "#/components/headers/L3RequestId" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "L1 could not verify Fabric identity because lookup failed operationally: unavailable, retryable=true, details.reason=identity_unverifiable. Applies to every L1 authenticated protocol, including person, cancel, and attempt credentials. The cause is logged safely server-side and never included in the response. Safe log categories include issuing_fabric_unavailable for missing issuing Fabric configuration and identity_incomplete for missing stable peer identity fields; these are diagnostics only and do not change this response.",
+        "headers": {
+          "X-Request-Id": { "$ref": "#/components/headers/RequestId" }
         },
         "content": {
           "application/json": {

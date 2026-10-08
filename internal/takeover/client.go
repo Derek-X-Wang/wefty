@@ -17,9 +17,10 @@ import (
 )
 
 // TransportError marks a failed exchange before an HTTP response was received
-// or a deadline or timeout waiting for the upgraded view admission banner.
+// or a non-envelope HTTP 5xx, or a deadline or timeout waiting for the upgraded
+// view admission banner.
 // Callers can classify availability without mistaking a local validation error
-// or a server refusal for a connection failure.
+// or a structured server refusal for a connection failure.
 type TransportError struct{ cause error }
 
 func (failure *TransportError) Error() string { return failure.cause.Error() }
@@ -73,9 +74,13 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 				failure.Error.Message = fmt.Sprintf("%s (HTTP %d)", failure.Error.Message, response.StatusCode)
 				return nil, &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
 			}
+			if response.StatusCode == http.StatusUnauthorized {
+				return nil, &ActionError{APIError: contract.APIError{Code: contract.ErrorUnauthorized,
+					Message: fmt.Sprintf("Computer view returned HTTP %d", response.StatusCode)}}
+			}
 		}
 		failure := fmt.Errorf("open Computer view session: %w", err)
-		if response == nil {
+		if response == nil || (response.StatusCode >= 500 && response.StatusCode < 600) {
 			return nil, &TransportError{cause: failure}
 		}
 		return nil, failure
@@ -172,6 +177,9 @@ func Perform(
 	}
 	var failure contract.ComputerControlErrorResponse
 	if err := json.Unmarshal(body, &failure); err != nil || failure.Error.Code == "" {
+		if response.StatusCode >= 500 && response.StatusCode < 600 {
+			return contract.ComputerControlReceipt{}, &TransportError{cause: fmt.Errorf("Computer %s returned HTTP %d", action, response.StatusCode)}
+		}
 		failure.Error = contract.APIError{Code: contract.ErrorInternal,
 			Message: fmt.Sprintf("Computer %s returned HTTP %d", action, response.StatusCode)}
 	}

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -57,7 +58,7 @@ func TestL1SerializedTransientDispatchRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.CloseIdleConnections()
-	s, _, _ := recoveryStore(t)
+	s, _, clock := recoveryStore(t)
 	record, _, err := s.CreateRun(ctx, CreateRunInput{IdempotencyKey: "transient", Actor: "test", Request: inlineRunRequest("#!/bin/sh\nexit 0\n")})
 	if err != nil {
 		t.Fatal(err)
@@ -80,6 +81,7 @@ func TestL1SerializedTransientDispatchRetries(t *testing.T) {
 	if err != nil || run.Status != contract.RunDispatching {
 		t.Fatalf("transient failed run: %+v %v", run, err)
 	}
+	clock.now = clock.now.Add(time.Second)
 	if _, err = probe.Exec(`DROP TRIGGER unavailable`); err != nil {
 		t.Fatal(err)
 	}
@@ -152,10 +154,10 @@ func TestL1RegressionExecutionReadBoundary(t *testing.T) {
 		body   string
 		want   int
 	}{
-		{"malformed", 404, `<html>proxy</html>`, 500},
-		{"auth", 401, `{"error":{"code":"unauthorized","message":"denied","retryable":false}}`, 401},
+		{"malformed", 404, `<html>proxy</html>`, 503},
+		{"auth", 401, `{"error":{"code":"unauthorized","message":"denied","retryable":false}}`, 503},
 		{"transient", 503, `{"error":{"code":"internal","message":"unavailable","retryable":true}}`, 503},
-		{"wrong code", 404, `{"error":{"code":"attempt_not_found","message":"absent","retryable":false}}`, 409},
+		{"wrong code", 404, `{"error":{"code":"attempt_not_found","message":"absent","retryable":false}}`, 503},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			status, body = tt.status, tt.body

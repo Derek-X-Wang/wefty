@@ -686,7 +686,7 @@ func importRealtimeProbeImage(t *testing.T, archivePath, helperSocket, helperChe
 	defer barrier.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	if err := barrier.Ensure(ctx); err != nil {
+	if err := ensureAcceptanceNamespace(ctx, barrier.Ensure, waitAcceptanceShimRetry); err != nil {
 		var residue *ocihelper.NamespaceResidueError
 		if recordResidue != nil && errors.As(err, &residue) {
 			recordResidue(residue)

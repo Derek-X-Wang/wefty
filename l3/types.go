@@ -147,11 +147,12 @@ type RunAccepted struct {
 // L3 dispatch and L1 execution seam. Job is the redacted L1 projection and is
 // absent until dispatch succeeds.
 type RunExecution struct {
-	RunID            string             `json:"run_id"`
-	L1JobID          string             `json:"l1_job_id,omitempty"`
-	DispatchAttempts int                `json:"dispatch_attempts"`
-	DispatchError    *contract.APIError `json:"dispatch_error,omitempty"`
-	Job              *l1.Job            `json:"job,omitempty"`
+	DispatchHold     *contract.DispatchHold `json:"dispatch_hold,omitempty"`
+	RunID            string                 `json:"run_id"`
+	L1JobID          string                 `json:"l1_job_id,omitempty"`
+	DispatchAttempts int                    `json:"dispatch_attempts"`
+	DispatchError    *contract.APIError     `json:"dispatch_error,omitempty"`
+	Job              *l1.Job                `json:"job,omitempty"`
 }
 
 // AttemptImageEvidence is the accepted L1 observation needed to freeze a

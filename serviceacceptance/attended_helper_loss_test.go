@@ -362,10 +362,9 @@ func lossFakes(t *testing.T, config attendedConfig, tunnelSurvives bool) (*fakeB
 		session: session, prepared: true,
 		// While the fault stands, a re-Ensure cannot reach the helper. That
 		// refusal is what gives the barrier a typed reason at all, and the
-		// reason is one BootBarrier.recordCapabilityReason actually emits: it
-		// only ever yields helper_unit_unavailable, helper_handshake_stalled or
-		// boot_sweep_failed, so pinning anything else would be a fake the real
-		// barrier could not produce.
+		// reason is one BootBarrier.recordCapabilityReason actually emits (the
+		// shared ClassifyBarrierError vocabulary), so pinning a reason outside
+		// it would be a fake the real barrier could not produce.
 		refuseEnsure:  func() bool { return faulted },
 		refusal:       errors.New("dial oci helper: connect: connection refused"),
 		refusalReason: contract.CapabilityReasonHelperUnitUnavailable,

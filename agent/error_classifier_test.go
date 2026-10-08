@@ -84,6 +84,11 @@ func TestClassifyAgentProtocolErrorDefaultsClientFailuresToTransient(t *testing.
 			StatusCode: http.StatusServiceUnavailable,
 			APIError:   contract.APIError{Code: contract.ErrorRunLedgerUnavailable, Retryable: false},
 		}},
+		{name: "identity unavailable", err: &ProtocolError{
+			StatusCode: http.StatusServiceUnavailable,
+			APIError: contract.APIError{Code: contract.ErrorUnavailable, Retryable: true,
+				Details: map[string]any{"reason": "identity_unverifiable"}},
+		}},
 		{name: "unknown", err: &ProtocolError{
 			StatusCode: http.StatusForbidden,
 			APIError:   contract.APIError{Code: contract.ErrorCode("future_code"), Retryable: false},

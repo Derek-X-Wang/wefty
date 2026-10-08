@@ -227,7 +227,7 @@ func TestL1ClientRedirectDoesNotInventJobAbsence(t *testing.T) {
 		t.Fatalf("redirect invented absence: %v", err)
 	}
 	var remote *l1ResponseError
-	if !errors.As(err, &remote) || remote.path != "/unknown" || calls != 2 {
+	if !errors.As(err, &remote) || remote.path != "/v1/jobs/job" || !remote.redirected || remote.status != http.StatusFound || calls != 1 {
 		t.Fatalf("lost redirect origin: %#v calls=%d", remote, calls)
 	}
 }

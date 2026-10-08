@@ -680,14 +680,24 @@ type Evidence struct {
 	Value string `json:"value"`
 }
 
+// DispatchHold is a ledger-wide condition projected onto waiting Runs.
+// It never changes a Run's outcome or its staged dispatch credentials.
+type DispatchHold struct {
+	Generation  int64     `json:"generation"`
+	Reason      string    `json:"reason"`
+	Since       time.Time `json:"since"`
+	NextProbeAt time.Time `json:"next_probe_at"`
+}
+
 type RunRecord struct {
-	SchemaVersion int      `json:"schema_version"`
-	RunID         string   `json:"run_id"`
-	L1JobID       string   `json:"l1_job_id,omitempty"`
-	NodeID        string   `json:"node_id,omitempty"`
-	ParentRunID   string   `json:"parent_run_id,omitempty"`
-	DispatchKey   string   `json:"dispatch_key"`
-	Status        RunState `json:"status"`
+	DispatchHold  *DispatchHold `json:"dispatch_hold,omitempty"`
+	SchemaVersion int           `json:"schema_version"`
+	RunID         string        `json:"run_id"`
+	L1JobID       string        `json:"l1_job_id,omitempty"`
+	NodeID        string        `json:"node_id,omitempty"`
+	ParentRunID   string        `json:"parent_run_id,omitempty"`
+	DispatchKey   string        `json:"dispatch_key"`
+	Status        RunState      `json:"status"`
 	// CancelStatus describes recorded cancellation delivery, independently of
 	// the Run outcome. It is absent until cancellation intent is recorded.
 	CancelStatus string `json:"cancel_status,omitempty"` // pending, settled, refused, completed (legacy)

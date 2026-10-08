@@ -27,6 +27,15 @@ remain unchanged in JSON. Non-retryable `internal` and
 `run_ledger_unavailable` remain exit 1. Retryability alone never changes an
 authority refusal or an unknown protocol code's exit.
 
+An L1 identity lookup that fails operationally returns `503 unavailable`,
+`retryable:true`, `details.reason="identity_unverifiable"`; the CLI preserves
+that server envelope and exits 13. Genuine Fabric identity absence remains
+`401 unauthorized` and exits 3. Node agents classify `unavailable` as
+transient without treating it as lost attempt or node-session authority.
+Ledger-only admission refusals remain `403 forbidden` and exit 3, adding
+`details.reason="run_ledger_not_admitted"`; per-Computer and per-host
+authority refusals carry no ledger-admission reason.
+
 `--json` and `--json=true` are global wherever they appear in the argument list,
 including after the command or its operands, except when consumed as another
 flag's value or after the `--` argument terminator. `--json=false` disables JSON;
@@ -45,7 +54,11 @@ request ID. Connection failures (including dial timeouts, request deadlines,
 and a deadline or timeout waiting for the display banner after a take-over
 WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
 `retryable=true`,
-exit 13. An unavailable result advises the operator to check reachability and
+exit 13. This includes non-envelope 5xx from the Computer take-over front door
+on `services takeover view`, `take`, and `release`, such as a plain-text 503
+when the display is not ready or Fabric identity cannot be verified. Structured
+take-over refusals keep their existing classification; a plain-text or structured
+401 authentication refusal exits 3. An unavailable result advises the operator to check reachability and
 retry with backoff within its authority. A bare `context.DeadlineExceeded` is
 not evidence of unavailability: only a typed transport/service availability
 failure or the named server-envelope cases map to exit 13. Caller cancellation

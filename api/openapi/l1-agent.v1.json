@@ -3,7 +3,7 @@
   "info": {
     "title": "Wefty L1 agent protocol",
     "version": "0.1.0-prerelease",
-    "description": "Fabric-authenticated node registration, liveness, claim, lease, log, and completion protocol. OCI helper control is a private node-local protocol: each heartbeat reply waits at most the authenticated helper HeartbeatTimeout minus min(100 ms, HeartbeatTimeout / 10), independently of send cadence. Heartbeats pipeline and successful attempt renewals flush immediately even while an earlier reply is outstanding. The wire TTL derives from absolute L1 expiry at send time, but the helper measures it from apply time: for an accepted reply, send-to-apply delay can overshoot that expiry by up to the reply wait budget (about 2.9 s by default, previously about 1 s). L1's first lease-loss requeue backoff is about 1 s before jitter and does not by itself cover this overshoot. A late or missing reply loses the helper session and triggers reap; the reply budget is not a hard wall-clock bound on scheduling or reap completion. See docs/contracts/oci-helper-protocol.md. Each HTTP request receives a server-generated X-Request-Id response header. Only HTTP errors (status >= 400) and panics produce a completion log; routine successes are silent. Panics log status=500 and propagate. Mux 404/405 envelopes carry details.reason=no_route; error.request_id matches the header."
+    "description": "Fabric-authenticated node registration, liveness, claim, lease, log, and completion protocol. OCI helper control is a private node-local protocol: each heartbeat reply waits at most the authenticated helper HeartbeatTimeout minus min(100 ms, HeartbeatTimeout / 10), independently of send cadence. Heartbeats pipeline and successful attempt renewals flush immediately even while an earlier reply is outstanding. The wire TTL derives from absolute L1 expiry at send time, but the helper measures it from apply time: for an accepted reply, send-to-apply delay can overshoot that expiry by up to the reply wait budget (about 2.9 s by default, previously about 1 s). L1's first lease-loss requeue backoff is about 1 s before jitter and does not by itself cover this overshoot. A late or missing reply loses the helper session and triggers reap; the reply budget is not a hard wall-clock bound on scheduling or reap completion. See docs/contracts/oci-helper-protocol.md. Each HTTP request receives a server-generated X-Request-Id response header. Only HTTP errors (status >= 400) and panics produce a completion log; routine successes are silent. Panics log status=500 and propagate. Mux 404/405 envelopes carry details.reason=no_route; error.request_id matches the header. Every authenticated request, including person, cancel and attempt-credential routes, returns 503 unavailable with retryable=true and details.reason=identity_unverifiable on an operational Fabric identity lookup failure. Genuine identity absence remains 401 unauthorized."
   },
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
@@ -22,6 +22,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Node boot session registered.",
             "content": {
@@ -89,6 +90,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Node liveness updated and the current node-scoped intent channel returned.",
             "content": {
@@ -115,6 +117,7 @@
         "summary": "Long-poll a fresh node/boot-bound Computer policy snapshot",
         "description": "Returns immediately for a newer revision or policy topology change and otherwise renews the short freshness lease before expiry. The node must discard policy on watch loss, expiry, regression, or generation change.",
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Fresh in-memory policy snapshot.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerPolicySnapshot" } } } },
           "204": { "description": "This node has never hosted a Computer; ordinary service behavior is unchanged." },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
@@ -134,6 +137,7 @@
         "description": "The receipt is derived from the installed in-memory snapshot. A dedicated retry loop sends it only after every authorization downgraded by this revision has released after closing both relay legs, without parking heartbeat or watch. A replacement boot does not complete revocation until any older boot policy lease expires or that boot already acknowledged the revision.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerPolicyInstallAcknowledgement" } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "204": { "description": "Matching current-boot installation recorded." },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -166,6 +170,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Node is draining; existing attempt authority remains valid.",
             "content": {
@@ -210,6 +215,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Claim won; attempt, fence, and lease were created atomically.",
             "content": {
@@ -274,7 +280,7 @@
       "post": {
         "operationId": "proveServiceBinding",
         "summary": "Ask whether this node still owes a service binding its image pin",
-        "description": "Read-only. The agent asks before reconciliation deletes a pinned OCI image. bound is true while the job is a queued, claimed, running, stopping, stopped, or failed service bound to this node, and also while a stalled removal's cleanup is still unacknowledged, because that removal released its Slot without proving cleanup and its standing directive still needs the image. An unknown job, a job bound elsewhere, or any other state answers false. The node and boot session must be the authenticated node's current registration.",
+        "description": "Read-only. Node-session validation and the service-binding read share one read-only transaction snapshot without taking or waiting for SQLite's write lock. The proof is an observation, not a reservation for a later pin action. The agent asks before reconciliation deletes a pinned OCI image. bound is true while the job is a queued, claimed, running, stopping, stopped, or failed service bound to this node, and also while a stalled removal's cleanup is still unacknowledged, because that removal released its Slot without proving cleanup and its standing directive still needs the image. An unknown job, a job bound elsewhere, or any other state answers false. The node and boot session must be the authenticated node's current registration.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["node_id", "boot_session_id"],
@@ -284,6 +290,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Binding proof.", "content": { "application/json": { "schema": {
             "type": "object", "additionalProperties": false,
             "required": ["bound"],
@@ -313,6 +320,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "The latched service job.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -345,6 +353,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Lease renewed with a duration TTL and any stop, restart or one-shot cancel directive for this payload. Cancellation caps the lease at the durable fixed settlement deadline, never acknowledges a new process start, and uses TERM, grace, then KILL.",
             "content": {
@@ -389,6 +398,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Publication changed or was already in the requested state.",
             "content": {
@@ -434,6 +444,7 @@
           } } }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Observation accepted or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -457,6 +468,7 @@
           "properties": { "fencing_token": { "type": "string", "minLength": 1 } }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Started accepted or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -497,6 +509,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Batch accepted or identically replayed. Ack sequences are per stream and are upload acknowledgements, not reader cursors; attempt_state is L1's durable state after the append.",
             "content": {
@@ -562,6 +575,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "The stored row's digest, size and time.",
             "content": {
@@ -627,6 +641,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Completion accepted or identically replayed.",
             "content": {
@@ -675,6 +690,7 @@
           }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
             "description": "Deletion attestation accepted, identically replayed, already finalized, or a Computer cleanup quarantine recorded without finalization.",
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Job" } } }
@@ -711,6 +727,7 @@
           } } }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Event committed or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerTakeoverAuditReceipt" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -752,6 +769,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Exact receipt accepted or replayed; logical Backup publication and unchanged-intent resume are atomic. backup is omitted for a positively absent ENOSPC or digest-mismatch failure.", "content": { "application/json": { "schema": { "type": "object", "required": ["computer"], "properties": { "backup": { "$ref": "./common.v1.json#/components/schemas/Backup" }, "computer": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -786,6 +804,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Copy absence accepted; the logical Backup is retained as a pruned record.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Backup" } } } },
           "204": { "description": "A create superseded by Computer removal had no logical Backup; its planned physical copy is positively absent." },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
@@ -830,6 +849,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Destination published or identically replayed; clones are stable and stopped, while restores remain stopped pending predecessor retirement.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -878,6 +898,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Completion or refusal evidence recorded. The source Storage stays custody-tainted unless the receipt is a refusal that left the destination untouched.", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -903,6 +924,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Predecessor absence accepted; the restored Computer is stable and remains stopped.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -950,6 +972,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Grow result accepted or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -1008,6 +1031,7 @@
           }
         } } } },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Preflight evidence accepted or identically replayed.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } } },
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" }, "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" }, "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
@@ -1060,6 +1084,7 @@
           } } }
         },
         "responses": {
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
       "description": "Successor preparation accepted or identically replayed; the returned stopped Computer has the successor published and predecessor retirement still pending.",
             "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }
@@ -1099,6 +1124,7 @@
       } } }
     },
     "responses": {
+      "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
       "200": {
       "description": "Predecessor absence accepted or replayed; the returned Computer is stable and stopped.",
       "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/Computer" } } }

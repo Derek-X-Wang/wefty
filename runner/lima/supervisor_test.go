@@ -543,13 +543,13 @@ func TestSupervisedBarrierRepairsHelperUnitUnavailableAndReearnsOCI(t *testing.T
 					// A real helper may need another bounded takeover window.
 					// Only positively classified retryable outcomes belong here,
 					// plus one documented unknown: a dial the takeover window
-					// outlived is an unknown final dial, which the barrier
-					// reports as boot_sweep_failed (never positive absence) and
-					// Lima retries as helper_unreachable. It is explained only
+					// outlived is an unknown final dial, which both barriers
+					// report as helper_unreachable (never positive absence).
+					// It is explained only
 					// when the latest real dial failed on its own expired window.
 					switch reason {
 					case contract.CapabilityReasonHelperUnitUnavailable, contract.CapabilityReasonHelperHandshakeStalled:
-					case contract.CapabilityReasonBootSweepFailed:
+					case contract.CapabilityReasonHelperUnreachable:
 						if !lastSocketDialWindowExpired {
 							t.Fatalf("unexplained real-socket retry: reason=%s last_dial_window_expired=false", reason)
 						}

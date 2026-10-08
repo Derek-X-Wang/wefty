@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -255,6 +256,9 @@ func (r *Reconciler) cancelRunJob(ctx context.Context, cancellation runCancellat
 
 func (r *Reconciler) deliverRunCancellation(ctx, remote context.Context, cancellation runCancellation) error {
 	err := r.cancelRunJobRemote(ctx, remote, cancellation)
+	if err != nil {
+		err = r.store.observeL1Error(ctx, err)
+	}
 	if err != nil && ctx.Err() == nil {
 		// Keep the dependency/storage cause in server logs when HTTP exposes
 		// only a retryable internal error. This also covers background retries.
@@ -281,9 +285,6 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 			return r.store.deferRunCancellation(ctx, run.RunID, err)
 		}
 		if err != nil {
-			if isL1CancellationIdentityFailure(err) {
-				return internalError(err, "L1 could not authenticate the run ledger")
-			}
 			return err
 		}
 		if err := r.store.completeDispatch(ctx, run.RunID, job.JobID); err != nil {
@@ -316,22 +317,11 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 	}
 	job, err := canceler.CancelJob(remote, run.JobID)
 	if err != nil {
-		var refusal *Error
-		var response *l1ResponseError
-		hasProtocol := errors.As(err, &refusal)
-		hasResponse := errors.As(err, &response)
-		if isL1CancellationIdentityFailure(err) {
-			// Identity lookup failure is not a decision about this Run's cancel.
-			// Retain intent and advertise the same retryability to the caller.
-			return internalError(err, "L1 could not authenticate the run ledger")
-		}
-		typedRefusal := hasProtocol && !refusal.Retryable
-		if hasResponse && !response.validEnvelope {
-			typedRefusal = false
-		}
-		if !typedRefusal {
+		a := classifyL1Answer(err)
+		if a.Kind != l1WorkRefused || a.Method != http.MethodPost || a.Target != "/v1/jobs/"+url.PathEscape(run.JobID)+"/cancel" {
 			return err
 		}
+		refusal := a.Response.protocol
 		// A cancel 404 can also hide an ownership refusal. Only the existing
 		// authoritative GetJob absence may fail the Run as an L1 regression.
 		if refusal.Code == contract.ErrorNotFound {
@@ -364,15 +354,6 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		return r.store.finishRunCancellation(ctx, run.RunID)
 	}
 	return nil
-}
-
-// Authentication of the ledger is a dependency failure on both dispatch
-// lookup and job cancel, never a refusal of the authenticated person's request.
-func isL1CancellationIdentityFailure(err error) bool {
-	var protocol *Error
-	var response *l1ResponseError
-	return (errors.As(err, &protocol) && (protocol.Code == contract.ErrorUnauthorized || protocol.Code == contract.ErrorPersonIdentityRequired)) ||
-		(errors.As(err, &response) && response.status == http.StatusUnauthorized)
 }
 
 // projectObservedJob preserves ordinary reconciliation's image evidence,

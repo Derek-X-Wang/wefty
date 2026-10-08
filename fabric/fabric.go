@@ -16,6 +16,16 @@ import (
 // remote address.
 var ErrIdentityNotFound = errors.New("fabric identity not found")
 
+// ErrIssuingFabricUnavailable means the authenticated peer's issuing Fabric
+// cannot be established from the local network configuration. It is an
+// operational failure, not evidence that the peer is unauthenticated.
+var ErrIssuingFabricUnavailable = errors.New("issuing fabric identity unavailable")
+
+// ErrIdentityIncomplete means the network returned a peer record without the
+// stable identity fields needed for authorization. It is an operational
+// failure, not identity absence.
+var ErrIdentityIncomplete = errors.New("fabric identity incomplete")
+
 type Fabric interface {
 	Listen(network, address string) (net.Listener, error)
 	Dial(ctx context.Context, network, address string) (net.Conn, error)

@@ -233,7 +233,7 @@ func TestExpiredAttemptRecordBoundedAndSessionScoped(t *testing.T) {
 		t.Fatalf("record outlived session: %d/%d", count, order)
 	}
 	_ = session.Close()
-	replacement, err := client.OpenSession(t.Context(), testSessionRequest())
+	replacement, err := openReplacementSession(t.Context(), client, testSessionRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
