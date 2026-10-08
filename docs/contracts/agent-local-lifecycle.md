@@ -1019,7 +1019,10 @@ terminally fails.
 Boot keeps OCI publication restrictive and reuses its restrictive heartbeat's
 removal directives. For every ledger row the agent obtains positive current L1
 service-binding proof; cold-empty L1 state is not proof, so unbound rows are
-deleted. The remaining ledger is sent as an absolute helper reconciliation.
+deleted. L1 validates the current node session and reads the service binding
+in one read-only transaction snapshot, without taking or waiting for SQLite's
+write lock. The proof is an observation, not a reservation for a later pin
+action. The remaining ledger is sent as an absolute helper reconciliation.
 Every missing digest after an external cache wipe is automatically redelivered
 under ordinary agent image policy, followed by a second helper reconciliation
 that attaches recovered leases. Exhaustion latches the affected service and

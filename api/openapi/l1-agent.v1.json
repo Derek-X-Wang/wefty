@@ -274,7 +274,7 @@
       "post": {
         "operationId": "proveServiceBinding",
         "summary": "Ask whether this node still owes a service binding its image pin",
-        "description": "Read-only. The agent asks before reconciliation deletes a pinned OCI image. bound is true while the job is a queued, claimed, running, stopping, stopped, or failed service bound to this node, and also while a stalled removal's cleanup is still unacknowledged, because that removal released its Slot without proving cleanup and its standing directive still needs the image. An unknown job, a job bound elsewhere, or any other state answers false. The node and boot session must be the authenticated node's current registration.",
+        "description": "Read-only. Node-session validation and the service-binding read share one read-only transaction snapshot without taking or waiting for SQLite's write lock. The proof is an observation, not a reservation for a later pin action. The agent asks before reconciliation deletes a pinned OCI image. bound is true while the job is a queued, claimed, running, stopping, stopped, or failed service bound to this node, and also while a stalled removal's cleanup is still unacknowledged, because that removal released its Slot without proving cleanup and its standing directive still needs the image. An unknown job, a job bound elsewhere, or any other state answers false. The node and boot session must be the authenticated node's current registration.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["node_id", "boot_session_id"],

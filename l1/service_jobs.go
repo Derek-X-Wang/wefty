@@ -135,7 +135,9 @@ func (s *Store) ProveServiceBinding(ctx context.Context, identityNodeID, jobID s
 	if jobID == "" || request.NodeID == "" || request.BootSessionID == "" {
 		return false, protocolError(contract.ErrorInvalidRequest, "service binding proof authority is incomplete")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	// Session authority and binding share a snapshot without taking the
+	// store's default IMMEDIATE write lock during image-pin reconciliation.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return false, internalError(err, "begin service binding proof")
 	}
