@@ -343,7 +343,8 @@ type takeoverViewOpen func(context.Context) (*takeover.Session, error)
 func openTakeoverViewWithPolicyRetry(ctx context.Context, participant fabric.Fabric, endpoint string, policyRevision int64) (*takeover.Session, error) {
 	return retryTakeoverViewPolicyInstallation(ctx, takeoverPolicyInstallRetryWindow, takeoverPolicyInstallRetryInterval,
 		func(openContext context.Context) (*takeover.Session, error) {
-			return takeover.OpenAtPolicyRevision(openContext, participant, endpoint, policyRevision)
+			session, err := takeover.OpenAtPolicyRevision(openContext, participant, endpoint, policyRevision)
+			return session, classifyTakeoverTransportError(err)
 		})
 }
 

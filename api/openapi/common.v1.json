@@ -34,7 +34,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "Stable machine-readable error code. CLI transport failures, deadlines, and non-envelope HTTP 5xx use unavailable with retryable=true and exit 13."
+            "description": "Stable machine-readable error code. CLI transport failures (including request deadlines and a deadline or timeout waiting for the take-over display banner after WebSocket upgrade) and non-envelope HTTP 5xx use unavailable with retryable=true and exit 13. HTTP 5xx envelopes with retryable internal or run_ledger_unavailable also exit 13 while retaining the server code; non-retryable versions remain exit 1. Bare local deadlines and caller cancellation (including Ctrl-C during take-over or registry requests) are not unavailable; cancellation remains exit 1. Accepted-mutation observation timeouts use the CLI-local wait_timeout code, retryable=false, and exit 14; this is not a server error code. details.mutation_applied is always present: true or false from the Computer receipt (false for replay/no-op), and always null for service lifecycle/removal because L1 provides no applied receipt for desired-state or remove mutations; a prior read cannot prove application under a concurrent change. Null means applied evidence is unknown. services revoke --wait also exits 14 on revocation_wait_timeout, retaining that code, retryability, and receipt-derived applied evidence."
           },
           "message": { "type": "string" },
           "retryable": {
@@ -1903,7 +1903,8 @@
         ]
       },
       "RunRecord": {
-        "$ref": "../../contract/schemas/v1/run-record.schema.json"
+        "$ref": "../../contract/schemas/v1/run-record.schema.json",
+        "description": "The ledger RunRecord. CLI wait JSON preserves recorded failure_reason; for a failed legacy Run without one, the CLI includes a reason derived from a bounded execution-evidence lookup when available, without mutating the ledger."
       },
       "Envelope": {
         "$ref": "../../contract/schemas/v1/envelope.schema.json"

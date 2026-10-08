@@ -8,7 +8,7 @@ typed result.
 | Exit | Meaning |
 | --- | --- |
 | 0 | Success |
-| 1 | Other failure, including internal or an unknown protocol code |
+| 1 | Other failure, including non-retryable internal or an unknown protocol code |
 | 2 | CLI usage or `invalid_request` |
 | 3 | Authentication or authorization refusal |
 | 4 | Not found or an ended take-over session |
@@ -17,29 +17,69 @@ typed result.
 | 10 | Run failed (`wait`) |
 | 11 | Wait timeout (`wait`) |
 | 12 | Cluster not ready (`status`) |
-| 13 | Transport or service unavailable (`unavailable`, retryable) |
+| 13 | Transport or service unavailable (`unavailable`, or retryable server-unavailable envelope) |
+| 14 | Accepted-mutation observation timeout (`wait_timeout` or `revocation_wait_timeout`) |
 
-The existing protocol-code membership of the exit map remains authoritative;
-`retryable` is advisory and never changes the exit code or an authority refusal.
+The protocol-code membership of the exit map remains authoritative. HTTP 5xx
+error envelopes with `code=internal` or `code=run_ledger_unavailable` and
+`retryable=true` exit 13; their server code, details, retryability, and request ID
+remain unchanged in JSON. Non-retryable `internal` and
+`run_ledger_unavailable` remain exit 1. Retryability alone never changes an
+authority refusal or an unknown protocol code's exit.
 
 `--json` and `--json=true` are global wherever they appear in the argument list,
 including after the command or its operands, except when consumed as another
 flag's value or after the `--` argument terminator. `--json=false` disables JSON;
 the last occurrence wins. An invalid boolean is a usage error and emits JSON.
+The value-flag vocabulary is checked against CLI and authoring registrations
+and the real Lima sizing FlagSet (`--vm-memory`, `--vm-cpus`, `--vm-disk`).
+Boolean flags cannot consume the following `--json`; the overloaded `--wait`
+is boolean on grant/revoke and takes a duration on mutation waits.
 Errors go to stderr as the shared envelope, for example
 `{"error":{"code":"invalid_request","message":"a command is required","retryable":false}}`,
 with optional `details` and `request_id`. This includes global and command flag
 errors and failures raised inside the CLI. Parser usage text is suppressed in JSON
 mode. Existing take-over refusals may also include their `receipt`. Unknown
 CLI-local failures use `code=internal`, `retryable=false`; they have no server
-request ID. Connection failures (including dial timeouts and request deadlines)
-and non-envelope HTTP 5xx responses use `code=unavailable`, `retryable=true`,
+request ID. Connection failures (including dial timeouts, request deadlines,
+and a deadline or timeout waiting for the display banner after a take-over
+WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
+`retryable=true`,
 exit 13. An unavailable result advises the operator to check reachability and
-retry with backoff within its authority. Typed outcomes (custody exits 6–9,
+retry with backoff within its authority. A bare `context.DeadlineExceeded` is
+not evidence of unavailability: only a typed transport/service availability
+failure or the named server-envelope cases map to exit 13. Caller cancellation
+(including Ctrl-C during take-over or registry requests) remains a local failure
+(exit 1), not `unavailable`.
+
+A Computer storage, resize, or removal `--wait` that expires after acceptance
+exits 14 and emits a CLI-local `error.code=wait_timeout`, `retryable=false` on
+stderr. `error.details.mutation_applied` matches the mutation result on stdout
+(true for a newly applied change, false for a replay or no-op).
+The field is always present; `null` means the applied evidence is unknown.
+If no Computer projection was observed, no result document is emitted, but the
+error still carries the known receipt value. Otherwise the mutation result and
+failed observation remain on stdout. Service start, stop,
+and removal observation timeouts also exit 14 with the same error code. For
+services, `mutation_applied` is always `null`: L1 provides no applied receipt
+for desired-state or removal mutations. A prior read cannot prove whether a
+mutation applied under a concurrent change, even for a repeated request.
+Read or wait for completion; do not assume the mutation failed or repeat it to
+recover observation.
+Caller cancellation is a separate local failure. Grant revocation
+(`services revoke --wait`) also exits 14 on an accepted-mutation
+observation timeout. It retains `revocation_wait_timeout`, its existing
+retryability, and receipt-derived `details.mutation_applied`; it is not
+transport unavailability. `services grant` does not accept `--wait`.
+
+Typed outcomes (custody exits 6–9,
 failed run 10, wait timeout 11, not-ready status 12) already write their result
 document on stdout and emit no additional JSON error on stderr. A wait timeout
 is not a failed Run: its document carries `timed_out=true` and the last observed
-status; waiting again is allowed. A not-ready verdict names readiness reasons,
+status; waiting again is allowed. A failed Run's JSON record includes its
+recorded `failure_reason` or, when absent, the reason derived from a bounded
+execution-evidence lookup. Unavailable evidence leaves that field absent and
+does not change the Run's verdict. A not-ready verdict names readiness reasons,
 not an internal error. Missing `--l1` or a required `--l3` is usage (exit 2).
 
 L1 and L3 generate an opaque request ID for **each** HTTP request, including

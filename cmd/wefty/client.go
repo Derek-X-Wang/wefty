@@ -246,7 +246,19 @@ func (c *apiClients) getComputerTakeoverAvailability(ctx context.Context, comput
 type takeoverActionError = takeover.ActionError
 
 func (c *apiClients) performComputerTakeoverAction(ctx context.Context, endpoint, token, action string) (contract.ComputerControlReceipt, error) {
-	return takeover.Perform(ctx, c.fabric, endpoint, token, action)
+	receipt, err := takeover.Perform(ctx, c.fabric, endpoint, token, action)
+	return receipt, classifyTakeoverTransportError(err)
+}
+
+func classifyTakeoverTransportError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	var transport *takeover.TransportError
+	if errors.As(err, &transport) {
+		return &unavailableError{cause: err}
+	}
+	return err
 }
 
 func (c *apiClients) listComputerTakeoverAudit(

@@ -949,6 +949,11 @@ func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe 
 			}
 			observation.Status, observation.Error = "failed", waitCtx.Err().Error()
 			observation.EndedAt = time.Now().UTC().Format(time.RFC3339Nano)
+			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded {
+				return observation, &storageObservationError{cause: &mutationWaitTimeoutError{
+					message: fmt.Sprintf("timed out after %s waiting for mutation completion", wait.timeout),
+				}}
+			}
 			return observation, &storageObservationError{cause: waitCtx.Err()}
 		case <-timer.C:
 		}
@@ -956,6 +961,10 @@ func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe 
 }
 
 func writeStorageMutationThenError(writer io.Writer, output storageMutationOutput, jsonOutput bool, err error) error {
+	var timeout *mutationWaitTimeoutError
+	if errors.As(err, &timeout) {
+		timeout.mutationApplied = &output.MutationApplied
+	}
 	if writeErr := writeStorageMutation(writer, output, jsonOutput); writeErr != nil {
 		return errors.Join(err, writeErr)
 	}

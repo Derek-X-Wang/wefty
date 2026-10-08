@@ -63,7 +63,11 @@ const (
 	exitNotReady = 12
 	// exitUnavailable tells an operator that the transport or service may recover.
 	exitUnavailable = 13
+	// exitMutationWaitTimeout means accepted intent is still being observed.
+	exitMutationWaitTimeout = 14
 )
+
+const errorWaitTimeout contract.ErrorCode = "wait_timeout"
 
 func commandExitCode(err error) int {
 	var usage usageError
@@ -95,8 +99,12 @@ func commandExitCode(err error) int {
 	if errors.As(err, &waitTimeout) {
 		return exitWaitTimeout
 	}
+	var mutationTimeout *mutationWaitTimeoutError
+	if errors.As(err, &mutationTimeout) {
+		return exitMutationWaitTimeout
+	}
 	var unavailable *unavailableError
-	if errors.As(err, &unavailable) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.As(err, &unavailable) {
 		return exitUnavailable
 	}
 	var apiError contract.APIError
@@ -108,12 +116,18 @@ func commandExitCode(err error) int {
 		apiError = localErr.APIError
 	case errors.As(err, &responseErr):
 		apiError = responseErr.APIError
+		if responseErr.StatusCode >= 500 && apiError.Retryable &&
+			(apiError.Code == contract.ErrorInternal || apiError.Code == contract.ErrorRunLedgerUnavailable) {
+			return exitUnavailable
+		}
 	case errors.As(err, &takeoverErr):
 		apiError = takeoverErr.APIError
 	default:
 		return exitFailure
 	}
 	switch apiError.Code {
+	case contract.ErrorRevocationWaitTimeout:
+		return exitMutationWaitTimeout
 	case contract.ErrorUnavailable:
 		return exitUnavailable
 	case contract.ErrorInvalidRequest:
@@ -145,8 +159,16 @@ func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
 		if errors.As(err, &custody) || errors.As(err, &outcome) || errors.As(err, &notReady) || errors.As(err, &timeout) {
 			return
 		}
+		var mutationTimeout *mutationWaitTimeoutError
+		if errors.As(err, &mutationTimeout) {
+			_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
+				Code: errorWaitTimeout, Message: err.Error(), Retryable: false,
+				Details: map[string]any{"mutation_applied": mutationTimeout.mutationApplied},
+			}})
+			return
+		}
 		var unavailable *unavailableError
-		if errors.As(err, &unavailable) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.As(err, &unavailable) {
 			_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
 				Code: contract.ErrorUnavailable, Message: err.Error(), Retryable: true,
 			}})
@@ -388,7 +410,7 @@ const rootUsage = `Usage: wefty [global flags] <command>
 
 --json[=true|false] is accepted before or after a command and its arguments.
 Every command uses typed exits: usage 2, unauthorized 3, not found 4,
-conflict 5, unavailable 13, other failure 1. JSON errors go to stderr.
+conflict 5, unavailable 13, accepted-mutation wait timeout 14, other failure 1. JSON errors go to stderr.
 
 Commands:
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot

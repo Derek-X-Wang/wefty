@@ -584,6 +584,10 @@ func executeServiceRemove(
 		if wait.timeout > 0 {
 			observed, observation, waitErr := waitForComputerRemoval(ctx, clients, computer.ComputerID, wait)
 			if waitErr != nil && observed.ComputerID == "" {
+				var timeout *mutationWaitTimeoutError
+				if errors.As(waitErr, &timeout) {
+					timeout.mutationApplied = &receipt.Applied
+				}
 				return waitErr
 			}
 			projection = newComputerProjection(observed, &receipt.Applied, &receipt.Replay)
@@ -766,13 +770,13 @@ func waitForService(
 			if ctx.Err() != nil {
 				return l1.Job{}, ctx.Err()
 			}
-			return l1.Job{}, fmt.Errorf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)
+			return l1.Job{}, &mutationWaitTimeoutError{message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
 		case <-timer.C:
 		}
 		job, err := clients.getService(waitCtx, initial.JobID)
 		if err != nil {
-			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded {
-				return l1.Job{}, fmt.Errorf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)
+			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
+				return l1.Job{}, &mutationWaitTimeoutError{message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
 			}
 			return l1.Job{}, err
 		}

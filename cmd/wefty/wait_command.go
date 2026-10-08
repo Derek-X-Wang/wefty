@@ -52,6 +52,17 @@ func (e *runOutcomeError) Error() string {
 	return fmt.Sprintf("run %s %s: %s", e.runID, e.status, e.reason)
 }
 
+// mutationWaitTimeoutError reports that an accepted mutation has not yet been
+// observed complete. Repeating the mutation is not advised; read or wait again.
+type mutationWaitTimeoutError struct {
+	message string
+	// nil means the accepted mutation has no known applied evidence.
+	mutationApplied *bool
+}
+
+func (e *mutationWaitTimeoutError) Error() string { return e.message }
+func (e *mutationWaitTimeoutError) Unwrap() error { return context.DeadlineExceeded }
+
 // waitTimeoutError is the third outcome, kept separate from a failed run for
 // the reason above.
 type waitTimeoutError struct {
@@ -206,8 +217,11 @@ func waitExpired(stdout io.Writer, runID string, status contract.RunState, start
 // the code should not have to run a second command for it. Stdout stays the
 // bare status; why a failed run failed travels in the error, which main prints
 // to stderr as one line in plain mode. JSON mode emits only the RunRecord on
-// stdout; the failure_reason, when recorded by the ledger, is in that document.
+// stdout; failure_reason includes recorded or derived execution evidence.
 func reportTerminalRun(stdout io.Writer, record contract.RunRecord, reason string, jsonOutput bool) error {
+	if record.Status == contract.RunFailed && record.FailureReason == "" {
+		record.FailureReason = reason
+	}
 	if jsonOutput {
 		if err := writeJSON(stdout, record); err != nil {
 			return err

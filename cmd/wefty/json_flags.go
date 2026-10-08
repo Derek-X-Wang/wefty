@@ -22,7 +22,7 @@ poll-interval probe-archive probe-digest probe-reference published-port reason
 reference restart revision runtime-handler script session-token-file setup-state
 state state-dir status step storage-generation storage-id submit-intent-revision
 submitter summary tag timeout unit-directory wait wait-timeout workflow-ref
-working-directory`
+vm-memory vm-cpus vm-disk working-directory`
 
 func removeBoolFlag(args []string, name string) ([]string, bool, error) {
 	valueFlags := make(map[string]bool)

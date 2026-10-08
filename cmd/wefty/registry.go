@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -75,7 +76,11 @@ func (r *registryResolver) headManifest(ctx context.Context, manifestURL, author
 	}
 	response, err := r.client.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("registry HEAD: %w", err)
+		failure := fmt.Errorf("registry HEAD: %w", err)
+		if response == nil && !errors.Is(err, context.Canceled) {
+			return nil, &unavailableError{cause: failure}
+		}
+		return nil, failure
 	}
 	return response, nil
 }
@@ -102,7 +107,11 @@ func (r *registryResolver) publicBearerToken(ctx context.Context, challenge stri
 	}
 	response, err := r.client.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("request public registry token: %w", err)
+		failure := fmt.Errorf("request public registry token: %w", err)
+		if response == nil && !errors.Is(err, context.Canceled) {
+			return "", &unavailableError{cause: failure}
+		}
+		return "", failure
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
