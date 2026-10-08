@@ -168,6 +168,10 @@ func (columns jobSpawnColumns) apply(job *Job) {
 // Children are a job-level resource, so a retried parent attempt sees the
 // children spawned by earlier attempts.
 func (s *Store) ListChildJobs(ctx context.Context, parentJobID, cursorValue string, limit int) (JobList, error) {
+	return s.listChildJobsForCaller(ctx, parentJobID, cursorValue, limit, nil)
+}
+
+func (s *Store) listChildJobsForCaller(ctx context.Context, parentJobID, cursorValue string, limit int, actor *serviceActionActor) (JobList, error) {
 	if strings.TrimSpace(parentJobID) == "" {
 		return JobList{}, protocolError(contract.ErrorInvalidRequest, "job_id is required")
 	}
@@ -178,14 +182,29 @@ func (s *Store) ListChildJobs(ctx context.Context, parentJobID, cursorValue stri
 	if err != nil {
 		return JobList{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT job_id, created_ns FROM jobs
+	// Keep membership, Job rows and operator facts in one read-only snapshot.
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return JobList{}, internalError(err, "begin child job listing")
+	}
+	defer tx.Rollback()
+	if actor != nil {
+		var exists bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id=?)
+			OR EXISTS(SELECT 1 FROM service_tombstones WHERE job_id=?)`, parentJobID, parentJobID).Scan(&exists); err != nil {
+			return JobList{}, internalError(err, "read child listing parent")
+		}
+		if !exists {
+			return JobList{}, protocolError(contract.ErrorNotFound, "job %q was not found", parentJobID)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT job_id, created_ns FROM jobs
 		WHERE parent_job_id=? AND (created_ns>? OR (created_ns=? AND job_id>?))
 		ORDER BY created_ns, job_id LIMIT ?`,
 		parentJobID, cursor.CreatedNS, cursor.CreatedNS, cursor.JobID, limit+1)
 	if err != nil {
 		return JobList{}, internalError(err, "list child job IDs")
 	}
-	defer rows.Close()
 	type listedID struct {
 		jobID     string
 		createdNS int64
@@ -194,11 +213,14 @@ func (s *Store) ListChildJobs(ctx context.Context, parentJobID, cursorValue stri
 	for rows.Next() {
 		var item listedID
 		if err := rows.Scan(&item.jobID, &item.createdNS); err != nil {
+			rows.Close()
 			return JobList{}, internalError(err, "scan child job ID")
 		}
 		listed = append(listed, item)
 	}
-	if err := rows.Err(); err != nil {
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
 		return JobList{}, internalError(err, "iterate child job IDs")
 	}
 	page := JobList{Jobs: []Job{}}
@@ -206,16 +228,28 @@ func (s *Store) ListChildJobs(ctx context.Context, parentJobID, cursorValue stri
 	if hasMore {
 		listed = listed[:limit]
 	}
+	now := canonicalTime(s.clock.Now())
 	for _, item := range listed {
-		job, err := s.GetJob(ctx, item.jobID)
-		if err != nil {
-			return JobList{}, err
-		}
-		job, err = s.projectJob(ctx, job)
+		job, err := getJobByID(ctx, tx, item.jobID, now)
 		if err != nil {
 			return JobList{}, err
 		}
 		page.Jobs = append(page.Jobs, job)
+	}
+	if actor != nil {
+		if err := projectServiceOperatorPage(ctx, tx, page.Jobs, actor); err != nil {
+			return JobList{}, err
+		}
+	}
+	for i, job := range page.Jobs {
+		projected, err := s.projectJobWithQueryer(ctx, tx, job)
+		if err != nil {
+			return JobList{}, err
+		}
+		page.Jobs[i] = projected
+	}
+	if err := tx.Commit(); err != nil {
+		return JobList{}, internalError(err, "finish child job listing")
 	}
 	if hasMore && len(listed) > 0 {
 		last := listed[len(listed)-1]

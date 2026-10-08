@@ -200,15 +200,12 @@ func (s *Store) listReadableJobsForCaller(ctx context.Context, filters jobListFi
 		if err != nil {
 			return JobList{}, internalError(err, "read listed job")
 		}
-		// Only caller-facing service facts are added here; ordinary Job
-		// listing/filter semantics remain in this same read-only snapshot.
-		if actor != nil {
-			job, err = projectServiceOperatorFacts(ctx, tx, job, actor)
-			if err != nil {
-				return JobList{}, err
-			}
-		}
 		page.Jobs = append(page.Jobs, job)
+	}
+	if actor != nil {
+		if err := projectServiceOperatorPage(ctx, tx, page.Jobs, actor); err != nil {
+			return JobList{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return JobList{}, internalError(err, "finish job listing")
