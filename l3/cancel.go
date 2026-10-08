@@ -5,11 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
-	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -17,10 +17,6 @@ import (
 // attempt. A never-attempted run can settle locally. Once an attempt began,
 // even without an acknowledgement, L1 is the authority on the job's outcome.
 func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string) error {
-	return s.requestAuthorizedRunCancellation(ctx, runID, actor, false)
-}
-
-func (s *Store) requestAuthorizedRunCancellation(ctx context.Context, runID, actor string, admin bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return internalError(err, "begin run cancellation")
@@ -39,16 +35,22 @@ func (s *Store) requestAuthorizedRunCancellation(ctx context.Context, runID, act
 	if err != nil {
 		return internalError(err, "read run cancellation target")
 	}
-	if actor != submitter && !admin {
-		allowed, err := cancellationRootActorAllowed(ctx, tx, runID, actor)
-		if err != nil {
-			return err
+	if actor != submitter {
+		// Follow parent links only: a rerun starts a new lineage with its own
+		// submitter. Bound the walk and refuse corrupt or incomplete lineage.
+		var rootActor string
+		err := tx.QueryRowContext(ctx, `WITH RECURSIVE ancestors(run_id, parent_run_id, depth) AS (
+ SELECT run_id, parent_run_id, 0 FROM runs WHERE run_id=?
+ UNION ALL
+ SELECT r.run_id, r.parent_run_id, a.depth+1 FROM runs r JOIN ancestors a ON r.run_id=a.parent_run_id WHERE a.depth<?
+) SELECT t.actor FROM ancestors a JOIN run_triggers t ON t.run_id=a.run_id WHERE a.parent_run_id IS NULL`, runID, maxLineageTraversalDepth).Scan(&rootActor)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return internalError(err, "read cancellation lineage root")
 		}
-		if !allowed {
+		if err != nil || actor != rootActor {
 			return protocolError(contract.ErrorForbidden, "only the submitting actor or lineage root's submitting actor may cancel a run")
 		}
 	}
-
 	if (state == contract.RunSucceeded || state == contract.RunFailed) && !jobID.Valid && !attempted.Valid {
 		return nil
 	}
@@ -78,49 +80,6 @@ func (s *Store) requestAuthorizedRunCancellation(ctx context.Context, runID, act
 		return internalError(err, "commit run cancellation intent")
 	}
 	return nil
-}
-
-// Read lineage without acquiring SQLite's immediate writer lock or holding
-// a transaction across the L1 authority check. Parent and trigger links are immutable.
-func (s *Store) cancellationActorAllowed(ctx context.Context, runID, actor string) (bool, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return false, internalError(err, "begin cancel authority read")
-	}
-	defer tx.Rollback()
-	var submitter string
-	err = tx.QueryRowContext(ctx, `SELECT actor FROM run_triggers WHERE run_id=?`, runID).Scan(&submitter)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, protocolError(contract.ErrorNotFound, "run was not found")
-	}
-	if err != nil {
-		return false, internalError(err, "read cancel submitter")
-	}
-	allowed := actor == submitter
-	if !allowed {
-		allowed, err = cancellationRootActorAllowed(ctx, tx, runID, actor)
-		if err != nil {
-			return false, err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return false, internalError(err, "commit cancel authority read")
-	}
-	return allowed, nil
-}
-
-func cancellationRootActorAllowed(ctx context.Context, tx *sql.Tx, runID, actor string) (bool, error) {
-	// Reruns start new lineages. Refuse corrupt or incomplete parent chains.
-	var rootActor string
-	err := tx.QueryRowContext(ctx, `WITH RECURSIVE ancestors(run_id, parent_run_id, depth) AS (
- SELECT run_id, parent_run_id, 0 FROM runs WHERE run_id=?
- UNION ALL
- SELECT r.run_id, r.parent_run_id, a.depth+1 FROM runs r JOIN ancestors a ON r.run_id=a.parent_run_id WHERE a.depth<?
-) SELECT t.actor FROM ancestors a JOIN run_triggers t ON t.run_id=a.run_id WHERE a.parent_run_id IS NULL`, runID, maxLineageTraversalDepth).Scan(&rootActor)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, internalError(err, "read cancellation lineage root")
-	}
-	return err == nil && actor == rootActor, nil
 }
 
 type runCancellation struct {
@@ -244,28 +203,7 @@ func (s *Server) cancelRun(w http.ResponseWriter, req *http.Request) {
 	}
 	ctx := req.Context()
 	runID := req.PathValue("run_id")
-	identity := identityFromRequest(req)
-	actor := actorFromIdentity(identity)
-	allowed, err := s.store.cancellationActorAllowed(ctx, runID, actor)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	admin := false
-	if !allowed && identity.Kind != fabric.IdentityKindMachine && identity.UserID != "" && identity.FabricID != "" && identity.DeviceID != "" {
-		checker, ok := s.jobs.(PersonAdminClient)
-		if !ok {
-			writeError(w, &Error{Code: contract.ErrorUnavailable, Message: "L1 admin check is unavailable", Retryable: true})
-			return
-		}
-		answer, checkErr := checker.CheckPersonAdmin(ctx, l1.PersonAdminCheckRequest{FabricID: identity.FabricID, UserID: identity.UserID, DeviceID: identity.DeviceID})
-		if checkErr != nil {
-			writeError(w, &Error{Code: contract.ErrorUnavailable, Message: "L1 admin check is unavailable", Retryable: true, Cause: checkErr})
-			return
-		}
-		admin = answer.CurrentAdmin
-	}
-	if err := s.store.requestAuthorizedRunCancellation(ctx, runID, actor, admin); err != nil {
+	if err := s.store.requestRunCancellation(ctx, runID, actorFromIdentity(identityFromRequest(req))); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -318,6 +256,9 @@ func (r *Reconciler) cancelRunJob(ctx context.Context, cancellation runCancellat
 func (r *Reconciler) deliverRunCancellation(ctx, remote context.Context, cancellation runCancellation) error {
 	err := r.cancelRunJobRemote(ctx, remote, cancellation)
 	if err != nil && ctx.Err() == nil {
+		// Keep the dependency/storage cause in server logs when HTTP exposes
+		// only a retryable internal error. This also covers background retries.
+		log.Printf("L3 run cancellation failed: run_id=%s error=%v cause=%v", cancellation.RunID, err, errors.Unwrap(err))
 		return errors.Join(err, r.store.deferRunCancellation(ctx, cancellation.RunID, err))
 	}
 	return err

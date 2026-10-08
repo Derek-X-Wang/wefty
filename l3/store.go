@@ -2119,6 +2119,9 @@ WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
 // replaces a dispatch_not_found settlement recovery recorded before it
 // arrived.
 func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error {
+	if jobID == "" {
+		return internalError(errors.New("L1 dispatch acknowledgement has an empty job ID"), "complete dispatch")
+	}
 	now := canonicalTime(s.clock.Now())
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

@@ -70,7 +70,6 @@ const (
 	// until a human changed the deployment (wefty #548).
 	ErrorRunLedgerUnavailable ErrorCode = "run_ledger_unavailable"
 	ErrorInternal             ErrorCode = "internal"
-	ErrorUnavailable          ErrorCode = "unavailable"
 )
 
 // APIError is the single error shape shared by every HTTP protocol. Retryable

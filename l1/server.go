@@ -349,7 +349,6 @@ type attemptCredentialContextKey struct{}
 
 func (s *Server) routes() http.Handler {
 	client := http.NewServeMux()
-	client.HandleFunc("POST /v1/person-admin-check", s.checkPersonAdmin)
 	client.HandleFunc("POST /v1/jobs", s.createJob)
 	client.HandleFunc("GET /v1/dispatch-keys/{dispatch_key}/job", s.lookupJobByDispatchKey)
 	client.HandleFunc("GET /v1/jobs", s.listJobs)
@@ -473,7 +472,6 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/computers/{computer_id}/takeover", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/{computer_id}/submission", s.authorize(personPrincipal, person))
 	root.Handle("/v1/computers/", s.authorize(clientPrincipal, client))
-	root.Handle("/v1/person-admin-check", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/host-boot-session-proof", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/nodes/", s.authorize(clientPrincipal, client))

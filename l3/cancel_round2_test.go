@@ -1,12 +1,14 @@
 package l3
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"testing"
@@ -17,36 +19,30 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-func cancelAdmin(t *testing.T, h *integrationHarness) (*http.Client, *http.Client, l1.AuthenticatedPerson) {
+// Bootstrap a person on L1's existing public HTTP path. The tagged L3
+// identity is retained only to prove that admin membership adds no L3 authority.
+func cancelAdmin(t *testing.T, h *integrationHarness) (*http.Client, *http.Client) {
 	t.Helper()
-	identity := fabric.Identity{NodeID: "admin-device", UserID: "admin", DeviceID: "device", Tags: []string{DefaultCallerPrincipalTag}}
-	admin := h.client(identity, DefaultL3Address)
-	identity.Tags = nil
+	identity := fabric.Identity{NodeID: "admin-device", UserID: "admin", DeviceID: "device"}
 	person := h.client(identity, DefaultL1Address)
-	status, _, body := h.do(person, http.MethodGet, "/v1/whoami", nil, nil)
-	if status != http.StatusOK {
-		t.Fatalf("whoami=%d %s", status, body)
-	}
-	var who l1.AuthenticatedPerson
-	if err := json.Unmarshal(body, &who); err != nil {
-		t.Fatal(err)
-	}
+	identity.Tags = []string{DefaultCallerPrincipalTag}
+	caller := h.client(identity, DefaultL3Address)
 	challenge, err := h.l1Store.InitiateAdminBootstrap(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, _, body = h.do(person, http.MethodPost, "/v1/admin-bootstrap", l1.BootstrapAdminRequest{Nonce: challenge.Nonce}, nil)
+	status, _, body := h.do(person, http.MethodPost, "/v1/admin-bootstrap", l1.BootstrapAdminRequest{Nonce: challenge.Nonce}, nil)
 	if status != http.StatusCreated {
 		t.Fatalf("bootstrap=%d %s", status, body)
 	}
-	return admin, person, who
+	return caller, person
 }
 
-func TestCancelRound2AdminRealL1(t *testing.T) {
+func TestPersonAdminCancelsRunJobAtL1HTTP(t *testing.T) {
 	for _, computer := range []bool{false, true} {
 		t.Run(fmt.Sprint("computer=", computer), func(t *testing.T) {
 			h := newIntegrationHarnessWithL1Options(t, l1.StoreOptions{}, true)
-			admin, _, _ := cancelAdmin(t, h)
+			_, person := cancelAdmin(t, h)
 			ctx := context.Background()
 			runID := ""
 			if computer {
@@ -70,79 +66,54 @@ func TestCancelRound2AdminRealL1(t *testing.T) {
 				if err != nil || run.Trigger.ComputerID != proof.ComputerID || run.ParentRunID != "" {
 					t.Fatalf("not a Computer root: %+v %v", run, err)
 				}
-
 			} else {
 				runID = h.submit(inlineRunRequest("exit 0\n"), "admin-person").RunID
 			}
-			r, _ := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
-			if err := r.ReconcileOnce(ctx); err != nil {
-				t.Fatal(err)
-			}
 			before, err := h.l3Store.GetRun(ctx, runID)
+			if err != nil || before.L1JobID != "" {
+				t.Fatalf("undispatched run has a job: %+v %v", before, err)
+			}
+			r, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
 			if err != nil {
 				t.Fatal(err)
 			}
-			status, _, body := h.do(admin, http.MethodPost, "/v1/runs/"+runID+"/cancel", nil, nil)
-			if status != http.StatusOK {
-				t.Fatalf("admin cancel=%d %s", status, body)
-			}
-			job, err := h.l1Client.GetJob(ctx, before.L1JobID)
-			if err != nil || job.Outcome != contract.JobOutcomeCanceled {
-				t.Fatalf("job not canceled: %+v %v", job, err)
-			}
-			// Reset removes the authority; even a repeated terminal cancel must recheck.
-			if _, err := h.l1Store.ResetAdminPolicy(ctx); err != nil {
+			if err := r.ReconcileOnce(ctx); err != nil {
 				t.Fatal(err)
 			}
-			status, _, body = h.do(admin, http.MethodPost, "/v1/runs/"+runID+"/cancel", nil, nil)
-			assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+			before, err = h.l3Store.GetRun(ctx, runID)
+			if err != nil || before.L1JobID == "" {
+				t.Fatalf("dispatched run has no job: %+v %v", before, err)
+			}
+			status, _, body := h.do(person, http.MethodPost, "/v1/jobs/"+before.L1JobID+"/cancel", nil, nil)
+			if status != http.StatusOK {
+				t.Fatalf("person admin L1 cancel=%d %s", status, body)
+			}
+			var job l1.Job
+			if err := json.Unmarshal(body, &job); err != nil || job.State != contract.JobFailed || job.Outcome != contract.JobOutcomeCanceled {
+				t.Fatalf("L1 cancel response=%s error=%v", body, err)
+			}
+			if err := r.ReconcileOnce(ctx); err != nil {
+				t.Fatal(err)
+			}
+			status, _, body = h.do(h.caller, http.MethodGet, "/v1/runs/"+runID, nil, nil)
+			var settled contract.RunRecord
+			if err := json.Unmarshal(body, &settled); err != nil || status != http.StatusOK || settled.Status != contract.RunFailed || settled.FailureReason != "the L1 job was canceled" || settled.L1JobID != before.L1JobID || settled.CancelStatus != "" {
+				t.Fatalf("L3 projection=%d %s error=%v", status, body, err)
+			}
 		})
 	}
 }
 
-func TestCancelRound2AdminCheckOutage(t *testing.T) {
+func TestPersonAdminHasNoL3CancelAuthority(t *testing.T) {
 	h := newIntegrationHarnessWithL1Options(t, l1.StoreOptions{}, true)
-	admin, _, _ := cancelAdmin(t, h)
-	run := h.submit(inlineRunRequest("exit 0\n"), "admin-outage")
-	// Both transport loss and a valid L1 401 are dependency failures.
-	for _, unauthorized := range []bool{false, true} {
-		t.Run(fmt.Sprint(unauthorized), func(t *testing.T) {
-			h.l3Server.jobs = &L1Client{operationTimeout: time.Second, client: &http.Client{Transport: recoveryRoundTripper(func(req *http.Request) (*http.Response, error) {
-				if req.URL.Path != "/v1/person-admin-check" {
-					t.Errorf("unexpected path=%s", req.URL.Path)
-				}
-				if !unauthorized {
-					return nil, errors.New("L1 offline")
-				}
-				return &http.Response{StatusCode: 401, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"unauthorized","message":"ledger unknown","retryable":false}}`)), Header: make(http.Header)}, nil
-			})}}
-			status, _, body := h.do(admin, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
-			assertAPIError(t, status, body, http.StatusServiceUnavailable, contract.ErrorUnavailable)
-			var response contract.ErrorResponse
-			_ = json.Unmarshal(body, &response)
-			if !response.Error.Retryable {
-				t.Fatalf("not retryable: %s", body)
-			}
-			var count int
-			if err := h.l3Store.db.QueryRow(`SELECT COUNT(*) FROM run_cancellations WHERE run_id=?`, run.RunID).Scan(&count); err != nil || count != 0 {
-				t.Fatalf("outage created intent=%d %v", count, err)
-			}
-
-		})
-	}
-	// Root authority comes first and requires no L1 read.
-	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
-	if status != http.StatusOK {
-		t.Fatalf("root cancel during outage=%d %s", status, body)
-	}
-}
-
-func TestCancelRound2NonAdminRealL1(t *testing.T) {
-	h := newIntegrationHarness(t)
-	run := h.submit(inlineRunRequest("exit 0\n"), "non-admin")
-	stranger := h.client(fabric.Identity{NodeID: "other", UserID: "other", DeviceID: "other-device", Tags: []string{DefaultCallerPrincipalTag}}, DefaultL3Address)
-	status, _, body := h.do(stranger, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+	caller, _ := cancelAdmin(t, h)
+	run := h.submit(inlineRunRequest("exit 0\n"), "admin-l3-forbidden")
+	status, _, body := h.do(caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
+	var count int
+	if err := h.l3Store.db.QueryRow(`SELECT COUNT(*) FROM run_cancellations WHERE run_id=?`, run.RunID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("forbidden request recorded intent=%d %v", count, err)
+	}
 }
 
 func TestCancelRound2ConflictingTerminalAcknowledgement(t *testing.T) {
@@ -231,7 +202,17 @@ func TestCancelRound2Ledger401HTTP(t *testing.T) {
 			h.l3Server.jobs = &L1Client{operationTimeout: time.Second, client: &http.Client{Transport: recoveryRoundTripper(func(*http.Request) (*http.Response, error) {
 				return &http.Response{StatusCode: 401, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"unauthorized","message":"ledger unknown","retryable":false}}`)), Header: make(http.Header)}, nil
 			})}}
+			var serverLog bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&serverLog)
+			t.Cleanup(func() { log.SetOutput(previous) })
 			status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+			if !strings.Contains(serverLog.String(), "ledger unknown") || !strings.Contains(serverLog.String(), run.RunID) {
+				t.Fatalf("missing server-side cause: %s", serverLog.String())
+			}
+			if strings.Contains(string(body), "ledger unknown") {
+				t.Fatalf("internal cause leaked: %s", body)
+			}
 			assertAPIError(t, status, body, http.StatusServiceUnavailable, contract.ErrorInternal)
 			var response contract.ErrorResponse
 			_ = json.Unmarshal(body, &response)
@@ -288,17 +269,36 @@ func TestCancelRound2SuccessfulDeliveryClearsFailure(t *testing.T) {
 	}
 }
 
-func TestCancelRound2MalformedAdminCheck(t *testing.T) {
-	h := newIntegrationHarnessWithL1Options(t, l1.StoreOptions{}, true)
-	admin, _, _ := cancelAdmin(t, h)
-	run := h.submit(inlineRunRequest("exit 0\n"), "malformed-admin")
-	for _, raw := range []string{`{}`, `{"current_admin":true}`, `{"policy_revision":1}`, `{"current_admin":null,"policy_revision":1}`, `{"current_admin":true,"policy_revision":-1}`} {
-		t.Run(raw, func(t *testing.T) {
-			h.l3Server.jobs = &L1Client{operationTimeout: time.Second, client: &http.Client{Transport: recoveryRoundTripper(func(*http.Request) (*http.Response, error) {
-				return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(raw)), Header: make(http.Header)}, nil
-			})}}
-			status, _, body := h.do(admin, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
-			assertAPIError(t, status, body, http.StatusServiceUnavailable, contract.ErrorUnavailable)
+func TestCompleteDispatchRejectsEmptyJobID(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprint("terminal=", terminal), func(t *testing.T) {
+			s, _, _ := recoveryStore(t)
+			ctx := context.Background()
+			run, _, err := s.CreateRun(ctx, CreateRunInput{Actor: "test", IdempotencyKey: "empty-job", Request: inlineRunRequest("exit 0\n")})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.beginDispatch(ctx, run.RunID); err != nil {
+				t.Fatal(err)
+			}
+			if terminal {
+				failRunAfterDispatchAttempt(t, s, run.RunID)
+			}
+			snapshot := func() string {
+				var value string
+				err := s.db.QueryRow(`SELECT json_object('state', r.status, 'job', r.l1_job_id, 'updated', r.updated_ns, 'outbox_job', o.job_id, 'dispatched', o.dispatched_ns, 'delivery', o.token_delivery) FROM runs r JOIN dispatch_outbox o USING(run_id) WHERE r.run_id=?`, run.RunID).Scan(&value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return value
+			}
+			before := snapshot()
+			if err := s.completeDispatch(ctx, run.RunID, ""); err == nil {
+				t.Fatal("empty job ID was accepted")
+			}
+			if after := snapshot(); after != before {
+				t.Fatal("empty acknowledgement mutated durable state")
+			}
 		})
 	}
 }

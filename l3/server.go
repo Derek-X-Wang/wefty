@@ -1079,8 +1079,6 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusNotFound
 	case contract.ErrorNotImplemented:
 		status = http.StatusNotImplemented
-	case contract.ErrorUnavailable:
-		status = http.StatusServiceUnavailable
 	case contract.ErrorInternal:
 		status = http.StatusInternalServerError
 		if apiError.Retryable {

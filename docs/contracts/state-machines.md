@@ -1123,18 +1123,21 @@ canceled" ahead of any earlier attempt exit, spawn failure or lease loss.
 ### Run cancellation (#691)
 
 `POST /v1/runs/{run_id}/cancel` requires the existing L3 caller principal.
-First it checks for an actor matching either the Run's immutable submitting
-actor or the immutable submitting actor of its lineage's root Run. Authority follows parent links, not
-a rerun's source: a rerun starts a new lineage with its own submitting actor.
-Otherwise, a Fabric person may cancel any Run, including Computer-submitted
-roots, only after the public L1 [person admin check](l1-client.md) confirms
-current membership for this request. No result is cached. Non-admin actors
-retain `403 forbidden`; an erroring or unreachable L1 check yields retryable
-`503 unavailable`, without recording intent. Run tokens and Computer tokens
-receive `403 forbidden`;
-an unknown Run
-receives `404 not_found`. The response is HTTP 200 with the current `RunRecord`,
-including for a terminal or already-canceled Run.
+Only an actor matching either the Run's immutable submitting actor or the
+immutable submitting actor of its lineage's root Run may cancel. Authority
+follows parent links, not a rerun's source: a rerun starts a new lineage with
+its own submitting actor. Other actors, Run tokens and Computer tokens receive
+`403 forbidden`; an unknown Run receives `404 not_found`. The response is
+HTTP 200 with the current `RunRecord`, including for a terminal or already-canceled Run.
+
+A person admin stops any Run, including a Computer-submitted root, by
+cancelling its current L1 job through L1's existing person cancel path,
+`POST /v1/jobs/{job_id}/cancel`, from an untagged person device. L1 revalidates
+current admin authority; no L3 admin authorization path is added. L3 observes
+the job settlement and projects the Run as `failed`, with
+`failure_reason=the L1 job was canceled`. A Run that has not dispatched yet
+has no job to cancel: it dispatches first, and the admin can cancel its job
+once it dispatches.
 
 Cancellation arbitrates with the first dispatch attempt inside the ledger
 transaction. If no attempt has begun and no L1 job is linked, L3 directly
@@ -1156,7 +1159,8 @@ acknowledgement wakes cancellation delivery immediately. A dispatch-key
 absence remains provisional until the existing one-hour dispatch settlement
 horizon has passed since the last attempt; only then, with no acknowledgement
 recorded meanwhile, can the Run settle locally as canceled before dispatch.
-A conflicting acknowledgement cannot link a Run: its outbox job must be NULL
+An empty L1 job ID is rejected before the acknowledgement can be written to
+the outbox or Run. A conflicting acknowledgement cannot link a Run: its outbox job must be NULL
 or equal the job being linked. Pending cancellation reads coalesce the Run
 and outbox job IDs and link the Run before calling L1 cancel, so outbox-only
 acknowledgements do not wait indefinitely on a missing dispatch-key lookup.
@@ -1179,7 +1183,9 @@ response clears the last error and failure count, including still-running jobs.
 Authentication/identity failures (including any HTTP 401, `unauthorized` or
 `person_identity_required`) remain transient even when L1 marks them non-retryable.
 These ledger authentication failures reach the person as retryable `503 internal`,
-never as a person-facing 401.
+never as a person-facing 401. Cancellation delivery failures retain their
+dependency or storage cause in server logs even when HTTP exposes only
+`503 internal`.
 For permanent refusals, reconciliation and repeated cancel calls do not send
 it again. A cancel `not_found` alone can hide an ownership
 refusal, so only an authoritative `GetJob` absence fails an active Run through

@@ -187,8 +187,6 @@ var driftRows = []driftRow{
 	{requestBody(l3Doc, "post", "/v1/runs"), typeOf[l3.CreateRunRequest]()},
 
 	// L1 client inline bodies.
-	{requestBody(clientDoc, "post", "/v1/person-admin-check"), typeOf[l1.PersonAdminCheckRequest]()},
-	{responseBody(clientDoc, "post", "/v1/person-admin-check", "200"), typeOf[l1.PersonAdminCheck]()},
 	{responseBody(clientDoc, "get", "/v1/computers/{computer_id}/submission", "200"), typeOf[l1.ComputerSubmissionState]()},
 	{requestBody(clientDoc, "put", "/v1/computers/{computer_id}/submission"), typeOf[l1.ComputerSubmissionRequest]()},
 	{responseBody(clientDoc, "put", "/v1/computers/{computer_id}/submission", "200"), typeOf[l1.ComputerSubmissionMutationResult]()},
