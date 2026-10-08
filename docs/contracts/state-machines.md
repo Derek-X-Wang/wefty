@@ -1168,11 +1168,13 @@ bound from the answer. The ASCII marker keeps a truncated visible-ASCII
 request ID visible ASCII; Unicode strings retain their UTF-8 prefix. The kept
 L1 `details` object is also capped at 4 KiB of encoded JSON, counting keys,
 values, nested containers, delimiters and escaping. `details.reason`, the only
-detail read by classification, is retained first with its decoded type intact;
-an oversized non-string reason keeps a bounded container prefix and remains a
-protocol violation. Other object entries are considered in sorted original-key
-order, and arrays in their original order, using the remaining shared budget;
-the first entry that cannot fit and the remaining entries are dropped. Nested
+detail read by classification, is retained first with its decoded type intact.
+In every object, including nested objects, a `reason` entry is considered first
+before the other entries. An oversized non-string reason keeps a bounded
+container prefix and remains a protocol violation. Other object entries are
+considered in sorted original-key order, and arrays in their original order,
+using the remaining shared budget; the first entry that cannot fit and the
+remaining entries are dropped. Nested
 containers keep a prefix within that same budget. If keys collide after
 128-rune truncation, the first sorted original key wins. The 2 MiB L1 response
 read limit remains unchanged. Envelope metadata and L3's local

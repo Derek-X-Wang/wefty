@@ -496,6 +496,7 @@ func TestL1DetailsSizeBound(t *testing.T) {
 		{"reason array", contract.ErrorUnavailable, 503, items, nil, l1ProtocolViolation},
 		{"nested array", contract.ErrorUnavailable, 503, "capacity_exhausted", items, l1Transient},
 		{"escaped Unicode", contract.ErrorUnavailable, 503, "capacity_exhausted", escaped, l1Transient},
+		{"escaped keys tiny values", contract.ErrorUnavailable, 503, "capacity_exhausted", escapeHeavyL1DetailKeys(), l1Transient},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			details := map[string]any{"reason": tt.reason, "aaa": tt.extra}
@@ -514,6 +515,94 @@ func TestL1DetailsSizeBound(t *testing.T) {
 				t.Fatal("classification reason changed")
 			}
 			assertL1DetailsSize(t, kept)
+		})
+	}
+}
+
+func escapeHeavyL1DetailKeys() map[string]any {
+	details := make(map[string]any, 1000)
+	for i := 0; i < 1000; i++ {
+		details[fmt.Sprintf("\x00<>&%06d", i)] = ""
+	}
+	return details
+}
+
+func TestBoundedL1DetailValueEncodedSize(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value any
+	}{
+		{"escaped keys tiny values", escapeHeavyL1DetailKeys()},
+		{"nested containers", map[string]any{
+			"reason": "capacity_exhausted",
+			"\x00<>&": []any{true, float64(7), nil, map[string]any{
+				"\x00<>&": strings.Repeat("\x00<>&界", 40),
+			}},
+		}},
+	} {
+		for _, budget := range []int{256, 4096} {
+			t.Run(fmt.Sprintf("%s/budget=%d", tt.name, budget), func(t *testing.T) {
+				out, size, fits := boundedL1DetailValue(tt.value, budget)
+				if !fits {
+					t.Fatal("container did not fit")
+				}
+				encoded, err := json.Marshal(out)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if size != len(encoded) {
+					t.Errorf("reported size = %d, encoded size = %d", size, len(encoded))
+				}
+				if len(encoded) > budget {
+					t.Errorf("encoded size = %d, budget = %d", len(encoded), budget)
+				}
+			})
+		}
+	}
+}
+
+func TestL1DetailsStopAtFirstMisfit(t *testing.T) {
+	// Thirty bounded ASCII strings fill most of the 4 KiB budget. The next
+	// string expands during JSON escaping and cannot fit, but the tiny item
+	// after it could fit if the client incorrectly skipped the misfit.
+	prefix := make([]any, 30)
+	for i := range prefix {
+		prefix[i] = strings.Repeat("x", 128)
+	}
+	misfit := strings.Repeat("\x00<>&", 32)
+	for _, container := range []string{"object", "array"} {
+		t.Run(container, func(t *testing.T) {
+			details := map[string]any{"a": prefix, "b": misfit, "z": ""}
+			if container == "array" {
+				details = map[string]any{"items": []any{prefix, misfit, ""}}
+			}
+			client := l1DetailsClient(l1DetailsBody(t, contract.ErrorUnavailable, details), 503)
+			_, err := client.GetJob(context.Background(), "job")
+			var protocol *Error
+			if !errors.As(err, &protocol) {
+				t.Fatalf("missing L1 error envelope: %v", err)
+			}
+			kept := protocol.Details
+			assertL1DetailsSize(t, kept)
+			var keptPrefix []any
+			if container == "object" {
+				if _, exists := kept["b"]; exists {
+					t.Error("misfit string was retained")
+				}
+				if _, exists := kept["z"]; exists {
+					t.Error("tiny later key was retained after the first misfit")
+				}
+				keptPrefix = kept["a"].([]any)
+			} else {
+				items := kept["items"].([]any)
+				if len(items) != 1 {
+					t.Errorf("kept %d array items, want only the prefix before the misfit", len(items))
+				}
+				keptPrefix = items[0].([]any)
+			}
+			if len(keptPrefix) != len(prefix) {
+				t.Errorf("kept %d prefix strings, want %d", len(keptPrefix), len(prefix))
+			}
 		})
 	}
 }
