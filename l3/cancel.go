@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"time"
 
@@ -87,8 +88,9 @@ type runCancellation struct {
 }
 
 func (s *Store) pendingRunCancellations(ctx context.Context, runID string) ([]runCancellation, error) {
-	query := `SELECT r.run_id, COALESCE(r.l1_job_id, ''), r.status, r.required_envelope, r.dispatch_key
+	query := `SELECT r.run_id, COALESCE(r.l1_job_id, o.job_id, ''), r.status, r.required_envelope, r.dispatch_key
  FROM run_cancellations c JOIN runs r ON r.run_id=c.run_id
+ LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id
  WHERE c.completed_ns IS NULL AND c.retry_ns<=?`
 	args := []any{s.recoveryNow().UnixNano()}
 	if runID != "" {
@@ -254,6 +256,9 @@ func (r *Reconciler) cancelRunJob(ctx context.Context, cancellation runCancellat
 func (r *Reconciler) deliverRunCancellation(ctx, remote context.Context, cancellation runCancellation) error {
 	err := r.cancelRunJobRemote(ctx, remote, cancellation)
 	if err != nil && ctx.Err() == nil {
+		// Keep the dependency/storage cause in server logs when HTTP exposes
+		// only a retryable internal error. This also covers background retries.
+		log.Printf("L3 run cancellation failed: run_id=%s error=%v cause=%v", cancellation.RunID, err, errors.Unwrap(err))
 		return errors.Join(err, r.store.deferRunCancellation(ctx, cancellation.RunID, err))
 	}
 	return err
@@ -276,6 +281,9 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 			return r.store.deferRunCancellation(ctx, run.RunID, err)
 		}
 		if err != nil {
+			if isL1CancellationIdentityFailure(err) {
+				return internalError(err, "L1 could not authenticate the run ledger")
+			}
 			return err
 		}
 		if err := r.store.completeDispatch(ctx, run.RunID, job.JobID); err != nil {
@@ -288,6 +296,20 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		run.JobID, run.State = record.L1JobID, record.Status
 	}
 
+	// Link legacy outbox acknowledgements before sending any cancellation.
+	// A mismatched dispatch lookup must never become authority over another job.
+	if err := r.store.completeDispatch(ctx, run.RunID, run.JobID); err != nil {
+		return err
+	}
+	record, err := r.store.GetRun(ctx, run.RunID)
+	if err != nil {
+		return err
+	}
+	if record.L1JobID != run.JobID || run.JobID == "" {
+		return internalError(errors.New("canceled dispatch acknowledgement conflicts with run association"), "link canceled dispatch")
+	}
+	run.State = record.Status
+
 	canceler, ok := r.jobs.(JobCancelClient)
 	if !ok {
 		return internalError(errors.New("L1 cancellation client is not configured"), "cancel run job")
@@ -298,13 +320,10 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		var response *l1ResponseError
 		hasProtocol := errors.As(err, &refusal)
 		hasResponse := errors.As(err, &response)
-		if hasProtocol && (refusal.Code == contract.ErrorUnauthorized || refusal.Code == contract.ErrorPersonIdentityRequired ||
-			(hasResponse && response.status == http.StatusUnauthorized)) {
+		if isL1CancellationIdentityFailure(err) {
 			// Identity lookup failure is not a decision about this Run's cancel.
 			// Retain intent and advertise the same retryability to the caller.
-			retry := *refusal
-			retry.Retryable = true
-			return &retry
+			return internalError(err, "L1 could not authenticate the run ledger")
 		}
 		typedRefusal := hasProtocol && !refusal.Retryable
 		if hasResponse && !response.validEnvelope {
@@ -325,6 +344,9 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		}
 		return r.store.refuseRunCancellation(ctx, run.RunID, err)
 	}
+	if _, err := r.store.db.ExecContext(ctx, `UPDATE run_cancellations SET last_error=NULL, failures=0, retry_ns=0 WHERE run_id=? AND completed_ns IS NULL`, run.RunID); err != nil {
+		return internalError(err, "clear cancellation delivery failure")
+	}
 	if err := r.projectObservedJob(ctx, run, job); err != nil {
 		return err
 	}
@@ -342,6 +364,15 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		return r.store.finishRunCancellation(ctx, run.RunID)
 	}
 	return nil
+}
+
+// Authentication of the ledger is a dependency failure on both dispatch
+// lookup and job cancel, never a refusal of the authenticated person's request.
+func isL1CancellationIdentityFailure(err error) bool {
+	var protocol *Error
+	var response *l1ResponseError
+	return (errors.As(err, &protocol) && (protocol.Code == contract.ErrorUnauthorized || protocol.Code == contract.ErrorPersonIdentityRequired)) ||
+		(errors.As(err, &response) && response.status == http.StatusUnauthorized)
 }
 
 // projectObservedJob preserves ordinary reconciliation's image evidence,
