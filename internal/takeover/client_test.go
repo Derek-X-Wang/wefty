@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -156,5 +158,38 @@ func TestOpenStructured5xxIsActionRefusal(t *testing.T) {
 	var transport *TransportError
 	if !errors.As(err, &action) || errors.As(err, &transport) || action.APIError.Code != contract.ErrorTenureUnavailable || !action.APIError.Retryable {
 		t.Fatalf("structured 503 must remain an action refusal: %v", err)
+	}
+}
+
+func TestNonEnvelope5xxReasonSanitized(t *testing.T) {
+	const body = "\x1b[31mComputer\r\n display\x00\x01\x7f\u0085\u200b is\t not ready: 世界"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	for _, action := range []string{"view", "take", "release"} {
+		t.Run(action, func(t *testing.T) {
+			var err error
+			if action == "view" {
+				_, err = Open(t.Context(), directFabric{}, endpoint)
+			} else {
+				_, err = Perform(t.Context(), directFabric{}, endpoint, "session-token", action)
+			}
+			var transport *TransportError
+			if !errors.As(err, &transport) {
+				t.Fatalf("expected transport failure: %v", err)
+			}
+			message := err.Error()
+			for _, r := range message {
+				if !unicode.IsPrint(r) && r != '\t' {
+					t.Fatalf("non-printable rune %U retained in message: %q", r, message)
+				}
+			}
+			if !utf8.ValidString(message) || !strings.Contains(message, "[31mComputer display is\t not ready: 世界") {
+				t.Fatalf("printable reason not preserved: %q", message)
+			}
+		})
 	}
 }

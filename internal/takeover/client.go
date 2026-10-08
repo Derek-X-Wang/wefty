@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -204,7 +205,15 @@ func Perform(
 // Callers bound the response read to 4096 bytes before retaining a refusal reason.
 func responseFailureMessage(action string, status int, body []byte) string {
 	message := fmt.Sprintf("Computer %s returned HTTP %d", action, status)
-	if reason := strings.TrimSpace(string(body)); reason != "" {
+	// Drop invalid UTF-8, including a rune cut by the bounded response read.
+	reason := strings.ToValidUTF8(string(body), "")
+	reason = strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) || r == '\t' {
+			return r
+		}
+		return -1
+	}, reason)
+	if reason = strings.TrimSpace(reason); reason != "" {
 		message += ": " + reason
 	}
 	return message

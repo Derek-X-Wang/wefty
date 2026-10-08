@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -21,17 +22,28 @@ import (
 func TestTakeoverFrontDoorNonEnvelope5xxFromRealBinary(t *testing.T) {
 	binary := buildWefty(t)
 	for _, failure := range []struct {
+		name   string
 		status int
 		body   string
+		reason string
 	}{
-		{503, "Computer display is not ready"},
-		{503, "Fabric identity could not be verified"},
-		{500, "front door failed"},
-		{502, `{"error":{}}`},
-		{599, "front door unavailable"},
+		{status: 503, body: "Computer display is not ready"},
+		{status: 503, body: "Fabric identity could not be verified"},
+		{status: 500, body: "front door failed"},
+		{status: 502, body: `{"error":{}}`},
+		{status: 599, body: "front door unavailable"},
+		{name: "oversized ASCII", status: 503, body: strings.Repeat("a", 9000), reason: strings.Repeat("a", 4096)},
+		{name: "oversized UTF-8", status: 503, body: strings.Repeat("a", 4094) + "界" + strings.Repeat("b", 4903), reason: strings.Repeat("a", 4094)},
 	} {
+		name, reason := failure.name, failure.reason
+		if name == "" {
+			name = failure.body
+		}
+		if reason == "" {
+			reason = failure.body
+		}
 		for _, action := range []string{"take", "release", "view"} {
-			t.Run(fmt.Sprintf("%s/%d/%s", action, failure.status, failure.body), func(t *testing.T) {
+			t.Run(fmt.Sprintf("%s/%d/%s", action, failure.status, name), func(t *testing.T) {
 				var unauthorized atomic.Bool
 				frontDoor := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 					wantPath := contract.ComputerDisplayWebSocketPath
@@ -78,8 +90,21 @@ func TestTakeoverFrontDoorNonEnvelope5xxFromRealBinary(t *testing.T) {
 				code, stdout, stderr := runPolishBinary(t, binary, args...)
 				var envelope contract.ErrorResponse
 				if err := json.Unmarshal(stderr, &envelope); err != nil || code != 13 || envelope.Error.Code != contract.ErrorUnavailable ||
-					!envelope.Error.Retryable || len(stdout) != 0 || !strings.Contains(envelope.Error.Message, failure.body) {
+					!envelope.Error.Retryable || len(stdout) != 0 {
 					t.Errorf("exit=%d stdout=%s stderr=%s decode=%v, want unavailable/retryable/exit 13", code, stdout, stderr, err)
+				}
+				prefix := fmt.Sprintf("Computer %s returned HTTP %d: ", action, failure.status)
+				_, retainedReason, found := strings.Cut(envelope.Error.Message, prefix)
+				if action == "view" {
+					retainedReason = strings.TrimSuffix(retainedReason, ")")
+				}
+				reasonMatches := retainedReason == reason
+				if action == "view" && len(failure.body) > 4096 {
+					// WebSocket dial may retain fewer response bytes than our bound.
+					reasonMatches = retainedReason != "" && strings.HasPrefix(reason, retainedReason)
+				}
+				if !found || !reasonMatches || len(retainedReason) > 4096 || !utf8.ValidString(retainedReason) || !utf8.Valid(stderr) {
+					t.Errorf("retained reason has %d bytes, valid UTF-8=%t; want bounded reason with no split rune (full length %d)", len(retainedReason), utf8.ValidString(retainedReason), len(reason))
 				}
 
 				// Plain-text authentication refusals retain their distinct exit.
