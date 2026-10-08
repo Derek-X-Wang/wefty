@@ -1,16 +1,63 @@
 package tsnet
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 )
+
+type identityRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f identityRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+// Exercise the production WhoIs path without starting an embedded node.
+func TestWhoIsFailureCategories(t *testing.T) {
+	for _, test := range []struct {
+		name, status, peer string
+		want               error
+	}{
+		{"missing issuing Fabric", `{}`, `{"Node":{"StableID":"device","Tags":["tag:agent"]}}`, fabric.ErrIssuingFabricUnavailable},
+		{"missing identity domain", `{"CurrentTailnet":{}}`, `{"Node":{"StableID":"device","Tags":["tag:agent"]}}`, fabric.ErrIssuingFabricUnavailable},
+		{"missing peer record", `{"CurrentTailnet":{"MagicDNSSuffix":"private-domain"}}`, `null`, fabric.ErrIdentityIncomplete},
+		{"missing node", `{"CurrentTailnet":{"MagicDNSSuffix":"private-domain"}}`, `{}`, fabric.ErrIdentityIncomplete},
+		{"missing device ID", `{"CurrentTailnet":{"MagicDNSSuffix":"private-domain"}}`, `{"Node":{}}`, fabric.ErrIdentityIncomplete},
+		{"missing person", `{"CurrentTailnet":{"MagicDNSSuffix":"private-domain"}}`, `{"Node":{"StableID":"device"}}`, fabric.ErrIdentityIncomplete},
+		{"missing user ID", `{"CurrentTailnet":{"MagicDNSSuffix":"private-domain"}}`, `{"Node":{"StableID":"device"},"UserProfile":{}}`, fabric.ErrIdentityIncomplete},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &local.Client{OmitAuth: true, Transport: identityRoundTripper(func(r *http.Request) (*http.Response, error) {
+				var body string
+				switch r.URL.Path {
+				case "/localapi/v0/whois":
+					body = test.peer
+				case "/localapi/v0/status":
+					body = test.status
+				default:
+					t.Fatalf("unexpected local API path: %s", r.URL.Path)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			})}
+			f := &Fabric{client: client}
+			identity, err := f.WhoIs(context.Background(), "private-peer:1234")
+			if !errors.Is(err, test.want) || errors.Is(err, fabric.ErrIdentityNotFound) || identity.NodeID != "" {
+				t.Fatalf("WhoIs() = %#v, %v; want operational category %v", identity, err, test.want)
+			}
+		})
+	}
+}
 
 func TestNewRequiresWeftyName(t *testing.T) {
 	if _, err := New(Config{Name: "runner-1"}); err == nil {

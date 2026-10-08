@@ -84,6 +84,8 @@ func TestIdentityLookupAvailabilityAcrossAuthenticatedProtocols(t *testing.T) {
 		cause  string
 	}{
 		{"operational", errors.New("lookup backend failed: private-credential"), 503, contract.ErrorUnavailable, "lookup_failed"},
+		{"issuing Fabric unavailable", fmt.Errorf("private-endpoint: %w", fabric.ErrIssuingFabricUnavailable), 503, contract.ErrorUnavailable, "issuing_fabric_unavailable"},
+		{"incomplete identity", fmt.Errorf("private-credential: %w", fabric.ErrIdentityIncomplete), 503, contract.ErrorUnavailable, "identity_incomplete"},
 		{"timeout", fmt.Errorf("private-endpoint: %w", context.DeadlineExceeded), 503, contract.ErrorUnavailable, "timeout"},
 		{"canceled", context.Canceled, 503, contract.ErrorUnavailable, "canceled"},
 		{"absent", fabric.ErrIdentityNotFound, 401, contract.ErrorUnauthorized, ""},
@@ -114,8 +116,9 @@ func TestIdentityLookupAvailabilityAcrossAuthenticatedProtocols(t *testing.T) {
 					if w.Code != answer.status || got.Code != answer.code || got.Retryable != (answer.status == 503) {
 						t.Fatalf("status=%d error=%+v, want %d %s retryable=%t", w.Code, got, answer.status, answer.code, answer.status == 503)
 					}
-					if answer.status == 503 && got.Details["reason"] != "identity_unverifiable" {
-						t.Fatalf("details = %#v, want identity_unverifiable", got.Details)
+					if answer.status == 503 && (got.Details["reason"] != "identity_unverifiable" || len(got.Details) != 1 ||
+						got.Message != "fabric identity could not be verified") {
+						t.Fatalf("operational response changed: %+v", got)
 					}
 					if answer.status == 401 && len(got.Details) != 0 {
 						t.Fatalf("absence details = %#v", got.Details)

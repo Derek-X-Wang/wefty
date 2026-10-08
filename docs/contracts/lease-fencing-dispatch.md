@@ -19,9 +19,15 @@ person, cancel, and attempt-credential requests. Genuine identity absence
 `retryable:false`. Any other lookup failure returns `503 unavailable`,
 `retryable:true`, with `details.reason="identity_unverifiable"`. No handler
 or authority mutation runs when identity cannot be verified. L1 logs the
-cause type and a safe category (`lookup_failed`, `timeout`, or `canceled`)
+cause type and a safe category (`lookup_failed`, `timeout`, `canceled`,
+`issuing_fabric_unavailable`, or `identity_incomplete`)
 with the request ID; arbitrary Fabric error text, addresses, request bodies,
 queries, and bearer credentials are excluded from that diagnostic.
+The Fabric seam exports `ErrIssuingFabricUnavailable` for missing issuing
+Fabric configuration and `ErrIdentityIncomplete` for a peer record missing
+required stable identity fields. These categories are diagnostics only;
+they do not change the HTTP response or imply that retry will repair a
+persistent configuration problem.
 
 The three ledger-only gates — dispatch-key lookup, Computer token-scope
 proof, and host boot-session proof — require the configured run-ledger

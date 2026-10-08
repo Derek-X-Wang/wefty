@@ -6,11 +6,13 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,6 +25,68 @@ import (
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
 )
+
+func TestComputerFrontDoorIdentityLookupAvailability(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"operational", errors.New("private-credential private-endpoint")},
+		{"timeout", fmt.Errorf("private-endpoint: %w", context.DeadlineExceeded)},
+		{"canceled", context.Canceled},
+		{"issuing Fabric unavailable", fmt.Errorf("private-endpoint: %w", fabric.ErrIssuingFabricUnavailable)},
+		{"incomplete identity", fmt.Errorf("private-credential: %w", fabric.ErrIdentityIncomplete)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, _, auditor, _, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
+			defer server.Close()
+			// Each changed operational branch is paired with genuine absence,
+			// including a wrapped sentinel, on all three front-door paths.
+			for _, path := range []string{computerWebSocketPath, computerControlTakePath, computerControlReleasePath} {
+				for _, answer := range []struct {
+					err    error
+					status int
+				}{
+					{test.err, http.StatusServiceUnavailable},
+					{fabric.ErrIdentityNotFound, http.StatusUnauthorized},
+					{fmt.Errorf("private-endpoint: %w", fabric.ErrIdentityNotFound), http.StatusUnauthorized},
+				} {
+					fixture.identity.set(identity, answer.err)
+					method := http.MethodPost
+					if path == computerWebSocketPath {
+						method = http.MethodGet
+					}
+					request := httptest.NewRequest(method, path, nil)
+					request.Header.Set("Sec-WebSocket-Protocol", "binary")
+					response := httptest.NewRecorder()
+					fixture.frontDoor.ServeHTTP(response, request)
+					if response.Code != answer.status {
+						t.Errorf("%s: status=%d body=%q, want %d", path, response.Code, response.Body.String(), answer.status)
+					}
+					for _, secret := range []string{"private-credential", "private-endpoint", "issuing fabric", "identity incomplete"} {
+						if strings.Contains(response.Body.String(), secret) {
+							t.Errorf("%s leaked %q: %s", path, secret, response.Body.String())
+						}
+					}
+				}
+			}
+			if fixture.viewDials.Load() != 0 || fixture.controlDials.Load() != 0 || len(fixture.frontDoor.active) != 0 {
+				t.Fatal("identity failure dialed a backend or created a session")
+			}
+			fixture.frontDoor.denials.flush(t.Context())
+			events := auditor.snapshot()
+			if len(events) != 1 || events[0].EventCount != 9 {
+				t.Fatalf("identity failure denial audit = %#v, want 9 aggregated denials", events)
+			}
+			for _, event := range events {
+				if event.Kind != l1.ComputerTakeoverAdmissionDenied || event.Reason != l1.ComputerTakeoverIdentityUnavailable ||
+					event.UserID != "" || event.DeviceID != "" || event.FabricID != "" {
+					t.Fatalf("identity failure audit = %#v", event)
+				}
+			}
+		})
+	}
+}
 
 func TestComputerFrontDoorReturnsTypedStalePolicyRefusal(t *testing.T) {
 	_, _, _, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantNone)
