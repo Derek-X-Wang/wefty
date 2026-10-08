@@ -484,12 +484,12 @@ func executeComputerResize(ctx context.Context, clients *apiClients, jsonOutput 
 
 func waitForComputerGrowRevision(ctx context.Context, clients *apiClients, computerID string, operationRevision int64, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
 	var observed l1.Computer
-	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
-		var readErr error
-		observed, readErr = clients.getComputerStorageAuthority(ctx, computerID)
+	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
+		current, readErr := clients.getComputerStorageAuthority(ctx, computerID)
 		if readErr != nil {
 			return false, readErr
 		}
+		observed = current
 		if observed.AppliedRevision > operationRevision {
 			return false, fmt.Errorf("Computer grow revision %d was superseded by applied revision %d", operationRevision, observed.AppliedRevision)
 		}
@@ -500,12 +500,12 @@ func waitForComputerGrowRevision(ctx context.Context, clients *apiClients, compu
 
 func waitForComputerRemoval(ctx context.Context, clients *apiClients, computerID string, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
 	var observed l1.Computer
-	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
-		var readErr error
-		observed, readErr = clients.getComputerStorageAuthority(ctx, computerID)
+	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
+		current, readErr := clients.getComputerStorageAuthority(ctx, computerID)
 		if readErr != nil {
 			return false, readErr
 		}
+		observed = current
 		return computerRemovalTerminal(observed) || computerRemovalQuarantine(observed) != nil ||
 			computerRemovalStalled(observed), nil
 	})

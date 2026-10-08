@@ -777,6 +777,9 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, fmt.Errorf("read %s response: %w", c.name, err)
+		}
 		return nil, &unavailableError{cause: fmt.Errorf("read %s response: %w", c.name, err)}
 	}
 	for _, status := range success {

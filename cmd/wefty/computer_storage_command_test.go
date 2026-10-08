@@ -249,10 +249,15 @@ func assertComputerStorageCLIAdversarialRows(t *testing.T) {
 		var exportOutput storageMutationOutput
 		if err := json.Unmarshal(exportJSON, &exportOutput); err != nil || exportOutput.CustodyExport == nil ||
 			!exportOutput.MutationApplied || exportOutput.CustodyExport.Status != "planned" ||
-			exportOutput.StorageProvenance == nil || !exportOutput.StorageProvenance.CustodyTainted ||
-			len(exportOutput.StorageProvenance.CustodyExports) != 1 || exportOutput.Observation == nil ||
+			exportOutput.Observation == nil ||
 			exportOutput.Observation.Status != "failed" {
 			t.Fatalf("Custody export output = %s err=%v", exportJSON, err)
+		}
+		// A timed-out wait cannot start another provenance request. Verify
+		// export taint with a separate read before any attestation is made.
+		provenance, err := h.clients.listComputerStorageProvenance(h.ctx, h.computer.ComputerID)
+		if err != nil || !provenance.CustodyTainted || len(provenance.CustodyExports) != 1 {
+			t.Fatalf("Custody export provenance = %#v err=%v", provenance, err)
 		}
 		attestArgs := []string{"services", "custody", "attest", exportOutput.CustodyExport.ExportID,
 			"--idempotency-key", "operator-attested-deleted"}

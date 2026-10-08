@@ -113,6 +113,8 @@ type storageWaitObservation struct {
 	Error     string `json:"error,omitempty"`
 	StartedAt string `json:"started_at,omitempty"`
 	EndedAt   string `json:"ended_at,omitempty"`
+	// A follow-up provenance read shares the original observation budget.
+	waitDeadline time.Time
 }
 
 type storageMutationOutput struct {
@@ -752,12 +754,12 @@ func executeComputerCustodyAttest(ctx context.Context, clients *apiClients, json
 
 func waitForBackupOperation(ctx context.Context, clients *apiClients, computerID, backupID string, wait storageWaitFlags) (l1.BackupList, storageWaitObservation, error) {
 	var last l1.BackupList
-	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
-		var readErr error
-		last, readErr = clients.listComputerBackupsFor(ctx, computerID, backupID)
+	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
+		current, readErr := clients.listComputerBackupsFor(ctx, computerID, backupID)
 		if readErr != nil {
 			return false, readErr
 		}
+		last = current
 		if last.Operation == nil {
 			return false, fmt.Errorf("L1 did not return Backup operation %q of Computer %q", backupID, computerID)
 		}
@@ -770,10 +772,24 @@ func waitForBackupOperation(ctx context.Context, clients *apiClients, computerID
 }
 
 func attachStorageProvenance(ctx context.Context, clients *apiClients, computerID string, output *storageMutationOutput, prior error) error {
-	provenance, err := clients.listComputerStorageProvenance(ctx, computerID)
+	if errors.Is(prior, context.Canceled) || errors.Is(prior, context.DeadlineExceeded) {
+		return prior
+	}
+	observationCtx := ctx
+	if output.Observation != nil && !output.Observation.waitDeadline.IsZero() {
+		var cancel context.CancelFunc
+		observationCtx, cancel = context.WithDeadline(ctx, output.Observation.waitDeadline)
+		defer cancel()
+	}
+	provenance, err := clients.listComputerStorageProvenance(observationCtx, computerID)
 	if err == nil {
 		output.StorageProvenance = &provenance
 		return prior
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	} else if observationCtx.Err() == context.DeadlineExceeded {
+		err = &mutationWaitTimeoutError{message: "timed out waiting for mutation completion provenance"}
 	}
 	if output.Observation == nil {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -796,7 +812,7 @@ func attachStorageProvenance(ctx context.Context, clients *apiClients, computerI
 
 func waitForBackupPrune(ctx context.Context, clients *apiClients, computerID, backupID string, wait storageWaitFlags) (l1.Backup, storageWaitObservation, error) {
 	var observed l1.Backup
-	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
+	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
 		backups, readErr := clients.listComputerBackups(ctx, computerID)
 		if readErr != nil {
 			return false, readErr
@@ -817,12 +833,12 @@ func waitForBackupPrune(ctx context.Context, clients *apiClients, computerID, ba
 // clone after a later operation on its destination must report the clone.
 func waitForComputerClone(ctx context.Context, clients *apiClients, operation cloneComputerOperation, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
 	var observed l1.Computer
-	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
-		var readErr error
-		observed, readErr = clients.getComputerCloneOperation(ctx, operation.computerID, operation.operationRevision)
+	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
+		current, readErr := clients.getComputerCloneOperation(ctx, operation.computerID, operation.operationRevision)
 		if readErr != nil {
 			return false, readErr
 		}
+		observed = current
 		if observed.CloneOperation == nil {
 			return false, fmt.Errorf("L1 did not return clone operation %d of Computer %q", operation.operationRevision, operation.computerID)
 		}
@@ -840,12 +856,12 @@ func waitForComputerClone(ctx context.Context, clients *apiClients, operation cl
 // older restore after a newer one ended must report the older one.
 func waitForComputerRestore(ctx context.Context, clients *apiClients, computerID string, operationRevision int64, wait storageWaitFlags) (l1.Computer, storageWaitObservation, error) {
 	var observed l1.Computer
-	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
-		var readErr error
-		observed, readErr = clients.getComputerRestoreOperation(ctx, computerID, operationRevision)
+	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
+		current, readErr := clients.getComputerRestoreOperation(ctx, computerID, operationRevision)
 		if readErr != nil {
 			return false, readErr
 		}
+		observed = current
 		if observed.RestoreOperation == nil {
 			return false, fmt.Errorf("L1 did not return restore operation %d of Computer %q", operationRevision, computerID)
 		}
@@ -861,12 +877,12 @@ func waitForComputerRestore(ctx context.Context, clients *apiClients, computerID
 func waitForCustodyImport(ctx context.Context, clients *apiClients, importID string, operationRevision int64, wait storageWaitFlags) (l1.ComputerCustodyImportObservation, l1.Computer, storageWaitObservation, error) {
 	var observed l1.ComputerCustodyImportObservation
 	var computer l1.Computer
-	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
-		var readErr error
-		observed, readErr = clients.getComputerCustodyImport(ctx, importID)
+	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
+		current, readErr := clients.getComputerCustodyImport(ctx, importID)
 		if readErr != nil {
 			return false, readErr
 		}
+		observed = current
 		if observed.OperationRevision != operationRevision {
 			return false, fmt.Errorf("Custody import %q observation revision %d does not match accepted revision %d", importID, observed.OperationRevision, operationRevision)
 		}
@@ -892,10 +908,11 @@ func waitForCustodyImport(ctx context.Context, clients *apiClients, importID str
 		if observed.Status != "complete" {
 			return false, fmt.Errorf("Custody import %q reported unexpected status %q", importID, observed.Status)
 		}
-		computer, readErr = clients.getComputerStorageAuthority(ctx, importID)
+		currentComputer, readErr := clients.getComputerStorageAuthority(ctx, importID)
 		if readErr != nil {
 			return false, readErr
 		}
+		computer = currentComputer
 		if computer.AppliedRevision < operationRevision || computer.ReconfigurationPhase != l1.ComputerReconfigurationStable {
 			return false, fmt.Errorf("Custody import %q completed without matching stable Computer authority", importID)
 		}
@@ -906,7 +923,7 @@ func waitForCustodyImport(ctx context.Context, clients *apiClients, importID str
 
 func waitForCustodyExport(ctx context.Context, clients *apiClients, computerID, exportID string, wait storageWaitFlags) (l1.ComputerCustodyExport, storageWaitObservation, error) {
 	var observed l1.ComputerCustodyExport
-	observation, err := pollStorageObservation(ctx, wait, func() (bool, error) {
+	observation, err := pollStorageObservation(ctx, wait, func(ctx context.Context) (bool, error) {
 		exports, readErr := clients.listComputerCustodyExports(ctx, computerID)
 		if readErr != nil {
 			return false, readErr
@@ -924,17 +941,32 @@ func waitForCustodyExport(ctx context.Context, clients *apiClients, computerID, 
 	return observed, observation, err
 }
 
-func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe func() (bool, error)) (storageWaitObservation, error) {
+func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe func(context.Context) (bool, error)) (storageWaitObservation, error) {
 	started := time.Now().UTC()
-	observation := storageWaitObservation{Status: "waiting", StartedAt: started.Format(time.RFC3339Nano)}
 	waitCtx, cancel := context.WithTimeout(ctx, wait.timeout)
 	defer cancel()
+	deadline, _ := waitCtx.Deadline()
+	observation := storageWaitObservation{Status: "waiting", StartedAt: started.Format(time.RFC3339Nano), waitDeadline: deadline}
+	fail := func(err error) (storageWaitObservation, error) {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		} else if waitCtx.Err() == context.DeadlineExceeded {
+			err = &mutationWaitTimeoutError{message: fmt.Sprintf("timed out after %s waiting for mutation completion", wait.timeout)}
+		}
+		observation.Status, observation.Error = "failed", err.Error()
+		observation.EndedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		return observation, &storageObservationError{cause: err}
+	}
 	for {
-		done, err := observe()
+		if err := waitCtx.Err(); err != nil {
+			return fail(err)
+		}
+		done, err := observe(waitCtx)
 		if err != nil {
-			observation.Status, observation.Error = "failed", err.Error()
-			observation.EndedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			return observation, &storageObservationError{cause: err}
+			return fail(err)
+		}
+		if err := waitCtx.Err(); err != nil {
+			return fail(err)
 		}
 		if done {
 			observation.Status = "observed"
@@ -947,14 +979,7 @@ func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe 
 			if !timer.Stop() {
 				<-timer.C
 			}
-			observation.Status, observation.Error = "failed", waitCtx.Err().Error()
-			observation.EndedAt = time.Now().UTC().Format(time.RFC3339Nano)
-			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded {
-				return observation, &storageObservationError{cause: &mutationWaitTimeoutError{
-					message: fmt.Sprintf("timed out after %s waiting for mutation completion", wait.timeout),
-				}}
-			}
-			return observation, &storageObservationError{cause: waitCtx.Err()}
+			return fail(waitCtx.Err())
 		case <-timer.C:
 		}
 	}
