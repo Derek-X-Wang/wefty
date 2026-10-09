@@ -605,10 +605,22 @@ func (c *apiClients) listComputerBackupsFor(ctx context.Context, computerID, bac
 }
 
 func (c *apiClients) listComputerStorageProvenance(ctx context.Context, computerID string) (l1.ComputerStorageProvenance, error) {
-	var projection l1.ComputerStorageProvenance
-	path := "/v1/computers/" + url.PathEscape(computerID) + "/storage-provenance"
-	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &projection, http.StatusOK)
-	return projection, err
+	var result l1.ComputerStorageProvenance
+	cursor := ""
+	for {
+		path := "/v1/computers/" + url.PathEscape(computerID) + "/storage-provenance?" + url.Values{"cursor": {cursor}}.Encode()
+		var page l1.ComputerStorageProvenance
+		if err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &page, http.StatusOK); err != nil {
+			return l1.ComputerStorageProvenance{}, err
+		}
+		provenance := append(result.Provenance, page.Provenance...)
+		result = page
+		result.Provenance = provenance
+		if page.NextCursor == "" {
+			return result, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 func (c *apiClients) pruneComputerBackup(ctx context.Context, computerID, backupID string, request l1.ComputerBackupPruneRequest) (l1.Backup, bool, error) {

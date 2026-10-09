@@ -18,7 +18,6 @@ import (
 // transaction, after replay checks, so decisions remain inside the write.
 type readModel interface {
 	computerBackupsPage(context.Context, string, string, string, int) (BackupList, error)
-	computerViewListComputerBackups(ctx context.Context, computerID string) (BackupList, error)
 	computerViewComputerBackupOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerBackupOperationOutcome, error)
 	computerViewComputerBackupOperation(ctx context.Context, computerID, backupID string) (ComputerBackupOperationOutcome, error)
 	computerViewComputerPolicyRevisionInstalled(ctx context.Context, revision int64, computerID string) (bool, error)
@@ -42,7 +41,7 @@ type readModel interface {
 	computerViewGetComputerWithCloneOperation(ctx context.Context, computerID string, operationRevision int64) (Computer, error)
 	computerViewComputerCloneOperationForKey(ctx context.Context, backupID, idempotencyKey string) (ComputerCloneOperation, error)
 	computerViewListComputerStorageGenerations(ctx context.Context, computerID string) (ComputerStorageGenerationList, error)
-	computerViewListComputerStorageProvenance(ctx context.Context, computerID string) (ComputerStorageProvenance, error)
+	computerProvenancePage(context.Context, string, string, int) (ComputerStorageProvenance, error)
 	now() time.Time
 	caller() *serviceActionActor
 	validateCredential(context.Context, AttemptCredentialScope) error

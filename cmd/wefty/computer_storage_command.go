@@ -118,20 +118,22 @@ type storageWaitObservation struct {
 }
 
 type storageMutationOutput struct {
-	MutationApplied   bool                          `json:"mutation_applied"`
-	IdempotentReplay  bool                          `json:"idempotent_replay"`
-	Observation       *storageWaitObservation       `json:"observation,omitempty"`
-	Computer          *l1.Computer                  `json:"computer,omitempty"`
-	Backup            *l1.Backup                    `json:"backup,omitempty"`
-	Backups           *l1.BackupList                `json:"backups,omitempty"`
-	CustodyExport     *l1.ComputerCustodyExport     `json:"custody_export,omitempty"`
-	CustodyImport     *l1.ComputerCustodyImport     `json:"custody_import,omitempty"`
-	StorageProvenance *l1.ComputerStorageProvenance `json:"storage_provenance,omitempty"`
+	MutationApplied       bool                          `json:"mutation_applied"`
+	IdempotentReplay      bool                          `json:"idempotent_replay"`
+	Observation           *storageWaitObservation       `json:"observation,omitempty"`
+	Computer              *l1.Computer                  `json:"computer,omitempty"`
+	Backup                *l1.Backup                    `json:"backup,omitempty"`
+	Backups               *l1.BackupList                `json:"backups,omitempty"`
+	CustodyExport         *l1.ComputerCustodyExport     `json:"custody_export,omitempty"`
+	CustodyImport         *l1.ComputerCustodyImport     `json:"custody_import,omitempty"`
+	StorageProvenance     *l1.ComputerStorageProvenance `json:"storage_provenance,omitempty"`
+	ProvenanceUnavailable string                        `json:"provenance_unavailable,omitempty"`
 }
 
 type computerBackupInventory struct {
 	l1.BackupList
-	l1.ComputerStorageProvenance
+	*l1.ComputerStorageProvenance
+	ProvenanceUnavailable string `json:"provenance_unavailable,omitempty"`
 }
 
 type storageObservationError struct{ cause error }
@@ -202,13 +204,25 @@ func executeComputerBackups(ctx context.Context, clients *apiClients, jsonOutput
 			return err
 		}
 		provenance, err := clients.listComputerStorageProvenance(ctx, computerID)
+		notice := ""
 		if err != nil {
-			return err
+			if !isProvenanceRefused(err) {
+				return err
+			}
+			notice = "Storage provenance unavailable: " + err.Error()
 		}
 		if jsonOutput {
-			return writeJSON(stdout, computerBackupInventory{BackupList: backups, ComputerStorageProvenance: provenance})
+			inventory := computerBackupInventory{BackupList: backups, ProvenanceUnavailable: notice}
+			if notice == "" {
+				inventory.ComputerStorageProvenance = &provenance
+			}
+			return writeJSON(stdout, inventory)
 		}
 		if err := writeComputerBackups(stdout, backups); err != nil {
+			return err
+		}
+		if notice != "" {
+			_, err := fmt.Fprintln(stdout, notice)
 			return err
 		}
 		return writeComputerStorageProvenance(stdout, provenance)
@@ -771,6 +785,12 @@ func waitForBackupOperation(ctx context.Context, clients *apiClients, computerID
 	return last, observation, err
 }
 
+func isProvenanceRefused(err error) bool {
+	var response *apiResponseError
+	return errors.As(err, &response) && response.APIError.Code == contract.ErrorConflict &&
+		!response.APIError.Retryable && response.APIError.Details["reason"] == "storage_custody_limit"
+}
+
 func attachStorageProvenance(ctx context.Context, clients *apiClients, computerID string, output *storageMutationOutput, prior error) error {
 	if errors.Is(prior, context.Canceled) || errors.Is(prior, context.DeadlineExceeded) {
 		return prior
@@ -784,6 +804,10 @@ func attachStorageProvenance(ctx context.Context, clients *apiClients, computerI
 	provenance, err := clients.listComputerStorageProvenance(observationCtx, computerID)
 	if err == nil {
 		output.StorageProvenance = &provenance
+		return prior
+	}
+	if isProvenanceRefused(err) {
+		output.ProvenanceUnavailable = "Storage provenance unavailable: " + err.Error()
 		return prior
 	}
 	if ctx.Err() != nil {
@@ -1072,6 +1096,11 @@ func writeStorageMutation(writer io.Writer, output storageMutationOutput, jsonOu
 			return err
 		}
 		if err := table.Flush(); err != nil {
+			return err
+		}
+	}
+	if output.ProvenanceUnavailable != "" {
+		if _, err := fmt.Fprintln(writer, output.ProvenanceUnavailable); err != nil {
 			return err
 		}
 	}

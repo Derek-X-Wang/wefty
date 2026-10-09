@@ -650,13 +650,20 @@ func readBackup(ctx context.Context, q queryer, backupID string) (Backup, error)
 }
 
 func (s *Store) ListComputerBackups(ctx context.Context, computerID string) (BackupList, error) {
-	var value BackupList
-	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
-		var err error
-		value, err = reads.computerViewListComputerBackups(ctx, computerID)
-		return err
-	})
-	return value, err
+	result := BackupList{Backups: []Backup{}}
+	cursor := ""
+	for {
+		page, err := s.ListComputerBackupsPage(ctx, computerID, cursor, "", DefaultJobPageLimit)
+		if err != nil {
+			return BackupList{}, err
+		}
+		result.Backups = append(result.Backups, page.Backups...)
+		result.LastOperation = page.LastOperation
+		if page.NextCursor == "" {
+			return result, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 // ListComputerBackupsPage fixes collection membership at the first page's
@@ -669,10 +676,6 @@ func (s *Store) ListComputerBackupsPage(ctx context.Context, computerID, cursor,
 		return err
 	})
 	return page, err
-}
-
-func (r *databaseReads) computerViewListComputerBackups(ctx context.Context, computerID string) (BackupList, error) {
-	return r.computerBackupsPage(ctx, computerID, "", "", DefaultJobPageLimit)
 }
 
 // backupCollectionCursor binds an opaque creation/ID cursor to its Computer

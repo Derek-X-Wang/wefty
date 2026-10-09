@@ -80,7 +80,10 @@ display projection never alters cached facts, expires attempts, or synthesizes
 conditions. Background reconciliation records those changes on its own cadence.
 Heartbeat cancel, removal and Computer directive reads stay on the main pool as #752
 write-path agent-protocol exceptions, independent of operator snapshot admission, so
-operator read load can never fail a heartbeat.
+operator read load can never fail a heartbeat. Computer agent acknowledgements
+also reload their committed Computer (and nested Backup, when present) through
+a coherent read-only transaction on the main pool, as #752 agent-protocol
+exceptions; operator admission cannot starve an acknowledgement after its write.
 
 The typed raw-pool guard in `l1/read_boundary_test.go` permits the write door
 and inventories production SQL pool and connection expressions, including
@@ -182,8 +185,11 @@ returns 503 `unavailable`,
 `reason=read_snapshot_post_change_failed`, `mutation_applied=true`, `computer_id`
 and `read_reason`. Only snapshot availability failures are retryable; retry a
 read, and retain the original replay key when retrying a mutation. Applied
-submission changes still report an L3 count failure as null and a revocation
-failure as a notice: those separate observations cannot undo the commit.
+submission changes fall back to the committed Computer and its committed
+`submit_policy_revision` if their post-change snapshot fails. This fallback
+retains the in-hand `revoked` receipt or `revocation_notice`; its readiness and
+status are the committed authority projection, not a fresh observation. L3 count
+failure still yields null and revocation failure a notice: none can undo the commit.
 
 The Backup collection has a stable insertion watermark and `(created_ns,
 backup_id)` keyset cursor bound to its Computer. The first page fixes membership,
@@ -197,14 +203,25 @@ The CLI walks pages to produce the complete inventory; that combined inventory
 contains separate observations per page. Backup-local provenance is bounded by
 the page's at most 250 Backups; it does not traverse the custody graph.
 
-The Storage provenance view supports at most 1000 reachable Storage identities
-and at most 1000 rows in each collection (custody forks, provenance, exports).
-The recursive query and each result query return at most 1001 rows to detect overflow;
-indexed source/destination lookups avoid scanning all provenance for each edge.
-Overflow returns 503 `unavailable`, `reason=read_snapshot_provenance_limit`.
-Nothing is truncated: incomplete graphs cannot report an untainted answer.
-The hard hold deadline independently bounds elapsed work, including a graph
-node with unusually many adjacent edges.
+The Storage provenance collection is paged with a stable insertion watermark
+and `(created_ns, provenance_id)` keyset cursor bound to its Computer. The first
+page fixes provenance-row membership even for later equal-time or backdated
+inserts. Default limit is 100, maximum 250 (clamped); the shared adaptive cutoff
+returns `next_cursor` after at least one complete row. Each continuation reads
+fresh Computer and custody facts. Custody taint covers the entire family,
+including imports outside the current provenance page. The CLI walks all pages
+and retains the existing complete-inventory output shape.
+
+The custody graph, custody forks and custody exports each support at most 1000
+entries. The explicit bounded recursive query and those result queries return
+at most 1001 entries to detect overflow. Overflow returns HTTP 409 `conflict`,
+`retryable=false`, `reason=storage_custody_limit`: this is a permanent supported-size
+refusal, not a snapshot availability failure. Nothing truncates custody facts or
+reports an incomplete family as untainted. The hard hold deadline independently
+bounds elapsed work. When this typed refusal prevents a provenance read, the CLI
+still prints Backups or the mutation result and adds `provenance_unavailable` in
+JSON (a corresponding notice in table output). A successful operation's wait
+observation remains successful; any prior operation failure keeps its verdict.
 
 Submission `inflight_count` carries `inflight_observation="run-ledger"`.
 L1 closes its snapshot before calling L3; the count is a separate observation

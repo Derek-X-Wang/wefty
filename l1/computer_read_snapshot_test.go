@@ -270,13 +270,16 @@ func TestComputerSnapshotBackupAdaptivePaging(t *testing.T) {
 			t.Fatalf("page=%+v err=%v", page, err)
 		}
 		id := page.Backups[0].BackupID
+		if strings.HasPrefix(id, "snapshot-backup-2-") {
+			t.Fatal("mid-walk insert passed the Backup watermark: " + id)
+		}
 		if seen[id] {
 			t.Fatal("duplicate " + id)
 		}
 		seen[id] = true
 		if i == 0 {
-			seedComputerSnapshotBackups(t, h, backup, 2, 0)
-		} // new rows sort before the continuation
+			seedComputerSnapshotBackups(t, h, backup, 2, 2)
+		} // new rows sort after the continuation: only the watermark excludes them
 		if page.NextCursor == "" {
 			break
 		}
@@ -294,17 +297,6 @@ func TestComputerSnapshotBackupAdaptivePaging(t *testing.T) {
 	}
 	if _, err := h.store.ListComputerBackupsPage(t.Context(), computer.ComputerID, "invalid", "", 1); errorCode(err) != contract.ErrorInvalidRequest {
 		t.Fatalf("invalid cursor=%v", err)
-	}
-}
-
-func TestComputerSnapshotProvenanceBound(t *testing.T) {
-	h, _, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
-	h.stopServer()
-	seedComputerSnapshotBackups(t, h, backup, maxComputerProvenanceRows, 1)
-	_, err := h.store.ListComputerStorageProvenance(t.Context(), computer.ComputerID)
-	typed, ok := err.(*Error)
-	if errorCode(err) != contract.ErrorUnavailable || !ok || typed.Details["reason"] != "read_snapshot_provenance_limit" {
-		t.Fatalf("bound=%v", err)
 	}
 }
 

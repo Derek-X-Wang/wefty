@@ -1444,7 +1444,16 @@ CREATE INDEX IF NOT EXISTS backups_computer_status
 		ON storage_provenance(backup_id) WHERE kind='backup';
 		DROP INDEX IF EXISTS storage_provenance_destination;
 		CREATE UNIQUE INDEX storage_provenance_destination
-		ON storage_provenance(destination_storage_id, destination_generation) WHERE kind IN ('restore', 'clone', 'import');`); err != nil {
+		ON storage_provenance(destination_storage_id, destination_generation) WHERE kind IN ('restore', 'clone', 'import');
+ CREATE TABLE IF NOT EXISTS provenance_listing_order (
+  ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+  provenance_id TEXT NOT NULL UNIQUE REFERENCES storage_provenance(provenance_id) ON DELETE CASCADE
+ );
+ CREATE TRIGGER IF NOT EXISTS provenance_listing_insert AFTER INSERT ON storage_provenance
+  BEGIN INSERT INTO provenance_listing_order(provenance_id) VALUES(NEW.provenance_id); END;
+ INSERT INTO provenance_listing_order(provenance_id) SELECT provenance_id FROM storage_provenance
+  WHERE provenance_id NOT IN (SELECT provenance_id FROM provenance_listing_order) ORDER BY created_ns, provenance_id;
+ CREATE INDEX IF NOT EXISTS storage_provenance_creation ON storage_provenance(created_ns, provenance_id);`); err != nil {
 		return fmt.Errorf("l1: ensure Storage provenance indexes: %w", err)
 	}
 	for _, column := range []struct{ name, definition string }{

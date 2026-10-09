@@ -628,7 +628,7 @@ func (s *Server) getComputerSubmission(w http.ResponseWriter, r *http.Request) {
 
 // computerSubmissionResult answers a submission request. Once a change has
 // applied, L3 failures cannot undo it (#600). L1 observations are reloaded in
-// one post-commit snapshot; failure to observe it carries mutation_applied.
+// one post-commit snapshot; failed observation falls back to committed authority.
 // The separate run-ledger observation starts only after that snapshot closes.
 func (s *Server) computerSubmissionResult(ctx context.Context, identity fabric.Identity, computer Computer, mutationApplied bool,
 	receipt *contract.ComputerTokenRevocationReceipt) (ComputerSubmissionMutationResult, error) {
@@ -647,7 +647,12 @@ func (s *Server) computerSubmissionResult(ctx context.Context, identity fabric.I
 			return nil
 		})
 		if err != nil {
-			return ComputerSubmissionMutationResult{}, appliedComputerReadError(err, computer.ComputerID)
+			// The commit and in-hand revocation receipt remain authoritative when
+			// the optional post-change observation cannot be acquired (#600).
+			state = projectComputerSubmissionState(computer, computer.SubmitPolicyRevision)
+			if s.logf != nil {
+				s.logf("event=l1_submission_post_change_unread computer_id=%s cause=%q", computer.ComputerID, scrubbedCause(err))
+			}
 		}
 	} else {
 		var err error
@@ -1433,7 +1438,12 @@ func (s *Server) listComputerStorageGenerations(w http.ResponseWriter, r *http.R
 }
 
 func (s *Server) listComputerStorageProvenance(w http.ResponseWriter, r *http.Request) {
-	projection, err := s.store.ListComputerStorageProvenance(r.Context(), r.PathValue("computer_id"))
+	limit, err := parseJobListingLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	projection, err := s.store.ListComputerStorageProvenancePage(r.Context(), r.PathValue("computer_id"), r.URL.Query().Get("cursor"), limit)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -2454,7 +2464,7 @@ func (s *Server) acknowledgeComputerStorageReset(w http.ResponseWriter, r *http.
 		writeError(w, err)
 		return
 	}
-	s.writeComputerForCaller(w, r, http.StatusOK, computer)
+	s.writeAgentComputer(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerStorageGrow(w http.ResponseWriter, r *http.Request) {
@@ -2475,7 +2485,7 @@ func (s *Server) acknowledgeComputerStorageGrow(w http.ResponseWriter, r *http.R
 			return
 		}
 	}
-	s.writeComputerForCaller(w, r, http.StatusOK, computer)
+	s.writeAgentComputer(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerReimagePreflight(w http.ResponseWriter, r *http.Request) {
@@ -2490,7 +2500,7 @@ func (s *Server) acknowledgeComputerReimagePreflight(w http.ResponseWriter, r *h
 		writeError(w, err)
 		return
 	}
-	s.writeComputerForCaller(w, r, http.StatusOK, computer)
+	s.writeAgentComputer(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerStorageRetirement(w http.ResponseWriter, r *http.Request) {
@@ -2505,7 +2515,7 @@ func (s *Server) acknowledgeComputerStorageRetirement(w http.ResponseWriter, r *
 		writeError(w, err)
 		return
 	}
-	s.writeComputerForCaller(w, r, http.StatusOK, computer)
+	s.writeAgentComputer(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerBackup(w http.ResponseWriter, r *http.Request) {
@@ -2521,7 +2531,7 @@ func (s *Server) acknowledgeComputerBackup(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var response ComputerBackupAcknowledgementResponse
-	err = s.store.withReadSnapshot(r.Context(), nil, func(ctx context.Context, reads readModel) error {
+	err = s.store.withAgentReadSnapshot(r.Context(), func(ctx context.Context, reads readModel) error {
 		var err error
 		response.Computer, err = projectComputerResponse(ctx, reads, computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
 		if err != nil {
@@ -2575,7 +2585,7 @@ func (s *Server) acknowledgeComputerStorageCopy(w http.ResponseWriter, r *http.R
 		writeError(w, err)
 		return
 	}
-	s.writeComputerForCaller(w, r, http.StatusOK, computer)
+	s.writeAgentComputer(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) acknowledgeComputerCustodyExport(w http.ResponseWriter, r *http.Request) {
@@ -2605,7 +2615,7 @@ func (s *Server) acknowledgeComputerRestoreRetirement(w http.ResponseWriter, r *
 		writeError(w, err)
 		return
 	}
-	s.writeComputerForCaller(w, r, http.StatusOK, computer)
+	s.writeAgentComputer(w, r, http.StatusOK, computer)
 }
 
 func (s *Server) drainNode(w http.ResponseWriter, r *http.Request) {

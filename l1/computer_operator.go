@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"net/http"
 	"time"
 
@@ -394,4 +395,33 @@ func appliedComputerReadError(err error, id string) error {
 		}
 	}
 	return &Error{Code: contract.ErrorUnavailable, Message: "Computer change committed but its view is unavailable", Details: details, notRetryable: !retryable}
+}
+
+// #752 agent-protocol exception: a committed acknowledgement must not queue
+// behind operator admission. Keep the reload coherent on the main pool.
+func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, readModel) error) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var anchor int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&anchor); err != nil {
+		return err
+	}
+	return use(ctx, transactionReads(tx, canonicalTime(s.clock.Now())))
+}
+
+func (s *Server) writeAgentComputer(w http.ResponseWriter, r *http.Request, status int, computer Computer) {
+	var projection Computer
+	err := s.store.withAgentReadSnapshot(r.Context(), func(ctx context.Context, reads readModel) error {
+		var err error
+		projection, err = projectComputerResponse(ctx, reads, computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
+		return err
+	})
+	if err != nil {
+		writeError(w, appliedComputerReadError(err, computer.ComputerID))
+		return
+	}
+	writeJSON(w, status, projection)
 }

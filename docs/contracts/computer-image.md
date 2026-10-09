@@ -70,9 +70,16 @@ job view's open vocabulary (`restart-pending`, `unschedulable`, and the other
 computed statuses); the CLI Computer table displays it. Intents of a deleted
 Computer return `not_found`. Post-change Computer views reload after the commit.
 Backup listings accept `cursor` and `limit` (100 by default, clamped to 250),
-returning `next_cursor` under the adaptive page cutoff. Provenance refuses a
-reachable graph or result collection above 1000 rather than truncate custody
-facts. Submission responses label `inflight_count` with
+returning `next_cursor` under the adaptive page cutoff. Storage provenance rows
+use the same limits and cutoff, with a Computer-bound creation/ID cursor and
+insertion watermark. Custody taint covers imports beyond the current page.
+The custody graph, forks and exports remain bounded at 1000: overflow returns
+409 `conflict`, `retryable=false`, `reason=storage_custody_limit`, without
+truncating custody facts. The CLI walks provenance pages; if refused, Backup
+listings and mutation wait outputs keep their operation results and note
+`provenance_unavailable`. Applied submission changes retain the revocation
+receipt or notice even if their post-change read fails, by falling back to the
+committed Computer and its submission policy revision. Submission responses label `inflight_count` with
 `inflight_observation="run-ledger"`; the L3 call starts after L1 closes its snapshot.
 
 ## Bring your own desktop
