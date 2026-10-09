@@ -226,7 +226,7 @@ func (s *Server) projectComputerForCaller(r *http.Request, computer Computer) (C
 		return Computer{}, internalError(err, "begin Computer operator read")
 	}
 	defer tx.Rollback()
-	return projectComputerForCallerTx(r.Context(), transactionReads(tx), computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
+	return projectComputerForCallerTx(r.Context(), transactionReads(tx, canonicalTime(s.store.clock.Now())), computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
 }
 
 func projectComputerForCallerTx(ctx context.Context, tx readModel, computer Computer, actor computerActionActor) (Computer, error) {
@@ -296,7 +296,8 @@ func (s *Server) getComputerForCaller(r *http.Request, cloneRevision, restoreRev
 		return Computer{}, internalError(err, "begin Computer detail snapshot")
 	}
 	defer tx.Rollback()
-	computer, err := readComputerAuthority(r.Context(), tx, r.PathValue("computer_id"), canonicalTime(s.store.clock.Now()))
+	now := canonicalTime(s.store.clock.Now())
+	computer, err := readComputerAuthority(r.Context(), tx, r.PathValue("computer_id"), now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", r.PathValue("computer_id"))
 	}
@@ -319,7 +320,7 @@ func (s *Server) getComputerForCaller(r *http.Request, cloneRevision, restoreRev
 		}
 		computer.RestoreOperation = &operation
 	}
-	return projectComputerForCallerTx(r.Context(), transactionReads(tx), computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
+	return projectComputerForCallerTx(r.Context(), transactionReads(tx, now), computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
 }
 
 // HTTP mutations carry the actual authenticated identity and deployment tag
@@ -343,10 +344,6 @@ func computerWritePreconditionDecision(ctx context.Context, computer Computer, r
 	return computerActorPreconditionDecision(computer, actor, request)
 }
 
-// Compatibility bridge for existing transaction callers; no new acquisition.
-func computerBackupChoiceDecision(ctx context.Context, q queryer, computer Computer, values *computerActionValues, decision func() error) error {
-	return computerBackupChoiceWithReads(ctx, transactionReads(q), computer, values, decision)
-}
 func (r *databaseReads) backupChoices(ctx context.Context, computerID string) ([]string, error) {
 	rows, err := r.q.QueryContext(ctx, `SELECT backup_id FROM backups WHERE computer_id=? AND status='available' ORDER BY backup_id`, computerID)
 	if err != nil {

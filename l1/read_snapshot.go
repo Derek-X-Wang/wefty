@@ -6,6 +6,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log"
+	"reflect"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -43,10 +45,14 @@ type readModel interface {
 // view adapters deliberately keep their existing acquisition and timing until
 // #748-#751. A write gets a fresh memo at each decision, never across writes.
 type databaseReads struct {
-	q     queryer
-	at    time.Time
-	actor *serviceActionActor
-	reads *serviceOperatorReads
+	q           queryer
+	at          time.Time
+	actor       *serviceActionActor
+	reads       *serviceOperatorReads
+	nodeIDs     []string
+	nodeTags    map[string][]string
+	nodesLoaded bool
+	nodesErr    error
 }
 type nodeRead struct {
 	value Node
@@ -64,7 +70,12 @@ type stateRead struct {
 func newDatabaseReads(q queryer, at time.Time, actor *serviceActionActor) *databaseReads {
 	return &databaseReads{q: q, at: at, actor: actor, reads: newServiceOperatorReads(q)}
 }
-func transactionReads(q queryer) readModel           { return newDatabaseReads(q, time.Time{}, nil) }
+func transactionReads(q queryer, now time.Time) readModel {
+	if now.IsZero() {
+		panic("l1: transactionReads requires a pinned clock")
+	}
+	return newDatabaseReads(q, now, nil)
+}
 func (r *databaseReads) now() time.Time              { return r.at }
 func (r *databaseReads) caller() *serviceActionActor { return r.actor }
 func (r *databaseReads) job(ctx context.Context, id string) (Job, error) {
@@ -88,6 +99,63 @@ func (r *databaseReads) node(ctx context.Context, id string) (Node, error) {
 		r.reads.nodes[id] = value
 	}
 	return value.value, value.err
+}
+
+// The page loads candidate identities/tags once. Only eligible candidates
+// need full node facts, and those use the same memo as bound-node projection.
+func (r *databaseReads) eligibleNodeIDs(ctx context.Context, tags []string) ([]string, error) {
+	if !r.nodesLoaded {
+		r.nodesLoaded = true
+		r.nodeTags = make(map[string][]string)
+		rows, err := r.q.QueryContext(ctx, `SELECT nodes.node_id, node_tags.tag
+   FROM nodes LEFT JOIN node_tags ON node_tags.node_id=nodes.node_id`)
+		if err != nil {
+			r.nodesErr = err
+		} else {
+			for rows.Next() {
+				var id string
+				var tag sql.NullString
+				if err = rows.Scan(&id, &tag); err != nil {
+					break
+				}
+				if _, seen := r.nodeTags[id]; !seen {
+					r.nodeIDs = append(r.nodeIDs, id)
+					r.nodeTags[id] = nil
+				}
+				if tag.Valid {
+					r.nodeTags[id] = append(r.nodeTags[id], tag.String)
+				}
+			}
+			if err == nil {
+				err = rows.Err()
+			}
+			r.nodesErr = errors.Join(err, rows.Close())
+		}
+	}
+	if r.nodesErr != nil {
+		return nil, r.nodesErr
+	}
+	var eligible []string
+	for _, id := range r.nodeIDs {
+		matches := true
+		for _, tag := range tags {
+			found := false
+			for _, present := range r.nodeTags[id] {
+				if present == tag {
+					found = true
+					break
+				}
+			}
+			if !found {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			eligible = append(eligible, id)
+		}
+	}
+	return eligible, nil
 }
 func (r *databaseReads) nodeRoot(ctx context.Context, id string) (string, error) {
 	value, ok := r.reads.nodeRoots[id]
@@ -121,64 +189,72 @@ func (r *databaseReads) projectStatus(ctx context.Context, job Job) (Job, error)
 	return projectJobStatus(ctx, r, job)
 }
 
-// Twelve readers leave four of the existing sixteen connections for writes and
-// cleanup. The transaction deadline is below the 250ms scrubbing checkpoint
-// wait. Admission itself is cancellable and does not start that budget.
+// The read-only pool is the admission cap. The measured target is independent
+// of the hard transaction limit, which stays below the 250ms scrub checkpoint.
 const readSnapshotLimit = 12
 const readSnapshotBudget = 100 * time.Millisecond
+const readSnapshotHardLimit = 200 * time.Millisecond
 
 type readSnapshotContextKey struct{}
 
-var errNestedReadSnapshot = errors.New("l1: nested read snapshot refused")
+var errNestedReadSnapshot = snapshotUnavailable("read_snapshot_nested", nil)
 
-// withReadSnapshot anchors SQLite before sampling the clock, after admission
-// and pool checkout. The derived context must be used for all snapshot work.
-// query_only enforces read-only (modernc's ReadOnly option only selects BEGIN).
-// The callback must finish before encoding, external calls or long polling.
+func snapshotUnavailable(reason string, cause error) error {
+	return &Error{Code: contract.ErrorUnavailable, Message: "read snapshot unavailable", Cause: cause,
+		Details: map[string]any{"reason": reason}}
+}
+
+func (s *Store) readSnapshotOverrunCount() uint64 { return s.readSnapshotOverruns.Load() }
+
+// withReadSnapshot anchors SQLite before sampling the clock. A request context
+// owns at most one snapshot, even if a callback captures it instead of using
+// the derived context. Concurrent work in one request must share its read set.
 func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor, use func(context.Context, readModel) error) (err error) {
 	if ctx.Value(readSnapshotContextKey{}) != nil {
 		return errNestedReadSnapshot
 	}
-	select {
-	case s.readSnapshots <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
+	// Context implementations must have identity to participate in the request
+	// guard. Standard contexts are comparable; refuse unsupported custom ones.
+	if !reflect.TypeOf(ctx).Comparable() {
+		return snapshotUnavailable("read_snapshot_context", nil)
 	}
-	defer func() { <-s.readSnapshots }()
-	ctx, cancel := context.WithTimeout(context.WithValue(ctx, readSnapshotContextKey{}, true), readSnapshotBudget)
-	defer cancel()
-	conn, err := s.db.Conn(ctx)
+	if _, loaded := s.readSnapshotContexts.LoadOrStore(ctx, struct{}{}); loaded {
+		return errNestedReadSnapshot
+	}
+	defer s.readSnapshotContexts.Delete(ctx)
+	admission, cancelAdmission := context.WithTimeout(ctx, readSnapshotHardLimit)
+	conn, err := s.readDB.Conn(admission)
+	cancelAdmission()
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return snapshotUnavailable("read_snapshot_admission_expired", err)
+		}
 		return err
 	}
 	defer conn.Close()
-	// Always reset the connection-local pragma before returning to the shared
-	// pool. A failed cleanup discards the connection instead of poisoning writes.
+	// Checkout is not part of the transaction hold limit. ReadOnly selects a
+	// deferred BEGIN in modernc; the pool's connection pragma enforces no writes.
+	ctx, cancel := context.WithTimeout(context.WithValue(ctx, readSnapshotContextKey{}, true), readSnapshotHardLimit)
+	defer cancel()
 	defer func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), readSnapshotBudget)
-		defer cancel()
-		if _, resetErr := conn.ExecContext(cleanup, "PRAGMA query_only=OFF"); resetErr != nil {
-			if errors.Is(resetErr, sql.ErrConnDone) {
-				// Already discarded by rollback or cancellation.
-				return
-			}
-			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-			err = errors.Join(err, fmt.Errorf("reset snapshot connection: %w", resetErr))
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			err = snapshotUnavailable("read_snapshot_expired", ctx.Err())
 		}
 	}()
-	if _, err = conn.ExecContext(ctx, "PRAGMA query_only=ON"); err != nil {
-		return err
-	}
 	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
+	anchored := time.Now()
 	defer func() {
 		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
-			// A failed rollback must never return a potentially active transaction
-			// to the writer pool, even if resetting query_only would succeed.
 			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 			err = errors.Join(err, fmt.Errorf("rollback snapshot: %w", rollbackErr))
+		}
+		elapsed := time.Since(anchored)
+		if elapsed > readSnapshotBudget {
+			count := s.readSnapshotOverruns.Add(1)
+			log.Printf("l1 read_snapshot_target_overrun elapsed_ms=%d target_ms=%d count=%d", elapsed.Milliseconds(), readSnapshotBudget.Milliseconds(), count)
 		}
 	}()
 	var anchor int
@@ -229,12 +305,12 @@ func projectJobWithReads(ctx context.Context, reads readModel, job Job, parts jo
 	return job, nil
 }
 
-// writeTransaction is the other door. Mutation code keeps SQL authority here;
-// its projections receive only the embedded readModel. Existing writes retain
-// their acquisition/timing through transactionReads until the ratchet shrinks.
+// writeTransaction keeps mutation authority and one pinned clock. Each
+// decision gets a new read set, so earlier decisions cannot hide later writes.
 type writeTransaction struct {
-	tx *sql.Tx
-	*databaseReads
+	tx    *sql.Tx
+	at    time.Time
+	actor *serviceActionActor
 }
 
 func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceActionActor) (*writeTransaction, error) {
@@ -242,9 +318,12 @@ func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceAction
 	if err != nil {
 		return nil, err
 	}
-	return &writeTransaction{tx: tx, databaseReads: newDatabaseReads(tx, canonicalTime(s.clock.Now()), caller)}, nil
+	return &writeTransaction{tx: tx, at: canonicalTime(s.clock.Now()), actor: caller}, nil
+}
+func (w *writeTransaction) decisionReads() readModel {
+	reads := transactionReads(w.tx, w.at).(*databaseReads)
+	reads.actor = w.actor
+	return reads
 }
 func (w *writeTransaction) commit() error   { return w.tx.Commit() }
 func (w *writeTransaction) rollback() error { return w.tx.Rollback() }
-
-var _ readModel = (*writeTransaction)(nil)

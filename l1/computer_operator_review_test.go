@@ -59,7 +59,7 @@ func TestComputerBackupChoicesBoundedByLiveHistory(t *testing.T) {
 	values := computerActionValues{}
 	calls := 0
 	var unavailable string
-	err = computerBackupChoiceDecision(t.Context(), tx, computer, &values, func() error {
+	err = computerBackupChoiceWithReads(t.Context(), transactionReads(tx, h.clock.Now()), computer, &values, func() error {
 		calls++
 		if values.BackupID != backup.BackupID {
 			unavailable = values.BackupID
@@ -95,6 +95,9 @@ func operatorProductionQuery(t *testing.T, file, function, beginning string) str
 	source := string(data)
 	start := strings.Index(source, "func "+function+"(")
 	if start < 0 {
+		start = strings.Index(source, "func (r *databaseReads) "+function+"(")
+	}
+	if start < 0 {
 		t.Fatalf("missing production function %s", function)
 	}
 	source = source[start:]
@@ -110,9 +113,9 @@ func TestComputerBackupOperatorQueryPlansExcludeHistory(t *testing.T) {
 	for _, test := range []struct {
 		name, file, function, beginning, index, predicate string
 	}{
-		{"choices", "computer_operator.go", "computerBackupChoiceDecision", "SELECT backup_id FROM backups", "backups_computer_status", "computer_id=? AND status=?"},
-		{"backup-cap", "computer_decisions.go", "computerBackupDecision", "SELECT COUNT(*) FROM backups", "backups_computer_status", "computer_id=? AND status=?"},
-		{"restore-cap", "computer_decisions.go", "computerRestoreRetentionDecision", "SELECT COUNT(*) FROM backups", "backups_computer_status", "computer_id=? AND status=?"},
+		{"choices", "computer_operator.go", "backupChoices", "SELECT backup_id FROM backups", "backups_computer_status", "computer_id=? AND status=?"},
+		{"backup-cap", "computer_decisions.go", "retainedBackups", "SELECT COUNT(*) FROM backups", "backups_computer_status", "computer_id=? AND status=?"},
+		{"restore-cap", "computer_decisions.go", "retainedBackups", "SELECT COUNT(*) FROM backups", "backups_computer_status", "computer_id=? AND status=?"},
 		{"copies", "backups.go", "readBackup", "SELECT copy_id", "backup_copies_backup_id", "backup_id=?"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

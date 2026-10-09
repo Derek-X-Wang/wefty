@@ -71,7 +71,9 @@ type StoreOptions struct {
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
-	readSnapshots                     chan struct{}
+	readDB                            *sql.DB
+	readSnapshotContexts              sync.Map
+	readSnapshotOverruns              atomic.Uint64
 	db                                *sql.DB
 	settlementDB                      *sql.DB
 	checkpointDB                      *sql.DB
@@ -201,7 +203,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	db.SetMaxOpenConns(16)
 	store := &Store{
-		readSnapshots: make(chan struct{}, readSnapshotLimit), db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
+		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
 		logRetention:                      logRetention,
@@ -255,6 +257,27 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, fmt.Errorf("l1: open SQLite secret WAL checkpoint handle: %w", err)
 	}
 	store.checkpointDB = checkpointDB
+	readURL, err := url.Parse(sqliteDSN(path, sqliteBusyTimeout))
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	query := readURL.Query()
+	query.Add("_pragma", "query_only(1)")
+	readURL.RawQuery = query.Encode()
+	readDB, err := sql.Open("sqlite", readURL.String())
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("l1: open SQLite read pool: %w", err)
+	}
+	readDB.SetMaxOpenConns(readSnapshotLimit)
+	readDB.SetMaxIdleConns(readSnapshotLimit)
+	if err := readDB.PingContext(context.Background()); err != nil {
+		_ = readDB.Close()
+		_ = store.Close()
+		return nil, fmt.Errorf("l1: open SQLite read pool: %w", err)
+	}
+	store.readDB = readDB
 	return store, nil
 }
 
@@ -2164,14 +2187,17 @@ func (s *Store) migrateComputerAbortConstraints(ctx context.Context) error {
 }
 
 func (s *Store) Close() error {
-	var settlementErr, checkpointErr error
+	var settlementErr, checkpointErr, readErr error
 	if s.settlementDB != nil {
 		settlementErr = s.settlementDB.Close()
 	}
 	if s.checkpointDB != nil {
 		checkpointErr = s.checkpointDB.Close()
 	}
-	return errors.Join(s.db.Close(), settlementErr, checkpointErr)
+	if s.readDB != nil {
+		readErr = s.readDB.Close()
+	}
+	return errors.Join(s.db.Close(), settlementErr, checkpointErr, readErr)
 }
 
 // CreateJob creates a job or returns the identical dispatch-key replay.

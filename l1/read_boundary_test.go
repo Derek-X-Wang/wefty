@@ -23,6 +23,7 @@ type rawPoolException struct {
 	Site   string `json:"site"`
 	Count  int    `json:"count"`
 	Reason string `json:"reason"`
+	Slice  string `json:"slice"`
 }
 
 // Load compiler export data rather than guessing selector names. This catches
@@ -128,6 +129,14 @@ func rawPoolSites(fset *token.FileSet, files []*ast.File, info *types.Info) map[
 	return sites
 }
 
+func validReadSlice(slice string) bool {
+	switch slice {
+	case "#748", "#749", "#750", "#751", "#752":
+		return true
+	}
+	return false
+}
+
 func TestReadSnapshotRawPoolRatchet(t *testing.T) {
 	fset, files, info := readBoundaryTypes(t)
 	actual := rawPoolSites(fset, files, info)
@@ -141,7 +150,7 @@ func TestReadSnapshotRawPoolRatchet(t *testing.T) {
 	}
 	allowed := map[string]int{}
 	for _, exception := range exceptions {
-		if exception.Reason == "" || exception.Count <= 0 || allowed[exception.Site] != 0 {
+		if exception.Reason == "" || !validReadSlice(exception.Slice) || exception.Count <= 0 || allowed[exception.Site] != 0 {
 			t.Fatalf("invalid exception: %+v", exception)
 		}
 		allowed[exception.Site] = exception.Count
@@ -184,6 +193,9 @@ func TestReadSnapshotGuardDetectsRawHandleEscapes(t *testing.T) {
  type Pool = dbsql.DB
  type Connection = dbsql.Conn
  type Store struct { pool *Pool; db string }
+ type writeTransaction struct { tx *dbsql.Tx }
+ func (s *Store) beginWriteTransaction(context.Context) *writeTransaction { return nil }
+ func migrated(ctx context.Context, s *Store) { w:=s.beginWriteTransaction(ctx); _,_=w.tx.ExecContext(ctx,"INSERT INTO x VALUES(1)") }
  func accept(any) {}
  func leak(s *Store,c *Connection) *Pool {
   accept(s.pool)

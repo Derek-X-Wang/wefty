@@ -114,8 +114,8 @@ func (reads *serviceOperatorReads) removalRoot(ctx context.Context, job Job) err
 
 // A nil actor is the existing trusted Store API, used by internal callers and
 // store tests. HTTP reads and writes always supply the authenticated actor.
-func serviceActionAuthority(ctx context.Context, q queryer, job Job, verb string, actor *serviceActionActor) error {
-	return serviceActionAuthorityWithReads(ctx, transactionReads(q), job, verb, actor)
+func serviceActionAuthority(ctx context.Context, q queryer, now time.Time, job Job, verb string, actor *serviceActionActor) error {
+	return serviceActionAuthorityWithReads(ctx, transactionReads(q, now), job, verb, actor)
 }
 
 func serviceActionAuthorityWithReads(ctx context.Context, reads readModel, job Job, verb string, actor *serviceActionActor) error {
@@ -154,8 +154,8 @@ func serviceActionAuthorityWithReads(ctx context.Context, reads readModel, job J
 // serviceActionDecision is the single source for advertised actions and the
 // enforcing mutation. Chosen inputs are validated by their request decoder;
 // restart describes a fresh key, while accepted key replays retain their path.
-func serviceActionDecision(ctx context.Context, q queryer, job Job, verb string, actor *serviceActionActor) error {
-	return serviceActionDecisionWithReads(ctx, transactionReads(q), job, verb, actor)
+func serviceActionDecision(ctx context.Context, q queryer, now time.Time, job Job, verb string, actor *serviceActionActor) error {
+	return serviceActionDecisionWithReads(ctx, transactionReads(q, now), job, verb, actor)
 }
 
 func serviceActionDecisionWithReads(ctx context.Context, reads readModel, job Job, verb string, actor *serviceActionActor) error {

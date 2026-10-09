@@ -1,0 +1,388 @@
+{
+  "allowed_actions": [
+    {
+      "requires": {
+        "desired_state": "running",
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "start"
+    },
+    {
+      "requires": {
+        "desired_state": "stopped",
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "stop"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "refused_because": {
+        "code": "conflict",
+        "message": "Computer \"COMPUTER\" can restart only from stopped, failed, or an active insufficient-resource latch, not \"queued\"",
+        "retryable": false
+      },
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "restart"
+    },
+    {
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "remove"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "terminate_sessions",
+          "required": false,
+          "type": "boolean"
+        },
+        {
+          "name": "image",
+          "required": true,
+          "type": "object"
+        },
+        {
+          "name": "chown",
+          "required": false,
+          "type": "boolean"
+        }
+      ],
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "reimage"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "terminate_sessions",
+          "required": false,
+          "type": "boolean"
+        }
+      ],
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "reset"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "disk_bytes",
+          "required": true,
+          "type": "integer"
+        }
+      ],
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "resize"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "refused_because": {
+        "code": "conflict",
+        "message": "Computer \"COMPUTER\" has no bound source Node to back up",
+        "retryable": false
+      },
+      "requires": {
+        "allow_power_off": true,
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "backup"
+    },
+    {
+      "inputs": [
+        {
+          "name": "backup_cap",
+          "required": true,
+          "type": "integer"
+        }
+      ],
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "backup-cap"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "in": "path",
+          "name": "backup_id",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "keep_old_as_backup",
+          "required": true,
+          "type": "boolean"
+        }
+      ],
+      "refused_because": {
+        "code": "conflict",
+        "message": "Computer \"COMPUTER\" must be stopped or failed with no current attempt before restore",
+        "retryable": false
+      },
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "restore"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "in": "path",
+          "name": "backup_id",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "name",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "disk_bytes",
+          "required": true,
+          "type": "integer"
+        }
+      ],
+      "refused_because": {
+        "code": "not_found",
+        "message": "Backup \"\" was not found",
+        "retryable": false
+      },
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "clone"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "in": "path",
+          "name": "backup_id",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "refused_because": {
+        "code": "not_found",
+        "message": "Backup \"\" was not found",
+        "retryable": false
+      },
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "prune"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "in": "path",
+          "name": "backup_id",
+          "required": true,
+          "type": "string"
+        },
+        {
+          "name": "external_path",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "refused_because": {
+        "code": "not_found",
+        "message": "Backup \"\" was not found",
+        "retryable": false
+      },
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "custody-export"
+    },
+    {
+      "inputs": [
+        {
+          "name": "spec",
+          "required": true,
+          "type": "object"
+        }
+      ],
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "projections"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "refused_because": {
+        "code": "conflict",
+        "message": "Computer \"COMPUTER\" has no abortable reconfiguration authority",
+        "retryable": false
+      },
+      "requires": {
+        "intent_revision": 1,
+        "storage_generation": 1,
+        "storage_id": "STORAGE"
+      },
+      "verb": "reconfiguration-abort"
+    }
+  ],
+  "applied_revision": 1,
+  "backup_cap": 4,
+  "computer_id": "COMPUTER",
+  "controller_tenure": "free",
+  "created_at": "2026-08-09T10:00:00Z",
+  "current_job": {
+    "computer_id": "COMPUTER",
+    "created_at": "2026-08-09T10:00:00Z",
+    "desired_state": "running",
+    "holds_slot": false,
+    "job_id": "JOB",
+    "lease_loss_count": 0,
+    "lifetime_restart_count": 0,
+    "restart_streak": 0,
+    "spec": {
+      "class": "service",
+      "dispatch_key": "computer:backup",
+      "execution": {
+        "oci": {
+          "computer": {
+            "disk_bytes": 1073741824,
+            "display": {
+              "protocol": "rfb-websocket-v1"
+            }
+          },
+          "image": {
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "reference": "ghcr.io/example/tool:latest"
+          },
+          "limits": {
+            "memory_bytes": 67108864
+          }
+        }
+      },
+      "kind": "oci",
+      "restart": "always",
+      "routing_tags": [
+        "wefty:node:computer-node"
+      ],
+      "schema_version": 1
+    },
+    "state": "queued",
+    "status": "queued",
+    "updated_at": "2026-08-09T10:00:00Z"
+  },
+  "current_job_id": "JOB",
+  "current_spec_revision": 1,
+  "desired_disk_bytes": 1073741824,
+  "desired_state": "running",
+  "display_endpoint": null,
+  "grants": [],
+  "intent_revision": 1,
+  "last_condition": {
+    "code": "computer_intent_create",
+    "details": {
+      "desired_state": "running",
+      "intent_revision": 1,
+      "storage_generation": 1,
+      "storage_id": "STORAGE"
+    },
+    "scope": "computer.intent",
+    "since": "2026-08-09T10:00:00Z"
+  },
+  "name": "backup-computer",
+  "placement_node_id": "computer-node",
+  "reconfiguration_phase": "stable",
+  "storage_generation": 1,
+  "storage_id": "STORAGE",
+  "submit_enabled": false,
+  "submit_intent_revision": 0,
+  "submit_max_inflight": 20,
+  "submit_policy_revision": 0,
+  "updated_at": "2026-08-09T10:00:00Z"
+}

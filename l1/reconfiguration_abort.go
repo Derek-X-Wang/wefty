@@ -75,7 +75,7 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	boundNodeID, err := computerAbortDecision(ctx, transactionReads(tx), computer, request)
+	boundNodeID, err := computerAbortDecision(ctx, transactionReads(tx, now), computer, request)
 	if err != nil {
 		return Computer{}, false, err
 	}

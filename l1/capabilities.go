@@ -236,40 +236,24 @@ func (r *databaseReads) queuedStatus(ctx context.Context, job Job) (Job, error) 
 	if err != nil {
 		return Job{}, internalError(err, "read required job capabilities")
 	}
-	rows, err := q.QueryContext(ctx, `SELECT nodes.capabilities_json
-		FROM nodes
-		WHERE NOT EXISTS (
-		 SELECT 1 FROM job_tags
-		 WHERE job_tags.job_id=? AND NOT EXISTS (
-		  SELECT 1 FROM node_tags WHERE node_tags.node_id=nodes.node_id AND node_tags.tag=job_tags.tag
-		 )
-		)`, job.JobID)
+	nodes, err := r.eligibleNodeIDs(ctx, job.Spec.RoutingTags)
 	if err != nil {
 		return Job{}, internalError(err, "read capability placement candidates")
 	}
-	defer rows.Close()
 	missingSet := make(map[string]struct{}, len(required))
-	candidates := 0
-	for rows.Next() {
-		candidates++
-		var capabilitiesJSON []byte
-		if err := rows.Scan(&capabilitiesJSON); err != nil {
-			return Job{}, internalError(err, "scan capability placement candidate")
+	candidates := len(nodes)
+	for _, id := range nodes {
+		node, err := r.node(ctx, id)
+		if err != nil {
+			return Job{}, internalError(err, "read capability placement candidate")
 		}
-		var advertised map[string]bool
-		if err := json.Unmarshal(capabilitiesJSON, &advertised); err != nil {
-			return Job{}, internalError(err, "decode capability placement candidate")
-		}
-		missing := MissingCapabilities(required, advertised)
+		missing := MissingCapabilities(required, node.Capabilities)
 		if len(missing) == 0 {
 			return job, nil
 		}
 		for _, capability := range missing {
 			missingSet[capability] = struct{}{}
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return Job{}, internalError(err, "iterate capability placement candidates")
 	}
 	if candidates == 0 {
 		for _, capability := range required {

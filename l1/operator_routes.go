@@ -127,7 +127,7 @@ func (s *Store) setServiceDesiredState(ctx context.Context, jobID string, desire
 	if desired == contract.ServiceDesiredStopped {
 		verb = "stop"
 	}
-	if err := serviceActionDecision(ctx, tx, job, verb, actor); err != nil {
+	if err := serviceActionDecision(ctx, tx, now, job, verb, actor); err != nil {
 		return Job{}, err
 	}
 
@@ -218,7 +218,7 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	if err != nil {
 		return Job{}, false, internalError(err, "read service restart target")
 	}
-	if err := serviceActionAuthority(ctx, tx, job, "restart", actor); err != nil {
+	if err := serviceActionAuthority(ctx, tx, now, job, "restart", actor); err != nil {
 		return Job{}, false, err
 	}
 	var storedHash string
@@ -233,7 +233,7 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read service restart replay")
 	}
-	if err := serviceActionDecision(ctx, tx, job, "restart", actor); err != nil {
+	if err := serviceActionDecision(ctx, tx, now, job, "restart", actor); err != nil {
 		return Job{}, false, err
 	}
 
@@ -451,10 +451,10 @@ func (r *databaseReads) serviceStatus(ctx context.Context, job Job) (Job, error)
 		}
 	}
 	if service.BoundNodeID != "" {
-		var claimsEnabled bool
-		var capabilitiesJSON []byte
-		err := q.QueryRowContext(ctx, "SELECT state, claims_enabled, capabilities_json FROM nodes WHERE node_id=?", service.BoundNodeID).
-			Scan(&service.NodeState, &claimsEnabled, &capabilitiesJSON)
+		node, err := r.node(ctx, service.BoundNodeID)
+		if err == nil {
+			service.NodeState = node.State
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			if job.State == contract.JobQueued && job.Status != "restart-pending" {
 				job.UnschedulableReason = fmt.Sprintf("bound node %q is not registered", service.BoundNodeID)
@@ -465,18 +465,14 @@ func (r *databaseReads) serviceStatus(ctx context.Context, job Job) (Job, error)
 			switch {
 			case service.NodeState != contract.NodeAlive:
 				job.UnschedulableReason = fmt.Sprintf("bound node %q is %s", service.BoundNodeID, service.NodeState)
-			case !claimsEnabled:
+			case !node.ClaimsEnabled:
 				job.UnschedulableReason = fmt.Sprintf("bound node %q has claims disabled", service.BoundNodeID)
 			default:
-				var advertised map[string]bool
-				if err := json.Unmarshal(capabilitiesJSON, &advertised); err != nil {
-					return Job{}, internalError(err, "decode bound node capabilities")
-				}
 				required, err := storedRequiredCapabilities(ctx, q, job.JobID)
 				if err != nil {
 					return Job{}, internalError(err, "read required job capabilities")
 				}
-				if missing := MissingCapabilities(required, advertised); len(missing) > 0 {
+				if missing := MissingCapabilities(required, node.Capabilities); len(missing) > 0 {
 					job.UnschedulableReason = fmt.Sprintf("bound node %q is missing capabilities: %s", service.BoundNodeID, strings.Join(missing, ", "))
 				}
 			}

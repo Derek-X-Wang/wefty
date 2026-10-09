@@ -44,9 +44,19 @@ func TestReadSnapshotClockAdmissionAndAnchor(t *testing.T) {
 	s, clock := snapshotStore(t)
 	// Admission is held without using a connection; the read budget starts only
 	// after this wait, and the clock must not be sampled while waiting.
+	var held []*sql.Conn
 	for range readSnapshotLimit {
-		s.readSnapshots <- struct{}{}
+		conn, err := s.readDB.Conn(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, conn)
 	}
+	defer func() {
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+	}()
 	actor := &serviceActionActor{Identity: fabric.Identity{NodeID: "caller"}}
 	entered := make(chan struct{})
 	done := make(chan error, 1)
@@ -71,13 +81,11 @@ func TestReadSnapshotClockAdmissionAndAnchor(t *testing.T) {
 		t.Fatal("clock sampled before admission")
 	}
 	clock.at.Add(int64(time.Minute))
-	<-s.readSnapshots
+	_ = held[0].Close()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	for range readSnapshotLimit - 1 {
-		<-s.readSnapshots
-	}
+
 }
 func TestReadSnapshotAnchoredBeforeFirstDomainRead(t *testing.T) {
 	s, _ := snapshotStore(t)
@@ -100,7 +108,7 @@ func TestReadSnapshotAnchoredBeforeFirstDomainRead(t *testing.T) {
 		t.Fatal(err)
 	}
 }
-func TestReadSnapshotMemoAndReadOnlyReset(t *testing.T) {
+func TestReadSnapshotMemoAndReadOnlyPool(t *testing.T) {
 	s, _ := snapshotStore(t)
 	// Missing-node errors are memoized just like node capabilities, tags and
 	// occupancy. A production-called getNode read populates exactly one entry.
@@ -125,7 +133,7 @@ func TestReadSnapshotMemoAndReadOnlyReset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Exercise the same pooled connection, not a random one, after cleanup.
+	// Writers remain on the independent main pool.
 	s.db.SetMaxOpenConns(1)
 	if _, err := s.db.ExecContext(t.Context(), "CREATE TABLE reset_ok(value TEXT)"); err != nil {
 		t.Fatalf("query_only leaked to writer: %v", err)
@@ -207,7 +215,7 @@ func TestReadSnapshotCapUnderContention(t *testing.T) {
 		holders.Add(1)
 		go func() {
 			defer holders.Done()
-			results <- s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+			results <- s.withReadSnapshot(context.WithValue(t.Context(), readSnapshotContextKey{}, nil), nil, func(ctx context.Context, r readModel) error {
 				count := active.Add(1)
 				defer active.Add(-1)
 				for old := peak.Load(); count > old; old = peak.Load() {
@@ -278,8 +286,8 @@ func TestReadSnapshotCapUnderContention(t *testing.T) {
 	if writeErr != nil {
 		t.Fatalf("writer had no reserved capacity: %v", writeErr)
 	}
-	if peak.Load() != readSnapshotLimit || len(s.readSnapshots) != 0 {
-		t.Fatalf("peak=%d admission remaining=%d", peak.Load(), len(s.readSnapshots))
+	if peak.Load() != readSnapshotLimit || s.readDB.Stats().InUse != 0 {
+		t.Fatalf("peak=%d admission remaining=%d", peak.Load(), s.readDB.Stats().InUse)
 	}
 }
 func TestReadSnapshotBudgetReleasesSQLiteReadLock(t *testing.T) {
@@ -294,7 +302,7 @@ func TestReadSnapshotBudgetReleasesSQLiteReadLock(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("deadline=%v", err)
 	}
-	if len(s.readSnapshots) != 0 {
+	if s.readDB.Stats().InUse != 0 {
 		t.Fatal("admission leaked")
 	}
 	if _, err = s.db.ExecContext(t.Context(), "CREATE TABLE after_deadline(value TEXT)"); err != nil {
@@ -308,7 +316,7 @@ func TestReadSnapshotWriteDoorSharesUncommittedReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer write.rollback()
-	var same readModel = write
+	same := write.decisionReads()
 	// This node is inserted without committing. Domain reads must use this exact
 	// write transaction; a pool read would report not found.
 	if _, err = write.tx.ExecContext(t.Context(), "INSERT INTO nodes(node_id, identity_node_id, boot_session_id, os, architecture, agent_version, capabilities_json, missing_capabilities_json, state, max_oneshot_slots, max_service_slots, last_heartbeat_ns) VALUES('inside','fabric-inside','boot','linux','amd64','test','{}','[]','alive',1,1,0)"); err != nil {
@@ -356,8 +364,8 @@ func TestReadSnapshotSharedJobProjectorMatchesOriginalWire(t *testing.T) {
 func TestReadSnapshotClockAfterPoolCheckout(t *testing.T) {
 	s, clock := snapshotStore(t)
 	var held []*sql.Conn
-	for range 16 {
-		conn, err := s.db.Conn(t.Context())
+	for range s.readDB.Stats().MaxOpenConnections {
+		conn, err := s.readDB.Conn(t.Context())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -368,26 +376,28 @@ func TestReadSnapshotClockAfterPoolCheckout(t *testing.T) {
 			_ = conn.Close()
 		}
 	}()
-	waiting := s.db.Stats().WaitCount
+	waiting := s.readDB.Stats().WaitCount
 	done := make(chan error, 1)
 	go func() {
 		done <- s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
 			if r.now().UnixNano() != clock.at.Load() || clock.calls.Load() != 1 {
 				return errors.New("clock sampled before pool checkout")
 			}
+			time.Sleep(125 * time.Millisecond)
 			return nil
 		})
 	}()
 	deadline := time.Now().Add(time.Second)
-	for s.db.Stats().WaitCount == waiting && time.Now().Before(deadline) {
+	for s.readDB.Stats().WaitCount == waiting && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if s.db.Stats().WaitCount == waiting {
+	if s.readDB.Stats().WaitCount == waiting {
 		t.Fatal("snapshot did not wait for pool")
 	}
 	if clock.calls.Load() != 0 {
 		t.Fatal("clock sampled while waiting for connection")
 	}
+	time.Sleep(125 * time.Millisecond)
 	clock.at.Add(int64(time.Minute))
 	_ = held[0].Close()
 	held = held[1:]
@@ -407,8 +417,8 @@ func TestReadSnapshotRollbackFailureDiscardsConnection(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "rollback snapshot") {
 		t.Fatalf("rollback failure was ignored: %v", err)
 	}
-	if s.db.Stats().OpenConnections != 0 {
-		t.Fatalf("failed rollback returned connection to pool: %+v", s.db.Stats())
+	if s.readDB.Stats().OpenConnections != 0 {
+		t.Fatalf("failed rollback returned connection to pool: %+v", s.readDB.Stats())
 	}
 	if _, err = s.db.ExecContext(t.Context(), "CREATE TABLE after_failed_rollback(value TEXT)"); err != nil {
 		t.Fatal(err)
