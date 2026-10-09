@@ -704,8 +704,23 @@ func executeServiceLogs(
 	for {
 		page, err := clients.getServiceLogs(followCtx, jobID, cursor, limit)
 		if err != nil {
-			if followFor > 0 && ctx.Err() == nil && followCtx.Err() == context.DeadlineExceeded {
+			// The follow window ending is a clean stop, whatever the read
+			// answered with; cancellation is the leaving reader.
+			if ctx.Err() == nil && followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
 				return nil
+			}
+			// A follow with no deadline sees a retryable 503 as one bad poll,
+			// not a verdict (#763). Keep following at the normal interval;
+			// only cancellation or a non-retryable answer ends it.
+			if follow && isRetryableL1Answer(err) && ctx.Err() == nil && followCtx.Err() == nil {
+				if sleepFollowRetry(followCtx, pollInterval) {
+					continue
+				}
+				// The retry sleep hit the window end: stop the same way an
+				// interrupted follow does.
+				if followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
+					return nil
+				}
 			}
 			return err
 		}
@@ -783,8 +798,10 @@ func waitForService(
 		}
 		job, err := clients.getService(waitCtx, initial.JobID)
 		if err != nil {
+			// Only deadline-shaped answers become the timeout; a refusal
+			// arriving at the deadline keeps its own classification (#763).
 			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded &&
-				(errors.Is(err, context.DeadlineExceeded) || isRetryableL1Answer(err) || lastRetryable != nil) {
+				(errors.Is(err, context.DeadlineExceeded) || isRetryableL1Answer(err)) {
 				detail := lastRetryable
 				if isRetryableL1Answer(err) {
 					detail = err

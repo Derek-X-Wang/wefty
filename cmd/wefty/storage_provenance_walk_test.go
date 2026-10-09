@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -78,6 +79,26 @@ func TestProvenanceWalkToleratesARetryableAnswer(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "read_snapshot_expired") {
 			t.Fatalf("last retryable answer missing from provenance timeout: %v", err)
+		}
+	})
+	t.Run("a retryable answer arriving after the window closes is still recorded", func(t *testing.T) {
+		// The window is already gone when the walk starts; the transport
+		// answers only after the request context is done (#763 round 2).
+		transport := &refusedAtDeadlineTransport{
+			first:     contract.APIError{Code: contract.ErrorUnavailable, Message: "read snapshot unavailable", Retryable: true, Details: map[string]any{"reason": "read_snapshot_expired"}},
+			firstCode: http.StatusServiceUnavailable,
+			late:      contract.APIError{Code: contract.ErrorUnavailable, Message: "read snapshot unavailable", Retryable: true, Details: map[string]any{"reason": "read_snapshot_expired"}},
+			lateCode:  http.StatusServiceUnavailable,
+		}
+		clients := &apiClients{l1: &apiClient{name: "L1", client: &http.Client{Transport: transport}}}
+		output := storageMutationOutput{Observation: &storageWaitObservation{
+			waitDeadline: time.Now().Add(-time.Second), waitPollInterval: time.Millisecond,
+		}}
+		err := attachStorageProvenance(ctx, clients, "computer-1", &output, nil)
+		var timeout *mutationWaitTimeoutError
+		if commandExitCode(err) != exitMutationWaitTimeout || !errors.As(err, &timeout) ||
+			!strings.Contains(err.Error(), "read_snapshot_expired") {
+			t.Fatalf("retryable answer after the window closes: exit=%d err=%v", commandExitCode(err), err)
 		}
 	})
 }

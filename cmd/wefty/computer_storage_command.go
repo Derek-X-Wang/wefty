@@ -840,10 +840,12 @@ func attachStorageProvenance(ctx context.Context, clients *apiClients, computerI
 		if !isRetryableL1Answer(err) || pollInterval <= 0 {
 			break
 		}
+		// Record before the window check: a retryable answer that arrives
+		// just after it closed still belongs in the timeout detail (#763).
+		lastRetryable = err
 		if observationCtx.Err() != nil {
 			break
 		}
-		lastRetryable = err
 		timer := time.NewTimer(pollInterval)
 		select {
 		case <-observationCtx.Done():
@@ -1057,6 +1059,15 @@ func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe 
 		}
 		done, err := observe(waitCtx)
 		if err != nil && !isRetryableL1Answer(err) {
+			// The deadline can land mid-read: the transport then answers
+			// DeadlineExceeded even though the last actual answer was a
+			// retryable 503 (#763). That is still the retryable-only
+			// exhaustion, and the detail must survive it. A typed outcome or
+			// refusal arriving at the deadline keeps its own classification.
+			if lastRetryable != nil && ctx.Err() == nil &&
+				errors.Is(waitCtx.Err(), context.DeadlineExceeded) && errors.Is(err, context.DeadlineExceeded) {
+				return retryableExpired()
+			}
 			return fail(err)
 		}
 		if err != nil {
