@@ -3,7 +3,6 @@ package l1
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -138,7 +137,15 @@ func (s *Store) listReadableJobs(ctx context.Context, filters jobListFilters, cu
 	return s.listReadableJobsForCaller(ctx, filters, cursorValue, limit, nil)
 }
 
-func (s *Store) listReadableJobsForCaller(ctx context.Context, filters jobListFilters, cursorValue string, limit int, actor *serviceActionActor) (JobList, error) {
+func (s *Store) listReadableJobsForCaller(ctx context.Context, filters jobListFilters, cursorValue string, limit int, actor *serviceActionActor) (page JobList, err error) {
+	err = s.withReadSnapshot(ctx, actor, func(ctx context.Context, reads readModel) error {
+		page, err = reads.jobsPage(ctx, filters, cursorValue, limit)
+		return err
+	})
+	return
+}
+
+func (r *databaseReads) jobsPage(ctx context.Context, filters jobListFilters, cursorValue string, limit int) (JobList, error) {
 	if limit < 1 || limit > MaxJobPageLimit {
 		return JobList{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxJobPageLimit)
 	}
@@ -150,22 +157,21 @@ func (s *Store) listReadableJobsForCaller(ctx context.Context, filters jobListFi
 			return JobList{}, err
 		}
 	}
-	// The store's default transaction mode is IMMEDIATE. A read-only page
-	// must retain its snapshot without taking the SQLite writer lock.
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return JobList{}, internalError(err, "begin job listing")
+	if err := validateReadCredential(ctx, r); err != nil {
+		return JobList{}, err
 	}
-	defer tx.Rollback()
+	if _, err := r.eligibleNodeIDs(ctx, nil); err != nil {
+		return JobList{}, internalError(err, "load page node facts")
+	}
 	if cursor.HighWater == 0 {
-		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence), 0) FROM job_listing_order`).Scan(&cursor.HighWater); err != nil {
+		if err := r.q.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence), 0) FROM job_listing_order`).Scan(&cursor.HighWater); err != nil {
 			return JobList{}, internalError(err, "read job listing watermark")
 		}
 		cursor.Version = 1
 		cursor.Filters = jobFilterFingerprint(filters)
 	}
 	query, args := jobListingQuery(filters, cursor, limit)
-	rows, err := tx.QueryContext(ctx, query, args...)
+	rows, err := r.q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return JobList{}, internalError(err, "list readable job IDs")
 	}
@@ -194,28 +200,16 @@ func (s *Store) listReadableJobsForCaller(ctx context.Context, filters jobListFi
 	}
 	// Read the selected rows in the same snapshot as the filter query so a
 	// state transition cannot turn a state-filtered page into mismatched rows.
-	now := canonicalTime(s.clock.Now())
 	for _, item := range listed {
-		job, err := getJobByID(ctx, tx, item.jobID, now)
+		job, err := readJob(ctx, r, item.jobID)
 		if err != nil {
-			return JobList{}, internalError(err, "read listed job")
+			return JobList{}, err
+		}
+		job, err = projectJobWithReads(ctx, r, job, projectJobAll)
+		if err != nil {
+			return JobList{}, err
 		}
 		page.Jobs = append(page.Jobs, job)
-	}
-	if actor != nil {
-		if err := projectServiceOperatorPage(ctx, tx, page.Jobs, actor); err != nil {
-			return JobList{}, err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return JobList{}, internalError(err, "finish job listing")
-	}
-	for index, job := range page.Jobs {
-		projected, err := s.projectJob(ctx, job)
-		if err != nil {
-			return JobList{}, err
-		}
-		page.Jobs[index] = projected
 	}
 	if hasMore {
 		last := listed[len(listed)-1]

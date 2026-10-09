@@ -219,14 +219,6 @@ func RequiredCapabilities(spec contract.JobSpec) []string {
 	return required
 }
 
-func (s *Store) projectQueuedJobCapabilities(ctx context.Context, job Job) (Job, error) {
-	return s.projectQueuedJobCapabilitiesWithQueryer(ctx, s.db, job)
-}
-
-func (s *Store) projectQueuedJobCapabilitiesWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
-	return newDatabaseReads(q, time.Time{}, nil).queuedStatus(ctx, job)
-}
-
 func (r *databaseReads) queuedStatus(ctx context.Context, job Job) (Job, error) {
 	if job.State != contract.JobQueued {
 		return job, nil

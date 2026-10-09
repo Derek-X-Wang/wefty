@@ -12,9 +12,9 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-// Counts the production per-row projector used by listReadableJobsForCaller.
-// Membership, row decoding and operator facts are outside this regression.
-func TestLegacyJobListingProjectionQueryBudget(t *testing.T) {
+// Keep the status component query budget while the production listing now
+// shares its complete projection memo and clock across the page.
+func TestJobListingProjectionQueryBudget(t *testing.T) {
 	for _, scenario := range []struct {
 		name   string
 		bound  bool
@@ -25,7 +25,7 @@ func TestLegacyJobListingProjectionQueryBudget(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			h, _, original, _ := jobProjectionFixture(t, "claimed")
-			jobs := make([]Job, 1000)
+			jobs := make([]Job, MaxJobPageLimit)
 			for i := range jobs {
 				spec := original.Spec
 				spec.DispatchKey = fmt.Sprintf("listing-%04d", i)
@@ -52,8 +52,8 @@ func TestLegacyJobListingProjectionQueryBudget(t *testing.T) {
 				t.Fatal(err)
 			}
 			started := time.Now()
-			page, err := h.store.listReadableJobsForCaller(t.Context(), jobListFilters{}, "", 1000, nil)
-			if err != nil || len(page.Jobs) != 1000 {
+			page, err := h.store.listReadableJobsForCaller(t.Context(), jobListFilters{}, "", MaxJobPageLimit, nil)
+			if err != nil || len(page.Jobs) != MaxJobPageLimit {
 				t.Fatalf("listing: rows=%d err=%v", len(page.Jobs), err)
 			}
 			elapsed := time.Since(started)
@@ -61,16 +61,16 @@ func TestLegacyJobListingProjectionQueryBudget(t *testing.T) {
 			perJob := 0
 			for _, job := range page.Jobs {
 				before := counter.count
-				if _, err := h.store.projectJobWithQueryer(t.Context(), counter, job); err != nil {
+				if _, err := projectJobWithReads(t.Context(), newDatabaseReads(counter, h.clock.Now(), nil), job, projectJobStatusPart); err != nil {
 					t.Fatal(err)
 				}
 				perJob = counter.count - before
 				if queries := perJob; queries > scenario.budget {
-					t.Errorf("legacy per-job queries=%d exceeds main=%d", queries, scenario.budget)
+					t.Errorf("per-job queries=%d exceeds main=%d", queries, scenario.budget)
 					break
 				}
 			}
-			t.Logf("1000-row legacy listing=%s projection_queries_per_job=%d main_budget=%d", elapsed, perJob, scenario.budget)
+			t.Logf("maximum-page listing=%s projection_queries_per_job=%d main_budget=%d", elapsed, perJob, scenario.budget)
 		})
 	}
 }
@@ -151,7 +151,7 @@ func TestQueuedPlacementUsesStoredTags(t *testing.T) {
 	}
 	job.State = contract.JobQueued
 	job.Spec.RoutingTags = nil
-	got, err := h.store.projectQueuedJobCapabilities(t.Context(), job)
+	got, err := newDatabaseReads(h.store.db, h.clock.Now(), nil).queuedStatus(t.Context(), job)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestReadSnapshotPlacementSkipsOccupancy(t *testing.T) {
 	counter := &snapshotQueryCounter{queryer: h.store.db}
 	// The legacy projection must not need service or active-attempt occupancy.
 	q := &rejectOccupancyReads{queryer: counter}
-	if _, err := h.store.projectJobWithQueryer(t.Context(), q, job); err != nil {
+	if _, err := projectJobWithReads(t.Context(), newDatabaseReads(q, h.clock.Now(), nil), job, projectJobStatusPart); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -2488,31 +2488,33 @@ func (s *Store) readConcurrentSubmit(ctx context.Context, spec contract.JobSpec,
 	return job, true, nil
 }
 
-func (s *Store) GetJob(ctx context.Context, jobID string) (Job, error) {
-	job, err := getJobByID(ctx, s.db, jobID, canonicalTime(s.clock.Now()))
-	if errors.Is(err, sql.ErrNoRows) {
-		tombstone, tombstoneErr := readServiceTombstoneByID(ctx, s.db, jobID)
-		if errors.Is(tombstoneErr, sql.ErrNoRows) {
-			return Job{}, protocolError(contract.ErrorNotFound, "job %q was not found", jobID)
-		}
-		if tombstoneErr != nil {
-			return Job{}, internalError(tombstoneErr, "read removed job")
-		}
-		return tombstone.job(), nil
-	}
-	if err != nil {
-		return Job{}, internalError(err, "read job")
-	}
-	return job, nil
+func (s *Store) GetJob(ctx context.Context, jobID string) (job Job, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		job, err = readJob(ctx, reads, jobID)
+		return err
+	})
+	return
 }
 
 // LookupRunLedgerJob returns the root one-shot job L1 accepted from its
 // configured run ledger under dispatchKey. It is a read only recovery seam:
 // it never creates, replays, or changes a job, and every out-of-scope key is
 // reported with the same absence.
-func (s *Store) LookupRunLedgerJob(ctx context.Context, dispatchKey string) (Job, error) {
+func (s *Store) LookupRunLedgerJob(ctx context.Context, dispatchKey string) (job Job, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		job, err = reads.ledgerJob(ctx, dispatchKey)
+		if err != nil {
+			return err
+		}
+		job, err = projectJobWithReads(ctx, reads, job, projectJobAll)
+		return err
+	})
+	return
+}
+
+func (r *databaseReads) ledgerJob(ctx context.Context, dispatchKey string) (Job, error) {
 	var jobID string
-	err := s.db.QueryRowContext(ctx, `SELECT job_id FROM jobs
+	err := r.q.QueryRowContext(ctx, `SELECT job_id FROM jobs
 		WHERE dispatch_key=? AND COALESCE(parent_job_id, '')='' AND submitted_by_run_ledger=1`, dispatchKey).Scan(&jobID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, protocolError(contract.ErrorNotFound, "run-ledger dispatch was not found")
@@ -2520,7 +2522,8 @@ func (s *Store) LookupRunLedgerJob(ctx context.Context, dispatchKey string) (Job
 	if err != nil {
 		return Job{}, internalError(err, "look up run-ledger dispatch")
 	}
-	job, err := getJobByID(ctx, s.db, jobID, canonicalTime(s.clock.Now()))
+	observeRead(ctx, "ledger_key")
+	job, err := getJobByID(ctx, r.q, jobID, r.now())
 	if err != nil {
 		return Job{}, internalError(err, "read run-ledger dispatch")
 	}
@@ -2533,9 +2536,12 @@ func (s *Store) LookupRunLedgerJob(ctx context.Context, dispatchKey string) (Job
 // ListJobAttempts returns the retained execution summaries in chronological
 // order. Service retention may prune old empty summaries; a one-shot keeps its
 // sole attempt. Authority-bearing columns never cross this operator boundary.
-func (s *Store) ListJobAttempts(ctx context.Context, jobID string) ([]Attempt, error) {
-	job, err := projectJobWithReads(ctx, newDatabaseReads(s.db, time.Time{}, nil), Job{JobID: jobID}, projectJobAttemptsPart)
-	return job.Attempts, err
+func (s *Store) ListJobAttempts(ctx context.Context, jobID string) (attempts []Attempt, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		attempts, err = reads.attempts(ctx, jobID)
+		return err
+	})
+	return
 }
 
 func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, error) {
@@ -2581,6 +2587,7 @@ func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, e
 	if err := rows.Err(); err != nil {
 		return nil, internalError(err, "iterate job attempts")
 	}
+	observeRead(ctx, "attempts")
 	return attempts, nil
 }
 
@@ -4024,18 +4031,26 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 
 // GetJobLogs returns one polling page after an opaque reader cursor. The
 // internal insertion ordinal is never exposed directly.
-func (s *Store) GetJobLogs(ctx context.Context, jobID, cursor string, limit int) (LogPage, error) {
+func (s *Store) GetJobLogs(ctx context.Context, jobID, cursor string, limit int) (answer LogPage, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		answer, err = reads.logs(ctx, jobID, cursor, limit)
+		return err
+	})
+	return
+}
+
+func (r *databaseReads) logs(ctx context.Context, jobID, cursor string, limit int) (LogPage, error) {
 	if limit < 1 || limit > MaxLogPageLimit {
 		return LogPage{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxLogPageLimit)
 	}
-	if _, err := s.GetJob(ctx, jobID); err != nil {
+	if _, err := readJob(ctx, r, jobID); err != nil {
 		return LogPage{}, err
 	}
 	after, err := decodeLogCursor(cursor)
 	if err != nil {
 		return LogPage{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT ordinal, event_json, bytes FROM log_events
+	rows, err := r.q.QueryContext(ctx, `SELECT ordinal, event_json, bytes FROM log_events
 WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 	if err != nil {
 		return LogPage{}, internalError(err, "read job logs")
@@ -4059,8 +4074,12 @@ WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 	if err := rows.Err(); err != nil {
 		return LogPage{}, internalError(err, "iterate job logs")
 	}
+	if err := rows.Close(); err != nil {
+		return LogPage{}, internalError(err, "close job logs")
+	}
+	observeRead(ctx, "log_page")
 	page.NextCursor = encodeLogCursor(last)
-	page.Truncation, err = readLogTruncation(ctx, s.db, jobID)
+	page.Truncation, err = readLogTruncation(ctx, r.q, jobID)
 	if err != nil {
 		return LogPage{}, err
 	}
@@ -4069,11 +4088,19 @@ WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 
 // RawJobLogJSONL derives JSONL from the authoritative event rows. There is no
 // independently retained or append-rewritten raw-log blob.
-func (s *Store) RawJobLogJSONL(ctx context.Context, jobID string) ([]byte, error) {
-	if _, err := s.GetJob(ctx, jobID); err != nil {
+func (s *Store) RawJobLogJSONL(ctx context.Context, jobID string) (answer []byte, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		answer, err = reads.rawLogs(ctx, jobID)
+		return err
+	})
+	return
+}
+
+func (r *databaseReads) rawLogs(ctx context.Context, jobID string) ([]byte, error) {
+	if _, err := readJob(ctx, r, jobID); err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT event_json, bytes FROM log_events WHERE job_id=? ORDER BY ordinal", jobID)
+	rows, err := r.q.QueryContext(ctx, "SELECT event_json, bytes FROM log_events WHERE job_id=? ORDER BY ordinal", jobID)
 	if err != nil {
 		return nil, internalError(err, "read authoritative job log events for JSONL export")
 	}
@@ -4971,6 +4998,7 @@ WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_
 	} else if !errors.Is(removalErr, sql.ErrNoRows) {
 		return Job{}, removalErr
 	}
+	observeRead(ctx, "job")
 	return job, nil
 }
 
@@ -5241,11 +5269,19 @@ func latestAttemptID(ctx context.Context, q queryer, jobID string) (string, erro
 // between completing an attempt and uploading its result leaves the
 // predecessor's row in place, and that document is not this run's answer. The
 // reader is told there is no result rather than shown an earlier attempt's.
-func (s *Store) GetJobResult(ctx context.Context, jobID string) (JobResult, error) {
+func (s *Store) GetJobResult(ctx context.Context, jobID string) (answer JobResult, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		answer, err = reads.result(ctx, jobID)
+		return err
+	})
+	return
+}
+
+func (r *databaseReads) result(ctx context.Context, jobID string) (JobResult, error) {
 	var result JobResult
 	var uploadedNS int64
 	var skipReason string
-	err := s.db.QueryRowContext(ctx, `SELECT r.job_id, r.attempt_id, r.document, r.sha256, r.skip_reason, r.uploaded_ns
+	err := r.q.QueryRowContext(ctx, `SELECT r.job_id, r.attempt_id, r.document, r.sha256, r.skip_reason, r.uploaded_ns
 		FROM job_results r WHERE r.job_id=? AND r.attempt_id=(
 			SELECT a.attempt_id FROM attempts a WHERE a.job_id=r.job_id
 			ORDER BY a.created_ns DESC, a.attempt_id DESC LIMIT 1)`, jobID).

@@ -13,14 +13,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 const (
-	DefaultJobPageLimit = 100
-	MaxJobPageLimit     = 1000
+	DefaultJobPageLimit  = 100
+	MaxJobPageLimit      = 250
+	MaxChildJobPageLimit = 1000
 )
 
 type serviceJobCursor struct {
@@ -54,12 +54,20 @@ func validateJobRouteClass(r *http.Request, job Job) error {
 }
 
 func parseJobLimit(value string) (int, error) {
+	return parseReadJobLimit(value, MaxJobPageLimit)
+}
+
+func parseChildJobLimit(value string) (int, error) {
+	return parseReadJobLimit(value, MaxChildJobPageLimit)
+}
+
+func parseReadJobLimit(value string, maximum int) (int, error) {
 	if value == "" {
 		return DefaultJobPageLimit, nil
 	}
 	limit, err := strconv.Atoi(value)
-	if err != nil || limit < 1 || limit > MaxJobPageLimit {
-		return 0, protocolError(contract.ErrorInvalidRequest, "limit must be an integer between 1 and %d", MaxJobPageLimit)
+	if err != nil || limit < 1 || limit > maximum {
+		return 0, protocolError(contract.ErrorInvalidRequest, "limit must be an integer between 1 and %d", maximum)
 	}
 	return limit, nil
 }
@@ -127,7 +135,7 @@ func (s *Store) setServiceDesiredState(ctx context.Context, jobID string, desire
 	if desired == contract.ServiceDesiredStopped {
 		verb = "stop"
 	}
-	if err := serviceActionDecision(ctx, tx, now, job, verb, actor); err != nil {
+	if err := serviceActionDecision(ctx, transactionReads(tx, now), job, verb, actor); err != nil {
 		return Job{}, err
 	}
 
@@ -218,7 +226,7 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	if err != nil {
 		return Job{}, false, internalError(err, "read service restart target")
 	}
-	if err := serviceActionAuthority(ctx, tx, now, job, "restart", actor); err != nil {
+	if err := serviceActionAuthority(ctx, transactionReads(tx, now), job, "restart", actor); err != nil {
 		return Job{}, false, err
 	}
 	var storedHash string
@@ -233,7 +241,7 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read service restart replay")
 	}
-	if err := serviceActionDecision(ctx, tx, now, job, "restart", actor); err != nil {
+	if err := serviceActionDecision(ctx, transactionReads(tx, now), job, "restart", actor); err != nil {
 		return Job{}, false, err
 	}
 
@@ -368,39 +376,12 @@ func neverAutomaticFailureCause(ctx context.Context, q queryer, job Job) (string
 	return "", false, nil
 }
 
-func (s *Store) projectJob(ctx context.Context, job Job) (Job, error) {
-	return s.projectJobWithQueryer(ctx, s.db, job)
-}
-
-func (s *Store) projectJobWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
-	at := time.Time{}
-	if job.ServiceJob != nil && job.Removal == nil {
-		at = canonicalTime(s.clock.Now())
-	}
-	return projectJobWithReads(ctx, newDatabaseReads(q, at, nil), job, projectJobStatusPart)
-}
-
 func projectJobStatus(ctx context.Context, reads readModel, job Job) (Job, error) {
 	if job.ServiceJob != nil || job.Removal != nil {
 		return reads.serviceStatus(ctx, job)
 	}
 	job.Status = string(job.State)
 	return reads.queuedStatus(ctx, job)
-}
-
-func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
-	return s.projectServiceJobWithQueryer(ctx, s.db, job)
-}
-
-func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
-	at := time.Time{}
-	if job.ServiceJob != nil && job.Removal == nil {
-		at = canonicalTime(s.clock.Now())
-	}
-	if job.ServiceJob == nil && job.Removal == nil {
-		return Job{}, protocolError(contract.ErrorNotFound, "service job %q was not found", job.JobID)
-	}
-	return projectJobWithReads(ctx, newDatabaseReads(q, at, nil), job, projectJobStatusPart)
 }
 
 func (r *databaseReads) serviceStatus(ctx context.Context, job Job) (Job, error) {
@@ -496,9 +477,6 @@ func (r *databaseReads) serviceStatus(ctx context.Context, job Job) (Job, error)
 	return job, nil
 }
 
-func unboundServiceUnschedulableReasonWithQueryer(ctx context.Context, q queryer, jobID string) (string, error) {
-	return newDatabaseReads(q, time.Time{}, nil).unboundServiceUnschedulableReason(ctx, jobID)
-}
 func (r *databaseReads) unboundServiceUnschedulableReason(ctx context.Context, jobID string) (string, error) {
 	requirements, err := r.placementRequirements(ctx, jobID)
 	if err != nil {

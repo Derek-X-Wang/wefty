@@ -76,13 +76,25 @@ func insertAttemptCredential(ctx context.Context, tx *sql.Tx, hash string, scope
 // identityNodeID is the Fabric identity the request actually arrived with. It
 // must be the node holding the attempt, so a leaked bearer cannot be replayed
 // from anywhere else. This mirrors ProveComputerTokenScope's host binding.
-func (s *Store) ResolveAttemptCredential(ctx context.Context, token, identityNodeID string) (AttemptCredentialScope, error) {
+func (s *Store) ResolveAttemptCredential(ctx context.Context, token, identityNodeID string) (scope AttemptCredentialScope, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		scope, err = reads.resolveCredential(ctx, token, identityNodeID)
+		return err
+	})
+	return
+}
+
+func (r *databaseReads) validateCredential(ctx context.Context, scope AttemptCredentialScope) error {
+	return revalidateAttemptCredential(ctx, r.q, scope, r.now().UnixNano())
+}
+
+func (r *databaseReads) resolveCredential(ctx context.Context, token, identityNodeID string) (AttemptCredentialScope, error) {
 	token = strings.TrimSpace(token)
 	if token == "" || strings.TrimSpace(identityNodeID) == "" {
 		return AttemptCredentialScope{}, protocolError(contract.ErrorUnauthorized, "attempt credential is required")
 	}
 	var scope AttemptCredentialScope
-	err := s.db.QueryRowContext(ctx, `SELECT attempt_id, job_id, node_id, originating_submitter, spawn_depth
+	err := r.q.QueryRowContext(ctx, `SELECT attempt_id, job_id, node_id, originating_submitter, spawn_depth
 		FROM attempt_credentials WHERE token_hash=?`, hashAttemptCredential(token)).
 		Scan(&scope.AttemptID, &scope.JobID, &scope.NodeID, &scope.OriginatingSubmitter, &scope.SpawnDepth)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -91,14 +103,14 @@ func (s *Store) ResolveAttemptCredential(ctx context.Context, token, identityNod
 	if err != nil {
 		return AttemptCredentialScope{}, internalError(err, "read attempt credential")
 	}
-	authority, err := readAttemptAuthority(ctx, s.db, scope.AttemptID)
+	authority, err := readAttemptAuthority(ctx, r.q, scope.AttemptID)
 	if err != nil {
 		// An attempt that no longer exists cannot confer authority. Report the
 		// credential as refused rather than leaking which attempt it named.
 		return AttemptCredentialScope{}, protocolError(contract.ErrorUnauthorized, "attempt credential is no longer live")
 	}
 	if err := validateAttemptCredentialAuthority(identityNodeID, scope, authority,
-		canonicalTime(s.clock.Now()).UnixNano()); err != nil {
+		r.now().UnixNano()); err != nil {
 		return AttemptCredentialScope{}, err
 	}
 	scope.IdentityNodeID = identityNodeID
@@ -171,26 +183,34 @@ func (s *Store) ListChildJobs(ctx context.Context, parentJobID, cursorValue stri
 	return s.listChildJobsForCaller(ctx, parentJobID, cursorValue, limit, nil)
 }
 
-func (s *Store) listChildJobsForCaller(ctx context.Context, parentJobID, cursorValue string, limit int, actor *serviceActionActor) (JobList, error) {
+func (s *Store) listChildJobsForCaller(ctx context.Context, parentJobID, cursorValue string, limit int, actor *serviceActionActor) (page JobList, err error) {
+	err = s.withReadSnapshot(ctx, actor, func(ctx context.Context, reads readModel) error {
+		page, err = reads.childrenPage(ctx, parentJobID, cursorValue, limit)
+		return err
+	})
+	return
+}
+
+func (r *databaseReads) childrenPage(ctx context.Context, parentJobID, cursorValue string, limit int) (JobList, error) {
 	if strings.TrimSpace(parentJobID) == "" {
 		return JobList{}, protocolError(contract.ErrorInvalidRequest, "job_id is required")
 	}
-	if limit < 1 || limit > MaxJobPageLimit {
-		return JobList{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxJobPageLimit)
+	if limit < 1 || limit > MaxChildJobPageLimit {
+		return JobList{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxChildJobPageLimit)
 	}
 	cursor, err := decodeServiceJobCursor(cursorValue)
 	if err != nil {
 		return JobList{}, err
 	}
-	// Keep membership, Job rows and operator facts in one read-only snapshot.
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return JobList{}, internalError(err, "begin child job listing")
+	if err := validateReadCredential(ctx, r); err != nil {
+		return JobList{}, err
 	}
-	defer tx.Rollback()
-	if actor != nil {
+	if _, err := r.eligibleNodeIDs(ctx, nil); err != nil {
+		return JobList{}, internalError(err, "load page node facts")
+	}
+	if r.caller() != nil {
 		var exists bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id=?)
+		if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM jobs WHERE job_id=?)
 			OR EXISTS(SELECT 1 FROM service_tombstones WHERE job_id=?)`, parentJobID, parentJobID).Scan(&exists); err != nil {
 			return JobList{}, internalError(err, "read child listing parent")
 		}
@@ -198,7 +218,7 @@ func (s *Store) listChildJobsForCaller(ctx context.Context, parentJobID, cursorV
 			return JobList{}, protocolError(contract.ErrorNotFound, "job %q was not found", parentJobID)
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT job_id, created_ns FROM jobs
+	rows, err := r.q.QueryContext(ctx, `SELECT job_id, created_ns FROM jobs
 		WHERE parent_job_id=? AND (created_ns>? OR (created_ns=? AND job_id>?))
 		ORDER BY created_ns, job_id LIMIT ?`,
 		parentJobID, cursor.CreatedNS, cursor.CreatedNS, cursor.JobID, limit+1)
@@ -228,28 +248,16 @@ func (s *Store) listChildJobsForCaller(ctx context.Context, parentJobID, cursorV
 	if hasMore {
 		listed = listed[:limit]
 	}
-	now := canonicalTime(s.clock.Now())
 	for _, item := range listed {
-		job, err := getJobByID(ctx, tx, item.jobID, now)
+		job, err := readJob(ctx, r, item.jobID)
+		if err != nil {
+			return JobList{}, err
+		}
+		job, err = projectJobWithReads(ctx, r, job, projectJobAll)
 		if err != nil {
 			return JobList{}, err
 		}
 		page.Jobs = append(page.Jobs, job)
-	}
-	if actor != nil {
-		if err := projectServiceOperatorPage(ctx, tx, page.Jobs, actor); err != nil {
-			return JobList{}, err
-		}
-	}
-	for i, job := range page.Jobs {
-		projected, err := s.projectJobWithQueryer(ctx, tx, job)
-		if err != nil {
-			return JobList{}, err
-		}
-		page.Jobs[i] = projected
-	}
-	if err := tx.Commit(); err != nil {
-		return JobList{}, internalError(err, "finish child job listing")
 	}
 	if hasMore && len(listed) > 0 {
 		last := listed[len(listed)-1]

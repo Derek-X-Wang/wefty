@@ -108,7 +108,7 @@ func TestServiceOperatorPageQueryCost(t *testing.T) {
 			defer tx.Rollback()
 			queries := &countedServiceQueries{queryer: tx}
 			actor := &serviceActionActor{Identity: fabric.Identity{Tags: []string{DefaultClientPrincipalTag}}, ClientPrincipalTag: DefaultClientPrincipalTag}
-			if err := projectServiceOperatorPage(t.Context(), queries, jobs, actor); err != nil {
+			if err := projectOperatorPageProbe(t.Context(), newDatabaseReads(queries, h.clock.Now(), actor), jobs); err != nil {
 				t.Fatal(err)
 			}
 			// The occupancy COUNT visits this node's services once for the whole
@@ -266,26 +266,22 @@ func TestChildListingDeletedBeforeOperatorProjection(t *testing.T) {
 	}
 	oldClock := h.store.clock
 	calls := 0
-	h.store.clock = ClockFunc(func() time.Time {
-		calls++
-		// In the original handler this is after the first child's GetJob
-		// and before its separate operator-fact transaction. In the fixed
-		// listing it is during status projection in the page transaction.
-		if calls == 3 {
-			if _, err := h.store.db.Exec("DELETE FROM jobs WHERE job_id=?", firstID); err != nil {
-				t.Fatal(err)
-			}
+	h.store.clock = ClockFunc(func() time.Time { calls++; return oldClock.Now() })
+	// Delete after the first selected Job is decoded, before its operator
+	// projection, without depending on the legacy multiple-clock stitching.
+	ctx, deleted := observeOnce(t, t.Context(), "job", func() {
+		if _, err := h.store.db.Exec("DELETE FROM jobs WHERE job_id=?", firstID); err != nil {
+			t.Fatal(err)
 		}
-		return oldClock.Now()
 	})
 	defer func() { h.store.clock = oldClock }()
 	r := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+parent.JobID+"/children", nil)
 	r.SetPathValue("job_id", parent.JobID)
-	r = r.WithContext(context.WithValue(r.Context(), identityContextKey{}, fabric.Identity{Tags: []string{DefaultClientPrincipalTag}}))
+	r = r.WithContext(context.WithValue(ctx, identityContextKey{}, fabric.Identity{Tags: []string{DefaultClientPrincipalTag}}))
 	w := httptest.NewRecorder()
 	h.server.listChildJobs(w, r)
 	var page JobList
-	if calls < 3 || w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &page) != nil || len(page.Jobs) != 2 {
+	if calls != 1 || !*deleted || w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &page) != nil || len(page.Jobs) != 2 {
 		t.Fatalf("deletion before operator projection: calls=%d status=%d %s", calls, w.Code, w.Body.String())
 	}
 	for _, job := range page.Jobs {
@@ -293,4 +289,15 @@ func TestChildListingDeletedBeforeOperatorProjection(t *testing.T) {
 			t.Fatalf("missing facts after deletion: %+v", job)
 		}
 	}
+}
+
+func projectOperatorPageProbe(ctx context.Context, reads readModel, jobs []Job) error {
+	for i, job := range jobs {
+		projected, err := projectJobWithReads(ctx, reads, job, projectJobOperatorPart)
+		if err != nil {
+			return err
+		}
+		jobs[i] = projected
+	}
+	return nil
 }

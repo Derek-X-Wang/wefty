@@ -18,6 +18,14 @@ import (
 type readModel interface {
 	now() time.Time
 	caller() *serviceActionActor
+	validateCredential(context.Context, AttemptCredentialScope) error
+	resolveCredential(context.Context, string, string) (AttemptCredentialScope, error)
+	jobsPage(context.Context, jobListFilters, string, int) (JobList, error)
+	childrenPage(context.Context, string, string, int) (JobList, error)
+	ledgerJob(context.Context, string) (Job, error)
+	logs(context.Context, string, string, int) (LogPage, error)
+	result(context.Context, string) (JobResult, error)
+	rawLogs(context.Context, string) ([]byte, error)
 	job(context.Context, string) (Job, error)
 	attempts(context.Context, string) ([]Attempt, error)
 	node(context.Context, string) (Node, error)
@@ -40,9 +48,8 @@ type readModel interface {
 	queuedStatus(context.Context, Job) (Job, error)
 }
 
-// databaseReads is private SQL plumbing; callers see only readModel. Legacy
-// view adapters deliberately keep their existing acquisition and timing until
-// #748-#751. A write gets a fresh memo at each decision, never across writes.
+// databaseReads is private SQL plumbing; callers see only readModel.
+// A write gets a fresh memo at each decision, never across writes.
 type databaseReads struct {
 	q               queryer
 	at              time.Time
@@ -400,9 +407,8 @@ func (s *Store) recordReadSnapshotOverrun(elapsed time.Duration) {
 
 var _ readModel = (*databaseReads)(nil)
 
-// Component selection preserves today's view stitching and refusal order. The
-// subsequent tickets request all components inside one snapshot; no route is
-// migrated here. Every component uses this same projector and read vocabulary.
+// Component selection serves internal status decisions and complete public views.
+// Every component uses the same pinned clock and read vocabulary.
 type jobProjectionParts uint8
 
 const (
@@ -421,7 +427,7 @@ func projectJobWithReads(ctx context.Context, reads readModel, job Job, parts jo
 		}
 	}
 	if parts&projectJobOperatorPart != 0 {
-		job, err = projectServiceOperatorFactsWithReads(ctx, reads, job, reads.caller())
+		job, err = projectServiceOperatorFacts(ctx, reads, job, reads.caller())
 		if err != nil {
 			return Job{}, err
 		}

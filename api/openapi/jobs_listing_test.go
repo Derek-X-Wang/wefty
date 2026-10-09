@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 func TestJobCollectionPublishesFiltersAndScopedPaging(t *testing.T) {
@@ -43,7 +44,7 @@ func TestJobCollectionPublishesFiltersAndScopedPaging(t *testing.T) {
 		t.Fatalf("submitter=%v", submitter)
 	}
 	limit := object(t, params["limit"]["schema"], "limit schema")
-	if limit["default"] != float64(100) || limit["minimum"] != float64(1) || limit["maximum"] != float64(1000) {
+	if limit["default"] != float64(l1.DefaultJobPageLimit) || limit["minimum"] != float64(1) || limit["maximum"] != float64(l1.MaxJobPageLimit) {
 		t.Fatalf("limit=%v", limit)
 	}
 	if len(route["security"].([]any)) != 2 {

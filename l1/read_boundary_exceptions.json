@@ -48,18 +48,6 @@
     "slice": "#752"
   },
   {
-    "site": "attempt_credential.go:*Store.ResolveAttemptCredential | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
-    "site": "attempt_credential.go:*Store.listChildJobsForCaller | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
     "site": "backups.go:*Store.AcknowledgeComputerBackup | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
@@ -124,12 +112,6 @@
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #750",
     "slice": "#750"
-  },
-  {
-    "site": "capabilities.go:*Store.projectQueuedJobCapabilities | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
   },
   {
     "site": "computer_operator.go:*Server.getComputerForCaller | s.store.db",
@@ -366,12 +348,6 @@
     "slice": "permanent"
   },
   {
-    "site": "jobs_listing.go:*Store.listReadableJobsForCaller | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
     "site": "log_continuity.go:*Store.seedLogContinuity | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
@@ -418,18 +394,6 @@
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #750",
     "slice": "#750"
-  },
-  {
-    "site": "operator_routes.go:*Store.projectJob | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
-    "site": "operator_routes.go:*Store.projectServiceJob | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
   },
   {
     "site": "operator_routes.go:*Store.restartService | s.db",
@@ -610,12 +574,6 @@
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
     "slice": "#752"
-  },
-  {
-    "site": "service_operator.go:*Server.projectServiceForCaller | s.store.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
   },
   {
     "site": "storage_copies.go:*Store.AcknowledgeComputerRestoreRetirement | s.db",
@@ -804,52 +762,16 @@
     "slice": "#752"
   },
   {
-    "site": "store.go:*Store.GetJob | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
-    "site": "store.go:*Store.GetJobLogs | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
-    "site": "store.go:*Store.GetJobResult | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
-    "site": "store.go:*Store.ListJobAttempts | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
     "site": "store.go:*Store.ListNodes | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #750",
     "slice": "#750"
   },
   {
-    "site": "store.go:*Store.LookupRunLedgerJob | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
-  },
-  {
     "site": "store.go:*Store.ObserveAttemptImage | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
     "slice": "#752"
-  },
-  {
-    "site": "store.go:*Store.RawJobLogJSONL | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #748",
-    "slice": "#748"
   },
   {
     "site": "store.go:*Store.RegisterNode | s.db",

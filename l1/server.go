@@ -825,36 +825,13 @@ func (s *Server) createChildJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	job, err = s.store.projectJob(r.Context(), job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	job, err = s.projectServiceForCaller(r, job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, status, redactJob(job))
+	s.writeChangedJob(w, r, job, status)
 }
 
 // getAttemptScopedJob is GET /v1/jobs/{job_id} presented with an attempt
 // credential: the credential's own job, or one of that job's children.
 func (s *Server) getAttemptScopedJob(w http.ResponseWriter, r *http.Request) {
-	scope := attemptCredentialFromRequest(r)
-	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
-	if err != nil && errorCode(err) != contract.ErrorNotFound {
-		writeError(w, err)
-		return
-	}
-	// Absent and out-of-scope answer identically. A distinct not-found would
-	// turn this route into an existence probe over the whole job collection.
-	if err != nil || (job.JobID != scope.JobID && job.ParentJobID != scope.JobID) {
-		writeError(w, protocolError(contract.ErrorForbidden,
-			"an attempt credential may read only its own job and that job's children"))
-		return
-	}
-	s.writeJobProjection(w, r, job)
+	s.getJob(w, r)
 }
 
 // listAttemptScopedChildJobs is GET /v1/jobs/{job_id}/children presented with
@@ -870,7 +847,7 @@ func (s *Server) listAttemptScopedChildJobs(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) listChildJobs(w http.ResponseWriter, r *http.Request) {
-	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	limit, err := parseChildJobLimit(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1217,17 +1194,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	job, err = s.store.projectJob(r.Context(), job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	job, err = s.projectServiceForCaller(r, job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, status, redactJob(job))
+	s.writeChangedJob(w, r, job, status)
 }
 
 func (s *Server) createComputer(w http.ResponseWriter, r *http.Request) {
@@ -2114,23 +2081,18 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for index := range page.Jobs {
-		projected, projectErr := s.projectServiceForCaller(r, page.Jobs[index])
-		if projectErr != nil {
-			writeError(w, projectErr)
-			return
-		}
-		page.Jobs[index] = redactJob(projected)
+		page.Jobs[index] = redactJob(page.Jobs[index])
 	}
 	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
+	job, err := s.store.readJobResource(r.Context(), r.PathValue("job_id"), s.serviceActionActor(r), func(job Job) error { return validateJobRouteClass(r, job) })
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	s.writeJobProjection(w, r, job)
+	writeJSON(w, http.StatusOK, redactJob(job))
 }
 
 func (s *Server) lookupJobByDispatchKey(w http.ResponseWriter, r *http.Request) {
@@ -2148,35 +2110,7 @@ func (s *Server) lookupJobByDispatchKey(w http.ResponseWriter, r *http.Request) 
 		writeError(w, err)
 		return
 	}
-	s.writeJobProjection(w, r, job)
-}
-
-// writeJobProjection is the single job read projection. The class selector
-// rule is shared deliberately: an in-job caller sees exactly what a client
-// principal would see for the same job, never more.
-func (s *Server) writeJobProjection(w http.ResponseWriter, r *http.Request, job Job) {
 	if err := validateJobRouteClass(r, job); err != nil {
-		writeError(w, err)
-		return
-	}
-	s.writeJobResource(w, r, job)
-}
-
-// writeJobResource also serves cancel, whose transaction determines the class
-// and whose committed response must not be rejected by a read-route selector.
-func (s *Server) writeJobResource(w http.ResponseWriter, r *http.Request, job Job) {
-	job, err := s.store.projectJob(r.Context(), job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	job.Attempts, err = s.store.ListJobAttempts(r.Context(), job.JobID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	job, err = s.projectServiceForCaller(r, job)
-	if err != nil {
 		writeError(w, err)
 		return
 	}
@@ -2184,26 +2118,27 @@ func (s *Server) writeJobResource(w http.ResponseWriter, r *http.Request, job Jo
 }
 
 func (s *Server) getJobLogs(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
+	var answer LogPage
+	err := s.store.withReadSnapshot(r.Context(), s.serviceActionActor(r), func(ctx context.Context, reads readModel) error {
+		job, err := readJob(ctx, reads, r.PathValue("job_id"))
+		if err != nil {
+			return err
+		}
+		if err := validateJobRouteClass(r, job); err != nil {
+			return err
+		}
+		limit, err := parseLogLimit(r.URL.Query().Get("limit"))
+		if err != nil {
+			return err
+		}
+		answer, err = reads.logs(ctx, r.PathValue("job_id"), r.URL.Query().Get("cursor"), limit)
+		return err
+	})
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if err := validateJobRouteClass(r, job); err != nil {
-		writeError(w, err)
-		return
-	}
-	limit, err := parseLogLimit(r.URL.Query().Get("limit"))
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	page, err := s.store.GetJobLogs(r.Context(), r.PathValue("job_id"), r.URL.Query().Get("cursor"), limit)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, page)
+	writeJSON(w, http.StatusOK, answer)
 }
 
 func (s *Server) setServiceDesiredState(w http.ResponseWriter, r *http.Request) {
@@ -2221,17 +2156,7 @@ func (s *Server) setServiceDesiredState(w http.ResponseWriter, r *http.Request) 
 		writeError(w, err)
 		return
 	}
-	job, err = s.store.projectServiceJob(r.Context(), job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	job, err = s.projectServiceForCaller(r, job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, redactJob(job))
+	s.writeChangedJob(w, r, job, http.StatusAccepted)
 }
 
 func (s *Server) restartService(w http.ResponseWriter, r *http.Request) {
@@ -2249,22 +2174,12 @@ func (s *Server) restartService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	job, err = s.store.projectServiceJob(r.Context(), job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
 	status := http.StatusAccepted
 	if replayed {
 		status = http.StatusOK
 		w.Header().Set("Idempotent-Replay", "true")
 	}
-	job, err = s.projectServiceForCaller(r, job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, status, redactJob(job))
+	s.writeChangedJob(w, r, job, status)
 }
 
 func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
@@ -2277,17 +2192,7 @@ func (s *Server) removeService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	job, err = s.store.projectServiceJob(r.Context(), job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	job, err = s.projectServiceForCaller(r, job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, redactJob(job))
+	s.writeChangedJob(w, r, job, http.StatusAccepted)
 }
 
 func (s *Server) forceForgetService(w http.ResponseWriter, r *http.Request) {
@@ -2309,17 +2214,7 @@ func (s *Server) forceForgetService(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	job, err = s.store.projectServiceJob(r.Context(), job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	job, err = s.projectServiceForCaller(r, job)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, redactJob(job))
+	s.writeChangedJob(w, r, job, http.StatusOK)
 }
 
 func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
@@ -2820,21 +2715,24 @@ func (s *Server) setAttemptResult(w http.ResponseWriter, r *http.Request) {
 // result is evidence about the job, and whoever may read the job's logs may
 // read what it concluded.
 func (s *Server) getJobResult(w http.ResponseWriter, r *http.Request) {
-	job, err := s.store.GetJob(r.Context(), r.PathValue("job_id"))
+	var err error
+	var answer JobResult
+	err = s.store.withReadSnapshot(r.Context(), s.serviceActionActor(r), func(ctx context.Context, reads readModel) error {
+		job, err := readJob(ctx, reads, r.PathValue("job_id"))
+		if err != nil {
+			return err
+		}
+		if err := validateJobRouteClass(r, job); err != nil {
+			return err
+		}
+		answer, err = reads.result(ctx, r.PathValue("job_id"))
+		return err
+	})
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if err := validateJobRouteClass(r, job); err != nil {
-		writeError(w, err)
-		return
-	}
-	result, err := s.store.GetJobResult(r.Context(), job.JobID)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, answer)
 }
 
 func (s *Server) appendComputerTakeoverAudit(w http.ResponseWriter, r *http.Request) {
