@@ -98,8 +98,8 @@
   {
     "site": "cancel.go:*Store.ListNodeCancelDirectives | s.db",
     "count": 1,
-    "reason": "legacy acquisition/use; migrate in #750",
-    "slice": "#750"
+    "reason": "Agent-protocol heartbeat reads must remain independent of operator snapshot admission; in #752, document as a heartbeat exception or give it separate admission",
+    "slice": "#752"
   },
   {
     "site": "capabilities.go:*Store.projectQueuedJobCapabilities | s.db",
@@ -378,22 +378,10 @@
     "slice": "permanent"
   },
   {
-    "site": "node_operator.go:*Store.GetNode | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #750",
-    "slice": "#750"
-  },
-  {
     "site": "nodes_listing.go:*Store.initializeNodeListing | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
     "slice": "permanent"
-  },
-  {
-    "site": "nodes_listing.go:*Store.listNodesPage | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #750",
-    "slice": "#750"
   },
   {
     "site": "operator_routes.go:*Store.projectJob | s.db",
@@ -524,8 +512,8 @@
   {
     "site": "removal.go:*Store.ListNodeRemovalDirectives | s.db",
     "count": 5,
-    "reason": "legacy acquisition/use; migrate in #750",
-    "slice": "#750"
+    "reason": "Agent-protocol heartbeat reads must remain independent of operator snapshot admission; in #752, document as a heartbeat exception or give it separate admission",
+    "slice": "#752"
   },
   {
     "site": "removal.go:*Store.forceForgetService | s.db",
@@ -802,12 +790,6 @@
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #748",
     "slice": "#748"
-  },
-  {
-    "site": "store.go:*Store.ListNodes | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #750",
-    "slice": "#750"
   },
   {
     "site": "store.go:*Store.LookupRunLedgerJob | s.db",

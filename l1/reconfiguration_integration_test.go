@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -792,9 +793,9 @@ func TestComputerGrowInsufficientDiskLatchesUntilExplicitRestart(t *testing.T) {
 }
 
 func TestReconfigurationAbortRequiresDeadBoundNodeAndLeavesExplicitRestart(t *testing.T) {
-	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{LeaseDuration: 3 * time.Second}, map[string]NodePolicy{
 		"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-	})
+	}, true, time.Hour)
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
 		"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_platform:linux/amd64": true,
 	}, []string{contract.StableNodeTagPrefix + "computer-node"})
@@ -827,9 +828,38 @@ func TestReconfigurationAbortRequiresDeadBoundNodeAndLeavesExplicitRestart(t *te
 	if _, _, err := h.store.AbortComputerReconfiguration(t.Context(), computer.ComputerID, abort); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("live-node abort error = %v", err)
 	}
-	if _, err := h.store.db.Exec(`UPDATE nodes SET state=? WHERE node_id=?`, contract.NodeDead, node.NodeID); err != nil {
-		t.Fatal(err)
+	h.clock.Advance(DefaultNodeDeadAfter)
+	operator := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+	status, _, body := h.do(operator, http.MethodGet, "/v1/nodes/"+node.NodeID, nil)
+	var effective Node
+	if err := json.Unmarshal(body, &effective); err != nil || status != http.StatusOK || effective.State != contract.NodeDead {
+		t.Fatalf("effective node=%d %s err=%v", status, body, err)
 	}
+	assertAbortAction := func(wantAllowed bool) {
+		t.Helper()
+		status, _, body := h.do(operator, http.MethodGet, "/v1/computers/"+computer.ComputerID, nil)
+		var facts computerOperatorFacts
+		if err := json.Unmarshal(body, &facts); err != nil || status != http.StatusOK {
+			t.Fatalf("Computer actions=%d %s err=%v", status, body, err)
+		}
+		for _, action := range facts.AllowedActions {
+			if action.Verb == "reconfiguration-abort" {
+				if (action.RefusedBecause == nil) != wantAllowed || !wantAllowed && action.RefusedBecause.Code != contract.ErrorConflict {
+					t.Fatalf("abort allowed=%t action=%#v", wantAllowed, action)
+				}
+				return
+			}
+		}
+		t.Fatalf("missing abort action: %s", body)
+	}
+	assertAbortAction(false)
+	if _, _, err := h.store.AbortComputerReconfiguration(t.Context(), computer.ComputerID, abort); errorCode(err) != contract.ErrorConflict {
+		t.Fatalf("effective-dead abort error=%v, want recorded-dead refusal", err)
+	}
+	if result, err := h.store.Reconcile(t.Context()); err != nil || result.DeadNodes != 1 {
+		t.Fatalf("record dead node=%#v err=%v", result, err)
+	}
+	assertAbortAction(true)
 	aborted, replayed, err := h.store.AbortComputerReconfiguration(t.Context(), computer.ComputerID, abort)
 	if err != nil || replayed {
 		t.Fatalf("abort = %#v replayed=%t err=%v", aborted, replayed, err)
