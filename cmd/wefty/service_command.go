@@ -303,8 +303,8 @@ func executeServiceList(
 	if flags.NArg() != 0 {
 		return usageError("services list does not accept positional arguments")
 	}
-	if limit < 1 || limit > l1.MaxJobListingPageLimit {
-		return usageError(fmt.Sprintf("--limit must be between 1 and %d", l1.MaxJobListingPageLimit))
+	if limit < 1 || limit > l1.MaxJobPageLimit {
+		return usageError(fmt.Sprintf("--limit must be between 1 and %d", l1.MaxJobPageLimit))
 	}
 	page, err := clients.listServices(ctx, cursor, limit)
 	if err != nil {

@@ -19,7 +19,9 @@ import (
 
 const (
 	DefaultJobPageLimit = 100
-	// MaxJobPageLimit is the shared maximum for non-Job collections.
+	// MaxJobPageLimit is the shared collection maximum, also the accepted
+	// `limit` input range for job listings, which the server clamps to
+	// MaxJobListingPageLimit.
 	MaxJobPageLimit = 1000
 	// MaxJobListingPageLimit bounds Job projection work in one Read snapshot.
 	MaxJobListingPageLimit = 250
