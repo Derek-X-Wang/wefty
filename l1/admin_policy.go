@@ -316,7 +316,7 @@ func (s *Store) GetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
 		return err
 	})
 	if err != nil {
-		return AdminPolicy{}, internalError(err, "read admin policy")
+		return AdminPolicy{}, snapshotReadError(err, "read admin policy")
 	}
 	return policy, nil
 }
@@ -342,7 +342,7 @@ func (s *Store) GetVisibleAdminPolicy(ctx context.Context, identity fabric.Ident
 		return err
 	})
 	if err != nil {
-		return AdminPolicy{}, internalError(err, "read visible admin policy")
+		return AdminPolicy{}, snapshotReadError(err, "read visible admin policy")
 	}
 	return policy, nil
 }

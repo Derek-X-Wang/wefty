@@ -258,3 +258,31 @@ func TestFirstPersonViewRecordsThenGrantSucceeds(t *testing.T) {
 		t.Fatalf("grant after first view status=%d body=%s", status, body)
 	}
 }
+
+// The admin-policy views are read-snapshot users: a busy read pool must reach
+// the caller as the contract's retryable 503 with its read_snapshot_* reason,
+// never as a scrubbed 500.
+func TestAdminPolicyViewReportsBusyReadPoolAsUnavailable(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	for i := 0; i < readSnapshotLimit; i++ {
+		conn, err := h.store.readDB.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+	}
+	client := h.client(fabric.Identity{UserID: "person-busy", DeviceID: "device-busy"})
+	client.Timeout = 5 * time.Second
+	status, _, body := h.do(client, http.MethodGet, "/v1/admin-policy", nil)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("admin policy with the read pool busy status=%d body=%s, want 503", status, body)
+	}
+	var envelope contract.ErrorResponse
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Error.Code != contract.ErrorUnavailable || !envelope.Error.Retryable ||
+		envelope.Error.Details["reason"] != "read_snapshot_admission_expired" {
+		t.Fatalf("admin policy busy-pool error = %+v, want retryable unavailable read_snapshot_admission_expired", envelope.Error)
+	}
+}

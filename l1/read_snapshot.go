@@ -352,7 +352,7 @@ func (r *databaseReads) adminAuditPage(ctx context.Context, afterRevision int64,
 		actor_user_id, actor_device_id, subject_fabric_id, subject_user_id, created_ns FROM admin_policy_audit
 		WHERE revision>? ORDER BY revision LIMIT ?`, afterRevision, limit+1)
 	if err != nil {
-		return AdminPolicyAuditList{}, err
+		return AdminPolicyAuditList{}, internalError(err, "list admin policy audit")
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -361,13 +361,13 @@ func (r *databaseReads) adminAuditPage(ctx context.Context, afterRevision int64,
 		if err := rows.Scan(&entry.Revision, &entry.Operation, &entry.ActorKind,
 			&entry.ActorFabricID, &entry.ActorUserID, &entry.ActorDeviceID,
 			&entry.SubjectFabricID, &entry.SubjectUserID, &createdNS); err != nil {
-			return AdminPolicyAuditList{}, err
+			return AdminPolicyAuditList{}, internalError(err, "scan admin policy audit")
 		}
 		entry.CreatedAt = time.Unix(0, createdNS).UTC()
 		page.Entries = append(page.Entries, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return AdminPolicyAuditList{}, err
+		return AdminPolicyAuditList{}, internalError(err, "read admin policy audit")
 	}
 	if len(page.Entries) > limit {
 		page.Entries = page.Entries[:limit]
@@ -538,3 +538,14 @@ func (w *writeTransaction) decisionReads() readModel {
 }
 func (w *writeTransaction) commit() error   { return w.tx.Commit() }
 func (w *writeTransaction) rollback() error { return w.tx.Rollback() }
+
+// snapshotReadError keeps typed read-snapshot refusals (unavailable with a
+// read_snapshot_* reason) intact for the caller and labels only raw errors as
+// internal, so a busy read pool answers 503 rather than a scrubbed 500.
+func snapshotReadError(err error, message string) error {
+	var typed *Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	return internalError(err, message)
+}
