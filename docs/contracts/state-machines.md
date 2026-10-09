@@ -735,7 +735,12 @@ admin authority.
 
 Every successful person-route authentication records the stable
 `(FabricID, UserID)` plus latest device evidence in L1; `GET /v1/whoami` is the
-explicit touch route. A grant subject must have one of these authenticated
+explicit touch route. The record refresh is dirty-then-stale: a person view
+writes only when the observation is new, a recorded field changed, or the
+record is older than a refresh interval of one hour. A known, up-to-date person
+answers from a read snapshot and performs no write, so views never wait on the
+write SQLite lock. A person's first request still records them durably before
+answering. A grant subject must have one of these authenticated
 person observations before receiving `view` or `control`. Machine principals
 are rejected before observation and are never inserted. Administrator
 membership remains exempt from this existence check so a misspelled bootstrap

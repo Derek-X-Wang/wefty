@@ -106,11 +106,48 @@ func validatePersonIdentity(identity fabric.Identity) error {
 	return nil
 }
 
+// personSeenRefreshInterval is how long a recorded person observation stays
+// fresh enough that a person view performs no write at all.
+const personSeenRefreshInterval = time.Hour
+
+// ObserveAuthenticatedPerson records person presence only when the durable
+// record is missing, a recorded field drifted, or the record is older than the
+// refresh interval. A known, up-to-date person never waits on the write lock:
+// the check runs through the read-snapshot door, and a person's first request
+// still records them durably before answering so grants succeed.
 func (s *Store) ObserveAuthenticatedPerson(ctx context.Context, identity fabric.Identity) (AuthenticatedPerson, error) {
 	if err := validatePersonIdentity(identity); err != nil {
 		return AuthenticatedPerson{}, err
 	}
 	now := canonicalTime(s.clock.Now())
+	needed, err := s.personObservationNeedsWrite(ctx, identity, now)
+	if err != nil {
+		// The read snapshot could not confirm the record; record durably so
+		// the security guarantee behind the observation survives.
+		needed = true
+	}
+	if !needed {
+		return AuthenticatedPerson{FabricID: identity.FabricID, UserID: identity.UserID,
+			DeviceID: identity.DeviceID, SeenAt: now}, nil
+	}
+	return s.recordAuthenticatedPerson(ctx, identity, now)
+}
+
+func (s *Store) personObservationNeedsWrite(ctx context.Context, identity fabric.Identity, now time.Time) (bool, error) {
+	needed := true
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		person, known, err := reads.person(ctx, identity.FabricID, identity.UserID)
+		if err != nil || !known || person.DeviceID != identity.DeviceID ||
+			now.Sub(person.SeenAt) >= personSeenRefreshInterval {
+			return err
+		}
+		needed = false
+		return nil
+	})
+	return needed, err
+}
+
+func (s *Store) recordAuthenticatedPerson(ctx context.Context, identity fabric.Identity, now time.Time) (AuthenticatedPerson, error) {
 	if _, err := s.db.ExecContext(ctx, `INSERT INTO authenticated_people(fabric_id, user_id, last_device_id, last_seen_ns)
 		VALUES(?, ?, ?, ?) ON CONFLICT(fabric_id, user_id) DO UPDATE SET
 		last_device_id=excluded.last_device_id, last_seen_ns=excluded.last_seen_ns`,

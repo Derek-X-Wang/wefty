@@ -30,7 +30,7 @@
     "slice": "#751"
   },
   {
-    "site": "admin_policy.go:*Store.ObserveAuthenticatedPerson | s.db",
+    "site": "admin_policy.go:*Store.recordAuthenticatedPerson | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #751",
     "slice": "#751"

@@ -38,6 +38,7 @@ type readModel interface {
 	projectStatus(context.Context, Job) (Job, error)
 	serviceStatus(context.Context, Job) (Job, error)
 	queuedStatus(context.Context, Job) (Job, error)
+	person(context.Context, string, string) (AuthenticatedPerson, bool, error)
 }
 
 // databaseReads is private SQL plumbing; callers see only readModel. Legacy
@@ -311,6 +312,21 @@ func (r *databaseReads) availableBackup(ctx context.Context, id string) (Backup,
 }
 func (r *databaseReads) intents(ctx context.Context, id string, after int64, limit int) ([]ComputerIntent, error) {
 	return queryComputerIntents(ctx, r.q, id, after, limit)
+}
+func (r *databaseReads) person(ctx context.Context, fabricID, userID string) (AuthenticatedPerson, bool, error) {
+	var person AuthenticatedPerson
+	var lastSeen int64
+	err := r.q.QueryRowContext(ctx, `SELECT fabric_id, user_id, last_device_id, last_seen_ns
+		FROM authenticated_people WHERE fabric_id=? AND user_id=?`, fabricID, userID).
+		Scan(&person.FabricID, &person.UserID, &person.DeviceID, &lastSeen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AuthenticatedPerson{}, false, nil
+	}
+	if err != nil {
+		return AuthenticatedPerson{}, false, internalError(err, "read authenticated person")
+	}
+	person.SeenAt = time.Unix(0, lastSeen).UTC()
+	return person, true, nil
 }
 func (r *databaseReads) projectStatus(ctx context.Context, job Job) (Job, error) {
 	return projectJobStatus(ctx, r, job)
