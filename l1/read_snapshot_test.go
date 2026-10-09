@@ -425,8 +425,9 @@ func TestReadSnapshotRollbackFailureDiscardsConnection(t *testing.T) {
 	}
 }
 
-// The hold-limit override applies: a 1 ns budget expires the snapshot while a
-// default context without the override still answers.
+// The hold-limit override applies both ways: a 1 ns budget expires the
+// snapshot, a 10 s budget outlasts the 200 ms default, and a context without
+// the override still answers.
 func TestReadSnapshotHoldLimitOverride(t *testing.T) {
 	s, _ := snapshotStore(t)
 	ctx := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, time.Nanosecond)
@@ -443,5 +444,15 @@ func TestReadSnapshotHoldLimitOverride(t *testing.T) {
 		return r.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&count)
 	}); err != nil {
 		t.Fatal(err)
+	}
+	// Lengthening must work too, or the writer-between-reads tests silently
+	// fall back to 200 ms. The sleep can only run long, so this is deterministic.
+	longer := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, 10*time.Second)
+	if err := s.withReadSnapshot(longer, nil, func(ctx context.Context, r readModel) error {
+		time.Sleep(readSnapshotHardLimit + 50*time.Millisecond)
+		var count int
+		return r.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&count)
+	}); err != nil {
+		t.Fatalf("10 s override expired after the default limit: %v", err)
 	}
 }
