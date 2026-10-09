@@ -569,22 +569,28 @@ func insertComputerIntent(
 }
 
 func (s *Store) GetComputer(ctx context.Context, computerID string) (Computer, error) {
+	var value Computer
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewGetComputer(ctx, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewGetComputer(ctx context.Context, computerID string) (Computer, error) {
 	if strings.TrimSpace(computerID) == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return Computer{}, internalError(err, "begin Computer read")
-	}
-	defer tx.Rollback()
-	computer, err := readComputerAuthority(ctx, tx, computerID, canonicalTime(s.clock.Now()))
+	computer, err := readComputerAuthority(ctx, r.q, computerID, r.now())
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	}
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer")
 	}
-	return computer, nil
+	computer.CurrentJob, err = r.projectStatus(ctx, computer.CurrentJob)
+	return computer, err
 }
 
 func encodeComputerCursor(cursor computerCursor) string {
@@ -623,20 +629,26 @@ func (s *Store) ListComputers(ctx context.Context, cursorValue string, limit int
 }
 
 func (s *Store) listComputersForCaller(ctx context.Context, cursorValue string, limit int, actor *computerActionActor) (ComputerList, error) {
-	if limit < 1 || limit > MaxJobPageLimit {
+	var value ComputerList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputersForCaller(ctx, cursorValue, limit, actor)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputersForCaller(ctx context.Context, cursorValue string, limit int, actor *computerActionActor) (ComputerList, error) {
+	if limit < 1 {
 		return ComputerList{}, protocolError(contract.ErrorInvalidRequest,
 			"limit must be between 1 and %d", MaxJobPageLimit)
 	}
+	limit = min(limit, MaxJobListingPageLimit)
 	cursor, err := decodeComputerCursor(cursorValue)
 	if err != nil {
 		return ComputerList{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return ComputerList{}, internalError(err, "begin Computer list snapshot")
-	}
-	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT computer_id, created_ns FROM computers
+	rows, err := r.q.QueryContext(ctx, `SELECT computer_id, created_ns FROM computers
 		WHERE (created_ns, computer_id) > (?, ?)
 		ORDER BY created_ns, computer_id LIMIT ?`, cursor.CreatedNS, cursor.ComputerID, limit+1)
 	if err != nil {
@@ -667,26 +679,28 @@ func (s *Store) listComputersForCaller(ctx context.Context, cursorValue string, 
 	if hasMore {
 		listed = listed[:limit]
 	}
+	returned := 0
 	for _, item := range listed {
-		now := canonicalTime(s.clock.Now())
-		computer, err := readComputerAuthority(ctx, tx, item.computerID, now)
+		if returned > 0 && r.pageCutoffReached() {
+			hasMore = true
+			break
+		}
+		computer, err := r.computerViewGetComputer(ctx, item.computerID)
 		if err != nil {
 			return ComputerList{}, err
 		}
 		if actor != nil {
-			computer, err = projectComputerForCallerTx(ctx, transactionReads(tx, now), computer, *actor)
+			computer, err = projectComputerForCallerTx(ctx, r, computer, *actor)
 			if err != nil {
 				return ComputerList{}, err
 			}
 		}
 		page.Computers = append(page.Computers, computer)
+		returned++
 	}
-	if hasMore && len(listed) > 0 {
-		last := listed[len(listed)-1]
+	if hasMore && returned > 0 {
+		last := listed[returned-1]
 		page.NextCursor = encodeComputerCursor(computerCursor{CreatedNS: last.createdNS, ComputerID: last.computerID})
-	}
-	if err := tx.Commit(); err != nil {
-		return ComputerList{}, internalError(err, "commit Computer list snapshot")
 	}
 	return page, nil
 }
@@ -753,6 +767,7 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	if err != nil {
 		return Computer{}, err
 	}
+	observeRead(ctx, "computer_job")
 	// DiskBytes is mutable Computer authority, not part of immutable Job
 	// identity. Project the current budget from its owner so a grow cannot
 	// leave a stale Job observation that contaminates the next reimage.
@@ -957,6 +972,16 @@ func decodeComputerIntentCursor(value string) (int64, error) {
 }
 
 func (s *Store) ListComputerIntents(ctx context.Context, computerID, cursorValue string, limit int) (ComputerIntentList, error) {
+	var value ComputerIntentList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerIntents(ctx, computerID, cursorValue, limit)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerIntents(ctx context.Context, computerID, cursorValue string, limit int) (ComputerIntentList, error) {
 	if strings.TrimSpace(computerID) == "" {
 		return ComputerIntentList{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
 	}
@@ -969,13 +994,14 @@ func (s *Store) ListComputerIntents(ctx context.Context, computerID, cursorValue
 		return ComputerIntentList{}, err
 	}
 	var exists bool
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM computers WHERE computer_id=?)`, computerID).Scan(&exists); err != nil {
+	if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM computers WHERE computer_id=?)`, computerID).Scan(&exists); err != nil {
 		return ComputerIntentList{}, internalError(err, "read Computer intent authority")
 	}
 	if !exists {
 		return ComputerIntentList{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	}
-	intents, err := queryComputerIntents(ctx, s.db, computerID, afterRevision, limit+1)
+	observeRead(ctx, "computer_intents_owner")
+	intents, err := queryComputerIntents(ctx, r.q, computerID, afterRevision, limit+1)
 	if err != nil {
 		return ComputerIntentList{}, internalError(err, "list Computer intents")
 	}

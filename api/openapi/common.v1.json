@@ -615,7 +615,7 @@
           "controller_tenure": { "enum": ["free", "held"], "description": "Current Controller-tenure truth derived from immutable current-attempt audit evidence." },
           "allowed_actions": { "type": "array", "readOnly": true, "items": { "$ref": "#/components/schemas/AllowedAction" }, "description": "Client Computer verbs evaluated for this authenticated caller. Person-only grants, submission and take-over are omitted; agent-only callers receive refused client verbs. Describes new operations with valid inputs, not replay keys or same-image reimage no-ops. Backup verbs require at least one valid status=available Backup choice; pruned and pruning records are excluded. With no available choice, caller and resource checks precede not_found. A corrupt available choice is skipped when another choice succeeds; with no success, any internal choice refusal takes precedence." },
           "last_condition": { "anyOf": [{ "$ref": "#/components/schemas/Condition" }, { "type": "null" }], "readOnly": true, "description": "Latest recorded intent, grow or Backup completion, or removal stall from existing evidence. Recording time is preserved on reads; null when no evidence exists." },
-          "current_job": { "$ref": "#/components/schemas/Job" },
+          "current_job": { "$ref": "#/components/schemas/Job", "description": "Projected in the same Read snapshot as Computer authority and actions, using the job view status vocabulary including restart-pending and unschedulable. status is an open string; state remains the persisted lifecycle state." },
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" }
         },
@@ -702,7 +702,8 @@
           "custody_tainted": { "type": "boolean", "description": "True when the custody graph contains imported external bytes or a Custody export that may have placed bytes outside managed custody. An export the helper refused before touching the destination (managed_root_path, external_path_unconfined, external_root_unmounted, or external_path_crosses_mount) does not taint. Operator deletion attestation never clears it." },
           "custody_forks": { "type": "array", "items": { "$ref": "#/components/schemas/ComputerCustodyBranch" } },
           "storage_provenance": { "type": "array", "items": { "$ref": "#/components/schemas/StorageProvenance" } },
-          "custody_exports": { "type": "array", "items": { "type": "object" } }
+          "custody_exports": { "type": "array", "items": { "type": "object" } },
+          "next_cursor": { "type": "string", "description": "Opaque Computer-bound provenance cursor with insertion watermark; continue until absent." }
         }
       },
       "ComputerStorageCopyReceipt": {
@@ -833,6 +834,7 @@
         "required": ["backups"],
         "properties": {
           "backups": { "type": "array", "items": { "$ref": "#/components/schemas/Backup" } },
+          "next_cursor": { "type": "string", "description": "Opaque stable insertion-watermark continuation for this Computer, in creation-time and Backup-ID order. Mutable facts use a new Read snapshot for each page." },
           "last_operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome" },
           "operation": { "$ref": "#/components/schemas/ComputerBackupOperationOutcome", "description": "Present only when the request named a backup_id: that operation's own state." }
         }
@@ -1979,7 +1981,7 @@
         }
       },
       "Conflict": {
-        "description": "State, fence, lease, dispatch key, or idempotency conflict.",
+        "description": "State, fence, lease, dispatch key, or idempotency conflict. A Computer custody graph, its forks or its exports above 1000 entries return conflict, retryable=false, details.reason=storage_custody_limit; Storage provenance rows themselves are paged.",
         "headers": {
           "X-Request-Id": { "$ref": "#/components/headers/RequestId" },
           "X-L3-Request-Id": { "$ref": "#/components/headers/L3RequestId" }
@@ -2015,7 +2017,7 @@
         }
       },
       "Unavailable": {
-        "description": "L1 could not verify Fabric identity because lookup failed operationally: unavailable, retryable=true, details.reason=identity_unverifiable. Applies to every L1 authenticated protocol, including person, cancel, and attempt credentials. The cause is logged safely server-side and never included in the response. Safe log categories include issuing_fabric_unavailable for missing issuing Fabric configuration and identity_incomplete for missing stable peer identity fields; these are diagnostics only and do not change this response. Job/service views and attempt-credential resolution also return unavailable, retryable=true, details.reason=read_snapshot_admission_expired when snapshot checkout exceeds 200 ms, or read_snapshot_expired when the read transaction exceeds its separate 200 ms hard hold limit. The advisory hold target is 100 ms. Job creation/replay, desired-state, restart/replay, remove, forget and cancel project from one fresh snapshot after success: projection/acquisition/revalidation failure returns unavailable with details.reason=read_snapshot_post_change_failed, mutation_applied=true and job_id; the commit stands, including idempotent success. details.read_reason gives the underlying error code or snapshot availability reason; retryable is true only for snapshot availability errors. Retry a read; creation/restart retries retain the original replay key.",
+        "description": "L1 could not verify Fabric identity because lookup failed operationally: unavailable, retryable=true, details.reason=identity_unverifiable. Applies to every L1 authenticated protocol, including person, cancel, and attempt credentials. The cause is logged safely server-side and never included in the response. Safe log categories include issuing_fabric_unavailable for missing issuing Fabric configuration and identity_incomplete for missing stable peer identity fields; these are diagnostics only and do not change this response. Job/service and Computer views and attempt-credential resolution also return unavailable, retryable=true, details.reason=read_snapshot_admission_expired when snapshot checkout exceeds 200 ms, or read_snapshot_expired when the read transaction exceeds its separate 200 ms hard hold limit. The advisory hold target is 100 ms. Job creation/replay, desired-state, restart/replay, remove, forget and cancel project from one fresh snapshot after success: projection/acquisition/revalidation failure returns unavailable with details.reason=read_snapshot_post_change_failed, mutation_applied=true and job_id; the commit stands, including idempotent success. details.read_reason gives the underlying error code or snapshot availability reason; retryable is true only for snapshot availability errors. Retry a read; creation/restart retries retain the original replay key. Computer mutations likewise reload their view after the commit and report post-change failure with computer_id and mutation_applied=true. Applied submission changes retain receipts and notices by falling back to committed Computer authority when the post-change snapshot fails. Agent acknowledgement reloads use the main pool independently of operator snapshot admission.",
         "headers": {
           "X-Request-Id": { "$ref": "#/components/headers/RequestId" }
         },

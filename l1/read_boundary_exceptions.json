@@ -48,34 +48,16 @@
     "slice": "#752"
   },
   {
-    "site": "backups.go:*Store.ComputerBackupOperation | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "backups.go:*Store.ComputerBackupOperationForKey | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "backups.go:*Store.ListComputerBackups | s.db",
-    "count": 4,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
     "site": "backups.go:*Store.ListNodeComputerBackupDirectives | s.db",
     "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "backups.go:*Store.ListNodeComputerBackupPruneDirectives | s.db",
     "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "cancel.go:*Store.CancelJob | s.db",
@@ -90,16 +72,10 @@
     "slice": "#752"
   },
   {
-    "site": "computer_operator.go:*Server.getComputerForCaller | s.store.db",
+    "site": "computer_operator.go:*Store.withAgentReadSnapshot | s.db",
     "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "computer_operator.go:*Server.projectComputerForCaller | s.store.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent acknowledgement post-commit reload stays coherent on the main pool, independent of operator snapshot admission.",
+    "slice": "#752"
   },
   {
     "site": "computer_policy.go:*Store.AcknowledgeComputerPolicyInstallation | s.db",
@@ -108,58 +84,16 @@
     "slice": "#752"
   },
   {
-    "site": "computer_policy.go:*Store.GetComputerPolicyRevocation | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "computer_policy.go:*Store.GetComputerTakeoverAvailability | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
     "site": "computer_policy.go:*Store.IssueComputerPolicySnapshot | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
     "slice": "#752"
   },
   {
-    "site": "computer_policy.go:*Store.ListComputerGrants | s.db",
-    "count": 4,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "computer_policy.go:*Store.ListComputerPolicyAudit | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
     "site": "computer_policy.go:*Store.MutateComputerGrant | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
     "slice": "#752"
-  },
-  {
-    "site": "computer_policy.go:*Store.ResolvePersonComputerHandle | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "computer_policy.go:*Store.computerPolicyRevisionInstalled | s.db",
-    "count": 4,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "computer_submission.go:*Store.GetComputerSubmissionState | s.db",
-    "count": 3,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
   },
   {
     "site": "computer_submission.go:*Store.MutateComputerSubmission | s.db",
@@ -186,40 +120,10 @@
     "slice": "#752"
   },
   {
-    "site": "computer_takeover_audit.go:*Store.ListComputerTakeoverAudit | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "computer_takeover_audit.go:*Store.ListComputerTakeoverSessions | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "computer_takeover_audit.go:*Store.listComputerTakeoverAuditTail | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
     "site": "computers.go:*Store.CreateComputer | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
     "slice": "#752"
-  },
-  {
-    "site": "computers.go:*Store.GetComputer | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "computers.go:*Store.ListComputerIntents | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
   },
   {
     "site": "computers.go:*Store.RemoveComputer | s.db",
@@ -250,12 +154,6 @@
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
     "slice": "#752"
-  },
-  {
-    "site": "computers.go:*Store.listComputersForCaller | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
   },
   {
     "site": "computers.go:*Store.reimageComputer | s.db",
@@ -294,22 +192,10 @@
     "slice": "#752"
   },
   {
-    "site": "custody.go:*Store.GetComputerCustodyImport | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "custody.go:*Store.ListComputerCustodyExports | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
     "site": "custody.go:*Store.ListNodeComputerCustodyExportDirectives | s.db",
     "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "instance_keys.go:*Store.initializeInstanceKeys | s.db",
@@ -398,14 +284,14 @@
   {
     "site": "owed_revocations.go:*Store.listNodeOwedComputerRevocations | s.db",
     "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "owed_revocations.go:*Store.owedComputerRevocation | s.db",
     "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Authority-loss write-path read before external revocation; Computer client views read owed rows inside their snapshot.",
+    "slice": "#752"
   },
   {
     "site": "read_snapshot.go:*Store.beginWriteTransaction | s.db",
@@ -458,8 +344,8 @@
   {
     "site": "reimage_preflight.go:*Store.ListNodeComputerReimagePreflightDirectives | s.db",
     "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "removal.go:*Store.AcknowledgeServiceRemoval | s.db",
@@ -564,46 +450,16 @@
     "slice": "#752"
   },
   {
-    "site": "storage_copies.go:*Store.ComputerCloneOperation | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "storage_copies.go:*Store.ComputerCloneOperationForKey | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "storage_copies.go:*Store.ComputerRestoreOperation | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "storage_copies.go:*Store.ComputerRestoreOperationForKey | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "storage_copies.go:*Store.GetComputerWithCloneOperation | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
     "site": "storage_copies.go:*Store.ListNodeComputerRestoreRevocations | s.db",
     "count": 1,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "storage_copies.go:*Store.ListNodeComputerStorageCopyDirectives | s.db",
     "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "storage_copies.go:*Store.RecordComputerRestoreAuthorityRevoked | s.db",
@@ -630,16 +486,10 @@
     "slice": "#752"
   },
   {
-    "site": "storage_generations.go:*Store.ListComputerStorageGenerations | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
     "site": "storage_generations.go:*Store.ListNodeComputerStorageResetDirectives | s.db",
     "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "storage_generations.go:*Store.publishVerifiedComputerStorageReset | s.db",
@@ -668,14 +518,8 @@
   {
     "site": "storage_grow.go:*Store.ListNodeComputerStorageGrowDirectives | s.db",
     "count": 2,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
-  },
-  {
-    "site": "storage_provenance.go:*Store.ListComputerStorageProvenance | s.db",
-    "count": 3,
-    "reason": "legacy acquisition/use; migrate in #749",
-    "slice": "#749"
+    "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
+    "slice": "#752"
   },
   {
     "site": "store.go:*Store.AppendLogs | s.db",

@@ -17,6 +17,31 @@ import (
 // It grants neither SQL access nor mutation authority. Writes adapt their own
 // transaction, after replay checks, so decisions remain inside the write.
 type readModel interface {
+	computerBackupsPage(context.Context, string, string, string, int) (BackupList, error)
+	computerViewComputerBackupOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerBackupOperationOutcome, error)
+	computerViewComputerBackupOperation(ctx context.Context, computerID, backupID string) (ComputerBackupOperationOutcome, error)
+	computerViewComputerPolicyRevisionInstalled(ctx context.Context, revision int64, computerID string) (bool, error)
+	computerViewResolvePersonComputerHandle(ctx context.Context, identity fabric.Identity, handle string, administratorRequired bool) (ComputerHandleResolution, error)
+	computerViewGetComputerPolicyRevocation(ctx context.Context, identity fabric.Identity, revision int64, computerID, fabricID, userID string) (ComputerPolicyRevocation, error)
+	computerViewGetComputerTakeoverAvailability(ctx context.Context, identity fabric.Identity, computerID string) (ComputerTakeoverAvailability, error)
+	computerViewListComputerGrants(ctx context.Context, identity fabric.Identity, computerID string) (ComputerGrantList, error)
+	computerViewListComputerPolicyAudit(ctx context.Context, identity fabric.Identity, computerID, cursor string, limit int) (ComputerPolicyAuditList, error)
+	computerViewGetComputerSubmissionState(ctx context.Context, identity fabric.Identity, computerID string) (ComputerSubmissionState, error)
+	computerViewListComputerTakeoverAudit(ctx context.Context, identity fabric.Identity, computerID, cursor string, limit int, tail bool) (ComputerTakeoverAuditList, error)
+	computerViewListComputerTakeoverSessions(ctx context.Context, identity fabric.Identity, computerID string) (ComputerTakeoverSessionList, error)
+	computerViewListComputerTakeoverAuditTail(ctx context.Context, computerID string, limit int) (ComputerTakeoverAuditList, error)
+	computerViewListComputersForCaller(ctx context.Context, cursorValue string, limit int, actor *computerActionActor) (ComputerList, error)
+	computerViewListComputerIntents(ctx context.Context, computerID, cursorValue string, limit int) (ComputerIntentList, error)
+	computerViewGetComputer(ctx context.Context, computerID string) (Computer, error)
+	computerViewListComputerCustodyExports(ctx context.Context, computerID string) ([]ComputerCustodyExport, error)
+	computerViewGetComputerCustodyImport(ctx context.Context, importID string) (ComputerCustodyImportObservation, error)
+	computerViewComputerCloneOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerCloneOperation, error)
+	computerViewComputerRestoreOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerRestoreOperation, error)
+	computerViewComputerRestoreOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerRestoreOperation, error)
+	computerViewGetComputerWithCloneOperation(ctx context.Context, computerID string, operationRevision int64) (Computer, error)
+	computerViewComputerCloneOperationForKey(ctx context.Context, backupID, idempotencyKey string) (ComputerCloneOperation, error)
+	computerViewListComputerStorageGenerations(ctx context.Context, computerID string) (ComputerStorageGenerationList, error)
+	computerProvenancePage(context.Context, string, string, int) (ComputerStorageProvenance, error)
 	now() time.Time
 	caller() *serviceActionActor
 	validateCredential(context.Context, AttemptCredentialScope) error

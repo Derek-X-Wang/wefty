@@ -43,7 +43,7 @@ node placement facts load once per page. `current_attempt_id`, when present,
 names a member of that same answer's `attempts`. Collection membership is
 bounded by the insertion-watermark cursor; mutable facts use a fresh snapshot
 on each page request. The shared job projector supplies status, operator facts
-and attempts. Computers migrate in #749.
+and attempts. Computer views use the same door and status projector.
 
 Attempt-credential resolution reads its digest row and live authority together.
 Detail, jobs pages and child pages then revalidate live attempt, holding node,
@@ -68,7 +68,7 @@ resource; creation and restart retries must retain their original replay key.
 The marker means the mutation succeeded (including idempotent success); it
 does not promise that a replay applied a new change.
 
-The three public unavailable reasons are `read_snapshot_admission_expired`,
+Snapshot admission/hold and post-change unavailable reasons are `read_snapshot_admission_expired`,
 `read_snapshot_expired`, and `read_snapshot_post_change_failed`, published in
 OpenAPI's shared Unavailable response. These do not change refusal semantics
 for authorization or lifecycle decisions.
@@ -78,9 +78,12 @@ from the pinned clock. Their state filters apply the same thresholds before
 paging. The node memo and `nodeState` retain recorded state for decisions; a
 display projection never alters cached facts, expires attempts, or synthesizes
 conditions. Background reconciliation records those changes on its own cadence.
-Heartbeat cancel and removal directive reads stay on the main pool as #752
-agent-protocol exceptions, independent of operator snapshot admission, so
-operator read load can never fail a heartbeat.
+Heartbeat cancel, removal and Computer directive reads stay on the main pool as #752
+write-path agent-protocol exceptions, independent of operator snapshot admission, so
+operator read load can never fail a heartbeat. Computer agent acknowledgements
+also reload their committed Computer (and nested Backup, when present) through
+a coherent read-only transaction on the main pool, as #752 agent-protocol
+exceptions; operator admission cannot starve an acknowledgement after its write.
 
 The typed raw-pool guard in `l1/read_boundary_test.go` permits the write door
 and inventories production SQL pool and connection expressions, including
@@ -97,8 +100,10 @@ The jobs/service collection (`GET /v1/jobs`, with any class filter) now has a
 maximum page size of **250**, default 100. `GET /v1/jobs/{job_id}/children`
 has the same maximum and default. A request above the maximum is clamped to
 250: either listing may return fewer rows than `limit`, with `next_cursor`
-when more rows exist. Walking the cursor visits all selected rows. Other
-collections retain their 1000-row maximum. Pages are never divided across
+when more rows exist. Walking the cursor visits all selected rows. Computer
+and Backup listings also cap each projected page at 250 under the same soft
+cutoff, as described below. Other collections retain their 1000-row maximum.
+Pages are never divided across
 snapshots. The named `readSnapshotPageSoftLimit` is **60% of the hard hold
 limit (120 ms)**, measured with elapsed monotonic time from the transaction
 anchor, including clock sampling, authorization and membership selection.
@@ -157,3 +162,67 @@ wall-clock speed by default; `WEFTY_ENFORCE_READ_BUDGET=1` explicitly enforces
 the 100 ms target in the diagnostics. Functional listing tests can simulate a
 slow machine with `WEFTY_TEST_READ_PAGE_CUTOFF=1ns` (test binary only), and
 assert complete, duplicate-free walks for any returned page size.
+
+Computer detail and listing, intents, Storage generations and provenance,
+Backups and selected Backup operations, Custody exports/import observations,
+grants with their actual policy revision, policy audit and revocation,
+take-over sessions/audit, and submission authority use one Read snapshot per
+answer. Existence checks share the same moment as rows: a deleted Computer's
+intents return `not_found`, while a failure committed during an older snapshot
+cannot turn that snapshot's retained intents into an empty page. Computer
+`current_job.status` uses the job projector, including `restart-pending` and
+`unschedulable`; the persisted `state` remains unchanged. The CLI Computer table
+shows computed status. Node facts and the clock are shared across a Computer page.
+Computer listings accept limits up to 1000, but project at most 250 rows per
+page, stop at the adaptive cutoff, and resume through `next_cursor`.
+
+Every HTTP Computer mutation response reloads its authority, computed status,
+actions and named clone/restore observations from one post-commit snapshot.
+The Backup acknowledgement's nested Computer and Backup also share that moment.
+Backup, restore and clone operation header selectors are read in that same
+snapshot as the returned Computer. As for jobs, projection failure after success
+returns 503 `unavailable`,
+`reason=read_snapshot_post_change_failed`, `mutation_applied=true`, `computer_id`
+and `read_reason`. Only snapshot availability failures are retryable; retry a
+read, and retain the original replay key when retrying a mutation. Applied
+submission changes fall back to the committed Computer and its committed
+`submit_policy_revision` if their post-change snapshot fails. This fallback
+retains the in-hand `revoked` receipt or `revocation_notice`; its readiness and
+status are the committed authority projection, not a fresh observation. L3 count
+failure still yields null and revocation failure a notice: none can undo the commit.
+
+The Backup collection has a stable insertion watermark and `(created_ns,
+backup_id)` keyset cursor bound to its Computer. The first page fixes membership,
+even if later inserts have equal timestamps or the clock moves backwards.
+Default limit is 100, maximum 250, larger limits are clamped. The shared 120 ms
+soft cutoff stops before another row after at least one complete row and returns
+`next_cursor`; the 200 ms hard limit remains authoritative. Rows, copies,
+`last_operation` and an optional `backup_id`-selected `operation` all belong to
+that page's snapshot. Mutable observations are fresh on each continuation.
+The CLI walks pages to produce the complete inventory; that combined inventory
+contains separate observations per page. Backup-local provenance is bounded by
+the page's at most 250 Backups; it does not traverse the custody graph.
+
+The Storage provenance collection is paged with a stable insertion watermark
+and `(created_ns, provenance_id)` keyset cursor bound to its Computer. The first
+page fixes provenance-row membership even for later equal-time or backdated
+inserts. Default limit is 100, maximum 250 (clamped); the shared adaptive cutoff
+returns `next_cursor` after at least one complete row. Each continuation reads
+fresh Computer and custody facts. Custody taint covers the entire family,
+including imports outside the current provenance page. The CLI walks all pages
+and retains the existing complete-inventory output shape.
+
+The custody graph, custody forks and custody exports each support at most 1000
+entries. The explicit bounded recursive query and those result queries return
+at most 1001 entries to detect overflow. Overflow returns HTTP 409 `conflict`,
+`retryable=false`, `reason=storage_custody_limit`: this is a permanent supported-size
+refusal, not a snapshot availability failure. Nothing truncates custody facts or
+reports an incomplete family as untainted. The hard hold deadline independently
+bounds elapsed work. When this typed refusal prevents a provenance read, the CLI
+still prints Backups or the mutation result and adds `provenance_unavailable` in
+JSON (a corresponding notice in table output). A successful operation's wait
+observation remains successful; any prior operation failure keeps its verdict.
+
+Submission `inflight_count` carries `inflight_observation="run-ledger"`.
+L1 closes its snapshot before calling L3; the count is a separate observation
+and is not atomic with submission authority, readiness, status or policy revision.

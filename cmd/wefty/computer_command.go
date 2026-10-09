@@ -708,7 +708,7 @@ func writeComputersTable(writer io.Writer, computers []computerOperatorProjectio
 	for _, computer := range computers {
 		job := computer.CurrentJob
 		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			computer.ComputerID, computer.Name, computer.DesiredState, job.State,
+			computer.ComputerID, computer.Name, computer.DesiredState, job.Status,
 			computer.StorageID, computer.StorageGeneration, computer.IntentRevision, computer.AppliedRevision,
 			computer.ReconfigurationPhase, computer.CurrentJobID, valueOrNA(job.CurrentAttemptID),
 			valueOrNA(computer.BoundNodeID), int64PointerOrNA(computer.Capacity.RequestedMemoryBytes), computer.Capacity.RequestedDiskBytes, computer.BackupCap,

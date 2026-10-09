@@ -279,10 +279,20 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 }
 
 func (s *Store) ListComputerStorageGenerations(ctx context.Context, computerID string) (ComputerStorageGenerationList, error) {
+	var value ComputerStorageGenerationList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerStorageGenerations(ctx, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerStorageGenerations(ctx context.Context, computerID string) (ComputerStorageGenerationList, error) {
 	if strings.TrimSpace(computerID) == "" {
 		return ComputerStorageGenerationList{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT storage_id, storage_generation, disk_bytes, phase,
+	rows, err := r.q.QueryContext(ctx, `SELECT storage_id, storage_generation, disk_bytes, phase,
 		reset_revision, created_ns, retired_ns FROM computer_storage_generations
 		WHERE computer_id=? ORDER BY storage_generation`, computerID)
 	if err != nil {
@@ -314,7 +324,7 @@ func (s *Store) ListComputerStorageGenerations(ctx context.Context, computerID s
 	}
 	if len(result.Generations) == 0 {
 		var exists bool
-		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM computers WHERE computer_id=?)`, computerID).Scan(&exists); err != nil {
+		if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM computers WHERE computer_id=?)`, computerID).Scan(&exists); err != nil {
 			return ComputerStorageGenerationList{}, internalError(err, "read Computer Storage authority")
 		}
 		if !exists {

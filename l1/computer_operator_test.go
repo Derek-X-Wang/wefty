@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -376,19 +375,9 @@ func TestComputerListingQueryPlanSeeksPagingIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	source, err := os.ReadFile("computers.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Explain the production statement, including the original OR predicate in
-	// the red check, rather than independently spelling a better query here.
-	listing := string(source)[strings.Index(string(source), "func (s *Store) ListComputers("):]
-	marker := "rows, err := tx.QueryContext(ctx, `"
-	start := strings.Index(listing, marker)
-	if start < 0 {
-		t.Fatal("Computer listing query was not found")
-	}
-	query := strings.SplitN(listing[start+len(marker):], "`", 2)[0]
+	// Explain the statement called by the snapshot page, preserving the indexed-seek assertion.
+	query := operatorProductionQuery(t, "computers.go", "computerViewListComputersForCaller", "SELECT computer_id, created_ns FROM computers")
+
 	args := []any{1, "computer", 10}
 	if strings.Count(query, "?") == 4 {
 		args = []any{1, 1, "computer", 10}

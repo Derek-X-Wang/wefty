@@ -1292,3 +1292,32 @@ func TestQueuedCancelPublishesOutcomeAndRefusals(t *testing.T) {
 		t.Fatalf("outcome enum=%#v", outcome["enum"])
 	}
 }
+
+func TestReviewSubmissionInflightObservationEnum(t *testing.T) {
+	doc := readObject(t, "l1-client.v1.json")
+	// Both inline submission projections must constrain this discriminator.
+	var count int
+	var walk func(any)
+	walk = func(value any) {
+		switch value := value.(type) {
+		case map[string]any:
+			if property, ok := value["inflight_observation"].(map[string]any); ok {
+				count++
+				if !reflect.DeepEqual(property["enum"], []any{"run-ledger"}) {
+					t.Fatalf("inflight observation enum=%v", property["enum"])
+				}
+			}
+			for _, child := range value {
+				walk(child)
+			}
+		case []any:
+			for _, child := range value {
+				walk(child)
+			}
+		}
+	}
+	walk(doc)
+	if count != 2 {
+		t.Fatalf("submission projections=%d", count)
+	}
+}

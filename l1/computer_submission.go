@@ -46,8 +46,9 @@ type ComputerSubmissionState struct {
 	SubmitEnabled        bool   `json:"submit_enabled"`
 	SubmitIntentRevision int64  `json:"submit_intent_revision"`
 	SubmitMaxInflight    int    `json:"submit_max_inflight"`
-	// InflightCount is null only in the answer to an applied change whose
-	// run ledger could not be read after the commit.
+	// The run-ledger count is observed only after the L1 snapshot closes.
+	InflightObservation string `json:"inflight_observation"`
+	// InflightCount is null when an applied change's run ledger could not be read.
 	InflightCount   *int                   `json:"inflight_count"`
 	PolicyRevision  int64                  `json:"policy_revision"`
 	Ready           *bool                  `json:"ready"`
@@ -69,7 +70,7 @@ func projectComputerSubmissionState(computer Computer, policyRevision int64) Com
 	state := ComputerSubmissionState{
 		ComputerID: computer.ComputerID, SubmitEnabled: computer.SubmitEnabled,
 		SubmitIntentRevision: computer.SubmitIntentRevision, SubmitMaxInflight: computer.SubmitMaxInflight,
-		PolicyRevision: policyRevision, Status: computer.CurrentJob.Status,
+		PolicyRevision: policyRevision, Status: computer.CurrentJob.Status, InflightObservation: "run-ledger",
 	}
 	if computer.CurrentJob.ServiceJob != nil {
 		state.Ready = computer.CurrentJob.Ready
@@ -99,18 +100,28 @@ func ComputerPassUnavailable(lastFailure json.RawMessage) *contract.SpawnFailure
 }
 
 func (s *Store) GetComputerSubmissionState(ctx context.Context, identity fabric.Identity, computerID string) (ComputerSubmissionState, error) {
-	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
+	var value ComputerSubmissionState
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewGetComputerSubmissionState(ctx, identity, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewGetComputerSubmissionState(ctx context.Context, identity fabric.Identity, computerID string) (ComputerSubmissionState, error) {
+	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerSubmissionState{}, err
 	}
-	computer, err := readComputerAuthority(ctx, s.db, computerID, canonicalTime(s.clock.Now()))
+	computer, err := r.computerViewGetComputer(ctx, computerID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ComputerSubmissionState{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	}
 	if err != nil {
-		return ComputerSubmissionState{}, internalError(err, "read Computer submission state")
+		return ComputerSubmissionState{}, err
 	}
 	var policyRevision int64
-	if err := s.db.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&policyRevision); err != nil {
+	if err := r.q.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&policyRevision); err != nil {
 		return ComputerSubmissionState{}, internalError(err, "read Computer submission policy revision")
 	}
 	return projectComputerSubmissionState(computer, policyRevision), nil

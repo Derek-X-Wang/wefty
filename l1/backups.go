@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"time"
@@ -64,6 +66,7 @@ type BackupCopy struct {
 }
 
 type BackupList struct {
+	NextCursor    string                          `json:"next_cursor,omitempty"`
 	Backups       []Backup                        `json:"backups"`
 	LastOperation *ComputerBackupOperationOutcome `json:"last_operation,omitempty"`
 	// Operation is one specific Backup operation, named by the backup_id query
@@ -541,21 +544,41 @@ func readLastComputerBackupOperation(ctx context.Context, q queryer, computerID 
 // started. The key-to-operation binding is immutable, so a fresh call and any
 // later replay -- even after newer operations exist -- name the same one.
 func (s *Store) ComputerBackupOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerBackupOperationOutcome, error) {
-	row, err := readComputerBackupOperationByKey(ctx, s.db, computerID, strings.TrimSpace(idempotencyKey))
+	var value ComputerBackupOperationOutcome
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewComputerBackupOperationForKey(ctx, computerID, idempotencyKey)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewComputerBackupOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerBackupOperationOutcome, error) {
+	row, err := readComputerBackupOperationByKey(ctx, r.q, computerID, strings.TrimSpace(idempotencyKey))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ComputerBackupOperationOutcome{}, protocolError(contract.ErrorNotFound, "Computer Backup operation was not found")
 	}
 	if err != nil {
 		return ComputerBackupOperationOutcome{}, internalError(err, "read Computer Backup operation by key")
 	}
-	return s.ComputerBackupOperation(ctx, computerID, row.BackupID)
+	return r.computerViewComputerBackupOperation(ctx, computerID, row.BackupID)
 }
 
 // ComputerBackupOperation reads one Backup operation's own observed state.
 func (s *Store) ComputerBackupOperation(ctx context.Context, computerID, backupID string) (ComputerBackupOperationOutcome, error) {
+	var value ComputerBackupOperationOutcome
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewComputerBackupOperation(ctx, computerID, backupID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewComputerBackupOperation(ctx context.Context, computerID, backupID string) (ComputerBackupOperationOutcome, error) {
 	var outcome ComputerBackupOperationOutcome
 	var completedNS sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT operation_revision, backup_id, status, failure_code, completed_ns
+	err := r.q.QueryRowContext(ctx, `SELECT operation_revision, backup_id, status, failure_code, completed_ns
 		FROM computer_backup_operations WHERE computer_id=? AND backup_id=?`, computerID, backupID).Scan(
 		&outcome.OperationRevision, &outcome.BackupID, &outcome.Status, &outcome.FailureCode, &completedNS)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -627,41 +650,129 @@ func readBackup(ctx context.Context, q queryer, backupID string) (Backup, error)
 }
 
 func (s *Store) ListComputerBackups(ctx context.Context, computerID string) (BackupList, error) {
+	result := BackupList{Backups: []Backup{}}
+	cursor := ""
+	for {
+		page, err := s.ListComputerBackupsPage(ctx, computerID, cursor, "", DefaultJobPageLimit)
+		if err != nil {
+			return BackupList{}, err
+		}
+		result.Backups = append(result.Backups, page.Backups...)
+		result.LastOperation = page.LastOperation
+		if page.NextCursor == "" {
+			return result, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// ListComputerBackupsPage fixes collection membership at the first page's
+// insertion watermark. Mutable operation/copy state is observed anew per page.
+func (s *Store) ListComputerBackupsPage(ctx context.Context, computerID, cursor, backupID string, limit int) (BackupList, error) {
+	var page BackupList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		page, err = reads.computerBackupsPage(ctx, computerID, cursor, backupID, limit)
+		return err
+	})
+	return page, err
+}
+
+// backupCollectionCursor binds an opaque creation/ID cursor to its Computer
+// and monotonically assigned insertion watermark (including clock rollback).
+type backupCollectionCursor struct {
+	Version    int    `json:"v"`
+	ComputerID string `json:"computer_id"`
+	HighWater  int64  `json:"high_water"`
+	CreatedNS  int64  `json:"created_ns"`
+	BackupID   string `json:"backup_id"`
+}
+
+func (r *databaseReads) computerBackupsPage(ctx context.Context, computerID, value, backupID string, limit int) (BackupList, error) {
+	if limit < 1 {
+		return BackupList{}, protocolError(contract.ErrorInvalidRequest, "limit must be positive")
+	}
+	if limit > MaxJobListingPageLimit {
+		limit = MaxJobListingPageLimit
+	}
+	cursor := backupCollectionCursor{Version: 1, ComputerID: computerID}
+	if value != "" {
+		payload, err := base64.RawURLEncoding.DecodeString(value)
+		if err != nil {
+			return BackupList{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+		}
+		decoder := json.NewDecoder(strings.NewReader(string(payload)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&cursor); err != nil {
+			return BackupList{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid")
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) || cursor.Version != 1 || cursor.ComputerID != computerID || cursor.HighWater < 1 || cursor.BackupID == "" {
+			return BackupList{}, protocolError(contract.ErrorInvalidRequest, "cursor is invalid or for another Computer")
+		}
+	}
 	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM computers WHERE computer_id=?`, computerID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+	if err := r.q.QueryRowContext(ctx, `SELECT 1 FROM computers WHERE computer_id=?`, computerID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 		return BackupList{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	} else if err != nil {
 		return BackupList{}, internalError(err, "read Computer Backup owner")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT backup_id FROM backups WHERE computer_id=? ORDER BY created_ns, backup_id`, computerID)
+	if value == "" {
+		if err := r.q.QueryRowContext(ctx, `SELECT COALESCE(MAX(ordinal),0) FROM backup_listing_order`).Scan(&cursor.HighWater); err != nil {
+			return BackupList{}, internalError(err, "read Backup watermark")
+		}
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT b.backup_id, b.created_ns FROM backups b CROSS JOIN backup_listing_order o ON o.backup_id=b.backup_id
+ WHERE b.computer_id=? AND o.ordinal<=? AND (b.created_ns,b.backup_id)>(?,?) ORDER BY b.created_ns,b.backup_id LIMIT ?`, computerID, cursor.HighWater, cursor.CreatedNS, cursor.BackupID, limit+1)
 	if err != nil {
 		return BackupList{}, internalError(err, "list Computer Backups")
 	}
 	defer rows.Close()
-	ids := []string{}
+	type row struct {
+		id      string
+		created int64
+	}
+	listed := []row{}
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return BackupList{}, internalError(err, "scan Computer Backup")
+		var item row
+		if err := rows.Scan(&item.id, &item.created); err != nil {
+			return BackupList{}, err
 		}
-		ids = append(ids, id)
+		listed = append(listed, item)
 	}
 	if err := rows.Err(); err != nil {
-		return BackupList{}, internalError(err, "iterate Computer Backups")
+		return BackupList{}, err
 	}
-	list := BackupList{Backups: []Backup{}}
-	for _, id := range ids {
-		backup, err := readBackup(ctx, s.db, id)
+	if err := rows.Close(); err != nil {
+		return BackupList{}, err
+	}
+	observeRead(ctx, "computer_backups_ids")
+	page := BackupList{Backups: []Backup{}}
+	page.LastOperation, err = readLastComputerBackupOperation(ctx, r.q, computerID)
+	if err != nil {
+		return BackupList{}, err
+	}
+	if backupID != "" {
+		op, err := r.computerViewComputerBackupOperation(ctx, computerID, backupID)
+		if err != nil {
+			return BackupList{}, err
+		}
+		page.Operation = &op
+	}
+	for i, item := range listed {
+		if i == limit || (i > 0 && r.pageCutoffReached()) {
+			payload, _ := json.Marshal(cursor)
+			page.NextCursor = base64.RawURLEncoding.EncodeToString(payload)
+			break
+		}
+		backup, err := readBackup(ctx, r.q, item.id)
 		if err != nil {
 			return BackupList{}, internalError(err, "read Computer Backup")
 		}
-		list.Backups = append(list.Backups, backup)
+		page.Backups = append(page.Backups, backup)
+		cursor.CreatedNS = item.created
+		cursor.BackupID = item.id
 	}
-	list.LastOperation, err = readLastComputerBackupOperation(ctx, s.db, computerID)
-	if err != nil {
-		return BackupList{}, internalError(err, "read last Computer Backup operation")
-	}
-	return list, nil
+	return page, nil
 }
 
 func (s *Store) BeginComputerBackupPrune(ctx context.Context, computerID string, request ComputerBackupPruneRequest) (Backup, bool, error) {
