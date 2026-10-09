@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -410,22 +411,81 @@ func boundedL1Error(value contract.APIError) contract.APIError {
 	return value
 }
 
+const l1DetailsBytes = 4 << 10
+
 func boundedL1Details(value any) any {
+	details, _, _ := boundedL1DetailValue(value, l1DetailsBytes)
+	return details
+}
+
+// Count the encoded JSON, including delimiters and escaping, against one
+// shared budget. Containers keep a deterministic prefix; nested containers
+// use only the space left by their parent. Decoded non-string types survive.
+func boundedL1DetailValue(value any, budget int) (any, int, bool) {
 	switch value := value.(type) {
 	case string:
-		return boundedL1Evidence(value)
+		value = boundedL1Evidence(value)
+		encoded, _ := json.Marshal(value)
+		return value, len(encoded), len(encoded) <= budget
 	case map[string]any:
-		details := make(map[string]any, len(value))
-		for key, item := range value {
-			details[boundedL1Evidence(key)] = boundedL1Details(item)
+		if budget < 2 {
+			return nil, 0, false
 		}
-		return details
+		keys := make([]string, 0, len(value))
+		for key := range value {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		// reason is the only detail read by classifyL1Answer. Reserve it
+		// before optional evidence, including malformed non-string reasons.
+		if _, ok := value["reason"]; ok {
+			index := sort.SearchStrings(keys, "reason")
+			copy(keys[1:index+1], keys[:index])
+			keys[0] = "reason"
+		}
+		details := make(map[string]any)
+		size := 2 // braces
+		for _, key := range keys {
+			boundedKey := boundedL1Evidence(key)
+			if _, exists := details[boundedKey]; exists {
+				continue // first sorted original key wins a truncation collision
+			}
+			encodedKey, _ := json.Marshal(boundedKey)
+			overhead := len(encodedKey) + 1 // colon
+			if len(details) > 0 {
+				overhead++ // comma
+			}
+			item, itemSize, fits := boundedL1DetailValue(value[key], budget-size-overhead)
+			if !fits {
+				break
+			}
+			details[boundedKey] = item
+			size += overhead + itemSize
+		}
+		return details, size, true
 	case []any:
-		for i, item := range value {
-			value[i] = boundedL1Details(item)
+		if budget < 2 {
+			return nil, 0, false
 		}
+		items := make([]any, 0)
+		size := 2 // brackets
+		for _, item := range value {
+			overhead := 0
+			if len(items) > 0 {
+				overhead = 1 // comma
+			}
+			bounded, itemSize, fits := boundedL1DetailValue(item, budget-size-overhead)
+			if !fits {
+				break
+			}
+			items = append(items, bounded)
+			size += overhead + itemSize
+		}
+		return items, size, true
+	default:
+		encoded, err := json.Marshal(value)
+		return value, len(encoded), err == nil && len(encoded) <= budget
 	}
-	return value
 }
 
 // The ASCII marker occupies the last three of 128 runes. Iterate only far

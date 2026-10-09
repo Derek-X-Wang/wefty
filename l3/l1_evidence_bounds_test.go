@@ -352,3 +352,277 @@ func TestL3RelayedClassifiedL1EvidenceBounds(t *testing.T) {
 		}
 	}
 }
+
+func hugeL1Details() map[string]any {
+	details := make(map[string]any, 60001)
+	for i := 0; i < 60000; i++ {
+		details[fmt.Sprintf("detail-%05d", i)] = "short-evidence"
+	}
+	details["reason"] = "capacity_exhausted"
+	return details
+}
+
+func l1DetailsBody(t *testing.T, code contract.ErrorCode, details map[string]any) []byte {
+	t.Helper()
+	body, err := json.Marshal(contract.ErrorResponse{Error: contract.APIError{
+		Code: code, Message: "L1 error", Retryable: code == contract.ErrorUnavailable,
+		RequestID: "upstream-request", Details: details,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) > 2<<20 {
+		t.Fatalf("fixture exceeds the L1 read limit: %d bytes", len(body))
+	}
+	return body
+}
+
+func l1DetailsClient(body []byte, status int) *L1Client {
+	return &L1Client{operationTimeout: time.Second, client: &http.Client{Transport: recoveryRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(body))}, nil
+	})}}
+}
+
+func assertL1DetailsSize(t *testing.T, details map[string]any) []byte {
+	t.Helper()
+	encoded, err := json.Marshal(details)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Literal contract limit so the test cannot grow with a changed constant.
+	if len(encoded) > 4096 {
+		t.Fatalf("kept details = %d encoded bytes, want <= 4096", len(encoded))
+	}
+	return encoded
+}
+
+// Reproduce the wide-answer failure through the production client, reconciler,
+// dispatch_outbox persistence and HTTP writer, for retry and refusal answers.
+func TestDispatchL1DetailsSizeBound(t *testing.T) {
+	for _, tt := range []struct {
+		code   contract.ErrorCode
+		status int
+		kind   l1AnswerKind
+	}{
+		{contract.ErrorUnavailable, 503, l1Transient},
+		{contract.ErrorConflict, 409, l1WorkRefused},
+	} {
+		t.Run(string(tt.code), func(t *testing.T) {
+			h := newHoldHTTPHarness(t)
+			ctx := context.Background()
+			run := h.submit(inlineRunRequest("exit 0\n"), "wide-evidence")
+			body := l1DetailsBody(t, tt.code, hugeL1Details())
+			h.l1Client.client.Transport = l1DetailsClient(body, tt.status).client.Transport
+			_, seamErr := h.l1Client.SubmitJob(ctx, contract.JobSpec{})
+			answer := classifyL1Answer(seamErr)
+			if answer.Kind != tt.kind || answer.Reason != "capacity_exhausted" {
+				t.Fatalf("classification changed: kind=%d reason=%q", answer.Kind, answer.Reason)
+			}
+			var reported error
+			reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{OnError: func(err error) { reported = err }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			reconciler.reconcileAndReport(ctx)
+			if reported == nil {
+				t.Fatal("missing reported dispatch error")
+			}
+			var stored []byte
+			if err := h.l3Store.db.QueryRowContext(ctx, `SELECT last_error FROM dispatch_outbox WHERE run_id=?`, run.RunID).Scan(&stored); err != nil {
+				t.Fatal(err)
+			}
+			var protocol contract.APIError
+			if err := json.Unmarshal(stored, &protocol); err != nil {
+				t.Fatal(err)
+			}
+			kept := assertL1DetailsSize(t, protocol.Details)
+			if protocol.Details["reason"] != "capacity_exhausted" || protocol.Retryable != (tt.kind == l1Transient) {
+				t.Fatal("stored reason or retryability changed")
+			}
+			if !bytes.Equal(kept, assertL1DetailsSize(t, answer.Response.protocol.Details)) {
+				t.Fatal("stored details differ from bounded client evidence")
+			}
+			// reason sorts after all 60,000 optional keys, but survives the cap.
+			for i := 0; i < len(protocol.Details)-1; i++ {
+				if protocol.Details[fmt.Sprintf("detail-%05d", i)] != "short-evidence" {
+					t.Fatal("optional details did not retain a sorted prefix")
+				}
+			}
+			w := httptest.NewRecorder()
+			w.Header().Set("X-L3-Request-Id", "local-request")
+			writeError(w, reported)
+			var relayed contract.ErrorResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &relayed); err != nil {
+				t.Fatal(err)
+			}
+			if w.Code != tt.status || relayed.Error.Details["reason"] != "capacity_exhausted" || relayed.Error.Details["l3_request_id"] != "local-request" {
+				t.Fatal("relayed status, reason or local correlation changed")
+			}
+			delete(relayed.Error.Details, "l3_request_id")
+			if !bytes.Equal(kept, assertL1DetailsSize(t, relayed.Error.Details)) {
+				t.Fatal("relay lost bounded upstream details")
+			}
+			if len(stored) > 4096+512 || w.Body.Len() > 4096+512 {
+				t.Fatalf("envelopes exceeded cap plus metadata: stored=%d relayed=%d", len(stored), w.Body.Len())
+			}
+			t.Logf("input=%d kept=%d stored=%d relayed=%d bytes", len(body), len(kept), len(stored), w.Body.Len())
+		})
+	}
+}
+
+func TestL1DetailsSizeBound(t *testing.T) {
+	wide := hugeL1Details()
+	items := make([]any, 60000)
+	for i := range items {
+		items[i] = "short-evidence"
+	}
+	escaped := make(map[string]any, 1000)
+	for i := 0; i < 1000; i++ {
+		escaped[fmt.Sprintf("<%04d\x00界", i)] = strings.Repeat("\x00<界", 40)
+	}
+	for _, tt := range []struct {
+		name   string
+		code   contract.ErrorCode
+		status int
+		reason any
+		extra  any
+		kind   l1AnswerKind
+	}{
+		{"ledger hold", contract.ErrorUnavailable, 503, "identity_unverifiable", wide, l1LedgerNotAdmitted},
+		{"absence", contract.ErrorNotFound, 404, "missing", wide, l1AuthoritativeAbsence},
+		{"no route", contract.ErrorUnavailable, 503, "no_route", wide, l1ProtocolViolation},
+		{"malformed reason", contract.ErrorUnavailable, 503, false, wide, l1ProtocolViolation},
+		{"reason object", contract.ErrorUnavailable, 503, wide, nil, l1ProtocolViolation},
+		{"reason array", contract.ErrorUnavailable, 503, items, nil, l1ProtocolViolation},
+		{"nested array", contract.ErrorUnavailable, 503, "capacity_exhausted", items, l1Transient},
+		{"escaped Unicode", contract.ErrorUnavailable, 503, "capacity_exhausted", escaped, l1Transient},
+		{"escaped keys tiny values", contract.ErrorUnavailable, 503, "capacity_exhausted", escapeHeavyL1DetailKeys(), l1Transient},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			details := map[string]any{"reason": tt.reason, "aaa": tt.extra}
+			client := l1DetailsClient(l1DetailsBody(t, tt.code, details), tt.status)
+			_, err := client.GetJob(context.Background(), "job")
+			answer := classifyL1Answer(err)
+			if answer.Kind != tt.kind {
+				t.Fatalf("kind=%d want=%d", answer.Kind, tt.kind)
+			}
+			kept := answer.Response.protocol.Details
+			reason, exists := kept["reason"]
+			if !exists || fmt.Sprintf("%T", reason) != fmt.Sprintf("%T", tt.reason) {
+				t.Fatalf("classification reason lost or changed type: %T", reason)
+			}
+			if want, ok := tt.reason.(string); ok && reason != want {
+				t.Fatal("classification reason changed")
+			}
+			assertL1DetailsSize(t, kept)
+		})
+	}
+}
+
+func escapeHeavyL1DetailKeys() map[string]any {
+	details := make(map[string]any, 1000)
+	for i := 0; i < 1000; i++ {
+		details[fmt.Sprintf("\x00<>&%06d", i)] = ""
+	}
+	return details
+}
+
+func TestBoundedL1DetailValueEncodedSize(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		value any
+	}{
+		{"escaped keys tiny values", escapeHeavyL1DetailKeys()},
+		{"nested containers", map[string]any{
+			"reason": "capacity_exhausted",
+			"\x00<>&": []any{true, float64(7), nil, map[string]any{
+				"\x00<>&": strings.Repeat("\x00<>&界", 40),
+			}},
+		}},
+	} {
+		for _, budget := range []int{256, 4096} {
+			t.Run(fmt.Sprintf("%s/budget=%d", tt.name, budget), func(t *testing.T) {
+				out, size, fits := boundedL1DetailValue(tt.value, budget)
+				if !fits {
+					t.Fatal("container did not fit")
+				}
+				encoded, err := json.Marshal(out)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if size != len(encoded) {
+					t.Errorf("reported size = %d, encoded size = %d", size, len(encoded))
+				}
+				if len(encoded) > budget {
+					t.Errorf("encoded size = %d, budget = %d", len(encoded), budget)
+				}
+			})
+		}
+	}
+}
+
+func TestL1DetailsStopAtFirstMisfit(t *testing.T) {
+	// Thirty bounded ASCII strings fill most of the 4 KiB budget. The next
+	// string expands during JSON escaping and cannot fit, but the tiny item
+	// after it could fit if the client incorrectly skipped the misfit.
+	prefix := make([]any, 30)
+	for i := range prefix {
+		prefix[i] = strings.Repeat("x", 128)
+	}
+	misfit := strings.Repeat("\x00<>&", 32)
+	for _, container := range []string{"object", "array"} {
+		t.Run(container, func(t *testing.T) {
+			details := map[string]any{"a": prefix, "b": misfit, "z": ""}
+			if container == "array" {
+				details = map[string]any{"items": []any{prefix, misfit, ""}}
+			}
+			client := l1DetailsClient(l1DetailsBody(t, contract.ErrorUnavailable, details), 503)
+			_, err := client.GetJob(context.Background(), "job")
+			var protocol *Error
+			if !errors.As(err, &protocol) {
+				t.Fatalf("missing L1 error envelope: %v", err)
+			}
+			kept := protocol.Details
+			assertL1DetailsSize(t, kept)
+			var keptPrefix []any
+			if container == "object" {
+				if _, exists := kept["b"]; exists {
+					t.Error("misfit string was retained")
+				}
+				if _, exists := kept["z"]; exists {
+					t.Error("tiny later key was retained after the first misfit")
+				}
+				keptPrefix = kept["a"].([]any)
+			} else {
+				items := kept["items"].([]any)
+				if len(items) != 1 {
+					t.Errorf("kept %d array items, want only the prefix before the misfit", len(items))
+				}
+				keptPrefix = items[0].([]any)
+			}
+			if len(keptPrefix) != len(prefix) {
+				t.Errorf("kept %d prefix strings, want %d", len(keptPrefix), len(prefix))
+			}
+		})
+	}
+}
+
+func TestL1DetailKeyCollisionDeterministic(t *testing.T) {
+	prefix := strings.Repeat("界", 125)
+	first, second := prefix+"aaaa", prefix+"zzzz"
+	details := map[string]any{second: "second", first: "first"}
+	body := l1DetailsBody(t, contract.ErrorUnavailable, map[string]any{
+		"reason": "capacity_exhausted", "nested": []any{details},
+		first: "first", second: "second",
+	})
+	client := l1DetailsClient(body, 503)
+	for i := 0; i < 200; i++ {
+		_, err := client.GetJob(context.Background(), "job")
+		answer := classifyL1Answer(err)
+		kept := answer.Response.protocol.Details
+		nested := kept["nested"].([]any)[0].(map[string]any)
+		if kept[prefix+"..."] != "first" || nested[prefix+"..."] != "first" {
+			t.Fatalf("iteration %d: collision winner top=%v nested=%v, want first sorted key", i, kept[prefix+"..."], nested[prefix+"..."])
+		}
+	}
+}
