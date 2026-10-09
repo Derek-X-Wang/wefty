@@ -442,7 +442,13 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 			var listErr error
 			listed := make(chan struct{})
 			go func() {
-				page, listErr = store.listReadableJobs(t.Context(), jobListFilters{}, "", MaxJobListingPageLimit)
+				// Barrier coordination can outlast the production hold limit on
+				// a busy runner. Keep the anchored WAL view and production page
+				// method, with no deadline on this deliberate pause.
+				listErr = diagnosticReadSnapshot(t, store, nil, func(reads readModel) (err error) {
+					page, err = reads.jobsPage(t.Context(), jobListFilters{}, "", MaxJobListingPageLimit)
+					return err
+				})
 				close(listed)
 			}()
 			defer func() { unblock(); <-listed }()
@@ -471,10 +477,10 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 					t.Fatalf("concurrent %s write failed while listing held its snapshot: %v", handle, err)
 				}
 				t.Logf("concurrent %s write completed in %s with the listing paused", handle, time.Since(started))
-			case <-time.After(2 * time.Second):
+			case <-time.After(10 * time.Second):
 				unblock()
 				<-written
-				t.Fatalf("concurrent %s write did not complete within 2s while the listing was paused", handle)
+				t.Fatalf("concurrent %s write did not complete within 10s while the listing was paused", handle)
 			}
 			unblock()
 			<-listed

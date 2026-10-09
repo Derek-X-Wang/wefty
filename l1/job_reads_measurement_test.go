@@ -22,6 +22,7 @@ func TestJobReadSnapshotMeasureMaximumPage(t *testing.T) {
 				fixture = "latch"
 			}
 			h, _, seed, _ := jobProjectionFixture(t, fixture)
+			h.stopServer()
 			for i := 0; i < 1000; i++ {
 				spec := seed.Spec
 				spec.DispatchKey = fmt.Sprintf("page-measure-%04d", i)
@@ -134,6 +135,7 @@ func TestJobReadSnapshotMeasureChildrenPage(t *testing.T) {
 				fixture = "latch"
 			}
 			h, _, parent, _ := jobProjectionFixture(t, fixture)
+			h.stopServer()
 			for i := 0; i < 251; i++ {
 				spec := parent.Spec
 				spec.DispatchKey = fmt.Sprintf("child-measure-%04d", i)

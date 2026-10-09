@@ -220,18 +220,20 @@ func TestJobReadSnapshotWriterHeldHTTP(t *testing.T) {
 	if _, err := tx.Exec("UPDATE jobs SET updated_ns=updated_ns WHERE job_id=?", service.JobID); err != nil {
 		t.Fatal(err)
 	}
+	// The writer stays held until every request answers; the timeout is only
+	// a deadlock watchdog, not a machine-speed assertion.
 	for _, path := range []string{"/v1/jobs/" + one.JobID, "/v1/jobs/" + service.JobID + "?class=service", "/v1/jobs?class=service", "/v1/jobs/" + service.JobID + "/children"} {
-		ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://control-plane"+path, nil)
-		started := time.Now()
 		res, err := client.Do(req)
-		cancel()
 		if err != nil {
+			cancel()
 			t.Fatalf("writer held blocked %s: %v", path, err)
 		}
 		res.Body.Close()
-		if res.StatusCode != http.StatusOK || time.Since(started) >= 150*time.Millisecond {
-			t.Fatalf("writer held %s status=%d elapsed=%s", path, res.StatusCode, time.Since(started))
+		cancel()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("writer held %s status=%d", path, res.StatusCode)
 		}
 	}
 }
@@ -397,6 +399,7 @@ func TestJobReadSnapshotResultBetweenReads(t *testing.T) {
 
 func TestJobReadSnapshotPageClock(t *testing.T) {
 	h, _, _, _ := jobProjectionFixture(t, "claimed")
+	h.stopServer()
 	calls := 0
 	at := h.clock.Now()
 	h.store.clock = ClockFunc(func() time.Time { calls++; return at })

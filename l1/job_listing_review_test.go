@@ -144,6 +144,7 @@ func TestJobReadReviewPostChangeFailureReason(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			h.stopServer()
 			ctx := t.Context()
 			wantReason := string(contract.ErrorInternal)
 			switch failure {

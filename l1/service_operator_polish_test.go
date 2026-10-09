@@ -3,10 +3,8 @@ package l1
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -162,6 +160,7 @@ func TestChildListingSurvivesDeletedRow(t *testing.T) {
 			// SQLite is anchored before sampling the clock. Delete on another
 			// connection there: the snapshot must retain the Job and its attempt
 			// evidence. Exempt this fsync seam from projection timing.
+			h.stopServer()
 			oldClock := h.store.clock
 			deleted := false
 			h.store.clock = ClockFunc(func() time.Time {
@@ -207,6 +206,7 @@ func TestChildListingOperatorFactsSnapshot(t *testing.T) {
 	if _, err := h.store.db.Exec("UPDATE service_jobs SET desired_state='stopped', bound_node_id=? WHERE job_id=?", node.NodeID, child.JobID); err != nil {
 		t.Fatal(err)
 	}
+	h.stopServer()
 	oldClock := h.store.clock
 	changed := false
 	h.store.clock = ClockFunc(func() time.Time {
@@ -222,18 +222,20 @@ func TestChildListingOperatorFactsSnapshot(t *testing.T) {
 		return oldClock.Now()
 	})
 	defer func() { h.store.clock = oldClock }()
-	r := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+parent.JobID+"/children", nil)
-	r.SetPathValue("job_id", parent.JobID)
-	r = r.WithContext(context.WithValue(r.Context(), identityContextKey{}, fabric.Identity{Tags: []string{DefaultClientPrincipalTag}}))
-	w := httptest.NewRecorder()
-	h.server.listChildJobs(w, r)
+	// The injected writes synchronize the snapshot; their fsync time is not
+	// projection cost. Exercise the production page method without a deadline.
+	actor := &serviceActionActor{Identity: fabric.Identity{Tags: []string{DefaultClientPrincipalTag}}, ClientPrincipalTag: DefaultClientPrincipalTag}
 	var page JobList
-	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &page) != nil || len(page.Jobs) != 1 {
-		t.Fatalf("child snapshot=%d %s", w.Code, w.Body.String())
+	err = diagnosticReadSnapshot(t, h.store, actor, func(reads readModel) (err error) {
+		page, err = reads.childrenPage(t.Context(), parent.JobID, "", 100)
+		return err
+	})
+	if err != nil || len(page.Jobs) != 1 {
+		t.Fatalf("child snapshot=%+v err=%v", page, err)
 	}
 	facts := page.Jobs[0].ServiceOperatorFacts
 	if facts == nil || len(facts.AllowedActions) != 5 {
-		t.Fatalf("missing child operator facts: %s", w.Body.String())
+		t.Fatalf("missing child operator facts: %+v", page)
 	}
 	for _, action := range facts.AllowedActions {
 		if action.RefusedBecause != nil {
@@ -268,6 +270,7 @@ func TestChildListingDeletedBeforeOperatorProjection(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	h.stopServer()
 	oldClock := h.store.clock
 	calls := 0
 	h.store.clock = ClockFunc(func() time.Time { calls++; return oldClock.Now() })

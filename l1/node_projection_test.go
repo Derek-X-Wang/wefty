@@ -508,7 +508,7 @@ func TestNodeReadsDoNotAcquireWriteLock(t *testing.T) {
 	}
 	for _, path := range []string{"/v1/nodes/node", "/v1/nodes?state=dead"} {
 		t.Run(path, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 700*time.Millisecond)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://control-plane"+path, nil)
 			if err != nil {

@@ -245,6 +245,20 @@ type integrationHarness struct {
 	clients []*http.Client
 }
 
+// Reaching HTTP Accept proves Serve has completed initial reconciliation and
+// maintenance. A long ticker interval alone does not stop that initial pass
+// from racing fixtures that advance the domain clock before their first HTTP call.
+type harnessReadyListener struct {
+	net.Listener
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (l *harnessReadyListener) Accept() (net.Conn, error) {
+	l.once.Do(func() { close(l.ready) })
+	return l.Listener.Accept()
+}
+
 func newIntegrationHarness(t *testing.T, nodeTags map[string][]string) *integrationHarness {
 	t.Helper()
 	policies := make(map[string]NodePolicy, len(nodeTags))
@@ -310,20 +324,44 @@ func newIntegrationHarnessWithReconcileInterval(
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &integrationHarness{t: t, network: network, store: store, server: server, clock: clock, cancel: cancel, served: make(chan error, 1)}
-	go func() { h.served <- server.Serve(ctx, listener) }()
+	ready := make(chan struct{})
+	go func() { h.served <- server.Serve(ctx, &harnessReadyListener{Listener: listener, ready: ready}) }()
 	t.Cleanup(func() {
 		for _, client := range h.clients {
 			client.CloseIdleConnections()
 		}
-		cancel()
-		if err := <-h.served; err != nil {
-			t.Errorf("serve L1: %v", err)
-		}
+		h.stopServer()
 		if err := store.Close(); err != nil {
 			t.Errorf("close store: %v", err)
 		}
 	})
+	select {
+	case <-ready:
+	case err := <-h.served:
+		cancel()
+		h.served = nil
+		_ = listener.Close()
+		t.Fatalf("L1 stopped before accepting connections: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("L1 did not finish initial recovery")
+	}
 	return h
+}
+
+// stopServer joins Serve and its background loops while leaving the Store open.
+// Store-only and direct-handler tests can then replace the clock or count one
+// snapshot's reads without unrelated goroutines touching the instrumentation.
+// Cleanup calls this too, so stopping explicitly is safe.
+func (h *integrationHarness) stopServer() {
+	h.t.Helper()
+	if h.served == nil {
+		return
+	}
+	h.cancel()
+	if err := <-h.served; err != nil {
+		h.t.Errorf("serve L1: %v", err)
+	}
+	h.served = nil
 }
 
 func (h *integrationHarness) client(identity fabric.Identity) *http.Client {

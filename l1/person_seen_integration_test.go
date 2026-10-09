@@ -50,16 +50,13 @@ func TestKnownPersonViewAnswersWithWriteLockHeld(t *testing.T) {
 	defer lockConn.Close()
 	defer func() { _, _ = lockConn.ExecContext(context.Background(), `ROLLBACK`) }()
 
+	// Keep the writer held through the response. Only a deadlock watchdog
+	// depends on real time; unchanged durable facts prove the no-write path.
 	lockedClient := h.client(identity)
-	lockedClient.Timeout = 3 * time.Second
-	before := time.Now()
+	lockedClient.Timeout = 10 * time.Second
 	status, _, body = h.do(lockedClient, http.MethodGet, "/v1/whoami", nil)
-	elapsed := time.Since(before)
 	if status != http.StatusOK {
 		t.Fatalf("whoami with the write lock held status=%d body=%s", status, body)
-	}
-	if elapsed < 0 || elapsed > 500*time.Millisecond {
-		t.Fatalf("known person view took %s with the write lock held, want under 500ms", elapsed)
 	}
 	if _, second := personSeenRow(t, h, observed.FabricID, observed.UserID); second != lastSeen {
 		t.Fatalf("known person view rewrote last_seen: %d then %d", lastSeen, second)

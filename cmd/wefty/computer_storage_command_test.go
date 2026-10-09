@@ -240,32 +240,34 @@ func assertComputerStorageCLIAdversarialRows(t *testing.T) {
 		var exportBuffer bytes.Buffer
 		exportErr := execute(h.ctx, h.clients, true, []string{"services", "custody", "export",
 			h.computer.ComputerID, backups.Backups[0].BackupID, "--path", filepath.Join(t.TempDir(), "external"),
-			"--expect-current", "--idempotency-key", "export-before-bytes", "--wait", "2ms",
+			"--expect-current", "--idempotency-key", "export-before-bytes", "--wait", "1ns",
 			"--poll-interval", "1ms"}, &exportBuffer, &bytes.Buffer{})
 		var observationErr *storageObservationError
-		if !errors.As(exportErr, &observationErr) {
+		var timeoutErr *mutationWaitTimeoutError
+		if !errors.As(exportErr, &observationErr) || !errors.As(exportErr, &timeoutErr) {
 			t.Fatalf("Custody export wait error = %T %v", exportErr, exportErr)
 		}
 		exportJSON := exportBuffer.Bytes()
 		var exportOutput storageMutationOutput
-		if err := json.Unmarshal(exportJSON, &exportOutput); err != nil || exportOutput.CustodyExport == nil ||
-			!exportOutput.MutationApplied || exportOutput.CustodyExport.Status != "planned" ||
+		if err := json.Unmarshal(exportJSON, &exportOutput); err != nil || !exportOutput.MutationApplied ||
 			exportOutput.Observation == nil ||
 			exportOutput.Observation.Status != "failed" {
 			t.Fatalf("Custody export output = %s err=%v", exportJSON, err)
 		}
-		// A timed-out wait cannot start another provenance request. Verify
-		// export taint with a separate read before any attestation is made.
+		// The wait expires before an observation is guaranteed. Its output
+		// guarantees the committed mutation and failed observation, not an
+		// export record. Recover that record and its taint through backup list.
 		binary := buildWefty(t)
-		code, inventoryJSON := runWefty(t, binary, 3*time.Second, "--json", "--fabric=plain", "--plain-identity=operator",
+		code, inventoryJSON := runWefty(t, binary, 10*time.Second, "--json", "--fabric=plain", "--plain-identity=operator",
 			"--l1="+h.l1Address, "--l3=", "services", "backup", "list", h.computer.ComputerID)
 		var inventory computerBackupInventory
 		if err := json.Unmarshal([]byte(inventoryJSON), &inventory); err != nil || code != 0 ||
 			!inventory.CustodyTainted || len(inventory.CustodyExports) != 1 || len(inventory.Provenance) == 0 ||
-			inventory.CustodyExports[0].ExportID != exportOutput.CustodyExport.ExportID {
+			inventory.CustodyExports[0].ExportID == "" || inventory.CustodyExports[0].Status != "planned" ||
+			inventory.CustodyExports[0].BackupID != backups.Backups[0].BackupID {
 			t.Fatalf("Custody export recovery via backup list: exit=%d output=%s err=%v", code, inventoryJSON, err)
 		}
-		attestArgs := []string{"services", "custody", "attest", exportOutput.CustodyExport.ExportID,
+		attestArgs := []string{"services", "custody", "attest", inventory.CustodyExports[0].ExportID,
 			"--idempotency-key", "operator-attested-deleted"}
 		first := runStorageCLI(t, h.ctx, h.clients, true, attestArgs...)
 		var attested storageMutationOutput
