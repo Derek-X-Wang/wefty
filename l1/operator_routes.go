@@ -18,9 +18,12 @@ import (
 )
 
 const (
-	DefaultJobPageLimit  = 100
-	MaxJobPageLimit      = 250
-	MaxChildJobPageLimit = 1000
+	DefaultJobPageLimit = 100
+	// MaxJobPageLimit is the shared maximum for non-Job collections.
+	MaxJobPageLimit = 1000
+	// MaxJobListingPageLimit bounds Job projection work in one Read snapshot.
+	MaxJobListingPageLimit = 250
+	MaxChildJobPageLimit   = MaxJobListingPageLimit
 )
 
 type serviceJobCursor struct {
@@ -58,7 +61,18 @@ func parseJobLimit(value string) (int, error) {
 }
 
 func parseChildJobLimit(value string) (int, error) {
-	return parseReadJobLimit(value, MaxChildJobPageLimit)
+	return parseJobListingLimit(value)
+}
+
+func parseJobListingLimit(value string) (int, error) {
+	if value == "" {
+		return DefaultJobPageLimit, nil
+	}
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit < 1 {
+		return 0, protocolError(contract.ErrorInvalidRequest, "limit must be a positive integer")
+	}
+	return min(limit, MaxJobListingPageLimit), nil
 }
 
 func parseReadJobLimit(value string, maximum int) (int, error) {

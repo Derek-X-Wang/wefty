@@ -1509,10 +1509,14 @@ the store's default immediate writer lock. Detail and collection answers share o
 and snapshot across Job state, retained attempts, service status and actions.
 Child pages use that same door, so concurrent row deletion cannot break a
 selected page. Job collections retain membership/filter semantics with a
-measured maximum of 250 rows (default 100); child collections retain their
-1000-row maximum. Successful service changes project from one fresh snapshot
+measured maximum of 250 rows (default 100); child collections use the same
+maximum and default. Both clamp larger requested limits, so a page may return
+fewer rows than `limit`; `next_cursor` continues the walk when more rows exist.
+Successful service changes project from one fresh snapshot
 after commit; view failure returns documented `read_snapshot_post_change_failed`
-unavailable with `mutation_applied=true` and the commit stands
+unavailable with `mutation_applied=true`; `read_reason` identifies the underlying
+error code or snapshot reason, `retryable` is true only for snapshot availability
+errors, and the commit stands
 ([Read model](read-model.md)). For operator facts, ownership and failure evidence are read once
 per service; node capacity counts and removal roots are shared within each page snapshot.
 

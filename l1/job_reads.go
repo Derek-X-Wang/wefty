@@ -60,12 +60,16 @@ func (s *Server) writeChangedJob(w http.ResponseWriter, r *http.Request, job Job
 	projected, err := s.store.readJobResource(r.Context(), job.JobID, s.serviceActionActor(r), nil)
 	if err != nil {
 		details := map[string]any{"reason": "read_snapshot_post_change_failed", "mutation_applied": true, "job_id": job.JobID}
-		if api := apiErrorFromDecision(err); api != nil && api.Details != nil {
-			if reason, ok := api.Details["reason"]; ok {
+		details["read_reason"] = string(errorCode(err))
+		snapshotUnavailable := false
+		if api := apiErrorFromDecision(err); api != nil && api.Code == contract.ErrorUnavailable {
+			if reason, ok := api.Details["reason"].(string); ok && (reason == "read_snapshot_admission_expired" || reason == "read_snapshot_expired") {
 				details["read_reason"] = reason
+				snapshotUnavailable = true
 			}
 		}
-		writeError(w, protocolErrorWithDetails(contract.ErrorUnavailable, details, "job change committed but its view is unavailable"))
+		writeError(w, &Error{Code: contract.ErrorUnavailable, Details: details,
+			Message: "job change committed but its view is unavailable", notRetryable: !snapshotUnavailable})
 		return
 	}
 	writeJSON(w, status, redactJob(projected))

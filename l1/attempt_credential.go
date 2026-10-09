@@ -195,9 +195,10 @@ func (r *databaseReads) childrenPage(ctx context.Context, parentJobID, cursorVal
 	if strings.TrimSpace(parentJobID) == "" {
 		return JobList{}, protocolError(contract.ErrorInvalidRequest, "job_id is required")
 	}
-	if limit < 1 || limit > MaxChildJobPageLimit {
-		return JobList{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxChildJobPageLimit)
+	if limit < 1 {
+		return JobList{}, protocolError(contract.ErrorInvalidRequest, "limit must be positive")
 	}
+	limit = min(limit, MaxChildJobPageLimit)
 	cursor, err := decodeServiceJobCursor(cursorValue)
 	if err != nil {
 		return JobList{}, err

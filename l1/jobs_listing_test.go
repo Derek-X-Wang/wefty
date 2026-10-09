@@ -116,7 +116,7 @@ func TestJobsListingFiltersAreExact(t *testing.T) {
 func TestJobsListingRejectsInvalidSelectors(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
 	client := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
-	for _, query := range []string{"class=unknown", "class=service&class=one-shot", "class=", "kind=", "class=service&kind=", "state=restart-pending", "state=Queued", "submitter=other", "submitter=", "limit=0", "limit=1001", "limit=no", "limit=1&limit=2", "cursor=bad"} {
+	for _, query := range []string{"class=unknown", "class=service&class=one-shot", "class=", "kind=", "class=service&kind=", "state=restart-pending", "state=Queued", "submitter=other", "submitter=", "limit=0", "limit=no", "limit=1&limit=2", "cursor=bad"} {
 		t.Run(query, func(t *testing.T) {
 			status, _, body := h.do(client, http.MethodGet, "/v1/jobs?"+query, nil)
 			assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
@@ -395,7 +395,7 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 			defer unblock()
 			now := store.clock.Now()
 			// listReadableJobs reads its clock after selecting the IDs, before
-			// loading up to 1000 projections in the still-open transaction.
+			// loading a maximum page of projections in the still-open transaction.
 			store.clock = ClockFunc(func() time.Time {
 				select {
 				case <-entered:
@@ -409,7 +409,7 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 			var listErr error
 			listed := make(chan struct{})
 			go func() {
-				page, listErr = store.listReadableJobs(t.Context(), jobListFilters{}, "", MaxJobPageLimit)
+				page, listErr = store.listReadableJobs(t.Context(), jobListFilters{}, "", MaxJobListingPageLimit)
 				close(listed)
 			}()
 			defer func() { unblock(); <-listed }()
@@ -431,7 +431,7 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 				written <- err
 			}()
 			// The reader remains paused throughout this generous deadline. This
-			// tests lock ownership, not how fast the machine reads 1000 jobs.
+			// tests lock ownership, not how fast the machine reads a maximum page of jobs.
 			select {
 			case err := <-written:
 				if err != nil {
@@ -445,7 +445,7 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 			}
 			unblock()
 			<-listed
-			if listErr != nil || len(page.Jobs) != MaxJobPageLimit {
+			if listErr != nil || len(page.Jobs) != MaxJobListingPageLimit {
 				t.Fatalf("large page: jobs=%d err=%v", len(page.Jobs), listErr)
 			}
 			if page.Jobs[0].State != contract.JobQueued {

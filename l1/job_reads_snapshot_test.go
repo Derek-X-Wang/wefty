@@ -283,7 +283,7 @@ func TestJobReadSnapshotPostChangeFailureCommitStands(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if envelope.Error.Code != contract.ErrorUnavailable || !envelope.Error.Retryable || envelope.Error.Details["reason"] != "read_snapshot_post_change_failed" || envelope.Error.Details["mutation_applied"] != true {
+	if envelope.Error.Code != contract.ErrorUnavailable || envelope.Error.Retryable || envelope.Error.Details["read_reason"] != string(contract.ErrorInternal) || envelope.Error.Details["reason"] != "read_snapshot_post_change_failed" || envelope.Error.Details["mutation_applied"] != true {
 		t.Fatalf("undefined post-change failure: %s", w.Body.String())
 	}
 	var desired string
@@ -392,18 +392,6 @@ func TestJobReadSnapshotResultBetweenReads(t *testing.T) {
 	_, err := h.store.GetJobResult(t.Context(), job.JobID)
 	if errorCode(err) != contract.ErrorNotFound {
 		t.Fatalf("new attempt inherited result: %v", err)
-	}
-}
-
-func TestJobReadSnapshotListingPageLimit(t *testing.T) {
-	h, client, parent, _ := jobProjectionFixture(t, "claimed")
-	status, _, raw := h.do(client, http.MethodGet, "/v1/jobs?limit=251", nil)
-	if status != http.StatusBadRequest {
-		t.Fatalf("unmeasured page accepted: %d %s", status, raw)
-	}
-	status, _, raw = h.do(client, http.MethodGet, "/v1/jobs/"+parent.JobID+"/children?limit=1000", nil)
-	if status != http.StatusOK {
-		t.Fatalf("child page contract changed: %d %s", status, raw)
 	}
 }
 

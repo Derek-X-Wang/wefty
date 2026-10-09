@@ -58,10 +58,12 @@ successfully. They may therefore show a subsequent committed transition, but
 never combine the mutation's older Job with newer attempts or node facts.
 Projection runs outside the write transaction; response encoding runs outside
 the read transaction. If acquisition, revalidation or projection fails after
-success, the response is HTTP 503, `unavailable`, `retryable=true`, with
+success, the response is HTTP 503, `unavailable`, with
 `details.reason=read_snapshot_post_change_failed`, `mutation_applied=true`, and
-`job_id`. The commit stands. `details.read_reason`, when available, identifies
-the underlying snapshot expiry/admission refusal. Retry a read to observe the
+`job_id`. The commit stands. `details.read_reason` identifies the underlying
+error code (for example `unauthorized` for a dead credential or `internal` for
+a projection fault), or the snapshot expiry/admission reason. `retryable` is
+true only for snapshot availability errors. Retry a read to observe the
 resource; creation and restart retries must retain their original replay key.
 The marker means the mutation succeeded (including idempotent success); it
 does not promise that a replay applied a new change.
@@ -83,8 +85,12 @@ never widen an exception to admit a new legacy escape.
 ## Jobs page measurement (#748)
 
 The jobs/service collection (`GET /v1/jobs`, with any class filter) now has a
-maximum page size of **250**, default 100. Child collections retain their
-existing maximum 1000. Pages are never divided across snapshots.
+maximum page size of **250**, default 100. `GET /v1/jobs/{job_id}/children`
+has the same maximum and default. A request above the maximum is clamped to
+250: either listing may return fewer rows than `limit`, with `next_cursor`
+when more rows exist. Walking the cursor visits all selected rows. Other
+collections retain their 1000-row maximum. Pages are never divided across
+snapshots.
 
 On the owner's Mac, through the shared Go lock with CGO disabled, three idle
 samples of the production page projector (authenticated client actions,
@@ -108,3 +114,20 @@ membership batches inside the **same** transaction, clock and memo; diagnostics
 use no deadline to report full cost. Production pages retain the 200 ms hard
 limit. These are local idle measurements, not sustained-load proof: #752 sets
 the final cap from concurrent paging and secret-scrubbing evidence.
+
+The child-page diagnostic `TestJobReadSnapshotMeasureChildrenPage` measures
+250 service children with one retained attempt each, authenticated client
+projection, one pinned clock, and the production 200 ms hard hold limit.
+Three local idle samples per state on the same Mac measured the complete
+snapshot door (before checkout through rollback):
+
+| Child service rows | 250 rows |
+| --- | --- |
+| Queued, bound | 38.5–40.3 ms |
+| Queued, unbound | 38.8–39.3 ms |
+| Running, bound | 33.2–35.6 ms |
+| Failed, bound | 42.0–44.2 ms |
+
+Each fixture has 251 children and requests `limit=1000`; each answer contains
+250 children plus `next_cursor`, with exactly one clock sample. These are
+local idle measurements, not sustained-load proof.

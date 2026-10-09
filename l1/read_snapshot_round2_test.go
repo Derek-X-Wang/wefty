@@ -25,7 +25,7 @@ func TestJobListingProjectionQueryBudget(t *testing.T) {
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			h, _, original, _ := jobProjectionFixture(t, "claimed")
-			jobs := make([]Job, MaxJobPageLimit)
+			jobs := make([]Job, MaxJobListingPageLimit)
 			for i := range jobs {
 				spec := original.Spec
 				spec.DispatchKey = fmt.Sprintf("listing-%04d", i)
@@ -47,13 +47,13 @@ func TestJobListingProjectionQueryBudget(t *testing.T) {
 			if _, err := h.store.db.ExecContext(t.Context(), "UPDATE jobs SET state=?", scenario.state); err != nil {
 				t.Fatal(err)
 			}
-			// Exclude the seed so the actual listing contains exactly 1000 rows.
+			// Exclude the seed so the actual listing contains exactly the maximum page size.
 			if _, err := h.store.db.ExecContext(t.Context(), "DELETE FROM jobs WHERE job_id=?", original.JobID); err != nil {
 				t.Fatal(err)
 			}
 			started := time.Now()
-			page, err := h.store.listReadableJobsForCaller(t.Context(), jobListFilters{}, "", MaxJobPageLimit, nil)
-			if err != nil || len(page.Jobs) != MaxJobPageLimit {
+			page, err := h.store.listReadableJobsForCaller(t.Context(), jobListFilters{}, "", MaxJobListingPageLimit, nil)
+			if err != nil || len(page.Jobs) != MaxJobListingPageLimit {
 				t.Fatalf("listing: rows=%d err=%v", len(page.Jobs), err)
 			}
 			elapsed := time.Since(started)

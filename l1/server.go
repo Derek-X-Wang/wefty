@@ -2070,7 +2070,7 @@ func (s *Server) listJobs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	limit, err := parseJobLimit(r.URL.Query().Get("limit"))
+	limit, err := parseJobListingLimit(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, err)
 		return
