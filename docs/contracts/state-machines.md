@@ -733,9 +733,20 @@ data: L1 refuses person routes unless the operator explicitly enables
 `-allow-plain-person-identities`, and they must never be treated as production
 admin authority.
 
-Every successful person-route authentication records the stable
-`(FabricID, UserID)` plus latest device evidence in L1; `GET /v1/whoami` is the
-explicit touch route. A grant subject must have one of these authenticated
+Every person-route authentication checks the stable `(FabricID, UserID)` plus
+latest device evidence in L1; `GET /v1/whoami` is the explicit touch route.
+Only the check uses the read snapshot; recording happens on the write door,
+and mutation audit stays transactional. The record refresh is
+dirty-then-stale: a person view writes only when the observation is new, a
+recorded field changed, or the record is one hour old or older (a
+future-dated record counts as stale). A known, up-to-date person answers
+without writing and never waits on the write SQLite lock; a first request, a
+changed field, a stale or future-dated record, and a snapshot-unavailable
+fallback all record durably before answering. Snapshot unavailability falls
+back to writing the observation, counted and rate-limited-logged so the
+departure from write-free views stays visible, while a misplaced nested
+snapshot is a programming error that refuses without writing. A
+grant subject must have one of these authenticated
 person observations before receiving `view` or `control`. Machine principals
 are rejected before observation and are never inserted. Administrator
 membership remains exempt from this existence check so a misspelled bootstrap
@@ -1048,6 +1059,11 @@ For `kind=oci`, only the fenced, idempotent `Started` acknowledgement may move
 that transition.
 
 ## Node
+
+The table describes recorded transitions. Node list and detail views compute
+effective liveness from their Read snapshot's pinned clock without recording a
+transition; see [Node operator facts and guarded actions](#node-operator-facts-and-guarded-actions)
+for the distinction and the background reconciliation cadence.
 
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
@@ -1362,8 +1378,32 @@ ordering and authority rules.
 ## Node operator facts and guarded actions
 
 `GET /v1/nodes` and `GET /v1/nodes/{node_id}` return the same Node
-projection after reconciling node liveness and attempt expiry. `wefty nodes
-list` and `wefty nodes inspect NODE_ID` show these facts in table or JSON form:
+projection from one read-only Read snapshot and its pinned clock. Neither route
+runs cleanup, writes, or waits for the database write lock. `wefty nodes list`
+and `wefty nodes inspect NODE_ID` show these facts in table or JSON form.
+
+The view's `state` is **effective liveness**, distinct from the **recorded state**
+used for durable decisions. An `alive` Node becomes effectively `stale` at the
+stale heartbeat threshold. An `alive`, `stale`, or `draining` Node becomes
+effectively `dead` at the dead threshold, including equality. A draining Node
+stays draining before that threshold; a recorded dead Node stays dead until
+registration. State filters use this same effective liveness before pagination.
+Effective `dead`/`stale` is provisional, and a heartbeat accepted before
+reconciliation returns the Node to `alive`.
+Each page uses one snapshot and clock; subsequent pages observe their own moment.
+
+The background reconciler runs at startup and on its configured cadence
+(nominally one second; delayed under write contention). It records liveness
+transitions, expires attempts and records conditions independently of reads.
+A computed-dead view never performs
+or fabricates those durable consequences. Computer token proofs refuse a host
+on recorded dead state (independent of their other authority checks), and
+reconfiguration abort requires recorded dead state. Actions requiring recorded
+state stay unavailable until cleanup records it. Node operator intent actions
+remain independent of liveness. Drain and claims mutation responses report
+recorded state.
+
+The remaining Node facts retain their recorded meaning:
 
 - `active_attempts`: nonterminal persisted attempts (`claimed`, `running`,
   `awaiting-input`), ordered by creation time and attempt ID. Each includes

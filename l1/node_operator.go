@@ -103,20 +103,41 @@ func recordNodeCondition(ctx context.Context, tx *sql.Tx, nodeID, code, scope st
 // GetNode reads the same factual snapshot as the fleet listing. The route
 // computes allowed actions for its authenticated caller.
 func (s *Store) GetNode(ctx context.Context, nodeID string) (Node, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return Node{}, internalError(err, "begin node read")
+	var node Node
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		node, err = reads.node(ctx, nodeID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return protocolError(contract.ErrorNotFound, "node %q was not found", nodeID)
+		}
+		if err != nil {
+			return internalError(err, "read node")
+		}
+		node = s.nodeLiveness().project(node, reads.now())
+		return nil
+	})
+	return node, err
+}
+
+// nodeLiveness projects only display state. The cached Node and nodeState
+// remain recorded facts for enforcing decisions such as reconfiguration abort.
+type nodeLiveness struct {
+	staleAfter time.Duration
+	deadAfter  time.Duration
+}
+
+func (s *Store) nodeLiveness() nodeLiveness {
+	return nodeLiveness{staleAfter: s.nodeStaleAfter, deadAfter: s.nodeDeadAfter}
+}
+
+func (l nodeLiveness) project(node Node, now time.Time) Node {
+	switch node.State {
+	case contract.NodeAlive, contract.NodeStale, contract.NodeDraining:
+		if !node.LastHeartbeatAt.Add(l.deadAfter).After(now) {
+			node.State = contract.NodeDead
+		} else if node.State == contract.NodeAlive && !node.LastHeartbeatAt.Add(l.staleAfter).After(now) {
+			node.State = contract.NodeStale
+		}
 	}
-	defer tx.Rollback()
-	node, err := getNode(ctx, tx, nodeID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Node{}, protocolError(contract.ErrorNotFound, "node %q was not found", nodeID)
-	}
-	if err != nil {
-		return Node{}, internalError(err, "read node")
-	}
-	if err := tx.Commit(); err != nil {
-		return Node{}, internalError(err, "commit node read")
-	}
-	return node, nil
+	return node
 }

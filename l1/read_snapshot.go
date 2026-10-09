@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 )
 
 // readModel is the internal vocabulary shared by projections and decisions.
@@ -29,6 +30,8 @@ type readModel interface {
 	job(context.Context, string) (Job, error)
 	attempts(context.Context, string) ([]Attempt, error)
 	node(context.Context, string) (Node, error)
+	nodes(context.Context) ([]Node, error)
+	nodePage(context.Context, nodeListFilters, nodeListCursor, int, nodeLiveness) (NodeList, error)
 	nodeRoot(context.Context, string) (string, error)
 	nodeState(context.Context, string) (contract.NodeState, error)
 	requireStorage(context.Context, Computer, string) error
@@ -46,6 +49,11 @@ type readModel interface {
 	projectStatus(context.Context, Job) (Job, error)
 	serviceStatus(context.Context, Job) (Job, error)
 	queuedStatus(context.Context, Job) (Job, error)
+	person(context.Context, string, string) (AuthenticatedPerson, bool, error)
+	adminPolicy(context.Context) (AdminPolicy, error)
+	adminPolicyRevision(context.Context) (int64, error)
+	currentAdmin(context.Context, fabric.Identity) error
+	adminAuditPage(context.Context, int64, int) (AdminPolicyAuditList, error)
 }
 
 // databaseReads is private SQL plumbing; callers see only readModel.
@@ -320,6 +328,63 @@ func (r *databaseReads) availableBackup(ctx context.Context, id string) (Backup,
 func (r *databaseReads) intents(ctx context.Context, id string, after int64, limit int) ([]ComputerIntent, error) {
 	return queryComputerIntents(ctx, r.q, id, after, limit)
 }
+func (r *databaseReads) person(ctx context.Context, fabricID, userID string) (AuthenticatedPerson, bool, error) {
+	var person AuthenticatedPerson
+	var lastSeen int64
+	err := r.q.QueryRowContext(ctx, `SELECT fabric_id, user_id, last_device_id, last_seen_ns
+		FROM authenticated_people WHERE fabric_id=? AND user_id=?`, fabricID, userID).
+		Scan(&person.FabricID, &person.UserID, &person.DeviceID, &lastSeen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AuthenticatedPerson{}, false, nil
+	}
+	if err != nil {
+		return AuthenticatedPerson{}, false, internalError(err, "read authenticated person")
+	}
+	person.SeenAt = time.Unix(0, lastSeen).UTC()
+	return person, true, nil
+}
+func (r *databaseReads) adminPolicy(ctx context.Context) (AdminPolicy, error) {
+	return readAdminPolicy(ctx, r.q)
+}
+func (r *databaseReads) adminPolicyRevision(ctx context.Context) (int64, error) {
+	var revision int64
+	if err := r.q.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&revision); err != nil {
+		return 0, internalError(err, "read admin policy revision")
+	}
+	return revision, nil
+}
+func (r *databaseReads) currentAdmin(ctx context.Context, identity fabric.Identity) error {
+	return requireCurrentAdmin(ctx, r.q, identity)
+}
+func (r *databaseReads) adminAuditPage(ctx context.Context, afterRevision int64, limit int) (AdminPolicyAuditList, error) {
+	page := AdminPolicyAuditList{Entries: []AdminPolicyAudit{}}
+	rows, err := r.q.QueryContext(ctx, `SELECT revision, operation, actor_kind, actor_fabric_id,
+		actor_user_id, actor_device_id, subject_fabric_id, subject_user_id, created_ns FROM admin_policy_audit
+		WHERE revision>? ORDER BY revision LIMIT ?`, afterRevision, limit+1)
+	if err != nil {
+		return AdminPolicyAuditList{}, internalError(err, "list admin policy audit")
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var entry AdminPolicyAudit
+		var createdNS int64
+		if err := rows.Scan(&entry.Revision, &entry.Operation, &entry.ActorKind,
+			&entry.ActorFabricID, &entry.ActorUserID, &entry.ActorDeviceID,
+			&entry.SubjectFabricID, &entry.SubjectUserID, &createdNS); err != nil {
+			return AdminPolicyAuditList{}, internalError(err, "scan admin policy audit")
+		}
+		entry.CreatedAt = time.Unix(0, createdNS).UTC()
+		page.Entries = append(page.Entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return AdminPolicyAuditList{}, internalError(err, "read admin policy audit")
+	}
+	if len(page.Entries) > limit {
+		page.Entries = page.Entries[:limit]
+		page.NextCursor = encodeAdminAuditCursor(page.Entries[len(page.Entries)-1].Revision)
+	}
+	return page, nil
+}
 func (r *databaseReads) projectStatus(ctx context.Context, job Job) (Job, error) {
 	return projectJobStatus(ctx, r, job)
 }
@@ -354,6 +419,24 @@ func snapshotUnavailable(reason string, cause error) error {
 }
 
 func (s *Store) readSnapshotOverrunCount() uint64 { return s.readSnapshotOverruns.Load() }
+
+// Count every person-observation fallback write, but emit at most one
+// diagnostic per second per Store so a busy snapshot pool cannot flood logs.
+func (s *Store) recordPersonFallbackWrite() {
+	s.personObservationFallbacks.Add(1)
+	now := time.Now().UnixNano()
+	prior := s.personObservationFallbackLastLog.Load()
+	if now-prior < int64(time.Second) || !s.personObservationFallbackLastLog.CompareAndSwap(prior, now) {
+		return
+	}
+	if s.logf != nil {
+		s.logf("event=l1_person_observation_fallback count=%d", s.personObservationFallbacks.Load())
+	}
+}
+
+func (s *Store) personObservationFallbackCount() uint64 {
+	return s.personObservationFallbacks.Load()
+}
 
 // withReadSnapshot anchors SQLite before sampling the clock. The derived
 // context marks nested acquisition as a programming error. Independent reads
@@ -483,3 +566,14 @@ func (w *writeTransaction) decisionReads() readModel {
 }
 func (w *writeTransaction) commit() error   { return w.tx.Commit() }
 func (w *writeTransaction) rollback() error { return w.tx.Rollback() }
+
+// snapshotReadError keeps typed read-snapshot refusals (unavailable with a
+// read_snapshot_* reason) intact for the caller and labels only raw errors as
+// internal, so a busy read pool answers 503 rather than a scrubbed 500.
+func snapshotReadError(err error, message string) error {
+	var typed *Error
+	if errors.As(err, &typed) {
+		return err
+	}
+	return internalError(err, message)
+}

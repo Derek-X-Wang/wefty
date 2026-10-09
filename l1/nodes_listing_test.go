@@ -136,7 +136,7 @@ func TestNodesListingPlanAndReadSnapshot(t *testing.T) {
 						cursor.NodeID = "m"
 						cursor.Identity = "agent"
 					}
-					query, args := nodeListingQuery(nodeListFilters{State: state, ClaimsEnabled: claims, Capability: capability}, cursor, 1)
+					query, args := nodeListingQuery(nodeListFilters{State: state, ClaimsEnabled: claims, Capability: capability}, cursor, 1, h.clock.Now(), h.store.nodeLiveness())
 					rows, err := h.store.db.QueryContext(t.Context(), "EXPLAIN QUERY PLAN "+query, args...)
 					if err != nil {
 						t.Fatal(err)

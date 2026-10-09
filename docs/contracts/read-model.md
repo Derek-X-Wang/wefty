@@ -73,11 +73,20 @@ The three public unavailable reasons are `read_snapshot_admission_expired`,
 OpenAPI's shared Unavailable response. These do not change refusal semantics
 for authorization or lifecycle decisions.
 
+Node list and detail views (#750) use this door and project effective liveness
+from the pinned clock. Their state filters apply the same thresholds before
+paging. The node memo and `nodeState` retain recorded state for decisions; a
+display projection never alters cached facts, expires attempts, or synthesizes
+conditions. Background reconciliation records those changes on its own cadence.
+Heartbeat cancel and removal directive reads stay on the main pool as #752
+agent-protocol exceptions, independent of operator snapshot admission, so
+operator read load can never fail a heartbeat.
+
 The typed raw-pool guard in `l1/read_boundary_test.go` permits the write door
 and inventories production SQL pool and connection expressions, including
 aliases. `l1/read_boundary_exceptions.json` names each exact legacy use, count,
-reason and owning slice: #748 jobs/services, #749 Computers, #750 nodes,
-#751 person-seen, #752 legacy writes. The two door constructors and
+reason and owning slice: #748 jobs/services, #749 Computers,
+#751 person-seen, #752 legacy writes and agent-protocol heartbeat reads. The two door constructors and
 infrastructure use the permanent category. The guard also rejects `query_only`
 pragma strings outside `OpenStore`. Shrink entries as uses migrate;
 never widen an exception to admit a new legacy escape.

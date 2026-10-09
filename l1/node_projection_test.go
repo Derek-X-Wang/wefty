@@ -2,7 +2,6 @@ package l1
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -132,7 +131,9 @@ func TestNodeAllowedActionsMatchOperatorHTTP(t *testing.T) {
 }
 
 func TestNodeProjectionReportsAttemptsAndDurableCondition(t *testing.T) {
-	h := newIntegrationHarness(t, map[string][]string{"node": {"linux"}})
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, map[string]NodePolicy{
+		"node": DefaultNodePolicy("linux"),
+	}, true, time.Hour)
 	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
 	operator := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
 	node := h.register(agent, "node")
@@ -222,6 +223,7 @@ func TestNodeProjectionReportsAttemptsAndDurableCondition(t *testing.T) {
 			t.Fatalf("old attempt boot rewritten: %s", body)
 		}
 	}
+	lastRecorded := facts.LastCondition
 	h.clock.Advance(DefaultNodeDeadAfter)
 	status, _, body = h.do(operator, http.MethodGet, "/v1/nodes/node", nil)
 	if status != http.StatusOK {
@@ -230,8 +232,27 @@ func TestNodeProjectionReportsAttemptsAndDurableCondition(t *testing.T) {
 	if err := json.Unmarshal(body, &facts); err != nil {
 		t.Fatal(err)
 	}
-	if facts.ActiveAttempts == nil || len(facts.ActiveAttempts) != 0 || facts.LastCondition == nil || facts.LastCondition.Code != "node_dead" || facts.LastCondition.Scope != "node_liveness" {
-		t.Fatalf("expired attempt/dead condition: %s", body)
+	// Looking reports effective liveness, but leaves attempts and the last
+	// recorded condition alone until a cleanup pass records the transitions.
+	var effective Node
+	if err := json.Unmarshal(body, &effective); err != nil {
+		t.Fatal(err)
+	}
+	if effective.State != contract.NodeDead || len(facts.ActiveAttempts) != 2 || facts.LastCondition == nil || facts.LastCondition.Code != lastRecorded.Code || !facts.LastCondition.Since.Equal(lastRecorded.Since) {
+		t.Fatalf("view fabricated recorded consequences: %s", body)
+	}
+	if result, err := h.store.Reconcile(t.Context()); err != nil || result.DeadNodes != 1 || result.ExpiredAttempts != 2 {
+		t.Fatalf("cleanup result=%#v err=%v", result, err)
+	}
+	status, _, body = h.do(operator, http.MethodGet, "/v1/nodes/node", nil)
+	if status != http.StatusOK {
+		t.Fatalf("reconciled detail status=%d body=%s", status, body)
+	}
+	if err := json.Unmarshal(body, &facts); err != nil {
+		t.Fatal(err)
+	}
+	if facts.ActiveAttempts == nil || len(facts.ActiveAttempts) != 0 || facts.LastCondition == nil || facts.LastCondition.Code != "node_dead" || facts.LastCondition.Scope != "node_liveness" || !facts.LastCondition.Since.Equal(h.clock.Now()) {
+		t.Fatalf("cleanup did not record attempt expiry/dead condition: %s", body)
 	}
 	status, _, body = h.do(operator, http.MethodGet, "/v1/nodes/missing", nil)
 	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
@@ -467,37 +488,63 @@ func TestAgentNodeActionsRefuseOperatorProtocol(t *testing.T) {
 }
 
 func TestNodeReadsDoNotAcquireWriteLock(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "read-lock.sqlite"), StoreOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	_, err = store.RegisterNode(t.Context(), fabric.Identity{NodeID: "agent"}, contract.NodeRegistration{NodeID: "node", BootSessionID: "boot", OS: "linux", Architecture: "arm64", AgentVersion: "test", Capabilities: map[string]bool{"kind:process": true}}, NodePolicy{}, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tx, err := store.db.BeginTx(t.Context(), &sql.TxOptions{})
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, map[string]NodePolicy{
+		"node": DefaultNodePolicy("linux"),
+	}, true, time.Hour)
+	agent := h.client(fabric.Identity{NodeID: "agent", Tags: []string{DefaultAgentPrincipalTag}})
+	operator := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+	node := h.register(agent, "node")
+	h.clock.Advance(DefaultNodeDeadAfter)
+	tx, err := h.store.db.BeginTx(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	for _, path := range []string{"detail", "list"} {
+	// An uncommitted change also proves the HTTP response reads a separate
+	// committed snapshot. The real handler includes Fabric authentication and
+	// principal middleware; calling Store methods alone misses route writes.
+	if _, err := tx.ExecContext(t.Context(), "UPDATE nodes SET intent_revision=99 WHERE node_id='node'"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/v1/nodes/node", "/v1/nodes?state=dead"} {
 		t.Run(path, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 700*time.Millisecond)
 			defer cancel()
-			start := time.Now()
-			if path == "detail" {
-				_, err = store.GetNode(ctx, "node")
-			} else {
-				_, err = store.ListNodes(ctx)
-			}
+			request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://control-plane"+path, nil)
 			if err != nil {
-				t.Fatalf("read waited for writer (%s): %v", time.Since(start), err)
+				t.Fatal(err)
 			}
-			if ctx.Err() != nil {
-				t.Fatalf("read exceeded deadline: %s", time.Since(start))
+			response, err := operator.Do(request)
+			if err != nil {
+				t.Fatalf("HTTP read waited for writer: %v", err)
+			}
+			defer response.Body.Close()
+			var got Node
+			if path == "/v1/nodes/node" {
+				err = json.NewDecoder(response.Body).Decode(&got)
+			} else {
+				var page NodeList
+				err = json.NewDecoder(response.Body).Decode(&page)
+				if len(page.Nodes) != 1 {
+					t.Fatalf("locked list returned %#v, status=%d", page, response.StatusCode)
+				}
+				got = page.Nodes[0]
+			}
+			if err != nil || response.StatusCode != http.StatusOK || ctx.Err() != nil || got.State != contract.NodeDead || got.IntentRevision != node.IntentRevision || len(got.AllowedActions) != 2 {
+				t.Fatalf("locked HTTP read: node=%#v err=%v status=%d context=%v", got, err, response.StatusCode, ctx.Err())
 			}
 		})
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var recorded contract.NodeState
+	var revision int64
+	if err := h.store.db.QueryRow("SELECT state, intent_revision FROM nodes WHERE node_id='node'").Scan(&recorded, &revision); err != nil {
+		t.Fatal(err)
+	}
+	if recorded != contract.NodeAlive || revision != node.IntentRevision {
+		t.Fatalf("HTTP reads wrote facts: state=%s revision=%d", recorded, revision)
 	}
 }
 

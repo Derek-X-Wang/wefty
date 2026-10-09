@@ -683,10 +683,6 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if _, err := s.store.Reconcile(r.Context()); err != nil {
-		writeError(w, err)
-		return
-	}
 	page, err := s.store.listNodesPage(r.Context(), filters, r.URL.Query().Get("cursor"), limit)
 	if err != nil {
 		writeError(w, err)
@@ -699,10 +695,6 @@ func (s *Server) listNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getNode(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.store.Reconcile(r.Context()); err != nil {
-		writeError(w, err)
-		return
-	}
 	node, err := s.store.GetNode(r.Context(), r.PathValue("node_id"))
 	if err != nil {
 		writeError(w, err)
