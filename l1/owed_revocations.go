@@ -102,12 +102,9 @@ const (
 	owedRevocationWriteMargin = 50 * time.Millisecond
 )
 
-// sqlSession is what owed-revocation writes run against: the main pool, or
-// the settlement handle.
-type sqlSession interface {
-	BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}
+// writeTransactionBegin selects the write door, preserving the heartbeat's
+// shorter SQLite lock wait without passing raw database pools to callers.
+type writeTransactionBegin func(context.Context, *serviceActionActor, ...time.Time) (*writeTransaction, error)
 
 // owedRevocationWriteBudget admits heartbeat settlement writes while enough
 // of the heartbeat's budget is left for one full lock wait.
@@ -310,13 +307,14 @@ func (s *Store) listNodeOwedComputerRevocations(ctx context.Context, nodeID stri
 // settleOwedRevocationTx runs one settlement write against an unsettled row.
 // It reports false, writing nothing, when a concurrent settlement already
 // closed the row: that earlier settlement's record stands.
-func (s *Store) settleOwedRevocationTx(ctx context.Context, session sqlSession, revocationID int64,
+func (s *Store) settleOwedRevocationTx(ctx context.Context, begin writeTransactionBegin, revocationID int64,
 	settle func(*sql.Tx, owedRevocationRow, int64) error) (bool, error) {
-	tx, err := session.BeginTx(ctx, nil)
+	write, err := begin(ctx, nil)
 	if err != nil {
 		return false, internalError(err, "begin owed Computer revocation settlement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	row, err := scanOwedRevocation(tx.QueryRowContext(ctx, `SELECT `+owedRevocationColumns+`
 		FROM computer_owed_revocations WHERE revocation_id=?`, revocationID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -356,7 +354,7 @@ func closeOwedRevocation(ctx context.Context, tx *sql.Tx, revocationID int64, se
 // a handler sent right after a Computer-wide row's mutation committed.
 func (s *Store) SettleOwedComputerRevocationRevokeAll(ctx context.Context, revocationID int64,
 	receipt contract.ComputerTokenRevocationReceipt) (bool, error) {
-	return s.settleOwedRevocationTx(ctx, s.db, revocationID, func(tx *sql.Tx, row owedRevocationRow, nowNS int64) error {
+	return s.settleOwedRevocationTx(ctx, s.beginWriteTransaction, revocationID, func(tx *sql.Tx, row owedRevocationRow, nowNS int64) error {
 		if row.owed.Scope != ComputerRevocationScopeRevokeAll || receipt.ComputerID != row.owed.ComputerID ||
 			receipt.ComputerAttemptID != "" || receipt.RestoreOperationRevision != 0 || receipt.CommittedAt.IsZero() {
 			return errors.New("the run ledger's receipt does not match the owed Computer-wide revocation")
@@ -372,13 +370,13 @@ func (s *Store) SettleOwedComputerRevocationRevokeAll(ctx context.Context, revoc
 // never reaches beyond the attempts the mutation ended.
 func (s *Store) RecordOwedComputerAttemptRevocations(ctx context.Context, revocationID int64,
 	receipts []contract.ComputerTokenRevocationReceipt) (bool, error) {
-	return s.recordOwedComputerAttemptRevocations(ctx, s.db, revocationID, receipts)
+	return s.recordOwedComputerAttemptRevocations(ctx, s.beginWriteTransaction, revocationID, receipts)
 }
 
-func (s *Store) recordOwedComputerAttemptRevocations(ctx context.Context, session sqlSession, revocationID int64,
+func (s *Store) recordOwedComputerAttemptRevocations(ctx context.Context, begin writeTransactionBegin, revocationID int64,
 	receipts []contract.ComputerTokenRevocationReceipt) (bool, error) {
 	settled := false
-	_, err := s.settleOwedRevocationTx(ctx, session, revocationID, func(tx *sql.Tx, row owedRevocationRow, nowNS int64) error {
+	_, err := s.settleOwedRevocationTx(ctx, begin, revocationID, func(tx *sql.Tx, row owedRevocationRow, nowNS int64) error {
 		merged := slices.Clone(row.receipts)
 		for _, receipt := range receipts {
 			if receipt.ComputerID != row.owed.ComputerID || receipt.RestoreOperationRevision != 0 || receipt.CommittedAt.IsZero() ||
@@ -429,11 +427,11 @@ func (s *Store) recordOwedComputerAttemptRevocations(ctx context.Context, sessio
 // Computer passes, so there is nothing to revoke and nothing to wait for; the
 // row says so rather than staying owed forever.
 func (s *Store) SettleOwedComputerRevocationWithoutRunLedger(ctx context.Context, revocationID int64) (bool, error) {
-	return s.settleOwedComputerRevocationWithoutRunLedger(ctx, s.db, revocationID)
+	return s.settleOwedComputerRevocationWithoutRunLedger(ctx, s.beginWriteTransaction, revocationID)
 }
 
-func (s *Store) settleOwedComputerRevocationWithoutRunLedger(ctx context.Context, session sqlSession, revocationID int64) (bool, error) {
-	return s.settleOwedRevocationTx(ctx, session, revocationID, func(tx *sql.Tx, _ owedRevocationRow, nowNS int64) error {
+func (s *Store) settleOwedComputerRevocationWithoutRunLedger(ctx context.Context, begin writeTransactionBegin, revocationID int64) (bool, error) {
+	return s.settleOwedRevocationTx(ctx, begin, revocationID, func(tx *sql.Tx, _ owedRevocationRow, nowNS int64) error {
 		return closeOwedRevocation(ctx, tx, revocationID, owedRevocationSettledNoRunLedger, nil, nowNS)
 	})
 }
@@ -441,19 +439,28 @@ func (s *Store) settleOwedComputerRevocationWithoutRunLedger(ctx context.Context
 // RecordOwedComputerRevocationFailure notes why a settlement attempt did not
 // land, for the operator reading the Computer. The row stays owed.
 func (s *Store) RecordOwedComputerRevocationFailure(ctx context.Context, revocationID int64, cause string) error {
-	return s.recordOwedComputerRevocationFailure(ctx, s.db, revocationID, cause)
+	return s.recordOwedComputerRevocationFailure(ctx, s.beginWriteTransaction, revocationID, cause)
 }
 
-func (s *Store) recordOwedComputerRevocationFailure(ctx context.Context, session sqlSession, revocationID int64, cause string) error {
+func (s *Store) recordOwedComputerRevocationFailure(ctx context.Context, begin writeTransactionBegin, revocationID int64, cause string) error {
 	if len(cause) > maxOwedRevocationFailureBytes {
 		cause = cause[:maxOwedRevocationFailureBytes]
 		for !utf8.ValidString(cause) {
 			cause = cause[:len(cause)-1]
 		}
 	}
-	if _, err := session.ExecContext(ctx, `UPDATE computer_owed_revocations
+	now := canonicalTime(s.clock.Now())
+	write, err := begin(ctx, nil, now)
+	if err != nil {
+		return internalError(err, "record owed Computer revocation failure")
+	}
+	defer write.rollback()
+	if _, err := write.tx.ExecContext(ctx, `UPDATE computer_owed_revocations
 		SET settle_failures=settle_failures+1, last_failure=?, last_failure_ns=?
-		WHERE revocation_id=? AND settled_ns IS NULL`, cause, canonicalTime(s.clock.Now()).UnixNano(), revocationID); err != nil {
+		WHERE revocation_id=? AND settled_ns IS NULL`, cause, now.UnixNano(), revocationID); err != nil {
+		return internalError(err, "record owed Computer revocation failure")
+	}
+	if err := write.commit(); err != nil {
 		return internalError(err, "record owed Computer revocation failure")
 	}
 	return nil

@@ -226,11 +226,12 @@ func (s *Store) BeginComputerBackup(ctx context.Context, computerID string, requ
 		return Computer{}, false, internalError(err, "encode Computer Backup request")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "begin Computer Backup")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -397,11 +398,12 @@ func (s *Store) AcknowledgeComputerBackup(ctx context.Context, identityNodeID, c
 		return Backup{}, Computer{}, internalError(err, "encode Computer Backup acknowledgement")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Backup{}, Computer{}, internalError(err, "begin Computer Backup acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Backup{}, Computer{}, err
 	}
@@ -790,11 +792,12 @@ func (s *Store) BeginComputerBackupPrune(ctx context.Context, computerID string,
 		return Backup{}, false, internalError(err, "encode Computer Backup prune")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Backup{}, false, internalError(err, "begin Computer Backup prune")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Backup{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -913,11 +916,12 @@ func (s *Store) AcknowledgeComputerBackupPrune(ctx context.Context, identityNode
 		return Backup{}, internalError(err, "encode Computer Backup copy removal acknowledgement")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Backup{}, internalError(err, "begin Computer Backup prune acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Backup{}, err
 	}

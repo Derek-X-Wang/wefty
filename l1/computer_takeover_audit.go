@@ -61,11 +61,12 @@ func (s *Store) AppendComputerTakeoverAudit(
 	if err != nil {
 		return ComputerTakeoverAuditReceipt{}, internalError(err, "hash Computer take-over audit event")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return ComputerTakeoverAuditReceipt{}, internalError(err, "begin Computer take-over audit append")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return ComputerTakeoverAuditReceipt{}, err

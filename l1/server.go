@@ -1925,13 +1925,13 @@ func (s *Server) recordOwedRevocationSettlements(ctx context.Context, settlement
 // when the write budget ran out before the row's writes were done.
 func (s *Server) recordOwedRevocationSettlement(ctx context.Context, budget *owedRevocationWriteBudget,
 	settlement owedRevocationSettlement, answers []revocationAnswer) bool {
-	session := s.store.settlementDB
+	begin := s.store.beginSettlementWriteTransaction
 	revocationID := settlement.row.owed.RevocationID
 	if s.computerTokenRevoker == nil {
 		if !budget.allow() {
 			return false
 		}
-		if _, err := s.store.settleOwedComputerRevocationWithoutRunLedger(ctx, session, revocationID); err != nil {
+		if _, err := s.store.settleOwedComputerRevocationWithoutRunLedger(ctx, begin, revocationID); err != nil {
 			s.logOwedRevocationDeferred(settlement.row.owed, err)
 		}
 		return true
@@ -1950,7 +1950,7 @@ func (s *Server) recordOwedRevocationSettlement(ctx context.Context, budget *owe
 		if !budget.allow() {
 			return false
 		}
-		if _, err := s.store.recordOwedComputerAttemptRevocations(ctx, session, revocationID, receipts); err != nil {
+		if _, err := s.store.recordOwedComputerAttemptRevocations(ctx, begin, revocationID, receipts); err != nil {
 			failure = errors.Join(failure, err)
 		}
 	}
@@ -1959,7 +1959,7 @@ func (s *Server) recordOwedRevocationSettlement(ctx context.Context, budget *owe
 		if !budget.allow() {
 			return false
 		}
-		if err := s.store.recordOwedComputerRevocationFailure(ctx, session, revocationID, scrubbedCause(failure)); err != nil {
+		if err := s.store.recordOwedComputerRevocationFailure(ctx, begin, revocationID, scrubbedCause(failure)); err != nil {
 			s.logOwedRevocationDeferred(settlement.row.owed, err)
 		}
 	}

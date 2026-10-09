@@ -2290,11 +2290,12 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	hash := sha256.Sum256(specJSON)
 	requestHash := hex.EncodeToString(hash[:])
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return Job{}, false, internalError(err, "begin job creation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	// Beginning an immediate transaction can wait behind another writer. Read
 	// time after acquiring it so a lease that expired while waiting is refused.
 	now := canonicalTime(s.clock.Now())
@@ -2486,13 +2487,24 @@ func replayWithinScope(origin JobOrigin, replayed Job) bool {
 }
 
 func (s *Store) readConcurrentSubmit(ctx context.Context, spec contract.JobSpec, requestHash string, origin JobOrigin, insertErr error) (Job, bool, error) {
+	var job Job
+	var replayed bool
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		job, replayed, err = reads.concurrentSubmit(ctx, spec, requestHash, origin, insertErr)
+		return err
+	})
+	return job, replayed, err
+}
+
+func (r *databaseReads) concurrentSubmit(ctx context.Context, spec contract.JobSpec, requestHash string, origin JobOrigin, insertErr error) (Job, bool, error) {
 	dispatchKey := spec.DispatchKey
-	job, storedHash, err := getJobByDispatchKey(ctx, s.db, dispatchKey, canonicalTime(s.clock.Now()))
+	job, storedHash, err := getJobByDispatchKey(ctx, r.q, dispatchKey, r.now())
 	if err != nil {
-		tombstone, tombstoneErr := readServiceTombstoneByDispatchHash(ctx, s.db, hashDispatchKey(dispatchKey))
+		tombstone, tombstoneErr := readServiceTombstoneByDispatchHash(ctx, r.q, hashDispatchKey(dispatchKey))
 		if tombstoneErr != nil {
 			if errors.Is(err, sql.ErrNoRows) && errors.Is(tombstoneErr, sql.ErrNoRows) {
-				if conflict := instanceKeyConflict(ctx, s.db, spec, origin); conflict != nil {
+				if conflict := instanceKeyConflict(ctx, r.q, spec, origin); conflict != nil {
 					return Job{}, false, conflict
 				}
 			}
@@ -2706,11 +2718,12 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 			!incoming.observation.ReasonCode.ValidOCIRestriction()) {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "capability supersede requires a restrictive OCI observation")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Node{}, internalError(err, "begin node registration")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var storedIdentity, storedBoot string
 	var storedState contract.NodeState
 	var storedCapabilitiesJSON, storedMissingJSON []byte
@@ -2860,11 +2873,12 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	if policy != nil && (policy.MaxOneshotSlots < 0 || policy.MaxServiceSlots < 0) {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "configured node slot limits must be non-negative")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Node{}, internalError(err, "begin node heartbeat")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var storedIdentity, storedBoot string
 	var storedState contract.NodeState
 	var storedCapabilitiesJSON, storedMissingJSON []byte
@@ -2967,11 +2981,12 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	if err != nil {
 		return nil, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return nil, internalError(err, "begin job claim")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 
 	var nodeState contract.NodeState
 	var storedIdentity, storedBoot string
@@ -3351,11 +3366,12 @@ func claimExclusion(jobIDs []string) (string, []any, error) {
 }
 
 func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID, fencingToken string) (AttemptLease, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return AttemptLease{}, internalError(err, "begin lease renewal")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return AttemptLease{}, err
@@ -3439,11 +3455,12 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 	}
 	jobHash := sha256.Sum256(jobIdentityJSON)
 	jobObservationHash := hex.EncodeToString(jobHash[:])
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return Job{}, internalError(err, "begin image observation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return Job{}, err
@@ -3595,11 +3612,12 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 	if request.FencingToken == "" {
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "fencing_token is required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return Job{}, internalError(err, "begin Started acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return Job{}, err
@@ -3712,11 +3730,12 @@ func (s *Store) SetAttemptPublication(
 	if request.FencingToken == "" || request.Ready == nil {
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "fencing_token and ready are required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return Job{}, internalError(err, "begin publication mutation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
@@ -3876,11 +3895,12 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		return AppendLogsResponse{}, protocolError(contract.ErrorInvalidRequest, "events must contain between 1 and %d entries", MaxLogBatchEvents)
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return AppendLogsResponse{}, internalError(err, "begin log append")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return AppendLogsResponse{}, err
@@ -4290,11 +4310,12 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		}
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return CompletionOutcome{}, internalError(err, "begin completion")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return CompletionOutcome{}, err
@@ -5229,11 +5250,12 @@ func (s *Store) SetAttemptResult(ctx context.Context, identityNodeID, jobID, att
 			"document does not match its declared sha256")
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return AttemptResultResponse{}, internalError(err, "begin result upload")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return AttemptResultResponse{}, err

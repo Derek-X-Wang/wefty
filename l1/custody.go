@@ -168,11 +168,12 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 		return ComputerCustodyExport{}, false, internalError(err, "encode Custody export request")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return ComputerCustodyExport{}, false, internalError(err, "begin Custody export")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ComputerCustodyExport{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -425,11 +426,12 @@ func (s *Store) AcknowledgeComputerCustodyExport(ctx context.Context, identityNo
 		return ComputerCustodyExport{}, internalError(err, "encode Custody export acknowledgement")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return ComputerCustodyExport{}, internalError(err, "begin Custody export acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return ComputerCustodyExport{}, err
 	}
@@ -512,7 +514,13 @@ func (s *Store) AttestComputerCustodyDeletedWithReplay(ctx context.Context, expo
 		return ComputerCustodyExport{}, false, protocolError(contract.ErrorInvalidRequest, "export_id, idempotency_key, and actor are required")
 	}
 	now := canonicalTime(s.clock.Now())
-	result, err := s.db.ExecContext(ctx, `UPDATE computer_custody_exports SET operator_attestation_key=?,
+	write, err := s.beginWriteTransaction(ctx, nil, now)
+	if err != nil {
+		return ComputerCustodyExport{}, false, internalError(err, "record operator_attested_deleted evidence")
+	}
+	defer write.rollback()
+	tx := write.tx
+	result, err := tx.ExecContext(ctx, `UPDATE computer_custody_exports SET operator_attestation_key=?,
 		operator_attestation_actor=?, operator_attested_ns=? WHERE export_id=? AND operator_attestation_key IS NULL`,
 		request.IdempotencyKey, request.Actor, now.UnixNano(), exportID)
 	if err != nil {
@@ -522,7 +530,7 @@ func (s *Store) AttestComputerCustodyDeletedWithReplay(ctx context.Context, expo
 	if changed, _ := result.RowsAffected(); changed == 0 {
 		replayed = true
 		var key, actor string
-		if err := s.db.QueryRowContext(ctx, `SELECT operator_attestation_key, operator_attestation_actor
+		if err := tx.QueryRowContext(ctx, `SELECT operator_attestation_key, operator_attestation_actor
 			FROM computer_custody_exports WHERE export_id=?`, exportID).Scan(&key, &actor); errors.Is(err, sql.ErrNoRows) {
 			return ComputerCustodyExport{}, false, protocolError(contract.ErrorNotFound, "Custody export %q was not found", exportID)
 		} else if err != nil {
@@ -531,7 +539,17 @@ func (s *Store) AttestComputerCustodyDeletedWithReplay(ctx context.Context, expo
 			return ComputerCustodyExport{}, false, protocolError(contract.ErrorIdempotencyConflict, "Custody deletion attestation is immutable")
 		}
 	}
-	exported, err := scanCustodyExport(s.db.QueryRowContext(ctx, `SELECT `+custodyExportColumns+` FROM computer_custody_exports WHERE export_id=?`, exportID))
+	// The evidence commits before the response reload, as with the original
+	// autocommit UPDATE. A reload failure must not undo the attestation.
+	if err := write.commit(); err != nil {
+		return ComputerCustodyExport{}, false, internalError(err, "record operator_attested_deleted evidence")
+	}
+	var exported ComputerCustodyExport
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		exported, err = reads.custodyExport(ctx, exportID)
+		return err
+	})
 	return exported, replayed, err
 }
 
@@ -581,11 +599,12 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		return ComputerCustodyImport{}, false, internalError(err, "encode Custody import request")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return ComputerCustodyImport{}, false, internalError(err, "begin Custody import")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if replay, replayErr := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
 		FROM computer_storage_copy_operations WHERE export_id=? AND idempotency_key=?`, exportID,
 		request.IdempotencyKey)); replayErr == nil {
@@ -748,11 +767,12 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 		return Computer{}, internalError(err, "encode Custody import acknowledgement")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Custody import acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}
@@ -940,4 +960,8 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 	}
 	s.notifyComputerPolicyChanged()
 	return computer, nil
+}
+
+func (r *databaseReads) custodyExport(ctx context.Context, exportID string) (ComputerCustodyExport, error) {
+	return scanCustodyExport(r.q.QueryRowContext(ctx, `SELECT `+custodyExportColumns+` FROM computer_custody_exports WHERE export_id=?`, exportID))
 }

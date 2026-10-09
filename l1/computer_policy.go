@@ -290,11 +290,12 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 		return ComputerGrantMutationResult{}, err
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return ComputerGrantMutationResult{}, internalError(err, "begin Computer grant mutation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return ComputerGrantMutationResult{}, err
 	}
@@ -780,11 +781,12 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 		freshness = DefaultComputerPolicyFreshness
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return nil, internalError(err, "begin Computer policy snapshot")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var storedIdentity, storedBoot string
 	if err := tx.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id FROM nodes WHERE node_id=?`, nodeID).
 		Scan(&storedIdentity, &storedBoot); errors.Is(err, sql.ErrNoRows) {
@@ -890,11 +892,12 @@ func (s *Store) AcknowledgeComputerPolicyInstallation(ctx context.Context, ident
 		return protocolError(contract.ErrorInvalidRequest, "complete Computer policy installation evidence is required")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return internalError(err, "begin Computer policy acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var storedIdentity, storedBoot string
 	if err := tx.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id FROM nodes WHERE node_id=?`, request.NodeID).
 		Scan(&storedIdentity, &storedBoot); errors.Is(err, sql.ErrNoRows) {

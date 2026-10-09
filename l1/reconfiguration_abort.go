@@ -46,11 +46,12 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 		return Computer{}, false, internalError(err, "encode Computer reconfiguration abort")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "begin Computer reconfiguration abort")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)

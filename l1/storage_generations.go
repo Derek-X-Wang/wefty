@@ -179,11 +179,12 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 		return Computer{}, false, internalError(err, "encode Computer Storage reset request")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "begin Computer Storage reset")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -420,11 +421,12 @@ func (s *Store) recordComputerStorageResetVerification(ctx context.Context, iden
 		return internalError(err, "encode Computer Storage reset acknowledgement")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return internalError(err, "begin Computer Storage reset verification")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateStorageResetNode(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return err
 	}
@@ -501,11 +503,12 @@ func validateComputerStorageCleanupQuarantine(receipt ComputerStorageCleanupQuar
 
 func (s *Store) publishVerifiedComputerStorageReset(ctx context.Context, computerID string, intentRevision int64) (Computer, error) {
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer Storage reset publication")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer Storage reset publication authority")
@@ -620,11 +623,12 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 			"complete Computer Storage retirement acknowledgement fields are required")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer Storage retirement acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateStorageResetNode(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}

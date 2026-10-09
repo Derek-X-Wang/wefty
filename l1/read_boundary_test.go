@@ -71,7 +71,7 @@ func readBoundaryTypes(t *testing.T) (*token.FileSet, []*ast.File, *types.Info) 
 	if len(files) == 0 {
 		t.Fatal("no l1 production sources")
 	}
-	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Uses: map[*ast.Ident]types.Object{}, Defs: map[*ast.Ident]types.Object{}, Selections: map[*ast.SelectorExpr]*types.Selection{}}
 	imp := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) { return os.Open(exports[path]) })
 	config := types.Config{Importer: imp}
 	if _, err := config.Check("github.com/Derek-X-Wang/wefty/l1", fset, files, info); err != nil {
@@ -195,7 +195,7 @@ func TestReadSnapshotGuardDetectsQueryOnlyPragma(t *testing.T) {
 
 func validReadSlice(slice string) bool {
 	switch slice {
-	case "#748", "#749", "#750", "#751", "#752", "permanent":
+	case "permanent", "agent-protocol":
 		return true
 	}
 	return false
@@ -232,8 +232,7 @@ func TestReadSnapshotRawPoolRatchet(t *testing.T) {
 	}
 	sort.Strings(violations)
 	if len(violations) > 0 {
-		// A diagnostic inventory is never read as an allowlist. It makes the initial
-		// documented ratchet auditable without accepting a newly planted use.
+		// The diagnostic inventory is never read as an allowlist.
 		var inventory []rawPoolException
 		var keys []string
 		for site := range actual {
@@ -241,11 +240,11 @@ func TestReadSnapshotRawPoolRatchet(t *testing.T) {
 		}
 		sort.Strings(keys)
 		for _, site := range keys {
-			inventory = append(inventory, rawPoolException{Site: site, Count: actual[site], Reason: "legacy acquisition/use; migrate in #748-#752"})
+			inventory = append(inventory, rawPoolException{Site: site, Count: actual[site], Reason: "unclassified raw pool use"})
 		}
 		dump, _ := json.MarshalIndent(inventory, "", "  ")
 		t.Logf("INVENTORY\n%s\nEND INVENTORY", dump)
-		t.Fatalf("read boundary ratchet:\n%s", strings.Join(violations, "\n"))
+		t.Fatalf("read boundary guard:\n%s", strings.Join(violations, "\n"))
 	}
 }
 

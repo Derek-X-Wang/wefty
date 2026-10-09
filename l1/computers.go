@@ -360,11 +360,12 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 		return Computer{}, false, err
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "begin Computer creation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 
 	if existing, storedHash, readErr := getJobByDispatchKey(ctx, tx, request.Spec.DispatchKey, now); readErr == nil {
 		if storedHash != requestHash {
@@ -904,11 +905,12 @@ func (s *Store) SetComputerBackupCap(ctx context.Context, computerID string, req
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "backup_cap must be non-negative")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer Backup cap mutation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1077,11 +1079,12 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 			"desired_state must be %q or %q", contract.ServiceDesiredRunning, contract.ServiceDesiredStopped)
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer desired-state mutation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1232,11 +1235,12 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 		return Computer{}, false, err
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "begin Computer restart")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1336,11 +1340,12 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 // Computer removal ticket; this method deliberately retains the durable row.
 func (s *Store) RemoveComputer(ctx context.Context, computerID string, request ComputerRemoveRequest) (Computer, error) {
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer removal")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1621,8 +1626,12 @@ func (s *Store) reimageComputer(ctx context.Context, computerID string, request 
 	reimageHash := sha256.Sum256(reimagePayload)
 	reimageRequestHash := hex.EncodeToString(reimageHash[:])
 	var storedRequestHash string
-	if lookupErr := s.db.QueryRowContext(ctx, `SELECT request_hash FROM computer_reimage_operations
-		WHERE computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey).Scan(&storedRequestHash); lookupErr == nil {
+	lookupErr := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		storedRequestHash, err = reads.computerReimageReplayHash(ctx, computerID, request.IdempotencyKey)
+		return err
+	})
+	if lookupErr == nil {
 		if storedRequestHash != reimageRequestHash {
 			return Computer{}, protocolError(contract.ErrorIdempotencyConflict,
 				"Computer reimage idempotency key was reused with different authority")
@@ -1679,11 +1688,12 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 		return Computer{}, err
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer projection install")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -2006,4 +2016,11 @@ func (s *Store) finalizeComputerProjectionTx(ctx context.Context, tx *sql.Tx, co
 		return err
 	}
 	return nil
+}
+
+func (r *databaseReads) computerReimageReplayHash(ctx context.Context, computerID, key string) (string, error) {
+	var hash string
+	err := r.q.QueryRowContext(ctx, `SELECT request_hash FROM computer_reimage_operations
+		WHERE computer_id=? AND idempotency_key=?`, computerID, key).Scan(&hash)
+	return hash, err
 }

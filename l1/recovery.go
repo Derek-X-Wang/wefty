@@ -17,11 +17,12 @@ import (
 // of an expiry-boundary race fully determines the durable result.
 func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "begin L1 reconciliation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 
 	result := ReconcileResult{}
 	dead, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_condition_json=?
@@ -279,11 +280,12 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 	if bootSessionID == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "boot_session_id is required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return Node{}, internalError(err, "begin agent drain")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	result, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?,
 		last_condition_json=CASE WHEN state=? THEN last_condition_json ELSE ? END
 		WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
@@ -358,11 +360,12 @@ func (s *Store) setNodeIntentByOperator(ctx context.Context, nodeID, verb string
 		return Node{}, err
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Node{}, internalError(err, "begin operator intent mutation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	current, err := getNode(ctx, tx, nodeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, protocolError(contract.ErrorNotFound, "node %q was not found", nodeID)
