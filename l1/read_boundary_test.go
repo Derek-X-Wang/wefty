@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -71,7 +72,7 @@ func readBoundaryTypes(t *testing.T) (*token.FileSet, []*ast.File, *types.Info) 
 	if len(files) == 0 {
 		t.Fatal("no l1 production sources")
 	}
-	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Selections: map[*ast.SelectorExpr]*types.Selection{}}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Selections: map[*ast.SelectorExpr]*types.Selection{}, Uses: map[*ast.Ident]types.Object{}}
 	imp := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) { return os.Open(exports[path]) })
 	config := types.Config{Importer: imp}
 	if _, err := config.Check("github.com/Derek-X-Wang/wefty/l1", fset, files, info); err != nil {
@@ -322,68 +323,189 @@ func (i boundaryFixtureImporter) Import(path string) (*types.Package, error) {
 	return i.base.Import(path)
 }
 
-// withAgentReadSnapshot is the agent-protocol exception on the main pool. Its
-// own declaration and these agent acknowledgement handlers are the closed
-// caller set; anything else must use the read door.
-var agentReadSnapshotCallers = map[string]bool{
-	"computer_operator.go:*Server.writeAgentComputer":   true,
-	"server.go:*Server.acknowledgeComputerBackup":       true,
-	"computer_operator.go:*Store.withAgentReadSnapshot": true,
+// The agent-protocol exception chain is closed by construction. withAgentReadSnapshot is reachable
+// only inside writeAgentComputer, and each of the two is reachable only
+// from the agent acknowledgement route handlers the agent mux registers.
+// The rule matches every selector resolving to one of the methods — calls,
+// method values and method expressions, including package-level var
+// initialisers — so there is no bypass shape it misses.
+var agentReadSnapshotTargets = []string{"withAgentReadSnapshot", "writeAgentComputer"}
+
+const boundaryPkgPath = "github.com/Derek-X-Wang/wefty/l1"
+
+// boundaryMethodObject resolves a selector identifier to the l1 (or fixture)
+// target method, whether the selector is a call, a method value, or a method
+// expression.
+func boundaryMethodObject(info *types.Info, selector *ast.SelectorExpr, pkgPath string) bool {
+	if selection := info.Selections[selector]; selection != nil && selection.Obj() != nil &&
+		selection.Obj().Pkg() != nil && selection.Obj().Pkg().Path() == pkgPath &&
+		hasString(agentReadSnapshotTargets, selection.Obj().Name()) {
+		return true
+	}
+	if use := info.Uses[selector.Sel]; use != nil && use.Name() != "" &&
+		use.Pkg() != nil && use.Pkg().Path() == pkgPath && hasString(agentReadSnapshotTargets, use.Name()) {
+		return true
+	}
+	return false
 }
 
-// agentReadSnapshotCallSites lists the enclosing production functions that call
-// withAgentReadSnapshot, typed through the compiler's selection data.
-func agentReadSnapshotCallSites(fset *token.FileSet, files []*ast.File, info *types.Info) []string {
+func hasString(list []string, want string) bool {
+	for _, value := range list {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+// boundaryOwnerSites walks every declaration in a package-level file body.
+// Function declarations report `file:Receiver.Name`; package-level var
+// initialisers report `file:var <name>`, so an aggregator there cannot hide
+// behind a call at another site.
+func boundaryOwnerSites(fset *token.FileSet, files []*ast.File, info *types.Info, pkgPath string) []string {
 	var sites []string
 	for _, file := range files {
 		name := filepath.Base(fset.Position(file.Pos()).Filename)
 		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				owner := fn.Name.Name
+				if fn.Recv != nil {
+					var receiver bytes.Buffer
+					_ = format.Node(&receiver, fset, fn.Recv.List[0].Type)
+					owner = receiver.String() + "." + owner
+				}
+				sites = append(sites, boundarySelectors(fset, fn, name+":"+owner, info, pkgPath)...)
 				continue
 			}
-			owner := fn.Name.Name
-			if fn.Recv != nil {
-				var receiver bytes.Buffer
-				_ = format.Node(&receiver, fset, fn.Recv.List[0].Type)
-				owner = receiver.String() + "." + owner
+			genDecl, ok := decl.(*ast.GenDecl)
+			if !ok {
+				continue
 			}
-			ast.Inspect(fn.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok || len(call.Args) != 2 {
-					return true
+			for _, spec := range genDecl.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
 				}
-				selector, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || selector.Sel.Name != "withAgentReadSnapshot" {
-					return true
+				for _, identifier := range valueSpec.Names {
+					if res := boundarySelectors(fset, valueSpec, name+":var "+identifier.Name, info, pkgPath); len(res) > 0 {
+						sites = append(sites, res...)
+					}
 				}
-				selection, ok := info.Selections[selector]
-				if !ok || selection.Obj() == nil || selection.Obj().Pkg() == nil || selection.Obj().Pkg().Path() != "github.com/Derek-X-Wang/wefty/l1" {
-					return true
-				}
-				sites = append(sites, name+":"+owner)
-				return true
-			})
+			}
 		}
 	}
 	return sites
 }
 
-func TestAgentReadSnapshotIsAgentOnly(t *testing.T) {
-	fset, files, info := readBoundaryTypes(t)
-	// The declaration itself stays on the list so its own body's call count is
-	// irrelevant; every other site must be a listed agent handler. A listed
-	// handler that stops calling the helper is allowed to become dead code, but
-	// an unmapped caller is a boundary violation.
-	actual := agentReadSnapshotCallSites(fset, files, info)
-	var violations []string
-	for _, site := range actual {
-		if !agentReadSnapshotCallers[site] {
-			violations = append(violations, site)
+func boundarySelectors(fset *token.FileSet, node ast.Node, site string, info *types.Info, pkgPath string) []string {
+	var sites []string
+	ast.Inspect(node, func(inside ast.Node) bool {
+		selector, ok := inside.(*ast.SelectorExpr)
+		if !ok || !boundaryMethodObject(info, selector, pkgPath) {
+			return true
+		}
+		sites = append(sites, site)
+		return true
+	})
+	return sites
+}
+
+// agentAcknowledgementSites is the exact site set the chain may live in: the
+// two loader declarations after the agent acknowledgement Store methods, and
+// the agent-mux acknowledgement handlers that write the reloaded Computer
+// view. It is asserted by set equality, so a vanished handler or type check
+// fails the guard rather than silently relaxing the boundary.
+var agentAcknowledgementSites = map[string]bool{
+	"computer_operator.go:*Server.writeAgentComputer":        true,
+	"server.go:*Server.acknowledgeComputerBackup":            true,
+	"server.go:*Server.acknowledgeComputerStorageReset":      true,
+	"server.go:*Server.acknowledgeComputerStorageGrow":       true,
+	"server.go:*Server.acknowledgeComputerReimagePreflight":  true,
+	"server.go:*Server.acknowledgeComputerStorageRetirement": true,
+	"server.go:*Server.acknowledgeComputerStorageCopy":       true,
+	"server.go:*Server.acknowledgeComputerRestoreRetirement": true,
+}
+
+func TestReadSnapshotAgentGuardDetectsBypassShapes(t *testing.T) {
+	// These are typed-checked fixtures, not substring checks. Every bypass form
+	// the old CallExpr-only matcher missed must be reported under its owner.
+	source := `package fixture
+	import "context"
+	type model int
+	type Store struct{}
+	func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, model) error) error { _ = ctx; _ = use; return nil }
+	type Server struct{ store *Store }
+	func (s *Server) writeAgentComputer(args ...any) { s.store.withAgentReadSnapshot(context.Background(), nil) }
+	func (s *Server) acknowledgeComputerBackup() { s.store.withAgentReadSnapshot(context.Background(), nil) }
+	func handlerCallingWrapper(s *Server) { s.writeAgentComputer() }
+	func bypassMethodValue(s *Store) { f := s.withAgentReadSnapshot; _ = f }
+	func bypassMethodExpr(s *Store) { _ = (*Store).withAgentReadSnapshot }
+	var bypassPackageVar = func(s *Store) { s.withAgentReadSnapshot(context.Background(), nil) }
+	`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fixture.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Selections: map[*ast.SelectorExpr]*types.Selection{}, Uses: map[*ast.Ident]types.Object{}}
+	_, _, production := readBoundaryTypes(t)
+	config := types.Config{Importer: boundaryFixtureImporter{sql: snapshotSQLPackage(t, production), base: importer.Default()}}
+	if _, err := config.Check("fixture", fset, []*ast.File{file}, info); err != nil {
+		t.Fatal(err)
+	}
+	sites := boundaryOwnerSites(fset, []*ast.File{file}, info, "fixture")
+	expected := map[string]bool{
+		"fixture.go:*Server.writeAgentComputer":        true,
+		"fixture.go:*Server.acknowledgeComputerBackup": true,
+		"fixture.go:handlerCallingWrapper":             true,
+		"fixture.go:bypassMethodValue":                 true,
+		"fixture.go:bypassMethodExpr":                  true,
+		"fixture.go:var bypassPackageVar":              true,
+	}
+	if len(sites) != len(expected) {
+		t.Fatalf("sites=%v, want exactly %v", sites, expected)
+	}
+	for _, site := range sites {
+		if !expected[site] {
+			t.Fatalf("unexpected site %s; all=%v", site, sites)
 		}
 	}
-	if violations != nil {
-		t.Fatalf("withAgentReadSnapshot outside agent acknowledgement handlers:\n%s",
-			strings.Join(violations, "\n"))
+}
+
+func snapshotSQLPackage(t *testing.T, info *types.Info) *types.Package {
+	t.Helper()
+	for _, value := range info.Types {
+		if rawSQLHandle(value.Type) {
+			return types.Unalias(value.Type).(*types.Pointer).Elem().(*types.Named).Obj().Pkg()
+		}
+	}
+	t.Fatal("no sql handle in production type check")
+	return nil
+}
+
+func TestAgentReadSnapshotIsAgentOnly(t *testing.T) {
+	fset, files, info := readBoundaryTypes(t)
+	actual := map[string]bool{}
+	for _, site := range boundaryOwnerSites(fset, files, info, boundaryPkgPath) {
+		actual[site] = true
+	}
+	// Positive control: the chain must be exactly where the agent mux routes
+	// it. A vanished type check, a moved helper, or a disappeared handler all
+	// fail here instead of silently relaxing the boundary.
+	if !reflect.DeepEqual(actual, agentAcknowledgementSites) {
+		var extra, missing []string
+		for site := range actual {
+			if !agentAcknowledgementSites[site] {
+				extra = append(extra, site)
+			}
+		}
+		for site := range agentAcknowledgementSites {
+			if !actual[site] {
+				missing = append(missing, site)
+			}
+		}
+		sort.Strings(extra)
+		sort.Strings(missing)
+		t.Fatalf("agent acknowledgement chain mismatch; extra=%v missing=%v", extra, missing)
 	}
 }

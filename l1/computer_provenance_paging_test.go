@@ -201,47 +201,58 @@ func TestComputerStoreBackupInventoryWalksPages(t *testing.T) {
 }
 
 func TestComputerSubmissionReceiptSurvivesPostChangeReadFailure(t *testing.T) {
-	for _, revoked := range []bool{true, false} {
-		t.Run(fmt.Sprint(revoked), func(t *testing.T) {
-			h, _, computer := backupHarness(t, 2, nil)
-			h.stopServer()
-			// The submission mutation never moves the ServiceJob's persisted
-			// state, so the committed authority's raw status holds across it.
-			committed, err := readComputerAuthority(t.Context(), h.store.db, computer.ComputerID, canonicalTime(h.clock.Now()))
-			if err != nil {
-				t.Fatal(err)
-			}
-			wantStatus := committed.CurrentJob.Status
-			admin, policy := computerSnapshotAdmin(t, h)
-			h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(ctx context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
-				if err := h.store.readDB.Close(); err != nil {
+	for _, scenario := range []string{"raw", "restart-pending"} {
+		for _, revoked := range []bool{true, false} {
+			t.Run(scenario+"/"+fmt.Sprint(revoked), func(t *testing.T) {
+				h, _, computer := backupHarness(t, 2, nil)
+				h.stopServer()
+				// The submission mutation never moves the ServiceJob's persisted
+				// state, so the committed authority's raw status holds across it.
+				committed, err := readComputerAuthority(t.Context(), h.store.db, computer.ComputerID, canonicalTime(h.clock.Now()))
+				if err != nil {
 					t.Fatal(err)
-				} // Failure only after the write and revocation.
-				if !revoked {
-					return contract.ComputerTokenRevocationReceipt{}, errors.New("revocation unavailable")
 				}
-				return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID, SubmitIntentRevision: request.NewSubmitIntentRevision, CommittedAt: h.clock.Now()}, nil
-			}}
-			payload, _ := json.Marshal(ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: boolPointer(true), IdempotencyKey: "review-submission"})
-			ctx := context.WithValue(t.Context(), identityContextKey{}, admin)
-			r := httptest.NewRequest(http.MethodPut, "/submission", strings.NewReader(string(payload))).WithContext(ctx)
-			r.SetPathValue("computer_id", computer.ComputerID)
-			w := httptest.NewRecorder()
-			h.server.mutateComputerSubmission(w, r)
-			var result ComputerSubmissionMutationResult
-			if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &result) != nil || !result.MutationApplied || !result.SubmitEnabled || result.SubmitIntentRevision != 1 || result.PolicyRevision != policy.Revision+1 || (result.Revoked != nil) != revoked || (!revoked && result.RevocationNotice == "") {
-				t.Fatalf("receipt lost=%d %s", w.Code, w.Body.String())
-			}
-			if result.Projection != committedFallbackProjection {
-				t.Fatalf("fallback marker=%q, want %q (%s)", result.Projection, committedFallbackProjection, w.Body.String())
-			}
-			// Without a fresh read only restart-pending is computable from facts
-			// in hand; this Computer is not in restart backoff, so the fallback
-			// keeps the raw persisted state instead of the job projector's walk.
-			if result.Status != wantStatus {
-				t.Fatalf("status=%q, want committed raw state %q", result.Status, wantStatus)
-			}
-		})
+				wantStatus := committed.CurrentJob.Status
+				if scenario == "restart-pending" {
+					_, err := h.store.db.Exec(`UPDATE service_jobs SET bound_node_id='computer-node', next_restart_at=? WHERE job_id=?`,
+						h.clock.Now().Add(time.Hour).UnixNano(), computer.CurrentJobID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					wantStatus = "restart-pending"
+				}
+				admin, policy := computerSnapshotAdmin(t, h)
+				h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(ctx context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+					if err := h.store.readDB.Close(); err != nil {
+						t.Fatal(err)
+					} // Failure only after the write and revocation.
+					if !revoked {
+						return contract.ComputerTokenRevocationReceipt{}, errors.New("revocation unavailable")
+					}
+					return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID, SubmitIntentRevision: request.NewSubmitIntentRevision, CommittedAt: h.clock.Now()}, nil
+				}}
+				payload, _ := json.Marshal(ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: boolPointer(true), IdempotencyKey: "review-submission"})
+				ctx := context.WithValue(t.Context(), identityContextKey{}, admin)
+				r := httptest.NewRequest(http.MethodPut, "/submission", strings.NewReader(string(payload))).WithContext(ctx)
+				r.SetPathValue("computer_id", computer.ComputerID)
+				w := httptest.NewRecorder()
+				h.server.mutateComputerSubmission(w, r)
+				var result ComputerSubmissionMutationResult
+				if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &result) != nil || !result.MutationApplied || !result.SubmitEnabled || result.SubmitIntentRevision != 1 || result.PolicyRevision != policy.Revision+1 || (result.Revoked != nil) != revoked || (!revoked && result.RevocationNotice == "") {
+					t.Fatalf("receipt lost=%d %s", w.Code, w.Body.String())
+				}
+				if result.Projection != committedFallbackProjection {
+					t.Fatalf("fallback marker=%q, want %q (%s)", result.Projection, committedFallbackProjection, w.Body.String())
+				}
+				// Without a fresh read the status is the projected status only
+				// where it is computable from facts in hand: restart-pending from
+				// the committed backoff; otherwise the raw persisted state stays
+				// instead of the job projector's database walks.
+				if result.Status != wantStatus {
+					t.Fatalf("status=%q, want %q from committed authority (%s)", result.Status, wantStatus, w.Body.String())
+				}
+			})
+		}
 	}
 }
 

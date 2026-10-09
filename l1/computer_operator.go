@@ -399,10 +399,13 @@ func appliedComputerReadError(err error, id string) error {
 }
 
 // #752 agent-protocol exception: a committed acknowledgement must not queue
-// behind operator admission. Keep the reload coherent on the main pool. The
-// reload holds its transaction under the same hard limit the read door
-// enforces, reusing its test-only override and typed expiry shape; only agent
-// acknowledgement handlers between this Store and the HTTP route may call it.
+// behind the read door. Keep the reload coherent on the main pool, with the
+// door's own two-stage shape: main-pool checkout gets its own admission
+// budget, and the read-only transaction then holds its connection under the
+// same hard hold limit with the same typed expiry; both reuse the door's
+// test-only override. The derived context marks nested snapshot acquisition
+// as a programming error. Only agent acknowledgement handlers between this
+// Store and the agent mux may call it (see read_boundary_test.go).
 func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, readModel) error) (err error) {
 	if ctx.Value(readSnapshotContextKey{}) != nil {
 		return errNestedReadSnapshot
@@ -411,17 +414,24 @@ func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Cont
 	if override, ok := ctx.Value(readSnapshotHardLimitContextKey{}).(time.Duration); ok {
 		limit = override
 	}
-	ctx, cancel := context.WithTimeout(ctx, limit)
+	admission, cancelAdmission := context.WithTimeout(ctx, limit)
+	conn, err := s.db.Conn(admission)
+	cancelAdmission()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return snapshotUnavailable("read_snapshot_admission_expired", err)
+		}
+		return err
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.WithValue(ctx, readSnapshotContextKey{}, true), limit)
 	defer cancel()
 	defer func() {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			err = snapshotUnavailable("read_snapshot_expired", ctx.Err())
 		}
 	}()
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if errors.Is(err, context.DeadlineExceeded) {
-		return snapshotUnavailable("read_snapshot_admission_expired", err)
-	}
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
