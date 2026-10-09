@@ -60,10 +60,31 @@ type ComputerSubmissionMutationResult struct {
 	ComputerSubmissionState
 	MutationApplied bool                                     `json:"mutation_applied"`
 	Revoked         *contract.ComputerTokenRevocationReceipt `json:"revoked"`
+	// Projection is set only when the post-change Read snapshot failed and the
+	// answer was built from committed Computer authority: `committed-fallback`.
+	// Omitted, the answer is one post-change observation.
+	Projection string `json:"projection,omitempty"`
 	// RevocationNotice is set when an applied change's L3 revocation was not
 	// recorded. The change still stands, and L3's live-scope check already
 	// refuses the superseded passes; revoked is then null.
 	RevocationNotice string `json:"revocation_notice,omitempty"`
+}
+
+// committedFallbackProjection marks a submission answer built from committed
+// Computer authority instead of one post-change Read snapshot.
+const committedFallbackProjection = "committed-fallback"
+
+// submissionCommittedStatus computes the job-view status of a committed
+// Computer from facts already in hand, without a new read. Only the
+// restart-pending projection needs no further read: unschedulable placement
+// walks and failed-cause reads need the snapshot, so other states keep the raw
+// persisted state.
+func submissionCommittedStatus(computer Computer, now time.Time) string {
+	if computer.CurrentJob.ServiceJob != nil &&
+		computer.CurrentJob.ServiceJob.RestartPending(computer.CurrentJob.State, now) {
+		return "restart-pending"
+	}
+	return computer.CurrentJob.Status
 }
 
 func projectComputerSubmissionState(computer Computer, policyRevision int64) ComputerSubmissionState {

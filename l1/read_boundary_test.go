@@ -71,7 +71,7 @@ func readBoundaryTypes(t *testing.T) (*token.FileSet, []*ast.File, *types.Info) 
 	if len(files) == 0 {
 		t.Fatal("no l1 production sources")
 	}
-	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Selections: map[*ast.SelectorExpr]*types.Selection{}}
 	imp := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) { return os.Open(exports[path]) })
 	config := types.Config{Importer: imp}
 	if _, err := config.Check("github.com/Derek-X-Wang/wefty/l1", fset, files, info); err != nil {
@@ -320,4 +320,70 @@ func (i boundaryFixtureImporter) Import(path string) (*types.Package, error) {
 		return nil, fmt.Errorf("context missing from sql imports")
 	}
 	return i.base.Import(path)
+}
+
+// withAgentReadSnapshot is the agent-protocol exception on the main pool. Its
+// own declaration and these agent acknowledgement handlers are the closed
+// caller set; anything else must use the read door.
+var agentReadSnapshotCallers = map[string]bool{
+	"computer_operator.go:*Server.writeAgentComputer":   true,
+	"server.go:*Server.acknowledgeComputerBackup":       true,
+	"computer_operator.go:*Store.withAgentReadSnapshot": true,
+}
+
+// agentReadSnapshotCallSites lists the enclosing production functions that call
+// withAgentReadSnapshot, typed through the compiler's selection data.
+func agentReadSnapshotCallSites(fset *token.FileSet, files []*ast.File, info *types.Info) []string {
+	var sites []string
+	for _, file := range files {
+		name := filepath.Base(fset.Position(file.Pos()).Filename)
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			owner := fn.Name.Name
+			if fn.Recv != nil {
+				var receiver bytes.Buffer
+				_ = format.Node(&receiver, fset, fn.Recv.List[0].Type)
+				owner = receiver.String() + "." + owner
+			}
+			ast.Inspect(fn.Body, func(node ast.Node) bool {
+				call, ok := node.(*ast.CallExpr)
+				if !ok || len(call.Args) != 2 {
+					return true
+				}
+				selector, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != "withAgentReadSnapshot" {
+					return true
+				}
+				selection, ok := info.Selections[selector]
+				if !ok || selection.Obj() == nil || selection.Obj().Pkg() == nil || selection.Obj().Pkg().Path() != "github.com/Derek-X-Wang/wefty/l1" {
+					return true
+				}
+				sites = append(sites, name+":"+owner)
+				return true
+			})
+		}
+	}
+	return sites
+}
+
+func TestAgentReadSnapshotIsAgentOnly(t *testing.T) {
+	fset, files, info := readBoundaryTypes(t)
+	// The declaration itself stays on the list so its own body's call count is
+	// irrelevant; every other site must be a listed agent handler. A listed
+	// handler that stops calling the helper is allowed to become dead code, but
+	// an unmapped caller is a boundary violation.
+	actual := agentReadSnapshotCallSites(fset, files, info)
+	var violations []string
+	for _, site := range actual {
+		if !agentReadSnapshotCallers[site] {
+			violations = append(violations, site)
+		}
+	}
+	if violations != nil {
+		t.Fatalf("withAgentReadSnapshot outside agent acknowledgement handlers:\n%s",
+			strings.Join(violations, "\n"))
+	}
 }

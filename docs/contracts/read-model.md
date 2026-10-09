@@ -186,10 +186,17 @@ returns 503 `unavailable`,
 and `read_reason`. Only snapshot availability failures are retryable; retry a
 read, and retain the original replay key when retrying a mutation. Applied
 submission changes fall back to the committed Computer and its committed
-`submit_policy_revision` if their post-change snapshot fails. This fallback
-retains the in-hand `revoked` receipt or `revocation_notice`; its readiness and
-status are the committed authority projection, not a fresh observation. L3 count
-failure still yields null and revocation failure a notice: none can undo the commit.
+`submit_policy_revision` if their post-change snapshot fails, and the response
+carries `projection: "committed-fallback"` so consumers can tell that fallback
+answer from a post-change observation. This fallback retains the in-hand
+`revoked` receipt or `revocation_notice`; its readiness and status are the
+committed authority projection, not a fresh observation. The fallback's
+`current_job.status` is the projected status only where it is computable from
+committed facts already in hand, which is `restart-pending` from the committed
+ServiceJob's own backoff facts; unschedulable placement walks and failed-cause
+reads would need a fresh read, so other statuses keep the raw persisted state.
+L3 count failure still yields null and revocation failure a notice: none can
+undo the commit.
 
 The Backup collection has a stable insertion watermark and `(created_ns,
 backup_id)` keyset cursor bound to its Computer. The first page fixes membership,

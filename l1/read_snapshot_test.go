@@ -456,3 +456,27 @@ func TestReadSnapshotHoldLimitOverride(t *testing.T) {
 		t.Fatalf("10 s override expired after the default limit: %v", err)
 	}
 }
+
+// The agent acknowledgement snapshot shares the read door's hard hold limit
+// and its test-only override; expiry is the same typed unavailable shape.
+func TestAgentReadSnapshotHoldLimitExpiresUnavailable(t *testing.T) {
+	s, _ := snapshotStore(t)
+	ctx := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, time.Nanosecond)
+	err := s.withAgentReadSnapshot(ctx, func(context.Context, readModel) error { return nil })
+	if errorCode(err) != contract.ErrorUnavailable {
+		t.Fatalf("1 ns override=%v, want unavailable", err)
+	}
+	reason, _ := err.(*Error).Details["reason"].(string)
+	if reason != "read_snapshot_admission_expired" && reason != "read_snapshot_expired" {
+		t.Fatalf("reason=%q, want an expired agent read snapshot", reason)
+	}
+	if api := apiErrorFromDecision(err); api == nil || !api.Retryable {
+		t.Fatalf("expired agent read snapshot is not retryable: %v", err)
+	}
+	if err := s.withAgentReadSnapshot(t.Context(), func(ctx context.Context, reads readModel) error {
+		var count int
+		return reads.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

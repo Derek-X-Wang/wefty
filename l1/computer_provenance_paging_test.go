@@ -205,6 +205,13 @@ func TestComputerSubmissionReceiptSurvivesPostChangeReadFailure(t *testing.T) {
 		t.Run(fmt.Sprint(revoked), func(t *testing.T) {
 			h, _, computer := backupHarness(t, 2, nil)
 			h.stopServer()
+			// The submission mutation never moves the ServiceJob's persisted
+			// state, so the committed authority's raw status holds across it.
+			committed, err := readComputerAuthority(t.Context(), h.store.db, computer.ComputerID, canonicalTime(h.clock.Now()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := committed.CurrentJob.Status
 			admin, policy := computerSnapshotAdmin(t, h)
 			h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(ctx context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 				if err := h.store.readDB.Close(); err != nil {
@@ -225,7 +232,32 @@ func TestComputerSubmissionReceiptSurvivesPostChangeReadFailure(t *testing.T) {
 			if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &result) != nil || !result.MutationApplied || !result.SubmitEnabled || result.SubmitIntentRevision != 1 || result.PolicyRevision != policy.Revision+1 || (result.Revoked != nil) != revoked || (!revoked && result.RevocationNotice == "") {
 				t.Fatalf("receipt lost=%d %s", w.Code, w.Body.String())
 			}
+			if result.Projection != committedFallbackProjection {
+				t.Fatalf("fallback marker=%q, want %q (%s)", result.Projection, committedFallbackProjection, w.Body.String())
+			}
+			// Without a fresh read only restart-pending is computable from facts
+			// in hand; this Computer is not in restart backoff, so the fallback
+			// keeps the raw persisted state instead of the job projector's walk.
+			if result.Status != wantStatus {
+				t.Fatalf("status=%q, want committed raw state %q", result.Status, wantStatus)
+			}
 		})
+	}
+}
+
+// The committed-fallback status projects restart-pending from the committed
+// ServiceJob facts, without a new read; every other state stays raw.
+func TestSubmissionCommittedStatusUsesFactsInHand(t *testing.T) {
+	now := canonicalTime(time.Now())
+	nextRestart := now.Add(time.Second)
+	backoff := Computer{CurrentJob: Job{State: contract.JobQueued, Status: string(contract.JobQueued),
+		ServiceJob: &ServiceJob{DesiredState: contract.ServiceDesiredRunning, NextRestartAt: &nextRestart}}}
+	if status := submissionCommittedStatus(backoff, now); status != "restart-pending" {
+		t.Fatalf("committed backoff status=%q, want restart-pending", status)
+	}
+	failed := Computer{CurrentJob: Job{State: contract.JobFailed, Status: string(contract.JobFailed)}}
+	if status := submissionCommittedStatus(failed, now); status != string(contract.JobFailed) {
+		t.Fatalf("committed failed status=%q, want %q", status, string(contract.JobFailed))
 	}
 }
 

@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http"
 	"time"
 
@@ -398,9 +399,29 @@ func appliedComputerReadError(err error, id string) error {
 }
 
 // #752 agent-protocol exception: a committed acknowledgement must not queue
-// behind operator admission. Keep the reload coherent on the main pool.
-func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, readModel) error) error {
+// behind operator admission. Keep the reload coherent on the main pool. The
+// reload holds its transaction under the same hard limit the read door
+// enforces, reusing its test-only override and typed expiry shape; only agent
+// acknowledgement handlers between this Store and the HTTP route may call it.
+func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, readModel) error) (err error) {
+	if ctx.Value(readSnapshotContextKey{}) != nil {
+		return errNestedReadSnapshot
+	}
+	limit := readSnapshotHardLimit
+	if override, ok := ctx.Value(readSnapshotHardLimitContextKey{}).(time.Duration); ok {
+		limit = override
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	defer func() {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			err = snapshotUnavailable("read_snapshot_expired", ctx.Err())
+		}
+	}()
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if errors.Is(err, context.DeadlineExceeded) {
+		return snapshotUnavailable("read_snapshot_admission_expired", err)
+	}
 	if err != nil {
 		return err
 	}
