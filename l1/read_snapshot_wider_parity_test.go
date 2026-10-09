@@ -68,9 +68,12 @@ func TestReadModelWiderPublicFixtures(t *testing.T) {
 		if _, err := h.store.db.ExecContext(t.Context(), "UPDATE service_jobs SET bound_node_id=?", node.NodeID); err != nil {
 			t.Fatal(err)
 		}
-		status, _, raw := h.do(client, http.MethodGet, "/v1/jobs?limit=2", nil)
-		if status != http.StatusOK {
-			t.Fatalf("%d %s", status, raw)
+		// Compare both rows' public wire shape across any adaptive page sizes.
+		// Snapshot-local memo sharing is checked separately below.
+		page := listingWalk(t, h, client, "/v1/jobs?limit=2")
+		raw, err := json.Marshal(page)
+		if err != nil {
+			t.Fatal(err)
 		}
 		assertWiderProjectionFixture(t, "same-node-page", raw, first.JobID, "JOB1", second.JobID, "JOB2")
 		if err := h.store.withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {

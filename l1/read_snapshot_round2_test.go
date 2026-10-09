@@ -52,9 +52,31 @@ func TestJobListingProjectionQueryBudget(t *testing.T) {
 				t.Fatal(err)
 			}
 			started := time.Now()
-			page, err := h.store.listReadableJobsForCaller(t.Context(), jobListFilters{}, "", MaxJobListingPageLimit, nil)
-			if err != nil || len(page.Jobs) != MaxJobListingPageLimit {
-				t.Fatalf("listing: rows=%d err=%v", len(page.Jobs), err)
+			var page JobList
+			cursor := ""
+			seen := map[string]bool{}
+			for {
+				next, err := h.store.listReadableJobsForCaller(t.Context(), jobListFilters{}, cursor, MaxJobListingPageLimit, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(next.Jobs) == 0 && next.NextCursor != "" {
+					t.Fatal("empty continuation")
+				}
+				for _, job := range next.Jobs {
+					if seen[job.JobID] {
+						t.Fatalf("duplicate job %s", job.JobID)
+					}
+					seen[job.JobID] = true
+				}
+				page.Jobs = append(page.Jobs, next.Jobs...)
+				cursor = next.NextCursor
+				if cursor == "" {
+					break
+				}
+			}
+			if len(page.Jobs) != MaxJobListingPageLimit {
+				t.Fatalf("listing walk: rows=%d", len(page.Jobs))
 			}
 			elapsed := time.Since(started)
 			counter := &snapshotQueryCounter{queryer: h.store.db}
@@ -70,7 +92,7 @@ func TestJobListingProjectionQueryBudget(t *testing.T) {
 					break
 				}
 			}
-			t.Logf("maximum-page listing=%s projection_queries_per_job=%d main_budget=%d", elapsed, perJob, scenario.budget)
+			t.Logf("listing walk=%s projection_queries_per_job=%d main_budget=%d", elapsed, perJob, scenario.budget)
 		})
 	}
 }

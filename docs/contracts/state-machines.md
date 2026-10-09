@@ -1509,9 +1509,14 @@ the store's default immediate writer lock. Detail and collection answers share o
 and snapshot across Job state, retained attempts, service status and actions.
 Child pages use that same door, so concurrent row deletion cannot break a
 selected page. Job collections retain membership/filter semantics with a
-measured maximum of 250 rows (default 100); child collections use the same
+maximum of 250 rows (default 100); child collections use the same
 maximum and default. Both clamp larger requested limits, so a page may return
-fewer rows than `limit`; `next_cursor` continues the walk when more rows exist.
+fewer rows than `limit`, including when the page is cut short to stay within
+the read budget. The soft cutoff is 60% of the 200 ms hard hold limit (120 ms).
+A nonempty selection returns at least one fully projected row from the same
+snapshot; `next_cursor` continues exactly after the last returned row when
+more rows exist, without gaps or duplicates. Single-resource views and the
+hard backstop are unchanged.
 Successful service changes project from one fresh snapshot
 after commit; view failure returns documented `read_snapshot_post_change_failed`
 unavailable with `mutation_applied=true`; `read_reason` identifies the underlying

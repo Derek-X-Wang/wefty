@@ -36,6 +36,34 @@ func listingPage(t *testing.T, h *integrationHarness, client *http.Client, path 
 	return page
 }
 
+func listingWalk(t *testing.T, h *integrationHarness, client *http.Client, path string) JobList {
+	t.Helper()
+	var combined JobList
+	cursor := ""
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	seen := map[string]bool{}
+	for {
+		page := listingPage(t, h, client, path+separator+"cursor="+url.QueryEscape(cursor))
+		if len(page.Jobs) == 0 && page.NextCursor != "" {
+			t.Fatal("empty continuation page")
+		}
+		for _, job := range page.Jobs {
+			if seen[job.JobID] {
+				t.Fatalf("duplicate row %s", job.JobID)
+			}
+			seen[job.JobID] = true
+		}
+		combined.Jobs = append(combined.Jobs, page.Jobs...)
+		cursor = page.NextCursor
+		if cursor == "" {
+			return combined
+		}
+	}
+}
+
 func jobListingIDs(page JobList) []string {
 	ids := make([]string, 0, len(page.Jobs))
 	for _, job := range page.Jobs {
@@ -182,7 +210,7 @@ func TestJobsListingCursorWalkExcludesConcurrentInserts(t *testing.T) {
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("walk IDs=%v, want exactly original IDs=%v", got, want)
 			}
-			fresh := listingPage(t, h, client, "/v1/jobs?limit=100")
+			fresh := listingWalk(t, h, client, "/v1/jobs?limit=100")
 			if len(fresh.Jobs) != 10 {
 				t.Fatalf("fresh walk has %d jobs, want 10", len(fresh.Jobs))
 			}
@@ -281,8 +309,13 @@ func TestJobsListingCursorBindsFiltersAndLegacyServiceCursor(t *testing.T) {
 	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
 	legacy := encodeServiceJobCursor(serviceJobCursor{CreatedNS: first.Jobs[0].CreatedAt.UnixNano(), JobID: first.Jobs[0].JobID})
 	page := listingPage(t, h, client, "/v1/jobs?class=service&cursor="+url.QueryEscape(legacy))
-	if len(page.Jobs) != 2 {
-		t.Fatalf("legacy cursor returns %d jobs, want 2", len(page.Jobs))
+	got := jobListingIDs(page)
+	for page.NextCursor != "" {
+		page = listingPage(t, h, client, "/v1/jobs?class=service&cursor="+url.QueryEscape(page.NextCursor))
+		got = append(got, jobListingIDs(page)...)
+	}
+	if len(got) != 2 || got[0] == got[1] {
+		t.Fatalf("legacy walk IDs=%v, want 2 distinct jobs", got)
 	}
 }
 
@@ -394,8 +427,8 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 			unblock := func() { once.Do(func() { close(release) }) }
 			defer unblock()
 			now := store.clock.Now()
-			// listReadableJobs reads its clock after selecting the IDs, before
-			// loading a maximum page of projections in the still-open transaction.
+			// The snapshot is anchored before its clock is sampled; pause there
+			// to prove a writer can commit while that view is held.
 			store.clock = ClockFunc(func() time.Time {
 				select {
 				case <-entered:
@@ -445,7 +478,7 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 			}
 			unblock()
 			<-listed
-			if listErr != nil || len(page.Jobs) != MaxJobListingPageLimit {
+			if listErr != nil || len(page.Jobs) < 1 || len(page.Jobs) > MaxJobListingPageLimit || page.NextCursor == "" {
 				t.Fatalf("large page: jobs=%d err=%v", len(page.Jobs), listErr)
 			}
 			if page.Jobs[0].State != contract.JobQueued {
@@ -539,7 +572,7 @@ func TestJobsListingExcludesRetiredComputerProjections(t *testing.T) {
 	}
 	for _, query := range []string{"", "class=service", "class=one-shot", "kind=oci", "state=stopped", "submitter=me", "kind=oci&state=stopped&submitter=me"} {
 		t.Run(query, func(t *testing.T) {
-			page := listingPage(t, h, client, "/v1/jobs?"+query)
+			page := listingWalk(t, h, client, "/v1/jobs?"+query)
 			for _, job := range page.Jobs {
 				if job.JobID == retiredID {
 					t.Errorf("retired Computer projection appeared in collection: %s", job.JobID)
@@ -550,9 +583,9 @@ func TestJobsListingExcludesRetiredComputerProjections(t *testing.T) {
 			}
 		})
 	}
-	all := jobListingIDs(listingPage(t, h, client, "/v1/jobs"))
-	partition := append(jobListingIDs(listingPage(t, h, client, "/v1/jobs?class=one-shot")),
-		jobListingIDs(listingPage(t, h, client, "/v1/jobs?class=service"))...)
+	all := jobListingIDs(listingWalk(t, h, client, "/v1/jobs"))
+	partition := append(jobListingIDs(listingWalk(t, h, client, "/v1/jobs?class=one-shot")),
+		jobListingIDs(listingWalk(t, h, client, "/v1/jobs?class=service"))...)
 	sort.Strings(partition)
 	if len(all) != 3 || !reflect.DeepEqual(all, partition) {
 		t.Fatalf("unfiltered=%v, want one-shot plus service=%v (3 jobs)", all, partition)

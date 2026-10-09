@@ -49,7 +49,7 @@ func TestJobListingReviewClampedCursorWalk(t *testing.T) {
 			seen := map[string]bool{}
 			cursor := ""
 			for pageNumber := 0; ; pageNumber++ {
-				if pageNumber > 10 {
+				if pageNumber >= want {
 					t.Fatal("cursor walk did not finish")
 				}
 				status, _, body := h.do(client, http.MethodGet, path+"&cursor="+url.QueryEscape(cursor), nil)
@@ -60,7 +60,7 @@ func TestJobListingReviewClampedCursorWalk(t *testing.T) {
 				if err := json.Unmarshal(body, &page); err != nil {
 					t.Fatal(err)
 				}
-				if len(page.Jobs) > 250 || pageNumber == 0 && (len(page.Jobs) != 250 || page.NextCursor == "") {
+				if len(page.Jobs) < 1 || len(page.Jobs) > MaxJobListingPageLimit || pageNumber == 0 && page.NextCursor == "" {
 					t.Fatalf("page %d: rows=%d cursor=%q", pageNumber, len(page.Jobs), page.NextCursor)
 				}
 				for _, job := range page.Jobs {
@@ -103,8 +103,21 @@ func TestJobListingReviewStoreClamps(t *testing.T) {
 			} else {
 				page, err = h.store.listReadableJobs(t.Context(), jobListFilters{}, "", 1000)
 			}
-			if err != nil || len(page.Jobs) != 250 || page.NextCursor == "" {
+			// The real door may adapt; verify the exact clamp independently of
+			// wall-clock speed using the same production page method.
+			if err != nil || len(page.Jobs) < 1 || len(page.Jobs) > MaxJobListingPageLimit || page.NextCursor == "" {
 				t.Fatalf("rows=%d cursor=%q err=%v", len(page.Jobs), page.NextCursor, err)
+			}
+			err = diagnosticReadSnapshot(t, h.store, nil, func(reads readModel) (err error) {
+				if children {
+					page, err = reads.childrenPage(t.Context(), parent.JobID, "", 1000)
+				} else {
+					page, err = reads.jobsPage(t.Context(), jobListFilters{}, "", 1000)
+				}
+				return err
+			})
+			if err != nil || len(page.Jobs) != MaxJobListingPageLimit || page.NextCursor == "" {
+				t.Fatalf("clamp: rows=%d cursor=%q err=%v", len(page.Jobs), page.NextCursor, err)
 			}
 		})
 	}

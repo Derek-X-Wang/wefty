@@ -90,7 +90,16 @@ has the same maximum and default. A request above the maximum is clamped to
 250: either listing may return fewer rows than `limit`, with `next_cursor`
 when more rows exist. Walking the cursor visits all selected rows. Other
 collections retain their 1000-row maximum. Pages are never divided across
-snapshots.
+snapshots. The named `readSnapshotPageSoftLimit` is **60% of the hard hold
+limit (120 ms)**, measured with elapsed monotonic time from the transaction
+anchor, including clock sampling, authorization and membership selection.
+Jobs and child listings finish at least one row when one exists, then stop
+adding rows once this cutoff is reached. All returned rows still share one
+snapshot. The cursor resumes exactly after the last returned row, including
+when the cutoff shortens a page; no selected row is skipped or repeated.
+Slow machines therefore return shorter pages. The unchanged 200 ms hard limit
+remains a backstop for pathological membership queries or individual rows;
+single-resource views are unchanged. Neither limit delays secret scrubbing.
 
 On the owner's Mac, through the shared Go lock with CGO disabled, three idle
 samples of the production page projector (authenticated client actions,
@@ -105,7 +114,9 @@ dedicated read pool, one clock/memo, anchor through rollback) measured:
 
 Earlier 1000-row samples reached 195 ms, leaving insufficient margin under
 200 ms and exceeding the 100 ms advisory. A 400-row failed-service sample
-reached 114 ms. The measured 250-row cap leaves margin under both limits.
+reached 114 ms. Those local samples left margin under both limits; CI runners
+exceeded the hard limit even at 250 rows. The cap alone does not guarantee a time budget,
+so production now uses the adaptive soft cutoff above.
 Node queries were constant per page
 (two for the queued/running cases, three for failed); they did not grow with
 row count. `TestJobReadSnapshotMeasureMaximumPage` reproduces the diagnostic.
@@ -117,7 +128,8 @@ the final cap from concurrent paging and secret-scrubbing evidence.
 
 The child-page diagnostic `TestJobReadSnapshotMeasureChildrenPage` measures
 250 service children with one retained attempt each, authenticated client
-projection, one pinned clock, and the production 200 ms hard hold limit.
+projection and one pinned clock. The diagnostic now excludes both time
+cutoffs so slow machines can report full projection cost.
 Three local idle samples per state on the same Mac measured the complete
 snapshot door (before checkout through rollback):
 
@@ -128,6 +140,11 @@ snapshot door (before checkout through rollback):
 | Running, bound | 33.2–35.6 ms |
 | Failed, bound | 42.0–44.2 ms |
 
-Each fixture has 251 children and requests `limit=1000`; each answer contains
-250 children plus `next_cursor`, with exactly one clock sample. These are
-local idle measurements, not sustained-load proof.
+Each diagnostic fixture has 251 children and requests `limit=1000`; its
+uncut answer contains 250 children plus `next_cursor`, with one clock sample.
+Production pages may be shorter. These are historical local idle measurements,
+not sustained-load proof. Measurement tests log durations and do not enforce
+wall-clock speed by default; `WEFTY_ENFORCE_READ_BUDGET=1` explicitly enforces
+the 100 ms target in the diagnostics. Functional listing tests can simulate a
+slow machine with `WEFTY_TEST_READ_PAGE_CUTOFF=1ns` (test binary only), and
+assert complete, duplicate-free walks for any returned page size.

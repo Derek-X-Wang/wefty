@@ -159,9 +159,9 @@ func TestChildListingSurvivesDeletedRow(t *testing.T) {
 			if _, err := h.store.db.Exec("UPDATE jobs SET parent_job_id=? WHERE job_id=?", parent.JobID, child.JobID); err != nil {
 				t.Fatal(err)
 			}
-			// Projection time is obtained after selecting IDs. Delete on another
-			// connection at that boundary: WAL readers must retain the Job and
-			// its attempt evidence for both operator and status projections.
+			// SQLite is anchored before sampling the clock. Delete on another
+			// connection there: the snapshot must retain the Job and its attempt
+			// evidence. Exempt this fsync seam from projection timing.
 			oldClock := h.store.clock
 			deleted := false
 			h.store.clock = ClockFunc(func() time.Time {
@@ -174,7 +174,11 @@ func TestChildListingSurvivesDeletedRow(t *testing.T) {
 				return oldClock.Now()
 			})
 			defer func() { h.store.clock = oldClock }()
-			page, err := h.store.ListChildJobs(t.Context(), parent.JobID, "", 10)
+			var page JobList
+			err = diagnosticReadSnapshot(t, h.store, nil, func(reads readModel) (err error) {
+				page, err = reads.childrenPage(t.Context(), parent.JobID, "", 10)
+				return err
+			})
 			if err != nil || len(page.Jobs) != 1 || page.Jobs[0].JobID != child.JobID {
 				t.Fatalf("deleted row broke listing snapshot: page=%+v err=%v", page, err)
 			}
@@ -275,19 +279,27 @@ func TestChildListingDeletedBeforeOperatorProjection(t *testing.T) {
 		}
 	})
 	defer func() { h.store.clock = oldClock }()
-	r := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+parent.JobID+"/children", nil)
-	r.SetPathValue("job_id", parent.JobID)
-	r = r.WithContext(context.WithValue(ctx, identityContextKey{}, fabric.Identity{Tags: []string{DefaultClientPrincipalTag}}))
-	w := httptest.NewRecorder()
-	h.server.listChildJobs(w, r)
+	actor := &serviceActionActor{Identity: fabric.Identity{Tags: []string{DefaultClientPrincipalTag}}, ClientPrincipalTag: DefaultClientPrincipalTag}
 	var page JobList
-	if calls != 1 || !*deleted || w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &page) != nil || len(page.Jobs) != 2 {
-		t.Fatalf("deletion before operator projection: calls=%d status=%d %s", calls, w.Code, w.Body.String())
+	// Exempt this synchronization seam from the time budget: the deletion's
+	// fsync is test coordination, not read projection cost. Membership and
+	// operator projection still use the production method and one anchored view.
+	err = diagnosticReadSnapshot(t, h.store, actor, func(reads readModel) (err error) {
+		page, err = reads.childrenPage(ctx, parent.JobID, "", 100)
+		return err
+	})
+	if err != nil || calls != 1 || !*deleted || len(page.Jobs) != 2 {
+		t.Fatalf("deletion before operator projection: calls=%d rows=%d err=%v", calls, len(page.Jobs), err)
 	}
 	for _, job := range page.Jobs {
-		if job.ServiceOperatorFacts == nil || len(job.ServiceOperatorFacts.AllowedActions) != 5 {
-			t.Fatalf("missing facts after deletion: %+v", job)
+		if job.State != contract.JobStopped || job.ServiceOperatorFacts == nil || len(job.ServiceOperatorFacts.AllowedActions) != 5 {
+			t.Fatalf("half-applied deletion: %+v", job)
 		}
+	}
+	// A fresh production page sees the deletion fully applied.
+	fresh, err := h.store.listChildJobsForCaller(t.Context(), parent.JobID, "", 100, actor)
+	if err != nil || len(fresh.Jobs) != 1 || fresh.Jobs[0].JobID == firstID || fresh.Jobs[0].ServiceOperatorFacts == nil {
+		t.Fatalf("fresh page after deletion: %+v err=%v", fresh, err)
 	}
 }
 

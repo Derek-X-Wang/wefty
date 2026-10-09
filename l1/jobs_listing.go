@@ -201,7 +201,7 @@ func (r *databaseReads) jobsPage(ctx context.Context, filters jobListFilters, cu
 	}
 	// Read the selected rows in the same snapshot as the filter query so a
 	// state transition cannot turn a state-filtered page into mismatched rows.
-	for _, item := range listed {
+	for i, item := range listed {
 		job, err := readJob(ctx, r, item.jobID)
 		if err != nil {
 			return JobList{}, err
@@ -211,9 +211,15 @@ func (r *databaseReads) jobsPage(ctx context.Context, filters jobListFilters, cu
 			return JobList{}, err
 		}
 		page.Jobs = append(page.Jobs, job)
+		// Finish at least one row, then stop before starting another expensive
+		// projection. Membership and every returned fact stay in this snapshot.
+		if r.pageCutoffReached() {
+			hasMore = hasMore || i+1 < len(listed)
+			break
+		}
 	}
 	if hasMore {
-		last := listed[len(listed)-1]
+		last := listed[len(page.Jobs)-1]
 		cursor.CreatedNS, cursor.JobID = last.createdNS, last.jobID
 		payload, _ := json.Marshal(cursor)
 		page.NextCursor = base64.RawURLEncoding.EncodeToString(payload)

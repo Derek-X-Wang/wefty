@@ -93,6 +93,7 @@ func TestJobReadSnapshotMeasureMaximumPage(t *testing.T) {
 						t.Fatalf("node facts grew with page: %d queries", counter.nodes)
 					}
 					t.Logf("rows=%d anchor-to-rollback=%s node_queries=%d", size, elapsed, counter.nodes)
+					enforceReadMeasurementBudget(t, elapsed)
 				}
 			}
 		})
@@ -123,7 +124,7 @@ func measureJobPage(ctx context.Context, r *databaseReads, size int) (JobList, e
 	return combined, nil
 }
 
-// Measure the real children page with the production 200 ms hold limit,
+// Measure a complete children page without a wall-clock deadline,
 // authenticated action projection, and one retained attempt per service.
 func TestJobReadSnapshotMeasureChildrenPage(t *testing.T) {
 	for _, scenario := range []string{"queued-bound", "queued-unbound", "running-bound", "failed-bound"} {
@@ -166,7 +167,11 @@ func TestJobReadSnapshotMeasureChildrenPage(t *testing.T) {
 				calls := 0
 				h.store.clock = ClockFunc(func() time.Time { calls++; return at })
 				start := time.Now()
-				page, err := h.store.listChildJobsForCaller(t.Context(), parent.JobID, "", 1000, actor)
+				var page JobList
+				err := diagnosticReadSnapshot(t, h.store, actor, func(reads readModel) (err error) {
+					page, err = reads.childrenPage(t.Context(), parent.JobID, "", 1000)
+					return err
+				})
 				elapsed := time.Since(start)
 				if err != nil || len(page.Jobs) != 250 || page.NextCursor == "" || calls != 1 {
 					t.Fatalf("rows=%d cursor=%q clocks=%d err=%v", len(page.Jobs), page.NextCursor, calls, err)
@@ -174,7 +179,8 @@ func TestJobReadSnapshotMeasureChildrenPage(t *testing.T) {
 				for _, job := range page.Jobs {
 					assertCurrentAttemptPresent(t, job)
 				}
-				t.Logf("children=%d one-snapshot-door=%s clocks=%d", len(page.Jobs), elapsed, calls)
+				t.Logf("children=%d diagnostic-snapshot=%s clocks=%d", len(page.Jobs), elapsed, calls)
+				enforceReadMeasurementBudget(t, elapsed)
 			}
 		})
 	}

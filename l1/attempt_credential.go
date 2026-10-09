@@ -249,7 +249,7 @@ func (r *databaseReads) childrenPage(ctx context.Context, parentJobID, cursorVal
 	if hasMore {
 		listed = listed[:limit]
 	}
-	for _, item := range listed {
+	for i, item := range listed {
 		job, err := readJob(ctx, r, item.jobID)
 		if err != nil {
 			return JobList{}, err
@@ -259,9 +259,15 @@ func (r *databaseReads) childrenPage(ctx context.Context, parentJobID, cursorVal
 			return JobList{}, err
 		}
 		page.Jobs = append(page.Jobs, job)
+		// Finish at least one row, then stop before starting another expensive
+		// projection. Membership and every returned fact stay in this snapshot.
+		if r.pageCutoffReached() {
+			hasMore = hasMore || i+1 < len(listed)
+			break
+		}
 	}
 	if hasMore && len(listed) > 0 {
-		last := listed[len(listed)-1]
+		last := listed[len(page.Jobs)-1]
 		page.NextCursor = encodeServiceJobCursor(serviceJobCursor{CreatedNS: last.createdNS, JobID: last.jobID})
 	}
 	return page, nil

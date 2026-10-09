@@ -51,6 +51,7 @@ type readModel interface {
 // databaseReads is private SQL plumbing; callers see only readModel.
 // A write gets a fresh memo at each decision, never across writes.
 type databaseReads struct {
+	pageDeadline    time.Time
 	q               queryer
 	at              time.Time
 	actor           *serviceActionActor
@@ -329,6 +330,20 @@ const readSnapshotLimit = 12
 const readSnapshotBudget = 100 * time.Millisecond
 const readSnapshotHardLimit = 200 * time.Millisecond
 
+// Leave 40% of the hard hold limit for finishing a row and rolling back.
+// This is elapsed monotonic time, independent of the pinned domain clock.
+const readSnapshotPageSoftLimit = readSnapshotHardLimit * 3 / 5
+
+// Tests may lower the cutoff before running the suite; production keeps the
+// named default. A context override permits deterministic per-request probes.
+var readSnapshotPageCutoff = readSnapshotPageSoftLimit
+
+type readPageCutoffContextKey struct{}
+
+func (r *databaseReads) pageCutoffReached() bool {
+	return !r.pageDeadline.IsZero() && !time.Now().Before(r.pageDeadline)
+}
+
 type readSnapshotContextKey struct{}
 
 var errNestedReadSnapshot = &Error{Code: contract.ErrorInternal, Message: "nested read snapshot acquisition", notRetryable: true}
@@ -386,6 +401,11 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 		return err
 	}
 	reads := newDatabaseReads(tx, canonicalTime(s.clock.Now()), caller)
+	cutoff := readSnapshotPageCutoff
+	if override, ok := ctx.Value(readPageCutoffContextKey{}).(time.Duration); ok {
+		cutoff = override
+	}
+	reads.pageDeadline = anchored.Add(cutoff)
 	if err = use(ctx, reads); err != nil {
 		return err
 	}
