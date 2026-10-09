@@ -626,7 +626,11 @@ completion time, so a client waiting on an export judges its status: only
 were both digest-verified. Typed helper failure evidence records `failed` and
 closes `exporting`, and a dead bound Node permits an explicit abort.
 `operator_attested_deleted` is append-only operator evidence and never changes
-`removed_reduced`.
+`removed_reduced`. After the evidence commits, response reload failure returns
+503 `unavailable` with `reason=read_snapshot_post_change_failed`,
+`mutation_applied=true`, `export_id` and `read_reason`; only snapshot availability
+failures are retryable. Retry a read to observe the export; a mutation retry keeps
+its original idempotency key.
 
 `custody.json` is the portable import authority: it contains the sanitized Job
 specification, manifest digest inputs, immutable source digest, and Storage

@@ -289,7 +289,7 @@ func (s *Store) DrainNode(ctx context.Context, identityNodeID, nodeID, bootSessi
 	result, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?,
 		last_condition_json=CASE WHEN state=? THEN last_condition_json ELSE ? END
 		WHERE node_id=? AND identity_node_id=? AND boot_session_id=? AND state IN (?, ?, ?)`,
-		contract.NodeDraining, contract.NodeDraining, conditionJSON("node_draining", "node_liveness", s.clock.Now(), nil), nodeID, identityNodeID, bootSessionID,
+		contract.NodeDraining, contract.NodeDraining, conditionJSON("node_draining", "node_liveness", write.at, nil), nodeID, identityNodeID, bootSessionID,
 		contract.NodeAlive, contract.NodeStale, contract.NodeDraining)
 	if err != nil {
 		return Node{}, internalError(err, "drain node")

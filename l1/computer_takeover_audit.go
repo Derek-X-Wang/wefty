@@ -104,7 +104,7 @@ func (s *Store) AppendComputerTakeoverAudit(
 
 	event := request.Event
 	event.AuthorityGeneration = attempt.authorityGeneration
-	storedNS := canonicalTime(s.clock.Now()).UnixNano()
+	storedNS := write.at.UnixNano()
 	_, err = tx.ExecContext(ctx, `INSERT INTO computer_takeover_audit(
 		attempt_id, event_id, event_kind, computer_id, job_id, session_id, fabric_id, user_id, device_id,
 		authorized_role, admitted_mode, policy_revision, authority_generation, occurred_ns, stored_ns, reason, event_count, request_hash

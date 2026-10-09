@@ -389,7 +389,11 @@ func (r *databaseReads) backupChoices(ctx context.Context, computerID string) ([
 
 // A failed post-commit observation must not invite replay as an unapplied write.
 func appliedComputerReadError(err error, id string) error {
-	details := map[string]any{"reason": "read_snapshot_post_change_failed", "mutation_applied": true, "computer_id": id, "read_reason": string(errorCode(err))}
+	return appliedResourceReadError(err, "computer_id", id, "Computer change committed but its view is unavailable")
+}
+
+func appliedResourceReadError(err error, resource, id, message string) error {
+	details := map[string]any{"reason": "read_snapshot_post_change_failed", "mutation_applied": true, resource: id, "read_reason": string(errorCode(err))}
 	retryable := false
 	if api := apiErrorFromDecision(err); api != nil && api.Code == contract.ErrorUnavailable {
 		if reason, ok := api.Details["reason"].(string); ok && (reason == "read_snapshot_admission_expired" || reason == "read_snapshot_expired") {
@@ -397,17 +401,17 @@ func appliedComputerReadError(err error, id string) error {
 			retryable = true
 		}
 	}
-	return &Error{Code: contract.ErrorUnavailable, Message: "Computer change committed but its view is unavailable", Details: details, notRetryable: !retryable}
+	return &Error{Code: contract.ErrorUnavailable, Message: message, Details: details, notRetryable: !retryable}
 }
 
-// #752 agent-protocol exception: a committed acknowledgement must not queue
-// behind the read door. Keep the reload coherent on the main pool, with the
+// #752 agent and L3 protocol reads must not queue behind operator admission.
+// Keep the read coherent on the main pool, with the
 // door's own two-stage shape: main-pool checkout gets its own admission
 // budget, and the read-only transaction then holds its connection under the
 // same hard hold limit with the same typed expiry; both reuse the door's
 // test-only override. The derived context marks nested snapshot acquisition
-// as a programming error. Only agent acknowledgement handlers between this
-// Store and the agent mux may call it (see read_boundary_test.go).
+// as a programming error. Only reviewed agent and L3 protocol owners may
+// call it (see read_boundary_test.go).
 func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, readModel) error) (err error) {
 	if ctx.Value(readSnapshotContextKey{}) != nil {
 		return errNestedReadSnapshot

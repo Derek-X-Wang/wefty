@@ -124,7 +124,7 @@ func (s *Store) markLogEventDocumentsCompactOnNewDatabase(ctx context.Context) e
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name, applied_ns) VALUES(?, ?)`,
-		logEventDocumentMigration, s.clock.Now().UnixNano()); err != nil {
+		logEventDocumentMigration, write.at.UnixNano()); err != nil {
 		return fmt.Errorf("l1: record log event document migration: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -212,7 +212,7 @@ func (s *Store) CompactLogEventDocuments(ctx context.Context) (LogEventCompactio
 			return LogEventCompaction{}, internalError(err, "retire log event document migration cursor")
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name, applied_ns) VALUES(?, ?)`,
-			logEventDocumentMigration, s.clock.Now().UnixNano()); err != nil {
+			logEventDocumentMigration, write.at.UnixNano()); err != nil {
 			return LogEventCompaction{}, internalError(err, "record log event document migration")
 		}
 		result.Done = true

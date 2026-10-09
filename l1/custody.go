@@ -550,7 +550,11 @@ func (s *Store) AttestComputerCustodyDeletedWithReplay(ctx context.Context, expo
 		exported, err = reads.custodyExport(ctx, exportID)
 		return err
 	})
-	return exported, replayed, err
+	if err != nil {
+		return exported, replayed, appliedResourceReadError(err, "export_id", exportID,
+			"Custody deletion attestation committed but its view is unavailable")
+	}
+	return exported, replayed, nil
 }
 
 func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string, request ComputerCustodyImportRequest) (ComputerCustodyImport, bool, error) {
@@ -766,13 +770,17 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 	if err != nil {
 		return Computer{}, internalError(err, "encode Custody import acknowledgement")
 	}
-	now := canonicalTime(s.clock.Now())
-	write, err := s.beginWriteTransaction(ctx, nil, now)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Custody import acknowledgement")
 	}
-	tx := write.tx
 	defer write.rollback()
+	return s.acknowledgeComputerCustodyImport(ctx, write, identityNodeID, destinationComputerID, request, bodyHash)
+}
+
+// Dispatch and import settlement share the write and its pinned clock.
+func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *writeTransaction, identityNodeID, destinationComputerID string, request ComputerStorageCopyAcknowledgementRequest, bodyHash string) (Computer, error) {
+	tx, now := write.tx, write.at
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}

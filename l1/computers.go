@@ -1640,7 +1640,7 @@ func (s *Store) reimageComputer(ctx context.Context, computerID string, request 
 			*replayed = true
 		}
 	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
-		return Computer{}, internalError(lookupErr, "read Computer reimage replay")
+		return Computer{}, snapshotReadError(lookupErr, "read Computer reimage replay")
 	}
 	dispatchHash := sha256.Sum256(append([]byte(computerID+"\x00"+request.Actor+"\x00"), reimagePayload...))
 	dispatchKey := "computer-reimage:" + hex.EncodeToString(dispatchHash[:])

@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -151,7 +152,7 @@ func boundaryExternal(fn *types.Func) bool {
 	switch path {
 	case "net/http":
 		switch name {
-		case "Do", "Get", "Head", "Post", "PostForm", "RoundTrip", "Serve", "ServeTLS", "ListenAndServe", "ListenAndServeTLS", "Write", "Flush", "Hijack":
+		case "Do", "Get", "Head", "Post", "PostForm", "RoundTrip", "Serve", "ServeTLS", "ListenAndServe", "ListenAndServeTLS", "Write", "WriteHeader", "Flush", "Hijack":
 			return true
 		}
 	case "net/rpc", "net/smtp":
@@ -188,9 +189,6 @@ func (c *boundaryCalls) networkArgument(expr ast.Expr) bool {
 }
 
 func (c *boundaryCalls) genericNetworkIO(call *ast.CallExpr, fn *types.Func) bool {
-	if fn == nil || fn.Pkg() == nil || (fn.Pkg().Path() != "io" && fn.Pkg().Path() != "fmt") {
-		return false
-	}
 	for _, arg := range call.Args {
 		if c.networkArgument(arg) {
 			return true
@@ -251,28 +249,72 @@ func (c *boundaryCalls) externalCalls(root ast.Node) []*ast.CallExpr {
 	return violations
 }
 
+func boundaryAuthorityParams(params *ast.FieldList, info *types.Info, includeBegin bool) bool {
+	if params == nil {
+		return false
+	}
+	for _, param := range params.List {
+		if named := boundaryNamed(info.TypeOf(param.Type)); named != nil {
+			obj := named.Obj()
+			if obj.Pkg() != nil && ((obj.Pkg().Path() == boundaryPkgPath || obj.Pkg().Path() == "fixture") &&
+				(!includeBegin && obj.Name() == "readModel" || obj.Name() == "writeTransaction" || includeBegin && obj.Name() == "writeTransactionBegin") ||
+				obj.Pkg().Path() == "database/sql" && obj.Name() == "Tx") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func boundaryWriteOwner(fn *ast.FuncDecl, calls *boundaryCalls) bool {
+	if boundaryAuthorityParams(fn.Type.Params, calls.info, true) {
+		return true
+	}
+	owns := false
+	ast.Inspect(fn.Body, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok && boundaryStoreDoor(calls.function(call.Fun), "beginWriteTransaction", "beginSettlementWriteTransaction") {
+			owns = true
+		}
+		return true
+	})
+	return owns
+}
+
 func snapshotCallbackSites(fset *token.FileSet, files []*ast.File, info *types.Info) []string {
 	calls := newBoundaryCalls(files, info)
 	var sites []string
+	reported := map[token.Pos]bool{}
+	report := func(call *ast.CallExpr, kind string) {
+		if !reported[call.Pos()] {
+			reported[call.Pos()] = true
+			sites = append(sites, fmt.Sprintf("%s: %s", fset.Position(call.Pos()), kind))
+		}
+	}
+	scan := func(body *ast.BlockStmt) {
+		ast.Inspect(body, func(n ast.Node) bool {
+			if nested, ok := n.(*ast.CallExpr); ok && boundaryStoreDoor(calls.function(nested.Fun), "withReadSnapshot", "withAgentReadSnapshot") {
+				report(nested, "nested snapshot")
+			}
+			return true
+		})
+		for _, external := range calls.externalCalls(body) {
+			report(external, "external call")
+		}
+	}
 	for _, file := range files {
 		ast.Inspect(file, func(node ast.Node) bool {
+			// Forwarded callbacks and settlement literals hold authority even when
+			// their enclosing owner has neither a door call nor a transaction parameter.
+			if literal, ok := node.(*ast.FuncLit); ok && boundaryAuthorityParams(literal.Type.Params, info, false) {
+				scan(literal.Body)
+			}
 			call, ok := node.(*ast.CallExpr)
 			if !ok || !boundaryStoreDoor(calls.function(call.Fun), "withReadSnapshot", "withAgentReadSnapshot") {
 				return true
 			}
 			for _, arg := range call.Args {
-				literal, ok := calls.resolve(arg).(*ast.FuncLit)
-				if !ok {
-					continue
-				}
-				ast.Inspect(literal.Body, func(n ast.Node) bool {
-					if nested, ok := n.(*ast.CallExpr); ok && boundaryStoreDoor(calls.function(nested.Fun), "withReadSnapshot") {
-						sites = append(sites, fmt.Sprintf("%s: nested withReadSnapshot", fset.Position(nested.Pos())))
-					}
-					return true
-				})
-				for _, external := range calls.externalCalls(literal.Body) {
-					sites = append(sites, fmt.Sprintf("%s: external call in snapshot at %s", fset.Position(external.Pos()), fset.Position(call.Pos())))
+				if literal, ok := calls.resolve(arg).(*ast.FuncLit); ok {
+					scan(literal.Body)
 				}
 			}
 			return true
@@ -282,27 +324,9 @@ func snapshotCallbackSites(fset *token.FileSet, files []*ast.File, info *types.I
 			if !ok || fn.Body == nil || boundaryStoreDoor(calls.function(fn.Name), "beginWriteTransaction", "beginSettlementWriteTransaction") {
 				continue
 			}
-			ownsWrite := false
-			ast.Inspect(fn.Body, func(node ast.Node) bool {
-				if call, ok := node.(*ast.CallExpr); ok && boundaryStoreDoor(calls.function(call.Fun), "beginWriteTransaction", "beginSettlementWriteTransaction") {
-					ownsWrite = true
-				}
-				return true
-			})
-			// Settlement callbacks use an injected write door. Protect their
-			// owner too, along with any helper taking transaction authority.
-			if fn.Type.Params != nil {
-				for _, param := range fn.Type.Params.List {
-					typ := info.TypeOf(param.Type)
-					if named := boundaryNamed(typ); named != nil {
-						obj := named.Obj()
-						ownsWrite = ownsWrite || obj.Name() == "writeTransactionBegin" || obj.Name() == "writeTransaction" || obj.Pkg() != nil && obj.Pkg().Path() == "database/sql" && obj.Name() == "Tx"
-					}
-				}
-			}
-			if ownsWrite {
+			if boundaryWriteOwner(fn, calls) {
 				for _, external := range calls.externalCalls(fn.Body) {
-					sites = append(sites, fmt.Sprintf("%s: external call in write owner %s", fset.Position(external.Pos()), fn.Name.Name))
+					report(external, "external call")
 				}
 			}
 		}
@@ -311,8 +335,37 @@ func snapshotCallbackSites(fset *token.FileSet, files []*ast.File, info *types.I
 	return sites
 }
 
+func requireBoundaryInfo(t *testing.T, info *types.Info) {
+	t.Helper()
+	if len(info.Defs) == 0 || len(info.Uses) == 0 || len(info.Selections) == 0 {
+		t.Fatalf("boundary type resolution empty: Defs=%d Uses=%d Selections=%d", len(info.Defs), len(info.Uses), len(info.Selections))
+	}
+}
+
 func TestReadSnapshotCallbackGuard(t *testing.T) {
 	fset, files, info := readBoundaryTypes(t)
+	requireBoundaryInfo(t, info)
+	calls := newBoundaryCalls(files, info)
+	snapshots, owners := 0, 0
+	for _, file := range files {
+		ast.Inspect(file, func(node ast.Node) bool {
+			if call, ok := node.(*ast.CallExpr); ok && boundaryStoreDoor(calls.function(call.Fun), "withReadSnapshot", "withAgentReadSnapshot") {
+				snapshots++
+			}
+			return true
+		})
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Body != nil && boundaryWriteOwner(fn, calls) {
+				owners++
+			}
+		}
+	}
+	// Floors pin known snapshot and write-authority coverage without requiring
+	// unrelated additions to update counts.
+	t.Logf("resolved bodies=%d snapshots=%d write owners=%d", len(calls.bodies), snapshots, owners)
+	if len(calls.bodies) == 0 || snapshots < 50 || owners < 100 {
+		t.Fatalf("callback scan lost coverage: bodies=%d snapshots=%d write owners=%d", len(calls.bodies), snapshots, owners)
+	}
 	if sites := snapshotCallbackSites(fset, files, info); len(sites) != 0 {
 		t.Fatalf("read boundary callbacks:\n%s", strings.Join(sites, "\n"))
 	}
@@ -320,9 +373,10 @@ func TestReadSnapshotCallbackGuard(t *testing.T) {
 
 func TestReadSnapshotGuardDetectsCallbackEscapes(t *testing.T) {
 	source := `package fixture
- import (web "net/http"; network "net"; "io")
+ import (web "net/http"; network "net"; "io"; "database/sql"; "encoding/json")
  type Store struct{}
  type writeTransaction struct{}
+ type readModel interface{}
  type ComputerTokenRevoker interface {CountComputerInflight()}
  type Harmless struct{}
  func (Harmless) CountComputerInflight() {}
@@ -335,6 +389,17 @@ func TestReadSnapshotGuardDetectsCallbackEscapes(t *testing.T) {
  func agent(s *Store, c ComputerTokenRevoker) {s.withAgentReadSnapshot(func(){c.CountComputerInflight()})}
  func write(s *Store, c ComputerTokenRevoker) {_=s.beginWriteTransaction(); use:=func(){c.CountComputerInflight()}; use()}
  func networkIO(s *Store, c network.Conn, h *web.Client) {s.withReadSnapshot(func(){ _,_=c.Write(nil); _,_=h.Get("http://example.invalid"); writer:=io.Writer(c); _,_=io.WriteString(writer, "test") })}
+ func settle(use func(*sql.Tx)) {}
+ func settlement() {settle(func(tx *sql.Tx){ _,_=web.Get("http://example.invalid") })}
+ func forward(use func(readModel)) {}
+ func forwardedWrite(w web.ResponseWriter) {forward(func(reads readModel){ _,_=w.Write(nil) })}
+ func forwardedNested(s *Store) {forward(func(reads readModel){s.withReadSnapshot(func(){})})}
+ func forwardWriteAuthority(use func(*writeTransaction)) {}
+ func writeLiteral() {forwardWriteAuthority(func(write *writeTransaction){_,_=web.Get("http://example.invalid")})}
+ func writeJSON(w web.ResponseWriter, value any) { _=json.NewEncoder(w).Encode(value) }
+ func response(s *Store, w web.ResponseWriter) {s.withReadSnapshot(func(){writeJSON(w, nil)})}
+ func encoding(s *Store, w web.ResponseWriter) {s.withReadSnapshot(func(){_=json.NewEncoder(w).Encode(nil)})}
+ func header(s *Store, w web.ResponseWriter) {s.withReadSnapshot(func(){w.WriteHeader(200)})}
  func harmless(s *Store) {s.withReadSnapshot(func(){Harmless{}.CountComputerInflight()})}
  `
 	fset := token.NewFileSet()
@@ -342,7 +407,7 @@ func TestReadSnapshotGuardDetectsCallbackEscapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Uses: map[*ast.Ident]types.Object{}, Defs: map[*ast.Ident]types.Object{}, Selections: map[*ast.SelectorExpr]*types.Selection{}}
+	info := newBoundaryInfo()
 	_, _, production := readBoundaryTypes(t)
 	packages := map[string]*types.Package{}
 	for _, obj := range production.Uses {
@@ -353,10 +418,30 @@ func TestReadSnapshotGuardDetectsCallbackEscapes(t *testing.T) {
 	if _, err := (&types.Config{Importer: boundaryPackageImporter(packages)}).Check("fixture", fset, []*ast.File{file}, info); err != nil {
 		t.Fatal(err)
 	}
+	requireBoundaryInfo(t, info)
 	sites := snapshotCallbackSites(fset, []*ast.File{file}, info)
-	if len(sites) != 7 {
-		t.Fatalf("want nested, indirect L3, agent L3, write L3, net.Conn, HTTP client and generic I/O violations; got %v", sites)
+	expected := []string{
+		"fixture.go:12:71: external call", // helper reached by indirect callback
+		"fixture.go:13:52: nested snapshot",
+		"fixture.go:15:79: external call",   // agent callback
+		"fixture.go:16:89: external call",   // write owner
+		"fixture.go:17:90: external call",   // Conn.Write
+		"fixture.go:17:108: external call",  // Client.Get
+		"fixture.go:17:149: external call",  // io.Writer conversion of Conn
+		"fixture.go:17:167: external call",  // io.WriteString
+		"fixture.go:19:50: external call",   // settlement literal with *sql.Tx
+		"fixture.go:21:80: external call",   // forwarded readModel literal: Write
+		"fixture.go:22:64: nested snapshot", // forwarded readModel literal: snapshot
+		"fixture.go:24:79: external call",   // writeTransaction literal
+		"fixture.go:26:75: external call",   // writeJSON(w, ...)
+		"fixture.go:27:77: external call",   // json.NewEncoder(w)
+		"fixture.go:28:73: external call",   // WriteHeader
 	}
+	sort.Strings(expected)
+	if !reflect.DeepEqual(sites, expected) {
+		t.Fatalf("callback sites=%v; want exactly %v", sites, expected)
+	}
+
 }
 
 func TestReadSnapshotExceptionClasses(t *testing.T) {

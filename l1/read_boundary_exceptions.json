@@ -20,13 +20,13 @@
   {
     "site": "computer_operator.go:*Store.withAgentReadSnapshot | s.db",
     "count": 1,
-    "reason": "Agent acknowledgement post-commit reload stays coherent on the main pool, independent of operator snapshot admission.",
+    "reason": "Agent and L3 protocol reads stay coherent on the main pool, independent of operator snapshot admission.",
     "slice": "agent-protocol"
   },
   {
     "site": "computer_operator.go:*Store.withAgentReadSnapshot | conn",
     "count": 3,
-    "reason": "Agent acknowledgement snapshot constructor: main-pool checkout admission, read-only transaction hold and rollback failure discard.",
+    "reason": "Agent and L3 protocol reads stay coherent on the main pool, independent of operator snapshot admission.",
     "slice": "permanent"
   },
   {
@@ -63,12 +63,6 @@
     "site": "owed_revocations.go:*Store.listNodeOwedComputerRevocations | s.db",
     "count": 1,
     "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",
-    "slice": "agent-protocol"
-  },
-  {
-    "site": "owed_revocations.go:*Store.owedComputerRevocation | s.db",
-    "count": 1,
-    "reason": "Authority-loss write-path read before external revocation; Computer client views read owed rows inside their snapshot.",
     "slice": "agent-protocol"
   },
   {

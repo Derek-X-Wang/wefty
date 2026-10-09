@@ -157,9 +157,9 @@ func TestServiceBindingProofKeepsOneSnapshotAcrossConcurrentCommit(t *testing.T)
 			return nil
 		},
 	})
-	originalReadDB := store.readDB
-	store.readDB = readerDB
-	defer func() { store.readDB = originalReadDB; readerDB.Close() }()
+	originalReadDB := store.db
+	store.db = readerDB
+	defer func() { store.db = originalReadDB; readerDB.Close() }()
 	bound, err := store.ProveServiceBinding(ctx, "agent", job.JobID, ServiceBindingProofRequest{
 		NodeID: node.NodeID, BootSessionID: node.BootSessionID,
 	})

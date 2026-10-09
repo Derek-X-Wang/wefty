@@ -2298,7 +2298,7 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	defer write.rollback()
 	// Beginning an immediate transaction can wait behind another writer. Read
 	// time after acquiring it so a lease that expired while waiting is refused.
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 
 	// Authorization ran before this transaction opened. Re-prove the credential
 	// against the snapshot the write will commit on, so an attempt that lost
@@ -3007,7 +3007,7 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	if storedBoot != bootSessionID {
 		return nil, protocolError(contract.ErrorNodeSessionReplaced, "node %q boot session has been replaced", nodeID)
 	}
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 	nodeState, err = s.reconcileClaimingNode(ctx, tx, nodeID, nodeState, time.Unix(0, heartbeatNS).UTC(), now)
 	if err != nil {
 		return nil, err
@@ -3379,7 +3379,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, fencingToken, attempt); err != nil {
 		return AttemptLease{}, err
 	}
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 	canceled, settleBy, err := cancellationDeadline(ctx, tx, jobID)
 	if err != nil {
 		return AttemptLease{}, err
@@ -3481,7 +3481,7 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 		if attempt.imageObservationHash.String != observationHash {
 			return Job{}, protocolError(contract.ErrorIdempotencyConflict, "image observation conflicts with the accepted identity")
 		}
-		return getJobByID(ctx, tx, jobID, canonicalTime(s.clock.Now()))
+		return getJobByID(ctx, tx, jobID, write.at)
 	}
 	canceled, _, err := cancellationDeadline(ctx, tx, jobID)
 	if err != nil {
@@ -3493,7 +3493,7 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return Job{}, err
 	}
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 	if !now.Before(attempt.leaseExpires) {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
@@ -3628,7 +3628,7 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 	if attempt.spec.Kind != contract.JobKindOCI && attempt.spec.Kind != contract.JobKindProcess {
 		return Job{}, protocolError(contract.ErrorConflict, "Started is only valid for OCI or process attempts")
 	}
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 	if !now.Before(attempt.leaseExpires) {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
@@ -3748,7 +3748,7 @@ func (s *Store) SetAttemptPublication(
 		return Job{}, protocolError(contract.ErrorConflict, "attempt is terminal")
 	}
 
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 	if !now.Before(attempt.leaseExpires) {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
@@ -3920,7 +3920,7 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 		return AppendLogsResponse{}, err
 	}
 	hasAuthority := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt) == nil
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 	if !now.Before(attempt.leaseExpires) {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return AppendLogsResponse{}, err
@@ -4333,7 +4333,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err := validateOCICompletionPhase(attempt, request.Result); err != nil {
 		return CompletionOutcome{}, err
 	}
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 	canceled, settleBy, err := cancellationDeadline(ctx, tx, jobID)
 	if err != nil {
 		return CompletionOutcome{}, err
@@ -5278,7 +5278,7 @@ func (s *Store) SetAttemptResult(ctx context.Context, identityNodeID, jobID, att
 		return AttemptResultResponse{}, protocolError(contract.ErrorSupersededAttempt,
 			"attempt %s is not the latest attempt of job %s", attemptID, jobID)
 	}
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_results(job_id, attempt_id, document, sha256, skip_reason, uploaded_ns)
 		VALUES(?, ?, ?, ?, ?, ?)
 		ON CONFLICT(job_id) DO UPDATE SET attempt_id=excluded.attempt_id, document=excluded.document,

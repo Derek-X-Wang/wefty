@@ -270,13 +270,17 @@ func readOwedComputerRevocations(ctx context.Context, q queryer, computerID stri
 }
 
 func (s *Store) owedComputerRevocation(ctx context.Context, revocationID int64) (owedRevocationRow, error) {
-	row, err := scanOwedRevocation(s.db.QueryRowContext(ctx, `SELECT `+owedRevocationColumns+`
-		FROM computer_owed_revocations WHERE revocation_id=?`, revocationID))
+	var row owedRevocationRow
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		row, err = reads.owedComputerRevocation(ctx, revocationID)
+		return err
+	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return owedRevocationRow{}, protocolError(contract.ErrorNotFound, "owed Computer revocation %d was not found", revocationID)
 	}
 	if err != nil {
-		return owedRevocationRow{}, internalError(err, "read owed Computer revocation")
+		return owedRevocationRow{}, snapshotReadError(err, "read owed Computer revocation")
 	}
 	return row, nil
 }
@@ -326,7 +330,7 @@ func (s *Store) settleOwedRevocationTx(ctx context.Context, begin writeTransacti
 	if row.settled {
 		return false, nil
 	}
-	if err := settle(tx, row, canonicalTime(s.clock.Now()).UnixNano()); err != nil {
+	if err := settle(tx, row, write.at.UnixNano()); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -464,4 +468,9 @@ func (s *Store) recordOwedComputerRevocationFailure(ctx context.Context, begin w
 		return internalError(err, "record owed Computer revocation failure")
 	}
 	return nil
+}
+
+func (r *databaseReads) owedComputerRevocation(ctx context.Context, revocationID int64) (owedRevocationRow, error) {
+	return scanOwedRevocation(r.q.QueryRowContext(ctx, `SELECT `+owedRevocationColumns+`
+ FROM computer_owed_revocations WHERE revocation_id=?`, revocationID))
 }

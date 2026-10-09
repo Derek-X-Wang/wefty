@@ -342,7 +342,7 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 	}
 
 	var proof ComputerTokenScopeProof
-	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+	err := s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
 		var err error
 		proof, err = reads.proveComputerTokenScope(ctx, computerID, attemptID, hostIdentityNodeID, hostNodeID)
 		return err
@@ -402,7 +402,7 @@ func (s *Store) ProveHostBootSession(ctx context.Context, hostIdentityNodeID, ho
 		}
 	}
 
-	return s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+	return s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
 		return reads.proveHostBootSession(ctx, hostIdentityNodeID, hostStableNodeID, bootSessionID)
 	})
 }

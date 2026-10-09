@@ -1152,16 +1152,17 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		return Computer{}, internalError(err, "read stored Computer Storage copy verb")
 	}
 	if storedOperation == "import" {
-		if err := write.rollback(); err != nil {
-			return Computer{}, internalError(err, "begin Computer Storage copy acknowledgement")
+		bodyHash, err := storageCopyHash(request)
+		if err != nil {
+			return Computer{}, internalError(err, "encode Custody import acknowledgement")
 		}
-		return s.AcknowledgeComputerCustodyImport(ctx, identityNodeID, destinationComputerID, request)
+		return s.acknowledgeComputerCustodyImport(ctx, write, identityNodeID, destinationComputerID, request, bodyHash)
 	}
 	bodyHash, err := storageCopyHash(request)
 	if err != nil {
 		return Computer{}, internalError(err, "encode Computer Storage copy acknowledgement")
 	}
-	now := canonicalTime(s.clock.Now())
+	now := write.at
 
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err

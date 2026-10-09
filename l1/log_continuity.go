@@ -77,7 +77,7 @@ func (s *Store) seedLogContinuity(ctx context.Context) error {
 		return fmt.Errorf("l1: seed log stream continuity: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name, applied_ns) VALUES(?, ?)`,
-		logContinuitySeedMigration, s.clock.Now().UnixNano()); err != nil {
+		logContinuitySeedMigration, write.at.UnixNano()); err != nil {
 		return fmt.Errorf("l1: record log stream continuity seed: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

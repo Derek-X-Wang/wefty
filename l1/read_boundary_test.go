@@ -72,13 +72,24 @@ func readBoundaryTypes(t *testing.T) (*token.FileSet, []*ast.File, *types.Info) 
 	if len(files) == 0 {
 		t.Fatal("no l1 production sources")
 	}
-	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Uses: map[*ast.Ident]types.Object{}, Defs: map[*ast.Ident]types.Object{}, Selections: map[*ast.SelectorExpr]*types.Selection{}}
+	info := newBoundaryInfo()
 	imp := importer.ForCompiler(fset, "gc", func(path string) (io.ReadCloser, error) { return os.Open(exports[path]) })
 	config := types.Config{Importer: imp}
 	if _, err := config.Check("github.com/Derek-X-Wang/wefty/l1", fset, files, info); err != nil {
 		t.Fatal(err)
 	}
 	return fset, files, info
+}
+
+func newBoundaryInfo() *types.Info {
+	return &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Uses: map[*ast.Ident]types.Object{}, Defs: map[*ast.Ident]types.Object{}, Selections: map[*ast.SelectorExpr]*types.Selection{}}
+}
+
+// Embedded handles expose promoted SQL methods without a raw expression.
+func embeddedRawSQLHandle(typ types.Type) bool {
+	named := boundaryNamed(typ)
+	return named != nil && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == "database/sql" &&
+		(named.Obj().Name() == "DB" || named.Obj().Name() == "Conn" || named.Obj().Name() == "Tx")
 }
 
 func rawSQLHandle(typ types.Type) bool {
@@ -113,6 +124,15 @@ func rawPoolSites(fset *token.FileSet, files []*ast.File, info *types.Info) map[
 				}
 			}
 			ast.Inspect(body, func(node ast.Node) bool {
+				if structure, ok := node.(*ast.StructType); ok {
+					for _, field := range structure.Fields.List {
+						if len(field.Names) == 0 && embeddedRawSQLHandle(info.TypeOf(field.Type)) {
+							var rendered bytes.Buffer
+							_ = format.Node(&rendered, fset, field.Type)
+							sites[name+":"+owner+" | embedded "+rendered.String()]++
+						}
+					}
+				}
 				expr, ok := node.(ast.Expr)
 				if !ok {
 					return true
@@ -256,6 +276,9 @@ func TestReadSnapshotGuardDetectsRawHandleEscapes(t *testing.T) {
  import ("context"; dbsql "database/sql")
  type Pool = dbsql.DB
  type Connection = dbsql.Conn
+ type EmbeddedDB struct { *Pool }
+ type EmbeddedConn struct { *Connection }
+ type EmbeddedTx struct { *dbsql.Tx }
  type Store struct { pool *Pool; db string }
  type writeTransaction struct { tx *dbsql.Tx }
  func (s *Store) beginWriteTransaction(context.Context) *writeTransaction { return nil }
@@ -292,12 +315,12 @@ func TestReadSnapshotGuardDetectsRawHandleEscapes(t *testing.T) {
 		t.Fatal(err)
 	}
 	sites := rawPoolSites(fset, []*ast.File{file}, info)
-	for site, count := range map[string]int{"fixture.go:leak | s.pool": 2, "fixture.go:leak | p": 2, "fixture.go:leak | c": 1, "fixture.go:read | s.pool": 1} {
+	for site, count := range map[string]int{"fixture.go:leak | s.pool": 2, "fixture.go:leak | p": 2, "fixture.go:leak | c": 1, "fixture.go:read | s.pool": 1, "fixture.go:package | embedded *Pool": 1, "fixture.go:package | embedded *Connection": 1, "fixture.go:package | embedded *dbsql.Tx": 1} {
 		if sites[site] != count {
 			t.Fatalf("%s: got %d want %d; all=%v", site, sites[site], count, sites)
 		}
 	}
-	if len(sites) != 4 {
+	if len(sites) != 7 {
 		t.Fatalf("unexpected raw handles: %v", sites)
 	}
 }
@@ -322,15 +345,10 @@ func (i boundaryFixtureImporter) Import(path string) (*types.Package, error) {
 	return i.base.Import(path)
 }
 
-// The agent-protocol exception chain is closed by a reviewed list.
-// withAgentReadSnapshot is reachable only inside writeAgentComputer, and each
-// of the two only from the agent acknowledgement handlers listed in
-// agentAcknowledgementSites; a new caller fails loudly until it is listed.
-// The list is hand-kept, not derived from the agent mux, so listing a handler
-// is a review decision. The rule matches every selector resolving to one of
-// the methods (calls, method values, method expressions, package-level var
-// initialisers). Residual: it tracks references, so a listed site that stored
-// the method value for an unlisted caller would pass.
+// Agent and L3 protocol reads are closed by a reviewed, hand-kept owner list.
+// The rule matches calls, method values, method expressions and package-level
+// initialisers by compiler identity. A listed owner forwarding a method value
+// to an unlisted caller remains a review responsibility.
 var agentReadSnapshotTargets = []string{"withAgentReadSnapshot", "writeAgentComputer"}
 
 const boundaryPkgPath = "github.com/Derek-X-Wang/wefty/l1"
@@ -412,12 +430,13 @@ func boundarySelectors(fset *token.FileSet, node ast.Node, site string, info *ty
 	return sites
 }
 
-// agentAcknowledgementSites is the exact site set the chain may live in: the
-// two loader declarations after the agent acknowledgement Store methods, and
-// the agent-mux acknowledgement handlers that write the reloaded Computer
-// view. It is asserted by set equality, so a vanished handler or type check
-// fails the guard rather than silently relaxing the boundary.
-var agentAcknowledgementSites = map[string]bool{
+// agentProtocolReadSites is the exact owner set for agent and L3 protocol
+// reads, including acknowledgement reloads and live authority proofs. Set
+// equality refuses both new owners and vanished type-check results.
+var agentProtocolReadSites = map[string]bool{
+	"service_jobs.go:*Store.ProveServiceBinding":             true,
+	"computer_submission.go:*Store.ProveComputerTokenScope":  true,
+	"computer_submission.go:*Store.ProveHostBootSession":     true,
 	"computer_operator.go:*Server.writeAgentComputer":        true,
 	"server.go:*Server.acknowledgeComputerBackup":            true,
 	"server.go:*Server.acknowledgeComputerStorageReset":      true,
@@ -491,23 +510,23 @@ func TestAgentReadSnapshotIsAgentOnly(t *testing.T) {
 	for _, site := range boundaryOwnerSites(fset, files, info, boundaryPkgPath) {
 		actual[site] = true
 	}
-	// Positive control: the chain must be exactly at the listed agent
-	// acknowledgement handlers. A vanished type check, a moved helper, or a disappeared handler all
+	// Positive control: the chain must be exactly at the reviewed agent and L3
+	// protocol owners. A vanished type check, a moved helper, or a disappeared owner all
 	// fail here instead of silently relaxing the boundary.
-	if !reflect.DeepEqual(actual, agentAcknowledgementSites) {
+	if !reflect.DeepEqual(actual, agentProtocolReadSites) {
 		var extra, missing []string
 		for site := range actual {
-			if !agentAcknowledgementSites[site] {
+			if !agentProtocolReadSites[site] {
 				extra = append(extra, site)
 			}
 		}
-		for site := range agentAcknowledgementSites {
+		for site := range agentProtocolReadSites {
 			if !actual[site] {
 				missing = append(missing, site)
 			}
 		}
 		sort.Strings(extra)
 		sort.Strings(missing)
-		t.Fatalf("agent acknowledgement chain mismatch; extra=%v missing=%v", extra, missing)
+		t.Fatalf("agent and L3 protocol read chain mismatch; extra=%v missing=%v", extra, missing)
 	}
 }

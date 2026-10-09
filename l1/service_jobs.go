@@ -137,7 +137,7 @@ func (s *Store) ProveServiceBinding(ctx context.Context, identityNodeID, jobID s
 	}
 
 	var bound bool
-	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+	err := s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
 		var err error
 		bound, err = reads.proveServiceBinding(ctx, identityNodeID, jobID, request)
 		return err
@@ -199,7 +199,7 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 	if err := validateImagePinNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Job{}, err
 	}
-	job, err := getJobByID(ctx, tx, jobID, s.clock.Now())
+	job, err := getJobByID(ctx, tx, jobID, write.at)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Job{}, protocolError(contract.ErrorNotFound, "service job %q was not found", jobID)
@@ -210,7 +210,7 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 		return Job{}, protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own service binding %q", jobID)
 	}
 	if job.State != contract.JobFailed {
-		if err := transitionServiceJob(ctx, tx, jobID, job.DesiredState, contract.JobFailed, s.clock.Now()); err != nil {
+		if err := transitionServiceJob(ctx, tx, jobID, job.DesiredState, contract.JobFailed, write.at); err != nil {
 			return Job{}, err
 		}
 	}
@@ -220,19 +220,19 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 	}
 	if job.CurrentAttemptID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, updated_ns=?
-			WHERE attempt_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, s.clock.Now().UnixNano(), job.CurrentAttemptID,
+			WHERE attempt_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, write.at.UnixNano(), job.CurrentAttemptID,
 			contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput); err != nil {
 			return Job{}, internalError(err, "fence attempt during service image reconciliation failure")
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET current_attempt_id=NULL, updated_ns=? WHERE job_id=?`, s.clock.Now().UnixNano(), jobID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET current_attempt_id=NULL, updated_ns=? WHERE job_id=?`, write.at.UnixNano(), jobID); err != nil {
 		return Job{}, internalError(err, "clear service attempt after image reconciliation failure")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET policy_stop_json=NULL, next_restart_at=NULL, last_failure=?,
 		healthy_since_ns=NULL, published_attempt_id=NULL WHERE job_id=?`, payload, jobID); err != nil {
 		return Job{}, internalError(err, "record service image reconciliation failure")
 	}
-	job, err = getJobByID(ctx, tx, jobID, s.clock.Now())
+	job, err = getJobByID(ctx, tx, jobID, write.at)
 	if err != nil {
 		return Job{}, internalError(err, "read latched service image reconciliation job")
 	}
