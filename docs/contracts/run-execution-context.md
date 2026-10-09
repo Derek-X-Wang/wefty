@@ -269,7 +269,7 @@ The optional filters intersect, with exact case-sensitive comparison:
 | `kind=KIND` | Workload isolation kind; an open vocabulary. |
 | `state=STATE` | Persisted Job state, not a derived status such as `restart-pending` or `unschedulable`. |
 | `submitter=me` | Originating submitter equals the authenticated client's stable Fabric node ID. For an attempt credential, `me` is its inherited originating submitter, within its own-job/child scope. If that identity is empty, the request returns `400 invalid_request`. |
-| `limit=N` | Page size, default 100, range 1–250. |
+| `limit=N` | Page size, default 100, range 1–250; larger values are clamped; follow `next_cursor`. |
 | `cursor=CURSOR` | Opaque continuation from `next_cursor`; absent on the final page. |
 
 The response is `{jobs: [...], next_cursor?: string}` and uses the same redacted

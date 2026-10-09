@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -315,7 +316,20 @@ func TestComputerSubmissionChangeRepublishesSameAttemptDisplay(t *testing.T) {
 		if step.enabled {
 			wantFiles = "files:" + step.token
 		}
+		// L1 shows the screen as soon as the publication commits, but
+		// publish:true is recorded only after SetAttemptPublication returns,
+		// and awaitScreen polls L1 every 20 ms, so it can win that race.
+		// Give the record its arrival under a 10 s watchdog before judging
+		// the order.
 		after := h.events.since(mark)
+		deadline := time.Now().Add(10 * time.Second)
+		for !slices.Contains(after, "publish:true") {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: publish:true was not recorded within 10s: %v", step.name, after)
+			}
+			time.Sleep(20 * time.Millisecond)
+			after = h.events.since(mark)
+		}
 		filesAt, publishAt := -1, -1
 		for index, event := range after {
 			if event == wantFiles {
