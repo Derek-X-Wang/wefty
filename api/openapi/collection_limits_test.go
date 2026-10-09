@@ -9,8 +9,9 @@ import (
 func TestCollectionLimitMaximumMatchesServer(t *testing.T) {
 	// Children and jobs deliberately share a cap; other collections retain theirs.
 	maxima := map[string]int{
-		"listJobs":                  l1.MaxJobListingPageLimit,
-		"listChildJobs":             l1.MaxChildJobPageLimit,
+		// The schema maximum is the accepted input range; the server clamps job pages to l1.MaxJobListingPageLimit.
+		"listJobs":                  l1.MaxJobPageLimit,
+		"listChildJobs":             l1.MaxJobPageLimit,
 		"getJobLogs":                l1.MaxLogPageLimit,
 		"listNodes":                 l1.MaxJobPageLimit,
 		"listAdminPolicyAudit":      l1.MaxJobPageLimit,

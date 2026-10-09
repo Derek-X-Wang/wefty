@@ -56,6 +56,8 @@ func TestJobReadSnapshotRemovalBetweenReads(t *testing.T) {
 			ctx, fired := observeOnce(t, t.Context(), "job", func() {
 				commitReadTestRemoval(t, h.store, job.JobID)
 			})
+			// The injected writer's fsync is not projection cost.
+			ctx = context.WithValue(ctx, readSnapshotHardLimitContextKey{}, 10*time.Second)
 			w := httptest.NewRecorder()
 			r := jobReadRequest(ctx, http.MethodGet, "/v1/jobs?class=service", job.JobID)
 			if listing {
@@ -109,6 +111,8 @@ func TestJobReadSnapshotClaimBetweenReads(t *testing.T) {
 			}
 			var claimed Claim
 			ctx, fired := observeOnce(t, t.Context(), point, func() { claimed = claimClass(t, h, agent, node, contract.JobClassService) })
+			// The injected writer's fsync is not projection cost.
+			ctx = context.WithValue(ctx, readSnapshotHardLimitContextKey{}, 10*time.Second)
 			w := httptest.NewRecorder()
 			r := jobReadRequest(ctx, http.MethodGet, "/v1/jobs?class=service", job.JobID)
 			if listing {
@@ -184,6 +188,8 @@ func TestJobReadSnapshotLogsBetweenPageAndMarker(t *testing.T) {
 					}
 				}
 			})
+			// The injected writer's fsync is not projection cost.
+			ctx = context.WithValue(ctx, readSnapshotHardLimitContextKey{}, 10*time.Second)
 			page, err := h.store.GetJobLogs(ctx, job.JobID, "", 10)
 			if err != nil {
 				t.Fatal(err)
@@ -351,6 +357,8 @@ func TestJobReadSnapshotLedgerLookupBetweenReads(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+	// The injected writer's fsync is not projection cost.
+	ctx = context.WithValue(ctx, readSnapshotHardLimitContextKey{}, 10*time.Second)
 	got, err := h.store.LookupRunLedgerJob(ctx, spec.DispatchKey)
 	if !*fired {
 		t.Fatal("lookup deletion did not commit")
@@ -376,6 +384,8 @@ func TestJobReadSnapshotResultBetweenReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx, fired := observeOnce(t, t.Context(), "job", func() { h.clock.Advance(time.Millisecond); claimClass(t, h, agent, node, contract.JobClassService) })
+	// The injected writer's fsync is not projection cost.
+	ctx = context.WithValue(ctx, readSnapshotHardLimitContextKey{}, 10*time.Second)
 	w := httptest.NewRecorder()
 	h.server.getJobResult(w, jobReadRequest(ctx, http.MethodGet, "/v1/jobs/"+job.JobID+"/result?class=service", job.JobID))
 	if !*fired {

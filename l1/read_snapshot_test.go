@@ -424,3 +424,24 @@ func TestReadSnapshotRollbackFailureDiscardsConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The hold-limit override applies: a 1 ns budget expires the snapshot while a
+// default context without the override still answers.
+func TestReadSnapshotHoldLimitOverride(t *testing.T) {
+	s, _ := snapshotStore(t)
+	ctx := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, time.Nanosecond)
+	err := s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error { return nil })
+	if errorCode(err) != contract.ErrorUnavailable {
+		t.Fatalf("1 ns override=%v, want unavailable", err)
+	}
+	reason, _ := err.(*Error).Details["reason"].(string)
+	if reason != "read_snapshot_admission_expired" && reason != "read_snapshot_expired" {
+		t.Fatalf("reason=%q, want an expired read snapshot", reason)
+	}
+	if err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+		var count int
+		return r.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
