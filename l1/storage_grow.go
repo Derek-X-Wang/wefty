@@ -188,7 +188,7 @@ func (s *Store) BeginComputerGrow(ctx context.Context, computerID string, reques
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	boundNodeID, rootInstanceID, err := computerGrowDecision(ctx, tx, computer, request)
+	boundNodeID, rootInstanceID, err := computerGrowDecision(ctx, transactionReads(tx, now), computer, request)
 	if err != nil {
 		return Computer{}, false, err
 	}

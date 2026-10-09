@@ -71,6 +71,11 @@ _Avoid_: calling any future declarative layer a "workflow"
 
 ### Scheduling and execution (L1, the cluster)
 
+**Read snapshot**:
+One coherent view of L1 facts with one pinned clock, used to project a response
+or make a decision. Its facts belong to that view alone.
+_Avoid_: Storage snapshot, Backup, retained history
+
 **Capability revision**:
 A boot-scoped monotonic revision over a node's complete observed capability
 set. Only a higher revision can replace the set within that boot session, and a

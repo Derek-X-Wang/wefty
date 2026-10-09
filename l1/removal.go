@@ -93,7 +93,7 @@ func (s *Store) removeService(ctx context.Context, jobID string, actor *serviceA
 		if tombstoneErr != nil {
 			return Job{}, internalError(tombstoneErr, "read removed service")
 		}
-		if err := serviceActionDecision(ctx, tx, tombstone.job(), "remove", actor); err != nil {
+		if err := serviceActionDecision(ctx, tx, now, tombstone.job(), "remove", actor); err != nil {
 			return Job{}, err
 		}
 		return tombstone.job(), nil
@@ -105,7 +105,7 @@ func (s *Store) removeService(ctx context.Context, jobID string, actor *serviceA
 	if err != nil {
 		return Job{}, internalError(err, "read service removal decision")
 	}
-	if err := serviceActionDecision(ctx, tx, target, "remove", actor); err != nil {
+	if err := serviceActionDecision(ctx, tx, now, target, "remove", actor); err != nil {
 		return Job{}, err
 	}
 

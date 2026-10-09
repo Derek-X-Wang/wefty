@@ -205,7 +205,7 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	if err := computerResetDecision(ctx, tx, computer, request); err != nil {
+	if err := computerResetDecision(ctx, transactionReads(tx, now), computer, request); err != nil {
 		return Computer{}, false, err
 	}
 	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
@@ -223,7 +223,7 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 		boundNodeID = computer.PlacementNodeID
 	}
 	cleanupFence := newID("storage-reset")
-	rootInstanceID, err := computerResetCapacityDecision(ctx, tx, computer, boundNodeID)
+	rootInstanceID, err := computerResetCapacityDecision(ctx, transactionReads(tx, now), computer, boundNodeID)
 	if err != nil {
 		return Computer{}, false, err
 	}

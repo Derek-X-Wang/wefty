@@ -310,7 +310,7 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	backup, copy, err := computerRestoreDecision(ctx, tx, computer, request)
+	backup, copy, err := computerRestoreDecision(ctx, transactionReads(tx, now), computer, request)
 	if err != nil {
 		return Computer{}, false, err
 	}
@@ -532,7 +532,7 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 	if err != nil {
 		return Computer{}, false, internalError(err, "read clone source Computer")
 	}
-	if err := computerCloneDecision(ctx, tx, source, copy, request); err != nil {
+	if err := computerCloneDecision(ctx, transactionReads(tx, now), source, copy, request); err != nil {
 		return Computer{}, false, err
 	}
 	computerID, storageID := newID("computer"), newID("storage")

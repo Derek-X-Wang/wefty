@@ -1,0 +1,40 @@
+{
+  "attempts": [
+    {
+      "attempt_id": "ATTEMPT",
+      "created_at": "2026-08-09T10:00:00Z",
+      "lease_expires_at": "2026-08-09T10:00:30Z",
+      "node_id": "node-1",
+      "state": "claimed",
+      "updated_at": "2026-08-09T10:00:00Z"
+    }
+  ],
+  "created_at": "2026-08-09T10:00:00Z",
+  "current_attempt_id": "ATTEMPT",
+  "job_id": "JOB",
+  "node_id": "node-1",
+  "originating_submitter": "submitter",
+  "spec": {
+    "class": "one-shot",
+    "dispatch_key": "baseline-one-shot",
+    "execution": {
+      "argv": [
+        "echo",
+        "hello"
+      ],
+      "executable": {
+        "path": "/bin/echo"
+      },
+      "handoff_directory": "/tmp/handoff",
+      "working_directory": "/tmp"
+    },
+    "kind": "process",
+    "routing_tags": [
+      "linux"
+    ],
+    "schema_version": 1
+  },
+  "state": "claimed",
+  "status": "claimed",
+  "updated_at": "2026-08-09T10:00:00Z"
+}

@@ -246,7 +246,7 @@ func (s *Store) BeginComputerBackup(ctx context.Context, computerID string, requ
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	boundNodeID, rootInstanceID, err := computerBackupDecision(ctx, tx, computer, request)
+	boundNodeID, rootInstanceID, err := computerBackupDecision(ctx, transactionReads(tx, now), computer, request)
 	if err != nil {
 		return Computer{}, false, err
 	}
@@ -704,7 +704,7 @@ func (s *Store) BeginComputerBackupPrune(ctx context.Context, computerID string,
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Backup{}, false, err
 	}
-	backup, err := computerPruneDecision(ctx, tx, computer, request)
+	backup, err := computerPruneDecision(ctx, transactionReads(tx, now), computer, request)
 	if err != nil {
 		return Backup{}, false, err
 	}

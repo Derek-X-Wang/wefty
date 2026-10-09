@@ -30,17 +30,24 @@ func (s *Server) serviceActionActor(r *http.Request) *serviceActionActor {
 		AttemptCredential: attemptCredentialFromRequest(r).JobID != ""}
 }
 
-// serviceOperatorReads lives for exactly one read snapshot or mutation decision.
+// readMemo lives for exactly one read snapshot or mutation decision.
+// Node facts include capabilities, authoritative tags and both occupancies.
 // Ownership and failure evidence are read once per Job. Node-wide occupancy
 // counts and managed roots are shared across a page, avoiding repeated scans of
 // the same node's services. Errors are cached too, preserving refusal precedence.
-type serviceOperatorReads struct {
+type readMemo struct {
+	nodes      map[string]nodeRead
+	nodeRoots  map[string]rootRead
+	nodeStates map[string]stateRead
+
 	q         queryer
 	computers map[string]serviceComputerRead
 	failures  map[string]serviceFailureRead
 	capacity  map[string]error
 	roots     map[string]error
 }
+
+type serviceOperatorReads = readMemo
 
 type serviceComputerRead struct {
 	id     string
@@ -54,7 +61,7 @@ type serviceFailureRead struct {
 }
 
 func newServiceOperatorReads(q queryer) *serviceOperatorReads {
-	return &serviceOperatorReads{q: q, computers: make(map[string]serviceComputerRead),
+	return &readMemo{nodes: make(map[string]nodeRead), nodeRoots: make(map[string]rootRead), nodeStates: make(map[string]stateRead), q: q, computers: make(map[string]serviceComputerRead),
 		failures: make(map[string]serviceFailureRead), capacity: make(map[string]error), roots: make(map[string]error)}
 }
 
@@ -107,11 +114,11 @@ func (reads *serviceOperatorReads) removalRoot(ctx context.Context, job Job) err
 
 // A nil actor is the existing trusted Store API, used by internal callers and
 // store tests. HTTP reads and writes always supply the authenticated actor.
-func serviceActionAuthority(ctx context.Context, q queryer, job Job, verb string, actor *serviceActionActor) error {
-	return serviceActionAuthorityWithReads(ctx, newServiceOperatorReads(q), job, verb, actor)
+func serviceActionAuthority(ctx context.Context, q queryer, now time.Time, job Job, verb string, actor *serviceActionActor) error {
+	return serviceActionAuthorityWithReads(ctx, transactionReads(q, now), job, verb, actor)
 }
 
-func serviceActionAuthorityWithReads(ctx context.Context, reads *serviceOperatorReads, job Job, verb string, actor *serviceActionActor) error {
+func serviceActionAuthorityWithReads(ctx context.Context, reads readModel, job Job, verb string, actor *serviceActionActor) error {
 	if actor != nil {
 		if actor.AttemptCredential {
 			return protocolError(contract.ErrorPrincipalForbidden, "an attempt credential may only submit a child job, list its own job and immediate children, read its own job, list or read its children, and cancel its children")
@@ -128,7 +135,7 @@ func serviceActionAuthorityWithReads(ctx context.Context, reads *serviceOperator
 	if job.ServiceJob == nil && (verb == "start" || verb == "stop" || verb == "restart") {
 		return protocolError(contract.ErrorNotFound, "service job %q was not found", job.JobID)
 	}
-	if computerID, mapped, err := reads.computer(ctx, job.JobID); err != nil {
+	if computerID, mapped, err := reads.serviceComputer(ctx, job.JobID); err != nil {
 		return err
 	} else if mapped {
 		authority := "lifecycle"
@@ -147,11 +154,11 @@ func serviceActionAuthorityWithReads(ctx context.Context, reads *serviceOperator
 // serviceActionDecision is the single source for advertised actions and the
 // enforcing mutation. Chosen inputs are validated by their request decoder;
 // restart describes a fresh key, while accepted key replays retain their path.
-func serviceActionDecision(ctx context.Context, q queryer, job Job, verb string, actor *serviceActionActor) error {
-	return serviceActionDecisionWithReads(ctx, newServiceOperatorReads(q), job, verb, actor)
+func serviceActionDecision(ctx context.Context, q queryer, now time.Time, job Job, verb string, actor *serviceActionActor) error {
+	return serviceActionDecisionWithReads(ctx, transactionReads(q, now), job, verb, actor)
 }
 
-func serviceActionDecisionWithReads(ctx context.Context, reads *serviceOperatorReads, job Job, verb string, actor *serviceActionActor) error {
+func serviceActionDecisionWithReads(ctx context.Context, reads readModel, job Job, verb string, actor *serviceActionActor) error {
 	if err := serviceActionAuthorityWithReads(ctx, reads, job, verb, actor); err != nil {
 		return err
 	}
@@ -159,7 +166,7 @@ func serviceActionDecisionWithReads(ctx context.Context, reads *serviceOperatorR
 		if job.Removal != nil || job.BoundNodeID == "" {
 			return nil
 		}
-		return reads.removalRoot(ctx, job)
+		return reads.serviceRemovalRoot(ctx, job)
 	}
 	if job.Removal != nil {
 		return protocolError(contract.ErrorConflict, "service job %q is being removed", job.JobID)
@@ -168,7 +175,7 @@ func serviceActionDecisionWithReads(ctx context.Context, reads *serviceOperatorR
 	case "start":
 		switch job.State {
 		case contract.JobFailed, contract.JobStopped:
-			resumable, err := reads.resumable(ctx, job)
+			resumable, err := reads.serviceResumable(ctx, job)
 			if err != nil {
 				return err
 			}
@@ -176,7 +183,7 @@ func serviceActionDecisionWithReads(ctx context.Context, reads *serviceOperatorR
 				return protocolError(contract.ErrorConflict, "service job %q is latched failed; use restart", job.JobID)
 			}
 			if !job.HoldsSlot(job.State) {
-				return reads.ensureCapacity(ctx, job)
+				return reads.ensureServiceCapacity(ctx, job)
 			}
 		case contract.JobStopping:
 			return protocolError(contract.ErrorConflict, "service job %q is still stopping; wait for stopped before start", job.JobID)
@@ -204,7 +211,7 @@ func serviceActionDecisionWithReads(ctx context.Context, reads *serviceOperatorR
 	case "restart":
 		// Preserve capacity-before-state refusal precedence from the write.
 		if !job.HoldsSlot(job.State) {
-			if err := reads.ensureCapacity(ctx, job); err != nil {
+			if err := reads.ensureServiceCapacity(ctx, job); err != nil {
 				return err
 			}
 		}
@@ -221,7 +228,7 @@ func serviceActionDecisionWithReads(ctx context.Context, reads *serviceOperatorR
 	return nil
 }
 
-func serviceAllowedActionsWithReads(ctx context.Context, reads *serviceOperatorReads, job Job, actor *serviceActionActor) []contract.AllowedAction {
+func serviceAllowedActionsWithReads(ctx context.Context, reads readModel, job Job, actor *serviceActionActor) []contract.AllowedAction {
 	actions := make([]contract.AllowedAction, 0, 5)
 	for _, verb := range []string{"start", "stop", "restart", "remove", "forget"} {
 		action := contract.AllowedAction{Verb: verb, Requires: map[string]any{}}
@@ -243,7 +250,7 @@ func serviceAllowedActionsWithReads(ctx context.Context, reads *serviceOperatorR
 
 // Closest persisted state-machine condition, rather than an invented event log.
 // Its timestamp comes from the relevant existing row, never the read clock.
-func serviceLastConditionWithReads(ctx context.Context, reads *serviceOperatorReads, job Job) (*contract.Condition, error) {
+func serviceLastConditionWithReads(ctx context.Context, reads readModel, job Job) (*contract.Condition, error) {
 	condition := &contract.Condition{Since: job.UpdatedAt, Details: map[string]any{"state": job.State}}
 	if removal := job.Removal; removal != nil {
 		condition.Code, condition.Scope, condition.Since = string(job.State), "service_removal", removal.RemovalRequestedAt
@@ -270,7 +277,7 @@ func serviceLastConditionWithReads(ctx context.Context, reads *serviceOperatorRe
 		condition.Details["restart"] = job.Spec.Restart
 		condition.Details["policy_stop"] = job.PolicyStop
 	case job.State == contract.JobFailed:
-		resumable, err := reads.resumable(ctx, job)
+		resumable, err := reads.serviceResumable(ctx, job)
 		if err != nil {
 			return nil, err
 		}
@@ -289,11 +296,11 @@ func serviceLastConditionWithReads(ctx context.Context, reads *serviceOperatorRe
 		return nil, nil
 	}
 	if job.CurrentAttemptID != "" {
-		var updatedNS int64
-		if err := reads.q.QueryRowContext(ctx, "SELECT updated_ns FROM attempts WHERE attempt_id=? AND job_id=?", job.CurrentAttemptID, job.JobID).Scan(&updatedNS); err != nil {
+		since, err := reads.attemptConditionTime(ctx, job)
+		if err != nil {
 			return nil, internalError(err, "read service condition time")
 		}
-		condition.Since = time.Unix(0, updatedNS).UTC()
+		condition.Since = since
 	}
 	return condition, nil
 }
@@ -301,10 +308,10 @@ func serviceLastConditionWithReads(ctx context.Context, reads *serviceOperatorRe
 // projectServiceOperatorFacts is shared by collection and detail reads. The
 // caller supplies the read snapshot containing this Job and its prerequisites.
 func projectServiceOperatorFacts(ctx context.Context, q queryer, job Job, actor *serviceActionActor) (Job, error) {
-	return projectServiceOperatorFactsWithReads(ctx, newServiceOperatorReads(q), job, actor)
+	return projectJobWithReads(ctx, newDatabaseReads(q, time.Time{}, actor), job, projectJobOperatorPart)
 }
 
-func projectServiceOperatorFactsWithReads(ctx context.Context, reads *serviceOperatorReads, job Job, actor *serviceActionActor) (Job, error) {
+func projectServiceOperatorFactsWithReads(ctx context.Context, reads readModel, job Job, actor *serviceActionActor) (Job, error) {
 	if job.ServiceJob == nil && job.Removal == nil {
 		return job, nil
 	}
@@ -318,9 +325,9 @@ func projectServiceOperatorFactsWithReads(ctx context.Context, reads *serviceOpe
 
 // projectServiceOperatorPage shares node reads only within the listing snapshot.
 func projectServiceOperatorPage(ctx context.Context, q queryer, jobs []Job, actor *serviceActionActor) error {
-	reads := newServiceOperatorReads(q)
+	reads := newDatabaseReads(q, time.Time{}, actor)
 	for i, job := range jobs {
-		projected, err := projectServiceOperatorFactsWithReads(ctx, reads, job, actor)
+		projected, err := projectJobWithReads(ctx, reads, job, projectJobOperatorPart)
 		if err != nil {
 			return err
 		}
@@ -362,4 +369,22 @@ func (s *Server) projectServiceForCaller(r *http.Request, job Job) (Job, error) 
 	}
 	snapshot.Attempts = job.Attempts
 	return snapshot, nil
+}
+
+func (r *databaseReads) serviceComputer(ctx context.Context, id string) (string, bool, error) {
+	return r.reads.computer(ctx, id)
+}
+func (r *databaseReads) serviceResumable(ctx context.Context, job Job) (bool, error) {
+	return r.reads.resumable(ctx, job)
+}
+func (r *databaseReads) ensureServiceCapacity(ctx context.Context, job Job) error {
+	return r.reads.ensureCapacity(ctx, job)
+}
+func (r *databaseReads) serviceRemovalRoot(ctx context.Context, job Job) error {
+	return r.reads.removalRoot(ctx, job)
+}
+func (r *databaseReads) attemptConditionTime(ctx context.Context, job Job) (time.Time, error) {
+	var ns int64
+	err := r.q.QueryRowContext(ctx, "SELECT updated_ns FROM attempts WHERE attempt_id=? AND job_id=?", job.CurrentAttemptID, job.JobID).Scan(&ns)
+	return time.Unix(0, ns).UTC(), err
 }

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -126,7 +127,7 @@ func (s *Store) setServiceDesiredState(ctx context.Context, jobID string, desire
 	if desired == contract.ServiceDesiredStopped {
 		verb = "stop"
 	}
-	if err := serviceActionDecision(ctx, tx, job, verb, actor); err != nil {
+	if err := serviceActionDecision(ctx, tx, now, job, verb, actor); err != nil {
 		return Job{}, err
 	}
 
@@ -217,7 +218,7 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	if err != nil {
 		return Job{}, false, internalError(err, "read service restart target")
 	}
-	if err := serviceActionAuthority(ctx, tx, job, "restart", actor); err != nil {
+	if err := serviceActionAuthority(ctx, tx, now, job, "restart", actor); err != nil {
 		return Job{}, false, err
 	}
 	var storedHash string
@@ -232,7 +233,7 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read service restart replay")
 	}
-	if err := serviceActionDecision(ctx, tx, job, "restart", actor); err != nil {
+	if err := serviceActionDecision(ctx, tx, now, job, "restart", actor); err != nil {
 		return Job{}, false, err
 	}
 
@@ -372,11 +373,19 @@ func (s *Store) projectJob(ctx context.Context, job Job) (Job, error) {
 }
 
 func (s *Store) projectJobWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
+	at := time.Time{}
+	if job.ServiceJob != nil && job.Removal == nil {
+		at = canonicalTime(s.clock.Now())
+	}
+	return projectJobWithReads(ctx, newDatabaseReads(q, at, nil), job, projectJobStatusPart)
+}
+
+func projectJobStatus(ctx context.Context, reads readModel, job Job) (Job, error) {
 	if job.ServiceJob != nil || job.Removal != nil {
-		return s.projectServiceJobWithQueryer(ctx, q, job)
+		return reads.serviceStatus(ctx, job)
 	}
 	job.Status = string(job.State)
-	return s.projectQueuedJobCapabilitiesWithQueryer(ctx, q, job)
+	return reads.queuedStatus(ctx, job)
 }
 
 func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
@@ -384,6 +393,18 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 }
 
 func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
+	at := time.Time{}
+	if job.ServiceJob != nil && job.Removal == nil {
+		at = canonicalTime(s.clock.Now())
+	}
+	if job.ServiceJob == nil && job.Removal == nil {
+		return Job{}, protocolError(contract.ErrorNotFound, "service job %q was not found", job.JobID)
+	}
+	return projectJobWithReads(ctx, newDatabaseReads(q, at, nil), job, projectJobStatusPart)
+}
+
+func (r *databaseReads) serviceStatus(ctx context.Context, job Job) (Job, error) {
+	q := r.q
 	if job.Removal != nil {
 		job.Status = string(job.State)
 		return job, nil
@@ -394,7 +415,7 @@ func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job
 	service := job.ServiceJob
 	service.SlotHeld = service.HoldsSlot(job.State)
 	job.Status = string(job.State)
-	now := canonicalTime(s.clock.Now())
+	now := r.now()
 	if service.RestartPending(job.State, now) {
 		job.Status = "restart-pending"
 	}
@@ -424,16 +445,22 @@ func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job
 	}
 	if job.Status != "restart-pending" {
 		var err error
-		job, err = s.projectQueuedJobCapabilitiesWithQueryer(ctx, q, job)
+		job, err = r.queuedStatus(ctx, job)
 		if err != nil {
 			return Job{}, err
 		}
 	}
 	if service.BoundNodeID != "" {
-		var claimsEnabled bool
-		var capabilitiesJSON []byte
-		err := q.QueryRowContext(ctx, "SELECT state, claims_enabled, capabilities_json FROM nodes WHERE node_id=?", service.BoundNodeID).
-			Scan(&service.NodeState, &claimsEnabled, &capabilitiesJSON)
+		var node placementFacts
+		var err error
+		if job.State == contract.JobQueued && job.Status != "restart-pending" {
+			node, err = r.placement(ctx, service.BoundNodeID)
+		} else {
+			node.state, err = r.nodeState(ctx, service.BoundNodeID)
+		}
+		if err == nil {
+			service.NodeState = node.state
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			if job.State == contract.JobQueued && job.Status != "restart-pending" {
 				job.UnschedulableReason = fmt.Sprintf("bound node %q is not registered", service.BoundNodeID)
@@ -444,24 +471,20 @@ func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job
 			switch {
 			case service.NodeState != contract.NodeAlive:
 				job.UnschedulableReason = fmt.Sprintf("bound node %q is %s", service.BoundNodeID, service.NodeState)
-			case !claimsEnabled:
+			case !node.claimsEnabled:
 				job.UnschedulableReason = fmt.Sprintf("bound node %q has claims disabled", service.BoundNodeID)
 			default:
-				var advertised map[string]bool
-				if err := json.Unmarshal(capabilitiesJSON, &advertised); err != nil {
-					return Job{}, internalError(err, "decode bound node capabilities")
-				}
-				required, err := storedRequiredCapabilities(ctx, q, job.JobID)
+				requirements, err := r.placementRequirements(ctx, job.JobID)
 				if err != nil {
 					return Job{}, internalError(err, "read required job capabilities")
 				}
-				if missing := MissingCapabilities(required, advertised); len(missing) > 0 {
+				if missing := MissingCapabilities(requirements.capabilities, node.capabilities); len(missing) > 0 {
 					job.UnschedulableReason = fmt.Sprintf("bound node %q is missing capabilities: %s", service.BoundNodeID, strings.Join(missing, ", "))
 				}
 			}
 		}
 	} else if job.State == contract.JobQueued && job.Status != "restart-pending" {
-		reason, err := unboundServiceUnschedulableReasonWithQueryer(ctx, q, job.JobID)
+		reason, err := r.unboundServiceUnschedulableReason(ctx, job.JobID)
 		if err != nil {
 			return Job{}, err
 		}
@@ -474,31 +497,18 @@ func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job
 }
 
 func unboundServiceUnschedulableReasonWithQueryer(ctx context.Context, q queryer, jobID string) (string, error) {
-	required, err := storedRequiredCapabilities(ctx, q, jobID)
+	return newDatabaseReads(q, time.Time{}, nil).unboundServiceUnschedulableReason(ctx, jobID)
+}
+func (r *databaseReads) unboundServiceUnschedulableReason(ctx context.Context, jobID string) (string, error) {
+	requirements, err := r.placementRequirements(ctx, jobID)
 	if err != nil {
 		return "", internalError(err, "read required job capabilities")
 	}
-	rows, err := q.QueryContext(ctx, `SELECT nodes.node_id, nodes.state, nodes.claims_enabled,
-		nodes.capabilities_json, nodes.max_service_slots,
-		(SELECT COUNT(*) FROM service_jobs occupied_service
-		 JOIN jobs occupied_job ON occupied_job.job_id=occupied_service.job_id
-		 WHERE occupied_service.bound_node_id=nodes.node_id
-		   AND ((occupied_job.state=? AND occupied_service.desired_state=?)
-		        OR occupied_job.state IN (?, ?, ?, ?, ?)))
-		FROM nodes
-		WHERE NOT EXISTS (
-		 SELECT 1 FROM job_tags
-		 WHERE job_tags.job_id=? AND NOT EXISTS (
-		  SELECT 1 FROM node_tags WHERE node_tags.node_id=nodes.node_id AND node_tags.tag=job_tags.tag
-		 )
-		)
-		ORDER BY nodes.node_id`, contract.JobQueued, contract.ServiceDesiredRunning,
-		contract.JobClaimed, contract.JobRunning, contract.JobStopping, contract.JobRemovalPending,
-		contract.JobAgentCleaned, jobID)
+	required := requirements.capabilities
+	ids, err := r.eligibleNodeIDs(ctx, requirements.tags)
 	if err != nil {
 		return "", internalError(err, "read service placement candidates")
 	}
-	defer rows.Close()
 	matched := 0
 	eligible := 0
 	capacityReasons := []string{}
@@ -506,15 +516,12 @@ func unboundServiceUnschedulableReasonWithQueryer(ctx context.Context, q queryer
 	missingRequirements := []string{}
 	seenMissing := map[string]struct{}{}
 	nonCapabilityIneligible := 0
-	for rows.Next() {
-		var nodeID string
-		var state contract.NodeState
-		var claimsEnabled bool
-		var capabilitiesJSON []byte
-		var capacity, occupancy int
-		if err := rows.Scan(&nodeID, &state, &claimsEnabled, &capabilitiesJSON, &capacity, &occupancy); err != nil {
-			return "", internalError(err, "scan service placement candidate")
+	for _, nodeID := range ids {
+		node, err := r.placement(ctx, nodeID)
+		if err != nil {
+			return "", internalError(err, "read service placement candidate")
 		}
+		state, claimsEnabled, capacity := node.state, node.claimsEnabled, node.maxServiceSlots
 		matched++
 		if state != contract.NodeAlive {
 			ineligibleReasons = append(ineligibleReasons, fmt.Sprintf("%s is %s", nodeID, state))
@@ -526,11 +533,7 @@ func unboundServiceUnschedulableReasonWithQueryer(ctx context.Context, q queryer
 			nonCapabilityIneligible++
 			continue
 		}
-		var advertised map[string]bool
-		if err := json.Unmarshal(capabilitiesJSON, &advertised); err != nil {
-			return "", internalError(err, "decode service placement capabilities")
-		}
-		missing := MissingCapabilities(required, advertised)
+		missing := MissingCapabilities(required, node.capabilities)
 		if len(missing) > 0 {
 			ineligibleReasons = append(ineligibleReasons, fmt.Sprintf("%s is missing capabilities: %s", nodeID, strings.Join(missing, ", ")))
 			for _, capability := range missing {
@@ -543,13 +546,14 @@ func unboundServiceUnschedulableReasonWithQueryer(ctx context.Context, q queryer
 			continue
 		}
 		eligible++
+		occupancy, err := r.serviceOccupancy(ctx, nodeID)
+		if err != nil {
+			return "", internalError(err, "read service placement occupancy")
+		}
 		if occupancy < capacity {
 			return "", nil
 		}
 		capacityReasons = append(capacityReasons, fmt.Sprintf("%s occupancy %d/%d", nodeID, occupancy, capacity))
-	}
-	if err := rows.Err(); err != nil {
-		return "", internalError(err, "iterate service placement candidates")
 	}
 	if matched == 0 {
 		return "no registered node matches the service routing tags", nil

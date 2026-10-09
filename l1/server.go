@@ -145,6 +145,11 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 		compactLogEvents:        store.CompactLogEventDocuments,
 		logf:                    log.Printf,
 	}
+	store.logf = func(format string, args ...any) {
+		if s.logf != nil {
+			s.logf(format, args...)
+		}
+	}
 	s.handler = s.routes()
 	return s, nil
 }

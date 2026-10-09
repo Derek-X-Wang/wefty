@@ -1,0 +1,35 @@
+{
+  "jobs": [
+    {
+      "created_at": "2026-08-09T10:00:00Z",
+      "job_id": "CHILD",
+      "originating_submitter": "submitter",
+      "parent_attempt_id": "PARENT_ATTEMPT",
+      "parent_job_id": "PARENT",
+      "spawn_depth": 1,
+      "spec": {
+        "class": "one-shot",
+        "dispatch_key": "baseline-child",
+        "execution": {
+          "argv": [
+            "echo",
+            "hello"
+          ],
+          "executable": {
+            "path": "/bin/echo"
+          },
+          "handoff_directory": "/tmp/handoff",
+          "working_directory": "/tmp"
+        },
+        "kind": "process",
+        "routing_tags": [
+          "linux"
+        ],
+        "schema_version": 1
+      },
+      "state": "queued",
+      "status": "queued",
+      "updated_at": "2026-08-09T10:00:00Z"
+    }
+  ]
+}
