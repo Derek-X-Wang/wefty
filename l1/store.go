@@ -1452,8 +1452,7 @@ CREATE INDEX IF NOT EXISTS backups_computer_status
  CREATE TRIGGER IF NOT EXISTS provenance_listing_insert AFTER INSERT ON storage_provenance
   BEGIN INSERT INTO provenance_listing_order(provenance_id) VALUES(NEW.provenance_id); END;
  INSERT INTO provenance_listing_order(provenance_id) SELECT provenance_id FROM storage_provenance
-  WHERE provenance_id NOT IN (SELECT provenance_id FROM provenance_listing_order) ORDER BY created_ns, provenance_id;
- CREATE INDEX IF NOT EXISTS storage_provenance_creation ON storage_provenance(created_ns, provenance_id);`); err != nil {
+  WHERE provenance_id NOT IN (SELECT provenance_id FROM provenance_listing_order) ORDER BY created_ns, provenance_id;`); err != nil {
 		return fmt.Errorf("l1: ensure Storage provenance indexes: %w", err)
 	}
 	for _, column := range []struct{ name, definition string }{

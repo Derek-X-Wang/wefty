@@ -605,7 +605,8 @@ func (c *apiClients) listComputerBackupsFor(ctx context.Context, computerID, bac
 }
 
 func (c *apiClients) listComputerStorageProvenance(ctx context.Context, computerID string) (l1.ComputerStorageProvenance, error) {
-	var result l1.ComputerStorageProvenance
+	// Non-nil, so an empty walk prints [] rather than null.
+	result := l1.ComputerStorageProvenance{Provenance: []l1.StorageProvenance{}}
 	cursor := ""
 	for {
 		path := "/v1/computers/" + url.PathEscape(computerID) + "/storage-provenance?" + url.Values{"cursor": {cursor}}.Encode()

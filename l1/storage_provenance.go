@@ -70,7 +70,8 @@ type provenanceCollectionCursor struct {
 // not infer deletion: external Custody is tainted by a committed export or an
 // import record, while each Computer retains its own removal outcome.
 func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID string) (ComputerStorageProvenance, error) {
-	var result ComputerStorageProvenance
+	// Non-nil, so an empty walk encodes [] rather than null.
+	result := ComputerStorageProvenance{Provenance: []StorageProvenance{}}
 	cursor := ""
 	for {
 		page, err := s.ListComputerStorageProvenancePage(ctx, computerID, cursor, DefaultJobPageLimit)

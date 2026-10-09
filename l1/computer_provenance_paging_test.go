@@ -294,3 +294,20 @@ func TestComputerCustodyExportLimitPermanent(t *testing.T) {
 		t.Fatalf("export bound=%d %s", w.Code, w.Body.String())
 	}
 }
+
+// A Computer with no provenance rows walks to an empty list, not null, so
+// JSON consumers can iterate the field unconditionally.
+func TestComputerProvenanceEmptyWalkEncodesEmptyList(t *testing.T) {
+	h, computer, _ := liveComputerTokenScope(t, "provenance-empty")
+	got, err := h.store.ListComputerStorageProvenance(t.Context(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Provenance) != 0 || !strings.Contains(string(encoded), `"storage_provenance":[]`) {
+		t.Fatalf("empty provenance walk encoded as %s", encoded)
+	}
+}
