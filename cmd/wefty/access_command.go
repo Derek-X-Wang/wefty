@@ -198,6 +198,9 @@ func executeComputerGrant(
 					computerGrantObservationMessage(result, "observation failed"), result)
 			}
 			result.Revocation = &revocation
+			// A good read clears the record: the timeout names a retryable
+			// answer only when the reads at the end were retryable.
+			lastRetryable = nil
 			result.LastObservedRevocation = &revocation
 		}
 		result.ObservationState = "completed"

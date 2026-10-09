@@ -721,6 +721,9 @@ func executeServiceLogs(
 				if followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
 					return nil
 				}
+				// The reader left during the retry sleep: cancellation, not
+				// the stale 503.
+				return followCtx.Err()
 			}
 			return err
 		}

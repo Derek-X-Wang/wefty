@@ -37,7 +37,10 @@ retryable `unavailable` answer — including `identity_unverifiable` and the
 keeps polling at its normal interval until the wait deadline, and exhausting
 that deadline on retryable answers alone is the wait-timeout outcome (exit 14,
 `wait_timeout`) with the last retryable answer recorded in the observation
-detail. One-shot reads (no `--wait`) still exit 13. Non-retryable answers still
+detail. The log follows (`wefty logs --follow`, `services logs --follow`) have
+no deadline: they retry such answers at their poll interval until the reader
+stops them, which is an ordinary interrupted follow, never exit 13. One-shot
+reads (no `--wait`) still exit 13. Non-retryable answers still
 end a wait immediately and keep their own classification. Genuine Fabric
 identity absence remains
 `401 unauthorized` and exits 3. Node agents classify `unavailable` as

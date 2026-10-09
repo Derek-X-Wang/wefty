@@ -591,8 +591,13 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			// A follow has no deadline: a retryable 503 is one bad poll, not
 			// a verdict (#763). Keep following at the normal interval; only
 			// the caller's cancellation or a non-retryable answer ends it.
-			if follow && isRetryableL1Answer(err) && sleepFollowRetry(ctx, pollInterval) {
-				continue
+			if follow && isRetryableL1Answer(err) {
+				if sleepFollowRetry(ctx, pollInterval) {
+					continue
+				}
+				// The reader left during the retry sleep: an interrupted
+				// follow, not the stale 503.
+				return stopped()
 			}
 			return err
 		}
@@ -628,8 +633,11 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			if ctx.Err() != nil {
 				return stopped()
 			}
-			if isRetryableL1Answer(err) && sleepFollowRetry(ctx, pollInterval) {
-				continue
+			if isRetryableL1Answer(err) {
+				if sleepFollowRetry(ctx, pollInterval) {
+					continue
+				}
+				return stopped()
 			}
 			return err
 		}

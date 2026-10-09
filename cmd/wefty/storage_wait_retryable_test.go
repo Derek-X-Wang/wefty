@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -522,6 +523,57 @@ func TestFollowLoopsTolerateARetryableAnswer(t *testing.T) {
 			[]string{"svc", "--follow", "--follow-for", "1s", "--poll-interval", "50ms"}, &stdout, &stderr)
 		if err != nil || logsReads.Load() < 3 {
 			t.Fatalf("services logs follow with retryable 503s: err=%v reads=%d", err, logsReads.Load())
+		}
+	})
+}
+
+// Leaving a follow while it sleeps before retrying a 503 is an ordinary
+// interrupted follow (exit 1), never the stale unavailable answer (exit 13).
+func TestFollowLoopsCancelledDuringRetrySleep(t *testing.T) {
+	constantUnavailable := func(served chan<- struct{}) *httptest.Server {
+		var once sync.Once
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			writeRetryableUnavailable(w, "read_snapshot_expired")
+			once.Do(func() { close(served) })
+		}))
+	}
+	follow := func(t *testing.T, run func(ctx context.Context, clients *apiClients) error) error {
+		t.Helper()
+		served := make(chan struct{})
+		server := constantUnavailable(served)
+		defer server.Close()
+		client := &apiClient{name: "L1", client: server.Client()}
+		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- run(ctx, &apiClients{l1: client, l3: client}) }()
+		<-served
+		// The follow sleeps a minute before its retry; leave well inside it.
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+		select {
+		case err := <-done:
+			return err
+		case <-time.After(10 * time.Second):
+			t.Fatal("follow did not stop after cancellation")
+			return nil
+		}
+	}
+	t.Run("run logs --follow", func(t *testing.T) {
+		err := follow(t, func(ctx context.Context, clients *apiClients) error {
+			return execute(ctx, clients, true, []string{"logs", "run-1", "--follow", "--poll-interval", "1m"}, &bytes.Buffer{}, &bytes.Buffer{})
+		})
+		if err == nil || isRetryableL1Answer(err) || !strings.Contains(err.Error(), "stopped following run run-1") {
+			t.Fatalf("cancelled run follow = %v, want the interrupted-follow error", err)
+		}
+	})
+	t.Run("services logs --follow", func(t *testing.T) {
+		err := follow(t, func(ctx context.Context, clients *apiClients) error {
+			return executeServiceLogs(ctx, clients, true, []string{"svc", "--follow", "--poll-interval", "1m"}, &bytes.Buffer{}, &bytes.Buffer{})
+		})
+		if !errors.Is(err, context.Canceled) || isRetryableL1Answer(err) {
+			t.Fatalf("cancelled service follow = %v, want context.Canceled", err)
 		}
 	})
 }
