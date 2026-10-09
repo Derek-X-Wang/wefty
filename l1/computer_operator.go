@@ -25,7 +25,7 @@ type computerActionValues struct {
 	Spec              contract.JobSpec
 }
 
-func computerActionDecision(ctx context.Context, tx *sql.Tx, computer Computer, verb string, actor computerActionActor, values computerActionValues) error {
+func computerActionDecision(ctx context.Context, tx readModel, computer Computer, verb string, actor computerActionActor, values computerActionValues) error {
 	values.Precondition.Actor = actor.Identity.NodeID
 	if err := computerActorPreconditionDecision(computer, actor, values.Precondition); err != nil {
 		return err
@@ -69,7 +69,7 @@ func computerActionDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 		_, _, err = computerRestoreDecision(ctx, tx, computer, ComputerRestoreRequest{ComputerMutationPrecondition: values.Precondition, BackupID: values.BackupID, KeepOldBackup: values.KeepOldBackup})
 	case "clone":
 		var copy BackupCopy
-		_, copy, err = readAvailableBackupCopy(ctx, tx, values.BackupID)
+		_, copy, err = tx.availableBackup(ctx, values.BackupID)
 		if err == nil {
 			err = computerCloneDecision(ctx, tx, computer, copy, ComputerCloneRequest{ComputerMutationPrecondition: values.Precondition})
 		}
@@ -99,7 +99,7 @@ func computerActionDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 
 var computerOperatorVerbs = []string{"start", "stop", "restart", "remove", "reimage", "reset", "resize", "backup", "backup-cap", "restore", "clone", "prune", "custody-export", "projections", "reconfiguration-abort"}
 
-func computerAllowedActions(ctx context.Context, tx *sql.Tx, computer Computer, actor computerActionActor) []contract.AllowedAction {
+func computerAllowedActions(ctx context.Context, tx readModel, computer Computer, actor computerActionActor) []contract.AllowedAction {
 	actions := make([]contract.AllowedAction, 0, len(computerOperatorVerbs))
 	authorizationErr := taggedIdentityDecision(actor.Identity, actor.ClientPrincipalTag)
 	for _, verb := range computerOperatorVerbs {
@@ -175,7 +175,7 @@ func computerAllowedActions(ctx context.Context, tx *sql.Tx, computer Computer, 
 		case verb == "restore" || verb == "clone" || verb == "prune" || verb == "custody-export":
 			// A path choice is valid only for this Computer and this operation. Allowed
 			// means at least one such choice exists; it does not bless arbitrary IDs.
-			action.RefusedBecause = apiErrorFromDecision(computerBackupChoiceDecision(ctx, tx, computer, &values, decision))
+			action.RefusedBecause = apiErrorFromDecision(computerBackupChoiceWithReads(ctx, tx, computer, &values, decision))
 		default:
 			action.RefusedBecause = apiErrorFromDecision(decision())
 		}
@@ -184,24 +184,10 @@ func computerAllowedActions(ctx context.Context, tx *sql.Tx, computer Computer, 
 	return actions
 }
 
-func computerBackupChoiceDecision(ctx context.Context, tx *sql.Tx, computer Computer, values *computerActionValues, decision func() error) error {
-	rows, err := tx.QueryContext(ctx, `SELECT backup_id FROM backups WHERE computer_id=? AND status='available' ORDER BY backup_id`, computer.ComputerID)
+func computerBackupChoiceWithReads(ctx context.Context, tx readModel, computer Computer, values *computerActionValues, decision func() error) error {
+	ids, err := tx.backupChoices(ctx, computer.ComputerID)
 	if err != nil {
-		return internalError(err, "list Computer action Backup choices")
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return internalError(err, "read Computer action Backup choice")
-		}
-		ids = append(ids, id)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return internalError(err, "iterate Computer action Backup choices")
+		return err
 	}
 	// With no Backup, still run the actor and resource checks before the absent
 	// choice refusal, so an agent-only caller sees its own authorization failure.
@@ -240,10 +226,10 @@ func (s *Server) projectComputerForCaller(r *http.Request, computer Computer) (C
 		return Computer{}, internalError(err, "begin Computer operator read")
 	}
 	defer tx.Rollback()
-	return projectComputerForCallerTx(r.Context(), tx, computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
+	return projectComputerForCallerTx(r.Context(), transactionReads(tx), computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
 }
 
-func projectComputerForCallerTx(ctx context.Context, tx *sql.Tx, computer Computer, actor computerActionActor) (Computer, error) {
+func projectComputerForCallerTx(ctx context.Context, tx readModel, computer Computer, actor computerActionActor) (Computer, error) {
 	computer.AllowedActions = computerAllowedActions(ctx, tx, computer, actor)
 	var err error
 	computer.LastCondition, err = computerLastCondition(ctx, tx, computer)
@@ -262,7 +248,7 @@ func (s *Server) writeComputerForCaller(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, status, projection)
 }
 
-func computerLastCondition(ctx context.Context, tx *sql.Tx, computer Computer) (*contract.Condition, error) {
+func computerLastCondition(ctx context.Context, tx readModel, computer Computer) (*contract.Condition, error) {
 	var condition *contract.Condition
 	record := func(code, scope string, since time.Time, details map[string]any) {
 		if since.IsZero() {
@@ -272,7 +258,7 @@ func computerLastCondition(ctx context.Context, tx *sql.Tx, computer Computer) (
 			condition = &contract.Condition{Code: code, Scope: scope, Since: since, Details: details}
 		}
 	}
-	intents, err := queryComputerIntents(ctx, tx, computer.ComputerID, computer.IntentRevision-1, 1)
+	intents, err := tx.intents(ctx, computer.ComputerID, computer.IntentRevision-1, 1)
 	if err != nil {
 		return nil, internalError(err, "read Computer last intent condition")
 	}
@@ -333,7 +319,7 @@ func (s *Server) getComputerForCaller(r *http.Request, cloneRevision, restoreRev
 		}
 		computer.RestoreOperation = &operation
 	}
-	return projectComputerForCallerTx(r.Context(), tx, computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
+	return projectComputerForCallerTx(r.Context(), transactionReads(tx), computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
 }
 
 // HTTP mutations carry the actual authenticated identity and deployment tag
@@ -355,4 +341,30 @@ func computerWritePreconditionDecision(ctx context.Context, computer Computer, r
 		return validateComputerPrecondition(computer, request)
 	}
 	return computerActorPreconditionDecision(computer, actor, request)
+}
+
+// Compatibility bridge for existing transaction callers; no new acquisition.
+func computerBackupChoiceDecision(ctx context.Context, q queryer, computer Computer, values *computerActionValues, decision func() error) error {
+	return computerBackupChoiceWithReads(ctx, transactionReads(q), computer, values, decision)
+}
+func (r *databaseReads) backupChoices(ctx context.Context, computerID string) ([]string, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT backup_id FROM backups WHERE computer_id=? AND status='available' ORDER BY backup_id`, computerID)
+	if err != nil {
+		return nil, internalError(err, "list Computer action Backup choices")
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, internalError(err, "read Computer action Backup choice")
+		}
+		ids = append(ids, id)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, internalError(err, "iterate Computer action Backup choices")
+	}
+	return ids, nil
 }

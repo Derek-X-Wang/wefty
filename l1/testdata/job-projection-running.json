@@ -1,0 +1,82 @@
+{
+  "allowed_actions": [
+    {
+      "requires": {
+        "desired_state": "running"
+      },
+      "verb": "start"
+    },
+    {
+      "requires": {
+        "desired_state": "stopped"
+      },
+      "verb": "stop"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "verb": "restart"
+    },
+    {
+      "verb": "remove"
+    },
+    {
+      "requires": {
+        "force": true
+      },
+      "verb": "forget"
+    }
+  ],
+  "attempts": [
+    {
+      "attempt_id": "ATTEMPT",
+      "created_at": "2026-08-09T10:00:00Z",
+      "lease_expires_at": "2026-08-09T10:00:30Z",
+      "node_id": "service-node",
+      "state": "running",
+      "updated_at": "2026-08-09T10:00:00Z"
+    }
+  ],
+  "bound_node_id": "service-node",
+  "created_at": "2026-08-09T10:00:00Z",
+  "current_attempt_id": "ATTEMPT",
+  "desired_state": "running",
+  "healthy_since_at": "2026-08-09T10:00:00Z",
+  "holds_slot": true,
+  "job_id": "JOB",
+  "last_condition": null,
+  "lease_loss_count": 0,
+  "lifetime_restart_count": 0,
+  "node_id": "service-node",
+  "node_state": "alive",
+  "originating_submitter": "client",
+  "restart_streak": 0,
+  "spec": {
+    "class": "service",
+    "dispatch_key": "never",
+    "execution": {
+      "argv": [
+        "echo",
+        "hello"
+      ],
+      "executable": {
+        "path": "/bin/echo"
+      },
+      "working_directory": "/tmp"
+    },
+    "kind": "process",
+    "restart": "never",
+    "routing_tags": [
+      "service"
+    ],
+    "schema_version": 1
+  },
+  "state": "running",
+  "status": "running",
+  "updated_at": "2026-08-09T10:00:00Z"
+}

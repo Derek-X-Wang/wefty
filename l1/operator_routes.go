@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -372,11 +373,19 @@ func (s *Store) projectJob(ctx context.Context, job Job) (Job, error) {
 }
 
 func (s *Store) projectJobWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
+	at := time.Time{}
+	if job.ServiceJob != nil && job.Removal == nil {
+		at = canonicalTime(s.clock.Now())
+	}
+	return projectJobWithReads(ctx, newDatabaseReads(q, at, nil), job, projectJobStatusPart)
+}
+
+func projectJobStatus(ctx context.Context, reads readModel, job Job) (Job, error) {
 	if job.ServiceJob != nil || job.Removal != nil {
-		return s.projectServiceJobWithQueryer(ctx, q, job)
+		return reads.serviceStatus(ctx, job)
 	}
 	job.Status = string(job.State)
-	return s.projectQueuedJobCapabilitiesWithQueryer(ctx, q, job)
+	return reads.queuedStatus(ctx, job)
 }
 
 func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
@@ -384,6 +393,18 @@ func (s *Store) projectServiceJob(ctx context.Context, job Job) (Job, error) {
 }
 
 func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job Job) (Job, error) {
+	at := time.Time{}
+	if job.ServiceJob != nil && job.Removal == nil {
+		at = canonicalTime(s.clock.Now())
+	}
+	if job.ServiceJob == nil && job.Removal == nil {
+		return Job{}, protocolError(contract.ErrorNotFound, "service job %q was not found", job.JobID)
+	}
+	return projectJobWithReads(ctx, newDatabaseReads(q, at, nil), job, projectJobStatusPart)
+}
+
+func (r *databaseReads) serviceStatus(ctx context.Context, job Job) (Job, error) {
+	q := r.q
 	if job.Removal != nil {
 		job.Status = string(job.State)
 		return job, nil
@@ -394,7 +415,7 @@ func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job
 	service := job.ServiceJob
 	service.SlotHeld = service.HoldsSlot(job.State)
 	job.Status = string(job.State)
-	now := canonicalTime(s.clock.Now())
+	now := r.now()
 	if service.RestartPending(job.State, now) {
 		job.Status = "restart-pending"
 	}
@@ -424,7 +445,7 @@ func (s *Store) projectServiceJobWithQueryer(ctx context.Context, q queryer, job
 	}
 	if job.Status != "restart-pending" {
 		var err error
-		job, err = s.projectQueuedJobCapabilitiesWithQueryer(ctx, q, job)
+		job, err = r.queuedStatus(ctx, job)
 		if err != nil {
 			return Job{}, err
 		}

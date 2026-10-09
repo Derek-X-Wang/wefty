@@ -71,6 +71,7 @@ type StoreOptions struct {
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
+	readSnapshots                     chan struct{}
 	db                                *sql.DB
 	settlementDB                      *sql.DB
 	checkpointDB                      *sql.DB
@@ -200,7 +201,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	db.SetMaxOpenConns(16)
 	store := &Store{
-		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
+		readSnapshots: make(chan struct{}, readSnapshotLimit), db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
 		logRetention:                      logRetention,
@@ -2504,7 +2505,12 @@ func (s *Store) LookupRunLedgerJob(ctx context.Context, dispatchKey string) (Job
 // order. Service retention may prune old empty summaries; a one-shot keeps its
 // sole attempt. Authority-bearing columns never cross this operator boundary.
 func (s *Store) ListJobAttempts(ctx context.Context, jobID string) ([]Attempt, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT attempt_id, node_id, state, lease_expires_ns,
+	job, err := projectJobWithReads(ctx, newDatabaseReads(s.db, time.Time{}, nil), Job{JobID: jobID}, projectJobAttemptsPart)
+	return job.Attempts, err
+}
+
+func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, error) {
+	rows, err := q.QueryContext(ctx, `SELECT attempt_id, node_id, state, lease_expires_ns,
 		result_json, late_result_json, image_observation_json, created_ns, updated_ns
 		FROM attempts WHERE job_id=? ORDER BY created_ns, attempt_id`, jobID)
 	if err != nil {

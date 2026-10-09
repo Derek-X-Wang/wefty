@@ -14,7 +14,7 @@ import (
 // These decisions are read-only. Both the atomic writes (after replay checks)
 // and the caller projection use them; request-value constraints stay enforced.
 
-func computerDesiredDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerDesiredStateRequest) (bool, error) {
+func computerDesiredDecision(ctx context.Context, tx readModel, computer Computer, request ComputerDesiredStateRequest) (bool, error) {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return false, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
@@ -26,7 +26,7 @@ func computerDesiredDecision(ctx context.Context, tx *sql.Tx, computer Computer,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
 	if request.DesiredState == contract.ServiceDesiredRunning {
-		if err := requireCurrentComputerStorage(ctx, tx, computer, "start"); err != nil {
+		if err := tx.requireStorage(ctx, computer, "start"); err != nil {
 			return false, err
 		}
 	}
@@ -38,7 +38,7 @@ func computerDesiredDecision(ctx context.Context, tx *sql.Tx, computer Computer,
 	return backupStopWins, nil
 }
 
-func computerRestartDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerRestartRequest) (bool, error) {
+func computerRestartDecision(ctx context.Context, tx readModel, computer Computer, request ComputerRestartRequest) (bool, error) {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return false, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
@@ -47,7 +47,7 @@ func computerRestartDecision(ctx context.Context, tx *sql.Tx, computer Computer,
 		return false, protocolError(contract.ErrorConflict,
 			"Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
-	if err := requireCurrentComputerStorage(ctx, tx, computer, "restart"); err != nil {
+	if err := tx.requireStorage(ctx, computer, "restart"); err != nil {
 		return false, err
 	}
 	var latchedFailure contract.SpawnFailure
@@ -60,14 +60,14 @@ func computerRestartDecision(ctx context.Context, tx *sql.Tx, computer Computer,
 			computerID, computer.CurrentJob.State)
 	}
 	if !activeResourceRestart && !computer.CurrentJob.HoldsSlot(computer.CurrentJob.State) {
-		if err := ensureBoundServiceCapacity(ctx, tx, computer.CurrentJob); err != nil {
+		if err := tx.ensureServiceCapacity(ctx, computer.CurrentJob); err != nil {
 			return false, err
 		}
 	}
 	return activeResourceRestart, nil
 }
 
-func computerBackupCapDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerBackupCapRequest) error {
+func computerBackupCapDecision(ctx context.Context, tx readModel, computer Computer, request ComputerBackupCapRequest) error {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRemoved || computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return protocolError(contract.ErrorConflict, "Computer %q is not stable", computerID)
@@ -75,7 +75,7 @@ func computerBackupCapDecision(ctx context.Context, tx *sql.Tx, computer Compute
 	return nil
 }
 
-func computerGrowDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerGrowRequest) (string, string, error) {
+func computerGrowDecision(ctx context.Context, tx readModel, computer Computer, request ComputerGrowRequest) (string, string, error) {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return "", "", protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
@@ -87,7 +87,7 @@ func computerGrowDecision(ctx context.Context, tx *sql.Tx, computer Computer, re
 	// A grow mutates the current generation's image. With no published
 	// generation there is nothing to grow, and the helper would refuse the
 	// absent disk on every poll.
-	if err := requireCurrentComputerStorage(ctx, tx, computer, "resize"); err != nil {
+	if err := tx.requireStorage(ctx, computer, "resize"); err != nil {
 		return "", "", err
 	}
 	if request.DiskBytes <= computer.DesiredDiskBytes {
@@ -100,8 +100,8 @@ func computerGrowDecision(ctx context.Context, tx *sql.Tx, computer Computer, re
 	if boundNodeID == "" {
 		boundNodeID = computer.PlacementNodeID
 	}
-	var rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
+	rootInstanceID, err := tx.nodeRoot(ctx, boundNodeID)
+	if err != nil {
 		return "", "", protocolError(contract.ErrorConflict, "bound node %q is unavailable", boundNodeID)
 	}
 	if rootInstanceID == "" {
@@ -110,7 +110,7 @@ func computerGrowDecision(ctx context.Context, tx *sql.Tx, computer Computer, re
 	return boundNodeID, rootInstanceID, nil
 }
 
-func computerBackupDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerBackupCreateRequest) (string, string, error) {
+func computerBackupDecision(ctx context.Context, tx readModel, computer Computer, request ComputerBackupCreateRequest) (string, string, error) {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRunning && !request.AllowPowerOff {
 		return "", "", protocolError(contract.ErrorConflict,
@@ -126,8 +126,8 @@ func computerBackupDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return "", "", protocolError(contract.ErrorConflict, "Computer %q is in reconfiguration phase %q", computerID, computer.ReconfigurationPhase)
 	}
-	var retained int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status IN ('available', 'pruning')`, computerID).Scan(&retained); err != nil {
+	retained, err := tx.retainedBackups(ctx, computerID)
+	if err != nil {
 		return "", "", internalError(err, "count retained Computer Backups")
 	}
 	if computer.BackupCap == 0 || retained >= computer.BackupCap {
@@ -140,8 +140,8 @@ func computerBackupDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 		return "", "", protocolError(contract.ErrorConflict,
 			"Computer %q has no bound source Node to back up", computerID)
 	}
-	var rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
+	rootInstanceID, err := tx.nodeRoot(ctx, boundNodeID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", "", protocolError(contract.ErrorConflict, "bound node %q was not found", boundNodeID)
 		}
@@ -153,7 +153,7 @@ func computerBackupDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 	return boundNodeID, rootInstanceID, nil
 }
 
-func computerRestoreDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerRestoreRequest) (Backup, BackupCopy, error) {
+func computerRestoreDecision(ctx context.Context, tx readModel, computer Computer, request ComputerRestoreRequest) (Backup, BackupCopy, error) {
 	computerID := computer.ComputerID
 	if err := validateStoppedDetachedComputer(computer, "restore"); err != nil {
 		return Backup{}, BackupCopy{}, err
@@ -161,7 +161,7 @@ func computerRestoreDecision(ctx context.Context, tx *sql.Tx, computer Computer,
 	if computer.StorageGeneration == math.MaxInt64 {
 		return Backup{}, BackupCopy{}, protocolError(contract.ErrorConflict, "Computer %q exhausted Storage generation space", computerID)
 	}
-	backup, copy, err := readAvailableBackupCopy(ctx, tx, request.BackupID)
+	backup, copy, err := tx.availableBackup(ctx, request.BackupID)
 	if err != nil {
 		return Backup{}, BackupCopy{}, err
 	}
@@ -176,8 +176,8 @@ func computerRestoreDecision(ctx context.Context, tx *sql.Tx, computer Computer,
 	if copy.NodeID != computer.BoundNodeID || copy.RootInstanceID == "" {
 		return Backup{}, BackupCopy{}, protocolError(contract.ErrorConflict, "restore Backup copy is not on the Computer's bound Node")
 	}
-	var currentRootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, copy.NodeID).Scan(&currentRootInstanceID); err != nil {
+	currentRootInstanceID, err := tx.nodeRoot(ctx, copy.NodeID)
+	if err != nil {
 		return Backup{}, BackupCopy{}, internalError(err, "read restore detachment managed-root authority")
 	}
 	if currentRootInstanceID == "" || currentRootInstanceID != copy.RootInstanceID {
@@ -191,12 +191,12 @@ func computerRestoreDecision(ctx context.Context, tx *sql.Tx, computer Computer,
 	return backup, copy, nil
 }
 
-func computerExportDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerCustodyExportRequest) (Backup, BackupCopy, error) {
+func computerExportDecision(ctx context.Context, tx readModel, computer Computer, request ComputerCustodyExportRequest) (Backup, BackupCopy, error) {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRemoved || computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		return Backup{}, BackupCopy{}, protocolError(contract.ErrorConflict, "Computer %q cannot begin a Custody export", computerID)
 	}
-	backup, copy, err := readAvailableBackupCopy(ctx, tx, request.BackupID)
+	backup, copy, err := tx.availableBackup(ctx, request.BackupID)
 	if err != nil {
 		return Backup{}, BackupCopy{}, err
 	}
@@ -206,8 +206,8 @@ func computerExportDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 	if copy.NodeID != computer.BoundNodeID || copy.RootInstanceID == "" {
 		return Backup{}, BackupCopy{}, protocolError(contract.ErrorConflict, "Custody export Backup is not on the Computer's bound Node")
 	}
-	var currentRoot string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, copy.NodeID).Scan(&currentRoot); err != nil {
+	currentRoot, err := tx.nodeRoot(ctx, copy.NodeID)
+	if err != nil {
 		return Backup{}, BackupCopy{}, internalError(err, "read Custody export managed-root identity")
 	}
 	if currentRoot == "" || currentRoot != copy.RootInstanceID {
@@ -216,7 +216,7 @@ func computerExportDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 	return backup, copy, nil
 }
 
-func computerAbortDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerReconfigurationAbortRequest) (string, error) {
+func computerAbortDecision(ctx context.Context, tx readModel, computer Computer, request ComputerReconfigurationAbortRequest) (string, error) {
 	computerID := computer.ComputerID
 	if computer.ReconfigurationRevision == nil || *computer.ReconfigurationRevision != computer.IntentRevision {
 		return "", protocolError(contract.ErrorConflict,
@@ -234,33 +234,18 @@ func computerAbortDecision(ctx context.Context, tx *sql.Tx, computer Computer, r
 		boundNodeID = computer.CurrentJob.BoundNodeID
 	}
 	if boundNodeID == "" {
-		var query string
-		switch computer.ReconfigurationPhase {
-		case ComputerReconfigurationBackingUp:
-			query = `SELECT bound_node_id FROM computer_backup_operations WHERE computer_id=? AND operation_revision=?`
-		case ComputerReconfigurationResetting:
-			query = `SELECT bound_node_id FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`
-		case ComputerReconfigurationReimaging:
-			query = `SELECT bound_node_id FROM computer_reimage_operations WHERE computer_id=? AND operation_revision=?`
-		case ComputerReconfigurationGrowing:
-			query = `SELECT bound_node_id FROM computer_storage_grows WHERE computer_id=? AND operation_revision=?`
-		case ComputerReconfigurationExporting:
-			query = `SELECT bound_node_id FROM computer_custody_exports WHERE computer_id=? AND operation_revision=?`
-		case ComputerReconfigurationImporting:
-			query = `SELECT bound_node_id FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='import'`
-		}
-		if query != "" {
-			if err := tx.QueryRowContext(ctx, query, computerID, computer.IntentRevision).Scan(&boundNodeID); err != nil {
-				return "", internalError(err, "read aborted Computer operation binding")
-			}
+		var err error
+		boundNodeID, err = tx.operationNode(ctx, computer)
+		if err != nil {
+			return "", internalError(err, "read aborted Computer operation binding")
 		}
 	}
 	if boundNodeID == "" {
 		return "", protocolError(contract.ErrorConflict,
 			"Computer %q has no bound Node whose loss can authorize abort", computerID)
 	}
-	var nodeState contract.NodeState
-	if err := tx.QueryRowContext(ctx, `SELECT state FROM nodes WHERE node_id=?`, boundNodeID).Scan(&nodeState); err != nil {
+	nodeState, err := tx.nodeState(ctx, boundNodeID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", protocolError(contract.ErrorConflict, "bound node %q was not found", boundNodeID)
 		}
@@ -274,7 +259,7 @@ func computerAbortDecision(ctx context.Context, tx *sql.Tx, computer Computer, r
 	return boundNodeID, nil
 }
 
-func computerResetDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerStorageResetRequest) error {
+func computerResetDecision(ctx context.Context, tx readModel, computer Computer, request ComputerStorageResetRequest) error {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
@@ -296,15 +281,15 @@ func computerResetDecision(ctx context.Context, tx *sql.Tx, computer Computer, r
 	// Computer whose generation was never published has no predecessor to
 	// retire, so admitting one would reserve a successor that can never be
 	// published.
-	if err := requireCurrentComputerStorage(ctx, tx, computer, "reset"); err != nil {
+	if err := tx.requireStorage(ctx, computer, "reset"); err != nil {
 		return err
 	}
 	return nil
 }
 
-func computerResetCapacityDecision(ctx context.Context, tx *sql.Tx, computer Computer, boundNodeID string) (string, error) {
-	var rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
+func computerResetCapacityDecision(ctx context.Context, tx readModel, computer Computer, boundNodeID string) (string, error) {
+	rootInstanceID, err := tx.nodeRoot(ctx, boundNodeID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", protocolError(contract.ErrorConflict, "bound node %q was not found", boundNodeID)
 		}
@@ -317,20 +302,20 @@ func computerResetCapacityDecision(ctx context.Context, tx *sql.Tx, computer Com
 	// The successor reserves its service Slot before any node-local allocation.
 	// Publication cannot fail after preparation because capacity changed later.
 	if !computer.CurrentJob.HoldsSlot(computer.CurrentJob.State) {
-		if err := ensureBoundServiceCapacity(ctx, tx, computer.CurrentJob); err != nil {
+		if err := tx.ensureServiceCapacity(ctx, computer.CurrentJob); err != nil {
 			return "", err
 		}
 	}
 	return rootInstanceID, nil
 }
 
-func computerCloneDecision(ctx context.Context, tx *sql.Tx, computer Computer, copy BackupCopy, request ComputerCloneRequest) error {
+func computerCloneDecision(ctx context.Context, tx readModel, computer Computer, copy BackupCopy, request ComputerCloneRequest) error {
 	source := computer
 	if source.DesiredState == contract.ServiceDesiredRemoved || copy.NodeID != source.PlacementNodeID {
 		return protocolError(contract.ErrorConflict, "clone source is not available on its Pinned Node")
 	}
-	var currentRootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, copy.NodeID).Scan(&currentRootInstanceID); err != nil {
+	currentRootInstanceID, err := tx.nodeRoot(ctx, copy.NodeID)
+	if err != nil {
 		return internalError(err, "read clone source managed-root authority")
 	}
 	if currentRootInstanceID == "" || currentRootInstanceID != copy.RootInstanceID {
@@ -342,7 +327,7 @@ func computerCloneDecision(ctx context.Context, tx *sql.Tx, computer Computer, c
 	return nil
 }
 
-func computerRemoveDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerRemoveRequest) error {
+func computerRemoveDecision(ctx context.Context, tx readModel, computer Computer, request ComputerRemoveRequest) error {
 	computerID := computer.ComputerID
 	if computer.ReconfigurationPhase != ComputerReconfigurationStable &&
 		computer.ReconfigurationPhase != ComputerReconfigurationProjecting &&
@@ -360,7 +345,7 @@ func computerRemoveDecision(ctx context.Context, tx *sql.Tx, computer Computer, 
 	return err
 }
 
-func computerProjectionDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerProjectionRequest, operation ComputerIntentOperation) error {
+func computerProjectionDecision(ctx context.Context, tx readModel, computer Computer, request ComputerProjectionRequest, operation ComputerIntentOperation) error {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
@@ -381,7 +366,7 @@ func computerProjectionDecision(ctx context.Context, tx *sql.Tx, computer Comput
 	// Refused before any revision is reserved: a projection or reimage of a
 	// Computer with no published Storage commits a phase whose directive no
 	// helper can ever complete.
-	if err := requireCurrentComputerStorage(ctx, tx, computer, string(operation)); err != nil {
+	if err := tx.requireStorage(ctx, computer, string(operation)); err != nil {
 		return err
 	}
 	return computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition)
@@ -390,7 +375,7 @@ func computerProjectionDecision(ctx context.Context, tx *sql.Tx, computer Comput
 // Reads must also check the predicates enforced later by projection writes.
 // Keep them out of the early write decision: dispatch-key conflicts precede
 // root lookup, quiescence and publication refusals in the write transaction.
-func computerProjectionReadinessDecision(ctx context.Context, tx *sql.Tx, computer Computer, operation ComputerIntentOperation) error {
+func computerProjectionReadinessDecision(ctx context.Context, tx readModel, computer Computer, operation ComputerIntentOperation) error {
 	if operation == ComputerIntentReimage {
 		if _, err := computerReimageRootDecision(ctx, tx, computer); err != nil {
 			return err
@@ -402,12 +387,12 @@ func computerProjectionReadinessDecision(ctx context.Context, tx *sql.Tx, comput
 	return computerProjectionQuiescenceDecision(computer.CurrentJob)
 }
 
-func computerPruneDecision(ctx context.Context, tx *sql.Tx, computer Computer, request ComputerBackupPruneRequest) (Backup, error) {
+func computerPruneDecision(ctx context.Context, tx readModel, computer Computer, request ComputerBackupPruneRequest) (Backup, error) {
 	computerID := computer.ComputerID
 	if computer.DesiredState == contract.ServiceDesiredRemoved || computer.ReconfigurationPhase == ComputerReconfigurationRemoving {
 		return Backup{}, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
 	}
-	backup, err := readBackup(ctx, tx, request.BackupID)
+	backup, err := tx.backup(ctx, request.BackupID)
 	if errors.Is(err, sql.ErrNoRows) || backup.ComputerID != computerID {
 		return Backup{}, protocolError(contract.ErrorNotFound, "Backup %q was not found", request.BackupID)
 	}
@@ -436,7 +421,7 @@ func computerRuntimeActive(computer Computer) bool {
 
 // This is also called immediately before applying the Job transition. Reads
 // must include the capacity and observed-state checks behind desired intent.
-func computerServiceDesiredDecision(ctx context.Context, tx *sql.Tx, job Job, desired contract.ServiceDesiredState) error {
+func computerServiceDesiredDecision(ctx context.Context, tx readModel, job Job, desired contract.ServiceDesiredState) error {
 	if job.ServiceJob == nil {
 		return internalError(errors.New("Computer current Job is not a service"), "apply Computer desired state")
 	}
@@ -447,7 +432,7 @@ func computerServiceDesiredDecision(ctx context.Context, tx *sql.Tx, job Job, de
 			return protocolError(contract.ErrorConflict, "Computer Job %q is latched failed; restart is required", job.JobID)
 		case contract.JobStopped:
 			if !job.HoldsSlot(job.State) {
-				return ensureBoundServiceCapacity(ctx, tx, job)
+				return tx.ensureServiceCapacity(ctx, job)
 			}
 		case contract.JobStopping:
 			return protocolError(contract.ErrorConflict, "Computer Job %q is still stopping", job.JobID)
@@ -472,7 +457,7 @@ func computerServiceDesiredDecision(ctx context.Context, tx *sql.Tx, job Job, de
 	return nil
 }
 
-func computerRemovalBindingDecision(ctx context.Context, tx *sql.Tx, computer Computer) (string, string, error) {
+func computerRemovalBindingDecision(ctx context.Context, tx readModel, computer Computer) (string, string, error) {
 	computerID := computer.ComputerID
 	boundNodeID := computer.CurrentJob.BoundNodeID
 	if computer.BoundNodeID != boundNodeID {
@@ -484,8 +469,8 @@ func computerRemovalBindingDecision(ctx context.Context, tx *sql.Tx, computer Co
 	if boundNodeID == "" {
 		return "", "", nil
 	}
-	var rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
+	rootInstanceID, err := tx.nodeRoot(ctx, boundNodeID)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", "", protocolError(contract.ErrorConflict, "bound node %q was not found", boundNodeID)
 		}
@@ -498,13 +483,13 @@ func computerRemovalBindingDecision(ctx context.Context, tx *sql.Tx, computer Co
 	return boundNodeID, rootInstanceID, nil
 }
 
-func computerReimageRootDecision(ctx context.Context, tx *sql.Tx, computer Computer) (string, error) {
+func computerReimageRootDecision(ctx context.Context, tx readModel, computer Computer) (string, error) {
 	boundNodeID := computer.BoundNodeID
 	if boundNodeID == "" {
 		boundNodeID = computer.PlacementNodeID
 	}
-	var rootInstanceID string
-	if err := tx.QueryRowContext(ctx, `SELECT root_instance_id FROM nodes WHERE node_id=?`, boundNodeID).Scan(&rootInstanceID); err != nil {
+	rootInstanceID, err := tx.nodeRoot(ctx, boundNodeID)
+	if err != nil {
 		return "", protocolError(contract.ErrorConflict, "Computer reimage bound Node is unavailable")
 	}
 	return rootInstanceID, nil
@@ -519,10 +504,10 @@ func computerProjectionQuiescenceDecision(job Job) error {
 	}
 }
 
-func computerRestoreRetentionDecision(ctx context.Context, tx *sql.Tx, computer Computer) error {
+func computerRestoreRetentionDecision(ctx context.Context, tx readModel, computer Computer) error {
 	computerID := computer.ComputerID
-	var retained int64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status IN ('available', 'pruning')`, computerID).Scan(&retained); err != nil {
+	retained, err := tx.retainedBackups(ctx, computerID)
+	if err != nil {
 		return internalError(err, "count retained Backups before restore")
 	}
 	if computer.BackupCap == 0 || retained >= computer.BackupCap {
@@ -536,4 +521,35 @@ func computerProjectionPublicationDecision(computerID string, state contract.Job
 		return protocolError(contract.ErrorConflict, "Computer %q has not quiesced its current Job", computerID)
 	}
 	return nil
+}
+
+func (r *databaseReads) retainedBackups(ctx context.Context, computerID string) (int64, error) {
+	var retained int64
+	err := r.q.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE computer_id=? AND status IN ('available', 'pruning')`, computerID).Scan(&retained)
+	return retained, err
+}
+func (r *databaseReads) operationNode(ctx context.Context, computer Computer) (string, error) {
+	computerID := computer.ComputerID
+	var boundNodeID string
+	var query string
+	switch computer.ReconfigurationPhase {
+	case ComputerReconfigurationBackingUp:
+		query = `SELECT bound_node_id FROM computer_backup_operations WHERE computer_id=? AND operation_revision=?`
+	case ComputerReconfigurationResetting:
+		query = `SELECT bound_node_id FROM computer_storage_resets WHERE computer_id=? AND intent_revision=?`
+	case ComputerReconfigurationReimaging:
+		query = `SELECT bound_node_id FROM computer_reimage_operations WHERE computer_id=? AND operation_revision=?`
+	case ComputerReconfigurationGrowing:
+		query = `SELECT bound_node_id FROM computer_storage_grows WHERE computer_id=? AND operation_revision=?`
+	case ComputerReconfigurationExporting:
+		query = `SELECT bound_node_id FROM computer_custody_exports WHERE computer_id=? AND operation_revision=?`
+	case ComputerReconfigurationImporting:
+		query = `SELECT bound_node_id FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=? AND operation='import'`
+	}
+	if query != "" {
+		if err := r.q.QueryRowContext(ctx, query, computerID, computer.IntentRevision).Scan(&boundNodeID); err != nil {
+			return "", err
+		}
+	}
+	return boundNodeID, nil
 }

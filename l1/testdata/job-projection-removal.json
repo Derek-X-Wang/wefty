@@ -1,0 +1,104 @@
+{
+  "allowed_actions": [
+    {
+      "refused_because": {
+        "code": "not_found",
+        "message": "service job \"JOB\" was not found",
+        "retryable": false
+      },
+      "requires": {
+        "desired_state": "running"
+      },
+      "verb": "start"
+    },
+    {
+      "refused_because": {
+        "code": "not_found",
+        "message": "service job \"JOB\" was not found",
+        "retryable": false
+      },
+      "requires": {
+        "desired_state": "stopped"
+      },
+      "verb": "stop"
+    },
+    {
+      "inputs": [
+        {
+          "name": "idempotency_key",
+          "required": true,
+          "type": "string"
+        }
+      ],
+      "refused_because": {
+        "code": "not_found",
+        "message": "service job \"JOB\" was not found",
+        "retryable": false
+      },
+      "verb": "restart"
+    },
+    {
+      "verb": "remove"
+    },
+    {
+      "requires": {
+        "force": true
+      },
+      "verb": "forget"
+    }
+  ],
+  "attempts": [
+    {
+      "attempt_id": "ATTEMPT",
+      "created_at": "2026-08-09T10:00:00Z",
+      "lease_expires_at": "2026-08-09T10:00:00Z",
+      "node_id": "service-node",
+      "state": "lost",
+      "updated_at": "2026-08-09T10:00:00Z"
+    }
+  ],
+  "created_at": "2026-08-09T10:00:00Z",
+  "job_id": "JOB",
+  "last_condition": {
+    "code": "removal_pending",
+    "details": {
+      "cleanup_status": "pending",
+      "removal_generation": 1,
+      "removal_outcome": "",
+      "state": "removal_pending"
+    },
+    "scope": "service_removal",
+    "since": "2026-08-09T10:00:00Z"
+  },
+  "originating_submitter": "client",
+  "removal": {
+    "bound_node_id": "service-node",
+    "cleanup_status": "pending",
+    "desired_state": "removed",
+    "removal_generation": 1,
+    "removal_requested_at": "2026-08-09T10:00:00Z"
+  },
+  "spec": {
+    "class": "service",
+    "dispatch_key": "never",
+    "execution": {
+      "argv": [
+        "echo",
+        "hello"
+      ],
+      "executable": {
+        "path": "/bin/echo"
+      },
+      "working_directory": "/tmp"
+    },
+    "kind": "process",
+    "restart": "never",
+    "routing_tags": [
+      "service"
+    ],
+    "schema_version": 1
+  },
+  "state": "removal_pending",
+  "status": "removal_pending",
+  "updated_at": "2026-08-09T10:00:00Z"
+}

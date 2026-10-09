@@ -673,7 +673,7 @@ func (s *Store) listComputersForCaller(ctx context.Context, cursorValue string, 
 			return ComputerList{}, err
 		}
 		if actor != nil {
-			computer, err = projectComputerForCallerTx(ctx, tx, computer, *actor)
+			computer, err = projectComputerForCallerTx(ctx, transactionReads(tx), computer, *actor)
 			if err != nil {
 				return ComputerList{}, err
 			}
@@ -903,7 +903,7 @@ func (s *Store) SetComputerBackupCap(ctx context.Context, computerID string, req
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
 	}
-	if err := computerBackupCapDecision(ctx, tx, computer, request); err != nil {
+	if err := computerBackupCapDecision(ctx, transactionReads(tx), computer, request); err != nil {
 		return Computer{}, err
 	}
 	if computer.BackupCap == request.BackupCap {
@@ -1065,14 +1065,14 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err
 	}
-	backupStopWins, err := computerDesiredDecision(ctx, tx, computer, request)
+	backupStopWins, err := computerDesiredDecision(ctx, transactionReads(tx), computer, request)
 	if err != nil {
 		return Computer{}, err
 	}
 	if computer.DesiredState == request.DesiredState {
 		return computer, nil
 	}
-	if err := computerServiceDesiredDecision(ctx, tx, computer.CurrentJob, request.DesiredState); err != nil {
+	if err := computerServiceDesiredDecision(ctx, transactionReads(tx), computer.CurrentJob, request.DesiredState); err != nil {
 		return Computer{}, err
 	}
 	// Read before the stop moves the Job or clears its current attempt.
@@ -1133,7 +1133,7 @@ func setComputerServiceDesiredState(
 	desired contract.ServiceDesiredState,
 	now time.Time,
 ) error {
-	if err := computerServiceDesiredDecision(ctx, tx, job, desired); err != nil {
+	if err := computerServiceDesiredDecision(ctx, transactionReads(tx), job, desired); err != nil {
 		return err
 	}
 	switch desired {
@@ -1233,7 +1233,7 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	activeResourceRestart, err := computerRestartDecision(ctx, tx, computer, request)
+	activeResourceRestart, err := computerRestartDecision(ctx, transactionReads(tx), computer, request)
 	if err != nil {
 		return Computer{}, false, err
 	}
@@ -1327,7 +1327,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return computer, nil
 	}
-	if err := computerRemoveDecision(ctx, tx, computer, request); err != nil {
+	if err := computerRemoveDecision(ctx, transactionReads(tx), computer, request); err != nil {
 		return Computer{}, err
 	}
 	// Read before the removal marks these attempts lost.
@@ -1416,7 +1416,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		contract.ServiceDesiredStopped, computer.CurrentJobID); err != nil {
 		return Computer{}, internalError(err, "withdraw Computer service projection")
 	}
-	boundNodeID, rootInstanceID, err := computerRemovalBindingDecision(ctx, tx, computer)
+	boundNodeID, rootInstanceID, err := computerRemovalBindingDecision(ctx, transactionReads(tx), computer)
 	if err != nil {
 		return Computer{}, err
 	}
@@ -1706,7 +1706,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 		}
 		return updated, nil
 	}
-	if err := computerProjectionDecision(ctx, tx, computer, request, operation); err != nil {
+	if err := computerProjectionDecision(ctx, transactionReads(tx), computer, request, operation); err != nil {
 		return Computer{}, err
 	}
 	holding, err := computerAttemptsHoldingAuthority(ctx, tx, computer.CurrentJobID)
@@ -1760,7 +1760,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 		if boundNodeID == "" {
 			boundNodeID = computer.PlacementNodeID
 		}
-		rootInstanceID, err := computerReimageRootDecision(ctx, tx, computer)
+		rootInstanceID, err := computerReimageRootDecision(ctx, transactionReads(tx), computer)
 		if err != nil {
 			return Computer{}, err
 		}

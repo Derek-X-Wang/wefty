@@ -1,0 +1,852 @@
+[
+  {
+    "site": "admin_policy.go:*Store.BootstrapAdmin | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "admin_policy.go:*Store.GetAdminPolicy | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "admin_policy.go:*Store.GetVisibleAdminPolicy | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "admin_policy.go:*Store.InitiateAdminBootstrap | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "admin_policy.go:*Store.ListAdminPolicyAudit | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "admin_policy.go:*Store.ObserveAuthenticatedPerson | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "admin_policy.go:*Store.ResetAdminPolicy | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "admin_policy.go:*Store.mutateAdmin | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "attempt_credential.go:*Store.ResolveAttemptCredential | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "attempt_credential.go:*Store.listChildJobsForCaller | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.AcknowledgeComputerBackup | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.AcknowledgeComputerBackupPrune | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.BeginComputerBackup | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.BeginComputerBackupPrune | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.ComputerBackupOperation | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.ComputerBackupOperationForKey | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.ListComputerBackups | s.db",
+    "count": 4,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.ListNodeComputerBackupDirectives | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "backups.go:*Store.ListNodeComputerBackupPruneDirectives | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "cancel.go:*Store.CancelJob | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "cancel.go:*Store.ListNodeCancelDirectives | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "capabilities.go:*Store.projectQueuedJobCapabilities | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_operator.go:*Server.getComputerForCaller | s.store.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_operator.go:*Server.projectComputerForCaller | s.store.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.AcknowledgeComputerPolicyInstallation | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.GetComputerPolicyRevocation | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.GetComputerTakeoverAvailability | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.IssueComputerPolicySnapshot | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.ListComputerGrants | s.db",
+    "count": 4,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.ListComputerPolicyAudit | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.MutateComputerGrant | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.ResolvePersonComputerHandle | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_policy.go:*Store.computerPolicyRevisionInstalled | s.db",
+    "count": 4,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_submission.go:*Store.GetComputerSubmissionState | s.db",
+    "count": 3,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_submission.go:*Store.MutateComputerSubmission | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_submission.go:*Store.ProveComputerTokenScope | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_submission.go:*Store.ProveHostBootSession | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_takeover_audit.go:*Store.AppendComputerTakeoverAudit | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_takeover_audit.go:*Store.ListComputerTakeoverAudit | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_takeover_audit.go:*Store.ListComputerTakeoverSessions | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computer_takeover_audit.go:*Store.listComputerTakeoverAuditTail | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.CreateComputer | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.GetComputer | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.ListComputerIntents | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.RemoveComputer | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.RestartComputer | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.SetComputerBackupCap | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.SetComputerDesiredState | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.installComputerProjection | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.listComputersForCaller | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "computers.go:*Store.reimageComputer | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "custody.go:*Store.AcknowledgeComputerCustodyExport | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "custody.go:*Store.AcknowledgeComputerCustodyImport | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "custody.go:*Store.AttestComputerCustodyDeletedWithReplay | s.db",
+    "count": 3,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "custody.go:*Store.BeginComputerCustodyExport | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "custody.go:*Store.BeginComputerCustodyImport | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "custody.go:*Store.GetComputerCustodyImport | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "custody.go:*Store.ListComputerCustodyExports | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "custody.go:*Store.ListNodeComputerCustodyExportDirectives | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "instance_keys.go:*Store.initializeInstanceKeys | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "jobs_listing.go:*Store.initializeJobListing | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "jobs_listing.go:*Store.listReadableJobsForCaller | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "log_continuity.go:*Store.seedLogContinuity | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "log_event_document.go:*Store.CompactLogEventDocuments | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "log_event_document.go:*Store.markLogEventDocumentsCompactOnNewDatabase | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "log_retention.go:*Store.ensureLogUsageCounters | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "log_retention.go:*Store.migrateServiceLogTruncations | s.db",
+    "count": 2,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "node_operator.go:*Store.GetNode | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "nodes_listing.go:*Store.initializeNodeListing | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "nodes_listing.go:*Store.listNodesPage | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "operator_routes.go:*Store.projectJob | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "operator_routes.go:*Store.projectServiceJob | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "operator_routes.go:*Store.restartService | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "operator_routes.go:*Store.setServiceDesiredState | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "owed_revocations.go:*Store.RecordOwedComputerAttemptRevocations | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "owed_revocations.go:*Store.RecordOwedComputerRevocationFailure | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "owed_revocations.go:*Store.SettleOwedComputerRevocationRevokeAll | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "owed_revocations.go:*Store.SettleOwedComputerRevocationWithoutRunLedger | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "owed_revocations.go:*Store.listNodeOwedComputerRevocations | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "owed_revocations.go:*Store.owedComputerRevocation | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "read_snapshot.go:*Store.beginWriteTransaction | s.db",
+    "count": 1,
+    "reason": "write transaction constructor: existing immediate transaction and authoritative clock"
+  },
+  {
+    "site": "read_snapshot.go:*Store.withReadSnapshot | conn",
+    "count": 6,
+    "reason": "snapshot constructor: admission, pool checkout, read-only enforcement and connection reset"
+  },
+  {
+    "site": "read_snapshot.go:*Store.withReadSnapshot | s.db",
+    "count": 1,
+    "reason": "snapshot constructor: admission, pool checkout, read-only enforcement and connection reset"
+  },
+  {
+    "site": "reconfiguration_abort.go:*Store.AbortComputerReconfiguration | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "recovery.go:*Store.DrainNode | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "recovery.go:*Store.Reconcile | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "recovery.go:*Store.setNodeIntentByOperator | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "reimage_preflight.go:*Store.AcknowledgeComputerReimagePreflight | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "reimage_preflight.go:*Store.ListNodeComputerReimagePreflightDirectives | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "removal.go:*Store.AcknowledgeServiceRemoval | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "removal.go:*Store.FinalizeServiceRemoval | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "removal.go:*Store.ListNodeRemovalDirectives | s.db",
+    "count": 5,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "removal.go:*Store.forceForgetService | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "removal.go:*Store.removeService | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "secret_scrub.go:*Store.SweepScrubbedSecrets | s.db",
+    "count": 1,
+    "reason": "infrastructure: secret scrubbing and WAL checkpoint; ADR-0002"
+  },
+  {
+    "site": "secret_scrub.go:*Store.backfillTerminalOneShotSecrets | s.db",
+    "count": 1,
+    "reason": "infrastructure: secret scrubbing and WAL checkpoint; ADR-0002"
+  },
+  {
+    "site": "secret_scrub.go:*Store.checkpointSecretWALOnce | s.checkpointDB",
+    "count": 1,
+    "reason": "infrastructure: secret scrubbing and WAL checkpoint; ADR-0002"
+  },
+  {
+    "site": "secret_scrub.go:*Store.initializeSecretScrub | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "server.go:*Server.recordOwedRevocationSettlement | s.store.settlementDB",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "server.go:*Server.recordOwedRevocationSettlement | session",
+    "count": 3,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "service_jobs.go:*Store.LatchServiceImageReconciliationFailure | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "service_jobs.go:*Store.ProveServiceBinding | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "service_operator.go:*Server.projectServiceForCaller | s.store.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.AcknowledgeComputerRestoreRetirement | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.AcknowledgeComputerStorageCopy | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.BeginComputerClone | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.BeginComputerRestore | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.ComputerCloneOperation | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.ComputerCloneOperationForKey | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.ComputerRestoreOperation | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.ComputerRestoreOperationForKey | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.GetComputerWithCloneOperation | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.ListNodeComputerRestoreRevocations | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.ListNodeComputerStorageCopyDirectives | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.RecordComputerRestoreAuthorityRevoked | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_copies.go:*Store.publishVerifiedComputerStorageCopy | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_generations.go:*Store.AcknowledgeComputerStorageRetirement | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_generations.go:*Store.BeginComputerStorageReset | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_generations.go:*Store.ListComputerStorageGenerations | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_generations.go:*Store.ListNodeComputerStorageResetDirectives | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_generations.go:*Store.publishVerifiedComputerStorageReset | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_generations.go:*Store.recordComputerStorageResetVerification | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_grow.go:*Store.AcknowledgeComputerStorageGrow | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_grow.go:*Store.BeginComputerGrow | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_grow.go:*Store.ListNodeComputerStorageGrowDirectives | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "storage_provenance.go:*Store.ListComputerStorageProvenance | s.db",
+    "count": 3,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.AppendLogs | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.ClaimJob | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.Close | s.checkpointDB",
+    "count": 2,
+    "reason": "infrastructure: close SQLite pools"
+  },
+  {
+    "site": "store.go:*Store.Close | s.db",
+    "count": 1,
+    "reason": "infrastructure: close SQLite pools"
+  },
+  {
+    "site": "store.go:*Store.Close | s.settlementDB",
+    "count": 2,
+    "reason": "infrastructure: close SQLite pools"
+  },
+  {
+    "site": "store.go:*Store.CompleteAttemptOutcome | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.CreateJobAs | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.GetJob | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.GetJobLogs | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.GetJobResult | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.ListJobAttempts | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.ListNodes | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.LookupRunLedgerJob | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.ObserveAttemptImage | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.RawJobLogJSONL | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.RegisterNode | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.RenewLease | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.SetAttemptPublication | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.SetAttemptResult | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.StartAttempt | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.ensureColumn | s.db",
+    "count": 2,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.heartbeatNode | s.db",
+    "count": 1,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:*Store.initialize | s.db",
+    "count": 11,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateBackupDigestConstraint | connection",
+    "count": 7,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateBackupDigestConstraint | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateComputerAbortConstraints | connection",
+    "count": 6,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateComputerAbortConstraints | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateComputerResetConstraints | connection",
+    "count": 8,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateComputerResetConstraints | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateComputerStorageCopyConstraints | connection",
+    "count": 6,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateComputerStorageCopyConstraints | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateCustodyExportConstraints | connection",
+    "count": 7,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateCustodyExportConstraints | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateOwedRevocationSettlementConstraint | s.db",
+    "count": 2,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateServiceRemovalStallConstraints | connection",
+    "count": 8,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateServiceRemovalStallConstraints | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateStorageProvenanceConstraints | connection",
+    "count": 6,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.migrateStorageProvenanceConstraints | s.db",
+    "count": 1,
+    "reason": "infrastructure: initialization and schema migration"
+  },
+  {
+    "site": "store.go:*Store.readConcurrentSubmit | s.db",
+    "count": 3,
+    "reason": "legacy acquisition/use; migrate in #748-#752"
+  },
+  {
+    "site": "store.go:OpenStore | checkpointDB",
+    "count": 4,
+    "reason": "infrastructure: open and configure the three SQLite pools"
+  },
+  {
+    "site": "store.go:OpenStore | db",
+    "count": 7,
+    "reason": "infrastructure: open and configure the three SQLite pools"
+  },
+  {
+    "site": "store.go:OpenStore | settlementDB",
+    "count": 6,
+    "reason": "infrastructure: open and configure the three SQLite pools"
+  },
+  {
+    "site": "store.go:OpenStore | store.checkpointDB",
+    "count": 1,
+    "reason": "infrastructure: open and configure the three SQLite pools"
+  },
+  {
+    "site": "store.go:OpenStore | store.settlementDB",
+    "count": 1,
+    "reason": "infrastructure: open and configure the three SQLite pools"
+  }
+]

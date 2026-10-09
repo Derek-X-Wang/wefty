@@ -196,7 +196,7 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return ComputerCustodyExport{}, false, err
 	}
-	backup, copy, err := computerExportDecision(ctx, tx, computer, request)
+	backup, copy, err := computerExportDecision(ctx, transactionReads(tx), computer, request)
 	if err != nil {
 		return ComputerCustodyExport{}, false, err
 	}
