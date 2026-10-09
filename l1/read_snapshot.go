@@ -430,6 +430,10 @@ var readSnapshotPageCutoff = readSnapshotPageSoftLimit
 
 type readPageCutoffContextKey struct{}
 
+// readSnapshotHardLimitContextKey overrides the hard hold limit. Test-only:
+// it has no production caller, and the unexported key keeps it that way.
+type readSnapshotHardLimitContextKey struct{}
+
 func (r *databaseReads) pageCutoffReached() bool {
 	return !r.pageDeadline.IsZero() && !time.Now().Before(r.pageDeadline)
 }
@@ -470,7 +474,11 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 	if ctx.Value(readSnapshotContextKey{}) != nil {
 		return errNestedReadSnapshot
 	}
-	admission, cancelAdmission := context.WithTimeout(ctx, readSnapshotHardLimit)
+	limit := readSnapshotHardLimit
+	if override, ok := ctx.Value(readSnapshotHardLimitContextKey{}).(time.Duration); ok {
+		limit = override
+	}
+	admission, cancelAdmission := context.WithTimeout(ctx, limit)
 	conn, err := s.readDB.Conn(admission)
 	cancelAdmission()
 	if err != nil {
@@ -482,7 +490,7 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 	defer conn.Close()
 	// Checkout is not part of the transaction hold limit. ReadOnly selects a
 	// deferred BEGIN in modernc; the pool's connection pragma enforces no writes.
-	ctx, cancel := context.WithTimeout(context.WithValue(ctx, readSnapshotContextKey{}, true), readSnapshotHardLimit)
+	ctx, cancel := context.WithTimeout(context.WithValue(ctx, readSnapshotContextKey{}, true), limit)
 	defer cancel()
 	defer func() {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {

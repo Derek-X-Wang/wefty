@@ -44,7 +44,8 @@ func TestJobCollectionPublishesFiltersAndScopedPaging(t *testing.T) {
 		t.Fatalf("submitter=%v", submitter)
 	}
 	limit := object(t, params["limit"]["schema"], "limit schema")
-	if limit["default"] != float64(l1.DefaultJobPageLimit) || limit["minimum"] != float64(1) || limit["maximum"] != float64(l1.MaxJobListingPageLimit) {
+	// The schema maximum is the accepted input range; the server clamps job pages to l1.MaxJobListingPageLimit.
+	if limit["default"] != float64(l1.DefaultJobPageLimit) || limit["minimum"] != float64(1) || limit["maximum"] != float64(l1.MaxJobPageLimit) {
 		t.Fatalf("limit=%v", limit)
 	}
 	if len(route["security"].([]any)) != 2 {
