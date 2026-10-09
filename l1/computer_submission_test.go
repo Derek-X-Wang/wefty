@@ -363,9 +363,14 @@ func TestComputerTokenScopeProofRequiresLiveAttemptAndInstalledPolicy(t *testing
 // the state every authority-losing verb starts from.
 func liveComputerTokenScope(t *testing.T, name string) (*integrationHarness, Computer, *Claim) {
 	t.Helper()
-	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: time.Minute}, map[string]NodePolicy{
+	return liveComputerTokenScopeWithReconcileInterval(t, name, 0)
+}
+
+func liveComputerTokenScopeWithReconcileInterval(t *testing.T, name string, interval time.Duration) (*integrationHarness, Computer, *Claim) {
+	t.Helper()
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{LeaseDuration: time.Minute}, map[string]NodePolicy{
 		"computer-node": DefaultNodePolicy(contract.StableNodeTagPrefix + "computer-node"),
-	})
+	}, true, interval)
 	ctx := context.Background()
 	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{
 		"kind:oci": true, "cgroup_v2": true, "computer": true,
@@ -490,7 +495,7 @@ func TestComputerTokenScopeProofRefusesAStoppingComputer(t *testing.T) {
 // the Node's state, and a Node that comes back by registering again must not
 // revive the passes its earlier registration held.
 func TestComputerTokenScopeProofRefusesAnAttemptOnADeadHost(t *testing.T) {
-	h, computer, claim := liveComputerTokenScope(t, "dead-host")
+	h, computer, claim := liveComputerTokenScopeWithReconcileInterval(t, "dead-host", time.Hour)
 	ctx := context.Background()
 	prove := func() error {
 		_, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "fabric-computer-node", "")
@@ -510,6 +515,15 @@ func TestComputerTokenScopeProofRefusesAnAttemptOnADeadHost(t *testing.T) {
 			t.Fatalf("renew while heartbeats are silent: %v", err)
 		}
 		lease = renewed
+	}
+	operator := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+	status, _, body := h.do(operator, http.MethodGet, "/v1/nodes/computer-node", nil)
+	var effective Node
+	if err := json.Unmarshal(body, &effective); err != nil || status != http.StatusOK || effective.State != contract.NodeDead {
+		t.Fatalf("effective host=%d %s err=%v", status, body, err)
+	}
+	if err := prove(); err != nil {
+		t.Fatalf("effective-dead view revoked a still-recorded-live host: %v", err)
 	}
 	result, err := h.store.Reconcile(ctx)
 	if err != nil || result.DeadNodes != 1 {

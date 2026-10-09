@@ -1071,11 +1071,11 @@ func TestProtocolPrincipalsCannotCrossRouteGroups(t *testing.T) {
 }
 
 func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
-	h := newIntegrationHarness(t, map[string][]string{
-		"alive-node": {"linux", "arm64"},
-		"stale-node": {"linux"},
-		"dead-node":  {"linux"},
-	})
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, map[string]NodePolicy{
+		"alive-node": DefaultNodePolicy("linux", "arm64"),
+		"stale-node": DefaultNodePolicy("linux"),
+		"dead-node":  DefaultNodePolicy("linux"),
+	}, true, time.Hour)
 	client := h.client(fabric.Identity{NodeID: "caller", Tags: []string{DefaultClientPrincipalTag}})
 	deadAgent := h.client(fabric.Identity{NodeID: "dead-node", Tags: []string{DefaultAgentPrincipalTag}})
 	h.register(deadAgent, "dead-node")
@@ -1101,6 +1101,15 @@ func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
 	for i, want := range wantStates {
 		if listed.Nodes[i].State != want {
 			t.Fatalf("node %q state = %q, want %q", listed.Nodes[i].NodeID, listed.Nodes[i].State, want)
+		}
+	}
+	for _, node := range listed.Nodes {
+		var recorded contract.NodeState
+		if err := h.store.db.QueryRow("SELECT state FROM nodes WHERE node_id=?", node.NodeID).Scan(&recorded); err != nil {
+			t.Fatal(err)
+		}
+		if recorded != contract.NodeAlive || node.LastCondition == nil || node.LastCondition.Code != "node_registered" {
+			t.Fatalf("listing recorded liveness: node=%#v recorded=%s", node, recorded)
 		}
 	}
 	if got := listed.Nodes[0].AuthoritativeTags; len(got) != 2 || got[0] != "arm64" || got[1] != "linux" {

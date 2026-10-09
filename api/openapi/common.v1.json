@@ -1733,7 +1733,7 @@
             "format": "date-time"
           }
         },
-        "description": "Nonterminal persisted attempt on this Node, including prior boots until reconciled. Read routes reconcile expiry first. Reports execution state and lease, never a credential, fence or proof that a payload is physically running."
+        "description": "Nonterminal persisted attempt on this Node, including prior boots until reconciled. Read routes preserve attempts whose leases have expired until background reconciliation records their expiry. Reports execution state and lease, never a credential, fence or proof that a payload is physically running."
       },
       "Node": {
         "allOf": [{ "$ref": "#/components/schemas/NodeFields" }],
@@ -1754,7 +1754,7 @@
               "active_attempts", "last_condition", "allowed_actions"
             ],
             "properties": {
-              "state": { "enum": ["alive", "stale", "draining", "dead"] },
+              "state": { "enum": ["alive", "stale", "draining", "dead"], "description": "Node list and detail GETs show effective liveness computed from the snapshot clock without writes; recorded state follows through background reconciliation. Agent and mutation responses report recorded state. Durable decisions use recorded state. Effective dead/stale is provisional, and a heartbeat accepted before reconciliation returns the node to alive." },
               "authoritative_tags": {
                 "type": "array",
                 "items": { "type": "string" },

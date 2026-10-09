@@ -21,6 +21,8 @@ type readModel interface {
 	job(context.Context, string) (Job, error)
 	attempts(context.Context, string) ([]Attempt, error)
 	node(context.Context, string) (Node, error)
+	nodes(context.Context) ([]Node, error)
+	nodePage(context.Context, nodeListFilters, nodeListCursor, int, nodeLiveness) (NodeList, error)
 	nodeRoot(context.Context, string) (string, error)
 	nodeState(context.Context, string) (contract.NodeState, error)
 	requireStorage(context.Context, Computer, string) error
