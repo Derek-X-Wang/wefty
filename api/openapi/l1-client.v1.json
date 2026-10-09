@@ -1651,11 +1651,11 @@
       "get": {
         "operationId": "listNodes",
         "summary": "List operator-visible nodes",
-        "description": "Returns a page of registered nodes after applying liveness thresholds, ordered by stable node ID. Cursors bind the exact filters and freeze insertion membership for a walk, excluding later inserts even when their IDs sort earlier. Mutable state, claims intent, capability observations and operator facts are live per-page snapshots. An empty next_cursor ends the walk.",
+        "description": "Returns a page of registered nodes with effective liveness computed from one read-only snapshot and pinned clock, ordered by stable node ID. State filters apply effective liveness before paging. Reads never run cleanup or take the database write lock; background reconciliation records transitions and attempt expiry on its configured cadence (default one second). Cursors bind the exact filters and freeze insertion membership for a walk, excluding later inserts even when their IDs sort earlier. Mutable state, claims intent, capability observations and operator facts are live per-page snapshots. An empty next_cursor ends the walk.",
         "parameters": [
           { "name": "cursor", "in": "query", "description": "Opaque continuation cursor from the same filter query. Limit may change between pages.", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
-          { "name": "state", "in": "query", "description": "Exact observed node state after liveness reconciliation.", "schema": { "type": "string", "enum": ["alive", "stale", "draining", "dead"] } },
+          { "name": "state", "in": "query", "description": "Exact effective node liveness at the snapshot clock, applied before pagination. Recorded state can lag until background reconciliation.", "schema": { "type": "string", "enum": ["alive", "stale", "draining", "dead"] } },
           { "name": "claims_enabled", "in": "query", "description": "Exact durable claims intent; accepts only true or false.", "schema": { "type": "boolean" } },
           { "name": "capability", "in": "query", "description": "Exact advertised capability key whose JSON value is true. Missing and false entries do not match.", "schema": { "type": "string", "minLength": 1 } }
         ],
@@ -1701,7 +1701,7 @@
       "get": {
         "operationId": "getNode",
         "summary": "Read one operator-visible node",
-        "description": "Returns the same Node projection as the fleet listing after applying liveness and attempt expiry. Includes active_attempts, the durable last_condition and allowed_actions with current preconditions.",
+        "description": "Returns the same Node projection as the fleet listing from one read-only snapshot and pinned clock. state shows effective liveness immediately; reads never run cleanup or take the database write lock. active_attempts and last_condition remain recorded facts until background reconciliation (default one second). Conditions and their since timestamps are never fabricated. Actions requiring recorded state, such as Computer reconfiguration abort needing a recorded dead Node, remain unavailable until it is recorded.",
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {

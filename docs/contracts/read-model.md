@@ -38,12 +38,20 @@ only for capacity decisions. The memo is sequential; callers must not mutate fac
 
 The shared job projector provides status, operator facts and attempts. #747
 keeps legacy view acquisition and refusal ordering; #748 assembles job views in
-one Read snapshot and #749 migrates Computers. No HTTP route is migrated here.
+one Read snapshot and #749 migrates Computers.
+
+Node list and detail views (#750) use this door and project effective liveness
+from the pinned clock. Their state filters apply the same thresholds before
+paging. The node memo and `nodeState` retain recorded state for decisions; a
+display projection never alters cached facts, expires attempts, or synthesizes
+conditions. Background reconciliation records those changes on its own cadence.
+Node cancel and removal directive reads also use one snapshot, including nested
+Storage, Backup and Custody export facts.
 
 The typed raw-pool guard in `l1/read_boundary_test.go` permits the write door
 and inventories production SQL pool and connection expressions, including
 aliases. `l1/read_boundary_exceptions.json` names each exact legacy use, count,
-reason and owning slice: #748 jobs/services, #749 Computers, #750 nodes,
+reason and owning slice: #748 jobs/services, #749 Computers,
 #751 person-seen, #752 legacy writes. The two door constructors and
 infrastructure use the permanent category. The guard also rejects `query_only`
 pragma strings outside `OpenStore`. Shrink entries as uses migrate;

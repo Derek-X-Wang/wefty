@@ -2586,12 +2586,22 @@ func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, e
 
 // ListNodes returns the operator-visible fleet in stable node ID order.
 func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return nil, internalError(err, "begin node listing")
-	}
-	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, "SELECT node_id FROM nodes ORDER BY node_id")
+	var nodes []Node
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		nodes, err = reads.nodes(ctx)
+		if err == nil {
+			for i := range nodes {
+				nodes[i] = s.nodeLiveness().project(nodes[i], reads.now())
+			}
+		}
+		return err
+	})
+	return nodes, err
+}
+
+func (r *databaseReads) nodes(ctx context.Context) ([]Node, error) {
+	rows, err := r.q.QueryContext(ctx, "SELECT node_id FROM nodes ORDER BY node_id")
 	if err != nil {
 		return nil, internalError(err, "list node IDs")
 	}
@@ -2611,14 +2621,11 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 
 	nodes := make([]Node, 0, len(nodeIDs))
 	for _, nodeID := range nodeIDs {
-		node, err := getNode(ctx, tx, nodeID)
+		node, err := r.node(ctx, nodeID)
 		if err != nil {
 			return nil, internalError(err, "read listed node")
 		}
 		nodes = append(nodes, node)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, internalError(err, "commit node listing")
 	}
 	return nodes, nil
 }

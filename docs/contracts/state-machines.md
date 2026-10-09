@@ -1049,6 +1049,11 @@ that transition.
 
 ## Node
 
+The table describes recorded transitions. Node list and detail views compute
+effective liveness from their Read snapshot's pinned clock without recording a
+transition; see [Node operator facts and guarded actions](#node-operator-facts-and-guarded-actions)
+for the distinction and the background reconciliation cadence.
+
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
 | `alive` | Heartbeats are within the alive threshold. New claims additionally require durable `claims_enabled=true` intent. | `stale`, `draining`, `dead` |
@@ -1362,8 +1367,28 @@ ordering and authority rules.
 ## Node operator facts and guarded actions
 
 `GET /v1/nodes` and `GET /v1/nodes/{node_id}` return the same Node
-projection after reconciling node liveness and attempt expiry. `wefty nodes
-list` and `wefty nodes inspect NODE_ID` show these facts in table or JSON form:
+projection from one read-only Read snapshot and its pinned clock. Neither route
+runs cleanup, writes, or waits for the database write lock. `wefty nodes list`
+and `wefty nodes inspect NODE_ID` show these facts in table or JSON form.
+
+The view's `state` is **effective liveness**, distinct from the **recorded state**
+used for durable decisions. An `alive` Node becomes effectively `stale` at the
+stale heartbeat threshold. An `alive`, `stale`, or `draining` Node becomes
+effectively `dead` at the dead threshold, including equality. A draining Node
+stays draining before that threshold; a recorded dead Node stays dead until
+registration. State filters use this same effective liveness before pagination.
+Each page uses one snapshot and clock; subsequent pages observe their own moment.
+
+The background reconciler runs at startup and on its configured cadence
+(default one second). It records liveness transitions, expires attempts and
+records conditions independently of reads. A computed-dead view never performs
+or fabricates those durable consequences. Computer token proofs refuse a host
+on recorded dead state (independent of their other authority checks), and
+reconfiguration abort requires recorded dead state. Actions requiring recorded
+state stay unavailable until cleanup records it. Node operator intent actions
+remain independent of liveness.
+
+The remaining Node facts retain their recorded meaning:
 
 - `active_attempts`: nonterminal persisted attempts (`claimed`, `running`,
   `awaiting-input`), ordered by creation time and attempt ID. Each includes

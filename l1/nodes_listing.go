@@ -2,13 +2,13 @@ package l1
 
 import (
 	"context"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -29,7 +29,7 @@ func parseNodeListFilters(r *http.Request) (nodeListFilters, error) {
 	filters := nodeListFilters{State: query.Get("state"), Capability: query.Get("capability")}
 	if filters.State != "" {
 		if _, valid := contract.NodeTransitions[contract.NodeState(filters.State)]; !valid {
-			return nodeListFilters{}, protocolError(contract.ErrorInvalidRequest, "state must be a persisted node state")
+			return nodeListFilters{}, protocolError(contract.ErrorInvalidRequest, "state must be a node liveness state")
 		}
 	}
 	if value := query.Get("claims_enabled"); value != "" {
@@ -101,22 +101,23 @@ CREATE INDEX IF NOT EXISTS nodes_listing_state_claims ON nodes(state, claims_ena
 	return nil
 }
 
-func nodeListingQuery(filters nodeListFilters, cursor nodeListCursor, limit int) (string, []any) {
+func nodeListingQuery(filters nodeListFilters, cursor nodeListCursor, limit int, now time.Time, liveness nodeLiveness) (string, []any) {
 	predicates := []string{"(nodes.node_id, nodes.identity_node_id) > (?, ?)", "EXISTS (SELECT 1 FROM node_listing_order WHERE node_listing_order.node_id=nodes.node_id AND sequence<=?)"}
 	args := []any{cursor.NodeID, cursor.Identity, cursor.HighWater}
 	index := "nodes_listing_order"
 	if filters.State != "" {
-		predicates = append(predicates, "nodes.state=?")
-		args = append(args, filters.State)
-		index = "nodes_listing_state"
+		// Apply the same liveness thresholds as projection, before LIMIT. State
+		// indexes cannot order a mix of recorded states, so seek the stable key.
+		predicates = append(predicates, `(CASE
+ WHEN nodes.state IN ('alive', 'stale', 'draining') AND nodes.last_heartbeat_ns<=? THEN 'dead'
+ WHEN nodes.state='alive' AND nodes.last_heartbeat_ns<=? THEN 'stale'
+ ELSE nodes.state END)=?`)
+		args = append(args, now.Add(-liveness.deadAfter).UnixNano(), now.Add(-liveness.staleAfter).UnixNano(), filters.State)
 	}
 	if filters.ClaimsEnabled != nil {
 		predicates = append(predicates, "nodes.claims_enabled=?")
 		args = append(args, *filters.ClaimsEnabled)
 		index = "nodes_listing_claims"
-		if filters.State != "" {
-			index = "nodes_listing_state_claims"
-		}
 	}
 	if filters.Capability != "" {
 		// json_each compares literal keys (including dots/quotes), and only an
@@ -140,18 +141,23 @@ func (s *Store) listNodesPage(ctx context.Context, filters nodeListFilters, curs
 			return NodeList{}, err
 		}
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return NodeList{}, internalError(err, "begin node page snapshot")
-	}
-	defer tx.Rollback()
-	if cursorValue == "" {
-		if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence),0) FROM node_listing_order").Scan(&cursor.HighWater); err != nil {
+	var page NodeList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		page, err = reads.nodePage(ctx, filters, cursor, limit, s.nodeLiveness())
+		return err
+	})
+	return page, err
+}
+
+func (r *databaseReads) nodePage(ctx context.Context, filters nodeListFilters, cursor nodeListCursor, limit int, liveness nodeLiveness) (NodeList, error) {
+	if cursor.HighWater == 0 {
+		if err := r.q.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence),0) FROM node_listing_order").Scan(&cursor.HighWater); err != nil {
 			return NodeList{}, internalError(err, "read node insertion watermark")
 		}
 	}
-	query, args := nodeListingQuery(filters, cursor, limit)
-	rows, err := tx.QueryContext(ctx, query, args...)
+	query, args := nodeListingQuery(filters, cursor, limit, r.now(), liveness)
+	rows, err := r.q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return NodeList{}, internalError(err, "list node page IDs")
 	}
@@ -176,20 +182,17 @@ func (s *Store) listNodesPage(ctx context.Context, filters nodeListFilters, curs
 	}
 	page := NodeList{Nodes: []Node{}}
 	for _, item := range keys {
-		node, err := getNode(ctx, tx, item.id)
+		node, err := r.node(ctx, item.id)
 		if err != nil {
 			return NodeList{}, internalError(err, "read paged node")
 		}
-		page.Nodes = append(page.Nodes, node)
+		page.Nodes = append(page.Nodes, liveness.project(node, r.now()))
 	}
 	if more {
 		last := keys[len(keys)-1]
 		cursor.NodeID, cursor.Identity = last.id, last.identity
 		payload, _ := json.Marshal(cursor)
 		page.NextCursor = base64.RawURLEncoding.EncodeToString(payload)
-	}
-	if err := tx.Commit(); err != nil {
-		return NodeList{}, internalError(err, "commit node page snapshot")
 	}
 	return page, nil
 }

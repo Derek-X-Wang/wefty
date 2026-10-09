@@ -177,7 +177,17 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 // a canceled job is never proof that an unreachable program has stopped. Exact
 // attempt, fence and boot binding prevent stopping any successor execution.
 func (s *Store) ListNodeCancelDirectives(ctx context.Context, identityNodeID, nodeID, bootSessionID string) ([]OneShotCancelDirective, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT jobs.job_id, attempts.attempt_id, attempts.fencing_token
+	var directives []OneShotCancelDirective
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		directives, err = reads.nodeCancelDirectives(ctx, identityNodeID, nodeID, bootSessionID)
+		return err
+	})
+	return directives, err
+}
+
+func (r *databaseReads) nodeCancelDirectives(ctx context.Context, identityNodeID, nodeID, bootSessionID string) ([]OneShotCancelDirective, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT jobs.job_id, attempts.attempt_id, attempts.fencing_token
  FROM jobs JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
  JOIN nodes ON nodes.node_id=attempts.node_id
  WHERE jobs.outcome='canceled' AND attempts.node_id=? AND nodes.identity_node_id=?
