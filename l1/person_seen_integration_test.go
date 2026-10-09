@@ -2,7 +2,9 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -50,12 +52,99 @@ func TestKnownPersonViewAnswersWithWriteLockHeld(t *testing.T) {
 
 	lockedClient := h.client(identity)
 	lockedClient.Timeout = 3 * time.Second
+	before := time.Now()
 	status, _, body = h.do(lockedClient, http.MethodGet, "/v1/whoami", nil)
+	elapsed := time.Since(before)
 	if status != http.StatusOK {
 		t.Fatalf("whoami with the write lock held status=%d body=%s", status, body)
 	}
+	if elapsed < 0 || elapsed > 500*time.Millisecond {
+		t.Fatalf("known person view took %s with the write lock held, want under 500ms", elapsed)
+	}
 	if _, second := personSeenRow(t, h, observed.FabricID, observed.UserID); second != lastSeen {
 		t.Fatalf("known person view rewrote last_seen: %d then %d", lastSeen, second)
+	}
+}
+
+// Once the snapshot pool is fully busy, the observation must still be recorded
+// durably before the answer: the unavailability fallback is load-bearing.
+func TestPersonObservationFallsBackWhenSnapshotBusy(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	var held []*sql.Conn
+	for i := 0; i < readSnapshotLimit; i++ {
+		conn, err := h.store.readDB.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		held = append(held, conn)
+	}
+	client := h.client(fabric.Identity{UserID: "person-alice", DeviceID: "device-a"})
+	client.Timeout = 5 * time.Second
+	status, _, body := h.do(client, http.MethodGet, "/v1/whoami", nil)
+	if status != http.StatusOK {
+		t.Fatalf("first view with the snapshot pool busy status=%d body=%s", status, body)
+	}
+	var observed AuthenticatedPerson
+	if err := json.Unmarshal(body, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if _, lastSeen := personSeenRow(t, h, observed.FabricID, observed.UserID); lastSeen == 0 {
+		t.Fatal("fallback write did not record the person")
+	}
+	if h.store.personObservationFallbackCount() == 0 {
+		t.Fatal("snapshot-unavailable view did not count a fallback write")
+	}
+}
+
+// A nested snapshot is a programming error, not unavailability: the fallback
+// must not turn that refusal into a write.
+func TestPersonObservationNestedSnapshotFailsClosed(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	identity := fabric.Identity{FabricID: h.store.deploymentID, UserID: "person-nest", DeviceID: "device-nest"}
+	var inner error
+	err := h.store.withReadSnapshot(context.Background(), nil, func(ctx context.Context, reads readModel) error {
+		_, inner = h.store.ObserveAuthenticatedPerson(ctx, identity)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("outer snapshot: %v", err)
+	}
+	if !errors.Is(inner, errNestedReadSnapshot) {
+		t.Fatalf("nested observation error = %v, want %v", inner, errNestedReadSnapshot)
+	}
+	if h.store.personObservationFallbackCount() != 0 {
+		t.Fatal("nested snapshot error counted a fallback write")
+	}
+	var count int
+	if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM authenticated_people
+		WHERE fabric_id=? AND user_id=?`, identity.FabricID, identity.UserID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("nested observation error wrote the person: rows=%d err=%v", count, err)
+	}
+}
+
+// A last_seen from the future is already stale: a negative age must refresh.
+func TestPersonObservationFutureDatedRecordIsStale(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	client := h.client(fabric.Identity{UserID: "person-alice", DeviceID: "device-a"})
+	status, _, body := h.do(client, http.MethodGet, "/v1/whoami", nil)
+	if status != http.StatusOK {
+		t.Fatalf("first whoami status=%d body=%s", status, body)
+	}
+	var observed AuthenticatedPerson
+	if err := json.Unmarshal(body, &observed); err != nil {
+		t.Fatal(err)
+	}
+	futureNS := observed.SeenAt.Add(time.Hour).UnixNano()
+	if _, err := h.store.db.Exec(`UPDATE authenticated_people SET last_seen_ns=?`, futureNS); err != nil {
+		t.Fatal(err)
+	}
+	status, _, body = h.do(client, http.MethodGet, "/v1/whoami", nil)
+	if status != http.StatusOK {
+		t.Fatalf("future-dated whoami status=%d", status)
+	}
+	if _, lastSeen := personSeenRow(t, h, observed.FabricID, observed.UserID); lastSeen == futureNS {
+		t.Fatalf("future-dated record was not refreshed: last_seen=%d", lastSeen)
 	}
 }
 
