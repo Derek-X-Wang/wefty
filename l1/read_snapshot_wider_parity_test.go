@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -52,16 +53,47 @@ func TestReadModelWiderPublicFixtures(t *testing.T) {
 		client := h.client(fabric.Identity{NodeID: "submitter", Tags: []string{DefaultClientPrincipalTag}})
 		agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
 		node := h.register(agent, "node-1")
-		first := h.submit(client, "baseline-first", []string{"linux"})
-		a := claimClass(t, h, agent, node, contract.JobClassOneShot)
+		submit := func(key string) Job {
+			spec := capabilityJobSpec(key, "process", contract.JobClassService, "", nil)
+			spec.RoutingTags = []string{"linux"}
+			status, _, raw := h.do(client, http.MethodPost, "/v1/jobs", spec)
+			if status != http.StatusCreated {
+				t.Fatalf("%d %s", status, raw)
+			}
+			return decodeJob(t, raw)
+		}
+		first := submit("baseline-first")
 		h.clock.Advance(time.Millisecond)
-		second := h.submit(client, "baseline-second", []string{"linux"})
-		b := claimClass(t, h, agent, node, contract.JobClassOneShot)
+		second := submit("baseline-second")
+		if _, err := h.store.db.ExecContext(t.Context(), "UPDATE service_jobs SET bound_node_id=?", node.NodeID); err != nil {
+			t.Fatal(err)
+		}
 		status, _, raw := h.do(client, http.MethodGet, "/v1/jobs?limit=2", nil)
 		if status != http.StatusOK {
 			t.Fatalf("%d %s", status, raw)
 		}
-		assertWiderProjectionFixture(t, "same-node-page", raw, first.JobID, "JOB1", second.JobID, "JOB2", a.Lease.AttemptID, "ATTEMPT1", b.Lease.AttemptID, "ATTEMPT2")
+		assertWiderProjectionFixture(t, "same-node-page", raw, first.JobID, "JOB1", second.JobID, "JOB2")
+		if err := h.store.withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
+			impl := reads.(*databaseReads)
+			counter := &projectionNodeCounter{queryer: impl.q}
+			impl.q = counter
+			for _, id := range []string{first.JobID, second.JobID} {
+				job, err := reads.job(ctx, id)
+				if err != nil {
+					return err
+				}
+				if _, err := projectJobWithReads(ctx, reads, job, projectJobStatusPart); err != nil {
+					return err
+				}
+			}
+			if counter.nodes != 1 {
+				t.Fatalf("same-node page used %d node queries; want one narrow cached scan", counter.nodes)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+
 	})
 	t.Run("children", func(t *testing.T) {
 		h, client, agent, node := credentialHarness(t)

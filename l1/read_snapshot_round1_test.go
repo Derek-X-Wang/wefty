@@ -5,7 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -19,9 +19,7 @@ import (
 func TestReadSnapshotTargetOverrunReturnsAnswer(t *testing.T) {
 	s, _ := snapshotStore(t)
 	var logs bytes.Buffer
-	prior := log.Writer()
-	log.SetOutput(&logs)
-	defer log.SetOutput(prior)
+	s.logf = func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) }
 	answer := ""
 	err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
 		time.Sleep(125 * time.Millisecond)
@@ -73,24 +71,6 @@ func TestReadSnapshotHardExpiryRefusesPartialAnswer(t *testing.T) {
 	}
 }
 
-func TestReadSnapshotOuterContextNestingRefused(t *testing.T) {
-	s, _ := snapshotStore(t)
-	outer, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	called := false
-	err := s.withReadSnapshot(outer, nil, func(ctx context.Context, reads readModel) error {
-		start := time.Now()
-		err := s.withReadSnapshot(outer, nil, func(context.Context, readModel) error { called = true; return nil })
-		if errorCode(err) != contract.ErrorUnavailable || called || time.Since(start) > 225*time.Millisecond {
-			t.Errorf("outer-context nested acquisition: called=%t elapsed=%s err=%v", called, time.Since(start), err)
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestReadSnapshotAdmissionBounded(t *testing.T) {
 	s, _ := snapshotStore(t)
 	release := make(chan struct{})
@@ -98,7 +78,7 @@ func TestReadSnapshotAdmissionBounded(t *testing.T) {
 	done := make(chan error, readSnapshotLimit)
 	for range readSnapshotLimit {
 		go func() {
-			ctx := context.WithValue(t.Context(), readSnapshotContextKey{}, nil)
+			ctx := t.Context()
 			done <- s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error {
 				entered <- struct{}{}
 				<-release

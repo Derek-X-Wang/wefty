@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/format"
 	"go/importer"
 	"go/parser"
@@ -129,9 +130,72 @@ func rawPoolSites(fset *token.FileSet, files []*ast.File, info *types.Info) map[
 	return sites
 }
 
+// Constants and aliases are checked by value, so hiding a pragma behind a
+// named string does not bypass the connection-creation rule.
+func queryOnlySites(fset *token.FileSet, files []*ast.File, info *types.Info) []string {
+	var sites []string
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			owner := "package"
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				owner = fn.Name.Name
+			}
+			if filepath.Base(fset.Position(file.Pos()).Filename) == "store.go" && owner == "OpenStore" {
+				continue
+			}
+			ast.Inspect(decl, func(node ast.Node) bool {
+				expr, ok := node.(ast.Expr)
+				if !ok {
+					return true
+				}
+				value := info.Types[expr].Value
+				if value != nil && value.Kind() == constant.String && strings.Contains(strings.ToLower(constant.StringVal(value)), "query_only") {
+					sites = append(sites, fmt.Sprintf("%s:%s", fset.Position(expr.Pos()), owner))
+				}
+				return true
+			})
+		}
+	}
+	return sites
+}
+
+func TestReadSnapshotQueryOnlyPragmaGuard(t *testing.T) {
+	fset, files, info := readBoundaryTypes(t)
+	if sites := queryOnlySites(fset, files, info); len(sites) != 0 {
+		t.Fatalf("query_only outside OpenStore: %v", sites)
+	}
+}
+
+func TestReadSnapshotGuardDetectsQueryOnlyPragma(t *testing.T) {
+	source := `package fixture
+ const reset = "PRAGMA QUERY_ONLY=OFF"
+ func leak() string {return reset}
+ func OpenStore() string {return "query_only(1)"}
+ `
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "store.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	config := types.Config{}
+	if _, err := config.Check("fixture", fset, []*ast.File{file}, info); err != nil {
+		t.Fatal(err)
+	}
+	sites := queryOnlySites(fset, []*ast.File{file}, info)
+	if len(sites) < 2 {
+		t.Fatalf("guard missed pragma declaration/use: %v", sites)
+	}
+	for _, site := range sites {
+		if strings.HasSuffix(site, ":OpenStore") {
+			t.Fatalf("guard refused allowed constructor: %v", sites)
+		}
+	}
+}
+
 func validReadSlice(slice string) bool {
 	switch slice {
-	case "#748", "#749", "#750", "#751", "#752":
+	case "#748", "#749", "#750", "#751", "#752", "permanent":
 		return true
 	}
 	return false

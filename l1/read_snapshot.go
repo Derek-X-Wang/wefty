@@ -4,10 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	"reflect"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -45,14 +44,18 @@ type readModel interface {
 // view adapters deliberately keep their existing acquisition and timing until
 // #748-#751. A write gets a fresh memo at each decision, never across writes.
 type databaseReads struct {
-	q           queryer
-	at          time.Time
-	actor       *serviceActionActor
-	reads       *serviceOperatorReads
-	nodeIDs     []string
-	nodeTags    map[string][]string
-	nodesLoaded bool
-	nodesErr    error
+	q               queryer
+	at              time.Time
+	actor           *serviceActionActor
+	reads           *serviceOperatorReads
+	nodeIDs         []string
+	placements      map[string]placementRead
+	requirements    map[string]placementRequirements
+	occupancy       map[string]int
+	occupancyLoaded bool
+	occupancyErr    error
+	nodesLoaded     bool
+	nodesErr        error
 }
 type nodeRead struct {
 	value Node
@@ -68,7 +71,7 @@ type stateRead struct {
 }
 
 func newDatabaseReads(q queryer, at time.Time, actor *serviceActionActor) *databaseReads {
-	return &databaseReads{q: q, at: at, actor: actor, reads: newServiceOperatorReads(q)}
+	return &databaseReads{q: q, at: at, actor: actor, reads: newServiceOperatorReads(q), placements: make(map[string]placementRead), requirements: make(map[string]placementRequirements), occupancy: make(map[string]int)}
 }
 func transactionReads(q queryer, now time.Time) readModel {
 	if now.IsZero() {
@@ -101,36 +104,130 @@ func (r *databaseReads) node(ctx context.Context, id string) (Node, error) {
 	return value.value, value.err
 }
 
-// The page loads candidate identities/tags once. Only eligible candidates
-// need full node facts, and those use the same memo as bound-node projection.
+// Placement facts deliberately exclude occupancy and active attempts. A legacy
+// per-job projection costs one node query; a snapshot shares the same facts
+// across bound jobs and candidate scans.
+type placementFacts struct {
+	id              string
+	state           contract.NodeState
+	claimsEnabled   bool
+	capabilities    map[string]bool
+	tags            []string
+	maxServiceSlots int
+}
+type placementRead struct {
+	value placementFacts
+	err   error
+}
+type placementRequirements struct {
+	capabilities, tags []string
+	err                error
+}
+
+func (r *databaseReads) placementRequirements(ctx context.Context, jobID string) (placementRequirements, error) {
+	if value, ok := r.requirements[jobID]; ok {
+		return value, value.err
+	}
+	value := placementRequirements{}
+	rows, err := r.q.QueryContext(ctx, `SELECT 'capability', capability FROM job_required_capabilities WHERE job_id=?
+ UNION ALL SELECT 'tag', tag FROM job_tags WHERE job_id=? ORDER BY 1, 2`, jobID, jobID)
+	if err == nil {
+		for rows.Next() {
+			var kind, item string
+			if err = rows.Scan(&kind, &item); err != nil {
+				break
+			}
+			if kind == "tag" {
+				value.tags = append(value.tags, item)
+			} else {
+				value.capabilities = append(value.capabilities, item)
+			}
+		}
+		if err == nil {
+			err = rows.Err()
+		}
+		err = errors.Join(err, rows.Close())
+	}
+	value.err = err
+	r.requirements[jobID] = value
+	return value, err
+}
+
+func (r *databaseReads) loadPlacements(ctx context.Context, id string) error {
+	query := `SELECT nodes.node_id, nodes.state, nodes.claims_enabled, nodes.capabilities_json,
+ nodes.max_service_slots, node_tags.tag FROM nodes LEFT JOIN node_tags ON node_tags.node_id=nodes.node_id`
+	var args []any
+	if id != "" {
+		query += " WHERE nodes.node_id=?"
+		args = append(args, id)
+	}
+	query += " ORDER BY nodes.node_id, node_tags.tag"
+	rows, err := r.q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	loaded := make(map[string]placementRead)
+	var ids []string
+	for rows.Next() {
+		var value placementFacts
+		var caps []byte
+		var tag sql.NullString
+		if err = rows.Scan(&value.id, &value.state, &value.claimsEnabled, &caps, &value.maxServiceSlots, &tag); err != nil {
+			break
+		}
+		prior, ok := loaded[value.id]
+		if !ok {
+			prior.value = value
+			prior.err = json.Unmarshal(caps, &prior.value.capabilities)
+			ids = append(ids, value.id)
+		}
+		if tag.Valid {
+			prior.value.tags = append(prior.value.tags, tag.String)
+		}
+		loaded[value.id] = prior
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	err = errors.Join(err, rows.Close())
+	if err != nil {
+		return err
+	}
+	for key, value := range loaded {
+		if _, ok := r.placements[key]; !ok {
+			r.placements[key] = value
+		}
+		if _, ok := r.reads.nodeStates[key]; !ok {
+			r.reads.nodeStates[key] = stateRead{value: value.value.state}
+		}
+	}
+	if id == "" {
+		r.nodeIDs = ids
+	}
+	return nil
+}
+func (r *databaseReads) placement(ctx context.Context, id string) (placementFacts, error) {
+	value, ok := r.placements[id]
+	if !ok {
+		if !r.nodesLoaded {
+			value.err = r.loadPlacements(ctx, id)
+		} else {
+			value.err = r.nodesErr
+		}
+		if value.err == nil {
+			value, ok = r.placements[id]
+			if !ok {
+				value.err = sql.ErrNoRows
+			}
+		}
+		r.placements[id] = value
+	}
+	return value.value, value.err
+}
 func (r *databaseReads) eligibleNodeIDs(ctx context.Context, tags []string) ([]string, error) {
 	if !r.nodesLoaded {
 		r.nodesLoaded = true
-		r.nodeTags = make(map[string][]string)
-		rows, err := r.q.QueryContext(ctx, `SELECT nodes.node_id, node_tags.tag
-   FROM nodes LEFT JOIN node_tags ON node_tags.node_id=nodes.node_id`)
-		if err != nil {
-			r.nodesErr = err
-		} else {
-			for rows.Next() {
-				var id string
-				var tag sql.NullString
-				if err = rows.Scan(&id, &tag); err != nil {
-					break
-				}
-				if _, seen := r.nodeTags[id]; !seen {
-					r.nodeIDs = append(r.nodeIDs, id)
-					r.nodeTags[id] = nil
-				}
-				if tag.Valid {
-					r.nodeTags[id] = append(r.nodeTags[id], tag.String)
-				}
-			}
-			if err == nil {
-				err = rows.Err()
-			}
-			r.nodesErr = errors.Join(err, rows.Close())
-		}
+		r.nodesErr = r.loadPlacements(ctx, "")
 	}
 	if r.nodesErr != nil {
 		return nil, r.nodesErr
@@ -140,7 +237,7 @@ func (r *databaseReads) eligibleNodeIDs(ctx context.Context, tags []string) ([]s
 		matches := true
 		for _, tag := range tags {
 			found := false
-			for _, present := range r.nodeTags[id] {
+			for _, present := range r.placements[id].value.tags {
 				if present == tag {
 					found = true
 					break
@@ -156,6 +253,36 @@ func (r *databaseReads) eligibleNodeIDs(ctx context.Context, tags []string) ([]s
 		}
 	}
 	return eligible, nil
+}
+
+// Capacity decisions load service occupancy once for the page, independent of
+// how many candidates are full. Placement alone never executes this scan.
+func (r *databaseReads) serviceOccupancy(ctx context.Context, id string) (int, error) {
+	if !r.occupancyLoaded {
+		r.occupancyLoaded = true
+		rows, err := r.q.QueryContext(ctx, `SELECT nodes.node_id, (SELECT COUNT(*) FROM service_jobs occupied_service
+ JOIN jobs occupied_job ON occupied_job.job_id=occupied_service.job_id
+ WHERE occupied_service.bound_node_id=nodes.node_id
+ AND ((occupied_job.state=? AND occupied_service.desired_state=?) OR occupied_job.state IN (?, ?, ?, ?, ?)))
+ FROM nodes`, contract.JobQueued, contract.ServiceDesiredRunning,
+			contract.JobClaimed, contract.JobRunning, contract.JobStopping, contract.JobRemovalPending, contract.JobAgentCleaned)
+		if err == nil {
+			for rows.Next() {
+				var nodeID string
+				var count int
+				if err = rows.Scan(&nodeID, &count); err != nil {
+					break
+				}
+				r.occupancy[nodeID] = count
+			}
+			if err == nil {
+				err = rows.Err()
+			}
+			err = errors.Join(err, rows.Close())
+		}
+		r.occupancyErr = err
+	}
+	return r.occupancy[id], r.occupancyErr
 }
 func (r *databaseReads) nodeRoot(ctx context.Context, id string) (string, error) {
 	value, ok := r.reads.nodeRoots[id]
@@ -197,7 +324,7 @@ const readSnapshotHardLimit = 200 * time.Millisecond
 
 type readSnapshotContextKey struct{}
 
-var errNestedReadSnapshot = snapshotUnavailable("read_snapshot_nested", nil)
+var errNestedReadSnapshot = &Error{Code: contract.ErrorInternal, Message: "nested read snapshot acquisition", notRetryable: true}
 
 func snapshotUnavailable(reason string, cause error) error {
 	return &Error{Code: contract.ErrorUnavailable, Message: "read snapshot unavailable", Cause: cause,
@@ -206,22 +333,13 @@ func snapshotUnavailable(reason string, cause error) error {
 
 func (s *Store) readSnapshotOverrunCount() uint64 { return s.readSnapshotOverruns.Load() }
 
-// withReadSnapshot anchors SQLite before sampling the clock. A request context
-// owns at most one snapshot, even if a callback captures it instead of using
-// the derived context. Concurrent work in one request must share its read set.
+// withReadSnapshot anchors SQLite before sampling the clock. The derived
+// context marks nested acquisition as a programming error. Independent reads
+// may share a parent context; pool admission remains bounded at 200 ms.
 func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor, use func(context.Context, readModel) error) (err error) {
 	if ctx.Value(readSnapshotContextKey{}) != nil {
 		return errNestedReadSnapshot
 	}
-	// Context implementations must have identity to participate in the request
-	// guard. Standard contexts are comparable; refuse unsupported custom ones.
-	if !reflect.TypeOf(ctx).Comparable() {
-		return snapshotUnavailable("read_snapshot_context", nil)
-	}
-	if _, loaded := s.readSnapshotContexts.LoadOrStore(ctx, struct{}{}); loaded {
-		return errNestedReadSnapshot
-	}
-	defer s.readSnapshotContexts.Delete(ctx)
 	admission, cancelAdmission := context.WithTimeout(ctx, readSnapshotHardLimit)
 	conn, err := s.readDB.Conn(admission)
 	cancelAdmission()
@@ -253,8 +371,7 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 		}
 		elapsed := time.Since(anchored)
 		if elapsed > readSnapshotBudget {
-			count := s.readSnapshotOverruns.Add(1)
-			log.Printf("l1 read_snapshot_target_overrun elapsed_ms=%d target_ms=%d count=%d", elapsed.Milliseconds(), readSnapshotBudget.Milliseconds(), count)
+			s.recordReadSnapshotOverrun(elapsed)
 		}
 	}()
 	var anchor int
@@ -266,6 +383,19 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 		return err
 	}
 	return ctx.Err()
+}
+
+// Count every overrun, but emit at most one diagnostic per second per Store.
+func (s *Store) recordReadSnapshotOverrun(elapsed time.Duration) {
+	s.readSnapshotOverruns.Add(1)
+	now := time.Now().UnixNano()
+	prior := s.readSnapshotLastLog.Load()
+	if now-prior < int64(time.Second) || !s.readSnapshotLastLog.CompareAndSwap(prior, now) {
+		return
+	}
+	if s.logf != nil {
+		s.logf("event=l1_read_snapshot_target_overrun elapsed_ms=%d target_ms=%d count=%d", elapsed.Milliseconds(), readSnapshotBudget.Milliseconds(), s.readSnapshotOverruns.Load())
+	}
 }
 
 var _ readModel = (*databaseReads)(nil)

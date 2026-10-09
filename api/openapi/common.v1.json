@@ -2015,7 +2015,7 @@
         }
       },
       "Unavailable": {
-        "description": "Read snapshot acquisition or transaction expiry is unavailable, retryable=true, with details.reason=read_snapshot_admission_expired or read_snapshot_expired. The 100 ms snapshot target is measured, not a deadline; the separate 200 ms transaction limit protects secret scrubbing. Nested snapshot acquisition is unavailable with details.reason=read_snapshot_nested. No HTTP route uses the new snapshot door yet. L1 could not verify Fabric identity because lookup failed operationally: unavailable, retryable=true, details.reason=identity_unverifiable. Applies to every L1 authenticated protocol, including person, cancel, and attempt credentials. The cause is logged safely server-side and never included in the response. Safe log categories include issuing_fabric_unavailable for missing issuing Fabric configuration and identity_incomplete for missing stable peer identity fields; these are diagnostics only and do not change this response.",
+        "description": "L1 could not verify Fabric identity because lookup failed operationally: unavailable, retryable=true, details.reason=identity_unverifiable. Applies to every L1 authenticated protocol, including person, cancel, and attempt credentials. The cause is logged safely server-side and never included in the response. Safe log categories include issuing_fabric_unavailable for missing issuing Fabric configuration and identity_incomplete for missing stable peer identity fields; these are diagnostics only and do not change this response.",
         "headers": {
           "X-Request-Id": { "$ref": "#/components/headers/RequestId" }
         },

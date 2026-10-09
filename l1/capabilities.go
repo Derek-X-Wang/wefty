@@ -228,26 +228,26 @@ func (s *Store) projectQueuedJobCapabilitiesWithQueryer(ctx context.Context, q q
 }
 
 func (r *databaseReads) queuedStatus(ctx context.Context, job Job) (Job, error) {
-	q := r.q
 	if job.State != contract.JobQueued {
 		return job, nil
 	}
-	required, err := storedRequiredCapabilities(ctx, q, job.JobID)
+	requirements, err := r.placementRequirements(ctx, job.JobID)
 	if err != nil {
 		return Job{}, internalError(err, "read required job capabilities")
 	}
-	nodes, err := r.eligibleNodeIDs(ctx, job.Spec.RoutingTags)
+	required := requirements.capabilities
+	nodes, err := r.eligibleNodeIDs(ctx, requirements.tags)
 	if err != nil {
 		return Job{}, internalError(err, "read capability placement candidates")
 	}
 	missingSet := make(map[string]struct{}, len(required))
 	candidates := len(nodes)
 	for _, id := range nodes {
-		node, err := r.node(ctx, id)
+		node, err := r.placement(ctx, id)
 		if err != nil {
 			return Job{}, internalError(err, "read capability placement candidate")
 		}
-		missing := MissingCapabilities(required, node.Capabilities)
+		missing := MissingCapabilities(required, node.capabilities)
 		if len(missing) == 0 {
 			return job, nil
 		}

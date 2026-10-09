@@ -357,13 +357,13 @@
     "site": "instance_keys.go:*Store.initializeInstanceKeys | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "jobs_listing.go:*Store.initializeJobListing | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "jobs_listing.go:*Store.listReadableJobsForCaller | s.db",
@@ -399,7 +399,7 @@
     "site": "log_retention.go:*Store.migrateServiceLogTruncations | s.db",
     "count": 2,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "node_operator.go:*Store.GetNode | s.db",
@@ -411,7 +411,7 @@
     "site": "nodes_listing.go:*Store.initializeNodeListing | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "nodes_listing.go:*Store.listNodesPage | s.db",
@@ -483,19 +483,19 @@
     "site": "read_snapshot.go:*Store.beginWriteTransaction | s.db",
     "count": 1,
     "reason": "write transaction constructor: existing immediate transaction and authoritative clock",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "read_snapshot.go:*Store.withReadSnapshot | conn",
     "count": 3,
-    "reason": "snapshot constructor: admission, pool checkout, read-only enforcement and connection reset",
-    "slice": "#752"
+    "reason": "snapshot constructor: admission, pool checkout, read-only enforcement and rollback failure discard",
+    "slice": "permanent"
   },
   {
     "site": "read_snapshot.go:*Store.withReadSnapshot | s.readDB",
     "count": 1,
-    "reason": "snapshot constructor: admission, pool checkout, read-only enforcement and connection reset",
-    "slice": "#752"
+    "reason": "snapshot constructor: admission, pool checkout, read-only enforcement and rollback failure discard",
+    "slice": "permanent"
   },
   {
     "site": "reconfiguration_abort.go:*Store.AbortComputerReconfiguration | s.db",
@@ -567,25 +567,25 @@
     "site": "secret_scrub.go:*Store.SweepScrubbedSecrets | s.db",
     "count": 1,
     "reason": "infrastructure: secret scrubbing and WAL checkpoint; ADR-0002",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "secret_scrub.go:*Store.backfillTerminalOneShotSecrets | s.db",
     "count": 1,
     "reason": "infrastructure: secret scrubbing and WAL checkpoint; ADR-0002",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "secret_scrub.go:*Store.checkpointSecretWALOnce | s.checkpointDB",
     "count": 1,
     "reason": "infrastructure: secret scrubbing and WAL checkpoint; ADR-0002",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "secret_scrub.go:*Store.initializeSecretScrub | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "server.go:*Server.recordOwedRevocationSettlement | s.store.settlementDB",
@@ -771,25 +771,25 @@
     "site": "store.go:*Store.Close | s.checkpointDB",
     "count": 2,
     "reason": "infrastructure: close SQLite pools",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.Close | s.db",
     "count": 1,
     "reason": "infrastructure: close SQLite pools",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.Close | s.readDB",
     "count": 2,
     "reason": "infrastructure: dedicated read pool lifecycle",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.Close | s.settlementDB",
     "count": 2,
     "reason": "infrastructure: close SQLite pools",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.CompleteAttemptOutcome | s.db",
@@ -897,97 +897,97 @@
     "site": "store.go:*Store.initialize | s.db",
     "count": 11,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateBackupDigestConstraint | connection",
     "count": 7,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateBackupDigestConstraint | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateComputerAbortConstraints | connection",
     "count": 6,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateComputerAbortConstraints | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateComputerResetConstraints | connection",
     "count": 8,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateComputerResetConstraints | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateComputerStorageCopyConstraints | connection",
     "count": 6,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateComputerStorageCopyConstraints | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateCustodyExportConstraints | connection",
     "count": 7,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateCustodyExportConstraints | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateOwedRevocationSettlementConstraint | s.db",
     "count": 2,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateServiceRemovalStallConstraints | connection",
     "count": 8,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateServiceRemovalStallConstraints | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateStorageProvenanceConstraints | connection",
     "count": 6,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.migrateStorageProvenanceConstraints | s.db",
     "count": 1,
     "reason": "infrastructure: initialization and schema migration",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:*Store.readConcurrentSubmit | s.db",
@@ -999,42 +999,42 @@
     "site": "store.go:OpenStore | checkpointDB",
     "count": 4,
     "reason": "infrastructure: open and configure the four SQLite pools",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:OpenStore | db",
     "count": 7,
     "reason": "infrastructure: open and configure the four SQLite pools",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:OpenStore | readDB",
     "count": 5,
     "reason": "infrastructure: dedicated read pool lifecycle",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:OpenStore | settlementDB",
     "count": 6,
     "reason": "infrastructure: open and configure the four SQLite pools",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:OpenStore | store.checkpointDB",
     "count": 1,
     "reason": "infrastructure: open and configure the four SQLite pools",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:OpenStore | store.readDB",
     "count": 1,
     "reason": "infrastructure: dedicated read pool lifecycle",
-    "slice": "#752"
+    "slice": "permanent"
   },
   {
     "site": "store.go:OpenStore | store.settlementDB",
     "count": 1,
     "reason": "infrastructure: open and configure the four SQLite pools",
-    "slice": "#752"
+    "slice": "permanent"
   }
 ]

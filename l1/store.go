@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"math"
 	"net/url"
 	"os"
@@ -72,7 +73,8 @@ type StoreOptions struct {
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
 	readDB                            *sql.DB
-	readSnapshotContexts              sync.Map
+	readSnapshotLastLog               atomic.Int64
+	logf                              func(string, ...any)
 	readSnapshotOverruns              atomic.Uint64
 	db                                *sql.DB
 	settlementDB                      *sql.DB
@@ -203,7 +205,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	db.SetMaxOpenConns(16)
 	store := &Store{
-		db: db, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
+		db: db, logf: log.Printf, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
 		logRetention:                      logRetention,
@@ -263,6 +265,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, err
 	}
 	query := readURL.Query()
+	query.Set("mode", "ro")
 	query.Add("_pragma", "query_only(1)")
 	readURL.RawQuery = query.Encode()
 	readDB, err := sql.Open("sqlite", readURL.String())

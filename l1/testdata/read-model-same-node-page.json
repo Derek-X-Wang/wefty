@@ -1,13 +1,52 @@
 {
   "jobs": [
     {
+      "allowed_actions": [
+        {
+          "requires": {
+            "desired_state": "running"
+          },
+          "verb": "start"
+        },
+        {
+          "requires": {
+            "desired_state": "stopped"
+          },
+          "verb": "stop"
+        },
+        {
+          "inputs": [
+            {
+              "name": "idempotency_key",
+              "required": true,
+              "type": "string"
+            }
+          ],
+          "verb": "restart"
+        },
+        {
+          "verb": "remove"
+        },
+        {
+          "requires": {
+            "force": true
+          },
+          "verb": "forget"
+        }
+      ],
+      "bound_node_id": "node-1",
       "created_at": "2026-08-09T10:00:00Z",
-      "current_attempt_id": "ATTEMPT1",
+      "desired_state": "running",
+      "holds_slot": true,
       "job_id": "JOB1",
-      "node_id": "node-1",
+      "last_condition": null,
+      "lease_loss_count": 0,
+      "lifetime_restart_count": 0,
+      "node_state": "alive",
       "originating_submitter": "submitter",
+      "restart_streak": 0,
       "spec": {
-        "class": "one-shot",
+        "class": "service",
         "dispatch_key": "baseline-first",
         "execution": {
           "argv": [
@@ -17,27 +56,66 @@
           "executable": {
             "path": "/bin/echo"
           },
-          "handoff_directory": "/tmp/handoff",
           "working_directory": "/tmp"
         },
         "kind": "process",
+        "restart": "always",
         "routing_tags": [
           "linux"
         ],
         "schema_version": 1
       },
-      "state": "claimed",
-      "status": "claimed",
+      "state": "queued",
+      "status": "queued",
       "updated_at": "2026-08-09T10:00:00Z"
     },
     {
+      "allowed_actions": [
+        {
+          "requires": {
+            "desired_state": "running"
+          },
+          "verb": "start"
+        },
+        {
+          "requires": {
+            "desired_state": "stopped"
+          },
+          "verb": "stop"
+        },
+        {
+          "inputs": [
+            {
+              "name": "idempotency_key",
+              "required": true,
+              "type": "string"
+            }
+          ],
+          "verb": "restart"
+        },
+        {
+          "verb": "remove"
+        },
+        {
+          "requires": {
+            "force": true
+          },
+          "verb": "forget"
+        }
+      ],
+      "bound_node_id": "node-1",
       "created_at": "2026-08-09T10:00:00.001Z",
-      "current_attempt_id": "ATTEMPT2",
+      "desired_state": "running",
+      "holds_slot": true,
       "job_id": "JOB2",
-      "node_id": "node-1",
+      "last_condition": null,
+      "lease_loss_count": 0,
+      "lifetime_restart_count": 0,
+      "node_state": "alive",
       "originating_submitter": "submitter",
+      "restart_streak": 0,
       "spec": {
-        "class": "one-shot",
+        "class": "service",
         "dispatch_key": "baseline-second",
         "execution": {
           "argv": [
@@ -47,17 +125,17 @@
           "executable": {
             "path": "/bin/echo"
           },
-          "handoff_directory": "/tmp/handoff",
           "working_directory": "/tmp"
         },
         "kind": "process",
+        "restart": "always",
         "routing_tags": [
           "linux"
         ],
         "schema_version": 1
       },
-      "state": "claimed",
-      "status": "claimed",
+      "state": "queued",
+      "status": "queued",
       "updated_at": "2026-08-09T10:00:00.001Z"
     }
   ]

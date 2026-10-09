@@ -215,7 +215,7 @@ func TestReadSnapshotCapUnderContention(t *testing.T) {
 		holders.Add(1)
 		go func() {
 			defer holders.Done()
-			results <- s.withReadSnapshot(context.WithValue(t.Context(), readSnapshotContextKey{}, nil), nil, func(ctx context.Context, r readModel) error {
+			results <- s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
 				count := active.Add(1)
 				defer active.Add(-1)
 				for old := peak.Load(); count > old; old = peak.Load() {
