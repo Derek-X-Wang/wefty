@@ -258,18 +258,8 @@ func (s *Store) forceForgetService(ctx context.Context, jobID string, actor *ser
 // ListNodeRemovalDirectives returns the standing cleanup work carried on the
 // current authenticated boot's heartbeat response.
 func (s *Store) ListNodeRemovalDirectives(ctx context.Context, identityNodeID, nodeID, bootSessionID string) ([]RemovalDirective, error) {
-	var directives []RemovalDirective
-	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
-		var err error
-		directives, err = reads.nodeRemovalDirectives(ctx, identityNodeID, nodeID, bootSessionID)
-		return err
-	})
-	return directives, err
-}
-
-func (r *databaseReads) nodeRemovalDirectives(ctx context.Context, identityNodeID, nodeID, bootSessionID string) ([]RemovalDirective, error) {
 	var storedIdentity, storedBoot string
-	err := r.q.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id FROM nodes WHERE node_id=?`, nodeID).
+	err := s.db.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id FROM nodes WHERE node_id=?`, nodeID).
 		Scan(&storedIdentity, &storedBoot)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)
@@ -283,7 +273,7 @@ func (r *databaseReads) nodeRemovalDirectives(ctx context.Context, identityNodeI
 	if storedBoot != bootSessionID {
 		return nil, protocolError(contract.ErrorNodeSessionReplaced, "node %q boot session has been replaced", nodeID)
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT service_removals.job_id, service_removals.bound_node_id,
+	rows, err := s.db.QueryContext(ctx, `SELECT service_removals.job_id, service_removals.bound_node_id,
 		service_removals.removal_generation, service_removals.cleanup_fence, service_removals.root_instance_id,
 		jobs.spec_json, computers.computer_id, computers.storage_id, computers.storage_generation
 		FROM service_removals JOIN jobs ON jobs.job_id=service_removals.job_id
@@ -321,7 +311,7 @@ func (r *databaseReads) nodeRemovalDirectives(ctx context.Context, identityNodeI
 			}
 			directive.ComputerStorage = &ComputerStorageClaim{ComputerID: computerID.String, StorageID: storageID.String,
 				StorageGeneration: storageGeneration.Int64}
-			generations, generationErr := listComputerRemovalStorageGenerations(ctx, r.q, computerID.String)
+			generations, generationErr := listComputerRemovalStorageGenerations(ctx, s.db, computerID.String)
 			if generationErr != nil {
 				return nil, generationErr
 			}
@@ -329,7 +319,7 @@ func (r *databaseReads) nodeRemovalDirectives(ctx context.Context, identityNodeI
 			if len(directive.ComputerStorageGenerations.Generations) == 0 {
 				return nil, internalError(errors.New("Computer removal has no Storage generations"), "list Computer Storage removal generations")
 			}
-			backupRows, backupErr := r.q.QueryContext(ctx, `SELECT p.backup_id, p.copy_id, p.computer_id,
+			backupRows, backupErr := s.db.QueryContext(ctx, `SELECT p.backup_id, p.copy_id, p.computer_id,
 					b.source_storage_id, b.source_generation, b.allocated_size, bc.node_id, bc.root_instance_id,
 					p.intent_revision, p.cleanup_fence, 0
 				FROM computer_backup_prunes p
@@ -373,7 +363,7 @@ func (r *databaseReads) nodeRemovalDirectives(ctx context.Context, identityNodeI
 			if err := backupRows.Close(); err != nil {
 				return nil, internalError(err, "close Computer Backup copy removals")
 			}
-			custodyRows, custodyErr := r.q.QueryContext(ctx, computerCustodyGraph+` SELECT e.export_id, e.source_storage_id, e.source_generation, e.status,
+			custodyRows, custodyErr := s.db.QueryContext(ctx, computerCustodyGraph+` SELECT e.export_id, e.source_storage_id, e.source_generation, e.status,
 				e.operator_attestation_key IS NOT NULL FROM computer_custody_exports e
 				JOIN custody ON custody.storage_id=e.source_storage_id ORDER BY e.requested_ns, e.export_id`, storageID.String)
 			if custodyErr != nil {

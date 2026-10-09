@@ -78,6 +78,8 @@ func decodeNodeListCursor(value string, filters nodeListFilters) (nodeListCursor
 func (s *Store) initializeNodeListing(ctx context.Context) error {
 	// AUTOINCREMENT keeps insertion membership stable through VACUUM and row
 	// deletion; registration of another boot does not create new membership.
+	// Drop legacy recorded-state indexes on existing stores: effective liveness
+	// filtering seeks the stable key instead of either state index.
 	_, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS node_listing_order (
  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,9 +93,9 @@ INSERT INTO node_listing_order(node_id)
  (SELECT 1 FROM node_listing_order WHERE node_listing_order.node_id=nodes.node_id)
  ORDER BY node_id;
 CREATE INDEX IF NOT EXISTS nodes_listing_order ON nodes(node_id, identity_node_id);
-CREATE INDEX IF NOT EXISTS nodes_listing_state ON nodes(state, node_id, identity_node_id);
+DROP INDEX IF EXISTS nodes_listing_state;
 CREATE INDEX IF NOT EXISTS nodes_listing_claims ON nodes(claims_enabled, node_id, identity_node_id);
-CREATE INDEX IF NOT EXISTS nodes_listing_state_claims ON nodes(state, claims_enabled, node_id, identity_node_id);
+DROP INDEX IF EXISTS nodes_listing_state_claims;
 `)
 	if err != nil {
 		return internalError(err, "initialize node listing")

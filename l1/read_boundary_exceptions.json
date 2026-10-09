@@ -120,6 +120,12 @@
     "slice": "#752"
   },
   {
+    "site": "cancel.go:*Store.ListNodeCancelDirectives | s.db",
+    "count": 1,
+    "reason": "Agent-protocol heartbeat reads must remain independent of operator snapshot admission; migrate in #752",
+    "slice": "#752"
+  },
+  {
     "site": "capabilities.go:*Store.projectQueuedJobCapabilities | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #748",
@@ -525,6 +531,12 @@
     "site": "removal.go:*Store.FinalizeServiceRemoval | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
+    "slice": "#752"
+  },
+  {
+    "site": "removal.go:*Store.ListNodeRemovalDirectives | s.db",
+    "count": 5,
+    "reason": "Agent-protocol heartbeat reads must remain independent of operator snapshot admission; migrate in #752",
     "slice": "#752"
   },
   {

@@ -1651,7 +1651,7 @@
       "get": {
         "operationId": "listNodes",
         "summary": "List operator-visible nodes",
-        "description": "Returns a page of registered nodes with effective liveness computed from one read-only snapshot and pinned clock, ordered by stable node ID. State filters apply effective liveness before paging. Reads never run cleanup or take the database write lock; background reconciliation records transitions and attempt expiry on its configured cadence (default one second). Cursors bind the exact filters and freeze insertion membership for a walk, excluding later inserts even when their IDs sort earlier. Mutable state, claims intent, capability observations and operator facts are live per-page snapshots. An empty next_cursor ends the walk.",
+        "description": "Returns a page of registered nodes with effective liveness computed from one read-only snapshot and pinned clock, ordered by stable node ID. State filters apply effective liveness before paging. Reads never run cleanup or take the database write lock; background reconciliation records transitions and attempt expiry on its configured cadence (nominally one second; delayed under write contention). Cursors bind the exact filters and freeze insertion membership for a walk, excluding later inserts even when their IDs sort earlier. Mutable state, claims intent, capability observations and operator facts are live per-page snapshots. An empty next_cursor ends the walk.",
         "parameters": [
           { "name": "cursor", "in": "query", "description": "Opaque continuation cursor from the same filter query. Limit may change between pages.", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
@@ -1701,7 +1701,7 @@
       "get": {
         "operationId": "getNode",
         "summary": "Read one operator-visible node",
-        "description": "Returns the same Node projection as the fleet listing from one read-only snapshot and pinned clock. state shows effective liveness immediately; reads never run cleanup or take the database write lock. active_attempts and last_condition remain recorded facts until background reconciliation (default one second). Conditions and their since timestamps are never fabricated. Actions requiring recorded state, such as Computer reconfiguration abort needing a recorded dead Node, remain unavailable until it is recorded.",
+        "description": "Returns the same Node projection as the fleet listing from one read-only snapshot and pinned clock. state shows effective liveness immediately; reads never run cleanup or take the database write lock. active_attempts and last_condition remain recorded facts until background reconciliation (nominally one second; delayed under write contention). Conditions and their since timestamps are never fabricated. Actions requiring recorded state, such as Computer reconfiguration abort needing a recorded dead Node, remain unavailable until it is recorded.",
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": {
@@ -1741,7 +1741,7 @@
       "post": {
         "operationId": "operatorDrainNode",
         "summary": "Stop new claims on a node",
-        "description": "Disables claims as durable operator intent while allowing active attempt authority to finish. The mutation is revision-guarded and is valid for dead nodes. A stale revision is refused as stale_intent_revision with revision details as defined in the shared Error schema.",
+        "description": "Disables claims as durable operator intent while allowing active attempt authority to finish. The mutation is revision-guarded and is valid for dead nodes. A stale revision is refused as stale_intent_revision with revision details as defined in the shared Error schema. The response reports recorded node state.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1789,7 +1789,7 @@
       "post": {
         "operationId": "setNodeClaims",
         "summary": "Set durable node claim intent",
-        "description": "Stale intent revisions return stale_intent_revision with revision details as defined in the shared Error schema. Atomically enables or disables new claims when intent_revision matches. Liveness does not gate the write, and changing intent does not fence active attempts.",
+        "description": "Stale intent revisions return stale_intent_revision with revision details as defined in the shared Error schema. Atomically enables or disables new claims when intent_revision matches. Liveness does not gate the write, and changing intent does not fence active attempts. The response reports recorded node state.",
         "requestBody": {
           "required": true,
           "content": {

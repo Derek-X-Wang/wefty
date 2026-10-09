@@ -1754,7 +1754,7 @@
               "active_attempts", "last_condition", "allowed_actions"
             ],
             "properties": {
-              "state": { "enum": ["alive", "stale", "draining", "dead"], "description": "Node list and detail GETs show effective liveness computed from the snapshot clock without writes; recorded state follows through background reconciliation. Agent and mutation responses report recorded state. Durable decisions use recorded state." },
+              "state": { "enum": ["alive", "stale", "draining", "dead"], "description": "Node list and detail GETs show effective liveness computed from the snapshot clock without writes; recorded state follows through background reconciliation. Agent and mutation responses report recorded state. Durable decisions use recorded state. Effective dead/stale is provisional, and a heartbeat accepted before reconciliation returns the node to alive." },
               "authoritative_tags": {
                 "type": "array",
                 "items": { "type": "string" },

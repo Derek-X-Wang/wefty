@@ -1377,16 +1377,20 @@ stale heartbeat threshold. An `alive`, `stale`, or `draining` Node becomes
 effectively `dead` at the dead threshold, including equality. A draining Node
 stays draining before that threshold; a recorded dead Node stays dead until
 registration. State filters use this same effective liveness before pagination.
+Effective `dead`/`stale` is provisional, and a heartbeat accepted before
+reconciliation returns the Node to `alive`.
 Each page uses one snapshot and clock; subsequent pages observe their own moment.
 
 The background reconciler runs at startup and on its configured cadence
-(default one second). It records liveness transitions, expires attempts and
-records conditions independently of reads. A computed-dead view never performs
+(nominally one second; delayed under write contention). It records liveness
+transitions, expires attempts and records conditions independently of reads.
+A computed-dead view never performs
 or fabricates those durable consequences. Computer token proofs refuse a host
 on recorded dead state (independent of their other authority checks), and
 reconfiguration abort requires recorded dead state. Actions requiring recorded
 state stay unavailable until cleanup records it. Node operator intent actions
-remain independent of liveness.
+remain independent of liveness. Drain and claims mutation responses report
+recorded state.
 
 The remaining Node facts retain their recorded meaning:
 
