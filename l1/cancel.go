@@ -38,12 +38,13 @@ func cancellationDeadline(ctx context.Context, q queryer, jobID string) (bool, t
 // CancelJob reserves the outcome in the same immediate transaction as claim,
 // start, child creation and completion. The first committed terminal intent wins.
 func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCaller) (Job, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return Job{}, internalError(err, "begin job cancellation")
 	}
-	defer tx.Rollback()
-	now := canonicalTime(s.clock.Now())
+	tx := write.tx
+	defer write.rollback()
+	now := write.at
 	if caller.Parent != nil {
 		if err := revalidateAttemptCredential(ctx, tx, *caller.Parent, now.UnixNano()); err != nil {
 			return Job{}, err

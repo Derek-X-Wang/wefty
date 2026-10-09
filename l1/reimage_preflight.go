@@ -305,11 +305,12 @@ func (s *Store) AcknowledgeComputerReimagePreflight(ctx context.Context, identit
 		return Computer{}, internalError(err, "encode Computer reimage preflight receipt")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer reimage preflight acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateStorageResetNode(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}

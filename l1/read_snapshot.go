@@ -17,6 +17,13 @@ import (
 // It grants neither SQL access nor mutation authority. Writes adapt their own
 // transaction, after replay checks, so decisions remain inside the write.
 type readModel interface {
+	owedComputerRevocation(context.Context, int64) (owedRevocationRow, error)
+	computerReimageReplayHash(context.Context, string, string) (string, error)
+	custodyExport(context.Context, string) (ComputerCustodyExport, error)
+	proveComputerTokenScope(context.Context, string, string, string, string) (ComputerTokenScopeProof, error)
+	proveHostBootSession(context.Context, string, string, string) error
+	proveServiceBinding(context.Context, string, string, ServiceBindingProofRequest) (bool, error)
+	concurrentSubmit(context.Context, contract.JobSpec, string, JobOrigin, error) (Job, bool, error)
 	computerBackupsPage(context.Context, string, string, string, int) (BackupList, error)
 	computerViewComputerBackupOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerBackupOperationOutcome, error)
 	computerViewComputerBackupOperation(ctx context.Context, computerID, backupID string) (ComputerBackupOperationOutcome, error)
@@ -585,13 +592,45 @@ type writeTransaction struct {
 	actor *serviceActionActor
 }
 
-func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceActionActor) (*writeTransaction, error) {
+// A caller that already sampled its write clock supplies it here. This keeps
+// the existing sampling point and prevents a second clock read during migration.
+func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceActionActor, pinned ...time.Time) (*writeTransaction, error) {
+	if len(pinned) > 1 || len(pinned) == 1 && pinned[0].IsZero() {
+		return nil, fmt.Errorf("l1: invalid pinned write clock")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	return &writeTransaction{tx: tx, at: canonicalTime(s.clock.Now()), actor: caller}, nil
+	var at time.Time
+	if len(pinned) == 1 {
+		at = canonicalTime(pinned[0])
+	} else {
+		at = canonicalTime(s.clock.Now())
+	}
+	return &writeTransaction{tx: tx, at: at, actor: caller}, nil
 }
+
+// beginSettlementWriteTransaction is the write door for heartbeat revocation
+// receipts. Its separate pool retains the bounded SQLite busy wait; callers
+// cannot accidentally move these writes to the main pool's five-second wait.
+func (s *Store) beginSettlementWriteTransaction(ctx context.Context, caller *serviceActionActor, pinned ...time.Time) (*writeTransaction, error) {
+	if len(pinned) > 1 || len(pinned) == 1 && pinned[0].IsZero() {
+		return nil, fmt.Errorf("l1: invalid pinned write clock")
+	}
+	tx, err := s.settlementDB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	var at time.Time
+	if len(pinned) == 1 {
+		at = canonicalTime(pinned[0])
+	} else {
+		at = canonicalTime(s.clock.Now())
+	}
+	return &writeTransaction{tx: tx, at: at, actor: caller}, nil
+}
+
 func (w *writeTransaction) decisionReads() readModel {
 	reads := transactionReads(w.tx, w.at).(*databaseReads)
 	reads.actor = w.actor

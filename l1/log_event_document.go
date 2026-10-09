@@ -109,11 +109,12 @@ type LogEventCompaction struct {
 // markLogEventDocumentsCompactOnNewDatabase records the migration as applied
 // when there is nothing to migrate, so a new database never runs it.
 func (s *Store) markLogEventDocumentsCompactOnNewDatabase(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("l1: begin log event document migration check: %w", err)
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var applied, rows bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM l1_data_migrations WHERE name=?),
 		EXISTS(SELECT 1 FROM log_events)`, logEventDocumentMigration).Scan(&applied, &rows); err != nil {
@@ -123,7 +124,7 @@ func (s *Store) markLogEventDocumentsCompactOnNewDatabase(ctx context.Context) e
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name, applied_ns) VALUES(?, ?)`,
-		logEventDocumentMigration, s.clock.Now().UnixNano()); err != nil {
+		logEventDocumentMigration, write.at.UnixNano()); err != nil {
 		return fmt.Errorf("l1: record log event document migration: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -141,11 +142,12 @@ func (s *Store) markLogEventDocumentsCompactOnNewDatabase(ctx context.Context) e
 // the uncommitted batch, and rewriting a row twice is a no-op. The retained
 // byte counters are untouched: they count the payload, which never moves.
 func (s *Store) CompactLogEventDocuments(ctx context.Context) (LogEventCompaction, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return LogEventCompaction{}, internalError(err, "begin log event document migration")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var applied bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM l1_data_migrations WHERE name=?)`,
 		logEventDocumentMigration).Scan(&applied); err != nil {
@@ -210,7 +212,7 @@ func (s *Store) CompactLogEventDocuments(ctx context.Context) (LogEventCompactio
 			return LogEventCompaction{}, internalError(err, "retire log event document migration cursor")
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name, applied_ns) VALUES(?, ?)`,
-			logEventDocumentMigration, s.clock.Now().UnixNano()); err != nil {
+			logEventDocumentMigration, write.at.UnixNano()); err != nil {
 			return LogEventCompaction{}, internalError(err, "record log event document migration")
 		}
 		result.Done = true

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -119,7 +120,15 @@ func TestServiceBindingProofKeepsOneSnapshotAcrossConcurrentCommit(t *testing.T)
 	sessionReads, commits := 0, 0
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	readerDB := sql.OpenDB(bindingSnapshotConnector{driver: writerDB.Driver(), dsn: sqliteDSN(path, sqliteBusyTimeout),
+	readURL, err := url.Parse(sqliteDSN(path, sqliteBusyTimeout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := readURL.Query()
+	query.Set("mode", "ro")
+	query.Add("_pragma", "query_only(1)")
+	readURL.RawQuery = query.Encode()
+	readerDB := sql.OpenDB(bindingSnapshotConnector{driver: writerDB.Driver(), dsn: readURL.String(),
 		beforeQuery: func(query string) error {
 			if strings.Contains(query, "SELECT identity_node_id, boot_session_id FROM nodes") {
 				sessionReads++
@@ -148,8 +157,9 @@ func TestServiceBindingProofKeepsOneSnapshotAcrossConcurrentCommit(t *testing.T)
 			return nil
 		},
 	})
+	originalReadDB := store.db
 	store.db = readerDB
-	defer func() { store.db = writerDB; readerDB.Close() }()
+	defer func() { store.db = originalReadDB; readerDB.Close() }()
 	bound, err := store.ProveServiceBinding(ctx, "agent", job.JobID, ServiceBindingProofRequest{
 		NodeID: node.NodeID, BootSessionID: node.BootSessionID,
 	})

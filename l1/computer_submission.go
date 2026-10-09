@@ -215,11 +215,12 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 		return Computer{}, false, false, err
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, false, false, internalError(err, "begin Computer submission mutation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return Computer{}, false, false, err
 	}
@@ -339,10 +340,21 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 	if computerID == "" || attemptID == "" || (hostIdentityNodeID == "") == (hostNodeID == "") {
 		return ComputerTokenScopeProof{}, protocolError(contract.ErrorForbidden, "Computer token scope proof is bound to the hosting Node")
 	}
+
+	var proof ComputerTokenScopeProof
+	err := s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
+		var err error
+		proof, err = reads.proveComputerTokenScope(ctx, computerID, attemptID, hostIdentityNodeID, hostNodeID)
+		return err
+	})
+	return proof, err
+}
+
+func (r *databaseReads) proveComputerTokenScope(ctx context.Context, computerID, attemptID, hostIdentityNodeID, hostNodeID string) (ComputerTokenScopeProof, error) {
 	var proof ComputerTokenScopeProof
 	var submitEnabled bool
 	var leaseExpiresNS int64
-	err := s.db.QueryRowContext(ctx, `SELECT c.computer_id, a.attempt_id, c.storage_generation,
+	err := r.q.QueryRowContext(ctx, `SELECT c.computer_id, a.attempt_id, c.storage_generation,
 		c.submit_intent_revision, host.identity_node_id, host.node_id, host.boot_session_id, c.submit_max_inflight, c.submit_enabled, a.lease_expires_ns
 		FROM computers c JOIN attempts a ON a.job_id=c.current_job_id
 		JOIN jobs j ON j.job_id=c.current_job_id
@@ -370,7 +382,7 @@ func (s *Store) ProveComputerTokenScope(ctx context.Context, computerID, attempt
 	if err != nil {
 		return ComputerTokenScopeProof{}, internalError(err, "prove Computer token scope")
 	}
-	if !submitEnabled || leaseExpiresNS <= canonicalTime(s.clock.Now()).UnixNano() {
+	if !submitEnabled || leaseExpiresNS <= r.now().UnixNano() {
 		return ComputerTokenScopeProof{}, protocolError(contract.ErrorForbidden, "Computer submission authority is not current")
 	}
 	return proof, nil
@@ -389,8 +401,15 @@ func (s *Store) ProveHostBootSession(ctx context.Context, hostIdentityNodeID, ho
 			return protocolError(contract.ErrorInvalidRequest, "host boot session proof is incomplete")
 		}
 	}
+
+	return s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
+		return reads.proveHostBootSession(ctx, hostIdentityNodeID, hostStableNodeID, bootSessionID)
+	})
+}
+
+func (r *databaseReads) proveHostBootSession(ctx context.Context, hostIdentityNodeID, hostStableNodeID, bootSessionID string) error {
 	var current int
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+	if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(
 		SELECT 1 FROM nodes WHERE node_id=? AND identity_node_id=? AND boot_session_id=?
 	)`, hostStableNodeID, hostIdentityNodeID, bootSessionID).Scan(&current); err != nil {
 		return internalError(err, "prove host boot session")

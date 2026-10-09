@@ -500,11 +500,12 @@ func (s *Store) migrateServiceLogTruncations(ctx context.Context) error {
 // database that predates them. The singleton total row records that the
 // seed happened; the triggers keep both counters exact from then on.
 func (s *Store) ensureLogUsageCounters(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("l1: begin log usage seed: %w", err)
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var seeded bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM log_usage_total WHERE singleton=1)`).Scan(&seeded); err != nil {
 		return fmt.Errorf("l1: inspect log usage counters: %w", err)
