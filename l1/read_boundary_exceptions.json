@@ -74,8 +74,14 @@
   {
     "site": "computer_operator.go:*Store.withAgentReadSnapshot | s.db",
     "count": 1,
-    "reason": "Agent acknowledgement post-commit reload stays coherent on the main pool, independent of operator snapshot admission.",
+    "reason": "Agent acknowledgement post-commit reload stays coherent on the main pool, independent of the read door's operator snapshot admission.",
     "slice": "#752"
+  },
+  {
+    "site": "computer_operator.go:*Store.withAgentReadSnapshot | conn",
+    "count": 3,
+    "reason": "Agent acknowledgement snapshot constructor: main-pool checkout admission, read-only transaction hold and rollback failure discard.",
+    "slice": "permanent"
   },
   {
     "site": "computer_policy.go:*Store.AcknowledgeComputerPolicyInstallation | s.db",

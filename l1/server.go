@@ -633,6 +633,7 @@ func (s *Server) getComputerSubmission(w http.ResponseWriter, r *http.Request) {
 func (s *Server) computerSubmissionResult(ctx context.Context, identity fabric.Identity, computer Computer, mutationApplied bool,
 	receipt *contract.ComputerTokenRevocationReceipt) (ComputerSubmissionMutationResult, error) {
 	var state ComputerSubmissionState
+	projection := ""
 	if mutationApplied {
 		err := s.store.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
 			observed, err := reads.computerViewGetComputer(ctx, computer.ComputerID)
@@ -649,7 +650,14 @@ func (s *Server) computerSubmissionResult(ctx context.Context, identity fabric.I
 		if err != nil {
 			// The commit and in-hand revocation receipt remain authoritative when
 			// the optional post-change observation cannot be acquired (#600).
+			// The answer marks its own committed-fallback provenance: the status
+			// is the projected status only where it is computable from facts
+			// already in hand (restart-pending); unschedulable and failed-cause
+			// reads would need a new read, so other statuses keep the raw
+			// persisted state.
 			state = projectComputerSubmissionState(computer, computer.SubmitPolicyRevision)
+			state.Status = submissionCommittedStatus(computer, canonicalTime(s.store.clock.Now()))
+			projection = committedFallbackProjection
 			if s.logf != nil {
 				s.logf("event=l1_submission_post_change_unread computer_id=%s cause=%q", computer.ComputerID, scrubbedCause(err))
 			}
@@ -676,7 +684,8 @@ func (s *Server) computerSubmissionResult(ctx context.Context, identity fabric.I
 	default:
 		return ComputerSubmissionMutationResult{}, internalError(err, "read Computer inflight state")
 	}
-	return ComputerSubmissionMutationResult{ComputerSubmissionState: state, MutationApplied: mutationApplied, Revoked: receipt}, nil
+	return ComputerSubmissionMutationResult{ComputerSubmissionState: state, Projection: projection,
+		MutationApplied: mutationApplied, Revoked: receipt}, nil
 }
 
 func (s *Server) latchServiceImageReconciliationFailure(w http.ResponseWriter, r *http.Request) {

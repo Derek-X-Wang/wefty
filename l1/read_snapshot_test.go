@@ -456,3 +456,44 @@ func TestReadSnapshotHoldLimitOverride(t *testing.T) {
 		t.Fatalf("10 s override expired after the default limit: %v", err)
 	}
 }
+
+// The agent acknowledgement snapshot shares the read door's hard hold limit
+// and its test-only override. Checkout is the first stage, so a 1 ns budget
+// expires admission specifically; the hold limit completes the shape when
+// the checkout succeeds but the transaction outlasts its budget.
+func TestAgentReadSnapshotHoldLimitExpiresUnavailable(t *testing.T) {
+	s, _ := snapshotStore(t)
+	err := s.withAgentReadSnapshot(context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, time.Nanosecond),
+		func(context.Context, readModel) error { return nil })
+	assertAgentSnapshotUnavailable(t, err, "read_snapshot_admission_expired")
+	// Checkout inside the 50 ms budget succeeds; the transaction then holds
+	// past it, so the hold stage expires specifically. The sleep can only
+	// run long, which makes the hold expiry deterministic.
+	ctx := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, 50*time.Millisecond)
+	err = s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
+		time.Sleep(readSnapshotHardLimit)
+		var count int
+		return reads.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&count)
+	})
+	assertAgentSnapshotUnavailable(t, err, "read_snapshot_expired")
+	if err := s.withAgentReadSnapshot(t.Context(), func(ctx context.Context, reads readModel) error {
+		var count int
+		return reads.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertAgentSnapshotUnavailable(t *testing.T, err error, want string) {
+	t.Helper()
+	if errorCode(err) != contract.ErrorUnavailable {
+		t.Fatalf("agent read snapshot=%v, want unavailable", err)
+	}
+	reason, _ := err.(*Error).Details["reason"].(string)
+	if reason != want {
+		t.Fatalf("reason=%q, want %q", reason, want)
+	}
+	if api := apiErrorFromDecision(err); api == nil || !api.Retryable {
+		t.Fatalf("expired agent read snapshot is not retryable: %v", err)
+	}
+}

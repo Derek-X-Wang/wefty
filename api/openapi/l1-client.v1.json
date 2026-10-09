@@ -92,7 +92,7 @@
         } } } },
         "responses": {
           "200": {
-            "description": "Canonical narrow state plus whether policy changed and the factual L3 revocation receipt. If an applied change cannot acquire its post-change snapshot, committed Computer authority and submit_policy_revision supply the fallback, preserving revoked or revocation_notice. Idempotent replay is additionally identified by Idempotent-Replay: true.",
+            "description": "Canonical narrow state plus whether policy changed and the factual L3 revocation receipt. If an applied change cannot acquire its post-change Read snapshot, committed Computer authority and submit_policy_revision supply the fallback, preserving revoked or revocation_notice; that response carries projection=committed-fallback and describes the committed authority. Its status is the projected status only where it is computable from committed facts already in hand; without a fresh read the only real divergence is queued versus unschedulable, which needs the placement walks, so other statuses are the raw persisted state. Idempotent replay is additionally identified by Idempotent-Replay: true.",
             "content": { "application/json": { "schema": {
               "type": "object", "additionalProperties": false,
               "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "inflight_count", "inflight_observation", "policy_revision", "ready", "mutation_applied", "revoked"],
@@ -105,9 +105,10 @@
                 "inflight_observation": { "type": "string", "enum": ["run-ledger"], "description": "Always run-ledger; the count is not part of the L1 Read snapshot." },
                 "policy_revision": { "type": "integer", "minimum": 1 },
                 "ready": { "type": ["boolean", "null"] },
-                "status": { "type": "string", "description": "Shared job view computed status, including restart-pending and unschedulable; open vocabulary." },
+                "status": { "type": "string", "description": "Shared job view computed status, including restart-pending and unschedulable; open vocabulary. Under projection=committed-fallback the status is computed from committed facts in hand only, so a truly unschedulable queued Computer may still show queued." },
                 "pass_unavailable": { "$ref": "./common.v1.json#/components/schemas/SpawnFailure" },
                 "mutation_applied": { "type": "boolean" },
+                "projection": { "type": "string", "enum": ["committed-fallback"], "description": "Present only when the post-change Read snapshot failed and the answer was built from committed authority. Omitted on an ordinary post-change observation." },
                 "revoked": { "oneOf": [{ "$ref": "./common.v1.json#/components/schemas/ComputerTokenRevocationReceipt" }, { "type": "null" }] },
                 "revocation_notice": { "type": "string", "minLength": 1, "description": "Present only when an applied change's L3 revocation was not recorded; revoked is then null. Do not retry the request for it." }
               }
@@ -119,7 +120,7 @@
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
-          "503": { "description": "Also unavailable, retryable=true, details.reason=identity_unverifiable when Fabric identity lookup fails operationally. run_ledger_unavailable, retryable: this control plane names no run ledger, so nothing was applied. Applied submission changes fall back to committed Computer authority and submit_policy_revision if the post-change snapshot fails, retaining the revoked receipt or revocation_notice. Status and readiness then describe the committed authority projection.", "headers": { "X-Request-Id": { "$ref": "./common.v1.json#/components/headers/RequestId" } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } } }
+          "503": { "description": "Also unavailable, retryable=true, details.reason=identity_unverifiable when Fabric identity lookup fails operationally. run_ledger_unavailable, retryable: this control plane names no run ledger, so nothing was applied.", "headers": { "X-Request-Id": { "$ref": "./common.v1.json#/components/headers/RequestId" } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
