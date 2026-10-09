@@ -122,7 +122,7 @@
   {
     "site": "cancel.go:*Store.ListNodeCancelDirectives | s.db",
     "count": 1,
-    "reason": "Agent-protocol heartbeat reads must remain independent of operator snapshot admission; migrate in #752",
+    "reason": "Agent-protocol heartbeat reads must remain independent of operator snapshot admission; in #752, document as a heartbeat exception or give it separate admission",
     "slice": "#752"
   },
   {
@@ -536,7 +536,7 @@
   {
     "site": "removal.go:*Store.ListNodeRemovalDirectives | s.db",
     "count": 5,
-    "reason": "Agent-protocol heartbeat reads must remain independent of operator snapshot admission; migrate in #752",
+    "reason": "Agent-protocol heartbeat reads must remain independent of operator snapshot admission; in #752, document as a heartbeat exception or give it separate admission",
     "slice": "#752"
   },
   {
