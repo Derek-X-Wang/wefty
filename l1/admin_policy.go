@@ -106,16 +106,65 @@ func validatePersonIdentity(identity fabric.Identity) error {
 	return nil
 }
 
+// personSeenRefreshInterval is how long a recorded person observation stays
+// fresh enough that a person view performs no write at all.
+const personSeenRefreshInterval = time.Hour
+
+// ObserveAuthenticatedPerson records person presence only when the durable
+// record is missing, a recorded field drifted, a future-dated record, or the
+// record is one hour old or older. A known, up-to-date person never waits on
+// the write lock: the check runs through the read-snapshot door, and a
+// person's first request still records them durably before answering so
+// grants succeed. Snapshot unavailability falls back to a counted, logged
+// durable write; a nested snapshot is a programming error and refuses without
+// writing.
 func (s *Store) ObserveAuthenticatedPerson(ctx context.Context, identity fabric.Identity) (AuthenticatedPerson, error) {
 	if err := validatePersonIdentity(identity); err != nil {
 		return AuthenticatedPerson{}, err
 	}
 	now := canonicalTime(s.clock.Now())
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO authenticated_people(fabric_id, user_id, last_device_id, last_seen_ns)
+	needed, err := s.personObservationNeedsWrite(ctx, identity, now)
+	if err != nil {
+		if errorCode(err) != contract.ErrorUnavailable {
+			return AuthenticatedPerson{}, err
+		}
+		// The read snapshot could not confirm the record; record durably so
+		// the security guarantee behind the observation survives.
+		s.recordPersonFallbackWrite()
+		return s.recordAuthenticatedPerson(ctx, identity, now)
+	}
+	if !needed {
+		return AuthenticatedPerson{FabricID: identity.FabricID, UserID: identity.UserID,
+			DeviceID: identity.DeviceID, SeenAt: now}, nil
+	}
+	return s.recordAuthenticatedPerson(ctx, identity, now)
+}
+
+func (s *Store) personObservationNeedsWrite(ctx context.Context, identity fabric.Identity, now time.Time) (bool, error) {
+	needed := true
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		person, known, err := reads.person(ctx, identity.FabricID, identity.UserID)
+		needed = err != nil || !known || person.DeviceID != identity.DeviceID ||
+			now.Sub(person.SeenAt) >= personSeenRefreshInterval || now.Before(person.SeenAt)
+		return err
+	})
+	return needed, err
+}
+
+func (s *Store) recordAuthenticatedPerson(ctx context.Context, identity fabric.Identity, now time.Time) (AuthenticatedPerson, error) {
+	w, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		return AuthenticatedPerson{}, internalError(err, "begin authenticated person record")
+	}
+	defer w.rollback()
+	if _, err := w.tx.ExecContext(ctx, `INSERT INTO authenticated_people(fabric_id, user_id, last_device_id, last_seen_ns)
 		VALUES(?, ?, ?, ?) ON CONFLICT(fabric_id, user_id) DO UPDATE SET
 		last_device_id=excluded.last_device_id, last_seen_ns=excluded.last_seen_ns`,
 		identity.FabricID, identity.UserID, identity.DeviceID, now.UnixNano()); err != nil {
 		return AuthenticatedPerson{}, internalError(err, "record authenticated person")
+	}
+	if err := w.commit(); err != nil {
+		return AuthenticatedPerson{}, internalError(err, "commit authenticated person record")
 	}
 	return AuthenticatedPerson{FabricID: identity.FabricID, UserID: identity.UserID,
 		DeviceID: identity.DeviceID, SeenAt: now}, nil
@@ -260,17 +309,14 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 }
 
 func (s *Store) GetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	var policy AdminPolicy
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		policy, err = reads.adminPolicy(ctx)
+		return err
+	})
 	if err != nil {
-		return AdminPolicy{}, internalError(err, "begin admin policy read")
-	}
-	defer tx.Rollback()
-	policy, err := readAdminPolicy(ctx, tx)
-	if err != nil {
-		return AdminPolicy{}, internalError(err, "read admin policy")
-	}
-	if err := tx.Commit(); err != nil {
-		return AdminPolicy{}, internalError(err, "commit admin policy read")
+		return AdminPolicy{}, snapshotReadError(err, "read admin policy")
 	}
 	return policy, nil
 }
@@ -279,30 +325,24 @@ func (s *Store) GetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
 // every authenticated person may observe the revision needed for change
 // detection without learning membership.
 func (s *Store) GetVisibleAdminPolicy(ctx context.Context, identity fabric.Identity) (AdminPolicy, error) {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return AdminPolicy{}, internalError(err, "begin visible admin policy read")
-	}
-	defer tx.Rollback()
-	var revision int64
-	if err := tx.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&revision); err != nil {
-		return AdminPolicy{}, internalError(err, "read admin policy revision")
-	}
-	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
-		if errorCode(err) == contract.ErrorAdminRequired {
-			if err := tx.Commit(); err != nil {
-				return AdminPolicy{}, internalError(err, "commit redacted admin policy read")
-			}
-			return AdminPolicy{Revision: revision}, nil
+	var policy AdminPolicy
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		revision, err := reads.adminPolicyRevision(ctx)
+		if err != nil {
+			return err
 		}
-		return AdminPolicy{}, err
-	}
-	policy, err := readAdminPolicy(ctx, tx)
+		if err := reads.currentAdmin(ctx, identity); err != nil {
+			if errorCode(err) == contract.ErrorAdminRequired {
+				policy = AdminPolicy{Revision: revision}
+				return nil
+			}
+			return err
+		}
+		policy, err = reads.adminPolicy(ctx)
+		return err
+	})
 	if err != nil {
-		return AdminPolicy{}, internalError(err, "read visible admin policy")
-	}
-	if err := tx.Commit(); err != nil {
-		return AdminPolicy{}, internalError(err, "commit visible admin policy read")
+		return AdminPolicy{}, snapshotReadError(err, "read visible admin policy")
 	}
 	return policy, nil
 }
@@ -674,34 +714,17 @@ func (s *Store) ListAdminPolicyAudit(
 	if err != nil {
 		return AdminPolicyAuditList{}, err
 	}
-	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
-		return AdminPolicyAuditList{}, err
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT revision, operation, actor_kind, actor_fabric_id,
-		actor_user_id, actor_device_id, subject_fabric_id, subject_user_id, created_ns FROM admin_policy_audit
-		WHERE revision>? ORDER BY revision LIMIT ?`, afterRevision, limit+1)
-	if err != nil {
-		return AdminPolicyAuditList{}, internalError(err, "list admin policy audit")
-	}
-	defer rows.Close()
-	page := AdminPolicyAuditList{Entries: []AdminPolicyAudit{}}
-	for rows.Next() {
-		var entry AdminPolicyAudit
-		var createdNS int64
-		if err := rows.Scan(&entry.Revision, &entry.Operation, &entry.ActorKind,
-			&entry.ActorFabricID, &entry.ActorUserID, &entry.ActorDeviceID,
-			&entry.SubjectFabricID, &entry.SubjectUserID, &createdNS); err != nil {
-			return AdminPolicyAuditList{}, internalError(err, "scan admin policy audit")
+	var page AdminPolicyAuditList
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		if err := reads.currentAdmin(ctx, identity); err != nil {
+			return err
 		}
-		entry.CreatedAt = time.Unix(0, createdNS).UTC()
-		page.Entries = append(page.Entries, entry)
-	}
-	if err := rows.Err(); err != nil {
-		return AdminPolicyAuditList{}, internalError(err, "read admin policy audit")
-	}
-	if len(page.Entries) > limit {
-		page.Entries = page.Entries[:limit]
-		page.NextCursor = encodeAdminAuditCursor(page.Entries[len(page.Entries)-1].Revision)
+		var pageErr error
+		page, pageErr = reads.adminAuditPage(ctx, afterRevision, limit)
+		return pageErr
+	})
+	if err != nil {
+		return AdminPolicyAuditList{}, err
 	}
 	return page, nil
 }

@@ -6,34 +6,10 @@
     "slice": "#752"
   },
   {
-    "site": "admin_policy.go:*Store.GetAdminPolicy | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #751",
-    "slice": "#751"
-  },
-  {
-    "site": "admin_policy.go:*Store.GetVisibleAdminPolicy | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #751",
-    "slice": "#751"
-  },
-  {
     "site": "admin_policy.go:*Store.InitiateAdminBootstrap | s.db",
     "count": 1,
     "reason": "legacy acquisition/use; migrate in #752",
     "slice": "#752"
-  },
-  {
-    "site": "admin_policy.go:*Store.ListAdminPolicyAudit | s.db",
-    "count": 2,
-    "reason": "legacy acquisition/use; migrate in #751",
-    "slice": "#751"
-  },
-  {
-    "site": "admin_policy.go:*Store.ObserveAuthenticatedPerson | s.db",
-    "count": 1,
-    "reason": "legacy acquisition/use; migrate in #751",
-    "slice": "#751"
   },
   {
     "site": "admin_policy.go:*Store.ResetAdminPolicy | s.db",

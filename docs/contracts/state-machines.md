@@ -733,9 +733,20 @@ data: L1 refuses person routes unless the operator explicitly enables
 `-allow-plain-person-identities`, and they must never be treated as production
 admin authority.
 
-Every successful person-route authentication records the stable
-`(FabricID, UserID)` plus latest device evidence in L1; `GET /v1/whoami` is the
-explicit touch route. A grant subject must have one of these authenticated
+Every person-route authentication checks the stable `(FabricID, UserID)` plus
+latest device evidence in L1; `GET /v1/whoami` is the explicit touch route.
+Only the check uses the read snapshot; recording happens on the write door,
+and mutation audit stays transactional. The record refresh is
+dirty-then-stale: a person view writes only when the observation is new, a
+recorded field changed, or the record is one hour old or older (a
+future-dated record counts as stale). A known, up-to-date person answers
+without writing and never waits on the write SQLite lock; a first request, a
+changed field, a stale or future-dated record, and a snapshot-unavailable
+fallback all record durably before answering. Snapshot unavailability falls
+back to writing the observation, counted and rate-limited-logged so the
+departure from write-free views stays visible, while a misplaced nested
+snapshot is a programming error that refuses without writing. A
+grant subject must have one of these authenticated
 person observations before receiving `view` or `control`. Machine principals
 are rejected before observation and are never inserted. Administrator
 membership remains exempt from this existence check so a misspelled bootstrap
