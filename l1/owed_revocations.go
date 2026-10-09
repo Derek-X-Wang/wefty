@@ -271,7 +271,7 @@ func readOwedComputerRevocations(ctx context.Context, q queryer, computerID stri
 
 func (s *Store) owedComputerRevocation(ctx context.Context, revocationID int64) (owedRevocationRow, error) {
 	var row owedRevocationRow
-	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+	err := s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
 		var err error
 		row, err = reads.owedComputerRevocation(ctx, revocationID)
 		return err

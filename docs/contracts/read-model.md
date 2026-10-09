@@ -92,7 +92,7 @@ limit, both with typed `unavailable` expiry (`read_snapshot_admission_expired`,
 `read_snapshot_expired`, retryable) and the door's test-only override. The door
 is reachable only from reviewed agent and L3 protocol read owners; the guard
 asserts the exact site set of `withAgentReadSnapshot`, the `writeAgentComputer`
-wrapper and their reviewed callers, set-equality, with
+wrapper, the three `Prove*` methods and their reviewed HTTP callers, set equality, with
 a fixture test covering the bypass shapes. The list is hand-kept rather than
 derived from route registration, and the rule tracks references, not
 invocations: a listed site that stored the method value for another caller
@@ -113,8 +113,17 @@ in `l1/read_boundary_exceptions.json` accepts only two permanent classes:
   They stay on the main pool so operator admission cannot starve protocol traffic.
 
 Policy watch records issued policy through the write door; its long poll stays
-outside that transaction. Operator Stop/Restart/Reimage/Remove authority-loss
-revocation lookup uses an operator snapshot that closes before external revocation.
+outside that transaction. Authority-loss revocation lookup is protocol-reachable:
+agent Computer attempt completion and storage-grow acknowledgement use it, along
+with operator Stop/Restart/Reset/Reimage/Remove and projection installation.
+It uses the bounded main-pool protocol read door and closes its snapshot before
+external revocation. Operator snapshot saturation cannot fail agent completion.
+If this lookup expires after commit, the route returns `unavailable` with
+`details.reason=read_snapshot_post_change_failed`, `mutation_applied=true`,
+`computer_id` and `read_reason`; only snapshot availability failures are retryable.
+The authority-losing mutation and owed row stand, and the host heartbeat still
+settles the revocation. An external revocation failure keeps the established
+applied/owed (or nothing-owed) `run_ledger_unavailable` answer.
 
 Every inventory entry has an exact use count and a precise reason. Any other
 class, including a ticket slice tag, fails the guard. A new raw use, an increased

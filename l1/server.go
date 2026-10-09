@@ -1999,7 +1999,10 @@ func (s *Server) revokeAfterAuthorityLoss(ctx context.Context, owedRevocationID 
 	}
 	row, err := s.store.owedComputerRevocation(ctx, owedRevocationID)
 	if err != nil {
-		return err
+		// The authority-losing mutation and its owed row already committed.
+		// Protocol snapshot expiry must not look like an unapplied write;
+		// the host heartbeat can still settle the durable revocation.
+		return appliedComputerReadError(err, computerID)
 	}
 	if row.settled {
 		return nil

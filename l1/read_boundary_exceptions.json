@@ -26,7 +26,7 @@
   {
     "site": "computer_operator.go:*Store.withAgentReadSnapshot | conn",
     "count": 3,
-    "reason": "Agent and L3 protocol reads stay coherent on the main pool, independent of operator snapshot admission.",
+    "reason": "Agent and L3 protocol snapshot constructor: main-pool checkout admission, read-only transaction hold and rollback failure discard.",
     "slice": "permanent"
   },
   {

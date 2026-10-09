@@ -3,6 +3,10 @@ package l1
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -198,7 +202,7 @@ func TestCustodyImportAcknowledgementUsesOneWrite(t *testing.T) {
 	}
 }
 
-func TestAuthorityLossReadUsesClosedOperatorSnapshot(t *testing.T) {
+func TestAuthorityLossReadUsesClosedProtocolSnapshot(t *testing.T) {
 	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{})
 	h.stopServer()
 	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "authority-read", Spec: computerCapabilityJobSpec("computer:authority-read"), Actor: "operator"})
@@ -211,18 +215,111 @@ func TestAuthorityLossReadUsesClosedOperatorSnapshot(t *testing.T) {
 	}
 	t.Run("operator-admission", func(t *testing.T) {
 		occupyOperatorPool(t, h.store)
-		_, err := h.store.owedComputerRevocation(t.Context(), stopped.owedRevocationID)
-		assertSnapshotUnavailable(t, err, "read_snapshot_admission_expired")
+		row, err := h.store.owedComputerRevocation(t.Context(), stopped.owedRevocationID)
+		if err != nil || row.owed.RevocationID != stopped.owedRevocationID {
+			t.Fatalf("row=%+v err=%v", row, err)
+		}
 	})
 	called := false
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(ctx context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 		called = true
-		if used := h.store.readDB.Stats().InUse; used != 0 {
+		if used := h.store.db.Stats().InUse + h.store.readDB.Stats().InUse; used != 0 {
 			t.Fatalf("external revocation retained %d snapshot slots", used)
 		}
 		return contract.ComputerTokenRevocationReceipt{ComputerID: computer.ComputerID, SubmitIntentRevision: 1, CommittedAt: h.clock.Now()}, nil
 	}}
 	if err := h.server.revokeAfterAuthorityLoss(t.Context(), stopped.owedRevocationID, computer.ComputerID, "", "computer_stopped"); err != nil || !called {
 		t.Fatalf("called=%t err=%v", called, err)
+	}
+}
+
+// Exercise the real agent HTTP route while every operator snapshot slot is held.
+func TestComputerCompletionIndependentOfOperatorPool(t *testing.T) {
+	h, _, node, agent := computerCompletionHarness(t)
+	ledger := newOutageLedger(h)
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "completion-admission", Spec: computerCapabilityJobSpec("computer:completion-admission"), Actor: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := startComputerAttempt(t, h, node, nil)
+	ledger.mint(claim.Lease.AttemptID)
+	occupyOperatorPool(t, h.store)
+	postCompletion(t, h, agent, claim, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion-admission", Result: ProcessResult{ExitCode: intPointer(0)}, RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt})
+	audit := owedRevocationAuditRows(t, h, computer.ComputerID)
+	if len(audit) != 1 || audit[0].verb != ComputerRevocationVerbAttemptCompletion || audit[0].scope != ComputerRevocationScopeAttempt || len(audit[0].recorded) != 1 || audit[0].recorded[0] != claim.Lease.AttemptID || audit[0].settlement != owedRevocationSettledRevoked || audit[0].record == nil || len(audit[0].record.Attempts) != 1 || audit[0].record.Attempts[0].ComputerAttemptID != claim.Lease.AttemptID || ledger.active(claim.Lease.AttemptID) {
+		t.Fatalf("completion revocation audit=%+v active=%t", audit, ledger.active(claim.Lease.AttemptID))
+	}
+	requests := ledger.taken()
+	if len(requests) != 1 || requests[0].ComputerAttemptID != claim.Lease.AttemptID || requests[0].RevokeAll {
+		t.Fatalf("revocations=%+v", requests)
+	}
+}
+
+// A protocol-door timeout must describe the committed change even before L3 is called.
+func TestAuthorityLossReadExpiryMarksApplied(t *testing.T) {
+	for _, route := range []string{"completion", "stop"} {
+		t.Run(route, func(t *testing.T) {
+			h, _, node, _ := computerCompletionHarness(t)
+			computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: "expiry-" + route, Spec: computerCapabilityJobSpec("computer:expiry-" + route), Actor: "operator"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim := startComputerAttempt(t, h, node, nil)
+			computer = mustGetComputer(t, h, computer.ComputerID)
+			h.stopServer()
+			called := false
+			h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(context.Context, ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
+				called = true
+				return contract.ComputerTokenRevocationReceipt{}, nil
+			}}
+			ctx := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, time.Nanosecond)
+			var payload any
+			method, path := http.MethodPost, fmt.Sprintf("/v1/agent/jobs/%s/attempts/%s/complete", claim.Job.JobID, claim.Lease.AttemptID)
+			identity := fabric.Identity{NodeID: "fabric-computer-node", Tags: []string{DefaultAgentPrincipalTag}}
+			handler := h.server.completeAttempt
+			if route == "completion" {
+				payload = CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "expiry-completion", Result: ProcessResult{ExitCode: intPointer(0)}, RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt}
+			} else {
+				payload = computerDesiredRequest(computer, contract.ServiceDesiredStopped, "operator")
+				method, path = http.MethodPut, "/v1/computers/"+computer.ComputerID+"/desired-state"
+				identity = fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}}
+				handler = h.server.setComputerDesiredState
+			}
+			encoded, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(method, path, strings.NewReader(string(encoded))).WithContext(context.WithValue(ctx, identityContextKey{}, identity))
+			r.SetPathValue("computer_id", computer.ComputerID)
+			r.SetPathValue("job_id", claim.Job.JobID)
+			r.SetPathValue("attempt_id", claim.Lease.AttemptID)
+			w := httptest.NewRecorder()
+			handler(w, r)
+			var response struct {
+				Error contract.APIError `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			api := response.Error
+			if w.Code != http.StatusServiceUnavailable || api.Code != contract.ErrorUnavailable || !api.Retryable || api.Details["mutation_applied"] != true || api.Details["computer_id"] != computer.ComputerID || api.Details["reason"] != "read_snapshot_post_change_failed" || api.Details["read_reason"] != "read_snapshot_admission_expired" || called {
+				t.Fatalf("status=%d body=%s revoker_called=%t", w.Code, w.Body.String(), called)
+			}
+			audit := owedRevocationAuditRows(t, h, computer.ComputerID)
+			if len(audit) != 1 || audit[0].settlement != "" || len(audit[0].recorded) != 1 || audit[0].recorded[0] != claim.Lease.AttemptID {
+				t.Fatalf("owed audit=%+v", audit)
+			}
+			// The write itself succeeded, independently of the failed observation.
+			job, err := h.store.GetJob(t.Context(), claim.Job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if route == "completion" && job.State == contract.JobRunning {
+				t.Fatalf("completion did not commit: %+v", job)
+			}
+			if route == "stop" && job.DesiredState != contract.ServiceDesiredStopped {
+				t.Fatalf("stop did not commit: %+v", job)
+			}
+		})
 	}
 }

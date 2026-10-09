@@ -349,7 +349,7 @@ func (i boundaryFixtureImporter) Import(path string) (*types.Package, error) {
 // The rule matches calls, method values, method expressions and package-level
 // initialisers by compiler identity. A listed owner forwarding a method value
 // to an unlisted caller remains a review responsibility.
-var agentReadSnapshotTargets = []string{"withAgentReadSnapshot", "writeAgentComputer"}
+var agentReadSnapshotTargets = []string{"withAgentReadSnapshot", "writeAgentComputer", "ProveServiceBinding", "ProveComputerTokenScope", "ProveHostBootSession"}
 
 const boundaryPkgPath = "github.com/Derek-X-Wang/wefty/l1"
 
@@ -434,6 +434,10 @@ func boundarySelectors(fset *token.FileSet, node ast.Node, site string, info *ty
 // reads, including acknowledgement reloads and live authority proofs. Set
 // equality refuses both new owners and vanished type-check results.
 var agentProtocolReadSites = map[string]bool{
+	"owed_revocations.go:*Store.owedComputerRevocation":      true,
+	"server.go:*Server.proveServiceBinding":                  true,
+	"server.go:*Server.proveComputerTokenScope":              true,
+	"server.go:*Server.proveHostBootSession":                 true,
 	"service_jobs.go:*Store.ProveServiceBinding":             true,
 	"computer_submission.go:*Store.ProveComputerTokenScope":  true,
 	"computer_submission.go:*Store.ProveHostBootSession":     true,
@@ -455,7 +459,13 @@ func TestReadSnapshotAgentGuardDetectsBypassShapes(t *testing.T) {
 	type model int
 	type Store struct{}
 	func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, model) error) error { _ = ctx; _ = use; return nil }
-	type Server struct{ store *Store }
+	func (s *Store) ProveServiceBinding() {}
+ func (s *Store) ProveComputerTokenScope() {}
+ func (s *Store) ProveHostBootSession() {}
+ type Server struct{ store *Store }
+ func newOperatorBindingCaller(s *Store) { s.ProveServiceBinding() }
+ func newOperatorTokenScopeCaller(s *Store) { _ = s.ProveComputerTokenScope }
+ var newOperatorBootCaller = (*Store).ProveHostBootSession
 	func (s *Server) writeAgentComputer(args ...any) { s.store.withAgentReadSnapshot(context.Background(), nil) }
 	func (s *Server) acknowledgeComputerBackup() { s.store.withAgentReadSnapshot(context.Background(), nil) }
 	func handlerCallingWrapper(s *Server) { s.writeAgentComputer() }
@@ -482,6 +492,9 @@ func TestReadSnapshotAgentGuardDetectsBypassShapes(t *testing.T) {
 		"fixture.go:bypassMethodValue":                 true,
 		"fixture.go:bypassMethodExpr":                  true,
 		"fixture.go:var bypassPackageVar":              true,
+		"fixture.go:newOperatorBindingCaller":          true,
+		"fixture.go:newOperatorTokenScopeCaller":       true,
+		"fixture.go:var newOperatorBootCaller":         true,
 	}
 	if len(sites) != len(expected) {
 		t.Fatalf("sites=%v, want exactly %v", sites, expected)
