@@ -653,6 +653,7 @@
         "additionalProperties": false,
         "required": ["generations"],
         "properties": {
+          "next_cursor": { "type": "string", "description": "Opaque continuation cursor; absent at the end of the walk." },
           "generations": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/ComputerStorageGeneration" }

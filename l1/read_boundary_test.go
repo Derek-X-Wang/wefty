@@ -349,7 +349,7 @@ func (i boundaryFixtureImporter) Import(path string) (*types.Package, error) {
 // The rule matches calls, method values, method expressions and package-level
 // initialisers by compiler identity. A listed owner forwarding a method value
 // to an unlisted caller remains a review responsibility.
-var agentReadSnapshotTargets = []string{"withAgentReadSnapshot", "writeAgentComputer", "ProveServiceBinding", "ProveComputerTokenScope", "ProveHostBootSession"}
+var agentReadSnapshotTargets = []string{"withAgentReadSnapshot", "writeAgentComputer", "ProveServiceBinding", "ProveComputerTokenScope", "ProveHostBootSession", "owedComputerRevocation"}
 
 const boundaryPkgPath = "github.com/Derek-X-Wang/wefty/l1"
 
@@ -434,6 +434,7 @@ func boundarySelectors(fset *token.FileSet, node ast.Node, site string, info *ty
 // reads, including acknowledgement reloads and live authority proofs. Set
 // equality refuses both new owners and vanished type-check results.
 var agentProtocolReadSites = map[string]bool{
+	"server.go:*Server.revokeAfterAuthorityLoss":             true,
 	"owed_revocations.go:*Store.owedComputerRevocation":      true,
 	"server.go:*Server.proveServiceBinding":                  true,
 	"server.go:*Server.proveComputerTokenScope":              true,
@@ -459,7 +460,9 @@ func TestReadSnapshotAgentGuardDetectsBypassShapes(t *testing.T) {
 	type model int
 	type Store struct{}
 	func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, model) error) error { _ = ctx; _ = use; return nil }
-	func (s *Store) ProveServiceBinding() {}
+	func (s *Store) owedComputerRevocation() {}
+ func newOperatorOwedCaller(s *Store) { _ = s.owedComputerRevocation }
+ func (s *Store) ProveServiceBinding() {}
  func (s *Store) ProveComputerTokenScope() {}
  func (s *Store) ProveHostBootSession() {}
  type Server struct{ store *Store }
@@ -492,6 +495,7 @@ func TestReadSnapshotAgentGuardDetectsBypassShapes(t *testing.T) {
 		"fixture.go:bypassMethodValue":                 true,
 		"fixture.go:bypassMethodExpr":                  true,
 		"fixture.go:var bypassPackageVar":              true,
+		"fixture.go:newOperatorOwedCaller":             true,
 		"fixture.go:newOperatorBindingCaller":          true,
 		"fixture.go:newOperatorTokenScopeCaller":       true,
 		"fixture.go:var newOperatorBootCaller":         true,

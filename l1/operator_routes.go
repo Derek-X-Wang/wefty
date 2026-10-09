@@ -24,8 +24,11 @@ const (
 	// MaxJobListingPageLimit.
 	MaxJobPageLimit = 1000
 	// MaxJobListingPageLimit bounds Job projection work in one Read snapshot.
-	MaxJobListingPageLimit = 250
-	MaxChildJobPageLimit   = MaxJobListingPageLimit
+	// #752 disk-pressure measurements kept p95 under 100 ms at 150 rows.
+	MaxJobListingPageLimit = 150
+	// Computer collections retain their independently measured bound.
+	MaxComputerListingPageLimit = 250
+	MaxChildJobPageLimit        = MaxJobListingPageLimit
 )
 
 type serviceJobCursor struct {
@@ -67,6 +70,14 @@ func parseChildJobLimit(value string) (int, error) {
 }
 
 func parseJobListingLimit(value string) (int, error) {
+	return parseProjectedPageLimit(value, MaxJobListingPageLimit)
+}
+
+func parseComputerListingLimit(value string) (int, error) {
+	return parseProjectedPageLimit(value, MaxComputerListingPageLimit)
+}
+
+func parseProjectedPageLimit(value string, maximum int) (int, error) {
 	if value == "" {
 		return DefaultJobPageLimit, nil
 	}
@@ -74,7 +85,7 @@ func parseJobListingLimit(value string) (int, error) {
 	if err != nil || limit < 1 {
 		return 0, protocolError(contract.ErrorInvalidRequest, "limit must be a positive integer")
 	}
-	return min(limit, MaxJobListingPageLimit), nil
+	return min(limit, maximum), nil
 }
 
 func parseReadJobLimit(value string, maximum int) (int, error) {

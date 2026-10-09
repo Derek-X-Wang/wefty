@@ -389,7 +389,7 @@ func (r *databaseReads) backupChoices(ctx context.Context, computerID string) ([
 
 // A failed post-commit observation must not invite replay as an unapplied write.
 func appliedComputerReadError(err error, id string) error {
-	return appliedResourceReadError(err, "computer_id", id, "Computer change committed but its view is unavailable")
+	return appliedResourceReadError(err, "computer_id", id, "Computer change committed but its post-change read is unavailable")
 }
 
 func appliedResourceReadError(err error, resource, id, message string) error {

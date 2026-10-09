@@ -1438,7 +1438,12 @@ func (s *Server) abortComputerReconfiguration(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) listComputerStorageGenerations(w http.ResponseWriter, r *http.Request) {
-	generations, err := s.store.ListComputerStorageGenerations(r.Context(), r.PathValue("computer_id"))
+	limit, err := parseComputerListingLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	generations, err := s.store.ListComputerStorageGenerationsPage(r.Context(), r.PathValue("computer_id"), r.URL.Query().Get("cursor"), limit)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1447,7 +1452,7 @@ func (s *Server) listComputerStorageGenerations(w http.ResponseWriter, r *http.R
 }
 
 func (s *Server) listComputerStorageProvenance(w http.ResponseWriter, r *http.Request) {
-	limit, err := parseJobListingLimit(r.URL.Query().Get("limit"))
+	limit, err := parseComputerListingLimit(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1493,7 +1498,7 @@ func (s *Server) createComputerBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listComputerBackups(w http.ResponseWriter, r *http.Request) {
-	limit, err := parseJobListingLimit(r.URL.Query().Get("limit"))
+	limit, err := parseComputerListingLimit(r.URL.Query().Get("limit"))
 	if err != nil {
 		writeError(w, err)
 		return
@@ -1616,7 +1621,12 @@ func (s *Server) exportComputerBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listComputerCustodyExports(w http.ResponseWriter, r *http.Request) {
-	exports, err := s.store.ListComputerCustodyExports(r.Context(), r.PathValue("computer_id"))
+	limit, err := parseComputerListingLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	exports, err := s.store.ListComputerCustodyExportsPage(r.Context(), r.PathValue("computer_id"), r.URL.Query().Get("cursor"), limit)
 	if err != nil {
 		writeError(w, err)
 		return

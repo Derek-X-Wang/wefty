@@ -226,6 +226,8 @@ var driftRows = []driftRow{
 	{requestBody(clientDoc, "post", "/v1/custody-exports/{export_id}/import"), typeOf[l1.ComputerCustodyImportRequest]()},
 	{requestBody(clientDoc, "post", "/v1/computers/{computer_id}/projections"), typeOf[l1.ComputerProjectionRequest]()},
 	{requestBody(clientDoc, "post", "/v1/computers/{computer_id}/remove"), typeOf[l1.ComputerRemoveRequest]()},
+	{responseBody(clientDoc, "get", "/v1/computers/{computer_id}/custody-exports", "200"), typeOf[l1.ComputerCustodyExportList]()},
+	{responseBody(clientDoc, "get", "/v1/computers/{computer_id}/storage-generations", "200"), typeOf[l1.ComputerStorageGenerationList]()},
 	{responseBody(clientDoc, "get", "/v1/nodes", "200"), typeOf[l1.NodeList]()},
 	{responseBody(clientDoc, "get", "/v1/nodes/{node_id}", "200"), typeOf[l1.Node]()},
 	{requestBody(clientDoc, "post", "/v1/nodes/{node_id}/drain"), typeOf[l1.NodeIntentRequest]()},

@@ -644,7 +644,7 @@ func (r *databaseReads) computerViewListComputersForCaller(ctx context.Context, 
 		return ComputerList{}, protocolError(contract.ErrorInvalidRequest,
 			"limit must be between 1 and %d", MaxJobPageLimit)
 	}
-	limit = min(limit, MaxJobListingPageLimit)
+	limit = min(limit, MaxComputerListingPageLimit)
 	cursor, err := decodeComputerCursor(cursorValue)
 	if err != nil {
 		return ComputerList{}, err

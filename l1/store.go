@@ -1452,7 +1452,25 @@ CREATE INDEX IF NOT EXISTS backups_computer_status
  CREATE TRIGGER IF NOT EXISTS provenance_listing_insert AFTER INSERT ON storage_provenance
   BEGIN INSERT INTO provenance_listing_order(provenance_id) VALUES(NEW.provenance_id); END;
  INSERT INTO provenance_listing_order(provenance_id) SELECT provenance_id FROM storage_provenance
-  WHERE provenance_id NOT IN (SELECT provenance_id FROM provenance_listing_order) ORDER BY created_ns, provenance_id;`); err != nil {
+  WHERE provenance_id NOT IN (SELECT provenance_id FROM provenance_listing_order) ORDER BY created_ns, provenance_id;
+ CREATE TABLE IF NOT EXISTS generation_listing_order (
+  ordinal INTEGER PRIMARY KEY AUTOINCREMENT, computer_id TEXT NOT NULL, storage_generation INTEGER NOT NULL,
+  UNIQUE(computer_id, storage_generation),
+  FOREIGN KEY(computer_id, storage_generation) REFERENCES computer_storage_generations(computer_id, storage_generation) ON DELETE CASCADE
+ );
+ CREATE TRIGGER IF NOT EXISTS generation_listing_insert AFTER INSERT ON computer_storage_generations
+  BEGIN INSERT INTO generation_listing_order(computer_id,storage_generation) VALUES(NEW.computer_id,NEW.storage_generation); END;
+ INSERT INTO generation_listing_order(computer_id,storage_generation) SELECT computer_id,storage_generation FROM computer_storage_generations g
+  WHERE NOT EXISTS(SELECT 1 FROM generation_listing_order o WHERE o.computer_id=g.computer_id AND o.storage_generation=g.storage_generation)
+  ORDER BY computer_id,storage_generation;
+ CREATE TABLE IF NOT EXISTS custody_export_listing_order (
+  ordinal INTEGER PRIMARY KEY AUTOINCREMENT, export_id TEXT NOT NULL UNIQUE REFERENCES computer_custody_exports(export_id) ON DELETE CASCADE
+ );
+ CREATE TRIGGER IF NOT EXISTS custody_export_listing_insert AFTER INSERT ON computer_custody_exports
+  BEGIN INSERT INTO custody_export_listing_order(export_id) VALUES(NEW.export_id); END;
+ INSERT INTO custody_export_listing_order(export_id) SELECT export_id FROM computer_custody_exports
+  WHERE export_id NOT IN (SELECT export_id FROM custody_export_listing_order) ORDER BY requested_ns,export_id;
+ CREATE INDEX IF NOT EXISTS custody_export_listing_key ON computer_custody_exports(computer_id,requested_ns,export_id);`); err != nil {
 		return fmt.Errorf("l1: ensure Storage provenance indexes: %w", err)
 	}
 	for _, column := range []struct{ name, definition string }{

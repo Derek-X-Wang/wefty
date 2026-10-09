@@ -693,10 +693,20 @@ func (c *apiClients) exportComputerBackup(ctx context.Context, computerID, backu
 }
 
 func (c *apiClients) listComputerCustodyExports(ctx context.Context, computerID string) ([]l1.ComputerCustodyExport, error) {
-	var exports []l1.ComputerCustodyExport
-	path := "/v1/computers/" + url.PathEscape(computerID) + "/custody-exports"
-	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &exports, http.StatusOK)
-	return exports, err
+	exports := []l1.ComputerCustodyExport{}
+	cursor := ""
+	for {
+		var page l1.ComputerCustodyExportList
+		path := "/v1/computers/" + url.PathEscape(computerID) + "/custody-exports?limit=250&cursor=" + url.QueryEscape(cursor)
+		if err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &page, http.StatusOK); err != nil {
+			return nil, err
+		}
+		exports = append(exports, page.Exports...)
+		if page.NextCursor == "" {
+			return exports, nil
+		}
+		cursor = page.NextCursor
+	}
 }
 
 func (c *apiClients) attestComputerCustodyDeleted(ctx context.Context, exportID string, request l1.ComputerCustodyAttestationRequest) (l1.ComputerCustodyExport, bool, error) {

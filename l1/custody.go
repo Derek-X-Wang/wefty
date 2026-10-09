@@ -278,41 +278,65 @@ func (s *Store) ListNodeComputerCustodyExportDirectives(ctx context.Context, ide
 	return directives, rows.Err()
 }
 
+type ComputerCustodyExportList struct {
+	Exports    []ComputerCustodyExport `json:"custody_exports"`
+	NextCursor string                  `json:"next_cursor,omitempty"`
+}
+
+// ListComputerCustodyExports walks separate page snapshots for internal inventory callers.
 func (s *Store) ListComputerCustodyExports(ctx context.Context, computerID string) ([]ComputerCustodyExport, error) {
-	var value []ComputerCustodyExport
+	result := []ComputerCustodyExport{}
+	cursor := ""
+	for {
+		page, err := s.ListComputerCustodyExportsPage(ctx, computerID, cursor, DefaultJobPageLimit)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, page.Exports...)
+		if page.NextCursor == "" {
+			return result, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func (s *Store) ListComputerCustodyExportsPage(ctx context.Context, computerID, cursor string, limit int) (ComputerCustodyExportList, error) {
+	var value ComputerCustodyExportList
 	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
 		var err error
-		value, err = reads.computerViewListComputerCustodyExports(ctx, computerID)
+		value, err = reads.computerViewListComputerCustodyExports(ctx, computerID, cursor, limit)
 		return err
 	})
 	return value, err
 }
 
-func (r *databaseReads) computerViewListComputerCustodyExports(ctx context.Context, computerID string) ([]ComputerCustodyExport, error) {
-	if strings.TrimSpace(computerID) == "" {
-		return nil, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
-	}
-	var exists int
-	if err := r.q.QueryRowContext(ctx, `SELECT 1 FROM computers WHERE computer_id=?`, computerID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
-		return nil, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
-	} else if err != nil {
-		return nil, internalError(err, "read Custody export Computer")
+func (r *databaseReads) computerViewListComputerCustodyExports(ctx context.Context, computerID, value string, limit int) (ComputerCustodyExportList, error) {
+	cursor, limit, err := r.computerLifetimeCursor(ctx, "exports", computerID, value, limit)
+	if err != nil {
+		return ComputerCustodyExportList{}, err
 	}
 	rows, err := r.q.QueryContext(ctx, `SELECT `+custodyExportColumns+` FROM computer_custody_exports
-		WHERE computer_id=? ORDER BY requested_ns, export_id`, computerID)
+ WHERE computer_id=? AND EXISTS(SELECT 1 FROM custody_export_listing_order o WHERE o.export_id=computer_custody_exports.export_id AND o.ordinal<=?)
+ AND (requested_ns,export_id)>(?,?) ORDER BY requested_ns,export_id LIMIT ?`, computerID, cursor.HighWater, cursor.CreatedNS, cursor.ID, limit+1)
 	if err != nil {
-		return nil, internalError(err, "list Custody exports")
+		return ComputerCustodyExportList{}, internalError(err, "list Custody exports")
 	}
 	defer rows.Close()
-	exports := []ComputerCustodyExport{}
+	result := ComputerCustodyExportList{Exports: []ComputerCustodyExport{}}
 	for rows.Next() {
+		if len(result.Exports) == limit || (len(result.Exports) > 0 && r.pageCutoffReached()) {
+			result.NextCursor = encodeComputerLifetimeCursor(cursor)
+			break
+		}
 		export, err := scanCustodyExport(rows)
 		if err != nil {
-			return nil, internalError(err, "scan Custody export")
+			return ComputerCustodyExportList{}, internalError(err, "scan Custody export")
 		}
-		exports = append(exports, export)
+		result.Exports = append(result.Exports, export)
+		cursor.CreatedNS = export.RequestedAt.UnixNano()
+		cursor.ID = export.ExportID
 	}
-	return exports, rows.Err()
+	return result, rows.Err()
 }
 
 func validateCustodyExportReceipt(export ComputerCustodyExportDirective, receipt ComputerCustodyExportReceipt) error {

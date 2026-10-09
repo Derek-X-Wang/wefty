@@ -211,8 +211,8 @@ func TestFailedWaitsExitFiveFromTheRealBinary(t *testing.T) {
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(l1.ComputerCustodyExport{ExportID: "export-1", ComputerID: computerID, BackupID: "backup-1", Status: "planned"})
 		case r.Method == http.MethodGet && r.URL.Path == base+"/custody-exports":
-			_ = json.NewEncoder(w).Encode([]l1.ComputerCustodyExport{{ExportID: "export-1", ComputerID: computerID,
-				BackupID: "backup-1", Status: exportStatus, FailureCode: contract.CustodyExportPathUnconfined, CompletedAt: &now}})
+			_ = json.NewEncoder(w).Encode(l1.ComputerCustodyExportList{Exports: []l1.ComputerCustodyExport{{ExportID: "export-1", ComputerID: computerID,
+				BackupID: "backup-1", Status: exportStatus, FailureCode: contract.CustodyExportPathUnconfined, CompletedAt: &now}}})
 		case r.Method == http.MethodGet && r.URL.Path == base+"/storage-provenance":
 			_ = json.NewEncoder(w).Encode(l1.ComputerStorageProvenance{})
 		default:

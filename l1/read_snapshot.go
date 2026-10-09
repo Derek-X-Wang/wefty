@@ -40,14 +40,14 @@ type readModel interface {
 	computerViewListComputersForCaller(ctx context.Context, cursorValue string, limit int, actor *computerActionActor) (ComputerList, error)
 	computerViewListComputerIntents(ctx context.Context, computerID, cursorValue string, limit int) (ComputerIntentList, error)
 	computerViewGetComputer(ctx context.Context, computerID string) (Computer, error)
-	computerViewListComputerCustodyExports(ctx context.Context, computerID string) ([]ComputerCustodyExport, error)
+	computerViewListComputerCustodyExports(ctx context.Context, computerID, cursor string, limit int) (ComputerCustodyExportList, error)
 	computerViewGetComputerCustodyImport(ctx context.Context, importID string) (ComputerCustodyImportObservation, error)
 	computerViewComputerCloneOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerCloneOperation, error)
 	computerViewComputerRestoreOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerRestoreOperation, error)
 	computerViewComputerRestoreOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerRestoreOperation, error)
 	computerViewGetComputerWithCloneOperation(ctx context.Context, computerID string, operationRevision int64) (Computer, error)
 	computerViewComputerCloneOperationForKey(ctx context.Context, backupID, idempotencyKey string) (ComputerCloneOperation, error)
-	computerViewListComputerStorageGenerations(ctx context.Context, computerID string) (ComputerStorageGenerationList, error)
+	computerViewListComputerStorageGenerations(ctx context.Context, computerID, cursor string, limit int) (ComputerStorageGenerationList, error)
 	computerProvenancePage(context.Context, string, string, int) (ComputerStorageProvenance, error)
 	now() time.Time
 	caller() *serviceActionActor
