@@ -450,21 +450,32 @@ func readComputerGrantReplay(ctx context.Context, q queryer, computerID, idempot
 }
 
 func (s *Store) ListComputerGrants(ctx context.Context, identity fabric.Identity, computerID string) (ComputerGrantList, error) {
-	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
+	var value ComputerGrantList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerGrants(ctx, identity, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerGrants(ctx context.Context, identity fabric.Identity, computerID string) (ComputerGrantList, error) {
+	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerGrantList{}, err
 	}
 	var result ComputerGrantList
-	if err := s.db.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&result.PolicyRevision); err != nil {
+	if err := r.q.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&result.PolicyRevision); err != nil {
 		return ComputerGrantList{}, internalError(err, "read Computer grant list revision")
 	}
+	observeRead(ctx, "computer_grants_revision")
 	var exists bool
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM computers WHERE computer_id=? AND desired_state<>'removed')`, computerID).Scan(&exists); err != nil {
+	if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM computers WHERE computer_id=? AND desired_state<>'removed')`, computerID).Scan(&exists); err != nil {
 		return ComputerGrantList{}, internalError(err, "read Computer grant list target")
 	}
 	if !exists {
 		return ComputerGrantList{}, protocolError(contract.ErrorNotFound, "Computer %q not found", computerID)
 	}
-	grants, err := listComputerGrants(ctx, s.db, computerID)
+	grants, err := listComputerGrants(ctx, r.q, computerID)
 	if err != nil {
 		return ComputerGrantList{}, internalError(err, "list Computer grants")
 	}
@@ -472,32 +483,33 @@ func (s *Store) ListComputerGrants(ctx context.Context, identity fabric.Identity
 	return result, nil
 }
 
-func (s *Store) GetComputerTakeoverAvailability(
-	ctx context.Context,
-	identity fabric.Identity,
-	computerID string,
-) (ComputerTakeoverAvailability, error) {
+func (s *Store) GetComputerTakeoverAvailability(ctx context.Context, identity fabric.Identity, computerID string) (ComputerTakeoverAvailability, error) {
+	var value ComputerTakeoverAvailability
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewGetComputerTakeoverAvailability(ctx, identity, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewGetComputerTakeoverAvailability(ctx context.Context, identity fabric.Identity, computerID string) (ComputerTakeoverAvailability, error) {
 	if err := validatePersonIdentity(identity); err != nil {
 		return ComputerTakeoverAvailability{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return ComputerTakeoverAvailability{}, internalError(err, "begin Computer take-over availability read")
-	}
-	defer tx.Rollback()
 	access := ComputerTakeoverAvailability{ComputerID: computerID, UserID: identity.UserID,
 		DeviceID: identity.DeviceID, DisplayName: identity.DisplayName}
-	if err := tx.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&access.PolicyRevision); err != nil {
+	if err := r.q.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&access.PolicyRevision); err != nil {
 		return ComputerTakeoverAvailability{}, internalError(err, "read Computer take-over policy revision")
 	}
 	var administrator bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
+	if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
 		identity.FabricID, identity.UserID).Scan(&administrator); err != nil {
 		return ComputerTakeoverAvailability{}, internalError(err, "read Computer administrator access")
 	}
 	if !administrator {
 		var permission ComputerGrantPermission
-		if err := tx.QueryRowContext(ctx, `SELECT permission FROM computer_grants
+		if err := r.q.QueryRowContext(ctx, `SELECT permission FROM computer_grants
 			WHERE computer_id=? AND fabric_id=? AND user_id=?`, computerID, identity.FabricID, identity.UserID).
 			Scan(&permission); errors.Is(err, sql.ErrNoRows) {
 			return ComputerTakeoverAvailability{}, protocolError(contract.ErrorForbidden, "person %q has no Computer access", identity.UserID)
@@ -510,7 +522,7 @@ func (s *Store) GetComputerTakeoverAvailability(
 	}
 	// Authorization precedes existence/endpoint discovery to avoid an oracle.
 	var endpoint sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT computers.name, service_jobs.display_endpoint FROM computers
+	if err := r.q.QueryRowContext(ctx, `SELECT computers.name, service_jobs.display_endpoint FROM computers
 		JOIN service_jobs ON service_jobs.job_id=computers.current_job_id
 		WHERE computers.computer_id=? AND computers.desired_state<>'removed'`, computerID).
 		Scan(&access.FriendlyName, &endpoint); errors.Is(err, sql.ErrNoRows) {
@@ -521,28 +533,25 @@ func (s *Store) GetComputerTakeoverAvailability(
 	if endpoint.Valid {
 		access.DisplayEndpoint = &endpoint.String
 	}
-	if err := tx.Commit(); err != nil {
-		return ComputerTakeoverAvailability{}, internalError(err, "commit Computer take-over availability read")
-	}
 	return access, nil
 }
 
-func (s *Store) ResolvePersonComputerHandle(
-	ctx context.Context,
-	identity fabric.Identity,
-	handle string,
-	administratorRequired bool,
-) (ComputerHandleResolution, error) {
+func (s *Store) ResolvePersonComputerHandle(ctx context.Context, identity fabric.Identity, handle string, administratorRequired bool) (ComputerHandleResolution, error) {
+	var value ComputerHandleResolution
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewResolvePersonComputerHandle(ctx, identity, handle, administratorRequired)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewResolvePersonComputerHandle(ctx context.Context, identity fabric.Identity, handle string, administratorRequired bool) (ComputerHandleResolution, error) {
 	if err := validatePersonIdentity(identity); err != nil {
 		return ComputerHandleResolution{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return ComputerHandleResolution{}, internalError(err, "begin Computer handle resolution")
-	}
-	defer tx.Rollback()
 	var administrator bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
+	if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
 		identity.FabricID, identity.UserID).Scan(&administrator); err != nil {
 		return ComputerHandleResolution{}, internalError(err, "read Computer handle administrator access")
 	}
@@ -554,7 +563,7 @@ func (s *Store) ResolvePersonComputerHandle(
 	var currentJobID string
 	// Durable IDs continue to address retained take-over evidence after removal;
 	// the reusable friendly name is only actionable for a live Computer.
-	err = tx.QueryRowContext(ctx, `SELECT computer_id, name, current_job_id FROM computers
+	err := r.q.QueryRowContext(ctx, `SELECT computer_id, name, current_job_id FROM computers
 		WHERE computer_id=? OR current_job_id=? OR (name=? AND desired_state<>'removed')
 		ORDER BY CASE WHEN computer_id=? THEN 0 WHEN current_job_id=? THEN 1 ELSE 2 END LIMIT 1`,
 		handle, handle, handle, handle, handle).Scan(&result.ComputerID, &result.FriendlyName, &currentJobID)
@@ -570,7 +579,7 @@ func (s *Store) ResolvePersonComputerHandle(
 	}
 	if !administrator {
 		var permission ComputerGrantPermission
-		if err := tx.QueryRowContext(ctx, `SELECT permission FROM computer_grants
+		if err := r.q.QueryRowContext(ctx, `SELECT permission FROM computer_grants
 			WHERE computer_id=? AND fabric_id=? AND user_id=?`, result.ComputerID, identity.FabricID, identity.UserID).
 			Scan(&permission); errors.Is(err, sql.ErrNoRows) {
 			return ComputerHandleResolution{}, protocolError(contract.ErrorForbidden,
@@ -590,9 +599,6 @@ func (s *Store) ResolvePersonComputerHandle(
 		result.MatchedBy = "current_job_id"
 	default:
 		result.MatchedBy = "friendly_name"
-	}
-	if err := tx.Commit(); err != nil {
-		return ComputerHandleResolution{}, internalError(err, "commit Computer handle resolution")
 	}
 	return result, nil
 }
@@ -641,7 +647,17 @@ func decodeComputerPolicyAuditCursor(value string) (int64, string, string, strin
 }
 
 func (s *Store) ListComputerPolicyAudit(ctx context.Context, identity fabric.Identity, computerID, cursor string, limit int) (ComputerPolicyAuditList, error) {
-	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
+	var value ComputerPolicyAuditList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerPolicyAudit(ctx, identity, computerID, cursor, limit)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerPolicyAudit(ctx context.Context, identity fabric.Identity, computerID, cursor string, limit int) (ComputerPolicyAuditList, error) {
+	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerPolicyAuditList{}, err
 	}
 	if limit < 1 || limit > MaxJobPageLimit {
@@ -654,7 +670,7 @@ func (s *Store) ListComputerPolicyAudit(ctx context.Context, identity fabric.Ide
 	if cursorComputer != "" && cursorComputer != computerID {
 		return ComputerPolicyAuditList{}, protocolError(contract.ErrorInvalidRequest, "cursor is for another Computer")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT policy_revision, computer_id, operation, actor_kind,
+	rows, err := r.q.QueryContext(ctx, `SELECT policy_revision, computer_id, operation, actor_kind,
 		actor_fabric_id, actor_user_id, actor_device_id, subject_fabric_id, subject_user_id,
 		previous_permission, permission, idempotency_key, created_ns
 		FROM computer_policy_audit WHERE computer_id=? AND
@@ -960,17 +976,27 @@ func readComputerPolicyRevocation(ctx context.Context, q queryer, revision int64
 }
 
 func (s *Store) GetComputerPolicyRevocation(ctx context.Context, identity fabric.Identity, revision int64, computerID, fabricID, userID string) (ComputerPolicyRevocation, error) {
-	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
+	var value ComputerPolicyRevocation
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewGetComputerPolicyRevocation(ctx, identity, revision, computerID, fabricID, userID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewGetComputerPolicyRevocation(ctx context.Context, identity fabric.Identity, revision int64, computerID, fabricID, userID string) (ComputerPolicyRevocation, error) {
+	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerPolicyRevocation{}, err
 	}
-	revocation, err := readComputerPolicyRevocation(ctx, s.db, revision, computerID, fabricID, userID)
+	revocation, err := readComputerPolicyRevocation(ctx, r.q, revision, computerID, fabricID, userID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ComputerPolicyRevocation{}, protocolError(contract.ErrorNotFound, "Computer policy revocation not found")
 	}
 	if err != nil {
 		return ComputerPolicyRevocation{}, internalError(err, "read Computer policy revocation")
 	}
-	completed, err := s.computerPolicyRevisionInstalled(ctx, revision, computerID)
+	completed, err := r.computerViewComputerPolicyRevisionInstalled(ctx, revision, computerID)
 	if err != nil {
 		return ComputerPolicyRevocation{}, err
 	}
@@ -981,11 +1007,21 @@ func (s *Store) GetComputerPolicyRevocation(ctx context.Context, identity fabric
 }
 
 func (s *Store) computerPolicyRevisionInstalled(ctx context.Context, revision int64, computerID string) (bool, error) {
+	var value bool
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewComputerPolicyRevisionInstalled(ctx, revision, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewComputerPolicyRevisionInstalled(ctx context.Context, revision int64, computerID string) (bool, error) {
 	var generation int64
-	if err := s.db.QueryRowContext(ctx, `SELECT authority_generation FROM admin_policy WHERE singleton=1`).Scan(&generation); err != nil {
+	if err := r.q.QueryRowContext(ctx, `SELECT authority_generation FROM admin_policy WHERE singleton=1`).Scan(&generation); err != nil {
 		return false, internalError(err, "read revocation policy generation")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT COALESCE(NULLIF(bound_node_id, ''), placement_node_id)
+	rows, err := r.q.QueryContext(ctx, `SELECT DISTINCT COALESCE(NULLIF(bound_node_id, ''), placement_node_id)
 		FROM computers WHERE desired_state<>'removed' AND (?='' OR computer_id=?)`, computerID, computerID)
 	if err != nil {
 		return false, internalError(err, "list revocation nodes")
@@ -1006,7 +1042,7 @@ func (s *Store) computerPolicyRevisionInstalled(ctx context.Context, revision in
 	}
 	for _, nodeID := range nodes {
 		var installed, olderBootStillLeased bool
-		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(
 			SELECT 1 FROM nodes n JOIN computer_policy_installations i
 			ON i.node_id=n.node_id AND i.boot_session_id=n.boot_session_id
 			WHERE n.node_id=? AND i.policy_generation=? AND i.policy_revision>=?
@@ -1016,7 +1052,7 @@ func (s *Store) computerPolicyRevisionInstalled(ctx context.Context, revision in
 		if !installed {
 			return false, nil
 		}
-		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(
 			SELECT 1 FROM nodes n JOIN computer_policy_issued issued ON issued.node_id=n.node_id
 			WHERE n.node_id=? AND issued.boot_session_id<>n.boot_session_id
 			AND issued.expires_ns>? AND issued.policy_revision<? AND NOT EXISTS(
@@ -1026,7 +1062,7 @@ func (s *Store) computerPolicyRevisionInstalled(ctx context.Context, revision in
 				AND installed.policy_generation=issued.policy_generation
 				AND installed.policy_revision>=?
 			)
-		)`, nodeID, canonicalTime(s.clock.Now()).UnixNano(), revision, revision).Scan(&olderBootStillLeased); err != nil {
+		)`, nodeID, r.now().UnixNano(), revision, revision).Scan(&olderBootStillLeased); err != nil {
 			return false, internalError(err, "read replaced-boot Computer policy lease")
 		}
 		if olderBootStillLeased {

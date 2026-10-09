@@ -278,16 +278,26 @@ func (s *Store) ListNodeComputerCustodyExportDirectives(ctx context.Context, ide
 }
 
 func (s *Store) ListComputerCustodyExports(ctx context.Context, computerID string) ([]ComputerCustodyExport, error) {
+	var value []ComputerCustodyExport
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerCustodyExports(ctx, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerCustodyExports(ctx context.Context, computerID string) ([]ComputerCustodyExport, error) {
 	if strings.TrimSpace(computerID) == "" {
 		return nil, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
 	}
 	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM computers WHERE computer_id=?`, computerID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+	if err := r.q.QueryRowContext(ctx, `SELECT 1 FROM computers WHERE computer_id=?`, computerID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 		return nil, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	} else if err != nil {
 		return nil, internalError(err, "read Custody export Computer")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+custodyExportColumns+` FROM computer_custody_exports
+	rows, err := r.q.QueryContext(ctx, `SELECT `+custodyExportColumns+` FROM computer_custody_exports
 		WHERE computer_id=? ORDER BY requested_ns, export_id`, computerID)
 	if err != nil {
 		return nil, internalError(err, "list Custody exports")
@@ -688,13 +698,23 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 }
 
 func (s *Store) GetComputerCustodyImport(ctx context.Context, importID string) (ComputerCustodyImportObservation, error) {
+	var value ComputerCustodyImportObservation
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewGetComputerCustodyImport(ctx, importID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewGetComputerCustodyImport(ctx context.Context, importID string) (ComputerCustodyImportObservation, error) {
 	if strings.TrimSpace(importID) == "" {
 		return ComputerCustodyImportObservation{}, protocolError(contract.ErrorInvalidRequest, "import_id is required")
 	}
 	var observation ComputerCustodyImportObservation
 	var completed sql.NullInt64
 	var outcomeJSON []byte
-	err := s.db.QueryRowContext(ctx, `SELECT destination_computer_id, operation_revision, status, failure_code,
+	err := r.q.QueryRowContext(ctx, `SELECT destination_computer_id, operation_revision, status, failure_code,
 		preparation_outcome_json, completed_ns FROM computer_storage_copy_operations
 		WHERE destination_computer_id=? AND operation='import' ORDER BY operation_revision DESC LIMIT 1`, importID).
 		Scan(&observation.ImportID, &observation.OperationRevision, &observation.Status,

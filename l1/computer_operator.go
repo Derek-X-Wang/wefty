@@ -2,8 +2,6 @@ package l1
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"net/http"
 	"time"
 
@@ -221,12 +219,53 @@ func computerBackupChoiceWithReads(ctx context.Context, tx readModel, computer C
 // One projection for every route returning a Computer, including nested agent
 // acknowledgement responses. No read grants authority or changes intent.
 func (s *Server) projectComputerForCaller(r *http.Request, computer Computer) (Computer, error) {
-	tx, err := s.store.db.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return Computer{}, internalError(err, "begin Computer operator read")
+	return s.projectComputerForCallerWithSelection(r, computer, nil)
+}
+
+// Named-operation selectors and the returned Computer share a single door.
+// Selection may capture immutable header fields; it must use these reads.
+func (s *Server) projectComputerForCallerWithSelection(r *http.Request, computer Computer, selectOperation func(context.Context, readModel) error) (Computer, error) {
+	var projection Computer
+	err := s.store.withReadSnapshot(r.Context(), nil, func(ctx context.Context, reads readModel) error {
+		if selectOperation != nil {
+			if err := selectOperation(ctx, reads); err != nil {
+				return err
+			}
+		}
+		var err error
+		projection, err = projectComputerResponse(ctx, reads, computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
+		return err
+	})
+	return projection, err
+}
+
+// Reload authority and named operation observations after a commit. The write's
+// row is only a selector, never combined with facts from a later moment.
+func projectComputerResponse(ctx context.Context, reads readModel, selected Computer, actor computerActionActor) (Computer, error) {
+	// Failed provisional imports retain their existing empty acknowledgement;
+	// there is no surviving authority to reload or mix with later observations.
+	if selected.ComputerID == "" {
+		return projectComputerForCallerTx(ctx, reads, Computer{}, actor)
 	}
-	defer tx.Rollback()
-	return projectComputerForCallerTx(r.Context(), transactionReads(tx, canonicalTime(s.store.clock.Now())), computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
+	computer, err := reads.computerViewGetComputer(ctx, selected.ComputerID)
+	if err != nil {
+		return Computer{}, err
+	}
+	if selected.CloneOperation != nil {
+		op, err := reads.computerViewComputerCloneOperation(ctx, computer.ComputerID, selected.CloneOperation.OperationRevision)
+		if err != nil {
+			return Computer{}, err
+		}
+		computer.CloneOperation = &op
+	}
+	if selected.RestoreOperation != nil {
+		op, err := reads.computerViewComputerRestoreOperation(ctx, computer.ComputerID, selected.RestoreOperation.OperationRevision)
+		if err != nil {
+			return Computer{}, err
+		}
+		computer.RestoreOperation = &op
+	}
+	return projectComputerForCallerTx(ctx, reads, computer, actor)
 }
 
 func projectComputerForCallerTx(ctx context.Context, tx readModel, computer Computer, actor computerActionActor) (Computer, error) {
@@ -242,7 +281,7 @@ func projectComputerForCallerTx(ctx context.Context, tx readModel, computer Comp
 func (s *Server) writeComputerForCaller(w http.ResponseWriter, r *http.Request, status int, computer Computer) {
 	projection, err := s.projectComputerForCaller(r, computer)
 	if err != nil {
-		writeError(w, err)
+		writeError(w, appliedComputerReadError(err, computer.ComputerID))
 		return
 	}
 	writeJSON(w, status, projection)
@@ -291,36 +330,14 @@ func computerLastCondition(ctx context.Context, tx readModel, computer Computer)
 }
 
 func (s *Server) getComputerForCaller(r *http.Request, cloneRevision, restoreRevision int64) (Computer, error) {
-	tx, err := s.store.db.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return Computer{}, internalError(err, "begin Computer detail snapshot")
-	}
-	defer tx.Rollback()
-	now := canonicalTime(s.store.clock.Now())
-	computer, err := readComputerAuthority(r.Context(), tx, r.PathValue("computer_id"), now)
-	if errors.Is(err, sql.ErrNoRows) {
-		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", r.PathValue("computer_id"))
-	}
-	if err != nil {
-		return Computer{}, internalError(err, "read Computer detail")
-	}
+	selected := Computer{ComputerID: r.PathValue("computer_id")}
 	if cloneRevision > 0 {
-		operation, err := readComputerCloneOperation(r.Context(), tx, computer.ComputerID, cloneRevision)
-		if err != nil {
-			return Computer{}, err
-		}
-		computer.CloneOperation = &operation
+		selected.CloneOperation = &ComputerCloneOperation{OperationRevision: cloneRevision}
 	}
 	if restoreRevision > 0 {
-		// The public operation reader supplies the same selection validation. Its
-		// implementation below also serves this snapshot's query source.
-		operation, err := readComputerRestoreOperation(r.Context(), tx, computer.ComputerID, restoreRevision)
-		if err != nil {
-			return Computer{}, err
-		}
-		computer.RestoreOperation = &operation
+		selected.RestoreOperation = &ComputerRestoreOperation{OperationRevision: restoreRevision}
 	}
-	return projectComputerForCallerTx(r.Context(), transactionReads(tx, now), computer, computerActionActor{Identity: identityFromRequest(r), ClientPrincipalTag: s.clientPrincipalTag})
+	return s.projectComputerForCaller(r, selected)
 }
 
 // HTTP mutations carry the actual authenticated identity and deployment tag
@@ -364,4 +381,17 @@ func (r *databaseReads) backupChoices(ctx context.Context, computerID string) ([
 		return nil, internalError(err, "iterate Computer action Backup choices")
 	}
 	return ids, nil
+}
+
+// A failed post-commit observation must not invite replay as an unapplied write.
+func appliedComputerReadError(err error, id string) error {
+	details := map[string]any{"reason": "read_snapshot_post_change_failed", "mutation_applied": true, "computer_id": id, "read_reason": string(errorCode(err))}
+	retryable := false
+	if api := apiErrorFromDecision(err); api != nil && api.Code == contract.ErrorUnavailable {
+		if reason, ok := api.Details["reason"].(string); ok && (reason == "read_snapshot_admission_expired" || reason == "read_snapshot_expired") {
+			details["read_reason"] = reason
+			retryable = true
+		}
+	}
+	return &Error{Code: contract.ErrorUnavailable, Message: "Computer change committed but its view is unavailable", Details: details, notRetryable: !retryable}
 }

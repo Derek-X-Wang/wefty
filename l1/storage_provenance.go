@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -27,6 +28,8 @@ type ComputerStorageProvenance struct {
 	CustodyExports    []ComputerCustodyExport `json:"custody_exports"`
 }
 
+const maxComputerProvenanceRows = 1000
+
 const computerCustodyGraph = `WITH RECURSIVE custody(storage_id) AS (
 	SELECT ?
 	UNION SELECT p.source_storage_id FROM storage_provenance p
@@ -39,17 +42,35 @@ const computerCustodyGraph = `WITH RECURSIVE custody(storage_id) AS (
 // not infer deletion: external Custody is tainted by a committed export or an
 // import record, while each Computer retains its own removal outcome.
 func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID string) (ComputerStorageProvenance, error) {
-	computer, err := s.GetComputer(ctx, computerID)
+	var value ComputerStorageProvenance
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerStorageProvenance(ctx, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerStorageProvenance(ctx context.Context, computerID string) (ComputerStorageProvenance, error) {
+	computer, err := r.computerViewGetComputer(ctx, computerID)
 	if err != nil {
 		return ComputerStorageProvenance{}, err
+	}
+	graph := strings.Replace(computerCustodyGraph, "\n)", "\n LIMIT 1001\n)", 1)
+	var graphRows int
+	if err := r.q.QueryRowContext(ctx, graph+` SELECT COUNT(*) FROM custody`, computer.StorageID).Scan(&graphRows); err != nil {
+		return ComputerStorageProvenance{}, err
+	}
+	if graphRows > maxComputerProvenanceRows {
+		return ComputerStorageProvenance{}, snapshotUnavailable("read_snapshot_provenance_limit", nil)
 	}
 	projection := ComputerStorageProvenance{ComputerID: computer.ComputerID, StorageID: computer.StorageID,
 		StorageGeneration: computer.StorageGeneration, RemovalOutcome: computer.RemovalOutcome,
 		CustodyForks: []ComputerCustodyBranch{}, Provenance: []StorageProvenance{}, CustodyExports: []ComputerCustodyExport{}}
 
-	rows, err := s.db.QueryContext(ctx, computerCustodyGraph+`
+	rows, err := r.q.QueryContext(ctx, graph+`
 		SELECT c.computer_id, c.storage_id, c.storage_generation, c.removal_outcome
-		FROM computers c JOIN custody ON custody.storage_id=c.storage_id ORDER BY c.created_ns, c.computer_id`, computer.StorageID)
+		FROM computers c JOIN custody ON custody.storage_id=c.storage_id ORDER BY c.created_ns, c.computer_id LIMIT 1001`, computer.StorageID)
 	if err != nil {
 		return ComputerStorageProvenance{}, internalError(err, "list Computer custody forks")
 	}
@@ -62,6 +83,10 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 		}
 		branch.RemovalOutcome = removal.String
 		projection.CustodyForks = append(projection.CustodyForks, branch)
+		if len(projection.CustodyForks) > maxComputerProvenanceRows {
+			rows.Close()
+			return ComputerStorageProvenance{}, snapshotUnavailable("read_snapshot_provenance_limit", nil)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -71,7 +96,7 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 		return ComputerStorageProvenance{}, internalError(err, "close Computer custody forks")
 	}
 
-	rows, err = s.db.QueryContext(ctx, computerCustodyGraph+`
+	rows, err = r.q.QueryContext(ctx, graph+`
 		SELECT p.provenance_id, p.kind, p.source_storage_id, p.source_generation, p.backup_id,
 			p.destination_computer_id, p.destination_storage_id, p.destination_generation, p.created_ns,
 			(SELECT o.verification_receipt_json FROM computer_storage_copy_operations o
@@ -83,7 +108,7 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 		FROM storage_provenance p
 		WHERE p.source_storage_id IN (SELECT storage_id FROM custody)
 			OR p.destination_storage_id IN (SELECT storage_id FROM custody)
-		ORDER BY p.created_ns, p.provenance_id`, computer.StorageID)
+		ORDER BY p.created_ns, p.provenance_id LIMIT 1001`, computer.StorageID)
 	if err != nil {
 		return ComputerStorageProvenance{}, internalError(err, "list Storage provenance")
 	}
@@ -115,6 +140,10 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 			projection.CustodyTainted = true
 		}
 		projection.Provenance = append(projection.Provenance, provenance)
+		if len(projection.Provenance) > maxComputerProvenanceRows {
+			rows.Close()
+			return ComputerStorageProvenance{}, snapshotUnavailable("read_snapshot_provenance_limit", nil)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -124,9 +153,9 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 		return ComputerStorageProvenance{}, internalError(err, "close Storage provenance")
 	}
 
-	rows, err = s.db.QueryContext(ctx, computerCustodyGraph+`
+	rows, err = r.q.QueryContext(ctx, graph+`
 		SELECT `+custodyExportColumns+` FROM computer_custody_exports e
-		JOIN custody ON custody.storage_id=e.source_storage_id ORDER BY e.requested_ns, e.export_id`, computer.StorageID)
+		JOIN custody ON custody.storage_id=e.source_storage_id ORDER BY e.requested_ns, e.export_id LIMIT 1001`, computer.StorageID)
 	if err != nil {
 		return ComputerStorageProvenance{}, internalError(err, "list Storage Custody exports")
 	}
@@ -143,6 +172,10 @@ func (s *Store) ListComputerStorageProvenance(ctx context.Context, computerID st
 			projection.CustodyTainted = true
 		}
 		projection.CustodyExports = append(projection.CustodyExports, exported)
+		if len(projection.CustodyExports) > maxComputerProvenanceRows {
+			rows.Close()
+			return ComputerStorageProvenance{}, snapshotUnavailable("read_snapshot_provenance_limit", nil)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()

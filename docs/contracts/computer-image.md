@@ -63,6 +63,18 @@ and the agent's all-or-nothing screen-door readiness verdict. The ratified
 authority is the agent-computer spec section 7; this document fixes the seam
 that reference images and conformance tooling consume.
 
+Computer client observations follow [the Read model](read-model.md): authority,
+current Job, actions, grant policy revision, Storage/Backup/Custody evidence and
+take-over views each come from one Read snapshot. `current_job.status` uses the
+job view's open vocabulary (`restart-pending`, `unschedulable`, and the other
+computed statuses); the CLI Computer table displays it. Intents of a deleted
+Computer return `not_found`. Post-change Computer views reload after the commit.
+Backup listings accept `cursor` and `limit` (100 by default, clamped to 250),
+returning `next_cursor` under the adaptive page cutoff. Provenance refuses a
+reachable graph or result collection above 1000 rather than truncate custody
+facts. Submission responses label `inflight_count` with
+`inflight_observation="run-ledger"`; the L3 call starts after L1 closes its snapshot.
+
 ## Bring your own desktop
 
 A compatible image brings its own Linux distribution, init, desktop, display

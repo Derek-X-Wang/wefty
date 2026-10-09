@@ -1399,7 +1399,16 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	// The leading ownership columns index all history reads; status and copy
 	// ID additionally bound operator decisions to retained/available records
 	// and avoid sorting copies. Removed copies need an unconditional index.
-	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS backups_computer_status
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS backup_listing_order (
+ ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+ backup_id TEXT NOT NULL UNIQUE REFERENCES backups(backup_id) ON DELETE CASCADE
+);
+CREATE TRIGGER IF NOT EXISTS backup_listing_insert AFTER INSERT ON backups
+ BEGIN INSERT INTO backup_listing_order(backup_id) VALUES(NEW.backup_id); END;
+INSERT INTO backup_listing_order(backup_id) SELECT backup_id FROM backups
+ WHERE backup_id NOT IN (SELECT backup_id FROM backup_listing_order) ORDER BY created_ns, backup_id;
+CREATE INDEX IF NOT EXISTS backups_computer_creation ON backups(computer_id, created_ns, backup_id);
+CREATE INDEX IF NOT EXISTS backups_computer_status
 		ON backups(computer_id, status, backup_id);
 		CREATE INDEX IF NOT EXISTS backup_copies_backup_id
 		ON backup_copies(backup_id, copy_id);`); err != nil {
@@ -1429,7 +1438,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.migrateStorageProvenanceConstraints(ctx); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS storage_provenance_backup_origin
+	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS storage_provenance_source ON storage_provenance(source_storage_id);
+ CREATE INDEX IF NOT EXISTS storage_provenance_target ON storage_provenance(destination_storage_id);
+ CREATE UNIQUE INDEX IF NOT EXISTS storage_provenance_backup_origin
 		ON storage_provenance(backup_id) WHERE kind='backup';
 		DROP INDEX IF EXISTS storage_provenance_destination;
 		CREATE UNIQUE INDEX storage_provenance_destination

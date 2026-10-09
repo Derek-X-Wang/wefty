@@ -51,16 +51,17 @@
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Current Computer submission state.", "content": { "application/json": { "schema": {
             "type": "object", "additionalProperties": false,
-            "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "inflight_count", "policy_revision", "ready"],
+            "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "inflight_count", "inflight_observation", "policy_revision", "ready"],
             "properties": {
               "computer_id": { "type": "string", "minLength": 1 },
               "submit_enabled": { "type": "boolean" },
               "submit_intent_revision": { "type": "integer", "minimum": 0 },
               "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
-              "inflight_count": { "type": "integer", "minimum": 0 },
+              "inflight_count": { "type": "integer", "minimum": 0, "description": "A separate run-ledger observation, made after the L1 Read snapshot closes." },
+              "inflight_observation": { "type": "string", "description": "Always run-ledger. The inflight count is not atomic with the L1 snapshot." },
               "policy_revision": { "type": "integer", "minimum": 1 },
               "ready": { "type": ["boolean", "null"] },
-              "status": { "type": "string" },
+              "status": { "type": "string", "description": "Shared job view computed status, including restart-pending and unschedulable; open vocabulary." },
               "pass_unavailable": { "$ref": "./common.v1.json#/components/schemas/SpawnFailure" }
             }
           } } } },
@@ -94,16 +95,17 @@
             "description": "Canonical narrow state plus whether policy changed and the factual L3 revocation receipt. Idempotent replay is additionally identified by Idempotent-Replay: true.",
             "content": { "application/json": { "schema": {
               "type": "object", "additionalProperties": false,
-              "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "inflight_count", "policy_revision", "ready", "mutation_applied", "revoked"],
+              "required": ["computer_id", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "inflight_count", "inflight_observation", "policy_revision", "ready", "mutation_applied", "revoked"],
               "properties": {
                 "computer_id": { "type": "string", "minLength": 1 },
                 "submit_enabled": { "type": "boolean" },
                 "submit_intent_revision": { "type": "integer", "minimum": 0 },
                 "submit_max_inflight": { "type": "integer", "minimum": 1, "maximum": 1000 },
-                "inflight_count": { "type": ["integer", "null"], "minimum": 0, "description": "Null only when the change applied but the run ledger could not report the count afterwards." },
+                "inflight_count": { "type": ["integer", "null"], "minimum": 0, "description": "A separate run-ledger observation after the L1 snapshot closes. Null when an applied change's count could not be observed." },
+                "inflight_observation": { "type": "string", "description": "Always run-ledger; the count is not part of the L1 Read snapshot." },
                 "policy_revision": { "type": "integer", "minimum": 1 },
                 "ready": { "type": ["boolean", "null"] },
-                "status": { "type": "string" },
+                "status": { "type": "string", "description": "Shared job view computed status, including restart-pending and unschedulable; open vocabulary." },
                 "pass_unavailable": { "$ref": "./common.v1.json#/components/schemas/SpawnFailure" },
                 "mutation_applied": { "type": "boolean" },
                 "revoked": { "oneOf": [{ "$ref": "./common.v1.json#/components/schemas/ComputerTokenRevocationReceipt" }, { "type": "null" }] },
@@ -117,7 +119,7 @@
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },
           "409": { "$ref": "./common.v1.json#/components/responses/Conflict" },
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" },
-          "503": { "description": "Also unavailable, retryable=true, details.reason=identity_unverifiable when Fabric identity lookup fails operationally. run_ledger_unavailable, retryable: this control plane names no run ledger, so nothing was applied.", "headers": { "X-Request-Id": { "$ref": "./common.v1.json#/components/headers/RequestId" } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } } }
+          "503": { "description": "Also unavailable, retryable=true, details.reason=identity_unverifiable when Fabric identity lookup fails operationally. run_ledger_unavailable, retryable: this control plane names no run ledger, so nothing was applied. If a change succeeded but its post-commit Read snapshot cannot be observed, unavailable carries reason=read_snapshot_post_change_failed, mutation_applied=true, computer_id and read_reason; the commit stands and retryable is true only for snapshot availability errors.", "headers": { "X-Request-Id": { "$ref": "./common.v1.json#/components/headers/RequestId" } }, "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ErrorResponse" } } } }
         }
       }
     },
@@ -918,7 +920,7 @@
       "get": {
         "operationId": "listComputers",
         "summary": "List durable Computer authorities and their current Job observations",
-        "description": "Each page is a read-only snapshot including per-caller allowed_actions and the closest last_condition from recorded Computer evidence. Action preconditions use literal request fields. Path choices identify backup_id with in=path and consider only status=available Backup records, excluding pruned and pruning history. Person-only grant, submission and take-over verbs are omitted on this client-principal surface.",
+        "description": "Each page is a read-only snapshot with one pinned clock and shared node facts, capped at 250 projected rows even when limit is higher. The adaptive cutoff may return fewer rows with next_cursor. Current Job status uses the shared job view projector. Each page includes per-caller allowed_actions and the closest last_condition from recorded Computer evidence. Action preconditions use literal request fields. Path choices identify backup_id with in=path and consider only status=available Backup records, excluding pruned and pruning history. Person-only grant, submission and take-over verbs are omitted on this client-principal surface.",
         "parameters": [
           { "name": "cursor", "in": "query", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
@@ -1298,7 +1300,7 @@
       "get": {
         "operationId": "listComputerStorageProvenance",
         "summary": "Project Storage provenance, managed custody forks, external taint, and exact removal outcomes",
-        "description": "Returns durable L1 ledger facts only. A Custody import, or a Custody export that may have placed bytes outside managed custody, keeps custody_tainted true even after operator_attested_deleted; an export the helper refused before touching the destination (managed_root_path, external_path_unconfined, external_root_unmounted, or external_path_crosses_mount) does not taint; each managed branch independently reports removed_reduced versus removed_verified.",
+        "description": "Returns durable L1 ledger facts from one Read snapshot. The recursive query returns at most 1001 Storage identities and each result query at most 1001 rows: the extra row detects overflow above the supported 1000 bound. Overflow returns 503 unavailable with read_snapshot_provenance_limit, never a partial custody-taint answer. The 200 ms snapshot hold limit also bounds elapsed work. A cold Backup page materializes at most 250 Backups and their exact local provenance, without traversing the custody graph. A Custody import, or a Custody export that may have placed bytes outside managed custody, keeps custody_tainted true even after operator_attested_deleted; an export the helper refused before touching the destination (managed_root_path, external_path_unconfined, external_root_unmounted, or external_path_crosses_mount) does not taint; each managed branch independently reports removed_reduced versus removed_verified.",
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Storage provenance and custody graph facts.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/ComputerStorageProvenance" } } } },
@@ -1315,13 +1317,17 @@
       ],
       "get": {
         "operationId": "listComputerBackups",
-        "summary": "List immutable logical Backups and their managed source-node copy",
+        "summary": "Page immutable logical Backups and their managed source-node copy",
+        "description": "One Read snapshot supplies rows, copy state, last_operation and the selected operation. Default limit 100, maximum 250; larger limits are clamped. An elapsed soft cutoff may return fewer rows with next_cursor. A cursor fixes insertion membership even if later Backups share an older creation time; each page observes mutable state anew.",
         "parameters": [
+          { "name": "cursor", "in": "query", "schema": { "type": "string" }, "description": "Opaque stable continuation, bound to this Computer." },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "default": 100 }, "description": "Clamped to 250; the adaptive cutoff may return fewer." },
           { "name": "backup_id", "in": "query", "required": false, "schema": { "type": "string", "minLength": 1 }, "description": "Also return that Backup operation's own observed state as `operation`, so a caller follows the operation it started rather than the latest one. 404 when the Computer has no such operation." }
         ],
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
           "200": { "description": "Backup records with Storage provenance and physical copy lifecycle.", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/BackupList" } } } },
+          "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
           "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" },

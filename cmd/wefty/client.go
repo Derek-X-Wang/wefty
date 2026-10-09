@@ -581,13 +581,27 @@ func (c *apiClients) listComputerBackups(ctx context.Context, computerID string)
 // listComputerBackupsFor additionally reads one Backup operation's own state
 // when backupID is set.
 func (c *apiClients) listComputerBackupsFor(ctx context.Context, computerID, backupID string) (l1.BackupList, error) {
-	var backups l1.BackupList
-	path := "/v1/computers/" + url.PathEscape(computerID) + "/backups"
-	if backupID != "" {
-		path += "?backup_id=" + url.QueryEscape(backupID)
+	result := l1.BackupList{Backups: []l1.Backup{}}
+	cursor := ""
+	for {
+		query := url.Values{}
+		query.Set("cursor", cursor)
+		if backupID != "" {
+			query.Set("backup_id", backupID)
+		}
+		path := "/v1/computers/" + url.PathEscape(computerID) + "/backups?" + query.Encode()
+		var page l1.BackupList
+		if err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &page, http.StatusOK); err != nil {
+			return l1.BackupList{}, err
+		}
+		result.Backups = append(result.Backups, page.Backups...)
+		result.LastOperation = page.LastOperation
+		result.Operation = page.Operation
+		if page.NextCursor == "" {
+			return result, nil
+		}
+		cursor = page.NextCursor
 	}
-	err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &backups, http.StatusOK)
-	return backups, err
 }
 
 func (c *apiClients) listComputerStorageProvenance(ctx context.Context, computerID string) (l1.ComputerStorageProvenance, error) {

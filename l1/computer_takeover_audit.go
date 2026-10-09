@@ -269,20 +269,24 @@ func decodeComputerTakeoverAuditCursor(value, computerID string) (int64, error) 
 	return rowID, nil
 }
 
-func (s *Store) ListComputerTakeoverAudit(
-	ctx context.Context,
-	identity fabric.Identity,
-	computerID, cursor string,
-	limit int,
-	tail bool,
-) (ComputerTakeoverAuditList, error) {
-	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
+func (s *Store) ListComputerTakeoverAudit(ctx context.Context, identity fabric.Identity, computerID, cursor string, limit int, tail bool) (ComputerTakeoverAuditList, error) {
+	var value ComputerTakeoverAuditList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerTakeoverAudit(ctx, identity, computerID, cursor, limit, tail)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerTakeoverAudit(ctx context.Context, identity fabric.Identity, computerID, cursor string, limit int, tail bool) (ComputerTakeoverAuditList, error) {
+	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerTakeoverAuditList{}, err
 	}
 	if limit < 1 || limit > MaxJobPageLimit {
 		return ComputerTakeoverAuditList{}, protocolError(contract.ErrorInvalidRequest, "limit must be between 1 and %d", MaxJobPageLimit)
 	}
-	if _, err := s.GetComputer(ctx, computerID); err != nil {
+	if _, err := r.computerViewGetComputer(ctx, computerID); err != nil {
 		return ComputerTakeoverAuditList{}, err
 	}
 	rowID, err := decodeComputerTakeoverAuditCursor(cursor, computerID)
@@ -293,9 +297,9 @@ func (s *Store) ListComputerTakeoverAudit(
 		if cursor != "" {
 			return ComputerTakeoverAuditList{}, protocolError(contract.ErrorInvalidRequest, "tail does not accept a cursor")
 		}
-		return s.listComputerTakeoverAuditTail(ctx, computerID, limit)
+		return r.computerViewListComputerTakeoverAuditTail(ctx, computerID, limit)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT rowid, event_id, event_kind, computer_id, job_id, attempt_id, session_id,
+	rows, err := r.q.QueryContext(ctx, `SELECT rowid, event_id, event_kind, computer_id, job_id, attempt_id, session_id,
 		fabric_id, user_id, device_id, authorized_role, admitted_mode, policy_revision,
 		authority_generation, occurred_ns, reason, event_count
 		FROM computer_takeover_audit WHERE computer_id=? AND rowid>?
@@ -331,7 +335,17 @@ func (s *Store) ListComputerTakeoverAudit(
 }
 
 func (s *Store) listComputerTakeoverAuditTail(ctx context.Context, computerID string, limit int) (ComputerTakeoverAuditList, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT rowid, event_id, event_kind, computer_id, job_id, attempt_id, session_id,
+	var value ComputerTakeoverAuditList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerTakeoverAuditTail(ctx, computerID, limit)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerTakeoverAuditTail(ctx context.Context, computerID string, limit int) (ComputerTakeoverAuditList, error) {
+	rows, err := r.q.QueryContext(ctx, `SELECT rowid, event_id, event_kind, computer_id, job_id, attempt_id, session_id,
 		fabric_id, user_id, device_id, authorized_role, admitted_mode, policy_revision,
 		authority_generation, occurred_ns, reason, event_count
 		FROM computer_takeover_audit WHERE computer_id=?
@@ -368,19 +382,25 @@ func (s *Store) listComputerTakeoverAuditTail(ctx context.Context, computerID st
 	return page, nil
 }
 
-func (s *Store) ListComputerTakeoverSessions(
-	ctx context.Context,
-	identity fabric.Identity,
-	computerID string,
-) (ComputerTakeoverSessionList, error) {
-	if err := requireCurrentAdmin(ctx, s.db, identity); err != nil {
+func (s *Store) ListComputerTakeoverSessions(ctx context.Context, identity fabric.Identity, computerID string) (ComputerTakeoverSessionList, error) {
+	var value ComputerTakeoverSessionList
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewListComputerTakeoverSessions(ctx, identity, computerID)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewListComputerTakeoverSessions(ctx context.Context, identity fabric.Identity, computerID string) (ComputerTakeoverSessionList, error) {
+	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerTakeoverSessionList{}, err
 	}
-	if _, err := s.GetComputer(ctx, computerID); err != nil {
+	if _, err := r.computerViewGetComputer(ctx, computerID); err != nil {
 		return ComputerTakeoverSessionList{}, err
 	}
-	cutoff := s.clock.Now().Add(-time.Hour).UnixNano()
-	rows, err := s.db.QueryContext(ctx, `SELECT rowid, event_kind, job_id, attempt_id, session_id, fabric_id, user_id,
+	cutoff := r.now().Add(-time.Hour).UnixNano()
+	rows, err := r.q.QueryContext(ctx, `SELECT rowid, event_kind, job_id, attempt_id, session_id, fabric_id, user_id,
 		device_id, authorized_role, admitted_mode, policy_revision, occurred_ns
 		FROM computer_takeover_audit WHERE computer_id=? AND session_id<>'' AND stored_ns>=?
 		ORDER BY rowid`, computerID, cutoff)

@@ -367,8 +367,18 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 // started. The key-to-operation binding is immutable, so a fresh call and any
 // later replay -- even after newer operations exist -- name the same one.
 func (s *Store) ComputerRestoreOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerRestoreOperation, error) {
+	var value ComputerRestoreOperation
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewComputerRestoreOperationForKey(ctx, computerID, idempotencyKey)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewComputerRestoreOperationForKey(ctx context.Context, computerID, idempotencyKey string) (ComputerRestoreOperation, error) {
 	var operationRevision int64
-	err := s.db.QueryRowContext(ctx, `SELECT operation_revision FROM computer_storage_copy_operations
+	err := r.q.QueryRowContext(ctx, `SELECT operation_revision FROM computer_storage_copy_operations
 		WHERE destination_computer_id=? AND idempotency_key=? AND operation='restore'`,
 		computerID, strings.TrimSpace(idempotencyKey)).Scan(&operationRevision)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -377,12 +387,22 @@ func (s *Store) ComputerRestoreOperationForKey(ctx context.Context, computerID, 
 	if err != nil {
 		return ComputerRestoreOperation{}, internalError(err, "read Computer restore operation by key")
 	}
-	return s.ComputerRestoreOperation(ctx, computerID, operationRevision)
+	return r.computerViewComputerRestoreOperation(ctx, computerID, operationRevision)
 }
 
 // ComputerRestoreOperation reads one restore's own observed state.
 func (s *Store) ComputerRestoreOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerRestoreOperation, error) {
-	return readComputerRestoreOperation(ctx, s.db, computerID, operationRevision)
+	var value ComputerRestoreOperation
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewComputerRestoreOperation(ctx, computerID, operationRevision)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewComputerRestoreOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerRestoreOperation, error) {
+	return readComputerRestoreOperation(ctx, r.q, computerID, operationRevision)
 }
 
 func readComputerRestoreOperation(ctx context.Context, q queryer, computerID string, operationRevision int64) (ComputerRestoreOperation, error) {
@@ -410,9 +430,19 @@ func readComputerRestoreOperation(ctx context.Context, q queryer, computerID str
 // immutable, so a fresh call and any later replay name the same destination
 // Computer and revision however many operations followed.
 func (s *Store) ComputerCloneOperationForKey(ctx context.Context, backupID, idempotencyKey string) (ComputerCloneOperation, error) {
+	var value ComputerCloneOperation
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewComputerCloneOperationForKey(ctx, backupID, idempotencyKey)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewComputerCloneOperationForKey(ctx context.Context, backupID, idempotencyKey string) (ComputerCloneOperation, error) {
 	var computerID string
 	var operationRevision int64
-	err := s.db.QueryRowContext(ctx, `SELECT destination_computer_id, operation_revision FROM computer_storage_copy_operations
+	err := r.q.QueryRowContext(ctx, `SELECT destination_computer_id, operation_revision FROM computer_storage_copy_operations
 		WHERE backup_id=? AND idempotency_key=? AND operation='clone'`,
 		strings.TrimSpace(backupID), strings.TrimSpace(idempotencyKey)).Scan(&computerID, &operationRevision)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -421,12 +451,22 @@ func (s *Store) ComputerCloneOperationForKey(ctx context.Context, backupID, idem
 	if err != nil {
 		return ComputerCloneOperation{}, internalError(err, "read Computer clone operation by key")
 	}
-	return s.ComputerCloneOperation(ctx, computerID, operationRevision)
+	return r.computerViewComputerCloneOperation(ctx, computerID, operationRevision)
 }
 
 // ComputerCloneOperation reads one clone's own observed state.
 func (s *Store) ComputerCloneOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerCloneOperation, error) {
-	return readComputerCloneOperation(ctx, s.db, computerID, operationRevision)
+	var value ComputerCloneOperation
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewComputerCloneOperation(ctx, computerID, operationRevision)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewComputerCloneOperation(ctx context.Context, computerID string, operationRevision int64) (ComputerCloneOperation, error) {
+	return readComputerCloneOperation(ctx, r.q, computerID, operationRevision)
 }
 
 // GetComputerWithCloneOperation reads the destination Computer and one clone's
@@ -436,22 +476,27 @@ func (s *Store) ComputerCloneOperation(ctx context.Context, computerID string, o
 // was before that commit -- still `cloning`, with no failure or byte counts
 // to report.
 func (s *Store) GetComputerWithCloneOperation(ctx context.Context, computerID string, operationRevision int64) (Computer, error) {
+	var value Computer
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		var err error
+		value, err = reads.computerViewGetComputerWithCloneOperation(ctx, computerID, operationRevision)
+		return err
+	})
+	return value, err
+}
+
+func (r *databaseReads) computerViewGetComputerWithCloneOperation(ctx context.Context, computerID string, operationRevision int64) (Computer, error) {
 	if strings.TrimSpace(computerID) == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return Computer{}, internalError(err, "begin Computer clone read")
-	}
-	defer tx.Rollback()
-	computer, err := readComputerAuthority(ctx, tx, computerID, canonicalTime(s.clock.Now()))
+	computer, err := r.computerViewGetComputer(ctx, computerID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
 	}
 	if err != nil {
-		return Computer{}, internalError(err, "read Computer")
+		return Computer{}, err
 	}
-	operation, err := readComputerCloneOperation(ctx, tx, computer.ComputerID, operationRevision)
+	operation, err := readComputerCloneOperation(ctx, r.q, computer.ComputerID, operationRevision)
 	if err != nil {
 		return Computer{}, err
 	}

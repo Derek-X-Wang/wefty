@@ -1125,7 +1125,7 @@ func writeStorageComputer(writer io.Writer, computer l1.Computer) error {
 		return err
 	}
 	if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%d\t%d\t%s\n",
-		computer.ComputerID, computer.Name, computer.DesiredState, computer.CurrentJob.State,
+		computer.ComputerID, computer.Name, computer.DesiredState, computer.CurrentJob.Status,
 		computer.StorageID, computer.StorageGeneration, computer.IntentRevision, computer.AppliedRevision,
 		computer.ReconfigurationPhase, computer.BackupCap, len(computer.Grants),
 		computerRemovalColumn(computer.RemovalOutcome, computer.CurrentJob.Removal)); err != nil {
