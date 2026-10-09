@@ -114,11 +114,7 @@ func (reads *serviceOperatorReads) removalRoot(ctx context.Context, job Job) err
 
 // A nil actor is the existing trusted Store API, used by internal callers and
 // store tests. HTTP reads and writes always supply the authenticated actor.
-func serviceActionAuthority(ctx context.Context, q queryer, now time.Time, job Job, verb string, actor *serviceActionActor) error {
-	return serviceActionAuthorityWithReads(ctx, transactionReads(q, now), job, verb, actor)
-}
-
-func serviceActionAuthorityWithReads(ctx context.Context, reads readModel, job Job, verb string, actor *serviceActionActor) error {
+func serviceActionAuthority(ctx context.Context, reads readModel, job Job, verb string, actor *serviceActionActor) error {
 	if actor != nil {
 		if actor.AttemptCredential {
 			return protocolError(contract.ErrorPrincipalForbidden, "an attempt credential may only submit a child job, list its own job and immediate children, read its own job, list or read its children, and cancel its children")
@@ -154,12 +150,8 @@ func serviceActionAuthorityWithReads(ctx context.Context, reads readModel, job J
 // serviceActionDecision is the single source for advertised actions and the
 // enforcing mutation. Chosen inputs are validated by their request decoder;
 // restart describes a fresh key, while accepted key replays retain their path.
-func serviceActionDecision(ctx context.Context, q queryer, now time.Time, job Job, verb string, actor *serviceActionActor) error {
-	return serviceActionDecisionWithReads(ctx, transactionReads(q, now), job, verb, actor)
-}
-
-func serviceActionDecisionWithReads(ctx context.Context, reads readModel, job Job, verb string, actor *serviceActionActor) error {
-	if err := serviceActionAuthorityWithReads(ctx, reads, job, verb, actor); err != nil {
+func serviceActionDecision(ctx context.Context, reads readModel, job Job, verb string, actor *serviceActionActor) error {
+	if err := serviceActionAuthority(ctx, reads, job, verb, actor); err != nil {
 		return err
 	}
 	if verb == "remove" || verb == "forget" {
@@ -228,7 +220,7 @@ func serviceActionDecisionWithReads(ctx context.Context, reads readModel, job Jo
 	return nil
 }
 
-func serviceAllowedActionsWithReads(ctx context.Context, reads readModel, job Job, actor *serviceActionActor) []contract.AllowedAction {
+func serviceAllowedActions(ctx context.Context, reads readModel, job Job, actor *serviceActionActor) []contract.AllowedAction {
 	actions := make([]contract.AllowedAction, 0, 5)
 	for _, verb := range []string{"start", "stop", "restart", "remove", "forget"} {
 		action := contract.AllowedAction{Verb: verb, Requires: map[string]any{}}
@@ -242,7 +234,7 @@ func serviceAllowedActionsWithReads(ctx context.Context, reads readModel, job Jo
 		case "forget":
 			action.Requires["force"] = true
 		}
-		action.RefusedBecause = apiErrorFromDecision(serviceActionDecisionWithReads(ctx, reads, job, verb, actor))
+		action.RefusedBecause = apiErrorFromDecision(serviceActionDecision(ctx, reads, job, verb, actor))
 		actions = append(actions, action)
 	}
 	return actions
@@ -250,7 +242,7 @@ func serviceAllowedActionsWithReads(ctx context.Context, reads readModel, job Jo
 
 // Closest persisted state-machine condition, rather than an invented event log.
 // Its timestamp comes from the relevant existing row, never the read clock.
-func serviceLastConditionWithReads(ctx context.Context, reads readModel, job Job) (*contract.Condition, error) {
+func serviceLastCondition(ctx context.Context, reads readModel, job Job) (*contract.Condition, error) {
 	condition := &contract.Condition{Since: job.UpdatedAt, Details: map[string]any{"state": job.State}}
 	if removal := job.Removal; removal != nil {
 		condition.Code, condition.Scope, condition.Since = string(job.State), "service_removal", removal.RemovalRequestedAt
@@ -305,70 +297,16 @@ func serviceLastConditionWithReads(ctx context.Context, reads readModel, job Job
 	return condition, nil
 }
 
-// projectServiceOperatorFacts is shared by collection and detail reads. The
-// caller supplies the read snapshot containing this Job and its prerequisites.
-func projectServiceOperatorFacts(ctx context.Context, q queryer, job Job, actor *serviceActionActor) (Job, error) {
-	return projectJobWithReads(ctx, newDatabaseReads(q, time.Time{}, actor), job, projectJobOperatorPart)
-}
-
-func projectServiceOperatorFactsWithReads(ctx context.Context, reads readModel, job Job, actor *serviceActionActor) (Job, error) {
+func projectServiceOperatorFacts(ctx context.Context, reads readModel, job Job, actor *serviceActionActor) (Job, error) {
 	if job.ServiceJob == nil && job.Removal == nil {
 		return job, nil
 	}
-	condition, err := serviceLastConditionWithReads(ctx, reads, job)
+	condition, err := serviceLastCondition(ctx, reads, job)
 	if err != nil {
 		return Job{}, err
 	}
-	job.ServiceOperatorFacts = &ServiceOperatorFacts{AllowedActions: serviceAllowedActionsWithReads(ctx, reads, job, actor), LastCondition: condition}
+	job.ServiceOperatorFacts = &ServiceOperatorFacts{AllowedActions: serviceAllowedActions(ctx, reads, job, actor), LastCondition: condition}
 	return job, nil
-}
-
-// projectServiceOperatorPage shares node reads only within the listing snapshot.
-func projectServiceOperatorPage(ctx context.Context, q queryer, jobs []Job, actor *serviceActionActor) error {
-	reads := newDatabaseReads(q, time.Time{}, actor)
-	for i, job := range jobs {
-		projected, err := projectJobWithReads(ctx, reads, job, projectJobOperatorPart)
-		if err != nil {
-			return err
-		}
-		jobs[i] = projected
-	}
-	return nil
-}
-
-// Every service collection/detail response uses this per-caller projection.
-// ReadOnly is essential: the store's default SQLite transaction is IMMEDIATE.
-func (s *Server) projectServiceForCaller(r *http.Request, job Job) (Job, error) {
-	if job.ServiceJob == nil && job.Removal == nil || job.ServiceOperatorFacts != nil {
-		return job, nil
-	}
-	tx, err := s.store.db.BeginTx(r.Context(), &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return Job{}, internalError(err, "begin service operator read")
-	}
-	defer tx.Rollback()
-	snapshot, err := getJobByID(r.Context(), tx, job.JobID, canonicalTime(s.store.clock.Now()))
-	if errors.Is(err, sql.ErrNoRows) {
-		tombstone, tombstoneErr := readServiceTombstoneByID(r.Context(), tx, job.JobID)
-		err = tombstoneErr
-		snapshot = tombstone.job()
-	}
-	if err != nil {
-		return Job{}, internalError(err, "read service operator snapshot")
-	}
-	snapshot, err = projectServiceOperatorFacts(r.Context(), tx, snapshot, s.serviceActionActor(r))
-	if err != nil {
-		return Job{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Job{}, internalError(err, "finish service operator read")
-	}
-	snapshot, err = s.store.projectServiceJob(r.Context(), snapshot)
-	if err != nil {
-		return Job{}, err
-	}
-	snapshot.Attempts = job.Attempts
-	return snapshot, nil
 }
 
 func (r *databaseReads) serviceComputer(ctx context.Context, id string) (string, bool, error) {

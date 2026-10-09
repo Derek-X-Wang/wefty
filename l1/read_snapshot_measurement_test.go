@@ -58,5 +58,7 @@ func TestReadSnapshotMeasure1000ProjectedRows(t *testing.T) {
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("1000 projected rows anchor-to-rollback=%s node_queries=%d", time.Since(started), counter.nodes)
+	elapsed := time.Since(started)
+	t.Logf("1000 projected rows anchor-to-rollback=%s node_queries=%d", elapsed, counter.nodes)
+	enforceReadMeasurementBudget(t, elapsed)
 }

@@ -269,11 +269,14 @@ The optional filters intersect, with exact case-sensitive comparison:
 | `kind=KIND` | Workload isolation kind; an open vocabulary. |
 | `state=STATE` | Persisted Job state, not a derived status such as `restart-pending` or `unschedulable`. |
 | `submitter=me` | Originating submitter equals the authenticated client's stable Fabric node ID. For an attempt credential, `me` is its inherited originating submitter, within its own-job/child scope. If that identity is empty, the request returns `400 invalid_request`. |
-| `limit=N` | Page size, default 100, range 1–1000. |
+| `limit=N` | Page size, default 100, range 1–250. |
 | `cursor=CURSOR` | Opaque continuation from `next_cursor`; absent on the final page. |
 
 The response is `{jobs: [...], next_cursor?: string}` and uses the same redacted
-Job projection as other client reads. Filters and authorization are applied
+Job projection as other client reads, including retained attempts. Membership,
+status, per-caller service actions and `current_attempt_id`/`attempts` use one
+Read snapshot and pinned clock per page, with node facts shared across its rows
+(see [Read model](read-model.md)). Filters and authorization are applied
 before the page limit. Invalid selectors, duplicate query parameters, a
 malformed cursor, or a cursor reused with different filters or attempt scope
 return `400 invalid_request`. Kind is open; an unknown kind returns an empty
@@ -288,9 +291,9 @@ but filters and scope must stay the same. This bounds insertion membership,
 not mutable state: state changes and removals remain live between requests.
 
 `class=service` retains the active service collection, current Computer
-projection selection, service status projection, ordering and page-size
-semantics. Previously issued service cursors are accepted for the unfiltered
-service query; their insertion watermark is established when first resumed.
+projection selection, service status projection and ordering. It uses the
+jobs collection's measured maximum of 250 rows. Previously issued service
+cursors are accepted for the unfiltered service query; their insertion watermark is established when first resumed.
 The class selector on individual Job reads and service mutations is unchanged.
 
 `wefty jobs list` exposes `--class`, `--kind`, `--state`, `--submitter me`,
@@ -330,7 +333,9 @@ one: `class=service` is required when the target is a service job and must be
 absent when it is a one-shot, exactly as for a client principal. A job that is
 neither the credential's own nor one of its children receives `forbidden`, and
 so does a job ID that does not exist, so the route cannot be used to discover
-which jobs are present.
+which jobs are present. Detail and page reads revalidate the credential's live
+attempt and holding-node authority inside the answer's Read snapshot, after
+middleware resolution.
 
 The credential also authorizes `POST /v1/jobs/{job_id}/cancel` for its immediate
 children only, revalidated inside the cancellation transaction. Its own job,

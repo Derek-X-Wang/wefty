@@ -170,7 +170,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	s.writeJobResource(w, r, job)
+	s.writeChangedJob(w, r, job, http.StatusOK)
 }
 
 // ListNodeCancelDirectives keeps stop delivery available after logical settlement:

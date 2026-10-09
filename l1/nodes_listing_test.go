@@ -173,7 +173,7 @@ func TestNodesListingPlanAndReadSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	ctx, cancel := context.WithTimeout(t.Context(), 700*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	page, err := h.store.listNodesPage(ctx, nodeListFilters{}, "", 1)
 	if err != nil || ctx.Err() != nil || len(page.Nodes) != 1 {

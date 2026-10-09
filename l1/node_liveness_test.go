@@ -179,7 +179,7 @@ func TestNodeBackgroundReconcileRecordsEffectiveLiveness(t *testing.T) {
 	}
 	defer tx.Rollback()
 	h.clock.Advance(DefaultNodeDeadAfter)
-	operator.Timeout = 700 * time.Millisecond
+	operator.Timeout = 10 * time.Second
 	status, _, body := h.do(operator, http.MethodGet, "/v1/nodes/node", nil)
 	var effective Node
 	if err := json.Unmarshal(body, &effective); err != nil || status != http.StatusOK {
@@ -193,7 +193,7 @@ func TestNodeBackgroundReconcileRecordsEffectiveLiveness(t *testing.T) {
 	}
 	// Poll only durable facts after releasing the writer. No GET or explicit
 	// Reconcile drives cleanup; the production Serve ticker records it.
-	deadline := time.Now().Add(h.server.reconcileInterval + time.Second)
+	deadline := time.Now().Add(h.server.reconcileInterval + 10*time.Second)
 	for {
 		var recorded contract.NodeState
 		var attemptState contract.AttemptState

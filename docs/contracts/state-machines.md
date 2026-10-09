@@ -1544,12 +1544,25 @@ Computer endpoints remain their sole lifecycle and grant authority.
 There is no advice or preferred action in the new fields. `requires` is omitted
 or an object, never null; restart's key is a typed input, never a manufactured
 exact value. The server rechecks the shared actor-aware decision in the mutation
-transaction. Read projections use read-only transactions, avoiding the store's
-default immediate writer lock. State and actions share a fresh read snapshot;
-collection membership and filters retain their existing paging semantics.
-Child pages select membership, read Job rows and compute per-caller operator
-facts in one read-only transaction, so concurrent row deletion cannot break a
-selected page. For operator facts, ownership and failure evidence are read once
+transaction. Read projections use the dedicated read-snapshot door, avoiding
+the store's default immediate writer lock. Detail and collection answers share one clock
+and snapshot across Job state, retained attempts, service status and actions.
+Child pages use that same door, so concurrent row deletion cannot break a
+selected page. Job collections retain membership/filter semantics with a
+maximum of 250 rows (default 100); child collections use the same
+maximum and default. Both clamp larger requested limits, so a page may return
+fewer rows than `limit`, including when the page is cut short to stay within
+the read budget. The soft cutoff is 60% of the 200 ms hard hold limit (120 ms).
+A nonempty selection returns at least one fully projected row from the same
+snapshot; `next_cursor` continues exactly after the last returned row when
+more rows exist, without gaps or duplicates. Single-resource views and the
+hard backstop are unchanged.
+Successful service changes project from one fresh snapshot
+after commit; view failure returns documented `read_snapshot_post_change_failed`
+unavailable with `mutation_applied=true`; `read_reason` identifies the underlying
+error code or snapshot reason, `retryable` is true only for snapshot availability
+errors, and the commit stands
+([Read model](read-model.md)). For operator facts, ownership and failure evidence are read once
 per service; node capacity counts and removal roots are shared within each page snapshot.
 
 `last_condition` is the **closest existing state-machine fact**, rather than a

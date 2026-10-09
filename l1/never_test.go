@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -110,7 +111,7 @@ func TestNeverCompletionMatrix(t *testing.T) {
 				if got.State != tc.want || (got.PolicyStop != nil) != tc.policy || (len(got.LastFailure) > 0) != tc.failure || got.NextRestartAt != nil || got.RestartStreak != 2 || got.LifetimeRestartCount != 5 || got.LeaseLossCount != 3 || got.DesiredState != contract.ServiceDesiredRunning || got.HoldsSlot(got.State) {
 					t.Fatalf("completion = %+v service=%+v", got, got.ServiceJob)
 				}
-				projected, err := h.store.projectServiceJob(t.Context(), got)
+				projected, err := projectServiceStatusProbe(t.Context(), h.store, got)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -464,7 +465,7 @@ func TestNeverAcknowledgedPublishedListenerFailure(t *testing.T) {
 	if status != http.StatusNoContent {
 		t.Fatalf("automatic claim = %d %s", status, body)
 	}
-	projected, err := h.store.projectServiceJob(t.Context(), getRestartService(t, h, job.JobID))
+	projected, err := projectServiceStatusProbe(t.Context(), h.store, getRestartService(t, h, job.JobID))
 	if err != nil || !strings.Contains(projected.RestartSuppressed, "published_listener") {
 		t.Fatalf("suppression = %+v %v", projected.ServiceJob, err)
 	}
@@ -547,7 +548,7 @@ func TestNeverStartAfterAutomaticFailure(t *testing.T) {
 					}
 					neverComplete(t, h, agent, job, claim, completion)
 				}
-				got, err := h.store.projectServiceJob(t.Context(), getRestartService(t, h, job.JobID))
+				got, err := projectServiceStatusProbe(t.Context(), h.store, getRestartService(t, h, job.JobID))
 				if err != nil || got.State != contract.JobFailed || got.PolicyStop != nil || !strings.Contains(got.RestartSuppressed, "use start or restart") || (cause == "lease loss" && !strings.Contains(got.RestartSuppressed, "lease lost")) {
 					t.Errorf("automatic failure cause = %+v %v", got.ServiceJob, err)
 				}
@@ -615,7 +616,7 @@ func TestNeverMaxStreakRaceNamesOneCause(t *testing.T) {
 				if got.State != contract.JobFailed || got.PolicyStop != nil || got.RestartStreak != 1 || got.NextRestartAt != nil {
 					t.Fatalf("raced completion = %+v service=%+v", got, got.ServiceJob)
 				}
-				projected, err := h.store.projectServiceJob(t.Context(), got)
+				projected, err := projectServiceStatusProbe(t.Context(), h.store, got)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -692,7 +693,7 @@ func TestNeverLegacyCompletionWithoutInitiator(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			projected, err := upgraded.projectServiceJob(t.Context(), legacy)
+			projected, err := projectServiceStatusProbe(t.Context(), upgraded, legacy)
 			if err != nil || projected.RestartSuppressed != tc.reason {
 				t.Fatalf("legacy suppression = %q %v, want %q", projected.RestartSuppressed, err, tc.reason)
 			}
@@ -702,4 +703,13 @@ func TestNeverLegacyCompletionWithoutInitiator(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Test the status component through the same snapshot door as public reads.
+func projectServiceStatusProbe(ctx context.Context, s *Store, job Job) (projected Job, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		projected, err = projectJobWithReads(ctx, reads, job, projectJobStatusPart)
+		return err
+	})
+	return
 }
