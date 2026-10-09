@@ -69,11 +69,12 @@ func (s *Store) removeService(ctx context.Context, jobID string, actor *serviceA
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "job_id is required")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Job{}, internalError(err, "begin service removal")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 
 	var dispatchKey, requestHash string
 	var specJSON []byte
@@ -208,11 +209,12 @@ func (s *Store) forceForgetService(ctx context.Context, jobID string, actor *ser
 	}
 
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Job{}, internalError(err, "begin forced service forget")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	removal, err := readServiceRemoval(ctx, tx, jobID)
 	if err != nil {
 		return Job{}, internalError(err, "read forced service forget")
@@ -434,11 +436,12 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	hash := sha256.Sum256(payload)
 	bodyHash := hex.EncodeToString(hash[:])
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Job{}, internalError(err, "begin removal acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 
 	removal, err := readServiceRemoval(ctx, tx, jobID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -828,11 +831,12 @@ func validateServiceRemovalStallEvidence(evidence ServiceRemovalStallEvidence, j
 // two commits.
 func (s *Store) FinalizeServiceRemoval(ctx context.Context, jobID string) (Job, bool, error) {
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Job{}, false, internalError(err, "begin service removal finalization")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	job, finalized, err := finalizeServiceRemovalTx(ctx, tx, jobID, now)
 	if err != nil {
 		return Job{}, false, err

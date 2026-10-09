@@ -199,11 +199,12 @@ func (s *Store) InitiateAdminBootstrap(ctx context.Context) (AdminBootstrapChall
 	}
 	nonce := base64.RawURLEncoding.EncodeToString(value)
 	expiresAt := canonicalTime(now.Add(s.adminBootstrapTTL))
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return AdminBootstrapChallenge{}, internalError(err, "begin admin bootstrap initiation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var bootstrapOpen bool
 	var authorityGeneration, adminCount int64
 	if err := tx.QueryRowContext(ctx, `SELECT bootstrap_open, authority_generation,
@@ -242,11 +243,12 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 		return AdminPolicy{}, protocolError(contract.ErrorInvalidRequest, "bootstrap nonce is required")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "begin admin bootstrap")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var revision, authorityGeneration, adminCount int64
 	var bootstrapOpen bool
 	if err := tx.QueryRowContext(ctx, `SELECT revision, bootstrap_open, authority_generation,
@@ -433,11 +435,12 @@ func (s *Store) mutateAdmin(
 	operation AdminPolicyOperation,
 ) (AdminPolicy, error) {
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "begin admin policy mutation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return AdminPolicy{}, err
 	}
@@ -614,11 +617,12 @@ func insertAdminPolicyAudit(
 // live challenges, reopens bootstrap, and appends an audit row atomically.
 func (s *Store) ResetAdminPolicy(ctx context.Context) (AdminPolicy, error) {
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return AdminPolicy{}, internalError(err, "begin admin policy reset")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var revision, authorityGeneration int64
 	if err := tx.QueryRowContext(ctx, `SELECT revision, authority_generation
 		FROM admin_policy WHERE singleton=1`).Scan(&revision, &authorityGeneration); err != nil {

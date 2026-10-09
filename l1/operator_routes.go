@@ -135,11 +135,12 @@ func (s *Store) setServiceDesiredState(ctx context.Context, jobID string, desire
 		return Job{}, protocolError(contract.ErrorInvalidRequest, "desired_state must be %q or %q", contract.ServiceDesiredRunning, contract.ServiceDesiredStopped)
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Job{}, internalError(err, "begin service desired-state mutation")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	job, err := getJobByID(ctx, tx, jobID, now)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && job.ServiceJob == nil) {
 		return Job{}, protocolError(contract.ErrorNotFound, "service job %q was not found", jobID)
@@ -230,11 +231,12 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	hash := sha256.Sum256(payload)
 	requestHash := hex.EncodeToString(hash[:])
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Job{}, false, internalError(err, "begin service restart")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	job, err := getJobByID(ctx, tx, jobID, now)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && job.ServiceJob == nil) {
 		return Job{}, false, protocolError(contract.ErrorNotFound, "service job %q was not found", jobID)

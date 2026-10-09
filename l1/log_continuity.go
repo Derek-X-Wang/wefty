@@ -58,11 +58,12 @@ const logContinuitySeedMigration = "log_stream_continuity_seed"
 // behaves as it did before the upgrade. INSERT OR IGNORE never lowers a record
 // an append already wrote.
 func (s *Store) seedLogContinuity(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("l1: begin log stream continuity seed: %w", err)
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var seeded bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM l1_data_migrations WHERE name=?)`,
 		logContinuitySeedMigration).Scan(&seeded); err != nil {
@@ -76,7 +77,7 @@ func (s *Store) seedLogContinuity(ctx context.Context) error {
 		return fmt.Errorf("l1: seed log stream continuity: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name, applied_ns) VALUES(?, ?)`,
-		logContinuitySeedMigration, s.clock.Now().UnixNano()); err != nil {
+		logContinuitySeedMigration, write.at.UnixNano()); err != nil {
 		return fmt.Errorf("l1: record log stream continuity seed: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -135,20 +135,24 @@ func (s *Store) ProveServiceBinding(ctx context.Context, identityNodeID, jobID s
 	if jobID == "" || request.NodeID == "" || request.BootSessionID == "" {
 		return false, protocolError(contract.ErrorInvalidRequest, "service binding proof authority is incomplete")
 	}
-	// Session authority and binding share a snapshot without taking the
-	// store's default IMMEDIATE write lock during image-pin reconciliation.
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return false, internalError(err, "begin service binding proof")
-	}
-	defer tx.Rollback()
-	if err := validateImagePinNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
+
+	var bound bool
+	err := s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
+		var err error
+		bound, err = reads.proveServiceBinding(ctx, identityNodeID, jobID, request)
+		return err
+	})
+	return bound, err
+}
+
+func (r *databaseReads) proveServiceBinding(ctx context.Context, identityNodeID, jobID string, request ServiceBindingProofRequest) (bool, error) {
+	if err := validateImagePinNodeSession(ctx, r.q, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return false, err
 	}
 	var boundNodeID sql.NullString
 	var state contract.JobState
 	var cleanupStatus sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT service_jobs.bound_node_id, jobs.state, service_removals.cleanup_status
+	err := r.q.QueryRowContext(ctx, `SELECT service_jobs.bound_node_id, jobs.state, service_removals.cleanup_status
 		FROM jobs JOIN service_jobs ON service_jobs.job_id=jobs.job_id
 		LEFT JOIN service_removals ON service_removals.job_id=jobs.job_id
 		WHERE jobs.job_id=?`, jobID).
@@ -186,15 +190,16 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 	if err := validateProcessResult(result); err != nil {
 		return Job{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return Job{}, internalError(err, "begin service image reconciliation failure")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateImagePinNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Job{}, err
 	}
-	job, err := getJobByID(ctx, tx, jobID, s.clock.Now())
+	job, err := getJobByID(ctx, tx, jobID, write.at)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Job{}, protocolError(contract.ErrorNotFound, "service job %q was not found", jobID)
@@ -205,7 +210,7 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 		return Job{}, protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own service binding %q", jobID)
 	}
 	if job.State != contract.JobFailed {
-		if err := transitionServiceJob(ctx, tx, jobID, job.DesiredState, contract.JobFailed, s.clock.Now()); err != nil {
+		if err := transitionServiceJob(ctx, tx, jobID, job.DesiredState, contract.JobFailed, write.at); err != nil {
 			return Job{}, err
 		}
 	}
@@ -215,19 +220,19 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 	}
 	if job.CurrentAttemptID != "" {
 		if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, updated_ns=?
-			WHERE attempt_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, s.clock.Now().UnixNano(), job.CurrentAttemptID,
+			WHERE attempt_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, write.at.UnixNano(), job.CurrentAttemptID,
 			contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput); err != nil {
 			return Job{}, internalError(err, "fence attempt during service image reconciliation failure")
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET current_attempt_id=NULL, updated_ns=? WHERE job_id=?`, s.clock.Now().UnixNano(), jobID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET current_attempt_id=NULL, updated_ns=? WHERE job_id=?`, write.at.UnixNano(), jobID); err != nil {
 		return Job{}, internalError(err, "clear service attempt after image reconciliation failure")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET policy_stop_json=NULL, next_restart_at=NULL, last_failure=?,
 		healthy_since_ns=NULL, published_attempt_id=NULL WHERE job_id=?`, payload, jobID); err != nil {
 		return Job{}, internalError(err, "record service image reconciliation failure")
 	}
-	job, err = getJobByID(ctx, tx, jobID, s.clock.Now())
+	job, err = getJobByID(ctx, tx, jobID, write.at)
 	if err != nil {
 		return Job{}, internalError(err, "read latched service image reconciliation job")
 	}

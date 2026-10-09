@@ -275,11 +275,12 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 		return Computer{}, false, internalError(err, "encode Computer restore request")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "begin Computer restore")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -540,11 +541,12 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 		return Computer{}, false, internalError(err, "encode Computer clone request")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, false, internalError(err, "begin Computer clone")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if replay, replayErr := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
 		FROM computer_storage_copy_operations WHERE backup_id=? AND idempotency_key=?`, request.BackupID, request.IdempotencyKey)); replayErr == nil {
 		if replay.Operation != "clone" {
@@ -777,11 +779,12 @@ func (s *Store) RecordComputerRestoreAuthorityRevoked(ctx context.Context, compu
 		evidence.TokenRevocation.RevokedGrantCount < 0 || evidence.TokenRevocation.CommittedAt.IsZero() {
 		return protocolError(contract.ErrorInvalidRequest, "Computer restore authority revocation evidence is incomplete")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return internalError(err, "begin restore authority revocation receipt")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	var existingJSON []byte
 	var existingNS sql.NullInt64
 	if err := tx.QueryRowContext(ctx, `SELECT authority_revoked_ns, authority_revocation_receipt_json FROM computer_storage_copy_operations
@@ -1134,8 +1137,14 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 	if destinationComputerID == "" || request.NodeID == "" || request.BootSessionID == "" || request.IdempotencyKey == "" {
 		return Computer{}, protocolError(contract.ErrorInvalidRequest, "complete Computer Storage copy acknowledgement fields are required")
 	}
+	write, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		return Computer{}, internalError(err, "begin Computer Storage copy acknowledgement")
+	}
+	tx := write.tx
+	defer write.rollback()
 	var storedOperation string
-	if err := s.db.QueryRowContext(ctx, `SELECT operation FROM computer_storage_copy_operations
+	if err := tx.QueryRowContext(ctx, `SELECT operation FROM computer_storage_copy_operations
 		WHERE destination_computer_id=? ORDER BY operation_revision DESC LIMIT 1`, destinationComputerID).
 		Scan(&storedOperation); errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer Storage copy operation was not found")
@@ -1143,18 +1152,18 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 		return Computer{}, internalError(err, "read stored Computer Storage copy verb")
 	}
 	if storedOperation == "import" {
-		return s.AcknowledgeComputerCustodyImport(ctx, identityNodeID, destinationComputerID, request)
+		bodyHash, err := storageCopyHash(request)
+		if err != nil {
+			return Computer{}, internalError(err, "encode Custody import acknowledgement")
+		}
+		return s.acknowledgeComputerCustodyImport(ctx, write, identityNodeID, destinationComputerID, request, bodyHash)
 	}
 	bodyHash, err := storageCopyHash(request)
 	if err != nil {
 		return Computer{}, internalError(err, "encode Computer Storage copy acknowledgement")
 	}
-	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return Computer{}, internalError(err, "begin Computer Storage copy acknowledgement")
-	}
-	defer tx.Rollback()
+	now := write.at
+
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}
@@ -1331,11 +1340,12 @@ func acknowledgeComputerClonePreparation(ctx context.Context, tx *sql.Tx, row co
 
 func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinationComputerID string, operationRevision int64) (Computer, error) {
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin verified Computer Storage copy publication")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	row, err := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
 		FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`,
 		destinationComputerID, operationRevision))
@@ -1497,11 +1507,12 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 		return Computer{}, internalError(err, "encode Computer restore retirement acknowledgement")
 	}
 	now := canonicalTime(s.clock.Now())
-	tx, err := s.db.BeginTx(ctx, nil)
+	write, err := s.beginWriteTransaction(ctx, nil, now)
 	if err != nil {
 		return Computer{}, internalError(err, "begin Computer restore retirement acknowledgement")
 	}
-	defer tx.Rollback()
+	tx := write.tx
+	defer write.rollback()
 	if err := validateStorageResetNode(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}

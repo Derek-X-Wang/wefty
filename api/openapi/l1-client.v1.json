@@ -1516,6 +1516,7 @@
       "post": {
         "operationId": "attestComputerCustodyDeleted",
         "summary": "Record operator_attested_deleted without upgrading removal truth",
+        "description": "The evidence commits before response reload. Reload failure returns 503 unavailable with details.reason=read_snapshot_post_change_failed, mutation_applied=true, export_id and read_reason; only snapshot availability errors are retryable. Retry a read to observe the export; mutation retries retain the original idempotency key.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false, "required": ["idempotency_key"],
           "properties": { "idempotency_key": { "type": "string", "minLength": 1 } }

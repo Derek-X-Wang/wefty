@@ -9,7 +9,7 @@ Concurrent projections in the same request share the read set.
 
 Snapshots use a dedicated file pool opened with `mode=ro`, with `query_only`
 set at connection creation. Disabling the pragma cannot enable writes.
-Its twelve open and idle connections are the admission cap. Writers and legacy
+Its twelve open and idle connections are the admission cap. Writers and agent-protocol
 reads remain on the main pool; the secret WAL checkpoint keeps its own handle.
 Checkout waits at most 200 ms. Admission order is random under overload; no
 FIFO fairness is promised. Admission expiry returns HTTP 503, code
@@ -78,33 +78,86 @@ from the pinned clock. Their state filters apply the same thresholds before
 paging. The node memo and `nodeState` retain recorded state for decisions; a
 display projection never alters cached facts, expires attempts, or synthesizes
 conditions. Background reconciliation records those changes on its own cadence.
-Heartbeat cancel, removal and Computer directive reads stay on the main pool as #752
-write-path agent-protocol exceptions, independent of operator snapshot admission, so
-operator read load can never fail a heartbeat. Computer agent acknowledgements
-also reload their committed Computer (and nested Backup, when present) through
-a coherent read-only transaction on the main pool, as #752 agent-protocol
-exceptions; operator admission cannot starve an acknowledgement after its
-write. That main-pool reload holds the door's own two-stage shape: connection
-checkout gets its own 200 ms admission budget and the read-only transaction
-then holds its connection under the same 200 ms hard limit, both with the
-door's typed `unavailable` expiry (`read_snapshot_admission_expired`,
-`read_snapshot_expired`, retryable) and the door's test-only override. The
-reload is reachable only from a reviewed list of agent acknowledgement
-handlers; the guard asserts the exact site set of `withAgentReadSnapshot`, the
-`writeAgentComputer` wrapper and the handlers that call it, set-equality, with
+Heartbeat cancel, removal and Computer directive reads stay on the main pool as permanent
+agent-protocol exceptions, independent of operator snapshot admission, so
+operator read load can never fail a heartbeat. Agent and L3 protocol reads also
+include service-binding, Computer token-scope and host boot-session proofs.
+These proofs use a coherent read-only transaction on the main pool. Computer
+agent acknowledgements reload their committed Computer (and nested Backup,
+when present) through that same door; operator admission cannot starve an
+acknowledgement after its write. This main-pool door holds its own two-stage
+shape: connection checkout gets its own 200 ms admission budget and the
+read-only transaction then holds its connection under the same 200 ms hard
+limit, both with typed `unavailable` expiry (`read_snapshot_admission_expired`,
+`read_snapshot_expired`, retryable) and the door's test-only override. The door
+is reachable only from reviewed agent and L3 protocol read owners; the guard
+asserts the exact site set of `withAgentReadSnapshot`, the `writeAgentComputer`
+wrapper, the three `Prove*` methods and their reviewed HTTP callers, set equality, with
 a fixture test covering the bypass shapes. The list is hand-kept rather than
 derived from route registration, and the rule tracks references, not
 invocations: a listed site that stored the method value for another caller
 would pass, so such a change needs review.
 
-The typed raw-pool guard in `l1/read_boundary_test.go` permits the write door
-and inventories production SQL pool and connection expressions, including
-aliases. `l1/read_boundary_exceptions.json` names each exact legacy use, count,
-reason and owning slice: #748 jobs/services, #749 Computers,
-#751 person-seen, #752 legacy writes and agent-protocol heartbeat reads. The two door constructors and
-infrastructure use the permanent category. The guard also rejects `query_only`
-pragma strings outside `OpenStore`. Shrink entries as uses migrate;
-never widen an exception to admit a new legacy escape.
+The typed raw-pool guard in `l1/read_boundary_test.go` inventories production
+SQL pool and connection expressions, including aliases, and rejects embedded
+raw DB, Conn or Tx handles that expose promoted methods. Its exact-site inventory
+in `l1/read_boundary_exceptions.json` accepts only two permanent classes:
+
+- `permanent`: database open/configuration, schema initialization and migrations,
+  pool close and read-pool lifecycle, secret scrubbing and WAL checkpointing,
+  and the read-snapshot and write-transaction constructors. The heartbeat
+  settlement write constructor preserves the settlement pool's shorter SQLite
+  lock wait; all settlement decisions and writes still use a write transaction.
+- `agent-protocol`: heartbeat cancel/removal/Computer directive reads, the agent
+  and L3 protocol read door for acknowledgement reloads and authority proofs.
+  They stay on the main pool so operator admission cannot starve protocol traffic.
+
+Policy watch records issued policy through the write door; its long poll stays
+outside that transaction. Authority-loss revocation lookup is protocol-reachable:
+agent Computer attempt completion and storage-grow acknowledgement use it, along
+with operator Stop/Restart/Reset/Reimage/Remove and projection installation.
+It uses the bounded main-pool protocol read door and closes its snapshot before
+external revocation. Operator snapshot saturation cannot fail agent completion.
+If this lookup expires after commit, the route returns `unavailable` with
+`details.reason=read_snapshot_post_change_failed`, `mutation_applied=true`,
+`computer_id` and `read_reason`; only snapshot availability failures are retryable.
+The authority-losing mutation and owed row stand, and the host heartbeat still
+settles the revocation. An external revocation failure keeps the established
+applied/owed (or nothing-owed) `run_ledger_unavailable` answer.
+
+Every inventory entry has an exact use count and a precise reason. Any other
+class, including a ticket slice tag, fails the guard. A new raw use, an increased
+count, and an obsolete exception also fail. The guard rejects `query_only`
+pragma strings outside `OpenStore`.
+
+The type-aware callback guard rejects nested `withReadSnapshot` calls in
+snapshot callbacks, including method aliases and callbacks assigned to local
+variables. Runtime context marking rejects acquisition using the derived
+context. A captured parent context does not carry that marker: nesting hidden
+behind an indirect helper or opaque callback remains a residual static-analysis
+limit and must not be used to acquire another snapshot. Independent answers may
+still share a parent context.
+
+Snapshot callbacks (both read doors), write-door owners and helpers receiving
+transaction authority may not call L3/run-ledger clients or perform network I/O.
+The callback guard follows local helpers, aliases and local interface
+implementations to check run-ledger, Fabric and standard network client calls.
+It conservatively checks the entire body of write owners, including settlement
+callbacks and any function literal receiving `readModel`, `writeTransaction` or
+`*sql.Tx` authority; move external work into the caller after the transaction returns.
+Production positive controls require resolved snapshot sites, write-authority
+owners and non-empty helper bodies. Fixtures share the production type-info
+constructor and assert exact violation sites, including response encoding.
+Opaque function values, generic I/O interfaces with no visible connection binding,
+and third-party wrappers remain a review responsibility.
+No snapshot or transaction spans an external call, policy long poll or response
+encoding. Custody deletion attestation and owed-revocation failure recording keep
+one committed write per call; an attestation commits before its response reload,
+so reload failure cannot undo the evidence. A failed attestation reload returns
+503 `unavailable`, `reason=read_snapshot_post_change_failed`, `mutation_applied=true`,
+`export_id`, and `read_reason`; only snapshot availability failures are retryable.
+Import acknowledgement dispatch and settlement share one write transaction and
+one pinned clock, avoiding a second immediate-writer admission wait.
 
 ## Jobs page measurement (#748)
 
