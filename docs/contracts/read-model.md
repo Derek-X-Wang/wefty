@@ -89,10 +89,13 @@ checkout gets its own 200 ms admission budget and the read-only transaction
 then holds its connection under the same 200 ms hard limit, both with the
 door's typed `unavailable` expiry (`read_snapshot_admission_expired`,
 `read_snapshot_expired`, retryable) and the door's test-only override. The
-reload is reachable only from the agent acknowledgement route handlers; the
-guard asserts the exact site set of `withAgentReadSnapshot`, the
+reload is reachable only from a reviewed list of agent acknowledgement
+handlers; the guard asserts the exact site set of `withAgentReadSnapshot`, the
 `writeAgentComputer` wrapper and the handlers that call it, set-equality, with
-a fixture test covering the bypass shapes.
+a fixture test covering the bypass shapes. The list is hand-kept rather than
+derived from route registration, and the rule tracks references, not
+invocations: a listed site that stored the method value for another caller
+would pass, so such a change needs review.
 
 The typed raw-pool guard in `l1/read_boundary_test.go` permits the write door
 and inventories production SQL pool and connection expressions, including

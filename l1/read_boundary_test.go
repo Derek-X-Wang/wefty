@@ -323,12 +323,15 @@ func (i boundaryFixtureImporter) Import(path string) (*types.Package, error) {
 	return i.base.Import(path)
 }
 
-// The agent-protocol exception chain is closed by construction. withAgentReadSnapshot is reachable
-// only inside writeAgentComputer, and each of the two is reachable only
-// from the agent acknowledgement route handlers the agent mux registers.
-// The rule matches every selector resolving to one of the methods — calls,
-// method values and method expressions, including package-level var
-// initialisers — so there is no bypass shape it misses.
+// The agent-protocol exception chain is closed by a reviewed list.
+// withAgentReadSnapshot is reachable only inside writeAgentComputer, and each
+// of the two only from the agent acknowledgement handlers listed in
+// agentAcknowledgementSites; a new caller fails loudly until it is listed.
+// The list is hand-kept, not derived from the agent mux, so listing a handler
+// is a review decision. The rule matches every selector resolving to one of
+// the methods (calls, method values, method expressions, package-level var
+// initialisers). Residual: it tracks references, so a listed site that stored
+// the method value for an unlisted caller would pass.
 var agentReadSnapshotTargets = []string{"withAgentReadSnapshot", "writeAgentComputer"}
 
 const boundaryPkgPath = "github.com/Derek-X-Wang/wefty/l1"
@@ -489,8 +492,8 @@ func TestAgentReadSnapshotIsAgentOnly(t *testing.T) {
 	for _, site := range boundaryOwnerSites(fset, files, info, boundaryPkgPath) {
 		actual[site] = true
 	}
-	// Positive control: the chain must be exactly where the agent mux routes
-	// it. A vanished type check, a moved helper, or a disappeared handler all
+	// Positive control: the chain must be exactly at the listed agent
+	// acknowledgement handlers. A vanished type check, a moved helper, or a disappeared handler all
 	// fail here instead of silently relaxing the boundary.
 	if !reflect.DeepEqual(actual, agentAcknowledgementSites) {
 		var extra, missing []string

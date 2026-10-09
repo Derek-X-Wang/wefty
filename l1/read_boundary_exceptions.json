@@ -79,7 +79,7 @@
   },
   {
     "site": "computer_operator.go:*Store.withAgentReadSnapshot | conn",
-    "count": 2,
+    "count": 3,
     "reason": "Agent acknowledgement snapshot constructor: main-pool checkout admission, read-only transaction hold and rollback failure discard.",
     "slice": "permanent"
   },

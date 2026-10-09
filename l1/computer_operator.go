@@ -3,7 +3,9 @@ package l1
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -435,7 +437,14 @@ func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Cont
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	// As in the read door: a failed rollback must not return a main-pool
+	// connection with an open read transaction.
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			err = errors.Join(err, fmt.Errorf("rollback agent read snapshot: %w", rollbackErr))
+		}
+	}()
 	var anchor int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&anchor); err != nil {
 		return err
