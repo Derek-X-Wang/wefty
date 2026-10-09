@@ -3,6 +3,9 @@ package l1
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -398,13 +401,50 @@ func appliedComputerReadError(err error, id string) error {
 }
 
 // #752 agent-protocol exception: a committed acknowledgement must not queue
-// behind operator admission. Keep the reload coherent on the main pool.
-func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, readModel) error) error {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+// behind the read door. Keep the reload coherent on the main pool, with the
+// door's own two-stage shape: main-pool checkout gets its own admission
+// budget, and the read-only transaction then holds its connection under the
+// same hard hold limit with the same typed expiry; both reuse the door's
+// test-only override. The derived context marks nested snapshot acquisition
+// as a programming error. Only agent acknowledgement handlers between this
+// Store and the agent mux may call it (see read_boundary_test.go).
+func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Context, readModel) error) (err error) {
+	if ctx.Value(readSnapshotContextKey{}) != nil {
+		return errNestedReadSnapshot
+	}
+	limit := readSnapshotHardLimit
+	if override, ok := ctx.Value(readSnapshotHardLimitContextKey{}).(time.Duration); ok {
+		limit = override
+	}
+	admission, cancelAdmission := context.WithTimeout(ctx, limit)
+	conn, err := s.db.Conn(admission)
+	cancelAdmission()
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return snapshotUnavailable("read_snapshot_admission_expired", err)
+		}
+		return err
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.WithValue(ctx, readSnapshotContextKey{}, true), limit)
+	defer cancel()
+	defer func() {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			err = snapshotUnavailable("read_snapshot_expired", ctx.Err())
+		}
+	}()
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	// As in the read door: a failed rollback must not return a main-pool
+	// connection with an open read transaction.
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			err = errors.Join(err, fmt.Errorf("rollback agent read snapshot: %w", rollbackErr))
+		}
+	}()
 	var anchor int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&anchor); err != nil {
 		return err

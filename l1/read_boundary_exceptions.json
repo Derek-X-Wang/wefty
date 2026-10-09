@@ -24,6 +24,12 @@
     "slice": "agent-protocol"
   },
   {
+    "site": "computer_operator.go:*Store.withAgentReadSnapshot | conn",
+    "count": 3,
+    "reason": "Agent acknowledgement snapshot constructor: main-pool checkout admission, read-only transaction hold and rollback failure discard.",
+    "slice": "permanent"
+  },
+  {
     "site": "custody.go:*Store.ListNodeComputerCustodyExportDirectives | s.db",
     "count": 2,
     "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",

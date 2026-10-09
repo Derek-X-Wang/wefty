@@ -83,7 +83,19 @@ agent-protocol exceptions, independent of operator snapshot admission, so
 operator read load can never fail a heartbeat. Computer agent acknowledgements
 also reload their committed Computer (and nested Backup, when present) through
 a coherent read-only transaction on the main pool, as permanent agent-protocol
-exceptions; operator admission cannot starve an acknowledgement after its write.
+exceptions; operator admission cannot starve an acknowledgement after its
+write. That main-pool reload holds the door's own two-stage shape: connection
+checkout gets its own 200 ms admission budget and the read-only transaction
+then holds its connection under the same 200 ms hard limit, both with the
+door's typed `unavailable` expiry (`read_snapshot_admission_expired`,
+`read_snapshot_expired`, retryable) and the door's test-only override. The
+reload is reachable only from a reviewed list of agent acknowledgement
+handlers; the guard asserts the exact site set of `withAgentReadSnapshot`, the
+`writeAgentComputer` wrapper and the handlers that call it, set-equality, with
+a fixture test covering the bypass shapes. The list is hand-kept rather than
+derived from route registration, and the rule tracks references, not
+invocations: a listed site that stored the method value for another caller
+would pass, so such a change needs review.
 
 The typed raw-pool guard in `l1/read_boundary_test.go` inventories production
 SQL pool and connection expressions, including aliases. Its exact-site inventory
@@ -219,10 +231,19 @@ returns 503 `unavailable`,
 and `read_reason`. Only snapshot availability failures are retryable; retry a
 read, and retain the original replay key when retrying a mutation. Applied
 submission changes fall back to the committed Computer and its committed
-`submit_policy_revision` if their post-change snapshot fails. This fallback
-retains the in-hand `revoked` receipt or `revocation_notice`; its readiness and
-status are the committed authority projection, not a fresh observation. L3 count
-failure still yields null and revocation failure a notice: none can undo the commit.
+`submit_policy_revision` if their post-change snapshot fails, and the response
+carries `projection: "committed-fallback"` so consumers can tell that fallback
+answer from a post-change observation. This fallback retains the in-hand
+`revoked` receipt or `revocation_notice`; its readiness and top-level `status`
+are the committed authority projection, not a fresh observation. The fallback's
+`status` is the projected status only where it is computable from committed
+facts already in hand, which is `restart-pending` from the committed
+ServiceJob's own backoff facts; without a fresh read the only real divergence
+is `queued` versus `unschedulable`, which needs the placement walks, while
+failed-cause reads shape `restart_suppressed` and not the status, so other
+statuses keep the raw persisted state.
+L3 count failure still yields null and revocation failure a notice: none can
+undo the commit.
 
 The Backup collection has a stable insertion watermark and `(created_ns,
 backup_id)` keyset cursor bound to its Computer. The first page fixes membership,
