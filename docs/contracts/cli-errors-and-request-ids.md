@@ -31,7 +31,18 @@ as on view open.
 
 An L1 identity lookup that fails operationally returns `503 unavailable`,
 `retryable:true`, `details.reason="identity_unverifiable"`; the CLI preserves
-that server envelope and exits 13. Genuine Fabric identity absence remains
+that server envelope and exits 13. One exception: inside a `--wait` window a
+retryable `unavailable` answer — including `identity_unverifiable` and the
+`read_snapshot_*` reasons — is transient (#763); every wait or observation loop
+keeps polling at its normal interval until the wait deadline, and exhausting
+that deadline on retryable answers alone is the wait-timeout outcome (exit 14,
+`wait_timeout`) with the last retryable answer recorded in the observation
+detail. The log follows (`wefty logs --follow`, `services logs --follow`) have
+no deadline: they retry such answers at their poll interval until the reader
+stops them, which is an ordinary interrupted follow, never exit 13. One-shot
+reads (no `--wait`) still exit 13. Non-retryable answers still
+end a wait immediately and keep their own classification. Genuine Fabric
+identity absence remains
 `401 unauthorized` and exits 3. Node agents classify `unavailable` as
 transient without treating it as lost attempt or node-session authority.
 Ledger-only admission refusals remain `403 forbidden` and exit 3, adding
@@ -95,14 +106,21 @@ A missing `storage_provenance` after a timeout means "not read", not "untainted"
 `services backup list COMPUTER` reads it.
 An already-observed typed failure keeps its own exit code if a follow-up
 provenance read fails or times out; that miss is recorded in `observation.error`.
-Only an observation error caused by `context.DeadlineExceeded` becomes
+Only an observation error caused by `context.DeadlineExceeded` (which includes
+a wait that exhausted its window on retryable `unavailable` answers alone,
+whose timeout records the last retryable answer) becomes
 `wait_timeout`; a typed outcome or HTTP refusal arriving at the deadline keeps
 its classification.
 Caller cancellation is a separate local failure. Grant revocation
 (`services revoke --wait`) also exits 14 on an accepted-mutation
 observation timeout. It retains `revocation_wait_timeout`, its existing
 retryability, and receipt-derived `details.mutation_applied`; it is not
-transport unavailability. `services grant` does not accept `--wait`.
+transport unavailability. A retryable `unavailable` read during that
+observation window is retried at the normal poll interval, and running out of
+the window on retryable answers alone is the same `revocation_wait_timeout`
+outcome (exit 14) with the last answer recorded in
+`details.observation_failure`; a non-retryable read error still reports
+`revocation_observation_failed` at once. `services grant` does not accept `--wait`.
 
 Typed outcomes (custody exits 6–9,
 failed run 10, wait timeout 11, not-ready status 12) already write their result

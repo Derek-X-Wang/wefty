@@ -704,8 +704,26 @@ func executeServiceLogs(
 	for {
 		page, err := clients.getServiceLogs(followCtx, jobID, cursor, limit)
 		if err != nil {
-			if followFor > 0 && ctx.Err() == nil && followCtx.Err() == context.DeadlineExceeded {
+			// The follow window ending is a clean stop, whatever the read
+			// answered with; cancellation is the leaving reader.
+			if ctx.Err() == nil && followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
 				return nil
+			}
+			// A follow with no deadline sees a retryable 503 as one bad poll,
+			// not a verdict (#763). Keep following at the normal interval;
+			// only cancellation or a non-retryable answer ends it.
+			if follow && isRetryableL1Answer(err) && ctx.Err() == nil && followCtx.Err() == nil {
+				if sleepFollowRetry(followCtx, pollInterval) {
+					continue
+				}
+				// The retry sleep hit the window end: stop the same way an
+				// interrupted follow does.
+				if followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
+					return nil
+				}
+				// The reader left during the retry sleep: cancellation, not
+				// the stale 503.
+				return followCtx.Err()
 			}
 			return err
 		}
@@ -762,6 +780,14 @@ func waitForService(
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
+	timeout := func(lastRetryable error) error {
+		message := fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)
+		if lastRetryable != nil {
+			message += fmt.Sprintf(" (last L1 answer: %s)", lastRetryable.Error())
+		}
+		return &mutationWaitTimeoutError{message: message}
+	}
+	var lastRetryable error
 	for {
 		timer := time.NewTimer(pollInterval)
 		select {
@@ -770,16 +796,31 @@ func waitForService(
 			if ctx.Err() != nil {
 				return l1.Job{}, ctx.Err()
 			}
-			return l1.Job{}, &mutationWaitTimeoutError{message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
+			return l1.Job{}, timeout(lastRetryable)
 		case <-timer.C:
 		}
 		job, err := clients.getService(waitCtx, initial.JobID)
 		if err != nil {
-			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
-				return l1.Job{}, &mutationWaitTimeoutError{message: fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)}
+			// Only deadline-shaped answers become the timeout; a refusal
+			// arriving at the deadline keeps its own classification (#763).
+			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded &&
+				(errors.Is(err, context.DeadlineExceeded) || isRetryableL1Answer(err)) {
+				detail := lastRetryable
+				if isRetryableL1Answer(err) {
+					detail = err
+				}
+				return l1.Job{}, timeout(detail)
+			}
+			// A retryable 503 inside the wait window is one bad poll, not a
+			// verdict (#763): keep asking at the normal interval until the
+			// deadline decides the outcome.
+			if isRetryableL1Answer(err) && ctx.Err() == nil && waitCtx.Err() == nil {
+				lastRetryable = err
+				continue
 			}
 			return l1.Job{}, err
 		}
+		lastRetryable = nil
 		if predicate(job) {
 			return job, nil
 		}
