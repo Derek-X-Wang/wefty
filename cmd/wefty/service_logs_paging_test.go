@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,10 +22,9 @@ import (
 )
 
 // #767: a service log read is one page of an adaptive page sequence. Without
-// --follow the CLI can now name the next cursor (--cursor in, NEXT CURSOR out)
-// or drain the whole retained log (--all), the way `services list` and
-// `runs list` page. An empty poll is the end of the log; L1 answers pages with
-// next_cursor.
+// --follow the CLI can continue from a cursor (--cursor, NEXT CURSOR out) or
+// drain the retained log (--all). L1 answers every log page with next_cursor,
+// so for logs an empty page, not a missing cursor, is the end.
 
 func appendServiceLogEvent(
 	t *testing.T, store *l1.Store, identityNodeID, jobID string,
@@ -123,6 +123,26 @@ func TestServiceLogsPagedReadsFromRealL1(t *testing.T) {
 		}
 	}
 
+	// An empty page ends the log: L1 still answers it with next_cursor,
+	// but there is nothing to show, so no NEXT CURSOR hint may print.
+	third := readPage("--limit=1", "--cursor", second.NextCursor)
+	if len(third.Events) != 1 || string(third.Events[0].Bytes) != "third event\n" {
+		t.Fatalf("final event page = %+v", third)
+	}
+	emptyPage := readPage("--limit=1", "--cursor", third.NextCursor)
+	if len(emptyPage.Events) != 0 {
+		t.Fatalf("past-the-end page = %+v", emptyPage)
+	}
+	var emptyOut, emptyErr bytes.Buffer
+	if err := execute(ctx, harness.clients, false,
+		[]string{"services", "logs", created.JobID, "--limit=1", "--cursor", third.NextCursor},
+		&emptyOut, &emptyErr); err != nil {
+		t.Fatalf("empty-page human read = %v, stderr=%s", err, emptyErr.String())
+	}
+	if bytes.Contains(emptyOut.Bytes(), []byte("NEXT CURSOR")) || emptyOut.Len() != 0 {
+		t.Fatalf("empty page printed a hint or noise:\nstdout=%q", emptyOut.String())
+	}
+
 	// --all drains the retained log one page at a time and ends at the
 	// empty poll.
 	allHuman := runServiceCLI(t, ctx, harness.clients, false, "services", "logs", created.JobID, "--all", "--limit=1")
@@ -143,23 +163,59 @@ func TestServiceLogsPagedReadsFromRealL1(t *testing.T) {
 		t.Fatalf("--all --json events = %q", seen)
 	}
 
+	// --all may start at a cursor: it walks the remaining pages to the
+	// end (the `--all` convention of `nodes`, `computers` and `runs list`).
+	tailHuman := runServiceCLI(t, ctx, harness.clients, false,
+		"services", "logs", created.JobID, "--all", "--limit=1", "--cursor", first.NextCursor)
+	for _, want := range []string{"second event", "third event"} {
+		if !bytes.Contains(tailHuman, []byte(want)) {
+			t.Fatalf("--all from cursor missing %q:\n%s", want, tailHuman)
+		}
+	}
+	if bytes.Contains(tailHuman, []byte("first event")) {
+		t.Fatalf("--all from cursor replayed pages before the cursor:\n%s", tailHuman)
+	}
+	if bytes.Contains(tailHuman, []byte("NEXT CURSOR")) {
+		t.Fatalf("--all from cursor drained the log yet advertised a cursor:\n%s", tailHuman)
+	}
+
 	// A follow may start where a previous page ended instead of repeating
-	// history. This is the chosen --cursor + --follow rule: the follow
-	// loop already advances cursors, so it can sensibly start from one.
-	followOutput := runServiceCLI(t, ctx, harness.clients, true,
-		"services", "logs", created.JobID, "--cursor", first.NextCursor,
-		"--follow", "--follow-for", "30ms", "--poll-interval", "2ms")
-	var followed []string
-	scanJSONEvents(t, followOutput, func(event contract.LogEvent) {
-		followed = append(followed, string(event.Bytes))
-	})
-	if !equalStrings(followed, []string{"second event\n", "third event\n"}) {
-		t.Fatalf("follow from cursor events = %q, want exactly the events past the cursor", followed)
+	// history: the follow loop already advances cursors, so it can
+	// sensibly start from one. There is no --follow-for window; the test
+	// cancels once the expected events are seen, under a watchdog.
+	followCtx, cancelFollow := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelFollow()
+	stdout := &markerOutput{marker: "third event", done: make(chan struct{})}
+	var followErrOutput bytes.Buffer
+	res := make(chan error, 1)
+	go func() {
+		res <- execute(followCtx, harness.clients, false, []string{
+			"services", "logs", created.JobID, "--cursor", first.NextCursor,
+			"--follow", "--poll-interval", "2ms",
+		}, stdout, &followErrOutput)
+	}()
+	select {
+	case <-stdout.done:
+	case <-followCtx.Done():
+		t.Fatalf("follow from cursor never saw the expected events within 10s:\nstdout=%s\nstderr=%s",
+			stdout.String(), followErrOutput.String())
+	}
+	cancelFollow()
+	if err := <-res; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("follow from cursor = %v, stderr=%s", err, followErrOutput.String())
+	}
+	followed := stdout.String()
+	for _, want := range []string{"second event", "third event"} {
+		if !bytes.Contains([]byte(followed), []byte(want)) {
+			t.Fatalf("follow from cursor missing %q:\n%s", want, followed)
+		}
+	}
+	if bytes.Contains([]byte(followed), []byte("first event")) {
+		t.Fatalf("follow from cursor replayed the page it was told to resume past:\n%s", followed)
 	}
 
 	// Invalid combinations stay usage errors.
 	for _, args := range [][]string{
-		{"--all", "--cursor", first.NextCursor},
 		{"--all", "--follow"},
 		{"--all", "--follow", "--follow-for", "5ms"},
 	} {
@@ -172,13 +228,63 @@ func TestServiceLogsPagedReadsFromRealL1(t *testing.T) {
 	}
 }
 
+// markerOutput is a test writer that closes done the first time the expected
+// marker is seen, so a follow can be stopped by its own evidence instead of a
+// wall-clock window.
+type markerOutput struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	marker  string
+	done    chan struct{}
+	marking bool
+}
+
+func (w *markerOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	n, err := w.buf.Write(p)
+	hit := w.marker != "" && !w.marking && bytes.Contains(w.buf.Bytes(), []byte(w.marker))
+	if hit {
+		w.marking = true
+	}
+	w.mu.Unlock()
+	if hit {
+		close(w.done)
+	}
+	return n, err
+}
+
+func (w *markerOutput) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
 // cutoffStubLogServer serves the adaptive log-page shape the read cutoff
 // produces: one event per page even when the caller asks for more, a next
 // cursor on every page, and an empty page once the walk reaches the end.
 // WEFTY_TEST_READ_PAGE_CUTOFF is read by l1's TestMain only, so it does not
-// apply here; this stub reproduces that page shape without it.
+// apply here; this stub reproduces that page shape without it. It can also
+// fail chosen polls the way a retryable L1 answer fails, to test what a
+// --all walk does mid-walk.
 type cutoffStubLogServer struct {
-	events []contract.LogEvent
+	mu                 sync.Mutex
+	events             []contract.LogEvent
+	retryableFailures  map[int]int
+	retryableServed    int
+	nonRetryableCursor int
+	nonRetryableOn     bool
+	nonRetryableServed int
+}
+
+func (stub *cutoffStubLogServer) eventsFromCursor(cursor string) (index int, ok bool) {
+	if cursor == "" {
+		return 0, true
+	}
+	parsed, err := strconv.Atoi(cursor)
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
 }
 
 func (stub *cutoffStubLogServer) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -186,27 +292,57 @@ func (stub *cutoffStubLogServer) ServeHTTP(writer http.ResponseWriter, request *
 		http.NotFound(writer, request)
 		return
 	}
-	cursor := request.URL.Query().Get("cursor")
-	index := 0
-	if cursor != "" {
-		parsed, err := strconv.Atoi(cursor)
-		if err != nil {
-			http.Error(writer, `{"error":{"code":"invalid_request","message":"cursor is invalid"}}`, http.StatusBadRequest)
-			return
-		}
-		index = parsed
-	}
 	if request.URL.Query().Get("class") != contract.JobClassService {
 		http.Error(writer, `{"error":{"code":"invalid_request","message":"class is required"}}`, http.StatusBadRequest)
 		return
 	}
+	index, ok := stub.eventsFromCursor(request.URL.Query().Get("cursor"))
+	if !ok {
+		http.Error(writer, `{"error":{"code":"invalid_request","message":"cursor is invalid"}}`, http.StatusBadRequest)
+		return
+	}
+	stub.mu.Lock()
+	failRetryable := stub.retryableFailures[index] > 0
+	if failRetryable {
+		stub.retryableFailures[index]--
+		stub.retryableServed++
+	}
+	failFinal := stub.nonRetryableOn && stub.nonRetryableCursor == index
+	if failFinal {
+		stub.nonRetryableServed++
+	}
+	stub.mu.Unlock()
+	if failFinal {
+		writeStubAPIError(writer, http.StatusInternalServerError,
+			contract.ErrorInternal, "stub internal failure", false)
+		return
+	}
+	if failRetryable {
+		writeStubAPIError(writer, http.StatusServiceUnavailable,
+			contract.ErrorUnavailable, "stub unavailable", true)
+		return
+	}
 	page := l1.LogPage{Events: []contract.LogEvent{}}
-	if index < len(stub.events) {
+	if index >= 0 && index < len(stub.events) {
 		page.Events = append(page.Events, stub.events[index])
 		page.NextCursor = strconv.Itoa(index + 1)
 	}
 	writer.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(writer).Encode(page)
+}
+
+func writeStubAPIError(writer http.ResponseWriter, status int, code contract.ErrorCode, message string, retryable bool) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(contract.ErrorResponse{Error: contract.APIError{
+		Code: code, Message: message, Retryable: retryable,
+	}})
+}
+
+func (stub *cutoffStubLogServer) servedRetryableFailures() int {
+	stub.mu.Lock()
+	defer stub.mu.Unlock()
+	return stub.retryableServed
 }
 
 func scanJSONEvents(t *testing.T, output []byte, visit func(contract.LogEvent)) {
@@ -228,26 +364,10 @@ func scanJSONEvents(t *testing.T, output []byte, visit func(contract.LogEvent)) 
 	}
 }
 
-func TestServiceLogsAllWalksCutoffShapedPages(t *testing.T) {
-	stub := &cutoffStubLogServer{}
-	attemptA := "stub-attempt-a"
-	attemptB := "stub-attempt-b"
-	specs := []struct {
-		attempt  string
-		contents string
-	}{
-		{attemptA, "stub event 0\n"},
-		{attemptA, "stub event 1\n"},
-		{attemptB, "stub event 2\n"},
-		{attemptB, "stub event 3\n"},
-		{attemptB, "stub event 4\n"},
-	}
-	for index, spec := range specs {
-		stub.events = append(stub.events, contract.LogEvent{
-			AttemptID: spec.attempt, Stream: contract.LogStdout, Sequence: uint64(index),
-			Timestamp: time.Now().UTC(), Bytes: []byte(spec.contents),
-		})
-	}
+// newStubServiceLogsClients serves a stub L1 log API in-process and returns
+// the clients a `services logs` invocation talks to.
+func newStubServiceLogsClients(t *testing.T, stub *cutoffStubLogServer) *apiClients {
+	t.Helper()
 	network := plain.NewNetwork()
 	serving := network.NewFabric(fabric.Identity{NodeID: "log-stub-serving"})
 	listener, err := serving.Listen("tcp", "127.0.0.1:0")
@@ -258,11 +378,44 @@ func TestServiceLogsAllWalksCutoffShapedPages(t *testing.T) {
 	go func() { _ = httpServer.Serve(listener) }()
 	t.Cleanup(func() { _ = httpServer.Close() })
 	calling := network.NewFabric(fabric.Identity{NodeID: "log-stub-calling"})
-	clients := &apiClients{
+	return &apiClients{
 		l1:     newAPIClient("L1", "l1", calling, listener.Addr().String()),
 		wait:   waitForContext,
 		images: newRegistryResolver(nil),
 	}
+}
+
+func stubLogEvents(specs []struct {
+	attempt  string
+	contents string
+}) []contract.LogEvent {
+	events := make([]contract.LogEvent, 0, len(specs))
+	for index, spec := range specs {
+		events = append(events, contract.LogEvent{
+			AttemptID: spec.attempt, Stream: contract.LogStdout, Sequence: uint64(index),
+			Timestamp: time.Now().UTC(), Bytes: []byte(spec.contents),
+		})
+	}
+	return events
+}
+
+func TestServiceLogsAllWalksCutoffShapedPages(t *testing.T) {
+	stub := &cutoffStubLogServer{}
+	attemptA := "stub-attempt-a"
+	attemptB := "stub-attempt-b"
+	// The last event has no trailing newline: the NEXT CURSOR hint that
+	// follows it must not glue onto the log line.
+	stub.events = stubLogEvents([]struct {
+		attempt  string
+		contents string
+	}{
+		{attemptA, "stub event 0\n"},
+		{attemptA, "stub event 1\n"},
+		{attemptB, "stub event 2\n"},
+		{attemptB, "stub event 3\n"},
+		{attemptB, "stub event 4"},
+	})
+	clients := newStubServiceLogsClients(t, stub)
 	ctx := context.Background()
 
 	// The default read is still one page: a stub page stops early despite
@@ -299,7 +452,7 @@ func TestServiceLogsAllWalksCutoffShapedPages(t *testing.T) {
 		stubSeen = append(stubSeen, string(event.Bytes))
 	})
 	if !equalStrings(stubSeen, []string{
-		"stub event 0\n", "stub event 1\n", "stub event 2\n", "stub event 3\n", "stub event 4\n",
+		"stub event 0\n", "stub event 1\n", "stub event 2\n", "stub event 3\n", "stub event 4",
 	}) {
 		t.Fatalf("--all --json events = %q", stubSeen)
 	}
@@ -320,6 +473,181 @@ func TestServiceLogsAllWalksCutoffShapedPages(t *testing.T) {
 			t.Fatalf("human continuation missing %q:\n%s", want, humanContinuation)
 		}
 	}
+
+	// The last page has an event whose line does not end in a newline, so
+	// the hint gets its own line in human output too.
+	lastPageHuman := runServiceCLI(t, ctx, clients, false, "services", "logs", "stub-job", "--cursor", "4")
+	if !bytes.Contains(lastPageHuman, []byte("\nNEXT CURSOR\t5")) {
+		t.Fatalf("hint glued onto an unterminated log line or lost:\n%s", lastPageHuman)
+	}
+	if bytes.Contains(lastPageHuman, []byte("stub event 4NEXT CURSOR")) {
+		t.Fatalf("hint glued onto the log line:\n%s", lastPageHuman)
+	}
+
+	// An empty page is the end: no events, no hint.
+	var emptyOut, emptyErr bytes.Buffer
+	if err := execute(ctx, clients, false,
+		[]string{"services", "logs", "stub-job", "--cursor", "5"}, &emptyOut, &emptyErr); err != nil {
+		t.Fatalf("empty-page human read = %v, stderr=%s", err, emptyErr.String())
+	}
+	if bytes.Contains(emptyOut.Bytes(), []byte("NEXT CURSOR")) || emptyOut.Len() != 0 {
+		t.Fatalf("empty page printed a hint or noise:\nstdout=%q", emptyOut.String())
+	}
+
+	// --all accepts --cursor and walks the remaining pages to the end.
+	tailHuman := runServiceCLI(t, ctx, clients, false,
+		"services", "logs", "stub-job", "--all", "--cursor", "2")
+	for _, want := range []string{"stub event 2", "stub event 3", "stub event 4"} {
+		if !bytes.Contains(tailHuman, []byte(want)) {
+			t.Fatalf("--all from cursor missing %q:\n%s", want, tailHuman)
+		}
+	}
+	if bytes.Contains(tailHuman, []byte("stub event 0")) || bytes.Contains(tailHuman, []byte("stub event 1")) {
+		t.Fatalf("--all from cursor replayed pages before the cursor:\n%s", tailHuman)
+	}
+	if bytes.Contains(tailHuman, []byte("NEXT CURSOR")) {
+		t.Fatalf("--all from cursor drained the log yet advertised a cursor:\n%s", tailHuman)
+	}
+}
+
+// TestServiceLogsAllStopsAtWalkPageCap bounds the walk: a log still growing
+// after the cap's worth of pages stops the walk with the resume point, exit 0,
+// hint on stdout in human mode and stderr in --json mode.
+func TestServiceLogsAllStopsAtWalkPageCap(t *testing.T) {
+	stub := &cutoffStubLogServer{}
+	stub.events = stubLogEvents([]struct {
+		attempt  string
+		contents string
+	}{
+		{"stub-cap-a", "cap event 0\n"},
+		{"stub-cap-a", "cap event 1\n"},
+		{"stub-cap-a", "cap event 2\n"},
+		{"stub-cap-b", "cap event 3\n"},
+		{"stub-cap-b", "cap event 4\n"},
+	})
+	clients := newStubServiceLogsClients(t, stub)
+	ctx := context.Background()
+	savedCap := logWalkPageCap
+	logWalkPageCap = 2
+	defer func() { logWalkPageCap = savedCap }()
+
+	var stdout, stderr bytes.Buffer
+	if err := execute(ctx, clients, false, []string{
+		"services", "logs", "stub-job", "--all",
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("capped --all = %v, stderr=%s", err, stderr.String())
+	}
+	for _, want := range []string{"cap event 0", "cap event 1", "NEXT CURSOR\t2"} {
+		if !bytes.Contains(stdout.Bytes(), []byte(want)) {
+			t.Fatalf("capped --all human stdout missing %q:\nstdout=%s", want, stdout.String())
+		}
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("cap event 2")) {
+		t.Fatalf("capped --all human walked past the cap:\nstdout=%s", stdout.String())
+	}
+
+	var jsonStdout, jsonStderr bytes.Buffer
+	if err := execute(ctx, clients, true, []string{
+		"services", "logs", "stub-job", "--all",
+	}, &jsonStdout, &jsonStderr); err != nil {
+		t.Fatalf("capped --all --json = %v, stderr=%s", err, jsonStderr.String())
+	}
+	var jsonSeen []string
+	scanJSONEvents(t, jsonStdout.Bytes(), func(event contract.LogEvent) {
+		jsonSeen = append(jsonSeen, string(event.Bytes))
+	})
+	if !equalStrings(jsonSeen, []string{"cap event 0\n", "cap event 1\n"}) {
+		t.Fatalf("capped --all --json events = %q", jsonSeen)
+	}
+	if !bytes.Contains(jsonStderr.Bytes(), []byte("NEXT CURSOR\t2")) {
+		t.Fatalf("capped --all --json stderr missing the resume hint:\nstderr=%s", jsonStderr.String())
+	}
+	if bytes.Contains(jsonStdout.Bytes(), []byte("NEXT CURSOR")) {
+		t.Fatalf("capped --all --json put the hint on stdout:\nstdout=%s", jsonStdout.String())
+	}
+
+	// The printed hint resumes the walk to its end; restore the default
+	// cap first so the remainder fits inside this one walk.
+	logWalkPageCap = savedCap
+	resume := runServiceCLI(t, ctx, clients, false,
+		"services", "logs", "stub-job", "--all", "--cursor", "2")
+	for _, want := range []string{"cap event 2", "cap event 3", "cap event 4"} {
+		if !bytes.Contains(resume, []byte(want)) {
+			t.Fatalf("resumed --all missing %q:\n%s", want, resume)
+		}
+	}
+	if bytes.Contains(resume, []byte("NEXT CURSOR")) {
+		t.Fatalf("resumed --all drained the log yet advertised a cursor:\n%s", resume)
+	}
+}
+
+// TestServiceLogsAllRetriesRetryablePoll carries the #763 rule over to --all:
+// a retryable 503 mid-walk is one bad poll, not a verdict. The walk retries at
+// the poll interval and completes; a non-retryable answer ends it.
+func TestServiceLogsAllRetriesRetryablePoll(t *testing.T) {
+	stub := &cutoffStubLogServer{}
+	stub.events = stubLogEvents([]struct {
+		attempt  string
+		contents string
+	}{
+		{"stub-retry-a", "retry event 0\n"},
+		{"stub-retry-a", "retry event 1\n"},
+		{"stub-retry-a", "retry event 2\n"},
+		{"stub-retry-b", "retry event 3\n"},
+		{"stub-retry-b", "retry event 4\n"},
+	})
+	// One bad poll before the second event's page and one before the
+	// fourth's, so the walk hit retries in the middle, not only at the top.
+	stub.retryableFailures = map[int]int{1: 2, 3: 1}
+	clients := newStubServiceLogsClients(t, stub)
+	ctx := context.Background()
+
+	retryOutput := runServiceCLI(t, ctx, clients, false,
+		"services", "logs", "stub-job", "--all", "--poll-interval", "2ms")
+	for _, want := range []string{"retry event 0", "retry event 1", "retry event 2", "retry event 3", "retry event 4"} {
+		if !bytes.Contains(retryOutput, []byte(want)) {
+			t.Fatalf("--all after retryable polls missing %q:\n%s", want, retryOutput)
+		}
+	}
+	if stub.servedRetryableFailures() != 3 {
+		t.Fatalf("stub served %d retryable failures, want 3 (retries at cursors 1 and 3)", stub.servedRetryableFailures())
+	}
+	if bytes.Contains(retryOutput, []byte("NEXT CURSOR")) {
+		t.Fatalf("--all after retries drained the log yet advertised a cursor:\n%s", retryOutput)
+	}
+}
+
+func TestServiceLogsAllStopsOnNonRetryablePoll(t *testing.T) {
+	stub := &cutoffStubLogServer{}
+	stub.events = stubLogEvents([]struct {
+		attempt  string
+		contents string
+	}{
+		{"stub-fatal-a", "fatal event 0\n"},
+		{"stub-fatal-a", "fatal event 1\n"},
+		{"stub-fatal-a", "fatal event 2\n"},
+	})
+	stub.nonRetryableCursor = 2
+	stub.nonRetryableOn = true
+	clients := newStubServiceLogsClients(t, stub)
+	ctx := context.Background()
+
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, clients, false, []string{
+		"services", "logs", "stub-job", "--all", "--poll-interval", "2ms",
+	}, &stdout, &stderr)
+	var responseErr *apiResponseError
+	if !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorInternal || responseErr.APIError.Retryable {
+		t.Fatalf("--all with a non-retryable mid-walk answer = %v (%T), want the L1 internal error", err, err)
+	}
+	for _, want := range []string{"fatal event 0", "fatal event 1"} {
+		if !bytes.Contains(stdout.Bytes(), []byte(want)) {
+			t.Fatalf("walk stopped before its earlier events:\nstdout=%s", stdout.String())
+		}
+	}
+	if bytes.Contains(stdout.Bytes(), []byte("fatal event 2")) {
+		t.Fatalf("walk printed events from the page that failed:\nstdout=%s", stdout.String())
+	}
 }
 
 // TestServiceLogsPagingUsageErrors keeps the invalid combinations out of the
@@ -327,7 +655,6 @@ func TestServiceLogsAllWalksCutoffShapedPages(t *testing.T) {
 // coverage; no new exit code appears in #767.
 func TestServiceLogsPagingUsageErrors(t *testing.T) {
 	for _, args := range [][]string{
-		{"job", "--all", "--cursor", "opaque"},
 		{"job", "--all", "--follow"},
 		{"job", "--all", "--follow", "--follow-for", "5ms"},
 	} {

@@ -654,6 +654,41 @@ func executeServiceForget(
 	return writeServiceResult(stdout, job, jsonOutput)
 }
 
+// logWalkPageCap bounds the --all walk so a log that keeps growing for a
+// whole cap's worth of pages cannot run the walk forever. It is generous on
+// purpose; the printed NEXT CURSOR keeps the read resumable. Tests shrink it.
+var logWalkPageCap = 1000
+
+// writeNextCursorHint tells a reader where an event-bearing log page left
+// off. For logs, next_cursor sits on every page, so the hint is owed only
+// when the page had events; an empty page, not a missing cursor, is the end.
+// The hint follows the log text, so a last event without a trailing newline
+// gets one first, on the stream that event printed to -- in --json mode the
+// hint names its own line on stderr and stdout stays one event per line.
+func writeNextCursorHint(
+	stdout, stderr io.Writer, jsonOutput bool,
+	cursor string, lastEvent []byte, lastEventStream contract.LogStream,
+) error {
+	if cursor == "" {
+		return nil
+	}
+	glueWriter := stdout
+	if !jsonOutput && lastEventStream == contract.LogStderr {
+		glueWriter = stderr
+	}
+	if !jsonOutput && len(lastEvent) > 0 && lastEvent[len(lastEvent)-1] != '\n' {
+		if _, err := fmt.Fprintln(glueWriter); err != nil {
+			return err
+		}
+	}
+	writer := stdout
+	if jsonOutput {
+		writer = stderr
+	}
+	_, err := fmt.Fprintf(writer, "NEXT CURSOR\t%s\n", cursor)
+	return err
+}
+
 func executeServiceLogs(
 	ctx context.Context,
 	clients *apiClients,
@@ -671,8 +706,8 @@ func executeServiceLogs(
 	flags.BoolVar(&follow, "follow", false, "keep polling across service attempts")
 	flags.DurationVar(&followFor, "follow-for", 0, "stop following after this duration")
 	flags.DurationVar(&pollInterval, "poll-interval", defaultServicePollInterval, "follow polling interval")
-	flags.StringVar(&requestedCursor, "cursor", "", "opaque cursor from the previous page; with --follow, start polling from it")
-	flags.BoolVar(&all, "all", false, "walk every page and print every retained event (cannot combine with --follow or --cursor)")
+	flags.StringVar(&requestedCursor, "cursor", "", "opaque cursor to continue from (with --follow, start polling from it); an empty page, not a missing cursor, ends the log")
+	flags.BoolVar(&all, "all", false, "walk pages and print every retained event, from --cursor if given; stops at an empty page, or at a walk-page cap whose NEXT CURSOR names the resume point")
 	flags.IntVar(&limit, "limit", l1.DefaultLogPageLimit, "events per poll")
 	if err := flags.Parse(args); err != nil {
 		return usageError(err.Error())
@@ -695,9 +730,6 @@ func executeServiceLogs(
 	if all && follow {
 		return usageError("--all prints every retained event once; it cannot follow")
 	}
-	if all && requestedCursor != "" {
-		return usageError("--all walks the retained log from the start; --cursor has nothing to continue from")
-	}
 
 	followCtx := ctx
 	cancel := func() {}
@@ -709,6 +741,9 @@ func executeServiceLogs(
 	jobID := flags.Arg(0)
 	cursor := requestedCursor
 	lastAttemptID := ""
+	var lastEvent []byte
+	lastEventStream := contract.LogStdout
+	walkedPages := 0
 	var truncation truncationAnnouncer
 	for {
 		page, err := clients.getServiceLogs(followCtx, jobID, cursor, limit)
@@ -718,10 +753,11 @@ func executeServiceLogs(
 			if ctx.Err() == nil && followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
 				return nil
 			}
-			// A follow with no deadline sees a retryable 503 as one bad poll,
-			// not a verdict (#763). Keep following at the normal interval;
-			// only cancellation or a non-retryable answer ends it.
-			if follow && isRetryableL1Answer(err) && ctx.Err() == nil && followCtx.Err() == nil {
+			// A follow with no deadline -- and a --all walk -- sees a
+			// retryable 503 as one bad poll, not a verdict (#763). Keep
+			// asking at the normal interval; only cancellation or a
+			// non-retryable answer ends it.
+			if (follow || all) && isRetryableL1Answer(err) && ctx.Err() == nil && followCtx.Err() == nil {
 				if sleepFollowRetry(followCtx, pollInterval) {
 					continue
 				}
@@ -758,20 +794,33 @@ func executeServiceLogs(
 			if err := writeServiceLogEvents(stdout, stderr, page.Events, &lastAttemptID); err != nil {
 				return err
 			}
+			lastEvent = nil
+			if len(page.Events) > 0 {
+				lastEvent = page.Events[len(page.Events)-1].Bytes
+				lastEventStream = page.Events[len(page.Events)-1].Stream
+			}
 		}
 		cursor = page.NextCursor
 		if !follow {
-			// --all walks until the empty poll that means the retained log
-			// is drained; anything before that empty page carries more
-			// events behind the cursor.
+			// --all walks from --cursor, or the start of the retained log,
+			// until the empty poll that is its end; anything before that
+			// empty page carries more events behind the cursor.
 			if all && len(page.Events) > 0 && page.NextCursor != "" {
+				walkedPages++
+				if walkedPages >= logWalkPageCap {
+					// The log kept growing for a whole cap's worth of
+					// pages. Report where to continue and leave the walk
+					// resumable instead of running it forever.
+					return writeNextCursorHint(stdout, stderr, jsonOutput, page.NextCursor, lastEvent, lastEventStream)
+				}
 				continue
 			}
-			// One page shows its continuation point; --all has already
-			// drained the log, so it has no next cursor to name.
-			if !all && page.NextCursor != "" {
-				_, err := fmt.Fprintf(stdout, "NEXT CURSOR\t%s\n", page.NextCursor)
-				return err
+			// L1 sets next_cursor on every log page, so a cursor may name
+			// an empty page rather than more events: for logs the empty
+			// page, not a missing cursor, is the end. A page with events
+			// shows where it left off.
+			if !all && len(page.Events) > 0 {
+				return writeNextCursorHint(stdout, stderr, jsonOutput, page.NextCursor, lastEvent, lastEventStream)
 			}
 			return nil
 		}
