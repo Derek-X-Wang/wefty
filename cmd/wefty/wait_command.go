@@ -108,7 +108,11 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		if expired(deadline) {
 			return waitExpired(stdout, runID, last, started, jsonOutput)
 		}
-		record, err := clients.getRun(requestContext(ctx, deadline, &cancelRequest), runID)
+		// This poll context is also marked out of the shared client's
+		// one-shot quiet retry (#773): the wait itself keeps answering
+		// transient failures with another poll at its own backoff (#763), and
+		// stacking the client's retry on top would double that cadence.
+		record, err := clients.getRun(withoutClientRetry(requestContext(ctx, deadline, &cancelRequest)), runID)
 		cancelRequest()
 		if err != nil {
 			if ctx.Err() != nil {

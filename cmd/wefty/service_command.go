@@ -696,6 +696,12 @@ func executeServiceLogs(
 		followCtx, cancel = context.WithTimeout(ctx, followFor)
 	}
 	defer cancel()
+	if follow {
+		// A follow retries retryable answers at its own interval (#763, #773):
+		// the shared client's one-shot quiet retry is doubled backoff on top
+		// of it, so the loop's reads are marked out.
+		followCtx = withoutClientRetry(followCtx)
+	}
 
 	jobID := flags.Arg(0)
 	cursor := ""
@@ -780,6 +786,10 @@ func waitForService(
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
+	// A wait retries retryable answers at its own interval (#763, #773): the
+	// shared client's one-shot quiet retry is doubled backoff on top of it,
+	// so the loop's reads are marked out.
+	waitCtx = withoutClientRetry(waitCtx)
 	timeout := func(lastRetryable error) error {
 		message := fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)
 		if lastRetryable != nil {

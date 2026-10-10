@@ -158,6 +158,10 @@ func executeComputerGrant(
 		return err
 	}
 	if waitForCompletion && result.Revocation != nil {
+		// The observation loop retries retryable answers at its own interval
+		// (#763, #773): the shared client's one-shot quiet retry is doubled
+		// backoff on top of it, so the loop's reads are marked out.
+		observingCtx := withoutClientRetry(ctx)
 		result.ObservationState = "pending"
 		result.LastObservedRevocation = result.Revocation
 		waited := time.Duration(0)
@@ -181,7 +185,7 @@ func executeComputerGrant(
 					computerGrantObservationMessage(result, "observation failed"), result)
 			}
 			waited += delay
-			revocation, err := clients.getComputerPolicyRevocation(ctx, result.Revocation.ComputerID,
+			revocation, err := clients.getComputerPolicyRevocation(observingCtx, result.Revocation.ComputerID,
 				result.Revocation.SubjectFabricID, result.Revocation.SubjectUserID, result.Revocation.PolicyRevision)
 			if err != nil {
 				// The revocation read goes through the snapshot door, so it

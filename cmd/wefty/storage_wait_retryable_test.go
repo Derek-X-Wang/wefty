@@ -385,9 +385,11 @@ func TestOneShotReadStillSurfacesRetryable503FromRealBinary(t *testing.T) {
 	decoder := json.NewDecoder(strings.NewReader(output))
 	var envelope contract.ErrorResponse
 	_ = decoder.Decode(&envelope)
+	// A one-shot read has no wait window: it makes its bounded quiet retries
+	// (#773, one try plus three) and then still surfaces the answer as exit 13.
 	if code != exitUnavailable || envelope.Error.Code != contract.ErrorUnavailable || !envelope.Error.Retryable ||
-		reads.Load() != 1 {
-		t.Fatalf("one-shot read exited %d with %d reads, want 13 without any wait retry: %s", code, reads.Load(), output)
+		reads.Load() != 4 {
+		t.Fatalf("one-shot read exited %d with %d reads, want 13 after one try plus three quiet retries: %s", code, reads.Load(), output)
 	}
 }
 

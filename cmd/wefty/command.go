@@ -568,6 +568,12 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return usageError("--poll-interval must be positive")
 	}
 	runID := flags.Arg(0)
+	if follow {
+		// A follow retries retryable answers at its own interval (#763, #773):
+		// the shared client's one-shot quiet retry is doubled backoff on top
+		// of it, so the loop's reads are marked out.
+		ctx = withoutClientRetry(ctx)
+	}
 	cursor := ""
 	var truncation truncationAnnouncer
 	var lastStatus contract.RunState

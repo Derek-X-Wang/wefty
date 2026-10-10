@@ -56,12 +56,12 @@ func TestProvenanceWalkToleratesARetryableAnswer(t *testing.T) {
 			t.Fatalf("provenance reads = %d, want 3 with provenance attached", reads.Load())
 		}
 	})
-	t.Run("one-shot read is unchanged", func(t *testing.T) {
+	t.Run("one-shot read quietly retries, then reports exit 13 (#773)", func(t *testing.T) {
 		clients, reads := provenanceStub(t, func(int32) bool { return true })
 		output := storageMutationOutput{}
 		err := attachStorageProvenance(ctx, clients, "computer-1", &output, nil)
 		var refusal *apiResponseError
-		if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) || reads.Load() != 1 ||
+		if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) || reads.Load() != 1+3 ||
 			output.ProvenanceUnavailable != "" {
 			t.Fatalf("one-shot provenance read changed: reads=%d exit=%d err=%v note=%q",
 				reads.Load(), commandExitCode(err), err, output.ProvenanceUnavailable)
