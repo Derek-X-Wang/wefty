@@ -272,7 +272,10 @@ func TestReadSnapshotCapUnderContention(t *testing.T) {
 		}
 	}
 
-	writer, cancel := context.WithTimeout(t.Context(), readSnapshotBudget/2)
+	// The readers are released only after this write returns, so a writer
+	// blocked by them would wait out the deadline; 10s is a deadlock watchdog,
+	// not a speed bound (a slow runner's fsync once took longer than 50ms).
+	writer, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	_, writeErr := s.db.ExecContext(writer, "CREATE TABLE writer_progress(value TEXT)")
 	cancel()
 	close(release)
