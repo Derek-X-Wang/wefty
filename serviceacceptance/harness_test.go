@@ -498,21 +498,16 @@ func (h *acceptanceHarness) doJSON(t *testing.T, method, path string, input, out
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := h.client.Do(request)
+	status, payload, err := harnessHTTP(t.Context(), h.client, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
-	payload, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if output != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+	if output != nil && status >= 200 && status < 300 {
 		if err := json.Unmarshal(payload, output); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return response.StatusCode, payload
+	return status, payload
 }
 
 type readyMetadata struct {

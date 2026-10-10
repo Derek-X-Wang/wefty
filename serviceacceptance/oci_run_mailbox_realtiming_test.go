@@ -437,24 +437,16 @@ func runLedgerJSON(t *testing.T, harness *acceptanceHarness, method, path, idemp
 	if idempotencyKey != "" {
 		request.Header.Set("Idempotency-Key", idempotencyKey)
 	}
-	response, err := client.Do(request)
+	status, body, err := harnessHTTP(t.Context(), client, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
-	body := make([]byte, 0, 4096)
-	buffer := make([]byte, 4096)
-	for {
-		count, readErr := response.Body.Read(buffer)
-		body = append(body, buffer[:count]...)
-		if readErr != nil {
-			break
+	if output != nil && len(body) > 0 && status >= 200 && status < 300 {
+		if err := json.Unmarshal(body, output); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if output != nil && len(body) > 0 {
-		_ = json.Unmarshal(body, output)
-	}
-	return response.StatusCode, body
+	return status, body
 }
 
 // readRunLedgerEvidence reads the ledger's own append-only rows. The ledger has

@@ -1342,11 +1342,39 @@ func TestPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 }
 
 func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
-	runPartitionedAgentRejoinFixture(t, false)
+	runPartitionedAgentRejoinFixture(t, false, false)
 }
 
 func TestPartitionedAgentRejoinsAfterTransientReregistrationFailure(t *testing.T) {
-	runPartitionedAgentRejoinFixture(t, true)
+	runPartitionedAgentRejoinFixture(t, true, false)
+}
+
+func TestPartitionedAgentRejoinsAfterTransientFirstClaimFailure(t *testing.T) {
+	runPartitionedAgentRejoinFixture(t, false, true)
+}
+
+type firstClaimFailureTransport struct {
+	base   http.RoundTripper
+	claims atomic.Int32
+}
+
+func (transport *firstClaimFailureTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Path == "/v1/agent/jobs/claim" {
+		body, err := request.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		var claim l1.ClaimRequest
+		err = json.NewDecoder(body).Decode(&claim)
+		body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if claim.Class == contract.JobClassOneShot && transport.claims.Add(1) == 1 {
+			return nil, context.DeadlineExceeded
+		}
+	}
+	return transport.base.RoundTrip(request)
 }
 
 type reregistrationFailureTransport struct {
@@ -1361,7 +1389,7 @@ func (transport *reregistrationFailureTransport) RoundTrip(request *http.Request
 	return transport.base.RoundTrip(request)
 }
 
-func runPartitionedAgentRejoinFixture(t *testing.T, transientFailure bool) {
+func runPartitionedAgentRejoinFixture(t *testing.T, transientFailure, firstClaimFailure bool) {
 	t.Helper()
 	clock := newManualClock(time.Date(2026, 8, 9, 14, 0, 0, 0, time.UTC))
 	network := plain.NewNetwork()
@@ -1372,6 +1400,10 @@ func runPartitionedAgentRejoinFixture(t *testing.T, transientFailure bool) {
 	// too, and the job fails for the test's own ordering (#163).
 	partitionedPolicy := l1.DefaultNodePolicy("linux")
 	partitionedPolicy.MaxOneshotSlots = 1
+	// This fixture exercises only one-shots. Idle service claim workers can
+	// overwrite a transient claim's Rejoining observation with Ready, hiding
+	// the manual-clock backoff the start wait must release.
+	partitionedPolicy.MaxServiceSlots = 0
 	store, stopServer := startFailureServerWithPolicies(t, network, clock, map[string]l1.NodePolicy{
 		"node-1": partitionedPolicy, "node-2": l1.DefaultNodePolicy("linux"),
 	})
@@ -1397,11 +1429,20 @@ func runPartitionedAgentRejoinFixture(t *testing.T, transientFailure bool) {
 		registrationTransport = &reregistrationFailureTransport{base: client.httpClient.Transport}
 		client.httpClient.Transport = registrationTransport
 	}
+	var claimTransport *firstClaimFailureTransport
+	if firstClaimFailure {
+		client := nodeAgent.session.client
+		claimTransport = &firstClaimFailureTransport{base: client.httpClient.Transport}
+		client.httpClient.Transport = claimTransport
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
-	expiredAttemptID := runner.waitStarted(t, done)
+	expiredAttemptID := runner.waitStarted(t, done, clock, nodeAgent)
+	if claimTransport != nil && claimTransport.claims.Load() < 2 {
+		t.Fatal("first attempt started without retrying the injected claim failure")
+	}
 	freshJob := createAgentTestJob(t, store, "partitioned-agent-fresh")
 	clock.waitForDeadline(t, clock.Now().Add(10*time.Second))
 
@@ -1415,7 +1456,7 @@ func runPartitionedAgentRejoinFixture(t *testing.T, transientFailure bool) {
 		t.Fatalf("agent exited after attempt-authority loss: %v", err)
 	default:
 	}
-	freshAttemptID := runner.waitStartedAfterRejoin(t, done, clock, nodeAgent)
+	freshAttemptID := runner.waitStarted(t, done, clock, nodeAgent)
 	if registrationTransport != nil && registrationTransport.registrations.Load() < 3 {
 		t.Fatal("fresh attempt started without retrying the injected re-registration failure")
 	}
@@ -3737,21 +3778,7 @@ func (runner *resilienceRunner) Run(ctx context.Context, request processrunner.R
 	return contract.ProcessResult{ExitCode: &exitCode}, nil
 }
 
-func (runner *resilienceRunner) waitStarted(t *testing.T, done <-chan error) string {
-	t.Helper()
-	select {
-	case attemptID := <-runner.started:
-		return attemptID
-	case err := <-done:
-		t.Fatalf("agent exited before runtime start: %v", err)
-		return ""
-	case <-time.After(resilienceTestWatchdog):
-		t.Fatal("process runner did not start")
-		return ""
-	}
-}
-
-func (runner *resilienceRunner) waitStartedAfterRejoin(t *testing.T, done <-chan error, clock *manualClock, nodeAgent *Agent) string {
+func (runner *resilienceRunner) waitStarted(t *testing.T, done <-chan error, clock *manualClock, nodeAgent *Agent) string {
 	t.Helper()
 	watchdog := time.NewTimer(resilienceTestWatchdog)
 	defer watchdog.Stop()
@@ -3765,14 +3792,15 @@ func (runner *resilienceRunner) waitStartedAfterRejoin(t *testing.T, done <-chan
 			t.Fatalf("agent exited before runtime start: %v", err)
 			return ""
 		case <-watchdog.C:
-			t.Fatal("process runner did not start")
+			t.Fatalf("process runner did not start: agent=%+v", nodeAgent.Status())
 			return ""
 		case <-poll.C:
-			// Registration retries wait on the manual clock. Drive their
-			// backoff while rejoining, without aging a fresh attempt's lease.
+			// Initial claim and registration retries both wait on the manual
+			// clock. Advance only once the backoff timer is armed. Advancing
+			// during the RPC would age its lease while the answer is in flight.
 			status := nodeAgent.Status()
 			if status.State == LifecycleRejoining && status.SessionBackoff > 0 {
-				clock.Advance(status.SessionBackoff)
+				clock.advanceArmedBackoff(status.SessionBackoff)
 			}
 		}
 	}
@@ -3858,8 +3886,29 @@ func (clock *manualClock) NewTimer(duration time.Duration) Timer {
 	return timer
 }
 
+func (clock *manualClock) advanceArmedBackoff(duration time.Duration) {
+	clock.advance(duration, true)
+}
+
 func (clock *manualClock) Advance(duration time.Duration) {
+	clock.advance(duration, false)
+}
+
+func (clock *manualClock) advance(duration time.Duration, requireArmedBackoff bool) {
 	clock.mu.Lock()
+	if requireArmedBackoff {
+		armed := false
+		for _, timer := range clock.timers {
+			if timer.active && timer.deadline.Equal(clock.now.Add(duration)) {
+				armed = true
+				break
+			}
+		}
+		if !armed {
+			clock.mu.Unlock()
+			return
+		}
+	}
 	clock.now = clock.now.Add(duration)
 	clock.wall = clock.wall.Add(duration)
 	now := clock.now
