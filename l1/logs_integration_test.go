@@ -60,10 +60,10 @@ func TestTailRunningJobWithOpaqueCursorAndPerStreamOrder(t *testing.T) {
 	if err := json.Unmarshal(body, &first); err != nil {
 		t.Fatal(err)
 	}
-	// The limit caps a page, but an adaptive read cutoff may stop the page
-	// after one complete row, so require the row and the opaque cursor the
-	// continuation needs rather than a full page here.
-	if len(first.Events) < 1 || first.NextCursor == "" {
+	// The limit caps a page, and an adaptive read cutoff may stop it after
+	// one complete row: between one row and the limit, with the opaque cursor
+	// the continuation needs.
+	if n := len(first.Events); n < 1 || n > 2 || first.NextCursor == "" {
 		t.Fatalf("first page = %#v", first)
 	}
 	// Treat the cursor only as an opaque token returned by the protocol. The

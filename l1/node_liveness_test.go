@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"reflect"
@@ -93,20 +94,20 @@ func TestNodesEffectiveLivenessFiltersBeforePaging(t *testing.T) {
 			var cursor string
 			var ids []string
 			for pageNumber := 0; ; pageNumber++ {
-				if pageNumber > 250 {
+				if pageNumber > 4 {
 					t.Fatal("paging did not terminate")
 				}
-				page, err := h.store.listNodesPage(t.Context(), filters, cursor, 2)
+				// Pin the adaptive cutoff out of reach: this test is about the
+				// filter running before LIMIT, which only full pages can show.
+				ctx := context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Hour)
+				page, err := h.store.listNodesPage(ctx, filters, cursor, 2)
 				if err != nil {
 					t.Fatal(err)
 				}
 				remaining := len(check.want) - len(ids)
-				// An adaptive page may stop short of its limit at the read
-				// cutoff, so requiring a full page here would fail the slow
-				// machine. The essential property is what these pages must
-				// never contain: rows the filter excludes.
-				if len(page.Nodes) > min(2, remaining) {
-					t.Fatalf("filter applied after paging: page=%#v want rows<=%d", page, min(2, remaining))
+				wantCount := min(2, remaining)
+				if len(page.Nodes) != wantCount {
+					t.Fatalf("filter applied after paging: page=%#v want rows=%d", page, wantCount)
 				}
 				for _, node := range page.Nodes {
 					if string(node.State) != check.state {
