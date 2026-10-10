@@ -2491,11 +2491,14 @@ func tryLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, idemp
 
 func runLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, idempotencyKey string, body any) liveComputerHTTPResult {
 	t.Helper()
-	result, err := tryLiveComputerHTTP(t, computer, method, path, idempotencyKey, body)
+	status, payload, err := retryHarnessRequest(t.Context(), t.Logf, method, path, idempotencyKey, func() (int, []byte, error) {
+		result, err := tryLiveComputerHTTP(t, computer, method, path, idempotencyKey, body)
+		return result.Status, []byte(result.Body), err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return result
+	return liveComputerHTTPResult{Status: status, Body: string(payload)}
 }
 
 func listComputerRunsFromAuthority(t *testing.T, harness *acceptanceHarness, computerID string) l3.ComputerRunPage {
@@ -2515,17 +2518,12 @@ func listComputerRunsFromAuthority(t *testing.T, harness *acceptanceHarness, com
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := client.Do(request)
+	status, payload, err := harnessHTTP(t.Context(), t.Logf, client, request)
 	if err != nil {
 		t.Fatalf("list Computer Runs from L3 authority: %v", err)
 	}
-	defer response.Body.Close()
-	payload, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("list Computer Runs from L3 authority status=%d body=%s", response.StatusCode, payload)
+	if status != http.StatusOK {
+		t.Fatalf("list Computer Runs from L3 authority status=%d body=%s", status, payload)
 	}
 	var page l3.ComputerRunPage
 	if err := json.Unmarshal(payload, &page); err != nil {
