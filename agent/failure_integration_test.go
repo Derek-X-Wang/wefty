@@ -1342,6 +1342,27 @@ func TestPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 }
 
 func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
+	runPartitionedAgentRejoinFixture(t, false)
+}
+
+func TestPartitionedAgentRejoinsAfterTransientReregistrationFailure(t *testing.T) {
+	runPartitionedAgentRejoinFixture(t, true)
+}
+
+type reregistrationFailureTransport struct {
+	base          http.RoundTripper
+	registrations atomic.Int32
+}
+
+func (transport *reregistrationFailureTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Path == "/v1/agent/nodes/register" && transport.registrations.Add(1) == 2 {
+		return nil, errors.New("injected transient re-registration failure")
+	}
+	return transport.base.RoundTrip(request)
+}
+
+func runPartitionedAgentRejoinFixture(t *testing.T, transientFailure bool) {
+	t.Helper()
 	clock := newManualClock(time.Date(2026, 8, 9, 14, 0, 0, 0, time.UTC))
 	network := plain.NewNetwork()
 	// One one-shot slot: the only claim loop stays inside the expired attempt
@@ -1370,6 +1391,12 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
+	var registrationTransport *reregistrationFailureTransport
+	if transientFailure {
+		client := nodeAgent.session.client
+		registrationTransport = &reregistrationFailureTransport{base: client.httpClient.Transport}
+		client.httpClient.Transport = registrationTransport
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -1388,7 +1415,10 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		t.Fatalf("agent exited after attempt-authority loss: %v", err)
 	default:
 	}
-	freshAttemptID := runner.waitStarted(t, done)
+	freshAttemptID := runner.waitStartedAfterRejoin(t, done, clock, nodeAgent)
+	if registrationTransport != nil && registrationTransport.registrations.Load() < 3 {
+		t.Fatal("fresh attempt started without retrying the injected re-registration failure")
+	}
 	if freshAttemptID == expiredAttemptID {
 		t.Fatalf("fresh job reused expired attempt %q", freshAttemptID)
 	}
@@ -3721,6 +3751,33 @@ func (runner *resilienceRunner) waitStarted(t *testing.T, done <-chan error) str
 	}
 }
 
+func (runner *resilienceRunner) waitStartedAfterRejoin(t *testing.T, done <-chan error, clock *manualClock, nodeAgent *Agent) string {
+	t.Helper()
+	watchdog := time.NewTimer(resilienceTestWatchdog)
+	defer watchdog.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case attemptID := <-runner.started:
+			return attemptID
+		case err := <-done:
+			t.Fatalf("agent exited before runtime start: %v", err)
+			return ""
+		case <-watchdog.C:
+			t.Fatal("process runner did not start")
+			return ""
+		case <-poll.C:
+			// Registration retries wait on the manual clock. Drive their
+			// backoff while rejoining, without aging a fresh attempt's lease.
+			status := nodeAgent.Status()
+			if status.State == LifecycleRejoining && status.SessionBackoff > 0 {
+				clock.Advance(status.SessionBackoff)
+			}
+		}
+	}
+}
+
 func (runner *resilienceRunner) waitCanceled(t *testing.T, want string) {
 	t.Helper()
 	select {
@@ -3827,7 +3884,7 @@ func (clock *manualClock) AdvanceWall(duration time.Duration) {
 
 func (clock *manualClock) waitForDeadline(t *testing.T, deadline time.Time) {
 	t.Helper()
-	waitUntil := time.Now().Add(5 * time.Second)
+	waitUntil := time.Now().Add(resilienceTestWatchdog)
 	for time.Now().Before(waitUntil) {
 		clock.mu.Lock()
 		found := false

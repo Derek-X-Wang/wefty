@@ -2508,8 +2508,9 @@ func assertPendingEvidenceDoesNotBlockRegistration(t *testing.T) {
 		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-2", Version: "test",
 		// Registration is observed while the poison request is held; no fast
-		// HTTP response is part of this test's contract.
-		OperationTimeout: 10 * time.Second, LogRetryInterval: time.Millisecond,
+		// HTTP response is part of this test's contract. The operation timeout
+		// exceeds the registration watchdog so serialized replay cannot pass.
+		OperationTimeout: 30 * time.Second, LogRetryInterval: time.Millisecond,
 		HeartbeatInterval: time.Second, ClaimInterval: 10 * time.Millisecond,
 		LogSpoolDirectory: spoolDirectory, LogSpoolMaxBytes: 1024,
 	})

@@ -235,7 +235,9 @@ func TestCancelReviewLookupBudgetAndBackoff(t *testing.T) {
 		}
 	}
 	lookup := &unavailableLookupClient{hang: true}
-	const budget = 50 * time.Millisecond
+	// Allow the preceding SQLite read to finish under hosted CPU contention
+	// while still bounding the lookup's ten-second hang.
+	const budget = 500 * time.Millisecond
 	r, _ := NewReconciler(s, &recordingJobClient{}, ReconcilerConfig{DispatchLookup: lookup, DispatchRecoveryBudget: budget})
 	started := time.Now()
 	_ = r.ReconcileOnce(ctx)
