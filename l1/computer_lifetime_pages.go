@@ -12,7 +12,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-// Ordinals survive deletion and reinsertion; display keys never fix membership.
+// AUTOINCREMENT ordinals are never reused; deletion/reinsertion gets a new
+// ordinal and cannot join an existing walk. Display keys never fix membership.
 type computerLifetimeCursor struct {
 	Version    int    `json:"v"`
 	Kind       string `json:"kind"`
@@ -68,7 +69,7 @@ func (r *databaseReads) computerLifetimeCursor(ctx context.Context, kind, comput
 			query = `SELECT COALESCE(MAX(ordinal),0) FROM custody_export_listing_order`
 		}
 		if err := r.q.QueryRowContext(ctx, query).Scan(&cursor.HighWater); err != nil {
-			return cursor, 0, err
+			return cursor, 0, internalError(err, "read Computer collection insertion watermark")
 		}
 	}
 	return cursor, limit, nil

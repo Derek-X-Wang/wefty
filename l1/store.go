@@ -4125,6 +4125,9 @@ WHERE job_id=? AND ordinal>? ORDER BY ordinal LIMIT ?`, jobID, after, limit)
 	page := LogPage{Events: []contract.LogEvent{}}
 	last := after
 	for rows.Next() {
+		if len(page.Events) > 0 && r.pageCutoffReached() {
+			break
+		}
 		var ordinal int64
 		var stored, payload []byte
 		if err := rows.Scan(&ordinal, &stored, &payload); err != nil {

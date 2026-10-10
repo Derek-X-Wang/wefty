@@ -283,7 +283,8 @@ type ComputerCustodyExportList struct {
 	NextCursor string                  `json:"next_cursor,omitempty"`
 }
 
-// ListComputerCustodyExports walks separate page snapshots for internal inventory callers.
+// ListComputerCustodyExports walks separate page snapshots to assemble a complete inventory.
+// Currently used by tests; production routes return individual pages.
 func (s *Store) ListComputerCustodyExports(ctx context.Context, computerID string) ([]ComputerCustodyExport, error) {
 	result := []ComputerCustodyExport{}
 	cursor := ""

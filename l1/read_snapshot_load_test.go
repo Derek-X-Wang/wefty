@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,21 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 )
+
+// Leave time for cancellation and joins before the test binary's watchdog.
+// A generous cap catches deadlocks without making slow CPUs a speed verdict.
+func loadWatchdogContext(t *testing.T, parent context.Context, cap time.Duration) (context.Context, context.CancelFunc) {
+	t.Helper()
+	deadline := time.Now().Add(cap)
+	if testDeadline, ok := t.Deadline(); ok {
+		remaining := time.Until(testDeadline)
+		reserve := min(5*time.Second, remaining/10)
+		if limit := testDeadline.Add(-reserve); limit.Before(deadline) {
+			deadline = limit
+		}
+	}
+	return context.WithDeadline(parent, deadline)
+}
 
 type loadSamples struct {
 	holds    []time.Duration
@@ -70,28 +86,34 @@ func writeLoadSecret(ctx context.Context, s *Store, n int) error {
 // callback code has not returned. Removing cancellation makes this fail after
 // the generous watchdog, rather than accepting one lucky post-load checkpoint.
 func TestReadSnapshotLoadHeldReaderSecretProgress(t *testing.T) {
+	if readLoadRaceEnabled {
+		t.Skip("race instrumentation changes SQLite hold/checkpoint timing; run the non-race load gate for timing evidence")
+	}
 	s, err := OpenStore(filepath.Join(t.TempDir(), "progress.sqlite"), StoreOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
+	t.Cleanup(func() { s.Close() })
 	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
-	defer unblock()
+	ctx, cancel := loadWatchdogContext(t, t.Context(), time.Minute)
+	var reader sync.WaitGroup
+	reader.Add(1)
+	t.Cleanup(func() { cancel(); unblock(); reader.Wait() })
 	go func() {
-		done <- s.withReadSnapshot(t.Context(), nil, func(context.Context, readModel) error { close(entered); <-release; return nil })
+		defer reader.Done()
+		done <- s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error { close(entered); <-release; return nil })
 	}()
 	select {
 	case <-entered:
-	case <-time.After(12 * time.Second):
+	case <-ctx.Done():
 		t.Fatal("reader did not anchor")
 	}
 	if err = writeLoadSecret(t.Context(), s, 0); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
-	defer cancel()
+
 	start := time.Now()
 	attempts := 0
 	for {
@@ -111,7 +133,7 @@ func TestReadSnapshotLoadHeldReaderSecretProgress(t *testing.T) {
 	unblock()
 	select {
 	case err = <-done:
-	case <-time.After(12 * time.Second):
+	case <-ctx.Done():
 		t.Fatal("reader did not finish")
 	}
 	if errorCode(err) != contract.ErrorUnavailable {
@@ -122,7 +144,23 @@ func TestReadSnapshotLoadHeldReaderSecretProgress(t *testing.T) {
 // Four paging workers, one disk writer, and sequential secret writes/sweeps.
 // The default verdict is membership, no deadlock, and repeated WAL progress;
 // speed is diagnostic unless explicitly opted in.
+// cutoffBoundedLoadViews are read at the 1000-row maximum with an adaptive
+// cutoff, so their hold is bounded by the cutoff rather than by a page cap.
+var cutoffBoundedLoadViews = map[string]bool{"nodes": true, "logs": true}
+
 func TestReadSnapshotSustainedLoad(t *testing.T) {
+	if readLoadRaceEnabled {
+		t.Skip("race instrumentation changes SQLite hold/checkpoint timing; run the non-race load gate for timing evidence")
+	}
+	enforce := os.Getenv("WEFTY_ENFORCE_READ_BUDGET") == "1"
+	trialCap := MaxJobListingPageLimit
+	if value := os.Getenv("WEFTY_READ_JOB_TRIAL_CAP"); value != "" {
+		var err error
+		trialCap, err = strconv.Atoi(value)
+		if err != nil || (trialCap != 150 && trialCap != 200 && trialCap != 250) {
+			t.Fatal("WEFTY_READ_JOB_TRIAL_CAP must be 150, 200 or 250")
+		}
+	}
 	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
 	h.stopServer()
 	export, _ := beginCustodyExport(t, h, node, computer, backup, "load")
@@ -154,14 +192,54 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 	}
 	if _, err = tx.Exec(`INSERT INTO nodes(node_id,identity_node_id,boot_session_id,os,architecture,agent_version,capabilities_json,state,last_heartbeat_ns,max_oneshot_slots,max_service_slots,claims_enabled)
  SELECT 'load-node-'||n,'load-identity-'||n,'boot-'||n,'linux','amd64','load','{"kind:process":true,"kind:oci":true}','alive',?,4,4,1
- FROM (WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<32) SELECT n FROM fixture)`, h.clock.Now().UnixNano()); err != nil {
+ FROM (WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<999) SELECT n FROM fixture)`, h.clock.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	admin := fabric.Identity{FabricID: "load-fabric", UserID: "load-admin", DeviceID: "load-device"}
+	if _, err = tx.Exec(`INSERT INTO admins(fabric_id,user_id,added_revision,added_ns) VALUES(?,?,1,1)`, admin.FabricID, admin.UserID); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		`WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<1000)
+        INSERT INTO admin_policy_audit(revision,operation,actor_kind,actor_fabric_id,actor_user_id,actor_device_id,subject_fabric_id,subject_user_id,created_ns)
+        SELECT n,'add','local_operator','','','','','',n FROM fixture`,
+		`WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<1000)
+        INSERT INTO computer_policy_audit(policy_revision,computer_id,operation,actor_kind,actor_fabric_id,actor_user_id,actor_device_id,subject_fabric_id,subject_user_id,previous_permission,permission,idempotency_key,request_hash,created_ns)
+        SELECT n,?,'grant','local_operator','','','','','','none','view','','load',n FROM fixture`,
+		`WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<1000)
+        INSERT INTO computer_takeover_audit(attempt_id,event_id,event_kind,computer_id,job_id,session_id,fabric_id,user_id,device_id,authorized_role,admitted_mode,policy_revision,authority_generation,occurred_ns,stored_ns,reason,event_count,request_hash)
+        SELECT 'load',printf('event-%04d',n),'session_open',?,'','','','','','view','view',0,0,n,n,'',1,'load' FROM fixture`,
+	} {
+		args := []any{}
+		if strings.Contains(query, "?") {
+			args = append(args, computer.ComputerID)
+		}
+		if _, err = tx.Exec(query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = tx.Exec(`WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<1000)
+     INSERT INTO log_events(job_id,attempt_id,stream,sequence,sequence_end,timestamp_ns,bytes,event_json)
+     SELECT 'load-job-0001','load-attempt-load-job-0001','stdout',n,n,?,zeroblob(1024),json_object('attempt_id','load-attempt-load-job-0001','stream','stdout','sequence',n,'timestamp','2026-08-09T10:00:00Z') FROM fixture`, h.clock.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	// Replace only this fixture's history; retained Computer authority stays put.
+	if _, err = tx.Exec(`DELETE FROM computer_intent_history WHERE computer_id=?`, computer.ComputerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.Exec(`WITH RECURSIVE fixture(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<1000)
+     INSERT INTO computer_intent_history(computer_id,intent_revision,operation,desired_state,storage_id,storage_generation,job_id,spec_revision,actor,created_ns)
+     SELECT ?,n,'start','running',?,1,?,1,'load',n FROM fixture`, computer.ComputerID, computer.StorageID, computer.CurrentJobID); err != nil {
 		t.Fatal(err)
 	}
 	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+	ctx, cancel := loadWatchdogContext(t, t.Context(), 3*time.Minute)
 	defer cancel()
+	if trialCap != MaxJobListingPageLimit {
+		ctx = context.WithValue(ctx, readJobTrialPageLimitContextKey{}, trialCap)
+	}
 	actor := &serviceActionActor{Identity: fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}}, ClientPrincipalTag: DefaultClientPrincipalTag}
 	var mu sync.Mutex
 	samples := map[string]*loadSamples{}
@@ -280,6 +358,48 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 				for _, n := range p.Nodes {
 					a.keys = append(a.keys, n.NodeID)
 				}
+			case "logs":
+				p, e := r.logs(ctx, "load-job-0001", cursor, 1000)
+				err, a.next = e, p.NextCursor
+				if len(p.Events) == 0 {
+					a.next = ""
+				} // Log polls terminate with an empty page, not an absent cursor.
+				for _, event := range p.Events {
+					a.keys = append(a.keys, fmt.Sprint(event.Sequence))
+				}
+
+			case "admin-audit":
+				after, e := decodeAdminAuditCursor(cursor)
+				if e != nil {
+					return a, e
+				}
+				p, e := r.adminAuditPage(ctx, after, 1000)
+				err, a.next = e, p.NextCursor
+				for _, entry := range p.Entries {
+					a.keys = append(a.keys, fmt.Sprint(entry.Revision))
+				}
+			case "policy-audit":
+				p, e := r.computerViewListComputerPolicyAudit(ctx, admin, computer.ComputerID, cursor, 1000)
+				err, a.next = e, p.NextCursor
+				for _, entry := range p.Entries {
+					a.keys = append(a.keys, fmt.Sprint(entry.PolicyRevision))
+				}
+			case "takeover-audit", "takeover-tail":
+				p, e := r.computerViewListComputerTakeoverAudit(ctx, admin, computer.ComputerID, cursor, 1000, name == "takeover-tail")
+				err, a.next = e, p.NextCursor
+				if name == "takeover-tail" {
+					a.next = ""
+				} // tail's cursor starts a subsequent forward observation.
+				for _, entry := range p.Events {
+					a.keys = append(a.keys, entry.EventID)
+				}
+			case "intents":
+				p, e := r.computerViewListComputerIntents(ctx, computer.ComputerID, cursor, 1000)
+				err, a.next = e, p.NextCursor
+				for _, intent := range p.Intents {
+					a.keys = append(a.keys, fmt.Sprint(intent.IntentRevision))
+				}
+
 			case "node-detail":
 				n, e := r.node(ctx, node.NodeID)
 				err = e
@@ -321,7 +441,7 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 				break
 			}
 		}
-		expected := map[string]int{"children": 1000, "computer": 1, "backups": 501, "provenance": 501, "generations": 65, "exports": 65, "nodes": 33, "node-detail": 1}
+		expected := map[string]int{"children": 1000, "computer": 1, "backups": 501, "provenance": 501, "generations": 65, "exports": 65, "nodes": 1000, "node-detail": 1, "admin-audit": 1000, "policy-audit": 1000, "takeover-audit": 1000, "takeover-tail": 1000, "intents": 1000, "logs": 1000}
 		if name == "jobs" || name == "jobs-one-row" {
 			if loadJobs != 1000 {
 				return fmt.Errorf("%s load membership=%d", name, loadJobs)
@@ -337,14 +457,23 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 		return nil
 	}
 	// Stream a bounded 64 MiB file, syncing each 8 MiB. It is independent of
-	// SQLite locks and continues through the one-row measurement.
+	// SQLite locks. Total volume is capped at 256 MiB, including diagnostics.
 	ioCtx, stopIO := context.WithCancel(ctx)
-	defer stopIO()
+	var workers, diskWriter sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		stopIO()
+		workers.Wait()
+		diskWriter.Wait()
+	})
 	ioDone := make(chan error, 1)
 	ioStarted := make(chan struct{})
 	var ioBytes atomic.Int64
+	ioPath := filepath.Join(t.TempDir(), "load-io")
+	diskWriter.Add(1)
 	go func() {
-		f, err := os.Create(filepath.Join(t.TempDir(), "load-io"))
+		defer diskWriter.Done()
+		f, err := os.Create(ioPath)
 		if err != nil {
 			ioDone <- err
 			return
@@ -354,7 +483,7 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 		for i := range buf {
 			buf[i] = byte(i*31 + i/257)
 		}
-		for block := 0; ; block++ {
+		for block := 0; block < 256; block++ {
 			if ioCtx.Err() != nil {
 				ioDone <- nil
 				return
@@ -377,9 +506,10 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 			case <-ioCtx.Done():
 				ioDone <- nil
 				return
-			case <-time.After(5 * time.Millisecond):
+			case <-time.After(50 * time.Millisecond):
 			}
 		}
+		ioDone <- nil
 	}()
 	select {
 	case <-ioStarted:
@@ -390,8 +520,7 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 	}
 	writesDone := make(chan struct{})
 	results := make(chan error, 4)
-	var workers sync.WaitGroup
-	for _, names := range [][]string{{"jobs", "computer"}, {"children", "nodes", "node-detail"}, {"backups", "generations"}, {"provenance", "exports"}} {
+	for _, names := range [][]string{{"jobs", "computer"}, {"children", "nodes", "node-detail", "admin-audit", "policy-audit", "takeover-audit", "takeover-tail", "intents", "logs"}, {"backups", "generations"}, {"provenance", "exports"}} {
 		workers.Add(1)
 		go func(names []string) {
 			defer workers.Done()
@@ -434,7 +563,7 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 			t.Fatal(err)
 		}
 		start := time.Now()
-		progressCtx, finish := context.WithTimeout(ctx, 12*time.Second)
+		progressCtx, finish := loadWatchdogContext(t, ctx, time.Minute)
 		for {
 			attempts++
 			sweep, e := h.store.SweepScrubbedSecrets(progressCtx)
@@ -476,18 +605,28 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Fixed costs include admission, membership and shared node-fact loading.
-	smallCtx := context.WithValue(ctx, readPageCutoffContextKey{}, time.Nanosecond)
-	smallStart := time.Now()
-	if err = walk("jobs-one-row", smallCtx); err != nil {
-		t.Fatal(err)
+	// The 1001-snapshot diagnostic is opt-in and has its own watchdog. Default
+	// membership/hygiene verdicts do not depend on finishing this timing probe.
+	smallElapsed := time.Duration(0)
+	if enforce {
+		diagnosticCtx, finish := loadWatchdogContext(t, t.Context(), time.Minute)
+		if trialCap != MaxJobListingPageLimit {
+			diagnosticCtx = context.WithValue(diagnosticCtx, readJobTrialPageLimitContextKey{}, trialCap)
+		}
+		smallCtx := context.WithValue(diagnosticCtx, readPageCutoffContextKey{}, time.Nanosecond)
+		smallStart := time.Now()
+		err = walk("jobs-one-row", smallCtx)
+		finish()
+		if err != nil {
+			t.Fatal(err)
+		}
+		smallElapsed = time.Since(smallStart)
 	}
-	smallElapsed := time.Since(smallStart)
 	stopIO()
 	if err = <-ioDone; err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("machine=%s/%s CPUs=%d Go=%s readers=4 jobs=1000 attempts=1000 backups=501 provenance=501 nodes=33 lifetime=65 disk_MiB=%d checkpoints=%d attempts=%d longest_progress=%s one_row_walk=%s cost_per_row=%s", runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), runtime.Version(), ioBytes.Load()>>20, checkpoints, attempts, longest, smallElapsed, smallElapsed/1000)
+	t.Logf("machine=%s/%s CPUs=%d Go=%s readers=4 jobs=1000 attempts=1000 backups=501 provenance=501 nodes=1000 audit/intents/logs=1000 lifetime=65 job_cap=%d disk_MiB=%d checkpoints=%d attempts=%d longest_progress=%s one_row_walk=%s cost_per_row=%s", runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), runtime.Version(), trialCap, ioBytes.Load()>>20, checkpoints, attempts, longest, smallElapsed, smallElapsed/1000)
 	names := make([]string, 0, len(samples))
 	for name := range samples {
 		names = append(names, name)
@@ -503,9 +642,17 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 		p95 := v.holds[(len(v.holds)*95+99)/100-1]
 		max := v.holds[len(v.holds)-1]
 		t.Logf("view=%s samples=%d p50=%s p95=%s max=%s rows=%d retries=%d walks=%d mean_walk=%s target=%s hard=%s", name, len(v.holds), p50, p95, max, v.rows, v.retries, v.walks, v.walkTime/time.Duration(v.walks), readSnapshotBudget, readSnapshotHardLimit)
-		if os.Getenv("WEFTY_ENFORCE_READ_BUDGET") == "1" {
-			if p95 > readSnapshotBudget || max > readSnapshotHardLimit || v.retries != 0 {
-				t.Errorf("opt-in read budget exceeded: %s p95=%s max=%s retries=%d", name, p95, max, v.retries)
+		if enforce {
+			// Nodes and logs are read at the 1000-row maximum and adapt: by
+			// design a full page runs to the 120 ms cutoff, above the advisory
+			// target, and returns next_cursor. They are held to the hard limit;
+			// capped views must keep p95 under the target.
+			target := readSnapshotBudget
+			if cutoffBoundedLoadViews[name] {
+				target = readSnapshotHardLimit
+			}
+			if p95 > target || max > readSnapshotHardLimit || v.retries != 0 {
+				t.Errorf("opt-in read budget exceeded: %s p95=%s (target %s) max=%s retries=%d", name, p95, target, max, v.retries)
 			}
 		}
 	}

@@ -280,7 +280,8 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	return updated, false, nil
 }
 
-// ListComputerStorageGenerations walks separate page snapshots for internal inventory callers.
+// ListComputerStorageGenerations walks separate page snapshots to assemble a complete inventory.
+// Currently used by tests; production routes return individual pages.
 func (s *Store) ListComputerStorageGenerations(ctx context.Context, computerID string) (ComputerStorageGenerationList, error) {
 	result := ComputerStorageGenerationList{Generations: []ComputerStorageGeneration{}}
 	cursor := ""

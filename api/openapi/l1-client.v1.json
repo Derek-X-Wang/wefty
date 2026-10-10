@@ -415,7 +415,7 @@
       ],
       "get": {
         "operationId": "getJobLogs",
-        "description": "Class validation, the log page and its truncation marker come from one Read snapshot and pinned clock.",
+        "description": "Class validation, the log page and its truncation marker come from one Read snapshot and pinned clock. Adaptive polls may return fewer events than limit and always keep the last returned event cursor; continue polling until an empty page.",
         "summary": "Poll ordered job logs",
         "parameters": [
           { "name": "class", "in": "query", "required": false, "schema": { "const": "service" }, "description": "Required, as class=service, when the job is a service; must be absent when it is a one-shot. An unscoped read of a service job is invalid_request and a class-scoped read of a one-shot is not_found." },
@@ -1283,7 +1283,7 @@
         "summary": "List current, staging, and retired Storage generations",
         "description": "One Read snapshot and pinned clock per page. Default limit 100, clamped to 250; the adaptive cutoff can return fewer rows with next_cursor. A Computer-bound opaque cursor fixes insertion membership, excluding later inserts even with older display keys. Mutable facts are fresh on continuation. Continue until next_cursor is absent.",
         "parameters": [
-          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "cursor", "in": "query", "description": "Opaque next_cursor from this Computer collection. Preserves the initial insertion watermark; omit or use an empty value for the first page. Limit may change between pages.", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "description": "Values above 250 are clamped; adaptive pages may contain fewer rows.", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
         ],
         "responses": {
@@ -1309,7 +1309,7 @@
         "summary": "Project Storage provenance, managed custody forks, external taint, and exact removal outcomes",
         "description": "Returns durable L1 ledger facts from one Read snapshot per page. Storage provenance rows use a Computer-bound creation/ID cursor and insertion watermark; default 100, clamped to 250, with an adaptive cutoff and next_cursor. Continue until next_cursor is absent. Custody facts are fresh per page and taint covers imports outside the provenance page. The custody graph, forks and exports each have a 1000-entry bound, with an explicit 1001-entry overflow sentinel. Overflow returns HTTP 409 conflict, retryable=false, reason=storage_custody_limit, never a partial custody-taint answer. The 200 ms snapshot hold deadline also bounds elapsed work. Imports and exports that may have placed bytes outside managed custody permanently taint; an export refused before touching the destination does not taint. Operator deletion attestation never clears taint.",
         "parameters": [
-          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "cursor", "in": "query", "description": "Opaque next_cursor from this Computer collection. Preserves the initial insertion watermark; omit or use an empty value for the first page. Limit may change between pages.", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "default": 100 }, "description": "Clamped to 250; adaptive cutoff may return fewer rows." }
         ],
         "responses": {
@@ -1511,13 +1511,13 @@
         "summary": "List permanent external custody events and non-upgrading deletion attestations",
         "description": "One Read snapshot and pinned clock per page. Default limit 100, clamped to 250; the adaptive cutoff can return fewer rows with next_cursor. A Computer-bound opaque cursor fixes insertion membership, excluding later inserts even with older display keys. Mutable facts are fresh on continuation. Continue until next_cursor is absent.",
         "parameters": [
-          { "name": "cursor", "in": "query", "schema": { "type": "string" } },
+          { "name": "cursor", "in": "query", "description": "Opaque next_cursor from this Computer collection. Preserves the initial insertion watermark; omit or use an empty value for the first page. Limit may change between pages.", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "description": "Values above 250 are clamped; adaptive pages may contain fewer rows.", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
         ],
         "responses": {
           "400": { "$ref": "./common.v1.json#/components/responses/BadRequest" },
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
-          "200": { "description": "Custody events ordered by record time.", "content": { "application/json": { "schema": { "type": "object", "required": ["custody_exports"], "properties": { "custody_exports": { "type": "array", "items": { "type": "object" } }, "next_cursor": { "type": "string" } } } } } },
+          "200": { "description": "Custody events ordered by record time.", "content": { "application/json": { "schema": { "type": "object", "additionalProperties": false, "required": ["custody_exports"], "properties": { "custody_exports": { "type": "array", "items": { "type": "object" } }, "next_cursor": { "type": "string" } } } } } },
           "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" }, "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
           "404": { "$ref": "./common.v1.json#/components/responses/NotFound" }, "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }
@@ -1678,7 +1678,7 @@
       "get": {
         "operationId": "listNodes",
         "summary": "List operator-visible nodes",
-        "description": "Returns a page of registered nodes with effective liveness computed from one read-only snapshot and pinned clock, ordered by stable node ID. State filters apply effective liveness before paging. Reads never run cleanup or take the database write lock; background reconciliation records transitions and attempt expiry on its configured cadence (nominally one second; delayed under write contention). Cursors bind the exact filters and freeze insertion membership for a walk, excluding later inserts even when their IDs sort earlier. Mutable state, claims intent, capability observations and operator facts are live per-page snapshots. An empty next_cursor ends the walk.",
+        "description": "Adaptive projection may return fewer rows than limit, with next_cursor at the last returned node; continue until it is absent. Returns a page of registered nodes with effective liveness computed from one read-only snapshot and pinned clock, ordered by stable node ID. State filters apply effective liveness before paging. Reads never run cleanup or take the database write lock; background reconciliation records transitions and attempt expiry on its configured cadence (nominally one second; delayed under write contention). Cursors bind the exact filters and freeze insertion membership for a walk, excluding later inserts even when their IDs sort earlier. Mutable state, claims intent, capability observations and operator facts are live per-page snapshots. An empty next_cursor ends the walk.",
         "parameters": [
           { "name": "cursor", "in": "query", "description": "Opaque continuation cursor from the same filter query. Limit may change between pages.", "schema": { "type": "string" } },
           { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },

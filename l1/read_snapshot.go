@@ -437,6 +437,17 @@ var readSnapshotPageCutoff = readSnapshotPageSoftLimit
 
 type readPageCutoffContextKey struct{}
 
+// Test-only cap trials use the production projectors without changing the
+// public 150-row cap. No production caller sets this unexported context key.
+type readJobTrialPageLimitContextKey struct{}
+
+func readJobPageLimit(ctx context.Context, maximum int) int {
+	if trial, ok := ctx.Value(readJobTrialPageLimitContextKey{}).(int); ok && trial >= maximum && trial <= 250 {
+		return trial
+	}
+	return maximum
+}
+
 // readSnapshotHardLimitContextKey overrides the hard hold limit. Test-only:
 // it has no production caller, and the unexported key keeps it that way.
 type readSnapshotHardLimitContextKey struct{}

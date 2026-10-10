@@ -692,12 +692,25 @@ func (c *apiClients) exportComputerBackup(ctx context.Context, computerID, backu
 	return export, responseWasIdempotentReplay(headers), err
 }
 
+// Accept the prior bare-array response for one release so observing an applied
+// export remains safe while operators upgrade the CLI and L1 independently.
+type custodyExportPage struct{ l1.ComputerCustodyExportList }
+
+func (p *custodyExportPage) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) > 0 && data[0] == '[' {
+		p.ComputerCustodyExportList = l1.ComputerCustodyExportList{}
+		return json.Unmarshal(data, &p.Exports)
+	}
+	return json.Unmarshal(data, &p.ComputerCustodyExportList)
+}
+
 func (c *apiClients) listComputerCustodyExports(ctx context.Context, computerID string) ([]l1.ComputerCustodyExport, error) {
 	exports := []l1.ComputerCustodyExport{}
 	cursor := ""
 	for {
-		var page l1.ComputerCustodyExportList
-		path := "/v1/computers/" + url.PathEscape(computerID) + "/custody-exports?limit=250&cursor=" + url.QueryEscape(cursor)
+		var page custodyExportPage
+		path := "/v1/computers/" + url.PathEscape(computerID) + "/custody-exports?limit=" + strconv.Itoa(l1.MaxComputerListingPageLimit) + "&cursor=" + url.QueryEscape(cursor)
 		if err := c.l1.do(ctx, http.MethodGet, path, nil, nil, &page, http.StatusOK); err != nil {
 			return nil, err
 		}

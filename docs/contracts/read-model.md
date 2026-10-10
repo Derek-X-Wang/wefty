@@ -318,10 +318,12 @@ return `invalid_request`.
 `GET /v1/computers/{computer_id}/storage-generations` returns
 `{generations, next_cursor?}`. Direct `custody-exports` now returns
 `{custody_exports, next_cursor?}`, replacing the previous bare array.
-Continue until `next_cursor` is absent. Internal inventory helpers walk every
+Continue until `next_cursor` is absent. The Store inventory convenience helpers currently serve tests and walk every
 page; their combined inventory is a series of observations, not one snapshot.
 The CLI's custody-export wait lookup walks every page, so an older operation
-remains observable. The CLI has no direct Storage-generation listing consumer.
+remains observable. For one release it accepts both the old bare-array response
+and the paged envelope during CLI/L1 upgrades. The CLI has no direct
+Storage-generation listing consumer.
 The 1000-entry custody-family bound on provenance projection is unchanged;
 direct lifetime lists can walk more than 1000 records.
 
@@ -331,15 +333,32 @@ The final limits are **12 admitted readers**, **100 ms advisory target**,
 **200 ms hard hold limit**, and a **120 ms adaptive cutoff** (60% of the hard
 limit). Jobs and child pages now cap at **150** rows; Computer, Backup,
 provenance, Storage-generation and direct Custody-export pages retain **250**.
-Other collection maxima remain **1000**.
+Other collection maxima remain **1000**. Node projection now stops after at
+least one node at the adaptive cutoff and resumes from the last returned
+`(node_id, identity_node_id)`, preserving its insertion watermark. Log polls
+also yield after at least one event at the cutoff, retaining their existing
+last-event cursor and empty-poll termination semantics.
 
-On the owner's shared Mac (Darwin/arm64, 12 logical CPUs, Go 1.27.1, CGO
-disabled, shared Go lock), four paging workers exercised 1000 queued bound
+The Job/children cap criterion is the **largest tested page whose p95 stays
+under the 100 ms soft target with concurrent disk pressure**. The 150-row
+baseline keeps ordinary Job pages away from the 200 ms hard limit in that
+measurement environment; it is not a guarantee under CPU starvation. A
+250-row trial measured p95 approximately **104 ms** and maximum approximately
+**110 ms**: within the hard limit, but over the soft target. The committed
+`WEFTY_READ_JOB_TRIAL_CAP=200` or `250` test parameter runs the production
+Job/children projectors with that trial cap; the public cap remains 150.
+
+In the earlier phase-2 baseline on the owner's shared Mac (Darwin/arm64,
+12 logical CPUs, Go 1.27.1, CGO disabled, shared Go lock), four paging workers exercised 1000 queued bound
 services with one retained attempt each, Computer detail including client
 actions, 501 Backups/provenance rows, 65 generations/exports, and 33 nodes.
 A separate writer repeatedly streamed a bounded 64 MiB file, syncing each
-8 MiB, with 336 MiB written during the final sample. Eight secret-bearing
-one-shots were written and made terminal while paging continued: all eight
+8 MiB, with 336 MiB written during that historical sample. The revised test caps
+total pressure-writer volume at 256 MiB per run, including the opt-in
+diagnostic, with no more than 32 syncs. Darwin sync is a device-wide flush
+and competes with other test lanes. The revised writer paces each 1 MiB
+block at 50 ms to retain concurrent pressure within that volume cap. In
+that earlier baseline, eight secret-bearing one-shots were written and made terminal while paging continued: all eight
 sweeps completed TRUNCATE in one attempt each, and the WAL file was verified
 at zero bytes before the next secret write. The slowest sweep was **132.49 ms**.
 Walks were complete and duplicate-free; no read expired or retried.
@@ -384,23 +403,89 @@ per page, so this is not a hosted CLI latency promise.
 `TestReadSnapshotLoadHeldReaderSecretProgress` independently parks a snapshot
 callback past the checkpoint wait until hygiene succeeds. SQLite transaction
 cancellation must release its WAL read lock before the callback returns.
-The progress watchdog is 12 seconds, allowing slow scheduling and retries.
+Parked-reader checkpoints measured about **244–260 ms**, only a few ms of
+margin around the **250 ms** checkpoint wait; some samples exceed that wait.
+Hygiene is protected by cancellation/release of readers at the 200 ms hard
+limit and retried checkpoints, not by guaranteed completion in one attempt.
+Under `-cpu 1`, historical holds reached **600+ ms**, with availability retries
+and extra checkpoint attempts. Scheduling/rollback can delay observed hold
+completion beyond the hard deadline; the deadline is not a promise about
+wall-clock completion on a starved CPU.
+
+The progress watchdog follows `t.Deadline()` with a one-minute cap, allowing
+slow scheduling and retries.
 Removing transaction cancellation leaves the reader held and fails this
 progress assertion. Neither test makes a wall-clock speed assertion by
 default: only complete walks, repeated checkpoint/truncation progress and
 absence of deadlock are required. The sustained test has four paging workers
-and a 45-second overall watchdog. Timing enforcement is explicit:
+and a watchdog based on `t.Deadline()` with a three-minute cap and cleanup
+reserve. Cleanup cancels and joins paging workers and the pressure writer
+before the harness closes the Store, including fatal paths. The 1001-page
+one-row diagnostic runs only with budget enforcement, with a separate
+one-minute watchdog outside the default verdict. The timing-sensitive load
+and parked-reader tests explicitly skip under `-race`; functional snapshot,
+cursor, and CLI tests remain available to the race detector. Timing
+enforcement is explicit:
 `WEFTY_ENFORCE_READ_BUDGET=1` requires per-view p95 <=100 ms, max <=200 ms and
 zero availability retries.
+
+The fix-round-1 fixture seeds **1000 nodes**, plus **1000 rows each** for
+administrator policy audit, Computer policy audit, take-over audit (forward
+and tail), intents, and log polls. Node and log pages are adaptive. The audit
+and intent scans remain non-adaptive: their maximum-limit pages returned all
+1000 rows under concurrent paging and disk pressure with these measured holds
+from the opt-in run:
+
+| View | p95 ms | max ms |
+| --- | ---: | ---: |
+| Jobs, cap 150 | 57.31 | 63.75 |
+| Children, cap 150 | 55.90 | 64.89 |
+| Nodes, requested limit 1000 | 120.36 | 120.36 |
+| Administrator policy audit, limit 1000 | 1.75 | 1.75 |
+| Computer policy audit, limit 1000 | 3.49 | 3.49 |
+| Take-over audit, limit 1000 | 4.22 | 4.22 |
+| Take-over audit tail, limit 1000 | 5.39 | 5.39 |
+| Computer intents, limit 1000 | 1.92 | 1.92 |
+| Log polls, limit 1000 | 3.96 | 3.96 |
+| Jobs, forced one-row pages | 3.03 | 9.55 |
+
+Three default runs and three `-cpu 1` runs passed with complete, duplicate-free
+1000-node walks and eight verified scrub/TRUNCATE cycles per run. The opt-in
+run wrote **91 MiB**, completed all eight checkpoints in eight attempts
+(slowest **179.29 ms**), and took **2.710 s** for the one-row inventory
+(**2.710 ms per returned row**, with 1001 page snapshots). A maximum-limit
+(1000) Node page held **120.36 ms** at p95, above the 100 ms advisory
+target: by design an adaptive page reads until the 120 ms cutoff and returns
+`next_cursor`, so it is bounded by the cutoff, not by a page cap. The opt-in
+gate therefore holds the adaptive maximum-limit views (Nodes, logs) to the
+200 ms hard limit and no retries, and keeps the 100 ms p95 target for capped
+views (jobs, children, Computer collections). Such a page logs a target
+overrun; the CLI's default Node page (100) stays far below it. There were no
+availability retries in that run.
+
+The final `-cpu 1` runs observed a hold as long as **823.89 ms**, availability
+retries, and **9–11 checkpoint attempts for eight cycles**. Their parked-reader
+checkpoints completed in **240.07–249.65 ms**; other local samples above reach
+250–260 ms. These are contention diagnostics, not hard wall-clock guarantees.
+
+Fresh knob checks with the revised, paced writer also completed: cap 200
+measured Jobs/children p95 **76.18/84.12 ms**, and cap 250 measured
+**98.60/98.80 ms** (Job max **99.51 ms**). These single samples demonstrate
+the committed trial parameter, not a new cap calibration. Pressure volume and
+contention differ from the earlier trials, where 200 and 250 exceeded the
+soft target. A passing individual trial does not establish that p95 stays
+under the target; the orchestrator's 150-row cap remains unchanged.
 
 Rerun on this Mac (each Go invocation takes the shared lock):
 
 ```sh
 export GOCACHE=/tmp/wefty-gocache GOMODCACHE=/tmp/go127-mod GOTMPDIR=/tmp/wefty-gotmp
 mkdir -p "$GOTMPDIR"
-lock=/Users/derekxwang/.codex/work-products/wefty-orch-2026-09-07/golock.sh
+lock=../../golock.sh # orchestration checkout layout; substitute your shared Go lock
 "$lock" go test ./l1/ -run 'TestReadSnapshot(SustainedLoad|LoadHeldReaderSecretProgress)' -cpu 1 -count=3 -v
 WEFTY_ENFORCE_READ_BUDGET=1 "$lock" go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
+WEFTY_READ_JOB_TRIAL_CAP=200 "$lock" go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
+WEFTY_READ_JOB_TRIAL_CAP=250 "$lock" go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
 WEFTY_TEST_READ_PAGE_CUTOFF=1ns "$lock" go test ./l1/ -run 'TestComputerLifetime|TestJobListingSoftCutoffCursorWalk|TestComputerProvenanceAdaptivePagingWatermark' -count=1
 ```
 
