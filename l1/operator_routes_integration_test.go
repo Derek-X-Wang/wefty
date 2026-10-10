@@ -275,14 +275,7 @@ func assertServiceOperatorDesiredStateRestartCapacityAndLogs(t *testing.T) {
 		t.Fatalf("active restart directive = %q, want %q", lease.Directive, AttemptDirectiveRestart)
 	}
 
-	status, _, body = h.do(client, http.MethodGet, "/v1/jobs/"+first.JobID+"/logs?class=service&limit=100", nil)
-	if status != http.StatusOK {
-		t.Fatalf("service logs = %d body=%s", status, body)
-	}
-	var logs LogPage
-	if err := json.Unmarshal(body, &logs); err != nil {
-		t.Fatal(err)
-	}
+	logs := walkLogPages(t, h, client, "/v1/jobs/"+first.JobID+"/logs?class=service&limit=100")
 	attempts := map[string]bool{}
 	for _, event := range logs.Events {
 		attempts[event.AttemptID] = true

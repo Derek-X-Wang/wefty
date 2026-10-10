@@ -639,15 +639,9 @@ func claimOneshot(t *testing.T, h *integrationHarness, agent *http.Client, node 
 
 func getJobLogPage(t *testing.T, h *integrationHarness, client *http.Client, jobID string) LogPage {
 	t.Helper()
-	status, _, body := h.do(client, http.MethodGet, "/v1/jobs/"+jobID+"/logs?limit=1000", nil)
-	if status != http.StatusOK {
-		t.Fatalf("get job logs status = %d body=%s", status, body)
-	}
-	var page LogPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		t.Fatal(err)
-	}
-	return page
+	// The whole log: follow the cursor until an empty poll so an adaptive
+	// read cutoff cannot hide the tail of the list.
+	return walkLogPages(t, h, client, "/v1/jobs/"+jobID+"/logs?limit=1000")
 }
 
 func assertRetainedPayloads(t *testing.T, h *integrationHarness, jobID string, want ...string) {

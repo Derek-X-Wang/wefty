@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -844,12 +845,7 @@ func waitForAttemptLogs(
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		var page l1.LogPage
-		status, body := harness.doJSON(t, http.MethodGet,
-			"/v1/jobs/"+jobID+"/logs?class=service&limit=1000", nil, &page)
-		if status != http.StatusOK {
-			t.Fatalf("read service logs status = %d body=%s", status, body)
-		}
+		page := readWholeServiceLog(t, harness, jobID)
 		seen := make(map[string]bool, len(attemptIDs))
 		for _, event := range page.Events {
 			seen[event.AttemptID] = true
@@ -865,6 +861,35 @@ func waitForAttemptLogs(
 	}
 	t.Fatalf("logs did not contain every attempt %v", attemptIDs)
 	return l1.LogPage{}
+}
+
+// readWholeServiceLog follows the log cursor until an empty poll so the
+// result is the whole attempt log, not one page cut short by the read
+// cutoff of a slow machine.
+func readWholeServiceLog(t *testing.T, harness *acceptanceHarness, jobID string) l1.LogPage {
+	t.Helper()
+	var combined l1.LogPage
+	cursor := ""
+	for poll := 0; ; poll++ {
+		if poll > l1.MaxLogPageLimit {
+			t.Fatal("service log paging did not terminate")
+		}
+		path := "/v1/jobs/" + jobID + "/logs?class=service&limit=1000"
+		if cursor != "" {
+			path += "&cursor=" + url.QueryEscape(cursor)
+		}
+		var page l1.LogPage
+		status, body := harness.doJSON(t, http.MethodGet, path, nil, &page)
+		if status != http.StatusOK {
+			t.Fatalf("read service logs status = %d body=%s", status, body)
+		}
+		combined.Events = append(combined.Events, page.Events...)
+		combined.Truncation = page.Truncation
+		if len(page.Events) == 0 {
+			return combined
+		}
+		cursor = page.NextCursor
+	}
 }
 
 func assertStoppedService(

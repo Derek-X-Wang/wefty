@@ -99,10 +99,7 @@ func assertServiceLogByteRetentionAndDerivedJSONL(t *testing.T) {
 	}
 	appendRetentionLogs(t, h, agent, oneshotPath, oneshotClaim.Lease.FencingToken, oneshotEvents)
 	assertRetainedRawBytes(t, h, oneshot.JobID, 18)
-	oneshotPage, err := h.store.GetJobLogs(context.Background(), oneshot.JobID, "", MaxLogPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	oneshotPage := walkStoreJobLogs(t, h, oneshot.JobID)
 	if len(oneshotPage.Events) != 3 || oneshotPage.Truncation != nil {
 		t.Fatalf("one-shot retention changed = %#v", oneshotPage)
 	}
@@ -342,15 +339,9 @@ func appendRetentionLogs(t *testing.T, h *integrationHarness, agent *http.Client
 
 func getRetentionPage(t *testing.T, h *integrationHarness, client *http.Client, jobID string) LogPage {
 	t.Helper()
-	status, _, body := h.do(client, http.MethodGet, "/v1/jobs/"+jobID+"/logs?class=service&limit=1000", nil)
-	if status != http.StatusOK {
-		t.Fatalf("get retained logs status = %d body=%s", status, body)
-	}
-	var page LogPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		t.Fatal(err)
-	}
-	return page
+	// The whole retained log: follow the cursor until an empty poll so an
+	// adaptive read cutoff cannot hide the tail of the list.
+	return walkLogPages(t, h, client, "/v1/jobs/"+jobID+"/logs?class=service&limit=1000")
 }
 
 func assertRetainedRawBytes(t *testing.T, h *integrationHarness, jobID string, want int64) {

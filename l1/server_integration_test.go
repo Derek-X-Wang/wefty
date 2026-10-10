@@ -1124,16 +1124,11 @@ func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
 	aliveAgent := h.client(fabric.Identity{NodeID: "alive-node", Tags: []string{DefaultAgentPrincipalTag}})
 	h.register(aliveAgent, "alive-node")
 
-	status, _, body := h.do(client, http.MethodGet, "/v1/nodes", nil)
-	if status != http.StatusOK {
-		t.Fatalf("list nodes status = %d body=%s", status, body)
-	}
-	var listed NodeList
-	if err := json.Unmarshal(body, &listed); err != nil {
-		t.Fatal(err)
-	}
+	// The listed fleet is the cursor chain across /v1/nodes, not one page:
+	// a page may stop at the read cutoff after one row.
+	listed := walkNodePages(t, h, client, "")
 	if len(listed.Nodes) != 3 {
-		t.Fatalf("listed nodes = %d, want 3: %s", len(listed.Nodes), body)
+		t.Fatalf("listed nodes = %d, want 3", len(listed.Nodes))
 	}
 	wantStates := []contract.NodeState{contract.NodeAlive, contract.NodeDead, contract.NodeStale}
 	for i, want := range wantStates {
@@ -1157,7 +1152,7 @@ func TestClientListsNodeLivenessAndDrainsNode(t *testing.T) {
 		t.Fatalf("alive agent version = %q, want test", listed.Nodes[0].AgentVersion)
 	}
 
-	status, _, body = h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", NodeIntentRequest{
+	status, _, body := h.do(client, http.MethodPost, "/v1/nodes/alive-node/drain", NodeIntentRequest{
 		ClaimsEnabled: false, IntentRevision: 0, Reason: "maintenance",
 	})
 	if status != http.StatusOK {

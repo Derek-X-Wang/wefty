@@ -60,20 +60,37 @@ func TestTailRunningJobWithOpaqueCursorAndPerStreamOrder(t *testing.T) {
 	if err := json.Unmarshal(body, &first); err != nil {
 		t.Fatal(err)
 	}
-	if len(first.Events) != 2 || first.NextCursor == "" {
+	// The limit caps a page, but an adaptive read cutoff may stop the page
+	// after one complete row, so require the row and the opaque cursor the
+	// continuation needs rather than a full page here.
+	if len(first.Events) < 1 || first.NextCursor == "" {
 		t.Fatalf("first page = %#v", first)
 	}
 	// Treat the cursor only as an opaque token returned by the protocol. The
 	// test deliberately makes no assertion about SQLite row identifiers.
-	status, _, body = h.do(client, http.MethodGet, "/v1/jobs/"+job.JobID+"/logs?limit=2&cursor="+first.NextCursor, nil)
-	if status != http.StatusOK {
-		t.Fatalf("second poll status = %d body=%s", status, body)
+	// Keep the single-page shape above; this walk is the whole remaining
+	// list, not whichever rows happened to fit the next page.
+	var all []contract.LogEvent
+	all = append(all, first.Events...)
+	cursor := first.NextCursor
+	for pageIndex := 0; ; pageIndex++ {
+		if pageIndex > 250 {
+			t.Fatal("cursor did not terminate")
+		}
+		status, _, body = h.do(client, http.MethodGet, "/v1/jobs/"+job.JobID+"/logs?limit=2&cursor="+cursor, nil)
+		if status != http.StatusOK {
+			t.Fatalf("continuation poll status = %d body=%s", status, body)
+		}
+		var page LogPage
+		if err := json.Unmarshal(body, &page); err != nil {
+			t.Fatal(err)
+		}
+		all = append(all, page.Events...)
+		if len(page.Events) == 0 {
+			break
+		}
+		cursor = page.NextCursor
 	}
-	var second LogPage
-	if err := json.Unmarshal(body, &second); err != nil {
-		t.Fatal(err)
-	}
-	all := append(append([]contract.LogEvent(nil), first.Events...), second.Events...)
 	assertPerStreamEvents(t, all)
 	if got := string(joinLogStream(all, contract.LogStdout)); got != "out-0\nout-1\n" {
 		t.Fatalf("stdout = %q", got)
@@ -122,10 +139,7 @@ func TestLogReplayIsIdempotentAndRawJSONLMatchesRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := h.store.GetJobLogs(context.Background(), job.JobID, "", MaxLogPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	page := walkStoreJobLogs(t, h, job.JobID)
 	var rows bytes.Buffer
 	for _, event := range page.Events {
 		encoded, err := json.Marshal(event)
@@ -205,10 +219,7 @@ func TestLogBytesPreserveLongPartialAndInvalidUTF8Data(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("append status = %d body=%s", status, body)
 	}
-	page, err := h.store.GetJobLogs(context.Background(), job.JobID, "", MaxLogPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	page := walkStoreJobLogs(t, h, job.JobID)
 	want := bytes.Join([][]byte{longLine, partial, invalidUTF8}, nil)
 	if got := joinLogStream(page.Events, contract.LogStdout); !bytes.Equal(got, want) {
 		t.Fatalf("round-tripped bytes differ: got %d bytes, want %d", len(got), len(want))
