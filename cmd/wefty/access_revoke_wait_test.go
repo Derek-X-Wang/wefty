@@ -44,7 +44,8 @@ func revokeWaitStub(t *testing.T, revocationAnswer func(reads int32) func(w http
 		}
 	}))
 	t.Cleanup(server.Close)
-	client := waitStubClient(t, server)
+	// Resolving the Computer handle is a one-shot read before the wait loop.
+	client := waitStubClient(t, server, "/v1/computer-handle-resolutions/")
 	return &apiClients{l1: client, wait: waitForContext}, &revocationReads
 }
 

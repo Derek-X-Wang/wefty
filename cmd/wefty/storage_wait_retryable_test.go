@@ -63,9 +63,17 @@ type requireMarkedReads struct {
 	t    *testing.T
 	base http.RoundTripper
 	once atomic.Bool
+	// oneShot names the paths a command legitimately reads once before its
+	// loop starts (for example a handle resolution); they keep the quiet retry.
+	oneShot []string
 }
 
 func (transport *requireMarkedReads) RoundTrip(request *http.Request) (*http.Response, error) {
+	for _, prefix := range transport.oneShot {
+		if strings.HasPrefix(request.URL.Path, prefix) {
+			return transport.base.RoundTrip(request)
+		}
+	}
 	if request.Method == http.MethodGet && !clientRetrySuppressed(request.Context()) &&
 		transport.once.CompareAndSwap(false, true) {
 		transport.t.Errorf("an unmarked GET reached the shared client: %s", request.URL.Path)
@@ -75,10 +83,10 @@ func (transport *requireMarkedReads) RoundTrip(request *http.Request) (*http.Res
 
 // waitStubClient builds the L1 client the wait and follow tests use: the
 // test-server rewrite, plus the marked-read assertion above.
-func waitStubClient(t *testing.T, server *httptest.Server) *apiClient {
+func waitStubClient(t *testing.T, server *httptest.Server, oneShot ...string) *apiClient {
 	t.Helper()
 	client := &apiClient{name: "L1", client: server.Client()}
-	client.client.Transport = &requireMarkedReads{t: t,
+	client.client.Transport = &requireMarkedReads{t: t, oneShot: oneShot,
 		base: rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}}
 	return client
 }
