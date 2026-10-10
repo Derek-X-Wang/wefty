@@ -457,9 +457,10 @@ run wrote **91 MiB**, completed all eight checkpoints in eight attempts
 (1000) Node page held **120.36 ms** at p95, above the 100 ms advisory
 target: by design an adaptive page reads until the 120 ms cutoff and returns
 `next_cursor`, so it is bounded by the cutoff, not by a page cap. The opt-in
-gate therefore holds the adaptive maximum-limit views (Nodes, logs) to the
-200 ms hard limit and no retries, and keeps the 100 ms p95 target for capped
-views (jobs, children, Computer collections). Such a page logs a target
+gate therefore holds the adaptive maximum-limit Node page to the cutoff plus
+20 ms of slack (one row in flight and rollback) and no retries, and keeps the
+100 ms p95 target for capped views (jobs, children, Computer collections) and
+for log polls, which stay far below the cutoff. Such a page logs a target
 overrun; the CLI's default Node page (100) stays far below it. There were no
 availability retries in that run.
 
@@ -474,20 +475,24 @@ measured Jobs/children p95 **76.18/84.12 ms**, and cap 250 measured
 the committed trial parameter, not a new cap calibration. Pressure volume and
 contention differ from the earlier trials, where 200 and 250 exceeded the
 soft target. A passing individual trial does not establish that p95 stays
-under the target; the orchestrator's 150-row cap remains unchanged.
+under the target.
 
-Rerun on this Mac (each Go invocation takes the shared lock):
+**Why 150, not 200.** With the committed paced writer on this 12-CPU Mac, the
+stated criterion would admit 200 (p95 about 75–85 ms) and rejects 250 (p95
+about 100–103 ms in repeated runs). The cap stays at 150 for headroom on
+slower hardware: hosted CI runners logged 200–253 ms snapshot holds and one
+`read_snapshot_expired` during a disk-heavy clone on 2026-10-09. Raising the
+cap to 200 is a reasonable later change if hosted-runner evidence shows the
+headroom is unused.
+
+Rerun:
 
 ```sh
-export GOCACHE=/tmp/wefty-gocache GOMODCACHE=/tmp/go127-mod GOTMPDIR=/tmp/wefty-gotmp
-mkdir -p "$GOTMPDIR"
-lock=../../golock.sh # orchestration checkout layout; substitute your shared Go lock
-"$lock" go test ./l1/ -run 'TestReadSnapshot(SustainedLoad|LoadHeldReaderSecretProgress)' -cpu 1 -count=3 -v
-WEFTY_ENFORCE_READ_BUDGET=1 "$lock" go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
-WEFTY_READ_JOB_TRIAL_CAP=200 "$lock" go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
-WEFTY_READ_JOB_TRIAL_CAP=250 "$lock" go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
-WEFTY_TEST_READ_PAGE_CUTOFF=1ns "$lock" go test ./l1/ -run 'TestComputerLifetime|TestJobListingSoftCutoffCursorWalk|TestComputerProvenanceAdaptivePagingWatermark' -count=1
+go test ./l1/ -run 'TestReadSnapshot(SustainedLoad|LoadHeldReaderSecretProgress)' -cpu 1 -count=3 -v
+WEFTY_ENFORCE_READ_BUDGET=1 go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
+WEFTY_READ_JOB_TRIAL_CAP=200 go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
+WEFTY_READ_JOB_TRIAL_CAP=250 go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
+WEFTY_TEST_READ_PAGE_CUTOFF=1ns go test ./l1/ -run 'TestComputerLifetime|TestJobListingSoftCutoffCursorWalk|TestComputerProvenanceAdaptivePagingWatermark' -count=1
 ```
 
-Outside this shared Mac, use `go test` with the same patterns/environment;
-timing enforcement remains opt-in.
+Timing enforcement remains opt-in; run these on an otherwise idle machine.

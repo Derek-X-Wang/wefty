@@ -145,8 +145,14 @@ func TestReadSnapshotLoadHeldReaderSecretProgress(t *testing.T) {
 // The default verdict is membership, no deadlock, and repeated WAL progress;
 // speed is diagnostic unless explicitly opted in.
 // cutoffBoundedLoadViews are read at the 1000-row maximum with an adaptive
-// cutoff, so their hold is bounded by the cutoff rather than by a page cap.
-var cutoffBoundedLoadViews = map[string]bool{"nodes": true, "logs": true}
+// cutoff that this fixture actually reaches, so their hold is bounded by the
+// cutoff rather than by a page cap. Log polls stay far below the cutoff and
+// keep the capped-view target.
+var cutoffBoundedLoadViews = map[string]bool{"nodes": true}
+
+// cutoffBoundedSlack covers the row in flight at the cutoff plus rollback;
+// overshoot beyond it is the regression an adaptive page can have.
+const cutoffBoundedSlack = 20 * time.Millisecond
 
 func TestReadSnapshotSustainedLoad(t *testing.T) {
 	if readLoadRaceEnabled {
@@ -643,13 +649,13 @@ func TestReadSnapshotSustainedLoad(t *testing.T) {
 		max := v.holds[len(v.holds)-1]
 		t.Logf("view=%s samples=%d p50=%s p95=%s max=%s rows=%d retries=%d walks=%d mean_walk=%s target=%s hard=%s", name, len(v.holds), p50, p95, max, v.rows, v.retries, v.walks, v.walkTime/time.Duration(v.walks), readSnapshotBudget, readSnapshotHardLimit)
 		if enforce {
-			// Nodes and logs are read at the 1000-row maximum and adapt: by
-			// design a full page runs to the 120 ms cutoff, above the advisory
-			// target, and returns next_cursor. They are held to the hard limit;
+			// A maximum-limit node page adapts: by design it reads until the
+			// 120 ms cutoff, above the advisory target, and returns
+			// next_cursor. It is held to the cutoff plus one row's slack;
 			// capped views must keep p95 under the target.
 			target := readSnapshotBudget
 			if cutoffBoundedLoadViews[name] {
-				target = readSnapshotHardLimit
+				target = readSnapshotPageCutoff + cutoffBoundedSlack
 			}
 			if p95 > target || max > readSnapshotHardLimit || v.retries != 0 {
 				t.Errorf("opt-in read budget exceeded: %s p95=%s (target %s) max=%s retries=%d", name, p95, target, max, v.retries)
