@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,8 +38,12 @@ func readRetryStub(t *testing.T, answer func(requests int32, r *http.Request, w 
 // stdout, and stderr.
 func runOneShotList(t *testing.T, clients *apiClients) (error, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
+	return runOneShotListWithCtx(t, t.Context(), clients)
+}
+
+func runOneShotListWithCtx(_ *testing.T, ctx context.Context, clients *apiClients) (error, *bytes.Buffer, *bytes.Buffer) {
 	var stdout, stderr bytes.Buffer
-	err := execute(t.Context(), clients, true, []string{"computers", "list"}, &stdout, &stderr)
+	err := execute(ctx, clients, true, []string{"computers", "list"}, &stdout, &stderr)
 	return err, &stdout, &stderr
 }
 
@@ -81,10 +84,10 @@ func TestOneShotReadQuietlyRetriesARetryableAnswer(t *testing.T) {
 // binary against a counting stub.
 func TestOneShotReadExhaustsQuietRetries(t *testing.T) {
 	binary := buildWefty(t)
-	var requests int32
+	var requests atomic.Int32
 	address := startStubLedger(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		requests++
+		requests.Add(1)
 		writeRetryableUnavailable(w, "read_snapshot_expired")
 	})
 	code, output := runWefty(t, binary, 30*time.Second, "--json", "--l1", address, "computers", "list")
@@ -93,8 +96,8 @@ func TestOneShotReadExhaustsQuietRetries(t *testing.T) {
 		code != exitUnavailable ||
 		envelope.Error.Code != contract.ErrorUnavailable || !envelope.Error.Retryable ||
 		envelope.Error.Details["reason"] != "read_snapshot_expired" ||
-		requests != 1+3 {
-		t.Fatalf("exhausted one-shot read: exit=%d requests=%d output=%s decode=%v", code, requests, output, decode)
+		requests.Load() != 1+3 {
+		t.Fatalf("exhausted one-shot read: exit=%d requests=%d output=%s decode=%v", code, requests.Load(), output, decode)
 	}
 }
 
@@ -126,46 +129,86 @@ func TestMutationIsNeverQuietlyRetried(t *testing.T) {
 	}
 }
 
-// TestOneShotReadNeverRetriesANonRetryableAnswer: any other answer — a
-// refusal included — ends the read at once.
+// TestOneShotReadNeverRetriesANonRetryableAnswer: any other answer ends the
+// read at once — a refusal (exit 3), an `unavailable` refused without
+// retryability (exit 13), and a plain 503 with no envelope at all, which is
+// reachability advice, not load.
 func TestOneShotReadNeverRetriesANonRetryableAnswer(t *testing.T) {
-	clients, requests := readRetryStub(t, func(_ int32, _ *http.Request, w http.ResponseWriter) {
-		writeForbiddenResponse(w)
-	})
-	err, _, _ := runOneShotList(t, clients)
-	if commandExitCode(err) != exitUnauthorized || requests.Load() != 1 {
-		t.Fatalf("non-retryable answer: requests=%d exit=%d", requests.Load(), commandExitCode(err))
+	for _, test := range []struct {
+		name   string
+		answer func(w http.ResponseWriter)
+		exit   int
+	}{
+		{"forbidden refusal", writeForbiddenResponse, exitUnauthorized},
+		{"unavailable without retryability", func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+				Code: contract.ErrorUnavailable, Message: "read snapshot unavailable", Retryable: false,
+				Details: map[string]any{"reason": "read_snapshot_expired"},
+			}})
+		}, exitUnavailable},
+		{"plain 503 without an envelope", func(w http.ResponseWriter) { w.WriteHeader(http.StatusServiceUnavailable) }, exitUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clients, requests := readRetryStub(t, func(_ int32, _ *http.Request, w http.ResponseWriter) {
+				test.answer(w)
+			})
+			err, _, _ := runOneShotList(t, clients)
+			if commandExitCode(err) != test.exit || requests.Load() != 1 {
+				t.Fatalf("%s: requests=%d exit=%d want %d", test.name, requests.Load(), commandExitCode(err), test.exit)
+			}
+		})
 	}
 }
 
+// withRetryWait swaps the backoff's end for a deterministic one and restores
+// the real sleep afterwards.
+func withRetryWait(t *testing.T, wait func(context.Context, time.Duration) error) {
+	t.Helper()
+	previous := readRetryWait
+	readRetryWait = wait
+	t.Cleanup(func() { readRetryWait = previous })
+}
+
 // TestOneShotReadCancelledDuringQuietRetryBackoff: a caller cancellation
-// during the backoff returns promptly, despite the read never having to wait
-// longer than the backoff it was already inside.
+// during the backoff returns at once, so the reader never sees the stale
+// retryable answer. The injected wait cancels the context and reports it, so
+// the outcome is a decision, not a race against a real sleep.
 func TestOneShotReadCancelledDuringQuietRetryBackoff(t *testing.T) {
-	served := make(chan struct{})
-	var once sync.Once
 	clients, requests := readRetryStub(t, func(_ int32, _ *http.Request, w http.ResponseWriter) {
 		writeRetryableUnavailable(w, "read_snapshot_expired")
-		once.Do(func() { close(served) })
 	})
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	done := make(chan error, 1)
-	go func() {
-		var stdout, stderr bytes.Buffer
-		done <- execute(ctx, clients, true, []string{"computers", "list"}, &stdout, &stderr)
-	}()
-	<-served
-	// The first quiet retry sleeps about 100 ms; leave well inside it.
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-	select {
-	case err := <-done:
-		if errors.Is(err, context.Canceled) && requests.Load() == 1 {
-			return
-		}
+	withRetryWait(t, func(ctx context.Context, _ time.Duration) error {
+		cancel()
+		return ctx.Err()
+	})
+	var stdout, stderr bytes.Buffer
+	err := execute(ctx, clients, true, []string{"computers", "list"}, &stdout, &stderr)
+	if !errors.Is(err, context.Canceled) || requests.Load() != 1 {
 		t.Fatalf("cancelled during the quiet-retry backoff: requests=%d err=%v", requests.Load(), err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("one-shot read did not return after cancellation")
+	}
+}
+
+// TestOneShotReadDeadlineDuringQuietRetryBackoff: a deadline passing during
+// the backoff is the congestion the read was answering, so the read reports
+// the last answer (exit 13) rather than a bare deadline error.
+func TestOneShotReadDeadlineDuringQuietRetryBackoff(t *testing.T) {
+	clients, requests := readRetryStub(t, func(_ int32, _ *http.Request, w http.ResponseWriter) {
+		writeRetryableUnavailable(w, "read_snapshot_expired")
+	})
+	withRetryWait(t, func(context.Context, time.Duration) error {
+		return context.DeadlineExceeded
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	err, _, _ := runOneShotListWithCtx(t, ctx, clients)
+	var refusal *apiResponseError
+	if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) ||
+		errors.Is(err, context.DeadlineExceeded) || requests.Load() != 1 {
+		t.Fatalf("deadline during the quiet-retry backoff: requests=%d exit=%d err=%v (%#v)",
+			requests.Load(), commandExitCode(err), err, refusal)
 	}
 }

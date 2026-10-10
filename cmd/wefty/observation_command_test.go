@@ -126,8 +126,12 @@ type waitHarness struct {
 	mu       sync.Mutex
 	statuses []contract.RunState
 	failures []int
-	stall    chan struct{}
-	requests int
+	// failureUnavailable turns the failures into the read-snapshot shape: a
+	// retryable `unavailable` envelope, the one the client's one-shot quiet
+	// retry (#773) answers and the wait loop must absorb at its own interval.
+	failureUnavailable bool
+	stall              chan struct{}
+	requests           int
 }
 
 func newWaitHarness(t *testing.T) *waitHarness {
@@ -161,8 +165,14 @@ func newWaitHarness(t *testing.T) *waitHarness {
 		if failure != 0 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(failure)
-			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
-				Code: contract.ErrorInternal, Message: "not now", Retryable: true}})
+			if h.failureUnavailable {
+				_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+					Code: contract.ErrorUnavailable, Message: "read snapshot unavailable", Retryable: true,
+					Details: map[string]any{"reason": "read_snapshot_expired"}}})
+			} else {
+				_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
+					Code: contract.ErrorInternal, Message: "not now", Retryable: true}})
+			}
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -267,8 +277,34 @@ func TestWaitKeepsWaitingThroughATransientFailure(t *testing.T) {
 	if strings.TrimSpace(out.String()) != string(contract.RunSucceeded) {
 		t.Fatalf("wait printed %q", out.String())
 	}
-	if h.polls() < 3 {
-		t.Fatalf("the wait polled %d times, so it did not retry", h.polls())
+	if h.polls() != 3 {
+		t.Fatalf("the wait polled %d times, want exactly one poll per step", h.polls())
+	}
+}
+
+// TestWaitKeepsWaitingThroughARetryableAnswer, at one request per poll: a
+// retryable `unavailable` answer is the same transient nothing as any other
+// 5xx here, and `wefty wait` must absorb it at its own interval — the shared
+// client's one-shot quiet retry (#773) is marked out of this loop, so the
+// poll count stays exact.
+func TestWaitKeepsWaitingThroughARetryableAnswer(t *testing.T) {
+	t.Parallel()
+
+	h := newWaitHarness(t)
+	h.failureUnavailable = true
+	h.failures = []int{http.StatusServiceUnavailable, http.StatusServiceUnavailable}
+	h.statuses = []contract.RunState{contract.RunRunning, contract.RunRunning, contract.RunSucceeded}
+
+	var out, errOut bytes.Buffer
+	if err := executeWait(t.Context(), h.clients, false,
+		[]string{"run-under-test", "--timeout", "30s"}, &out, &errOut); err != nil {
+		t.Fatalf("a retryable answer ended the wait: %v", err)
+	}
+	if strings.TrimSpace(out.String()) != string(contract.RunSucceeded) {
+		t.Fatalf("wait printed %q", out.String())
+	}
+	if h.polls() != 3 {
+		t.Fatalf("the wait polled %d times, want one request per poll", h.polls())
 	}
 }
 

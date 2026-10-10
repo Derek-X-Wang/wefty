@@ -44,8 +44,7 @@ func revokeWaitStub(t *testing.T, revocationAnswer func(reads int32) func(w http
 		}
 	}))
 	t.Cleanup(server.Close)
-	client := &apiClient{name: "L1", client: server.Client()}
-	client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+	client := waitStubClient(t, server)
 	return &apiClients{l1: client, wait: waitForContext}, &revocationReads
 }
 

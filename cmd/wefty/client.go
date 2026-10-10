@@ -823,6 +823,11 @@ func readRetryBackoff(attempt int) time.Duration {
 	return gap + time.Duration(rand.Int64N(int64(gap/4)))
 }
 
+// readRetryWait spaces one quiet retry, honouring the reader's context during
+// the gap. A package variable so the round-zero checks can decide the gap's
+// end deterministically instead of racing a real sleep.
+var readRetryWait = waitForContext
+
 func (c *apiClient) do(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) error {
 	_, err := c.doWithResponse(ctx, method, path, body, headers, target, success...)
 	// A one-shot GET read quietly retries a retryable `unavailable` answer
@@ -835,8 +840,15 @@ func (c *apiClient) do(ctx context.Context, method, path string, body any, heade
 	// reachability advice, not load.
 	for attempt := 0; method == http.MethodGet && !clientRetrySuppressed(ctx) &&
 		attempt < readRetryAttempts && isRetryableL1Answer(err) && ctx.Err() == nil; attempt++ {
-		if wait := waitForContext(ctx, readRetryBackoff(attempt)); wait != nil {
-			return wait
+		if wait := readRetryWait(ctx, readRetryBackoff(attempt)); wait != nil {
+			// A cancellation is the reader leaving: report it at once. A
+			// deadline passing during the gap is the congestion the read was
+			// already answering (#773): the last answer is the one a single
+			// try would have reported, not a bare deadline error.
+			if errors.Is(wait, context.Canceled) {
+				return wait
+			}
+			return err
 		}
 		if _, err = c.doWithResponse(ctx, method, path, body, headers, target, success...); !isRetryableL1Answer(err) {
 			return err

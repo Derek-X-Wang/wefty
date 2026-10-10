@@ -39,8 +39,7 @@ func TestProvenanceWalkToleratesARetryableAnswer(t *testing.T) {
 			writeRetryableUnavailable(w, "read_snapshot_expired")
 		}))
 		t.Cleanup(server.Close)
-		client := &apiClient{name: "L1", client: server.Client()}
-		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		client := waitStubClient(t, server)
 		return &apiClients{l1: client}, &reads
 	}
 

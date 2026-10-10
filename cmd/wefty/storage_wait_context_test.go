@@ -72,8 +72,7 @@ func TestComputerStorageWaitBoundsEveryObservationRead(t *testing.T) {
 			// It must not be mistaken for the much shorter --wait deadline.
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
-			client := &apiClient{name: "L1", client: server.Client()}
-			client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+			client := waitStubClient(t, server)
 			err := test.wait(ctx, &apiClients{l1: client})
 			if code := commandExitCode(err); code != exitMutationWaitTimeout || ctx.Err() != nil {
 				t.Fatalf("observation exit = %d, caller = %v, want wait deadline exit 14: %v", code, ctx.Err(), err)
@@ -96,8 +95,7 @@ func TestComputerWaitRetainsProjectionAtRequestDeadline(t *testing.T) {
 			defer server.Close()
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
-			client := &apiClient{name: "L1", client: server.Client()}
-			client.client.Transport = rewriteWaitTestTransport{base: client.client.Transport, url: server.URL}
+			client := waitStubClient(t, server)
 			clients := &apiClients{l1: client}
 			wait := storageWaitFlags{timeout: 50 * time.Millisecond, pollInterval: time.Millisecond}
 			var observed l1.Computer
