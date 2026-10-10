@@ -149,7 +149,7 @@ func (r *databaseReads) jobsPage(ctx context.Context, filters jobListFilters, cu
 	if limit < 1 {
 		return JobList{}, protocolError(contract.ErrorInvalidRequest, "limit must be positive")
 	}
-	limit = min(limit, MaxJobListingPageLimit)
+	limit = min(limit, readJobPageLimit(ctx, MaxJobListingPageLimit))
 	cursor := jobCollectionCursor{Version: 1, Filters: jobFilterFingerprint(filters)}
 	if cursorValue != "" {
 		var err error

@@ -183,15 +183,21 @@ func (r *databaseReads) nodePage(ctx context.Context, filters nodeListFilters, c
 		keys = keys[:limit]
 	}
 	page := NodeList{Nodes: []Node{}}
-	for _, item := range keys {
+	for i, item := range keys {
 		node, err := r.node(ctx, item.id)
 		if err != nil {
 			return NodeList{}, internalError(err, "read paged node")
 		}
 		page.Nodes = append(page.Nodes, liveness.project(node, r.now()))
+		// Finish at least one node before yielding. Continue from the last
+		// returned key, including when the cutoff shortens a maximum page.
+		if r.pageCutoffReached() {
+			more = more || i+1 < len(keys)
+			break
+		}
 	}
 	if more {
-		last := keys[len(keys)-1]
+		last := keys[len(page.Nodes)-1]
 		cursor.NodeID, cursor.Identity = last.id, last.identity
 		payload, _ := json.Marshal(cursor)
 		page.NextCursor = base64.RawURLEncoding.EncodeToString(payload)

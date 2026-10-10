@@ -694,8 +694,8 @@ func (r *databaseReads) computerBackupsPage(ctx context.Context, computerID, val
 	if limit < 1 {
 		return BackupList{}, protocolError(contract.ErrorInvalidRequest, "limit must be positive")
 	}
-	if limit > MaxJobListingPageLimit {
-		limit = MaxJobListingPageLimit
+	if limit > MaxComputerListingPageLimit {
+		limit = MaxComputerListingPageLimit
 	}
 	cursor := backupCollectionCursor{Version: 1, ComputerID: computerID}
 	if value != "" {

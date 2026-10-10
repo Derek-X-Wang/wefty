@@ -1553,7 +1553,7 @@ the store's default immediate writer lock. Detail and collection answers share o
 and snapshot across Job state, retained attempts, service status and actions.
 Child pages use that same door, so concurrent row deletion cannot break a
 selected page. Job collections retain membership/filter semantics with a
-maximum of 250 rows (default 100); child collections use the same
+maximum of 150 rows (default 100); child collections use the same
 maximum and default. Both clamp larger requested limits, so a page may return
 fewer rows than `limit`, including when the page is cut short to stay within
 the read budget. The soft cutoff is 60% of the 200 ms hard hold limit (120 ms).

@@ -269,7 +269,7 @@ The optional filters intersect, with exact case-sensitive comparison:
 | `kind=KIND` | Workload isolation kind; an open vocabulary. |
 | `state=STATE` | Persisted Job state, not a derived status such as `restart-pending` or `unschedulable`. |
 | `submitter=me` | Originating submitter equals the authenticated client's stable Fabric node ID. For an attempt credential, `me` is its inherited originating submitter, within its own-job/child scope. If that identity is empty, the request returns `400 invalid_request`. |
-| `limit=N` | Page size, default 100; accepts 1–1000; pages hold at most 250 and may be shorter; follow `next_cursor`. |
+| `limit=N` | Page size, default 100; accepts 1–1000; pages hold at most 150 and may be shorter; follow `next_cursor`. |
 | `cursor=CURSOR` | Opaque continuation from `next_cursor`; absent on the final page. |
 
 The response is `{jobs: [...], next_cursor?: string}` and uses the same redacted
@@ -292,7 +292,7 @@ not mutable state: state changes and removals remain live between requests.
 
 `class=service` retains the active service collection, current Computer
 projection selection, service status projection and ordering. It uses the
-jobs collection's measured maximum of 250 rows. Previously issued service
+jobs collection's measured maximum of 150 rows. Previously issued service
 cursors are accepted for the unfiltered service query; their insertion watermark is established when first resumed.
 The class selector on individual Job reads and service mutations is unchanged.
 

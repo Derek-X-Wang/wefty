@@ -22,7 +22,7 @@ its answer. A separate 200 ms hard limit begins at transaction BEGIN and cancels
 and rolls back the SQLite read transaction, below the 250 ms secret-scrubbing
 checkpoint wait (ADR-0002). Expiry returns HTTP 503, code `unavailable`,
 `retryable=true`, and `details.reason=read_snapshot_expired`, including when a
-projector swallowed cancellation. #752 will tune the limit using load evidence.
+projector swallowed cancellation. The sustained-load evidence below retains these limits.
 Callbacks must finish promptly and exclude external calls, long polling and
 response encoding. Rollback failure discards the connection.
 
@@ -92,7 +92,8 @@ limit, both with typed `unavailable` expiry (`read_snapshot_admission_expired`,
 `read_snapshot_expired`, retryable) and the door's test-only override. The door
 is reachable only from reviewed agent and L3 protocol read owners; the guard
 asserts the exact site set of `withAgentReadSnapshot`, the `writeAgentComputer`
-wrapper, the three `Prove*` methods and their reviewed HTTP callers, set equality, with
+wrapper, the three `Prove*` methods, `owedComputerRevocation` with the exact
+`revokeAfterAuthorityLoss` caller, and their reviewed HTTP callers, set equality, with
 a fixture test covering the bypass shapes. The list is hand-kept rather than
 derived from route registration, and the rule tracks references, not
 invocations: a listed site that stored the method value for another caller
@@ -162,9 +163,9 @@ one pinned clock, avoiding a second immediate-writer admission wait.
 ## Jobs page measurement (#748)
 
 The jobs/service collection (`GET /v1/jobs`, with any class filter) now has a
-maximum page size of **250**, default 100. `GET /v1/jobs/{job_id}/children`
+maximum page size of **150**, default 100. `GET /v1/jobs/{job_id}/children`
 has the same maximum and default. A request above the maximum is clamped to
-250: either listing may return fewer rows than `limit`, with `next_cursor`
+150: either listing may return fewer rows than `limit`, with `next_cursor`
 when more rows exist. Walking the cursor visits all selected rows. Computer
 and Backup listings also cap each projected page at 250 under the same soft
 cutoff, as described below. Other collections retain their 1000-row maximum.
@@ -202,12 +203,11 @@ row count. `TestJobReadSnapshotMeasureMaximumPage` reproduces the diagnostic.
 The 1000-row comparison bypasses only the lowered page cap using multiple
 membership batches inside the **same** transaction, clock and memo; diagnostics
 use no deadline to report full cost. Production pages retain the 200 ms hard
-limit. These are local idle measurements, not sustained-load proof: #752 sets
-the final cap from concurrent paging and secret-scrubbing evidence.
+limit. These are local idle measurements, historical measurements; the sustained-load evidence below sets the final cap.
 
-The child-page diagnostic `TestJobReadSnapshotMeasureChildrenPage` measures
+The historical child-page diagnostic `TestJobReadSnapshotMeasureChildrenPage` measures
 250 service children with one retained attempt each, authenticated client
-projection and one pinned clock. The diagnostic now excludes both time
+projection and one pinned clock. The diagnostic excludes both time
 cutoffs so slow machines can report full projection cost.
 Three local idle samples per state on the same Mac measured the complete
 snapshot door (before checkout through rollback):
@@ -220,8 +220,8 @@ snapshot door (before checkout through rollback):
 | Failed, bound | 42.0–44.2 ms |
 
 Each diagnostic fixture has 251 children and requests `limit=1000`; its
-uncut answer contains 250 children plus `next_cursor`, with one clock sample.
-Production pages may be shorter. These are historical local idle measurements,
+historical uncut answer contained 250 children plus `next_cursor`, with one clock sample.
+The diagnostic now uses the 150-row cap. Production pages may be shorter. These are historical local idle measurements,
 not sustained-load proof. Measurement tests log durations and do not enforce
 wall-clock speed by default; `WEFTY_ENFORCE_READ_BUDGET=1` explicitly enforces
 the 100 ms target in the diagnostics. Functional listing tests can simulate a
@@ -300,3 +300,199 @@ observation remains successful; any prior operation failure keeps its verdict.
 Submission `inflight_count` carries `inflight_observation="run-ledger"`.
 L1 closes its snapshot before calling L3; the count is a separate observation
 and is not atomic with submission authority, readiness, status or policy revision.
+
+
+## Computer lifetime collections (#752)
+
+Storage generations and direct Custody exports use one snapshot per page,
+default 100 and maximum 250 (clamped), with the same adaptive cutoff.
+Generation pages preserve ascending `storage_generation`; export pages preserve
+`(requested_ns, export_id)` order. Their opaque cursors bind the Computer and
+collection, and fix an independent AUTOINCREMENT insertion watermark. Later
+inserts, including backdated exports or generation keys smaller than the
+continuation key, cannot join that walk. Deletion/reinsertion gets new membership.
+Each continuation observes mutable lifecycle facts anew. A missing Computer
+returns `not_found`; malformed or mismatched cursors and nonpositive limits
+return `invalid_request`.
+
+`GET /v1/computers/{computer_id}/storage-generations` returns
+`{generations, next_cursor?}`. Direct `custody-exports` now returns
+`{custody_exports, next_cursor?}`, replacing the previous bare array.
+Continue until `next_cursor` is absent. The Store inventory convenience helpers currently serve tests and walk every
+page; their combined inventory is a series of observations, not one snapshot.
+The CLI's custody-export wait lookup walks every page, so an older operation
+remains observable. For one release it accepts both the old bare-array response
+and the paged envelope during CLI/L1 upgrades. The CLI has no direct
+Storage-generation listing consumer.
+The 1000-entry custody-family bound on provenance projection is unchanged;
+direct lifetime lists can walk more than 1000 records.
+
+## Sustained-load budget evidence (#752, 2026-10-09)
+
+The final limits are **12 admitted readers**, **100 ms advisory target**,
+**200 ms hard hold limit**, and a **120 ms adaptive cutoff** (60% of the hard
+limit). Jobs and child pages now cap at **150** rows; Computer, Backup,
+provenance, Storage-generation and direct Custody-export pages retain **250**.
+Other collection maxima remain **1000**. Node projection now stops after at
+least one node at the adaptive cutoff and resumes from the last returned
+`(node_id, identity_node_id)`, preserving its insertion watermark. Log polls
+also yield after at least one event at the cutoff, retaining their existing
+last-event cursor and empty-poll termination semantics.
+
+The Job/children cap criterion is the **largest tested page whose p95 stays
+under the 100 ms soft target with concurrent disk pressure**. The 150-row
+baseline keeps ordinary Job pages away from the 200 ms hard limit in that
+measurement environment; it is not a guarantee under CPU starvation. A
+250-row trial measured p95 approximately **104 ms** and maximum approximately
+**110 ms**: within the hard limit, but over the soft target. The committed
+`WEFTY_READ_JOB_TRIAL_CAP=200` or `250` test parameter runs the production
+Job/children projectors with that trial cap; the public cap remains 150.
+
+In the earlier phase-2 baseline on the owner's shared Mac (Darwin/arm64,
+12 logical CPUs, Go 1.27.1, CGO disabled, shared Go lock), four paging workers exercised 1000 queued bound
+services with one retained attempt each, Computer detail including client
+actions, 501 Backups/provenance rows, 65 generations/exports, and 33 nodes.
+A separate writer repeatedly streamed a bounded 64 MiB file, syncing each
+8 MiB, with 336 MiB written during that historical sample. The revised test caps
+total pressure-writer volume at 256 MiB per run, including the opt-in
+diagnostic, with no more than 32 syncs. Darwin sync is a device-wide flush
+and competes with other test lanes. The revised writer paces each 1 MiB
+block at 50 ms to retain concurrent pressure within that volume cap. In
+that earlier baseline, eight secret-bearing one-shots were written and made terminal while paging continued: all eight
+sweeps completed TRUNCATE in one attempt each, and the WAL file was verified
+at zero bytes before the next secret write. The slowest sweep was **132.49 ms**.
+Walks were complete and duplicate-free; no read expired or retried.
+
+Snapshot holds measured from the production door's anchor through rollback
+and connection return (admission and response encoding excluded):
+
+| View | Samples | p50 ms | p95 ms | max ms |
+| --- | ---: | ---: | ---: | ---: |
+| Jobs | 28 | 50.91 | 78.66 | 87.37 |
+| Children | 28 | 51.56 | 79.06 | 82.13 |
+| Computer detail with actions | 4 | 2.53 | 3.50 | 3.50 |
+| Backups | 96 | 16.72 | 24.84 | 30.14 |
+| Provenance | 252 | 4.57 | 8.11 | 15.05 |
+| Nodes | 4 | 13.67 | 19.54 | 19.54 |
+| Node detail | 4 | 1.50 | 1.86 | 1.86 |
+| Storage generations | 32 | 0.26 | 0.57 | 3.87 |
+| Custody exports | 84 | 0.45 | 0.88 | 6.44 |
+| Jobs, forced one-row pages | 1001 | 0.53 | 0.63 | 6.32 |
+
+The 250-row trial exceeded the advisory target under concurrent disk pressure
+(children p95 **103.84 ms**, max **109.71 ms**); a 200-row trial also exceeded
+it (jobs p95 **102.56 ms**, children p95 **110.28 ms**, max **113.74 ms**).
+The 150-row cap gave useful margin under both target and hard limit. These
+are local samples with variable contention, not a scaling forecast or proof
+that every CI snapshot will meet the target. The supplied Linux disk-clone
+expiry and macOS CI overruns (202–253 ms) are additional reasons to keep
+availability retryable and reduce projected work. They do not justify lifting
+the hard hold limit toward or beyond the 250 ms secret checkpoint wait.
+ADR-0002 prioritizes hygiene: a busy reader may lose its answer, while its
+transaction must release the WAL for scrubbing.
+
+With the cutoff forced to one row, the 1001-row service inventory took
+**541.08 ms**, **0.541 ms per returned row** including admission, membership
+selection and fresh node facts on every page. A normal inventory walk under
+four-worker pressure averaged **356.30 ms**. The forced one-row walk ran
+after those workers finished, while disk pressure continued; these are
+different contention levels, not a controlled speedup ratio. A thousand-row
+walk remains practical locally; remote network round trips add one request
+per page, so this is not a hosted CLI latency promise.
+
+`TestReadSnapshotLoadHeldReaderSecretProgress` independently parks a snapshot
+callback past the checkpoint wait until hygiene succeeds. SQLite transaction
+cancellation must release its WAL read lock before the callback returns.
+Parked-reader checkpoints measured about **244–260 ms**, only a few ms of
+margin around the **250 ms** checkpoint wait; some samples exceed that wait.
+Hygiene is protected by cancellation/release of readers at the 200 ms hard
+limit and retried checkpoints, not by guaranteed completion in one attempt.
+Under `-cpu 1`, historical holds reached **600+ ms**, with availability retries
+and extra checkpoint attempts. Scheduling/rollback can delay observed hold
+completion beyond the hard deadline; the deadline is not a promise about
+wall-clock completion on a starved CPU.
+
+The progress watchdog follows `t.Deadline()` with a one-minute cap, allowing
+slow scheduling and retries.
+Removing transaction cancellation leaves the reader held and fails this
+progress assertion. Neither test makes a wall-clock speed assertion by
+default: only complete walks, repeated checkpoint/truncation progress and
+absence of deadlock are required. The sustained test has four paging workers
+and a watchdog based on `t.Deadline()` with a three-minute cap and cleanup
+reserve. Cleanup cancels and joins paging workers and the pressure writer
+before the harness closes the Store, including fatal paths. The 1001-page
+one-row diagnostic runs only with budget enforcement, with a separate
+one-minute watchdog outside the default verdict. The timing-sensitive load
+and parked-reader tests explicitly skip under `-race`; functional snapshot,
+cursor, and CLI tests remain available to the race detector. Timing
+enforcement is explicit:
+`WEFTY_ENFORCE_READ_BUDGET=1` requires per-view p95 <=100 ms, max <=200 ms and
+zero availability retries.
+
+The fix-round-1 fixture seeds **1000 nodes**, plus **1000 rows each** for
+administrator policy audit, Computer policy audit, take-over audit (forward
+and tail), intents, and log polls. Node and log pages are adaptive. The audit
+and intent scans remain non-adaptive: their maximum-limit pages returned all
+1000 rows under concurrent paging and disk pressure with these measured holds
+from the opt-in run:
+
+| View | p95 ms | max ms |
+| --- | ---: | ---: |
+| Jobs, cap 150 | 57.31 | 63.75 |
+| Children, cap 150 | 55.90 | 64.89 |
+| Nodes, requested limit 1000 | 120.36 | 120.36 |
+| Administrator policy audit, limit 1000 | 1.75 | 1.75 |
+| Computer policy audit, limit 1000 | 3.49 | 3.49 |
+| Take-over audit, limit 1000 | 4.22 | 4.22 |
+| Take-over audit tail, limit 1000 | 5.39 | 5.39 |
+| Computer intents, limit 1000 | 1.92 | 1.92 |
+| Log polls, limit 1000 | 3.96 | 3.96 |
+| Jobs, forced one-row pages | 3.03 | 9.55 |
+
+Three default runs and three `-cpu 1` runs passed with complete, duplicate-free
+1000-node walks and eight verified scrub/TRUNCATE cycles per run. The opt-in
+run wrote **91 MiB**, completed all eight checkpoints in eight attempts
+(slowest **179.29 ms**), and took **2.710 s** for the one-row inventory
+(**2.710 ms per returned row**, with 1001 page snapshots). A maximum-limit
+(1000) Node page held **120.36 ms** at p95, above the 100 ms advisory
+target: by design an adaptive page reads until the 120 ms cutoff and returns
+`next_cursor`, so it is bounded by the cutoff, not by a page cap. The opt-in
+gate therefore holds the adaptive maximum-limit Node page to the cutoff plus
+20 ms of slack (one row in flight and rollback) and no retries, and keeps the
+100 ms p95 target for capped views (jobs, children, Computer collections) and
+for log polls, which stay far below the cutoff. Such a page logs a target
+overrun; the CLI's default Node page (100) stays far below it. There were no
+availability retries in that run.
+
+The final `-cpu 1` runs observed a hold as long as **823.89 ms**, availability
+retries, and **9–11 checkpoint attempts for eight cycles**. Their parked-reader
+checkpoints completed in **240.07–249.65 ms**; other local samples above reach
+250–260 ms. These are contention diagnostics, not hard wall-clock guarantees.
+
+Fresh knob checks with the revised, paced writer also completed: cap 200
+measured Jobs/children p95 **76.18/84.12 ms**, and cap 250 measured
+**98.60/98.80 ms** (Job max **99.51 ms**). These single samples demonstrate
+the committed trial parameter, not a new cap calibration. Pressure volume and
+contention differ from the earlier trials, where 200 and 250 exceeded the
+soft target. A passing individual trial does not establish that p95 stays
+under the target.
+
+**Why 150, not 200.** With the committed paced writer on this 12-CPU Mac, the
+stated criterion would admit 200 (p95 about 75–85 ms) and rejects 250 (p95
+about 100–103 ms in repeated runs). The cap stays at 150 for headroom on
+slower hardware: hosted CI runners logged 200–253 ms snapshot holds and one
+`read_snapshot_expired` during a disk-heavy clone on 2026-10-09. Raising the
+cap to 200 is a reasonable later change if hosted-runner evidence shows the
+headroom is unused.
+
+Rerun:
+
+```sh
+go test ./l1/ -run 'TestReadSnapshot(SustainedLoad|LoadHeldReaderSecretProgress)' -cpu 1 -count=3 -v
+WEFTY_ENFORCE_READ_BUDGET=1 go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
+WEFTY_READ_JOB_TRIAL_CAP=200 go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
+WEFTY_READ_JOB_TRIAL_CAP=250 go test ./l1/ -run '^TestReadSnapshotSustainedLoad$' -count=1 -v
+WEFTY_TEST_READ_PAGE_CUTOFF=1ns go test ./l1/ -run 'TestComputerLifetime|TestJobListingSoftCutoffCursorWalk|TestComputerProvenanceAdaptivePagingWatermark' -count=1
+```
+
+Timing enforcement remains opt-in; run these on an otherwise idle machine.

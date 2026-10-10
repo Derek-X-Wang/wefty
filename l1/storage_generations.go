@@ -43,6 +43,7 @@ type ComputerStorageGeneration struct {
 
 type ComputerStorageGenerationList struct {
 	Generations []ComputerStorageGeneration `json:"generations"`
+	NextCursor  string                      `json:"next_cursor,omitempty"`
 }
 
 type ComputerStorageResetRequest struct {
@@ -279,29 +280,57 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	return updated, false, nil
 }
 
+// ListComputerStorageGenerations walks separate page snapshots to assemble a complete inventory.
+// Currently used by tests; production routes return individual pages.
 func (s *Store) ListComputerStorageGenerations(ctx context.Context, computerID string) (ComputerStorageGenerationList, error) {
+	result := ComputerStorageGenerationList{Generations: []ComputerStorageGeneration{}}
+	cursor := ""
+	for {
+		page, err := s.ListComputerStorageGenerationsPage(ctx, computerID, cursor, DefaultJobPageLimit)
+		if err != nil {
+			return ComputerStorageGenerationList{}, err
+		}
+		result.Generations = append(result.Generations, page.Generations...)
+		if page.NextCursor == "" {
+			return result, nil
+		}
+		cursor = page.NextCursor
+	}
+}
+
+func (s *Store) ListComputerStorageGenerationsPage(ctx context.Context, computerID, cursor string, limit int) (ComputerStorageGenerationList, error) {
 	var value ComputerStorageGenerationList
 	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
 		var err error
-		value, err = reads.computerViewListComputerStorageGenerations(ctx, computerID)
+		value, err = reads.computerViewListComputerStorageGenerations(ctx, computerID, cursor, limit)
 		return err
 	})
 	return value, err
 }
 
-func (r *databaseReads) computerViewListComputerStorageGenerations(ctx context.Context, computerID string) (ComputerStorageGenerationList, error) {
+func (r *databaseReads) computerViewListComputerStorageGenerations(ctx context.Context, computerID, value string, limit int) (ComputerStorageGenerationList, error) {
 	if strings.TrimSpace(computerID) == "" {
 		return ComputerStorageGenerationList{}, protocolError(contract.ErrorInvalidRequest, "computer_id is required")
 	}
-	rows, err := r.q.QueryContext(ctx, `SELECT storage_id, storage_generation, disk_bytes, phase,
-		reset_revision, created_ns, retired_ns FROM computer_storage_generations
-		WHERE computer_id=? ORDER BY storage_generation`, computerID)
+	cursor, limit, err := r.computerLifetimeCursor(ctx, "generations", computerID, value, limit)
+	if err != nil {
+		return ComputerStorageGenerationList{}, err
+	}
+	rows, err := r.q.QueryContext(ctx, `SELECT g.storage_id, g.storage_generation, disk_bytes, phase,
+  reset_revision, created_ns, retired_ns FROM computer_storage_generations g
+  CROSS JOIN generation_listing_order o ON o.computer_id=g.computer_id AND o.storage_generation=g.storage_generation
+  WHERE g.computer_id=? AND o.ordinal<=? AND g.storage_generation>?
+  ORDER BY g.storage_generation LIMIT ?`, computerID, cursor.HighWater, cursor.Generation, limit+1)
 	if err != nil {
 		return ComputerStorageGenerationList{}, internalError(err, "list Computer Storage generations")
 	}
 	defer rows.Close()
 	result := ComputerStorageGenerationList{Generations: []ComputerStorageGeneration{}}
 	for rows.Next() {
+		if len(result.Generations) == limit || (len(result.Generations) > 0 && r.pageCutoffReached()) {
+			result.NextCursor = encodeComputerLifetimeCursor(cursor)
+			break
+		}
 		var generation ComputerStorageGeneration
 		var resetRevision, retiredNS sql.NullInt64
 		var createdNS int64
@@ -319,18 +348,10 @@ func (r *databaseReads) computerViewListComputerStorageGenerations(ctx context.C
 			generation.RetiredAt = &value
 		}
 		result.Generations = append(result.Generations, generation)
+		cursor.Generation = generation.StorageGeneration
 	}
 	if err := rows.Err(); err != nil {
 		return ComputerStorageGenerationList{}, internalError(err, "iterate Computer Storage generations")
-	}
-	if len(result.Generations) == 0 {
-		var exists bool
-		if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM computers WHERE computer_id=?)`, computerID).Scan(&exists); err != nil {
-			return ComputerStorageGenerationList{}, internalError(err, "read Computer Storage authority")
-		}
-		if !exists {
-			return ComputerStorageGenerationList{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
-		}
 	}
 	return result, nil
 }

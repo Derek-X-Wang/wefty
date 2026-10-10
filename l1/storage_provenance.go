@@ -102,8 +102,8 @@ func (r *databaseReads) computerProvenancePage(ctx context.Context, computerID, 
 	if limit < 1 {
 		return ComputerStorageProvenance{}, protocolError(contract.ErrorInvalidRequest, "limit must be positive")
 	}
-	if limit > MaxJobListingPageLimit {
-		limit = MaxJobListingPageLimit
+	if limit > MaxComputerListingPageLimit {
+		limit = MaxComputerListingPageLimit
 	}
 	cursor := provenanceCollectionCursor{Version: 1, ComputerID: computerID}
 	if value != "" {

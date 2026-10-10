@@ -69,7 +69,7 @@ func (s *Server) writeChangedJob(w http.ResponseWriter, r *http.Request, job Job
 			}
 		}
 		writeError(w, &Error{Code: contract.ErrorUnavailable, Details: details,
-			Message: "job change committed but its view is unavailable", notRetryable: !snapshotUnavailable})
+			Message: "job change committed but its post-change read is unavailable", notRetryable: !snapshotUnavailable})
 		return
 	}
 	writeJSON(w, status, redactJob(projected))

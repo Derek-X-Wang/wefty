@@ -296,8 +296,8 @@ func TestSupersededWaitsExitFiveFromTheRealBinary(t *testing.T) {
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(l1.ComputerCustodyExport{ExportID: "export-1", ComputerID: computerID, BackupID: "backup-1", Status: "planned"})
 		case r.Method == http.MethodGet && r.URL.Path == base+"/custody-exports":
-			_ = json.NewEncoder(w).Encode([]l1.ComputerCustodyExport{{ExportID: "export-1", ComputerID: computerID,
-				BackupID: "backup-1", Status: "superseded"}})
+			_ = json.NewEncoder(w).Encode(l1.ComputerCustodyExportList{Exports: []l1.ComputerCustodyExport{{ExportID: "export-1", ComputerID: computerID,
+				BackupID: "backup-1", Status: "superseded"}}})
 		case r.Method == http.MethodPost && r.URL.Path == base+"/backups/backup-1/clone":
 			w.Header().Set("Clone-Computer-Id", cloneID)
 			w.Header().Set("Clone-Operation-Revision", "1")

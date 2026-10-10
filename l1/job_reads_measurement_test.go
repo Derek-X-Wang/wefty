@@ -175,7 +175,7 @@ func TestJobReadSnapshotMeasureChildrenPage(t *testing.T) {
 					return err
 				})
 				elapsed := time.Since(start)
-				if err != nil || len(page.Jobs) != 250 || page.NextCursor == "" || calls != 1 {
+				if err != nil || len(page.Jobs) != MaxChildJobPageLimit || page.NextCursor == "" || calls != 1 {
 					t.Fatalf("rows=%d cursor=%q clocks=%d err=%v", len(page.Jobs), page.NextCursor, calls, err)
 				}
 				for _, job := range page.Jobs {

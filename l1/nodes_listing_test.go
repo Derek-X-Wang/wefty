@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -178,5 +179,39 @@ func TestNodesListingPlanAndReadSnapshot(t *testing.T) {
 	page, err := h.store.listNodesPage(ctx, nodeListFilters{}, "", 1)
 	if err != nil || ctx.Err() != nil || len(page.Nodes) != 1 {
 		t.Fatalf("read blocked by writer: page=%+v err=%v context=%v", page, err, ctx.Err())
+	}
+}
+
+// A maximum-limit page must still make progress when projection reaches its
+// cutoff. The forced cutoff makes the 1000-node regression CPU-independent.
+func TestNodesListing1000AdaptiveCutoff(t *testing.T) {
+	h := newIntegrationHarness(t, nil)
+	h.stopServer()
+	if _, err := h.store.db.ExecContext(t.Context(), `WITH RECURSIVE fixture(n) AS
+ (SELECT 1 UNION ALL SELECT n+1 FROM fixture WHERE n<1000)
+ INSERT INTO nodes(node_id,identity_node_id,boot_session_id,os,architecture,agent_version,capabilities_json,state,last_heartbeat_ns,max_oneshot_slots,max_service_slots,claims_enabled)
+ SELECT printf('node-%04d',n),printf('identity-%04d',n),'boot','linux','amd64','test','{}','alive',?,4,4,1 FROM fixture`, h.clock.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Nanosecond)
+	cursor := ""
+	for i := 1; i <= 1000; i++ {
+		page, err := h.store.listNodesPage(ctx, nodeListFilters{}, cursor, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := fmt.Sprintf("node-%04d", i)
+		if len(page.Nodes) != 1 || page.Nodes[0].NodeID != want {
+			t.Fatalf("1000-node adaptive page %d: rows=%d want one node %s", i, len(page.Nodes), want)
+		}
+		if i < 1000 {
+			decoded, err := decodeNodeListCursor(page.NextCursor, nodeListFilters{})
+			if err != nil || decoded.NodeID != want || decoded.Identity != fmt.Sprintf("identity-%04d", i) {
+				t.Fatalf("cursor did not name last returned node: %+v %v", decoded, err)
+			}
+		} else if page.NextCursor != "" {
+			t.Fatal("terminal page has cursor")
+		}
+		cursor = page.NextCursor
 	}
 }
