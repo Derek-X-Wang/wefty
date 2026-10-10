@@ -664,18 +664,21 @@ func executeServiceLogs(
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("services logs", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
-	var follow bool
+	var follow, all bool
+	var requestedCursor string
 	var followFor, pollInterval time.Duration
 	var limit int
 	flags.BoolVar(&follow, "follow", false, "keep polling across service attempts")
 	flags.DurationVar(&followFor, "follow-for", 0, "stop following after this duration")
 	flags.DurationVar(&pollInterval, "poll-interval", defaultServicePollInterval, "follow polling interval")
+	flags.StringVar(&requestedCursor, "cursor", "", "opaque cursor from the previous page; with --follow, start polling from it")
+	flags.BoolVar(&all, "all", false, "walk every page and print every retained event (cannot combine with --follow or --cursor)")
 	flags.IntVar(&limit, "limit", l1.DefaultLogPageLimit, "events per poll")
 	if err := flags.Parse(args); err != nil {
 		return usageError(err.Error())
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty services logs JOB_ID [--follow]")
+		return usageError("usage: wefty services logs JOB_ID [--follow | --cursor | --all]")
 	}
 	if limit < 1 || limit > l1.MaxLogPageLimit {
 		return usageError(fmt.Sprintf("--limit must be between 1 and %d", l1.MaxLogPageLimit))
@@ -689,6 +692,12 @@ func executeServiceLogs(
 	if followFor > 0 && !follow {
 		return usageError("--follow-for requires --follow")
 	}
+	if all && follow {
+		return usageError("--all prints every retained event once; it cannot follow")
+	}
+	if all && requestedCursor != "" {
+		return usageError("--all walks the retained log from the start; --cursor has nothing to continue from")
+	}
 
 	followCtx := ctx
 	cancel := func() {}
@@ -698,7 +707,7 @@ func executeServiceLogs(
 	defer cancel()
 
 	jobID := flags.Arg(0)
-	cursor := ""
+	cursor := requestedCursor
 	lastAttemptID := ""
 	var truncation truncationAnnouncer
 	for {
@@ -728,7 +737,7 @@ func executeServiceLogs(
 			return err
 		}
 		if jsonOutput {
-			if follow {
+			if follow || all {
 				// stdout stays one event per line; the notice goes to stderr,
 				// so a fully trimmed run never follows as a silent one.
 				if err := truncation.announce(stderr, page.Truncation); err != nil {
@@ -752,6 +761,18 @@ func executeServiceLogs(
 		}
 		cursor = page.NextCursor
 		if !follow {
+			// --all walks until the empty poll that means the retained log
+			// is drained; anything before that empty page carries more
+			// events behind the cursor.
+			if all && len(page.Events) > 0 && page.NextCursor != "" {
+				continue
+			}
+			// One page shows its continuation point; --all has already
+			// drained the log, so it has no next cursor to name.
+			if !all && page.NextCursor != "" {
+				_, err := fmt.Fprintf(stdout, "NEXT CURSOR\t%s\n", page.NextCursor)
+				return err
+			}
 			return nil
 		}
 		timer := time.NewTimer(pollInterval)
