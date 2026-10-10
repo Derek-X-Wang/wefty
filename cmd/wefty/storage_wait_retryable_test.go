@@ -55,6 +55,42 @@ func retryable503() *apiResponseError {
 // here even on a loaded runner; every fake below decides by count.
 var retryableWaitFlags = storageWaitFlags{timeout: 3 * time.Second, pollInterval: time.Millisecond}
 
+// requireMarkedReads fails any GET the shared client makes without the
+// caller-watched marker (#773), so a wait or follow loop that lost its
+// withoutClientRetry mark fails here deterministically instead of hoping four
+// extra requests per poll shift a count assertion.
+type requireMarkedReads struct {
+	t    *testing.T
+	base http.RoundTripper
+	once atomic.Bool
+	// oneShot names the paths a command legitimately reads once before its
+	// loop starts (for example a handle resolution); they keep the quiet retry.
+	oneShot []string
+}
+
+func (transport *requireMarkedReads) RoundTrip(request *http.Request) (*http.Response, error) {
+	for _, prefix := range transport.oneShot {
+		if strings.HasPrefix(request.URL.Path, prefix) {
+			return transport.base.RoundTrip(request)
+		}
+	}
+	if request.Method == http.MethodGet && !clientRetrySuppressed(request.Context()) &&
+		transport.once.CompareAndSwap(false, true) {
+		transport.t.Errorf("an unmarked GET reached the shared client: %s", request.URL.Path)
+	}
+	return transport.base.RoundTrip(request)
+}
+
+// waitStubClient builds the L1 client the wait and follow tests use: the
+// test-server rewrite, plus the marked-read assertion above.
+func waitStubClient(t *testing.T, server *httptest.Server, oneShot ...string) *apiClient {
+	t.Helper()
+	client := &apiClient{name: "L1", client: server.Client()}
+	client.client.Transport = &requireMarkedReads{t: t, oneShot: oneShot,
+		base: rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}}
+	return client
+}
+
 func TestPollStorageObservationContinuesPastRetryableAnswers(t *testing.T) {
 	t.Run("retryable answers mid-wait do not end the wait", func(t *testing.T) {
 		var answers atomic.Int32
@@ -197,8 +233,7 @@ func TestEveryStorageWaitToleratesARetryableAnswer(t *testing.T) {
 			defer server.Close()
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
-			client := &apiClient{name: "L1", client: server.Client()}
-			client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+			client := waitStubClient(t, server)
 			if err := test.wait(ctx, &apiClients{l1: client}); err != nil {
 				t.Fatalf("wait with one retryable 503 mid-wait: %v", err)
 			}
@@ -222,8 +257,7 @@ func TestWaitForServiceToleratesARetryableAnswer(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(l1.Job{JobID: "svc", State: contract.JobStopped})
 		}))
 		defer server.Close()
-		client := &apiClient{name: "L1", client: server.Client()}
-		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		client := waitStubClient(t, server)
 		job, err := waitForService(t.Context(), &apiClients{l1: client}, l1.Job{JobID: "svc", State: contract.JobRunning},
 			retryableWaitFlags.timeout, retryableWaitFlags.pollInterval, "stopped", predicate)
 		if err != nil || reads.Load() != 2 || job.State != contract.JobStopped {
@@ -238,8 +272,7 @@ func TestWaitForServiceToleratesARetryableAnswer(t *testing.T) {
 			writeForbiddenResponse(w)
 		}))
 		defer server.Close()
-		client := &apiClient{name: "L1", client: server.Client()}
-		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		client := waitStubClient(t, server)
 		_, err := waitForService(t.Context(), &apiClients{l1: client}, l1.Job{JobID: "svc", State: contract.JobRunning},
 			retryableWaitFlags.timeout, retryableWaitFlags.pollInterval, "stopped", predicate)
 		if commandExitCode(err) != exitUnauthorized || reads.Load() != 1 {
@@ -254,8 +287,7 @@ func TestWaitForServiceToleratesARetryableAnswer(t *testing.T) {
 			writeRetryableUnavailable(w, "read_snapshot_expired")
 		}))
 		defer server.Close()
-		client := &apiClient{name: "L1", client: server.Client()}
-		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		client := waitStubClient(t, server)
 		job, err := waitForService(t.Context(), &apiClients{l1: client}, l1.Job{JobID: "svc", State: contract.JobRunning},
 			time.Second, time.Millisecond, "stopped", predicate)
 		if reads.Load() < 2 || commandExitCode(err) != exitMutationWaitTimeout || job.JobID != "" {
@@ -385,9 +417,11 @@ func TestOneShotReadStillSurfacesRetryable503FromRealBinary(t *testing.T) {
 	decoder := json.NewDecoder(strings.NewReader(output))
 	var envelope contract.ErrorResponse
 	_ = decoder.Decode(&envelope)
+	// A one-shot read has no wait window: it makes its bounded quiet retries
+	// (#773, one try plus three) and then still surfaces the answer as exit 13.
 	if code != exitUnavailable || envelope.Error.Code != contract.ErrorUnavailable || !envelope.Error.Retryable ||
-		reads.Load() != 1 {
-		t.Fatalf("one-shot read exited %d with %d reads, want 13 without any wait retry: %s", code, reads.Load(), output)
+		reads.Load() != 4 {
+		t.Fatalf("one-shot read exited %d with %d reads, want 13 after one try plus three quiet retries: %s", code, reads.Load(), output)
 	}
 }
 
@@ -457,7 +491,7 @@ func TestWaitForServiceKeepsTheRefusalThatArrivesAtTheDeadline(t *testing.T) {
 		late:      contract.APIError{Code: contract.ErrorNotFound, Message: "gone", Retryable: false},
 		lateCode:  http.StatusNotFound,
 	}
-	client := &apiClient{name: "L1", client: &http.Client{Transport: transport}}
+	client := &apiClient{name: "L1", client: &http.Client{Transport: &requireMarkedReads{t: t, base: transport}}}
 	job, err := waitForService(t.Context(), &apiClients{l1: client}, l1.Job{JobID: "svc", State: contract.JobRunning},
 		time.Second, time.Millisecond, "stopped", func(job l1.Job) bool { return job.State == contract.JobStopped })
 	var refusal *apiResponseError
@@ -468,14 +502,17 @@ func TestWaitForServiceKeepsTheRefusalThatArrivesAtTheDeadline(t *testing.T) {
 }
 
 func TestFollowLoopsTolerateARetryableAnswer(t *testing.T) {
-	t.Run("run logs --follow keeps following past a 503", func(t *testing.T) {
+	t.Run("run logs --follow keeps following past 503s, one request per poll", func(t *testing.T) {
 		var logsReads atomic.Int32
 		var runReads atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			switch r.URL.Path {
 			case "/v1/runs/run-1/logs":
-				if logsReads.Add(1) == 1 {
+				// Two refusals: a marked loop must spend exactly one request
+				// on each poll, so the client's quiet retry (#773) never
+				// stacks its backoff on the follow's interval (#763).
+				if logsReads.Add(1) <= 2 {
 					writeRetryableUnavailable(w, "read_snapshot_expired")
 					return
 				}
@@ -489,16 +526,15 @@ func TestFollowLoopsTolerateARetryableAnswer(t *testing.T) {
 			}
 		}))
 		defer server.Close()
-		client := &apiClient{name: "L1", client: server.Client()}
-		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		client := waitStubClient(t, server)
 		clients := &apiClients{l1: client, l3: client}
 		var stdout, stderr bytes.Buffer
 		err := execute(t.Context(), clients, true, []string{"logs", "run-1", "--follow", "--poll-interval", "10ms"}, &stdout, &stderr)
-		if err != nil || logsReads.Load() != 2 || runReads.Load() != 1 {
-			t.Fatalf("run logs follow with one retryable 503: err=%v logs=%d runs=%d", err, logsReads.Load(), runReads.Load())
+		if err != nil || logsReads.Load() != 3 || runReads.Load() != 1 {
+			t.Fatalf("run logs follow with retryable 503s: err=%v logs=%d runs=%d", err, logsReads.Load(), runReads.Load())
 		}
 	})
-	t.Run("services logs --follow keeps following past a 503", func(t *testing.T) {
+	t.Run("services logs --follow keeps following past 503s, one request per poll", func(t *testing.T) {
 		var logsReads atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -508,20 +544,23 @@ func TestFollowLoopsTolerateARetryableAnswer(t *testing.T) {
 				return
 			}
 			read := logsReads.Add(1)
-			if read == 1 || read > 2 {
+			if read == 1 || read == 3 {
 				writeRetryableUnavailable(w, "read_snapshot_expired")
 				return
 			}
 			_ = json.NewEncoder(w).Encode(l1.LogPage{})
 		}))
 		defer server.Close()
-		client := &apiClient{name: "L1", client: server.Client()}
-		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		client := waitStubClient(t, server)
 		clients := &apiClients{l1: client}
 		var stdout, stderr bytes.Buffer
+		// The window is what ends a services follow, so the poll spacing and
+		// the window are sized to make the poll count — and the request
+		// count — exact: refusals at polls 1 and 3, and the window landing
+		// inside the retry sleep before a poll 4 could begin.
 		err := executeServiceLogs(t.Context(), clients, true,
-			[]string{"svc", "--follow", "--follow-for", "1s", "--poll-interval", "50ms"}, &stdout, &stderr)
-		if err != nil || logsReads.Load() < 3 {
+			[]string{"svc", "--follow", "--follow-for", "1400ms", "--poll-interval", "500ms"}, &stdout, &stderr)
+		if err != nil || logsReads.Load() != 3 {
 			t.Fatalf("services logs follow with retryable 503s: err=%v reads=%d", err, logsReads.Load())
 		}
 	})
@@ -542,8 +581,7 @@ func TestFollowLoopsCancelledDuringRetrySleep(t *testing.T) {
 		served := make(chan struct{})
 		server := constantUnavailable(served)
 		defer server.Close()
-		client := &apiClient{name: "L1", client: server.Client()}
-		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		client := waitStubClient(t, server)
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		done := make(chan error, 1)

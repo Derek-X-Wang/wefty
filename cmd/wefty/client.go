@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -788,8 +789,71 @@ func (c *apiClients) listRunsByOrigin(ctx context.Context, origin, cursor string
 	return page, err
 }
 
+// clientRetryKey marks a context whose GET requests are watched by a wait or
+// follow loop that already retries retryable answers at its own interval
+// (#763). Stacking the one-shot quiet retry's backoff (#773) on top of that
+// loop would double its cadence, so the caller marks the loop's reads out.
+type clientRetryKey struct{}
+
+// withoutClientRetry marks a caller-watched context this way.
+func withoutClientRetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, clientRetryKey{}, true)
+}
+
+func clientRetrySuppressed(ctx context.Context) bool {
+	value, _ := ctx.Value(clientRetryKey{}).(bool)
+	return value
+}
+
+// readRetryAttempts is how many quiet retries a one-shot GET read may make
+// after a retryable answer (#773). Bounded and short: transient overload —
+// such as a read snapshot that expired while its node was busy — is not a
+// verdict a one-shot reader should act on, but a read must stay a read,
+// inside about a second all in.
+const readRetryAttempts = 3
+
+// readRetryBase gaps the first quiet retry; each later one doubles it, so the
+// schedule is 100, 200 and then 400 ms before jitter.
+const readRetryBase = 100 * time.Millisecond
+
+// readRetryBackoff spaces the quiet retries, short and jittered so a fleet
+// of simultaneous readers does not re-align on the same gap.
+func readRetryBackoff(attempt int) time.Duration {
+	gap := readRetryBase << attempt
+	return gap + time.Duration(rand.Int64N(int64(gap/4)))
+}
+
+// readRetryWait spaces one quiet retry, honouring the reader's context during
+// the gap. A package variable so the round-zero checks can decide the gap's
+// end deterministically instead of racing a real sleep.
+var readRetryWait = waitForContext
+
 func (c *apiClient) do(ctx context.Context, method, path string, body any, headers http.Header, target any, success ...int) error {
 	_, err := c.doWithResponse(ctx, method, path, body, headers, target, success...)
+	// A one-shot GET read quietly retries a retryable `unavailable` answer
+	// (#773), so transient overload is invisible to a command that has no
+	// other reading to do. The last answer, refused or not, is reported
+	// exactly as a single try would be. A caller's cancellation ends even
+	// the backoff, mutations keep their exact-once semantics, and a wait or
+	// follow loop that already retries such answers (#763) suppresses this
+	// one entirely. Transport failures are never retried: they are
+	// reachability advice, not load.
+	for attempt := 0; method == http.MethodGet && !clientRetrySuppressed(ctx) &&
+		attempt < readRetryAttempts && isRetryableL1Answer(err) && ctx.Err() == nil; attempt++ {
+		if wait := readRetryWait(ctx, readRetryBackoff(attempt)); wait != nil {
+			// A cancellation is the reader leaving: report it at once. A
+			// deadline passing during the gap is the congestion the read was
+			// already answering (#773): the last answer is the one a single
+			// try would have reported, not a bare deadline error.
+			if errors.Is(wait, context.Canceled) {
+				return wait
+			}
+			return err
+		}
+		if _, err = c.doWithResponse(ctx, method, path, body, headers, target, success...); !isRetryableL1Answer(err) {
+			return err
+		}
+	}
 	return err
 }
 

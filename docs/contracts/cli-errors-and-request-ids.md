@@ -40,7 +40,8 @@ that deadline on retryable answers alone is the wait-timeout outcome (exit 14,
 detail. The log follows (`wefty logs --follow`, `services logs --follow`) have
 no deadline: they retry such answers at their poll interval until the reader
 stops them, which is an ordinary interrupted follow, never exit 13. One-shot
-reads (no `--wait`) still exit 13. Non-retryable answers still
+reads (no `--wait`) still exit 13, after quietly retrying (see below).
+Non-retryable answers still
 end a wait immediately and keep their own classification. Genuine Fabric
 identity absence remains
 `401 unauthorized` and exits 3. Node agents classify `unavailable` as
@@ -48,6 +49,19 @@ transient without treating it as lost attempt or node-session authority.
 Ledger-only admission refusals remain `403 forbidden` and exit 3, adding
 `details.reason="run_ledger_not_admitted"`; per-Computer and per-host
 authority refusals carry no ledger-admission reason.
+
+A one-shot read — a GET with no `--wait`, `--follow`, or wait window of its
+own — quietly retries an answer of `code=unavailable`, `retryable=true`
+(#773) before reporting anything: up to three retries at about 100, 200 and
+400 ms with jitter, inside about a second. Each retry is a new request with
+its own request ID, and if every try is refused the last answer's envelope
+and exit 13 are reported exactly as a single try would be. Mutations are
+never retried; transport failures without an envelope are not retried;
+non-retryable answers and caller cancellation return at once, including
+during the backoff. Wait and follow loops that already retry such answers at
+their own interval (#763) skip this one-shot retry, so their cadence is
+unchanged; `--all` page walks are one-shot reads and may make up to three
+extra requests per page.
 
 `--json` and `--json=true` are global wherever they appear in the argument list,
 including after the command or its operands, except when consumed as another

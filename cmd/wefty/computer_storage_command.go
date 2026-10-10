@@ -815,6 +815,11 @@ func attachStorageProvenance(ctx context.Context, clients *apiClients, computerI
 		defer cancel()
 		// The follow-up read inherits the observation loop's cadence (#763).
 		pollInterval = output.Observation.waitPollInterval
+		// A wait window's walks retry retryable answers at their own interval
+		// (#763, #773): the shared client's one-shot quiet retry is doubled
+		// backoff on top of it, so the walk is marked out. Without a window
+		// the read is one-shot and keeps the quiet retry.
+		observationCtx = withoutClientRetry(observationCtx)
 	}
 	var provenance l1.ComputerStorageProvenance
 	var err error
@@ -1025,6 +1030,10 @@ func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe 
 	started := time.Now().UTC()
 	waitCtx, cancel := context.WithTimeout(ctx, wait.timeout)
 	defer cancel()
+	// The observation loop retries retryable answers at its own interval
+	// (#763, #773): the shared client's one-shot quiet retry is doubled
+	// backoff on top of it, so the observed reads are marked out.
+	waitCtx = withoutClientRetry(waitCtx)
 	deadline, _ := waitCtx.Deadline()
 	observation := storageWaitObservation{Status: "waiting", StartedAt: started.Format(time.RFC3339Nano),
 		waitDeadline: deadline, waitPollInterval: wait.pollInterval}

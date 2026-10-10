@@ -21,7 +21,7 @@ func TestProvenanceWalkToleratesARetryableAnswer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
 
-	provenanceStub := func(t *testing.T, retryable func(reads int32) bool) (*apiClients, *atomic.Int32) {
+	provenanceStub := func(t *testing.T, retryable func(reads int32) bool, oneShot ...string) (*apiClients, *atomic.Int32) {
 		t.Helper()
 		var reads atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -39,8 +39,7 @@ func TestProvenanceWalkToleratesARetryableAnswer(t *testing.T) {
 			writeRetryableUnavailable(w, "read_snapshot_expired")
 		}))
 		t.Cleanup(server.Close)
-		client := &apiClient{name: "L1", client: server.Client()}
-		client.client.Transport = rewriteWaitTestTransport{base: server.Client().Transport, url: server.URL}
+		client := waitStubClient(t, server, oneShot...)
 		return &apiClients{l1: client}, &reads
 	}
 
@@ -56,12 +55,13 @@ func TestProvenanceWalkToleratesARetryableAnswer(t *testing.T) {
 			t.Fatalf("provenance reads = %d, want 3 with provenance attached", reads.Load())
 		}
 	})
-	t.Run("one-shot read is unchanged", func(t *testing.T) {
-		clients, reads := provenanceStub(t, func(int32) bool { return true })
+	t.Run("one-shot read quietly retries, then reports exit 13 (#773)", func(t *testing.T) {
+		// Outside a wait window this is a one-shot read that keeps the quiet retry.
+		clients, reads := provenanceStub(t, func(int32) bool { return true }, "/v1/computers/computer-1/storage-provenance")
 		output := storageMutationOutput{}
 		err := attachStorageProvenance(ctx, clients, "computer-1", &output, nil)
 		var refusal *apiResponseError
-		if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) || reads.Load() != 1 ||
+		if commandExitCode(err) != exitUnavailable || !errors.As(err, &refusal) || reads.Load() != 1+3 ||
 			output.ProvenanceUnavailable != "" {
 			t.Fatalf("one-shot provenance read changed: reads=%d exit=%d err=%v note=%q",
 				reads.Load(), commandExitCode(err), err, output.ProvenanceUnavailable)
