@@ -2491,7 +2491,7 @@ func tryLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, idemp
 
 func runLiveComputerHTTP(t *testing.T, computer l1.Computer, method, path, idempotencyKey string, body any) liveComputerHTTPResult {
 	t.Helper()
-	status, payload, err := retryHarnessRequest(t.Context(), method, path, idempotencyKey, func() (int, []byte, error) {
+	status, payload, err := retryHarnessRequest(t.Context(), t.Logf, method, path, idempotencyKey, func() (int, []byte, error) {
 		result, err := tryLiveComputerHTTP(t, computer, method, path, idempotencyKey, body)
 		return result.Status, []byte(result.Body), err
 	})
@@ -2518,7 +2518,7 @@ func listComputerRunsFromAuthority(t *testing.T, harness *acceptanceHarness, com
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, payload, err := harnessHTTP(t.Context(), client, request)
+	status, payload, err := harnessHTTP(t.Context(), t.Logf, client, request)
 	if err != nil {
 		t.Fatalf("list Computer Runs from L3 authority: %v", err)
 	}

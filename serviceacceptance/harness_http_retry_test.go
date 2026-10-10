@@ -55,7 +55,7 @@ func TestHarnessHTTPRetry(t *testing.T) {
 				t.Fatal(err)
 			}
 			request.Header.Set("Idempotency-Key", test.key)
-			status, body, err := harnessHTTP(t.Context(), client, request)
+			status, body, err := harnessHTTP(t.Context(), t.Logf, client, request)
 			if err != nil || calls != test.wantCalls || status != test.wantStatus {
 				t.Fatalf("calls=%d status=%d body=%s err=%v", calls, status, body, err)
 			}
@@ -70,7 +70,7 @@ func TestHarnessRetryStopsOnTransportFailureAndCancellation(t *testing.T) {
 	t.Run("transport failure", func(t *testing.T) {
 		want := errors.New("connection lost")
 		calls := 0
-		_, _, err := retryHarnessRequest(t.Context(), http.MethodGet, "/v1/jobs", "", func() (int, []byte, error) {
+		_, _, err := retryHarnessRequest(t.Context(), t.Logf, http.MethodGet, "/v1/jobs", "", func() (int, []byte, error) {
 			calls++
 			return 0, nil, want
 		})
@@ -82,7 +82,7 @@ func TestHarnessRetryStopsOnTransportFailureAndCancellation(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 		calls := 0
-		_, _, err := retryHarnessRequest(ctx, http.MethodGet, "/v1/jobs", "", func() (int, []byte, error) {
+		_, _, err := retryHarnessRequest(ctx, t.Logf, http.MethodGet, "/v1/jobs", "", func() (int, []byte, error) {
 			calls++
 			cancel()
 			return 503, []byte(`{"error":{"code":"` + string(contract.ErrorUnavailable) + `","retryable":true}}`), nil

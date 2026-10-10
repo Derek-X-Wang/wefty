@@ -437,7 +437,7 @@ func runLedgerJSON(t *testing.T, harness *acceptanceHarness, method, path, idemp
 	if idempotencyKey != "" {
 		request.Header.Set("Idempotency-Key", idempotencyKey)
 	}
-	status, body, err := harnessHTTP(t.Context(), client, request)
+	status, body, err := harnessHTTP(t.Context(), t.Logf, client, request)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -498,7 +498,7 @@ func (h *acceptanceHarness) doJSON(t *testing.T, method, path string, input, out
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	status, payload, err := harnessHTTP(t.Context(), h.client, request)
+	status, payload, err := harnessHTTP(t.Context(), t.Logf, h.client, request)
 	if err != nil {
 		t.Fatal(err)
 	}
