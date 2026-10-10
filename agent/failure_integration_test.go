@@ -1342,6 +1342,27 @@ func TestPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 }
 
 func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
+	runPartitionedAgentRejoinFixture(t, false)
+}
+
+func TestPartitionedAgentRejoinsAfterTransientReregistrationFailure(t *testing.T) {
+	runPartitionedAgentRejoinFixture(t, true)
+}
+
+type reregistrationFailureTransport struct {
+	base          http.RoundTripper
+	registrations atomic.Int32
+}
+
+func (transport *reregistrationFailureTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Path == "/v1/agent/nodes/register" && transport.registrations.Add(1) == 2 {
+		return nil, errors.New("injected transient re-registration failure")
+	}
+	return transport.base.RoundTrip(request)
+}
+
+func runPartitionedAgentRejoinFixture(t *testing.T, transientFailure bool) {
+	t.Helper()
 	clock := newManualClock(time.Date(2026, 8, 9, 14, 0, 0, 0, time.UTC))
 	network := plain.NewNetwork()
 	// One one-shot slot: the only claim loop stays inside the expired attempt
@@ -1370,11 +1391,17 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
+	var registrationTransport *reregistrationFailureTransport
+	if transientFailure {
+		client := nodeAgent.session.client
+		registrationTransport = &reregistrationFailureTransport{base: client.httpClient.Transport}
+		client.httpClient.Transport = registrationTransport
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
-	expiredAttemptID := runner.waitStarted(t)
+	expiredAttemptID := runner.waitStarted(t, done)
 	freshJob := createAgentTestJob(t, store, "partitioned-agent-fresh")
 	clock.waitForDeadline(t, clock.Now().Add(10*time.Second))
 
@@ -1388,11 +1415,14 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		t.Fatalf("agent exited after attempt-authority loss: %v", err)
 	default:
 	}
-	freshAttemptID := runner.waitStarted(t)
+	freshAttemptID := runner.waitStartedAfterRejoin(t, done, clock, nodeAgent)
+	if registrationTransport != nil && registrationTransport.registrations.Load() < 3 {
+		t.Fatal("fresh attempt started without retrying the injected re-registration failure")
+	}
 	if freshAttemptID == expiredAttemptID {
 		t.Fatalf("fresh job reused expired attempt %q", freshAttemptID)
 	}
-	completed, err := waitForFailureJobState(store, freshJob.JobID, contract.JobSucceeded, 5*time.Second)
+	completed, err := waitForFailureJobState(store, freshJob.JobID, contract.JobSucceeded, resilienceTestWatchdog)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1438,7 +1468,7 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent Run() after outer cancellation = %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(resilienceTestWatchdog):
 		t.Fatal("agent did not return after outer cancellation")
 	}
 }
@@ -3679,6 +3709,10 @@ func (runner *stubbornRunner) waitCanceled(t *testing.T) {
 
 func (runner *stubbornRunner) release() { close(runner.releaseC) }
 
+// Runtime-start and reap channels order this test. This watchdog only catches
+// deadlocks; hosted runner scheduling is not an execution-start contract.
+const resilienceTestWatchdog = 30 * time.Second
+
 func newResilienceRunner() *resilienceRunner {
 	return &resilienceRunner{
 		starts: make(map[string]int), started: make(chan string, 4), canceled: make(chan string, 4),
@@ -3703,14 +3737,44 @@ func (runner *resilienceRunner) Run(ctx context.Context, request processrunner.R
 	return contract.ProcessResult{ExitCode: &exitCode}, nil
 }
 
-func (runner *resilienceRunner) waitStarted(t *testing.T) string {
+func (runner *resilienceRunner) waitStarted(t *testing.T, done <-chan error) string {
 	t.Helper()
 	select {
 	case attemptID := <-runner.started:
 		return attemptID
-	case <-time.After(5 * time.Second):
+	case err := <-done:
+		t.Fatalf("agent exited before runtime start: %v", err)
+		return ""
+	case <-time.After(resilienceTestWatchdog):
 		t.Fatal("process runner did not start")
 		return ""
+	}
+}
+
+func (runner *resilienceRunner) waitStartedAfterRejoin(t *testing.T, done <-chan error, clock *manualClock, nodeAgent *Agent) string {
+	t.Helper()
+	watchdog := time.NewTimer(resilienceTestWatchdog)
+	defer watchdog.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case attemptID := <-runner.started:
+			return attemptID
+		case err := <-done:
+			t.Fatalf("agent exited before runtime start: %v", err)
+			return ""
+		case <-watchdog.C:
+			t.Fatal("process runner did not start")
+			return ""
+		case <-poll.C:
+			// Registration retries wait on the manual clock. Drive their
+			// backoff while rejoining, without aging a fresh attempt's lease.
+			status := nodeAgent.Status()
+			if status.State == LifecycleRejoining && status.SessionBackoff > 0 {
+				clock.Advance(status.SessionBackoff)
+			}
+		}
 	}
 }
 
@@ -3721,7 +3785,7 @@ func (runner *resilienceRunner) waitCanceled(t *testing.T, want string) {
 		if attemptID != want {
 			t.Fatalf("canceled attempt = %q, want %q", attemptID, want)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(resilienceTestWatchdog):
 		t.Fatal("authority-lost payload was not canceled and reaped")
 	}
 }
@@ -3820,7 +3884,7 @@ func (clock *manualClock) AdvanceWall(duration time.Duration) {
 
 func (clock *manualClock) waitForDeadline(t *testing.T, deadline time.Time) {
 	t.Helper()
-	waitUntil := time.Now().Add(5 * time.Second)
+	waitUntil := time.Now().Add(resilienceTestWatchdog)
 	for time.Now().Before(waitUntil) {
 		clock.mu.Lock()
 		found := false

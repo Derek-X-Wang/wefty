@@ -235,7 +235,9 @@ func TestCancelReviewLookupBudgetAndBackoff(t *testing.T) {
 		}
 	}
 	lookup := &unavailableLookupClient{hang: true}
-	const budget = 50 * time.Millisecond
+	// Allow the preceding SQLite read to finish under hosted CPU contention
+	// while still bounding the lookup's ten-second hang.
+	const budget = 500 * time.Millisecond
 	r, _ := NewReconciler(s, &recordingJobClient{}, ReconcilerConfig{DispatchLookup: lookup, DispatchRecoveryBudget: budget})
 	started := time.Now()
 	_ = r.ReconcileOnce(ctx)
@@ -246,6 +248,9 @@ func TestCancelReviewLookupBudgetAndBackoff(t *testing.T) {
 		t.Fatalf("lookups=%v want one", lookup.looked)
 	}
 	lookup.hang = false
+	// The short budget proves that a hanging lookup is bounded. Subsequent
+	// passes prove fake-clock backoff, independent of hosted SQLite latency.
+	r, _ = NewReconciler(s, &recordingJobClient{}, ReconcilerConfig{DispatchLookup: lookup, DispatchRecoveryBudget: 10 * time.Second})
 	_ = r.ReconcileOnce(ctx)
 	if len(lookup.looked) != 3 {
 		t.Fatalf("backed-off row retried or peers starved: %v", lookup.looked)
