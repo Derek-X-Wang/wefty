@@ -1642,22 +1642,34 @@ func TestCompletionOwnProtocolVerdictIsNotAbandonedDelivery(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusConflict)
 				_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: code, Message: "independent completion verdict"}})
-			}), time.Second)
+			}), 10*time.Second)
 			defer stopServer()
 			defer client.Close()
 			claim := spoolTestClaim("own-completion-verdict")
 			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, clock: systemClock{}, completionRetry: time.Millisecond})
-			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+			// Cancellation follows the delivery verdict; elapsed time must not
+			// choose between L1's own refusal and abandoned delivery. The
+			// watchdog below only detects a call that never returns.
+			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			failure := lifecycle.completeWithRetry(ctx, claim, l1.CompletionRequest{FencingToken: claim.Lease.FencingToken})
+			delivered := make(chan destinationError, 1)
+			go func() {
+				delivered <- lifecycle.completeWithRetry(ctx, claim, l1.CompletionRequest{FencingToken: claim.Lease.FencingToken})
+			}()
+			var failure destinationError
+			select {
+			case failure = <-delivered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("completion did not return L1's own verdict")
+			}
 			var abandoned *completionDeliveryAbandoned
 			if errors.As(failure.err, &abandoned) {
 				t.Fatalf("independent L1 verdict became directive cancellation: %+v", failure)
 			}
-			if failure.err == nil {
-				t.Fatal("independent L1 failure was absorbed")
+			if got := protocolErrorCode(failure.err); got != code {
+				t.Fatalf("completion verdict = %q (%v), want %q", got, failure.err, code)
 			}
-			if code == contract.ErrorAttemptMismatch && failure.destination != errorDestinationAttemptAuthority {
+			if (code == contract.ErrorAttemptMismatch || code == contract.ErrorStaleFence) && failure.destination != errorDestinationAttemptAuthority {
 				t.Fatalf("fencing destination=%d", failure.destination)
 			}
 			if code == contract.ErrorNodeSessionReplaced && failure.destination != errorDestinationNodeSession {
@@ -2139,7 +2151,9 @@ func TestEvidenceRecoveryBoundsLostLogBacklogBeforeCompletion(t *testing.T) {
 		}
 		_ = json.NewEncoder(w).Encode(completed)
 	})
-	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	// The pass is synchronized by recoveryAttemptFinished below.
+	// HTTP timeouts are deadlock guards, not a second bound on the eight batches.
+	client, stopServer := startEvidenceReplayServer(t, handler, 10*time.Second)
 	defer stopServer()
 	defer client.Close()
 	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1<<20, systemClock{}, 32, time.Hour, time.Millisecond)
@@ -2172,7 +2186,7 @@ func TestEvidenceRecoveryBoundsLostLogBacklogBeforeCompletion(t *testing.T) {
 	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 	select {
 	case <-firstPassFinished:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("bounded lost recovery pass did not finish")
 	}
 	mu.Lock()
@@ -2187,7 +2201,7 @@ func TestEvidenceRecoveryBoundsLostLogBacklogBeforeCompletion(t *testing.T) {
 	}
 	releaseFirstPassNow()
 	wantLogCalls := (backlogEvents + outbox.batchSize - 1) / outbox.batchSize
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		mu.Lock()
 		calls := logCalls
@@ -2200,7 +2214,7 @@ func TestEvidenceRecoveryBoundsLostLogBacklogBeforeCompletion(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	deadline = time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for {
 		receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 		if receipt.State == "delivered" && receipt.EventCount == 0 {
@@ -2493,7 +2507,9 @@ func assertPendingEvidenceDoesNotBlockRegistration(t *testing.T) {
 	nodeAgent, err := New(Config{
 		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-2", Version: "test",
-		OperationTimeout: 50 * time.Millisecond, LogRetryInterval: time.Millisecond,
+		// Registration is observed while the poison request is held; no fast
+		// HTTP response is part of this test's contract.
+		OperationTimeout: 10 * time.Second, LogRetryInterval: time.Millisecond,
 		HeartbeatInterval: time.Second, ClaimInterval: 10 * time.Millisecond,
 		LogSpoolDirectory: spoolDirectory, LogSpoolMaxBytes: 1024,
 	})
@@ -2506,12 +2522,12 @@ func assertPendingEvidenceDoesNotBlockRegistration(t *testing.T) {
 	go func() { runDone <- nodeAgent.Run(ctx) }()
 	select {
 	case <-poisonStarted:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("pending evidence recovery did not start")
 	}
 	select {
 	case <-registered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("pending evidence blocked registration")
 	}
 	select {
@@ -2525,7 +2541,7 @@ func assertPendingEvidenceDoesNotBlockRegistration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent Run() after cancellation = %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("agent did not stop")
 	}
 }

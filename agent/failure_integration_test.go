@@ -1374,7 +1374,7 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
-	expiredAttemptID := runner.waitStarted(t)
+	expiredAttemptID := runner.waitStarted(t, done)
 	freshJob := createAgentTestJob(t, store, "partitioned-agent-fresh")
 	clock.waitForDeadline(t, clock.Now().Add(10*time.Second))
 
@@ -1388,11 +1388,11 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		t.Fatalf("agent exited after attempt-authority loss: %v", err)
 	default:
 	}
-	freshAttemptID := runner.waitStarted(t)
+	freshAttemptID := runner.waitStarted(t, done)
 	if freshAttemptID == expiredAttemptID {
 		t.Fatalf("fresh job reused expired attempt %q", freshAttemptID)
 	}
-	completed, err := waitForFailureJobState(store, freshJob.JobID, contract.JobSucceeded, 5*time.Second)
+	completed, err := waitForFailureJobState(store, freshJob.JobID, contract.JobSucceeded, resilienceTestWatchdog)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1438,7 +1438,7 @@ func assertPartitionedAgentRejoinsWithoutRepeatingExpiredAttempt(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent Run() after outer cancellation = %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(resilienceTestWatchdog):
 		t.Fatal("agent did not return after outer cancellation")
 	}
 }
@@ -3679,6 +3679,10 @@ func (runner *stubbornRunner) waitCanceled(t *testing.T) {
 
 func (runner *stubbornRunner) release() { close(runner.releaseC) }
 
+// Runtime-start and reap channels order this test. This watchdog only catches
+// deadlocks; hosted runner scheduling is not an execution-start contract.
+const resilienceTestWatchdog = 30 * time.Second
+
 func newResilienceRunner() *resilienceRunner {
 	return &resilienceRunner{
 		starts: make(map[string]int), started: make(chan string, 4), canceled: make(chan string, 4),
@@ -3703,12 +3707,15 @@ func (runner *resilienceRunner) Run(ctx context.Context, request processrunner.R
 	return contract.ProcessResult{ExitCode: &exitCode}, nil
 }
 
-func (runner *resilienceRunner) waitStarted(t *testing.T) string {
+func (runner *resilienceRunner) waitStarted(t *testing.T, done <-chan error) string {
 	t.Helper()
 	select {
 	case attemptID := <-runner.started:
 		return attemptID
-	case <-time.After(5 * time.Second):
+	case err := <-done:
+		t.Fatalf("agent exited before runtime start: %v", err)
+		return ""
+	case <-time.After(resilienceTestWatchdog):
 		t.Fatal("process runner did not start")
 		return ""
 	}
@@ -3721,7 +3728,7 @@ func (runner *resilienceRunner) waitCanceled(t *testing.T, want string) {
 		if attemptID != want {
 			t.Fatalf("canceled attempt = %q, want %q", attemptID, want)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(resilienceTestWatchdog):
 		t.Fatal("authority-lost payload was not canceled and reaped")
 	}
 }
