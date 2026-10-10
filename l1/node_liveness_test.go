@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"reflect"
@@ -96,7 +97,10 @@ func TestNodesEffectiveLivenessFiltersBeforePaging(t *testing.T) {
 				if pageNumber > 4 {
 					t.Fatal("paging did not terminate")
 				}
-				page, err := h.store.listNodesPage(t.Context(), filters, cursor, 2)
+				// Pin the adaptive cutoff out of reach: this test is about the
+				// filter running before LIMIT, which only full pages can show.
+				ctx := context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Hour)
+				page, err := h.store.listNodesPage(ctx, filters, cursor, 2)
 				if err != nil {
 					t.Fatal(err)
 				}

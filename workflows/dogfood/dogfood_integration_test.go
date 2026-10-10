@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -376,26 +377,46 @@ func lineageRunIDs(entries []l3.LineageEntry) []string {
 	return ids
 }
 
+// getRunLogs reads the whole run log, following the cursor until an empty
+// poll so one adaptive read-cutoff page cannot hide the tail of the output.
 func getRunLogs(t *testing.T, client *http.Client, runID string) string {
 	t.Helper()
-	response, err := client.Get("http://run-ledger.invalid/v1/runs/" + runID + "/logs?limit=1000")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("get root logs = %d body=%s", response.StatusCode, body)
-	}
-	var page l1.LogPage
-	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
-		t.Fatal(err)
-	}
 	var output strings.Builder
-	for _, event := range page.Events {
-		output.Write(event.Bytes)
+	var cursor string
+	for poll := 0; ; poll++ {
+		if poll > l1.MaxLogPageLimit {
+			t.Fatalf("run log paging did not terminate for run %s", runID)
+		}
+		resource := "http://run-ledger.invalid/v1/runs/" + runID + "/logs?limit=1000"
+		if cursor != "" {
+			resource += "&cursor=" + url.QueryEscape(cursor)
+		}
+		response, err := client.Get(resource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(response.Body)
+		if closeErr := response.Body.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("get root logs = %d cursor=%s body=%s", response.StatusCode, cursor, body)
+		}
+		var page l1.LogPage
+		if err := json.Unmarshal(body, &page); err != nil {
+			t.Fatal(err)
+		}
+		for _, event := range page.Events {
+			output.Write(event.Bytes)
+		}
+		if len(page.Events) == 0 {
+			return output.String()
+		}
+		cursor = page.NextCursor
 	}
-	return output.String()
 }
 
 func fabricHTTPClient(participant fabric.Fabric, address string) *http.Client {

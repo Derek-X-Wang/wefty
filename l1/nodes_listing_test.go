@@ -65,7 +65,7 @@ func TestNodesListingPagingAndExactFilters(t *testing.T) {
 		{"capability=missing", []string{}},
 	} {
 		t.Run(check.query, func(t *testing.T) {
-			page := read(check.query)
+			page := walkNodePages(t, h, client, check.query)
 			got := []string{}
 			for _, n := range page.Nodes {
 				got = append(got, n.NodeID)

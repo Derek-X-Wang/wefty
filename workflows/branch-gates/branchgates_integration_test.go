@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -808,33 +809,51 @@ func waitForTerminalRun(t *testing.T, store *l3.Store, runID string, timeout tim
 	return contract.RunRecord{}
 }
 
-// fetchRunLogs reads the run log under an explicit deadline.
+// fetchRunLogs reads the run log under an explicit deadline, following the
+// cursor until an empty poll so one adaptive read-cutoff page cannot hide
+// the tail of the run's output.
 func fetchRunLogs(client *http.Client, runID string, budget time.Duration) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"http://run-ledger.invalid/v1/runs/"+runID+"/logs?limit=1000", nil)
-	if err != nil {
-		return "", err
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		return "", fmt.Errorf("get run logs = %d body=%s", response.StatusCode, body)
-	}
-	var page l1.LogPage
-	if err := json.NewDecoder(response.Body).Decode(&page); err != nil {
-		return "", err
-	}
 	var output strings.Builder
-	for _, event := range page.Events {
-		output.Write(event.Bytes)
+	var cursor string
+	for poll := 0; ; poll++ {
+		if poll > l1.MaxLogPageLimit {
+			return "", fmt.Errorf("run log paging did not terminate for run %s", runID)
+		}
+		next := "http://run-ledger.invalid/v1/runs/" + runID + "/logs?limit=1000"
+		if cursor != "" {
+			next += "&cursor=" + url.QueryEscape(cursor)
+		}
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, next, nil)
+		if err != nil {
+			return "", err
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return "", err
+		}
+		if response.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(response.Body)
+			response.Body.Close()
+			return "", fmt.Errorf("get run logs = %d body=%s", response.StatusCode, body)
+		}
+		var page l1.LogPage
+		err = json.NewDecoder(response.Body).Decode(&page)
+		if closeErr := response.Body.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return "", err
+		}
+		for _, event := range page.Events {
+			output.Write(event.Bytes)
+		}
+		if len(page.Events) == 0 {
+			return output.String(), nil
+		}
+		cursor = page.NextCursor
 	}
-	return output.String(), nil
 }
 
 // fetchRunResult reads the run's uploaded result document under an explicit

@@ -152,14 +152,9 @@ func assertEvidenceGapContract(t *testing.T) {
 		status, _, body = h.do(agent, http.MethodPost, path, conflict)
 		assertAPIError(t, status, body, http.StatusConflict, contract.ErrorIdempotencyConflict)
 
-		status, _, body = h.do(client, http.MethodGet, fmt.Sprintf("/v1/jobs/%s/logs", job.JobID), nil)
-		if status != http.StatusOK {
-			t.Fatalf("read logs status = %d body=%s", status, body)
-		}
-		var page LogPage
-		if err := json.Unmarshal(body, &page); err != nil {
-			t.Fatal(err)
-		}
+		// The whole retained log: follow the cursor until an empty poll so
+		// one cut-short page cannot hide the trailing gap event.
+		page := walkLogPages(t, h, client, fmt.Sprintf("/v1/jobs/%s/logs", job.JobID))
 		if len(page.Events) != 2 {
 			t.Fatalf("retained events = %d, want raw event plus window gap", len(page.Events))
 		}
