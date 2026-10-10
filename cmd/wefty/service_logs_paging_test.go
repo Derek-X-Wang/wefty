@@ -532,10 +532,12 @@ func TestServiceLogsAllStopsAtWalkPageCap(t *testing.T) {
 	defer func() { logWalkPageCap = savedCap }()
 
 	var stdout, stderr bytes.Buffer
+	// Reaching the cap is an incomplete read: it fails, naming the resume
+	// cursor, rather than exiting as if the walk had reached the end.
 	if err := execute(ctx, clients, false, []string{
 		"services", "logs", "stub-job", "--all",
-	}, &stdout, &stderr); err != nil {
-		t.Fatalf("capped --all = %v, stderr=%s", err, stderr.String())
+	}, &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "--all --cursor 2") {
+		t.Fatalf("capped --all = %v, want the incomplete-read error naming the cursor; stderr=%s", err, stderr.String())
 	}
 	for _, want := range []string{"cap event 0", "cap event 1", "NEXT CURSOR\t2"} {
 		if !bytes.Contains(stdout.Bytes(), []byte(want)) {
@@ -549,8 +551,8 @@ func TestServiceLogsAllStopsAtWalkPageCap(t *testing.T) {
 	var jsonStdout, jsonStderr bytes.Buffer
 	if err := execute(ctx, clients, true, []string{
 		"services", "logs", "stub-job", "--all",
-	}, &jsonStdout, &jsonStderr); err != nil {
-		t.Fatalf("capped --all --json = %v, stderr=%s", err, jsonStderr.String())
+	}, &jsonStdout, &jsonStderr); err == nil || !strings.Contains(err.Error(), "--all --cursor 2") {
+		t.Fatalf("capped --all --json = %v, want the incomplete-read error; stderr=%s", err, jsonStderr.String())
 	}
 	var jsonSeen []string
 	scanJSONEvents(t, jsonStdout.Bytes(), func(event contract.LogEvent) {
@@ -664,5 +666,33 @@ func TestServiceLogsPagingUsageErrors(t *testing.T) {
 		if !errors.As(err, &usage) {
 			t.Fatalf("services logs %v = %v (%T), want a usage error", args, err, err)
 		}
+	}
+}
+
+// A one-shot --all walk does not retry forever: after logWalkRetryLimit
+// consecutive retryable answers it reports the last one instead.
+func TestServiceLogsAllGivesUpAfterRetryLimit(t *testing.T) {
+	stub := &cutoffStubLogServer{}
+	stub.events = stubLogEvents([]struct {
+		attempt  string
+		contents string
+	}{
+		{"stub-limit-a", "limit event 0\n"},
+		{"stub-limit-a", "limit event 1\n"},
+	})
+	stub.retryableFailures = map[int]int{1: logWalkRetryLimit + 10}
+	clients := newStubServiceLogsClients(t, stub)
+	var stdout, stderr bytes.Buffer
+	err := execute(context.Background(), clients, false, []string{
+		"services", "logs", "stub-job", "--all", "--poll-interval", "1ms",
+	}, &stdout, &stderr)
+	if !isRetryableL1Answer(err) {
+		t.Fatalf("--all under endless retryable answers = %v, want the last retryable answer", err)
+	}
+	if got := stub.servedRetryableFailures(); got != logWalkRetryLimit+1 {
+		t.Fatalf("stub served %d retryable answers, want %d", got, logWalkRetryLimit+1)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte("limit event 0")) {
+		t.Fatalf("--all lost the events read before the retries:\n%s", stdout.String())
 	}
 }

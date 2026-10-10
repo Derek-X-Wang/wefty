@@ -654,10 +654,17 @@ func executeServiceForget(
 	return writeServiceResult(stdout, job, jsonOutput)
 }
 
-// logWalkPageCap bounds the --all walk so a log that keeps growing for a
-// whole cap's worth of pages cannot run the walk forever. It is generous on
-// purpose; the printed NEXT CURSOR keeps the read resumable. Tests shrink it.
-var logWalkPageCap = 1000
+// logWalkPageCap bounds the --all walk so a log that keeps growing cannot run
+// it forever. It is far above any retained log's page count (2M events at the
+// default limit), so reaching it means the read is incomplete: the walk
+// reports the resume cursor and fails rather than exiting as if complete.
+// Tests shrink it.
+var logWalkPageCap = 10000
+
+// logWalkRetryLimit bounds consecutive retryable answers in one --all walk.
+// A one-shot read gives up and reports the answer instead of retrying
+// forever like an open-ended follow.
+const logWalkRetryLimit = 30
 
 // writeNextCursorHint tells a reader where an event-bearing log page left
 // off. For logs, next_cursor sits on every page, so the hint is owed only
@@ -744,6 +751,7 @@ func executeServiceLogs(
 	var lastEvent []byte
 	lastEventStream := contract.LogStdout
 	walkedPages := 0
+	walkRetries := 0
 	var truncation truncationAnnouncer
 	for {
 		page, err := clients.getServiceLogs(followCtx, jobID, cursor, limit)
@@ -758,6 +766,12 @@ func executeServiceLogs(
 			// asking at the normal interval; only cancellation or a
 			// non-retryable answer ends it.
 			if (follow || all) && isRetryableL1Answer(err) && ctx.Err() == nil && followCtx.Err() == nil {
+				if all {
+					walkRetries++
+					if walkRetries > logWalkRetryLimit {
+						return err
+					}
+				}
 				if sleepFollowRetry(followCtx, pollInterval) {
 					continue
 				}
@@ -772,6 +786,7 @@ func executeServiceLogs(
 			}
 			return err
 		}
+		walkRetries = 0
 		if jsonOutput {
 			if follow || all {
 				// stdout stays one event per line; the notice goes to stderr,
@@ -809,9 +824,13 @@ func executeServiceLogs(
 				walkedPages++
 				if walkedPages >= logWalkPageCap {
 					// The log kept growing for a whole cap's worth of
-					// pages. Report where to continue and leave the walk
-					// resumable instead of running it forever.
-					return writeNextCursorHint(stdout, stderr, jsonOutput, page.NextCursor, lastEvent, lastEventStream)
+					// pages. Report where to continue and fail: the
+					// output is incomplete, so it must not exit as if
+					// the walk had reached the end.
+					if err := writeNextCursorHint(stdout, stderr, jsonOutput, page.NextCursor, lastEvent, lastEventStream); err != nil {
+						return err
+					}
+					return fmt.Errorf("services logs --all stopped after %d pages before the end of the log; resume with --all --cursor %s", logWalkPageCap, page.NextCursor)
 				}
 				continue
 			}
