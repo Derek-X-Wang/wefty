@@ -161,8 +161,15 @@ func executeComputerGrant(
 		result.ObservationState = "pending"
 		result.LastObservedRevocation = result.Revocation
 		waited := time.Duration(0)
+		var lastRetryable error
 		for result.Revocation.State != l1.ComputerPolicyRevocationCompleted {
 			if waited >= waitTimeout {
+				// The window ran out: the existing observation timeout, with
+				// the last retryable answer on record when every read hit one
+				// (#763).
+				if lastRetryable != nil {
+					result.ObservationFailure = lastRetryable.Error()
+				}
 				return computerGrantObservationError(contract.ErrorRevocationWaitTimeout,
 					computerGrantObservationMessage(result, "observation timed out"), result)
 			}
@@ -177,12 +184,23 @@ func executeComputerGrant(
 			revocation, err := clients.getComputerPolicyRevocation(ctx, result.Revocation.ComputerID,
 				result.Revocation.SubjectFabricID, result.Revocation.SubjectUserID, result.Revocation.PolicyRevision)
 			if err != nil {
+				// The revocation read goes through the snapshot door, so it
+				// can answer a retryable 503 (`read_snapshot_expired`); inside
+				// the wait window that is one bad read, not a verdict (#763).
+				// Keep polling until the window decides the outcome.
+				if isRetryableL1Answer(err) && ctx.Err() == nil {
+					lastRetryable = err
+					continue
+				}
 				result.ObservationState = "failed"
 				result.ObservationFailure = err.Error()
 				return computerGrantObservationError(contract.ErrorRevocationObservationFailed,
 					computerGrantObservationMessage(result, "observation failed"), result)
 			}
 			result.Revocation = &revocation
+			// A good read clears the record: the timeout names a retryable
+			// answer only when the reads at the end were retryable.
+			lastRetryable = nil
 			result.LastObservedRevocation = &revocation
 		}
 		result.ObservationState = "completed"

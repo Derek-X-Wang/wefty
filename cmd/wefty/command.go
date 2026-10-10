@@ -588,6 +588,17 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			if follow && ctx.Err() != nil {
 				return stopped()
 			}
+			// A follow has no deadline: a retryable 503 is one bad poll, not
+			// a verdict (#763). Keep following at the normal interval; only
+			// the caller's cancellation or a non-retryable answer ends it.
+			if follow && isRetryableL1Answer(err) {
+				if sleepFollowRetry(ctx, pollInterval) {
+					continue
+				}
+				// The reader left during the retry sleep: an interrupted
+				// follow, not the stale 503.
+				return stopped()
+			}
 			return err
 		}
 		if jsonOutput {
@@ -622,6 +633,12 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			if ctx.Err() != nil {
 				return stopped()
 			}
+			if isRetryableL1Answer(err) {
+				if sleepFollowRetry(ctx, pollInterval) {
+					continue
+				}
+				return stopped()
+			}
 			return err
 		}
 		lastStatus = run.Status
@@ -652,6 +669,20 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 // started before saying so. Dispatch and a claim take a second or two on a
 // healthy cluster; past this the silence is worth explaining.
 var followWaitingNoticeAfter = 3 * time.Second
+
+// sleepFollowRetry spaces one retried follow poll at its normal interval.
+// False means the caller is leaving, which ends the follow the same way an
+// interrupted wait does.
+func sleepFollowRetry(ctx context.Context, pollInterval time.Duration) bool {
+	timer := time.NewTimer(pollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
 
 // announceWaitingForNode is the one line a follower of a not-yet-started run
 // reads, with L1's reason when no node could ever take it as things stand.
