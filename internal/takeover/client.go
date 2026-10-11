@@ -10,22 +10,16 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"unicode"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/httpexchange"
 	"github.com/coder/websocket"
 )
 
-// TransportError marks a failed exchange before an HTTP response was received
-// or a non-envelope HTTP 5xx, or a deadline or timeout waiting for the upgraded
-// view admission banner.
-// Callers can classify availability without mistaking a local validation error
-// or a structured server refusal for a connection failure.
-type TransportError struct{ cause error }
-
-func (failure *TransportError) Error() string { return failure.cause.Error() }
-func (failure *TransportError) Unwrap() error { return failure.cause }
+// TransportError records a failed exchange for the CLI's shared classifier.
+// It does not determine availability or a structured refusal's exit code.
+type TransportError = httpexchange.Failure
 
 type ActionError struct {
 	APIError contract.APIError
@@ -60,22 +54,29 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 	if policyRevision > 0 {
 		header.Set(contract.ComputerPolicyRevisionHeader, fmt.Sprint(policyRevision))
 	}
+	handshake := &handshakeTransport{transport: transport}
 	connection, response, err := websocket.Dial(ctx, endpoint, &websocket.DialOptions{
-		HTTPClient:   &http.Client{Transport: transport},
+		HTTPClient:   &http.Client{Transport: handshake},
 		HTTPHeader:   header,
 		Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol},
 	})
 	if err != nil {
 		transport.CloseIdleConnections()
+		if handshake.readErr != nil {
+			return nil, &TransportError{Phase: httpexchange.Body, Cause: fmt.Errorf("read Computer view response: %w", handshake.readErr)}
+		}
 		if response != nil {
 			defer response.Body.Close()
 			body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+			if readErr != nil {
+				return nil, &TransportError{Phase: httpexchange.Body, Cause: fmt.Errorf("read Computer view response: %w", readErr)}
+			}
 			var failure contract.ComputerControlErrorResponse
-			if readErr == nil && json.Unmarshal(body, &failure) == nil && failure.Error.Code != "" {
+			if json.Unmarshal(body, &failure) == nil && failure.Error.Code != "" {
 				failure.Error.Message = fmt.Sprintf("%s (HTTP %d)", failure.Error.Message, response.StatusCode)
 				return nil, &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
 			}
-			if response.StatusCode >= 500 && response.StatusCode < 600 && readErr == nil {
+			if response.StatusCode >= 500 && response.StatusCode < 600 {
 				err = fmt.Errorf("%w (%s)", err, responseFailureMessage("view", response.StatusCode, body))
 			}
 			if response.StatusCode == http.StatusUnauthorized {
@@ -84,8 +85,11 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 			}
 		}
 		failure := fmt.Errorf("open Computer view session: %w", err)
-		if response == nil || (response.StatusCode >= 500 && response.StatusCode < 600) {
-			return nil, &TransportError{cause: failure}
+		if response == nil {
+			return nil, &TransportError{Phase: httpexchange.Request, Cause: failure}
+		}
+		if response.StatusCode >= 500 && response.StatusCode < 600 {
+			return nil, &TransportError{Phase: httpexchange.Headers, Cause: failure}
 		}
 		return nil, failure
 	}
@@ -100,12 +104,7 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 		_ = connection.CloseNow()
 		transport.CloseIdleConnections()
 		failure := fmt.Errorf("read Computer view admission banner: %w", err)
-		var timeout net.Error
-		if !errors.Is(err, context.Canceled) && (errors.Is(err, context.DeadlineExceeded) ||
-			(errors.As(err, &timeout) && timeout.Timeout())) {
-			return nil, &TransportError{cause: failure}
-		}
-		return nil, failure
+		return nil, &TransportError{Phase: httpexchange.Banner, Cause: failure}
 	}
 	if len(banner) != contract.ComputerRFBVersionBannerBytes || !contract.ValidComputerRFBVersionBanner(banner) {
 		_ = connection.CloseNow()
@@ -161,21 +160,17 @@ func Perform(
 	request.Header.Set(contract.ComputerControlTokenHeader, token)
 	response, err := (&http.Client{Transport: transport}).Do(request)
 	if err != nil {
-		failure := fmt.Errorf("perform Computer %s: %w", action, err)
-		if response == nil {
-			return contract.ComputerControlReceipt{}, &TransportError{cause: failure}
-		}
-		return contract.ComputerControlReceipt{}, failure
+		return contract.ComputerControlReceipt{}, &TransportError{Phase: httpexchange.Request, Cause: fmt.Errorf("perform Computer %s: %w", action, err)}
 	}
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
 	if err != nil {
-		return contract.ComputerControlReceipt{}, fmt.Errorf("read Computer %s response: %w", action, err)
+		return contract.ComputerControlReceipt{}, &TransportError{Phase: httpexchange.Body, Cause: fmt.Errorf("read Computer %s response: %w", action, err)}
 	}
 	if response.StatusCode == http.StatusOK {
 		var receipt contract.ComputerControlReceipt
 		if err := json.Unmarshal(body, &receipt); err != nil {
-			return contract.ComputerControlReceipt{}, fmt.Errorf("decode Computer %s receipt: %w", action, err)
+			return contract.ComputerControlReceipt{}, &TransportError{Phase: httpexchange.Decode, Cause: fmt.Errorf("decode Computer %s receipt: %w", action, err)}
 		}
 		return receipt, nil
 	}
@@ -184,7 +179,7 @@ func Perform(
 		return receiptOrZero(failure.Receipt), &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
 	}
 	if response.StatusCode >= 500 && response.StatusCode < 600 {
-		return contract.ComputerControlReceipt{}, &TransportError{cause: errors.New(responseFailureMessage(action, response.StatusCode, body))}
+		return contract.ComputerControlReceipt{}, &TransportError{Phase: httpexchange.Headers, Cause: errors.New(responseFailureMessage(action, response.StatusCode, body))}
 	}
 	failure = contract.ComputerControlErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal,
 		Message: fmt.Sprintf("Computer %s returned HTTP %d", action, response.StatusCode)}}
@@ -204,19 +199,7 @@ func Perform(
 
 // Callers bound the response read to 4096 bytes before retaining a refusal reason.
 func responseFailureMessage(action string, status int, body []byte) string {
-	message := fmt.Sprintf("Computer %s returned HTTP %d", action, status)
-	// Drop invalid UTF-8, including a rune cut by the bounded response read.
-	reason := strings.ToValidUTF8(string(body), "")
-	reason = strings.Map(func(r rune) rune {
-		if unicode.IsPrint(r) || r == '\t' {
-			return r
-		}
-		return -1
-	}, reason)
-	if reason = strings.TrimSpace(reason); reason != "" {
-		message += ": " + reason
-	}
-	return message
+	return httpexchange.ResponseMessage("Computer "+action, status, body)
 }
 
 func parseEndpoint(endpoint string) (*url.URL, error) {
@@ -239,4 +222,33 @@ func receiptOrZero(receipt *contract.ComputerControlReceipt) contract.ComputerCo
 		return contract.ComputerControlReceipt{}
 	}
 	return *receipt
+}
+
+// websocket.Dial buffers a refused handshake's body and discards its read error.
+// Observe the original reader so a truncated or cancelled body cannot become a
+// complete protocol refusal. Keep the library's bounded read and close behavior.
+type handshakeTransport struct {
+	transport *http.Transport
+	readErr   error
+}
+
+func (t *handshakeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := t.transport.RoundTrip(request)
+	if err == nil && response.StatusCode != http.StatusSwitchingProtocols {
+		response.Body = &handshakeBody{ReadCloser: response.Body, transport: t}
+	}
+	return response, err
+}
+
+type handshakeBody struct {
+	io.ReadCloser
+	transport *handshakeTransport
+}
+
+func (body *handshakeBody) Read(p []byte) (int, error) {
+	n, err := body.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		body.transport.readErr = err
+	}
+	return n, err
 }

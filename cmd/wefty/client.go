@@ -17,6 +17,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/httpexchange"
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
@@ -248,18 +249,7 @@ type takeoverActionError = takeover.ActionError
 
 func (c *apiClients) performComputerTakeoverAction(ctx context.Context, endpoint, token, action string) (contract.ComputerControlReceipt, error) {
 	receipt, err := takeover.Perform(ctx, c.fabric, endpoint, token, action)
-	return receipt, classifyTakeoverTransportError(err)
-}
-
-func classifyTakeoverTransportError(err error) error {
-	if errors.Is(err, context.Canceled) {
-		return err
-	}
-	var transport *takeover.TransportError
-	if errors.As(err, &transport) {
-		return &unavailableError{cause: err}
-	}
-	return err
+	return receipt, classifyTakeoverTransportError(ctx, err)
 }
 
 func (c *apiClients) listComputerTakeoverAudit(
@@ -881,20 +871,13 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	}
 	response, err := c.client.Do(request)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil, fmt.Errorf("call %s: %w", c.name, err)
-		}
-		// A transport failure is almost always the wrong address or a
-		// service that is not running, and the fix is to say where to look.
-		return nil, &unavailableError{cause: fmt.Errorf("call %s at %s: %w (%s)", c.name, c.address, err, c.addressHint())}
+		return nil, classifyFailedExchange(ctx, httpexchange.Request,
+			fmt.Errorf("call %s at %s: %w (%s)", c.name, c.address, err, c.addressHint()))
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil, fmt.Errorf("read %s response: %w", c.name, err)
-		}
-		return nil, &unavailableError{cause: fmt.Errorf("read %s response: %w", c.name, err)}
+		return nil, classifyFailedExchange(ctx, httpexchange.Body, fmt.Errorf("read %s response: %w", c.name, err))
 	}
 	for _, status := range success {
 		if response.StatusCode == status {
@@ -902,7 +885,7 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 				return response.Header.Clone(), nil
 			}
 			if err := json.Unmarshal(responseBody, target); err != nil {
-				return nil, fmt.Errorf("decode %s response: %w", c.name, err)
+				return nil, classifyFailedExchange(ctx, httpexchange.Decode, fmt.Errorf("decode %s response: %w", c.name, err))
 			}
 			return response.Header.Clone(), nil
 		}
@@ -912,8 +895,8 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 		return response.Header.Clone(), &apiResponseError{Service: c.name, StatusCode: response.StatusCode, APIError: responseError.Error}
 	}
 	failure := fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
-	if response.StatusCode >= 500 {
-		return response.Header.Clone(), &unavailableError{cause: failure}
+	if response.StatusCode >= 500 && response.StatusCode < 600 {
+		return response.Header.Clone(), classifyFailedExchange(ctx, httpexchange.Headers, errors.New(httpexchange.ResponseMessage(c.name, response.StatusCode, responseBody)))
 	}
 	return response.Header.Clone(), failure
 }
