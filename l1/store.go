@@ -3440,7 +3440,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 			return AttemptLease{}, internalError(err, "acknowledge renewed job execution")
 		}
 	}
-	if attempt.spec.Kind != contract.JobKindOCI && !canceled {
+	if (attempt.spec.Kind != contract.JobKindOCI || attempt.startedNS.Valid) && !canceled {
 		if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
 			return AttemptLease{}, err
 		}
@@ -4071,11 +4071,14 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging attempt running")
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?", contract.JobRunning, now.UnixNano(), jobID); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?", contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging job running")
 		}
 	}
-	if attempt.spec.Kind != contract.JobKindOCI {
+	// Evidence from a lost or replaced attempt is still retained, but cannot
+	// start the current service's stability window.
+	if hasAuthority && !canceled && now.Before(attempt.leaseExpires) && attempt.spec.Kind != contract.JobKindOCI &&
+		(attempt.state == contract.AttemptClaimed || attempt.state == contract.AttemptRunning || attempt.state == contract.AttemptAwaitingInput) {
 		if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
 			return AppendLogsResponse{}, err
 		}
@@ -4935,9 +4938,25 @@ func completionStates(result ProcessResult) (contract.JobState, contract.Attempt
 }
 
 func markPortlessServiceStable(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) error {
+	// A Computer's NULL port does not make execution alone healthy: its
+	// display must still be published for the current attempt in this write.
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
 		SET healthy_since_ns=COALESCE(healthy_since_ns, ?)
-		WHERE job_id=? AND published_port IS NULL`, now.UnixNano(), jobID); err != nil {
+		WHERE job_id=? AND published_port IS NULL
+			AND EXISTS (
+				SELECT 1 FROM jobs
+				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
+				JOIN nodes ON nodes.node_id=attempts.node_id
+				WHERE jobs.job_id=service_jobs.job_id
+					AND (NOT EXISTS (
+						SELECT 1 FROM computer_job_projections
+						WHERE computer_job_projections.job_id=service_jobs.job_id
+					) OR service_jobs.published_attempt_id=jobs.current_attempt_id)
+					AND service_jobs.bound_node_id=attempts.node_id
+					AND nodes.state=?
+					AND attempts.boot_session_id=nodes.boot_session_id
+					AND attempts.authority_generation=nodes.authority_generation
+			)`, now.UnixNano(), jobID, contract.NodeAlive); err != nil {
 		return internalError(err, "record portless service stability")
 	}
 	return nil

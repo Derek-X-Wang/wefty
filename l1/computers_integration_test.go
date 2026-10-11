@@ -1008,3 +1008,48 @@ func computerDesiredRequest(computer Computer, desired contract.ServiceDesiredSt
 		DesiredState:                 desired,
 	}
 }
+
+func TestQueuedComputerStopMustRetainCompletionReplay(t *testing.T) {
+	h, _, node, _ := computerCompletionHarness(t)
+	h.stopServer()
+	computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+		Name: "queued-stop-replay", Spec: computerCapabilityJobSpec("computer:queued-stop-replay"), Actor: "operator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := startComputerAttempt(t, h, node, nil)
+	exitCode := 1
+	request := CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+		Result: ProcessResult{ExitCode: &exitCode}, RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt}
+	first, err := h.store.CompleteAttemptOutcome(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, request)
+	if err != nil || first.Job.State != contract.JobQueued || first.Replayed {
+		t.Fatalf("first completion=%+v err=%v", first, err)
+	}
+	// Model a lost completion response. Before replay, the operator stops the
+	// queued Computer without a new attempt ever being claimed.
+	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := h.store.SetComputerDesiredState(t.Context(), computer.ComputerID, ComputerDesiredStateRequest{
+		ComputerMutationPrecondition: computerPrecondition(computer, "operator"), DesiredState: contract.ServiceDesiredStopped,
+	})
+	if err != nil || stopped.CurrentJob.State != contract.JobStopped || stopped.CurrentJob.CurrentAttemptID != "" {
+		t.Fatalf("queued Computer stop=%+v err=%v", stopped, err)
+	}
+	beforeReplay := snapshotDatabase(t, h.store.db)
+	replay, err := h.store.CompleteAttemptOutcome(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, request)
+	if err != nil || !replay.Replayed || replay.Job.State != contract.JobStopped {
+		t.Fatalf("recorded completion refused after queued Computer stop: code=%s err=%v replay=%+v; want already-recorded stopped", errorCode(err), err, replay)
+	}
+
+	if replay.Job.RestartStreak != first.Job.RestartStreak || replay.Job.LifetimeRestartCount != first.Job.LifetimeRestartCount ||
+		snapshotDatabase(t, h.store.db) != beforeReplay {
+		t.Fatal("completion replay changed recorded state or applied restart accounting twice")
+	}
+	request.IdempotencyKey = "different-completion-key"
+	if _, err := h.store.CompleteAttemptOutcome(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, request); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("changed completion replay err=%v, want idempotency_conflict", err)
+	}
+}

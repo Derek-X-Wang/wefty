@@ -60,3 +60,47 @@ func TestRestartPendingIsComputedAtReadTime(t *testing.T) {
 		t.Fatal("running service must not project restart-pending")
 	}
 }
+
+func TestImageReconciliationLatchMustRetainCompletionReplay(t *testing.T) {
+	store, _, node, job := newProcessStabilityStore(t)
+	claim := claimProcessStabilityService(t, store, node)
+	queued := failProcessStabilityService(t, store, claim)
+	if queued.CurrentAttemptID != claim.Lease.AttemptID {
+		t.Fatal("queued service must retain its terminal predecessor before detachment")
+	}
+	exitCode := 1
+	request := CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+		Result: ProcessResult{ExitCode: &exitCode}}
+	latched, err := store.LatchServiceImageReconciliationFailure(t.Context(), "stability-agent", job.JobID,
+		ServiceImageReconciliationFailureRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			Failure: contract.SpawnFailure{Code: contract.SpawnFailureImageUnavailable, Message: "pin unavailable"}})
+	if err != nil || latched.State != contract.JobFailed || latched.CurrentAttemptID != "" {
+		t.Fatalf("image reconciliation latch=%+v err=%v", latched, err)
+	}
+	// Repeating the latch after detachment must preserve the existing binding.
+	if _, err := store.LatchServiceImageReconciliationFailure(t.Context(), "stability-agent", job.JobID,
+		ServiceImageReconciliationFailureRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+			Failure: contract.SpawnFailure{Code: contract.SpawnFailureImageUnavailable, Message: "pin unavailable"}}); err != nil {
+		t.Fatal(err)
+	}
+	beforeReplay := snapshotDatabase(t, store.db)
+	replay, err := store.CompleteAttemptOutcome(t.Context(), "stability-agent", job.JobID, claim.Lease.AttemptID, request)
+	if err != nil || !replay.Replayed || replay.Job.State != contract.JobFailed {
+		t.Fatalf("accepted completion refused after image latch: code=%s replay=%+v err=%v", errorCode(err), replay, err)
+	}
+	if snapshotDatabase(t, store.db) != beforeReplay {
+		t.Fatal("completion replay changed the image latch or applied restart accounting twice")
+	}
+	changed := request
+	changed.IdempotencyKey = "changed-completion"
+	if _, err := store.CompleteAttemptOutcome(t.Context(), "stability-agent", job.JobID, claim.Lease.AttemptID, changed); errorCode(err) != contract.ErrorIdempotencyConflict {
+		t.Fatalf("changed replay err=%v, want idempotency_conflict", err)
+	}
+	if _, _, err := store.RestartService(t.Context(), job.JobID, ServiceRestartRequest{IdempotencyKey: "restart-after-latch"}); err != nil {
+		t.Fatal(err)
+	}
+	claimProcessStabilityService(t, store, node)
+	if _, err := store.CompleteAttemptOutcome(t.Context(), "stability-agent", job.JobID, claim.Lease.AttemptID, request); errorCode(err) != contract.ErrorAttemptMismatch {
+		t.Fatalf("superseded completion replay err=%v, want attempt_mismatch", err)
+	}
+}
