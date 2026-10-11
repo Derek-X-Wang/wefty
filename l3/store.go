@@ -2182,8 +2182,8 @@ const (
 	dispatchLookupEvidence
 )
 
-// dispatchObservation captures identity and verdict before an L1 lookup. A later
-// verdict must not be overwritten by an answer to that earlier lookup.
+// dispatchObservation captures identity and verdict before an L1 lookup. A newer
+// regression must not be overwritten by an answer to that earlier lookup.
 type dispatchObservation struct {
 	outboxJob, runJob, lastError sql.NullString
 	dispatched                   sql.NullInt64
@@ -2221,9 +2221,10 @@ func (s *Store) completeDispatchWithEvidence(ctx context.Context, runID, jobID s
 	}
 	// An overlapping acknowledgement of the same Job can change identity,
 	// dispatch stamps and Run state without changing the verdict. Recheck
-	// identities below; only a later verdict makes this lookup stale.
-	if evidence == dispatchLookupEvidence && (observed == nil || current.settled != observed.settled ||
-		current.reason != observed.reason || current.diagnosticJob != observed.diagnosticJob) {
+	// identities below; only a newer regression makes this lookup stale.
+	// Fresh positive evidence supersedes even a settlement written during lookup.
+	if evidence == dispatchLookupEvidence && (observed == nil || (current.reason == l1RegressedReason &&
+		(observed.reason != l1RegressedReason || current.diagnosticJob != observed.diagnosticJob || current.lastError != observed.lastError))) {
 		return internalError(errors.New("dispatch evidence changed during lookup"), "complete dispatch")
 	}
 	outboxJob, runJob := current.outboxJob, current.runJob

@@ -1279,10 +1279,14 @@ recorded identity must be absent or equal the Job being linked. Pending
 cancellation reads prefer the Run's linked Job, and use an outbox-only
 acknowledgement only when no settled absence or regression diagnostic contradicts it. The write rechecks that
 stored evidence is still usable before linking. Stored identity alone cannot
-clear a contradiction or restore a link. A fresh identity-bound lookup can
-supersede the contradiction only if the observed verdict's settlement bit,
-reason and diagnostic Job have not changed since the lookup began; a stale
-answer leaves the next pass to decide. An acknowledgement of the same Job
+clear a contradiction or restore a link. A fresh identity-bound lookup
+supersedes a settlement, including `job_link_settled`, `dispatch_not_found`, or
+cancellation settled before confirmation, even when it lands during lookup.
+A lookup answer is stale only when the current diagnostic is `l1_regressed`
+and either the observed diagnostic was not a regression, the diagnostic Job
+changed, or `last_error` changed since lookup began. A regression re-recorded for the same
+Job with a different `last_error` is a newer verdict. A stale answer leaves
+the next pass to decide. An acknowledgement of the same Job
 during lookup does not prevent delivery in that pass. The write still refuses
 any conflicting recorded Job identity. Uncontradicted legacy outbox
 acknowledgements still link before delivery, even when dispatch-key lookup
