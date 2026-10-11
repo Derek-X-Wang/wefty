@@ -218,15 +218,13 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 	if err != nil {
 		return Job{}, internalError(err, "encode service image reconciliation failure")
 	}
-	if job.CurrentAttemptID != "" {
-		if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, updated_ns=?
-			WHERE attempt_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, write.at.UnixNano(), job.CurrentAttemptID,
-			contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput); err != nil {
-			return Job{}, internalError(err, "fence attempt during service image reconciliation failure")
-		}
+	if _, err := invalidateAttempts(ctx, tx, jobID, invalidateImageLatch, write.at); err != nil {
+		return Job{}, internalError(err, "fence attempt during service image reconciliation failure")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET completion_replay_attempt_id=COALESCE(current_attempt_id, completion_replay_attempt_id),
-		current_attempt_id=NULL, updated_ns=? WHERE job_id=?`, write.at.UnixNano(), jobID); err != nil {
+	if err := detachAttempt(ctx, tx, jobID, "", detachImageLatch); err != nil {
+		return Job{}, internalError(err, "detach service attempt after image reconciliation failure")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET updated_ns=? WHERE job_id=?`, write.at.UnixNano(), jobID); err != nil {
 		return Job{}, internalError(err, "clear service attempt after image reconciliation failure")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET policy_stop_json=NULL, next_restart_at=NULL, last_failure=?,

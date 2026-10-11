@@ -187,7 +187,9 @@ was never bound to a node has nothing to clean and is deleted at once with a
 `removed_verified` tombstone. The bound agent may also latch `failed` from any
 pre-removal state, `stopped` included, when it cannot reconcile the service's
 pinned image: the same transaction fences the live attempt `lost`, clears the
-restart schedule, and records the typed failure as `last_failure`.
+restart schedule, caps the lost Attempt's lease at the transaction clock
+without extending an earlier expiry, and records the typed failure as
+`last_failure`.
 
 A removal that cannot complete ends in `stalled_cleanup_unverified` with
 `removal_outcome=cleanup_stalled`. It is agent-declared non-completion, not an
@@ -1073,6 +1075,37 @@ without extending log finalization or waiting for recovery. While L1 reports
 the attempt live, recovery drains its durable logs before completion; an
 accepted completion would otherwise close their admission. The existing bounded
 lost-attempt recovery rule applies after lease expiry.
+
+## Attempt authority modes (#807)
+
+The private Attempt authority owner holds decisions and effects inside the
+existing write transaction; endpoints keep their bodies and expiry commits.
+[Lease, fencing and dispatch](lease-fencing-dispatch.md#attempt-authority-modes-807)
+names the five modes and their endpoint check order:
+
+- Current execution authority (E): identity → path → current binding → fence
+  → registration, followed by active phase and unexpired lease.
+- Original-evidence provenance (O): identity → path → original fence, without
+  requiring current binding, registration, phase or lease.
+- Accepted-completion replay (R): provenance, no standing removal, identical
+  stored key and body, Attempt not lost, and current or retained replay binding.
+  Removal precedes provenance; phase and expiry handling precede key/body,
+  lost refusal and binding. Replay applies no completion/accounting effects;
+  exact-Attempt Computer revocation is re-driven.
+- Workload credential (CW): bearer/scope, bound identity, current binding,
+  registration, active phase and lease, without a fencing token.
+- Reconcile stability (RS): desired running, positive streak, health for the
+  window, current binding, bound Node and registration, Node alive, Job and
+  Attempt running, and lease. Node liveness and health interruption run first
+  at the same transaction clock.
+
+Queued Computer stop, abort and image latch retain the current or existing
+replay binding on detach. Completion with stopped Computer quiescence or
+pre-start requeue explicitly retains the completed Attempt. Storage destination
+detaches leave existing replay untouched without creating one; claim replaces
+both bindings. Invalidation marks only active Attempts lost. Abort, removal
+and image latch also cap the lease at the transaction clock; inline
+lease/deadline settlement retains its existing lease and accounting rules.
 
 ## Attempt
 
