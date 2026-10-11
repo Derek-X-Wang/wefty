@@ -270,8 +270,10 @@ attempt still has current boot-session, generation, current-attempt, and lease
 authority; late observation always skips it. Job promotion is conditional on
 `jobs.state=claimed`, so logs cannot reverse `stopping` or erase stop intent.
 Only logs from an active process attempt with current live authority may start
-the portless-service stability window. `kind=oci` log insertion never promotes:
-only `Started` does.
+the portless-service stability window. Renewal, `Started`, and logs establish
+portless health only on the bound alive node under the attempt's matching boot
+session and registration generation, inside the same write transaction.
+`kind=oci` log insertion never promotes: only `Started` does.
 
 A gap declaration uses `LogEvent.sequence` as the first lost sequence and
 `gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
@@ -618,9 +620,13 @@ attempt's lease runs, then `lease_expired` with late evidence; an attempt that
 is no longer the job's current or retained replay attempt is `attempt_mismatch`
 (#553). Stopping a queued Computer retains its terminal predecessor as the
 exact completion replay binding when it clears the runtime owner. If the queued
-projection was already detached by an accepted pre-start completion, its replay
-binding is preserved. A later claim replaces either binding; stop never reapplies
-the accepted completion or grants the detached attempt live authority.
+projection was already detached by an accepted stop completion, then started
+back to `queued`, stopping it again preserves that completion replay binding.
+The image-reconciliation failure latch and Computer reconfiguration abort also
+retain the terminal predecessor's accepted completion binding when detaching a
+queued Job, including an existing detached replay binding. A later claim replaces
+either binding; detachment never reapplies the accepted completion or grants the
+detached attempt live authority.
 
 An accepted completion of a Computer Job -- first write or replay, of the
 Computer's current Job or of one a reimage has since superseded -- is followed

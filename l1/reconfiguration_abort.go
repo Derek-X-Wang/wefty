@@ -150,7 +150,8 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 		contract.AttemptAwaitingInput); err != nil {
 		return Computer{}, false, internalError(err, "fence aborted Computer attempt")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, current_attempt_id=NULL, updated_ns=? WHERE job_id=?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, completion_replay_attempt_id=COALESCE(current_attempt_id, completion_replay_attempt_id),
+		current_attempt_id=NULL, updated_ns=? WHERE job_id=?`,
 		contract.JobStopped, now.UnixNano(), computer.CurrentJobID); err != nil {
 		return Computer{}, false, internalError(err, "stop aborted Computer projection")
 	}

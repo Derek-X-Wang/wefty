@@ -4940,7 +4940,17 @@ func completionStates(result ProcessResult) (contract.JobState, contract.Attempt
 func markPortlessServiceStable(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
 		SET healthy_since_ns=COALESCE(healthy_since_ns, ?)
-		WHERE job_id=? AND published_port IS NULL`, now.UnixNano(), jobID); err != nil {
+		WHERE job_id=? AND published_port IS NULL
+			AND EXISTS (
+				SELECT 1 FROM jobs
+				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
+				JOIN nodes ON nodes.node_id=attempts.node_id
+				WHERE jobs.job_id=service_jobs.job_id
+					AND service_jobs.bound_node_id=attempts.node_id
+					AND nodes.state=?
+					AND attempts.boot_session_id=nodes.boot_session_id
+					AND attempts.authority_generation=nodes.authority_generation
+			)`, now.UnixNano(), jobID, contract.NodeAlive); err != nil {
 		return internalError(err, "record portless service stability")
 	}
 	return nil

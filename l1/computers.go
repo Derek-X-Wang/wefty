@@ -1183,7 +1183,7 @@ func setComputerServiceDesiredState(
 			// predecessor attempt turns that observed quiescence into the positive
 			// detached precondition required by Storage replacement operations.
 			// Keep the exact accepted completion acknowledgeable after detachment,
-			// including an already-detached pre-start completion's replay binding.
+			// including a stop completion's binding after start queues the Job again.
 			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET completion_replay_attempt_id=COALESCE(current_attempt_id, completion_replay_attempt_id),
 				current_attempt_id=NULL WHERE job_id=?`, job.JobID); err != nil {
 				return internalError(err, "publish detached stopped Computer")

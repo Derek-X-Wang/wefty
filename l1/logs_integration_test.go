@@ -295,6 +295,23 @@ func joinLogStream(events []contract.LogEvent, stream contract.LogStream) []byte
 	return joined
 }
 
+func TestCurrentFirstLogStartsProcessServiceStability(t *testing.T) {
+	store, clock, node, job := newProcessStabilityStore(t)
+	claim := claimProcessStabilityService(t, store, node)
+	clock.Advance(5 * time.Second)
+	at := clock.Now()
+	if _, err := store.AppendLogs(t.Context(), "stability-agent", job.JobID, claim.Lease.AttemptID, AppendLogsRequest{
+		FencingToken: claim.Lease.FencingToken,
+		Events:       []contract.LogEvent{logEvent(claim.Lease.AttemptID, contract.LogStdout, 0, []byte("first\n"))},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	observed, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil || observed.State != contract.JobRunning || observed.HealthySinceAt == nil || !observed.HealthySinceAt.Equal(at) {
+		t.Fatalf("current first log: job=%+v err=%v", observed, err)
+	}
+}
+
 func TestLogsMustPreserveStopping(t *testing.T) {
 	store, _, node, job := newProcessStabilityStore(t)
 	claim := claimProcessStabilityService(t, store, node)

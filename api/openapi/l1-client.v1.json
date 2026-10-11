@@ -1037,7 +1037,7 @@
       "put": {
         "operationId": "setComputerDesiredState",
         "summary": "Start or stop a Computer under intent and Storage CAS",
-        "description": "The Computer is the sole desired-state authority. A stale intent revision or storage reference is a typed conflict and performs no write. Stopping a queued Computer detaches its terminal predecessor while retaining that exact accepted completion for idempotent acknowledgement. An already-detached queued projection keeps its completion replay binding until a later claim replaces it.",
+        "description": "The Computer is the sole desired-state authority. A stale intent revision or storage reference is a typed conflict and performs no write. Stopping a queued Computer detaches its terminal predecessor while retaining that exact accepted completion for idempotent acknowledgement. After an accepted stop completion detaches the projection, start queues it again; another stop keeps that completion replay binding until a later claim replaces it.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {
@@ -1210,7 +1210,7 @@
       "post": {
         "operationId": "abortComputerReconfiguration",
         "summary": "Release a reconfiguration stranded on a dead bound Node",
-        "description": "Typed escape hatch for a Computer stranded in backing_up, resetting, reimaging, growing, exporting, or importing. It requires exact CAS authority and a dead bound Node, preserves desired state, records uncertain artifacts for later removal, and requires explicit restart for recovery.",
+        "description": "Typed escape hatch for a Computer stranded in backing_up, resetting, reimaging, growing, exporting, or importing. It requires exact CAS authority and a dead bound Node, preserves desired state, records uncertain artifacts for later removal, and requires explicit restart for recovery. Detaching a queued Job retains its terminal predecessor's accepted completion for exact idempotent acknowledgement, including an existing detached replay binding; a later claim replaces the binding.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["intent_revision", "storage_id", "storage_generation", "idempotency_key"],

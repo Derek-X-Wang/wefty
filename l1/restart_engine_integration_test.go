@@ -1017,3 +1017,93 @@ func TestReplacedRegistrationMustNotResetStreak(t *testing.T) {
 		})
 	}
 }
+
+func TestStaleNodeEvidenceMustNotStartServiceStability(t *testing.T) {
+	for _, evidence := range []string{"renewal", "started", "logs"} {
+		t.Run(evidence, func(t *testing.T) {
+			store, clock, node, job := newProcessStabilityStore(t)
+			first := claimProcessStabilityService(t, store, node)
+			queued := failProcessStabilityService(t, store, first)
+			clock.Advance(queued.NextRestartAt.Sub(clock.Now()))
+			current := claimProcessStabilityService(t, store, node)
+			renew := func() {
+				t.Helper()
+				if _, err := store.RenewLease(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, current.Lease.FencingToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			heartbeat := func() {
+				t.Helper()
+				if _, err := store.HeartbeatNode(t.Context(), "stability-agent", node.NodeID, node.BootSessionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			heartbeat()
+			for i := 0; i < 4; i++ {
+				clock.Advance(15 * time.Second)
+				renew()
+			}
+			result, err := store.Reconcile(t.Context())
+			if err != nil || result.StaleNodes != 1 {
+				t.Fatalf("stale reconciliation=%+v err=%v", result, err)
+			}
+			stale, err := store.GetJob(t.Context(), job.JobID)
+			if err != nil || stale.HealthySinceAt != nil {
+				t.Fatalf("stale service health=%v err=%v", stale.HealthySinceAt, err)
+			}
+			switch evidence {
+			case "renewal":
+				renew()
+			case "started":
+				if _, err := store.StartAttempt(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID,
+					StartedRequest{FencingToken: current.Lease.FencingToken}); err != nil {
+					t.Fatal(err)
+				}
+			case "logs":
+				if _, err := store.AppendLogs(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, AppendLogsRequest{
+					FencingToken: current.Lease.FencingToken,
+					Events:       []contract.LogEvent{logEvent(current.Lease.AttemptID, contract.LogStdout, 0, []byte("stale output\n"))},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stale, err = store.GetJob(t.Context(), job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stale.HealthySinceAt != nil {
+				t.Errorf("%s on stale node restored health at %v", evidence, stale.HealthySinceAt)
+			}
+			clock.Advance(15 * time.Second)
+			renew() // Still stale; heartbeat alone restores liveness.
+			heartbeat()
+			aliveAt := clock.Now()
+			renew()
+			for i := 0; i < 7; i++ {
+				clock.Advance(15 * time.Second)
+				renew()
+				heartbeat()
+			}
+			result, err = store.Reconcile(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, err := store.GetJob(t.Context(), job.JobID)
+			if err != nil || result.RestartStreakResets != 0 || observed.RestartStreak != 1 ||
+				observed.HealthySinceAt == nil || !observed.HealthySinceAt.Equal(aliveAt) {
+				t.Fatalf("suppressed stale time counted toward stability: result=%+v job=%+v recovered=%v err=%v", result, observed, aliveAt, err)
+			}
+			clock.Advance(15 * time.Second)
+			renew()
+			heartbeat()
+			result, err = store.Reconcile(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, err = store.GetJob(t.Context(), job.JobID)
+			if err != nil || result.RestartStreakResets != 1 || observed.RestartStreak != 0 {
+				t.Fatalf("recovered service did not earn stability: result=%+v job=%+v err=%v", result, observed, err)
+			}
+		})
+	}
+}

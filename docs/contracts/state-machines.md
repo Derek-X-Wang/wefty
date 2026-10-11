@@ -151,9 +151,11 @@ streak resets only after continuous stability under its current, active,
 unexpired attempt on its bound alive node, with matching boot session and
 registration authority generation. Reconcile clears the health timestamp when
 the node becomes unavailable or its registration replaces the attempt's
-authority. That suppressed time cannot count toward stability. Late logs from a
-lost, superseded, or replaced attempt retain evidence but never start or extend
-the current service's stability window.
+authority. Renewal, `Started`, and logs establish portless health only while the
+bound node is alive and its boot session and registration generation match the
+current attempt. That suppressed time cannot count toward stability. Late logs
+from a lost, superseded, or replaced attempt retain evidence but never start or
+extend the current service's stability window.
 
 Lease loss records an attempt `lost` without a process result. Under `never`,
 loss after durable OCI `Started` or process start acknowledgement leaves the
