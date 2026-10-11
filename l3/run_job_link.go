@@ -13,10 +13,10 @@ import (
 )
 
 // Run job link owns dispatch creation and attempts, token staging and cleanup,
-// confirmation, terminal recovery and cancel ownership. L1 observations are
+// confirmation, terminal recovery, regression and cancel ownership. L1 observations are
 // obtained before short ledger writes that recheck ownership and identity.
-// Migration and its resumable validation live here too; adoption of active
-// regression and readers continues in #782–#784.
+// Migration and its resumable validation live here too; reader adoption
+// continues in #783–#784.
 
 // completeDispatch records L1's acknowledgement. A run that ended while its
 // submit was in flight is linked here too, keeping its terminal state: the
@@ -1017,11 +1017,65 @@ func (s *Store) completeMigratedLinkValidation(ctx context.Context, item migrate
 	return true, nil
 }
 
+// l1RegressionCause keeps active and terminal regression diagnostics identical.
+// Both retain the original Job identity and forbid replay.
+func l1RegressionCause(jobID string) contract.APIError {
+	return contract.APIError{Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed", Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": jobID}}
+}
+
+// failMissingL1Job fails closed without replay: a cold authority may have lost
+// dispatch-key deduplication along with the job. The first write checks the
+// captured state and both durable identities; terminal winners cannot be changed.
+func (s *Store) failMissingL1Job(ctx context.Context, run projectedRun) (bool, error) {
+	if run.JobID == "" || run.State == contract.RunSucceeded || run.State == contract.RunFailed {
+		return false, nil
+	}
+	now := canonicalTime(s.clock.Now())
+	cause := l1RegressionCause(run.JobID)
+	payload, err := json.Marshal(cause)
+	if err != nil {
+		return false, internalError(err, "encode L1 regression")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, internalError(err, "begin L1 regression")
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, failure_reason=?, updated_ns=?, started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?)
+ WHERE run_id=? AND status=? AND l1_job_id=? AND EXISTS (
+ SELECT 1 FROM dispatch_outbox o WHERE o.run_id=runs.run_id AND o.job_id=? AND o.dispatched_ns IS NOT NULL)`,
+		contract.RunFailed, nullableReason("L1 lost the dispatched job "+run.JobID+"; the work was not replayed"),
+		now.UnixNano(), now.UnixNano(), now.UnixNano(), run.RunID, run.State, run.JobID, run.JobID)
+	if err != nil {
+		return false, internalError(err, "fail L1-regressed run")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, internalError(err, "read L1 regression result")
+	}
+	if changed == 0 {
+		return false, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`, string(payload), run.RunID); err != nil {
+		return false, internalError(err, "record L1 regression")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, canonicalTime(now.Add(s.tokenGrace)).UnixNano(), run.RunID); err != nil {
+		return false, internalError(err, "expire L1-regressed run token")
+	}
+	if err := clearDispatchRetry(ctx, tx, run.RunID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, internalError(err, "commit L1 regression")
+	}
+	return true, nil
+}
+
 // markTerminalLinkRegressedTx is separate from active-run regression: terminal
 // outcome, reason, timestamps and token expiry must never be rewritten. The
 // caller has rechecked the captured acknowledgement and current ownership.
 func markTerminalLinkRegressedTx(ctx context.Context, tx *sql.Tx, runID, jobID string) error {
-	cause := contract.APIError{Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed", Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": jobID}}
+	cause := l1RegressionCause(jobID)
 	payload, err := json.Marshal(cause)
 	if err != nil {
 		return internalError(err, "encode terminal link regression")

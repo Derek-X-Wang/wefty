@@ -472,54 +472,6 @@
     "retirement": "#785"
   },
   {
-    "file": "regression_http_test.go",
-    "function": "TestL1RegressionExecutionReadBoundary",
-    "fingerprint": "5962591bc9ca2eb13e61937e2228d49628c64a9bccf86ba521711d9363905e13",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "regression_http_test.go",
-    "function": "TestL1RegressionExecutionReadBoundary",
-    "fingerprint": "b18517a79776be1c2235fc33ddf7f93a3067f421a74951a54fcf26b2c150ec8f",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "regression_store_test.go",
-    "function": "TestL1RegressionGuardAndRollback",
-    "fingerprint": "090db2044586ce1eb04d78b71895f1b391e434f45ece4d13d7ec86f26c70be8d",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "regression_store_test.go",
-    "function": "TestL1RegressionGuardAndRollback",
-    "fingerprint": "57a918ca08dd6df22ea72a63d7c2052ee13e593f65772fa7bbd5f8ed114c47b3",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "regression_store_test.go",
-    "function": "TestL1RegressionGuardAndRollback",
-    "fingerprint": "e0cc7d6dc651d4572a83d24e6599f8bbf91e49db87e412c37fc212b0b363c6a1",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "regression_store_test.go",
-    "function": "snapshotRecovery",
-    "fingerprint": "539ebf784f3756ec953eab977952f5647a67010f47d3d64cc20885931bbd16db",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
     "file": "run_idempotency_actor_test.go",
     "function": "TestRunIdempotencyActorUpgradeAndReopen",
     "fingerprint": "4dc8f061d5b156fdcf0bdbf756aa9db1e9a237005dfa80c90c54e58bdcd46993",
@@ -808,6 +760,54 @@
     "retirement": "#785"
   },
   {
+    "file": "run_job_link_regression_http_test.go",
+    "function": "TestL1RegressionExecutionReadBoundary",
+    "fingerprint": "5962591bc9ca2eb13e61937e2228d49628c64a9bccf86ba521711d9363905e13",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_regression_http_test.go",
+    "function": "TestL1RegressionExecutionReadBoundary",
+    "fingerprint": "b18517a79776be1c2235fc33ddf7f93a3067f421a74951a54fcf26b2c150ec8f",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_regression_test.go",
+    "function": "TestL1RegressionGuardAndRollback",
+    "fingerprint": "090db2044586ce1eb04d78b71895f1b391e434f45ece4d13d7ec86f26c70be8d",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_regression_test.go",
+    "function": "TestL1RegressionGuardAndRollback",
+    "fingerprint": "57a918ca08dd6df22ea72a63d7c2052ee13e593f65772fa7bbd5f8ed114c47b3",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_regression_test.go",
+    "function": "TestL1RegressionGuardAndRollback",
+    "fingerprint": "e0cc7d6dc651d4572a83d24e6599f8bbf91e49db87e412c37fc212b0b363c6a1",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_regression_test.go",
+    "function": "snapshotRecovery",
+    "fingerprint": "539ebf784f3756ec953eab977952f5647a67010f47d3d64cc20885931bbd16db",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
     "file": "run_list.go",
     "function": "*Store.ListRuns",
     "fingerprint": "839f590236d85d23733edeb99cbc0a81beb4139700ddde29d9434036bc49aea2",
@@ -894,22 +894,6 @@
     "count": 1,
     "reason": "Projection and node-attribution selection reads link storage directly until background-reader adoption.",
     "retirement": "#784"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.failMissingL1Job",
-    "fingerprint": "350279fffdacdf003ae175217cca16c120a5a8df0533592ac1daeabfb0f99755",
-    "count": 1,
-    "reason": "Existing atomic regression safeguards remain intact until the regression writer moves.",
-    "retirement": "#782"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.failMissingL1Job",
-    "fingerprint": "56c816fa355a5ade4e78e1e6ff54041d691d66425120ac238581170cf9e856bc",
-    "count": 1,
-    "reason": "Existing atomic regression safeguards remain intact until the regression writer moves.",
-    "retirement": "#782"
   },
   {
     "file": "store.go",
