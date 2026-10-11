@@ -1308,6 +1308,16 @@ wins even when recovery selected the Run first. A conflicting recorded Job
 identity or outbox dispatch key is reported and uses ordinary recovery's
 existing exponential backoff, so corrupt rows cannot block later due rows.
 
+Cancellation also revisits settled or refused legacy cancellations whose Run
+link remains unresolved. Those lookups use the same durable backoff. A backoff
+pass updates only its failure count and retry time; it never rewrites the
+recorded cancellation status or reason. Authoritative dispatch absence beyond
+the settlement horizon settles delivery with nothing to cancel, including a
+legacy refusal. This is a new absence verdict, not a retry error.
+Any usable evidence that links a previously unlinked Run with a cancellation
+record atomically reopens delivery. This includes stored outbox evidence used
+by an HTTP cancel request, as well as acknowledgements and positive lookups.
+
 A positive observation already in flight is handed to the cancel path rather
 than dropped: that write rechecks the dispatch key and the identity and verdict
 captured before the L1 lookup. It applies the lookup freshness and identity
@@ -1377,8 +1387,8 @@ These ledger authentication failures reach the person as retryable `503 internal
 never as a person-facing 401. Cancellation delivery failures retain their
 dependency or storage cause in server logs even when HTTP exposes only
 `503 internal`.
-For permanent refusals, reconciliation and repeated cancel calls do not send
-it again. A cancel `not_found` alone can hide an ownership
+For permanent refusals on a resolved link, reconciliation and repeated cancel
+calls do not send it again. A cancel `not_found` alone can hide an ownership
 refusal, so only an authoritative `GetJob` absence fails an active Run through
 the existing L1-regression settlement. Other refusals leave its real state intact.
 After authorization, an existing terminal Run always returns HTTP 200 with that recorded outcome,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"reflect"
 	"testing"
 	"time"
@@ -93,11 +94,19 @@ type controlledCancelLookupClient struct {
 }
 
 func (c *controlledCancelLookupClient) LookupJobByDispatchKey(ctx context.Context, key string) (l1.Job, error) {
-	return c.lookup(ctx, key)
+	job, err := c.lookup(ctx, key)
+	if err == nil && (job.JobID == "" || job.Spec.DispatchKey != key) {
+		return l1.Job{}, invalidL1Success(http.MethodGet, "/v1/dispatch-keys/"+url.PathEscape(key)+"/job", "dispatch lookup")
+	}
+	return job, err
 }
 func (c *controlledCancelLookupClient) GetJob(ctx context.Context, id string) (l1.Job, error) {
 	if c.get != nil {
-		return c.get(ctx, id)
+		job, err := c.get(ctx, id)
+		if err == nil && job.JobID != id {
+			return l1.Job{}, invalidL1Success(http.MethodGet, "/v1/jobs/"+url.PathEscape(id), "job projection")
+		}
+		return job, err
 	}
 	return c.L1Client.GetJob(ctx, id)
 }
