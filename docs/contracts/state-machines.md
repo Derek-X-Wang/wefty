@@ -1043,7 +1043,13 @@ durable spool remain available for later recovery while the completion records
 covered by that same incomplete-evidence fact. The deadline does not replace an
 observed exit or signal with `output_error`. This rule also applies to one-shot
 payload exit: exit zero remains authoritative when the only finalization error
-is expiry of the agent-owned bound.
+is expiry of the agent-owned bound. Shutdown, cancellation and renewal
+cancel/stop/restart directives also persist completion before releasing it to
+ordered recovery when log evidence is incomplete. They stop renewal and return
+without extending log finalization or waiting for recovery. While L1 reports
+the attempt live, recovery drains its durable logs before completion; an
+accepted completion would otherwise close their admission. The existing bounded
+lost-attempt recovery rule applies after lease expiry.
 
 ## Attempt
 
