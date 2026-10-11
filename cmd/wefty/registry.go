@@ -189,7 +189,7 @@ func registryStatusError(ctx context.Context, service string, response *http.Res
 		if err != nil {
 			return classifyFailedExchange(ctx, httpexchange.Body, fmt.Errorf("read %s response: %w", service, err))
 		}
-		return classifyFailedExchange(ctx, httpexchange.Headers, fmt.Errorf("%s", httpexchange.ResponseMessage(service, response.StatusCode, body)))
+		return classifyFailedExchange(ctx, httpexchange.BareStatus, fmt.Errorf("%s", httpexchange.ResponseMessage(service, response.StatusCode, body)))
 	}
 	return fmt.Errorf("%s returned HTTP %d", service, response.StatusCode)
 }

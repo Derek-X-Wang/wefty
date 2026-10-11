@@ -18,6 +18,7 @@ import (
 )
 
 // TransportError records a failed exchange for the CLI's shared classifier.
+// It also covers the Decode and Banner phases.
 // It does not determine availability or a structured refusal's exit code.
 type TransportError = httpexchange.Failure
 
@@ -67,10 +68,9 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 		}
 		if response != nil {
 			defer response.Body.Close()
-			body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
-			if readErr != nil {
-				return nil, &TransportError{Phase: httpexchange.Body, Cause: fmt.Errorf("read Computer view response: %w", readErr)}
-			}
+			// websocket.Dial has replaced this body with an in-memory reader;
+			// the original body's read error is captured by handshakeTransport.
+			body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 			var failure contract.ComputerControlErrorResponse
 			if json.Unmarshal(body, &failure) == nil && failure.Error.Code != "" {
 				failure.Error.Message = fmt.Sprintf("%s (HTTP %d)", failure.Error.Message, response.StatusCode)
@@ -89,7 +89,7 @@ func OpenAtPolicyRevision(ctx context.Context, participant fabric.Fabric, endpoi
 			return nil, &TransportError{Phase: httpexchange.Request, Cause: failure}
 		}
 		if response.StatusCode >= 500 && response.StatusCode < 600 {
-			return nil, &TransportError{Phase: httpexchange.Headers, Cause: failure}
+			return nil, &TransportError{Phase: httpexchange.BareStatus, Cause: failure}
 		}
 		return nil, failure
 	}
@@ -179,7 +179,7 @@ func Perform(
 		return receiptOrZero(failure.Receipt), &ActionError{APIError: failure.Error, Receipt: failure.Receipt}
 	}
 	if response.StatusCode >= 500 && response.StatusCode < 600 {
-		return contract.ComputerControlReceipt{}, &TransportError{Phase: httpexchange.Headers, Cause: errors.New(responseFailureMessage(action, response.StatusCode, body))}
+		return contract.ComputerControlReceipt{}, &TransportError{Phase: httpexchange.BareStatus, Cause: errors.New(responseFailureMessage(action, response.StatusCode, body))}
 	}
 	failure = contract.ComputerControlErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal,
 		Message: fmt.Sprintf("Computer %s returned HTTP %d", action, response.StatusCode)}}
@@ -233,6 +233,8 @@ type handshakeTransport struct {
 }
 
 func (t *handshakeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	// A redirect's drain error must not leak into the final response.
+	t.readErr = nil
 	response, err := t.transport.RoundTrip(request)
 	if err == nil && response.StatusCode != http.StatusSwitchingProtocols {
 		response.Body = &handshakeBody{ReadCloser: response.Body, transport: t}

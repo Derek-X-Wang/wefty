@@ -11,8 +11,8 @@ import (
 type Phase uint8
 
 const (
-	Request Phase = iota // Dialing, sending, or waiting for response headers.
-	Headers              // A non-envelope HTTP 5xx response.
+	Request    Phase = iota // Dialing, sending, or waiting for response headers.
+	BareStatus              // A non-envelope HTTP 5xx response.
 	Body
 	Decode // Decoding a completely read body is a local failure.
 	Banner // The upgraded take-over admission banner has its own timeout rule.

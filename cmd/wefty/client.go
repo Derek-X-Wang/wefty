@@ -896,7 +896,7 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	}
 	failure := fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
 	if response.StatusCode >= 500 && response.StatusCode < 600 {
-		return response.Header.Clone(), classifyFailedExchange(ctx, httpexchange.Headers, errors.New(httpexchange.ResponseMessage(c.name, response.StatusCode, responseBody)))
+		return response.Header.Clone(), classifyFailedExchange(ctx, httpexchange.BareStatus, errors.New(httpexchange.ResponseMessage(c.name, response.StatusCode, responseBody)))
 	}
 	return response.Header.Clone(), failure
 }

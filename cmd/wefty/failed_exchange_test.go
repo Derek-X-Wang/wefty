@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,6 +19,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/httpexchange"
+	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/coder/websocket"
 )
 
@@ -80,7 +84,6 @@ func TestHTTPFailedExchangeAdapters(t *testing.T) {
 					_, _ = w.Write([]byte("{"))
 					if failure == "stalled-body" || failure == "cancel-body" {
 						w.(http.Flusher).Flush()
-						notify()
 						<-r.Context().Done()
 					}
 				})
@@ -104,17 +107,16 @@ func TestHTTPFailedExchangeAdapters(t *testing.T) {
 							return nil, context.Canceled
 						}
 					}
-					return (&net.Dialer{}).DialContext(ctx, network, target)
+					conn, err := (&net.Dialer{}).DialContext(ctx, network, target)
+					if err == nil && failure == "cancel-body" && !strings.HasPrefix(adapter, "registry-") {
+						conn = newExchangeBodySignalConn(conn, notify)
+					}
+					return conn, err
 				}
 				if strings.HasPrefix(failure, "cancel-") {
 					go func() {
 						select {
 						case <-arrived:
-							// Let flushed headers reach the body reader before
-							// cancellation. The server remains blocked throughout.
-							if failure == "cancel-body" {
-								time.Sleep(20 * time.Millisecond)
-							}
 							cancel()
 						case <-ctx.Done():
 						}
@@ -140,6 +142,15 @@ func TestHTTPFailedExchangeAdapters(t *testing.T) {
 					client := server.Client()
 					transport := client.Transport.(*http.Transport).Clone()
 					transport.DialContext = dial
+					if failure == "cancel-body" {
+						transport.DialTLSContext = func(ctx context.Context, network, target string) (net.Conn, error) {
+							conn, err := (&tls.Dialer{Config: transport.TLSClientConfig}).DialContext(ctx, network, target)
+							if err == nil {
+								conn = newExchangeBodySignalConn(conn, notify)
+							}
+							return conn, err
+						}
+					}
 					client.Transport = transport
 					defer client.CloseIdleConnections()
 					resolver := newRegistryResolver(client)
@@ -189,6 +200,41 @@ func TestHTTPFailedExchangeAdapters(t *testing.T) {
 	}
 }
 
+// Return headers separately from the body, then signal when the HTTP reader
+// asks for body bytes. This also works after TLS, without a timing assumption.
+type exchangeBodySignalConn struct {
+	net.Conn
+	reader *bufio.Reader
+	header []byte
+	ready  bool
+	notify func()
+}
+
+func newExchangeBodySignalConn(conn net.Conn, notify func()) net.Conn {
+	return &exchangeBodySignalConn{Conn: conn, reader: bufio.NewReader(conn), notify: notify}
+}
+
+func (conn *exchangeBodySignalConn) Read(p []byte) (int, error) {
+	if !conn.ready && len(conn.header) == 0 {
+		line, err := conn.reader.ReadBytes('\n')
+		if err != nil {
+			return copy(p, line), err
+		}
+		conn.header = line
+		conn.ready = bytes.Equal(line, []byte("\r\n"))
+	}
+	if len(conn.header) != 0 {
+		n := copy(p, conn.header)
+		conn.header = conn.header[n:]
+		return n, nil
+	}
+	if conn.notify != nil {
+		conn.notify()
+		conn.notify = nil
+	}
+	return conn.reader.Read(p)
+}
+
 type exchangeTestFabric struct {
 	directDialFabric
 	dial func(context.Context, string, string) (net.Conn, error)
@@ -232,4 +278,46 @@ func TestHTTPFailedExchangeNormalViewEnd(t *testing.T) {
 	}
 	defer session.Close()
 	assertExchangeReport(t, session.Wait(t.Context()), 1, contract.ErrorInternal, false)
+}
+
+func TestHTTPFailedExchangeCanceledAfterBareStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("display not ready"))
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	_, err := takeover.Open(ctx, directDialFabric{}, endpoint)
+	var failure *takeover.TransportError
+	if !errors.As(err, &failure) || failure.Phase != httpexchange.BareStatus || errors.Is(err, context.Canceled) {
+		t.Fatalf("expected a completed bare status without cancellation: %v", err)
+	}
+	// A caller can cancel between the adapter's return and CLI classification.
+	cancel()
+	err = classifyTakeoverTransportError(ctx, err)
+	assertExchangeReport(t, err, 1, contract.ErrorInternal, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("caller cancellation lost: %v", err)
+	}
+}
+
+func TestHTTPFailedExchangeViewClosedBeforeBanner(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(contract.ComputerControlTokenHeader, "session-token")
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol}})
+		if err != nil {
+			return
+		}
+		_ = conn.CloseNow()
+	}))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	_, err := openTakeoverViewWithPolicyRetry(t.Context(), directDialFabric{}, endpoint, 1)
+	var failure *takeover.TransportError
+	if !errors.As(err, &failure) || failure.Phase != httpexchange.Banner {
+		t.Fatalf("expected a banner read failure: %v", err)
+	}
+	assertExchangeReport(t, err, 1, contract.ErrorInternal, false)
 }

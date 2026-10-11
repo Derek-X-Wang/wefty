@@ -18,13 +18,13 @@ func classifyFailedExchange(ctx context.Context, phase httpexchange.Phase, err e
 	if errors.Is(err, context.Canceled) {
 		return err
 	}
-	// Some protocol libraries discard the underlying body read error. Preserve
-	// cancellation even when the surviving error only describes HTTP status.
+	// Preserve caller cancellation that arrives after the exchange completes
+	// but before its failure is classified.
 	if errors.Is(ctx.Err(), context.Canceled) {
 		return fmt.Errorf("%w: %w", err, ctx.Err())
 	}
 	switch phase {
-	case httpexchange.Request, httpexchange.Headers, httpexchange.Body:
+	case httpexchange.Request, httpexchange.BareStatus, httpexchange.Body:
 		return &unavailableError{cause: err}
 	case httpexchange.Banner:
 		var timeout net.Error
