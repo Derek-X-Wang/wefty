@@ -1,16 +1,45 @@
 package l3
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestRunJobLinkBoundaryBypassFixtures(t *testing.T) {
-	tests := []struct {
-		name, source string
-		want         int
-	}{
+type linkBypassFixture struct {
+	name, source string
+	want         int
+}
+
+func runJobLinkBypassFixtures() []linkBypassFixture {
+	return []linkBypassFixture{
+		{"function-parameter", `func read(q func(string) (*sql.Rows,error)){q("SELECT l1_job_id FROM runs")}`, 1},
+		{"sql-handle-call-argument", `func read(q func(context.Context,string,...any)*sql.Row,ctx context.Context,id string){q(ctx,"SELECT l1_job_id FROM runs WHERE run_id=?",id)};func f(s *Store,ctx context.Context){read(s.db.QueryRowContext,ctx,"run")}`, 2},
+		{"function-field-literal", `type h struct {q func(string,...any)(*sql.Rows,error)};func f(db *sql.DB){x:=h{q:db.Query};x.q("SELECT l1_job_id FROM runs")}`, 1},
+		{"function-field-assignment", `type h struct {q func(string,...any)(*sql.Rows,error)};func f(db *sql.DB){var x h;x.q=db.Query;x.q("SELECT l1_job_id FROM runs")}`, 1},
+		{"function-method-result", `type h struct{};func(x h)get(db *sql.DB)func(string,...any)(*sql.Rows,error){return db.Query};func f(x h,db *sql.DB){x.get(db)("SELECT l1_job_id FROM runs")}`, 1},
+		{"named-function-parameter", `type query func(string);func f(q query){q("SELECT l1_job_id FROM runs")}`, 1},
+		{"replace-without-into", `func f(db *sql.DB){db.Exec("REPLACE runs(run_id,status) VALUES(?,?)")}`, 1},
+		{"function-result", `func get(db *sql.DB)func(string,...any)(*sql.Rows,error){return db.Query};func f(db *sql.DB){get(db)("SELECT l1_job_id FROM runs")}`, 1},
+		{"function-local", `func f(db *sql.DB){q:=func(s string){db.Query(s)};q("SELECT l1_job_id FROM runs")}`, 2},
+		{"opaque-function-safe-string", `func f(q func(string)){q("SELECT status FROM runs")}`, 1},
+		{"function-no-string-positive", `func f(q func(int)){q(2)}`, 0},
+		{"ordinary-function-positive", `func read(s string){};func f(){read("ordinary string")}`, 0},
+		{"ordinary-method-positive", `type h struct{};func(x h)q(s string){};func f(x h){x.q("ordinary string")}`, 0},
+		{"replace-runs", `func f(db *sql.DB){db.Exec("REPLACE INTO runs(run_id,status) VALUES(?,?)")}`, 1},
+		{"insert-or-replace-outbox", `func f(db *sql.DB){db.Exec("INSERT OR REPLACE INTO dispatch_outbox(run_id,dispatch_key) VALUES(?,?)")}`, 1},
+		{"positional-insert-outbox", `func f(db *sql.DB){db.Exec("INSERT INTO dispatch_outbox VALUES(?,?,?,?,?)")}`, 1},
+		{"positional-insert-runs", `func f(db *sql.DB){db.Exec("INSERT INTO main.runs VALUES(?,?,?,?,?)")}`, 1},
+		{"unprotected-replace-positive", `func f(db *sql.DB){db.Exec("INSERT OR REPLACE INTO other(run_id) VALUES(?)")}`, 0},
+		{"explicit-unprotected-insert-positive", `func f(db *sql.DB){db.Exec("INSERT INTO runs(run_id,status) VALUES(?,?)")}`, 0},
+		{"ownership-count-one", `func f(db *sql.DB){db.Query("SELECT COUNT(1) FROM run_cancellations WHERE run_id=?")}`, 1},
+		{"ownership-select-two", `func f(db *sql.DB){db.Query("SELECT 2 FROM run_cancellations WHERE run_id=?")}`, 1},
+		{"ownership-left-join", `func f(db *sql.DB){db.Query("SELECT r.status FROM runs r LEFT JOIN run_cancellations c ON c.run_id=r.run_id WHERE c.requested_ns IS NULL")}`, 1},
+		{"ownership-scalar-subquery", `func f(db *sql.DB){db.Query("SELECT (SELECT requested_ns FROM run_cancellations WHERE run_id=r.run_id) FROM runs r")}`, 1},
+		{"ownership-delivery-column", `func f(db *sql.DB){db.Query("SELECT failures FROM run_cancellations WHERE run_id=?")}`, 1},
+		{"delivery-unfiltered-positive", `func f(db *sql.DB){db.Query("SELECT failures FROM run_cancellations")}`, 0},
 		{"constant-concatenation", `func f(db *sql.DB){db.Query("SELECT "+"l1_job_id FROM runs")}`, 1},
 		{"cross-file-constant", `func f(db *sql.DB){db.Query(linkRead)}`, 1},
 		{"local-constant", `func f(db *sql.DB){const q="SELECT l1_job_id FROM runs";db.Query(q)}`, 1},
@@ -53,11 +82,14 @@ func TestRunJobLinkBoundaryBypassFixtures(t *testing.T) {
 		{"unrelated-qualified-job-id", `func f(db *sql.DB){db.Query("SELECT x.job_id FROM other x JOIN dispatch_outbox o ON o.run_id=x.run_id")}`, 0},
 		{"unrelated-run-outcome", `func f(db *sql.DB){db.Query("SELECT status FROM runs")}`, 0},
 		{"unrelated-row-count", `func f(db *sql.DB){db.Query("SELECT COUNT(*) FROM runs")}`, 0},
-		{"delivery-read", `func f(db *sql.DB){db.Query("SELECT failures FROM run_cancellations WHERE run_id=?")}`, 0},
+		{"delivery-read", `func f(db *sql.DB){db.Query("SELECT failures FROM run_cancellations WHERE run_id=?")}`, 1},
 		{"delivery-write", `func f(db *sql.DB){db.Exec("UPDATE run_cancellations SET completed_ns=? WHERE run_id=?")}`, 0},
 		{"imported-unrelated", `func f(db *sql.DB){db.Query(foreign.OtherRead)}`, 0},
 	}
-	for _, test := range tests {
+}
+
+func TestRunJobLinkBoundaryBypassFixtures(t *testing.T) {
+	for _, test := range runJobLinkBypassFixtures() {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
 			if err := os.Mkdir(filepath.Join(root, "foreign"), 0700); err != nil {
@@ -121,6 +153,61 @@ func TestRunJobLinkBoundaryExactRatchet(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if err := checkLinkBoundaryRatchet(test.actual, test.allowed); err == nil {
 				t.Fatal("ratchet accepted mismatch")
+			}
+		})
+	}
+}
+
+// Run the same scanner and exact ratchet as the real repository gate, adding
+// each review bypass as a new production source. Positive controls must leave
+// the ratchet unchanged. Parser fixtures may deliberately use unresolved types.
+func TestRunJobLinkBoundaryProductionBypasses(t *testing.T) {
+	sources := map[string]string{}
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".go") {
+			body, err := os.ReadFile(entry.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			sources[entry.Name()] = string(body)
+		}
+	}
+	body, err := os.ReadFile("testdata/run_job_link_boundary.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var allowed []linkBoundaryEntry
+	if err := json.Unmarshal(body, &allowed); err != nil {
+		t.Fatal(err)
+	}
+	p, err := parseLinkSQLPackage("..", sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkLinkBoundaryRatchet(p.sites(), allowed); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range runJobLinkBypassFixtures() {
+		if test.name == "constant-concatenation" {
+			break
+		} // Review's new bypass family.
+		t.Run(test.name, func(t *testing.T) {
+			sources["zz_review_bypass.go"] = "package l3;" + test.source
+			defer delete(sources, "zz_review_bypass.go")
+			p, err := parseLinkSQLPackage("..", sources)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = checkLinkBoundaryRatchet(p.sites(), allowed)
+			if test.want > 0 && err == nil {
+				t.Fatal("production bypass passed the real storage ratchet")
+			}
+			if test.want == 0 && err != nil {
+				t.Fatalf("positive control changed storage ratchet: %v", err)
 			}
 		})
 	}

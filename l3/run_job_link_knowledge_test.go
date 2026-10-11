@@ -27,6 +27,8 @@ func TestRunJobLinkKnowledge(t *testing.T) {
 		{name: "terminal-linked-settled-flag", fixture: linkKnowledgeFixture{runJob: linkID("job"), outboxJob: linkID("job"), settled: true}, state: linkLinked, id: "job"},
 		{name: "legacy-acknowledged", fixture: linkKnowledgeFixture{outboxJob: linkID("job"), acknowledged: true, attemptedAt: &attempt}, state: linkLinked, id: "job"},
 		{name: "missing-settled", fixture: linkKnowledgeFixture{settled: true, attemptedAt: &attempt}, state: linkMissingSettled},
+		{name: "legacy-acknowledged-later-missing", fixture: linkKnowledgeFixture{outboxJob: linkID("job"), acknowledged: true, settled: true, attemptedAt: &attempt}, state: linkRegressed, id: "job"},
+		{name: "legacy-acknowledged-missing-diagnostic", fixture: linkKnowledgeFixture{outboxJob: linkID("job"), acknowledged: true, diagnostic: &contract.APIError{Details: map[string]any{"reason": dispatchNotFoundReason}}}, state: linkRegressed, id: "job"},
 		{name: "missing-contradicts-outbox", fixture: linkKnowledgeFixture{outboxJob: linkID("job"), settled: true, attemptedAt: &attempt}, state: linkMissingSettled, id: "job"},
 		{name: "regressed-precedes-linked", fixture: linkKnowledgeFixture{runJob: linkID("job"), outboxJob: linkID("job"), diagnostic: regression("job")}, state: linkRegressed, id: "job"},
 		{name: "legacy-regressed-outbox-only", fixture: linkKnowledgeFixture{outboxJob: linkID("job"), diagnostic: regression("job")}, state: linkRegressed, id: "job"},
