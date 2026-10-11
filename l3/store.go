@@ -2171,7 +2171,7 @@ WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
 // arrived. A regression verdict contradicts that earlier commit, so a delayed
 // acknowledgement cannot restore its link or erase the diagnostic.
 func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error {
-	return s.completeDispatchWithEvidence(ctx, runID, jobID, dispatchAcknowledgementEvidence)
+	return s.completeDispatchWithEvidence(ctx, runID, jobID, dispatchAcknowledgementEvidence, nil)
 }
 
 type dispatchLinkEvidence int
@@ -2182,7 +2182,30 @@ const (
 	dispatchLookupEvidence
 )
 
-func (s *Store) completeDispatchWithEvidence(ctx context.Context, runID, jobID string, evidence dispatchLinkEvidence) error {
+// dispatchObservation captures identity and verdict before an L1 lookup. A later
+// verdict must not be overwritten by an answer to that earlier lookup.
+type dispatchObservation struct {
+	outboxJob, runJob, lastError sql.NullString
+	dispatched                   sql.NullInt64
+	settled                      bool
+	state                        contract.RunState
+	reason, diagnosticJob        string
+}
+
+func readDispatchObservation(ctx context.Context, q queryRower, runID string) (dispatchObservation, error) {
+	var observed dispatchObservation
+	err := q.QueryRowContext(ctx, `SELECT o.job_id, r.l1_job_id, o.last_error, o.dispatched_ns, r.job_link_settled, r.status,
+ COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, ''),
+ COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.l1_job_id') END, '')
+ FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).
+		Scan(&observed.outboxJob, &observed.runJob, &observed.lastError, &observed.dispatched, &observed.settled, &observed.state, &observed.reason, &observed.diagnosticJob)
+	if err != nil {
+		return observed, internalError(err, "read dispatch acknowledgement")
+	}
+	return observed, nil
+}
+
+func (s *Store) completeDispatchWithEvidence(ctx context.Context, runID, jobID string, evidence dispatchLinkEvidence, observed *dispatchObservation) error {
 	if jobID == "" {
 		return internalError(errors.New("L1 dispatch acknowledgement has an empty job ID"), "complete dispatch")
 	}
@@ -2192,16 +2215,15 @@ func (s *Store) completeDispatchWithEvidence(ctx context.Context, runID, jobID s
 		return internalError(err, "begin dispatch completion")
 	}
 	defer tx.Rollback()
-	var outboxJob, runJob sql.NullString
-	var settled bool
-	var reason, diagnosticJob string
-	if err := tx.QueryRowContext(ctx, `SELECT o.job_id, r.l1_job_id, r.job_link_settled,
- COALESCE(json_extract(o.last_error, '$.details.reason'), ''),
- COALESCE(json_extract(o.last_error, '$.details.l1_job_id'), '')
- FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).
-		Scan(&outboxJob, &runJob, &settled, &reason, &diagnosticJob); err != nil {
-		return internalError(err, "read dispatch acknowledgement")
+	current, err := readDispatchObservation(ctx, tx, runID)
+	if err != nil {
+		return err
 	}
+	if evidence == dispatchLookupEvidence && (observed == nil || current != *observed) {
+		return internalError(errors.New("dispatch evidence changed during lookup"), "complete dispatch")
+	}
+	outboxJob, runJob := current.outboxJob, current.runJob
+	settled, reason, diagnosticJob := current.settled, current.reason, current.diagnosticJob
 	if (outboxJob.Valid && outboxJob.String != jobID) || (runJob.Valid && runJob.String != jobID) ||
 		(reason == l1RegressedReason && diagnosticJob != "" && diagnosticJob != jobID) {
 		return internalError(errors.New("dispatch acknowledgement conflicts with recorded job"), "complete dispatch")
