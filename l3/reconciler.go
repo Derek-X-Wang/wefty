@@ -164,23 +164,20 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 // exponentially, so an unavailable L1 costs one budget per pass at most and
 // later rows still get their turn.
 func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
-	if r.lookup == nil {
-		return nil
-	}
 	remote, cancel := context.WithTimeout(ctx, r.budget)
 	defer cancel()
 	return r.recoverUnrecordedDispatchesRemote(ctx, remote)
 }
 
 func (r *Reconciler) recoverUnrecordedDispatchesRemote(ctx, remote context.Context) []error {
+	passErrors := r.validateMigratedLinks(ctx, remote)
 	if r.lookup == nil || remote.Err() != nil {
-		return nil
+		return passErrors
 	}
 	pending, err := r.store.unrecordedDispatches(remote, unrecordedDispatchBatch)
 	if err != nil {
-		return []error{err}
+		return append(passErrors, err)
 	}
-	var passErrors []error
 	for _, item := range pending {
 		if remote.Err() != nil {
 			break
@@ -302,6 +299,14 @@ func (r *Reconciler) settlePendingNodeAttributions(ctx context.Context) []error 
 	}
 	var passErrors []error
 	for _, item := range pending {
+		validating, err := r.store.pendingMigratedLinkValidation(ctx, item.RunID)
+		if err != nil {
+			passErrors = append(passErrors, err)
+			continue
+		}
+		if validating {
+			continue
+		}
 		job, err := r.jobs.GetJob(ctx, item.JobID)
 		if err != nil {
 			if isMissingL1Job(err, item.JobID) {
@@ -350,4 +355,46 @@ func (r *Reconciler) reconcileAndReport(ctx context.Context) {
 	if err := r.ReconcileOnce(ctx); err != nil && r.onError != nil && ctx.Err() == nil {
 		r.onError(err)
 	}
+}
+
+// validateMigratedLinks uses acknowledged Job identity, including old Jobs
+// without dispatch-key provenance. All network calls precede ledger writes.
+func (r *Reconciler) validateMigratedLinks(ctx, remote context.Context) []error {
+	if remote.Err() != nil {
+		return nil
+	}
+	pending, err := r.store.migratedLinkValidations(remote)
+	if err != nil {
+		return []error{err}
+	}
+	var passErrors []error
+	for _, item := range pending {
+		if remote.Err() != nil {
+			break
+		}
+		if !item.owned {
+			if err := r.store.completeMigratedLinkValidation(ctx, item, migratedLinkRetired); err != nil {
+				passErrors = append(passErrors, err)
+			}
+			continue
+		}
+		job, readErr := r.jobs.GetJob(remote, item.jobID)
+		verdict := migratedLinkFound
+		switch {
+		case isMissingL1Job(readErr, item.jobID):
+			verdict = migratedLinkAbsent
+		case readErr != nil:
+			verdict = migratedLinkRetry
+		case job.JobID != item.jobID:
+			verdict = migratedLinkRetry
+			readErr = fmt.Errorf("L1 validation returned Job %q for %q", job.JobID, item.jobID)
+		}
+		if readErr != nil {
+			passErrors = append(passErrors, r.store.observeL1Error(ctx, readErr))
+		}
+		if err := r.store.completeMigratedLinkValidation(ctx, item, verdict); err != nil {
+			passErrors = append(passErrors, err)
+		}
+	}
+	return passErrors
 }
