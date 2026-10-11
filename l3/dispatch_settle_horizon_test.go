@@ -22,6 +22,9 @@ func (c *appearingLookupClient) LookupJobByDispatchKey(_ context.Context, key st
 	if c.job == nil {
 		return l1.Job{}, &DispatchNotFoundError{DispatchKey: key}
 	}
+	if c.job.Spec.DispatchKey != key {
+		return l1.Job{}, &DispatchNotFoundError{DispatchKey: key}
+	}
 	return *c.job, nil
 }
 
@@ -69,7 +72,7 @@ func TestDispatchNotFoundBeforeTheSettleHorizonRetriesAndLinksWhenTheJobAppears(
 		t.Fatalf("absence backoff = %d failures, retry at %v", failures, retryAt)
 	}
 
-	lookup.job = &l1.Job{JobID: "job-committed-late", State: contract.JobQueued}
+	lookup.job = &l1.Job{JobID: "job-committed-late", State: contract.JobQueued, Spec: contract.JobSpec{DispatchKey: key}}
 	clock.now = clock.now.Add(unrecordedDispatchRetryBase)
 	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 		t.Fatal(err)
