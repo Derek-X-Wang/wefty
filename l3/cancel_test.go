@@ -109,7 +109,7 @@ func TestCancelRunStates(t *testing.T) {
 			want := contract.RunFailed
 			reason := "the L1 job was canceled"
 			if state == "pending" {
-				reason = "the run was canceled before dispatch"
+				reason = "canceled before dispatch was confirmed"
 			}
 			if state == "succeeded" || state == "succeeded-unprojected" {
 				want = contract.RunSucceeded
@@ -279,7 +279,7 @@ func TestCancelRunAbsentDispatchSettlement(t *testing.T) {
 	if err := json.Unmarshal(body, &record); err != nil {
 		t.Fatal(err)
 	}
-	if record.Status != contract.RunFailed || record.FinishedAt == nil || record.L1JobID != "" || record.FailureReason != "the run was canceled before dispatch" {
+	if record.Status != contract.RunFailed || record.FinishedAt == nil || record.L1JobID != "" || record.FailureReason != "canceled before dispatch was confirmed" {
 		t.Fatalf("absent cancellation=%+v", record)
 	}
 }

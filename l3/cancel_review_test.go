@@ -15,13 +15,13 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-type reviewCancelClient struct {
+type recordingCancelClient struct {
 	*L1Client
 	err   error
 	calls int
 }
 
-func (c *reviewCancelClient) CancelJob(ctx context.Context, id string) (l1.Job, error) {
+func (c *recordingCancelClient) CancelJob(ctx context.Context, id string) (l1.Job, error) {
 	c.calls++
 	if c.err != nil {
 		// This alternate client supplies an affirmative complete wire refusal,
@@ -61,7 +61,7 @@ func TestCancelReviewPermanentRefusal(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			client := &reviewCancelClient{L1Client: h.l1Client, err: &Error{Code: contract.ErrorNotFound, Message: "job was not found"}}
+			client := &recordingCancelClient{L1Client: h.l1Client, err: &Error{Code: contract.ErrorNotFound, Message: "job was not found"}}
 			if missing {
 				client.err = nil
 			}
@@ -178,7 +178,7 @@ func TestCancelReviewTransientBackoff(t *testing.T) {
 	if err := r.ReconcileOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
-	client := &reviewCancelClient{L1Client: h.l1Client, err: errors.New("transport outage")}
+	client := &recordingCancelClient{L1Client: h.l1Client, err: errors.New("transport outage")}
 	h.l3Server.jobs = client
 	_, _, _ = h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
 	reopened, err := OpenStore(h.l3Path, StoreOptions{Clock: clock})
@@ -278,7 +278,7 @@ func TestCancelReviewTerminalOutageReturnsRealState(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, _ := h.l3Store.GetRun(ctx, run.RunID)
-	client := &reviewCancelClient{L1Client: h.l1Client, err: &Error{Code: contract.ErrorInternal, Retryable: true, Message: "outage"}}
+	client := &recordingCancelClient{L1Client: h.l1Client, err: &Error{Code: contract.ErrorInternal, Retryable: true, Message: "outage"}}
 	h.l3Server.jobs = client
 	for i := 0; i < 2; i++ {
 		status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
@@ -297,9 +297,9 @@ func TestCancelReviewTerminalOutageReturnsRealState(t *testing.T) {
 	}
 }
 
-type absentReviewLookup struct{ calls int }
+type absentDispatchLookup struct{ calls int }
 
-func (c *absentReviewLookup) LookupJobByDispatchKey(_ context.Context, key string) (l1.Job, error) {
+func (c *absentDispatchLookup) LookupJobByDispatchKey(_ context.Context, key string) (l1.Job, error) {
 	c.calls++
 	return l1.Job{}, &DispatchNotFoundError{DispatchKey: key}
 }
@@ -317,7 +317,7 @@ func TestCancelReviewProvisionalAbsenceBackoff(t *testing.T) {
 	if err := s.requestRunCancellation(ctx, run.RunID, "test"); err != nil {
 		t.Fatal(err)
 	}
-	lookup := &absentReviewLookup{}
+	lookup := &absentDispatchLookup{}
 	r, _ := NewReconciler(s, &recordingJobClient{}, ReconcilerConfig{DispatchLookup: lookup})
 	for i := 0; i < 3; i++ {
 		if err := r.ReconcileOnce(ctx); err != nil {
@@ -336,7 +336,7 @@ func TestCancelReviewProvisionalAbsenceBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	record, _ = s.GetRun(ctx, run.RunID)
-	if lookup.calls != 2 || record.Status != contract.RunFailed || record.FailureReason != "the run was canceled before dispatch" {
+	if lookup.calls != 2 || record.Status != contract.RunFailed || record.FailureReason != "canceled before dispatch was confirmed" {
 		t.Fatalf("horizon settlement=%+v calls=%d", record, lookup.calls)
 	}
 }
