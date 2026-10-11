@@ -655,6 +655,15 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 						fingerprintInput += "\x00opaque SQL\x00" + linkGoFingerprint(node)
 						var declarations []string
 						seen := map[ast.Node]bool{}
+						// A method that builds the SQL (x.sql()) is part of the
+						// assembly: include the method resolved for the operand's
+						// own type, so editing its body changes the fingerprint.
+						for _, selector := range linkSQLSelectors(argument) {
+							if fn := p.methodDeclaration(selector); fn != nil && !seen[fn] {
+								declarations = append(declarations, linkGoFingerprint(fn))
+								seen[fn] = true
+							}
+						}
 						for _, id := range linkSQLDependencies(argument) {
 							if id.Obj != nil {
 								if declaration, ok := id.Obj.Decl.(ast.Node); ok && !seen[declaration] {
@@ -663,10 +672,14 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 								}
 							} else {
 								// Package declarations referenced across files do not
-								// share parser objects. Resolve their names explicitly.
+								// share parser objects. Resolve their names explicitly,
+								// against package-level functions only: a method that
+								// shares the name is not this identifier, and folding it
+								// in made fingerprints shift whenever any type gained a
+								// method of that name.
 								for _, source := range p.files {
 									for _, decl := range source.Decls {
-										if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == id.Name && !seen[fn] {
+										if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == id.Name && !seen[fn] {
 											declarations = append(declarations, linkGoFingerprint(fn))
 											seen[fn] = true
 										}
@@ -811,6 +824,35 @@ func TestRunJobLinkStorageBoundary(t *testing.T) {
 	}
 }
 
+// linkSQLSelectors returns the selectors an expression depends on, following
+// local declarations the same way linkSQLDependencies does.
+func linkSQLSelectors(expr ast.Expr) []*ast.SelectorExpr {
+	var result []*ast.SelectorExpr
+	visited := map[ast.Node]bool{}
+	var walk func(ast.Node)
+	walk = func(node ast.Node) {
+		if node == nil || visited[node] {
+			return
+		}
+		visited[node] = true
+		ast.Inspect(node, func(n ast.Node) bool {
+			if selector, ok := n.(*ast.SelectorExpr); ok {
+				result = append(result, selector)
+				walk(selector.X)
+				return false
+			}
+			if id, ok := n.(*ast.Ident); ok && id.Obj != nil {
+				if declaration, ok := id.Obj.Decl.(ast.Node); ok {
+					walk(declaration)
+				}
+			}
+			return true
+		})
+	}
+	walk(expr)
+	return result
+}
+
 // Parser object identity follows local aliases without conflating shadowed
 // names. The walk is conservative: all assignments inside a declaration enter
 // opaque fingerprints, and a parameter hidden behind an alias still taints the
@@ -825,6 +867,12 @@ func linkSQLDependencies(expr ast.Expr) []*ast.Ident {
 		}
 		visited[node] = true
 		ast.Inspect(node, func(n ast.Node) bool {
+			// A selector's name (x.read) is a field or method of x, never a
+			// package identifier. Only its operand can name a declaration.
+			if selector, ok := n.(*ast.SelectorExpr); ok {
+				walk(selector.X)
+				return false
+			}
 			id, ok := n.(*ast.Ident)
 			if !ok {
 				return true

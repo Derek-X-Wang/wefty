@@ -13,8 +13,8 @@ import (
 
 // Run job link owns dispatch creation and attempts, token staging and cleanup,
 // confirmation, terminal association and cancel ownership. L1 observations are
-// obtained before these short ledger writes. Adoption of migration, recovery,
-// regression and readers continues in #780–#784.
+// obtained before these short ledger writes. Migration and its resumable validation live here too; adoption of ordinary
+// recovery, active regression and readers continues in #781–#784.
 
 // completeDispatch records L1's acknowledgement. A run that ended while its
 // submit was in flight is linked here too, keeping its terminal state: the
@@ -320,8 +320,9 @@ func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupSt
 	return nil
 }
 
-// cancelAbsentStoredIdentity settles only delivery for an already-terminal Run.
-// Preserve its verdict, terminal facts and token expiry. Recheck the identity
+// cancelAbsentStoredIdentity settles delivery for an already-terminal Run.
+// A linked identity records regression; an unlinked verdict is retained.
+// Preserve terminal facts and token expiry. Recheck the identity
 // and verdict that authorized the remote read inside the write transaction.
 func (s *Store) cancelAbsentStoredIdentity(ctx context.Context, runID string, observed dispatchObservation) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -344,6 +345,14 @@ func (s *Store) cancelAbsentStoredIdentity(ctx context.Context, runID string, ob
 	if current.state != contract.RunSucceeded && current.state != contract.RunFailed {
 		// An active Run still follows the existing regression/absence rules.
 		return nil
+	}
+	if current.runJob.Valid && current.runJob.String != "" {
+		if !current.dispatched.Valid {
+			return internalError(errors.New("linked job has no dispatch acknowledgement"), "settle absent identity cancellation")
+		}
+		if err := markTerminalLinkRegressedTx(ctx, tx, runID, current.runJob.String); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=?, last_error=NULL, refused=0 WHERE run_id=? AND completed_ns IS NULL`, s.recoveryNow().UnixNano(), runID); err != nil {
 		return internalError(err, "finish absent identity cancellation")
@@ -823,3 +832,210 @@ func runDispatchHold(ctx context.Context, q holdReader, runID string) (*contract
 // request won, or admission/retry is deferred. The caller must not submit:
 // replay could create new work after the run ended or was told to stop.
 var errDispatchAbandoned = errors.New("l3: dispatch attempt abandoned")
+
+// migrateLegacyRunJobLinks commits the links, their validation work and the
+// one-time marker together. The store's prerequisite backfills have run before
+// this call. Store open never contacts L1.
+func (s *Store) migrateLegacyRunJobLinks(ctx context.Context) error {
+	var exists bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE name='run_job_link_migration' AND type='table')`).Scan(&exists); err != nil {
+		return err
+	}
+	if exists {
+		var done bool
+		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM run_job_link_migration WHERE id=1)`).Scan(&done); err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS run_job_link_migration (id INTEGER PRIMARY KEY CHECK(id=1));
+CREATE TABLE IF NOT EXISTS run_job_link_validations (
+ run_id TEXT PRIMARY KEY REFERENCES runs(run_id), dispatch_key TEXT NOT NULL, job_id TEXT NOT NULL,
+ failures INTEGER NOT NULL DEFAULT 0, retry_ns INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS run_job_link_validations_due ON run_job_link_validations(retry_ns,run_id);`); err != nil {
+		return err
+	}
+	// Recheck under the immediate write lock, after any competing opener commits.
+	var done bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM run_job_link_migration WHERE id=1)`).Scan(&done); err != nil {
+		return err
+	}
+	if done {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_job_link_validations(run_id, dispatch_key, job_id)
+ SELECT r.run_id, r.dispatch_key, o.job_id FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE r.status IN ('succeeded','failed') AND r.l1_job_id IS NULL AND r.job_link_settled=0
+ AND r.dispatch_attempt_ns IS NOT NULL AND o.dispatch_key=r.dispatch_key
+ AND o.job_id IS NOT NULL AND o.job_id<>'' AND o.dispatched_ns IS NOT NULL
+ AND o.token_delivery IS NULL AND o.last_error IS NULL
+ AND COALESCE(r.failure_reason,'') NOT IN ('the run was canceled before dispatch','canceled before dispatch','canceled before dispatch was confirmed')
+ AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)`); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT run_id,job_id FROM run_job_link_validations`)
+	if err != nil {
+		return err
+	}
+	var links [][2]string
+	for rows.Next() {
+		var item [2]string
+		if err := rows.Scan(&item[0], &item[1]); err != nil {
+			rows.Close()
+			return err
+		}
+		links = append(links, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, item := range links {
+		if _, err := linkTerminalRunTx(ctx, tx, item[0], item[1]); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_job_link_migration(id) VALUES(1)`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type migratedLinkValidation struct {
+	runID, dispatchKey, jobID string
+	failures                  int
+	retryNS                   int64
+	observed                  dispatchObservation
+	owned                     bool
+}
+
+// This predicate also prevents obsolete validation work from holding node
+// attribution after cancellation or newer link evidence takes ownership.
+const migratedLinkOwnership = `r.dispatch_key=v.dispatch_key AND o.dispatch_key=v.dispatch_key
+ AND r.l1_job_id=v.job_id AND o.job_id=v.job_id AND o.dispatched_ns IS NOT NULL
+ AND r.status IN ('succeeded','failed') AND o.last_error IS NULL AND o.token_delivery IS NULL
+ AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)`
+
+// Reading the due prefix bounds each pass even when some work is superseded.
+// Superseded work retires without an L1 read or a link verdict.
+func (s *Store) migratedLinkValidations(ctx context.Context) ([]migratedLinkValidation, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT v.run_id,v.dispatch_key,v.job_id,v.failures,v.retry_ns, `+dispatchObservationColumns+`, COALESCE((`+migratedLinkOwnership+`),0)
+ FROM run_job_link_validations v JOIN runs r ON r.run_id=v.run_id JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE v.retry_ns<=? ORDER BY v.retry_ns,v.run_id LIMIT ?`, s.recoveryNow().UnixNano(), unrecordedDispatchBatch)
+	if err != nil {
+		return nil, internalError(err, "list migrated link validations")
+	}
+	defer rows.Close()
+	var pending []migratedLinkValidation
+	for rows.Next() {
+		var item migratedLinkValidation
+		o := &item.observed
+		if err := rows.Scan(&item.runID, &item.dispatchKey, &item.jobID, &item.failures, &item.retryNS, &o.outboxJob, &o.runJob, &o.lastError, &o.dispatched, &o.settled, &o.state, &o.reason, &o.diagnosticJob, &o.attempted, &item.owned); err != nil {
+			return nil, internalError(err, "read migrated link validation")
+		}
+		pending = append(pending, item)
+	}
+	return pending, rows.Err()
+}
+
+type migratedLinkVerdict int
+
+const (
+	migratedLinkFound migratedLinkVerdict = iota
+	migratedLinkAbsent
+	migratedLinkRetry
+	migratedLinkRetired
+)
+
+// completeMigratedLinkValidation rechecks both identity and ownership after
+// the remote read. A crash before this commit leaves the lookup retryable.
+// Concurrent validators cannot commit over a completed verdict or newer retry.
+// The result is true only when this observation committed a verdict or retry.
+func (s *Store) completeMigratedLinkValidation(ctx context.Context, item migratedLinkValidation, verdict migratedLinkVerdict) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, internalError(err, "begin migrated link validation")
+	}
+	defer tx.Rollback()
+	var owned bool
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE((`+migratedLinkOwnership+`),0) FROM run_job_link_validations v
+ JOIN runs r ON r.run_id=v.run_id JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE v.run_id=? AND v.dispatch_key=? AND v.job_id=? AND v.failures=? AND v.retry_ns=?`, item.runID, item.dispatchKey, item.jobID, item.failures, item.retryNS).Scan(&owned)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, internalError(err, "recheck migrated link ownership")
+	}
+	if !owned {
+		// The migrated identity or its recovery ownership no longer applies. This
+		// retires work, not a completed validation, and writes no link verdict.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM run_job_link_validations WHERE run_id=?`, item.runID); err != nil {
+			return false, internalError(err, "retire superseded link validation")
+		}
+		return false, tx.Commit()
+	}
+	if verdict == migratedLinkRetired {
+		return false, nil
+	}
+	current, err := readDispatchObservation(ctx, tx, item.runID)
+	if err != nil {
+		return false, err
+	}
+	if current != item.observed {
+		return false, nil
+	}
+	if verdict == migratedLinkRetry {
+		if _, err := tx.ExecContext(ctx, `UPDATE run_job_link_validations SET failures=failures+1,retry_ns=? WHERE run_id=?`, s.recoveryNow().Add(unrecordedDispatchBackoff(item.failures)).UnixNano(), item.runID); err != nil {
+			return false, internalError(err, "defer migrated link validation")
+		}
+	} else {
+		if verdict == migratedLinkAbsent {
+			if err := markTerminalLinkRegressedTx(ctx, tx, item.runID, item.jobID); err != nil {
+				return false, err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM run_job_link_validations WHERE run_id=?`, item.runID); err != nil {
+			return false, internalError(err, "complete migrated link validation")
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, internalError(err, "commit migrated link validation")
+	}
+	return true, nil
+}
+
+// markTerminalLinkRegressedTx is separate from active-run regression: terminal
+// outcome, reason, timestamps and token expiry must never be rewritten. The
+// caller has rechecked the captured acknowledgement and current ownership.
+func markTerminalLinkRegressedTx(ctx context.Context, tx *sql.Tx, runID, jobID string) error {
+	cause := contract.APIError{Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed", Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": jobID}}
+	payload, err := json.Marshal(cause)
+	if err != nil {
+		return internalError(err, "encode terminal link regression")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`, string(payload), runID); err != nil {
+		return internalError(err, "record terminal link regression")
+	}
+	return nil
+}
+
+// Node attribution must not bypass the validation queue's backoff and budget
+// by making an extra, unbounded L1 read for each newly migrated link.
+func (s *Store) pendingMigratedLinkValidation(ctx context.Context, runID string) (bool, error) {
+	var pending bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM run_job_link_validations v
+ JOIN runs r ON r.run_id=v.run_id JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE v.run_id=? AND (`+migratedLinkOwnership+`))`, runID).Scan(&pending)
+	return pending, err
+}

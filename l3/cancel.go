@@ -196,6 +196,15 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 	if !ok {
 		return internalError(errors.New("L1 cancellation client is not configured"), "cancel run job")
 	}
+	observed, err := readDispatchObservation(ctx, r.store.db, run.RunID)
+	if err != nil {
+		return err
+	}
+	if !observed.runJob.Valid || observed.runJob.String != run.JobID ||
+		!observed.outboxJob.Valid || observed.outboxJob.String != run.JobID {
+		return internalError(errors.New("dispatch identity changed before cancellation"), "cancel run job")
+	}
+	run.State = observed.state
 	job, err := canceler.CancelJob(remote, run.JobID)
 	if err != nil {
 		a := classifyL1Answer(err)
@@ -203,11 +212,15 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 			return err
 		}
 		refusal := a.Response.protocol
-		// A cancel 404 can also hide an ownership refusal. Only the existing
-		// authoritative GetJob absence may fail the Run as an L1 regression.
+		// A cancel 404 can also hide an ownership refusal. Only authoritative
+		// GetJob absence establishes regression. The captured observation fences
+		// both remote calls against newer terminal link evidence.
 		if refusal.Code == contract.ErrorNotFound {
 			_, getErr := r.jobs.GetJob(remote, run.JobID)
 			if isMissingL1Job(getErr, run.JobID) {
+				if run.State == contract.RunSucceeded || run.State == contract.RunFailed {
+					return r.store.cancelAbsentStoredIdentity(ctx, run.RunID, observed)
+				}
 				if _, err := r.store.failMissingL1Job(ctx, run); err != nil {
 					return err
 				}

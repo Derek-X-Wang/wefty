@@ -178,7 +178,7 @@
   {
     "file": "computer_dead_host_scope_test.go",
     "function": "TestComputerPassRefusedOnceL1MarksItsHostDead",
-    "fingerprint": "0cc83f2bb5f3ea781b3d87a46f283c80639331ff4125134c30755c3d459e93b4",
+    "fingerprint": "0a0514d8ab54d409ce21ee0d0ea8ae9d8c6fdedac6acc666646d8440adcd01e2",
     "count": 1,
     "reason": "Existing HTTP expectation callback accepts a string label; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -186,7 +186,7 @@
   {
     "file": "computer_dead_host_scope_test.go",
     "function": "TestComputerPassRefusedOnceL1MarksItsHostDead",
-    "fingerprint": "c9e5d56bd0719d62a82ef11df906b7496e313a6c4c55902da56f62a9b1bcc533",
+    "fingerprint": "5271713a2e7cff9bdbfe6020f51f651cf1494f828a088bba6e368cc615344369",
     "count": 1,
     "reason": "Existing HTTP expectation callback accepts a string label; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -194,7 +194,7 @@
   {
     "file": "computer_dead_host_scope_test.go",
     "function": "TestComputerPassRefusedOnceL1MarksItsHostDead",
-    "fingerprint": "d5c479981769439c404a9612e71797e590349cc0f34cf2b074dad747713a8840",
+    "fingerprint": "ea2a23058beea419ab03faeccd020fdeea208778aa562440aca49274d769831f",
     "count": 1,
     "reason": "Existing HTTP expectation callback accepts a string label; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -218,7 +218,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.RevokeComputerAttemptTokens",
-    "fingerprint": "8d4cc1eece3dda993177a19b14d2c8f6004139420aceb1d905f7677d3fb955b3",
+    "fingerprint": "624df27bce9834ec2f157bf376f9728128a8c05a9a41beac7b0312c25002d18c",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -226,7 +226,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.RevokeComputerTokenScope",
-    "fingerprint": "03b2221a07fa37bbc61d8c97db36303c14220f96216ad5fb4913e07646ec6b7b",
+    "fingerprint": "21696c4c05e4e7df21519d3a1a70fcca18e59546b04262083c2a3c1e80a46301",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -234,7 +234,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.RevokeComputerTokens",
-    "fingerprint": "be3b9ef0faaaef2391a9053fc4c0a4587c56697f7e889261c7dee6b0aa63dbd8",
+    "fingerprint": "16149295d17132012d06306cd6f8d3237fc0f4d4733b7270c2b64c8f79e03f0a",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -242,7 +242,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.RevokeHostComputerTokens",
-    "fingerprint": "36e3c528bdaaf2610448bccdf6f59bd99beb29f1d264d651b232b6f4fbdedd9b",
+    "fingerprint": "007e4424caf53edb91406939a7147b9ce9ca644513759e9f90a21de869294f25",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -250,7 +250,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.adoptComputerAuthorityInstance",
-    "fingerprint": "4860ed3772d0dc3c645bac7daae936de6813264830a6c880ae7ed287fd58e39f",
+    "fingerprint": "51e3e59c8f70a78a8d2ce70b11dcd066323001c0f0ffc4353ae42f194f2c1960",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -258,7 +258,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.insertComputerGrant",
-    "fingerprint": "ef5c4c7a95656ee49f85dba663e3e4fc3b9e8d278093f70c9fd5de28d09537a2",
+    "fingerprint": "89920e3ebff2d1fabeb6cec25ccab555598b22b65db126e0773bc22ca81063db",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -274,7 +274,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.revokeComputerAttemptTokensAsControlPlane",
-    "fingerprint": "5666302dd35f98ffa71873e5511b3dd8a0f012bcaef1afb2bd5fb3cc2a42a9c1",
+    "fingerprint": "9d52400bd5c25008cdad8b66167468c4d08731e31e26a97cd9653d87c8346dee",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -282,7 +282,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.settleComputerGrantMint",
-    "fingerprint": "5a198e9244f848a78414d22fe68d894e6e35a4c5568e73bcbf88ca18cd8fc164",
+    "fingerprint": "4362c4de04839adf15107532c0774bb24b57890994891b3dd334eae2d818afe0",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -306,7 +306,7 @@
   {
     "file": "computer_tokens_test.go",
     "function": "TestComputerRunProvenanceAndAtomicInflightLimit",
-    "fingerprint": "22268023dfff878454321028c88037decf7611a2110baaff7b46c788c82c765b",
+    "fingerprint": "375eeafdd22c02295a3008d2eae87433bab9916ffe3442c62d8ff08905028f35",
     "count": 4,
     "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -314,7 +314,7 @@
   {
     "file": "computer_tokens_test.go",
     "function": "TestComputerRunProvenanceAndAtomicInflightLimit",
-    "fingerprint": "2f1240e961173f6db1ca2dc74e744240be30d39030ccae3b218f91139cfff5b3",
+    "fingerprint": "3b13cf171590414ca4e5054471aeee81c665a68f19829585a211bcdd3e25c0a9",
     "count": 2,
     "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -322,7 +322,7 @@
   {
     "file": "computer_tokens_test.go",
     "function": "TestComputerRunProvenanceAndAtomicInflightLimit",
-    "fingerprint": "aaf8c0e639b1af430ef3a2bda84e89eb7b9a1390ffb46f7749c89666b74d2da7",
+    "fingerprint": "e44c726548eefd7c765fbfdb55559c11ab94ac86534c8f2ebb72d89b37fe717b",
     "count": 3,
     "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -330,7 +330,7 @@
   {
     "file": "computer_tokens_test.go",
     "function": "TestControlPlaneAttemptScopedRevocationRevokesOnlyThatAttempt",
-    "fingerprint": "1a5f1b4949fce2526b002c8b18edb09adb84d0050a1b775d34567f5f5c695dab",
+    "fingerprint": "1d7d4bddb64c9768c48506db7db64a55509f4289d79631d298dcc70c42de5735",
     "count": 1,
     "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -338,7 +338,7 @@
   {
     "file": "computer_tokens_test.go",
     "function": "TestControlPlaneAttemptScopedRevocationRevokesOnlyThatAttempt",
-    "fingerprint": "ef89eeb5589d7b6a64ec0cb7f233486aa5a918daedb6a7639a0e5521519c56f5",
+    "fingerprint": "588d0b508f2a4e3d8c0751adc88e112293c63e770300e61136719356e239845a",
     "count": 1,
     "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -514,7 +514,7 @@
   {
     "file": "protocol_integration_test.go",
     "function": "TestLineageQueryBoundsUnboundedCycleRecursion",
-    "fingerprint": "74e48bc40a0aab239eb2641737e87833f50193cbbbfae3b12e96415729b2b588",
+    "fingerprint": "88252df985f12f661b33aec90d2b2b33cc5f7886b95c3e850ff55a807812e99a",
     "count": 1,
     "reason": "Existing corrupt-lineage fixture callback accepts Run identities and writes only parent links; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -522,7 +522,7 @@
   {
     "file": "protocol_integration_test.go",
     "function": "TestLineageQueryBoundsUnboundedCycleRecursion",
-    "fingerprint": "d2824df3b1b3c26b5d163c02169884147c97d3f63d37bb74fbf27bf5f7f951c9",
+    "fingerprint": "9b7c94c1d2f73209e34ab1877c0e74d17c665ba756711de03fd4324d5370dfd3",
     "count": 1,
     "reason": "Existing corrupt-lineage fixture callback accepts Run identities and writes only parent links; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -530,7 +530,7 @@
   {
     "file": "protocol_integration_test.go",
     "function": "TestLineageQueryBoundsUnboundedCycleRecursion",
-    "fingerprint": "db76f869cbc76310a447ceaf629d16dfcb80eb7fe4077ef7161926183af00d03",
+    "fingerprint": "ab3fdba0e9dfabc511036ce6986dd9ccbb613e96454a8c3d013ce032e2e17b13",
     "count": 1,
     "reason": "Existing corrupt-lineage fixture callback accepts Run identities and writes only parent links; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -698,7 +698,7 @@
   {
     "file": "run_job_link_boundary_test.go",
     "function": "*linkSQLPackage.sites",
-    "fingerprint": "905631433bb1f010fab580700013e2ff4ad5d60e4dfd039957abe54a2b3da1ae",
+    "fingerprint": "270556a72a454a6c03fa45fa50fdb5b87bdb803402926b2ef10710bd11e131ac",
     "count": 1,
     "reason": "Guard implementation callbacks accept strings for AST or SQL analysis, not ledger execution; exact opaque callback exception through final guard closure.",
     "retirement": "#785"
@@ -904,6 +904,14 @@
     "retirement": "#785"
   },
   {
+    "file": "run_job_link_migration_test.go",
+    "function": "*migratedLinkClient.GetJob",
+    "fingerprint": "0615cb36c8f2ff4ecf0346c0d3e2bab3d3683b09aae2aafd519ba415e267cbea",
+    "count": 1,
+    "reason": "Test fake L1 client forwards string identities through a function-typed field; no ledger SQL. Opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
     "file": "run_list.go",
     "function": "*Store.ListRuns",
     "fingerprint": "839f590236d85d23733edeb99cbc0a81beb4139700ddde29d9434036bc49aea2",
@@ -938,7 +946,7 @@
   {
     "file": "server.go",
     "function": "*Server.filterVisibleLineage",
-    "fingerprint": "d72f1c966c147dfb08c676bb088fd0e532a88b7860cff12f06c456aa93df0c31",
+    "fingerprint": "575e0063678ff39280bfb6a376917d96552d9c4559bd814828d4ad42dd04d823",
     "count": 1,
     "reason": "Existing lineage visibility function value accepts Run identity strings; conservatively opaque until reader adoption.",
     "retirement": "#783"
