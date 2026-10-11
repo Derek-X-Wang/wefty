@@ -280,3 +280,69 @@ func TestCancelCompletionRetryOutageKeepsAgentRunning(t *testing.T) {
 		})
 	}
 }
+
+// Cancellation happens exactly when the completion path enters transient
+// backoff. Renewal and execution never use this distinctive timer duration.
+type cancelAtCompletionBackoffClock struct {
+	systemClock
+	cancel context.CancelCauseFunc
+	once   atomic.Bool
+}
+
+func (clock *cancelAtCompletionBackoffClock) NewTimer(delay time.Duration) Timer {
+	if delay == 17*time.Hour && clock.once.CompareAndSwap(false, true) {
+		clock.cancel(errAttemptDirectiveCancel)
+	}
+	return clock.systemClock.NewTimer(delay)
+}
+
+func TestCancelDuringCompletionBackoffRetriesIdenticalResultNow(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	var calls atomic.Int32
+	var mu sync.Mutex
+	var first l1.CompletionRequest
+	client, stop := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/complete") {
+			http.NotFound(w, r)
+			return
+		}
+		var request l1.CompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if calls.Add(1) == 1 {
+			first = request
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Retryable: true}})
+			return
+		}
+		if !reflect.DeepEqual(request, first) {
+			t.Errorf("completion retry changed evidence: first=%+v retry=%+v", first, request)
+		}
+		_ = json.NewEncoder(w).Encode(l1.Job{})
+	}), time.Second)
+	defer stop()
+	defer client.Close()
+	outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	claim := spoolTestClaim("backoff-cancel")
+	claim.Job.Spec.Kind = contract.JobKindProcess
+	claim.Lease.LeaseTTL = time.Hour
+	clock := &cancelAtCompletionBackoffClock{cancel: cancel}
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, outbox: outbox,
+		runtimes: workloadRuntimeSet{contract.JobKindProcess: &captureRuntime{}}, clock: clock,
+		renewalInterval: time.Hour, completionRetry: 17 * time.Hour, observer: newLifecycleObserver(systemClock{}),
+	})
+	destination, executeErr := lifecycle.execute(ctx, claim, time.Now())
+	if executeErr != nil || destination != errorDestinationUnclassified || calls.Load() != 2 || !clock.once.Load() || !lifecycle.resultUploaded.Load() {
+		t.Fatalf("cancel during backoff missed immediate settlement: calls=%d destination=%v err=%v receipt=%+v", calls.Load(), destination, executeErr, outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID))
+	}
+	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", time.Second)
+}
