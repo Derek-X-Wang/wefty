@@ -204,64 +204,64 @@
     "function": "*Store.MintReprovedComputerToken",
     "fingerprint": "196b428a2e66d48bdcd9db5d495709be9c8fe3442c2c5ace0d40a16bbcfb3b8d",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "*Store.MintReprovedComputerToken",
     "fingerprint": "81087307d0b932487a7828c5e86d0fa0c5aa9d89d11089379cbf463e7b88bb93",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "*Store.RevokeComputerAttemptTokens",
     "fingerprint": "624df27bce9834ec2f157bf376f9728128a8c05a9a41beac7b0312c25002d18c",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "*Store.RevokeComputerTokenScope",
     "fingerprint": "21696c4c05e4e7df21519d3a1a70fcca18e59546b04262083c2a3c1e80a46301",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "*Store.RevokeComputerTokens",
     "fingerprint": "16149295d17132012d06306cd6f8d3237fc0f4d4733b7270c2b64c8f79e03f0a",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "*Store.RevokeHostComputerTokens",
     "fingerprint": "007e4424caf53edb91406939a7147b9ce9ca644513759e9f90a21de869294f25",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "*Store.adoptComputerAuthorityInstance",
     "fingerprint": "51e3e59c8f70a78a8d2ce70b11dcd066323001c0f0ffc4353ae42f194f2c1960",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "*Store.insertComputerGrant",
     "fingerprint": "89920e3ebff2d1fabeb6cec25ccab555598b22b65db126e0773bc22ca81063db",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
@@ -276,32 +276,32 @@
     "function": "*Store.revokeComputerAttemptTokensAsControlPlane",
     "fingerprint": "9d52400bd5c25008cdad8b66167468c4d08731e31e26a97cd9653d87c8346dee",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "*Store.settleComputerGrantMint",
     "fingerprint": "4362c4de04839adf15107532c0774bb24b57890994891b3dd334eae2d818afe0",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "revokeComputerGrantRows",
     "fingerprint": "1a130c905468f035a9a07f6a0c3980461902839ed0f53170a9f476fbe7f478a7",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
     "function": "revokeComputerGrantRowsWithCount",
     "fingerprint": "835640906434c5d481a1cef92ac4e6d3a0f052ba4305a5997b3533ee6abe3255",
     "count": 1,
-    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
-    "retirement": "#784"
+    "reason": "Internal Computer grant and token code forwards constructed SQL through function values the guard treats as opaque; #784 found no merged Run-or-outbox link read here. Preserve grant fencing; exact exception until #785 narrows opaque detection or adopts these sites.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens_test.go",
@@ -873,14 +873,6 @@
   },
   {
     "file": "store.go",
-    "function": "*Store.activeProjectedRuns",
-    "fingerprint": "cb5c378e0b5fe1c2b00b1daac8e161cd24bdf4ce2b80203ab638c7c9ce00ca84",
-    "count": 1,
-    "reason": "Projection and node-attribution selection reads link storage directly until background-reader adoption.",
-    "retirement": "#784"
-  },
-  {
-    "file": "store.go",
     "function": "*Store.initialize",
     "fingerprint": "13aab94687cba96e5e4d3a6d1310a849269581fcf40e363cb886de255be116e1",
     "count": 1,
@@ -1014,14 +1006,6 @@
     "count": 1,
     "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
     "retirement": "#785"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.pendingNodeAttributions",
-    "fingerprint": "13634dca77e61b023d462dc7bbbc741ba4e600b1037624b3469ddbefec8f129f",
-    "count": 1,
-    "reason": "Projection and node-attribution selection reads link storage directly until background-reader adoption.",
-    "retirement": "#784"
   },
   {
     "file": "store.go",

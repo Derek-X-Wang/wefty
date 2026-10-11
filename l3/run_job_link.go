@@ -15,8 +15,9 @@ import (
 // Run job link owns dispatch creation and attempts, token staging and cleanup,
 // confirmation, terminal recovery, regression and cancel ownership. L1 observations are
 // obtained before short ledger writes that recheck ownership and identity.
-// Migration and its resumable validation live here too; reader adoption
-// continues in #783–#784.
+// Migration, resumable validation, projection selection and cancellation
+// identity resolution live here too. Public readers use the Run reference;
+// acknowledged-ID fallback remains private to this module.
 
 // completeDispatch records L1's acknowledgement. A run that ended while its
 // submit was in flight is linked here too, keeping its terminal state: the
@@ -1599,4 +1600,142 @@ func (r *Reconciler) validateMigratedLinks(ctx, remote context.Context) []error 
 		}
 	}
 	return passErrors
+}
+
+// Background readers keep their selection and ordering rules while this module
+// owns access to the Run reference. They never merge outbox acknowledgements.
+func (s *Store) activeProjectedRuns(ctx context.Context) ([]projectedRun, error) {
+	rows, err := s.db.QueryContext(ctx, `
+WITH RECURSIVE run_depth(run_id, depth) AS (
+  SELECT run_id, 0 FROM runs WHERE parent_run_id IS NULL
+  UNION ALL
+  SELECT r.run_id, d.depth + 1 FROM runs r JOIN run_depth d ON r.parent_run_id=d.run_id
+)
+SELECT r.run_id, r.l1_job_id, r.status, r.required_envelope
+FROM runs r JOIN run_depth d ON d.run_id=r.run_id
+WHERE r.l1_job_id IS NOT NULL AND r.status NOT IN (?, ?)
+ORDER BY d.depth DESC, r.created_ns, r.run_id`, contract.RunSucceeded, contract.RunFailed)
+	if err != nil {
+		return nil, internalError(err, "list runs for projection")
+	}
+	defer rows.Close()
+	var runs []projectedRun
+	for rows.Next() {
+		var run projectedRun
+		if err := rows.Scan(&run.RunID, &run.JobID, &run.State, &run.RequiredEnvelope); err != nil {
+			return nil, internalError(err, "scan run for projection")
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate runs for projection")
+	}
+	return runs, nil
+}
+
+// pendingNodeAttributionsQuery names node_attribution_pending=1 literally so
+// SQLite can answer it from the runs_node_attribution_pending partial index.
+const pendingNodeAttributionsQuery = `SELECT run_id, l1_job_id FROM runs
+WHERE node_attribution_pending=1 AND l1_job_id IS NOT NULL ORDER BY created_ns, run_id`
+
+func (s *Store) pendingNodeAttributions(ctx context.Context) ([]pendingNodeAttribution, error) {
+	rows, err := s.db.QueryContext(ctx, pendingNodeAttributionsQuery)
+	if err != nil {
+		return nil, internalError(err, "list pending run node attributions")
+	}
+	defer rows.Close()
+	var pending []pendingNodeAttribution
+	for rows.Next() {
+		var item pendingNodeAttribution
+		if err := rows.Scan(&item.RunID, &item.JobID); err != nil {
+			return nil, internalError(err, "scan pending run node attribution")
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate pending run node attributions")
+	}
+	return pending, nil
+}
+
+// canceledRunJob resolves cancellation's private acknowledged-ID fallback and
+// rechecks its stored identity before remote delivery. Reads of L1 happen before
+// each short ledger write; the captured observation also fences terminal absence.
+func (r *Reconciler) canceledRunJob(ctx, remote context.Context, cancellation runCancellation) (projectedRun, dispatchObservation, bool, error) {
+	run := cancellation.projectedRun
+	if run.JobID == "" {
+		if r.lookup == nil {
+			return run, dispatchObservation{}, false, internalError(errors.New("L1 dispatch lookup client is not configured"), "resolve canceled dispatch")
+		}
+		observed, err := readDispatchObservation(ctx, r.store.db, run.RunID)
+		if err != nil {
+			return run, dispatchObservation{}, false, err
+		}
+		lookupStarted := r.store.recoveryNow()
+		job, err := r.lookup.LookupJobByDispatchKey(remote, cancellation.DispatchKey)
+		if isMissingDispatch(err, cancellation.DispatchKey) {
+			// A contradicted acknowledgement is not link evidence. Resolve its
+			// identity through L1, outside the write, just as recovery does.
+			if observed.outboxJob.Valid && observed.outboxJob.String != "" {
+				job, err = r.jobs.GetJob(remote, observed.outboxJob.String)
+				if isMissingL1Job(err, observed.outboxJob.String) {
+					if err := r.store.cancelAbsentStoredIdentity(ctx, run.RunID, observed); err != nil {
+						return run, dispatchObservation{}, false, err
+					}
+					return run, dispatchObservation{}, false, r.store.deferRunCancellation(ctx, run.RunID, nil)
+				}
+				if err != nil {
+					return run, dispatchObservation{}, false, err
+				}
+				if job.JobID != observed.outboxJob.String {
+					return run, dispatchObservation{}, false, internalError(errors.New("job lookup conflicts with stored identity"), "resolve canceled dispatch")
+				}
+			} else {
+				if err := r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted); err != nil {
+					return run, dispatchObservation{}, false, err
+				}
+				return run, dispatchObservation{}, false, r.store.deferRunCancellation(ctx, run.RunID, err)
+			}
+		}
+		if err != nil {
+			return run, dispatchObservation{}, false, err
+		}
+		if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, job.JobID, dispatchLookupEvidence, &observed); err != nil {
+			return run, dispatchObservation{}, false, err
+		}
+		record, err := r.store.GetRun(ctx, run.RunID)
+		if err != nil {
+			return run, dispatchObservation{}, false, err
+		}
+		run.JobID, run.State = record.L1JobID, record.Status
+	}
+
+	// Recheck stored outbox acknowledgements before sending any cancellation.
+	// A mismatched dispatch lookup must never become authority over another job.
+	if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, run.JobID, dispatchStoredEvidence, nil); err != nil {
+		return run, dispatchObservation{}, false, err
+	}
+	record, err := r.store.GetRun(ctx, run.RunID)
+	if err != nil {
+		return run, dispatchObservation{}, false, err
+	}
+	if record.L1JobID != run.JobID || run.JobID == "" {
+		return run, dispatchObservation{}, false, internalError(errors.New("canceled dispatch acknowledgement conflicts with run association"), "link canceled dispatch")
+	}
+	run.State = record.Status
+
+	_, ok := r.jobs.(JobCancelClient)
+	if !ok {
+		return run, dispatchObservation{}, false, internalError(errors.New("L1 cancellation client is not configured"), "cancel run job")
+	}
+	observed, err := readDispatchObservation(ctx, r.store.db, run.RunID)
+	if err != nil {
+		return run, dispatchObservation{}, false, err
+	}
+	if !observed.runJob.Valid || observed.runJob.String != run.JobID ||
+		!observed.outboxJob.Valid || observed.outboxJob.String != run.JobID {
+		return run, dispatchObservation{}, false, internalError(errors.New("dispatch identity changed before cancellation"), "cancel run job")
+	}
+	run.State = observed.state
+	return run, observed, true, nil
 }

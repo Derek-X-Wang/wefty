@@ -1870,35 +1870,6 @@ type projectedRun struct {
 	RequiredEnvelope bool
 }
 
-func (s *Store) activeProjectedRuns(ctx context.Context) ([]projectedRun, error) {
-	rows, err := s.db.QueryContext(ctx, `
-WITH RECURSIVE run_depth(run_id, depth) AS (
-  SELECT run_id, 0 FROM runs WHERE parent_run_id IS NULL
-  UNION ALL
-  SELECT r.run_id, d.depth + 1 FROM runs r JOIN run_depth d ON r.parent_run_id=d.run_id
-)
-SELECT r.run_id, r.l1_job_id, r.status, r.required_envelope
-FROM runs r JOIN run_depth d ON d.run_id=r.run_id
-WHERE r.l1_job_id IS NOT NULL AND r.status NOT IN (?, ?)
-ORDER BY d.depth DESC, r.created_ns, r.run_id`, contract.RunSucceeded, contract.RunFailed)
-	if err != nil {
-		return nil, internalError(err, "list runs for projection")
-	}
-	defer rows.Close()
-	var runs []projectedRun
-	for rows.Next() {
-		var run projectedRun
-		if err := rows.Scan(&run.RunID, &run.JobID, &run.State, &run.RequiredEnvelope); err != nil {
-			return nil, internalError(err, "scan run for projection")
-		}
-		runs = append(runs, run)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, internalError(err, "iterate runs for projection")
-	}
-	return runs, nil
-}
-
 func (s *Store) projectJobState(ctx context.Context, run projectedRun, jobState contract.JobState) error {
 	return s.projectJobOutcome(ctx, run, jobState, "")
 }
@@ -2027,31 +1998,6 @@ func nullableReason(reason string) any {
 type pendingNodeAttribution struct {
 	RunID string
 	JobID string
-}
-
-// pendingNodeAttributionsQuery names node_attribution_pending=1 literally so
-// SQLite can answer it from the runs_node_attribution_pending partial index.
-const pendingNodeAttributionsQuery = `SELECT run_id, l1_job_id FROM runs
-WHERE node_attribution_pending=1 AND l1_job_id IS NOT NULL ORDER BY created_ns, run_id`
-
-func (s *Store) pendingNodeAttributions(ctx context.Context) ([]pendingNodeAttribution, error) {
-	rows, err := s.db.QueryContext(ctx, pendingNodeAttributionsQuery)
-	if err != nil {
-		return nil, internalError(err, "list pending run node attributions")
-	}
-	defer rows.Close()
-	var pending []pendingNodeAttribution
-	for rows.Next() {
-		var item pendingNodeAttribution
-		if err := rows.Scan(&item.RunID, &item.JobID); err != nil {
-			return nil, internalError(err, "scan pending run node attribution")
-		}
-		pending = append(pending, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, internalError(err, "iterate pending run node attributions")
-	}
-	return pending, nil
 }
 
 // settleNodeAttribution is the one write allowed to a terminal run's node:
