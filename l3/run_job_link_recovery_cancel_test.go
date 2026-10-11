@@ -10,8 +10,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// These tests use the production recovery transitions before extraction in
-// #778. Cancellation status and execution are observed through ledger reads;
+// These tests use the production transitions owned by the link module. Cancellation status and execution are observed through ledger reads;
 // only the existing backoff helper inspects the durable retry schedule.
 func TestRecoveryWritesRespectCancellationOwnership(t *testing.T) {
 	for _, status := range []string{"pending", "settled", "refused"} {
@@ -379,8 +378,7 @@ func TestRecoveryCancelHandoffCannotOverwriteLaterVerdict(t *testing.T) {
 				recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, job.JobID)
 			}
 			if verdict == "changed-regression" {
-				if _, err := h.l3Store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
-					`{"code":"not_found","message":"earlier handoff verdict","details":{"reason":"l1_regressed","l1_job_id":"`+job.JobID+`"}}`, run.RunID); err != nil {
+				if err := recordRecoveryRegression(ctx, h.l3Store, run.RunID, job.JobID, "earlier handoff verdict"); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -393,8 +391,7 @@ func TestRecoveryCancelHandoffCannotOverwriteLaterVerdict(t *testing.T) {
 				}
 				// This write also proves the L1 read holds no ledger write transaction.
 				if verdict != "settlement" {
-					if _, err := h.l3Store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
-						`{"code":"not_found","message":"newer handoff verdict","details":{"reason":"l1_regressed","l1_job_id":"`+job.JobID+`"}}`, run.RunID); err != nil {
+					if err := recordRecoveryRegression(ctx, h.l3Store, run.RunID, job.JobID, "newer handoff verdict"); err != nil {
 						return l1.Job{}, err
 					}
 				}
@@ -459,8 +456,7 @@ func TestRecoveryAcknowledgedDiscoveryReachesCancel(t *testing.T) {
 		recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, job.JobID)
 		// A prior regression prevents requestRunCancellation from linking the
 		// outbox identity itself; recovery's GetJob handoff must do the link.
-		if _, err := h.l3Store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
-			`{"code":"not_found","message":"prior regression","details":{"reason":"l1_regressed","l1_job_id":"`+job.JobID+`"}}`, run.RunID); err != nil {
+		if err := recordRecoveryRegression(ctx, h.l3Store, run.RunID, job.JobID, "prior regression"); err != nil {
 			t.Fatal(err)
 		}
 		terminal := snapshotTerminalRun(t, h.l3Store, run.RunID)
@@ -501,15 +497,12 @@ func TestRecoveryIdentityConflictBacksOff(t *testing.T) {
 			keys := endedUnrecordedRuns(t, s, clock, unrecordedDispatchBatch+1)
 			for _, key := range keys[:unrecordedDispatchBatch] {
 				id := runIDForDispatchKey(t, s, key)
-				var err error
 				if conflict == "regression-job" {
-					_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
-						`{"code":"not_found","message":"corrupt regression identity","details":{"reason":"l1_regressed","l1_job_id":"job-other"}}`, id)
+					if err := recordRecoveryRegression(ctx, s, id, "job-other", "corrupt regression identity"); err != nil {
+						t.Fatal(err)
+					}
 				} else {
-					_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET dispatch_key=? WHERE run_id=?`, "corrupt-"+key, id)
-				}
-				if err != nil {
-					t.Fatal(err)
+					corruptRecoveryOutboxKey(t, s, id, "corrupt-"+key)
 				}
 			}
 			lookup := &cancelDuringRecoveryLookup{lookup: func(_ context.Context, key string) (l1.Job, error) {

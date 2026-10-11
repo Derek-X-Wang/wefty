@@ -61,8 +61,8 @@ func TestAcknowledgementDuringRecoveryLookupLinksTheRun(t *testing.T) {
 			// holds the acknowledgement in the outbox only.
 			name: "outbox-only acknowledgement",
 			ack: func(ctx context.Context, s *Store, runID, jobID string) error {
-				_, err := s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=? WHERE run_id=? AND dispatched_ns IS NULL`, jobID, s.clock.Now().UnixNano(), runID)
-				return err
+				recordOutboxOnlyAcknowledgement(t, s, runID, jobID)
+				return nil
 			},
 		},
 	} {

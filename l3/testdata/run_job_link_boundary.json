@@ -424,70 +424,6 @@
     "retirement": "#785"
   },
   {
-    "file": "dispatch_recovery_budget_test.go",
-    "function": "TestOpeningALedgerHealsMissingDispatchAttemptTimes",
-    "fingerprint": "05ca85b3d62be95fb229694ca8b058acae1378c2bd1da1ff29c0b74de3263823",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "dispatch_recovery_budget_test.go",
-    "function": "TestOpeningALedgerHealsMissingDispatchAttemptTimes",
-    "fingerprint": "531f4b66612c343d075dfdee9abccb9057f6241a7d3997fb63996d9391fd2d0f",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "dispatch_recovery_budget_test.go",
-    "function": "TestOpeningALedgerHealsMissingDispatchAttemptTimes",
-    "fingerprint": "df3d417c7b4c9fca283812beec41db5fd6eaf2f0a40015ba2ad4c1aa8133ef6d",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "dispatch_recovery_budget_test.go",
-    "function": "TestOpeningAnOlderLedgerBackfillsDispatchAttemptTime",
-    "fingerprint": "15acecff4c0f812280d68a59fb04d775611641db8e67d1facb08089f26fe2af7",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "dispatch_recovery_budget_test.go",
-    "function": "TestOpeningAnOlderLedgerBackfillsDispatchAttemptTime",
-    "fingerprint": "1b630c3b58145d5c55c4097147cd286b2a76a14adc149164beabed3975c8b779",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "dispatch_recovery_budget_test.go",
-    "function": "TestRunEndedBeforeAnyAttemptIsNotRecoveryEligible",
-    "fingerprint": "dcad589aa37297e48eed587d56b7da3748cf21dd2ed70138730e2605e6a8abd3",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "dispatch_recovery_budget_test.go",
-    "function": "jobLinkBackoff",
-    "fingerprint": "b28b088dc955d963123ba0731ae5fd842b590666f6f57a6f72f66fe2a57f93d0",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "dispatch_settle_horizon_test.go",
-    "function": "jobLinkSettled",
-    "fingerprint": "9d248015404c9f84c40fca84fd306df113003df1b8288e1ec969d7f5e31e0e43",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
     "file": "error_recovery_test.go",
     "function": "*recoveryJobClient.GetJob",
     "fingerprint": "9b05a2c4343f0b78e464192ddc2ff455ed7899d28271acf669e7c3fbf94cb784",
@@ -533,46 +469,6 @@
     "fingerprint": "ab3fdba0e9dfabc511036ce6986dd9ccbb613e96454a8c3d013ce032e2e17b13",
     "count": 1,
     "reason": "Existing corrupt-lineage fixture callback accepts Run identities and writes only parent links; exact opaque callback exception through final test adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "recovery_cancel_test.go",
-    "function": "*cancelDuringRecoveryLookup.LookupJobByDispatchKey",
-    "fingerprint": "62020117b88c77a7a56d903e8c49f234e8d0d587d8c23dfd0c095a39c4858ba5",
-    "count": 1,
-    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "recovery_cancel_test.go",
-    "function": "TestRecoveryAcknowledgedDiscoveryReachesCancel",
-    "fingerprint": "e4f14795740285809aee7fc2b34cb93e09c92bdbc4e09a44d56a04b9382eb8ba",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "recovery_cancel_test.go",
-    "function": "TestRecoveryCancelHandoffCannotOverwriteLaterVerdict",
-    "fingerprint": "5df6ce2f54c502897c43e644aba63d2f0398156c330b9d7a10cd4d6bd7e00084",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "recovery_cancel_test.go",
-    "function": "TestRecoveryCancelHandoffCannotOverwriteLaterVerdict",
-    "fingerprint": "c0a5e669bc78170fd95307a9e3a094f4f6621f8618b42bc1bbb53d97c5d119bc",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "recovery_cancel_test.go",
-    "function": "TestRecoveryIdentityConflictBacksOff",
-    "fingerprint": "f7bb5cebb7a2dbccf9309892b4a0a5f1b14e2e6326658d83b74a7276e0d96ba2",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
     "retirement": "#785"
   },
   {
@@ -669,14 +565,6 @@
     "fingerprint": "fa4dee398fe3659da5e9d36c2d4c6ee869efa71e1162888e06f37edeee337bee",
     "count": 1,
     "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
-    "retirement": "#785"
-  },
-  {
-    "file": "run_job_link_acknowledgement_test.go",
-    "function": "TestAcknowledgementDuringRecoveryLookupLinksTheRun",
-    "fingerprint": "88396a16735eac3e194563588eddb29ec97cff25a67d35e5453ac5982fc33274",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
     "retirement": "#785"
   },
   {
@@ -912,6 +800,14 @@
     "retirement": "#785"
   },
   {
+    "file": "run_job_link_recovery_cancel_test.go",
+    "function": "*cancelDuringRecoveryLookup.LookupJobByDispatchKey",
+    "fingerprint": "62020117b88c77a7a56d903e8c49f234e8d0d587d8c23dfd0c095a39c4858ba5",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
     "file": "run_list.go",
     "function": "*Store.ListRuns",
     "fingerprint": "839f590236d85d23733edeb99cbc0a81beb4139700ddde29d9434036bc49aea2",
@@ -998,22 +894,6 @@
     "count": 1,
     "reason": "Projection and node-attribution selection reads link storage directly until background-reader adoption.",
     "retirement": "#784"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.deferUnrecordedDispatch",
-    "fingerprint": "8a7b6d76a408714506aa2f5004c01d063d026de096235b9f570dabdab2a463a4",
-    "count": 1,
-    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
-    "retirement": "#781"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.deferUnrecordedDispatch",
-    "fingerprint": "cef3b9f2b73b5447089a98746cdd9fb5c724089590a4f92ccb1e14803e8ba955",
-    "count": 1,
-    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
-    "retirement": "#781"
   },
   {
     "file": "store.go",
@@ -1185,30 +1065,6 @@
   },
   {
     "file": "store.go",
-    "function": "*Store.settleUnrecordedDispatch",
-    "fingerprint": "08846ba26ce4f78bf538b0833fedc5df0dee88fef5d8ffa5847224d8258e09a2",
-    "count": 1,
-    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
-    "retirement": "#781"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.settleUnrecordedDispatch",
-    "fingerprint": "b0a4b218aba12c4509fd34a14b1e067bf72eb9bb341197153d175d806cba8371",
-    "count": 1,
-    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
-    "retirement": "#781"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.unrecordedDispatches",
-    "fingerprint": "cdf39bcecb9e488d4c913ddc5213b5a1ceb6b2256c0f726643ff63533c6768f5",
-    "count": 1,
-    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
-    "retirement": "#781"
-  },
-  {
-    "file": "store.go",
     "function": "ensureSQLiteColumn",
     "fingerprint": "a82a83d259085248c691c0c109abe3c343c551d53d6474c3e79b02cd4939374c",
     "count": 1,
@@ -1224,49 +1080,9 @@
     "retirement": "#785"
   },
   {
-    "file": "store.go",
-    "function": "unrecordedDispatchForTx",
-    "fingerprint": "ab184caa9d3ae074eeb306f16fdc971a117e5ce5336891b44a4e5d08d046eac3",
-    "count": 1,
-    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
-    "retirement": "#781"
-  },
-  {
     "file": "store_durability_test.go",
     "function": "TestTheL3LedgerCarriesTheDurabilityPragmas",
     "fingerprint": "0262cda19b864f1f8ec5688af3e165b0bb7d753f59033bb79b1fb3f693b4f9aa",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "unrecorded_dispatch_test.go",
-    "function": "TestRunEndedDuringItsInFlightSubmitIsLinked",
-    "fingerprint": "e8ce65f04e25df802d5a6d92b6b0c20d33975435d041671b2a54b434dcae522f",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "unrecorded_dispatch_test.go",
-    "function": "TestUnrecordedDispatchesUseThePartialIndex",
-    "fingerprint": "77b4304028929529fd9e1c93f1cb565cb849f732082b3c2a34f83def6e837dd9",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "unrecorded_dispatch_test.go",
-    "function": "ageDispatchAttemptPastSettleHorizon",
-    "fingerprint": "6f20339e0a7eac65e9a73d774e054cac3e1ab98be9e0e83879db5cf133bab694",
-    "count": 1,
-    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
-    "retirement": "#785"
-  },
-  {
-    "file": "unrecorded_dispatch_test.go",
-    "function": "recordOutboxOnlyAcknowledgement",
-    "fingerprint": "f73ad6eaf1ad1584a324cc5629d419979a1fe31b90d387f601064bd6cfa7fd73",
     "count": 1,
     "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
     "retirement": "#785"
