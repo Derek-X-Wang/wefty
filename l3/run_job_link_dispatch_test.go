@@ -64,7 +64,13 @@ func TestDispatchDeliversExactRunEnvironmentAndStoresTokenHash(t *testing.T) {
 		t.Fatalf("stored token binding/hash = %q/%x", attemptID, storedHash)
 	}
 	var staged *string
-	if err := h.l3Store.db.QueryRow(`SELECT token_delivery FROM dispatch_outbox WHERE run_id=?`, accepted.RunID).Scan(&staged); err != nil {
+	if err := inspectTestOutbox(h.l3Store, accepted.RunID, func(v dispatchOutboxRecord) {
+		if v.delivery.Valid {
+			staged = &v.delivery.String
+		} else {
+			staged = nil
+		}
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if staged != nil {
@@ -164,7 +170,7 @@ func TestDispatchReviewRetryCleanup(t *testing.T) {
 			case "refused":
 				err = s.failDispatch(ctx, run.RunID, protocolError(contract.ErrorInvalidRequest, "refused"))
 			case "canceled":
-				_, err = s.db.Exec(`UPDATE runs SET dispatch_attempt_ns=NULL WHERE run_id=?`, run.RunID)
+				err = resetLegacyUnattemptedDispatch(t, s, run.RunID)
 				if err == nil {
 					err = s.requestRunCancellation(ctx, run.RunID, "alice")
 				}
@@ -268,10 +274,10 @@ func TestPermanentRefusalKeepsItsDiagnosticWhenNoJobIsFound(t *testing.T) {
 	if lookup.lookups != 2 || execution.DispatchError == nil || execution.DispatchError.Code != contract.ErrorDispatchKeyConflict {
 		t.Fatalf("settled refusal: lookups=%d diagnostic=%+v", lookup.lookups, execution.DispatchError)
 	}
-	var settled int
-	if err := h.l3Store.db.QueryRow(`SELECT job_link_settled FROM runs WHERE run_id=?`, run.RunID).Scan(&settled); err != nil || settled != 1 {
-		t.Fatalf("refusal not settled: %d, %v", settled, err)
+	if !jobLinkSettled(t, h.l3Store, run.RunID) {
+		t.Fatal("refusal not settled")
 	}
+
 	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +304,7 @@ func TestTerminalRunDropsItsStagedTokenDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	var staged sql.NullString
-	if err := s.db.QueryRow(`SELECT token_delivery FROM dispatch_outbox WHERE run_id=?`, record.RunID).Scan(&staged); err != nil {
+	if err := inspectTestOutbox(s, record.RunID, func(v dispatchOutboxRecord) { staged = v.delivery }); err != nil {
 		t.Fatal(err)
 	}
 	if staged.String != token {
@@ -307,11 +313,12 @@ func TestTerminalRunDropsItsStagedTokenDelivery(t *testing.T) {
 	if err := s.rejectProtocolWrite(ctx, record.RunID, "envelope", "rejected", []byte(`{}`), "hash", "invalid envelope", errors.New("invalid envelope")); err != nil {
 		t.Fatal(err)
 	}
-	var status contract.RunState
-	if err := s.db.QueryRow(`SELECT r.status, o.token_delivery FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, record.RunID).
-		Scan(&status, &staged); err != nil {
+	failed, err := s.GetRun(ctx, record.RunID)
+	if err != nil {
 		t.Fatal(err)
 	}
+	status := failed.Status
+	staged = linkTestOutbox(t, s, record.RunID).delivery
 	if status != contract.RunFailed || staged.Valid {
 		t.Fatalf("failed run status=%s staged delivery=%v, want failed with no bearer", status, staged)
 	}

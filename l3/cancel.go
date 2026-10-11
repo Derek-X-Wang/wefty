@@ -35,11 +35,11 @@ func (s *Store) deferRunCancellation(ctx context.Context, runID string, cause er
 	if err != nil {
 		return internalError(err, "encode cancellation failure")
 	}
-	var failures int
-	if err := s.db.QueryRowContext(ctx, `SELECT failures FROM run_cancellations WHERE run_id=?`, runID).Scan(&failures); err != nil {
+	view, err := readRunCancellationView(ctx, s.db, runID)
+	if err != nil {
 		return internalError(err, "read cancellation failures")
 	}
-	return s.writeCancellationBackoff(ctx, runID, failures, s.recoveryNow().Add(unrecordedDispatchBackoff(failures)), string(payload))
+	return s.writeCancellationBackoff(ctx, runID, view.failures, s.recoveryNow().Add(unrecordedDispatchBackoff(view.failures)), string(payload))
 }
 
 func (s *Store) refuseRunCancellation(ctx context.Context, runID string, cause error) error {

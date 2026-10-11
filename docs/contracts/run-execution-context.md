@@ -1637,7 +1637,26 @@ record and every other program field unchanged, and dispatches by the frozen
 top-level digest; later observations and tag movement cannot replace it. If no accepted
 observation exists, rerun creation fails with `no_resolved_image_snapshot`.
 
-## Run job link for public readers
+## Run job link
+
+Link knowledge is separate from Run outcome, submission eligibility and cancel
+delivery. It is `unknown`, `attempted-unconfirmed`, `linked`, `missing-settled`,
+or `regressed`. Provisional absence and transient lookup failures share the
+attempted-unconfirmed state; backoff counters do not prove absence.
+
+An acknowledgement confirms a Job but never replaces a known identity. A
+fresh lookup bound to the dispatch key or acknowledged Job can supersede a
+settled absence. A delayed acknowledgement cannot undo a later regression;
+contradicted stored evidence cannot restore a link. Every write rechecks the
+current identity and ownership in its transaction. L1 calls occur outside it.
+
+Any cancellation record owns the Run immediately and blocks submission and
+ordinary recovery writes. Positive evidence is handed to cancellation, linking
+the Job and reopening delivery atomically. New local settlements say
+`canceled before dispatch was confirmed`. Late confirmation delivers the cancel
+and reports its outcome in the existing cancellation fields, while terminal
+reason, status, timestamps and token expiry stay unchanged. See
+[state-machines.md](state-machines.md#run-cancellation-691) for delivery rules.
 
 Run show, execution, logs and result obtain link knowledge through the Run job
 link module. Only the Run's own Job reference is public evidence of a confirmed

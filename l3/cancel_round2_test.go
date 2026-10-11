@@ -110,9 +110,8 @@ func TestPersonAdminHasNoL3CancelAuthority(t *testing.T) {
 	run := h.submit(inlineRunRequest("exit 0\n"), "admin-l3-forbidden")
 	status, _, body := h.do(caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorForbidden)
-	var count int
-	if err := h.l3Store.db.QueryRow(`SELECT COUNT(*) FROM run_cancellations WHERE run_id=?`, run.RunID).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("forbidden request recorded intent=%d %v", count, err)
+	if intent := linkTestCancellation(t, h.l3Store, run.RunID); intent.requested.Valid {
+		t.Fatalf("forbidden request recorded intent: %+v", intent)
 	}
 }
 
@@ -220,7 +219,7 @@ func TestCancelRound2Ledger401HTTP(t *testing.T) {
 				t.Fatalf("not retryable: %s", body)
 			}
 			var completed sql.NullInt64
-			if err := h.l3Store.db.QueryRow(`SELECT completed_ns FROM run_cancellations WHERE run_id=?`, run.RunID).Scan(&completed); err != nil || completed.Valid {
+			if err := inspectTestCancellation(h.l3Store, run.RunID, func(v runCancellationView) { completed = v.completed }); err != nil || completed.Valid {
 				t.Fatalf("401 settled intent: %v %v", completed, err)
 			}
 
@@ -257,7 +256,7 @@ func TestCancelRound2SuccessfulDeliveryClearsFailure(t *testing.T) {
 	var failures int
 	var last sql.NullString
 	var completed sql.NullInt64
-	if err := s.db.QueryRow(`SELECT failures,last_error,completed_ns FROM run_cancellations WHERE run_id=?`, run.RunID).Scan(&failures, &last, &completed); err != nil {
+	if err := inspectTestCancellation(s, run.RunID, func(v runCancellationView) { failures = v.failures; last = v.lastError; completed = v.completed }); err != nil {
 		t.Fatal(err)
 	}
 	if failures != 0 || last.Valid || completed.Valid {
@@ -285,12 +284,19 @@ func TestCompleteDispatchRejectsEmptyJobID(t *testing.T) {
 				failRunAfterDispatchAttempt(t, s, run.RunID)
 			}
 			snapshot := func() string {
-				var value string
-				err := s.db.QueryRow(`SELECT json_object('state', r.status, 'job', r.l1_job_id, 'updated', r.updated_ns, 'outbox_job', o.job_id, 'dispatched', o.dispatched_ns, 'delivery', o.token_delivery) FROM runs r JOIN dispatch_outbox o USING(run_id) WHERE r.run_id=?`, run.RunID).Scan(&value)
+				observed, err := readDispatchObservation(ctx, s.db, run.RunID)
 				if err != nil {
 					t.Fatal(err)
 				}
-				return value
+				record, err := s.GetRun(ctx, run.RunID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw, err := json.Marshal(record)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return fmt.Sprintf("%#v/%#v/%s", observed, linkTestOutbox(t, s, run.RunID), raw)
 			}
 			before := snapshot()
 			if err := s.completeDispatch(ctx, run.RunID, ""); err == nil {

@@ -25,7 +25,7 @@ type linkKnowledgeFixture struct {
 
 func linkID(id string) *string { return &id }
 
-func buildLinkKnowledge(t *testing.T, s *Store, runID string, fixture linkKnowledgeFixture) {
+func buildLegacyOrCorruptLinkKnowledge(t *testing.T, s *Store, runID string, fixture linkKnowledgeFixture) {
 	t.Helper()
 	var attempted, dispatched any
 	if fixture.attemptedAt != nil {
@@ -217,17 +217,19 @@ func recordOutboxOnlyAcknowledgementKeepingError(ctx context.Context, store *Sto
 // settle an unacknowledged dispatch's absence.
 func ageDispatchAttemptPastSettleHorizon(t *testing.T, store *Store, runID string) {
 	t.Helper()
-	if _, err := store.db.Exec(`UPDATE runs SET dispatch_attempt_ns=dispatch_attempt_ns-?, job_link_retry_ns=0 WHERE run_id=?`,
-		int64(unrecordedDispatchSettleHorizon+time.Minute), runID); err != nil {
-		t.Fatal(err)
-	}
+	// Advance the fixture clock past both the absence horizon and retry cap.
+	// The production attempt and backoff remain intact.
+	store.clock = &mutableClock{now: store.clock.Now().Add(unrecordedDispatchSettleHorizon + time.Minute)}
 }
 
 func jobLinkBackoff(t *testing.T, s *Store, dispatchKey string) (int, time.Time) {
 	t.Helper()
-	var failures int
-	var retryNS int64
-	if err := s.db.QueryRow(`SELECT job_link_failures, job_link_retry_ns FROM runs WHERE dispatch_key=?`, dispatchKey).Scan(&failures, &retryNS); err != nil {
+	var runID string
+	if err := s.db.QueryRow(`SELECT run_id FROM runs WHERE dispatch_key=?`, dispatchKey).Scan(&runID); err != nil {
+		t.Fatal(err)
+	}
+	failures, retryNS, err := readRecoveryBackoff(t.Context(), s.db, runID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	return failures, time.Unix(0, retryNS).UTC()
@@ -235,11 +237,11 @@ func jobLinkBackoff(t *testing.T, s *Store, dispatchKey string) (int, time.Time)
 
 func jobLinkSettled(t *testing.T, s *Store, runID string) bool {
 	t.Helper()
-	var settled int
-	if err := s.db.QueryRow(`SELECT job_link_settled FROM runs WHERE run_id=?`, runID).Scan(&settled); err != nil {
+	observed, err := readDispatchObservation(t.Context(), s.db, runID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return settled == 1
+	return observed.settled
 }
 
 // Recovery fixtures preserve the rest of the captured link while modeling
@@ -261,31 +263,37 @@ func corruptRecoveryOutboxKey(t *testing.T, s *Store, runID, key string) {
 
 func recoveryAttemptTimes(t *testing.T, s *Store, key string) (sql.NullInt64, int64) {
 	t.Helper()
-	var attempt sql.NullInt64
-	var finished int64
-	if err := s.db.QueryRow(`SELECT dispatch_attempt_ns, finished_ns FROM runs WHERE dispatch_key=?`, key).Scan(&attempt, &finished); err != nil {
+	var runID string
+	if err := s.db.QueryRow(`SELECT run_id FROM runs WHERE dispatch_key=?`, key).Scan(&runID); err != nil {
 		t.Fatal(err)
 	}
-	return attempt, finished
+	observed, err := readDispatchObservation(t.Context(), s.db, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.GetRun(t.Context(), runID)
+	if err != nil || run.FinishedAt == nil {
+		t.Fatalf("terminal run: %+v %v", run, err)
+	}
+	return observed.attempted, run.FinishedAt.UnixNano()
 }
 
 func recoveryRunAttemptTime(t *testing.T, s *Store, runID string) sql.NullInt64 {
 	t.Helper()
-	var attempt sql.NullInt64
-	if err := s.db.QueryRow(`SELECT dispatch_attempt_ns FROM runs WHERE run_id=?`, runID).Scan(&attempt); err != nil {
+	observed, err := readDispatchObservation(t.Context(), s.db, runID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return attempt
+	return observed.attempted
 }
 
 func snapshotDispatchAcknowledgement(t *testing.T, s *Store, runID string) (string, sql.NullInt64) {
 	t.Helper()
-	var job string
-	var dispatched sql.NullInt64
-	if err := s.db.QueryRow(`SELECT job_id,dispatched_ns FROM dispatch_outbox WHERE run_id=?`, runID).Scan(&job, &dispatched); err != nil {
+	observed, err := readDispatchObservation(t.Context(), s.db, runID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return job, dispatched
+	return observed.outboxJob.String, observed.dispatched
 }
 
 // Query-plan inspection is a storage-level exception: recovery must walk the
@@ -321,4 +329,81 @@ func removeRecoveryAttemptColumn(t *testing.T, s *Store) {
 func clearRecoveryAttemptTimes(t *testing.T, s *Store) {
 	t.Helper()
 	migrationFixtureSQL(t, s, `UPDATE runs SET dispatch_attempt_ns=NULL`)
+}
+func (s *Store) ensureRunToken(ctx context.Context, runID string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", internalError(err, "begin run token mint")
+	}
+	defer tx.Rollback()
+	token, err := ensureRunTokenTx(ctx, tx, runID, canonicalTime(s.clock.Now()))
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", internalError(err, "commit run token mint")
+	}
+	return token, nil
+}
+
+func linkTestOutbox(t *testing.T, s *Store, runID string) dispatchOutboxRecord {
+	t.Helper()
+	v, err := readDispatchOutbox(t.Context(), s.db, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+func linkTestCancellation(t *testing.T, s *Store, runID string) runCancellationView {
+	t.Helper()
+	v, err := readRunCancellationView(t.Context(), s.db, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+// Ordinary fixtures drive the production transition. Other shapes deliberately
+// model partial legacy acknowledgements, settled history or corrupt identities.
+func buildLinkKnowledge(t *testing.T, s *Store, runID string, f linkKnowledgeFixture) {
+	t.Helper()
+	if f.runJob == nil && f.outboxJob == nil && !f.settled && f.diagnostic == nil && f.cancellation == "" && f.attemptedAt == nil {
+		return
+	}
+	observed, observeErr := readDispatchObservation(t.Context(), s.db, runID)
+	if observeErr != nil {
+		t.Fatal(observeErr)
+	}
+	canAcknowledge := observed.state == contract.RunPending || observed.state == contract.RunDispatching || observed.state == contract.RunSucceeded || observed.state == contract.RunFailed || observed.runJob.Valid
+	if canAcknowledge && (!observed.runJob.Valid || f.runJob != nil && observed.runJob.String == *f.runJob) && (!observed.outboxJob.Valid || f.outboxJob != nil && observed.outboxJob.String == *f.outboxJob) && f.runJob != nil && f.outboxJob != nil && *f.runJob != "" && *f.runJob == *f.outboxJob && f.acknowledged && !f.settled && f.diagnostic == nil && f.cancellation == "" {
+		if err := s.completeDispatch(t.Context(), runID, *f.runJob); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	buildLegacyOrCorruptLinkKnowledge(t, s, runID, f)
+}
+
+// resetLegacyUnattemptedDispatch models a retry row left by older ledgers
+// whose submit-attempt timestamp was absent. Current beginDispatch always stamps it.
+func resetLegacyUnattemptedDispatch(t *testing.T, s *Store, runID string) error {
+	_, err := s.db.Exec(`UPDATE runs SET dispatch_attempt_ns=NULL WHERE run_id=?`, runID)
+	return err
+}
+
+func inspectTestOutbox(s *Store, runID string, inspect func(dispatchOutboxRecord)) error {
+	v, err := readDispatchOutbox(context.Background(), s.db, runID)
+	if err != nil {
+		return err
+	}
+	inspect(v)
+	return nil
+}
+func inspectTestCancellation(s *Store, runID string, inspect func(runCancellationView)) error {
+	v, err := readRunCancellationView(context.Background(), s.db, runID)
+	if err != nil {
+		return err
+	}
+	inspect(v)
+	return nil
 }

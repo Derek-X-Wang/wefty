@@ -29,7 +29,7 @@
       },
     "schema_version": { "const": 1 },
     "run_id": { "$ref": "#/$defs/id" },
-    "l1_job_id": { "$ref": "#/$defs/id" },
+    "l1_job_id": { "$ref": "#/$defs/id", "description": "The Run's confirmed Job reference. Outbox and diagnostic identities alone are not public links. A regressed Run retains its original confirmed Job identity; link knowledge is independent of Run outcome." },
     "node_id": { "$ref": "#/$defs/id" },
     "parent_run_id": { "$ref": "#/$defs/id" },
     "dispatch_key": { "$ref": "#/$defs/id" },

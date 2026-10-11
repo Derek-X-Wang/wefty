@@ -95,7 +95,7 @@ func TestCancelFollowupIdentityFailuresRetry(t *testing.T) {
 			}
 			var completed sql.NullInt64
 			var retry int64
-			if err := s.db.QueryRow(`SELECT completed_ns,retry_ns FROM run_cancellations WHERE run_id=?`, run.RunID).Scan(&completed, &retry); err != nil {
+			if err := inspectTestCancellation(s, run.RunID, func(v runCancellationView) { completed = v.completed; retry = v.retry }); err != nil {
 				t.Fatal(err)
 			}
 			if completed.Valid || retry <= clock.now.UnixNano() {
@@ -164,7 +164,7 @@ func TestCancelFollowupLegacyOutboxAcknowledgement(t *testing.T) {
 				t.Fatalf("legacy job = %+v %v", observed, err)
 			}
 			var completed sql.NullInt64
-			if err := h.l3Store.db.QueryRow(`SELECT completed_ns FROM run_cancellations WHERE run_id=?`, run.RunID).Scan(&completed); err != nil || !completed.Valid {
+			if err := inspectTestCancellation(h.l3Store, run.RunID, func(v runCancellationView) { completed = v.completed }); err != nil || !completed.Valid {
 				t.Fatalf("legacy cancel not settled: %v %v", completed, err)
 			}
 			if after := snapshotTerminalRun(t, h.l3Store, run.RunID); !reflect.DeepEqual(before, after) {
@@ -196,7 +196,7 @@ func TestCancelFollowupRepeatResetsBackoff(t *testing.T) {
 	}
 	var failures int
 	var completed sql.NullInt64
-	if err := h.l3Store.db.QueryRow(`SELECT failures,completed_ns FROM run_cancellations WHERE run_id=?`, run.RunID).Scan(&failures, &completed); err != nil || failures != 0 || !completed.Valid {
+	if err := inspectTestCancellation(h.l3Store, run.RunID, func(v runCancellationView) { failures = v.failures; completed = v.completed }); err != nil || failures != 0 || !completed.Valid {
 		t.Fatalf("repeat not reset/settled: failures=%d completed=%v err=%v", failures, completed, err)
 	}
 }

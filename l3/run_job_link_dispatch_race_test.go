@@ -86,7 +86,14 @@ func TestRetryForARunThatEndedBeforeItsAttemptDoesNotSubmit(t *testing.T) {
 	}
 	var attempts, tokensAfter int
 	var delivery *string
-	if err := h.l3Store.db.QueryRow(`SELECT attempt_count, token_delivery FROM dispatch_outbox WHERE run_id=?`, victim.RunID).Scan(&attempts, &delivery); err != nil {
+	if err := inspectTestOutbox(h.l3Store, victim.RunID, func(v dispatchOutboxRecord) {
+		attempts = v.attempts
+		if v.delivery.Valid {
+			delivery = &v.delivery.String
+		} else {
+			delivery = nil
+		}
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.l3Store.db.QueryRow(`SELECT COUNT(*) FROM run_tokens WHERE run_id=?`, victim.RunID).Scan(&tokensAfter); err != nil {
@@ -126,7 +133,14 @@ func TestBeginDispatchRefusesARunThatIsTerminal(t *testing.T) {
 	}
 	var attempts int
 	var delivery *string
-	if err := s.db.QueryRow(`SELECT attempt_count, token_delivery FROM dispatch_outbox WHERE run_id=?`, record.RunID).Scan(&attempts, &delivery); err != nil {
+	if err := inspectTestOutbox(s, record.RunID, func(v dispatchOutboxRecord) {
+		attempts = v.attempts
+		if v.delivery.Valid {
+			delivery = &v.delivery.String
+		} else {
+			delivery = nil
+		}
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if attempts != 1 || delivery != nil {

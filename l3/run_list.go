@@ -166,35 +166,37 @@ func runListQuery(status, submitter string, cursor runListCursor, limit int) (st
 		// including one at the largest representable creation timestamp.
 		cursor.CreatedNS, cursor.RunID = math.MaxInt64, "\uffff"
 	}
-	query := `
+	projection := `
 SELECT r.run_id, r.parent_run_id, r.status, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
        t.actor, t.source, t.source_run_id, t.computer_id, t.computer_attempt_id,
        t.computer_storage_generation, t.submit_intent_revision
 `
 	var args []any
+	from, beforeCursor, afterCursor := "", "", ""
+	cursorPredicate := "(r.created_ns, r.run_id) < (?, ?)"
 	order := "r.created_ns DESC, r.run_id DESC"
 	if submitter == "" {
-		query += "FROM runs r CROSS JOIN run_triggers t ON t.run_id=r.run_id WHERE "
+		from = "FROM runs r CROSS JOIN run_triggers t ON t.run_id=r.run_id WHERE "
 		if status != "" {
-			query += "r.status=? AND "
+			beforeCursor = "r.status=? AND "
 			args = append(args, status)
 		}
-		query += "(r.created_ns, r.run_id) < (?, ?)"
 	} else {
 		// Trigger and Run creation times are written together. Drive the
 		// actor-filtered walk from provenance so it seeks within that actor,
 		// even with a status filter. CROSS JOIN preserves the driving table
 		// rather than letting SQLite choose a scan and sort after ANALYZE.
-		query += "FROM run_triggers t CROSS JOIN runs r ON r.run_id=t.run_id WHERE t.actor=? AND (t.created_ns, t.run_id) < (?, ?)"
+		from = "FROM run_triggers t CROSS JOIN runs r ON r.run_id=t.run_id WHERE t.actor=? AND "
+		cursorPredicate = "(t.created_ns, t.run_id) < (?, ?)"
 		args = append(args, submitter)
 		order = "t.created_ns DESC, t.run_id DESC"
 	}
 	args = append(args, cursor.CreatedNS, cursor.RunID)
 	if submitter != "" && status != "" {
-		query += " AND r.status=?"
+		afterCursor = " AND r.status=?"
 		args = append(args, status)
 	}
-	query += " ORDER BY " + order + " LIMIT ?"
+	query := projection + from + beforeCursor + cursorPredicate + afterCursor + " ORDER BY " + order + " LIMIT ?"
 	args = append(args, limit+1)
 	return query, args
 }

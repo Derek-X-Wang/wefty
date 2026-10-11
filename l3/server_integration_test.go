@@ -404,7 +404,7 @@ func TestDispatchRecoveryCreatesExactlyOneL1JobAndPreservesScript(t *testing.T) 
 		t.Fatalf("second claim status = %d, want 204 (no duplicate job), body=%s", status, body)
 	}
 	var attempts int
-	if err := h.l3Store.db.QueryRow(`SELECT attempt_count FROM dispatch_outbox WHERE run_id=?`, accepted.RunID).Scan(&attempts); err != nil {
+	if err := inspectTestOutbox(h.l3Store, accepted.RunID, func(v dispatchOutboxRecord) { attempts = v.attempts }); err != nil {
 		t.Fatal(err)
 	}
 	if attempts != 2 {
@@ -441,7 +441,13 @@ func TestPermanentDispatchFailureFailsRunAndReleasesSucceededParent(t *testing.T
 		t.Fatalf("permanent dispatch states child/parent = %q/%q, want failed/failed", childRecord.Status, parentRecord.Status)
 	}
 	var staged *string
-	if err := h.l3Store.db.QueryRow(`SELECT token_delivery FROM dispatch_outbox WHERE run_id=?`, child.RunID).Scan(&staged); err != nil {
+	if err := inspectTestOutbox(h.l3Store, child.RunID, func(v dispatchOutboxRecord) {
+		if v.delivery.Valid {
+			staged = &v.delivery.String
+		} else {
+			staged = nil
+		}
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if staged != nil {

@@ -93,9 +93,9 @@ func TestCancelReviewPermanentRefusal(t *testing.T) {
 				t.Fatalf("state=%s want=%s", record.Status, want)
 			}
 			// The refusal is durable evidence, rather than a retrying delivery row.
-			var reason string
-			if err := h.l3Store.db.QueryRow(`SELECT last_error FROM run_cancellations WHERE run_id=? AND completed_ns IS NOT NULL`, run.RunID).Scan(&reason); err != nil || reason == "" {
-				t.Fatalf("refusal evidence=%q %v", reason, err)
+			view := linkTestCancellation(t, h.l3Store, run.RunID)
+			if !view.completed.Valid || view.lastError.String == "" {
+				t.Fatalf("refusal not retained: %+v", view)
 			}
 		})
 	}

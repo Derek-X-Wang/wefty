@@ -268,9 +268,7 @@ func TestCancelRunAbsentDispatchSettlement(t *testing.T) {
 	if _, err := h.l3Store.beginDispatch(ctx, run.RunID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.l3Store.db.Exec(`UPDATE runs SET dispatch_attempt_ns=dispatch_attempt_ns-? WHERE run_id=?`, int64(unrecordedDispatchSettleHorizon+time.Minute), run.RunID); err != nil {
-		t.Fatal(err)
-	}
+	ageDispatchAttemptPastSettleHorizon(t, h.l3Store, run.RunID)
 	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
 	if status != http.StatusOK {
 		t.Fatalf("cancel = %d %s", status, body)
