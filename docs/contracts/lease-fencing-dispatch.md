@@ -940,7 +940,14 @@ after logical settlement until attempt completion evidence has been recorded;
 a terminal canceled job alone never proves the runtime stopped. The agent
 matches all three identifiers to a resident process or OCI one-shot, requests TERM,
 waits the existing five-second grace, then forces KILL. Normal output flush,
-completion evidence, result upload and handoff retention still run. Confirmed
+completion evidence, result upload and handoff retention still run. Incomplete
+bounded log finalization hands the durable completion to ordered recovery,
+which delivers pending logs before completion while the attempt is live. The
+agent stops renewal and returns without waiting for recovery or extending the
+log-finalization bound. Cancellation during a completion request or transient
+retry backoff retains its cause and triggers an immediate identical retry
+within the existing bounded delivery budget; an exhausted retry hands the
+completion to recovery without ending the node session. Confirmed
 delivery follows the existing agent termination-initiator rule; failed signal
 delivery must not invent confirmed termination. A TERM handler's zero exit
 remains a real attempt fact, with `termination_initiator=agent`, independent of
