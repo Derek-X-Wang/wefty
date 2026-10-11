@@ -202,7 +202,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.MintReprovedComputerToken",
-    "fingerprint": "3312ef596db5a1171d233ff0dfc86d2fc7bf0fe857e7093bae6bd621f409ba53",
+    "fingerprint": "196b428a2e66d48bdcd9db5d495709be9c8fe3442c2c5ace0d40a16bbcfb3b8d",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -210,7 +210,7 @@
   {
     "file": "computer_tokens.go",
     "function": "*Store.MintReprovedComputerToken",
-    "fingerprint": "a584bed21a722ceefd89162e19c1fd65bf6c7e7e7a9653c2a78c63bcf9aaba53",
+    "fingerprint": "81087307d0b932487a7828c5e86d0fa0c5aa9d89d11089379cbf463e7b88bb93",
     "count": 1,
     "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
     "retirement": "#784"
@@ -698,7 +698,7 @@
   {
     "file": "run_job_link_boundary_test.go",
     "function": "*linkSQLPackage.sites",
-    "fingerprint": "e9c4fccfd88bc777fb1439f062b2268a9e8775ccab0682489ce197084bd7f9af",
+    "fingerprint": "270556a72a454a6c03fa45fa50fdb5b87bdb803402926b2ef10710bd11e131ac",
     "count": 1,
     "reason": "Guard implementation callbacks accept strings for AST or SQL analysis, not ledger execution; exact opaque callback exception through final guard closure.",
     "retirement": "#785"
@@ -938,7 +938,7 @@
   {
     "file": "run_token_routes_test.go",
     "function": "TestRunTokenRoutesAreExactlyWhereARunTokenIsServed",
-    "fingerprint": "9214d0cdebc7e5affdb144bb5597f35482b5c4d9b2d48e2407b785c357dd962b",
+    "fingerprint": "b674a52d49c5dd60ae92ea203f53213bd0094b093038a09660ac170eab6f1958",
     "count": 1,
     "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
@@ -946,7 +946,7 @@
   {
     "file": "server.go",
     "function": "*Server.filterVisibleLineage",
-    "fingerprint": "bd0821fa9c1900c45ac440f56b09bf970527f9c472d4b85cf2263607c7af69c8",
+    "fingerprint": "575e0063678ff39280bfb6a376917d96552d9c4559bd814828d4ad42dd04d823",
     "count": 1,
     "reason": "Existing lineage visibility function value accepts Run identity strings; conservatively opaque until reader adoption.",
     "retirement": "#783"
