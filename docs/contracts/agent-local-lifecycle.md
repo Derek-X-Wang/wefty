@@ -402,9 +402,10 @@ completion delivery, or node-local intent-suppression decision. If authority
 loss or cancellation abandons live delivery after suppression is ruled out,
 the lifecycle does not classify the cancellation cause as a `/complete`
 response. If a one-shot cancel interrupts completion after execution already
-ended, the lifecycle joins the abandoned request and immediately retries its
-identical durable completion under a bounded uncanceled context, then performs
-normal result upload and retention. Other authority loss releases ownership
+ended, during either the request or transient retry backoff, the lifecycle
+keeps cancellation provenance, joins abandoned delivery and immediately retries
+its identical durable completion under a bounded uncanceled context, then
+performs normal result upload and retention. Other authority loss releases ownership
 and wakes the bounded outbox reconciler. So does a completion L1 permanently
 rejects, on the codes on which recovery seals a completion: `invalid_request`,
 `conflict`, `idempotency_conflict`, `not_found`, `unsupported_class`,
@@ -448,8 +449,13 @@ from the owning node identity as an already-recorded success
 treats like any accepted completion -- the row is marked delivered and retired,
 with no further requests or log lines. While L1 reports the attempt as
 live, recovery drains every durable log batch before delivering the single
-completion; an accepted completion closes that attempt's log stream at L1
-(`l1/store.go`, `AppendLogs`). Once L1 reports the attempt as `lost`, the
+completion. Shutdown, one-shot cancellation, and renewal cancel/stop/restart
+directives follow the same rule: after bounded log finalization reports
+`log_evidence_incomplete`, the lifecycle persists completion, stops renewal,
+releases attempt ownership and wakes ordered recovery instead of delivering
+completion directly. It does not extend the finalization bound or wait for
+recovery before returning. An accepted completion closes that attempt's log
+stream at L1 (`l1/store.go`, `AppendLogs`). Once L1 reports the attempt as `lost`, the
 completion is late evidence, so recovery may yield after eight log batches,
 deliver the completion, and continue the remaining raw log stream on later
 passes from its acknowledged high-water mark. Reaching that per-pass bound
@@ -1079,7 +1085,8 @@ pre-start refusal evidence; it reads any available result before the normal
 `ReapAndVerify`. A canceled attempt uses the same result upload,
 publication and handoff retention rules, including unpublished retention when
 capture or upload fails. If heartbeat or renewal cancellation abandons an
-in-flight completion, the node retries the identical durable completion under
+in-flight completion or its transient retry backoff, the node retains the
+cancellation cause and retries the identical durable completion under
 the existing bounded delivery budget. A transport outage, unavailability or
 deadline that exhausts that retry releases the completion to the outbox without
 ending the agent session; recovery later delivers the same evidence. A distinct
@@ -1100,7 +1107,10 @@ error, so neither live completion delivery nor durable completion replay turns
 a plain lost attempt into a payload result. Shutdown and cancel/stop/restart
 directives keep their existing agent-terminated completion semantics: that
 completion is persisted before delivery even when Watch also reports attempt
-loss, and remains replayable after a delivery failure. L1 still fences replay.
+loss. Incomplete log finalization hands that persisted completion to ordered
+recovery; otherwise it is delivered within the existing bounded budget and
+remains replayable after a delivery failure. This exception does not manufacture
+a completion for plain helper attempt loss. L1 still fences replay.
 Other attempts, OCI capability, and helper generation remain live. The exact
 identity, bounded recognition record, and session-fatal exceptions are defined
 in [OCI helper protocol](oci-helper-protocol.md#late-attempt-renewals).

@@ -3552,3 +3552,198 @@ func failWorkload(t *testing.T, err error) (contract.ProcessResult, error) {
 	t.Error(err)
 	return contract.ProcessResult{}, err
 }
+
+// Inject the existing typed finalization fault, with real durable events behind
+// it. No short wall-clock deadline decides the delivery ordering (#163).
+type pendingFinalizationLogSink struct{ outbox *evidenceOutbox }
+
+func (sink pendingFinalizationLogSink) WriteOutput(ctx context.Context, event contract.LogEvent) error {
+	event.Timestamp = time.Now().UTC()
+	return sink.outbox.spool.append(ctx, event)
+}
+
+func (pendingFinalizationLogSink) CloseContext(context.Context) error {
+	return &logFinalizationDeadlineError{stage: logFinalizationStageUpload, cause: context.DeadlineExceeded}
+}
+
+type canceledLogRuntime struct {
+	captureRuntime
+	started chan struct{}
+}
+
+func (runtime *canceledLogRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: request.Authority.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("last output\n")}); err != nil {
+		return workloadrunner.Result{}, err
+	}
+	close(runtime.started)
+	<-ctx.Done()
+	return workloadrunner.Result{Outcome: contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}}, nil
+}
+
+func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		cause     error
+		directive l1.AttemptDirective
+		class     string
+	}{
+		{"shutdown", context.Canceled, "", contract.JobClassOneShot},
+		{"cancel", errAttemptDirectiveCancel, "", contract.JobClassOneShot},
+		{"renewal_cancel", nil, l1.AttemptDirectiveCancel, contract.JobClassOneShot},
+		{"renewal_stop", nil, l1.AttemptDirectiveStop, contract.JobClassService},
+		{"renewal_restart", nil, l1.AttemptDirectiveRestart, contract.JobClassService},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{LeaseDuration: time.Minute})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if _, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "ordered-fabric"}, contract.NodeRegistration{
+				NodeID: "ordered-node", BootSessionID: "ordered-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"kind:process": true},
+			}, l1.NodePolicy{MaxOneshotSlots: 1, MaxServiceSlots: 1}, true); err != nil {
+				t.Fatal(err)
+			}
+			spec := contract.JobSpec{
+				SchemaVersion: contract.SchemaVersionV1, DispatchKey: "ordered-" + test.name, Kind: contract.JobKindProcess, Class: test.class,
+				Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: t.TempDir()},
+			}
+			if test.class == contract.JobClassService {
+				spec.Restart = contract.RestartAlways
+			}
+			job, _, err := store.CreateJob(t.Context(), spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, err := store.ClaimJob(t.Context(), "ordered-fabric", "ordered-node", "ordered-boot", test.class)
+			if err != nil || claim == nil {
+				t.Fatalf("claim=%+v err=%v", claim, err)
+			}
+			outbox, err := newEvidenceOutbox(t.TempDir(), "ordered-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer outbox.Close()
+			runtime := &canceledLogRuntime{started: make(chan struct{})}
+			var completionCalls atomic.Int32
+			var mu sync.Mutex
+			var deliveryOrder []string
+			client, stop := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/lease") {
+					select {
+					case <-runtime.started:
+					case <-r.Context().Done():
+						return
+					}
+					lease := claim.Lease
+					lease.Directive = test.directive
+					_ = json.NewEncoder(w).Encode(lease)
+					return
+				}
+				if strings.HasSuffix(r.URL.Path, "/logs") {
+					var request l1.AppendLogsRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Error(err)
+						return
+					}
+					response, err := store.AppendLogs(r.Context(), "ordered-fabric", job.JobID, claim.Lease.AttemptID, request)
+					if err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					mu.Lock()
+					deliveryOrder = append(deliveryOrder, "logs")
+					mu.Unlock()
+					_ = json.NewEncoder(w).Encode(response)
+					return
+				}
+				if !strings.HasSuffix(r.URL.Path, "/complete") {
+					http.NotFound(w, r)
+					return
+				}
+				var request l1.CompletionRequest
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Error(err)
+					return
+				}
+				completed, err := store.CompleteAttempt(r.Context(), "ordered-fabric", job.JobID, claim.Lease.AttemptID, request)
+				if err != nil {
+					t.Error(err)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				completionCalls.Add(1)
+				mu.Lock()
+				deliveryOrder = append(deliveryOrder, "completion")
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(completed)
+			}), time.Second)
+			defer stop()
+			defer client.Close()
+			renewalInterval := time.Hour
+			if test.directive != "" {
+				renewalInterval = time.Millisecond
+			}
+			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, outbox: outbox,
+				runtimes: workloadRuntimeSet{contract.JobKindProcess: runtime}, clock: systemClock{}, renewalInterval: renewalInterval, managedResource: &preflightManagedResource{},
+				completionRetry: time.Millisecond, observer: newLifecycleObserver(systemClock{}),
+				logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
+					return pendingFinalizationLogSink{outbox}, nil
+				},
+			})
+			ctx, cancel := context.WithCancelCause(t.Context())
+			defer cancel(nil)
+			done := make(chan error, 1)
+			go func() { _, err := lifecycle.execute(ctx, *claim, time.Now()); done <- err }()
+			select {
+			case <-runtime.started:
+			case <-time.After(10 * time.Second):
+				t.Fatal("runtime did not start")
+			}
+			if test.cause != nil {
+				cancel(test.cause)
+			}
+			select {
+			case err := <-done:
+				if err != nil && !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("lifecycle did not join")
+			}
+			pending, err := outbox.spool.pending(t.Context(), claim.Lease.AttemptID, 8)
+			if err != nil || len(pending) != 1 {
+				t.Fatalf("pending=%+v err=%v", pending, err)
+			}
+			_, appendErr := store.AppendLogs(t.Context(), "ordered-fabric", job.JobID, claim.Lease.AttemptID, l1.AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: pending})
+			if completionCalls.Load() != 0 || appendErr != nil {
+				t.Fatalf("completion overtook durable logs: accepted_completions=%d pending_logs=%d L1_append_error=%v receipt=%+v", completionCalls.Load(), len(pending), appendErr, outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID))
+			}
+			// Recovery uses the production delivery path and real L1 admission.
+			// The direct append above also proves the event stayed admissible.
+			attempts, err := outbox.spool.pendingAttempts(t.Context())
+			if err != nil || len(attempts) != 1 {
+				t.Fatalf("recoverable attempts=%+v err=%v", attempts, err)
+			}
+			if err := outbox.recoverAttempt(t.Context(), client, attempts[0]); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			order := append([]string(nil), deliveryOrder...)
+			mu.Unlock()
+			if completionCalls.Load() != 1 || !reflect.DeepEqual(order, []string{"logs", "completion"}) {
+				t.Fatalf("recovery delivery order=%v accepted completions=%d", order, completionCalls.Load())
+			}
+			page, err := store.GetJobLogs(t.Context(), job.JobID, "", 8)
+			if err != nil || len(page.Events) != 1 || string(page.Events[0].Bytes) != "last output\n" || page.Events[0].Gap != nil {
+				t.Fatalf("recovered output=%+v err=%v", page, err)
+			}
+			attemptResults, err := store.ListJobAttempts(t.Context(), job.JobID)
+			if err != nil || len(attemptResults) != 1 || attemptResults[0].Result == nil || !attemptResults[0].Result.LogEvidenceIncomplete || attemptResults[0].Result.Signal != "terminated" || attemptResults[0].Result.TerminationCause != contract.TerminationCauseAgent {
+				t.Fatalf("recovered completion=%+v err=%v", attemptResults, err)
+			}
+			waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", time.Second)
+		})
+	}
+}
