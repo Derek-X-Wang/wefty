@@ -569,10 +569,24 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			// reap before it purges spool metadata or invokes managedroot.Remove.
 			return errorDestinationUnclassified, nil
 		}
-		request := completionRequest(claim, result, outcome.reapEvidence)
-		finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
-		defer cancelFinalization()
-		failure := lifecycle.completeWithRetry(finalizationContext, claim, request)
+		var failure destinationError
+		if result.LogEvidenceIncomplete && lifecycle.dependencies.outbox != nil {
+			// Keep logs ahead of completion. Directives leave Run's recovery
+			// loop alive; shutdown cancels it, so deliver this attempt inline
+			// while its lease may still admit an authoritative completion.
+			reconcileCompletion = true
+			if !errors.Is(cause, errAttemptDirectiveCancel) && !errors.Is(cause, errAttemptDirectiveStop) && !errors.Is(cause, errAttemptDirectiveRestart) && lifecycle.dependencies.outbox.recoveryStopped() {
+				recoveryContext, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+				failure.err = lifecycle.dependencies.outbox.recoverShutdownAttempt(recoveryContext, lifecycle.dependencies.client, claim)
+				cancelRecovery()
+				failure.destination = classifyAgentProtocolError(failure.err).destination
+			}
+		} else {
+			request := completionRequest(claim, result, outcome.reapEvidence)
+			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+			defer cancelFinalization()
+			failure = lifecycle.completeWithRetry(finalizationContext, claim, request)
+		}
 		if errors.Is(failure.err, errOCIIntentDisabled) {
 			return errorDestinationUnclassified, nil
 		}
@@ -601,10 +615,17 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			if err := persistCompletion(&outcome, true); err != nil {
 				return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
 			}
-			request := completionRequest(claim, result, outcome.reapEvidence)
-			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
-			defer cancelFinalization()
-			completionFailure := lifecycle.completeWithRetry(finalizationContext, claim, request)
+			var completionFailure destinationError
+			if result.LogEvidenceIncomplete && lifecycle.dependencies.outbox != nil {
+				// Directives use the same ordered handoff as normal completion,
+				// without extending finalization or waiting for recovery.
+				reconcileCompletion = true
+			} else {
+				request := completionRequest(claim, result, outcome.reapEvidence)
+				finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+				defer cancelFinalization()
+				completionFailure = lifecycle.completeWithRetry(finalizationContext, claim, request)
+			}
 			if errors.Is(completionFailure.err, errOCIIntentDisabled) {
 				return errorDestinationUnclassified, nil
 			}
@@ -911,7 +932,10 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 			select {
 			case <-ctx.Done():
 				stopTimer(timer)
-				return destinationError{destination: errorDestinationUnclassified, err: ctx.Err()}
+				// The transient response did not settle delivery. Preserve the
+				// cancellation cause just as an abandoned HTTP request does, so
+				// a one-shot cancel can retry the identical completion now.
+				return destinationError{destination: errorDestinationUnclassified, err: &completionDeliveryAbandoned{cause: context.Cause(ctx), err: ctx.Err()}}
 			case <-timer.C():
 			}
 			continue
