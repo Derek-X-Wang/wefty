@@ -173,7 +173,13 @@ func executeComputerGrant(
 			// turns a deadline-caused read or sleep failure into exit 14,
 			// as in pollStorageObservation (#722).
 			if ctx.Err() != nil {
-				return ctx.Err()
+				result.ObservationState = "failed"
+				result.ObservationFailure = ctx.Err().Error()
+				observationErr := fmt.Errorf("%s: %w", computerGrantObservationMessage(result, "observation failed"), ctx.Err())
+				if writeErr := writeComputerGrantMutation(stdout, result, jsonOutput); writeErr != nil {
+					return errors.Join(observationErr, writeErr)
+				}
+				return observationErr
 			}
 			if waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
 				if lastRetryable != nil {
@@ -214,9 +220,6 @@ func executeComputerGrant(
 			// A good read clears the record: the timeout names a retryable
 			// answer only when the reads at the end were retryable.
 			lastRetryable = nil
-			if err := waitCtx.Err(); err != nil {
-				return fail(err)
-			}
 			result.Revocation = &revocation
 			result.LastObservedRevocation = &revocation
 		}

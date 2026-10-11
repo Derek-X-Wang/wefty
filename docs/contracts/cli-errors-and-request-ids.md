@@ -136,8 +136,11 @@ outcome (exit 14) with the last answer recorded in
 `details.observation_failure`, including when the deadline interrupts the next
 read. One elapsed-time deadline bounds polling delays and every revocation
 read, including response-body reads; slow answers cannot extend
-`--wait-timeout`. Caller cancellation during a delay or read remains a local
-failure (exit 1, `retryable=false`). A non-retryable read error still reports
+`--wait-timeout`. An answer received before the deadline check is accepted.
+Caller cancellation during a delay or read is now a local failure (exit 1,
+`retryable=false`), with the mutation receipt and last observed revocation on
+stdout in both JSON and human output, and an observation-failed message on
+stderr. A non-retryable read error still reports
 `revocation_observation_failed` at once. `services grant` does not accept `--wait`.
 
 Typed outcomes (custody exits 6–9,

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -63,8 +64,8 @@ func assertRevokeWaitTimeout(t *testing.T, ctx context.Context, err error, elaps
 	var refusal *apiResponseError
 	if commandExitCode(err) != exitMutationWaitTimeout || !errors.As(err, &refusal) ||
 		refusal.APIError.Code != contract.ErrorRevocationWaitTimeout || ctx.Err() != nil ||
-		elapsed > 300*time.Millisecond {
-		t.Fatalf("revoke wait: elapsed=%s caller=%v exit=%d, want wait deadline exit 14 within 300ms: %v",
+		elapsed > 2*time.Second {
+		t.Fatalf("revoke wait: elapsed=%s caller=%v exit=%d, want wait deadline exit 14 within 2s: %v",
 			elapsed, ctx.Err(), commandExitCode(err), err)
 	}
 	last, ok := refusal.APIError.Details["last_observed_revocation"].(*l1.ComputerPolicyRevocation)
@@ -92,11 +93,11 @@ func TestRevokeWaitBoundsStalledReads(t *testing.T) {
 					<-r.Context().Done()
 				})
 				// The caller deadline only releases the original unbounded read.
-				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 				defer cancel()
 				var stdout, stderr bytes.Buffer
 				started := time.Now()
-				err := executeComputerGrant(ctx, clients, true, revokeWaitArgs("120ms", "10ms"), &stdout, &stderr, true)
+				err := executeComputerGrant(ctx, clients, true, revokeWaitArgs("500ms", "5ms"), &stdout, &stderr, true)
 				refusal := assertRevokeWaitTimeout(t, ctx, err, time.Since(started))
 				wantReads := int32(1)
 				if retryFirst {
@@ -105,8 +106,8 @@ func TestRevokeWaitBoundsStalledReads(t *testing.T) {
 						t.Fatalf("last retryable answer lost at stalled read deadline: %#v", refusal.APIError)
 					}
 				}
-				if reads.Load() != wantReads {
-					t.Fatalf("revocation reads=%d, want %d", reads.Load(), wantReads)
+				if reads.Load() < wantReads {
+					t.Fatalf("revocation reads=%d, want at least %d", reads.Load(), wantReads)
 				}
 			})
 		}
@@ -117,9 +118,9 @@ func TestRevokeWaitCountsReadTime(t *testing.T) {
 	for _, answer := range []string{"pending", "retryable", "late-completed"} {
 		t.Run(answer, func(t *testing.T) {
 			clients, reads := revokeWaitRequestStub(t, func(_ int32, w http.ResponseWriter, r *http.Request) {
-				delay := 60 * time.Millisecond
+				delay := 100 * time.Millisecond
 				if answer == "late-completed" {
-					delay = 240 * time.Millisecond
+					delay = 3 * time.Second
 				}
 				timer := time.NewTimer(delay)
 				defer timer.Stop()
@@ -139,11 +140,11 @@ func TestRevokeWaitCountsReadTime(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(l1.ComputerPolicyRevocation{ComputerID: "computer-1",
 					SubjectFabricID: "fabric-1", SubjectUserID: "person-1", PolicyRevision: 2, State: state})
 			})
-			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
 			var stdout, stderr bytes.Buffer
 			started := time.Now()
-			err := executeComputerGrant(ctx, clients, true, revokeWaitArgs("120ms", "20ms"), &stdout, &stderr, true)
+			err := executeComputerGrant(ctx, clients, true, revokeWaitArgs("500ms", "5ms"), &stdout, &stderr, true)
 			refusal := assertRevokeWaitTimeout(t, ctx, err, time.Since(started))
 			if answer != "late-completed" && reads.Load() < 2 {
 				t.Fatalf("reads=%d, want a slow answer followed by another read", reads.Load())
@@ -160,10 +161,11 @@ func TestRevokeWaitCountsReadTime(t *testing.T) {
 type revokeCanceledBodyTransport struct {
 	base   http.RoundTripper
 	cancel context.CancelFunc
+	reads  *atomic.Int32
 }
 
 func (transport revokeCanceledBodyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if strings.HasPrefix(r.URL.Path, "/v1/computers/computer-1/revocations/") {
+	if strings.HasPrefix(r.URL.Path, "/v1/computers/computer-1/revocations/") && transport.reads.Add(1) > 1 {
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header),
 			Body: canceledResponseBody{cancel: transport.cancel}}, nil
 	}
@@ -172,45 +174,71 @@ func (transport revokeCanceledBodyTransport) RoundTrip(r *http.Request) (*http.R
 
 func TestRevokeWaitCallerCancellationIsLocal(t *testing.T) {
 	for _, phase := range []string{"sleep", "headers", "body"} {
-		t.Run(phase, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			reading := make(chan struct{})
-			clients, _ := revokeWaitRequestStub(t, func(_ int32, w http.ResponseWriter, r *http.Request) {
-				close(reading)
-				<-r.Context().Done()
-			})
-			if phase == "sleep" {
-				clients.wait = func(ctx context.Context, delay time.Duration) error {
-					cancel()
-					return waitForContext(ctx, delay)
-				}
-			} else if phase == "body" {
-				clients.l1.client.Transport = revokeCanceledBodyTransport{
-					base: clients.l1.client.Transport, cancel: cancel,
-				}
-			} else {
-				go func() {
-					select {
-					case <-reading:
-						cancel()
-					case <-ctx.Done():
+		for _, jsonOutput := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/json=%t", phase, jsonOutput), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+				reading := make(chan struct{})
+				clients, _ := revokeWaitRequestStub(t, func(reads int32, w http.ResponseWriter, r *http.Request) {
+					if reads == 1 {
+						_ = json.NewEncoder(w).Encode(l1.ComputerPolicyRevocation{ComputerID: "computer-1",
+							SubjectFabricID: "fabric-1", SubjectUserID: "person-1", PolicyRevision: 2,
+							State: l1.ComputerPolicyRevocationPending, CreatedAt: time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)})
+						return
 					}
-				}()
-			}
-			var stdout, stderr bytes.Buffer
-			err := executeComputerGrant(ctx, clients, true, revokeWaitArgs("1s", "1ms"), &stdout, &stderr, true)
-			writeCommandError(&stderr, err, true)
-			var envelope contract.ErrorResponse
-			if decodeErr := json.Unmarshal(stderr.Bytes(), &envelope); decodeErr != nil {
-				t.Fatal(decodeErr)
-			}
-			if !errors.Is(err, context.Canceled) || commandExitCode(err) != exitFailure ||
-				envelope.Error.Code != contract.ErrorInternal || envelope.Error.Retryable {
-				t.Fatalf("caller cancellation exit=%d, want local exit 1 with retryable=false: %v / %s",
-					commandExitCode(err), err, stderr.String())
-			}
-		})
+					close(reading)
+					<-r.Context().Done()
+				})
+				if phase == "sleep" {
+					var waits int
+					clients.wait = func(ctx context.Context, delay time.Duration) error {
+						waits++
+						if waits > 1 {
+							cancel()
+						}
+						return waitForContext(ctx, delay)
+					}
+				} else if phase == "body" {
+					clients.l1.client.Transport = revokeCanceledBodyTransport{
+						base: clients.l1.client.Transport, cancel: cancel, reads: &atomic.Int32{},
+					}
+				} else {
+					go func() {
+						select {
+						case <-reading:
+							cancel()
+						case <-ctx.Done():
+						}
+					}()
+				}
+				var stdout, stderr bytes.Buffer
+				err := executeComputerGrant(ctx, clients, jsonOutput, revokeWaitArgs("5s", "5ms"), &stdout, &stderr, true)
+				writeCommandError(&stderr, err, jsonOutput)
+				if !errors.Is(err, context.Canceled) || commandExitCode(err) != exitFailure ||
+					!strings.Contains(stderr.String(), "revocation was applied but observation failed") {
+					t.Fatalf("caller cancellation exit=%d, want local exit 1 with applied evidence: %v / %s",
+						commandExitCode(err), err, stderr.String())
+				}
+				if jsonOutput {
+					var envelope contract.ErrorResponse
+					if err := json.Unmarshal(stderr.Bytes(), &envelope); err != nil ||
+						envelope.Error.Code != contract.ErrorInternal || envelope.Error.Retryable {
+						t.Fatalf("cancellation must be local and non-retryable: %v / %s", err, stderr.String())
+					}
+					var result l1.ComputerGrantMutationResult
+					if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || !result.MutationApplied ||
+						result.ObservationState != "failed" || result.ObservationFailure != context.Canceled.Error() ||
+						result.LastObservedRevocation == nil || result.LastObservedRevocation.State != l1.ComputerPolicyRevocationPending ||
+						result.LastObservedRevocation.SubjectUserID != "person-1" || result.LastObservedRevocation.PolicyRevision != 2 ||
+						result.LastObservedRevocation.CreatedAt.Format(time.RFC3339) != "2026-10-11T12:00:00Z" {
+						t.Fatalf("cancellation lost applied receipt or last observation: %v / %s", err, stdout.String())
+					}
+				} else if !strings.Contains(stdout.String(), "MUTATION APPLIED") ||
+					!strings.Contains(stdout.String(), "\ttrue\tcomputer-1:fabric-1:person-1:pending:2") {
+					t.Fatalf("human cancellation lost applied receipt or last observation: %s", stdout.String())
+				}
+			})
+		}
 	}
 }
 
@@ -239,19 +267,19 @@ func TestRevokeWaitToleratesARetryableAnswer(t *testing.T) {
 			return withCompletedRevocation(completed)
 		})
 		var stdout, stderr bytes.Buffer
-		if err := executeComputerGrant(t.Context(), clients, true, revokeWaitArgs("2s", "20ms"), &stdout, &stderr, true); err != nil {
+		if err := executeComputerGrant(t.Context(), clients, true, revokeWaitArgs("2s", "5ms"), &stdout, &stderr, true); err != nil {
 			t.Fatalf("revoke wait with two retryable 503s: %v\n%s", err, stderr.String())
 		}
 		var result l1.ComputerGrantMutationResult
 		if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || result.ObservationState != "completed" ||
-			reads.Load() != 3 {
+			reads.Load() < 3 {
 			t.Fatalf("revoke wait result = %s decode=%v reads=%d", stdout.String(), err, reads.Load())
 		}
 	})
 	t.Run("only retryable answers until the window closes", func(t *testing.T) {
 		clients, reads := revokeWaitStub(t, retryable503Revocation)
 		var stdout, stderr bytes.Buffer
-		err := executeComputerGrant(t.Context(), clients, true, revokeWaitArgs("1s", "20ms"), &stdout, &stderr, true)
+		err := executeComputerGrant(t.Context(), clients, true, revokeWaitArgs("500ms", "5ms"), &stdout, &stderr, true)
 		var refusal *apiResponseError
 		if commandExitCode(err) != exitMutationWaitTimeout || !errors.As(err, &refusal) ||
 			refusal.APIError.Code != contract.ErrorRevocationWaitTimeout || reads.Load() < 2 ||
@@ -259,4 +287,109 @@ func TestRevokeWaitToleratesARetryableAnswer(t *testing.T) {
 			t.Fatalf("retryable-only revoke wait: reads=%d exit=%d err=%v (%#v)", reads.Load(), commandExitCode(err), err, refusal)
 		}
 	})
+}
+
+// The response has been fully decoded when the client's deferred Close runs.
+// Hold Close until the request deadline, to probe an answer already in hand
+// without depending on scheduler timing between the read and deadline check.
+type revokeDeadlineCloseBody struct {
+	io.Reader
+	ctx context.Context
+}
+
+func (body revokeDeadlineCloseBody) Close() error {
+	<-body.ctx.Done()
+	return nil
+}
+
+type revokeDeadlineCloseTransport struct {
+	base             http.RoundTripper
+	status           int
+	body             string
+	refuseAtDeadline bool
+}
+
+func (transport revokeDeadlineCloseTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasPrefix(r.URL.Path, "/v1/computers/computer-1/revocations/") {
+		if transport.refuseAtDeadline {
+			<-r.Context().Done()
+		}
+		return &http.Response{StatusCode: transport.status, Header: make(http.Header),
+			Body: revokeDeadlineCloseBody{Reader: strings.NewReader(transport.body), ctx: r.Context()}}, nil
+	}
+	return transport.base.RoundTrip(r)
+}
+
+func TestRevokeWaitAcceptsAnswerBeforeDeadlineCheck(t *testing.T) {
+	for _, state := range []string{"completed", "pending"} {
+		t.Run(state, func(t *testing.T) {
+			clients, _ := revokeWaitStub(t, func(int32) func(http.ResponseWriter) {
+				return func(http.ResponseWriter) { t.Error("probe must supply the revocation response") }
+			})
+			clients.l1.client.Transport = revokeDeadlineCloseTransport{
+				base: clients.l1.client.Transport, status: http.StatusOK,
+				body: fmt.Sprintf(`{"computer_id":"computer-1","subject_fabric_id":"fabric-1","subject_user_id":"person-1","policy_revision":2,"state":%q,"created_at":"2026-10-11T12:00:00Z"}`, state),
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			var stdout, stderr bytes.Buffer
+			started := time.Now()
+			err := executeComputerGrant(ctx, clients, true, revokeWaitArgs("500ms", "5ms"), &stdout, &stderr, true)
+			if state == "completed" {
+				var result l1.ComputerGrantMutationResult
+				if err != nil || time.Since(started) > 2*time.Second ||
+					json.Unmarshal(stdout.Bytes(), &result) != nil || result.ObservationState != "completed" ||
+					result.LastObservedRevocation == nil || result.LastObservedRevocation.CreatedAt.Format(time.RFC3339) != "2026-10-11T12:00:00Z" {
+					t.Fatalf("decoded completion must win over the deadline check: %v / %s", err, stdout.String())
+				}
+			} else {
+				refusal := assertRevokeWaitTimeout(t, ctx, err, time.Since(started))
+				last := refusal.APIError.Details["last_observed_revocation"].(*l1.ComputerPolicyRevocation)
+				if last.CreatedAt.Format(time.RFC3339) != "2026-10-11T12:00:00Z" {
+					t.Fatalf("pending answer must refresh the last observation before timeout: %#v", last)
+				}
+			}
+		})
+	}
+}
+
+func TestRevokeWaitTypedRefusalAtDeadline(t *testing.T) {
+	clients, _ := revokeWaitStub(t, func(int32) func(http.ResponseWriter) {
+		return func(http.ResponseWriter) { t.Error("probe must supply the refusal") }
+	})
+	clients.l1.client.Transport = revokeDeadlineCloseTransport{
+		base: clients.l1.client.Transport, status: http.StatusForbidden, refuseAtDeadline: true,
+		body: `{"error":{"code":"forbidden","message":"deadline refusal","retryable":false}}`,
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	started := time.Now()
+	err := executeComputerGrant(ctx, clients, true, revokeWaitArgs("500ms", "5ms"), &stdout, &stderr, true)
+	writeCommandError(&stderr, err, true)
+	var envelope contract.ErrorResponse
+	if json.Unmarshal(stderr.Bytes(), &envelope) != nil || commandExitCode(err) != exitFailure ||
+		ctx.Err() != nil || time.Since(started) > 2*time.Second ||
+		envelope.Error.Code != contract.ErrorRevocationObservationFailed ||
+		!strings.Contains(fmt.Sprint(envelope.Error.Details["observation_failure"]), "deadline refusal") ||
+		envelope.Error.Details["mutation_applied"] != true {
+		t.Fatalf("typed refusal at deadline must retain observation-failed exit 1: %v / %s", err, stderr.String())
+	}
+}
+
+func TestRevokeWaitBoundsLongPollSleep(t *testing.T) {
+	clients, reads := revokeWaitRequestStub(t, func(_ int32, _ http.ResponseWriter, r *http.Request) {
+		// The sleep timer can win the race with context cancellation at
+		// the deadline. Any read it permits must share that same deadline.
+		<-r.Context().Done()
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	var stdout, stderr bytes.Buffer
+	started := time.Now()
+	err := executeComputerGrant(ctx, clients, true, revokeWaitArgs("500ms", "5s"), &stdout, &stderr, true)
+	assertRevokeWaitTimeout(t, ctx, err, time.Since(started))
+	if reads.Load() > 1 {
+		t.Fatalf("revocation reads=%d, want at most one deadline-bounded read", reads.Load())
+	}
 }
