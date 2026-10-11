@@ -213,7 +213,7 @@ func (s *Server) getRunExecution(w http.ResponseWriter, r *http.Request) {
 				s.writeError(w, r, readErr)
 				return
 			}
-			if run.Status != contract.RunFailed || run.L1JobID != projection.L1JobID {
+			if (run.Status != contract.RunFailed && run.Status != contract.RunSucceeded) || run.L1JobID != projection.L1JobID {
 				s.writeError(w, r, err)
 				return
 			}

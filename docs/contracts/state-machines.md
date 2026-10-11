@@ -1370,8 +1370,17 @@ The Run's recorded terminal reason, status and timestamps never change, and
 its token is neither minted nor extended. Existing rows keep their old reason.
 An ambiguous dispatch is never replayed to create work after cancellation.
 
-A typed non-retryable L1 cancel refusal ends delivery and is retained with its
-reason on the Run read as `cancel_status=refused` and `cancel_reason`. A
+For every terminal linked Run, including a migrated link whose validation is
+not yet due, a cancel `not_found` triggers an identity-bound `GetJob` read.
+Authoritative absence records `l1_regressed` through the terminal-link
+transition and settles delivery with nothing to cancel (`cancel_status=settled`
+without a reason). The write rechecks the captured identity and observation;
+terminal reason, status, timestamps and token expiry remain unchanged.
+A cancel `not_found` alone does not establish absence.
+
+A typed non-retryable L1 cancel refusal without this terminal authoritative
+absence ends delivery and is retained with its reason on the Run read as
+`cancel_status=refused` and `cancel_reason`. A
 pending delivery reports `cancel_status=pending` and, when present, the last
 delivery error as `cancel_reason`; a local cancellation or terminal L1 response
 reports `cancel_status=settled` without a reason. These fields are absent before

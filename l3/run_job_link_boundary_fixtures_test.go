@@ -212,3 +212,34 @@ func TestRunJobLinkBoundaryProductionBypasses(t *testing.T) {
 		})
 	}
 }
+
+// An opaque site's fingerprint covers the method that builds its SQL, so
+// editing only that method's body changes the ratchet; a same-named method on
+// an unrelated type, or an unrelated package function, does not.
+func TestRunJobLinkOpaqueFingerprintTracksSQLMethod(t *testing.T) {
+	base := linkOpaqueFixtureFingerprint(t, "", `"SELECT run_id FROM runs"`)
+	if changed := linkOpaqueFixtureFingerprint(t, "", `"SELECT l1_job_id FROM runs"`); changed == base {
+		t.Fatal("editing the SQL-building method kept the opaque fingerprint")
+	}
+	unrelated := "\ntype other struct{}\nfunc (other) sql() string { return \"x\" }\nfunc read(s string) {}"
+	if stable := linkOpaqueFixtureFingerprint(t, unrelated, `"SELECT run_id FROM runs"`); stable != base {
+		t.Fatal("an unrelated same-named method or package function shifted the fingerprint")
+	}
+}
+
+func linkOpaqueFixtureFingerprint(t *testing.T, extra, body string) string {
+	t.Helper()
+	sources := map[string]string{"fixture.go": `package fixture; import "database/sql";
+type builder struct{}
+func (builder) sql() string { return ` + body + ` }
+func f(db *sql.DB, b builder) { db.Query(b.sql()) }` + extra}
+	p, err := parseLinkSQLPackage(t.TempDir(), sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sites := p.sites()
+	if len(sites) != 1 {
+		t.Fatalf("sites=%+v want 1", sites)
+	}
+	return sites[0].Fingerprint
+}

@@ -81,6 +81,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.migrateLegacyRunJobLinks(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("l3: migrate legacy Run job links: %w", err)
+	}
 	return store, nil
 }
 
