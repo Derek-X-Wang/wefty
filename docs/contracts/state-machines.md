@@ -151,11 +151,16 @@ streak resets only after continuous stability under its current, active,
 unexpired attempt on its bound alive node, with matching boot session and
 registration authority generation. Reconcile clears the health timestamp when
 the node becomes unavailable or its registration replaces the attempt's
-authority. Renewal, `Started`, and logs establish portless health only while the
-bound node is alive and its boot session and registration generation match the
-current attempt. OCI renewal may start or re-arm portless health only after a
-durable `Started`; before `Started`, renewal never starts the stability clock.
-Computer stability also requires its display to be published for the current attempt.
+authority. First `Started`, renewal (non-OCI, or OCI after durable `Started`),
+new non-OCI logs with live authority, and `ready=true` publication all apply
+one health-setting rule: the triggering Attempt is current, active, unexpired,
+and has no pending cancellation; the bound Node is its Node, recorded alive,
+with matching boot session and registration generation. Ported services and
+Computers additionally require publication by the current Attempt. A stale
+Node's publication records its marker without starting health. After the Node
+heartbeats alive, renewal re-arms health on that same published Attempt without
+another readiness transition. OCI renewal before `Started` never sets health.
+Withdrawal clears health; repeated evidence retains an existing timestamp.
 That suppressed time cannot count toward stability. Late logs
 from a lost, superseded, or replaced attempt retain evidence but never start or
 extend the current service's stability window.
