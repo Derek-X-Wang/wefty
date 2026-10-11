@@ -262,3 +262,275 @@ func TestCancelFollowupLegacyCompletedEvidence(t *testing.T) {
 		}
 	}
 }
+
+// A legacy outbox-only acknowledgement must not become a link after L1 has
+// contradicted it. Exercise both explicit cancel and background delivery.
+func TestCancelContradictedStoredAcknowledgement(t *testing.T) {
+	for _, verdict := range []string{"regression", "legacy-regression-diagnostic", "authoritative-absence"} {
+		for _, delivery := range []string{"explicit", "background", "delayed-acknowledgement"} {
+			if verdict == "authoritative-absence" && delivery == "delayed-acknowledgement" {
+				continue // A first acknowledgement can supersede dispatch absence.
+			}
+			t.Run(verdict+"/"+delivery, func(t *testing.T) {
+				h := newIntegrationHarness(t)
+				ctx := context.Background()
+				run := h.submit(inlineRunRequest("exit 0\n"), "contradicted-cancel")
+				if _, err := h.l3Store.ensureRunToken(ctx, run.RunID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.l3Store.beginDispatch(ctx, run.RunID); err != nil {
+					t.Fatal(err)
+				}
+				failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
+				if verdict != "authoritative-absence" {
+					recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, "job-gone")
+				} else {
+					ageDispatchAttemptPastSettleHorizon(t, h.l3Store, run.RunID)
+				}
+				r, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := r.ReconcileOnce(ctx); err == nil {
+					t.Fatal("expected authoritative absence")
+				}
+				// Older ledgers can carry a diagnostic without the settlement bit,
+				// or a stale acknowledgement beside a settled dispatch absence.
+				if verdict == "legacy-regression-diagnostic" {
+					if _, err := h.l3Store.db.Exec(`UPDATE runs SET job_link_settled=0 WHERE run_id=?`, run.RunID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if verdict == "authoritative-absence" {
+					if _, err := h.l3Store.db.Exec(`UPDATE dispatch_outbox SET job_id='job-gone', dispatched_ns=? WHERE run_id=?`, h.l3Store.clock.Now().UnixNano(), run.RunID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+				if err != nil || before.L1JobID != "" || before.DispatchError == nil {
+					t.Fatalf("contradicted execution = %+v %v", before, err)
+				}
+				terminal := snapshotTerminalRun(t, h.l3Store, run.RunID)
+				if delivery == "explicit" {
+					status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+					if status != http.StatusOK {
+						t.Fatalf("cancel = %d %s", status, body)
+					}
+				} else if delivery == "delayed-acknowledgement" {
+					if err := h.l3Store.completeDispatch(ctx, run.RunID, "job-gone"); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					// A persisted pre-upgrade intent bypasses request-time repair.
+					if _, err := h.l3Store.db.Exec(`INSERT INTO run_cancellations(run_id, requested_ns) VALUES(?, ?)`, run.RunID, h.l3Store.clock.Now().UnixNano()); err != nil {
+						t.Fatal(err)
+					}
+					_ = r.ReconcileOnce(ctx)
+				}
+				after, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+				if err != nil || after.L1JobID != "" || !reflect.DeepEqual(before.DispatchError, after.DispatchError) {
+					t.Errorf("cancel revived contradicted identity: before=%+v after=%+v err=%v", before, after, err)
+				}
+				status, _, body := h.do(h.caller, http.MethodGet, "/v1/runs/"+run.RunID+"/logs", nil, nil)
+				var page l1.LogPage
+				if err := json.Unmarshal(body, &page); err != nil || status != http.StatusOK || len(page.Events) != 0 {
+					t.Errorf("logs no longer empty: %d %s err=%v", status, body, err)
+				}
+				if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
+					t.Errorf("cancel changed terminal history: %+v -> %+v", terminal, after)
+				}
+			})
+		}
+	}
+}
+
+func TestCancelLateAcknowledgementPreservesTerminalHistory(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(map[bool]string{false: "new-reason", true: "legacy-reason"}[legacy], func(t *testing.T) {
+			h := newIntegrationHarness(t)
+			ctx := context.Background()
+			clock := &mutableClock{now: time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)}
+			h.l3Store.clock = clock
+			run := h.submit(inlineRunRequest("exit 0\n"), "late-cancel-ack")
+			intents, err := h.l3Store.pendingDispatches(ctx)
+			if err != nil || len(intents) != 1 {
+				t.Fatalf("dispatch intent = %+v %v", intents, err)
+			}
+			token, err := h.l3Store.beginDispatch(ctx, run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// L1 has not committed this in-flight submit at the lookup start.
+			clock.now = clock.now.Add(unrecordedDispatchSettleHorizon)
+			status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+			var before contract.RunRecord
+			if err := json.Unmarshal(body, &before); err != nil || status != http.StatusOK || before.Status != contract.RunFailed || before.CancelStatus != "settled" || before.L1JobID != "" {
+				t.Fatalf("cancel settlement = %d %s err=%v", status, body, err)
+			}
+			if before.FailureReason != "canceled before dispatch was confirmed" {
+				t.Errorf("terminal reason = %q, want %q", before.FailureReason, "canceled before dispatch was confirmed")
+			}
+			if legacy {
+				// Historical reasons are fixtures, never upgraded or rewritten.
+				if _, err := h.l3Store.db.Exec(`UPDATE runs SET failure_reason='the run was canceled before dispatch' WHERE run_id=?`, run.RunID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			terminal := snapshotTerminalRun(t, h.l3Store, run.RunID)
+			// L1 commits the saved in-flight request, then its first answer lands.
+			job, err := h.l1Client.SubmitJob(ctx, intents[0].jobSpec(token))
+			if err != nil || job.Spec.DispatchKey != intents[0].DispatchKey {
+				t.Fatalf("late Job = %+v %v", job, err)
+			}
+			clock.now = clock.now.Add(time.Minute)
+			if err := h.l3Store.completeDispatch(ctx, run.RunID, job.JobID); err != nil {
+				t.Fatal(err)
+			}
+			linked, err := h.l3Store.GetRun(ctx, run.RunID)
+			if err != nil || linked.L1JobID != job.JobID || linked.CancelStatus != "pending" {
+				t.Fatalf("late acknowledgement did not link and wake cancel: %+v %v", linked, err)
+			}
+			r, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := r.ReconcileOnce(ctx); err != nil {
+				t.Fatal(err)
+			}
+			observed, err := h.l1Client.GetJob(ctx, job.JobID)
+			if err != nil || observed.Outcome != contract.JobOutcomeCanceled {
+				t.Fatalf("late Job escaped cancel: %+v %v", observed, err)
+			}
+			settled, err := h.l3Store.GetRun(ctx, run.RunID)
+			if err != nil || settled.CancelStatus != "settled" || settled.CancelReason != "" || settled.L1JobID != job.JobID {
+				t.Fatalf("cancel outcome = %+v %v", settled, err)
+			}
+			if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
+				t.Fatalf("late Job changed terminal history or token expiry: %+v -> %+v", terminal, after)
+			}
+		})
+	}
+}
+
+func TestCancelRechecksStoredEvidenceBeforeLinking(t *testing.T) {
+	h := newIntegrationHarness(t)
+	ctx := context.Background()
+	run := h.submit(inlineRunRequest("exit 0\n"), "cancel-read-before-verdict")
+	if _, err := h.l3Store.beginDispatch(ctx, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
+	recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, "job-gone")
+	// Persisted legacy intent: the delivery read can race a later verdict.
+	if _, err := h.l3Store.db.Exec(`INSERT INTO run_cancellations(run_id, requested_ns) VALUES(?, ?)`, run.RunID, h.l3Store.clock.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := h.l3Store.pendingRunCancellations(ctx, run.RunID)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("delivery read = %+v %v", pending, err)
+	}
+	// The production absence writer commits after cancel's read. This ticket
+	// guards cancel's later use of that read, not recovery's ownership rules.
+	record, err := h.l3Store.GetRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := h.l3Store.settleUnrecordedDispatch(ctx, unrecordedDispatch{RunID: run.RunID, DispatchKey: record.DispatchKey, OutboxJobID: "job-gone"}, h.l3Store.recoveryNow())
+	if err != nil || outcome != settled {
+		t.Fatalf("absence verdict = %v %v", outcome, err)
+	}
+	before, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.cancelRunJob(ctx, pending[0])
+	after, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+	if err != nil || after.L1JobID != "" || !reflect.DeepEqual(after.DispatchError, before.DispatchError) {
+		t.Fatalf("stale cancel read restored a link: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
+// Positive lookup evidence can still link a settled Run and reach its Job.
+func TestCancelFreshLookupLinksSettledRun(t *testing.T) {
+	h := newIntegrationHarness(t)
+	ctx := context.Background()
+	clock := &mutableClock{now: time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)}
+	h.l3Store.clock = clock
+	run := h.submit(inlineRunRequest("exit 0\n"), "cancel-fresh-lookup")
+	intents, err := h.l3Store.pendingDispatches(ctx)
+	if err != nil || len(intents) != 1 {
+		t.Fatalf("dispatch intents = %+v %v", intents, err)
+	}
+	token, err := h.l3Store.beginDispatch(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
+	clock.now = clock.now.Add(unrecordedDispatchSettleHorizon)
+	r, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReconcileOnce(ctx); err == nil {
+		t.Fatal("expected authoritative dispatch absence")
+	}
+	before := snapshotTerminalRun(t, h.l3Store, run.RunID)
+	job, err := h.l1Client.SubmitJob(ctx, intents[0].jobSpec(token))
+	if err != nil || job.Spec.DispatchKey != intents[0].DispatchKey {
+		t.Fatalf("late Job = %+v %v", job, err)
+	}
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+	var record contract.RunRecord
+	if err := json.Unmarshal(body, &record); err != nil || status != http.StatusOK || record.L1JobID != job.JobID || record.CancelStatus != "settled" {
+		t.Fatalf("positive lookup cancel = %d %s err=%v", status, body, err)
+	}
+	observed, err := h.l1Client.GetJob(ctx, job.JobID)
+	if err != nil || observed.Outcome != contract.JobOutcomeCanceled {
+		t.Fatalf("lookup Job escaped cancel = %+v %v", observed, err)
+	}
+	execution, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+	if err != nil || execution.DispatchError != nil {
+		t.Fatalf("positive lookup left diagnostic = %+v %v", execution, err)
+	}
+	if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != before {
+		t.Fatalf("lookup changed terminal history or token expiry: %+v -> %+v", before, after)
+	}
+}
+
+func TestCancelFreshLookupSupersedesStoredRegression(t *testing.T) {
+	h := newIntegrationHarness(t)
+	ctx := context.Background()
+	run, job := crashWindowRun(t, h, "cancel-found-after-regression")
+	recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, job.JobID)
+	// A cold control plane gives authoritative absence. The later cancel
+	// observes positive evidence through the identity-bound real client.
+	empty, _ := newEmptyL1LookupClient(t)
+	r, err := NewReconciler(h.l3Store, empty, ReconcilerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReconcileOnce(ctx); err == nil {
+		t.Fatal("expected regression verdict")
+	}
+	before := snapshotTerminalRun(t, h.l3Store, run.RunID)
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+	var record contract.RunRecord
+	if err := json.Unmarshal(body, &record); err != nil || status != http.StatusOK || record.L1JobID != job.JobID || record.CancelStatus != "settled" {
+		t.Fatalf("fresh positive cancel = %d %s err=%v", status, body, err)
+	}
+	execution, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+	if err != nil || execution.L1JobID != job.JobID || execution.DispatchError != nil {
+		t.Fatalf("fresh lookup left regression = %+v %v", execution, err)
+	}
+	observed, err := h.l1Client.GetJob(ctx, job.JobID)
+	if err != nil || observed.Outcome != contract.JobOutcomeCanceled {
+		t.Fatalf("positive Job escaped cancel = %+v %v", observed, err)
+	}
+	if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != before {
+		t.Fatalf("lookup changed terminal history or token expiry: %+v -> %+v", before, after)
+	}
+}

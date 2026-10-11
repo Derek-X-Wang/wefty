@@ -2168,8 +2168,21 @@ WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
 // submit was in flight is linked here too, keeping its terminal state: the
 // acknowledgement is L1's own answer for this dispatch key, so it also
 // replaces a dispatch_not_found settlement recovery recorded before it
-// arrived.
+// arrived. A regression verdict contradicts that earlier commit, so a delayed
+// acknowledgement cannot restore its link or erase the diagnostic.
 func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error {
+	return s.completeDispatchWithEvidence(ctx, runID, jobID, dispatchAcknowledgementEvidence)
+}
+
+type dispatchLinkEvidence int
+
+const (
+	dispatchAcknowledgementEvidence dispatchLinkEvidence = iota
+	dispatchStoredEvidence
+	dispatchLookupEvidence
+)
+
+func (s *Store) completeDispatchWithEvidence(ctx context.Context, runID, jobID string, evidence dispatchLinkEvidence) error {
 	if jobID == "" {
 		return internalError(errors.New("L1 dispatch acknowledgement has an empty job ID"), "complete dispatch")
 	}
@@ -2179,12 +2192,26 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 		return internalError(err, "begin dispatch completion")
 	}
 	defer tx.Rollback()
-	var outboxJob sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT job_id FROM dispatch_outbox WHERE run_id=?`, runID).Scan(&outboxJob); err != nil {
+	var outboxJob, runJob sql.NullString
+	var settled bool
+	var reason, diagnosticJob string
+	if err := tx.QueryRowContext(ctx, `SELECT o.job_id, r.l1_job_id, r.job_link_settled,
+ COALESCE(json_extract(o.last_error, '$.details.reason'), ''),
+ COALESCE(json_extract(o.last_error, '$.details.l1_job_id'), '')
+ FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).
+		Scan(&outboxJob, &runJob, &settled, &reason, &diagnosticJob); err != nil {
 		return internalError(err, "read dispatch acknowledgement")
 	}
-	if outboxJob.Valid && outboxJob.String != jobID {
-		return internalError(errors.New("dispatch acknowledgement conflicts with recorded outbox job"), "complete dispatch")
+	if (outboxJob.Valid && outboxJob.String != jobID) || (runJob.Valid && runJob.String != jobID) ||
+		(reason == l1RegressedReason && diagnosticJob != "" && diagnosticJob != jobID) {
+		return internalError(errors.New("dispatch acknowledgement conflicts with recorded job"), "complete dispatch")
+	}
+	// Stored identity cannot undo a verdict. An acknowledgement delivered
+	// after regression proves the earlier commit, not a later live Job. Only
+	// a fresh, identity-bound lookup can supersede that diagnostic.
+	if (evidence == dispatchStoredEvidence && (settled || reason == l1RegressedReason || reason == dispatchNotFoundReason)) ||
+		(evidence == dispatchAcknowledgementEvidence && reason == l1RegressedReason) {
+		return nil
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL AND (job_id IS NULL OR job_id=?)`, jobID, now.UnixNano(), runID, jobID)
 	if err != nil {
@@ -2193,6 +2220,13 @@ func (s *Store) completeDispatch(ctx context.Context, runID, jobID string) error
 	acknowledged, err := result.RowsAffected()
 	if err != nil {
 		return internalError(err, "read dispatch completion result")
+	}
+	if evidence == dispatchLookupEvidence {
+		// A bound positive lookup is a new observation, even when the outbox
+		// already recorded the earlier acknowledgement and its later absence.
+		if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=NULL, token_delivery=NULL WHERE run_id=? AND job_id=?`, runID, jobID); err != nil {
+			return internalError(err, "record confirmed canceled dispatch")
+		}
 	}
 	result, err = tx.ExecContext(ctx, `UPDATE runs SET l1_job_id=?, status=?, updated_ns=? WHERE run_id=? AND status IN (?, ?)`,
 		jobID, contract.RunQueued, now.UnixNano(), runID, contract.RunPending, contract.RunDispatching)

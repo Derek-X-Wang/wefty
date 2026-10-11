@@ -14,6 +14,12 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
+// cancelStoredJobID uses an outbox acknowledgement only while no settled absence
+// or regression diagnostic contradicts it. The Run's own link remains primary.
+const cancelStoredJobID = `COALESCE(r.l1_job_id, CASE WHEN r.job_link_settled=0
+ AND COALESCE(json_extract(o.last_error, '$.details.reason'), '') NOT IN ('l1_regressed', 'dispatch_not_found')
+ THEN o.job_id END)`
+
 // requestRunCancellation arbitrates cancellation with the first dispatch
 // attempt. A never-attempted run can settle locally. Once an attempt began,
 // even without an acknowledgement, L1 is the authority on the job's outcome.
@@ -27,7 +33,7 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	var submitter string
 	var attempted sql.NullInt64
 	var jobID sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT r.status, t.actor, r.dispatch_attempt_ns, COALESCE(r.l1_job_id, o.job_id)
+	err = tx.QueryRowContext(ctx, `SELECT r.status, t.actor, r.dispatch_attempt_ns, `+cancelStoredJobID+`
  FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
  LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).Scan(&state, &submitter, &attempted, &jobID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -55,7 +61,7 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	if (state == contract.RunSucceeded || state == contract.RunFailed) && !jobID.Valid && !attempted.Valid {
 		return nil
 	}
-	// Legacy acknowledgements may exist only in the outbox. Link them before
+	// Uncontradicted legacy acknowledgements may exist only in the outbox. Link them before
 	// cancellation takes over recovery, preserving the terminal outcome.
 	if jobID.Valid {
 		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID.String); err != nil {
@@ -64,7 +70,7 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	}
 	now := canonicalTime(s.clock.Now())
 	if !attempted.Valid && !jobID.Valid {
-		if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, "the run was canceled before dispatch"); err != nil {
+		if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, "canceled before dispatch was confirmed"); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO run_cancellations(run_id, requested_ns, completed_ns) VALUES(?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, runID, now.UnixNano(), now.UnixNano()); err != nil {
@@ -89,7 +95,7 @@ type runCancellation struct {
 }
 
 func (s *Store) pendingRunCancellations(ctx context.Context, runID string) ([]runCancellation, error) {
-	query := `SELECT r.run_id, COALESCE(r.l1_job_id, o.job_id, ''), r.status, r.required_envelope, r.dispatch_key
+	query := `SELECT r.run_id, COALESCE(` + cancelStoredJobID + `, ''), r.status, r.required_envelope, r.dispatch_key
  FROM run_cancellations c JOIN runs r ON r.run_id=c.run_id
  LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id
  WHERE c.completed_ns IS NULL AND c.retry_ns<=?`
@@ -136,7 +142,7 @@ func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupSt
 	if !eligible {
 		return nil
 	}
-	if err := failRunTx(ctx, tx, runID, canonicalTime(s.clock.Now()), s.tokenGrace, "the run was canceled before dispatch"); err != nil {
+	if err := failRunTx(ctx, tx, runID, canonicalTime(s.clock.Now()), s.tokenGrace, "canceled before dispatch was confirmed"); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1 WHERE run_id=?`, runID); err != nil {
@@ -287,7 +293,7 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		if err != nil {
 			return err
 		}
-		if err := r.store.completeDispatch(ctx, run.RunID, job.JobID); err != nil {
+		if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, job.JobID, dispatchLookupEvidence); err != nil {
 			return err
 		}
 		record, err := r.store.GetRun(ctx, run.RunID)
@@ -297,9 +303,9 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		run.JobID, run.State = record.L1JobID, record.Status
 	}
 
-	// Link legacy outbox acknowledgements before sending any cancellation.
+	// Recheck stored outbox acknowledgements before sending any cancellation.
 	// A mismatched dispatch lookup must never become authority over another job.
-	if err := r.store.completeDispatch(ctx, run.RunID, run.JobID); err != nil {
+	if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, run.JobID, dispatchStoredEvidence); err != nil {
 		return err
 	}
 	record, err := r.store.GetRun(ctx, run.RunID)

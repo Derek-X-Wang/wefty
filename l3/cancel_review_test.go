@@ -336,7 +336,7 @@ func TestCancelReviewProvisionalAbsenceBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	record, _ = s.GetRun(ctx, run.RunID)
-	if lookup.calls != 2 || record.Status != contract.RunFailed || record.FailureReason != "the run was canceled before dispatch" {
+	if lookup.calls != 2 || record.Status != contract.RunFailed || record.FailureReason != "canceled before dispatch was confirmed" {
 		t.Fatalf("horizon settlement=%+v calls=%d", record, lookup.calls)
 	}
 }
