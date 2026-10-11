@@ -824,10 +824,6 @@ func TestRunJobLinkStorageBoundary(t *testing.T) {
 	}
 }
 
-// Parser object identity follows local aliases without conflating shadowed
-// names. The walk is conservative: all assignments inside a declaration enter
-// opaque fingerprints, and a parameter hidden behind an alias still taints the
-// wrapper's callers.
 // linkSQLSelectors returns the selectors an expression depends on, following
 // local declarations the same way linkSQLDependencies does.
 func linkSQLSelectors(expr ast.Expr) []*ast.SelectorExpr {
@@ -857,6 +853,10 @@ func linkSQLSelectors(expr ast.Expr) []*ast.SelectorExpr {
 	return result
 }
 
+// Parser object identity follows local aliases without conflating shadowed
+// names. The walk is conservative: all assignments inside a declaration enter
+// opaque fingerprints, and a parameter hidden behind an alias still taints the
+// wrapper's callers.
 func linkSQLDependencies(expr ast.Expr) []*ast.Ident {
 	var result []*ast.Ident
 	visited := map[ast.Node]bool{}
