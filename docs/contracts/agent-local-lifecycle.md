@@ -762,10 +762,19 @@ by this agent and cannot satisfy a Computer claim. Display readiness and
 publication remain a separate consumer of the returned opaque endpoints.
 
 Take-over discovery returns L1's durable policy revision. The CLI carries that
-revision to the private front door; if the live cache is older and therefore
-does not yet contain the identity, the refusal is typed retryable
-`stale_policy_revision`, not an undifferentiated 403. The CLI retries only that
-code every 100 ms for at most two seconds inside its existing command context.
+revision in `X-Wefty-Policy-Revision` to the private front door as a minimum
+admission revision. If the authorization decision is older, admission returns
+HTTP 403 with typed retryable `stale_policy_revision` and
+`requested_policy_revision` / `installed_policy_revision` details before any
+backend dial, session creation, or control bearer issuance. This also applies
+when the older policy already grants view or control. The comparison uses the
+revision captured by the authorization decision, so a concurrent policy install
+cannot conceal admission under an older revision. Equal or newer installed
+policy still evaluates the current grant and always admits view first. A grant
+upgrade does not expand an existing session's admission authority; reconnect
+with the new discovery revision to obtain a control-capable session.
+The CLI retries only `stale_policy_revision` every 100 ms for at most two
+seconds inside its existing command context.
 All other admission failures return immediately, and the native acceptance
 harness permits at most three typed stale-policy process attempts within a
 six-second sub-window while retaining each tolerated stderr in its receipt.

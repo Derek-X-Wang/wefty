@@ -89,24 +89,88 @@ func TestComputerFrontDoorIdentityLookupAvailability(t *testing.T) {
 }
 
 func TestComputerFrontDoorReturnsTypedStalePolicyRefusal(t *testing.T) {
-	_, _, _, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantNone)
+	for _, permission := range []l1.ComputerGrantPermission{l1.ComputerGrantNone, l1.ComputerGrantView, l1.ComputerGrantControl} {
+		t.Run(string(permission), func(t *testing.T) {
+			fixture, cache, auditor, _, server, _ := computerFrontDoorFixture(t, permission)
+			defer server.Close()
+			// Freeze policy delivery at revision 1 even though discovery names 2.
+			// An existing view or control grant must not bypass the revision floor.
+			request := httptest.NewRequest(http.MethodGet, computerWebSocketPath, nil)
+			request.Header.Set("Sec-WebSocket-Protocol", computerWebSocketSubprotocol)
+			request.Header.Set(contract.ComputerPolicyRevisionHeader, "2")
+			response := httptest.NewRecorder()
+			fixture.frontDoor.ServeHTTP(response, request)
+			var failure contract.ComputerControlErrorResponse
+			if response.Code != http.StatusForbidden || json.Unmarshal(response.Body.Bytes(), &failure) != nil ||
+				failure.Error.Code != contract.ErrorStalePolicyRevision || !failure.Error.Retryable ||
+				failure.Error.Details["requested_policy_revision"] != float64(2) ||
+				failure.Error.Details["installed_policy_revision"] != float64(1) {
+				t.Fatalf("stale policy refusal = status=%d body=%s", response.Code, response.Body)
+			}
+			if fixture.viewDials.Load() != 0 || fixture.controlDials.Load() != 0 || response.Header().Get(computerControlTokenHeader) != "" {
+				t.Fatal("stale policy refusal dialed a backend or issued a control token")
+			}
+			cache.mu.Lock()
+			remaining := len(cache.authorizations)
+			cache.mu.Unlock()
+			if remaining != 0 {
+				t.Fatalf("stale policy refusal retained %d authorizations", remaining)
+			}
+			for _, event := range auditor.snapshot() {
+				if event.Kind != l1.ComputerTakeoverAdmissionDenied {
+					t.Fatalf("stale policy refusal recorded session evidence: %#v", event)
+				}
+			}
+		})
+	}
+}
+
+func TestComputerFrontDoorControlGrantWaitsForRequestedPolicy(t *testing.T) {
+	fixture, cache, auditor, _, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantView)
 	defer server.Close()
-	header := http.Header{}
-	header.Set(contract.ComputerPolicyRevisionHeader, "2")
-	connection, response, err := websocket.Dial(t.Context(), "ws"+server.URL[len("http"):]+computerWebSocketPath,
-		&websocket.DialOptions{Subprotocols: []string{computerWebSocketSubprotocol}, HTTPHeader: header})
-	if connection != nil {
-		connection.CloseNow()
-		t.Fatal("stale policy refusal upgraded the connection")
+	controller := newControllerTenureFixture(t)
+	fixture.frontDoor.config.controlTenure = controller.tenure
+	endpoint := "ws" + server.URL[len("http"):] + computerWebSocketPath
+	participant := &countingTakeoverFabric{}
+
+	// Discovery after the durable control grant names revision 2. Hold the
+	// injected-clock cache at view-only revision 1 until the refusal is observed.
+	session, err := takeover.OpenAtPolicyRevision(t.Context(), participant, endpoint, 2)
+	if session != nil {
+		_, takeErr := takeover.Perform(t.Context(), participant, endpoint, session.Token, "take")
+		session.Close()
+		t.Fatalf("control-grant discovery admitted a view-only session at revision 1; take = %v", takeErr)
 	}
-	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
-		t.Fatalf("stale policy refusal = status=%v err=%v", response, err)
+	var actionErr *takeover.ActionError
+	if !errors.As(err, &actionErr) || actionErr.APIError.Code != contract.ErrorStalePolicyRevision || !actionErr.APIError.Retryable {
+		t.Fatalf("admission before control-policy install = %v", err)
 	}
-	defer response.Body.Close()
-	body, readErr := io.ReadAll(response.Body)
-	var failure contract.ComputerControlErrorResponse
-	if readErr != nil || json.Unmarshal(body, &failure) != nil || failure.Error.Code != contract.ErrorStalePolicyRevision || !failure.Error.Retryable {
-		t.Fatalf("stale policy refusal body = %s readErr=%v decoded=%+v", body, readErr, failure)
+	if _, err := cache.Install(policySnapshot(t, fixture.clock.Now(), 1, 2, nil, l1.ComputerGrant{
+		FabricID: identity.FabricID, UserID: identity.UserID, Permission: l1.ComputerGrantControl, PolicyRevision: 2,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	// A revision floor admits both the discovered revision and an older
+	// discovery once a newer policy is installed. Admission still starts view.
+	for _, revision := range []int64{2, 1} {
+		session, err := takeover.OpenAtPolicyRevision(t.Context(), participant, endpoint, revision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		if receipt, err := takeover.Perform(t.Context(), participant, endpoint, session.Token, "take"); err != nil || receipt.TenureState != contract.ComputerControlTenureHeld || receipt.PolicyRevision != 2 {
+			t.Fatalf("take after policy install = %+v err=%v", receipt, err)
+		}
+		if _, err := takeover.Perform(t.Context(), participant, endpoint, session.Token, "release"); err != nil {
+			t.Fatal(err)
+		}
+		session.Close()
+	}
+	for _, event := range auditor.snapshot() {
+		if event.Kind == l1.ComputerTakeoverSessionOpen &&
+			(event.PolicyRevision != 2 || event.AuthorizedRole != l1.ComputerGrantControl || event.AdmittedMode != l1.ComputerAdmittedView) {
+			t.Fatalf("post-grant admission authority = %#v", event)
+		}
 	}
 }
 

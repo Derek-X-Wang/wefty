@@ -406,17 +406,26 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 		return
 	}
 	authorization, err := frontDoor.config.authorizer.AcquireGrant(frontDoor.config.computerID, identity)
+	requestedRevision, revisionErr := strconv.ParseInt(request.Header.Get(contract.ComputerPolicyRevisionHeader), 10, 64)
+	var installedRevision int64
+	if authorization != nil {
+		// Compare the decision that will issue the session bearer, not a later
+		// cache revision: policy installation can race with AcquireGrant.
+		installedRevision = authorization.PolicyRevision()
+	} else {
+		installedRevision = frontDoor.config.authorizer.Revision()
+	}
+	if revisionErr == nil && requestedRevision > installedRevision {
+		authorization.Release()
+		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
+		writeComputerControlError(writer, http.StatusForbidden, contract.APIError{
+			Code: contract.ErrorStalePolicyRevision, Message: "Computer policy revision is not installed at the hosting agent", Retryable: true,
+			Details: map[string]any{"requested_policy_revision": requestedRevision, "installed_policy_revision": installedRevision},
+		}, nil)
+		return
+	}
 	if err != nil || authorization == nil {
 		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
-		requestedRevision, revisionErr := strconv.ParseInt(request.Header.Get(contract.ComputerPolicyRevisionHeader), 10, 64)
-		installedRevision := frontDoor.config.authorizer.Revision()
-		if revisionErr == nil && requestedRevision > installedRevision {
-			writeComputerControlError(writer, http.StatusForbidden, contract.APIError{
-				Code: contract.ErrorStalePolicyRevision, Message: "Computer policy revision is not installed at the hosting agent", Retryable: true,
-				Details: map[string]any{"requested_policy_revision": requestedRevision, "installed_policy_revision": installedRevision},
-			}, nil)
-			return
-		}
 		writeComputerControlError(writer, http.StatusForbidden, contract.APIError{Code: contract.ErrorControlNotAuthorized,
 			Message: "Computer access is not authorized", Retryable: false}, nil)
 		return
