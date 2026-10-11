@@ -12,12 +12,13 @@ import (
 // Optional identities also permit explicit legacy/corrupt shapes. Outcome and
 // token history are established through the ordinary Run transitions.
 type linkKnowledgeFixture struct {
-	runJob, outboxJob *string
-	diagnostic        *contract.APIError
-	attemptedAt       *time.Time
-	settled           bool
-	acknowledged      bool
-	cancellation      string
+	runJob, outboxJob  *string
+	diagnostic         *contract.APIError
+	attemptedAt        *time.Time
+	settled            bool
+	acknowledged       bool
+	cancellation       string
+	cancellationReason string
 }
 
 func linkID(id string) *string { return &id }
@@ -56,6 +57,15 @@ func buildLinkKnowledge(t *testing.T, s *Store, runID string, fixture linkKnowle
 			completed = s.clock.Now().UnixNano()
 		}
 		if _, err := tx.Exec(`INSERT INTO run_cancellations(run_id, requested_ns, completed_ns, refused) VALUES(?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET completed_ns=excluded.completed_ns, refused=excluded.refused, retry_ns=0`, runID, s.clock.Now().UnixNano(), completed, fixture.cancellation == "refused"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fixture.cancellationReason != "" {
+		payload, err := json.Marshal(contract.APIError{Code: contract.ErrorForbidden, Message: fixture.cancellationReason})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(`UPDATE run_cancellations SET last_error=? WHERE run_id=?`, string(payload), runID); err != nil {
 			t.Fatal(err)
 		}
 	}

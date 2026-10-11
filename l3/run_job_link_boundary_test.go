@@ -356,6 +356,50 @@ func linkSQLProtected(sql string) bool {
 			add(linkSQLIdentifier(tokens[j]), table)
 		}
 	}
+	// Replacement can delete the existing row, including omitted protected
+	// columns. Positional insertion implicitly writes every column.
+	for i, t := range tokens {
+		if t != "insert" && t != "replace" {
+			continue
+		}
+		replacement := t == "replace"
+		j := i + 1
+		if t == "insert" {
+			for j < len(tokens) && tokens[j] != "into" {
+				if tokens[j] == "replace" {
+					replacement = true
+				}
+				j++
+			}
+		}
+		if j < len(tokens) && tokens[j] == "into" {
+			j++
+		}
+		if j >= len(tokens) {
+			continue
+		}
+		table := linkSQLIdentifier(tokens[j])
+		if j+2 < len(tokens) && tokens[j+1] == "." {
+			j += 2
+			table = linkSQLIdentifier(tokens[j])
+		}
+		if linkProtectedColumns[table] != nil && (replacement || j+1 >= len(tokens) || tokens[j+1] != "(") {
+			return true
+		}
+	}
+	// A Run-filtered or Run-joined cancellation read reveals ownership even
+	// when it projects only a literal, cardinality or a delivery column.
+	// Known delivery-only sites are individually recorded in the exact ratchet.
+	if tables["run_cancellations"] {
+		selecting, runScoped := false, tables["runs"]
+		for _, t := range tokens {
+			selecting = selecting || t == "select"
+			runScoped = runScoped || linkSQLIdentifier(t) == "run_id"
+		}
+		if selecting && runScoped {
+			return true
+		}
+	}
 	for i, t := range tokens {
 		if t == "*" {
 			// COUNT(*) reads row cardinality, not every protected column. For a
@@ -573,6 +617,17 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 				if indexes == nil {
 					indexes = localTargets[callName]
 				}
+				dynamic := p.opaqueSQLCall(file, call)
+				if len(dynamic) > 0 {
+					merged := map[int]bool{}
+					for index := range indexes {
+						merged[index] = true
+					}
+					for index := range dynamic {
+						merged[index] = true
+					}
+					indexes = merged
+				}
 				for index := range indexes {
 					var argument ast.Expr
 					if index < len(call.Args) {
@@ -582,11 +637,15 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 					// Inputs to an SQL constructor are fragments, not complete
 					// statements. Individually safe fragments cannot authorize
 					// assembled identifiers through a grandfathered helper.
-					opaque := opaqueTargets[callName] || localOpaque[callName]
+					opaque := opaqueTargets[callName] || localOpaque[callName] || len(dynamic) > 0
 					if opaque {
 						sql = ""
 						resolved = false
-						argument = &ast.CompositeLit{Elts: call.Args}
+						arguments := append([]ast.Expr(nil), call.Args...)
+						if len(dynamic) > 0 {
+							arguments = append(arguments, call.Fun)
+						}
+						argument = &ast.CompositeLit{Elts: arguments}
 					}
 					if resolved && !linkSQLProtected(sql) {
 						continue
@@ -604,10 +663,14 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 								}
 							} else {
 								// Package declarations referenced across files do not
-								// share parser objects. Resolve their names explicitly.
+								// share parser objects. Resolve their names explicitly,
+								// against package-level functions only: a method that
+								// shares the name is not this identifier, and folding it
+								// in made fingerprints shift whenever any type gained a
+								// method of that name.
 								for _, source := range p.files {
 									for _, decl := range source.Decls {
-										if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == id.Name && !seen[fn] {
+										if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil && fn.Name.Name == id.Name && !seen[fn] {
 											declarations = append(declarations, linkGoFingerprint(fn))
 											seen[fn] = true
 										}
@@ -766,6 +829,12 @@ func linkSQLDependencies(expr ast.Expr) []*ast.Ident {
 		}
 		visited[node] = true
 		ast.Inspect(node, func(n ast.Node) bool {
+			// A selector's name (x.read) is a field or method of x, never a
+			// package identifier. Only its operand can name a declaration.
+			if selector, ok := n.(*ast.SelectorExpr); ok {
+				walk(selector.X)
+				return false
+			}
 			id, ok := n.(*ast.Ident)
 			if !ok {
 				return true
@@ -900,4 +969,200 @@ func (p *linkSQLPackage) nonSQLURLQuery(file *ast.File, call *ast.CallExpr) bool
 	}
 	member, ok := method.X.(*ast.SelectorExpr)
 	return ok && member.Sel.Name == "URL" && isType(member.X, "net/http", "Request")
+}
+
+// expressionType resolves local function values and package-declared types
+// without depending on successful type checking of corrupt/bypass fixtures.
+// SQL handles need not keep an SQL method name when passed through a callback.
+func (p *linkSQLPackage) expressionType(expr ast.Expr, seen map[ast.Node]bool) ast.Expr {
+	if expr == nil || seen[expr] {
+		return nil
+	}
+	seen[expr] = true
+	switch e := expr.(type) {
+	case *ast.ParenExpr:
+		return p.expressionType(e.X, seen)
+	case *ast.BasicLit:
+		if e.Kind == token.STRING {
+			return ast.NewIdent("string")
+		}
+	case *ast.BinaryExpr:
+		if e.Op == token.ADD {
+			return p.expressionType(e.X, seen)
+		}
+	case *ast.FuncLit:
+		return e.Type
+	case *ast.CompositeLit:
+		return e.Type
+	case *ast.Ident:
+		if e.Obj != nil {
+			switch d := e.Obj.Decl.(type) {
+			case *ast.Field:
+				return d.Type
+			case *ast.FuncDecl:
+				return d.Type
+			case *ast.ValueSpec:
+				if d.Type != nil {
+					return d.Type
+				}
+				for i, n := range d.Names {
+					if n.Name == e.Name && i < len(d.Values) {
+						return p.expressionType(d.Values[i], seen)
+					}
+				}
+			case *ast.AssignStmt:
+				for i, left := range d.Lhs {
+					if id, ok := left.(*ast.Ident); ok && id.Name == e.Name && i < len(d.Rhs) {
+						return p.expressionType(d.Rhs[i], seen)
+					}
+				}
+			}
+		}
+		for _, file := range p.files {
+			for _, decl := range file.Decls {
+				if d, ok := decl.(*ast.FuncDecl); ok && d.Recv == nil && d.Name.Name == e.Name {
+					return d.Type
+				}
+				if d, ok := decl.(*ast.GenDecl); ok {
+					for _, spec := range d.Specs {
+						if v, ok := spec.(*ast.ValueSpec); ok {
+							for i, n := range v.Names {
+								if n.Name == e.Name {
+									if v.Type != nil {
+										return v.Type
+									}
+									if i < len(v.Values) {
+										return p.expressionType(v.Values[i], seen)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	case *ast.SelectorExpr:
+		typ := p.underlyingType(p.expressionType(e.X, seen), map[string]bool{})
+		if ptr, ok := typ.(*ast.StarExpr); ok {
+			typ = p.underlyingType(ptr.X, map[string]bool{})
+		}
+		if st, ok := typ.(*ast.StructType); ok {
+			for _, field := range st.Fields.List {
+				for _, n := range field.Names {
+					if n.Name == e.Sel.Name {
+						return field.Type
+					}
+				}
+			}
+		}
+		if method := p.methodDeclaration(e); method != nil {
+			return method.Type
+		}
+	case *ast.CallExpr:
+		if fn, ok := p.underlyingType(p.expressionType(e.Fun, seen), map[string]bool{}).(*ast.FuncType); ok && fn.Results != nil && len(fn.Results.List) == 1 {
+			return fn.Results.List[0].Type
+		}
+	case *ast.IndexExpr:
+		if a, ok := p.underlyingType(p.expressionType(e.X, seen), map[string]bool{}).(*ast.ArrayType); ok {
+			return a.Elt
+		}
+	}
+	return nil
+}
+
+func (p *linkSQLPackage) underlyingType(expr ast.Expr, seen map[string]bool) ast.Expr {
+	id, ok := expr.(*ast.Ident)
+	if !ok || seen[id.Name] {
+		return expr
+	}
+	seen[id.Name] = true
+	for _, file := range p.files {
+		for _, decl := range file.Decls {
+			if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.TYPE {
+				for _, spec := range gen.Specs {
+					d := spec.(*ast.TypeSpec)
+					if d.Name.Name == id.Name {
+						return p.underlyingType(d.Type, seen)
+					}
+				}
+			}
+		}
+	}
+	return expr
+}
+
+func (p *linkSQLPackage) opaqueSQLCall(file *ast.File, call *ast.CallExpr) map[int]bool {
+	// Ordinary declared functions are handled by wrapper propagation. Values
+	// of function type are opaque: their target can change at runtime.
+	indirect := false
+	if _, ok := p.underlyingType(p.expressionType(call.Fun, map[ast.Node]bool{}), map[string]bool{}).(*ast.FuncType); ok {
+		indirect = true
+		if id, ok := call.Fun.(*ast.Ident); ok {
+			if id.Obj != nil && id.Obj.Kind == ast.Fun {
+				indirect = false
+			}
+			if id.Obj == nil {
+				for _, f := range p.files {
+					for _, decl := range f.Decls {
+						if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == id.Name {
+							indirect = false
+						}
+					}
+				}
+			}
+		}
+	}
+	if selector, ok := call.Fun.(*ast.SelectorExpr); ok && p.methodDeclaration(selector) != nil {
+		indirect = false
+	}
+	// Passing an SQL method as a value is itself a boundary crossing, even
+	// when the receiving helper is declared in another source file.
+	for _, arg := range call.Args {
+		if _, ok := arg.(*ast.SelectorExpr); ok {
+			if _, sql := linkSQLMethod(linkCallName(arg)); sql {
+				indirect = true
+			}
+		}
+	}
+	indexes := map[int]bool{}
+	if indirect {
+		for i, arg := range call.Args {
+			_, constant := p.constant(file, arg, map[string]bool{})
+			typ := p.underlyingType(p.expressionType(arg, map[ast.Node]bool{}), map[string]bool{})
+			id, _ := typ.(*ast.Ident)
+			if constant || (id != nil && id.Name == "string") {
+				indexes[i] = true
+			}
+		}
+	}
+	return indexes
+}
+
+// Resolve declared methods only to distinguish them from function fields and
+// to follow methods whose result is a callable value.
+func (p *linkSQLPackage) methodDeclaration(selector *ast.SelectorExpr) *ast.FuncDecl {
+	typ := p.expressionType(selector.X, map[ast.Node]bool{})
+	if pointer, ok := typ.(*ast.StarExpr); ok {
+		typ = pointer.X
+	}
+	id, ok := typ.(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	for _, file := range p.files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || fn.Name.Name != selector.Sel.Name {
+				continue
+			}
+			receiver := fn.Recv.List[0].Type
+			if pointer, ok := receiver.(*ast.StarExpr); ok {
+				receiver = pointer.X
+			}
+			if r, ok := receiver.(*ast.Ident); ok && r.Name == id.Name {
+				return fn
+			}
+		}
+	}
+	return nil
 }
