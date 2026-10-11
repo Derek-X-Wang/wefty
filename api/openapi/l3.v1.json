@@ -347,7 +347,7 @@
       "get": {
         "operationId": "getRun",
         "summary": "Read a run record",
-        "description": "Run tokens may read their own run and descendants, never siblings or ancestors. Computer tokens may read only same-Computer current-storage-generation roots and descendants. The RunRecord includes cancel_status (pending, settled, refused or legacy completed) and cancel_reason when cancellation intent exists, as well as accepted Envelopes and Gates; there is no separate Computer envelope-read route.",
+        "description": "Run tokens may read their own run and descendants, never siblings or ancestors. Computer tokens may read only same-Computer current-storage-generation roots and descendants. The RunRecord includes cancel_status (pending, settled, refused or legacy completed) and cancel_reason when cancellation intent exists, as well as accepted Envelopes and Gates; there is no separate Computer envelope-read route. Only the Run's own confirmed Job reference supplies l1_job_id; outbox acknowledgements and diagnostic identities alone do not. Until confirmation, the Run retains its recorded status. Computer run pages hydrate this same Run view.",
         "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "responses": {
           "200": {
@@ -395,7 +395,7 @@
       "get": {
         "operationId": "getRunExecution",
         "summary": "Inspect L1 execution through its owning run",
-        "description": "Projects durable L3 dispatch attempts and structured error together with the redacted L1 job and retained attempt evidence. The surface remains run-keyed and exposes no generic job namespace. A succeeded or failed Run with a matching regression diagnostic and an identity-bound authoritative missing-job response returns the retained Job ID and diagnostic without a job.",
+        "description": "Projects durable L3 dispatch attempts and structured error together with the redacted L1 job and retained attempt evidence. The surface remains run-keyed and exposes no generic job namespace. A succeeded or failed Run with a matching regression diagnostic and an identity-bound authoritative missing-job response returns the retained Job ID and diagnostic without a job. Only the Run's own confirmed Job reference supplies l1_job_id and the L1 Job read. Without that reference, dispatch attempts, errors and holds remain visible without waiting or contacting L1.",
         "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }],
         "responses": {
           "200": {
@@ -460,6 +460,7 @@
       "get": {
         "operationId": "getRunLogs",
         "summary": "Poll the run's L1 logs",
+        "description": "Only the Run's own confirmed Job reference selects L1 logs. Without that reference, returns an empty event page and preserves the supplied cursor without waiting or contacting L1; outbox acknowledgements alone do not supply a Job. Regressed Runs retain their existing L1 log response.",
         "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "parameters": [
           { "name": "cursor", "in": "query", "schema": { "type": "string" } },
@@ -496,7 +497,7 @@
       "get": {
         "operationId": "getRunResult",
         "summary": "Read the result document this run uploaded",
-        "description": "Proxies the ledger row for the run's current attempt, authorized as the run's logs are. Computer passes are not authorized for this route.",
+        "description": "Proxies the ledger row for the run's current attempt, authorized as the run's logs are. Computer passes are not authorized for this route. Only the Run's own confirmed Job reference selects the L1 result. Without that reference, returns not_found without waiting or contacting L1; outbox acknowledgements alone do not supply a Job.",
         "responses": {
           "200": {
             "description": "The run's result document, or the reason a result that exists on the node did not travel.",

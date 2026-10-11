@@ -1314,11 +1314,8 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 		return contract.RunRecord{}, internalError(err, "begin run read")
 	}
 	defer tx.Rollback()
-	var cancelRequested, cancelCompleted sql.NullInt64
-	var cancelError sql.NullString
-	var cancelRefused sql.NullBool
 	var record contract.RunRecord
-	var parent, l1JobID, nodeID, failureReason, sourceRun, workflowRef sql.NullString
+	var parent, nodeID, failureReason, sourceRun, workflowRef sql.NullString
 	var computerID, computerAttemptID sql.NullString
 	var computerStorageGeneration, submitIntentRevision sql.NullInt64
 	var paramsJSON, tagsJSON []byte
@@ -1329,23 +1326,30 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 	var createdNS, updatedNS int64
 	var startedNS, finishedNS sql.NullInt64
 	err = tx.QueryRowContext(ctx, `
-SELECT r.run_id, r.parent_run_id, r.l1_job_id, r.node_id, r.failure_reason, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
+SELECT r.run_id, r.parent_run_id, r.node_id, r.failure_reason, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
        r.dispatch_authority, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
 	       s.content, s.sha256, i.program_json, w.workflow_ref, t.actor, t.source, t.source_run_id,
-	       t.computer_id, t.computer_attempt_id, t.computer_storage_generation, t.submit_intent_revision, c.requested_ns, c.completed_ns, c.last_error, c.refused
+	       t.computer_id, t.computer_attempt_id, t.computer_storage_generation, t.submit_intent_revision
 FROM runs r LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
-LEFT JOIN run_cancellations c ON c.run_id=r.run_id
-WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &failureReason, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
+WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &nodeID, &failureReason, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
 		&record.DispatchAuthority, &createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &imageJSON, &workflowRef, &actor, &source, &sourceRun,
-		&computerID, &computerAttemptID, &computerStorageGeneration, &submitIntentRevision, &cancelRequested, &cancelCompleted, &cancelError, &cancelRefused)
+		&computerID, &computerAttemptID, &computerStorageGeneration, &submitIntentRevision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
 	}
 	if err != nil {
 		return contract.RunRecord{}, internalError(err, "read run")
+	}
+	link, err := readRunViewJobLink(ctx, tx, runID)
+	if err != nil {
+		return contract.RunRecord{}, err
+	}
+	cancellation, err := readRunCancellationView(ctx, tx, runID)
+	if err != nil {
+		return contract.RunRecord{}, err
 	}
 	record.DispatchHold, err = runDispatchHold(ctx, tx, runID)
 	if err != nil {
@@ -1354,22 +1358,22 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &failu
 	if err := tx.Commit(); err != nil {
 		return contract.RunRecord{}, internalError(err, "commit run read")
 	}
-	if cancelRequested.Valid {
+	if cancellation.requested.Valid {
 		record.CancelStatus = "pending"
-		if cancelCompleted.Valid {
+		if cancellation.completed.Valid {
 			record.CancelStatus = "settled"
-			if cancelRefused.Bool {
+			if cancellation.refused.Bool {
 				record.CancelStatus = "refused"
-			} else if cancelError.Valid {
+			} else if cancellation.lastError.Valid {
 				// Older successful deliveries kept their last transient error,
 				// just as older refusals did. Report completion and the evidence
 				// without inventing which delivery outcome that row represents.
 				record.CancelStatus = "completed"
 			}
 		}
-		if cancelError.Valid {
+		if cancellation.lastError.Valid {
 			var reason contract.APIError
-			if err := json.Unmarshal([]byte(cancelError.String), &reason); err != nil {
+			if err := json.Unmarshal([]byte(cancellation.lastError.String), &reason); err != nil {
 				return contract.RunRecord{}, internalError(err, "decode cancellation reason")
 			}
 			record.CancelReason = reason.Message
@@ -1377,7 +1381,7 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &l1JobID, &nodeID, &failu
 	}
 	record.SchemaVersion = contract.SchemaVersionV1
 	record.ParentRunID = parent.String
-	record.L1JobID = l1JobID.String
+	record.L1JobID = link.viewJobID()
 	record.NodeID = nodeID.String
 	record.FailureReason = failureReason.String
 	record.Params = append(json.RawMessage(nil), paramsJSON...)
@@ -1436,24 +1440,14 @@ func (s *Store) GetRunExecution(ctx context.Context, runID string) (RunExecution
 	}
 	defer tx.Rollback()
 	var projection RunExecution
-	var l1JobID sql.NullString
-	var dispatchErrorJSON []byte
-	err = tx.QueryRowContext(ctx, `SELECT r.run_id, r.l1_job_id, o.attempt_count, o.last_error
-		FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).
-		Scan(&projection.RunID, &l1JobID, &projection.DispatchAttempts, &dispatchErrorJSON)
-	if errors.Is(err, sql.ErrNoRows) {
-		return RunExecution{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
-	}
+	link, attempts, dispatchError, err := readRunExecutionLink(ctx, tx, runID)
 	if err != nil {
-		return RunExecution{}, internalError(err, "read run execution")
+		return RunExecution{}, err
 	}
-	projection.L1JobID = l1JobID.String
-	if len(dispatchErrorJSON) > 0 {
-		projection.DispatchError = &contract.APIError{}
-		if err := json.Unmarshal(dispatchErrorJSON, projection.DispatchError); err != nil {
-			return RunExecution{}, internalError(err, "decode dispatch error")
-		}
-	}
+	projection.RunID = runID
+	projection.L1JobID = link.viewJobID()
+	projection.DispatchAttempts = attempts
+	projection.DispatchError = dispatchError
 	projection.DispatchHold, err = runDispatchHold(ctx, tx, runID)
 	if err != nil {
 		return RunExecution{}, err
@@ -1462,18 +1456,6 @@ func (s *Store) GetRunExecution(ctx context.Context, runID string) (RunExecution
 		return RunExecution{}, internalError(err, "commit execution read")
 	}
 	return projection, nil
-}
-
-func (s *Store) runJobID(ctx context.Context, runID string) (string, bool, error) {
-	var jobID sql.NullString
-	err := s.db.QueryRowContext(ctx, "SELECT l1_job_id FROM runs WHERE run_id=?", runID).Scan(&jobID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
-	}
-	if err != nil {
-		return "", false, internalError(err, "read run job ID")
-	}
-	return jobID.String, jobID.Valid && jobID.String != "", nil
 }
 
 func (s *Store) GetTrigger(ctx context.Context, runID string) (TriggerProvenance, error) {
