@@ -126,10 +126,15 @@ type computerSessionEnd struct{ reason l1.ComputerTakeoverReason }
 
 func (end *computerSessionEnd) Error() string { return string(end.reason) }
 
+type computerGrantAuthorizer interface {
+	AcquireGrant(string, fabric.Identity) (*ComputerGrantAuthorization, error)
+	Revision() int64
+}
+
 type computerFrontDoorConfig struct {
 	authorityContext     context.Context
 	fabric               fabric.Fabric
-	authorizer           *ComputerPolicyCache
+	authorizer           computerGrantAuthorizer
 	auditor              computerTakeoverAuditor
 	clock                Clock
 	computerID           string
@@ -405,19 +410,14 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 		http.Error(writer, "Computer display requires the binary WebSocket subprotocol", http.StatusBadRequest)
 		return
 	}
+	// Revisions only grow within a generation. Capture the no-grant floor
+	// before acquisition so a concurrent install cannot hide a stale denial.
+	floorRevision := frontDoor.config.authorizer.Revision()
 	authorization, err := frontDoor.config.authorizer.AcquireGrant(frontDoor.config.computerID, identity)
 	requestedRevision, revisionErr := strconv.ParseInt(request.Header.Get(contract.ComputerPolicyRevisionHeader), 10, 64)
-	var installedRevision int64
-	if authorization != nil {
-		// Compare the decision that will issue the session bearer, not a later
-		// cache revision: policy installation can race with AcquireGrant.
-		installedRevision = authorization.PolicyRevision()
-	} else {
-		installedRevision = frontDoor.config.authorizer.Revision()
-	}
-	if revisionErr == nil && requestedRevision > installedRevision {
+	installedRevision, stale := staleComputerAdmission(authorization, floorRevision, requestedRevision)
+	if revisionErr == nil && stale {
 		authorization.Release()
-		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
 		writeComputerControlError(writer, http.StatusForbidden, contract.APIError{
 			Code: contract.ErrorStalePolicyRevision, Message: "Computer policy revision is not installed at the hosting agent", Retryable: true,
 			Details: map[string]any{"requested_policy_revision": requestedRevision, "installed_policy_revision": installedRevision},
@@ -431,6 +431,17 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 		return
 	}
 	frontDoor.serveAuthorized(writer, request, identity, authorization, admittedAt)
+}
+
+// staleComputerAdmission compares the grant's decision revision, or the
+// pre-acquisition floor when no grant was returned, with the requested floor.
+// It never reads the cache, which may already contain a newer policy.
+func staleComputerAdmission(authorization *ComputerGrantAuthorization, floorRevision, requestedRevision int64) (int64, bool) {
+	decisionRevision := floorRevision
+	if authorization != nil {
+		decisionRevision = authorization.PolicyRevision()
+	}
+	return decisionRevision, requestedRevision > decisionRevision
 }
 
 func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWriter, request *http.Request, identity fabric.Identity) {

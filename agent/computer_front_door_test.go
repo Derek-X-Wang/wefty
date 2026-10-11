@@ -116,10 +116,78 @@ func TestComputerFrontDoorReturnsTypedStalePolicyRefusal(t *testing.T) {
 			if remaining != 0 {
 				t.Fatalf("stale policy refusal retained %d authorizations", remaining)
 			}
-			for _, event := range auditor.snapshot() {
-				if event.Kind != l1.ComputerTakeoverAdmissionDenied {
-					t.Fatalf("stale policy refusal recorded session evidence: %#v", event)
+			fixture.frontDoor.denials.flush(t.Context())
+			if events := auditor.snapshot(); len(events) != 0 {
+				t.Fatalf("stale policy refusal recorded denial evidence: %#v", events)
+			}
+		})
+	}
+}
+
+// Install after the real cache evaluates the grant, but before AcquireGrant
+// returns to admission. This pins the race without timers or goroutine timing.
+type installAfterGrantAuthorizer struct {
+	*ComputerPolicyCache
+	install func(*ComputerGrantAuthorization)
+}
+
+func (authorizer installAfterGrantAuthorizer) AcquireGrant(computerID string, identity fabric.Identity) (*ComputerGrantAuthorization, error) {
+	authorization, err := authorizer.ComputerPolicyCache.AcquireGrant(computerID, identity)
+	authorizer.install(authorization)
+	return authorization, err
+}
+
+func TestComputerFrontDoorConcurrentPolicyInstall(t *testing.T) {
+	for _, permission := range []l1.ComputerGrantPermission{l1.ComputerGrantNone, l1.ComputerGrantView, l1.ComputerGrantControl} {
+		t.Run(string(permission), func(t *testing.T) {
+			fixture, cache, auditor, _, server, identity := computerFrontDoorFixture(t, permission)
+			defer server.Close()
+			floorRevision := cache.Revision()
+			fixture.frontDoor.config.authorizer = installAfterGrantAuthorizer{cache, func(authorization *ComputerGrantAuthorization) {
+				if _, err := cache.Install(policySnapshot(t, fixture.clock.Now(), 1, 2, nil, l1.ComputerGrant{
+					FabricID: identity.FabricID, UserID: identity.UserID, Permission: l1.ComputerGrantControl, PolicyRevision: 2,
+				})); err != nil {
+					t.Fatal(err)
 				}
+				// Exercise the pure comparison with the old grant decision (or
+				// the floor captured before acquisition), while the cache is 2.
+				comparisonFloor := floorRevision
+				if authorization != nil {
+					comparisonFloor = cache.Revision()
+				}
+				if decision, stale := staleComputerAdmission(authorization, comparisonFloor, 2); decision != 1 || !stale {
+					t.Fatalf("stale comparison = revision %d, stale %t; want 1, true", decision, stale)
+				}
+				for _, requested := range []int64{0, 1} {
+					if _, stale := staleComputerAdmission(authorization, comparisonFloor, requested); stale {
+						t.Fatalf("revision 1 refused requested floor %d", requested)
+					}
+				}
+			}}
+			request := httptest.NewRequest(http.MethodGet, computerWebSocketPath, nil)
+			request.Header.Set("Sec-WebSocket-Protocol", computerWebSocketSubprotocol)
+			request.Header.Set(contract.ComputerPolicyRevisionHeader, "2")
+			response := httptest.NewRecorder()
+			fixture.frontDoor.ServeHTTP(response, request)
+			var failure contract.ComputerControlErrorResponse
+			if response.Code != http.StatusForbidden || json.Unmarshal(response.Body.Bytes(), &failure) != nil ||
+				failure.Error.Code != contract.ErrorStalePolicyRevision || !failure.Error.Retryable ||
+				failure.Error.Details["installed_policy_revision"] != float64(1) ||
+				failure.Error.Details["requested_policy_revision"] != float64(2) || cache.Revision() != 2 {
+				t.Fatalf("concurrent install refusal = status=%d body=%s cache=%d", response.Code, response.Body, cache.Revision())
+			}
+			if fixture.viewDials.Load() != 0 || fixture.controlDials.Load() != 0 || response.Header().Get(computerControlTokenHeader) != "" {
+				t.Fatal("concurrent install admitted a session")
+			}
+			cache.mu.Lock()
+			remaining := len(cache.authorizations)
+			cache.mu.Unlock()
+			if remaining != 0 {
+				t.Fatalf("concurrent install retained %d authorizations", remaining)
+			}
+			fixture.frontDoor.denials.flush(t.Context())
+			if events := auditor.snapshot(); len(events) != 0 {
+				t.Fatalf("concurrent install recorded denial evidence: %#v", events)
 			}
 		})
 	}
@@ -175,7 +243,7 @@ func TestComputerFrontDoorControlGrantWaitsForRequestedPolicy(t *testing.T) {
 }
 
 func TestComputerFrontDoorKeepsPermanentDenialNonRetryable(t *testing.T) {
-	_, _, _, _, server, _ := computerFrontDoorFixture(t, l1.ComputerGrantNone)
+	fixture, _, auditor, _, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantNone)
 	defer server.Close()
 	header := http.Header{}
 	header.Set(contract.ComputerPolicyRevisionHeader, "1")
@@ -189,6 +257,13 @@ func TestComputerFrontDoorKeepsPermanentDenialNonRetryable(t *testing.T) {
 	var failure contract.ComputerControlErrorResponse
 	if json.Unmarshal(body, &failure) != nil || failure.Error.Code != contract.ErrorControlNotAuthorized || failure.Error.Retryable {
 		t.Fatalf("permanent policy refusal body = %s decoded=%+v", body, failure)
+	}
+	fixture.frontDoor.denials.flush(t.Context())
+	events := auditor.snapshot()
+	if len(events) != 1 || events[0].Kind != l1.ComputerTakeoverAdmissionDenied ||
+		events[0].Reason != l1.ComputerTakeoverUnauthorizedIdentity || events[0].EventCount != 1 ||
+		events[0].FabricID != identity.FabricID || events[0].UserID != identity.UserID || events[0].DeviceID != identity.DeviceID {
+		t.Fatalf("permanent policy refusal audit = %#v, want one unauthorized denial", events)
 	}
 }
 

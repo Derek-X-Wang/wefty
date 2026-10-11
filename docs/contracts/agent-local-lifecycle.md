@@ -768,8 +768,13 @@ HTTP 403 with typed retryable `stale_policy_revision` and
 `requested_policy_revision` / `installed_policy_revision` details before any
 backend dial, session creation, or control bearer issuance. This also applies
 when the older policy already grants view or control. The comparison uses the
-revision captured by the authorization decision, so a concurrent policy install
-cannot conceal admission under an older revision. Equal or newer installed
+revision captured by the authorization decision when a grant exists, or a
+revision floor read before grant acquisition when no grant is returned. A
+concurrent policy install cannot conceal an older decision in either path;
+the no-grant floor can cause one extra retryable refusal. This retryable
+refusal is not recorded as a Take-over denial. A final, non-retryable
+`control_not_authorized` refusal still records `unauthorized_identity` denial
+evidence. Equal or newer installed
 policy still evaluates the current grant and always admits view first. A grant
 upgrade does not expand an existing session's admission authority; reconnect
 with the new discovery revision to obtain a control-capable session.
