@@ -248,10 +248,12 @@ commits the tombstone in a separate crash-recoverable transaction.
 `PUT .../attempts/{attempt_id}/publication` carries an absolute `ready` boolean.
 L1 derives the immutable Fabric-namespace port from the stored service
 specification; the request cannot supply a port. Publication is applicable only
-to portful services, is not replayable after terminalization, and same-state
-requests are database no-ops. The operator-visible `ready` projection is true
-only while the stored publication references the current, active, unexpired
-attempt under the node's current boot session and authority generation.
+to ported services and Computers, is not replayable after terminalization, and
+same-state requests leave the publication fields unchanged. A repeated
+`ready=true` can re-arm health under the Service stability rule below; if health is already set,
+the request remains a database no-op. The operator-visible `ready` projection
+is true only while the stored publication references the current, active,
+unexpired attempt under the node's current boot session and authority generation.
 
 Log insertion records evidence rather than changing authority. It validates
 the original attempt's authenticated node, job, attempt ID, and per-attempt
@@ -269,12 +271,8 @@ for `kind=process` because it is authority-changing. It runs only while the
 attempt still has current boot-session, generation, current-attempt, and lease
 authority; late observation always skips it. Job promotion is conditional on
 `jobs.state=claimed`, so logs cannot reverse `stopping` or erase stop intent.
-Only logs from an active process attempt with current live authority may start
-the portless-service stability window. Renewal, `Started`, and logs establish
-portless health only on the bound alive node under the attempt's matching boot
-session and registration generation, inside the same write transaction.
-Computer stability also requires its display to be published for the current attempt.
-`kind=oci` log insertion never promotes: only `Started` does.
+Only new logs from a non-OCI attempt with live authority may establish service
+health. `kind=oci` log insertion never promotes: only `Started` does.
 
 A gap declaration uses `LogEvent.sequence` as the first lost sequence and
 `gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
@@ -347,9 +345,9 @@ an expired lease, or a pending cancellation) or 501 is a refusal. A refusal, or
 no verdict within the window, cancels the payload; it cannot remain running
 under refused or unanswered authority. For `kind=oci`, renewal never acknowledges
 execution. Only after a durable `Started` may renewal start or re-arm the
-portless-service stability clock, on the bound alive node under the attempt's
-matching boot session and authority generation, inside the same write
-transaction. Before `Started`, renewal changes only the lease and directive.
+service stability clock under the rule below, on the bound alive Node under
+the Attempt's matching boot session and authority generation, inside the same
+write transaction. Before `Started`, renewal changes only the lease and directive.
 Successful completion likewise never supplies a missing OCI `Started`.
 The OCI `Started` acknowledgement, sent after the helper proves payload start
 and before the agent admits the attempt or reports it running, follows the
@@ -361,6 +359,28 @@ only lose it (`agent-local-lifecycle.md`). A refusal, or no verdict before
 either bound, stops the payload as a refused post-start mutation. A one-shot's
 acknowledgement and its retries are not abandoned when the attempt is
 canceled; L1 arbitrates a pending cancel against an earlier durable start.
+
+## Service stability
+
+Every trigger applies one rule for setting `healthy_since_at`, inside its
+existing write transaction. The triggering Attempt must be the Job's current
+Attempt, active (`claimed`, `running`, or `awaiting-input`), with an unexpired
+lease and no pending cancellation. The service's bound Node must be that
+Attempt's Node, recorded `alive`, with matching boot session and registration
+authority generation. Ported services and Computers additionally require
+`published_attempt_id = current_attempt_id`.
+
+The triggers are first `Started`, renewal (non-OCI, or OCI after durable
+`Started`), new non-OCI logs with live authority, and `ready=true` publication.
+Setting health retains an existing timestamp, so repeated evidence cannot
+restart the stability window. A publication while the Node is recorded stale
+stores the publication marker but does not set health. Once the Node heartbeats
+alive, renewal can re-arm health on the same currently published Attempt,
+including for a ported service; no new readiness transition is required.
+OCI renewal before `Started` still never sets health. `ready=false` and
+reconciliation of a stale or replaced Node clear health. The stability window
+starts again at recovery; unavailable time does not count toward resetting the
+restart streak.
 
 ## Log retention
 
