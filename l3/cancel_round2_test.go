@@ -139,21 +139,21 @@ func TestCancelRound2ConflictingTerminalAcknowledgement(t *testing.T) {
 	}
 }
 
-type round2LinkedCanceler struct {
-	*reviewCancelClient
+type linkCheckingCancelClient struct {
+	*recordingCancelClient
 	store *Store
 	runID string
 	jobID string
 }
 
-func (c *round2LinkedCanceler) CancelJob(ctx context.Context, id string) (l1.Job, error) {
+func (c *linkCheckingCancelClient) CancelJob(ctx context.Context, id string) (l1.Job, error) {
 	record, err := c.store.GetRun(ctx, c.runID)
 	if err != nil || id != c.jobID || record.L1JobID != id {
 		return l1.Job{}, fmt.Errorf("cancel before link: id=%s record=%+v error=%v", id, record, err)
 	}
-	return c.reviewCancelClient.CancelJob(ctx, id)
+	return c.recordingCancelClient.CancelJob(ctx, id)
 }
-func (c *round2LinkedCanceler) LookupJobByDispatchKey(_ context.Context, key string) (l1.Job, error) {
+func (c *linkCheckingCancelClient) LookupJobByDispatchKey(_ context.Context, key string) (l1.Job, error) {
 	return l1.Job{}, &DispatchNotFoundError{DispatchKey: key}
 }
 
@@ -171,7 +171,7 @@ func TestCancelRound2OutboxOnlyNotFound(t *testing.T) {
 	if _, err := h.l3Store.db.Exec(`INSERT INTO run_cancellations(run_id, requested_ns) VALUES(?, ?)`, run.RunID, h.l3Store.clock.Now().UnixNano()); err != nil {
 		t.Fatal(err)
 	}
-	client := &round2LinkedCanceler{reviewCancelClient: &reviewCancelClient{L1Client: h.l1Client}, store: h.l3Store, runID: run.RunID, jobID: crashing.submitted.JobID}
+	client := &linkCheckingCancelClient{recordingCancelClient: &recordingCancelClient{L1Client: h.l1Client}, store: h.l3Store, runID: run.RunID, jobID: crashing.submitted.JobID}
 	r, _ = NewReconciler(h.l3Store, client, ReconcilerConfig{})
 	if err := r.ReconcileOnce(ctx); err != nil {
 		t.Fatal(err)
@@ -228,9 +228,9 @@ func TestCancelRound2Ledger401HTTP(t *testing.T) {
 	}
 }
 
-type round2RunningCanceler struct{ *fixedJobClient }
+type runningJobCancelClient struct{ *fixedJobClient }
 
-func (c round2RunningCanceler) CancelJob(ctx context.Context, id string) (l1.Job, error) {
+func (c runningJobCancelClient) CancelJob(ctx context.Context, id string) (l1.Job, error) {
 	return c.GetJob(ctx, id)
 }
 
@@ -245,7 +245,7 @@ func TestCancelRound2SuccessfulDeliveryClearsFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	clock.now = clock.now.Add(unrecordedDispatchRetryBase)
-	client := round2RunningCanceler{&fixedJobClient{jobs: map[string]l1.Job{run.JobID: {JobID: run.JobID, State: contract.JobRunning, Outcome: contract.JobOutcomeCanceled}}}}
+	client := runningJobCancelClient{&fixedJobClient{jobs: map[string]l1.Job{run.JobID: {JobID: run.JobID, State: contract.JobRunning, Outcome: contract.JobOutcomeCanceled}}}}
 	r, _ := NewReconciler(s, client, ReconcilerConfig{})
 	pending, err := s.pendingRunCancellations(ctx, run.RunID)
 	if err != nil || len(pending) != 1 {

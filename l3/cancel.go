@@ -14,6 +14,12 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
+// cancelStoredJobID uses an outbox acknowledgement only while no settled absence
+// or regression diagnostic contradicts it. The Run's own link remains primary.
+const cancelStoredJobID = `COALESCE(r.l1_job_id, CASE WHEN r.job_link_settled=0
+ AND COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, '') NOT IN ('` + l1RegressedReason + `', '` + dispatchNotFoundReason + `')
+ THEN o.job_id END)`
+
 // requestRunCancellation arbitrates cancellation with the first dispatch
 // attempt. A never-attempted run can settle locally. Once an attempt began,
 // even without an acknowledgement, L1 is the authority on the job's outcome.
@@ -27,7 +33,7 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	var submitter string
 	var attempted sql.NullInt64
 	var jobID sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT r.status, t.actor, r.dispatch_attempt_ns, COALESCE(r.l1_job_id, o.job_id)
+	err = tx.QueryRowContext(ctx, `SELECT r.status, t.actor, r.dispatch_attempt_ns, `+cancelStoredJobID+`
  FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
  LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).Scan(&state, &submitter, &attempted, &jobID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -55,7 +61,7 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	if (state == contract.RunSucceeded || state == contract.RunFailed) && !jobID.Valid && !attempted.Valid {
 		return nil
 	}
-	// Legacy acknowledgements may exist only in the outbox. Link them before
+	// Uncontradicted legacy acknowledgements may exist only in the outbox. Link them before
 	// cancellation takes over recovery, preserving the terminal outcome.
 	if jobID.Valid {
 		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID.String); err != nil {
@@ -64,7 +70,7 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	}
 	now := canonicalTime(s.clock.Now())
 	if !attempted.Valid && !jobID.Valid {
-		if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, "the run was canceled before dispatch"); err != nil {
+		if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, "canceled before dispatch was confirmed"); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO run_cancellations(run_id, requested_ns, completed_ns) VALUES(?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, runID, now.UnixNano(), now.UnixNano()); err != nil {
@@ -89,7 +95,7 @@ type runCancellation struct {
 }
 
 func (s *Store) pendingRunCancellations(ctx context.Context, runID string) ([]runCancellation, error) {
-	query := `SELECT r.run_id, COALESCE(r.l1_job_id, o.job_id, ''), r.status, r.required_envelope, r.dispatch_key
+	query := `SELECT r.run_id, COALESCE(` + cancelStoredJobID + `, ''), r.status, r.required_envelope, r.dispatch_key
  FROM run_cancellations c JOIN runs r ON r.run_id=c.run_id
  LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id
  WHERE c.completed_ns IS NULL AND c.retry_ns<=?`
@@ -136,7 +142,7 @@ func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupSt
 	if !eligible {
 		return nil
 	}
-	if err := failRunTx(ctx, tx, runID, canonicalTime(s.clock.Now()), s.tokenGrace, "the run was canceled before dispatch"); err != nil {
+	if err := failRunTx(ctx, tx, runID, canonicalTime(s.clock.Now()), s.tokenGrace, "canceled before dispatch was confirmed"); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1 WHERE run_id=?`, runID); err != nil {
@@ -147,6 +153,40 @@ func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupSt
 	}
 	if err := tx.Commit(); err != nil {
 		return internalError(err, "commit absent dispatch cancellation")
+	}
+	return nil
+}
+
+// cancelAbsentStoredIdentity settles only delivery for an already-terminal Run.
+// Preserve its verdict, terminal facts and token expiry. Recheck the identity
+// and verdict that authorized the remote read inside the write transaction.
+func (s *Store) cancelAbsentStoredIdentity(ctx context.Context, runID string, observed dispatchObservation) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin absent identity cancellation")
+	}
+	defer tx.Rollback()
+	current, err := readDispatchObservation(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	if current != observed {
+		return internalError(errors.New("dispatch evidence changed during lookup"), "settle absent identity cancellation")
+	}
+	if !current.outboxJob.Valid || current.outboxJob.String == "" ||
+		(current.runJob.Valid && current.runJob.String != current.outboxJob.String) ||
+		(current.reason == l1RegressedReason && current.diagnosticJob != "" && current.diagnosticJob != current.outboxJob.String) {
+		return internalError(errors.New("stored dispatch identity conflicts with recorded job"), "settle absent identity cancellation")
+	}
+	if current.state != contract.RunSucceeded && current.state != contract.RunFailed {
+		// An active Run still follows the existing regression/absence rules.
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=?, last_error=NULL, refused=0 WHERE run_id=? AND completed_ns IS NULL`, s.recoveryNow().UnixNano(), runID); err != nil {
+		return internalError(err, "finish absent identity cancellation")
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit absent identity cancellation")
 	}
 	return nil
 }
@@ -274,20 +314,40 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		if r.lookup == nil {
 			return internalError(errors.New("L1 dispatch lookup client is not configured"), "resolve canceled dispatch")
 		}
+		observed, err := readDispatchObservation(ctx, r.store.db, run.RunID)
+		if err != nil {
+			return err
+		}
 		lookupStarted := r.store.recoveryNow()
 		job, err := r.lookup.LookupJobByDispatchKey(remote, cancellation.DispatchKey)
 		if isMissingDispatch(err, cancellation.DispatchKey) {
-			if err := r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted); err != nil {
-				return err
+			// A contradicted acknowledgement is not link evidence. Resolve its
+			// identity through L1, outside the write, just as recovery does.
+			if observed.outboxJob.Valid && observed.outboxJob.String != "" {
+				job, err = r.jobs.GetJob(remote, observed.outboxJob.String)
+				if isMissingL1Job(err, observed.outboxJob.String) {
+					if err := r.store.cancelAbsentStoredIdentity(ctx, run.RunID, observed); err != nil {
+						return err
+					}
+					return r.store.deferRunCancellation(ctx, run.RunID, nil)
+				}
+				if err != nil {
+					return err
+				}
+				if job.JobID != observed.outboxJob.String {
+					return internalError(errors.New("job lookup conflicts with stored identity"), "resolve canceled dispatch")
+				}
+			} else {
+				if err := r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted); err != nil {
+					return err
+				}
+				return r.store.deferRunCancellation(ctx, run.RunID, err)
 			}
-			// If the absence was provisional, the row remains pending. Back
-			// it off even though the lookup itself succeeded.
-			return r.store.deferRunCancellation(ctx, run.RunID, err)
 		}
 		if err != nil {
 			return err
 		}
-		if err := r.store.completeDispatch(ctx, run.RunID, job.JobID); err != nil {
+		if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, job.JobID, dispatchLookupEvidence, &observed); err != nil {
 			return err
 		}
 		record, err := r.store.GetRun(ctx, run.RunID)
@@ -297,9 +357,9 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		run.JobID, run.State = record.L1JobID, record.Status
 	}
 
-	// Link legacy outbox acknowledgements before sending any cancellation.
+	// Recheck stored outbox acknowledgements before sending any cancellation.
 	// A mismatched dispatch lookup must never become authority over another job.
-	if err := r.store.completeDispatch(ctx, run.RunID, run.JobID); err != nil {
+	if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, run.JobID, dispatchStoredEvidence, nil); err != nil {
 		return err
 	}
 	record, err := r.store.GetRun(ctx, run.RunID)
