@@ -316,6 +316,14 @@
   },
   {
     "file": "run_job_link_builder_test.go",
+    "function": "recordOutboxOnlyAcknowledgementKeepingError",
+    "fingerprint": "e6d3dd098e18b7524720023acafe3c37c51627d79ad9908beeadb6350fd77679",
+    "count": 1,
+    "reason": "Models an old ledger's outbox-only acknowledgement that left a stale retryable diagnostic for recovery's link to clear.",
+    "category": "old-schema"
+  },
+  {
+    "file": "run_job_link_builder_test.go",
     "function": "recordRecoveryRegression",
     "fingerprint": "ee2191a297899f7e5224ffd46f1586ff74122a21c0cb3923e35cd92bceb127b7",
     "count": 1,
