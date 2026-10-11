@@ -444,3 +444,59 @@ func (r *Reconciler) projectObservedJob(ctx context.Context, run projectedRun, j
 	}
 	return r.store.projectJobOutcome(ctx, run, job.State, reason)
 }
+
+// acceptRecoveredCancellation hands a bound positive observation to cancel.
+// The same write checks ownership and dispatch identity, links the Job using
+// lookup evidence, and wakes delivery. L1 calls happen only after it commits.
+func (s *Store) acceptRecoveredCancellation(ctx context.Context, item unrecordedDispatch, jobID string, observed *dispatchObservation) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin recovered cancellation")
+	}
+	defer tx.Rollback()
+	var key, outboxKey string
+	err = tx.QueryRowContext(ctx, `SELECT r.dispatch_key, o.dispatch_key
+ FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE r.run_id=? AND EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)`, item.RunID).Scan(&key, &outboxKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return internalError(err, "read recovered cancellation ownership")
+	}
+	if key != item.DispatchKey || outboxKey != key {
+		return internalError(errors.New("recovered cancellation conflicts with dispatch key"), "link recovered cancellation")
+	}
+	if err := s.completeDispatchWithEvidenceTx(ctx, tx, item.RunID, jobID, dispatchLookupEvidence, observed); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit recovered cancellation")
+	}
+	return nil
+}
+
+// linkRecoveredDispatch preserves discoveries when cancellation took ownership
+// during L1's read. The recovery write is fenced; the cancel-owned write links
+// and durably wakes delivery, even if the remaining remote budget is spent.
+func (r *Reconciler) linkRecoveredDispatch(ctx, remote context.Context, item unrecordedDispatch, jobID string, observed *dispatchObservation) error {
+	if err := r.store.linkUnrecordedDispatch(ctx, item, jobID); err != nil {
+		return err
+	}
+	if err := r.store.acceptRecoveredCancellation(ctx, item, jobID, observed); err != nil {
+		return err
+	}
+	cancellations, err := r.store.pendingRunCancellations(ctx, item.RunID)
+	if err != nil {
+		return err
+	}
+	for _, cancellation := range cancellations {
+		if remote.Err() != nil {
+			break
+		}
+		if err := r.deliverRunCancellation(ctx, remote, cancellation); err != nil {
+			return err
+		}
+	}
+	return nil
+}

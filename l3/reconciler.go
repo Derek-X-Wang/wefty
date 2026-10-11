@@ -159,7 +159,8 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 //
 // Each pass reads a bounded batch of the rows that are due, inside its budget,
 // and stops starting L1 reads once that budget is spent. A row whose L1 reads
-// fail transiently, including one the budget cut short, backs off
+// fail transiently or reveal conflicting recorded identities, including one
+// the budget cut short, backs off
 // exponentially, so an unavailable L1 costs one budget per pass at most and
 // later rows still get their turn.
 func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
@@ -195,7 +196,7 @@ type recoveryOutcome int
 
 const (
 	recoveryDone recoveryOutcome = iota
-	// recoveryTransient is a remote failure: back the row off.
+	// recoveryTransient is a remote failure or identity conflict: back the row off.
 	recoveryTransient
 	// recoveryStale is a settlement compare-and-set miss: reread the row.
 	recoveryStale
@@ -206,8 +207,8 @@ const (
 )
 
 // maxRecoveryRereads bounds how often one row is reread after its settlement
-// compare-and-set missed. Each miss means an acknowledgement landed; a row
-// still contended after that is left for the next pass.
+// compare-and-set missed. An acknowledgement or cancellation ownership may
+// have landed; a row still contended after that is left for the next pass.
 const maxRecoveryRereads = 2
 
 // recoverUnrecordedDispatch resolves one row. L1 reads use remote, bounded by
@@ -234,18 +235,29 @@ func (r *Reconciler) recoverUnrecordedDispatch(ctx, remote context.Context, item
 	}
 }
 
+// recoveredDispatchOutcome backs off corrupt identities without treating an
+// unrelated ledger failure as a remote outage. Cancellation ownership still
+// fences the recovery backoff write.
+func recoveredDispatchOutcome(err error) (recoveryOutcome, error) {
+	if errors.Is(err, errRecoveredDispatchIdentityConflict) {
+		return recoveryTransient, err
+	}
+	return recoveryDone, err
+}
+
 // resolveUnrecordedDispatch links or settles one row from what L1 answers.
 // It reports stale when the settlement compare-and-set found the row changed
 // since it was read, so the caller rereads it rather than settle over an
-// acknowledgement that arrived meanwhile, and not due when an unacknowledged
-// dispatch's absence is still inside the settle horizon.
+// acknowledgement or cancellation ownership that arrived meanwhile. It reports
+// not due when an unacknowledged dispatch's absence is still inside the
+// settle horizon.
 func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item unrecordedDispatch) (recoveryOutcome, error) {
 	lookupStarted := r.store.recoveryNow()
 	job, err := r.lookup.LookupJobByDispatchKey(remote, item.DispatchKey)
 	var absence error
 	switch {
 	case err == nil && (item.OutboxJobID == "" || job.JobID == item.OutboxJobID):
-		return recoveryDone, r.store.linkUnrecordedDispatch(ctx, item, job.JobID)
+		return recoveredDispatchOutcome(r.linkRecoveredDispatch(ctx, remote, item, job.JobID, &item.observed))
 	case err == nil:
 		absence = fmt.Errorf("L1 dispatch %q resolved to job %q, not acknowledged job %q", item.DispatchKey, job.JobID, item.OutboxJobID)
 	case isMissingDispatch(err, item.DispatchKey):
@@ -260,7 +272,7 @@ func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item
 		// run-ledger provenance, and that job is still this run's to link.
 		_, err := r.jobs.GetJob(remote, item.OutboxJobID)
 		if err == nil {
-			return recoveryDone, r.store.linkUnrecordedDispatch(ctx, item, item.OutboxJobID)
+			return recoveredDispatchOutcome(r.linkRecoveredDispatch(ctx, remote, item, item.OutboxJobID, &item.observed))
 		}
 		if !isMissingL1Job(err, item.OutboxJobID) {
 			return recoveryTransient, errors.Join(absence, r.store.observeL1Error(ctx, err))
