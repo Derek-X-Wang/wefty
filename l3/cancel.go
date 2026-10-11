@@ -130,81 +130,11 @@ func (r *Reconciler) deliverRunCancellation(ctx, remote context.Context, cancell
 }
 
 func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellation runCancellation) error {
-	run := cancellation.projectedRun
-	if run.JobID == "" {
-		if r.lookup == nil {
-			return internalError(errors.New("L1 dispatch lookup client is not configured"), "resolve canceled dispatch")
-		}
-		observed, err := readDispatchObservation(ctx, r.store.db, run.RunID)
-		if err != nil {
-			return err
-		}
-		lookupStarted := r.store.recoveryNow()
-		job, err := r.lookup.LookupJobByDispatchKey(remote, cancellation.DispatchKey)
-		if isMissingDispatch(err, cancellation.DispatchKey) {
-			// A contradicted acknowledgement is not link evidence. Resolve its
-			// identity through L1, outside the write, just as recovery does.
-			if observed.outboxJob.Valid && observed.outboxJob.String != "" {
-				job, err = r.jobs.GetJob(remote, observed.outboxJob.String)
-				if isMissingL1Job(err, observed.outboxJob.String) {
-					if err := r.store.cancelAbsentStoredIdentity(ctx, run.RunID, observed); err != nil {
-						return err
-					}
-					return r.store.deferRunCancellation(ctx, run.RunID, nil)
-				}
-				if err != nil {
-					return err
-				}
-				if job.JobID != observed.outboxJob.String {
-					return internalError(errors.New("job lookup conflicts with stored identity"), "resolve canceled dispatch")
-				}
-			} else {
-				if err := r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted); err != nil {
-					return err
-				}
-				return r.store.deferRunCancellation(ctx, run.RunID, err)
-			}
-		}
-		if err != nil {
-			return err
-		}
-		if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, job.JobID, dispatchLookupEvidence, &observed); err != nil {
-			return err
-		}
-		record, err := r.store.GetRun(ctx, run.RunID)
-		if err != nil {
-			return err
-		}
-		run.JobID, run.State = record.L1JobID, record.Status
-	}
-
-	// Recheck stored outbox acknowledgements before sending any cancellation.
-	// A mismatched dispatch lookup must never become authority over another job.
-	if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, run.JobID, dispatchStoredEvidence, nil); err != nil {
+	run, observed, ready, err := r.canceledRunJob(ctx, remote, cancellation)
+	if err != nil || !ready {
 		return err
 	}
-	record, err := r.store.GetRun(ctx, run.RunID)
-	if err != nil {
-		return err
-	}
-	if record.L1JobID != run.JobID || run.JobID == "" {
-		return internalError(errors.New("canceled dispatch acknowledgement conflicts with run association"), "link canceled dispatch")
-	}
-	run.State = record.Status
-
-	canceler, ok := r.jobs.(JobCancelClient)
-	if !ok {
-		return internalError(errors.New("L1 cancellation client is not configured"), "cancel run job")
-	}
-	observed, err := readDispatchObservation(ctx, r.store.db, run.RunID)
-	if err != nil {
-		return err
-	}
-	if !observed.runJob.Valid || observed.runJob.String != run.JobID ||
-		!observed.outboxJob.Valid || observed.outboxJob.String != run.JobID {
-		return internalError(errors.New("dispatch identity changed before cancellation"), "cancel run job")
-	}
-	run.State = observed.state
+	canceler := r.jobs.(JobCancelClient)
 	job, err := canceler.CancelJob(remote, run.JobID)
 	if err != nil {
 		a := classifyL1Answer(err)
