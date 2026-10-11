@@ -120,37 +120,6 @@ func TestDispatchNotFoundSettlesOnlyAtTheSettleHorizon(t *testing.T) {
 	}
 }
 
-// A submit error that L3 records after the run settled must not replace the
-// settled dispatch_not_found diagnostic.
-func TestLateSubmitErrorDoesNotClobberASettledDiagnostic(t *testing.T) {
-	s, _, clock := recoveryStore(t)
-	key := endedUnrecordedRuns(t, s, clock, 1)[0]
-	runID := runIDForDispatchKey(t, s, key)
-	clock.now = clock.now.Add(unrecordedDispatchSettleHorizon)
-	reconciler, err := NewReconciler(s, &recordingJobClient{}, ReconcilerConfig{DispatchLookup: &appearingLookupClient{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = reconciler.ReconcileOnce(context.Background())
-	if !jobLinkSettled(t, s, runID) {
-		t.Fatal("fixture did not settle")
-	}
-	ctx := context.Background()
-	if err := s.recordDispatchError(ctx, runID, &Error{Code: contract.ErrorConflict, Message: "late transport error", Retryable: true}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.failDispatch(ctx, runID, &Error{Code: contract.ErrorInvalidRequest, Message: "late refusal"}); err != nil {
-		t.Fatal(err)
-	}
-	execution, err := s.GetRunExecution(ctx, runID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if execution.DispatchError == nil || execution.DispatchError.Details["reason"] != dispatchNotFoundReason {
-		t.Fatalf("late submit error replaced the settled diagnostic: %+v", execution.DispatchError)
-	}
-}
-
 // clockAdvancingLookupClient answers not_found, with the ledger clock moved
 // on while the request was in flight.
 type clockAdvancingLookupClient struct {

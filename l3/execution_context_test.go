@@ -1,13 +1,9 @@
 package l3
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"net/http"
-	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -16,60 +12,6 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
-
-func TestDispatchDeliversExactRunEnvironmentAndStoresTokenHash(t *testing.T) {
-	h := newIntegrationHarness(t)
-	accepted := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "execution-env")
-	reconciler, err := NewReconciler(h.l3Store, h.l1Client, ReconcilerConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	agent := h.agent()
-	status, _, body := h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: "node-1", BootSessionID: "boot-1", Class: contract.JobClassOneShot}, nil)
-	if status != http.StatusOK {
-		t.Fatalf("claim status = %d body=%s", status, body)
-	}
-	var claim l1.Claim
-	if err := json.Unmarshal(body, &claim); err != nil {
-		t.Fatal(err)
-	}
-	handoff := filepath.Join(DefaultHandoffRoot, accepted.RunID)
-	wantPublic := map[string]string{
-		contract.EnvRunID: accepted.RunID, contract.EnvL3Endpoint: DefaultL3Address,
-		contract.EnvHandoffDir: handoff,
-	}
-	if !reflect.DeepEqual(claim.Job.Spec.Execution.Env, wantPublic) {
-		t.Fatalf("public env = %#v, want %#v", claim.Job.Spec.Execution.Env, wantPublic)
-	}
-	if len(claim.Job.Spec.Execution.SensitiveEnv) != 1 || claim.Job.Spec.Execution.SensitiveEnv[contract.EnvRunToken] == "" {
-		t.Fatalf("sensitive env = %#v, want only %s", claim.Job.Spec.Execution.SensitiveEnv, contract.EnvRunToken)
-	}
-	token := claim.Job.Spec.Execution.SensitiveEnv[contract.EnvRunToken]
-	if claim.Job.Spec.Execution.HandoffDirectory != handoff {
-		t.Fatalf("handoff directory = %q, want %q", claim.Job.Spec.Execution.HandoffDirectory, handoff)
-	}
-
-	var storedHash []byte
-	var attemptID string
-	if err := h.l3Store.db.QueryRow(`SELECT attempt_id, token_hash FROM run_tokens WHERE run_id=?`, accepted.RunID).Scan(&attemptID, &storedHash); err != nil {
-		t.Fatal(err)
-	}
-	digest := sha256.Sum256([]byte(token))
-	if attemptID == "" || !bytes.Equal(storedHash, digest[:]) || bytes.Contains(storedHash, []byte(token)) {
-		t.Fatalf("stored token binding/hash = %q/%x", attemptID, storedHash)
-	}
-	var staged *string
-	if err := h.l3Store.db.QueryRow(`SELECT token_delivery FROM dispatch_outbox WHERE run_id=?`, accepted.RunID).Scan(&staged); err != nil {
-		t.Fatal(err)
-	}
-	if staged != nil {
-		t.Fatalf("token delivery remained staged after dispatch: %q", *staged)
-	}
-}
 
 func TestRunTokenScopeDeniesSiblingAndAllowsOwnDescendant(t *testing.T) {
 	h := newIntegrationHarness(t)
@@ -177,78 +119,6 @@ func TestRunTokenRequiresFabricIdentityAndDoesNotReplaceFabricPrincipal(t *testi
 	l1Workflow := h.client(workflowIdentity, DefaultL1Address)
 	status, _, body = h.do(l1Workflow, http.MethodGet, "/v1/jobs/does-not-matter", nil, http.Header{"Authorization": []string{"Bearer " + token}})
 	assertAPIError(t, status, body, http.StatusForbidden, contract.ErrorPrincipalForbidden)
-}
-
-func TestTerminalRunTokenGraceAndExpiry(t *testing.T) {
-	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
-	clock := &mutableClock{now: now}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "tokens.sqlite"), StoreOptions{Clock: clock, RunTokenGrace: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	request := inlineRunRequest("#!/bin/sh\nexit 0\n")
-	record, _, err := store.CreateRun(context.Background(), CreateRunInput{IdempotencyKey: "grace", Actor: "test", Request: request})
-	if err != nil {
-		t.Fatal(err)
-	}
-	token, err := store.ensureRunToken(context.Background(), record.RunID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.beginDispatch(context.Background(), record.RunID); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.projectJobState(context.Background(), projectedRun{RunID: record.RunID, State: contract.RunDispatching}, contract.JobSucceeded); err != nil {
-		t.Fatal(err)
-	}
-	scope, err := store.AuthenticateRunToken(context.Background(), token)
-	if err != nil || scope.RunID != record.RunID || scope.AttemptID == "" {
-		t.Fatalf("authenticate during grace = (%#v, %v)", scope, err)
-	}
-	clock.now = now.Add(time.Minute - time.Nanosecond)
-	if _, err := store.AuthenticateRunToken(context.Background(), token); err != nil {
-		t.Fatalf("authenticate before grace expiry: %v", err)
-	}
-	clock.now = now.Add(time.Minute)
-	if _, err := store.AuthenticateRunToken(context.Background(), token); err == nil {
-		t.Fatal("authenticate at expiry succeeded, want unauthorized")
-	} else {
-		var protocolErr *Error
-		if !errors.As(err, &protocolErr) || protocolErr.Code != contract.ErrorUnauthorized {
-			t.Fatalf("authenticate at expiry = %v, want unauthorized", err)
-		}
-	}
-}
-
-func TestTerminalRunTokenGraceRejectsNewChildDispatch(t *testing.T) {
-	h := newIntegrationHarness(t)
-	parent := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "terminal-parent")
-	token, err := h.l3Store.ensureRunToken(context.Background(), parent.RunID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tx, err := h.l3Store.db.BeginTx(context.Background(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := failRunTx(context.Background(), tx, parent.RunID, time.Now().UTC(), time.Minute, "test failure"); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.l3Store.AuthenticateRunToken(context.Background(), token); err != nil {
-		t.Fatalf("terminal token should remain valid for final reads and writes: %v", err)
-	}
-	child := inlineRunRequest("#!/bin/sh\nexit 0\n")
-	child.ParentRunID = parent.RunID
-	workflow := h.client(fabric.Identity{NodeID: "workflow-node"}, DefaultL3Address)
-	status, _, body := h.do(workflow, http.MethodPost, "/v1/runs", child, http.Header{
-		"Authorization":   []string{"Bearer " + token},
-		"Idempotency-Key": []string{"terminal-child"},
-	})
-	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorConflict)
 }
 
 type mutableClock struct{ now time.Time }

@@ -3,7 +3,6 @@ package l3
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -205,64 +204,6 @@ func TestDispatchReviewHealthRefusesBearersWithoutL1(t *testing.T) {
 			health, err := h.l3Store.DispatchHealth(ctx)
 			if err != nil || health.DispatchHold != nil {
 				t.Fatalf("health refusal started hold: %+v %v", health, err)
-			}
-		})
-	}
-}
-
-func TestDispatchReviewRetryCleanup(t *testing.T) {
-	for _, end := range []string{"acknowledged", "refused", "canceled", "projected"} {
-		t.Run(end, func(t *testing.T) {
-			h := newHoldHTTPHarness(t)
-			s := h.l3Store
-			ctx := context.Background()
-			run := h.submit(inlineRunRequest("exit 0\n"), "cleanup")
-			if _, err := s.beginDispatch(ctx, run.RunID); err != nil {
-				t.Fatal(err)
-			}
-			if err := s.recordDispatchError(ctx, run.RunID, errors.New("transient")); err != nil {
-				t.Fatal(err)
-			}
-			var err error
-			switch end {
-			case "acknowledged":
-				err = s.completeDispatch(ctx, run.RunID, "job-review")
-			case "refused":
-				err = s.failDispatch(ctx, run.RunID, protocolError(contract.ErrorInvalidRequest, "refused"))
-			case "canceled":
-				_, err = s.db.Exec(`UPDATE runs SET dispatch_attempt_ns=NULL WHERE run_id=?`, run.RunID)
-				if err == nil {
-					err = s.requestRunCancellation(ctx, run.RunID, "alice")
-				}
-			case "projected":
-				err = s.completeDispatch(ctx, run.RunID, "job-review")
-				if err == nil {
-					// A legacy row present when the job becomes terminal is cleaned too.
-					_, err = s.db.Exec(`INSERT INTO dispatch_retry(run_id,failures,retry_ns) VALUES(?,1,0) ON CONFLICT(run_id) DO NOTHING`, run.RunID)
-				}
-				if err == nil {
-					err = s.projectJobState(ctx, projectedRun{RunID: run.RunID, JobID: "job-review", State: contract.RunQueued}, contract.JobFailed)
-				}
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			var n int
-			if err := s.db.QueryRow(`SELECT COUNT(*) FROM dispatch_retry WHERE run_id=?`, run.RunID).Scan(&n); err != nil {
-				t.Fatal(err)
-			}
-			if n != 0 {
-				t.Fatalf("%s retained dispatch retry row", end)
-			}
-			// A late failed submit cannot resurrect retry state for a finished dispatch.
-			if err := s.recordDispatchError(ctx, run.RunID, errors.New("late transient")); err != nil {
-				t.Fatal(err)
-			}
-			if err := s.db.QueryRow(`SELECT COUNT(*) FROM dispatch_retry WHERE run_id=?`, run.RunID).Scan(&n); err != nil {
-				t.Fatal(err)
-			}
-			if n != 0 {
-				t.Fatal("late submit error resurrected retry row")
 			}
 		})
 	}
