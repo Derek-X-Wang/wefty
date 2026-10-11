@@ -54,6 +54,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "read stale-node result")
 	}
+	// Resolve Node liveness before service stability at the same clock snapshot.
 	if err := interruptServiceStability(ctx, tx); err != nil {
 		return ReconcileResult{}, err
 	}

@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -43,19 +44,28 @@ const (
 // establishHealth applies the same health rule for Started, renewal, live
 // process logs and ready publication, inside the triggering write transaction.
 func establishHealth(ctx context.Context, tx *sql.Tx, attemptID string, cause healthCause, now time.Time) error {
-	// Read again after the caller's writes: Started and renewal may have
-	// changed phase or lease since the endpoint's initial authority check.
-	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
+	// Read only the health cause's inputs and target Job; phase, lease and
+	// authority are checked in the UPDATE below, after the caller's writes.
+	var jobID string
+	var kind string
+	var startedNS sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT jobs.job_id,
+		json_extract(CAST(jobs.spec_json AS TEXT), '$.kind'), attempts.started_ns
+		FROM attempts JOIN jobs ON jobs.job_id=attempts.job_id
+		WHERE attempts.attempt_id=?`, attemptID).Scan(&jobID, &kind, &startedNS)
+	if errors.Is(err, sql.ErrNoRows) {
+		return protocolError(contract.ErrorAttemptNotFound, "attempt %q was not found", attemptID)
+	}
 	if err != nil {
-		return err
+		return internalError(err, "read service health inputs")
 	}
 	switch cause {
 	case healthFromRenewal:
-		if attempt.spec.Kind == contract.JobKindOCI && !attempt.startedNS.Valid {
+		if kind == contract.JobKindOCI && !startedNS.Valid {
 			return nil
 		}
 	case healthFromLogs:
-		if attempt.spec.Kind == contract.JobKindOCI {
+		if kind == contract.JobKindOCI {
 			return nil
 		}
 	case healthFromStarted, healthFromPublication:
@@ -85,7 +95,7 @@ func establishHealth(ctx context.Context, tx *sql.Tx, attemptID string, cause he
 					AND nodes.state=?
 					AND attempts.boot_session_id=nodes.boot_session_id
 					AND attempts.authority_generation=nodes.authority_generation
-			)`, now.UnixNano(), attempt.jobID, attemptID, contract.AttemptClaimed, contract.AttemptRunning,
+			)`, now.UnixNano(), jobID, attemptID, contract.AttemptClaimed, contract.AttemptRunning,
 		contract.AttemptAwaitingInput, now.UnixNano(), contract.NodeAlive); err != nil {
 		return internalError(err, "record service stability")
 	}
@@ -97,7 +107,8 @@ func establishHealth(ctx context.Context, tx *sql.Tx, attemptID string, cause he
 // intermediate promotion is overwritten by settlement in the same transaction.
 func promoteExecution(ctx context.Context, tx *sql.Tx, attemptID string, now time.Time) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
-		WHERE current_attempt_id=? AND state=?`, contract.JobRunning, now.UnixNano(), attemptID, contract.JobClaimed); err != nil {
+		WHERE job_id=(SELECT job_id FROM attempts WHERE attempt_id=?)
+			AND current_attempt_id=? AND state=?`, contract.JobRunning, now.UnixNano(), attemptID, attemptID, contract.JobClaimed); err != nil {
 		return err
 	}
 	return nil
