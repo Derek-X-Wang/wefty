@@ -3,6 +3,7 @@ package l3
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -133,6 +134,8 @@ func TestRunJobLinkPublicViewsAndComputerPages(t *testing.T) {
 
 // Every successful fake read is bound to the requested Job identity, as L1's
 // client is. Unexpected identities fail the test instead of returning a Job.
+// These methods run on the HTTP server's goroutine, so they report with
+// t.Errorf and return an error rather than calling t.Fatal.
 type runViewL1Reader struct {
 	t                               *testing.T
 	jobID                           string
@@ -141,19 +144,23 @@ type runViewL1Reader struct {
 }
 
 func (reader *runViewL1Reader) SubmitJob(context.Context, contract.JobSpec) (l1.Job, error) {
-	reader.t.Fatal("reader submitted a Job")
-	return l1.Job{}, nil
+	reader.t.Error("reader submitted a Job")
+	return l1.Job{}, errors.New("reader submitted a Job")
 }
 
-func (reader *runViewL1Reader) checkJobID(jobID string) {
+func (reader *runViewL1Reader) checkJobID(jobID string) error {
 	reader.t.Helper()
 	if jobID != reader.jobID {
-		reader.t.Fatalf("read Job %q, want %q", jobID, reader.jobID)
+		reader.t.Errorf("read Job %q, want %q", jobID, reader.jobID)
+		return fmt.Errorf("read Job %q, want %q", jobID, reader.jobID)
 	}
+	return nil
 }
 
 func (reader *runViewL1Reader) GetJob(_ context.Context, jobID string) (l1.Job, error) {
-	reader.checkJobID(jobID)
+	if err := reader.checkJobID(jobID); err != nil {
+		return l1.Job{}, err
+	}
 	reader.jobReads++
 	if reader.missing {
 		return l1.Job{}, &JobNotFoundError{JobID: jobID}
@@ -162,7 +169,9 @@ func (reader *runViewL1Reader) GetJob(_ context.Context, jobID string) (l1.Job, 
 }
 
 func (reader *runViewL1Reader) GetJobLogs(_ context.Context, jobID, cursor string, _ int) (l1.LogPage, error) {
-	reader.checkJobID(jobID)
+	if err := reader.checkJobID(jobID); err != nil {
+		return l1.LogPage{}, err
+	}
 	reader.logReads++
 	if reader.missing {
 		return l1.LogPage{}, protocolError(contract.ErrorNotFound, "Job %s was not found", jobID)
@@ -171,7 +180,9 @@ func (reader *runViewL1Reader) GetJobLogs(_ context.Context, jobID, cursor strin
 }
 
 func (reader *runViewL1Reader) GetJobResult(_ context.Context, jobID string) (l1.JobResult, error) {
-	reader.checkJobID(jobID)
+	if err := reader.checkJobID(jobID); err != nil {
+		return l1.JobResult{}, err
+	}
 	reader.resultReads++
 	if reader.missing {
 		return l1.JobResult{}, protocolError(contract.ErrorNotFound, "Job %s was not found", jobID)
