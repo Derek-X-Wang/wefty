@@ -392,12 +392,29 @@ func linkSQLProtected(sql string) bool {
 			return true
 		}
 	}
+	for i, t := range tokens {
+		if t != "delete" || i+2 >= len(tokens) || tokens[i+1] != "from" {
+			continue
+		}
+		j := i + 2
+		if j+2 < len(tokens) && tokens[j+1] == "." {
+			j += 2
+		}
+		if linkProtectedColumns[linkSQLIdentifier(tokens[j])] != nil {
+			return true
+		}
+	}
 	// A Run-filtered or Run-joined cancellation read reveals ownership even
 	// when it projects only a literal, cardinality or a delivery column.
 	// Known delivery-only sites are individually recorded in the exact ratchet.
 	if tables["run_cancellations"] {
 		selecting, runScoped := false, tables["runs"]
 		for _, t := range tokens {
+			// NATURAL JOIN implicitly compares run_id; RETURNING exposes
+			// whether a cancellation ownership row exists.
+			if t == "natural" || t == "returning" {
+				return true
+			}
 			selecting = selecting || t == "select"
 			runScoped = runScoped || linkSQLIdentifier(t) == "run_id"
 		}
@@ -572,7 +589,7 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 						indexes = localTargets[callName]
 					}
 					for index := range indexes {
-						if index < len(call.Args) && p.provenUnprotectedSQL(file, call.Args[index]) {
+						if index < len(call.Args) && !opaqueTargets[callName] && !localOpaque[callName] && p.provenUnprotectedSQL(file, call.Args[index]) {
 							continue
 						}
 						if index >= len(call.Args) {
@@ -605,32 +622,51 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 	}
 	sites := map[string]linkBoundaryEntry{}
 	for name, file := range p.files {
-		if name == "run_job_link.go" || name == "run_job_link_recovery.go" {
+		if name == "run_job_link.go" {
 			continue
 		}
 		inspect := func(owner string, node ast.Node) {
 			// Bind method values in this owner; reassignment conservatively keeps the
 			// SQL target so it cannot erase the boundary.
 			localTargets, localOpaque := linkLocalSQLTargets(node, targets, opaqueTargets)
-			// Guard SQL method values at their source, including escapes into
-			// maps, interfaces, generic callbacks and channels. A callback
-			// taking strings alone carries no SQL authority.
+			// Guard SQL methods and declared wrappers at their value-use source,
+			// including escapes into maps, interfaces, callbacks and channels.
 			invoked := map[ast.Node]bool{}
 			ast.Inspect(node, func(n ast.Node) bool {
-				if c, ok := n.(*ast.CallExpr); ok {
-					invoked[c.Fun] = true
+				switch n := n.(type) {
+				case *ast.CallExpr:
+					invoked[n.Fun] = true
+				case *ast.SelectorExpr:
+					invoked[n.Sel] = true // Member name, not a function value.
+				case *ast.FuncDecl:
+					invoked[n.Name] = true // Declaration, not a use.
 				}
 				return true
 			})
 			ast.Inspect(node, func(n ast.Node) bool {
-				selector, ok := n.(*ast.SelectorExpr)
-				if !ok || invoked[selector] {
+				expr, ok := n.(ast.Expr)
+				if !ok || invoked[expr] {
 					return true
 				}
-				if _, sql := linkSQLMethod(selector.Sel.Name); !sql || p.nonSQLURLQuery(file, &ast.CallExpr{Fun: selector}) {
+				switch value := expr.(type) {
+				case *ast.Ident:
+					if value.Obj != nil {
+						fn, declared := value.Obj.Decl.(*ast.FuncDecl)
+						if !declared || fn.Name == value {
+							return true
+						}
+					}
+				case *ast.SelectorExpr:
+					if p.nonSQLURLQuery(file, &ast.CallExpr{Fun: value}) {
+						return false
+					}
+				default:
 					return true
 				}
-				input := linkGoFingerprint(selector) + "\x00SQL method value\x00" + linkGoFingerprint(node)
+				if targets[linkCallName(expr)] == nil {
+					return true
+				}
+				input := linkGoFingerprint(expr) + "\x00SQL method value\x00" + linkGoFingerprint(node)
 				fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(input)))
 				key := name + ":" + owner + ":" + fingerprint
 				site := sites[key]
@@ -639,7 +675,7 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 				site.Fingerprint = fingerprint
 				site.Count++
 				sites[key] = site
-				return true
+				return false
 			})
 			ast.Inspect(node, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
@@ -655,12 +691,23 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 					indexes = localTargets[callName]
 				}
 
+				// Calls through function parameters can carry SQL even
+				// without a locally visible handle. Only protected string arguments
+				// count; ordinary callbacks remain free.
+				if indexes == nil && p.indirectFunction(call.Fun) {
+					indexes = map[int]bool{}
+					for i, arg := range call.Args {
+						if sql, ok := p.constant(file, arg, map[string]bool{}); ok && linkSQLProtected(sql) {
+							indexes[i] = true
+						}
+					}
+				}
 				for index := range indexes {
 					var argument ast.Expr
 					if index < len(call.Args) {
 						argument = call.Args[index]
 					}
-					if _, direct := linkSQLMethod(callName); direct && p.provenUnprotectedSQL(file, argument) {
+					if !opaqueTargets[callName] && !localOpaque[callName] && p.provenUnprotectedSQL(file, argument) {
 						continue
 					}
 					sql, resolved := p.constant(file, argument, map[string]bool{})
@@ -1271,10 +1318,26 @@ func (p *linkSQLPackage) sqlValues(file *ast.File, expr ast.Expr, seen map[ast.N
 				if !ok || fn.Recv != nil || fn.Name.Name != id.Name {
 					continue
 				}
+				// Named results can change in assignments and deferred closures.
+				// They are opaque until the proof models all of those writes.
+				if fn.Type.Results != nil {
+					for _, field := range fn.Type.Results.List {
+						if len(field.Names) > 0 {
+							return nil, false
+						}
+					}
+				}
 				var result []string
 				valid := true
 				ast.Inspect(fn.Body, func(n ast.Node) bool {
-					if ret, ok := n.(*ast.ReturnStmt); ok && len(ret.Results) > 0 {
+					if _, nested := n.(*ast.FuncLit); nested {
+						return false
+					}
+					if ret, ok := n.(*ast.ReturnStmt); ok {
+						if len(ret.Results) == 0 {
+							valid = false
+							return false
+						}
 						values, ok := p.sqlValues(source, ret.Results[0], next)
 						valid = valid && ok
 						result = append(result, values...)
@@ -1470,6 +1533,54 @@ func (p *linkSQLPackage) sqlBindingEscapes(object *ast.Object) bool {
 			return true
 		})
 	}
+	// += is order-sensitive. The finite proof follows source order, so loops,
+	// jumps and writes in distinct branches cannot establish a closed set.
+	for _, file := range p.files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			var stack []ast.Node
+			branches := map[ast.Node]bool{}
+			appendWrite, loopWrite, jump := false, false, false
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				if n == nil {
+					stack = stack[:len(stack)-1]
+					return false
+				}
+				stack = append(stack, n)
+				if b, ok := n.(*ast.BranchStmt); ok && b.Tok == token.GOTO {
+					jump = true
+				}
+				assign, ok := n.(*ast.AssignStmt)
+				if !ok {
+					return true
+				}
+				for _, left := range assign.Lhs {
+					id, ok := left.(*ast.Ident)
+					if !ok || id.Obj != object {
+						continue
+					}
+					appendWrite = appendWrite || assign.Tok == token.ADD_ASSIGN
+					for i, parent := range stack {
+						switch parent.(type) {
+						case *ast.ForStmt, *ast.RangeStmt:
+							loopWrite = loopWrite || assign.Tok == token.ADD_ASSIGN
+						case *ast.IfStmt:
+							if i+1 < len(stack) {
+								branches[stack[i+1]] = true
+							}
+						case *ast.CaseClause, *ast.CommClause:
+							branches[parent] = true
+						}
+					}
+				}
+				return true
+			})
+			unsafe = unsafe || (appendWrite && (loopWrite || jump || len(branches) > 1))
+		}
+	}
 	p.unsafeSQLBindings[object] = unsafe
 	return unsafe
 }
@@ -1535,4 +1646,17 @@ func (p *linkSQLPackage) sqlHelperEscapes(fn *ast.FuncDecl) bool {
 	}
 	p.escapedSQLHelpers[fn] = escaped
 	return escaped
+}
+
+// An indirect callable may receive SQL at a call site whose handle is elsewhere.
+func (p *linkSQLPackage) indirectFunction(expr ast.Expr) bool {
+	id, ok := expr.(*ast.Ident)
+	if !ok || id.Obj == nil {
+		return false
+	}
+	if _, parameter := id.Obj.Decl.(*ast.Field); !parameter {
+		return false
+	}
+	_, ok = p.underlyingType(p.expressionType(expr, map[ast.Node]bool{}), map[string]bool{}).(*ast.FuncType)
+	return ok
 }

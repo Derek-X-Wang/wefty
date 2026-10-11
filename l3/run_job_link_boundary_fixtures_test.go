@@ -16,6 +16,21 @@ type linkBypassFixture struct {
 
 func runJobLinkBypassFixtures() []linkBypassFixture {
 	return []linkBypassFixture{
+		{"nested-protected-return-positive", `func q()string{fn:=func()string{return "SELECT l1_job_id FROM runs"};_=fn;return "SELECT status FROM runs"};func f(db *sql.DB){db.Query(q())}`, 0},
+		{"named-result-bare-return", `func q(all bool)(s string){if all{s="SELECT l1_job_id FROM runs";return};return "SELECT status FROM runs"};func f(db *sql.DB){db.Query(q(true))}`, 1},
+		{"named-result-defer", `func q()(s string){defer func(){s="SELECT l1_job_id FROM runs"}();return "SELECT status FROM runs"};func f(db *sql.DB){db.Query(q())}`, 1},
+		{"nested-return-is-not-helper-result", `func q()string{fn:=func()string{return "SELECT status FROM runs"};_=fn;panic("opaque")};func f(db *sql.DB){db.Query(q())}`, 1},
+		{"wrapper-as-value", `func migrationFixtureSQL(t *testing.T,s *Store,q string){s.db.Exec(q)};func applyFixtureSQL(fn func(*testing.T,*Store,string),t *testing.T,s *Store){fn(t,s,"UPDATE runs SET l1_job_id=NULL WHERE run_id=?")};func f(t *testing.T,s *Store){applyFixtureSQL(migrationFixtureSQL,t,s)}`, 3},
+		{"loop-reverse-assembly", `func f(db *sql.DB){q:="SELECT status FROM runs WHERE ";for i:=0;i<2;i++{if i==1{q+="job_id IS NULL"}else{q+="l1_"}};db.Query(q)}`, 1},
+		{"goto-reverse-assembly", `func f(db *sql.DB){q:="SELECT ";goto a;b:q+="job_id FROM runs";db.Query(q);return;a:q+="l1_";goto b}`, 1},
+		{"branches-reverse-assembly", `func f(db *sql.DB,a,b bool){q:="SELECT ";if a{q+="job_id FROM runs"};if b{q+="l1_"};db.Query(q)}`, 1},
+		{"opaque-forwarding-wrapper", `func ensure(db *sql.DB,table,column string){db.Exec("ALTER TABLE "+table+" ADD COLUMN "+column)};func add(db *sql.DB,table,column string){ensure(db,table,column)};func f(db *sql.DB){add(db,"other","x")};func g(db *sql.DB){add(db,"runs","l1_job_id")}`, 4},
+		{"opaque-builder-wrapper", `func execute(db *sql.DB,q string){db.Exec(builder(q))};func forward(db *sql.DB,q string){execute(db,q)};func f(db *sql.DB){forward(db,"ordinary fragment")}`, 3},
+		{"delete-runs", `func f(db *sql.DB){db.Exec("DELETE FROM runs WHERE run_id=?")}`, 1},
+		{"delete-outbox", `func f(db *sql.DB){db.Exec("DELETE FROM dispatch_outbox WHERE run_id=?")}`, 1},
+		{"natural-join-cancellation", `func f(db *sql.DB){db.Query("SELECT t.actor FROM run_triggers t NATURAL JOIN run_cancellations")}`, 1},
+		{"cancellation-update-returning", `func f(db *sql.DB){db.QueryRow("UPDATE run_cancellations SET failures=failures WHERE run_id=? RETURNING 1")}`, 1},
+
 		{"map-of-sql-functions", `func f(db *sql.DB){m:=map[string]func(string,...any)(*sql.Rows,error){"q":db.Query};m["q"]("SELECT l1_job_id FROM runs")}`, 1},
 		{"asserted-sql-function", `func f(db *sql.DB){var x any=db.Query;x.(func(string,...any)(*sql.Rows,error))("SELECT l1_job_id FROM runs")}`, 1},
 		{"generic-sql-callback", `func call[F ~func(string,...any)(*sql.Rows,error)](f F){f("SELECT l1_job_id FROM runs")};func f(db *sql.DB){call(db.Query)}`, 1},
@@ -26,7 +41,7 @@ func runJobLinkBypassFixtures() []linkBypassFixture {
 		{"finite-safe-range", `func f(db *sql.DB){for _,pragma:=range []string{"fullfsync","checkpoint_fullfsync"}{db.Query("PRAGMA "+pragma)}}`, 0},
 		{"finite-protected-range", `func f(db *sql.DB){for _,column:=range []string{"status","l1_job_id"}{db.Query("SELECT "+column+" FROM runs")}}`, 1},
 		{"reassigned-sql-parameter", `func execute(db *sql.DB,q string){q="SELECT l1_job_id FROM runs";db.Query(q)};func f(db *sql.DB){execute(db,"SELECT status FROM runs")}`, 1},
-		{"escaped-private-sql-helper", `func execute(db *sql.DB,q string){db.Query(q)};var alias=execute;func f(db *sql.DB){alias(db,"SELECT l1_job_id FROM runs");execute(db,"SELECT status FROM runs")}`, 2},
+		{"escaped-private-sql-helper", `func execute(db *sql.DB,q string){db.Query(q)};var alias=execute;func f(db *sql.DB){alias(db,"SELECT l1_job_id FROM runs");execute(db,"SELECT status FROM runs")}`, 3},
 		{"addressed-sql-string", `func change(q *string){*q="SELECT l1_job_id FROM runs"};func f(db *sql.DB){q:="SELECT status FROM runs";change(&q);db.Query(q)}`, 1},
 		{"shadowed-sql-constructor", `func query()string{return "SELECT status FROM runs"};func f(db *sql.DB){query:=func()string{return "SELECT l1_job_id FROM runs"};db.Query(query())}`, 1},
 		{"mutable-global-sql", `var query="SELECT status FROM runs";func f(db *sql.DB){db.Query(query)}`, 1},
@@ -34,12 +49,12 @@ func runJobLinkBypassFixtures() []linkBypassFixture {
 		{"range-key-sql-string", `func f(db *sql.DB){q:="SELECT status FROM runs";for q=range map[string]int{"SELECT l1_job_id FROM runs":1}{};db.Query(q)}`, 1},
 		{"range-local-safe-sql", `func f(db *sql.DB){q:="SELECT status FROM runs";for _,q=range []string{"SELECT status FROM runs"}{};db.Query(q)}`, 0},
 		{"range-local-protected-sql", `func f(db *sql.DB){q:="SELECT status FROM runs";for _,q=range []string{"SELECT l1_job_id FROM runs"}{};db.Query(q)}`, 1},
-		{"function-parameter", `func read(q func(string) (*sql.Rows,error)){q("SELECT l1_job_id FROM runs")}`, 0},
-		{"sql-handle-call-argument", `func read(q func(context.Context,string,...any)*sql.Row,ctx context.Context,id string){q(ctx,"SELECT l1_job_id FROM runs WHERE run_id=?",id)};func f(s *Store,ctx context.Context){read(s.db.QueryRowContext,ctx,"run")}`, 1},
+		{"function-parameter", `func read(q func(string) (*sql.Rows,error)){q("SELECT l1_job_id FROM runs")}`, 1},
+		{"sql-handle-call-argument", `func read(q func(context.Context,string,...any)*sql.Row,ctx context.Context,id string){q(ctx,"SELECT l1_job_id FROM runs WHERE run_id=?",id)};func f(s *Store,ctx context.Context){read(s.db.QueryRowContext,ctx,"run")}`, 2},
 		{"function-field-literal", `type h struct {q func(string,...any)(*sql.Rows,error)};func f(db *sql.DB){x:=h{q:db.Query};x.q("SELECT l1_job_id FROM runs")}`, 1},
 		{"function-field-assignment", `type h struct {q func(string,...any)(*sql.Rows,error)};func f(db *sql.DB){var x h;x.q=db.Query;x.q("SELECT l1_job_id FROM runs")}`, 1},
 		{"function-method-result", `type h struct{};func(x h)get(db *sql.DB)func(string,...any)(*sql.Rows,error){return db.Query};func f(x h,db *sql.DB){x.get(db)("SELECT l1_job_id FROM runs")}`, 1},
-		{"named-function-parameter", `type query func(string);func f(q query){q("SELECT l1_job_id FROM runs")}`, 0},
+		{"named-function-parameter", `type query func(string);func f(q query){q("SELECT l1_job_id FROM runs")}`, 1},
 		{"replace-without-into", `func f(db *sql.DB){db.Exec("REPLACE runs(run_id,status) VALUES(?,?)")}`, 1},
 		{"function-result", `func get(db *sql.DB)func(string,...any)(*sql.Rows,error){return db.Query};func f(db *sql.DB){get(db)("SELECT l1_job_id FROM runs")}`, 1},
 		{"function-local", `func f(db *sql.DB){q:=func(s string){db.Query(s)};q("SELECT l1_job_id FROM runs")}`, 1},
@@ -88,7 +103,7 @@ func runJobLinkBypassFixtures() []linkBypassFixture {
 		{"opaque-wrapper", `func execute(db *sql.DB,q string){db.Exec(q)};func f(db *sql.DB){execute(db,"SELECT l1_job_id FROM runs")}`, 2},
 		{"wrapper-alias", `func execute(db *sql.DB,q string){sql:=q;db.Exec(sql)};func f(db *sql.DB){execute(db,"SELECT l1_job_id FROM runs")}`, 2},
 		{"wrapper-method-value", `func execute(db *sql.DB,q string){query:=db.Query;query(q)};func f(db *sql.DB){execute(db,"SELECT l1_job_id FROM runs")}`, 3},
-		{"wrapper-constructor-method-value", `func execute(db *sql.DB,table,column string){db.Query("SELECT "+column+" FROM "+table)};func f(db *sql.DB){exec:=execute;exec(db,"runs","l1_job_id")}`, 2},
+		{"wrapper-constructor-method-value", `func execute(db *sql.DB,table,column string){db.Query("SELECT "+column+" FROM "+table)};func f(db *sql.DB){exec:=execute;exec(db,"runs","l1_job_id")}`, 3},
 		{"global-method-value", `var query=(*sql.DB).Query;func f(db *sql.DB){query(db,"SELECT l1_job_id FROM runs")}`, 2},
 		{"var-method-value", `func f(db *sql.DB){var query=db.Query;query("SELECT l1_job_id FROM runs")}`, 2},
 		{"wrapper-identifier-construction", `func execute(db *sql.DB,table,column string){db.Query("SELECT "+column+" FROM "+table)};func f(db *sql.DB){execute(db,"runs","l1_job_id")}`, 2},
@@ -322,9 +337,6 @@ func TestRunJobLinkBoundaryBuilderHasNoFileExemption(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := 1
-		if name == "run_job_link_recovery.go" {
-			want = 0
-		}
 		if got := len(p.sites()); got != want {
 			t.Fatalf("%s sites=%d want %d", name, got, want)
 		}

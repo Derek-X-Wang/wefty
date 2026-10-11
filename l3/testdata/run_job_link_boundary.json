@@ -451,6 +451,14 @@
     "category": "corruption"
   },
   {
+    "file": "run_job_link_cancel_refence_test.go",
+    "function": "*cancelRefenceConn.QueryContext",
+    "fingerprint": "2946035aae91d1cb7b8408487d8064e03df0d8d57b3dc10260e1def0dfefd075",
+    "count": 1,
+    "reason": "Test-only SQLite driver forwards the real queries and injects a competing identity write after GetRun finishes, before the final cancellation fence.",
+    "category": "injected-failure"
+  },
+  {
     "file": "run_job_link_regression_http_test.go",
     "function": "TestL1RegressionExecutionReadBoundary",
     "fingerprint": "5962591bc9ca2eb13e61937e2228d49628c64a9bccf86ba521711d9363905e13",
