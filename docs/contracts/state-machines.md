@@ -1314,12 +1314,24 @@ locally with
 An empty L1 job ID is rejected before the acknowledgement can be written to
 the outbox or Run. An acknowledgement cannot link a Run if it conflicts with
 the outbox Job, the Run's own Job, or the regression diagnostic's Job. Each
-recorded identity must be absent or equal the Job being linked. Pending
-cancellation reads use the Run job link module's confirmed Job reference;
-public reads never merge it with an outbox-only acknowledgement. Cancellation
-resolves an unlinked Run by dispatch key. Its private fallback can use a stored
-acknowledgement only when no settled absence or regression diagnostic
-contradicts it; contradicted evidence needs a fresh identity-bound L1 lookup.
+recorded identity must be absent or equal the Job being linked. Public Run
+readers use only the Run job link module's confirmed Job reference; they never
+merge it with an outbox-only acknowledgement. Cancellation privately uses
+identity in this order:
+
+1. The Run's confirmed Job reference.
+2. An uncontradicted stored outbox acknowledgement, linked without an L1
+   lookup. Both the cancellation request and pending cancellation reads prefer
+   the confirmed reference, then this acknowledgement. The request links the
+   acknowledgement before recording intent; delivery also links it without a
+   lookup when its pending record supplies a non-empty Job ID.
+3. The dispatch-key lookup, only when no usable stored identity exists.
+4. A `GetJob` lookup of the contradicted stored identity, only when the
+   dispatch-key lookup reports authoritative absence.
+
+A stored acknowledgement is usable only when no settled absence or regression
+verdict contradicts it. Contradicted evidence needs a fresh identity-bound L1
+lookup.
 The module rechecks evidence before committing a confirmed link and rechecks
 both recorded identities before remote cancellation delivery. Stored identity
 alone cannot clear a contradiction or restore a link. A fresh identity-bound lookup
@@ -1331,11 +1343,10 @@ changed, or `last_error` changed since lookup began. A regression re-recorded
 for the same Job with a different `last_error` is a newer verdict. A stale
 answer leaves the next pass to decide. An acknowledgement of the same Job
 during lookup does not prevent delivery in that pass. The write still refuses
-any conflicting recorded Job identity. When dispatch-key lookup cannot find
-the Job, cancellation can confirm an
-uncontradicted legacy acknowledgement through the module's stored-evidence
-transition. This preserves terminal outcomes and timestamps; it is not a
-precondition that every cancel request writes a link.
+any conflicting recorded Job identity. Linking an uncontradicted legacy
+acknowledgement through the module's stored-evidence transition preserves
+terminal outcomes and timestamps; it is not a precondition that every cancel
+request writes a link.
 A delayed acknowledgement after a regression proves the earlier commit and
 cannot overturn that verdict. A fresh lookup that finds the same Job and is
 bound to the requested dispatch key or acknowledged Job ID can link it,

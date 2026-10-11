@@ -1082,6 +1082,16 @@ diagnostics, empty logs, and a result `not_found`; no read waits or writes.
 Computer run pages hydrate through the Run view. Regression diagnostics and
 original Job identity remain visible as before, including succeeded Runs.
 
+Cancellation privately prefers the Run's confirmed Job reference, then an
+uncontradicted stored outbox acknowledgement. The cancellation request and
+pending cancellation reads use this same order; an acknowledgement links
+without an L1 lookup, during the request or before delivery of a pending
+record with a non-empty Job ID. Only when no usable stored identity exists
+does cancellation look up the dispatch key. If that lookup reports
+authoritative absence and stored identity is contradicted, cancellation falls
+back to `GetJob` for that identity. A fresh identity-bound positive lookup is
+required to restore a contradicted link.
+
 L3 owns the Run-to-Job link; L1 remains the authority on Job existence and
 outcome. Link knowledge is `unknown`, `attempted-unconfirmed`, `linked`,
 `missing-settled`, or `regressed`, independent of Run outcome. Acknowledgements

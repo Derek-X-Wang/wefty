@@ -22,7 +22,8 @@ import (
 // Protected storage (not public protocol vocabulary): runs.l1_job_id,
 // job_link_settled, job_link_failures, job_link_retry_ns, dispatch_attempt_ns;
 // dispatch_outbox.job_id, dispatched_ns, last_error, token_delivery; existence,
-// insertion and deletion of run_cancellations. Delivery status is separate.
+// insertion and deletion of run_cancellations. Re-keying runs or dispatch_outbox
+// also moves link evidence. Delivery status and ordinary run_id reads are separate.
 var linkProtectedColumns = map[string]map[string]bool{
 	"runs":              {"l1_job_id": true, "job_link_settled": true, "job_link_failures": true, "job_link_retry_ns": true, "dispatch_attempt_ns": true},
 	"dispatch_outbox":   {"job_id": true, "dispatched_ns": true, "last_error": true, "token_delivery": true},
@@ -402,6 +403,41 @@ func linkSQLProtected(sql string) bool {
 		}
 		if linkProtectedColumns[linkSQLIdentifier(tokens[j])] != nil {
 			return true
+		}
+	}
+	// Re-keying moves existing link evidence to another Run. Protect assignment
+	// targets, including tuple assignments and UPSERT, while leaving ordinary
+	// run_id reads, filters and explicit new-row insertion outside this rule.
+	if tables["runs"] || tables["dispatch_outbox"] {
+		for i, t := range tokens {
+			if t != "set" {
+				continue
+			}
+			left, depth := true, 0
+		assignments:
+			for _, t := range tokens[i+1:] {
+				switch t {
+				case "where", "returning", ";":
+					if depth == 0 {
+						break assignments
+					}
+				case "(":
+					depth++
+				case ")":
+					depth--
+				case "=":
+					if depth == 0 {
+						left = false
+					}
+				case ",":
+					if depth == 0 {
+						left = true
+					}
+				}
+				if left && linkSQLIdentifier(t) == "run_id" {
+					return true
+				}
+			}
 		}
 	}
 	// A Run-filtered or Run-joined cancellation read reveals ownership even
@@ -1517,6 +1553,20 @@ func (p *linkSQLPackage) sqlBindingEscapes(object *ast.Object) bool {
 			}
 		}
 		ast.Inspect(file, func(n ast.Node) bool {
+			// A closure can run after later writes in its enclosing scope.
+			// Source-order concatenation cannot prove its SQL values closed.
+			if closure, ok := n.(*ast.FuncLit); ok {
+				ast.Inspect(closure.Body, func(n ast.Node) bool {
+					if assign, ok := n.(*ast.AssignStmt); ok && assign.Tok == token.ADD_ASSIGN {
+						for _, left := range assign.Lhs {
+							if id, ok := left.(*ast.Ident); ok && id.Obj == object {
+								unsafe = true
+							}
+						}
+					}
+					return true
+				})
+			}
 			// Range keys can be map strings; their finite values are not part
 			// of the value-only range proof.
 			if loop, ok := n.(*ast.RangeStmt); ok && linkRangeValueObject(loop.Key) == object {
