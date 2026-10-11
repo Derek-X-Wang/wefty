@@ -1037,7 +1037,7 @@
       "put": {
         "operationId": "setComputerDesiredState",
         "summary": "Start or stop a Computer under intent and Storage CAS",
-        "description": "The Computer is the sole desired-state authority. A stale intent revision or storage reference is a typed conflict and performs no write.",
+        "description": "The Computer is the sole desired-state authority. A stale intent revision or storage reference is a typed conflict and performs no write. Stopping a queued Computer detaches its terminal predecessor while retaining that exact accepted completion for idempotent acknowledgement. An already-detached queued projection keeps its completion replay binding until a later claim replaces it.",
         "requestBody": {
           "required": true,
           "content": { "application/json": { "schema": {

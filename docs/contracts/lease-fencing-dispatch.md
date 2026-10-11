@@ -262,13 +262,16 @@ explicit window, L1 replaces each received raw event with a truthful per-stream
 `late_evidence_window_expired` gap; the independent log retention ages (7 days
 for services, 30 days for one-shots) remain storage bounds and therefore bind
 later. Neither path changes the job verdict, attempt verdict, current attempt,
-or authority generation.
+authority generation, or current service health.
 
 The claimed-to-running promotion block inside a log append remains in place
 for `kind=process` because it is authority-changing. It runs only while the
 attempt still has current boot-session, generation, current-attempt, and lease
-authority; late observation always skips it. `kind=oci` log insertion never
-promotes: only `Started` does.
+authority; late observation always skips it. Job promotion is conditional on
+`jobs.state=claimed`, so logs cannot reverse `stopping` or erase stop intent.
+Only logs from an active process attempt with current live authority may start
+the portless-service stability window. `kind=oci` log insertion never promotes:
+only `Started` does.
 
 A gap declaration uses `LogEvent.sequence` as the first lost sequence and
 `gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
@@ -613,7 +616,11 @@ differs in any of those fields is `idempotency_conflict`; a first completion
 from a replaced registration is `node_session_replaced` for as long as the
 attempt's lease runs, then `lease_expired` with late evidence; an attempt that
 is no longer the job's current or retained replay attempt is `attempt_mismatch`
-(#553).
+(#553). Stopping a queued Computer retains its terminal predecessor as the
+exact completion replay binding when it clears the runtime owner. If the queued
+projection was already detached by an accepted pre-start completion, its replay
+binding is preserved. A later claim replaces either binding; stop never reapplies
+the accepted completion or grants the detached attempt live authority.
 
 An accepted completion of a Computer Job -- first write or replay, of the
 Computer's current Job or of one a reimage has since superseded -- is followed

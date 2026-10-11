@@ -4071,11 +4071,14 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging attempt running")
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?", contract.JobRunning, now.UnixNano(), jobID); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?", contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging job running")
 		}
 	}
-	if attempt.spec.Kind != contract.JobKindOCI {
+	// Evidence from a lost or replaced attempt is still retained, but cannot
+	// start the current service's stability window.
+	if hasAuthority && !canceled && now.Before(attempt.leaseExpires) && attempt.spec.Kind != contract.JobKindOCI &&
+		(attempt.state == contract.AttemptClaimed || attempt.state == contract.AttemptRunning || attempt.state == contract.AttemptAwaitingInput) {
 		if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
 			return AppendLogsResponse{}, err
 		}

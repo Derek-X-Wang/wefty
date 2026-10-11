@@ -145,6 +145,16 @@ spawn/output failure, image-reconciliation latch, or removal. Operator stop
 records stopped intent without starting an attempt; repeat stop is a validated
 no-op.
 
+Process logs may promote a Job only from `claimed` to `running`; logs received
+after operator stop retain `stopping` and desired `stopped`. A service's restart
+streak resets only after continuous stability under its current, active,
+unexpired attempt on its bound alive node, with matching boot session and
+registration authority generation. Reconcile clears the health timestamp when
+the node becomes unavailable or its registration replaces the attempt's
+authority. That suppressed time cannot count toward stability. Late logs from a
+lost, superseded, or replaced attempt retain evidence but never start or extend
+the current service's stability window.
+
 Lease loss records an attempt `lost` without a process result. Under `never`,
 loss after durable OCI `Started` or process start acknowledgement leaves the
 service `failed` with no automatic requeue, policy stop, or payload failure.
@@ -463,9 +473,12 @@ ENOSPC and digest mismatch publish no Backup and require positive copy absence.
 Restore is stopped-only. For a Computer with a current attempt, an accepted
 stop completion's runtime-quiescence evidence atomically clears the current
 runtime owner while recording that terminal attempt as the exact idempotent
-completion replay binding; a stopped projection with a current attempt is not
-detached. An ordinary runtime failure retains its current attempt and is
-therefore not detached even though restore also admits a failed projection
+completion replay binding. Stopping a queued Computer also clears its terminal
+predecessor as current runtime owner and retains that predecessor's exact
+completion replay binding; an already-detached queued projection keeps its
+existing replay binding. A later claim replaces the binding. A stopped
+projection with a current attempt is not detached. An ordinary runtime failure
+retains its current attempt and is therefore not detached even though restore also admits a failed projection
 whose current attempt has been cleared. The L1 stopped-or-failed projection
 with no current attempt is a necessary restore-admission condition, not proof
 of node-local absence: helper-side `computer_storage_busy` remains the
@@ -1056,8 +1069,17 @@ is expiry of the agent-owned bound.
 | `failed` | A matching, in-lease failure was accepted. Terminal. | none |
 | `lost` | The control plane's clock observed lease expiry, or L1 revoked the attempt's authority: an image-reconciliation latch, a Computer reconfiguration abort, or removal of its service or Computer. Terminal; a desired-running service may requeue its containing job, never this attempt. | none |
 
-Only the current `(job_id, attempt_id, fencing_token)` tuple may renew a lease,
-append logs, or complete. An expired attempt becomes `lost` exactly once.
+Only the current `(job_id, attempt_id, fencing_token)` tuple under the current
+node boot session and authority generation may renew a lease or perform a first
+authoritative completion. An expired attempt becomes `lost` exactly once.
+Logs instead use the original attempt's evidence provenance: lost attempts may
+append late evidence within the documented window, and recorded events remain
+replayable under the log-continuity rules. Late evidence never changes current
+service health or authority. An exact accepted completion remains acknowledgeable
+while its attempt is current or retained as the completion replay binding,
+including after node re-registration or queued Computer stop detaches it. These
+exceptions retain history and acknowledge prior writes; they do not grant live
+authority. See `lease-fencing-dispatch.md` for their windows and replay rules.
 For `kind=oci`, only the fenced, idempotent `Started` acknowledgement may move
 `claimed → running`; renewal, log insertion, and completion never synthesize
 that transition.
