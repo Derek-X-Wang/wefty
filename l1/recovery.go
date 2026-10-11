@@ -54,49 +54,12 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "read stale-node result")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET healthy_since_ns=NULL
-		WHERE healthy_since_ns IS NOT NULL
-			AND EXISTS (
-				SELECT 1 FROM jobs
-				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
-				JOIN nodes ON nodes.node_id=attempts.node_id
-				WHERE jobs.job_id=service_jobs.job_id
-					AND service_jobs.bound_node_id=attempts.node_id
-					AND (nodes.state<>?
-						OR attempts.boot_session_id<>nodes.boot_session_id
-						OR attempts.authority_generation<>nodes.authority_generation)
-			)`, contract.NodeAlive); err != nil {
-		return ReconcileResult{}, internalError(err, "interrupt service stability on unavailable or replaced nodes")
+	if err := interruptServiceStability(ctx, tx); err != nil {
+		return ReconcileResult{}, err
 	}
-
-	// Node liveness is resolved first at the same clock snapshot. In
-	// particular, a node that reaches the equal two-minute dead/stability
-	// boundary is dead and cannot reset a service's failure streak.
-	resets, err := tx.ExecContext(ctx, `UPDATE service_jobs SET restart_streak=0
-		WHERE restart_streak>0
-			AND desired_state=?
-			AND healthy_since_ns IS NOT NULL
-			AND healthy_since_ns<=?
-			AND EXISTS (
-				SELECT 1 FROM jobs
-				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
-				JOIN nodes ON nodes.node_id=attempts.node_id
-				WHERE jobs.job_id=service_jobs.job_id
-					AND jobs.state=?
-					AND attempts.state=?
-					AND attempts.lease_expires_ns>?
-					AND nodes.state=?
-					AND attempts.boot_session_id=nodes.boot_session_id
-					AND attempts.authority_generation=nodes.authority_generation
-					AND service_jobs.bound_node_id=attempts.node_id
-			)`, contract.ServiceDesiredRunning, now.Add(-s.serviceStabilityWindow).UnixNano(),
-		contract.JobRunning, contract.AttemptRunning, now.UnixNano(), contract.NodeAlive)
+	result.RestartStreakResets, err = reconcileServiceStability(ctx, tx, now, s.serviceStabilityWindow)
 	if err != nil {
-		return ReconcileResult{}, internalError(err, "reset stable service restart streaks")
-	}
-	result.RestartStreakResets, err = resets.RowsAffected()
-	if err != nil {
-		return ReconcileResult{}, internalError(err, "read stable service reset result")
+		return ReconcileResult{}, err
 	}
 
 	rows, err := tx.QueryContext(ctx, `SELECT attempts.attempt_id
