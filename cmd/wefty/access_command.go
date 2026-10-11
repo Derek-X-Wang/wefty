@@ -158,34 +158,53 @@ func executeComputerGrant(
 		return err
 	}
 	if waitForCompletion && result.Revocation != nil {
+		waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
+		defer cancel()
 		// The observation loop retries retryable answers at its own interval
 		// (#763, #773): the shared client's one-shot quiet retry is doubled
 		// backoff on top of it, so the loop's reads are marked out.
-		observingCtx := withoutClientRetry(ctx)
+		waitCtx = withoutClientRetry(waitCtx)
+		deadline, _ := waitCtx.Deadline()
 		result.ObservationState = "pending"
 		result.LastObservedRevocation = result.Revocation
-		waited := time.Duration(0)
 		var lastRetryable error
-		for result.Revocation.State != l1.ComputerPolicyRevocationCompleted {
-			if waited >= waitTimeout {
-				// The window ran out: the existing observation timeout, with
-				// the last retryable answer on record when every read hit one
-				// (#763).
+		fail := func(err error) error {
+			// Caller cancellation stays local. Only the wait's own deadline
+			// turns a deadline-caused read or sleep failure into exit 14,
+			// as in pollStorageObservation (#722).
+			if ctx.Err() != nil {
+				result.ObservationState = "failed"
+				result.ObservationFailure = ctx.Err().Error()
+				observationErr := fmt.Errorf("%s: %w", computerGrantObservationMessage(result, "observation failed"), ctx.Err())
+				if writeErr := writeComputerGrantMutation(stdout, result, jsonOutput); writeErr != nil {
+					return errors.Join(observationErr, writeErr)
+				}
+				return observationErr
+			}
+			if waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
 				if lastRetryable != nil {
 					result.ObservationFailure = lastRetryable.Error()
 				}
 				return computerGrantObservationError(contract.ErrorRevocationWaitTimeout,
 					computerGrantObservationMessage(result, "observation timed out"), result)
 			}
-			delay := min(pollInterval, waitTimeout-waited)
-			if err := clients.wait(ctx, delay); err != nil {
-				result.ObservationState = "failed"
-				result.ObservationFailure = err.Error()
-				return computerGrantObservationError(contract.ErrorRevocationObservationFailed,
-					computerGrantObservationMessage(result, "observation failed"), result)
+			result.ObservationState = "failed"
+			result.ObservationFailure = err.Error()
+			return computerGrantObservationError(contract.ErrorRevocationObservationFailed,
+				computerGrantObservationMessage(result, "observation failed"), result)
+		}
+		for result.Revocation.State != l1.ComputerPolicyRevocationCompleted {
+			if err := waitCtx.Err(); err != nil {
+				return fail(err)
 			}
-			waited += delay
-			revocation, err := clients.getComputerPolicyRevocation(observingCtx, result.Revocation.ComputerID,
+			delay := min(pollInterval, time.Until(deadline))
+			if err := clients.wait(waitCtx, delay); err != nil {
+				return fail(err)
+			}
+			if err := waitCtx.Err(); err != nil {
+				return fail(err)
+			}
+			revocation, err := clients.getComputerPolicyRevocation(waitCtx, result.Revocation.ComputerID,
 				result.Revocation.SubjectFabricID, result.Revocation.SubjectUserID, result.Revocation.PolicyRevision)
 			if err != nil {
 				// The revocation read goes through the snapshot door, so it
@@ -196,15 +215,12 @@ func executeComputerGrant(
 					lastRetryable = err
 					continue
 				}
-				result.ObservationState = "failed"
-				result.ObservationFailure = err.Error()
-				return computerGrantObservationError(contract.ErrorRevocationObservationFailed,
-					computerGrantObservationMessage(result, "observation failed"), result)
+				return fail(err)
 			}
-			result.Revocation = &revocation
 			// A good read clears the record: the timeout names a retryable
 			// answer only when the reads at the end were retryable.
 			lastRetryable = nil
+			result.Revocation = &revocation
 			result.LastObservedRevocation = &revocation
 		}
 		result.ObservationState = "completed"

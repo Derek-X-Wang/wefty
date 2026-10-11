@@ -133,8 +133,18 @@ transport unavailability. A retryable `unavailable` read during that
 observation window is retried at the normal poll interval, and running out of
 the window on retryable answers alone is the same `revocation_wait_timeout`
 outcome (exit 14) with the last answer recorded in
-`details.observation_failure`; a non-retryable read error still reports
-`revocation_observation_failed` at once. `services grant` does not accept `--wait`.
+`details.observation_failure`, including when the deadline interrupts the next
+read. One elapsed-time deadline bounds polling delays and every revocation
+read, including response-body reads; slow answers cannot extend
+`--wait-timeout`. An answer that a deadline-bounded read returns is used even
+if the deadline passes while it is processed: a completed revocation succeeds,
+and a pending one becomes `details.last_observed_revocation` in the timeout.
+Caller cancellation during a delay or read is a local failure (exit 1,
+`retryable=false`): the mutation receipt and last observed revocation go to
+stdout in both JSON and human output, and stderr carries `error.code=internal`
+with a message saying the revocation was applied (or, for a replay, not
+reapplied) and that observation failed with `context canceled`. A non-retryable read error
+reports `revocation_observation_failed` at once. `services grant` does not accept `--wait`.
 
 Typed outcomes (custody exits 6–9,
 failed run 10, wait timeout 11, not-ready status 12) already write their result
