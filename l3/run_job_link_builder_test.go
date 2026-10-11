@@ -204,6 +204,14 @@ func recordOutboxOnlyAcknowledgement(t *testing.T, store *Store, runID, jobID st
 	}
 }
 
+// recordOutboxOnlyAcknowledgementKeepingError records only the acknowledgement,
+// leaving the stale retryable diagnostic for recovery's link to clear.
+func recordOutboxOnlyAcknowledgementKeepingError(ctx context.Context, store *Store, runID, jobID string) error {
+	_, err := store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=? WHERE run_id=? AND dispatched_ns IS NULL`,
+		jobID, store.clock.Now().UnixNano(), runID)
+	return err
+}
+
 // ageDispatchAttemptPastSettleHorizon moves the run's last submit attempt
 // beyond the settle horizon, and clears any backoff, so the next pass may
 // settle an unacknowledged dispatch's absence.
@@ -236,9 +244,9 @@ func jobLinkSettled(t *testing.T, s *Store, runID string) bool {
 	return observed.settled
 }
 
-// Recovery legacy/corruption fixtures preserve the rest of the captured link.
-// These writes model old ledgers and verdicts that no current terminal writer
-// can produce. Ordinary recovery tests drive the production transitions.
+// Recovery fixtures preserve the rest of the captured link while modeling
+// old or corrupt ledgers and concurrent newer verdicts. Other recovery tests
+// drive the production transitions.
 func recordRecoveryRegression(ctx context.Context, s *Store, runID, jobID, message string) error {
 	payload, err := json.Marshal(contract.APIError{Code: contract.ErrorNotFound, Message: message, Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": jobID}})
 	if err != nil {

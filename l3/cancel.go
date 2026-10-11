@@ -134,7 +134,10 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 	if err != nil || !ready {
 		return err
 	}
-	canceler := r.jobs.(JobCancelClient)
+	canceler, ok := r.jobs.(JobCancelClient)
+	if !ok {
+		return internalError(errors.New("L1 cancellation client is not configured"), "cancel run job")
+	}
 	job, err := canceler.CancelJob(remote, run.JobID)
 	if err != nil {
 		a := classifyL1Answer(err)
