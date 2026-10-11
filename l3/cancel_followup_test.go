@@ -24,7 +24,7 @@ func TestCancelFollowupRefusalVisibleOnRead(t *testing.T) {
 	if err := r.ReconcileOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
-	client := &reviewCancelClient{L1Client: h.l1Client, err: &Error{Code: contract.ErrorCancelNotQueued, Message: "only one-shots support active cancellation"}}
+	client := &recordingCancelClient{L1Client: h.l1Client, err: &Error{Code: contract.ErrorCancelNotQueued, Message: "only one-shots support active cancellation"}}
 	h.l3Server.jobs = client
 	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
 	if status != http.StatusOK {
@@ -183,7 +183,7 @@ func TestCancelFollowupRepeatResetsBackoff(t *testing.T) {
 	if err := r.ReconcileOnce(ctx); err != nil {
 		t.Fatal(err)
 	}
-	client := &reviewCancelClient{L1Client: h.l1Client, err: errors.New("outage")}
+	client := &recordingCancelClient{L1Client: h.l1Client, err: errors.New("outage")}
 	h.l3Server.jobs = client
 	_, _, _ = h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
 	if _, err := h.l3Store.db.Exec(`UPDATE run_cancellations SET failures=20,retry_ns=? WHERE run_id=?`, time.Now().Add(30*time.Minute).UnixNano(), run.RunID); err != nil {
@@ -438,8 +438,8 @@ func TestCancelRechecksStoredEvidenceBeforeLinking(t *testing.T) {
 		t.Fatalf("delivery read = %+v %v", pending, err)
 	}
 	// #777 fences recovery after the cancellation read, so current recovery
-	// cannot write this verdict. Inject the pre-upgrade shape to retain #776's
-	// check that cancel revalidates a stale stored acknowledgement at its write.
+	// cannot write this verdict. Inject a verdict after the delivery read to
+	// retain #776's check that cancel revalidates stored evidence at its write.
 	payload, err := json.Marshal(contract.APIError{
 		Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed",
 		Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": "job-gone"},

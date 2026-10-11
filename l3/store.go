@@ -2182,8 +2182,8 @@ const (
 	dispatchLookupEvidence
 )
 
-// dispatchObservation captures identity and verdict before an L1 lookup. A later
-// verdict must not be overwritten by an answer to that earlier lookup.
+// dispatchObservation captures identity and verdict before an L1 lookup. A newer
+// regression must not be overwritten by an answer to that earlier lookup.
 type dispatchObservation struct {
 	outboxJob, runJob, lastError sql.NullString
 	dispatched                   sql.NullInt64
@@ -2231,7 +2231,12 @@ func (s *Store) completeDispatchWithEvidenceTx(ctx context.Context, tx *sql.Tx, 
 	if err != nil {
 		return err
 	}
-	if evidence == dispatchLookupEvidence && (observed == nil || current != *observed) {
+	// An overlapping acknowledgement of the same Job can change identity,
+	// dispatch stamps and Run state without changing the verdict. Recheck
+	// identities below; only a newer regression makes this lookup stale.
+	// Fresh positive evidence supersedes even a settlement written during lookup.
+	if evidence == dispatchLookupEvidence && (observed == nil || (current.reason == l1RegressedReason &&
+		(observed.reason != l1RegressedReason || current.diagnosticJob != observed.diagnosticJob || current.lastError != observed.lastError))) {
 		return internalError(errors.New("dispatch evidence changed during lookup"), "complete dispatch")
 	}
 	outboxJob, runJob := current.outboxJob, current.runJob
@@ -2431,6 +2436,8 @@ WHERE r.run_id=? AND r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status I
 	return item, true, nil
 }
 
+var errRecoveredDispatchIdentityConflict = errors.New("recovered dispatch conflicts with recorded identity")
+
 // linkUnrecordedDispatch records only the missing association. The terminal
 // state, reason and timestamps are deliberately outside both updates.
 func (s *Store) linkUnrecordedDispatch(ctx context.Context, item unrecordedDispatch, jobID string) error {
@@ -2463,7 +2470,7 @@ func (s *Store) linkUnrecordedDispatch(ctx context.Context, item unrecordedDispa
 	if dispatchKey != item.DispatchKey || outboxKey != dispatchKey ||
 		(outboxJob.Valid && outboxJob.String != jobID) || (runJob.Valid && runJob.String != jobID) ||
 		(reason == l1RegressedReason && diagnosticJob != "" && diagnosticJob != jobID) {
-		return internalError(errors.New("recovered dispatch conflicts with recorded identity"), "link unrecorded dispatch")
+		return internalError(errRecoveredDispatchIdentityConflict, "link unrecorded dispatch")
 	}
 	linked, err := linkTerminalRunTx(ctx, tx, item.RunID, jobID)
 	if err != nil {

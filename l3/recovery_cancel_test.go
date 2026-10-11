@@ -240,9 +240,10 @@ func TestRecoveryDiscoveryReachesCancel(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// The canceled-before-confirmation reason case drives the resolving
-			// seam with a captured dispatch observation. The other cases use
-			// recovery's actual terminal-Run selector.
+			// The settled case hand-builds a non-terminal recovery item that
+			// production never selects, to check the canceled-before-confirmation
+			// reason. settled-terminal is the reachable case; it and the other
+			// cases use recovery's actual terminal-Run selector.
 			item := unrecordedDispatch{RunID: run.RunID, DispatchKey: intents[0].DispatchKey}
 			if scenario == "settled" {
 				item.observed, err = readDispatchObservation(ctx, h.l3Store.db, item.RunID)
@@ -364,61 +365,192 @@ func TestRecoveryLinkRechecksAcknowledgedIdentity(t *testing.T) {
 }
 
 // A Job found by recovery is lookup evidence even when cancellation owns the
-// receiving write. A later verdict must survive that handoff, and a pending
-// cancellation must be able to retry against a fresh L1 observation.
+// receiving write. A regression written during lookup refuses the handoff;
+// a settlement written during lookup must link and reopen delivery.
 func TestRecoveryCancelHandoffCannotOverwriteLaterVerdict(t *testing.T) {
-	h := newIntegrationHarness(t)
-	ctx := context.Background()
-	run, job := crashWindowRun(t, h, "handoff-newer-verdict")
-	recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, job.JobID)
-	terminal := snapshotTerminalRun(t, h.l3Store, run.RunID)
-	client := &reviewCancelClient{L1Client: h.l1Client}
-	lookup := &cancelDuringRecoveryLookup{lookup: func(ctx context.Context, key string) (l1.Job, error) {
-		if key != job.Spec.DispatchKey {
-			t.Fatalf("lookup key = %q, want %q", key, job.Spec.DispatchKey)
-		}
-		// Commit a newer verdict while the remote lookup is outstanding. This
-		// write also proves the L1 call holds no ledger write transaction.
+	for _, verdict := range []string{"regression", "changed-regression", "settlement"} {
+		t.Run(verdict, func(t *testing.T) {
+			h := newIntegrationHarness(t)
+			ctx := context.Background()
+			clock := &mutableClock{now: time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)}
+			h.l3Store.clock = clock
+			run, job := crashWindowRun(t, h, "handoff-newer-verdict")
+			if verdict != "settlement" {
+				recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, job.JobID)
+			}
+			if verdict == "changed-regression" {
+				if _, err := h.l3Store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
+					`{"code":"not_found","message":"earlier handoff verdict","details":{"reason":"l1_regressed","l1_job_id":"`+job.JobID+`"}}`, run.RunID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			terminal := snapshotTerminalRun(t, h.l3Store, run.RunID)
+			clock.now = clock.now.Add(unrecordedDispatchSettleHorizon)
+			client := &recordingCancelClient{L1Client: h.l1Client}
+			lookup := &cancelDuringRecoveryLookup{lookup: func(ctx context.Context, key string) (l1.Job, error) {
+				if key != job.Spec.DispatchKey {
+					t.Fatalf("lookup key = %q, want %q", key, job.Spec.DispatchKey)
+				}
+				// This write also proves the L1 read holds no ledger write transaction.
+				if verdict != "settlement" {
+					if _, err := h.l3Store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
+						`{"code":"not_found","message":"newer handoff verdict","details":{"reason":"l1_regressed","l1_job_id":"`+job.JobID+`"}}`, run.RunID); err != nil {
+						return l1.Job{}, err
+					}
+				}
+				if err := h.l3Store.requestRunCancellation(ctx, run.RunID, h.callerUser); err != nil {
+					return l1.Job{}, err
+				}
+				if verdict == "settlement" {
+					if err := h.l3Store.cancelAbsentDispatch(ctx, run.RunID, clock.now); err != nil {
+						return l1.Job{}, err
+					}
+				}
+				return h.l1Client.LookupJobByDispatchKey(ctx, key)
+			}}
+			r, err := NewReconciler(h.l3Store, client, ReconcilerConfig{DispatchLookup: lookup})
+			if err != nil {
+				t.Fatal(err)
+			}
+			errs := r.recoverUnrecordedDispatches(ctx)
+			if verdict == "settlement" {
+				if len(errs) != 0 {
+					t.Fatalf("settlement blocked positive lookup: %v", errs)
+				}
+			} else {
+				if len(errs) == 0 {
+					t.Error("stale recovery handoff was accepted")
+				}
+				execution, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+				if err != nil || execution.DispatchError == nil || execution.DispatchError.Message != "newer handoff verdict" || execution.DispatchError.Details["reason"] != l1RegressedReason {
+					t.Fatalf("stale handoff erased the newer verdict: %+v %v", execution, err)
+				}
+				record, err := h.l3Store.GetRun(ctx, run.RunID)
+				observed, getErr := h.l1Client.GetJob(ctx, job.JobID)
+				if err != nil || getErr != nil || record.L1JobID != "" || record.CancelStatus != "pending" || client.calls != 0 || observed.State != contract.JobQueued || lookup.calls != 1 {
+					t.Fatalf("stale handoff linked or delivered: run=%+v job=%+v cancels=%d lookups=%d errors=%v/%v", record, observed, client.calls, lookup.calls, err, getErr)
+				}
+				if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
+					t.Fatalf("stale handoff changed terminal facts: before=%+v after=%+v", terminal, after)
+				}
+				// A fresh cancel-owned observation can resolve the regression.
+				r.lookup = &absentDispatchLookup{}
+				if err := r.ReconcileOnce(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			record, err := h.l3Store.GetRun(ctx, run.RunID)
+			observed, getErr := h.l1Client.GetJob(ctx, job.JobID)
+			if err != nil || getErr != nil || record.L1JobID != job.JobID || record.CancelStatus != "settled" || observed.Outcome != contract.JobOutcomeCanceled || client.calls != 1 || lookup.calls != 1 {
+				t.Fatalf("fresh cancel handoff failed: run=%+v job=%+v cancels=%d lookups=%d errors=%v/%v", record, observed, client.calls, lookup.calls, err, getErr)
+			}
+			if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
+				t.Fatalf("fresh handoff changed terminal facts: before=%+v after=%+v", terminal, after)
+			}
+		})
+	}
+}
+
+func TestRecoveryAcknowledgedDiscoveryReachesCancel(t *testing.T) {
+	t.Run("job-id-fallback", func(t *testing.T) {
+		h := newIntegrationHarness(t)
+		ctx := context.Background()
+		run, job := crashWindowRun(t, h, "recovery-cancel-id-fallback")
+		recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, job.JobID)
+		// A prior regression prevents requestRunCancellation from linking the
+		// outbox identity itself; recovery's GetJob handoff must do the link.
 		if _, err := h.l3Store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
-			`{"code":"not_found","message":"newer handoff verdict","details":{"reason":"l1_regressed","l1_job_id":"`+job.JobID+`"}}`, run.RunID); err != nil {
-			return l1.Job{}, err
+			`{"code":"not_found","message":"prior regression","details":{"reason":"l1_regressed","l1_job_id":"`+job.JobID+`"}}`, run.RunID); err != nil {
+			t.Fatal(err)
 		}
-		if err := h.l3Store.requestRunCancellation(ctx, run.RunID, h.callerUser); err != nil {
-			return l1.Job{}, err
+		terminal := snapshotTerminalRun(t, h.l3Store, run.RunID)
+		client := &recordingCancelClient{L1Client: h.l1Client}
+		lookup := &cancelDuringRecoveryLookup{lookup: func(ctx context.Context, key string) (l1.Job, error) {
+			if key != job.Spec.DispatchKey {
+				t.Fatalf("lookup key = %q, want %q", key, job.Spec.DispatchKey)
+			}
+			// Recovery selected the Run before cancellation took ownership.
+			if err := h.l3Store.requestRunCancellation(ctx, run.RunID, h.callerUser); err != nil {
+				return l1.Job{}, err
+			}
+			return l1.Job{}, &DispatchNotFoundError{DispatchKey: key}
+		}}
+		r, err := NewReconciler(h.l3Store, client, ReconcilerConfig{DispatchLookup: lookup})
+		if err != nil {
+			t.Fatal(err)
 		}
-		return h.l1Client.LookupJobByDispatchKey(ctx, key)
-	}}
-	r, err := NewReconciler(h.l3Store, client, ReconcilerConfig{DispatchLookup: lookup})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if errs := r.recoverUnrecordedDispatches(ctx); len(errs) == 0 {
-		t.Error("stale recovery handoff was accepted")
-	}
-	execution, err := h.l3Store.GetRunExecution(ctx, run.RunID)
-	if err != nil || execution.DispatchError == nil || execution.DispatchError.Message != "newer handoff verdict" || execution.DispatchError.Details["reason"] != l1RegressedReason {
-		t.Fatalf("stale handoff erased the newer verdict: %+v %v", execution, err)
-	}
-	record, err := h.l3Store.GetRun(ctx, run.RunID)
-	observed, getErr := h.l1Client.GetJob(ctx, job.JobID)
-	if err != nil || getErr != nil || record.L1JobID != "" || record.CancelStatus != "pending" || client.calls != 0 || observed.State != contract.JobQueued || lookup.calls != 1 {
-		t.Fatalf("stale handoff linked or delivered: run=%+v job=%+v cancels=%d lookups=%d errors=%v/%v", record, observed, client.calls, lookup.calls, err, getErr)
-	}
-	if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
-		t.Fatalf("stale handoff changed terminal facts: before=%+v after=%+v", terminal, after)
-	}
-	// The cancel path alone resolves the contradicted stored identity on the
-	// next pass, using an observation captured before its GetJob fallback.
-	r.lookup = &absentReviewLookup{}
-	if err := r.ReconcileOnce(ctx); err != nil {
-		t.Fatal(err)
-	}
-	record, err = h.l3Store.GetRun(ctx, run.RunID)
-	observed, getErr = h.l1Client.GetJob(ctx, job.JobID)
-	if err != nil || getErr != nil || record.L1JobID != job.JobID || record.CancelStatus != "settled" || observed.Outcome != contract.JobOutcomeCanceled || client.calls != 1 || lookup.calls != 1 {
-		t.Fatalf("fresh cancel fallback failed: run=%+v job=%+v cancels=%d lookups=%d errors=%v/%v", record, observed, client.calls, lookup.calls, err, getErr)
-	}
-	if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
-		t.Fatalf("fresh fallback changed terminal facts: before=%+v after=%+v", terminal, after)
+		if errs := r.recoverUnrecordedDispatches(ctx); len(errs) != 0 {
+			t.Fatal(errs)
+		}
+		record, err := h.l3Store.GetRun(ctx, run.RunID)
+		observed, getErr := h.l1Client.GetJob(ctx, job.JobID)
+		if err != nil || getErr != nil || record.L1JobID != job.JobID || record.CancelStatus != "settled" || observed.Outcome != contract.JobOutcomeCanceled || client.calls != 1 || lookup.calls != 1 {
+			t.Fatalf("acknowledged discovery did not reach cancel: run=%+v job=%+v cancels=%d lookups=%d errors=%v/%v", record, observed, client.calls, lookup.calls, err, getErr)
+		}
+		if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
+			t.Fatalf("acknowledged discovery changed terminal facts: before=%+v after=%+v", terminal, after)
+		}
+	})
+}
+
+func TestRecoveryIdentityConflictBacksOff(t *testing.T) {
+	for _, conflict := range []string{"regression-job", "outbox-key"} {
+		t.Run(conflict, func(t *testing.T) {
+			s, _, clock := recoveryStore(t)
+			ctx := context.Background()
+			keys := endedUnrecordedRuns(t, s, clock, unrecordedDispatchBatch+1)
+			for _, key := range keys[:unrecordedDispatchBatch] {
+				id := runIDForDispatchKey(t, s, key)
+				var err error
+				if conflict == "regression-job" {
+					_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
+						`{"code":"not_found","message":"corrupt regression identity","details":{"reason":"l1_regressed","l1_job_id":"job-other"}}`, id)
+				} else {
+					_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET dispatch_key=? WHERE run_id=?`, "corrupt-"+key, id)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			lookup := &cancelDuringRecoveryLookup{lookup: func(_ context.Context, key string) (l1.Job, error) {
+				return l1.Job{JobID: "job-" + key, Spec: contract.JobSpec{DispatchKey: key}}, nil
+			}}
+			r, err := NewReconciler(s, &recordingJobClient{}, ReconcilerConfig{DispatchLookup: lookup})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if errs := r.recoverUnrecordedDispatches(ctx); len(errs) != unrecordedDispatchBatch {
+				t.Fatalf("identity conflicts = %v, want %d", errs, unrecordedDispatchBatch)
+			}
+			for _, key := range keys[:unrecordedDispatchBatch] {
+				if failures, retry := jobLinkBackoff(t, s, key); failures != 1 || !retry.Equal(clock.now.Add(unrecordedDispatchRetryBase)) {
+					t.Fatalf("identity conflict did not back off: failures=%d retry=%v", failures, retry)
+				}
+				record, err := s.GetRun(ctx, runIDForDispatchKey(t, s, key))
+				execution, executionErr := s.GetRunExecution(ctx, record.RunID)
+				if err != nil || executionErr != nil || record.L1JobID != "" || jobLinkSettled(t, s, record.RunID) ||
+					(conflict == "regression-job" && (execution.DispatchError == nil || execution.DispatchError.Details["l1_job_id"] != "job-other")) {
+					t.Fatalf("identity conflict altered evidence: run=%+v execution=%+v errors=%v/%v", record, execution, err, executionErr)
+				}
+			}
+			// Sixteen corrupt rows must not monopolize the next batch.
+			if errs := r.recoverUnrecordedDispatches(ctx); len(errs) != 0 {
+				t.Fatal(errs)
+			}
+			last := keys[unrecordedDispatchBatch]
+			record, err := s.GetRun(ctx, runIDForDispatchKey(t, s, last))
+			if err != nil || record.L1JobID != "job-"+last || lookup.calls != unrecordedDispatchBatch+1 {
+				t.Fatalf("corrupt rows blocked later recovery: run=%+v lookups=%d error=%v", record, lookup.calls, err)
+			}
+			clock.now = clock.now.Add(unrecordedDispatchRetryBase)
+			if errs := r.recoverUnrecordedDispatches(ctx); len(errs) != unrecordedDispatchBatch {
+				t.Fatalf("due conflict retries = %v", errs)
+			}
+			for _, key := range keys[:unrecordedDispatchBatch] {
+				if failures, retry := jobLinkBackoff(t, s, key); failures != 2 || !retry.Equal(clock.now.Add(2*unrecordedDispatchRetryBase)) {
+					t.Fatalf("identity conflict retry did not double backoff: failures=%d retry=%v", failures, retry)
+				}
+			}
+		})
 	}
 }
