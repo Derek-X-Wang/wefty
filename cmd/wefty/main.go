@@ -27,8 +27,8 @@ func main() {
 	}
 }
 
-// Every command publishes the same typed exit map. Keep this process boundary
-// unconditional so new command surfaces cannot silently collapse typed exits.
+// commandExitCodeForArgs, commandExitCode, and writeCommandError are test
+// shims over decideCommandReport. main consumes the report directly.
 func commandExitCodeForArgs(err error, _ []string) int {
 	return commandExitCode(err)
 }

@@ -19,8 +19,17 @@ type commandReport struct {
 	receipt       *contract.ComputerControlReceipt
 }
 
-func decideCommandReport(err error) (report commandReport) {
-	report = commandReport{exitCode: exitFailure, err: err}
+func decideCommandReport(err error) commandReport {
+	report := classifyCommandReport(err)
+	// Usage always wins the exit code, independently of stderr reporting.
+	if errors.As(err, new(usageError)) {
+		report.exitCode = exitUsage
+	}
+	return report
+}
+
+func classifyCommandReport(err error) commandReport {
+	report := commandReport{exitCode: exitFailure, err: err}
 	var takeoverErr *takeoverActionError
 	isTakeover := errors.As(err, &takeoverErr)
 	if isTakeover {
@@ -30,13 +39,6 @@ func decideCommandReport(err error) (report commandReport) {
 	}
 	var usage usageError
 	isUsage := errors.As(err, &usage)
-	// Usage has always taken exit precedence, even when an error tree also
-	// contains a verdict or availability error with different JSON reporting.
-	defer func() {
-		if isUsage {
-			report.exitCode = exitUsage
-		}
-	}()
 
 	var custody *custodyImportOutcomeError
 	if errors.As(err, &custody) {

@@ -20,25 +20,26 @@ import (
 // the production decision and its envelope constructors.
 func TestCommandReportingCharacterization(t *testing.T) {
 	type reportingCase struct {
-		name string
-		err  error
-		exit int
-		text string
-		json string
+		name             string
+		err              error
+		exit             int
+		text             string
+		json             string
+		jsonOuterContext bool
 	}
 	cases := []reportingCase{
-		{"usage", usageError("bad arguments"), 2, "wefty: bad arguments\n", `{"error":{"code":"invalid_request","message":"bad arguments","retryable":false}}`},
-		{"run-failed", &runOutcomeError{runID: "run-1", status: contract.RunFailed, reason: "job failed"}, 10, "wefty: run run-1 failed: job failed\n", ""},
-		{"run-no-reason", &runOutcomeError{runID: "run-1", status: contract.RunFailed}, 10, "wefty: run run-1 failed (no reason was recorded; see `wefty inspect run-1 --execution`)\n", ""},
-		{"not-ready", &notReadyError{verdict: "not ready: no nodes"}, 12, "wefty: not ready: no nodes\n", ""},
-		{"wait-timeout", &waitTimeoutError{runID: "run-1", status: contract.RunQueued, waited: time.Second}, 11, "wefty: run run-1 is still queued after 1s\n", ""},
-		{"unavailable", &unavailableError{cause: errors.New("connection refused")}, 13, "wefty: connection refused\n", `{"error":{"code":"unavailable","message":"connection refused","retryable":true}}`},
-		{"plain", errors.New("local failure"), 1, "wefty: local failure\n", `{"error":{"code":"internal","message":"local failure","retryable":false}}`},
-		{"deadline", context.DeadlineExceeded, 1, "wefty: context deadline exceeded\n", `{"error":{"code":"internal","message":"context deadline exceeded","retryable":false}}`},
-		{"canceled", context.Canceled, 1, "wefty: context canceled\n", `{"error":{"code":"internal","message":"context canceled","retryable":false}}`},
-		{"usage-under-unavailable", &unavailableError{cause: usageError("bad arguments")}, 2, "wefty: bad arguments\n", `{"error":{"code":"unavailable","message":"bad arguments","retryable":true}}`},
-		{"usage-and-verdict", errors.Join(usageError("bad arguments"), &notReadyError{verdict: "not ready: no nodes"}), 2, "wefty: bad arguments\nnot ready: no nodes\n", ""},
-		{"unknown-custody-and-mutation", errors.Join(&custodyImportOutcomeError{importID: "import-1", outcome: "future-outcome"}, &mutationWaitTimeoutError{message: "observation timed out"}), 14, "wefty: Custody import \"import-1\" is future-outcome\nobservation timed out\n", ""},
+		{"usage", usageError("bad arguments"), 2, "wefty: bad arguments\n", `{"error":{"code":"invalid_request","message":"bad arguments","retryable":false}}`, false},
+		{"run-failed", &runOutcomeError{runID: "run-1", status: contract.RunFailed, reason: "job failed"}, 10, "wefty: run run-1 failed: job failed\n", "", false},
+		{"run-no-reason", &runOutcomeError{runID: "run-1", status: contract.RunFailed}, 10, "wefty: run run-1 failed (no reason was recorded; see `wefty inspect run-1 --execution`)\n", "", false},
+		{"not-ready", &notReadyError{verdict: "not ready: no nodes"}, 12, "wefty: not ready: no nodes\n", "", false},
+		{"wait-timeout", &waitTimeoutError{runID: "run-1", status: contract.RunQueued, waited: time.Second}, 11, "wefty: run run-1 is still queued after 1s\n", "", false},
+		{"unavailable", &unavailableError{cause: errors.New("connection refused")}, 13, "wefty: connection refused\n", `{"error":{"code":"unavailable","message":"connection refused","retryable":true}}`, true},
+		{"plain", errors.New("local failure"), 1, "wefty: local failure\n", `{"error":{"code":"internal","message":"local failure","retryable":false}}`, true},
+		{"deadline", context.DeadlineExceeded, 1, "wefty: context deadline exceeded\n", `{"error":{"code":"internal","message":"context deadline exceeded","retryable":false}}`, true},
+		{"canceled", context.Canceled, 1, "wefty: context canceled\n", `{"error":{"code":"internal","message":"context canceled","retryable":false}}`, true},
+		{"usage-under-unavailable", &unavailableError{cause: usageError("bad arguments")}, 2, "wefty: bad arguments\n", `{"error":{"code":"unavailable","message":"bad arguments","retryable":true}}`, true},
+		{"usage-and-verdict", errors.Join(usageError("bad arguments"), &notReadyError{verdict: "not ready: no nodes"}), 2, "wefty: bad arguments\nnot ready: no nodes\n", "", false},
+		{"unknown-custody-and-mutation", errors.Join(&custodyImportOutcomeError{importID: "import-1", outcome: "future-outcome"}, &mutationWaitTimeoutError{message: "observation timed out"}), 14, "wefty: Custody import \"import-1\" is future-outcome\nobservation timed out\n", "", false},
 	}
 	for _, c := range []struct {
 		outcome custodyImportOutcome
@@ -62,7 +63,7 @@ func TestCommandReportingCharacterization(t *testing.T) {
 		{"true", reportingBool(true)}, {"false", reportingBool(false)}, {"null", nil},
 	} {
 		cases = append(cases, reportingCase{
-			name: "mutation-timeout-" + applied.name, exit: 14,
+			name: "mutation-timeout-" + applied.name, exit: 14, jsonOuterContext: true,
 			err:  &mutationWaitTimeoutError{message: "accepted; observation timed out", mutationApplied: applied.value},
 			text: "wefty: accepted; observation timed out\n",
 			json: `{"error":{"code":"wait_timeout","message":"accepted; observation timed out","retryable":false,"details":{"mutation_applied":` + applied.name + `}}}`,
@@ -114,6 +115,65 @@ func TestCommandReportingCharacterization(t *testing.T) {
 	}
 	const receiptJSON = `,"receipt":{"computer_id":"computer-1","action":"take","holder_session_id":"session-1","admitted_mode":"control","tenure_state":"held","policy_revision":7,"override_displaced_session_id":"session-0","human_driving":true,"signal_stayed_true":true,"session_end_reason":"revoked"}`
 	const receiptText = "COMPUTER ID\tcomputer-1\nACTION\ttake\nHOLDER SESSION ID\tsession-1\nADMITTED MODE\tcontrol\nTENURE STATE\theld\nPOLICY REVISION\t7\nOVERRIDE DISPLACED SESSION ID\tsession-0\nHUMAN DRIVING\ttrue\nSIGNAL STAYED TRUE\ttrue\nSESSION END REASON\trevoked\n"
+	// Joined pairs pin precedence independently of traversal order. The exit
+	// numbers and stderr literals were verified with main.go at 75c815aa.
+	mutation := &mutationWaitTimeoutError{message: "observation timed out", mutationApplied: reportingBool(true)}
+	unavailable := &unavailableError{cause: errors.New("connection refused")}
+	local := &ocicontrol.ResponseError{Status: 403, APIError: contract.APIError{
+		Code: contract.ErrorForbidden, Message: "local refusal",
+	}}
+	takeover := &takeoverActionError{APIError: contract.APIError{
+		Code: contract.ErrorConflict, Message: "takeover refusal",
+	}, Receipt: receipt}
+	outcome := &runOutcomeError{runID: "run-1", status: contract.RunFailed, reason: "job failed"}
+	const localJSON = `{"error":{"code":"forbidden","message":"local refusal","retryable":false}}`
+	type joinedPair struct {
+		name                  string
+		first, second         error
+		exit                  int
+		firstText, secondText string
+		json                  string
+		jsonOuterContext      bool
+		receiptText           string
+	}
+	pairs := []joinedPair{
+		{"mutation-timeout-and-unavailable", mutation, unavailable, 14, "observation timed out", "connection refused", `{"error":{"code":"wait_timeout","message":"observation timed out\nconnection refused","retryable":false,"details":{"mutation_applied":true}}}`, true, ""},
+		{"node-local-and-takeover-receipt", local, takeover, 3, "local refusal", "conflict: takeover refusal", localJSON, false, receiptText},
+		{"run-outcome-and-not-ready", outcome, &notReadyError{verdict: "not ready: no nodes"}, 10, "run run-1 failed: job failed", "not ready: no nodes", "", false, ""},
+		{"custody-deferred-and-run-outcome", &custodyImportOutcomeError{importID: "import-1", outcome: custodyImportDeferred}, outcome, 6, `Custody import "import-1" is deferred`, "run run-1 failed: job failed", "", false, ""},
+		{"usage-and-node-local", usageError("bad arguments"), local, 2, "bad arguments", "local refusal", `{"error":{"code":"invalid_request","message":"bad arguments","retryable":false}}`, false, ""},
+		{"run-outcome-and-mutation-timeout", outcome, mutation, 10, "run run-1 failed: job failed", "observation timed out", "", false, ""},
+		{"run-outcome-and-unavailable", outcome, unavailable, 10, "run run-1 failed: job failed", "connection refused", "", false, ""},
+	}
+	for _, service := range []string{"L1", "L3"} {
+		response := &apiResponseError{Service: service, StatusCode: 404, APIError: contract.APIError{
+			Code: contract.ErrorNotFound, Message: "server refusal",
+		}}
+		pairs = append(pairs,
+			joinedPair{"node-local-and-" + service, local, response, 3, "local refusal", "not_found: server refusal; retryable=false", localJSON, false, ""},
+			joinedPair{service + "-and-takeover-receipt", response, takeover, 4, "not_found: server refusal; retryable=false", "conflict: takeover refusal", `{"error":{"code":"not_found","message":"server refusal","retryable":false}}`, false, receiptText},
+		)
+	}
+	for _, pair := range pairs {
+		for _, reverse := range []bool{false, true} {
+			first, second := pair.first, pair.second
+			firstText, secondText := pair.firstText, pair.secondText
+			jsonLiteral := pair.json
+			if reverse {
+				first, second = second, first
+				firstText, secondText = secondText, firstText
+				if pair.jsonOuterContext {
+					jsonLiteral = strings.Replace(jsonLiteral, pair.firstText+`\n`+pair.secondText, firstText+`\n`+secondText, 1)
+				}
+			}
+			cases = append(cases, reportingCase{
+				name: fmt.Sprintf("joined/%s/reverse=%t", pair.name, reverse),
+				err:  errors.Join(first, second), exit: pair.exit,
+				text: "wefty: " + firstText + "\n" + secondText + "\n" + pair.receiptText,
+				json: jsonLiteral, jsonOuterContext: pair.jsonOuterContext,
+			})
+		}
+	}
 	for _, code := range protocolCodes {
 		for _, retryable := range []bool{false, true} {
 			for _, family := range []string{"node-local", "L1", "L3", "takeover", "takeover-receipt"} {
@@ -177,7 +237,7 @@ func TestCommandReportingCharacterization(t *testing.T) {
 						want = c.json
 						// These local error documents carry the outer context. Usage
 						// and server envelopes keep their original inner messages.
-						if wrapped && (c.name == "unavailable" || c.name == "usage-under-unavailable" || c.name == "plain" || c.name == "deadline" || c.name == "canceled" || strings.HasPrefix(c.name, "mutation-timeout-")) {
+						if wrapped && c.jsonOuterContext {
 							want = strings.Replace(want, `"message":"`, `"message":"outer context: `, 1)
 						}
 						want = reportingJSON(t, want)
