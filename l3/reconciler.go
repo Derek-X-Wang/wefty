@@ -170,7 +170,15 @@ func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
 }
 
 func (r *Reconciler) recoverUnrecordedDispatchesRemote(ctx, remote context.Context) []error {
-	passErrors := r.validateMigratedLinks(ctx, remote)
+	// Validation gets at most half the remaining budget. A slow migrated Job
+	// must leave time for ordinary terminal dispatch recovery in this pass.
+	validationBudget := r.budget / 2
+	if deadline, ok := remote.Deadline(); ok {
+		validationBudget = time.Until(deadline) / 2
+	}
+	validationRemote, cancel := context.WithTimeout(remote, validationBudget)
+	passErrors := r.validateMigratedLinks(ctx, validationRemote)
+	cancel()
 	if r.lookup == nil || remote.Err() != nil {
 		return passErrors
 	}
@@ -373,7 +381,7 @@ func (r *Reconciler) validateMigratedLinks(ctx, remote context.Context) []error 
 			break
 		}
 		if !item.owned {
-			if err := r.store.completeMigratedLinkValidation(ctx, item, migratedLinkRetired); err != nil {
+			if _, err := r.store.completeMigratedLinkValidation(ctx, item, migratedLinkRetired); err != nil {
 				passErrors = append(passErrors, err)
 			}
 			continue
@@ -389,11 +397,12 @@ func (r *Reconciler) validateMigratedLinks(ctx, remote context.Context) []error 
 			verdict = migratedLinkRetry
 			readErr = fmt.Errorf("L1 validation returned Job %q for %q", job.JobID, item.jobID)
 		}
-		if readErr != nil {
-			passErrors = append(passErrors, r.store.observeL1Error(ctx, readErr))
-		}
-		if err := r.store.completeMigratedLinkValidation(ctx, item, verdict); err != nil {
+		completed, err := r.store.completeMigratedLinkValidation(ctx, item, verdict)
+		if err != nil {
 			passErrors = append(passErrors, err)
+		}
+		if readErr != nil && (verdict != migratedLinkAbsent || completed) {
+			passErrors = append(passErrors, r.store.observeL1Error(ctx, readErr))
 		}
 	}
 	return passErrors

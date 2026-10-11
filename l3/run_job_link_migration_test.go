@@ -357,7 +357,9 @@ func TestLegacyRunJobLinkValidationRechecksCurrentOwnershipAndIdentity(t *testin
 				return l1.Job{}, &JobNotFoundError{JobID: id}
 			}}
 			r, _ := NewReconciler(s, client, ReconcilerConfig{})
-			_ = r.recoverUnrecordedDispatches(context.Background())
+			if errs := r.recoverUnrecordedDispatches(context.Background()); len(errs) != 0 {
+				t.Fatalf("stale absence reported as a verdict: %v", errs)
+			}
 			if len(client.ids) != 1 {
 				t.Fatalf("migration validation not run: %v", client.ids)
 			}
@@ -384,7 +386,9 @@ func TestLegacyRunJobLinkValidationConcurrentVerdicts(t *testing.T) {
 		return l1.Job{}, &JobNotFoundError{JobID: id}
 	}}
 	r, _ := NewReconciler(s, stale, ReconcilerConfig{})
-	_ = r.recoverUnrecordedDispatches(context.Background())
+	if errs := r.recoverUnrecordedDispatches(context.Background()); len(errs) != 0 {
+		t.Fatalf("completed validation reported stale absence: %v", errs)
+	}
 	execution, err := s.GetRunExecution(context.Background(), run.RunID)
 	if err != nil || execution.DispatchError != nil || len(positive.ids) != 1 || len(stale.ids) != 1 {
 		t.Fatalf("stale verdict replaced completion: %+v %v reads=%v/%v", execution, err, positive.ids, stale.ids)

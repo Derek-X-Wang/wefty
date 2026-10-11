@@ -1673,7 +1673,35 @@ flight, the acknowledgement links the run directly. Linking fills only
 and marks node attribution pending when no node is known so the ordinary
 terminal-attribution pass can name it.
 
-At store open, after prerequisite backfills, a one-time atomic migration links only unsettled succeeded or failed Runs with no Job reference and a recorded submit attempt, a matching outbox dispatch key with a non-empty acknowledged Job and dispatch time, no staged token or error, neither cancel-before-dispatch reason, and no cancellation record; it preserves terminal facts and the terminal-link node-attribution rule, and commits durable validation work with the links and marker. Recovery validates at most 16 due migrated links per pass within the shared recovery budget, retries transient failures with durable backoff (including interruption between the L1 read and SQLite completion), and rechecks current identity and cancel ownership before committing: found stays linked, authoritative absence records `l1_regressed` while preserving reason, status, timestamps and token expiry, and only a completed validation counts as checked once.
+At store open, after prerequisite backfills, a one-time atomic migration links
+only unsettled succeeded or failed Runs with no Job reference and a recorded
+submit attempt, a matching outbox dispatch key with a non-empty acknowledged
+Job and dispatch time, no staged token or error, and no cancellation record.
+It excludes all three reason strings: `the run was canceled before dispatch`,
+`canceled before dispatch was confirmed`, and `canceled before dispatch`.
+The last string was never recorded by L3; it is excluded conservatively for
+legacy data. The migration preserves terminal facts and the terminal-link
+node-attribution rule, and commits durable validation work with the links and
+one-time marker. Store open does not contact L1.
+
+Recovery validates at most 16 due migrated links per pass, using at most half
+of the remaining recovery budget so ordinary recovery has time in the same
+pass. It retries transient failures with durable backoff, including interruption
+between the L1 read and SQLite completion, and rechecks current identity and
+cancel ownership before committing. Found stays linked. Authoritative absence
+records `l1_regressed` while preserving reason, status, timestamps and token
+expiry. Only a completed validation counts as checked once. Superseded work
+retires without a verdict; a stale or retired absence is not reported as a
+regression error.
+
+Cancellation owns validation as soon as its intent is recorded. If cancellation
+of a terminal linked Run receives an L1 cancel `not_found`, L3 reads the Job by
+ID. That read's authoritative absence records `l1_regressed` through the
+terminal-link transition and settles cancellation with nothing to cancel
+(`cancel_status=settled`, without a reason). The write rechecks the identity
+and observation captured before the remote read. This applies to every terminal
+linked Run, including migrated links, and keeps its terminal facts and token
+expiry unchanged. A cancel refusal alone does not establish Job absence.
 
 A terminal run with no `l1_job_id` is eligible for lookup recovery when L3
 recorded a submit attempt for it and the recovery answer has not already been

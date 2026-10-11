@@ -319,8 +319,9 @@ func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupSt
 	return nil
 }
 
-// cancelAbsentStoredIdentity settles only delivery for an already-terminal Run.
-// Preserve its verdict, terminal facts and token expiry. Recheck the identity
+// cancelAbsentStoredIdentity settles delivery for an already-terminal Run.
+// A linked identity records regression; an unlinked verdict is retained.
+// Preserve terminal facts and token expiry. Recheck the identity
 // and verdict that authorized the remote read inside the write transaction.
 func (s *Store) cancelAbsentStoredIdentity(ctx context.Context, runID string, observed dispatchObservation) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -343,6 +344,14 @@ func (s *Store) cancelAbsentStoredIdentity(ctx context.Context, runID string, ob
 	if current.state != contract.RunSucceeded && current.state != contract.RunFailed {
 		// An active Run still follows the existing regression/absence rules.
 		return nil
+	}
+	if current.runJob.Valid && current.runJob.String != "" {
+		if !current.dispatched.Valid {
+			return internalError(errors.New("linked job has no dispatch acknowledgement"), "settle absent identity cancellation")
+		}
+		if err := markTerminalLinkRegressedTx(ctx, tx, runID, current.runJob.String); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=?, last_error=NULL, refused=0 WHERE run_id=? AND completed_ns IS NULL`, s.recoveryNow().UnixNano(), runID); err != nil {
 		return internalError(err, "finish absent identity cancellation")
@@ -945,10 +954,11 @@ const (
 // completeMigratedLinkValidation rechecks both identity and ownership after
 // the remote read. A crash before this commit leaves the lookup retryable.
 // Concurrent validators cannot commit over a completed verdict or newer retry.
-func (s *Store) completeMigratedLinkValidation(ctx context.Context, item migratedLinkValidation, verdict migratedLinkVerdict) error {
+// The result is true only when this observation committed a verdict or retry.
+func (s *Store) completeMigratedLinkValidation(ctx context.Context, item migratedLinkValidation, verdict migratedLinkVerdict) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return internalError(err, "begin migrated link validation")
+		return false, internalError(err, "begin migrated link validation")
 	}
 	defer tx.Rollback()
 	var owned bool
@@ -956,52 +966,52 @@ func (s *Store) completeMigratedLinkValidation(ctx context.Context, item migrate
  JOIN runs r ON r.run_id=v.run_id JOIN dispatch_outbox o ON o.run_id=r.run_id
  WHERE v.run_id=? AND v.dispatch_key=? AND v.job_id=? AND v.failures=? AND v.retry_ns=?`, item.runID, item.dispatchKey, item.jobID, item.failures, item.retryNS).Scan(&owned)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return internalError(err, "recheck migrated link ownership")
+		return false, internalError(err, "recheck migrated link ownership")
 	}
 	if !owned {
 		// The migrated identity or its recovery ownership no longer applies. This
 		// retires work, not a completed validation, and writes no link verdict.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM run_job_link_validations WHERE run_id=?`, item.runID); err != nil {
-			return internalError(err, "retire superseded link validation")
+			return false, internalError(err, "retire superseded link validation")
 		}
-		return tx.Commit()
+		return false, tx.Commit()
 	}
 	if verdict == migratedLinkRetired {
-		return nil
+		return false, nil
 	}
 	current, err := readDispatchObservation(ctx, tx, item.runID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if current != item.observed {
-		return nil
+		return false, nil
 	}
 	if verdict == migratedLinkRetry {
 		if _, err := tx.ExecContext(ctx, `UPDATE run_job_link_validations SET failures=failures+1,retry_ns=? WHERE run_id=?`, s.recoveryNow().Add(unrecordedDispatchBackoff(item.failures)).UnixNano(), item.runID); err != nil {
-			return internalError(err, "defer migrated link validation")
+			return false, internalError(err, "defer migrated link validation")
 		}
 	} else {
 		if verdict == migratedLinkAbsent {
 			if err := markTerminalLinkRegressedTx(ctx, tx, item.runID, item.jobID); err != nil {
-				return err
+				return false, err
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM run_job_link_validations WHERE run_id=?`, item.runID); err != nil {
-			return internalError(err, "complete migrated link validation")
+			return false, internalError(err, "complete migrated link validation")
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return internalError(err, "commit migrated link validation")
+		return false, internalError(err, "commit migrated link validation")
 	}
-	return nil
+	return true, nil
 }
 
 // markTerminalLinkRegressedTx is separate from active-run regression: terminal
 // outcome, reason, timestamps and token expiry must never be rewritten. The
-// caller has rechecked the captured acknowledgement and cancel ownership.
+// caller has rechecked the captured acknowledgement and current ownership.
 func markTerminalLinkRegressedTx(ctx context.Context, tx *sql.Tx, runID, jobID string) error {
 	cause := contract.APIError{Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed", Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": jobID}}
 	payload, err := json.Marshal(cause)
