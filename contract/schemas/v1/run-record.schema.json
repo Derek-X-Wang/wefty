@@ -51,7 +51,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 200,
-      "description": "One line (no newlines, at most 200 characters) saying why a failed run failed, recorded by the transition that failed it. A rejected write names the kind and, for a schema failure, the JSON pointer of the field, never its value. Absent for any other run and for a run failed before reasons were recorded."
+      "description": "One line (no newlines, at most 200 characters) saying why a failed run failed, recorded by the transition that failed it. A rejected write names the kind and, for a schema failure, the JSON pointer of the field, never its value. New cancellation settlements before dispatch confirmation record exactly: canceled before dispatch was confirmed. Later confirmation links the Job and delivers cancellation without changing the recorded reason, terminal status or timestamps. Existing rows keep their recorded reason. Absent for any other run and for a run failed before reasons were recorded."
     },
     "trigger": {
       "type": "object",

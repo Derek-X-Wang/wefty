@@ -1251,12 +1251,14 @@ once it dispatches.
 
 Cancellation arbitrates with the first dispatch attempt inside the ledger
 transaction. If no attempt has begun and no L1 job is linked, L3 directly
-settles the Run as `failed`, with `failure_reason=the run was canceled before
-dispatch`, expires its run token, and clears staged token delivery. The outbox
+settles the Run as `failed`, with
+`failure_reason=canceled before dispatch was confirmed`, expires its run token,
+and clears staged token delivery. The outbox
 cannot dispatch it afterward. Once a dispatch has begun, a lost acknowledgement
 is not proof that no job exists: L3 durably records cancellation intent, blocks
-further submits, links an existing run or outbox acknowledgement (using the
-public dispatch-key lookup only when neither exists), and delivers
+further submits, uses the linked Job or an uncontradicted outbox acknowledgement
+(using the public dispatch-key lookup when neither provides a usable identity),
+and delivers
 cancellation to `POST /v1/jobs/{job_id}/cancel` through the public L1 client
 contract, as the ledger's own originating-submitter identity. Intent survives
 ledger restart; transient delivery failures are retried with durable exponential
@@ -1268,15 +1270,44 @@ recovery does not also look up a Run with cancellation intent. A late first disp
 acknowledgement wakes cancellation delivery immediately. A dispatch-key
 absence remains provisional until the existing one-hour dispatch settlement
 horizon has passed since the last attempt; only then, with no acknowledgement
-recorded meanwhile, can the Run settle locally as canceled before dispatch.
+recorded meanwhile, can the Run settle locally with
+`failure_reason=canceled before dispatch was confirmed`.
 An empty L1 job ID is rejected before the acknowledgement can be written to
-the outbox or Run. A conflicting acknowledgement cannot link a Run: its outbox job must be NULL
-or equal the job being linked. Pending cancellation reads coalesce the Run
-and outbox job IDs and link the Run before calling L1 cancel, so outbox-only
-acknowledgements do not wait indefinitely on a missing dispatch-key lookup.
-A legacy terminal Run whose outbox already has the acknowledged job ID is
-linked before cancellation takes over recovery, preserving its outcome and
-timestamps. It cancels that job without an empty-ID call or a new dispatch.
+the outbox or Run. An acknowledgement cannot link a Run if it conflicts with
+the outbox Job, the Run's own Job, or the regression diagnostic's Job. Each
+recorded identity must be absent or equal the Job being linked. Pending
+cancellation reads prefer the Run's linked Job, and use an outbox-only
+acknowledgement only when no settled absence or regression diagnostic contradicts it. The write rechecks that
+stored evidence is still usable before linking. Stored identity alone cannot
+clear a contradiction or restore a link. A fresh identity-bound lookup
+supersedes a settlement, including `job_link_settled`, `dispatch_not_found`, or
+cancellation settled before confirmation, even when it lands during lookup.
+A lookup answer is stale only when the current diagnostic is `l1_regressed`
+and either the observed diagnostic was not a regression, the diagnostic Job
+changed, or `last_error` changed since lookup began. A regression re-recorded for the same
+Job with a different `last_error` is a newer verdict. A stale answer leaves
+the next pass to decide. An acknowledgement of the same Job
+during lookup does not prevent delivery in that pass. The write still refuses
+any conflicting recorded Job identity. Uncontradicted legacy outbox
+acknowledgements still link before delivery, even when dispatch-key lookup
+cannot find the Job, preserving terminal outcomes and timestamps.
+A delayed acknowledgement after a regression proves the earlier commit and
+cannot overturn that verdict. A fresh lookup that finds the same Job and is
+bound to the requested dispatch key or acknowledged Job ID can link it,
+including on a settled Run. When dispatch-key lookup finds nothing for a
+contradicted stored identity, cancellation reads that Job by ID outside the
+ledger write. A found, identity-bound Job links before cancellation delivery;
+a transient failure uses the existing backoff. Authoritative absence of that
+identity on an already-terminal Run settles cancellation with nothing to cancel
+(`cancel_status=settled`), preserving the diagnostic, terminal facts, reason and
+token expiry. For an active Run this fallback returns without error and backs
+off; it does not introduce a new terminal transition. The next due pass follows
+the existing regression/absence rules. Each write rechecks ownership and the
+stored evidence inside the transaction.
+A first acknowledgement after a cancel settlement links the Job and wakes
+cancel delivery. The existing cancellation fields report delivery's outcome.
+The Run's recorded terminal reason, status and timestamps never change, and
+its token is neither minted nor extended. Existing rows keep their old reason.
 An ambiguous dispatch is never replayed to create work after cancellation.
 
 A typed non-retryable L1 cancel refusal ends delivery and is retained with its
