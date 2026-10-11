@@ -2,193 +2,19 @@ package l3
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
 	"net/url"
-	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// cancelStoredJobID uses an outbox acknowledgement only while no settled absence
-// or regression diagnostic contradicts it. The Run's own link remains primary.
-const cancelStoredJobID = `COALESCE(r.l1_job_id, CASE WHEN r.job_link_settled=0
- AND COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, '') NOT IN ('` + l1RegressedReason + `', '` + dispatchNotFoundReason + `')
- THEN o.job_id END)`
-
-// requestRunCancellation arbitrates cancellation with the first dispatch
-// attempt. A never-attempted run can settle locally. Once an attempt began,
-// even without an acknowledgement, L1 is the authority on the job's outcome.
-func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return internalError(err, "begin run cancellation")
-	}
-	defer tx.Rollback()
-	var state contract.RunState
-	var submitter string
-	var attempted sql.NullInt64
-	var jobID sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT r.status, t.actor, r.dispatch_attempt_ns, `+cancelStoredJobID+`
- FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
- LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).Scan(&state, &submitter, &attempted, &jobID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return protocolError(contract.ErrorNotFound, "run was not found")
-	}
-	if err != nil {
-		return internalError(err, "read run cancellation target")
-	}
-	if actor != submitter {
-		// Follow parent links only: a rerun starts a new lineage with its own
-		// submitter. Bound the walk and refuse corrupt or incomplete lineage.
-		var rootActor string
-		err := tx.QueryRowContext(ctx, `WITH RECURSIVE ancestors(run_id, parent_run_id, depth) AS (
- SELECT run_id, parent_run_id, 0 FROM runs WHERE run_id=?
- UNION ALL
- SELECT r.run_id, r.parent_run_id, a.depth+1 FROM runs r JOIN ancestors a ON r.run_id=a.parent_run_id WHERE a.depth<?
-) SELECT t.actor FROM ancestors a JOIN run_triggers t ON t.run_id=a.run_id WHERE a.parent_run_id IS NULL`, runID, maxLineageTraversalDepth).Scan(&rootActor)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return internalError(err, "read cancellation lineage root")
-		}
-		if err != nil || actor != rootActor {
-			return protocolError(contract.ErrorForbidden, "only the submitting actor or lineage root's submitting actor may cancel a run")
-		}
-	}
-	if (state == contract.RunSucceeded || state == contract.RunFailed) && !jobID.Valid && !attempted.Valid {
-		return nil
-	}
-	// Uncontradicted legacy acknowledgements may exist only in the outbox. Link them before
-	// cancellation takes over recovery, preserving the terminal outcome.
-	if jobID.Valid {
-		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID.String); err != nil {
-			return err
-		}
-	}
-	now := canonicalTime(s.clock.Now())
-	if !attempted.Valid && !jobID.Valid {
-		if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, "canceled before dispatch was confirmed"); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO run_cancellations(run_id, requested_ns, completed_ns) VALUES(?, ?, ?) ON CONFLICT(run_id) DO NOTHING`, runID, now.UnixNano(), now.UnixNano()); err != nil {
-			return internalError(err, "record local run cancellation")
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO run_cancellations(run_id, requested_ns) VALUES(?, ?)
- ON CONFLICT(run_id) DO UPDATE SET failures=0, retry_ns=0, last_error=NULL, refused=0
- WHERE run_cancellations.completed_ns IS NULL`, runID, now.UnixNano()); err != nil {
-			return internalError(err, "record run cancellation intent")
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return internalError(err, "commit run cancellation intent")
-	}
-	return nil
-}
-
 type runCancellation struct {
 	projectedRun
 	DispatchKey string
-}
-
-func (s *Store) pendingRunCancellations(ctx context.Context, runID string) ([]runCancellation, error) {
-	query := `SELECT r.run_id, COALESCE(` + cancelStoredJobID + `, ''), r.status, r.required_envelope, r.dispatch_key
- FROM run_cancellations c JOIN runs r ON r.run_id=c.run_id
- LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id
- WHERE c.completed_ns IS NULL AND c.retry_ns<=?`
-	args := []any{s.recoveryNow().UnixNano()}
-	if runID != "" {
-		query += " AND r.run_id=?"
-		args = append(args, runID)
-	}
-	query += " ORDER BY c.retry_ns, c.requested_ns, r.run_id LIMIT ?"
-	args = append(args, unrecordedDispatchBatch)
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, internalError(err, "list run cancellations")
-	}
-	defer rows.Close()
-	var runs []runCancellation
-	for rows.Next() {
-		var run runCancellation
-		if err := rows.Scan(&run.RunID, &run.JobID, &run.State, &run.RequiredEnvelope, &run.DispatchKey); err != nil {
-			return nil, internalError(err, "scan run cancellation")
-		}
-		runs = append(runs, run)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, internalError(err, "iterate run cancellations")
-	}
-	return runs, nil
-}
-
-// cancelAbsentDispatch accepts an absence only beyond the existing dispatch
-// settlement horizon, and only if no acknowledgement landed meanwhile.
-func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupStarted time.Time) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return internalError(err, "begin absent dispatch cancellation")
-	}
-	defer tx.Rollback()
-	var eligible bool
-	if err := tx.QueryRowContext(ctx, `SELECT l1_job_id IS NULL AND dispatch_attempt_ns<=?
- AND NOT EXISTS (SELECT 1 FROM dispatch_outbox o WHERE o.run_id=runs.run_id AND o.job_id IS NOT NULL)
- FROM runs WHERE run_id=?`, canonicalTime(lookupStarted).Add(-unrecordedDispatchSettleHorizon).UnixNano(), runID).Scan(&eligible); err != nil {
-		return internalError(err, "check canceled dispatch absence")
-	}
-	if !eligible {
-		return nil
-	}
-	if err := failRunTx(ctx, tx, runID, canonicalTime(s.clock.Now()), s.tokenGrace, "canceled before dispatch was confirmed"); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1 WHERE run_id=?`, runID); err != nil {
-		return internalError(err, "settle canceled dispatch absence")
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=?, last_error=NULL, refused=0 WHERE run_id=?`, s.recoveryNow().UnixNano(), runID); err != nil {
-		return internalError(err, "finish absent dispatch cancellation")
-	}
-	if err := tx.Commit(); err != nil {
-		return internalError(err, "commit absent dispatch cancellation")
-	}
-	return nil
-}
-
-// cancelAbsentStoredIdentity settles only delivery for an already-terminal Run.
-// Preserve its verdict, terminal facts and token expiry. Recheck the identity
-// and verdict that authorized the remote read inside the write transaction.
-func (s *Store) cancelAbsentStoredIdentity(ctx context.Context, runID string, observed dispatchObservation) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return internalError(err, "begin absent identity cancellation")
-	}
-	defer tx.Rollback()
-	current, err := readDispatchObservation(ctx, tx, runID)
-	if err != nil {
-		return err
-	}
-	if current != observed {
-		return internalError(errors.New("dispatch evidence changed during lookup"), "settle absent identity cancellation")
-	}
-	if !current.outboxJob.Valid || current.outboxJob.String == "" ||
-		(current.runJob.Valid && current.runJob.String != current.outboxJob.String) ||
-		(current.reason == l1RegressedReason && current.diagnosticJob != "" && current.diagnosticJob != current.outboxJob.String) {
-		return internalError(errors.New("stored dispatch identity conflicts with recorded job"), "settle absent identity cancellation")
-	}
-	if current.state != contract.RunSucceeded && current.state != contract.RunFailed {
-		// An active Run still follows the existing regression/absence rules.
-		return nil
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=?, last_error=NULL, refused=0 WHERE run_id=? AND completed_ns IS NULL`, s.recoveryNow().UnixNano(), runID); err != nil {
-		return internalError(err, "finish absent identity cancellation")
-	}
-	if err := tx.Commit(); err != nil {
-		return internalError(err, "commit absent identity cancellation")
-	}
-	return nil
 }
 
 func (s *Store) finishRunCancellation(ctx context.Context, runID string) error {
@@ -213,12 +39,7 @@ func (s *Store) deferRunCancellation(ctx context.Context, runID string, cause er
 	if err := s.db.QueryRowContext(ctx, `SELECT failures FROM run_cancellations WHERE run_id=?`, runID).Scan(&failures); err != nil {
 		return internalError(err, "read cancellation failures")
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE run_cancellations SET failures=failures+1, retry_ns=?, last_error=? WHERE run_id=? AND completed_ns IS NULL AND failures=?`,
-		s.recoveryNow().Add(unrecordedDispatchBackoff(failures)).UnixNano(), string(payload), runID, failures)
-	if err != nil {
-		return internalError(err, "defer run cancellation")
-	}
-	return nil
+	return s.writeCancellationBackoff(ctx, runID, failures, s.recoveryNow().Add(unrecordedDispatchBackoff(failures)), string(payload))
 }
 
 func (s *Store) refuseRunCancellation(ctx context.Context, runID string, cause error) error {
@@ -443,37 +264,6 @@ func (r *Reconciler) projectObservedJob(ctx context.Context, run projectedRun, j
 		reason = JobFailureReason(job)
 	}
 	return r.store.projectJobOutcome(ctx, run, job.State, reason)
-}
-
-// acceptRecoveredCancellation hands a bound positive observation to cancel.
-// The same write checks ownership and dispatch identity, links the Job using
-// lookup evidence, and wakes delivery. L1 calls happen only after it commits.
-func (s *Store) acceptRecoveredCancellation(ctx context.Context, item unrecordedDispatch, jobID string, observed *dispatchObservation) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return internalError(err, "begin recovered cancellation")
-	}
-	defer tx.Rollback()
-	var key, outboxKey string
-	err = tx.QueryRowContext(ctx, `SELECT r.dispatch_key, o.dispatch_key
- FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
- WHERE r.run_id=? AND EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)`, item.RunID).Scan(&key, &outboxKey)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
-		return internalError(err, "read recovered cancellation ownership")
-	}
-	if key != item.DispatchKey || outboxKey != key {
-		return internalError(errors.New("recovered cancellation conflicts with dispatch key"), "link recovered cancellation")
-	}
-	if err := s.completeDispatchWithEvidenceTx(ctx, tx, item.RunID, jobID, dispatchLookupEvidence, observed); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return internalError(err, "commit recovered cancellation")
-	}
-	return nil
 }
 
 // linkRecoveredDispatch preserves discoveries when cancellation took ownership

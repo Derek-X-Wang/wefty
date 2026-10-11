@@ -1,0 +1,1034 @@
+[
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelContradictedStoredAcknowledgement",
+    "fingerprint": "03f18b4e828ebc535b7720368b2849ebc7d951a367069ca2dfe66f7c765bb61f",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelContradictedStoredAcknowledgement",
+    "fingerprint": "117ced34083bea519e2f2b2fc3445eb2f7e479f72fc086788bd42e6ce697f5b0",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelContradictedStoredAcknowledgement",
+    "fingerprint": "d9a70308ea3ae3a9fd8e57c8edd35c209d3d75e4026c56ccf11e9a2bc9d64687",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelFollowupLegacyCompletedEvidence",
+    "fingerprint": "ad252c8b5c2ce750d7cdd3f16da9ec40ae98fae7ac16b46d422ae475d5fa0088",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelFollowupLegacyCompletedEvidence",
+    "fingerprint": "fe45be819d2eb89f39f1f4dde9246b1864cd1aa560da709a44318d8d04468d21",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelFollowupLegacyOutboxAcknowledgement",
+    "fingerprint": "d9a70308ea3ae3a9fd8e57c8edd35c209d3d75e4026c56ccf11e9a2bc9d64687",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelRechecksStoredEvidenceBeforeLinking",
+    "fingerprint": "0911ad1222475afd2186c05443a97b010e3dd10f79876df72a14965732439c2f",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelRechecksStoredEvidenceBeforeLinking",
+    "fingerprint": "410fc951d573887a7ca39e42e0aac1069520e7ecdaa43eacdc5083844dda7025",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelRechecksStoredEvidenceBeforeLinking",
+    "fingerprint": "d9a70308ea3ae3a9fd8e57c8edd35c209d3d75e4026c56ccf11e9a2bc9d64687",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_review_test.go",
+    "function": "TestCancelReviewPermanentRefusal",
+    "fingerprint": "5f66575d5c0a28e166fab0e75a9c49518b1402082ec495b7d76f3af5102536b9",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_round2_test.go",
+    "function": "TestCancelRound2OutboxOnlyNotFound",
+    "fingerprint": "d9a70308ea3ae3a9fd8e57c8edd35c209d3d75e4026c56ccf11e9a2bc9d64687",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_round2_test.go",
+    "function": "TestCompleteDispatchRejectsEmptyJobID",
+    "fingerprint": "b7084e833ec1edcf8d8f1661fc46558f62f32d7070d63959290bc742aa3c7bc6",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_round2_test.go",
+    "function": "TestPersonAdminHasNoL3CancelAuthority",
+    "fingerprint": "bf7f6e0ea28f23f01b16ad0d8d990727d3a6e87b106d4404d56455f66f6c18d7",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_test.go",
+    "function": "TestCancelRunAbsentDispatchSettlement",
+    "fingerprint": "f7e97dfaff02c52bfe18dc9d8ec7276dcbf8fa76252a1d7242aef5047d71b466",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.MintReprovedComputerToken",
+    "fingerprint": "196b428a2e66d48bdcd9db5d495709be9c8fe3442c2c5ace0d40a16bbcfb3b8d",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.MintReprovedComputerToken",
+    "fingerprint": "81087307d0b932487a7828c5e86d0fa0c5aa9d89d11089379cbf463e7b88bb93",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.RevokeComputerAttemptTokens",
+    "fingerprint": "8d4cc1eece3dda993177a19b14d2c8f6004139420aceb1d905f7677d3fb955b3",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.RevokeComputerTokenScope",
+    "fingerprint": "03b2221a07fa37bbc61d8c97db36303c14220f96216ad5fb4913e07646ec6b7b",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.RevokeComputerTokens",
+    "fingerprint": "be3b9ef0faaaef2391a9053fc4c0a4587c56697f7e889261c7dee6b0aa63dbd8",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.RevokeHostComputerTokens",
+    "fingerprint": "36e3c528bdaaf2610448bccdf6f59bd99beb29f1d264d651b232b6f4fbdedd9b",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.adoptComputerAuthorityInstance",
+    "fingerprint": "4860ed3772d0dc3c645bac7daae936de6813264830a6c880ae7ed287fd58e39f",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.insertComputerGrant",
+    "fingerprint": "ef5c4c7a95656ee49f85dba663e3e4fc3b9e8d278093f70c9fd5de28d09537a2",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.listComputerRuns",
+    "fingerprint": "3bf4d238a768ac4ffe07a44d80f18344bea71163bf02cd4ee1065912be2238f6",
+    "count": 1,
+    "reason": "Computer Run pages hydrate the public Run view; replace this link read during public-reader adoption.",
+    "retirement": "#783"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.revokeComputerAttemptTokensAsControlPlane",
+    "fingerprint": "5666302dd35f98ffa71873e5511b3dd8a0f012bcaef1afb2bd5fb3cc2a42a9c1",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "*Store.settleComputerGrantMint",
+    "fingerprint": "5a198e9244f848a78414d22fe68d894e6e35a4c5568e73bcbf88ca18cd8fc164",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "revokeComputerGrantRows",
+    "fingerprint": "1a130c905468f035a9a07f6a0c3980461902839ed0f53170a9f476fbe7f478a7",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens.go",
+    "function": "revokeComputerGrantRowsWithCount",
+    "fingerprint": "835640906434c5d481a1cef92ac4e6d3a0f052ba4305a5997b3533ee6abe3255",
+    "count": 1,
+    "reason": "Internal Computer grant code reads Run identity or forwards constructed SQL; preserve grant fencing while adopting the module read in background paths.",
+    "retirement": "#784"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestRevokeHostRevokesLegacyGrantsWithoutBootSession",
+    "fingerprint": "2413bac61e3f9551f3bd8f1f0d5fabc33f28a11867b2699675a51a90a5bb9ed5",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_hold.go",
+    "function": "runDispatchHold",
+    "fingerprint": "07a54fa5989dfe6f9d3e20598fdfae627f8ffef39b620ce62a65b871f8bb86ba",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "dispatch_hold_test.go",
+    "function": "TestLedgerHoldReadsDoNotReserveSQLiteWriter",
+    "fingerprint": "91eba8a146f42b524b10ca47a8eb647ad8a94e5fc5d995b81e18b15af54a6884",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_hold_test.go",
+    "function": "stagedBearer",
+    "fingerprint": "3f51058f3912a8673d91872bf8ab0813f5191f071fb917de5b03b40f12cf786a",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_recovery_budget_test.go",
+    "function": "TestOpeningALedgerHealsMissingDispatchAttemptTimes",
+    "fingerprint": "05ca85b3d62be95fb229694ca8b058acae1378c2bd1da1ff29c0b74de3263823",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_recovery_budget_test.go",
+    "function": "TestOpeningALedgerHealsMissingDispatchAttemptTimes",
+    "fingerprint": "531f4b66612c343d075dfdee9abccb9057f6241a7d3997fb63996d9391fd2d0f",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_recovery_budget_test.go",
+    "function": "TestOpeningALedgerHealsMissingDispatchAttemptTimes",
+    "fingerprint": "df3d417c7b4c9fca283812beec41db5fd6eaf2f0a40015ba2ad4c1aa8133ef6d",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_recovery_budget_test.go",
+    "function": "TestOpeningAnOlderLedgerBackfillsDispatchAttemptTime",
+    "fingerprint": "15acecff4c0f812280d68a59fb04d775611641db8e67d1facb08089f26fe2af7",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_recovery_budget_test.go",
+    "function": "TestOpeningAnOlderLedgerBackfillsDispatchAttemptTime",
+    "fingerprint": "1b630c3b58145d5c55c4097147cd286b2a76a14adc149164beabed3975c8b779",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_recovery_budget_test.go",
+    "function": "TestRunEndedBeforeAnyAttemptIsNotRecoveryEligible",
+    "fingerprint": "dcad589aa37297e48eed587d56b7da3748cf21dd2ed70138730e2605e6a8abd3",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_recovery_budget_test.go",
+    "function": "jobLinkBackoff",
+    "fingerprint": "b28b088dc955d963123ba0731ae5fd842b590666f6f57a6f72f66fe2a57f93d0",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_review_test.go",
+    "function": "TestDispatchReviewRetryCleanup",
+    "fingerprint": "6ae6ee1f3d20e3d1befc10df30d9198f447f641579645c114694d959fd2865c1",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "dispatch_settle_horizon_test.go",
+    "function": "jobLinkSettled",
+    "fingerprint": "9d248015404c9f84c40fca84fd306df113003df1b8288e1ec969d7f5e31e0e43",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "execution_context_test.go",
+    "function": "TestDispatchDeliversExactRunEnvironmentAndStoresTokenHash",
+    "fingerprint": "d069384cb4f74c3531ffbb995e9921e824f3176decfbf4aa13d8d179d4cb70ea",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "failure_reason_test.go",
+    "function": "TestPendingNodeAttributionsUseThePartialIndex",
+    "fingerprint": "bb82b5295900ab450bf363166f9875c19b156a2157d367f1607a7305bd417266",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "l1_evidence_bounds_test.go",
+    "function": "TestDispatchL1DetailsSizeBound",
+    "fingerprint": "134ecd2828b75b03782c813d2c49f0bf300105bfaaaaafc0f3daf8d4401e62ce",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "recovery_cancel_test.go",
+    "function": "TestRecoveryAcknowledgedDiscoveryReachesCancel",
+    "fingerprint": "e4f14795740285809aee7fc2b34cb93e09c92bdbc4e09a44d56a04b9382eb8ba",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "recovery_cancel_test.go",
+    "function": "TestRecoveryCancelHandoffCannotOverwriteLaterVerdict",
+    "fingerprint": "5df6ce2f54c502897c43e644aba63d2f0398156c330b9d7a10cd4d6bd7e00084",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "recovery_cancel_test.go",
+    "function": "TestRecoveryCancelHandoffCannotOverwriteLaterVerdict",
+    "fingerprint": "c0a5e669bc78170fd95307a9e3a094f4f6621f8618b42bc1bbb53d97c5d119bc",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "recovery_cancel_test.go",
+    "function": "TestRecoveryIdentityConflictBacksOff",
+    "fingerprint": "f7bb5cebb7a2dbccf9309892b4a0a5f1b14e2e6326658d83b74a7276e0d96ba2",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "regression_http_test.go",
+    "function": "TestL1RegressionExecutionReadBoundary",
+    "fingerprint": "5962591bc9ca2eb13e61937e2228d49628c64a9bccf86ba521711d9363905e13",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "regression_http_test.go",
+    "function": "TestL1RegressionExecutionReadBoundary",
+    "fingerprint": "b18517a79776be1c2235fc33ddf7f93a3067f421a74951a54fcf26b2c150ec8f",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "regression_store_test.go",
+    "function": "TestL1RegressionGuardAndRollback",
+    "fingerprint": "090db2044586ce1eb04d78b71895f1b391e434f45ece4d13d7ec86f26c70be8d",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "regression_store_test.go",
+    "function": "TestL1RegressionGuardAndRollback",
+    "fingerprint": "57a918ca08dd6df22ea72a63d7c2052ee13e593f65772fa7bbd5f8ed114c47b3",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "regression_store_test.go",
+    "function": "TestL1RegressionGuardAndRollback",
+    "fingerprint": "e0cc7d6dc651d4572a83d24e6599f8bbf91e49db87e412c37fc212b0b363c6a1",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "regression_store_test.go",
+    "function": "snapshotRecovery",
+    "fingerprint": "539ebf784f3756ec953eab977952f5647a67010f47d3d64cc20885931bbd16db",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_idempotency_actor_test.go",
+    "function": "TestRunIdempotencyActorUpgradeAndReopen",
+    "fingerprint": "4dc8f061d5b156fdcf0bdbf756aa9db1e9a237005dfa80c90c54e58bdcd46993",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_idempotency_actor_test.go",
+    "function": "legacyRunKeyLedger",
+    "fingerprint": "5ae62c74d8fa1e1661ff19f50313d35e9435665a8d7ce41cac92e756ff481b88",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_idempotency_actor_test.go",
+    "function": "legacyRunKeyLedger",
+    "fingerprint": "9ba175975ffa03e7d9ee2a61136c498183a1964eaa111f3fc5adff490ad9f6f8",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_idempotency_migration.go",
+    "function": "*Store.migrateRunActorKeys",
+    "fingerprint": "4f33bc7c3b597f029d20aeb90ac3df63a2ff31fc8350060a8133af4ad6d941d3",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_idempotency_migration.go",
+    "function": "*Store.migrateRunActorKeys",
+    "fingerprint": "50c0e7ef09b36d5728ba0cac6aacf73a017bdf1f0bcf60d472a6c89bf5f585d1",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_idempotency_migration.go",
+    "function": "*Store.migrateRunActorKeys",
+    "fingerprint": "fa4dee398fe3659da5e9d36c2d4c6ee869efa71e1162888e06f37edeee337bee",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_acknowledgement_test.go",
+    "function": "TestAcknowledgementDuringRecoveryLookupLinksTheRun",
+    "fingerprint": "88396a16735eac3e194563588eddb29ec97cff25a67d35e5453ac5982fc33274",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelAbsentFallbackPreservesConflictingOwnership",
+    "fingerprint": "05c8fc076bdf14fe4697efdd1bfe5e2879dde4d8e342e7097171c6700722ddf2",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelAbsentFallbackPreservesConflictingOwnership",
+    "fingerprint": "afc29b559a113cacdcd919e40305a9b0272cc8ec2ea2dae810547ea8325a6f7b",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelAbsentIdentityFallbackDefersActiveRun",
+    "fingerprint": "c0f3d15615dd1526662f0b9b08bf2229fbbe9106ac8a04715a668eb02261f3b5",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelContradictedIdentityFallback",
+    "fingerprint": "03f18b4e828ebc535b7720368b2849ebc7d951a367069ca2dfe66f7c765bb61f",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelContradictedIdentityFallback",
+    "fingerprint": "2b9dfa950fa532724e92ace50e995d500ad2a5412e708b14610b5cfd5a095fb0",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelIdentityFallbackRechecksAndDefers",
+    "fingerprint": "a892d567215c572b641b530b524ada28443d8329622983160a17ed89e4466cfb",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelLookupCannotOverwriteRerecordedRegression",
+    "fingerprint": "6d1578757d2811fc79c0b41a7477cb35af3b1529c82d769507a24e976491a467",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelLookupSupersedesRecoverySettlementDuringLookup",
+    "fingerprint": "54d5aed40be83884fa6e1580fb575b1f807c7e7e0425b219bd514d676061b5ab",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelLookupSupersedesRecoverySettlementDuringLookup",
+    "fingerprint": "e9040675c1e5152803fb70242a1b4f00383f5e2286c066cffb558503f46892d8",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelMalformedDispatchErrorDoesNotBlockBatch",
+    "fingerprint": "1b030a9eaecfc2b238467bdcd43a34403ff426b6accd808396dc7e8b45612292",
+    "count": 2,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "TestCancelMalformedDispatchErrorDoesNotBlockBatch",
+    "fingerprint": "fb5d80dd2ab736f761da38ec8bc64528710c0895d0f78d3869ae2789b0b5c751",
+    "count": 2,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_list.go",
+    "function": "*Store.ListRuns",
+    "fingerprint": "839f590236d85d23733edeb99cbc0a81beb4139700ddde29d9434036bc49aea2",
+    "count": 1,
+    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
+    "retirement": "#783"
+  },
+  {
+    "file": "run_list_plan_test.go",
+    "function": "TestRunListIndexUpgradeAndReopen",
+    "fingerprint": "9edcad452ac65fbe1427bb2c2a12da3d6011a8e27cea34e6ba4c7faee71325d5",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_list_plan_test.go",
+    "function": "assertRunListPlans",
+    "fingerprint": "e52e2efcaa6c396fcc49136cd4bb5438c72db22ee65345851c03f7c57368ca03",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "secret_hygiene_test.go",
+    "function": "TestTerminalRunDropsItsStagedTokenDelivery",
+    "fingerprint": "2cb88d6c483b45f3eae7d7acfc015a66d6d8c5584b996654bf15acb0bc28c2b3",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "secret_hygiene_test.go",
+    "function": "TestTerminalRunDropsItsStagedTokenDelivery",
+    "fingerprint": "d4cf95c48b496f57cb089b15d605447f1370a7af36e3baebcfbed5ee407ae3d3",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "server.go",
+    "function": "*Server.listRecentRuns",
+    "fingerprint": "042cb2401f5a746843c326f41b61fd1d55f2670309cb37077eac4111ef3a1b8a",
+    "count": 1,
+    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
+    "retirement": "#783"
+  },
+  {
+    "file": "server.go",
+    "function": "*Server.listRuns",
+    "fingerprint": "beb908f912d081c09666431471806ef23b156653ffd73a645b01a05f94c2cfb8",
+    "count": 1,
+    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
+    "retirement": "#783"
+  },
+  {
+    "file": "server_integration_test.go",
+    "function": "TestPermanentDispatchFailureFailsRunAndReleasesSucceededParent",
+    "fingerprint": "277899d6d803aea495f819e9a5588730805de5c5842c67819b9943a3d370d75d",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.GetRun",
+    "fingerprint": "1c814e625ce98796215b9c501e795a578de5255339b5e4d388a810b388cea027",
+    "count": 1,
+    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
+    "retirement": "#783"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.GetRunExecution",
+    "fingerprint": "45a80b0bef54912665e2c923703c6cfd4376968fe86ed2bdaa55e9f6b4581f6b",
+    "count": 1,
+    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
+    "retirement": "#783"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.activeProjectedRuns",
+    "fingerprint": "cb5c378e0b5fe1c2b00b1daac8e161cd24bdf4ce2b80203ab638c7c9ce00ca84",
+    "count": 1,
+    "reason": "Projection and node-attribution selection reads link storage directly until background-reader adoption.",
+    "retirement": "#784"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.beginDispatch",
+    "fingerprint": "26121d8a8dfa02904611fa390e6d454dc65f47e588bd78c146f8b47becc4cbb8",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.beginDispatch",
+    "fingerprint": "da2bfa1aaea0a49af7cc649aedce657ba82b3815c53647f6184d86ba4a2466cb",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.deferUnrecordedDispatch",
+    "fingerprint": "8a7b6d76a408714506aa2f5004c01d063d026de096235b9f570dabdab2a463a4",
+    "count": 1,
+    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
+    "retirement": "#781"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.deferUnrecordedDispatch",
+    "fingerprint": "cef3b9f2b73b5447089a98746cdd9fb5c724089590a4f92ccb1e14803e8ba955",
+    "count": 1,
+    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
+    "retirement": "#781"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.failDispatch",
+    "fingerprint": "72efb556f07ff64c28d438974c55aa99707858c4cde3a72e0c4c84c38d02c1e1",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.failMissingL1Job",
+    "fingerprint": "350279fffdacdf003ae175217cca16c120a5a8df0533592ac1daeabfb0f99755",
+    "count": 1,
+    "reason": "Existing atomic regression safeguards remain intact until the regression writer moves.",
+    "retirement": "#782"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.failMissingL1Job",
+    "fingerprint": "56c816fa355a5ade4e78e1e6ff54041d691d66425120ac238581170cf9e856bc",
+    "count": 1,
+    "reason": "Existing atomic regression safeguards remain intact until the regression writer moves.",
+    "retirement": "#782"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "13aab94687cba96e5e4d3a6d1310a849269581fcf40e363cb886de255be116e1",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "216e9f80db5a953dd3b4318cc2ff1cdfdffdb67ab735b6646e23031dd90e2700",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "25d7983a4399fd974b82701ad2a205d4d69065185bda5012770b6d628a254bfe",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "270943ffabbbd4d0257f22b71aa46432198aca32a36b818ed8e073ef3edc282d",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "275f41d8478580fc69a11cbbcb04e2183f487f04ae0f0c0004669c2033ae1d7d",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "3111157c6808ebb02ec808028464a14ed8a356b7c25218352b9ff65a6f58e6a1",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "46eb149edef8d3faff142bb00fc6d60a5add84d7858569bd127f449dc97a89ef",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "4f81150c071fe667108f2b130652bfe4f85cd927c1ef6b03da0cd04485cfde75",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "50c4ba6d9bc727dba9bc3a507bacb566951f5c678a0f0c8024224535c098611d",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "67b52e3d4fc3b0e8bc745623554f292cc2b6cb2ec69d54b586059c9c94fc91ae",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "68f3edc2771e23628d892e0276dd365f1dc1b588936d249ad403e62a92286a21",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "83621b7d70a7bb6657fdb2ef678a194838beb8dc3813134e5d5adead6aad6970",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "83d53705a9e948d0fc3665661b61830555f91ce365d5d373f9546f297b8da808",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "8639bfb1866b6b2455d21ad014c687fe648b6da0015b1ef773fe9175f69b1f47",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "ad638c9f6367626535209058bb6fc31475095f384d205daf27f1a5b31cf5b08f",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "c8cc8ec14ab2977ed9f5caecb57517550798d2aa76cd0cc1fa0eecad42628b2d",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "eb354f2fce85ce5e19bc65d61671e4e2f6d327e9a54af56b6b53031a0685bb07",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.pendingDispatches",
+    "fingerprint": "02179fc11e2abe9d4d65808fece26bbe997a5bd5ea78132c8e6dd7afc1af86cd",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.pendingNodeAttributions",
+    "fingerprint": "13634dca77e61b023d462dc7bbbc741ba4e600b1037624b3469ddbefec8f129f",
+    "count": 1,
+    "reason": "Projection and node-attribution selection reads link storage directly until background-reader adoption.",
+    "retirement": "#784"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.recordDispatchError",
+    "fingerprint": "c6532a891d5ccb7183d3ea08ea69be8b10b15d4c4fadbda31b247f01a0e288a9",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.recordDispatchError",
+    "fingerprint": "ef0979ca29b6c197aa920208b5fc729acaacfa4d3d7a2e85ad9ac1033d432008",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.runJobID",
+    "fingerprint": "84422f1fc51a7fdf3cb4a8fc8f30a97f1585dda62ce2512766ceb6cb0bd97825",
+    "count": 1,
+    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
+    "retirement": "#783"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.settleUnrecordedDispatch",
+    "fingerprint": "08846ba26ce4f78bf538b0833fedc5df0dee88fef5d8ffa5847224d8258e09a2",
+    "count": 1,
+    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
+    "retirement": "#781"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.settleUnrecordedDispatch",
+    "fingerprint": "b0a4b218aba12c4509fd34a14b1e067bf72eb9bb341197153d175d806cba8371",
+    "count": 1,
+    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
+    "retirement": "#781"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.unrecordedDispatches",
+    "fingerprint": "cdf39bcecb9e488d4c913ddc5213b5a1ceb6b2256c0f726643ff63533c6768f5",
+    "count": 1,
+    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
+    "retirement": "#781"
+  },
+  {
+    "file": "store.go",
+    "function": "clearStagedTokenDelivery",
+    "fingerprint": "874318e9389dca0a2ec06ab52923c12d76ceba8936f8e53c8b5c83312ca7fa8e",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "ensureRunTokenTx",
+    "fingerprint": "6245cccb0cbf1b7372e8ae65b669d805995ad4c6a0c30cee057f4582d09d4157",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "ensureRunTokenTx",
+    "fingerprint": "e9c6f05fcef3061b0908792be372af6d4adcb9f096dee0f4630f35a8d52df6ea",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "ensureSQLiteColumn",
+    "fingerprint": "a82a83d259085248c691c0c109abe3c343c551d53d6474c3e79b02cd4939374c",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "ensureSQLiteColumn",
+    "fingerprint": "ff690675deb681f0d4511634383809e6b368be7f7231c828e1da4793c7ecfd37",
+    "count": 1,
+    "reason": "Existing schema/bootstrap or actor-key table-copy SQL; replace this adoption entry with the named, explicit-destination schema exception when the guard closes.",
+    "retirement": "#785"
+  },
+  {
+    "file": "store.go",
+    "function": "failRunTx",
+    "fingerprint": "3ee2bf566dde3ecadadcb1d67e6cdd846c2030e1ca835488ab0f2961ea6392cd",
+    "count": 1,
+    "reason": "Dispatch creation, submission eligibility, token staging or attempt recording remains outside this move.",
+    "retirement": "#779"
+  },
+  {
+    "file": "store.go",
+    "function": "unrecordedDispatchForTx",
+    "fingerprint": "ab184caa9d3ae074eeb306f16fdc971a117e5ce5336891b44a4e5d08d046eac3",
+    "count": 1,
+    "reason": "Recovery selection, absence settlement and backoff remain in their existing owner until resolver adoption.",
+    "retirement": "#781"
+  },
+  {
+    "file": "store_durability_test.go",
+    "function": "TestTheL3LedgerCarriesTheDurabilityPragmas",
+    "fingerprint": "0262cda19b864f1f8ec5688af3e165b0bb7d753f59033bb79b1fb3f693b4f9aa",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "terminal_dispatch_race_test.go",
+    "function": "TestBeginDispatchRefusesARunThatIsTerminal",
+    "fingerprint": "ae64d218212118745ca6f919f66a57e332ebd6537b25832ac8580fbe778b9556",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "terminal_dispatch_race_test.go",
+    "function": "TestRetryForARunThatEndedBeforeItsAttemptDoesNotSubmit",
+    "fingerprint": "c2c4c8b2dfc278b5e57d4c0609d94dff873e610743a523af40bc5092bbfe30e9",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "unrecorded_dispatch_test.go",
+    "function": "TestPermanentRefusalKeepsItsDiagnosticWhenNoJobIsFound",
+    "fingerprint": "4d7dbc7c3b6fea3d709061c24f5861c14437724d162b6e4b52c42a05edd74f4c",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "unrecorded_dispatch_test.go",
+    "function": "TestRunEndedDuringItsInFlightSubmitIsLinked",
+    "fingerprint": "e8ce65f04e25df802d5a6d92b6b0c20d33975435d041671b2a54b434dcae522f",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "unrecorded_dispatch_test.go",
+    "function": "TestUnrecordedDispatchesUseThePartialIndex",
+    "fingerprint": "77b4304028929529fd9e1c93f1cb565cb849f732082b3c2a34f83def6e837dd9",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "unrecorded_dispatch_test.go",
+    "function": "ageDispatchAttemptPastSettleHorizon",
+    "fingerprint": "6f20339e0a7eac65e9a73d774e054cac3e1ab98be9e0e83879db5cf133bab694",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "unrecorded_dispatch_test.go",
+    "function": "recordOutboxOnlyAcknowledgement",
+    "fingerprint": "f73ad6eaf1ad1584a324cc5629d419979a1fe31b90d387f601064bd6cfa7fd73",
+    "count": 1,
+    "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  }
+]
