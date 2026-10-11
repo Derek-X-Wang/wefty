@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -22,8 +21,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
-		writeCommandError(os.Stderr, err, hasJSONFlag(os.Args[1:]))
-		os.Exit(commandExitCodeForArgs(err, os.Args[1:]))
+		report := decideCommandReport(err)
+		report.writeError(os.Stderr, hasJSONFlag(os.Args[1:]))
+		os.Exit(report.exitCode)
 	}
 }
 
@@ -70,147 +70,11 @@ const (
 const errorWaitTimeout contract.ErrorCode = "wait_timeout"
 
 func commandExitCode(err error) int {
-	var usage usageError
-	if errors.As(err, &usage) {
-		return exitUsage
-	}
-	var importOutcome *custodyImportOutcomeError
-	if errors.As(err, &importOutcome) {
-		switch importOutcome.outcome {
-		case custodyImportDeferred:
-			return exitCustodyImportDeferred
-		case custodyImportQuarantined:
-			return exitCustodyImportQuarantined
-		case custodyImportFailed:
-			return exitCustodyImportFailed
-		case custodyImportSuperseded:
-			return exitCustodyImportSuperseded
-		}
-	}
-	var outcome *runOutcomeError
-	if errors.As(err, &outcome) {
-		return exitRunFailed
-	}
-	var notReady *notReadyError
-	if errors.As(err, &notReady) {
-		return exitNotReady
-	}
-	var waitTimeout *waitTimeoutError
-	if errors.As(err, &waitTimeout) {
-		return exitWaitTimeout
-	}
-	var mutationTimeout *mutationWaitTimeoutError
-	if errors.As(err, &mutationTimeout) {
-		return exitMutationWaitTimeout
-	}
-	var unavailable *unavailableError
-	if errors.As(err, &unavailable) {
-		return exitUnavailable
-	}
-	var apiError contract.APIError
-	var localErr *ocicontrol.ResponseError
-	var responseErr *apiResponseError
-	var takeoverErr *takeoverActionError
-	switch {
-	case errors.As(err, &localErr):
-		apiError = localErr.APIError
-	case errors.As(err, &responseErr):
-		apiError = responseErr.APIError
-		if responseErr.StatusCode >= 500 && apiError.Retryable &&
-			(apiError.Code == contract.ErrorInternal || apiError.Code == contract.ErrorRunLedgerUnavailable) {
-			return exitUnavailable
-		}
-	case errors.As(err, &takeoverErr):
-		apiError = takeoverErr.APIError
-	default:
-		return exitFailure
-	}
-	switch apiError.Code {
-	case contract.ErrorRevocationWaitTimeout:
-		return exitMutationWaitTimeout
-	case contract.ErrorUnavailable:
-		return exitUnavailable
-	case contract.ErrorInvalidRequest:
-		return exitUsage
-	case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorPrincipalForbidden,
-		contract.ErrorPersonIdentityRequired, contract.ErrorAdminRequired, contract.ErrorControlNotAuthorized:
-		return exitUnauthorized
-	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
-		return exitNotFound
-	case contract.ErrorCancelService, contract.ErrorCancelNotQueued, contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
-		contract.ErrorStorageReferenceConflict, contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict,
-		contract.ErrorInstanceKeyConflict, contract.ErrorInstanceKeyNotSupported, contract.ErrorFinalAdmin,
-		contract.ErrorCapacityExhausted, contract.ErrorComputerResourceRequired, contract.ErrorComputerTraitRequired,
-		contract.ErrorControllerBusy, contract.ErrorControllerAlreadyHeld:
-		return exitConflict
-	default:
-		return exitFailure
-	}
+	return decideCommandReport(err).exitCode
 }
 
 func writeCommandError(writer io.Writer, err error, jsonOutput bool) {
-	// These typed outcomes have already written their result document to stdout.
-	// A second error document would mislabel the verdict and corrupt JSON output.
-	if jsonOutput {
-		var custody *custodyImportOutcomeError
-		var outcome *runOutcomeError
-		var notReady *notReadyError
-		var timeout *waitTimeoutError
-		if errors.As(err, &custody) || errors.As(err, &outcome) || errors.As(err, &notReady) || errors.As(err, &timeout) {
-			return
-		}
-		var mutationTimeout *mutationWaitTimeoutError
-		if errors.As(err, &mutationTimeout) {
-			_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
-				Code: errorWaitTimeout, Message: err.Error(), Retryable: false,
-				Details: map[string]any{"mutation_applied": mutationTimeout.mutationApplied},
-			}})
-			return
-		}
-		var unavailable *unavailableError
-		if errors.As(err, &unavailable) {
-			_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
-				Code: contract.ErrorUnavailable, Message: err.Error(), Retryable: true,
-			}})
-			return
-		}
-	}
-	var usage usageError
-	if jsonOutput && errors.As(err, &usage) {
-		_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
-			Code: contract.ErrorInvalidRequest, Message: usage.Error(), Retryable: false,
-		}})
-		return
-	}
-	var localErr *ocicontrol.ResponseError
-	if jsonOutput && errors.As(err, &localErr) {
-		_ = writeJSON(writer, contract.ErrorResponse{Error: localErr.APIError})
-		return
-	}
-	var responseErr *apiResponseError
-	if jsonOutput && errors.As(err, &responseErr) {
-		_ = writeJSON(writer, contract.ErrorResponse{Error: responseErr.APIError})
-		return
-	}
-	var takeoverErr *takeoverActionError
-	if errors.As(err, &takeoverErr) {
-		if jsonOutput {
-			_ = writeJSON(writer, contract.ComputerControlErrorResponse{Error: takeoverErr.APIError, Receipt: takeoverErr.Receipt})
-			return
-		}
-		_, _ = fmt.Fprintf(writer, "wefty: %v\n", err)
-		if takeoverErr.Receipt != nil {
-			_ = writeComputerControlReceipt(writer, *takeoverErr.Receipt, false)
-		}
-		return
-	}
-	if jsonOutput {
-		_ = writeJSON(writer, contract.ErrorResponse{Error: contract.APIError{
-			Code: contract.ErrorInternal, Message: err.Error(), Retryable: false,
-		}})
-		return
-	}
-	_, _ = fmt.Fprintf(writer, "wefty: %v\n", err)
+	decideCommandReport(err).writeError(writer, jsonOutput)
 }
 
 // Only flag diagnostics are suppressed: command warnings retain their normal
