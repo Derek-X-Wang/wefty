@@ -3441,7 +3441,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		}
 	}
 	if (attempt.spec.Kind != contract.JobKindOCI || attempt.startedNS.Valid) && !canceled {
-		if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
+		if err := markServiceStable(ctx, tx, jobID, attemptID, now); err != nil {
 			return AttemptLease{}, err
 		}
 	}
@@ -3696,7 +3696,7 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 		contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
 		return Job{}, internalError(err, "acknowledge Started job")
 	}
-	if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
+	if err := markServiceStable(ctx, tx, jobID, attemptID, now); err != nil {
 		return Job{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE computer_job_projections SET chown=0
@@ -3833,10 +3833,10 @@ func (s *Store) SetAttemptPublication(
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE service_jobs
 		SET published_attempt_id=?,
-			healthy_since_ns=CASE WHEN ? THEN COALESCE(healthy_since_ns, ?) ELSE NULL END,
+			healthy_since_ns=CASE WHEN ? THEN healthy_since_ns ELSE NULL END,
 			display_endpoint=?
 		WHERE job_id=? AND (published_attempt_id IS NOT ? OR display_endpoint IS NOT ?)`,
-		targetAttempt, *request.Ready, now.UnixNano(), displayEndpoint, jobID, targetAttempt, displayEndpoint)
+		targetAttempt, *request.Ready, displayEndpoint, jobID, targetAttempt, displayEndpoint)
 	if err != nil {
 		return Job{}, internalError(err, "write service publication")
 	}
@@ -3847,6 +3847,12 @@ func (s *Store) SetAttemptPublication(
 	if changed > 0 {
 		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET updated_ns=? WHERE job_id=?", now.UnixNano(), jobID); err != nil {
 			return Job{}, internalError(err, "timestamp service publication")
+		}
+	}
+
+	if *request.Ready {
+		if err := markServiceStable(ctx, tx, jobID, attemptID, now); err != nil {
+			return Job{}, err
 		}
 	}
 
@@ -4079,7 +4085,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 	// start the current service's stability window.
 	if hasAuthority && !canceled && now.Before(attempt.leaseExpires) && attempt.spec.Kind != contract.JobKindOCI &&
 		(attempt.state == contract.AttemptClaimed || attempt.state == contract.AttemptRunning || attempt.state == contract.AttemptAwaitingInput) {
-		if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
+		if err := markServiceStable(ctx, tx, jobID, attemptID, now); err != nil {
 			return AppendLogsResponse{}, err
 		}
 	}
@@ -4937,27 +4943,32 @@ func completionStates(result ProcessResult) (contract.JobState, contract.Attempt
 	return contract.JobFailed, contract.AttemptFailed
 }
 
-func markPortlessServiceStable(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) error {
-	// A Computer's NULL port does not make execution alone healthy: its
-	// display must still be published for the current attempt in this write.
+// markServiceStable applies the same health rule for Started, renewal, live
+// process logs and ready publication, inside the triggering write transaction.
+func markServiceStable(ctx context.Context, tx *sql.Tx, jobID, attemptID string, now time.Time) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
-		SET healthy_since_ns=COALESCE(healthy_since_ns, ?)
-		WHERE job_id=? AND published_port IS NULL
+		SET healthy_since_ns=?
+		WHERE job_id=? AND healthy_since_ns IS NULL
 			AND EXISTS (
 				SELECT 1 FROM jobs
 				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
 				JOIN nodes ON nodes.node_id=attempts.node_id
 				WHERE jobs.job_id=service_jobs.job_id
-					AND (NOT EXISTS (
+					AND jobs.current_attempt_id=?
+					AND attempts.state IN (?, ?, ?)
+					AND attempts.lease_expires_ns>?
+					AND jobs.outcome<>'canceled'
+					AND ((service_jobs.published_port IS NULL AND NOT EXISTS (
 						SELECT 1 FROM computer_job_projections
 						WHERE computer_job_projections.job_id=service_jobs.job_id
-					) OR service_jobs.published_attempt_id=jobs.current_attempt_id)
+					)) OR service_jobs.published_attempt_id=jobs.current_attempt_id)
 					AND service_jobs.bound_node_id=attempts.node_id
 					AND nodes.state=?
 					AND attempts.boot_session_id=nodes.boot_session_id
 					AND attempts.authority_generation=nodes.authority_generation
-			)`, now.UnixNano(), jobID, contract.NodeAlive); err != nil {
-		return internalError(err, "record portless service stability")
+			)`, now.UnixNano(), jobID, attemptID, contract.AttemptClaimed, contract.AttemptRunning,
+		contract.AttemptAwaitingInput, now.UnixNano(), contract.NodeAlive); err != nil {
+		return internalError(err, "record service stability")
 	}
 	return nil
 }
