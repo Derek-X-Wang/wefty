@@ -10,7 +10,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// These tests use the production transitions owned by the link module. Cancellation status and execution are observed through ledger reads;
+// These tests use the production transitions owned by the link module.
+// Cancellation status and execution are observed through ledger reads;
 // only the existing backoff helper inspects the durable retry schedule.
 func TestRecoveryWritesRespectCancellationOwnership(t *testing.T) {
 	for _, status := range []string{"pending", "settled", "refused"} {
