@@ -113,19 +113,23 @@ type evidenceOutbox struct {
 	// recoveryAttemptFinished is a test seam for ordering a wake against the
 	// scheduler's active-attempt retirement edge. Production leaves it nil.
 	recoveryAttemptFinished func(string)
+	// recoveryScanFinished orders tests against the initial scan, so startup
+	// replay cannot mask a missing lifecycle wake. Production leaves it nil.
+	recoveryScanFinished func()
 
-	recoveryMu     sync.Mutex
-	recoveryCancel context.CancelFunc
-	recoveryWG     sync.WaitGroup
-	recoveryWake   chan struct{}
-	ownershipMu    sync.RWMutex
-	liveAttempts   map[string]struct{}
-	lateEvents     map[string]int
-	lateMu         sync.Mutex
-	lateContext    context.Context
-	lateCancel     context.CancelFunc
-	lateWG         sync.WaitGroup
-	lateClosed     bool
+	recoveryMu      sync.Mutex
+	recoveryContext context.Context
+	recoveryCancel  context.CancelFunc
+	recoveryWG      sync.WaitGroup
+	recoveryWake    chan struct{}
+	ownershipMu     sync.RWMutex
+	liveAttempts    map[string]struct{}
+	lateEvents      map[string]int
+	lateMu          sync.Mutex
+	lateContext     context.Context
+	lateCancel      context.CancelFunc
+	lateWG          sync.WaitGroup
+	lateClosed      bool
 
 	// createdHere names the spool rows this process created and has not yet
 	// released, guarded by ownershipMu. The spool sweep takes an empty row
@@ -300,6 +304,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 		return
 	}
 	recoveryContext, cancel := context.WithCancel(ctx)
+	outbox.recoveryContext = recoveryContext
 	outbox.recoveryCancel = cancel
 	outbox.recoveryWG.Add(1)
 	outbox.recoveryMu.Unlock()
@@ -414,6 +419,9 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 				}(attempt)
 			}
 			armRetry()
+			if outbox.recoveryScanFinished != nil {
+				outbox.recoveryScanFinished()
+			}
 		}
 
 		launchPending()
@@ -580,6 +588,39 @@ func (outbox *evidenceOutbox) recoverAttempt(ctx context.Context, client *Client
 		return err
 	}
 	return nil
+}
+
+// recoveryStopped distinguishes process shutdown from cancellation of a
+// resident or boot session whose process-lifetime recovery loop is still up.
+// A lifecycle used without that loop must also deliver shutdown inline.
+func (outbox *evidenceOutbox) recoveryStopped() bool {
+	outbox.recoveryMu.Lock()
+	defer outbox.recoveryMu.Unlock()
+	return outbox.recoveryContext == nil || outbox.recoveryContext.Err() != nil
+}
+
+// recoverShutdownAttempt borrows the lifecycle's ownership until bounded
+// inline delivery ends. The canceled Run context cannot drive background
+// recovery, and releasing ownership first could race that loop. Any redaction
+// flush whose durable append outlived finalization must finish before replay.
+func (outbox *evidenceOutbox) recoverShutdownAttempt(ctx context.Context, client *Client, claim l1.Claim) error {
+	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID,
+		fencingToken: claim.Lease.FencingToken, kind: claim.Job.Spec.Kind, class: claim.Job.Spec.Class}
+	for {
+		outbox.ownershipMu.RLock()
+		late := outbox.lateEvents[attempt.attemptID] > 0
+		outbox.ownershipMu.RUnlock()
+		if !late {
+			return outbox.recoverAttempt(ctx, client, attempt)
+		}
+		timer := outbox.clock.NewTimer(outbox.retryInterval)
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return ctx.Err()
+		case <-timer.C():
+		}
+	}
 }
 
 func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, attempt logSpoolAttempt) error {

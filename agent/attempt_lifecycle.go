@@ -571,9 +571,16 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 		var failure destinationError
 		if result.LogEvidenceIncomplete && lifecycle.dependencies.outbox != nil {
-			// Bounded finalization left evidence behind. Completion would close
-			// its admission at L1; release both to ordered recovery instead.
+			// Keep logs ahead of completion. Directives leave Run's recovery
+			// loop alive; shutdown cancels it, so deliver this attempt inline
+			// while its lease may still admit an authoritative completion.
 			reconcileCompletion = true
+			if !errors.Is(cause, errAttemptDirectiveCancel) && !errors.Is(cause, errAttemptDirectiveStop) && !errors.Is(cause, errAttemptDirectiveRestart) && lifecycle.dependencies.outbox.recoveryStopped() {
+				recoveryContext, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+				failure.err = lifecycle.dependencies.outbox.recoverShutdownAttempt(recoveryContext, lifecycle.dependencies.client, claim)
+				cancelRecovery()
+				failure.destination = classifyAgentProtocolError(failure.err).destination
+			}
 		} else {
 			request := completionRequest(claim, result, outcome.reapEvidence)
 			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)

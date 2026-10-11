@@ -3582,18 +3582,22 @@ func (runtime *canceledLogRuntime) Run(ctx context.Context, request workloadrunn
 
 func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		cause     error
-		directive l1.AttemptDirective
-		class     string
+		name         string
+		cause        error
+		directive    l1.AttemptDirective
+		class        string
+		boundRunsOut bool
 	}{
-		{"shutdown", context.Canceled, "", contract.JobClassOneShot},
-		{"cancel", errAttemptDirectiveCancel, "", contract.JobClassOneShot},
-		{"renewal_cancel", nil, l1.AttemptDirectiveCancel, contract.JobClassOneShot},
-		{"renewal_stop", nil, l1.AttemptDirectiveStop, contract.JobClassService},
-		{"renewal_restart", nil, l1.AttemptDirectiveRestart, contract.JobClassService},
+		{"shutdown", context.Canceled, "", contract.JobClassOneShot, false},
+		{"shutdown_bound", context.Canceled, "", contract.JobClassOneShot, true},
+		{"cancel", errAttemptDirectiveCancel, "", contract.JobClassOneShot, false},
+		{"session_end", context.Canceled, "", contract.JobClassOneShot, false},
+		{"renewal_cancel", nil, l1.AttemptDirectiveCancel, contract.JobClassOneShot, false},
+		{"renewal_stop", nil, l1.AttemptDirectiveStop, contract.JobClassService, false},
+		{"renewal_restart", nil, l1.AttemptDirectiveRestart, contract.JobClassService, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			shutdown := strings.HasPrefix(test.name, "shutdown")
 			store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{LeaseDuration: time.Minute})
 			if err != nil {
 				t.Fatal(err)
@@ -3619,19 +3623,57 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 			if err != nil || claim == nil {
 				t.Fatalf("claim=%+v err=%v", claim, err)
 			}
-			outbox, err := newEvidenceOutbox(t.TempDir(), "ordered-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+			spoolDirectory := t.TempDir()
+			outbox, err := newEvidenceOutbox(spoolDirectory, "ordered-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer outbox.Close()
 			runtime := &canceledLogRuntime{started: make(chan struct{})}
-			var completionCalls atomic.Int32
+			allowDirective := make(chan struct{})
+			allowReplay := make(chan struct{})
+			var allowReplayOnce sync.Once
+			releaseReplay := func() { allowReplayOnce.Do(func() { close(allowReplay) }) }
+			defer releaseReplay()
+			var completionCalls, logCalls atomic.Int32
+			var claimSent atomic.Bool
+			var resumed atomic.Bool
+			assertLiveAndEmpty := func() {
+				t.Helper()
+				attempts, err := store.ListJobAttempts(t.Context(), job.JobID)
+				if err != nil || len(attempts) != 1 || attempts[0].Result != nil || (attempts[0].State != contract.AttemptClaimed && attempts[0].State != contract.AttemptRunning) {
+					t.Fatalf("attempt settled before ordered delivery: %+v err=%v", attempts, err)
+				}
+				page, err := store.GetJobLogs(t.Context(), job.JobID, "", 8)
+				if err != nil || len(page.Events) != 0 {
+					t.Fatalf("logs appeared before replay: %+v err=%v", page, err)
+				}
+			}
 			var mu sync.Mutex
 			var deliveryOrder []string
 			client, stop := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/register") || strings.HasSuffix(r.URL.Path, "/heartbeat") {
+					_ = json.NewEncoder(w).Encode(l1.Node{NodeRegistration: contract.NodeRegistration{NodeID: "ordered-node", BootSessionID: "ordered-boot"},
+						State: contract.NodeAlive, ClaimsEnabled: true, MaxOneshotSlots: 1})
+					return
+				}
+				if strings.HasSuffix(r.URL.Path, "/computer-policy") {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if strings.HasSuffix(r.URL.Path, "/claim") {
+					var request l1.ClaimRequest
+					_ = json.NewDecoder(r.Body).Decode(&request)
+					if request.Class != test.class || !claimSent.CompareAndSwap(false, true) {
+						w.WriteHeader(http.StatusNoContent)
+					} else {
+						_ = json.NewEncoder(w).Encode(claim)
+					}
+					return
+				}
 				if strings.HasSuffix(r.URL.Path, "/lease") {
 					select {
-					case <-runtime.started:
+					case <-allowDirective:
 					case <-r.Context().Done():
 						return
 					}
@@ -3641,6 +3683,18 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 					return
 				}
 				if strings.HasSuffix(r.URL.Path, "/logs") {
+					call := logCalls.Add(1)
+					if shutdown && !resumed.Load() && (call == 1 || test.boundRunsOut) {
+						// Hold finalization, then (in the bound case) inline recovery.
+						// Only cancellation of the request releases either call.
+						<-r.Context().Done()
+						return
+					}
+					select {
+					case <-allowReplay:
+					case <-r.Context().Done():
+						return
+					}
 					var request l1.AppendLogsRequest
 					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 						t.Error(err)
@@ -3667,6 +3721,10 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 					t.Error(err)
 					return
 				}
+				live, liveErr := store.ListJobAttempts(r.Context(), job.JobID)
+				if liveErr != nil || len(live) != 1 || live[0].Result != nil || live[0].State == contract.AttemptLost || !live[0].LeaseExpiresAt.After(time.Now()) {
+					t.Errorf("completion did not arrive under a live lease: %+v err=%v", live, liveErr)
+				}
 				completed, err := store.CompleteAttempt(r.Context(), "ordered-fabric", job.JobID, claim.Lease.AttemptID, request)
 				if err != nil {
 					t.Error(err)
@@ -3681,6 +3739,10 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 			}), time.Second)
 			defer stop()
 			defer client.Close()
+			if test.boundRunsOut {
+				client.operationTimeout = 500 * time.Millisecond
+				client.httpClient.Timeout = client.operationTimeout
+			}
 			renewalInterval := time.Hour
 			if test.directive != "" {
 				renewalInterval = time.Millisecond
@@ -3695,11 +3757,46 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 			ctx, cancel := context.WithCancelCause(t.Context())
 			defer cancel(nil)
 			done := make(chan error, 1)
-			go func() { _, err := lifecycle.execute(ctx, *claim, time.Now()); done <- err }()
+			if shutdown {
+				capabilities := newCapabilityState(map[string]bool{"kind:process": true}, nil, systemClock{}, time.Second, nil)
+				registration := contract.NodeRegistration{NodeID: "ordered-node", BootSessionID: "ordered-boot"}
+				session := newAgentSession(client, registration, capabilities, time.Hour, time.Hour,
+					systemClock{}, lifecycle.dependencies.observer, nil, 1, 0)
+				defer session.close()
+				nodeAgent := &Agent{session: session, registration: registration, capabilities: capabilities, outbox: outbox,
+					clock: systemClock{}, observer: lifecycle.dependencies.observer, runtimes: lifecycle.dependencies.runtimes,
+					managedResource: &preflightManagedResource{}, renewalInterval: time.Hour, logRetryInterval: time.Millisecond,
+					finalizationTimeout: 200 * time.Millisecond}
+				go func() { done <- nodeAgent.Run(ctx) }()
+			} else {
+				go func() { _, err := lifecycle.execute(ctx, *claim, time.Now()); done <- err }()
+			}
 			select {
 			case <-runtime.started:
 			case <-time.After(10 * time.Second):
 				t.Fatal("runtime did not start")
+			}
+			assertLiveAndEmpty()
+			if !shutdown {
+				// Ensure the real recovery loop has skipped the owned attempt.
+				// No startup scan or periodic retry can substitute for the wake.
+				scanned := make(chan struct{}, 1)
+				outbox.recoveryScanFinished = func() {
+					select {
+					case scanned <- struct{}{}:
+					default:
+					}
+				}
+				outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recovery: %v", err) })
+				select {
+				case <-scanned:
+				case <-time.After(2 * time.Second):
+					t.Fatal("initial recovery scan did not finish")
+				}
+			}
+			close(allowDirective)
+			if shutdown {
+				releaseReplay()
 			}
 			if test.cause != nil {
 				cancel(test.cause)
@@ -3712,23 +3809,41 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("lifecycle did not join")
 			}
-			pending, err := outbox.spool.pending(t.Context(), claim.Lease.AttemptID, 8)
-			if err != nil || len(pending) != 1 {
-				t.Fatalf("pending=%+v err=%v", pending, err)
+			if shutdown && !test.boundRunsOut {
+				// Run has joined; background recovery used its canceled context.
+				// Delivery must already be complete, without a manual replay.
+				if receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID); receipt.State != "delivered" {
+					t.Fatalf("Run returned before inline delivery: %+v log_calls=%d", receipt, logCalls.Load())
+				}
+			} else {
+				pending, err := outbox.spool.pending(t.Context(), claim.Lease.AttemptID, 8)
+				if err != nil || len(pending) != 1 || completionCalls.Load() != 0 {
+					t.Fatalf("completion overtook pending logs: pending=%+v err=%v completions=%d", pending, err, completionCalls.Load())
+				}
+				assertLiveAndEmpty()
+				if test.boundRunsOut {
+					if logCalls.Load() < 2 {
+						t.Fatalf("shutdown did not try inline recovery before its bound: log_calls=%d", logCalls.Load())
+					}
+					receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
+					if receipt.State != "durable_completion" || receipt.Result.Signal != "terminated" || !receipt.Result.LogEvidenceIncomplete {
+						t.Fatalf("bounded shutdown lost durable completion: %+v", receipt)
+					}
+					if err := outbox.Close(); err != nil {
+						t.Fatal(err)
+					}
+					// A new outbox reopens the on-disk evidence on the next start.
+					outbox, err = newEvidenceOutbox(spoolDirectory, "ordered-node", 1<<20, systemClock{}, 8, time.Hour, time.Millisecond)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer outbox.Close()
+					resumed.Store(true)
+					outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("restart recovery: %v", err) })
+				}
+				releaseReplay()
 			}
-			_, appendErr := store.AppendLogs(t.Context(), "ordered-fabric", job.JobID, claim.Lease.AttemptID, l1.AppendLogsRequest{FencingToken: claim.Lease.FencingToken, Events: pending})
-			if completionCalls.Load() != 0 || appendErr != nil {
-				t.Fatalf("completion overtook durable logs: accepted_completions=%d pending_logs=%d L1_append_error=%v receipt=%+v", completionCalls.Load(), len(pending), appendErr, outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID))
-			}
-			// Recovery uses the production delivery path and real L1 admission.
-			// The direct append above also proves the event stayed admissible.
-			attempts, err := outbox.spool.pendingAttempts(t.Context())
-			if err != nil || len(attempts) != 1 {
-				t.Fatalf("recoverable attempts=%+v err=%v", attempts, err)
-			}
-			if err := outbox.recoverAttempt(t.Context(), client, attempts[0]); err != nil {
-				t.Fatal(err)
-			}
+			waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
 			mu.Lock()
 			order := append([]string(nil), deliveryOrder...)
 			mu.Unlock()

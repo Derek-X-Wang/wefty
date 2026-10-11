@@ -449,13 +449,24 @@ from the owning node identity as an already-recorded success
 treats like any accepted completion -- the row is marked delivered and retired,
 with no further requests or log lines. While L1 reports the attempt as
 live, recovery drains every durable log batch before delivering the single
-completion. Shutdown, one-shot cancellation, and renewal cancel/stop/restart
-directives follow the same rule: after bounded log finalization reports
-`log_evidence_incomplete`, the lifecycle persists completion, stops renewal,
-releases attempt ownership and wakes ordered recovery instead of delivering
-completion directly. It does not extend the finalization bound or wait for
-recovery before returning. An accepted completion closes that attempt's log
-stream at L1 (`l1/store.go`, `AppendLogs`). Once L1 reports the attempt as `lost`, the
+completion. After bounded log finalization reports `log_evidence_incomplete`,
+shutdown, one-shot cancellation, and renewal cancel/stop/restart directives
+persist completion and stop renewal. On shutdown, the lifecycle keeps attempt
+ownership and runs inline ordered recovery for this attempt: pending logs first,
+then completion, under `context.WithoutCancel(ctx)` plus the existing
+`operationTimeout`. This does not extend log finalization. If inline delivery
+is incomplete, the durable evidence stays on disk for delivery on the next
+start, when L1 may already have settled the attempt by lease expiry and can
+accept the completion only as late evidence. Cancellation and renewal
+cancel/stop/restart directives leave the agent running, so they release attempt
+ownership and wake ordered recovery without waiting for it before returning.
+The logs-first drain can push cancel, stop or restart completion past L1's
+cancel or settle deadline when log finalization is incomplete. Evidence order
+takes precedence over settlement speed. A stop or restart directive received
+during completion backoff also hands the abandoned request to recovery instead
+of ending the node session, consistent with the abandoned-request rule above.
+An accepted completion closes that attempt's log stream at L1 (`l1/store.go`,
+`AppendLogs`). Once L1 reports the attempt as `lost`, the
 completion is late evidence, so recovery may yield after eight log batches,
 deliver the completion, and continue the remaining raw log stream on later
 passes from its acknowledged high-water mark. Reaching that per-pass bound
