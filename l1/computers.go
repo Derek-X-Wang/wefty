@@ -1182,7 +1182,10 @@ func setComputerServiceDesiredState(
 			// A queued Computer has no live runtime owner. Clearing the terminal
 			// predecessor attempt turns that observed quiescence into the positive
 			// detached precondition required by Storage replacement operations.
-			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET current_attempt_id=NULL WHERE job_id=?`, job.JobID); err != nil {
+			// Keep the exact accepted completion acknowledgeable after detachment,
+			// including a stop completion's binding after start queues the Job again.
+			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET completion_replay_attempt_id=COALESCE(current_attempt_id, completion_replay_attempt_id),
+				current_attempt_id=NULL WHERE job_id=?`, job.JobID); err != nil {
 				return internalError(err, "publish detached stopped Computer")
 			}
 		case contract.JobClaimed, contract.JobRunning:

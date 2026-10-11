@@ -262,13 +262,19 @@ explicit window, L1 replaces each received raw event with a truthful per-stream
 `late_evidence_window_expired` gap; the independent log retention ages (7 days
 for services, 30 days for one-shots) remain storage bounds and therefore bind
 later. Neither path changes the job verdict, attempt verdict, current attempt,
-or authority generation.
+authority generation, or current service health.
 
 The claimed-to-running promotion block inside a log append remains in place
 for `kind=process` because it is authority-changing. It runs only while the
 attempt still has current boot-session, generation, current-attempt, and lease
-authority; late observation always skips it. `kind=oci` log insertion never
-promotes: only `Started` does.
+authority; late observation always skips it. Job promotion is conditional on
+`jobs.state=claimed`, so logs cannot reverse `stopping` or erase stop intent.
+Only logs from an active process attempt with current live authority may start
+the portless-service stability window. Renewal, `Started`, and logs establish
+portless health only on the bound alive node under the attempt's matching boot
+session and registration generation, inside the same write transaction.
+Computer stability also requires its display to be published for the current attempt.
+`kind=oci` log insertion never promotes: only `Started` does.
 
 A gap declaration uses `LogEvent.sequence` as the first lost sequence and
 `gap.through_sequence` as the inclusive last sequence. Gaps advance continuity
@@ -339,9 +345,12 @@ start. Any other status L1 sent is its verdict even when the body is
 unreadable: a 2xx is the committed start, and any 4xx (such as a stale fence,
 an expired lease, or a pending cancellation) or 501 is a refusal. A refusal, or
 no verdict within the window, cancels the payload; it cannot remain running
-under refused or unanswered authority. For `kind=oci`, renewal changes only the lease and directive;
-it never acknowledges execution or starts the portless-service stability
-clock. Successful completion likewise never supplies a missing OCI `Started`.
+under refused or unanswered authority. For `kind=oci`, renewal never acknowledges
+execution. Only after a durable `Started` may renewal start or re-arm the
+portless-service stability clock, on the bound alive node under the attempt's
+matching boot session and authority generation, inside the same write
+transaction. Before `Started`, renewal changes only the lease and directive.
+Successful completion likewise never supplies a missing OCI `Started`.
 The OCI `Started` acknowledgement, sent after the helper proves payload start
 and before the agent admits the attempt or reports it running, follows the
 same answer rule: an answer that never arrived or a 5xx other than 501 is
@@ -613,7 +622,15 @@ differs in any of those fields is `idempotency_conflict`; a first completion
 from a replaced registration is `node_session_replaced` for as long as the
 attempt's lease runs, then `lease_expired` with late evidence; an attempt that
 is no longer the job's current or retained replay attempt is `attempt_mismatch`
-(#553).
+(#553). Stopping a queued Computer retains its terminal predecessor as the
+exact completion replay binding when it clears the runtime owner. If the queued
+projection was already detached by an accepted stop completion, then started
+back to `queued`, stopping it again preserves that completion replay binding.
+The image-reconciliation failure latch and Computer reconfiguration abort also
+retain the terminal predecessor's accepted completion binding when detaching a
+queued Job, including an existing detached replay binding. A later claim replaces
+either binding; detachment never reapplies the accepted completion or grants the
+detached attempt live authority.
 
 An accepted completion of a Computer Job -- first write or replay, of the
 Computer's current Job or of one a reimage has since superseded -- is followed

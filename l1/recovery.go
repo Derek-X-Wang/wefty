@@ -62,9 +62,11 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 				JOIN nodes ON nodes.node_id=attempts.node_id
 				WHERE jobs.job_id=service_jobs.job_id
 					AND service_jobs.bound_node_id=attempts.node_id
-					AND nodes.state<>?
+					AND (nodes.state<>?
+						OR attempts.boot_session_id<>nodes.boot_session_id
+						OR attempts.authority_generation<>nodes.authority_generation)
 			)`, contract.NodeAlive); err != nil {
-		return ReconcileResult{}, internalError(err, "interrupt service stability on unavailable nodes")
+		return ReconcileResult{}, internalError(err, "interrupt service stability on unavailable or replaced nodes")
 	}
 
 	// Node liveness is resolved first at the same clock snapshot. In
@@ -84,6 +86,8 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 					AND attempts.state=?
 					AND attempts.lease_expires_ns>?
 					AND nodes.state=?
+					AND attempts.boot_session_id=nodes.boot_session_id
+					AND attempts.authority_generation=nodes.authority_generation
 					AND service_jobs.bound_node_id=attempts.node_id
 			)`, contract.ServiceDesiredRunning, now.Add(-s.serviceStabilityWindow).UnixNano(),
 		contract.JobRunning, contract.AttemptRunning, now.UnixNano(), contract.NodeAlive)
