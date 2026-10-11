@@ -1272,27 +1272,44 @@ backoff: 30 seconds, doubling to a 30-minute cap. An explicit repeat HTTP cancel
 resets the failure count and retry time for pending delivery and immediately
 attempts delivery again; automatic recovery still honors backoff. Ambiguous-dispatch lookups use this schedule and share the
 existing per-pass dispatch-recovery budget (five seconds by default); ordinary
-recovery does not also look up a Run with cancellation intent. A late first dispatch
-acknowledgement wakes cancellation delivery immediately. A dispatch-key
-absence remains provisional until the existing one-hour dispatch settlement
-horizon has passed since the last attempt; only then, with no acknowledgement
-recorded meanwhile, can the Run settle locally with
+recovery does not select a Run with any cancellation record, including pending,
+settled or refused delivery. Recovery's link, settle-as-missing and backoff
+writes check this ownership inside their write transaction and do nothing once
+cancel owns the Run. The reread after a changed recovery observation has the
+same ownership fence. A cancel requested during an outstanding L1 lookup thus
+wins even when recovery selected the Run first. A conflicting recorded Job
+identity or outbox dispatch key is reported and uses ordinary recovery's
+existing exponential backoff, so corrupt rows cannot block later due rows.
+
+A positive observation already in flight is handed to the cancel path rather
+than dropped: that write rechecks the dispatch key and the identity and verdict
+captured before the L1 lookup. It applies the lookup freshness and identity
+rules below, and durably reopens cancellation delivery when the Run was
+unlinked. This includes settled and refused cancellations, and an old
+outbox-only acknowledgement. Delivery uses the remaining pass budget; if it
+is spent, the next pass delivers using the linked Job without another
+dispatch-key lookup. Linking and reopening delivery commit together, before
+any L1 call.
+A dispatch-key absence remains provisional until the existing one-hour dispatch
+settlement horizon has passed since the last attempt, measured at lookup start.
+Only then, with no acknowledgement recorded meanwhile, can the Run settle
+locally with
 `failure_reason=canceled before dispatch was confirmed`.
 An empty L1 job ID is rejected before the acknowledgement can be written to
 the outbox or Run. An acknowledgement cannot link a Run if it conflicts with
 the outbox Job, the Run's own Job, or the regression diagnostic's Job. Each
 recorded identity must be absent or equal the Job being linked. Pending
 cancellation reads prefer the Run's linked Job, and use an outbox-only
-acknowledgement only when no settled absence or regression diagnostic contradicts it. The write rechecks that
-stored evidence is still usable before linking. Stored identity alone cannot
-clear a contradiction or restore a link. A fresh identity-bound lookup
+acknowledgement only when no settled absence or regression diagnostic
+contradicts it. The write rechecks that stored evidence is still usable before
+linking. Stored identity alone cannot clear a contradiction or restore a link. A fresh identity-bound lookup
 supersedes a settlement, including `job_link_settled`, `dispatch_not_found`, or
 cancellation settled before confirmation, even when it lands during lookup.
 A lookup answer is stale only when the current diagnostic is `l1_regressed`
 and either the observed diagnostic was not a regression, the diagnostic Job
-changed, or `last_error` changed since lookup began. A regression re-recorded for the same
-Job with a different `last_error` is a newer verdict. A stale answer leaves
-the next pass to decide. An acknowledgement of the same Job
+changed, or `last_error` changed since lookup began. A regression re-recorded
+for the same Job with a different `last_error` is a newer verdict. A stale
+answer leaves the next pass to decide. An acknowledgement of the same Job
 during lookup does not prevent delivery in that pass. The write still refuses
 any conflicting recorded Job identity. Uncontradicted legacy outbox
 acknowledgements still link before delivery, even when dispatch-key lookup

@@ -233,12 +233,36 @@ func TestCancelLookupSupersedesRecoverySettlementDuringLookup(t *testing.T) {
 					t.Fatalf("lookup did not start before settlement: %+v %v", observed, err)
 				}
 				outcome, err := h.l3Store.settleUnrecordedDispatch(ctx, unrecordedDispatch{RunID: run.RunID, DispatchKey: key}, h.l3Store.recoveryNow())
-				if err != nil || outcome != settled {
-					t.Fatalf("recovery did not settle during lookup: %v %v", outcome, err)
+				if err != nil || outcome != settleChanged {
+					t.Fatalf("recovery crossed cancellation ownership during lookup: %v %v", outcome, err)
+				}
+				// #777 prevents recovery from writing after cancellation owns the
+				// Run. Inject the settlement after the delivery read to retain
+				// #776's promise that positive lookup evidence supersedes it.
+				payload, err := json.Marshal(contract.APIError{
+					Code: contract.ErrorNotFound, Message: "L1 did not find the attempted dispatch; work was not replayed",
+					Details: map[string]any{"reason": dispatchNotFoundReason, "dispatch_key": key},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				tx, err := h.l3Store.db.BeginTx(ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback()
+				if _, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1 WHERE run_id=?`, run.RunID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=?, token_delivery=NULL WHERE run_id=?`, string(payload), run.RunID); err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
+					t.Fatal(err)
 				}
 				observed, err = readDispatchObservation(ctx, h.l3Store.db, run.RunID)
 				if err != nil || !observed.settled || observed.reason != dispatchNotFoundReason {
-					t.Fatalf("recovery settlement = %+v %v", observed, err)
+					t.Fatalf("injected settlement = %+v %v", observed, err)
 				}
 				return h.l1Client.LookupJobByDispatchKey(ctx, key)
 			}
