@@ -268,8 +268,8 @@
     "function": "*Store.listComputerRuns",
     "fingerprint": "3bf4d238a768ac4ffe07a44d80f18344bea71163bf02cd4ee1065912be2238f6",
     "count": 1,
-    "reason": "Computer Run pages hydrate the public Run view; replace this link read during public-reader adoption.",
-    "retirement": "#783"
+    "reason": "Dynamic list query assembly is opaque to the guard; #783 confirmed it reads no link storage (summaries carry no Job field). Exact exception until #785 narrows opaque detection.",
+    "retirement": "#785"
   },
   {
     "file": "computer_tokens.go",
@@ -812,8 +812,8 @@
     "function": "*Store.ListRuns",
     "fingerprint": "839f590236d85d23733edeb99cbc0a81beb4139700ddde29d9434036bc49aea2",
     "count": 1,
-    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
-    "retirement": "#783"
+    "reason": "Dynamic list query assembly is opaque to the guard; #783 confirmed it reads no link storage (summaries carry no Job field). Exact exception until #785 narrows opaque detection.",
+    "retirement": "#785"
   },
   {
     "file": "run_list_plan_test.go",
@@ -845,23 +845,23 @@
     "fingerprint": "575e0063678ff39280bfb6a376917d96552d9c4559bd814828d4ad42dd04d823",
     "count": 1,
     "reason": "Existing lineage visibility function value accepts Run identity strings; conservatively opaque until reader adoption.",
-    "retirement": "#783"
+    "retirement": "#785"
   },
   {
     "file": "server.go",
     "function": "*Server.listRecentRuns",
     "fingerprint": "042cb2401f5a746843c326f41b61fd1d55f2670309cb37077eac4111ef3a1b8a",
     "count": 1,
-    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
-    "retirement": "#783"
+    "reason": "Dynamic list query assembly is opaque to the guard; #783 confirmed it reads no link storage (summaries carry no Job field). Exact exception until #785 narrows opaque detection.",
+    "retirement": "#785"
   },
   {
     "file": "server.go",
     "function": "*Server.listRuns",
     "fingerprint": "beb908f912d081c09666431471806ef23b156653ffd73a645b01a05f94c2cfb8",
     "count": 1,
-    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
-    "retirement": "#783"
+    "reason": "Dynamic list query assembly is opaque to the guard; #783 confirmed it reads no link storage (summaries carry no Job field). Exact exception until #785 narrows opaque detection.",
+    "retirement": "#785"
   },
   {
     "file": "server_integration_test.go",
@@ -870,22 +870,6 @@
     "count": 1,
     "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
     "retirement": "#785"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.GetRun",
-    "fingerprint": "1c814e625ce98796215b9c501e795a578de5255339b5e4d388a810b388cea027",
-    "count": 1,
-    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
-    "retirement": "#783"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.GetRunExecution",
-    "fingerprint": "45a80b0bef54912665e2c923703c6cfd4376968fe86ed2bdaa55e9f6b4581f6b",
-    "count": 1,
-    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
-    "retirement": "#783"
   },
   {
     "file": "store.go",
@@ -1038,14 +1022,6 @@
     "count": 1,
     "reason": "Projection and node-attribution selection reads link storage directly until background-reader adoption.",
     "retirement": "#784"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.runJobID",
-    "fingerprint": "84422f1fc51a7fdf3cb4a8fc8f30a97f1585dda62ce2512766ceb6cb0bd97825",
-    "count": 1,
-    "reason": "Existing reader or projection access awaits common link-knowledge reader adoption.",
-    "retirement": "#783"
   },
   {
     "file": "store.go",

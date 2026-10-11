@@ -459,6 +459,97 @@ func (s *Store) runJobLink(ctx context.Context, runID string) (runJobLinkKnowled
 	return knowledge, nil
 }
 
+// readRunViewJobLink decodes only the Run's own reference for public readers.
+// Outbox acknowledgements and diagnostic identities remain internal recovery
+// evidence. A mismatched diagnostic cannot replace the reference or hide L1's
+// error; execution retains that diagnostic separately for its existing checks.
+// An empty legacy reference still reads as no Job, just as before adoption.
+func readRunViewJobLink(ctx context.Context, q queryRower, runID string) (runJobLinkKnowledge, error) {
+	var observed dispatchObservation
+	var diagnosticJob string
+	err := q.QueryRowContext(ctx, `SELECT NULLIF(r.l1_job_id, ''), r.dispatch_attempt_ns, r.job_link_settled,
+ COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, ''),
+ COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.l1_job_id') END, '')
+ FROM runs r LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).
+		Scan(&observed.runJob, &observed.attempted, &observed.settled, &observed.reason, &diagnosticJob)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runJobLinkKnowledge{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
+	}
+	if err != nil {
+		return runJobLinkKnowledge{}, internalError(err, "read Run view job link")
+	}
+	if observed.reason == l1RegressedReason && (!observed.runJob.Valid || diagnosticJob != observed.runJob.String) {
+		observed.reason = ""
+	}
+	knowledge, err := decodeRunJobLink(observed)
+	if err != nil {
+		return runJobLinkKnowledge{}, internalError(err, "decode Run view job link")
+	}
+	return knowledge, nil
+}
+
+func (knowledge runJobLinkKnowledge) viewJobID() string {
+	switch knowledge.state {
+	case linkLinked, linkRegressed:
+		return knowledge.jobID
+	default:
+		return ""
+	}
+}
+
+func (s *Store) runJobID(ctx context.Context, runID string) (string, bool, error) {
+	knowledge, err := readRunViewJobLink(ctx, s.db, runID)
+	if err != nil {
+		return "", false, err
+	}
+	jobID := knowledge.viewJobID()
+	return jobID, jobID != "", nil
+}
+
+type runCancellationView struct {
+	requested, completed sql.NullInt64
+	lastError            sql.NullString
+	refused              sql.NullBool
+}
+
+func readRunCancellationView(ctx context.Context, q queryRower, runID string) (runCancellationView, error) {
+	var view runCancellationView
+	err := q.QueryRowContext(ctx, `SELECT requested_ns, completed_ns, last_error, refused FROM run_cancellations WHERE run_id=?`, runID).
+		Scan(&view.requested, &view.completed, &view.lastError, &view.refused)
+	if errors.Is(err, sql.ErrNoRows) {
+		return view, nil
+	}
+	if err != nil {
+		return view, internalError(err, "read Run cancellation view")
+	}
+	return view, nil
+}
+
+func readRunExecutionLink(ctx context.Context, q queryRower, runID string) (runJobLinkKnowledge, int, *contract.APIError, error) {
+	var attempts int
+	var diagnosticJSON []byte
+	err := q.QueryRowContext(ctx, `SELECT attempt_count, last_error FROM dispatch_outbox WHERE run_id=?`, runID).
+		Scan(&attempts, &diagnosticJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runJobLinkKnowledge{}, 0, nil, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
+	}
+	if err != nil {
+		return runJobLinkKnowledge{}, 0, nil, internalError(err, "read run execution")
+	}
+	knowledge, err := readRunViewJobLink(ctx, q, runID)
+	if err != nil {
+		return runJobLinkKnowledge{}, 0, nil, err
+	}
+	var diagnostic *contract.APIError
+	if len(diagnosticJSON) > 0 {
+		diagnostic = &contract.APIError{}
+		if err := json.Unmarshal(diagnosticJSON, diagnostic); err != nil {
+			return runJobLinkKnowledge{}, 0, nil, internalError(err, "decode dispatch error")
+		}
+	}
+	return knowledge, attempts, diagnostic, nil
+}
+
 func decodeRunJobLink(observed dispatchObservation) (runJobLinkKnowledge, error) {
 	knowledge := runJobLinkKnowledge{state: linkUnknown}
 	identities := []sql.NullString{observed.runJob, observed.outboxJob}

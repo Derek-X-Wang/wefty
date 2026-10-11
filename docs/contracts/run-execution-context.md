@@ -1637,6 +1637,28 @@ record and every other program field unchanged, and dispatches by the frozen
 top-level digest; later observations and tag movement cannot replace it. If no accepted
 observation exists, rerun creation fails with `no_resolved_image_snapshot`.
 
+## Run job link for public readers
+
+Run show, execution, logs and result obtain link knowledge through the Run job
+link module. Only the Run's own Job reference is public evidence of a confirmed
+Job. An outbox acknowledgement or diagnostic identity alone does not supply a
+Job to these readers. Internal recovery and cancellation keep their legacy
+acknowledged-identity fallback.
+
+Until the Run has its own Job reference, show retains its recorded status and
+execution retains its dispatch attempts, error and hold. Logs return an empty
+page with the supplied cursor, and result returns `not_found`. No read waits for
+confirmation or changes the ledger. Computer run pages hydrate through Run show
+and return the same records, with their existing authorization and cursors.
+
+A regressed Run with its own reference still names the original Job. Execution
+preserves its diagnostic-only HTTP 200 response when an identity-bound L1 absence
+matches the durable regression diagnostic and the Run is failed or succeeded.
+Other L1 failures keep their existing responses. A legacy regressed Run whose
+identity exists only in the outbox or diagnostic still has no public Job link.
+Run summaries and Lineage entries have no Job field. All wire shapes stay the
+same.
+
 ## L1 error and recovery boundary
 
 L1 internal errors use HTTP 500 with `retryable: true`; capacity exhaustion

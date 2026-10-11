@@ -652,6 +652,13 @@ recomputed from the stored spec. A terminal one-shot whose secrets L1 has
 since scrubbed (see `state-machines.md`) therefore still replays: the
 identical request returns the stored job, whose spec is the scrubbed record.
 
+Public Run readers use the Run job link module and only the Run's own Job
+reference. Stored outbox acknowledgements remain internal recovery and cancel
+evidence. Until that reference exists, readers keep the Run's status and dispatch
+diagnostics, empty logs, and a result `not_found`; no read waits or writes.
+Computer run pages hydrate through the Run view. Regression diagnostics and
+original Job identity remain visible as before, including succeeded Runs.
+
 L3 commits the run row and dispatch intent atomically. The outbox reconciler
 uses a stable dispatch key derived from that intent for every retry while the
 run remains pending or dispatching. A crash between the L3 commit and L1
