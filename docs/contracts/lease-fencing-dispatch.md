@@ -344,9 +344,12 @@ start. Any other status L1 sent is its verdict even when the body is
 unreadable: a 2xx is the committed start, and any 4xx (such as a stale fence,
 an expired lease, or a pending cancellation) or 501 is a refusal. A refusal, or
 no verdict within the window, cancels the payload; it cannot remain running
-under refused or unanswered authority. For `kind=oci`, renewal changes only the lease and directive;
-it never acknowledges execution or starts the portless-service stability
-clock. Successful completion likewise never supplies a missing OCI `Started`.
+under refused or unanswered authority. For `kind=oci`, renewal never acknowledges
+execution. Only after a durable `Started` may renewal start or re-arm the
+portless-service stability clock, on the bound alive node under the attempt's
+matching boot session and authority generation, inside the same write
+transaction. Before `Started`, renewal changes only the lease and directive.
+Successful completion likewise never supplies a missing OCI `Started`.
 The OCI `Started` acknowledgement, sent after the helper proves payload start
 and before the agent admits the attempt or reports it running, follows the
 same answer rule: an answer that never arrived or a 5xx other than 501 is

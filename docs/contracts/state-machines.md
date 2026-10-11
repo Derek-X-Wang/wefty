@@ -153,7 +153,9 @@ registration authority generation. Reconcile clears the health timestamp when
 the node becomes unavailable or its registration replaces the attempt's
 authority. Renewal, `Started`, and logs establish portless health only while the
 bound node is alive and its boot session and registration generation match the
-current attempt. That suppressed time cannot count toward stability. Late logs
+current attempt. OCI renewal may start or re-arm portless health only after a
+durable `Started`; before `Started`, renewal never starts the stability clock.
+That suppressed time cannot count toward stability. Late logs
 from a lost, superseded, or replaced attempt retain evidence but never start or
 extend the current service's stability window.
 

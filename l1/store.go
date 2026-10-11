@@ -3440,7 +3440,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 			return AttemptLease{}, internalError(err, "acknowledge renewed job execution")
 		}
 	}
-	if attempt.spec.Kind != contract.JobKindOCI && !canceled {
+	if (attempt.spec.Kind != contract.JobKindOCI || attempt.startedNS.Valid) && !canceled {
 		if err := markPortlessServiceStable(ctx, tx, jobID, now); err != nil {
 			return AttemptLease{}, err
 		}
