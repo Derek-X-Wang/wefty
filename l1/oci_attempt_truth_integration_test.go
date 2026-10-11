@@ -543,3 +543,124 @@ func assertOCIFixtureState(t *testing.T, h *integrationHarness, jobID string, jo
 		t.Fatalf("job/attempt state = %s/%#v, want %s/%s", job.State, attempts, jobState, attemptState)
 	}
 }
+
+// Both stale-node paths must recover health on the same durably started attempt.
+func TestOCIPortlessHealthRecoversAfterStaleNode(t *testing.T) {
+	for _, scenario := range []string{"started-while-stale", "stale-after-started", "renewal-before-started"} {
+		t.Run(scenario, func(t *testing.T) {
+			h := newIntegrationHarness(t, map[string][]string{"node-1": {}})
+			registerOCIFixtureNode(t, h)
+			job := createOCIFixtureJob(t, h, "oci-portless-health-"+scenario, contract.JobClassService)
+			start := func(claim *Claim) {
+				t.Helper()
+				if _, err := h.store.ObserveAttemptImage(t.Context(), "agent", job.JobID, claim.Lease.AttemptID, testImageObservation(claim.Lease.FencingToken)); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.store.StartAttempt(t.Context(), "agent", job.JobID, claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fail := func(claim *Claim) Job {
+				t.Helper()
+				exitCode := 1
+				failed, err := h.store.CompleteAttempt(t.Context(), "agent", job.JobID, claim.Lease.AttemptID, CompletionRequest{
+					FencingToken: claim.Lease.FencingToken, IdempotencyKey: "health-failure-" + claim.Lease.AttemptID,
+					Result: ProcessResult{ExitCode: &exitCode},
+				})
+				if err != nil || failed.State != contract.JobQueued || failed.RestartStreak != 1 || failed.NextRestartAt == nil {
+					t.Fatalf("restartable failure=%+v err=%v, want queued with streak 1", failed, err)
+				}
+				return failed
+			}
+			first := claimOCIFixture(t, h, contract.JobClassService)
+			start(first)
+			queued := fail(first)
+			h.clock.Advance(queued.NextRestartAt.Sub(h.clock.Now()))
+			current := claimOCIFixture(t, h, contract.JobClassService)
+			renew := func() {
+				t.Helper()
+				if _, err := h.store.RenewLease(t.Context(), "agent", job.JobID, current.Lease.AttemptID, current.Lease.FencingToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			heartbeat := func() {
+				t.Helper()
+				if _, err := h.store.HeartbeatNode(t.Context(), "agent", "node-1", "boot-node-1"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			heartbeat()
+			if scenario == "stale-after-started" {
+				start(current)
+				if observed := getRestartService(t, h, job.JobID); observed.HealthySinceAt == nil {
+					t.Fatal("Started on alive node did not start health")
+				}
+			}
+			for i := 0; i < 4; i++ {
+				h.clock.Advance(15 * time.Second)
+				renew()
+			}
+			result, err := h.store.Reconcile(t.Context())
+			if err != nil || result.StaleNodes != 1 || result.RestartStreakResets != 0 {
+				t.Fatalf("stale reconciliation=%+v err=%v", result, err)
+			}
+			if scenario == "started-while-stale" {
+				start(current)
+			} else if scenario == "renewal-before-started" {
+				// An image observation alone must not authorize portless health.
+				if _, err := h.store.ObserveAttemptImage(t.Context(), "agent", job.JobID, current.Lease.AttemptID, testImageObservation(current.Lease.FencingToken)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			renew()
+			if observed := getRestartService(t, h, job.JobID); observed.HealthySinceAt != nil || observed.RestartStreak != 1 {
+				t.Fatalf("stale attempt regained health: %+v", observed)
+			}
+			h.clock.Advance(15 * time.Second)
+			renew() // Renewal while stale must not start the clock.
+			heartbeat()
+			aliveAt := h.clock.Now()
+			renew()
+			assertHealth := func(wantStreak int) {
+				t.Helper()
+				observed := getRestartService(t, h, job.JobID)
+				if observed.RestartStreak != wantStreak || observed.CurrentAttemptID != current.Lease.AttemptID {
+					t.Fatalf("recovered attempt=%+v, want same attempt with streak %d", observed, wantStreak)
+				}
+				if scenario == "renewal-before-started" {
+					if observed.HealthySinceAt != nil || observed.State != contract.JobClaimed {
+						t.Fatalf("OCI renewal before Started changed health or execution: %+v", observed)
+					}
+				} else if observed.HealthySinceAt == nil || !observed.HealthySinceAt.Equal(aliveAt) || observed.State != contract.JobRunning {
+					t.Fatalf("alive renewal did not re-arm health at %s: %+v", aliveAt, observed)
+				}
+			}
+			assertHealth(1)
+			for i := 0; i < 7; i++ {
+				h.clock.Advance(15 * time.Second)
+				heartbeat()
+				renew()
+			}
+			result, err = h.store.Reconcile(t.Context())
+			if err != nil || result.RestartStreakResets != 0 {
+				t.Fatalf("stale time counted before two healthy minutes: result=%+v err=%v", result, err)
+			}
+			assertHealth(1)
+			h.clock.Advance(15 * time.Second)
+			heartbeat()
+			renew()
+			result, err = h.store.Reconcile(t.Context())
+			wantResets := int64(1)
+			if scenario == "renewal-before-started" {
+				wantResets = 0
+			}
+			if err != nil || result.RestartStreakResets != wantResets {
+				t.Fatalf("two-minute reconciliation=%+v err=%v, want resets %d", result, err, wantResets)
+			}
+			assertHealth(1 - int(wantResets))
+			if scenario != "renewal-before-started" {
+				fail(current) // The next failure earns first-failure backoff again.
+			}
+		})
+	}
+}
