@@ -1079,3 +1079,19 @@ Computer-submitted Runs held before their L1 Job exists cannot be cancelled
 until admission recovers; this gap is accepted. Authorized submitting actors
 can locally cancel never-attempted Runs through L3. Previously failed Runs
 are not revived.
+
+## Run job link
+
+L3 owns the Run-to-Job link; L1 remains the authority on Job existence and
+outcome. Link knowledge is `unknown`, `attempted-unconfirmed`, `linked`,
+`missing-settled`, or `regressed`, independent of Run outcome. Acknowledgements
+and identity-bound positive lookups confirm the Job. Contradicted stored
+evidence cannot restore a link, and a delayed acknowledgement cannot undo
+regression. Any cancellation record owns the Run at once, blocking further
+submits and ordinary recovery writes. Late positive evidence links and wakes
+cancel delivery without rewriting terminal history. L1 calls stay outside
+ledger write transactions, which recheck ownership and identity before commit.
+
+See [run-execution-context.md](run-execution-context.md#run-job-link) for reader
+and migration rules, and [state-machines.md](state-machines.md#run-cancellation-691)
+for cancellation delivery and the reason `canceled before dispatch was confirmed`.

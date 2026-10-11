@@ -35,15 +35,20 @@ type linkBoundaryEntry struct {
 	Fingerprint string `json:"fingerprint"`
 	Count       int    `json:"count"`
 	Reason      string `json:"reason"`
-	Retirement  string `json:"retirement"`
+	Category    string `json:"category"`
+	Destination string `json:"destination,omitempty"`
+	Retirement  string `json:"retirement,omitempty"`
 }
 
 type linkSQLPackage struct {
-	files     map[string]*ast.File
-	imports   map[*ast.File]map[string]string
-	constants map[string]ast.Expr
-	root      string
-	packages  map[string]*linkSQLPackage
+	files                   map[string]*ast.File
+	imports                 map[*ast.File]map[string]string
+	constants               map[string]ast.Expr
+	root                    string
+	packages                map[string]*linkSQLPackage
+	unsafeSQLBindings       map[*ast.Object]bool
+	reassignedSQLParameters map[*ast.Object]bool
+	escapedSQLHelpers       map[*ast.FuncDecl]bool
 }
 
 func parseLinkSQLPackage(root string, sources map[string]string) (*linkSQLPackage, error) {
@@ -567,6 +572,9 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 						indexes = localTargets[callName]
 					}
 					for index := range indexes {
+						if index < len(call.Args) && p.provenUnprotectedSQL(file, call.Args[index]) {
+							continue
+						}
 						if index >= len(call.Args) {
 							continue
 						}
@@ -597,13 +605,42 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 	}
 	sites := map[string]linkBoundaryEntry{}
 	for name, file := range p.files {
-		if name == "run_job_link.go" || name == "run_job_link_builder_test.go" {
+		if name == "run_job_link.go" || name == "run_job_link_recovery.go" {
 			continue
 		}
 		inspect := func(owner string, node ast.Node) {
 			// Bind method values in this owner; reassignment conservatively keeps the
 			// SQL target so it cannot erase the boundary.
 			localTargets, localOpaque := linkLocalSQLTargets(node, targets, opaqueTargets)
+			// Guard SQL method values at their source, including escapes into
+			// maps, interfaces, generic callbacks and channels. A callback
+			// taking strings alone carries no SQL authority.
+			invoked := map[ast.Node]bool{}
+			ast.Inspect(node, func(n ast.Node) bool {
+				if c, ok := n.(*ast.CallExpr); ok {
+					invoked[c.Fun] = true
+				}
+				return true
+			})
+			ast.Inspect(node, func(n ast.Node) bool {
+				selector, ok := n.(*ast.SelectorExpr)
+				if !ok || invoked[selector] {
+					return true
+				}
+				if _, sql := linkSQLMethod(selector.Sel.Name); !sql || p.nonSQLURLQuery(file, &ast.CallExpr{Fun: selector}) {
+					return true
+				}
+				input := linkGoFingerprint(selector) + "\x00SQL method value\x00" + linkGoFingerprint(node)
+				fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(input)))
+				key := name + ":" + owner + ":" + fingerprint
+				site := sites[key]
+				site.File = name
+				site.Function = owner
+				site.Fingerprint = fingerprint
+				site.Count++
+				sites[key] = site
+				return true
+			})
 			ast.Inspect(node, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok {
@@ -617,34 +654,24 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 				if indexes == nil {
 					indexes = localTargets[callName]
 				}
-				dynamic := p.opaqueSQLCall(file, call)
-				if len(dynamic) > 0 {
-					merged := map[int]bool{}
-					for index := range indexes {
-						merged[index] = true
-					}
-					for index := range dynamic {
-						merged[index] = true
-					}
-					indexes = merged
-				}
+
 				for index := range indexes {
 					var argument ast.Expr
 					if index < len(call.Args) {
 						argument = call.Args[index]
 					}
+					if _, direct := linkSQLMethod(callName); direct && p.provenUnprotectedSQL(file, argument) {
+						continue
+					}
 					sql, resolved := p.constant(file, argument, map[string]bool{})
 					// Inputs to an SQL constructor are fragments, not complete
 					// statements. Individually safe fragments cannot authorize
 					// assembled identifiers through a grandfathered helper.
-					opaque := opaqueTargets[callName] || localOpaque[callName] || len(dynamic) > 0
+					opaque := opaqueTargets[callName] || localOpaque[callName]
 					if opaque {
 						sql = ""
 						resolved = false
 						arguments := append([]ast.Expr(nil), call.Args...)
-						if len(dynamic) > 0 {
-							arguments = append(arguments, call.Fun)
-						}
 						argument = &ast.CompositeLit{Elts: arguments}
 					}
 					if resolved && !linkSQLProtected(sql) {
@@ -659,9 +686,23 @@ func (p *linkSQLPackage) sites() []linkBoundaryEntry {
 						// assembly: include the method resolved for the operand's
 						// own type, so editing its body changes the fingerprint.
 						for _, selector := range linkSQLSelectors(argument) {
-							if fn := p.methodDeclaration(selector); fn != nil && !seen[fn] {
-								declarations = append(declarations, linkGoFingerprint(fn))
-								seen[fn] = true
+							methods := []*ast.FuncDecl{}
+							if fn := p.methodDeclaration(selector); fn != nil {
+								methods = append(methods, fn)
+							} else {
+								for _, source := range p.files {
+									for _, decl := range source.Decls {
+										if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv != nil && fn.Name.Name == selector.Sel.Name {
+											methods = append(methods, fn)
+										}
+									}
+								}
+							}
+							for _, fn := range methods {
+								if !seen[fn] {
+									declarations = append(declarations, linkGoFingerprint(fn))
+									seen[fn] = true
+								}
 							}
 						}
 						for _, id := range linkSQLDependencies(argument) {
@@ -759,18 +800,36 @@ func checkLinkBoundaryRatchet(actual, allowed []linkBoundaryEntry) error {
 	seen := map[string]bool{}
 	for _, entry := range allowed {
 		key := entry.File + ":" + entry.Function + ":" + entry.Fingerprint
-		if seen[key] || entry.Count < 1 || entry.Reason == "" || !strings.HasPrefix(entry.Retirement, "#") {
+		if seen[key] || entry.Count < 1 || entry.Reason == "" {
 			return fmt.Errorf("invalid or duplicate ratchet entry: %+v", entry)
 		}
-		ticket, err := strconv.Atoi(strings.TrimPrefix(entry.Retirement, "#"))
-		if err != nil || ticket < 779 || ticket > 785 {
-			return fmt.Errorf("invalid retirement: %+v", entry)
+		if entry.Retirement != "" {
+			return fmt.Errorf("closed guard forbids retirement tags: %+v", entry)
+		}
+
+		if entry.Function == "" || entry.Function == "var" {
+			return fmt.Errorf("exception must name a function: %+v", entry)
+		}
+		fixture := strings.HasSuffix(entry.File, "_test.go")
+		switch entry.Category {
+		case "old-schema", "corruption", "query-plan", "injected-failure":
+			if !fixture || entry.Destination != "" {
+				return fmt.Errorf("fixture exception outside tests: %+v", entry)
+			}
+		case "schema/bootstrap", "table-copy":
+			if fixture || entry.Destination == "" {
+				return fmt.Errorf("schema exception needs explicit destination: %+v", entry)
+			}
+		default:
+			return fmt.Errorf("invalid permanent exception category: %+v", entry)
 		}
 		seen[key] = true
 	}
 	expected := append([]linkBoundaryEntry(nil), allowed...)
 	for i := range expected {
 		expected[i].Reason = ""
+		expected[i].Category = ""
+		expected[i].Destination = ""
 		expected[i].Retirement = ""
 	}
 	sort.Slice(expected, func(i, j int) bool {
@@ -1129,53 +1188,6 @@ func (p *linkSQLPackage) underlyingType(expr ast.Expr, seen map[string]bool) ast
 	return expr
 }
 
-func (p *linkSQLPackage) opaqueSQLCall(file *ast.File, call *ast.CallExpr) map[int]bool {
-	// Ordinary declared functions are handled by wrapper propagation. Values
-	// of function type are opaque: their target can change at runtime.
-	indirect := false
-	if _, ok := p.underlyingType(p.expressionType(call.Fun, map[ast.Node]bool{}), map[string]bool{}).(*ast.FuncType); ok {
-		indirect = true
-		if id, ok := call.Fun.(*ast.Ident); ok {
-			if id.Obj != nil && id.Obj.Kind == ast.Fun {
-				indirect = false
-			}
-			if id.Obj == nil {
-				for _, f := range p.files {
-					for _, decl := range f.Decls {
-						if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == id.Name {
-							indirect = false
-						}
-					}
-				}
-			}
-		}
-	}
-	if selector, ok := call.Fun.(*ast.SelectorExpr); ok && p.methodDeclaration(selector) != nil {
-		indirect = false
-	}
-	// Passing an SQL method as a value is itself a boundary crossing, even
-	// when the receiving helper is declared in another source file.
-	for _, arg := range call.Args {
-		if _, ok := arg.(*ast.SelectorExpr); ok {
-			if _, sql := linkSQLMethod(linkCallName(arg)); sql {
-				indirect = true
-			}
-		}
-	}
-	indexes := map[int]bool{}
-	if indirect {
-		for i, arg := range call.Args {
-			_, constant := p.constant(file, arg, map[string]bool{})
-			typ := p.underlyingType(p.expressionType(arg, map[ast.Node]bool{}), map[string]bool{})
-			id, _ := typ.(*ast.Ident)
-			if constant || (id != nil && id.Name == "string") {
-				indexes[i] = true
-			}
-		}
-	}
-	return indexes
-}
-
 // Resolve declared methods only to distinguish them from function fields and
 // to follow methods whose result is a callable value.
 func (p *linkSQLPackage) methodDeclaration(selector *ast.SelectorExpr) *ast.FuncDecl {
@@ -1203,4 +1215,324 @@ func (p *linkSQLPackage) methodDeclaration(selector *ast.SelectorExpr) *ast.Func
 		}
 	}
 	return nil
+}
+
+// sqlValues proves a finite set of SQL strings from local assembly and private
+// helpers. Every assignment and caller is included; unknown input fails closed.
+// This lets ordinary list/grant queries use placeholders without exemptions.
+func (p *linkSQLPackage) sqlValues(file *ast.File, expr ast.Expr, seen map[ast.Node]bool) ([]string, bool) {
+	if value, ok := p.constant(file, expr, map[string]bool{}); ok {
+		return []string{value}, true
+	}
+	if expr == nil || seen[expr] {
+		return nil, false
+	}
+	next := map[ast.Node]bool{}
+	for k, v := range seen {
+		next[k] = v
+	}
+	next[expr] = true
+	combine := func(a, b []string) ([]string, bool) {
+		if len(a)*len(b) > 512 {
+			return nil, false
+		}
+		var out []string
+		for _, x := range a {
+			for _, y := range b {
+				out = append(out, x+y)
+			}
+		}
+		return out, true
+	}
+	switch e := expr.(type) {
+	case *ast.ParenExpr:
+		return p.sqlValues(file, e.X, next)
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return nil, false
+		}
+		a, ok := p.sqlValues(file, e.X, next)
+		if !ok {
+			return nil, false
+		}
+		b, ok := p.sqlValues(file, e.Y, next)
+		if !ok {
+			return nil, false
+		}
+		return combine(a, b)
+	case *ast.CallExpr:
+		id, ok := e.Fun.(*ast.Ident)
+		if !ok || (id.Obj != nil && id.Obj.Kind != ast.Fun) {
+			return nil, false
+		}
+		for _, source := range p.files {
+			for _, decl := range source.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Recv != nil || fn.Name.Name != id.Name {
+					continue
+				}
+				var result []string
+				valid := true
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					if ret, ok := n.(*ast.ReturnStmt); ok && len(ret.Results) > 0 {
+						values, ok := p.sqlValues(source, ret.Results[0], next)
+						valid = valid && ok
+						result = append(result, values...)
+					}
+					return true
+				})
+				return result, valid && len(result) > 0 && len(result) <= 512
+			}
+		}
+	case *ast.Ident:
+		if e.Obj == nil || p.sqlBindingEscapes(e.Obj) {
+			return nil, false
+		}
+
+		if field, ok := e.Obj.Decl.(*ast.Field); ok {
+			// Only private, package-declared helpers have a closed caller inventory.
+			for _, source := range p.files {
+				for _, decl := range source.Decls {
+					fn, ok := decl.(*ast.FuncDecl)
+					if !ok || ast.IsExported(fn.Name.Name) {
+						continue
+					}
+					parameter := -1
+					i := 0
+					for _, f := range fn.Type.Params.List {
+						for _, name := range f.Names {
+							if f == field && name.Name == e.Name {
+								parameter = i
+							}
+							i++
+						}
+					}
+					if parameter < 0 {
+						continue
+					}
+					if p.sqlParameterReassigned(e.Obj) || p.sqlHelperEscapes(fn) {
+						return nil, false
+					}
+					var values []string
+					valid := true
+					for _, caller := range p.files {
+						ast.Inspect(caller, func(n ast.Node) bool {
+							call, ok := n.(*ast.CallExpr)
+							if !ok || linkCallName(call.Fun) != fn.Name.Name {
+								return true
+							}
+							if parameter >= len(call.Args) {
+								valid = false
+								return true
+							}
+							v, ok := p.sqlValues(caller, call.Args[parameter], next)
+							valid = valid && ok
+							values = append(values, v...)
+							return true
+						})
+					}
+					return values, valid && len(values) > 0 && len(values) <= 512
+				}
+			}
+			return nil, false
+		}
+		var values []string
+		valid := true
+		// go/parser binds range variables to a synthetic assignment. Resolve
+		// the actual range declaration by object identity, and still include
+		// any later assignments below.
+		for _, source := range p.files {
+			ast.Inspect(source, func(n ast.Node) bool {
+				loop, ok := n.(*ast.RangeStmt)
+				if !ok || linkRangeValueObject(loop.Value) != e.Obj {
+					return true
+				}
+				literal, ok := loop.X.(*ast.CompositeLit)
+				if !ok {
+					valid = false
+					return true
+				}
+				for _, element := range literal.Elts {
+					v, ok := p.sqlValues(source, element, next)
+					valid = valid && ok
+					values = append(values, v...)
+				}
+				return true
+			})
+		}
+		for _, source := range p.files {
+			ast.Inspect(source, func(n ast.Node) bool {
+				var left, right []ast.Expr
+				op := token.ASSIGN
+				switch a := n.(type) {
+				case *ast.AssignStmt:
+					left, right, op = a.Lhs, a.Rhs, a.Tok
+				case *ast.ValueSpec:
+					for _, id := range a.Names {
+						left = append(left, id)
+					}
+					right = a.Values
+				default:
+					return true
+				}
+				for i, l := range left {
+					id, ok := l.(*ast.Ident)
+					if !ok || id.Obj != e.Obj {
+						continue
+					}
+					j := i
+					if len(right) == 1 {
+						j = 0
+					}
+					if j >= len(right) {
+						valid = false
+						continue
+					}
+					// Multiple-return SQL builders put the query first.
+					if i > 0 && len(right) == 1 {
+						valid = false
+						continue
+					}
+					v, ok := p.sqlValues(source, right[j], next)
+					valid = valid && ok
+					if op == token.ADD_ASSIGN {
+						joined, ok := combine(values, v)
+						valid = valid && ok
+						values = append(values, joined...)
+					} else if op == token.ASSIGN || op == token.DEFINE {
+						values = append(values, v...)
+					} else {
+						valid = false
+					}
+				}
+				return true
+			})
+		}
+		return values, valid && len(values) > 0 && len(values) <= 512
+	}
+	return nil, false
+}
+
+func (p *linkSQLPackage) provenUnprotectedSQL(file *ast.File, expr ast.Expr) bool {
+	values, ok := p.sqlValues(file, expr, map[ast.Node]bool{})
+	if !ok {
+		return false
+	}
+	for _, value := range values {
+		if linkSQLProtected(value) {
+			return false
+		}
+	}
+	return true
+}
+
+func linkRangeValueObject(expr ast.Expr) *ast.Object {
+	if id, ok := expr.(*ast.Ident); ok {
+		return id.Obj
+	}
+	return nil
+}
+
+// Address-taken and package-mutable strings do not have a closed write set.
+func (p *linkSQLPackage) sqlBindingEscapes(object *ast.Object) bool {
+	if cached, ok := p.unsafeSQLBindings[object]; ok {
+		return cached
+	}
+	if p.unsafeSQLBindings == nil {
+		p.unsafeSQLBindings = map[*ast.Object]bool{}
+	}
+
+	unsafe := false
+	for _, file := range p.files {
+		for _, decl := range file.Decls {
+			if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.VAR {
+				for _, spec := range gen.Specs {
+					for _, id := range spec.(*ast.ValueSpec).Names {
+						unsafe = unsafe || id.Obj == object
+					}
+				}
+			}
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			// Range keys can be map strings; their finite values are not part
+			// of the value-only range proof.
+			if loop, ok := n.(*ast.RangeStmt); ok && linkRangeValueObject(loop.Key) == object {
+				unsafe = true
+			}
+			if unary, ok := n.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+				ast.Inspect(unary.X, func(n ast.Node) bool {
+					if id, ok := n.(*ast.Ident); ok && id.Obj == object {
+						unsafe = true
+					}
+					return true
+				})
+			}
+			return true
+		})
+	}
+	p.unsafeSQLBindings[object] = unsafe
+	return unsafe
+}
+
+func (p *linkSQLPackage) sqlParameterReassigned(object *ast.Object) bool {
+	if cached, ok := p.reassignedSQLParameters[object]; ok {
+		return cached
+	}
+	if p.reassignedSQLParameters == nil {
+		p.reassignedSQLParameters = map[*ast.Object]bool{}
+	}
+
+	changed := false
+	for _, file := range p.files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			if loop, ok := n.(*ast.RangeStmt); ok && (linkRangeValueObject(loop.Key) == object || linkRangeValueObject(loop.Value) == object) {
+				changed = true
+			}
+			if assign, ok := n.(*ast.AssignStmt); ok {
+				for _, left := range assign.Lhs {
+					if id, ok := left.(*ast.Ident); ok && id.Obj == object {
+						changed = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	p.reassignedSQLParameters[object] = changed
+	return changed
+}
+
+// A private helper passed as a value can have callers that the finite-string
+// proof cannot bind. Wrapper propagation still guards its SQL conservatively.
+func (p *linkSQLPackage) sqlHelperEscapes(fn *ast.FuncDecl) bool {
+	if cached, ok := p.escapedSQLHelpers[fn]; ok {
+		return cached
+	}
+	if p.escapedSQLHelpers == nil {
+		p.escapedSQLHelpers = map[*ast.FuncDecl]bool{}
+	}
+
+	invoked := map[ast.Node]bool{}
+	for _, file := range p.files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				invoked[call.Fun] = true
+				if selector, ok := call.Fun.(*ast.SelectorExpr); ok {
+					invoked[selector.Sel] = true
+				}
+			}
+			return true
+		})
+	}
+	escaped := false
+	for _, file := range p.files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && id != fn.Name && id.Name == fn.Name.Name && (id.Obj == nil || id.Obj.Kind == ast.Fun) && !invoked[id] {
+				escaped = true
+			}
+			return true
+		})
+	}
+	p.escapedSQLHelpers[fn] = escaped
+	return escaped
 }

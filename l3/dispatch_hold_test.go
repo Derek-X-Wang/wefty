@@ -228,7 +228,7 @@ func assertHeld(t *testing.T, s *Store, id string) {
 func stagedBearer(t *testing.T, s *Store, id string) string {
 	t.Helper()
 	var token string
-	if err := s.db.QueryRow(`SELECT token_delivery FROM dispatch_outbox WHERE run_id=?`, id).Scan(&token); err != nil || token == "" {
+	if err := inspectTestOutbox(s, id, func(v dispatchOutboxRecord) { token = v.delivery.String }); err != nil || token == "" {
 		t.Fatalf("missing staged bearer: %v", err)
 	}
 	return token

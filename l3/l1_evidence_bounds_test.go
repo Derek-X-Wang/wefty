@@ -428,7 +428,7 @@ func TestDispatchL1DetailsSizeBound(t *testing.T) {
 				t.Fatal("missing reported dispatch error")
 			}
 			var stored []byte
-			if err := h.l3Store.db.QueryRowContext(ctx, `SELECT last_error FROM dispatch_outbox WHERE run_id=?`, run.RunID).Scan(&stored); err != nil {
+			if err := inspectTestOutbox(h.l3Store, run.RunID, func(v dispatchOutboxRecord) { stored = []byte(v.lastError.String) }); err != nil {
 				t.Fatal(err)
 			}
 			var protocol contract.APIError

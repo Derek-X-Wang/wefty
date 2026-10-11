@@ -1232,6 +1232,11 @@ actor can locally cancel a never-attempted held Run through L3.
 
 ### Run cancellation (#691)
 
+Public readers use only the Run's confirmed Job reference; they do not merge
+outbox or diagnostic identities. The [Run job link contract](run-execution-context.md#run-job-link)
+defines link knowledge and evidence ordering. Cancellation alone resolves
+private legacy evidence before remote delivery.
+
 `POST /v1/runs/{run_id}/cancel` requires the existing L3 caller principal.
 Only an actor matching either the Run's immutable submitting actor or the
 immutable submitting actor of its lineage's root Run may cancel. Authority
@@ -1281,6 +1286,13 @@ pass updates only its failure count and retry time; it never rewrites the
 recorded cancellation status or reason. Authoritative dispatch absence beyond
 the settlement horizon settles delivery with nothing to cancel, including a
 legacy refusal. This is a new absence verdict, not a retry error.
+An authorized cancel still commits pending intent when a corrupt diagnostic
+prevents linking an outbox-only acknowledgement. The evidence remains intact;
+delivery reports the conflict and backs off. An active Run returns a retryable
+HTTP 503 internal error; a terminal Run returns HTTP 200 with its recorded
+outcome and pending cancellation fields. Neither path submits again or
+cancels an identity that conflicts with stored evidence.
+
 Any usable evidence that links a previously unlinked Run with a cancellation
 record atomically reopens delivery. This includes stored outbox evidence used
 by an HTTP cancel request, as well as acknowledgements and positive lookups.

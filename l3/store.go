@@ -2240,3 +2240,40 @@ func newToken() string {
 	}
 	return "wrun_" + hex.EncodeToString(random[:])
 }
+
+// failRunTx fails a non-terminal run from the ledger side and records why.
+// The reason is written only by the transition that fails the run, so the
+// first cause is the one kept.
+//
+// The run's node attribution is cleared and marked pending when an L1 job
+// exists. The ledger cannot tell which node wrote the failing evidence -- a
+// run token names the run, not the L1 attempt -- and a node recorded while
+// the job was live may be one an earlier attempt failed on before it was
+// requeued. Once the job settles, the reconciler fills the node from the
+// attempt that settled it, from empty only (#604 review).
+func failRunTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time, tokenGrace time.Duration, reason string) error {
+	linked, err := failedRunAttributionTx(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, failure_reason=?, updated_ns=?,
+  started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?),
+ node_id=CASE WHEN ? THEN NULL ELSE node_id END,
+ node_attribution_pending=CASE WHEN ? THEN 1 ELSE 0 END
+WHERE run_id=? AND status NOT IN (?, ?)`,
+		contract.RunFailed, nullableReason(reason), now.UnixNano(), now.UnixNano(), now.UnixNano(), linked, linked, runID, contract.RunSucceeded, contract.RunFailed)
+	if err != nil {
+		return internalError(err, "fail run protocol")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read protocol failure result")
+	}
+	if changed == 1 {
+		expires := canonicalTime(now.Add(tokenGrace))
+		if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, expires.UnixNano(), runID); err != nil {
+			return internalError(err, "expire protocol-failed run token")
+		}
+	}
+	return clearStagedTokenDelivery(ctx, tx, runID)
+}

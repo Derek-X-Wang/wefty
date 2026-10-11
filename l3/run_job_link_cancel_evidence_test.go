@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -619,6 +620,66 @@ func TestCancelAbsentFallbackPreservesConflictingOwnership(t *testing.T) {
 			}
 			if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
 				t.Fatal("conflict changed terminal facts/token")
+			}
+		})
+	}
+}
+
+// A corrupt identity diagnostic must not prevent durable cancellation ownership.
+// The conflicting evidence remains intact and blocks delivery, rather than
+// authorizing cancellation of a different Job.
+func TestCancelCorruptDiagnosticRecordsIntent(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprint("terminal=", terminal), func(t *testing.T) {
+			h := newIntegrationHarness(t)
+			run := h.submit(inlineRunRequest("exit 0\n"), "corrupt-cancel")
+			if _, err := h.l3Store.beginDispatch(t.Context(), run.RunID); err != nil {
+				t.Fatal(err)
+			}
+			if terminal {
+				failRunAfterDispatchAttempt(t, h.l3Store, run.RunID)
+			}
+			recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, "job-owned")
+			corrupt := &contract.APIError{Code: contract.ErrorForbidden, Message: "corrupt diagnostic", Details: map[string]any{"reason": "not-a-regression", "l1_job_id": "another-job"}}
+			attempted := h.l3Store.clock.Now()
+			buildLegacyOrCorruptLinkKnowledge(t, h.l3Store, run.RunID, linkKnowledgeFixture{attemptedAt: &attempted, outboxJob: linkID("job-owned"), acknowledged: true, diagnostic: corrupt})
+			before := linkTestOutbox(t, h.l3Store, run.RunID)
+			beforeFacts := snapshotTerminalRun(t, h.l3Store, run.RunID)
+			client := &recordingCancelClient{L1Client: h.l1Client}
+			h.l3Server.jobs = client
+			status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+			intent := linkTestCancellation(t, h.l3Store, run.RunID)
+			if !intent.requested.Valid || intent.completed.Valid {
+				t.Fatalf("cancel did not retain pending intent: %+v HTTP %d %s", intent, status, body)
+			}
+			if terminal && status == http.StatusOK {
+				var record contract.RunRecord
+				if err := json.Unmarshal(body, &record); err != nil || record.CancelStatus != "pending" || record.CancelReason == "" {
+					t.Fatalf("terminal cancel fields: %s %v", body, err)
+				}
+			}
+			if terminal && status != http.StatusOK {
+				t.Fatalf("terminal cancel=%d %s", status, body)
+			}
+			if !terminal && status != http.StatusServiceUnavailable {
+				t.Fatalf("active corrupt cancel=%d %s", status, body)
+			}
+			if client.calls != 0 {
+				t.Fatalf("corrupt evidence authorized %d remote cancels", client.calls)
+			}
+			if facts := snapshotTerminalRun(t, h.l3Store, run.RunID); facts != beforeFacts {
+				t.Fatalf("cancel changed outcome/token history: %+v -> %+v", beforeFacts, facts)
+			}
+			after := linkTestOutbox(t, h.l3Store, run.RunID)
+			if after != before {
+				t.Fatalf("cancel changed corrupt evidence: %+v -> %+v", before, after)
+			}
+			if intent.retry <= h.l3Store.clock.Now().UnixNano() || !intent.lastError.Valid {
+				t.Fatal("corrupt delivery did not back off with visible error")
+			}
+			pending, err := h.l3Store.pendingDispatches(t.Context())
+			if err != nil || len(pending) != 0 {
+				t.Fatalf("canceled Run can submit again: %+v %v", pending, err)
 			}
 		})
 	}
