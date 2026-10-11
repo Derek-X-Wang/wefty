@@ -679,6 +679,25 @@ terminal transition has cleared the staged bearer, and an L1 that lost its
 database could otherwise accept the replay as new work and repeat side
 effects for an ended run.
 
+A cancellation record owns its Run from the cancellation request onward,
+including pending, settled and refused delivery. Ordinary recovery's link,
+settle-as-missing and backoff writes check for that record inside their write
+transaction and do nothing when it exists. Recovery's reread is fenced too.
+Recovery settlement requires no cancellation record. For an unacknowledged
+dispatch, settle-as-missing also requires authoritative absence at lookup start
+at least one hour after the last submit attempt; a lookup started before that
+horizon remains provisional. An acknowledged Job's authoritative absence by ID
+still records regression immediately.
+
+If an outstanding recovery lookup finds a Job after cancel took ownership,
+the observation goes to the cancel-owned link transition. It rechecks the
+stable dispatch key and stored Job identities, records lookup evidence, and
+reopens delivery for a previously unlinked Run, even if cancel already settled
+or was refused. The link and delivery wakeup commit atomically; delivery then
+uses the remaining recovery budget or retries on the next pass. The Run's
+terminal reason, status, timestamps and token expiry stay unchanged. All L1
+reads and cancellation calls happen outside ledger write transactions.
+
 ## Workload support and reserved operations
 
 JSON Schema and `contract.ValidateJobSpec` accept every non-empty job `kind` and

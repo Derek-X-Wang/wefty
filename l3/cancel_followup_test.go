@@ -429,15 +429,21 @@ func TestCancelRechecksStoredEvidenceBeforeLinking(t *testing.T) {
 	if err != nil || len(pending) != 1 {
 		t.Fatalf("delivery read = %+v %v", pending, err)
 	}
-	// The production absence writer commits after cancel's read. This ticket
-	// guards cancel's later use of that read, not recovery's ownership rules.
-	record, err := h.l3Store.GetRun(ctx, run.RunID)
+	// #777 fences recovery after the cancellation read, so current recovery
+	// cannot write this verdict. Inject the pre-upgrade shape to retain #776's
+	// check that cancel revalidates a stale stored acknowledgement at its write.
+	payload, err := json.Marshal(contract.APIError{
+		Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed",
+		Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": "job-gone"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	outcome, err := h.l3Store.settleUnrecordedDispatch(ctx, unrecordedDispatch{RunID: run.RunID, DispatchKey: record.DispatchKey, OutboxJobID: "job-gone"}, h.l3Store.recoveryNow())
-	if err != nil || outcome != settled {
-		t.Fatalf("absence verdict = %v %v", outcome, err)
+	if _, err := h.l3Store.db.Exec(`UPDATE runs SET job_link_settled=1 WHERE run_id=?`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.l3Store.db.Exec(`UPDATE dispatch_outbox SET last_error=?, token_delivery=NULL WHERE run_id=?`, string(payload), run.RunID); err != nil {
+		t.Fatal(err)
 	}
 	before, err := h.l3Store.GetRunExecution(ctx, run.RunID)
 	if err != nil {

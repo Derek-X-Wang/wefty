@@ -1266,11 +1266,24 @@ backoff: 30 seconds, doubling to a 30-minute cap. An explicit repeat HTTP cancel
 resets the failure count and retry time for pending delivery and immediately
 attempts delivery again; automatic recovery still honors backoff. Ambiguous-dispatch lookups use this schedule and share the
 existing per-pass dispatch-recovery budget (five seconds by default); ordinary
-recovery does not also look up a Run with cancellation intent. A late first dispatch
-acknowledgement wakes cancellation delivery immediately. A dispatch-key
+recovery does not select a Run with any cancellation record, including pending,
+settled or refused delivery. Recovery's link, settle-as-missing and backoff
+writes check this ownership inside their write transaction and do nothing once
+cancel owns the Run. The reread after a changed recovery observation has the
+same ownership fence. A cancel requested during an outstanding L1 lookup thus
+wins even when recovery selected the Run first.
+
+A positive observation already in flight is handed to the cancel path rather
+than dropped: that write rechecks the dispatch key and current Job identity,
+links with lookup evidence, and durably reopens cancellation delivery when the
+Run was unlinked. This includes settled and refused cancellations, and an old
+outbox-only acknowledgement. Delivery uses the remaining pass budget; if it is
+spent, the next pass delivers using the linked Job without another dispatch-key
+lookup. Linking and reopening delivery commit together, before any L1 call.
+A late first dispatch acknowledgement also wakes cancellation immediately. A dispatch-key
 absence remains provisional until the existing one-hour dispatch settlement
-horizon has passed since the last attempt; only then, with no acknowledgement
-recorded meanwhile, can the Run settle locally with
+horizon has passed since the last attempt, measured at lookup start; only then,
+with no acknowledgement recorded meanwhile, can the Run settle locally with
 `failure_reason=canceled before dispatch was confirmed`.
 An empty L1 job ID is rejected before the acknowledgement can be written to
 the outbox or Run. A conflicting acknowledgement cannot link a Run: its outbox job must be NULL
