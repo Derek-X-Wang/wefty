@@ -273,6 +273,7 @@ Only logs from an active process attempt with current live authority may start
 the portless-service stability window. Renewal, `Started`, and logs establish
 portless health only on the bound alive node under the attempt's matching boot
 session and registration generation, inside the same write transaction.
+Computer stability also requires its display to be published for the current attempt.
 `kind=oci` log insertion never promotes: only `Started` does.
 
 A gap declaration uses `LogEvent.sequence` as the first lost sequence and

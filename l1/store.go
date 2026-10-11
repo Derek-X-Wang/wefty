@@ -4938,6 +4938,8 @@ func completionStates(result ProcessResult) (contract.JobState, contract.Attempt
 }
 
 func markPortlessServiceStable(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) error {
+	// A Computer's NULL port does not make execution alone healthy: its
+	// display must still be published for the current attempt in this write.
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
 		SET healthy_since_ns=COALESCE(healthy_since_ns, ?)
 		WHERE job_id=? AND published_port IS NULL
@@ -4946,6 +4948,10 @@ func markPortlessServiceStable(ctx context.Context, tx *sql.Tx, jobID string, no
 				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
 				JOIN nodes ON nodes.node_id=attempts.node_id
 				WHERE jobs.job_id=service_jobs.job_id
+					AND (NOT EXISTS (
+						SELECT 1 FROM computer_job_projections
+						WHERE computer_job_projections.job_id=service_jobs.job_id
+					) OR service_jobs.published_attempt_id=jobs.current_attempt_id)
 					AND service_jobs.bound_node_id=attempts.node_id
 					AND nodes.state=?
 					AND attempts.boot_session_id=nodes.boot_session_id
