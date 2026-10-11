@@ -245,6 +245,10 @@ func TestRecoveryDiscoveryReachesCancel(t *testing.T) {
 			// recovery's actual terminal-Run selector.
 			item := unrecordedDispatch{RunID: run.RunID, DispatchKey: intents[0].DispatchKey}
 			if scenario == "settled" {
+				item.observed, err = readDispatchObservation(ctx, h.l3Store.db, item.RunID)
+				if err != nil {
+					t.Fatal(err)
+				}
 				if err := r.recoverUnrecordedDispatch(ctx, ctx, item); err != nil {
 					t.Fatal(err)
 				}
@@ -356,5 +360,65 @@ func TestRecoveryLinkRechecksAcknowledgedIdentity(t *testing.T) {
 				t.Fatalf("conflicting observation changed Run identity: %+v %v", record, err)
 			}
 		})
+	}
+}
+
+// A Job found by recovery is lookup evidence even when cancellation owns the
+// receiving write. A later verdict must survive that handoff, and a pending
+// cancellation must be able to retry against a fresh L1 observation.
+func TestRecoveryCancelHandoffCannotOverwriteLaterVerdict(t *testing.T) {
+	h := newIntegrationHarness(t)
+	ctx := context.Background()
+	run, job := crashWindowRun(t, h, "handoff-newer-verdict")
+	recordOutboxOnlyAcknowledgement(t, h.l3Store, run.RunID, job.JobID)
+	terminal := snapshotTerminalRun(t, h.l3Store, run.RunID)
+	client := &reviewCancelClient{L1Client: h.l1Client}
+	lookup := &cancelDuringRecoveryLookup{lookup: func(ctx context.Context, key string) (l1.Job, error) {
+		if key != job.Spec.DispatchKey {
+			t.Fatalf("lookup key = %q, want %q", key, job.Spec.DispatchKey)
+		}
+		// Commit a newer verdict while the remote lookup is outstanding. This
+		// write also proves the L1 call holds no ledger write transaction.
+		if _, err := h.l3Store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`,
+			`{"code":"not_found","message":"newer handoff verdict","details":{"reason":"l1_regressed","l1_job_id":"`+job.JobID+`"}}`, run.RunID); err != nil {
+			return l1.Job{}, err
+		}
+		if err := h.l3Store.requestRunCancellation(ctx, run.RunID, h.callerUser); err != nil {
+			return l1.Job{}, err
+		}
+		return h.l1Client.LookupJobByDispatchKey(ctx, key)
+	}}
+	r, err := NewReconciler(h.l3Store, client, ReconcilerConfig{DispatchLookup: lookup})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs := r.recoverUnrecordedDispatches(ctx); len(errs) == 0 {
+		t.Error("stale recovery handoff was accepted")
+	}
+	execution, err := h.l3Store.GetRunExecution(ctx, run.RunID)
+	if err != nil || execution.DispatchError == nil || execution.DispatchError.Message != "newer handoff verdict" || execution.DispatchError.Details["reason"] != l1RegressedReason {
+		t.Fatalf("stale handoff erased the newer verdict: %+v %v", execution, err)
+	}
+	record, err := h.l3Store.GetRun(ctx, run.RunID)
+	observed, getErr := h.l1Client.GetJob(ctx, job.JobID)
+	if err != nil || getErr != nil || record.L1JobID != "" || record.CancelStatus != "pending" || client.calls != 0 || observed.State != contract.JobQueued || lookup.calls != 1 {
+		t.Fatalf("stale handoff linked or delivered: run=%+v job=%+v cancels=%d lookups=%d errors=%v/%v", record, observed, client.calls, lookup.calls, err, getErr)
+	}
+	if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
+		t.Fatalf("stale handoff changed terminal facts: before=%+v after=%+v", terminal, after)
+	}
+	// The cancel path alone resolves the contradicted stored identity on the
+	// next pass, using an observation captured before its GetJob fallback.
+	r.lookup = &absentReviewLookup{}
+	if err := r.ReconcileOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	record, err = h.l3Store.GetRun(ctx, run.RunID)
+	observed, getErr = h.l1Client.GetJob(ctx, job.JobID)
+	if err != nil || getErr != nil || record.L1JobID != job.JobID || record.CancelStatus != "settled" || observed.Outcome != contract.JobOutcomeCanceled || client.calls != 1 || lookup.calls != 1 {
+		t.Fatalf("fresh cancel fallback failed: run=%+v job=%+v cancels=%d lookups=%d errors=%v/%v", record, observed, client.calls, lookup.calls, err, getErr)
+	}
+	if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
+		t.Fatalf("fresh fallback changed terminal facts: before=%+v after=%+v", terminal, after)
 	}
 }

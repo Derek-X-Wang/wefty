@@ -327,6 +327,14 @@ func TestCancelContradictedStoredAcknowledgement(t *testing.T) {
 					}
 					_ = r.ReconcileOnce(ctx)
 				}
+				record, readErr := h.l3Store.GetRun(ctx, run.RunID)
+				wantCancelStatus := "settled"
+				if delivery == "delayed-acknowledgement" {
+					wantCancelStatus = ""
+				}
+				if readErr != nil || record.CancelStatus != wantCancelStatus {
+					t.Errorf("cancel status = %q, want %q: %v", record.CancelStatus, wantCancelStatus, readErr)
+				}
 				after, err := h.l3Store.GetRunExecution(ctx, run.RunID)
 				if err != nil || after.L1JobID != "" || !reflect.DeepEqual(before.DispatchError, after.DispatchError) {
 					t.Errorf("cancel revived contradicted identity: before=%+v after=%+v err=%v", before, after, err)
@@ -457,6 +465,18 @@ func TestCancelRechecksStoredEvidenceBeforeLinking(t *testing.T) {
 	after, err := h.l3Store.GetRunExecution(ctx, run.RunID)
 	if err != nil || after.L1JobID != "" || !reflect.DeepEqual(after.DispatchError, before.DispatchError) {
 		t.Fatalf("stale cancel read restored a link: before=%+v after=%+v err=%v", before, after, err)
+	}
+	record, err := h.l3Store.GetRun(ctx, run.RunID)
+	if err != nil || record.CancelStatus != "pending" {
+		t.Fatalf("stale delivery was not deferred: %+v %v", record, err)
+	}
+	terminal := snapshotTerminalRun(t, h.l3Store, run.RunID)
+	status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+	if err := json.Unmarshal(body, &record); err != nil || status != http.StatusOK || record.CancelStatus != "settled" {
+		t.Fatalf("next cancel did not settle: %d %s %v", status, body, err)
+	}
+	if after := snapshotTerminalRun(t, h.l3Store, run.RunID); after != terminal {
+		t.Fatal("retry changed terminal facts")
 	}
 }
 

@@ -17,7 +17,7 @@ import (
 // cancelStoredJobID uses an outbox acknowledgement only while no settled absence
 // or regression diagnostic contradicts it. The Run's own link remains primary.
 const cancelStoredJobID = `COALESCE(r.l1_job_id, CASE WHEN r.job_link_settled=0
- AND COALESCE(json_extract(o.last_error, '$.details.reason'), '') NOT IN ('l1_regressed', 'dispatch_not_found')
+ AND COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, '') NOT IN ('` + l1RegressedReason + `', '` + dispatchNotFoundReason + `')
  THEN o.job_id END)`
 
 // requestRunCancellation arbitrates cancellation with the first dispatch
@@ -157,6 +157,40 @@ func (s *Store) cancelAbsentDispatch(ctx context.Context, runID string, lookupSt
 	return nil
 }
 
+// cancelAbsentStoredIdentity settles only delivery for an already-terminal Run.
+// Preserve its verdict, terminal facts and token expiry. Recheck the identity
+// and verdict that authorized the remote read inside the write transaction.
+func (s *Store) cancelAbsentStoredIdentity(ctx context.Context, runID string, observed dispatchObservation) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin absent identity cancellation")
+	}
+	defer tx.Rollback()
+	current, err := readDispatchObservation(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	if current != observed {
+		return internalError(errors.New("dispatch evidence changed during lookup"), "settle absent identity cancellation")
+	}
+	if !current.outboxJob.Valid || current.outboxJob.String == "" ||
+		(current.runJob.Valid && current.runJob.String != current.outboxJob.String) ||
+		(current.reason == l1RegressedReason && current.diagnosticJob != "" && current.diagnosticJob != current.outboxJob.String) {
+		return internalError(errors.New("stored dispatch identity conflicts with recorded job"), "settle absent identity cancellation")
+	}
+	if current.state != contract.RunSucceeded && current.state != contract.RunFailed {
+		// An active Run still follows the existing regression/absence rules.
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=?, last_error=NULL, refused=0 WHERE run_id=? AND completed_ns IS NULL`, s.recoveryNow().UnixNano(), runID); err != nil {
+		return internalError(err, "finish absent identity cancellation")
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit absent identity cancellation")
+	}
+	return nil
+}
+
 func (s *Store) finishRunCancellation(ctx context.Context, runID string) error {
 	if _, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET completed_ns=?, last_error=NULL, refused=0 WHERE run_id=?`, s.recoveryNow().UnixNano(), runID); err != nil {
 		return internalError(err, "finish run cancellation delivery")
@@ -280,20 +314,40 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 		if r.lookup == nil {
 			return internalError(errors.New("L1 dispatch lookup client is not configured"), "resolve canceled dispatch")
 		}
+		observed, err := readDispatchObservation(ctx, r.store.db, run.RunID)
+		if err != nil {
+			return err
+		}
 		lookupStarted := r.store.recoveryNow()
 		job, err := r.lookup.LookupJobByDispatchKey(remote, cancellation.DispatchKey)
 		if isMissingDispatch(err, cancellation.DispatchKey) {
-			if err := r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted); err != nil {
-				return err
+			// A contradicted acknowledgement is not link evidence. Resolve its
+			// identity through L1, outside the write, just as recovery does.
+			if observed.outboxJob.Valid && observed.outboxJob.String != "" {
+				job, err = r.jobs.GetJob(remote, observed.outboxJob.String)
+				if isMissingL1Job(err, observed.outboxJob.String) {
+					if err := r.store.cancelAbsentStoredIdentity(ctx, run.RunID, observed); err != nil {
+						return err
+					}
+					return r.store.deferRunCancellation(ctx, run.RunID, nil)
+				}
+				if err != nil {
+					return err
+				}
+				if job.JobID != observed.outboxJob.String {
+					return internalError(errors.New("job lookup conflicts with stored identity"), "resolve canceled dispatch")
+				}
+			} else {
+				if err := r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted); err != nil {
+					return err
+				}
+				return r.store.deferRunCancellation(ctx, run.RunID, err)
 			}
-			// If the absence was provisional, the row remains pending. Back
-			// it off even though the lookup itself succeeded.
-			return r.store.deferRunCancellation(ctx, run.RunID, err)
 		}
 		if err != nil {
 			return err
 		}
-		if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, job.JobID, dispatchLookupEvidence); err != nil {
+		if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, job.JobID, dispatchLookupEvidence, &observed); err != nil {
 			return err
 		}
 		record, err := r.store.GetRun(ctx, run.RunID)
@@ -305,7 +359,7 @@ func (r *Reconciler) cancelRunJobRemote(ctx, remote context.Context, cancellatio
 
 	// Recheck stored outbox acknowledgements before sending any cancellation.
 	// A mismatched dispatch lookup must never become authority over another job.
-	if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, run.JobID, dispatchStoredEvidence); err != nil {
+	if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, run.JobID, dispatchStoredEvidence, nil); err != nil {
 		return err
 	}
 	record, err := r.store.GetRun(ctx, run.RunID)
@@ -394,7 +448,7 @@ func (r *Reconciler) projectObservedJob(ctx context.Context, run projectedRun, j
 // acceptRecoveredCancellation hands a bound positive observation to cancel.
 // The same write checks ownership and dispatch identity, links the Job using
 // lookup evidence, and wakes delivery. L1 calls happen only after it commits.
-func (s *Store) acceptRecoveredCancellation(ctx context.Context, item unrecordedDispatch, jobID string) error {
+func (s *Store) acceptRecoveredCancellation(ctx context.Context, item unrecordedDispatch, jobID string, observed *dispatchObservation) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return internalError(err, "begin recovered cancellation")
@@ -413,7 +467,7 @@ func (s *Store) acceptRecoveredCancellation(ctx context.Context, item unrecorded
 	if key != item.DispatchKey || outboxKey != key {
 		return internalError(errors.New("recovered cancellation conflicts with dispatch key"), "link recovered cancellation")
 	}
-	if err := s.completeDispatchWithEvidenceTx(ctx, tx, item.RunID, jobID, dispatchLookupEvidence); err != nil {
+	if err := s.completeDispatchWithEvidenceTx(ctx, tx, item.RunID, jobID, dispatchLookupEvidence, observed); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -425,11 +479,11 @@ func (s *Store) acceptRecoveredCancellation(ctx context.Context, item unrecorded
 // linkRecoveredDispatch preserves discoveries when cancellation took ownership
 // during L1's read. The recovery write is fenced; the cancel-owned write links
 // and durably wakes delivery, even if the remaining remote budget is spent.
-func (r *Reconciler) linkRecoveredDispatch(ctx, remote context.Context, item unrecordedDispatch, jobID string) error {
+func (r *Reconciler) linkRecoveredDispatch(ctx, remote context.Context, item unrecordedDispatch, jobID string, observed *dispatchObservation) error {
 	if err := r.store.linkUnrecordedDispatch(ctx, item, jobID); err != nil {
 		return err
 	}
-	if err := r.store.acceptRecoveredCancellation(ctx, item, jobID); err != nil {
+	if err := r.store.acceptRecoveredCancellation(ctx, item, jobID, observed); err != nil {
 		return err
 	}
 	cancellations, err := r.store.pendingRunCancellations(ctx, item.RunID)

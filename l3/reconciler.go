@@ -245,7 +245,7 @@ func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item
 	var absence error
 	switch {
 	case err == nil && (item.OutboxJobID == "" || job.JobID == item.OutboxJobID):
-		return recoveryDone, r.linkRecoveredDispatch(ctx, remote, item, job.JobID)
+		return recoveryDone, r.linkRecoveredDispatch(ctx, remote, item, job.JobID, &item.observed)
 	case err == nil:
 		absence = fmt.Errorf("L1 dispatch %q resolved to job %q, not acknowledged job %q", item.DispatchKey, job.JobID, item.OutboxJobID)
 	case isMissingDispatch(err, item.DispatchKey):
@@ -260,7 +260,7 @@ func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item
 		// run-ledger provenance, and that job is still this run's to link.
 		_, err := r.jobs.GetJob(remote, item.OutboxJobID)
 		if err == nil {
-			return recoveryDone, r.linkRecoveredDispatch(ctx, remote, item, item.OutboxJobID)
+			return recoveryDone, r.linkRecoveredDispatch(ctx, remote, item, item.OutboxJobID, &item.observed)
 		}
 		if !isMissingL1Job(err, item.OutboxJobID) {
 			return recoveryTransient, errors.Join(absence, r.store.observeL1Error(ctx, err))
