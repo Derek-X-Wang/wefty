@@ -1401,3 +1401,88 @@ func TestNodeRuntimePlatformReadsOneAdvertisedFactOrNone(t *testing.T) {
 		t.Fatalf("RuntimePlatformCapability() with no architecture = %q", got)
 	}
 }
+
+func TestQueuedComputerAbortMustRetainCompletionReplay(t *testing.T) {
+	for _, detached := range []bool{false, true} {
+		name := "terminal-current-attempt"
+		if detached {
+			name = "already-detached-completion"
+		}
+		t.Run(name, func(t *testing.T) {
+			h, _, node, _ := computerCompletionHarness(t)
+			h.stopServer()
+			computer, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{
+				Name: "queued-abort-replay", Spec: computerCapabilityJobSpec("computer:queued-abort-replay"), Actor: "operator",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim := startComputerAttempt(t, h, node, nil)
+			if detached {
+				computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := h.store.SetComputerDesiredState(t.Context(), computer.ComputerID,
+					computerDesiredRequest(computer, contract.ServiceDesiredStopped, "stop")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exitCode := 1
+			request := CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+				Result: ProcessResult{ExitCode: &exitCode}, RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt}
+			first, err := h.store.CompleteAttemptOutcome(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, request)
+			if err != nil || first.Replayed {
+				t.Fatalf("first completion=%+v err=%v", first, err)
+			}
+			computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if detached {
+				if first.Job.State != contract.JobStopped || first.Job.CurrentAttemptID != "" {
+					t.Fatalf("stop completion did not detach: %+v", first)
+				}
+				computer, err = h.store.SetComputerDesiredState(t.Context(), computer.ComputerID,
+					computerDesiredRequest(computer, contract.ServiceDesiredRunning, "start"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if computer.CurrentJob.CurrentAttemptID != claim.Lease.AttemptID {
+				t.Fatal("queued Computer must retain terminal predecessor before abort")
+			}
+			if computer.CurrentJob.State != contract.JobQueued {
+				t.Fatalf("Computer not queued before grow: %+v", computer.CurrentJob)
+			}
+			growing, _, err := h.store.BeginComputerGrow(t.Context(), computer.ComputerID,
+				ComputerGrowRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
+					DiskBytes: computer.DesiredDiskBytes + (1 << 20), IdempotencyKey: "grow-before-abort"})
+			if err != nil || growing.CurrentJob.State != contract.JobQueued {
+				t.Fatalf("queued grow=%+v err=%v", growing, err)
+			}
+			h.clock.Advance(DefaultNodeDeadAfter)
+			if result, err := h.store.Reconcile(t.Context()); err != nil || result.DeadNodes != 1 {
+				t.Fatalf("dead reconciliation=%+v err=%v", result, err)
+			}
+			aborted, _, err := h.store.AbortComputerReconfiguration(t.Context(), computer.ComputerID,
+				ComputerReconfigurationAbortRequest{ComputerMutationPrecondition: computerPrecondition(growing, "operator"),
+					IdempotencyKey: "abort-queued-grow"})
+			if err != nil || aborted.CurrentJob.State != contract.JobStopped || aborted.CurrentJob.CurrentAttemptID != "" ||
+				aborted.ReconfigurationPhase != ComputerReconfigurationStable {
+				t.Fatalf("queued grow abort=%+v err=%v", aborted, err)
+			}
+			beforeReplay := snapshotDatabase(t, h.store.db)
+			replay, err := h.store.CompleteAttemptOutcome(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, request)
+			if err != nil || !replay.Replayed || replay.Job.State != contract.JobStopped {
+				t.Fatalf("accepted completion refused after queued Computer abort: code=%s replay=%+v err=%v", errorCode(err), replay, err)
+			}
+			if snapshotDatabase(t, h.store.db) != beforeReplay {
+				t.Fatal("completion replay changed the aborted operation or applied restart accounting twice")
+			}
+			request.IdempotencyKey = "changed-completion"
+			if _, err := h.store.CompleteAttemptOutcome(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, request); errorCode(err) != contract.ErrorIdempotencyConflict {
+				t.Fatalf("changed completion replay err=%v, want idempotency_conflict", err)
+			}
+		})
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -824,5 +825,285 @@ func assertAttemptState(t *testing.T, h *integrationHarness, attemptID string, w
 	}
 	if got != want {
 		t.Fatalf("attempt %q state = %q, want %q", attemptID, got, want)
+	}
+}
+
+func newProcessStabilityStore(t *testing.T) (*Store, *fakeClock, Node, Job) {
+	t.Helper()
+	clock := &fakeClock{now: time.Date(2026, 10, 10, 10, 0, 0, 0, time.UTC)}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "authority.sqlite"), StoreOptions{
+		Clock: clock, Jitter: func(delay time.Duration) time.Duration { return delay },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	node, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "stability-agent"}, contract.NodeRegistration{
+		NodeID: "stability-node", BootSessionID: "stability-boot", RootInstanceID: "stability-root",
+		OS: "linux", Architecture: "amd64", AgentVersion: "stability",
+		Capabilities: map[string]bool{"kind:process": true}, CapabilityRevision: 1,
+		CapabilityObservedAt: clock.Now(), MissingCapabilities: []string{},
+	}, DefaultNodePolicy("stability"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := validJobSpec(t.Name(), []string{"stability"})
+	spec.Class = contract.JobClassService
+	spec.Execution.HandoffDirectory = ""
+	spec.Restart = contract.RestartAlways
+	job, _, err := store.CreateJob(t.Context(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, clock, node, job
+}
+
+func claimProcessStabilityService(t *testing.T, store *Store, node Node) *Claim {
+	t.Helper()
+	claim, err := store.ClaimJob(t.Context(), "stability-agent", node.NodeID, node.BootSessionID, contract.JobClassService)
+	if err != nil || claim == nil {
+		t.Fatalf("claim=%+v err=%v", claim, err)
+	}
+	return claim
+}
+
+func failProcessStabilityService(t *testing.T, store *Store, claim *Claim) Job {
+	t.Helper()
+	exitCode := 1
+	job, err := store.CompleteAttempt(t.Context(), "stability-agent", claim.Job.JobID, claim.Lease.AttemptID, CompletionRequest{
+		FencingToken: claim.Lease.FencingToken, IdempotencyKey: "completion:" + claim.Lease.AttemptID,
+		Result: ProcessResult{ExitCode: &exitCode},
+	})
+	if err != nil || job.State != contract.JobQueued || job.RestartStreak != 1 || job.NextRestartAt == nil {
+		t.Fatalf("restartable completion=%+v err=%v", job, err)
+	}
+	return job
+}
+
+func TestLateLogsMustNotStartSuccessorStability(t *testing.T) {
+	store, clock, node, job := newProcessStabilityStore(t)
+	first := claimProcessStabilityService(t, store, node)
+	queued := failProcessStabilityService(t, store, first)
+	clock.Advance(queued.NextRestartAt.Sub(clock.Now()))
+	lost := claimProcessStabilityService(t, store, node)
+	clock.Advance(DefaultLeaseDuration)
+	if _, err := store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	queued, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil || queued.State != contract.JobQueued || queued.NextRestartAt == nil {
+		t.Fatalf("lease loss=%+v err=%v", queued, err)
+	}
+	clock.Advance(queued.NextRestartAt.Sub(clock.Now()))
+	current := claimProcessStabilityService(t, store, node)
+	lateAt := clock.Now()
+	if _, err := store.AppendLogs(t.Context(), "stability-agent", job.JobID, lost.Lease.AttemptID, AppendLogsRequest{
+		FencingToken: lost.Lease.FencingToken,
+		Events:       []contract.LogEvent{logEvent(lost.Lease.AttemptID, contract.LogStdout, 0, []byte("late lost-attempt output\n"))},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := store.GetJobLogs(t.Context(), job.JobID, "", 10)
+	if err != nil || len(logs.Events) != 1 || logs.Events[0].AttemptID != lost.Lease.AttemptID ||
+		string(logs.Events[0].Bytes) != "late lost-attempt output\n" {
+		t.Fatalf("late logs were not retained: logs=%+v err=%v", logs, err)
+	}
+	beforeStart, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(15 * time.Second)
+	startedAt := clock.Now()
+	if _, err := store.StartAttempt(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID,
+		StartedRequest{FencingToken: current.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := store.RenewLease(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, current.Lease.FencingToken); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.HeartbeatNode(t.Context(), "stability-agent", node.NodeID, node.BootSessionID); err != nil {
+			t.Fatal(err)
+		}
+		if i < 7 {
+			clock.Advance(15 * time.Second)
+		}
+	}
+	result, err := store.Reconcile(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeStart.HealthySinceAt != nil || result.RestartStreakResets != 0 || observed.RestartStreak != 1 {
+		t.Fatalf("late logs changed successor health: before-start health=%v lateAt=%v; runningFor=%s resets=%d streak=%d, want nil/0/1",
+			beforeStart.HealthySinceAt, lateAt, clock.Now().Sub(startedAt), result.RestartStreakResets, observed.RestartStreak)
+	}
+	clock.Advance(15 * time.Second)
+	if _, err := store.RenewLease(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, current.Lease.FencingToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.HeartbeatNode(t.Context(), "stability-agent", node.NodeID, node.BootSessionID); err != nil {
+		t.Fatal(err)
+	}
+	result, err = store.Reconcile(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err = store.GetJob(t.Context(), job.JobID)
+	if err != nil || result.RestartStreakResets != 1 || observed.RestartStreak != 0 ||
+		observed.HealthySinceAt == nil || !observed.HealthySinceAt.Equal(startedAt) {
+		t.Fatalf("successor did not earn its own stability: result=%+v job=%+v err=%v", result, observed, err)
+	}
+}
+
+func TestReplacedRegistrationMustNotResetStreak(t *testing.T) {
+	for _, boot := range []string{"stability-boot", "replacement-boot"} {
+		t.Run(boot, func(t *testing.T) {
+			store, clock, node, job := newProcessStabilityStore(t)
+			first := claimProcessStabilityService(t, store, node)
+			queued := failProcessStabilityService(t, store, first)
+			clock.Advance(queued.NextRestartAt.Sub(clock.Now()))
+			current := claimProcessStabilityService(t, store, node)
+			if _, err := store.StartAttempt(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID,
+				StartedRequest{FencingToken: current.Lease.FencingToken}); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 8; i++ {
+				if _, err := store.RenewLease(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, current.Lease.FencingToken); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.HeartbeatNode(t.Context(), "stability-agent", node.NodeID, node.BootSessionID); err != nil {
+					t.Fatal(err)
+				}
+				clock.Advance(15 * time.Second)
+			}
+			registration := node.NodeRegistration
+			registration.BootSessionID = boot
+			registration.CapabilityObservedAt = clock.Now()
+			if _, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "stability-agent"}, registration, DefaultNodePolicy("stability"), true); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.RenewLease(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, current.Lease.FencingToken); errorCode(err) != contract.ErrorNodeSessionReplaced {
+				t.Fatalf("negative control: old renewal err=%v, want node_session_replaced", err)
+			}
+			result, err := store.Reconcile(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, err := store.GetJob(t.Context(), job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.RestartStreakResets != 0 || observed.RestartStreak != 1 || observed.HealthySinceAt != nil {
+				t.Fatalf("fenced registration counted as stable: resets=%d streak=%d health=%v, want 0/1/nil", result.RestartStreakResets, observed.RestartStreak, observed.HealthySinceAt)
+			}
+			if _, err := store.AppendLogs(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, AppendLogsRequest{
+				FencingToken: current.Lease.FencingToken,
+				Events:       []contract.LogEvent{logEvent(current.Lease.AttemptID, contract.LogStdout, 0, []byte("fenced output\n"))},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			observed, err = store.GetJob(t.Context(), job.JobID)
+			if err != nil || observed.HealthySinceAt != nil || observed.RestartStreak != 1 {
+				t.Fatalf("fenced logs restored health: job=%+v err=%v", observed, err)
+			}
+		})
+	}
+}
+
+func TestStaleNodeEvidenceMustNotStartServiceStability(t *testing.T) {
+	for _, evidence := range []string{"renewal", "started", "logs"} {
+		t.Run(evidence, func(t *testing.T) {
+			store, clock, node, job := newProcessStabilityStore(t)
+			first := claimProcessStabilityService(t, store, node)
+			queued := failProcessStabilityService(t, store, first)
+			clock.Advance(queued.NextRestartAt.Sub(clock.Now()))
+			current := claimProcessStabilityService(t, store, node)
+			renew := func() {
+				t.Helper()
+				if _, err := store.RenewLease(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, current.Lease.FencingToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			heartbeat := func() {
+				t.Helper()
+				if _, err := store.HeartbeatNode(t.Context(), "stability-agent", node.NodeID, node.BootSessionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			heartbeat()
+			for i := 0; i < 4; i++ {
+				clock.Advance(15 * time.Second)
+				renew()
+			}
+			result, err := store.Reconcile(t.Context())
+			if err != nil || result.StaleNodes != 1 {
+				t.Fatalf("stale reconciliation=%+v err=%v", result, err)
+			}
+			stale, err := store.GetJob(t.Context(), job.JobID)
+			if err != nil || stale.HealthySinceAt != nil {
+				t.Fatalf("stale service health=%v err=%v", stale.HealthySinceAt, err)
+			}
+			switch evidence {
+			case "renewal":
+				renew()
+			case "started":
+				if _, err := store.StartAttempt(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID,
+					StartedRequest{FencingToken: current.Lease.FencingToken}); err != nil {
+					t.Fatal(err)
+				}
+			case "logs":
+				if _, err := store.AppendLogs(t.Context(), "stability-agent", job.JobID, current.Lease.AttemptID, AppendLogsRequest{
+					FencingToken: current.Lease.FencingToken,
+					Events:       []contract.LogEvent{logEvent(current.Lease.AttemptID, contract.LogStdout, 0, []byte("stale output\n"))},
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stale, err = store.GetJob(t.Context(), job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stale.HealthySinceAt != nil {
+				t.Errorf("%s on stale node restored health at %v", evidence, stale.HealthySinceAt)
+			}
+			clock.Advance(15 * time.Second)
+			renew() // Still stale; heartbeat alone restores liveness.
+			heartbeat()
+			aliveAt := clock.Now()
+			renew()
+			for i := 0; i < 7; i++ {
+				clock.Advance(15 * time.Second)
+				renew()
+				heartbeat()
+			}
+			result, err = store.Reconcile(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, err := store.GetJob(t.Context(), job.JobID)
+			if err != nil || result.RestartStreakResets != 0 || observed.RestartStreak != 1 ||
+				observed.HealthySinceAt == nil || !observed.HealthySinceAt.Equal(aliveAt) {
+				t.Fatalf("suppressed stale time counted toward stability: result=%+v job=%+v recovered=%v err=%v", result, observed, aliveAt, err)
+			}
+			clock.Advance(15 * time.Second)
+			renew()
+			heartbeat()
+			result, err = store.Reconcile(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed, err = store.GetJob(t.Context(), job.JobID)
+			if err != nil || result.RestartStreakResets != 1 || observed.RestartStreak != 0 {
+				t.Fatalf("recovered service did not earn stability: result=%+v job=%+v err=%v", result, observed, err)
+			}
+		})
 	}
 }
