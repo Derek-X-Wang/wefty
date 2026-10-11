@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -49,29 +48,6 @@ func snapshotTerminalRun(t *testing.T, store *Store, runID string) terminalRunSn
 		t.Fatal(err)
 	}
 	return snapshot
-}
-
-// recordOutboxOnlyAcknowledgement writes the state an L3 from before
-// completeDispatch linked ended runs left behind: L1's acknowledgement in the
-// outbox, and a terminal run with no l1_job_id. Recovery must still link or
-// settle these historical rows.
-func recordOutboxOnlyAcknowledgement(t *testing.T, store *Store, runID, jobID string) {
-	t.Helper()
-	if _, err := store.db.Exec(`UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`,
-		jobID, store.clock.Now().UnixNano(), runID); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// ageDispatchAttemptPastSettleHorizon moves the run's last submit attempt
-// beyond the settle horizon, and clears any backoff, so the next pass may
-// settle an unacknowledged dispatch's absence.
-func ageDispatchAttemptPastSettleHorizon(t *testing.T, store *Store, runID string) {
-	t.Helper()
-	if _, err := store.db.Exec(`UPDATE runs SET dispatch_attempt_ns=dispatch_attempt_ns-?, job_link_retry_ns=0 WHERE run_id=?`,
-		int64(unrecordedDispatchSettleHorizon+time.Minute), runID); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func failRunAfterDispatchAttempt(t *testing.T, store *Store, runID string) {
@@ -247,11 +223,7 @@ func TestRunEndedDuringItsInFlightSubmitIsLinked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var outboxJob string
-	var dispatched sql.NullInt64
-	if err := h.l3Store.db.QueryRow(`SELECT job_id,dispatched_ns FROM dispatch_outbox WHERE run_id=?`, run.RunID).Scan(&outboxJob, &dispatched); err != nil {
-		t.Fatal(err)
-	}
+	outboxJob, dispatched := snapshotDispatchAcknowledgement(t, h.l3Store, run.RunID)
 	record, err := h.l3Store.GetRun(ctx, run.RunID)
 	if err != nil {
 		t.Fatal(err)
@@ -347,23 +319,7 @@ func (c *failRunAfterSubmitClient) SubmitJob(ctx context.Context, spec contract.
 
 func TestUnrecordedDispatchesUseThePartialIndex(t *testing.T) {
 	store, _, _ := recoveryStore(t)
-	rows, err := store.db.Query(`EXPLAIN QUERY PLAN `+unrecordedDispatchesQuery, int64(0), unrecordedDispatchBatch)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	var plan []string
-	for rows.Next() {
-		var id, parent, unused int
-		var detail string
-		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
-			t.Fatal(err)
-		}
-		plan = append(plan, detail)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
+	plan := recoveryQueryPlan(t, store)
 	// The index must answer the eligibility predicate, the retry filter and
 	// the order on its own: a backed-off backlog is otherwise walked, and
 	// sorted, every pass even when no row is due.

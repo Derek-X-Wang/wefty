@@ -1,6 +1,8 @@
 package l3
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"testing"
 	"time"
@@ -188,4 +190,135 @@ func legacyMigrationFault(t *testing.T, s *Store, phase string, enabled bool) {
 	default:
 		t.Fatalf("unknown interruption %q", phase)
 	}
+}
+
+// recordOutboxOnlyAcknowledgement writes the state an L3 from before
+// completeDispatch linked ended runs left behind: L1's acknowledgement in the
+// outbox, and a terminal run with no l1_job_id. Recovery must still link or
+// settle these historical rows.
+func recordOutboxOnlyAcknowledgement(t *testing.T, store *Store, runID, jobID string) {
+	t.Helper()
+	if _, err := store.db.Exec(`UPDATE dispatch_outbox SET job_id=?, dispatched_ns=?, last_error=NULL, token_delivery=NULL WHERE run_id=? AND dispatched_ns IS NULL`,
+		jobID, store.clock.Now().UnixNano(), runID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// recordOutboxOnlyAcknowledgementKeepingError records only the acknowledgement,
+// leaving the stale retryable diagnostic for recovery's link to clear.
+func recordOutboxOnlyAcknowledgementKeepingError(ctx context.Context, store *Store, runID, jobID string) error {
+	_, err := store.db.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=?, dispatched_ns=? WHERE run_id=? AND dispatched_ns IS NULL`,
+		jobID, store.clock.Now().UnixNano(), runID)
+	return err
+}
+
+// ageDispatchAttemptPastSettleHorizon moves the run's last submit attempt
+// beyond the settle horizon, and clears any backoff, so the next pass may
+// settle an unacknowledged dispatch's absence.
+func ageDispatchAttemptPastSettleHorizon(t *testing.T, store *Store, runID string) {
+	t.Helper()
+	if _, err := store.db.Exec(`UPDATE runs SET dispatch_attempt_ns=dispatch_attempt_ns-?, job_link_retry_ns=0 WHERE run_id=?`,
+		int64(unrecordedDispatchSettleHorizon+time.Minute), runID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func jobLinkBackoff(t *testing.T, s *Store, dispatchKey string) (int, time.Time) {
+	t.Helper()
+	var failures int
+	var retryNS int64
+	if err := s.db.QueryRow(`SELECT job_link_failures, job_link_retry_ns FROM runs WHERE dispatch_key=?`, dispatchKey).Scan(&failures, &retryNS); err != nil {
+		t.Fatal(err)
+	}
+	return failures, time.Unix(0, retryNS).UTC()
+}
+
+func jobLinkSettled(t *testing.T, s *Store, runID string) bool {
+	t.Helper()
+	var settled int
+	if err := s.db.QueryRow(`SELECT job_link_settled FROM runs WHERE run_id=?`, runID).Scan(&settled); err != nil {
+		t.Fatal(err)
+	}
+	return settled == 1
+}
+
+// Recovery fixtures preserve the rest of the captured link while modeling
+// old or corrupt ledgers and concurrent newer verdicts. Other recovery tests
+// drive the production transitions.
+func recordRecoveryRegression(ctx context.Context, s *Store, runID, jobID, message string) error {
+	payload, err := json.Marshal(contract.APIError{Code: contract.ErrorNotFound, Message: message, Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": jobID}})
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=?`, string(payload), runID)
+	return err
+}
+
+func corruptRecoveryOutboxKey(t *testing.T, s *Store, runID, key string) {
+	t.Helper()
+	migrationFixtureSQL(t, s, `UPDATE dispatch_outbox SET dispatch_key=? WHERE run_id=?`, key, runID)
+}
+
+func recoveryAttemptTimes(t *testing.T, s *Store, key string) (sql.NullInt64, int64) {
+	t.Helper()
+	var attempt sql.NullInt64
+	var finished int64
+	if err := s.db.QueryRow(`SELECT dispatch_attempt_ns, finished_ns FROM runs WHERE dispatch_key=?`, key).Scan(&attempt, &finished); err != nil {
+		t.Fatal(err)
+	}
+	return attempt, finished
+}
+
+func recoveryRunAttemptTime(t *testing.T, s *Store, runID string) sql.NullInt64 {
+	t.Helper()
+	var attempt sql.NullInt64
+	if err := s.db.QueryRow(`SELECT dispatch_attempt_ns FROM runs WHERE run_id=?`, runID).Scan(&attempt); err != nil {
+		t.Fatal(err)
+	}
+	return attempt
+}
+
+func snapshotDispatchAcknowledgement(t *testing.T, s *Store, runID string) (string, sql.NullInt64) {
+	t.Helper()
+	var job string
+	var dispatched sql.NullInt64
+	if err := s.db.QueryRow(`SELECT job_id,dispatched_ns FROM dispatch_outbox WHERE run_id=?`, runID).Scan(&job, &dispatched); err != nil {
+		t.Fatal(err)
+	}
+	return job, dispatched
+}
+
+// Query-plan inspection is a storage-level exception: recovery must walk the
+// due prefix of its partial index rather than scan and sort the entire backlog.
+func recoveryQueryPlan(t *testing.T, s *Store) []string {
+	t.Helper()
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+unrecordedDispatchesQuery, int64(0), unrecordedDispatchBatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan = append(plan, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func removeRecoveryAttemptColumn(t *testing.T, s *Store) {
+	t.Helper()
+	migrationFixtureSQL(t, s, `DROP INDEX runs_job_link_recovery`)
+	migrationFixtureSQL(t, s, `ALTER TABLE runs DROP COLUMN dispatch_attempt_ns`)
+}
+
+func clearRecoveryAttemptTimes(t *testing.T, s *Store) {
+	t.Helper()
+	migrationFixtureSQL(t, s, `UPDATE runs SET dispatch_attempt_ns=NULL`)
 }

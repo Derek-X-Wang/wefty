@@ -278,28 +278,3 @@ func (r *Reconciler) projectObservedJob(ctx context.Context, run projectedRun, j
 	}
 	return r.store.projectJobOutcome(ctx, run, job.State, reason)
 }
-
-// linkRecoveredDispatch preserves discoveries when cancellation took ownership
-// during L1's read. The recovery write is fenced; the cancel-owned write links
-// and durably wakes delivery, even if the remaining remote budget is spent.
-func (r *Reconciler) linkRecoveredDispatch(ctx, remote context.Context, item unrecordedDispatch, jobID string, observed *dispatchObservation) error {
-	if err := r.store.linkUnrecordedDispatch(ctx, item, jobID); err != nil {
-		return err
-	}
-	if err := r.store.acceptRecoveredCancellation(ctx, item, jobID, observed); err != nil {
-		return err
-	}
-	cancellations, err := r.store.pendingRunCancellations(ctx, item.RunID)
-	if err != nil {
-		return err
-	}
-	for _, cancellation := range cancellations {
-		if remote.Err() != nil {
-			break
-		}
-		if err := r.deliverRunCancellation(ctx, remote, cancellation); err != nil {
-			return err
-		}
-	}
-	return nil
-}

@@ -6,15 +6,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 // Run job link owns dispatch creation and attempts, token staging and cleanup,
-// confirmation, terminal association and cancel ownership. L1 observations are
-// obtained before these short ledger writes. Migration and its resumable validation live here too; adoption of ordinary
-// recovery, active regression and readers continues in #781–#784.
+// confirmation, terminal recovery and cancel ownership. L1 observations are
+// obtained before short ledger writes that recheck ownership and identity.
+// Migration and its resumable validation live here too; adoption of active
+// regression and readers continues in #782–#784.
 
 // completeDispatch records L1's acknowledgement. A run that ended while its
 // submit was in flight is linked here too, keeping its terminal state: the
@@ -1038,4 +1040,418 @@ func (s *Store) pendingMigratedLinkValidation(ctx context.Context, runID string)
  JOIN runs r ON r.run_id=v.run_id JOIN dispatch_outbox o ON o.run_id=r.run_id
  WHERE v.run_id=? AND (`+migratedLinkOwnership+`))`, runID).Scan(&pending)
 	return pending, err
+}
+
+// unrecordedDispatch is a terminal run for which at least one dispatch began
+// but L3 never recorded the L1 job association.
+type unrecordedDispatch struct {
+	RunID, DispatchKey, OutboxJobID string
+	observed                        dispatchObservation
+}
+
+// unrecordedDispatchesQuery repeats the partial-index predicate literally so
+// SQLite walks only the due prefix of runs_job_link_recovery, in index order:
+// rows never backed off first, oldest first, then backed-off rows as they
+// come due. CROSS JOIN keeps runs the outer loop so LIMIT stops the walk.
+const unrecordedDispatchesQuery = `SELECT r.run_id, r.dispatch_key, COALESCE(o.job_id, ''), ` + dispatchObservationColumns + `
+FROM runs r INDEXED BY runs_job_link_recovery CROSS JOIN dispatch_outbox o ON o.run_id=r.run_id
+WHERE r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN ('succeeded','failed') AND r.dispatch_attempt_ns IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)
+  AND r.job_link_retry_ns<=?
+ORDER BY r.job_link_retry_ns, r.created_ns, r.run_id
+LIMIT ?`
+
+const (
+	// unrecordedDispatchBatch bounds the rows one recovery pass reads.
+	unrecordedDispatchBatch = 16
+	// A row whose L1 reads failed transiently waits unrecordedDispatchRetryBase,
+	// doubling per consecutive failure up to unrecordedDispatchRetryCap.
+	unrecordedDispatchRetryBase = 30 * time.Second
+	unrecordedDispatchRetryCap  = 30 * time.Minute
+	// unrecordedDispatchSettleHorizon is how long after the run's last submit
+	// attempt a dispatch-key absence stays provisional. L1 may commit a submit
+	// after recovery first asks, with the response lost; only an absence at
+	// or after the horizon settles the run.
+	unrecordedDispatchSettleHorizon = time.Hour
+)
+
+func (s *Store) unrecordedDispatches(ctx context.Context, limit int) ([]unrecordedDispatch, error) {
+	now := canonicalTime(s.clock.Now())
+	rows, err := s.db.QueryContext(ctx, unrecordedDispatchesQuery, now.UnixNano(), limit)
+	if err != nil {
+		return nil, internalError(err, "list unrecorded dispatches")
+	}
+	defer rows.Close()
+	var pending []unrecordedDispatch
+	for rows.Next() {
+		var item unrecordedDispatch
+		if err := scanUnrecordedDispatch(rows, &item); err != nil {
+			return nil, internalError(err, "scan unrecorded dispatch")
+		}
+		pending = append(pending, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate unrecorded dispatches")
+	}
+	return pending, nil
+}
+
+// deferUnrecordedDispatch backs one row off after a transient L1 failure.
+func (s *Store) deferUnrecordedDispatch(ctx context.Context, runID string) error {
+	now := canonicalTime(s.clock.Now())
+	var failures int
+	if err := s.db.QueryRowContext(ctx, `SELECT job_link_failures FROM runs WHERE run_id=?`, runID).Scan(&failures); err != nil {
+		return internalError(err, "read unrecorded dispatch failures")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET job_link_failures=job_link_failures+1, job_link_retry_ns=?
+WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND job_link_failures=?
+ AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=runs.run_id)`,
+		now.Add(unrecordedDispatchBackoff(failures)).UnixNano(), runID, failures)
+	if err != nil {
+		return internalError(err, "defer unrecorded dispatch")
+	}
+	return nil
+}
+
+// unrecordedDispatchBackoff is the wait after failures earlier consecutive
+// transient failures plus this one.
+func unrecordedDispatchBackoff(failures int) time.Duration {
+	delay := unrecordedDispatchRetryBase
+	for i := 0; i < failures && delay < unrecordedDispatchRetryCap; i++ {
+		delay *= 2
+	}
+	return min(delay, unrecordedDispatchRetryCap)
+}
+
+// recoveryNow is the ledger clock reading recovery stamps on an L1 read before
+// sending it.
+func (s *Store) recoveryNow() time.Time { return canonicalTime(s.clock.Now()) }
+
+// unrecordedDispatchFor rereads one run's recovery state after a settlement
+// compare-and-set missed. It reports false once the run is no longer waiting.
+func (s *Store) unrecordedDispatchFor(ctx context.Context, runID string) (unrecordedDispatch, bool, error) {
+	return unrecordedDispatchForTx(ctx, s.db, runID)
+}
+
+type rowQuerier interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+// scanUnrecordedDispatch captures the verdict in the same read that selects or
+// rereads recovery's dispatch, before any L1 lookup can begin.
+func scanUnrecordedDispatch(row interface{ Scan(...any) error }, item *unrecordedDispatch) error {
+	observed := &item.observed
+	return row.Scan(&item.RunID, &item.DispatchKey, &item.OutboxJobID,
+		&observed.outboxJob, &observed.runJob, &observed.lastError, &observed.dispatched,
+		&observed.settled, &observed.state, &observed.reason, &observed.diagnosticJob, &observed.attempted)
+}
+
+func unrecordedDispatchForTx(ctx context.Context, db rowQuerier, runID string) (unrecordedDispatch, bool, error) {
+	item := unrecordedDispatch{RunID: runID}
+	row := db.QueryRowContext(ctx, `SELECT r.run_id, r.dispatch_key, COALESCE(o.job_id, ''), `+dispatchObservationColumns+`
+FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+WHERE r.run_id=? AND r.l1_job_id IS NULL AND r.job_link_settled=0 AND r.status IN (?, ?) AND r.dispatch_attempt_ns IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)`,
+		runID, contract.RunSucceeded, contract.RunFailed)
+	err := scanUnrecordedDispatch(row, &item)
+	if errors.Is(err, sql.ErrNoRows) {
+		return unrecordedDispatch{}, false, nil
+	}
+	if err != nil {
+		return unrecordedDispatch{}, false, internalError(err, "reread unrecorded dispatch")
+	}
+	return item, true, nil
+}
+
+var errRecoveredDispatchIdentityConflict = errors.New("recovered dispatch conflicts with recorded identity")
+
+type settleOutcome int
+
+const (
+	settled settleOutcome = iota
+	// settleChanged: the row changed since it was read; reread it.
+	settleChanged
+	// settleNotDue: an unacknowledged dispatch's absence is still inside the
+	// settle horizon; ask again after the backoff.
+	settleNotDue
+)
+
+// settleUnrecordedDispatch records one authoritative absence and stops future
+// lookups without changing the already-terminal run. It settles nothing when
+// the row changed since item was read, or when the dispatch was never
+// acknowledged and lookupStarted, the time the absent answer was asked for,
+// is earlier than the settle horizon after the run's last submit attempt. A
+// lookup in flight across the horizon may have missed a submit L1 committed
+// meanwhile, so the answer counts from when it was asked, not received.
+func (s *Store) settleUnrecordedDispatch(ctx context.Context, item unrecordedDispatch, lookupStarted time.Time) (settleOutcome, error) {
+	horizon := canonicalTime(lookupStarted).Add(-unrecordedDispatchSettleHorizon)
+	cause := contract.APIError{
+		Code: contract.ErrorNotFound, Message: "L1 did not find the attempted dispatch; work was not replayed",
+		Details: map[string]any{"reason": dispatchNotFoundReason, "dispatch_key": item.DispatchKey},
+	}
+	if item.OutboxJobID != "" {
+		cause = contract.APIError{
+			Code: contract.ErrorNotFound, Message: "L1 regressed: previously dispatched job is absent; work was not replayed",
+			Details: map[string]any{"reason": l1RegressedReason, "l1_job_id": item.OutboxJobID},
+		}
+	}
+	payload, err := json.Marshal(cause)
+	if err != nil {
+		return settled, internalError(err, "encode unrecorded dispatch settlement")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return settled, internalError(err, "begin unrecorded dispatch settlement")
+	}
+	defer tx.Rollback()
+	// Compare-and-set on the acknowledgement recovery read before its L1
+	// reads: one recorded since then is L1's own answer, which the caller
+	// links instead of settling over it. An acknowledged job's absence by ID
+	// settles at once; L1 committed it before acknowledging it.
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET job_link_settled=1
+WHERE run_id=? AND l1_job_id IS NULL AND job_link_settled=0 AND status IN (?, ?)
+  AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=runs.run_id)
+  AND dispatch_key=?
+  AND (SELECT COALESCE(o.job_id, '') FROM dispatch_outbox o WHERE o.run_id=runs.run_id)=?
+  AND (?<>'' OR dispatch_attempt_ns<=?)`,
+		item.RunID, contract.RunSucceeded, contract.RunFailed, item.DispatchKey, item.OutboxJobID, item.OutboxJobID, horizon.UnixNano())
+	if err != nil {
+		return settled, internalError(err, "settle unrecorded dispatch")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return settled, internalError(err, "read unrecorded dispatch settlement result")
+	}
+	if changed == 0 {
+		current, waiting, err := unrecordedDispatchForTx(ctx, tx, item.RunID)
+		if err != nil {
+			return settled, err
+		}
+		if waiting && current == item {
+			return settleNotDue, nil
+		}
+		return settleChanged, nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET
+  last_error=CASE WHEN last_error IS NULL OR json_extract(last_error, '$.retryable')=1 THEN ? ELSE last_error END,
+  token_delivery=NULL
+WHERE run_id=?`, string(payload), item.RunID); err != nil {
+		return settled, internalError(err, "record unrecorded dispatch settlement")
+	}
+	if err := tx.Commit(); err != nil {
+		return settled, internalError(err, "commit unrecorded dispatch settlement")
+	}
+	return settled, nil
+}
+
+// recoverUnrecordedDispatches links terminal runs by read-only L1 reads only.
+// Replaying SubmitJob is impossible after #52 cleared the staged bearer, and
+// unsafe when L1 has regressed because it could recreate side effects for an
+// ended run.
+//
+// Each pass reads a bounded batch of the rows that are due, inside its budget,
+// and stops starting L1 reads once that budget is spent. A row whose L1 reads
+// fail transiently or reveal conflicting recorded identities, including one
+// the budget cut short, backs off
+// exponentially, so an unavailable L1 costs one budget per pass at most and
+// later rows still get their turn.
+func (r *Reconciler) recoverUnrecordedDispatches(ctx context.Context) []error {
+	remote, cancel := context.WithTimeout(ctx, r.budget)
+	defer cancel()
+	return r.recoverUnrecordedDispatchesRemote(ctx, remote)
+}
+
+func (r *Reconciler) recoverUnrecordedDispatchesRemote(ctx, remote context.Context) []error {
+	// Validation gets at most half the remaining budget. A slow migrated Job
+	// must leave time for ordinary terminal dispatch recovery in this pass.
+	validationBudget := r.budget / 2
+	if deadline, ok := remote.Deadline(); ok {
+		validationBudget = time.Until(deadline) / 2
+	}
+	validationRemote, cancel := context.WithTimeout(remote, validationBudget)
+	passErrors := r.validateMigratedLinks(ctx, validationRemote)
+	cancel()
+	if r.lookup == nil || remote.Err() != nil {
+		return passErrors
+	}
+	pending, err := r.store.unrecordedDispatches(remote, unrecordedDispatchBatch)
+	if err != nil {
+		return append(passErrors, err)
+	}
+	for _, item := range pending {
+		if remote.Err() != nil {
+			break
+		}
+		if err := r.recoverUnrecordedDispatch(ctx, remote, item); err != nil {
+			passErrors = append(passErrors, err)
+		}
+	}
+	return passErrors
+}
+
+type recoveryOutcome int
+
+const (
+	recoveryDone recoveryOutcome = iota
+	// recoveryTransient is a remote failure or identity conflict: back the row off.
+	recoveryTransient
+	// recoveryStale is a settlement compare-and-set miss: reread the row.
+	recoveryStale
+	// recoveryNotDue is an unacknowledged dispatch's absence inside the
+	// settle horizon: not an error yet, but asked again only after the
+	// backoff, the same as a transient failure.
+	recoveryNotDue
+)
+
+// maxRecoveryRereads bounds how often one row is reread after its settlement
+// compare-and-set missed. An acknowledgement or cancellation ownership may
+// have landed; a row still contended after that is left for the next pass.
+const maxRecoveryRereads = 2
+
+// recoverUnrecordedDispatch resolves one row. L1 reads use remote, bounded by
+// the pass budget; ledger writes use ctx so a spent budget cannot drop them.
+func (r *Reconciler) recoverUnrecordedDispatch(ctx, remote context.Context, item unrecordedDispatch) error {
+	for rereads := 0; ; rereads++ {
+		outcome, err := r.resolveUnrecordedDispatch(ctx, remote, item)
+		switch {
+		case outcome == recoveryTransient || outcome == recoveryNotDue:
+			if ctx.Err() == nil {
+				if deferErr := r.store.deferUnrecordedDispatch(ctx, item.RunID); deferErr != nil {
+					err = errors.Join(err, deferErr)
+				}
+			}
+			return err
+		case outcome != recoveryStale || rereads == maxRecoveryRereads:
+			return err
+		}
+		next, waiting, err := r.store.unrecordedDispatchFor(ctx, item.RunID)
+		if err != nil || !waiting {
+			return err
+		}
+		item = next
+	}
+}
+
+// recoveredDispatchOutcome backs off corrupt identities without treating an
+// unrelated ledger failure as a remote outage. Cancellation ownership still
+// fences the recovery backoff write.
+func recoveredDispatchOutcome(err error) (recoveryOutcome, error) {
+	if errors.Is(err, errRecoveredDispatchIdentityConflict) {
+		return recoveryTransient, err
+	}
+	return recoveryDone, err
+}
+
+// resolveUnrecordedDispatch links or settles one row from what L1 answers.
+// It reports stale when the settlement compare-and-set found the row changed
+// since it was read, so the caller rereads it rather than settle over an
+// acknowledgement or cancellation ownership that arrived meanwhile. It reports
+// not due when an unacknowledged dispatch's absence is still inside the
+// settle horizon.
+func (r *Reconciler) resolveUnrecordedDispatch(ctx, remote context.Context, item unrecordedDispatch) (recoveryOutcome, error) {
+	lookupStarted := r.store.recoveryNow()
+	job, err := r.lookup.LookupJobByDispatchKey(remote, item.DispatchKey)
+	var absence error
+	switch {
+	case err == nil && (item.OutboxJobID == "" || job.JobID == item.OutboxJobID):
+		return recoveredDispatchOutcome(r.linkRecoveredDispatch(ctx, remote, item, job.JobID, &item.observed))
+	case err == nil:
+		absence = fmt.Errorf("L1 dispatch %q resolved to job %q, not acknowledged job %q", item.DispatchKey, job.JobID, item.OutboxJobID)
+	case isMissingDispatch(err, item.DispatchKey):
+		absence = err
+	default:
+		return recoveryTransient, r.store.observeL1Error(ctx, err)
+	}
+	if item.OutboxJobID != "" {
+		// L1 acknowledged this job, so only its authoritative absence by ID
+		// is a regression, the same evidence failMissingL1Job requires. The
+		// scoped lookup cannot see a job L1 stored before it recorded
+		// run-ledger provenance, and that job is still this run's to link.
+		_, err := r.jobs.GetJob(remote, item.OutboxJobID)
+		if err == nil {
+			return recoveredDispatchOutcome(r.linkRecoveredDispatch(ctx, remote, item, item.OutboxJobID, &item.observed))
+		}
+		if !isMissingL1Job(err, item.OutboxJobID) {
+			return recoveryTransient, errors.Join(absence, r.store.observeL1Error(ctx, err))
+		}
+		absence = errors.Join(absence, err)
+	}
+	outcome, storeErr := r.store.settleUnrecordedDispatch(ctx, item, lookupStarted)
+	switch {
+	case storeErr != nil:
+		return recoveryDone, errors.Join(absence, storeErr)
+	case outcome == settleChanged:
+		return recoveryStale, nil
+	case outcome == settleNotDue:
+		return recoveryNotDue, nil
+	}
+	return recoveryDone, absence
+}
+
+// linkRecoveredDispatch preserves discoveries when cancellation took ownership
+// during L1's read. The recovery write is fenced; the cancel-owned write links
+// and durably wakes delivery, even if the remaining remote budget is spent.
+func (r *Reconciler) linkRecoveredDispatch(ctx, remote context.Context, item unrecordedDispatch, jobID string, observed *dispatchObservation) error {
+	if err := r.store.linkUnrecordedDispatch(ctx, item, jobID); err != nil {
+		return err
+	}
+	if err := r.store.acceptRecoveredCancellation(ctx, item, jobID, observed); err != nil {
+		return err
+	}
+	cancellations, err := r.store.pendingRunCancellations(ctx, item.RunID)
+	if err != nil {
+		return err
+	}
+	for _, cancellation := range cancellations {
+		if remote.Err() != nil {
+			break
+		}
+		if err := r.deliverRunCancellation(ctx, remote, cancellation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateMigratedLinks uses acknowledged Job identity, including old Jobs
+// without dispatch-key provenance. All network calls precede ledger writes.
+func (r *Reconciler) validateMigratedLinks(ctx, remote context.Context) []error {
+	if remote.Err() != nil {
+		return nil
+	}
+	pending, err := r.store.migratedLinkValidations(remote)
+	if err != nil {
+		return []error{err}
+	}
+	var passErrors []error
+	for _, item := range pending {
+		if remote.Err() != nil {
+			break
+		}
+		if !item.owned {
+			if _, err := r.store.completeMigratedLinkValidation(ctx, item, migratedLinkRetired); err != nil {
+				passErrors = append(passErrors, err)
+			}
+			continue
+		}
+		job, readErr := r.jobs.GetJob(remote, item.jobID)
+		verdict := migratedLinkFound
+		switch {
+		case isMissingL1Job(readErr, item.jobID):
+			verdict = migratedLinkAbsent
+		case readErr != nil:
+			verdict = migratedLinkRetry
+		case job.JobID != item.jobID:
+			verdict = migratedLinkRetry
+			readErr = fmt.Errorf("L1 validation returned Job %q for %q", job.JobID, item.jobID)
+		}
+		completed, err := r.store.completeMigratedLinkValidation(ctx, item, verdict)
+		if err != nil {
+			passErrors = append(passErrors, err)
+		}
+		if readErr != nil && (verdict != migratedLinkAbsent || completed) {
+			passErrors = append(passErrors, r.store.observeL1Error(ctx, readErr))
+		}
+	}
+	return passErrors
 }

@@ -37,15 +37,6 @@ func runIDForDispatchKey(t *testing.T, s *Store, dispatchKey string) string {
 	return runID
 }
 
-func jobLinkSettled(t *testing.T, s *Store, runID string) bool {
-	t.Helper()
-	var settled int
-	if err := s.db.QueryRow(`SELECT job_link_settled FROM runs WHERE run_id=?`, runID).Scan(&settled); err != nil {
-		t.Fatal(err)
-	}
-	return settled == 1
-}
-
 // A not_found inside the settle horizon is not final: L1 may commit the
 // submit after the lookup, so the run is asked again after the backoff and is
 // linked once the job is visible.

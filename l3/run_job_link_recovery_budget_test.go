@@ -2,7 +2,6 @@ package l3
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"testing"
@@ -53,16 +52,6 @@ func endedUnrecordedRuns(t *testing.T, s *Store, clock *mutableClock, count int)
 		keys = append(keys, record.DispatchKey)
 	}
 	return keys
-}
-
-func jobLinkBackoff(t *testing.T, s *Store, dispatchKey string) (int, time.Time) {
-	t.Helper()
-	var failures int
-	var retryNS int64
-	if err := s.db.QueryRow(`SELECT job_link_failures, job_link_retry_ns FROM runs WHERE dispatch_key=?`, dispatchKey).Scan(&failures, &retryNS); err != nil {
-		t.Fatal(err)
-	}
-	return failures, time.Unix(0, retryNS).UTC()
 }
 
 // An L1 that hangs costs one recovery budget per pass, not a timeout per
@@ -166,12 +155,7 @@ func TestOpeningAnOlderLedgerBackfillsDispatchAttemptTime(t *testing.T) {
 	s, path, clock := recoveryStore(t)
 	keys := endedUnrecordedRuns(t, s, clock, 1)
 	ctx := context.Background()
-	if _, err := s.db.ExecContext(ctx, `DROP INDEX runs_job_link_recovery`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.db.ExecContext(ctx, `ALTER TABLE runs DROP COLUMN dispatch_attempt_ns`); err != nil {
-		t.Fatal(err)
-	}
+	removeRecoveryAttemptColumn(t, s)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -180,12 +164,9 @@ func TestOpeningAnOlderLedgerBackfillsDispatchAttemptTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { reopened.Close() })
-	var attemptNS, finishedNS int64
-	if err := reopened.db.QueryRow(`SELECT dispatch_attempt_ns, finished_ns FROM runs WHERE dispatch_key=?`, keys[0]).Scan(&attemptNS, &finishedNS); err != nil {
-		t.Fatal(err)
-	}
-	if attemptNS != finishedNS {
-		t.Fatalf("backfilled attempt time = %d, want the run's finish %d", attemptNS, finishedNS)
+	attemptNS, finishedNS := recoveryAttemptTimes(t, reopened, keys[0])
+	if !attemptNS.Valid || attemptNS.Int64 != finishedNS {
+		t.Fatalf("backfilled attempt time = %v, want the run's finish %d", attemptNS, finishedNS)
 	}
 	pending, err := reopened.unrecordedDispatches(ctx, unrecordedDispatchBatch)
 	if err != nil || len(pending) != 1 || pending[0].DispatchKey != keys[0] {
@@ -205,13 +186,9 @@ func TestRunEndedBeforeAnyAttemptIsNotRecoveryEligible(t *testing.T) {
 	if err := s.rejectProtocolWrite(ctx, record.RunID, "envelope", "never-attempted", []byte(`{}`), "never-hash", "invalid envelope", errors.New("invalid envelope")); err != nil {
 		t.Fatal(err)
 	}
-	var indexed int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM runs INDEXED BY runs_job_link_recovery
-WHERE l1_job_id IS NULL AND job_link_settled=0 AND status IN ('succeeded','failed') AND dispatch_attempt_ns IS NOT NULL`).Scan(&indexed); err != nil {
-		t.Fatal(err)
-	}
-	if indexed != 0 {
-		t.Fatalf("never-attempted run is in the recovery index (%d rows)", indexed)
+	pending, err := s.unrecordedDispatches(ctx, unrecordedDispatchBatch)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("never-attempted run is recovery eligible: %+v %v", pending, err)
 	}
 }
 
@@ -229,9 +206,7 @@ func TestOpeningALedgerHealsMissingDispatchAttemptTimes(t *testing.T) {
 	if err := s.rejectProtocolWrite(ctx, never.RunID, "envelope", "heal-never", []byte(`{}`), "heal-hash", "invalid envelope", errors.New("invalid envelope")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET dispatch_attempt_ns=NULL`); err != nil {
-		t.Fatal(err)
-	}
+	clearRecoveryAttemptTimes(t, s)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -240,17 +215,11 @@ func TestOpeningALedgerHealsMissingDispatchAttemptTimes(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { reopened.Close() })
-	var attemptNS sql.NullInt64
-	var finishedNS int64
-	if err := reopened.db.QueryRow(`SELECT dispatch_attempt_ns, finished_ns FROM runs WHERE dispatch_key=?`, attempted).Scan(&attemptNS, &finishedNS); err != nil {
-		t.Fatal(err)
-	}
+	attemptNS, finishedNS := recoveryAttemptTimes(t, reopened, attempted)
 	if !attemptNS.Valid || attemptNS.Int64 != finishedNS {
 		t.Fatalf("healed attempt time = %v, want the run's finish %d", attemptNS, finishedNS)
 	}
-	if err := reopened.db.QueryRow(`SELECT dispatch_attempt_ns FROM runs WHERE run_id=?`, never.RunID).Scan(&attemptNS); err != nil {
-		t.Fatal(err)
-	}
+	attemptNS = recoveryRunAttemptTime(t, reopened, never.RunID)
 	if attemptNS.Valid {
 		t.Fatalf("never-attempted run was given an attempt time %d", attemptNS.Int64)
 	}
