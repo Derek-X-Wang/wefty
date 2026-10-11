@@ -2,6 +2,7 @@ package l3
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -10,9 +11,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-// Run job link owns confirmation, terminal association and cancel ownership.
-// L1 observations are obtained before these short ledger writes. Adoption of
-// dispatch, recovery, regression and readers continues in #779–#784.
+// Run job link owns dispatch creation and attempts, token staging and cleanup,
+// confirmation, terminal association and cancel ownership. L1 observations are
+// obtained before these short ledger writes. Adoption of migration, recovery,
+// regression and readers continues in #780–#784.
 
 // completeDispatch records L1's acknowledgement. A run that ended while its
 // submit was in flight is linked here too, keeping its terminal state: the
@@ -513,3 +515,311 @@ func (s *Store) writeCancellationBackoff(ctx context.Context, runID string, fail
 	}
 	return nil
 }
+
+// insertDispatchIntentTx creates the outbox entry in the same transaction as
+// its Run or rerun, so a committed Run always carries its stable dispatch key.
+func insertDispatchIntentTx(ctx context.Context, tx *sql.Tx, runID, dispatchKey string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO dispatch_outbox(run_id, dispatch_key) VALUES(?, ?)`, runID, dispatchKey)
+	return err
+}
+
+func (s *Store) ensureRunToken(ctx context.Context, runID string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", internalError(err, "begin run token mint")
+	}
+	defer tx.Rollback()
+	token, err := ensureRunTokenTx(ctx, tx, runID, canonicalTime(s.clock.Now()))
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", internalError(err, "commit run token mint")
+	}
+	return token, nil
+}
+
+// ensureRunTokenTx returns the bearer staged for the run's pending dispatch,
+// minting and staging one on the first attempt.
+func ensureRunTokenTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time) (string, error) {
+	var delivery sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT token_delivery FROM dispatch_outbox WHERE run_id=? AND dispatched_ns IS NULL`, runID).Scan(&delivery)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", protocolError(contract.ErrorConflict, "run %q has no pending dispatch", runID)
+	}
+	if err != nil {
+		return "", internalError(err, "read pending run token delivery")
+	}
+	if delivery.Valid && delivery.String != "" {
+		return delivery.String, nil
+	}
+	token := newToken()
+	digest := sha256.Sum256([]byte(token))
+	attemptID := newID("runattempt")
+	if _, err := tx.ExecContext(ctx, `INSERT INTO run_tokens(run_id, attempt_id, token_hash, minted_ns) VALUES(?, ?, ?, ?)`, runID, attemptID, digest[:], now.UnixNano()); err != nil {
+		return "", internalError(err, "store run token hash")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET token_delivery=? WHERE run_id=? AND dispatched_ns IS NULL`, token, runID); err != nil {
+		return "", internalError(err, "stage run token delivery")
+	}
+	return token, nil
+}
+
+// failRunTx fails a non-terminal run from the ledger side and records why.
+// The reason is written only by the transition that fails the run, so the
+// first cause is the one kept.
+//
+// The run's node attribution is cleared and marked pending when an L1 job
+// exists. The ledger cannot tell which node wrote the failing evidence -- a
+// run token names the run, not the L1 attempt -- and a node recorded while
+// the job was live may be one an earlier attempt failed on before it was
+// requeued. Once the job settles, the reconciler fills the node from the
+// attempt that settled it, from empty only (#604 review).
+func failRunTx(ctx context.Context, tx *sql.Tx, runID string, now time.Time, tokenGrace time.Duration, reason string) error {
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=?, failure_reason=?, updated_ns=?,
+  started_ns=COALESCE(started_ns, ?), finished_ns=COALESCE(finished_ns, ?),
+  node_id=CASE WHEN l1_job_id IS NULL THEN node_id ELSE NULL END,
+  node_attribution_pending=CASE WHEN l1_job_id IS NULL THEN 0 ELSE 1 END
+WHERE run_id=? AND status NOT IN (?, ?)`,
+		contract.RunFailed, nullableReason(reason), now.UnixNano(), now.UnixNano(), now.UnixNano(), runID, contract.RunSucceeded, contract.RunFailed)
+	if err != nil {
+		return internalError(err, "fail run protocol")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return internalError(err, "read protocol failure result")
+	}
+	if changed == 1 {
+		expires := canonicalTime(now.Add(tokenGrace))
+		if _, err := tx.ExecContext(ctx, `UPDATE run_tokens SET expires_ns=COALESCE(expires_ns, ?) WHERE run_id=?`, expires.UnixNano(), runID); err != nil {
+			return internalError(err, "expire protocol-failed run token")
+		}
+	}
+	return clearStagedTokenDelivery(ctx, tx, runID)
+}
+
+func clearDispatchRetry(ctx context.Context, tx *sql.Tx, runID string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM dispatch_retry WHERE run_id=?`, runID); err != nil {
+		return internalError(err, "clear dispatch retry")
+	}
+	return nil
+}
+
+// clearStagedTokenDelivery drops a terminal run's staged run-token bearer. A
+// terminal run is never dispatched again, so a bearer still staged for a
+// dispatch L3 never recorded -- L1 accepted the job, L3 crashed before
+// completeDispatch, and the run then ended -- would otherwise stay in the
+// outbox in plaintext forever (#52).
+func clearStagedTokenDelivery(ctx context.Context, tx *sql.Tx, runID string) error {
+	if err := clearDispatchRetry(ctx, tx, runID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET token_delivery=NULL WHERE run_id=? AND token_delivery IS NOT NULL`, runID); err != nil {
+		return internalError(err, "clear terminal run's staged token delivery")
+	}
+	return nil
+}
+
+func (s *Store) pendingDispatches(ctx context.Context) ([]dispatchIntent, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT r.run_id, r.dispatch_key, COALESCE(r.parent_run_id, ''),
+       CASE WHEN t.source='rerun' THEN t.source_run_id ELSE r.run_id END,
+       s.content, s.sha256, s.interpreter_json, s.mode, i.program_json, r.tags_json, r.limits_json,
+       r.params_json, r.dispatch_authority
+FROM dispatch_outbox o JOIN runs r ON r.run_id=o.run_id LEFT JOIN run_scripts s ON s.run_id=r.run_id
+LEFT JOIN run_images i ON i.run_id=r.run_id
+JOIN run_triggers t ON t.run_id=r.run_id
+WHERE o.dispatched_ns IS NULL AND r.status IN (?, ?)
+AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id)
+AND NOT EXISTS (SELECT 1 FROM dispatch_hold WHERE since_ns IS NOT NULL)
+AND NOT EXISTS (SELECT 1 FROM dispatch_retry d WHERE d.run_id=r.run_id AND d.retry_ns>?)
+ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching, s.recoveryNow().UnixNano())
+	if err != nil {
+		return nil, internalError(err, "list pending dispatches")
+	}
+	defer rows.Close()
+	var intents []dispatchIntent
+	for rows.Next() {
+		var intent dispatchIntent
+		var content, interpreterJSON, imageJSON, tagsJSON, limitsJSON, paramsJSON []byte
+		var sha sql.NullString
+		var mode sql.NullInt64
+		if err := rows.Scan(&intent.RunID, &intent.DispatchKey, &intent.ParentRunID, &intent.HandoffOwnerID, &content, &sha, &interpreterJSON, &mode, &imageJSON, &tagsJSON, &limitsJSON, &paramsJSON, &intent.DispatchAuthority); err != nil {
+			return nil, internalError(err, "scan pending dispatch")
+		}
+		if len(imageJSON) > 0 {
+			intent.Image = &contract.ImageProgram{}
+			if err := json.Unmarshal(imageJSON, intent.Image); err != nil {
+				return nil, internalError(err, "decode dispatch image program")
+			}
+		} else {
+			intent.Content = content
+			intent.SHA256 = sha.String
+			intent.Mode = uint32(mode.Int64)
+			if err := json.Unmarshal(interpreterJSON, &intent.Interpreter); err != nil {
+				return nil, internalError(err, "decode dispatch interpreter")
+			}
+		}
+		if err := json.Unmarshal(tagsJSON, &intent.Tags); err != nil {
+			return nil, internalError(err, "decode dispatch tags")
+		}
+		intent.Params = paramsJSON
+		if len(limitsJSON) > 0 {
+			intent.Limits = &contract.RunLimits{}
+			if err := json.Unmarshal(limitsJSON, intent.Limits); err != nil {
+				return nil, internalError(err, "decode dispatch limits")
+			}
+		}
+		intents = append(intents, intent)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate pending dispatches")
+	}
+	return intents, nil
+}
+
+// beginDispatch starts one submit attempt and returns the bearer it carries.
+// The run-status and cancellation guards, bearer hand-out and attempt count
+// share one transaction. A run that ends or is canceled after this commit,
+// while the submit is in flight, is linked by completeDispatch when L1
+// acknowledges the job, or by lookup recovery when it does not.
+func (s *Store) beginDispatch(ctx context.Context, runID string) (string, error) {
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", internalError(err, "begin dispatch attempt")
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE runs SET status=CASE WHEN status=? THEN ? ELSE status END, updated_ns=?, dispatch_attempt_ns=?
+WHERE run_id=? AND status IN (?, ?)
+AND NOT EXISTS (SELECT 1 FROM run_cancellations c WHERE c.run_id=runs.run_id)
+AND NOT EXISTS (SELECT 1 FROM dispatch_hold WHERE since_ns IS NOT NULL)
+AND NOT EXISTS (SELECT 1 FROM dispatch_retry d WHERE d.run_id=runs.run_id AND d.retry_ns>?)`,
+		contract.RunPending, contract.RunDispatching, now.UnixNano(), now.UnixNano(), runID, contract.RunPending, contract.RunDispatching, now.UnixNano())
+	if err != nil {
+		return "", internalError(err, "mark dispatch attempt")
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return "", internalError(err, "read dispatch attempt result")
+	}
+	if changed == 0 {
+		return "", errDispatchAbandoned
+	}
+	token, err := ensureRunTokenTx(ctx, tx, runID, now)
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET attempt_count=attempt_count+1, last_error=NULL WHERE run_id=? AND dispatched_ns IS NULL`, runID); err != nil {
+		return "", internalError(err, "increment dispatch attempt")
+	}
+	if err := tx.Commit(); err != nil {
+		return "", internalError(err, "commit dispatch attempt")
+	}
+	return token, nil
+}
+
+func (s *Store) recordDispatchError(ctx context.Context, runID string, dispatchErr error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin dispatch retry")
+	}
+	defer tx.Rollback()
+	payload, err := json.Marshal(apiErrorFrom(dispatchErr))
+	if err != nil {
+		return internalError(err, "encode dispatch error")
+	}
+	// A submit error that returns after recovery settled the run must not
+	// replace the settled diagnostic.
+	_, err = tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=? WHERE run_id=? AND dispatched_ns IS NULL
+  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.run_id=dispatch_outbox.run_id AND r.job_link_settled=1)`, string(payload), runID)
+	if err != nil {
+		return internalError(err, "record dispatch error")
+	}
+	var waiting bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE r.run_id=? AND r.status IN ('pending','dispatching') AND o.dispatched_ns IS NULL AND r.job_link_settled=0
+ AND NOT EXISTS(SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id))`, runID).Scan(&waiting); err != nil {
+		return internalError(err, "read dispatch retry eligibility")
+	}
+	if !waiting {
+		return tx.Commit()
+	}
+	var failures int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE((SELECT failures FROM dispatch_retry WHERE run_id=?),0)`, runID).Scan(&failures); err != nil {
+		return internalError(err, "read dispatch retries")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO dispatch_retry(run_id,failures,retry_ns) VALUES(?,?,?) ON CONFLICT(run_id) DO UPDATE SET failures=excluded.failures,retry_ns=excluded.retry_ns`, runID, failures+1, s.recoveryNow().Add(dispatchRetryBackoff(failures)).UnixNano()); err != nil {
+		return internalError(err, "schedule dispatch retry")
+	}
+	return tx.Commit()
+}
+
+func (s *Store) failDispatch(ctx context.Context, runID string, dispatchErr error) error {
+	now := canonicalTime(s.clock.Now())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return internalError(err, "begin permanent dispatch failure")
+	}
+	defer tx.Rollback()
+	payload, err := json.Marshal(apiErrorFrom(dispatchErr))
+	if err != nil {
+		return internalError(err, "encode permanent dispatch error")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=CASE
+    WHEN EXISTS (SELECT 1 FROM runs r WHERE r.run_id=dispatch_outbox.run_id AND r.job_link_settled=1) THEN last_error ELSE ? END,
+  token_delivery=NULL
+WHERE run_id=? AND dispatched_ns IS NULL`, string(payload), runID); err != nil {
+		return internalError(err, "record permanent dispatch error")
+	}
+	if err := failRunTx(ctx, tx, runID, now, s.tokenGrace, dispatchFailureReason(dispatchErr)); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return internalError(err, "commit permanent dispatch failure")
+	}
+	return nil
+}
+
+type dispatchIntent struct {
+	RunID          string
+	DispatchKey    string
+	ParentRunID    string
+	HandoffOwnerID string
+	// Params is the run's canonical parameter document. It reaches the job as
+	// a file in the run mailbox, written by the node agent, so a workload can
+	// read what it was submitted with while holding no credential.
+	Params []byte
+	// DispatchAuthority is the run's stored public declaration that its
+	// workload dispatches child work. Dispatch converts it into both wire
+	// labels — the positive dispatch_authority marker when it is true, the
+	// withhold_workload_credentials instruction when it is false — which the
+	// node agent reads alongside L1's own record of who submitted the job.
+	DispatchAuthority bool
+	Content           []byte
+	SHA256            string
+	Interpreter       []string
+	Mode              uint32
+	Image             *contract.ImageProgram
+	Tags              []string
+	Limits            *contract.RunLimits
+}
+
+func runDispatchHold(ctx context.Context, q holdReader, runID string) (*contract.DispatchHold, error) {
+	var waiting bool
+	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE r.run_id=? AND r.status IN ('pending','dispatching') AND o.dispatched_ns IS NULL
+ AND NOT EXISTS(SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id))`, runID).Scan(&waiting)
+	if err != nil {
+		return nil, internalError(err, "read dispatch wait")
+	}
+	if !waiting {
+		return nil, nil
+	}
+	return readDispatchHold(ctx, q)
+}
+
+// errDispatchAbandoned reports that a terminal transition or cancellation
+// request won, or admission/retry is deferred. The caller must not submit:
+// replay could create new work after the run ended or was told to stop.
+var errDispatchAbandoned = errors.New("l3: dispatch attempt abandoned")

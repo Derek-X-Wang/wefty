@@ -58,19 +58,6 @@ func readDispatchHold(ctx context.Context, q holdReader) (*contract.DispatchHold
 	h.NextProbeAt = time.Unix(0, next).UTC()
 	return &h, nil
 }
-func runDispatchHold(ctx context.Context, q holdReader, runID string) (*contract.DispatchHold, error) {
-	var waiting bool
-	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM runs r JOIN dispatch_outbox o ON o.run_id=r.run_id
- WHERE r.run_id=? AND r.status IN ('pending','dispatching') AND o.dispatched_ns IS NULL
- AND NOT EXISTS(SELECT 1 FROM run_cancellations c WHERE c.run_id=r.run_id))`, runID).Scan(&waiting)
-	if err != nil {
-		return nil, internalError(err, "read dispatch wait")
-	}
-	if !waiting {
-		return nil, nil
-	}
-	return readDispatchHold(ctx, q)
-}
 
 // Repeated refusals preserve onset and schedule without another write. Only an
 // in-flight probe needs a generation bump to fence its eventual success.

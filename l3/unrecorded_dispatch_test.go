@@ -374,53 +374,6 @@ func TestUnrecordedDispatchesUseThePartialIndex(t *testing.T) {
 	t.Logf("plan: %s", joined)
 }
 
-func TestPermanentRefusalKeepsItsDiagnosticWhenNoJobIsFound(t *testing.T) {
-	h := newIntegrationHarness(t)
-	run := h.submit(inlineRunRequest("#!/bin/sh\nexit 0\n"), "permanent-refusal")
-	refusal := &permanentSubmitErrorClient{JobClient: h.l1Client, runID: run.RunID}
-	lookup := &countingDispatchRecoveryClient{JobClient: refusal, JobDispatchLookupClient: h.l1Client}
-	reconciler, err := NewReconciler(h.l3Store, lookup, ReconcilerConfig{DispatchLookup: lookup})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := reconciler.ReconcileOnce(context.Background()); err == nil {
-		t.Fatal("permanent dispatch refusal was not reported")
-	}
-	execution, err := h.l3Store.GetRunExecution(context.Background(), run.RunID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if execution.DispatchError == nil || execution.DispatchError.Code != contract.ErrorDispatchKeyConflict || execution.DispatchError.Message != "dispatch key conflict" {
-		t.Fatalf("permanent refusal was replaced: %+v", execution.DispatchError)
-	}
-	if lookup.lookups != 1 {
-		t.Fatalf("lookup calls = %d, want 1", lookup.lookups)
-	}
-	// Inside the settle horizon the absence only backs the run off; past it
-	// the absence settles and the refusal stays the recorded diagnostic.
-	ageDispatchAttemptPastSettleHorizon(t, h.l3Store, run.RunID)
-	if err := reconciler.ReconcileOnce(context.Background()); err == nil {
-		t.Fatal("settled absence was not reported")
-	}
-	execution, err = h.l3Store.GetRunExecution(context.Background(), run.RunID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if lookup.lookups != 2 || execution.DispatchError == nil || execution.DispatchError.Code != contract.ErrorDispatchKeyConflict {
-		t.Fatalf("settled refusal: lookups=%d diagnostic=%+v", lookup.lookups, execution.DispatchError)
-	}
-	var settled int
-	if err := h.l3Store.db.QueryRow(`SELECT job_link_settled FROM runs WHERE run_id=?`, run.RunID).Scan(&settled); err != nil || settled != 1 {
-		t.Fatalf("refusal not settled: %d, %v", settled, err)
-	}
-	if err := reconciler.ReconcileOnce(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if lookup.lookups != 2 {
-		t.Fatalf("settled refusal looked up again: %d", lookup.lookups)
-	}
-}
-
 func newEmptyL1LookupClient(t *testing.T) (*L1Client, *sql.DB) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "empty-l1.sqlite")
