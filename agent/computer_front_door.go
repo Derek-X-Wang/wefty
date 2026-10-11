@@ -417,6 +417,12 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 	requestedRevision, revisionErr := strconv.ParseInt(request.Header.Get(contract.ComputerPolicyRevisionHeader), 10, 64)
 	installedRevision, stale := staleComputerAdmission(authorization, floorRevision, requestedRevision)
 	if revisionErr == nil && stale {
+		// A grant holder is only waiting for an install, so the retryable
+		// refusal is not a denial. Without a grant it still is: a caller could
+		// otherwise name any future revision and never leave denial evidence.
+		if authorization == nil {
+			frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
+		}
 		authorization.Release()
 		writeComputerControlError(writer, http.StatusForbidden, contract.APIError{
 			Code: contract.ErrorStalePolicyRevision, Message: "Computer policy revision is not installed at the hosting agent", Retryable: true,

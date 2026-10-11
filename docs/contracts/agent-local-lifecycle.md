@@ -771,10 +771,11 @@ when the older policy already grants view or control. The comparison uses the
 revision captured by the authorization decision when a grant exists, or a
 revision floor read before grant acquisition when no grant is returned. A
 concurrent policy install cannot conceal an older decision in either path;
-the no-grant floor can cause one extra retryable refusal. This retryable
-refusal is not recorded as a Take-over denial. A final, non-retryable
-`control_not_authorized` refusal still records `unauthorized_identity` denial
-evidence. Equal or newer installed
+the no-grant floor can cause one extra retryable refusal. When the requester
+holds a grant, this retryable refusal is only a wait for installation and is
+not recorded as a Take-over denial. Without a grant it still records
+`unauthorized_identity` denial evidence, whatever revision the request names,
+as does a final, non-retryable `control_not_authorized` refusal. Equal or newer installed
 policy still evaluates the current grant and always admits view first. A grant
 upgrade does not expand an existing session's admission authority; reconnect
 with the new discovery revision to obtain a control-capable session.

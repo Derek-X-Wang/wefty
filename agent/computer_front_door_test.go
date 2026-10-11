@@ -91,7 +91,7 @@ func TestComputerFrontDoorIdentityLookupAvailability(t *testing.T) {
 func TestComputerFrontDoorReturnsTypedStalePolicyRefusal(t *testing.T) {
 	for _, permission := range []l1.ComputerGrantPermission{l1.ComputerGrantNone, l1.ComputerGrantView, l1.ComputerGrantControl} {
 		t.Run(string(permission), func(t *testing.T) {
-			fixture, cache, auditor, _, server, _ := computerFrontDoorFixture(t, permission)
+			fixture, cache, auditor, _, server, identity := computerFrontDoorFixture(t, permission)
 			defer server.Close()
 			// Freeze policy delivery at revision 1 even though discovery names 2.
 			// An existing view or control grant must not bypass the revision floor.
@@ -117,10 +117,25 @@ func TestComputerFrontDoorReturnsTypedStalePolicyRefusal(t *testing.T) {
 				t.Fatalf("stale policy refusal retained %d authorizations", remaining)
 			}
 			fixture.frontDoor.denials.flush(t.Context())
-			if events := auditor.snapshot(); len(events) != 0 {
-				t.Fatalf("stale policy refusal recorded denial evidence: %#v", events)
-			}
+			assertStaleRefusalAudit(t, auditor.snapshot(), permission, identity)
 		})
+	}
+}
+
+// A grant holder's stale refusal is only "not yet" and leaves no denial. An
+// identity without a grant is still denied, whatever revision it names.
+func assertStaleRefusalAudit(t *testing.T, events []l1.ComputerTakeoverAuditEvent, permission l1.ComputerGrantPermission, identity fabric.Identity) {
+	t.Helper()
+	if permission != l1.ComputerGrantNone {
+		if len(events) != 0 {
+			t.Fatalf("grant holder's stale refusal recorded denial evidence: %#v", events)
+		}
+		return
+	}
+	if len(events) != 1 || events[0].Kind != l1.ComputerTakeoverAdmissionDenied ||
+		events[0].Reason != l1.ComputerTakeoverUnauthorizedIdentity || events[0].EventCount != 1 ||
+		events[0].FabricID != identity.FabricID || events[0].UserID != identity.UserID || events[0].DeviceID != identity.DeviceID {
+		t.Fatalf("no-grant stale refusal audit = %#v, want one unauthorized denial", events)
 	}
 }
 
@@ -186,9 +201,7 @@ func TestComputerFrontDoorConcurrentPolicyInstall(t *testing.T) {
 				t.Fatalf("concurrent install retained %d authorizations", remaining)
 			}
 			fixture.frontDoor.denials.flush(t.Context())
-			if events := auditor.snapshot(); len(events) != 0 {
-				t.Fatalf("concurrent install recorded denial evidence: %#v", events)
-			}
+			assertStaleRefusalAudit(t, auditor.snapshot(), permission, identity)
 		})
 	}
 }
