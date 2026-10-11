@@ -60,10 +60,7 @@ func TestAcknowledgementDuringRecoveryLookupLinksTheRun(t *testing.T) {
 			// A ledger written before completeDispatch linked terminal runs
 			// holds the acknowledgement in the outbox only.
 			name: "outbox-only acknowledgement",
-			ack: func(ctx context.Context, s *Store, runID, jobID string) error {
-				recordOutboxOnlyAcknowledgement(t, s, runID, jobID)
-				return nil
-			},
+			ack:  recordOutboxOnlyAcknowledgementKeepingError,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
