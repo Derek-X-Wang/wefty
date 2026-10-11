@@ -1,5 +1,13 @@
 [
   {
+    "file": "cancel.go",
+    "function": "*Store.deferRunCancellation",
+    "fingerprint": "d83e986242f083219d556eb25f5996b998f5542cf0c5f43fdf2129ee7a2ff5ab",
+    "count": 1,
+    "reason": "Delivery-only failure-count read filtered by Run; exact exception until cancellation delivery adoption. It does not arbitrate cancellation ownership.",
+    "retirement": "#780"
+  },
+  {
     "file": "cancel_followup_test.go",
     "function": "TestCancelContradictedStoredAcknowledgement",
     "fingerprint": "03f18b4e828ebc535b7720368b2849ebc7d951a367069ca2dfe66f7c765bb61f",
@@ -25,6 +33,14 @@
   },
   {
     "file": "cancel_followup_test.go",
+    "function": "TestCancelFollowupIdentityFailuresRetry",
+    "fingerprint": "051a0f2e119157ddd9d3c314980c3e0f38da73f01ee2e3ad9f27ac38989ba821",
+    "count": 1,
+    "reason": "Delivery-only fixture reads cancellation status, error or retry counters filtered by Run; exact exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
     "function": "TestCancelFollowupLegacyCompletedEvidence",
     "fingerprint": "ad252c8b5c2ce750d7cdd3f16da9ec40ae98fae7ac16b46d422ae475d5fa0088",
     "count": 1,
@@ -42,9 +58,25 @@
   {
     "file": "cancel_followup_test.go",
     "function": "TestCancelFollowupLegacyOutboxAcknowledgement",
+    "fingerprint": "65a6445e02916e2854a6a21e3f2664d2ba6765cc53baec988f89dedf3764e574",
+    "count": 1,
+    "reason": "Delivery-only fixture reads cancellation status, error or retry counters filtered by Run; exact exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelFollowupLegacyOutboxAcknowledgement",
     "fingerprint": "d9a70308ea3ae3a9fd8e57c8edd35c209d3d75e4026c56ccf11e9a2bc9d64687",
     "count": 1,
     "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_followup_test.go",
+    "function": "TestCancelFollowupRepeatResetsBackoff",
+    "fingerprint": "b03a7c620f2af9c9a7a40602864fdfc61167285eb1f248aac596e9e0873f3958",
+    "count": 1,
+    "reason": "Delivery-only fixture reads cancellation status, error or retry counters filtered by Run; exact exception through final test adoption.",
     "retirement": "#785"
   },
   {
@@ -74,9 +106,25 @@
   {
     "file": "cancel_review_test.go",
     "function": "TestCancelReviewPermanentRefusal",
+    "fingerprint": "011da7eeeddf7fcb77df2cf026e3a53865e928f6590655e90cdbd4d730744c14",
+    "count": 1,
+    "reason": "Delivery-only fixture reads cancellation status, error or retry counters filtered by Run; exact exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_review_test.go",
+    "function": "TestCancelReviewPermanentRefusal",
     "fingerprint": "5f66575d5c0a28e166fab0e75a9c49518b1402082ec495b7d76f3af5102536b9",
     "count": 1,
     "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_round2_test.go",
+    "function": "TestCancelRound2Ledger401HTTP",
+    "fingerprint": "65a6445e02916e2854a6a21e3f2664d2ba6765cc53baec988f89dedf3764e574",
+    "count": 1,
+    "reason": "Delivery-only fixture reads cancellation status, error or retry counters filtered by Run; exact exception through final test adoption.",
     "retirement": "#785"
   },
   {
@@ -85,6 +133,14 @@
     "fingerprint": "d9a70308ea3ae3a9fd8e57c8edd35c209d3d75e4026c56ccf11e9a2bc9d64687",
     "count": 1,
     "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "cancel_round2_test.go",
+    "function": "TestCancelRound2SuccessfulDeliveryClearsFailure",
+    "fingerprint": "a8883971dcb5f7f3d516b9aa2f7507d0d5bd542c8129f8dcc836a03df5817652",
+    "count": 1,
+    "reason": "Delivery-only fixture reads cancellation status, error or retry counters filtered by Run; exact exception through final test adoption.",
     "retirement": "#785"
   },
   {
@@ -109,6 +165,38 @@
     "fingerprint": "f7e97dfaff02c52bfe18dc9d8ec7276dcbf8fa76252a1d7242aef5047d71b466",
     "count": 1,
     "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "client_test.go",
+    "function": "clientTestFabric.Dial",
+    "fingerprint": "0fa141405b34502b8973ed6b37c1184c9c96b5a0bbf4de236de35ef49221a866",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_dead_host_scope_test.go",
+    "function": "TestComputerPassRefusedOnceL1MarksItsHostDead",
+    "fingerprint": "0cc83f2bb5f3ea781b3d87a46f283c80639331ff4125134c30755c3d459e93b4",
+    "count": 1,
+    "reason": "Existing HTTP expectation callback accepts a string label; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_dead_host_scope_test.go",
+    "function": "TestComputerPassRefusedOnceL1MarksItsHostDead",
+    "fingerprint": "c9e5d56bd0719d62a82ef11df906b7496e313a6c4c55902da56f62a9b1bcc533",
+    "count": 1,
+    "reason": "Existing HTTP expectation callback accepts a string label; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_dead_host_scope_test.go",
+    "function": "TestComputerPassRefusedOnceL1MarksItsHostDead",
+    "fingerprint": "d5c479981769439c404a9612e71797e590349cc0f34cf2b074dad747713a8840",
+    "count": 1,
+    "reason": "Existing HTTP expectation callback accepts a string label; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
   },
   {
@@ -217,6 +305,102 @@
   },
   {
     "file": "computer_tokens_test.go",
+    "function": "TestComputerRunProvenanceAndAtomicInflightLimit",
+    "fingerprint": "52402fc2eaeed99fee2e3fe5fdc7a04ecd2bb5c0ee7035935b40e08e0af06221",
+    "count": 2,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestComputerRunProvenanceAndAtomicInflightLimit",
+    "fingerprint": "9eb837b2a1c5c35865c4939e4ec4de38695de41ba3428603c94c1a0239717363",
+    "count": 4,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestComputerRunProvenanceAndAtomicInflightLimit",
+    "fingerprint": "e72f99c7ce6564ea258cb9f87daaa67af735a7c46a04277f662aaed65e247fbe",
+    "count": 3,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestControlPlaneAttemptScopedRevocationRevokesOnlyThatAttempt",
+    "fingerprint": "1a5f1b4949fce2526b002c8b18edb09adb84d0050a1b775d34567f5f5c695dab",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestControlPlaneAttemptScopedRevocationRevokesOnlyThatAttempt",
+    "fingerprint": "ef89eeb5589d7b6a64ec0cb7f233486aa5a918daedb6a7639a0e5521519c56f5",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestDelayedRevokeHostEndsOnlyEarlierBootsGrants",
+    "fingerprint": "0807781e65bb467bd8776058dd7a7224050008b2b626bc396a31d92b40c49cc9",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestDelayedRevokeHostEndsOnlyEarlierBootsGrants",
+    "fingerprint": "08ad8c30c47c3938ddc8922901aac8925a59d6cd3b6baae6e651a307627f1191",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestDelayedRevokeHostEndsOnlyEarlierBootsGrants",
+    "fingerprint": "2a36daa8f830aae017d854bae86f077dbdfb6eb083cde8962e767e8ed7cc58e6",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestDelayedRevokeHostEndsOnlyEarlierBootsGrants",
+    "fingerprint": "5cc4063405995bf91429345236d9c00b295e23ef6d1c5ccc55e40f0d3fab82f6",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestDelayedRevokeHostEndsOnlyEarlierBootsGrants",
+    "fingerprint": "74b246bf77f321ad5271cdafc8cbc8909e1eea2f56417dbf7cc9467d51d8f162",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestDelayedRevokeHostEndsOnlyEarlierBootsGrants",
+    "fingerprint": "7f524051c1d6d850781bcf194ecb5a8b2754a977e292b68de67efb25a5c7ff89",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
+    "function": "TestDelayedRevokeHostEndsOnlyEarlierBootsGrants",
+    "fingerprint": "a42df6d5f6abb04a1c17b83aa5aee4e22bb5f93ebbd9c3014bf596a0a2bd2ccd",
+    "count": 1,
+    "reason": "Existing Computer scope, minting or grant assertion callback accepts string identities; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "computer_tokens_test.go",
     "function": "TestRevokeHostRevokesLegacyGrantsWithoutBootSession",
     "fingerprint": "2413bac61e3f9551f3bd8f1f0d5fabc33f28a11867b2699675a51a90a5bb9ed5",
     "count": 1,
@@ -320,6 +504,14 @@
     "retirement": "#785"
   },
   {
+    "file": "error_recovery_test.go",
+    "function": "*recoveryJobClient.GetJob",
+    "fingerprint": "9b05a2c4343f0b78e464192ddc2ff455ed7899d28271acf669e7c3fbf94cb784",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
     "file": "execution_context_test.go",
     "function": "TestDispatchDeliversExactRunEnvironmentAndStoresTokenHash",
     "fingerprint": "d069384cb4f74c3531ffbb995e9921e824f3176decfbf4aa13d8d179d4cb70ea",
@@ -341,6 +533,38 @@
     "fingerprint": "134ecd2828b75b03782c813d2c49f0bf300105bfaaaaafc0f3daf8d4401e62ce",
     "count": 1,
     "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "protocol_integration_test.go",
+    "function": "TestLineageQueryBoundsUnboundedCycleRecursion",
+    "fingerprint": "74e48bc40a0aab239eb2641737e87833f50193cbbbfae3b12e96415729b2b588",
+    "count": 1,
+    "reason": "Existing corrupt-lineage fixture callback accepts Run identities and writes only parent links; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "protocol_integration_test.go",
+    "function": "TestLineageQueryBoundsUnboundedCycleRecursion",
+    "fingerprint": "d2824df3b1b3c26b5d163c02169884147c97d3f63d37bb74fbf27bf5f7f951c9",
+    "count": 1,
+    "reason": "Existing corrupt-lineage fixture callback accepts Run identities and writes only parent links; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "protocol_integration_test.go",
+    "function": "TestLineageQueryBoundsUnboundedCycleRecursion",
+    "fingerprint": "db76f869cbc76310a447ceaf629d16dfcb80eb7fe4077ef7161926183af00d03",
+    "count": 1,
+    "reason": "Existing corrupt-lineage fixture callback accepts Run identities and writes only parent links; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "recovery_cancel_test.go",
+    "function": "*cancelDuringRecoveryLookup.LookupJobByDispatchKey",
+    "fingerprint": "62020117b88c77a7a56d903e8c49f234e8d0d587d8c23dfd0c095a39c4858ba5",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
     "retirement": "#785"
   },
   {
@@ -480,6 +704,62 @@
     "retirement": "#785"
   },
   {
+    "file": "run_job_link_boundary_test.go",
+    "function": "*linkSQLPackage.nonSQLURLQuery",
+    "fingerprint": "25c3e132ed5ddbaa2c2be929f2b2a816aa6c1632877fd6a05af4a2d6c9df1f03",
+    "count": 1,
+    "reason": "Guard implementation callbacks accept strings for AST or SQL analysis, not ledger execution; exact opaque callback exception through final guard closure.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_boundary_test.go",
+    "function": "*linkSQLPackage.nonSQLURLQuery",
+    "fingerprint": "5f7290d49d3962979351f4a85e7a7fad411bac43065364dcd09b701d073319ac",
+    "count": 1,
+    "reason": "Guard implementation callbacks accept strings for AST or SQL analysis, not ledger execution; exact opaque callback exception through final guard closure.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_boundary_test.go",
+    "function": "*linkSQLPackage.sites",
+    "fingerprint": "905631433bb1f010fab580700013e2ff4ad5d60e4dfd039957abe54a2b3da1ae",
+    "count": 1,
+    "reason": "Guard implementation callbacks accept strings for AST or SQL analysis, not ledger execution; exact opaque callback exception through final guard closure.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_boundary_test.go",
+    "function": "linkSQLProtected",
+    "fingerprint": "b158559a18393b789d3240614db60b582435e2d0c0fd1989a0cb5e8bb0261327",
+    "count": 1,
+    "reason": "Guard implementation callbacks accept strings for AST or SQL analysis, not ledger execution; exact opaque callback exception through final guard closure.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_boundary_test.go",
+    "function": "linkSQLProtected",
+    "fingerprint": "bf33cbba5547be50b4012cb6ee5c2ccf716db850f9b7b669a829644db01a5c41",
+    "count": 1,
+    "reason": "Guard implementation callbacks accept strings for AST or SQL analysis, not ledger execution; exact opaque callback exception through final guard closure.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "*controlledCancelLookupClient.GetJob",
+    "fingerprint": "5c5aa9b2a527c2a066d2886032e7458637d8e27e9cfae27929cf83557c698e7d",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_cancel_evidence_test.go",
+    "function": "*controlledCancelLookupClient.LookupJobByDispatchKey",
+    "fingerprint": "d8b64632204456d2c4b517a393aa696a77a6a9845cf4bb7dfadd9c5400bc4bd8",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
     "file": "run_job_link_cancel_evidence_test.go",
     "function": "TestCancelAbsentFallbackPreservesConflictingOwnership",
     "fingerprint": "05c8fc076bdf14fe4697efdd1bfe5e2879dde4d8e342e7097171c6700722ddf2",
@@ -568,6 +848,30 @@
     "retirement": "#785"
   },
   {
+    "file": "run_job_link_knowledge_test.go",
+    "function": "TestRunJobLinkKnowledge",
+    "fingerprint": "26b46c118dc94c88299ccd74bf49835879600bc647c4a2a62bdf7c44760b981f",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_knowledge_test.go",
+    "function": "TestRunJobLinkKnowledge",
+    "fingerprint": "8bbf5e91d023328997a763459a6b96778beb788f5b474877f726a25ba9c37166",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
+    "file": "run_job_link_knowledge_test.go",
+    "function": "TestRunJobLinkKnowledge",
+    "fingerprint": "c7535973955cc9be6eb9ca9b405f51491e6f3cf24cf119ea295bd1716dac07c3",
+    "count": 3,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
     "file": "run_list.go",
     "function": "*Store.ListRuns",
     "fingerprint": "839f590236d85d23733edeb99cbc0a81beb4139700ddde29d9434036bc49aea2",
@@ -592,6 +896,14 @@
     "retirement": "#785"
   },
   {
+    "file": "run_token_routes_test.go",
+    "function": "TestRunTokenRoutesAreExactlyWhereARunTokenIsServed",
+    "fingerprint": "b674a52d49c5dd60ae92ea203f53213bd0094b093038a09660ac170eab6f1958",
+    "count": 1,
+    "reason": "Existing transport, evidence or identity fixture callback accepts strings; exact opaque callback exception through final test adoption.",
+    "retirement": "#785"
+  },
+  {
     "file": "secret_hygiene_test.go",
     "function": "TestTerminalRunDropsItsStagedTokenDelivery",
     "fingerprint": "2cb88d6c483b45f3eae7d7acfc015a66d6d8c5584b996654bf15acb0bc28c2b3",
@@ -606,6 +918,14 @@
     "count": 1,
     "reason": "Existing transition, corruption or historical ledger fixture; replace ordinary link SQL with the test builder during final adoption.",
     "retirement": "#785"
+  },
+  {
+    "file": "server.go",
+    "function": "*Server.filterVisibleLineage",
+    "fingerprint": "d72f1c966c147dfb08c676bb088fd0e532a88b7860cff12f06c456aa93df0c31",
+    "count": 1,
+    "reason": "Existing lineage visibility function value accepts Run identity strings; conservatively opaque until reader adoption.",
+    "retirement": "#783"
   },
   {
     "file": "server.go",

@@ -116,7 +116,7 @@ func (s *Store) completeDispatchWithEvidenceTx(ctx context.Context, tx *sql.Tx, 
 	if evidence == dispatchLookupEvidence {
 		// A bound positive lookup is a new observation, even when the outbox
 		// already recorded the earlier acknowledgement and its later absence.
-		if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET last_error=NULL, token_delivery=NULL WHERE run_id=? AND job_id=?`, runID, jobID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE dispatch_outbox SET job_id=COALESCE(job_id, ?), last_error=NULL, token_delivery=NULL WHERE run_id=? AND (job_id IS NULL OR job_id=?)`, jobID, runID, jobID); err != nil {
 			return internalError(err, "record confirmed canceled dispatch")
 		}
 	}
@@ -210,11 +210,12 @@ func (s *Store) linkUnrecordedDispatch(ctx context.Context, item unrecordedDispa
 	return nil
 }
 
-// cancelStoredJobID uses an outbox acknowledgement only while no settled absence
-// or regression diagnostic contradicts it. The Run's own link remains primary.
-const cancelStoredJobID = `COALESCE(r.l1_job_id, CASE WHEN r.job_link_settled=0
- AND COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, '') NOT IN ('` + l1RegressedReason + `', '` + dispatchNotFoundReason + `')
- THEN o.job_id END)`
+// uncontradictedOutbox is the shared eligibility rule for stored evidence and
+// unresolved legacy cancellation retries. Both queries bind runs r and outbox o.
+const uncontradictedOutbox = `r.job_link_settled=0 AND COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, '') NOT IN ('` + l1RegressedReason + `', '` + dispatchNotFoundReason + `')`
+
+// cancelStoredJobID prefers the Run link over uncontradicted outbox evidence.
+const cancelStoredJobID = `COALESCE(r.l1_job_id, CASE WHEN ` + uncontradictedOutbox + ` THEN o.job_id END)`
 
 // requestRunCancellation arbitrates cancellation with the first dispatch
 // attempt. A never-attempted run can settle locally. Once an attempt began,
@@ -228,10 +229,10 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	var state contract.RunState
 	var submitter string
 	var attempted sql.NullInt64
-	var jobID sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT r.status, t.actor, r.dispatch_attempt_ns, `+cancelStoredJobID+`
+	var jobID, runJob sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT r.status, t.actor, r.dispatch_attempt_ns, r.l1_job_id, `+cancelStoredJobID+`
  FROM runs r JOIN run_triggers t ON t.run_id=r.run_id
- LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).Scan(&state, &submitter, &attempted, &jobID)
+ LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id WHERE r.run_id=?`, runID).Scan(&state, &submitter, &attempted, &runJob, &jobID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return protocolError(contract.ErrorNotFound, "run was not found")
 	}
@@ -259,8 +260,8 @@ func (s *Store) requestRunCancellation(ctx context.Context, runID, actor string)
 	}
 	// Uncontradicted legacy acknowledgements may exist only in the outbox. Link them before
 	// cancellation takes over recovery, preserving the terminal outcome.
-	if jobID.Valid {
-		if _, err := linkTerminalRunTx(ctx, tx, runID, jobID.String); err != nil {
+	if jobID.Valid && !runJob.Valid {
+		if err := s.completeDispatchWithEvidenceTx(ctx, tx, runID, jobID.String, dispatchStoredEvidence, nil); err != nil {
 			return err
 		}
 	}
@@ -386,8 +387,8 @@ func (s *Store) pendingRunCancellations(ctx context.Context, runID string) ([]ru
 	query := `SELECT r.run_id, COALESCE(` + cancelStoredJobID + `, ''), r.status, r.required_envelope, r.dispatch_key
  FROM run_cancellations c JOIN runs r ON r.run_id=c.run_id
  LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id
- WHERE (c.completed_ns IS NULL OR (r.l1_job_id IS NULL AND r.job_link_settled=0 AND (r.dispatch_attempt_ns IS NOT NULL OR o.job_id IS NOT NULL)
- AND COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, '') NOT IN ('` + l1RegressedReason + `', '` + dispatchNotFoundReason + `')))
+ WHERE (c.completed_ns IS NULL OR (r.l1_job_id IS NULL AND (r.dispatch_attempt_ns IS NOT NULL OR o.job_id IS NOT NULL)
+ AND ` + uncontradictedOutbox + `))
  AND c.retry_ns<=?`
 	args := []any{s.recoveryNow().UnixNano()}
 	if runID != "" {
@@ -485,7 +486,12 @@ func decodeRunJobLink(observed dispatchObservation) (runJobLinkKnowledge, error)
 	case observed.runJob.Valid:
 		knowledge.state = linkLinked
 	case observed.settled || observed.reason == dispatchNotFoundReason:
-		knowledge.state = linkMissingSettled
+		if observed.outboxJob.Valid && observed.dispatched.Valid {
+			// A legacy acknowledgement confirmed this Job before its absence.
+			knowledge.state = linkRegressed
+		} else {
+			knowledge.state = linkMissingSettled
+		}
 	case observed.outboxJob.Valid:
 		knowledge.state = linkLinked
 	case observed.attempted.Valid:
@@ -497,11 +503,11 @@ func decodeRunJobLink(observed dispatchObservation) (runJobLinkKnowledge, error)
 // writeCancellationBackoff also schedules unresolved, completed legacy links.
 // Their old delivery outcome stays recorded until positive evidence wakes it.
 func (s *Store) writeCancellationBackoff(ctx context.Context, runID string, failures int, retry time.Time, payload string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET failures=failures+1, retry_ns=?, last_error=? WHERE run_id=? AND failures=? AND (completed_ns IS NULL OR EXISTS
- (SELECT 1 FROM runs r WHERE r.run_id=run_cancellations.run_id AND r.l1_job_id IS NULL AND r.job_link_settled=0 AND (r.dispatch_attempt_ns IS NOT NULL OR EXISTS
- (SELECT 1 FROM dispatch_outbox a WHERE a.run_id=r.run_id AND a.job_id IS NOT NULL))
- AND NOT EXISTS (SELECT 1 FROM dispatch_outbox o WHERE o.run_id=r.run_id
- AND COALESCE(CASE WHEN json_valid(o.last_error) THEN json_extract(o.last_error, '$.details.reason') END, '') IN ('`+l1RegressedReason+`', '`+dispatchNotFoundReason+`'))))`, retry.UnixNano(), payload, runID, failures)
+	_, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET failures=failures+1, retry_ns=?, last_error=CASE WHEN completed_ns IS NULL THEN ? ELSE last_error END WHERE run_id=? AND failures=? AND (completed_ns IS NULL OR EXISTS
+ (SELECT 1 FROM runs r LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id
+ WHERE r.run_id=run_cancellations.run_id AND r.l1_job_id IS NULL
+ AND (r.dispatch_attempt_ns IS NOT NULL OR o.job_id IS NOT NULL)
+ AND `+uncontradictedOutbox+`))`, retry.UnixNano(), payload, runID, failures)
 	if err != nil {
 		return internalError(err, "defer run cancellation")
 	}
