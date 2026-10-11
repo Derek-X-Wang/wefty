@@ -1280,10 +1280,13 @@ cancellation reads prefer the Run's linked Job, and use an outbox-only
 acknowledgement only when no settled absence or regression diagnostic contradicts it. The write rechecks that
 stored evidence is still usable before linking. Stored identity alone cannot
 clear a contradiction or restore a link. A fresh identity-bound lookup can
-supersede the contradiction only if the observed identity and diagnostic have
-not changed since the lookup began; a stale answer leaves the next pass to
-decide. Uncontradicted legacy outbox acknowledgements still link before
-delivery, even when dispatch-key lookup cannot find the Job, preserving terminal outcomes and timestamps.
+supersede the contradiction only if the observed verdict's settlement bit,
+reason and diagnostic Job have not changed since the lookup began; a stale
+answer leaves the next pass to decide. An acknowledgement of the same Job
+during lookup does not prevent delivery in that pass. The write still refuses
+any conflicting recorded Job identity. Uncontradicted legacy outbox
+acknowledgements still link before delivery, even when dispatch-key lookup
+cannot find the Job, preserving terminal outcomes and timestamps.
 A delayed acknowledgement after a regression proves the earlier commit and
 cannot overturn that verdict. A fresh lookup that finds the same Job and is
 bound to the requested dispatch key or acknowledged Job ID can link it,
@@ -1293,9 +1296,10 @@ ledger write. A found, identity-bound Job links before cancellation delivery;
 a transient failure uses the existing backoff. Authoritative absence of that
 identity on an already-terminal Run settles cancellation with nothing to cancel
 (`cancel_status=settled`), preserving the diagnostic, terminal facts, reason and
-token expiry. An active Run follows the existing regression/absence rules;
-this fallback does not introduce a new terminal transition. Each write rechecks
-ownership and the stored evidence inside the transaction.
+token expiry. For an active Run this fallback returns without error and backs
+off; it does not introduce a new terminal transition. The next due pass follows
+the existing regression/absence rules. Each write rechecks ownership and the
+stored evidence inside the transaction.
 A first acknowledgement after a cancel settlement links the Job and wakes
 cancel delivery. The existing cancellation fields report delivery's outcome.
 The Run's recorded terminal reason, status and timestamps never change, and

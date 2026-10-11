@@ -2219,7 +2219,11 @@ func (s *Store) completeDispatchWithEvidence(ctx context.Context, runID, jobID s
 	if err != nil {
 		return err
 	}
-	if evidence == dispatchLookupEvidence && (observed == nil || current != *observed) {
+	// An overlapping acknowledgement of the same Job can change identity,
+	// dispatch stamps and Run state without changing the verdict. Recheck
+	// identities below; only a later verdict makes this lookup stale.
+	if evidence == dispatchLookupEvidence && (observed == nil || current.settled != observed.settled ||
+		current.reason != observed.reason || current.diagnosticJob != observed.diagnosticJob) {
 		return internalError(errors.New("dispatch evidence changed during lookup"), "complete dispatch")
 	}
 	outboxJob, runJob := current.outboxJob, current.runJob
