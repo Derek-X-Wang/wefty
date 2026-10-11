@@ -3436,14 +3436,12 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 		return AttemptLease{}, internalError(err, "renew attempt lease")
 	}
 	if attempt.state == contract.AttemptClaimed && attempt.spec.Kind != contract.JobKindOCI && !canceled {
-		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?", contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
+		if err := promoteExecution(ctx, tx, attemptID, now); err != nil {
 			return AttemptLease{}, internalError(err, "acknowledge renewed job execution")
 		}
 	}
-	if (attempt.spec.Kind != contract.JobKindOCI || attempt.startedNS.Valid) && !canceled {
-		if err := markServiceStable(ctx, tx, jobID, attemptID, now); err != nil {
-			return AttemptLease{}, err
-		}
+	if err := establishHealth(ctx, tx, attemptID, healthFromRenewal, now); err != nil {
+		return AttemptLease{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return AttemptLease{}, internalError(err, "commit lease renewal")
@@ -3692,11 +3690,10 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 		contract.AttemptRunning, startedAt.UnixNano(), imageJSON, now.UnixNano(), attemptID); err != nil {
 		return Job{}, internalError(err, "acknowledge Started attempt")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?`,
-		contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
+	if err := promoteExecution(ctx, tx, attemptID, now); err != nil {
 		return Job{}, internalError(err, "acknowledge Started job")
 	}
-	if err := markServiceStable(ctx, tx, jobID, attemptID, now); err != nil {
+	if err := establishHealth(ctx, tx, attemptID, healthFromStarted, now); err != nil {
 		return Job{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE computer_job_projections SET chown=0
@@ -3851,7 +3848,7 @@ func (s *Store) SetAttemptPublication(
 	}
 
 	if *request.Ready {
-		if err := markServiceStable(ctx, tx, jobID, attemptID, now); err != nil {
+		if err := establishHealth(ctx, tx, attemptID, healthFromPublication, now); err != nil {
 			return Job{}, err
 		}
 	}
@@ -4077,15 +4074,14 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?)`, jobID, attemptID, event.Stream, event.Sequence,
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=?, updated_ns=? WHERE attempt_id=?", contract.AttemptRunning, now.UnixNano(), attemptID); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging attempt running")
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=? AND state=?", contract.JobRunning, now.UnixNano(), jobID, contract.JobClaimed); err != nil {
+		if err := promoteExecution(ctx, tx, attemptID, now); err != nil {
 			return AppendLogsResponse{}, internalError(err, "mark logging job running")
 		}
 	}
 	// Evidence from a lost or replaced attempt is still retained, but cannot
 	// start the current service's stability window.
-	if hasAuthority && !canceled && now.Before(attempt.leaseExpires) && attempt.spec.Kind != contract.JobKindOCI &&
-		(attempt.state == contract.AttemptClaimed || attempt.state == contract.AttemptRunning || attempt.state == contract.AttemptAwaitingInput) {
-		if err := markServiceStable(ctx, tx, jobID, attemptID, now); err != nil {
+	if hasAuthority {
+		if err := establishHealth(ctx, tx, attemptID, healthFromLogs, now); err != nil {
 			return AppendLogsResponse{}, err
 		}
 	}
@@ -4503,7 +4499,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET state=? WHERE attempt_id=?", contract.AttemptRunning, attemptID); err != nil {
 			return CompletionOutcome{}, internalError(err, "acknowledge attempt execution")
 		}
-		if _, err := tx.ExecContext(ctx, "UPDATE jobs SET state=? WHERE job_id=?", contract.JobRunning, jobID); err != nil {
+		if err := promoteExecution(ctx, tx, attemptID, now); err != nil {
 			return CompletionOutcome{}, internalError(err, "acknowledge job execution")
 		}
 	}
@@ -4697,25 +4693,6 @@ JOIN nodes n ON n.node_id=a.node_id
 		return attemptAuthority{}, internalError(err, "decode attempt job specification")
 	}
 	return a, nil
-}
-
-func validateAttemptAuthority(identityNodeID, jobID, attemptID, fencingToken string, a attemptAuthority) error {
-	if a.identityNodeID != identityNodeID {
-		return protocolError(contract.ErrorAttemptNotOwned, "authenticated node does not own this attempt")
-	}
-	if a.jobID != jobID || a.attemptID != attemptID {
-		return protocolError(contract.ErrorAttemptMismatch, "attempt does not match the request path")
-	}
-	if !a.currentAttempt.Valid || a.currentAttempt.String != attemptID {
-		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
-	}
-	if a.fencingToken != fencingToken {
-		return protocolError(contract.ErrorStaleFence, "fencing token is stale")
-	}
-	if a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration {
-		return protocolError(contract.ErrorNodeSessionReplaced, "attempt authority belongs to a replaced node registration")
-	}
-	return nil
 }
 
 func validateAttemptEvidence(identityNodeID, jobID, attemptID, fencingToken string, a attemptAuthority) error {
@@ -4941,36 +4918,6 @@ func completionStates(result ProcessResult) (contract.JobState, contract.Attempt
 		return contract.JobSucceeded, contract.AttemptSucceeded
 	}
 	return contract.JobFailed, contract.AttemptFailed
-}
-
-// markServiceStable applies the same health rule for Started, renewal, live
-// process logs and ready publication, inside the triggering write transaction.
-func markServiceStable(ctx context.Context, tx *sql.Tx, jobID, attemptID string, now time.Time) error {
-	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs
-		SET healthy_since_ns=?
-		WHERE job_id=? AND healthy_since_ns IS NULL
-			AND EXISTS (
-				SELECT 1 FROM jobs
-				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
-				JOIN nodes ON nodes.node_id=attempts.node_id
-				WHERE jobs.job_id=service_jobs.job_id
-					AND jobs.current_attempt_id=?
-					AND attempts.state IN (?, ?, ?)
-					AND attempts.lease_expires_ns>?
-					AND jobs.outcome<>'canceled'
-					AND ((service_jobs.published_port IS NULL AND NOT EXISTS (
-						SELECT 1 FROM computer_job_projections
-						WHERE computer_job_projections.job_id=service_jobs.job_id
-					)) OR service_jobs.published_attempt_id=jobs.current_attempt_id)
-					AND service_jobs.bound_node_id=attempts.node_id
-					AND nodes.state=?
-					AND attempts.boot_session_id=nodes.boot_session_id
-					AND attempts.authority_generation=nodes.authority_generation
-			)`, now.UnixNano(), jobID, attemptID, contract.AttemptClaimed, contract.AttemptRunning,
-		contract.AttemptAwaitingInput, now.UnixNano(), contract.NodeAlive); err != nil {
-		return internalError(err, "record service stability")
-	}
-	return nil
 }
 
 type queryer interface {
