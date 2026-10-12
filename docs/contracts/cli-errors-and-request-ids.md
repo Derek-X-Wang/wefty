@@ -155,7 +155,7 @@ answer. A permanent HTTP refusal or typed operation error arriving at the
 deadline keeps its classification, even in provenance with an earlier transient
 503. An already-known typed operation verdict still survives a provenance miss.
 
-Caller interruption (Ctrl-C or a caller deadline) wins when handling a failed
+Caller interruption (Ctrl-C or SIGTERM) wins when handling a failed
 read or polling delay in every accepted-mutation wait, the service log follow,
 and the take-over admission retry. This includes a fully decoded typed answer
 handled after the caller stops. The interruption is a local failure (exit 1,

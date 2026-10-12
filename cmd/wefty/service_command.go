@@ -762,7 +762,9 @@ func executeServiceLogs(
 	for {
 		page, err := clients.getServiceLogs(followCtx, jobID, cursor, limit)
 		if err != nil {
-			if ctx.Err() != nil {
+			// A follower who left stopped the command, whatever the read
+			// answered; a one-shot read keeps the answer it got.
+			if (follow || all) && ctx.Err() != nil {
 				return ctx.Err()
 			}
 			// The follow window ending is a clean stop, whatever the read
@@ -784,13 +786,16 @@ func executeServiceLogs(
 				if sleepFollowRetry(followCtx, pollInterval) {
 					continue
 				}
-				// The retry sleep hit the window end: stop the same way an
-				// interrupted follow does.
-				if followFor > 0 && ctx.Err() == nil && followCtx.Err() == context.DeadlineExceeded {
-					return nil
-				}
 				// The reader left during the retry sleep: cancellation, not
 				// the stale 503.
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				// The retry sleep hit the window end: stop the same way an
+				// interrupted follow does.
+				if followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
+					return nil
+				}
 				return followCtx.Err()
 			}
 			return err
