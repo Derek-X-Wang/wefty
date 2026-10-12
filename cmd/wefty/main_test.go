@@ -37,6 +37,7 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() {
 		if err := l1Store.Close(); err != nil {
 			t.Errorf("close L1 store: %v", err)

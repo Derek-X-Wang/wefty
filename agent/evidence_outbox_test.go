@@ -1997,6 +1997,7 @@ func TestEvidenceRecoveryDrainsLiveLogBacklogBeforeCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	identity := fabric.Identity{NodeID: "bounded-replay-agent"}
 	registration := contract.NodeRegistration{
@@ -2185,6 +2186,7 @@ func TestEvidenceRecoveryBoundsLostLogBacklogBeforeCompletion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	identity := fabric.Identity{NodeID: "bounded-lost-replay-agent"}
 	registration := contract.NodeRegistration{
@@ -3744,6 +3746,7 @@ func TestNormalFinishKeepsPendingLogsBeforeCompletion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 			defer store.Close()
 			if _, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "normal-finish-fabric"}, contract.NodeRegistration{
 				NodeID: "normal-finish-node", BootSessionID: "normal-finish-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"kind:process": true},
@@ -3948,6 +3951,7 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 			defer store.Close()
 			if _, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "ordered-fabric"}, contract.NodeRegistration{
 				NodeID: "ordered-node", BootSessionID: "ordered-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"kind:process": true},

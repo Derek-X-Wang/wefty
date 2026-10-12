@@ -56,6 +56,7 @@ func TestTSNetSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{
 		AgentPrincipalTag: agentPrincipalTag,
@@ -126,6 +127,7 @@ func TestTSNetServiceReachability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{
 		AgentPrincipalTag: agentPrincipalTag,

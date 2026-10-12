@@ -50,6 +50,7 @@ func TestComputerPassRefusedOnceL1MarksItsHostDead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() { l1Store.Close() })
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{})
 	if err != nil {

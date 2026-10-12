@@ -426,6 +426,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
@@ -504,6 +505,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
@@ -658,6 +660,7 @@ func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 			defer store.Close()
 			l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"stable-node": l1.DefaultNodePolicy("linux")}})
 			if err != nil {

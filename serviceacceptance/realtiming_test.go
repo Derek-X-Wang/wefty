@@ -42,6 +42,7 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
 			t.Errorf("close realtime OCI store: %v", err)
@@ -84,6 +85,7 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 	if first.Lease.LeaseTTL != l1.DefaultLeaseDuration {
 		t.Fatalf("lease TTL = %s, want production %s", first.Lease.LeaseTTL, l1.DefaultLeaseDuration)
 	}
+	completionStarted := time.Now()
 	requeued, err := store.CompleteAttempt(context.Background(), "oci-realtime-agent", job.JobID, first.Lease.AttemptID, l1.CompletionRequest{
 		FencingToken: first.Lease.FencingToken, IdempotencyKey: "realtime-runtime-unavailable",
 		Result: l1.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "engine unavailable"}},
@@ -91,17 +93,27 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 	if err != nil || requeued.State != contract.JobQueued || requeued.CurrentAttemptID != "" || requeued.NodeID != "" {
 		t.Fatalf("pre-start requeue = %#v err %v", requeued, err)
 	}
+	completionFinished := time.Now()
 	var nextRetryNS int64
 	if err := database.QueryRow(`SELECT prestart_next_retry_at_ns FROM jobs WHERE job_id=?`, job.JobID).Scan(&nextRetryNS); err != nil {
 		t.Fatal(err)
 	}
-	if immediate, err := store.ClaimJob(context.Background(), "oci-realtime-agent", registration.NodeID, registration.BootSessionID, contract.JobClassOneShot); err != nil || immediate != nil {
-		t.Fatalf("claim before persisted backoff = %#v err %v", immediate, err)
+	// CompleteAttempt pins its transaction clock and adds prestartRetryDelay.
+	// Production jitter is 80%-120%; this fixture injects identity jitter, so
+	// its first delay is exactly one second, with nanosecond persistence and no
+	// rounding. Bracket the transaction anchor with the call's wall-clock times.
+	nextRetry := time.Unix(0, nextRetryNS)
+	if nextRetry.Before(completionStarted.Add(time.Second)) || nextRetry.After(completionFinished.Add(time.Second)) {
+		t.Fatalf("persisted due time %s outside completion anchor [%s, %s] plus one second", nextRetry, completionStarted, completionFinished)
 	}
-	waitStarted := time.Now()
+	// The first probe may itself arrive after the due time on a loaded runner.
+	// Accept that claim only if its transaction clock satisfies the same bound.
+	second, err := store.ClaimJob(context.Background(), "oci-realtime-agent", registration.NodeID, registration.BootSessionID, contract.JobClassOneShot)
+	if err != nil {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(2 * time.Second)
-	var second *l1.Claim
-	for time.Now().Before(deadline) {
+	for second == nil && time.Now().Before(deadline) {
 		second, err = store.ClaimJob(context.Background(), "oci-realtime-agent", registration.NodeID, registration.BootSessionID, contract.JobClassOneShot)
 		if err != nil {
 			t.Fatal(err)
@@ -117,8 +129,14 @@ func TestOCIPrestartRuntimeUnavailablePersistsWallClockBackoffAtProductionTiming
 	if nowNS := time.Now().UnixNano(); nowNS < nextRetryNS {
 		t.Fatalf("second claim at %d preceded persisted due time %d", nowNS, nextRetryNS)
 	}
-	if elapsed := time.Since(waitStarted); elapsed < 900*time.Millisecond {
-		t.Fatalf("wall-clock backoff = %s, want approximately one second", elapsed)
+	// The SQL read and immediate claim also consume the enforced backoff.
+	// Measuring only the polling loop omits that time on loaded runners.
+	claimedAt := second.Lease.LeaseExpires.Add(-second.Lease.LeaseTTL)
+	if claimedAt.Before(nextRetry) {
+		t.Fatalf("second claim transaction at %s preceded persisted due time %s", claimedAt, nextRetry)
+	}
+	if elapsed := time.Since(completionStarted); elapsed < time.Second {
+		t.Fatalf("wall-clock backoff from completion = %s, want at least one second", elapsed)
 	}
 }
 
@@ -1279,6 +1297,7 @@ func TestForgottenTombstoneObservationRequiresFinalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	registration := contract.NodeRegistration{NodeID: "node", BootSessionID: "boot", RootInstanceID: "root",
 		OS: "linux", Architecture: runtime.GOARCH, AgentVersion: "test",

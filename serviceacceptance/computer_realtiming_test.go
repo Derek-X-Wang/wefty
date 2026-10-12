@@ -830,6 +830,15 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	receipt.ResidueInventories["post_removal_durable_retained"] = verification.DurableRetained
 	observedExact, observedGCNoNew, observedGCRemoved := compareRemovalInventoryBaseline(comparisonBaseline.Inventory, verification.Inventory)
 	retainedExact, retainedGCNoNew, _ := compareRemovalInventoryBaseline(comparisonBaseline.DurableRetained, verification.DurableRetained)
+	if differences := removalInventoryDifferences(comparisonBaseline.Inventory, verification.Inventory); len(differences) > 0 {
+		diagnostic, err := json.Marshal(differences)
+		if err != nil {
+			t.Cleanup(func() { t.Logf("removal-inventory-diagnostic unavailable: %v", err) })
+		} else {
+			t.Cleanup(func() { t.Logf("removal-inventory-diagnostic=%s", diagnostic) })
+		}
+	}
+
 	missingLogSegments := missingRetainedLogSegmentDiagnostics(removalBaseline, verification)
 	if len(missingLogSegments) > 0 {
 		diagnostic, err := json.Marshal(missingLogSegments)
@@ -990,6 +999,77 @@ func removalBaselineWithoutExpiredRetentions(before, after ocihelper.VerifyRespo
 		before.DurableRetained.Cgroups = stringSetDifference(before.DurableRetained.Cgroups, expiredCgroups)
 	}
 	return before
+}
+
+// removalInventoryDifference preserves both sides, including order and nil versus
+// empty slices, because the removal gate compares non-GC classes exactly.
+type removalInventoryDifference struct {
+	Class        string   `json:"class"`
+	Baseline     any      `json:"baseline"`
+	Verification any      `json:"verification"`
+	MissingIDs   []string `json:"missing_ids,omitempty"`
+	AddedIDs     []string `json:"added_ids,omitempty"`
+}
+
+func removalInventoryDifferences(before, after ocihelper.ResourceInventory) []removalInventoryDifference {
+	baseline, verification := reflect.ValueOf(before), reflect.ValueOf(after)
+	inventoryType := baseline.Type()
+	var differences []removalInventoryDifference
+	for index := 0; index < inventoryType.NumField(); index++ {
+		left, right := baseline.Field(index).Interface(), verification.Field(index).Interface()
+		if reflect.DeepEqual(left, right) {
+			continue
+		}
+		difference := removalInventoryDifference{
+			Class:    strings.Split(inventoryType.Field(index).Tag.Get("json"), ",")[0],
+			Baseline: left, Verification: right,
+		}
+		if baselineIDs, ok := left.([]string); ok {
+			verificationIDs := right.([]string)
+			difference.MissingIDs = stringSetDifference(baselineIDs, verificationIDs)
+			difference.AddedIDs = stringSetDifference(verificationIDs, baselineIDs)
+		}
+		differences = append(differences, difference)
+	}
+	return differences
+}
+
+func TestRemovalInventoryDifferences(t *testing.T) {
+	t.Run("class and exact IDs", func(t *testing.T) {
+		before := ocihelper.ResourceInventory{Containers: []string{"baseline-container"}, Cgroups: []string{"kept", "missing"}, ImageSpools: []string{"expired"}}
+		after := ocihelper.ResourceInventory{Containers: []string{"new-container"}, Cgroups: []string{"kept", "added"}}
+		payload, err := json.Marshal(removalInventoryDifferences(before, after))
+		want := `[{"class":"containers","baseline":["baseline-container"],"verification":["new-container"],"missing_ids":["baseline-container"],"added_ids":["new-container"]},{"class":"cgroups","baseline":["kept","missing"],"verification":["kept","added"],"missing_ids":["missing"],"added_ids":["added"]},{"class":"image_spools","baseline":["expired"],"verification":null,"missing_ids":["expired"]}]`
+		if err != nil || string(payload) != want {
+			t.Fatalf("inventory diagnostic = %s, err=%v; want %s", payload, err, want)
+		}
+		if got := removalInventoryDifferences(before, before); len(got) != 0 {
+			t.Fatalf("equal inventory diagnostic = %+v", got)
+		}
+	})
+	t.Run("structured inventory identities and changed records", func(t *testing.T) {
+		entry := ocihelper.ComputerStorageRecoveryInventoryEntry{Storage: ocihelper.ComputerStorageReference{ComputerID: "computer-1", StorageID: "storage-1", StorageGeneration: 2}, DiskName: "disk-1", Reason: "before"}
+		before := ocihelper.ResourceInventory{ComputerStorageDeferred: []ocihelper.ComputerStorageRecoveryInventoryEntry{entry}}
+		entry.Reason = "after"
+		after := ocihelper.ResourceInventory{ComputerStorageDeferred: []ocihelper.ComputerStorageRecoveryInventoryEntry{entry}}
+		got := removalInventoryDifferences(before, after)
+		if len(got) != 1 || got[0].Class != "computer_storage_deferred" || !reflect.DeepEqual(got[0].Baseline, before.ComputerStorageDeferred) || !reflect.DeepEqual(got[0].Verification, after.ComputerStorageDeferred) {
+			t.Fatalf("structured diagnostic = %+v", got)
+		}
+		payload, err := json.Marshal(got)
+		if err != nil || !bytes.Contains(payload, []byte(`"storage_id":"storage-1"`)) || !bytes.Contains(payload, []byte(`"disk_name":"disk-1"`)) {
+			t.Fatalf("structured diagnostic lost identity: %s, err=%v", payload, err)
+		}
+	})
+	t.Run("order and nil versus empty remain visible", func(t *testing.T) {
+		before := ocihelper.ResourceInventory{Tasks: []string{"a", "b"}}
+		after := ocihelper.ResourceInventory{Tasks: []string{"b", "a"}, Leases: []string{}}
+		payload, err := json.Marshal(removalInventoryDifferences(before, after))
+		want := `[{"class":"leases","baseline":null,"verification":[]},{"class":"tasks","baseline":["a","b"],"verification":["b","a"]}]`
+		if err != nil || string(payload) != want {
+			t.Fatalf("inventory diagnostic = %s, err=%v; want %s", payload, err, want)
+		}
+	})
 }
 
 // compareRemovalInventoryBaseline keeps the post-removal gate exact for every

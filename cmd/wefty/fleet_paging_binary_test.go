@@ -24,6 +24,7 @@ func TestFleetPagingFromRealBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() { store.Close() })
 	server, err := l1.NewServer(control, store, l1.ServerConfig{})
 	if err != nil {

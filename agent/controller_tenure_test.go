@@ -331,6 +331,7 @@ func TestControllerTenureAcceptsSemanticReceiptFromRealL1Store(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	nodeID := "computer-node"
 	fabricNodeID := "fabric-computer-node"

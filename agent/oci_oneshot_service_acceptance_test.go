@@ -41,6 +41,7 @@ func TestServiceAcceptanceOrdinaryL3RunDispatchesOCIOneshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() { _ = l1Store.Close() })
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"node-1": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-1"),

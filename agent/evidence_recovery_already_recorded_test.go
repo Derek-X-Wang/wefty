@@ -30,6 +30,7 @@ func TestEvidenceRecoveryRetiresCompletionL1AlreadyRecordedAfterReregistration(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	network := plain.NewNetwork()
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})

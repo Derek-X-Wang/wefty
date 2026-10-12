@@ -49,6 +49,7 @@ func TestTSNetPersonWhoAmI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{})
 	if err != nil {

@@ -36,6 +36,7 @@ func TestServiceAcceptanceComputerTakeoverCLIRealFrontDoor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	server, err := l1.NewServer(controlFabric, store, l1.ServerConfig{AllowSelfAssertedPersonIdentities: true})
 	if err != nil {

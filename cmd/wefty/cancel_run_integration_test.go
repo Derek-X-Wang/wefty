@@ -28,6 +28,7 @@ func TestCancelRunRealBinaryOverL1L3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer l1Store.Close()
 	l1Server, err := l1.NewServer(control, l1Store, l1.ServerConfig{})
 	if err != nil {
