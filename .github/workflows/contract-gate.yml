@@ -95,7 +95,9 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Run cross-platform runner and contract tests
-        run: go test ./...
+        # cmd/wefty takes 380-500 s on hosted macOS runners and once hit the
+        # 10-minute per-package default (#163); a hang still fails here.
+        run: go test -timeout=20m ./...
 
   service-acceptance:
     name: service-acceptance / ${{ matrix.os }}
