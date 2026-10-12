@@ -2776,8 +2776,9 @@ func TestIntentStopDrainWaitsForLiveSuppressionDisposition(t *testing.T) {
 		},
 		observed: func(OCIIntentObservation) { close(intentObserved) },
 	}
+	outbox.ociIntentGate = gate
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		client: client, outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+		client: client, outbox: outbox, clock: systemClock{}, completionRetry: time.Millisecond,
 	})
 	writeLock, err := outbox.spool.db.BeginTx(t.Context(), nil)
 	if err != nil {
@@ -2861,8 +2862,9 @@ func TestIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *testing.
 		observed:           func(OCIIntentObservation) { close(intentObserved) },
 		suppressionTimeout: suppressionBudget,
 	}
+	outbox.ociIntentGate = gate
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		client: client, outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+		client: client, outbox: outbox, clock: systemClock{}, completionRetry: time.Millisecond,
 	})
 	connectionBlocker, err := outbox.spool.db.BeginTx(t.Context(), nil)
 	if err != nil {

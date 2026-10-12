@@ -470,6 +470,23 @@ lease expiry and can accept completion only as late evidence. Cancellation and
 renewal cancel/stop/restart directives use the same route rule. A hand-off releases
 attempt ownership and wakes ordered recovery without waiting. The cause still
 determines the completion result and the lifecycle's return value.
+
+Live completion and replay call one delivery step on the evidence outbox.
+The step observes and releases the OCI intent fence around one completion
+request, then applies the existing durable mutations and returns a typed
+verdict. Success and `lease_expired` record delivery. Unavailable intent
+withholds completion; disabled intent suppresses it, without suppressing logs.
+Suppressed completion remains excluded from replay even after intent changes.
+Attempt-authority refusal seals evidence. A permanent body refusal instead
+leaves live evidence for recovery, which seals it on refusal. Node-session
+refusal retains evidence; replay parks stop-and-escalate refusals on its slow
+recheck schedule. Live delivery owns transient retries, run-ledger backoff,
+and cancellation-abandonment provenance. Replay makes one pass and lets its
+scheduler retry. A local persistence failure has no L1 verdict, even after L1
+answered the request; it cannot acknowledge, seal, or abandon delivery.
+A short source-pattern guard pins the durable effects to this step and replay's
+log path, with counted, named persistence exceptions.
+
 The logs-first drain can push cancel, stop or restart completion past L1's
 cancel or settle deadline when log finalization is incomplete. Evidence order
 takes precedence over settlement speed. A stop or restart directive received

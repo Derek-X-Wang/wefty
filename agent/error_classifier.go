@@ -47,9 +47,13 @@ var agentProtocolErrorClassifications = map[contract.ErrorCode]agentProtocolErro
 
 // classifyAgentProtocolError classifies an error returned by a Client
 // operation. A non-ProtocolError at that seam is transport, timeout, or an
-// unparseable response and therefore transient. Local invariant failures must
-// remain outside this classifier.
+// unparseable response and therefore transient. Completion storage failures
+// carry a local marker so inline replay cannot give them an L1 destination.
 func classifyAgentProtocolError(err error) agentProtocolErrorClassification {
+	var persistenceErr *completionPersistenceError
+	if errors.As(err, &persistenceErr) {
+		return agentProtocolErrorClassification{destination: errorDestinationUnclassified}
+	}
 	var protocolErr *ProtocolError
 	if errors.As(err, &protocolErr) {
 		if classification, ok := agentProtocolErrorClassifications[protocolErr.APIError.Code]; ok {

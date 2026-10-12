@@ -128,8 +128,9 @@ func TestControllerStopReportsResidentSuppressionFailureCreatedDuringTeardown(t 
 		t.Fatal("acquire service gate for resident")
 	}
 	session.attempts.Add(1)
+	outbox.ociIntentGate = gate
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+		outbox: outbox, clock: systemClock{}, completionRetry: time.Millisecond,
 	})
 	residentStarted := make(chan struct{})
 	residentDone := make(chan error, 1)
@@ -228,8 +229,9 @@ func TestControllerStopReportsResidentSuppressionFailureCompletedBeforeTeardownS
 		t.Fatal("acquire service gate for resident")
 	}
 	session.attempts.Add(1)
+	outbox.ociIntentGate = gate
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+		outbox: outbox, clock: systemClock{}, completionRetry: time.Millisecond,
 	})
 	completeResident := make(chan struct{})
 	residentStarted := make(chan struct{})
@@ -389,8 +391,9 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 		t.Fatal("acquire service gate for resident")
 	}
 	session.attempts.Add(1)
+	outbox.ociIntentGate = gate
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+		outbox: outbox, clock: systemClock{}, completionRetry: time.Millisecond,
 	})
 	beforeCompletionRecord := make(chan struct{}, 1)
 	continueCompletionRecord := make(chan struct{})
@@ -546,8 +549,9 @@ func TestControllerStopDoesNotReuseLateResidentSuppressionFailureAfterIntentReop
 		t.Fatal("acquire service gate for resident")
 	}
 	session.attempts.Add(1)
+	outbox.ociIntentGate = gate
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		outbox: outbox, ociIntentGate: gate, clock: systemClock{}, completionRetry: time.Millisecond,
+		outbox: outbox, clock: systemClock{}, completionRetry: time.Millisecond,
 	})
 	beforeCompletionRecord := make(chan struct{}, 1)
 	continueCompletionRecord := make(chan struct{})
