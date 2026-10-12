@@ -162,12 +162,14 @@ func TestComputerAllowedActionsMatchEveryVerbHTTP(t *testing.T) {
 					exec(`UPDATE backup_copies SET content_digest='invalid' WHERE backup_id=?`, backup.BackupID)
 				}
 				var err error
-				computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+				computer, err = retryTestStatusRead(t.Context(), func() (Computer, error) {
+					return h.store.GetComputer(t.Context(), computer.ComputerID)
+				})
 				if err != nil {
 					t.Fatal(err)
 				}
 				caller := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
-				status, _, wire := h.do(caller, http.MethodGet, "/v1/computers/"+computer.ComputerID, nil)
+				status, _, wire := h.readStatus(t.Context(), caller, "/v1/computers/"+computer.ComputerID)
 				if status != http.StatusOK {
 					t.Fatalf("detail %d: %s", status, wire)
 				}
@@ -178,7 +180,7 @@ func TestComputerAllowedActionsMatchEveryVerbHTTP(t *testing.T) {
 				if len(facts.AllowedActions) != len(testedComputerVerbs) || facts.LastCondition == nil {
 					t.Fatalf("missing Computer facts: %s", wire)
 				}
-				status, _, listWire := h.do(caller, http.MethodGet, "/v1/computers?limit=1", nil)
+				status, _, listWire := h.readStatus(t.Context(), caller, "/v1/computers?limit=1")
 				var page struct {
 					Computers []computerOperatorFacts `json:"computers"`
 				}
@@ -260,8 +262,18 @@ func TestComputerActionsUseActualCallerAndOmitPersonVerbs(t *testing.T) {
 				r := httptest.NewRequest(http.MethodGet, "/v1/computers/"+computer.ComputerID, nil)
 				r.SetPathValue("computer_id", computer.ComputerID)
 				r = r.WithContext(context.WithValue(r.Context(), identityContextKey{}, identity))
-				w := httptest.NewRecorder()
-				h.server.getComputer(w, r)
+				w, err := retryTestStatusRead(t.Context(), func() (*httptest.ResponseRecorder, error) {
+					w := httptest.NewRecorder()
+					h.server.getComputer(w, r)
+					var refusal contract.ErrorResponse
+					if w.Code == http.StatusServiceUnavailable && json.Unmarshal(w.Body.Bytes(), &refusal) == nil && refusal.Error.Code == contract.ErrorUnavailable {
+						return w, &Error{Code: refusal.Error.Code, notRetryable: !refusal.Error.Retryable}
+					}
+					return w, nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
 				var facts computerOperatorFacts
 				if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &facts) != nil || len(facts.AllowedActions) != len(testedComputerVerbs) {
 					t.Fatalf("projection: %d %s", w.Code, w.Body.String())
@@ -295,7 +307,7 @@ func TestComputerActionsConsentAndConditionEvidence(t *testing.T) {
 	h, node, computer := backupHarness(t, 2, nil)
 	computer, _ = startBackupComputer(t, h, node, computer)
 	caller := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
-	status, _, body := h.do(caller, http.MethodGet, "/v1/computers/"+computer.ComputerID, nil)
+	status, _, body := h.readStatus(t.Context(), caller, "/v1/computers/"+computer.ComputerID)
 	var facts computerOperatorFacts
 	if status != http.StatusOK || json.Unmarshal(body, &facts) != nil || facts.LastCondition == nil {
 		t.Fatalf("facts: %d %s", status, body)
@@ -320,7 +332,7 @@ func TestComputerActionsConsentAndConditionEvidence(t *testing.T) {
 	}
 	before, _ := json.Marshal(facts.LastCondition)
 	h.clock.Advance(time.Minute)
-	status, _, body = h.do(caller, http.MethodGet, "/v1/computers/"+computer.ComputerID, nil)
+	status, _, body = h.readStatus(t.Context(), caller, "/v1/computers/"+computer.ComputerID)
 	if status != http.StatusOK || json.Unmarshal(body, &facts) != nil {
 		t.Fatalf("repeat read %d %s", status, body)
 	}
@@ -337,7 +349,7 @@ func TestComputerReadSnapshotDoesNotTakeWriteLock(t *testing.T) {
 	h, _, computer := backupHarness(t, 0, nil)
 	// Finish server startup recovery before acquiring the writer lock.
 	caller := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
-	status, _, body := h.do(caller, http.MethodGet, "/v1/computers", nil)
+	status, _, body := h.readStatus(t.Context(), caller, "/v1/computers")
 	if status != http.StatusOK {
 		t.Fatalf("warm read: %d %s", status, body)
 	}
@@ -352,18 +364,10 @@ func TestComputerReadSnapshotDoesNotTakeWriteLock(t *testing.T) {
 	}
 	for _, path := range []string{"/v1/computers", "/v1/computers/" + computer.ComputerID} {
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://control-plane.invalid"+path, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		response, err := caller.Do(req)
+		status, _, body := h.readStatus(ctx, caller, path)
 		cancel()
-		if err != nil {
-			t.Fatalf("read while writer holds immediate lock: %s: %v", path, err)
-		}
-		response.Body.Close()
-		if response.StatusCode != http.StatusOK {
-			t.Fatalf("read while writer holds lock: %s status=%d", path, response.StatusCode)
+		if status != http.StatusOK {
+			t.Fatalf("read while writer holds lock: %s status=%d body=%s", path, status, body)
 		}
 	}
 }
@@ -449,7 +453,7 @@ func TestComputerActionsNoBackupAndUnknownErrorsFailClosed(t *testing.T) {
 			h, _, computer := backupHarness(t, 2, nil)
 			caller := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
 			// Let startup recovery finish before deliberately breaking a decision input.
-			if status, _, body := h.do(caller, http.MethodGet, "/v1/computers", nil); status != http.StatusOK {
+			if status, _, body := h.readStatus(t.Context(), caller, "/v1/computers"); status != http.StatusOK {
 				t.Fatalf("warm read %d %s", status, body)
 			}
 			if corrupt {
@@ -457,7 +461,7 @@ func TestComputerActionsNoBackupAndUnknownErrorsFailClosed(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			status, _, body := h.do(caller, http.MethodGet, "/v1/computers/"+computer.ComputerID, nil)
+			status, _, body := h.readStatus(t.Context(), caller, "/v1/computers/"+computer.ComputerID)
 			var facts computerOperatorFacts
 			if status != http.StatusOK || json.Unmarshal(body, &facts) != nil || len(facts.AllowedActions) != len(testedComputerVerbs) {
 				t.Fatalf("facts %d %s", status, body)

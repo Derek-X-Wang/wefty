@@ -454,17 +454,12 @@ func getE2EJobContext(t *testing.T, ctx context.Context, client *http.Client, jo
 	if err != nil {
 		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
-	response, err := client.Do(request)
+	status, body, err := testStatusHTTP(ctx, client, request)
 	if err != nil {
 		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
 	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatalf("phase=job observation elapsed=%s job=%s err=%v", time.Since(started), jobID, err)
-	}
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("get job status = %d body=%s", response.StatusCode, body)
+	if status != http.StatusOK {
+		t.Fatalf("get job status = %d body=%s", status, body)
 	}
 	var job l1.Job
 	if err := json.Unmarshal(body, &job); err != nil {
