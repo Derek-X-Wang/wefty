@@ -780,9 +780,47 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 		return failure
 	}
+	finishShutdownCompletion := func(completionFailure destinationError) (errorDestination, error) {
+		cause := context.Cause(ctx)
+		<-renewalDone
+		var abandoned *completionDeliveryAbandoned
+		isAbandoned := errors.As(completionFailure.err, &abandoned)
+		switch completionRoute((outcome.logsPending || isAbandoned) && lifecycle.dependencies.outbox != nil,
+			lifecycle.dependencies.outbox != nil && lifecycle.dependencies.outbox.recoveryStopped()) {
+		case completionRouteHandoff:
+			reconcileCompletion = true
+		case completionRouteInline:
+			// Retry only an abandoned request. An independent delivery verdict
+			// or persistence failure keeps its own meaning after cancellation.
+			if isAbandoned {
+				reconcileCompletion = true
+				recoveryContext, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+				completionFailure.err = lifecycle.dependencies.outbox.recoverShutdownAttempt(recoveryContext, lifecycle.dependencies.client, claim)
+				cancelRecovery()
+				completionFailure.destination = classifyAgentProtocolError(completionFailure.err).destination
+			}
+		}
+		if errors.Is(cause, errAttemptDirectiveCancel) {
+			completionFailure = retryCanceledDelivery(completionFailure)
+			if completionFailure.err == nil {
+				return lifecycle.finishCompletedAttempt(context.WithoutCancel(ctx), claim, outcome.result, outcome.err)
+			}
+			reconcileCompletion = true
+			return completionFailure.destination, fmt.Errorf("agent: cancel while completing: %w", completionFailure.err)
+		}
+		reconcileCompletion = true
+		return errorDestinationUnclassified, ctx.Err()
+	}
 	var completionFailure destinationError
 	select {
 	case completionFailure = <-completionDone:
+		var abandoned *completionDeliveryAbandoned
+		if ctx.Err() != nil && errors.As(completionFailure.err, &abandoned) {
+			cause := context.Cause(ctx)
+			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
+			cancelAttempt(cause)
+			return finishShutdownCompletion(completionFailure)
+		}
 		cancelAttempt(nil)
 	case renewalFailure := <-renewalErrors:
 		cancelAttempt(renewalFailure.err)
@@ -815,35 +853,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		cause := context.Cause(ctx)
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
 		cancelAttempt(cause)
-		completionFailure = <-completionDone
-		<-renewalDone
-		var abandoned *completionDeliveryAbandoned
-		isAbandoned := errors.As(completionFailure.err, &abandoned)
-		switch completionRoute((outcome.logsPending || isAbandoned) && lifecycle.dependencies.outbox != nil,
-			lifecycle.dependencies.outbox != nil && lifecycle.dependencies.outbox.recoveryStopped()) {
-		case completionRouteHandoff:
-			reconcileCompletion = true
-		case completionRouteInline:
-			// Retry only an abandoned request. An independent delivery verdict
-			// or persistence failure keeps its own meaning after cancellation.
-			if isAbandoned {
-				reconcileCompletion = true
-				recoveryContext, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
-				completionFailure.err = lifecycle.dependencies.outbox.recoverShutdownAttempt(recoveryContext, lifecycle.dependencies.client, claim)
-				cancelRecovery()
-				completionFailure.destination = classifyAgentProtocolError(completionFailure.err).destination
-			}
-		}
-		if errors.Is(cause, errAttemptDirectiveCancel) {
-			completionFailure = retryCanceledDelivery(completionFailure)
-			if completionFailure.err == nil {
-				return lifecycle.finishCompletedAttempt(context.WithoutCancel(ctx), claim, outcome.result, outcome.err)
-			}
-			reconcileCompletion = true
-			return completionFailure.destination, fmt.Errorf("agent: cancel while completing: %w", completionFailure.err)
-		}
-		reconcileCompletion = true
-		return errorDestinationUnclassified, ctx.Err()
+		return finishShutdownCompletion(<-completionDone)
 	}
 	<-renewalDone
 	completionFailure = retryCanceledDelivery(completionFailure)
