@@ -393,11 +393,14 @@ func computerPruneDecision(ctx context.Context, tx readModel, computer Computer,
 		return Backup{}, protocolError(contract.ErrorConflict, "Computer %q is being removed", computerID)
 	}
 	backup, err := tx.backup(ctx, request.BackupID)
-	if errors.Is(err, sql.ErrNoRows) || backup.ComputerID != computerID {
+	if errors.Is(err, sql.ErrNoRows) {
 		return Backup{}, protocolError(contract.ErrorNotFound, "Backup %q was not found", request.BackupID)
 	}
 	if err != nil {
 		return Backup{}, internalError(err, "read Computer Backup prune target")
+	}
+	if backup.ComputerID != computerID {
+		return Backup{}, protocolError(contract.ErrorNotFound, "Backup %q was not found", request.BackupID)
 	}
 	if backup.Status == "pruned" {
 		return backup, nil
