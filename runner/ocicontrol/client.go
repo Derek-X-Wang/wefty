@@ -117,7 +117,7 @@ func (client *Client) call(ctx context.Context, method, path string, body io.Rea
 	}
 	result, err := client.http.Do(request)
 	if err != nil {
-		return &httpexchange.Failure{Phase: httpexchange.Request, Cause: fmt.Errorf("call node-local OCI control socket: %w", err)}
+		return &httpexchange.Failure{Phase: httpexchange.Request, Network: "unix", Cause: fmt.Errorf("call node-local OCI control socket: %w", err)}
 	}
 	defer result.Body.Close()
 	// Finish the bounded read before decoding: a valid JSON prefix does not

@@ -26,14 +26,18 @@ func classifyFailedExchange(ctx context.Context, phase httpexchange.Phase, err e
 	}
 	switch phase {
 	case httpexchange.Request:
+		var failure *httpexchange.Failure
 		var dial *net.OpError
-		if errors.As(err, &dial) && dial.Op == "dial" && dial.Net == "unix" {
-			if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
-				return err
-			}
-			if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) {
+		unixRequest := errors.As(err, &failure) && failure.Network == "unix"
+		unixDial := errors.As(err, &dial) && dial.Op == "dial" && dial.Net == "unix"
+		if unixRequest || unixDial {
+			// Only an absent socket or refused Unix dial proves the agent is
+			// not running. Other request failures need local investigation.
+			if unixDial && (errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)) {
 				err = fmt.Errorf("%w; check that the node agent is running", err)
+				return &unavailableError{cause: err}
 			}
+			return err
 		}
 		return &unavailableError{cause: err}
 	case httpexchange.BareStatus, httpexchange.Body:

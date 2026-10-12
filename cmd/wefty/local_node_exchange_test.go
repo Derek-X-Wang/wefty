@@ -63,7 +63,7 @@ func serveLocalExchange(t *testing.T, socket string, handler http.Handler) {
 // Each failure travels through a real Unix socket and the command dispatcher,
 // then through the same exit/stderr decision consumed by main.
 func TestNodeLocalFailedExchange(t *testing.T) {
-	for _, scenario := range []string{"no-file", "no-listener", "permission-denied", "headers-timeout", "stalled-body", "truncated-body", "truncated-valid-body", "truncated-refusal", "bare-5xx", "bounded-5xx", "oversized-5xx", "empty-envelope-5xx", "bare-4xx", "malformed-body", "trailing-malformed-body", "cancel-dial", "cancel-headers", "cancel-body", "cancel-refusal-body"} {
+	for _, scenario := range []string{"no-file", "no-listener", "overlong-path", "not-directory", "peer-uid-refusal", "permission-denied", "headers-timeout", "stalled-body", "truncated-body", "truncated-valid-body", "truncated-refusal", "bare-5xx", "bounded-5xx", "oversized-5xx", "empty-envelope-5xx", "bare-4xx", "malformed-body", "trailing-malformed-body", "cancel-dial", "cancel-headers", "cancel-body", "cancel-refusal-body"} {
 		t.Run(scenario, func(t *testing.T) {
 			root := localExchangeRoot(t)
 			socket := filepath.Join(root, "s")
@@ -74,14 +74,48 @@ func TestNodeLocalFailedExchange(t *testing.T) {
 				}
 				socket = filepath.Join(permissionDir, "s")
 			}
+			if scenario == "overlong-path" {
+				socket = filepath.Join(root, strings.Repeat("s", 128))
+			}
+			if scenario == "not-directory" {
+				parent := filepath.Join(root, "regular-file")
+				if err := os.WriteFile(parent, []byte("not a directory"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				socket = filepath.Join(parent, "s")
+			}
 			config := localExchangeConfig(t, root, socket)
 			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 			defer cancel()
 			wantPhase := httpexchange.Request
 			switch scenario {
-			case "no-file", "cancel-dial":
+			case "no-file", "overlong-path", "not-directory", "cancel-dial":
 				if scenario == "cancel-dial" {
 					cancel()
+				}
+			case "peer-uid-refusal":
+				server, err := ocicontrol.NewServer(socket, ocicontrol.ServiceFuncs{}, uint32(os.Geteuid())+1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				serverCtx, stop := context.WithCancel(t.Context())
+				done := make(chan error, 1)
+				go func() { done <- server.Serve(serverCtx) }()
+				t.Cleanup(func() {
+					stop()
+					if err := <-done; err != nil {
+						t.Errorf("stop control server: %v", err)
+					}
+				})
+				deadline := time.Now().Add(3 * time.Second)
+				for {
+					if info, err := os.Stat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("control server did not become ready")
+					}
+					time.Sleep(10 * time.Millisecond)
 				}
 			case "no-listener":
 				listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
@@ -151,7 +185,7 @@ func TestNodeLocalFailedExchange(t *testing.T) {
 				}
 			}
 			wantExit, wantCode, wantRetry := 13, contract.ErrorUnavailable, true
-			if scenario == "permission-denied" || scenario == "bare-4xx" || strings.Contains(scenario, "malformed-body") || strings.HasPrefix(scenario, "cancel-") {
+			if scenario == "overlong-path" || scenario == "not-directory" || scenario == "peer-uid-refusal" || scenario == "headers-timeout" || scenario == "permission-denied" || scenario == "bare-4xx" || strings.Contains(scenario, "malformed-body") || strings.HasPrefix(scenario, "cancel-") {
 				wantExit, wantCode, wantRetry = 1, contract.ErrorInternal, false
 			}
 			switch scenario {
@@ -180,6 +214,18 @@ func TestNodeLocalFailedExchange(t *testing.T) {
 				if !errors.Is(err, errno) || !strings.Contains(err.Error(), "check that the node agent is running") {
 					t.Fatalf("missing errno or agent guidance: %v", err)
 				}
+			}
+			if scenario != "no-file" && scenario != "no-listener" && strings.Contains(err.Error(), "node agent") {
+				t.Fatalf("unexpected missing-agent hint: %v", err)
+			}
+			if scenario == "overlong-path" && !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("overlong-path cause lost: %v", err)
+			}
+			if scenario == "not-directory" && !errors.Is(err, syscall.ENOTDIR) {
+				t.Fatalf("not-directory cause lost: %v", err)
+			}
+			if scenario == "peer-uid-refusal" && !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+				t.Fatalf("peer refusal did not close the connection: %v", err)
 			}
 			if scenario == "permission-denied" && !errors.Is(err, syscall.EACCES) {
 				t.Fatalf("permission cause lost: %v", err)
@@ -214,7 +260,11 @@ func TestNodeLocalMissingAgentCommandFamily(t *testing.T) {
 		commands = append(commands, []string{"setup-oci"})
 	}
 	for _, command := range commands {
-		t.Run(strings.Join(command[:1], "-"), func(t *testing.T) {
+		name := strings.Join(command, "-")
+		if command[0] == "load-image" {
+			name = "load-image"
+		}
+		t.Run(name, func(t *testing.T) {
 			args := append([]string{"--node-config=" + config, "--json", "node"}, command...)
 			err := run(t.Context(), args, io.Discard, io.Discard)
 			assertExchangeReport(t, err, 13, contract.ErrorUnavailable, true)
@@ -288,23 +338,47 @@ func TestNodeLocalAgentNotRunningFromRealBinary(t *testing.T) {
 }
 
 func TestNodeLocalErrnoAndCancellationClassification(t *testing.T) {
-	for _, errno := range []syscall.Errno{syscall.EACCES, syscall.EPERM, syscall.ENOENT, syscall.ECONNREFUSED} {
+	for _, errno := range []syscall.Errno{syscall.EACCES, syscall.EPERM, syscall.EINVAL, syscall.ENOTDIR, syscall.ETIMEDOUT, syscall.ENOENT, syscall.ECONNREFUSED} {
 		for _, phase := range []httpexchange.Phase{httpexchange.Request, httpexchange.Body, httpexchange.Decode, httpexchange.BareStatus} {
-			cause := &net.OpError{Op: "dial", Net: "unix", Err: &os.SyscallError{Syscall: "connect", Err: errno}}
-			failure := &httpexchange.Failure{Phase: phase, Cause: cause}
-			wantExit, wantCode, wantRetry := 13, contract.ErrorUnavailable, true
-			if phase == httpexchange.Decode || (phase == httpexchange.Request && (errno == syscall.EACCES || errno == syscall.EPERM)) {
-				wantExit, wantCode, wantRetry = 1, contract.ErrorInternal, false
-			}
-			assertExchangeReport(t, classifyFailedExchange(t.Context(), phase, failure), wantExit, wantCode, wantRetry)
-			ctx, cancel := context.WithCancel(t.Context())
-			cancel()
-			err := classifyFailedExchange(ctx, phase, failure)
-			assertExchangeReport(t, err, 1, contract.ErrorInternal, false)
-			if !errors.Is(err, context.Canceled) || !errors.Is(err, errno) {
-				t.Fatalf("causes lost: %v", err)
-			}
+			t.Run(errno.Error()+"/phase-"+strconv.Itoa(int(phase)), func(t *testing.T) {
+				cause := &net.OpError{Op: "dial", Net: "unix", Err: &os.SyscallError{Syscall: "connect", Err: errno}}
+				failure := &httpexchange.Failure{Phase: phase, Cause: cause}
+				wantExit, wantCode, wantRetry := 13, contract.ErrorUnavailable, true
+				if phase == httpexchange.Decode || (phase == httpexchange.Request && (errno != syscall.ENOENT && errno != syscall.ECONNREFUSED)) {
+					wantExit, wantCode, wantRetry = 1, contract.ErrorInternal, false
+				}
+				assertExchangeReport(t, classifyFailedExchange(t.Context(), phase, failure), wantExit, wantCode, wantRetry)
+				ctx, cancel := context.WithCancel(t.Context())
+				cancel()
+				err := classifyFailedExchange(ctx, phase, failure)
+				assertExchangeReport(t, err, 1, contract.ErrorInternal, false)
+				if !errors.Is(err, context.Canceled) || !errors.Is(err, errno) {
+					t.Fatalf("causes lost: %v", err)
+				}
+			})
 		}
+	}
+}
+
+// Request errors need the adapter's network even when there is no dial errno.
+func TestNodeLocalRequestFailureClassification(t *testing.T) {
+	for _, row := range []struct {
+		name  string
+		cause error
+	}{
+		{"eof", io.EOF},
+		{"connection-reset", &net.OpError{Op: "read", Net: "unix", Err: syscall.ECONNRESET}},
+		{"dial-timeout", &net.OpError{Op: "dial", Net: "unix", Err: context.DeadlineExceeded}},
+		{"request-deadline", context.DeadlineExceeded},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			failure := &httpexchange.Failure{Phase: httpexchange.Request, Network: "unix", Cause: row.cause}
+			err := classifyRecordedExchangeError(t.Context(), failure)
+			assertExchangeReport(t, err, 1, contract.ErrorInternal, false)
+			if !errors.Is(err, row.cause) || strings.Contains(err.Error(), "node agent") {
+				t.Fatalf("cause lost or unexpected missing-agent hint: %v", err)
+			}
+		})
 	}
 }
 

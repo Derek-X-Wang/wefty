@@ -79,7 +79,8 @@ mode. Existing take-over refusals may also include their `receipt`. Unknown
 CLI-local failures use `code=internal`, `retryable=false`; they have no server
 request ID. All CLI HTTP adapters — L1/L3, Computer take-over, registry, and the node-local
 control socket — use one
-failed-exchange classification. Connection failures (including dial timeouts,
+failed-exchange classification, with the Unix-socket request exception below.
+Connection failures on TCP adapters (including dial timeouts,
 request deadlines,
 and a deadline or timeout waiting for the display banner after a take-over
 WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
@@ -109,11 +110,14 @@ requests) wins at dial, headers, and body-read time and remains a local failure
 5xx take-over view-open handshake body. Structured server refusals still use
 their adapter-specific decoding and exit rules.
 
-Node-local control socket failures use that same classification. At Unix socket
-dial time, `ECONNREFUSED` or `ENOENT` at the configured or default socket path
-means the node agent is not running: `unavailable`, `retryable=true`, exit 13.
+At the request phase of a node-local Unix-socket exchange, only dial errors
+`ENOENT` and `ECONNREFUSED` mean the node agent is not running:
+`unavailable`, `retryable=true`, exit 13.
 The message tells the operator to check that the node agent is running.
-`EACCES` or `EPERM` at socket dial time remains a local failure (exit 1).
+Every other Unix-socket request failure remains local (exit 1), including
+`EINVAL`, `ENOTDIR`, `EACCES`, `EPERM`, dial or request timeouts, and EOF or
+connection reset before a response.
+An agent that refuses the caller's user ID closes the connection; this reports as a local failure (exit 1).
 Invalid socket configuration remains a local or usage failure. Stalled or
 truncated response bodies and bare non-envelope 5xx responses exit 13;
 a completely read malformed response remains exit 1. Caller cancellation
