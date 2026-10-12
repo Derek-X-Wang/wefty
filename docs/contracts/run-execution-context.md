@@ -991,7 +991,8 @@ workload can alter the retained evidence of its own lineage as well as its own.
 It cannot reach any other run, the agent's bookkeeping — `.published/` is not in
 the volume at all, and for an OCI attempt it is agent-local and per attempt — or
 anything else on the node; and a workload that replaces `events/` with a symlink
-only makes its own mailbox unreadable, because the descent refuses it.
+only makes its own mailbox unreadable, because the descent refuses it; the
+helper session and other attempts remain usable.
 
 The permissions are defense in depth for the ordinary case, a non-root image.
 The volume root, `.wefty/` and `.wefty/<run id>/` are root-owned and traversable

@@ -1254,6 +1254,13 @@ func rpcErrorProvesRuntimeLoss(err *RPCError) bool {
 		if err.EngineFailure != nil && err.EngineFailure.Operation == MethodInventoryHandoffs {
 			return false
 		}
+		// Run-mailbox operations are confined, attempt-scoped evidence
+		// operations. A refused read or removal cannot prove that the helper
+		// session or namespace authority disappeared (#834).
+		if err.EngineFailure != nil && (err.EngineFailure.Operation == MethodListRunMailbox ||
+			err.EngineFailure.Operation == MethodReadRunMailbox || err.EngineFailure.Operation == MethodRemoveRunMailbox) {
+			return false
+		}
 		// Delete is independently bounded and followed by attempt-scoped
 		// verification. Cancellation or deadline expiry here is failed cleanup
 		// for this attempt, not proof that the helper session or namespace
