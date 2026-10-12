@@ -226,9 +226,10 @@ func TestNodeLocalFailedExchange(t *testing.T) {
 			}
 			// The agent closes a refused peer's connection; the client sees
 			// that as EOF, a reset, (when the close beats the request
-			// write) a broken pipe, or net/http's unexported idle-close
-			// error when the close lands before the transport reads.
-			if scenario == "peer-uid-refusal" && !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) &&
+			// write) a broken pipe or, on macOS, a socket that is no longer
+			// connected, or net/http's unexported idle-close error when the
+			// close lands before the transport reads.
+			if scenario == "peer-uid-refusal" && !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ENOTCONN) &&
 				!strings.Contains(err.Error(), "http: server closed idle connection") {
 				t.Fatalf("peer refusal did not close the connection: %v", err)
 			}
