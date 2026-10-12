@@ -164,10 +164,8 @@ func executeComputerGrant(
 		result.ObservationState = "pending"
 		result.LastObservedRevocation = result.Revocation
 		var lastRetryable error
-		fail := func(err error) error {
-			switch decideWaitFailure(ctx, waitCtx, err, &lastRetryable) {
-			case waitRetry:
-				return nil
+		fail := func(err error, verdict waitVerdict) error {
+			switch verdict {
 			case waitCallerStopped:
 				result.ObservationState = "failed"
 				result.ObservationFailure = ctx.Err().Error()
@@ -190,20 +188,21 @@ func executeComputerGrant(
 		}
 		for result.Revocation.State != l1.ComputerPolicyRevocationCompleted {
 			if err := waitCtx.Err(); err != nil {
-				return fail(err)
+				return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 			}
 			delay := min(pollInterval, time.Until(deadline))
 			if err := clients.wait(waitCtx, delay); err != nil {
-				return fail(err)
+				return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 			}
 			if err := waitCtx.Err(); err != nil {
-				return fail(err)
+				return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 			}
 			revocation, err := clients.getComputerPolicyRevocation(waitCtx, result.Revocation.ComputerID,
 				result.Revocation.SubjectFabricID, result.Revocation.SubjectUserID, result.Revocation.PolicyRevision)
 			if err != nil {
-				if err := fail(err); err != nil {
-					return err
+				verdict := decideWaitFailure(ctx, waitCtx, err, &lastRetryable)
+				if verdict != waitRetry {
+					return fail(err, verdict)
 				}
 				continue
 			}

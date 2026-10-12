@@ -32,7 +32,7 @@ func decideWaitFailure(caller, window context.Context, err error, last *error) w
 		*last = nil
 		return waitRetry
 	}
-	if caller.Err() != nil {
+	if caller.Err() != nil || errors.Is(window.Err(), context.Canceled) {
 		return waitCallerStopped
 	}
 	retryable := isRetryableL1Answer(err)

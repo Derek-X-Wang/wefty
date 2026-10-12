@@ -891,14 +891,12 @@ func waitForService(
 		return &mutationWaitTimeoutError{message: message}
 	}
 	var lastRetryable error
-	fail := func(err error) error {
-		switch decideWaitFailure(ctx, waitCtx, err, &lastRetryable) {
+	fail := func(err error, verdict waitVerdict) error {
+		switch verdict {
 		case waitCallerStopped:
 			return ctx.Err()
 		case waitWindowExpired:
 			return timeout(lastRetryable)
-		case waitRetry:
-			return nil
 		default:
 			return err
 		}
@@ -908,13 +906,15 @@ func waitForService(
 		select {
 		case <-waitCtx.Done():
 			timer.Stop()
-			return l1.Job{}, fail(waitCtx.Err())
+			err := waitCtx.Err()
+			return l1.Job{}, fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 		case <-timer.C:
 		}
 		job, err := clients.getService(waitCtx, initial.JobID)
 		if err != nil {
-			if err := fail(err); err != nil {
-				return l1.Job{}, err
+			verdict := decideWaitFailure(ctx, waitCtx, err, &lastRetryable)
+			if verdict != waitRetry {
+				return l1.Job{}, fail(err, verdict)
 			}
 			continue
 		}

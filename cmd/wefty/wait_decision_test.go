@@ -15,6 +15,79 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
+func TestMutationWaitCallerStopAfterWindowDeadline(t *testing.T) {
+	for _, loop := range []string{"service", "storage", "revocation"} {
+		t.Run(loop, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			reads := 0
+			transport := storageRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				reads++
+				<-r.Context().Done()
+				if !errors.Is(r.Context().Err(), context.DeadlineExceeded) {
+					t.Fatalf("read must reach the window deadline before caller stop: %v", r.Context().Err())
+				}
+				cancel()
+				return nil, r.Context().Err()
+			})
+			client := &apiClient{name: "L1", client: &http.Client{Transport: &requireMarkedReads{t: t, base: transport}}}
+			clients := &apiClients{l1: client}
+			var err error
+			switch loop {
+			case "service":
+				_, err = waitForService(ctx, clients, l1.Job{JobID: "svc", State: contract.JobRunning},
+					100*time.Millisecond, time.Millisecond, "stopped", serviceIsQuiescent)
+			case "storage":
+				_, _, err = waitForBackupOperation(ctx, clients, "computer-1", "backup-1",
+					storageWaitFlags{timeout: 100 * time.Millisecond, pollInterval: time.Millisecond})
+			case "revocation":
+				clients, _ = revokeWaitStub(t, func(int32) func(http.ResponseWriter) {
+					return func(http.ResponseWriter) { t.Error("transport must supply the observation failure") }
+				})
+				base := clients.l1.client.Transport
+				clients.l1.client.Transport = storageRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+					if strings.Contains(r.URL.Path, "/revocations/") {
+						return client.client.Transport.RoundTrip(r)
+					}
+					return base.RoundTrip(r)
+				})
+				var stdout, stderr bytes.Buffer
+				err = executeComputerGrant(ctx, clients, true, revokeWaitArgs("100ms", "1ms"), &stdout, &stderr, true)
+			}
+			if reads != 1 || !errors.Is(err, context.Canceled) || commandExitCode(err) != exitFailure {
+				t.Fatalf("caller stop after deadline: reads=%d exit=%d err=%v, want one read and local exit 1",
+					reads, commandExitCode(err), err)
+			}
+		})
+	}
+}
+
+// Cancel after reading the caller's error, before the decision reads the child
+// window's error. This pins the cancellation race without scheduler timing.
+type cancelAfterErrCheckContext struct {
+	context.Context
+	cancel context.CancelFunc
+}
+
+func (ctx cancelAfterErrCheckContext) Err() error {
+	err := ctx.Context.Err()
+	ctx.cancel()
+	return err
+}
+
+func TestWaitDecisionCallerStopsBetweenContextChecks(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	window, closeWindow := openWaitWindow(ctx, time.Second)
+	defer closeWindow()
+	caller := cancelAfterErrCheckContext{Context: ctx, cancel: cancel}
+	err := &apiResponseError{APIError: contract.APIError{Code: contract.ErrorUnavailable, Retryable: true}}
+	var last error
+	if verdict := decideWaitFailure(caller, window, err, &last); verdict != waitCallerStopped {
+		t.Fatalf("caller=%v window=%v verdict=%v, want caller stop", ctx.Err(), window.Err(), verdict)
+	}
+}
+
 func TestMutationWaitDoesNotRetryOtherFailures(t *testing.T) {
 	for _, answer := range []struct {
 		name      string
