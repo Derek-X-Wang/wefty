@@ -158,21 +158,15 @@ func executeComputerGrant(
 		return err
 	}
 	if waitForCompletion && result.Revocation != nil {
-		waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
+		waitCtx, cancel := openWaitWindow(ctx, waitTimeout)
 		defer cancel()
-		// The observation loop retries retryable answers at its own interval
-		// (#763, #773): the shared client's one-shot quiet retry is doubled
-		// backoff on top of it, so the loop's reads are marked out.
-		waitCtx = withoutClientRetry(waitCtx)
 		deadline, _ := waitCtx.Deadline()
 		result.ObservationState = "pending"
 		result.LastObservedRevocation = result.Revocation
 		var lastRetryable error
-		fail := func(err error) error {
-			// Caller cancellation stays local. Only the wait's own deadline
-			// turns a deadline-caused read or sleep failure into exit 14,
-			// as in pollStorageObservation (#722).
-			if ctx.Err() != nil {
+		fail := func(err error, verdict waitVerdict) error {
+			switch verdict {
+			case waitCallerStopped:
 				result.ObservationState = "failed"
 				result.ObservationFailure = ctx.Err().Error()
 				observationErr := fmt.Errorf("%s: %w", computerGrantObservationMessage(result, "observation failed"), ctx.Err())
@@ -180,8 +174,7 @@ func executeComputerGrant(
 					return errors.Join(observationErr, writeErr)
 				}
 				return observationErr
-			}
-			if waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
+			case waitWindowExpired:
 				if lastRetryable != nil {
 					result.ObservationFailure = lastRetryable.Error()
 				}
@@ -195,31 +188,25 @@ func executeComputerGrant(
 		}
 		for result.Revocation.State != l1.ComputerPolicyRevocationCompleted {
 			if err := waitCtx.Err(); err != nil {
-				return fail(err)
+				return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 			}
 			delay := min(pollInterval, time.Until(deadline))
 			if err := clients.wait(waitCtx, delay); err != nil {
-				return fail(err)
+				return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 			}
 			if err := waitCtx.Err(); err != nil {
-				return fail(err)
+				return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 			}
 			revocation, err := clients.getComputerPolicyRevocation(waitCtx, result.Revocation.ComputerID,
 				result.Revocation.SubjectFabricID, result.Revocation.SubjectUserID, result.Revocation.PolicyRevision)
 			if err != nil {
-				// The revocation read goes through the snapshot door, so it
-				// can answer a retryable 503 (`read_snapshot_expired`); inside
-				// the wait window that is one bad read, not a verdict (#763).
-				// Keep polling until the window decides the outcome.
-				if isRetryableL1Answer(err) && ctx.Err() == nil {
-					lastRetryable = err
-					continue
+				verdict := decideWaitFailure(ctx, waitCtx, err, &lastRetryable)
+				if verdict != waitRetry {
+					return fail(err, verdict)
 				}
-				return fail(err)
+				continue
 			}
-			// A good read clears the record: the timeout names a retryable
-			// answer only when the reads at the end were retryable.
-			lastRetryable = nil
+			decideWaitFailure(ctx, waitCtx, nil, &lastRetryable)
 			result.Revocation = &revocation
 			result.LastObservedRevocation = &revocation
 		}
