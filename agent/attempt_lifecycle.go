@@ -700,6 +700,10 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		<-renewalDone
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", cause)
 	}
+	lifecycle.dependencies.observer.setAttempt(attemptID, AttemptFinalizing, outcome.err)
+	if outcome.err != nil {
+		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
+	}
 	if outcome.logsPending && lifecycle.dependencies.outbox != nil {
 		// A bounded log finalization deadline can leave durable events behind.
 		// Hand the persisted result to the outbox while L1 still holds the
@@ -708,10 +712,6 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		cancelAttempt(nil)
 		<-renewalDone
 		return lifecycle.finishCompletedAttempt(ctx, claim, outcome.result, outcome.err)
-	}
-	lifecycle.dependencies.observer.setAttempt(attemptID, AttemptFinalizing, outcome.err)
-	if outcome.err != nil {
-		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
 	}
 	request := completionRequest(claim, outcome.result, outcome.reapEvidence)
 	completionDone := make(chan destinationError, 1)
@@ -1049,7 +1049,7 @@ func startAcknowledgementUndecided(err error) bool {
 
 func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult {
 	if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.RuntimeFailure == nil && result.OutputError == "" {
-		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent, LogEvidenceIncomplete: result.LogEvidenceIncomplete}
 	}
 	return result
 }

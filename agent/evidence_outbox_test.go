@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -3569,13 +3570,14 @@ func (pendingFinalizationLogSink) CloseContext(context.Context) error {
 type finalResultLogRuntime struct {
 	captureRuntime
 	result contract.ProcessResult
+	err    error
 }
 
 func (runtime *finalResultLogRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
 	if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: request.Authority.AttemptID, Stream: contract.LogStdout, Sequence: 0, Bytes: []byte("last output\n")}); err != nil {
 		return workloadrunner.Result{}, err
 	}
-	return workloadrunner.Result{Outcome: runtime.result}, nil
+	return workloadrunner.Result{Outcome: runtime.result}, runtime.err
 }
 
 // A normal finish must drain durable logs before L1 makes the Attempt terminal,
@@ -3583,16 +3585,18 @@ func (runtime *finalResultLogRuntime) Run(ctx context.Context, request workloadr
 // fault rather than relying on a short deadline to decide the ordering.
 func TestNormalFinishKeepsPendingLogsBeforeCompletion(t *testing.T) {
 	exit1 := 1
+	runErr := errors.New("runtime execution failed")
 	for _, test := range []struct {
 		name   string
 		result contract.ProcessResult
+		err    error
 	}{
-		{"exit_control", contract.ProcessResult{ExitCode: &exit1}},
-		{"runtime_failure", contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "attempt-scoped shim loss"}}},
-		{"output_error", contract.ProcessResult{OutputError: "runner output failed"}},
+		{"exit_control", contract.ProcessResult{ExitCode: &exit1}, nil},
+		{"runtime_failure", contract.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{Code: contract.RuntimeFailureUnavailable, Message: "attempt-scoped shim loss"}}, runErr},
+		{"output_error", contract.ProcessResult{OutputError: "runner output failed"}, runErr},
 		// This arm cannot carry the wire flag, but pending logs must still
 		// precede completion. It pins the separate local routing fact.
-		{"pre_start_spawn_error", contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "runtime refused start"}}},
+		{"pre_start_spawn_error", contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "runtime refused start"}}, runErr},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{LeaseDuration: time.Minute})
@@ -3690,9 +3694,18 @@ func TestNormalFinishKeepsPendingLogsBeforeCompletion(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("initial recovery scan did not finish")
 			}
+			observer := newLifecycleObserver(systemClock{})
+			var executionLog string
+			var finalizingStatus AttemptStatus
 			lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, outbox: outbox,
-				runtimes: workloadRuntimeSet{contract.JobKindProcess: &finalResultLogRuntime{result: test.result}}, clock: systemClock{}, renewalInterval: time.Hour, managedResource: &preflightManagedResource{},
-				completionRetry: time.Millisecond, observer: newLifecycleObserver(systemClock{}),
+				runtimes: workloadRuntimeSet{contract.JobKindProcess: &finalResultLogRuntime{result: test.result, err: test.err}}, clock: systemClock{}, renewalInterval: time.Hour, managedResource: &preflightManagedResource{},
+				completionRetry: time.Millisecond, observer: observer,
+				logf: func(format string, args ...any) {
+					if format == "attempt %s execution: %v" {
+						executionLog = fmt.Sprintf(format, args...)
+						finalizingStatus = observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).Attempts[claim.Lease.AttemptID]
+					}
+				},
 				logSinkFactory: func(context.Context, l1.Claim) (attemptLogSink, error) {
 					return pendingFinalizationLogSink{outbox}, nil
 				},
@@ -3700,6 +3713,10 @@ func TestNormalFinishKeepsPendingLogsBeforeCompletion(t *testing.T) {
 			destination, err := lifecycle.execute(t.Context(), *claim, time.Now())
 			if err != nil || destination != errorDestinationUnclassified {
 				t.Fatalf("execute: destination=%v err=%v", destination, err)
+			}
+			if test.err != nil && (executionLog != fmt.Sprintf("attempt %s execution: %v", claim.Lease.AttemptID, test.err) ||
+				finalizingStatus.State != AttemptFinalizing || finalizingStatus.LastError != test.err.Error()) {
+				t.Fatalf("pending-log failure lost diagnostics: log=%q status=%+v", executionLog, finalizingStatus)
 			}
 			// A later wake must also be safe: on the defective path this replays
 			// stranded logs after completion and seals away their durable bytes.
@@ -3734,6 +3751,7 @@ func TestNormalFinishKeepsPendingLogsBeforeCompletion(t *testing.T) {
 type canceledLogRuntime struct {
 	captureRuntime
 	started chan struct{}
+	result  *contract.ProcessResult
 }
 
 func (runtime *canceledLogRuntime) Run(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink) (workloadrunner.Result, error) {
@@ -3742,7 +3760,11 @@ func (runtime *canceledLogRuntime) Run(ctx context.Context, request workloadrunn
 	}
 	close(runtime.started)
 	<-ctx.Done()
-	return workloadrunner.Result{Outcome: contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}}, nil
+	result := contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+	if runtime.result != nil {
+		result = *runtime.result
+	}
+	return workloadrunner.Result{Outcome: result}, nil
 }
 
 func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
@@ -3752,14 +3774,19 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 		directive    l1.AttemptDirective
 		class        string
 		boundRunsOut bool
+		spawnError   bool
 	}{
-		{"shutdown", context.Canceled, "", contract.JobClassOneShot, false},
-		{"shutdown_bound", context.Canceled, "", contract.JobClassOneShot, true},
-		{"cancel", errAttemptDirectiveCancel, "", contract.JobClassOneShot, false},
-		{"session_end", context.Canceled, "", contract.JobClassOneShot, false},
-		{"renewal_cancel", nil, l1.AttemptDirectiveCancel, contract.JobClassOneShot, false},
-		{"renewal_stop", nil, l1.AttemptDirectiveStop, contract.JobClassService, false},
-		{"renewal_restart", nil, l1.AttemptDirectiveRestart, contract.JobClassService, false},
+		{"shutdown", context.Canceled, "", contract.JobClassOneShot, false, false},
+		{"shutdown_bound", context.Canceled, "", contract.JobClassOneShot, true, false},
+		{"cancel", errAttemptDirectiveCancel, "", contract.JobClassOneShot, false, false},
+		{"session_end", context.Canceled, "", contract.JobClassOneShot, false, false},
+		{"renewal_cancel", nil, l1.AttemptDirectiveCancel, contract.JobClassOneShot, false, false},
+		{"renewal_stop", nil, l1.AttemptDirectiveStop, contract.JobClassService, false, false},
+		{"renewal_restart", nil, l1.AttemptDirectiveRestart, contract.JobClassService, false, false},
+		// Spawn failures cannot carry the wire flag. Pin both logs-first
+		// branches using the independent local pending-log fact.
+		{"cancel_spawn_error", errAttemptDirectiveCancel, "", contract.JobClassOneShot, false, true},
+		{"renewal_cancel_spawn_error", nil, l1.AttemptDirectiveCancel, contract.JobClassOneShot, false, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			shutdown := strings.HasPrefix(test.name, "shutdown")
@@ -3795,6 +3822,9 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 			}
 			defer outbox.Close()
 			runtime := &canceledLogRuntime{started: make(chan struct{})}
+			if test.spawnError {
+				runtime.result = &contract.ProcessResult{SpawnError: &contract.SpawnFailure{Code: contract.SpawnFailureRuntimeUnavailable, Message: "runtime refused start"}}
+			}
 			allowDirective := make(chan struct{})
 			allowReplay := make(chan struct{})
 			var allowReplayOnce sync.Once
@@ -4020,7 +4050,11 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 				t.Fatalf("recovered output=%+v err=%v", page, err)
 			}
 			attemptResults, err := store.ListJobAttempts(t.Context(), job.JobID)
-			if err != nil || len(attemptResults) != 1 || attemptResults[0].Result == nil || !attemptResults[0].Result.LogEvidenceIncomplete || attemptResults[0].Result.Signal != "terminated" || attemptResults[0].Result.TerminationCause != contract.TerminationCauseAgent {
+			want := l1.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent, LogEvidenceIncomplete: true}
+			if test.spawnError {
+				want = toL1Result(*runtime.result)
+			}
+			if err != nil || len(attemptResults) != 1 || attemptResults[0].Result == nil || !reflect.DeepEqual(*attemptResults[0].Result, want) {
 				t.Fatalf("recovered completion=%+v err=%v", attemptResults, err)
 			}
 			waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", time.Second)
