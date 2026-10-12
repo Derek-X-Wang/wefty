@@ -212,6 +212,10 @@ type RetainedOCIVolumeFigures struct {
 	// admitted to this volume reached the ledger: its OCI handoff record, never
 	// the helper's, which knows nothing about publication.
 	Published bool `json:"published,omitempty"`
+	// record is the admission this pass attributed the volume from, kept
+	// only to check that an eviction still names the same attempt.
+	record   ociHandoffRecord
+	recorded bool
 }
 
 // RetainedRunFigures is one run's share of a pass.
