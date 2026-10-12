@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -40,7 +42,21 @@ func startOCIIntentFixtureAgent(t *testing.T, a *Agent, store *l1.Store, jobID s
 			if !first.CompareAndSwap(false, true) {
 				return lifecycle.execute(attemptContext, claim, started)
 			}
-			gate := &fixtureRenewalWatchdog{attemptWatchdog: lifecycle.dependencies.watchdog, second: make(chan struct{}), receipts: make(chan struct{}, 2)}
+			// Copy the lifecycle's client so only this first attempt's two
+			// controlled setup RPCs get real-time scheduling headroom. The
+			// L1 lease and manual-clock watchdog deadlines stay at one second:
+			// intent_stop must expire the attempt without waking heartbeat
+			// or crossing the Node's stale/dead thresholds before OCI reopen.
+			client := *lifecycle.dependencies.client
+			httpClient := *client.httpClient
+			transport := &fixtureSetupRenewalTransport{
+				base: httpClient.Transport, path: attemptPath(claim.Job.JobID, claim.Lease.AttemptID) + "/lease",
+			}
+			httpClient.Transport = transport
+			httpClient.Timeout = hostedFixtureTimeout
+			client.httpClient = &httpClient
+			lifecycle.dependencies.client = &client
+			gate := &fixtureRenewalWatchdog{attemptWatchdog: lifecycle.dependencies.watchdog, second: make(chan struct{}), receipts: make(chan struct{}, 2), transport: transport}
 			lifecycle.dependencies.watchdog = gate
 			var arrived atomic.Bool
 			var setupCause error
@@ -103,14 +119,52 @@ func startOCIIntentFixtureAgent(t *testing.T, a *Agent, store *l1.Store, jobID s
 	return cancel, result, cleanup
 }
 
+// The normal renewal loop budgets real HTTP time from a manual-clock lease.
+// While setup is parked, that domain clock cannot expire authority; only the
+// request's real-time deadline could race the runner. Rebind exactly the two
+// setup requests to the lifecycle context, retaining cancellation and a finite
+// hang guard through response decoding. Later renewals keep their normal bound.
+type fixtureSetupRenewalTransport struct {
+	base     http.RoundTripper
+	path     string
+	parent   context.Context
+	requests atomic.Int32
+}
+
+func (transport *fixtureSetupRenewalTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method != http.MethodPost || request.URL.Path != transport.path || transport.requests.Add(1) > 2 {
+		return transport.base.RoundTrip(request)
+	}
+	ctx, cancel := context.WithTimeout(transport.parent, hostedFixtureTimeout)
+	response, err := transport.base.RoundTrip(request.Clone(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	response.Body = &fixtureRenewalResponseBody{ReadCloser: response.Body, cancel: cancel}
+	return response, nil
+}
+
+type fixtureRenewalResponseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body *fixtureRenewalResponseBody) Close() error {
+	defer body.cancel()
+	return body.ReadCloser.Close()
+}
+
 type fixtureRenewalWatchdog struct {
 	attemptWatchdog
-	renewals atomic.Int32
-	second   chan struct{}
-	receipts chan struct{}
+	renewals  atomic.Int32
+	second    chan struct{}
+	receipts  chan struct{}
+	transport *fixtureSetupRenewalTransport
 }
 
 func (watchdog *fixtureRenewalWatchdog) Start(ctx context.Context, authority localAuthority, cancel context.CancelCauseFunc) attemptWatch {
+	watchdog.transport.parent = ctx
 	return &fixtureRenewalWatch{attemptWatch: watchdog.attemptWatchdog.Start(ctx, authority, cancel), owner: watchdog}
 }
 

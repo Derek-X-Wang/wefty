@@ -98,6 +98,10 @@ func TestComputerAllowedActionsMatchEveryVerbHTTP(t *testing.T) {
 		for _, verb := range testedComputerVerbs {
 			t.Run(state+"/"+verb, func(t *testing.T) {
 				h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 4)
+				// This matrix pins action parity, not snapshot hygiene. Keep the
+				// shared fixture at the production limit and give only this
+				// test's projections headroom on loaded runners.
+				h.store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 				h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 					return contract.ComputerTokenRevocationReceipt{ComputerID: request.ComputerID, ComputerAttemptID: request.ComputerAttemptID, SubmitIntentRevision: request.NewSubmitIntentRevision, CommittedAt: h.clock.Now()}, nil
 				}}

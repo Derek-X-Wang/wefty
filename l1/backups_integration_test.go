@@ -44,7 +44,9 @@ func startBackupComputer(t *testing.T, h *integrationHarness, node Node, compute
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = retryTestStatusRead(t.Context(), func() (Computer, error) {
+		return h.store.GetComputer(t.Context(), computer.ComputerID)
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
