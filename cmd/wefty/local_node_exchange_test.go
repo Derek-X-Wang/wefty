@@ -224,7 +224,10 @@ func TestNodeLocalFailedExchange(t *testing.T) {
 			if scenario == "not-directory" && !errors.Is(err, syscall.ENOTDIR) {
 				t.Fatalf("not-directory cause lost: %v", err)
 			}
-			if scenario == "peer-uid-refusal" && !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+			// The agent closes a refused peer's connection; the client sees
+			// that as EOF, a reset, or (when the close beats the request
+			// write) a broken pipe.
+			if scenario == "peer-uid-refusal" && !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) {
 				t.Fatalf("peer refusal did not close the connection: %v", err)
 			}
 			if scenario == "permission-denied" && !errors.Is(err, syscall.EACCES) {
