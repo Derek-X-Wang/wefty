@@ -402,6 +402,9 @@ func retryTakeoverViewPolicyInstallation(ctx context.Context, window, interval t
 		select {
 		case <-retryContext.Done():
 			timer.Stop()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, err
 		case <-timer.C:
 		}

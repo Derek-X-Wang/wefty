@@ -102,3 +102,40 @@ func TestProvenanceWalkToleratesARetryableAnswer(t *testing.T) {
 		}
 	})
 }
+
+func TestProvenanceKeepsPermanentRefusalAtDeadline(t *testing.T) {
+	for _, retryFirst := range []bool{true, false} {
+		name := "without earlier unavailable"
+		if retryFirst {
+			name = "after earlier unavailable"
+		}
+		t.Run(name, func(t *testing.T) {
+			transport := &refusedAtDeadlineTransport{
+				first: contract.APIError{Code: contract.ErrorUnavailable, Message: "old snapshot answer", Retryable: true,
+					Details: map[string]any{"reason": "read_snapshot_expired"}},
+				firstCode: http.StatusServiceUnavailable,
+				late: contract.APIError{Code: contract.ErrorForbidden, Message: "provenance forbidden", Retryable: false,
+					RequestID: "provenance-refusal"},
+				lateCode: http.StatusForbidden,
+			}
+			if !retryFirst {
+				transport.reads.Store(1)
+			}
+			client := &apiClient{name: "L1", client: &http.Client{Transport: &requireMarkedReads{t: t, base: transport}}}
+			output := storageMutationOutput{MutationApplied: true, Observation: &storageWaitObservation{Status: "observed",
+				waitDeadline: time.Now().Add(300 * time.Millisecond), waitPollInterval: time.Millisecond}}
+			err := attachStorageProvenance(t.Context(), &apiClients{l1: client}, "computer-1", &output, nil)
+			var refusal *apiResponseError
+			var timeout *mutationWaitTimeoutError
+			if commandExitCode(err) != exitUnauthorized || !errors.As(err, &refusal) || errors.As(err, &timeout) ||
+				refusal.APIError.Code != contract.ErrorForbidden || refusal.APIError.Retryable ||
+				refusal.APIError.RequestID != "provenance-refusal" {
+				t.Fatalf("403 at provenance deadline: exit=%d err=%v, want original refusal", commandExitCode(err), err)
+			}
+			if !output.MutationApplied || output.Observation.Status != "failed" || output.StorageProvenance != nil ||
+				!strings.Contains(output.Observation.Error, "provenance forbidden") || strings.Contains(output.Observation.Error, "old snapshot answer") {
+				t.Fatalf("refused provenance lost evidence or named stale answer: %+v", output)
+			}
+		})
+	}
+}

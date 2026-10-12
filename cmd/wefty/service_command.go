@@ -762,6 +762,11 @@ func executeServiceLogs(
 	for {
 		page, err := clients.getServiceLogs(followCtx, jobID, cursor, limit)
 		if err != nil {
+			// A follower who left stopped the command, whatever the read
+			// answered; a one-shot read keeps the answer it got.
+			if (follow || all) && ctx.Err() != nil {
+				return ctx.Err()
+			}
 			// The follow window ending is a clean stop, whatever the read
 			// answered with; cancellation is the leaving reader.
 			if ctx.Err() == nil && followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
@@ -781,13 +786,16 @@ func executeServiceLogs(
 				if sleepFollowRetry(followCtx, pollInterval) {
 					continue
 				}
+				// The reader left during the retry sleep: cancellation, not
+				// the stale 503.
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 				// The retry sleep hit the window end: stop the same way an
 				// interrupted follow does.
 				if followFor > 0 && followCtx.Err() == context.DeadlineExceeded {
 					return nil
 				}
-				// The reader left during the retry sleep: cancellation, not
-				// the stale 503.
 				return followCtx.Err()
 			}
 			return err
@@ -900,6 +908,9 @@ func waitForService(
 		}
 		job, err := clients.getService(waitCtx, initial.JobID)
 		if err != nil {
+			if ctx.Err() != nil {
+				return l1.Job{}, ctx.Err()
+			}
 			// Only deadline-shaped answers become the timeout; a refusal
 			// arriving at the deadline keeps its own classification (#763).
 			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded &&
