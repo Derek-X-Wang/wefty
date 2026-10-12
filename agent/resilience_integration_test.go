@@ -25,6 +25,7 @@ func assertAgentReregistersAfterControlPlaneReturns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"node-1": l1.DefaultNodePolicy("linux"),

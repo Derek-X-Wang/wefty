@@ -1936,6 +1936,7 @@ func assertSilentRenewalHangCannotOutliveLocalAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"node-1": l1.DefaultNodePolicy("linux"),
@@ -3220,6 +3221,7 @@ func startFailureServerWithPoliciesAndLease(t *testing.T, network *plain.Network
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: policies})
 	if err != nil {
 		store.Close()

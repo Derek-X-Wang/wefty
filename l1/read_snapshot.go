@@ -449,7 +449,8 @@ func readJobPageLimit(ctx context.Context, maximum int) int {
 }
 
 // readSnapshotHardLimitContextKey overrides the hard hold limit. Test-only:
-// it has no production caller, and the unexported key keeps it that way.
+// it has no production caller. Per-request probes take precedence over the
+// Store override used by integration harnesses outside this package.
 type readSnapshotHardLimitContextKey struct{}
 
 func (r *databaseReads) pageCutoffReached() bool {
@@ -487,15 +488,12 @@ func (s *Store) personObservationFallbackCount() uint64 {
 
 // withReadSnapshot anchors SQLite before sampling the clock. The derived
 // context marks nested acquisition as a programming error. Independent reads
-// may share a parent context; pool admission remains bounded at 200 ms.
+// may share a parent context; production pool admission is bounded at 200 ms.
 func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor, use func(context.Context, readModel) error) (err error) {
 	if ctx.Value(readSnapshotContextKey{}) != nil {
 		return errNestedReadSnapshot
 	}
-	limit := readSnapshotHardLimit
-	if override, ok := ctx.Value(readSnapshotHardLimitContextKey{}).(time.Duration); ok {
-		limit = override
-	}
+	limit := s.snapshotHardLimit(ctx)
 	admission, cancelAdmission := context.WithTimeout(ctx, limit)
 	conn, err := s.readDB.Conn(admission)
 	cancelAdmission()

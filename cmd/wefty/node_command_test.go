@@ -158,6 +158,7 @@ func newNodeCLIHarness(t *testing.T) *nodeCLIHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	server, err := l1.NewServer(controlFabric, store, l1.ServerConfig{})
 	if err != nil {
 		_ = store.Close()
