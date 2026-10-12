@@ -862,7 +862,8 @@ func attachStorageProvenance(ctx context.Context, clients *apiClients, computerI
 	}
 	if ctx.Err() != nil {
 		err = ctx.Err()
-	} else if observationCtx.Err() == context.DeadlineExceeded {
+	} else if observationCtx.Err() == context.DeadlineExceeded &&
+		(errors.Is(err, context.DeadlineExceeded) || isRetryableL1Answer(err)) {
 		timeout := "timed out waiting for mutation completion provenance"
 		if lastRetryable != nil {
 			timeout += " (last L1 answer: " + lastRetryable.Error() + ")"

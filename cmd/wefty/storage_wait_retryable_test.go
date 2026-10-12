@@ -615,3 +615,94 @@ func TestFollowLoopsCancelledDuringRetrySleep(t *testing.T) {
 		}
 	})
 }
+
+// cancelAfterDecodedAnswerTransport cancels when the client closes a fully
+// decoded error body, before the polling loop handles the typed answer.
+// Unlike a stalled body, this exercises the loop's decision after decoding.
+type cancelAfterDecodedAnswerTransport struct {
+	cancel context.CancelFunc
+	status int
+	answer contract.APIError
+}
+
+func (transport cancelAfterDecodedAnswerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	body, err := json.Marshal(contract.ErrorResponse{Error: transport.answer})
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{StatusCode: transport.status, Header: http.Header{"Content-Type": {"application/json"}},
+		Body: &cancelOnAnswerClose{Reader: bytes.NewReader(body), cancel: transport.cancel}, Request: request}, nil
+}
+
+type cancelOnAnswerClose struct {
+	io.Reader
+	cancel context.CancelFunc
+}
+
+func (body *cancelOnAnswerClose) Close() error {
+	body.cancel()
+	return nil
+}
+
+func TestWaitForServiceCallerStopAfterDecodedAnswer(t *testing.T) {
+	for _, answer := range []struct {
+		status    int
+		code      contract.ErrorCode
+		retryable bool
+	}{
+		{http.StatusServiceUnavailable, contract.ErrorUnavailable, true},
+		{http.StatusForbidden, contract.ErrorForbidden, false},
+		{http.StatusNotFound, contract.ErrorNotFound, false},
+	} {
+		t.Run(string(answer.code), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			transport := cancelAfterDecodedAnswerTransport{cancel: cancel, status: answer.status,
+				answer: contract.APIError{Code: answer.code, Message: "decoded answer", Retryable: answer.retryable}}
+			client := &apiClient{name: "L1", client: &http.Client{Transport: &requireMarkedReads{t: t, base: transport}}}
+			_, err := waitForService(ctx, &apiClients{l1: client}, l1.Job{JobID: "svc", State: contract.JobRunning},
+				time.Second, time.Millisecond, "stopped", func(job l1.Job) bool { return job.State == contract.JobStopped })
+			if commandExitCode(err) != exitFailure || !errors.Is(err, context.Canceled) || isRetryableL1Answer(err) {
+				t.Fatalf("caller stopped after decoded %s: exit=%d err=%v, want local cancellation", answer.code, commandExitCode(err), err)
+			}
+		})
+	}
+}
+
+func TestStorageWaitCallerStopAfterDecodedUnavailable(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	transport := cancelAfterDecodedAnswerTransport{cancel: cancel, status: http.StatusServiceUnavailable,
+		answer: contract.APIError{Code: contract.ErrorUnavailable, Message: "decoded answer", Retryable: true}}
+	client := &apiClient{name: "L1", client: &http.Client{Transport: &requireMarkedReads{t: t, base: transport}}}
+	_, _, err := waitForBackupOperation(ctx, &apiClients{l1: client}, "computer-1", "backup-1",
+		storageWaitFlags{timeout: time.Second, pollInterval: time.Millisecond})
+	if commandExitCode(err) != exitFailure || !errors.Is(err, context.Canceled) || isRetryableL1Answer(err) {
+		t.Fatalf("storage caller stopped after decoded 503: exit=%d err=%v, want local cancellation", commandExitCode(err), err)
+	}
+}
+
+func TestServiceLogFollowCallerStopAfterDecodedUnavailable(t *testing.T) {
+	for _, bounded := range []bool{false, true} {
+		name := "unbounded follow"
+		if bounded {
+			name = "bounded follow"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			transport := cancelAfterDecodedAnswerTransport{cancel: cancel, status: http.StatusServiceUnavailable,
+				answer: contract.APIError{Code: contract.ErrorUnavailable, Message: "decoded answer", Retryable: true}}
+			client := &apiClient{name: "L1", client: &http.Client{Transport: &requireMarkedReads{t: t, base: transport}}}
+			args := []string{"svc", "--follow", "--poll-interval", "1m"}
+			if bounded {
+				args = append(args, "--follow-for", "1m")
+			}
+			var stdout, stderr bytes.Buffer
+			err := executeServiceLogs(ctx, &apiClients{l1: client}, true, args, &stdout, &stderr)
+			if commandExitCode(err) != exitFailure || !errors.Is(err, context.Canceled) || isRetryableL1Answer(err) {
+				t.Fatalf("follow stopped after decoded 503: exit=%d err=%v, want local cancellation", commandExitCode(err), err)
+			}
+		})
+	}
+}
