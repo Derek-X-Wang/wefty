@@ -228,6 +228,27 @@ func (h *retentionHarness) retainOCI(ownerKey, attemptID string, published bool)
 	}
 }
 
+// rerunOCI is a whole rerun into ownerKey's volume: lease, admission, finish,
+// release, the same as an attempt, plus the helper's new receipt.
+func (h *retentionHarness) rerunOCI(helper *fakeHelperHandoffRoot, ownerKey, attemptID string, published bool) {
+	h.t.Helper()
+	spec := ociHandoffClaim(ownerKey, attemptID).Job.Spec
+	lease := h.admitOCI(ownerKey, attemptID)
+	if err := h.manager.finishOCIHandoff(legacyExecutionHandoff(spec), "node-1", attemptID, true, published); err != nil {
+		h.t.Error(err)
+	}
+	lease.release()
+	name, err := ocihelper.DeterministicHandoffVolumeDirectory(ownerKey)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	for i := range helper.volumes {
+		if helper.volumes[i].Name == name {
+			helper.volumes[i].TerminalAt = h.now
+		}
+	}
+}
+
 // admitOCI takes the volume's lease and writes the admission, and hands the
 // lease back so a test can hold it the way a running attempt does.
 func (h *retentionHarness) admitOCI(ownerKey, attemptID string) *handoffLease {
@@ -1082,6 +1103,34 @@ func TestATruncatedMeasurementWithholdsUnpublishedEviction(t *testing.T) {
 	}
 }
 
+// TestAnUnreadablePublishedVolumeWithholdsUnpublishedEviction is the same
+// rule as an unfinished measurement. A complete listing can contain a volume
+// the helper could not measure, even with no charge and no truncated flag.
+func TestAnUnreadablePublishedVolumeWithholdsUnpublishedEviction(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retainOCI("run_p_oci", "attempt-1", true)
+	harness.now = harness.now.Add(time.Hour)
+	harness.retain("run_u", true, false, map[string]int{"result.json": 16, "payload.bin": 4 << 20})
+	name, err := ocihelper.DeterministicHandoffVolumeDirectory("run_p_oci")
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{{
+		Name: name, Anomalies: []string{string(ocihelper.HandoffAnomalyVolumeUnreadable)},
+	}}}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+
+	harness.budget(1 << 20)
+
+	if !harness.exists("run_u") {
+		t.Fatalf("the node gave up its only copy of run_u while a published volume was unmeasured")
+	}
+	if !harness.logged(handoffUnpublishedEvictionWithheld) {
+		t.Fatalf("the node withheld the eviction without saying so under its token: %v", harness.logs)
+	}
+}
+
 // TestANodeWithOneRootStillGivesUpUnpublishedResults is the other side of the
 // gate: a node with no OCI runtime has one root, it read it whole, and
 // withholding there would make a full node stop serving for a root it does not
@@ -1169,6 +1218,119 @@ func TestARerunBetweenSelectionAndDeletionIsNotGivenUp(t *testing.T) {
 	// really was oldest once the rerun had moved.
 	if harness.exists("run_other") {
 		t.Fatalf("the node chose again and then gave up nothing: %v", harness.logs)
+	}
+}
+
+// TestAnOCIRerunBetweenSelectionAndLeaseIsNotGivenUp is the OCI side of
+// the rerun rule: publication is unchanged, but the chosen volume is no longer
+// the oldest result once a rerun finishes before the pass takes its lease.
+func TestAnOCIRerunBetweenSelectionAndLeaseIsNotGivenUp(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retainOCI("run_a_oci", "attempt-1", false)
+	t1 := harness.now
+	harness.now = harness.now.Add(time.Hour)
+	harness.retainOCI("run_b_oci", "attempt-1", false)
+	t2 := harness.now
+	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
+		ociVolume(t, "run_a_oci", 2<<20, 2, t1),
+		ociVolume(t, "run_b_oci", 2<<20, 2, t2),
+	}}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+	harness.manager.nodeBytes = 3 << 20
+
+	reran := false
+	handoffBudgetRace = func(stage string, candidate handoffEvictionCandidate) {
+		if reran || stage != handoffBudgetCandidateChosen || candidate.ownerKey != "run_a_oci" {
+			return
+		}
+		reran = true
+		harness.now = harness.now.Add(2 * time.Hour)
+		harness.rerunOCI(helper, "run_a_oci", "attempt-2", false)
+	}
+	t.Cleanup(func() { handoffBudgetRace = nil })
+	harness.budget(3 << 20)
+	// The admission snapshot is for eviction alone. The status JSON keeps
+	// the same volume figures and publishes none of the private record.
+	encoded, err := json.Marshal(Status{RetainedResults: &harness.measured})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projected struct {
+		RetainedResults struct {
+			OCI struct {
+				PerVolume []map[string]json.RawMessage `json:"per_volume"`
+			} `json:"oci"`
+		} `json:"retained_results"`
+	}
+	if err := json.Unmarshal(encoded, &projected); err != nil {
+		t.Fatal(err)
+	}
+	if len(projected.RetainedResults.OCI.PerVolume) != 2 {
+		t.Fatalf("the status lost the measured volumes: %s", encoded)
+	}
+	for _, volume := range projected.RetainedResults.OCI.PerVolume {
+		for field := range volume {
+			switch field {
+			case "name", "owner_key", "entries", "logical_bytes", "deduped_bytes", "charged_bytes",
+				"terminal_at", "terminal_known", "live", "truncated", "published":
+			default:
+				t.Fatalf("the status serialized a private eviction field %q: %s", field, encoded)
+			}
+		}
+	}
+	if !reran {
+		t.Fatal("the fixture never reached the window it exists to stage")
+	}
+	for _, owner := range helper.attempted {
+		if owner == "run_a_oci" {
+			t.Fatalf("the node asked the helper to give up a freshly rerun volume ahead of an older one; evicted=%v", helper.evicted)
+		}
+	}
+	if !slices.Equal(helper.evicted, []string{"run_b_oci"}) {
+		t.Fatalf("the node gave up %v, want the older run_b_oci", helper.evicted)
+	}
+}
+
+// TestAnOCIRerunDuringAProcessDeletionIsNotGivenUp covers the same rule
+// across roots. The pass carries OCI figures across a process deletion, so
+// those figures can name an older admission even before the volume is chosen.
+func TestAnOCIRerunDuringAProcessDeletionIsNotGivenUp(t *testing.T) {
+	harness := newRetentionHarness(t, 7*24*time.Hour)
+	harness.retain("run_p1", true, true, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	harness.now = harness.now.Add(time.Hour)
+	harness.retainOCI("run_a_oci", "attempt-1", true)
+	ta := harness.now
+	harness.now = harness.now.Add(time.Hour)
+	harness.retain("run_p2", true, true, map[string]int{"result.json": 16, "payload.bin": 2 << 20})
+	helper := &fakeHelperHandoffRoot{volumes: []workloadrunner.RetainedHandoffVolume{
+		ociVolume(t, "run_a_oci", 2<<20, 2, ta),
+	}}
+	harness.manager.ociHandoffs = helper
+	harness.manager.ociEvictor = helper
+	harness.manager.nodeBytes = 3 << 20
+
+	reran := false
+	handoffBudgetRace = func(stage string, candidate handoffEvictionCandidate) {
+		if reran || stage != handoffBudgetCandidateChosen || candidate.runID != "run_p1" {
+			return
+		}
+		reran = true
+		harness.now = harness.now.Add(2 * time.Hour)
+		harness.rerunOCI(helper, "run_a_oci", "attempt-2", true)
+	}
+	t.Cleanup(func() { handoffBudgetRace = nil })
+	if err := harness.manager.accountNode(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !reran {
+		t.Fatal("the fixture never reached the window it exists to stage")
+	}
+	if len(helper.evicted) != 0 {
+		t.Fatalf("a freshly rerun volume was given up ahead of older run_p2 (p2 exists=%t)", harness.exists("run_p2"))
+	}
+	if harness.exists("run_p1") || harness.exists("run_p2") {
+		t.Fatalf("the node kept an older process result after choosing again: %v", harness.logs)
 	}
 }
 

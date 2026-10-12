@@ -1458,9 +1458,11 @@ a run's only copy; the next hourly pass tries again.
 roots whole.** An empty list of published candidates is not the same fact as a
 node holding none: a page of the helper's root nobody read, a read that failed
 outright, or a run whose tree the pass could not finish can each hide the
-published result the node is supposed to give up first. A pass that cannot say
-it read both roots to the end therefore gives up nothing rather than the only
-copy of what some run did, and says so under a fixed log token. Everything else
+published result the node is supposed to give up first. An OCI volume reported
+as `volume_unreadable` or `subtree_replaced` counts as incomplete knowledge even
+when the listing is complete and the volume reports zero charge. A pass that
+cannot say it read both roots to the end therefore gives up nothing rather than
+the only copy of what some run did, and says so under a fixed log token. Everything else
 it does is unchanged — it reports every figure, it still gives up published
 results, and expiry is untouched. The helper's root is read as pages with a
 cursor for exactly this reason: a bound with no way to ask for the rest left
