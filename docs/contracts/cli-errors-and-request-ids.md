@@ -77,14 +77,21 @@ with optional `details` and `request_id`. This includes global and command flag
 errors and failures raised inside the CLI. Parser usage text is suppressed in JSON
 mode. Existing take-over refusals may also include their `receipt`. Unknown
 CLI-local failures use `code=internal`, `retryable=false`; they have no server
-request ID. Connection failures (including dial timeouts, request deadlines,
+request ID. All CLI HTTP adapters — L1/L3, Computer take-over, and registry — use one
+failed-exchange classification. Connection failures (including dial timeouts,
+request deadlines,
 and a deadline or timeout waiting for the display banner after a take-over
 WebSocket upgrade) and non-envelope HTTP 5xx responses use `code=unavailable`,
 `retryable=true`,
-exit 13. This includes non-envelope 5xx from the Computer take-over front door
+exit 13. Response-body I/O failures, including a stalled or truncated body,
+follow the same rule on every adapter, including registry token reads and
+take-over take, release, and refused view-open handshakes. A completely read
+body that fails to decode is a local failure (exit 1). A take-over WebSocket
+session that ends normally is also a local failure. Non-envelope 5xx include
+responses from the registry and the Computer take-over front door
 on `services takeover view`, `take`, and `release`, such as a plain-text 503
 when the display is not ready or Fabric identity cannot be verified. The
-unavailable message retains the front door's plain-text reason after bounding
+unavailable message retains each adapter's plain-text reason after bounding
 the response to 4096 bytes, dropping any split UTF-8 rune and non-printable
 characters except tab. Structured take-over refusals, including HTTP 5xx on view
 open, take, and release, retain the server's code, message, retryability, details,
@@ -96,7 +103,10 @@ retry with backoff within its authority. A bare `context.DeadlineExceeded` is
 not evidence of unavailability: only a typed transport/service availability
 failure or the named server-envelope cases map to exit 13. Caller cancellation
 (including Ctrl-C during L1/L3 response-body reads, take-over or registry
-requests) remains a local failure (exit 1), not `unavailable`.
+requests) wins at dial, headers, and body-read time and remains a local failure
+(exit 1), not `unavailable`. This includes cancellation while reading a refused
+5xx take-over view-open handshake body. Structured server refusals still use
+their adapter-specific decoding and exit rules.
 
 A Computer storage, resize, or removal `--wait` that expires after acceptance
 exits 14 and emits a CLI-local `error.code=wait_timeout`, `retryable=false` on
