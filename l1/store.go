@@ -72,6 +72,7 @@ type StoreOptions struct {
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
+	readSnapshotHardLimitForTest      time.Duration
 	readDB                            *sql.DB
 	readSnapshotLastLog               atomic.Int64
 	logf                              func(string, ...any)

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -337,6 +338,7 @@ func newEmptyL1LookupClient(t *testing.T) (*L1Client, *sql.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	probe, err := sql.Open("sqlite", path)
 	if err != nil {
 		store.Close()

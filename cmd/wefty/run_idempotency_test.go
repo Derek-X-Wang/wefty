@@ -65,6 +65,7 @@ func runRetryLedger(t *testing.T) (*l3.Store, string, string, *atomic.Bool) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	controlStore.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() { _ = controlStore.Close() })
 	controlServer, err := l1.NewServer(control, controlStore, l1.ServerConfig{})
 	if err != nil {

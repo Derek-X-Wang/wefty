@@ -416,10 +416,7 @@ func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Cont
 	if ctx.Value(readSnapshotContextKey{}) != nil {
 		return errNestedReadSnapshot
 	}
-	limit := readSnapshotHardLimit
-	if override, ok := ctx.Value(readSnapshotHardLimitContextKey{}).(time.Duration); ok {
-		limit = override
-	}
+	limit := s.snapshotHardLimit(ctx)
 	admission, cancelAdmission := context.WithTimeout(ctx, limit)
 	conn, err := s.db.Conn(admission)
 	cancelAdmission()

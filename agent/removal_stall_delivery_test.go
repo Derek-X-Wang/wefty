@@ -79,6 +79,7 @@ func newStalledRemovalFixtureForKind(t *testing.T, computerKind, withBackup bool
 		cancel()
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	policy := l1.DefaultNodePolicy("linux")
 	policy.Tags = append(policy.Tags, contract.StableNodeTagPrefix+"stall-node")
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{

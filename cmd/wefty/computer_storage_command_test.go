@@ -794,6 +794,7 @@ func newStorageCLIHarness(t *testing.T) *storageCLIHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	server, err := l1.NewServer(controlFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"storage-node": {Tags: []string{contract.StableNodeTagPrefix + "storage-node"}, MaxOneshotSlots: 1, MaxServiceSlots: 2},
 	}})

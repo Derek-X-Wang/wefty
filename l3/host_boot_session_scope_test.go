@@ -33,6 +33,7 @@ func newHostRevocationHarness(t *testing.T) *hostRevocationHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	l1Server, err := l1.NewServer(control, l1Store, l1.ServerConfig{RunLedgerNodeID: "run-ledger"})
 	if err != nil {
 		t.Fatal(err)

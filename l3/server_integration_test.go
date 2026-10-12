@@ -55,6 +55,7 @@ func newIntegrationHarnessWithL1Options(t *testing.T, l1Options l1.StoreOptions,
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{AllowSelfAssertedPersonIdentities: len(allowPersons) > 0 && allowPersons[0], NodePolicies: map[string]l1.NodePolicy{
 		"node-1": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-1"),
 	}})
