@@ -1074,8 +1074,16 @@ finalization error is expiry of the agent-owned bound. Shutdown, cancellation
 and renewal cancel/stop/restart directives also persist completion before
 releasing it to ordered recovery when bounded finalization left logs pending.
 This local routing fact is independent of the primary result arm and wire flag,
-including the `spawn_error` exception. These paths stop renewal and return
-without extending log finalization or waiting for recovery. While L1 reports
+including the `spawn_error` exception. One route decision selects live delivery
+when no logs are pending, even after recovery has stopped; live delivery keeps
+its transient retries and backoff. Pending logs require an ordered hand-off while
+recovery is running, or inline delivery under the existing operation bound when
+process-lifetime recovery is stopping after finalization joins. An abandoned
+in-flight completion is routed like pending evidence; a delivery verdict or local
+persistence failure keeps its own meaning. The rule applies to every cancellation
+cause. Cancellation provenance still determines the result and return value.
+These paths stop renewal without extending log finalization; a hand-off returns
+without waiting for recovery. While L1 reports
 the attempt live, recovery drains its durable logs before completion; an
 accepted completion would otherwise close their admission. The existing bounded
 lost-attempt recovery rule applies after lease expiry.
