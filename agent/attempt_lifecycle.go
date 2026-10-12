@@ -106,7 +106,6 @@ type attemptLifecycleDependencies struct {
 	prepareServiceEndpoint func(context.Context) (serviceRuntimeEndpoint, error)
 	prepareAuthorityLoss   func(context.Context, string) error
 	allowsStart            func(contract.JobSpec) bool
-	ociIntentGate          *ociIntentCompletionGate
 	currentOCIGeneration   func() (workloadrunner.RuntimeGeneration, bool)
 	embargoOCIRuntime      func(workloadrunner.RuntimeGeneration)
 	recoverOCIRuntime      func(context.Context, workloadrunner.RuntimeGeneration) error
@@ -895,92 +894,29 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 }
 
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
-	// ledgerRefusals counts consecutive run_ledger_unavailable answers. L1
-	// has already committed such a completion and owes only the run ledger's
-	// token revocation, which it settles on its own; every replay still costs
-	// L1 a run-ledger call, so the replay backs off like evidence recovery
-	// instead of retrying at the completion interval for the whole outage.
+	// Tests may use a lifecycle without durable storage; production borrows the
+	// process-lifetime outbox, which also owns its intent gate.
+	outbox := lifecycle.dependencies.outbox
+	if outbox == nil {
+		outbox = &evidenceOutbox{}
+	}
+	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID,
+		fencingToken: claim.Lease.FencingToken, kind: claim.Job.Spec.Kind, class: claim.Job.Spec.Class}
+	// L1 has committed ledger refusals and still owes revocation. Replays cost
+	// another ledger call, so back off while preserving the identical body.
 	ledgerRefusals := 0
 	for {
-		var observation OCIIntentObservation
-		var releaseIntent func()
-		if requiresOCIIntentFence(claim.Job.Spec.Kind, claim.Job.Spec.Class) && lifecycle.dependencies.ociIntentGate != nil {
-			var intentErr error
-			observation, releaseIntent, intentErr = lifecycle.dependencies.ociIntentGate.beginCompletion(context.WithoutCancel(ctx))
-			if intentErr != nil {
-				lifecycle.log("attempt %s withheld completion: %v", claim.Lease.AttemptID, intentErr)
-				if lifecycle.dependencies.outbox != nil {
-					if receiptErr := lifecycle.dependencies.outbox.withholdCompletion(context.WithoutCancel(ctx), claim.Lease.AttemptID, "intent_authority_unavailable", 0); receiptErr != nil {
-						intentErr = errors.Join(intentErr, receiptErr)
-					}
-				}
-				return destinationError{destination: errorDestinationUnclassified, err: intentErr}
-			}
-			if !lifecycle.dependencies.ociIntentGate.allows(observation) {
-				if lifecycle.dependencies.outbox != nil {
-					suppressionContext, cancelSuppression := lifecycle.dependencies.ociIntentGate.beginSuppression(ctx)
-					err := lifecycle.dependencies.outbox.suppressCompletion(suppressionContext, claim.Lease.AttemptID, observation.Revision)
-					cancelSuppression()
-					persistenceErr := lifecycle.dependencies.ociIntentGate.finishSuppression(claim.Lease.AttemptID, observation, err)
-					releaseIntent()
-					if persistenceErr != nil {
-						return destinationError{destination: errorDestinationUnclassified, err: persistenceErr}
-					}
-					return destinationError{destination: errorDestinationUnclassified, err: errOCIIntentDisabled}
-				}
-				releaseIntent()
-				return destinationError{destination: errorDestinationUnclassified, err: errOCIIntentDisabled}
-			}
-		}
-		_, err := lifecycle.dependencies.client.Complete(ctx, claim.Job.JobID, claim.Lease.AttemptID, request)
-		if releaseIntent != nil {
-			releaseIntent()
-		}
-		if err != nil {
-			var ownProtocolResponse *ProtocolError
-			cause := context.Cause(ctx)
-			hasOwnProtocolResponse := errors.As(err, &ownProtocolResponse) && (cause == nil || !errors.Is(err, cause))
-			if cause != nil && !hasOwnProtocolResponse {
-				// A canceled HTTP request has no L1 delivery verdict. Its cause may
-				// itself be a ProtocolError from renewal, but classifying that cause
-				// as the /complete response can falsely acknowledge or seal evidence.
-				return destinationError{destination: errorDestinationUnclassified, err: &completionDeliveryAbandoned{cause: cause, err: err}}
-			}
-			if protocolErrorCode(err) == contract.ErrorLeaseExpired {
-				if lifecycle.dependencies.outbox != nil {
-					if releaseErr := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID, observation.Revision); releaseErr != nil {
-						return destinationError{destination: errorDestinationUnclassified, err: releaseErr}
-					}
-				}
-				return destinationError{destination: errorDestinationAttemptAuthority, err: err}
-			}
-			classification := classifyAgentProtocolError(err)
-			if classification.destination != errorDestinationTransient {
-				if classification.destination == errorDestinationAttemptAuthority && lifecycle.dependencies.outbox != nil {
-					if sealErr := lifecycle.dependencies.outbox.sealAttemptEvidence(
-						context.WithoutCancel(ctx), claim.Lease.AttemptID,
-						"attempt authority no longer accepts completion evidence", protocolErrorCode(err),
-					); sealErr != nil {
-						return destinationError{destination: errorDestinationUnclassified, err: errors.Join(err, sealErr)}
-					}
-				}
-				return destinationError{destination: classification.destination, err: err}
-			}
-			if code := protocolErrorCode(err); permanentEvidenceRejection(code) {
-				// L1 permanently rejected this completion -- a spawn_error after
-				// a committed OCI Started, for one, is a 409 conflict. While the
-				// attempt renews, an identical replay only repeats that verdict,
-				// so the live attempt stops here, ending its renewal. The refusal
-				// is this attempt's own, not the node session's. Evidence recovery
-				// applies its rules to the durable completion: it drains logs L1
-				// still accepts, replays the completion, and seals it when L1
-				// permanently rejects it again. L1 settles the attempt when its
-				// lease expires.
-				lifecycle.log("attempt %s completion permanently rejected by L1; releasing it to evidence recovery: %v", claim.Lease.AttemptID, err)
-				return destinationError{destination: errorDestinationAttemptAuthority, err: err}
-			}
+		verdict := outbox.deliverCompletion(ctx, lifecycle.dependencies.client, attempt, request, completionDeliveryLive)
+		switch verdict.kind {
+		case completionSuppressed:
+			return destinationError{err: errOCIIntentDisabled}
+		case completionWithheld:
+			lifecycle.log("attempt %s withheld completion: %v", claim.Lease.AttemptID, verdict.err)
+		case completionPermanentRefusal:
+			lifecycle.log("attempt %s completion permanently rejected by L1; releasing it to evidence recovery: %v", claim.Lease.AttemptID, verdict.err)
+		case completionRetry, completionLedgerBackoff:
 			delay := lifecycle.dependencies.completionRetry
-			if protocolErrorCode(err) == contract.ErrorRunLedgerUnavailable {
+			if verdict.kind == completionLedgerBackoff {
 				ledgerRefusals++
 				delay = evidenceRecoveryBackoff(delay, ledgerRefusals)
 			} else {
@@ -990,20 +926,14 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 			select {
 			case <-ctx.Done():
 				stopTimer(timer)
-				// The transient response did not settle delivery. Preserve the
-				// cancellation cause just as an abandoned HTTP request does, so
-				// a one-shot cancel can retry the identical completion now.
-				return destinationError{destination: errorDestinationUnclassified, err: &completionDeliveryAbandoned{cause: context.Cause(ctx), err: ctx.Err()}}
+				// A transient response did not settle delivery. Keep cancellation
+				// provenance so one-shot cancel retries the identical completion now.
+				return destinationError{err: &completionDeliveryAbandoned{cause: context.Cause(ctx), err: ctx.Err()}}
 			case <-timer.C():
 			}
 			continue
 		}
-		if lifecycle.dependencies.outbox != nil {
-			if err := lifecycle.dependencies.outbox.completionDelivered(context.WithoutCancel(ctx), claim.Lease.AttemptID, observation.Revision); err != nil {
-				return destinationError{destination: errorDestinationUnclassified, err: err}
-			}
-		}
-		return destinationError{}
+		return destinationError{destination: verdict.destination, err: verdict.err}
 	}
 }
 

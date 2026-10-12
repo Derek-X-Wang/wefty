@@ -681,7 +681,6 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		prepareServiceEndpoint: prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:   a.prepareAuthorityLoss,
 		allowsStart:            allowsStart,
-		ociIntentGate:          a.ociIntentGate,
 		currentOCIGeneration:   a.currentOCIRuntimeGeneration,
 		embargoOCIRuntime:      a.embargoOCIRuntimeLoss,
 		recoverOCIRuntime:      a.recoverOCIRuntimeAfterLoss,

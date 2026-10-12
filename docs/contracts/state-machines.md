@@ -1088,6 +1088,16 @@ the attempt live, recovery drains its durable logs before completion; an
 accepted completion would otherwise close their admission. The existing bounded
 lost-attempt recovery rule applies after lease expiry.
 
+Live completion and replay share the evidence outbox's single delivery step:
+one intent observation and fence, one completion call, and the existing durable
+effects. Accepted or `lease_expired` completion becomes delivered; withheld
+intent remains retryable and suppressed intent stays excluded from completion
+replay while logs drain. Attempt-authority refusals seal evidence; live permanent
+body refusals hand off for replay to seal. Node-session refusals retain evidence,
+with replay's stop-and-escalate refusals parked on slow rechecks. Live retries
+and ledger backoff remain in the live loop; replay is one pass. Local persistence
+failures remain local and never become an L1 verdict.
+
 ## Attempt authority modes (#807)
 
 The private Attempt authority owner holds decisions and effects inside the
