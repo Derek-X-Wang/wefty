@@ -21,6 +21,9 @@ const (
 type Failure struct {
 	Phase Phase
 	Cause error
+	// Network identifies an adapter's transport even when its cause (such as
+	// EOF or a request deadline) has no net.OpError. Empty leaves it unknown.
+	Network string
 }
 
 func (f *Failure) Error() string { return f.Cause.Error() }
