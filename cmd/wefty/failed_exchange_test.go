@@ -43,6 +43,7 @@ func TestHTTPFailedExchangeAdapters(t *testing.T) {
 				ctx, cancel := context.WithTimeout(t.Context(), budget)
 				defer cancel()
 				arrived := make(chan struct{}, 1)
+				bodyRelease := make(chan struct{})
 				notify := func() {
 					select {
 					case arrived <- struct{}{}:
@@ -85,7 +86,7 @@ func TestHTTPFailedExchangeAdapters(t *testing.T) {
 					_, _ = w.Write([]byte("{"))
 					if failure == "stalled-body" || failure == "cancel-body" {
 						w.(http.Flusher).Flush()
-						<-r.Context().Done()
+						<-bodyRelease
 					}
 				})
 				var server *httptest.Server
@@ -95,6 +96,9 @@ func TestHTTPFailedExchangeAdapters(t *testing.T) {
 					server = httptest.NewServer(handler)
 				}
 				defer server.Close()
+				// Release body handlers before Close waits for them. A request
+				// cancellation must not let the handler complete the body.
+				defer close(bodyRelease)
 				address, _ := url.Parse(server.URL)
 				dialRelease := make(chan struct{})
 				defer close(dialRelease)
