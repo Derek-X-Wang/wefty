@@ -286,6 +286,7 @@ func newAttemptLifecycle(dependencies attemptLifecycleDependencies) *attemptLife
 type runOutcome struct {
 	result        contract.ProcessResult
 	reapEvidence  workloadrunner.ReapEvidence
+	logsPending   bool
 	err           error
 	durabilityErr error
 }
@@ -513,11 +514,12 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptRunning, nil)
 		}
 		var reapEvidence workloadrunner.ReapEvidence
-		result, err := lifecycle.runWorkloadContexts(executionContext, finalization, claim, &reapEvidence, func(unlock func()) {
+		var logsPending bool
+		result, err := lifecycle.runWorkloadContexts(executionContext, finalization, claim, &reapEvidence, &logsPending, func(unlock func()) {
 			handoffUnlock = unlock
 		}, deadmanAdmission)
 		deadmanAdmission.terminate()
-		completed <- runOutcome{result: result, reapEvidence: reapEvidence, err: err}
+		completed <- runOutcome{result: result, reapEvidence: reapEvidence, logsPending: logsPending, err: err}
 	}()
 	persistCompletion := func(outcome *runOutcome, agentTerminated bool) error {
 		// The helper has refused expired authority. L1 may still hold a lease,
@@ -570,7 +572,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			return errorDestinationUnclassified, nil
 		}
 		var failure destinationError
-		if result.LogEvidenceIncomplete && lifecycle.dependencies.outbox != nil {
+		if outcome.logsPending && lifecycle.dependencies.outbox != nil {
 			// Keep logs ahead of completion. Directives leave Run's recovery
 			// loop alive; shutdown cancels it, so deliver this attempt inline
 			// while its lease may still admit an authoritative completion.
@@ -616,7 +618,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 				return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
 			}
 			var completionFailure destinationError
-			if result.LogEvidenceIncomplete && lifecycle.dependencies.outbox != nil {
+			if outcome.logsPending && lifecycle.dependencies.outbox != nil {
 				// Directives use the same ordered handoff as normal completion,
 				// without extending finalization or waiting for recovery.
 				reconcileCompletion = true
@@ -698,7 +700,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		<-renewalDone
 		return errorDestinationAttemptAuthority, fmt.Errorf("agent: authority watchdog: %w", cause)
 	}
-	if outcome.result.LogEvidenceIncomplete && lifecycle.dependencies.outbox != nil {
+	if outcome.logsPending && lifecycle.dependencies.outbox != nil {
 		// A bounded log finalization deadline can leave durable events behind.
 		// Hand the persisted result to the outbox while L1 still holds the
 		// attempt live so recovery drains those logs strictly before completion.
@@ -1056,7 +1058,7 @@ func (lifecycle *attemptLifecycle) runWorkload(ctx context.Context, claim l1.Cla
 	claim = lifecycle.adoptHandoffDirectory(claim)
 	finalization := newAttemptFinalization(ctx, lifecycle.dependencies.finalizationTimeout)
 	defer finalization.stop()
-	return lifecycle.runWorkloadContexts(ctx, finalization, claim, nil, nil, nil)
+	return lifecycle.runWorkloadContexts(ctx, finalization, claim, nil, nil, nil, nil)
 }
 
 func (lifecycle *attemptLifecycle) runWorkloadContexts(
@@ -1064,6 +1066,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	finalization *attemptFinalization,
 	claim l1.Claim,
 	reapEvidence *workloadrunner.ReapEvidence,
+	logsPending *bool,
 	retainHandoffLock func(func()),
 	deadmanAdmission *attemptDeadmanAdmission,
 ) (contract.ProcessResult, error) {
@@ -1430,12 +1433,19 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if uploadIncomplete {
 			lifecycle.log("agent: %s exceeded the bounded finalization deadline for attempt %s", uploadStage, claim.Lease.AttemptID)
 		}
-		if (outputIncomplete || uploadIncomplete) && (result.ExitCode != nil || result.Signal != "") {
+		if outputIncomplete || uploadIncomplete {
+			if logsPending != nil {
+				*logsPending = true
+			}
 			// The spool retains unacknowledged events for later recovery. A busy
 			// destination consuming the bounded finalization window is therefore
 			// evidence incompleteness, not a replacement for the payload's
-			// already-observed terminal result.
-			result.LogEvidenceIncomplete = true
+			// already-observed terminal result. Keep the local routing fact even
+			// for a pre-Started spawn failure, whose wire result cannot carry
+			// additive runtime evidence.
+			if result.SpawnError == nil {
+				result.LogEvidenceIncomplete = true
+			}
 		}
 		finalizationErr := errors.Join(recoveryErr, reapErr, outputErr, uploadErr)
 		if finalizationErr != nil {
