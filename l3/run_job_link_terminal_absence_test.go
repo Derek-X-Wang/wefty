@@ -94,24 +94,44 @@ func TestMigratedLinkValidationLeavesRecoveryBudget(t *testing.T) {
 	prepareLegacyLinkUpgrade(t, s)
 	s = reopenLinkStore(t, s, path)
 	client := &migratedLinkClient{JobClient: &recordingJobClient{}, read: func(ctx context.Context, id string) (l1.Job, error) {
+		// Spend the entire validation share. Ordinary recovery must still run
+		// in this pass, even when ledger work is slow on a loaded runner.
 		<-ctx.Done()
 		return l1.Job{}, ctx.Err()
 	}}
+	lookupStarted := make(chan error, 1)
 	lookup := &cancelDuringRecoveryLookup{lookup: func(ctx context.Context, key string) (l1.Job, error) {
-		if ctx.Err() != nil {
-			t.Errorf("ordinary recovery started with spent budget: %v", ctx.Err())
-		}
+		lookupStarted <- ctx.Err()
 		return l1.Job{JobID: "recovered-job"}, nil
 	}}
-	r, err := NewReconciler(s, client, ReconcilerConfig{DispatchLookup: lookup, DispatchRecoveryBudget: 200 * time.Millisecond})
+	// Use the production-sized budget so the half-share bound decides the
+	// outcome, with ample time for local ledger work after validation ends.
+	r, err := NewReconciler(s, client, ReconcilerConfig{DispatchLookup: lookup, DispatchRecoveryBudget: DefaultDispatchRecoveryBudget})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.ReconcileOnce(context.Background()); err == nil {
-		t.Fatal("slow validation not reported")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	passDone := make(chan error, 1)
+	go func() { passDone <- r.ReconcileOnce(ctx) }()
+	select {
+	case err := <-lookupStarted:
+		if err != nil {
+			t.Fatalf("ordinary recovery started with spent budget: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("watchdog expired waiting for ordinary recovery to start")
+	}
+	select {
+	case err := <-passDone:
+		if err == nil {
+			t.Fatal("slow validation not reported")
+		}
+	case <-ctx.Done():
+		t.Fatal("watchdog expired waiting for the recovery pass to finish")
 	}
 	if lookup.calls != 1 {
-		t.Fatalf("ordinary recovery starved: lookups=%d", lookup.calls)
+		t.Fatalf("ordinary recovery lookups=%d, want 1", lookup.calls)
 	}
 	record, err := s.GetRun(context.Background(), runIDForDispatchKey(t, s, keys[0]))
 	if err != nil || record.L1JobID != "recovered-job" {
