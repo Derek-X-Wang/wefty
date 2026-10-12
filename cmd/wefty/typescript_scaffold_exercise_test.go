@@ -156,6 +156,7 @@ func startTypeScriptExerciseStack(t *testing.T) *apiClients {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() { l1Store.Close() })
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"node-ts": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-ts"),

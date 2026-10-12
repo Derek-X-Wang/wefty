@@ -33,6 +33,7 @@ func startInterceptedL1(t *testing.T, network *plain.Network, nodeID string, lea
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		nodeID: {Tags: []string{ociStartTag}, MaxOneshotSlots: 1, MaxServiceSlots: 1},

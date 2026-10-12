@@ -1079,9 +1079,11 @@ when no logs are pending, even after recovery has stopped; live delivery keeps
 its transient retries and backoff. Pending logs require an ordered hand-off while
 recovery is running, or inline delivery under the existing operation bound when
 process-lifetime recovery is stopping after finalization joins. An abandoned
-in-flight completion is routed like pending evidence; a delivery verdict or local
-persistence failure keeps its own meaning. The rule applies to every cancellation
-cause. Cancellation provenance still determines the result and return value.
+in-flight completion is routed like pending evidence once the caller's context
+is canceled, whether its result or shutdown wins the lifecycle's select. A
+delivery verdict or local persistence failure keeps its own meaning. The rule
+applies to every cancellation cause. Cancellation provenance still determines
+the result and return value.
 These paths stop renewal without extending log finalization; a hand-off returns
 without waiting for recovery. While L1 reports
 the attempt live, recovery drains its durable logs before completion; an

@@ -462,8 +462,10 @@ logs first, then completion, under `context.WithoutCancel(ctx)` plus the existin
 joins, independently of the cancellation cause. If shutdown interrupts an
 in-flight completion, an abandoned request is routed like pending evidence: hand
 off while recovery is running, or deliver the unchanged persisted request inline
-when recovery is stopping. A delivery verdict or local persistence failure keeps
-its own meaning; only an abandoned request is retried. This does not extend log
+when recovery is stopping. Once the caller's context is canceled, this rule
+applies whether the abandoned completion result or shutdown wins the lifecycle's
+select. A delivery verdict or local persistence failure keeps its own meaning;
+only an abandoned request is retried. This does not extend log
 finalization. If inline delivery is incomplete, durable evidence stays on disk
 for delivery on the next start, when L1 may already have settled the attempt by
 lease expiry and can accept completion only as late evidence. Cancellation and

@@ -1173,6 +1173,56 @@ func TestAdapterUnscopedRuntimeFailureStillRecoversTheSession(t *testing.T) {
 	}
 }
 
+func TestAdapterRuntimeLossNamesRunGenerationAfterImagePreparationReplacement(t *testing.T) {
+	engine := &adapterTestEngine{watch: ocihelper.WatchResponse{RuntimeFailure: "rpc error: code = Unavailable desc = connection refused"}}
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
+	defer closeAdapter()
+	imageGeneration, ok := barrier.Generation()
+	if !ok {
+		t.Fatal("image preparation helper generation is unavailable")
+	}
+	request := adapterTestRequest()
+	var runGeneration ocihelper.HelperSession
+	request.OCIImageReady = func() {
+		barrier.Invalidate()
+		if err := barrier.Ensure(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		session, _, err := barrier.ExecutionSnapshot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		runGeneration = helperSession(session)
+		if runGeneration == imageGeneration {
+			t.Fatal("replacement during image preparation did not change helper generation")
+		}
+		adapter.mu.Lock()
+		adapter.probePlatforms[runGeneration] = ocihelper.OCIPlatform{OS: "linux", Architecture: "amd64"}
+		adapter.mu.Unlock()
+	}
+	var admitted, reported workloadrunner.RuntimeGeneration
+	request.OCIHelperAdmitted = func(generation workloadrunner.RuntimeGeneration) error {
+		admitted = generation
+		return nil
+	}
+	recoveries := 0
+	request.OCIRuntimeUnavailable = func(generation workloadrunner.RuntimeGeneration) {
+		recoveries++
+		reported = generation
+	}
+	result, err := adapter.Run(t.Context(), request, nil)
+	if err != nil || result.Outcome.RuntimeFailure == nil || result.Outcome.RuntimeFailure.Code != contract.RuntimeFailureUnavailable {
+		t.Fatalf("unscoped Watch failure outcome = %+v err=%v, want runtime_unavailable", result.Outcome, err)
+	}
+	want := workloadrunner.RuntimeGeneration{InstanceID: runGeneration.HelperInstanceID, Generation: runGeneration.SessionGeneration}
+	if admitted != want {
+		t.Fatalf("admission generation = %+v, want Run helper B %+v", admitted, want)
+	}
+	if recoveries != 1 || reported != want {
+		t.Fatalf("recoveries = %d loss generation = %+v, want one recovery of Run helper B %+v (image helper A %+v)", recoveries, reported, want, imageGeneration)
+	}
+}
+
 // The helper publishes a broken Wait's terminal within one task-release
 // bound (its shim-loss probe spends that bound) and seals logs within one
 // seal bound after it, so the post-KILL Watch budget must cover both with a
@@ -2065,16 +2115,24 @@ func TestAdapterEngineLossMidPullFailsFast(t *testing.T) {
 		ensureErrors:  []error{ocihelper.NewImageMechanicsError(ocihelper.ImageFailureFact{Kind: ocihelper.ImageFailureEngineLoss, TopLevelDigest: adapterTestDigest}, errors.New("containerd stopped"))},
 		ensureEntered: make(chan struct{}), releaseEnsure: make(chan struct{}),
 	}
-	adapter, closeAdapter := startAdapterTestServer(t, engine)
+	adapter, barrier, _, closeAdapter := startAdapterTestServerWithSnapshots(t, engine, ImagePolicy{})
 	defer closeAdapter()
+	imageGeneration, ok := barrier.Generation()
+	if !ok {
+		t.Fatal("image preparation helper generation is unavailable")
+	}
 	type outcome struct {
 		result workloadrunner.Result
 		err    error
 	}
 	done := make(chan outcome, 1)
 	recoveries := 0
+	var reported workloadrunner.RuntimeGeneration
 	request := adapterTestRequest()
-	request.OCIRuntimeUnavailable = func(workloadrunner.RuntimeGeneration) { recoveries++ }
+	request.OCIRuntimeUnavailable = func(generation workloadrunner.RuntimeGeneration) {
+		recoveries++
+		reported = generation
+	}
 	go func() {
 		result, err := adapter.Run(t.Context(), request, nil)
 		done <- outcome{result: result, err: err}
@@ -2088,8 +2146,9 @@ func TestAdapterEngineLossMidPullFailsFast(t *testing.T) {
 	if engine.ensureCalls != 1 {
 		t.Fatalf("engine loss retried EnsureImage %d times", engine.ensureCalls)
 	}
-	if recoveries != 1 {
-		t.Fatalf("engine loss recovery calls = %d, want 1", recoveries)
+	want := workloadrunner.RuntimeGeneration{InstanceID: imageGeneration.HelperInstanceID, Generation: imageGeneration.SessionGeneration}
+	if recoveries != 1 || reported != want {
+		t.Fatalf("engine loss recovery calls = %d generation = %+v, want one recovery of image helper A %+v", recoveries, reported, want)
 	}
 }
 

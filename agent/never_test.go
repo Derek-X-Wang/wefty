@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -423,7 +422,7 @@ func TestNeverProcessPublicContractWithRealAgent(t *testing.T) {
 			defer stopServer()
 			client := newHTTPClient(network.NewFabric(fabric.Identity{NodeID: "app", Tags: []string{l1.DefaultClientPrincipalTag}}), "wefty://control-plane")
 			defer client.CloseIdleConnections()
-			call := func(method, path string, value any, want int) l1.Job {
+			call := func(ctx context.Context, method, path string, value any, want int) l1.Job {
 				t.Helper()
 				var payload []byte
 				if value != nil {
@@ -433,22 +432,17 @@ func TestNeverProcessPublicContractWithRealAgent(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				req, err := http.NewRequestWithContext(t.Context(), method, "http://l1"+path, bytes.NewReader(payload))
+				req, err := http.NewRequestWithContext(ctx, method, "http://l1"+path, bytes.NewReader(payload))
 				if err != nil {
 					t.Fatal(err)
 				}
 				req.Header.Set("Content-Type", "application/json")
-				resp, err := client.Do(req)
+				status, body, err := testStatusHTTP(ctx, client, req)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer resp.Body.Close()
-				body, err := io.ReadAll(resp.Body)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if resp.StatusCode != want {
-					t.Fatalf("%s %s = %d %s", method, path, resp.StatusCode, body)
+				if status != want {
+					t.Fatalf("%s %s = %d %s", method, path, status, body)
 				}
 				var job l1.Job
 				if err := json.Unmarshal(body, &job); err != nil {
@@ -474,12 +468,14 @@ func TestNeverProcessPublicContractWithRealAgent(t *testing.T) {
 					t.Errorf("agent shutdown: %v", err)
 				}
 			}()
-			job := call(http.MethodPost, "/v1/jobs", contract.JobSpec{SchemaVersion: 1, DispatchKey: "never-real", Kind: "process", Class: "service", Restart: "never", Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", fmt.Sprintf("exit %d", code)}, WorkingDirectory: t.TempDir()}}, http.StatusCreated)
+			job := call(t.Context(), http.MethodPost, "/v1/jobs", contract.JobSpec{SchemaVersion: 1, DispatchKey: "never-real", Kind: "process", Class: "service", Restart: "never", Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", fmt.Sprintf("exit %d", code)}, WorkingDirectory: t.TempDir()}}, http.StatusCreated)
 			wait := func() l1.Job {
 				t.Helper()
 				deadline := time.Now().Add(5 * time.Second)
+				ctx, cancel := context.WithDeadline(t.Context(), deadline)
+				defer cancel()
 				for {
-					got := call(http.MethodGet, "/v1/jobs/"+job.JobID+"?class=service", nil, http.StatusOK)
+					got := call(ctx, http.MethodGet, "/v1/jobs/"+job.JobID+"?class=service", nil, http.StatusOK)
 					if got.PolicyStop != nil {
 						return got
 					}
@@ -504,9 +500,9 @@ func TestNeverProcessPublicContractWithRealAgent(t *testing.T) {
 				t.Fatalf("automatic retry scheduled = %+v", stopped.ServiceJob)
 			}
 			if code == 0 {
-				call(http.MethodPut, "/v1/jobs/"+job.JobID+"/desired-state?class=service", l1.ServiceDesiredStateRequest{DesiredState: contract.ServiceDesiredRunning}, http.StatusAccepted)
+				call(t.Context(), http.MethodPut, "/v1/jobs/"+job.JobID+"/desired-state?class=service", l1.ServiceDesiredStateRequest{DesiredState: contract.ServiceDesiredRunning}, http.StatusAccepted)
 			} else {
-				call(http.MethodPost, "/v1/jobs/"+job.JobID+"/restart?class=service", l1.ServiceRestartRequest{IdempotencyKey: "resume"}, http.StatusAccepted)
+				call(t.Context(), http.MethodPost, "/v1/jobs/"+job.JobID+"/restart?class=service", l1.ServiceRestartRequest{IdempotencyKey: "resume"}, http.StatusAccepted)
 			}
 			resumed := wait()
 			if resumed.State != want || resumed.CurrentAttemptID == stopped.CurrentAttemptID {
@@ -628,17 +624,18 @@ func TestNeverProcessStartSurvivesLostAcknowledgement(t *testing.T) {
 	if calls := startCalls.Load(); calls < 2 {
 		t.Fatalf("start acknowledgement calls = %d, want a retry after the lost answer", calls)
 	}
-	running, err := store.GetJob(t.Context(), job.JobID)
-	if err != nil || running.State != contract.JobRunning || len(running.LastFailure) != 0 {
-		t.Fatalf("service after a lost start answer = %+v %v", running, err)
+	statusClient := newHTTPClient(network.NewFabric(fabric.Identity{NodeID: "status-client", Tags: []string{l1.DefaultClientPrincipalTag}}), "wefty://control-plane")
+	defer statusClient.CloseIdleConnections()
+	running := getTestServiceJob(t, t.Context(), statusClient, job.JobID)
+	if running.State != contract.JobRunning || len(running.LastFailure) != 0 {
+		t.Fatalf("service after a lost start answer = %+v", running)
 	}
 	close(release)
 	deadline := time.Now().Add(10 * time.Second)
+	readCtx, cancelRead := context.WithDeadline(t.Context(), deadline)
+	defer cancelRead()
 	for {
-		got, err := store.GetJob(t.Context(), job.JobID)
-		if err != nil {
-			t.Fatal(err)
-		}
+		got := getTestServiceJob(t, readCtx, statusClient, job.JobID)
 		if got.State == contract.JobFailed {
 			t.Fatalf("service failed after a lost start answer: %+v", got.ServiceJob)
 		}

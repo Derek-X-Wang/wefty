@@ -1117,15 +1117,53 @@ func (runtime *deadlineManagedVolumeRuntime) FinalizeManagedVolumes(_ context.Co
 	return nil
 }
 
+// completionResultSelectGate parks execute while it evaluates the in-flight
+// completion select. The test can cancel both lifetimes before releasing it.
+type completionResultSelectGate struct {
+	disabledAttemptWatch
+	selects int
+	entered chan struct{}
+	release chan struct{}
+	cancel  context.CancelCauseFunc
+}
+
+func (gate *completionResultSelectGate) Start(_ context.Context, _ localAuthority, cancel context.CancelCauseFunc) attemptWatch {
+	gate.cancel = cancel
+	return gate
+}
+
+func (gate *completionResultSelectGate) Failures() <-chan error {
+	gate.selects++
+	if gate.selects == 2 {
+		close(gate.entered)
+		<-gate.release
+	}
+	return nil
+}
+
+type completionResultSelectContext struct {
+	context.Context
+	done <-chan struct{}
+}
+
+func (ctx completionResultSelectContext) Done() <-chan struct{} {
+	// Delay the caller's shutdown channel until execute has joined. Err and
+	// Cause report cancellation immediately; the watchdog cancels the attempt
+	// through its real fence, leaving only completionDone selectable.
+	return ctx.done
+}
+
 func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 	for _, test := range []struct {
-		name         string
-		cause        error
-		stopRecovery bool
+		name                string
+		cause               error
+		stopRecovery        bool
+		forceCompletionDone bool
 	}{
-		{"running_recovery", context.Canceled, false},
-		{"shutdown_stopped_recovery", context.Canceled, true},
-		{"cancel_stopped_recovery", errAttemptDirectiveCancel, true},
+		{"running_recovery", context.Canceled, false, false},
+		{"shutdown_stopped_recovery", context.Canceled, true, false},
+		{"cancel_stopped_recovery", errAttemptDirectiveCancel, true, false},
+		{"completion_done_wins_shutdown_stopped_recovery", context.Canceled, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			firstCompletionStarted := make(chan l1.CompletionRequest, 1)
@@ -1194,9 +1232,25 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 			})
 			ctx, cancel := context.WithCancelCause(t.Context())
 			defer cancel(nil)
+			var executeContext context.Context = ctx
+			var gate *completionResultSelectGate
+			if test.forceCompletionDone {
+				gate = &completionResultSelectGate{entered: make(chan struct{}), release: make(chan struct{})}
+				lifecycle.dependencies.watchdog = gate
+				shutdownDone := make(chan struct{})
+				defer close(shutdownDone)
+				executeContext = completionResultSelectContext{Context: ctx, done: shutdownDone}
+				defer func() {
+					select {
+					case <-gate.release:
+					default:
+						close(gate.release)
+					}
+				}()
+			}
 			executeDone := make(chan error, 1)
 			go func() {
-				_, executeErr := lifecycle.execute(ctx, claim, time.Now())
+				_, executeErr := lifecycle.execute(executeContext, claim, time.Now())
 				executeDone <- executeErr
 			}()
 			var live l1.CompletionRequest
@@ -1205,6 +1259,13 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("live completion did not start")
 			}
+			if gate != nil {
+				select {
+				case <-gate.entered:
+				case <-time.After(2 * time.Second):
+					t.Fatal("lifecycle did not reach the in-flight completion select")
+				}
+			}
 			if test.stopRecovery {
 				// The first delivery is already in flight. Explicitly join recovery
 				// before canceling it; no timer decides whether inline delivery runs.
@@ -1212,18 +1273,22 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 				outbox.recoveryWG.Wait()
 			}
 			cancel(test.cause)
+			if gate != nil {
+				gate.cancel(test.cause)
+				close(gate.release)
+			}
 			select {
 			case err := <-executeDone:
 				if test.stopRecovery {
+					if receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID); receipt.State != "delivered" {
+						t.Fatalf("lifecycle returned before inline completion: %+v", receipt)
+					}
 					wantErr := error(context.Canceled)
 					if errors.Is(test.cause, errAttemptDirectiveCancel) {
 						wantErr = nil
 					}
 					if !errors.Is(err, wantErr) {
 						t.Fatalf("cancellation provenance changed: err=%v want=%v", err, wantErr)
-					}
-					if receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID); receipt.State != "delivered" {
-						t.Fatalf("lifecycle returned before inline completion: %+v", receipt)
 					}
 				}
 			case <-time.After(2 * time.Second):

@@ -216,34 +216,113 @@ func TestComputerBackupChoicesContinuePastCorruptRecord(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		for _, path := range []string{"/v1/computers/" + computer.ComputerID, "/v1/computers?limit=1"} {
-			status, _, body := h.do(caller, http.MethodGet, path, nil)
-			var facts computerOperatorFacts
-			if strings.Contains(path, "?") {
-				var page struct {
-					Computers []computerOperatorFacts `json:"computers"`
+		scenario := "corrupt-first-with-valid-choice"
+		if onlyCorrupt {
+			scenario = "only-corrupt-choice"
+		}
+		t.Run(scenario, func(t *testing.T) {
+			for _, path := range []string{"/v1/computers/" + computer.ComputerID, "/v1/computers?limit=1"} {
+				t.Run(path, func(t *testing.T) {
+					before := backupAbsenceRows(t, h.store, computer.ComputerID, corruptID, "copy-"+corruptID)
+					status, _, body := h.do(caller, http.MethodGet, path, nil)
+					var facts computerOperatorFacts
+					if strings.Contains(path, "?") {
+						var page struct {
+							Computers []computerOperatorFacts `json:"computers"`
+						}
+						if err := json.Unmarshal(body, &page); err != nil || len(page.Computers) != 1 {
+							t.Fatalf("list: %s err=%v", body, err)
+						}
+						facts = page.Computers[0]
+					} else if err := json.Unmarshal(body, &facts); err != nil {
+						t.Fatal(err)
+					}
+					if status != http.StatusOK {
+						t.Fatalf("read %s: %d %s", path, status, body)
+					}
+					found := make(map[string]bool)
+					for _, action := range facts.AllowedActions {
+						if action.Verb != "restore" && action.Verb != "clone" && action.Verb != "prune" && action.Verb != "custody-export" {
+							continue
+						}
+						found[action.Verb] = true
+						if !onlyCorrupt && action.RefusedBecause != nil {
+							t.Fatalf("valid choice hidden by corruption: %#v", action)
+						}
+						if onlyCorrupt && (action.RefusedBecause == nil || action.RefusedBecause.Code != contract.ErrorInternal ||
+							!action.RefusedBecause.Retryable || action.RefusedBecause.Message != "internal server error" || len(action.RefusedBecause.Details) != 0) {
+							t.Errorf("%s must return scrubbed, retryable internal: %#v", action.Verb, action.RefusedBecause)
+						}
+					}
+					for _, verb := range []string{"restore", "clone", "prune", "custody-export"} {
+						if !found[verb] {
+							t.Errorf("missing Backup verb %s", verb)
+						}
+					}
+					if after := backupAbsenceRows(t, h.store, computer.ComputerID, corruptID, "copy-"+corruptID); after != before {
+						t.Fatalf("advertisement changed prune state: before=%s after=%s", before, after)
+					}
+				})
+			}
+			t.Run("fresh-http-prune", func(t *testing.T) {
+				before := backupAbsenceRows(t, h.store, computer.ComputerID, corruptID, "copy-"+corruptID)
+				beforeComputer, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+				if err != nil {
+					t.Fatal(err)
 				}
-				if err := json.Unmarshal(body, &page); err != nil || len(page.Computers) != 1 {
-					t.Fatalf("list: %s err=%v", body, err)
+				method, path, body := computerActionHTTP(computer, "prune", corruptID)
+				body["idempotency_key"] = "corrupt-prune-" + scenario
+				status, _, wire := h.do(caller, method, path, body)
+				var refusal contract.ErrorResponse
+				if err := json.Unmarshal(wire, &refusal); err != nil {
+					t.Fatal(err)
 				}
-				facts = page.Computers[0]
-			} else if err := json.Unmarshal(body, &facts); err != nil {
+				if status != http.StatusInternalServerError || refusal.Error.Code != contract.ErrorInternal ||
+					!refusal.Error.Retryable || refusal.Error.Message != "internal server error" || len(refusal.Error.Details) != 0 {
+					t.Errorf("corrupt prune must return scrubbed, retryable internal: HTTP=%d %s", status, wire)
+				}
+				if after := backupAbsenceRows(t, h.store, computer.ComputerID, corruptID, "copy-"+corruptID); after != before {
+					t.Fatalf("refused prune changed state: before=%s after=%s", before, after)
+				}
+				current, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+				if err != nil || !reflect.DeepEqual(current, beforeComputer) {
+					t.Fatalf("refused prune changed Computer: %#v err=%v", current, err)
+				}
+			})
+		})
+	}
+}
+
+func TestComputerBackupPruneMissingAndForeignRemainNotFound(t *testing.T) {
+	for _, target := range []string{"missing", "foreign"} {
+		t.Run(target, func(t *testing.T) {
+			h, _, computer, backup, _ := publishedBackupForStorageCopy(t, 4)
+			backupID := "missing-backup"
+			if target == "foreign" {
+				var err error
+				computer, _, err = h.store.CreateComputer(t.Context(), CreateComputerRequest{
+					Name: "other-computer", Spec: computerCapabilityJobSpec("computer:other"), Actor: "operator",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				backupID = backup.BackupID
+			}
+			before := backupAbsenceRows(t, h.store, backup.ComputerID, backup.BackupID, backup.Copies[0].CopyID)
+			caller := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+			method, path, body := computerActionHTTP(computer, "prune", backupID)
+			status, _, wire := h.do(caller, method, path, body)
+			var refusal contract.ErrorResponse
+			if err := json.Unmarshal(wire, &refusal); err != nil {
 				t.Fatal(err)
 			}
-			if status != http.StatusOK {
-				t.Fatalf("read %s: %d %s", path, status, body)
+			if status != http.StatusNotFound || refusal.Error.Code != contract.ErrorNotFound || refusal.Error.Retryable ||
+				refusal.Error.Message != fmt.Sprintf("Backup %q was not found", backupID) {
+				t.Fatalf("%s prune must remain not_found: HTTP=%d %s", target, status, wire)
 			}
-			for _, action := range facts.AllowedActions {
-				if action.Verb != "restore" && action.Verb != "clone" && action.Verb != "custody-export" {
-					continue
-				}
-				if !onlyCorrupt && action.RefusedBecause != nil {
-					t.Fatalf("valid choice hidden by corruption: %#v", action)
-				}
-				if onlyCorrupt && (action.RefusedBecause == nil || action.RefusedBecause.Code != contract.ErrorInternal) {
-					t.Fatalf("all corrupt choices must fail closed: %#v", action)
-				}
+			if after := backupAbsenceRows(t, h.store, backup.ComputerID, backup.BackupID, backup.Copies[0].CopyID); after != before {
+				t.Fatalf("refused prune changed state: before=%s after=%s", before, after)
 			}
-		}
+		})
 	}
 }

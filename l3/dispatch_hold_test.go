@@ -135,6 +135,7 @@ func newHoldHTTPHarness(t *testing.T) *holdHTTPHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	authority.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	good, err := l1.NewServer(control, authority, l1.ServerConfig{RunLedgerNodeID: "run-ledger"})
 	if err != nil {
 		t.Fatal(err)
