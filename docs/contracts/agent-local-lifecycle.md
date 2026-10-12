@@ -451,15 +451,22 @@ with no further requests or log lines. While L1 reports the attempt as
 live, recovery drains every durable log batch before delivering the single
 completion. After bounded log finalization leaves logs pending,
 shutdown, one-shot cancellation, and renewal cancel/stop/restart directives
-persist completion and stop renewal. On shutdown, the lifecycle keeps attempt
-ownership and runs inline ordered recovery for this attempt: pending logs first,
-then completion, under `context.WithoutCancel(ctx)` plus the existing
-`operationTimeout`. This does not extend log finalization. If inline delivery
-is incomplete, the durable evidence stays on disk for delivery on the next
-start, when L1 may already have settled the attempt by lease expiry and can
+persist completion and stop renewal. One route decision selects live delivery
+when no logs are pending and recovery is running, or an ordered hand-off when
+logs are pending and recovery is running. If process-lifetime recovery is
+stopping, the lifecycle keeps attempt ownership and runs inline ordered recovery
+for this attempt: pending logs first, then completion, under
+`context.WithoutCancel(ctx)` plus the existing `operationTimeout`. It reads the
+actual recovery lifetime after finalization joins, independently of the
+cancellation cause. This also applies when shutdown interrupts a completion
+already in flight; the persisted request is unchanged. This does not extend log
+finalization. If inline delivery is incomplete, the durable evidence stays on
+disk for delivery on the next start, when L1 may already have settled the attempt by lease expiry and can
 accept the completion only as late evidence. Cancellation and renewal
-cancel/stop/restart directives leave the agent running, so they release attempt
-ownership and wake ordered recovery without waiting for it before returning.
+cancel/stop/restart directives release attempt ownership and wake ordered
+recovery without waiting only while recovery is still running. If recovery has
+stopped, those same causes deliver inline. The cause still determines the
+completion result and the lifecycle's return value.
 The logs-first drain can push cancel, stop or restart completion past L1's
 cancel or settle deadline when log finalization is incomplete. Evidence order
 takes precedence over settlement speed. A stop or restart directive received
@@ -881,8 +888,8 @@ service and one-shot payload results, including `runtime_failure` and
 `output_error`, but never adds runtime evidence to a pre-`Started` OCI
 `spawn_error`. The logs-first route follows the local fact that bounded
 finalization left logs pending, independently of the result arm or wire flag.
-The agent hands delivery to ordered recovery, or delivers inline during
-shutdown when recovery is stopping, so L1 receives pending logs before
+The agent hands delivery to ordered recovery, or delivers inline when
+process-lifetime recovery is stopping, so L1 receives pending logs before
 completion closes admission. A synthesized agent-terminated signal preserves
 any existing `log_evidence_incomplete` flag.
 
