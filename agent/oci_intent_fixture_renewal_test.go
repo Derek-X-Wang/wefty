@@ -19,18 +19,6 @@ func TestOCIIntentFixturesSurviveRenewalDuringSetup(t *testing.T) {
 	t.Run("prestarted_runtime_loss", func(t *testing.T) { runPreStartedOCIRuntimeLossFixture(t, true) })
 }
 
-// The controlled setup waits for two real HTTP/SQLite renewal receipts. Give
-// renewals the full operation timeout, rather than the original 1 s lease's
-// sub-second request timeout. Manual time still drives both renewals
-// and eventual expiry, so this adds no wall-clock sleep or production changes.
-func ociIntentFixtureTiming(controlled bool) (lease, renewal time.Duration) {
-	if controlled {
-		lease = 4 * hostedFixtureTimeout
-		return lease, lease / 20
-	}
-	return time.Second, 50 * time.Millisecond
-}
-
 // Keep the original fixtures and assertions shared. Only the controlled case
 // decorates the normal executor; real claiming, renewal, watchdog and outbox
 // remain active. Cleanup joins resident work before the caller closes SQLite.

@@ -29,12 +29,11 @@ func TestOCIIntentStopCancellationCannotCompleteOrRestartService(t *testing.T) {
 }
 
 func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
-	leaseDuration, renewalInterval := ociIntentFixtureTiming(controlledRenewal)
 	clock := newManualClock(time.Now())
 	network := plain.NewNetwork()
 	store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 		"intent-node": {Tags: []string{"intent-stop"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-	}, leaseDuration)
+	}, time.Second)
 	defer stopServer()
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
@@ -86,7 +85,7 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 		OCIBootBarrier:       readyOCIBootBarrier{},
 		WorkloadRuntimes:     map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
-		HeartbeatInterval: DefaultHeartbeatInterval, ClaimInterval: 5 * time.Millisecond, RenewalInterval: renewalInterval,
+		HeartbeatInterval: DefaultHeartbeatInterval, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
 		Logf: t.Logf,
 	})
 	if err != nil {
@@ -138,7 +137,7 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	clock.Advance(2 * leaseDuration)
+	clock.Advance(2 * time.Second)
 	if _, err := store.Reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +205,6 @@ func TestPreStartedOCIRuntimeLossRetainsSpawnFailureThroughRecoveryError(t *test
 }
 
 func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
-	leaseDuration, renewalInterval := ociIntentFixtureTiming(controlledRenewal)
 	for _, test := range []struct {
 		name       string
 		intentStop bool
@@ -219,7 +217,7 @@ func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 			network := plain.NewNetwork()
 			store, stopServer := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{
 				"prestarted-loss-node": {Tags: []string{"prestarted-loss"}, MaxOneshotSlots: 1, MaxServiceSlots: 1},
-			}, leaseDuration)
+			}, time.Second)
 			defer stopServer()
 			digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 			job, _, err := store.CreateJob(t.Context(), contract.JobSpec{
@@ -269,7 +267,7 @@ func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 				AttemptDeadman: newRecordingDeadmanRenewer(),
 				OCIBootBarrier: barrier, WorkloadRuntimes: map[string]WorkloadRuntime{contract.JobKindOCI: runtime},
 				ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 1,
-				HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: renewalInterval,
+				HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond,
 				Logf: t.Logf,
 			})
 			if err != nil {
@@ -320,7 +318,7 @@ func runPreStartedOCIRuntimeLossFixture(t *testing.T, controlledRenewal bool) {
 					}
 					time.Sleep(5 * time.Millisecond)
 				}
-				clock.Advance(2 * leaseDuration)
+				clock.Advance(2 * time.Second)
 				lostDeadline := time.Now().Add(hostedFixtureTimeout)
 				for {
 					if _, err := store.Reconcile(t.Context()); err != nil {
