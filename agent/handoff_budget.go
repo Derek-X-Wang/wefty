@@ -76,6 +76,9 @@ type handoffEvictionCandidate struct {
 	// however identical its publication looks.
 	admittedAt time.Time
 	retainedAt time.Time
+	// ociRecord is the admission an OCI candidate was attributed from.
+	ociRecord   ociHandoffRecord
+	ociRecorded bool
 }
 
 func (candidate handoffEvictionCandidate) describe() string {
@@ -408,6 +411,7 @@ func (m *handoffManager) evictionCandidates(status RetainedResultsStatus) (publi
 				ociVolume: true, ownerKey: volume.OwnerKey, name: volume.Name,
 				published: volume.Published, at: volume.TerminalAt,
 				atKnown: volume.TerminalKnown, charged: volume.ChargedBytes,
+				ociRecord: volume.record, ociRecorded: volume.recorded,
 			})
 		}
 	}
@@ -538,6 +542,8 @@ func (m *handoffManager) candidateMoved(candidate handoffEvictionCandidate) (boo
 		switch {
 		case err != nil:
 			return true, "no longer has a record this node can read"
+		case !found && candidate.ociRecorded:
+			return true, "no longer has the record this pass attributed it from"
 		case !found:
 			// No admission record names it, which is what a volume attributed
 			// through the legacy upload record looks like. Nothing about the
@@ -550,6 +556,9 @@ func (m *handoffManager) candidateMoved(candidate handoffEvictionCandidate) (boo
 			return false, ""
 		case record.evidenceReachedLedger() != candidate.published:
 			return true, "no longer carries the same answer to whether its evidence reached the ledger"
+		case !candidate.ociRecorded || record.AttemptID != candidate.ociRecord.AttemptID ||
+			!record.AdmittedAt.Equal(candidate.ociRecord.AdmittedAt) || !record.RetainedAt.Equal(candidate.ociRecord.RetainedAt):
+			return true, "was retained again"
 		}
 		return false, ""
 	}
@@ -704,6 +713,10 @@ func (m *handoffManager) evictHandoffVolume(ctx context.Context, candidate hando
 	}
 	if found && record.evidenceReachedLedger() != candidate.published {
 		m.log("agent: whether run %s's evidence reached the ledger changed while this node was being measured; the node will choose again", candidate.ownerKey)
+		return evictionReselect
+	}
+	if moved, why := m.candidateMoved(candidate); moved {
+		m.log("agent: the OCI handoff volume for run %s %s while this node was being measured; the node will choose again", candidate.ownerKey, why)
 		return evictionReselect
 	}
 	if err := m.ociEvictor.EvictRetainedHandoff(ctx, candidate.ownerKey); err != nil {
