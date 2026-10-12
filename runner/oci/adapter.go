@@ -1097,6 +1097,7 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		err := errors.New("OCI helper generation changed without matching probe evidence")
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
+	runtimeGeneration = helperSession(session)
 	entry := runEntry{
 		entered: true, sweep: sweepBaseline{epoch: sweepReceipt.SweepEpoch, helper: sweepReceipt.HelperSession},
 		volumes: helperManagedVolumes(request),
