@@ -297,3 +297,12 @@ func (r *cancelUploadOCIRuntime) Run(ctx context.Context, request workloadrunner
 	}
 	return workloadrunner.Result{Outcome: contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}}, nil
 }
+
+func TestAgentTerminatedResultPreservesPendingLogEvidence(t *testing.T) {
+	for _, incomplete := range []bool{false, true} {
+		got := agentTerminatedResult(contract.ProcessResult{LogEvidenceIncomplete: incomplete})
+		if got.Signal != "terminated" || got.TerminationCause != contract.TerminationCauseAgent || got.LogEvidenceIncomplete != incomplete {
+			t.Fatalf("empty result lost termination or pending-log evidence: incomplete=%t result=%+v", incomplete, got)
+		}
+	}
+}
