@@ -449,7 +449,7 @@ from the owning node identity as an already-recorded success
 treats like any accepted completion -- the row is marked delivered and retired,
 with no further requests or log lines. While L1 reports the attempt as
 live, recovery drains every durable log batch before delivering the single
-completion. After bounded log finalization reports `log_evidence_incomplete`,
+completion. After bounded log finalization leaves logs pending,
 shutdown, one-shot cancellation, and renewal cancel/stop/restart directives
 persist completion and stop renewal. On shutdown, the lifecycle keeps attempt
 ownership and runs inline ordered recovery for this attempt: pending logs first,
@@ -869,15 +869,22 @@ unreaped payload safe. Completed attempt entries are removed.
 
 The final redaction flush and log upload share the bounded finalization
 context. If that deadline expires after the payload has returned, the agent
-preserves the payload's exit or signal, records additive
-`log_evidence_incomplete`, and leaves events already accepted by the durable
-spool available for later recovery. A redaction tail that did not reach the
-spool before expiry is covered by the incomplete-evidence fact. A non-deadline
-redaction, spool, or uploader failure remains a genuine `output_error`; if it
-coincides with bounded expiry, the output error remains primary and the
+preserves the payload's primary result arm, records additive
+`log_evidence_incomplete` except for a `spawn_error`, and leaves
+events already accepted by the durable spool available for later recovery.
+A redaction tail that did not reach the spool before expiry is covered by the
+incomplete-evidence fact. A non-deadline redaction, spool, or uploader failure
+remains a genuine `output_error`; if it coincides with bounded expiry, the
+output error remains primary and the
 incomplete-evidence fact remains additive. The deadline rule applies to both
-service and one-shot payload results, but never adds runtime evidence to a
-pre-`Started` OCI `spawn_error`.
+service and one-shot payload results, including `runtime_failure` and
+`output_error`, but never adds runtime evidence to a pre-`Started` OCI
+`spawn_error`. The logs-first route follows the local fact that bounded
+finalization left logs pending, independently of the result arm or wire flag.
+The agent hands delivery to ordered recovery, or delivers inline during
+shutdown when recovery is stopping, so L1 receives pending logs before
+completion closes admission. A synthesized agent-terminated signal preserves
+any existing `log_evidence_incomplete` flag.
 
 Once an output event is durably appended, the sink decides whether to wake its
 uploader from its attempt-local pending count; it does not synchronously recount
