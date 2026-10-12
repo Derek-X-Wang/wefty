@@ -77,7 +77,8 @@ with optional `details` and `request_id`. This includes global and command flag
 errors and failures raised inside the CLI. Parser usage text is suppressed in JSON
 mode. Existing take-over refusals may also include their `receipt`. Unknown
 CLI-local failures use `code=internal`, `retryable=false`; they have no server
-request ID. All CLI HTTP adapters — L1/L3, Computer take-over, and registry — use one
+request ID. All CLI HTTP adapters — L1/L3, Computer take-over, registry, and the node-local
+control socket — use one
 failed-exchange classification. Connection failures (including dial timeouts,
 request deadlines,
 and a deadline or timeout waiting for the display banner after a take-over
@@ -107,6 +108,19 @@ requests) wins at dial, headers, and body-read time and remains a local failure
 (exit 1), not `unavailable`. This includes cancellation while reading a refused
 5xx take-over view-open handshake body. Structured server refusals still use
 their adapter-specific decoding and exit rules.
+
+Node-local control socket failures use that same classification. At Unix socket
+dial time, `ECONNREFUSED` or `ENOENT` at the configured or default socket path
+means the node agent is not running: `unavailable`, `retryable=true`, exit 13.
+The message tells the operator to check that the node agent is running.
+`EACCES` or `EPERM` at socket dial time remains a local failure (exit 1).
+Invalid socket configuration remains a local or usage failure. Stalled or
+truncated response bodies and bare non-envelope 5xx responses exit 13;
+a completely read malformed response remains exit 1. Caller cancellation
+remains exit 1 at every phase. Structured socket refusals retain the server
+code, message, retryability, details, and request ID and use the existing exit
+map; retryable `internal` on this adapter still exits 1. These failures do not
+cause an automatic socket retry.
 
 A Computer storage, resize, or removal `--wait` that expires after acceptance
 exits 14 and emits a CLI-local `error.code=wait_timeout`, `retryable=false` on

@@ -57,7 +57,7 @@ func executeLocalDoctor(ctx context.Context, client *ocicontrol.Client, jsonOutp
 	}
 	report, err := client.Doctor(ctx)
 	if err != nil {
-		return err
+		return classifyRecordedExchangeError(ctx, err)
 	}
 	if err := report.Validate(); err != nil {
 		return fmt.Errorf("validate node doctor response: %w", err)
@@ -97,7 +97,7 @@ func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOu
 		ApplyRestart: *applyRestart, Recreate: *recreate,
 	})
 	if err != nil {
-		return err
+		return classifyRecordedExchangeError(ctx, err)
 	}
 	if jsonOutput {
 		return writeJSON(stdout, response)
@@ -121,7 +121,7 @@ func executeLocalOCIIntent(ctx context.Context, client *ocicontrol.Client, jsonO
 	}
 	current, err := client.Intent(ctx)
 	if err != nil {
-		return err
+		return classifyRecordedExchangeError(ctx, err)
 	}
 	var response ocicontrol.IntentResponse
 	if args[0] == "start" {
@@ -130,7 +130,7 @@ func executeLocalOCIIntent(ctx context.Context, client *ocicontrol.Client, jsonO
 		response, err = client.Stop(ctx, current.Revision)
 	}
 	if err != nil {
-		return err
+		return classifyRecordedExchangeError(ctx, err)
 	}
 	if jsonOutput {
 		return writeJSON(stdout, response)
@@ -148,7 +148,7 @@ func executeLocalOCIIntent(ctx context.Context, client *ocicontrol.Client, jsonO
 func executeLocalOCIRemovals(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, stdout io.Writer) error {
 	response, err := client.Removals(ctx)
 	if err != nil {
-		return err
+		return classifyRecordedExchangeError(ctx, err)
 	}
 	if jsonOutput {
 		return writeJSON(stdout, response)
@@ -202,7 +202,7 @@ func executeLocalLoadImage(ctx context.Context, client *ocicontrol.Client, jsonO
 	}
 	response, err := client.LoadImage(ctx, path, ocicontrol.LoadImageRequest{Reference: strings.TrimSpace(*reference)})
 	if err != nil {
-		return err
+		return classifyRecordedExchangeError(ctx, err)
 	}
 	if jsonOutput {
 		return writeJSON(stdout, response)

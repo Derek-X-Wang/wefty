@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/httpexchange"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 )
 
@@ -116,19 +117,30 @@ func (client *Client) call(ctx context.Context, method, path string, body io.Rea
 	}
 	result, err := client.http.Do(request)
 	if err != nil {
-		return fmt.Errorf("call node-local OCI control socket: %w", err)
+		return &httpexchange.Failure{Phase: httpexchange.Request, Cause: fmt.Errorf("call node-local OCI control socket: %w", err)}
 	}
 	defer result.Body.Close()
-	decoder := json.NewDecoder(io.LimitReader(result.Body, maximumControlJSONBytes))
+	// Finish the bounded read before decoding: a valid JSON prefix does not
+	// prove that the response body arrived completely.
+	payload, err := io.ReadAll(io.LimitReader(result.Body, maximumControlJSONBytes+1))
+	if err != nil {
+		return &httpexchange.Failure{Phase: httpexchange.Body, Cause: fmt.Errorf("read node-local OCI control response: %w", err)}
+	}
 	if result.StatusCode < 200 || result.StatusCode >= 300 {
 		var failure contract.ErrorResponse
-		if err := decoder.Decode(&failure); err != nil {
-			return fmt.Errorf("node-local OCI control returned HTTP %d", result.StatusCode)
+		if err := json.Unmarshal(payload, &failure); err == nil && len(payload) <= maximumControlJSONBytes && failure.Error.Code != "" {
+			return &ResponseError{Status: result.StatusCode, APIError: failure.Error}
 		}
-		return &ResponseError{Status: result.StatusCode, APIError: failure.Error}
+		if result.StatusCode >= 500 && result.StatusCode < 600 {
+			return &httpexchange.Failure{Phase: httpexchange.BareStatus, Cause: errors.New(httpexchange.ResponseMessage("node-local OCI control", result.StatusCode, payload))}
+		}
+		return &httpexchange.Failure{Phase: httpexchange.Decode, Cause: fmt.Errorf("node-local OCI control returned HTTP %d", result.StatusCode)}
 	}
-	if err := decoder.Decode(response); err != nil {
-		return fmt.Errorf("decode node-local OCI control response: %w", err)
+	if len(payload) > maximumControlJSONBytes {
+		return &httpexchange.Failure{Phase: httpexchange.Decode, Cause: errors.New("node-local OCI control response exceeds JSON limit")}
+	}
+	if err := json.Unmarshal(payload, response); err != nil {
+		return &httpexchange.Failure{Phase: httpexchange.Decode, Cause: fmt.Errorf("decode node-local OCI control response: %w", err)}
 	}
 	return nil
 }
