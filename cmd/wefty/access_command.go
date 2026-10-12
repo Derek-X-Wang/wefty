@@ -382,7 +382,7 @@ func openTakeoverViewWithPolicyRetry(ctx context.Context, participant fabric.Fab
 	return retryTakeoverViewPolicyInstallation(ctx, takeoverPolicyInstallRetryWindow, takeoverPolicyInstallRetryInterval,
 		func(openContext context.Context) (*takeover.Session, error) {
 			session, err := takeover.OpenAtPolicyRevision(openContext, participant, endpoint, policyRevision)
-			return session, classifyTakeoverTransportError(err)
+			return session, classifyTakeoverTransportError(openContext, err)
 		})
 }
 

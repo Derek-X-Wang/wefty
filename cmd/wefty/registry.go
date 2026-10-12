@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/httpexchange"
 )
 
 const registryManifestAccept = "application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
@@ -55,7 +55,7 @@ func (r *registryResolver) ResolveDigest(ctx context.Context, reference string) 
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fmt.Errorf("registry HEAD for %q returned HTTP %d", reference, response.StatusCode)
+		return "", registryStatusError(ctx, fmt.Sprintf("registry HEAD for %q", reference), response)
 	}
 	digest := strings.TrimSpace(response.Header.Get("Docker-Content-Digest"))
 	program := contract.ImageProgram{Reference: reference, Digest: &digest}
@@ -76,11 +76,7 @@ func (r *registryResolver) headManifest(ctx context.Context, manifestURL, author
 	}
 	response, err := r.client.Do(request)
 	if err != nil {
-		failure := fmt.Errorf("registry HEAD: %w", err)
-		if response == nil && !errors.Is(err, context.Canceled) {
-			return nil, &unavailableError{cause: failure}
-		}
-		return nil, failure
+		return nil, classifyFailedExchange(ctx, httpexchange.Request, fmt.Errorf("registry HEAD: %w", err))
 	}
 	return response, nil
 }
@@ -107,22 +103,22 @@ func (r *registryResolver) publicBearerToken(ctx context.Context, challenge stri
 	}
 	response, err := r.client.Do(request)
 	if err != nil {
-		failure := fmt.Errorf("request public registry token: %w", err)
-		if response == nil && !errors.Is(err, context.Canceled) {
-			return "", &unavailableError{cause: failure}
-		}
-		return "", failure
+		return "", classifyFailedExchange(ctx, httpexchange.Request, fmt.Errorf("request public registry token: %w", err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fmt.Errorf("public registry token request returned HTTP %d", response.StatusCode)
+		return "", registryStatusError(ctx, "public registry token request", response)
 	}
 	var body struct {
 		Token       string `json:"token"`
 		AccessToken string `json:"access_token"`
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&body); err != nil {
-		return "", fmt.Errorf("decode public registry token: %w", err)
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return "", classifyFailedExchange(ctx, httpexchange.Body, fmt.Errorf("read public registry token: %w", err))
+	}
+	if err := json.Unmarshal(responseBody, &body); err != nil {
+		return "", classifyFailedExchange(ctx, httpexchange.Decode, fmt.Errorf("decode public registry token: %w", err))
 	}
 	if body.Token == "" {
 		body.Token = body.AccessToken
@@ -183,4 +179,17 @@ func registryLocation(reference string) (registry, repository, tag string, err e
 		repository = repository[:lastColon]
 	}
 	return registry, repository, tag, nil
+}
+
+// Registry refusals retain their status semantics. Its protocol has no wefty
+// error envelope; only a 5xx is an availability failure.
+func registryStatusError(ctx context.Context, service string, response *http.Response) error {
+	if response.StatusCode >= 500 && response.StatusCode < 600 {
+		body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+		if err != nil {
+			return classifyFailedExchange(ctx, httpexchange.Body, fmt.Errorf("read %s response: %w", service, err))
+		}
+		return classifyFailedExchange(ctx, httpexchange.BareStatus, fmt.Errorf("%s", httpexchange.ResponseMessage(service, response.StatusCode, body)))
+	}
+	return fmt.Errorf("%s returned HTTP %d", service, response.StatusCode)
 }

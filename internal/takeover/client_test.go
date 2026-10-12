@@ -161,6 +161,30 @@ func TestOpenStructured5xxIsActionRefusal(t *testing.T) {
 	}
 }
 
+func TestOpenRedirectBodyErrorDoesNotOverrideRefusal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == contract.ComputerDisplayWebSocketPath {
+			w.Header().Set("Location", "/refusal")
+			w.Header().Set("Content-Length", "200")
+			w.WriteHeader(http.StatusFound)
+			_, _ = w.Write([]byte("truncated redirect"))
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(contract.ComputerControlErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorControlNotAuthorized, Message: "complete refusal",
+		}})
+	}))
+	defer server.Close()
+	endpoint := "ws" + strings.TrimPrefix(server.URL, "http") + contract.ComputerDisplayWebSocketPath
+	_, err := Open(t.Context(), directFabric{}, endpoint)
+	var action *ActionError
+	var transport *TransportError
+	if !errors.As(err, &action) || errors.As(err, &transport) || action.APIError.Code != contract.ErrorControlNotAuthorized {
+		t.Fatalf("redirect drain must not override the complete refusal: %v", err)
+	}
+}
+
 func TestNonEnvelope5xxReasonSanitized(t *testing.T) {
 	const body = "\x1b[31mComputer\r\n display\x00\x01\x7f\u0085\u200b is\t not ready: 世界"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
