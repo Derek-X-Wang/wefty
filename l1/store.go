@@ -4510,20 +4510,16 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err != nil {
 		return CompletionOutcome{}, internalError(err, "complete attempt")
 	}
-	jobUpdate := "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?"
-	jobUpdateArgs := []any{finalJobState, now.UnixNano(), jobID}
-	if prestartRequeue && finalJobState == contract.JobQueued {
-		jobUpdate = "UPDATE jobs SET state=?, updated_ns=?, current_attempt_id=NULL, completion_replay_attempt_id=? WHERE job_id=?"
-		jobUpdateArgs = []any{finalJobState, now.UnixNano(), attemptID, jobID}
-	} else if jobBeforeCompletion.ComputerID != "" && servicePolicy != nil && finalJobState == contract.JobStopped &&
-		validRuntimeQuiescenceEvidence(request.RuntimeQuiescenceEvidence) {
-		// A Computer reaches stopped only after accepted runtime-quiescence
-		// evidence. Publish that positive detachment by clearing the runtime
-		// owner while retaining an exact completion replay binding.
-		jobUpdate = "UPDATE jobs SET state=?, updated_ns=?, current_attempt_id=NULL, completion_replay_attempt_id=? WHERE job_id=?"
-		jobUpdateArgs = []any{finalJobState, now.UnixNano(), attemptID, jobID}
+	if (prestartRequeue && finalJobState == contract.JobQueued) ||
+		(jobBeforeCompletion.ComputerID != "" && servicePolicy != nil && finalJobState == contract.JobStopped &&
+			validRuntimeQuiescenceEvidence(request.RuntimeQuiescenceEvidence)) {
+		// Accepted pre-start requeue and positive Computer quiescence bind the
+		// completed Attempt explicitly for replay, without a runtime owner.
+		if err := detachAttempt(ctx, tx, jobID, attemptID, detachCompletion); err != nil {
+			return CompletionOutcome{}, internalError(err, "detach completed attempt")
+		}
 	}
-	_, err = tx.ExecContext(ctx, jobUpdate, jobUpdateArgs...)
+	_, err = tx.ExecContext(ctx, "UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?", finalJobState, now.UnixNano(), jobID)
 	if err != nil {
 		return CompletionOutcome{}, internalError(err, "complete job")
 	}
@@ -4708,21 +4704,6 @@ func validateAttemptEvidence(identityNodeID, jobID, attemptID, fencingToken stri
 	return nil
 }
 
-// validateCompletionReplayBinding checks that the job still binds attemptID
-// for completion replay. It deliberately does not check the node's current
-// registration: it gates only an identical replay, which writes nothing, and a
-// completion accepted under one registration stays accepted under the next.
-// Identity, path, and fence are checked by validateAttemptEvidence first.
-func validateCompletionReplayBinding(attemptID string, a attemptAuthority) error {
-	if a.currentAttempt.Valid && a.currentAttempt.String != attemptID {
-		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
-	}
-	if !a.currentAttempt.Valid && (!a.completionReplayAttempt.Valid || a.completionReplayAttempt.String != attemptID) {
-		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's retained completion replay attempt")
-	}
-	return nil
-}
-
 func validateOCICompletionPhase(attempt attemptAuthority, result ProcessResult) error {
 	if attempt.spec.Kind != contract.JobKindOCI {
 		return nil
@@ -4759,9 +4740,7 @@ func terminalResourceFailure(job Job, result ProcessResult, nodeID string) *cont
 }
 
 func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, now time.Time, jitter func(time.Duration) time.Duration) error {
-	result, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, updated_ns=?
-		WHERE attempt_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, now.UnixNano(), attempt.attemptID,
-		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput)
+	result, err := invalidateAttempts(ctx, tx, attempt.attemptID, invalidateLeaseSettlement, now)
 	if err != nil {
 		return internalError(err, "mark attempt lost")
 	}

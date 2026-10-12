@@ -962,7 +962,10 @@ func (s *Store) acknowledgeComputerCustodyImport(ctx context.Context, write *wri
 		destinationComputerID, row.DestinationStorageID, now.UnixNano()); err != nil {
 		return Computer{}, internalError(err, "publish imported Storage provenance")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='stopped', current_attempt_id=NULL, updated_ns=? WHERE job_id=?;
+	if err := detachAttempt(ctx, tx, row.JobID, "", detachStorageDestination); err != nil {
+		return Computer{}, internalError(err, "detach Storage destination attempt")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='stopped', updated_ns=? WHERE job_id=?;
 		UPDATE service_jobs SET desired_state='stopped', published_attempt_id=NULL, healthy_since_ns=NULL,
 		next_restart_at=NULL WHERE job_id=?`, now.UnixNano(), row.JobID, row.JobID); err != nil {
 		return Computer{}, internalError(err, "keep imported Computer stopped")

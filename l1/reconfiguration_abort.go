@@ -144,14 +144,13 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	if err != nil {
 		return Computer{}, false, internalError(err, "encode Computer reconfiguration abort observation")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, lease_expires_ns=MIN(lease_expires_ns, ?),
-		updated_ns=? WHERE job_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, now.UnixNano(),
-		now.UnixNano(), computer.CurrentJobID, contract.AttemptClaimed, contract.AttemptRunning,
-		contract.AttemptAwaitingInput); err != nil {
+	if _, err := invalidateAttempts(ctx, tx, computer.CurrentJobID, invalidateComputerAbort, now); err != nil {
 		return Computer{}, false, internalError(err, "fence aborted Computer attempt")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, completion_replay_attempt_id=COALESCE(current_attempt_id, completion_replay_attempt_id),
-		current_attempt_id=NULL, updated_ns=? WHERE job_id=?`,
+	if err := detachAttempt(ctx, tx, computer.CurrentJobID, "", detachComputerAbort); err != nil {
+		return Computer{}, false, internalError(err, "detach aborted Computer attempt")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
 		contract.JobStopped, now.UnixNano(), computer.CurrentJobID); err != nil {
 		return Computer{}, false, internalError(err, "stop aborted Computer projection")
 	}

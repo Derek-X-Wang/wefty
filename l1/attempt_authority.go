@@ -165,3 +165,92 @@ func reconcileServiceStability(ctx context.Context, tx *sql.Tx, now time.Time, w
 
 	return count, nil
 }
+
+type detachCause string
+
+const (
+	detachQueuedComputerStop detachCause = "queued-computer-stop"
+	detachComputerAbort      detachCause = "computer-abort"
+	detachImageLatch         detachCause = "image-latch"
+	detachCompletion         detachCause = "completion"
+	detachStorageDestination detachCause = "storage-destination"
+)
+
+// detachAttempt changes only the bindings. The caller owns Job settlement and
+// timestamps in the same transaction; a detach grants no execution authority.
+func detachAttempt(ctx context.Context, tx *sql.Tx, jobID, completedAttemptID string, cause detachCause) error {
+	query := "UPDATE jobs SET current_attempt_id=NULL"
+	args := []any{}
+	switch cause {
+	case detachQueuedComputerStop, detachComputerAbort, detachImageLatch:
+		query += ", completion_replay_attempt_id=COALESCE(current_attempt_id, completion_replay_attempt_id)"
+	case detachCompletion:
+		if completedAttemptID == "" {
+			return fmt.Errorf("completion detach requires an Attempt")
+		}
+		query += ", completion_replay_attempt_id=?"
+		args = append(args, completedAttemptID)
+	case detachStorageDestination:
+		// Storage destinations clear the runtime binding without retaining it
+		// for replay. Leave any existing replay binding untouched, as before.
+	default:
+		return fmt.Errorf("unknown detach cause %q", cause)
+	}
+	query += " WHERE job_id=?"
+	args = append(args, jobID)
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+type invalidationCause string
+
+const (
+	invalidateComputerAbort   invalidationCause = "computer-abort"
+	invalidateComputerRemoval invalidationCause = "computer-removal"
+	invalidateServiceRemoval  invalidationCause = "service-removal"
+	invalidateImageLatch      invalidationCause = "image-latch"
+	invalidateLeaseSettlement invalidationCause = "lease-settlement"
+)
+
+// invalidateAttempts loses only active Attempts. Revocation caps their leases;
+// inline lease/deadline settlement preserves its existing expiry and row count.
+func invalidateAttempts(ctx context.Context, tx *sql.Tx, targetID string, cause invalidationCause, now time.Time) (sql.Result, error) {
+	query := "UPDATE attempts SET state=?, updated_ns=?"
+	args := []any{contract.AttemptLost, now.UnixNano()}
+	if cause != invalidateLeaseSettlement {
+		query += ", lease_expires_ns=MIN(lease_expires_ns, ?)"
+		args = append(args, now.UnixNano())
+	}
+	switch cause {
+	case invalidateComputerAbort, invalidateServiceRemoval:
+		query += " WHERE job_id=?"
+	case invalidateComputerRemoval:
+		query += " WHERE job_id IN (SELECT job_id FROM computer_job_projections WHERE computer_id=?)"
+	case invalidateImageLatch:
+		query += " WHERE attempt_id=(SELECT current_attempt_id FROM jobs WHERE job_id=?)"
+	case invalidateLeaseSettlement:
+		// Expiry or cancellation-deadline accounting stays in expireAttempt;
+		// this cause preserves its original lease even at an early deadline.
+		query += " WHERE attempt_id=?"
+	default:
+		return nil, fmt.Errorf("unknown invalidation cause %q", cause)
+	}
+	query += " AND state IN (?, ?, ?)"
+	args = append(args, targetID, contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput)
+	return tx.ExecContext(ctx, query, args...)
+}
+
+// validateCompletionReplayBinding checks that the job still binds attemptID
+// for completion replay. It deliberately does not check the node's current
+// registration: it gates only an identical replay, which writes nothing, and a
+// completion accepted under one registration stays accepted under the next.
+// Identity, path, and fence are checked by validateAttemptEvidence first.
+func validateCompletionReplayBinding(attemptID string, a attemptAuthority) error {
+	if a.currentAttempt.Valid && a.currentAttempt.String != attemptID {
+		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
+	}
+	if !a.currentAttempt.Valid && (!a.completionReplayAttempt.Valid || a.completionReplayAttempt.String != attemptID) {
+		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's retained completion replay attempt")
+	}
+	return nil
+}

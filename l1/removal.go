@@ -1031,9 +1031,7 @@ func finalizeComputerCustodyOutcome(ctx context.Context, tx *sql.Tx, computerID 
 }
 
 func scrubServiceControllerState(ctx context.Context, tx *sql.Tx, jobID string, specJSON []byte, now time.Time) error {
-	if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, lease_expires_ns=MIN(lease_expires_ns, ?), updated_ns=?
-		WHERE job_id=? AND state IN (?, ?, ?)`, contract.AttemptLost, now.UnixNano(), now.UnixNano(), jobID,
-		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput); err != nil {
+	if _, err := invalidateAttempts(ctx, tx, jobID, invalidateServiceRemoval, now); err != nil {
 		return internalError(err, "invalidate service attempt authority")
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET published_attempt_id=NULL, healthy_since_ns=NULL WHERE job_id=?`, jobID); err != nil {

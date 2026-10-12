@@ -39,6 +39,52 @@ code and details without this reason. Principal-tag refusals are unchanged.
 Shared HTTP error codes remain an open vocabulary; this does not extend the
 OCI helper's closed protocol vocabulary.
 
+## Attempt authority modes (#807)
+
+Attempt authority has one private owner, `l1/attempt_authority.go`, for
+its decisions and effects inside the caller's existing transaction. Endpoint
+bodies and inline-expiry commits stay at their existing endpoints. These modes
+answer distinct questions; evidence provenance is not live authority:
+
+- **Current execution authority (E):** identity → path → current binding →
+  fence → registration, then the endpoint's active phase and unexpired lease
+  checks. A wrong fence on a non-current Attempt is `attempt_mismatch`, not
+  `stale_fence`.
+- **Original-evidence provenance (O):** identity → path → original fence.
+  Current binding, registration, phase and lease are not provenance checks.
+- **Accepted-completion replay (R):** original provenance, no standing removal,
+  identical stored key and canonical body, an Attempt not `lost`, and either
+  the current binding or, only when current is NULL, the retained replay
+  binding. Removal is checked before provenance; provenance and OCI completion
+  phase are checked before expiry handling, key/body comparison, lost refusal
+  and replay binding. Replay applies no completion or accounting effects.
+  Computer revocation remains scoped to that exact Attempt and is re-driven
+  on replay.
+- **Workload credential (CW):** bearer/scope, bound identity, current binding,
+  registration, active phase and lease. It has no fencing-token check.
+- **Reconcile stability (RS):** desired running, a positive streak, health for
+  at least the window, current binding and bound Node, matching registration,
+  Node recorded alive, Job running, Attempt running and unexpired lease.
+  Reconcile resolves Node liveness, interrupts unavailable/replaced health,
+  then tests stability at the same transaction clock.
+
+Detach causes keep their existing binding rules: queued Computer stop,
+Computer abort and image latch retain `COALESCE(current_attempt_id,
+completion_replay_attempt_id)`; accepted stopped Computer completion with
+quiescence evidence and pre-start requeue explicitly bind the completed
+Attempt. Storage destinations clear current without creating a replay binding
+and leave an existing replay binding untouched. Claim installs the successor
+and clears predecessor replay. Queued one-shot cancellation and exhausted
+pre-start budget clear current and leave replay untouched.
+
+Invalidation loses only active Attempts. Computer abort, Computer removal,
+service removal and image latch cap the lease at the transaction clock without
+extending an already expired lease. Image latch's previously missing cap was
+drift: the original image-pin implementation documented fencing, with no
+contract or history giving that lost Attempt a continuing lease. Inline
+lease/cancellation-deadline settlement preserves its existing lease value and
+row-count-driven accounting. Removal authority remains separate from leases.
+
 ## Atomic claim and eligibility
 
 A claim is one SQLite transaction that verifies durable operator intent permits

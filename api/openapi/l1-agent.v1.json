@@ -309,7 +309,7 @@
       "post": {
         "operationId": "latchServiceImageReconciliationFailure",
         "summary": "Latch a service failed after its bound node could not deliver the service image",
-        "description": "Sent by the bound node when image reconciliation could not deliver a pinned OCI image to one of its service bindings. L1 moves the service to failed, fences any claimed or running attempt as lost, clears its restart schedule and publication, and records the spawn failure as last_failure. Only the node that holds the binding, in its current boot session, may latch it.",
+        "description": "Sent by the bound node when image reconciliation could not deliver a pinned OCI image to one of its service bindings. L1 moves the service to failed, fences any claimed, running or awaiting-input attempt as lost and caps its lease at the transaction clock without extending an earlier expiry, clears its restart schedule and publication, and records the spawn failure as last_failure. Only the node that holds the binding, in its current boot session, may latch it.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false,
           "required": ["node_id", "boot_session_id", "failure"],
