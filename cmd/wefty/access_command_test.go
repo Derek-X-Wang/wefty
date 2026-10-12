@@ -63,6 +63,38 @@ func TestTakeoverViewPolicyRetryIsTypedAndBounded(t *testing.T) {
 	})
 }
 
+// Queue the caller stop at the hand-off from the admission answer to its
+// retry delay. The cancelled select must return the caller's stop, regardless
+// of whether the goroutine reaches the select before or after cancel runs.
+// A long real interval prevents another attempt; channels replace timed sleeps.
+func TestTakeoverPolicyRetryCallerStopDuringRetryDelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	answered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := retryTakeoverViewPolicyInstallation(ctx, time.Minute, time.Minute,
+			func(context.Context) (*takeover.Session, error) {
+				close(answered)
+				<-release
+				return nil, &takeover.ActionError{APIError: contract.APIError{Code: contract.ErrorStalePolicyRevision, Retryable: true}}
+			})
+		done <- err
+	}()
+	<-answered
+	cancel()
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) || commandExitCode(err) != exitFailure {
+			t.Fatalf("cancelled admission retry delay: exit=%d err=%v, want local cancellation", commandExitCode(err), err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("admission retry did not stop after caller cancellation")
+	}
+}
+
 func TestComputerTakeoverViewProjectsFriendlyNameBeforeRawConnectHost(t *testing.T) {
 	result := computerTakeoverViewResult{
 		FriendlyName:     "alice",

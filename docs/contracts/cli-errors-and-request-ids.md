@@ -148,12 +148,25 @@ A missing `storage_provenance` after a timeout means "not read", not "untainted"
 `services backup list COMPUTER` reads it.
 An already-observed typed failure keeps its own exit code if a follow-up
 provenance read fails or times out; that miss is recorded in `observation.error`.
-Only an observation error caused by `context.DeadlineExceeded` (which includes
-a wait that exhausted its window on retryable `unavailable` answers alone,
-whose timeout records the last retryable answer) becomes
-`wait_timeout`; a typed outcome or HTTP refusal arriving at the deadline keeps
-its classification.
-Caller cancellation is a separate local failure. Grant revocation
+For every accepted-mutation wait, including follow-up Storage provenance,
+only a deadline-caused failure or an exhausted typed retryable `unavailable`
+answer becomes an observation timeout. The timeout records the last retryable
+answer. A permanent HTTP refusal or typed operation error arriving at the
+deadline keeps its classification, even in provenance with an earlier transient
+503. An already-known typed operation verdict still survives a provenance miss.
+
+Caller interruption (Ctrl-C or a caller deadline) wins when handling a failed
+read or polling delay in every accepted-mutation wait, the service log follow,
+and the take-over admission retry. This includes a fully decoded typed answer
+handled after the caller stops. The interruption is a local failure (exit 1,
+`retryable=false`), rather than the last unavailable or stale-policy answer,
+subject to provenance's already-known typed verdict rule above.
+The service log follow's own `--follow-for` window ending remains a clean stop
+(exit 0). The take-over admission retry's own window ending retains the last
+`stale_policy_revision` refusal (exit 5); caller interruption during its retry
+delay exits 1.
+
+Grant revocation
 (`services revoke --wait`) also exits 14 on an accepted-mutation
 observation timeout. It retains `revocation_wait_timeout`, its existing
 retryability, and receipt-derived `details.mutation_applied`; it is not
