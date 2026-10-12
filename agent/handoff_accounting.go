@@ -8,10 +8,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
 // handoffChargedEntryFloor is what one directory entry costs the node figure
@@ -1281,7 +1283,11 @@ func (m *handoffManager) foldOCIPage(report workloadrunner.RetainedHandoffReport
 		if !volume.TerminalKnown {
 			status.TerminalUnknown++
 		}
-		if volume.Truncated {
+		// An unreadable volume or a replaced subtree is a floor too, even
+		// when the helper finished listing the root and reports no charge.
+		if volume.Truncated || slices.ContainsFunc(volume.Anomalies, func(anomaly string) bool {
+			return anomaly == string(ocihelper.HandoffAnomalyVolumeUnreadable) || anomaly == string(ocihelper.HandoffAnomalySubtreeReplaced)
+		}) {
 			status.Truncated++
 		}
 		if len(volume.Anomalies) != 0 {
@@ -1298,6 +1304,7 @@ func (m *handoffManager) foldOCIPage(report workloadrunner.RetainedHandoffReport
 			TerminalAt: volume.TerminalAt, TerminalKnown: volume.TerminalKnown,
 			Live: volume.Live || attribution.live, Truncated: volume.Truncated,
 			Published: attribution.published,
+			record:    attribution.record, recorded: attribution.recorded,
 		})
 	}
 }
@@ -1330,6 +1337,8 @@ type handoffVolumeAttribution struct {
 	ownerKey  string
 	published bool
 	live      bool
+	record    ociHandoffRecord
+	recorded  bool
 }
 
 // derivedHandoffVolumes is every handoff volume name this node's own runs would
@@ -1404,6 +1413,7 @@ func (m *handoffManager) derivedHandoffVolumes() map[string]handoffVolumeAttribu
 		}
 		volumes[derived] = handoffVolumeAttribution{
 			ownerKey: record.OwnerKey, published: record.evidenceReachedLedger(), live: record.live(),
+			record: record, recorded: true,
 		}
 	}
 	return volumes
