@@ -881,12 +881,8 @@ func waitForService(
 	if predicate(initial) {
 		return initial, nil
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	waitCtx, cancel := openWaitWindow(ctx, wait)
 	defer cancel()
-	// A wait retries retryable answers at its own interval (#763, #773): the
-	// shared client's one-shot quiet retry is doubled backoff on top of it,
-	// so the loop's reads are marked out.
-	waitCtx = withoutClientRetry(waitCtx)
 	timeout := func(lastRetryable error) error {
 		message := fmt.Sprintf("timed out after %s waiting for service %q to become %s", wait, initial.JobID, description)
 		if lastRetryable != nil {
@@ -895,42 +891,34 @@ func waitForService(
 		return &mutationWaitTimeoutError{message: message}
 	}
 	var lastRetryable error
+	fail := func(err error) error {
+		switch decideWaitFailure(ctx, waitCtx, err, &lastRetryable) {
+		case waitCallerStopped:
+			return ctx.Err()
+		case waitWindowExpired:
+			return timeout(lastRetryable)
+		case waitRetry:
+			return nil
+		default:
+			return err
+		}
+	}
 	for {
 		timer := time.NewTimer(pollInterval)
 		select {
 		case <-waitCtx.Done():
 			timer.Stop()
-			if ctx.Err() != nil {
-				return l1.Job{}, ctx.Err()
-			}
-			return l1.Job{}, timeout(lastRetryable)
+			return l1.Job{}, fail(waitCtx.Err())
 		case <-timer.C:
 		}
 		job, err := clients.getService(waitCtx, initial.JobID)
 		if err != nil {
-			if ctx.Err() != nil {
-				return l1.Job{}, ctx.Err()
+			if err := fail(err); err != nil {
+				return l1.Job{}, err
 			}
-			// Only deadline-shaped answers become the timeout; a refusal
-			// arriving at the deadline keeps its own classification (#763).
-			if ctx.Err() == nil && waitCtx.Err() == context.DeadlineExceeded &&
-				(errors.Is(err, context.DeadlineExceeded) || isRetryableL1Answer(err)) {
-				detail := lastRetryable
-				if isRetryableL1Answer(err) {
-					detail = err
-				}
-				return l1.Job{}, timeout(detail)
-			}
-			// A retryable 503 inside the wait window is one bad poll, not a
-			// verdict (#763): keep asking at the normal interval until the
-			// deadline decides the outcome.
-			if isRetryableL1Answer(err) && ctx.Err() == nil && waitCtx.Err() == nil {
-				lastRetryable = err
-				continue
-			}
-			return l1.Job{}, err
+			continue
 		}
-		lastRetryable = nil
+		decideWaitFailure(ctx, waitCtx, nil, &lastRetryable)
 		if predicate(job) {
 			return job, nil
 		}
