@@ -792,17 +792,6 @@ func isProvenanceRefused(err error) bool {
 		!response.APIError.Retryable && response.APIError.Details["reason"] == "storage_custody_limit"
 }
 
-// isRetryableL1Answer reports whether L1 answered a read with a transient
-// refusal a wait window may outlast (#763): the `unavailable` code with
-// retryable=true, such as a read snapshot that expired while the node was busy
-// copying a clone's disk. Inside a --wait window such an answer is one poll's
-// bad luck, not a verdict; outside one it still surfaces as exit 13.
-func isRetryableL1Answer(err error) bool {
-	var response *apiResponseError
-	return errors.As(err, &response) && response.APIError.Code == contract.ErrorUnavailable &&
-		response.APIError.Retryable
-}
-
 func attachStorageProvenance(ctx context.Context, clients *apiClients, computerID string, output *storageMutationOutput, prior error) error {
 	if errors.Is(prior, context.Canceled) || errors.Is(prior, context.DeadlineExceeded) {
 		return prior
@@ -824,31 +813,21 @@ func attachStorageProvenance(ctx context.Context, clients *apiClients, computerI
 	var provenance l1.ComputerStorageProvenance
 	var err error
 	var lastRetryable error
+	verdict := waitFailed
 	for {
 		provenance, err = clients.listComputerStorageProvenance(observationCtx, computerID)
+		if err != nil && isProvenanceRefused(err) {
+			output.ProvenanceUnavailable = "Storage provenance unavailable: " + err.Error()
+			return prior
+		}
+		verdict = decideWaitFailure(ctx, observationCtx, err, &lastRetryable)
 		if err == nil {
 			output.StorageProvenance = &provenance
 			return prior
 		}
-		if isProvenanceRefused(err) {
-			output.ProvenanceUnavailable = "Storage provenance unavailable: " + err.Error()
-			return prior
-		}
-		if ctx.Err() != nil {
-			err = ctx.Err()
-			break
-		}
-		// A retryable 503 during a wait window is transient, exactly as it
-		// is inside the observation loop itself: keep polling at the same
-		// interval until the shared deadline. Without a window the read is
-		// one-shot and surfaces the answer as-is (exit 13).
-		if !isRetryableL1Answer(err) || pollInterval <= 0 {
-			break
-		}
-		// Record before the window check: a retryable answer that arrives
-		// just after it closed still belongs in the timeout detail (#763).
-		lastRetryable = err
-		if observationCtx.Err() != nil {
+		// Without a wait window this is a one-shot read, with the client's
+		// ordinary quiet retry. Only a windowed walk polls at this cadence.
+		if verdict != waitRetry || pollInterval <= 0 {
 			break
 		}
 		timer := time.NewTimer(pollInterval)
@@ -857,13 +836,17 @@ func attachStorageProvenance(ctx context.Context, clients *apiClients, computerI
 			if !timer.Stop() {
 				<-timer.C
 			}
+			err = observationCtx.Err()
+			verdict = decideWaitFailure(ctx, observationCtx, err, &lastRetryable)
 		case <-timer.C:
+			continue
 		}
+		break
 	}
-	if ctx.Err() != nil {
+	switch verdict {
+	case waitCallerStopped:
 		err = ctx.Err()
-	} else if observationCtx.Err() == context.DeadlineExceeded &&
-		(errors.Is(err, context.DeadlineExceeded) || isRetryableL1Answer(err)) {
+	case waitWindowExpired:
 		timeout := "timed out waiting for mutation completion provenance"
 		if lastRetryable != nil {
 			timeout += " (last L1 answer: " + lastRetryable.Error() + ")"
@@ -1029,67 +1012,40 @@ func waitForCustodyExport(ctx context.Context, clients *apiClients, computerID, 
 
 func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe func(context.Context) (bool, error)) (storageWaitObservation, error) {
 	started := time.Now().UTC()
-	waitCtx, cancel := context.WithTimeout(ctx, wait.timeout)
+	waitCtx, cancel := openWaitWindow(ctx, wait.timeout)
 	defer cancel()
-	// The observation loop retries retryable answers at its own interval
-	// (#763, #773): the shared client's one-shot quiet retry is doubled
-	// backoff on top of it, so the observed reads are marked out.
-	waitCtx = withoutClientRetry(waitCtx)
 	deadline, _ := waitCtx.Deadline()
 	observation := storageWaitObservation{Status: "waiting", StartedAt: started.Format(time.RFC3339Nano),
 		waitDeadline: deadline, waitPollInterval: wait.pollInterval}
 	var lastRetryable error
-	fail := func(err error) (storageWaitObservation, error) {
-		if ctx.Err() != nil {
+	fail := func(err error, verdict waitVerdict) (storageWaitObservation, error) {
+		switch verdict {
+		case waitCallerStopped:
 			err = ctx.Err()
-		} else if waitCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
-			err = &mutationWaitTimeoutError{message: fmt.Sprintf("timed out after %s waiting for mutation completion", wait.timeout)}
+		case waitWindowExpired:
+			message := fmt.Sprintf("timed out after %s waiting for mutation completion", wait.timeout)
+			if lastRetryable != nil {
+				message += " (last L1 answer: " + lastRetryable.Error() + ")"
+			}
+			err = &mutationWaitTimeoutError{message: message}
 		}
 		observation.Status, observation.Error = "failed", err.Error()
 		observation.EndedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		return observation, &storageObservationError{cause: err}
 	}
-	// The deadline ran out while every answer L1 gave was a retryable 503.
-	// That is the existing wait-timeout outcome (#763), not exit 13: the
-	// mutation may still be landing, and the last answer belongs in the
-	// observation so an operator can see why the window was never >= a good
-	// read.
-	retryableExpired := func() (storageWaitObservation, error) {
-		timeout := &mutationWaitTimeoutError{message: fmt.Sprintf("timed out after %s waiting for mutation completion (last L1 answer: %s)", wait.timeout, lastRetryable.Error())}
-		observation.Status, observation.Error = "failed", timeout.Error()
-		observation.EndedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		return observation, &storageObservationError{cause: timeout}
-	}
 	for {
 		if err := waitCtx.Err(); err != nil {
-			if lastRetryable != nil && err == context.DeadlineExceeded && ctx.Err() == nil {
-				return retryableExpired()
-			}
-			return fail(err)
+			return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 		}
 		done, err := observe(waitCtx)
-		if err != nil && !isRetryableL1Answer(err) {
-			// The deadline can land mid-read: the transport then answers
-			// DeadlineExceeded even though the last actual answer was a
-			// retryable 503 (#763). That is still the retryable-only
-			// exhaustion, and the detail must survive it. A typed outcome or
-			// refusal arriving at the deadline keeps its own classification.
-			if lastRetryable != nil && ctx.Err() == nil &&
-				errors.Is(waitCtx.Err(), context.DeadlineExceeded) && errors.Is(err, context.DeadlineExceeded) {
-				return retryableExpired()
-			}
-			return fail(err)
+		verdict := decideWaitFailure(ctx, waitCtx, err, &lastRetryable)
+		if err != nil && verdict != waitRetry {
+			return fail(err, verdict)
 		}
-		if err != nil {
-			lastRetryable = err
-		} else {
-			lastRetryable = nil
-		}
+		// Storage rejects even a completed answer processed after the
+		// deadline. Service and revocation keep an answer already in hand.
 		if err := waitCtx.Err(); err != nil {
-			if lastRetryable != nil && err == context.DeadlineExceeded && ctx.Err() == nil {
-				return retryableExpired()
-			}
-			return fail(err)
+			return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 		}
 		if err == nil && done {
 			observation.Status = "observed"
@@ -1102,10 +1058,8 @@ func pollStorageObservation(ctx context.Context, wait storageWaitFlags, observe 
 			if !timer.Stop() {
 				<-timer.C
 			}
-			if lastRetryable != nil && waitCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
-				return retryableExpired()
-			}
-			return fail(waitCtx.Err())
+			err := waitCtx.Err()
+			return fail(err, decideWaitFailure(ctx, waitCtx, err, &lastRetryable))
 		case <-timer.C:
 		}
 	}
