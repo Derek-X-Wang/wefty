@@ -104,3 +104,32 @@ func TestImageReconciliationLatchMustRetainCompletionReplay(t *testing.T) {
 		t.Fatalf("superseded completion replay err=%v, want attempt_mismatch", err)
 	}
 }
+
+func TestImageReconciliationLatchCapsActiveAttemptLease(t *testing.T) {
+	for _, state := range []contract.AttemptState{contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput} {
+		t.Run(string(state), func(t *testing.T) {
+			store, clock, node, job := newProcessStabilityStore(t)
+			claim := claimProcessStabilityService(t, store, node)
+			if _, err := store.db.ExecContext(t.Context(), "UPDATE attempts SET state=? WHERE attempt_id=?", state, claim.Lease.AttemptID); err != nil {
+				t.Fatal(err)
+			}
+			clock.Advance(time.Second)
+			latched, err := store.LatchServiceImageReconciliationFailure(t.Context(), "stability-agent", job.JobID,
+				ServiceImageReconciliationFailureRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					Failure: contract.SpawnFailure{Code: contract.SpawnFailureImageUnavailable, Message: "pin unavailable"}})
+			if err != nil || latched.State != contract.JobFailed || latched.CurrentAttemptID != "" {
+				t.Fatalf("image latch=%+v err=%v", latched, err)
+			}
+			var gotState contract.AttemptState
+			var leaseNS, updatedNS int64
+			if err := store.db.QueryRowContext(t.Context(), "SELECT state, lease_expires_ns, updated_ns FROM attempts WHERE attempt_id=?",
+				claim.Lease.AttemptID).Scan(&gotState, &leaseNS, &updatedNS); err != nil {
+				t.Fatal(err)
+			}
+			if gotState != contract.AttemptLost || leaseNS != clock.Now().UnixNano() || updatedNS != clock.Now().UnixNano() {
+				t.Fatalf("latch must lose and cap the active Attempt at its transaction clock: state=%s lease=%d updated=%d want=%d",
+					gotState, leaseNS, updatedNS, clock.Now().UnixNano())
+			}
+		})
+	}
+}

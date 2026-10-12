@@ -1184,8 +1184,7 @@ func setComputerServiceDesiredState(
 			// detached precondition required by Storage replacement operations.
 			// Keep the exact accepted completion acknowledgeable after detachment,
 			// including a stop completion's binding after start queues the Job again.
-			if _, err := tx.ExecContext(ctx, `UPDATE jobs SET completion_replay_attempt_id=COALESCE(current_attempt_id, completion_replay_attempt_id),
-				current_attempt_id=NULL WHERE job_id=?`, job.JobID); err != nil {
+			if err := detachAttempt(ctx, tx, job.JobID, "", detachQueuedComputerStop); err != nil {
 				return internalError(err, "publish detached stopped Computer")
 			}
 		case contract.JobClaimed, contract.JobRunning:
@@ -1434,10 +1433,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		computer.CurrentJobID, computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state=?, lease_expires_ns=MIN(lease_expires_ns, ?), updated_ns=?
-		WHERE job_id IN (SELECT job_id FROM computer_job_projections WHERE computer_id=?)
-		AND state IN (?, ?, ?)`, contract.AttemptLost, now.UnixNano(), now.UnixNano(), computerID,
-		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput); err != nil {
+	if _, err := invalidateAttempts(ctx, tx, computerID, invalidateComputerRemoval, now); err != nil {
 		return Computer{}, internalError(err, "revoke Computer attempt authority")
 	}
 	if err := scrubComputerControllerState(ctx, tx, computerID); err != nil {
