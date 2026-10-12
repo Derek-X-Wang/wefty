@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode"
@@ -169,6 +170,15 @@ func TestHTTPFailedExchangeAdapters(t *testing.T) {
 					wantExit, wantCode, wantRetry = 1, contract.ErrorInternal, false
 				}
 				assertExchangeReport(t, err, wantExit, wantCode, wantRetry)
+				if adapter == "L1" && failure == "dial-failure" {
+					var dialErr *net.OpError
+					if !errors.As(err, &dialErr) || dialErr.Op != "dial" || dialErr.Net != "tcp" || !errors.Is(err, syscall.ECONNREFUSED) {
+						t.Fatalf("expected a refused TCP dial: %v", err)
+					}
+					if strings.Contains(err.Error(), "node agent") {
+						t.Fatalf("TCP refusal has a node-agent hint: %v", err)
+					}
+				}
 				if strings.HasPrefix(failure, "cancel-") && !errors.Is(err, context.Canceled) {
 					t.Fatalf("cancellation cause lost: %v", err)
 				}
