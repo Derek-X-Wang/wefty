@@ -687,74 +687,25 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 
 func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
 	completion, _, present, err := outbox.spool.durableCompletion(ctx, attempt.attemptID)
-	if err != nil || !present {
-		return err
+	if err != nil {
+		return &completionPersistenceError{err: err}
 	}
-	var observation OCIIntentObservation
-	var releaseIntent func()
-	if requiresOCIIntentFence(attempt.kind, attempt.class) {
-		disposition, _, dispositionRevision, dispositionErr := outbox.spool.completionDisposition(ctx, attempt.attemptID)
-		if dispositionErr != nil {
-			return dispositionErr
-		}
-		if disposition == "suppressed" {
-			return nil
-		}
-		if outbox.ociIntentGate != nil {
-			var intentErr error
-			observation, releaseIntent, intentErr = outbox.ociIntentGate.beginCompletion(ctx)
-			if intentErr != nil {
-				if disposition == "withheld" && dispositionRevision == 0 {
-					return intentErr
-				}
-				if receiptErr := outbox.withholdCompletion(context.WithoutCancel(ctx), attempt.attemptID, "intent_authority_unavailable", 0); receiptErr != nil {
-					return errors.Join(intentErr, receiptErr)
-				}
-				return intentErr
-			}
-			if !outbox.ociIntentGate.allows(observation) {
-				suppressionContext, cancelSuppression := outbox.ociIntentGate.beginSuppression(ctx)
-				err := outbox.suppressCompletion(suppressionContext, attempt.attemptID, observation.Revision)
-				cancelSuppression()
-				err = outbox.ociIntentGate.finishSuppression(attempt.attemptID, observation, err)
-				releaseIntent()
-				return err
-			}
-		}
+	if !present {
+		return nil
 	}
 	request := l1.CompletionRequest{
 		FencingToken: attempt.fencingToken, IdempotencyKey: "completion:" + attempt.attemptID,
 		Result: completion.Result, RuntimeQuiescenceEvidence: completion.RuntimeQuiescenceEvidence,
 		TerminationInitiator: completion.TerminationInitiator,
 	}
-	_, err = client.Complete(ctx, attempt.jobID, attempt.attemptID, request)
-	if releaseIntent != nil {
-		releaseIntent()
-	}
-	if err == nil || protocolErrorCode(err) == contract.ErrorLeaseExpired {
-		return outbox.spool.completionDelivered(ctx, attempt.attemptID, observation.Revision)
-	}
-	code := protocolErrorCode(err)
-	if permanentEvidenceRejection(code) {
-		return outbox.sealIncomplete(ctx, attempt.attemptID, "completion was permanently rejected", code)
-	}
-	classification := classifyAgentProtocolError(err)
-	switch classification.destination {
-	case errorDestinationTransient:
-		return err
-	case errorDestinationAttemptAuthority:
-		return outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts completion evidence", code)
-	case errorDestinationNodeSession:
-		// node_session_replaced: the attempt belongs to an older registration
-		// of this node and L1 has not accepted this completion. (One it had
-		// accepted -- the #549 storm -- is answered as an already-recorded
-		// replay and was delivered above, #553.) It clears only when the
-		// attempt's lease expires at L1, after which the replay is answered
-		// lease_expired and lands as late evidence -- what the slow re-checks
-		// are for.
-		return recoveryRefusal(err, code, classification)
+	verdict := outbox.deliverCompletion(ctx, client, attempt, request, completionDeliveryReplay)
+	switch verdict.kind {
+	case completionDelivered, completionSuppressed:
+		return nil
+	case completionRefused:
+		return recoveryRefusal(verdict.err, protocolErrorCode(verdict.err), classifyAgentProtocolError(verdict.err))
 	default:
-		return err
+		return verdict.err
 	}
 }
 
