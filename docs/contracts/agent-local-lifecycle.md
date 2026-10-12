@@ -451,15 +451,25 @@ with no further requests or log lines. While L1 reports the attempt as
 live, recovery drains every durable log batch before delivering the single
 completion. After bounded log finalization leaves logs pending,
 shutdown, one-shot cancellation, and renewal cancel/stop/restart directives
-persist completion and stop renewal. On shutdown, the lifecycle keeps attempt
-ownership and runs inline ordered recovery for this attempt: pending logs first,
-then completion, under `context.WithoutCancel(ctx)` plus the existing
-`operationTimeout`. This does not extend log finalization. If inline delivery
-is incomplete, the durable evidence stays on disk for delivery on the next
-start, when L1 may already have settled the attempt by lease expiry and can
-accept the completion only as late evidence. Cancellation and renewal
-cancel/stop/restart directives leave the agent running, so they release attempt
-ownership and wake ordered recovery without waiting for it before returning.
+persist completion and stop renewal. One route decision selects live delivery
+with `completeWithRetry` when no logs are pending, even if recovery has stopped.
+This preserves transient retries and `run_ledger_unavailable` backoff within the
+existing delivery budget. Pending logs require ordered delivery: hand off while
+recovery is running, or deliver inline when process-lifetime recovery is stopping.
+For inline delivery, the lifecycle keeps attempt ownership and delivers pending
+logs first, then completion, under `context.WithoutCancel(ctx)` plus the existing
+`operationTimeout`. It reads the actual recovery lifetime after finalization
+joins, independently of the cancellation cause. If shutdown interrupts an
+in-flight completion, an abandoned request is routed like pending evidence: hand
+off while recovery is running, or deliver the unchanged persisted request inline
+when recovery is stopping. A delivery verdict or local persistence failure keeps
+its own meaning; only an abandoned request is retried. This does not extend log
+finalization. If inline delivery is incomplete, durable evidence stays on disk
+for delivery on the next start, when L1 may already have settled the attempt by
+lease expiry and can accept completion only as late evidence. Cancellation and
+renewal cancel/stop/restart directives use the same route rule. A hand-off releases
+attempt ownership and wakes ordered recovery without waiting. The cause still
+determines the completion result and the lifecycle's return value.
 The logs-first drain can push cancel, stop or restart completion past L1's
 cancel or settle deadline when log finalization is incomplete. Evidence order
 takes precedence over settlement speed. A stop or restart directive received
@@ -881,8 +891,8 @@ service and one-shot payload results, including `runtime_failure` and
 `output_error`, but never adds runtime evidence to a pre-`Started` OCI
 `spawn_error`. The logs-first route follows the local fact that bounded
 finalization left logs pending, independently of the result arm or wire flag.
-The agent hands delivery to ordered recovery, or delivers inline during
-shutdown when recovery is stopping, so L1 receives pending logs before
+The agent hands delivery to ordered recovery, or delivers inline when
+process-lifetime recovery is stopping, so L1 receives pending logs before
 completion closes admission. A synthesized agent-terminated signal preserves
 any existing `log_evidence_incomplete` flag.
 
@@ -1141,9 +1151,12 @@ a plain lost attempt into a payload result. Shutdown and cancel/stop/restart
 directives keep their existing agent-terminated completion semantics: that
 completion is persisted before delivery even when Watch also reports attempt
 loss. Incomplete log finalization hands that persisted completion to ordered
-recovery; otherwise it is delivered within the existing bounded budget and
-remains replayable after a delivery failure. This exception does not manufacture
-a completion for plain helper attempt loss. L1 still fences replay.
+recovery while recovery is running, or delivers pending logs and completion
+inline if recovery is stopping. With no logs pending, live completion delivery
+keeps its transient retries and backoff within the existing bounded budget,
+even after recovery has stopped. Failed delivery remains replayable. This
+exception does not manufacture a completion for plain helper attempt loss. L1
+still fences replay.
 Other attempts, OCI capability, and helper generation remain live. The exact
 identity, bounded recognition record, and session-fatal exceptions are defined
 in [OCI helper protocol](oci-helper-protocol.md#late-attempt-renewals).
