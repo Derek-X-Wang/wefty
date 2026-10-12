@@ -267,6 +267,7 @@ func TestDurableOCIIntentGatesBackgroundRecoveryUntilControllerStart(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"intent-node": {MaxOneshotSlots: 1, MaxServiceSlots: 1},
@@ -374,6 +375,7 @@ func TestControllerStopWaitsForRealInFlightCompletionRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	serverFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"controller-fence-node": {MaxServiceSlots: 1},

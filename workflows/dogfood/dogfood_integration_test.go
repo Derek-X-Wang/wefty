@@ -55,6 +55,7 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	// The stores, and the agent below, close in cleanups registered before
 	// the one that stops the servers. Cleanups run last-in first-out and only
 	// after every defer, so a deferred close would shut the database under a

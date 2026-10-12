@@ -24,6 +24,7 @@ func TestJobsListFromRealBinaryOverL1(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
 			t.Error(err)

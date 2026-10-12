@@ -1381,6 +1381,7 @@ func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	registration := contract.NodeRegistration{NodeID: "native-node", BootSessionID: "native-boot", OS: "linux", Architecture: "amd64", AgentVersion: "realtiming",
 		Capabilities:       map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true},
@@ -2367,6 +2368,7 @@ func exerciseDirectL1OCIOneShot(t *testing.T, ctx context.Context, barrier *ocih
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	server, err := l1.NewServer(control, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"native-node": l1.DefaultNodePolicy("linux")}})
 	if err != nil {
@@ -2526,6 +2528,7 @@ func exerciseOrdinaryL3OCIOneshot(
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer l1Store.Close()
 	// L1 must be told which identity the run ledger actually uses here, or it
 	// classifies this test's L3 as an ordinary direct-L1 submitter: the default
@@ -2843,6 +2846,7 @@ func exerciseNativeLinuxPrestartRequeue(t *testing.T, ctx context.Context, adapt
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	registration := contract.NodeRegistration{
 		NodeID: "native-node", BootSessionID: "native-boot", OS: "linux", Architecture: "amd64", AgentVersion: "realtiming",

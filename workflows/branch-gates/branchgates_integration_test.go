@@ -662,6 +662,7 @@ func startStack(t *testing.T) (*http.Client, *l3.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() { l1Store.Close() })
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		nodeID: l1.DefaultNodePolicy(runtime.GOOS, contract.StableNodeTagPrefix+nodeID),

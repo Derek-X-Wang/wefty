@@ -2401,6 +2401,7 @@ func TestServiceCrashWithExpiredLogUploadStillRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 
 	_, err = store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-log-gap-node"}, contract.NodeRegistration{
@@ -2508,6 +2509,7 @@ func TestOCIPreStartSpawnFailureIgnoresExpiredLogFinalization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	_, err = store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-pre-start-node"}, contract.NodeRegistration{
 		NodeID: "pre-start-node", BootSessionID: "pre-start-boot", OS: "linux", Architecture: "amd64", AgentVersion: "test",
@@ -2628,6 +2630,7 @@ func TestConcurrentLogDeadlineAndGenuineOutputFailureStayTerminalThroughRecovery
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	identity := fabric.Identity{NodeID: "agent"}
 	registration := contract.NodeRegistration{

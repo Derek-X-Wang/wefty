@@ -117,6 +117,7 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{
 		AllowSelfAssertedPersonIdentities: true, ComputerTokenRevoker: revoker, RunLedgerNodeID: "run-ledger",
 	})
@@ -457,6 +458,7 @@ func TestComputerSubmissionCLIReportsAnAppliedChangeWhoseRevocationWasNotRecorde
 	if err != nil {
 		t.Fatal(err)
 	}
+	l1Store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	l1Server, err := l1.NewServer(controlFabric, l1Store, l1.ServerConfig{
 		AllowSelfAssertedPersonIdentities: true, ComputerTokenRevoker: downRunLedger{}, RunLedgerNodeID: "run-ledger",
 	})

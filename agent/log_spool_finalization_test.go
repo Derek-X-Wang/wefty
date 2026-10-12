@@ -24,6 +24,7 @@ func TestPendingSpoolDeadlinePreservesServiceRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer store.Close()
 	identity := fabric.Identity{NodeID: "spool-agent"}
 	registration := contract.NodeRegistration{

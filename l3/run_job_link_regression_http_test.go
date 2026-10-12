@@ -23,6 +23,7 @@ func TestL1SerializedTransientDispatchRetries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	authority.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	defer authority.Close()
 	probe, err := sql.Open("sqlite", path)
 	if err != nil {

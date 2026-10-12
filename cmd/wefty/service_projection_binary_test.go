@@ -23,6 +23,7 @@ func TestServiceOperatorFactsFromRealBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	t.Cleanup(func() { _ = store.Close() })
 	server, err := l1.NewServer(control, store, l1.ServerConfig{})
 	if err != nil {
