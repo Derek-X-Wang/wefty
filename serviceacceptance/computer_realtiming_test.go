@@ -823,12 +823,13 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 	}
 	harness.agent.kill(t)
 	verification := inspectHelperNamespaceInventory(t, helperSocket, helperChecksum)
+	comparisonBaseline := removalBaselineWithoutExpiredRetentions(removalBaseline, verification, time.Now())
 	receipt.ResidueInventories["post_removal_observed_inventory"] = verification.Inventory
 	receipt.ResidueInventories["post_removal_helper_namespace"] = verification.Inventory
 	receipt.ResidueInventories["post_removal_runtime_residue"] = verification.RuntimeResidue
 	receipt.ResidueInventories["post_removal_durable_retained"] = verification.DurableRetained
-	observedExact, observedGCNoNew, observedGCRemoved := compareRemovalInventoryBaseline(removalBaseline.Inventory, verification.Inventory)
-	retainedExact, retainedGCNoNew, _ := compareRemovalInventoryBaseline(removalBaseline.DurableRetained, verification.DurableRetained)
+	observedExact, observedGCNoNew, observedGCRemoved := compareRemovalInventoryBaseline(comparisonBaseline.Inventory, verification.Inventory)
+	retainedExact, retainedGCNoNew, _ := compareRemovalInventoryBaseline(comparisonBaseline.DurableRetained, verification.DurableRetained)
 	missingLogSegments := missingRetainedLogSegmentDiagnostics(removalBaseline, verification)
 	if len(missingLogSegments) > 0 {
 		diagnostic, err := json.Marshal(missingLogSegments)
@@ -856,8 +857,8 @@ func TestLinuxNativeComputerCLIMatrixAtProductionTimings(t *testing.T) {
 		"disks_loops_mounts_restored": reflect.DeepEqual(verification.Inventory.ComputerDiskImages, removalBaseline.Inventory.ComputerDiskImages) &&
 			reflect.DeepEqual(verification.Inventory.ComputerDiskLoops, removalBaseline.Inventory.ComputerDiskLoops) &&
 			reflect.DeepEqual(verification.Inventory.ComputerDiskMounts, removalBaseline.Inventory.ComputerDiskMounts),
-		"logs_and_control_restored": reflect.DeepEqual(verification.Inventory.LogSegments, removalBaseline.Inventory.LogSegments) &&
-			reflect.DeepEqual(verification.Inventory.Cgroups, removalBaseline.Inventory.Cgroups),
+		"logs_and_control_restored": reflect.DeepEqual(verification.Inventory.LogSegments, comparisonBaseline.Inventory.LogSegments) &&
+			reflect.DeepEqual(verification.Inventory.Cgroups, comparisonBaseline.Inventory.Cgroups),
 		"durable_retained_restored":      retainedExact && retainedGCNoNew,
 		"publication_withdrawn":          verified.DisplayEndpoint == nil,
 		"operator_bind_source_untouched": archiveBefore == archiveAfter,
@@ -952,6 +953,43 @@ func observeRetainedLogSegment(response ocihelper.VerifyResponse, id string) ret
 		})
 	}
 	return observation
+}
+
+// removalBaselineWithoutExpiredRetentions allows bounded baseline retentions to
+// expire during the matrix. Every other inventory difference still fails.
+func removalBaselineWithoutExpiredRetentions(before, after ocihelper.VerifyResponse, observedAt time.Time) ocihelper.VerifyResponse {
+	var expiredLogs, expiredCgroups []string
+	for _, retention := range before.DurableRetentions {
+		if retention.Owner != ocihelper.DurableRetentionOwnerOCIHelper || retention.AttemptID == "" ||
+			retention.Bound <= 0 || retention.RecordedAt.IsZero() || retention.Deadline.IsZero() ||
+			!retention.Deadline.Equal(retention.RecordedAt.Add(retention.Bound)) || !retention.Deadline.Before(observedAt) {
+			continue
+		}
+		switch retention.Class {
+		case ocihelper.RemovalResourceLogSegments:
+			if retention.Reason == ocihelper.DurableRetentionReasonLogSpoolSealing && retention.State == ocihelper.DurableRetentionStateUnsealed &&
+				slices.Contains(before.DurableRetained.LogSegments, retention.ID) &&
+				!slices.Contains(after.Inventory.LogSegments, retention.ID) && !slices.Contains(after.DurableRetained.LogSegments, retention.ID) {
+				expiredLogs = append(expiredLogs, retention.ID)
+			}
+		case ocihelper.RemovalResourceCgroup:
+			if retention.Reason == ocihelper.DurableRetentionReasonCgroupReaping && retention.State == ocihelper.DurableRetentionStatePopulated &&
+				slices.Contains(before.DurableRetained.Cgroups, retention.ID) &&
+				!slices.Contains(after.Inventory.Cgroups, retention.ID) && !slices.Contains(after.DurableRetained.Cgroups, retention.ID) {
+				expiredCgroups = append(expiredCgroups, retention.ID)
+			}
+		}
+	}
+	// Copy the filtered slices so receipts and diagnostics keep the original baseline.
+	if len(expiredLogs) > 0 {
+		before.Inventory.LogSegments = stringSetDifference(before.Inventory.LogSegments, expiredLogs)
+		before.DurableRetained.LogSegments = stringSetDifference(before.DurableRetained.LogSegments, expiredLogs)
+	}
+	if len(expiredCgroups) > 0 {
+		before.Inventory.Cgroups = stringSetDifference(before.Inventory.Cgroups, expiredCgroups)
+		before.DurableRetained.Cgroups = stringSetDifference(before.DurableRetained.Cgroups, expiredCgroups)
+	}
+	return before
 }
 
 // compareRemovalInventoryBaseline keeps the post-removal gate exact for every
@@ -1714,6 +1752,96 @@ func TestScreenCrossoverProbeRecordsTypedTransportRefusal(t *testing.T) {
 		receipt.EgressAddress.Outcome != "refused" || receipt.EgressAddress.ErrnoName != "ECONNREFUSED" ||
 		receipt.AbstractSocket.Outcome != "not_applicable" || receipt.DerivedDisplay.Outcome != "not_applicable" {
 		t.Fatalf("typed crossover refusal = %+v", receipt)
+	}
+}
+
+func TestRemovalBaselineAllowsOnlyExpiredRetentions(t *testing.T) {
+	recordedAt := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	retention := ocihelper.DurableRetention{
+		Class: ocihelper.RemovalResourceLogSegments, ID: "probe-logs",
+		Owner:     ocihelper.DurableRetentionOwnerOCIHelper,
+		Reason:    ocihelper.DurableRetentionReasonLogSpoolSealing,
+		AttemptID: "probe-attempt", State: ocihelper.DurableRetentionStateUnsealed,
+		Bound: 300 * time.Second, RecordedAt: recordedAt, Deadline: recordedAt.Add(300 * time.Second),
+	}
+	for _, test := range []struct {
+		name   string
+		at     time.Time
+		mutate func(*ocihelper.VerifyResponse, *ocihelper.VerifyResponse)
+		want   bool
+	}{
+		{name: "expired missing retention", at: recordedAt.Add(570 * time.Second), want: true},
+		{name: "missing before deadline", at: retention.Deadline.Add(-time.Nanosecond)},
+		{name: "missing at deadline", at: retention.Deadline},
+		{name: "no recorded deadline", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.DurableRetentions[0].Deadline = time.Time{}
+		}},
+		{name: "unrecorded retention", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.DurableRetentions = nil
+		}},
+		{name: "invalid bound", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.DurableRetentions[0].Bound = time.Second
+		}},
+		{name: "expired still present", at: recordedAt.Add(570 * time.Second), want: true, mutate: func(before, after *ocihelper.VerifyResponse) {
+			after.Inventory.LogSegments = []string{retention.ID}
+			after.DurableRetained.LogSegments = []string{retention.ID}
+		}},
+		{name: "expired alongside live retention", at: recordedAt.Add(570 * time.Second), want: true, mutate: func(before, after *ocihelper.VerifyResponse) {
+			live := retention
+			live.ID, live.Bound, live.Deadline = "live-logs", time.Hour, recordedAt.Add(time.Hour)
+			before.DurableRetentions = append(before.DurableRetentions, live)
+			before.Inventory.LogSegments = append(before.Inventory.LogSegments, live.ID)
+			before.DurableRetained.LogSegments = append(before.DurableRetained.LogSegments, live.ID)
+			after.Inventory.LogSegments, after.DurableRetained.LogSegments = []string{live.ID}, []string{live.ID}
+		}},
+		{name: "expired alongside missing live retention", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			live := retention
+			live.ID, live.Bound, live.Deadline = "live-logs", time.Hour, recordedAt.Add(time.Hour)
+			before.DurableRetentions = append(before.DurableRetentions, live)
+			before.Inventory.LogSegments = append(before.Inventory.LogSegments, live.ID)
+			before.DurableRetained.LogSegments = append(before.DurableRetained.LogSegments, live.ID)
+		}},
+		{name: "new retention", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			after.Inventory.LogSegments = []string{"new-logs"}
+			after.DurableRetained.LogSegments = []string{"new-logs"}
+		}},
+		{name: "unrelated resource lost", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.Inventory.Containers = []string{"preexisting-container"}
+		}},
+		{name: "expired cgroup retention", at: recordedAt.Add(570 * time.Second), want: true, mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.Inventory.LogSegments, before.DurableRetained.LogSegments = nil, nil
+			before.Inventory.Cgroups, before.DurableRetained.Cgroups = []string{"probe-cgroup"}, []string{"probe-cgroup"}
+			before.DurableRetentions[0].Class = ocihelper.RemovalResourceCgroup
+			before.DurableRetentions[0].ID = "probe-cgroup"
+			before.DurableRetentions[0].Reason = ocihelper.DurableRetentionReasonCgroupReaping
+			before.DurableRetentions[0].State = ocihelper.DurableRetentionStatePopulated
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := ocihelper.VerifyResponse{
+				Inventory:         ocihelper.ResourceInventory{LogSegments: []string{retention.ID}},
+				DurableRetained:   ocihelper.ResourceInventory{LogSegments: []string{retention.ID}},
+				DurableRetentions: []ocihelper.DurableRetention{retention},
+			}
+			after := ocihelper.VerifyResponse{}
+			if test.mutate != nil {
+				test.mutate(&before, &after)
+			}
+			original := before
+			original.Inventory.LogSegments = slices.Clone(before.Inventory.LogSegments)
+			original.Inventory.Cgroups = slices.Clone(before.Inventory.Cgroups)
+			original.DurableRetained.LogSegments = slices.Clone(before.DurableRetained.LogSegments)
+			original.DurableRetained.Cgroups = slices.Clone(before.DurableRetained.Cgroups)
+			comparisonBaseline := removalBaselineWithoutExpiredRetentions(before, after, test.at)
+			observedExact, observedNoNew, _ := compareRemovalInventoryBaseline(comparisonBaseline.Inventory, after.Inventory)
+			retainedExact, retainedNoNew, _ := compareRemovalInventoryBaseline(comparisonBaseline.DurableRetained, after.DurableRetained)
+			if got := observedExact && observedNoNew && retainedExact && retainedNoNew; got != test.want {
+				t.Fatalf("removal comparison = %t, want %t (observed=%t retained=%t)", got, test.want, observedExact, retainedExact)
+			}
+			if !reflect.DeepEqual(before, original) {
+				t.Fatal("comparison mutated baseline inventory")
+			}
+		})
 	}
 }
 
