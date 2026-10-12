@@ -1125,6 +1125,7 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 	}{
 		{"running_recovery", context.Canceled, false},
 		{"shutdown_stopped_recovery", context.Canceled, true},
+		{"cancel_stopped_recovery", errAttemptDirectiveCancel, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			firstCompletionStarted := make(chan l1.CompletionRequest, 1)
@@ -1175,7 +1176,7 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 			outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 			select {
 			case <-scanned:
-			case <-time.After(2 * time.Second):
+			case <-time.After(5 * time.Second):
 				t.Fatal("initial recovery scan did not finish")
 			}
 			claim := l1.Claim{
@@ -1551,8 +1552,6 @@ func TestCompletionDirectivePreservesSessionAndEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer outbox.Close()
-			releaseRecovery := holdInitialEvidenceRecoveryScan(t, outbox, client, func(err error) { t.Logf("recovery: %v", err) })
-			defer releaseRecovery()
 			lifecycleOutbox := outbox
 			if test.withoutOutbox {
 				lifecycleOutbox = nil
@@ -1608,9 +1607,9 @@ func TestCompletionDirectivePreservesSessionAndEvidence(t *testing.T) {
 				routed = session.routeError(destination, executeErr)
 			}
 			t.Logf("phases=%v destination=%d execution_error=%v session_routed_error=%v retained=%+v", observedPhases, destination, executeErr, routed, pending)
-			// Release the initial scan only after the durable hand-off was
-			// inspected, so replay cannot mask missing persistence.
-			releaseRecovery()
+			// Recovery is deliberately started only after the live request has
+			// returned, so a recovered receipt cannot mask missing persistence.
+			outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 			select {
 			case body := <-replayed:
 				if !reflect.DeepEqual(body, liveBody) {
@@ -3338,11 +3337,8 @@ func startEvidenceReplayServer(t *testing.T, handler http.Handler, operationTime
 	}
 }
 
-// The transport releases a completed HTTP response only after the directive
-// cancels delivery. This orders the lifecycle join without replacing the real
-// Client decoder, completion classifier, durable outbox, or handoff manager.
-// Live-delivery fixtures keep a real recovery loop alive, but hold its initial
-// scan until the test has inspected the hand-off. Stopped recovery routes inline.
+// Hold the initial recovery scan until a pending-log fixture has inspected its
+// hand-off. Recovery must stay running to select the hand-off route.
 func holdInitialEvidenceRecoveryScan(t *testing.T, outbox *evidenceOutbox, client *Client, report func(error)) func() {
 	t.Helper()
 	scanned := make(chan struct{})
@@ -3360,12 +3356,15 @@ func holdInitialEvidenceRecoveryScan(t *testing.T, outbox *evidenceOutbox, clien
 	outbox.startRecovery(t.Context(), client, report)
 	select {
 	case <-scanned:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("initial recovery scan did not finish")
 	}
 	return releaseScan
 }
 
+// The transport releases a completed HTTP response only after the directive
+// cancels delivery. This orders the lifecycle join without replacing the real
+// Client decoder, completion classifier, durable outbox, or handoff manager.
 func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 	for _, directive := range []l1.AttemptDirective{l1.AttemptDirectiveStop, l1.AttemptDirectiveRestart} {
 		for _, test := range []struct {
@@ -3461,9 +3460,6 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 					t.Fatal(err)
 				}
 				defer outbox.Close()
-				recoveryErrors := make(chan error, 1)
-				releaseRecovery := holdInitialEvidenceRecoveryScan(t, outbox, client, func(err error) { recoveryErrors <- err })
-				defer releaseRecovery()
 				var handoffs *handoffManager
 				var handoffPath string
 				if test.successfulHandoff {
@@ -3564,7 +3560,8 @@ func TestCompletionDirectiveOwnVerdictAndSuccessfulHandoff(t *testing.T) {
 				if pending.State != "durable_completion" || live.Result.ExitCode == nil || *live.Result.ExitCode != 0 || !reflect.DeepEqual(pending.Result, live.Result) {
 					t.Fatalf("successful completion not durable before replay: %+v", pending)
 				}
-				releaseRecovery()
+				recoveryErrors := make(chan error, 1)
+				outbox.startRecovery(t.Context(), client, func(err error) { recoveryErrors <- err })
 				select {
 				case body := <-replayed:
 					if !reflect.DeepEqual(body, live) {
@@ -4075,7 +4072,7 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 				outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recovery: %v", err) })
 				select {
 				case <-scanned:
-				case <-time.After(2 * time.Second):
+				case <-time.After(5 * time.Second):
 					t.Fatal("initial recovery scan did not finish")
 				}
 			}

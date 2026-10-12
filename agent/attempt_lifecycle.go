@@ -292,12 +292,13 @@ const (
 )
 
 // completionRoute keeps recovery lifetime separate from cancellation provenance.
-// Stopping recovery requires inline delivery, even without pending logs.
+// Pending evidence needs ordered recovery; completed logs keep live retries.
+// An abandoned in-flight request is routed as pending evidence.
 func completionRoute(logsPending, recoveryStopping bool) completionDeliveryRoute {
-	if recoveryStopping {
-		return completionRouteInline
-	}
 	if logsPending {
+		if recoveryStopping {
+			return completionRouteInline
+		}
 		return completionRouteHandoff
 	}
 	return completionRouteLive
@@ -817,15 +818,16 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		cancelAttempt(cause)
 		completionFailure = <-completionDone
 		<-renewalDone
-		switch completionRoute(outcome.logsPending && lifecycle.dependencies.outbox != nil,
+		var abandoned *completionDeliveryAbandoned
+		isAbandoned := errors.As(completionFailure.err, &abandoned)
+		switch completionRoute((outcome.logsPending || isAbandoned) && lifecycle.dependencies.outbox != nil,
 			lifecycle.dependencies.outbox != nil && lifecycle.dependencies.outbox.recoveryStopped()) {
 		case completionRouteHandoff:
 			reconcileCompletion = true
 		case completionRouteInline:
 			// Retry only an abandoned request. An independent delivery verdict
 			// or persistence failure keeps its own meaning after cancellation.
-			var abandoned *completionDeliveryAbandoned
-			if errors.As(completionFailure.err, &abandoned) {
+			if isAbandoned {
 				reconcileCompletion = true
 				recoveryContext, cancelRecovery := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 				completionFailure.err = lifecycle.dependencies.outbox.recoverShutdownAttempt(recoveryContext, lifecycle.dependencies.client, claim)

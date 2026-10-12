@@ -54,8 +54,6 @@ func TestHeartbeatCancelDuringCompletionFinishesResultNow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer outbox.Close()
-	releaseRecovery := holdInitialEvidenceRecoveryScan(t, outbox, client, func(err error) { t.Errorf("recovery: %v", err) })
-	defer releaseRecovery()
 	claim := spoolTestClaim("heartbeat-completion-cancel")
 	claim.Job.Spec.Kind = contract.JobKindProcess
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{client: client, runtimes: workloadRuntimeSet{contract.JobKindProcess: &captureRuntime{}}, outbox: outbox,
@@ -334,8 +332,6 @@ func TestCancelDuringCompletionBackoffRetriesIdenticalResultNow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer outbox.Close()
-	releaseRecovery := holdInitialEvidenceRecoveryScan(t, outbox, client, func(err error) { t.Errorf("recovery: %v", err) })
-	defer releaseRecovery()
 	claim := spoolTestClaim("backoff-cancel")
 	claim.Job.Spec.Kind = contract.JobKindProcess
 	claim.Lease.LeaseTTL = time.Hour
