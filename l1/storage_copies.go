@@ -1115,7 +1115,10 @@ func closeTerminalComputerClone(ctx context.Context, tx *sql.Tx, row computerSto
 	// The destination is latched failed rather than stopped: it owns no
 	// Storage generation, so it is not a Computer that merely happens to be
 	// off, and nothing may start it into a freshly formatted empty disk.
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, current_attempt_id=NULL, updated_ns=?
+	if err := detachAttempt(ctx, tx, row.JobID, "", detachStorageDestination); err != nil {
+		return internalError(err, "detach refused Storage destination attempt")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
 		WHERE job_id=?`, contract.JobFailed, now.UnixNano(), row.JobID); err != nil {
 		return internalError(err, "latch refused Computer clone failed")
 	}
@@ -1464,7 +1467,10 @@ func publishComputerStorageCopy(ctx context.Context, tx *sql.Tx, row computerSto
 			return internalError(err, "publish destination Storage provenance")
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='stopped', current_attempt_id=NULL,
+	if err := detachAttempt(ctx, tx, row.JobID, "", detachStorageDestination); err != nil {
+		return internalError(err, "detach Storage destination attempt")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='stopped',
 		updated_ns=? WHERE job_id=?`, now.UnixNano(), row.JobID); err != nil {
 		return internalError(err, "keep copied Computer stopped")
 	}
