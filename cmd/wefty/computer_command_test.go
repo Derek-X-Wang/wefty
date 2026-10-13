@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,116 @@ import (
 
 const computerCLITestDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 const computerCLITestDigestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+func TestRemovedComputerTableThroughCommands(t *testing.T) {
+	for _, command := range []string{"status", "list", "remove"} {
+		t.Run(command, func(t *testing.T) {
+			defer func() {
+				if caught := recover(); caught != nil {
+					t.Errorf("%s table panicked: %v", command, caught)
+				}
+			}()
+			harness, running, node, claim := newRunningComputerCLIFixture(t, "table-running")
+			ctx := context.Background()
+			neighbour := createComputerCLIProjection(t, ctx, harness.clients, "table-neighbour", "table-neighbour-create")
+			neighbourBefore := computerTableCells(t, runServiceCLI(t, ctx, harness.clients, false,
+				"services", "status", neighbour.Name), neighbour.ComputerID)
+			removed := running
+			jobColumns := []string{"OBSERVED", "JOB ID", "ATTEMPT", "MEMORY", "ACTIVE CAPACITY FAILURE", "READY", "LAST FAILURE", "REMOVAL"}
+			assertRunning := func(output []byte) {
+				t.Helper()
+				cells := computerTableCells(t, output, running.ComputerID)
+				for column, want := range map[string]string{
+					"OBSERVED": "running", "JOB ID": running.CurrentJobID, "ATTEMPT": claim.Lease.AttemptID,
+					"MEMORY": "1073741824", "ACTIVE CAPACITY FAILURE": "NOT-RUN(capacity_failure_absent)",
+					"READY": "N/A", "LAST FAILURE": "N/A", "REMOVAL": "N/A",
+				} {
+					if cells[column] != want {
+						t.Errorf("running Computer %s = %q, want %q", column, cells[column], want)
+					}
+				}
+			}
+			assertRunning(runServiceCLI(t, ctx, harness.clients, false, "services", "status", running.Name))
+			runServiceCLI(t, ctx, harness.clients, true, "services", "remove", removed.Name, "--expect-current")
+			directives, err := harness.store.ListNodeRemovalDirectives(ctx, "fabric-"+node.NodeID, node.NodeID, node.BootSessionID)
+			if err != nil || len(directives) != 1 {
+				t.Fatalf("removal directives = %#v, err=%v", directives, err)
+			}
+			directive := directives[0]
+			if _, err := harness.store.AcknowledgeServiceRemoval(ctx, "fabric-"+node.NodeID, removed.CurrentJobID,
+				l1.RemovalAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID,
+					RemovalGeneration: directive.RemovalGeneration, CleanupFence: directive.CleanupFence,
+					RootInstanceID: directive.RootInstanceID, IdempotencyKey: "table-removed-cleaned"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, changed, err := harness.store.FinalizeServiceRemoval(ctx, removed.CurrentJobID); err != nil || !changed {
+				t.Fatalf("finalize removal changed=%v, err=%v", changed, err)
+			}
+			status := runServiceCLI(t, ctx, harness.clients, true, "services", "status", removed.Name)
+			var projection computerOperatorProjection
+			if err := json.Unmarshal(status, &projection); err != nil {
+				t.Fatal(err)
+			}
+			if projection.CurrentJob.ServiceJob != nil || projection.CurrentJobID != removed.CurrentJobID ||
+				projection.CurrentJob.Status != "removed_verified" || projection.RemovalOutcome != "removed_verified" {
+				t.Fatalf("removed Computer JSON: ServiceJob=%#v job ID=%q status=%q removal=%q",
+					projection.CurrentJob.ServiceJob, projection.CurrentJobID, projection.CurrentJob.Status, projection.RemovalOutcome)
+			}
+
+			args := []string{"services", command, removed.Name}
+			if command == "remove" {
+				args = append(args, "--expect-current")
+			} else if command == "list" {
+				args = []string{"computers", "list"}
+			}
+			output := runServiceCLI(t, ctx, harness.clients, false, args...)
+			cells := computerTableCells(t, output, removed.ComputerID)
+			// Only the service Job facts are absent; the Computer and its
+			// final Job status and removal outcome still render.
+			for column, want := range map[string]string{
+				"OBSERVED": "removed_verified", "JOB ID": removed.CurrentJobID, "REMOVAL": "removed_verified",
+				"READY": "N/A", "LAST FAILURE": "N/A",
+			} {
+				if cells[column] != want {
+					t.Errorf("removed Computer %s = %q, want %q", column, cells[column], want)
+				}
+			}
+			if cells["NAME"] != removed.Name || cells["DESIRED"] != "removed" || cells["DISK"] != "8589934592" {
+				t.Errorf("removed Computer facts = %#v", cells)
+			}
+			if command == "list" {
+				neighbourAfter := computerTableCells(t, output, neighbour.ComputerID)
+				for _, column := range jobColumns {
+					if neighbourAfter[column] != neighbourBefore[column] {
+						t.Errorf("neighbour Computer %s changed from %q to %q", column, neighbourBefore[column], neighbourAfter[column])
+					}
+				}
+			}
+		})
+	}
+}
+
+func computerTableCells(t *testing.T, output []byte, computerID string) map[string]string {
+	t.Helper()
+	lines := strings.Split(strings.TrimSuffix(string(output), "\n"), "\n")
+	header := lines[0]
+	for _, row := range lines[1:] {
+		if !strings.HasPrefix(row, computerID+" ") {
+			continue
+		}
+		cells := make(map[string]string)
+		start := 0
+		for _, gap := range regexp.MustCompile(` {2,}`).FindAllStringIndex(header, -1) {
+			end := min(gap[1], len(row))
+			cells[header[start:gap[0]]] = strings.TrimSpace(row[min(start, len(row)):end])
+			start = gap[1]
+		}
+		cells[header[start:]] = strings.TrimSpace(row[min(start, len(row)):])
+		return cells
+	}
+	t.Fatalf("Computer %q absent from table:\n%s", computerID, output)
+	return nil
+}
 
 func TestComputerCLIResolvesFriendlyNameAfterExactID(t *testing.T) {
 	harness, computer, _, _ := newRunningComputerCLIFixture(t, "primary-handle")
