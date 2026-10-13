@@ -84,7 +84,8 @@ func (runner *Runner) runGuarded(
 			_ = command.Process.Kill()
 			<-guardianWait
 		}
-		return spawnFailure(contract.SpawnFailureProcessWait, err), err
+		// Guardian Wait alone cannot prove that its payload was reaped.
+		return spawnFailure(contract.SpawnFailureProcessWait, err), errors.Join(err, ErrGuardianLost)
 	}
 
 	start := guardianControlMessage{Type: guardianMessageStart, Start: &guardianStart{
@@ -145,14 +146,16 @@ func (runner *Runner) runGuarded(
 	stopping := false
 	finish := func(status guardianStatusResult, guardianOutcome waitResult) (contract.ProcessResult, error) {
 		if status.err != nil {
-			return spawnFailure(contract.SpawnFailureProcessWait, status.err), fmt.Errorf("receive guardian result: %w", status.err)
+			return spawnFailure(contract.SpawnFailureProcessWait, status.err), errors.Join(fmt.Errorf("receive guardian result: %w", status.err), ErrGuardianLost)
 		}
 		if status.message.Type != guardianMessageExited {
 			err := fmt.Errorf("guardian sent unexpected %q message", status.message.Type)
-			return spawnFailure(contract.SpawnFailureProcessWait, err), err
+			return spawnFailure(contract.SpawnFailureProcessWait, err), errors.Join(err, ErrGuardianLost)
 		}
 		if guardianOutcome.err != nil {
-			return spawnFailure(contract.SpawnFailureProcessWait, guardianOutcome.err), guardianOutcome.err
+			// A valid Guardian exits cleanly after its exited report. A wait
+			// error makes that report suspect, so it cannot prove payload reaping.
+			return spawnFailure(contract.SpawnFailureProcessWait, guardianOutcome.err), errors.Join(guardianOutcome.err, ErrGuardianLost)
 		}
 		result := *status.message.Result
 		// A later output error must not hide which limit stopped the payload.
@@ -271,6 +274,10 @@ func (runner *Runner) runGuarded(
 }
 
 func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
+	// ExtraFiles clears close-on-exec when passing this endpoint to the
+	// Guardian. Restore it before spawning a payload so only the Guardian
+	// can write status reports or keep the agent's control stream open.
+	syscall.CloseOnExec(int(endpoint.Fd()))
 	decoder := json.NewDecoder(endpoint)
 	encoder := json.NewEncoder(endpoint)
 	var message guardianControlMessage
