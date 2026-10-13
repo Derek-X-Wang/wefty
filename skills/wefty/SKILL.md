@@ -89,6 +89,8 @@ wefty --json inspect "$RUN_ID"         # the evidence
 wefty results "$RUN_ID"                # the result document, exact bytes
 ```
 
+`--json` on `wait`, `inspect` (root and children), `cancel RUN_ID`, and `runs list --origin` omits `workflow.inline_script.content`, keeps `sha256`, and adds `size_bytes` and `content_omitted: true`; add `--include-script` to restore the exact body without `content_omitted`.
+
 A run has no time limit unless you pass `--max-runtime=SECONDS`. AI work can
 normally take hours or days, so do not add a limit by habit. Set one only as a
 cap you choose on purpose, such as a cost ceiling or a backstop for a workflow
