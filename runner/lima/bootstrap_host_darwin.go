@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type launchDaemonInstaller struct {
@@ -127,8 +128,22 @@ func (installer launchDaemonInstaller) remove(ctx context.Context) (LaunchDaemon
 	if _, err := installer.run(ctx, "/usr/bin/sudo", "/bin/rm", "-f", LaunchDaemonPath); err != nil {
 		return evidence, fmt.Errorf("remove LaunchDaemon: %w", err)
 	}
-	_, loadedErr := installer.run(ctx, "/bin/launchctl", "print", label)
-	evidence.Unloaded = loadedErr != nil
+	// launchd may still report the unit briefly after bootout returns.
+	unloadContext, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	evidence.Unloaded = false
+	for unloadContext.Err() == nil {
+		if _, loadedErr := installer.run(unloadContext, "/bin/launchctl", "print", label); loadedErr != nil {
+			evidence.Unloaded = unloadContext.Err() == nil
+			break
+		}
+		select {
+		case <-unloadContext.Done():
+		case <-ticker.C:
+		}
+	}
 	_, statErr := installer.stat(LaunchDaemonPath)
 	evidence.PlistAbsent = errors.Is(statErr, os.ErrNotExist)
 	if !evidence.Unloaded || !evidence.PlistAbsent {
