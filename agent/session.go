@@ -53,6 +53,9 @@ type agentSession struct {
 	logf              func(string, ...any)
 	capabilities      *capabilityState
 	ociBootBarrier    OCIBootBarrier
+	// ociBootReady wakes the collector's one post-barrier measure-only pass.
+	// It is buffered so readiness reached before Run is not lost.
+	ociBootReady chan struct{}
 	// ociIntent reads the durable node-local OCI intent marker. It is the only
 	// authority allowed to close capability with oci_intent_disabled.
 	ociIntent     func(context.Context) (OCIIntentObservation, error)
@@ -258,6 +261,9 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 	}
 
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
+	if barrierErr == nil {
+		session.notifyOCIBootReady()
+	}
 	if barrierErr != nil && !session.capabilities.ociIntentDisabled.Load() {
 		// A boot sweep that fails only because intent is durably disabled must
 		// keep the intent reason it already published, exactly as recovery does.
@@ -285,6 +291,13 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 		return node, nil
 	}
 	return session.publishRegistrationCapabilityPinned(ctx)
+}
+
+func (session *agentSession) notifyOCIBootReady() {
+	select {
+	case session.ociBootReady <- struct{}{}:
+	default:
+	}
 }
 
 // publishRegistrationCapabilityPinned is registration's own pinned positive
@@ -622,6 +635,9 @@ func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihe
 		return ocihelper.HelperSession{}, err
 	}
 	barrierErr := session.ociBootBarrier.Ensure(ctx)
+	if barrierErr == nil {
+		session.notifyOCIBootReady()
+	}
 	if barrierErr != nil && !intentDisabled {
 		session.capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), barrierErr)
 	}
