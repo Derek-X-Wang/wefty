@@ -23,9 +23,10 @@ import (
 // test observes whether the helper was asked to give anything up.
 type bootMeasurementRuntime struct {
 	instantWorkloadRuntime
-	barrier *recordingOCIBootBarrier
-	mu      sync.Mutex
-	root    fakeHelperHandoffRoot
+	barrier         *recordingOCIBootBarrier
+	mu              sync.Mutex
+	root            fakeHelperHandoffRoot
+	scansAtEviction int
 }
 
 func (runtime *bootMeasurementRuntime) InventoryRetainedHandoffs(ctx context.Context, after string) (workloadrunner.RetainedHandoffReport, error) {
@@ -44,7 +45,14 @@ func (runtime *bootMeasurementRuntime) RetainedHandoffVolumeName(ownerKey string
 func (runtime *bootMeasurementRuntime) EvictRetainedHandoff(ctx context.Context, ownerKey string) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	runtime.scansAtEviction = runtime.root.scans
 	return runtime.root.EvictRetainedHandoff(ctx, ownerKey)
+}
+
+func (runtime *bootMeasurementRuntime) successfulScans() int {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.root.scans
 }
 
 func (runtime *bootMeasurementRuntime) evictionAttempts() int {
@@ -87,7 +95,13 @@ func TestTheOCIBootBarrierMeasuresRetainedResultsBeforeTheCollectorTick(t *testi
 				volumes: []workloadrunner.RetainedHandoffVolume{ociVolume(t, "run_oci", 8<<20, 4, harness.now)},
 			}}
 			network := plain.NewNetwork()
-			_, stopServer := startFailureServer(t, network, clock, map[string][]string{"node-1": nil})
+			// Advance retention time without also expiring L1's node authority.
+			// Sharing this clock used to age the registration heartbeat by ten
+			// minutes while Ensure was parked. The first claim then returned
+			// node_dead, and re-registration's OCI suppression could supersede
+			// the explicit recovery's intent read even after LifecycleReady.
+			controlPlaneClock := newManualClock(harness.now)
+			_, stopServer := startFailureServer(t, network, controlPlaneClock, map[string][]string{"node-1": nil})
 			defer stopServer()
 			nodeAgent, err := New(Config{
 				Fabric:              network.NewFabric(fabric.Identity{NodeID: "boot-measurement-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}),
@@ -104,6 +118,7 @@ func TestTheOCIBootBarrierMeasuresRetainedResultsBeforeTheCollectorTick(t *testi
 				t.Fatal(err)
 			}
 			nodeAgent.handoffs = harness.manager
+			registered := nodeAgent.session.registrationSignal()
 			defer nodeAgent.Close()
 			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan error, 1)
@@ -126,8 +141,17 @@ func TestTheOCIBootBarrierMeasuresRetainedResultsBeforeTheCollectorTick(t *testi
 			clock.waitForDeadline(t, startedAt.Add(time.Hour))
 			clock.Advance(10 * time.Minute)
 			close(releaseBarrier)
+			// Complete registration, including the failed barrier's suppression
+			// and standing directives, before explicit recovery may begin.
+			select {
+			case <-registered:
+			case <-time.After(hostedFixtureTimeout):
+				t.Fatal("startup registration did not complete")
+			}
 			if failsAtStartup {
-				waitForAgentLifecycle(t, nodeAgent, LifecycleReady)
+				if barrier.Ready() || ensures.Load() != 1 || runtime.successfulScans() != 0 {
+					t.Fatal("the failed startup barrier recovered before explicit recovery")
+				}
 				if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
 					t.Fatalf("complete the boot barrier during recovery: %v", err)
 				}
@@ -148,6 +172,13 @@ func TestTheOCIBootBarrierMeasuresRetainedResultsBeforeTheCollectorTick(t *testi
 			if got := runtime.evictionAttempts(); got != 0 {
 				t.Fatalf("the post-barrier measure-only pass attempted %d evictions", got)
 			}
+			if got := runtime.successfulScans(); got != 1 {
+				t.Fatalf("the first successful barrier triggered %d OCI scans, want one", got)
+			}
+			// Later successful barriers must not add another measure-only pass.
+			if err := nodeAgent.RecoverOCIRuntimeCapabilities(t.Context()); err != nil {
+				t.Fatalf("repeat successful recovery: %v", err)
+			}
 			// Completing the barrier must not move the original enforcing tick.
 			if !clock.hasDeadline(startedAt.Add(time.Hour)) {
 				t.Fatal("the post-barrier pass moved the collector's first tick")
@@ -161,6 +192,15 @@ func TestTheOCIBootBarrierMeasuresRetainedResultsBeforeTheCollectorTick(t *testi
 				return runtime.evictionAttempts() == 1
 			}); err != nil {
 				t.Fatal(err)
+			}
+			runtime.mu.Lock()
+			scansAtEviction := runtime.scansAtEviction
+			runtime.mu.Unlock()
+			// One post-barrier scan and one enforcing scan, before any scans
+			// that report the figures after eviction. The repeated recovery
+			// above must not have inserted another pass before this tick.
+			if scansAtEviction != 2 {
+				t.Fatalf("OCI scans at first eviction = %d, want two", scansAtEviction)
 			}
 		})
 	}
