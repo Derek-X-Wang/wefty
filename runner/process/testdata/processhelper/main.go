@@ -21,18 +21,15 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "check-no-inherited-socket":
-		// The Guardian's control endpoint is the only socket a payload could
-		// inherit. Check every descriptor rather than fd 3 alone: this helper's
-		// own runtime may reuse a free fd 3 (on Linux, for its epoll instance).
-		for fd := 3; fd < 1024; fd++ {
-			var stat syscall.Stat_t
-			if syscall.Fstat(fd, &stat) != nil {
-				continue
-			}
-			if stat.Mode&syscall.S_IFMT == syscall.S_IFSOCK {
-				fatalf("inherited socket at fd %d", fd)
-			}
+	case "check-guardian-socket-not-inherited":
+		// The Guardian holds its control socket at fd 3, so a leaked endpoint
+		// would be a socket at fd 3 here. An open fd 3 alone proves nothing:
+		// this helper's own runtime may reuse it (on Linux, for epoll). Other
+		// descriptors are out of scope; hosted macOS runners leak unrelated
+		// sockets into every process.
+		var stat syscall.Stat_t
+		if syscall.Fstat(3, &stat) == nil && stat.Mode&syscall.S_IFMT == syscall.S_IFSOCK {
+			fatalf("inherited Guardian control socket at fd 3")
 		}
 	case "exit":
 		exit()

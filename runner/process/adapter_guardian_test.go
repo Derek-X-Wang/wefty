@@ -24,7 +24,7 @@ func TestGuardedPayloadDoesNotInheritGuardianControlEndpoint(t *testing.T) {
 		AttemptID: "attempt-guardian-fd", Guarded: true, IdlePolicy: IgnoreIdle,
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: helperPath},
-			Argv:       []string{"process-helper", "check-no-inherited-socket"}, WorkingDirectory: t.TempDir(),
+			Argv:       []string{"process-helper", "check-guardian-socket-not-inherited"}, WorkingDirectory: t.TempDir(),
 		},
 	}, sink)
 	if err != nil || result.SpawnError != nil || result.ExitCode == nil || *result.ExitCode != 0 {
