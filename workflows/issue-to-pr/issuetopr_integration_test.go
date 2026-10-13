@@ -519,10 +519,9 @@ exit 0
 	// It is also the fake gate for the reserved-name leak: `vet` and `test` both
 	// run through it, so it is where the gate subshell's own environment can be
 	// inspected. It checks the seven reserved names by name rather than every
-	// WEFTY_-prefixed variable, because this exercise's own environment carries
-	// WEFTY_ISSUE_TO_PR_EXERCISE (and, in the shellcheck-required lane,
-	// WEFTY_REQUIRE_SHELLCHECK) into every job's base environment; those are not
-	// run-execution-context and the workflow never promised to strip them.
+	// WEFTY_-prefixed variable, because the fixture explicitly carries its
+	// WEFTY_ISSUE_TO_PR_AGENT_CMD test seam into each job. That is not run
+	// execution context and the workflow never promised to strip it.
 	goPath, err := exec.LookPath("go")
 	if err != nil {
 		t.Fatal(err)
@@ -821,6 +820,11 @@ func environmentWithWefty(t *testing.T) []string {
 	environment := make([]string, 0, len(os.Environ())+1)
 	path := directory
 	for _, entry := range os.Environ() {
+		// installStubTools sets the agent command explicitly. Keep that test
+		// seam, but exclude every other value from an outer wefty job.
+		if strings.HasPrefix(entry, "WEFTY_") && !strings.HasPrefix(entry, "WEFTY_ISSUE_TO_PR_AGENT_CMD=") {
+			continue
+		}
 		if value, ok := strings.CutPrefix(entry, "PATH="); ok {
 			path = directory + string(os.PathListSeparator) + value
 			continue
@@ -828,6 +832,27 @@ func environmentWithWefty(t *testing.T) []string {
 		environment = append(environment, entry)
 	}
 	return append(environment, "PATH="+path)
+}
+
+func TestWorkflowBaseEnvironmentExcludesOuterRunContext(t *testing.T) {
+	t.Setenv("WEFTY_RUN_ID", "outer-run")
+	t.Setenv("WEFTY_RUN_DIR", t.TempDir())
+	t.Setenv("WEFTY_OUTER_CUSTOM", "outer-context")
+	const agentCommand = "/fixture/fake-agent"
+	t.Setenv("WEFTY_ISSUE_TO_PR_AGENT_CMD", agentCommand)
+	var keptAgentCommand bool
+	for _, entry := range environmentWithWefty(t) {
+		if entry == "WEFTY_ISSUE_TO_PR_AGENT_CMD="+agentCommand {
+			keptAgentCommand = true
+			continue
+		}
+		if strings.HasPrefix(entry, "WEFTY_") {
+			t.Fatalf("workflow base environment inherited %q", entry)
+		}
+	}
+	if !keptAgentCommand {
+		t.Fatal("workflow base environment lost its explicit fake agent command")
+	}
 }
 
 func submitRun(t *testing.T, client *http.Client, input l3.CreateRunRequest, idempotencyKey string) l3.RunAccepted {

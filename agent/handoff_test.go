@@ -128,6 +128,7 @@ func TestHandoffDirectoryRejectsSymlink(t *testing.T) {
 }
 
 func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
+	clearInheritedWeftyEnvironment(t)
 	for _, testCase := range []struct {
 		name string
 		// declares is the submitter's dispatch-authority declaration, which is
@@ -187,6 +188,27 @@ func TestInlineJobProcessReceivesExactRunEnvironment(t *testing.T) {
 				t.Fatalf("process environment output = %q, want %q", output.String(), want)
 			}
 		})
+	}
+}
+
+// These assertions must also work when go test is itself a wefty workload.
+// Drive the same real-process tests with an outer context present, so a plain
+// shell still exercises the regression.
+func TestRunEnvironmentAssertionsIgnoreOuterJob(t *testing.T) {
+	for _, name := range []string{
+		contract.EnvRunID, contract.EnvRunDir, contract.EnvL3Endpoint,
+		contract.EnvHandoffDir, contract.EnvL1Endpoint,
+		contract.EnvAttemptToken, contract.EnvRunToken, "WEFTY_OUTER_CUSTOM",
+	} {
+		t.Setenv(name, "outer-job-value")
+	}
+	t.Run("inline run", TestInlineJobProcessReceivesExactRunEnvironment)
+	t.Run("managed L1 handoff", TestProcessManagedHandoffThroughL1WithoutL3)
+	t.Run("custom handoff root", TestACustomHandoffRootStillCarriesTheResult)
+	t.Run("explicit ambient credentials", TestAmbientAgentCredentialsNeverReachAWorkload)
+	// Each child test must restore the outer context when it finishes.
+	if got := os.Getenv(contract.EnvRunID); got != "outer-job-value" {
+		t.Fatalf("outer run ID after child tests = %q, want restored context", got)
 	}
 }
 

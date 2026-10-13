@@ -364,12 +364,13 @@ func TestInlineTypeScriptWriterBoundsLikeRun(t *testing.T) {
 	})
 
 	t.Run("no mailbox is a refusal that names it", func(t *testing.T) {
+		clearInheritedWeftyEnvironment(t)
 		harness := filepath.Join(t.TempDir(), "harness.mts")
 		if err := os.WriteFile(harness, []byte(workflowhelper.InlineTypeScriptWriter()+typeScriptHarness), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		command := exec.Command(node[0], append(node[1:], harness, `{"call":"gate","name":"vet","outcome":"pass"}`)...)
-		command.Env = append(os.Environ(), workflowhelper.RunDirEnv+"=")
+		command.Env = os.Environ()
 		output, err := command.CombinedOutput()
 		if err == nil || !bytes.Contains(output, []byte("WEFTY_RUN_DIR is not set")) {
 			t.Fatalf("reporting without a mailbox: %v\n%s", err, output)
