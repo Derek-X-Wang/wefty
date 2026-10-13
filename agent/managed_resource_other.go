@@ -4,7 +4,7 @@ package agent
 
 import "fmt"
 
-func initializeManagedResource(rootDirectory, _, _ string) (managedResourceManager, error) {
+func initializeManagedResource(rootDirectory, _, _ string, _ func(string, ...any)) (managedResourceManager, error) {
 	if rootDirectory == "" {
 		return nil, nil
 	}

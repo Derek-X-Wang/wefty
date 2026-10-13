@@ -934,7 +934,7 @@ func TestServiceFinalizationEvictionDeadlinePreservesPayloadAndRecoversTail(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedResource, err := initializeManagedResource(managedRoot, "service-eviction-deadline-node", "service-eviction-deadline-boot")
+	managedResource, err := initializeManagedResource(managedRoot, "service-eviction-deadline-node", "service-eviction-deadline-boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

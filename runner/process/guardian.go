@@ -38,6 +38,7 @@ type guardianStart struct {
 	Args                     []string      `json:"args"`
 	Directory                string        `json:"directory"`
 	Environment              []string      `json:"environment"`
+	ReapTimeout              time.Duration `json:"reap_timeout"`
 	TerminationGrace         time.Duration `json:"termination_grace"`
 	ServiceAddress           string        `json:"service_address,omitempty"`
 	StartupReadinessDeadline time.Duration `json:"startup_readiness_deadline,omitempty"`

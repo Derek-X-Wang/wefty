@@ -3,8 +3,11 @@ package agent
 import "context"
 
 type managedResourceAttempt struct {
-	dataDirectory    string
-	runtimeDirectory string
+	prepareProcess    func() error
+	processNotSpawned func() error
+	processStarted    func(int) error
+	dataDirectory     string
+	runtimeDirectory  string
 }
 
 // managedResourceManager keeps the agent contract resource-neutral. The

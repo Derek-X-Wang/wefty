@@ -30,6 +30,15 @@ func killProcessGroup(processGroupID int) error {
 	return ignoreMissingProcessGroup(syscall.Kill(-processGroupID, syscall.SIGKILL))
 }
 
+// queryProcessGroup never signals the group. Only ESRCH is absence proof.
+func queryProcessGroup(processGroupID int) error {
+	if processGroupID <= 0 {
+		return errors.New("invalid payload process group")
+	}
+	return syscall.Kill(-processGroupID, 0)
+}
+func isMissingProcessGroup(err error) bool { return errors.Is(err, syscall.ESRCH) }
+
 func processGroupAlive(processGroupID int) bool {
 	err := syscall.Kill(-processGroupID, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)

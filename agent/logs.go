@@ -317,7 +317,7 @@ type bestEffortOutputSink struct {
 }
 
 func (sink bestEffortOutputSink) WriteOutput(ctx context.Context, event contract.LogEvent) error {
-	if err := sink.sink.WriteOutput(ctx, event); err != nil && sink.report != nil {
+	if err := sink.sink.WriteOutput(ctx, event); err != nil && sink.report != nil && ctx.Err() == nil {
 		sink.report(err)
 	}
 	return nil

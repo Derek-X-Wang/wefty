@@ -101,7 +101,7 @@ func TestRemovalAcknowledgementResponsePrecedesLocalIntentRelease(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	managed, err := initializeManagedResource(root, "removal-node", "removal-boot")
+	managed, err := initializeManagedResource(root, "removal-node", "removal-boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

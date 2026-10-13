@@ -56,6 +56,7 @@ type OutputSinkFunc = workloadrunner.OutputSinkFunc
 // guardian ownership, when configured, has been established. Runtime adapters
 // must not call it for a spawn failure.
 type Request struct {
+	ProcessStarted   func(processGroupID int) error
 	AttemptID        string
 	Execution        contract.ExecutionSpec
 	Limits           *contract.JobLimits

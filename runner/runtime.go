@@ -449,6 +449,9 @@ type OCIComputerControlRuntime interface {
 // class are intentionally absent: kind selected the adapter already, while
 // class-specific lifecycle policy was compiled into these fields by the agent.
 type Request struct {
+	// ProcessStarted stores Guardian's payload group before Started is called.
+	// A persistence failure prevents Started and stops the guarded payload.
+	ProcessStarted   func(processGroupID int) error
 	Authority        AttemptAuthority
 	RuntimeHandler   string
 	Execution        contract.ExecutionSpec
@@ -571,9 +574,21 @@ type ReapReceipt struct {
 // kind-specific runtime cannot supply prior-boot quiescence evidence.
 var ErrPriorBootEvidenceUnavailable = errors.New("prior-boot runtime evidence is unavailable")
 
+// ProcessGroupRecord is durable process inventory supplied by managedroot.
+// A zero group records an attempt whose spawn acknowledgement was not stored.
+// NotSpawned resolves that uncertainty only after positive no-payload proof.
+type ProcessGroupRecord struct {
+	NotSpawned     bool   `json:"not_spawned,omitempty"`
+	AttemptID      string `json:"attempt_id"`
+	BootSessionID  string `json:"boot_session_id"`
+	HostBootID     string `json:"host_boot_id"`
+	ProcessGroupID int    `json:"process_group_id"`
+}
+
 // PriorBootReapRequest asks a runtime to verify the boot boundary for a
 // service whose attempt was owned by an earlier agent boot.
 type PriorBootReapRequest struct {
+	ProcessGroups        []ProcessGroupRecord
 	NodeID               string
 	JobID                string
 	PriorBootSessionID   string
@@ -585,7 +600,7 @@ type PriorBootReapRequest struct {
 }
 
 // PriorBootReaper is optional because not every runtime has boot-barrier
-// evidence. Process derives it from Guardian disconnect; OCI will derive it
+// evidence. Process proves host reboot or recorded group absence; OCI derives it
 // from the helper boot sweep.
 type PriorBootReaper interface {
 	ReapPriorBoot(context.Context, PriorBootReapRequest) (ReapReceipt, error)
@@ -951,6 +966,7 @@ type ComputerCustodyExportReceipt = contract.ComputerCustodyExportReceipt
 
 // OutputSink receives raw output events. Calls may be concurrent across
 // streams, so implementations must provide any required synchronization.
+// Implementations must release blocked WriteOutput calls when ctx is cancelled.
 type OutputSink interface {
 	WriteOutput(context.Context, contract.LogEvent) error
 }

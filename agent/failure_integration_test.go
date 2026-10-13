@@ -2438,7 +2438,7 @@ func TestServiceCrashWithExpiredLogUploadStillRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedResource, err := initializeManagedResource(managedRoot, "log-gap-node", "log-gap-boot")
+	managedResource, err := initializeManagedResource(managedRoot, "log-gap-node", "log-gap-boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2668,7 +2668,7 @@ func TestConcurrentLogDeadlineAndGenuineOutputFailureStayTerminalThroughRecovery
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedResource, err := initializeManagedResource(managedRoot, registration.NodeID, registration.BootSessionID)
+	managedResource, err := initializeManagedResource(managedRoot, registration.NodeID, registration.BootSessionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -111,7 +111,7 @@ func TestServiceAttemptReceivesNoAttemptCredentialYet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedResource, err := initializeManagedResource(resolvedRoot, "delivery-node", "delivery-boot")
+	managedResource, err := initializeManagedResource(resolvedRoot, "delivery-node", "delivery-boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

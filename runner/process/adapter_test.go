@@ -121,8 +121,10 @@ func TestFreshAdapterHasNoReapEvidence(t *testing.T) {
 
 func TestAdapterIssuesPriorBootGuardianReceipt(t *testing.T) {
 	adapter := NewAdapterForBoot(&materializationExecutor{t: t}, "boot-current")
+	adapter.hostBootIdentity = func() (string, error) { return "darwin:2:0:00000000-0000-0000-0000-000000000002", nil }
 	receipt, err := adapter.ReapPriorBoot(context.Background(), workloadrunner.PriorBootReapRequest{
 		NodeID: "node-test", JobID: "job-prior-boot",
+		ProcessGroups:      []workloadrunner.ProcessGroupRecord{{AttemptID: "attempt", BootSessionID: "boot-prior", HostBootID: "darwin:1:0:00000000-0000-0000-0000-000000000001"}},
 		PriorBootSessionID: "boot-prior", CurrentBootSessionID: "boot-current",
 	})
 	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidencePriorBootGuardian || receipt.BootSessionID != "boot-prior" {

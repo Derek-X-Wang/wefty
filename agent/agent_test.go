@@ -328,7 +328,7 @@ func assertConsoleMirrorFailurePolicyByClass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedResource, err := initializeManagedResource(resolvedRoot, "console-mirror-node", "boot-console-mirror")
+	managedResource, err := initializeManagedResource(resolvedRoot, "console-mirror-node", "boot-console-mirror", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

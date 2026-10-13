@@ -55,7 +55,7 @@ func neverProcessLifecycle(t *testing.T, client *Client, clock Clock, executor p
 	if err != nil {
 		t.Fatal(err)
 	}
-	resource, err := initializeManagedResource(root, "node", "boot")
+	resource, err := initializeManagedResource(root, "node", "boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

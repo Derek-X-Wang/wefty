@@ -50,16 +50,25 @@ func (runner *Runner) runGuarded(
 	}
 	defer agentEndpoint.Close()
 
+	// Preserve trailing output on ordinary cancellation. A separate context
+	// interrupts sink writes when Guardian output must be cut off.
+	outputContext, cancelOutput := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelOutput()
 	activity := newActivityTracker(runner.clock.Now())
 	failure := newSinkFailure()
 	command := exec.Command(runner.guardianExecutable, guardianArg)
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// WaitDelay bounds inherited stdout/stderr after the Guardian dies.
+	// Allow one complete TERM grace plus the final group-reap bound and
+	// a scheduling margin. Cancel sink output one second before pipe closure.
+	command.WaitDelay = runner.terminationGraceTime + runner.processReapTimeout + time.Second
 	command.ExtraFiles = []*os.File{guardianEndpoint}
 	command.Stdout = &eventWriter{
-		ctx: ctx, clock: runner.clock, attemptID: request.AttemptID,
+		ctx: outputContext, clock: runner.clock, attemptID: request.AttemptID,
 		stream: contract.LogStdout, sink: sink, activity: activity, failure: failure,
 	}
 	command.Stderr = &eventWriter{
-		ctx: ctx, clock: runner.clock, attemptID: request.AttemptID,
+		ctx: outputContext, clock: runner.clock, attemptID: request.AttemptID,
 		stream: contract.LogStderr, sink: sink, activity: activity, failure: failure,
 	}
 	if err := command.Start(); err != nil {
@@ -73,19 +82,31 @@ func (runner *Runner) runGuarded(
 		err := command.Wait()
 		guardianWait <- waitResult{err: err, state: command.ProcessState}
 	}()
+	awaitGuardianWait := func() waitResult {
+		timer := time.AfterFunc(command.WaitDelay-time.Second, cancelOutput)
+		defer timer.Stop()
+		return <-guardianWait
+	}
+	guardianFailure := func(err error) (contract.ProcessResult, error) {
+		result := spawnFailure(contract.SpawnFailureProcessWait, err)
+		// Guardian loss cannot establish whether all runtime output was captured.
+		result.LogEvidenceIncomplete = true
+		return result, errors.Join(err, ErrGuardianLost)
+	}
 	stopGuardian := func() {
 		_ = json.NewEncoder(agentEndpoint).Encode(guardianControlMessage{Type: guardianMessageStop})
 	}
 	failGuardian := func(err error) (contract.ProcessResult, error) {
 		_ = agentEndpoint.Close()
+		cancelOutput()
 		select {
 		case <-guardianWait:
-		case <-time.After(runner.terminationGraceTime + time.Second):
+		case <-time.After(runner.terminationGraceTime + runner.processReapTimeout + time.Second):
 			_ = command.Process.Kill()
-			<-guardianWait
+			_ = awaitGuardianWait()
 		}
 		// Guardian Wait alone cannot prove that its payload was reaped.
-		return spawnFailure(contract.SpawnFailureProcessWait, err), errors.Join(err, ErrGuardianLost)
+		return guardianFailure(err)
 	}
 
 	start := guardianControlMessage{Type: guardianMessageStart, Start: &guardianStart{
@@ -93,6 +114,7 @@ func (runner *Runner) runGuarded(
 		Directory:                request.Execution.WorkingDirectory,
 		Environment:              buildEnvironment(runner.baseEnvironment, request.Execution.Env, request.Execution.SensitiveEnv),
 		TerminationGrace:         runner.terminationGraceTime,
+		ReapTimeout:              runner.processReapTimeout,
 		ServiceAddress:           request.ServiceAddress,
 		StartupReadinessDeadline: runner.startupReadinessDeadline,
 		ReadinessProbeInterval:   runner.readinessProbeInterval,
@@ -107,8 +129,17 @@ func (runner *Runner) runGuarded(
 		return failGuardian(fmt.Errorf("receive guardian started: %w", err))
 	}
 	if started.Type == guardianMessageExited {
-		<-guardianWait
+		outcome := awaitGuardianWait()
+		if outcome.err != nil {
+			return guardianFailure(outcome.err)
+		}
 		return *started.Result, nil
+	}
+	if request.ProcessStarted != nil {
+		if err := request.ProcessStarted(started.ProcessGroupID); err != nil {
+			stopGuardian()
+			return failGuardian(fmt.Errorf("persist guardian started group: %w", err))
+		}
 	}
 	if request.Started != nil {
 		request.Started()
@@ -146,21 +177,22 @@ func (runner *Runner) runGuarded(
 	stopping := false
 	finish := func(status guardianStatusResult, guardianOutcome waitResult) (contract.ProcessResult, error) {
 		if status.err != nil {
-			return spawnFailure(contract.SpawnFailureProcessWait, status.err), errors.Join(fmt.Errorf("receive guardian result: %w", status.err), ErrGuardianLost)
+			return guardianFailure(fmt.Errorf("receive guardian result: %w", status.err))
 		}
 		if status.message.Type != guardianMessageExited {
 			err := fmt.Errorf("guardian sent unexpected %q message", status.message.Type)
-			return spawnFailure(contract.SpawnFailureProcessWait, err), errors.Join(err, ErrGuardianLost)
+			return guardianFailure(err)
 		}
-		if guardianOutcome.err != nil {
-			// A valid Guardian exits cleanly after its exited report. A wait
-			// error makes that report suspect, so it cannot prove payload reaping.
-			return spawnFailure(contract.SpawnFailureProcessWait, guardianOutcome.err), errors.Join(guardianOutcome.err, ErrGuardianLost)
+		if guardianOutcome.err != nil && !errors.Is(guardianOutcome.err, exec.ErrWaitDelay) {
+			// A failed Guardian exit still makes its report suspect. ErrWaitDelay
+			// means a clean exit with incomplete output, not loss of payload proof.
+			return guardianFailure(guardianOutcome.err)
 		}
 		result := *status.message.Result
+		result.LogEvidenceIncomplete = result.LogEvidenceIncomplete || outputContext.Err() != nil || errors.Is(guardianOutcome.err, exec.ErrWaitDelay)
 		// A later output error must not hide which limit stopped the payload.
 		markReachedLimit(&result, supervisionErr)
-		if sinkErr := failure.Err(); sinkErr != nil {
+		if sinkErr := failure.Err(); sinkErr != nil && !(outputContext.Err() != nil && errors.Is(sinkErr, context.Canceled)) {
 			return result, fmt.Errorf("output sink: %w", sinkErr)
 		}
 		return result, supervisionErr
@@ -200,7 +232,7 @@ func (runner *Runner) runGuarded(
 			if status.message.Type != guardianMessageExited {
 				return failGuardian(fmt.Errorf("guardian sent unexpected %q message", status.message.Type))
 			}
-			guardianOutcome := <-guardianWait
+			guardianOutcome := awaitGuardianWait()
 			return finish(status, guardianOutcome)
 
 		case outcome := <-guardianWait:
@@ -288,7 +320,10 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 		return errors.New("guardian expected one structured start message")
 	}
 	start := message.Start
-	if start.Path == "" || len(start.Args) == 0 || start.Args[0] == "" || start.Directory == "" || start.TerminationGrace <= 0 {
+	if start.ReapTimeout == 0 {
+		start.ReapTimeout = DefaultProcessReapTimeout
+	}
+	if start.Path == "" || len(start.Args) == 0 || start.Args[0] == "" || start.Directory == "" || start.TerminationGrace <= 0 || start.ReapTimeout <= 0 {
 		return errors.New("guardian start message is invalid")
 	}
 	if start.ServiceAddress != "" && (start.StartupReadinessDeadline <= 0 || start.ReadinessProbeInterval <= 0 || start.ReadinessConnectTimeout <= 0) {
@@ -317,7 +352,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 	if err := encoder.Encode(guardianStatusMessage{
 		Type: guardianMessageStarted, PID: command.Process.Pid, ProcessGroupID: processGroupID,
 	}); err != nil {
-		_, _ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+		_, _, _ = guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
 		return nil
 	}
 	control := make(chan guardianDecodeResult, 1)
@@ -355,7 +390,11 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 		return encoder.Encode(guardianStatusMessage{Type: guardianMessageExited, Result: &result})
 	}
 	writeSpontaneousExit := func(outcome waitResult) error {
-		guardianCleanupRemainingGroup(processGroupID, start.TerminationGrace)
+		completed := make(chan waitResult, 1)
+		completed <- outcome
+		if _, _, err := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, completed); err != nil {
+			return err
+		}
 		return writeExit(outcome, contract.TerminationCauseSpontaneous)
 	}
 
@@ -365,7 +404,10 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 			return writeSpontaneousExit(outcome)
 		case next := <-control:
 			disconnected := next.err != nil || next.message.Type != guardianMessageStop
-			outcome, delivered := guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+			outcome, delivered, reapErr := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
+			if reapErr != nil {
+				return reapErr
+			}
 			cause := terminationCause(delivered, contract.TerminationCauseGuardian)
 			if disconnected {
 				_ = writeExit(outcome, cause)
@@ -391,7 +433,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 					deadlineChannel = nil
 				}
 				if err := writeReadiness(true); err != nil {
-					_, _ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+					_, _, _ = guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
 					return nil
 				}
 				continue
@@ -401,7 +443,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 			}
 			ready = probeReady
 			if err := writeReadiness(ready); err != nil {
-				_, _ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+				_, _, _ = guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait)
 				return nil
 			}
 		case <-deadlineChannel:
@@ -413,7 +455,9 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 				return writeSpontaneousExit(outcome)
 			default:
 			}
-			_, _ = guardianTerminateAndWait(processGroupID, start.TerminationGrace, wait)
+			if _, _, err := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait); err != nil {
+				return err
+			}
 			result := spawnFailure(
 				contract.SpawnFailureStartupReadinessTimeout,
 				errors.New("runtime-local service endpoint did not accept connections before the startup deadline"),
@@ -453,36 +497,68 @@ func guardianServiceProbes(ctx context.Context, address string, interval, timeou
 	return results
 }
 
-// guardianTerminateAndWait reports, beside the payload's outcome, whether
-// the guardian's TERM reached a payload that was still running.
+// guardianTerminateAndWait retains the internal test caller's default bound.
 func guardianTerminateAndWait(processGroupID int, grace time.Duration, wait <-chan waitResult) (waitResult, bool) {
-	completed, delivered := requestTermination(processGroupID, wait)
-	timer := time.NewTimer(grace)
-	defer timer.Stop()
-	for {
-		if completed != nil && !processGroupAlive(processGroupID) {
-			return *completed, delivered
+	outcome, delivered, err := guardianTerminateAndWaitBounded(processGroupID, grace, DefaultProcessReapTimeout, wait)
+	if err != nil {
+		outcome.err = errors.Join(outcome.err, err)
+	}
+	return outcome, delivered
+}
+
+// A terminal report requires BOTH a reaped leader and kernel ESRCH for the
+// entire payload group. Query failures, including EPERM, never prove absence.
+// After final SIGKILL, a real wall-clock timer bounds even a missing Wait.
+func guardianTerminateAndWaitBounded(processGroupID int, grace, reapBound time.Duration, wait <-chan waitResult) (waitResult, bool, error) {
+	return guardianTerminateAndWaitWithGroupOps(processGroupID, grace, reapBound, wait, deliverTermination, killProcessGroup, queryProcessGroup)
+}
+
+func guardianTerminateAndWaitWithGroupOps(processGroupID int, grace, reapBound time.Duration, wait <-chan waitResult, term func(int) bool, kill func(int) error, query func(int) error) (waitResult, bool, error) {
+	if processGroupID <= 0 {
+		return waitResult{}, false, errors.Join(ErrGuardianLost, errors.New("invalid payload group"))
+	}
+	var completed *waitResult
+	select {
+	case outcome := <-wait:
+		completed = &outcome
+	default:
+	}
+	delivered := term(processGroupID) && completed == nil
+	graceTimer := time.NewTimer(grace)
+	defer graceTimer.Stop()
+	var reapTimer *time.Timer
+	var reapDeadline <-chan time.Time
+	var killErr error
+	defer func() {
+		if reapTimer != nil {
+			reapTimer.Stop()
 		}
+	}()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		groupErr := query(processGroupID)
+		if isMissingProcessGroup(groupErr) && completed != nil {
+			return *completed, delivered, nil
+		}
+		// A query error is never positive evidence. Retry within the same bound:
+		// Wait may still be reaping the leader while the kernel reports EPERM for
+		// its dying group. Only ESRCH plus Wait can complete this path.
 		select {
 		case outcome := <-wait:
 			completed = &outcome
-		case <-timer.C:
-			_ = killProcessGroup(processGroupID)
-			if completed != nil {
-				return *completed, delivered
+		case <-poll.C:
+		case <-graceTimer.C:
+			// A failed signal does not prove absence. Keep waiting within the
+			// final bound: the payload may already be exiting or being reaped.
+			killErr = kill(processGroupID)
+			reapTimer = time.NewTimer(reapBound)
+			reapDeadline = reapTimer.C
+		case <-reapDeadline:
+			if isMissingProcessGroup(groupErr) {
+				groupErr = nil
 			}
-			return <-wait, delivered
+			return waitResult{}, delivered, errors.Join(fmt.Errorf("%w: payload group %d reap proof incomplete", ErrGuardianLost, processGroupID), groupErr, killErr)
 		}
 	}
-}
-
-func guardianCleanupRemainingGroup(processGroupID int, grace time.Duration) {
-	if !processGroupAlive(processGroupID) {
-		return
-	}
-	_ = terminateProcessGroup(processGroupID)
-	timer := time.NewTimer(grace)
-	defer timer.Stop()
-	<-timer.C
-	_ = killProcessGroup(processGroupID)
 }
