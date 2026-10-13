@@ -80,12 +80,14 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags := flag.NewFlagSet("wait", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var timeout time.Duration
+	var includeScript bool
 	flags.DurationVar(&timeout, "timeout", 0, "give up after this long (default: wait indefinitely)")
+	flags.BoolVar(&includeScript, "include-script", false, "include inline script content in JSON output")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty wait RUN_ID [--timeout D]")
+		return usageError("usage: wefty wait RUN_ID [--timeout D] [--include-script]")
 	}
 	if timeout < 0 {
 		return usageError("--timeout must not be negative")
@@ -144,7 +146,7 @@ func executeWait(ctx context.Context, clients *apiClients, jsonOutput bool, args
 				reasonCtx := requestContext(ctx, deadline, &cancelRequest)
 				reason := runFailureReason(reasonCtx, clients, record)
 				cancelRequest()
-				return reportTerminalRun(stdout, record, reason, jsonOutput)
+				return reportTerminalRun(stdout, record, reason, jsonOutput, includeScript)
 			}
 		}
 		sleep := delay
@@ -222,12 +224,12 @@ func waitExpired(stdout io.Writer, runID string, status contract.RunState, start
 // bare status; why a failed run failed travels in the error, which main prints
 // to stderr as one line in plain mode. JSON mode emits only the RunRecord on
 // stdout; failure_reason includes recorded or derived execution evidence.
-func reportTerminalRun(stdout io.Writer, record contract.RunRecord, reason string, jsonOutput bool) error {
+func reportTerminalRun(stdout io.Writer, record contract.RunRecord, reason string, jsonOutput, includeScript bool) error {
 	if record.Status == contract.RunFailed && record.FailureReason == "" {
 		record.FailureReason = reason
 	}
 	if jsonOutput {
-		if err := writeJSON(stdout, record); err != nil {
+		if err := writeJSON(stdout, newRunRecordJSON(record, includeScript)); err != nil {
 			return err
 		}
 	} else if _, err := fmt.Fprintln(stdout, record.Status); err != nil {

@@ -285,13 +285,14 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("inspect", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	var includeExecution bool
+	var includeExecution, includeScript bool
 	flags.BoolVar(&includeExecution, "execution", false, "include L1 execution diagnostics")
+	flags.BoolVar(&includeScript, "include-script", false, "include inline script content in JSON output")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty inspect RUN_ID [--execution]")
+		return usageError("usage: wefty inspect RUN_ID [--execution] [--include-script]")
 	}
 	runID := flags.Arg(0)
 	root, err := clients.getRun(ctx, runID)
@@ -337,7 +338,11 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 		inspection.FailureReason = runFailureReason(ctx, clients, root)
 	}
 	if jsonOutput {
-		return writeJSON(stdout, inspection)
+		return writeJSON(stdout, struct {
+			runInspection
+			Run  runRecordJSON   `json:"run"`
+			Runs []runRecordJSON `json:"runs"`
+		}{inspection, newRunRecordJSON(inspection.Run, includeScript), newRunRecordsJSON(inspection.Runs, includeScript)})
 	}
 	return writeRunInspection(stdout, inspection)
 }

@@ -154,3 +154,17 @@ func helpOutputMatchesCommand(output []byte, command string) bool {
 	expected := expectedHelpFirstLine(command)
 	return first == expected || (strings.HasPrefix(expected, "usage: wefty ") && strings.HasPrefix(first, expected+" "))
 }
+
+func TestRunScriptFlagHelpFromRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	for _, command := range [][]string{{"wait", "run_help"}, {"inspect", "run_help"}, {"cancel", "run_help"}, {"runs", "list"}} {
+		args := append([]string{"--json", "--fabric=invalid"}, command...)
+		args = append(args, "--include-script", "--help")
+		t.Run(strings.Join(command, " "), func(t *testing.T) {
+			code, stdout, stderr := runPolishBinary(t, binary, args...)
+			if code != 0 || len(stderr) != 0 || !strings.Contains(string(stdout), "-include-script") {
+				t.Fatalf("exit=%d stdout=%s stderr=%s; want flag help without opening Fabric", code, stdout, stderr)
+			}
+		})
+	}
+}

@@ -91,7 +91,7 @@ func TestWaitTurnsATerminalRunIntoAnExitCode(t *testing.T) {
 
 	succeeded := contract.RunRecord{RunID: "run-ok", Status: contract.RunSucceeded}
 	var out strings.Builder
-	if err := reportTerminalRun(&out, succeeded, "", false); err != nil {
+	if err := reportTerminalRun(&out, succeeded, "", false, false); err != nil {
 		t.Fatalf("a successful run reported an error: %v", err)
 	}
 	if strings.TrimSpace(out.String()) != string(contract.RunSucceeded) {
@@ -100,7 +100,7 @@ func TestWaitTurnsATerminalRunIntoAnExitCode(t *testing.T) {
 
 	failed := contract.RunRecord{RunID: "run-bad", Status: contract.RunFailed}
 	out.Reset()
-	err := reportTerminalRun(&out, failed, "", false)
+	err := reportTerminalRun(&out, failed, "", false, false)
 	if err == nil {
 		t.Fatal("a failed run exited zero")
 	}
@@ -342,7 +342,7 @@ func TestWaitJSONPrintsTheFinalRecord(t *testing.T) {
 	for _, status := range []contract.RunState{contract.RunSucceeded, contract.RunFailed} {
 		var out strings.Builder
 		record := contract.RunRecord{RunID: "run-json", Status: status}
-		_ = reportTerminalRun(&out, record, "", true)
+		_ = reportTerminalRun(&out, record, "", true, false)
 		var decoded contract.RunRecord
 		if err := json.Unmarshal([]byte(out.String()), &decoded); err != nil {
 			t.Fatalf("--json output for a %s run is not JSON: %v (%s)", status, err, out.String())
