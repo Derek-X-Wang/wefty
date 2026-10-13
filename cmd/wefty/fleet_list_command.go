@@ -32,8 +32,8 @@ func parseFleetListOptions(kind string, args []string) (fleetListOptions, error)
 		flags.StringVar(&capability, "capability", "", "exact advertised capability key whose value is true")
 		flags.StringVar(&claims, "claims-enabled", "", "exact claims intent: true or false")
 	}
-	if err := flags.Parse(args); err != nil {
-		return options, usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return options, flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
 		return options, usageError(kind + " list does not accept positional arguments")

@@ -155,11 +155,11 @@ func executeStatus(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var budget time.Duration
 	flags.DurationVar(&budget, "timeout", statusBudget, "give up probing after this long")
-	if err := flags.Parse(args); err != nil {
+	if err := parseCommandFlags(flags, args, false); err != nil {
 		// This command's exit codes are part of what it promises, so a bad
 		// flag has to be a usage error rather than the generic failure a raw
 		// flag error becomes.
-		return usageError(err.Error())
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
 		return usageError("usage: wefty status [--timeout D]")

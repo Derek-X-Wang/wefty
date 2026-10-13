@@ -246,8 +246,8 @@ func parseStorageFlags(flags *flag.FlagSet, args []string, leadingPositionals in
 	for range leadingPositionals {
 		args = moveFirstPositionalToEnd(args)
 	}
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	return nil
 }

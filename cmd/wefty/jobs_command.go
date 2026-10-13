@@ -28,8 +28,8 @@ func executeJobs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags.StringVar(&submitter, "submitter", "", "me: jobs with your originating submitter identity")
 	flags.StringVar(&cursor, "cursor", "", "opaque cursor from the previous page")
 	flags.IntVar(&limit, "limit", l1.DefaultJobPageLimit, "jobs per page")
-	if err := flags.Parse(args[1:]); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args[1:], false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
 		return usageError("jobs list does not accept positional arguments")
