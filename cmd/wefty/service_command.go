@@ -106,8 +106,8 @@ func executeServiceCreate(
 	flags.Var(&publishedPort, "published-port", "Fabric port to publish")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable service creation idempotency key")
 	flags.StringVar(&instanceKey, "instance-key", "", "reserve this instance key in the authenticated app namespace")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
 		return usageError("services create does not accept positional arguments")
@@ -297,8 +297,8 @@ func executeServiceList(
 	var limit int
 	flags.StringVar(&cursor, "cursor", "", "opaque cursor from the previous page")
 	flags.IntVar(&limit, "limit", l1.DefaultJobPageLimit, "services per page")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
 		return usageError("services list does not accept positional arguments")
@@ -407,8 +407,8 @@ func executeServiceDesiredState(
 	flags.DurationVar(&wait, "wait", 0, "wait up to this duration for observed completion")
 	flags.DurationVar(&pollInterval, "poll-interval", defaultServicePollInterval, "wait polling interval")
 	mutation.bind(flags, false)
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services " + verb + " JOB_ID [--wait DURATION]")
@@ -482,8 +482,8 @@ func executeServiceRestart(
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var mutation computerMutationFlags
 	mutation.bind(flags, true)
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services restart JOB_ID --idempotency-key KEY")
@@ -549,8 +549,8 @@ func executeServiceRemove(
 	wait.pollInterval = defaultServicePollInterval
 	wait.bind(flags)
 	mutation.bind(flags, false)
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services remove JOB_ID [--wait DURATION]")
@@ -638,8 +638,8 @@ func executeServiceForget(
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var force bool
 	flags.BoolVar(&force, "force", false, "waive cleanup proof without cancelling the deletion directive")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services forget JOB_ID --force")
@@ -716,8 +716,8 @@ func executeServiceLogs(
 	flags.StringVar(&requestedCursor, "cursor", "", "opaque cursor to continue from (with --follow, start polling from it); an empty page, not a missing cursor, ends the log")
 	flags.BoolVar(&all, "all", false, "walk pages and print every retained event, from --cursor if given; stops at an empty page, or at a walk-page cap whose NEXT CURSOR names the resume point")
 	flags.IntVar(&limit, "limit", l1.DefaultLogPageLimit, "events per poll")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty services logs JOB_ID [--follow | --cursor | --all]")

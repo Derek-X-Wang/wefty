@@ -82,8 +82,8 @@ func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOu
 	sizing := lima.BindSizingFlags(flags, defaults)
 	applyRestart := flags.Bool("apply-restart", false, "apply restart-required Lima template changes")
 	recreate := flags.Bool("recreate", false, "apply recreate-required Lima template changes with zero live OCI attempts")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
 		return usageError("wefty node setup-oci does not accept positional arguments")
@@ -183,8 +183,8 @@ func executeLocalLoadImage(ctx context.Context, client *ocicontrol.Client, jsonO
 	// keyed by. Naming it here is what lets two variants of one repository be
 	// imported offline side by side instead of colliding (#418).
 	reference := flags.String("reference", "", "import name for an archive whose export named no artifact (no reference, or a repository with no tag)")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
 		return usageError("usage: wefty node load-image FILE [--reference REFERENCE]")

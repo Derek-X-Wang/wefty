@@ -219,8 +219,8 @@ func executeResults(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var out string
 	flags.StringVar(&out, "out", "", "write the result document to this file instead of stdout")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty results RUN_ID [--out FILE]")
@@ -287,8 +287,8 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 	flags.SetOutput(io.Discard)
 	var includeExecution bool
 	flags.BoolVar(&includeExecution, "execution", false, "include L1 execution diagnostics")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty inspect RUN_ID [--execution]")
@@ -378,8 +378,8 @@ func executeSetNodeClaims(
 	flags.Var(&claimsEnabled, "claims-enabled", "whether the node may claim new jobs (true or false)")
 	flags.Int64Var(&intentRevision, "intent-revision", 0, "intent revision observed in nodes list")
 	flags.StringVar(&reason, "reason", "", "operator reason recorded with the intent")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty nodes set-claims NODE_ID --claims-enabled BOOL --intent-revision REVISION --reason REASON")
@@ -440,8 +440,8 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 		"this run dispatches child work, so deliver the in-job credentials (default: report through the run mailbox and hold none)")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
 	flags.BoolVar(&again, "again", false, "deliberately create a fresh run instead of replaying the same request")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
 		return usageError("submit does not accept positional arguments")
@@ -526,8 +526,8 @@ func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	var again bool
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "explicit replay key scoped per authenticated actor (overrides the derived key and --again)")
 	flags.BoolVar(&again, "again", false, "deliberately create a fresh rerun instead of replaying the same request")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty rerun RUN_ID")
@@ -558,8 +558,8 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags.BoolVar(&follow, "follow", false, "poll until the run reaches a terminal state and logs are drained")
 	flags.DurationVar(&pollInterval, "poll-interval", time.Second, "follow polling interval")
 	flags.IntVar(&limit, "limit", l1.DefaultLogPageLimit, "events per poll")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty logs RUN_ID [--follow]")
@@ -717,8 +717,8 @@ func executeDrain(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	flags.SetOutput(io.Discard)
 	revision := flags.Int64("revision", 0, "intent revision observed in nodes list or inspect")
 	reason := flags.String("reason", "operator requested drain", "operator reason recorded with the intent")
-	if err := flags.Parse(moveFirstPositionalToEnd(args)); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, moveFirstPositionalToEnd(args), false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
 		return usageError("usage: wefty drain NODE_ID [--revision REVISION] [--reason REASON]")

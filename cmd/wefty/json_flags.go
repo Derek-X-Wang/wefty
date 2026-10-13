@@ -6,7 +6,8 @@ import (
 	"strings"
 )
 
-// Value-taking flags protect their next argument from global --json extraction.
+// Value-taking flags protect their next argument from global --json extraction
+// and help routing. Linux privilege bypass uses the actual command parse.
 // Keep this vocabulary in sync with command registrations (including authoring
 // and platform-specific commands); TestJSONValueFlagVocabulary checks it.
 const jsonValueFlags = `agent-path allowed-mount-root argv auth-key backup-cap cap
@@ -53,12 +54,7 @@ func removeBoolFlag(args []string, name string) ([]string, bool, error) {
 			continue
 		}
 		filtered = append(filtered, arg)
-		flagName := strings.TrimLeft(arg, "-")
-		takesValue := strings.HasPrefix(arg, "-") && valueFlags[flagName]
-		if flagName == "wait" && len(command) >= 2 && command[0] == "services" && (command[1] == "grant" || command[1] == "revoke") {
-			takesValue = false
-		}
-		if takesValue && i+1 < len(args) {
+		if flagArgumentTakesValue(arg, command, valueFlags) && i+1 < len(args) {
 			i++
 			filtered = append(filtered, args[i])
 		} else if !strings.HasPrefix(arg, "-") && len(command) < 2 {
@@ -66,4 +62,13 @@ func removeBoolFlag(args []string, name string) ([]string, bool, error) {
 		}
 	}
 	return filtered, enabled, nil
+}
+
+// --wait is boolean on grant/revoke and takes a duration elsewhere.
+func flagArgumentTakesValue(arg string, command []string, valueFlags map[string]bool) bool {
+	flagName := strings.TrimLeft(arg, "-")
+	if flagName == "wait" && len(command) >= 2 && command[0] == "services" && (command[1] == "grant" || command[1] == "revoke") {
+		return false
+	}
+	return strings.HasPrefix(arg, "-") && valueFlags[flagName]
 }
