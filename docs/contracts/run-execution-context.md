@@ -1633,6 +1633,12 @@ typed arm in an update- and delete-protected row and copies every field into the
 OCI L1 job without applying image defaults. Saved Workflow image versions use
 the same arm but require a digest before the immutable version is accepted.
 
+Run `limits.max_runtime_seconds` is copied to the L1 job for both process and
+OCI image runs. Thus `wefty submit --image … --max-runtime N` retains its
+submission contract and OCI now enforces that attempt runtime. L3 does not
+add an idle timeout to image jobs; explicit idle timeouts are process-only
+at the L1 submission boundary.
+
 An operator mount makes the run Pinned. L3 requires exactly one
 `wefty:node:<stable-node-id>` routing tag whenever an image snapshot has a
 mount, independently of CLI enforcement. A digest-bearing image rerun copies

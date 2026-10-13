@@ -615,9 +615,28 @@ type ExecutableSpec struct {
 }
 
 type JobLimits struct {
-	MaxRuntimeSeconds        int `json:"max_runtime_seconds,omitempty"`
+	// MaxRuntimeSeconds applies to process and OCI attempts. Zero means unset.
+	MaxRuntimeSeconds int `json:"max_runtime_seconds,omitempty"`
+	// IdleTimeoutSeconds applies only to process jobs. OCI submission rejects
+	// explicit wire presence, including zero or null, and nonzero Go values.
 	IdleTimeoutSeconds       int `json:"idle_timeout_seconds,omitempty"`
 	CompletionTimeoutSeconds int `json:"completion_timeout_seconds,omitempty"`
+	idleTimeoutSet           bool
+}
+
+func (limits *JobLimits) UnmarshalJSON(data []byte) error {
+	type wire JobLimits
+	var decoded wire
+	if err := decodeJSONStrict(data, &decoded); err != nil {
+		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	*limits = JobLimits(decoded)
+	_, limits.idleTimeoutSet = members["idle_timeout_seconds"]
+	return nil
 }
 
 type Envelope struct {

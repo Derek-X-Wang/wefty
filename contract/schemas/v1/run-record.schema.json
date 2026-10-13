@@ -142,7 +142,7 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "max_runtime_seconds": { "type": "integer", "minimum": 1 },
+        "max_runtime_seconds": { "type": "integer", "minimum": 1, "description": "Maximum attempt runtime for both process and OCI image runs. Copied to the L1 job runtime limit; omission is unlimited." },
         "max_cost": { "type": "number", "minimum": 0 }
       }
     },
