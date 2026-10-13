@@ -1217,6 +1217,7 @@
             "minLength": 1,
             "description": "Output redaction, durable spooling, or upload finalization failed for a reason other than the bounded log-finalization deadline; the process exit code is not authoritative success."
           },
+          "limit_reached": { "$ref": "../../contract/schemas/v1/limit-reached.schema.json" },
           "exit_code": { "type": "integer" },
           "signal": { "type": "string", "minLength": 1 },
           "termination_cause": {
@@ -1236,6 +1237,7 @@
             "description": "Additive evidence alongside one valid primary arm that a helper log segment was lost, corrupt, or truncated, or that the bounded agent log-finalization deadline expired after a payload result. The bounded-deadline flag applies to every primary result arm, including runtime_failure and output_error, except a spawn_error (L1 refuses the flag on a pre-Started OCI spawn error). The agent routes pending durable logs before completion independently of this wire flag. A synthesized agent-terminated signal preserves any existing flag."
           }
         },
+        "dependentSchemas": { "limit_reached": { "not": { "required": ["spawn_error"] } } },
         "dependentRequired": {
           "signal": ["termination_cause"],
           "termination_cause": ["signal"]

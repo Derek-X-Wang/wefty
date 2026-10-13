@@ -982,6 +982,11 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 }
 
 func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.Request, sink workloadrunner.OutputSink, trace *terminationTrace) (result workloadrunner.Result, runErr error) {
+	defer func() {
+		if errors.Is(runErr, ErrMaxRuntime) {
+			result.Outcome.LimitReached = contract.LimitReachedMaxRuntime
+		}
+	}()
 	adapter.trackRun(request.Authority, runEntry{})
 	session, imageSweepReceipt, err := adapter.sessions.ExecutionSnapshot()
 	if err != nil {

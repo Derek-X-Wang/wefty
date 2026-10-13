@@ -481,7 +481,10 @@ func executeSubmit(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 		EnvelopeSchema: envelopeJSON, RequiredEnvelope: requiredEnvelope,
 		DispatchAuthority: dispatchAuthority,
 	}
-	if maxRuntime < 0 || maxCost < 0 {
+	if err := contract.ValidateLimitSeconds("limits.max_runtime_seconds", maxRuntime); err != nil {
+		return usageError(err.Error())
+	}
+	if maxCost < 0 {
 		return usageError("run limits cannot be negative")
 	}
 	if maxRuntime > 0 || maxCost > 0 {

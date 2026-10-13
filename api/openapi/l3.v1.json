@@ -261,7 +261,7 @@
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                      "max_runtime_seconds": { "type": "integer", "minimum": 1, "description": "Maximum attempt runtime for both process and OCI image runs. Copied to the L1 job runtime limit; omission is unlimited." },
+                      "max_runtime_seconds": { "type": "integer", "minimum": 1, "maximum": 9223372036, "description": "Maximum attempt runtime for both process and OCI image runs. Copied to the L1 job runtime limit; omission is unlimited. Reaching it records a failed Run with failure_reason naming the limit, regardless of payload exit code." },
                       "max_cost": { "type": "number", "minimum": 0 }
                     }
                   },

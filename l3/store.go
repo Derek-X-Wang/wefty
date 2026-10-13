@@ -1229,7 +1229,10 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 		}
 	}
 	if request.Limits != nil {
-		if request.Limits.MaxRuntimeSeconds < 0 || request.Limits.MaxCost < 0 {
+		if err := contract.ValidateLimitSeconds("limits.max_runtime_seconds", request.Limits.MaxRuntimeSeconds); err != nil {
+			return input, "", 0, protocolError(contract.ErrorInvalidRequest, "%v", err)
+		}
+		if request.Limits.MaxCost < 0 {
 			return input, "", 0, protocolError(contract.ErrorInvalidRequest, "run limits cannot be negative")
 		}
 	}

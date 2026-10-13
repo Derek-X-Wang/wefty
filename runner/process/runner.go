@@ -131,7 +131,8 @@ func New(config Config) *Runner {
 // Process outcomes, including spawn failures and nonzero exits, are represented
 // in ProcessResult. The returned error reports supervision failures such as a
 // timeout, context cancellation, or output-sink failure.
-func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink) (contract.ProcessResult, error) {
+func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink) (result contract.ProcessResult, runErr error) {
+	defer func() { markReachedLimit(&result, runErr) }()
 	if sink == nil {
 		sink = OutputSinkFunc(func(context.Context, contract.LogEvent) error { return nil })
 	}
@@ -264,6 +265,26 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 		case <-ctx.Done():
 			return runner.terminate(command.Process.Pid, wait), ctx.Err()
 		}
+	}
+}
+
+// markReachedLimit records only a limit stop confirmed by payload termination
+// evidence. A precompleted exit belongs to the payload; a wait failure cannot
+// carry a limit marker on the completion wire.
+func markReachedLimit(result *contract.ProcessResult, runErr error) {
+	if result.SpawnError != nil {
+		return
+	}
+	delivered := result.TerminationInitiator != "" ||
+		(result.Signal != "" && result.TerminationCause != "" && result.TerminationCause != contract.TerminationCauseSpontaneous)
+	if !delivered {
+		return
+	}
+	switch {
+	case errors.Is(runErr, ErrMaxRuntime):
+		result.LimitReached = contract.LimitReachedMaxRuntime
+	case errors.Is(runErr, ErrIdleTimeout):
+		result.LimitReached = contract.LimitReachedIdleTimeout
 	}
 }
 

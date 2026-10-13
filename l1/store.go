@@ -4813,6 +4813,12 @@ func validateJobSpec(spec *contract.JobSpec) error {
 }
 
 func validateProcessResult(result ProcessResult) error {
+	if result.LimitReached != "" && result.LimitReached != contract.LimitReachedMaxRuntime && result.LimitReached != contract.LimitReachedIdleTimeout {
+		return protocolError(contract.ErrorInvalidRequest, "limit_reached must be max_runtime or idle_timeout")
+	}
+	if result.LimitReached != "" && result.SpawnError != nil {
+		return protocolError(contract.ErrorInvalidRequest, "limit_reached cannot accompany spawn_error")
+	}
 	set := 0
 	if result.SpawnError != nil {
 		set++
@@ -4894,7 +4900,7 @@ func validSHA256(value string) bool {
 }
 
 func completionStates(result ProcessResult) (contract.JobState, contract.AttemptState) {
-	if result.ExitCode != nil && *result.ExitCode == 0 {
+	if result.LimitReached == "" && result.ExitCode != nil && *result.ExitCode == 0 {
 		return contract.JobSucceeded, contract.AttemptSucceeded
 	}
 	return contract.JobFailed, contract.AttemptFailed

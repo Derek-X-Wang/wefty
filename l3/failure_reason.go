@@ -75,6 +75,7 @@ func jobFailureReason(job l1.Job) string {
 // result type, which ADR-0006 keeps off the L3 side of the boundary: the job
 // projection is the allowlisted wire type, and its attempts ride inside it.
 type resultOutcome struct {
+	limitReached  contract.LimitReached
 	exitCode      *int
 	spawn         string
 	runtime       string
@@ -100,7 +101,8 @@ func attemptOutcome(job l1.Job, index int, late bool) (resultOutcome, bool) {
 		return resultOutcome{}, false
 	}
 	outcome := resultOutcome{
-		exitCode: result.ExitCode, outputError: result.OutputError, signal: result.Signal,
+		limitReached: result.LimitReached,
+		exitCode:     result.ExitCode, outputError: result.OutputError, signal: result.Signal,
 		cause: string(result.TerminationCause), outOfMemory: result.OOM, diskExhausted: result.DiskExhausted,
 	}
 	if result.SpawnError != nil {
@@ -132,6 +134,9 @@ func (outcome resultOutcome) reason() string {
 		}
 	default:
 		reason = "no exit code, signal or failure was recorded"
+	}
+	if outcome.limitReached != "" {
+		reason = outcome.limitReached.FailureReason() + " (" + reason + ")"
 	}
 	var flags []string
 	if outcome.outOfMemory {

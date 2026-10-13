@@ -155,6 +155,8 @@ func (runner *Runner) runGuarded(
 			return spawnFailure(contract.SpawnFailureProcessWait, guardianOutcome.err), guardianOutcome.err
 		}
 		result := *status.message.Result
+		// A later output error must not hide which limit stopped the payload.
+		markReachedLimit(&result, supervisionErr)
 		if sinkErr := failure.Err(); sinkErr != nil {
 			return result, fmt.Errorf("output sink: %w", sinkErr)
 		}

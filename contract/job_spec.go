@@ -83,6 +83,21 @@ func ValidateJobSpec(spec *JobSpec) error {
 		}
 	}
 
+	if spec.Limits != nil {
+		for _, limit := range []struct {
+			field   string
+			seconds int
+		}{
+			{"max_runtime_seconds", spec.Limits.MaxRuntimeSeconds},
+			{"idle_timeout_seconds", spec.Limits.IdleTimeoutSeconds},
+			{"completion_timeout_seconds", spec.Limits.CompletionTimeoutSeconds},
+		} {
+			if err := ValidateLimitSeconds("limits."+limit.field, limit.seconds); err != nil {
+				return invalidJobSpecf("%v", err)
+			}
+		}
+	}
+
 	if spec.Class == JobClassService {
 		if IsComputerExecution(spec.Execution) && spec.Restart != RestartAlways {
 			return invalidJobSpecf("Computer restart must be explicitly %q", RestartAlways)

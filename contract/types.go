@@ -890,6 +890,9 @@ const (
 // for a signal. OOM, DiskExhausted, and LogEvidenceIncomplete are additive
 // evidence alongside one valid primary terminal arm.
 type ProcessResult struct {
+	// LimitReached records the limit the runner actually enforced. It is
+	// additive evidence, independent of the payload exit and stop initiator.
+	LimitReached          LimitReached     `json:"limit_reached,omitempty"`
 	SpawnError            *SpawnFailure    `json:"spawn_error,omitempty"`
 	RuntimeFailure        *RuntimeFailure  `json:"runtime_failure,omitempty"`
 	OutputError           string           `json:"output_error,omitempty"`
@@ -900,6 +903,26 @@ type ProcessResult struct {
 	OOM                   bool             `json:"oom,omitempty"`
 	DiskExhausted         bool             `json:"disk_exhausted,omitempty"`
 	LogEvidenceIncomplete bool             `json:"log_evidence_incomplete,omitempty"`
+}
+
+// LimitReached names the limit actually enforced by the node runner. A stop
+// initiator alone cannot establish this evidence.
+type LimitReached string
+
+const (
+	LimitReachedMaxRuntime  LimitReached = "max_runtime"
+	LimitReachedIdleTimeout LimitReached = "idle_timeout"
+)
+
+func (limit LimitReached) FailureReason() string {
+	switch limit {
+	case LimitReachedMaxRuntime:
+		return "maximum runtime reached"
+	case LimitReachedIdleTimeout:
+		return "idle limit reached"
+	default:
+		return ""
+	}
 }
 
 // RuntimeFailure is stable machine-readable evidence that the runtime or
