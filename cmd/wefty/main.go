@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -109,13 +110,26 @@ type globalOptions struct {
 	nodeConfigPath     string
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result error) {
+	defer func() {
+		var help *commandHelp
+		if errors.As(result, &help) {
+			_, result = io.WriteString(stdout, help.usage)
+		}
+	}()
 	options, commandArgs, err := parseGlobalOptions(args, stderr)
 	if err != nil {
-		return usageError(err.Error())
+		return flagUsageError(err)
 	}
 	if len(commandArgs) == 0 {
 		return usageError("a command is required")
+	}
+	if commandArgs[0] == "help" {
+		_, err := io.WriteString(stdout, rootUsage)
+		return err
+	}
+	if wantsCommandHelp(commandArgs) {
+		return executeCommandHelp(ctx, options, commandArgs, stdout, stderr)
 	}
 	if commandArgs[0] == "node" {
 		return executeLocalNode(ctx, options, commandArgs[1:], stdout, stderr)
@@ -231,7 +245,7 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.BoolVar(&options.printEnrollmentURL, "fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
 	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by singular node commands")
 	flags.Usage = func() { fmt.Fprint(flags.Output(), rootUsage) }
-	if err := flags.Parse(args); err != nil {
+	if err := parseCommandFlags(flags, args, true); err != nil {
 		return globalOptions{}, nil, err
 	}
 	return options, flags.Args(), nil
