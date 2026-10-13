@@ -359,6 +359,7 @@ func New(config Config) (*Agent, error) {
 	session.ociIntent = config.OCIIntent
 	session.ociImagePins = ociImagePins
 	if session.ociBootBarrier != nil {
+		session.ociBootReady = make(chan struct{}, 1)
 		session.ociBootBarrier.SetLossHandler(func(_ ocihelper.HelperSession, lossErr error) {
 			capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), lossErr)
 		})
@@ -704,14 +705,28 @@ func (a *Agent) startResultCollector(parent context.Context) {
 	a.collectorCancel = cancel
 	a.collectorContext = ctx
 	a.collectorDone = make(chan struct{})
+	var ociReady <-chan struct{}
+	if a.session != nil {
+		ociReady = a.session.ociBootReady
+	}
 	go func() {
 		defer close(a.collectorDone)
+		timer := a.clock.NewTimer(resultCollectionInterval)
+		defer stopTimer(timer)
 		for {
-			timer := a.clock.NewTimer(resultCollectionInterval)
 			select {
 			case <-ctx.Done():
-				stopTimer(timer)
 				return
+			case <-ociReady:
+				// Startup measured before the helper could expose its root.
+				// Fill in those figures once, without giving results up or
+				// moving the first enforcing tick. The collector owns this
+				// walk too, so shutdown cancels and joins it.
+				ociReady = nil
+				if err := a.handoffs.measureNodeOnly(ctx); err != nil {
+					a.log("measure this node's retained results after the OCI boot barrier: %v", err)
+				}
+				continue
 			case <-timer.C():
 			}
 			if err := a.handoffs.collect(); err != nil {
@@ -723,6 +738,7 @@ func (a *Agent) startResultCollector(parent context.Context) {
 			if err := a.handoffs.accountNode(ctx); err != nil {
 				a.log("measure this node's retained results: %v", err)
 			}
+			timer.Reset(resultCollectionInterval)
 		}
 	}()
 }

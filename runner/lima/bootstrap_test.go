@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -210,6 +211,73 @@ func TestLaunchDaemonRemovalIsIdempotentAndVerified(t *testing.T) {
 		if reflect.DeepEqual(command, []string{"/usr/bin/sudo", "/bin/launchctl", "bootout", "system/dev.wefty.agent"}) {
 			t.Fatalf("idempotent removal booted out an absent unit: %v", commands)
 		}
+	}
+}
+
+func TestLaunchDaemonRemovalWaitsForUnload(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var bootoutAt time.Time
+		installer := launchDaemonInstaller{
+			run: func(_ context.Context, name string, arguments ...string) ([]byte, error) {
+				switch {
+				case name == "/bin/launchctl" && reflect.DeepEqual(arguments, []string{"print", "system/dev.wefty.agent"}):
+					if !bootoutAt.IsZero() && time.Since(bootoutAt) >= 250*time.Millisecond {
+						return nil, os.ErrNotExist
+					}
+				case name == "/usr/bin/sudo" && reflect.DeepEqual(arguments, []string{"/bin/launchctl", "bootout", "system/dev.wefty.agent"}):
+					bootoutAt = time.Now()
+				case name == "/usr/bin/sudo" && reflect.DeepEqual(arguments, []string{"/bin/rm", "-f", LaunchDaemonPath}):
+				default:
+					t.Fatalf("unexpected removal command: %s %v", name, arguments)
+				}
+				return nil, nil
+			},
+			stat: func(string) (os.FileInfo, error) { return nil, os.ErrNotExist },
+		}
+		evidence, err := installer.remove(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if evidence != (LaunchDaemonRemovalEvidence{Label: LaunchDaemonLabel, Unloaded: true, PlistAbsent: true}) {
+			t.Fatalf("delayed unload evidence = %+v", evidence)
+		}
+	})
+}
+
+func TestLaunchDaemonRemovalFailsWhenUnloadExceedsBound(t *testing.T) {
+	for _, stallInspection := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stall_inspection=%t", stallInspection), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				var bootoutAt time.Time
+				installer := launchDaemonInstaller{
+					run: func(ctx context.Context, name string, arguments ...string) ([]byte, error) {
+						switch {
+						case name == "/bin/launchctl" && reflect.DeepEqual(arguments, []string{"print", "system/dev.wefty.agent"}):
+							if stallInspection && !bootoutAt.IsZero() {
+								<-ctx.Done()
+								return nil, ctx.Err()
+							}
+						case name == "/usr/bin/sudo" && reflect.DeepEqual(arguments, []string{"/bin/launchctl", "bootout", "system/dev.wefty.agent"}):
+							bootoutAt = time.Now()
+						case name == "/usr/bin/sudo" && reflect.DeepEqual(arguments, []string{"/bin/rm", "-f", LaunchDaemonPath}):
+						default:
+							t.Fatalf("unexpected removal command: %s %v", name, arguments)
+						}
+						return nil, nil
+					},
+					stat: func(string) (os.FileInfo, error) { return nil, os.ErrNotExist },
+				}
+				evidence, err := installer.remove(ctx)
+				if err == nil || evidence.Unloaded || !evidence.PlistAbsent {
+					t.Fatalf("unverified unload evidence = %+v, error=%v", evidence, err)
+				}
+				if elapsed := time.Since(bootoutAt); elapsed < 3*time.Second || elapsed > 4*time.Second {
+					t.Fatalf("unload verification did not use a short bound: %v", elapsed)
+				}
+			})
+		})
 	}
 }
 

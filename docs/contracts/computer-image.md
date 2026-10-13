@@ -67,8 +67,13 @@ Computer client observations follow [the Read model](read-model.md): authority,
 current Job, actions, grant policy revision, Storage/Backup/Custody evidence and
 take-over views each come from one Read snapshot. `current_job.status` uses the
 job view's open vocabulary (`restart-pending`, `unschedulable`, and the other
-computed statuses); the CLI Computer table displays it. Intents of a deleted
-Computer return `not_found`. Post-change Computer views reload after the commit.
+computed statuses); the CLI Computer table displays it. When removal leaves no
+current service Job projection, `services status`, `computers list`, and the
+`services remove` result display `N/A` for the service-only columns READY and
+LAST FAILURE; the Job status, Job ID and removal outcome still render. JSON
+output retains the Job tombstone and Computer removal outcome unchanged.
+Intents of a deleted Computer return `not_found`. Post-change Computer views
+reload after the commit.
 Backup listings accept `cursor` and `limit` (100 by default, clamped to 250),
 returning `next_cursor` under the adaptive page cutoff. Storage provenance rows
 use the same limits and cutoff, with a Computer-bound creation/ID cursor and

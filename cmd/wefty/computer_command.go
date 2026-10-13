@@ -707,6 +707,11 @@ func writeComputersTable(writer io.Writer, computers []computerOperatorProjectio
 	}
 	for _, computer := range computers {
 		job := computer.CurrentJob
+		// A removed Computer's projection carries no service Job facts.
+		ready, lastFailure := "N/A", "N/A"
+		if job.ServiceJob != nil {
+			ready, lastFailure = boolOrNA(job.Ready), jsonOrNA(job.LastFailure)
+		}
 		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			computer.ComputerID, computer.Name, computer.DesiredState, job.Status,
 			computer.StorageID, computer.StorageGeneration, computer.IntentRevision, computer.AppliedRevision,
@@ -714,9 +719,9 @@ func writeComputersTable(writer io.Writer, computers []computerOperatorProjectio
 			valueOrNA(computer.BoundNodeID), int64PointerOrNA(computer.Capacity.RequestedMemoryBytes), computer.Capacity.RequestedDiskBytes, computer.BackupCap,
 			computer.Capacity.LastGrow.Status+"("+computer.Capacity.LastGrow.Code+")",
 			computer.Capacity.ActiveFailure.Status+"("+computer.Capacity.ActiveFailure.Code+")",
-			boolOrNA(job.Ready), pointerOrNA(computer.DisplayEndpoint, ""),
+			ready, pointerOrNA(computer.DisplayEndpoint, ""),
 			computer.ControllerTenure,
-			jsonOrNA(job.LastFailure), computerRemovalColumn(computer.RemovalOutcome, job.Removal),
+			lastFailure, computerRemovalColumn(computer.RemovalOutcome, job.Removal),
 			computerOwedRevocationsColumn(computer.OwedRevocations), boolPointerOrNA(computer.MutationApplied),
 			boolPointerOrNA(computer.IdempotentReplay), computerConditionColumn(computer.LastCondition), computerActionsColumn(computer.AllowedActions)); err != nil {
 			return err

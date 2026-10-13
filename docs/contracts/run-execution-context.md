@@ -1223,10 +1223,10 @@ Collection expires and nothing else; measuring what is left, and giving results
 up to fit the node budget, are the accounting pass on the collector's own
 timer. Collection runs at agent startup, after finalizing an attempt's prepared
 handoff — including attempts that never completed cleanly — and hourly. The
-accounting pass runs at startup and on that timer and **never on an attempt's
-finalization**: eviction has to measure first, and one workload's directory
-tree must never sit in front of another run finishing or of the node lock being
-released.
+accounting pass runs at startup, once after the OCI boot barrier first completes,
+and on that timer and **never on an attempt's finalization**: eviction has to
+measure first, and one workload's directory tree must never sit in front of
+another run finishing or of the node lock being released.
 The collector is the agent's own and is cancelled and joined before the node
 lock is released. A run an attempt is holding is never swept and never evicted:
 both take the same path lock an attempt does, re-check ownership immediately
@@ -1348,15 +1348,21 @@ subtrees that stopped being the directory the pass was measuring, which are
 left out rather than measured somewhere else; and runs the pass did not finish,
 because one pass has a bounded number of directories it may open and a shutdown
 interrupts it. A truncated run's figures are a floor, not a measurement. The
-pass runs at agent startup and on the collector's own timer, never on an
-attempt's finalization, so one workload's directory tree never sits in front of
-another run finishing or of the node lock being released. All of it reaches a
-person through the agent log and the node doctor's retained-results line.
+pass runs at agent startup, once after the OCI boot barrier first completes,
+and on the collector's own timer, never on an attempt's finalization, so one
+workload's directory tree never sits in front of another run finishing or of
+the node lock being released. All of it reaches a person through the agent log
+and the node doctor's retained-results line.
 
 **What the node gives up when it is over budget.** On the collector's timer, and only
 there, the node evicts until it fits. The pass at agent startup measures and
 reports and gives nothing up: the budget's first irreversible decision does not
 belong inside the call bringing the node up, before it has claimed any work.
+The collector also runs one measure-only pass when the OCI boot barrier first
+completes, including when startup failed and recovery completes it later. This
+fills in the helper-owned root's figures for status and node doctor without
+waiting for the hourly tick. It neither expires nor evicts results and does not
+move the first enforcing tick or later timer passes.
 Published results go first. A handoff is **published** only when the node
 observed both of its attempt's evidence streams reach a ledger:
 
