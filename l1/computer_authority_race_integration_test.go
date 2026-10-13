@@ -40,7 +40,11 @@ func TestRestoreReceiptRacingARemovalNeverFailsTheHeartbeat(t *testing.T) {
 			first := restoreRevocations == 1
 			mu.Unlock()
 			if first {
-				current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+				// This read supplies the test's removal precondition. Snapshot
+				// overload must not prevent the intended receipt/removal race.
+				current, err := retryTestStatusRead(t.Context(), func() (Computer, error) {
+					return h.store.GetComputer(t.Context(), computer.ComputerID)
+				})
 				if err != nil {
 					t.Error(err)
 				} else if _, err := h.store.RemoveComputer(context.Background(), computer.ComputerID,
@@ -92,7 +96,10 @@ func TestRestoreReceiptRacingARemovalNeverFailsTheHeartbeat(t *testing.T) {
 	if restoreRevocations != 1 {
 		t.Fatalf("pre-restore revocations sent = %d, want 1", restoreRevocations)
 	}
-	removed, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	// Retry only the final observation, not the heartbeat under test.
+	removed, err := retryTestStatusRead(t.Context(), func() (Computer, error) {
+		return h.store.GetComputer(t.Context(), computer.ComputerID)
+	})
 	if err != nil || removed.LastRestoreRevocation != nil {
 		t.Fatalf("a removed restore recorded a receipt = %#v err=%v", removed.LastRestoreRevocation, err)
 	}

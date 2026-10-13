@@ -356,11 +356,16 @@ func (r *uploadHeldCrashRuntime) Run(ctx context.Context, request workloadrunner
 }
 
 func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
+	// Recovery RPCs and receipt polling get scheduling headroom. The first
+	// upload still expires on the lifecycle's separate 25 ms finalization
+	// bound; this test pins logs/logs/completion ordering, not replay speed.
+	const recoveryTimeout = 10 * time.Second
 	var mu sync.Mutex
 	var callOrder []string
 	logCalls := 0
 	completionRejected := 0
 	completionSeen := make(chan l1.CompletionRequest, 1)
+	uploadStarted := make(chan struct{}, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch {
 		case strings.HasSuffix(request.URL.Path, "/logs"):
@@ -375,6 +380,7 @@ func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
 			callOrder = append(callOrder, "logs")
 			mu.Unlock()
 			if call == 1 {
+				uploadStarted <- struct{}{}
 				<-request.Context().Done()
 				return
 			}
@@ -413,10 +419,12 @@ func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
 			http.NotFound(w, request)
 		}
 	})
-	client, stopServer := startEvidenceReplayServer(t, handler, time.Second)
+	client, stopServer := startEvidenceReplayServer(t, handler, recoveryTimeout)
 	defer stopServer()
 	defer client.Close()
-	outbox, err := newEvidenceOutbox(t.TempDir(), "ordered-deadline-node", 1024*1024, systemClock{}, 8, time.Hour, time.Millisecond)
+	// Start the upload during the payload, before its finalization deadline
+	// begins. A loaded runner must not consume that bound before L1 sees logs.
+	outbox, err := newEvidenceOutbox(t.TempDir(), "ordered-deadline-node", 1024*1024, systemClock{}, 1, time.Hour, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,9 +438,10 @@ func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
 			AttemptID: "ordered-deadline-attempt", FencingToken: "ordered-deadline-fence", LeaseTTL: time.Minute,
 		},
 	}
+	runtime := &uploadHeldCrashRuntime{uploadStarted: uploadStarted}
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
 		client: client, outbox: outbox,
-		runtimes:            workloadRuntimeSet{contract.JobKindProcess: &restartableCrashRuntime{}},
+		runtimes:            workloadRuntimeSet{contract.JobKindProcess: runtime},
 		clock:               systemClock{},
 		renewalInterval:     10 * time.Second,
 		completionRetry:     time.Millisecond,
@@ -442,15 +451,18 @@ func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
 	if _, err := lifecycle.execute(t.Context(), claim, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if !runtime.uploadHeld.Load() {
+		t.Fatal("durable log sink never attempted AppendLogs before the payload exited")
+	}
 	select {
 	case completion := <-completionSeen:
 		if completion.Result.Signal != "killed" || !completion.Result.LogEvidenceIncomplete || completion.Result.OutputError != "" {
 			t.Fatalf("ordered recovery completion = %#v", completion.Result)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(recoveryTimeout):
 		t.Fatal("ordered recovery did not deliver completion")
 	}
-	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
+	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", recoveryTimeout)
 	mu.Lock()
 	defer mu.Unlock()
 	if completionRejected != 0 || !reflect.DeepEqual(callOrder, []string{"logs", "logs", "completion"}) {
