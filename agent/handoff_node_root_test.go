@@ -194,6 +194,7 @@ func TestPreparationNeverAcceptsADirectoryWithoutOwningIt(t *testing.T) {
 // so one assertion covers both halves: what reached the ledger, and where the
 // run was told to put it.
 func TestACustomHandoffRootStillCarriesTheResult(t *testing.T) {
+	clearInheritedWeftyEnvironment(t)
 	harness := newRetentionHarness(t, time.Hour)
 	// The ledger's default root is a wire value, not a place on this machine.
 	// Pointing it at a directory of its own keeps this test from writing into

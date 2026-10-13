@@ -21,6 +21,7 @@ import (
 )
 
 func TestProcessManagedHandoffThroughL1WithoutL3(t *testing.T) {
+	clearInheritedWeftyEnvironment(t)
 	network := plain.NewNetwork()
 	_, stop := startFailureServer(t, network, nil, map[string][]string{"node-1": {"process-result"}})
 	defer stop()

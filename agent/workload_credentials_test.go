@@ -344,6 +344,7 @@ func TestTheRedactorStillMasksUndeliveredTokens(t *testing.T) {
 // a delivered credential and an ambient one both redact to the same text: the
 // length is what says which one arrived.
 func TestAmbientAgentCredentialsNeverReachAWorkload(t *testing.T) {
+	clearInheritedWeftyEnvironment(t)
 	const (
 		ambientRunToken     = "wrun_ambient_operator_canary_value"
 		ambientAttemptToken = "wattempt_ambient_operator_canary"

@@ -751,6 +751,11 @@ func environmentWithWefty(t *testing.T) []string {
 	environment := make([]string, 0, len(os.Environ())+1)
 	path := directory
 	for _, entry := range os.Environ() {
+		// The fixture supplies its own run context; an outer wefty job must
+		// not become part of the workflow or its subject's environment.
+		if strings.HasPrefix(entry, "WEFTY_") {
+			continue
+		}
 		if value, ok := strings.CutPrefix(entry, "PATH="); ok {
 			path = directory + string(os.PathListSeparator) + value
 			continue
@@ -758,6 +763,17 @@ func environmentWithWefty(t *testing.T) []string {
 		environment = append(environment, entry)
 	}
 	return append(environment, "PATH="+path)
+}
+
+func TestWorkflowBaseEnvironmentExcludesOuterRunContext(t *testing.T) {
+	t.Setenv("WEFTY_RUN_ID", "outer-run")
+	t.Setenv("WEFTY_RUN_DIR", t.TempDir())
+	t.Setenv("WEFTY_OUTER_CUSTOM", "outer-context")
+	for _, entry := range environmentWithWefty(t) {
+		if strings.HasPrefix(entry, "WEFTY_") {
+			t.Fatalf("workflow base environment inherited %q", entry)
+		}
+	}
 }
 
 func submitRun(t *testing.T, client *http.Client, input l3.CreateRunRequest, idempotencyKey string) l3.RunAccepted {
