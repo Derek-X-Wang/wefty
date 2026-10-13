@@ -82,13 +82,21 @@ RUN_ID=$(wefty --json submit \
   --interpreter=node \
   --params-file=params.json \
   --tag=<routing-tag> \
-  --required-envelope \
-  --max-runtime=7200 | jq -er '.run_id')
+  --required-envelope | jq -er '.run_id')
 
 wefty wait "$RUN_ID" --timeout 30m     # exit 0 / 10 / 11; see below
 wefty --json inspect "$RUN_ID"         # the evidence
 wefty results "$RUN_ID"                # the result document, exact bytes
 ```
+
+A run has no time limit unless you pass `--max-runtime=SECONDS`. AI work can
+normally take hours or days, so do not add a limit by habit. Set one only as a
+cap you choose on purpose, such as a cost ceiling or a backstop for a workflow
+that could hang. A run that reaches its limit is stopped and recorded as
+failed, even if it exits 0 when it is stopped. Separately, a `kind=process`
+one-shot that prints nothing for 10 minutes is stopped as idle and also
+recorded as failed: long AI work should print progress, or run as a service,
+which has no idle limit.
 
 `results` has two shapes, and the difference matters if you are going to hash or
 re-parse the document. Plain `wefty results RUN_ID` writes the document's exact
@@ -212,6 +220,11 @@ RUN_ID=$(wefty --json submit \
 wefty wait "$RUN_ID" --timeout 90m
 wefty --json results "$RUN_ID" | jq -er '.document.pr_url'
 ```
+
+Here `--max-runtime=5400` is a deliberate backstop. The workflow stops its own
+agent phases at `budget_minutes` (60 by default) and reports a verdict, so the
+job limit only catches a workflow that hangs. For a longer budget, raise both
+together.
 
 Six steps — `read-issue`, `plan`, `implement`, `gates`, `push`, `open-pr` — so
 `wefty runs list` names the one it is in and `inspect` shows how long each took.

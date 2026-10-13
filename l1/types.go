@@ -514,8 +514,10 @@ type NodeList struct {
 // Bounded log-finalization deadline expiry after a payload result instead
 // preserves that payload arm and sets LogEvidenceIncomplete. A pre-Started OCI
 // SpawnError remains a sole spawn arm. Signal outcomes carry a structured
-// termination initiator.
+// termination initiator. LimitReached independently names an enforced limit
+// and makes an attempt fail even when the payload exits zero.
 type ProcessResult struct {
+	LimitReached          contract.LimitReached     `json:"limit_reached,omitempty"`
 	SpawnError            *contract.SpawnFailure    `json:"spawn_error,omitempty"`
 	RuntimeFailure        *contract.RuntimeFailure  `json:"runtime_failure,omitempty"`
 	OutputError           string                    `json:"output_error,omitempty"`

@@ -840,6 +840,34 @@ diagnostic. Signal results name `termination_cause=agent`; a TERM handler's
 own exit code keeps agent termination provenance on the completion request.
 Expiry is not a spawn error or runtime-loss inference.
 
+The runner reports the enforced limit explicitly as the optional additive
+`ProcessResult.limit_reached`: `max_runtime`, or `idle_timeout` for a process
+idle stop. The marker requires a delivered stop and no `spawn_error`; a
+payload that exited before the stop keeps its own exit without the marker.
+L1 records the attempt and one-shot job as `failed` regardless of
+the payload's exit code, including a TERM handler's exit zero. It preserves
+the real exit code, signal, and termination provenance. L1's job read shows
+`limit_reached` on the attempt result. L3 derives the Run's `failure_reason`
+from that result as `maximum runtime reached (exit 0)` or
+`idle limit reached (signal killed (agent))`, retaining payload evidence;
+`wefty wait --json` prints that Run with exit 10.
+An agent or guardian initiator alone is never limit evidence: cancellation,
+drain, and lease loss retain their own routing. Older agents omitting
+`limit_reached` retain the previous exit-code classification. Upgrade L1
+before agents: an older L1 strictly decodes completions and refuses a new
+agent's `limit_reached` field.
+
+Services ignore `limit_reached`, and a service stopped for its runtime limit
+keeps the existing agent-interruption routing.
+
+L1's Go JobSpec validation accepts each seconds limit only in the range
+0 through 9223372036, before conversion to `time.Duration`. Zero is unset.
+This covers `max_runtime_seconds`, `idle_timeout_seconds`, and
+`completion_timeout_seconds`. Run admission in L3 and CLI submission use the
+same `contract.ValidateLimitSeconds` boundary for maximum runtime. Omitted
+runtime caps remain unlimited, including work that runs for days. The
+existing 600-second process one-shot idle default remains unchanged.
+
 `limits.idle_timeout_seconds` applies only to process jobs. L1 refuses explicit
 presence on an OCI submission with HTTP 400, non-retryable `invalid_request`,
 and `limits.idle_timeout_seconds applies only to process jobs`. Presence

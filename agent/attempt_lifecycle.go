@@ -1446,7 +1446,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		finalizationErr := errors.Join(recoveryErr, reapErr, outputErr, uploadErr)
 		if finalizationErr != nil {
 			if result.RuntimeFailure == nil && result.SpawnError == nil {
-				result = contract.ProcessResult{OutputError: finalizationErr.Error(), LogEvidenceIncomplete: result.LogEvidenceIncomplete}
+				result = contract.ProcessResult{OutputError: finalizationErr.Error(), LimitReached: result.LimitReached, LogEvidenceIncomplete: result.LogEvidenceIncomplete}
 			}
 		}
 		return result, errors.Join(runErr, finalizationErr)
@@ -2380,7 +2380,8 @@ func completionRequest(claim l1.Claim, result contract.ProcessResult, evidence w
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {
 	return l1.ProcessResult{
-		SpawnError: result.SpawnError, RuntimeFailure: result.RuntimeFailure, OutputError: result.OutputError, ExitCode: result.ExitCode,
+		LimitReached: result.LimitReached,
+		SpawnError:   result.SpawnError, RuntimeFailure: result.RuntimeFailure, OutputError: result.OutputError, ExitCode: result.ExitCode,
 		Signal: result.Signal, TerminationCause: result.TerminationCause, OOM: result.OOM, DiskExhausted: result.DiskExhausted,
 		LogEvidenceIncomplete: result.LogEvidenceIncomplete,
 	}

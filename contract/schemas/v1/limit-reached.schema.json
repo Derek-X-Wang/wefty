@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wefty.dev/schemas/v1/limit-reached.schema.json",
+  "title": "Reached attempt limit",
+  "description": "Optional additive ProcessResult evidence naming the limit the node agent enforced. A reached limit fails the attempt and one-shot job regardless of payload exit code. Omission preserves exit-code classification. It is independent of termination initiator and is never inferred from an agent stop.",
+  "type": "string",
+  "enum": ["max_runtime", "idle_timeout"]
+}

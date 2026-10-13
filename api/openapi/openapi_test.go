@@ -1117,7 +1117,7 @@ func compileProtocolSchema(t *testing.T, location string) *jsonschema.Schema {
 		"file:///api/openapi/common.v1.json":    "common.v1.json",
 		"file:///api/openapi/l1-client.v1.json": "l1-client.v1.json",
 	}
-	for _, name := range []string{"job-spec", "envelope", "gate-result", "run-record"} {
+	for _, name := range []string{"job-spec", "envelope", "gate-result", "run-record", "limit-reached"} {
 		resources["file:///contract/schemas/v1/"+name+".schema.json"] =
 			filepath.Join("..", "..", "contract", "schemas", "v1", name+".schema.json")
 		resources["https://wefty.dev/schemas/v1/"+name+".schema.json"] =

@@ -1000,6 +1000,14 @@ remains the authority: a copied file from another person, device, ended
 session, or Computer fails closed, and neither a CLI flag nor URL selects the
 control backend directly.
 
+Completion's optional `result.limit_reached` is explicit runner evidence:
+`max_runtime` or process `idle_timeout`. A reached limit makes a one-shot
+attempt and its job failed even with exit zero; services ignore it. It does not rewrite the exit or
+termination evidence. L1's job read shows `limit_reached` on the attempt
+result; L3 derives the Run's failure reason from that result. The CLI's JSON
+wait prints the failed Run and exits 10. Omission preserves
+the legacy exit-code classification and creates no new runtime cap.
+
 Service completion policy classifies who ended the payload before what it
 returned. Its initiator rows are explicit:
 
