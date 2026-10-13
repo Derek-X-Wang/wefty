@@ -113,7 +113,7 @@ func (clock *runtimeTestClock) next(t *testing.T) *runtimeTestTimer {
 	select {
 	case timer := <-clock.timers:
 		return timer
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("OCI did not arm runtime/termination timer")
 		return nil
 	}

@@ -1288,8 +1288,24 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	}
 	runtimeExceeded := false
 	stopForRuntime := func() error {
-		runtimeExceeded = true
-		return terminateAndWaitObservedWithClock(ctx, session, authority, request.TerminationGrace, watchDone, termination, adapter.clock)
+		// An attempt loss keeps its authority-loss routing before and after
+		// the stop, and a payload that finished as the timer fired did not
+		// exceed its runtime.
+		select {
+		case lost := <-attemptLoss:
+			cancelWatch()
+			<-watchDone
+			return lost
+		default:
+		}
+		err := terminateAndWaitObservedWithClock(ctx, session, authority, request.TerminationGrace, watchDone, termination, adapter.clock)
+		runtimeExceeded = termination.decision != terminationWatchPrecompleted
+		select {
+		case lost := <-attemptLoss:
+			return errors.Join(lost, err)
+		default:
+		}
+		return err
 	}
 	waitForWatch := func() error {
 		if startErr != nil {
@@ -1347,6 +1363,9 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		return spawnResult(contract.SpawnFailureProcessRequest, err), err
 	}
 	if err != nil {
+		if runtimeExceeded {
+			err = errors.Join(ErrMaxRuntime, err)
+		}
 		if requiresOCIRuntimeRecovery(err) && (request.LifetimeBoundary == workloadrunner.AgentBootLifetime || ctx.Err() == nil) {
 			reportOCIRuntimeUnavailable(request, runtimeGeneration)
 		}
