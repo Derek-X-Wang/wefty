@@ -87,8 +87,8 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 
 // ReapAndVerify is a positive receipt over the process executor's ordinary
 // return contract: Wait reaped the payload (and, for a guarded service, the
-// Guardian reported its terminal result). A bounded process-reap timeout is
-// retained as negative evidence instead of being promoted to a clean receipt.
+// Guardian reported its terminal result). A bounded process-reap timeout or
+// missing Guardian exit report is retained as negative evidence.
 func (adapter *Adapter) ReapAndVerify(_ context.Context, request workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
 	if err := validateAuthority(request.Authority); err != nil {
 		return workloadrunner.ReapReceipt{}, err
@@ -105,8 +105,8 @@ func (adapter *Adapter) ReapAndVerify(_ context.Context, request workloadrunner.
 	if !recorded {
 		return workloadrunner.ReapReceipt{}, fmt.Errorf("process reap verification has no evidence for attempt %q", request.Authority.AttemptID)
 	}
-	if errors.Is(reapErr, ErrProcessReapTimeout) {
-		return workloadrunner.ReapReceipt{}, ErrProcessReapTimeout
+	if reapErr != nil {
+		return workloadrunner.ReapReceipt{}, reapErr
 	}
 	return workloadrunner.ReapReceipt{
 		RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt,
@@ -144,6 +144,10 @@ func (adapter *Adapter) recordReap(authority workloadrunner.AttemptAuthority, ru
 	}
 	if errors.Is(runErr, ErrProcessReapTimeout) {
 		adapter.reaped[authority] = ErrProcessReapTimeout
+		return
+	}
+	if errors.Is(runErr, ErrGuardianLost) {
+		adapter.reaped[authority] = ErrGuardianLost
 		return
 	}
 	adapter.reaped[authority] = nil

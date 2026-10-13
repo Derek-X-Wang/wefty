@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -572,6 +573,150 @@ func TestRunPassesWorkingDirectoryStraightToProcessSpawn(t *testing.T) {
 
 func TestTerminateAndWaitSurfacesStalledProcessWait(t *testing.T) {
 	assertTerminateAndWaitSurfacesStalledProcessWait(t)
+}
+
+func TestRunPreservesStopErrorAndReapTimeout(t *testing.T) {
+	sinkErr := errors.New("sink unavailable")
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"idle activity", ErrIdleTimeout},
+		{"idle timer", ErrIdleTimeout},
+		{"completion", ErrCompletionTimeout},
+		{"max runtime", ErrMaxRuntime},
+		{"output sink", sinkErr},
+		{"context", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var outputErr error
+			if tc.name == "output sink" {
+				outputErr = sinkErr
+			}
+			runner, request, clock, sink, start := stalledReapRun(t, outputErr)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			completion := make(chan struct{})
+			switch tc.name {
+			case "idle activity", "idle timer":
+				request.IdlePolicy = MonitorIdle
+			case "completion":
+				request.CompletionSignal = completion
+			case "max runtime":
+				request.Limits = &contract.JobLimits{MaxRuntimeSeconds: 10}
+			}
+			finished := make(chan runOutcome, 1)
+			go func() {
+				result, err := runner.Run(ctx, request, sink)
+				finished <- runOutcome{result: result, err: err}
+			}()
+			if tc.name == "idle activity" {
+				// Output marks activity before Started returns. Advance before
+				// the idle timer exists, so only the activity arm can stop it.
+				start(10 * time.Second)
+			} else {
+				start(0)
+			}
+			graceTimerCount := 1
+			switch tc.name {
+			case "idle activity":
+				graceTimerCount = 2
+			case "idle timer":
+				clock.WaitForResetDeadline(t, clock.Now().Add(10*time.Second))
+				clock.Advance(10 * time.Second)
+				graceTimerCount = 2
+			case "completion":
+				close(completion)
+				clock.WaitForTimerCount(t, 1)
+				clock.Advance(10 * time.Second)
+				graceTimerCount = 2
+			case "max runtime":
+				clock.WaitForTimerCount(t, 1)
+				clock.Advance(10 * time.Second)
+				graceTimerCount = 2
+			case "context":
+				cancel()
+			}
+			clock.WaitForTimerCount(t, graceTimerCount)
+			clock.Advance(2 * time.Second)
+			outcome := awaitRun(t, finished)
+			if !errors.Is(outcome.err, tc.err) {
+				t.Errorf("Run error = %v, want stop error %v", outcome.err, tc.err)
+			}
+			if !errors.Is(outcome.err, ErrProcessReapTimeout) {
+				t.Errorf("Run error = %v, want reap timeout", outcome.err)
+			}
+			assertReapTimeoutResult(t, outcome.result)
+		})
+	}
+}
+
+// stalledReapRun keeps the real command.Wait result unavailable by holding a
+// stdout copy in the sink. SIGKILL still kills the real payload, and the real
+// reap timer must expire before cleanup releases the copy. Started holds the
+// supervisor until both streams have marked activity at the initial clock time.
+func stalledReapRun(t *testing.T, sinkErr error) (*Runner, Request, *fakeClock, OutputSink, func(time.Duration)) {
+	t.Helper()
+	clock := newFakeClock(time.Unix(4_000, 0))
+	runner := New(Config{
+		Clock: clock, IdleTimeout: 10 * time.Second, CompletionTimeout: 10 * time.Second,
+		TerminationGraceTime: 2 * time.Second, ProcessReapTimeout: 10 * time.Millisecond,
+	})
+	output := newCollectingSink()
+	releaseOutput := make(chan struct{})
+	releaseStarted := make(chan struct{})
+	stdoutHeld := make(chan struct{})
+	var outputOnce, startedOnce, stdoutOnce sync.Once
+	var pid int
+	t.Cleanup(func() {
+		if pid != 0 {
+			_ = killProcessGroup(pid)
+		}
+		outputOnce.Do(func() { close(releaseOutput) })
+		startedOnce.Do(func() { close(releaseStarted) })
+		stdoutOnce.Do(func() { close(stdoutHeld) })
+		if pid != 0 {
+			waitForProcessGone(t, pid)
+		}
+	})
+	// The two stream copies race into the sink. A sink error marks the
+	// runner's output as failed, and the runner then drops later events, so
+	// stderr reports its error only after stdout is held. Otherwise stdout
+	// would never reach the sink and Wait would not stall.
+	sink := OutputSinkFunc(func(ctx context.Context, event contract.LogEvent) error {
+		_ = output.WriteOutput(ctx, event)
+		if event.Stream == contract.LogStdout {
+			stdoutOnce.Do(func() { close(stdoutHeld) })
+			<-releaseOutput
+			return sinkErr
+		}
+		<-stdoutHeld
+		return sinkErr
+	})
+	request := Request{
+		AttemptID: "attempt-stalled-reap", Execution: helperExecution("hang-both-streams"),
+		IdlePolicy: IgnoreIdle, Started: func() { <-releaseStarted },
+	}
+	start := func(advance time.Duration) {
+		t.Helper()
+		pid = eventPID(t, output.Next(t))
+		if other := eventPID(t, output.Next(t)); other != pid {
+			t.Fatalf("stream PIDs differ: %d and %d", pid, other)
+		}
+		clock.Advance(advance)
+		startedOnce.Do(func() { close(releaseStarted) })
+	}
+	return runner, request, clock, sink, start
+}
+
+func assertReapTimeoutResult(t *testing.T, result contract.ProcessResult) {
+	t.Helper()
+	want := contract.ProcessResult{SpawnError: &contract.SpawnFailure{
+		Code: contract.SpawnFailureProcessWait, Message: ErrProcessReapTimeout.Error(),
+	}}
+	if !reflect.DeepEqual(result, want) {
+		t.Fatalf("Run result = %#v, want only process_wait spawn error %#v", result, want)
+	}
 }
 
 func assertTerminateAndWaitSurfacesStalledProcessWait(t *testing.T) {

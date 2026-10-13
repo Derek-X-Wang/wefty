@@ -762,10 +762,13 @@ receipt naming the same job and removal generation. No matching sweep evidence
 fails closed; it is never upgraded into an empty or verified manifest.
 
 For `kind=process`, `Run` already waits for process or Guardian reaping, so the
-receipt verifies that blocking return contract. Inline executable decoding,
-digest validation, interpreter resolution, materialization, and cleanup are
-owned by the process adapter; the agent lifecycle never materializes a
-kind-specific executable.
+receipt verifies that blocking return contract. If the payload is not reaped
+within the bound after SIGKILL, or the Guardian ends without a decoded `exited`
+report, the adapter issues no receipt. In these cases,
+`ReapAndVerify` returns `ErrProcessReapTimeout` or `ErrGuardianLost`, respectively.
+Inline executable decoding, digest validation, interpreter resolution,
+materialization, and cleanup are owned by the process adapter; the agent
+lifecycle never materializes a kind-specific executable.
 
 `ServiceAddress` remains only for the process readiness guardian. A portful OCI
 request instead asks its adapter for the named `service` `AttemptEndpoint`: the

@@ -21,6 +21,16 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "check-guardian-socket-not-inherited":
+		// The Guardian holds its control socket at fd 3, so a leaked endpoint
+		// would be a socket at fd 3 here. An open fd 3 alone proves nothing:
+		// this helper's own runtime may reuse it (on Linux, for epoll). Other
+		// descriptors are out of scope; hosted macOS runners leak unrelated
+		// sockets into every process.
+		var stat syscall.Stat_t
+		if syscall.Fstat(3, &stat) == nil && stat.Mode&syscall.S_IFMT == syscall.S_IFSOCK {
+			fatalf("inherited Guardian control socket at fd 3")
+		}
 	case "exit":
 		exit()
 	case "stdout":
@@ -29,6 +39,11 @@ func main() {
 		write(os.Stderr)
 	case "hang":
 		hang()
+	case "hang-both-streams":
+		ignoreTermination(nil)
+		fmt.Fprintln(os.Stdout, os.Getpid())
+		fmt.Fprintln(os.Stderr, os.Getpid())
+		select {}
 	case "spawn-child":
 		spawnChild()
 	case "wait-release":
