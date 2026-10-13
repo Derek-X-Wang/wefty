@@ -21,6 +21,11 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "check-guardian-fd-closed":
+		_, _, err := syscall.Syscall(syscall.SYS_FCNTL, 3, syscall.F_GETFD, 0)
+		if err != syscall.EBADF {
+			fatalf("guardian control fd 3 is open or failed unexpectedly: %v", err)
+		}
 	case "exit":
 		exit()
 	case "stdout":
@@ -29,6 +34,11 @@ func main() {
 		write(os.Stderr)
 	case "hang":
 		hang()
+	case "hang-both-streams":
+		ignoreTermination(nil)
+		fmt.Fprintln(os.Stdout, os.Getpid())
+		fmt.Fprintln(os.Stderr, os.Getpid())
+		select {}
 	case "spawn-child":
 		spawnChild()
 	case "wait-release":

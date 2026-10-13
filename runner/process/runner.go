@@ -32,6 +32,7 @@ var (
 	ErrCompletionTimeout  = errors.New("process completion timeout exceeded")
 	ErrMaxRuntime         = errors.New("process maximum runtime exceeded")
 	ErrProcessReapTimeout = errors.New("process did not report exit after SIGKILL")
+	ErrGuardianLost       = errors.New("guardian ended without reporting payload exit")
 )
 
 type IdlePolicy = workloadrunner.IdlePolicy
@@ -233,7 +234,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			}
 			remaining := activity.Remaining(runner.clock.Now(), idleTimeout)
 			if remaining <= 0 {
-				return runner.terminate(command.Process.Pid, wait), ErrIdleTimeout
+				return runner.terminate(command.Process.Pid, wait, ErrIdleTimeout)
 			}
 			resetTimer(idleTimer, remaining)
 
@@ -243,7 +244,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 				resetTimer(idleTimer, remaining)
 				continue
 			}
-			return runner.terminate(command.Process.Pid, wait), ErrIdleTimeout
+			return runner.terminate(command.Process.Pid, wait, ErrIdleTimeout)
 
 		case <-completionSignal:
 			completionSignal = nil
@@ -254,16 +255,16 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			defer stopTimer(completionTimer)
 
 		case <-completionTimerChannel:
-			return runner.terminate(command.Process.Pid, wait), ErrCompletionTimeout
+			return runner.terminate(command.Process.Pid, wait, ErrCompletionTimeout)
 
 		case <-maxRuntimeChannel:
-			return runner.terminate(command.Process.Pid, wait), ErrMaxRuntime
+			return runner.terminate(command.Process.Pid, wait, ErrMaxRuntime)
 
 		case <-failure.Changed():
-			return runner.terminate(command.Process.Pid, wait), fmt.Errorf("output sink: %w", failure.Err())
+			return runner.terminate(command.Process.Pid, wait, fmt.Errorf("output sink: %w", failure.Err()))
 
 		case <-ctx.Done():
-			return runner.terminate(command.Process.Pid, wait), ctx.Err()
+			return runner.terminate(command.Process.Pid, wait, ctx.Err())
 		}
 	}
 }
@@ -318,10 +319,15 @@ func (runner *Runner) timeouts(limits *contract.JobLimits) (time.Duration, time.
 // terminate ends the payload's process group for the agent and reports the
 // payload's result. The result names the agent as initiator only when TERM
 // reached a payload that was still running; otherwise the exit is the
-// payload's own.
-func (runner *Runner) terminate(processGroupID int, wait <-chan waitResult) contract.ProcessResult {
+// payload's own. A reap timeout is joined to the stop error so callers retain
+// both the supervision reason and the lack of confirmed quiescence.
+func (runner *Runner) terminate(processGroupID int, wait <-chan waitResult, stopErr error) (contract.ProcessResult, error) {
 	outcome, delivered := runner.terminateAndWait(processGroupID, wait)
-	return resultFromWait(outcome.err, outcome.state, terminationCause(delivered, contract.TerminationCauseAgent))
+	result := resultFromWait(outcome.err, outcome.state, terminationCause(delivered, contract.TerminationCauseAgent))
+	if errors.Is(outcome.err, ErrProcessReapTimeout) {
+		return result, errors.Join(stopErr, outcome.err)
+	}
+	return result, stopErr
 }
 
 // requestTermination sends TERM to the payload's process group, which also

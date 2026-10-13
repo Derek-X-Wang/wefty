@@ -73,7 +73,10 @@ func TestLimitStopAfterReapedExitKeepsL1Succeeded(t *testing.T) {
 			}
 			wait := make(chan waitResult, 1)
 			wait <- waitResult{state: command.ProcessState}
-			result := New(Config{}).terminate(command.Process.Pid, wait)
+			result, err := New(Config{}).terminate(command.Process.Pid, wait, limitErr)
+			if err != limitErr {
+				t.Fatalf("reaped exit error = %v, want unchanged stop error %v", err, limitErr)
+			}
 			markReachedLimit(&result, limitErr)
 			assertExitCode(t, result, 0)
 			if result.TerminationInitiator != "" {
@@ -113,7 +116,10 @@ func TestLimitMarkerOmitsStalledProcessWait(t *testing.T) {
 	clock := newFakeClock(time.Unix(4_000, 0))
 	runner := New(Config{Clock: clock, TerminationGraceTime: time.Second, ProcessReapTimeout: 10 * time.Millisecond})
 	done := make(chan contract.ProcessResult, 1)
-	go func() { done <- runner.terminate(1<<30, make(chan waitResult)) }()
+	go func() {
+		result, _ := runner.terminate(1<<30, make(chan waitResult), ErrMaxRuntime)
+		done <- result
+	}()
 	clock.WaitForTimerCount(t, 1)
 	clock.Advance(time.Second)
 	select {
