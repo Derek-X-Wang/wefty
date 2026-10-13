@@ -57,8 +57,8 @@ func executeAdminPolicy(ctx context.Context, clients *apiClients, jsonOutput boo
 	flags.SetOutput(io.Discard)
 	var revision int64
 	flags.Int64Var(&revision, "policy-revision", 0, "policy revision observed by admin policy get")
-	if err := flags.Parse(mutationArgs); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, mutationArgs, false); err != nil {
+		return flagUsageError(err)
 	}
 	seenRevision := false
 	flags.Visit(func(visited *flag.Flag) { seenRevision = seenRevision || visited.Name == "policy-revision" })
@@ -116,8 +116,8 @@ func executeComputerGrant(
 	flags.BoolVar(&waitForCompletion, "wait", false, "wait until the hosting node closes affected sessions and installs the revocation")
 	flags.DurationVar(&pollInterval, "poll-interval", time.Second, "revocation status polling interval")
 	flags.DurationVar(&waitTimeout, "wait-timeout", 2*time.Minute, "maximum time to observe revocation installation")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	seenRevision := false
 	flags.Visit(func(visited *flag.Flag) { seenRevision = seenRevision || visited.Name == "policy-revision" })
@@ -253,8 +253,8 @@ func executeComputerTakeover(
 		var limit int
 		flags.StringVar(&cursor, "cursor", "", "opaque cursor from the previous page")
 		flags.IntVar(&limit, "limit", l1.DefaultJobPageLimit, "take-over events per page")
-		if err := flags.Parse(moveFirstPositionalToEnd(args[1:])); err != nil {
-			return usageError(err.Error())
+		if err := parseCommandFlags(flags, moveFirstPositionalToEnd(args[1:]), false); err != nil {
+			return flagUsageError(err)
 		}
 		if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" || limit < 1 || limit > l1.MaxJobPageLimit {
 			return usageError(fmt.Sprintf("usage: wefty services takeover audit COMPUTER [--limit 1..%d] [--cursor CURSOR]", l1.MaxJobPageLimit))
@@ -304,8 +304,8 @@ func executeComputerTakeoverAction(
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var tokenFile string
 	flags.StringVar(&tokenFile, "session-token-file", "", "owner-readable file containing the capability issued by this live view session")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
 		return usageError("usage: wefty services takeover " + action + " COMPUTER" + takeoverTokenFileUsage(action))

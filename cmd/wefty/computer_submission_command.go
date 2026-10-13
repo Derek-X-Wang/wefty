@@ -67,8 +67,8 @@ func executeComputerSubmission(ctx context.Context, clients *apiClients, jsonOut
 	flags.IntVar(&maxInflight, "max-inflight", 0, "maximum nonterminal Computer-root Lineages")
 	flags.StringVar(&idempotencyKey, "idempotency-key", "", "stable mutation idempotency key")
 	flags.BoolVar(&expectCurrent, "expect-current", false, "read the current revisions before issuing the mutation")
-	if err := flags.Parse(args); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args, false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" {
 		return usageError(computerSubmissionUsage)
@@ -230,8 +230,8 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags.StringVar(&cursor, "cursor", "", "opaque cursor returned by the previous page")
 	flags.BoolVar(&mine, "mine", false, "only Runs submitted by the caller")
 	flags.BoolVar(&all, "all", false, "walk every remaining page")
-	if err := flags.Parse(args[1:]); err != nil {
-		return usageError(err.Error())
+	if err := parseCommandFlags(flags, args[1:], false); err != nil {
+		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
 		return usageError("runs list does not accept positional arguments")
