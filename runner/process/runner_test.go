@@ -665,7 +665,8 @@ func stalledReapRun(t *testing.T, sinkErr error) (*Runner, Request, *fakeClock, 
 	output := newCollectingSink()
 	releaseOutput := make(chan struct{})
 	releaseStarted := make(chan struct{})
-	var outputOnce, startedOnce sync.Once
+	stdoutHeld := make(chan struct{})
+	var outputOnce, startedOnce, stdoutOnce sync.Once
 	var pid int
 	t.Cleanup(func() {
 		if pid != 0 {
@@ -673,15 +674,23 @@ func stalledReapRun(t *testing.T, sinkErr error) (*Runner, Request, *fakeClock, 
 		}
 		outputOnce.Do(func() { close(releaseOutput) })
 		startedOnce.Do(func() { close(releaseStarted) })
+		stdoutOnce.Do(func() { close(stdoutHeld) })
 		if pid != 0 {
 			waitForProcessGone(t, pid)
 		}
 	})
+	// The two stream copies race into the sink. A sink error marks the
+	// runner's output as failed, and the runner then drops later events, so
+	// stderr reports its error only after stdout is held. Otherwise stdout
+	// would never reach the sink and Wait would not stall.
 	sink := OutputSinkFunc(func(ctx context.Context, event contract.LogEvent) error {
 		_ = output.WriteOutput(ctx, event)
 		if event.Stream == contract.LogStdout {
+			stdoutOnce.Do(func() { close(stdoutHeld) })
 			<-releaseOutput
+			return sinkErr
 		}
+		<-stdoutHeld
 		return sinkErr
 	})
 	request := Request{

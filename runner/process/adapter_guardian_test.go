@@ -24,11 +24,11 @@ func TestGuardedPayloadDoesNotInheritGuardianControlEndpoint(t *testing.T) {
 		AttemptID: "attempt-guardian-fd", Guarded: true, IdlePolicy: IgnoreIdle,
 		Execution: contract.ExecutionSpec{
 			Executable: contract.ExecutableSpec{Path: helperPath},
-			Argv:       []string{"process-helper", "check-guardian-fd-closed"}, WorkingDirectory: t.TempDir(),
+			Argv:       []string{"process-helper", "check-no-inherited-socket"}, WorkingDirectory: t.TempDir(),
 		},
 	}, sink)
 	if err != nil || result.SpawnError != nil || result.ExitCode == nil || *result.ExitCode != 0 {
-		t.Fatalf("guarded fd check result = %#v err=%v stderr=%q, want closed control fd", result, err, joinStream(sink.Events(), contract.LogStderr))
+		t.Fatalf("guarded socket check result = %#v err=%v stderr=%q, want no inherited control socket", result, err, joinStream(sink.Events(), contract.LogStderr))
 	}
 }
 

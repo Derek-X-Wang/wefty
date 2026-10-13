@@ -21,10 +21,18 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "check-guardian-fd-closed":
-		_, _, err := syscall.Syscall(syscall.SYS_FCNTL, 3, syscall.F_GETFD, 0)
-		if err != syscall.EBADF {
-			fatalf("guardian control fd 3 is open or failed unexpectedly: %v", err)
+	case "check-no-inherited-socket":
+		// The Guardian's control endpoint is the only socket a payload could
+		// inherit. Check every descriptor rather than fd 3 alone: this helper's
+		// own runtime may reuse a free fd 3 (on Linux, for its epoll instance).
+		for fd := 3; fd < 1024; fd++ {
+			var stat syscall.Stat_t
+			if syscall.Fstat(fd, &stat) != nil {
+				continue
+			}
+			if stat.Mode&syscall.S_IFMT == syscall.S_IFSOCK {
+				fatalf("inherited socket at fd %d", fd)
+			}
 		}
 	case "exit":
 		exit()
