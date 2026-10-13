@@ -10,6 +10,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/agent/managedroot"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 type processManagedResource struct {
@@ -22,7 +23,7 @@ func (resource *processManagedResource) rootInstanceID() string {
 	return resource.root.Manifest().RootInstanceID
 }
 
-func initializeManagedResource(rootDirectory, nodeID, bootSessionID string) (managedResourceManager, error) {
+func initializeManagedResource(rootDirectory, nodeID, bootSessionID string, logf func(string, ...any)) (managedResourceManager, error) {
 	if rootDirectory == "" {
 		return nil, nil
 	}
@@ -31,6 +32,11 @@ func initializeManagedResource(rootDirectory, nodeID, bootSessionID string) (man
 	})
 	if err != nil {
 		return nil, fmt.Errorf("agent: initialize managed service root: %w", err)
+	}
+	if logf != nil {
+		for _, err := range root.LegacyStampErrors() {
+			logf("agent: skipped legacy service stamping: %v", err)
+		}
 	}
 	return &processManagedResource{
 		root: root, bootSessionID: bootSessionID,
@@ -84,5 +90,20 @@ func (resource *processManagedResource) prepareAttempt(jobID, attemptID string) 
 	}
 	return managedResourceAttempt{
 		dataDirectory: paths.Data, runtimeDirectory: runtimeDirectory,
+		prepareProcess:    func() error { return resource.root.RecordProcessAttempt(jobID, attemptID, 0) },
+		processNotSpawned: func() error { return resource.root.RecordProcessNotSpawned(jobID, attemptID) },
+		processStarted:    func(pgid int) error { return resource.root.RecordProcessAttempt(jobID, attemptID, pgid) },
 	}, cleanup, nil
+}
+
+func (resource *processManagedResource) processGroups(jobID string) ([]workloadrunner.ProcessGroupRecord, error) {
+	records, err := resource.root.ProcessAttempts(jobID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", workloadrunner.ErrPriorBootEvidenceUnavailable, err)
+	}
+	groups := make([]workloadrunner.ProcessGroupRecord, 0, len(records))
+	for _, record := range records {
+		groups = append(groups, workloadrunner.ProcessGroupRecord{NotSpawned: record.NotSpawned, AttemptID: record.AttemptID, BootSessionID: record.BootSessionID, HostBootID: record.HostBootID, ProcessGroupID: record.ProcessGroupID})
+	}
+	return groups, nil
 }

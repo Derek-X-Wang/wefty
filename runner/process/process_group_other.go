@@ -12,6 +12,9 @@ import (
 
 var errUnsupportedPlatform = errors.New("process runner requires darwin or linux process groups")
 
+func queryProcessGroup(int) error      { return errUnsupportedPlatform }
+func isMissingProcessGroup(error) bool { return false }
+
 func configureProcessGroup(*exec.Cmd) error { return errUnsupportedPlatform }
 func terminateProcessGroup(int) error       { return errUnsupportedPlatform }
 func killProcessGroup(int) error            { return errUnsupportedPlatform }

@@ -724,9 +724,49 @@ Discovery failure is a start failure, not permission to broaden the listener.
 A receipt names its evidence kind. Same-boot process attempts use consumed,
 full-authority `attempt` evidence. When a removal directive first reaches a
 returning node after an offline agent boot, the process adapter may instead
-issue `prior_boot_guardian`: the prior boot differs from its configured current
-boot and Guardian's disconnect contract reaped that boot's guarded payloads.
-Same-boot removal never falls back to this proof. The OCI boot barrier supplies
+issue `prior_boot_guardian` only with durable, job-scoped process inventory
+from the managed root. Each attempt records its agent boot, host boot identity,
+and Guardian-reported payload process group before `Started` is called. An
+unknown group is stored before spawn, so a crash in the acknowledgement window
+cannot manufacture absence. The adapter verifies every retained attempt,
+including attempts from older agent boots: either it records a proven
+`not_spawned` outcome, its host boot differs from
+the current kernel boot, or `kill(-pgid, 0)` returns `ESRCH`. Agent boot IDs alone
+are not host reboot evidence. macOS reads `kern.bootsessionuuid`;
+old timestamp-plus-UUID identities remain readable. Only a changed kernel boot
+session UUID proves reboot:
+XNU adjusts its boot timestamp when the wall clock changes
+([kernel clock implementation](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/clock.c));
+the UUID is generated at boot
+([boot session initialization](https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOPMrootDomain.cpp)).
+A timestamp change with the same UUID remains a same-host-boot query. Linux reads
+`/proc/sys/kernel/random/boot_id`, which is independent of wall-clock changes.
+Missing or malformed identity, a live or reused group, and query errors fail
+closed with no receipt and no signal. A same-host-boot unknown group also fails
+closed. A known pre-Guardian failure, or a clean Guardian `Wait` following
+`exited` before `started`, resolves its pending record as `not_spawned` after a
+positive runtime receipt. Guardian loss preserves the unknown record.
+Legacy ownership records have no complete inventory. Managed-root `Open` and
+`Initialize` make a best-effort scan under the node lock to stamp each readable
+version 1 service with the current host boot and agent boot. Later opens retain
+that first observation. A service-open, manifest, or stamp-write failure skips
+that service and records the reason; an unreadable or invalid host boot identity
+skips the whole scan. These failures do not stop agent startup. Existing root
+and layout checks remain fatal. The agent logs skipped stamping through its
+configured logger. Inventory detection or promotion retries stamping lazily
+and still refuses invalid records or unavailable host identity fail-closed. Legacy
+uncertainty refuses removal until a later kernel boot identity differs; an agent
+restart alone cannot resolve it. The adapter independently checks that reboot
+proof, together with every newer attempt. Same-boot removal never falls back
+to this proof. Ownership manifests and process-attempt
+records use version 2. Each attempt has a separate encoded file under the
+service's `process-attempts` directory, outside attempt scratch cleanup. The
+managed-root reader still accepts version 1 ownership for ordinary guarded
+removal, but prior-boot inventory reads first promote it while retaining
+uncertainty. A version 1 record upgraded to version 2 retains `legacy_process_inventory`; adding a new attempt cannot
+erase unknown historical processes. Unacknowledged `.tmp-` files are ignored
+by inventory reads. Root, active-boot, and removal-record versions remain
+unchanged. The OCI boot barrier supplies
 the equivalent namespace sweep evidence to the OCI adapter. Same-boot helper
 recovery names evidence `oci_sweep`; prior-agent-boot removal names
 `prior_boot_oci_sweep`. Both receipts are single-use, while #150 persists
@@ -764,8 +804,38 @@ fails closed; it is never upgraded into an empty or verified manifest.
 For `kind=process`, `Run` already waits for process or Guardian reaping, so the
 receipt verifies that blocking return contract. If the payload is not reaped
 within the bound after SIGKILL, or the Guardian ends without a decoded `exited`
-report, the adapter issues no receipt. In these cases,
-`ReapAndVerify` returns `ErrProcessReapTimeout` or `ErrGuardianLost`, respectively.
+report and a clean Guardian exit, the adapter issues no receipt. In
+these cases, `ReapAndVerify` returns `ErrProcessReapTimeout` or `ErrGuardianLost`,
+respectively. The Guardian has its own process group; the payload has another
+group and retains the agent's session. No Guardian signal disposition is
+ignored. Stop messages, agent disconnect, startup-readiness timeout, and
+spontaneous exit all require both the payload leader's `Wait` and group
+`ESRCH` before an `exited` report. After final SIGKILL, group proof is bounded by
+`ProcessReapTimeout` (five seconds by default). Failed proof ends the control
+stream and makes the agent report `ErrGuardianLost`.
+
+The agent's Guardian `WaitDelay` is termination grace plus that reap bound
+plus a one-second scheduling margin (eleven seconds by default). Its independent
+output context is cancelled on Guardian loss or one second before that output
+wait bound, releasing production SQLite append waits and console-sink callers. One bounded console queue and one
+process-wide worker keep a stuck console fd out of attempt pipe copying;
+closing an owned test pipe also releases the worker. A permanently blocked
+console fd can hold that single mirror worker until the daemon exits.
+After a proven `exited`, `exec.ErrWaitDelay` means output was cut off after a
+clean Guardian exit. The positive receipt remains valid and
+`log_evidence_incomplete` is true. Cancellation of the runner's own output
+context is not an output-sink failure. Guardian loss and other suspect Guardian
+`Wait` outcomes keep #869's `process_wait` `spawn_error` result shape. They also mark `log_evidence_incomplete` because
+Guardian output was cut off or its completeness is unknown; captured events
+remain available. Structured pre-start spawn failures keep their sole spawn
+arm.
+
+Rollback to an older agent deliberately fails closed: it refuses version 2
+ownership manifests and cannot restart or remove services touched by the new
+agent. The node still boots, but pending removals can suppress OCI admission on
+that node. This protective refusal prevents older code from discarding process
+inventory it cannot understand.
+
 Inline executable decoding, digest validation, interpreter resolution,
 materialization, and cleanup are owned by the process adapter; the agent
 lifecycle never materializes a kind-specific executable.
@@ -902,7 +972,7 @@ unreaped payload safe. Completed attempt entries are removed.
 The final redaction flush and log upload share the bounded finalization
 context. If that deadline expires after the payload has returned, the agent
 preserves the payload's primary result arm, records additive
-`log_evidence_incomplete` except for a `spawn_error`, and leaves
+`log_evidence_incomplete` except for a pre-start `spawn_error`, and leaves
 events already accepted by the durable spool available for later recovery.
 A redaction tail that did not reach the spool before expiry is covered by the
 incomplete-evidence fact. A non-deadline redaction, spool, or uploader failure

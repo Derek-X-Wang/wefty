@@ -130,7 +130,7 @@ func newStalledRemovalFixtureForKind(t *testing.T, computerKind, withBackup bool
 	if err != nil {
 		t.Fatal(err)
 	}
-	managed, err := initializeManagedResource(root, "stall-node", "stall-boot")
+	managed, err := initializeManagedResource(root, "stall-node", "stall-boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +512,7 @@ func (fixture stalledRemovalFixture) completeManagedRootRemoval(t *testing.T) {
 func (fixture stalledRemovalFixture) rebootSession(t *testing.T, pins *stallPinRuntime) *agentSession {
 	t.Helper()
 	bootSessionID := "stall-reboot"
-	managed, err := initializeManagedResource(fixture.root, "stall-node", bootSessionID)
+	managed, err := initializeManagedResource(fixture.root, "stall-node", bootSessionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

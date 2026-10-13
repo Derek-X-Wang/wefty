@@ -16,17 +16,19 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	agentDirectory      = "agent"
-	nodesDirectory      = "nodes"
-	servicesDirectory   = "services"
-	quarantineDirectory = "quarantine"
-	removalsDirectory   = "removals"
-	stagingDirectory    = "staging"
-	activeBootName      = "active-boot-session"
+	agentDirectory           = "agent"
+	nodesDirectory           = "nodes"
+	servicesDirectory        = "services"
+	quarantineDirectory      = "quarantine"
+	removalsDirectory        = "removals"
+	stagingDirectory         = "staging"
+	activeBootName           = "active-boot-session"
+	processAttemptsDirectory = "process-attempts"
 )
 
 type removalPhase string
@@ -63,10 +65,12 @@ type Manager struct {
 	bootSessionID         string
 	previousBootSessionID string
 	manifest              RootManifest
+	legacyStampErrors     []error
 
-	checkpoint      func(Checkpoint) error
-	mountIdentityFD func(int) (mountIdentity, error)
-	mountIdentityAt func(int, string) (mountIdentity, error)
+	hostBootIdentity func() (string, error)
+	checkpoint       func(Checkpoint) error
+	mountIdentityFD  func(int) (mountIdentity, error)
+	mountIdentityAt  func(int, string) (mountIdentity, error)
 }
 
 var processLocks sync.Map
@@ -115,6 +119,7 @@ func Initialize(config Config) (*Manager, error) {
 			return nil, err
 		}
 	}
+	manager.stampLegacyServicesAt(nodeFD, rootMount)
 	if err := manager.activateBootAt(nodeFD); err != nil {
 		return nil, err
 	}
@@ -154,6 +159,7 @@ func Open(config Config) (*Manager, error) {
 	if err := manager.capturePreviousBootAt(nodeFD); err != nil {
 		return nil, err
 	}
+	manager.stampLegacyServicesAt(nodeFD, rootMount)
 	if err := manager.activateBootAt(nodeFD); err != nil {
 		return nil, err
 	}
@@ -171,11 +177,16 @@ func newManager(config Config) (*Manager, error) {
 	if err := validateID("boot session", config.BootSessionID); err != nil {
 		return nil, err
 	}
+	bootReader := config.HostBootIdentity
+	if bootReader == nil {
+		bootReader = hostboot.Identity
+	}
 	return &Manager{
 		root: configRootClean(root), nodeID: config.NodeID, bootSessionID: config.BootSessionID,
-		checkpoint:      config.FaultInjector,
-		mountIdentityFD: platformMountIdentityFD,
-		mountIdentityAt: platformMountIdentityAt,
+		checkpoint:       config.FaultInjector,
+		hostBootIdentity: bootReader,
+		mountIdentityFD:  platformMountIdentityFD,
+		mountIdentityAt:  platformMountIdentityAt,
 	}, nil
 }
 
@@ -210,6 +221,13 @@ func (m *Manager) BootSessionID() string { return m.bootSessionID }
 // PreviousBootSessionID returns the durable boot that owned the managed root
 // before this manager activated its current boot.
 func (m *Manager) PreviousBootSessionID() string { return m.previousBootSessionID }
+
+// LegacyStampErrors reports best-effort startup stamping failures. Each error
+// identifies a skipped service component or why the entire scan was skipped.
+// Later inventory operations still validate and stamp services fail-closed.
+func (m *Manager) LegacyStampErrors() []error {
+	return append([]error(nil), m.legacyStampErrors...)
+}
 
 func (m *Manager) NodePath() string {
 	return filepath.Join(m.root, agentDirectory, nodesDirectory, EncodeID(m.nodeID))
@@ -276,12 +294,12 @@ func (m *Manager) CreateService(jobID string, generation uint64) (ServicePaths, 
 		if err != nil {
 			return err
 		}
-		manifest := OwnershipManifest{Version: 1, JobID: jobID, RemovalGeneration: generation}
+		manifest := OwnershipManifest{Version: 2, JobID: jobID, RemovalGeneration: generation}
 		if err := writeJSONAtomicAt(serviceFD, OwnershipManifestName, manifest, false); err != nil {
 			unix.Close(serviceFD)
 			return fmt.Errorf("write ownership manifest: %w", err)
 		}
-		for _, name := range []string{"data", "attempts", "runtime"} {
+		for _, name := range []string{"data", "attempts", "runtime", processAttemptsDirectory} {
 			childFD, err := openChildDirectory(serviceFD, name, true, rootMount, m.mountIdentityFD)
 			if err != nil {
 				unix.Close(serviceFD)
@@ -304,6 +322,246 @@ func (m *Manager) CreateService(jobID string, generation uint64) (ServicePaths, 
 		return syncDirectory(servicesFD)
 	})
 	return paths, err
+}
+
+// RecordProcessAttempt first stores an unknown group before spawn, then
+// replaces it with Guardian's started group. Atomic rename plus file and
+// directory fsync makes the acknowledgement durable before Started returns.
+// Entries survive attempt scratch cleanup; a later attempt cannot erase an
+// unproven group from an earlier one.
+func (m *Manager) RecordProcessAttempt(jobID, attemptID string, pgid int) error {
+	return m.recordProcessAttempt(jobID, attemptID, pgid, false)
+}
+
+// RecordProcessNotSpawned resolves only a pending record after the runtime
+// positively proves that this attempt never created a payload.
+func (m *Manager) RecordProcessNotSpawned(jobID, attemptID string) error {
+	return m.recordProcessAttempt(jobID, attemptID, 0, true)
+}
+
+func (m *Manager) recordProcessAttempt(jobID, attemptID string, pgid int, notSpawned bool) error {
+	if err := validateID("job", jobID); err != nil {
+		return err
+	}
+	if err := validateID("attempt", attemptID); err != nil {
+		return err
+	}
+	if pgid < 0 {
+		return errors.New("invalid process group")
+	}
+	hostID, err := m.hostBootIdentity()
+	if err != nil {
+		return fmt.Errorf("read attempt host boot: %w", err)
+	}
+	if !hostboot.ValidIdentity(hostID) {
+		return errors.New("invalid attempt host boot identity")
+	}
+	return m.withProcessManifest(jobID, func(fd int, manifest *OwnershipManifest) error {
+		mount, err := m.mountIdentityFD(fd)
+		if err != nil {
+			return err
+		}
+		recordsFD, err := openChildDirectory(fd, processAttemptsDirectory, true, mount, m.mountIdentityFD)
+		if err != nil {
+			return err
+		}
+		defer unix.Close(recordsFD)
+		record := ProcessAttempt{NotSpawned: notSpawned, Version: 2, AttemptID: attemptID, BootSessionID: m.bootSessionID, HostBootID: hostID, ProcessGroupID: pgid}
+		name := EncodeID(attemptID) + ".json"
+		var prior ProcessAttempt
+		err = readJSONAt(recordsFD, name, &prior)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %w", ErrOwnershipManifest, err)
+		}
+		if err == nil && (prior.Version != 2 || prior.AttemptID != attemptID || prior.BootSessionID != record.BootSessionID || !hostboot.SameBoot(prior.HostBootID, record.HostBootID) || (prior.ProcessGroupID != 0 && prior.ProcessGroupID != pgid) || (prior.NotSpawned && !notSpawned)) {
+			return fmt.Errorf("%w: conflicting process attempt", ErrOwnershipManifest)
+		}
+		if err := writeJSONAtomicAt(recordsFD, name, record, true); err != nil {
+			return err
+		}
+		if err := syncDirectory(fd); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// ProcessAttempts returns the whole retained inventory, not just the last
+// agent boot. Repeated agent restarts cannot forget an older live group.
+// Each record has its own bounded metadata file, so repeated restarts cannot
+// overflow the ownership manifest's existing metadata limit.
+func (m *Manager) ProcessAttempts(jobID string) ([]ProcessAttempt, error) {
+	if err := validateID("job", jobID); err != nil {
+		return nil, err
+	}
+	var records []ProcessAttempt
+	err := m.withProcessManifest(jobID, func(fd int, manifest *OwnershipManifest) error {
+		if manifest.LegacyProcessInventory {
+			current, err := m.hostBootIdentity()
+			if err != nil {
+				return err
+			}
+			if !hostboot.ValidIdentity(current) || !hostboot.SamePlatform(manifest.LegacyHostBootID, current) || hostboot.SameBoot(manifest.LegacyHostBootID, current) {
+				return ErrProcessTreeNotReaped
+			}
+			// This synthetic unknown-group record carries the original observation.
+			// The adapter must independently confirm reboot before issuing a receipt.
+			records = append(records, ProcessAttempt{Version: 2, AttemptID: "legacy-process-inventory", BootSessionID: manifest.LegacyBootSessionID, HostBootID: manifest.LegacyHostBootID})
+		}
+		mount, err := m.mountIdentityFD(fd)
+		if err != nil {
+			return err
+		}
+		recordsFD, err := openChildDirectory(fd, processAttemptsDirectory, false, mount, m.mountIdentityFD)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) && manifest.LegacyProcessInventory {
+				return nil
+			}
+			return err
+		}
+		defer unix.Close(recordsFD)
+		names, err := readDirectoryNames(recordsFD)
+		if err != nil {
+			return err
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if strings.HasPrefix(name, ".tmp-") {
+				continue
+			}
+			fileMount, err := m.mountIdentityAt(recordsFD, name)
+			if err != nil {
+				return err
+			}
+			if fileMount != mount {
+				return ErrMountBoundary
+			}
+			var record ProcessAttempt
+			if err := readJSONAt(recordsFD, name, &record); err != nil {
+				return fmt.Errorf("%w: %w", ErrOwnershipManifest, err)
+			}
+			if record.Version != 2 || record.AttemptID == "" || EncodeID(record.AttemptID)+".json" != name || record.BootSessionID == "" || !hostboot.ValidIdentity(record.HostBootID) || record.ProcessGroupID < 0 || (record.NotSpawned && record.ProcessGroupID != 0) {
+				return ErrOwnershipManifest
+			}
+			records = append(records, record)
+		}
+		if len(records) == 0 {
+			return ErrProcessTreeNotReaped
+		}
+		return nil
+	})
+	return records, err
+}
+
+func (m *Manager) withProcessManifest(jobID string, fn func(int, *OwnershipManifest) error) error {
+	return m.withNodeLock(func(nodeFD int, rootMount mountIdentity) error {
+		servicesFD, err := openChildDirectory(nodeFD, servicesDirectory, false, rootMount, m.mountIdentityFD)
+		if err != nil {
+			return err
+		}
+		defer unix.Close(servicesFD)
+		serviceFD, err := openChildDirectory(servicesFD, EncodeID(jobID), false, rootMount, m.mountIdentityFD)
+		if err != nil {
+			return err
+		}
+		defer unix.Close(serviceFD)
+		var manifest OwnershipManifest
+		if err := readJSONAt(serviceFD, OwnershipManifestName, &manifest); err != nil {
+			return fmt.Errorf("%w: %w", ErrOwnershipManifest, err)
+		}
+		if (manifest.Version != 1 && manifest.Version != 2) || manifest.JobID != jobID {
+			return ErrOwnershipManifest
+		}
+		if err := m.stampLegacyManifestAt(serviceFD, &manifest); err != nil {
+			return err
+		}
+		return fn(serviceFD, &manifest)
+	})
+}
+
+// Best-effort stamping under the node lock retains the first observed host
+// boot without requiring a service restart or inventory read. Scan failures
+// never stop the node from starting; layout verification remains authoritative.
+func (m *Manager) stampLegacyServicesAt(nodeFD int, rootMount mountIdentity) {
+	servicesFD, err := openChildDirectory(nodeFD, servicesDirectory, false, rootMount, m.mountIdentityFD)
+	if err != nil {
+		m.legacyStampErrors = append(m.legacyStampErrors, fmt.Errorf("open services for legacy stamping: %w", err))
+		return
+	}
+	defer unix.Close(servicesFD)
+	names, err := readDirectoryNames(servicesFD)
+	if err != nil {
+		m.legacyStampErrors = append(m.legacyStampErrors, fmt.Errorf("list services for legacy stamping: %w", err))
+		return
+	}
+	if len(names) == 0 {
+		return
+	}
+	// Read once before writing any service, so unavailable host identity skips
+	// the whole scan rather than leaving a partially stamped boot observation.
+	host, err := m.hostBootIdentity()
+	if err == nil && !hostboot.ValidIdentity(host) {
+		err = errors.New("invalid host boot identity")
+	}
+	if err != nil {
+		m.legacyStampErrors = append(m.legacyStampErrors, fmt.Errorf("read host boot identity for legacy stamping: %w", err))
+		return
+	}
+	for _, name := range names {
+		if err := m.stampLegacyServiceAt(servicesFD, name, rootMount, host); err != nil {
+			m.legacyStampErrors = append(m.legacyStampErrors, fmt.Errorf("stamp legacy service %q: %w", name, err))
+		}
+	}
+}
+
+func (m *Manager) stampLegacyServiceAt(servicesFD int, name string, rootMount mountIdentity, host string) error {
+	serviceFD, err := openChildDirectory(servicesFD, name, false, rootMount, m.mountIdentityFD)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(serviceFD)
+	var manifest OwnershipManifest
+	if err := readJSONAt(serviceFD, OwnershipManifestName, &manifest); err != nil {
+		return fmt.Errorf("%w: %w", ErrOwnershipManifest, err)
+	}
+	if (manifest.Version != 1 && manifest.Version != 2) || validateID("job", manifest.JobID) != nil || EncodeID(manifest.JobID) != name {
+		return ErrOwnershipManifest
+	}
+	return m.stampLegacyManifestForBootAt(serviceFD, &manifest, host)
+}
+
+func (m *Manager) stampLegacyManifestAt(serviceFD int, manifest *OwnershipManifest) error {
+	var host string
+	if (manifest.Version == 1 || manifest.LegacyProcessInventory) && manifest.LegacyHostBootID == "" {
+		var err error
+		host, err = m.hostBootIdentity()
+		if err != nil {
+			return err
+		}
+	}
+	return m.stampLegacyManifestForBootAt(serviceFD, manifest, host)
+}
+
+func (m *Manager) stampLegacyManifestForBootAt(serviceFD int, manifest *OwnershipManifest, host string) error {
+	if manifest.Version != 1 && !manifest.LegacyProcessInventory {
+		return nil
+	}
+	if manifest.LegacyHostBootID == "" {
+		if !hostboot.ValidIdentity(host) {
+			return ErrOwnershipManifest
+		}
+		manifest.Version = 2
+		manifest.LegacyProcessInventory = true
+		manifest.LegacyHostBootID = host
+		manifest.LegacyBootSessionID = m.bootSessionID
+		if err := writeJSONAtomicAt(serviceFD, OwnershipManifestName, manifest, true); err != nil {
+			return err
+		}
+	}
+	if !hostboot.ValidIdentity(manifest.LegacyHostBootID) || manifest.LegacyBootSessionID == "" {
+		return ErrOwnershipManifest
+	}
+	return nil
 }
 
 func (m *Manager) Remove(ctx context.Context, removal Removal) error {
@@ -591,7 +849,7 @@ func (m *Manager) validateServiceAt(ctx context.Context, parentFD int, name stri
 	if err := readJSONAt(serviceFD, OwnershipManifestName, &manifest); err != nil {
 		return fmt.Errorf("%w: %w", ErrOwnershipManifest, err)
 	}
-	if manifest.Version != 1 || manifest.JobID == "" {
+	if (manifest.Version != 1 && manifest.Version != 2) || manifest.JobID == "" {
 		return ErrOwnershipManifest
 	}
 	if manifest.JobID != jobID {

@@ -31,6 +31,11 @@ func main() {
 		if syscall.Fstat(3, &stat) == nil && stat.Mode&syscall.S_IFMT == syscall.S_IFSOCK {
 			fatalf("inherited Guardian control socket at fd 3")
 		}
+	case "escape-stdout":
+		escapeStdout()
+	case "escape-output-holder":
+		fmt.Fprintln(os.Stdout, "held output")
+		waitRelease()
 	case "exit":
 		exit()
 	case "stdout":
@@ -318,4 +323,34 @@ func waitRelease() {
 			fatalf("observe release: %v", err)
 		}
 	}
+}
+
+// escapeStdout models a descendant which leaves the payload group and keeps
+// inherited output open. The test releases it through a file, never a stale PID.
+func escapeStdout() {
+	if len(os.Args) != 5 {
+		fatalf("escape-stdout requires ready, release and pid paths")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		fatalf("self: %v", err)
+	}
+	child := exec.Command(executable, "escape-output-holder", os.Args[2], os.Args[3], "30s")
+	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		fatalf("escaped child: %v", err)
+	}
+	if err := os.WriteFile(os.Args[4], []byte(strconv.Itoa(child.Process.Pid)), 0600); err != nil {
+		fatalf("child pid: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(os.Args[2]); err == nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	fatalf("escaped child not ready")
 }

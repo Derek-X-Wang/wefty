@@ -26,7 +26,7 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	stateRoot := filepath.Join(resolvedTemporaryRoot, "state")
-	resource, err := initializeManagedResource(stateRoot, "node-1", "boot-1")
+	resource, err := initializeManagedResource(stateRoot, "node-1", "boot-1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestServiceAcceptanceAgentClassAndHandoffContract(t *testing.T) {
 	if afterTemp := executableTempDirectories(t, claim.Lease.AttemptID); !sameStringSet(beforeTemp, afterTemp) {
 		t.Fatalf("wefty executable temp directories changed across service run: before=%v after=%v", beforeTemp, afterTemp)
 	}
-	restartedResource, err := initializeManagedResource(stateRoot, "node-1", "boot-2")
+	restartedResource, err := initializeManagedResource(stateRoot, "node-1", "boot-2", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

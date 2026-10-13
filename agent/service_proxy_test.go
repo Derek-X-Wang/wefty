@@ -312,7 +312,7 @@ func TestPortlessOCIServiceReceivesOnlyReservedContainerDirectory(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	resource, err := initializeManagedResource(root, "portless-oci-node", "portless-oci-boot")
+	resource, err := initializeManagedResource(root, "portless-oci-node", "portless-oci-boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func startPortfulTeardownService(t *testing.T, kind, restart string, ready bool)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resource, err := initializeManagedResource(root, "node", "boot")
+	resource, err := initializeManagedResource(root, "node", "boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +571,7 @@ func assertPortlessServiceSkipsFabricProxyProbeAndDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resource, err := initializeManagedResource(root, "portless-node", "portless-boot")
+	resource, err := initializeManagedResource(root, "portless-node", "portless-boot", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

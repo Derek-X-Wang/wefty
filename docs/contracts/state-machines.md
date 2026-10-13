@@ -1063,9 +1063,29 @@ log finalization. Its finalization-related classifier rows are explicit:
 | --- | --- | ---: |
 | Bounded log flush/upload deadline expiry after a payload result | Preserve the payload's primary arm, record additive `log_evidence_incomplete`, and classify restartability from the payload. | follows the payload arm |
 | Genuine `output_error` (corruption, disk, redaction, or uploader failure other than that bounded deadline) | Latch `failed`, even when the payload exit would otherwise be restartable. | unchanged |
+| Process Guardian loss or suspect Guardian `Wait` | Keep #869's `process_wait` `spawn_error`, mark `log_evidence_incomplete`, and refuse the reap receipt. | follows process infrastructure policy |
 | Pre-`Started` OCI `spawn_error` plus an expired log-finalization context | Preserve the sole `spawn_error`; runtime log evidence is not attached to an attempt that never started. | follows pre-start infrastructure policy |
 | Bounded deadline plus a genuine output failure | Keep `output_error` terminal and retain `log_evidence_incomplete` as a concurrent evidence fact. | unchanged |
 | Expected service-spool capacity eviction | Not a termination cause; it never produces `output_error` or reaches the classifier. | n/a |
+
+A process Guardian reports `exited` only after the payload leader is reaped
+and the payload group returns `ESRCH`, including spontaneous-exit cleanup.
+The final SIGKILL starts a finite group-reap bound. Missing proof becomes
+`ErrGuardianLost`; no transition may treat that as positive quiescence.
+Prior-agent-boot removal requires every durable managed-root process record
+to prove `not_spawned`, host reboot, or group `ESRCH`. Known pre-Guardian spawn
+failures and clean `exited`-before-`started` outcomes resolve pending inventory;
+a crash in that window still refuses. Managed-root startup best-effort stamps
+readable legacy services with their first observed host boot. Per-service
+failures skip that service; unavailable or invalid host identity skips the scan.
+The failures are recorded and do not prevent agent startup. Existing root and
+layout checks remain fatal. Lazy inventory detection or promotion retries the
+stamp and fails closed if it cannot validate it. Legacy uncertainty resolves only after a later
+host reboot is independently proven, including when newer attempts exist.
+Agent restart, unknown groups without reboot proof, and query errors leave
+removal blocked without signals. A proven `exited` followed by `exec.ErrWaitDelay`
+keeps the positive receipt and marks log evidence incomplete. The runner's own
+output cancellation is not a sink failure.
 
 The finalization timeout begins only after the payload returns; payload uptime
 can never consume that bound. Finalization remains uncancelable by ordinary
