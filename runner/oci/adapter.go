@@ -45,6 +45,7 @@ func controlFailure(reason ocihelper.ErrorCode, err error) error {
 }
 
 type Adapter struct {
+	clock                 Clock
 	sessions              SessionSource
 	imagePolicy           ImagePolicy
 	mu                    sync.Mutex
@@ -205,6 +206,10 @@ func NewAdapter(sessions SessionSource, options ...Option) *Adapter {
 
 const DefaultImageBudget = 10 * time.Minute
 
+// ErrMaxRuntime accompanies the payload's terminal result after an
+// agent-requested stop, just as it does in the process runner.
+var ErrMaxRuntime = errors.New("OCI maximum runtime exceeded")
+
 // ImagePolicy is agent-owned policy around narrow helper mechanics. The
 // helper never chooses retries, backoff, Retry-After treatment, or this total
 // resolve/fetch/unpack/wait budget.
@@ -229,6 +234,7 @@ func NewAdapterWithPolicy(sessions SessionSource, policy ImagePolicy, options ..
 		policy.Sleep = sleepContext
 	}
 	adapter := &Adapter{
+		clock:    realClock{},
 		sessions: sessions, imagePolicy: policy, pinLedger: newMemoryBindingPinLedger(), cacheMaxBytes: ocihelper.DefaultImageCacheMaxBytes,
 		consumedRuntimeSweeps: make(map[runtimeSweepEvidenceKey]struct{}),
 		consumedSameBootSweep: make(map[sameBootSweepEvidenceKey]struct{}),
@@ -1141,6 +1147,17 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		_ = reapAfterFailedStart(session, authority)
 		return spawnResult(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
+	// The runtime clock starts on the agent's clock when the helper reports
+	// Started, before waiting for L1's durable Started acknowledgement, so image
+	// preparation does not consume it and the acknowledgement cannot reset it.
+	// The helper's StartedAt is not used: on a Mac it is the Lima guest's clock,
+	// which can lag the host after sleep and would cut the runtime short.
+	var maxRuntime <-chan time.Time
+	if request.Limits != nil && request.Limits.MaxRuntimeSeconds > 0 {
+		timer := adapter.clock.NewTimer(time.Duration(request.Limits.MaxRuntimeSeconds) * time.Second)
+		defer timer.Stop()
+		maxRuntime = timer.C()
+	}
 	if request.OCIStartedAt != nil {
 		request.OCIStartedAt(runResponse.StartedAt.UTC().Round(0))
 	}
@@ -1269,6 +1286,11 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	if termination == nil {
 		termination = &terminationTrace{}
 	}
+	runtimeExceeded := false
+	stopForRuntime := func() error {
+		runtimeExceeded = true
+		return terminateAndWaitObservedWithClock(ctx, session, authority, request.TerminationGrace, watchDone, termination, adapter.clock)
+	}
 	waitForWatch := func() error {
 		if startErr != nil {
 			return terminateAndWaitObserved(ctx, session, authority, request.TerminationGrace, watchDone, termination)
@@ -1277,6 +1299,8 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 			select {
 			case watchErr := <-watchDone:
 				return watchErr
+			case <-maxRuntime:
+				return stopForRuntime()
 			case lost := <-attemptLoss:
 				cancelWatch()
 				<-watchDone
@@ -1286,6 +1310,8 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 		select {
 		case watchErr := <-watchDone:
 			return watchErr
+		case <-maxRuntime:
+			return stopForRuntime()
 		case lost := <-attemptLoss:
 			cancelWatch()
 			<-watchDone
@@ -1345,6 +1371,9 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	// evidence and still takes the embargo-and-sweep path.
 	if completion.RuntimeFailure != "" && !completion.RuntimeFailureAttemptScoped {
 		reportOCIRuntimeUnavailable(request, runtimeGeneration)
+	}
+	if runtimeExceeded {
+		return result, ErrMaxRuntime
 	}
 	return result, nil
 }
@@ -1515,11 +1544,23 @@ func terminateAndWaitObserved(
 	watchDone <-chan error,
 	trace *terminationTrace,
 ) error {
+	return terminateAndWaitObservedWithClock(ctx, session, authority, grace, watchDone, trace, realClock{})
+}
+
+func terminateAndWaitObservedWithClock(
+	ctx context.Context,
+	session *ocihelper.Session,
+	authority ocihelper.AttemptAuthority,
+	grace time.Duration,
+	watchDone <-chan error,
+	trace *terminationTrace,
+	clock Clock,
+) error {
 	if grace <= 0 {
 		grace = defaultTerminationGrace
 	}
 	watchResult := func(wait time.Duration, termGrace bool) (error, bool) {
-		timer := time.NewTimer(wait)
+		timer := clock.NewTimer(wait)
 		defer timer.Stop()
 		select {
 		case err := <-watchDone:
@@ -1527,7 +1568,7 @@ func terminateAndWaitObserved(
 				trace.decision = terminationSuccessWatchSelected
 			}
 			return err, true
-		case <-timer.C:
+		case <-timer.C():
 			if trace != nil && termGrace {
 				trace.decision = terminationSuccessGraceTimerSelected
 			}

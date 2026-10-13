@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:runtime-limit",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "oci": {
+      "image": {
+        "reference": "example/tool:latest"
+      }
+    }
+  },
+  "limits": {
+    "max_runtime_seconds": 30
+  }
+}

@@ -206,6 +206,9 @@ func validateProcessExecution(spec *JobSpec) error {
 }
 
 func validateOCIExecution(spec *JobSpec) error {
+	if spec.Limits != nil && (spec.Limits.idleTimeoutSet || spec.Limits.IdleTimeoutSeconds != 0) {
+		return invalidJobSpecf("limits.idle_timeout_seconds applies only to process jobs")
+	}
 	if spec.Execution.OCI == nil {
 		return invalidJobSpecf("execution.oci is required for OCI jobs")
 	}

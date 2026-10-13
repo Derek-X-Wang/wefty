@@ -62,8 +62,8 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "max_runtime_seconds": { "type": "integer", "minimum": 1 },
-        "idle_timeout_seconds": { "type": "integer", "minimum": 1, "default": 600 },
+        "max_runtime_seconds": { "type": "integer", "minimum": 1, "description": "Maximum attempt runtime for process and OCI jobs. Omission is unlimited. OCI measures on the node agent's clock from the helper's Started report and stops through TERM, grace, then KILL." },
+        "idle_timeout_seconds": { "type": "integer", "minimum": 1, "description": "Applies only to process jobs. Explicit presence on OCI jobs is refused. Process idle monitoring defaults to 600 seconds; no idle default is applied to OCI jobs." },
         "completion_timeout_seconds": { "type": "integer", "minimum": 1, "default": 60 }
       }
     },
@@ -97,7 +97,8 @@
             "required": ["executable", "argv", "working_directory"],
             "not": { "required": ["oci"] }
           },
-          "runtime_handler": { "pattern": "^\\s*$" }
+          "runtime_handler": { "pattern": "^\\s*$" },
+          "limits": { "properties": { "idle_timeout_seconds": { "default": 600 } } }
         }
       }
     },
@@ -108,6 +109,7 @@
       },
       "then": {
         "properties": {
+          "limits": { "not": { "required": ["idle_timeout_seconds"] } },
           "execution": {
             "required": ["oci"],
             "not": {

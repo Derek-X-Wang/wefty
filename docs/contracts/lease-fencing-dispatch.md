@@ -827,6 +827,28 @@ receive `422 unsupported_runtime_handler`.
 Environment names on both process and OCI arms follow the portable
 `[A-Za-z_][A-Za-z0-9_]*` grammar before L1 accepts the job.
 
+`limits.max_runtime_seconds` applies to process and OCI attempts, for both
+one-shot and service jobs. Omission leaves runtime unlimited. An OCI attempt
+measures runtime on the agent's clock from the moment the helper reports
+`Started`, so image preparation does not consume it and the durable L1
+acknowledgement does not reset it. The helper's `StartedAt` is not the clock:
+on a Mac it is the Lima guest's clock, which can lag the host after sleep. At expiry the agent stops that exact attempt through the existing
+TERM → termination grace → KILL path and waits for the helper's terminal
+evidence. The runner returns `ErrMaxRuntime` (`OCI maximum runtime exceeded`)
+beside the payload result, matching the process runner's maximum-runtime
+diagnostic. Signal results name `termination_cause=agent`; a TERM handler's
+own exit code keeps agent termination provenance on the completion request.
+Expiry is not a spawn error or runtime-loss inference.
+
+`limits.idle_timeout_seconds` applies only to process jobs. L1 refuses explicit
+presence on an OCI submission with HTTP 400, non-retryable `invalid_request`,
+and `limits.idle_timeout_seconds applies only to process jobs`. Presence
+includes zero and null; omitting the member remains valid, including when
+other limits are set. The process runner's 600-second idle default is not
+filled into OCI jobs. Services retain their process idle-monitoring policy.
+OCI `execution.oci.limits.memory_bytes` and `cpu_millicores` retain their
+existing helper-owned cgroup-v2 enforcement.
+
 The operator CLI keeps image work in the existing command families. `submit`
 accepts exactly one of a saved Workflow, inline script, or image. `services
 create` accepts script or image, resolves an unpinned public image reference by

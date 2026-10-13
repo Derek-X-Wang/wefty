@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "dispatch_key": "oci:explicit-idle",
+  "kind": "oci",
+  "class": "one-shot",
+  "execution": {
+    "oci": {
+      "image": {
+        "reference": "example/tool:latest"
+      }
+    }
+  },
+  "limits": {
+    "idle_timeout_seconds": 600
+  }
+}
