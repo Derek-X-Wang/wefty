@@ -13,6 +13,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/l3"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -111,6 +112,10 @@ type globalOptions struct {
 	printEnrollmentURL bool
 	jsonOutput         bool
 	nodeConfigPath     string
+	profilePath        string
+	// explicitFlags names the global flags the caller passed, so the
+	// connection profile never overrides one of them.
+	explicitFlags map[string]bool
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result error) {
@@ -131,6 +136,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 		_, err := io.WriteString(stdout, rootUsage)
 		return err
 	}
+	// Setup installs this machine's stack and writes the connection profile;
+	// it neither reads that profile nor opens the Fabric. Its own flag parser
+	// answers --help before anything is touched.
+	if commandArgs[0] == "setup" {
+		return executeSetup(ctx, options, commandArgs[1:], stdout, stderr)
+	}
 	if wantsCommandHelp(commandArgs) {
 		return executeCommandHelp(ctx, options, commandArgs, stdout, stderr)
 	}
@@ -142,6 +153,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 	// through its run mailbox holds no credential and has no identity to dial
 	// with, so requiring one here would defeat the mailbox entirely.
 	if handled, err := executeAuthoringCommand(options, commandArgs, stdout, stderr); handled {
+		return err
+	}
+	if err := applyConnectionProfile(&options); err != nil {
 		return err
 	}
 	plainIdentity := fabric.Identity{
@@ -248,11 +262,41 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
 	flags.BoolVar(&options.printEnrollmentURL, "fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
 	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by exec, status and singular node commands")
+	flags.StringVar(&options.profilePath, "profile", os.Getenv(connprofile.EnvironmentVariable),
+		"connection profile (default $"+connprofile.EnvironmentVariable+", else ~/.config/wefty/"+connprofile.FileName+" when it exists)")
 	flags.Usage = func() { fmt.Fprint(flags.Output(), rootUsage) }
 	if err := parseCommandFlags(flags, args, true); err != nil {
 		return globalOptions{}, nil, err
 	}
+	options.explicitFlags = make(map[string]bool)
+	flags.Visit(func(set *flag.Flag) { options.explicitFlags[set.Name] = true })
 	return options, flags.Args(), nil
+}
+
+// applyConnectionProfile fills the endpoint and identity options that no flag
+// and no environment variable set from the connection profile `wefty setup`
+// wrote. It runs after the authoring and node-local commands are dispatched:
+// those never reach the cluster, and a job reporting through its run mailbox
+// must not fail on a profile it does not need.
+func applyConnectionProfile(options *globalOptions) error {
+	fallback := ""
+	if home, err := os.UserHomeDir(); err == nil {
+		fallback, _ = connprofile.DefaultPath(home)
+	}
+	profile, _, err := connprofile.Resolve(options.profilePath, fallback)
+	if err != nil {
+		return err
+	}
+	settings := profile.CLI()
+	layer := connprofile.Layer{Explicit: options.explicitFlags}
+	layer.Fill(&options.fabricMode, "fabric", "", settings.Fabric)
+	layer.Fill(&options.l1Address, "l1", l1AddressEnv, settings.L1)
+	layer.Fill(&options.l3Address, "l3", l3AddressEnv, settings.L3)
+	layer.Fill(&options.plainIdentity, "plain-identity", "", settings.Identity)
+	layer.Fill(&options.plainUserID, "plain-user-id", "WEFTY_DEV_PLAIN_USER_ID", settings.PersonUserID)
+	layer.Fill(&options.plainDeviceID, "plain-device-id", "WEFTY_DEV_PLAIN_DEVICE_ID", settings.PersonDeviceID)
+	layer.Fill(&options.plainFabricID, "plain-fabric-id", "WEFTY_DEV_PLAIN_FABRIC_ID", settings.PlainFabricID)
+	return nil
 }
 
 // l1AddressEnv and l3AddressEnv are the variables the README and the
@@ -295,6 +339,8 @@ Every command uses typed exits: usage 2, unauthorized 3, not found 4,
 conflict 5, unavailable 13, accepted-mutation wait timeout 14, other failure 1. JSON errors go to stderr.
 
 Commands:
+  setup [--from DIR]         Install L1, L3 and a node agent as login services on
+                             this Mac and write the connection profile
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
   whoami                    Observe the current Fabric-scoped person identity in L1
   admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
@@ -382,13 +428,18 @@ Commands:
 
 Global flags:
   --fabric plain|tsnet
-  --l1 ADDRESS               default $WEFTY_L1_ADDR, else wefty://control-plane
-  --l3 ADDRESS               default $WEFTY_L3_ADDR, else wefty://run-ledger;
+  --l1 ADDRESS               default $WEFTY_L1_ADDR, else the profile, else
+                             wefty://control-plane
+  --l3 ADDRESS               default $WEFTY_L3_ADDR, else the profile, else
+                             wefty://run-ledger;
                              pass --l3= for an L1-only installation
   --plain-user-id USER_ID    DEVELOPMENT ONLY: self-asserted plain person identity
   --plain-device-id DEVICE_ID
   --json
   --node-config PATH
+  --profile PATH             connection profile; default $WEFTY_PROFILE, else
+                             ~/.config/wefty/profile.json when it exists.
+                             Flags, then environment, then the profile win
   --fabric-print-enrollment-url
                              Print the raw Fabric enrollment URL on first login instead of the wefty notice
 `

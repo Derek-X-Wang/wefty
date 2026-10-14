@@ -412,3 +412,36 @@ func TestTheFullFsyncSwitchDefaultsToOn(t *testing.T) {
 		t.Fatalf("pragmas before any test = %v, want %v", pragmasAtStart, want)
 	}
 }
+
+// A file converges on its bytes, its type and its exact permission bits, so a
+// lost executable bit or a link standing in for the file is repaired.
+func TestHoldsChecksBytesTypeAndModeAndWriteFileModeSetsTheMode(t *testing.T) {
+	root, path := openRoot(t)
+	if Holds(root, "tool", []byte("v1"), 0o755) {
+		t.Fatal("an absent file holds the payload")
+	}
+	if err := WriteFileMode(root, "tool", []byte("v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(filepath.Join(path, "tool")); err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("mode after WriteFileMode = %v, %v", info.Mode(), err)
+	}
+	if !Holds(root, "tool", []byte("v1"), 0o755) || Holds(root, "tool", []byte("v2"), 0o755) {
+		t.Fatal("Holds does not compare the bytes")
+	}
+	if err := os.Chmod(filepath.Join(path, "tool"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if Holds(root, "tool", []byte("v1"), 0o755) {
+		t.Fatal("a file that lost its executable bit still holds")
+	}
+	if err := os.WriteFile(filepath.Join(path, "elsewhere"), []byte("v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("elsewhere", filepath.Join(path, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	if Holds(root, "linked", []byte("v1"), 0o755) {
+		t.Fatal("a link holds the payload")
+	}
+}

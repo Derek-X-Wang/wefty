@@ -32,6 +32,10 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 	if err != nil {
 		return err
 	}
+	if config.ControlSocket == "" {
+		return fmt.Errorf("installed node %q at %s is a plain-process node with no OCI control socket; `wefty node %s` needs an OCI node installation",
+			config.NodeID, configPath, args[0])
+	}
 	client, err := ocicontrol.NewClient(config.ControlSocket)
 	if err != nil {
 		return err

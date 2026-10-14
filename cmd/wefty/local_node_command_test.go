@@ -464,3 +464,19 @@ func TestOCINodeRunbookCommandsUseExercisedSurfaces(t *testing.T) {
 		}
 	}
 }
+
+// A plain-process node installed by `wefty setup` has no OCI control socket.
+// Singular node commands say so, naming the file, instead of failing on an
+// empty socket path.
+func TestSingularNodeCommandsExplainAPlainProcessNode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.json")
+	if err := ocicontrol.WriteInstalledConfig(path, ocicontrol.InstalledConfig{
+		Version: ocicontrol.InstalledConfigVersion, NodeID: "plain-node",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := run(context.Background(), []string{"--node-config", path, "node", "doctor"}, io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "plain-process node") || !strings.Contains(err.Error(), path) {
+		t.Fatalf("node doctor on a plain-process node = %v", err)
+	}
+}
