@@ -21,9 +21,12 @@ import (
 
 var version = "dev"
 
+type execSignalResetKey struct{}
+
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
+	ctx = context.WithValue(ctx, execSignalResetKey{}, stop)
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		report := decideCommandReport(err)
 		report.writeError(os.Stderr, hasJSONFlag(os.Args[1:]))
@@ -56,9 +59,9 @@ const (
 	exitCustodyImportQuarantined = 7
 	exitCustodyImportFailed      = 8
 	exitCustodyImportSuperseded  = 9
-	// exitRunFailed and exitWaitTimeout are `wefty wait`'s two non-zero
-	// answers. They are distinct because "the run failed" and "I stopped
-	// waiting" lead a script to different next actions.
+	// exitRunFailed is the typed run outcome for `wefty exec` and `wefty wait`.
+	// exitWaitTimeout is `wefty wait` ending its observation window.
+	// A failed run and an expired wait need different next actions.
 	exitRunFailed   = 10
 	exitWaitTimeout = 11
 	// exitNotReady is `wefty status` answering no. The command worked; the
@@ -267,7 +270,7 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.controlURL, "control-url", "", "optional tsnet coordination URL (default $TS_CONTROL_URL)")
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
 	flags.BoolVar(&options.printEnrollmentURL, "fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
-	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by status and singular node commands")
+	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by exec, status and singular node commands")
 	flags.StringVar(&options.profilePath, "profile", os.Getenv(connprofile.EnvironmentVariable),
 		"connection profile (default $"+connprofile.EnvironmentVariable+", else ~/.config/wefty/"+connprofile.FileName+" when it exists)")
 	flags.Usage = func() { fmt.Fprint(flags.Output(), rootUsage) }
@@ -398,6 +401,8 @@ Commands:
   runs list [--status STATUS] [--mine] [--limit LIMIT] [--cursor CURSOR] [--all]
                              List Runs, newest first; --all walks every remaining page
     --origin computer:ID     List Runs by immutable Computer origin instead
+  exec [--tag TAG] [--max-runtime D] -- <command...>
+                             Run this checkout on this machine's node; exit 0 or 10
   submit [--again] [--idempotency-key KEY]
                              Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID [--again] [--idempotency-key KEY]

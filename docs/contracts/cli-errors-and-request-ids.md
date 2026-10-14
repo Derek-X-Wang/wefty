@@ -1,6 +1,6 @@
 # CLI errors and HTTP request correlation
 
-Every `wefty` command uses the same process exit map, including `submit`,
+Every `wefty` command uses the same process exit map, including `exec`, `submit`,
 `rerun`, `drain`, `nodes`, `runs`, `logs`, `inspect`, `results`, and the local
 and service command families. No command-specific whitelist can discard a
 typed result.
@@ -14,10 +14,10 @@ typed result.
 | 4 | Not found or an ended take-over session |
 | 5 | State, revision, idempotency, capacity, or controller conflict |
 | 6–9 | Custody import deferred, quarantined, failed, or superseded |
-| 10 | Run failed (`wait`) |
+| 10 | Run failed (`exec`, `wait`) |
 | 11 | Wait timeout (`wait`) |
 | 12 | Cluster not ready (`status`) |
-| 13 | Transport or service unavailable (`unavailable`, or retryable server-unavailable envelope) |
+| 13 | Transport or service unavailable (`unavailable`, or retryable server-unavailable envelope); for `exec`, a lost watch, an unconfirmed submission, a run infrastructure failure, or a missing command result |
 | 14 | Accepted-mutation observation timeout (`wait_timeout` or `revocation_wait_timeout`) |
 
 The protocol-code membership of the exit map remains authoritative. L1/L3 HTTP
