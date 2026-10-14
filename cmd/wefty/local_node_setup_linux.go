@@ -154,6 +154,7 @@ func maybeExecutePrivilegedLinuxSetup(ctx context.Context, options globalOptions
 		"--oci-control-socket=" + controlSocket,
 	}
 	receipt, err := linuxunit.Configure(ctx, linuxunit.Config{
+		NodeID:    *nodeID,
 		AgentPath: *agentPath, AgentArguments: agentArguments, OperatorUser: operator.Username, OperatorGroup: group.Name,
 		OperatorUID: uid, OperatorGID: gid, WorkingDirectory: *workingDirectory,
 		AllowedMountRoots: []string{*allowedMountRoot}, ContainerdAddress: "/run/containerd/containerd.sock",

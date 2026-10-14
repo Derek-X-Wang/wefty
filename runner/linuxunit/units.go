@@ -32,6 +32,8 @@ const (
 var userPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,63}$`)
 
 type Config struct {
+	// NodeID records the identity used by the installation command in AgentArguments.
+	NodeID              string
 	AgentPath           string
 	AgentArguments      []string
 	OperatorUser        string

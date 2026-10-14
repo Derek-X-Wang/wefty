@@ -84,6 +84,9 @@ func Configure(ctx context.Context, config Config, paths ConfigurePaths, runner 
 	if err != nil {
 		return ConfigureReceipt{}, err
 	}
+	if strings.TrimSpace(config.NodeID) == "" {
+		return ConfigureReceipt{}, errors.New("Linux node installation requires a stable node ID")
+	}
 	receipt := ConfigureReceipt{SystemdVersion: config.SystemdVersion, RestartPolicy: HelperRestartPolicyName(config.SystemdVersion)}
 	if paths.chown == nil {
 		paths.chown = os.Chown
@@ -109,7 +112,7 @@ func Configure(ctx context.Context, config Config, paths ConfigurePaths, runner 
 			return receipt, err
 		}
 	}
-	if err := ocicontrol.WriteInstalledConfig(paths.NodeConfig, ocicontrol.InstalledConfig{Version: ocicontrol.InstalledConfigVersion, ControlSocket: paths.ControlSocket}); err != nil {
+	if err := ocicontrol.WriteInstalledConfig(paths.NodeConfig, ocicontrol.InstalledConfig{Version: ocicontrol.InstalledConfigVersion, ControlSocket: paths.ControlSocket, NodeID: config.NodeID}); err != nil {
 		return receipt, err
 	}
 	if err := paths.chown(filepath.Dir(paths.NodeConfig), config.OperatorUID, config.OperatorGID); err != nil {
