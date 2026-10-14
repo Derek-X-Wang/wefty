@@ -1,6 +1,6 @@
 ---
 name: wefty
-description: Submit and track work on a wefty cluster — check the cluster is ready, schedule AI agent workflows and one-shot jobs onto machines you own, wait for an outcome, follow logs, inspect run lineage and results, and rerun from snapshots. Use when the user wants to run something "on wefty", "on the cluster/fabric", schedule AI agent work onto their machines, or check on a wefty run.
+description: Submit and track work on a wefty cluster — check the cluster is ready, offload a command and local changes with wefty exec, schedule AI agent workflows and one-shot jobs onto machines you own, wait for an outcome, follow logs, inspect run lineage and results, and rerun from snapshots. Use when the user wants to run something "on wefty", "on the cluster/fabric", schedule AI agent work onto their machines, or check on a wefty run.
 ---
 
 # Driving a wefty cluster
@@ -67,7 +67,68 @@ right. `wefty run ...` and `wefty workflow init` are
 the exceptions: they only write files, so they need no endpoint, no identity and
 no credential — see "Reporting from a workflow".
 
+## One command with local changes: `wefty exec`
+
+Use `exec` for one build, test, or other command in your current Git checkout.
+Use a stored workflow for repeatable work that drives other runs, such as
+branch gates or issue-to-PR work on a committed ref. You do not need to write
+a workflow wrapper to offload one command.
+
+```sh
+wefty exec -- go test ./cmd/wefty/
+wefty exec --keep-running --max-runtime 30m -- go test ./cmd/wefty/
+wefty exec --json -- go test ./cmd/wefty/
+RUN_ID=$(wefty exec --detach --json -- go test ./cmd/wefty/ | jq -er '.run_id')
+wefty logs "$RUN_ID" --follow
+wefty cancel "$RUN_ID"
+```
+
+`exec` freezes the base commit, tracked local changes, and untracked files
+that Git does not ignore before submission. It runs in the same relative
+folder in a throwaway copy, on this machine's installed node. Later edits do
+not change the run. The command inherits the node's environment and `PATH`;
+the run's `WEFTY_*` variables are removed. No files are returned. The command
+runs as the node's user and can write absolute paths.
+
+**Stopping `exec` cancels the run unless `--keep-running` is set.** Ctrl-C,
+TERM, and HUP follow this rule. With `--keep-running`, streaming stays the
+same, but stopping ends only the watching. The CLI prints the run ID and
+follow/cancel commands and exits 13 because the result is not yet known. If
+the run had already ended, it reports that verdict and exits 0 or 10 instead.
+For an AI tool with a command time limit, use `--keep-running` or `--detach`
+when the run must survive that limit. A hard kill cannot be caught.
+
+| Flag | Effect |
+| --- | --- |
+| `--keep-running` | Keep streaming; stopping the CLI leaves the run running |
+| `--detach` | Print the run ID after capture and L3 acceptance, then exit 0 without watching |
+| `--json` | Stream NDJSON: one `output`, `heartbeat`, or `finished` event per line; all observed logs precede `finished` |
+| `--detach --json` | Print exactly one line: `{"run_id":"..."}` |
+| `--tag TAG` | Narrow this machine's Pinned run with an extra tag; repeatable |
+| `--max-runtime D` | Choose a runtime cap, such as `30m`; no cap by default |
+
+`--keep-running` and `--detach` are alternatives. Flags after `--` belong to
+the command. In JSON mode, `output` has `stream` and `text`. `finished` has
+`outcome`, `exit_code`, `run_id`, `base_commit`, and `dirty` (whether local
+changes were included). `outcome` is `pass` or `fail` for a command result.
+An infrastructure failure reports `infrastructure_error`, with a null command
+exit code. A stopped or lost watch reports `queued` or `running` when that
+status is known, and `observation_lost` otherwise. Terminal cancellation reports
+`cancelled`.
+Exec exits 0 on pass, 10 on run failure, and 13 when infrastructure or lost
+observation prevents a command verdict. Wrapper liveness appears once per
+minute, so a quiet command does not hit the no-output limit. It proves the
+wrapper is alive, not that the command makes progress.
+
+**Never put a secret on the command line.** The command text is stored
+permanently as typed, with no secret scrubbing. See
+[`docs/contracts/exec.md`](../../docs/contracts/exec.md) for capture refusals,
+output fields, and storage cleanup.
+
 ## Retry safety and deliberate repeats
+
+`exec` creates a fresh run on every call; its internal submission retries use
+one random key for that call. The rule below applies to `submit` and `rerun`.
 
 **The same submit or rerun request means the same run**, permanently, within
 the authenticated actor's namespace. The CLI derives the key automatically.

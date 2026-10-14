@@ -112,7 +112,7 @@ func expectedHelpFirstLine(command string) string {
 	}
 	switch {
 	case command == "exec":
-		return "Usage: wefty exec [--tag TAG] [--max-runtime D] -- <command...>"
+		return "Usage: wefty exec [--tag TAG] [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>"
 	case command == "run" || strings.HasPrefix(command, "run "):
 		return "Usage: wefty run <envelope|step|gate|result|params> [flags]"
 	case command == "workflow" || strings.HasPrefix(command, "workflow "):
