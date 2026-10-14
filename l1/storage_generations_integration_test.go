@@ -105,7 +105,7 @@ func assertComputerStorageResetLifecycle(t *testing.T) {
 	if _, err := h.store.db.ExecContext(context.Background(), `UPDATE computers SET grants_json=? WHERE computer_id=?`, grantsJSON, computer.ComputerID); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func assertComputerStorageResetLifecycle(t *testing.T) {
 		!wasReplay || replay.IntentRevision != reserved.IntentRevision {
 		t.Fatalf("reservation replay = %#v replayed=%t err=%v", replay, wasReplay, err)
 	}
-	generations, err := resumedStore.ListComputerStorageGenerations(context.Background(), computer.ComputerID)
+	generations, err := testReads(resumedStore).ListComputerStorageGenerations(context.Background(), computer.ComputerID)
 	if err != nil || len(generations.Generations) != 2 ||
 		generations.Generations[0].Phase != ComputerStorageGenerationCurrent ||
 		generations.Generations[1].Phase != ComputerStorageGenerationStaging ||
@@ -198,7 +198,7 @@ func assertComputerStorageResetLifecycle(t *testing.T) {
 	if err := resumedStore.recordComputerStorageResetVerification(context.Background(), "fabric-computer-node", computer.ComputerID, acknowledgement); err != nil {
 		t.Fatal(err)
 	}
-	verifiedOnly, err := resumedStore.GetComputer(context.Background(), computer.ComputerID)
+	verifiedOnly, err := testReads(resumedStore).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || verifiedOnly.StorageGeneration != 1 || verifiedOnly.ReconfigurationPhase != ComputerReconfigurationResetting {
 		t.Fatalf("verification prematurely published Storage: %#v err=%v", verifiedOnly, err)
 	}
@@ -223,7 +223,7 @@ func assertComputerStorageResetLifecycle(t *testing.T) {
 		replayedPublication.AppliedRevision != published.AppliedRevision {
 		t.Fatalf("publication replay = %#v err=%v", replayedPublication, err)
 	}
-	generations, err = publicationResume.ListComputerStorageGenerations(context.Background(), computer.ComputerID)
+	generations, err = testReads(publicationResume).ListComputerStorageGenerations(context.Background(), computer.ComputerID)
 	if err != nil || len(generations.Generations) != 2 || generations.Generations[0].Phase != ComputerStorageGenerationRetired ||
 		generations.Generations[0].RetiredAt == nil || generations.Generations[1].Phase != ComputerStorageGenerationCurrent {
 		t.Fatalf("published Storage generations = %#v err=%v", generations, err)

@@ -1,7 +1,10 @@
 package agent
 
 import (
+	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,48 +26,127 @@ func storeClockCompletion(t *testing.T, outbox *evidenceOutbox, clock *manualClo
 	}
 }
 
-// waitForArmedRetry waits until recovery has taken in its last answer and
-// armed its next retry: some timer is due after the clock's now. Only then
-// may a test advance the clock. Advanced any earlier, while an ask is still
-// in flight, recovery would arm its retry after the advance, relative to the
-// new now, and the next advance would be the first to fire it.
-func waitForArmedRetry(t *testing.T, clock *manualClock) {
+// recoveryDriver moves a manual clock for a recovery loop that keeps asking
+// L1 about one attempt, and moves it only between recovery passes. A test
+// that moves the clock from its own goroutine can land inside a pass: the pass
+// reads the time, the move fires the retry timer, and the pass then replaces
+// that timer with one armed from the old time -- due at once, or a whole move
+// late -- which a manual clock fires only when it next moves. The attempt is
+// never asked again (#921). The driver moves the clock from the recovery
+// goroutine instead, at the end of a pass that has taken in the attempt's last
+// answer and armed its retry. No pass is running then, and every later pass
+// reads the new time.
+type recoveryDriver struct {
+	clock     *manualClock
+	outbox    *evidenceOutbox
+	counter   *completionCounter
+	attemptID string
+
+	mu   sync.Mutex
+	move *recoveryMove
+}
+
+type recoveryMove struct {
+	by   time.Duration
+	done chan recoveryMoved
+}
+
+type recoveryMoved struct {
+	asked int // how many times L1 had been asked about the attempt
+	err   error
+}
+
+// newRecoveryDriver hooks a driver into outbox's recovery loop. Call it before
+// startRecovery; from then on only the driver moves the clock.
+func newRecoveryDriver(clock *manualClock, outbox *evidenceOutbox, counter *completionCounter, attemptID string) *recoveryDriver {
+	driver := &recoveryDriver{clock: clock, outbox: outbox, counter: counter, attemptID: attemptID}
+	outbox.recoveryScanFinished = driver.passFinished
+	return driver
+}
+
+// advance moves the clock by duration once recovery has taken in the
+// attempt's last answer and armed its next retry, and returns how many times
+// L1 had been asked about the attempt when the clock moved.
+func (driver *recoveryDriver) advance(t *testing.T, duration time.Duration) int {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		clock.mu.Lock()
-		armed := false
-		for _, timer := range clock.timers {
-			if timer.active && timer.deadline.After(clock.now) {
-				armed = true
-				break
-			}
+	move := &recoveryMove{by: duration, done: make(chan recoveryMoved, 1)}
+	driver.mu.Lock()
+	driver.move = move
+	// An idle loop ends no pass by itself; this wake makes it run one.
+	driver.outbox.scheduleRecovery()
+	driver.mu.Unlock()
+	select {
+	case moved := <-move.done:
+		if moved.err != nil {
+			t.Fatal(moved.err)
 		}
-		clock.mu.Unlock()
-		if armed {
-			return
+		return moved.asked
+	case <-time.After(30 * time.Second):
+		driver.mu.Lock()
+		if driver.move == move {
+			driver.move = nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("recovery never armed its next retry")
-		}
-		time.Sleep(time.Millisecond)
+		driver.mu.Unlock()
+		t.Fatalf("recovery never armed the next retry of attempt %s", driver.attemptID)
+		return 0
 	}
 }
 
+// passFinished runs on the recovery goroutine at the end of every pass, after
+// the pass has armed its retry.
+func (driver *recoveryDriver) passFinished() {
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	move := driver.move
+	if move == nil || !retryArmed(driver.clock) {
+		return
+	}
+	driver.move = nil
+	// Recovery arms one timer, for its earliest retry, and only for attempts
+	// still pending. With the attempt the only one pending, the armed retry is
+	// its own: its answer is in.
+	attempts, err := driver.outbox.spool.pendingAttempts(context.Background())
+	if err == nil && (len(attempts) != 1 || attempts[0].attemptID != driver.attemptID) {
+		err = fmt.Errorf("the armed retry may not be attempt %s's: pending replay is %+v", driver.attemptID, attempts)
+	}
+	if err != nil {
+		move.done <- recoveryMoved{err: err}
+		return
+	}
+	// The driver's wake has done its job. Dropped, it cannot ask about the
+	// attempt in place of the retry the move is meant to fire.
+	select {
+	case <-driver.outbox.recoveryWake:
+	default:
+	}
+	asked := driver.counter.count(driver.attemptID)
+	driver.clock.Advance(move.by)
+	move.done <- recoveryMoved{asked: asked}
+}
+
+// retryArmed reports whether a timer is armed to fire after the clock's now.
+func retryArmed(clock *manualClock) bool {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	for _, timer := range clock.timers {
+		if timer.active && timer.deadline.After(clock.now) {
+			return true
+		}
+	}
+	return false
+}
+
 // advanceRecoveryDays drives recovery through days of simulated time, one
-// day at a time, each to quiescence: the retry armed before the day is
-// advanced past, and the day's ask of attemptID seen before the next. It
+// day at a time: each day starts once the attempt's last answer is in and its
+// retry armed, and ends once L1 has been asked about the attempt again. It
 // asserts at least one ask per day, never a total that depends on how fast
 // the runner schedules recovery.
-func advanceRecoveryDays(t *testing.T, clock *manualClock, counter *completionCounter, attemptID string, days int) {
+func advanceRecoveryDays(t *testing.T, driver *recoveryDriver, days int) {
 	t.Helper()
 	for day := 1; day <= days; day++ {
-		waitForArmedRetry(t, clock)
-		calls := counter.count(attemptID)
-		clock.Advance(24 * time.Hour)
-		waitForCompletionCalls(t, counter, attemptID, calls+1)
+		asked := driver.advance(t, 24*time.Hour)
+		waitForCompletionCalls(t, driver.counter, driver.attemptID, asked+1)
 	}
-	waitForArmedRetry(t, clock)
 }
 
 func waitForSpoolRowGone(t *testing.T, outbox *evidenceOutbox, attemptID string) {
@@ -102,18 +184,19 @@ func TestRecoveryKeepsAnUnansweredCompletionThroughAFiveDayOutage(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer outbox.Close()
+	driver := newRecoveryDriver(clock, outbox, counter, attemptID)
 	storeClockCompletion(t, outbox, clock, attemptID)
 	outbox.startRecovery(t.Context(), client, func(error) {})
 	waitForCompletionCalls(t, counter, attemptID, 1)
 
 	// Five days of an unavailable L1: every recovery pass, and every sweep
 	// it carries, runs while nothing has answered.
-	advanceRecoveryDays(t, clock, counter, attemptID, 5)
+	advanceRecoveryDays(t, driver, 5)
 	waitForCompletionState(t, outbox, attemptID, "durable_completion")
 	assertAttemptPending(t, outbox, attemptID)
 
 	offline.Store(false)
-	clock.Advance(time.Minute) // past the capped transient backoff
+	driver.advance(t, time.Minute) // past the capped transient backoff
 	waitForCompletionState(t, outbox, attemptID, "delivered")
 }
 
@@ -145,6 +228,7 @@ func TestRecoverySweepsOnlyWhatL1RefusedForGood(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer outbox.Close()
+	driver := newRecoveryDriver(clock, outbox, counter, parked)
 	for _, attemptID := range []string{refused, parked, tooLate} {
 		storeClockCompletion(t, outbox, clock, attemptID)
 	}
@@ -163,7 +247,7 @@ func TestRecoverySweepsOnlyWhatL1RefusedForGood(t *testing.T) {
 	waitForCompletionCalls(t, counter, parked, 1)
 
 	// The next sweep, an hour on, takes the refused one-shot only.
-	clock.Advance(time.Hour)
+	driver.advance(t, time.Hour)
 	deliverBarrier(t, outbox, barrier1)
 	waitForSpoolRowGone(t, outbox, refused)
 	for _, kept := range []string{parked, service} {
@@ -173,7 +257,7 @@ func TestRecoverySweepsOnlyWhatL1RefusedForGood(t *testing.T) {
 	}
 	// Five more days of the parked refusal: still kept, still asked every
 	// day.
-	advanceRecoveryDays(t, clock, counter, parked, 5)
+	advanceRecoveryDays(t, driver, 5)
 	waitForCompletionState(t, outbox, parked, "durable_completion")
 	assertAttemptPending(t, outbox, parked)
 	if !spoolRowExists(t, outbox.spool, service) {
@@ -213,16 +297,17 @@ func TestRecoveryKeepsAnUnansweredCompletionForSixtyDays(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer outbox.Close()
+	driver := newRecoveryDriver(clock, outbox, counter, attemptID)
 	storeClockCompletion(t, outbox, clock, attemptID)
 	reports := make(chan error, 256)
 	outbox.startRecovery(t.Context(), client, func(err error) { reports <- err })
 	waitForCompletionCalls(t, counter, attemptID, 1)
-	advanceRecoveryDays(t, clock, counter, attemptID, 60)
+	advanceRecoveryDays(t, driver, 60)
 	waitForCompletionState(t, outbox, attemptID, "durable_completion")
 	assertAttemptPending(t, outbox, attemptID)
 
 	offline.Store(false)
-	clock.Advance(time.Minute) // past the capped transient backoff
+	driver.advance(t, time.Minute) // past the capped transient backoff
 	waitForCompletionState(t, outbox, attemptID, "delivered")
 	for len(reports) > 0 {
 		if report := (<-reports).Error(); strings.Contains(report, "swept") {

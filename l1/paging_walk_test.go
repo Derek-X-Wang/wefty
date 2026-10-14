@@ -89,7 +89,7 @@ func walkStoreJobLogs(t *testing.T, h *integrationHarness, jobID string) LogPage
 		if poll > 250 {
 			t.Fatal("store log paging did not terminate")
 		}
-		page, err := h.store.GetJobLogs(context.Background(), jobID, cursor, MaxLogPageLimit)
+		page, err := testReads(h.store).GetJobLogs(context.Background(), jobID, cursor, MaxLogPageLimit)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -43,7 +43,7 @@ func TestAgentServiceBindingProofAndImageFailureLatch(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("image failure latch status=%d body=%s", status, body)
 	}
-	latched, err := h.store.GetJob(t.Context(), service.JobID)
+	latched, err := testReads(h.store).GetJob(t.Context(), service.JobID)
 	if err != nil || latched.State != contract.JobFailed || latched.CurrentAttemptID != "" || latched.LastFailure == nil {
 		t.Fatalf("latched service=%+v err=%v", latched, err)
 	}

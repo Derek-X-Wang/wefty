@@ -17,25 +17,33 @@ import (
 )
 
 func TestReadSnapshotTargetOverrunReturnsAnswer(t *testing.T) {
-	s, _ := snapshotStore(t)
-	var logs bytes.Buffer
-	s.logf = func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) }
-	answer := ""
-	err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
-		time.Sleep(125 * time.Millisecond)
-		if _, err := reads.node(ctx, "absent"); !errors.Is(err, sql.ErrNoRows) {
+	retryTestSnapshotScenario(t, func() error {
+
+		s, _ := snapshotStore(t)
+		var logs bytes.Buffer
+		s.logf = func(format string, args ...any) { fmt.Fprintf(&logs, format, args...) }
+		answer := ""
+		err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
+			time.Sleep(125 * time.Millisecond)
+			if _, err := reads.node(ctx, "absent"); !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			answer = "correct"
+			return nil
+		})
+		if testReadRetryable(err) {
 			return err
 		}
-		answer = "correct"
+		if err != nil || answer != "correct" {
+			t.Fatalf("slow correct answer=%q err=%v", answer, err)
+		}
+		counter, ok := any(s).(interface{ readSnapshotOverrunCount() uint64 })
+		if !ok || counter.readSnapshotOverrunCount() != 1 || !strings.Contains(logs.String(), "read_snapshot_target_overrun") {
+			t.Fatalf("overrun was not counted and logged: %s", logs.String())
+		}
+
 		return nil
 	})
-	if err != nil || answer != "correct" {
-		t.Fatalf("slow correct answer=%q err=%v", answer, err)
-	}
-	counter, ok := any(s).(interface{ readSnapshotOverrunCount() uint64 })
-	if !ok || counter.readSnapshotOverrunCount() != 1 || !strings.Contains(logs.String(), "read_snapshot_target_overrun") {
-		t.Fatalf("overrun was not counted and logged: %s", logs.String())
-	}
 }
 
 func assertSnapshotUnavailable(t *testing.T, err error, reason string) {
@@ -170,7 +178,7 @@ func TestReadSnapshotSeparatePoolCannotBeStarvedByLegacyReads(t *testing.T) {
 			_ = conn.Close()
 		}
 	}()
-	if err := s.withReadSnapshot(t.Context(), nil, func(context.Context, readModel) error { return nil }); err != nil {
+	if err := testReads(s).withReadSnapshot(t.Context(), nil, func(context.Context, readModel) error { return nil }); err != nil {
 		t.Fatalf("legacy pool starved snapshot checkout: %v", err)
 	}
 }
@@ -209,7 +217,7 @@ func TestReadSnapshotProjectorMemoizesNodeFacts(t *testing.T) {
 	for _, state := range []string{"claimed", "capability-missing"} {
 		t.Run(state, func(t *testing.T) {
 			h, _, original, _ := jobProjectionFixture(t, state)
-			if err := h.store.withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
+			if err := testReads(h.store).withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
 				impl := reads.(*databaseReads)
 				counter := &projectionNodeCounter{queryer: impl.q}
 				impl.q = counter

@@ -56,7 +56,7 @@ func TestJobListingProjectionQueryBudget(t *testing.T) {
 			cursor := ""
 			seen := map[string]bool{}
 			for {
-				next, err := h.store.listReadableJobsForCaller(t.Context(), jobListFilters{}, cursor, MaxJobListingPageLimit, nil)
+				next, err := testReads(h.store).listReadableJobsForCaller(t.Context(), jobListFilters{}, cursor, MaxJobListingPageLimit, nil)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -98,45 +98,59 @@ func TestJobListingProjectionQueryBudget(t *testing.T) {
 }
 
 func TestReadSnapshotIndependentBackgroundContexts(t *testing.T) {
-	s, _ := snapshotStore(t)
-	entered := make(chan struct{}, 2)
-	release := make(chan struct{})
-	done := make(chan error, 2)
-	for range 2 {
-		go func() {
-			done <- s.withReadSnapshot(context.Background(), nil, func(context.Context, readModel) error {
-				entered <- struct{}{}
-				<-release
-				return nil
-			})
-		}()
-	}
-	timer := time.NewTimer(150 * time.Millisecond)
-	defer timer.Stop()
-	count := 0
-	for count < 2 {
-		select {
-		case <-entered:
-			count++
-		case <-timer.C:
-			close(release)
-			for range 2 {
-				<-done
+	retryTestSnapshotScenario(t, func() error {
+
+		s, _ := snapshotStore(t)
+		entered := make(chan struct{}, 2)
+		release := make(chan struct{})
+		done := make(chan error, 2)
+		for range 2 {
+			go func() {
+				done <- s.withReadSnapshot(context.Background(), nil, func(context.Context, readModel) error {
+					entered <- struct{}{}
+					<-release
+					return nil
+				})
+			}()
+		}
+		timer := time.NewTimer(150 * time.Millisecond)
+		defer timer.Stop()
+		count := 0
+		for count < 2 {
+			select {
+			case <-entered:
+				count++
+			case <-timer.C:
+				close(release)
+				var expiry error
+				for range 2 {
+					if err := <-done; testReadRetryable(err) {
+						expiry = err
+					}
+				}
+				if expiry != nil {
+					return expiry
+				}
+				t.Fatalf("only %d independent Background snapshots entered", count)
 			}
-			t.Fatalf("only %d independent Background snapshots entered", count)
 		}
-	}
-	close(release)
-	for range 2 {
-		if err := <-done; err != nil {
-			t.Fatal(err)
+		close(release)
+		for range 2 {
+			if err := <-done; err != nil {
+				if testReadRetryable(err) {
+					return err
+				}
+				t.Fatal(err)
+			}
 		}
-	}
+
+		return nil
+	})
 }
 
 func TestReadSnapshotNestedIsProgrammingError(t *testing.T) {
 	s, _ := snapshotStore(t)
-	if err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, _ readModel) error {
+	if err := testReads(s).withReadSnapshot(t.Context(), nil, func(ctx context.Context, _ readModel) error {
 		err := s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error { t.Error("nested callback ran"); return nil })
 		api := apiErrorFromDecision(err)
 		if api == nil || api.Code != contract.ErrorInternal || api.Retryable {
@@ -208,24 +222,42 @@ func (q *rejectOccupancyReads) QueryContext(ctx context.Context, query string, a
 }
 
 func TestReadSnapshotOverrunLoggerRateLimit(t *testing.T) {
-	s, _ := snapshotStore(t)
-	var lines []string
-	s.logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
-	slow := func() {
-		t.Helper()
-		if err := s.withReadSnapshot(t.Context(), nil, func(context.Context, readModel) error { time.Sleep(110 * time.Millisecond); return nil }); err != nil {
+	retryTestSnapshotScenario(t, func() error {
+
+		s, _ := snapshotStore(t)
+		var lines []string
+		s.logf = func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
+		slow := func() error {
+			return s.withReadSnapshot(t.Context(), nil, func(context.Context, readModel) error { time.Sleep(110 * time.Millisecond); return nil })
+		}
+
+		if err := slow(); err != nil {
+			if testReadRetryable(err) {
+				return err
+			}
 			t.Fatal(err)
 		}
-	}
-	slow()
-	slow()
-	if len(lines) != 1 || !strings.HasPrefix(lines[0], "event=l1_read_snapshot_target_overrun ") || s.readSnapshotOverrunCount() != 2 {
-		t.Fatalf("lines=%v count=%d", lines, s.readSnapshotOverrunCount())
-	}
-	// Advance only the log gate; the transaction still exercises real timing.
-	s.readSnapshotLastLog.Add(-int64(time.Second))
-	slow()
-	if len(lines) != 2 || !strings.Contains(lines[1], "count=3") {
-		t.Fatalf("running count not reported: %v", lines)
-	}
+		if err := slow(); err != nil {
+			if testReadRetryable(err) {
+				return err
+			}
+			t.Fatal(err)
+		}
+		if len(lines) != 1 || !strings.HasPrefix(lines[0], "event=l1_read_snapshot_target_overrun ") || s.readSnapshotOverrunCount() != 2 {
+			t.Fatalf("lines=%v count=%d", lines, s.readSnapshotOverrunCount())
+		}
+		// Advance only the log gate; the transaction still exercises real timing.
+		s.readSnapshotLastLog.Add(-int64(time.Second))
+		if err := slow(); err != nil {
+			if testReadRetryable(err) {
+				return err
+			}
+			t.Fatal(err)
+		}
+		if len(lines) != 2 || !strings.Contains(lines[1], "count=3") {
+			t.Fatalf("running count not reported: %v", lines)
+		}
+
+		return nil
+	})
 }

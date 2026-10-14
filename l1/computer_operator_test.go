@@ -266,18 +266,7 @@ func TestComputerActionsUseActualCallerAndOmitPersonVerbs(t *testing.T) {
 				r := httptest.NewRequest(http.MethodGet, "/v1/computers/"+computer.ComputerID, nil)
 				r.SetPathValue("computer_id", computer.ComputerID)
 				r = r.WithContext(context.WithValue(r.Context(), identityContextKey{}, identity))
-				w, err := retryTestStatusRead(t.Context(), func() (*httptest.ResponseRecorder, error) {
-					w := httptest.NewRecorder()
-					h.server.getComputer(w, r)
-					var refusal contract.ErrorResponse
-					if w.Code == http.StatusServiceUnavailable && json.Unmarshal(w.Body.Bytes(), &refusal) == nil && refusal.Error.Code == contract.ErrorUnavailable {
-						return w, &Error{Code: refusal.Error.Code, notRetryable: !refusal.Error.Retryable}
-					}
-					return w, nil
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
+				w := recordTestRead(r, h.server.getComputer)
 				var facts computerOperatorFacts
 				if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &facts) != nil || len(facts.AllowedActions) != len(testedComputerVerbs) {
 					t.Fatalf("projection: %d %s", w.Code, w.Body.String())

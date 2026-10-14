@@ -213,7 +213,7 @@ func TestServiceAllowedActionsCallerHTTP(t *testing.T) {
 					r.SetPathValue("job_id", job.JobID)
 					r = r.WithContext(context.WithValue(r.Context(), identityContextKey{}, identity))
 					w := httptest.NewRecorder()
-					h.server.getJob(w, r)
+					w = recordTestRead(r, h.server.getJob)
 					if w.Code != http.StatusOK {
 						t.Fatalf("read=%d %s", w.Code, w.Body.String())
 					}
@@ -251,7 +251,7 @@ func TestServiceOperatorListAndReadOnly(t *testing.T) {
 	defer cancel()
 	r := httptest.NewRequest(http.MethodGet, "/v1/jobs?class=service", nil).WithContext(context.WithValue(ctx, identityContextKey{}, fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}}))
 	w := httptest.NewRecorder()
-	h.server.listJobs(w, r)
+	w = recordTestRead(r, h.server.listJobs)
 	if w.Code != http.StatusOK {
 		t.Fatalf("list acquired writer lock: %d %s", w.Code, w.Body.String())
 	}

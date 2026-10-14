@@ -264,7 +264,7 @@ func TestAdminBootstrapChallengeExpiryAndReplacement(t *testing.T) {
 	if _, err := h.store.BootstrapAdmin(context.Background(), identity, second.Nonce); errorCode(err) != contract.ErrorAdminBootstrapInvalid {
 		t.Fatalf("expired challenge error = %v, want %q", err, contract.ErrorAdminBootstrapInvalid)
 	}
-	policy, err := h.store.GetAdminPolicy(context.Background())
+	policy, err := testReads(h.store).GetAdminPolicy(context.Background())
 	if err != nil || policy.Revision != 0 || len(policy.Admins) != 0 {
 		t.Fatalf("failed challenges changed policy = %#v err=%v", policy, err)
 	}
@@ -350,7 +350,7 @@ func TestAdminPolicyBoundAndAuditFailureRollback(t *testing.T) {
 		t.Fatalf("audit failure error = %v, want internal", err)
 	}
 	assertAdminPolicyRevisionAndAuditCount(t, h, 1, 1)
-	current, err := h.store.GetAdminPolicy(context.Background())
+	current, err := testReads(h.store).GetAdminPolicy(context.Background())
 	if err != nil || len(current.Admins) != 1 {
 		t.Fatalf("audit failure changed membership = %#v err=%v", current, err)
 	}

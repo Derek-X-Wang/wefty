@@ -87,13 +87,13 @@ func TestRestoreBeginNamesItsOwnOperationAndTheReadReturnsItsOutcome(t *testing.
 		t.Fatalf("fresh restore A names revision %d, want %d", revisionA, computer.IntentRevision+1)
 	}
 	settleCopy(revisionA, "")
-	afterA, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	afterA, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	revisionB := begin(afterA, true, "restore-b", http.StatusAccepted)
 	settleCopy(revisionB, ComputerBackupFailureInsufficientDisk)
-	aborted, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	aborted, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || aborted.ReconfigurationPhase != ComputerReconfigurationStable || aborted.AppliedRevision != revisionB {
 		t.Fatalf("aborted restore left Computer = %#v err=%v", aborted, err)
 	}

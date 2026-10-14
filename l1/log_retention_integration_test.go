@@ -63,7 +63,7 @@ func assertServiceLogByteRetentionAndDerivedJSONL(t *testing.T) {
 		t.Fatalf("service state after byte eviction = %q, want running", got)
 	}
 
-	raw, err := h.store.RawJobLogJSONL(context.Background(), job.JobID)
+	raw, err := testReads(h.store).RawJobLogJSONL(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}

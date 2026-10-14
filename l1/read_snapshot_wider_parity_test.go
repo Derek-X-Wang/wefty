@@ -76,7 +76,7 @@ func TestReadModelWiderPublicFixtures(t *testing.T) {
 			t.Fatal(err)
 		}
 		assertWiderProjectionFixture(t, "same-node-page", raw, first.JobID, "JOB1", second.JobID, "JOB2")
-		if err := h.store.withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
+		if err := testReads(h.store).withReadSnapshot(t.Context(), nil, func(ctx context.Context, reads readModel) error {
 			impl := reads.(*databaseReads)
 			counter := &projectionNodeCounter{queryer: impl.q}
 			impl.q = counter

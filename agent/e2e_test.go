@@ -75,6 +75,7 @@ func TestAgentUploadsLongPartialAndInvalidUTF8Output(t *testing.T) {
 		"--control-plane="+address,
 		"--node-id=stable-node",
 		"--log-spool-dir="+directory,
+		"--managed-root="+temporaryManagedRoot(t),
 		"--plain-identity=fabric-node",
 		"--heartbeat-interval=5s",
 		"--claim-interval=10ms",
@@ -133,6 +134,7 @@ func TestAgentLogPollTailsRunningProcess(t *testing.T) {
 		"--control-plane="+address,
 		"--node-id=stable-node",
 		"--log-spool-dir="+directory,
+		"--managed-root="+temporaryManagedRoot(t),
 		"--plain-identity=fabric-node",
 		"--heartbeat-interval=5s",
 		"--claim-interval=10ms",
@@ -217,6 +219,7 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 		"--control-plane="+address,
 		"--node-id=stable-node",
 		"--log-spool-dir="+directory,
+		"--managed-root="+temporaryManagedRoot(t),
 		"--plain-identity=fabric-node",
 		"--heartbeat-interval=5s",
 		"--claim-interval=10ms",
@@ -558,6 +561,11 @@ type managedProcess struct {
 
 func startManagedProcess(t *testing.T, executable string, arguments ...string) *managedProcess {
 	t.Helper()
+	if executable == agentBinaryPath {
+		if err := requireTestManagedRoot(arguments); err != nil {
+			t.Fatal(err)
+		}
+	}
 	process := &managedProcess{command: exec.Command(executable, arguments...), done: make(chan error, 1)}
 	t.Cleanup(func() { process.stop(t) })
 	return process

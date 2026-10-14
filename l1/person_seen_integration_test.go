@@ -100,7 +100,7 @@ func TestPersonObservationNestedSnapshotFailsClosed(t *testing.T) {
 	h := newIntegrationHarness(t, nil)
 	identity := fabric.Identity{FabricID: h.store.deploymentID, UserID: "person-nest", DeviceID: "device-nest"}
 	var inner error
-	err := h.store.withReadSnapshot(context.Background(), nil, func(ctx context.Context, reads readModel) error {
+	err := testReads(h.store).withReadSnapshot(context.Background(), nil, func(ctx context.Context, reads readModel) error {
 		_, inner = h.store.ObserveAuthenticatedPerson(ctx, identity)
 		return nil
 	})
@@ -217,7 +217,7 @@ func TestFirstPersonViewRecordsThenGrantSucceeds(t *testing.T) {
 	if status != http.StatusCreated {
 		t.Fatalf("bootstrap status=%d body=%s", status, body)
 	}
-	policy, err := h.store.GetAdminPolicy(context.Background())
+	policy, err := testReads(h.store).GetAdminPolicy(context.Background())
 	if err != nil || len(policy.Admins) != 1 {
 		t.Fatalf("bootstrapped policy = %#v err=%v", policy, err)
 	}

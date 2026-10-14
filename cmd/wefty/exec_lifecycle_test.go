@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -20,12 +21,18 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-func shortenExecReadRecovery(t *testing.T) {
+// shortenExecReadRecovery makes a read that never succeeds give up quickly.
+// Use it only while that read is stubbed to fail or to block, so the short
+// budget ends the same way however slowly the real stack answers. A healthy
+// read must not share it: restore the production budget before one.
+func shortenExecReadRecovery(t *testing.T) (restore func()) {
 	t.Helper()
 	old := execReadRecoveryBudget
 	execReadRecoveryBudget = 300 * time.Millisecond
-	t.Cleanup(func() { execReadRecoveryBudget = old })
+	restore = func() { execReadRecoveryBudget = old }
+	t.Cleanup(restore)
 	shortenExecTimers(t)
+	return restore
 }
 
 func execReadFailure(kind string) (*http.Response, error) {
@@ -43,7 +50,9 @@ func TestExecObservationRetriesWithoutCancellation(t *testing.T) {
 	for _, path := range []string{"logs", "record"} {
 		for _, kind := range []string{"transport", "unavailable", "internal"} {
 			t.Run(path+"/"+kind, func(t *testing.T) {
-				shortenExecReadRecovery(t)
+				// The run is healthy, so its reads keep the production budget.
+				// Only the stubbed failures decide how a read recovers.
+				shortenExecTimers(t)
 				stack := newExecStack(t, execTestIdleLimit)
 				repo := execTestRepo(t)
 				t.Chdir(repo)
@@ -232,10 +241,10 @@ func TestExecRemovesReadOnlyFolders(t *testing.T) {
 }
 
 func TestExecCancelFeedbackAndAcceptedSettlement(t *testing.T) {
+	// The cancel request is healthy and keeps L1's settlement budget. Only
+	// terminal confirmation is lost: its reads fail until the short read
+	// budget ends, however slowly the real stack answers the cancel.
 	shortenExecReadRecovery(t)
-	old := execCancelSettlementBudget
-	execCancelSettlementBudget = 250 * time.Millisecond
-	t.Cleanup(func() { execCancelSettlementBudget = old })
 	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -517,6 +526,32 @@ func TestExecHeartbeatStopsAtCommandEnd(t *testing.T) {
 	boundary := strings.Index(observed, output.token) + len(output.token)
 	if !strings.Contains(observed[:boundary], "command-last\n") || !strings.Contains(observed[:boundary], "still running") || strings.Contains(output.String()[boundary:], "still running") {
 		t.Fatalf("heartbeat continued after command exited: %q", output.String())
+	}
+}
+
+// Every exec stop path prints feedback. A second Ctrl-C that follows any of
+// it must meet default signal handling, so exec observes cancellation only
+// after the reset has finished, however slow the reset is.
+func TestExecSignalContextCancelsOnlyAfterReset(t *testing.T) {
+	base, cancelBase := context.WithCancel(t.Context())
+	var reset atomic.Bool
+	parent := context.WithValue(base, execSignalResetKey{}, context.CancelFunc(func() {
+		time.Sleep(50 * time.Millisecond)
+		reset.Store(true)
+	}))
+	ctx, stop := execSignalContext(parent)
+	defer stop()
+	cancelBase()
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("exec context ignored the parent's cancellation")
+	}
+	if !reset.Load() {
+		t.Fatal("exec observed cancellation before the signal reset finished")
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("exec context error = %v, want canceled", ctx.Err())
 	}
 }
 

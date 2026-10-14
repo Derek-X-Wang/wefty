@@ -58,7 +58,7 @@ func custodyManifest(directive ComputerCustodyExportDirective) contract.Computer
 func TestCustodyExportCommitsTaintBeforeBytesAndAttestationNeverUpgrades(t *testing.T) {
 	h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
 	export, directive := beginCustodyExport(t, h, node, computer, backup, "race")
-	current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	current, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func TestCustodyExportCommitsTaintBeforeBytesAndAttestationNeverUpgrades(t *test
 	finalizeOrObserveRemoval(t, h.store, removalDirectives[0].JobID, func(job Job) bool {
 		return job.State == contract.JobRemovedVerified
 	})
-	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
+	removed, err = testReads(h.store).GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("pre-byte Custody event removal = %#v err=%v", removed, err)
 	}
@@ -110,11 +110,11 @@ func TestCustodyExportCommitsTaintBeforeBytesAndAttestationNeverUpgrades(t *test
 	if err != nil || !replayed || !attested.OperatorAttestedDeleted {
 		t.Fatalf("operator_attested_deleted replay = %#v replay=%t err=%v", attested, replayed, err)
 	}
-	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
+	removed, err = testReads(h.store).GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("attestation upgraded removal = %#v err=%v", removed, err)
 	}
-	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), removed.ComputerID)
+	provenance, err := testReads(h.store).ListComputerStorageProvenance(context.Background(), removed.ComputerID)
 	if err != nil || !provenance.CustodyTainted || len(provenance.CustodyForks) != 1 ||
 		provenance.CustodyForks[0].RemovalOutcome != "removed_reduced" || len(provenance.CustodyExports) != 1 ||
 		!provenance.CustodyExports[0].OperatorAttestedDeleted {
@@ -127,7 +127,7 @@ func TestCustodyExportCommitsTaintBeforeBytesAndAttestationNeverUpgrades(t *test
 	if errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("late Custody export acknowledgement = %#v err=%v, want conflict", completed, err)
 	}
-	removed, _ = h.store.GetComputer(context.Background(), removed.ComputerID)
+	removed, _ = testReads(h.store).GetComputer(context.Background(), removed.ComputerID)
 	if removed.RemovalOutcome != "removed_reduced" || removed.ReconfigurationPhase != ComputerReconfigurationRemoving {
 		t.Fatalf("late export acknowledgement changed removal truth = %#v", removed)
 	}
@@ -154,7 +154,7 @@ func TestCustodyImportValidatesReceiptCreatesNoGrantIdentityAndTaintsDescendants
 	if err != nil || replayed {
 		t.Fatalf("begin Custody import = %#v replayed=%t err=%v", operation, replayed, err)
 	}
-	reserved, err := h.store.GetComputer(context.Background(), operation.DestinationComputerID)
+	reserved, err := testReads(h.store).GetComputer(context.Background(), operation.DestinationComputerID)
 	if err != nil || reserved.ReconfigurationPhase != ComputerReconfigurationImporting || reserved.Name != "returned-custody" {
 		t.Fatalf("unverified import did not atomically reserve Computer = %#v err=%v", reserved, err)
 	}
@@ -269,7 +269,7 @@ func TestCustodyImportValidatesReceiptCreatesNoGrantIdentityAndTaintsDescendants
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	clone, err = h.store.GetComputer(context.Background(), clone.ComputerID)
+	clone, err = testReads(h.store).GetComputer(context.Background(), clone.ComputerID)
 	if err != nil || clone.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("second-generation Custody descendant removal = %#v err=%v", clone, err)
 	}
@@ -331,7 +331,7 @@ func TestCustodyExportFailureClosesPhaseAndPathCanBeReused(t *testing.T) {
 	if err != nil || failed.Status != "failed" || failed.FailureCode != "cancelled" {
 		t.Fatalf("failed Custody export = %#v err=%v", failed, err)
 	}
-	current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	current, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || current.ReconfigurationPhase != ComputerReconfigurationStable {
 		t.Fatalf("failed export stranded Computer = %#v err=%v", current, err)
 	}
@@ -357,11 +357,11 @@ func TestCustodyExportRefusedBeforeAnyExternalByteLeavesTheSourceUntainted(t *te
 	if err != nil || refused.Status != "failed" || refused.FailureCode != contract.CustodyExportPathUnconfined {
 		t.Fatalf("refused Custody export = %#v err=%v", refused, err)
 	}
-	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+	provenance, err := testReads(h.store).ListComputerStorageProvenance(context.Background(), computer.ComputerID)
 	if err != nil || provenance.CustodyTainted || len(provenance.CustodyExports) != 1 {
 		t.Fatalf("refused export tainted the source = %#v err=%v", provenance, err)
 	}
-	current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	current, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +391,7 @@ func TestCustodyExportRefusedBeforeAnyExternalByteLeavesTheSourceUntainted(t *te
 	finalizeOrObserveRemoval(t, h.store, removalDirectives[0].JobID, func(job Job) bool {
 		return job.State == contract.JobRemovedVerified
 	})
-	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
+	removed, err = testReads(h.store).GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_verified" {
 		t.Fatalf("refused export reduced the removal outcome = %#v err=%v", removed, err)
 	}
@@ -412,12 +412,12 @@ func TestCustodyExportThatTouchedTheDestinationTaintsAndReducesRemoval(t *testin
 			if err != nil || refused.Status != "failed" || refused.FailureCode != code {
 				t.Fatalf("Custody export refused %s = %#v err=%v", code, refused, err)
 			}
-			provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+			provenance, err := testReads(h.store).ListComputerStorageProvenance(context.Background(), computer.ComputerID)
 			if err != nil || !provenance.CustodyTainted {
 				t.Fatalf("an export that touched the destination left the source untainted = %#v err=%v", provenance, err)
 			}
 			// A lost acknowledgement must not become a clean removal.
-			current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+			current, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -447,7 +447,7 @@ func TestCustodyExportThatTouchedTheDestinationTaintsAndReducesRemoval(t *testin
 			finalizeOrObserveRemoval(t, h.store, directives[0].JobID, func(job Job) bool {
 				return job.State == contract.JobRemovedVerified
 			})
-			removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
+			removed, err = testReads(h.store).GetComputer(context.Background(), removed.ComputerID)
 			if err != nil || removed.RemovalOutcome != "removed_reduced" {
 				t.Fatalf("an export that touched the destination allowed %q = %#v err=%v", removed.RemovalOutcome, removed, err)
 			}
@@ -506,7 +506,7 @@ func TestCustodyExportVerifiedAtTheDestinationTaintsTheSource(t *testing.T) {
 	if err != nil || completed.Status != "available" {
 		t.Fatalf("verified Custody export = %#v err=%v", completed, err)
 	}
-	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+	provenance, err := testReads(h.store).ListComputerStorageProvenance(context.Background(), computer.ComputerID)
 	if err != nil || !provenance.CustodyTainted {
 		t.Fatalf("verified export left the source untainted = %#v err=%v", provenance, err)
 	}
@@ -536,7 +536,7 @@ func TestCustodyExportedComputerRemovesReducedWhenTheRunLedgerRefusesRevocation(
 	if err != nil || completed.Status != "available" || completed.OperatorAttestedDeleted {
 		t.Fatalf("verified, unattested Custody export = %#v err=%v", completed, err)
 	}
-	current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	current, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -569,7 +569,7 @@ func TestCustodyExportedComputerRemovesReducedWhenTheRunLedgerRefusesRevocation(
 		return job.State == contract.JobRemovedVerified
 	})
 
-	removed, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	removed, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -581,7 +581,7 @@ func TestCustodyExportedComputerRemovesReducedWhenTheRunLedgerRefusesRevocation(
 		t.Fatalf("Job state = %q, want %q: the Job records proven managed cleanup and Slot release, not custody",
 			removed.CurrentJob.State, contract.JobRemovedVerified)
 	}
-	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), computer.ComputerID)
+	provenance, err := testReads(h.store).ListComputerStorageProvenance(context.Background(), computer.ComputerID)
 	if err != nil || !provenance.CustodyTainted || len(provenance.CustodyForks) != 1 ||
 		provenance.CustodyForks[0].ComputerID != computer.ComputerID ||
 		provenance.CustodyForks[0].RemovalOutcome != "removed_reduced" || len(provenance.CustodyExports) != 1 ||
@@ -692,7 +692,7 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 			}
 		})
 	}
-	observed, err := h.store.GetComputerCustodyImport(context.Background(), operation.ImportID)
+	observed, err := testReads(h.store).GetComputerCustodyImport(context.Background(), operation.ImportID)
 	if err != nil || observed.OperationRevision != operation.OperationRevision || observed.Status != "reserved" ||
 		observed.PreparationOutcome == nil || observed.PreparationOutcome.RecordedAt == nil ||
 		observed.PreparationOutcome.Code != ComputerStoragePreparationResumeDeferred ||
@@ -745,10 +745,10 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 		operation.DestinationComputerID).Scan(&provisionalFields); err != nil || provisionalFields != 0 {
 		t.Fatalf("terminal import retained provisional preparation fields: count=%d err=%v", provisionalFields, err)
 	}
-	if _, err := h.store.GetComputer(context.Background(), operation.DestinationComputerID); errorCode(err) != contract.ErrorNotFound {
+	if _, err := testReads(h.store).GetComputer(context.Background(), operation.DestinationComputerID); errorCode(err) != contract.ErrorNotFound {
 		t.Fatalf("failed import retained reserved identity: %v", err)
 	}
-	observed, err = h.store.GetComputerCustodyImport(context.Background(), operation.ImportID)
+	observed, err = testReads(h.store).GetComputerCustodyImport(context.Background(), operation.ImportID)
 	if err != nil || observed.Status != "failed" || observed.FailureCode != "manifest_invalid" ||
 		observed.PreparationOutcome != nil || observed.CompletedAt == nil {
 		t.Fatalf("failed import durable observation = %#v err=%v", observed, err)
@@ -765,7 +765,7 @@ func TestCustodyExportAndImportAbortWhenTheirDestinationNodeDies(t *testing.T) {
 	t.Run("export", func(t *testing.T) {
 		h, node, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
 		_, _ = beginCustodyExport(t, h, node, computer, backup, "abort-export")
-		current, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+		current, err := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -812,7 +812,7 @@ func TestCustodyExportAndImportAbortWhenTheirDestinationNodeDies(t *testing.T) {
 				BootSessionID: node.BootSessionID, IdempotencyKey: "abort-import-preparation", PreparationOutcome: &preparation}); err != nil {
 			t.Fatalf("record preparation before superseding import: %v", err)
 		}
-		reserved, err := h.store.GetComputer(t.Context(), operation.DestinationComputerID)
+		reserved, err := testReads(h.store).GetComputer(t.Context(), operation.DestinationComputerID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -888,7 +888,7 @@ func TestCustodyImportSurvivesExportingDatabaseLossAndUsesCurrentDestinationRoot
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	imported, err = destination.store.GetComputer(t.Context(), imported.ComputerID)
+	imported, err = testReads(destination.store).GetComputer(t.Context(), imported.ComputerID)
 	if err != nil || imported.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("portable import lost external-custody taint = %#v err=%v", imported, err)
 	}

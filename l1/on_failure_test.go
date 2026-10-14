@@ -95,7 +95,7 @@ func TestOnFailurePublicLifecycle(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			persisted, err := reopened.GetJob(t.Context(), job.JobID)
+			persisted, err := testReads(reopened).GetJob(t.Context(), job.JobID)
 			reopened.Close()
 			if err != nil || persisted.State != contract.JobStopped || len(policyStopJSON(t, persisted)) == 0 {
 				t.Fatalf("persisted stop = %+v %v", persisted, err)
@@ -437,7 +437,7 @@ func TestStoreAddsPolicyStopToExistingServiceJobs(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('service_jobs') WHERE name='policy_stop_json'`).Scan(&columns); err != nil || columns != 1 {
 		t.Fatalf("policy_stop_json columns = %d %v", columns, err)
 	}
-	reopened, err := store.GetJob(ctx, existing.JobID)
+	reopened, err := testReads(store).GetJob(ctx, existing.JobID)
 	if err != nil || reopened.State != contract.JobClaimed || reopened.DesiredState != contract.ServiceDesiredRunning || reopened.PolicyStop != nil {
 		t.Fatalf("existing service after migration = %+v %v", reopened, err)
 	}
@@ -493,7 +493,7 @@ func TestOnFailureLatchesWin(t *testing.T) {
 					t.Fatal(err)
 				}
 				_, _ = h.store.CompleteAttempt(t.Context(), "agent", job.JobID, claim.Lease.AttemptID, completion)
-				removed, err := h.store.GetJob(t.Context(), job.JobID)
+				removed, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 				if err != nil {
 					t.Fatal(err)
 				}

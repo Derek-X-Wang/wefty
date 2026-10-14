@@ -56,7 +56,7 @@ func assertBootTakeoverFencesAuthorityWritesButRetainsEvidence(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("evidence append after takeover status = %d body=%s", status, body)
 	}
-	afterLog, err := h.store.GetJob(t.Context(), job.JobID)
+	afterLog, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,14 +70,14 @@ func assertBootTakeoverFencesAuthorityWritesButRetainsEvidence(t *testing.T) {
 		Result: ProcessResult{ExitCode: &exitCode},
 	})
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeSessionReplaced)
-	afterCompletion, err := h.store.GetJob(t.Context(), job.JobID)
+	afterCompletion, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if afterCompletion.State != contract.JobClaimed {
 		t.Fatalf("superseded completion changed job to %q, want claimed", afterCompletion.State)
 	}
-	logs, err := h.store.GetJobLogs(t.Context(), job.JobID, "", 10)
+	logs, err := testReads(h.store).GetJobLogs(t.Context(), job.JobID, "", 10)
 	if err != nil {
 		t.Fatal(err)
 	}

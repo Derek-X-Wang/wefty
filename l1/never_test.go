@@ -217,7 +217,7 @@ func TestNeverLeaseExpiryMatrix(t *testing.T) {
 				if got.State != want || got.PolicyStop != nil || got.LeaseLossCount != 1 || got.RestartStreak != 2 || got.LifetimeRestartCount != 5 || len(got.LastFailure) != 0 || (got.NextRestartAt != nil) != (want == contract.JobQueued) {
 					t.Fatalf("expiry = %+v service=%+v", got, got.ServiceJob)
 				}
-				attempts, err := h.store.ListJobAttempts(t.Context(), job.JobID)
+				attempts, err := testReads(h.store).ListJobAttempts(t.Context(), job.JobID)
 				if err != nil || len(attempts) != 1 || attempts[0].State != contract.AttemptLost || attempts[0].Result != nil {
 					t.Fatalf("lost attempt = %+v %v", attempts, err)
 				}
@@ -430,7 +430,7 @@ func TestNeverStartAcknowledgementSurvivesReopen(t *testing.T) {
 			if _, err := reopened.Reconcile(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			got, err := reopened.GetJob(t.Context(), job.JobID)
+			got, err := testReads(reopened).GetJob(t.Context(), job.JobID)
 			if err != nil || got.State != contract.JobFailed || got.LeaseLossCount != 1 || got.NextRestartAt != nil {
 				t.Fatalf("reopened loss = %+v %v", got, err)
 			}
@@ -689,7 +689,7 @@ func TestNeverLegacyCompletionWithoutInitiator(t *testing.T) {
 			if err := upgraded.db.QueryRow(`SELECT termination_initiator FROM attempts WHERE attempt_id=?`, claim.Lease.AttemptID).Scan(&initiator); err != nil || initiator.Valid {
 				t.Fatalf("legacy initiator = %+v %v", initiator, err)
 			}
-			legacy, err := upgraded.GetJob(t.Context(), job.JobID)
+			legacy, err := testReads(upgraded).GetJob(t.Context(), job.JobID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -707,7 +707,7 @@ func TestNeverLegacyCompletionWithoutInitiator(t *testing.T) {
 
 // Test the status component through the same snapshot door as public reads.
 func projectServiceStatusProbe(ctx context.Context, s *Store, job Job) (projected Job, err error) {
-	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+	err = testReads(s).withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
 		projected, err = projectJobWithReads(ctx, reads, job, projectJobStatusPart)
 		return err
 	})

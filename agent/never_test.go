@@ -241,30 +241,57 @@ func TestNeverProcessStartRetryEndsWithLeaseWindow(t *testing.T) {
 	}
 }
 
+// startAcknowledgementSends counts the start acknowledgements the node agent
+// sends, as each request begins, and those that have not yet returned.
+type startAcknowledgementSends struct {
+	base     http.RoundTripper
+	sent     atomic.Int32
+	inFlight atomic.Int32
+}
+
+func (sends *startAcknowledgementSends) RoundTrip(request *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(request.URL.Path, "/started") {
+		sends.sent.Add(1)
+		sends.inFlight.Add(1)
+		defer sends.inFlight.Add(-1)
+	}
+	return sends.base.RoundTrip(request)
+}
+
 // While L1 has not answered the start acknowledgement, the real process
 // runner still enforces the payload's maximum runtime, and no acknowledgement
 // request outlives the attempt.
 func TestNeverProcessMaxRuntimeHoldsWhileStartUndecided(t *testing.T) {
-	var calls atomic.Int32
+	var delivered atomic.Int32
 	client, closeServer := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
+		delivered.Add(1)
 		<-r.Context().Done()
 	}), 500*time.Millisecond)
 	defer closeServer()
 	defer client.Close()
+	// The rule is about what the node agent sends. A request it wrote before
+	// the attempt ended can still reach L1's handler after, so handler entries
+	// are not a measure of it.
+	sends := &startAcknowledgementSends{base: client.httpClient.Transport}
+	client.httpClient.Transport = sends
 	lifecycle, _ := neverProcessLifecycle(t, client, systemClock{}, processrunner.New(processrunner.Config{}))
 	started := time.Now()
 	result, err := lifecycle.runWorkload(t.Context(), neverProcessClaim(t, 20*time.Second, &contract.JobLimits{MaxRuntimeSeconds: 1}, "/bin/sleep", "sleep", "30"))
 	elapsed := time.Since(started)
+	sent, inFlight := sends.sent.Load(), sends.inFlight.Load()
 	if !errors.Is(err, processrunner.ErrMaxRuntime) || elapsed > 5*time.Second {
 		t.Fatalf("payload under an undecided start = %+v %v after %s, want the 1s maximum runtime enforced", result, err, elapsed)
 	}
-	if calls.Load() == 0 {
+	if sent == 0 || delivered.Load() == 0 {
 		t.Fatal("start acknowledgement never reached L1")
 	}
-	settled := calls.Load()
+	// The attempt joins its acknowledgement before it ends. A request still in
+	// flight now, or one sent later, is a retry that outlived the attempt.
+	if inFlight != 0 {
+		t.Fatalf("%d start acknowledgement requests still in flight after their attempt ended", inFlight)
+	}
 	time.Sleep(100 * time.Millisecond)
-	if calls.Load() != settled {
+	if sends.sent.Load() != sent {
 		t.Fatal("start acknowledgement kept retrying after its attempt ended")
 	}
 }

@@ -34,7 +34,7 @@ func (h *integrationHarness) credentialRequest(client *http.Client, method, path
 		request.Header.Set("Content-Type", "application/json")
 	}
 	request.Header.Set("Authorization", "Bearer "+token)
-	response, err := client.Do(request)
+	response, err := doTestReadHTTP(client, request)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -349,7 +349,7 @@ func TestAttemptCredentialRevalidatesInsideTheWriteTransaction(t *testing.T) {
 
 			// Resolve the credential while it is still live: this is what the
 			// HTTP layer hands to CreateJobAs.
-			scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
+			scope, err := testReads(h.store).ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
 			if err != nil {
 				t.Fatalf("resolve live credential: %v", err)
 			}
@@ -362,7 +362,7 @@ func TestAttemptCredentialRevalidatesInsideTheWriteTransaction(t *testing.T) {
 					err, errorCode(err), contract.ErrorUnauthorized)
 			}
 			// The refusal must happen before any row is written.
-			page, err := h.store.ListChildJobs(t.Context(), claim.Job.JobID, "", DefaultJobPageLimit)
+			page, err := testReads(h.store).ListChildJobs(t.Context(), claim.Job.JobID, "", DefaultJobPageLimit)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -612,7 +612,7 @@ func TestAttemptCredentialSpawnDepthIsCapped(t *testing.T) {
 	// in-transaction revalidation is satisfied at every step; only the depth
 	// moves, which is the value the cap is about. Building a literal eight-deep
 	// ancestry through claims would test the scheduler, not the cap.
-	scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
+	scope, err := testReads(h.store).ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
 	if err != nil {
 		t.Fatalf("resolve live credential: %v", err)
 	}

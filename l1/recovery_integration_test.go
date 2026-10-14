@@ -366,7 +366,7 @@ func TestDrainStopsClaimsAndAllowsRunningAttemptToFinish(t *testing.T) {
 	}
 	status, _, body = h.do(agent, http.MethodPost, "/v1/agent/jobs/claim", ClaimRequest{NodeID: "node-1", BootSessionID: "boot-node-1", Class: contract.JobClassOneShot})
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorNodeDraining)
-	queued, err := h.store.GetJob(context.Background(), queuedJobID)
+	queued, err := testReads(h.store).GetJob(context.Background(), queuedJobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +553,7 @@ func claimJob(t *testing.T, h *integrationHarness, client *http.Client, nodeID s
 
 func assertJobAndAttemptState(t *testing.T, store *Store, jobID, attemptID string, jobState contract.JobState, attemptState contract.AttemptState) {
 	t.Helper()
-	job, err := store.GetJob(context.Background(), jobID)
+	job, err := testReads(store).GetJob(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
 	}

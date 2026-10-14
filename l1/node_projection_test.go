@@ -354,7 +354,7 @@ func TestNodeConditionPersistsAcrossRecoveryAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodes, err := store.ListNodes(t.Context())
+	nodes, err := testReads(store).ListNodes(t.Context())
 	if err != nil || len(nodes) != 1 {
 		t.Fatalf("reopened nodes=%#v err=%v", nodes, err)
 	}
@@ -413,7 +413,7 @@ func TestNodeAllowedActionsMatchPrincipalHTTP(t *testing.T) {
 					r.SetPathValue("node_id", "node")
 					r = r.WithContext(context.WithValue(r.Context(), identityContextKey{}, identity))
 					w := httptest.NewRecorder()
-					h.server.getNode(w, r)
+					w = recordTestRead(r, h.server.getNode)
 					if w.Code != http.StatusOK {
 						t.Fatalf("projection: %d %s", w.Code, w.Body.String())
 					}
@@ -514,7 +514,7 @@ func TestNodeReadsDoNotAcquireWriteLock(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			response, err := operator.Do(request)
+			response, err := doTestReadHTTP(operator, request)
 			if err != nil {
 				t.Fatalf("HTTP read waited for writer: %v", err)
 			}
