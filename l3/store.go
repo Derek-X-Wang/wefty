@@ -148,6 +148,8 @@ func (s *Store) initialize(ctx context.Context) error {
 	if !strings.EqualFold(mode, "wal") {
 		return fmt.Errorf("l3: SQLite did not enable WAL (mode %q)", mode)
 	}
+	// Data-format changes must alter DDL or a migration marker (for example
+	// user_version) so upgrade fingerprints refuse unsafe binary rollback.
 	const schema = runTableSchema + dispatchHoldSchema + `
 CREATE TABLE IF NOT EXISTS run_cancellations (
   run_id TEXT PRIMARY KEY REFERENCES runs(run_id),

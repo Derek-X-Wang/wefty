@@ -29,6 +29,12 @@ func TestMain(main *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	// Keep CLI subprocesses on an explicit temporary node configuration too,
+	// while leaving HOME (and therefore Go's default cache locations) alone.
+	if err := os.Setenv("WEFTY_NODE_CONFIG", filepath.Join(directory, "node.json")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	code := main.Run()
 	_ = os.RemoveAll(directory)
 	os.Exit(code)

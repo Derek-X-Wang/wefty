@@ -66,8 +66,10 @@ folders remain with a warning.
 Setup records the digest of each file it installs in `setup-files.json`.
 A rerun keeps previously recorded skill files beneath the canonical skill
 roots in the receipt, so old embedded files remain removable if unchanged.
-`wefty upgrade` (#896) must refresh `setup-files.json` when installed file
-bytes change.
+`wefty upgrade` refreshes `setup-files.json` when installed file bytes change.
+The [upgrade contract](plain-node-upgrade.md) defines staged activation,
+lease-renewal evidence, schema-gated rollback, the installed-version receipt
+and ownership-based source clone purge.
 Removal accepts only a fixed set of setup destinations and skill files beneath
 the two canonical skill roots. A regular file must match its recorded digest;
 a link, changed file or unknown skill file remains with a warning. The

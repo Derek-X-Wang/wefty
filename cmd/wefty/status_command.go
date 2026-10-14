@@ -120,7 +120,8 @@ const (
 
 // clusterStatus is the whole answer, and the shape `--json` publishes.
 type clusterStatus struct {
-	Ready bool `json:"ready"`
+	InstalledVersion string `json:"installed_version,omitempty"`
+	Ready            bool   `json:"ready"`
 	// Verdict is the one line a person reads: "ready", or "not ready: ..."
 	// naming what is missing rather than what was checked.
 	Verdict string `json:"verdict"`
@@ -176,6 +177,7 @@ func executeStatus(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	bounded, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	status := collectStatus(bounded, clients)
+	status.InstalledVersion = installedStackVersion(clients.nodeConfigPath)
 
 	if jsonOutput {
 		if err := writeJSON(stdout, status); err != nil {
@@ -527,6 +529,11 @@ func endpointOrNone(endpoint string) string {
 func writeStatus(writer io.Writer, status clusterStatus) error {
 	if _, err := fmt.Fprintf(writer, "%s\n", status.Verdict); err != nil {
 		return err
+	}
+	if status.InstalledVersion != "" {
+		if _, err := fmt.Fprintln(writer, "installed version:", status.InstalledVersion); err != nil {
+			return err
+		}
 	}
 	for _, limitation := range status.Limitations {
 		if _, err := fmt.Fprintf(writer, "note: %s\n", limitation.Detail); err != nil {
