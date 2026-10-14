@@ -13,6 +13,7 @@ import (
 // followers retain their separate policies; one-shot GET retries stay local.
 func TestCLIWaitDecisionCallSites(t *testing.T) {
 	allowed := map[string]bool{
+		"exec_command.go:submitExecRun:isRetryableL1Answer":                     true,
 		"wait_decision.go:decideWaitFailure:isRetryableL1Answer":                true,
 		"client.go:do:isRetryableL1Answer":                                      true,
 		"command.go:executeLogs:isRetryableL1Answer":                            true,

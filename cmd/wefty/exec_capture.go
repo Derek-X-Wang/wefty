@@ -1,0 +1,417 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+type execCapture struct {
+	Storage string `json:"snapshot_storage"`
+	Base    string `json:"base_commit"`
+	Tree    string `json:"snapshot_tree"`
+	Dirty   bool   `json:"dirty"`
+	Folder  string `json:"relative_folder"`
+}
+
+// All Git writes use an independent bare repository and index. In particular,
+// GIT_INDEX_FILE alone would still write objects into the user's repository.
+func execGit(ctx context.Context, dir, private string, input io.Reader, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"}, args...)...)
+	cmd.WaitDelay = 2 * time.Second
+	cmd.Dir = dir
+	for _, value := range os.Environ() {
+		name, _, _ := strings.Cut(value, "=")
+		if !strings.HasPrefix(name, "GIT_") {
+			cmd.Env = append(cmd.Env, value)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GIT_OPTIONAL_LOCKS=0")
+	if private != "" {
+		cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_DIR="+private, "GIT_INDEX_FILE="+filepath.Join(private, "capture.index"), "GIT_AUTHOR_NAME=wefty", "GIT_AUTHOR_EMAIL=exec@wefty.local", "GIT_COMMITTER_NAME=wefty", "GIT_COMMITTER_EMAIL=exec@wefty.local")
+	}
+	cmd.Stdin = input
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("git %s: %w", args[0], ctx.Err())
+		}
+		return "", fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
+	}
+	return string(out), nil
+}
+
+func captureExec(ctx context.Context, cwd string) (capture execCapture, err error) {
+	root, err := execGit(ctx, cwd, "", nil, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return capture, fmt.Errorf("not a git repo: %w", err)
+	}
+	root, err = filepath.EvalSymlinks(strings.TrimSuffix(root, "\n"))
+	if err != nil {
+		return capture, err
+	}
+	cwd, err = filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return capture, err
+	}
+	base, err := execGit(ctx, root, "", nil, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil {
+		return capture, fmt.Errorf("no commits yet (unborn HEAD): %w", err)
+	}
+	if err = validateExecRepo(ctx, root); err != nil {
+		return capture, err
+	}
+	status, err := execGit(ctx, root, "", nil, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
+	if err != nil {
+		return capture, err
+	}
+	folder, err := filepath.Rel(root, cwd)
+	if err != nil || folder == ".." || strings.HasPrefix(folder, ".."+string(filepath.Separator)) {
+		return capture, fmt.Errorf("current folder is outside the git checkout")
+	}
+	storageRoot, err := execStorageRoot()
+	if err != nil {
+		return capture, err
+	}
+	if err = prepareExecStorageRoot(storageRoot); err != nil {
+		return capture, err
+	}
+	storage, err := os.MkdirTemp(storageRoot, "wefty-exec-")
+	if err != nil {
+		return capture, err
+	}
+	capture = execCapture{Storage: storage, Base: strings.TrimSpace(base), Dirty: status != "", Folder: folder}
+	defer func() {
+		if err != nil {
+			err = errorsWithCleanup(err, storage)
+		}
+	}()
+	private := filepath.Join(storage, "snapshot.git")
+	if _, err = execGit(ctx, root, "", nil, "clone", "--template=", "--bare", "--no-local", "--", root, private); err != nil {
+		return capture, err
+	}
+	// Start with an empty private index. Hash working files without clean filters:
+	// this is the code present in the checkout, including executable bits/symlinks.
+	if _, err = execGit(ctx, root, private, nil, "read-tree", "--empty"); err != nil {
+		return capture, err
+	}
+	if err = captureExecFiles(ctx, root, "", private); err != nil {
+		return capture, err
+	}
+	tree, err := execGit(ctx, root, private, nil, "write-tree")
+	if err != nil {
+		return capture, err
+	}
+	capture.Tree = strings.TrimSpace(tree)
+	if folder != "." {
+		entry, e := execGit(ctx, root, private, nil, "--literal-pathspecs", "ls-tree", "-d", "-z", capture.Tree, "--", filepath.ToSlash(folder))
+		if e != nil {
+			return capture, e
+		}
+		if entry == "" {
+			ignoreCase, _ := execGit(ctx, root, "", nil, "config", "--bool", "core.ignorecase")
+			if strings.TrimSpace(ignoreCase) == "true" {
+				directories, e := execGit(ctx, root, private, nil, "ls-tree", "-r", "-d", "-z", "--name-only", capture.Tree)
+				if e != nil {
+					return capture, e
+				}
+				for _, path := range strings.Split(directories, "\x00") {
+					if strings.EqualFold(path, filepath.ToSlash(folder)) {
+						capture.Folder = filepath.FromSlash(path)
+						entry = path
+						break
+					}
+				}
+			}
+		}
+		if entry == "" {
+			ignored, _ := execGit(ctx, root, "", nil, "check-ignore", "--", folder)
+			if ignored != "" {
+				return capture, fmt.Errorf("ignored start folder is not in the snapshot: %s", folder)
+			}
+			return capture, fmt.Errorf("empty start folder (or one containing only ignored files) is not in the snapshot: %s", folder)
+		}
+	}
+	// Re-read the working image before submission. Status alone cannot detect
+	// a second edit to a file that was already dirty throughout the capture.
+	if _, err = execGit(ctx, root, private, nil, "read-tree", "--empty"); err != nil {
+		return capture, err
+	}
+	if err = captureExecFiles(ctx, root, "", private); err != nil {
+		return capture, err
+	}
+	confirm, err := execGit(ctx, root, private, nil, "write-tree")
+	if err != nil {
+		return capture, err
+	}
+	if strings.TrimSpace(confirm) != capture.Tree {
+		return capture, fmt.Errorf("checkout changed during capture; retry exec")
+	}
+
+	after, err := execGit(ctx, root, "", nil, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
+	if err != nil {
+		return capture, err
+	}
+	head, err := execGit(ctx, root, "", nil, "rev-parse", "HEAD")
+	if err != nil {
+		return capture, err
+	}
+	if after != status || strings.TrimSpace(head) != capture.Base {
+		return capture, fmt.Errorf("checkout changed during capture; retry exec")
+	}
+	commit, err := execGit(ctx, root, private, strings.NewReader("wefty exec capture\n"), "commit-tree", capture.Tree, "-p", capture.Base)
+	if err != nil {
+		return capture, err
+	}
+	if _, err = execGit(ctx, root, private, nil, "update-ref", "refs/heads/capture", strings.TrimSpace(commit)); err != nil {
+		return capture, err
+	}
+	_, err = execGit(ctx, root, private, nil, "symbolic-ref", "HEAD", "refs/heads/capture")
+	return capture, err
+}
+
+func validateExecRepo(ctx context.Context, root string) error {
+	if _, err := execGit(ctx, root, "", nil, "config", "--get", "extensions.partialClone"); err == nil {
+		return fmt.Errorf("partial clone is not supported by exec (extensions.partialClone is set)")
+	}
+	unmerged, err := execGit(ctx, root, "", nil, "ls-files", "-u")
+	if err != nil {
+		return err
+	}
+	if unmerged != "" {
+		return fmt.Errorf("unresolved merge is not supported by exec")
+	}
+	sparse, _ := execGit(ctx, root, "", nil, "config", "--bool", "core.sparseCheckout")
+	if strings.TrimSpace(sparse) == "true" {
+		return fmt.Errorf("sparse checkout is not supported by exec")
+	}
+	files, err := execGit(ctx, root, "", nil, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return err
+	}
+	attrs, err := execGit(ctx, root, "", strings.NewReader(files), "check-attr", "--stdin", "-z", "filter")
+	if err != nil {
+		return err
+	}
+	fields := strings.Split(attrs, "\x00")
+	for i := 2; i < len(fields); i += 3 {
+		if fields[i] == "lfs" {
+			return fmt.Errorf("Git LFS is not supported by exec")
+		}
+	}
+	// A configured LFS repository is unsupported even if its current files do
+	// not happen to use the filter (the attribute may change in this capture).
+	filters, _ := execGit(ctx, root, "", nil, "config", "--local", "--get-regexp", "^filter\\.lfs\\.")
+	if filters != "" {
+		return fmt.Errorf("Git LFS is not supported by exec")
+	}
+	modules, err := execGit(ctx, root, "", nil, "ls-files", "--stage", "-z")
+	if err != nil {
+		return err
+	}
+	for _, entry := range strings.Split(modules, "\x00") {
+		if !strings.HasPrefix(entry, "160000 ") {
+			continue
+		}
+		metadata, path, ok := strings.Cut(entry, "\t")
+		if !ok {
+			continue
+		}
+		sub := filepath.Join(root, path)
+		head, e := execGit(ctx, sub, "", nil, "rev-parse", "HEAD")
+		words := strings.Fields(metadata)
+		if e != nil || len(words) < 2 || strings.TrimSpace(head) != words[1] {
+			return fmt.Errorf("submodules with changes or missing checkout are not supported by exec: %s", path)
+		}
+		dirty, e := execGit(ctx, sub, "", nil, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
+		if e != nil || dirty != "" {
+			return fmt.Errorf("submodules with changes are not supported by exec: %s", path)
+		}
+		if e = validateExecRepo(ctx, sub); e != nil {
+			return e
+		}
+	}
+	return nil
+}
+
+type execFile struct{ full, path, mode, hash string }
+
+func listExecFiles(ctx context.Context, root, prefix string) ([]execFile, error) {
+	files, err := execGit(ctx, root, "", nil, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+	if err != nil {
+		return nil, err
+	}
+	var result []execFile
+	seen := map[string]bool{}
+	for _, path := range strings.Split(files, "\x00") {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		// A directory replaced by a symlink must never make a cached descendant
+		// read through that symlink. The replacement itself is captured instead.
+		safe := true
+		for parent := filepath.Dir(path); parent != "."; parent = filepath.Dir(parent) {
+			info, e := os.Lstat(filepath.Join(root, parent))
+			if e != nil || !info.IsDir() {
+				safe = false
+				break
+			}
+		}
+		if !safe {
+			continue
+		}
+		full := filepath.Join(root, path)
+		info, e := os.Lstat(full)
+		if os.IsNotExist(e) {
+			continue
+		}
+		if e != nil {
+			return nil, e
+		}
+		if info.IsDir() {
+			nested, e := listExecFiles(ctx, full, filepath.Join(prefix, path))
+			if e != nil {
+				return nil, e
+			}
+			result = append(result, nested...)
+			continue
+		}
+		mode := "100644"
+		if info.Mode()&os.ModeSymlink != 0 {
+			mode = "120000"
+		} else if info.Mode().IsRegular() {
+			if info.Mode()&0100 != 0 {
+				mode = "100755"
+			}
+		} else {
+			return nil, fmt.Errorf("unsupported file in checkout: %s", path)
+		}
+		result = append(result, execFile{full: full, path: filepath.ToSlash(filepath.Join(prefix, path)), mode: mode})
+	}
+	return result, nil
+}
+
+func captureExecFiles(ctx context.Context, root, prefix, private string) error {
+	files, err := listExecFiles(ctx, root, prefix)
+	if err != nil {
+		return err
+	}
+	var paths strings.Builder
+	for i := range files {
+		file := &files[i]
+		if file.mode == "120000" {
+			target, e := os.Readlink(file.full)
+			if e != nil {
+				return e
+			}
+			hash, e := execGit(ctx, root, private, strings.NewReader(target), "hash-object", "-w", "--stdin", "--no-filters")
+			if e != nil {
+				return e
+			}
+			file.hash = strings.TrimSpace(hash)
+		} else {
+			paths.WriteString(quoteExecGitPath(file.full))
+			paths.WriteByte('\n')
+		}
+	}
+	// Batch hashing and index writes keep a large checkout from spawning two
+	// processes per file. --no-filters preserves the working bytes exactly.
+	hashes, err := execGit(ctx, root, private, strings.NewReader(paths.String()), "hash-object", "-w", "--stdin-paths", "--no-filters")
+	if err != nil {
+		return err
+	}
+	values := strings.Fields(hashes)
+	next := 0
+	var index strings.Builder
+	for _, file := range files {
+		hash := file.hash
+		if hash == "" {
+			if next >= len(values) {
+				return fmt.Errorf("incomplete capture hashes")
+			}
+			hash = values[next]
+			next++
+		}
+		index.WriteString(file.mode + " " + hash + "\t" + file.path + "\x00")
+	}
+	_, err = execGit(ctx, root, private, strings.NewReader(index.String()), "update-index", "-z", "--index-info")
+	return err
+}
+
+func cleanupExecStorage(storage string) error {
+	return cleanupExecStorageContext(context.Background(), storage)
+}
+
+func cleanupExecStorageContext(caller context.Context, storage string) error {
+	ctx, cancel := context.WithTimeout(caller, 10*time.Second)
+	defer cancel()
+	if _, err := os.Stat(storage); os.IsNotExist(err) {
+		return nil
+	}
+	// Go module caches and other generated directories may be read-only.
+	if out, err := exec.CommandContext(ctx, "/bin/chmod", "-R", "u+w", storage).CombinedOutput(); err != nil {
+		if _, e := os.Stat(storage); os.IsNotExist(e) {
+			return nil
+		}
+		return fmt.Errorf("snapshot cleanup failed at %s: chmod: %w: %s", storage, err, out)
+	}
+	// Only paths allocated by captureExec are passed here. rm is cancellable;
+	// a failed cleanup is surfaced with its exact remaining path.
+	if out, err := exec.CommandContext(ctx, "/bin/rm", "-rf", "--", storage).CombinedOutput(); err != nil {
+		if _, e := os.Stat(storage); os.IsNotExist(e) {
+			return nil
+		}
+		return fmt.Errorf("snapshot cleanup failed at %s: %w: %s", storage, err, out)
+	}
+	return nil
+}
+func errorsWithCleanup(err error, storage string) error {
+	if e := cleanupExecStorage(storage); e != nil {
+		return fmt.Errorf("%w; %v", err, e)
+	}
+	return err
+}
+
+func execStorageRoot() (string, error) {
+	if root := os.Getenv("WEFTY_EXEC_STORAGE_ROOT"); root != "" {
+		return filepath.Abs(root)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	if root := os.Getenv("XDG_STATE_HOME"); filepath.IsAbs(root) {
+		return filepath.Join(root, "wefty", "exec"), nil
+	}
+	return filepath.Join(home, ".local", "state", "wefty", "exec"), nil
+}
+
+// Git's --stdin-paths parser uses C quoting, with octal escapes for bytes.
+// Go's Unicode and hex escapes (\\u202f, \\x01) are not accepted by Git.
+func quoteExecGitPath(path string) string {
+	var out strings.Builder
+	out.WriteByte('"')
+	for i := 0; i < len(path); i++ {
+		b := path[i]
+		switch {
+		case b == '"' || b == '\\':
+			out.WriteByte('\\')
+			out.WriteByte(b)
+		case b < 32 || b >= 127:
+			fmt.Fprintf(&out, "\\%03o", b)
+		default:
+			out.WriteByte(b)
+		}
+	}
+	out.WriteByte('"')
+	return out.String()
+}
