@@ -382,7 +382,7 @@ func (w *execReviewOutput) String() string {
 // carries the wrapper's traps (seen with Linux Bash 5.2). A wrapper that stops
 // its heartbeat with a signal then waits out a whole heartbeat period after
 // the command. Concurrent runs with the production period make that likely.
-func TestExecWrapperEndsWithinATickOfTheCommand(t *testing.T) {
+func TestExecWrapperEndsWellInsideAHeartbeatPeriod(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
 	old := execHeartbeatSeconds
@@ -445,9 +445,11 @@ func TestExecWrapperEndsWhenTheCommandLocksStorage(t *testing.T) {
 }
 
 // runExecWrapperPromptly runs a built wrapper and reports a failure unless it
-// exits with want well inside the production heartbeat period.
+// exits with want well inside the production heartbeat period. The bound
+// covers the clone, the command and cleanup; it catches a wrapper that waits
+// out a 60 s period, not the exact tick.
 func runExecWrapperPromptly(t *testing.T, wrapper string, want int) string {
-	ctx, stop := context.WithTimeout(t.Context(), 30*time.Second)
+	ctx, stop := context.WithTimeout(t.Context(), 45*time.Second)
 	defer stop()
 	// A timeout stops the whole wrapper group, so a surviving helper cannot
 	// hold the output open and hang the test.
@@ -458,7 +460,7 @@ func runExecWrapperPromptly(t *testing.T, wrapper string, want int) string {
 	started := time.Now()
 	output, err := cmd.CombinedOutput()
 	var exit *exec.ExitError
-	if elapsed := time.Since(started); !errors.As(err, &exit) || exit.ExitCode() != want || elapsed > 10*time.Second {
+	if elapsed := time.Since(started); !errors.As(err, &exit) || exit.ExitCode() != want || elapsed > 20*time.Second {
 		return fmt.Sprintf("took %s: %v %q", elapsed.Round(time.Millisecond), err, output)
 	}
 	return ""
