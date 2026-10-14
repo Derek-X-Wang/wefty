@@ -101,9 +101,8 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	// Only exec restores default signal handling after the first signal.
 	// A second Ctrl-C exits immediately; a later exec sweeps abandoned captures.
-	if reset, ok := ctx.Value(execSignalResetKey{}).(context.CancelFunc); ok {
-		go func() { <-ctx.Done(); reset() }()
-	}
+	ctx, stopSignalContext := execSignalContext(ctx)
+	defer stopSignalContext()
 	sweepExecStorage(ctx, clients, stderr)
 	node, err := resolveLocalNode(ctx, clients)
 	if err != nil {
@@ -284,6 +283,27 @@ func findExecAcceptance(ctx context.Context, clients *apiClients, storage string
 		}
 		cursor = page.NextCursor
 	}
+}
+
+// execSignalContext returns the context exec observes. When the CLI carries
+// a signal reset, exec sees cancellation only after default signal handling
+// is back. Every stop path prints feedback, and a reset that lagged behind it
+// would let the first signal's handler swallow a second Ctrl-C.
+func execSignalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	reset, ok := parent.Value(execSignalResetKey{}).(context.CancelFunc)
+	if !ok {
+		return parent, func() {}
+	}
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
+	go func() {
+		select {
+		case <-parent.Done():
+			reset()
+			cancel(context.Cause(parent))
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() { cancel(context.Canceled) }
 }
 
 func cancelExecRun(clients *apiClients, runID, storage string, cause error, stderr io.Writer) error {
