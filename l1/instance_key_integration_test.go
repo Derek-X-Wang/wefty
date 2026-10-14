@@ -211,7 +211,7 @@ func TestInstanceKeyUpgradeAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if old, err := upgraded.GetJob(t.Context(), legacy.JobID); err != nil || old.Spec.DispatchKey != "legacy-unkeyed" {
+	if old, err := testReads(upgraded).GetJob(t.Context(), legacy.JobID); err != nil || old.Spec.DispatchKey != "legacy-unkeyed" {
 		t.Fatalf("legacy row = %+v %v", old, err)
 	}
 	spec := keyedSpec(t, removalServiceSpec("upgraded-key", nil), "persisted")

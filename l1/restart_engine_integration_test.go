@@ -807,7 +807,7 @@ func claimRestartService(t *testing.T, h *integrationHarness, agent *http.Client
 
 func getRestartService(t *testing.T, h *integrationHarness, jobID string) Job {
 	t.Helper()
-	job, err := h.store.GetJob(context.Background(), jobID)
+	job, err := testReads(h.store).GetJob(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -894,7 +894,7 @@ func TestLateLogsMustNotStartSuccessorStability(t *testing.T) {
 	if _, err := store.Reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	queued, err := store.GetJob(t.Context(), job.JobID)
+	queued, err := testReads(store).GetJob(t.Context(), job.JobID)
 	if err != nil || queued.State != contract.JobQueued || queued.NextRestartAt == nil {
 		t.Fatalf("lease loss=%+v err=%v", queued, err)
 	}
@@ -907,12 +907,12 @@ func TestLateLogsMustNotStartSuccessorStability(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	logs, err := store.GetJobLogs(t.Context(), job.JobID, "", 10)
+	logs, err := testReads(store).GetJobLogs(t.Context(), job.JobID, "", 10)
 	if err != nil || len(logs.Events) != 1 || logs.Events[0].AttemptID != lost.Lease.AttemptID ||
 		string(logs.Events[0].Bytes) != "late lost-attempt output\n" {
 		t.Fatalf("late logs were not retained: logs=%+v err=%v", logs, err)
 	}
-	beforeStart, err := store.GetJob(t.Context(), job.JobID)
+	beforeStart, err := testReads(store).GetJob(t.Context(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -937,7 +937,7 @@ func TestLateLogsMustNotStartSuccessorStability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed, err := store.GetJob(t.Context(), job.JobID)
+	observed, err := testReads(store).GetJob(t.Context(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -956,7 +956,7 @@ func TestLateLogsMustNotStartSuccessorStability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed, err = store.GetJob(t.Context(), job.JobID)
+	observed, err = testReads(store).GetJob(t.Context(), job.JobID)
 	if err != nil || result.RestartStreakResets != 1 || observed.RestartStreak != 0 ||
 		observed.HealthySinceAt == nil || !observed.HealthySinceAt.Equal(startedAt) {
 		t.Fatalf("successor did not earn its own stability: result=%+v job=%+v err=%v", result, observed, err)
@@ -997,7 +997,7 @@ func TestReplacedRegistrationMustNotResetStreak(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			observed, err := store.GetJob(t.Context(), job.JobID)
+			observed, err := testReads(store).GetJob(t.Context(), job.JobID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1010,7 +1010,7 @@ func TestReplacedRegistrationMustNotResetStreak(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			observed, err = store.GetJob(t.Context(), job.JobID)
+			observed, err = testReads(store).GetJob(t.Context(), job.JobID)
 			if err != nil || observed.HealthySinceAt != nil || observed.RestartStreak != 1 {
 				t.Fatalf("fenced logs restored health: job=%+v err=%v", observed, err)
 			}
@@ -1047,7 +1047,7 @@ func TestStaleNodeEvidenceMustNotStartServiceStability(t *testing.T) {
 			if err != nil || result.StaleNodes != 1 {
 				t.Fatalf("stale reconciliation=%+v err=%v", result, err)
 			}
-			stale, err := store.GetJob(t.Context(), job.JobID)
+			stale, err := testReads(store).GetJob(t.Context(), job.JobID)
 			if err != nil || stale.HealthySinceAt != nil {
 				t.Fatalf("stale service health=%v err=%v", stale.HealthySinceAt, err)
 			}
@@ -1067,7 +1067,7 @@ func TestStaleNodeEvidenceMustNotStartServiceStability(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			stale, err = store.GetJob(t.Context(), job.JobID)
+			stale, err = testReads(store).GetJob(t.Context(), job.JobID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1088,7 +1088,7 @@ func TestStaleNodeEvidenceMustNotStartServiceStability(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			observed, err := store.GetJob(t.Context(), job.JobID)
+			observed, err := testReads(store).GetJob(t.Context(), job.JobID)
 			if err != nil || result.RestartStreakResets != 0 || observed.RestartStreak != 1 ||
 				observed.HealthySinceAt == nil || !observed.HealthySinceAt.Equal(aliveAt) {
 				t.Fatalf("suppressed stale time counted toward stability: result=%+v job=%+v recovered=%v err=%v", result, observed, aliveAt, err)
@@ -1100,7 +1100,7 @@ func TestStaleNodeEvidenceMustNotStartServiceStability(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			observed, err = store.GetJob(t.Context(), job.JobID)
+			observed, err = testReads(store).GetJob(t.Context(), job.JobID)
 			if err != nil || result.RestartStreakResets != 1 || observed.RestartStreak != 0 {
 				t.Fatalf("recovered service did not earn stability: result=%+v job=%+v err=%v", result, observed, err)
 			}

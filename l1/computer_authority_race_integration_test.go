@@ -144,7 +144,7 @@ func TestSubmissionChangeRevokesOnlyAfterItCommits(t *testing.T) {
 	var revocations []sent
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 		if request.ComputerID == c.ComputerID {
-			current, err := h.store.GetComputer(ctx, c.ComputerID)
+			current, err := testReads(h.store).GetComputer(ctx, c.ComputerID)
 			if err != nil {
 				t.Error(err)
 			}
@@ -161,7 +161,7 @@ func TestSubmissionChangeRevokesOnlyAfterItCommits(t *testing.T) {
 	status, _, body = h.do(client, http.MethodPut, "/v1/computers/"+c.ComputerID+"/submission",
 		ComputerSubmissionRequest{PolicyRevision: policy.Revision, SubmitIntentRevision: 0, SubmitEnabled: boolPointer(true),
 			IdempotencyKey: "c-enable"})
-	after, err := h.store.GetComputer(ctx, c.ComputerID)
+	after, err := testReads(h.store).GetComputer(ctx, c.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestSubmissionChangeRevokesOnlyAfterItCommits(t *testing.T) {
 	if status != http.StatusConflict || json.Unmarshal(body, &refusal) != nil || refusal.Error.Code != contract.ErrorStalePolicyRevision {
 		t.Fatalf("C's stale change status=%d body=%s", status, body)
 	}
-	unchanged, err := h.store.GetComputer(ctx, c.ComputerID)
+	unchanged, err := testReads(h.store).GetComputer(ctx, c.ComputerID)
 	if err != nil || unchanged.SubmitIntentRevision != 1 || !unchanged.SubmitEnabled {
 		t.Fatalf("a change that lost its CAS moved C's authority = %#v err=%v", unchanged, err)
 	}
@@ -244,7 +244,7 @@ func TestSubmissionChangeRevokesTheOldPassAndSparesTheReMint(t *testing.T) {
 	h.server.computerTokenRevoker = recordingComputerTokenRevoker{revoke: func(_ context.Context, request ComputerTokenRevocation) (contract.ComputerTokenRevocationReceipt, error) {
 		requests = append(requests, request)
 		// The agent saw the committed change and re-minted first.
-		current, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+		current, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 		if err != nil {
 			return contract.ComputerTokenRevocationReceipt{}, err
 		}
@@ -298,11 +298,11 @@ func TestSubmissionChangeWithTheRunLedgerDownAfterCommitStillAnswersApplied(t *t
 	}
 	ctx := context.Background()
 	// Until the node installs the new policy, L1 proves no scope at all.
-	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("scope proof before the new policy is installed = %v, want forbidden", err)
 	}
-	nodes, err := h.store.ListNodes(ctx)
+	nodes, err := testReads(h.store).ListNodes(ctx)
 	if err != nil || len(nodes) != 1 {
 		t.Fatalf("nodes = %#v err=%v", nodes, err)
 	}
@@ -317,7 +317,7 @@ func TestSubmissionChangeWithTheRunLedgerDownAfterCommitStillAnswersApplied(t *t
 	}
 	// Then it proves only the committed revision and limit, which the old
 	// pass's grant does not carry, so L3 refuses it.
-	proof, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "fabric-computer-node", "")
+	proof, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "fabric-computer-node", "")
 	if err != nil || proof.SubmitIntentRevision != computer.SubmitIntentRevision+1 || proof.SubmitMaxInflight != 7 {
 		t.Fatalf("scope proof after the change = (%#v, %v)", proof, err)
 	}

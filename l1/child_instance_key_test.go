@@ -62,7 +62,7 @@ func TestChildInstanceKeyRevalidatesBeforeConflict(t *testing.T) {
 	h, client, agent, node := credentialHarness(t)
 	h.submit(client, "key-revalidation-parent", []string{"linux"})
 	claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
-	scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
+	scope, err := testReads(h.store).ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestChildInstanceKeyRevalidatesBeforeConflict(t *testing.T) {
 	if errorCode(err) != contract.ErrorUnauthorized {
 		t.Fatalf("stale scope=%v, want unauthorized", err)
 	}
-	page, err := h.store.ListChildJobs(t.Context(), scope.JobID, "", DefaultJobPageLimit)
+	page, err := testReads(h.store).ListChildJobs(t.Context(), scope.JobID, "", DefaultJobPageLimit)
 	if err != nil || len(page.Jobs) != 1 || page.Jobs[0].JobID != holder.JobID {
 		t.Fatalf("stale credential created a child: %+v %v", page, err)
 	}
@@ -87,7 +87,7 @@ func TestChildInstanceKeyExpiryWhileWaitingForCreationTransaction(t *testing.T) 
 	h, client, agent, node := credentialHarness(t)
 	h.submit(client, "key-wait-parent", []string{"linux"})
 	claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
-	scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
+	scope, err := testReads(h.store).ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestChildInstanceKeyConflictDisclosureUsesReplayScope(t *testing.T) {
 			h, client, agent, node := credentialHarness(t)
 			h.submit(client, "key-disclosure-parent", []string{"linux"})
 			claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
-			scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
+			scope, err := testReads(h.store).ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
 			if err != nil {
 				t.Fatal(err)
 			}

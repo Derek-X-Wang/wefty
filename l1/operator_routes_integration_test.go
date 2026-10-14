@@ -133,7 +133,7 @@ func assertServiceOperatorRouteOwnershipListAndProjection(t *testing.T) {
 	}
 	status, _, body = h.do(client, http.MethodPost, "/v1/jobs/"+serviceID+"/remove", nil)
 	assertAPIError(t, status, body, http.StatusBadRequest, contract.ErrorInvalidRequest)
-	if _, err := h.store.GetJob(context.Background(), serviceID); err != nil {
+	if _, err := testReads(h.store).GetJob(context.Background(), serviceID); err != nil {
 		t.Fatalf("unscoped removal mutated the service: %v", err)
 	}
 }

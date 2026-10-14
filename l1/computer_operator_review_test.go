@@ -187,7 +187,7 @@ func TestComputerProjectionDispatchConflictPrecedesFailedJob(t *testing.T) {
 	if _, err := h.store.InstallComputerProjection(t.Context(), computer.ComputerID, request); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("fresh key must still refuse failed Computer: %v", err)
 	}
-	current, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+	current, err := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil || current.IntentRevision != computer.IntentRevision || current.CurrentJobID != computer.CurrentJobID || current.ReconfigurationPhase != ComputerReconfigurationStable {
 		t.Fatalf("refusal changed Computer authority: %#v err=%v", current, err)
 	}
@@ -266,7 +266,7 @@ func TestComputerBackupChoicesContinuePastCorruptRecord(t *testing.T) {
 			}
 			t.Run("fresh-http-prune", func(t *testing.T) {
 				before := backupAbsenceRows(t, h.store, computer.ComputerID, corruptID, "copy-"+corruptID)
-				beforeComputer, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+				beforeComputer, err := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -284,7 +284,7 @@ func TestComputerBackupChoicesContinuePastCorruptRecord(t *testing.T) {
 				if after := backupAbsenceRows(t, h.store, computer.ComputerID, corruptID, "copy-"+corruptID); after != before {
 					t.Fatalf("refused prune changed state: before=%s after=%s", before, after)
 				}
-				current, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+				current, err := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 				if err != nil || !reflect.DeepEqual(current, beforeComputer) {
 					t.Fatalf("refused prune changed Computer: %#v err=%v", current, err)
 				}

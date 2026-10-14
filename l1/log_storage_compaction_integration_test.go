@@ -44,7 +44,7 @@ func TestJobLogJSONLTableIsRetired(t *testing.T) {
 	}
 	insertDetachedLogRows(t, store, job.JobID, "jsonl-attempt", contract.AttemptRunning, "a", "b")
 	assertNoJobLogJSONLTable(t, store)
-	want, err := store.RawJobLogJSONL(context.Background(), job.JobID)
+	want, err := testReads(store).RawJobLogJSONL(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,10 +72,10 @@ func TestJobLogJSONLTableIsRetired(t *testing.T) {
 	}
 	defer store.Close()
 	assertNoJobLogJSONLTable(t, store)
-	if _, err := store.GetJob(context.Background(), job.JobID); err != nil {
+	if _, err := testReads(store).GetJob(context.Background(), job.JobID); err != nil {
 		t.Fatalf("job after retiring job_log_jsonl: %v", err)
 	}
-	got, err := store.RawJobLogJSONL(context.Background(), job.JobID)
+	got, err := testReads(store).RawJobLogJSONL(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestLogEventDocumentsStoreThePayloadOnceAndReadBackUnchanged(t *testing.T) 
 		if status != http.StatusOK {
 			t.Fatalf("%s: get logs status = %d body=%s", label, status, body)
 		}
-		jsonl, err := h.store.RawJobLogJSONL(context.Background(), job.JobID)
+		jsonl, err := testReads(h.store).RawJobLogJSONL(context.Background(), job.JobID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -341,11 +341,11 @@ func TestLogEventDocumentMigrationIsBoundedAndResumable(t *testing.T) {
 		t.Fatal(err)
 	}
 	beforePages := usedPages(t, store)
-	wantJSONL, err := store.RawJobLogJSONL(context.Background(), job.JobID)
+	wantJSONL, err := testReads(store).RawJobLogJSONL(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPage, err := store.GetJobLogs(context.Background(), job.JobID, "", MaxLogPageLimit)
+	wantPage, err := testReads(store).GetJobLogs(context.Background(), job.JobID, "", MaxLogPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,14 +414,14 @@ func TestLogEventDocumentMigrationIsBoundedAndResumable(t *testing.T) {
 		t.Fatalf("pass after migration = %+v, %v", again, err)
 	}
 
-	gotJSONL, err := store.RawJobLogJSONL(context.Background(), job.JobID)
+	gotJSONL, err := testReads(store).RawJobLogJSONL(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(gotJSONL, wantJSONL) {
 		t.Fatal("JSONL export changed across the migration")
 	}
-	gotPage, err := store.GetJobLogs(context.Background(), job.JobID, "", MaxLogPageLimit)
+	gotPage, err := testReads(store).GetJobLogs(context.Background(), job.JobID, "", MaxLogPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}

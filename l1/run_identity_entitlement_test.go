@@ -356,7 +356,7 @@ func TestAComputerProjectionMayNameNoRun(t *testing.T) {
 	if errorCode(err) != contract.ErrorRunIdentityNotEntitled {
 		t.Fatalf("labelled projection error = %v, want %s", err, contract.ErrorRunIdentityNotEntitled)
 	}
-	after, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+	after, err := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil || after.IntentRevision != computer.IntentRevision || after.CurrentJobID != computer.CurrentJobID {
 		t.Fatalf("a refused projection changed the Computer: %#v err=%v", after, err)
 	}

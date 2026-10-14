@@ -175,7 +175,7 @@ func heartbeatComputerNode(t *testing.T, h *integrationHarness, node Node) time.
 
 func mustGetComputer(t *testing.T, h *integrationHarness, computerID string) Computer {
 	t.Helper()
-	computer, err := h.store.GetComputer(t.Context(), computerID)
+	computer, err := testReads(h.store).GetComputer(t.Context(), computerID)
 	if err != nil {
 		t.Fatal(err)
 	}

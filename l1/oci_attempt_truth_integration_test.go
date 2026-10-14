@@ -171,7 +171,7 @@ func TestOCIAttemptRequiresStartedForRunning(t *testing.T) {
 		t.Fatalf("Started replay: %v", err)
 	}
 	assertOCIFixtureState(t, h, job.JobID, contract.JobRunning, contract.AttemptRunning)
-	attempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	attempts, err := testReads(h.store).ListJobAttempts(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +222,7 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, first.Lease.AttemptID, testImageObservation(first.Lease.FencingToken)); err != nil {
 		t.Fatal(err)
 	}
-	firstAttempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	firstAttempts, err := testReads(h.store).ListJobAttempts(context.Background(), job.JobID)
 	if err != nil || len(firstAttempts) != 1 || firstAttempts[0].Image == nil {
 		t.Fatalf("first resolution evidence = %#v err %v", firstAttempts, err)
 	}
@@ -263,7 +263,7 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 	if second.Job.Spec.Execution.OCI.Image.Digest == nil || *second.Job.Spec.Execution.OCI.Image.Digest != testTopDigest {
 		t.Fatalf("retry claim did not carry pinned top-level digest: %#v", second.Job.Spec.Execution.OCI.Image)
 	}
-	secondAttempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	secondAttempts, err := testReads(h.store).ListJobAttempts(context.Background(), job.JobID)
 	if err != nil || len(secondAttempts) != 2 || secondAttempts[1].Image != nil {
 		t.Fatalf("fresh retry should await per-attempt image evidence = %#v err %v", secondAttempts, err)
 	}
@@ -278,7 +278,7 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, second.Lease.AttemptID, retryObservation); err != nil {
 		t.Fatalf("cross-architecture retry with frozen top-level identity: %v", err)
 	}
-	secondAttempts, err = h.store.ListJobAttempts(context.Background(), job.JobID)
+	secondAttempts, err = testReads(h.store).ListJobAttempts(context.Background(), job.JobID)
 	if err != nil || secondAttempts[1].Image == nil || secondAttempts[1].Image.TopLevelDigest != testTopDigest ||
 		secondAttempts[1].Image.Platform.Architecture != "amd64" || !secondAttempts[1].Image.ResolvedAt.Equal(resolvedAt) {
 		t.Fatalf("cross-architecture attempt evidence = %#v err %v", secondAttempts, err)
@@ -302,7 +302,7 @@ func TestOCIPrestartRuntimeLossRequeuesOnceAndExhaustsBudget(t *testing.T) {
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, first.Lease.AttemptID, changedReplay); errorCode(err) != contract.ErrorIdempotencyConflict {
 		t.Fatalf("changed image replay after requeue = %v, want idempotency conflict", err)
 	}
-	attempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	attempts, err := testReads(h.store).ListJobAttempts(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +363,7 @@ func TestOCIPrestartBudgetExpiryTerminalizesWithoutDeadClaim(t *testing.T) {
 	if deadClaim, err := h.store.ClaimJob(context.Background(), "agent", "node-1", "boot-node-1", contract.JobClassOneShot); err != nil || deadClaim != nil {
 		t.Fatalf("claim after persisted budget deadline = %#v err %v", deadClaim, err)
 	}
-	failed, err := h.store.GetJob(context.Background(), job.JobID)
+	failed, err := testReads(h.store).GetJob(context.Background(), job.JobID)
 	if err != nil || failed.State != contract.JobFailed || failed.CurrentAttemptID != "" ||
 		failed.FailureReason != "pre-start infrastructure budget expired while awaiting scheduling" {
 		t.Fatalf("expired scheduling-gap job = %#v err %v", failed, err)
@@ -415,7 +415,7 @@ func TestOCIServiceRestartPreservesDigestAndResolutionTime(t *testing.T) {
 	if _, err := h.store.StartAttempt(context.Background(), "agent", job.JobID, first.Lease.AttemptID, StartedRequest{FencingToken: first.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	firstAttempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	firstAttempts, err := testReads(h.store).ListJobAttempts(context.Background(), job.JobID)
 	if err != nil || firstAttempts[0].Image == nil {
 		t.Fatalf("first service image = %#v err %v", firstAttempts, err)
 	}
@@ -435,7 +435,7 @@ func TestOCIServiceRestartPreservesDigestAndResolutionTime(t *testing.T) {
 	if _, err := h.store.ObserveAttemptImage(context.Background(), "agent", job.JobID, second.Lease.AttemptID, secondObservation); err != nil {
 		t.Fatal(err)
 	}
-	attempts, err := h.store.ListJobAttempts(context.Background(), job.JobID)
+	attempts, err := testReads(h.store).ListJobAttempts(context.Background(), job.JobID)
 	if err != nil || len(attempts) != 2 || attempts[1].Image == nil || attempts[1].Image.TopLevelDigest != testTopDigest || !attempts[1].Image.ResolvedAt.Equal(resolvedAt) {
 		t.Fatalf("service restart image evidence = %#v err %v", attempts, err)
 	}
@@ -531,11 +531,11 @@ func testImageObservation(fence string) ImageObservationRequest {
 
 func assertOCIFixtureState(t *testing.T, h *integrationHarness, jobID string, jobState contract.JobState, attemptState contract.AttemptState) {
 	t.Helper()
-	job, err := h.store.GetJob(context.Background(), jobID)
+	job, err := testReads(h.store).GetJob(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempts, err := h.store.ListJobAttempts(context.Background(), jobID)
+	attempts, err := testReads(h.store).ListJobAttempts(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
 	}

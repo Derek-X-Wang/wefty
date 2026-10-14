@@ -264,7 +264,7 @@ func TestComputerSubmissionAuthorityChangeInvalidatesPublishedReadiness(t *testi
 		typed.Details["expected_revision"] != current || typed.Details["observed_revision"] != stale {
 		t.Fatalf("stale-revision publication = %v, want stale_policy_revision expected=%d observed=%d", err, current, stale)
 	}
-	if after, err := h.store.GetComputer(ctx, computer.ComputerID); err != nil || after.DisplayEndpoint != nil {
+	if after, err := testReads(h.store).GetComputer(ctx, computer.ComputerID); err != nil || after.DisplayEndpoint != nil {
 		t.Fatalf("stale-revision publication restored the display: %v err=%v", after.DisplayEndpoint, err)
 	}
 	for name, err := range map[string]error{
@@ -278,7 +278,7 @@ func TestComputerSubmissionAuthorityChangeInvalidatesPublishedReadiness(t *testi
 	if err := publish(&current, true, &endpoint); err != nil {
 		t.Fatalf("current-revision publication: %v", err)
 	}
-	if after, err := h.store.GetComputer(ctx, computer.ComputerID); err != nil || after.DisplayEndpoint == nil || *after.DisplayEndpoint != endpoint {
+	if after, err := testReads(h.store).GetComputer(ctx, computer.ComputerID); err != nil || after.DisplayEndpoint == nil || *after.DisplayEndpoint != endpoint {
 		t.Fatalf("current-revision publication display = %v err=%v", after.DisplayEndpoint, err)
 	}
 	// An agent that sends no revision keeps the unfenced behaviour.
@@ -325,7 +325,7 @@ func TestComputerTokenScopeProofRequiresLiveAttemptAndInstalledPolicy(t *testing
 	if err != nil || claim == nil {
 		t.Fatalf("claim = (%#v, %v)", claim, err)
 	}
-	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("scope proof before installed policy = %v", err)
 	}
@@ -337,23 +337,23 @@ func TestComputerTokenScopeProofRequiresLiveAttemptAndInstalledPolicy(t *testing
 	if err := h.store.AcknowledgeComputerPolicyInstallation(ctx, "fabric-computer-node", acknowledgementFor(*snapshot)); err != nil {
 		t.Fatal(err)
 	}
-	proof, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+	proof, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"fabric-computer-node", "")
 	if err != nil || proof.ComputerStorageGeneration != computer.StorageGeneration ||
 		proof.SubmitIntentRevision != computer.SubmitIntentRevision || proof.SubmitMaxInflight != 20 ||
 		proof.HostBootSessionID != node.BootSessionID || proof.HostStableNodeID != node.NodeID {
 		t.Fatalf("scope proof = (%#v, %v)", proof, err)
 	}
-	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"foreign-node", ""); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("foreign Node scope proof = %v", err)
 	}
-	if stableProof, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+	if stableProof, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"", node.NodeID); err != nil || stableProof.HostNodeID != "fabric-computer-node" {
 		t.Fatalf("stable Node revalidation proof = (%#v, %v)", stableProof, err)
 	}
 	h.clock.Advance(2 * time.Second)
-	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"", node.NodeID); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("expired lease scope proof = %v", err)
 	}
@@ -407,11 +407,11 @@ func liveComputerTokenScopeWithReconcileInterval(t *testing.T, name string, inte
 	if err := h.store.AcknowledgeComputerPolicyInstallation(ctx, "fabric-computer-node", acknowledgementFor(*snapshot)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"fabric-computer-node", ""); err != nil {
 		t.Fatalf("scope proof for a live Computer = %v", err)
 	}
-	computer, err = h.store.GetComputer(ctx, computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(ctx, computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +451,7 @@ func TestComputerTokenScopeProofRefusesAStoppingComputer(t *testing.T) {
 					failure, computer.CurrentJobID); err != nil {
 					t.Fatal(err)
 				}
-				latched, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+				latched, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -480,7 +480,7 @@ func TestComputerTokenScopeProofRefusesAStoppingComputer(t *testing.T) {
 				Scan(&attemptState); err != nil || (attemptState != "claimed" && attemptState != "running") {
 				t.Fatalf("old attempt state = %q err=%v, want it still live while it drains", attemptState, err)
 			}
-			if proof, err := h.store.ProveComputerTokenScope(context.Background(), computer.ComputerID,
+			if proof, err := testReads(h.store).ProveComputerTokenScope(context.Background(), computer.ComputerID,
 				claim.Lease.AttemptID, "fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 				t.Fatalf("scope proof after %s = (%#v, %v), want forbidden", verb.name, proof, err)
 			}
@@ -498,11 +498,11 @@ func TestComputerTokenScopeProofRefusesAnAttemptOnADeadHost(t *testing.T) {
 	h, computer, claim := liveComputerTokenScopeWithReconcileInterval(t, "dead-host", time.Hour)
 	ctx := context.Background()
 	prove := func() error {
-		_, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "fabric-computer-node", "")
+		_, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "fabric-computer-node", "")
 		if err != nil {
 			return err
 		}
-		_, err = h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "", "computer-node")
+		_, err = testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "", "computer-node")
 		return err
 	}
 	// The workload keeps renewing its lease while the Node's heartbeats stop,

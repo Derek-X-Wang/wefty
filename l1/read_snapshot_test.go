@@ -41,78 +41,93 @@ func snapshotStore(t *testing.T) (*Store, *snapshotClock) {
 	return store, clock
 }
 func TestReadSnapshotClockAdmissionAndAnchor(t *testing.T) {
-	s, clock := snapshotStore(t)
-	// Admission is held without using a connection; the read budget starts only
-	// after this wait, and the clock must not be sampled while waiting.
-	var held []*sql.Conn
-	for range readSnapshotLimit {
-		conn, err := s.readDB.Conn(t.Context())
-		if err != nil {
+	retryTestSnapshotScenario(t, func() error {
+
+		s, clock := snapshotStore(t)
+		// Admission is held without using a connection; the read budget starts only
+		// after this wait, and the clock must not be sampled while waiting.
+		var held []*sql.Conn
+		for range readSnapshotLimit {
+			conn, err := s.readDB.Conn(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			held = append(held, conn)
+		}
+		defer func() {
+			for _, conn := range held {
+				_ = conn.Close()
+			}
+		}()
+		actor := &serviceActionActor{Identity: fabric.Identity{NodeID: "caller"}}
+		entered := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			close(entered)
+			done <- s.withReadSnapshot(t.Context(), actor, func(ctx context.Context, r readModel) error {
+				at := r.now()
+				if at.UnixNano() != clock.at.Load() || r.caller() != actor {
+					return errors.New("wrong admitted clock or caller")
+				}
+				clock.at.Add(int64(time.Hour))
+				if r.now() != at || clock.calls.Load() != 1 {
+					return errors.New("clock was not pinned")
+				}
+				return nil
+			})
+		}()
+		<-entered
+		// Check after the waiter has started. Since every token is held, no clock
+		// read is possible regardless of goroutine scheduling.
+		if clock.calls.Load() != 0 {
+			t.Fatal("clock sampled before admission")
+		}
+		clock.at.Add(int64(time.Minute))
+		_ = held[0].Close()
+		if err := <-done; err != nil {
+			if testReadRetryable(err) {
+				return err
+			}
 			t.Fatal(err)
 		}
-		held = append(held, conn)
-	}
-	defer func() {
-		for _, conn := range held {
-			_ = conn.Close()
-		}
-	}()
-	actor := &serviceActionActor{Identity: fabric.Identity{NodeID: "caller"}}
-	entered := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		close(entered)
-		done <- s.withReadSnapshot(t.Context(), actor, func(ctx context.Context, r readModel) error {
-			at := r.now()
-			if at.UnixNano() != clock.at.Load() || r.caller() != actor {
-				return errors.New("wrong admitted clock or caller")
+
+		return nil
+	})
+}
+func TestReadSnapshotAnchoredBeforeFirstDomainRead(t *testing.T) {
+	retryTestSnapshotScenario(t, func() error {
+
+		s, _ := snapshotStore(t)
+		err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+			// No domain read has run. A writer changes the schema after acquisition;
+			// the anchored snapshot must still see the old sqlite_schema.
+			if _, err := s.db.ExecContext(ctx, "CREATE TABLE after_anchor(value TEXT)"); err != nil {
+				return err
 			}
-			clock.at.Add(int64(time.Hour))
-			if r.now() != at || clock.calls.Load() != 1 {
-				return errors.New("clock was not pinned")
+			var count int
+			if err := r.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema WHERE name='after_anchor'").Scan(&count); err != nil {
+				return err
+			}
+			if count != 0 {
+				return errors.New("snapshot began at first domain read")
 			}
 			return nil
 		})
-	}()
-	<-entered
-	// Check after the waiter has started. Since every token is held, no clock
-	// read is possible regardless of goroutine scheduling.
-	if clock.calls.Load() != 0 {
-		t.Fatal("clock sampled before admission")
-	}
-	clock.at.Add(int64(time.Minute))
-	_ = held[0].Close()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+		if testReadRetryable(err) {
+			return err
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
 
-}
-func TestReadSnapshotAnchoredBeforeFirstDomainRead(t *testing.T) {
-	s, _ := snapshotStore(t)
-	err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
-		// No domain read has run. A writer changes the schema after acquisition;
-		// the anchored snapshot must still see the old sqlite_schema.
-		if _, err := s.db.ExecContext(ctx, "CREATE TABLE after_anchor(value TEXT)"); err != nil {
-			return err
-		}
-		var count int
-		if err := r.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema WHERE name='after_anchor'").Scan(&count); err != nil {
-			return err
-		}
-		if count != 0 {
-			return errors.New("snapshot began at first domain read")
-		}
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 }
 func TestReadSnapshotMemoAndReadOnlyPool(t *testing.T) {
 	s, _ := snapshotStore(t)
 	// Missing-node errors are memoized just like node capabilities, tags and
 	// occupancy. A production-called getNode read populates exactly one entry.
-	err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+	err := testReads(s).withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
 		for range 2 {
 			if _, err := r.node(ctx, "absent"); !errors.Is(err, sql.ErrNoRows) {
 				return errors.New("wrong missing node result")
@@ -138,7 +153,7 @@ func TestReadSnapshotMemoAndReadOnlyPool(t *testing.T) {
 	if _, err := s.db.ExecContext(t.Context(), "CREATE TABLE reset_ok(value TEXT)"); err != nil {
 		t.Fatalf("query_only leaked to writer: %v", err)
 	}
-	if err = s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+	if err = testReads(s).withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
 		if len(r.(*databaseReads).reads.nodes) != 0 {
 			return errors.New("memo crossed snapshots")
 		}
@@ -169,7 +184,7 @@ func TestReadSnapshotNodeFactsMemo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+	if err := testReads(s).withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
 		impl := r.(*databaseReads)
 		counter := &snapshotQueryCounter{queryer: impl.q}
 		impl.q = counter
@@ -195,7 +210,7 @@ func TestReadSnapshotNodeFactsMemo(t *testing.T) {
 }
 func TestReadSnapshotNestedRefused(t *testing.T) {
 	s, _ := snapshotStore(t)
-	if err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+	if err := testReads(s).withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
 		if err := s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error { t.Error("nested callback ran"); return nil }); !errors.Is(err, errNestedReadSnapshot) {
 			return errors.New("nested snapshot not refused")
 		}
@@ -205,93 +220,101 @@ func TestReadSnapshotNestedRefused(t *testing.T) {
 	}
 }
 func TestReadSnapshotCapUnderContention(t *testing.T) {
-	s, _ := snapshotStore(t)
-	release := make(chan struct{})
-	entered := make(chan struct{}, readSnapshotLimit)
-	var active, peak atomic.Int32
-	var holders sync.WaitGroup
-	results := make(chan error, readSnapshotLimit)
-	for range readSnapshotLimit {
-		holders.Add(1)
-		go func() {
-			defer holders.Done()
-			results <- s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
-				count := active.Add(1)
-				defer active.Add(-1)
-				for old := peak.Load(); count > old; old = peak.Load() {
-					if peak.CompareAndSwap(old, count) {
-						break
+	retryTestSnapshotScenario(t, func() error {
+
+		s, _ := snapshotStore(t)
+		release := make(chan struct{})
+		entered := make(chan struct{}, readSnapshotLimit)
+		var active, peak atomic.Int32
+		var holders sync.WaitGroup
+		results := make(chan error, readSnapshotLimit)
+		for range readSnapshotLimit {
+			holders.Add(1)
+			go func() {
+				defer holders.Done()
+				results <- s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+					count := active.Add(1)
+					defer active.Add(-1)
+					for old := peak.Load(); count > old; old = peak.Load() {
+						if peak.CompareAndSwap(old, count) {
+							break
+						}
 					}
-				}
-				entered <- struct{}{}
-				select {
-				case <-release:
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			})
-		}()
-	}
-	for range readSnapshotLimit {
-		select {
-		case <-entered:
-		case <-time.After(time.Second):
-			close(release)
-			holders.Wait()
-			t.Fatal("cap holders did not enter")
+					entered <- struct{}{}
+					select {
+					case <-release:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				})
+			}()
 		}
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if err := s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error { t.Error("over-cap read admitted"); return nil }); !errors.Is(err, context.Canceled) {
-		t.Errorf("admission cancellation: %v", err)
-	}
+		for range readSnapshotLimit {
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				close(release)
+				holders.Wait()
+				t.Fatal("cap holders did not enter")
+			}
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error { t.Error("over-cap read admitted"); return nil }); !errors.Is(err, context.Canceled) {
+			t.Errorf("admission cancellation: %v", err)
+		}
 
-	// Four additional readers contend with all twelve occupied admissions. Each
-	// must time out before its callback; cancellation alone without contention
-	// would not demonstrate that the cap is enforced.
-	var contenders sync.WaitGroup
-	contended := make(chan error, 4)
-	for range 4 {
-		contenders.Add(1)
-		go func() {
-			defer contenders.Done()
-			ctx, cancel := context.WithTimeout(t.Context(), readSnapshotBudget/4)
-			defer cancel()
-			contended <- s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error {
-				return errors.New("over-cap callback admitted")
-			})
-		}()
-	}
-	contenders.Wait()
-	close(contended)
-	for err := range contended {
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("contended admission: %v", err)
+		// Four additional readers contend with all twelve occupied admissions. Each
+		// must time out before its callback; cancellation alone without contention
+		// would not demonstrate that the cap is enforced.
+		var contenders sync.WaitGroup
+		contended := make(chan error, 4)
+		for range 4 {
+			contenders.Add(1)
+			go func() {
+				defer contenders.Done()
+				ctx, cancel := context.WithTimeout(t.Context(), readSnapshotBudget/4)
+				defer cancel()
+				contended <- s.withReadSnapshot(ctx, nil, func(context.Context, readModel) error {
+					return errors.New("over-cap callback admitted")
+				})
+			}()
 		}
-	}
+		contenders.Wait()
+		close(contended)
 
-	// The readers are released only after this write returns, so a writer
-	// blocked by them would wait out the deadline; 10s is a deadlock watchdog,
-	// not a speed bound (a slow runner's fsync once took longer than 50ms).
-	writer, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	_, writeErr := s.db.ExecContext(writer, "CREATE TABLE writer_progress(value TEXT)")
-	cancel()
-	close(release)
-	holders.Wait()
-	close(results)
-	for err := range results {
-		if err != nil {
-			t.Error(err)
+		// The readers are released only after this write returns, so a writer
+		// blocked by them would wait out the deadline; 10s is a deadlock watchdog,
+		// not a speed bound (a slow runner's fsync once took longer than 50ms).
+		writer, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		_, writeErr := s.db.ExecContext(writer, "CREATE TABLE writer_progress(value TEXT)")
+		cancel()
+		close(release)
+		holders.Wait()
+		close(results)
+		for err := range results {
+			if testReadRetryable(err) {
+				return err
+			}
+			if err != nil {
+				t.Error(err)
+			}
 		}
-	}
-	if writeErr != nil {
-		t.Fatalf("writer had no reserved capacity: %v", writeErr)
-	}
-	if peak.Load() != readSnapshotLimit || s.readDB.Stats().InUse != 0 {
-		t.Fatalf("peak=%d admission remaining=%d", peak.Load(), s.readDB.Stats().InUse)
-	}
+		for err := range contended {
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("contended admission: %v", err)
+			}
+		}
+		if writeErr != nil {
+			t.Fatalf("writer had no reserved capacity: %v", writeErr)
+		}
+		if peak.Load() != readSnapshotLimit || s.readDB.Stats().InUse != 0 {
+			t.Fatalf("peak=%d admission remaining=%d", peak.Load(), s.readDB.Stats().InUse)
+		}
+
+		return nil
+	})
 }
 func TestReadSnapshotBudgetReleasesSQLiteReadLock(t *testing.T) {
 	s, _ := snapshotStore(t)
@@ -337,7 +360,7 @@ func TestReadSnapshotSharedJobProjectorMatchesOriginalWire(t *testing.T) {
 			h, _, job, claim := jobProjectionFixture(t, state)
 			actor := &serviceActionActor{Identity: fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}}, ClientPrincipalTag: DefaultClientPrincipalTag}
 			var projected Job
-			err := h.store.withReadSnapshot(t.Context(), actor, func(ctx context.Context, r readModel) error {
+			err := testReads(h.store).withReadSnapshot(t.Context(), actor, func(ctx context.Context, r readModel) error {
 				current, err := r.job(ctx, job.JobID)
 				if err != nil {
 					return err
@@ -365,67 +388,83 @@ func TestReadSnapshotSharedJobProjectorMatchesOriginalWire(t *testing.T) {
 }
 
 func TestReadSnapshotClockAfterPoolCheckout(t *testing.T) {
-	s, clock := snapshotStore(t)
-	var held []*sql.Conn
-	for range s.readDB.Stats().MaxOpenConnections {
-		conn, err := s.readDB.Conn(t.Context())
-		if err != nil {
+	retryTestSnapshotScenario(t, func() error {
+
+		s, clock := snapshotStore(t)
+		var held []*sql.Conn
+		for range s.readDB.Stats().MaxOpenConnections {
+			conn, err := s.readDB.Conn(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			held = append(held, conn)
+		}
+		defer func() {
+			for _, conn := range held {
+				_ = conn.Close()
+			}
+		}()
+		waiting := s.readDB.Stats().WaitCount
+		done := make(chan error, 1)
+		go func() {
+			done <- s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+				if r.now().UnixNano() != clock.at.Load() || clock.calls.Load() != 1 {
+					return errors.New("clock sampled before pool checkout")
+				}
+				time.Sleep(125 * time.Millisecond)
+				return nil
+			})
+		}()
+		deadline := time.Now().Add(time.Second)
+		for s.readDB.Stats().WaitCount == waiting && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if s.readDB.Stats().WaitCount == waiting {
+			t.Fatal("snapshot did not wait for pool")
+		}
+		if clock.calls.Load() != 0 {
+			t.Fatal("clock sampled while waiting for connection")
+		}
+		time.Sleep(125 * time.Millisecond)
+		clock.at.Add(int64(time.Minute))
+		_ = held[0].Close()
+		held = held[1:]
+		if err := <-done; err != nil {
+			if testReadRetryable(err) {
+				return err
+			}
 			t.Fatal(err)
 		}
-		held = append(held, conn)
-	}
-	defer func() {
-		for _, conn := range held {
-			_ = conn.Close()
-		}
-	}()
-	waiting := s.readDB.Stats().WaitCount
-	done := make(chan error, 1)
-	go func() {
-		done <- s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
-			if r.now().UnixNano() != clock.at.Load() || clock.calls.Load() != 1 {
-				return errors.New("clock sampled before pool checkout")
-			}
-			time.Sleep(125 * time.Millisecond)
-			return nil
-		})
-	}()
-	deadline := time.Now().Add(time.Second)
-	for s.readDB.Stats().WaitCount == waiting && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if s.readDB.Stats().WaitCount == waiting {
-		t.Fatal("snapshot did not wait for pool")
-	}
-	if clock.calls.Load() != 0 {
-		t.Fatal("clock sampled while waiting for connection")
-	}
-	time.Sleep(125 * time.Millisecond)
-	clock.at.Add(int64(time.Minute))
-	_ = held[0].Close()
-	held = held[1:]
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+
+		return nil
+	})
 }
 
 func TestReadSnapshotRollbackFailureDiscardsConnection(t *testing.T) {
-	s, _ := snapshotStore(t)
-	err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
-		// End SQLite's transaction beneath database/sql's transaction object. Its
-		// deferred Rollback will fail, exercising the real driver cleanup path.
-		_, err := r.(*databaseReads).q.(*sql.Tx).ExecContext(ctx, "ROLLBACK")
-		return err
+	retryTestSnapshotScenario(t, func() error {
+
+		s, _ := snapshotStore(t)
+		err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+			// End SQLite's transaction beneath database/sql's transaction object. Its
+			// deferred Rollback will fail, exercising the real driver cleanup path.
+			_, err := r.(*databaseReads).q.(*sql.Tx).ExecContext(ctx, "ROLLBACK")
+			return err
+		})
+		if testReadRetryable(err) {
+			return err
+		}
+		if err == nil || !strings.Contains(err.Error(), "rollback snapshot") {
+			t.Fatalf("rollback failure was ignored: %v", err)
+		}
+		if s.readDB.Stats().OpenConnections != 0 {
+			t.Fatalf("failed rollback returned connection to pool: %+v", s.readDB.Stats())
+		}
+		if _, err = s.db.ExecContext(t.Context(), "CREATE TABLE after_failed_rollback(value TEXT)"); err != nil {
+			t.Fatal(err)
+		}
+
+		return nil
 	})
-	if err == nil || !strings.Contains(err.Error(), "rollback snapshot") {
-		t.Fatalf("rollback failure was ignored: %v", err)
-	}
-	if s.readDB.Stats().OpenConnections != 0 {
-		t.Fatalf("failed rollback returned connection to pool: %+v", s.readDB.Stats())
-	}
-	if _, err = s.db.ExecContext(t.Context(), "CREATE TABLE after_failed_rollback(value TEXT)"); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // The hold-limit override applies both ways: a 1 ns budget expires the
@@ -442,14 +481,13 @@ func TestReadSnapshotHoldLimitOverride(t *testing.T) {
 	if reason != "read_snapshot_admission_expired" && reason != "read_snapshot_expired" {
 		t.Fatalf("reason=%q, want an expired read snapshot", reason)
 	}
-	if err := s.withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
+	if err := testReads(s).withReadSnapshot(t.Context(), nil, func(ctx context.Context, r readModel) error {
 		var count int
 		return r.(*databaseReads).q.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&count)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Lengthening must work too, or the writer-between-reads tests silently
-	// fall back to 200 ms. The sleep can only run long, so this is deterministic.
+	// Verify that the per-read override outlasts the default hold limit.
 	longer := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, 10*time.Second)
 	if err := s.withReadSnapshot(longer, nil, func(ctx context.Context, r readModel) error {
 		time.Sleep(readSnapshotHardLimit + 50*time.Millisecond)

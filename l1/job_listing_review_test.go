@@ -99,9 +99,9 @@ func TestJobListingReviewStoreClamps(t *testing.T) {
 			var page JobList
 			var err error
 			if children {
-				page, err = h.store.ListChildJobs(t.Context(), parent.JobID, "", 1000)
+				page, err = testReads(h.store).ListChildJobs(t.Context(), parent.JobID, "", 1000)
 			} else {
-				page, err = h.store.listReadableJobs(t.Context(), jobListFilters{}, "", 1000)
+				page, err = testReads(h.store).listReadableJobs(t.Context(), jobListFilters{}, "", 1000)
 			}
 			// The real door may adapt; verify the exact clamp independently of
 			// wall-clock speed using the same production page method.
@@ -140,7 +140,7 @@ func TestJobReadReviewPostChangeFailureReason(t *testing.T) {
 			h, client, agent, node := credentialHarness(t)
 			job := h.submit(client, "post-change-reason", []string{"linux"})
 			claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
-			scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
+			scope, err := testReads(h.store).ResolveAttemptCredential(t.Context(), claim.AttemptToken, node.NodeID)
 			if err != nil {
 				t.Fatal(err)
 			}

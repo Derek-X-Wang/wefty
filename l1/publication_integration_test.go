@@ -91,7 +91,7 @@ func TestComputerDisplayPublicationIsFencedAndWithdrawn(t *testing.T) {
 		PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready, DisplayEndpoint: &endpoint}); err != nil {
 		t.Fatal(err)
 	}
-	projected, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	projected, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || projected.DisplayEndpoint == nil || *projected.DisplayEndpoint != endpoint {
 		t.Fatalf("published Computer = %#v err=%v", projected.DisplayEndpoint, err)
 	}
@@ -100,7 +100,7 @@ func TestComputerDisplayPublicationIsFencedAndWithdrawn(t *testing.T) {
 		PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready}); err != nil {
 		t.Fatal(err)
 	}
-	projected, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	projected, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || projected.DisplayEndpoint != nil {
 		t.Fatalf("withdrawn Computer display = %#v err=%v", projected.DisplayEndpoint, err)
 	}

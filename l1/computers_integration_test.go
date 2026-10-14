@@ -84,7 +84,7 @@ func TestComputerOperatorRoutesPreserveCASAndRedaction(t *testing.T) {
 	if neverBoundRemoved.RemovalOutcome != "removed_verified" || neverBoundRemoved.CurrentJob.State != contract.JobRemovedVerified {
 		t.Fatalf("never-bound Computer removal stayed non-terminal: %#v", neverBoundRemoved)
 	}
-	provenance, err := h.store.ListComputerStorageProvenance(context.Background(), neverBoundRemoved.ComputerID)
+	provenance, err := testReads(h.store).ListComputerStorageProvenance(context.Background(), neverBoundRemoved.ComputerID)
 	if err != nil || provenance.CustodyTainted || len(provenance.CustodyForks) != 1 ||
 		provenance.CustodyForks[0].RemovalOutcome != "removed_verified" {
 		t.Fatalf("verified removal provenance projection = %#v err=%v", provenance, err)
@@ -208,7 +208,7 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 		computer.ReconfigurationPhase != ComputerReconfigurationStable {
 		t.Fatalf("initial Computer = %#v", computer)
 	}
-	history, err := h.store.ListComputerIntents(context.Background(), computer.ComputerID, "", 1)
+	history, err := testReads(h.store).ListComputerIntents(context.Background(), computer.ComputerID, "", 1)
 	if err != nil || len(history.Intents) != 1 || history.Intents[0].Actor != "operator-a" || history.NextCursor != "" {
 		t.Fatalf("initial Computer intents = %#v err=%v", history, err)
 	}
@@ -244,7 +244,7 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +270,7 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 		}); err != nil {
 		t.Fatal(err)
 	}
-	stopped, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	stopped, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 	if _, err := h.store.SetComputerDesiredState(context.Background(), stopped.ComputerID, wrongStorage); errorCode(err) != contract.ErrorStorageReferenceConflict {
 		t.Fatalf("wrong storage error = %v, want %q", err, contract.ErrorStorageReferenceConflict)
 	}
-	unchanged, err := h.store.GetComputer(context.Background(), stopped.ComputerID)
+	unchanged, err := testReads(h.store).GetComputer(context.Background(), stopped.ComputerID)
 	if err != nil || unchanged.IntentRevision != stopped.IntentRevision || unchanged.CurrentJob.State != contract.JobStopped {
 		t.Fatalf("storage conflict mutated Computer: %#v err=%v", unchanged, err)
 	}
@@ -335,7 +335,7 @@ func TestComputerIntentOwnsLifecycleAndSlot(t *testing.T) {
 	if wins != 1 || stale != 1 {
 		t.Fatalf("competing starts = %d wins / %d stale, want 1/1", wins, stale)
 	}
-	started, err := h.store.GetComputer(context.Background(), stopped.ComputerID)
+	started, err := testReads(h.store).GetComputer(context.Background(), stopped.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +402,7 @@ func TestStoppedComputerCompletionReplayRejectsSupersededAttempt(t *testing.T) {
 		second.Lease.AttemptID, StartedRequest{FencingToken: second.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -454,7 +454,7 @@ func TestComputerProjectionRetirementAndRemovalForecloseClaims(t *testing.T) {
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestComputerProjectionRetirementAndRemovalForecloseClaims(t *testing.T) {
 		}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +494,7 @@ func TestComputerProjectionRetirementAndRemovalForecloseClaims(t *testing.T) {
 		projected.CurrentJob.BoundNodeID != node.NodeID {
 		t.Fatalf("projected Computer = %#v", projected)
 	}
-	listed, err := h.store.ListServiceJobs(context.Background(), "", MaxJobPageLimit)
+	listed, err := testReads(h.store).ListServiceJobs(context.Background(), "", MaxJobPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +586,7 @@ func TestComputerProjectionQuiescesRunningObservationWithInternalServiceStop(t *
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -607,7 +607,7 @@ func TestComputerProjectionQuiescesRunningObservationWithInternalServiceStop(t *
 		projecting.IntentRevision != computer.IntentRevision+1 || projecting.AppliedRevision != computer.AppliedRevision {
 		t.Fatalf("projecting Computer = %#v", projecting)
 	}
-	history, err := h.store.ListComputerIntents(context.Background(), computer.ComputerID, "", MaxJobPageLimit)
+	history, err := testReads(h.store).ListComputerIntents(context.Background(), computer.ComputerID, "", MaxJobPageLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -674,7 +674,7 @@ func TestComputerRestartRecoversFailedAndStoppedObservations(t *testing.T) {
 		}); err != nil {
 		t.Fatal(err)
 	}
-	failed, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	failed, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || failed.CurrentJob.State != contract.JobFailed || failed.CurrentJob.NextRestartAt != nil ||
 		failed.CurrentJob.RestartStreak != 0 || failed.CurrentJob.LifetimeRestartCount != 0 || failed.CurrentJob.HoldsSlot(failed.CurrentJob.State) ||
 		failed.BoundNodeID != node.NodeID || failed.StorageID != computer.StorageID || failed.CurrentJob.Spec.Execution.OCI.Image.Digest == nil {
@@ -790,7 +790,7 @@ func TestComputerRemovalCleanupQuarantineStopsRedispatchAndHoldsSlot(t *testing.
 	if err != nil || claim == nil {
 		t.Fatalf("claim = %#v err=%v", claim, err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -847,7 +847,7 @@ func TestComputerRemovalCleanupQuarantineStopsRedispatchAndHoldsSlot(t *testing.
 		finalized.State != contract.JobRemovalPending {
 		t.Fatalf("quarantined removal finalization = job %#v changed=%t err=%v", finalized, changed, err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -889,7 +889,7 @@ func assertComputerRemovalDirectiveCompletionReleasesSlot(t *testing.T) {
 	if err != nil || claim == nil {
 		t.Fatalf("claim = %#v err=%v", claim, err)
 	}
-	computer, err = h.store.GetComputer(context.Background(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1028,7 +1028,7 @@ func TestQueuedComputerStopMustRetainCompletionReplay(t *testing.T) {
 	}
 	// Model a lost completion response. Before replay, the operator stops the
 	// queued Computer without a new attempt ever being claimed.
-	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}

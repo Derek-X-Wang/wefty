@@ -124,7 +124,7 @@ func TestARestartReplacesTheResultRatherThanAppendingOne(t *testing.T) {
 		t.Fatalf("second upload status = %d body=%s", status, body)
 	}
 
-	stored, err := h.store.GetJobResult(context.Background(), service.JobID)
+	stored, err := testReads(h.store).GetJobResult(context.Background(), service.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestASupersededAttemptCannotReplaceTheLatestResult(t *testing.T) {
 		AttemptResultRequest{FencingToken: first.Lease.FencingToken, Document: []byte(`{"attempt":1}`)})
 	assertAPIError(t, status, body, http.StatusConflict, contract.ErrorSupersededAttempt)
 
-	stored, err := h.store.GetJobResult(context.Background(), service.JobID)
+	stored, err := testReads(h.store).GetJobResult(context.Background(), service.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +273,7 @@ func TestASuccessorThatWroteNoResultDisplacesItsPredecessorsDocument(t *testing.
 		t.Fatalf("absence receipt status = %d body=%s", status, body)
 	}
 
-	stored, err := h.store.GetJobResult(context.Background(), service.JobID)
+	stored, err := testReads(h.store).GetJobResult(context.Background(), service.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +317,7 @@ func TestAPredecessorsResultIsNotServedWhenTheLatestAttemptNeverUploaded(t *test
 
 	status, _, body = h.do(client, http.MethodGet, "/v1/jobs/"+service.JobID+"/result?class=service", nil)
 	assertAPIError(t, status, body, http.StatusNotFound, contract.ErrorNotFound)
-	if stored, err := h.store.GetJobResult(context.Background(), service.JobID); err == nil {
+	if stored, err := testReads(h.store).GetJobResult(context.Background(), service.JobID); err == nil {
 		t.Fatalf("a predecessor's result was served as the run's answer: %#v", stored)
 	}
 }

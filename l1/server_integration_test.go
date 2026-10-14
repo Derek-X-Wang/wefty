@@ -399,7 +399,7 @@ func doRequest(client *http.Client, method, path string, body any) (int, http.He
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := client.Do(request)
+	response, err := doTestReadHTTP(client, request)
 	if err != nil {
 		return 0, nil, nil, err
 	}
