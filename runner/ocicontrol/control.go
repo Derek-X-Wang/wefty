@@ -41,6 +41,9 @@ func (class ConvergenceClass) Valid() bool {
 type InstalledConfig struct {
 	Version       int    `json:"version"`
 	ControlSocket string `json:"control_socket"`
+	// NodeID is the stable identity passed to the installed node agent. Older
+	// installations omit it and remain usable for socket-only commands.
+	NodeID string `json:"node_id,omitempty"`
 }
 
 type SetupRequest struct {

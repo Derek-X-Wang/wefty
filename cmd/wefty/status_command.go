@@ -61,8 +61,9 @@ type serviceStatus struct {
 
 // nodeStatus is a node's ability to take work, not its whole projection.
 type nodeStatus struct {
-	NodeID string             `json:"node_id"`
-	State  contract.NodeState `json:"state"`
+	NodeID      string             `json:"node_id"`
+	ThisMachine bool               `json:"this_machine,omitempty"`
+	State       contract.NodeState `json:"state"`
 	// ClaimsEnabled is durable operator intent. A node can be perfectly healthy
 	// and still be closed for work, and that is a different sentence.
 	ClaimsEnabled bool `json:"claims_enabled"`
@@ -136,6 +137,10 @@ type clusterStatus struct {
 	Identity    fabricStatus    `json:"identity"`
 	Services    []serviceStatus `json:"services"`
 	Nodes       []nodeStatus    `json:"nodes"`
+	// LocalNode is null unless both the installation and L1 identify this
+	// machine's node. A local installation problem does not block the cluster.
+	LocalNode      *localNodeIdentity `json:"local_node"`
+	LocalNodeError *statusReason      `json:"local_node_error,omitempty"`
 	// Capacity is free one-shot slots per executable kind, counted over the
 	// nodes that could actually take a claim.
 	Capacity  map[string]int `json:"capacity_by_kind"`
@@ -196,7 +201,21 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 	var nodes l1.NodeList
 	var stuck []queuedRunNote
 	var group sync.WaitGroup
-	group.Add(3)
+	group.Add(4)
+	go func() {
+		defer group.Done()
+		probeCtx, done := context.WithTimeout(ctx, statusProbeBudget)
+		defer done()
+		local, err := resolveLocalNode(probeCtx, clients)
+		if err != nil {
+			var localErr *localNodeError
+			if errors.As(err, &localErr) {
+				status.LocalNodeError = &statusReason{Code: string(localErr.Code), Detail: localErr.Detail}
+			}
+			return
+		}
+		status.LocalNode = &local
+	}()
 	go func() {
 		defer group.Done()
 		probeCtx, done := context.WithTimeout(ctx, statusProbeBudget)
@@ -257,6 +276,11 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 
 	status.Services = []serviceStatus{l1Status, l3Status}
 	status.Nodes = nodeStatuses(nodes)
+	if status.LocalNode != nil {
+		for i := range status.Nodes {
+			status.Nodes[i].ThisMachine = status.Nodes[i].NodeID == status.LocalNode.NodeID
+		}
+	}
 	status.Capacity = capacityByKind(status.Nodes)
 	status.Reasons, status.Limitations = reasonsFor(l1Status, l3Status, status.Nodes, status.Capacity)
 	if note, ok := unschedulableRunsNote(stuck); ok {
@@ -525,6 +549,15 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 	if _, err := fmt.Fprintf(writer, "identity: %s\n\n", identity); err != nil {
 		return err
 	}
+	localDetail := "no installed node"
+	if status.LocalNode != nil {
+		localDetail = fmt.Sprintf("%s (Pinned tag: %s)", status.LocalNode.NodeID, status.LocalNode.Tag)
+	} else if status.LocalNodeError != nil {
+		localDetail = status.LocalNodeError.Detail
+	}
+	if _, err := fmt.Fprintf(writer, "this machine: %s\n\n", localDetail); err != nil {
+		return err
+	}
 	services := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
 	if _, err := fmt.Fprintln(services, "SERVICE\tENDPOINT\tREACHABLE\tDETAIL"); err != nil {
 		return err
@@ -554,6 +587,10 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 		return err
 	}
 	for _, node := range status.Nodes {
+		nodeID := node.NodeID
+		if node.ThisMachine {
+			nodeID += " (this machine)"
+		}
 		claims := "enabled"
 		if !node.ClaimsEnabled {
 			claims = "disabled"
@@ -563,7 +600,7 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 			kinds = strings.Join(node.Kinds, ",")
 		}
 		if _, err := fmt.Fprintf(nodes, "%s\t%s\t%s\t%s\t%d/%d free\t%d/%d free\n",
-			node.NodeID, node.State, claims, kinds,
+			nodeID, node.State, claims, kinds,
 			node.FreeOneshot, node.TotalOneshot, node.FreeService, node.TotalService); err != nil {
 			return err
 		}
