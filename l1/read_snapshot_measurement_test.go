@@ -13,6 +13,8 @@ import (
 // Production transaction expiry is independently exercised by behaviour tests.
 func TestReadSnapshotMeasure1000ProjectedRows(t *testing.T) {
 	h, _, original, _ := jobProjectionFixture(t, "capability-missing")
+	// The live reconcile pass walks every service in one write transaction and starves these 1000 creates on slow hosts (#939).
+	h.stopServer()
 	jobs := make([]Job, 1000)
 	for i := range jobs {
 		spec := original.Spec
