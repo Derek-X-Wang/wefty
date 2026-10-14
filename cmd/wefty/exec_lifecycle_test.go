@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -517,6 +518,32 @@ func TestExecHeartbeatStopsAtCommandEnd(t *testing.T) {
 	boundary := strings.Index(observed, output.token) + len(output.token)
 	if !strings.Contains(observed[:boundary], "command-last\n") || !strings.Contains(observed[:boundary], "still running") || strings.Contains(output.String()[boundary:], "still running") {
 		t.Fatalf("heartbeat continued after command exited: %q", output.String())
+	}
+}
+
+// Every exec stop path prints feedback. A second Ctrl-C that follows any of
+// it must meet default signal handling, so exec observes cancellation only
+// after the reset has finished, however slow the reset is.
+func TestExecSignalContextCancelsOnlyAfterReset(t *testing.T) {
+	base, cancelBase := context.WithCancel(t.Context())
+	var reset atomic.Bool
+	parent := context.WithValue(base, execSignalResetKey{}, context.CancelFunc(func() {
+		time.Sleep(50 * time.Millisecond)
+		reset.Store(true)
+	}))
+	ctx, stop := execSignalContext(parent)
+	defer stop()
+	cancelBase()
+	select {
+	case <-ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("exec context ignored the parent's cancellation")
+	}
+	if !reset.Load() {
+		t.Fatal("exec observed cancellation before the signal reset finished")
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("exec context error = %v, want canceled", ctx.Err())
 	}
 }
 
