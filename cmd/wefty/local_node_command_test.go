@@ -475,8 +475,8 @@ func TestSingularNodeCommandsExplainAPlainProcessNode(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	err := run(context.Background(), []string{"--node-config", path, "node", "doctor"}, io.Discard, io.Discard)
+	err := run(context.Background(), []string{"--node-config", path, "node", "oci", "start"}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "plain-process node") || !strings.Contains(err.Error(), path) {
-		t.Fatalf("node doctor on a plain-process node = %v", err)
+		t.Fatalf("node oci start on a plain-process node = %v", err)
 	}
 }

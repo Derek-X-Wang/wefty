@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -123,7 +124,32 @@ var setupFolders = struct {
 // resolveSetupPaths spells every destination folder from the home folder's
 // real path. It is the first check of a run and writes nothing.
 func resolveSetupPaths(home string) (setupPaths, error) {
+	paths, issues := resolveMaintenancePaths(home)
+	if len(issues) != 0 {
+		return setupPaths{}, issues[0].err
+	}
+	return paths, nil
+}
+
+type setupPathIssue struct {
+	folder string
+	err    error
+}
+
+// Maintenance resolves each path independently. Unusable skill roots are
+// excluded so neither diagnosis nor removal can follow a link into a checkout.
+// Other unusable paths stay named for findings but must not be accessed.
+func resolveMaintenancePaths(home string) (setupPaths, []setupPathIssue) {
 	paths := setupPaths{home: home}
+	var issues []setupPathIssue
+	resolve := func(wanted string) string {
+		rel, err := canonicalHomeFolder(home, wanted)
+		if err != nil {
+			issues = append(issues, setupPathIssue{wanted, err})
+			return wanted
+		}
+		return rel
+	}
 	for _, folder := range []struct {
 		rel    *string
 		wanted string
@@ -131,11 +157,7 @@ func resolveSetupPaths(home string) (setupPaths, error) {
 		{&paths.binRel, setupFolders.bin}, {&paths.configRel, setupFolders.config}, {&paths.dataRel, setupFolders.data},
 		{&paths.logsRel, setupFolders.logs}, {&paths.launchAgentsRel, setupFolders.launchAgents},
 	} {
-		rel, err := canonicalHomeFolder(home, folder.wanted)
-		if err != nil {
-			return setupPaths{}, err
-		}
-		*folder.rel = rel
+		*folder.rel = resolve(folder.wanted)
 	}
 	paths.bin, paths.config = filepath.Join(home, paths.binRel), filepath.Join(home, paths.configRel)
 	paths.data, paths.logs = filepath.Join(home, paths.dataRel), filepath.Join(home, paths.logsRel)
@@ -145,26 +167,24 @@ func resolveSetupPaths(home string) (setupPaths, error) {
 	// The node agent refuses a state root reached through a link, so its
 	// folders are resolved on their own rather than assumed to sit under data.
 	for _, wanted := range []string{"log-spool", "managed"} {
-		rel, err := canonicalHomeFolder(home, filepath.Join(setupFolders.data, "node-agent", wanted))
-		if err != nil {
-			return setupPaths{}, err
-		}
-		paths.nodeDataFolders = append(paths.nodeDataFolders, rel)
+		paths.nodeDataFolders = append(paths.nodeDataFolders, resolve(filepath.Join(setupFolders.data, "node-agent", wanted)))
 	}
 	paths.nodeData = filepath.Join(home, filepath.Dir(paths.nodeDataFolders[0]))
 	for _, wanted := range setupFolders.skills {
 		// A link here could point into a checkout, even one inside home, and
 		// setup would then write the skill into that checkout.
 		if info, err := os.Lstat(filepath.Join(home, wanted)); err == nil && info.Mode()&os.ModeSymlink != 0 {
-			return setupPaths{}, fmt.Errorf("%s is a symbolic link; setup installs a copy of the skill there, so remove the link and run setup again", filepath.Join(home, wanted))
+			issues = append(issues, setupPathIssue{wanted, fmt.Errorf("%s is a symbolic link; setup installs a copy of the skill there, so remove the link and run setup again", filepath.Join(home, wanted))})
+			continue
 		}
 		rel, err := canonicalHomeFolder(home, wanted)
 		if err != nil {
-			return setupPaths{}, err
+			issues = append(issues, setupPathIssue{wanted, err})
+			continue
 		}
 		paths.skillTargets = append(paths.skillTargets, rel)
 	}
-	return paths, nil
+	return paths, issues
 }
 
 // canonicalHomeFolder spells wanted (relative to home) without symbolic
@@ -230,17 +250,49 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	var request setupRequest
+	var remove, purge bool
+	flags.BoolVar(&remove, "remove", false, "remove the per-user install, keeping data and logs")
+	flags.BoolVar(&purge, "purge", false, "also delete data and logs (requires --remove)")
 	flags.StringVar(&request.from, "from", "", "folder holding wefty, wefty-l1, wefty-l3 and wefty-agent (default: the folder of this wefty)")
 	flags.StringVar(&request.nodeID, "node-id", "", "stable node ID for a first install (default: chosen once from the host name and kept)")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
-		return usageError("usage: wefty setup [--from DIR] [--node-id ID]")
+		return usageError("usage: wefty setup [--from DIR] [--node-id ID] | --remove [--purge]")
+	}
+	if purge && !remove || remove && (request.from != "" || request.nodeID != "") {
+		return usageError("--purge requires --remove; --remove cannot use --from or --node-id")
 	}
 	host, err := realSetupHost()
 	if err != nil {
 		return err
+	}
+	if remove {
+		report, err := runSetupRemove(ctx, host, purge)
+		if err != nil {
+			return err
+		}
+		if options.jsonOutput {
+			if err := writeJSON(stdout, report); err != nil {
+				return err
+			}
+		} else {
+			for _, change := range report.Changes {
+				if _, err := fmt.Fprintln(stdout, "Removed:", change); err != nil {
+					return err
+				}
+			}
+			for _, warning := range report.Warnings {
+				if _, err := fmt.Fprintln(stdout, "Warning:", warning); err != nil {
+					return err
+				}
+			}
+		}
+		if len(report.Warnings) != 0 {
+			return &notReadyError{verdict: "setup removal left files behind; inspect the warnings"}
+		}
+		return nil
 	}
 	report, err := runSetup(ctx, host, request)
 	if err != nil {
@@ -385,7 +437,7 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	for _, file := range files {
 		folders = append(folders, file.folder)
 	}
-	destinations := []string{}
+	destinations := []string{filepath.Join(paths.configRel, setupManifestName)}
 	for _, name := range setupBinaries {
 		destinations = append(destinations, filepath.Join(paths.binRel, name))
 	}
@@ -422,12 +474,37 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		files = append([]setupFile{{folder: paths.binRel, name: name, payload: payload, mode: 0o755,
 			change: "installed " + filepath.Join(paths.bin, name)}}, files...)
 	}
+	manifest := setupManifest{Version: 1, Files: map[string]string{}}
+	if payload, err := homeRoot.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
+		var previous setupManifest
+		if json.Unmarshal(payload, &previous) == nil && previous.Version == 1 {
+			for name, digest := range previous.Files {
+				for _, target := range paths.skillTargets {
+					rel, err := filepath.Rel(target, name)
+					if err == nil && rel != "." && filepath.IsLocal(rel) {
+						manifest.Files[name] = digest
+					}
+				}
+			}
+		}
+	}
+	for _, file := range files {
+		manifest.Files[filepath.Join(file.folder, file.name)] = payloadDigest(file.payload)
+	}
+	for index, service := range services {
+		manifest.Files[filepath.Join(paths.launchAgentsRel, service.Label+".plist")] = payloadDigest(plists[index])
+	}
+	manifestPayload, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return setupReport{}, err
+	}
+	files = append(files, setupFile{folder: paths.configRel, name: setupManifestName, payload: append(manifestPayload, '\n'), mode: 0o600, change: ""})
 	for _, file := range files {
 		changed, err := convergeHomeFile(homeRoot, file)
 		if err != nil {
 			return setupReport{}, fmt.Errorf("write %s: %w", filepath.Join(home, file.folder, file.name), err)
 		}
-		if changed && !slices.Contains(report.Changes, file.change) {
+		if changed && file.change != "" && !slices.Contains(report.Changes, file.change) {
 			report.Changes = append(report.Changes, file.change)
 		}
 	}
