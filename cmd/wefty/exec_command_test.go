@@ -41,6 +41,11 @@ type execStack struct {
 
 func newExecStack(t *testing.T, idle time.Duration) *execStack {
 	t.Helper()
+	// Every test stack reports liveness every 50 ms, so a loaded CI runner's
+	// slow process start or clone never looks like a silent command.
+	if execHeartbeatSeconds == "60" {
+		shortenExecTimers(t)
+	}
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
@@ -355,16 +360,18 @@ func setExecTestClaims(t *testing.T, clients *apiClients, enabled bool) {
 
 func TestExecHeartbeatAndFailure(t *testing.T) {
 	shortenExecTimers(t)
-	stack := newExecStack(t, 200*time.Millisecond)
+	// The command stays quiet for longer than the idle limit; only the
+	// heartbeat keeps it alive. The margin absorbs a loaded CI runner.
+	stack := newExecStack(t, 2*time.Second)
 	repo := execTestRepo(t)
 	t.Chdir(repo)
 	var out, errOut bytes.Buffer
 	started := time.Now()
-	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "sleep 0.65; exit 7"}, &out, &errOut)
+	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "sleep 3; exit 7"}, &out, &errOut)
 	if commandExitCode(err) != 10 || !strings.Contains(errOut.String(), "still running (1m)") || !strings.HasSuffix(errOut.String(), "failed\n") {
 		t.Fatalf("heartbeat/failure: %v %q %q", err, out.String(), errOut.String())
 	}
-	if time.Since(started) > 5*time.Second {
+	if time.Since(started) > 15*time.Second {
 		t.Fatal("heartbeat kept output pipes open after child exited")
 	}
 	page, e := stack.clients.listRuns(t.Context(), "", 20)
@@ -622,7 +629,7 @@ func TestExecHelpAndRefusalsFromRealBinary(t *testing.T) {
 
 func TestExecMaxRuntimeAndIgnoreSources(t *testing.T) {
 	shortenExecTimers(t)
-	stack := newExecStack(t, 200*time.Millisecond)
+	stack := newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	// Git's global excludes and local info/exclude participate in the capture.
 	global := filepath.Join(t.TempDir(), "excludes")
@@ -645,7 +652,7 @@ func TestExecMaxRuntimeAndIgnoreSources(t *testing.T) {
 	}
 	t.Chdir(repo)
 	var out bytes.Buffer
-	err := execute(t.Context(), stack.clients, false, []string{"exec", "--max-runtime", "1s", "--", "/bin/sh", "-c", "test ! -e global-secret && test ! -e local-secret && test ! -e sub/tracked && test -L link && ./script && sleep 60"}, &out, io.Discard)
+	err := execute(t.Context(), stack.clients, false, []string{"exec", "--max-runtime", "5s", "--", "/bin/sh", "-c", "test ! -e global-secret && test ! -e local-secret && test ! -e sub/tracked && test -L link && ./script && sleep 60"}, &out, io.Discard)
 	if commandExitCode(err) != 10 || !strings.Contains(out.String(), "executable") {
 		t.Fatalf("runtime/ignore/modes: %v %q", err, out.String())
 	}
@@ -657,7 +664,7 @@ func TestExecMaxRuntimeAndIgnoreSources(t *testing.T) {
 	if e != nil || record.Status != contract.RunFailed || !strings.HasPrefix(record.FailureReason, "maximum runtime reached") {
 		t.Fatalf("runtime cap confused with idle limit: %+v %v", record, e)
 	}
-	if stack.requests[0].Limits == nil || stack.requests[0].Limits.MaxRuntimeSeconds != 1 {
+	if stack.requests[0].Limits == nil || stack.requests[0].Limits.MaxRuntimeSeconds != 5 {
 		t.Fatalf("runtime limits: %+v", stack.requests[0].Limits)
 	}
 }

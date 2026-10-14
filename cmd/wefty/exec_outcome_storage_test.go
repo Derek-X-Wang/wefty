@@ -293,8 +293,9 @@ func TestExecStartFolderUsesSnapshotCase(t *testing.T) {
 	if capture.Folder != "sub" {
 		t.Fatalf("folder case not resolved: %q", capture.Folder)
 	}
+	// Liveness lines go to stderr; the command's own output is stdout.
 	command := exec.Command("/bin/bash", "-c", buildExecWrapper(capture, []string{"cat", "tracked"}))
-	out, err := command.CombinedOutput()
+	out, err := command.Output()
 	if err != nil || string(out) != "base" {
 		t.Fatalf("resolved wrapper: %v %q", err, out)
 	}
