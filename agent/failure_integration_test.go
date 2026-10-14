@@ -3,12 +3,17 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"path/filepath"
+	"reflect"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1380,7 +1385,7 @@ func TestResilienceStartWaitRecoversAfterLostClaimAnswer(t *testing.T) {
 	}
 	defer nodeAgent.Close()
 	client := nodeAgent.session.client
-	transport := &lostClaimAnswerTransport{base: client.httpClient.Transport, committed: make(chan l1.Claim, 1)}
+	transport := &lostClaimAnswerTransport{base: client.httpClient.Transport, clock: clock, committed: make(chan l1.Claim, 1)}
 	client.httpClient.Transport = transport
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -1418,8 +1423,12 @@ func TestResilienceStartWaitRecoversAfterLostClaimAnswer(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	beforeClaimInterval := clock.Now()
-	clock.waitForDeadline(t, beforeClaimInterval.Add(nodeAgent.session.claimInterval))
+	nextClaimPoll := clock.Now().Add(nodeAgent.session.claimInterval)
+	if err := awaitFixtureCondition(t.Context(), "empty retry waits on the claim interval", func() bool {
+		return clock.claimWaitArmed(nextClaimPoll)
+	}); err != nil {
+		t.Fatal(err)
+	}
 	status := nodeAgent.Status()
 	if status.State != LifecycleReady || len(status.Attempts) != 0 || status.OneShot.Occupied != 0 || status.Services.Occupied != 0 {
 		t.Fatalf("after lost claim answer = %+v, want Ready and idle", status)
@@ -1429,6 +1438,9 @@ func TestResilienceStartWaitRecoversAfterLostClaimAnswer(t *testing.T) {
 		t.Fatalf("unanswered claim was not committed: job=%+v err=%v", storedLost, err)
 	}
 
+	// From here on, record what L1 answers and keep each answer in flight
+	// across many start-wait polls, as a slow runner does (#917).
+	transport.recordAndHold.Store(true)
 	job := createAgentTestJob(t, store, "after-lost-claim-answer")
 	attemptID := runner.waitStarted(t, done, clock, nodeAgent)
 	started, err := store.GetJob(t.Context(), job.JobID)
@@ -1438,23 +1450,79 @@ func TestResilienceStartWaitRecoversAfterLostClaimAnswer(t *testing.T) {
 	if runner.startCount(lostClaim.Lease.AttemptID) != 0 || runner.startCount(attemptID) != 1 {
 		t.Fatal("runtime must start only the job with a received claim answer, exactly once")
 	}
-	// The new job can land just after an empty poll, so the start wait may
-	// release one more claim interval. Bound it so a runaway clock still fails.
-	interval := nodeAgent.session.claimInterval
-	if got := clock.Now(); got.Before(beforeClaimInterval.Add(interval)) || got.After(beforeClaimInterval.Add(3*interval)) {
-		t.Fatalf("start clock = %s, want one to three claim intervals after %s", got, beforeClaimInterval)
+	// The lost claim's unstarted attempt holds one of the node's two L1 slots.
+	// It must not hold back the node: L1 answers the first claim after the
+	// job is queued with that job, not with an empty claim.
+	answers := transport.recordedAnswers()
+	var first *recordedClaimAnswer
+	for index := range answers {
+		if answers[index].status == http.StatusOK || answers[index].status == http.StatusNoContent {
+			first = &answers[index]
+			break
+		}
+	}
+	if first == nil || first.status != http.StatusOK || first.jobID != job.JobID {
+		t.Fatalf("L1 claim answers after queueing %s = %v, want that job first", job.JobID, answers)
+	}
+	// The start wait releases only the claim worker's own wait. The clock
+	// must not move while a claim answer is in flight.
+	for _, answer := range answers {
+		if !answer.answered.Equal(answer.sent) {
+			t.Fatalf("manual clock moved while a claim answer was in flight: %v", answer)
+		}
+	}
+	// The lost claim's lease must stay live, or this proves lease expiry
+	// instead of recovery from a lost answer.
+	if got := clock.Now(); !got.Before(lostClaim.Lease.LeaseExpires) {
+		t.Fatalf("start clock = %s, want before the lost claim's lease expires at %s", got, lostClaim.Lease.LeaseExpires)
 	}
 }
 
+// lostClaimAnswerHold keeps a claim answer in flight for about 20 start-wait
+// polls. On the realtiming lane one slow claim let the old start wait advance
+// the manual clock 21 claim intervals (#917).
+const lostClaimAnswerHold = 200 * time.Millisecond
+
 type lostClaimAnswerTransport struct {
 	base      http.RoundTripper
+	clock     *manualClock
 	claims    atomic.Int32
 	committed chan l1.Claim
+	// recordAndHold records each later claim answer and holds it in flight
+	// for lostClaimAnswerHold.
+	recordAndHold atomic.Bool
+	mu            sync.Mutex
+	answers       []recordedClaimAnswer
+}
+
+// recordedClaimAnswer is one L1 claim answer with the manual clock when the
+// claim was sent and when its answer reached the node agent.
+type recordedClaimAnswer struct {
+	status         int
+	jobID          string
+	sent, answered time.Time
+}
+
+func (answer recordedClaimAnswer) String() string {
+	return fmt.Sprintf("HTTP %d job=%q sent=%s answered=%s", answer.status, answer.jobID,
+		answer.sent.Format(time.RFC3339Nano), answer.answered.Format(time.RFC3339Nano))
+}
+
+func (transport *lostClaimAnswerTransport) recordedAnswers() []recordedClaimAnswer {
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	return slices.Clone(transport.answers)
 }
 
 func (transport *lostClaimAnswerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	if request.URL.Path != "/v1/agent/jobs/claim" || transport.claims.Add(1) != 1 {
+	if request.URL.Path != "/v1/agent/jobs/claim" {
 		return transport.base.RoundTrip(request)
+	}
+	if transport.claims.Add(1) != 1 {
+		if !transport.recordAndHold.Load() {
+			return transport.base.RoundTrip(request)
+		}
+		return transport.recordAndHoldAnswer(request)
 	}
 	response, err := transport.base.RoundTrip(request)
 	if err != nil {
@@ -1472,6 +1540,34 @@ func (transport *lostClaimAnswerTransport) RoundTrip(request *http.Request) (*ht
 	// L1 has committed and sent a valid claim. Inject the client's timeout
 	// instead of delivering that answer; no wall-clock race is required.
 	return nil, context.DeadlineExceeded
+}
+
+func (transport *lostClaimAnswerTransport) recordAndHoldAnswer(request *http.Request) (*http.Response, error) {
+	answer := recordedClaimAnswer{sent: transport.clock.Now()}
+	response, err := transport.base.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	response.Body = io.NopCloser(bytes.NewReader(body))
+	answer.status = response.StatusCode
+	if response.StatusCode == http.StatusOK {
+		var claim l1.Claim
+		if err := json.Unmarshal(body, &claim); err != nil {
+			return nil, err
+		}
+		answer.jobID = claim.Job.JobID
+	}
+	time.Sleep(lostClaimAnswerHold)
+	answer.answered = transport.clock.Now()
+	transport.mu.Lock()
+	transport.answers = append(transport.answers, answer)
+	transport.mu.Unlock()
+	return response, nil
 }
 
 type firstClaimFailureTransport struct {
@@ -3924,14 +4020,17 @@ func (runner *resilienceRunner) waitStarted(t *testing.T, done <-chan error, clo
 			// Initial claim and registration retries both wait on the manual
 			// clock. A committed claim whose answer is lost can also leave an
 			// empty retry waiting in Ready on ClaimInterval. Advance only an
-			// armed timer, so a claim RPC's in-flight lease does not age. Ready
-			// must also be idle to avoid expiring a live local attempt.
+			// armed timer, so a claim RPC's in-flight lease does not age. In
+			// Ready that must be the claim worker's own wait: Ready stays idle
+			// while a claim is in flight, and another 1 s agent timer would
+			// move the clock under it (#917). Ready must also be idle to avoid
+			// expiring a live local attempt.
 			status := nodeAgent.Status()
 			if status.State == LifecycleRejoining && status.SessionBackoff > 0 {
 				clock.advanceArmedTimer(status.SessionBackoff)
 			} else if status.State == LifecycleReady && len(status.Attempts) == 0 &&
 				status.OneShot.Occupied == 0 && status.Services.Occupied == 0 {
-				clock.advanceArmedTimer(nodeAgent.session.claimInterval)
+				clock.advanceClaimWait(nodeAgent.session.claimInterval)
 			}
 		}
 	}
@@ -4012,30 +4111,53 @@ func (clock *manualClock) WallNow() time.Time {
 func (clock *manualClock) NewTimer(duration time.Duration) Timer {
 	clock.mu.Lock()
 	defer clock.mu.Unlock()
-	timer := &manualTimer{clock: clock, channel: make(chan time.Time, 1), deadline: clock.now.Add(duration), active: true}
+	timer := &manualTimer{clock: clock, channel: make(chan time.Time, 1), deadline: clock.now.Add(duration), active: true,
+		claimWait: armedByClaimWait()}
 	clock.timers = append(clock.timers, timer)
 	return timer
 }
 
 func (clock *manualClock) advanceArmedTimer(duration time.Duration) {
-	clock.advance(duration, true)
+	clock.advance(duration, func(*manualTimer) bool { return true })
+}
+
+// advanceClaimWait moves the clock only when the claim worker itself waits
+// exactly duration for its next claim poll. Another agent timer with the same
+// period does not count: the Computer policy acknowledgement loop also wakes
+// every second, and advancing on it moved the clock while a claim answer was
+// still in flight (#917).
+func (clock *manualClock) advanceClaimWait(duration time.Duration) {
+	clock.advance(duration, func(timer *manualTimer) bool { return timer.claimWait })
+}
+
+func (clock *manualClock) claimWaitArmed(deadline time.Time) bool {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	for _, timer := range clock.timers {
+		if timer.active && timer.claimWait && timer.deadline.Equal(deadline) {
+			return true
+		}
+	}
+	return false
 }
 
 func (clock *manualClock) Advance(duration time.Duration) {
-	clock.advance(duration, false)
+	clock.advance(duration, nil)
 }
 
-func (clock *manualClock) advance(duration time.Duration, requireArmedTimer bool) {
+// advance moves the clock by duration. A non-nil armed requires an active
+// timer, accepted by armed, that is due exactly at the new time.
+func (clock *manualClock) advance(duration time.Duration, armed func(*manualTimer) bool) {
 	clock.mu.Lock()
-	if requireArmedTimer {
-		armed := false
+	if armed != nil {
+		found := false
 		for _, timer := range clock.timers {
-			if timer.active && timer.deadline.Equal(clock.now.Add(duration)) {
-				armed = true
+			if timer.active && timer.deadline.Equal(clock.now.Add(duration)) && armed(timer) {
+				found = true
 				break
 			}
 		}
-		if !armed {
+		if !found {
 			clock.mu.Unlock()
 			return
 		}
@@ -4088,6 +4210,24 @@ type manualTimer struct {
 	channel  chan time.Time
 	deadline time.Time
 	active   bool
+	// claimWait marks the claim worker's wait between claim polls.
+	claimWait bool
+}
+
+// claimWaitFunction names the only place a claim worker waits between claim
+// polls. The method expression turns a rename into a compile error here.
+var claimWaitFunction = runtime.FuncForPC(reflect.ValueOf((*agentSession).waitForClaimWork).Pointer()).Name()
+
+// armedByClaimWait reports whether manualClock.NewTimer was called directly
+// from the claim worker's wait.
+func armedByClaimWait() bool {
+	var callers [1]uintptr
+	// Skip runtime.Callers, this function and manualClock.NewTimer.
+	if runtime.Callers(3, callers[:]) == 0 {
+		return false
+	}
+	frame, _ := runtime.CallersFrames(callers[:]).Next()
+	return frame.Function == claimWaitFunction
 }
 
 func (timer *manualTimer) C() <-chan time.Time { return timer.channel }
