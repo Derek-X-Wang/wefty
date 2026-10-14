@@ -22,6 +22,8 @@ import (
 
 func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
+	case "exec":
+		return executeExec(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "cancel":
 		return executeCancel(ctx, clients, jsonOutput, args[1:], stdout)
 	case "status":
