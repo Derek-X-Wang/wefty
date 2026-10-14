@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -43,8 +44,19 @@ func run() error {
 		readyFile                 = flag.String("ready-file", "", "write listener metadata after the server is ready")
 		controlPlaneNodeID        = flag.String("control-plane-node-id", "control-plane", "authenticated Fabric Node ID allowed to revoke Computer grants administratively")
 		computerAuthorityInstance = flag.String("computer-authority-instance", "default", "persisted L3 authority instance marker; change only for restore or promotion")
+		profilePath               = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, listen and control-plane addresses not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
 	flag.Parse()
+	profile, _, err := connprofile.Resolve(*profilePath, "")
+	if err != nil {
+		return err
+	}
+	settings := profile.L3()
+	layer := connprofile.Layer{Explicit: connprofile.ExplicitFlags(flag.CommandLine)}
+	layer.Fill(fabricMode, "fabric", "", settings.Fabric)
+	layer.Fill(plainFabricID, "plain-fabric-id", "WEFTY_DEV_PLAIN_FABRIC_ID", settings.PlainFabricID)
+	layer.Fill(listenAddress, "listen", "", settings.Listen)
+	layer.Fill(controlPlane, "control-plane", "", settings.ControlPlane)
 	if *reconcileEvery <= 0 {
 		return fmt.Errorf("--reconcile-interval must be positive")
 	}

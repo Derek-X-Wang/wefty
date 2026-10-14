@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func DefaultInstalledConfigPath(home string) (string, error) {
@@ -31,21 +32,55 @@ func ReadInstalledConfig(path string) (InstalledConfig, error) {
 	if err := decoder.Decode(&config); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
 		return InstalledConfig{}, errors.New("read installed node configuration: invalid JSON")
 	}
-	if config.Version != InstalledConfigVersion || !filepath.IsAbs(config.ControlSocket) || filepath.Clean(config.ControlSocket) == string(filepath.Separator) {
-		return InstalledConfig{}, errors.New("read installed node configuration: invalid version or control socket")
+	if err := config.validate(); err != nil {
+		return InstalledConfig{}, fmt.Errorf("read installed node configuration: %w", err)
 	}
 	return config, nil
 }
 
-func WriteInstalledConfig(path string, config InstalledConfig) error {
-	if !filepath.IsAbs(path) || config.Version != InstalledConfigVersion || !filepath.IsAbs(config.ControlSocket) || filepath.Clean(config.ControlSocket) == string(filepath.Separator) {
-		return errors.New("installed node configuration requires absolute paths and the current version")
+// validate accepts two shapes. An OCI installation names its absolute control
+// socket, and an older one may omit the node ID. A plain-process node has no
+// OCI control socket, so it must name the stable node ID instead: a file with
+// neither identifies nothing.
+func (config InstalledConfig) validate() error {
+	if config.Version != InstalledConfigVersion {
+		return errors.New("invalid version")
 	}
-	payload, err := json.Marshal(config)
+	if config.ControlSocket == "" {
+		if strings.TrimSpace(config.NodeID) == "" {
+			return errors.New("a configuration without an OCI control socket must record the stable node ID")
+		}
+		return nil
+	}
+	if !filepath.IsAbs(config.ControlSocket) || filepath.Clean(config.ControlSocket) == string(filepath.Separator) {
+		return errors.New("invalid control socket")
+	}
+	return nil
+}
+
+func WriteInstalledConfig(path string, config InstalledConfig) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("installed node configuration requires an absolute path")
+	}
+	payload, err := EncodeInstalledConfig(config)
 	if err != nil {
 		return err
 	}
-	return writeAtomic(path, append(payload, '\n'), 0o600)
+	return writeAtomic(path, payload, 0o600)
+}
+
+// EncodeInstalledConfig returns the exact bytes WriteInstalledConfig stores,
+// so an installer that writes through its own confined folder handle stores
+// the same document.
+func EncodeInstalledConfig(config InstalledConfig) ([]byte, error) {
+	if err := config.validate(); err != nil {
+		return nil, fmt.Errorf("installed node configuration: %w", err)
+	}
+	payload, err := json.Marshal(config)
+	if err != nil {
+		return nil, err
+	}
+	return append(payload, '\n'), nil
 }
 
 func writeAtomic(path string, payload []byte, mode os.FileMode) error {

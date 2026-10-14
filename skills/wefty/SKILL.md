@@ -17,7 +17,7 @@ running after the AI agent's session ends. A single local node is a valid
 target: the work still uses that machine's CPU, but its lifetime belongs to
 the cluster rather than to the AI agent's session.
 
-Install by copying `skills/wefty/` to `~/.claude/skills/wefty/` (Claude Code) or `~/.agents/skills/wefty/` (Codex).
+Install by copying `skills/wefty/` to `~/.claude/skills/wefty/` (Claude Code) or `~/.agents/skills/wefty/` (Codex). `wefty setup` does this on a Mac it sets up.
 
 ## Start here: is the cluster ready?
 
@@ -55,7 +55,10 @@ them to fix it. Single-machine setup is in
 [`docs/acceptance/v0.1-dogfood.md`](../../docs/acceptance/v0.1-dogfood.md)
 (v0.1 section); build the binaries with `go build -o .bin/<name> ./cmd/<name>`.
 
-Every CLI call that reaches the cluster needs the endpoints:
+On a Mac where the owner ran `wefty setup`, the connection profile it wrote
+(`~/.config/wefty/profile.json`) supplies the endpoints and identities, so no
+flag below is needed; a flag or a `WEFTY_*` variable still wins. Elsewhere,
+every CLI call that reaches the cluster needs the endpoints:
 `--l1=<host:port> --l3=<host:port>` (plain fabric) — or the tsnet flags on a
 fleet. Set them once per shell: `export WEFTY_L1_ADDR=<host:port>
 WEFTY_L3_ADDR=<host:port>` makes them the defaults, and a flag still wins.

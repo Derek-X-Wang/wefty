@@ -10,6 +10,7 @@
 package durable
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -59,6 +60,54 @@ func WriteFile(dir *os.Root, name string, payload []byte, mode os.FileMode) erro
 	}
 	if err := dir.Rename(staging, name); err != nil {
 		_ = dir.Remove(staging)
+		return err
+	}
+	return syncDirectory(dir)
+}
+
+// Holds reports whether name in dir is a regular file, not a link, holding
+// exactly payload with exactly the permission bits of mode. Anything else,
+// including an error reading it, is a no, and the caller publishes again.
+func Holds(dir *os.Root, name string, payload []byte, mode os.FileMode) bool {
+	info, err := dir.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != mode.Perm() || info.Size() != int64(len(payload)) {
+		return false
+	}
+	current, err := dir.ReadFile(name)
+	return err == nil && bytes.Equal(current, payload)
+}
+
+// WriteFileMode is WriteFile that then sets the permission bits to exactly
+// mode: the process umask may have narrowed them when the file was created,
+// and a file that can never match its mode would be rewritten on every run.
+func WriteFileMode(dir *os.Root, name string, payload []byte, mode os.FileMode) error {
+	if err := WriteFile(dir, name, payload, mode); err != nil {
+		return err
+	}
+	return dir.Chmod(name, mode.Perm())
+}
+
+// Stage durably writes payload with exactly mode under the name staging,
+// replacing whatever stood there, so a caller can prepare a document before
+// it disturbs anything and publish it later with Publish.
+func Stage(dir *os.Root, staging string, payload []byte, mode os.FileMode) error {
+	if err := dir.Remove(staging); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("clear staging file %q: %w", staging, err)
+	}
+	if err := writeStaged(dir, staging, payload, mode); err != nil {
+		return err
+	}
+	if err := dir.Chmod(staging, mode.Perm()); err != nil {
+		_ = dir.Remove(staging)
+		return err
+	}
+	return nil
+}
+
+// Publish renames a staged document over name with one rename and syncs the
+// directory, so name holds either the old document or the staged one.
+func Publish(dir *os.Root, staging, name string) error {
+	if err := dir.Rename(staging, name); err != nil {
 		return err
 	}
 	return syncDirectory(dir)
