@@ -29,10 +29,11 @@ import (
 )
 
 var (
-	agentHelperPath       string
-	agentBinaryPath       string
-	controlPlanePath      string
-	echoServiceBinaryPath string
+	agentHelperPath        string
+	agentBinaryPath        string
+	controlPlanePath       string
+	echoServiceBinaryPath  string
+	agentTestGoEnvironment map[string]string
 )
 
 func TestMain(main *testing.M) {
@@ -52,6 +53,50 @@ func TestMain(main *testing.M) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	}
+	// Pin Go's real cache, workspace and env-file paths before changing HOME.
+	// Both these builds and the later conformance CLI build inherit them;
+	// otherwise an unconfigured caller puts a module cache in our fake home.
+	// Failure-path children inherit these values and must not invoke Go.
+	if !inherited {
+		output, err := exec.Command("go", "env", "-json", "GOCACHE", "GOMODCACHE", "GOPATH", "GOENV").CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "resolve test Go environment: %v\n%s", err, output)
+			os.Exit(1)
+		}
+		if err := json.Unmarshal(output, &agentTestGoEnvironment); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		for key, value := range agentTestGoEnvironment {
+			if err := os.Setenv(key, value); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
+	}
+	// Isolate even a future subprocess that bypasses startManagedProcess.
+	// Observe only this disposable default root, never the owner's state.
+	canonicalDirectory, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	home := filepath.Join(canonicalDirectory, "home")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	for key, value := range map[string]string{"HOME": home, "XDG_STATE_HOME": filepath.Join(home, ".local", "state")} {
+		if err := os.Setenv(key, value); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	defaultRoot, err := DefaultManagedRootDirectory()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 	agentHelperPath = filepath.Join(directory, "processhelper")
 	agentBinaryPath = filepath.Join(directory, "wefty-agent")
@@ -80,6 +125,16 @@ func TestMain(main *testing.M) {
 		}
 	}
 	code := main.Run()
+	if _, err := os.Lstat(defaultRoot); !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(os.Stderr, "test isolation regression: default managed root %q was touched (stat: %v); pass a temporary --managed-root\n", defaultRoot, err)
+		code = 1
+	}
+	for _, path := range agentTestFakeHomeGoPaths(home) {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "test isolation regression: Go state appeared under fake HOME at %q (stat: %v)\n", path, err)
+			code = 1
+		}
+	}
 	if err := removeOwnedAgentTestHelpers(directory, inherited); err != nil && code == 0 {
 		fmt.Fprintln(os.Stderr, err)
 		code = 1

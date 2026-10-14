@@ -66,12 +66,14 @@ From the repository root, build the four Go binaries and the workflow:
 
 ```sh
 export WEFTY_ROOT="$(git rev-parse --show-toplevel)"
-export WEFTY_STATE_ROOT="${TMPDIR:-/tmp}/wefty-quickstart"
+# The managed root refuses symlinked paths, and macOS's TMPDIR is under /var,
+# a symlink, so resolve the state root to its canonical path here.
+export WEFTY_STATE_ROOT="$(mkdir -p "${TMPDIR:-/tmp}/wefty-quickstart" && cd "${TMPDIR:-/tmp}/wefty-quickstart" && pwd -P)"
 export WEFTY_L1_ADDR=127.0.0.1:42101
 export WEFTY_L3_ADDR=127.0.0.1:42102
 export WEFTY_DEV_PLAIN_FABRIC_ID=plain-local-quickstart
 
-mkdir -p "$WEFTY_ROOT/.bin" "$WEFTY_STATE_ROOT"
+mkdir -p "$WEFTY_ROOT/.bin"
 go build -o "$WEFTY_ROOT/.bin/wefty-l1" ./cmd/wefty-l1
 go build -o "$WEFTY_ROOT/.bin/wefty-l3" ./cmd/wefty-l3
 go build -o "$WEFTY_ROOT/.bin/wefty-agent" ./cmd/wefty-agent
@@ -147,6 +149,7 @@ mkdir -p "$WEFTY_STATE_ROOT/agent-logs"
   --control-plane="$WEFTY_L1_ADDR" \
   --run-ledger="$WEFTY_L3_ADDR" \
   --node-id=dogfood-local \
+  --managed-root="$WEFTY_STATE_ROOT/managed" \
   --log-spool-dir="$WEFTY_STATE_ROOT/agent-logs"
 ```
 
