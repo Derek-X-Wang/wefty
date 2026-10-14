@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -109,11 +110,18 @@ func run() error {
 		allowPlainPersonIDs      = flag.Bool("allow-plain-person-identities", false, "DEVELOPMENT ONLY: allow self-asserted plain Fabric identities on person routes")
 		runLedgerAddress         = flag.String("run-ledger", l1.DefaultRunLedgerAddress, "L3 run-ledger Fabric address; pass --run-ledger= for an installation that has no run ledger")
 		runLedgerNodeID          = flag.String("run-ledger-node-id", "run-ledger", "authenticated Fabric identity allowed to request Computer scope proofs and classified as run-ledger job provenance; on tsnet this is the run ledger's Tailscale StableID, not a friendly name")
+		profilePath              = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, listen and run-ledger addresses, the plain person identity rule and node admission not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
 	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies, service: true}, "node-max-service-slots", "authoritative service capacity as node-id=slots (repeatable)")
 	flag.Parse()
+	if err := applyConnectionProfile(*profilePath, connprofile.ExplicitFlags(flag.CommandLine), l1Options{
+		fabricMode: fabricMode, plainFabricID: plainFabricID, listen: listenAddress, runLedger: runLedgerAddress,
+		allowPlainPersonIDs: allowPlainPersonIDs, nodePolicies: nodePolicies,
+	}); err != nil {
+		return err
+	}
 	if err := pathflags.Absolutize(
 		pathflags.Flag{Name: "db", Value: databasePath},
 		pathflags.Flag{Name: "state-dir", Value: stateDirectory},
@@ -231,6 +239,36 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return server.Serve(ctx, listener)
+}
+
+// l1Options are the settings the connection profile may supply.
+type l1Options struct {
+	fabricMode, plainFabricID, listen, runLedger *string
+	allowPlainPersonIDs                          *bool
+	nodePolicies                                 map[string]l1.NodePolicy
+}
+
+// applyConnectionProfile fills what the flags and environment left unset from
+// the named connection profile. Node admission comes from the profile only
+// when no node policy flag was passed: flags replace that policy whole.
+func applyConnectionProfile(path string, explicit map[string]bool, options l1Options) error {
+	profile, _, err := connprofile.Resolve(path, "")
+	if err != nil {
+		return err
+	}
+	settings := profile.L1()
+	layer := connprofile.Layer{Explicit: explicit}
+	layer.Fill(options.fabricMode, "fabric", "", settings.Fabric)
+	layer.Fill(options.plainFabricID, "plain-fabric-id", "WEFTY_DEV_PLAIN_FABRIC_ID", settings.PlainFabricID)
+	layer.Fill(options.listen, "listen", "", settings.Listen)
+	layer.Fill(options.runLedger, "run-ledger", "", settings.RunLedger)
+	layer.Enable(options.allowPlainPersonIDs, "allow-plain-person-identities", settings.AllowPlainPersonIdentities)
+	if !explicit["node-tags"] && !explicit["node-max-oneshot-slots"] && !explicit["node-max-service-slots"] {
+		for nodeID, policy := range settings.NodePolicies() {
+			options.nodePolicies[nodeID] = policy
+		}
+	}
+	return nil
 }
 
 // requireReachableRunLedger refuses a start that could never revoke Computer

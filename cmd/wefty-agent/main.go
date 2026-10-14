@@ -22,6 +22,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -466,10 +467,26 @@ func run() error {
 		ociSetupState         = flag.String("oci-setup-state", "", "absolute durable OCI setup convergence state")
 		ociMemoryCapacity     = flag.Int64("oci-memory-capacity-bytes", 0, "setup-configured Computer memory ceiling used by the private helper")
 		ociMemoryReserve      = flag.Int64("oci-memory-reserve-bytes", 0, "setup-configured infrastructure memory reserve used by the private helper")
+		shutdownBudget        = flag.Duration("shutdown-budget", 0, "after the first SIGINT or SIGTERM, cancel resident attempts in order once this long has passed; 0 waits for them (a second signal still cancels at once)")
+		profilePath           = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, control-plane and run-ledger addresses and the node ID not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
 	flag.Parse()
+	profile, _, err := connprofile.Resolve(*profilePath, "")
+	if err != nil {
+		return err
+	}
+	settings := profile.NodeAgent()
+	layer := connprofile.Layer{Explicit: connprofile.ExplicitFlags(flag.CommandLine)}
+	layer.Fill(fabricMode, "fabric", "", settings.Fabric)
+	layer.Fill(plainFabricID, "plain-fabric-id", "WEFTY_DEV_PLAIN_FABRIC_ID", settings.PlainFabricID)
+	layer.Fill(controlPlane, "control-plane", "", settings.ControlPlane)
+	layer.Fill(runLedger, "run-ledger", "", settings.RunLedger)
+	layer.Fill(nodeID, "node-id", "", settings.NodeID)
 	if *nodeID == "" {
 		return fmt.Errorf("--node-id is required")
+	}
+	if *shutdownBudget < 0 {
+		return errors.New("--shutdown-budget must not be negative")
 	}
 	// The OCI paths below stay required-absolute: they name operator-owned
 	// files whose location is part of a security check, and a guess would
@@ -915,7 +932,7 @@ func run() error {
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	go func() {
-		handleShutdownSignals(ctx, signals, func(drainContext context.Context) error {
+		handleShutdownSignals(ctx, signals, *shutdownBudget, func(drainContext context.Context) error {
 			_, err := nodeAgent.Drain(drainContext)
 			return err
 		}, cancel, log.Printf)
@@ -925,9 +942,16 @@ func run() error {
 	return err
 }
 
+// handleShutdownSignals drains on the first signal and cancels resident
+// attempts on the second. A positive budget, counted from the first signal,
+// cancels them on its own when it runs out: a service manager that kills the
+// process after a fixed timeout (launchd's ExitTimeOut) then still gets the
+// orderly path -- each attempt terminated, reaped and finalized -- instead
+// of SIGKILL. Zero keeps waiting for residents, as a hand-started agent does.
 func handleShutdownSignals(
 	ctx context.Context,
 	signals <-chan os.Signal,
+	budget time.Duration,
 	drain func(context.Context) error,
 	cancel context.CancelFunc,
 	logf func(string, ...any),
@@ -936,6 +960,12 @@ func handleShutdownSignals(
 	case <-ctx.Done():
 		return
 	case <-signals:
+	}
+	var budgetExpired <-chan time.Time
+	if budget > 0 {
+		timer := time.NewTimer(budget)
+		defer timer.Stop()
+		budgetExpired = timer.C
 	}
 	drainDone := make(chan error, 1)
 	go func() {
@@ -953,6 +983,10 @@ func handleShutdownSignals(
 		logf("wefty-agent: forced_shutdown transition=draining_to_forced reason=second_signal")
 		cancel()
 		return
+	case <-budgetExpired:
+		logf("wefty-agent: forced_shutdown transition=draining_to_forced reason=shutdown_budget")
+		cancel()
+		return
 	case err := <-drainDone:
 		if err != nil {
 			logf("wefty-agent: graceful drain failed: %v", err)
@@ -964,6 +998,9 @@ func handleShutdownSignals(
 	case <-ctx.Done():
 	case <-signals:
 		logf("wefty-agent: forced_shutdown transition=drained_to_forced reason=second_signal")
+		cancel()
+	case <-budgetExpired:
+		logf("wefty-agent: forced_shutdown transition=drained_to_forced reason=shutdown_budget")
 		cancel()
 	}
 }

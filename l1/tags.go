@@ -50,3 +50,7 @@ func validTag(tag string) bool {
 	}
 	return true
 }
+
+// ValidTag reports whether tag is one L1 accepts as an authoritative node tag
+// after normalization, so configuration can be refused before L1 starts.
+func ValidTag(tag string) bool { return validTag(tag) }

@@ -30,6 +30,28 @@ directly to nodes, and L1 remains the only job queue. See the
 [v1 design](docs/2026-08-06-wefty-v1-design.md) for the architecture and build
 order.
 
+## Daily use on this Mac: `wefty setup`
+
+Build the four binaries into one folder and run that folder's `wefty setup`.
+It copies them to `~/.local/bin`, installs L1, the run ledger and a node agent
+as per-user LaunchAgents that start at login and restart after a crash (plain
+network mode, no sudo), and writes one connection profile,
+`~/.config/wefty/profile.json`, that every wefty program reads. Flags win over
+environment variables, which win over the profile, which wins over built-in
+defaults. Running setup again changes only what is wrong.
+
+```sh
+go build -o .bin/ ./cmd/wefty ./cmd/wefty-l1 ./cmd/wefty-l3 ./cmd/wefty-agent
+.bin/wefty setup
+wefty status    # in a new shell, with no flags
+```
+
+Data lives in `~/Library/Application Support/wefty` (fresh databases; setup
+never adopts development ones), logs in `~/Library/Logs/wefty`, and this
+machine's stable node ID in `~/.config/wefty/node.json`. The node agent gets
+your login-shell `PATH`, and the skill is copied to `~/.claude/skills/wefty`
+and `~/.agents/skills/wefty`.
+
 ## Quickstart: one machine, plain fabric
 
 This is the condensed v0.1 path. It runs the whole stack over localhost with no

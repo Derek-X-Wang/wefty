@@ -10,7 +10,7 @@ import (
 )
 
 var helpCommands = []string{
-	"", "help", "submit", "status", "whoami", "cancel", "rerun", "logs", "wait", "results", "inspect", "drain",
+	"", "help", "setup", "submit", "status", "whoami", "cancel", "rerun", "logs", "wait", "results", "inspect", "drain",
 	"nodes", "nodes list", "nodes inspect", "nodes set-claims", "jobs", "jobs list", "computers", "computers list", "runs", "runs list",
 	"admin", "admin bootstrap", "admin policy", "admin policy get", "admin policy add", "admin policy remove",
 	"admins", "admins list", "admins get", "admins add", "admins remove",

@@ -31,6 +31,20 @@ resident attempts immediately. While Drain is joining residents it emits
 Drain returns it emits
 `forced_shutdown transition=drained_to_forced reason=second_signal`. These
 exact tokens distinguish operator abort from clean drain completion.
+`--shutdown-budget D` (default `0`, which keeps the behavior above) makes the
+agent take that same forced transition itself once `D` has passed since the
+first signal, emitting `reason=shutdown_budget` in place of
+`reason=second_signal`. Resident attempts are then cancelled in order: each is
+terminated with `termination_cause=agent`, reaped and finalized, and its result
+reaches L1. Each attempt's cancellation phases run one after another: the
+process runner's termination grace and reap; the final log flush, which runs
+to the finalization timeout and can overrun it by the one request in flight
+(one L1 operation timeout); then the completion or its evidence recovery and
+the result upload (one operation timeout each). `agent.ForcedShutdownBound` is
+their sum. A service manager that
+kills after a fixed timeout must allow `D` plus that bound; `wefty setup`
+passes a budget to the installed node agent and derives launchd's `ExitTimeOut`
+from both, with slack.
 
 ## Capability observation and local admission
 
@@ -238,7 +252,13 @@ recreate-required by comparing current with desired rather than echoing the
 last probe reason.
 
 Singular `wefty node` commands resolve the installed node configuration before
-Fabric initialization and use only the live agent's Unix control socket. Its
+Fabric initialization and use only the live agent's Unix control socket. The
+configuration has two valid shapes: an OCI installation names its absolute
+`control_socket` (an older one may omit `node_id`), and a plain-process node
+installed by `wefty setup` records `node_id` with no `control_socket`. A file
+with neither is invalid. The plain shape still names this machine's node for
+`wefty status` and `wefty exec`; singular `wefty node` commands refuse it with
+an error naming the file, because they need an OCI installation. Its
 private runtime directory is `0700`, its socket is `0600`, an active socket is never replaced,
 and a symlink or non-socket path fails closed. The server authenticates every
 accepted peer with `SO_PEERCRED` on Linux or `LOCAL_PEERCRED` on macOS and

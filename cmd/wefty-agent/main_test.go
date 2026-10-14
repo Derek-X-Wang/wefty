@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -41,7 +42,7 @@ func TestSecondShutdownSignalCancelsWhileGracefulDrainIsStillJoining(t *testing.
 	logs := make(chan string, 1)
 	done := make(chan struct{})
 	go func() {
-		handleShutdownSignals(ctx, signals, func(context.Context) error {
+		handleShutdownSignals(ctx, signals, 0, func(context.Context) error {
 			close(drainEntered)
 			<-releaseDrain
 			return nil
@@ -75,7 +76,7 @@ func TestSingleShutdownSignalDrainsToCompletionWithoutForcingCancellation(t *tes
 	canceled := make(chan struct{}, 1)
 	done := make(chan struct{})
 	go func() {
-		handleShutdownSignals(ctx, signals, func(context.Context) error {
+		handleShutdownSignals(ctx, signals, 0, func(context.Context) error {
 			close(drained)
 			return nil
 		}, func() { canceled <- struct{}{} }, func(string, ...any) {})
@@ -103,7 +104,7 @@ func TestSecondShutdownSignalAfterDrainStillEmitsForcedShutdownEvidence(t *testi
 	drained := make(chan struct{})
 	canceled := make(chan struct{})
 	logs := make(chan string, 1)
-	go handleShutdownSignals(ctx, signals, func(context.Context) error {
+	go handleShutdownSignals(ctx, signals, 0, func(context.Context) error {
 		close(drained)
 		return nil
 	}, func() { close(canceled) }, func(format string, _ ...any) { logs <- format })
@@ -122,6 +123,44 @@ func TestSecondShutdownSignalAfterDrainStillEmitsForcedShutdownEvidence(t *testi
 		}
 	case <-time.After(time.Second):
 		t.Fatal("post-drain second signal emitted no typed evidence")
+	}
+}
+
+// The installed node agent runs with a shutdown budget so launchd's
+// ExitTimeOut never has to SIGKILL it: one signal, and once the budget has
+// passed the resident attempts are cancelled in order, whether the drain
+// request is still joining them or has already returned.
+func TestShutdownBudgetCancelsResidentsAfterOneSignal(t *testing.T) {
+	for _, drainReturns := range []bool{false, true} {
+		t.Run(map[bool]string{false: "drain joining", true: "drain returned"}[drainReturns], func(t *testing.T) {
+			ctx, cancelContext := context.WithCancel(t.Context())
+			defer cancelContext()
+			signals := make(chan os.Signal, 1)
+			release := make(chan struct{})
+			defer close(release)
+			canceled := make(chan time.Time, 1)
+			logs := make(chan string, 1)
+			go handleShutdownSignals(ctx, signals, 50*time.Millisecond, func(context.Context) error {
+				if !drainReturns {
+					<-release
+				}
+				return nil
+			}, func() { canceled <- time.Now() }, func(format string, _ ...any) { logs <- format })
+			signaled := time.Now()
+			signals <- syscall.SIGTERM
+			select {
+			case at := <-canceled:
+				if at.Sub(signaled) < 50*time.Millisecond {
+					t.Fatalf("cancelled after %s, before the budget", at.Sub(signaled))
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("one signal with a shutdown budget never cancelled the residents")
+			}
+			want := map[bool]string{false: "transition=draining_to_forced reason=shutdown_budget", true: "transition=drained_to_forced reason=shutdown_budget"}[drainReturns]
+			if line := <-logs; !strings.Contains(line, "forced_shutdown "+want) {
+				t.Fatalf("forced shutdown evidence = %q, want %q", line, want)
+			}
+		})
 	}
 }
 
