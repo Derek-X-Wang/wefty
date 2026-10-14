@@ -20,6 +20,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		log.Printf("wefty-l3: %v", err)
@@ -29,6 +31,8 @@ func main() {
 
 func run() error {
 	var (
+		printVersion              = flag.Bool("version", false, "print the build commit and exit")
+		statePreflight            = flag.Bool("state-preflight", false, "open --db for upgrade preflight and exit; use only a temporary copy")
 		fabricMode                = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
 		plainFabricID             = flag.String("plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain Fabric ID (must start with plain-)")
 		listenAddress             = flag.String("listen", l3.DefaultL3Address, "run-ledger Fabric listen address")
@@ -47,6 +51,17 @@ func run() error {
 		profilePath               = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, listen and control-plane addresses not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
 	flag.Parse()
+	if *printVersion {
+		fmt.Println(version)
+		return nil
+	}
+	if *statePreflight {
+		store, err := l3.OpenStore(*databasePath, l3.StoreOptions{})
+		if err != nil {
+			return err
+		}
+		return store.Close()
+	}
 	profile, _, err := connprofile.Resolve(*profilePath, "")
 	if err != nil {
 		return err

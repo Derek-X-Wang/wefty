@@ -92,11 +92,21 @@ type setupHost struct {
 	// l1Address and l3Address are the ports a new profile gets.
 	l1Address, l3Address string
 	unloadBound          time.Duration
+	upgrade              *upgradeHost
 }
 
 type setupRequest struct {
-	from   string
-	nodeID string
+	from             string
+	nodeID           string
+	installedVersion string
+	skillSource      fs.FS
+	beforeWrites     func() error
+	serviceContext   func(int) context.Context
+	afterService     func(int, launchagent.Action) error
+	lockHeld         bool
+	wroteFile        func(string, []byte)
+	deferNodeBinary  bool
+	deferSkills      bool
 }
 
 // setupPaths are the standard locations under one owner's home. Every
@@ -359,6 +369,18 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return setupReport{}, err
 	}
+	if !request.lockHeld {
+		if _, err := os.Stat(paths.data); err == nil {
+			unlock, err := lockSetup(paths, true)
+			if err != nil {
+				return setupReport{}, err
+			}
+			defer unlock()
+			request.lockHeld = true
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return setupReport{}, err
+		}
+	}
 	report := setupReport{
 		Profile: paths.profile, NodeConfig: paths.nodeConfig,
 		BinDir: paths.bin, DataDir: paths.data, LogDir: paths.logs,
@@ -368,31 +390,31 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	// before the first write: a refusal changes no file and no service.
 	sourceDirectory, err := setupSourceDirectory(host, request)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	sourceDigests := make(map[string]string, len(setupBinaries))
 	for _, name := range setupBinaries {
 		digest, err := executableDigest(filepath.Join(sourceDirectory, name))
 		if err != nil {
-			return setupReport{}, fmt.Errorf("setup installs the binaries next to this wefty (or in --from DIR); build all four into one folder first: %w", err)
+			return report, fmt.Errorf("setup installs the binaries next to this wefty (or in --from DIR); build all four into one folder first: %w", err)
 		}
 		sourceDigests[name] = digest
 	}
 	existingProfile, err := readSetupProfile(paths.profile)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	nodeID, err := chooseSetupNodeID(host, request, paths, existingProfile)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	profile, err := desiredSetupProfile(host, existingProfile, nodeID)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	loginPATH, err := captureLoginPATH(ctx, host)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	nodeAgentPATH := loginPATH
 	if !slices.Contains(filepath.SplitList(loginPATH), paths.bin) {
@@ -403,34 +425,34 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 
 	profilePayload, err := connprofile.Encode(profile)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	nodeConfigPayload, err := ocicontrol.EncodeInstalledConfig(ocicontrol.InstalledConfig{Version: ocicontrol.InstalledConfigVersion, NodeID: nodeID})
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	files := []setupFile{
 		{folder: paths.configRel, name: connprofile.FileName, payload: profilePayload, mode: 0o600, change: "wrote connection profile " + paths.profile},
 		{folder: paths.configRel, name: "node.json", payload: nodeConfigPayload, mode: 0o600, change: "recorded node " + nodeID + " in " + paths.nodeConfig},
 	}
-	skillFiles, err := setupSkillFiles(paths)
+	skillFiles, err := setupSkillFilesFrom(paths, request.skillSource)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	files = append(files, skillFiles...)
 	services, err := setupServices(paths, profile, sourceDigests, nodeAgentPATH)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	plists := make([][]byte, len(services))
 	for index, service := range services {
 		if plists[index], err = launchagent.Render(service); err != nil {
-			return setupReport{}, err
+			return report, err
 		}
 	}
 	homeRoot, err := os.OpenRoot(home)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	defer homeRoot.Close()
 	folders := append([]string{paths.binRel, paths.configRel, paths.dataRel, paths.logsRel, paths.launchAgentsRel}, paths.nodeDataFolders...)
@@ -448,9 +470,31 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		destinations = append(destinations, filepath.Join(paths.launchAgentsRel, service.Label+".plist"))
 	}
 	if err := checkSetupDestinations(homeRoot, home, folders, destinations); err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 
+	// A first install validates without creating state folders. Once validation
+	// succeeds, acquire the state lock and re-read under it: another first install
+	// may have completed while this read-only preparation was running.
+	if !request.lockHeld {
+		unlock, err := lockSetup(paths, true)
+		if err != nil {
+			return report, err
+		}
+		defer unlock()
+		request.lockHeld = true
+		// Reuse the validated PATH; opening an interactive login shell twice
+		// can repeat owner shell side effects. Identity and files are re-read.
+		host.loginShell = func(context.Context, string, ...string) ([]byte, error) {
+			return []byte(setupPATHBegin + "\n" + loginPATH + "\n" + setupPATHEnd + "\n"), nil
+		}
+		return runSetup(ctx, host, request)
+	}
+	if request.beforeWrites != nil {
+		if err := request.beforeWrites(); err != nil {
+			return report, err
+		}
+	}
 	// Writes start here, all through the confined home handle.
 	for _, folder := range folders {
 		mode := os.FileMode(0o700)
@@ -458,26 +502,38 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			mode = 0o755
 		}
 		if err := homeRoot.MkdirAll(folder, mode); err != nil {
-			return setupReport{}, fmt.Errorf("create %s: %w", filepath.Join(home, folder), err)
+			return report, fmt.Errorf("create %s: %w", filepath.Join(home, folder), err)
 		}
 	}
 	for _, name := range setupBinaries {
 		payload, err := os.ReadFile(filepath.Join(sourceDirectory, name))
 		if err != nil {
-			return setupReport{}, err
+			return report, err
 		}
 		if digest := sha256.Sum256(payload); "sha256:"+hex.EncodeToString(digest[:]) != sourceDigests[name] {
-			return setupReport{}, fmt.Errorf("%s changed while setup was reading it; run setup again", filepath.Join(sourceDirectory, name))
+			return report, fmt.Errorf("%s changed while setup was reading it; run setup again", filepath.Join(sourceDirectory, name))
 		}
 		// The rename gives a running service's old binary its own inode, so
 		// the service keeps running until setup reloads it below.
 		files = append([]setupFile{{folder: paths.binRel, name: name, payload: payload, mode: 0o755,
 			change: "installed " + filepath.Join(paths.bin, name)}}, files...)
 	}
-	manifest := setupManifest{Version: 1, Files: map[string]string{}}
+	previous := setupManifest{Version: 1, Files: map[string]string{}}
+	manifest := setupManifest{Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
 	if payload, err := homeRoot.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
-		var previous setupManifest
 		if json.Unmarshal(payload, &previous) == nil && previous.Version == 1 {
+			if manifest.InstalledVersion == "" {
+				manifest.UpgradeSource = previous.UpgradeSource
+				unchanged := true
+				for _, name := range setupBinaries {
+					if sourceDigests[name] != previous.Files[filepath.Join(paths.binRel, name)] {
+						unchanged = false
+					}
+				}
+				if unchanged {
+					manifest.InstalledVersion = previous.InstalledVersion
+				}
+			}
 			for name, digest := range previous.Files {
 				for _, target := range paths.skillTargets {
 					rel, err := filepath.Rel(target, name)
@@ -488,6 +544,29 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			}
 		}
 	}
+	if request.deferSkills {
+		unownedWarning := false
+		files = slices.DeleteFunc(files, func(file setupFile) bool {
+			name := filepath.Join(file.folder, file.name)
+			if !setupSkillPath(paths, name) {
+				return false
+			}
+			payload, err := homeRoot.ReadFile(name)
+			// Never claim or overwrite an owner edit, including a previously unowned copy.
+			if err == nil && payloadDigest(payload) != previous.Files[name] {
+				if previous.Files[name] == "" {
+					if !unownedWarning {
+						report.Notes = append(report.Notes, "left existing skill copies without ownership evidence; run wefty setup to refresh the skill copies")
+						unownedWarning = true
+					}
+				} else {
+					report.Notes = append(report.Notes, "left owner-edited skill copy "+filepath.Join(home, name))
+				}
+				return true
+			}
+			return false
+		})
+	}
 	for _, file := range files {
 		manifest.Files[filepath.Join(file.folder, file.name)] = payloadDigest(file.payload)
 	}
@@ -496,13 +575,44 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	manifestPayload, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	files = append(files, setupFile{folder: paths.configRel, name: setupManifestName, payload: append(manifestPayload, '\n'), mode: 0o600, change: ""})
+	// Keep the previous receipt until activation and deferred publication finish.
+	// A partial receipt can lose ownership entries and disable legacy removal.
+	var completedReceipt *setupFile
+	if request.installedVersion != "" {
+		file := files[len(files)-1]
+		completedReceipt = &file
+		files = files[:len(files)-1]
+	}
+	var deferredNodeFile *setupFile
+	var deferredSkills []setupFile
 	for _, file := range files {
+		if request.deferSkills {
+			skill := false
+			for _, target := range paths.skillTargets {
+				rel, err := filepath.Rel(target, filepath.Join(file.folder, file.name))
+				if err == nil && rel != "." && filepath.IsLocal(rel) {
+					skill = true
+				}
+			}
+			if skill {
+				deferredSkills = append(deferredSkills, file)
+				continue
+			}
+		}
+		if request.deferNodeBinary && file.folder == paths.binRel && file.name == "wefty-agent" {
+			copy := file
+			deferredNodeFile = &copy
+			continue
+		}
 		changed, err := convergeHomeFile(homeRoot, file)
 		if err != nil {
-			return setupReport{}, fmt.Errorf("write %s: %w", filepath.Join(home, file.folder, file.name), err)
+			return report, fmt.Errorf("write %s: %w", filepath.Join(home, file.folder, file.name), err)
+		}
+		if changed && request.wroteFile != nil {
+			request.wroteFile(filepath.Join(file.folder, file.name), file.payload)
 		}
 		if changed && file.change != "" && !slices.Contains(report.Changes, file.change) {
 			report.Changes = append(report.Changes, file.change)
@@ -510,22 +620,64 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	launchAgents, err := homeRoot.OpenRoot(paths.launchAgentsRel)
 	if err != nil {
-		return setupReport{}, err
+		return report, err
 	}
 	defer launchAgents.Close()
 	for index, service := range services {
+		serviceCtx := ctx
+		if request.serviceContext != nil {
+			serviceCtx = request.serviceContext(index)
+		}
+		if index == 2 && deferredNodeFile != nil {
+			changed, err := convergeHomeFile(homeRoot, *deferredNodeFile)
+			if err != nil {
+				return report, err
+			}
+			if changed && request.wroteFile != nil {
+				request.wroteFile(filepath.Join(deferredNodeFile.folder, deferredNodeFile.name), deferredNodeFile.payload)
+			}
+		}
 		manager := launchagent.Manager{Run: host.launchctl, UID: host.uid, UnloadBound: host.unloadBound}
 		if manager.UnloadBound == 0 && service.ExitTimeOut > 0 {
 			manager.UnloadBound = time.Duration(service.ExitTimeOut+15) * time.Second
 		}
 		plist := filepath.Join(paths.launchAgents, service.Label+".plist")
-		action, err := manager.Converge(ctx, launchAgents, plist, service.Label, plists[index])
+		action, err := manager.Converge(serviceCtx, launchAgents, plist, service.Label, plists[index])
+		if request.wroteFile != nil && action != launchagent.Unchanged {
+			// Converge can publish its plist before bootstrap fails. Record only bytes
+			// that are actually present, never an unrelated owner modification.
+			if payload, readErr := launchAgents.ReadFile(service.Label + ".plist"); readErr == nil && bytes.Equal(payload, plists[index]) {
+				request.wroteFile(filepath.Join(paths.launchAgentsRel, service.Label+".plist"), payload)
+			}
+		}
 		if err != nil {
-			return setupReport{}, err
+			return report, err
+		}
+		if request.afterService != nil {
+			if err := request.afterService(index, action); err != nil {
+				return report, err
+			}
 		}
 		report.Services = append(report.Services, setupServiceReport{
 			Label: service.Label, Plist: plist, Log: service.LogPath, Action: action,
 		})
+	}
+	for _, file := range deferredSkills {
+		changed, err := convergeHomeFile(homeRoot, file)
+		if err != nil {
+			return report, err
+		}
+		if changed && request.wroteFile != nil {
+			request.wroteFile(filepath.Join(file.folder, file.name), file.payload)
+		}
+		if changed && !slices.Contains(report.Changes, file.change) {
+			report.Changes = append(report.Changes, file.change)
+		}
+	}
+	if completedReceipt != nil {
+		if _, err := convergeHomeFile(homeRoot, *completedReceipt); err != nil {
+			return report, err
+		}
 	}
 	if report.Changes == nil {
 		report.Changes = []string{}
@@ -537,6 +689,16 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 // is not a folder or a destination file that is a folder or another
 // non-file, and lets the confined handle refuse any path that would leave
 // home. A file that is a link is replaced, never followed.
+func setupSkillPath(paths setupPaths, name string) bool {
+	for _, target := range paths.skillTargets {
+		rel, err := filepath.Rel(target, name)
+		if err == nil && rel != "." && filepath.IsLocal(rel) {
+			return true
+		}
+	}
+	return false
+}
+
 func checkSetupDestinations(homeRoot *os.Root, home string, folders, files []string) error {
 	for _, folder := range folders {
 		for ancestor := folder; ancestor != "."; ancestor = filepath.Dir(ancestor) {
@@ -864,13 +1026,20 @@ func captureLoginPATH(ctx context.Context, host setupHost) (string, error) {
 // setupSkillFiles prepares the embedded skill's files for both skill
 // folders: Claude Code reads ~/.claude/skills, Codex ~/.agents/skills.
 func setupSkillFiles(paths setupPaths) ([]setupFile, error) {
+	return setupSkillFilesFrom(paths, nil)
+}
+
+func setupSkillFilesFrom(paths setupPaths, source fs.FS) ([]setupFile, error) {
+	if source == nil {
+		source = skills.Wefty
+	}
 	var files []setupFile
 	for _, target := range paths.skillTargets {
-		err := fs.WalkDir(skills.Wefty, "wefty", func(name string, entry fs.DirEntry, err error) error {
+		err := fs.WalkDir(source, "wefty", func(name string, entry fs.DirEntry, err error) error {
 			if err != nil || entry.IsDir() {
 				return err
 			}
-			payload, err := skills.Wefty.ReadFile(name)
+			payload, err := fs.ReadFile(source, name)
 			if err != nil {
 				return err
 			}

@@ -74,6 +74,8 @@ func policyForNode(policies map[string]l1.NodePolicy, nodeID string) l1.NodePoli
 	return policy
 }
 
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		log.Printf("wefty-l1: %v", err)
@@ -84,6 +86,8 @@ func main() {
 func run() error {
 	nodePolicies := make(map[string]l1.NodePolicy)
 	var (
+		printVersion             = flag.Bool("version", false, "print the build commit and exit")
+		statePreflight           = flag.Bool("state-preflight", false, "open --db for upgrade preflight and exit; use only a temporary copy")
 		fabricMode               = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
 		plainFabricID            = flag.String("plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain Fabric ID (must start with plain-)")
 		listenAddress            = flag.String("listen", "wefty://control-plane", "control-plane Fabric listen address")
@@ -116,6 +120,17 @@ func run() error {
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies, service: true}, "node-max-service-slots", "authoritative service capacity as node-id=slots (repeatable)")
 	flag.Parse()
+	if *printVersion {
+		fmt.Println(version)
+		return nil
+	}
+	if *statePreflight {
+		store, err := l1.OpenStore(*databasePath, l1.StoreOptions{})
+		if err != nil {
+			return err
+		}
+		return store.Close()
+	}
 	if err := applyConnectionProfile(*profilePath, connprofile.ExplicitFlags(flag.CommandLine), l1Options{
 		fabricMode: fabricMode, plainFabricID: plainFabricID, listen: listenAddress, runLedger: runLedgerAddress,
 		allowPlainPersonIDs: allowPlainPersonIDs, nodePolicies: nodePolicies,

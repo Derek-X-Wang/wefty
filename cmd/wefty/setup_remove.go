@@ -22,8 +22,10 @@ import (
 const setupManifestName = "setup-files.json"
 
 type setupManifest struct {
-	Version int               `json:"version"`
-	Files   map[string]string `json:"files"`
+	InstalledVersion string            `json:"installed_version,omitempty"`
+	UpgradeSource    bool              `json:"upgrade_source,omitempty"`
+	Version          int               `json:"version"`
+	Files            map[string]string `json:"files"`
 }
 type setupRemoveReport struct {
 	Changes  []string `json:"changes"`
@@ -63,6 +65,11 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 	if purge && (paths.dataRel != setupFolders.data || paths.logsRel != setupFolders.logs) {
 		return report, errors.New("purge requires standard data and log folders without redirected paths; move their symbolic links aside first")
 	}
+	unlock, err := lockSetup(paths, false)
+	if err != nil {
+		return report, err
+	}
+	defer unlock()
 	root, err := os.OpenRoot(home)
 	if err != nil {
 		return report, err
@@ -255,6 +262,13 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 		pruneSetupEmpty(root, target, skillFolders)
 	}
 	_ = root.Remove(paths.configRel)
+	// Unlink the locked state directory only as our final mutation. Another
+	// installer may recreate it after this point without overlapping our writes.
+	if purge && setupEvidence {
+		if err := root.Remove(paths.dataRel); err == nil {
+			report.Changes = append(report.Changes, paths.data)
+		}
+	}
 	return report, nil
 }
 func setupMetadataPath(paths setupPaths, name string) bool {
@@ -262,6 +276,10 @@ func setupMetadataPath(paths setupPaths, name string) bool {
 }
 
 func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveReport) error {
+	var manifest setupManifest
+	if payload, err := root.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
+		_ = json.Unmarshal(payload, &manifest)
+	}
 	for _, folder := range []string{paths.dataRel, paths.logsRel} {
 		entries, err := fs.ReadDir(root.FS(), folder)
 		if errors.Is(err, fs.ErrNotExist) {
@@ -274,7 +292,7 @@ func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveRepor
 			name := entry.Name()
 			ownFile := folder == paths.dataRel && slices.Contains([]string{"l1.sqlite", "l1.sqlite-wal", "l1.sqlite-shm", "l1.sqlite-journal", "l3.sqlite", "l3.sqlite-wal", "l3.sqlite-shm", "l3.sqlite-journal"}, name) ||
 				folder == paths.logsRel && slices.Contains([]string{"l1.log", "l3.log", "node-agent.log"}, name)
-			ownFolder := folder == paths.dataRel && name == "node-agent" && entry.IsDir()
+			ownFolder := folder == paths.dataRel && (name == "node-agent" || name == upgradeSourceName && manifest.Version == 1 && manifest.UpgradeSource) && entry.IsDir()
 			rel := filepath.Join(folder, name)
 			if !ownFolder && !(ownFile && entry.Type().IsRegular()) {
 				report.Warnings = append(report.Warnings, "left "+filepath.Join(paths.home, rel)+": this entry was not installed by setup; inspect it before removing it yourself")
@@ -288,8 +306,10 @@ func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveRepor
 			report.Changes = append(report.Changes, filepath.Join(paths.home, rel))
 		}
 		// Remove only an empty container that existed when this pass began.
-		if err := root.Remove(folder); err == nil {
-			report.Changes = append(report.Changes, filepath.Join(paths.home, folder))
+		if folder != paths.dataRel {
+			if err := root.Remove(folder); err == nil {
+				report.Changes = append(report.Changes, filepath.Join(paths.home, folder))
+			}
 		}
 	}
 	return nil

@@ -421,6 +421,7 @@ func (remover macBootstrapRemover) removeBootstrap(instance, limactl, factsPath,
 }
 
 func run() error {
+	printVersion := flag.Bool("version", false, "print the build commit and exit")
 	agentExecutable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate wefty-agent executable: %w", err)
@@ -471,6 +472,10 @@ func run() error {
 		profilePath           = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, control-plane and run-ledger addresses and the node ID not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
 	flag.Parse()
+	if *printVersion {
+		fmt.Println(version)
+		return nil
+	}
 	profile, _, err := connprofile.Resolve(*profilePath, "")
 	if err != nil {
 		return err

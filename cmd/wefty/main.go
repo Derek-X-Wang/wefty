@@ -19,6 +19,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
+var version = "dev"
+
 type execSignalResetKey struct{}
 
 func main() {
@@ -125,6 +127,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 			_, result = io.WriteString(stdout, help.usage)
 		}
 	}()
+	if len(args) == 1 && (args[0] == "--version" || args[0] == "-version") {
+		_, err := fmt.Fprintln(stdout, version)
+		return err
+	}
 	options, commandArgs, err := parseGlobalOptions(args, stderr)
 	if err != nil {
 		return flagUsageError(err)
@@ -139,6 +145,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 	// Setup installs this machine's stack and writes the connection profile;
 	// it neither reads that profile nor opens the Fabric. Its own flag parser
 	// answers --help before anything is touched.
+	if commandArgs[0] == "upgrade" {
+		return executeUpgrade(ctx, options, commandArgs[1:], stdout, stderr)
+	}
 	if commandArgs[0] == "setup" {
 		return executeSetup(ctx, options, commandArgs[1:], stdout, stderr)
 	}
@@ -339,6 +348,7 @@ Every command uses typed exits: usage 2, unauthorized 3, not found 4,
 conflict 5, unavailable 13, accepted-mutation wait timeout 14, other failure 1. JSON errors go to stderr.
 
 Commands:
+  upgrade [--yes]           Build latest main and upgrade this Mac's installed stack
   setup [--from DIR]         Install L1, L3 and a node agent as login services on
                              this Mac and write the connection profile
                              --remove keeps data and logs; --purge deletes them
