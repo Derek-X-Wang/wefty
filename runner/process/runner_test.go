@@ -28,6 +28,15 @@ var (
 )
 
 func TestMain(main *testing.M) {
+	if os.Getenv("WEFTY_871_OUTPUT_CHILD") == "1" {
+		helperPath = os.Getenv("WEFTY_871_PAYLOAD")
+		guardianAgentPath = os.Getenv("WEFTY_871_GUARDIAN")
+		os.Exit(main.Run())
+	}
+	if os.Getenv("WEFTY_871_CHILD") == "1" {
+		guardianGroupChild()
+		os.Exit(0)
+	}
 	directory, err := os.MkdirTemp("", "wefty-process-helper-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

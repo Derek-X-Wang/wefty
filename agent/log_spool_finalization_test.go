@@ -75,7 +75,7 @@ func TestPendingSpoolDeadlinePreservesServiceRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedResource, err := initializeManagedResource(managedRoot, registration.NodeID, registration.BootSessionID)
+	managedResource, err := initializeManagedResource(managedRoot, registration.NodeID, registration.BootSessionID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

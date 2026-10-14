@@ -984,21 +984,63 @@ func doctorHelperSource(adapter *ocirunner.Adapter) ocicontrol.HelperDoctorSourc
 	}
 }
 
-var consoleOutputMu sync.Mutex
+// One process-wide worker serializes console mirrors. The durable spool is
+// written first. A stuck console fd may hold this one worker, but cannot hold
+// an attempt's pipe copier or create an unbounded set of write goroutines.
+type consoleOutputRequest struct {
+	ctx     context.Context
+	writer  io.Writer
+	prefix  string
+	payload []byte
+	done    chan error
+}
+
+type consoleOutputDispatcher struct {
+	once     sync.Once
+	requests chan consoleOutputRequest
+}
+
+var consoleOutput = consoleOutputDispatcher{}
+
+func (dispatcher *consoleOutputDispatcher) write(ctx context.Context, writer io.Writer, prefix string, payload []byte) error {
+	dispatcher.once.Do(func() {
+		dispatcher.requests = make(chan consoleOutputRequest, 64)
+		go func() {
+			for request := range dispatcher.requests {
+				if err := request.ctx.Err(); err != nil {
+					request.done <- err
+					continue
+				}
+				_, err := io.WriteString(request.writer, request.prefix)
+				if err == nil {
+					_, err = request.writer.Write(request.payload)
+				}
+				request.done <- err
+			}
+		}()
+	})
+	request := consoleOutputRequest{ctx: ctx, writer: writer, prefix: prefix, payload: append([]byte(nil), payload...), done: make(chan error, 1)}
+	select {
+	case dispatcher.requests <- request:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-request.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 func newConsoleOutputSink(stdout, stderr io.Writer, claim l1.Claim) processrunner.OutputSink {
-	return processrunner.OutputSinkFunc(func(_ context.Context, event contract.LogEvent) error {
+	return processrunner.OutputSinkFunc(func(ctx context.Context, event contract.LogEvent) error {
 		writer := stdout
 		if event.Stream == contract.LogStderr {
 			writer = stderr
 		}
-		consoleOutputMu.Lock()
-		defer consoleOutputMu.Unlock()
-		if _, err := fmt.Fprintf(writer, "[job=%s attempt=%s stream=%s] ", claim.Job.JobID, claim.Lease.AttemptID, event.Stream); err != nil {
-			return err
-		}
-		_, err := writer.Write(event.Bytes)
-		return err
+		prefix := fmt.Sprintf("[job=%s attempt=%s stream=%s] ", claim.Job.JobID, claim.Lease.AttemptID, event.Stream)
+		return consoleOutput.write(ctx, writer, prefix, event.Bytes)
 	})
 }
 

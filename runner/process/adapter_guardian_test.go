@@ -71,18 +71,16 @@ func TestAdapterRefusesQuiescenceAfterGuardianLost(t *testing.T) {
 	directory := t.TempDir()
 	pidPath := filepath.Join(directory, "payload.pid")
 	releasePath := filepath.Join(directory, "release")
-	// Redirect stdout and stderr so the surviving payload does not hold the
-	// Guardian's output pipes open and block the agent's Guardian Wait. Keeping
-	// those pipes open safely withholds a receipt but strands reaping (#871).
+	// The surviving payload retains both Guardian output pipes (#871).
 	// Force a Guardian crash; the payload remains in its own process group.
 	execution := contract.ExecutionSpec{
 		Executable:       contract.ExecutableSpec{Path: "/bin/sh"},
-		Argv:             []string{"sh", "-c", `exec >/dev/null 2>&1; echo $$ > "$1"; while [ ! -f "$2" ]; do /bin/sleep 0.01; done; kill -KILL "$PPID"; exec /bin/sleep 30`, "guardian-loss", pidPath, releasePath},
+		Argv:             []string{"sh", "-c", `echo $$ > "$1"; while [ ! -f "$2" ]; do /bin/sleep 0.01; done; kill -KILL "$PPID"; exec /bin/sleep 30`, "guardian-loss", pidPath, releasePath},
 		WorkingDirectory: t.TempDir(),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	adapter := NewAdapter(New(Config{GuardianExecutable: guardianAgentPath, TerminationGraceTime: 10 * time.Millisecond}))
+	adapter := NewAdapter(New(Config{GuardianExecutable: guardianAgentPath, TerminationGraceTime: 10 * time.Millisecond, ProcessReapTimeout: time.Second}))
 	authority := testAuthority("job-guardian-probe", "attempt-guardian-probe", "fence-guardian-probe")
 	t.Cleanup(func() {
 		data, _ := os.ReadFile(pidPath)
@@ -103,7 +101,15 @@ func TestAdapterRefusesQuiescenceAfterGuardianLost(t *testing.T) {
 		}, nil)
 		finished <- runOutcome{result: result.Outcome, err: err}
 	}()
-	outcome := awaitRun(t, finished)
+	var outcome runOutcome
+	select {
+	case outcome = <-finished:
+	case <-time.After(6 * time.Second):
+		t.Fatal("Guardian crash retained output pipes blocked bounded completion")
+	}
+	if !outcome.result.LogEvidenceIncomplete {
+		t.Error("Guardian loss did not mark retained output incomplete")
+	}
 	data, err := os.ReadFile(pidPath)
 	if err != nil {
 		t.Fatal(err)
@@ -129,8 +135,9 @@ func TestAdapterVerifiesQuiescenceAfterGuardedStop(t *testing.T) {
 	defer cancel()
 	started := make(chan struct{})
 	directory := t.TempDir()
-	adapter := NewAdapter(New(Config{GuardianExecutable: guardianAgentPath, TerminationGraceTime: 10 * time.Millisecond}))
+	adapter := NewAdapter(New(Config{GuardianExecutable: guardianAgentPath, TerminationGraceTime: 10 * time.Millisecond, ProcessReapTimeout: time.Second}))
 	authority := testAuthority("job-guarded-stop", "attempt-guarded-stop", "fence-guarded-stop")
+	var payloadGroup int
 	finished := make(chan runOutcome, 1)
 	go func() {
 		result, err := adapter.Run(ctx, workloadrunner.Request{
@@ -140,6 +147,7 @@ func TestAdapterVerifiesQuiescenceAfterGuardedStop(t *testing.T) {
 				Argv:       []string{"process-helper", "hang"}, WorkingDirectory: directory,
 			},
 			IdlePolicy: IgnoreIdle, Started: func() { close(started) },
+			ProcessStarted: func(group int) error { payloadGroup = group; return nil },
 		}, nil)
 		finished <- runOutcome{result: result.Outcome, err: err}
 	}()
@@ -156,5 +164,8 @@ func TestAdapterVerifiesQuiescenceAfterGuardedStop(t *testing.T) {
 	receipt, err := adapter.ReapAndVerify(context.Background(), workloadrunner.ReapRequest{Authority: authority})
 	if err != nil || !receipt.RuntimeQuiesced || receipt.Evidence != workloadrunner.ReapEvidenceAttempt || receipt.BootSessionID != authority.BootSessionID {
 		t.Fatalf("ReapAndVerify receipt = %#v err=%v, want positive guarded-stop receipt", receipt, err)
+	}
+	if payloadGroup <= 0 || !isMissingProcessGroup(queryProcessGroup(payloadGroup)) {
+		t.Fatalf("positive receipt preceded group ESRCH: %d", payloadGroup)
 	}
 }

@@ -1311,6 +1311,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var uploader attemptLogSink
 	var redactingSink *redactingOutputSink
 	var managedResources workloadrunner.ManagedResources
+	var processPending bool
+	var processNotSpawned func() error
+	var processAcknowledged atomic.Bool
 	var mailbox *runMailbox
 	var handoffReader handoffFileReader
 	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
@@ -1388,6 +1391,15 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 		if reapErr == nil && reapReceipt.Evidence == "" {
 			reapErr = errors.New("workload runtime reap receipt has no evidence kind")
+		}
+		// A positive runtime receipt plus no started acknowledgement and a spawn
+		// failure proves no payload existed. Guardian loss never supplies this proof.
+		if reapErr == nil && processPending && !processAcknowledged.Load() && result.SpawnError != nil && result.SpawnError.Code != contract.SpawnFailureProcessWait && result.SpawnError.Code != contract.SpawnFailureStartupReadinessTimeout && processNotSpawned != nil {
+			if err := processNotSpawned(); err != nil {
+				// This write helps future boots; it cannot withdraw this boot's
+				// positive receipt. The pending record still refuses safely later.
+				lifecycle.log("agent: resolve pending process inventory for attempt %s: %v", claim.Lease.AttemptID, err)
+			}
 		}
 		if reapErr == nil && reapEvidence != nil {
 			*reapEvidence = reapReceipt.Evidence
@@ -1526,6 +1538,29 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		defer cleanupResource()
 		managedResources = resource
 		request.ManagedResources = resource
+		if claim.Job.Spec.Kind == contract.JobKindProcess && resource.prepareProcess != nil {
+			processPending = true
+			processNotSpawned = resource.processNotSpawned
+			if err := resource.prepareProcess(); err != nil {
+				return finish(spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err)
+			}
+			localStarted := request.Started
+			request.Started = func() {
+				// The unguarded runner reports payload existence through Started.
+				processAcknowledged.Store(true)
+				if localStarted != nil {
+					localStarted()
+				}
+			}
+			request.ProcessStarted = func(pgid int) error {
+				// Set before persistence: a failed write still means a payload exists.
+				processAcknowledged.Store(true)
+				if resource.processStarted != nil {
+					return resource.processStarted(pgid)
+				}
+				return nil
+			}
+		}
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.SensitiveEnv = cloneEnvironment(executionSpec.SensitiveEnv)
 		delete(executionSpec.SensitiveEnv, contract.EnvServiceDir)

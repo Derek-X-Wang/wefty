@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
@@ -21,14 +22,16 @@ type Executor interface {
 // kind=process. Guardian, logging, readiness, and idle behavior remain owned by
 // the existing Executor.
 type Adapter struct {
-	executor      Executor
-	bootSessionID string
-	mu            sync.Mutex
-	reaped        map[workloadrunner.AttemptAuthority]error
+	executor         Executor
+	bootSessionID    string
+	hostBootIdentity func() (string, error)
+	queryGroup       func(int) error
+	mu               sync.Mutex
+	reaped           map[workloadrunner.AttemptAuthority]error
 }
 
 func NewAdapter(executor Executor) *Adapter {
-	return &Adapter{executor: executor, reaped: make(map[workloadrunner.AttemptAuthority]error)}
+	return &Adapter{executor: executor, hostBootIdentity: hostboot.Identity, queryGroup: queryProcessGroup, reaped: make(map[workloadrunner.AttemptAuthority]error)}
 }
 
 // NewAdapterForBoot binds Guardian's agent-disconnect guarantee to the
@@ -36,7 +39,7 @@ func NewAdapter(executor Executor) *Adapter {
 // embedded callers that do not own a boot barrier use NewAdapter.
 func NewAdapterForBoot(executor Executor, bootSessionID string) *Adapter {
 	return &Adapter{
-		executor: executor, bootSessionID: bootSessionID,
+		executor: executor, bootSessionID: bootSessionID, hostBootIdentity: hostboot.Identity, queryGroup: queryProcessGroup,
 		reaped: make(map[workloadrunner.AttemptAuthority]error),
 	}
 }
@@ -77,6 +80,7 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		IdlePolicy:       IdlePolicy(request.IdlePolicy),
 		CompletionSignal: request.CompletionSignal,
 		Started:          request.Started,
+		ProcessStarted:   request.ProcessStarted,
 		ServiceAddress:   request.ServiceAddress,
 		ReadinessChanged: request.ReadinessChanged,
 		Guarded:          request.LifetimeBoundary == workloadrunner.AgentBootLifetime,
@@ -116,7 +120,7 @@ func (adapter *Adapter) ReapAndVerify(_ context.Context, request workloadrunner.
 
 // ReapPriorBoot returns boot-scoped evidence only when both the managed-root
 // record and this adapter agree that the payload belonged to an earlier boot.
-// Guardian reaps every guarded process when its agent endpoint disconnects.
+// Neither Guardian disconnect nor an agent restart proves group absence.
 func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.PriorBootReapRequest) (workloadrunner.ReapReceipt, error) {
 	if adapter == nil || adapter.bootSessionID == "" {
 		return workloadrunner.ReapReceipt{}, errors.New("process runtime has no boot-scoped Guardian authority")
@@ -129,6 +133,33 @@ func (adapter *Adapter) ReapPriorBoot(_ context.Context, request workloadrunner.
 	}
 	if request.PriorBootSessionID == request.CurrentBootSessionID {
 		return workloadrunner.ReapReceipt{}, errors.New("prior-boot process reap cannot verify a same-boot payload")
+	}
+	if len(request.ProcessGroups) == 0 {
+		return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
+	}
+	currentHostBoot, err := adapter.hostBootIdentity()
+	if err != nil || !hostboot.ValidIdentity(currentHostBoot) {
+		return workloadrunner.ReapReceipt{}, errors.Join(workloadrunner.ErrPriorBootEvidenceUnavailable, err)
+	}
+	for _, record := range request.ProcessGroups {
+		if record.AttemptID == "" || record.BootSessionID == "" || record.BootSessionID == request.CurrentBootSessionID || !hostboot.ValidIdentity(record.HostBootID) || !hostboot.SamePlatform(record.HostBootID, currentHostBoot) {
+			return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
+		}
+		if record.NotSpawned {
+			if record.ProcessGroupID != 0 {
+				return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
+			}
+			continue
+		}
+		if !hostboot.SameBoot(record.HostBootID, currentHostBoot) {
+			continue
+		}
+		if record.ProcessGroupID <= 0 {
+			return workloadrunner.ReapReceipt{}, workloadrunner.ErrPriorBootEvidenceUnavailable
+		}
+		if err := adapter.queryGroup(record.ProcessGroupID); !isMissingProcessGroup(err) {
+			return workloadrunner.ReapReceipt{}, fmt.Errorf("%w: group %d absence not proven: %v", workloadrunner.ErrPriorBootEvidenceUnavailable, record.ProcessGroupID, err)
+		}
 	}
 	return workloadrunner.ReapReceipt{
 		RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidencePriorBootGuardian,

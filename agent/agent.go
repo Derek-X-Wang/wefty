@@ -239,7 +239,7 @@ func New(config Config) (*Agent, error) {
 			Clock: processClockAdapter{clock: clock}, GuardianExecutable: config.GuardianExecutable,
 		}), config.BootSessionID)
 	}
-	managedResource, err := initializeManagedResource(config.ManagedRootDirectory, config.NodeID, config.BootSessionID)
+	managedResource, err := initializeManagedResource(config.ManagedRootDirectory, config.NodeID, config.BootSessionID, config.Logf)
 	if err != nil {
 		client.Close()
 		return nil, err
@@ -392,6 +392,13 @@ func New(config Config) (*Agent, error) {
 							return workloadrunner.ReapReceipt{}, err
 						}
 					}
+				}
+				if kind == contract.JobKindProcess {
+					groups, err := resource.processGroups(jobID)
+					if err != nil {
+						return workloadrunner.ReapReceipt{}, err
+					}
+					base.ProcessGroups = groups
 				}
 				return reapPriorBootForKind(ctx, priorBootReapers, kind, base)
 			}

@@ -350,12 +350,17 @@ Commands:
   pushing a new reg/app:latest still replays the old run. Pin images by digest
   (reg/app@sha256:...) or use --again; pin Workflow versions or use --again too.
   logs RUN_ID [--follow]     Read or follow run logs
-  cancel JOB_ID|RUN_ID       Cancel a run or one-shot job
-  wait RUN_ID [--timeout D]  Block until a run is terminal; exit 10 if it failed, 11 on timeout
+  cancel JOB_ID|RUN_ID [--include-script]
+                             Cancel a run or one-shot job
+  wait RUN_ID [--timeout D] [--include-script]
+                             Block until a run is terminal; exit 10 if it failed, 11 on timeout
   results RUN_ID [--out FILE]
                              Read the result document the run uploaded
-  inspect RUN_ID [--execution]
+  inspect RUN_ID [--execution] [--include-script]
                              Show run lineage, with optional L1 execution diagnostics
+  JSON run records omit inline script content, keeping sha256, size_bytes, and
+  content_omitted=true. --include-script restores content on wait, inspect,
+  cancel RUN_ID, and runs list --origin computer:ID.
   drain NODE_ID              Disable new claims [--revision REV] [--reason REASON]
   run <envelope|step|gate|result|params>
                              Report from inside a running job by writing run

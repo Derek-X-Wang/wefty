@@ -45,6 +45,8 @@ type Config struct {
 	// FaultInjector is a test seam for simulating process death at durable
 	// phase boundaries. Production callers leave it nil.
 	FaultInjector func(Checkpoint) error
+	// HostBootIdentity is a kernel-reader seam; nil uses the local host.
+	HostBootIdentity func() (string, error)
 }
 
 type RootManifest struct {
@@ -53,10 +55,23 @@ type RootManifest struct {
 	NodeID         string `json:"node_id"`
 }
 
+type ProcessAttempt struct {
+	NotSpawned     bool   `json:"not_spawned,omitempty"`
+	Version        int    `json:"version"`
+	AttemptID      string `json:"attempt_id"`
+	BootSessionID  string `json:"boot_session_id"`
+	HostBootID     string `json:"host_boot_id"`
+	ProcessGroupID int    `json:"process_group_id"`
+}
+
 type OwnershipManifest struct {
-	Version           int    `json:"version"`
-	JobID             string `json:"job_id"`
-	RemovalGeneration uint64 `json:"removal_generation"`
+	// Version 2 owns durable process-attempt records outside scratch directories.
+	LegacyHostBootID       string `json:"legacy_host_boot_id,omitempty"`
+	LegacyBootSessionID    string `json:"legacy_boot_session_id,omitempty"`
+	LegacyProcessInventory bool   `json:"legacy_process_inventory,omitempty"`
+	Version                int    `json:"version"`
+	JobID                  string `json:"job_id"`
+	RemovalGeneration      uint64 `json:"removal_generation"`
 }
 
 type ServicePaths struct {

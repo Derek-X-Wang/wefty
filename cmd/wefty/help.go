@@ -122,7 +122,6 @@ func wantsCommandHelp(args []string) bool {
 // positional --help can become a resource ID or a request to open local state.
 var positionalCommandUsage = map[string]string{
 	"whoami":                          "usage: wefty whoami",
-	"cancel":                          "usage: wefty cancel JOB_ID|RUN_ID",
 	"admin bootstrap":                 "usage: wefty admin bootstrap NONCE",
 	"admin policy get":                "usage: wefty admin policy get",
 	"admins get":                      "usage: wefty admins get",

@@ -221,11 +221,12 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags := flag.NewFlagSet("runs list", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var origin, cursor, status string
-	var includeDescendants, mine, all bool
+	var includeDescendants, mine, all, includeScript bool
 	var limit int
 	flags.StringVar(&origin, "origin", "", "immutable Run origin, currently computer:COMPUTER_ID")
 	flags.StringVar(&status, "status", "", "only Runs in this state")
 	flags.BoolVar(&includeDescendants, "include-descendants", false, "include chain descendants of matching roots")
+	flags.BoolVar(&includeScript, "include-script", false, "include inline script content in JSON output for --origin listings")
 	flags.IntVar(&limit, "limit", 0, "how many Runs to list")
 	flags.StringVar(&cursor, "cursor", "", "opaque cursor returned by the previous page")
 	flags.BoolVar(&mine, "mine", false, "only Runs submitted by the caller")
@@ -299,7 +300,10 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		page.NextCursor = next.NextCursor
 	}
 	if jsonOutput {
-		return writeJSON(stdout, page)
+		return writeJSON(stdout, struct {
+			l3.ComputerRunPage
+			Runs []runRecordJSON `json:"runs"`
+		}{page, newRunRecordsJSON(page.Runs, includeScript)})
 	}
 	return writeComputerOriginRuns(stdout, page)
 }
