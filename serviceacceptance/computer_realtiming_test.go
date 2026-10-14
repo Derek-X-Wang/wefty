@@ -990,13 +990,23 @@ func removalBaselineWithoutExpiredRetentions(before, after ocihelper.VerifyRespo
 		}
 	}
 	// Copy the filtered slices so receipts and diagnostics keep the original baseline.
+	withoutExpired := func(baseline, expired, observed []string) []string {
+		remaining := stringSetDifference(baseline, expired)
+		if len(remaining) == 0 && len(observed) == 0 {
+			// After removing only the exact expired retentions above, match the
+			// helper's empty encoding: observed classes use [], retained use null.
+			// DeepEqual must still reject every remaining or newly observed ID.
+			return slices.Clone(observed)
+		}
+		return remaining
+	}
 	if len(expiredLogs) > 0 {
-		before.Inventory.LogSegments = stringSetDifference(before.Inventory.LogSegments, expiredLogs)
-		before.DurableRetained.LogSegments = stringSetDifference(before.DurableRetained.LogSegments, expiredLogs)
+		before.Inventory.LogSegments = withoutExpired(before.Inventory.LogSegments, expiredLogs, after.Inventory.LogSegments)
+		before.DurableRetained.LogSegments = withoutExpired(before.DurableRetained.LogSegments, expiredLogs, after.DurableRetained.LogSegments)
 	}
 	if len(expiredCgroups) > 0 {
-		before.Inventory.Cgroups = stringSetDifference(before.Inventory.Cgroups, expiredCgroups)
-		before.DurableRetained.Cgroups = stringSetDifference(before.DurableRetained.Cgroups, expiredCgroups)
+		before.Inventory.Cgroups = withoutExpired(before.Inventory.Cgroups, expiredCgroups, after.Inventory.Cgroups)
+		before.DurableRetained.Cgroups = withoutExpired(before.DurableRetained.Cgroups, expiredCgroups, after.DurableRetained.Cgroups)
 	}
 	return before
 }
@@ -1851,6 +1861,14 @@ func TestRemovalBaselineAllowsOnlyExpiredRetentions(t *testing.T) {
 		want   bool
 	}{
 		{name: "expired missing retention", at: recordedAt.Add(570 * time.Second), want: true},
+		// The native helper reports an empty observed class as [] and an empty
+		// durable-retained class as null. Exercise both encodings after expiry.
+		{name: "expired missing retention native empty inventory", at: recordedAt.Add(570 * time.Second), want: true, mutate: func(before, after *ocihelper.VerifyResponse) {
+			after.Inventory.LogSegments = []string{}
+		}},
+		{name: "expired missing retention empty retained inventory", at: recordedAt.Add(570 * time.Second), want: true, mutate: func(before, after *ocihelper.VerifyResponse) {
+			after.DurableRetained.LogSegments = []string{}
+		}},
 		{name: "missing before deadline", at: retention.Deadline.Add(-time.Nanosecond)},
 		{name: "missing at deadline", at: retention.Deadline},
 		{name: "no recorded deadline", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
@@ -1861,6 +1879,18 @@ func TestRemovalBaselineAllowsOnlyExpiredRetentions(t *testing.T) {
 		}},
 		{name: "invalid bound", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
 			before.DurableRetentions[0].Bound = time.Second
+		}},
+		{name: "wrong owner", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.DurableRetentions[0].Owner = "unknown"
+		}},
+		{name: "wrong reason", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.DurableRetentions[0].Reason = "unknown"
+		}},
+		{name: "wrong state", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.DurableRetentions[0].State = "unknown"
+		}},
+		{name: "missing attempt owner", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.DurableRetentions[0].AttemptID = ""
 		}},
 		{name: "expired still present", at: recordedAt.Add(570 * time.Second), want: true, mutate: func(before, after *ocihelper.VerifyResponse) {
 			after.Inventory.LogSegments = []string{retention.ID}
@@ -1885,6 +1915,17 @@ func TestRemovalBaselineAllowsOnlyExpiredRetentions(t *testing.T) {
 			after.Inventory.LogSegments = []string{"new-logs"}
 			after.DurableRetained.LogSegments = []string{"new-logs"}
 		}},
+		{name: "removed Computer log leak alongside expired probe", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			leak := retention
+			leak.ID, leak.AttemptID = "removed-computer-logs", "removed-computer-attempt"
+			leak.Bound, leak.Deadline = time.Hour, recordedAt.Add(time.Hour)
+			after.Inventory.LogSegments = []string{leak.ID}
+			after.DurableRetained.LogSegments = []string{leak.ID}
+			after.DurableRetentions = []ocihelper.DurableRetention{leak}
+		}},
+		{name: "unrelated empty encoding still exact", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
+			after.Inventory.Cgroups = []string{}
+		}},
 		{name: "unrelated resource lost", at: recordedAt.Add(570 * time.Second), mutate: func(before, after *ocihelper.VerifyResponse) {
 			before.Inventory.Containers = []string{"preexisting-container"}
 		}},
@@ -1895,6 +1936,15 @@ func TestRemovalBaselineAllowsOnlyExpiredRetentions(t *testing.T) {
 			before.DurableRetentions[0].ID = "probe-cgroup"
 			before.DurableRetentions[0].Reason = ocihelper.DurableRetentionReasonCgroupReaping
 			before.DurableRetentions[0].State = ocihelper.DurableRetentionStatePopulated
+		}},
+		{name: "expired cgroup retention native empty inventory", at: recordedAt.Add(570 * time.Second), want: true, mutate: func(before, after *ocihelper.VerifyResponse) {
+			before.Inventory.LogSegments, before.DurableRetained.LogSegments = nil, nil
+			before.Inventory.Cgroups, before.DurableRetained.Cgroups = []string{"probe-cgroup"}, []string{"probe-cgroup"}
+			before.DurableRetentions[0].Class = ocihelper.RemovalResourceCgroup
+			before.DurableRetentions[0].ID = "probe-cgroup"
+			before.DurableRetentions[0].Reason = ocihelper.DurableRetentionReasonCgroupReaping
+			before.DurableRetentions[0].State = ocihelper.DurableRetentionStatePopulated
+			after.Inventory.Cgroups = []string{}
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -1915,8 +1965,10 @@ func TestRemovalBaselineAllowsOnlyExpiredRetentions(t *testing.T) {
 			comparisonBaseline := removalBaselineWithoutExpiredRetentions(before, after, test.at)
 			observedExact, observedNoNew, _ := compareRemovalInventoryBaseline(comparisonBaseline.Inventory, after.Inventory)
 			retainedExact, retainedNoNew, _ := compareRemovalInventoryBaseline(comparisonBaseline.DurableRetained, after.DurableRetained)
-			if got := observedExact && observedNoNew && retainedExact && retainedNoNew; got != test.want {
-				t.Fatalf("removal comparison = %t, want %t (observed=%t retained=%t)", got, test.want, observedExact, retainedExact)
+			logsAndControlRestored := reflect.DeepEqual(comparisonBaseline.Inventory.LogSegments, after.Inventory.LogSegments) &&
+				reflect.DeepEqual(comparisonBaseline.Inventory.Cgroups, after.Inventory.Cgroups)
+			if got := observedExact && observedNoNew && retainedExact && retainedNoNew && logsAndControlRestored; got != test.want {
+				t.Fatalf("removal comparison = %t, want %t (observed=%t retained=%t logs_and_control_restored=%t)", got, test.want, observedExact, retainedExact, logsAndControlRestored)
 			}
 			if !reflect.DeepEqual(before, original) {
 				t.Fatal("comparison mutated baseline inventory")
