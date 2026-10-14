@@ -338,7 +338,7 @@ func TestExecInfrastructureExit13FromRealBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
-	stack := newExecStack(t, execTestIdleLimit)
+	stack := newExecStack(t, execRealBinaryIdleLimit)
 	t.Chdir(execTestRepo(t))
 	code, out := runWefty(t, binary, 30*time.Second, "--l1="+stack.l1Address, "--l3="+stack.l3Address, "--node-config="+stack.clients.nodeConfigPath, "exec", "--", "true")
 	if code != 13 || !strings.Contains(out, "infrastructure failure") {

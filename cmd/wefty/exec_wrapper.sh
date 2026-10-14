@@ -27,7 +27,7 @@ cleanup() {
   (
     sleeper=''
     trap 'if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null || :; wait "$sleeper" 2>/dev/null || :; fi; exit' TERM INT HUP
-    sleep 10 & sleeper=$!
+    sleep 10 </dev/null >/dev/null 2>&1 & sleeper=$!
     wait "$sleeper" || exit
     sleeper=''
     kill "$remover" 2>/dev/null || :
@@ -58,7 +58,7 @@ snapshot_checkout_failed() {
   trap 'if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null || :; wait "$sleeper" 2>/dev/null || :; fi; exit' TERM INT HUP
   minutes=0
   while :; do
-    sleep "$heartbeat_seconds" & sleeper=$!
+    sleep "$heartbeat_seconds" </dev/null >/dev/null 2>&1 & sleeper=$!
     wait "$sleeper" || exit
     sleeper=''
     minutes=$((minutes+1))
@@ -93,12 +93,14 @@ preparing=''
 child=$!
 (
   # Reap each sleep too: stopping the heartbeat must not leave an output pipe
-  # open for a minute after the command has already finished.
+  # open for a minute after the command has already finished. A stop that
+  # lands between a sleep's fork and "sleeper=$!" cannot reap it, so no timer
+  # sleep holds the run's output: the node waits for that output to close.
   sleeper=''
   trap 'if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null || :; wait "$sleeper" 2>/dev/null || :; fi; exit' TERM INT HUP
   minutes=0
   while :; do
-    sleep "$heartbeat_seconds" & sleeper=$!
+    sleep "$heartbeat_seconds" </dev/null >/dev/null 2>&1 & sleeper=$!
     wait "$sleeper" || exit
     sleeper=''
     # The child can end before the wrapper is scheduled to reap this timer.

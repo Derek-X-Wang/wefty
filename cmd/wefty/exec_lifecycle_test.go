@@ -434,7 +434,7 @@ func TestExecHeartbeatStopsAtCommandEnd(t *testing.T) {
 
 func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 	binary := buildWefty(t)
-	stack := newExecStack(t, execTestIdleLimit)
+	stack := newExecStack(t, execRealBinaryIdleLimit)
 	t.Chdir(execTestRepo(t))
 	cancelling := make(chan struct{})
 	ledger := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {

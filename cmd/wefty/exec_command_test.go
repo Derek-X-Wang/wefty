@@ -177,13 +177,21 @@ func writeExecFile(t *testing.T, path, content string) {
 	}
 }
 
-// execTestIdleLimit is the no-output limit for tests that do not test it.
-// The wrapper clones the snapshot before its heartbeat starts, and a loaded
-// hosted runner can take longer than a second for that clone.
+// execTestIdleLimit is the no-output limit for in-process tests that do not
+// test it. Those tests shorten the heartbeat, so a slow clone on a loaded
+// hosted runner still reports liveness well inside the limit.
 const execTestIdleLimit = 15 * time.Second
 
+// execRealBinaryIdleLimit is the no-output limit for real-binary tests. The
+// built binary keeps its production heartbeat, so this limit stays above it,
+// as production limits do. Each CLI call's own budget still catches a hang.
+const execRealBinaryIdleLimit = 90 * time.Second
+
+// Git 2.47+ commits start auto-maintenance in the background, which can
+// briefly lock files under .git while a test compares the checkout.
 func execTestGitEnv() []string {
-	return append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+	return append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		"GIT_CONFIG_COUNT=2", "GIT_CONFIG_KEY_0=maintenance.auto", "GIT_CONFIG_VALUE_0=false", "GIT_CONFIG_KEY_1=gc.auto", "GIT_CONFIG_VALUE_1=0")
 }
 
 func execTestGit(t *testing.T, dir string, args ...string) string {
@@ -531,7 +539,7 @@ func TestExecDetachedHEADAndCleanSubmodule(t *testing.T) {
 
 func TestExecExitCodesAndSignalsFromRealBinary(t *testing.T) {
 	binary := buildWefty(t)
-	stack := newExecStack(t, execTestIdleLimit)
+	stack := newExecStack(t, execRealBinaryIdleLimit)
 	repo := execTestRepo(t)
 	t.Chdir(filepath.Join(repo, "sub"))
 	base := []string{"--l1=" + stack.l1Address, "--l3=" + stack.l3Address, "--node-config=" + stack.clients.nodeConfigPath, "exec"}
@@ -607,7 +615,7 @@ func TestExecExitCodesAndSignalsFromRealBinary(t *testing.T) {
 
 func TestExecHelpAndRefusalsFromRealBinary(t *testing.T) {
 	binary := buildWefty(t)
-	stack := newExecStack(t, execTestIdleLimit)
+	stack := newExecStack(t, execRealBinaryIdleLimit)
 	repo := execTestRepo(t)
 	t.Chdir(repo)
 	code, out := runWefty(t, binary, 30*time.Second, "exec", "--help")
