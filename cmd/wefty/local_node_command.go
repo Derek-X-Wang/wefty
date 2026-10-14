@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/runner/lima"
@@ -20,6 +22,15 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 	}
 	if handled, err := maybeExecutePrivilegedLinuxSetup(ctx, options, args, stdout, stderr); handled {
 		return err
+	}
+	if args[0] == "doctor" {
+		plain, err := plainDoctorSelected(runtime.GOOS, options.nodeConfigPath)
+		if err != nil {
+			return err
+		}
+		if plain {
+			return executePlainDoctor(ctx, options, args[1:], stdout)
+		}
 	}
 	if options.nodeConfigPath == "" {
 		return errors.New("singular node commands require an installed node configuration; set --node-config or WEFTY_NODE_CONFIG")
@@ -53,6 +64,33 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 	default:
 		return usageError(fmt.Sprintf("unknown singular node command %q", args[0]))
 	}
+}
+
+func plainDoctorSelected(goos, configPath string) (bool, error) {
+	if goos != "darwin" {
+		return false, nil
+	}
+	if configPath == "" {
+		return true, nil
+	}
+	path, err := filepath.Abs(configPath)
+	if err != nil {
+		return false, err
+	}
+	payload, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// Select by the raw socket field. Invalid plain configuration belongs in
+	// the doctor's findings, while read failures remain configuration errors.
+	var config struct {
+		ControlSocket string `json:"control_socket"`
+	}
+	_ = json.Unmarshal(payload, &config)
+	return config.ControlSocket == "", nil
 }
 
 func executeLocalDoctor(ctx context.Context, client *ocicontrol.Client, jsonOutput bool, args []string, stdout io.Writer) error {

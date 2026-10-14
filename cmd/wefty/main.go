@@ -341,6 +341,7 @@ conflict 5, unavailable 13, accepted-mutation wait timeout 14, other failure 1. 
 Commands:
   setup [--from DIR]         Install L1, L3 and a node agent as login services on
                              this Mac and write the connection profile
+                             --remove keeps data and logs; --purge deletes them
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
   whoami                    Observe the current Fabric-scoped person identity in L1
   admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
@@ -348,7 +349,7 @@ Commands:
   admin policy add|remove    Mutate administrator membership with an observed revision
   admins list|add|remove     Alias for the administrator policy commands
   node setup-oci             Configure the installed node's OCI runtime
-  node doctor                Read versioned node-local OCI diagnostics
+  node doctor                Check the plain-process install or read OCI diagnostics
   node oci start|stop        Set durable node-local OCI intent
   node oci removals          Read durable runtime removal manifests, phases, and attestations
   node load-image FILE       Import an OCI archive through the live agent
