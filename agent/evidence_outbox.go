@@ -326,19 +326,33 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 		refusalCode := make(map[string]contract.ErrorCode)
 		var scanRetryAt time.Time
 		var scanFailures int
+		// liveRecheckAt is when recovery looks again at a due retry it left
+		// because the attempt was live, in case the attempt is released
+		// without a wake; liveWaits counts the passes in a row that left one.
+		var liveRecheckAt time.Time
+		var liveWaits int
 		var retryTimer Timer
 		var retryWake <-chan time.Time
 		finished := make(chan recoveryResult)
-		armRetry := func() {
-			var earliest time.Time
-			if !scanRetryAt.IsZero() {
-				earliest = scanRetryAt
-			}
-			for _, deadline := range retryAt {
-				if earliest.IsZero() || deadline.Before(earliest) {
+		// armRetry arms one timer for the earliest wait left by the pass that
+		// began at passNow. A retry already due at passNow was looked at by
+		// that pass and left only because it could not start: every worker
+		// busy, the attempt live, or the spool scan backing off. A timer for
+		// it would fire at once into the same answer, again and again (#927).
+		// It waits instead for what unblocks it -- a worker finishing, the
+		// attempt's release waking recovery, the scan's own retry, or
+		// liveRecheckAt.
+		armRetry := func(passNow time.Time) {
+			earliest := scanRetryAt
+			consider := func(deadline time.Time) {
+				if deadline.After(passNow) && (earliest.IsZero() || deadline.Before(earliest)) {
 					earliest = deadline
 				}
 			}
+			for _, deadline := range retryAt {
+				consider(deadline)
+			}
+			consider(liveRecheckAt)
 			if retryTimer != nil {
 				stopTimer(retryTimer)
 				retryTimer = nil
@@ -359,7 +373,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 			now := outbox.clock.Now()
 			outbox.sweepDeadOneShotSpool(recoveryContext, now, report)
 			if !scanRetryAt.IsZero() && now.Before(scanRetryAt) {
-				armRetry()
+				armRetry(now)
 				return
 			}
 			attempts, err := outbox.spool.pendingAttempts(recoveryContext)
@@ -369,7 +383,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 				}
 				scanFailures++
 				scanRetryAt = now.Add(evidenceRecoveryBackoff(outbox.retryInterval, scanFailures))
-				armRetry()
+				armRetry(now)
 				return
 			}
 			scanRetryAt = time.Time{}
@@ -390,17 +404,20 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 					delete(refusalCode, attemptID)
 				}
 			}
+			liveBlocked := false
 			for _, attempt := range attempts {
 				if _, running := active[attempt.attemptID]; running {
 					continue
 				}
-				if deadline, waiting := retryAt[attempt.attemptID]; waiting && now.Before(deadline) {
+				deadline, retrying := retryAt[attempt.attemptID]
+				if retrying && now.Before(deadline) {
 					continue
 				}
 				if len(active) >= maxEvidenceRecoveryWorkers {
 					break
 				}
 				if outbox.attemptIsLive(attempt.attemptID) {
+					liveBlocked = liveBlocked || retrying
 					continue
 				}
 				delete(retryAt, attempt.attemptID)
@@ -418,7 +435,14 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 					}
 				}(attempt)
 			}
-			armRetry()
+			if liveBlocked {
+				liveWaits++
+				liveRecheckAt = now.Add(evidenceRecoveryBackoff(outbox.retryInterval, liveWaits))
+			} else {
+				liveWaits = 0
+				liveRecheckAt = time.Time{}
+			}
+			armRetry(now)
 			if outbox.recoveryScanFinished != nil {
 				outbox.recoveryScanFinished()
 			}

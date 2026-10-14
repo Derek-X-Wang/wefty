@@ -440,7 +440,13 @@ The reconciler survives the attempt authority context, runs at most eight
 attempt workers, and retries both spool scan failures and per-attempt failures
 on the injected clock: the configured retry interval, doubled per consecutive
 failure of the same work and capped at 30 seconds (or at the interval itself
-when that is configured larger), reset by the first success. A typed refusal
+when that is configured larger), reset by the first success. A retry that
+falls due while it cannot start -- all eight workers busy, its attempt live
+again, or the spool scan backing off -- waits for what unblocks it: a worker
+finishing, the attempt's release, or the scan's own retry. A retry held by a
+live attempt is also re-checked from the retry interval, doubling to the same
+cap, for a release that does not wake the reconciler. The reconciler never
+arms a timer for a retry it has just found due and blocked. A typed refusal
 that repeating on a retry interval cannot clear -- `node_session_replaced`,
 `identity_bound`, or `principal_forbidden` -- moves the attempt onto a
 re-check schedule instead: 10 seconds, doubling per consecutive refusal, capped
