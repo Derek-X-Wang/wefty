@@ -171,11 +171,21 @@ func writeExecFile(t *testing.T, path, content string) {
 		t.Fatal(err)
 	}
 }
+
+// execTestIdleLimit is the no-output limit for tests that do not test it.
+// The wrapper clones the snapshot before its heartbeat starts, and a loaded
+// hosted runner can take longer than a second for that clone.
+const execTestIdleLimit = 15 * time.Second
+
+func execTestGitEnv() []string {
+	return append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+}
+
 func execTestGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	c := exec.Command("git", args...)
 	c.Dir = dir
-	c.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+	c.Env = execTestGitEnv()
 	out, err := c.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
@@ -226,7 +236,7 @@ func execTreeEvidence(t *testing.T, root string) map[string][32]byte {
 func TestExecCapturedCheckoutOverPlainFabric(t *testing.T) {
 	t.Setenv("EXEC_NODE_ENV", "node-value")
 	shortenExecTimers(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	// Include staged, unstaged and untracked changes, and an existing stash/ref.
 	writeExecFile(t, filepath.Join(repo, "sub", "tracked"), "staged")
@@ -283,7 +293,7 @@ func TestExecFrozenInputsAndFreshRetry(t *testing.T) {
 		remove := test.remove
 		t.Run(test.name, func(t *testing.T) {
 			shortenExecTimers(t)
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			repo := execTestRepo(t)
 			t.Chdir(filepath.Join(repo, "sub"))
 			setExecTestClaims(t, stack.clients, false)
@@ -371,7 +381,7 @@ func TestExecCancellation(t *testing.T) {
 	for _, queued := range []bool{false, true} {
 		t.Run(fmt.Sprint(queued), func(t *testing.T) {
 			shortenExecTimers(t)
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			repo := execTestRepo(t)
 			t.Chdir(repo)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -420,7 +430,7 @@ func TestExecCancellation(t *testing.T) {
 }
 
 func TestExecRefusalsSubmitNothing(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	for _, name := range []string{"not a git repo", "no commits yet", "unresolved merge", "sparse checkout", "partial clone", "ignored start folder", "empty start folder", "Git LFS", "submodules with changes", "no installed node", "requires --l3", "64 KiB", "cancelled before capture"} {
 		t.Run(name, func(t *testing.T) {
 			repo := execTestRepo(t)
@@ -437,8 +447,11 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 				execTestGit(t, repo, "checkout", "-q", "-")
 				writeExecFile(t, filepath.Join(repo, "sub", "tracked"), "main")
 				execTestGit(t, repo, "commit", "-qam", "main")
+				// The merge must stop on its conflict, not on a missing
+				// identity: hosted CI runners have no global git identity.
 				c := exec.Command("git", "merge", "side")
 				c.Dir = repo
+				c.Env = execTestGitEnv()
 				_ = c.Run()
 			case "sparse checkout":
 				execTestGit(t, repo, "config", "core.sparseCheckout", "true")
@@ -495,7 +508,7 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 
 func TestExecDetachedHEADAndCleanSubmodule(t *testing.T) {
 	shortenExecTimers(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	sub := execTestRepo(t)
 	execTestGit(t, repo, "-c", "protocol.file.allow=always", "submodule", "add", sub, "module")
@@ -511,7 +524,7 @@ func TestExecDetachedHEADAndCleanSubmodule(t *testing.T) {
 
 func TestExecExitCodesAndSignalsFromRealBinary(t *testing.T) {
 	binary := buildWefty(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	t.Chdir(filepath.Join(repo, "sub"))
 	base := []string{"--l1=" + stack.l1Address, "--l3=" + stack.l3Address, "--node-config=" + stack.clients.nodeConfigPath, "exec"}
@@ -587,7 +600,7 @@ func TestExecExitCodesAndSignalsFromRealBinary(t *testing.T) {
 
 func TestExecHelpAndRefusalsFromRealBinary(t *testing.T) {
 	binary := buildWefty(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	t.Chdir(repo)
 	code, out := runWefty(t, binary, 30*time.Second, "exec", "--help")
@@ -653,7 +666,7 @@ func TestExecStoppingBeforeAcceptanceAndLostReply(t *testing.T) {
 	for _, accepted := range []bool{false, true} {
 		t.Run(fmt.Sprint(accepted), func(t *testing.T) {
 			shortenExecTimers(t)
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			repo := execTestRepo(t)
 			t.Chdir(repo)
 			ctx, cancel := context.WithCancel(t.Context())
@@ -719,7 +732,7 @@ func (tr execStopTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestExecParamsLimitIncludesCaptureMetadata(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	t.Chdir(repo)
 	argv := []string{"/bin/sh", "-c", "exit 0", "sh", ""}
@@ -733,7 +746,7 @@ func TestExecParamsLimitIncludesCaptureMetadata(t *testing.T) {
 
 func TestExecKeepsWorkingBytesDespiteGitAttributes(t *testing.T) {
 	shortenExecTimers(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	writeExecFile(t, filepath.Join(repo, ".gitattributes"), "sub/tracked ident text eol=crlf\n")
 	writeExecFile(t, filepath.Join(repo, "sub", "tracked"), "$Id: literal $\nexact\n")
@@ -748,7 +761,7 @@ func TestExecKeepsWorkingBytesDespiteGitAttributes(t *testing.T) {
 func TestExecCaptureInterruptedAndConcurrentEdits(t *testing.T) {
 	for _, interrupt := range []bool{false, true} {
 		t.Run(fmt.Sprint(interrupt), func(t *testing.T) {
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			repo := execTestRepo(t)
 			t.Chdir(repo)
 			// Intercept the real Git capture at its first private tree write. The rest
@@ -811,7 +824,7 @@ func TestExecCaptureInterruptedAndConcurrentEdits(t *testing.T) {
 }
 
 func TestExecCaptureUsesOwnStorageRoot(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	root := os.Getenv("WEFTY_EXEC_STORAGE_ROOT")
 	repo := execTestRepo(t)
 	t.Chdir(repo)
@@ -830,7 +843,7 @@ func TestExecCaptureUsesOwnStorageRoot(t *testing.T) {
 func TestExecCapturesGitQuotedFilenames(t *testing.T) {
 	for _, name := range []string{"Screenshot 10.00.00\u202fAM.png", "nonbreaking\u00a0space", "line\nfeed", "control\x01byte", "quote\"and\\slash"} {
 		t.Run(name, func(t *testing.T) {
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			repo := execTestRepo(t)
 			writeExecFile(t, filepath.Join(repo, name), "exact bytes")
 			t.Chdir(repo)
@@ -845,7 +858,7 @@ func TestExecCapturesGitQuotedFilenames(t *testing.T) {
 }
 
 func TestExecSnapshotHasNoTemplateHooks(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	template := t.TempDir()
 	writeExecFile(t, filepath.Join(template, "hooks", "post-checkout"), "#!/bin/sh\nexit 99\n")

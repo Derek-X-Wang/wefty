@@ -20,7 +20,7 @@ import (
 
 func TestExecExternalCancellationIsTerminal(t *testing.T) {
 	shortenExecReadRecovery(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	base := stack.clients.l3.client.Transport
 	cancelled := false
@@ -44,7 +44,7 @@ func TestExecExternalCancellationIsTerminal(t *testing.T) {
 
 func TestExecSweepsAbandonedCaptures(t *testing.T) {
 	shortenExecReadRecovery(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	base := stack.clients.l3.client.Transport
 	stack.clients.l3.client.Transport = storageRoundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -139,7 +139,7 @@ func TestExecSweepsAbandonedCaptures(t *testing.T) {
 }
 
 func TestExecSweepCountIsBounded(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	root := os.Getenv("WEFTY_EXEC_STORAGE_ROOT")
 	for i := 0; i < 100; i++ {
@@ -160,7 +160,7 @@ func TestExecSweepCountIsBounded(t *testing.T) {
 }
 
 func TestExecSweepTimeAndFailureAreBounded(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	path := filepath.Join(os.Getenv("WEFTY_EXEC_STORAGE_ROOT"), "wefty-exec-stalled")
 	writeExecFile(t, filepath.Join(path, "run-id"), "run_stalled")
@@ -188,7 +188,7 @@ func TestExecSweepTimeAndFailureAreBounded(t *testing.T) {
 func TestExecStorageRootStateAndPermissions(t *testing.T) {
 	for _, state := range []bool{true, false} {
 		t.Run(fmt.Sprint(state), func(t *testing.T) {
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			t.Setenv("WEFTY_EXEC_STORAGE_ROOT", "")
 			t.Setenv("XDG_STATE_HOME", "")
 			root := filepath.Join(os.Getenv("HOME"), ".local", "state", "wefty", "exec")
@@ -223,7 +223,7 @@ func TestExecSignalAfterTerminalPreservesVerdict(t *testing.T) {
 	for _, exit := range []int{0, 7} {
 		t.Run(fmt.Sprint(exit), func(t *testing.T) {
 			shortenExecTimers(t)
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			t.Chdir(execTestRepo(t))
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -279,7 +279,7 @@ func TestExecSignalAfterTerminalPreservesVerdict(t *testing.T) {
 }
 
 func TestExecStartFolderUsesSnapshotCase(t *testing.T) {
-	_ = newExecStack(t, time.Second)
+	_ = newExecStack(t, execTestIdleLimit)
 	repo := execTestRepo(t)
 	if _, err := os.Stat(filepath.Join(repo, "Sub", "tracked")); err != nil {
 		t.Skip("filesystem is case-sensitive")
@@ -302,7 +302,7 @@ func TestExecStartFolderUsesSnapshotCase(t *testing.T) {
 
 func TestExecSlowResultUploadPreservesFailure(t *testing.T) {
 	shortenExecTimers(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	base := stack.clients.l3.client.Transport
 	resultStart := time.Time{}
@@ -337,7 +337,7 @@ func TestExecInfrastructureExit13FromRealBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	code, out := runWefty(t, binary, 30*time.Second, "--l1="+stack.l1Address, "--l3="+stack.l3Address, "--node-config="+stack.clients.nodeConfigPath, "exec", "--", "true")
 	if code != 13 || !strings.Contains(out, "infrastructure failure") {

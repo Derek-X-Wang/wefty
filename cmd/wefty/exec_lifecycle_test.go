@@ -44,7 +44,7 @@ func TestExecObservationRetriesWithoutCancellation(t *testing.T) {
 		for _, kind := range []string{"transport", "unavailable", "internal"} {
 			t.Run(path+"/"+kind, func(t *testing.T) {
 				shortenExecReadRecovery(t)
-				stack := newExecStack(t, time.Second)
+				stack := newExecStack(t, execTestIdleLimit)
 				repo := execTestRepo(t)
 				t.Chdir(repo)
 				base := stack.clients.l3.client.Transport
@@ -77,7 +77,7 @@ func TestExecObservationRetriesWithoutCancellation(t *testing.T) {
 
 func TestExecLostObservationLeavesRunAndStorage(t *testing.T) {
 	shortenExecReadRecovery(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	base := stack.clients.l3.client.Transport
 	cancels := 0
@@ -121,7 +121,7 @@ func TestExecLostObservationLeavesRunAndStorage(t *testing.T) {
 func TestExecVerdictUsesStderr(t *testing.T) {
 	for _, exit := range []int{0, 7} {
 		t.Run(fmt.Sprint(exit), func(t *testing.T) {
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			t.Chdir(execTestRepo(t))
 			var out, errOut bytes.Buffer
 			err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", fmt.Sprintf("printf 'command-output\\n'; exit %d", exit)}, &out, &errOut)
@@ -137,7 +137,7 @@ func TestExecVerdictUsesStderr(t *testing.T) {
 }
 
 func TestExecTagConflictNamesExec(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	err := execute(t.Context(), stack.clients, false, []string{"exec", "--tag", "wefty:node:other", "--", "true"}, io.Discard, io.Discard)
 	if err == nil || commandExitCode(err) != exitUsage || !strings.Contains(err.Error(), "--tag") || strings.Contains(err.Error(), "--mount") || strings.Contains(err.Error(), "--node") || len(stack.requests) != 0 {
 		t.Fatalf("exec tag conflict: %v requests=%d", err, len(stack.requests))
@@ -169,7 +169,7 @@ func TestExecCleanupFailurePreservesVerdict(t *testing.T) {
 	for _, exit := range []int{0, 7} {
 		t.Run(fmt.Sprint(exit), func(t *testing.T) {
 			shortenExecTimers(t)
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			t.Chdir(execTestRepo(t))
 			root := os.Getenv("WEFTY_EXEC_STORAGE_ROOT")
 			t.Cleanup(func() { _ = os.Chmod(root, 0700) })
@@ -213,7 +213,7 @@ func TestExecCleanupFailurePreservesVerdict(t *testing.T) {
 }
 
 func TestExecRemovesReadOnlyFolders(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	var errOut bytes.Buffer
 	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "mkdir frozen; touch frozen/file; chmod -R a-w frozen"}, io.Discard, &errOut)
@@ -236,7 +236,7 @@ func TestExecCancelFeedbackAndAcceptedSettlement(t *testing.T) {
 	old := execCancelSettlementBudget
 	execCancelSettlementBudget = 250 * time.Millisecond
 	t.Cleanup(func() { execCancelSettlementBudget = old })
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -278,7 +278,7 @@ func TestExecCancelFeedbackAndAcceptedSettlement(t *testing.T) {
 }
 
 func TestExecCancelWaitUsesL1Budget(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -325,7 +325,7 @@ func TestExecStartupFailuresAreInfrastructure(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			var out, errOut bytes.Buffer
 			err = execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "printf should-not-run"}, &out, &errOut)
 			if commandExitCode(err) != exitUnavailable || !strings.Contains(errOut.String(), "wefty: snapshot checkout failed") || out.Len() != 0 {
@@ -434,7 +434,7 @@ func TestExecHeartbeatStopsAtCommandEnd(t *testing.T) {
 
 func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 	binary := buildWefty(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	cancelling := make(chan struct{})
 	ledger := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
@@ -484,6 +484,12 @@ func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("first signal did not request cancellation")
 	}
+	// The server can see the cancel before the test's reader has copied the
+	// CLI's feedback line, so wait for the line itself.
+	feedbackDeadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(output.String(), "wefty: cancelling run ") && time.Now().Before(feedbackDeadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	feedback := output.String()
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)
@@ -509,7 +515,7 @@ func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 }
 
 func TestExecUnconfirmedSubmissionPrintsStorage(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	base := stack.clients.l3.client.Transport
 	stack.clients.l3.client.Transport = storageRoundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -532,7 +538,7 @@ func TestExecUnconfirmedSubmissionPrintsStorage(t *testing.T) {
 }
 
 func TestExecCaptureUsesUserDataFolder(t *testing.T) {
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", "")
 	state := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", state)
@@ -555,7 +561,7 @@ func TestExecCaptureUsesUserDataFolder(t *testing.T) {
 
 func TestExecCLIRemovesReadOnlyResidue(t *testing.T) {
 	shortenExecTimers(t)
-	stack := newExecStack(t, time.Second)
+	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	base := stack.clients.l3.client.Transport
 	injected := false

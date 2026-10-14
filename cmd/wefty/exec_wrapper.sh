@@ -4,10 +4,12 @@ set -u
 __WEFTY_EXEC_INPUT__
 work="$storage/work"
 heartbeat=''
+preparing=''
 child=''
 cleanup() {
   code=$?
   trap - EXIT INT TERM HUP
+  if [ -n "$preparing" ]; then kill "$preparing" 2>/dev/null || :; wait "$preparing" 2>/dev/null || :; fi
   if [ -n "$heartbeat" ]; then kill "$heartbeat" 2>/dev/null || :; wait "$heartbeat" 2>/dev/null || :; fi
   if [ -n "$child" ]; then kill "$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; fi
   cd /tmp || :
@@ -49,6 +51,21 @@ snapshot_checkout_failed() {
   fi
   exit 1
 }
+# A large snapshot can take a while to clone. Report liveness from the start,
+# so the no-output limit measures the command, not the checkout.
+(
+  sleeper=''
+  trap 'if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null || :; wait "$sleeper" 2>/dev/null || :; fi; exit' TERM INT HUP
+  minutes=0
+  while :; do
+    sleep "$heartbeat_seconds" & sleeper=$!
+    wait "$sleeper" || exit
+    sleeper=''
+    minutes=$((minutes+1))
+    printf 'still preparing the snapshot (%sm)\n' "$minutes" >&2
+  done
+) &
+preparing=$!
 # Acceptance can precede the CLI's marker write, or its reply can be lost.
 # Record ownership before cloning changes the capture directory's age.
 if [ -n "${WEFTY_RUN_ID:-}" ]; then
@@ -66,6 +83,9 @@ fi
   git -C "$work" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout --quiet --force HEAD
 ) || snapshot_checkout_failed
 cd "$work/$folder" || snapshot_checkout_failed
+kill "$preparing" 2>/dev/null || :
+wait "$preparing" 2>/dev/null || :
+preparing=''
 (
   for name in ${!WEFTY_@}; do unset "$name"; done
   exec -- "${command[@]}"

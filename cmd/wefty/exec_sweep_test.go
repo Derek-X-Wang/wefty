@@ -97,7 +97,7 @@ func TestExecSweepMarkerlessAcceptedCapture(t *testing.T) {
 func TestExecSweepMarkerlessLookup(t *testing.T) {
 	for _, kind := range []string{"unaccepted", "list-failure", "list-timeout", "record-failure", "record-timeout"} {
 		t.Run(kind, func(t *testing.T) {
-			stack := newExecStack(t, time.Second)
+			stack := newExecStack(t, execTestIdleLimit)
 			storage := filepath.Join(os.Getenv("WEFTY_EXEC_STORAGE_ROOT"), "wefty-exec-"+kind)
 			writeExecFile(t, filepath.Join(storage, "snapshot.git", "object"), "retained")
 			ageExecCapture(t, storage)

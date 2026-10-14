@@ -39,9 +39,12 @@ the CLI names the retained storage path.
 The embedded Bash wrapper clones the independent capture without hard links,
 changes to the same relative folder and runs the argv without `eval`. Only the
 command loses `WEFTY_*`; the wrapper keeps its run mailbox environment. The
-command otherwise inherits the node's environment. The wrapper prints
-`still running (Nm)` once per minute. This reports wrapper liveness. Its timer
-ends and is reaped with the child, before result publication or cleanup.
+command otherwise inherits the node's environment. While it clones the
+snapshot, the wrapper prints `still preparing the snapshot (Nm)` once per
+minute, so the no-output limit measures the command, not the checkout. Once
+the command starts, it prints `still running (Nm)` once per minute. This
+reports wrapper liveness. Its timer ends and is reaped with the child, before
+result publication or cleanup.
 Heartbeat lines go to stderr. The wrapper writes `{"exit_code":N}` to the
 run's result document, using the existing result upload path. Clone, checkout,
 or start-folder failures print `wefty: snapshot checkout failed` and write an
