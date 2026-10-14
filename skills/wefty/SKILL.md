@@ -1,6 +1,6 @@
 ---
 name: wefty
-description: Submit and track work on a wefty cluster — check the cluster is ready, schedule AI agent workflows and one-shot jobs onto machines you own, wait for an outcome, follow logs, inspect run lineage and results, and rerun from snapshots. Use when the user wants to run something "on wefty", "on the cluster/fabric", schedule agent work onto their machines, or check on a wefty run.
+description: Submit and track work on a wefty cluster — check the cluster is ready, schedule AI agent workflows and one-shot jobs onto machines you own, wait for an outcome, follow logs, inspect run lineage and results, and rerun from snapshots. Use when the user wants to run something "on wefty", "on the cluster/fabric", schedule AI agent work onto their machines, or check on a wefty run.
 ---
 
 # Driving a wefty cluster
@@ -9,8 +9,15 @@ Wefty is a personal compute fabric: the user's machines form one tag-routed
 cluster; every execution is permanently recorded. Read `CONTEXT.md` at the
 repo root for the vocabulary — the short version: a **workflow** is a stored
 program; running anything creates a **run** in the ledger (L3); the run
-becomes a **job** in the cluster queue (L1); a node's agent claims it as an
+becomes a **job** in the cluster queue (L1); a node agent claims it as an
 **attempt**.
+
+Use wefty to run work in the background, record it in the ledger, and keep it
+running after the AI agent's session ends. A single local node is a valid
+target: the work still uses that machine's CPU, but its lifetime belongs to
+the cluster rather than to the AI agent's session.
+
+Install by copying `skills/wefty/` to `~/.claude/skills/wefty/` (Claude Code) or `~/.agents/skills/wefty/` (Codex).
 
 ## Start here: is the cluster ready?
 
@@ -42,7 +49,7 @@ someone needs the detail, let them run the command themselves.
 
 **If `status` says not ready, stop.** Do not submit and do not retry in a loop.
 Bringing the stack up and enrolling machines into the Fabric are **human steps**,
-not agent steps: they need binaries installed, ports and identities decided, and
+not AI agent steps: they need binaries installed, ports and identities decided, and
 a person to authorize enrollment. Report the verdict line to the user and ask
 them to fix it. Single-machine setup is in
 [`docs/acceptance/v0.1-dogfood.md`](../../docs/acceptance/v0.1-dogfood.md)
@@ -175,7 +182,7 @@ as `--argv '--json'`) and arguments after `--` remain literal.
   `--json`); the run stays queued until a matching node joins, so treat the
   warning as a wrong tag unless you expect that node.
 - `--required-envelope`: exit 0 without an envelope fails the run — use for
-  agent workflows so "process exited" never masquerades as "step succeeded".
+  AI agent workflows so "process exited" never masquerades as "step succeeded".
 - Always guard the pipeline: `set -o pipefail` and `jq -er '.run_id'`.
 
 Everything else you will want:
@@ -205,9 +212,9 @@ running has no duration, because the time so far is not the time it took.
 
 ## Recipe: an issue to a draft PR
 
-`workflows/issue-to-pr/` reads a GitHub issue, lets a coding agent implement it,
+`workflows/issue-to-pr/` reads a GitHub issue, lets a coding AI agent implement it,
 runs the repository's gates, and opens a **draft** pull request. It runs as a
-`kind=process` job on a node you own, using your `gh` and agent logins, so pin it
+`kind=process` job on a node you own, using your `gh` and AI agent logins, so pin it
 to that node:
 
 ```sh
@@ -224,7 +231,7 @@ wefty --json results "$RUN_ID" | jq -er '.document.pr_url'
 ```
 
 Here `--max-runtime=5400` is a deliberate backstop. The workflow stops its own
-agent phases at `budget_minutes` (60 by default) and reports a verdict, so the
+AI agent phases at `budget_minutes` (60 by default) and reports a verdict, so the
 job limit only catches a workflow that hangs. For a longer budget, raise both
 together.
 
@@ -239,6 +246,34 @@ The pull request is a draft and nobody has reviewed it. Read it before you ask
 anyone else to. Its URL is in the verdict document's `pr_url` and in `pr.json`
 in the run's handoff directory. `workflows/issue-to-pr/README.md` has the rest,
 including what makes the run fail.
+
+## Recipe: branch gates
+
+`workflows/branch-gates/` clones a repository, checks out a ref, and reports a
+pass/fail verdict. Submit it as a `kind=process` job on a node with Bash, Git
+and Go on `PATH`. Only gate refs you trust.
+
+All params are strings: `ref` is required (branch, tag or commit); `repo_url`
+is optional (defaults to the public wefty repository); `gates` is an optional
+comma-separated subset of `gofmt,fabric-boundary,vet,test` (all four by
+default). This example uses the quick set `gates=gofmt,fabric-boundary,vet`:
+
+```sh
+set -o pipefail
+RUN_ID=$(wefty --json submit \
+  --script=workflows/branch-gates/branch-gates.sh \
+  --interpreter=bash \
+  --params '{"ref":"main","repo_url":"https://github.com/Derek-X-Wang/wefty.git","gates":"gofmt,fabric-boundary,vet"}' \
+  --required-envelope | jq -er '.run_id')
+
+wefty wait "$RUN_ID" --timeout 30m
+wefty --json inspect "$RUN_ID"
+wefty results "$RUN_ID"
+```
+
+The ref must be available from `repo_url`; unpushed branches and uncommitted
+edits are not included. `workflows/branch-gates/README.md` has the OCI recipe
+and full result details.
 
 ## Writing the workflow
 
@@ -255,13 +290,21 @@ nodes with Node.js 22.7 or later.
 
 ## Inside a workflow script
 
+A `kind=process` job starts with the node agent's environment, including
+`PATH` and other inherited variables. Values set on the job override
+inherited ones, and sensitive job values are applied last. The inherited
+`WEFTY_RUN_TOKEN`, `WEFTY_ATTEMPT_TOKEN` and `WEFTY_COMPUTER_TOKEN` are stripped
+before job values are applied. Tools are found through the node's `PATH`, so
+scripts should use tool names rather than hard-code tool paths. The run's own
+`WEFTY_*` variables reach child processes unless the workflow clears them.
+
 A workflow's job process receives the run execution context as env vars
 (documented in `docs/contracts/run-execution-context.md`): `WEFTY_RUN_ID`,
 `WEFTY_L3_ENDPOINT` (a dialable HTTP URL), `WEFTY_HANDOFF_DIR` (node-local) and
 `WEFTY_RUN_DIR`, the run mailbox. Report by writing event files into the
 mailbox: the node agent publishes them to the ledger, so the job needs no
 credential at all. This is the same for `kind=oci` and `kind=process`; an OCI
-job's mailbox lives in its handoff volume and the agent reads it through the
+job's mailbox lives in its handoff volume and the node agent reads it through the
 privileged helper.
 
 `WEFTY_RUN_TOKEN` (scoped to this run — dispatch children, write own
@@ -325,7 +368,7 @@ run's *status* as an exit code, which is the right gate for a script but not the
 same judgement — a run can succeed with a missing artifact or a failed
 envelope, so still read `inspect` before trusting the work, and `results` for
 the document the run itself concluded with. The reference workflow is
-`workflows/dogfood/` — plan → implement → cross-review with real agent CLIs.
+`workflows/dogfood/` — plan → implement → cross-review with real AI agent CLIs.
 `workflows/branch-gates/` is the smaller one to copy: it gates a branch and
 hands back a pass/fail verdict. `workflows/issue-to-pr/` is the one that writes
 code — see the recipe above.

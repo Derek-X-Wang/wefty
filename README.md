@@ -7,6 +7,8 @@ across machines you own. A control plane and node agents turn Macs, Linux
 servers, and eventually provider capacity into one tag-routed job queue, while a
 workflow ledger records runs, logs, handoffs, and gates.
 
+For background work on a single local node and the branch-gates recipe, see the [wefty skill](skills/wefty/SKILL.md).
+
 The brain stays home: the control plane, run ledger, state, and history always
 run on your machines, including cloud machines that you rent directly. Hosted
 agent systems put that brain in a service and send your code to it; wefty keeps
