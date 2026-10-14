@@ -43,8 +43,14 @@ command otherwise inherits the node's environment. While it clones the
 snapshot, the wrapper prints `still preparing the snapshot (Nm)` once per
 minute, so the no-output limit measures the command, not the checkout. Once
 the command starts, it prints `still running (Nm)` once per minute. This
-reports wrapper liveness. Its timer ends and is reaped with the child, before
-result publication or cleanup.
+reports wrapper liveness. One liveness loop serves both phases. It polls in
+ticks of at most 0.5 s and stops by itself when the wrapper writes a finished
+marker in the capture storage, so it normally ends about one tick after the
+command, before result publication or cleanup. The wrapper does not stop the
+loop with a catchable signal: Bash can catch and lose a signal that reaches a
+new subshell while it still carries the wrapper's traps. Only when the marker
+cannot be written does the wrapper use SIGKILL. Cleanup runs each removal step
+under a shared 10 s budget and kills a step that exceeds it.
 Heartbeat lines go to stderr. The wrapper writes `{"exit_code":N}` to the
 run's result document, using the existing result upload path. Clone, checkout,
 or start-folder failures print `wefty: snapshot checkout failed` and write an

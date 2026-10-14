@@ -378,6 +378,92 @@ func (w *execReviewOutput) String() string {
 	return w.buffer.String()
 }
 
+// Bash can catch and lose a signal that reaches a new subshell while it still
+// carries the wrapper's traps (seen with Linux Bash 5.2). A wrapper that stops
+// its heartbeat with a signal then waits out a whole heartbeat period after
+// the command. Concurrent runs with the production period make that likely.
+func TestExecWrapperEndsWithinATickOfTheCommand(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	old := execHeartbeatSeconds
+	execHeartbeatSeconds = "60"
+	t.Cleanup(func() { execHeartbeatSeconds = old })
+	repo := execTestRepo(t)
+	const runs, workers = 32, 4
+	wrappers := make(chan string, runs)
+	for range runs {
+		capture, err := captureExec(t.Context(), repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cleanupExecStorage(capture.Storage) })
+		wrappers <- buildExecWrapper(capture, []string{"/bin/sh", "-c", "exit 7"})
+	}
+	close(wrappers)
+	var group sync.WaitGroup
+	failures := make(chan string, runs)
+	for range workers {
+		group.Go(func() {
+			for wrapper := range wrappers {
+				if failure := runExecWrapperPromptly(t, wrapper, 7); failure != "" {
+					failures <- failure
+				}
+			}
+		})
+	}
+	group.Wait()
+	close(failures)
+	for failure := range failures {
+		t.Error(failure)
+	}
+}
+
+// The command can make its capture storage unwritable, so the finished
+// marker cannot be written. The liveness loop must still stop, and cleanup
+// must still remove the storage.
+func TestExecWrapperEndsWhenTheCommandLocksStorage(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory mode this test relies on")
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	old := execHeartbeatSeconds
+	execHeartbeatSeconds = "60"
+	t.Cleanup(func() { execHeartbeatSeconds = old })
+	capture, err := captureExec(t.Context(), execTestRepo(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cleanupExecStorage(capture.Storage) })
+	// The command runs in <storage>/work, so ".." is the capture storage.
+	if failure := runExecWrapperPromptly(t, buildExecWrapper(capture, []string{"/bin/sh", "-c", "chmod 500 .. && exit 3"}), 3); failure != "" {
+		t.Fatal(failure)
+	}
+	if _, err := os.Lstat(capture.Storage); !os.IsNotExist(err) {
+		t.Fatalf("storage after a locked run: %v", err)
+	}
+}
+
+// runExecWrapperPromptly runs a built wrapper and reports a failure unless it
+// exits with want well inside the production heartbeat period.
+func runExecWrapperPromptly(t *testing.T, wrapper string, want int) string {
+	ctx, stop := context.WithTimeout(t.Context(), 30*time.Second)
+	defer stop()
+	// A timeout stops the whole wrapper group, so a surviving helper cannot
+	// hold the output open and hang the test.
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", wrapper)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 5 * time.Second
+	started := time.Now()
+	output, err := cmd.CombinedOutput()
+	var exit *exec.ExitError
+	if elapsed := time.Since(started); !errors.As(err, &exit) || exit.ExitCode() != want || elapsed > 10*time.Second {
+		return fmt.Sprintf("took %s: %v %q", elapsed.Round(time.Millisecond), err, output)
+	}
+	return ""
+}
+
 func TestExecHeartbeatStopsAtCommandEnd(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())

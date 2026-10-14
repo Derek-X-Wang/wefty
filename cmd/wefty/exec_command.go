@@ -10,9 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +30,20 @@ var execWrapper string
 // while still executing the shipped wrapper through L1 and the node agent.
 var execHeartbeatSeconds = "60"
 var execPollInterval = time.Second
+
+// execHeartbeatTick bounds how long the wrapper's liveness loop takes to see
+// that the command ended, which delays the end of every run by up to one tick.
+const execHeartbeatTick = 0.5
+
+// execHeartbeatSchedule splits the heartbeat period into ticks of at most
+// execHeartbeatTick seconds.
+func execHeartbeatSchedule() (tick string, ticks int) {
+	period, err := strconv.ParseFloat(execHeartbeatSeconds, 64)
+	if err != nil || period <= execHeartbeatTick {
+		return execHeartbeatSeconds, 1
+	}
+	return strconv.FormatFloat(execHeartbeatTick, 'f', -1, 64), int(math.Ceil(period / execHeartbeatTick))
+}
 
 // Outlast the phase-1 service restart, which must complete in under 30 seconds.
 var execReadRecoveryBudget = 40 * time.Second
@@ -171,7 +187,8 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 func buildExecWrapper(capture execCapture, argv []string) string {
 	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
 	var input strings.Builder
-	fmt.Fprintf(&input, "storage=%s\nfolder=%s\nheartbeat_seconds=%s\ncommand=()\n", quote(capture.Storage), quote(capture.Folder), quote(execHeartbeatSeconds))
+	tick, ticks := execHeartbeatSchedule()
+	fmt.Fprintf(&input, "storage=%s\nfolder=%s\nheartbeat_tick=%s\nheartbeat_ticks=%d\ncommand=()\n", quote(capture.Storage), quote(capture.Folder), quote(tick), ticks)
 	// Scalar assignment avoids Bash 3.2 compound-array parsing of control bytes.
 	for i, arg := range argv {
 		fmt.Fprintf(&input, "command[%d]=%s\n", i, quote(arg))
