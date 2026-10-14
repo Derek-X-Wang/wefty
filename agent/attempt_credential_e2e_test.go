@@ -53,6 +53,7 @@ func TestProcessJobSpawnsChildWithOnlyTheInjectedCredential(t *testing.T) {
 		"--control-plane="+address,
 		"--node-id=stable-node",
 		"--log-spool-dir="+directory,
+		"--managed-root="+temporaryManagedRoot(t),
 		"--plain-identity=fabric-node",
 		"--heartbeat-interval=5s",
 		"--claim-interval=10ms",
