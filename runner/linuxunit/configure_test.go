@@ -36,6 +36,7 @@ func TestConfigureWritesUnitsAndConfigButOnlyPrintsServiceCommands(t *testing.T)
 	runner := &configureTestRunner{}
 	var chowns []string
 	receipt, err := Configure(t.Context(), Config{
+		NodeID: "node-linux", AgentArguments: []string{"--node-id=node-linux"},
 		AgentPath: "/usr/local/libexec/wefty-agent", OperatorUser: "wefty", OperatorGroup: "wefty", OperatorUID: 1001, OperatorGID: 1001,
 		WorkingDirectory: "/var/lib/wefty", ContainerdAddress: "/run/containerd/containerd.sock",
 		ContainerdStateRoot: "/run/containerd", RuntimeRoot: "/var/lib/wefty/oci", AllowedMountRoots: []string{"/srv/wefty"},
@@ -56,7 +57,7 @@ func TestConfigureWritesUnitsAndConfigButOnlyPrintsServiceCommands(t *testing.T)
 	}
 	wantControl := "/run/wefty-agent/control.sock"
 	installed, err := ocicontrol.ReadInstalledConfig(filepath.Join(root, "home", ".config", "wefty", "node.json"))
-	if err != nil || installed.ControlSocket != wantControl {
+	if err != nil || installed.ControlSocket != wantControl || installed.NodeID != "node-linux" {
 		t.Fatalf("installed config=%+v err=%v", installed, err)
 	}
 	for _, name := range []string{AgentUnit, HelperSocketUnit, HelperServiceUnit} {

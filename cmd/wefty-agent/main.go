@@ -329,7 +329,7 @@ func runMacBootstrap(arguments []string) error {
 		return err
 	}
 	if err := ocicontrol.WriteInstalledConfig(*nodeConfig, ocicontrol.InstalledConfig{
-		Version: ocicontrol.InstalledConfigVersion, ControlSocket: *controlSocket,
+		Version: ocicontrol.InstalledConfigVersion, ControlSocket: *controlSocket, NodeID: *nodeID,
 	}); err != nil {
 		return err
 	}

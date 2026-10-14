@@ -56,6 +56,15 @@ func (h *statusHarness) clients() *apiClients {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			switch {
+			case strings.HasPrefix(r.URL.Path, "/v1/nodes/"):
+				for _, node := range h.nodes.Nodes {
+					if strings.TrimPrefix(r.URL.Path, "/v1/nodes/") == node.NodeID {
+						_ = json.NewEncoder(w).Encode(node)
+						return
+					}
+				}
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorNotFound, Message: "node not found"}})
 			case strings.HasPrefix(r.URL.Path, "/v1/nodes"):
 				_ = json.NewEncoder(w).Encode(h.nodes)
 			case strings.HasPrefix(r.URL.Path, "/v1/whoami"):
