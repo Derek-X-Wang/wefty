@@ -1353,6 +1353,124 @@ func TestPartitionedAgentRejoinsAfterTransientFirstClaimFailure(t *testing.T) {
 	runPartitionedAgentRejoinFixture(t, false, true)
 }
 
+func TestResilienceStartWaitRecoversAfterLostClaimAnswer(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 8, 9, 14, 0, 0, 0, time.UTC))
+	network := plain.NewNetwork()
+	// The unanswered claim holds one L1 slot without occupying a local slot.
+	// Leave a second slot for the job queued after the empty retry, and keep
+	// the lost claim's lease live across the claim interval under test.
+	// Use one local claim worker so another empty poll cannot hide its backoff.
+	policy := l1.DefaultNodePolicy("linux")
+	policy.MaxOneshotSlots = 2
+	policy.MaxServiceSlots = 0
+	store, stopServer := startFailureServerWithPolicies(t, network, clock,
+		map[string]l1.NodePolicy{"node-1": policy})
+	defer stopServer()
+	lostJob := createAgentTestJob(t, store, "lost-claim-answer")
+	runner := newResilienceRunner()
+	nodeAgent, err := New(Config{
+		Fabric:              network.NewFabric(fabric.Identity{NodeID: "fabric-node-1", Tags: []string{l1.DefaultAgentPrincipalTag}}),
+		ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1", Version: "test", Clock: clock,
+		Capabilities: map[string]bool{"kind:process": true}, WorkloadRuntimes: testRuntimeSet(runner),
+		HeartbeatInterval: 5 * time.Minute, ClaimInterval: time.Second, RenewalInterval: 10 * time.Second, MaxOneshotSlots: 1,
+		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nodeAgent.Close()
+	client := nodeAgent.session.client
+	transport := &lostClaimAnswerTransport{base: client.httpClient.Transport, committed: make(chan l1.Claim, 1)}
+	client.httpClient.Transport = transport
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- nodeAgent.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("node agent shutdown: %v", err)
+			}
+		case <-time.After(resilienceTestWatchdog):
+			t.Error("node agent did not stop after cancellation")
+		}
+	}()
+
+	var lostClaim l1.Claim
+	select {
+	case lostClaim = <-transport.committed:
+	case <-time.After(resilienceTestWatchdog):
+		t.Fatal("L1 did not commit the claim whose answer must be lost")
+	}
+	if lostClaim.Job.JobID != lostJob.JobID {
+		t.Fatalf("lost claim job = %q, want %q", lostClaim.Job.JobID, lostJob.JobID)
+	}
+	// Release only the transient-error backoff. The next claim has no queued
+	// work and leaves Ready waiting on ClaimInterval, exactly as in #909.
+	if err := awaitFixtureCondition(t.Context(), "lost claim timeout backoff armed", func() bool {
+		status := nodeAgent.Status()
+		if status.State != LifecycleRejoining || status.SessionBackoff <= 0 {
+			return false
+		}
+		clock.advanceArmedTimer(status.SessionBackoff)
+		return clock.Now().After(lostClaim.Job.UpdatedAt)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	beforeClaimInterval := clock.Now()
+	clock.waitForDeadline(t, beforeClaimInterval.Add(nodeAgent.session.claimInterval))
+	status := nodeAgent.Status()
+	if status.State != LifecycleReady || len(status.Attempts) != 0 || status.OneShot.Occupied != 0 || status.Services.Occupied != 0 {
+		t.Fatalf("after lost claim answer = %+v, want Ready and idle", status)
+	}
+	storedLost, err := store.GetJob(t.Context(), lostJob.JobID)
+	if err != nil || storedLost.State != contract.JobClaimed || storedLost.CurrentAttemptID != lostClaim.Lease.AttemptID {
+		t.Fatalf("unanswered claim was not committed: job=%+v err=%v", storedLost, err)
+	}
+
+	job := createAgentTestJob(t, store, "after-lost-claim-answer")
+	attemptID := runner.waitStarted(t, done, clock, nodeAgent)
+	started, err := store.GetJob(t.Context(), job.JobID)
+	if err != nil || started.CurrentAttemptID != attemptID {
+		t.Fatalf("started job = %+v err=%v, want attempt %q", started, err, attemptID)
+	}
+	if runner.startCount(lostClaim.Lease.AttemptID) != 0 || runner.startCount(attemptID) != 1 {
+		t.Fatal("runtime must start only the job with a received claim answer, exactly once")
+	}
+	if got := clock.Now(); !got.Equal(beforeClaimInterval.Add(nodeAgent.session.claimInterval)) {
+		t.Fatalf("start clock = %s, want exactly one claim interval after %s", got, beforeClaimInterval)
+	}
+}
+
+type lostClaimAnswerTransport struct {
+	base      http.RoundTripper
+	claims    atomic.Int32
+	committed chan l1.Claim
+}
+
+func (transport *lostClaimAnswerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.URL.Path != "/v1/agent/jobs/claim" || transport.claims.Add(1) != 1 {
+		return transport.base.RoundTrip(request)
+	}
+	response, err := transport.base.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("lost-answer fixture: first claim returned HTTP %d", response.StatusCode)
+	}
+	var claim l1.Claim
+	if err := json.NewDecoder(response.Body).Decode(&claim); err != nil {
+		return nil, err
+	}
+	transport.committed <- claim
+	// L1 has committed and sent a valid claim. Inject the client's timeout
+	// instead of delivering that answer; no wall-clock race is required.
+	return nil, context.DeadlineExceeded
+}
+
 type firstClaimFailureTransport struct {
 	base   http.RoundTripper
 	claims atomic.Int32
@@ -3801,11 +3919,16 @@ func (runner *resilienceRunner) waitStarted(t *testing.T, done <-chan error, clo
 			return ""
 		case <-poll.C:
 			// Initial claim and registration retries both wait on the manual
-			// clock. Advance only once the backoff timer is armed. Advancing
-			// during the RPC would age its lease while the answer is in flight.
+			// clock. A committed claim whose answer is lost can also leave an
+			// empty retry waiting in Ready on ClaimInterval. Advance only an
+			// armed timer, so a claim RPC's in-flight lease does not age. Ready
+			// must also be idle to avoid expiring a live local attempt.
 			status := nodeAgent.Status()
 			if status.State == LifecycleRejoining && status.SessionBackoff > 0 {
-				clock.advanceArmedBackoff(status.SessionBackoff)
+				clock.advanceArmedTimer(status.SessionBackoff)
+			} else if status.State == LifecycleReady && len(status.Attempts) == 0 &&
+				status.OneShot.Occupied == 0 && status.Services.Occupied == 0 {
+				clock.advanceArmedTimer(nodeAgent.session.claimInterval)
 			}
 		}
 	}
@@ -3891,7 +4014,7 @@ func (clock *manualClock) NewTimer(duration time.Duration) Timer {
 	return timer
 }
 
-func (clock *manualClock) advanceArmedBackoff(duration time.Duration) {
+func (clock *manualClock) advanceArmedTimer(duration time.Duration) {
 	clock.advance(duration, true)
 }
 
@@ -3899,9 +4022,9 @@ func (clock *manualClock) Advance(duration time.Duration) {
 	clock.advance(duration, false)
 }
 
-func (clock *manualClock) advance(duration time.Duration, requireArmedBackoff bool) {
+func (clock *manualClock) advance(duration time.Duration, requireArmedTimer bool) {
 	clock.mu.Lock()
-	if requireArmedBackoff {
+	if requireArmedTimer {
 		armed := false
 		for _, timer := range clock.timers {
 			if timer.active && timer.deadline.Equal(clock.now.Add(duration)) {
