@@ -42,11 +42,11 @@ func TestHostBootSessionProofAcceptsOnlyCurrentRegistration(t *testing.T) {
 		"oversized identity":   {strings.Repeat("n", 256), "stable-node", "boot-a"},
 		"oversized stable one": {"fabric-node", strings.Repeat("s", 256), "boot-a"},
 	} {
-		if err := h.store.ProveHostBootSession(ctx, claim[0], claim[1], claim[2]); errorCode(err) != contract.ErrorInvalidRequest {
+		if err := testReads(h.store).ProveHostBootSession(ctx, claim[0], claim[1], claim[2]); errorCode(err) != contract.ErrorInvalidRequest {
 			t.Fatalf("%s proof = %v, want invalid_request", name, err)
 		}
 	}
-	if err := h.store.ProveHostBootSession(ctx, "fabric-node", "stable-node", "boot-a"); err != nil {
+	if err := testReads(h.store).ProveHostBootSession(ctx, "fabric-node", "stable-node", "boot-a"); err != nil {
 		t.Fatalf("prove current boot A: %v", err)
 	}
 	for name, claim := range map[string][3]string{
@@ -54,16 +54,16 @@ func TestHostBootSessionProofAcceptsOnlyCurrentRegistration(t *testing.T) {
 		"wrong identity":    {"foreign-node", "stable-node", "boot-a"},
 		"wrong stable node": {"fabric-node", "other-node", "boot-a"},
 	} {
-		if err := h.store.ProveHostBootSession(ctx, claim[0], claim[1], claim[2]); errorCode(err) != contract.ErrorForbidden {
+		if err := testReads(h.store).ProveHostBootSession(ctx, claim[0], claim[1], claim[2]); errorCode(err) != contract.ErrorForbidden {
 			t.Fatalf("%s proof = %v, want forbidden", name, err)
 		}
 	}
 
 	register("stable-node", "boot-b")
-	if err := h.store.ProveHostBootSession(ctx, "fabric-node", "stable-node", "boot-a"); errorCode(err) != contract.ErrorForbidden {
+	if err := testReads(h.store).ProveHostBootSession(ctx, "fabric-node", "stable-node", "boot-a"); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("replaced boot proof = %v, want forbidden", err)
 	}
-	if err := h.store.ProveHostBootSession(ctx, "fabric-node", "stable-node", "boot-b"); err != nil {
+	if err := testReads(h.store).ProveHostBootSession(ctx, "fabric-node", "stable-node", "boot-b"); err != nil {
 		t.Fatalf("prove current boot B: %v", err)
 	}
 
@@ -107,12 +107,12 @@ func TestHostBootSessionProofIsBoundToOneStableNode(t *testing.T) {
 		}
 	}
 	for _, claim := range [][2]string{{"node-old", "boot-a"}, {"node-new", "boot-b"}} {
-		if err := h.store.ProveHostBootSession(ctx, "fabric-node", claim[0], claim[1]); err != nil {
+		if err := testReads(h.store).ProveHostBootSession(ctx, "fabric-node", claim[0], claim[1]); err != nil {
 			t.Fatalf("prove %s/%s: %v", claim[0], claim[1], err)
 		}
 	}
 	for _, claim := range [][2]string{{"node-new", "boot-a"}, {"node-old", "boot-b"}} {
-		if err := h.store.ProveHostBootSession(ctx, "fabric-node", claim[0], claim[1]); errorCode(err) != contract.ErrorForbidden {
+		if err := testReads(h.store).ProveHostBootSession(ctx, "fabric-node", claim[0], claim[1]); errorCode(err) != contract.ErrorForbidden {
 			t.Fatalf("cross-node proof %s/%s = %v, want forbidden", claim[0], claim[1], err)
 		}
 	}

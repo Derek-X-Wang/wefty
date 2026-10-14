@@ -184,7 +184,7 @@ func TestRestartedResourceLatchCanEnterReimageWithoutSecondRestart(t *testing.T)
 		failure, computer.CurrentJobID); err != nil {
 		t.Fatal(err)
 	}
-	latched, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+	latched, err := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +229,7 @@ func TestComputerReimageMissingGenerationBudgetFailsClosed(t *testing.T) {
 	if _, err := h.store.db.Exec(`UPDATE service_jobs SET bound_node_id=? WHERE job_id=?`, node.NodeID, computer.CurrentJobID); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestComputerReimageAcknowledgementCapacityRefusalIsTypedOutcome(t *testing.
 	if _, err := h.store.db.Exec(`UPDATE computers SET desired_state='running' WHERE computer_id=?`, computer.ComputerID); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestComputerReimagePreservesIdentityStorageAndIntent(t *testing.T) {
 	if err != nil || replayed.IntentRevision != reimaged.IntentRevision || replayed.CurrentJobID != reimaged.CurrentJobID {
 		t.Fatalf("reimage replay = %#v err=%v", replayed, err)
 	}
-	history, err := h.store.ListComputerIntents(t.Context(), computer.ComputerID, "", MaxJobPageLimit)
+	history, err := testReads(h.store).ListComputerIntents(t.Context(), computer.ComputerID, "", MaxJobPageLimit)
 	if err != nil || len(history.Intents) != 3 || history.Intents[2].Operation != ComputerIntentReimage ||
 		history.Intents[2].DesiredState != contract.ServiceDesiredStopped {
 		t.Fatalf("reimage intent history = %#v err=%v", history, err)
@@ -540,7 +540,7 @@ func TestRunningComputerReimageUsesInternalQuiescence(t *testing.T) {
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +618,7 @@ func TestComputerGrowPreservesJobAttemptAndStorageGeneration(t *testing.T) {
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +660,7 @@ func TestComputerGrowPreservesJobAttemptAndStorageGeneration(t *testing.T) {
 	if errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("shrink error = %v", err)
 	}
-	unchanged, _ := h.store.GetComputer(t.Context(), grown.ComputerID)
+	unchanged, _ := testReads(h.store).GetComputer(t.Context(), grown.ComputerID)
 	if unchanged.IntentRevision != staleRevision || unchanged.DesiredDiskBytes != target {
 		t.Fatalf("rejected shrink changed Computer = %#v", unchanged)
 	}
@@ -752,7 +752,7 @@ func TestComputerGrowInsufficientDiskLatchesUntilExplicitRestart(t *testing.T) {
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -816,7 +816,7 @@ func TestReconfigurationAbortRequiresDeadBoundNodeAndLeavesExplicitRestart(t *te
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, _ = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, _ = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	reimage := ComputerReimageRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
 		Image: reimageTarget('f'), TerminateSessions: true, IdempotencyKey: "abort-target"}
 	reimaging, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, reimage)
@@ -917,7 +917,7 @@ func TestRemovalAcceptsAbortedComputerWithStoppedProjection(t *testing.T) {
 		claim.Lease.AttemptID, StartedRequest{FencingToken: claim.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
 	}
-	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1071,7 +1071,7 @@ func TestAbortCrashBoundariesRollbackAtomically(t *testing.T) {
 			if _, _, err := h.store.AbortComputerReconfiguration(t.Context(), computer.ComputerID, request); !errors.Is(err, injected) {
 				t.Fatalf("injected error = %v", err)
 			}
-			unchanged, _ := h.store.GetComputer(t.Context(), computer.ComputerID)
+			unchanged, _ := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 			if unchanged.ReconfigurationPhase != ComputerReconfigurationGrowing || unchanged.CurrentJob.State != contract.JobQueued {
 				t.Fatalf("partially committed abort = %#v", unchanged)
 			}
@@ -1113,7 +1113,7 @@ func TestReimageCrashBoundariesResumeWithoutPartialProjection(t *testing.T) {
 			if _, err := h.store.ReimageComputer(t.Context(), computer.ComputerID, request); !errors.Is(err, injected) {
 				t.Fatalf("injected error = %v", err)
 			}
-			unchanged, _ := h.store.GetComputer(t.Context(), computer.ComputerID)
+			unchanged, _ := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 			var staged int
 			if err := h.store.db.QueryRow(`SELECT COUNT(*) FROM computer_job_projections WHERE computer_id=? AND current=0`,
 				computer.ComputerID).Scan(&staged); err != nil || unchanged.ReconfigurationPhase != ComputerReconfigurationStable || staged != 0 {
@@ -1161,7 +1161,7 @@ func TestReimageCrashBoundariesResumeWithoutPartialProjection(t *testing.T) {
 			computer.ComputerID, acknowledgement); !errors.Is(err, injected) {
 			t.Fatalf("injected finalize error = %v", err)
 		}
-		unchanged, _ := h.store.GetComputer(t.Context(), computer.ComputerID)
+		unchanged, _ := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 		if unchanged.ReconfigurationPhase != ComputerReconfigurationReimaging || unchanged.CurrentJobID != staged.CurrentJobID {
 			t.Fatalf("partial finalize = %#v", unchanged)
 		}
@@ -1268,7 +1268,7 @@ func TestComputerReimageRefusesAnImageTheNodesRuntimeCannotRunAndLatchesTheTyped
 				if errorCode(err) != contract.ErrorConflict || !strings.Contains(err.Error(), wantRefusal) {
 					t.Fatalf("refusal %d = %v", refusal, err)
 				}
-				held, err := h.store.GetComputer(t.Context(), staged.ComputerID)
+				held, err := testReads(h.store).GetComputer(t.Context(), staged.ComputerID)
 				if err != nil || held.ReconfigurationPhase != ComputerReconfigurationReimaging {
 					t.Fatalf("Computer after refusal %d = %#v err=%v", refusal, held, err)
 				}
@@ -1419,7 +1419,7 @@ func TestQueuedComputerAbortMustRetainCompletionReplay(t *testing.T) {
 			}
 			claim := startComputerAttempt(t, h, node, nil)
 			if detached {
-				computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+				computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1435,7 +1435,7 @@ func TestQueuedComputerAbortMustRetainCompletionReplay(t *testing.T) {
 			if err != nil || first.Replayed {
 				t.Fatalf("first completion=%+v err=%v", first, err)
 			}
-			computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+			computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 			if err != nil {
 				t.Fatal(err)
 			}

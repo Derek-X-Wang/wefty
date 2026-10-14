@@ -170,7 +170,7 @@ func TestAdminRemovalWritesCurrentNoneBeforeDroppingOverride(t *testing.T) {
 			t.Fatalf("removed administrator remained in snapshot: %#v", snapshot.Admins)
 		}
 	}
-	audit, err := h.store.ListComputerPolicyAudit(context.Background(), bob, computer.ComputerID, "", 10)
+	audit, err := testReads(h.store).ListComputerPolicyAudit(context.Background(), bob, computer.ComputerID, "", 10)
 	if err != nil || len(audit.Entries) != 2 || audit.Entries[1].PreviousPermission != ComputerGrantView {
 		t.Fatalf("administrator removal audit = %#v err=%v", audit, err)
 	}
@@ -218,7 +218,7 @@ func TestComputerGrantRequiresObservedPersonAndAddressesFabric(t *testing.T) {
 	if err != nil || foreignGrant.Grant.FabricID != foreign.FabricID {
 		t.Fatalf("explicit-Fabric grant = %#v err=%v", foreignGrant, err)
 	}
-	listed, err := h.store.ListComputerGrants(context.Background(), admin, computer.ComputerID)
+	listed, err := testReads(h.store).ListComputerGrants(context.Background(), admin, computer.ComputerID)
 	if err != nil || len(listed.Grants) != 2 {
 		t.Fatalf("cross-Fabric grant list = %#v err=%v", listed, err)
 	}
@@ -381,13 +381,13 @@ func TestReplacementBootMustOutliveOlderPolicyLease(t *testing.T) {
 	if err := h.store.AcknowledgeComputerPolicyInstallation(context.Background(), "fabric-computer-node", acknowledgementFor(*newSnapshot)); err != nil {
 		t.Fatal(err)
 	}
-	status, err := h.store.GetComputerPolicyRevocation(context.Background(), admin, revoked.Grant.PolicyRevision,
+	status, err := testReads(h.store).GetComputerPolicyRevocation(context.Background(), admin, revoked.Grant.PolicyRevision,
 		computer.ComputerID, viewer.FabricID, viewer.UserID)
 	if err != nil || status.State != ComputerPolicyRevocationPending {
 		t.Fatalf("replacement boot bypassed old lease: %#v err=%v", status, err)
 	}
 	h.clock.Advance(time.Minute)
-	status, err = h.store.GetComputerPolicyRevocation(context.Background(), admin, revoked.Grant.PolicyRevision,
+	status, err = testReads(h.store).GetComputerPolicyRevocation(context.Background(), admin, revoked.Grant.PolicyRevision,
 		computer.ComputerID, viewer.FabricID, viewer.UserID)
 	if err != nil || status.State != ComputerPolicyRevocationCompleted {
 		t.Fatalf("expired old boot lease status = %#v err=%v", status, err)
@@ -477,7 +477,7 @@ func assertComputerGrantPolicyDistribution(t *testing.T) {
 		acknowledgementFor(*controlSnapshot)); err != nil {
 		t.Fatal(err)
 	}
-	pending, err := h.store.GetComputerPolicyRevocation(context.Background(), admin,
+	pending, err := testReads(h.store).GetComputerPolicyRevocation(context.Background(), admin,
 		downgrade.Grant.PolicyRevision, computer.ComputerID, "", "")
 	if err != nil || pending.State != ComputerPolicyRevocationPending {
 		t.Fatalf("revocation before current install = %#v err=%v", pending, err)
@@ -496,7 +496,7 @@ func assertComputerGrantPolicyDistribution(t *testing.T) {
 		acknowledgementFor(*controlSnapshot)); errorCode(err) != contract.ErrorStalePolicyRevision {
 		t.Fatalf("regressed installation acknowledgement error = %v, want %q", err, contract.ErrorStalePolicyRevision)
 	}
-	completed, err := h.store.GetComputerPolicyRevocation(context.Background(), admin,
+	completed, err := testReads(h.store).GetComputerPolicyRevocation(context.Background(), admin,
 		downgrade.Grant.PolicyRevision, computer.ComputerID, "", "")
 	if err != nil || completed.State != ComputerPolicyRevocationCompleted {
 		t.Fatalf("revocation after current install = %#v err=%v", completed, err)
@@ -516,7 +516,7 @@ func assertComputerGrantPolicyDistribution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pendingAfterRestart, err := h.store.GetComputerPolicyRevocation(context.Background(), admin,
+	pendingAfterRestart, err := testReads(h.store).GetComputerPolicyRevocation(context.Background(), admin,
 		downgrade.Grant.PolicyRevision, computer.ComputerID, "", "")
 	if err != nil || pendingAfterRestart.State != ComputerPolicyRevocationPending {
 		t.Fatalf("revocation after node restart = %#v err=%v", pendingAfterRestart, err)
@@ -530,7 +530,7 @@ func assertComputerGrantPolicyDistribution(t *testing.T) {
 		acknowledgementFor(*restartSnapshot)); err != nil {
 		t.Fatal(err)
 	}
-	completedAfterRestart, err := h.store.GetComputerPolicyRevocation(context.Background(), admin,
+	completedAfterRestart, err := testReads(h.store).GetComputerPolicyRevocation(context.Background(), admin,
 		downgrade.Grant.PolicyRevision, computer.ComputerID, "", "")
 	if err != nil || completedAfterRestart.State != ComputerPolicyRevocationCompleted {
 		t.Fatalf("revocation after replacement boot install = %#v err=%v", completedAfterRestart, err)
@@ -548,7 +548,7 @@ func assertComputerGrantPolicyDistribution(t *testing.T) {
 	}
 	assertSnapshotGrant(t, *revokedSnapshot, computer.ComputerID, "fabric-test", "person-viewer", ComputerGrantNone)
 
-	audit, err := h.store.ListComputerPolicyAudit(context.Background(), admin, computer.ComputerID, "", 10)
+	audit, err := testReads(h.store).ListComputerPolicyAudit(context.Background(), admin, computer.ComputerID, "", 10)
 	if err != nil || len(audit.Entries) != 4 || audit.Entries[0].ActorDeviceID != "device-admin" ||
 		audit.Entries[3].PreviousPermission != ComputerGrantView || audit.Entries[3].Permission != ComputerGrantNone {
 		t.Fatalf("Computer policy audit = %#v err=%v", audit, err)

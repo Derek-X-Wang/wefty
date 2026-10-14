@@ -42,7 +42,8 @@ func TestShutdownBudgetEndsAResidentAttemptInOrder(t *testing.T) {
 			address := waitForReadyAddress(t, readyFile, server, 10*time.Second)
 
 			arguments := []string{"--fabric=plain", "--control-plane=" + address, "--node-id=stable-node",
-				"--log-spool-dir=" + directory, "--plain-identity=fabric-node",
+				"--log-spool-dir=" + directory, "--managed-root=" + temporaryManagedRoot(t),
+				"--plain-identity=fabric-node",
 				"--heartbeat-interval=1s", "--claim-interval=10ms", "--renewal-interval=200ms"}
 			if budgeted {
 				arguments = append(arguments, "--shutdown-budget=1s")

@@ -148,7 +148,7 @@ func assertServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
 			t.Fatalf("%s rows after remove = %d, want 0", table, count)
 		}
 	}
-	jsonl, err := h.store.RawJobLogJSONL(context.Background(), job.JobID)
+	jsonl, err := testReads(h.store).RawJobLogJSONL(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestReconcileFinalizesAcknowledgedServiceRemoval(t *testing.T) {
 	if result.FinalizedRemovals != 1 {
 		t.Fatalf("finalized removals = %d, want 1", result.FinalizedRemovals)
 	}
-	removed, err := h.store.GetJob(context.Background(), job.JobID)
+	removed, err := testReads(h.store).GetJob(context.Background(), job.JobID)
 	if err != nil || removed.State != contract.JobRemovedVerified {
 		t.Fatalf("reconciled removal = %#v, %v", removed, err)
 	}
@@ -787,7 +787,7 @@ func finalizeWaivedComputerRemoval(t *testing.T) Job {
 		node.BootSessionID, contract.JobClassService); err != nil || claim == nil {
 		t.Fatalf("claim = %#v err=%v", claim, err)
 	}
-	if computer, err = h.store.GetComputer(context.Background(), computer.ComputerID); err != nil {
+	if computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.store.RemoveComputer(context.Background(), computer.ComputerID, ComputerRemoveRequest{

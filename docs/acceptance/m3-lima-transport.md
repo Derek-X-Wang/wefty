@@ -61,6 +61,23 @@ arm64 platform digest recorded in `acceptance-image-index.json`. Pass
 secret-free agent arguments only; tsnet must use persisted state rather than
 an auth key in the plist or process arguments.
 
+Before bootstrap, create a managed root dedicated to this acceptance session:
+
+```sh
+export WEFTY_ATTENDED_MANAGED_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wefty-attended-managed.XXXXXX")"
+export WEFTY_ATTENDED_MANAGED_ROOT="$(cd "$WEFTY_ATTENDED_MANAGED_ROOT" && pwd -P)"
+```
+
+Include `--agent-arg="--managed-root=$WEFTY_ATTENDED_MANAGED_ROOT"` in the
+bootstrap command. Keep that same root across restarts and retain it with the
+session evidence. Before every daemon start or restart below, confirm the
+installed plist's `ProgramArguments` contains that explicit managed-root flag.
+An older plist that omits it must be regenerated through bootstrap before this
+acceptance lane starts it; otherwise it writes node state into the operator's
+normal default managed root. The bootstrap seam preserves the supplied agent
+arguments; it does not add this isolation itself. Do not change the operator
+HOME or Lima HOME to isolate node state.
+
 The private `__wefty_mac_bootstrap` mode is an interim acceptance/setup seam,
 not the general `wefty node setup-oci` or doctor UI owned by later tickets. It
 requires explicit operator/home/Lima/work/log paths, the helper checksum,

@@ -66,7 +66,7 @@ func TestProtocolProofsIndependentOfOperatorPool(t *testing.T) {
 	if err != nil || claim == nil {
 		t.Fatalf("claim = (%#v, %v)", claim, err)
 	}
-	if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID,
 		"fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("scope proof before installed policy = %v", err)
 	}
@@ -81,19 +81,19 @@ func TestProtocolProofsIndependentOfOperatorPool(t *testing.T) {
 
 	occupyOperatorPool(t, h.store)
 	t.Run("binding", func(t *testing.T) {
-		bound, err := h.store.ProveServiceBinding(ctx, "fabric-computer-node", computer.CurrentJobID, ServiceBindingProofRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID})
+		bound, err := testReads(h.store).ProveServiceBinding(ctx, "fabric-computer-node", computer.CurrentJobID, ServiceBindingProofRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID})
 		if err != nil || !bound {
 			t.Fatalf("bound=%t err=%v", bound, err)
 		}
 	})
 	t.Run("token-scope", func(t *testing.T) {
-		proof, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "fabric-computer-node", "")
+		proof, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, claim.Lease.AttemptID, "fabric-computer-node", "")
 		if err != nil || proof.ComputerID != computer.ComputerID {
 			t.Fatalf("proof=%+v err=%v", proof, err)
 		}
 	})
 	t.Run("host-boot", func(t *testing.T) {
-		if err := h.store.ProveHostBootSession(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID); err != nil {
+		if err := testReads(h.store).ProveHostBootSession(ctx, "fabric-computer-node", node.NodeID, node.BootSessionID); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -215,7 +215,7 @@ func TestAuthorityLossReadUsesClosedProtocolSnapshot(t *testing.T) {
 	}
 	t.Run("operator-admission", func(t *testing.T) {
 		occupyOperatorPool(t, h.store)
-		row, err := h.store.owedComputerRevocation(t.Context(), stopped.owedRevocationID)
+		row, err := testReads(h.store).owedComputerRevocation(t.Context(), stopped.owedRevocationID)
 		if err != nil || row.owed.RevocationID != stopped.owedRevocationID {
 			t.Fatalf("row=%+v err=%v", row, err)
 		}
@@ -310,7 +310,7 @@ func TestAuthorityLossReadExpiryMarksApplied(t *testing.T) {
 				t.Fatalf("owed audit=%+v", audit)
 			}
 			// The write itself succeeded, independently of the failed observation.
-			job, err := h.store.GetJob(t.Context(), claim.Job.JobID)
+			job, err := testReads(h.store).GetJob(t.Context(), claim.Job.JobID)
 			if err != nil {
 				t.Fatal(err)
 			}

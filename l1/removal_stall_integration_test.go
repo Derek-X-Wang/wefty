@@ -389,7 +389,7 @@ func TestStalledRemovalKeepsItsBindingImagePinUntilCleanupCompletes(t *testing.T
 	if _, err := harness.declare(t, harness.declaration("image-pin")); err != nil {
 		t.Fatalf("declare stalled removal: %v", err)
 	}
-	bound, err := harness.h.store.ProveServiceBinding(context.Background(), "fabric-agent", harness.job.JobID, proof)
+	bound, err := testReads(harness.h.store).ProveServiceBinding(context.Background(), "fabric-agent", harness.job.JobID, proof)
 	if err != nil || !bound {
 		t.Fatalf("stalled binding proof = %t, %v; the pin would be deleted", bound, err)
 	}
@@ -402,7 +402,7 @@ func TestStalledRemovalKeepsItsBindingImagePinUntilCleanupCompletes(t *testing.T
 	if _, err := harness.declare(t, completion); err != nil {
 		t.Fatalf("late completion acknowledgement: %v", err)
 	}
-	bound, err = harness.h.store.ProveServiceBinding(context.Background(), "fabric-agent", harness.job.JobID, proof)
+	bound, err = testReads(harness.h.store).ProveServiceBinding(context.Background(), "fabric-agent", harness.job.JobID, proof)
 	if err != nil || bound {
 		t.Fatalf("cleaned binding proof = %t, %v; the pin must be released", bound, err)
 	}
@@ -658,7 +658,7 @@ func TestRecoveryFinalizesAStalledComputerRemovalExactlyOnce(t *testing.T) {
 		node.BootSessionID, contract.JobClassService); err != nil || claim == nil {
 		t.Fatalf("claim = %#v err=%v", claim, err)
 	}
-	if computer, err = h.store.GetComputer(context.Background(), computer.ComputerID); err != nil {
+	if computer, err = testReads(h.store).GetComputer(context.Background(), computer.ComputerID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.store.RemoveComputer(context.Background(), computer.ComputerID, ComputerRemoveRequest{

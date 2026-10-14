@@ -249,7 +249,7 @@ func assertClaimRequiresAdvertisedCapabilities(t *testing.T) {
 			if claim != nil {
 				t.Fatalf("node missing %q claimed job %q", test.missingCapability, claim.Job.JobID)
 			}
-			queued, err := h.store.GetJob(context.Background(), job.JobID)
+			queued, err := testReads(h.store).GetJob(context.Background(), job.JobID)
 			if err != nil {
 				t.Fatal(err)
 			}

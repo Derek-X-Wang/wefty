@@ -81,9 +81,9 @@ func TestJobListingSoftCutoffCursorWalk(t *testing.T) {
 				r := jobReadRequest(ctx, http.MethodGet, path+"&cursor="+url.QueryEscape(cursor), parent.JobID)
 				w := httptest.NewRecorder()
 				if route == "children" {
-					h.server.listChildJobs(w, r)
+					w = recordTestRead(r, h.server.listChildJobs)
 				} else {
-					h.server.listJobs(w, r)
+					w = recordTestRead(r, h.server.listJobs)
 				}
 				var page JobList
 				if w.Code != http.StatusOK {

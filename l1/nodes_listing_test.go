@@ -176,7 +176,7 @@ func TestNodesListingPlanAndReadSnapshot(t *testing.T) {
 	defer tx.Rollback()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	page, err := h.store.listNodesPage(ctx, nodeListFilters{}, "", 1)
+	page, err := testReads(h.store).listNodesPage(ctx, nodeListFilters{}, "", 1)
 	if err != nil || ctx.Err() != nil || len(page.Nodes) != 1 {
 		t.Fatalf("read blocked by writer: page=%+v err=%v context=%v", page, err, ctx.Err())
 	}
@@ -196,7 +196,7 @@ func TestNodesListing1000AdaptiveCutoff(t *testing.T) {
 	ctx := context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Nanosecond)
 	cursor := ""
 	for i := 1; i <= 1000; i++ {
-		page, err := h.store.listNodesPage(ctx, nodeListFilters{}, cursor, 1000)
+		page, err := testReads(h.store).listNodesPage(ctx, nodeListFilters{}, cursor, 1000)
 		if err != nil {
 			t.Fatal(err)
 		}

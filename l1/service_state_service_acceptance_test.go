@@ -148,7 +148,7 @@ func transitionAcceptanceService(t *testing.T, h *integrationHarness, jobID stri
 
 func getAcceptanceServiceJob(t *testing.T, h *integrationHarness, jobID string) Job {
 	t.Helper()
-	job, err := h.store.GetJob(context.Background(), jobID)
+	job, err := testReads(h.store).GetJob(context.Background(), jobID)
 	if err != nil {
 		t.Fatal(err)
 	}

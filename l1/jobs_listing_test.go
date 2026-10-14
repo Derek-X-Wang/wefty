@@ -348,7 +348,7 @@ func TestJobsListingWatermarkSurvivesRemovalAndReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page, err := store.ListServiceJobs(t.Context(), "", 1)
+	page, err := testReads(store).ListServiceJobs(t.Context(), "", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestJobsListingWatermarkSurvivesRemovalAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	create("persist-insert-after-removal")
-	continuation, err := store.ListServiceJobs(t.Context(), page.NextCursor, 100)
+	continuation, err := testReads(store).ListServiceJobs(t.Context(), page.NextCursor, 100)
 	if err != nil {
 		t.Fatal(err)
 	}

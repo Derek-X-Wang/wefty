@@ -121,7 +121,7 @@ func TestCompletionReplayAfterReimageRevokesOnlyTheCompletedAttempt(t *testing.T
 				t.Fatal(err)
 			}
 			old := startComputerAttempt(t, h, node, nil)
-			computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+			computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -175,7 +175,7 @@ func TestCompletionReplayOfCurrentComputerJobStillRevokes(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim := startComputerAttempt(t, h, node, nil)
-	computer, err = h.store.GetComputer(t.Context(), computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +326,7 @@ func TestDelayedCompletionRevocationSparesTheReplacementAttemptsPass(t *testing.
 	}
 	mintProven := func(attemptID string) {
 		t.Helper()
-		if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, attemptID, "fabric-computer-node", ""); err != nil {
+		if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, attemptID, "fabric-computer-node", ""); err != nil {
 			t.Fatalf("scope proof for attempt %s: %v", attemptID, err)
 		}
 		ledger.mint(computer.ComputerID, attemptID)
@@ -334,7 +334,7 @@ func TestDelayedCompletionRevocationSparesTheReplacementAttemptsPass(t *testing.
 
 	old := startComputerAttempt(t, h, node, nil)
 	mintProven(old.Lease.AttemptID)
-	computer, err = h.store.GetComputer(ctx, computer.ComputerID)
+	computer, err = testReads(h.store).GetComputer(ctx, computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,14 +390,14 @@ func TestDelayedCompletionRevocationSparesTheReplacementAttemptsPass(t *testing.
 		if !ledger.active(computer.ComputerID, replacement.Lease.AttemptID) {
 			t.Fatalf("%s: the replacement attempt's pass was revoked; requests = %#v", stage, ledger.requests)
 		}
-		if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, replacement.Lease.AttemptID,
+		if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, replacement.Lease.AttemptID,
 			"fabric-computer-node", ""); err != nil {
 			t.Fatalf("%s: replacement scope proof = %v", stage, err)
 		}
 		if ledger.active(computer.ComputerID, old.Lease.AttemptID) {
 			t.Fatalf("%s: the completed attempt's pass is still active", stage)
 		}
-		if _, err := h.store.ProveComputerTokenScope(ctx, computer.ComputerID, old.Lease.AttemptID,
+		if _, err := testReads(h.store).ProveComputerTokenScope(ctx, computer.ComputerID, old.Lease.AttemptID,
 			"fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 			t.Fatalf("%s: completed attempt scope proof = %v, want forbidden", stage, err)
 		}

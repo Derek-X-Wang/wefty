@@ -66,12 +66,14 @@ From the repository root, build the four Go binaries and the workflow:
 
 ```sh
 export WEFTY_ROOT="$(git rev-parse --show-toplevel)"
-export WEFTY_STATE_ROOT="${TMPDIR:-/tmp}/wefty-quickstart"
+# The managed root refuses symlinked paths, and macOS's TMPDIR is under /var,
+# a symlink, so resolve the state root to its canonical path here.
+export WEFTY_STATE_ROOT="$(mkdir -p "${TMPDIR:-/tmp}/wefty-quickstart" && cd "${TMPDIR:-/tmp}/wefty-quickstart" && pwd -P)"
 export WEFTY_L1_ADDR=127.0.0.1:42101
 export WEFTY_L3_ADDR=127.0.0.1:42102
 export WEFTY_DEV_PLAIN_FABRIC_ID=plain-local-quickstart
 
-mkdir -p "$WEFTY_ROOT/.bin" "$WEFTY_STATE_ROOT"
+mkdir -p "$WEFTY_ROOT/.bin"
 go build -o "$WEFTY_ROOT/.bin/wefty-l1" ./cmd/wefty-l1
 go build -o "$WEFTY_ROOT/.bin/wefty-l3" ./cmd/wefty-l3
 go build -o "$WEFTY_ROOT/.bin/wefty-agent" ./cmd/wefty-agent
@@ -147,6 +149,7 @@ mkdir -p "$WEFTY_STATE_ROOT/agent-logs"
   --control-plane="$WEFTY_L1_ADDR" \
   --run-ledger="$WEFTY_L3_ADDR" \
   --node-id=dogfood-local \
+  --managed-root="$WEFTY_STATE_ROOT/managed" \
   --log-spool-dir="$WEFTY_STATE_ROOT/agent-logs"
 ```
 
@@ -190,6 +193,48 @@ jq -n \
 
 The full pass criteria and evidence commands are in the
 [dogfood acceptance guide](docs/acceptance/v0.1-dogfood.md).
+
+## Offload one command and local changes
+
+Use `wefty exec` for one build, test, or other command in your Git checkout.
+Use a stored workflow for repeatable work that drives other runs. Exec needs
+this machine's installed node. It freezes the base commit, tracked local
+changes, and untracked files that Git does not ignore before submission, then
+runs in the same relative folder in a throwaway copy. Later edits do not
+change the run. It inherits the node's environment and `PATH`, removes the
+run's `WEFTY_*` variables, and returns no files.
+
+```sh
+wefty exec -- go test ./cmd/wefty/
+wefty exec --keep-running --max-runtime 30m -- go test ./cmd/wefty/
+wefty exec --json -- go test ./cmd/wefty/
+RUN_ID=$(wefty exec --detach --json -- go test ./cmd/wefty/ | jq -er '.run_id')
+wefty logs "$RUN_ID" --follow
+wefty cancel "$RUN_ID"
+```
+
+Stopping `exec` with Ctrl-C, TERM, or HUP cancels the run unless
+`--keep-running` is set. With that flag, stopping ends only the watching;
+the CLI prints the run ID and follow/cancel commands and exits 13 because
+the result is still unknown (if the run had already ended, it reports that
+verdict and exits 0 or 10 instead). `--detach` prints the run ID after capture and
+L3 acceptance and exits 0 without watching. Choose one of these flags when
+an AI tool's time limit must not cancel the work. A hard kill cannot be caught.
+
+`--json` streams NDJSON: `output` events with `stream` and `text`, wrapper
+`heartbeat` events, then `finished` after the observed logs. `finished` carries
+`outcome`, the command's `exit_code`, `run_id`, `base_commit`, and `dirty`
+(whether local changes were included). Command outcomes are `pass` or `fail`;
+queued and infrastructure outcomes are distinct and have a null command exit
+code. `--detach --json` prints exactly one line with `run_id`. Flags after
+`--` belong to the command. Repeat `--tag TAG` to narrow this machine's Pinned
+run. Set `--max-runtime D` for a chosen cap; there is no default cap. Streaming
+exits 0 on pass, 10 on run failure, and 13 on infrastructure or lost observation.
+
+Never put a secret on the command line: command text is stored permanently,
+as typed, with no secret scrubbing. The command runs as the node's user and
+can write absolute paths. See the [exec contract](docs/contracts/exec.md) and
+the shipped [wefty skill](skills/wefty/SKILL.md).
 
 ## CLI tour
 

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -391,4 +392,250 @@ func TestEvidenceRecoveryBackoffIsCapped(t *testing.T) {
 			t.Errorf("evidenceRecoveryRefusalDelay(%d) = %s, want %s", refusals, got, want)
 		}
 	}
+}
+
+// dueFiringClock is a manual clock whose timers fire the moment they are armed
+// already due, as system timers do. A plain manualClock fires a timer only when
+// the test moves it, which hides a recovery loop that keeps re-arming a timer
+// for a deadline already past (#927). arms counts every timer armed, dueArms
+// those armed already due.
+type dueFiringClock struct {
+	*manualClock
+	arms    atomic.Int64
+	dueArms atomic.Int64
+}
+
+func newDueFiringClock() *dueFiringClock {
+	return &dueFiringClock{manualClock: newManualClock(time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC))}
+}
+
+func (clock *dueFiringClock) NewTimer(duration time.Duration) Timer {
+	timer := clock.manualClock.NewTimer(duration)
+	if duration <= 0 {
+		clock.dueArms.Add(1)
+		clock.manualClock.Advance(0)
+	}
+	clock.arms.Add(1)
+	return timer
+}
+
+// countRecoveryPasses counts the recovery passes that scan the spool. Call it
+// before startRecovery.
+func countRecoveryPasses(outbox *evidenceOutbox) *atomic.Int64 {
+	var passes atomic.Int64
+	outbox.recoveryScanFinished = func() { passes.Add(1) }
+	return &passes
+}
+
+func waitForCount(t *testing.T, what string, count *atomic.Int64, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for count.Load() < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %d, want %d", what, count.Load(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// assertRecoveryWaits runs after the recovery pass that found a retry due but
+// unable to start, once that pass has armed its timer. Nothing changes until
+// the test changes it, so a recovery that waits arms no timer that is already
+// due. One that does rescans at once, finds the retry still blocked and arms
+// another: the scans keep coming with nothing changed. The failure shows them.
+func assertRecoveryWaits(t *testing.T, clock *dueFiringClock, passes *atomic.Int64) {
+	t.Helper()
+	if clock.dueArms.Load() == 0 {
+		return
+	}
+	scans := passes.Load()
+	deadline := time.Now().Add(5 * time.Second)
+	for clock.dueArms.Load() < 1000 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("recovery re-armed a due retry it could not start: %d zero-delay timers and counting, each another pass with nothing changed (%d of them full spool scans)",
+		clock.dueArms.Load(), passes.Load()-scans)
+}
+
+// heldCompletions holds /complete for the attempts in held until release is
+// closed, which keeps their recovery workers busy.
+type heldCompletions struct {
+	next    http.Handler
+	held    map[string]bool
+	arrived chan string
+	release chan struct{}
+}
+
+func (handler *heldCompletions) ServeHTTP(w http.ResponseWriter, request *http.Request) {
+	segments := strings.Split(request.URL.Path, "/")
+	if attemptID := segments[len(segments)-2]; handler.held[attemptID] {
+		handler.arrived <- attemptID
+		select {
+		case <-handler.release:
+		case <-request.Context().Done():
+		}
+	}
+	handler.next.ServeHTTP(w, request)
+}
+
+// #927: a retry that falls due while recovery cannot start it -- every worker
+// busy, its attempt live again, or the spool scan backing off -- stayed in the
+// retry schedule with its deadline past. Recovery armed a zero-delay timer for
+// it, rescanned, found it still blocked and armed another, spinning until
+// something changed. It now waits for the change: a worker finishing, the
+// attempt's release, the scan's own retry, or, for a live attempt released
+// without a wake, a bounded re-check. The retry still runs, once.
+func TestEvidenceRecoveryWaitsForABlockedRetryWithoutSpinning(t *testing.T) {
+	const retryInterval = 100 * time.Millisecond
+
+	t.Run("every worker busy", func(t *testing.T) {
+		const retried = "attempt-retried"
+		counter := newCompletionCounter(map[string][]contract.ErrorCode{retried: {contract.ErrorInternal, ""}})
+		held := &heldCompletions{next: counter, held: make(map[string]bool),
+			arrived: make(chan string, maxEvidenceRecoveryWorkers), release: make(chan struct{})}
+		busy := make([]string, 0, maxEvidenceRecoveryWorkers)
+		for i := range maxEvidenceRecoveryWorkers {
+			busy = append(busy, fmt.Sprintf("attempt-busy-%d", i))
+			held.held[busy[i]] = true
+		}
+		client, stopServer := startEvidenceReplayServer(t, held, 30*time.Second)
+		defer stopServer()
+		defer client.Close()
+		clock := newDueFiringClock()
+		outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1<<20, clock, 8, time.Hour, retryInterval)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer outbox.Close()
+		release := sync.OnceFunc(func() { close(held.release) })
+		defer release()
+		passes := countRecoveryPasses(outbox)
+		storeRecoveryCompletion(t, outbox, retried)
+		outbox.startRecovery(t.Context(), client, func(error) {})
+		// The first ask fails; the pass that takes the answer in arms the retry.
+		waitForCompletionCalls(t, counter, retried, 1)
+		waitForCount(t, "recovery passes", passes, 2)
+		clock.waitForDeadline(t, clock.Now().Add(retryInterval))
+
+		// Eight more attempts take every worker and hold it.
+		for _, attemptID := range busy {
+			storeRecoveryCompletion(t, outbox, attemptID)
+		}
+		outbox.scheduleRecovery()
+		for range busy {
+			select {
+			case <-held.arrived:
+			case <-time.After(5 * time.Second):
+				t.Fatal("recovery did not start every busy attempt")
+			}
+		}
+		waitForCount(t, "recovery passes", passes, 3)
+
+		clock.Advance(retryInterval)
+		waitForCount(t, "recovery passes", passes, 4)
+		assertRecoveryWaits(t, clock, passes)
+		if calls := counter.count(retried); calls != 1 {
+			t.Fatalf("retry started with every worker busy: L1 asked %d times", calls)
+		}
+
+		// A worker frees: the retry runs, once, and every attempt lands once.
+		release()
+		waitForCompletionState(t, outbox, retried, "delivered")
+		for _, attemptID := range busy {
+			waitForCompletionState(t, outbox, attemptID, "delivered")
+			if calls := counter.count(attemptID); calls != 1 {
+				t.Fatalf("attempt %s asked %d times, want 1", attemptID, calls)
+			}
+		}
+		if calls := counter.count(retried); calls != 2 {
+			t.Fatalf("retried attempt asked %d times, want 2", calls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		wake bool
+	}{
+		{name: "attempt live, released with a wake", wake: true},
+		{name: "attempt live, released without a wake", wake: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const attemptID = "attempt-live-retry"
+			counter := newCompletionCounter(map[string][]contract.ErrorCode{attemptID: {contract.ErrorInternal, ""}})
+			client, stopServer := startEvidenceReplayServer(t, counter, time.Second)
+			defer stopServer()
+			defer client.Close()
+			clock := newDueFiringClock()
+			outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1<<20, clock, 8, time.Hour, retryInterval)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer outbox.Close()
+			passes := countRecoveryPasses(outbox)
+			storeRecoveryCompletion(t, outbox, attemptID)
+			outbox.startRecovery(t.Context(), client, func(error) {})
+			waitForCompletionCalls(t, counter, attemptID, 1)
+			waitForCount(t, "recovery passes", passes, 2)
+			clock.waitForDeadline(t, clock.Now().Add(retryInterval))
+
+			// The attempt is live again when its retry falls due.
+			outbox.ownAttempt(attemptID)
+			clock.Advance(retryInterval)
+			waitForCount(t, "recovery passes", passes, 3)
+			assertRecoveryWaits(t, clock, passes)
+			if calls := counter.count(attemptID); calls != 1 {
+				t.Fatalf("live attempt replayed: L1 asked %d times", calls)
+			}
+
+			outbox.releaseAttempt(attemptID, tc.wake)
+			if !tc.wake {
+				// Nothing wakes recovery; its bounded re-check finds the
+				// attempt released.
+				clock.waitForDeadline(t, clock.Now().Add(retryInterval))
+				clock.Advance(retryInterval)
+			}
+			waitForCompletionState(t, outbox, attemptID, "delivered")
+			if calls := counter.count(attemptID); calls != 2 {
+				t.Fatalf("attempt asked %d times, want 2", calls)
+			}
+		})
+	}
+
+	t.Run("spool scan backing off", func(t *testing.T) {
+		const attemptID = "attempt-retry-in-scan-backoff"
+		counter := newCompletionCounter(map[string][]contract.ErrorCode{attemptID: {contract.ErrorInternal}})
+		client, stopServer := startEvidenceReplayServer(t, counter, time.Second)
+		defer stopServer()
+		defer client.Close()
+		clock := newDueFiringClock()
+		outbox, err := newEvidenceOutbox(t.TempDir(), "stable-node", 1<<20, clock, 8, time.Hour, retryInterval)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer outbox.Close()
+		passes := countRecoveryPasses(outbox)
+		storeRecoveryCompletion(t, outbox, attemptID)
+		outbox.startRecovery(t.Context(), client, func(error) {})
+		waitForCompletionCalls(t, counter, attemptID, 1)
+		waitForCount(t, "recovery passes", passes, 2)
+		clock.waitForDeadline(t, clock.Now().Add(retryInterval))
+
+		// Halfway to the retry the spool scan starts failing, so the scan
+		// backs off past the retry's deadline. The failed pass re-arms the
+		// retry's timer.
+		clock.Advance(retryInterval / 2)
+		if err := outbox.spool.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		arms := clock.arms.Load()
+		outbox.scheduleRecovery()
+		waitForCount(t, "armed timers", &clock.arms, arms+1)
+
+		// The retry falls due inside the scan backoff. The pass it wakes
+		// cannot scan, so it arms the scan's own retry.
+		clock.Advance(retryInterval / 2)
+		waitForCount(t, "armed timers", &clock.arms, arms+2)
+		assertRecoveryWaits(t, clock, passes)
+		clock.waitForDeadline(t, clock.Now().Add(retryInterval/2))
+	})
 }

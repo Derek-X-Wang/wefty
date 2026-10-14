@@ -32,118 +32,169 @@ func computerSnapshotAdmin(t *testing.T, h *integrationHarness) (fabric.Identity
 // A real failed import removes the provisional authority and its intents. The
 // observation barrier commits that failure between existence and history reads.
 func TestComputerSnapshotImportFailureBetweenIntentReads(t *testing.T) {
-	h, node, source, backup, _ := publishedBackupForStorageCopy(t, 2)
-	h.stopServer()
-	exported, directive := beginCustodyExport(t, h, node, source, backup, "snapshot-import")
-	receipt := successfulCustodyExportReceipt(directive)
-	_, err := h.store.AcknowledgeComputerCustodyExport(t.Context(), "fabric-computer-node", source.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
-	if err != nil {
-		t.Fatal(err)
-	}
-	op, _, err := h.store.BeginComputerCustodyImport(t.Context(), exported.ExportID, ComputerCustodyImportRequest{Name: "snapshot-import", DiskBytes: backup.AllocatedSize, NodeID: node.NodeID, ExternalPath: directive.ExternalPath, Manifest: custodyManifest(directive), ManifestDigest: receipt.ManifestDigest, IdempotencyKey: "snapshot-import", Actor: "operator"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	directives, err := h.store.ListNodeComputerStorageCopyDirectives(t.Context(), "fabric-computer-node", node.NodeID, node.BootSessionID)
-	if err != nil || len(directives) != 1 {
-		t.Fatalf("directives: %+v %v", directives, err)
-	}
-	before, err := h.store.ListComputerIntents(t.Context(), op.DestinationComputerID, "", 10)
-	if err != nil || len(before.Intents) == 0 {
-		t.Fatalf("before: %+v %v", before, err)
-	}
-	failure := successfulStorageCopyReceipt(directives[0])
-	failure.Kind = "computer_storage_copy_failed_absent"
-	failure.Operation = "import"
-	failure.DestinationDigest = ""
-	failure.OSIdentityRekeyed = false
-	failure.MachineIDBeforeDigest = ""
-	failure.MachineIDAfterDigest = ""
-	failure.SourceUnchanged = false
-	failure.DestinationPrepared = false
-	failure.FilesystemExpanded = false
-	failure.FailureCode = "manifest_invalid"
-	failure.DestinationAbsent = true
-	ctx, fired := observeOnce(t, t.Context(), "computer_intents_owner", func() {
-		_, err := h.store.AcknowledgeComputerStorageCopy(t.Context(), "fabric-computer-node", op.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: failure})
+	retryTestSnapshotScenario(t, func() error {
+
+		h, node, source, backup, _ := publishedBackupForStorageCopy(t, 2)
+		h.stopServer()
+		exported, directive := beginCustodyExport(t, h, node, source, backup, "snapshot-import")
+		receipt := successfulCustodyExportReceipt(directive)
+		_, err := h.store.AcknowledgeComputerCustodyExport(t.Context(), "fabric-computer-node", source.ComputerID, ComputerCustodyExportAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, IdempotencyKey: receipt.ReceiptID, Receipt: receipt})
 		if err != nil {
 			t.Fatal(err)
 		}
+		op, _, err := h.store.BeginComputerCustodyImport(t.Context(), exported.ExportID, ComputerCustodyImportRequest{Name: "snapshot-import", DiskBytes: backup.AllocatedSize, NodeID: node.NodeID, ExternalPath: directive.ExternalPath, Manifest: custodyManifest(directive), ManifestDigest: receipt.ManifestDigest, IdempotencyKey: "snapshot-import", Actor: "operator"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		directives, err := h.store.ListNodeComputerStorageCopyDirectives(t.Context(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+		if testReadRetryable(err) {
+			return err
+		}
+		if err != nil || len(directives) != 1 {
+			t.Fatalf("directives: %+v %v", directives, err)
+		}
+		before, err := h.store.ListComputerIntents(t.Context(), op.DestinationComputerID, "", 10)
+		if testReadRetryable(err) {
+			return err
+		}
+		if err != nil || len(before.Intents) == 0 {
+			t.Fatalf("before: %+v %v", before, err)
+		}
+		failure := successfulStorageCopyReceipt(directives[0])
+		failure.Kind = "computer_storage_copy_failed_absent"
+		failure.Operation = "import"
+		failure.DestinationDigest = ""
+		failure.OSIdentityRekeyed = false
+		failure.MachineIDBeforeDigest = ""
+		failure.MachineIDAfterDigest = ""
+		failure.SourceUnchanged = false
+		failure.DestinationPrepared = false
+		failure.FilesystemExpanded = false
+		failure.FailureCode = "manifest_invalid"
+		failure.DestinationAbsent = true
+		ctx, fired := observeOnce(t, t.Context(), "computer_intents_owner", func() {
+			_, err := h.store.AcknowledgeComputerStorageCopy(t.Context(), "fabric-computer-node", op.DestinationComputerID, ComputerStorageCopyAcknowledgementRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, IdempotencyKey: failure.ReceiptID, Receipt: failure})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+		// Allow time for the test writer's commits inside the observed read.
+		ctx = context.WithValue(ctx, readSnapshotHardLimitContextKey{}, 10*time.Second)
+		page, err := h.store.ListComputerIntents(ctx, op.DestinationComputerID, "", 10)
+		if testReadRetryable(err) {
+			return err
+		}
+		if !*fired || err != nil || !reflect.DeepEqual(page, before) {
+			t.Fatalf("mixed import history: fired=%v page=%+v err=%v", *fired, page, err)
+		}
+		if _, err := testReads(h.store).ListComputerIntents(t.Context(), op.DestinationComputerID, "", 10); errorCode(err) != contract.ErrorNotFound {
+			t.Fatalf("deleted intents: %v", err)
+		}
+		if _, err := testReads(h.store).GetComputer(t.Context(), op.DestinationComputerID); errorCode(err) != contract.ErrorNotFound {
+			t.Fatalf("deleted Computer: %v", err)
+		}
+		observed, err := h.store.GetComputerCustodyImport(t.Context(), op.ImportID)
+		if testReadRetryable(err) {
+			return err
+		}
+		if err != nil || observed.Status != "failed" {
+			t.Fatalf("retained import: %+v %v", observed, err)
+		}
+
+		return nil
 	})
-	page, err := h.store.ListComputerIntents(ctx, op.DestinationComputerID, "", 10)
-	if !*fired || err != nil || !reflect.DeepEqual(page, before) {
-		t.Fatalf("mixed import history: fired=%v page=%+v err=%v", *fired, page, err)
-	}
-	if _, err := h.store.ListComputerIntents(t.Context(), op.DestinationComputerID, "", 10); errorCode(err) != contract.ErrorNotFound {
-		t.Fatalf("deleted intents: %v", err)
-	}
-	if _, err := h.store.GetComputer(t.Context(), op.DestinationComputerID); errorCode(err) != contract.ErrorNotFound {
-		t.Fatalf("deleted Computer: %v", err)
-	}
-	observed, err := h.store.GetComputerCustodyImport(t.Context(), op.ImportID)
-	if err != nil || observed.Status != "failed" {
-		t.Fatalf("retained import: %+v %v", observed, err)
-	}
 }
 
 func TestComputerSnapshotGrantBetweenRevisionAndRows(t *testing.T) {
-	h, _, computer := backupHarness(t, 2, nil)
-	h.stopServer()
-	admin, policy := computerSnapshotAdmin(t, h)
-	viewer := fabric.Identity{FabricID: admin.FabricID, UserID: "snapshot-viewer", DeviceID: "snapshot-viewer-device"}
-	if _, err := h.store.ObserveAuthenticatedPerson(t.Context(), viewer); err != nil {
-		t.Fatal(err)
-	}
-	granted, err := h.store.MutateComputerGrant(t.Context(), admin, computer.ComputerID, viewer.UserID, ComputerGrantMutationRequest{PolicyRevision: policy.Revision, Permission: ComputerGrantView, IdempotencyKey: "snapshot-view"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	before, err := h.store.ListComputerGrants(t.Context(), admin, computer.ComputerID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, fired := observeOnce(t, t.Context(), "computer_grants_revision", func() {
-		_, err := h.store.MutateComputerGrant(t.Context(), admin, computer.ComputerID, viewer.UserID, ComputerGrantMutationRequest{PolicyRevision: granted.Grant.PolicyRevision, Permission: ComputerGrantControl, IdempotencyKey: "snapshot-control"})
+	retryTestSnapshotScenario(t, func() error {
+
+		h, _, computer := backupHarness(t, 2, nil)
+		h.stopServer()
+		admin, policy := computerSnapshotAdmin(t, h)
+		viewer := fabric.Identity{FabricID: admin.FabricID, UserID: "snapshot-viewer", DeviceID: "snapshot-viewer-device"}
+		if _, err := h.store.ObserveAuthenticatedPerson(t.Context(), viewer); err != nil {
+			t.Fatal(err)
+		}
+		granted, err := h.store.MutateComputerGrant(t.Context(), admin, computer.ComputerID, viewer.UserID, ComputerGrantMutationRequest{PolicyRevision: policy.Revision, Permission: ComputerGrantView, IdempotencyKey: "snapshot-view"})
 		if err != nil {
 			t.Fatal(err)
 		}
+		before, err := h.store.ListComputerGrants(t.Context(), admin, computer.ComputerID)
+		if testReadRetryable(err) {
+			return err
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, fired := observeOnce(t, t.Context(), "computer_grants_revision", func() {
+			_, err := h.store.MutateComputerGrant(t.Context(), admin, computer.ComputerID, viewer.UserID, ComputerGrantMutationRequest{PolicyRevision: granted.Grant.PolicyRevision, Permission: ComputerGrantControl, IdempotencyKey: "snapshot-control"})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+		// Allow time for the test writer's commits inside the observed read.
+		ctx = context.WithValue(ctx, readSnapshotHardLimitContextKey{}, 10*time.Second)
+		page, err := h.store.ListComputerGrants(ctx, admin, computer.ComputerID)
+		if testReadRetryable(err) {
+			return err
+		}
+		if !*fired || err != nil || !reflect.DeepEqual(page, before) {
+			t.Fatalf("mixed grants: fired=%v page=%+v err=%v", *fired, page, err)
+		}
+		next, err := h.store.ListComputerGrants(t.Context(), admin, computer.ComputerID)
+		if testReadRetryable(err) {
+			return err
+		}
+		if err != nil || next.PolicyRevision != before.PolicyRevision+1 || len(next.Grants) != 1 || next.Grants[0].PolicyRevision != next.PolicyRevision || next.Grants[0].Permission != ComputerGrantControl {
+			t.Fatalf("grant did not commit: %+v %v", next, err)
+		}
+
+		return nil
 	})
-	page, err := h.store.ListComputerGrants(ctx, admin, computer.ComputerID)
-	if !*fired || err != nil || !reflect.DeepEqual(page, before) {
-		t.Fatalf("mixed grants: fired=%v page=%+v err=%v", *fired, page, err)
-	}
-	next, err := h.store.ListComputerGrants(t.Context(), admin, computer.ComputerID)
-	if err != nil || next.PolicyRevision != before.PolicyRevision+1 || len(next.Grants) != 1 || next.Grants[0].PolicyRevision != next.PolicyRevision || next.Grants[0].Permission != ComputerGrantControl {
-		t.Fatalf("grant did not commit: %+v %v", next, err)
-	}
 }
 
 func TestComputerSnapshotBackupCreatedBetweenIDsAndOperation(t *testing.T) {
-	h, node, computer, _, _ := publishedBackupForStorageCopy(t, 3)
-	h.stopServer()
-	before, err := h.store.ListComputerBackups(t.Context(), computer.ComputerID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, fired := observeOnce(t, t.Context(), "computer_backups_ids", func() {
-		_, _, err := h.store.BeginComputerBackup(t.Context(), computer.ComputerID, ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "snapshot-new-backup"})
+	retryTestSnapshotScenario(t, func() error {
+
+		h, node, computer, _, _ := publishedBackupForStorageCopy(t, 3)
+		h.stopServer()
+		before, err := h.store.ListComputerBackups(t.Context(), computer.ComputerID)
+		if testReadRetryable(err) {
+			return err
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		directives, err := h.store.ListNodeComputerBackupDirectives(t.Context(), "fabric-computer-node", node.NodeID, node.BootSessionID)
-		if err != nil || len(directives) != 1 {
-			t.Fatalf("directives=%+v %v", directives, err)
+		ctx, fired := observeOnce(t, t.Context(), "computer_backups_ids", func() {
+			_, _, err := h.store.BeginComputerBackup(t.Context(), computer.ComputerID, ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(computer, "operator"), IdempotencyKey: "snapshot-new-backup"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			directives, err := h.store.ListNodeComputerBackupDirectives(t.Context(), "fabric-computer-node", node.NodeID, node.BootSessionID)
+			if err != nil || len(directives) != 1 {
+				t.Fatalf("directives=%+v %v", directives, err)
+			}
+			acknowledgeBackup(t, h, node, directives[0], successfulBackupReceipt(directives[0]))
+		})
+		// Allow time for the test writer's commits inside the observed read.
+		ctx = context.WithValue(ctx, readSnapshotHardLimitContextKey{}, 10*time.Second)
+		page, err := h.store.ListComputerBackups(ctx, computer.ComputerID)
+		if testReadRetryable(err) {
+			return err
 		}
-		acknowledgeBackup(t, h, node, directives[0], successfulBackupReceipt(directives[0]))
+		if !*fired || err != nil || !reflect.DeepEqual(page, before) {
+			t.Fatalf("mixed Backup view: fired=%v page=%+v err=%v", *fired, page, err)
+		}
+		next, err := h.store.ListComputerBackups(t.Context(), computer.ComputerID)
+		if testReadRetryable(err) {
+			return err
+		}
+		if err != nil || len(next.Backups) != 2 || next.LastOperation.BackupID == before.LastOperation.BackupID {
+			t.Fatalf("Backup not committed: %+v %v", next, err)
+		}
+
+		return nil
 	})
-	page, err := h.store.ListComputerBackups(ctx, computer.ComputerID)
-	if !*fired || err != nil || !reflect.DeepEqual(page, before) {
-		t.Fatalf("mixed Backup view: fired=%v page=%+v err=%v", *fired, page, err)
-	}
-	next, err := h.store.ListComputerBackups(t.Context(), computer.ComputerID)
-	if err != nil || len(next.Backups) != 2 || next.LastOperation.BackupID == before.LastOperation.BackupID {
-		t.Fatalf("Backup not committed: %+v %v", next, err)
-	}
 }
 
 func computerSnapshotRequest(ctx context.Context, computerID string) *http.Request {
@@ -185,13 +236,13 @@ func TestComputerSnapshotStatusParity(t *testing.T) {
 			}
 
 			t.Run("detail", func(t *testing.T) {
-				got, err := h.store.GetComputer(t.Context(), computer.ComputerID)
+				got, err := testReads(h.store).GetComputer(t.Context(), computer.ComputerID)
 				if err != nil || got.CurrentJob.Status != job.Status {
 					t.Fatalf("detail status=%s want=%s err=%v", got.CurrentJob.Status, job.Status, err)
 				}
 			})
 			t.Run("listing", func(t *testing.T) {
-				listed, err := h.store.ListComputers(t.Context(), "", 10)
+				listed, err := testReads(h.store).ListComputers(t.Context(), "", 10)
 				if err != nil || len(listed.Computers) != 1 || listed.Computers[0].CurrentJob.Status != job.Status {
 					t.Fatalf("listing=%+v %v", listed, err)
 				}
@@ -206,7 +257,7 @@ func TestComputerSnapshotStatusParity(t *testing.T) {
 				}
 			})
 			t.Run("submission", func(t *testing.T) {
-				submission, err := h.store.GetComputerSubmissionState(t.Context(), admin, computer.ComputerID)
+				submission, err := testReads(h.store).GetComputerSubmissionState(t.Context(), admin, computer.ComputerID)
 				if err != nil || submission.Status != job.Status {
 					t.Fatalf("submission=%+v %v", submission, err)
 				}
@@ -265,7 +316,7 @@ func TestComputerSnapshotBackupAdaptivePaging(t *testing.T) {
 		if i > 6 {
 			t.Fatal("cursor failed to advance")
 		}
-		page, err := h.store.ListComputerBackupsPage(ctx, computer.ComputerID, cursor, "", 1000000)
+		page, err := testReads(h.store).ListComputerBackupsPage(ctx, computer.ComputerID, cursor, "", 1000000)
 		if err != nil || len(page.Backups) != 1 {
 			t.Fatalf("page=%+v err=%v", page, err)
 		}
@@ -288,14 +339,14 @@ func TestComputerSnapshotBackupAdaptivePaging(t *testing.T) {
 	if len(seen) != 6 {
 		t.Fatalf("membership=%v", seen)
 	}
-	fresh, err := h.store.ListComputerBackupsPage(context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Hour), computer.ComputerID, "", "", 1000000)
+	fresh, err := testReads(h.store).ListComputerBackupsPage(context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Hour), computer.ComputerID, "", "", 1000000)
 	if err != nil || len(fresh.Backups) != 8 || fresh.NextCursor != "" {
 		t.Fatalf("fresh=%+v %v", fresh, err)
 	}
-	if _, err := h.store.ListComputerBackupsPage(t.Context(), "other", cursor, "", 1); errorCode(err) != contract.ErrorInvalidRequest {
+	if _, err := testReads(h.store).ListComputerBackupsPage(t.Context(), "other", cursor, "", 1); errorCode(err) != contract.ErrorInvalidRequest {
 		t.Fatalf("foreign cursor=%v", err)
 	}
-	if _, err := h.store.ListComputerBackupsPage(t.Context(), computer.ComputerID, "invalid", "", 1); errorCode(err) != contract.ErrorInvalidRequest {
+	if _, err := testReads(h.store).ListComputerBackupsPage(t.Context(), computer.ComputerID, "invalid", "", 1); errorCode(err) != contract.ErrorInvalidRequest {
 		t.Fatalf("invalid cursor=%v", err)
 	}
 }
@@ -319,43 +370,46 @@ func TestComputerSnapshotWriterHeld(t *testing.T) {
 		name string
 		read func() error
 	}{
-		{"detail", func() error { _, err := h.store.GetComputer(t.Context(), computer.ComputerID); return err }},
-		{"listing", func() error { _, err := h.store.ListComputers(t.Context(), "", 10); return err }},
+		{"detail", func() error { _, err := testReads(h.store).GetComputer(t.Context(), computer.ComputerID); return err }},
+		{"listing", func() error { _, err := testReads(h.store).ListComputers(t.Context(), "", 10); return err }},
 		{"intents", func() error {
-			_, err := h.store.ListComputerIntents(t.Context(), computer.ComputerID, "", 10)
+			_, err := testReads(h.store).ListComputerIntents(t.Context(), computer.ComputerID, "", 10)
 			return err
 		}},
-		{"backups", func() error { _, err := h.store.ListComputerBackups(t.Context(), computer.ComputerID); return err }},
+		{"backups", func() error {
+			_, err := testReads(h.store).ListComputerBackups(t.Context(), computer.ComputerID)
+			return err
+		}},
 		{"generations", func() error {
-			_, err := h.store.ListComputerStorageGenerations(t.Context(), computer.ComputerID)
+			_, err := testReads(h.store).ListComputerStorageGenerations(t.Context(), computer.ComputerID)
 			return err
 		}},
 		{"provenance", func() error {
-			_, err := h.store.ListComputerStorageProvenance(t.Context(), computer.ComputerID)
+			_, err := testReads(h.store).ListComputerStorageProvenance(t.Context(), computer.ComputerID)
 			return err
 		}},
 		{"exports", func() error {
-			_, err := h.store.ListComputerCustodyExports(t.Context(), computer.ComputerID)
+			_, err := testReads(h.store).ListComputerCustodyExports(t.Context(), computer.ComputerID)
 			return err
 		}},
 		{"grants", func() error {
-			_, err := h.store.ListComputerGrants(t.Context(), admin, computer.ComputerID)
+			_, err := testReads(h.store).ListComputerGrants(t.Context(), admin, computer.ComputerID)
 			return err
 		}},
 		{"grant audit", func() error {
-			_, err := h.store.ListComputerPolicyAudit(t.Context(), admin, computer.ComputerID, "", 10)
+			_, err := testReads(h.store).ListComputerPolicyAudit(t.Context(), admin, computer.ComputerID, "", 10)
 			return err
 		}},
 		{"sessions", func() error {
-			_, err := h.store.ListComputerTakeoverSessions(t.Context(), admin, computer.ComputerID)
+			_, err := testReads(h.store).ListComputerTakeoverSessions(t.Context(), admin, computer.ComputerID)
 			return err
 		}},
 		{"take-over audit", func() error {
-			_, err := h.store.ListComputerTakeoverAudit(t.Context(), admin, computer.ComputerID, "", 10, false)
+			_, err := testReads(h.store).ListComputerTakeoverAudit(t.Context(), admin, computer.ComputerID, "", 10, false)
 			return err
 		}},
 		{"submission", func() error {
-			_, err := h.store.GetComputerSubmissionState(t.Context(), admin, computer.ComputerID)
+			_, err := testReads(h.store).GetComputerSubmissionState(t.Context(), admin, computer.ComputerID)
 			return err
 		}},
 	}
@@ -376,21 +430,29 @@ func TestComputerSnapshotWriterHeld(t *testing.T) {
 }
 
 func TestComputerSnapshotListingPinsOneClock(t *testing.T) {
-	h, _, _ := backupHarness(t, 2, nil)
-	h.stopServer()
-	for i := 0; i < 2; i++ {
-		_, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: fmt.Sprintf("clock-%d", i), Spec: computerCapabilityJobSpec(fmt.Sprintf("computer:clock-%d", i)), Actor: "operator"})
-		if err != nil {
-			t.Fatal(err)
+	retryTestSnapshotScenario(t, func() error {
+
+		h, _, _ := backupHarness(t, 2, nil)
+		h.stopServer()
+		for i := 0; i < 2; i++ {
+			_, _, err := h.store.CreateComputer(t.Context(), CreateComputerRequest{Name: fmt.Sprintf("clock-%d", i), Spec: computerCapabilityJobSpec(fmt.Sprintf("computer:clock-%d", i)), Actor: "operator"})
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
-	}
-	clock := &snapshotClock{}
-	clock.at.Store(h.clock.Now().UnixNano())
-	h.store.clock = clock
-	page, err := h.store.ListComputers(context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Hour), "", 100)
-	if err != nil || len(page.Computers) != 3 || clock.calls.Load() != 1 {
-		t.Fatalf("rows=%d clock=%d err=%v", len(page.Computers), clock.calls.Load(), err)
-	}
+		clock := &snapshotClock{}
+		clock.at.Store(h.clock.Now().UnixNano())
+		h.store.clock = clock
+		page, err := h.store.ListComputers(context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Hour), "", 100)
+		if testReadRetryable(err) {
+			return err
+		}
+		if err != nil || len(page.Computers) != 3 || clock.calls.Load() != 1 {
+			t.Fatalf("rows=%d clock=%d err=%v", len(page.Computers), clock.calls.Load(), err)
+		}
+
+		return nil
+	})
 }
 
 func TestComputerSnapshotPostChangeFailureCommitStands(t *testing.T) {

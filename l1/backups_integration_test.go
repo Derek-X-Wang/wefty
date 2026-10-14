@@ -104,7 +104,7 @@ func TestComputerBackupDefaultCapZeroAndExplicitOverride(t *testing.T) {
 	if _, _, err := h.store.BeginComputerBackup(context.Background(), computer.ComputerID, request); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("default-zero Backup error = %v, want %q", err, contract.ErrorConflict)
 	}
-	unchanged, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	unchanged, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || unchanged.IntentRevision != computer.IntentRevision || unchanged.CurrentJob.State != contract.JobRunning {
 		t.Fatalf("default-zero Backup changed Computer = %#v err=%v", unchanged, err)
 	}
@@ -113,7 +113,7 @@ func TestComputerBackupDefaultCapZeroAndExplicitOverride(t *testing.T) {
 	if err != nil || mutable.BackupCap != 1 || mutable.IntentRevision != unchanged.IntentRevision+1 || mutable.AppliedRevision != mutable.IntentRevision {
 		t.Fatalf("mutable Backup cap = %#v err=%v", mutable, err)
 	}
-	intents, err := h.store.ListComputerIntents(context.Background(), mutable.ComputerID, "", 10)
+	intents, err := testReads(h.store).ListComputerIntents(context.Background(), mutable.ComputerID, "", 10)
 	if err != nil || intents.Intents[len(intents.Intents)-1].Operation != ComputerIntentBackupCap || intents.Intents[len(intents.Intents)-1].BackupCap != 1 {
 		t.Fatalf("revisioned Backup cap intent = %#v err=%v", intents, err)
 	}
@@ -123,7 +123,7 @@ func TestComputerBackupDefaultCapZeroAndExplicitOverride(t *testing.T) {
 	if overridden.BackupCap != 1 {
 		t.Fatalf("per-Computer Backup cap = %d, want 1", overridden.BackupCap)
 	}
-	list, err := h2.store.ListComputerBackups(context.Background(), overridden.ComputerID)
+	list, err := testReads(h2.store).ListComputerBackups(context.Background(), overridden.ComputerID)
 	if err != nil || len(list.Backups) != 0 {
 		t.Fatalf("fresh Backup list = %#v err=%v", list, err)
 	}
@@ -170,7 +170,7 @@ func TestComputerBackupRunningQuiescesPublishesAndResumesSameRevision(t *testing
 		ComputerBackupCreateRequest{ComputerMutationPrecondition: computerPrecondition(resumed, "operator"), IdempotencyKey: "at-cap", AllowPowerOff: true}); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("Backup at cap error = %v, want %q", err, contract.ErrorConflict)
 	}
-	list, err := h.store.ListComputerBackups(context.Background(), resumed.ComputerID)
+	list, err := testReads(h.store).ListComputerBackups(context.Background(), resumed.ComputerID)
 	if err != nil || len(list.Backups) != 1 || list.Backups[0].BackupID != backup.BackupID {
 		t.Fatalf("cap pressure auto-deleted Backup: %#v err=%v", list, err)
 	}
@@ -186,7 +186,7 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 			t.Fatal(err)
 		}
 		finishBackupQuiescence(t, h, claim, "operator-stop-quiescence")
-		stopped, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+		stopped, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 		if err != nil || stopped.CurrentJob.State != contract.JobStopped || stopped.BoundNodeID == "" {
 			t.Fatalf("stopped bound Computer = %#v err=%v", stopped, err)
 		}
@@ -251,7 +251,7 @@ func TestComputerBackupStopAndFailureRacesNeverResumeStaleIntent(t *testing.T) {
 		if backup.BackupID != "" || resumed.CurrentJob.State != contract.JobQueued || resumed.ReconfigurationPhase != ComputerReconfigurationStable {
 			t.Fatalf("ENOSPC Backup result = backup=%#v Computer=%#v", backup, resumed)
 		}
-		list, err := h.store.ListComputerBackups(context.Background(), computer.ComputerID)
+		list, err := testReads(h.store).ListComputerBackups(context.Background(), computer.ComputerID)
 		if err != nil || len(list.Backups) != 0 || list.LastOperation == nil ||
 			list.LastOperation.Status != "failed" || list.LastOperation.FailureCode != ComputerBackupFailureInsufficientDisk ||
 			resumed.LastBackupOperation == nil || resumed.LastBackupOperation.FailureCode != ComputerBackupFailureInsufficientDisk {
