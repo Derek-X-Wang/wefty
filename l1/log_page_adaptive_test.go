@@ -18,13 +18,13 @@ func TestLogPage1000AdaptiveCutoff(t *testing.T) {
 	ctx := context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Nanosecond)
 	cursor := ""
 	for i := 1; i <= 1000; i++ {
-		page, err := h.store.GetJobLogs(ctx, job.JobID, cursor, 1000)
+		page, err := testReads(h.store).GetJobLogs(ctx, job.JobID, cursor, 1000)
 		if err != nil || len(page.Events) != 1 || page.Events[0].Sequence != uint64(i) || page.NextCursor == cursor {
 			t.Fatalf("adaptive log page %d: rows=%d cursor=%q err=%v", i, len(page.Events), page.NextCursor, err)
 		}
 		cursor = page.NextCursor
 	}
-	page, err := h.store.GetJobLogs(ctx, job.JobID, cursor, 1000)
+	page, err := testReads(h.store).GetJobLogs(ctx, job.JobID, cursor, 1000)
 	if err != nil || len(page.Events) != 0 || page.NextCursor != cursor {
 		t.Fatalf("terminal poll: %+v %v", page, err)
 	}

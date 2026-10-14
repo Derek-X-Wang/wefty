@@ -53,7 +53,7 @@ func TestServiceBindingProofReadsSnapshotWhileWriterHoldsLock(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 700*time.Millisecond)
 	defer cancel()
-	bound, err := store.ProveServiceBinding(ctx, "agent", job.JobID, ServiceBindingProofRequest{
+	bound, err := testReads(store).ProveServiceBinding(ctx, "agent", job.JobID, ServiceBindingProofRequest{
 		NodeID: node.NodeID, BootSessionID: node.BootSessionID,
 	})
 	if err != nil || ctx.Err() != nil || !bound {
@@ -160,7 +160,7 @@ func TestServiceBindingProofKeepsOneSnapshotAcrossConcurrentCommit(t *testing.T)
 	originalReadDB := store.db
 	store.db = readerDB
 	defer func() { store.db = originalReadDB; readerDB.Close() }()
-	bound, err := store.ProveServiceBinding(ctx, "agent", job.JobID, ServiceBindingProofRequest{
+	bound, err := testReads(store).ProveServiceBinding(ctx, "agent", job.JobID, ServiceBindingProofRequest{
 		NodeID: node.NodeID, BootSessionID: node.BootSessionID,
 	})
 	if err != nil || !bound || sessionReads != 1 || commits != 1 {

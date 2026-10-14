@@ -165,7 +165,7 @@ func TestRunLedgerAdmissionReasonIsSeparateFromResourceAuthority(t *testing.T) {
 				f.identity.NodeID = "configured-ledger"
 			}
 			w := httptest.NewRecorder()
-			s.Handler().ServeHTTP(w, httptest.NewRequest(test.method, test.path, strings.NewReader(test.body)))
+			w = recordTestRead(httptest.NewRequest(test.method, test.path, strings.NewReader(test.body)), s.Handler().ServeHTTP)
 			var response contract.ErrorResponse
 			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 				t.Fatal(err)

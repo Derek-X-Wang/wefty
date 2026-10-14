@@ -124,7 +124,7 @@ func TestOneshotLogAgeRetentionRunsFromReconcile(t *testing.T) {
 	if len(page.Events) != 2 || string(page.Events[0].Bytes) != "fresh" || page.Truncation.EvictedEventCount != 3 {
 		t.Fatalf("terminal one-shot after age sweep = %#v, truncation %#v", page.Events, page.Truncation)
 	}
-	if got, err := h.store.GetJob(context.Background(), job.JobID); err != nil || got.State != contract.JobSucceeded {
+	if got, err := testReads(h.store).GetJob(context.Background(), job.JobID); err != nil || got.State != contract.JobSucceeded {
 		t.Fatalf("age eviction changed the job record: %#v, %v", got, err)
 	}
 	h.clock.Advance(2 * time.Hour)

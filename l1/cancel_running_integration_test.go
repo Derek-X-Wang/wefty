@@ -32,7 +32,7 @@ func TestCancelProcessStartAcknowledgementRefused(t *testing.T) {
 			if status != http.StatusOK {
 				t.Fatalf("cancel=%d %s", status, body)
 			}
-			pending, err := h.store.GetJob(t.Context(), job.JobID)
+			pending, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 			if err != nil || pending.State != wantState || pending.Outcome != "canceled" {
 				t.Fatalf("pending cancellation=%+v %v", pending, err)
 			}
@@ -52,7 +52,7 @@ func TestCancelProcessStartAcknowledgementRefused(t *testing.T) {
 			if started.Valid || string(state) != string(wantState) {
 				t.Fatalf("refused start mutated attempt: started=%+v state=%s", started, state)
 			}
-			after, err := h.store.GetJob(t.Context(), job.JobID)
+			after, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 			if err != nil || !reflect.DeepEqual(pending, after) {
 				t.Fatalf("refused start mutated pending cancellation=%+v %v", after, err)
 			}
@@ -83,7 +83,7 @@ func TestCancelProcessStartedReplayAccepted(t *testing.T) {
 		t.Fatalf("cancel=%d %s", status, body)
 	}
 	pending := decodeJob(t, body)
-	stored, err := h.store.GetJob(t.Context(), job.JobID)
+	stored, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 	if err != nil || pending.State != contract.JobRunning || pending.Outcome != "canceled" || stored.Outcome != "canceled" {
 		t.Fatalf("stored cancellation=%+v %v body=%s", stored, err, body)
 	}
@@ -99,7 +99,7 @@ func TestCancelProcessStartedReplayAccepted(t *testing.T) {
 	if startedAfter != startedBefore {
 		t.Fatalf("replay changed started_ns: before=%+v after=%+v", startedBefore, startedAfter)
 	}
-	after, err := h.store.GetJob(t.Context(), job.JobID)
+	after, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 	if err != nil || !reflect.DeepEqual(stored, after) {
 		t.Fatalf("replay mutated stored cancellation=%+v %v", after, err)
 	}
@@ -141,7 +141,7 @@ func TestCancelActiveProcessContract(t *testing.T) {
 			if err != nil || string(lease.Directive) != "cancel" {
 				t.Fatalf("renew=%+v %v", lease, err)
 			}
-			after, err := h.store.GetJob(t.Context(), job.JobID)
+			after, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 			if err != nil || after.State != state {
 				t.Fatalf("cancellation acknowledged start=%+v %v", after, err)
 			}
@@ -164,7 +164,7 @@ func TestCancelActiveProcessContract(t *testing.T) {
 			if err != nil || done.State != contract.JobFailed || done.Outcome != "canceled" {
 				t.Fatalf("cancel overwritten=%+v %v", done, err)
 			}
-			attempts, err := h.store.ListJobAttempts(t.Context(), job.JobID)
+			attempts, err := testReads(h.store).ListJobAttempts(t.Context(), job.JobID)
 			if err != nil || len(attempts) != 1 || attempts[0].Result == nil || attempts[0].Result.ExitCode == nil || *attempts[0].Result.ExitCode != 0 {
 				t.Fatalf("real result lost=%+v %v", attempts, err)
 			}
@@ -205,11 +205,11 @@ func TestCancelSettlementDeadlineReopenAndEvidence(t *testing.T) {
 	if err != nil || result.ExpiredAttempts != 1 {
 		t.Fatalf("settle=%+v %v", result, err)
 	}
-	done, err := reopened.GetJob(t.Context(), job.JobID)
+	done, err := testReads(reopened).GetJob(t.Context(), job.JobID)
 	if err != nil || done.State != contract.JobFailed || done.Outcome != "canceled" {
 		t.Fatalf("silent node=%+v %v", done, err)
 	}
-	attempts, err := reopened.ListJobAttempts(t.Context(), job.JobID)
+	attempts, err := testReads(reopened).ListJobAttempts(t.Context(), job.JobID)
 	if err != nil || len(attempts) != 1 || attempts[0].State != contract.AttemptLost || attempts[0].Result != nil {
 		t.Fatalf("invented termination=%+v %v", attempts, err)
 	}
@@ -234,7 +234,7 @@ func TestCancelSettlementDeadlineReopenAndEvidence(t *testing.T) {
 	if errorCode(err) != contract.ErrorLeaseExpired {
 		t.Fatalf("late completion=%v", err)
 	}
-	done, err = reopened.GetJob(t.Context(), job.JobID)
+	done, err = testReads(reopened).GetJob(t.Context(), job.JobID)
 	if err != nil || done.State != contract.JobFailed || done.Outcome != "canceled" {
 		t.Fatalf("late success overwrote cancel=%+v %v", done, err)
 	}
@@ -248,7 +248,7 @@ func TestCancelOrderedCompletionExpiryAndChildRaces(t *testing.T) {
 			claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
 			// Resolve middleware authority before cancel. The later creation must
 			// recheck intent inside its own committing transaction.
-			scope, err := h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, "node-1")
+			scope, err := testReads(h.store).ResolveAttemptCredential(t.Context(), claim.AttemptToken, "node-1")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -292,7 +292,7 @@ func TestCancelOrderedCompletionExpiryAndChildRaces(t *testing.T) {
 				t.Fatalf("cancel intent missing=%s", body)
 			}
 			if first == "child" {
-				got, err := h.store.GetJob(t.Context(), child.JobID)
+				got, err := testReads(h.store).GetJob(t.Context(), child.JobID)
 				if err != nil || got.State != contract.JobQueued || got.Outcome != "" {
 					t.Fatalf("cascade=%+v %v", got, err)
 				}
@@ -314,7 +314,7 @@ func TestCancelOrderedCompletionExpiryAndChildRaces(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			got, err := h.store.GetJob(context.Background(), job.JobID)
+			got, err := testReads(h.store).GetJob(context.Background(), job.JobID)
 			if err != nil || got.Outcome != "canceled" || got.State != contract.JobFailed {
 				t.Fatalf("cancel reservation lost=%+v %v", got, err)
 			}
@@ -388,7 +388,7 @@ func TestCancelDeterministicTransactionRaces(t *testing.T) {
 						if operation != "claim" {
 							won := claimClass(t, h, agent, node, contract.JobClassOneShot)
 							claim = &won
-							scope, err = h.store.ResolveAttemptCredential(t.Context(), claim.AttemptToken, "node-1")
+							scope, err = testReads(h.store).ResolveAttemptCredential(t.Context(), claim.AttemptToken, "node-1")
 							if err != nil {
 								t.Fatal(err)
 							}
@@ -470,7 +470,7 @@ func TestCancelDeterministicTransactionRaces(t *testing.T) {
 						} else if rivalErr != nil {
 							t.Fatal(rivalErr)
 						}
-						got, err := h.store.GetJob(t.Context(), job.JobID)
+						got, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -514,7 +514,7 @@ func TestCancelDeterministicTransactionRaces(t *testing.T) {
 							}
 						case "child":
 							if !cancelFirst {
-								got, err := h.store.GetJob(t.Context(), child.JobID)
+								got, err := testReads(h.store).GetJob(t.Context(), child.JobID)
 								if err != nil || got.State != contract.JobQueued || got.Outcome != "" {
 									t.Fatalf("child cascaded=%+v %v", got, err)
 								}

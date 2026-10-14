@@ -193,7 +193,7 @@ func assertServiceClaimEligibilityStaysInsideFIFOSelection(t *testing.T) {
 		if claim.Job.JobID != bound.JobID {
 			t.Fatalf("service claim = %q, want due bound service %q before older newcomer %q", claim.Job.JobID, bound.JobID, newcomer.JobID)
 		}
-		queued, err := h.store.GetJob(context.Background(), newcomer.JobID)
+		queued, err := testReads(h.store).GetJob(context.Background(), newcomer.JobID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -243,7 +243,7 @@ func assertClaimExcludesJobsStillResidentInTheRequestingAgent(t *testing.T) {
 	if claim.Job.JobID != younger.JobID {
 		t.Fatalf("claim with older job excluded = %q, want younger %q", claim.Job.JobID, younger.JobID)
 	}
-	olderState, err := h.store.GetJob(context.Background(), older.JobID)
+	olderState, err := testReads(h.store).GetJob(context.Background(), older.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}

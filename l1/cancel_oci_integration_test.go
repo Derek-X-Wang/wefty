@@ -122,7 +122,7 @@ func TestCancelOCISettlementAndCompletionReplay(t *testing.T) {
 					}
 				}
 			}
-			done, err := h.store.GetJob(ctx, job.JobID)
+			done, err := testReads(h.store).GetJob(ctx, job.JobID)
 			if err != nil || done.State != contract.JobFailed || done.Outcome != "canceled" {
 				t.Fatalf("settled=%+v %v", done, err)
 			}
@@ -226,7 +226,7 @@ func TestCancelOCIImageObservationRace(t *testing.T) {
 			if _, err := h.store.CancelJob(t.Context(), job.JobID, JobCancelCaller{Submitter: "ordinary-app"}); err != nil {
 				t.Fatal(err)
 			}
-			before, err := h.store.GetJob(t.Context(), job.JobID)
+			before, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -242,7 +242,7 @@ func TestCancelOCIImageObservationRace(t *testing.T) {
 					t.Fatalf("cancel refusal must be non-retryable: %s err=%v", body, err)
 				}
 			}
-			after, err := h.store.GetJob(t.Context(), job.JobID)
+			after, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 			if err != nil || !reflect.DeepEqual(before, after) {
 				t.Fatalf("observation after cancel mutated job: before=%+v after=%+v err=%v", before, after, err)
 			}

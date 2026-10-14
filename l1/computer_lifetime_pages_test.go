@@ -60,7 +60,7 @@ func TestComputerLifetimeAdaptivePages(t *testing.T) {
 				w := httptest.NewRecorder()
 				var keys []string
 				if kind == "generations" {
-					h.server.listComputerStorageGenerations(w, r)
+					w = recordTestRead(r, h.server.listComputerStorageGenerations)
 					var page ComputerStorageGenerationList
 					if json.Unmarshal(w.Body.Bytes(), &page) != nil {
 						t.Fatal(w.Body.String())
@@ -70,7 +70,7 @@ func TestComputerLifetimeAdaptivePages(t *testing.T) {
 						keys = append(keys, strconv.FormatInt(g.StorageGeneration, 10))
 					}
 				} else {
-					h.server.listComputerCustodyExports(w, r)
+					w = recordTestRead(r, h.server.listComputerCustodyExports)
 					var page ComputerCustodyExportList
 					if json.Unmarshal(w.Body.Bytes(), &page) != nil {
 						t.Fatal(w.Body.String())
@@ -112,12 +112,12 @@ func TestComputerLifetimeAdaptivePages(t *testing.T) {
 				t.Fatalf("watermark walk=%v", seen)
 			}
 			if kind == "generations" {
-				all, err := h.store.ListComputerStorageGenerations(ctx, computer.ComputerID)
+				all, err := testReads(h.store).ListComputerStorageGenerations(ctx, computer.ComputerID)
 				if err != nil || len(all.Generations) != 8 || all.NextCursor != "" {
 					t.Fatalf("fresh inventory=%+v %v", all, err)
 				}
 			} else {
-				all, err := h.store.ListComputerCustodyExports(ctx, computer.ComputerID)
+				all, err := testReads(h.store).ListComputerCustodyExports(ctx, computer.ComputerID)
 				if err != nil || len(all) != 8 {
 					t.Fatalf("fresh inventory=%+v %v", all, err)
 				}
@@ -138,14 +138,14 @@ func TestComputerLifetimeMaximumPages(t *testing.T) {
 		for {
 			count := 0
 			if kind == "generations" {
-				page, err := h.store.ListComputerStorageGenerationsPage(ctx, computer.ComputerID, cursor, 1000000)
+				page, err := testReads(h.store).ListComputerStorageGenerationsPage(ctx, computer.ComputerID, cursor, 1000000)
 				if err != nil {
 					t.Fatal(err)
 				}
 				count = len(page.Generations)
 				cursor = page.NextCursor
 			} else {
-				page, err := h.store.ListComputerCustodyExportsPage(ctx, computer.ComputerID, cursor, 1000000)
+				page, err := testReads(h.store).ListComputerCustodyExportsPage(ctx, computer.ComputerID, cursor, 1000000)
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -133,7 +133,7 @@ func TestComputerAuthorityLossRefusesTypedWhenRunLedgerIsUnreachable(t *testing.
 			// owed_revocation_integration_test.go).
 			assertRunLedgerUnavailable(t, status, body, false, "the Computer mutation applied",
 				"was not recorded", "nothing is owed", "live-scope check already refuses")
-			after, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+			after, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -182,7 +182,7 @@ func TestHeartbeatSurvivesAnUnreachableRunLedger(t *testing.T) {
 		!strings.Contains(logs.text(), computer.ComputerID) {
 		t.Fatalf("a deferred restore revocation was not named in the log: %s", logs.text())
 	}
-	owed, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	owed, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || owed.LastRestoreRevocation != nil {
 		t.Fatalf("restore revocation recorded against an unreachable run ledger = %#v err=%v", owed.LastRestoreRevocation, err)
 	}
@@ -357,7 +357,7 @@ func TestHeartbeatBoundsAStalledRunLedger(t *testing.T) {
 		!strings.Contains(text, stalled.ComputerID) || !strings.Contains(text, "heartbeat revocation budget") {
 		t.Fatalf("the stalled revocation was not named as a budget deferral: %s", text)
 	}
-	owed, err := h.store.GetComputer(ctx, stalled.ComputerID)
+	owed, err := testReads(h.store).GetComputer(ctx, stalled.ComputerID)
 	if err != nil || owed.LastRestoreRevocation != nil {
 		t.Fatalf("a stalled revocation was recorded as done = %#v err=%v", owed.LastRestoreRevocation, err)
 	}
@@ -369,7 +369,7 @@ func TestHeartbeatBoundsAStalledRunLedger(t *testing.T) {
 	if second[stalled.ComputerID] != 1 || second[healthy.ComputerID] != 1 {
 		t.Fatalf("the owed revocation was not re-driven on the next pass: %#v", second)
 	}
-	settled, err := h.store.GetComputer(ctx, stalled.ComputerID)
+	settled, err := testReads(h.store).GetComputer(ctx, stalled.ComputerID)
 	if err != nil || settled.LastRestoreRevocation == nil {
 		t.Fatalf("the re-driven revocation was not recorded = %#v err=%v", settled.LastRestoreRevocation, err)
 	}

@@ -262,7 +262,7 @@ func TestLeaseExpiredOneShotIsScrubbed(t *testing.T) {
 	if _, err := h.store.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	failed, err := h.store.GetJob(context.Background(), job.JobID)
+	failed, err := testReads(h.store).GetJob(context.Background(), job.JobID)
 	if err != nil || failed.State != contract.JobFailed {
 		t.Fatalf("expired one-shot = %+v err %v, want failed", failed, err)
 	}

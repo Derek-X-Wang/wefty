@@ -44,7 +44,7 @@ func TestTailRunningJobWithOpaqueCursorAndPerStreamOrder(t *testing.T) {
 		t.Fatalf("append attempt state = %q, want %q", acknowledgement.AttemptState, contract.AttemptRunning)
 	}
 
-	storedJob, err := h.store.GetJob(context.Background(), job.JobID)
+	storedJob, err := testReads(h.store).GetJob(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestLogReplayIsIdempotentAndRawJSONLMatchesRows(t *testing.T) {
 		t.Fatalf("complete status = %d body=%s", status, body)
 	}
 
-	raw, err := h.store.RawJobLogJSONL(context.Background(), job.JobID)
+	raw, err := testReads(h.store).RawJobLogJSONL(context.Background(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestCurrentFirstLogStartsProcessServiceStability(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	observed, err := store.GetJob(t.Context(), job.JobID)
+	observed, err := testReads(store).GetJob(t.Context(), job.JobID)
 	if err != nil || observed.State != contract.JobRunning || observed.HealthySinceAt == nil || !observed.HealthySinceAt.Equal(at) {
 		t.Fatalf("current first log: job=%+v err=%v", observed, err)
 	}
@@ -326,7 +326,7 @@ func TestLogsMustPreserveStopping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed, err := store.GetJob(t.Context(), job.JobID)
+	observed, err := testReads(store).GetJob(t.Context(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestLogsMustPreserveStopping(t *testing.T) {
 	if err != nil || lease.Directive != AttemptDirectiveStop {
 		t.Fatalf("logging attempt lost stop directive: lease=%+v err=%v", lease, err)
 	}
-	logs, err := store.GetJobLogs(t.Context(), job.JobID, "", 10)
+	logs, err := testReads(store).GetJobLogs(t.Context(), job.JobID, "", 10)
 	if err != nil || len(logs.Events) != 1 || string(logs.Events[0].Bytes) != "output racing stop\n" {
 		t.Fatalf("stopping logs were not retained: logs=%+v err=%v", logs, err)
 	}

@@ -100,7 +100,7 @@ func TestNodesEffectiveLivenessFiltersBeforePaging(t *testing.T) {
 				// Pin the adaptive cutoff out of reach: this test is about the
 				// filter running before LIMIT, which only full pages can show.
 				ctx := context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Hour)
-				page, err := h.store.listNodesPage(ctx, filters, cursor, 2)
+				page, err := testReads(h.store).listNodesPage(ctx, filters, cursor, 2)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -140,29 +140,43 @@ func TestNodeViewsPinOneClock(t *testing.T) {
 	clock.at.Add(int64(DefaultNodeStaleAfter))
 	for _, view := range []string{"page", "detail", "fleet"} {
 		t.Run(view, func(t *testing.T) {
-			clock.calls.Store(0)
-			var nodes []Node
-			var err error
-			switch view {
-			case "page":
-				var page NodeList
-				page, err = store.listNodesPage(t.Context(), nodeListFilters{State: "stale"}, "", 2)
-				nodes = page.Nodes
-			case "detail":
-				var node Node
-				node, err = store.GetNode(t.Context(), "a")
-				nodes = []Node{node}
-			case "fleet":
-				nodes, err = store.ListNodes(t.Context())
-			}
-			if err != nil || len(nodes) == 0 || clock.calls.Load() != 1 {
-				t.Fatalf("view=%s nodes=%#v err=%v clock calls=%d", view, nodes, err, clock.calls.Load())
-			}
-			for _, node := range nodes {
-				if node.State != contract.NodeStale {
-					t.Fatalf("view did not project the pinned boundary: %#v", node)
+			retryTestSnapshotScenario(t, func() error {
+
+				clock.calls.Store(0)
+				var nodes []Node
+				var err error
+				switch view {
+				case "page":
+					var page NodeList
+					page, err = store.listNodesPage(t.Context(), nodeListFilters{State: "stale"}, "", 2)
+					if testReadRetryable(err) {
+						return err
+					}
+					nodes = page.Nodes
+				case "detail":
+					var node Node
+					node, err = store.GetNode(t.Context(), "a")
+					if testReadRetryable(err) {
+						return err
+					}
+					nodes = []Node{node}
+				case "fleet":
+					nodes, err = store.ListNodes(t.Context())
+					if testReadRetryable(err) {
+						return err
+					}
 				}
-			}
+				if err != nil || len(nodes) == 0 || clock.calls.Load() != 1 {
+					t.Fatalf("view=%s nodes=%#v err=%v clock calls=%d", view, nodes, err, clock.calls.Load())
+				}
+				for _, node := range nodes {
+					if node.State != contract.NodeStale {
+						t.Fatalf("view did not project the pinned boundary: %#v", node)
+					}
+				}
+
+				return nil
+			})
 		})
 	}
 }

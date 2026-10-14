@@ -258,7 +258,7 @@ func assertClaimTimeAuthorityAndIntent(t *testing.T) {
 		if claim != nil || err != nil {
 			t.Fatalf("claims-disabled store claim = %#v, %v; want no claim and no error", claim, err)
 		}
-		if job, err := h.store.GetJob(t.Context(), queued.JobID); err != nil || job.State != contract.JobQueued {
+		if job, err := testReads(h.store).GetJob(t.Context(), queued.JobID); err != nil || job.State != contract.JobQueued {
 			t.Fatalf("claims-disabled queued job = %#v, %v; want queued", job, err)
 		}
 		if current, err := getNode(t.Context(), h.store.db, "node-1"); err != nil || current.State != contract.NodeAlive {

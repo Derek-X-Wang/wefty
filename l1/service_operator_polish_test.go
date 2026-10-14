@@ -43,7 +43,7 @@ func TestServiceConditionSinceSurvivesStop(t *testing.T) {
 			if !reflect.DeepEqual(before, after) || !after.Since.Equal(time.Unix(0, completedNS)) {
 				t.Fatalf("stop moved condition: %+v -> %+v; completion=%d", before, after, completedNS)
 			}
-			updated, err := h.store.GetJob(t.Context(), job.JobID)
+			updated, err := testReads(h.store).GetJob(t.Context(), job.JobID)
 			if err != nil || !updated.UpdatedAt.After(after.Since) {
 				t.Fatalf("fixture did not advance Job timestamp: %+v %v", updated, err)
 			}
@@ -93,7 +93,7 @@ func TestServiceOperatorPageQueryCost(t *testing.T) {
 				if _, err := h.store.db.Exec("UPDATE service_jobs SET desired_state='stopped', bound_node_id=? WHERE job_id=?", node.NodeID, job.JobID); err != nil {
 					t.Fatal(err)
 				}
-				job, err = h.store.GetJob(t.Context(), job.JobID)
+				job, err = testReads(h.store).GetJob(t.Context(), job.JobID)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -300,7 +300,7 @@ func TestChildListingDeletedBeforeOperatorProjection(t *testing.T) {
 		}
 	}
 	// A fresh production page sees the deletion fully applied.
-	fresh, err := h.store.listChildJobsForCaller(t.Context(), parent.JobID, "", 100, actor)
+	fresh, err := testReads(h.store).listChildJobsForCaller(t.Context(), parent.JobID, "", 100, actor)
 	if err != nil || len(fresh.Jobs) != 1 || fresh.Jobs[0].JobID == firstID || fresh.Jobs[0].ServiceOperatorFacts == nil {
 		t.Fatalf("fresh page after deletion: %+v err=%v", fresh, err)
 	}

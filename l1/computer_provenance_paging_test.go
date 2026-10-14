@@ -28,7 +28,7 @@ func provenanceReviewPage(t *testing.T, h *integrationHarness, computerID, curso
 	q.Set("limit", strconv.Itoa(limit))
 	r.URL.RawQuery = q.Encode()
 	w := httptest.NewRecorder()
-	h.server.listComputerStorageProvenance(w, r)
+	w = recordTestRead(r, h.server.listComputerStorageProvenance)
 	var page struct {
 		ComputerStorageProvenance
 		Next string `json:"next_cursor"`
@@ -87,7 +87,7 @@ func TestComputerProvenanceAdaptivePagingWatermark(t *testing.T) {
 		q.Set("limit", strconv.Itoa(bad.limit))
 		r.URL.RawQuery = q.Encode()
 		w := httptest.NewRecorder()
-		h.server.listComputerStorageProvenance(w, r)
+		w = recordTestRead(r, h.server.listComputerStorageProvenance)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("invalid cursor/limit=%d %s", w.Code, w.Body.String())
 		}
@@ -172,7 +172,7 @@ func TestComputerCustodyGraphLimitPermanent(t *testing.T) {
 	seedReviewCustodyChain(t, h, backup, 1000, "clone", 1)
 	r := computerSnapshotRequest(t.Context(), computer.ComputerID)
 	w := httptest.NewRecorder()
-	h.server.listComputerStorageProvenance(w, r)
+	w = recordTestRead(r, h.server.listComputerStorageProvenance)
 	var envelope contract.ErrorResponse
 	if w.Code != http.StatusConflict || json.Unmarshal(w.Body.Bytes(), &envelope) != nil || envelope.Error.Code != contract.ErrorConflict || envelope.Error.Retryable || envelope.Error.Details["reason"] != "storage_custody_limit" {
 		t.Fatalf("graph bound=%d %s", w.Code, w.Body.String())
@@ -194,7 +194,7 @@ func TestComputerStoreBackupInventoryWalksPages(t *testing.T) {
 	h, _, computer, backup, _ := publishedBackupForStorageCopy(t, 2)
 	h.stopServer()
 	seedComputerSnapshotBackups(t, h, backup, 5, 1)
-	page, err := h.store.ListComputerBackups(context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Nanosecond), computer.ComputerID)
+	page, err := testReads(h.store).ListComputerBackups(context.WithValue(t.Context(), readPageCutoffContextKey{}, time.Nanosecond), computer.ComputerID)
 	if err != nil || len(page.Backups) != 6 || page.NextCursor != "" {
 		t.Fatalf("inventory=%+v %v", page, err)
 	}
@@ -331,7 +331,7 @@ func TestComputerCustodyExportLimitPermanent(t *testing.T) {
 	}
 	r := computerSnapshotRequest(t.Context(), computer.ComputerID)
 	w := httptest.NewRecorder()
-	h.server.listComputerStorageProvenance(w, r)
+	w = recordTestRead(r, h.server.listComputerStorageProvenance)
 	var envelope contract.ErrorResponse
 	if w.Code != http.StatusConflict || json.Unmarshal(w.Body.Bytes(), &envelope) != nil || envelope.Error.Code != contract.ErrorConflict || envelope.Error.Retryable || envelope.Error.Details["reason"] != "storage_custody_limit" {
 		t.Fatalf("export bound=%d %s", w.Code, w.Body.String())
@@ -342,7 +342,7 @@ func TestComputerCustodyExportLimitPermanent(t *testing.T) {
 // JSON consumers can iterate the field unconditionally.
 func TestComputerProvenanceEmptyWalkEncodesEmptyList(t *testing.T) {
 	h, computer, _ := liveComputerTokenScope(t, "provenance-empty")
-	got, err := h.store.ListComputerStorageProvenance(t.Context(), computer.ComputerID)
+	got, err := testReads(h.store).ListComputerStorageProvenance(t.Context(), computer.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}

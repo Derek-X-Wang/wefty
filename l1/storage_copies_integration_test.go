@@ -79,7 +79,7 @@ func testRestoreHeartbeatRevocation(t *testing.T, skew time.Duration) {
 	if status != http.StatusOK || json.Unmarshal(body, &unrevoked) != nil || len(unrevoked.StorageCopyDirectives) != 0 {
 		t.Fatalf("heartbeat without revoker status=%d response=%#v body=%s", status, unrevoked, body)
 	}
-	if owed, err := h.store.GetComputer(context.Background(), computer.ComputerID); err != nil || owed.LastRestoreRevocation != nil {
+	if owed, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID); err != nil || owed.LastRestoreRevocation != nil {
 		t.Fatalf("restore revocation recorded without a run ledger = %#v err=%v", owed.LastRestoreRevocation, err)
 	}
 	revocations := 0
@@ -101,7 +101,7 @@ func testRestoreHeartbeatRevocation(t *testing.T, skew time.Duration) {
 			t.Fatalf("heartbeat %d revocations=%d", heartbeat, revocations)
 		}
 	}
-	revoked, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	revoked, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || revoked.LastRestoreRevocation == nil ||
 		revoked.LastRestoreRevocation.OperationRevision != reserved.IntentRevision ||
 		!revoked.LastRestoreRevocation.RevokeAll ||
@@ -337,7 +337,7 @@ func TestUnpreparableComputerCloneReachesTerminalOutcomeAndStopsRedispatch(t *te
 			// The acknowledgement deletes nothing on the Node; only the
 			// never-published generation row is retired so no later start can
 			// format an empty disk under the clone's identity.
-			generations, err := h.store.ListComputerStorageGenerations(context.Background(), clone.ComputerID)
+			generations, err := testReads(h.store).ListComputerStorageGenerations(context.Background(), clone.ComputerID)
 			if err != nil || len(generations.Generations) != 1 || generations.Generations[0].Phase != "retired" {
 				t.Fatalf("unpreparable clone generations = %#v err=%v", generations.Generations, err)
 			}
@@ -364,7 +364,7 @@ func TestUnpreparableComputerCloneReachesTerminalOutcomeAndStopsRedispatch(t *te
 					IdempotencyKey: "late-success", Receipt: successfulStorageCopyReceipt(directive)}); err == nil {
 				t.Fatal("late verified receipt was accepted after a terminal clone outcome")
 			}
-			unchanged, err := h.store.GetComputer(context.Background(), sourceComputer.ComputerID)
+			unchanged, err := testReads(h.store).GetComputer(context.Background(), sourceComputer.ComputerID)
 			if err != nil || unchanged.StorageID != sourceComputer.StorageID ||
 				unchanged.StorageGeneration != sourceComputer.StorageGeneration ||
 				unchanged.IntentRevision != sourceComputer.IntentRevision ||
@@ -517,7 +517,7 @@ func TestComputerCloneCapacityRefusalLatchesInsufficientDiskAndStopsRedispatch(t
 	if status != "failed" || failureCode != "insufficient_disk" {
 		t.Fatalf("refused clone operation = %q/%q", status, failureCode)
 	}
-	generations, err := h.store.ListComputerStorageGenerations(context.Background(), clone.ComputerID)
+	generations, err := testReads(h.store).ListComputerStorageGenerations(context.Background(), clone.ComputerID)
 	if err != nil || len(generations.Generations) != 1 || generations.Generations[0].Phase != "retired" {
 		t.Fatalf("refused clone generations = %#v err=%v", generations.Generations, err)
 	}
@@ -538,7 +538,7 @@ func TestComputerCloneCapacityRefusalLatchesInsufficientDiskAndStopsRedispatch(t
 			IdempotencyKey: "late-success", Receipt: successfulStorageCopyReceipt(directive)}); err == nil {
 		t.Fatal("late verified receipt was accepted after a terminal clone refusal")
 	}
-	unchanged, err := h.store.GetComputer(context.Background(), sourceComputer.ComputerID)
+	unchanged, err := testReads(h.store).GetComputer(context.Background(), sourceComputer.ComputerID)
 	if err != nil || unchanged.StorageID != sourceComputer.StorageID || unchanged.StorageGeneration != sourceComputer.StorageGeneration ||
 		unchanged.IntentRevision != sourceComputer.IntentRevision || unchanged.ReconfigurationPhase != ComputerReconfigurationStable {
 		t.Fatalf("refused clone changed source Computer = %#v err=%v", unchanged, err)
@@ -617,7 +617,7 @@ func TestRefusedComputerCloneCannotStartAnEmptyReplacementDisk(t *testing.T) {
 		{`UPDATE attempts SET state='lost' WHERE job_id=?`, refused.CurrentJobID},
 		{`UPDATE jobs SET state='failed', current_attempt_id=NULL WHERE job_id=?`, refused.CurrentJobID},
 	})
-	current, err := h.store.GetComputer(context.Background(), refused.ComputerID)
+	current, err := testReads(h.store).GetComputer(context.Background(), refused.ComputerID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +652,7 @@ func TestRefusedComputerCloneCannotStartAnEmptyReplacementDisk(t *testing.T) {
 			refusal.Details["required_operation"] != "remove" {
 			t.Fatalf("%s of a refused clone = %v (%#v)", operation.name, err, refusal)
 		}
-		unchanged, err := h.store.GetComputer(context.Background(), current.ComputerID)
+		unchanged, err := testReads(h.store).GetComputer(context.Background(), current.ComputerID)
 		if err != nil || unchanged.IntentRevision != current.IntentRevision ||
 			unchanged.ReconfigurationPhase != ComputerReconfigurationStable {
 			t.Fatalf("%s spent a revision on a refused clone = %#v err=%v", operation.name, unchanged, err)
@@ -682,7 +682,7 @@ func TestComputerRestorePublishesExactlyOneStoppedGenerationAndKeepsSource(t *te
 	if err != nil || !replayed || replayedRestore.IntentRevision != reserved.IntentRevision {
 		t.Fatalf("restore replay = %#v replayed=%t err=%v", replayedRestore, replayed, err)
 	}
-	if _, err := h.store.ProveComputerTokenScope(context.Background(), computer.ComputerID, oldClaim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(context.Background(), computer.ComputerID, oldClaim.Lease.AttemptID,
 		"fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("old planted credential scope = %v, want forbidden", err)
 	}
@@ -711,7 +711,7 @@ func TestComputerRestorePublishesExactlyOneStoppedGenerationAndKeepsSource(t *te
 		published.LastRestoreRevocation.TokenRevocation.ComputerID != computer.ComputerID {
 		t.Fatalf("published restored generation = %#v", published)
 	}
-	backups, err := h.store.ListComputerBackups(context.Background(), computer.ComputerID)
+	backups, err := testReads(h.store).ListComputerBackups(context.Background(), computer.ComputerID)
 	if err != nil || len(backups.Backups) != 2 {
 		t.Fatalf("source and precommitted old Backup = %#v err=%v", backups, err)
 	}
@@ -731,11 +731,11 @@ func TestComputerRestorePublishesExactlyOneStoppedGenerationAndKeepsSource(t *te
 		retirementRequest); err != nil || replay.IntentRevision != completed.IntentRevision {
 		t.Fatalf("retirement acknowledgement replay = %#v err=%v", replay, err)
 	}
-	if _, err := h.store.ProveComputerTokenScope(context.Background(), completed.ComputerID, oldClaim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(context.Background(), completed.ComputerID, oldClaim.Lease.AttemptID,
 		"fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("copied old restore credential after publication = %v, want forbidden", err)
 	}
-	generations, err := h.store.ListComputerStorageGenerations(context.Background(), computer.ComputerID)
+	generations, err := testReads(h.store).ListComputerStorageGenerations(context.Background(), computer.ComputerID)
 	if err != nil || len(generations.Generations) != 2 || generations.Generations[0].Phase != ComputerStorageGenerationRetired ||
 		generations.Generations[1].Phase != ComputerStorageGenerationCurrent {
 		t.Fatalf("restore generation phases = %#v err=%v", generations, err)
@@ -844,11 +844,11 @@ func TestComputerCloneCreatesNewStoppedIdentityWithoutGrantsAndExpands(t *testin
 		completed.DesiredState != contract.ServiceDesiredStopped || len(completed.Grants) != 0 {
 		t.Fatalf("completed clone = %#v err=%v", completed, err)
 	}
-	if _, err := h.store.ProveComputerTokenScope(context.Background(), completed.ComputerID, oldClaim.Lease.AttemptID,
+	if _, err := testReads(h.store).ProveComputerTokenScope(context.Background(), completed.ComputerID, oldClaim.Lease.AttemptID,
 		"fabric-computer-node", ""); errorCode(err) != contract.ErrorForbidden {
 		t.Fatalf("copied old clone credential = %v, want forbidden", err)
 	}
-	unchanged, err := h.store.GetComputer(context.Background(), sourceComputer.ComputerID)
+	unchanged, err := testReads(h.store).GetComputer(context.Background(), sourceComputer.ComputerID)
 	if err != nil || unchanged.StorageID != sourceComputer.StorageID || unchanged.StorageGeneration != sourceComputer.StorageGeneration ||
 		unchanged.IntentRevision != sourceComputer.IntentRevision {
 		t.Fatalf("clone changed source Computer = %#v err=%v", unchanged, err)
@@ -863,7 +863,7 @@ func TestComputerCloneCreatesNewStoppedIdentityWithoutGrantsAndExpands(t *testin
 	if kind != "clone" || destinationComputerID != clone.ComputerID || destinationStorageID != clone.StorageID || destinationGeneration != 1 {
 		t.Fatalf("clone Storage provenance = %q/%q/%q/%d", kind, destinationComputerID, destinationStorageID, destinationGeneration)
 	}
-	projection, err := h.store.ListComputerStorageProvenance(context.Background(), clone.ComputerID)
+	projection, err := testReads(h.store).ListComputerStorageProvenance(context.Background(), clone.ComputerID)
 	var observedReceipt *ComputerStorageCopyReceipt
 	for _, provenance := range projection.Provenance {
 		if provenance.Kind == "clone" {
@@ -907,7 +907,7 @@ func TestComputerCloneCustodyRemovalReducesThenCoordinatedRemovalVerifies(t *tes
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	clone, err = h.store.GetComputer(context.Background(), clone.ComputerID)
+	clone, err = testReads(h.store).GetComputer(context.Background(), clone.ComputerID)
 	if err != nil || clone.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("single clone-branch removal = %#v err=%v", clone, err)
 	}
@@ -925,11 +925,11 @@ func TestComputerCloneCustodyRemovalReducesThenCoordinatedRemovalVerifies(t *tes
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	sourceComputer, err = h.store.GetComputer(context.Background(), sourceComputer.ComputerID)
+	sourceComputer, err = testReads(h.store).GetComputer(context.Background(), sourceComputer.ComputerID)
 	if err != nil || sourceComputer.RemovalOutcome != "removed_verified" {
 		t.Fatalf("final source-branch removal = %#v err=%v", sourceComputer, err)
 	}
-	clone, err = h.store.GetComputer(context.Background(), clone.ComputerID)
+	clone, err = testReads(h.store).GetComputer(context.Background(), clone.ComputerID)
 	if err != nil || clone.RemovalOutcome != "removed_verified" {
 		t.Fatalf("coordinated branch upgrade = %#v err=%v", clone, err)
 	}
@@ -990,7 +990,7 @@ func TestComputerStorageCopyReceiptMutationRowsFailTwentyOfTwenty(t *testing.T) 
 			t.Errorf("negative receipt row %d was accepted", index)
 		}
 	}
-	stillStaged, err := h.store.GetComputer(context.Background(), clone.ComputerID)
+	stillStaged, err := testReads(h.store).GetComputer(context.Background(), clone.ComputerID)
 	if err != nil || stillStaged.ReconfigurationPhase != ComputerReconfigurationCloning {
 		t.Fatalf("negative rows changed clone = %#v err=%v", stillStaged, err)
 	}
@@ -1010,7 +1010,7 @@ func TestRestoreAndCloneFailClosedOnRunningAttachedAndStaleAuthority(t *testing.
 			t.Fatal(err)
 		}
 		finishBackupQuiescence(t, h, claim, "restore-source-detached")
-		stopped, err := h.store.GetComputer(context.Background(), resumed.ComputerID)
+		stopped, err := testReads(h.store).GetComputer(context.Background(), resumed.ComputerID)
 		if err != nil || stopped.CurrentJob.State != contract.JobStopped || stopped.CurrentJob.CurrentAttemptID != "" {
 			t.Fatalf("runtime-stopped restore source = %#v err=%v", stopped, err)
 		}
@@ -1036,7 +1036,7 @@ func TestRestoreAndCloneFailClosedOnRunningAttachedAndStaleAuthority(t *testing.
 				IdempotencyKey: "restore-source-unverified", Result: ProcessResult{OutputError: "runtime detach was not proven"}}); err != nil {
 			t.Fatal(err)
 		}
-		failed, err := h.store.GetComputer(context.Background(), resumed.ComputerID)
+		failed, err := testReads(h.store).GetComputer(context.Background(), resumed.ComputerID)
 		if err != nil || failed.CurrentJob.State != contract.JobFailed || failed.CurrentJob.CurrentAttemptID != claim.Lease.AttemptID {
 			t.Fatalf("unverified runtime-stopped restore source = %#v err=%v", failed, err)
 		}
@@ -1156,7 +1156,7 @@ func TestComputerRestoreRejectsFailedPredecessorBackupBeforeSwitchover(t *testin
 			IdempotencyKey: copyReceipt.ReceiptID, Receipt: copyReceipt, OldBackupReceipt: &oldReceipt}); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("failed predecessor receipt error = %v, want typed conflict", err)
 	}
-	unchanged, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+	unchanged, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 	if err != nil || unchanged.StorageGeneration != computer.StorageGeneration || unchanged.IntentRevision != reserved.IntentRevision ||
 		unchanged.ReconfigurationPhase != ComputerReconfigurationStable || unchanged.AppliedRevision != reserved.IntentRevision {
 		t.Fatalf("failed predecessor receipt switched authority = %#v err=%v", unchanged, err)
@@ -1254,7 +1254,7 @@ func TestRemovingCloneSourceSupersedesReservedForkAndCannotVerifyCustody(t *test
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	removed, err = h.store.GetComputer(context.Background(), removed.ComputerID)
+	removed, err = testReads(h.store).GetComputer(context.Background(), removed.ComputerID)
 	if err != nil || removed.RemovalOutcome != "removed_reduced" {
 		t.Fatalf("in-flight fork custody outcome = %#v err=%v", removed, err)
 	}

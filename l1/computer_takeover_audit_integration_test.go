@@ -92,7 +92,7 @@ func assertComputerTakeoverAuditContract(t *testing.T) {
 			controlReceipt.Event.AuthorityGeneration != node.AuthorityGeneration {
 			t.Fatalf("control audit receipt = %#v err=%v", controlReceipt, err)
 		}
-		projected, err := h.store.GetComputer(context.Background(), computer.ComputerID)
+		projected, err := testReads(h.store).GetComputer(context.Background(), computer.ComputerID)
 		wantTenure := contract.ComputerControlTenureHeld
 		if controlEvent.Kind == ComputerTakeoverControlReleased {
 			wantTenure = contract.ComputerControlTenureFree

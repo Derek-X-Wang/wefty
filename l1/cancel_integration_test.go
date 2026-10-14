@@ -127,7 +127,7 @@ func TestCancelAuthorizationRoutes(t *testing.T) {
 func TestCancelRefusalsAndTerminalReplay(t *testing.T) {
 	h, client, agent, node := credentialHarness(t)
 	service := submitRestartService(t, h, client, "cancel-service", []string{"linux"}, nil)
-	before, err := h.store.GetJob(t.Context(), service.JobID)
+	before, err := testReads(h.store).GetJob(t.Context(), service.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestCancelRefusalsAndTerminalReplay(t *testing.T) {
 	if refusal.Error.Retryable || refusal.Error.Details["desired_state_path"] != "/v1/jobs/"+service.JobID+"/desired-state?class=service" || refusal.Error.Details["remove_path"] != "/v1/jobs/"+service.JobID+"/remove?class=service" {
 		t.Fatalf("refusal=%s", body)
 	}
-	after, err := h.store.GetJob(t.Context(), service.JobID)
+	after, err := testReads(h.store).GetJob(t.Context(), service.JobID)
 	if err != nil || !reflect.DeepEqual(before, after) {
 		t.Fatalf("service changed=%#v err=%v", after, err)
 	}
@@ -179,7 +179,7 @@ func TestCancelRequeuedOCIPreservesAttemptEvidence(t *testing.T) {
 	if err != nil || requeued.State != contract.JobQueued {
 		t.Fatalf("requeue=%#v err=%v", requeued, err)
 	}
-	attempts, err := h.store.ListJobAttempts(t.Context(), job.JobID)
+	attempts, err := testReads(h.store).ListJobAttempts(t.Context(), job.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
