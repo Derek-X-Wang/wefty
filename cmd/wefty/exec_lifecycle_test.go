@@ -20,12 +20,18 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-func shortenExecReadRecovery(t *testing.T) {
+// shortenExecReadRecovery makes a read that never succeeds give up quickly.
+// Use it only while that read is stubbed to fail or to block, so the short
+// budget ends the same way however slowly the real stack answers. A healthy
+// read must not share it: restore the production budget before one.
+func shortenExecReadRecovery(t *testing.T) (restore func()) {
 	t.Helper()
 	old := execReadRecoveryBudget
 	execReadRecoveryBudget = 300 * time.Millisecond
-	t.Cleanup(func() { execReadRecoveryBudget = old })
+	restore = func() { execReadRecoveryBudget = old }
+	t.Cleanup(restore)
 	shortenExecTimers(t)
+	return restore
 }
 
 func execReadFailure(kind string) (*http.Response, error) {
@@ -43,7 +49,9 @@ func TestExecObservationRetriesWithoutCancellation(t *testing.T) {
 	for _, path := range []string{"logs", "record"} {
 		for _, kind := range []string{"transport", "unavailable", "internal"} {
 			t.Run(path+"/"+kind, func(t *testing.T) {
-				shortenExecReadRecovery(t)
+				// The run is healthy, so its reads keep the production budget.
+				// Only the stubbed failures decide how a read recovers.
+				shortenExecTimers(t)
 				stack := newExecStack(t, execTestIdleLimit)
 				repo := execTestRepo(t)
 				t.Chdir(repo)
@@ -232,10 +240,10 @@ func TestExecRemovesReadOnlyFolders(t *testing.T) {
 }
 
 func TestExecCancelFeedbackAndAcceptedSettlement(t *testing.T) {
+	// The cancel request is healthy and keeps L1's settlement budget. Only
+	// terminal confirmation is lost: its reads fail until the short read
+	// budget ends, however slowly the real stack answers the cancel.
 	shortenExecReadRecovery(t)
-	old := execCancelSettlementBudget
-	execCancelSettlementBudget = 250 * time.Millisecond
-	t.Cleanup(func() { execCancelSettlementBudget = old })
 	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	ctx, cancel := context.WithCancel(t.Context())
