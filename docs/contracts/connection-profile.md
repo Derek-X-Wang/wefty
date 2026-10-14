@@ -26,10 +26,13 @@ L1 ignore the profile's `node_admission`.
 A named profile must exist. The CLI's default path is optional: when it is
 absent the CLI behaves exactly as before setup. The services read a profile
 only when one is named, which their LaunchAgents do, so a service started by
-hand is unchanged. The CLI reads the profile only for commands that reach the
-cluster: `wefty run ...`, `wefty workflow init`, `wefty node ...` and
-`wefty setup` never open it, so a job reporting through its run mailbox cannot
-fail on it.
+hand is unchanged. Cluster commands read the profile under the precedence above.
+The CLI command dispatch for `run`, `workflow init`, `node` and `setup` never
+opens the profile. A job reporting through its run mailbox cannot fail on a
+profile it does not need. Plain-process `wefty node doctor` explicitly reads
+it as a diagnostic check and uses its L1 settings only to verify the installed
+node. Setup reads its installation profile to preserve owner settings. OCI
+node commands keep their node-local control-socket path.
 
 ## Format
 
@@ -79,3 +82,8 @@ changes. Every write goes through a handle confined to the home folder. A file
 converges on its bytes, its type and its permission bits. A changed service is
 unloaded before its new plist is published, so a failed unload is retried on
 the next run, and a service that is loaded but stopped is started.
+
+Setup also records installed file digests in `~/.config/wefty/setup-files.json`
+(mode `0600`). Removal uses these digests to preserve binaries, plists and skills the owner
+replaced or edited. Regular profile and node configuration files are removed
+even after owner edits; links remain. See [plain-node-maintenance](plain-node-maintenance.md).

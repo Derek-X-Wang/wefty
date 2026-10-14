@@ -412,3 +412,16 @@ func (manager Manager) waitUnloaded(ctx context.Context, label string) error {
 		}
 	}
 }
+
+// Unload waits for launchd to confirm absence before callers delete files.
+// A failed inspection or bootout leaves the install intact for a retry.
+func (manager Manager) Unload(ctx context.Context, label string) error {
+	state, err := manager.State(ctx, label)
+	if err != nil || !state.Loaded {
+		return err
+	}
+	if _, err := manager.Run(ctx, Launchctl, "bootout", manager.target(label)); err != nil {
+		return fmt.Errorf("unload LaunchAgent %s: %w", label, err)
+	}
+	return manager.waitUnloaded(ctx, label)
+}
