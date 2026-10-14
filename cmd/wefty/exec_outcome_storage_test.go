@@ -19,7 +19,9 @@ import (
 )
 
 func TestExecExternalCancellationIsTerminal(t *testing.T) {
-	shortenExecReadRecovery(t)
+	// Every read here is healthy, and one carries a whole cancel command, so
+	// the reads keep the production budget.
+	shortenExecTimers(t)
 	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	base := stack.clients.l3.client.Transport
@@ -43,7 +45,8 @@ func TestExecExternalCancellationIsTerminal(t *testing.T) {
 }
 
 func TestExecSweepsAbandonedCaptures(t *testing.T) {
-	shortenExecReadRecovery(t)
+	// Only the first exec loses observation; its log reads always fail.
+	restoreReadRecovery := shortenExecReadRecovery(t)
 	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
 	base := stack.clients.l3.client.Transport
@@ -58,6 +61,8 @@ func TestExecSweepsAbandonedCaptures(t *testing.T) {
 		t.Fatalf("lost CLI: %v", err)
 	}
 	stack.clients.l3.client.Transport = base
+	// The later execs are healthy, so they keep the production budget.
+	restoreReadRecovery()
 	runs, err := stack.clients.listRuns(t.Context(), "", 20)
 	if err != nil || len(runs.Runs) != 1 {
 		t.Fatalf("runs: %+v %v", runs, err)
