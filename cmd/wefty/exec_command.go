@@ -59,10 +59,14 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var tags stringListFlag
 	var maxRuntime time.Duration
+	var keepRunning, detach bool
+	flags.BoolVar(&keepRunning, "keep-running", false, "stopping ends only watching; the run continues")
+	flags.BoolVar(&detach, "detach", false, "return the run ID after acceptance without watching")
+	flags.BoolVar(&jsonOutput, "json", jsonOutput, "stream one JSON event per line")
 	flags.Var(&tags, "tag", "additional tag that narrows this machine's Pinned run (repeatable)")
 	flags.DurationVar(&maxRuntime, "max-runtime", 0, "optional runtime cap (no cap by default)")
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), "Usage: wefty exec [--tag TAG] [--max-runtime D] -- <command...>\nFreeze the checkout and local changes; run on this machine's node.\nStream output; exit 0 on pass or 10 on failure. Stopping cancels the run.")
+		fmt.Fprintln(flags.Output(), "Usage: wefty exec [--tag TAG] [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>\nFreeze the checkout and local changes; run on this machine's node.\nStream output; exit 0 on pass or 10 on failure. Stopping cancels the run unless --keep-running is set.")
 		flags.PrintDefaults()
 	}
 	if err := parseCommandFlags(flags, args, false); err != nil {
@@ -70,10 +74,10 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	separator := len(args) - flags.NArg() - 1
 	if separator < 0 || flags.NArg() == 0 || args[separator] != "--" {
-		return usageError("usage: wefty exec [--tag TAG] [--max-runtime D] -- <command...>")
+		return usageError("usage: wefty exec [--tag TAG] [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>")
 	}
-	if jsonOutput {
-		return usageError("exec --json is not supported yet")
+	if keepRunning && detach {
+		return usageError("--keep-running and --detach are alternatives")
 	}
 	argv := flags.Args()
 	for _, arg := range argv {
@@ -155,7 +159,13 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			recovered, recoverErr := recoverExecAcceptance(clients, capture.Storage)
 			if recoverErr == nil {
 				recordExecStorageRun(capture.Storage, recovered, stderr)
-				return cancelExecRun(clients, recovered, capture.Storage, ctx.Err(), stderr)
+				if detach {
+					return printExecDetached(stdout, jsonOutput, recovered)
+				}
+				if keepRunning {
+					return endExecObservation(clients, capture, contract.RunRecord{RunID: recovered}, jsonOutput, stdout, stderr, ctx.Err())
+				}
+				return cancelExecObservation(clients, capture, recovered, jsonOutput, stdout, stderr, ctx.Err())
 			}
 		}
 		fmt.Fprintf(stderr, "wefty: snapshot retained at %s (key %s)\n", capture.Storage, key)
@@ -163,20 +173,32 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	runID := accepted.RunID
 	recordExecStorageRun(capture.Storage, runID, stderr)
+	if detach {
+		return printExecDetached(stdout, jsonOutput, runID)
+	}
 	if _, err = fmt.Fprintf(stderr, "wefty: run %s\n", runID); err != nil {
-		return lostExecObservation(stderr, runID, capture.Storage, err)
+		return endExecObservation(clients, capture, contract.RunRecord{RunID: runID}, jsonOutput, stdout, stderr, err)
 	}
 	if ctx.Err() != nil {
-		return cancelExecRun(clients, runID, capture.Storage, ctx.Err(), stderr)
-	}
-	record, err := observeExecRun(ctx, clients, runID, stdout, stderr)
-	if err != nil && !(ctx.Err() != nil && runIsTerminal(record.Status)) {
-		if ctx.Err() != nil {
-			return cancelExecRun(clients, runID, capture.Storage, ctx.Err(), stderr)
+		if keepRunning {
+			return endExecObservation(clients, capture, contract.RunRecord{RunID: runID}, jsonOutput, stdout, stderr, ctx.Err())
 		}
-		return lostExecObservation(stderr, runID, capture.Storage, err)
+		return cancelExecObservation(clients, capture, runID, jsonOutput, stdout, stderr, ctx.Err())
 	}
-	result := reportExecRun(ctx, clients, record, stderr)
+	record, err := observeExecRunOutput(ctx, clients, runID, jsonOutput, stdout, stderr)
+	if err != nil && !runIsTerminal(record.Status) {
+		if ctx.Err() != nil && !keepRunning {
+			return cancelExecObservation(clients, capture, runID, jsonOutput, stdout, stderr, ctx.Err())
+		}
+		if record.RunID == "" {
+			record.RunID = runID
+		}
+		return endExecObservation(clients, capture, record, jsonOutput, stdout, stderr, err)
+	}
+	if err != nil && (jsonOutput || ctx.Err() == nil) {
+		fmt.Fprintf(stderr, "wefty: warning: could not drain logs for terminal run %s: %v\n", runID, err)
+	}
+	result := reportExecFinished(ctx, clients, record, capture, jsonOutput, stdout, stderr)
 	if err = cleanupExecStorage(capture.Storage); err != nil {
 		fmt.Fprintf(stderr, "wefty: warning: %v\n", err)
 	}
@@ -337,4 +359,14 @@ func cancelExecRun(clients *apiClients, runID, storage string, cause error, stde
 		fmt.Fprintf(stderr, "wefty: warning: %v\n", err)
 	}
 	return fmt.Errorf("cancelled run %s: %w", runID, cause)
+}
+
+func printExecDetached(stdout io.Writer, jsonOutput bool, runID string) error {
+	if jsonOutput {
+		return writeJSONLine(stdout, struct {
+			RunID string `json:"run_id"`
+		}{runID})
+	}
+	_, err := fmt.Fprintln(stdout, runID)
+	return err
 }

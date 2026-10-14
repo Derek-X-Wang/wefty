@@ -1,6 +1,7 @@
 # Local command runs (`wefty exec`)
 
-`wefty exec [--tag TAG ...] [--max-runtime D] -- <command...>` freezes a
+`wefty exec [--tag TAG ...] [--max-runtime D] [--keep-running | --detach]
+[--json] -- <command...>` freezes a
 checkout before L3 submission. It uses the installed `node_id`, checked through
 L1 by `resolveLocalNode`, and always includes that node's reserved tag. Extra
 tags narrow this Pinned run. It is an ordinary process one-shot without
@@ -58,11 +59,11 @@ or start-folder failures print `wefty: snapshot checkout failed` and write an
 these failures with typed unavailable exit 13. Private clones use `--template=`;
 all Git calls disable hooks with `-c core.hooksPath=/dev/null`.
 
-Exec follows the normal log drain, including queued and truncation notices,
+Without `--json`, exec follows the normal log drain, including queued and truncation notices,
 before printing the terminal verdict to stderr. Stdout contains only command
 stdout. Success exits 0. Failure uses the shared
 `runOutcomeError` typed-exit entry and exits 10. SIGINT, SIGTERM and SIGHUP cancel
-the run. The CLI prints `wefty: cancelling run <id>` before the cancel request.
+the run unless `--keep-running` or `--detach` is set. The CLI prints `wefty: cancelling run <id>` before the cancel request.
 An accepted cancellation is reported as cancelled; later observation serves
 only cleanup. A terminal run with recorded cancellation is reported as
 `cancelled` with exit 10, including cancellation from another CLI. A signal
@@ -105,6 +106,73 @@ fail exec. This also reclaims residue after a second Ctrl-C, SIGKILL, or a
 queued run cancelled after its CLI has exited.
 
 The command is not sandboxed and can write absolute paths as the node's user.
-No files are returned. `--keep-running`, `--detach`, `--json` and skill guidance
-are separate work in #889; the wrapper and capture are separate from observation
-so those modes can reuse the same request and lifecycle.
+No files are returned. Never put a secret on the command line: command text
+is stored permanently as typed. Use exec for one command with local changes;
+use a stored workflow for repeatable work that drives other runs.
+
+## Watching modes and JSON
+
+`--keep-running` streams normally. A signal after acceptance stops only the
+watching, prints the run ID and `wefty logs <id> --follow` / `wefty cancel <id>`
+commands, and exits 13 because no command verdict is known. When the run has
+already ended at that point, the CLI reports its verdict and exits 0 or 10. `--detach` prints
+the run ID on stdout as soon as L3 accepts the captured run and exits 0 without
+watching. These flags are alternatives; combining them is a usage error.
+Neither mode cancels an accepted run, including acceptance recovered through
+public reads after an interrupted submission. Before submission, a signal
+still stops capture and creates no run. If acceptance remains uncertain,
+storage stays retained and the existing unavailable report applies.
+
+A continuing run's snapshot storage is retained. The wrapper and the next
+exec's startup sweep own cleanup after the CLI exits. An observing CLI can
+still remove storage after a confirmed terminal run; queued storage is never
+removed merely because watching ended.
+
+`--json` writes NDJSON to stdout with one event per line. Command stderr also
+travels in stdout JSON; CLI diagnostics, queued notices, and retention warnings
+stay on stderr. The event discriminator is `type`:
+
+| Type | Fields |
+| --- | --- |
+| `output` | `stream` (`stdout` or `stderr`), `text` (including its newline when present) |
+| `heartbeat` | `stream` (`stderr`), `text` (the wrapper's `still running (Nm)` or `still preparing the snapshot (Nm)` line) |
+| `finished` | `outcome`, `exit_code`, `run_id`, `base_commit`, `dirty`, `status`, optional `reason` |
+
+Raw log chunks may contain multiple lines; each text piece becomes an event.
+Complete liveness lines on stderr are classified as heartbeat events. This
+classification uses text, so a command that prints an identical line on stderr
+is also classified as a heartbeat. Heartbeat text shows wrapper liveness, not
+command progress. Log text is JSON-escaped. An incomplete UTF-8 character
+carries to the next event on the same stream; any remaining bytes are flushed
+before `finished`. Invalid UTF-8 follows Go's JSON replacement rule. Plain mode
+preserves the original bytes.
+
+All observed log output precedes `finished`. On normal terminal observation,
+the log cursor drains before the final event. `outcome=pass` or `fail` carries
+the command's `exit_code`: 0 on success, or the result document's code on
+failure. The wrapper ends with the command's exit code, so a succeeded run
+proves exit 0 even if result upload failed or has not arrived. Only failed runs
+wait for the result within the bounded recovery window. `dirty` states whether
+local changes were included.
+Cancellation, runtime/idle limits, infrastructure failures, or unavailable
+command results have a null `exit_code`; a wrapper or node failure is never
+reported as a command exit code. Outcomes are `cancelled`, `fail` for a recorded
+runtime/idle limit, and `infrastructure_error` for unavailable execution evidence.
+
+If log draining fails after terminal observation, the CLI warns on stderr
+and reports the known verdict. Unseen logs cannot be promised, but all delivered
+output still precedes `finished`.
+
+When watching stops or is lost before a terminal state, `finished` describes
+the last known run state, not a command failure: `queued` for pending/dispatching/queued runs, `running`
+for a running run, or `observation_lost` otherwise. Its command `exit_code` is
+null. A bounded fresh public read obtains the status when a signal came
+immediately after acceptance. A partial watch cannot promise unseen logs;
+`finished` ends this CLI's observation, not a continuing run.
+
+`--detach --json` writes exactly one line, `{"run_id":"..."}`, with no streaming
+events. Flags after `--` are command arguments, including all three new flags.
+Exit codes keep the existing policy: 0 on success/detach, 10 on a terminal run
+failure, 13 on infrastructure or unavailable observation, and existing usage
+and cancellation codes. JSON does not change the default signal cancellation
+policy.

@@ -2,16 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
-	"github.com/Derek-X-Wang/wefty/l3"
 )
 
 // Exec alone outlasts transient transport failures during a service restart.
@@ -41,13 +38,21 @@ func readExec[T any](caller context.Context, clients *apiClients, read func(cont
 	}
 }
 
-func observeExecRun(ctx context.Context, clients *apiClients, runID string, stdout, stderr io.Writer) (contract.RunRecord, error) {
+func observeExecRunOutput(ctx context.Context, clients *apiClients, runID string, jsonOutput bool, stdout, stderr io.Writer) (record contract.RunRecord, err error) {
+	var jsonLogs execJSONLogWriter
+	if jsonOutput {
+		defer func() {
+			if flushErr := jsonLogs.flush(stdout); flushErr != nil {
+				err = flushErr
+			}
+		}()
+	}
 	cursor := ""
 	var truncation truncationAnnouncer
 	started := time.Now()
 	announcedWaiting := false
-	var record contract.RunRecord
 	for {
+		wasTerminal := runIsTerminal(record.Status)
 		page, err := readExec(ctx, clients, func(readCtx context.Context) (l1.LogPage, error) {
 			return clients.getRunLogs(readCtx, runID, cursor, l1.DefaultLogPageLimit)
 		})
@@ -57,7 +62,12 @@ func observeExecRun(ctx context.Context, clients *apiClients, runID string, stdo
 		if err = truncation.announce(stderr, page.Truncation); err != nil {
 			return record, err
 		}
-		if err = writeLogEvents(stdout, stderr, page.Events); err != nil {
+		if jsonOutput {
+			err = jsonLogs.write(stdout, page.Events)
+		} else {
+			err = writeLogEvents(stdout, stderr, page.Events)
+		}
+		if err != nil {
 			return record, err
 		}
 		cursor = page.NextCursor
@@ -68,7 +78,12 @@ func observeExecRun(ctx context.Context, clients *apiClients, runID string, stdo
 			return record, err
 		}
 		record = nextRecord
-		if runIsTerminal(record.Status) && len(page.Events) == 0 {
+		// Once JSON has a terminal projection, finish draining logs even if
+		// a signal arrives. Preserve the plain observer's existing policy.
+		if jsonOutput && runIsTerminal(record.Status) {
+			ctx = context.WithoutCancel(ctx)
+		}
+		if runIsTerminal(record.Status) && len(page.Events) == 0 && (!jsonOutput || wasTerminal) {
 			return record, nil
 		}
 		if !announcedWaiting && queuedRunIsWaiting(record.Status) && time.Since(started) >= followWaitingNoticeAfter {
@@ -91,56 +106,23 @@ func lostExecObservation(stderr io.Writer, runID, storage string, cause error) e
 // Mailbox result delivery may trail terminal projection. Startup failures have
 // their own result field, so they cannot be mistaken for the command's exit code.
 func reportExecRun(ctx context.Context, clients *apiClients, record contract.RunRecord, stderr io.Writer) error {
-	// Once terminal state is known, a late signal cannot cancel that verdict.
-	// Result delivery still has one bounded recovery window.
-	ctx = context.WithoutCancel(ctx)
-	if record.Status == contract.RunFailed {
-		if record.CancelStatus != "" {
-			if _, err := fmt.Fprintln(stderr, "cancelled"); err != nil {
-				return err
-			}
-			return &runOutcomeError{runID: record.RunID, status: record.Status, reason: "cancelled"}
-		}
-		reason := runFailureReason(ctx, clients, record)
-		if strings.HasPrefix(reason, "maximum runtime reached") || strings.HasPrefix(reason, "idle limit reached") {
-			return reportTerminalRun(stderr, record, reason, false, false)
-		}
-		resultCtx, stop := context.WithTimeout(ctx, execReadRecoveryBudget)
-		defer stop()
-		for {
-			result, err := readExec(resultCtx, clients, func(readCtx context.Context) (l3.RunResult, error) {
-				return clients.getRunResult(readCtx, record.RunID)
-			})
-			if err == nil && len(result.Document) > 0 {
-				var document struct {
-					InfrastructureError string `json:"infrastructure_error"`
-					ExitCode            *int   `json:"exit_code"`
-				}
-				if json.Unmarshal(result.Document, &document) == nil {
-					if document.InfrastructureError != "" {
-						fmt.Fprintf(stderr, "wefty: infrastructure failure: %s\n", document.InfrastructureError)
-						return &unavailableError{cause: fmt.Errorf("run %s infrastructure failure: %s", record.RunID, document.InfrastructureError)}
-					}
-					if document.ExitCode != nil {
-						return reportTerminalRun(stderr, record, reason, false, false)
-					}
-				}
-				break
-			}
-			if err == nil && result.SkipReason != "" {
-				break
-			}
-			var response *apiResponseError
-			if err != nil && !(errors.As(err, &response) && response.APIError.Code == contract.ErrorNotFound) {
-				return &unavailableError{cause: fmt.Errorf("run %s ended; could not read its result: %w", record.RunID, err)}
-			}
-			if clients.wait(resultCtx, 100*time.Millisecond) != nil {
-				break
-			}
-		}
-		// Without a result, an exit 1 may have been wrapper startup rather
-		// than the command. Do not turn unavailable evidence into exit 10.
-		return &unavailableError{cause: fmt.Errorf("run %s ended; command result unavailable; inspect with `wefty inspect %s --execution`", record.RunID, record.RunID)}
+	// Plain success keeps its existing policy: terminal projection is enough.
+	if record.Status != contract.RunFailed {
+		return reportTerminalRun(stderr, record, runFailureReason(context.WithoutCancel(ctx), clients, record), false, false)
 	}
-	return reportTerminalRun(stderr, record, runFailureReason(ctx, clients, record), false, false)
+	event, result := resolveExecFinished(ctx, clients, record, execCapture{})
+	if event.Outcome == "cancelled" {
+		if _, err := fmt.Fprintln(stderr, "cancelled"); err != nil {
+			return err
+		}
+		return result
+	}
+	var unavailable *unavailableError
+	if errors.As(result, &unavailable) {
+		if event.infrastructureFailure {
+			fmt.Fprintf(stderr, "wefty: infrastructure failure: %s\n", event.Reason)
+		}
+		return result
+	}
+	return reportTerminalRun(stderr, record, event.Reason, false, false)
 }
