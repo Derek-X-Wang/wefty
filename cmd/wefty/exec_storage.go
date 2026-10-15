@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -16,9 +18,16 @@ const execOrphanAge = time.Hour
 
 func prepareExecStorageRoot(root string) error {
 	if err := os.MkdirAll(root, 0700); err != nil {
-		return err
+		return execStorageWriteError(root, err)
 	}
-	return os.Chmod(root, 0700)
+	return execStorageWriteError(root, os.Chmod(root, 0700))
+}
+
+func execStorageWriteError(root string, err error) error {
+	if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS) {
+		return fmt.Errorf("cannot write exec snapshot folder %q; a sandboxed AI agent must allow writes to this folder (see the wefty skill: skills/wefty/SKILL.md)", root)
+	}
+	return err
 }
 
 func recordExecStorageRun(storage, runID string, stderr io.Writer) {
@@ -31,34 +40,34 @@ func recordExecStorageRun(storage, runID string, stderr io.Writer) {
 // Sweep only immediate capture directories. Unverifiable runs, symlinks, and
 // young unaccepted captures stay intact. Every probe and removal shares the
 // same deadline, and directory enumeration itself is capped at 64 entries.
-func sweepExecStorage(caller context.Context, clients *apiClients, stderr io.Writer) {
+func sweepExecStorage(caller context.Context, clients *apiClients, stderr io.Writer) error {
 	ctx, stop := context.WithTimeout(withoutClientRetry(caller), execSweepBudget)
 	defer stop()
 	warn := func(err error) { fmt.Fprintf(stderr, "wefty: warning: exec storage sweep: %v\n", err) }
 	root, err := execStorageRoot()
 	if err != nil {
-		warn(err)
-		return
+		return err
 	}
 	if err = prepareExecStorageRoot(root); err != nil {
-		warn(err)
-		return
+		// Root preparation is also required for the new capture. Let the
+		// caller report it once rather than warning and then failing again.
+		return err
 	}
 	dir, err := os.Open(root)
 	if err != nil {
 		warn(err)
-		return
+		return nil
 	}
 	defer dir.Close()
 	entries, err := dir.ReadDir(execSweepLimit)
 	if err != nil && err != io.EOF {
 		warn(err)
-		return
+		return nil
 	}
 	for _, entry := range entries {
 		if ctx.Err() != nil {
 			warn(ctx.Err())
-			return
+			return nil
 		}
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "wefty-exec-") {
 			continue
@@ -68,6 +77,7 @@ func sweepExecStorage(caller context.Context, clients *apiClients, stderr io.Wri
 			warn(err)
 		}
 	}
+	return nil
 }
 
 func sweepExecCapture(ctx context.Context, clients *apiClients, storage string) error {
