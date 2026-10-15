@@ -2045,7 +2045,19 @@ single total. All seven authority labels must reconstruct the deterministic
 identity exactly; unexpected containerd resources in namespace `wefty`, shim
 bundle entries under containerd's runtime-v2 state root, and cgroups found by a
 recursive scan of the configured cgroup hierarchy make absence verification
-fail. After containerd task deletion, sweep acts only on a cgroup bound to a
+fail. Sweep and attempt `Delete` remove a container's task, and with it the
+shim containerd runs for that task, before they delete the container record.
+containerd's task service reaches a task only through its container record. A
+task delete abandoned mid-flight, for example by a helper killed inside it, can
+leave a shim that has deleted its process but still runs and keeps its bundle.
+containerd's task lookup then reports the task gone. So whenever that lookup
+or the task delete answers not-found, removal asks containerd's task service to
+delete the task directly. Only a not-found or successful answer lets the
+record go. Any other answer keeps the record, so a later sweep can retry
+through it, and fails removal with a typed task-release refusal. A shim bundle
+whose container record is already gone is out of the helper's reach through
+containerd. It stays residue, and absence verification keeps failing on it.
+After containerd task deletion, sweep acts only on a cgroup bound to a
 durable LOST Attempt record. Observation remains broad for compatible CRI,
 systemd-composed, and pre-upgrade names containing `wefty-cgroup-`; inventory
 and sweep both descend through broad matches so an exact bound child cannot be
