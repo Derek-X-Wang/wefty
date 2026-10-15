@@ -1731,6 +1731,13 @@ func (runner completionStopProbeRunner) Run(_ context.Context, request processru
 
 func TestCompletionDirectiveDoesNotHideDurabilityFailure(t *testing.T) {
 	client, stopServer := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		// A process one-shot's start acknowledgement runs beside the payload
+		// and is only advisory (#945); it may or may not arrive before the
+		// failure. Refusing it changes nothing here.
+		if strings.HasSuffix(request.URL.Path, "/started") {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		t.Errorf("durability failure reached protocol delivery: %s", request.URL.Path)
 	}), time.Second)
 	defer stopServer()

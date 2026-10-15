@@ -379,7 +379,10 @@ func (manager Manager) restore(ctx context.Context, folder *os.Root, path, label
 
 // waitUnloaded waits for launchd to confirm it has forgotten label: bootout
 // can return while the service is still being torn down, and bootstrapping
-// then fails. An inspection failure is not that confirmation.
+// then fails. An inspection failure is not that confirmation. launchd's
+// confirmation counts even when it arrives at the bound; past the bound, the
+// error reports launchd's last answer, and "still loaded" only after launchd
+// said so.
 func (manager Manager) waitUnloaded(ctx context.Context, label string) error {
 	bound := manager.UnloadBound
 	if bound <= 0 {
@@ -393,13 +396,16 @@ func (manager Manager) waitUnloaded(ctx context.Context, label string) error {
 	defer cancel()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// lastErr is why the latest check did not confirm the unload, and nil
+	// after launchd answered "loaded". A check the bound cut off gave no
+	// answer, so its failure counts only when no check came before it.
 	var lastErr error
-	for {
+	for checks := 0; ; checks++ {
 		state, err := manager.State(waitContext, label)
-		if err == nil && !state.Loaded && waitContext.Err() == nil {
+		if err == nil && !state.Loaded {
 			return nil
 		}
-		if err != nil && waitContext.Err() == nil {
+		if err == nil || waitContext.Err() == nil || checks == 0 {
 			lastErr = err
 		}
 		select {
