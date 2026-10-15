@@ -130,9 +130,12 @@ func newSetupFixture(t *testing.T) *setupFixture {
 	return fixture
 }
 
+// writeBinary writes a stand-in that answers `--version` the way the real
+// binaries do, so setup records version for the four of them.
 func (fixture *setupFixture) writeBinary(t *testing.T, name, version string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(fixture.source, name), []byte("#!/bin/sh\necho "+name+" "+version+"\n"), 0o755); err != nil {
+	script := "#!/bin/sh\nif [ \"$1\" = --version ]; then echo " + version + "; exit 0; fi\necho " + name + " " + version + "\n"
+	if err := os.WriteFile(filepath.Join(fixture.source, name), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 }

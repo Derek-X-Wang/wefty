@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
@@ -31,8 +32,24 @@ import (
 )
 
 const upgradeRemote = "https://github.com/Derek-X-Wang/wefty.git"
-const upgradeLeaseBudget = 20 * time.Second
 const upgradeSourceName = "upgrade-source.git"
+
+// The renewal window starts just before L1 restarts. Only a node heartbeat
+// newer than both restarts counts as renewal evidence, so the window holds the
+// two restarts and then one full heartbeat interval. The installed node agent
+// heartbeats every agent.DefaultHeartbeatInterval: setup's plist passes no
+// --heartbeat-interval and the connection profile carries none. The window
+// stays well under the 30 s lease (l1.DefaultLeaseDuration); a test holds it.
+const (
+	upgradeHeartbeatInterval = agent.DefaultHeartbeatInterval
+	// upgradeReloadAllowance covers restarting L1 and the run ledger and
+	// observing the node afterwards.
+	upgradeReloadAllowance = 8 * time.Second
+	upgradeRenewalWindow   = upgradeReloadAllowance + upgradeHeartbeatInterval
+	// upgradeReplacementBudget bounds the replacement node agent's new boot
+	// session and first heartbeat.
+	upgradeReplacementBudget = 20 * time.Second
+)
 
 // These machine operations extend setupHost, rather than adding public flags.
 // Tests use a local bare repository, a fake build, runner and clock.
@@ -94,7 +111,9 @@ func executeUpgradeWithHost(ctx context.Context, host setupHost, options globalO
 			nodeMessage = "Node agent unchanged."
 		}
 	}
-	_, err = fmt.Fprintf(stdout, "Installed version: %s\nSuccessful node lease renewal after control-plane restart: %s (budget %s).\n%s\n", report.Version, report.LeaseRenewal, upgradeLeaseBudget, nodeMessage)
+	// The renewal line was already printed when it was observed, so a later
+	// node agent failure still shows it. The summary does not repeat it.
+	_, err = fmt.Fprintf(stdout, "Installed version: %s\n%s\n", report.Version, nodeMessage)
 	return err
 }
 
@@ -344,7 +363,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	request.serviceContext = func(index int) context.Context {
 		if index == 0 {
 			started = operations.now()
-			controlCtx, cancelControls = context.WithTimeout(ctx, upgradeLeaseBudget)
+			controlCtx, cancelControls = context.WithTimeout(ctx, upgradeRenewalWindow)
 		}
 		if index < 2 {
 			return controlCtx
@@ -360,7 +379,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 			if err != nil {
 				return err
 			}
-			if _, err := fmt.Fprintf(warnings, "Successful node lease renewal after control-plane restart: %s (budget %s).\n", elapsed, upgradeLeaseBudget); err != nil {
+			if _, err := fmt.Fprintf(warnings, "Successful node lease renewal after control-plane restart: %s (window %s).\n", elapsed, upgradeRenewalWindow); err != nil {
 				return err
 			}
 		}
@@ -589,7 +608,7 @@ func observeUpgradeJob(ctx context.Context, profile connprofile.Profile, jobID s
 
 func waitUpgradeRenewal(ctx context.Context, operations upgradeHost, profile connprofile.Profile, baseline l1.Node, started, restarted time.Time) (time.Duration, error) {
 	var lastErr error
-	for operations.now().Sub(started) < upgradeLeaseBudget && ctx.Err() == nil {
+	for operations.now().Sub(started) < upgradeRenewalWindow && ctx.Err() == nil {
 		node, err := operations.observe(ctx, profile)
 		if err == nil && node.BootSessionID == baseline.BootSessionID && node.AuthorityGeneration == baseline.AuthorityGeneration && node.LastHeartbeatAt.After(restarted) {
 			renewed := true
@@ -607,7 +626,7 @@ func waitUpgradeRenewal(ctx context.Context, operations upgradeHost, profile con
 				}
 			}
 			elapsed := operations.now().Sub(started)
-			if renewed && elapsed < upgradeLeaseBudget && ctx.Err() == nil {
+			if renewed && elapsed < upgradeRenewalWindow && ctx.Err() == nil {
 				return elapsed, nil
 			}
 		}
@@ -619,17 +638,17 @@ func waitUpgradeRenewal(ctx context.Context, operations upgradeHost, profile con
 			break
 		}
 	}
-	return operations.now().Sub(started), fmt.Errorf("no successful node lease renewal within %s after restarting L1 and the run ledger (last observation: %v)", upgradeLeaseBudget, lastErr)
+	return operations.now().Sub(started), fmt.Errorf("no successful node lease renewal within %s after restarting L1 and the run ledger (last observation: %v)", upgradeRenewalWindow, lastErr)
 }
 
 func waitUpgradeReplacement(ctx context.Context, operations upgradeHost, profile connprofile.Profile, oldBoot, commit string, action launchagent.Action) error {
 	if action == launchagent.Unchanged {
 		return nil
 	}
-	budget, cancel := context.WithTimeout(ctx, upgradeLeaseBudget)
+	budget, cancel := context.WithTimeout(ctx, upgradeReplacementBudget)
 	defer cancel()
 	started := operations.now()
-	for operations.now().Sub(started) < upgradeLeaseBudget && budget.Err() == nil {
+	for operations.now().Sub(started) < upgradeReplacementBudget && budget.Err() == nil {
 		node, err := operations.observe(budget, profile)
 		if err == nil && node.BootSessionID != "" && node.BootSessionID != oldBoot && node.AgentVersion == commit && node.State == contract.NodeAlive && node.LastHeartbeatAt.After(started) {
 			return nil
@@ -638,7 +657,7 @@ func waitUpgradeReplacement(ctx context.Context, operations upgradeHost, profile
 			break
 		}
 	}
-	return errors.New("replacement node agent did not become healthy within 20s")
+	return fmt.Errorf("replacement node agent did not become healthy within %s", upgradeReplacementBudget)
 }
 
 // Save installation files only. No database copy is ever kept for rollback.

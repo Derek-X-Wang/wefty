@@ -49,6 +49,22 @@ func TestUpgradeRealBinariesReportCommitAndPreflightCopies(t *testing.T) {
 			}
 		})
 	}
+	// Setup asks these real binaries for their version through the default
+	// runner and records it; status shows it.
+	t.Run("setup-records-version", func(t *testing.T) {
+		f := newSetupFixture(t)
+		report, err := runSetup(t.Context(), f.host, setupRequest{from: destination})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if receipt := readSetupReceipt(t, f.home); receipt.InstalledVersion != commit {
+			t.Fatalf("setup receipt installed_version = %q, want %q", receipt.InstalledVersion, commit)
+		}
+		if notes := strings.Join(report.Notes, "\n"); strings.Contains(notes, "installed version") {
+			t.Fatalf("setup notes = %v", report.Notes)
+		}
+		assertStatusShowsVersion(t, f.home, report.NodeID, commit)
+	})
 	for _, name := range []string{"wefty-l1", "wefty-l3"} {
 		t.Run(name+"-preflight", func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "copy.sqlite")
