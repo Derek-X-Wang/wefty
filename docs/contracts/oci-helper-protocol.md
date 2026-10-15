@@ -968,7 +968,7 @@ configuration, image-rootfs user/group databases, guest architecture/kernel
 facts, resolver and hosts files, translated Lima mount paths, namespace/device
 policy, and OCI JSON never cross from the agent.
 
-The privileged adapter constructs `wefty-v1` from containerd v2.3.6's generated
+The privileged adapter constructs `wefty-v1` from containerd v2.3.7's generated
 Linux baseline, then replaces every security-sensitive field explicitly. It
 resolves the image `USER` and supplemental groups from the pinned guest rootfs;
 sets the fixed capability sets, `noNewPrivileges`, containerd default seccomp,
@@ -980,8 +980,12 @@ workloads or read-only rootfs for Computers; and serializes
 cgroup-v2 memory/CPU limits when present. A memory limit also sets OCI swap to
 the same value, producing `memory.swap.max=0` on cgroup v2 rather than leaving a
 swap escape. `Resources.Pids` remains absent in M3; the missing PID limit is a
-known profile gap, not an implicit default. The helper attaches a point-to-point
-veth, brings the Computer namespace's loopback and veth interfaces up, installs
+known profile gap, not an implicit default. Since containerd v2.3.7 the default
+seccomp allows `socket(2)` only for a listed set of Linux address families;
+`AF_ALG`, `AF_VSOCK` and undefined families fail. wefty adds no family:
+workloads use Unix, IPv4, IPv6 and netlink sockets, and the Computer firewall
+and DNS proxy below run in the helper, outside the profile. The helper attaches
+a point-to-point veth, brings the Computer namespace's loopback and veth interfaces up, installs
 a default route, disables IPv6 through the namespace `all` and `default`
 sysctls, and masquerades the exact Computer IPv4 address through the Node/VM.
 Computer `/30`s use RFC 2544 benchmarking space `198.18.0.0/15`; endpoint port
@@ -1094,11 +1098,11 @@ The baseline `RLIMIT_NOFILE` soft/hard value of 1024 remains containerd's pinned
 default and is an explicit M3 decision; raising it needs workload evidence and
 a profile amendment. Opportunistic AppArmor names use the closed
 `[A-Za-z0-9][A-Za-z0-9_.-]{0,127}` shape. The `ociVersion` remains the linked
-runtime-spec v1.3.0 used by containerd v2.3.6 and the runc v2 shim targeted by
+runtime-spec v1.3.0 used by containerd v2.3.7 and the runc v2 shim targeted by
 #141; it is not versioned independently.
 
 The serialized fixtures under
-`runner/ocihelper/testdata/containerd-v2.3.6/` are the review boundary for
+`runner/ocihelper/testdata/containerd-v2.3.7/` are the review boundary for
 native Linux amd64, Lima Linux arm64, service mounts/environment, default-root,
 numeric-user, unlimited-resource, and the complete Computer profile. The
 Computer fixture proves image USER/ENTRYPOINT/CMD semantics, the unchanged

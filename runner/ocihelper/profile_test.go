@@ -24,7 +24,7 @@ func TestRuntimeSpecGoldens(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			input := goldenRuntimeSpecInput(t, test.architecture)
 			test.configure(&input)
-			seccompFixture := filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-"+test.architecture+".json")
+			seccompFixture := filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-"+test.architecture+".json")
 			dependencies := goldenDependencies(t, seccompFixture)
 			regenerate := os.Getenv("UPDATE_OCI_PROFILE_GOLDENS") == "1" && runtime.GOOS == "linux" && runtime.GOARCH == test.architecture
 			if regenerate {
@@ -40,7 +40,7 @@ func TestRuntimeSpecGoldens(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			goldenPath := filepath.Join("testdata", "containerd-v2.3.6", test.golden)
+			goldenPath := filepath.Join("testdata", "containerd-v2.3.7", test.golden)
 			actual := redactSensitiveEnvironment(t, marshalRuntimeSpecIndented(t, spec), input.Workload.SensitiveEnvironment)
 			if regenerate {
 				if err := os.WriteFile(goldenPath, actual, 0o644); err != nil {
@@ -139,11 +139,88 @@ func TestContainerdBaselineVersionPinned(t *testing.T) {
 	}
 }
 
+// containerd v2.3.7 turned the default profile's socket(2) rule into an
+// allow-list of address families (containerd#14248). One-shots, services and
+// Computers run under that profile; process services never do. Their families
+// are Unix sockets (X11, Wayland, D-Bus), IPv4/IPv6 (view, control and DNS
+// endpoints) and netlink (route and address queries), so wefty adds no family
+// of its own. The Computer firewall and DNS proxy run in the helper, outside
+// the profile. The Linux oracle pins these fixtures to the real generator.
+func TestContainerdSeccompSocketDomainsServeWeftyWorkloads(t *testing.T) {
+	// Linux UAPI values: the test host's x/sys/unix may not be Linux's.
+	required := map[string]uint64{"AF_UNIX": 1, "AF_INET": 2, "AF_INET6": 10, "AF_NETLINK": 16}
+	denied := map[string]uint64{"AF_ALG": 38, "AF_VSOCK": 40, "AF_MAX (first undefined family)": 46}
+	for _, architecture := range []string{"amd64", "arm64"} {
+		t.Run(architecture, func(t *testing.T) {
+			payload, err := os.ReadFile(filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-"+architecture+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var profile specs.LinuxSeccomp
+			if err := json.Unmarshal(payload, &profile); err != nil {
+				t.Fatal(err)
+			}
+			if profile.DefaultAction != specs.ActErrno {
+				t.Fatalf("default action = %q, want %q", profile.DefaultAction, specs.ActErrno)
+			}
+			for name, domain := range required {
+				if !seccompAllowsSocketDomain(t, profile, domain) {
+					t.Errorf("socket(%s=%d) is denied; wefty workloads need it", name, domain)
+				}
+			}
+			for name, domain := range denied {
+				if seccompAllowsSocketDomain(t, profile, domain) {
+					t.Errorf("socket(%s=%d) is allowed by the containerd default", name, domain)
+				}
+			}
+		})
+	}
+}
+
+// seccompAllowsSocketDomain applies the profile's socket rules as libseccomp
+// does: any matching ALLOW rule admits the call, otherwise the default errno
+// action applies. Rule shapes it does not model fail the test.
+func seccompAllowsSocketDomain(t *testing.T, profile specs.LinuxSeccomp, domain uint64) bool {
+	t.Helper()
+	for _, rule := range profile.Syscalls {
+		if !slices.Contains(rule.Names, "socket") {
+			continue
+		}
+		if rule.Action != specs.ActAllow || len(rule.Args) > 1 {
+			t.Fatalf("socket rule %+v is outside this test's model", rule)
+		}
+		if len(rule.Args) == 0 {
+			return true
+		}
+		argument := rule.Args[0]
+		if argument.Index != 0 {
+			t.Fatalf("socket rule %+v filters an argument other than the domain", rule)
+		}
+		switch argument.Op {
+		case specs.OpLessThan:
+			if domain < argument.Value {
+				return true
+			}
+		case specs.OpEqualTo:
+			if domain == argument.Value {
+				return true
+			}
+		case specs.OpGreaterThan:
+			if domain > argument.Value {
+				return true
+			}
+		default:
+			t.Fatalf("socket rule operator %q is outside this test's model", argument.Op)
+		}
+	}
+	return false
+}
+
 func TestCanonicalDocumentCrossesContainerdBoundaryWithoutReserialization(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
 	input.Workload.Limits.MemoryBytes = math.MaxInt64
 	spec, err := buildRuntimeSpec(context.Background(), input,
-		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json")))
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +258,7 @@ func TestCanonicalDocumentCrossesContainerdBoundaryWithoutReserialization(t *tes
 
 func TestNamedAndNumericImageUsersChooseDifferentSupplementalLookup(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
-	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json"))
+	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json"))
 	named, err := buildRuntimeSpec(context.Background(), input, dependencies)
 	if err != nil {
 		t.Fatal(err)
@@ -325,7 +402,7 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	input.ManagedVolumeSources = map[ManagedVolumeKind]string{ManagedVolumeComputerDisk: "/run/wefty/fixtures/computer-disk"}
 	input.ComputerControlSource = "/run/wefty/fixtures/control"
 	spec, err := buildRuntimeSpec(context.Background(), input,
-		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json")))
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -426,7 +503,7 @@ func TestOperatorMountsSortParentsBeforeChildren(t *testing.T) {
 	}
 	input.OperatorMountSources = []string{"/mnt/wefty/operator/child", "/mnt/wefty/operator/parent"}
 	spec, err := buildRuntimeSpec(context.Background(), input,
-		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json")))
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +552,7 @@ func TestHelperTranslatesOperatorMountSourcesBeforeGuestValidation(t *testing.T)
 func TestRuntimeSpecHasNoRawDefaultsOrEscapeHatches(t *testing.T) {
 	input := goldenRuntimeSpecInput(t, "amd64")
 	spec, err := buildRuntimeSpec(context.Background(), input,
-		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json")))
+		goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,7 +844,7 @@ func TestRuntimeSpecConstructionRejectsEveryInvalidBranch(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			input := goldenRuntimeSpecInput(t, "amd64")
-			dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json"))
+			dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json"))
 			if test.mutateInput != nil {
 				test.mutateInput(&input)
 			}
@@ -835,7 +912,7 @@ func TestComputerIdentityMountSourcesCrossValidationBoundary(t *testing.T) {
 			break
 		}
 	}
-	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json"))
+	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json"))
 	machineID := computerStorageIdentityAt(input.ManagedVolumeSources[ManagedVolumeComputerDisk]).MachineID
 	seen := map[string]bool{}
 	dependencies.validateSource = func(path string, _ []string, regularOnly bool) error {
@@ -892,7 +969,7 @@ func TestRuntimeSpecDocumentRejectsMountSwapAfterBuild(t *testing.T) {
 	input.OperatorMountSources = []string{translatedSource}
 
 	retained := &retainedMountSources{}
-	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.6", "seccomp-linux-amd64.json"))
+	dependencies := goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json"))
 	dependencies.validateSource = retained.validate
 	spec, err := buildRuntimeSpec(context.Background(), input, dependencies)
 	if err != nil {
