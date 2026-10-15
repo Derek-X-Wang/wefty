@@ -200,6 +200,81 @@ func TestConvergeNeedsAConfirmedAnswerFromLaunchd(t *testing.T) {
 	plist.assertOnly(t, "old")
 }
 
+// launchd's confirmed "no such service" ends the unload wait even when it
+// arrives at the bound. Past the bound, the error reports launchd's last
+// answer: "still loaded" only after launchd said so, and "not confirmed"
+// after a failed check or none that answered. A check the bound cuts off
+// gave no answer.
+//
+// The test ends the wait itself: it cancels Unload's context during the
+// check after the scripted ones, so the bound passes at a fixed point in the
+// script and no case races the clock. waitUnloaded sees a cancelled wait as
+// it sees an expired bound.
+func TestUnloadReportsLaunchdsLastAnswerAtTheBound(t *testing.T) {
+	type answer func(ctx context.Context) ([]byte, error)
+	output := []byte("gui/501/dev.wefty.test = {\n\tstate = running\n}\n")
+	absent := fmt.Errorf("%w: Could not find service", ErrServiceNotFound)
+	var (
+		loaded      answer = func(context.Context) ([]byte, error) { return output, nil }
+		notFound    answer = func(context.Context) ([]byte, error) { return nil, absent }
+		interrupted answer = func(context.Context) ([]byte, error) { return nil, errors.New("launchctl: connection interrupted") }
+		cutOff      answer = func(ctx context.Context) ([]byte, error) { return nil, ctx.Err() }
+	)
+	for _, test := range []struct {
+		name string
+		// before answers the checks after bootout, in order, within the
+		// bound; atBound answers the next check, during which it passes.
+		before  []answer
+		atBound answer
+		wantErr string
+	}{
+		{name: "not found at the bound", before: []answer{loaded}, atBound: notFound},
+		{name: "loaded at the bound", before: []answer{loaded}, atBound: loaded, wantErr: "still loaded"},
+		{name: "loaded, then cut off by the bound", before: []answer{loaded, loaded}, atBound: cutOff, wantErr: "still loaded"},
+		{name: "loaded after a failure", before: []answer{interrupted, loaded}, atBound: cutOff, wantErr: "still loaded"},
+		{name: "failing until the bound", before: []answer{interrupted, interrupted}, atBound: cutOff, wantErr: "not confirmed unloaded"},
+		{name: "failing after a loaded answer", before: []answer{loaded, interrupted}, atBound: cutOff, wantErr: "not confirmed unloaded"},
+		{name: "no answer before the bound", atBound: cutOff, wantErr: "not confirmed unloaded"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, endWait := context.WithCancel(t.Context())
+			defer endWait()
+			bootedOut, checks := false, 0
+			manager := Manager{UID: 501, PollInterval: time.Millisecond, UnloadBound: time.Hour}
+			manager.Run = func(waitContext context.Context, _ string, args ...string) ([]byte, error) {
+				switch {
+				case args[0] == "bootout":
+					bootedOut = true
+					return nil, nil
+				case args[0] == "print" && !bootedOut:
+					return output, nil
+				case args[0] != "print":
+					return nil, fmt.Errorf("unexpected launchctl %v", args)
+				}
+				checks++
+				switch {
+				case checks <= len(test.before):
+					return test.before[checks-1](waitContext)
+				case checks == len(test.before)+1:
+					endWait()
+					<-waitContext.Done()
+					return test.atBound(waitContext)
+				}
+				// A poll after the bound runs launchctl with an expired
+				// context, which answers nothing.
+				return cutOff(waitContext)
+			}
+			err := manager.Unload(ctx, "dev.wefty.test")
+			if test.wantErr == "" && err != nil || test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
+				t.Fatalf("unload = %v, want %q", err, test.wantErr)
+			}
+			if !bootedOut || checks <= len(test.before) {
+				t.Fatalf("bootout=%t; %d checks after it ran, want the %d scripted and the one at the bound", bootedOut, checks, len(test.before))
+			}
+		})
+	}
+}
+
 // If publishing fails after the unload -- before or after the rename -- the
 // previous definition is put back and loaded, and the next run reloads.
 func TestConvergeRestoresThePreviousDefinitionWhenPublishFails(t *testing.T) {
