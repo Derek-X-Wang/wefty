@@ -25,7 +25,7 @@ description: Development conventions for working on the wefty codebase itself â€
 gofmt -l . | (! grep .)               # formatting
 bash scripts/check-fabric-boundary.sh # tailscale imports only in fabric/tsnet
 go vet ./...
-go test ./...
+go test -timeout 30m ./...            # cmd/wefty outlasts the 10m default
 cd workflows/dogfood && npm ci && npm run lint && npm run typecheck && npm test && npm run build
 ```
 
