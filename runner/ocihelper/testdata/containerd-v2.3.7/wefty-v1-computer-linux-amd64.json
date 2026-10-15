@@ -1,6 +1,6 @@
 {
   "linux": {
-    "cgroupsPath": "/wefty/golden-service-amd64",
+    "cgroupsPath": "/wefty/golden-computer-amd64",
     "devices": [
       {
         "fileMode": 438,
@@ -85,6 +85,9 @@
       },
       {
         "type": "cgroup"
+      },
+      {
+        "type": "network"
       }
     ],
     "readonlyPaths": [
@@ -150,6 +153,9 @@
       "memory": {
         "limit": 536870912,
         "swap": 536870912
+      },
+      "unified": {
+        "memory.oom.group": "1"
       }
     },
     "seccomp": {
@@ -559,8 +565,60 @@
           "args": [
             {
               "index": 0,
-              "op": "SCMP_CMP_GT",
-              "value": 40
+              "op": "SCMP_CMP_EQ",
+              "value": 41
+            }
+          ],
+          "names": [
+            "socket"
+          ]
+        },
+        {
+          "action": "SCMP_ACT_ALLOW",
+          "args": [
+            {
+              "index": 0,
+              "op": "SCMP_CMP_EQ",
+              "value": 42
+            }
+          ],
+          "names": [
+            "socket"
+          ]
+        },
+        {
+          "action": "SCMP_ACT_ALLOW",
+          "args": [
+            {
+              "index": 0,
+              "op": "SCMP_CMP_EQ",
+              "value": 43
+            }
+          ],
+          "names": [
+            "socket"
+          ]
+        },
+        {
+          "action": "SCMP_ACT_ALLOW",
+          "args": [
+            {
+              "index": 0,
+              "op": "SCMP_CMP_EQ",
+              "value": 44
+            }
+          ],
+          "names": [
+            "socket"
+          ]
+        },
+        {
+          "action": "SCMP_ACT_ALLOW",
+          "args": [
+            {
+              "index": 0,
+              "op": "SCMP_CMP_EQ",
+              "value": 45
             }
           ],
           "names": [
@@ -718,7 +776,7 @@
         "noexec",
         "nodev",
         "mode=1777",
-        "size=65536k"
+        "size=1048576k"
       ],
       "source": "shm",
       "type": "tmpfs"
@@ -794,13 +852,61 @@
       "type": "bind"
     },
     {
+      "destination": "/wefty/control",
+      "options": [
+        "rbind",
+        "rro",
+        "rprivate",
+        "nosuid",
+        "nodev",
+        "noexec"
+      ],
+      "source": "/run/wefty/fixtures/control",
+      "type": "bind"
+    },
+    {
+      "destination": "/tmp",
+      "options": [
+        "nosuid",
+        "nodev",
+        "mode=1777",
+        "size=524288k"
+      ],
+      "source": "tmpfs",
+      "type": "tmpfs"
+    },
+    {
+      "destination": "/var/tmp",
+      "options": [
+        "nosuid",
+        "nodev",
+        "mode=1777",
+        "size=65536k"
+      ],
+      "source": "tmpfs",
+      "type": "tmpfs"
+    },
+    {
       "destination": "/wefty/service",
       "options": [
         "rbind",
         "rw",
         "rprivate"
       ],
-      "source": "/run/wefty/fixtures/service",
+      "source": "/run/wefty/fixtures/computer-disk",
+      "type": "bind"
+    },
+    {
+      "destination": "/etc/machine-id",
+      "options": [
+        "rbind",
+        "rro",
+        "rprivate",
+        "nosuid",
+        "nodev",
+        "noexec"
+      ],
+      "source": "/run/wefty/fixtures/computer-disk/etc/machine-id",
       "type": "bind"
     }
   ],
@@ -863,8 +969,8 @@
       "WEFTY_CUSTOM=preserved",
       "SECRET_TOKEN=\u003credacted\u003e",
       "WEFTY_SERVICE_DIR=/wefty/service",
-      "WEFTY_SERVICE_PORT=42100",
-      "WEFTY_RUN_TOKEN=authoritative-service-token"
+      "WEFTY_COMPUTER_VIEW_PORT=42111",
+      "WEFTY_COMPUTER_CONTROL_PORT=42112"
     ],
     "noNewPrivileges": true,
     "rlimits": [
@@ -886,6 +992,6 @@
   },
   "root": {
     "path": "rootfs",
-    "readonly": false
+    "readonly": true
   }
 }

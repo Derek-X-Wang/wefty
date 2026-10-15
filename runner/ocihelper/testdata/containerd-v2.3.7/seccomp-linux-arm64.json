@@ -1,9 +1,8 @@
 {
   "defaultAction": "SCMP_ACT_ERRNO",
   "architectures": [
-    "SCMP_ARCH_X86_64",
-    "SCMP_ARCH_X86",
-    "SCMP_ARCH_X32"
+    "SCMP_ARCH_ARM",
+    "SCMP_ARCH_AARCH64"
   ],
   "syscalls": [
     {
@@ -408,8 +407,60 @@
       "args": [
         {
           "index": 0,
-          "value": 40,
-          "op": "SCMP_CMP_GT"
+          "value": 41,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 42,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 43,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 44,
+          "op": "SCMP_CMP_EQ"
+        }
+      ]
+    },
+    {
+      "names": [
+        "socket"
+      ],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 45,
+          "op": "SCMP_CMP_EQ"
         }
       ]
     },
@@ -488,8 +539,12 @@
     },
     {
       "names": [
-        "arch_prctl",
-        "modify_ldt"
+        "arm_fadvise64_64",
+        "arm_sync_file_range",
+        "sync_file_range2",
+        "breakpoint",
+        "cacheflush",
+        "set_tls"
       ],
       "action": "SCMP_ACT_ALLOW"
     },

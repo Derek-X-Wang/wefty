@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -125,18 +127,27 @@ func TestWorkflowInitTypeScriptWritesTheDogfoodShape(t *testing.T) {
 }
 
 // TestTypeScriptScaffoldPinsTheDogfoodToolchain keeps the starter on the
-// toolchain the dogfood workflow is proven with. A bump there must be a bump
-// here, and the lockfile has to agree with the manifest or `npm ci` refuses it.
+// toolchain the dogfood workflow is proven with. The pins and the whole
+// lockfile are derived from workflows/dogfood/package-lock.json (#952), so a
+// Dependabot bump there lands here with no second edit. This test proves the
+// derivation against the dogfood files on disk, and that the lockfile agrees
+// with the manifest, or `npm ci` refuses it.
 func TestTypeScriptScaffoldPinsTheDogfoodToolchain(t *testing.T) {
 	parent, _ := initWorkflow(t, "pins", "--lang", "ts")
 	target := filepath.Join(parent, "pins")
 	manifest := readManifest(t, filepath.Join(target, "package.json"))
-	dogfood := readManifest(t, filepath.Join("..", "..", "workflows", "dogfood", "package.json"))
+	dogfoodDirectory := filepath.Join("..", "..", "workflows", "dogfood")
+	dogfood := readManifest(t, filepath.Join(dogfoodDirectory, "package.json"))
+	dogfoodLock := readLockPackages(t, filepath.Join(dogfoodDirectory, "package-lock.json"))
 
 	for _, tool := range []string{"esbuild", "typescript", "@types/node"} {
 		pinned := manifest.DevDependencies[tool]
-		if pinned == "" || pinned != dogfood.DevDependencies[tool] {
-			t.Fatalf("%s is pinned at %q; workflows/dogfood pins %q", tool, pinned, dogfood.DevDependencies[tool])
+		if dogfood.DevDependencies[tool] == "" {
+			t.Fatalf("workflows/dogfood no longer has %s as a devDependency", tool)
+		}
+		resolved := dogfoodLock["node_modules/"+tool]
+		if resolved == nil || pinned != resolved.Version || !exactVersion.MatchString(pinned) {
+			t.Fatalf("%s is pinned at %q; workflows/dogfood installs %+v", tool, pinned, resolved)
 		}
 	}
 	if len(manifest.DevDependencies) != 3 {
@@ -161,10 +172,12 @@ func TestTypeScriptScaffoldPinsTheDogfoodToolchain(t *testing.T) {
 	}
 	var lock struct {
 		Name     string `json:"name"`
+		Version  string `json:"version"`
 		Packages map[string]struct {
 			Name            string            `json:"name"`
 			Version         string            `json:"version"`
 			DevDependencies map[string]string `json:"devDependencies"`
+			Engines         map[string]string `json:"engines"`
 		} `json:"packages"`
 	}
 	if err := json.Unmarshal(raw, &lock); err != nil {
@@ -173,12 +186,86 @@ func TestTypeScriptScaffoldPinsTheDogfoodToolchain(t *testing.T) {
 	if lock.Name != "pins" || lock.Packages[""].Name != "pins" {
 		t.Fatalf("the lockfile names %q/%q, want the package name", lock.Name, lock.Packages[""].Name)
 	}
+	if lock.Packages[""].Engines["node"] != manifest.Engines["node"] {
+		t.Fatalf("the lockfile root says node %q, package.json %q", lock.Packages[""].Engines["node"], manifest.Engines["node"])
+	}
+	if len(lock.Packages[""].DevDependencies) != len(manifest.DevDependencies) {
+		t.Fatalf("the lockfile root lists %v, package.json %v", lock.Packages[""].DevDependencies, manifest.DevDependencies)
+	}
 	for tool, version := range manifest.DevDependencies {
 		if lock.Packages[""].DevDependencies[tool] != version || lock.Packages["node_modules/"+tool].Version != version {
 			t.Fatalf("the lockfile resolves %s to %q (root %q), want %s",
 				tool, lock.Packages["node_modules/"+tool].Version, lock.Packages[""].DevDependencies[tool], version)
 		}
 	}
+
+	// Every other entry is the dogfood one, at the same location, flagged dev,
+	// and the scaffold's lockfile installs everything it names.
+	scaffoldLock := readLockPackages(t, filepath.Join(target, "package-lock.json"))
+	for location, entry := range scaffoldLock {
+		if location == "" {
+			continue
+		}
+		if strings.Contains(location, "sandcastle") {
+			t.Fatalf("the starter's lockfile installs %s; Sandcastle stays inside workflows/dogfood", location)
+		}
+		if !hasLockField(entry, "dev") {
+			t.Fatalf("%s is not flagged dev; the starter has nothing but devDependencies", location)
+		}
+		source := dogfoodLock[location]
+		if source == nil {
+			t.Fatalf("%s is not in workflows/dogfood/package-lock.json", location)
+		}
+		if got, want := withoutLockFlags(t, entry), withoutLockFlags(t, source); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s differs from the dogfood entry:\n got %v\nwant %v", location, got, want)
+		}
+		for _, edge := range entry.edges() {
+			if _, ok := resolveLockLocation(scaffoldLock, location, edge.name); !ok && edge.kind != edgeOptional {
+				t.Fatalf("%s needs %s, which the starter's lockfile does not install", location, edge.name)
+			}
+		}
+	}
+}
+
+// readLockPackages reads a lockfile's packages the way the derivation does.
+func readLockPackages(t *testing.T, path string) map[string]*lockEntry {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, packages, err := readLockfile(raw)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return packages
+}
+
+func hasLockField(entry *lockEntry, key string) bool {
+	for _, field := range entry.fields {
+		if field.key == key {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutLockFlags is an entry's content, less the flags the derivation
+// recomputes for the scaffold's graph.
+func withoutLockFlags(t *testing.T, entry *lockEntry) map[string]any {
+	t.Helper()
+	content := make(map[string]any)
+	for _, field := range entry.fields {
+		if slices.Contains(lockFlagKeys, field.key) {
+			continue
+		}
+		var value any
+		if err := json.Unmarshal(field.value, &value); err != nil {
+			t.Fatal(err)
+		}
+		content[field.key] = value
+	}
+	return content
 }
 
 func TestWorkflowInitLanguageDefaultsToBash(t *testing.T) {
