@@ -1,6 +1,6 @@
 {
   "linux": {
-    "cgroupsPath": "/wefty/golden-amd64",
+    "cgroupsPath": "/wefty/golden-default-root-amd64",
     "devices": [
       {
         "fileMode": 438,
@@ -559,8 +559,60 @@
           "args": [
             {
               "index": 0,
-              "op": "SCMP_CMP_GT",
-              "value": 40
+              "op": "SCMP_CMP_EQ",
+              "value": 41
+            }
+          ],
+          "names": [
+            "socket"
+          ]
+        },
+        {
+          "action": "SCMP_ACT_ALLOW",
+          "args": [
+            {
+              "index": 0,
+              "op": "SCMP_CMP_EQ",
+              "value": 42
+            }
+          ],
+          "names": [
+            "socket"
+          ]
+        },
+        {
+          "action": "SCMP_ACT_ALLOW",
+          "args": [
+            {
+              "index": 0,
+              "op": "SCMP_CMP_EQ",
+              "value": 43
+            }
+          ],
+          "names": [
+            "socket"
+          ]
+        },
+        {
+          "action": "SCMP_ACT_ALLOW",
+          "args": [
+            {
+              "index": 0,
+              "op": "SCMP_CMP_EQ",
+              "value": 44
+            }
+          ],
+          "names": [
+            "socket"
+          ]
+        },
+        {
+          "action": "SCMP_ACT_ALLOW",
+          "args": [
+            {
+              "index": 0,
+              "op": "SCMP_CMP_EQ",
+              "value": 45
             }
           ],
           "names": [
@@ -792,31 +844,10 @@
       ],
       "source": "/run/wefty/fixtures/hosts",
       "type": "bind"
-    },
-    {
-      "destination": "/wefty/handoff",
-      "options": [
-        "rbind",
-        "rw",
-        "rprivate"
-      ],
-      "source": "/run/wefty/fixtures/handoff",
-      "type": "bind"
-    },
-    {
-      "destination": "/workspace/input",
-      "options": [
-        "rbind",
-        "rw",
-        "rprivate"
-      ],
-      "source": "/mnt/wefty/operator/input",
-      "type": "bind"
     }
   ],
   "ociVersion": "1.3.0",
   "process": {
-    "apparmorProfile": "wefty-default",
     "args": [
       "/usr/local/bin/echo-service",
       "--once"
@@ -887,12 +918,10 @@
     ],
     "user": {
       "additionalGids": [
-        1002,
-        44,
-        2000
+        0
       ],
-      "gid": 1002,
-      "uid": 1001
+      "gid": 0,
+      "uid": 0
     }
   },
   "root": {

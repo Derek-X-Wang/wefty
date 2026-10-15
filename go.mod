@@ -5,7 +5,7 @@ go 1.27.2
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/containerd/containerd/api v1.11.1
-	github.com/containerd/containerd/v2 v2.3.6
+	github.com/containerd/containerd/v2 v2.3.7
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/errdefs/pkg v0.3.0
 	github.com/containerd/platforms v1.0.0-rc.5
