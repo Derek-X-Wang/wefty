@@ -446,8 +446,8 @@ without one with its own wall clock, in UTC, before the event is spooled, so no
 event reaches L1 unset: an unset time has no nanosecond encoding and would
 otherwise be spooled as a date centuries old and evicted by the next sweep.
 
-Whichever bound binds first trims oldest-first: per-job bounds in insertion
-order within the job, the one-shot age bound and the total ceiling by event
+Whichever bound binds first trims oldest-first: per-job byte caps in
+insertion order within the job, both age bounds and the total ceiling by event
 timestamp across jobs. Trimmed bytes are deleted, not archived. Any row may
 be evicted, including a live attempt's newest row per stream and rows of a
 `lost` attempt still inside its late-evidence window, because upload
@@ -455,11 +455,37 @@ continuity does not live in the retained rows (see "Log upload continuity").
 
 Per-job and total retained bytes are trigger-maintained counters over
 `log_events` (`job_log_usage`, `log_usage_total`), so neither the append path
-nor the sweep sums the table. Services are few and are swept job by job, as
-before. One-shots are kept as records forever and are never walked: the sweep
-re-trims only one-shots the usage index shows over their cap (at most 16 per
-pass), and one-shot age and the total ceiling walk the `(timestamp_ns,
-ordinal)` index.
+nor the sweep sums the table. The sweep never visits jobs one by one, and each
+of its steps reads a bounded number of index rows per pass and resumes where
+the previous pass stopped, so the time a pass holds the write lock does not
+grow with the number of jobs, log rows or attempts, and an idle service is
+never visited (#939). Once a step reaches the end of its index, the next pass
+starts it again from the beginning; that is one round.
+
+- Per-job byte caps: the sweep walks the usage index from the most retained
+  bytes down, at most 256 rows per class per pass, and re-trims at most 16
+  services and 16 one-shots over their own cap.
+- Age: each class's age bound walks the `(timestamp_ns, ordinal)` index and
+  steps over the other class's rows, which have their own bound, reading at
+  most 2048 rows per bound per pass. A round covers only rows already stored
+  and past the cutoff when it began: it ends at that cutoff and at the highest
+  ordinal then stored (ordinals only grow). Rows that age past the cutoff, or
+  are uploaded later with an old timestamp, wait for the next round. Rows
+  aging in never lengthen a round. A late upload ahead of the walk counts
+  against the 2048 rows it passes over, at most 32 per timestamp, so such
+  uploads delay a round's end only while they keep arriving at more distinct
+  timestamps than a pass reads. The total ceiling walks the same index and
+  evicts every row it reads.
+- Service attempt summaries past the floor (the current attempt and the 32
+  newest others) are pruned when a claim, completion or log append touches
+  the service, and by the sweep. The sweep checks 256 services per pass,
+  reading at most 33 attempt index entries for each, and walks the history of
+  each service with summaries past the floor oldest-first, at most 256
+  attempts per pass across all services, kept attempts included.
+
+So the sweep removes what is due within one round of these walks, not always
+on the next pass. A round is longer when there are more old rows, services or
+attempts; each pass stays bounded.
 
 Every eviction is budgeted, so a backlog (an upgraded database, a lowered cap)
 is worked off in pieces instead of holding the write transaction that

@@ -114,6 +114,12 @@ type Store struct {
 	// is true from a deferred checkpoint until one succeeds.
 	walCheckpointMu       sync.Mutex
 	walTruncationDeferred atomic.Bool
+	// retentionSweep is where the reconcile pass's bounded retention steps
+	// resume.
+	retentionSweep retentionSweepCursor
+	// reconcileHoldForTest, when set before the Store is shared, observes how
+	// long each committed reconcile pass held the write lock.
+	reconcileHoldForTest func(time.Duration)
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -512,6 +518,9 @@ CREATE TABLE IF NOT EXISTS attempts (
   updated_ns INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attempts_job ON attempts(job_id);
+-- One service's attempts newest- or oldest-first: the summary floor and the
+-- sweep's bounded walk below it read only the entries they need (#939).
+CREATE INDEX IF NOT EXISTS attempts_job_created ON attempts(job_id, created_ns, attempt_id);
 -- attempt_credentials stores only the SHA-256 digest of each minted bearer.
 -- It carries no expiry: liveness is read from the attempt on every request,
 -- so a row can never outlive the authority it names.
@@ -542,6 +551,11 @@ CREATE TABLE IF NOT EXISTS service_jobs (
   policy_stop_json BLOB
 );
 CREATE INDEX IF NOT EXISTS service_jobs_bound_desired ON service_jobs(bound_node_id, desired_state);
+-- Deleting an attempt (summary pruning, removal) looks up the service that
+-- publishes it for the ON DELETE SET NULL above; without this index each
+-- deleted attempt scans every service (#939).
+CREATE INDEX IF NOT EXISTS service_jobs_published_attempt ON service_jobs(published_attempt_id)
+  WHERE published_attempt_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS computers (
   computer_id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,

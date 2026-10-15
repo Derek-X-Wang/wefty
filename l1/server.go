@@ -195,36 +195,22 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	reconcileDone := make(chan struct{})
 	go func() {
 		defer close(reconcileDone)
-		ticker := time.NewTicker(s.reconcileInterval)
-		defer ticker.Stop()
+		// The next pass starts one full interval after this one ends, never
+		// at a fixed tick, so a pass that runs long cannot be followed at once
+		// by another and writers always get the interval between passes
+		// (#939).
+		timer := time.NewTimer(s.reconcileInterval)
+		defer timer.Stop()
 		for {
 			select {
 			case <-reconcileContext.Done():
 				return
-			case <-ticker.C:
-				if _, err := s.reconcile(reconcileContext); err != nil {
-					if reconciliationCanceledByShutdown(reconcileContext, err) {
-						return
-					}
-					if errors.Is(err, context.Canceled) && reconcileContext.Err() == nil {
-						if s.logf != nil {
-							s.logf("event=l1_reconcile_live_context_canceled action=continue error=%v", err)
-						}
-						continue
-					}
-					if sqliteLockContention(err) {
-						if s.logf != nil {
-							s.logf("event=l1_reconcile_sqlite_busy action=retry_next_tick error=%v", err)
-						}
-						continue
-					}
-					reconcileFailures <- err
-					_ = httpServer.Close()
-					return
-				}
-				s.sweepSecrets(reconcileContext)
-				s.compactLogEventDocuments(reconcileContext)
+			case <-timer.C:
 			}
+			if !s.reconcileTick(reconcileContext, reconcileFailures, httpServer) {
+				return
+			}
+			timer.Reset(s.reconcileInterval)
 		}
 	}()
 	stopped := make(chan struct{})
@@ -248,6 +234,35 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 		return nil
 	}
 	return err
+}
+
+// reconcileTick runs one background reconcile pass and the maintenance that
+// follows it. It reports false when the loop must stop: on shutdown, or after
+// a failure it has handed to reconcileFailures and closed the server for.
+func (s *Server) reconcileTick(ctx context.Context, failures chan<- error, httpServer *http.Server) bool {
+	if _, err := s.reconcile(ctx); err != nil {
+		if reconciliationCanceledByShutdown(ctx, err) {
+			return false
+		}
+		if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+			if s.logf != nil {
+				s.logf("event=l1_reconcile_live_context_canceled action=continue error=%v", err)
+			}
+			return true
+		}
+		if sqliteLockContention(err) {
+			if s.logf != nil {
+				s.logf("event=l1_reconcile_sqlite_busy action=retry_next_tick error=%v", err)
+			}
+			return true
+		}
+		failures <- err
+		_ = httpServer.Close()
+		return false
+	}
+	s.sweepSecrets(ctx)
+	s.compactLogEventDocuments(ctx)
+	return true
 }
 
 // sweepSecrets runs one scrubbed-secret sweep after a reconcile pass. A
