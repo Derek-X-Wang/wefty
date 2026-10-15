@@ -2470,6 +2470,12 @@ func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
 	lateCompletion := make(chan struct{}, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if strings.Contains(request.URL.Path, "attempt-live") {
+			// The live lifecycle acknowledges its own one-shot start (#945);
+			// recovery never sends Started, so only other paths count.
+			if strings.HasSuffix(request.URL.Path, "/started") {
+				_ = json.NewEncoder(w).Encode(l1.Job{})
+				return
+			}
 			liveRequest <- request.URL.Path
 			if strings.HasSuffix(request.URL.Path, "/logs") {
 				_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0}})
@@ -3145,7 +3151,10 @@ func TestRestartReevaluatesDurableCompletionAgainstCurrentIntentBeforePublicatio
 			defer cancelRecovery()
 			recoveryErrors := make(chan error, 1)
 			restartedOutbox.startRecovery(recoveryContext, client, func(err error) { recoveryErrors <- err })
-			waitContext, cancelWait := context.WithTimeout(t.Context(), time.Second)
+			// The wait ends as soon as recovery records the disposition; the
+			// budget only bounds a hang. One second was less than a loaded
+			// hosted runner took to scan, observe and persist it.
+			waitContext, cancelWait := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancelWait()
 			receipt, err := restartedOutbox.spool.waitCompletionDisposition(
 				waitContext, claim.Lease.AttemptID, test.wantDisposition, test.observation.Revision,

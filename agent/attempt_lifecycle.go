@@ -1277,6 +1277,29 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				return nil
 			})
 		}
+	} else if claim.Job.Spec.Kind == contract.JobKindProcess && claim.Job.Spec.Class == contract.JobClassOneShot && lifecycle.dependencies.client != nil {
+		// A one-shot that prints nothing would otherwise stay claimed, and its
+		// run queued, until the first renewal ten seconds after the claim
+		// (#945). Acknowledging the runner's start makes it running as soon
+		// as the payload exists. The acknowledgement is only that: renewal
+		// still decides authority, so a refusal or an unanswered window
+		// leaves the payload to renewal exactly as before, and an L1 without
+		// process Started keeps the legacy promotion.
+		acknowledgementContext, stopAcknowledgement := context.WithCancel(ctx)
+		defer stopAcknowledgement()
+		processStart = &pendingStartAcknowledgement{stop: stopAcknowledgement}
+		localStarted := request.Started
+		request.Started = func() {
+			processStart.begin(func() error {
+				if err := lifecycle.acknowledgeStart(acknowledgementContext, claim); err != nil && acknowledgementContext.Err() == nil {
+					lifecycle.log("attempt %s start acknowledgement was not recorded; renewal keeps authority: %v", claim.Lease.AttemptID, err)
+				}
+				return nil
+			})
+			if localStarted != nil {
+				localStarted()
+			}
+		}
 	}
 	if computerService {
 		request.Execution = withoutComputerReservedOperatorEnvironment(request.Execution)
