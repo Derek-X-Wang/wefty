@@ -107,7 +107,9 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	// A second Ctrl-C exits immediately; a later exec sweeps abandoned captures.
 	ctx, stopSignalContext := execSignalContext(ctx)
 	defer stopSignalContext()
-	sweepExecStorage(ctx, clients, stderr)
+	if err := sweepExecStorage(ctx, clients, stderr); err != nil {
+		return err
+	}
 	node, err := resolveLocalNode(ctx, clients)
 	if err != nil {
 		return err

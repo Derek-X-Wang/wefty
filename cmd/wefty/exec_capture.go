@@ -86,7 +86,7 @@ func captureExec(ctx context.Context, cwd string) (capture execCapture, err erro
 	}
 	storage, err := os.MkdirTemp(storageRoot, "wefty-exec-")
 	if err != nil {
-		return capture, err
+		return capture, execStorageWriteError(storageRoot, err)
 	}
 	capture = execCapture{Storage: storage, Base: strings.TrimSpace(base), Dirty: status != "", Folder: folder}
 	defer func() {

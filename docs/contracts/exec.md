@@ -113,6 +113,12 @@ and unrelated folders stay intact. Sweep failures print warnings and do not
 fail exec. This also reclaims residue after a second Ctrl-C, SIGKILL, or a
 queued run cancelled after its CLI has exited.
 
+Storage-root preparation is required for the new capture: if it
+fails, exec reports one error and exits 1 before any sweep work or submission.
+Permission and read-only-filesystem failures to prepare the root or create
+a capture name the folder and tell a sandboxed AI agent to allow writes,
+with a pointer to the wefty skill.
+
 The command is not sandboxed and can write absolute paths as the node's user.
 No files are returned. Never put a secret on the command line: command text
 is stored permanently as typed. Use exec for one command with local changes;
