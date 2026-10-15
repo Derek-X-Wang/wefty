@@ -3,8 +3,8 @@
 # This is an acceptance/example image, not a required wefty base image. Both
 # build roots are immutable multi-platform indexes so rebuilding one commit
 # cannot silently select different toolchain or runtime bytes.
-# golang:1.27.1-alpine multi-platform index
-ARG GO_IMAGE=docker.io/library/golang@sha256:8a5910f31396cd4d89662f56c68b3ae31d374308270a1c3bd96672ee5ed43414
+# golang:1.27.2-alpine multi-platform index
+ARG GO_IMAGE=docker.io/library/golang@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d
 ARG BUSYBOX_IMAGE=docker.io/library/busybox@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
 ARG SOURCE_DATE_EPOCH=0
 

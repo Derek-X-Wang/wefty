@@ -181,7 +181,7 @@ handoff files are the same.
 ```sh
 cd "$WEFTY_ROOT"
 NODE_ID=<the Linux OCI node's stable id, from `w nodes list`>
-GOLANG_IMAGE=docker.io/library/golang:1.26-bookworm
+GOLANG_IMAGE=docker.io/library/golang:1.27.2-bookworm
 GOLANG_DIGEST=$(go run github.com/google/go-containerregistry/cmd/crane@v0.22.0 digest "$GOLANG_IMAGE")
 
 printf '{"ref":"%s"}\n' "my-branch" > /tmp/branch-gates-params.json

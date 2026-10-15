@@ -1520,3 +1520,51 @@ func TestAcceptanceImageUserVariantsArePublishedAndStayDerivedFromTheEchoImage(t
 		t.Fatal("publisher re-solves the image-user variants instead of promoting executed archives")
 	}
 }
+
+// TestGoVersionPinsMoveWithGoMod keeps every Go pin on the version go.mod
+// names. CI reads go.mod through go-version-file, but the echo images' golang
+// root is pinned by digest and sets GOTOOLCHAIN=local, so a go.mod bump that
+// leaves the root behind fails the image build only in a Docker lane. The
+// digest cannot be resolved offline; the version label above it can, and a
+// bump moves the two together (CONTRIBUTING.md).
+func TestGoVersionPinsMoveWithGoMod(t *testing.T) {
+	goMod, err := os.ReadFile("../go.mod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directive := regexp.MustCompile(`(?m)^go (\S+)$`).FindSubmatch(goMod)
+	if directive == nil {
+		t.Fatal("go.mod has no go directive")
+	}
+	pin := fmt.Sprintf("# golang:%s-alpine multi-platform index\nARG GO_IMAGE=docker.io/library/golang@sha256:", directive[1])
+	assertFileContains(t, "../examples/oci-echo-service/Dockerfile", pin)
+	assertFileContains(t, "../examples/oci-echo-service/Dockerfile.service-users", pin)
+
+	// A literal go-version in one workflow would be a pin the CONTRIBUTING.md
+	// search does not find, so every setup-go step reads go.mod.
+	entries, err := os.ReadDir("../.github/workflows")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setups := 0
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".yml") && !strings.HasSuffix(entry.Name(), ".yaml") {
+			continue
+		}
+		workflow, _ := readWorkflow(t, "../.github/workflows/"+entry.Name())
+		for jobName, job := range workflow.Jobs {
+			for _, step := range job.Steps {
+				if !strings.HasPrefix(step.Uses, "actions/setup-go@") {
+					continue
+				}
+				setups++
+				if step.With["go-version-file"] != "go.mod" || step.With["go-version"] != nil {
+					t.Fatalf("%s job %s setup-go with = %#v, want go-version-file: go.mod and no go-version", entry.Name(), jobName, step.With)
+				}
+			}
+		}
+	}
+	if setups == 0 {
+		t.Fatal("found no setup-go step to check")
+	}
+}
