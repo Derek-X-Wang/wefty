@@ -173,6 +173,74 @@ func TestCancelLookupDeliversSameJobAcknowledgedDuringLookup(t *testing.T) {
 	}
 }
 
+// A cancel that reaches L3 while the run's first submit is in flight looks up
+// the dispatch key. L1 can answer before it commits that submit, so the lookup
+// misses or fails, and the submit's acknowledgement links the Run and reopens
+// delivery before the stale answer returns. That answer must not back the
+// cancellation off for the retry delay: it is delivered to the linked Job in
+// the same request or pass (#961).
+func TestCancelLookupMissDoesNotDelayJobAcknowledgedDuringLookup(t *testing.T) {
+	for _, answer := range []string{"absence", "transient"} {
+		for _, delivery := range []string{"explicit", "background"} {
+			t.Run(answer+"/"+delivery, func(t *testing.T) {
+				h := newIntegrationHarness(t)
+				ctx := context.Background()
+				run := h.submit(inlineRunRequest("exit 0\n"), "ack-during-cancel-lookup-miss")
+				intents, err := h.l3Store.pendingDispatches(ctx)
+				if err != nil || len(intents) != 1 {
+					t.Fatalf("intents=%+v %v", intents, err)
+				}
+				token, err := h.l3Store.beginDispatch(ctx, run.RunID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				job, err := h.l1Client.SubmitJob(ctx, intents[0].jobSpec(token))
+				if err != nil {
+					t.Fatal(err)
+				}
+				client := &controlledCancelLookupClient{recordingCancelClient: &recordingCancelClient{L1Client: h.l1Client}}
+				lookups := 0
+				client.lookup = func(ctx context.Context, key string) (l1.Job, error) {
+					lookups++
+					// The submit's acknowledgement lands while the lookup is
+					// outstanding; the lookup's own answer predates it.
+					if err := h.l3Store.completeDispatch(ctx, run.RunID, job.JobID); err != nil {
+						return l1.Job{}, err
+					}
+					if answer == "absence" {
+						return l1.Job{}, &DispatchNotFoundError{DispatchKey: key}
+					}
+					return l1.Job{}, errors.New("injected transport failure")
+				}
+				r, err := NewReconciler(h.l3Store, client, ReconcilerConfig{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if delivery == "explicit" {
+					h.l3Server.jobs, h.l3Server.reconciler = client, r
+					status, _, body := h.do(h.caller, http.MethodPost, "/v1/runs/"+run.RunID+"/cancel", nil, nil)
+					if status != http.StatusOK {
+						t.Fatalf("stale lookup answer failed HTTP cancel: %d %s", status, body)
+					}
+				} else {
+					if err := h.l3Store.requestRunCancellation(ctx, run.RunID, h.callerUser); err != nil {
+						t.Fatal(err)
+					}
+					if err := r.ReconcileOnce(ctx); err != nil {
+						t.Fatalf("stale lookup answer failed the cancellation pass: %v", err)
+					}
+				}
+				record, err := h.l3Store.GetRun(ctx, run.RunID)
+				observed, getErr := h.l1Client.GetJob(ctx, job.JobID)
+				if err != nil || getErr != nil || record.CancelStatus != "settled" || record.CancelReason != "" || record.L1JobID != job.JobID ||
+					record.Status != contract.RunFailed || observed.Outcome != contract.JobOutcomeCanceled || lookups != 1 || client.calls != 1 {
+					t.Fatalf("stale lookup answer delayed cancellation: run=%+v job=%+v lookups=%d cancels=%d errors=%v/%v", record, observed, lookups, client.calls, err, getErr)
+				}
+			})
+		}
+	}
+}
+
 func TestCancelLookupCannotOverwriteLaterRegression(t *testing.T) {
 	h := newIntegrationHarness(t)
 	ctx := context.Background()
