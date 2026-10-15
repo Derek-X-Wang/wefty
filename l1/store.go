@@ -530,6 +530,13 @@ CREATE INDEX IF NOT EXISTS attempts_job ON attempts(job_id);
 -- One service's attempts newest- or oldest-first: the summary floor and the
 -- sweep's bounded walk below it read only the entries they need (#939).
 CREATE INDEX IF NOT EXISTS attempts_job_created ON attempts(job_id, created_ns, attempt_id);
+-- Attempts by state and lease deadline: a reconcile pass reads only the active
+-- Attempts whose lease has run out, not every active Job (#948).
+CREATE INDEX IF NOT EXISTS attempts_lease_expiry ON attempts(state, lease_expires_ns);
+-- A Node's Attempts by state: a claim's prior-boot embargo and one-shot slot
+-- count read only the claiming Node's active Attempts, not the whole history
+-- (#948).
+CREATE INDEX IF NOT EXISTS attempts_node_state ON attempts(node_id, state, boot_session_id);
 -- attempt_credentials stores only the SHA-256 digest of each minted bearer.
 -- It carries no expiry: liveness is read from the attempt on every request,
 -- so a row can never outlive the authority it names.
@@ -1296,9 +1303,15 @@ DROP TABLE IF EXISTS job_log_jsonl;
 			return err
 		}
 	}
+	// jobs_cancel_settlement holds canceled Jobs by state and settlement
+	// deadline, so a reconcile pass reads only the active ones past their
+	// deadline, not every active Job (#948). Both indexes follow the columns
+	// they need.
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS jobs_parent_order
-		ON jobs(parent_job_id, created_ns, job_id)`); err != nil {
-		return fmt.Errorf("l1: ensure child job order index: %w", err)
+		ON jobs(parent_job_id, created_ns, job_id);
+		CREATE INDEX IF NOT EXISTS jobs_cancel_settlement
+		ON jobs(state, cancel_settle_by_ns) WHERE outcome='canceled'`); err != nil {
+		return fmt.Errorf("l1: ensure child job order and cancellation settlement indexes: %w", err)
 	}
 	if err := s.ensureColumn(ctx, "service_jobs", "lease_loss_count", "INTEGER NOT NULL DEFAULT 0 CHECK(lease_loss_count >= 0)"); err != nil {
 		return err

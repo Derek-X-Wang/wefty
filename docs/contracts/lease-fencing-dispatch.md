@@ -204,7 +204,8 @@ successful registration increments `authority_generation`; a claim binds the
 current generation into its attempt. A replacement boot is embargoed from
 claiming while a non-terminal attempt from another boot session remains. Lease
 expiry makes the old attempt terminal and clears that embargo without waiting
-for node death.
+for node death. The embargo check, like the one-shot slot count, reads only the
+claiming node's non-terminal attempts, never its whole attempt history (#948).
 
 Registration also reports the current managed-root instance ID. It is a
 self-reported fact about local agent state, like OS or agent version, and is
@@ -701,6 +702,11 @@ pre-start backoff when requeue is permitted, so a lease-flapping node cannot hot
 terminally. A partitioned node may still be running non-idempotent work, so
 later authority-changing writes receive `lease_expired` or `stale_fence` and
 cannot alter state. Evidence writes follow the provenance-only rules above.
+
+Each reconcile pass finds the attempts to expire by their lease deadline, and
+canceled one-shots by their settlement deadline, so it reads only non-terminal
+attempts and canceled jobs whose deadline has passed, never every active job
+(#948). What a pass expires, and when, is unchanged.
 
 An attempt credential carries no independent expiry. Every request revalidates
 the live attempt, so the credential stops working at the same instant the
