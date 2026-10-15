@@ -63,10 +63,10 @@ const (
 	// sweep's.
 	appendEvictionEvents       = 2 * MaxLogBatchEvents
 	appendEvictionBytes  int64 = 2 * MaxLogUploadBodyBytes
-	// oneshotByteSweepJobBudget bounds how many over-cap one-shots one pass
-	// looks at. Ingest is the first byte site; this catches a job left over a
+	// byteSweepJobBudget bounds how many over-cap jobs of each class one pass
+	// re-trims. Ingest is the first byte site; this catches a job left over a
 	// lowered cap or an append-bounded backlog.
-	oneshotByteSweepJobBudget = 16
+	byteSweepJobBudget = 16
 )
 
 // evictionBudget is what one transaction may still delete.
@@ -155,59 +155,6 @@ func refreshLogTruncation(ctx context.Context, tx *sql.Tx, jobID string, now tim
 		return internalError(err, "refresh earliest retained job log timestamp")
 	}
 	return nil
-}
-
-// enforceServiceLogAgeRetention is #49's per-service age sweep. Services are
-// few and each is walked; one-shots are many and kept forever as records, so
-// their age bound walks the timestamp index instead (enforceOneshotLogRetention).
-func (s *Store) enforceServiceLogAgeRetention(ctx context.Context, tx *sql.Tx, jobID string, now time.Time, budget *evictionBudget) (logRetentionStats, error) {
-	cutoff := now.Add(-s.serviceLogRetentionAge).UnixNano()
-	perJob := map[string]*logRetentionStats{}
-	if err := evictLogEvents(ctx, tx, jobID, " AND e.timestamp_ns < ?", []any{cutoff}, budget, -1, perJob); err != nil {
-		return logRetentionStats{}, err
-	}
-	return recordLogTruncations(ctx, tx, perJob, LogRetentionAge, now)
-}
-
-// enforceOneshotLogRetention is the sweep's one-shot half: a re-trim of
-// one-shots over their per-job cap, then age eviction oldest-first by each
-// event's own timestamp across every one-shot, all within budget.
-func (s *Store) enforceOneshotLogRetention(ctx context.Context, tx *sql.Tx, now time.Time, budget *evictionBudget) (logRetentionStats, error) {
-	total := logRetentionStats{}
-	if budget.exhausted() {
-		return total, nil
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT u.job_id FROM job_log_usage u
-		WHERE u.retained_bytes > ?
-			AND NOT EXISTS (SELECT 1 FROM service_jobs sj WHERE sj.job_id=u.job_id)
-		ORDER BY u.retained_bytes DESC, u.job_id LIMIT ?`, s.logRetention.oneshotBytes, oneshotByteSweepJobBudget)
-	if err != nil {
-		return logRetentionStats{}, internalError(err, "select one-shots over their log byte cap")
-	}
-	overCap, err := scanJobIDs(rows, "one-shot over its log byte cap")
-	if err != nil {
-		return logRetentionStats{}, err
-	}
-	for _, jobID := range overCap {
-		stats, err := s.enforceJobLogByteRetention(ctx, tx, jobID, now, budget)
-		if err != nil {
-			return logRetentionStats{}, err
-		}
-		total.add(stats)
-	}
-
-	cutoff := now.Add(-s.logRetention.oneshotAge).UnixNano()
-	perJob := map[string]*logRetentionStats{}
-	if err := evictLogEvents(ctx, tx, "", ` AND e.timestamp_ns < ?
-		AND NOT EXISTS (SELECT 1 FROM service_jobs sj WHERE sj.job_id=e.job_id)`, []any{cutoff}, budget, -1, perJob); err != nil {
-		return logRetentionStats{}, err
-	}
-	stats, err := recordLogTruncations(ctx, tx, perJob, LogRetentionAge, now)
-	if err != nil {
-		return logRetentionStats{}, err
-	}
-	total.add(stats)
-	return total, nil
 }
 
 // enforceLogRetentionTotal applies the cluster-wide ceiling to every job's

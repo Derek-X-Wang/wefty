@@ -1616,7 +1616,9 @@ reconciliation returns the Node to `alive`.
 Each page uses one snapshot and clock; subsequent pages observe their own moment.
 
 The background reconciler runs at startup and on its configured cadence
-(nominally one second; delayed under write contention). It records liveness
+(nominally one second after the previous pass ends, never at a fixed tick, so
+writers get the whole interval between passes; delayed under write
+contention). It records liveness
 transitions, expires attempts and records conditions independently of reads.
 A computed-dead view never performs
 or fabricates those durable consequences. Computer token proofs refuse a host
