@@ -617,8 +617,8 @@ func decodeRunJobLink(observed dispatchObservation) (runJobLinkKnowledge, error)
 
 // writeCancellationBackoff also schedules unresolved, completed legacy links.
 // Their old delivery outcome stays recorded until positive evidence wakes it.
-func (s *Store) writeCancellationBackoff(ctx context.Context, runID string, failures int, retry time.Time, payload string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE run_cancellations SET failures=failures+1, retry_ns=?, last_error=CASE WHEN completed_ns IS NULL THEN ? ELSE last_error END WHERE run_id=? AND failures=? AND (completed_ns IS NULL OR EXISTS
+func writeCancellationBackoff(ctx context.Context, q execer, runID string, failures int, retry time.Time, payload string) error {
+	_, err := q.ExecContext(ctx, `UPDATE run_cancellations SET failures=failures+1, retry_ns=?, last_error=CASE WHEN completed_ns IS NULL THEN ? ELSE last_error END WHERE run_id=? AND failures=? AND (completed_ns IS NULL OR EXISTS
  (SELECT 1 FROM runs r LEFT JOIN dispatch_outbox o ON o.run_id=r.run_id
  WHERE r.run_id=run_cancellations.run_id AND r.l1_job_id IS NULL
  AND (r.dispatch_attempt_ns IS NOT NULL OR o.job_id IS NOT NULL)
@@ -627,6 +627,44 @@ func (s *Store) writeCancellationBackoff(ctx context.Context, runID string, fail
 		return internalError(err, "defer run cancellation")
 	}
 	return nil
+}
+
+// deferUnlinkedRunCancellation backs off delivery after a dispatch-key lookup
+// found no usable Job, but only while the Run still has no Job reference. The
+// lookup may have read L1 before it committed the Run's in-flight submit; that
+// submit's acknowledgement then links the Run and reopens delivery before the
+// stale answer returns. A backoff written over that reopen would hold a live
+// Job's cancellation for the full retry delay (#961). The link check and the
+// backoff share one write transaction. A non-empty result is the Job the Run
+// is now linked to, and nothing was written.
+func (s *Store) deferUnlinkedRunCancellation(ctx context.Context, runID string, cause error) (string, error) {
+	payload, err := cancellationFailurePayload(cause)
+	if err != nil {
+		return "", err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", internalError(err, "begin cancellation backoff")
+	}
+	defer tx.Rollback()
+	var jobID sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT l1_job_id FROM runs WHERE run_id=?`, runID).Scan(&jobID); err != nil {
+		return "", internalError(err, "read cancellation job link")
+	}
+	if jobID.Valid && jobID.String != "" {
+		return jobID.String, nil
+	}
+	view, err := readRunCancellationView(ctx, tx, runID)
+	if err != nil {
+		return "", err
+	}
+	if err := writeCancellationBackoff(ctx, tx, runID, view.failures, s.recoveryNow().Add(unrecordedDispatchBackoff(view.failures)), payload); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", internalError(err, "commit cancellation backoff")
+	}
+	return "", nil
 }
 
 // insertDispatchIntentTx creates the outbox entry in the same transaction as
@@ -1231,6 +1269,10 @@ func (s *Store) unrecordedDispatchFor(ctx context.Context, runID string) (unreco
 
 type rowQuerier interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+type execer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
 // scanUnrecordedDispatch captures the verdict in the same read that selects or
