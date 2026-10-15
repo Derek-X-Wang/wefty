@@ -250,13 +250,38 @@ func TestReadSnapshotCapUnderContention(t *testing.T) {
 				})
 			}()
 		}
+		// Release and collect every holder before deciding whether to retry. A
+		// holder can expire before its callback and never send to entered. Keep
+		// non-retryable failures visible even when another holder expired.
+		releaseHolders := func() error {
+			close(release)
+			holders.Wait()
+			close(results)
+			var retryErr, holderErr error
+			for err := range results {
+				if testReadRetryable(err) {
+					retryErr = err
+				} else if err != nil {
+					holderErr = errors.Join(holderErr, err)
+				}
+			}
+			if holderErr != nil {
+				return holderErr
+			}
+			return retryErr
+		}
+		// One watchdog bounds the whole entry phase, not each holder. This is
+		// not a speed assertion: a slow runner may delay a holder's goroutine.
+		entryWatchdog := time.NewTimer(10 * time.Second)
+		defer entryWatchdog.Stop()
 		for range readSnapshotLimit {
 			select {
 			case <-entered:
-			case <-time.After(time.Second):
-				close(release)
-				holders.Wait()
-				t.Fatal("cap holders did not enter")
+			case <-entryWatchdog.C:
+				if err := releaseHolders(); err != nil {
+					return err
+				}
+				return errors.New("cap holders did not enter before watchdog")
 			}
 		}
 		ctx, cancel := context.WithCancel(t.Context())
@@ -290,16 +315,8 @@ func TestReadSnapshotCapUnderContention(t *testing.T) {
 		writer, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		_, writeErr := s.db.ExecContext(writer, "CREATE TABLE writer_progress(value TEXT)")
 		cancel()
-		close(release)
-		holders.Wait()
-		close(results)
-		for err := range results {
-			if testReadRetryable(err) {
-				return err
-			}
-			if err != nil {
-				t.Error(err)
-			}
+		if err := releaseHolders(); err != nil {
+			return err
 		}
 		for err := range contended {
 			if !errors.Is(err, context.DeadlineExceeded) {
