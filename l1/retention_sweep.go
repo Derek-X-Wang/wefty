@@ -377,9 +377,11 @@ type attemptKey struct {
 }
 
 // pruneServiceAttemptSummaryWindow is the sweep's attempt-summary step.
-// Claims, completions and log appends prune their own service; the sweep
-// catches what becomes prunable with no such write, such as a lost attempt
-// whose late-evidence window closes or an attempt whose last log row ages out.
+// Claims, completions and log appends prune both ends of their own service's
+// history below the floor, a bounded number of entries each
+// (pruneServiceAttemptSummaries); the sweep catches the rest, and what
+// becomes prunable with no such write, such as a lost attempt whose
+// late-evidence window closes or an attempt whose last log row ages out.
 // Only a service with more non-current attempts than the floor can have one
 // to prune, which a read of at most the floor's worth of index entries shows,
 // so the step checks the next window of services in job order with one query
@@ -449,23 +451,18 @@ func (s *Store) pruneServiceAttemptSummaryWindow(ctx context.Context, tx *sql.Tx
 
 // pruneAttemptSummaryHistory walks one service's attempts oldest-first from
 // the walk's position, reading at most budget index entries, and prunes those
-// pruneServiceAttemptSummaries would. It stops below the floor: the newest
+// the summary rules allow. It stops below the floor: the newest
 // DefaultServiceAttemptSummaries non-current attempts, which the walk never
 // reaches. done reports that it reached the floor.
 func (s *Store) pruneAttemptSummaryHistory(ctx context.Context, tx *sql.Tx, now time.Time, walk summaryWalk, budget int) (pruned int64, next summaryWalk, done bool, read int, err error) {
 	jobID := walk.jobID
-	// The floor's oldest attempt: the walk covers only attempts before it.
-	var floor attemptKey
-	err = tx.QueryRowContext(ctx, `SELECT created_ns, attempt_id FROM attempts
-		WHERE job_id=? AND attempt_id<>COALESCE((SELECT current_attempt_id FROM jobs WHERE job_id=?), '')
-		ORDER BY created_ns DESC, attempt_id DESC LIMIT 1 OFFSET ?`,
-		jobID, jobID, DefaultServiceAttemptSummaries-1).Scan(&floor.createdNS, &floor.attemptID)
+	floor, found, err := attemptSummaryFloor(ctx, tx, jobID)
 	read = DefaultServiceAttemptSummaries
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, walk, true, read, nil
-	}
 	if err != nil {
-		return 0, walk, false, read, internalError(err, "read the service attempt summary floor")
+		return 0, walk, false, read, err
+	}
+	if !found {
+		return 0, walk, true, read, nil
 	}
 	limit := max(budget-read, 1)
 	keys, err := attemptHistoryKeys(ctx, tx, jobID, walk, floor, limit)
@@ -474,23 +471,8 @@ func (s *Store) pruneAttemptSummaryHistory(ctx context.Context, tx *sql.Tx, now 
 	}
 	read += len(keys)
 	if len(keys) > 0 {
-		ids := make([]string, len(keys))
-		for index, key := range keys {
-			ids[index] = key.attemptID
-		}
-		encoded, err := json.Marshal(ids)
-		if err != nil {
-			return 0, walk, false, read, internalError(err, "encode attempt summaries to check")
-		}
-		result, err := tx.ExecContext(ctx, pruneListedAttemptSummariesSQL,
-			string(encoded), jobID, jobID,
-			contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
-			contract.AttemptLost, now.Add(-s.lateEvidenceWindow).UnixNano())
-		if err != nil {
-			return 0, walk, false, read, internalError(err, "prune service attempt summaries past the floor")
-		}
-		if pruned, err = result.RowsAffected(); err != nil {
-			return 0, walk, false, read, internalError(err, "read service attempt pruning result")
+		if pruned, err = s.pruneListedAttemptSummaries(ctx, tx, jobID, keys, now); err != nil {
+			return 0, walk, false, read, err
 		}
 		lastKey := keys[len(keys)-1]
 		walk = summaryWalk{jobID: jobID, inHistory: true, read: true, createdNS: lastKey.createdNS, attemptID: lastKey.attemptID}
@@ -498,9 +480,56 @@ func (s *Store) pruneAttemptSummaryHistory(ctx context.Context, tx *sql.Tx, now 
 	return pruned, walk, len(keys) < limit, read, nil
 }
 
+// attemptSummaryFloor reads the oldest attempt of jobID's summary floor, the
+// newest DefaultServiceAttemptSummaries non-current attempts, reading that
+// many index entries. found is false when the history holds no more than the
+// floor, so nothing lies below it.
+func attemptSummaryFloor(ctx context.Context, tx *sql.Tx, jobID string) (floor attemptKey, found bool, err error) {
+	err = tx.QueryRowContext(ctx, `SELECT created_ns, attempt_id FROM attempts
+		WHERE job_id=? AND attempt_id<>COALESCE((SELECT current_attempt_id FROM jobs WHERE job_id=?), '')
+		ORDER BY created_ns DESC, attempt_id DESC LIMIT 1 OFFSET ?`,
+		jobID, jobID, DefaultServiceAttemptSummaries-1).Scan(&floor.createdNS, &floor.attemptID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return attemptKey{}, false, nil
+	}
+	if err != nil {
+		return attemptKey{}, false, internalError(err, "read the service attempt summary floor")
+	}
+	return floor, true, nil
+}
+
+// pruneListedAttemptSummaries deletes those of the listed attempts of jobID,
+// all below its summary floor, that the summary rules allow: each is looked
+// up by its ID, so the work follows the list, never the history.
+func (s *Store) pruneListedAttemptSummaries(ctx context.Context, tx *sql.Tx, jobID string, keys []attemptKey, now time.Time) (int64, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, len(keys))
+	for index, key := range keys {
+		ids[index] = key.attemptID
+	}
+	encoded, err := json.Marshal(ids)
+	if err != nil {
+		return 0, internalError(err, "encode attempt summaries to check")
+	}
+	result, err := tx.ExecContext(ctx, pruneListedAttemptSummariesSQL,
+		string(encoded), jobID, jobID,
+		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
+		contract.AttemptLost, now.Add(-s.lateEvidenceWindow).UnixNano())
+	if err != nil {
+		return 0, internalError(err, "prune service attempt summaries past the floor")
+	}
+	pruned, err := result.RowsAffected()
+	if err != nil {
+		return 0, internalError(err, "read service attempt pruning result")
+	}
+	return pruned, nil
+}
+
 // pruneListedAttemptSummariesSQL deletes the listed attempts of one service
-// that pruneServiceAttemptSummaries would delete, less its floor check: the
-// sweep lists only attempts older than the floor. The unary plus keeps the
+// that the summary rules allow, less the floor check: callers list only
+// attempts older than the floor. The unary plus keeps the
 // planner on the listed attempt IDs instead of walking the whole history
 // through job_id.
 const pruneListedAttemptSummariesSQL = `DELETE FROM attempts
@@ -539,6 +568,27 @@ func attemptHistoryKeys(ctx context.Context, tx *sql.Tx, jobID string, walk summ
 		return nil, err
 	}
 	return append(keys, later...), nil
+}
+
+// attemptKeysBelowFloor reads up to limit attempt keys of jobID just before
+// floor, newest-first.
+func attemptKeysBelowFloor(ctx context.Context, tx *sql.Tx, jobID string, floor attemptKey, limit int) ([]attemptKey, error) {
+	keys, err := scanAttemptKeys(ctx, tx, `SELECT created_ns, attempt_id FROM attempts
+		WHERE job_id=? AND created_ns=? AND attempt_id<?
+		ORDER BY attempt_id DESC LIMIT ?`, jobID, floor.createdNS, floor.attemptID, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) == limit || floor.createdNS == math.MinInt64 {
+		return keys, nil
+	}
+	earlier, err := scanAttemptKeys(ctx, tx, `SELECT created_ns, attempt_id FROM attempts
+		WHERE job_id=? AND created_ns<?
+		ORDER BY created_ns DESC, attempt_id DESC LIMIT ?`, jobID, floor.createdNS, limit-len(keys))
+	if err != nil {
+		return nil, err
+	}
+	return append(keys, earlier...), nil
 }
 
 func scanAttemptKeys(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]attemptKey, error) {

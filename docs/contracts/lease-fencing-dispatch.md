@@ -428,6 +428,16 @@ reconciliation of a stale or replaced Node clear health. The stability window
 starts again at recovery; unavailable time does not count toward resetting the
 restart streak.
 
+A reconcile pass does not read every service for this (#942). Health is set
+only while its Node is recorded alive with the Attempt's registration, and
+every registration advances the generation, so interruption reads only the
+healthy services bound to Nodes not recorded alive, and those bound to alive
+Nodes whose recorded state, boot session or registration generation changed
+since the previous committed pass; the first pass after L1 starts reads every
+service. No timestamp decides which Nodes are read. The streak reset reads only
+services with a positive streak whose health began at least the window ago.
+Each change is still applied on the pass that observes it.
+
 ## Log retention
 
 L1 bounds the log bytes it keeps; the job record (spec, status, attempts,
@@ -478,7 +488,12 @@ starts it again from the beginning; that is one round.
   evicts every row it reads.
 - Service attempt summaries past the floor (the current attempt and the 32
   newest others) are pruned when a claim, completion or log append touches
-  the service, and by the sweep. The sweep checks 256 services per pass,
+  the service, and by the sweep. A claim, completion or log append reads at
+  most 32 attempts at each end of the service's history below the floor and
+  prunes those that may go: the newest end, where an attempt the call moves
+  off the floor lands, and the oldest, whose logs retention trims first. Its
+  work does not grow with the history (#942); summaries between the two ends
+  wait for the sweep. The sweep checks 256 services per pass,
   reading at most 33 attempt index entries for each, and walks the history of
   each service with summaries past the floor oldest-first, at most 256
   attempts per pass across all services, kept attempts included.

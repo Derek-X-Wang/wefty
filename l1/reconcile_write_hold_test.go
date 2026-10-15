@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math"
@@ -118,9 +119,9 @@ func seedLogRows(t *testing.T, store *Store, jobID, attemptID string, firstSeque
 }
 
 // assertNothingLeftForTheOldSweep runs the sweep L1 had before #939 -- the
-// service age bound, the per-job byte cap and attempt-summary pruning, for
-// every service -- with no budget, in a transaction it rolls back, and fails
-// if it would still remove anything.
+// service age bound, the per-job byte cap and attempt-summary pruning over
+// each whole history (#942), for every service -- with no budget, in a
+// transaction it rolls back, and fails if it would still remove anything.
 func assertNothingLeftForTheOldSweep(t *testing.T, store *Store) {
 	t.Helper()
 	ctx := context.Background()
@@ -154,7 +155,7 @@ func assertNothingLeftForTheOldSweep(t *testing.T, store *Store) {
 			t.Fatal(err)
 		}
 		overCap += stats.events
-		count, err := store.pruneServiceAttemptSummaries(ctx, tx, jobID, now)
+		count, err := unboundedServiceAttemptSummaryPrune(ctx, tx, store, jobID, now)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -164,6 +165,34 @@ func assertNothingLeftForTheOldSweep(t *testing.T, store *Store) {
 		t.Fatalf("the old per-service sweep would still evict %d aged and %d over-cap rows and prune %d attempt summaries",
 			aged, overCap, pruned)
 	}
+}
+
+// unboundedServiceAttemptSummaryPrune is the attempt-summary prune claims,
+// completions, log appends and the sweep ran before #939 and #942: one
+// statement over the service's whole history. The bounded passes and calls
+// are checked against it.
+func unboundedServiceAttemptSummaryPrune(ctx context.Context, tx *sql.Tx, store *Store, jobID string, now time.Time) (int64, error) {
+	result, err := tx.ExecContext(ctx, `DELETE FROM attempts
+		WHERE job_id=?
+			AND EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=attempts.job_id)
+			AND attempt_id<>COALESCE((SELECT current_attempt_id FROM jobs WHERE job_id=?), '')
+			AND state NOT IN (?, ?, ?)
+			AND NOT (state=? AND updated_ns>=?)
+			AND NOT EXISTS (SELECT 1 FROM log_events WHERE log_events.attempt_id=attempts.attempt_id)
+			AND attempt_id NOT IN (
+				SELECT attempt_id FROM attempts recent
+				WHERE recent.job_id=?
+					AND recent.attempt_id<>COALESCE((SELECT current_attempt_id FROM jobs WHERE job_id=?), '')
+				ORDER BY recent.created_ns DESC, recent.attempt_id DESC
+				LIMIT ?
+			)`, jobID, jobID,
+		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
+		contract.AttemptLost, now.Add(-store.lateEvidenceWindow).UnixNano(),
+		jobID, jobID, DefaultServiceAttemptSummaries)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 func TestReconcileWriteHoldStaysBoundedAtThousandsOfIdleServices(t *testing.T) {
