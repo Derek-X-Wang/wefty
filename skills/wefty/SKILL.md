@@ -125,6 +125,30 @@ permanently as typed, with no secret scrubbing. See
 [`docs/contracts/exec.md`](../../docs/contracts/exec.md) for capture refusals,
 output fields, and storage cleanup.
 
+### Running `exec` from a sandboxed AI agent
+
+The agent's sandbox must allow writes to the snapshot folder:
+`~/.local/state/wefty/exec`, or `$XDG_STATE_HOME/wefty/exec` when
+`XDG_STATE_HOME` is an absolute path. Use the folder named by the error.
+The snapshot stays outside the checkout so this machine's node can read it.
+
+For Codex, add the absolute folder to `sandbox_workspace_write.writable_roots`
+in its configuration, or pass it when starting the session:
+
+```sh
+codex -c 'sandbox_workspace_write.writable_roots=["/Users/YOU/.local/state/wefty/exec"]'
+```
+
+For Claude Code, add the folder to `sandbox.filesystem.allowWrite` in its
+settings, for example:
+
+```json
+{"sandbox":{"filesystem":{"allowWrite":["~/.local/state/wefty/exec"]}}}
+```
+
+See Claude Code's [sandbox configuration](https://code.claude.com/docs/en/sandboxing#configure-sandboxing).
+After the allowance is active, check it with `wefty exec -- go version`.
+
 ## Retry safety and deliberate repeats
 
 `exec` creates a fresh run on every call; its internal submission retries use
