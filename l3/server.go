@@ -626,7 +626,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, err)
 			return
 		}
-		writeRunAccepted(w, record, replayed)
+		s.runAccepted(w, record, replayed)
 		return
 	}
 	record, replayed, err := s.store.CreateRun(r.Context(), CreateRunInput{
@@ -638,7 +638,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	writeRunAccepted(w, record, replayed)
+	s.runAccepted(w, record, replayed)
 }
 
 // listRecentRuns is the general listing. Its authorization is the read side of
@@ -998,7 +998,7 @@ func (s *Server) rerun(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
-	writeRunAccepted(w, record, replayed)
+	s.runAccepted(w, record, replayed)
 }
 
 func (s *Server) notImplemented(w http.ResponseWriter, r *http.Request) {
@@ -1040,6 +1040,13 @@ func (s *Server) getWorkflowVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, record)
+}
+
+// runAccepted answers an accepted run and wakes dispatch, so an idle ledger
+// submits it to L1 now instead of at its next reconcile pass (#945).
+func (s *Server) runAccepted(w http.ResponseWriter, record contract.RunRecord, replayed bool) {
+	s.reconciler.Wake()
+	writeRunAccepted(w, record, replayed)
 }
 
 func writeRunAccepted(w http.ResponseWriter, record contract.RunRecord, replayed bool) {

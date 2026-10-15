@@ -369,17 +369,20 @@ func setExecTestClaims(t *testing.T, clients *apiClients, enabled bool) {
 func TestExecHeartbeatAndFailure(t *testing.T) {
 	shortenExecTimers(t)
 	// The command stays quiet for longer than the idle limit; only the
-	// heartbeat keeps it alive. The margin absorbs a loaded CI runner.
-	stack := newExecStack(t, 2*time.Second)
+	// heartbeat keeps it alive. The margin absorbs a loaded CI runner. The
+	// runner reads output only as fast as the node's log spool accepts it,
+	// so a spool write stalled past the limit kills the command before it
+	// writes its result; hosted runners have stalled one past 2 s.
+	stack := newExecStack(t, 5*time.Second)
 	repo := execTestRepo(t)
 	t.Chdir(repo)
 	var out, errOut bytes.Buffer
 	started := time.Now()
-	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "sleep 3; exit 7"}, &out, &errOut)
+	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "sleep 6; exit 7"}, &out, &errOut)
 	if commandExitCode(err) != 10 || !strings.Contains(errOut.String(), "still running (1m)") || !strings.HasSuffix(errOut.String(), "failed\n") {
 		t.Fatalf("heartbeat/failure: %v %q %q", err, out.String(), errOut.String())
 	}
-	if time.Since(started) > 15*time.Second {
+	if time.Since(started) > 18*time.Second {
 		t.Fatal("heartbeat kept output pipes open after child exited")
 	}
 	page, e := stack.clients.listRuns(t.Context(), "", 20)

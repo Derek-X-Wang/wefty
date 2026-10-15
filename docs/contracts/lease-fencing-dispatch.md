@@ -390,7 +390,17 @@ start. Any other status L1 sent is its verdict even when the body is
 unreadable: a 2xx is the committed start, and any 4xx (such as a stale fence,
 an expired lease, or a pending cancellation) or 501 is a refusal. A refusal, or
 no verdict within the window, cancels the payload; it cannot remain running
-under refused or unanswered authority. For `kind=oci`, renewal never acknowledges
+under refused or unanswered authority.
+
+A process one-shot's agent sends the same acknowledgement after spawn, so a
+payload that prints nothing reads `running`, and its Run starts, at once
+rather than at its first output or its first renewal ten seconds after the
+claim (#945). For a one-shot it only reports the start: renewal still
+decides authority. A refusal, or no verdict within the window, leaves the
+payload to renewal exactly as before, and an L1 that accepts `Started` only
+for OCI leaves the legacy promotion in place.
+
+For `kind=oci`, renewal never acknowledges
 execution. Only after a durable `Started` may renewal start or re-arm the
 service stability clock under the rule below, on the bound alive Node under
 the Attempt's matching boot session and authority generation, inside the same
@@ -782,9 +792,12 @@ recomputed from the stored spec. A terminal one-shot whose secrets L1 has
 since scrubbed (see `state-machines.md`) therefore still replays: the
 identical request returns the stored job, whose spec is the scrubbed record.
 
-L3 commits the run row and dispatch intent atomically. The outbox reconciler
-uses a stable dispatch key derived from that intent for every retry while the
-run remains pending or dispatching. A crash between the L3 commit and L1
+L3 commits the run row and dispatch intent atomically. Accepting a run wakes
+the outbox reconciler, which then submits due intents at once instead of at
+its next pass (#945); the wake runs only that submission step, on the
+reconciler's own goroutine, and the pass cadence remains the retry path. The
+outbox reconciler uses a stable dispatch key derived from that intent for
+every retry while the run remains pending or dispatching. A crash between the L3 commit and L1
 response therefore converges on exactly one L1 job and one recorded run-to-job
 association while the run can still be dispatched.
 

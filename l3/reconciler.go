@@ -34,6 +34,9 @@ type Reconciler struct {
 	budget   time.Duration
 	interval time.Duration
 	onError  func(error)
+	// wake carries one coalesced request for an immediate dispatch, so an
+	// accepted run reaches L1 without waiting for the next pass (#945).
+	wake chan struct{}
 }
 
 func NewReconciler(store *Store, jobs JobClient, config ReconcilerConfig) (*Reconciler, error) {
@@ -59,7 +62,8 @@ func NewReconciler(store *Store, jobs JobClient, config ReconcilerConfig) (*Reco
 	if budget <= 0 {
 		budget = DefaultDispatchRecoveryBudget
 	}
-	return &Reconciler{store: store, jobs: jobs, images: images, lookup: lookup, budget: budget, interval: interval, onError: config.OnError}, nil
+	return &Reconciler{store: store, jobs: jobs, images: images, lookup: lookup, budget: budget, interval: interval, onError: config.OnError,
+		wake: make(chan struct{}, 1)}, nil
 }
 
 // ReconcileOnce makes one complete pass over every outstanding dispatch and
@@ -70,41 +74,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	if err := r.probeDispatchHold(ctx); err != nil {
 		passErrors = append(passErrors, err)
 	}
-	intents, err := r.store.pendingDispatches(ctx)
+	dispatchErrors, err := r.dispatchPending(ctx)
 	if err != nil {
 		return err
 	}
-	for _, intent := range intents {
-		runToken, err := r.store.beginDispatch(ctx, intent.RunID)
-		if errors.Is(err, errDispatchAbandoned) {
-			// The run ended, was canceled, or dispatch was deferred after
-			// this pass listed it. A job
-			// created by an earlier attempt is linked by lookup recovery,
-			// never by a new submit.
-			continue
-		}
-		if err != nil {
-			passErrors = append(passErrors, err)
-			continue
-		}
-		job, err := r.jobs.SubmitJob(ctx, intent.jobSpec(runToken))
-		if err != nil {
-			record := r.store.recordDispatchError
-			if !retryableDispatchError(err) {
-				record = r.store.failDispatch
-			}
-			err = r.store.observeL1Error(ctx, err)
-			if recordErr := record(ctx, intent.RunID, err); recordErr != nil {
-				passErrors = append(passErrors, errors.Join(err, recordErr))
-			} else {
-				passErrors = append(passErrors, err)
-			}
-			continue
-		}
-		if err := r.store.completeDispatch(ctx, intent.RunID, job.JobID); err != nil {
-			passErrors = append(passErrors, err)
-		}
-	}
+	passErrors = append(passErrors, dispatchErrors...)
 
 	runs, err := r.store.activeProjectedRuns(ctx)
 	if err != nil {
@@ -150,6 +124,48 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	}
 	passErrors = append(passErrors, r.recoverUnrecordedDispatchesRemote(ctx, remote)...)
 	return errors.Join(passErrors...)
+}
+
+// dispatchPending submits every due dispatch intent to L1. The listing error
+// is returned on its own: without it nothing was attempted.
+func (r *Reconciler) dispatchPending(ctx context.Context) ([]error, error) {
+	intents, err := r.store.pendingDispatches(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var passErrors []error
+	for _, intent := range intents {
+		runToken, err := r.store.beginDispatch(ctx, intent.RunID)
+		if errors.Is(err, errDispatchAbandoned) {
+			// The run ended, was canceled, or dispatch was deferred after
+			// this pass listed it. A job
+			// created by an earlier attempt is linked by lookup recovery,
+			// never by a new submit.
+			continue
+		}
+		if err != nil {
+			passErrors = append(passErrors, err)
+			continue
+		}
+		job, err := r.jobs.SubmitJob(ctx, intent.jobSpec(runToken))
+		if err != nil {
+			record := r.store.recordDispatchError
+			if !retryableDispatchError(err) {
+				record = r.store.failDispatch
+			}
+			err = r.store.observeL1Error(ctx, err)
+			if recordErr := record(ctx, intent.RunID, err); recordErr != nil {
+				passErrors = append(passErrors, errors.Join(err, recordErr))
+			} else {
+				passErrors = append(passErrors, err)
+			}
+			continue
+		}
+		if err := r.store.completeDispatch(ctx, intent.RunID, job.JobID); err != nil {
+			passErrors = append(passErrors, err)
+		}
+	}
+	return passErrors, nil
 }
 
 // settlePendingNodeAttributions names the node of runs the ledger failed while
@@ -198,9 +214,25 @@ func retryableDispatchError(err error) bool {
 	return a.Kind != l1WorkRefused || a.Method != "POST" || a.Target != "/v1/jobs"
 }
 
-// Run reconciles immediately and then on a fixed cadence until cancellation.
-// Transient pass failures are reported and retried rather than terminating the
-// crash-recovery loop.
+// Wake asks Run to dispatch due intents now rather than at its next pass. It
+// never blocks, and calls made before Run gets to it coalesce into one
+// dispatch. Only dispatch runs early: projection, recovery and the cadence
+// are unchanged, so a burst of accepted runs costs work in proportion to the
+// runs, never a full pass each.
+func (r *Reconciler) Wake() {
+	if r == nil {
+		return
+	}
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Run reconciles immediately and then on a fixed cadence until cancellation,
+// dispatching in between whenever Wake asks. Every pass and dispatch runs on
+// this one goroutine, so a wake never overlaps a pass. Transient pass failures
+// are reported and retried rather than terminating the crash-recovery loop.
 func (r *Reconciler) Run(ctx context.Context) error {
 	r.reconcileAndReport(ctx)
 	ticker := time.NewTicker(r.interval)
@@ -211,7 +243,16 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			r.reconcileAndReport(ctx)
+		case <-r.wake:
+			r.dispatchAndReport(ctx)
 		}
+	}
+}
+
+func (r *Reconciler) dispatchAndReport(ctx context.Context) {
+	passErrors, err := r.dispatchPending(ctx)
+	if err := errors.Join(append(passErrors, err)...); err != nil && r.onError != nil && ctx.Err() == nil {
+		r.onError(err)
 	}
 }
 
