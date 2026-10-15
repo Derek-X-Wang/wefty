@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"text/template"
+
+	"github.com/Derek-X-Wang/wefty/workflows/dogfood"
 )
 
 //go:embed templates/inline-writer.sh
@@ -41,11 +43,16 @@ var typeScriptReadmeTemplate string
 //go:embed templates/integration_test_ts.go.tmpl
 var typeScriptIntegrationTestTemplate string
 
+// packageJSONTemplate takes its devDependencies from the dogfood lockfile, and
+// the scaffold's package-lock.json is derived from that lockfile whole
+// (toolchain.go), so neither carries a version of its own.
+//
 //go:embed templates/package.json.tmpl
 var packageJSONTemplate string
 
-//go:embed templates/package-lock.json.tmpl
-var packageLockTemplate string
+// packageLockTemplate writes the derived lockfile as it is: text/template
+// does not escape.
+const packageLockTemplate = "{{.PackageLock}}"
 
 //go:embed templates/tsconfig.json
 var tsconfigTemplate string
@@ -100,6 +107,12 @@ type scaffold struct {
 	GoPackage    string
 	TestPrefix   string
 	InlineWriter string
+	// Toolchain, PackageVersion and NodeEngine fill the TypeScript package.json;
+	// PackageLock is its lockfile, derived whole, which carries the same values.
+	Toolchain      []pinnedPackage
+	PackageVersion string
+	NodeEngine     string
+	PackageLock    string
 }
 
 // scaffoldFile is one written file: its name in the workflow directory, the
@@ -168,6 +181,18 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 		// extension (runner/process), and no TypeScript runtime strips types
 		// from that. So the starter is the dogfood shape: src/NAME.ts bundled
 		// by the author's own `npm run build` into one dist/NAME.mjs.
+		//
+		// The build toolchain is the one workflows/dogfood pins and proves,
+		// read from its lockfile, so a Dependabot bump there is a bump here
+		// with no second edit (#952).
+		toolchain, lock, err := deriveTypeScriptToolchain(dogfood.PackageLock(), data.PackageName, typeScriptToolchain)
+		if err != nil {
+			return fmt.Errorf("derive the TypeScript toolchain from workflows/dogfood/package-lock.json: %w", err)
+		}
+		data.Toolchain = toolchain
+		data.PackageVersion = scaffoldPackageVersion
+		data.NodeEngine = scaffoldNodeEngine
+		data.PackageLock = string(lock)
 		data.InlineWriter = inlineTypeScriptWriter
 		data.ScriptName = filepath.Join("dist", name+".mjs")
 		files = []scaffoldFile{
