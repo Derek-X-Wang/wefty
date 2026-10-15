@@ -17,7 +17,8 @@ import (
 func TestJobListingReviewClampedCursorWalk(t *testing.T) {
 	for _, route := range []string{"jobs", "services", "children"} {
 		t.Run(route, func(t *testing.T) {
-			h := newIntegrationHarness(t, nil)
+			// The walk needs HTTP, so keep the server but hold the reconcile ticker off: a pass over 501 services starves the writes below on slow hosts (#939).
+			h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{}, nil, true, time.Hour)
 			client := h.client(fabric.Identity{NodeID: "client", Tags: []string{DefaultClientPrincipalTag}})
 			seedJobListingRows(t, h.store, 1001)
 			parent, _, err := h.store.CreateJob(t.Context(), operatorServiceSpec("review-parent", nil))
