@@ -74,13 +74,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, err
 	}
 
-	rows, err := tx.QueryContext(ctx, `SELECT attempts.attempt_id
-		FROM attempts JOIN jobs ON jobs.job_id=attempts.job_id
-		WHERE attempts.state IN (?, ?, ?) AND (attempts.lease_expires_ns<=? OR (jobs.outcome='canceled' AND jobs.cancel_settle_by_ns<=?))
-			AND jobs.current_attempt_id=attempts.attempt_id
-			AND jobs.state IN (?, ?, ?, ?)`,
-		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput, now.UnixNano(), now.UnixNano(),
-		contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput, contract.JobStopping)
+	rows, err := tx.QueryContext(ctx, expiredAttemptsSQL, expiredAttemptsArguments(now)...)
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "select expired attempts")
 	}
@@ -229,6 +223,42 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		s.reconcileHoldForTest(time.Since(locked))
 	}
 	return result, nil
+}
+
+// expiredAttemptsSQL selects every active Attempt that is its active Job's
+// current Attempt and whose lease has run out, or whose one-shot was canceled
+// and is past its settlement deadline: the statement every pass ran before
+// #948, split at its OR. Each branch walks its own index up to now, so a pass
+// reads only active Attempts and canceled active Jobs whose deadline has
+// passed, never every active Job: attempts_lease_expiry for leases, and
+// jobs_cancel_settlement, which holds only canceled Jobs, for cancellations.
+// UNION drops an Attempt both branches find.
+const expiredAttemptsSQL = `SELECT attempts.attempt_id
+	FROM attempts JOIN jobs ON jobs.job_id=attempts.job_id
+	WHERE attempts.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
+		AND attempts.lease_expires_ns<=@now_ns
+		AND jobs.current_attempt_id=attempts.attempt_id
+		AND jobs.state IN (@job_claimed, @job_running, @job_awaiting_input, @job_stopping)
+	UNION
+	SELECT attempts.attempt_id
+	FROM jobs JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
+	WHERE jobs.outcome='canceled'
+		AND jobs.state IN (@job_claimed, @job_running, @job_awaiting_input, @job_stopping)
+		AND jobs.cancel_settle_by_ns<=@now_ns
+		AND attempts.job_id=jobs.job_id
+		AND attempts.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)`
+
+func expiredAttemptsArguments(now time.Time) []any {
+	return []any{
+		sql.Named("attempt_claimed", contract.AttemptClaimed),
+		sql.Named("attempt_running", contract.AttemptRunning),
+		sql.Named("attempt_awaiting_input", contract.AttemptAwaitingInput),
+		sql.Named("job_claimed", contract.JobClaimed),
+		sql.Named("job_running", contract.JobRunning),
+		sql.Named("job_awaiting_input", contract.JobAwaitingInput),
+		sql.Named("job_stopping", contract.JobStopping),
+		sql.Named("now_ns", now.UnixNano()),
+	}
 }
 
 func (s *Store) reconcileClaimingNode(ctx context.Context, tx *sql.Tx, nodeID string, state contract.NodeState, heartbeat, now time.Time) (contract.NodeState, error) {
