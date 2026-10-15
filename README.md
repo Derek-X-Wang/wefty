@@ -41,9 +41,12 @@ environment variables, which win over the profile, which wins over built-in
 defaults. Running setup again changes only what is wrong.
 
 ```sh
-go build -o .bin/ ./cmd/wefty ./cmd/wefty-l1 ./cmd/wefty-l3 ./cmd/wefty-agent
-.bin/wefty setup
-wefty status    # in a new shell, with no flags
+# The same build `wefty upgrade` makes, so the first upgrade on this commit is a no-op.
+CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+  -ldflags="-X main.version=$(git rev-parse HEAD)" \
+  -o .bin/ ./cmd/wefty ./cmd/wefty-l1 ./cmd/wefty-l3 ./cmd/wefty-agent
+.bin/wefty setup   # from a fresh Terminal window, so the node agent gets your login PATH
+wefty status       # in a new shell, with no flags
 ```
 
 Data lives in `~/Library/Application Support/wefty` (fresh databases; setup

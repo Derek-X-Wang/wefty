@@ -62,6 +62,10 @@ const (
 	// another shutdown phase.
 	setupNodeAgentExitSlack = 10 * time.Second
 	setupLoginShellBudget   = 20 * time.Second
+	// setupVersionProbeBudget bounds asking the four binaries for their version,
+	// and setupVersionOutputLimit bounds one answer: a version is one short word.
+	setupVersionProbeBudget = 10 * time.Second
+	setupVersionOutputLimit = 256
 	setupPATHBegin          = "__WEFTY_LOGIN_PATH_BEGIN__"
 	setupPATHEnd            = "__WEFTY_LOGIN_PATH_END__"
 )
@@ -92,7 +96,9 @@ type setupHost struct {
 	// l1Address and l3Address are the ports a new profile gets.
 	l1Address, l3Address string
 	unloadBound          time.Duration
-	upgrade              *upgradeHost
+	// versionProbeBudget shortens setupVersionProbeBudget in tests; zero uses it.
+	versionProbeBudget time.Duration
+	upgrade            *upgradeHost
 }
 
 type setupRequest struct {
@@ -490,6 +496,13 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		}
 		return runSetup(ctx, host, request)
 	}
+	// Upgrade passes the commit it already checked every staged binary for.
+	// Setup asks the binaries it was given, so the receipt holds only what
+	// they report.
+	reportedVersion, versionProblem := "", ""
+	if request.installedVersion == "" {
+		reportedVersion, versionProblem = reportedSetupVersion(ctx, host, home, sourceDirectory)
+	}
 	if request.beforeWrites != nil {
 		if err := request.beforeWrites(); err != nil {
 			return report, err
@@ -522,7 +535,7 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	manifest := setupManifest{Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
 	if payload, err := homeRoot.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
 		if json.Unmarshal(payload, &previous) == nil && previous.Version == 1 {
-			if manifest.InstalledVersion == "" {
+			if request.installedVersion == "" {
 				manifest.UpgradeSource = previous.UpgradeSource
 				unchanged := true
 				for _, name := range setupBinaries {
@@ -543,6 +556,13 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 				}
 			}
 		}
+	}
+	// What the binaries report wins. Without a report, the previous receipt's
+	// version stands only for byte-identical binaries.
+	if reportedVersion != "" {
+		manifest.InstalledVersion = reportedVersion
+	} else if versionProblem != "" && manifest.InstalledVersion == "" {
+		report.Notes = append(report.Notes, versionProblem)
 	}
 	if request.deferSkills {
 		unownedWarning := false
@@ -1021,6 +1041,107 @@ func captureLoginPATH(ctx context.Context, host setupHost) (string, error) {
 		return "", fmt.Errorf("read the login-shell PATH from %s: the shell did not print one PATH", shell)
 	}
 	return lines[0], nil
+}
+
+// reportedSetupVersion asks each binary setup installs for its version, the
+// `--version` check upgrade makes of its own build. It returns a version only
+// when all four print the same one, so the receipt never holds a guessed
+// commit; otherwise it returns why there is none. A development build reports
+// `dev`, which is recorded as is: upgrade compares it with a full commit, so it
+// never counts as current. A binary that prints too much or does not answer in
+// time is stopped and gives no version; setup goes on without one.
+func reportedSetupVersion(ctx context.Context, host setupHost, home, directory string) (string, string) {
+	budget := host.versionProbeBudget
+	if budget <= 0 {
+		budget = setupVersionProbeBudget
+	}
+	probe, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	environment := []string{"HOME=" + home, "PATH=" + setupServicePATH}
+	reports := make([]string, 0, len(setupBinaries))
+	agreed := true
+	for _, name := range setupBinaries {
+		path := filepath.Join(directory, name)
+		output, err := runVersionProbe(probe, directory, environment, path)
+		switch {
+		case errors.Is(err, errVersionOutputLimit):
+			return "", fmt.Sprintf("%s --version printed more than %d bytes, not a version; setup recorded no installed version", path, setupVersionOutputLimit)
+		case err != nil && probe.Err() != nil:
+			return "", fmt.Sprintf("%s --version did not answer within %s; setup recorded no installed version", path, budget)
+		case err != nil:
+			return "", fmt.Sprintf("could not read the version of %s (%v); setup recorded no installed version", path, err)
+		}
+		value := strings.TrimSpace(string(output))
+		if !validReportedVersion(value) {
+			if len(value) > 64 {
+				value = value[:64] + "..."
+			}
+			return "", fmt.Sprintf("%s --version printed %q, not a version; setup recorded no installed version", path, value)
+		}
+		agreed = agreed && (len(reports) == 0 || value == reports[0])
+		reports = append(reports, value)
+	}
+	if !agreed {
+		described := make([]string, len(setupBinaries))
+		for index, name := range setupBinaries {
+			described[index] = name + " " + reports[index]
+		}
+		return "", "the binaries report different versions (" + strings.Join(described, ", ") + "); setup recorded no installed version"
+	}
+	return reports[0], ""
+}
+
+var errVersionOutputLimit = errors.New("version output limit exceeded")
+
+// versionOutput keeps at most limit bytes of an answer. A longer answer stops
+// the process at once, so a binary that prints without end cannot fill memory
+// and is not read to the end.
+type versionOutput struct {
+	buffer   bytes.Buffer
+	limit    int
+	exceeded bool
+	stop     context.CancelFunc
+}
+
+func (output *versionOutput) Write(payload []byte) (int, error) {
+	if output.exceeded || output.buffer.Len()+len(payload) > output.limit {
+		output.exceeded = true
+		output.stop()
+		return 0, errVersionOutputLimit
+	}
+	return output.buffer.Write(payload)
+}
+
+// runVersionProbe runs path --version and returns its standard output, at
+// most setupVersionOutputLimit bytes. Standard error is discarded.
+func runVersionProbe(ctx context.Context, directory string, environment []string, path string) ([]byte, error) {
+	run, stop := context.WithCancel(ctx)
+	defer stop()
+	output := &versionOutput{limit: setupVersionOutputLimit, stop: stop}
+	command := exec.CommandContext(run, path, "--version")
+	command.Dir, command.Env, command.Stdout, command.WaitDelay = directory, environment, output, time.Second
+	err := command.Run()
+	// Run has waited for the copy into output, so exceeded is final here.
+	if output.exceeded {
+		return nil, errVersionOutputLimit
+	}
+	if err != nil {
+		return nil, err
+	}
+	return output.buffer.Bytes(), nil
+}
+
+// validReportedVersion accepts one printable word, as `--version` prints.
+func validReportedVersion(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if character <= ' ' || character > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 // setupSkillFiles prepares the embedded skill's files for both skill
