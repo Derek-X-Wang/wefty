@@ -159,7 +159,7 @@ jobs:
             port=$((port + 1))
           done
       - name: Upload reproducibility and runtime evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: wefty-echo-service-platform-${{ matrix.arch }}-${{ github.sha }}
           path: ${{ runner.temp }}/acceptance-image-linux
@@ -182,7 +182,7 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Download platform digest evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: wefty-echo-service-platform-*-${{ github.sha }}
           path: ${{ runner.temp }}/platforms
@@ -362,7 +362,7 @@ jobs:
           tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP" \
             -cf "$package/wefty-acceptance-image-release.tar" acceptance-image-release
       - name: Upload stable acceptance image outputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: wefty-echo-service-${{ github.sha }}
           path: ${{ runner.temp }}/acceptance-image-package
@@ -485,7 +485,7 @@ jobs:
             > "$evidence/${ARCH}-runtime.complete.json"
           mv "$evidence/${ARCH}-runtime.complete.json" "$evidence/${ARCH}-runtime.json"
       - name: Upload reference desktop evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.artifact }}-platform-${{ matrix.arch }}-${{ github.sha }}
           path: ${{ runner.temp }}/computer-image-linux
@@ -506,7 +506,7 @@ jobs:
           go-version-file: go.mod
           cache: false
       - name: Download executed platform evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: wefty-computer-reference-platform-*-${{ github.sha }}
           path: ${{ runner.temp }}/computer-platforms
@@ -596,7 +596,7 @@ jobs:
           tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP" \
             -cf "$package/wefty-computer-reference-release.tar" computer-image-release
       - name: Upload stable Computer image outputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: wefty-computer-reference-${{ github.sha }}
           path: ${{ runner.temp }}/computer-image-package
@@ -617,7 +617,7 @@ jobs:
           go-version-file: go.mod
           cache: false
       - name: Download executed Wayland platform evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: wefty-computer-wayland-reference-platform-*-${{ github.sha }}
           path: ${{ runner.temp }}/wayland-computer-platforms
@@ -711,7 +711,7 @@ jobs:
           tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP" \
             -cf "$package/wefty-computer-wayland-reference-release.tar" wayland-computer-image-release
       - name: Upload stable Wayland Computer image outputs
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: wefty-computer-wayland-reference-${{ github.sha }}
           path: ${{ runner.temp }}/wayland-computer-image-package

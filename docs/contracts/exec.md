@@ -59,6 +59,14 @@ or start-folder failures print `wefty: snapshot checkout failed` and write an
 these failures with typed unavailable exit 13. Private clones use `--template=`;
 all Git calls disable hooks with `-c core.hooksPath=/dev/null`.
 
+On an idle node a run starts within about two seconds of acceptance, whether
+or not the command prints anything: L3 submits it to L1 on acceptance, the
+node claims it within its one-second idle claim interval and acknowledges
+the wrapper's start at once, and L3 records the start on its next one-second
+pass (#945). The queued notice, printed when a run has not started three
+seconds into watching, therefore points at a busy, ineligible or absent node
+rather than at a normal start.
+
 Without `--json`, exec follows the normal log drain, including queued and truncation notices,
 before printing the terminal verdict to stderr. Stdout contains only command
 stdout. Success exits 0. Failure uses the shared

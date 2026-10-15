@@ -107,7 +107,7 @@ jobs:
           WEFTY_FABRIC_MACHINE_RECEIPT: ${{ runner.temp }}/fabric-machine-identity.json
         run: go test -count=1 -timeout=5m -v -tags=tsnet_smoke ./fabric/tsnet -run '^TestTSNetSmoke$'
       - name: Upload machine Fabric identity receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fabric-machine-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/fabric-machine-identity.json
@@ -154,7 +154,7 @@ jobs:
           WEFTY_FABRIC_PERSON_RECEIPT: ${{ runner.temp }}/fabric-person-identity.json
         run: go test -count=1 -timeout=5m -v -tags=tsnet_smoke ./fabric/tsnet -run '^TestTSNetPersonWhoAmI$'
       - name: Upload person Fabric identity receipt
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fabric-person-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/fabric-person-identity.json
@@ -199,7 +199,7 @@ jobs:
           git checkout --detach "$EXPECTED_SHA"
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Download the triggering publication artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: wefty-echo-service-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/acceptance-image-download
@@ -207,7 +207,7 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ needs.resolve-published-artifact.outputs.run-id }}
       - name: Download the matching Computer image artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: wefty-computer-reference-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/computer-image-download
@@ -215,7 +215,7 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ needs.resolve-published-artifact.outputs.run-id }}
       - name: Download the matching Wayland Computer image artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: wefty-computer-wayland-reference-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/wayland-computer-image-download
@@ -574,7 +574,7 @@ jobs:
           set -e
       - name: Upload service acceptance evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: service-acceptance-realtiming-${{ matrix.os }}-${{ matrix.image }}-${{ env.CANDIDATE_SHA }}
           path: ${{ runner.temp }}/service-acceptance-realtiming
@@ -607,25 +607,25 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
       - name: Download the Linux XFCE matrix receipt
         if: needs.resolve-published-artifact.outputs.available == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: service-acceptance-realtiming-ubuntu-latest-xfce-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/linux-computer-receipt-xfce
       - name: Download the Linux Wayland matrix receipt
         if: needs.resolve-published-artifact.outputs.available == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: service-acceptance-realtiming-ubuntu-latest-wayland-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/linux-computer-receipt-wayland
       - name: Download the machine Fabric identity receipt
         if: needs.fabric-machine-identity.result == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fabric-machine-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/fabric-machine-identity
       - name: Download the person Fabric identity receipt
         if: needs.fabric-person-identity.result == 'success'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fabric-person-identity-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/fabric-person-identity
@@ -744,21 +744,21 @@ jobs:
           done
       - name: Upload the combined Fabric identity receipt
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fabric-identity-receipt-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/fabric-identity-receipt.json
           if-no-files-found: warn
       - name: Upload the M3 OCI acceptance matrix
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: oci-acceptance-matrix-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/oci-acceptance-matrix.json
           if-no-files-found: warn
       - name: Upload the agent-computer acceptance matrix
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: computer-acceptance-matrix-${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           path: ${{ runner.temp }}/computer-acceptance-matrix.json
