@@ -2470,6 +2470,12 @@ func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
 	lateCompletion := make(chan struct{}, 1)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if strings.Contains(request.URL.Path, "attempt-live") {
+			// The live lifecycle acknowledges its own one-shot start (#945);
+			// recovery never sends Started, so only other paths count.
+			if strings.HasSuffix(request.URL.Path, "/started") {
+				_ = json.NewEncoder(w).Encode(l1.Job{})
+				return
+			}
 			liveRequest <- request.URL.Path
 			if strings.HasSuffix(request.URL.Path, "/logs") {
 				_ = json.NewEncoder(w).Encode(l1.AppendLogsResponse{Acknowledged: map[contract.LogStream]uint64{contract.LogStdout: 0}})
