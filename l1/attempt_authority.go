@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -114,46 +116,162 @@ func promoteExecution(ctx context.Context, tx *sql.Tx, attemptID string, now tim
 	return nil
 }
 
-func interruptServiceStability(ctx context.Context, tx *sql.Tx) error {
-	if _, err := tx.ExecContext(ctx, `UPDATE service_jobs SET healthy_since_ns=NULL
-		WHERE healthy_since_ns IS NOT NULL
-			AND EXISTS (
-				SELECT 1 FROM jobs
-				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
-				JOIN nodes ON nodes.node_id=attempts.node_id
-				WHERE jobs.job_id=service_jobs.job_id
-					AND service_jobs.bound_node_id=attempts.node_id
-					AND (nodes.state<>?
-						OR attempts.boot_session_id<>nodes.boot_session_id
-						OR attempts.authority_generation<>nodes.authority_generation)
-			)`, contract.NodeAlive); err != nil {
-		return internalError(err, "interrupt service stability on unavailable or replaced nodes")
-	}
-	return nil
+// serviceHealthLost is the interruption rule: the service is healthy, and
+// the Node of its current Attempt, which is its bound Node, is no longer
+// recorded alive with that Attempt's registration.
+const serviceHealthLost = `healthy_since_ns IS NOT NULL
+	AND EXISTS (
+		SELECT 1 FROM jobs
+		JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
+		JOIN nodes ON nodes.node_id=attempts.node_id
+		WHERE jobs.job_id=service_jobs.job_id
+			AND service_jobs.bound_node_id=attempts.node_id
+			AND (nodes.state<>?
+				OR attempts.boot_session_id<>nodes.boot_session_id
+				OR attempts.authority_generation<>nodes.authority_generation)
+	)`
+
+// interruptNodeServiceStabilitySQL applies the interruption rule to the
+// healthy services bound to one Node, through the service_jobs_healthy_node
+// index: once interrupted, a service leaves that index, so a Node with none
+// costs one index probe.
+const interruptNodeServiceStabilitySQL = `UPDATE service_jobs SET healthy_since_ns=NULL
+	WHERE bound_node_id=? AND ` + serviceHealthLost
+
+// nodeLivenessKey is what the health of an alive Node's services depends on:
+// health is set only while the Node is recorded alive with the Attempt's boot
+// session and registration generation. Every registration advances the
+// generation and nothing lowers it, so an alive Node whose key is unchanged
+// since the last committed pass can hold no health the rule must clear,
+// whatever happened between the passes. A Node not recorded alive is checked
+// on every pass instead, through the index of healthy services, so no
+// timestamp, which a clock step can repeat, decides whether it is read.
+type nodeLivenessKey struct {
+	state               contract.NodeState
+	bootSessionID       string
+	authorityGeneration int64
 }
 
+// serviceHealthNodes holds each Node's liveness key as the last committed
+// reconcile pass saw it, or nil before this process's first pass.
+type serviceHealthNodes struct {
+	mu   sync.Mutex
+	seen map[string]nodeLivenessKey
+}
+
+func (nodes *serviceHealthNodes) load() map[string]nodeLivenessKey {
+	nodes.mu.Lock()
+	defer nodes.mu.Unlock()
+	return nodes.seen
+}
+
+func (nodes *serviceHealthNodes) save(seen map[string]nodeLivenessKey) {
+	nodes.mu.Lock()
+	defer nodes.mu.Unlock()
+	nodes.seen = seen
+}
+
+// interruptServiceStability clears the health of services whose Node is no
+// longer recorded alive with their current Attempt's registration, without
+// reading every service (#942): it reads the healthy services of every Node
+// not recorded alive, and of every alive Node whose key changed since the
+// last committed pass (nodeLivenessKey). seen is the keys of that pass; with
+// none, this process's first pass checks every service. It returns the keys
+// for the caller to keep once it commits.
+func interruptServiceStability(ctx context.Context, tx *sql.Tx, seen map[string]nodeLivenessKey) (map[string]nodeLivenessKey, error) {
+	current, err := readNodeLivenessKeys(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if seen == nil {
+		if _, err := interruptEveryServiceStability(ctx, tx); err != nil {
+			return nil, err
+		}
+		return current, nil
+	}
+	nodeIDs := make([]string, 0, len(current))
+	for nodeID, key := range current {
+		if previous, ok := seen[nodeID]; key.state != contract.NodeAlive || !ok || previous != key {
+			nodeIDs = append(nodeIDs, nodeID)
+		}
+	}
+	sort.Strings(nodeIDs)
+	for _, nodeID := range nodeIDs {
+		if _, err := tx.ExecContext(ctx, interruptNodeServiceStabilitySQL, nodeID, contract.NodeAlive); err != nil {
+			return nil, internalError(err, "interrupt service stability on an unavailable or replaced node")
+		}
+	}
+	return current, nil
+}
+
+// interruptEveryServiceStability applies the interruption rule to every
+// service.
+func interruptEveryServiceStability(ctx context.Context, tx *sql.Tx) (int64, error) {
+	result, err := tx.ExecContext(ctx, `UPDATE service_jobs SET healthy_since_ns=NULL
+		WHERE `+serviceHealthLost, contract.NodeAlive)
+	if err != nil {
+		return 0, internalError(err, "interrupt service stability on unavailable or replaced nodes")
+	}
+	interrupted, err := result.RowsAffected()
+	if err != nil {
+		return 0, internalError(err, "read service stability interruption result")
+	}
+	return interrupted, nil
+}
+
+func readNodeLivenessKeys(ctx context.Context, tx *sql.Tx) (map[string]nodeLivenessKey, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT node_id, state, boot_session_id, authority_generation FROM nodes`)
+	if err != nil {
+		return nil, internalError(err, "read node liveness")
+	}
+	defer rows.Close()
+	keys := map[string]nodeLivenessKey{}
+	for rows.Next() {
+		var nodeID string
+		var key nodeLivenessKey
+		if err := rows.Scan(&nodeID, &key.state, &key.bootSessionID, &key.authorityGeneration); err != nil {
+			return nil, internalError(err, "scan node liveness")
+		}
+		keys[nodeID] = key
+	}
+	if err := rows.Err(); err != nil {
+		return nil, internalError(err, "iterate node liveness")
+	}
+	return keys, nil
+}
+
+// serviceStabilityResetSQL is the reconcile stability rule. Its first terms
+// match the service_jobs_stability_due index, so it reads only the services
+// due for a reset.
+const serviceStabilityResetSQL = `UPDATE service_jobs SET restart_streak=0
+	WHERE restart_streak>0
+		AND desired_state=?
+		AND healthy_since_ns IS NOT NULL
+		AND healthy_since_ns<=?
+		AND EXISTS (
+			SELECT 1 FROM jobs
+			JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
+			JOIN nodes ON nodes.node_id=attempts.node_id
+			WHERE jobs.job_id=service_jobs.job_id
+				AND jobs.state=?
+				AND attempts.state=?
+				AND attempts.lease_expires_ns>?
+				AND nodes.state=?
+				AND attempts.boot_session_id=nodes.boot_session_id
+				AND attempts.authority_generation=nodes.authority_generation
+				AND service_jobs.bound_node_id=attempts.node_id
+		)`
+
+// reconcileServiceStability resets the failure streak of services stable for
+// the window. Only a service with a positive streak and health established
+// at least the window ago can reset, and the service_jobs_stability_due
+// index holds exactly those with a positive streak and health, by health
+// time, so a pass reads the due ones, never every service (#942).
 func reconcileServiceStability(ctx context.Context, tx *sql.Tx, now time.Time, window time.Duration) (int64, error) {
 	// Node liveness is resolved first at the same clock snapshot. In
 	// particular, a node that reaches the equal two-minute dead/stability
 	// boundary is dead and cannot reset a service's failure streak.
-	resets, err := tx.ExecContext(ctx, `UPDATE service_jobs SET restart_streak=0
-		WHERE restart_streak>0
-			AND desired_state=?
-			AND healthy_since_ns IS NOT NULL
-			AND healthy_since_ns<=?
-			AND EXISTS (
-				SELECT 1 FROM jobs
-				JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
-				JOIN nodes ON nodes.node_id=attempts.node_id
-				WHERE jobs.job_id=service_jobs.job_id
-					AND jobs.state=?
-					AND attempts.state=?
-					AND attempts.lease_expires_ns>?
-					AND nodes.state=?
-					AND attempts.boot_session_id=nodes.boot_session_id
-					AND attempts.authority_generation=nodes.authority_generation
-					AND service_jobs.bound_node_id=attempts.node_id
-			)`, contract.ServiceDesiredRunning, now.Add(-window).UnixNano(),
+	resets, err := tx.ExecContext(ctx, serviceStabilityResetSQL, contract.ServiceDesiredRunning, now.Add(-window).UnixNano(),
 		contract.JobRunning, contract.AttemptRunning, now.UnixNano(), contract.NodeAlive)
 	if err != nil {
 		return 0, internalError(err, "reset stable service restart streaks")

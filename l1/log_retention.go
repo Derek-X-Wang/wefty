@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"sort"
 	"time"
-
-	"github.com/Derek-X-Wang/wefty/contract"
 )
 
 // logRetentionLimits are the #52 bounds beside #49's service bounds: one-shot
@@ -67,6 +65,10 @@ const (
 	// re-trims. Ingest is the first byte site; this catches a job left over a
 	// lowered cap or an append-bounded backlog.
 	byteSweepJobBudget = 16
+	// hotPathSummaryRows bounds how many attempt index entries a claim,
+	// completion or log append reads at each end of its service's history
+	// below the summary floor (pruneServiceAttemptSummaries).
+	hotPathSummaryRows = 32
 )
 
 // evictionBudget is what one transaction may still delete.
@@ -354,33 +356,43 @@ func nullableInt64(value sql.NullInt64) any {
 // and pruning such an attempt would cascade its continuity record and refuse
 // its next upload as attempt_not_found. So a live attempt, and a lost one
 // whose late-evidence window is still open, are never pruned.
+//
+// Claims, completions and log appends call it in their own write
+// transaction, so it reads a bounded number of attempt index entries however
+// long the service's history is (#942): at most hotPathSummaryRows at each end
+// of the history below the floor. The newest end is where an attempt lands
+// when the call moves it off the floor; the oldest is where retention trims
+// logs first, by insertion order or age. Anything prunable between the ends
+// is the reconcile sweep's, within one round of its walk.
 func (s *Store) pruneServiceAttemptSummaries(ctx context.Context, tx *sql.Tx, jobID string, now time.Time) (int64, error) {
-	lateEvidenceOpenSince := now.Add(-s.lateEvidenceWindow).UnixNano()
-	result, err := tx.ExecContext(ctx, `DELETE FROM attempts
-		WHERE job_id=?
-			AND EXISTS (SELECT 1 FROM service_jobs WHERE service_jobs.job_id=attempts.job_id)
-			AND attempt_id<>COALESCE((SELECT current_attempt_id FROM jobs WHERE job_id=?), '')
-			AND state NOT IN (?, ?, ?)
-			AND NOT (state=? AND updated_ns>=?)
-			AND NOT EXISTS (SELECT 1 FROM log_events WHERE log_events.attempt_id=attempts.attempt_id)
-			AND attempt_id NOT IN (
-				SELECT attempt_id FROM attempts recent
-				WHERE recent.job_id=?
-					AND recent.attempt_id<>COALESCE((SELECT current_attempt_id FROM jobs WHERE job_id=?), '')
-				ORDER BY recent.created_ns DESC, recent.attempt_id DESC
-				LIMIT ?
-			)`, jobID, jobID,
-		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput,
-		contract.AttemptLost, lateEvidenceOpenSince,
-		jobID, jobID, DefaultServiceAttemptSummaries)
-	if err != nil {
-		return 0, internalError(err, "prune empty service attempt summaries")
+	service, err := jobIsService(ctx, tx, jobID)
+	if err != nil || !service {
+		return 0, err
 	}
-	pruned, err := result.RowsAffected()
-	if err != nil {
-		return 0, internalError(err, "read service attempt pruning result")
+	floor, found, err := attemptSummaryFloor(ctx, tx, jobID)
+	if err != nil || !found {
+		return 0, err
 	}
-	return pruned, nil
+	oldest, err := attemptHistoryKeys(ctx, tx, jobID, summaryWalk{}, floor, hotPathSummaryRows)
+	if err != nil {
+		return 0, err
+	}
+	newest, err := attemptKeysBelowFloor(ctx, tx, jobID, floor, hotPathSummaryRows)
+	if err != nil {
+		return 0, err
+	}
+	// The two ends overlap on a short history; each attempt is listed once.
+	listed := make(map[string]bool, len(oldest))
+	for _, key := range oldest {
+		listed[key.attemptID] = true
+	}
+	keys := oldest
+	for _, key := range newest {
+		if !listed[key.attemptID] {
+			keys = append(keys, key)
+		}
+	}
+	return s.pruneListedAttemptSummaries(ctx, tx, jobID, keys, now)
 }
 
 func readLogTruncation(ctx context.Context, q queryer, jobID string) (*LogTruncation, error) {

@@ -56,11 +56,20 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "read stale-node result")
 	}
-	// Resolve Node liveness before service stability at the same clock snapshot.
-	if err := interruptServiceStability(ctx, tx); err != nil {
-		return ReconcileResult{}, err
+	// Resolve Node liveness before service stability at the same clock
+	// snapshot. Neither step reads every service (#942): interruption reads
+	// the healthy services of Nodes not alive, or alive with a changed state or
+	// registration since the last committed pass, and the streak reset reads
+	// the services due for it.
+	var seenNodes map[string]nodeLivenessKey
+	if s.reconcileLivenessForTest != nil {
+		result.RestartStreakResets, err = s.reconcileLivenessForTest(ctx, tx, now)
+	} else {
+		seenNodes, err = interruptServiceStability(ctx, tx, s.serviceHealthNodes.load())
+		if err == nil {
+			result.RestartStreakResets, err = reconcileServiceStability(ctx, tx, now, s.serviceStabilityWindow)
+		}
 	}
-	result.RestartStreakResets, err = reconcileServiceStability(ctx, tx, now, s.serviceStabilityWindow)
 	if err != nil {
 		return ReconcileResult{}, err
 	}
@@ -215,6 +224,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, internalError(err, "commit L1 reconciliation")
 	}
 	s.retentionSweep.save(next)
+	s.serviceHealthNodes.save(seenNodes)
 	if s.reconcileHoldForTest != nil {
 		s.reconcileHoldForTest(time.Since(locked))
 	}

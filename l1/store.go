@@ -117,9 +117,18 @@ type Store struct {
 	// retentionSweep is where the reconcile pass's bounded retention steps
 	// resume.
 	retentionSweep retentionSweepCursor
+	// serviceHealthNodes is each Node's liveness as the last committed
+	// reconcile pass saw it, so the next interrupts health only on Nodes that
+	// changed.
+	serviceHealthNodes serviceHealthNodes
 	// reconcileHoldForTest, when set before the Store is shared, observes how
 	// long each committed reconcile pass held the write lock.
 	reconcileHoldForTest func(time.Duration)
+	// reconcileLivenessForTest, when set before the Store is shared, replaces
+	// each pass's service-liveness step (interruption and the streak reset),
+	// so a test can run the statements L1 had before #942 through an
+	// otherwise identical pass.
+	reconcileLivenessForTest func(context.Context, *sql.Tx, time.Time) (int64, error)
 }
 
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
@@ -556,6 +565,14 @@ CREATE INDEX IF NOT EXISTS service_jobs_bound_desired ON service_jobs(bound_node
 -- deleted attempt scans every service (#939).
 CREATE INDEX IF NOT EXISTS service_jobs_published_attempt ON service_jobs(published_attempt_id)
   WHERE published_attempt_id IS NOT NULL;
+-- Healthy services by bound Node, and services whose failure streak a stable
+-- run may reset by when their health began: each reconcile pass reads only
+-- the healthy services of Nodes not alive or re-registered, and only the
+-- services due a reset, never every service (#942).
+CREATE INDEX IF NOT EXISTS service_jobs_healthy_node ON service_jobs(bound_node_id)
+  WHERE healthy_since_ns IS NOT NULL;
+CREATE INDEX IF NOT EXISTS service_jobs_stability_due ON service_jobs(healthy_since_ns)
+  WHERE restart_streak>0 AND healthy_since_ns IS NOT NULL;
 CREATE TABLE IF NOT EXISTS computers (
   computer_id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
