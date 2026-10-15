@@ -3151,7 +3151,10 @@ func TestRestartReevaluatesDurableCompletionAgainstCurrentIntentBeforePublicatio
 			defer cancelRecovery()
 			recoveryErrors := make(chan error, 1)
 			restartedOutbox.startRecovery(recoveryContext, client, func(err error) { recoveryErrors <- err })
-			waitContext, cancelWait := context.WithTimeout(t.Context(), time.Second)
+			// The wait ends as soon as recovery records the disposition; the
+			// budget only bounds a hang. One second was less than a loaded
+			// hosted runner took to scan, observe and persist it.
+			waitContext, cancelWait := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancelWait()
 			receipt, err := restartedOutbox.spool.waitCompletionDisposition(
 				waitContext, claim.Lease.AttemptID, test.wantDisposition, test.observation.Revision,

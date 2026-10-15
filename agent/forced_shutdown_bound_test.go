@@ -200,6 +200,9 @@ func forcedShutdownAgainstSlowL1(t *testing.T, timeouts ShutdownTimeouts, slowKi
 		t.Fatal(err)
 	}
 	defer store.Close()
+	// A loaded runner can hold the job submission's post-change read past
+	// the 200 ms production limit, which answers a retryable 503 (#839).
+	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	l1Server, err := l1.NewServer(serverFabric, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{
 		"node-1": l1.DefaultNodePolicy("linux"),
 	}})
