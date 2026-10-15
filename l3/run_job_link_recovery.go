@@ -219,6 +219,34 @@ func (r *Reconciler) validateMigratedLinks(ctx, remote context.Context) []error 
 	return passErrors
 }
 
+// cancelLookupMiss handles a dispatch-key lookup that found no usable Job: an
+// absence, or a failed read. An absence beyond the settlement horizon settles
+// locally. Otherwise delivery backs off, unless the Run gained a Job reference
+// while the lookup ran: the in-flight submit's acknowledgement linked it, and
+// the answer predates that. The linked Job is then returned for delivery now
+// (#961). A provisional absence is not a delivery failure.
+func (r *Reconciler) cancelLookupMiss(ctx context.Context, runID string, lookupErr error, missing bool, lookupStarted time.Time) (string, error) {
+	cause := lookupErr
+	if missing {
+		if err := r.store.cancelAbsentDispatch(ctx, runID, lookupStarted); err != nil {
+			return "", err
+		}
+	} else {
+		// Record the same reason delivery would record for this failure.
+		cause = proxyL1Error(lookupErr)
+	}
+	linked, err := r.store.deferUnlinkedRunCancellation(ctx, runID, cause)
+	switch {
+	case linked != "" || missing:
+		return linked, err
+	case err != nil:
+		// Delivery retries the backoff write it could not record here.
+		return "", errors.Join(lookupErr, err)
+	default:
+		return "", deferredCancellationError{lookupErr}
+	}
+}
+
 // canceledRunJob resolves cancellation's private acknowledged-ID fallback and
 // rechecks its stored identity before remote delivery. Reads of L1 happen before
 // each short ledger write; the captured observation also fences terminal absence.
@@ -234,41 +262,40 @@ func (r *Reconciler) canceledRunJob(ctx, remote context.Context, cancellation ru
 		}
 		lookupStarted := r.store.recoveryNow()
 		job, err := r.lookup.LookupJobByDispatchKey(remote, cancellation.DispatchKey)
-		if isMissingDispatch(err, cancellation.DispatchKey) {
+		missing := isMissingDispatch(err, cancellation.DispatchKey)
+		if missing && observed.outboxJob.Valid && observed.outboxJob.String != "" {
 			// A contradicted acknowledgement is not link evidence. Resolve its
 			// identity through L1, outside the write, just as recovery does.
-			if observed.outboxJob.Valid && observed.outboxJob.String != "" {
-				job, err = r.jobs.GetJob(remote, observed.outboxJob.String)
-				if isMissingL1Job(err, observed.outboxJob.String) {
-					if err := r.store.cancelAbsentStoredIdentity(ctx, run.RunID, observed); err != nil {
-						return run, dispatchObservation{}, false, err
-					}
-					return run, dispatchObservation{}, false, r.store.deferRunCancellation(ctx, run.RunID, nil)
-				}
-				if err != nil {
+			job, err = r.jobs.GetJob(remote, observed.outboxJob.String)
+			if isMissingL1Job(err, observed.outboxJob.String) {
+				if err := r.store.cancelAbsentStoredIdentity(ctx, run.RunID, observed); err != nil {
 					return run, dispatchObservation{}, false, err
 				}
-				if job.JobID != observed.outboxJob.String {
-					return run, dispatchObservation{}, false, internalError(errors.New("job lookup conflicts with stored identity"), "resolve canceled dispatch")
-				}
-			} else {
-				if err := r.store.cancelAbsentDispatch(ctx, run.RunID, lookupStarted); err != nil {
-					return run, dispatchObservation{}, false, err
-				}
-				return run, dispatchObservation{}, false, r.store.deferRunCancellation(ctx, run.RunID, err)
+				return run, dispatchObservation{}, false, r.store.deferRunCancellation(ctx, run.RunID, nil)
+			}
+			if err != nil {
+				return run, dispatchObservation{}, false, err
+			}
+			if job.JobID != observed.outboxJob.String {
+				return run, dispatchObservation{}, false, internalError(errors.New("job lookup conflicts with stored identity"), "resolve canceled dispatch")
 			}
 		}
 		if err != nil {
-			return run, dispatchObservation{}, false, err
+			linked, err := r.cancelLookupMiss(ctx, run.RunID, err, missing, lookupStarted)
+			if linked == "" {
+				return run, dispatchObservation{}, false, err
+			}
+			run.JobID = linked
+		} else {
+			if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, job.JobID, dispatchLookupEvidence, &observed); err != nil {
+				return run, dispatchObservation{}, false, err
+			}
+			record, err := r.store.GetRun(ctx, run.RunID)
+			if err != nil {
+				return run, dispatchObservation{}, false, err
+			}
+			run.JobID, run.State = record.L1JobID, record.Status
 		}
-		if err := r.store.completeDispatchWithEvidence(ctx, run.RunID, job.JobID, dispatchLookupEvidence, &observed); err != nil {
-			return run, dispatchObservation{}, false, err
-		}
-		record, err := r.store.GetRun(ctx, run.RunID)
-		if err != nil {
-			return run, dispatchObservation{}, false, err
-		}
-		run.JobID, run.State = record.L1JobID, record.Status
 	}
 
 	// Recheck stored outbox acknowledgements before sending any cancellation.

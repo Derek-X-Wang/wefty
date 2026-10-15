@@ -1419,6 +1419,12 @@ cancels an identity that conflicts with stored evidence.
 Any usable evidence that links a previously unlinked Run with a cancellation
 record atomically reopens delivery. This includes stored outbox evidence used
 by an HTTP cancel request, as well as acknowledgements and positive lookups.
+A cancel dispatch-key lookup that finds no Job, by absence or a failed read,
+backs delivery off only while the Run is still unlinked; the check and the
+backoff share one write. L1 can answer before it commits the Run's in-flight
+submit, so the acknowledgement can link the Run during the lookup. That
+answer is then stale: it cannot back off the reopened delivery, and the same
+request or pass delivers to the linked Job (#961).
 
 A positive observation already in flight is handed to the cancel path rather
 than dropped: that write rechecks the dispatch key and the identity and verdict

@@ -27,20 +27,34 @@ func (s *Store) finishRunCancellation(ctx context.Context, runID string) error {
 // deferRunCancellation uses the same durable exponential schedule as dispatch
 // recovery, including provisional dispatch absence. Explicit repeats reset it.
 func (s *Store) deferRunCancellation(ctx context.Context, runID string, cause error) error {
+	payload, err := cancellationFailurePayload(cause)
+	if err != nil {
+		return err
+	}
+	view, err := readRunCancellationView(ctx, s.db, runID)
+	if err != nil {
+		return internalError(err, "read cancellation failures")
+	}
+	return writeCancellationBackoff(ctx, s.db, runID, view.failures, s.recoveryNow().Add(unrecordedDispatchBackoff(view.failures)), payload)
+}
+
+func cancellationFailurePayload(cause error) (string, error) {
 	reason := contract.APIError{Code: contract.ErrorNotFound, Message: "dispatch absence remains provisional", Retryable: true}
 	if cause != nil {
 		reason = apiErrorFrom(cause)
 	}
 	payload, err := json.Marshal(reason)
 	if err != nil {
-		return internalError(err, "encode cancellation failure")
+		return "", internalError(err, "encode cancellation failure")
 	}
-	view, err := readRunCancellationView(ctx, s.db, runID)
-	if err != nil {
-		return internalError(err, "read cancellation failures")
-	}
-	return s.writeCancellationBackoff(ctx, runID, view.failures, s.recoveryNow().Add(unrecordedDispatchBackoff(view.failures)), string(payload))
+	return string(payload), nil
 }
+
+// deferredCancellationError reports a delivery failure whose backoff the
+// attempt already recorded, so delivery does not count it twice.
+type deferredCancellationError struct{ error }
+
+func (e deferredCancellationError) Unwrap() error { return e.error }
 
 func (s *Store) refuseRunCancellation(ctx context.Context, runID string, cause error) error {
 	payload, err := json.Marshal(apiErrorFrom(cause))
@@ -117,6 +131,10 @@ func (r *Reconciler) cancelRunJob(ctx context.Context, cancellation runCancellat
 
 func (r *Reconciler) deliverRunCancellation(ctx, remote context.Context, cancellation runCancellation) error {
 	err := r.cancelRunJobRemote(ctx, remote, cancellation)
+	var deferred deferredCancellationError
+	if errors.As(err, &deferred) {
+		err = deferred.error
+	}
 	if err != nil {
 		err = r.store.observeL1Error(ctx, err)
 	}
@@ -124,6 +142,9 @@ func (r *Reconciler) deliverRunCancellation(ctx, remote context.Context, cancell
 		// Keep the dependency/storage cause in server logs when HTTP exposes
 		// only a retryable internal error. This also covers background retries.
 		log.Printf("L3 run cancellation failed: run_id=%s error=%v cause=%v", cancellation.RunID, err, errors.Unwrap(err))
+		if deferred.error != nil {
+			return err
+		}
 		return errors.Join(err, r.store.deferRunCancellation(ctx, cancellation.RunID, err))
 	}
 	return err
