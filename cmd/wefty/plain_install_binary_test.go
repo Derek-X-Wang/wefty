@@ -80,7 +80,9 @@ func plainInstallOverlay(source string) (string, error) {
  return output, err
  }`},
 		{regexp.QuoteMeta("loginShell: runLoginShell"), `loginShell: func(context.Context, string, ...string) ([]byte, error) { return []byte(setupPATHBegin+"\n"+os.Getenv("TEST_LOGIN_PATH")+"\n"+setupPATHEnd+"\n"), nil }`},
-		{regexp.QuoteMeta("l1Address: defaultSetupL1Address, l3Address: defaultSetupL3Address,"), "l1Address: defaultSetupL1Address, l3Address: defaultSetupL3Address, unloadBound: 100*time.Millisecond,"},
+		// Each unload check starts the fake launchctl, which can take well
+		// over 100ms on a loaded CI runner; only the stuck case waits it out.
+		{regexp.QuoteMeta("l1Address: defaultSetupL1Address, l3Address: defaultSetupL3Address,"), "l1Address: defaultSetupL1Address, l3Address: defaultSetupL3Address, unloadBound: 2*time.Second,"},
 	}
 	for _, replacement := range replacements {
 		var err error
