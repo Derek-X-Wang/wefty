@@ -30,6 +30,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	eventtypes "github.com/containerd/containerd/api/events"
+	tasksapi "github.com/containerd/containerd/api/services/tasks/v1"
 	runcoptions "github.com/containerd/containerd/api/types/runc/options"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
@@ -45,6 +46,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"github.com/containerd/platforms"
 	"github.com/containerd/typeurl/v2"
 	distributionref "github.com/distribution/reference"
@@ -2746,42 +2748,10 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 		return SweepResponse{}, err
 	}
 	observedInventory := mergeResourceInventory(cloneResourceInventory(inventory), computerNetworkInventory)
-	containersList, err := engine.client.Containers(ctx)
-	if err != nil {
-		return SweepResponse{}, err
-	}
 	prior := map[SessionIdentity]struct{}{}
 	attempts := map[string]SweptAttemptAuthority{}
-	for _, container := range containersList {
-		info, infoErr := container.Info(ctx)
-		if infoErr != nil {
-			return SweepResponse{}, infoErr
-		}
-		if !strings.HasPrefix(info.ID, "wefty-container-") {
-			continue
-		}
-		authority, labelErr := authorityFromLabels(info.Labels)
-		if labelErr != nil {
-			return SweepResponse{}, fmt.Errorf("validate container %s labels: %w", info.ID, labelErr)
-		}
-		expected, identityErr := DeterministicResourceIdentity(authority)
-		if identityErr != nil || expected.ContainerID != info.ID {
-			return SweepResponse{}, fmt.Errorf("container %s labels do not match its deterministic identity", info.ID)
-		}
-		captureSweepAuthority(authority, prior, attempts)
-		if err := engine.ensureAttemptOwnershipRecord(authority, expected); err != nil {
-			return SweepResponse{}, err
-		}
-		if task, taskErr := container.Task(ctx, nil); taskErr == nil {
-			if _, deleteErr := task.Delete(ctx, containerd.WithProcessKill); deleteErr != nil && !errdefs.IsNotFound(deleteErr) {
-				return SweepResponse{}, deleteErr
-			}
-		} else if !errdefs.IsNotFound(taskErr) {
-			return SweepResponse{}, taskErr
-		}
-		if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
-			return SweepResponse{}, err
-		}
+	if err := engine.sweepContainers(ctx, prior, attempts); err != nil {
+		return SweepResponse{}, err
 	}
 	engine.computerDiskSweepMu.Lock()
 	sweepComputerDiskErr := engine.sweepComputerDisksWithRecoveryAttempt(ctx, request.SweepEpoch, request.countComputerStorageRecoveryAttempt)
@@ -2824,6 +2794,94 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 		return SweepResponse{}, err
 	}
 	return response, nil
+}
+
+// sweepContainers removes every labelled wefty container in the namespace,
+// task and shim first, and records the authority each one carried.
+func (engine *ContainerdEngine) sweepContainers(ctx context.Context, prior map[SessionIdentity]struct{}, attempts map[string]SweptAttemptAuthority) error {
+	containersList, err := engine.client.Containers(ctx)
+	if err != nil {
+		return err
+	}
+	for _, container := range containersList {
+		info, infoErr := container.Info(ctx)
+		if infoErr != nil {
+			return infoErr
+		}
+		if !strings.HasPrefix(info.ID, "wefty-container-") {
+			continue
+		}
+		authority, labelErr := authorityFromLabels(info.Labels)
+		if labelErr != nil {
+			return fmt.Errorf("validate container %s labels: %w", info.ID, labelErr)
+		}
+		expected, identityErr := DeterministicResourceIdentity(authority)
+		if identityErr != nil || expected.ContainerID != info.ID {
+			return fmt.Errorf("container %s labels do not match its deterministic identity", info.ID)
+		}
+		captureSweepAuthority(authority, prior, attempts)
+		if err := engine.ensureAttemptOwnershipRecord(authority, expected); err != nil {
+			return err
+		}
+		if err := engine.removeContainer(ctx, container); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ContainerTaskReleaseError is the refusal when containerd would not delete a
+// container's task. The container record is kept, because containerd's task
+// service reaches a task only through it: a later sweep retries through the
+// same record, and until then absence verification fails on the container
+// and its shim.
+type ContainerTaskReleaseError struct {
+	ContainerID string
+	Err         error
+}
+
+func (err *ContainerTaskReleaseError) Error() string {
+	return fmt.Sprintf("delete task of container %s (container record kept for retry): %v", err.ContainerID, err.Err)
+}
+
+func (err *ContainerTaskReleaseError) Unwrap() error { return err.Err }
+
+// removeContainer deletes a container's task, and with it the shim containerd
+// runs for that task, and only then the container record. Both the sweep and
+// an attempt's Delete remove containers through it.
+//
+// containerd's task lookup asks the shim for the task's process. A task
+// delete abandoned mid-flight leaves a shim that has already deleted its
+// process, while containerd has not yet shut that shim down or removed its
+// state directory. A helper killed inside the delete does this (#920). The
+// lookup then answers "not found", so the client's task Delete never runs: it
+// looks the task up first. Deleting the container record at that point
+// strands the shim and its state directory for good, because containerd's
+// task service reaches a task only through its container record. So whenever
+// the lookup or the delete answers "not found", this asks the task service
+// directly. containerd then completes the teardown that was abandoned, or
+// answers "not found" because it runs no task for this container. Any other
+// answer is a ContainerTaskReleaseError and the record stays. Every call stays
+// in the engine's own containerd namespace and names only this container.
+func (engine *ContainerdEngine) removeContainer(ctx context.Context, container containerd.Container) error {
+	task, err := container.Task(ctx, nil)
+	if err == nil {
+		_, err = task.Delete(ctx, containerd.WithProcessKill)
+	}
+	if err != nil && !errdefs.IsNotFound(err) {
+		return &ContainerTaskReleaseError{ContainerID: container.ID(), Err: err}
+	}
+	if err != nil {
+		if _, err := engine.client.TaskService().Delete(ctx, &tasksapi.DeleteTaskRequest{ContainerID: container.ID()}); err != nil {
+			if err = errgrpc.ToNative(err); !errdefs.IsNotFound(err) {
+				return &ContainerTaskReleaseError{ContainerID: container.ID(), Err: err}
+			}
+		}
+	}
+	if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
+		return err
+	}
+	return nil
 }
 
 // reconcileHandoffsThenCountRemoved is the sweep's last two steps, and their
@@ -3215,14 +3273,7 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 		}
 	}
 	if container != nil {
-		if task, err := container.Task(ctx, nil); err == nil {
-			if _, err := task.Delete(ctx, containerd.WithProcessKill); err != nil && !errdefs.IsNotFound(err) {
-				failures = append(failures, err)
-			}
-		} else if !errdefs.IsNotFound(err) {
-			failures = append(failures, err)
-		}
-		if err := container.Delete(ctx, containerd.WithSnapshotCleanup); err != nil && !errdefs.IsNotFound(err) {
+		if err := engine.removeContainer(ctx, container); err != nil {
 			failures = append(failures, err)
 		}
 	} else {
