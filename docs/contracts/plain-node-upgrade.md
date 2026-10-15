@@ -48,6 +48,15 @@ unchanged.
 When the fetched commit matches the receipt's completed installed version and
 all four installed binary digests match both the receipt and the staged build,
 upgrade prints `already at <commit>` and exits 0 without stopping any service.
+Setup records the installed version as well (see the receipt section below).
+So the first upgrade after setup is also a no-op when setup installed binaries
+that are byte-identical to upgrade's own build: the same commit, built by the
+same Go toolchain with `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false` and
+`-ldflags=-X main.version=<commit>`. A build that differs gets one full
+activation, which installs upgrade's own build. One example is a build in a Git
+checkout without `-buildvcs=false`, because Go then stamps VCS details into
+the binary. A development build reports `dev`, which is never a commit, so it
+never makes upgrade skip.
 
 ## Running work and activation
 
@@ -71,8 +80,14 @@ the receipt existed have no ownership evidence for their existing skill copies.
 Upgrade preserves all such copies and warns once: run `wefty setup` to refresh
 the skill copies. Setup explicitly refreshes them and records their digests.
 
-The **20 s budget** starts immediately before the first control-plane service
-converge. It covers both restarts and the renewal observation. Both L1 and the
+The **renewal window** starts immediately before the first control-plane
+service converge. It covers both restarts and the renewal observation. Only a
+node heartbeat newer than both restarts counts. The installed node agent
+heartbeats every 15 s, the shared `agent.DefaultHeartbeatInterval`: setup's
+plist passes no `--heartbeat-interval`, and the connection profile carries no
+interval. The window is therefore one heartbeat interval plus an 8 s reload
+allowance for both restarts and the observation: 23 s, well under the 30 s
+attempt lease. A test holds this derivation. Both L1 and the
 run ledger must respond after restarting. This node must keep the same boot
 session and authority generation, and record a heartbeat newer than completion
 of both restarts. Every still-present attempt from the pre-restart observation
@@ -85,8 +100,11 @@ check failing. With no active attempts, the fresh heartbeat is the node's
 renewal evidence. This check adds no L1 schema or public API field. Process
 launch or an old heartbeat alone cannot pass. Upgrade reports the elapsed time as soon
 as it observes this evidence, including when a later node agent replacement
-fails. With `--json`, the report includes `running_work` and `lease_renewal_ns`,
-including available observations on refusal or activation failure. These are
+fails. In text mode, it prints that renewal line once, on stderr. The final
+summary on stdout names the installed version and the node agent result, and
+does not repeat the renewal line. With `--json`, the report includes
+`running_work` and `lease_renewal_ns`, including available observations on
+refusal or activation failure. These are
 JSON fields, with no plain-text running-work or renewal output on stderr.
 A missing renewal is a loud activation failure, never a success.
 
@@ -131,8 +149,18 @@ in ADR-0003. Upgrade never copies an old database over a live database.
 
 Setup's `setup-files.json` records the installed commit, ownership of the source
 clone and digests of all installed binaries, plists, profile, node configuration
-and skill files. An upgrade writes the new `installed_version` only after full
-activation and skill publication succeed. Until the complete new receipt can
+and skill files. Setup records as `installed_version` the version that its
+binaries report. Before the first write, it runs each of the four with
+`--version`. The four answers together get 10 s, and each answer at most
+256 bytes of stdout. A binary that prints more is stopped at once, and one that
+does not answer in time is stopped at the deadline. Either gives no version,
+and setup continues. Setup records the value only when all four print the same
+single word, and it never derives a version from anything else. A development build records `dev`. When the binaries
+disagree, or one cannot report, setup keeps the previous receipt's version only
+for binaries byte-identical to that receipt's. Otherwise it records no version
+and adds a note. Setup never sets `upgrade_source`; it keeps the previous value.
+An upgrade writes the new `installed_version` only after full activation and
+skill publication succeed. Until the complete new receipt can
 be published, setup retains the previous receipt; if none existed, it creates
 no partial receipt, so removal can still use its legacy ownership fallback.
 After a refused rollback, the receipt refresh clears `installed_version`, so
@@ -143,8 +171,9 @@ Previously recorded skill digests remain recorded for copies upgrade did not
 write.
 
 `wefty status` includes `installed_version` in JSON and `installed version:` in
-text when the local setup receipt records a version. It can show the installed
-commit even when the services are unavailable.
+text when the local setup receipt records a version, after setup as well as
+after upgrade. It can show the installed commit even when the services are
+unavailable.
 
 `wefty setup --remove` keeps data, logs and the source clone.
 `wefty setup --remove --purge` additionally removes the source clone when a

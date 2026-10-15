@@ -63,7 +63,8 @@ inside home. Shared binary and LaunchAgents folders remain. Empty private
 configuration and skill folders are removed; additional skill files and
 folders remain with a warning.
 
-Setup records the digest of each file it installs in `setup-files.json`.
+Setup records the digest of each file it installs in `setup-files.json`,
+and the version its binaries report as `installed_version`.
 A rerun keeps previously recorded skill files beneath the canonical skill
 roots in the receipt, so old embedded files remain removable if unchanged.
 `wefty upgrade` refreshes `setup-files.json` when installed file bytes change.

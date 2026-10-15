@@ -245,7 +245,7 @@ func TestUpgradeConvergesInLeaseOrderAndRefreshesReceiptAndStatus(t *testing.T) 
 	if !reflect.DeepEqual(f.events, want) {
 		t.Fatalf("activation order: %v", f.events)
 	}
-	if report.Version != f.commit || report.LeaseRenewal != 200*time.Millisecond || !strings.Contains(out.String(), "200ms (budget 20s)") {
+	if report.Version != f.commit || report.LeaseRenewal != 200*time.Millisecond || !strings.Contains(out.String(), "200ms (window "+upgradeRenewalWindow.String()+")") {
 		t.Fatalf("renewal measurement: %+v %s", report, out.String())
 	}
 	if !f.replaced {
@@ -478,14 +478,14 @@ func TestUpgradeRenewalRequiresHeartbeatAndAttemptLeaseAfterRestarts(t *testing.
 				return node, nil
 			}}
 			if failure == "slow-restart" {
-				now = started.Add(20 * time.Second)
+				now = started.Add(upgradeRenewalWindow)
 			}
 			elapsed, err := waitUpgradeRenewal(t.Context(), operations, connprofile.Profile{}, baseline, started, restarted)
 			if failure == "healthy" {
 				if err != nil || elapsed != 200*time.Millisecond {
 					t.Fatalf("healthy renewal rejected: %s %v", elapsed, err)
 				}
-			} else if err == nil || !strings.Contains(err.Error(), "20s") {
+			} else if err == nil || !strings.Contains(err.Error(), "within "+upgradeRenewalWindow.String()) {
 				t.Fatalf("accepted stale authority or missing renewal: %s %v", elapsed, err)
 			}
 		})
