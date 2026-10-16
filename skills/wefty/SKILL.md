@@ -118,6 +118,8 @@ runs as the node's user and can write absolute paths.
 
 Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied.
 Install dependencies inside the command (for example `pnpm install --frozen-lockfile && ...`), or point the tool at an absolute cache path.
+Share only dependency caches, which are keyed by content: `CARGO_HOME`, the pnpm store, `GOMODCACHE`, `GOCACHE`.
+Do not share a project build folder, such as a Cargo `target/`, between runs and the real checkout: builds there can keep the deleted run copy's paths. Use a separate build folder per run, for example under `$TMPDIR`.
 stdout and stderr are separate streams, so their order relative to each other
 is not kept. When order matters, merge them in the command: `sh -c '... 2>&1'`.
 
