@@ -148,10 +148,19 @@ codex -c 'sandbox_workspace_write.network_access=true'
 
 Any other sandbox that blocks loopback needs the same network allowance.
 
-The agent's sandbox must allow writes to the snapshot folder:
-`~/.local/state/wefty/exec`, or `$XDG_STATE_HOME/wefty/exec` when
-`XDG_STATE_HOME` is an absolute path. Use the folder named by the error.
-The snapshot stays outside the checkout so this machine's node can read it.
+Exec normally writes snapshots to `~/.local/state/wefty/exec`, or
+`$XDG_STATE_HOME/wefty/exec` when `XDG_STATE_HOME` is absolute. On macOS, if
+permissions or a read-only filesystem block that root, exec uses
+`$TMPDIR/wefty-exec` (Go's `os.TempDir()`) with the same 0700 permissions.
+The same-user node LaunchAgent can read it. No extra folder allowance is
+normally needed on a Mac.
+
+On other platforms, allow writes to the folder named by the error, or set
+`WEFTY_EXEC_STORAGE_ROOT` to a writable folder outside the checkout that the
+node can read. This override is supported on every platform and never falls
+back. Linux nodes may have a private `/tmp`, so do not assume they can read
+the caller's temp folder. If both macOS roots fail, use the same override or
+allow writes to the default root.
 
 For Codex, add the absolute folder to `sandbox_workspace_write.writable_roots`
 in its configuration, or pass it when starting the session:

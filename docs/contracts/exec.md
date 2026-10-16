@@ -19,13 +19,24 @@ An ignored or empty start folder that is absent from the snapshot is refused
 before submission.
 
 All Git writes use a separate bare repository, private index, independent
-objects and private ref under a mode-0700 capture directory in
-`$XDG_STATE_HOME/wefty/exec` on all platforms, including macOS (fallback
-`~/.local/state/wefty/exec`). The root is created with mode 0700; an existing
-root is tightened to 0700. `WEFTY_EXEC_STORAGE_ROOT` overrides this root for
-tests. The node must be able to read this path; it does not rely on a shared
-`/tmp`, which Linux node units can isolate with `PrivateTmp=true`. The
-capture never writes the caller's files, index, objects, stash or refs. It
+objects and private ref under a mode-0700 capture directory. The default root
+is `$XDG_STATE_HOME/wefty/exec` when `XDG_STATE_HOME` is absolute, or
+`~/.local/state/wefty/exec`. The root is created with mode 0700; an existing
+root is tightened to 0700.
+
+On macOS, if a permission or read-only-filesystem error prevents preparing the
+default root or creating a capture, exec tries `wefty-exec` under Go's
+`os.TempDir()` (`$TMPDIR` when set). This root has the same 0700 rule. The
+same-user LaunchAgent can read it. Other platforms do not fall back to temp:
+Linux node units can isolate `/tmp` with `PrivateTmp=true`.
+
+`WEFTY_EXEC_STORAGE_ROOT` is a supported override. Set it to a writable folder
+outside the checkout that the node can read. An explicit override never falls
+back. If both the default and fallback roots fail, exec reports the original
+error once and exits 1. Permission and read-only errors name the folder and
+this override.
+
+The capture never writes the caller's files, index, objects, stash or refs. It
 rechecks the file image, HEAD and status before submission to detect concurrent
 changes. The run does not read the source checkout after submission.
 
@@ -125,6 +136,10 @@ Once acceptance is confirmed, the CLI records the run ID in the capture's
 including when the CLI lost the acceptance reply or exited. At the start of
 each exec, a best-effort sweep examines at most
 64 immediate storage-root entries within a shared two-second foreground budget.
+On macOS without an explicit override, it also covers the fallback root when
+present, even if the default root is writable again. Each root gets a share of
+the same entry cap. If the default root is unwritable, only the fallback is
+swept. Trash from both roots is dispatched before any capture lookup.
 Trash directories go straight to background deletion, without an age wait or
 L3 lookup. Deletion does not spend the foreground budget. The sweep retires
 captures whose recorded runs are terminal and captures without a run ID that
@@ -139,9 +154,9 @@ queued run cancelled after its CLI has exited.
 
 Storage-root preparation is required for the new capture: if it
 fails, exec reports one error and exits 1 before any sweep work or submission.
-Permission and read-only-filesystem failures to prepare the root or create
-a capture name the folder and tell a sandboxed AI agent to allow writes,
-with a pointer to the wefty skill.
+On macOS, the default root's permission and read-only-filesystem failures
+first try the fallback described above. If no usable root remains, the error
+names the folder, the supported override, and the wefty skill.
 
 An L1 or L3 dial refused with `EPERM` reports: `the caller's sandbox blocks
 local network connections to wefty at <address>; a sandboxed AI agent must

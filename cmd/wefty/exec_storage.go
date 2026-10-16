@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -15,6 +16,51 @@ import (
 const execSweepLimit = 64
 const execSweepBudget = 2 * time.Second
 const execOrphanAge = time.Hour
+
+// Tests inject the caller OS while retaining the real capture and sweep paths.
+var execStorageGOOS = runtime.GOOS
+
+// Prepare the root and perform an optional allocation as one write attempt.
+// Preserve the original refusal if the macOS fallback also fails.
+func execStorageLocation(allocate func(string) error) (string, error) {
+	root, err := execStorageRoot()
+	if err != nil {
+		return "", err
+	}
+	attempt := func(root string) error {
+		if err := prepareExecStorageRoot(root); err != nil {
+			return err
+		}
+		if allocate != nil {
+			return execStorageWriteError(root, allocate(root))
+		}
+		return nil
+	}
+	err = attempt(root)
+	if err == nil {
+		return root, nil
+	}
+	var denied *execSnapshotWriteError
+	if execStorageGOOS != "darwin" || os.Getenv("WEFTY_EXEC_STORAGE_ROOT") != "" || !errors.As(err, &denied) {
+		return "", err
+	}
+	fallback := filepath.Join(os.TempDir(), "wefty-exec")
+	if fallback != root && attempt(fallback) == nil {
+		return fallback, nil
+	}
+	return "", err
+}
+
+type execSnapshotWriteError struct {
+	root  string
+	cause error
+}
+
+func (e *execSnapshotWriteError) Error() string {
+	return fmt.Sprintf("cannot write exec snapshot folder %q; allow writes to this folder, or set WEFTY_EXEC_STORAGE_ROOT to a writable folder outside the checkout that the node can read (see the wefty skill: skills/wefty/SKILL.md)", e.root)
+}
+
+func (e *execSnapshotWriteError) Unwrap() error { return e.cause }
 
 func prepareExecStorageRoot(root string) error {
 	if err := os.MkdirAll(root, 0700); err != nil {
@@ -25,7 +71,7 @@ func prepareExecStorageRoot(root string) error {
 
 func execStorageWriteError(root string, err error) error {
 	if errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS) {
-		return fmt.Errorf("cannot write exec snapshot folder %q; a sandboxed AI agent must allow writes to this folder (see the wefty skill: skills/wefty/SKILL.md)", root)
+		return &execSnapshotWriteError{root: root, cause: err}
 	}
 	return err
 }
@@ -44,51 +90,69 @@ func sweepExecStorage(caller context.Context, clients *apiClients, stderr io.Wri
 	ctx, stop := context.WithTimeout(withoutClientRetry(caller), execSweepBudget)
 	defer stop()
 	warn := func(err error) { fmt.Fprintf(stderr, "wefty: warning: exec storage sweep: %v\n", err) }
-	root, err := execStorageRoot()
+	root, err := execStorageLocation(nil)
 	if err != nil {
+		// Capture needs a writable root too. Report this once at the caller.
 		return err
 	}
-	if err = prepareExecStorageRoot(root); err != nil {
-		// Root preparation is also required for the new capture. Let the
-		// caller report it once rather than warning and then failing again.
-		return err
+	roots := []string{root}
+	if execStorageGOOS == "darwin" && os.Getenv("WEFTY_EXEC_STORAGE_ROOT") == "" {
+		fallback := filepath.Join(os.TempDir(), "wefty-exec")
+		if fallback != root {
+			roots = append(roots, fallback)
+		}
 	}
-	dir, err := os.Open(root)
-	if err != nil {
-		warn(err)
-		return nil
-	}
-	defer dir.Close()
-	entries, err := dir.ReadDir(execSweepLimit)
-	if err != nil && err != io.EOF {
-		warn(err)
-		return nil
-	}
-	for _, entry := range entries {
+	// Reserve a share for each root so a full state root cannot hide fallback
+	// trash. Both roots share the original entry cap and foreground deadline.
+	var storages []string
+	for _, root := range roots {
 		if ctx.Err() != nil {
 			warn(ctx.Err())
 			return nil
 		}
-		if !entry.IsDir() {
-			continue
-		}
-		storage := filepath.Join(root, entry.Name())
-		switch {
-		case strings.HasPrefix(entry.Name(), ".wefty-trash-"):
-			err = retireExecStorageContext(ctx, storage, "trash")
-		case strings.HasPrefix(entry.Name(), "wefty-exec-"):
-			err = sweepExecCapture(ctx, clients, storage)
-		default:
+		dir, err := os.Open(root)
+		if os.IsNotExist(err) {
 			continue
 		}
 		if err != nil {
-			var sandbox *networkSandboxError
-			if errors.As(err, &sandbox) {
-				// Exec needs L3 too. Report this required network allowance once,
-				// instead of warning here and failing another dial below.
-				return &unavailableError{cause: sandbox}
-			}
 			warn(err)
+			continue
+		}
+		entries, err := dir.ReadDir(execSweepLimit / len(roots))
+		_ = dir.Close()
+		if err != nil && err != io.EOF {
+			warn(err)
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				storages = append(storages, filepath.Join(root, entry.Name()))
+			}
+		}
+	}
+	// Trash needs no lookup. Dispatch it before probing any old capture.
+	for _, trash := range []bool{true, false} {
+		for _, storage := range storages {
+			if ctx.Err() != nil {
+				warn(ctx.Err())
+				return nil
+			}
+			name := filepath.Base(storage)
+			if trash && strings.HasPrefix(name, ".wefty-trash-") {
+				err = retireExecStorageContext(ctx, storage, "trash")
+			} else if !trash && strings.HasPrefix(name, "wefty-exec-") {
+				err = sweepExecCapture(ctx, clients, storage)
+			} else {
+				continue
+			}
+			if err != nil {
+				var sandbox *networkSandboxError
+				if errors.As(err, &sandbox) {
+					// Exec also needs L3. Report its required network allowance once.
+					return &unavailableError{cause: sandbox}
+				}
+				warn(err)
+			}
 		}
 	}
 	return nil

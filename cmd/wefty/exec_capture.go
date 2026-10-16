@@ -77,17 +77,16 @@ func captureExec(ctx context.Context, cwd string) (capture execCapture, err erro
 	if err != nil || folder == ".." || strings.HasPrefix(folder, ".."+string(filepath.Separator)) {
 		return capture, fmt.Errorf("current folder is outside the git checkout")
 	}
-	storageRoot, err := execStorageRoot()
+	var storage string
+	_, err = execStorageLocation(func(root string) error {
+		var err error
+		storage, err = os.MkdirTemp(root, "wefty-exec-")
+		return err
+	})
 	if err != nil {
 		return capture, err
 	}
-	if err = prepareExecStorageRoot(storageRoot); err != nil {
-		return capture, err
-	}
-	storage, err := os.MkdirTemp(storageRoot, "wefty-exec-")
-	if err != nil {
-		return capture, execStorageWriteError(storageRoot, err)
-	}
+
 	capture = execCapture{Storage: storage, Base: strings.TrimSpace(base), Dirty: status != "", Folder: folder}
 	defer func() {
 		if err != nil {
