@@ -6,6 +6,7 @@ checkout before L3 submission. It uses the installed `node_id`, checked through
 L1 by `resolveLocalNode`, and always includes that node's reserved tag. Extra
 tags narrow this Pinned run. It is an ordinary process one-shot without
 Workflow or dispatch authority. No default runtime cap is added.
+Exec runs from inside a Git checkout with at least one commit.
 
 The capture includes HEAD, current tracked files (including staged and unstaged
 changes and deletions), and untracked files not excluded by Git. Git's ignore

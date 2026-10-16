@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,17 @@ type execCapture struct {
 	Folder  string `json:"relative_folder"`
 }
 
+type execGitError struct {
+	command, stderr string
+	cause           error
+}
+
+func (e *execGitError) Error() string {
+	return fmt.Sprintf("git %s: %v: %s", e.command, e.cause, e.stderr)
+}
+
+func (e *execGitError) Unwrap() error { return e.cause }
+
 // All Git writes use an independent bare repository and index. In particular,
 // GIT_INDEX_FILE alone would still write objects into the user's repository.
 func execGit(ctx context.Context, dir, private string, input io.Reader, args ...string) (string, error) {
@@ -32,7 +44,9 @@ func execGit(ctx context.Context, dir, private string, input io.Reader, args ...
 			cmd.Env = append(cmd.Env, value)
 		}
 	}
-	cmd.Env = append(cmd.Env, "GIT_OPTIONAL_LOCKS=0")
+	// Keep discovery diagnostics stable across the caller's locale. They are
+	// used below to distinguish a missing checkout from other Git failures.
+	cmd.Env = append(cmd.Env, "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
 	if private != "" {
 		cmd.Env = append(cmd.Env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_DIR="+private, "GIT_INDEX_FILE="+filepath.Join(private, "capture.index"), "GIT_AUTHOR_NAME=wefty", "GIT_AUTHOR_EMAIL=exec@wefty.local", "GIT_COMMITTER_NAME=wefty", "GIT_COMMITTER_EMAIL=exec@wefty.local")
 	}
@@ -44,7 +58,7 @@ func execGit(ctx context.Context, dir, private string, input io.Reader, args ...
 		if ctx.Err() != nil {
 			return "", fmt.Errorf("git %s: %w", args[0], ctx.Err())
 		}
-		return "", fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
+		return "", &execGitError{command: args[0], cause: err, stderr: strings.TrimSpace(stderr.String())}
 	}
 	return string(out), nil
 }
@@ -52,6 +66,9 @@ func execGit(ctx context.Context, dir, private string, input io.Reader, args ...
 func captureExec(ctx context.Context, cwd string) (capture execCapture, err error) {
 	root, err := execGit(ctx, cwd, "", nil, "rev-parse", "--show-toplevel")
 	if err != nil {
+		if outsideExecCheckout(cwd, err) {
+			return capture, usageError("wefty exec runs from inside a Git checkout; cd into the project first")
+		}
 		return capture, fmt.Errorf("not a git repo: %w", err)
 	}
 	root, err = filepath.EvalSymlinks(strings.TrimSuffix(root, "\n"))
@@ -64,6 +81,9 @@ func captureExec(ctx context.Context, cwd string) (capture execCapture, err erro
 	}
 	base, err := execGit(ctx, root, "", nil, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
+		if unbornExecHEAD(ctx, root) {
+			return capture, usageError("wefty exec needs at least one commit in this checkout; commit first")
+		}
 		return capture, fmt.Errorf("no commits yet (unborn HEAD): %w", err)
 	}
 	if err = validateExecRepo(ctx, root); err != nil {
@@ -175,6 +195,46 @@ func captureExec(ctx context.Context, cwd string) (capture execCapture, err erro
 	}
 	_, err = execGit(ctx, root, private, nil, "symbolic-ref", "HEAD", "refs/heads/capture")
 	return capture, err
+}
+
+func execGitExited(err error, code int) bool {
+	var exit *exec.ExitError
+	return errors.As(err, &exit) && exit.ExitCode() == code
+}
+
+func outsideExecCheckout(cwd string, err error) bool {
+	var failure *execGitError
+	if !errors.As(err, &failure) || !execGitExited(err, 128) ||
+		!strings.HasPrefix(failure.stderr, "fatal: not a git repository (") {
+		return false
+	}
+	// Git gives the same diagnostic for a missing checkout and some broken
+	// .git directories. Existing or unreadable metadata is not a usage error.
+	dir, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		return false
+	}
+	for {
+		if _, err := os.Lstat(filepath.Join(dir, ".git")); !os.IsNotExist(err) {
+			return false
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return true
+		}
+		dir = parent
+	}
+}
+
+func unbornExecHEAD(ctx context.Context, root string) bool {
+	// An unborn HEAD is a symbolic branch whose ref does not exist. A failed
+	// commit lookup alone could also mean an unreadable or corrupt object.
+	ref, err := execGit(ctx, root, "", nil, "symbolic-ref", "--quiet", "HEAD")
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(ref), "refs/heads/") {
+		return false
+	}
+	_, err = execGit(ctx, root, "", nil, "show-ref", "--verify", "--quiet", strings.TrimSpace(ref))
+	return execGitExited(err, 1)
 }
 
 func validateExecRepo(ctx context.Context, root string) error {
