@@ -90,6 +90,9 @@ not change the run. The command inherits the node's environment and `PATH`;
 the run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
 
+Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied.
+Install dependencies inside the command (for example `pnpm install --frozen-lockfile && ...`), or point the tool at an absolute cache path.
+
 **Stopping `exec` cancels the run unless `--keep-running` is set.** Ctrl-C,
 TERM, and HUP follow this rule. With `--keep-running`, streaming stays the
 same, but stopping ends only the watching. The CLI prints the run ID and
