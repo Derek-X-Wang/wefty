@@ -37,11 +37,19 @@ func TestLogsCommandsAnnounceRetentionTruncation(t *testing.T) {
 		},
 	}
 	serve := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/runs/run-1" {
+			_ = json.NewEncoder(writer).Encode(contract.RunRecord{Status: contract.RunSucceeded})
+			return
+		}
 		if !strings.HasSuffix(request.URL.Path, "/logs") {
 			http.NotFound(writer, request)
 			return
 		}
 		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path == "/v1/runs/run-1/logs" && request.URL.Query().Get("cursor") == page.NextCursor {
+			_ = json.NewEncoder(writer).Encode(l1.LogPage{NextCursor: page.NextCursor, Truncation: page.Truncation})
+			return
+		}
 		_ = json.NewEncoder(writer).Encode(page)
 	})
 	client := &http.Client{Transport: handlerTransport{handler: serve}}
