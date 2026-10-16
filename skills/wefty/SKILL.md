@@ -109,7 +109,8 @@ wefty cancel "$RUN_ID"
 ```
 
 `exec` freezes the base commit, tracked local changes, and untracked files
-that Git does not ignore before submission. It runs in the same relative
+that Git does not ignore before submission. Run it from inside a Git checkout
+with at least one commit. It runs in the same relative
 folder in a throwaway copy, on this machine's installed node. Later edits do
 not change the run. The command inherits the node's environment and `PATH`;
 the run's `WEFTY_*` variables are removed. No files are returned. The command
@@ -175,6 +176,14 @@ codex -c 'sandbox_workspace_write.network_access=true'
 ```
 
 Any other sandbox that blocks loopback needs the same network allowance.
+
+This limit is on purpose. `exec` runs the command as the node's user, outside
+the agent's sandbox, so reaching wefty is the owner's trust decision. If the
+connection is blocked, ask the owner to allow it or to approve the run. Do not
+look for another way in.
+
+Do not use `exec` to run a command that your own sandbox blocks. `exec` runs it
+on the host, outside your sandbox. Ask the owner instead.
 
 Exec normally writes snapshots to `~/.local/state/wefty/exec`, or
 `$XDG_STATE_HOME/wefty/exec` when `XDG_STATE_HOME` is absolute. On macOS, if
