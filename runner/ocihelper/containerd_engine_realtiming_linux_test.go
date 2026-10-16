@@ -591,7 +591,10 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 	}
 	handoffMarkerBytes := exerciseNativeLinuxOneshotContract(t, ctx, adapter, echoReference, echoImage.TopLevelDigest, reference, digest)
 
-	liveRequest := nativeAdapterRequest(reference, digest, "live-logs", []string{"/bin/sh", "-c", "printf live-before-exit; sleep 2; exit 0"})
+	liveRequest := nativeAdapterRequest(reference, digest, "live-logs", []string{"/bin/sh", "-c", "printf live-before-exit; exec sleep 3600"})
+	// Keep the payload alive until the test observes its output and signals it.
+	// Container creation/start shares this budget with live log delivery.
+	liveLogBudget := liveRequest.InitialDeadman
 	liveRequest.OCIStarted = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
 	liveLog := make(chan struct{}, 1)
 	liveDone := make(chan error, 1)
@@ -607,15 +610,27 @@ func TestNativeLinuxOCIAdapterLifecycle(t *testing.T) {
 		}))
 		liveDone <- runErr
 	}()
+	liveLogDeadline := time.NewTimer(liveLogBudget)
+	defer liveLogDeadline.Stop()
 	select {
 	case <-liveLog:
 	case err := <-liveDone:
 		t.Fatalf("task completed before live log delivery: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("binary-v2 segment was not tailed while the task was running")
+	case <-liveLogDeadline.C:
+		t.Fatalf("binary-v2 segment was not tailed while the task was running within %s", liveLogBudget)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
-	if err := <-liveDone; err != nil {
+	if err := session.Signal(ctx, ocihelper.SignalRequest{Authority: ocirunner.HelperAuthority(liveRequest.Authority), Signal: ocihelper.SignalKILL}); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case err := <-liveDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 	if receipt, err := adapter.ReapAndVerify(ctx, workloadrunner.ReapRequest{Authority: liveRequest.Authority}); err != nil || !receipt.RuntimeQuiesced {
 		t.Fatalf("live-log cleanup receipt=%+v err=%v", receipt, err)

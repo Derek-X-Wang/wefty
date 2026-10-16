@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -124,41 +125,44 @@ func TestTestReadStoreRecoversFromRealSnapshotExpiry(t *testing.T) {
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			expected, expectedErr := test.read(t.Context())
-			// The clock is sampled after SQLite anchors the real transaction. Hold
-			// the first snapshot past a lowered test-only limit. Restore the
-			// normal limit before retrying; this stopped Store has no other readers.
-			// The limit also bounds connection checkout, so keep it well above a
-			// loaded runner's checkout time or the answer becomes an admission expiry.
-			original := h.store.clock
-			originalLimit := h.store.readSnapshotHardLimitForTest
-			const probeLimit = 50 * time.Millisecond
-			h.store.SetReadSnapshotHardLimitForTest(probeLimit)
-			calls := 0
-			h.store.clock = ClockFunc(func() time.Time {
-				calls++
-				if calls == 1 {
-					time.Sleep(2 * probeLimit)
+			synctest.Test(t, func(t *testing.T) {
+				expected, expectedErr := test.read(t.Context())
+				// The first clock call follows the real SQLite snapshot anchor.
+				// Advance past its lowered limit in a synctest bubble: a wall-clock
+				// sleep can resume before the deadline callback runs on a busy runner.
+				// Fake time runs that callback before the sleep returns, so even a
+				// fast read must expire. This stopped Store has no background readers.
+				// Restore the normal limit before retrying the complete read.
+				original := h.store.clock
+				originalLimit := h.store.readSnapshotHardLimitForTest
+				const probeLimit = 50 * time.Millisecond
+				h.store.SetReadSnapshotHardLimitForTest(probeLimit)
+				calls := 0
+				h.store.clock = ClockFunc(func() time.Time {
+					calls++
+					if calls == 1 {
+						time.Sleep(2 * probeLimit)
+					}
+					return original.Now()
+				})
+				defer func() {
+					h.store.clock = original
+					h.store.readSnapshotHardLimitForTest = originalLimit
+				}()
+				var attempts []error
+				ctx := context.WithValue(t.Context(), testReadAttemptObserverKey{}, func(err error) {
+					attempts = append(attempts, err)
+					h.store.readSnapshotHardLimitForTest = originalLimit
+				})
+				got, err := test.read(ctx)
+				if len(attempts) != 2 {
+					t.Fatalf("attempts=%v, want expiry then a completed read", attempts)
 				}
-				return original.Now()
+				assertSnapshotUnavailable(t, attempts[0], "read_snapshot_expired")
+				if !reflect.DeepEqual(got, expected) || !reflect.DeepEqual(apiErrorFromDecision(err), apiErrorFromDecision(expectedErr)) {
+					t.Fatalf("retry changed answer: got=%+v err=%v expected=%+v err=%v", got, err, expected, expectedErr)
+				}
 			})
-			defer func() {
-				h.store.clock = original
-				h.store.readSnapshotHardLimitForTest = originalLimit
-			}()
-			var attempts []error
-			ctx := context.WithValue(t.Context(), testReadAttemptObserverKey{}, func(err error) {
-				attempts = append(attempts, err)
-				h.store.readSnapshotHardLimitForTest = originalLimit
-			})
-			got, err := test.read(ctx)
-			if len(attempts) != 2 {
-				t.Fatalf("attempts=%v, want expiry then a completed read", attempts)
-			}
-			assertSnapshotUnavailable(t, attempts[0], "read_snapshot_expired")
-			if !reflect.DeepEqual(got, expected) || !reflect.DeepEqual(apiErrorFromDecision(err), apiErrorFromDecision(expectedErr)) {
-				t.Fatalf("retry changed answer: got=%+v err=%v expected=%+v err=%v", got, err, expected, expectedErr)
-			}
 		})
 	}
 }
