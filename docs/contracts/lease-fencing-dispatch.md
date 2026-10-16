@@ -190,6 +190,11 @@ treating the gate as the authority. Every claim names the jobs already resident
 on the node as exclusions, so L1 never hands the node a job it is still
 executing.
 
+Before a one-shot claim, the agent also applies local load admission and
+30-second claim spacing (`agent-local-lifecycle.md`). It sends no RPC while
+holding new work. The first one-shot is never held by load or spacing.
+Services are unchanged. This adds no fields or rules to the L1 claim protocol.
+
 The control plane obtains tags and capacity from authenticated Fabric identity
 plus operator configuration. Nodes in `stale`, `dead`, or `draining` state
 cannot claim. SQLite's immediate writer transaction serializes the

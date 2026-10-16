@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -27,8 +28,9 @@ import (
 //
 // Three rules shape it. It answers within a bounded time even when nothing is
 // listening, because a diagnostic that hangs is the problem it is meant to
-// diagnose. It re-probes nothing: the agent already observed its own
-// capabilities and reported them, and L1 already knows the slot policy and what
+// diagnose. It does not re-probe capabilities: the agent already observed its own
+// capabilities and reported them. Only this machine's load is read locally.
+// L1 already knows the slot policy and what
 // is occupying it, so this reads those facts rather than forming a second
 // opinion. And it asks for no authority beyond the person's own Fabric
 // identity -- the thing you would have anyway if you were about to submit.
@@ -120,10 +122,20 @@ const (
 	identityUnknown = "unknown"
 )
 
+// localLoadStatus describes only this machine's directly read load.
+type localLoadStatus struct {
+	Average *float64 `json:"average,omitempty"`
+	Limit   float64  `json:"limit"`
+	Holding bool     `json:"holding"`
+}
+
 // clusterStatus is the whole answer, and the shape `--json` publishes.
 type clusterStatus struct {
-	InstalledVersion string `json:"installed_version,omitempty"`
-	Ready            bool   `json:"ready"`
+	Busy             string           `json:"busy,omitempty"`
+	WaitingRuns      *int             `json:"waiting_runs,omitempty"`
+	LocalLoad        *localLoadStatus `json:"local_load,omitempty"`
+	InstalledVersion string           `json:"installed_version,omitempty"`
+	Ready            bool             `json:"ready"`
 	// Verdict is the one line a person reads: "ready", or "not ready: ..."
 	// naming what is missing rather than what was checked.
 	Verdict string `json:"verdict"`
@@ -204,6 +216,7 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 
 	var nodes l1.NodeList
 	var stuck []queuedRunNote
+	var waitingRuns *int
 	var group sync.WaitGroup
 	group.Add(4)
 	go func() {
@@ -251,6 +264,10 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 			return
 		}
 		l3Status.Reachable = true
+		if queued.NextCursor == "" {
+			n := len(queued.Runs)
+			waitingRuns = &n
+		}
 		runIDs := make([]string, 0, len(queued.Runs))
 		for _, run := range queued.Runs {
 			runIDs = append(runIDs, run.RunID)
@@ -287,6 +304,27 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 			status.Nodes[i].ThisMachine = status.Nodes[i].NodeID == status.LocalNode.NodeID
 		}
 	}
+	if status.LocalNode != nil {
+		reader := clients.readLoad
+		if reader == nil {
+			reader = nodeload.Read
+		}
+		limit := nodeload.DefaultLimit()
+		if clients.oneshotLoadLimit != nil {
+			limit = *clients.oneshotLoadLimit
+		}
+		status.LocalLoad = &localLoadStatus{Limit: limit}
+		if load, err := reader(); err == nil {
+			status.LocalLoad.Average = &load
+			for _, node := range nodes.Nodes {
+				if node.NodeID == status.LocalNode.NodeID {
+					status.LocalLoad.Holding = node.State == contract.NodeAlive && node.ClaimsEnabled &&
+						len(nodeExecutableKinds(executionKinds(node.Capabilities))) > 0 && nodeload.Holding(node.OneshotOccupancy, load, limit)
+				}
+			}
+		}
+	}
+	status.WaitingRuns = waitingRuns
 	status.Capacity = capacityByKind(status.Nodes)
 	status.Reasons, status.Limitations = reasonsFor(l1Status, l3Status, status.Nodes, status.Capacity)
 	if note, ok := unschedulableRunsNote(stuck); ok {
@@ -294,6 +332,13 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 	}
 	status.Ready = len(status.Reasons) == 0
 	status.Verdict = verdictOf(status.Reasons)
+	if status.Ready && allOneshotSlotsBusy(status.Nodes) {
+		status.Busy = "busy: all one-shot slots in use; "
+		if waitingRuns != nil {
+			status.Busy += fmt.Sprintf("%d runs waiting; ", *waitingRuns)
+		}
+		status.Busy += "a new run waits in line"
+	}
 	return status
 }
 
@@ -487,11 +532,14 @@ func reasonsFor(l1Status, l3Status serviceStatus, nodes []nodeStatus,
 			Detail: "no alive, claiming node advertises an executable kind (" +
 				strings.Join(executableKinds, " or ") + ")"}), nil
 	}
-	// Per kind, because "ready for a process job" and "ready for an OCI job"
-	// are different answers. A kind with no capacity is a limitation; only a
-	// cluster with no capacity for any kind is not ready, because a
-	// process-only fleet -- which is what the documented single-machine setup
-	// is -- can take work and must not be told to stop.
+	// A node configured with no one-shot slots cannot move the line at all.
+	// Keep that configuration problem distinct from occupied capacity.
+	if len(filterNodes(executing, func(node nodeStatus) bool { return node.TotalOneshot > 0 })) == 0 {
+		return append(reasons, statusReason{Code: "no_free_slot",
+			Detail: "no alive, claiming node has one-shot slots configured"}), nil
+	}
+	// Missing immediate capacity is a limitation. An alive, claiming node
+	// with an executable kind will take queued work once capacity returns.
 	var short []statusReason
 	for _, kind := range executableKinds {
 		if capacity[kind] == 0 {
@@ -499,11 +547,22 @@ func reasonsFor(l1Status, l3Status serviceStatus, nodes []nodeStatus,
 				Detail: "no node with a free one-shot slot can run kind=" + kind})
 		}
 	}
-	if len(short) == len(executableKinds) {
-		return append(reasons, statusReason{Code: "no_free_slot",
-			Detail: "no node has a free one-shot slot"}), nil
-	}
 	return reasons, short
+}
+
+func allOneshotSlotsBusy(nodes []nodeStatus) bool {
+	eligible := filterNodes(nodes, func(node nodeStatus) bool {
+		return node.State == contract.NodeAlive && node.ClaimsEnabled && len(nodeExecutableKinds(node.Kinds)) > 0
+	})
+	if len(eligible) == 0 {
+		return false
+	}
+	for _, node := range eligible {
+		if node.FreeOneshot > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // verdictOf is the one line, built from the reasons rather than alongside them
@@ -542,6 +601,11 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 	if _, err := fmt.Fprintf(writer, "%s\n", status.Verdict); err != nil {
 		return err
 	}
+	if status.Busy != "" {
+		if _, err := fmt.Fprintln(writer, status.Busy); err != nil {
+			return err
+		}
+	}
 	if status.InstalledVersion != "" {
 		if _, err := fmt.Fprintln(writer, "installed version:", status.InstalledVersion); err != nil {
 			return err
@@ -573,6 +637,16 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 		localDetail = fmt.Sprintf("%s (Pinned tag: %s)", status.LocalNode.NodeID, status.LocalNode.Tag)
 	} else if status.LocalNodeError != nil {
 		localDetail = status.LocalNodeError.Detail
+	}
+	if status.LocalLoad != nil {
+		load := "unavailable"
+		if status.LocalLoad.Average != nil {
+			load = fmt.Sprintf("%.2f", *status.LocalLoad.Average)
+		}
+		localDetail += fmt.Sprintf("; load %s; limit %.2f", load, status.LocalLoad.Limit)
+		if status.LocalLoad.Holding {
+			localDetail += "; holding new work: machine busy"
+		}
 	}
 	if _, err := fmt.Fprintf(writer, "this machine: %s\n\n", localDetail); err != nil {
 		return err

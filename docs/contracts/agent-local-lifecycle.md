@@ -1278,3 +1278,26 @@ still fences replay.
 Other attempts, OCI capability, and helper generation remain live. The exact
 identity, bounded recognition record, and session-fatal exceptions are defined
 in [OCI helper protocol](oci-helper-protocol.md#late-attempt-renewals).
+
+## One-shot claim admission
+
+Before a one-shot claim RPC, the agent checks its class gate and local machine
+load under the same claim lock. It reads the one-minute load from macOS
+`vm.loadavg` or Linux `/proc/loadavg`. If a one-shot attempt is already admitted
+and load is at or above the limit, the agent sends no claim request. It checks
+again on the next claim tick. With no one-shot attempts, load never blocks the
+first claim. An unreadable load leaves load admission open and logs once per
+agent session. Existing attempts continue.
+
+The node setting is `--oneshot-load-limit`, then `WEFTY_ONESHOT_LOAD_LIMIT`,
+then `oneshot_load_limit` in the setup connection profile. The default is
+1.5 times `runtime.NumCPU()`. Zero turns the rule off: no load check and no
+spacing. Negative or
+non-finite limits are invalid. Restart the node agent to apply a setting.
+
+While another one-shot attempt is admitted and the limit is not zero,
+successful one-shot claims must be at least 30 seconds apart. The first successful claim starts that interval.
+Empty responses and errors do not move it. The clock is injectable. Claim
+loops share the interval, so parallel loops cannot burst. An empty node can
+start immediately even if its last run just finished. Services use their
+existing admission and placement rules.

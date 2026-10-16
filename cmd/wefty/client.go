@@ -25,12 +25,14 @@ import (
 )
 
 type apiClients struct {
-	nodeConfigPath string
-	l1             *apiClient
-	l3             *apiClient
-	images         imageDigestResolver
-	fabric         fabric.Fabric
-	wait           func(context.Context, time.Duration) error
+	oneshotLoadLimit *float64
+	readLoad         func() (float64, error)
+	nodeConfigPath   string
+	l1               *apiClient
+	l3               *apiClient
+	images           imageDigestResolver
+	fabric           fabric.Fabric
+	wait             func(context.Context, time.Duration) error
 }
 
 type apiClient struct {
