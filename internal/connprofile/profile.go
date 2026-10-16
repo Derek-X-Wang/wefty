@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/internal/durable"
+	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -41,6 +42,8 @@ const (
 // profile can name only what differs from the built-in defaults.
 type Profile struct {
 	Version int `json:"version"`
+	// OneshotLoadLimit is this node agent's local load setting. Nil uses the CPU-based default.
+	OneshotLoadLimit *float64 `json:"oneshot_load_limit,omitempty"`
 	// Fabric is the Fabric mode every program uses: "plain" in phase 1.
 	Fabric string `json:"fabric,omitempty"`
 	// PlainFabricID is the shared DEVELOPMENT ONLY plain-Fabric authority. It
@@ -90,6 +93,11 @@ func DefaultPath(home string) (string, error) {
 
 // Validate rejects a profile that some program could not use as written.
 func (p Profile) Validate() error {
+	if p.OneshotLoadLimit != nil {
+		if err := nodeload.ValidateLimit(*p.OneshotLoadLimit); err != nil {
+			return err
+		}
+	}
 	if p.Version != Version {
 		return fmt.Errorf("connection profile: unsupported version %d, want %d", p.Version, Version)
 	}
@@ -239,11 +247,12 @@ type L3Settings struct {
 
 // NodeAgentSettings is everything the node agent reads from the profile.
 type NodeAgentSettings struct {
-	Fabric        string `json:"fabric,omitempty"`
-	PlainFabricID string `json:"plain_fabric_id,omitempty"`
-	ControlPlane  string `json:"control_plane,omitempty"`
-	RunLedger     string `json:"run_ledger,omitempty"`
-	NodeID        string `json:"node_id,omitempty"`
+	OneshotLoadLimit *float64 `json:"oneshot_load_limit,omitempty"`
+	Fabric           string   `json:"fabric,omitempty"`
+	PlainFabricID    string   `json:"plain_fabric_id,omitempty"`
+	ControlPlane     string   `json:"control_plane,omitempty"`
+	RunLedger        string   `json:"run_ledger,omitempty"`
+	NodeID           string   `json:"node_id,omitempty"`
 }
 
 // CLISettings is everything the CLI reads from the profile.
@@ -272,7 +281,7 @@ func (p Profile) L3() L3Settings {
 func (p Profile) NodeAgent() NodeAgentSettings {
 	return NodeAgentSettings{
 		Fabric: p.Fabric, PlainFabricID: p.PlainFabricID, ControlPlane: p.L1Address, RunLedger: p.L3Address,
-		NodeID: p.Identities.Node,
+		NodeID: p.Identities.Node, OneshotLoadLimit: p.OneshotLoadLimit,
 	}
 }
 

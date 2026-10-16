@@ -24,6 +24,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -447,6 +448,7 @@ func run() error {
 		claim                 = flag.Duration("claim-interval", agent.DefaultClaimInterval, "idle claim polling interval")
 		renewal               = flag.Duration("renewal-interval", agent.DefaultRenewalInterval, "maximum attempt lease-renewal interval")
 		finalization          = flag.Duration("finalization-timeout", agent.DefaultFinalizationTimeout, "maximum final log flush and upload duration after a payload exits")
+		oneshotLoadLimit      = flag.Float64("oneshot-load-limit", nodeload.DefaultLimit(), "one-minute load limit for additional one-shot work; 0 disables the load gate (also WEFTY_ONESHOT_LOAD_LIMIT)")
 		maxOneshotSlots       = flag.Int("max-oneshot-slots", l1.DefaultMaxOneshotSlots, "local ceiling for concurrent one-shot attempts")
 		maxServiceSlots       = flag.Int("max-service-slots", l1.DefaultMaxServiceSlots, "local ceiling for concurrent service attempts")
 		logSpoolDirectory     = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
@@ -481,6 +483,16 @@ func run() error {
 		return err
 	}
 	settings := profile.NodeAgent()
+	if !connprofile.ExplicitFlags(flag.CommandLine)["oneshot-load-limit"] {
+		resolved, err := nodeload.ResolveLimit(settings.OneshotLoadLimit, os.Getenv(nodeload.Environment))
+		if err != nil {
+			return err
+		}
+		*oneshotLoadLimit = resolved
+	}
+	if err := nodeload.ValidateLimit(*oneshotLoadLimit); err != nil {
+		return err
+	}
 	layer := connprofile.Layer{Explicit: connprofile.ExplicitFlags(flag.CommandLine)}
 	layer.Fill(fabricMode, "fabric", "", settings.Fabric)
 	layer.Fill(plainFabricID, "plain-fabric-id", "WEFTY_DEV_PLAIN_FABRIC_ID", settings.PlainFabricID)
@@ -654,6 +666,7 @@ func run() error {
 		RenewalInterval:         *renewal,
 		FinalizationTimeout:     *finalization,
 		MaxOneshotSlots:         *maxOneshotSlots,
+		OneshotLoadLimit:        oneshotLoadLimit,
 		MaxServiceSlots:         *maxServiceSlots,
 		LogSpoolDirectory:       *logSpoolDirectory,
 		LogSpoolMaxBytes:        *logSpoolMaxBytes,

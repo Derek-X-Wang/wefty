@@ -14,6 +14,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/l3"
 )
 
 // statusHarness is a control plane that answers however a test needs it to,
@@ -22,6 +23,7 @@ type statusHarness struct {
 	t      *testing.T
 	stall  chan struct{}
 	nodes  l1.NodeList
+	queued l3.RunListPage
 	person l1.AuthenticatedPerson
 	// personStatus and personCode refuse the person protocol the way a real L1
 	// refuses a machine principal.
@@ -76,7 +78,7 @@ func (h *statusHarness) clients() *apiClients {
 				}
 				_ = json.NewEncoder(w).Encode(h.person)
 			default:
-				_ = json.NewEncoder(w).Encode(map[string]any{"runs": []any{}})
+				_ = json.NewEncoder(w).Encode(h.queued)
 			}
 		}
 	}
@@ -204,15 +206,6 @@ func TestStatusSaysWhatIsMissing(t *testing.T) {
 			},
 			want: "every alive node has claims disabled",
 			code: "claims_disabled",
-		},
-		"every slot is taken": {
-			configure: func(h *statusHarness) {
-				node := readyNode("node-a")
-				node.OneshotOccupancy = node.MaxOneshotSlots
-				h.nodes = l1.NodeList{Nodes: []l1.Node{node}}
-			},
-			want: "no node has a free one-shot slot",
-			code: "no_free_slot",
 		},
 		"L1 is down": {
 			configure: func(h *statusHarness) { h.l1Down = true; h.nodes = l1.NodeList{Nodes: []l1.Node{readyNode("node-a")}} },
@@ -570,8 +563,8 @@ func TestNodeReasonsAreComputedOverEligibleCandidates(t *testing.T) {
 	h.nodes = l1.NodeList{Nodes: []l1.Node{dead, live}}
 
 	var out, errOut bytes.Buffer
-	if err := executeStatus(t.Context(), h.clients(), true, nil, &out, &errOut); err == nil {
-		t.Fatal("a full cluster reported ready")
+	if err := executeStatus(t.Context(), h.clients(), true, nil, &out, &errOut); err != nil {
+		t.Fatal(err)
 	}
 	var status clusterStatus
 	if err := json.Unmarshal(out.Bytes(), &status); err != nil {
@@ -586,7 +579,7 @@ func TestNodeReasonsAreComputedOverEligibleCandidates(t *testing.T) {
 	if slices.Contains(codes, "claims_disabled") || slices.Contains(codes, "no_alive_node") {
 		t.Fatalf("reasons = %v, computed over nodes that were never candidates", codes)
 	}
-	if !slices.Contains(codes, "no_free_slot") {
-		t.Fatalf("reasons = %v, want the real reason", codes)
+	if len(codes) != 0 || !status.Ready || !strings.HasPrefix(status.Busy, "busy:") {
+		t.Fatalf("busy cluster status = %#v", status)
 	}
 }
