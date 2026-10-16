@@ -119,7 +119,8 @@ changes were included). `outcome` is `pass` or `fail` for a command result.
 An infrastructure failure reports `infrastructure_error`, with a null command
 exit code. A stopped or lost watch reports `queued` or `running` when that
 status is known, and `observation_lost` otherwise. Terminal cancellation reports
-`cancelled`.
+`cancelled`. The Run state itself stays `failed`; `inspect` and `runs list`
+show it as `failed (cancelled)`, and their JSON is unchanged.
 Exec exits 0 on pass, 10 on run failure, and 13 when infrastructure or lost
 observation prevents a command verdict. Wrapper liveness appears once per
 minute, so a quiet command does not hit the no-output limit. It proves the

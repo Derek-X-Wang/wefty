@@ -124,6 +124,7 @@ const maxAnnotatedQueuedRuns = 20
 type runListingRow struct {
 	l3.RunSummary
 	UnschedulableReason string `json:"unschedulable_reason,omitempty"`
+	cancelStatus        string // Human-only evidence; the summary JSON stays unchanged.
 }
 
 type runListingPage struct {
@@ -144,4 +145,28 @@ func annotateRunListing(ctx context.Context, clients *apiClients, page l3.RunLis
 		annotated.Runs = append(annotated.Runs, runListingRow{RunSummary: run, UnschedulableReason: reasons[run.RunID]})
 	}
 	return annotated
+}
+
+// General summaries omit cancellation delivery. Read failed Runs only for the
+// human table, under one shared budget so a slow ledger cannot stall each row.
+// An unavailable record leaves the recorded status visible without guessing.
+func annotateRunCancellations(ctx context.Context, clients *apiClients, page *runListingPage) {
+	probeCtx, cancel := context.WithTimeout(ctx, statusProbeBudget)
+	defer cancel()
+	for index := range page.Runs {
+		run := &page.Runs[index]
+		if run.Status != contract.RunFailed {
+			continue
+		}
+		record, err := clients.getRun(probeCtx, run.RunID)
+		if err != nil {
+			// One unreadable record leaves its own row bare; only a spent
+			// budget ends the pass.
+			if probeCtx.Err() != nil {
+				break
+			}
+			continue
+		}
+		run.cancelStatus = record.CancelStatus
+	}
 }
