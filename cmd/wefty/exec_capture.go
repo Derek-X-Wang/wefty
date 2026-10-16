@@ -63,7 +63,39 @@ func execGit(ctx context.Context, dir, private string, input io.Reader, args ...
 	return string(out), nil
 }
 
-func captureExec(ctx context.Context, cwd string) (capture execCapture, err error) {
+var errExecCheckoutChanged = errors.New("checkout changed during capture; retry exec")
+
+type execCaptureConflictError struct{}
+
+func (*execCaptureConflictError) Error() string {
+	return "files kept changing while wefty copied them (another agent may be editing this folder); retry when edits pause"
+}
+
+func captureExec(ctx context.Context, cwd string) (execCapture, error) {
+	return captureExecWithWait(ctx, cwd, waitForContext)
+}
+
+func captureExecWithWait(ctx context.Context, cwd string, wait func(context.Context, time.Duration) error) (execCapture, error) {
+	for attempt := 0; ; attempt++ {
+		capture, err := captureExecAttempt(ctx, cwd)
+		if err != nil && ctx.Err() != nil {
+			return execCapture{}, context.Cause(ctx)
+		}
+		// Only retry a changed checkout whose failed capture was retired cleanly.
+		// Other failures, including cleanup failures, keep their existing behavior.
+		if err != errExecCheckoutChanged {
+			return capture, err
+		}
+		if attempt == 2 {
+			return execCapture{}, &execCaptureConflictError{}
+		}
+		if err := wait(ctx, time.Duration(attempt+1)*time.Second); err != nil {
+			return execCapture{}, err
+		}
+	}
+}
+
+func captureExecAttempt(ctx context.Context, cwd string) (capture execCapture, err error) {
 	root, err := execGit(ctx, cwd, "", nil, "rev-parse", "--show-toplevel")
 	if err != nil {
 		if outsideExecCheckout(cwd, err) {
@@ -172,7 +204,7 @@ func captureExec(ctx context.Context, cwd string) (capture execCapture, err erro
 		return capture, err
 	}
 	if strings.TrimSpace(confirm) != capture.Tree {
-		return capture, fmt.Errorf("checkout changed during capture; retry exec")
+		return capture, errExecCheckoutChanged
 	}
 
 	after, err := execGit(ctx, root, "", nil, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
@@ -184,7 +216,7 @@ func captureExec(ctx context.Context, cwd string) (capture execCapture, err erro
 		return capture, err
 	}
 	if after != status || strings.TrimSpace(head) != capture.Base {
-		return capture, fmt.Errorf("checkout changed during capture; retry exec")
+		return capture, errExecCheckoutChanged
 	}
 	commit, err := execGit(ctx, root, private, strings.NewReader("wefty exec capture\n"), "commit-tree", capture.Tree, "-p", capture.Base)
 	if err != nil {
