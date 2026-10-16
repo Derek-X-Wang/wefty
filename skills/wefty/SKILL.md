@@ -181,6 +181,9 @@ the agent's sandbox, so reaching wefty is the owner's trust decision. If the
 connection is blocked, ask the owner to allow it or to approve the run. Do not
 look for another way in.
 
+Do not use `exec` to run a command that your own sandbox blocks. `exec` runs it
+on the host, outside your sandbox. Ask the owner instead.
+
 Exec normally writes snapshots to `~/.local/state/wefty/exec`, or
 `$XDG_STATE_HOME/wefty/exec` when `XDG_STATE_HOME` is absolute. On macOS, if
 permissions or a read-only filesystem block that root, exec uses
