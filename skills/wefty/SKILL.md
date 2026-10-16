@@ -446,6 +446,7 @@ and full result details.
 `wefty workflow init NAME` writes a runnable bash starter that reports through
 the helper, a README with these commands, and a test that exercises the starter
 without a cluster. Start there rather than from an empty file.
+The printed next step names this machine's Pinned tag when its node config can be read; otherwise it points to `wefty status`.
 
 `wefty workflow init NAME --lang ts` writes the TypeScript version in the
 dogfood shape: `src/NAME.ts` with an inline mailbox writer (no package to

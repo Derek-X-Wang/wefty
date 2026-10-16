@@ -3,8 +3,11 @@ package main
 import (
 	"errors"
 	"io"
+	"path/filepath"
+	"strings"
 
 	"github.com/Derek-X-Wang/wefty/internal/workflowhelper"
+	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
 // executeAuthoringCommand dispatches the two commands a workflow author uses
@@ -21,10 +24,36 @@ func executeAuthoringCommand(options globalOptions, args []string, stdout, stder
 	case "run":
 		return true, asUsageError(workflowhelper.ExecuteRun(args[1:], options.jsonOutput, stdout, stderr))
 	case "workflow":
-		return true, asUsageError(workflowhelper.ExecuteWorkflow(args[1:], options.jsonOutput, stdout))
+		tag := ""
+		if len(args) > 1 && args[1] == "init" && !options.jsonOutput {
+			tag = workflowInitLocalTag(options.nodeConfigPath)
+		}
+		return true, asUsageError(workflowhelper.ExecuteWorkflowWithTag(args[1:], options.jsonOutput, stdout, tag))
 	default:
 		return false, nil
 	}
+}
+
+// workflowInitLocalTag reads only installation metadata. Unlike exec's
+// resolveLocalNode, this guidance must work offline, without checking L1.
+func workflowInitLocalTag(path string) string {
+	if path == "" {
+		return ""
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return ""
+	}
+	config, err := ocicontrol.ReadInstalledConfig(path)
+	if err != nil || strings.TrimSpace(config.NodeID) == "" ||
+		strings.TrimSpace(config.NodeID) != config.NodeID || strings.ContainsAny(config.NodeID, "\r\n\t") {
+		return ""
+	}
+	tags, err := pinnedImageTags(nil, config.NodeID, true)
+	if err != nil {
+		return ""
+	}
+	return tags[0]
 }
 
 // asUsageError gives an authoring mistake wefty's ordinary usage-error shape,

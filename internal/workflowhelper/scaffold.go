@@ -126,6 +126,12 @@ type scaffoldFile struct {
 // ExecuteWorkflow dispatches `wefty workflow ...`. Like `wefty run`, it needs
 // no cluster and no identity: it writes files.
 func ExecuteWorkflow(args []string, jsonOutput bool, stdout io.Writer) error {
+	return ExecuteWorkflowWithTag(args, jsonOutput, stdout, "")
+}
+
+// ExecuteWorkflowWithTag uses tag only in the printed next step; generated
+// files stay portable. An empty tag prints a placeholder and discovery hint.
+func ExecuteWorkflowWithTag(args []string, jsonOutput bool, stdout io.Writer, tag string) error {
 	if len(args) == 0 {
 		return UsageError("a wefty workflow subcommand is required: init")
 	}
@@ -135,13 +141,13 @@ func ExecuteWorkflow(args []string, jsonOutput bool, stdout io.Writer) error {
 	}
 	switch args[0] {
 	case "init":
-		return workflowInit(args[1:], jsonOutput, stdout)
+		return workflowInit(args[1:], jsonOutput, stdout, tag)
 	default:
 		return UsageError(fmt.Sprintf("unknown wefty workflow subcommand %q", args[0]))
 	}
 }
 
-func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
+func workflowInit(args []string, jsonOutput bool, stdout io.Writer, tag string) error {
 	flags := newFlagSet("init")
 	lang := flags.String("lang", LanguageBash, "the starter's language: bash or ts")
 	directory := flags.String("dir", "workflows", "the parent directory to write the workflow into")
@@ -174,6 +180,9 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 	}
 	var files []scaffoldFile
 	var submit string
+	if tag == "" {
+		tag = `<routing-tag> (see "Pinned tag" in wefty status)`
+	}
 	switch language {
 	case LanguageTypeScript:
 		// The source is not what gets submitted. A submission carries one
@@ -205,8 +214,8 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 			{"params.json", paramsTemplate, 0o644},
 			{data.TestFile, typeScriptIntegrationTestTemplate, 0o644},
 		}
-		submit = fmt.Sprintf("build it, then submit the bundle:\n  (cd %s && npm ci && npm run build)\n  wefty --json submit --script=%s --interpreter=node --required-envelope --tag=<routing-tag>\n",
-			target, filepath.Join(target, data.ScriptName))
+		submit = fmt.Sprintf("build it, then submit the bundle:\n  (cd %s && npm ci && npm run build)\n  wefty --json submit --script=%s --interpreter=node --required-envelope --tag=%s\n",
+			target, filepath.Join(target, data.ScriptName), tag)
 	default:
 		data.InlineWriter = inlineWriter
 		data.ScriptName = name + ".sh"
@@ -216,8 +225,8 @@ func workflowInit(args []string, jsonOutput bool, stdout io.Writer) error {
 			{"params.json", paramsTemplate, 0o644},
 			{data.TestFile, integrationTestTemplate, 0o644},
 		}
-		submit = fmt.Sprintf("submit with\n  wefty --json submit --script=%s --interpreter=bash --required-envelope --tag=<routing-tag>\n",
-			filepath.Join(target, data.ScriptName))
+		submit = fmt.Sprintf("submit with\n  wefty --json submit --script=%s --interpreter=bash --required-envelope --tag=%s\n",
+			filepath.Join(target, data.ScriptName), tag)
 	}
 
 	written := make([]string, 0, len(files))
