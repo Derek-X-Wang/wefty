@@ -92,6 +92,8 @@ runs as the node's user and can write absolute paths.
 
 Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied.
 Install dependencies inside the command (for example `pnpm install --frozen-lockfile && ...`), or point the tool at an absolute cache path.
+stdout and stderr are separate streams, so their order relative to each other
+is not kept. When order matters, merge them in the command: `sh -c '... 2>&1'`.
 
 **Stopping `exec` cancels the run unless `--keep-running` is set.** Ctrl-C,
 TERM, and HUP follow this rule. With `--keep-running`, streaming stays the
