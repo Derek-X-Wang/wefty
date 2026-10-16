@@ -1830,11 +1830,13 @@ func (session *agentSession) admitOneshot(occupied int) bool {
 	if occupied == 0 {
 		return true
 	}
-	if !session.lastOneshotClaim.IsZero() && session.oneshotClaimClock.Now().Sub(session.lastOneshotClaim) < 30*time.Second {
-		return false
-	}
+	// Zero turns the whole line-keeper rule off. The spacing exists only so
+	// the lagging load average can catch up before the next load check.
 	if session.oneshotLoadLimit == 0 {
 		return true
+	}
+	if !session.lastOneshotClaim.IsZero() && session.oneshotClaimClock.Now().Sub(session.lastOneshotClaim) < 30*time.Second {
+		return false
 	}
 	load, err := session.readLoad()
 	if err != nil {

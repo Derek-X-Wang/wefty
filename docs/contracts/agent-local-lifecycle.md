@@ -1291,11 +1291,12 @@ agent session. Existing attempts continue.
 
 The node setting is `--oneshot-load-limit`, then `WEFTY_ONESHOT_LOAD_LIMIT`,
 then `oneshot_load_limit` in the setup connection profile. The default is
-1.5 times `runtime.NumCPU()`. Zero disables only the load check. Negative or
+1.5 times `runtime.NumCPU()`. Zero turns the rule off: no load check and no
+spacing. Negative or
 non-finite limits are invalid. Restart the node agent to apply a setting.
 
-While another one-shot attempt is admitted, successful one-shot claims must
-be at least 30 seconds apart. The first successful claim starts that interval.
+While another one-shot attempt is admitted and the limit is not zero,
+successful one-shot claims must be at least 30 seconds apart. The first successful claim starts that interval.
 Empty responses and errors do not move it. The clock is injectable. Claim
 loops share the interval, so parallel loops cannot burst. An empty node can
 start immediately even if its last run just finished. Services use their

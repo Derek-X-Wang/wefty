@@ -67,7 +67,7 @@ Services keep their own slots and placement.
 The node agent's `--oneshot-load-limit` sets the limit. It overrides
 `WEFTY_ONESHOT_LOAD_LIMIT`, then `oneshot_load_limit` in the connection profile
 that setup writes. The default is 1.5 times this machine's logical CPUs.
-Zero disables the load gate; claim spacing still applies. Status uses the same
+Zero turns the rule off (no load check, no spacing). Status uses the same
 profile and environment setting. For an installed node, keep the setting there
 so status and the agent agree. Restart the node agent after a setting change.
 An unreadable load leaves load admission open and is logged once by the agent.

@@ -249,6 +249,9 @@ func newAcceptanceAgentProcess(
 		"--log-spool-dir=" + spoolDirectory,
 		"--managed-root=" + managedRoot,
 		"--handoff-root=" + handoffRoot,
+		// Capacity and isolation lanes fill every slot at once; the
+		// line-keeper hold and its spacing are covered by agent unit tests.
+		"--oneshot-load-limit=0",
 	}
 	if !productionTimings {
 		arguments = append(arguments,
