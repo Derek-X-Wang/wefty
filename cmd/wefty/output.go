@@ -426,6 +426,15 @@ func pointerOrNA(value *string, suffix string) string {
 	return *value + suffix
 }
 
+// humanRunStatus keeps cancellation visible without changing the ledger state.
+// Pending, refused and legacy delivery records do not prove settlement.
+func humanRunStatus(status contract.RunState, cancelStatus string) string {
+	if status == contract.RunFailed && cancelStatus == "settled" {
+		return "failed (cancelled)"
+	}
+	return string(status)
+}
+
 func writeRunInspection(writer io.Writer, inspection runInspection) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
 	// Dispatch authority is shown because it is the one column that says
@@ -439,7 +448,7 @@ func writeRunInspection(writer io.Writer, inspection runInspection) error {
 		if run.DispatchAuthority {
 			authority = "yes"
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%d\t%d\n", run.RunID, run.ParentRunID, run.Status, authority, len(run.Envelopes), len(run.Gates)); err != nil {
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%d\t%d\n", run.RunID, run.ParentRunID, humanRunStatus(run.Status, run.CancelStatus), authority, len(run.Envelopes), len(run.Gates)); err != nil {
 			return err
 		}
 	}
