@@ -126,7 +126,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	if err != nil {
 		return err
 	}
-	capture, err := captureExec(ctx, cwd)
+	capture, err := captureExecWithWait(ctx, cwd, clients.wait)
 	if err != nil {
 		return err
 	}

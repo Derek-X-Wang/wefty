@@ -831,14 +831,14 @@ func TestExecCaptureInterruptedAndConcurrentEdits(t *testing.T) {
 			}
 			before, _ := filepath.Glob(filepath.Join(os.Getenv("WEFTY_EXEC_STORAGE_ROOT"), "wefty-exec-*"))
 			err = execute(ctx, stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "exit 0"}, io.Discard, io.Discard)
-			if err == nil || len(stack.requests) != 0 {
+			if interrupt && (err == nil || len(stack.requests) != 0) {
 				t.Fatalf("capture interruption submitted: %v requests=%d", err, len(stack.requests))
+			}
+			if !interrupt && (err != nil || len(stack.requests) != 1) {
+				t.Fatalf("capture did not recover after edit: %v requests=%d", err, len(stack.requests))
 			}
 			if interrupt && !errors.Is(err, context.Canceled) {
 				t.Fatalf("capture stop: %v", err)
-			}
-			if !interrupt && !strings.Contains(err.Error(), "changed during capture") {
-				t.Fatalf("concurrent-edit refusal: %v", err)
 			}
 			after, _ := filepath.Glob(filepath.Join(os.Getenv("WEFTY_EXEC_STORAGE_ROOT"), "wefty-exec-*"))
 			if !reflect.DeepEqual(before, after) {

@@ -39,7 +39,10 @@ this override.
 
 The capture never writes the caller's files, index, objects, stash or refs. It
 rechecks the file image, HEAD and status before submission to detect concurrent
-changes. The run does not read the source checkout after submission.
+changes. A changed checkout triggers up to three fresh capture attempts with
+waits of one and two seconds; if all change, exec submits nothing and reports
+retryable `conflict` (exit 5). The run does not read the source checkout after
+submission.
 
 L3 params record `base_commit`, `snapshot_tree`, `dirty`, `relative_folder`,
 `snapshot_storage`, `argv` and `exec_version=1`. The version identifies new
