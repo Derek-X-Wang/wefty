@@ -118,6 +118,10 @@ func TestOneshotClaimsAreSpacedWithInjectedClock(t *testing.T) {
 	}
 	session.readLoad = func() (float64, error) { return 99, nil }
 	claim(true)
+	// A zero limit turns the whole rule off: high load and no spacing.
+	session.oneshotLoadLimit = 0
+	claim(true)
+	claim(true)
 }
 
 func boolCount(value bool) int32 {
