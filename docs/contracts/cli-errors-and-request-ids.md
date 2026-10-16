@@ -250,3 +250,32 @@ error-scrubbing rules. Internal errors still scrub private messages and details;
 L3's correlation detail is added after scrubbing and never discloses a cause.
 This metadata is additive and does not change authorization, request replay,
 or the L1 client boundary (ADR-0006).
+
+## Status readiness and busy nodes
+
+`wefty status` stays `ready` (exit 0) when an alive, claiming node advertises an
+executable one-shot kind but all such nodes have their one-shot slots in use.
+It adds `busy: all one-shot slots in use; N runs waiting; a new run waits in line`.
+Submit with `--detach` and wait. Busy does not require a repair.
+
+`N` comes from the existing queued-run read within the status probe budget.
+It is the visible queued count, not a separate queue census. If that read has
+another page or cannot provide the count, omit `N runs waiting; `.
+JSON adds `busy` and, when known, `waiting_runs`. Free slots and per-kind
+limitations still report immediate capacity. `accepts_oneshot` keeps its meaning
+of immediate eligibility, including a free slot.
+
+Exit 12 remains for unreachable control services, no registered or alive node,
+claims disabled on every alive node, no executable kind on an alive claiming
+node, or no one-shot slots configured on any such node. Zero configured slots
+cannot move the line and keep the `no_free_slot` reason. Draining nodes keep
+their existing not-ready advice.
+
+For the installed local node, the `this machine` row adds `load L; limit M`.
+With one-shot occupancy and load at or above a positive limit, an alive,
+claiming, executable local node adds `holding new work: machine busy`.
+An unreadable load says `load unavailable` and does not claim a hold. JSON
+adds `local_load` with `average` when known, `limit`, and `holding`.
+Status reads this machine directly with the agent's platform reader. It uses
+the local profile and environment limit; keep installed settings there so both
+commands agree. Other nodes' load is not reported in phase 1.

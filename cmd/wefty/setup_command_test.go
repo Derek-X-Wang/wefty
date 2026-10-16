@@ -378,6 +378,21 @@ func TestSetupSecondRunChangesNothingAndReloadsOnlyWhatChanged(t *testing.T) {
 		t.Fatalf("setup replaced the owner's slot policy (%d) or reported changes %v", got, report.Changes)
 	}
 
+	// Setup preserves a local load setting and reloads only its node agent.
+	for _, limit := range []float64{18, 0} {
+		profile = fixture.profile(t)
+		profile.OneshotLoadLimit = &limit
+		if err := connprofile.Write(filepath.Join(fixture.home, ".config", "wefty", "profile.json"), profile); err != nil {
+			t.Fatal(err)
+		}
+		report = fixture.setup(t, setupRequest{})
+		reloadsOnly(t, report, setupNodeAgentLabel)
+		got := fixture.profile(t).OneshotLoadLimit
+		if got == nil || *got != limit || len(report.Changes) != 0 {
+			t.Fatalf("setup replaced the load setting %v; changes=%v", got, report.Changes)
+		}
+	}
+
 	// A changed login-shell PATH reloads only the node agent.
 	fixture.loginPATH = "/opt/homebrew/bin:/usr/local/go/bin:/usr/bin:/bin"
 	reloadsOnly(t, fixture.setup(t, setupRequest{}), setupNodeAgentLabel)

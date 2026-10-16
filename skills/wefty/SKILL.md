@@ -36,7 +36,7 @@ exit code is the answer:
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | `ready` — submit |
+| 0 | `ready` — submit. A `busy:` line means the run waits in line. |
 | 12 | `not ready: <what is missing>` — read the line; it names the thing to fix |
 | 2 | you passed something wrong |
 
@@ -46,6 +46,31 @@ terminal, which is exactly what makes the output useful — and exactly why you
 must not paste it somewhere else. **Do not copy `status` output into a file, a
 commit, an issue or a message.** Report the verdict line and what it means; if
 someone needs the detail, let them run the command themselves.
+
+**If `status` says busy, submit with `--detach` and wait.** The node starts
+the run when there is room. Use `wefty wait RUN_ID --timeout 30m`; a wait timeout
+leaves the run in line. If an agent cannot wait, it may run directly and must
+log that choice in its daily-use log. Busy is healthy and keeps exit 0:
+
+```text
+ready
+busy: all one-shot slots in use; N runs waiting; a new run waits in line
+```
+
+The waiting count is omitted when the bounded read cannot count all queued runs.
+The `this machine` row shows the local one-minute load and its limit. With a
+one-shot attempt active, load at or above the limit shows
+`holding new work: machine busy`. The first one-shot can always start. Further
+one-shot claims are at least 30 seconds apart while another is active.
+Services keep their own slots and placement.
+
+The node agent's `--oneshot-load-limit` sets the limit. It overrides
+`WEFTY_ONESHOT_LOAD_LIMIT`, then `oneshot_load_limit` in the connection profile
+that setup writes. The default is 1.5 times this machine's logical CPUs.
+Zero turns the rule off (no load check, no spacing). Status uses the same
+profile and environment setting. For an installed node, keep the setting there
+so status and the agent agree. Restart the node agent after a setting change.
+An unreadable load leaves load admission open and is logged once by the agent.
 
 **If `status` says not ready, stop.** Do not submit and do not retry in a loop.
 Bringing the stack up and enrolling machines into the Fabric are **human steps**,
@@ -149,10 +174,19 @@ codex -c 'sandbox_workspace_write.network_access=true'
 
 Any other sandbox that blocks loopback needs the same network allowance.
 
-The agent's sandbox must allow writes to the snapshot folder:
-`~/.local/state/wefty/exec`, or `$XDG_STATE_HOME/wefty/exec` when
-`XDG_STATE_HOME` is an absolute path. Use the folder named by the error.
-The snapshot stays outside the checkout so this machine's node can read it.
+Exec normally writes snapshots to `~/.local/state/wefty/exec`, or
+`$XDG_STATE_HOME/wefty/exec` when `XDG_STATE_HOME` is absolute. On macOS, if
+permissions or a read-only filesystem block that root, exec uses
+`$TMPDIR/wefty-exec` (Go's `os.TempDir()`) with the same 0700 permissions.
+The same-user node LaunchAgent can read it. No extra folder allowance is
+normally needed on a Mac.
+
+On other platforms, allow writes to the folder named by the error, or set
+`WEFTY_EXEC_STORAGE_ROOT` to a writable folder outside the checkout that the
+node can read. This override is supported on every platform and never falls
+back. Linux nodes may have a private `/tmp`, so do not assume they can read
+the caller's temp folder. If both macOS roots fail, use the same override or
+allow writes to the default root.
 
 For Codex, add the absolute folder to `sandbox_workspace_write.writable_roots`
 in its configuration, or pass it when starting the session:

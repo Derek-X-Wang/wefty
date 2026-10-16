@@ -47,6 +47,7 @@ func newExecStack(t *testing.T, idle time.Duration) *execStack {
 		shortenExecTimers(t)
 	}
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("TMPDIR", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
 	network := plain.NewNetwork()
