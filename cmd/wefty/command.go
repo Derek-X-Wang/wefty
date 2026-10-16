@@ -540,6 +540,13 @@ func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 		return usageError("usage: wefty rerun RUN_ID")
 	}
 	sourceRunID := strings.TrimSpace(flags.Arg(0))
+	source, err := clients.getRun(ctx, sourceRunID)
+	if err != nil {
+		return err
+	}
+	if err := checkExecRerunCapture(source); err != nil {
+		return err
+	}
 	// The rerun protocol currently accepts no overrides: its entire request
 	// is the source run, whose immutable inputs are copied by L3.
 	key, err := runRequestKey("rerun", struct {

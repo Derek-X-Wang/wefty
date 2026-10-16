@@ -2,6 +2,7 @@
 set -u
 # Values below are shell-quoted by the CLI, never evaluated as shell source.
 __WEFTY_EXEC_INPUT__
+__WEFTY_EXEC_CLEANUP__
 work="$storage/work"
 # The liveness loop stops on these markers, not on a signal from this shell.
 # A signal that reaches a new subshell while it still carries this shell's
@@ -10,7 +11,6 @@ started="$storage/started"
 finished="$storage/finished"
 heartbeat=''
 child=''
-removal_polls=0
 # The command can make storage unwritable. SIGKILL cannot be caught, so it
 # still stops the liveness loop when the marker cannot be written.
 stop_heartbeat() {
@@ -18,28 +18,13 @@ stop_heartbeat() {
   wait "$heartbeat" 2>/dev/null || :
   heartbeat=''
 }
-# Run one removal step within the shared ten-second budget, so a stalled
-# filesystem cannot keep the run open. The step itself is tracked and killed.
-bounded_removal() {
-  "$@" </dev/null >/dev/null 2>&1 &
-  operation=$!
-  while kill -0 "$operation" 2>/dev/null && [ "$removal_polls" -lt 100 ]; do
-    sleep 0.1
-    removal_polls=$((removal_polls+1))
-  done
-  kill -KILL "$operation" 2>/dev/null || :
-  wait "$operation"
-}
 cleanup() {
   code=$?
   trap - EXIT INT TERM HUP
   if [ -n "$child" ]; then kill "$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; fi
   if [ -n "$heartbeat" ]; then stop_heartbeat; fi
   cd /tmp || :
-  # Bound removal even if a filesystem stalls. The CLI also removes storage
-  # after observing a terminal run, including a cancelled queued run.
-  bounded_removal /bin/chmod -R u+w "$storage" && bounded_removal /bin/rm -rf -- "$storage"
-  [ ! -e "$storage" ] || printf 'wefty: warning: snapshot cleanup failed at %s\n' "$storage" >&2
+  retire_exec_storage "$storage" capture || printf 'wefty: warning: snapshot cleanup failed at %s\n' "$storage" >&2
   exit "$code"
 }
 trap cleanup EXIT
@@ -47,12 +32,17 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 snapshot_checkout_failed() {
-  printf 'wefty: snapshot checkout failed\n' >&2
+  reason='snapshot checkout failed'
+  if [ ! -d "$storage/snapshot.git" ]; then
+    reason='the exec snapshot was deleted when the run ended; run `wefty exec` again'
+  fi
+  printf 'wefty: %s\n' "$reason" >&2
   if [ -n "${WEFTY_HANDOFF_DIR:-}" ]; then
-    printf '{"infrastructure_error":"snapshot checkout failed"}\n' > "$WEFTY_HANDOFF_DIR/result.json"
+    printf '{"infrastructure_error":"%s"}\n' "$reason" > "$WEFTY_HANDOFF_DIR/result.json"
   fi
   exit 1
 }
+[ -d "$storage/snapshot.git" ] || snapshot_checkout_failed
 # Report liveness from the start, so the no-output limit measures the
 # command, not the checkout of a large snapshot. The loop ends by itself
 # within one tick of the finished marker, or when storage is gone.
@@ -83,7 +73,7 @@ heartbeat=$!
 # Acceptance can precede the CLI's marker write, or its reply can be lost.
 # Record ownership before cloning changes the capture directory's age.
 if [ -n "${WEFTY_RUN_ID:-}" ]; then
-  (umask 077; printf '%s\n' "$WEFTY_RUN_ID" > "$storage/run-id") || snapshot_checkout_failed
+  (umask 077; printf '%s\n' "$WEFTY_RUN_ID" > "$storage/run-id") 2>/dev/null || snapshot_checkout_failed
 fi
 # --no-local prevents hard links or alternates back to the capture.
 (

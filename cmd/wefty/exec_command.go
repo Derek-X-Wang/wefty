@@ -26,6 +26,9 @@ import (
 //go:embed exec_wrapper.sh
 var execWrapper string
 
+//go:embed exec_cleanup.sh
+var execCleanupScript string
+
 // The interval is fixed in production. Tests shorten it at this workload seam
 // while still executing the shipped wrapper through L1 and the node agent.
 var execHeartbeatSeconds = "60"
@@ -51,7 +54,8 @@ var execCancelSettlementBudget = l1.CancelSettlementTimeout
 
 type execParams struct {
 	execCapture
-	Argv []string `json:"argv"`
+	Argv        []string `json:"argv"`
+	ExecVersion int      `json:"exec_version,omitempty"`
 }
 
 func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
@@ -126,7 +130,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	if err != nil {
 		return err
 	}
-	params, err := json.Marshal(execParams{execCapture: capture, Argv: argv})
+	params, err := json.Marshal(execParams{execCapture: capture, Argv: argv, ExecVersion: 1})
 	if err != nil {
 		return errorsWithCleanup(err, capture.Storage)
 	}
@@ -216,7 +220,8 @@ func buildExecWrapper(capture execCapture, argv []string) string {
 	for i, arg := range argv {
 		fmt.Fprintf(&input, "command[%d]=%s\n", i, quote(arg))
 	}
-	return strings.Replace(execWrapper, "__WEFTY_EXEC_INPUT__", input.String(), 1)
+	script := strings.Replace(execWrapper, "__WEFTY_EXEC_CLEANUP__", execCleanupScript, 1)
+	return strings.Replace(script, "__WEFTY_EXEC_INPUT__", input.String(), 1)
 }
 
 func submitExecRun(ctx context.Context, clients *apiClients, request l3.CreateRunRequest, key string, stderr io.Writer) (acceptedOutput, bool, error) {

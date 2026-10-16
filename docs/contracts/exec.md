@@ -30,7 +30,10 @@ rechecks the file image, HEAD and status before submission to detect concurrent
 changes. The run does not read the source checkout after submission.
 
 L3 params record `base_commit`, `snapshot_tree`, `dirty`, `relative_folder`,
-`snapshot_storage` and `argv`. Params exceeding 64 KiB are refused before
+`snapshot_storage`, `argv` and `exec_version=1`. The version identifies new
+exec runs for rerun checks. Legacy inline exec runs are recognized by their
+complete original typed params, including Git identities and allocated capture
+path, rather than script or log text. Params exceeding 64 KiB are refused before
 submission. Command text is stored as typed; there is no secret scrubbing.
 One random idempotency key belongs to each call. Up to three retries reuse that
 key and exactly the same request, including after a lost acknowledgement.
@@ -50,14 +53,23 @@ marker in the capture storage, so it normally ends about one tick after the
 command, before result publication or cleanup. The wrapper does not stop the
 loop with a catchable signal: Bash can catch and lose a signal that reaches a
 new subshell while it still carries the wrapper's traps. Only when the marker
-cannot be written does the wrapper use SIGKILL. Cleanup runs each removal step
-under a shared 10 s budget and kills a step that exceeds it.
+cannot be written does the wrapper use SIGKILL. Cleanup first renames the
+capture to a `.wefty-trash-` name in the same storage root. Only waiting for
+that rename has a ten-second budget; recursive deletion has no total time limit.
 Heartbeat lines go to stderr. The wrapper writes `{"exit_code":N}` to the
 run's result document, using the existing result upload path. Clone, checkout,
 or start-folder failures print `wefty: snapshot checkout failed` and write an
 `infrastructure_error` result without a command `exit_code`. The CLI reports
 these failures with typed unavailable exit 13. Private clones use `--template=`;
 all Git calls disable hooks with `-c core.hooksPath=/dev/null`.
+
+If the capture or its bare snapshot is gone, the wrapper instead prints
+``wefty: the exec snapshot was deleted when the run ended; run `wefty exec` again``
+and writes that reason as `infrastructure_error`, without a command `exit_code`.
+`wefty rerun` checks the immutable exec params and capture before submitting.
+It refuses a deleted snapshot with the same reason and usage exit 2, including
+with `--again` or an explicit idempotency key. No run is created. Use a new
+`wefty exec` to capture the current checkout.
 
 On an idle node a run starts within about two seconds of acceptance, whether
 or not the command prints anything: L3 submits it to L1 on acceptance, the
@@ -89,9 +101,17 @@ retained storage path. After a failed run ends, exec also waits up to forty
 seconds for the command result to arrive before reporting a missing result
 with exit 13. Other log-follow commands keep their existing policies.
 
-The wrapper bounds snapshot removal to ten seconds. Both the wrapper and CLI
-run `chmod -R u+w` before removal, including read-only generated directories.
-Cleanup failures are warnings and do not change a command's 0 or 10 result.
+Both the wrapper and CLI atomically rename a finished capture before removing
+its contents. Trash names start with `.wefty-trash-`, never the live capture
+prefix `wefty-exec-`. A detached Bash helper runs `chmod -R u+w` and `rm -rf`
+on trash, including read-only generated directories, with no total time limit.
+Bash job control gives the helper its own process group on macOS and Linux;
+it ignores HUP and closes stdin, stdout and stderr. Thus it neither holds the
+run's output open nor belongs to the process group the node reaps at attempt
+end. A stalled filesystem cannot hold the run open: the wrapper waits at most
+ten seconds for retirement, while the helper continues independently.
+Retirement failures are warnings and do not change a command's 0 or 10 result.
+Each trash entry has one deleter, guarded by a sibling `.wefty-delete-` marker whose dead owner process group allows a later sweep to retry failed or killed deletion.
 If another cleanup has already removed the capture, removal is successful.
 The observing CLI also removes storage after terminal observation, including a
 cancelled queued run.
@@ -104,10 +124,13 @@ Once acceptance is confirmed, the CLI records the run ID in the capture's
 `run-id` file. The wrapper also writes its `WEFTY_RUN_ID` there before cloning,
 including when the CLI lost the acceptance reply or exited. At the start of
 each exec, a best-effort sweep examines at most
-64 immediate storage-root entries within a shared two-second budget. It removes
+64 immediate storage-root entries within a shared two-second foreground budget.
+Trash directories go straight to background deletion, without an age wait or
+L3 lookup. Deletion does not spend the foreground budget. The sweep retires
 captures whose recorded runs are terminal and captures without a run ID that
 are older than one hour only after public reads of runs and their immutable
-`snapshot_storage` params confirm no live run uses the capture. A lookup failure
+`snapshot_storage` params confirm no live run uses the capture. Verified old
+markerless leftovers use the same rename-then-delete path. A lookup failure
 or timeout retains the capture. Live or unverifiable runs, young captures, symlinks,
 and unrelated folders stay intact. Sweep failures print warnings and do not
 fail exec, except for the sandbox network refusal described below. This also
