@@ -272,6 +272,7 @@ func executeRuns(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		if jsonOutput {
 			return writeJSON(stdout, annotated)
 		}
+		annotateRunCancellations(ctx, clients, &annotated)
 		return writeRunListing(stdout, annotated, time.Now().UTC())
 	}
 	if status != "" || mine {
@@ -322,7 +323,7 @@ func writeRunListing(writer io.Writer, page runListingPage, now time.Time) error
 	}
 	var unschedulable []runListingRow
 	for _, run := range page.Runs {
-		status := string(run.Status)
+		status := humanRunStatus(run.Status, run.cancelStatus)
 		if run.DispatchHold != nil {
 			status += " (dispatch held: " + run.DispatchHold.Reason + " since " + run.DispatchHold.Since.Format(time.RFC3339) + ")"
 		}
@@ -392,7 +393,7 @@ func writeComputerOriginRuns(writer io.Writer, page l3.ComputerRunPage) error {
 	}
 	for _, run := range page.Runs {
 		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			run.RunID, valueOrNA(run.ParentRunID), run.Status, run.Trigger.Type, run.Trigger.Principal,
+			run.RunID, valueOrNA(run.ParentRunID), humanRunStatus(run.Status, run.CancelStatus), run.Trigger.Type, run.Trigger.Principal,
 			valueOrNA(run.Trigger.ComputerID), valueOrNA(run.Trigger.ComputerAttemptID),
 			int64OrNA(run.Trigger.ComputerStorageGeneration), int64OrNA(run.Trigger.SubmitIntentRevision),
 			run.CreatedAt.Format(time.RFC3339), run.UpdatedAt.Format(time.RFC3339)); err != nil {
