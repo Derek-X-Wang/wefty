@@ -60,8 +60,36 @@ never retried; transport failures without an envelope are not retried;
 non-retryable answers and caller cancellation return at once, including
 during the backoff. Wait and follow loops that already retry such answers at
 their own interval (#763) skip this one-shot retry, so their cadence is
-unchanged; `--all` page walks are one-shot reads and may make up to three
-extra requests per page.
+unchanged. Most `--all` page walks are one-shot reads and may make up to three
+extra requests per page. Run and service log `--all` walks instead retry at
+`--poll-interval`, with at most 30 consecutive retries before returning the
+last answer.
+
+## Run log paging
+
+`wefty logs RUN_ID` reads one page by default. `--limit` caps events per
+page (default 200); the read cutoff may return fewer. `--cursor CURSOR`
+continues after a previous page's `next_cursor`, including with `--follow`.
+A nonempty plain page probes the next cursor with limit 1. If more events
+exist, stderr says `wefty: more log events exist; resume with --cursor CURSOR or use --all`.
+If the probe is empty, the CLI reads the run status. A non-terminal run says
+`wefty: run is still STATUS; more log events may follow; use --follow --cursor CURSOR`.
+A terminal run has no paging notice. If either read fails, stderr says
+`wefty: log read may be partial; resume with --cursor CURSOR or use --all for every retained event`.
+These extra reads cannot fail the command. Stdout stays as log bytes.
+An empty initial page has no paging notice.
+One-page `--json` keeps the existing page object, including `next_cursor`.
+
+`--all` reads every retained event once, starting at `--cursor` if supplied,
+until an empty page. Like `services logs --all`, it uses a 10,000-page cap;
+reaching the cap fails (exit 1) and names `--all --cursor CURSOR` on stderr.
+The cap does not add a paging notice that suggests `use --all`.
+`--all --json` writes one event per line, matching `--follow --json` and
+`services logs --all --json`. Truncation notices stay on stderr. `--all` with
+`--follow` is a usage error (exit 2). `--poll-interval` controls follow and
+retry polling. No new exit code is introduced.
+
+## JSON flags and errors
 
 `--json` and `--json=true` are global wherever they appear in the argument list,
 including after the command or its operands, except when consumed as another
