@@ -75,6 +75,10 @@ func resolveLocalNode(ctx context.Context, clients *apiClients) (localNodeIdenti
 		if errors.As(err, &responseErr) && responseErr.APIError.Code == contract.ErrorNotFound {
 			return fail(localNodeUnknown, fmt.Sprintf("installed node %q is not known to L1 at %s; check the L1 endpoint and the node installation", config.NodeID, clients.l1.address), err)
 		}
+		var sandbox *networkSandboxError
+		if errors.As(err, &sandbox) {
+			return fail(localNodeUnavailable, sandbox.Error(), err)
+		}
 		return fail(localNodeUnavailable, fmt.Sprintf("cannot verify installed node %q with L1: %s", config.NodeID, probeDetail(err)), err)
 	}
 	if node.NodeID != config.NodeID {

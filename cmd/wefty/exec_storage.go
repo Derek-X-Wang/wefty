@@ -74,6 +74,12 @@ func sweepExecStorage(caller context.Context, clients *apiClients, stderr io.Wri
 		}
 		storage := filepath.Join(root, entry.Name())
 		if err = sweepExecCapture(ctx, clients, storage); err != nil {
+			var sandbox *networkSandboxError
+			if errors.As(err, &sandbox) {
+				// Exec needs L3 too. Report this required network allowance once,
+				// instead of warning here and failing another dial below.
+				return &unavailableError{cause: sandbox}
+			}
 			warn(err)
 		}
 	}

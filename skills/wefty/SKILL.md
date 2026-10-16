@@ -127,6 +127,21 @@ output fields, and storage cleanup.
 
 ### Running `exec` from a sandboxed AI agent
 
+The agent's sandbox must allow local network connections to wefty's L1 and L3
+addresses, including loopback. An `operation not permitted` dial error means
+the caller's sandbox blocks the connection. Allow it before retrying; see the
+address in the error. A refused connection instead means the service may not
+be running.
+
+For Codex, set `sandbox_workspace_write.network_access = true` in its
+configuration, or use an approved escalation that permits the connection:
+
+```sh
+codex -c 'sandbox_workspace_write.network_access=true'
+```
+
+Any other sandbox that blocks loopback needs the same network allowance.
+
 The agent's sandbox must allow writes to the snapshot folder:
 `~/.local/state/wefty/exec`, or `$XDG_STATE_HOME/wefty/exec` when
 `XDG_STATE_HOME` is an absolute path. Use the folder named by the error.

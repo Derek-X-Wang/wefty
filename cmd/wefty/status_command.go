@@ -57,6 +57,8 @@ type serviceStatus struct {
 	Reachable bool   `json:"reachable"`
 	// Detail is why it is not reachable, or empty when it is.
 	Detail string `json:"detail,omitempty"`
+	// Keep the typed cause for readiness advice without changing the wire shape.
+	sandbox *networkSandboxError
 }
 
 // nodeStatus is a node's ability to take work, not its whole projection.
@@ -225,6 +227,7 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 		listed, err := clients.listNodes(probeCtx)
 		if err != nil {
 			l1Status.Detail = probeDetail(err)
+			errors.As(err, &l1Status.sandbox)
 			return
 		}
 		l1Status.Reachable = true
@@ -244,6 +247,7 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 		queued, err := clients.listRuns(probeCtx, string(contract.RunQueued), maxAnnotatedQueuedRuns)
 		if err != nil {
 			l3Status.Detail = probeDetail(err)
+			errors.As(err, &l3Status.sandbox)
 			return
 		}
 		l3Status.Reachable = true
@@ -430,12 +434,20 @@ func capacityByKind(nodes []nodeStatus) map[string]int {
 func reasonsFor(l1Status, l3Status serviceStatus, nodes []nodeStatus,
 	capacity map[string]int) (reasons, limitations []statusReason) {
 	if !l1Status.Reachable {
+		detail := "L1 at " + endpointOrNone(l1Status.Endpoint) + " is not reachable (" + addressHint("l1") + ")"
+		if l1Status.sandbox != nil {
+			detail = l1Status.sandbox.Error()
+		}
 		reasons = append(reasons, statusReason{Code: "l1_unreachable",
-			Detail: "L1 at " + endpointOrNone(l1Status.Endpoint) + " is not reachable (" + addressHint("l1") + ")"})
+			Detail: detail})
 	}
 	if !l3Status.Reachable {
+		detail := "L3 at " + endpointOrNone(l3Status.Endpoint) + " is not reachable (" + addressHint("l3") + ")"
+		if l3Status.sandbox != nil {
+			detail = l3Status.sandbox.Error()
+		}
 		reasons = append(reasons, statusReason{Code: "l3_unreachable",
-			Detail: "L3 at " + endpointOrNone(l3Status.Endpoint) + " is not reachable (" + addressHint("l3") + ")"})
+			Detail: detail})
 	}
 	if !l1Status.Reachable {
 		// Without L1 there is no node projection at all, so anything said
