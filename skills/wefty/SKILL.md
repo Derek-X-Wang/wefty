@@ -112,7 +112,10 @@ wefty cancel "$RUN_ID"
 that Git does not ignore before submission. Run it from inside a Git checkout
 with at least one commit. It runs in the same relative
 folder in a throwaway copy, on this machine's installed node. Later edits do
-not change the run. The command inherits the node's environment and `PATH`;
+not change the run. If the checkout changes during capture, exec makes up to
+three fresh attempts with waits of one and two seconds, then refuses with
+retryable `conflict` (exit 5) if edits continue. The command inherits the node's
+environment and `PATH`;
 the run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
 

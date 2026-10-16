@@ -66,6 +66,7 @@ func classifyCommandReport(err error) commandReport {
 	var unavailable *unavailableError
 	var localErr *ocicontrol.ResponseError
 	var responseErr *apiResponseError
+	var captureConflict *execCaptureConflictError
 	var apiError contract.APIError
 	switch {
 	case errors.As(err, &outcome):
@@ -95,6 +96,9 @@ func classifyCommandReport(err error) commandReport {
 			Code: contract.ErrorInvalidRequest, Message: usage.Error(), Retryable: false,
 		}}
 		return report
+	case errors.As(err, &captureConflict):
+		apiError = contract.APIError{Code: contract.ErrorConflict, Message: captureConflict.Error(), Retryable: true}
+		report.errorDocument = contract.ErrorResponse{Error: apiError}
 	case errors.As(err, &localErr):
 		apiError = localErr.APIError
 		report.errorDocument = contract.ErrorResponse{Error: apiError}
