@@ -352,24 +352,18 @@ func cleanupExecStorage(storage string) error {
 }
 
 func cleanupExecStorageContext(caller context.Context, storage string) error {
+	return retireExecStorageContext(caller, storage, "capture")
+}
+
+func retireExecStorageContext(caller context.Context, storage, kind string) error {
 	ctx, cancel := context.WithTimeout(caller, 10*time.Second)
 	defer cancel()
-	if _, err := os.Stat(storage); os.IsNotExist(err) {
-		return nil
-	}
-	// Go module caches and other generated directories may be read-only.
-	if out, err := exec.CommandContext(ctx, "/bin/chmod", "-R", "u+w", storage).CombinedOutput(); err != nil {
-		if _, e := os.Stat(storage); os.IsNotExist(e) {
-			return nil
-		}
-		return fmt.Errorf("snapshot cleanup failed at %s: chmod: %w: %s", storage, err, out)
-	}
-	// Only paths allocated by captureExec are passed here. rm is cancellable;
-	// a failed cleanup is surfaced with its exact remaining path.
-	if out, err := exec.CommandContext(ctx, "/bin/rm", "-rf", "--", storage).CombinedOutput(); err != nil {
-		if _, e := os.Stat(storage); os.IsNotExist(e) {
-			return nil
-		}
+	// The shell waits only for retirement. Its background helper has its own
+	// process group and no inherited output pipes; cancelling this wait cannot
+	// kill deletion or delay command completion until deletion finishes.
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", execCleanupScript+"\nretire_exec_storage \"$1\" \"$2\"", "wefty-exec-cleanup", storage, kind)
+	cmd.WaitDelay = time.Second
+	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("snapshot cleanup failed at %s: %w: %s", storage, err, out)
 	}
 	return nil

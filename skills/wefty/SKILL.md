@@ -129,7 +129,8 @@ wrapper is alive, not that the command makes progress.
 **Never put a secret on the command line.** The command text is stored
 permanently as typed, with no secret scrubbing. See
 [`docs/contracts/exec.md`](../../docs/contracts/exec.md) for capture refusals,
-output fields, and storage cleanup.
+output fields, and storage cleanup. Finished captures are renamed to trash;
+background deletion has no time limit and does not keep the run open.
 
 ### Running `exec` from a sandboxed AI agent
 
@@ -304,6 +305,9 @@ wefty logs <run_id> --all                 # a finished run's full retained log
 wefty rerun <run_id>                      # first call creates; identical retries replay
 wefty rerun <run_id> --again              # deliberately repeat the stored snapshot
 ```
+
+An exec snapshot is deleted when its run ends. Rerun refuses a deleted exec
+snapshot before creating a run (exit 2); run `wefty exec` again.
 
 Every command above accepts `--json`, and `--json` is what a script should use:
 the table forms are for people and their columns are not a contract.

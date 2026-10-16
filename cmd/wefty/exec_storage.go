@@ -38,8 +38,8 @@ func recordExecStorageRun(storage, runID string, stderr io.Writer) {
 }
 
 // Sweep only immediate capture directories. Unverifiable runs, symlinks, and
-// young unaccepted captures stay intact. Every probe and removal shares the
-// same deadline, and directory enumeration itself is capped at 64 entries.
+// young unaccepted captures stay intact. Probes and retirement share the
+// deadline; deletion runs independently. Enumeration is capped at 64 entries.
 func sweepExecStorage(caller context.Context, clients *apiClients, stderr io.Writer) error {
 	ctx, stop := context.WithTimeout(withoutClientRetry(caller), execSweepBudget)
 	defer stop()
@@ -69,11 +69,19 @@ func sweepExecStorage(caller context.Context, clients *apiClients, stderr io.Wri
 			warn(ctx.Err())
 			return nil
 		}
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "wefty-exec-") {
+		if !entry.IsDir() {
 			continue
 		}
 		storage := filepath.Join(root, entry.Name())
-		if err = sweepExecCapture(ctx, clients, storage); err != nil {
+		switch {
+		case strings.HasPrefix(entry.Name(), ".wefty-trash-"):
+			err = retireExecStorageContext(ctx, storage, "trash")
+		case strings.HasPrefix(entry.Name(), "wefty-exec-"):
+			err = sweepExecCapture(ctx, clients, storage)
+		default:
+			continue
+		}
+		if err != nil {
 			var sandbox *networkSandboxError
 			if errors.As(err, &sandbox) {
 				// Exec needs L3 too. Report this required network allowance once,
