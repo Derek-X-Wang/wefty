@@ -20,6 +20,10 @@ retire_exec_storage() {
     [ -d "$source" ] && [ ! -L "$source" ] || exit 1
     if [ "$kind" != trash ]; then
       [ ! -e "$trash" ] && [ ! -L "$trash" ] || exit 1
+      # macOS 15 refuses to rename a directory its owner cannot write, and a
+      # command may lock its own storage. Only the top directory, so this
+      # stays instant; deletion unlocks the tree.
+      /bin/chmod u+w "$source" 2>/dev/null || :
       /bin/mv -- "$source" "$trash" || exit 1
     fi
     # This child keeps the helper's independent lifetime. Exiting the
