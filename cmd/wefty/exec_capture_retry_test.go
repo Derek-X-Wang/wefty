@@ -205,7 +205,7 @@ func TestExecCaptureRetryWaitsAndOtherFailures(t *testing.T) {
 			}
 			err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "true"}, io.Discard, io.Discard)
 			if kind == "failure" {
-				if err == nil || !strings.Contains(err.Error(), "Git LFS") || commandExitCode(err) != exitFailure || len(waits) != 0 {
+				if err == nil || !strings.Contains(err.Error(), "Git LFS") || commandExitCode(err) != exitUsage || len(waits) != 0 {
 					t.Fatalf("unrelated failure retried: err=%v waits=%v", err, waits)
 				}
 			} else if commandExitCode(err) != exitConflict || attempts() != 3 || !reflect.DeepEqual(waits, []time.Duration{time.Second, 2 * time.Second}) {

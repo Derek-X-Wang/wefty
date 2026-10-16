@@ -18,6 +18,8 @@ Not-a-repository, unborn HEAD, unresolved conflicts, LFS attributes/configuratio
 sparse checkouts, and partial clones are refused. Detached HEAD is supported.
 An ignored or empty start folder that is absent from the snapshot is refused
 before submission.
+Unsupported checkouts are refused as usage errors (exit 2); `internal` means
+wefty itself failed.
 
 All Git writes use a separate bare repository, private index, independent
 objects and private ref under a mode-0700 capture directory. The default root

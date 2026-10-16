@@ -110,7 +110,8 @@ wefty cancel "$RUN_ID"
 
 `exec` freezes the base commit, tracked local changes, and untracked files
 that Git does not ignore before submission. Run it from inside a Git checkout
-with at least one commit. It runs in the same relative
+with at least one commit. Unsupported checkouts are refused as usage errors
+(exit 2); `internal` means wefty itself failed. It runs in the same relative
 folder in a throwaway copy, on this machine's installed node. Later edits do
 not change the run. If the checkout changes during capture, exec makes up to
 three fresh attempts with waits of one and two seconds, then refuses with

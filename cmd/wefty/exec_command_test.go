@@ -450,7 +450,7 @@ func TestExecCancellation(t *testing.T) {
 
 func TestExecRefusalsSubmitNothing(t *testing.T) {
 	stack := newExecStack(t, execTestIdleLimit)
-	for _, name := range []string{"not a git repo", "no commits yet", "unresolved merge", "sparse checkout", "partial clone", "ignored start folder", "empty start folder", "Git LFS", "submodules with changes", "no installed node", "requires --l3", "64 KiB", "cancelled before capture"} {
+	for _, name := range []string{"not a git repo", "no commits yet", "current folder is outside", "unresolved merge", "sparse checkout", "partial clone", "ignored start folder", "empty start folder", "Git LFS", "Git LFS config", "submodules with changes", "submodules with changed HEAD", "submodules with missing checkout", "unsupported file", "no installed node", "requires --l3", "64 KiB", "cancelled before capture"} {
 		t.Run(name, func(t *testing.T) {
 			repo := execTestRepo(t)
 			wantMessage := name
@@ -462,7 +462,24 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 				repo = t.TempDir()
 				execTestGit(t, repo, "init", "-q")
 				wantMessage = "wefty exec needs at least one commit in this checkout; commit first"
+			case "current folder is outside":
+				// Force Git discovery to name another checkout so the relative-
+				// folder guard is exercised through the production capture path.
+				root := execTestRepo(t)
+				git, err := exec.LookPath("git")
+				if err != nil {
+					t.Fatal(err)
+				}
+				shim := t.TempDir()
+				path := filepath.Join(shim, "git")
+				writeExecFile(t, path, "#!/bin/sh\nif [ \"$5\" = rev-parse ] && [ \"$6\" = --show-toplevel ]; then\n printf '%s\\n' "+captureTestShellQuote(root)+"\n exit 0\nfi\nexec "+captureTestShellQuote(git)+" \"$@\"\n")
+				if err := os.Chmod(path, 0700); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
+				wantMessage = "current folder is outside the git checkout; cd into the checkout first"
 			case "unresolved merge":
+				wantMessage = "unresolved merge is not supported by exec; finish or abort the merge first"
 				execTestGit(t, repo, "checkout", "-qb", "side")
 				writeExecFile(t, filepath.Join(repo, "sub", "tracked"), "side")
 				execTestGit(t, repo, "commit", "-qam", "side")
@@ -476,24 +493,51 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 				c.Env = execTestGitEnv()
 				_ = c.Run()
 			case "sparse checkout":
+				wantMessage = "sparse checkout is not supported by exec; disable sparse checkout or use a full clone"
 				execTestGit(t, repo, "config", "core.sparseCheckout", "true")
 			case "partial clone":
+				wantMessage = "partial clone is not supported by exec (extensions.partialClone is set); use a full clone"
 				execTestGit(t, repo, "config", "extensions.partialClone", "origin")
 			case "ignored start folder":
+				wantMessage = "ignored start folder is not in the snapshot: ignored; run from a tracked folder"
 				writeExecFile(t, filepath.Join(repo, "ignored", "file"), "excluded")
 				repo = filepath.Join(repo, "ignored")
 			case "empty start folder":
+				wantMessage = "empty start folder (or one containing only ignored files) is not in the snapshot: empty; run from a tracked folder"
 				repo = filepath.Join(repo, "empty")
 				if err := os.Mkdir(repo, 0700); err != nil {
 					t.Fatal(err)
 				}
 			case "Git LFS":
+				wantMessage = "Git LFS is not supported by exec; run the command directly"
 				writeExecFile(t, filepath.Join(repo, ".gitattributes"), "sub/tracked filter=lfs\n")
-			case "submodules with changes":
+			case "Git LFS config":
+				wantMessage = "Git LFS is not supported by exec; run the command directly"
+				execTestGit(t, repo, "config", "filter.lfs.clean", "git-lfs clean -- %f")
+			case "submodules with changes", "submodules with changed HEAD", "submodules with missing checkout":
 				sub := execTestRepo(t)
 				execTestGit(t, repo, "-c", "protocol.file.allow=always", "submodule", "add", sub, "module")
 				execTestGit(t, repo, "commit", "-qam", "module")
-				writeExecFile(t, filepath.Join(repo, "module", "sub", "tracked"), "dirty")
+				wantMessage = "submodules with changes are not supported by exec: module; commit or clean the submodule"
+				switch name {
+				case "submodules with changes":
+					writeExecFile(t, filepath.Join(repo, "module", "sub", "tracked"), "dirty")
+				case "submodules with changed HEAD":
+					execTestGit(t, filepath.Join(repo, "module"), "commit", "--allow-empty", "-qm", "changed")
+					wantMessage = "submodules with changes or missing checkout are not supported by exec: module; commit or clean the submodule, or restore its checkout"
+				case "submodules with missing checkout":
+					execTestGit(t, repo, "submodule", "deinit", "-f", "module")
+					wantMessage = "submodules with changes or missing checkout are not supported by exec: module; commit or clean the submodule, or restore its checkout"
+				}
+			case "unsupported file":
+				path := filepath.Join(repo, "sub", "tracked")
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := syscall.Mkfifo(path, 0600); err != nil {
+					t.Fatal(err)
+				}
+				wantMessage = "unsupported file in checkout: sub/tracked; remove or ignore that file"
 			}
 			t.Chdir(repo)
 			originalPath := stack.clients.nodeConfigPath
@@ -519,10 +563,19 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 				t.Fatalf("pre-capture stop: %v", err)
 			}
 			if err == nil || (name != "cancelled before capture" && !strings.Contains(err.Error(), wantMessage)) {
-				t.Fatalf("%s refusal: %v", name, err)
+				t.Errorf("%s refusal: %v, want %q", name, err, wantMessage)
 			}
-			if (name == "not a git repo" || name == "no commits yet") && commandExitCode(err) != exitUsage {
-				t.Fatalf("%s exit=%d, want usage", name, commandExitCode(err))
+			if name != "cancelled before capture" && name != "no installed node" {
+				report := decideCommandReport(err)
+				var stderr bytes.Buffer
+				report.writeError(&stderr, true)
+				var envelope contract.ErrorResponse
+				if e := json.Unmarshal(stderr.Bytes(), &envelope); e != nil || report.exitCode != exitUsage || envelope.Error.Code != contract.ErrorInvalidRequest || envelope.Error.Retryable {
+					t.Errorf("%s exit=%d JSON=%s decode=%v, want non-retryable usage/invalid_request", name, report.exitCode, &stderr, e)
+				}
+				if name != "requires --l3" && name != "64 KiB" && envelope.Error.Message != wantMessage {
+					t.Errorf("message=%q, want %q", envelope.Error.Message, wantMessage)
+				}
 			}
 			if len(stack.requests) != 0 {
 				t.Fatalf("refusal submitted %d requests", len(stack.requests))

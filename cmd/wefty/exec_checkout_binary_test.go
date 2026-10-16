@@ -14,16 +14,23 @@ func TestExecCheckoutUsageFromRealBinary(t *testing.T) {
 	binary := buildWefty(t)
 	for _, fixture := range []struct {
 		name, message string
-		unborn        bool
+		setup         func(*testing.T, string)
 	}{
-		{"outside-checkout", "wefty exec runs from inside a Git checkout; cd into the project first", false},
-		{"unborn-head", "wefty exec needs at least one commit in this checkout; commit first", true},
+		{"outside-checkout", "wefty exec runs from inside a Git checkout; cd into the project first", nil},
+		{"unborn-head", "wefty exec needs at least one commit in this checkout; commit first", func(t *testing.T, dir string) {
+			execTestGit(t, dir, "init", "-q")
+		}},
+		{"sparse-checkout", "sparse checkout is not supported by exec; disable sparse checkout or use a full clone", func(t *testing.T, dir string) {
+			execTestGit(t, dir, "init", "-q")
+			execTestGit(t, dir, "commit", "--allow-empty", "-qm", "base")
+			execTestGit(t, dir, "config", "core.sparseCheckout", "true")
+		}},
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			stack := newExecStack(t, execRealBinaryIdleLimit)
 			dir := t.TempDir()
-			if fixture.unborn {
-				execTestGit(t, dir, "init", "-q")
+			if fixture.setup != nil {
+				fixture.setup(t, dir)
 			}
 			t.Chdir(dir)
 			for _, jsonOutput := range []bool{false, true} {
