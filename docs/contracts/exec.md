@@ -110,7 +110,8 @@ are older than one hour only after public reads of runs and their immutable
 `snapshot_storage` params confirm no live run uses the capture. A lookup failure
 or timeout retains the capture. Live or unverifiable runs, young captures, symlinks,
 and unrelated folders stay intact. Sweep failures print warnings and do not
-fail exec. This also reclaims residue after a second Ctrl-C, SIGKILL, or a
+fail exec, except for the sandbox network refusal described below. This also
+reclaims residue after a second Ctrl-C, SIGKILL, or a
 queued run cancelled after its CLI has exited.
 
 Storage-root preparation is required for the new capture: if it
@@ -118,6 +119,14 @@ fails, exec reports one error and exits 1 before any sweep work or submission.
 Permission and read-only-filesystem failures to prepare the root or create
 a capture name the folder and tell a sandboxed AI agent to allow writes,
 with a pointer to the wefty skill.
+
+An L1 or L3 dial refused with `EPERM` reports: `the caller's sandbox blocks
+local network connections to wefty at <address>; a sandboxed AI agent must
+allow these connections (see the wefty skill: skills/wefty/SKILL.md)`.
+Exec prints this once and exits 13. If the sweep encounters it, exec retains
+the capture and stops before another dial, without a sweep warning. Other
+connection failures, including `ECONNREFUSED`, keep the existing
+`is it running? pass --l1 or set WEFTY_L1_ADDR` hint (or its L3 equivalent).
 
 The command is not sandboxed and can write absolute paths as the node's user.
 No files are returned. Never put a secret on the command line: command text

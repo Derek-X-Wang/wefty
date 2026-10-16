@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -47,6 +48,19 @@ type unavailableError struct{ cause error }
 
 func (e *unavailableError) Error() string { return e.cause.Error() }
 func (e *unavailableError) Unwrap() error { return e.cause }
+
+// A sandbox refusal is identified at the dial boundary, never from an HTTP
+// response or an error string. Keep the cause for cancellation and errno checks.
+type networkSandboxError struct {
+	address string
+	cause   error
+}
+
+func (e *networkSandboxError) Error() string {
+	return fmt.Sprintf("the caller's sandbox blocks local network connections to wefty at %s; a sandboxed AI agent must allow these connections (see the wefty skill: skills/wefty/SKILL.md)", e.address)
+}
+
+func (e *networkSandboxError) Unwrap() error { return e.cause }
 
 type apiResponseError struct {
 	Service    string
@@ -110,7 +124,11 @@ func newAPIClient(name, flagName string, participant fabric.Fabric, address stri
 		// its budget while a dial kept running behind it.
 		dialCtx, cancel := context.WithTimeout(ctx, dialBudget)
 		defer cancel()
-		return participant.Dial(dialCtx, network, address)
+		conn, err := participant.Dial(dialCtx, network, address)
+		if errors.Is(err, syscall.EPERM) {
+			return conn, &networkSandboxError{address: address, cause: err}
+		}
+		return conn, err
 	}}
 	return &apiClient{name: name, flag: flagName, address: address, client: &http.Client{Transport: transport}}
 }
@@ -872,6 +890,10 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	}
 	response, err := c.client.Do(request)
 	if err != nil {
+		var sandbox *networkSandboxError
+		if errors.As(err, &sandbox) {
+			return nil, classifyFailedExchange(ctx, httpexchange.Request, sandbox)
+		}
 		return nil, classifyFailedExchange(ctx, httpexchange.Request,
 			fmt.Errorf("call %s at %s: %w (%s)", c.name, c.address, err, c.addressHint()))
 	}
