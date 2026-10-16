@@ -14,6 +14,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -80,6 +81,10 @@ type Config struct {
 	RenewalInterval   time.Duration
 	MaxOneshotSlots   int
 	MaxServiceSlots   int
+	// OneshotLoadLimit defaults to 1.5 times logical CPUs; a pointer to zero disables load admission.
+	OneshotLoadLimit *float64
+	// ReadLoad supplies the local one-minute load. Nil uses the platform reader.
+	ReadLoad func() (float64, error)
 	// OperationTimeout bounds one L1 request. It also bounds a suppression
 	// transaction held under the OCI intent completion gate, clamped to the OCI
 	// control server's response-drain budget. Zero uses ten seconds.
@@ -181,6 +186,11 @@ func New(config Config) (*Agent, error) {
 	}
 	if config.LogSpoolMaxBytes < 0 {
 		return nil, errors.New("agent: log spool maximum bytes cannot be negative")
+	}
+	if config.OneshotLoadLimit != nil {
+		if err := nodeload.ValidateLimit(*config.OneshotLoadLimit); err != nil {
+			return nil, err
+		}
 	}
 	if config.MaxOneshotSlots < 0 || config.MaxServiceSlots < 0 {
 		return nil, errors.New("agent: local slot limits cannot be negative")
@@ -355,6 +365,12 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxOneshotSlots, l1.DefaultMaxOneshotSlots),
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
+	if config.OneshotLoadLimit != nil {
+		session.oneshotLoadLimit = *config.OneshotLoadLimit
+	}
+	if config.ReadLoad != nil {
+		session.readLoad = config.ReadLoad
+	}
 	session.ociBootBarrier = config.OCIBootBarrier
 	session.ociIntent = config.OCIIntent
 	session.ociImagePins = ociImagePins

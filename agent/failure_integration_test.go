@@ -1786,13 +1786,20 @@ func assertAgentFillsGrantedClassSlotsConcurrently(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
+	admissionClock := injectOneshotAdmissionClock(t, nodeAgent)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
 
 	wantStarts := int32(l1.DefaultMaxOneshotSlots + l1.DefaultMaxServiceSlots)
 	deadline := time.Now().Add(5 * time.Second)
+	observedStarts := int32(0)
 	for runner.starts.Load() != wantStarts && time.Now().Before(deadline) {
+		if starts := runner.starts.Load(); starts > observedStarts {
+			observedStarts = starts
+			admissionClock.Advance(30 * time.Second)
+		}
 		time.Sleep(time.Millisecond)
 	}
 	if runner.starts.Load() != wantStarts {
@@ -1865,11 +1872,14 @@ func assertAgentRefillsSlotAfterSiblingFinalization(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
+	admissionClock := injectOneshotAdmissionClock(t, nodeAgent)
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
 
 	firstAttempt := runner.waitStarted(t)
+	admissionClock.Advance(30 * time.Second)
 	secondAttempt := runner.waitStarted(t)
 	if firstAttempt == secondAttempt {
 		cancel()
@@ -1880,6 +1890,7 @@ func assertAgentRefillsSlotAfterSiblingFinalization(t *testing.T) {
 		cancel()
 		t.Fatalf("N+1th job before refill = state %q error %v, want queued", queued.State, err)
 	}
+	admissionClock.Advance(30 * time.Second)
 	runner.release(firstAttempt)
 	refilledAttempt := runner.waitStarted(t)
 	if refilledAttempt == firstAttempt || refilledAttempt == secondAttempt {
@@ -2111,11 +2122,16 @@ func assertDrainJoinsEveryResidentOneShotAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
+	admissionClock := injectOneshotAdmissionClock(t, nodeAgent)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
-	attempts := []string{runner.waitStarted(t), runner.waitStarted(t), runner.waitStarted(t)}
+	attempts := make([]string, 0, 3)
+	for range 3 {
+		attempts = append(attempts, runner.waitStarted(t))
+		admissionClock.Advance(30 * time.Second)
+	}
 	drainContext, stopDrain := context.WithTimeout(context.Background(), 5*time.Second)
 	_, err = nodeAgent.Drain(drainContext)
 	stopDrain()
@@ -3160,6 +3176,7 @@ func assertPluralServiceDrainJoinsAll(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
+	admissionClock := injectOneshotAdmissionClock(t, nodeAgent)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
@@ -3167,6 +3184,7 @@ func assertPluralServiceDrainJoinsAll(t *testing.T) {
 	attempts := make([]string, 0, 4)
 	for len(attempts) < 4 {
 		attempts = append(attempts, runner.waitStarted(t))
+		admissionClock.Advance(30 * time.Second)
 	}
 	drainCtx, stopDrain := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stopDrain()
@@ -3293,12 +3311,15 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaimsWithFreeSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
+	admissionClock := injectOneshotAdmissionClock(t, nodeAgent)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
 
 	residentAttemptID := runner.waitStarted(t)
+	// Catch-up spacing must not hide the claims-disabled RPC path below.
+	admissionClock.Advance(30 * time.Second)
 	// The free slot has already been told "no work" once and now waits one
 	// claim interval before asking again.
 	waitForClaimTick(t, clock, done, start.Add(DefaultClaimInterval))

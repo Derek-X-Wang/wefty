@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -66,6 +67,15 @@ type agentSession struct {
 	poolTargets     map[workloadClass]int
 	capacityChanged chan struct{}
 	claimsEnabled   bool
+
+	// One-shot load and spacing state is protected by claimMu.
+	// oneshotClaimClock defaults to the session clock. Keeping the admission
+	// clock separate lets tests advance catch-up time without aging leases.
+	oneshotClaimClock   Clock
+	readLoad            func() (float64, error)
+	oneshotLoadLimit    float64
+	loadReadErrorLogged bool
+	lastOneshotClaim    time.Time
 
 	claimMu                   sync.Mutex
 	residentJobID             map[string]struct{}
@@ -149,6 +159,7 @@ func newAgentSession(
 ) *agentSession {
 	session := &agentSession{
 		client: client, registration: registration,
+		readLoad: nodeload.Read, oneshotLoadLimit: nodeload.DefaultLimit(), oneshotClaimClock: clock,
 		heartbeatInterval: heartbeatInterval, claimInterval: claimInterval,
 		clock: clock, observer: observer, logf: logf, capabilities: capabilities,
 		routeError: func(destination errorDestination, err error) error {
@@ -1420,6 +1431,9 @@ func (session *agentSession) claim(
 	if !gate.canAcquire() && !serviceReservation {
 		return nil, false, nil
 	}
+	if selector == contract.JobClassOneShot && !session.admitOneshot(gate.occupancy().Occupied) {
+		return nil, false, nil
+	}
 	excluded := make([]string, 0, len(session.residentJobID))
 	for jobID := range session.residentJobID {
 		excluded = append(excluded, jobID)
@@ -1441,6 +1455,9 @@ func (session *agentSession) claim(
 		// binding already holds the slot. Reflect that execution locally
 		// without treating the gate as the authority for service placement.
 		gate.acquireReserved()
+	}
+	if selector == contract.JobClassOneShot {
+		session.lastOneshotClaim = session.oneshotClaimClock.Now()
 	}
 	session.residentJobID[claim.Job.JobID] = struct{}{}
 	session.residentKind[claim.Job.JobID] = claim.Job.Spec.Kind
@@ -1806,3 +1823,28 @@ func (backoff *sessionBackoff) next() time.Duration {
 }
 
 func (backoff *sessionBackoff) reset() { backoff.current = 0 }
+
+// admitOneshot runs under claimMu, including the subsequent claim RPC and
+// successful admission. Concurrent claim loops cannot bypass the spacing.
+func (session *agentSession) admitOneshot(occupied int) bool {
+	if occupied == 0 {
+		return true
+	}
+	if !session.lastOneshotClaim.IsZero() && session.oneshotClaimClock.Now().Sub(session.lastOneshotClaim) < 30*time.Second {
+		return false
+	}
+	if session.oneshotLoadLimit == 0 {
+		return true
+	}
+	load, err := session.readLoad()
+	if err != nil {
+		if !session.loadReadErrorLogged {
+			session.loadReadErrorLogged = true
+			if session.logf != nil {
+				session.logf("agent: cannot read machine load; load admission remains open: %v", err)
+			}
+		}
+		return true
+	}
+	return !nodeload.Holding(occupied, load, session.oneshotLoadLimit)
+}

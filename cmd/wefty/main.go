@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/l3"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
@@ -114,6 +115,7 @@ type globalOptions struct {
 	printEnrollmentURL bool
 	jsonOutput         bool
 	nodeConfigPath     string
+	oneshotLoadLimit   *float64
 	profilePath        string
 	// explicitFlags names the global flags the caller passed, so the
 	// connection profile never overrides one of them.
@@ -206,6 +208,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 	}
 	defer clients.close()
 	clients.nodeConfigPath = options.nodeConfigPath
+	clients.oneshotLoadLimit = options.oneshotLoadLimit
 	return execute(ctx, clients, options.jsonOutput, commandArgs, stdout, stderr)
 }
 
@@ -296,6 +299,11 @@ func applyConnectionProfile(options *globalOptions) error {
 	if err != nil {
 		return err
 	}
+	limit, err := nodeload.ResolveLimit(profile.OneshotLoadLimit, os.Getenv(nodeload.Environment))
+	if err != nil {
+		return err
+	}
+	options.oneshotLoadLimit = &limit
 	settings := profile.CLI()
 	layer := connprofile.Layer{Explicit: options.explicitFlags}
 	layer.Fill(&options.fabricMode, "fabric", "", settings.Fabric)

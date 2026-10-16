@@ -145,3 +145,27 @@ func TestLayerPrecedence(t *testing.T) {
 		t.Fatalf("enabled=%v kept=%v; an explicit false flag must win over the profile", *enabled, *kept)
 	}
 }
+
+func TestOneshotLoadLimitSurvivesProfileAndChangesOnlyAgentDigest(t *testing.T) {
+	for _, limit := range []float64{0, 18} {
+		p := sampleProfile()
+		l1Before, _ := Digest(p.L1())
+		l3Before, _ := Digest(p.L3())
+		agentBefore, _ := Digest(p.NodeAgent())
+		p.OneshotLoadLimit = &limit
+		path := filepath.Join(t.TempDir(), FileName)
+		if err := Write(path, p); err != nil {
+			t.Fatal(err)
+		}
+		got, err := Read(path)
+		if err != nil || got.OneshotLoadLimit == nil || *got.OneshotLoadLimit != limit || got.NodeAgent().OneshotLoadLimit == nil || *got.NodeAgent().OneshotLoadLimit != limit {
+			t.Fatalf("profile=%+v err=%v", got, err)
+		}
+		l1After, _ := Digest(got.L1())
+		l3After, _ := Digest(got.L3())
+		agentAfter, _ := Digest(got.NodeAgent())
+		if l1Before != l1After || l3Before != l3After || agentBefore == agentAfter {
+			t.Fatal("load limit did not stay local to node agent settings")
+		}
+	}
+}
