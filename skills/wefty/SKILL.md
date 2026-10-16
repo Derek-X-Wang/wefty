@@ -98,6 +98,8 @@ Use `exec` for one build, test, or other command in your current Git checkout.
 Use a stored workflow for repeatable work that drives other runs, such as
 branch gates or issue-to-PR work on a committed ref. You do not need to write
 a workflow wrapper to offload one command.
+`exec` needs no `--tag`; it always runs on this machine's node.
+A busy machine makes `exec` wait; this is normal, so agents should not cancel.
 
 ```sh
 wefty exec -- go test ./cmd/wefty/
@@ -116,9 +118,13 @@ folder in a throwaway copy, on this machine's installed node. Later edits do
 not change the run. If the checkout changes during capture, exec makes up to
 three fresh attempts with waits of one and two seconds, then refuses with
 retryable `conflict` (exit 5) if edits continue. The command inherits the node's
-environment and `PATH`;
-the run's `WEFTY_*` variables are removed. No files are returned. The command
+environment; the run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
+
+The run gets the node's login-shell `PATH`, not the caller's; project-local tools need `bun run`, `npx`, `pnpm exec` or `uv run`, or a path such as `./node_modules/.bin/turbo`.
+`wefty exec -- sh -c 'echo $PATH'` shows the run's `PATH`.
+Git-ignored files such as `.env.local` and ignored generated code (codegen output and framework caches) are not copied; pass non-secret values as environment variables in the command, and generate code inside the command.
+Never copy secrets into a run.
 
 Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied.
 Install dependencies inside the command (for example `pnpm install --frozen-lockfile && ...`), or point the tool at an absolute cache path.

@@ -408,7 +408,7 @@ func TestExecCancellation(t *testing.T) {
 			marker := filepath.Join(t.TempDir(), "started")
 			args := []string{"exec"}
 			if queued {
-				args = append(args, "--tag", "no-node-has-this")
+				holdExecNode(t, stack)
 			}
 			args = append(args, "--", "/bin/sh", "-c", "touch \"$1\"; sleep 60", "sh", marker)
 			stack.afterAccept = func() {
@@ -752,7 +752,8 @@ func TestExecStoppingBeforeAcceptanceAndLostReply(t *testing.T) {
 			original := stack.clients.l3.client.Transport
 			stack.clients.l3.client.Transport = execStopTransport{base: original, accepted: accepted, cancel: cancel}
 			var out, errOut bytes.Buffer
-			err := execute(ctx, stack.clients, false, []string{"exec", "--tag", "unavailable-node", "--", "/bin/sh", "-c", "exit 0"}, &out, &errOut)
+			holdExecNode(t, stack)
+			err := execute(ctx, stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "exit 0"}, &out, &errOut)
 			if err == nil {
 				t.Fatal("stopped exec returned success")
 			}
@@ -950,6 +951,14 @@ func TestExecSnapshotHasNoTemplateHooks(t *testing.T) {
 		}
 	}
 	if err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "test ! -e .git/hooks/post-checkout"}, io.Discard, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Keep a run queued without invalid routing tags: exec now refuses those.
+func holdExecNode(t *testing.T, stack *execStack) {
+	t.Helper()
+	if _, err := stack.clients.drainNode(t.Context(), "node-cli", nil, "queued exec test"); err != nil {
 		t.Fatal(err)
 	}
 }

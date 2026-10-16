@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -114,9 +115,19 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	if err := sweepExecStorage(ctx, clients, stderr); err != nil {
 		return err
 	}
-	node, err := resolveLocalNode(ctx, clients)
+	node, err := resolveLocalNodeRecord(ctx, clients)
 	if err != nil {
 		return err
+	}
+	carried := l1NormalizedTags(node.AuthoritativeTags)
+	var missing []string
+	for _, tag := range l1NormalizedTags(tags) {
+		if !slices.Contains(carried, tag) {
+			missing = append(missing, tag)
+		}
+	}
+	if len(missing) > 0 {
+		return usageError(fmt.Sprintf("this machine's node does not carry tag(s) %s; exec runs on this machine's node, so --tag is rarely needed; this machine's node carries tag(s) %s", strings.Join(missing, ", "), strings.Join(carried, ", ")))
 	}
 	resolvedTags, err := pinnedImageTags(tags, node.NodeID, true)
 	if err != nil {
@@ -191,7 +202,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		}
 		return cancelExecObservation(clients, capture, runID, jsonOutput, stdout, stderr, ctx.Err())
 	}
-	record, err := observeExecRunOutput(ctx, clients, runID, jsonOutput, stdout, stderr)
+	record, err := observeExecRunOutput(ctx, clients, runID, node.NodeID, jsonOutput, stdout, stderr)
 	if err != nil && !runIsTerminal(record.Status) {
 		if ctx.Err() != nil && !keepRunning {
 			return cancelExecObservation(clients, capture, runID, jsonOutput, stdout, stderr, ctx.Err())

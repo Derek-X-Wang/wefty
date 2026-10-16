@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
@@ -46,8 +47,18 @@ func (e *localNodeError) Unwrap() error { return e.Cause }
 // that exact stable ID and its reserved tag through the public L1 node API.
 // It needs neither a running control socket nor access to node credentials.
 func resolveLocalNode(ctx context.Context, clients *apiClients) (localNodeIdentity, error) {
-	fail := func(code localNodeErrorCode, detail string, cause error) (localNodeIdentity, error) {
-		return localNodeIdentity{}, &localNodeError{Code: code, Detail: detail, Cause: cause}
+	node, err := resolveLocalNodeRecord(ctx, clients)
+	if err != nil {
+		return localNodeIdentity{}, err
+	}
+	tags, _ := pinnedImageTags(nil, node.NodeID, true)
+	return localNodeIdentity{NodeID: node.NodeID, Tag: tags[0]}, nil
+}
+
+// Keep the verified L1 record available to exec's pre-submission tag check.
+func resolveLocalNodeRecord(ctx context.Context, clients *apiClients) (l1.Node, error) {
+	fail := func(code localNodeErrorCode, detail string, cause error) (l1.Node, error) {
+		return l1.Node{}, &localNodeError{Code: code, Detail: detail, Cause: cause}
 	}
 	if clients.nodeConfigPath == "" {
 		return fail(localNodeNotInstalled, "no installed node on this machine; install a node or select its metadata with --node-config or WEFTY_NODE_CONFIG", nil)
@@ -92,5 +103,5 @@ func resolveLocalNode(ctx context.Context, clients *apiClients) (localNodeIdenti
 	if !slices.Contains(node.AuthoritativeTags, tags[0]) {
 		return fail(localNodeTagMissing, fmt.Sprintf("installed node %q does not have reserved routing tag %q in L1; add it to the node's authoritative tags", config.NodeID, tags[0]), nil)
 	}
-	return localNodeIdentity{NodeID: config.NodeID, Tag: tags[0]}, nil
+	return node, nil
 }

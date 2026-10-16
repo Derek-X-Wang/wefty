@@ -56,7 +56,8 @@ func TestExecSweepsAbandonedCaptures(t *testing.T) {
 		}
 		return base.RoundTrip(r)
 	})
-	err := execute(t.Context(), stack.clients, false, []string{"exec", "--tag", "no-node", "--", "true"}, io.Discard, io.Discard)
+	// Leave a live run for the sweep while allowing later commands to start.
+	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "sleep 600"}, io.Discard, io.Discard)
 	if commandExitCode(err) != 13 {
 		t.Fatalf("lost CLI: %v", err)
 	}

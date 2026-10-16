@@ -4,7 +4,10 @@
 [--json] -- <command...>` freezes a
 checkout before L3 submission. It uses the installed `node_id`, checked through
 L1 by `resolveLocalNode`, and always includes that node's reserved tag. Extra
-tags narrow this Pinned run. It is an ordinary process one-shot without
+tags narrow this Pinned run. Before capture or submission, an extra `--tag`
+that the verified installed node does not carry is refused with usage exit 2
+and `invalid_request`; the message lists missing tags and the node's tags.
+It is an ordinary process one-shot without
 Workflow or dispatch authority. No default runtime cap is added.
 Exec runs from inside a Git checkout with at least one commit.
 
@@ -94,7 +97,14 @@ node claims it within its one-second idle claim interval and acknowledges
 the wrapper's start at once, and L3 records the start on its next one-second
 pass (#945). The queued notice, printed when a run has not started three
 seconds into watching, therefore points at a busy, ineligible or absent node
-rather than at a normal start.
+rather than at a normal start. For a queued exec on this machine, the notice
+uses the same local load reader, configured limit and admission rule as status.
+When the node is holding new work it says `this machine is busy (load X,
+limit Y), so it starts when the load drops`. An unreadable load, a disabled
+limit, or a node that is not holding keeps the usual waiting notice, including
+L1's reason when available. Notices are checked at most once a minute after
+the first notice, and printed again only when the reason changes; fluctuations
+of load while the machine remains busy do not count as a changed reason.
 
 Without `--json`, exec follows the normal log drain, including queued and truncation notices,
 before printing the terminal verdict to stderr. Stdout contains only command
@@ -205,14 +215,15 @@ stay on stderr. The event discriminator is `type`:
 | Type | Fields |
 | --- | --- |
 | `output` | `stream` (`stdout` or `stderr`), `text` (including its newline when present) |
-| `heartbeat` | `stream` (`stderr`), `text` (the wrapper's `still running (Nm)` or `still preparing the snapshot (Nm)` line) |
+| `heartbeat` | `stream` (`stderr`), `text` (wrapper liveness or a queued waiting notice), optional `reason` (the queued waiting explanation, including load and limit when busy) |
 | `finished` | `outcome`, `exit_code`, `run_id`, `base_commit`, `dirty`, `status`, optional `reason` |
 
 Raw log chunks may contain multiple lines; each text piece becomes an event.
 Complete liveness lines on stderr are classified as heartbeat events. This
-classification uses text, so a command that prints an identical line on stderr
+classification of wrapper lines uses text, so a command that prints an identical line on stderr
 is also classified as a heartbeat. Heartbeat text shows wrapper liveness, not
-command progress. Log text is JSON-escaped. An incomplete UTF-8 character
+command progress. Queued waiting heartbeats instead carry `reason` and describe
+why the run has not started; their `text` matches the notice on stderr. Log text is JSON-escaped. An incomplete UTF-8 character
 carries to the next event on the same stream; any remaining bytes are flushed
 before `finished`. Invalid UTF-8 follows Go's JSON replacement rule. Plain mode
 preserves the original bytes.
