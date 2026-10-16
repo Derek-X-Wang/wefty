@@ -109,7 +109,8 @@ wefty cancel "$RUN_ID"
 ```
 
 `exec` freezes the base commit, tracked local changes, and untracked files
-that Git does not ignore before submission. It runs in the same relative
+that Git does not ignore before submission. Run it from inside a Git checkout
+with at least one commit. It runs in the same relative
 folder in a throwaway copy, on this machine's installed node. Later edits do
 not change the run. The command inherits the node's environment and `PATH`;
 the run's `WEFTY_*` variables are removed. No files are returned. The command

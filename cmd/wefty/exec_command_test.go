@@ -453,12 +453,15 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 	for _, name := range []string{"not a git repo", "no commits yet", "unresolved merge", "sparse checkout", "partial clone", "ignored start folder", "empty start folder", "Git LFS", "submodules with changes", "no installed node", "requires --l3", "64 KiB", "cancelled before capture"} {
 		t.Run(name, func(t *testing.T) {
 			repo := execTestRepo(t)
+			wantMessage := name
 			switch name {
 			case "not a git repo":
 				repo = t.TempDir()
+				wantMessage = "wefty exec runs from inside a Git checkout; cd into the project first"
 			case "no commits yet":
 				repo = t.TempDir()
 				execTestGit(t, repo, "init", "-q")
+				wantMessage = "wefty exec needs at least one commit in this checkout; commit first"
 			case "unresolved merge":
 				execTestGit(t, repo, "checkout", "-qb", "side")
 				writeExecFile(t, filepath.Join(repo, "sub", "tracked"), "side")
@@ -515,8 +518,11 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 			if name == "cancelled before capture" && !errors.Is(err, context.Canceled) {
 				t.Fatalf("pre-capture stop: %v", err)
 			}
-			if err == nil || (name != "cancelled before capture" && !strings.Contains(err.Error(), name)) {
+			if err == nil || (name != "cancelled before capture" && !strings.Contains(err.Error(), wantMessage)) {
 				t.Fatalf("%s refusal: %v", name, err)
+			}
+			if (name == "not a git repo" || name == "no commits yet") && commandExitCode(err) != exitUsage {
+				t.Fatalf("%s exit=%d, want usage", name, commandExitCode(err))
 			}
 			if len(stack.requests) != 0 {
 				t.Fatalf("refusal submitted %d requests", len(stack.requests))
