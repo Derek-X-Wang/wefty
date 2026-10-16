@@ -86,7 +86,10 @@ stdout. Success exits 0. Failure uses the shared
 the run unless `--keep-running` or `--detach` is set. The CLI prints `wefty: cancelling run <id>` before the cancel request.
 An accepted cancellation is reported as cancelled; later observation serves
 only cleanup. A terminal run with recorded cancellation is reported as
-`cancelled` with exit 10, including cancellation from another CLI. A signal
+`cancelled` with exit 10, including cancellation from another CLI. The Run state
+itself stays `failed`; human `inspect` and `runs list` views show
+`failed (cancelled)` for a failed Run with `cancel_status=settled`, and JSON
+is unchanged. A signal
 after terminal observation preserves the known verdict. A second Ctrl-C exits
 immediately; the wrapper and the next exec provide storage cleanup. Stopping before submission removes the capture and creates no run.
 If a cancelled POST may have reached L3, bounded public reads find the run by
