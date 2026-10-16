@@ -176,6 +176,11 @@ codex -c 'sandbox_workspace_write.network_access=true'
 
 Any other sandbox that blocks loopback needs the same network allowance.
 
+This limit is on purpose. `exec` runs the command as the node's user, outside
+the agent's sandbox, so reaching wefty is the owner's trust decision. If the
+connection is blocked, ask the owner to allow it or to approve the run. Do not
+look for another way in.
+
 Exec normally writes snapshots to `~/.local/state/wefty/exec`, or
 `$XDG_STATE_HOME/wefty/exec` when `XDG_STATE_HOME` is absolute. On macOS, if
 permissions or a read-only filesystem block that root, exec uses
