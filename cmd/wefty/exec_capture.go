@@ -127,7 +127,7 @@ func captureExecAttempt(ctx context.Context, cwd string) (capture execCapture, e
 	}
 	folder, err := filepath.Rel(root, cwd)
 	if err != nil || folder == ".." || strings.HasPrefix(folder, ".."+string(filepath.Separator)) {
-		return capture, fmt.Errorf("current folder is outside the git checkout")
+		return capture, usageError("current folder is outside the git checkout; cd into the checkout first")
 	}
 	var storage string
 	_, err = execStorageLocation(func(root string) error {
@@ -186,9 +186,9 @@ func captureExecAttempt(ctx context.Context, cwd string) (capture execCapture, e
 		if entry == "" {
 			ignored, _ := execGit(ctx, root, "", nil, "check-ignore", "--", folder)
 			if ignored != "" {
-				return capture, fmt.Errorf("ignored start folder is not in the snapshot: %s", folder)
+				return capture, usageError(fmt.Sprintf("ignored start folder is not in the snapshot: %s; run from a tracked folder", folder))
 			}
-			return capture, fmt.Errorf("empty start folder (or one containing only ignored files) is not in the snapshot: %s", folder)
+			return capture, usageError(fmt.Sprintf("empty start folder (or one containing only ignored files) is not in the snapshot: %s; run from a tracked folder", folder))
 		}
 	}
 	// Re-read the working image before submission. Status alone cannot detect
@@ -271,18 +271,18 @@ func unbornExecHEAD(ctx context.Context, root string) bool {
 
 func validateExecRepo(ctx context.Context, root string) error {
 	if _, err := execGit(ctx, root, "", nil, "config", "--get", "extensions.partialClone"); err == nil {
-		return fmt.Errorf("partial clone is not supported by exec (extensions.partialClone is set)")
+		return usageError("partial clone is not supported by exec (extensions.partialClone is set); use a full clone")
 	}
 	unmerged, err := execGit(ctx, root, "", nil, "ls-files", "-u")
 	if err != nil {
 		return err
 	}
 	if unmerged != "" {
-		return fmt.Errorf("unresolved merge is not supported by exec")
+		return usageError("unresolved merge is not supported by exec; finish or abort the merge first")
 	}
 	sparse, _ := execGit(ctx, root, "", nil, "config", "--bool", "core.sparseCheckout")
 	if strings.TrimSpace(sparse) == "true" {
-		return fmt.Errorf("sparse checkout is not supported by exec")
+		return usageError("sparse checkout is not supported by exec; disable sparse checkout or use a full clone")
 	}
 	files, err := execGit(ctx, root, "", nil, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
 	if err != nil {
@@ -295,14 +295,14 @@ func validateExecRepo(ctx context.Context, root string) error {
 	fields := strings.Split(attrs, "\x00")
 	for i := 2; i < len(fields); i += 3 {
 		if fields[i] == "lfs" {
-			return fmt.Errorf("Git LFS is not supported by exec")
+			return usageError("Git LFS is not supported by exec; run the command directly")
 		}
 	}
 	// A configured LFS repository is unsupported even if its current files do
 	// not happen to use the filter (the attribute may change in this capture).
 	filters, _ := execGit(ctx, root, "", nil, "config", "--local", "--get-regexp", "^filter\\.lfs\\.")
 	if filters != "" {
-		return fmt.Errorf("Git LFS is not supported by exec")
+		return usageError("Git LFS is not supported by exec; run the command directly")
 	}
 	modules, err := execGit(ctx, root, "", nil, "ls-files", "--stage", "-z")
 	if err != nil {
@@ -320,11 +320,11 @@ func validateExecRepo(ctx context.Context, root string) error {
 		head, e := execGit(ctx, sub, "", nil, "rev-parse", "HEAD")
 		words := strings.Fields(metadata)
 		if e != nil || len(words) < 2 || strings.TrimSpace(head) != words[1] {
-			return fmt.Errorf("submodules with changes or missing checkout are not supported by exec: %s", path)
+			return usageError(fmt.Sprintf("submodules with changes or missing checkout are not supported by exec: %s; commit or clean the submodule, or restore its checkout", path))
 		}
 		dirty, e := execGit(ctx, sub, "", nil, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
 		if e != nil || dirty != "" {
-			return fmt.Errorf("submodules with changes are not supported by exec: %s", path)
+			return usageError(fmt.Sprintf("submodules with changes are not supported by exec: %s; commit or clean the submodule", path))
 		}
 		if e = validateExecRepo(ctx, sub); e != nil {
 			return e
@@ -384,7 +384,7 @@ func listExecFiles(ctx context.Context, root, prefix string) ([]execFile, error)
 				mode = "100755"
 			}
 		} else {
-			return nil, fmt.Errorf("unsupported file in checkout: %s", path)
+			return nil, usageError(fmt.Sprintf("unsupported file in checkout: %s; remove or ignore that file", path))
 		}
 		result = append(result, execFile{full: full, path: filepath.ToSlash(filepath.Join(prefix, path)), mode: mode})
 	}

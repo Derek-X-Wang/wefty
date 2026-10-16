@@ -38,7 +38,7 @@ func readExec[T any](caller context.Context, clients *apiClients, read func(cont
 	}
 }
 
-func observeExecRunOutput(ctx context.Context, clients *apiClients, runID string, jsonOutput bool, stdout, stderr io.Writer) (record contract.RunRecord, err error) {
+func observeExecRunOutput(ctx context.Context, clients *apiClients, runID, nodeID string, jsonOutput bool, stdout, stderr io.Writer) (record contract.RunRecord, err error) {
 	var jsonLogs execJSONLogWriter
 	if jsonOutput {
 		defer func() {
@@ -50,7 +50,7 @@ func observeExecRunOutput(ctx context.Context, clients *apiClients, runID string
 	cursor := ""
 	var truncation truncationAnnouncer
 	started := time.Now()
-	announcedWaiting := false
+	waiting := execWaitingAnnouncer{nodeID: nodeID}
 	for {
 		wasTerminal := runIsTerminal(record.Status)
 		page, err := readExec(ctx, clients, func(readCtx context.Context) (l1.LogPage, error) {
@@ -86,9 +86,8 @@ func observeExecRunOutput(ctx context.Context, clients *apiClients, runID string
 		if runIsTerminal(record.Status) && len(page.Events) == 0 && (!jsonOutput || wasTerminal) {
 			return record, nil
 		}
-		if !announcedWaiting && queuedRunIsWaiting(record.Status) && time.Since(started) >= followWaitingNoticeAfter {
-			announcedWaiting = true
-			if err = announceWaitingForNode(ctx, clients, stderr, runID, record.Status); err != nil {
+		if queuedRunIsWaiting(record.Status) && time.Since(started) >= followWaitingNoticeAfter {
+			if err = waiting.announce(ctx, clients, stdout, stderr, runID, record.Status, jsonOutput, time.Now()); err != nil {
 				return record, err
 			}
 		}
@@ -125,4 +124,53 @@ func reportExecRun(ctx context.Context, clients *apiClients, record contract.Run
 		return result
 	}
 	return reportTerminalRun(stderr, record, event.Reason, false, false)
+}
+
+// Check at most once a minute. Load fluctuations within a busy period are not
+// changes of reason; only a different reason merits another waiting line.
+type execWaitingAnnouncer struct {
+	nodeID    string
+	checkedAt time.Time
+	reasonKey string
+}
+
+func (a *execWaitingAnnouncer) announce(ctx context.Context, clients *apiClients, stdout, stderr io.Writer, runID string, status contract.RunState, jsonOutput bool, now time.Time) error {
+	if !a.checkedAt.IsZero() && now.Sub(a.checkedAt) < time.Minute {
+		return nil
+	}
+	a.checkedAt = now
+	reason := "waiting for a node to start it"
+	key := reason
+	if unavailable, _ := unschedulableReason(ctx, clients, runID); unavailable != "" {
+		reason += " (no eligible node: " + unavailable + ")"
+		key = reason
+	} else {
+		probeCtx, stop := context.WithTimeout(ctx, statusProbeBudget)
+		node, err := clients.getNode(probeCtx, a.nodeID)
+		stop()
+		if err == nil && node.NodeID == a.nodeID && node.Capabilities["kind:process"] {
+			load := readLocalNodeLoad(clients, node)
+			if load.Holding {
+				reason = fmt.Sprintf("this machine is busy (load %.2f, limit %.2f), so it starts when the load drops", *load.Average, load.Limit)
+				key = "machine_busy"
+			}
+		}
+	}
+	if a.reasonKey == key {
+		return nil
+	}
+	a.reasonKey = key
+	line := fmt.Sprintf("wefty: run %s is %s; %s\n", runID, status, reason)
+	if _, err := io.WriteString(stderr, line); err != nil {
+		return err
+	}
+	if jsonOutput {
+		return writeJSONLine(stdout, struct {
+			Type   string             `json:"type"`
+			Stream contract.LogStream `json:"stream"`
+			Text   string             `json:"text"`
+			Reason string             `json:"reason"`
+		}{"heartbeat", contract.LogStderr, line, reason})
+	}
+	return nil
 }

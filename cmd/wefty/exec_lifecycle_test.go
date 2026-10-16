@@ -101,7 +101,8 @@ func TestExecLostObservationLeavesRunAndStorage(t *testing.T) {
 	})
 	var errOut bytes.Buffer
 	started := time.Now()
-	err := execute(t.Context(), stack.clients, false, []string{"exec", "--tag", "no-such-node", "--", "/bin/sh", "-c", "exit 0"}, io.Discard, &errOut)
+	holdExecNode(t, stack)
+	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "exit 0"}, io.Discard, &errOut)
 	stack.clients.l3.client.Transport = base
 	var params execParams
 	_ = json.Unmarshal(stack.requests[0].Params, &params)
@@ -274,7 +275,8 @@ func TestExecCancelFeedbackAndAcceptedSettlement(t *testing.T) {
 		}
 		return base.RoundTrip(r)
 	})
-	err := execute(ctx, stack.clients, false, []string{"exec", "--tag", "no-such-node", "--", "true"}, io.Discard, &errOut)
+	holdExecNode(t, stack)
+	err := execute(ctx, stack.clients, false, []string{"exec", "--", "true"}, io.Discard, &errOut)
 	var params execParams
 	_ = json.Unmarshal(stack.requests[0].Params, &params)
 	t.Cleanup(func() { _ = cleanupExecStorage(params.Storage) })
@@ -302,7 +304,8 @@ func TestExecCancelWaitUsesL1Budget(t *testing.T) {
 		}
 		return base.RoundTrip(r)
 	})
-	if err := execute(ctx, stack.clients, false, []string{"exec", "--tag", "no-such-node", "--", "true"}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "cancelled run") {
+	holdExecNode(t, stack)
+	if err := execute(ctx, stack.clients, false, []string{"exec", "--", "true"}, io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "cancelled run") {
 		t.Fatalf("cancel: %v", err)
 	}
 }
@@ -587,7 +590,8 @@ func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 		_, _ = io.Copy(w, response.Body)
 	})
 	output := &execReviewOutput{token: "wefty: run ", seen: make(chan struct{})}
-	cmd := exec.Command(binary, "--l1="+stack.l1Address, "--l3="+ledger, "--node-config="+stack.clients.nodeConfigPath, "exec", "--tag", "no-such-node", "--", "true")
+	holdExecNode(t, stack)
+	cmd := exec.Command(binary, "--l1="+stack.l1Address, "--l3="+ledger, "--node-config="+stack.clients.nodeConfigPath, "exec", "--", "true")
 	cmd.Env = os.Environ()
 	cmd.Stdout, cmd.Stderr = output, output
 	if err := cmd.Start(); err != nil {

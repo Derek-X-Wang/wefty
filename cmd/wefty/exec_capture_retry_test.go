@@ -102,7 +102,8 @@ func TestExecCaptureRetriesFreshCheckoutAndSubmitsFinalState(t *testing.T) {
 				return ctx.Err()
 			}
 			var out, stderr bytes.Buffer
-			err := execute(t.Context(), stack.clients, false, []string{"exec", "--detach", "--tag", "no-such-node", "--", "true"}, &out, &stderr)
+			holdExecNode(t, stack)
+			err := execute(t.Context(), stack.clients, false, []string{"exec", "--detach", "--", "true"}, &out, &stderr)
 			if err != nil || len(stack.requests) != 1 || attempts() != 2 || !reflect.DeepEqual(waits, []time.Duration{time.Second}) {
 				t.Fatalf("retry did not submit final capture: err=%v attempts=%d submissions=%d stderr=%s", err, attempts(), len(stack.requests), &stderr)
 			}
@@ -205,7 +206,7 @@ func TestExecCaptureRetryWaitsAndOtherFailures(t *testing.T) {
 			}
 			err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "true"}, io.Discard, io.Discard)
 			if kind == "failure" {
-				if err == nil || !strings.Contains(err.Error(), "Git LFS") || commandExitCode(err) != exitFailure || len(waits) != 0 {
+				if err == nil || !strings.Contains(err.Error(), "Git LFS") || commandExitCode(err) != exitUsage || len(waits) != 0 {
 					t.Fatalf("unrelated failure retried: err=%v waits=%v", err, waits)
 				}
 			} else if commandExitCode(err) != exitConflict || attempts() != 3 || !reflect.DeepEqual(waits, []time.Duration{time.Second, 2 * time.Second}) {

@@ -182,7 +182,8 @@ func TestExecKeepRunningSurvivesStopAtAcceptance(t *testing.T) {
 				stack.afterAccept = cancel
 			}
 			var stderr bytes.Buffer
-			err := execute(ctx, stack.clients, false, []string{"exec", "--keep-running", "--tag", "no-node", "--", "true"}, io.Discard, &stderr)
+			holdExecNode(t, stack)
+			err := execute(ctx, stack.clients, false, []string{"exec", "--keep-running", "--", "true"}, io.Discard, &stderr)
 			if execModeCode(err) != 13 {
 				t.Fatalf("stopped watch: %v %q", err, stderr.String())
 			}
@@ -294,7 +295,8 @@ func TestExecJSONReportsQueuedAndInfrastructureOutcomes(t *testing.T) {
 			ctx := t.Context()
 			base := stack.clients.l3.client.Transport
 			if outcome == "queued" {
-				args = append(args, "--keep-running", "--tag", "no-node")
+				holdExecNode(t, stack)
+				args = append(args, "--keep-running")
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
 				defer cancel()
@@ -532,7 +534,8 @@ func TestExecJSONReportsCancellationAndLostObservation(t *testing.T) {
 				})
 			}
 			var out, stderr bytes.Buffer
-			err := execute(ctx, stack.clients, true, []string{"exec", "--tag", "no-node", "--", "true"}, &out, &stderr)
+			holdExecNode(t, stack)
+			err := execute(ctx, stack.clients, true, []string{"exec", "--", "true"}, &out, &stderr)
 			if err == nil {
 				t.Fatal("interrupted watch returned a command pass")
 			}

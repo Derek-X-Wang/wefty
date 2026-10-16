@@ -305,24 +305,15 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 		}
 	}
 	if status.LocalNode != nil {
-		reader := clients.readLoad
-		if reader == nil {
-			reader = nodeload.Read
-		}
-		limit := nodeload.DefaultLimit()
-		if clients.oneshotLoadLimit != nil {
-			limit = *clients.oneshotLoadLimit
-		}
-		status.LocalLoad = &localLoadStatus{Limit: limit}
-		if load, err := reader(); err == nil {
-			status.LocalLoad.Average = &load
-			for _, node := range nodes.Nodes {
-				if node.NodeID == status.LocalNode.NodeID {
-					status.LocalLoad.Holding = node.State == contract.NodeAlive && node.ClaimsEnabled &&
-						len(nodeExecutableKinds(executionKinds(node.Capabilities))) > 0 && nodeload.Holding(node.OneshotOccupancy, load, limit)
-				}
+		var local l1.Node
+		for _, node := range nodes.Nodes {
+			if node.NodeID == status.LocalNode.NodeID {
+				local = node
+				break
 			}
 		}
+		load := readLocalNodeLoad(clients, local)
+		status.LocalLoad = &load
 	}
 	status.WaitingRuns = waitingRuns
 	status.Capacity = capacityByKind(status.Nodes)
@@ -699,4 +690,23 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 		}
 	}
 	return nodes.Flush()
+}
+
+// Status and exec must report the same local admission facts and settings.
+func readLocalNodeLoad(clients *apiClients, node l1.Node) localLoadStatus {
+	reader := clients.readLoad
+	if reader == nil {
+		reader = nodeload.Read
+	}
+	limit := nodeload.DefaultLimit()
+	if clients.oneshotLoadLimit != nil {
+		limit = *clients.oneshotLoadLimit
+	}
+	status := localLoadStatus{Limit: limit}
+	if load, err := reader(); err == nil {
+		status.Average = &load
+		status.Holding = node.State == contract.NodeAlive && node.ClaimsEnabled &&
+			len(nodeExecutableKinds(executionKinds(node.Capabilities))) > 0 && nodeload.Holding(node.OneshotOccupancy, load, limit)
+	}
+	return status
 }
