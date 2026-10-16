@@ -559,17 +559,20 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	args = moveFirstPositionalToEnd(args)
 	flags := flag.NewFlagSet("logs", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
-	var follow bool
+	var follow, all bool
+	var requestedCursor string
 	var pollInterval time.Duration
 	var limit int
 	flags.BoolVar(&follow, "follow", false, "poll until the run reaches a terminal state and logs are drained")
+	flags.StringVar(&requestedCursor, "cursor", "", "opaque cursor to continue from (with --follow, start polling from it)")
+	flags.BoolVar(&all, "all", false, "walk pages and print every retained event, from --cursor if given; stops at an empty page or fails at the walk-page cap with a resume cursor")
 	flags.DurationVar(&pollInterval, "poll-interval", time.Second, "follow polling interval")
 	flags.IntVar(&limit, "limit", l1.DefaultLogPageLimit, "events per poll")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty logs RUN_ID [--follow]")
+		return usageError("usage: wefty logs RUN_ID [--follow | --all] [--cursor CURSOR]")
 	}
 	if limit < 1 || limit > l1.MaxLogPageLimit {
 		return usageError(fmt.Sprintf("--limit must be between 1 and %d", l1.MaxLogPageLimit))
@@ -577,14 +580,17 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	if pollInterval <= 0 {
 		return usageError("--poll-interval must be positive")
 	}
+	if all && follow {
+		return usageError("--all prints every retained event once; it cannot follow")
+	}
 	runID := flags.Arg(0)
-	if follow {
-		// A follow retries retryable answers at its own interval (#763, #773):
-		// the shared client's one-shot quiet retry is doubled backoff on top
-		// of it, so the loop's reads are marked out.
+	if follow || all {
+		// Like service logs, these loops own their retry interval and bound;
+		// do not nest the shared client's one-shot quiet retry inside them.
 		ctx = withoutClientRetry(ctx)
 	}
-	cursor := ""
+	cursor := requestedCursor
+	walkedPages, walkRetries := 0, 0
 	var truncation truncationAnnouncer
 	var lastStatus contract.RunState
 	announcedWaiting := false
@@ -604,12 +610,24 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			if follow && ctx.Err() != nil {
 				return stopped()
 			}
+			if all && ctx.Err() != nil {
+				return ctx.Err()
+			}
 			// A follow has no deadline: a retryable 503 is one bad poll, not
 			// a verdict (#763). Keep following at the normal interval; only
 			// the caller's cancellation or a non-retryable answer ends it.
-			if follow && isRetryableL1Answer(err) {
+			if (follow || all) && isRetryableL1Answer(err) {
+				if all {
+					walkRetries++
+					if walkRetries > logWalkRetryLimit {
+						return err
+					}
+				}
 				if sleepFollowRetry(ctx, pollInterval) {
 					continue
+				}
+				if all {
+					return ctx.Err()
 				}
 				// The reader left during the retry sleep: an interrupted
 				// follow, not the stale 503.
@@ -617,8 +635,9 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			}
 			return err
 		}
+		walkRetries = 0
 		if jsonOutput {
-			if follow {
+			if follow || all {
 				// stdout stays one event per line; the notice goes to stderr,
 				// so a fully trimmed run never follows as a silent one.
 				if err := truncation.announce(stderr, page.Truncation); err != nil {
@@ -642,6 +661,21 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		}
 		cursor = page.NextCursor
 		if !follow {
+			if all && len(page.Events) > 0 && cursor != "" {
+				walkedPages++
+				if walkedPages >= logWalkPageCap {
+					if !jsonOutput {
+						if err := separateRunLogStderr(stderr, page); err != nil {
+							return err
+						}
+					}
+					return fmt.Errorf("logs --all stopped after %d pages before the end of the log; resume with --all --cursor %s", logWalkPageCap, cursor)
+				}
+				continue
+			}
+			if !all && len(page.Events) > 0 {
+				return writeRunLogPageNotice(ctx, clients, stderr, runID, page)
+			}
 			return nil
 		}
 		run, err := clients.getRun(ctx, runID)
@@ -679,6 +713,49 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		case <-timer.C:
 		}
 	}
+}
+
+// L1 supplies a cursor even at the end. Probe without consuming the next
+// event, and keep these best-effort reads from failing a successful log read.
+func writeRunLogPageNotice(ctx context.Context, clients *apiClients, stderr io.Writer, runID string, page l1.LogPage) error {
+	if page.NextCursor == "" {
+		return nil
+	}
+	notice := fmt.Sprintf("wefty: log read may be partial; resume with --cursor %s or use --all for every retained event", page.NextCursor)
+	ctx = withoutClientRetry(ctx)
+	probe, err := clients.getRunLogs(ctx, runID, page.NextCursor, 1)
+	if err == nil {
+		if len(probe.Events) > 0 {
+			notice = fmt.Sprintf("wefty: more log events exist; resume with --cursor %s or use --all", page.NextCursor)
+		} else if run, err := clients.getRun(ctx, runID); err == nil {
+			if isTerminalRun(run.Status) {
+				return nil
+			}
+			notice = fmt.Sprintf("wefty: run is still %s; more log events may follow; use --follow --cursor %s", run.Status, page.NextCursor)
+		}
+	}
+	if err := separateRunLogStderr(stderr, page); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(stderr, notice)
+	return err
+}
+
+// Keep notices and cap errors on their own stderr line, without adding any
+// bytes to stdout. The last stderr event can precede later stdout events.
+func separateRunLogStderr(stderr io.Writer, page l1.LogPage) error {
+	for i := len(page.Events) - 1; i >= 0; i-- {
+		event := page.Events[i]
+		if event.Stream != contract.LogStderr || len(event.Bytes) == 0 {
+			continue
+		}
+		if event.Bytes[len(event.Bytes)-1] != '\n' {
+			_, err := fmt.Fprintln(stderr)
+			return err
+		}
+		break
+	}
+	return nil
 }
 
 // followWaitingNoticeAfter is how long a follow waits on a run no node has

@@ -90,6 +90,11 @@ not change the run. The command inherits the node's environment and `PATH`;
 the run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
 
+Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied.
+Install dependencies inside the command (for example `pnpm install --frozen-lockfile && ...`), or point the tool at an absolute cache path.
+stdout and stderr are separate streams, so their order relative to each other
+is not kept. When order matters, merge them in the command: `sh -c '... 2>&1'`.
+
 **Stopping `exec` cancels the run unless `--keep-running` is set.** Ctrl-C,
 TERM, and HUP follow this rule. With `--keep-running`, streaming stays the
 same, but stopping ends only the watching. The CLI prints the run ID and
@@ -294,12 +299,17 @@ Everything else you will want:
 wefty --json runs list                    # the most recent runs, newest first
 wefty --json runs list --status running   # just what is in flight
 wefty logs <run_id> --follow              # live tail (poll-based)
+wefty logs <run_id> --all                 # a finished run's full retained log
 wefty rerun <run_id>                      # first call creates; identical retries replay
 wefty rerun <run_id> --again              # deliberately repeat the stored snapshot
 ```
 
 Every command above accepts `--json`, and `--json` is what a script should use:
 the table forms are for people and their columns are not a contract.
+
+A plain `wefty logs RUN_ID` prints one page. When more events exist, or the
+run is still active, stderr says so and names the `--cursor` to continue.
+Use `--all` for a finished run's full log; it cannot be combined with `--follow`.
 
 Logs are not kept forever: L1 keeps a one-shot run's logs for 30 days and
 32 MiB, and all jobs' logs under a 5 GB total, deleting the oldest first. A
