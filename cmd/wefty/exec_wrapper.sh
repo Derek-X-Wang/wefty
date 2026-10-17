@@ -84,7 +84,9 @@ fi
   # change the exact working bytes frozen by --no-filters during capture.
   mkdir -p "$work/.git/info" || exit 1
   printf '* -filter -ident -text -eol -working-tree-encoding\n' > "$work/.git/info/attributes" || exit 1
-  git -C "$work" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout --quiet --force HEAD
+  git -C "$work" -c core.hooksPath=/dev/null -c core.autocrlf=false checkout --quiet --force HEAD || exit 1
+  # Restore the caller's base and index, keeping the captured working files.
+  git -C "$work" -c core.hooksPath=/dev/null -c core.autocrlf=false reset --quiet --mixed HEAD^
 ) || snapshot_checkout_failed
 cd "$work/$folder" || snapshot_checkout_failed
 : > "$started" || snapshot_checkout_failed
