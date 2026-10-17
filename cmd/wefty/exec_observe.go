@@ -123,6 +123,7 @@ func reportExecRun(ctx context.Context, clients *apiClients, record contract.Run
 		}
 		return result
 	}
+	writeExecPathHint(stderr, event)
 	return reportTerminalRun(stderr, record, event.Reason, false, false)
 }
 

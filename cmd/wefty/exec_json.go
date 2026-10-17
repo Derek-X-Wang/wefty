@@ -171,7 +171,14 @@ func reportExecFinished(ctx context.Context, clients *apiClients, record contrac
 	if err := writeJSONLine(stdout, event); err != nil {
 		return err
 	}
+	writeExecPathHint(stderr, event)
 	return result
+}
+
+func writeExecPathHint(stderr io.Writer, event execFinished) {
+	if event.Outcome == "fail" && event.ExitCode != nil && *event.ExitCode == 127 {
+		fmt.Fprintln(stderr, "wefty: exit 127 usually means a command was not found on the run's PATH; runs get the node's login-shell PATH, not yours. Use `bun run`, `npx`, `pnpm exec`, `uv run` or a path such as ./node_modules/.bin/<tool>; `wefty exec -- sh -c 'echo $PATH'` shows it.")
+	}
 }
 
 func endExecObservation(clients *apiClients, capture execCapture, record contract.RunRecord, jsonOutput bool, stdout, stderr io.Writer, cause error) error {
