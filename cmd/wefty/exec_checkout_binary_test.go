@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -9,6 +10,93 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
+
+func TestExecCheckoutGitStateFromRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	for _, state := range []string{"clean", "dirty"} {
+		for _, folder := range []string{".", "sub"} {
+			t.Run(state+"/"+folder, func(t *testing.T) {
+				stack := newExecStack(t, execRealBinaryIdleLimit)
+				repo := execTestRepo(t)
+				writeExecFile(t, filepath.Join(repo, "sub", "deleted"), "delete me\n")
+				writeExecFile(t, filepath.Join(repo, ".gitattributes"), "sub/attributes ident text eol=crlf filter=unused\n")
+				writeExecFile(t, filepath.Join(repo, "sub", "attributes"), "$Id$\nexact\n")
+				execTestGit(t, repo, "add", ".")
+				execTestGit(t, repo, "commit", "-qm", "Git state fixture")
+				base := execTestGit(t, repo, "rev-parse", "HEAD")
+				wantStatus := ""
+				if state == "dirty" {
+					writeExecFile(t, filepath.Join(repo, "sub", "tracked"), "local change\n")
+					// Staging is deliberately discarded inside the run.
+					execTestGit(t, repo, "add", "sub/tracked")
+					writeExecFile(t, filepath.Join(repo, "sub", "new"), "untracked bytes\n")
+					if err := os.Remove(filepath.Join(repo, "sub", "deleted")); err != nil {
+						t.Fatal(err)
+					}
+					wantStatus = " D sub/deleted\n M sub/tracked\n?? sub/new\n"
+				}
+				tracked, err := os.ReadFile(filepath.Join(repo, "sub", "tracked"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				attributes, err := os.ReadFile(filepath.Join(repo, "sub", "attributes"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Chdir(filepath.Join(repo, folder))
+				script := `set -e
+git rev-parse HEAD
+printf '\000'
+git status --porcelain=v1
+printf '\000'
+root=$(git rev-parse --show-toplevel)
+cat "$root/sub/tracked"
+printf '\000'
+cat "$root/sub/attributes"
+printf '\000'
+git show HEAD:sub/tracked
+printf '\000'
+if [ -e "$root/sub/new" ]; then
+  test ! -e "$root/sub/deleted"
+  cat "$root/sub/new"
+else
+  cat "$root/sub/deleted"
+fi
+`
+				code, stdout, stderr := runPolishBinary(t, binary,
+					"--l1="+stack.l1Address, "--l3="+stack.l3Address,
+					"--node-config="+stack.clients.nodeConfigPath, "exec", "--", "/bin/sh", "-c", script)
+				if code != 0 {
+					t.Fatalf("exit=%d stdout=%q stderr=%s", code, stdout, stderr)
+				}
+				parts := bytes.Split(stdout, []byte{0})
+				if len(parts) != 6 {
+					t.Fatalf("unexpected command output: %q", stdout)
+				}
+				if string(parts[0]) != base {
+					t.Errorf("HEAD=%q, want caller HEAD %q", parts[0], base)
+				}
+				if string(parts[1]) != wantStatus {
+					t.Errorf("status=%q, want %q", parts[1], wantStatus)
+				}
+				if !bytes.Equal(parts[2], tracked) || !bytes.Equal(parts[3], attributes) {
+					t.Errorf("working bytes changed: tracked=%q attributes=%q", parts[2], parts[3])
+				}
+				if string(parts[4]) != "base" {
+					t.Errorf("HEAD:sub/tracked=%q, want base contents", parts[4])
+				}
+				lastPath := "deleted"
+				if state == "dirty" {
+					lastPath = "new"
+				}
+				last, err := os.ReadFile(filepath.Join(repo, "sub", lastPath))
+				if err != nil || !bytes.Equal(parts[5], last) {
+					t.Errorf("%s bytes=%q, want %q (read error=%v)", lastPath, parts[5], last, err)
+				}
+			})
+		}
+	}
+}
 
 func TestExecCheckoutUsageFromRealBinary(t *testing.T) {
 	binary := buildWefty(t)

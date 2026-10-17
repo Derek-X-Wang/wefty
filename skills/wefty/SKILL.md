@@ -120,6 +120,7 @@ three fresh attempts with waits of one and two seconds, then refuses with
 retryable `conflict` (exit 5) if edits continue. The command inherits the node's
 environment; the run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
+Inside the run, `git` sees your checkout: HEAD is your base commit and your local changes are uncommitted.
 
 The run gets the node's login-shell `PATH`, not the caller's; project-local tools need `bun run`, `npx`, `pnpm exec` or `uv run`, or a path such as `./node_modules/.bin/turbo`.
 `wefty exec -- sh -c 'echo $PATH'` shows the run's `PATH`.

@@ -592,10 +592,13 @@ func TestExecDetachedHEADAndCleanSubmodule(t *testing.T) {
 	execTestGit(t, repo, "-c", "protocol.file.allow=always", "submodule", "add", sub, "module")
 	execTestGit(t, repo, "commit", "-qam", "module")
 	execTestGit(t, repo, "checkout", "--detach", "-q")
+	base := strings.TrimSpace(execTestGit(t, repo, "rev-parse", "HEAD"))
 	t.Chdir(repo)
 	var out bytes.Buffer
-	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "cat module/sub/tracked; test ! -e module/.git"}, &out, io.Discard)
-	if err != nil || !strings.Contains(out.String(), "base") {
+	// The frozen submodule is plain files under the base's gitlink; Git
+	// inside the run still sees a clean checkout at the caller's HEAD.
+	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "cat module/sub/tracked; test ! -e module/.git; git rev-parse HEAD; git status --porcelain=v1 | sed 's/^/status:/'"}, &out, io.Discard)
+	if err != nil || !strings.Contains(out.String(), "base") || !strings.Contains(out.String(), base) || strings.Contains(out.String(), "status:") {
 		t.Fatalf("detached HEAD and clean submodule: %v %q", err, out.String())
 	}
 }

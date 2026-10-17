@@ -311,7 +311,7 @@ func TestExecCancelWaitUsesL1Budget(t *testing.T) {
 }
 
 func TestExecStartupFailuresAreInfrastructure(t *testing.T) {
-	for _, step := range []string{"clone", "checkout", "cd"} {
+	for _, step := range []string{"clone", "checkout", "reset", "cd"} {
 		t.Run(step, func(t *testing.T) {
 			shortenExecTimers(t)
 			repo := execTestRepo(t)
@@ -321,12 +321,14 @@ func TestExecStartupFailuresAreInfrastructure(t *testing.T) {
 				t.Fatal(err)
 			}
 			shim := t.TempDir()
-			script := "#!/bin/sh\nclone=false; checkout=false; dir=''\nprev=''\nfor arg do\n [ \"$arg\" = --no-checkout ] && clone=true\n [ \"$arg\" = checkout ] && checkout=true\n [ \"$prev\" = -C ] && dir=$arg\n prev=$arg\ndone\n"
+			script := "#!/bin/sh\nclone=false; checkout=false; reset=false; dir=''\nprev=''\nfor arg do\n [ \"$arg\" = --no-checkout ] && clone=true\n [ \"$arg\" = checkout ] && checkout=true\n [ \"$arg\" = reset ] && reset=true\n [ \"$prev\" = -C ] && dir=$arg\n prev=$arg\ndone\n"
 			switch step {
 			case "clone":
 				script += "$clone && exit 1\n"
 			case "checkout":
 				script += "$checkout && exit 1\n"
+			case "reset":
+				script += "$reset && exit 1\n"
 			case "cd":
 				script += fmt.Sprintf("if $checkout; then '%s' \"$@\" || exit; /bin/rm -rf \"$dir/sub\"; exit; fi\n", git)
 			}
