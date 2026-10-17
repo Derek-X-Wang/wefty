@@ -24,6 +24,13 @@ before submission.
 Unsupported checkouts are refused as usage errors (exit 2); `internal` means
 wefty itself failed.
 
+Inside the run, HEAD is the caller's base commit. Tracked local changes and
+deletions appear unstaged, and new files appear untracked; staged versus
+unstaged state is not preserved. A clean caller gives a clean Git status.
+The wrapper checks out the capture, then quietly resets HEAD and the index to
+the capture commit's parent with a mixed reset, keeping the captured working
+files. A frozen submodule stays plain files under the base's gitlink.
+
 All Git writes use a separate bare repository, private index, independent
 objects and private ref under a mode-0700 capture directory. The default root
 is `$XDG_STATE_HOME/wefty/exec` when `XDG_STATE_HOME` is absolute, or
