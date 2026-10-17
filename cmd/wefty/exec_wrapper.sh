@@ -24,7 +24,12 @@ cleanup() {
   if [ -n "$child" ]; then kill "$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; fi
   if [ -n "$heartbeat" ]; then stop_heartbeat; fi
   cd /tmp || :
-  retire_exec_storage "$storage" capture || printf 'wefty: warning: snapshot cleanup failed at %s\n' "$storage" >&2
+  retire_exec_storage "$storage" capture
+  case $? in
+    0) ;;
+    3) printf 'wefty: warning: could not remove the temp link of %s\n' "$storage" >&2 ;;
+    *) printf 'wefty: warning: snapshot cleanup failed at %s\n' "$storage" >&2 ;;
+  esac
   exit "$code"
 }
 trap cleanup EXIT
@@ -32,7 +37,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 snapshot_checkout_failed() {
-  reason='snapshot checkout failed'
+  reason=${1:-'snapshot checkout failed'}
   if [ ! -d "$storage/snapshot.git" ]; then
     reason='the exec snapshot was deleted when the run ended; run `wefty exec` again'
   fi
@@ -89,8 +94,24 @@ fi
   git -C "$work" -c core.hooksPath=/dev/null -c core.autocrlf=false reset --quiet --mixed HEAD^
 ) || snapshot_checkout_failed
 cd "$work/$folder" || snapshot_checkout_failed
+# The data stays inside storage; the short link leaves room for Unix sockets.
+# Record each candidate before linking so retirement also covers setup failure.
+(umask 077; mkdir -m 700 -- "$storage/tmp") || snapshot_checkout_failed "could not create the run's temp folder"
+tmp_link=''
+for ((tries=0; tries<10; tries++)); do
+  candidate=$(mktemp -u /tmp/wefty-run.XXXXXXXX) || break
+  (umask 077; printf '%s\n' "$candidate" > "$storage/tmp-link") || break
+  [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || continue
+  # If a folder appeared at the name, ln would link inside it; check the result.
+  if ln -s -- "$storage/tmp" "$candidate" && [ -L "$candidate" ] && [ "$(readlink "$candidate")" = "$storage/tmp" ]; then
+    tmp_link=$candidate
+    break
+  fi
+done
+[ -n "$tmp_link" ] || snapshot_checkout_failed "could not create the run's temp folder"
 : > "$started" || snapshot_checkout_failed
 (
+  export TMPDIR="$tmp_link"
   for name in ${!WEFTY_@}; do unset "$name"; done
   exec -- "${command[@]}"
 ) &

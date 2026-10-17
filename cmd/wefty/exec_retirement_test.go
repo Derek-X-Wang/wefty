@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +30,7 @@ func blockExecRemoval(t *testing.T) (observed, release string) {
 	observed, release = filepath.Join(dir, "observed"), filepath.Join(dir, "release")
 	env := filepath.Join(dir, "bash-env")
 	writeExecFile(t, env, fmt.Sprintf(`function /bin/rm() {
+  if [ "$1" != -rf ]; then command /bin/rm "$@"; return; fi
   printf '%%s\n' "$*" > %q
   while [ ! -f %q ]; do sleep 0.1; done
   command /bin/rm "$@"
@@ -41,7 +43,8 @@ func blockExecRemoval(t *testing.T) (observed, release string) {
 
 func waitExecPath(t *testing.T, path string, present bool) {
 	t.Helper()
-	ctx, stop := context.WithTimeout(t.Context(), 10*time.Second)
+	// Waits for a run to start too; leave slow shared CI runners room.
+	ctx, stop := context.WithTimeout(t.Context(), 20*time.Second)
 	defer stop()
 	for {
 		_, err := os.Lstat(path)
@@ -50,6 +53,26 @@ func waitExecPath(t *testing.T, path string, present bool) {
 		}
 		if err := waitForContext(ctx, 20*time.Millisecond); err != nil {
 			t.Fatalf("path %s present=%v: %v", path, present, err)
+		}
+	}
+}
+
+// A missing capture path proves retirement only. Check the root too, so a
+// leaked temp file under renamed trash cannot masquerade as deletion.
+func waitExecStorageEmpty(t *testing.T, root string) {
+	t.Helper()
+	ctx, stop := context.WithTimeout(t.Context(), 10*time.Second)
+	defer stop()
+	for {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) == 0 {
+			return
+		}
+		if err := waitForContext(ctx, 20*time.Millisecond); err != nil {
+			t.Fatalf("storage root still contains retired data: %v: %v", entries, err)
 		}
 	}
 }
@@ -126,6 +149,7 @@ func TestExecSweepTrashHasOneDeleterAndRecoversKilledOwner(t *testing.T) {
 	observed, release := filepath.Join(dir, "observed"), filepath.Join(dir, "release")
 	env := filepath.Join(dir, "bash-env")
 	writeExecFile(t, env, fmt.Sprintf(`function /bin/rm() {
+  if [ "$1" != -rf ]; then command /bin/rm "$@"; return; fi
   printf '%%s\n' "$$" >> %q
   while [ ! -f %q ]; do sleep 0.1; done
   command /bin/rm "$@"
@@ -192,6 +216,19 @@ func TestExecSweepOldCaptureRetiresBeforeDeletion(t *testing.T) {
 	stack := newExecStack(t, execTestIdleLimit)
 	storage := filepath.Join(os.Getenv("WEFTY_EXEC_STORAGE_ROOT"), "wefty-exec-old-leftover")
 	writeExecFile(t, filepath.Join(storage, "work", "leftover"), "old data")
+	writeExecFile(t, filepath.Join(storage, "tmp", "run-file"), "temp data")
+	linkDir, err := os.MkdirTemp("/tmp", "wefty-run.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(linkDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(storage, "tmp"), linkDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(linkDir) })
+	writeExecFile(t, filepath.Join(storage, "tmp-link"), linkDir+"\n")
 	ageExecCapture(t, storage)
 	if err := sweepExecStorage(t.Context(), stack.clients, io.Discard); err != nil {
 		t.Fatal(err)
@@ -206,6 +243,8 @@ func TestExecSweepOldCaptureRetiresBeforeDeletion(t *testing.T) {
 		t.Fatalf("old capture was deleted without retirement: %q", raw)
 	}
 	waitExecPath(t, storage, false)
+	waitExecPath(t, linkDir, false)
+	waitExecPath(t, filepath.Join(trash, "tmp", "run-file"), true)
 	writeExecFile(t, release, "release")
 	waitExecPath(t, trash, false)
 }
@@ -301,4 +340,158 @@ func TestExecRerunGoneCaptureFromRealBinary(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("ordinary run was mistaken for exec: exit=%d %s", code, output)
 	}
+}
+
+func TestExecRetirementTempLinkSafety(t *testing.T) {
+	for _, kind := range []string{"owned", "outside-prefix", "directory", "wrong-target", "unsafe-suffix"} {
+		t.Run(kind, func(t *testing.T) {
+			storage := filepath.Join(t.TempDir(), "wefty-exec-owned")
+			target := filepath.Join(storage, "tmp")
+			writeExecFile(t, filepath.Join(target, "run-file"), "run data")
+			link, err := os.MkdirTemp("/tmp", "wefty-run.")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(link) })
+			if kind == "directory" {
+				writeExecFile(t, filepath.Join(link, "kept"), "owner data")
+			} else {
+				if err := os.Remove(link); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "outside-prefix" {
+					link = filepath.Join(t.TempDir(), "owner-link")
+				}
+				if kind == "unsafe-suffix" {
+					link += "!"
+				}
+				if kind == "wrong-target" {
+					target = t.TempDir()
+					writeExecFile(t, filepath.Join(target, "kept"), "owner data")
+				}
+				if err := os.Symlink(target, link); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeExecFile(t, filepath.Join(storage, "tmp-link"), link+"\n")
+			if err := cleanupExecStorage(storage); err != nil {
+				t.Fatal(err)
+			}
+			waitExecPath(t, storage, false)
+			waitExecPath(t, link, kind != "owned")
+			if kind == "directory" {
+				waitExecPath(t, filepath.Join(link, "kept"), true)
+			}
+			if kind == "wrong-target" {
+				waitExecPath(t, filepath.Join(target, "kept"), true)
+			}
+		})
+	}
+}
+
+func TestExecTempSetupFailureIsInfrastructure(t *testing.T) {
+	for _, step := range []string{"folder", "link"} {
+		t.Run(step, func(t *testing.T) {
+			t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+			capture, err := captureExec(t.Context(), execTestRepo(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			handoff := t.TempDir()
+			probe := filepath.Join(t.TempDir(), "bash-env")
+			shim := `mkdir() { case "${*: -1}" in */tmp) return 1 ;; esac; command mkdir "$@"; }`
+			if step == "link" {
+				shim = `ln() { return 1; }`
+			}
+			writeExecFile(t, probe, shim+"\n")
+			cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", buildExecWrapper(capture, []string{"true"}))
+			cmd.Env = append(os.Environ(), "BASH_ENV="+probe, "WEFTY_HANDOFF_DIR="+handoff)
+			output, err := cmd.CombinedOutput()
+			want := "could not create the run's temp folder"
+			if err == nil || !strings.Contains(string(output), "wefty: "+want) {
+				t.Fatalf("temp setup failure: %v %q", err, output)
+			}
+			raw, err := os.ReadFile(filepath.Join(handoff, "result.json"))
+			var result map[string]any
+			if err != nil || json.Unmarshal(raw, &result) != nil || result["infrastructure_error"] != want || result["exit_code"] != nil {
+				t.Fatalf("temp setup infrastructure result: %s %v", raw, err)
+			}
+			waitExecPath(t, capture.Storage, false)
+		})
+	}
+}
+
+func TestExecTempLinkRemovalFailurePreservesVerdict(t *testing.T) {
+	for _, exitCode := range []int{0, 1} {
+		t.Run(fmt.Sprint(exitCode), func(t *testing.T) {
+			t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+			capture, err := captureExec(t.Context(), execTestRepo(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			probe := filepath.Join(t.TempDir(), "bash-env")
+			writeExecFile(t, probe, `function /bin/rm() {
+  case "${*: -1}" in /tmp/wefty-run.*) return 1 ;; esac
+  command /bin/rm "$@"
+}
+`)
+			cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/sh", "-c", `printf '%s' "$TMPDIR"; exit "$1"`, "sh", fmt.Sprint(exitCode)}))
+			cmd.Env = append(os.Environ(), "BASH_ENV="+probe)
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			err = cmd.Run()
+			got := 0
+			if err != nil {
+				var status *exec.ExitError
+				if !errors.As(err, &status) {
+					t.Fatal(err)
+				}
+				got = status.ExitCode()
+			}
+			link := stdout.String()
+			t.Cleanup(func() { _ = os.Remove(link) })
+			if got != exitCode || !strings.Contains(stderr.String(), "warning: could not remove the temp link of "+capture.Storage) || strings.Contains(stderr.String(), "snapshot cleanup failed") {
+				t.Fatalf("unlink failure changed result: exit=%d want=%d stderr=%s", got, exitCode, stderr.String())
+			}
+			waitExecPath(t, capture.Storage, false)
+			waitExecPath(t, link, true)
+		})
+	}
+}
+
+func TestExecTempLinkRetriesCollision(t *testing.T) {
+	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	capture, err := captureExec(t.Context(), execTestRepo(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "collision")
+	probe := filepath.Join(t.TempDir(), "bash-env")
+	writeExecFile(t, probe, fmt.Sprintf(`ln() {
+  if [ ! -f %q ]; then
+    candidate="${*: -1}"
+    printf 'owner data' > "$candidate"
+    printf '%%s' "$candidate" > %q
+    return 1
+  fi
+  command ln "$@"
+}
+`, marker, marker))
+	cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/sh", "-c", `printf '%s' "$TMPDIR"`}))
+	cmd.Env = append(os.Environ(), "BASH_ENV="+probe)
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("collision retry: %v", err)
+	}
+	raw, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collision := string(raw)
+	t.Cleanup(func() { _ = os.Remove(collision) })
+	kept, err := os.ReadFile(collision)
+	if err != nil || string(kept) != "owner data" || string(output) == collision {
+		t.Fatalf("collision was overwritten or reused: kept=%q err=%v used=%q collision=%q", kept, err, output, collision)
+	}
+	waitExecPath(t, string(output), false)
 }

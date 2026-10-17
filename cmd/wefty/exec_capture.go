@@ -455,6 +455,11 @@ func retireExecStorageContext(caller context.Context, storage, kind string) erro
 	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", execCleanupScript+"\nretire_exec_storage \"$1\" \"$2\"", "wefty-exec-cleanup", storage, kind)
 	cmd.WaitDelay = time.Second
 	if out, err := cmd.CombinedOutput(); err != nil {
+		// Status 3: the capture is retired, but its temp link stays in /tmp.
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 3 {
+			return fmt.Errorf("could not remove the temp link of %s", storage)
+		}
 		return fmt.Errorf("snapshot cleanup failed at %s: %w: %s", storage, err, out)
 	}
 	return nil

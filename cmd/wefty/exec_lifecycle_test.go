@@ -729,3 +729,66 @@ func TestExecCLIRemovesReadOnlyResidue(t *testing.T) {
 		t.Fatalf("CLI left read-only residue: %v", err)
 	}
 }
+
+func TestExecCancelRemovesPrivateTemp(t *testing.T) {
+	stack := newExecStack(t, execTestIdleLimit)
+	t.Chdir(execTestRepo(t))
+	marker := filepath.Join(t.TempDir(), "temp-ready")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	settled := false
+	defer func() {
+		cancel()
+		if !settled {
+			select {
+			case <-done:
+			case <-time.After(35 * time.Second):
+				t.Error("cancelled temp probe did not stop")
+			}
+		}
+	}()
+	go func() {
+		done <- execute(ctx, stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", `set -e; printf data > "$TMPDIR/run-file"; printf '%s' "$TMPDIR" > "$1.pending"; mv "$1.pending" "$1"; sleep 60`, "sh", marker}, io.Discard, io.Discard)
+	}()
+	waitExecPath(t, marker, true)
+	raw, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := string(raw)
+	if !strings.HasPrefix(link, "/tmp/wefty-run.") {
+		t.Fatalf("run has no private TMPDIR: %q", link)
+	}
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil || info.Mode().Perm() != 0700 {
+		t.Fatalf("temp folder mode: %v %v", info, err)
+	}
+	info, err = os.Stat(filepath.Join(filepath.Dir(target), "tmp-link"))
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("temp link record mode: %v %v", info, err)
+	}
+	waitExecPath(t, filepath.Join(target, "run-file"), true)
+	cancel()
+	select {
+	case err := <-done:
+		settled = true
+		if err == nil || !strings.Contains(err.Error(), "cancelled run") {
+			t.Fatalf("cancel: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("cancellation never settled")
+	}
+	page, err := stack.clients.listRuns(t.Context(), "", 10)
+	if err != nil || len(page.Runs) != 1 || page.Runs[0].Status != contract.RunFailed {
+		t.Fatalf("terminal cancellation: %+v %v", page, err)
+	}
+	for _, path := range []string{link, target, filepath.Join(target, "run-file")} {
+		waitExecPath(t, path, false)
+	}
+	waitExecStorageEmpty(t, os.Getenv("WEFTY_EXEC_STORAGE_ROOT"))
+}

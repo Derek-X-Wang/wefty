@@ -100,3 +100,58 @@ func TestExecUnwritableStorageFromRealBinary(t *testing.T) {
 		})
 	}
 }
+
+func TestExecPrivateTempFromRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	var previous string
+	for _, exit := range []int{0, 1} {
+		t.Run(fmt.Sprint(exit), func(t *testing.T) {
+			stack := newExecStack(t, execRealBinaryIdleLimit)
+			callerTemp := os.Getenv("TMPDIR")
+			t.Chdir(execTestRepo(t))
+			script := `set -e
+printf '%s\000' "$TMPDIR" "$(readlink "$TMPDIR")" "$(ls -A "$TMPDIR")"
+printf 'run data' > "$TMPDIR/run-file"
+exit "$1"`
+			code, stdout, stderr := runPolishBinary(t, binary,
+				"--l1="+stack.l1Address, "--l3="+stack.l3Address,
+				"--node-config="+stack.clients.nodeConfigPath, "exec", "--", "/bin/sh", "-c", script, "sh", fmt.Sprint(exit))
+			wantCode := 0
+			if exit != 0 {
+				wantCode = 10
+			}
+			if code != wantCode {
+				t.Fatalf("exit=%d want=%d stdout=%q stderr=%s", code, wantCode, stdout, stderr)
+			}
+			parts := strings.Split(string(stdout), "\x00")
+			if len(parts) != 4 {
+				t.Fatalf("temp probe output: %q", stdout)
+			}
+			link := parts[0]
+			if link == callerTemp || link == previous || !strings.HasPrefix(link, "/tmp/wefty-run.") || len(link) > 32 || strings.HasSuffix(link, "/") {
+				t.Fatalf("run TMPDIR=%q caller=%q previous=%q", link, callerTemp, previous)
+			}
+			previous = link
+			page, err := stack.clients.listRuns(t.Context(), "", 10)
+			if err != nil || len(page.Runs) != 1 {
+				t.Fatalf("run list: %+v %v", page, err)
+			}
+			record, err := stack.clients.getRun(t.Context(), page.Runs[0].RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var params execParams
+			if err := json.Unmarshal(record.Params, &params); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(params.Storage, "tmp")
+			if parts[1] != target || parts[2] != "" {
+				t.Fatalf("temp target=%q want=%q initial contents=%q", parts[1], target, parts[2])
+			}
+			for _, path := range []string{link, target, filepath.Join(target, "run-file")} {
+				waitExecPath(t, path, false)
+			}
+			waitExecStorageEmpty(t, filepath.Dir(params.Storage))
+		})
+	}
+}

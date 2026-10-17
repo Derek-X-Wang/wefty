@@ -14,6 +14,7 @@ retire_exec_storage() {
   (
     trap - EXIT INT TERM
     trap '' HUP
+    link_failure=0
     # Keep every filesystem operation off the foreground path: even a stat
     # can stall. Never traverse a symlink, including discovered trash.
     [ -e "$source" ] || [ -L "$source" ] || exit 0
@@ -24,6 +25,28 @@ retire_exec_storage() {
       # command may lock its own storage. Only the top directory, so this
       # stays instant; deletion unlocks the tree.
       /bin/chmod u+w "$source" 2>/dev/null || :
+      # Only unlink our short alias. Never follow it or remove another run's
+      # link, even when the command has replaced the record or the path.
+      # A link that is already gone is fine: the wrapper and the CLI can
+      # retire the same capture at once. Only a link that stays is status 3.
+      if [ -f "$source/tmp-link" ] && [ ! -L "$source/tmp-link" ]; then
+        tmp_link=''
+        # A record without a final newline still sets the value.
+        IFS= read -r tmp_link < "$source/tmp-link" || :
+        case "$tmp_link" in
+          /tmp/wefty-run.?*)
+            suffix=${tmp_link#/tmp/wefty-run.}
+            case "$suffix" in
+              *[!a-zA-Z0-9._-]*) ;;
+              *)
+                if [ -L "$tmp_link" ] && [ "$(readlink "$tmp_link")" = "$source/tmp" ]; then
+                  /bin/rm -f -- "$tmp_link" || [ ! -L "$tmp_link" ] || link_failure=3
+                fi
+                ;;
+            esac
+            ;;
+        esac
+      fi
       /bin/mv -- "$source" "$trash" || exit 1
     fi
     # This child keeps the helper's independent lifetime. Exiting the
@@ -66,7 +89,7 @@ retire_exec_storage() {
       fi
       /bin/rmdir -- "$marker/$$" && /bin/rmdir -- "$marker"
     ' wefty-exec-delete "$trash" &
-    exit 0
+    exit "$link_failure"
   ) </dev/null >/dev/null 2>&1 &
   operation=$!
   set +m
