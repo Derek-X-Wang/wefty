@@ -405,7 +405,7 @@ func TestExecKeepRunningSignalsAndJSONFromRealBinary(t *testing.T) {
 		})
 	}
 	// Real global JSON extraction and command flags after --.
-	for _, exit := range []int{0, 7} {
+	for _, exit := range []int{0, 7, 127} {
 		cmd := exec.Command(binary, append(append([]string{}, base...), "--json", "--", "/bin/sh", "-c", fmt.Sprintf("printf '%%s\\n' \"$@\"; exit %d", exit), "sh", "--detach", "--keep-running", "--json")...)
 		var out, stderr bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &stderr
@@ -424,6 +424,13 @@ func TestExecKeepRunningSignalsAndJSONFromRealBinary(t *testing.T) {
 		}
 		if code != want {
 			t.Fatalf("JSON binary: %d %s", code, stderr.String())
+		}
+		wantHints := 0
+		if exit == 127 {
+			wantHints = 1
+		}
+		if got := strings.Count(stderr.String(), "wefty: exit 127 usually means"); got != wantHints {
+			t.Fatalf("JSON exit %d: hint count=%d stderr=%s", exit, got, &stderr)
 		}
 		events := execModeEvents(t, out.String())
 		final := events[len(events)-1]

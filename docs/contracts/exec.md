@@ -109,7 +109,10 @@ of load while the machine remains busy do not count as a changed reason.
 Without `--json`, exec follows the normal log drain, including queued and truncation notices,
 before printing the terminal verdict to stderr. Stdout contains only command
 stdout. Success exits 0. Failure uses the shared
-`runOutcomeError` typed-exit entry and exits 10. SIGINT, SIGTERM and SIGHUP cancel
+`runOutcomeError` typed-exit entry and exits 10. When the command itself exits
+127, exec prints one `wefty:` hint on stderr, before the verdict, that the
+command was likely not on the run's PATH; `--json` prints the same line on
+stderr. SIGINT, SIGTERM and SIGHUP cancel
 the run unless `--keep-running` or `--detach` is set. The CLI prints `wefty: cancelling run <id>` before the cancel request.
 An accepted cancellation is reported as cancelled; later observation serves
 only cleanup. A terminal run with recorded cancellation is reported as
@@ -210,7 +213,8 @@ removed merely because watching ended.
 
 `--json` writes NDJSON to stdout with one event per line. Command stderr also
 travels in stdout JSON; CLI diagnostics, queued notices, and retention warnings
-stay on stderr. The event discriminator is `type`:
+stay on stderr, including the exit-127 PATH hint. The event
+discriminator is `type`:
 
 | Type | Fields |
 | --- | --- |

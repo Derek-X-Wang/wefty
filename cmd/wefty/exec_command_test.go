@@ -606,7 +606,7 @@ func TestExecExitCodesAndSignalsFromRealBinary(t *testing.T) {
 	repo := execTestRepo(t)
 	t.Chdir(filepath.Join(repo, "sub"))
 	base := []string{"--l1=" + stack.l1Address, "--l3=" + stack.l3Address, "--node-config=" + stack.clients.nodeConfigPath, "exec"}
-	for _, exit := range []int{0, 7} {
+	for _, exit := range []int{0, 7, 127} {
 		code, out := runWefty(t, binary, 30*time.Second, append(append([]string{}, base...), "--", "/bin/sh", "-c", fmt.Sprintf("printf 'tail-output\\n'; exit %d", exit))...)
 		want := 0
 		if exit != 0 {
@@ -614,6 +614,13 @@ func TestExecExitCodesAndSignalsFromRealBinary(t *testing.T) {
 		}
 		if code != want || !strings.Contains(out, "tail-output\n") {
 			t.Fatalf("exec exit %d: code=%d output=%s", exit, code, out)
+		}
+		wantHints := 0
+		if exit == 127 {
+			wantHints = 1
+		}
+		if got := strings.Count(out, "wefty: exit 127 usually means"); got != wantHints {
+			t.Fatalf("exec exit %d: hint count=%d output=%s", exit, got, out)
 		}
 	}
 	// Environment metadata selection must work through the real argument path.
