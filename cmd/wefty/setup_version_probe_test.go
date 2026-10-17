@@ -42,15 +42,16 @@ func TestSetupVersionProbeStopsABinaryThatFloodsOutput(t *testing.T) {
 }
 
 // A binary that never answers is stopped at the probe budget, and setup goes
-// on without a version.
+// on without a version. The budget is shared by every probed binary, so it
+// leaves the healthy stand-ins room to start on a loaded machine.
 func TestSetupVersionProbeStopsABinaryThatHangs(t *testing.T) {
 	f := newSetupFixture(t)
-	f.host.versionProbeBudget = 300 * time.Millisecond
+	f.host.versionProbeBudget = 2 * time.Second
 	if err := os.WriteFile(filepath.Join(f.source, "wefty-agent"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	started := time.Now()
-	assertSetupWithoutVersion(t, f, "wefty-agent --version did not answer within 300ms")
+	assertSetupWithoutVersion(t, f, "wefty-agent --version did not answer within 2s")
 	if elapsed := time.Since(started); elapsed > 10*time.Second {
 		t.Fatalf("setup waited %s for a hanging binary", elapsed)
 	}
