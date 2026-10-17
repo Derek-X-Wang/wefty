@@ -70,7 +70,7 @@ the CLI names the retained storage path.
 The embedded Bash wrapper clones the independent capture without hard links,
 changes to the same relative folder and runs the argv without `eval`. Only the
 command loses `WEFTY_*`; the wrapper keeps its run mailbox environment. The
-command otherwise inherits the node's environment. While it clones the
+command otherwise inherits the node's environment, except `TMPDIR` (below). While it clones the
 snapshot, the wrapper prints `still preparing the snapshot (Nm)` once per
 minute, so the no-output limit measures the command, not the checkout. Once
 the command starts, it prints `still running (Nm)` once per minute. This
@@ -87,8 +87,15 @@ Heartbeat lines go to stderr. The wrapper writes `{"exit_code":N}` to the
 run's result document, using the existing result upload path. Clone, checkout,
 or start-folder failures print `wefty: snapshot checkout failed` and write an
 `infrastructure_error` result without a command `exit_code`. The CLI reports
-these failures with typed unavailable exit 13. Private clones use `--template=`;
+these failures with typed unavailable exit 13. Failure to create the run's temp
+folder or link follows the same infrastructure-error path, with reason
+`could not create the run's temp folder`. Private clones use `--template=`;
 all Git calls disable hooks with `-c core.hooksPath=/dev/null`.
+
+The command's `TMPDIR` is a private, initially empty folder inside the run
+storage, reached through a short `/tmp/wefty-run.*` link. Wefty deletes it with
+the storage, also after cancel. Tool caches kept in `TMPDIR` start cold in each
+run. A hard kill followed by a later sweep can leave only a dangling link.
 
 If the capture or its bare snapshot is gone, the wrapper instead prints
 ``wefty: the exec snapshot was deleted when the run ended; run `wefty exec` again``
@@ -141,7 +148,11 @@ retained storage path. After a failed run ends, exec also waits up to forty
 seconds for the command result to arrive before reporting a missing result
 with exit 13. Other log-follow commands keep their existing policies.
 
-Both the wrapper and CLI atomically rename a finished capture before removing
+Both the wrapper and CLI remove a recorded `/tmp/wefty-run.*` link only when
+its name has a safe suffix, it is a symlink, and its target is that capture's
+`tmp` folder. A link that is already gone is not a failure; a link that stays
+prints `wefty: warning: could not remove the temp link of <storage>` and never
+changes the command's result. They then atomically rename a finished capture before removing
 its contents. Trash names start with `.wefty-trash-`, never the live capture
 prefix `wefty-exec-`. A detached Bash helper runs `chmod -R u+w` and `rm -rf`
 on trash, including read-only generated directories, with no total time limit.

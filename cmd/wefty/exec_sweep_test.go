@@ -204,10 +204,16 @@ func TestExecWrapperCleanupAlreadyRemoved(t *testing.T) {
 	ctx, stop := context.WithTimeout(t.Context(), 5*time.Second)
 	defer stop()
 	// A competing sweep has already removed the folder when wrapper cleanup starts.
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/rm", "-rf", "--", capture.Storage}))
-	output, err := cmd.CombinedOutput()
-	if err != nil || strings.Contains(string(output), "cleanup failed") {
-		t.Fatalf("already removed folder was treated as cleanup failure: %v %q", err, output)
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/sh", "-c", `printf '%s' "$TMPDIR"; /bin/rm -rf -- "$1"`, "sh", capture.Storage}))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err = cmd.Run()
+	// Removing storage outside retirement leaves the run's /tmp link behind.
+	if link := stdout.String(); strings.HasPrefix(link, "/tmp/wefty-run.") {
+		t.Cleanup(func() { _ = os.Remove(link) })
+	}
+	if err != nil || strings.Contains(stderr.String(), "cleanup failed") {
+		t.Fatalf("already removed folder was treated as cleanup failure: %v %q", err, stderr.String())
 	}
 	if _, err := os.Stat(capture.Storage); !os.IsNotExist(err) {
 		t.Fatalf("capture still exists: %v", err)
