@@ -204,6 +204,13 @@ between Computers. A Computer with no Seats is idle.
 _Avoid_: lease (an Attempt's lease), session, Take-over session, login, Slot,
 the input "seat" of a Wayland desktop
 
+**Seat credential**:
+The secret wefty gives an AI agent with its Seat. Wefty treats screen input
+and Seat calls that carry it as that AI agent's, never as a person's. It is
+valid only while its Seat lasts. On one Mac it keeps order between the AI agent
+and the owner; it does not prove who acts.
+_Avoid_: Seat pass, Seat token, Attempt credential, take-over bearer
+
 **Seat limit**:
 The most Seats a Computer holds at once. A Computer with a Seat limit of 1 is
 a dedicated Computer; a higher limit makes it a shared Computer.
