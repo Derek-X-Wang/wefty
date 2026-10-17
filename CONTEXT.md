@@ -187,10 +187,39 @@ _Avoid_: pin, affinity, ownership, permanent placement
 ### Agent computers and storage
 
 **Computer**:
-A durable, Pinned service resource whose storage identity, name, placement,
-and grants persist across runtime attempts and image changes. Its tenant image
+A Pinned unit of compute with a screen and input, which wefty hosts so that
+AI agents can do work made for people and work beside a person. Its name,
+placement, and grants persist while it exists. Its settings decide how long it
+lives and how long its Storage lasts. Whenever it has Storage, that Storage
+keeps one identity across runtime attempts and image changes. Its tenant image
 may change without changing the Computer.
 _Avoid_: node, machine, VM, container, tenant, service job
+
+**Seat**:
+One AI agent's registration on a Computer, with its own desktop: screen, input,
+user, and folder. A Seat ends when the AI agent releases it or when it
+stops checking in. Seats on one Computer belong to one owner and are kept apart
+for order, not as a security wall; the Computer isolation boundary lies
+between Computers. A Computer with no Seats is idle.
+_Avoid_: lease (an Attempt's lease), session, Take-over session, login, Slot,
+the input "seat" of a Wayland desktop
+
+**Seat limit**:
+The most Seats a Computer holds at once. A Computer with a Seat limit of 1 is
+a dedicated Computer; a higher limit makes it a shared Computer.
+_Avoid_: sharing mode, capacity, Slot
+
+**Idle action**:
+What wefty does to a Computer that stays idle past its idle wait: delete it
+with its Storage (an on-demand Computer), stop it and keep its Storage, or
+nothing (an always-on Computer, which keeps the Desired state its owner sets).
+_Avoid_: timeout policy, TTL, keep-alive
+
+**Host VM**:
+The Linux virtual machine on a macOS Node that holds that Node's OCI
+workloads, Computers included. Today each macOS Node has one. It is never a
+Computer.
+_Avoid_: computer VM, Lima instance
 
 **Computer isolation boundary**:
 The invariant that a Computer may reach its orchestrator channel, its own
@@ -243,7 +272,7 @@ _Avoid_: Backup, managed copy, verified deletion
 **Take-over session**:
 One authenticated, bounded viewing or control connection from a person to a
 Computer through the Fabric.
-_Avoid_: Run, login, VNC session, tenant session
+_Avoid_: Run, Seat, login, VNC session, tenant session
 
 **Controller tenure**:
 The exclusive, attempt-scoped period in which one Take-over session holds a
@@ -269,7 +298,8 @@ occupied by a service binding, and is retained through restart backoff.
 Slots have no identity — occupancy is a count, never an assignment, and
 there is no slot ID and no slots table. Slots are never shared across
 classes.
-_Avoid_: lane, pool, worker, CPU, core, "execution path" as a countable noun
+_Avoid_: lane, pool, worker, CPU, core, Seat, Seat limit, "execution path" as a
+countable noun
 
 **Fabric**:
 The network seam — transport, identity, naming, provisioning — behind which
