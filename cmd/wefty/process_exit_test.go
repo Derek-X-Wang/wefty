@@ -25,15 +25,33 @@ import (
 // prevent lived entirely between the command's return value and that status,
 // and every in-process test passed while the real binary exited 1.
 
+// weftyBuild is the one build that buildWefty shares. Every real-binary test
+// runs the same binary and none changes it, and a link per test cost minutes
+// (#1035). It builds with the environment the test process started with, so
+// a test's own t.Setenv cannot reach the build.
+var weftyBuild struct {
+	once   sync.Once
+	binary string
+	output []byte
+	err    error
+}
+
 func buildWefty(t *testing.T) string {
 	t.Helper()
-	binary := filepath.Join(t.TempDir(), "wefty")
-	build := exec.Command("go", "build", "-o", binary, ".")
-	build.Env = os.Environ()
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build wefty: %v\n%s", err, output)
+	weftyBuild.once.Do(func() {
+		directory := filepath.Join(packageTestDirectory, "bin")
+		if weftyBuild.err = os.MkdirAll(directory, 0o700); weftyBuild.err != nil {
+			return
+		}
+		weftyBuild.binary = filepath.Join(directory, "wefty")
+		build := exec.Command("go", "build", "-o", weftyBuild.binary, ".")
+		build.Env = packageTestEnvironment
+		weftyBuild.output, weftyBuild.err = build.CombinedOutput()
+	})
+	if weftyBuild.err != nil {
+		t.Fatalf("build wefty: %v\n%s", weftyBuild.err, weftyBuild.output)
 	}
-	return binary
+	return weftyBuild.binary
 }
 
 // runWefty runs the built binary and returns its exit status and output.
