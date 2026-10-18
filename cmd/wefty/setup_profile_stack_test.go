@@ -193,19 +193,23 @@ func TestSetupProfileConnectsTheStackWithNoFlags(t *testing.T) {
 }
 
 // distinctLoopbackAddresses holds count loopback ports at once, so no two are
-// the same, and releases them together for the stack to bind. A port another
-// process takes in the moment between is a bind conflict the caller retries.
-func distinctLoopbackAddresses(t *testing.T, count int) []string {
+// the same, and releases them together for the stack to bind. A port in avoid
+// is held too but not returned, so the system cannot hand it out again. A
+// port another process takes in the moment between is a bind conflict the
+// caller retries.
+func distinctLoopbackAddresses(t *testing.T, count int, avoid ...string) []string {
 	t.Helper()
 	listeners := make([]net.Listener, 0, count)
 	addresses := make([]string, 0, count)
-	for range count {
+	for len(addresses) < count {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
 		listeners = append(listeners, listener)
-		addresses = append(addresses, listener.Addr().String())
+		if address := listener.Addr().String(); !slices.Contains(avoid, address) {
+			addresses = append(addresses, address)
+		}
 	}
 	for _, listener := range listeners {
 		if err := listener.Close(); err != nil {
@@ -240,9 +244,13 @@ type profileStackAttempt struct {
 func bindProfileStack(t *testing.T, occupy func(attempt int, addresses []string)) profileStack {
 	t.Helper()
 	var stack profileStack
+	var used []string
 	for attempt := 1; ; attempt++ {
 		stack.fixture = newSetupFixture(t)
-		addresses := distinctLoopbackAddresses(t, 2)
+		// A retry's ports differ from every earlier attempt's, including one
+		// the failed attempt bound and released.
+		addresses := distinctLoopbackAddresses(t, 2, used...)
+		used = append(used, addresses...)
 		stack.fixture.host.l1Address, stack.fixture.host.l3Address = addresses[0], addresses[1]
 		stack.report = stack.fixture.setup(t, setupRequest{})
 		t.Setenv("HOME", stack.fixture.home)
