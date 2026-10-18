@@ -569,7 +569,8 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	var follow, all bool
 	var requestedCursor string
 	var pollInterval time.Duration
-	var limit int
+	var limit, tail int
+	flags.IntVar(&tail, "tail", 0, "walk pages and print only the last N retained events; may be combined with --follow")
 	flags.BoolVar(&follow, "follow", false, "poll until the run reaches a terminal state and logs are drained")
 	flags.StringVar(&requestedCursor, "cursor", "", "opaque cursor to continue from (with --follow, start polling from it)")
 	flags.BoolVar(&all, "all", false, "walk pages and print every retained event, from --cursor if given; stops at an empty page or fails at the walk-page cap with a resume cursor")
@@ -579,7 +580,7 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty logs RUN_ID [--follow | --all] [--cursor CURSOR]")
+		return usageError("usage: wefty logs RUN_ID [--all | [--tail N] [--follow]] [--cursor CURSOR]")
 	}
 	if limit < 1 || limit > l1.MaxLogPageLimit {
 		return usageError(fmt.Sprintf("--limit must be between 1 and %d", l1.MaxLogPageLimit))
@@ -587,17 +588,41 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	if pollInterval <= 0 {
 		return usageError("--poll-interval must be positive")
 	}
+	tailSet := false
+	flags.Visit(func(f *flag.Flag) { tailSet = tailSet || f.Name == "tail" })
+	if tailSet && tail <= 0 {
+		return usageError("--tail must be positive")
+	}
+	if tailSet && all {
+		return usageError("--tail cannot be combined with --all")
+	}
 	if all && follow {
 		return usageError("--all prints every retained event once; it cannot follow")
 	}
 	runID := flags.Arg(0)
-	if follow || all {
+	walking := all || tailSet
+	if follow || walking {
 		// Like service logs, these loops own their retry interval and bound;
 		// do not nest the shared client's one-shot quiet retry inside them.
 		ctx = withoutClientRetry(ctx)
 	}
 	cursor := requestedCursor
 	walkedPages, walkRetries := 0, 0
+	// Grow only as events arrive: a large --tail on a short log must not
+	// allocate N slots up front. Once full, overwrite the oldest event.
+	var tailEvents []contract.LogEvent
+	tailNext := 0
+	writeEvents := func(events []contract.LogEvent) error {
+		if jsonOutput {
+			for _, event := range events {
+				if err := writeJSONLine(stdout, event); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return writeLogEvents(stdout, stderr, events)
+	}
 	var truncation truncationAnnouncer
 	var lastStatus contract.RunState
 	announcedWaiting := false
@@ -617,14 +642,14 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			if follow && ctx.Err() != nil {
 				return stopped()
 			}
-			if all && ctx.Err() != nil {
+			if walking && ctx.Err() != nil {
 				return ctx.Err()
 			}
 			// A follow has no deadline: a retryable 503 is one bad poll, not
 			// a verdict (#763). Keep following at the normal interval; only
 			// the caller's cancellation or a non-retryable answer ends it.
-			if (follow || all) && isRetryableL1Answer(err) {
-				if all {
+			if (follow || walking) && isRetryableL1Answer(err) {
+				if walking {
 					walkRetries++
 					if walkRetries > logWalkRetryLimit {
 						return err
@@ -633,7 +658,7 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 				if sleepFollowRetry(ctx, pollInterval) {
 					continue
 				}
-				if all {
+				if walking && !follow {
 					return ctx.Err()
 				}
 				// The reader left during the retry sleep: an interrupted
@@ -643,44 +668,61 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			return err
 		}
 		walkRetries = 0
-		if jsonOutput {
-			if follow || all {
-				// stdout stays one event per line; the notice goes to stderr,
-				// so a fully trimmed run never follows as a silent one.
-				if err := truncation.announce(stderr, page.Truncation); err != nil {
-					return err
+		if jsonOutput && !follow && !walking {
+			return writeJSON(stdout, page)
+		}
+		// Streaming and page walks keep stdout as event lines in JSON mode;
+		// announce retention even when all events have been trimmed.
+		if err := truncation.announce(stderr, page.Truncation); err != nil {
+			return err
+		}
+		if walking && tailSet {
+			for _, event := range page.Events {
+				if len(tailEvents) < tail {
+					tailEvents = append(tailEvents, event)
+				} else {
+					tailEvents[tailNext] = event
+					tailNext = (tailNext + 1) % tail
 				}
-				for _, event := range page.Events {
-					if err := writeJSONLine(stdout, event); err != nil {
-						return err
-					}
-				}
-			} else {
-				return writeJSON(stdout, page)
 			}
-		} else {
-			if err := truncation.announce(stderr, page.Truncation); err != nil {
-				return err
-			}
-			if err := writeLogEvents(stdout, stderr, page.Events); err != nil {
-				return err
-			}
+		} else if err := writeEvents(page.Events); err != nil {
+			return err
 		}
 		cursor = page.NextCursor
-		if !follow {
-			if all && len(page.Events) > 0 && cursor != "" {
+		if walking {
+			if len(page.Events) > 0 && cursor != "" {
 				walkedPages++
 				if walkedPages >= logWalkPageCap {
-					if !jsonOutput {
+					mode := "--all"
+					if tailSet {
+						mode = fmt.Sprintf("--tail %d", tail)
+						if follow {
+							mode += " --follow"
+						}
+					} else if !jsonOutput {
 						if err := separateRunLogStderr(stderr, page); err != nil {
 							return err
 						}
 					}
-					return fmt.Errorf("logs --all stopped after %d pages before the end of the log; resume with --all --cursor %s", logWalkPageCap, cursor)
+					return fmt.Errorf("logs %s stopped after %d pages before the end of the log; resume with %s --cursor %s", mode, logWalkPageCap, mode, cursor)
 				}
 				continue
 			}
-			if !all && len(page.Events) > 0 {
+			if tailSet {
+				if err := writeEvents(tailEvents[tailNext:]); err != nil {
+					return err
+				}
+				if err := writeEvents(tailEvents[:tailNext]); err != nil {
+					return err
+				}
+				tailEvents = nil
+			}
+			walking = false
+			if !follow {
+				return nil
+			}
+		} else if !follow {
+			if len(page.Events) > 0 {
 				return writeRunLogPageNotice(ctx, clients, stderr, runID, page)
 			}
 			return nil
