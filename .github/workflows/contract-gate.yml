@@ -79,7 +79,9 @@ jobs:
       - name: Run SQLite integration suite
         run: |
           echo "M0 placeholder: SQLite queue and ledger code arrives in M1/M2."
-          go test -tags=sqlite_integration ./...
+          # cmd/wefty takes 435-590 s here and hit the 10-minute default
+          # (#1034); a hang still fails here.
+          go test -timeout=20m -tags=sqlite_integration ./...
 
   mac-linux-runner:
     name: mac-linux-runner / ${{ matrix.os }}
@@ -95,9 +97,9 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Run cross-platform runner and contract tests
-        # cmd/wefty takes 380-500 s on hosted macOS runners and once hit the
-        # 10-minute per-package default (#163); a hang still fails here.
-        run: go test -timeout=20m ./...
+        # cmd/wefty takes 950-1125 s on hosted macOS runners and hit 20m
+        # (#163, #1034; growth tracked in #1035); a hang still fails here.
+        run: go test -timeout=30m ./...
 
   service-acceptance:
     name: service-acceptance / ${{ matrix.os }}
