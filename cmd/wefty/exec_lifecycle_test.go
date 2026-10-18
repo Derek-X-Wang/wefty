@@ -222,22 +222,52 @@ func TestExecCleanupFailurePreservesVerdict(t *testing.T) {
 	}
 }
 
-func TestExecRemovesReadOnlyFolders(t *testing.T) {
+func TestExecRemovesLockedFolders(t *testing.T) {
 	stack := newExecStack(t, execTestIdleLimit)
 	t.Chdir(execTestRepo(t))
+	root := os.Getenv("WEFTY_EXEC_STORAGE_ROOT")
+	// Read-only, write-only and no-permission folders, in the work tree and
+	// in the run's TMPDIR, like a test suite that checks delete protection.
+	// A hard link shares its mode with a file outside the run, like a package
+	// store does; unlocking the trash must not make that file executable.
+	shared := filepath.Join(t.TempDir(), "shared")
+	if err := os.WriteFile(shared, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// WriteFile applies the umask; the check below needs the exact mode.
+	if err := os.Chmod(shared, 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if entry != nil && entry.IsDir() {
+				_ = os.Chmod(path, 0700)
+			}
+			return nil
+		})
+	})
 	var errOut bytes.Buffer
-	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "mkdir frozen; touch frozen/file; chmod -R a-w frozen"}, io.Discard, &errOut)
+	lock := `for base in frozen "$TMPDIR/frozen"; do
+  mkdir -p "$base/sealed/inner" "$base/closed" && touch "$base/file" "$base/sealed/inner/file" "$base/closed/file" || exit
+  ln "$1" "$base/closed/shared" || exit
+  chmod 000 "$base/sealed/inner" && chmod 200 "$base/sealed" && chmod 000 "$base/closed" && chmod a-w "$base" || exit
+done`
+	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", lock, "sh", shared}, io.Discard, &errOut)
 	var params execParams
 	_ = json.Unmarshal(stack.requests[0].Params, &params)
-	t.Cleanup(func() {
-		_ = os.Chmod(filepath.Join(params.Storage, "work", "frozen"), 0700)
-		_ = cleanupExecStorage(params.Storage)
-	})
 	if err != nil || strings.Contains(errOut.String(), "cleanup failed") {
-		t.Fatalf("read-only cleanup: %v %q", err, errOut.String())
+		t.Fatalf("locked cleanup: %v %q", err, errOut.String())
 	}
 	if _, err := os.Stat(params.Storage); !os.IsNotExist(err) {
 		t.Fatalf("storage remains: %v", err)
+	}
+	// Retirement renames the storage at once; only an empty root proves the
+	// trash was deleted too.
+	waitExecStorageEmpty(t, root)
+	if info, err := os.Stat(shared); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0644 {
+		t.Fatalf("cleanup changed a file outside the run: %v", info.Mode())
 	}
 }
 
