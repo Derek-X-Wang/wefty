@@ -118,7 +118,10 @@ folder in a throwaway copy, on this machine's installed node. Later edits do
 not change the run. If the checkout changes during capture, exec makes up to
 three fresh attempts with waits of one and two seconds, then refuses with
 retryable `conflict` (exit 5) if edits continue. The command inherits the node's
-environment; the run's `WEFTY_*` variables are removed. No files are returned. The command
+environment, not your shell's: on an installed node that is `HOME`, `PATH` and the
+service manager's defaults, so variables you exported in your shell (for example API
+keys) are not set in the run. Set what the command needs in the command, for example
+`wefty exec -- env NAME=value make test`. The run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
 Each run has its own empty `$TMPDIR`, deleted when the run ends, so caches that tools keep in `$TMPDIR` (for example `bunx`) start cold.
 Inside the run, `git` sees your checkout: HEAD is your base commit and your local changes are uncommitted.

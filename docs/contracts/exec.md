@@ -70,7 +70,8 @@ the CLI names the retained storage path.
 The embedded Bash wrapper clones the independent capture without hard links,
 changes to the same relative folder and runs the argv without `eval`. Only the
 command loses `WEFTY_*`; the wrapper keeps its run mailbox environment. The
-command otherwise inherits the node's environment, except `TMPDIR` (below). While it clones the
+command otherwise inherits the node's environment, except `TMPDIR` (below). That is the
+node service's environment; the caller's shell variables are not forwarded. While it clones the
 snapshot, the wrapper prints `still preparing the snapshot (Nm)` once per
 minute, so the no-output limit measures the command, not the checkout. Once
 the command starts, it prints `still running (Nm)` once per minute. This
