@@ -240,6 +240,40 @@ func TestCancelSettlementDeadlineReopenAndEvidence(t *testing.T) {
 	}
 }
 
+// A lease longer than the cancel deadline outlives settlement. A node that
+// renews after L1 settled the attempt must hear lease_expired, which stops its
+// process at once, not conflict, which it retries until its own deadline.
+func TestCancelSettledRenewalWithLiveLeaseExpires(t *testing.T) {
+	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 2 * time.Minute}, map[string]NodePolicy{
+		"node-1": {Tags: []string{"linux"}, MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: DefaultMaxServiceSlots},
+	})
+	client := h.client(fabric.Identity{NodeID: "submitter", Tags: []string{DefaultClientPrincipalTag}})
+	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
+	node := h.register(agent, "node-1")
+	job := h.submit(client, "cancel-live-lease", []string{"linux"})
+	claim := claimClass(t, h, agent, node, contract.JobClassOneShot)
+	status, _, body := h.do(client, http.MethodPost, "/v1/jobs/"+job.JobID+"/cancel", nil)
+	if status != http.StatusOK {
+		t.Fatalf("cancel=%d %s", status, body)
+	}
+	h.clock.Advance(CancelSettlementTimeout + time.Second)
+	if _, err := h.store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	attempts, err := testReads(h.store).ListJobAttempts(t.Context(), job.JobID)
+	if err != nil || len(attempts) != 1 || attempts[0].State != contract.AttemptLost || !h.clock.Now().Before(claim.Lease.LeaseExpires) {
+		t.Fatalf("want a lost attempt inside its lease=%+v %v", attempts, err)
+	}
+	_, err = h.store.RenewLease(t.Context(), "node-1", job.JobID, claim.Lease.AttemptID, claim.Lease.FencingToken)
+	if errorCode(err) != contract.ErrorLeaseExpired {
+		t.Fatalf("renewal after settlement=%v", err)
+	}
+	done, err := testReads(h.store).GetJob(t.Context(), job.JobID)
+	if err != nil || done.State != contract.JobFailed || done.Outcome != "canceled" {
+		t.Fatalf("renewal changed the settled job=%+v %v", done, err)
+	}
+}
+
 func TestCancelOrderedCompletionExpiryAndChildRaces(t *testing.T) {
 	for _, first := range []string{"cancel", "completion", "expiry", "child"} {
 		t.Run(first, func(t *testing.T) {

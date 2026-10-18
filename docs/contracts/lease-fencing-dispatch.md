@@ -707,6 +707,11 @@ pre-start backoff when requeue is permitted, so a lease-flapping node cannot hot
 terminally. A partitioned node may still be running non-idempotent work, so
 later authority-changing writes receive `lease_expired` or `stale_fence` and
 cannot alter state. Evidence writes follow the provenance-only rules above.
+Once the identity, path and fence checks pass, renewal and completion of an
+attempt L1 already holds as `lost` answer `lease_expired`, even when its lease
+time has not passed: settlement of a canceled one-shot keeps the lease time,
+which can outlast the settlement deadline when the L1 lease is longer than 30
+seconds or the clock steps back (#1045).
 
 Each reconcile pass finds the attempts to expire by their lease deadline, and
 canceled one-shots by their settlement deadline, so it reads only non-terminal
