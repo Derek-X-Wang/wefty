@@ -84,8 +84,12 @@ retire_exec_storage() {
       /bin/rmdir -- "$pending"
       [ ! -L "$marker" ] && [ -d "$marker/$$" ] || exit 1
       # Do not release from a signal trap: a child may still be deleting.
+      # A command can leave a folder its owner cannot read or enter. Open
+      # each folder before it is read, and delete even when chmod reports
+      # an error, so one odd entry cannot keep the whole copy (#1040).
       if [ -d "$trash" ] && [ ! -L "$trash" ]; then
-        /bin/chmod -R u+w "$trash" && /bin/rm -rf -- "$trash"
+        /bin/chmod -R u+rwx "$trash"
+        /bin/rm -rf -- "$trash"
       fi
       /bin/rmdir -- "$marker/$$" && /bin/rmdir -- "$marker"
     ' wefty-exec-delete "$trash" &
