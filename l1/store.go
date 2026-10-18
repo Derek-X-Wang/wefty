@@ -3449,7 +3449,10 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	if err != nil {
 		return AttemptLease{}, err
 	}
-	if attempt.state == contract.AttemptLost && !now.Before(attempt.leaseExpires) {
+	// Settlement keeps a lost attempt's lease time, so a lease longer than the
+	// cancel deadline can still be running here. The node has lost authority
+	// all the same and must stop at once, as completion tells it (#1045).
+	if attempt.state == contract.AttemptLost {
 		return AttemptLease{}, protocolError(contract.ErrorLeaseExpired, "attempt lease has expired")
 	}
 	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
