@@ -211,6 +211,15 @@ valid only while its Seat lasts. On one Mac it keeps order between the AI agent
 and the owner; it does not prove who acts.
 _Avoid_: Seat pass, Seat token, Attempt credential, take-over bearer
 
+**Seat approval**:
+The owner's yes, in a prompt that wefty shows, to one Seat request and the
+network it names (with or without internet). It lasts as long as that Seat. An
+approval window is a Seat approval that, for a set time, covers every request
+for that network or for none. Nothing an AI agent can run gives a Seat
+approval.
+_Avoid_: grant (a person's take-over right), trust, the harness's approval of a
+command, permission
+
 **Seat limit**:
 The most Seats a Computer holds at once. A Computer with a Seat limit of 1 is
 a dedicated Computer; a higher limit makes it a shared Computer.
