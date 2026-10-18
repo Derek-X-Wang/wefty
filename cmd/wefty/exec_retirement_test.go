@@ -22,6 +22,13 @@ import (
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
+// The delete helper leaves the test's process group, so nothing reaps a
+// blocked hook. A test binary that dies before its cleanup (a go test
+// timeout runs none) must not leave the hook waiting forever (#1042).
+func execReleaseWait(release string) string {
+	return fmt.Sprintf("while [ ! -f %q ] && kill -0 %d 2>/dev/null; do sleep 0.1; done", release, os.Getpid())
+}
+
 // Block the real removal at the shell boundary. Absolute command functions
 // work in both macOS Bash 3.2 and Linux Bash; production still uses /bin/rm.
 func blockExecRemoval(t *testing.T) (observed, release string) {
@@ -32,10 +39,10 @@ func blockExecRemoval(t *testing.T) (observed, release string) {
 	writeExecFile(t, env, fmt.Sprintf(`function /bin/rm() {
   if [ "$1" != -rf ]; then command /bin/rm "$@"; return; fi
   printf '%%s\n' "$*" > %q
-  while [ ! -f %q ]; do sleep 0.1; done
+  %s
   command /bin/rm "$@"
 }
-`, observed, release))
+`, observed, execReleaseWait(release)))
 	t.Setenv("BASH_ENV", env)
 	t.Cleanup(func() { writeExecFile(t, release, "release") })
 	return observed, release
@@ -151,10 +158,10 @@ func TestExecSweepTrashHasOneDeleterAndRecoversKilledOwner(t *testing.T) {
 	writeExecFile(t, env, fmt.Sprintf(`function /bin/rm() {
   if [ "$1" != -rf ]; then command /bin/rm "$@"; return; fi
   printf '%%s\n' "$$" >> %q
-  while [ ! -f %q ]; do sleep 0.1; done
+  %s
   command /bin/rm "$@"
 }
-`, observed, release))
+`, observed, execReleaseWait(release)))
 	t.Setenv("BASH_ENV", env)
 	t.Cleanup(func() { writeExecFile(t, release, "release") })
 	trash := filepath.Join(os.Getenv("WEFTY_EXEC_STORAGE_ROOT"), ".wefty-trash-in-flight")
