@@ -420,7 +420,8 @@ Commands:
   Output distinguishes created/replayed. Mutable references hash by name:
   pushing a new reg/app:latest still replays the old run. Pin images by digest
   (reg/app@sha256:...) or use --again; pin Workflow versions or use --again too.
-  logs RUN_ID [--follow]     Read or follow run logs
+  logs RUN_ID [--all | [--tail N] [--follow]]
+                             Read or follow run logs
   cancel JOB_ID|RUN_ID [--include-script]
                              Cancel a run or one-shot job
   wait RUN_ID [--timeout D] [--include-script]
