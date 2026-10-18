@@ -229,9 +229,13 @@ func TestExecRemovesLockedFolders(t *testing.T) {
 	// Read-only, write-only and no-permission folders, in the work tree and
 	// in the run's TMPDIR, like a test suite that checks delete protection.
 	// A hard link shares its mode with a file outside the run, like a package
-	// store does; unlocking the trash must not change that file.
+	// store does; unlocking the trash must not make that file executable.
 	shared := filepath.Join(t.TempDir(), "shared")
 	if err := os.WriteFile(shared, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// WriteFile applies the umask; the check below needs the exact mode.
+	if err := os.Chmod(shared, 0644); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -243,12 +247,12 @@ func TestExecRemovesLockedFolders(t *testing.T) {
 		})
 	})
 	var errOut bytes.Buffer
-	lock := fmt.Sprintf(`for base in frozen "$TMPDIR/frozen"; do
+	lock := `for base in frozen "$TMPDIR/frozen"; do
   mkdir -p "$base/sealed/inner" "$base/closed" && touch "$base/file" "$base/sealed/inner/file" "$base/closed/file" || exit
-  ln %q "$base/closed/shared" || exit
+  ln "$1" "$base/closed/shared" || exit
   chmod 000 "$base/sealed/inner" && chmod 200 "$base/sealed" && chmod 000 "$base/closed" && chmod a-w "$base" || exit
-done`, shared)
-	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", lock}, io.Discard, &errOut)
+done`
+	err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", lock, "sh", shared}, io.Discard, &errOut)
 	var params execParams
 	_ = json.Unmarshal(stack.requests[0].Params, &params)
 	if err != nil || strings.Contains(errOut.String(), "cleanup failed") {

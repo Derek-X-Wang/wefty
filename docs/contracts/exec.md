@@ -159,8 +159,10 @@ prefix `wefty-exec-`. A detached Bash helper runs `chmod -R u+rwX` and then
 `rm -rf` on trash, with no total time limit. This includes read-only generated
 directories and directories the command left without read or search
 permission; `rm -rf` runs even when `chmod` reports an error. Capital `X`
-adds execute only to directories, so a hard link in trash never makes a file
-outside the run executable.
+adds execute only to directories and to files that already have an execute
+bit, so a hard link in trash never makes a plain file outside the run
+executable. Like the earlier `u+w`, it can still add owner read and write to
+such a file.
 Bash job control gives the helper its own process group on macOS and Linux;
 it ignores HUP and closes stdin, stdout and stderr. Thus it neither holds the
 run's output open nor belongs to the process group the node reaps at attempt

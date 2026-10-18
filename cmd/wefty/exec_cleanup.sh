@@ -87,8 +87,8 @@ retire_exec_storage() {
       # A command can leave a folder its owner cannot read or enter. Open
       # each folder before it is read, and delete even when chmod reports
       # an error, so one odd entry cannot keep the whole copy (#1040).
-      # X adds search only to folders: a hard link shares its mode with a
-      # file outside the run, such as a package store entry.
+      # X adds search to folders but not to plain files: a hard link shares
+      # its mode with a file outside the run, such as a package store entry.
       if [ -d "$trash" ] && [ ! -L "$trash" ]; then
         /bin/chmod -R u+rwX "$trash"
         /bin/rm -rf -- "$trash"
