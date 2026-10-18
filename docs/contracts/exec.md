@@ -155,10 +155,12 @@ its name has a safe suffix, it is a symlink, and its target is that capture's
 prints `wefty: warning: could not remove the temp link of <storage>` and never
 changes the command's result. They then atomically rename a finished capture before removing
 its contents. Trash names start with `.wefty-trash-`, never the live capture
-prefix `wefty-exec-`. A detached Bash helper runs `chmod -R u+rwx` and then
+prefix `wefty-exec-`. A detached Bash helper runs `chmod -R u+rwX` and then
 `rm -rf` on trash, with no total time limit. This includes read-only generated
 directories and directories the command left without read or search
-permission; `rm -rf` runs even when `chmod` reports an error.
+permission; `rm -rf` runs even when `chmod` reports an error. Capital `X`
+adds execute only to directories, so a hard link in trash never makes a file
+outside the run executable.
 Bash job control gives the helper its own process group on macOS and Linux;
 it ignores HUP and closes stdin, stdout and stderr. Thus it neither holds the
 run's output open nor belongs to the process group the node reaps at attempt
