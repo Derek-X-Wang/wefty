@@ -105,7 +105,11 @@ func newExecStack(t *testing.T, idle time.Duration) *execStack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n, err := agent.New(agent.Config{Fabric: node, ControlPlaneAddress: l3.DefaultL1Address, NodeID: "node-cli", BootSessionID: "boot-cli", Version: "exec-test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true}, HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 20 * time.Millisecond, LogFlushInterval: 5 * time.Millisecond, LogRetryInterval: 5 * time.Millisecond, LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: root, HandoffRoot: t.TempDir(), WorkloadRuntimes: map[string]agent.WorkloadRuntime{"process": processrunner.NewAdapter(processrunner.New(processrunner.Config{IdleTimeout: idle, TerminationGraceTime: 100 * time.Millisecond}))}})
+	// Exec tests check exec, not admission; agent tests cover that. On a
+	// loaded runner, load admission held a second run until a live first run
+	// ended, up to its whole length (#1044). Zero turns it off.
+	noLoadAdmission := 0.0
+	n, err := agent.New(agent.Config{Fabric: node, ControlPlaneAddress: l3.DefaultL1Address, NodeID: "node-cli", BootSessionID: "boot-cli", Version: "exec-test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true}, OneshotLoadLimit: &noLoadAdmission, HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 20 * time.Millisecond, LogFlushInterval: 5 * time.Millisecond, LogRetryInterval: 5 * time.Millisecond, LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: root, HandoffRoot: t.TempDir(), WorkloadRuntimes: map[string]agent.WorkloadRuntime{"process": processrunner.NewAdapter(processrunner.New(processrunner.Config{IdleTimeout: idle, TerminationGraceTime: 100 * time.Millisecond}))}})
 	if err != nil {
 		cancel()
 		t.Fatal(err)
