@@ -61,9 +61,9 @@ non-retryable answers and caller cancellation return at once, including
 during the backoff. Wait and follow loops that already retry such answers at
 their own interval (#763) skip this one-shot retry, so their cadence is
 unchanged. Most `--all` page walks are one-shot reads and may make up to three
-extra requests per page. Run and service log `--all` walks instead retry at
-`--poll-interval`, with at most 30 consecutive retries before returning the
-last answer.
+extra requests per page. Run log `--tail` walks and run and service log
+`--all` walks instead retry at `--poll-interval`, with at most 30
+consecutive retries before returning the last answer.
 
 ## Run log paging
 
@@ -87,7 +87,18 @@ The cap does not add a paging notice that suggests `use --all`.
 `--all --json` writes one event per line, matching `--follow --json` and
 `services logs --all --json`. Truncation notices stay on stderr. `--all` with
 `--follow` is a usage error (exit 2). `--poll-interval` controls follow and
-retry polling. No new exit code is introduced.
+retry polling.
+
+`--tail N` requires N > 0 and cannot be combined with `--all` (usage errors,
+exit 2). It walks from the start or `--cursor` using the same `--limit`,
+retry bound, and page cap as `--all`, but buffers only the last N events and
+prints them once after the walk. At the cap it fails with exit 1 and names
+`--tail N --cursor CURSOR` to resume (with `--follow` when it was given); a
+resumed walk sees only the events after that cursor, so it prints fewer than
+N when fewer remain. `--tail N --follow` prints that suffix,
+then continues with the existing follow loop from the walk's final cursor.
+`--tail N --json` writes the same event lines as `--all --json`; retention
+notices stay on stderr. No new exit code is introduced.
 
 ## JSON flags and errors
 

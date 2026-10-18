@@ -362,6 +362,7 @@ wefty --json runs list                    # the most recent runs, newest first
 wefty --json runs list --status running   # just what is in flight
 wefty logs <run_id> --follow              # live tail (poll-based)
 wefty logs <run_id> --all                 # a finished run's full retained log
+wefty logs <run_id> --tail 50             # the end of a run's log
 wefty rerun <run_id>                      # first call creates; identical retries replay
 wefty rerun <run_id> --again              # deliberately repeat the stored snapshot
 ```
@@ -375,6 +376,9 @@ the table forms are for people and their columns are not a contract.
 A plain `wefty logs RUN_ID` prints one page. When more events exist, or the
 run is still active, stderr says so and names the `--cursor` to continue.
 Use `--all` for a finished run's full log; it cannot be combined with `--follow`.
+Use `--tail N` (N > 0) for the last N retained events, starting from `--cursor`
+when given; it walks pages with the same cap as `--all`, cannot be combined
+with `--all`, and accepts `--follow` to continue from the end of the walk.
 
 Logs are not kept forever: L1 keeps a one-shot run's logs for 30 days and
 32 MiB, and all jobs' logs under a 5 GB total, deleting the oldest first. A
