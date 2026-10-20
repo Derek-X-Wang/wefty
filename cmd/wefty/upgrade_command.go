@@ -54,45 +54,55 @@ const (
 // These machine operations extend setupHost, rather than adding public flags.
 // Tests use a local bare repository, a fake build, runner and clock.
 type upgradeHost struct {
-	remote  string
-	build   func(context.Context, string, string, string, string) error
-	command func(context.Context, string, []string, string, ...string) ([]byte, error)
-	observe func(context.Context, connprofile.Profile) (l1.Node, error)
-	now     func() time.Time
-	wait    func(context.Context, time.Duration) error
+	remote         string
+	build          func(context.Context, string, string, string, string) error
+	command        func(context.Context, string, []string, string, ...string) ([]byte, error)
+	observe        func(context.Context, connprofile.Profile) (l1.Node, error)
+	setClaims      func(context.Context, connprofile.Profile, l1.NodeIntentRequest) (l1.Node, error)
+	readNode       func(context.Context, connprofile.Profile) (l1.Node, error)
+	readJob        func(context.Context, connprofile.Profile, string) (l1.Job, error)
+	restartService func(context.Context, connprofile.Profile, string, string) (l1.Job, error)
+	now            func() time.Time
+	wait           func(context.Context, time.Duration) error
 }
 
 type upgradeReport struct {
-	Version      string                 `json:"version"`
-	LeaseRenewal time.Duration          `json:"lease_renewal_ns"`
-	Setup        setupReport            `json:"setup"`
-	RunningWork  []l1.NodeActiveAttempt `json:"running_work"`
-	AlreadyAt    bool                   `json:"already_at"`
+	Version           string                 `json:"version"`
+	LeaseRenewal      time.Duration          `json:"lease_renewal_ns"`
+	Setup             setupReport            `json:"setup"`
+	RunningWork       []l1.NodeActiveAttempt `json:"running_work"`
+	AlreadyAt         bool                   `json:"already_at"`
+	RestartedServices []string               `json:"restarted_services,omitempty"`
+	ClaimsDisabled    bool                   `json:"claims_remain_disabled,omitempty"`
 }
 
 func executeUpgrade(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	yes := flags.Bool("yes", false, "replace the node agent even when work is running; one-shot attempts end")
+	drainTimeout := flags.Duration("drain-timeout", upgradeDrainTimeout, "wait at most this long for one-shot attempts to finish")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
-		return usageError("usage: wefty upgrade [--yes]")
+		return usageError("usage: wefty upgrade [--yes] [--drain-timeout DURATION]")
+	}
+	if *drainTimeout < upgradeDrainMinimum {
+		return usageError("--drain-timeout must be at least 10s")
 	}
 	host, err := realSetupHost()
 	if err != nil {
 		return err
 	}
-	return executeUpgradeWithHost(ctx, host, options, *yes, stdout, stderr)
+	return executeUpgradeWithHost(ctx, host, options, *yes, stdout, stderr, *drainTimeout)
 }
 
-func executeUpgradeWithHost(ctx context.Context, host setupHost, options globalOptions, yes bool, stdout, stderr io.Writer) error {
+func executeUpgradeWithHost(ctx context.Context, host setupHost, options globalOptions, yes bool, stdout, stderr io.Writer, drainTimeout ...time.Duration) error {
 	warnings := stderr
 	if options.jsonOutput {
 		warnings = io.Discard
 	}
-	report, err := runUpgrade(ctx, host, yes, warnings)
+	report, err := runUpgrade(ctx, host, yes, warnings, drainTimeout...)
 	if options.jsonOutput {
 		if writeErr := writeJSON(stdout, report); writeErr != nil {
 			return errors.Join(err, writeErr)
@@ -105,7 +115,10 @@ func executeUpgradeWithHost(ctx context.Context, host setupHost, options globalO
 	if report.AlreadyAt {
 		return nil
 	}
-	nodeMessage := "Node agent replaced; one-shot attempts ended and services come back."
+	nodeMessage := "Node agent replaced; services come back."
+	if report.ClaimsDisabled {
+		nodeMessage = "Node agent replaced; claims remain disabled; service restart requests wait for the operator to enable claims."
+	}
 	for _, service := range report.Setup.Services {
 		if service.Label == setupNodeAgentLabel && service.Action == launchagent.Unchanged {
 			nodeMessage = "Node agent unchanged."
@@ -140,6 +153,18 @@ func upgradeOperations(host setupHost) upgradeHost {
 	}
 	if operations.observe == nil {
 		operations.observe = observeUpgradeNode
+	}
+	if operations.setClaims == nil {
+		operations.setClaims = setUpgradeClaims
+	}
+	if operations.readNode == nil {
+		operations.readNode = readUpgradeIntent
+	}
+	if operations.readJob == nil {
+		operations.readJob = observeUpgradeJob
+	}
+	if operations.restartService == nil {
+		operations.restartService = restartUpgradeService
 	}
 	if operations.now == nil {
 		operations.now = time.Now
@@ -190,7 +215,7 @@ func runUpgradeCommand(ctx context.Context, directory string, environment []stri
 	return output, nil
 }
 
-func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Writer) (result upgradeReport, resultErr error) {
+func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Writer, drainTimeout ...time.Duration) (result upgradeReport, resultErr error) {
 	if host.euid == 0 {
 		return upgradeReport{}, errors.New("wefty upgrade must run as the owner, never as root")
 	}
@@ -236,6 +261,10 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if profile.Fabric != "plain" || config.ControlSocket != "" || config.NodeID != profile.Identities.Node {
 		return upgradeReport{}, errors.New("upgrade requires setup's plain-process node and matching connection profile")
 	}
+	operations := upgradeOperations(host)
+	if err := recoverUpgradeDrain(ctx, operations, paths, profile, warnings); err != nil {
+		return result, err
+	}
 	plist, err := os.ReadFile(filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist"))
 	if err != nil {
 		return upgradeReport{}, err
@@ -244,7 +273,16 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if err != nil {
 		return upgradeReport{}, err
 	}
-	operations := upgradeOperations(host)
+	var drain *upgradeDrainReceipt
+	defer func() {
+		if drain != nil {
+			if err := finishUpgradeDrain(ctx, operations, paths, profile, drain, false, warnings); err != nil {
+				resultErr = &upgradeCleanupError{primary: resultErr, restore: err}
+			}
+			result.RestartedServices = slices.Clone(drain.restarted)
+			result.ClaimsDisabled = drain.claimsDisabled
+		}
+	}()
 	// Refuse linked work folders, even links to another folder inside home.
 	for _, path := range []string{paths.data, filepath.Join(paths.data, upgradeSourceName)} {
 		if info, err := os.Lstat(path); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
@@ -311,9 +349,6 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return result, upgradeObservationError(ctx, host, err)
 	}
 	result = upgradeReport{Version: commit, RunningWork: slices.Clone(baseline.ActiveAttempts)}
-	if err := checkUpgradeWork(baseline, yes, warnings); err != nil {
-		return result, err
-	}
 	var before []string
 	var saved []setupFile
 	activated := false
@@ -335,14 +370,22 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		}
 	}
 	request.beforeWrites = func() error {
-		// Repeat immediately before activation: work may have arrived during the
-		// shell capture or file preparation. No service or installed file changed.
+		// Setup has validated all destinations and captured the login shell.
+		// Only now close admission; build/preflight failures never drain.
 		current, err := operations.observe(ctx, profile)
 		if err != nil {
 			return upgradeObservationError(ctx, host, err)
 		}
-		report.RunningWork = slices.Clone(current.ActiveAttempts)
-		if err := checkUpgradeWork(current, yes, warnings); err != nil {
+		bound := upgradeDrainTimeout
+		if len(drainTimeout) > 0 {
+			bound = drainTimeout[0]
+		}
+		drain, err = beginUpgradeDrain(ctx, operations, paths, profile, current, bound)
+		if err != nil {
+			return err
+		}
+		current, err = waitUpgradeDrain(ctx, operations, profile, drain, yes, bound, warnings, &report.RunningWork)
+		if err != nil {
 			return err
 		}
 		baseline = current
@@ -371,6 +414,32 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		nodeStageBegan = true
 		return ctx
 	}
+	request.beforeService = func(index int) error {
+		if index != 2 {
+			return nil
+		}
+		current, err := operations.observe(ctx, profile)
+		if err != nil {
+			return err
+		}
+		if err := checkUpgradeReplacement(current, drain, yes); err != nil {
+			return err
+		}
+		drain.OldBoot = current.BootSessionID
+		for _, attempt := range current.ActiveAttempts {
+			if attempt.Class == contract.JobClassService {
+				drain.Services = append(drain.Services, attempt)
+			} else if yes {
+				if _, err := fmt.Fprintf(warnings, "Ending one-shot job %s attempt %s (--yes).\n", attempt.JobID, attempt.AttemptID); err != nil {
+					return err
+				}
+				if !slices.ContainsFunc(report.RunningWork, func(old l1.NodeActiveAttempt) bool { return old.AttemptID == attempt.AttemptID }) {
+					report.RunningWork = append(report.RunningWork, attempt)
+				}
+			}
+		}
+		return writeUpgradeDrain(paths.config, drain)
+	}
 	request.afterService = func(index int, action launchagent.Action) error {
 		if index == 1 {
 			controlsRestarted = operations.now()
@@ -386,7 +455,10 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		if index == 2 {
 			// Bootstrapping is not health. Require the replacement node agent to
 			// register a new boot and heartbeat; the CLI also probes the run ledger.
-			return waitUpgradeReplacement(ctx, operations, profile, baseline.BootSessionID, commit, action)
+			if err := waitUpgradeReplacement(ctx, operations, profile, baseline.BootSessionID, commit, action); err != nil {
+				return err
+			}
+			return nil
 		}
 		return nil
 	}
@@ -434,24 +506,6 @@ func upgradeObservationError(ctx context.Context, host setupHost, cause error) e
 		return fmt.Errorf("L1 is down; run ~/.local/bin/wefty setup to start it: %w", cause)
 	}
 	return fmt.Errorf("cannot list running work; check L1; if L1 is down, run ~/.local/bin/wefty setup to start it: %w", cause)
-}
-
-func checkUpgradeWork(node l1.Node, yes bool, writer io.Writer) error {
-	if len(node.ActiveAttempts) == 0 {
-		return nil
-	}
-	if _, err := fmt.Fprintln(writer, "Running work on node", node.NodeID+":"); err != nil {
-		return err
-	}
-	for _, attempt := range node.ActiveAttempts {
-		if _, err := fmt.Fprintf(writer, "  job %s attempt %s (%s, %s)\n", attempt.JobID, attempt.AttemptID, attempt.Class, attempt.State); err != nil {
-			return err
-		}
-	}
-	if !yes {
-		return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "upgrade stopped with running work; rerun with --yes to end this node's one-shot attempts and restart services"}}
-	}
-	return nil
 }
 
 func fetchUpgradeSource(ctx context.Context, operations upgradeHost, paths setupPaths, source, loginPATH string, warnings ...io.Writer) (string, error) {

@@ -359,7 +359,11 @@ is session liveness, not operator intent: it leaves `claims_enabled` and every
 infrastructure interruption. Under `always` or `on-failure`, desired `running`
 projects back to `queued` with an unchanged restart streak. Under `never`, a
 post-start interruption remains `failed`, unless an explicit restart targets
-that attempt. Neither reaction fabricates operator stop intent or a policy stop.
+that attempt. Planned `wefty upgrade` replacement uses that existing explicit
+restart path for each previously active, still-desired running service,
+including `never`, after replacement health. The CLI retains its restart keys
+in the upgrade receipt for recovery; ordinary infrastructure failure semantics
+are unchanged. Neither reaction fabricates operator stop intent or a policy stop.
 
 Lease renewal continues after the subprocess exits while redacted output is
 flushed, durable logs are acknowledged, and the idempotent completion request
@@ -674,6 +678,18 @@ stale, draining, or dead, so an operator can forbid work before a dead node
 rejoins. A first registration is claims-enabled only when its stable node ID is
 present in operator-owned node policy; an unexpected node is registered and
 visible with claims disabled.
+
+`wefty upgrade` uses this same gate after successful build and state preflight,
+with a unique `wefty upgrade ... drain_deadline=TIMESTAMP` intent reason and a durable local receipt of
+the revision it owns. It re-reads claimed and running attempts after the CAS,
+waits only for one-shots, and leaves services running during the drain. It
+restores only its exact disabled revision after replacement health or on
+failure; pre-existing disables and newer operator intent survive. Lost
+disable replies are fenced at the original revision and re-read before receipt
+deletion. After control-plane renewal, upgrade rechecks that the disable still
+matches and no unauthorized one-shot is active before replacing the node.
+Interrupted receipt recovery runs first on the next upgrade. See
+[`plain-node-upgrade.md`](plain-node-upgrade.md) for deadlines and recovery.
 
 ## Lease expiry and fencing errors
 

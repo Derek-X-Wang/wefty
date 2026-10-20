@@ -108,6 +108,21 @@ func newUpgradeFixture(t *testing.T) *upgradeFixture {
 			return nil
 		},
 	}
+	f.operations.setClaims = func(ctx context.Context, p connprofile.Profile, request l1.NodeIntentRequest) (l1.Node, error) {
+		if ctx.Err() != nil {
+			return l1.Node{}, ctx.Err()
+		}
+		if !request.ClaimsEnabled && (!slices.Contains(f.events, "preflight:wefty-l1") || !slices.Contains(f.events, "preflight:wefty-l3")) {
+			t.Fatal("claims disabled before successful build/version/state preflight")
+		}
+		if request.IntentRevision != f.node.IntentRevision {
+			return l1.Node{}, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorStaleIntentRevision, Message: "intent changed"}}
+		}
+		f.node.ClaimsEnabled = request.ClaimsEnabled
+		f.node.IntentRevision++
+		f.node.IntentReason = request.Reason
+		return f.node, nil
+	}
 	f.operations.command = func(ctx context.Context, directory string, environment []string, name string, args ...string) ([]byte, error) {
 		if slices.Contains(args, "fetch") && f.failure == "fetch" {
 			return nil, errors.New("injected fetch failure")
@@ -167,6 +182,7 @@ func newUpgradeFixture(t *testing.T) *upgradeFixture {
 		}
 		return node, nil
 	}
+	f.operations.readNode = func(ctx context.Context, p connprofile.Profile) (l1.Node, error) { return f.operations.observe(ctx, p) }
 	f.host.upgrade = f.operations
 	f.host.launchctl = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		if args[0] == "bootstrap" {
@@ -312,6 +328,10 @@ func TestUpgradePreparationFailuresPreserveInstall(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			f := newUpgradeFixture(t)
 			f.failure = failure
+			f.operations.setClaims = func(context.Context, connprofile.Profile, l1.NodeIntentRequest) (l1.Node, error) {
+				t.Fatal("preparation failure mutated intent")
+				return l1.Node{}, nil
+			}
 			before := installedUpgradeFiles(t, f)
 			if failure == "snapshot" {
 				paths, _ := resolveSetupPaths(f.home)
@@ -334,42 +354,6 @@ func TestUpgradePreparationFailuresPreserveInstall(t *testing.T) {
 				if !f.launchd.loaded[label] {
 					t.Fatalf("old service stopped: %s", label)
 				}
-			}
-			assertNoUpgradeStage(t, f)
-		})
-	}
-}
-
-func TestUpgradeRunningWorkRequiresYes(t *testing.T) {
-	for _, late := range []bool{false, true} {
-		t.Run(fmt.Sprint(late), func(t *testing.T) {
-			f := newUpgradeFixture(t)
-			running := l1.NodeActiveAttempt{JobID: "long-job", AttemptID: "long-attempt", Class: contract.JobClassOneShot, State: contract.AttemptRunning, LeaseExpiresAt: f.now.Add(30 * time.Second)}
-			if late {
-				original := f.operations.observe
-				f.operations.observe = func(ctx context.Context, p connprofile.Profile) (l1.Node, error) {
-					node, err := original(ctx, p)
-					if f.observeCalls >= 2 && !f.restarted {
-						f.node.ActiveAttempts = []l1.NodeActiveAttempt{running}
-						node.ActiveAttempts = []l1.NodeActiveAttempt{running}
-					}
-					return node, err
-				}
-			} else {
-				f.node.ActiveAttempts = []l1.NodeActiveAttempt{running}
-			}
-			before := installedUpgradeFiles(t, f)
-			var output bytes.Buffer
-			_, err := runUpgrade(t.Context(), f.host, false, &output)
-			if err == nil || commandExitCode(err) != exitConflict || !strings.Contains(output.String(), "long-job") || !strings.Contains(err.Error(), "--yes") {
-				t.Fatalf("running work refusal: %v %s", err, output.String())
-			}
-			if !reflect.DeepEqual(before, installedUpgradeFiles(t, f)) || len(f.launchd.mutating()) != 0 {
-				t.Fatal("running work refusal mutated install")
-			}
-			_, err = runUpgrade(t.Context(), f.host, true, &output)
-			if err != nil {
-				t.Fatalf("--yes did not authorize replacement: %v", err)
 			}
 			assertNoUpgradeStage(t, f)
 		})

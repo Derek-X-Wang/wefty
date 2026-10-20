@@ -276,10 +276,29 @@ JSON adds `busy` and, when known, `waiting_runs`. Free slots and per-kind
 limitations still report immediate capacity. `accepts_oneshot` keeps its meaning
 of immediate eligibility, including a free slot.
 
+An active `wefty upgrade` drain is also busy with exit 0 when its disabled
+admission is the only obstacle on an otherwise eligible alive node. Text and
+JSON `busy` say `busy, queued: upgrading; new runs wait and start when it ends`.
+Node JSON adds `upgrading`; immediate `accepts_oneshot` stays false and capacity
+stays zero for that node. Submit and wait as for occupied slots. An unresolved
+local upgrade receipt after its installation lock is released adds
+`upgrade_recovery`, naming `wefty upgrade`. A matching disabled intent says
+`claims disabled by an interrupted upgrade` and keeps exit 12 when it leaves
+no eligible node; node JSON adds `upgrade_interrupted`.
+
+A local receipt plus the held installation lock also covers upgrade restarts:
+unreachable L1/L3 returns exit 0 with `busy: upgrading; retry in a few seconds`,
+and the old node boot in `draining` gets the busy/queued answer. Status observes
+the lock without acquiring it. With no readable receipt, an upgrade reason
+carrying `drain_deadline` stays busy until that deadline plus 30 minutes.
+Legacy reasons without a deadline instead use 35 minutes from
+`intent_updated_at`. An expired or invalid deadline, or an old or undated
+legacy reason, names an interrupted upgrade and its recovery command.
+
 Exit 12 remains for unreachable control services, no registered or alive node,
-claims disabled on every alive node, no executable kind on an alive claiming
+operator claims disabled on every alive node, no executable kind on an alive claiming
 node, or no one-shot slots configured on any such node. Zero configured slots
-cannot move the line and keep the `no_free_slot` reason. Draining nodes keep
+cannot move the line and keep the `no_free_slot` reason. Other draining nodes keep
 their existing not-ready advice.
 
 For the installed local node, the `this machine` row adds `load L; limit M`.

@@ -36,7 +36,7 @@ exit code is the answer:
 
 | Exit | Meaning |
 | --- | --- |
-| 0 | `ready` — submit. A `busy:` line means the run waits in line. |
+| 0 | `ready` — submit. A `busy:` or `busy, queued:` line means the run waits in line. |
 | 12 | `not ready: <what is missing>` — read the line; it names the thing to fix |
 | 2 | you passed something wrong |
 
@@ -56,6 +56,28 @@ log that choice in its daily-use log. Busy is healthy and keeps exit 0:
 ready
 busy: all one-shot slots in use; N runs waiting; a new run waits in line
 ```
+
+During an active upgrade drain, status also exits 0 and says:
+
+```text
+busy, queued: upgrading; new runs wait and start when it ends
+```
+
+Submit with `--detach` and wait. Resident one-shots finish while services keep
+running; new runs wait for upgrade completion. Do not treat this busy answer as
+a request to repair the cluster. During the brief control-plane restart, status
+may instead exit 0 with `busy: upgrading; retry in a few seconds`. Retry status
+after a few seconds before submitting if the control services are unreachable.
+The old node boot in `draining` during replacement also keeps the busy/queued
+answer. A local interrupted upgrade instead names
+`claims disabled by an interrupted upgrade` and `wefty upgrade` as recovery.
+Report that advice to the owner; running upgrades remains an owner action.
+Other operator disables keep their existing not-ready answer.
+Without a readable receipt, an upgrade intent stays busy until its
+`drain_deadline` plus 30 minutes, including for a long configured drain. Only
+legacy reasons without a deadline use the 35-minute age limit. An expired or
+invalid deadline, or an old or undated legacy reason, names an interrupted
+upgrade instead of staying busy.
 
 The waiting count is omitted when the bounded read cannot count all queued runs.
 The `this machine` row shows the local one-minute load and its limit. With a

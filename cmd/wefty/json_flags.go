@@ -11,7 +11,7 @@ import (
 // Keep this vocabulary in sync with command registrations (including authoring
 // and platform-specific commands); TestJSONValueFlagVocabulary checks it.
 const jsonValueFlags = `agent-path allowed-mount-root argv auth-key backup-cap cap
-capability claims-enabled class control-url cpu-millicores cursor dir disk-bytes
+capability claims-enabled class control-url cpu-millicores cursor dir disk-bytes drain-timeout
 envelope-schema envelope-schema-file evidence-file fabric fabric-id fabric-name
 file follow-for from helper-checksum idempotency-key image install-manifest instance-key
 intent-file intent-revision interpreter key kind l1 l3 lang limit manifest

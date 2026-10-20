@@ -290,7 +290,7 @@ func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveRepor
 		}
 		for _, entry := range entries {
 			name := entry.Name()
-			ownFile := folder == paths.dataRel && slices.Contains([]string{"l1.sqlite", "l1.sqlite-wal", "l1.sqlite-shm", "l1.sqlite-journal", "l3.sqlite", "l3.sqlite-wal", "l3.sqlite-shm", "l3.sqlite-journal"}, name) ||
+			ownFile := folder == paths.dataRel && slices.Contains([]string{setupLockProbeFile, "l1.sqlite", "l1.sqlite-wal", "l1.sqlite-shm", "l1.sqlite-journal", "l3.sqlite", "l3.sqlite-wal", "l3.sqlite-shm", "l3.sqlite-journal"}, name) ||
 				folder == paths.logsRel && slices.Contains([]string{"l1.log", "l3.log", "node-agent.log"}, name)
 			ownFolder := folder == paths.dataRel && (name == "node-agent" || name == upgradeSourceName && manifest.Version == 1 && manifest.UpgradeSource) && entry.IsDir()
 			rel := filepath.Join(folder, name)

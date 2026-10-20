@@ -46,7 +46,8 @@ to stderr. CLI usage errors retain the existing exit convention.
 absence through the shared LaunchAgent manager, and removes their plists,
 the four installed binaries, the profile, `node.json` and both skill copies.
 It keeps data and logs. `wefty setup --remove --purge` deletes only
-`l1.sqlite`, `l3.sqlite`, their `-wal`, `-shm`, and `-journal` sidecars, and the `node-agent/` folder under the standard
+`l1.sqlite`, `l3.sqlite`, their `-wal`, `-shm`, and `-journal` sidecars, the
+`.setup-lock` companion used for non-acquiring status queries, and the `node-agent/` folder under the standard
 `~/Library/Application Support/wefty` folder, and setup's `l1.log`, `l3.log`
 and `node-agent.log` files under `~/Library/Logs/wefty`. Every other entry
 remains, with a warning that names it. This includes database backups, `agent/`, and `capability/`
