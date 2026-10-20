@@ -24,7 +24,7 @@ jobs:
       PROTO_CONTAINERD_SOCK: /run/wefty-containerd/containerd.sock
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
       - name: Install pinned rootful containerd and runc
