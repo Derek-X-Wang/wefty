@@ -290,6 +290,12 @@ func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveRepor
 		}
 		for _, entry := range entries {
 			name := entry.Name()
+			if folder == paths.dataRel && name == "fabric" && entry.IsDir() {
+				if err := purgeSetupParticipants(root, paths, report); err != nil {
+					return err
+				}
+				continue
+			}
 			ownFile := folder == paths.dataRel && slices.Contains([]string{setupLockProbeFile, "l1.sqlite", "l1.sqlite-wal", "l1.sqlite-shm", "l1.sqlite-journal", "l3.sqlite", "l3.sqlite-wal", "l3.sqlite-shm", "l3.sqlite-journal"}, name) ||
 				folder == paths.logsRel && slices.Contains([]string{"l1.log", "l3.log", "node-agent.log"}, name)
 			ownFolder := folder == paths.dataRel && (name == "node-agent" || name == upgradeSourceName && manifest.Version == 1 && manifest.UpgradeSource) && entry.IsDir()
@@ -311,6 +317,30 @@ func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveRepor
 				report.Changes = append(report.Changes, filepath.Join(paths.home, folder))
 			}
 		}
+	}
+	return nil
+}
+
+func purgeSetupParticipants(root *os.Root, paths setupPaths, report *setupRemoveReport) error {
+	folder := filepath.Join(paths.dataRel, "fabric")
+	entries, err := fs.ReadDir(root.FS(), folder)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		rel := filepath.Join(folder, entry.Name())
+		_, _, known := setupParticipantPolicy(entry.Name())
+		if !known || !entry.IsDir() {
+			report.Warnings = append(report.Warnings, "left "+filepath.Join(paths.home, rel)+": this is not an enrolled participant folder; inspect it before removing it yourself")
+			continue
+		}
+		if err := root.RemoveAll(rel); err != nil {
+			return err
+		}
+		report.Changes = append(report.Changes, filepath.Join(paths.home, rel))
+	}
+	if err := root.Remove(folder); err == nil {
+		report.Changes = append(report.Changes, filepath.Join(paths.home, folder))
 	}
 	return nil
 }

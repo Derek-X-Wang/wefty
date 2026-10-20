@@ -15,6 +15,10 @@ func TestParse(t *testing.T) {
 		{address: "wefty://node/runner-1", wantName: true, want: "wefty://node/runner-1", transport: "node-a28bbc963ccacc17:80"},
 		{address: "wefty://node/", wantName: true, wantErr: true},
 		{address: "wefty://node/Runner_1", wantName: true, want: "wefty://node/Runner_1", transport: "node-cc2e08699ba0f120:80"},
+		{address: "wefty://client/runner-1", wantName: true, want: "wefty://client/runner-1", transport: "client-a28bbc963ccacc17:80"},
+		{address: "wefty://person/runner-1", wantName: true, want: "wefty://person/runner-1", transport: "person-a28bbc963ccacc17:80"},
+		{address: "wefty://client/", wantName: true, wantErr: true},
+		{address: "wefty://person/", wantName: true, wantErr: true},
 		{address: "wefty://other", wantName: true, wantErr: true},
 		{address: "wefty://control-plane:443", wantName: true, wantErr: true},
 	}
