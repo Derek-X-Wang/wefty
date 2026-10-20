@@ -123,6 +123,9 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		}
 	}
 	passErrors = append(passErrors, r.recoverUnrecordedDispatchesRemote(ctx, remote)...)
+	if err := r.store.sweepExecCaptures(ctx); err != nil {
+		passErrors = append(passErrors, err)
+	}
 	return errors.Join(passErrors...)
 }
 

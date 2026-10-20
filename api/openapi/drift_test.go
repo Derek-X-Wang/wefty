@@ -173,6 +173,7 @@ var driftRows = []driftRow{
 	{component(commonDoc, "DispatchHold"), typeOf[contract.DispatchHold]()},
 	{component(l3Doc, "DispatchHealth"), typeOf[l3.DispatchHealth]()},
 	{responseBody(l3Doc, "get", "/v1/health", "200"), typeOf[l3.DispatchHealth]()},
+	{responseBody(l3Doc, "post", "/v1/exec-captures/{sha256}", "201"), typeOf[l3.ExecCaptureReceipt]()},
 	// L3 components.
 	{component(l3Doc, "WorkflowVersionInput"), typeOf[l3.WorkflowVersionInput]()},
 	{component(l3Doc, "ImageProgram"), typeOf[contract.ImageProgram]()},
