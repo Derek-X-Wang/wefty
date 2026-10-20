@@ -10,9 +10,9 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
-	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
@@ -117,6 +117,7 @@ type globalOptions struct {
 	nodeConfigPath     string
 	oneshotLoadLimit   *float64
 	profilePath        string
+	participants       map[string]connprofile.Participant
 	// explicitFlags names the global flags the caller passed, so the
 	// connection profile never overrides one of them.
 	explicitFlags map[string]bool
@@ -169,17 +170,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 	if err := applyConnectionProfile(&options); err != nil {
 		return err
 	}
-	plainIdentity := fabric.Identity{
-		NodeID: options.plainIdentity, UserID: options.plainUserID, DeviceID: options.plainDeviceID,
-		Tags: []string{l3.DefaultCallerPrincipalTag},
-	}
-	if usesPersonProtocol(commandArgs) {
-		plainIdentity.Tags = nil
-		if options.fabricMode == "plain" && (options.plainUserID == "" || options.plainDeviceID == "") {
-			return usageError("plain person commands require DEVELOPMENT ONLY --plain-user-id and --plain-device-id")
-		}
-	}
 	resolveFabricEnvironment(&options)
+	config, err := commandFabricConfig(options, commandArgs)
+	if err != nil {
+		return err
+	}
 	// Written unconditionally: an inherited WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1
 	// must not survive an explicit --fabric-print-enrollment-url=false (wefty
 	// #498). The resolved boolean, not just the true case, always wins.
@@ -188,16 +183,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 	} else {
 		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
-	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
-		Mode:           options.fabricMode,
-		Identity:       plainIdentity,
-		PlainFabricID:  options.plainFabricID,
-		Name:           options.fabricName,
-		StateDirectory: options.stateDirectory,
-		AuthKey:        options.authKey,
-		ControlURL:     options.controlURL,
-		Ephemeral:      options.ephemeral,
-	})
+	participant, closeFabric, err := fabricconfig.Open(config)
 	if err != nil {
 		return err
 	}
@@ -209,15 +195,22 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 	defer clients.close()
 	clients.nodeConfigPath = options.nodeConfigPath
 	clients.oneshotLoadLimit = options.oneshotLoadLimit
+	clients.participantProfile = len(options.participants) != 0
+	if clients.participantProfile {
+		clients.clientIdentityID = config.Identity.NodeID
+		clients.localPersonSignIn = localPersonSignIn(options, time.Now())
+	}
 	return execute(ctx, clients, options.jsonOutput, commandArgs, stdout, stderr)
 }
 
-// resolveFabricEnvironment fills the credential defaults immediately before
+// resolveFabricEnvironment fills coordinator defaults immediately before
 // the fabric is opened. Reading them earlier would mean `wefty run` touched a
 // coordination credential on a path that exists precisely because the caller
 // has none.
 func resolveFabricEnvironment(options *globalOptions) {
-	if options.authKey == "" {
+	// Legacy bootstrap callers capture an explicit credential before New
+	// clears the ambient value. Enrolled participants never consume it.
+	if len(options.participants) == 0 && options.authKey == "" {
 		options.authKey = os.Getenv("TS_AUTHKEY")
 	}
 	if options.controlURL == "" {
@@ -263,13 +256,11 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.plainUserID, "plain-user-id", os.Getenv("WEFTY_DEV_PLAIN_USER_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person user ID")
 	flags.StringVar(&options.plainDeviceID, "plain-device-id", os.Getenv("WEFTY_DEV_PLAIN_DEVICE_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person device ID")
 	flags.StringVar(&options.plainFabricID, "plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain- prefixed Fabric authority")
-	flags.StringVar(&options.fabricName, "fabric-name", "wefty-cli", "tsnet logical node name")
+	flags.StringVar(&options.fabricName, "fabric-name", "wefty-cli", "enrolled tsnet logical node name (must match the selected participant)")
 	flags.StringVar(&options.stateDirectory, "state-dir", "", "tsnet state directory")
-	// These two default from the environment, but the read happens at
-	// resolveFabricEnvironment, after the authoring commands have been
-	// dispatched. `wefty run` reports from inside a job that holds no
-	// credential; it must not so much as look at one on the way.
-	flags.StringVar(&options.authKey, "auth-key", "", "tsnet auth key (default $TS_AUTHKEY)")
+	// The coordinator default is resolved after authoring dispatch. Join
+	// credentials belong only to setup, never an ordinary CLI participant.
+	flags.StringVar(&options.authKey, "auth-key", "", "legacy tsnet join key (default $TS_AUTHKEY); participant enrolment belongs to setup")
 	flags.StringVar(&options.controlURL, "control-url", "", "optional tsnet coordination URL (default $TS_CONTROL_URL)")
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
 	flags.BoolVar(&options.printEnrollmentURL, "fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
@@ -305,6 +296,7 @@ func applyConnectionProfile(options *globalOptions) error {
 	}
 	options.oneshotLoadLimit = &limit
 	settings := profile.CLI()
+	options.participants = profile.Participants
 	layer := connprofile.Layer{Explicit: options.explicitFlags}
 	layer.Fill(&options.fabricMode, "fabric", "", settings.Fabric)
 	layer.Fill(&options.l1Address, "l1", l1AddressEnv, settings.L1)

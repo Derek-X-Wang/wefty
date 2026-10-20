@@ -1,7 +1,7 @@
 # Connection profile
 
 The connection profile is the one file that tells every wefty program on a
-machine where the others listen and who each of them is on the plain Fabric.
+machine where the others listen and which Fabric participant each uses.
 `wefty setup` writes it at `~/.config/wefty/profile.json` (mode `0600`).
 Separate plain-Fabric processes cannot find each other by logical name, and L1
 and L3 refuse the built-in `wefty://` defaults in plain mode, so without the
@@ -18,7 +18,7 @@ L1 ignore the profile's `node_admission`.
 
 | Program | Finds the profile | Reads |
 | --- | --- | --- |
-| `wefty` (CLI) | `--profile`, else `$WEFTY_PROFILE`, else `~/.config/wefty/profile.json` when it exists | `fabric`, `plain_fabric_id`, `l1_address` (`--l1`), `l3_address` (`--l3`), `identities.cli`, `identities.person_user_id`, `identities.person_device_id` |
+| `wefty` (CLI) | `--profile`, else `$WEFTY_PROFILE`, else `~/.config/wefty/profile.json` when it exists | `fabric`, `plain_fabric_id`, `l1_address` (`--l1`), `l3_address` (`--l3`), `identities.cli`, `identities.person_user_id`, `identities.person_device_id`, `participants.client`, `participants.person` |
 | `wefty-l1` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--listen`), `l3_address` (`--run-ledger`), `allow_plain_person_identities`, `node_admission` |
 | `wefty-l3` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l3_address` (`--listen`), `l1_address` (`--control-plane`) |
 | `wefty-agent` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--control-plane`), `l3_address` (`--run-ledger`), `identities.node` (`--node-id`) |
@@ -39,6 +39,10 @@ node commands keep their node-local control-socket path.
 Version 1 is a JSON object. Unknown fields, trailing data, an unsupported
 version or fabric, a `plain_fabric_id` without the `plain-` prefix, a node
 named twice, negative slots or an invalid tag are refused with the file's path.
+The optional `participants` object extends version 1. Existing phase-1 profiles
+need no migration and are still written without this object. Older binaries
+that reject unknown fields cannot read a profile containing `participants`;
+fleet upgrade and rollback wiring must account for that limitation.
 
 ```json
 {
@@ -64,6 +68,82 @@ named twice, negative slots or an invalid tag are refused with the file's path.
 matching. The node ID is chosen once from the host name plus a random suffix
 and is recorded in the installed node configuration (`node.json`, which then
 has no `control_socket`; see [agent-local-lifecycle](agent-local-lifecycle.md)).
+
+## Enrolled participants
+
+For tsnet, `participants` records `node-agent`, `client`, optional `person`, and
+on a control-plane machine `l1` and `l3`. Each entry contains `name` (a Wefty
+logical name), `state_directory` (an absolute local folder), `node_id` (an opaque
+Fabric node ID), optional `user_id`, and optional `key_expiry` (an RFC 3339 time).
+Unknown participant roles, logical names that do not match their role,
+incomplete entries, relative paths, and shared state folders are refused.
+Service names must be exact; a suffix such as `control-plane-x` is invalid. State folders are `<data>/fabric/<participant>/`, mode `0700`.
+
+The names are `wefty://node/<id>`, `wefty://client/<id>`,
+`wefty://person/<id>`, `wefty://control-plane`, and `wefty://run-ledger`.
+`l1_address` and `l3_address` hold the corresponding opaque enrolled node IDs.
+The Fabric resolves those IDs internally; callers must not parse them or
+replace them with private network names. No join key or login URL is stored.
+
+The profile's shape selects the identity rule at one CLI decision point.
+A **legacy profile** has no participant records. It retains the base request
+shape, including `identities.person_user_id` and `identities.person_device_id`
+on client calls, and the existing plain-person usage error when those fields
+are missing. L3 therefore keeps the same submitting actor and cancel authority
+for existing and new legacy runs. No migration, alias, or person retry occurs.
+
+A **participant profile** has one or more participant records. It uses the
+strict split in both plain and tsnet modes: `whoami`, `admin`, `admins`, and
+`services grant|grants|revoke|takeover|submission` select the person participant;
+every other cluster command selects the client participant. Legacy identity
+fields are ignored. A client carries its participant node ID and client tag,
+with no person fields. Missing or expired person sign-in produces typed
+`person_identity_required` (exit 3) with participant-specific recovery advice.
+Recovery restores the original saved state or retires the old device and enrols
+a new identity through fleet setup. Public fleet setup is deferred to #900;
+Plain-development identity flags do not repair participant profiles. The CLI
+never falls back to the client. Missing saved state is refused before opening the Fabric.
+The fleet cutover starts with an empty control plane, so legacy run ownership
+never needs to cross into the strict rule.
+
+For an enrolled tsnet participant, the name and folder are one choice.
+Explicit `--fabric-name` and `--state-dir` must match it. `--auth-key` and
+`--ephemeral` cannot re-enrol an ordinary participant-profile CLI identity.
+The participant-profile CLI never consumes an ambient join key. Legacy
+bootstrap callers capture that key into an explicit in-memory credential
+before opening tsnet. The tsnet implementation then clears the environment
+entries, so the dependency and later child processes cannot consume them again.
+The adapter clears both join-key aliases, OAuth and identity-token credentials,
+and the force-login switch.
+
+Before any application request, a saved participant must reach running state
+and match the recorded opaque node ID and exact role tags. A person must be
+untagged and match the recorded user ID. Login or machine-authorization states
+and identity mismatches produce `person_identity_required` (exit 3). Ordinary
+commands never expose a login URL or its enrollment hint, even with the legacy
+enrollment-URL flag enabled. An opaque-ID listener bounds its wait and refuses
+login or machine-authorization states. Legacy profiles retain their original
+`--fabric-name` default, `wefty-cli`; participant profiles override it.
+
+For participant profiles, the CLI's `status` identity line uses the client and
+adds local person sign-in state. Text output retains any unknown or unreachable
+control-plane identity detail alongside the locally configured client ID. JSON
+adds `identity.node_id` and
+`identity.person_sign_in`, with values `signed_in`, `not_signed_in`, or
+`expired`. This describes saved local state; it does not verify remote
+revocation and never opens the person identity. Legacy status keeps the base
+identity fields and text.
+
+Cancel keeps the chosen client request shape. For participant profiles, a
+text-mode not-found or forbidden response adds a conditional hint to cancel
+work from its submitting machine. Legacy profiles receive no fleet-identity
+hint. Neither shape retries as the person; JSON preserves the server's error
+envelope.
+
+The setup enrolment step is callable independently of service installation.
+The current plain `wefty setup` flow is unchanged. Fleet role flags, service
+configuration for Mac and Linux, and cutover/rollback orchestration are #900.
+See [Fabric enrolment](fabric-enrolment.md) for the step's contract.
 
 ## What setup keeps
 

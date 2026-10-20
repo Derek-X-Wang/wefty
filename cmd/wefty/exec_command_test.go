@@ -60,7 +60,7 @@ func newExecStack(t *testing.T, idle time.Duration) *execStack {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = one.Close() })
-	server, err := l1.NewServer(control, one, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"node-cli": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-cli")}})
+	server, err := l1.NewServer(control, one, l1.ServerConfig{AllowSelfAssertedPersonIdentities: true, NodePolicies: map[string]l1.NodePolicy{"node-cli": l1.DefaultNodePolicy("linux", contract.StableNodeTagPrefix+"node-cli")}})
 	if err != nil {
 		t.Fatal(err)
 	}

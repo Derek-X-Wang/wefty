@@ -26,6 +26,8 @@ func TestTSNetSmoke(t *testing.T) {
 	if authKey == "" {
 		t.Skip("TS_AUTHKEY is not available")
 	}
+	// New clears the ambient key; restore the test fixture for the next smoke.
+	t.Setenv("TS_AUTHKEY", authKey)
 	controlURL := os.Getenv("TS_CONTROL_URL")
 	agentPrincipalTag := os.Getenv("TS_AGENT_PRINCIPAL_TAG")
 	if agentPrincipalTag == "" {
@@ -103,6 +105,8 @@ func TestTSNetServiceReachability(t *testing.T) {
 	if authKey == "" {
 		t.Skip("TS_AUTHKEY is not available")
 	}
+	// New clears the ambient key; restore the test fixture for the next smoke.
+	t.Setenv("TS_AUTHKEY", authKey)
 	controlURL := os.Getenv("TS_CONTROL_URL")
 	agentPrincipalTag := os.Getenv("TS_AGENT_PRINCIPAL_TAG")
 	if agentPrincipalTag == "" {

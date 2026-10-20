@@ -29,6 +29,16 @@ authority refusal or an unknown protocol code's exit. Structured take-over
 refusals map by server code for every HTTP status, including on take and release
 as on view open.
 
+For a participant profile, a missing or expired local person sign-in is a typed
+`person_identity_required` refusal (exit 3), with recovery advice for the saved
+participant. A saved backend that needs login or machine authorization, or
+whose node ID or role identity differs from the profile, uses the same typed
+refusal. Commands do not expose enrollment URLs or retry another identity.
+Recovery can restore the original state or retire the old device and enrol a
+new identity through fleet setup; public fleet setup is deferred to #900.
+The refusal is classified by the same command report used by `main`; it adds no new exit
+number and never retries using another identity.
+
 An L1 identity lookup that fails operationally returns `503 unavailable`,
 `retryable:true`, `details.reason="identity_unverifiable"`; the CLI preserves
 that server envelope and exits 13. One exception: inside a `--wait` window a
