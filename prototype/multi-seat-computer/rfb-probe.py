@@ -149,7 +149,12 @@ def main():
         ws = WS(port)
         print(json.dumps({"banner": ws.recv(12).decode().strip(), "ms": int((time.monotonic() - t0) * 1000)}))
         return
-    c = RFB(port)
+    try:
+        c = RFB(port)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(3)
     if mode in ("frame", "pixel"):
         expect = None
         timeout = 60.0

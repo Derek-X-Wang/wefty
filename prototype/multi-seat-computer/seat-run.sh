@@ -5,7 +5,8 @@ set -eu
 umask 077
 export HOME="$SEAT_DIR/home" XDG_RUNTIME_DIR="$SEAT_DIR/run" TMPDIR="$SEAT_DIR/tmp"
 export XAUTHORITY="$SEAT_DIR/.Xauthority" DISPLAY=":$SEAT_ID"
-mkdir -p "$HOME/.config/chromium" "$XDG_RUNTIME_DIR" "$TMPDIR"
+mkdir -p "$HOME/.config/chromium" "$XDG_RUNTIME_DIR" "$TMPDIR" "$SEAT_DIR/logs"
+L="$SEAT_DIR/logs"
 cookie=$(mcookie)
 rm -f "$XAUTHORITY"
 xauth -q -f "$XAUTHORITY" add "$DISPLAY" . "$cookie"
@@ -21,11 +22,11 @@ dbus-run-session -- sh -c '
   exec chromium --no-sandbox --disable-gpu \
     --no-first-run --no-default-browser-check --start-fullscreen \
     --user-data-dir="$HOME/.config/chromium" "$SEAT_URL"
-' &
-x11vnc -display "$DISPLAY" -auth "$XAUTHORITY" -localhost -nopw -forever -shared -quiet \
-  -noxdamage -rfbport $((VIEW_PORT+10000)) -viewonly &
-x11vnc -display "$DISPLAY" -auth "$XAUTHORITY" -localhost -nopw -forever -shared -quiet \
-  -noxdamage -rfbport $((CONTROL_PORT+10000)) &
+' >"$L/session.log" 2>&1 &
+x11vnc -display "$DISPLAY" -auth "$XAUTHORITY" -localhost -nopw -forever -shared \
+  -noxdamage -rfbport $((VIEW_PORT+10000)) -viewonly -o "$L/x11vnc-view.log" &
+x11vnc -display "$DISPLAY" -auth "$XAUTHORITY" -localhost -nopw -forever -shared \
+  -noxdamage -rfbport $((CONTROL_PORT+10000)) -o "$L/x11vnc-control.log" &
 websockify 127.0.0.1:"$VIEW_PORT" 127.0.0.1:$((VIEW_PORT+10000)) &
 websockify 127.0.0.1:"$CONTROL_PORT" 127.0.0.1:$((CONTROL_PORT+10000)) &
 wait

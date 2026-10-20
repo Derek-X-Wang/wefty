@@ -148,6 +148,12 @@ def mem(label, settle=0):
     log("MEM", label, row)
 
 
+def dump_logs(label):
+    rc, out = cexec(["sh", "-c", "for f in /wefty/service/seats/*/logs/*; do echo \"== $f\"; tail -n 25 \"$f\"; done; echo == ps; ps -eo uid,pid,args | cut -c1-120"])
+    with open("%s/seat-debug-%s.txt" % (OUT, label), "w") as f:
+        f.write(out)
+
+
 def shot(label, n):
     os.makedirs(OUT + "/shots", exist_ok=True)
     path = "%s/shots/%s_seat%d.png" % (OUT, label, n)
@@ -218,6 +224,7 @@ def main():
     t1 = add_seats("a_blank_add_seat1", [seat_spec(1)], [(1, COLORS[1])])
     time.sleep(20)
     shot("1seat", 1)
+    dump_logs("after_seat1")
     mem("1_seat_idle", settle=0)
     t2 = add_seats("a_blank_add_seat2", [seat_spec(1), seat_spec(2)], [(2, COLORS[2])])
     time.sleep(20)
@@ -354,7 +361,7 @@ echo "[shared folder]"; ls -l /wefty/service/shared
     rc_ls = run(["ctr", "-a", SOCK, "-n", "wefty", "task", "ls"], check=False).stdout
     write_seats([])                       # a restart gets a fresh control dir
     info = up()
-    rc, after = cexec(["sh", "-c", "ps -eo uid | awk '$1>=2000' | wc -l; ls -A /wefty/service/seats | wc -l; ls /wefty/service/shared"])
+    rc, after = cexec(["sh", "-c", "ps -eo uid | awk 'NR>1 && $1>=2000' | wc -l; ls -A /wefty/service/seats | wc -l; ls /wefty/service/shared"])
     st = status_file()
     lines = after.split("\n")
     ok_g = (before > 0 and "proto-seats" not in rc_ls.replace("TASK", "") and lines[0].strip() == "0" and lines[1].strip() == "0"
