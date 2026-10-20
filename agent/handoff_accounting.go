@@ -227,6 +227,11 @@ var handoffWalkDescended func(depth int)
 // Nothing outside a test ever sets it.
 var handoffWalkReopened func(depth int)
 
+// handoffWalkChildrenListed is a test seam. It can reorder the entries just
+// read from the filesystem, before the walk chooses its visitation order.
+// Nothing outside a test ever sets it.
+var handoffWalkChildrenListed func([]os.DirEntry)
+
 // walkHandoffTree sums one directory entry and, when it is a directory,
 // everything beneath it. It never follows a symlink and reaches every level
 // through a directory handle rather than by pathname.
@@ -599,6 +604,15 @@ func tallyHandoffChildren(run *os.Root, tally *handoffTally, seen map[handoffIno
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("read handoff directory: %w", err)
 	}
+	if handoffWalkChildrenListed != nil {
+		handoffWalkChildrenListed(children)
+	}
+	// ReadDir returns filesystem order. Name order makes descent, frame
+	// release/re-open, and the work reached within the opens budget repeatable
+	// across filesystems. The entries are already all in memory.
+	slices.SortFunc(children, func(a, b os.DirEntry) int {
+		return strings.Compare(a.Name(), b.Name())
+	})
 	var directories []string
 	for _, child := range children {
 		info, err := run.Lstat(child.Name())

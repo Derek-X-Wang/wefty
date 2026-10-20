@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -380,6 +381,11 @@ func TestMeasureEntryWalksACombWithinItsFrameBound(t *testing.T) {
 // walk accepts the re-open only if it is the same inode, and what it gives up
 // is reported rather than quietly left out of the node's figures.
 func TestACombSubtreeReplacedMidWalkIsCountedRatherThanMeasured(t *testing.T) {
+	withHandoffListingOrders(t, checkCombSubtreeReplacement)
+}
+
+func checkCombSubtreeReplacement(t *testing.T) {
+	t.Helper()
 	harness := newRetentionHarness(t, time.Hour)
 	const teeth = 192
 	const releasedBelow = 96
@@ -531,6 +537,35 @@ func buildDeepChain(t *testing.T, path string, depth, payload int) {
 	current.Close()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// withHandoffListingOrders runs the real walk against native, name-sorted, and
+// deliberately sibling-first listings. The seam runs immediately after ReadDir,
+// so these checks do not inherit the host filesystem's directory order.
+func withHandoffListingOrders(t *testing.T, check func(*testing.T)) {
+	t.Helper()
+	for _, order := range []struct {
+		name    string
+		reorder func([]os.DirEntry)
+	}{
+		{name: "filesystem"},
+		{name: "name", reorder: func(children []os.DirEntry) {
+			slices.SortFunc(children, func(a, b os.DirEntry) int {
+				return strings.Compare(a.Name(), b.Name())
+			})
+		}},
+		{name: "reverse-name", reorder: func(children []os.DirEntry) {
+			slices.SortFunc(children, func(a, b os.DirEntry) int {
+				return strings.Compare(b.Name(), a.Name())
+			})
+		}},
+	} {
+		t.Run(order.name, func(t *testing.T) {
+			handoffWalkChildrenListed = order.reorder
+			t.Cleanup(func() { handoffWalkChildrenListed = nil })
+			check(t)
+		})
 	}
 }
 
@@ -891,6 +926,11 @@ func TestAHashedRecordNameCannotBeSpelledByALiteralRunID(t *testing.T) {
 // Rebuilding a released frame from the stack opened base/comb, which does not
 // exist, and an unchanged tree reported its postponed siblings as lost.
 func TestAChainPrefixedCombIsMeasuredWhole(t *testing.T) {
+	withHandoffListingOrders(t, checkChainPrefixedCombMeasuredWhole)
+}
+
+func checkChainPrefixedCombMeasuredWhole(t *testing.T) {
+	t.Helper()
 	harness := newRetentionHarness(t, time.Hour)
 	// Deeper than the frame bound, so ancestors really are released and really
 	// have to be re-opened by name.
@@ -1212,6 +1252,11 @@ func TestNoWriterOverwritesAnotherRunsRecord(t *testing.T) {
 // mirrors the prefix down to the first frame, so the walk reaches a real
 // identity check rather than failing on a missing path.
 func TestAReplacedPrefixIsCaughtOnEveryReopen(t *testing.T) {
+	withHandoffListingOrders(t, checkReplacedPrefixOnEveryReopen)
+}
+
+func checkReplacedPrefixOnEveryReopen(t *testing.T) {
+	t.Helper()
 	harness := newRetentionHarness(t, time.Hour)
 	// Deeper than the frame bound so ancestors really are released and really
 	// have to be reached again by name.
