@@ -40,3 +40,6 @@ type Condition struct {
 	Since   time.Time      `json:"since"`
 	Details map[string]any `json:"details"`
 }
+
+// CapabilityExecCaptureBundle identifies node agents that seed verified exec bundles.
+const CapabilityExecCaptureBundle = "exec:capture-bundle"

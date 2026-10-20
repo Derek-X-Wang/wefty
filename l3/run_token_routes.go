@@ -23,6 +23,7 @@ var runTokenRoutes = []RunTokenRoute{
 	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/logs"},
 	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/execution"},
 	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/result"},
+	{Method: http.MethodGet, Path: "/v1/runs/{run_id}/exec-capture"},
 	{Method: http.MethodPost, Path: "/v1/runs/{run_id}/envelopes"},
 	{Method: http.MethodPost, Path: "/v1/runs/{run_id}/gates"},
 }

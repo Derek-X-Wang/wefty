@@ -578,7 +578,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	capabilities := map[string]bool{"kind:process": true}
+	capabilities := defaultAgentCapabilities()
 	runtimes := make(map[string]workloadrunner.WorkloadRuntime)
 	var bootBarrier *ocihelper.BootBarrier
 	var agentBootBarrier agent.OCIBootBarrier
@@ -1234,4 +1234,8 @@ func (renewer ociAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, expiresA
 		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
 		Class: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
 	}, expiresAt)
+}
+
+func defaultAgentCapabilities() map[string]bool {
+	return map[string]bool{"kind:process": true, contract.CapabilityExecCaptureBundle: true}
 }

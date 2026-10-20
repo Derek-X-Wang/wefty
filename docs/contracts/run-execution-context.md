@@ -180,6 +180,7 @@ only the exact method and path set on which L3 serves a run token
 | `GET` | `/v1/runs/{run_id}/logs` |
 | `GET` | `/v1/runs/{run_id}/execution` |
 | `GET` | `/v1/runs/{run_id}/result` |
+| `GET` | `/v1/runs/{run_id}/exec-capture` (only the exact live referencing run) |
 | `POST` | `/v1/runs/{run_id}/envelopes` |
 | `POST` | `/v1/runs/{run_id}/gates` |
 
@@ -787,6 +788,7 @@ The layout is fixed:
 
 ```
 $WEFTY_RUN_DIR/params.json    the run's params, written by the agent
+$WEFTY_RUN_DIR/capture.bundle cross-node exec input, verified by the node agent
 $WEFTY_RUN_DIR/tmp/           staging for write-then-rename
 $WEFTY_RUN_DIR/events/        complete events, published in lexical order per sweep
 $WEFTY_RUN_DIR/.published/    durable, advisory bookkeeping
@@ -797,6 +799,28 @@ from L3 on an agent-only dispatch label, never in the workload environment, and
 a document larger than 64 KiB is left in the ledger rather than delivered.
 The agent opens `tmp/` only during preparation to place `params.json`; it does
 not read staged events there.
+
+A version-2 cross-node exec also receives `capture.bundle`. The node agent
+fetches this file over its existing Fabric transport with its agent-held run
+token and checks the `capture_sha256` and `capture_size_bytes` in the params
+before it makes the file visible or starts the wrapper. Download errors or
+verification failures fail preparation without running the command. This GET
+uses the existing Fabric transport without the appender's 30-second whole-body
+budget. The attempt context bounds its lifetime; each response-header/body-read
+operation has a 30-second idle deadline. A progressing transfer can exceed 30
+seconds overall. Transient request/5xx/truncated-body failures retry up to three
+times with 250 ms and 500 ms backoff. Integrity mismatches and idle expiry fail
+preparation clearly without a partial checkout. Preparation removes stale
+staging, bundle and work files left by a previous attempt. The wrapper
+clones the file into its private exec storage. The node agent removes the
+downloaded bundle when the attempt ends, including when the wrapper is killed;
+the wrapper's normal retirement removes its private checkout. A separate
+agent-owned root handle also removes the bundle and work files when mailbox
+finalization detaches or closes its publisher roots, so a retained handoff does
+not keep the capture input. It receives no
+workload credential. The private L3 upload/fetch routes,
+caps and retention are documented in [exec.md](exec.md); L1 gains no input-file
+API. Mailbox event bounds do not apply to this independently capped input.
 
 An event becomes visible by being renamed into `events/` from `tmp/` on the
 same filesystem. The rename is the only "done writing" signal: there is no

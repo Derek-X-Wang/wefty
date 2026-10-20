@@ -1659,6 +1659,13 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		mailbox = prepared
 		defer mailbox.close()
 		lifecycle.storeMailbox(mailbox)
+		hasCapture, err := seedExecCapture(ctx, claim.Job.Spec, mailbox)
+		if err != nil {
+			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+		}
+		if hasCapture {
+			defer mailbox.removeExecCapture()
+		}
 		executionSpec.Env = cloneEnvironment(executionSpec.Env)
 		executionSpec.Env[contract.EnvRunDir] = mailbox.directory
 	} else if lifecycle.dependencies.runLedger != nil && ledgerDispatched && remoteRunMailboxAvailable(claim.Job.Spec) {

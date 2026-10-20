@@ -145,7 +145,7 @@ func (a *execWaitingAnnouncer) announce(ctx context.Context, clients *apiClients
 	if unavailable, _ := unschedulableReason(ctx, clients, runID); unavailable != "" {
 		reason += " (no eligible node: " + unavailable + ")"
 		key = reason
-	} else {
+	} else if a.nodeID != "" {
 		probeCtx, stop := context.WithTimeout(ctx, statusProbeBudget)
 		node, err := clients.getNode(probeCtx, a.nodeID)
 		stop()
