@@ -1,0 +1,38 @@
+UP {'pid': 6148, 'digest': 'sha256:b25d0b458d1e72f6cf90ec315bf384a4e8fc335aea8d9ee1c7e80013abaa9f5e', 'setup_ms': 3291, 'wall_s': 3.3}
+MEM 0_supervisor_only {'current_mib': 7.0, 'peak_mib': 10.5, 'anon_mib': 5.7, 'shmem_mib': 0.0, 'program_mib_anon_plus_shmem': 5.7, 'file_cache_mib_excl_shmem': 0.0, 'kernel_mib': 0.6, 'slab_mib': 0.4, 'kernel_stack_mib': 0.0, 'events': ['low', '0', 'high', '0', 'max', '0', 'oom', '0', 'oom_kill', '0', 'oom_group_kill', '0'], 'pids': '2'}
+TIMING a_blank_add_seat1 {'seat1': {'banner_view_s': 0.91, 'banner_control_s': 1.13, 'first_browser_frame_s': 1.49}}
+SHOT /tmp/proto-out/shots/1seat_seat1.png {"shot": "/tmp/proto-out/shots/1seat_seat1.png", "strip": "ff0000", "digest": "a48661e9df4a"}
+MEM 1_seat_idle {'current_mib': 300.4, 'peak_mib': 307.5, 'anon_mib': 259.1, 'shmem_mib': 14.7, 'program_mib_anon_plus_shmem': 273.8, 'file_cache_mib_excl_shmem': 8.6, 'kernel_mib': 17.5, 'slab_mib': 7.8, 'kernel_stack_mib': 1.7, 'events': ['low', '0', 'high', '0', 'max', '0', 'oom', '0', 'oom_kill', '0', 'oom_group_kill', '0'], 'pids': '111'}
+TIMING a_blank_add_seat2 {'seat2': {'banner_view_s': 0.83, 'banner_control_s': 1.02, 'first_browser_frame_s': 1.42}}
+SHOT /tmp/proto-out/shots/2seats_seat1.png {"shot": "/tmp/proto-out/shots/2seats_seat1.png", "strip": "ff0000", "digest": "a48661e9df4a"}
+SHOT /tmp/proto-out/shots/2seats_seat2.png {"shot": "/tmp/proto-out/shots/2seats_seat2.png", "strip": "0000aa", "digest": "17e56998415f"}
+MEM 2_seats_idle {'current_mib': 592.1, 'peak_mib': 599.0, 'anon_mib': 512.4, 'shmem_mib': 29.4, 'program_mib_anon_plus_shmem': 541.8, 'file_cache_mib_excl_shmem': 17.3, 'kernel_mib': 32.8, 'slab_mib': 13.4, 'kernel_stack_mib': 3.5, 'events': ['low', '0', 'high', '0', 'max', '0', 'oom', '0', 'oom_kill', '0', 'oom_group_kill', '0'], 'pids': '224'}
+CHECK a PASS: add Seat 1 then Seat 2 (blank); RFB banner and first browser frame | {'seat1': {'seat1': {'banner_view_s': 0.91, 'banner_control_s': 1.13, 'first_browser_frame_s': 1.49}}, 'seat2': {'seat2': {'banner_view_s': 0.83, 'banner_control_s': 1.02, 'first_browser_frame_s': 1.42}}, 'status': {'applied_generation': 3, 'seats': {'1': {'ready_ms': 503, 'state': 'ready', 'uid': 2
+CHECK b PASS: distinct framebuffers; input on Seat 1 control changes only Seat 1; view port ignores input | {'seat1_strip': {'strip': 'ff0000', 'digest': 'a48661e9df4a', 'ms': 309}, 'seat2_strip': {'strip': '0000aa', 'digest': '17e56998415f', 'ms': 176}, 'view_port_click_ignored': True, 'seat1_after_control_click': {'strip': '00ff00', 'digest': 'ed58b7ceb5e1', 'ms': 319}, 'seat2_unchanged': True}
+CHECK c PASS: exec as Seat user sees own HOME and screen; plain and double-forked background programs outlive the command | {'seat1': {'rc': 0, 'output': 'uid=2001 home=/wefty/service/seats/1/home display=:1\n. .. .ICEauthority .cache .config \n  dimensions:    1280x720 pixels (325x183 millimeters)\nstarted', 'background_sleeps_alive_after_command': 4}, 'seat2': {'rc': 0, 'output': 'uid=2002 home=/wefty/service/seats/2/h
+CHECK d OBSERVED: Seat 2 process reaching Seat 1 (X display, VNC control port, files, signals) | [draw-on-seat1-display, own cookie]
+Authorization required, but no authorization protocol specified
+
+[draw-on-seat1-display, no cookie]
+Authorization required, but no authorization protocol specified
+
+[read seat1 .Xauthority]
+DENIED
+[list seat1 folder]
+ls: cannot open directory '/wefty/service/seats
+SHOT /tmp/proto-out/shots/after_seat2_removed_blank_seat1.png {"shot": "/tmp/proto-out/shots/after_seat2_removed_blank_seat1.png", "strip": "00ff00", "digest": "ed58b7ceb5e1"}
+MEM after_seat2_removed_blank {'current_mib': 310.3, 'peak_mib': 602.3, 'anon_mib': 259.9, 'shmem_mib': 22.1, 'program_mib_anon_plus_shmem': 282.0, 'file_cache_mib_excl_shmem': 9.3, 'kernel_mib': 18.5, 'slab_mib': 8.6, 'kernel_stack_mib': 1.8, 'events': ['low', '0', 'high', '0', 'max', '0', 'oom', '0', 'oom_kill', '0', 'oom_group_kill', '0'], 'pids': '115'}
+TIMING f_blank_readd_seat2 {'seat2': {'banner_view_s': 0.85, 'banner_control_s': 1.05, 'first_browser_frame_s': 1.44}}
+CHECK f PASS: remove Seat 2: no processes, no sockets, folder gone, shared file survives, Seat 1 answers; re-add works | {'procs_before': 30, 'procs_after': [], 'folder_gone_s': 0.52, 'sockets_after': 'none', 'scratch_leftovers': "ls: cannot access '/tmp/.X2-lock': No such file or directory\n/tmp/.X11-unix:\nX1\n6\n1", 'shared_file': 'from-seat2', 'seat1_banner': '{"banner": "RFB 003.008", "ms": 199}', 'seat1_strip': 
+TIMING heavy_add_seat1 {'seat1': {'banner_view_s': 0.78, 'banner_control_s': 1.0, 'first_browser_frame_s': 1.36}}
+TIMING heavy_add_seat2 {'seat2': {'banner_view_s': 0.94, 'banner_control_s': 1.14, 'first_browser_frame_s': 1.53}}
+SHOT /tmp/proto-out/shots/2seats_heavy_seat1.png {"shot": "/tmp/proto-out/shots/2seats_heavy_seat1.png", "strip": "ff0000", "digest": "f652b01e93c5"}
+SHOT /tmp/proto-out/shots/2seats_heavy_seat2.png {"shot": "/tmp/proto-out/shots/2seats_heavy_seat2.png", "strip": "0000aa", "digest": "dad697b435d5"}
+MEM 2_seats_heavy {'current_mib': 878.6, 'peak_mib': 885.4, 'anon_mib': 753.4, 'shmem_mib': 52.1, 'program_mib_anon_plus_shmem': 805.5, 'file_cache_mib_excl_shmem': 37.6, 'kernel_mib': 34.9, 'slab_mib': 14.6, 'kernel_stack_mib': 3.5, 'events': ['low', '0', 'high', '0', 'max', '0', 'oom', '0', 'oom_kill', '0', 'oom_group_kill', '0'], 'pids': '226'}
+MEM 2_seats_heavy_viewer_connected {'current_mib': 869.8, 'peak_mib': 899.0, 'anon_mib': 739.3, 'shmem_mib': 56.9, 'program_mib_anon_plus_shmem': 796.2, 'file_cache_mib_excl_shmem': 37.8, 'kernel_mib': 35.4, 'slab_mib': 14.8, 'kernel_stack_mib': 3.6, 'events': ['low', '0', 'high', '0', 'max', '0', 'oom', '0', 'oom_kill', '0', 'oom_group_kill', '0'], 'pids': '228'}
+SHOT /tmp/proto-out/shots/after_seat2_removed_heavy_seat1.png {"shot": "/tmp/proto-out/shots/after_seat2_removed_heavy_seat1.png", "strip": "ff0000", "digest": "71c4d12b9469"}
+MEM after_seat2_removed_heavy {'current_mib': 464.2, 'peak_mib': 899.0, 'anon_mib': 375.0, 'shmem_mib': 49.2, 'program_mib_anon_plus_shmem': 424.3, 'file_cache_mib_excl_shmem': 20.0, 'kernel_mib': 19.3, 'slab_mib': 8.8, 'kernel_stack_mib': 1.8, 'events': ['low', '0', 'high', '0', 'max', '0', 'oom', '0', 'oom_kill', '0', 'oom_group_kill', '0'], 'pids': '116'}
+SHOT /tmp/proto-out/shots/numeric_uid_seat5.png {"shot": "/tmp/proto-out/shots/numeric_uid_seat5.png", "strip": "000000", "digest": "e1970e1940ad"}
+CHECK e FAIL: numeric-uid Seat (no passwd entry): desktop and Chromium start | {'banner_s': 0.92, 'first_browser_frame_s': None, 'ps_and_log': 'PID COMMAND\n   1187 /bin/sh /usr/local/libexec/seat-run\n   1192 Xvfb :5 -screen 0 1280x720x24 -nolisten tcp -noreset -auth /wefty/service/seats/5/.Xauthority\n   1199 x11vnc -display :5 -auth /wefty/service/seats/5/.Xauthority -local
+CHECK g PASS: Computer restart (stop+start task) ends every Seat; shared folder survives | {'seat1_procs_before': 26, 'task_list_after_down': 'TASK    PID    STATUS', 'after_restart': '0\n0\nfrom-seat1\nfrom-seat2', 'status': {'applied_generation': 13, 'seats': {}}, 'restart_wall_s': 0.21}
+DONE

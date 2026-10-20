@@ -1,0 +1,174 @@
+== /wefty/service/seats/1/logs/session.log
+dbus-daemon[803]: [session uid=2001 pid=803] Activated service 'org.xfce.FileManager' failed: Failed to execute program org.xfce.FileManager: No such file or directory
+dbus-daemon[803]: [session uid=2001 pid=803] Activating service name='org.freedesktop.FileManager1' requested by ':1.14' (uid=2001 pid=938 comm="xfdesktop" label="unconfined")
+dbus-daemon[803]: [session uid=2001 pid=803] Activating service name='org.xfce.FileManager' requested by ':1.14' (uid=2001 pid=938 comm="xfdesktop" label="unconfined")
+dbus-daemon[803]: [session uid=2001 pid=803] Activated service 'org.freedesktop.FileManager1' failed: Failed to execute program org.freedesktop.FileManager1: No such file or directory
+
+** (xfdesktop:938): WARNING **: 06:33:02.963: Failed to get system bus: Could not connect: No such file or directory
+xfce4-panel-Message: 06:33:03.037: Plugin "(null)-7" was not found and has been removed from the configuration
+xfce4-panel-Message: 06:33:03.037: Plugin "pulseaudio-8" was not found and has been removed from the configuration
+xfce4-panel-Message: 06:33:03.038: Plugin "power-manager-plugin-9" was not found and has been removed from the configuration
+xfce4-panel-Message: 06:33:03.038: Plugin "notification-plugin-10" was not found and has been removed from the configuration
+
+(wrapper-2.0:958): dbind-WARNING **: 06:33:03.050: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+libclock-Message: 06:33:03.054: could not get proxy for org.freedesktop.login1
+
+(xfce4-panel:933): libclock-WARNING **: 06:33:03.055: could not instantiate a sleep monitor
+
+(wrapper-2.0:961): dbind-WARNING **: 06:33:03.112: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+
+(xfce4-session:805): xfce4-session-WARNING **: 06:33:03.309: failed to run script: Failed to execute child process “/usr/bin/pm-is-supported” (No such file or directory)
+
+(xfce4-session:805): xfce4-session-WARNING **: 06:33:03.312: failed to run script: Failed to execute child process “/usr/bin/pm-is-supported” (No such file or directory)
+
+(xfce4-session:805): xfce4-session-WARNING **: 06:33:03.314: failed to run script: Failed to execute child process “/usr/bin/pm-is-supported” (No such file or directory)
+
+(xfsettingsd:1175): dbind-WARNING **: 06:33:10.794: AT-SPI: Error retrieving accessibility bus address: org.freedesktop.DBus.Error.ServiceUnknown: The name org.a11y.Bus was not provided by any .service files
+== /wefty/service/seats/1/logs/x11vnc-control.log
+Have you tried the x11vnc '-ncache' VNC client-side pixel caching feature yet?
+
+The scheme stores pixel data offscreen on the VNC viewer side for faster
+retrieval.  It should work with any VNC viewer.  Try it by running:
+
+    x11vnc -ncache 10 ...
+
+One can also add -ncache_cr for smooth 'copyrect' window motion.
+More info: http://www.karlrunge.com/x11vnc/faq.html#faq-client-caching
+
+20/10/2026 06:33:02 Got connection from client 127.0.0.1
+20/10/2026 06:33:02   0 other clients
+20/10/2026 06:33:02 Normal socket connection
+20/10/2026 06:33:02 check_access: client 127.0.0.1 matches host 127.0.0.1
+20/10/2026 06:33:02 Disabled X server key autorepeat.
+20/10/2026 06:33:02   to force back on run: 'xset r on' (3 times)
+20/10/2026 06:33:02 incr accepted_client=1 for 127.0.0.1:32804  sock=10
+20/10/2026 06:33:02 rfbProcessClientProtocolVersion: client gone
+20/10/2026 06:33:02 client_count: 0
+20/10/2026 06:33:02 Restored X server key autorepeat to: 1
+20/10/2026 06:33:02 Client 127.0.0.1 gone
+20/10/2026 06:33:02 Statistics             events    Transmit/ RawEquiv ( saved)
+20/10/2026 06:33:02  TOTALS              :      0 |         0/        0 (  0.0%)
+20/10/2026 06:33:02 Statistics             events    Received/ RawEquiv ( saved)
+20/10/2026 06:33:02  TOTALS              :      0 |         0/        0 (  0.0%)
+== /wefty/service/seats/1/logs/x11vnc-view.log
+20/10/2026 06:34:11 Got connection from client 127.0.0.1
+20/10/2026 06:34:11   0 other clients
+20/10/2026 06:34:11 Normal socket connection
+20/10/2026 06:34:11 check_access: client 127.0.0.1 matches host 127.0.0.1
+20/10/2026 06:34:11 incr accepted_client=5 for 127.0.0.1:35306  sock=10
+20/10/2026 06:34:11 Client Protocol Version 3.8
+20/10/2026 06:34:11 Protocol version sent 3.8, using 3.8
+20/10/2026 06:34:11 rfbProcessClientSecurityType: executing handler for type 1
+20/10/2026 06:34:11 rfbProcessClientSecurityType: returning securityResult for client rfb version >= 3.8
+20/10/2026 06:34:11 Pixel format for client 127.0.0.1:
+20/10/2026 06:34:11   32 bpp, depth 24, little endian
+20/10/2026 06:34:11   true colour: max r 255 g 255 b 255, shift r 16 g 8 b 0
+20/10/2026 06:34:11 no translation needed
+20/10/2026 06:34:11 Using raw encoding for client 127.0.0.1
+20/10/2026 06:34:11 client_count: 0
+20/10/2026 06:34:11 Client 127.0.0.1 gone
+20/10/2026 06:34:11 Statistics             events    Transmit/ RawEquiv ( saved)
+20/10/2026 06:34:11  FramebufferUpdate   :      1 |         0/        0 (  0.0%)
+20/10/2026 06:34:11  raw                 :      1 |   3686412/  3686412 (  0.0%)
+20/10/2026 06:34:11  TOTALS              :      2 |   3686412/  3686412 (  0.0%)
+20/10/2026 06:34:11 Statistics             events    Received/ RawEquiv ( saved)
+20/10/2026 06:34:11  FramebufferUpdate   :      1 |        10/       10 (  0.0%)
+20/10/2026 06:34:11  SetEncodings        :      1 |         8/        8 (  0.0%)
+20/10/2026 06:34:11  SetPixelFormat      :      1 |        20/       20 (  0.0%)
+20/10/2026 06:34:11  TOTALS              :      3 |        38/       38 (  0.0%)
+== /wefty/service/seats/5/logs/session.log
+dbus[1202]: Could not get password database information for UID of current process: User "???" unknown or no memory to allocate password entry
+
+dbus[1202]: Failed to start message bus: Memory allocation failure in message bus
+dbus-run-session: EOF reading address from bus daemon
+== /wefty/service/seats/5/logs/x11vnc-control.log
+20/10/2026 06:34:11 Xinerama is present and active (e.g. multi-head).
+20/10/2026 06:34:11 Xinerama: number of sub-screens: 1
+20/10/2026 06:34:11 Xinerama: no blackouts needed (only one sub-screen)
+20/10/2026 06:34:11 
+20/10/2026 06:34:11 fb read rate: 2556 MB/sec
+20/10/2026 06:34:11 fast read: reset -wait  ms to: 10
+20/10/2026 06:34:11 fast read: reset -defer ms to: 10
+20/10/2026 06:34:11 The X server says there are 10 mouse buttons.
+20/10/2026 06:34:11 screen setup finished.
+20/10/2026 06:34:11 
+
+The VNC desktop is:      localhost:11152
+20/10/2026 06:34:11 possible aliases:  localhost:17052, localhost::17052
+
+******************************************************************************
+Have you tried the x11vnc '-ncache' VNC client-side pixel caching feature yet?
+
+The scheme stores pixel data offscreen on the VNC viewer side for faster
+retrieval.  It should work with any VNC viewer.  Try it by running:
+
+    x11vnc -ncache 10 ...
+
+One can also add -ncache_cr for smooth 'copyrect' window motion.
+More info: http://www.karlrunge.com/x11vnc/faq.html#faq-client-caching
+
+== /wefty/service/seats/5/logs/x11vnc-view.log
+20/10/2026 06:35:12 Got connection from client 127.0.0.1
+20/10/2026 06:35:12   0 other clients
+20/10/2026 06:35:12 Normal socket connection
+20/10/2026 06:35:12 check_access: client 127.0.0.1 matches host 127.0.0.1
+20/10/2026 06:35:12 incr accepted_client=3 for 127.0.0.1:53916  sock=10
+20/10/2026 06:35:12 Client Protocol Version 3.8
+20/10/2026 06:35:12 Protocol version sent 3.8, using 3.8
+20/10/2026 06:35:12 rfbProcessClientSecurityType: executing handler for type 1
+20/10/2026 06:35:12 rfbProcessClientSecurityType: returning securityResult for client rfb version >= 3.8
+20/10/2026 06:35:12 Pixel format for client 127.0.0.1:
+20/10/2026 06:35:12   32 bpp, depth 24, little endian
+20/10/2026 06:35:12   true colour: max r 255 g 255 b 255, shift r 16 g 8 b 0
+20/10/2026 06:35:12 no translation needed
+20/10/2026 06:35:12 Using raw encoding for client 127.0.0.1
+20/10/2026 06:35:13 client_count: 0
+20/10/2026 06:35:13 Client 127.0.0.1 gone
+20/10/2026 06:35:13 Statistics             events    Transmit/ RawEquiv ( saved)
+20/10/2026 06:35:13  FramebufferUpdate   :      1 |         0/        0 (  0.0%)
+20/10/2026 06:35:13  raw                 :      1 |   3686412/  3686412 (  0.0%)
+20/10/2026 06:35:13  TOTALS              :      2 |   3686412/  3686412 (  0.0%)
+20/10/2026 06:35:13 Statistics             events    Received/ RawEquiv ( saved)
+20/10/2026 06:35:13  FramebufferUpdate   :      1 |        10/       10 (  0.0%)
+20/10/2026 06:35:13  SetEncodings        :      1 |         8/        8 (  0.0%)
+20/10/2026 06:35:13  SetPixelFormat      :      1 |        20/       20 (  0.0%)
+20/10/2026 06:35:13  TOTALS              :      3 |        38/       38 (  0.0%)
+== ps
+  UID     PID COMMAND
+    0       1 /usr/bin/tini -g -- /usr/local/bin/seat-supervisor
+    0       7 python3 /usr/local/bin/seat-supervisor
+ 2001     787 /bin/sh /usr/local/libexec/seat-run
+ 2001     792 Xvfb :1 -screen 0 1280x720x24 -nolisten tcp -noreset -auth /wefty/service/seats/1/.Xauthority
+ 2001     798 dbus-run-session -- sh -c    xfce4-session &   exec chromium --no-sandbox --disable-gpu \     --no-first-r
+ 2001     799 x11vnc -display :1 -auth /wefty/service/seats/1/.Xauthority -localhost -nopw -forever -shared -noxdamage -
+ 2001     800 x11vnc -display :1 -auth /wefty/service/seats/1/.Xauthority -localhost -nopw -forever -shared -noxdamage -
+ 2001     801 /usr/bin/python3 /usr/bin/websockify 127.0.0.1:7011 127.0.0.1:17011
+ 2001     802 /usr/bin/python3 /usr/bin/websockify 127.0.0.1:7012 127.0.0.1:17012
+ 2001     803 dbus-daemon --nofork --print-address 4 --session
+ 2001     804 /usr/lib/chromium/chromium --show-component-extension-options --enable-gpu-rasterization --no-default-brow
+ 2001     805 xfce4-session
+ 2001     819 /usr/lib/chromium/chrome_crashpad_handler --monitor-self --monitor-self-annotation=ptype=crashpad-handler 
+ 2001     821 /usr/lib/chromium/chrome_crashpad_handler --no-periodic-tasks --monitor-self-annotation=ptype=crashpad-han
+ 2001     824 /usr/lib/chromium/chromium --type=zygote --no-zygote-sandbox --no-sandbox --crashpad-handler-pid=819 --ena
+ 2001     825 /usr/lib/chromium/chromium --type=zygote --no-sandbox --crashpad-handler-pid=819 --enable-crash-reporter=,
+ 2001     829 /usr/lib/aarch64-linux-gnu/xfce4/xfconf/xfconfd
+ 2001     846 xfwm4
+ 2001     862 /usr/lib/chromium/chromium --type=gpu-process --no-sandbox --disable-dev-shm-usage --enable-gpu-rasterizat
+ 2001     863 /usr/lib/chromium/chromium --type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --s
+ 2001     874 /usr/lib/chromium/chromium --type=utility --utility-sub-type=storage.mojom.StorageService --lang=en-US --s
+ 2001     904 /usr/lib/chromium/chromium --type=renderer --crashpad-handler-pid=819 --enable-crash-reporter=,built on De
+ 2001     906 /usr/lib/chromium/chromium --type=renderer --crashpad-handler-pid=819 --enable-crash-reporter=,built on De
+ 2001     926 xfsettingsd
+ 2001     933 xfce4-panel
+ 2001     938 xfdesktop
+ 2001     958 /usr/lib/aarch64-linux-gnu/xfce4/panel/wrapper-2.0 /usr/lib/aarch64-linux-gnu/xfce4/panel/plugins/libsystr
+ 2001     961 /usr/lib/aarch64-linux-gnu/xfce4/panel/wrapper-2.0 /usr/lib/aarch64-linux-gnu/xfce4/panel/plugins/libactio
+60005    1187 /bin/sh /usr/local/libexec/seat-run
+60005    1192 Xvfb :5 -screen 0 1280x720x24 -nolisten tcp -noreset -auth /wefty/service/seats/5/.Xauthority
+60005    1199 x11vnc -display :5 -auth /wefty/service/seats/5/.Xauthority -localhost -nopw -forever -shared -noxdamage -
+60005    1200 x11vnc -display :5 -auth /wefty/service/seats/5/.Xauthority -localhost -nopw -forever -shared -noxdamage -
+60005    1201 /usr/bin/python3 /usr/bin/websockify 127.0.0.1:7051 127.0.0.1:17051
+60005    1203 /usr/bin/python3 /usr/bin/websockify 127.0.0.1:7052 127.0.0.1:17052
+    0    1220 sh -c for f in /wefty/service/seats/*/logs/*; do echo "== $f"; tail -n 25 "$f"; done; echo == ps; ps -eo u
+    0    1232 ps -eo uid,pid,args
+    0    1233 cut -c1-120
