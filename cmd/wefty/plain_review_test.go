@@ -14,7 +14,7 @@ func TestReviewPurgeOwnEntriesOnly(t *testing.T) {
 	f := newSetupFixture(t)
 	f.setup(t, setupRequest{})
 	paths, _ := resolveSetupPaths(f.home)
-	owned := []string{"l1.sqlite", "l1.sqlite-wal", "l1.sqlite-shm", "l1.sqlite-journal", "l3.sqlite", "l3.sqlite-wal", "l3.sqlite-shm", "l3.sqlite-journal", "node-agent/managed/job"}
+	owned := []string{".setup-lock", "l1.sqlite", "l1.sqlite-wal", "l1.sqlite-shm", "l1.sqlite-journal", "l3.sqlite", "l3.sqlite-wal", "l3.sqlite-shm", "l3.sqlite-journal", "node-agent/managed/job"}
 	foreign := []string{"agent/keep", "capability/keep", "foreign.txt", "l1.sqlite.bak", "l1.sqlite.pre-upgrade", "l3.sqlite.bak", "l3.sqlite.pre-upgrade"}
 	for _, name := range append(owned, foreign...) {
 		path := filepath.Join(paths.data, name)

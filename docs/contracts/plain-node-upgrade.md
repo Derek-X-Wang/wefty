@@ -1,6 +1,6 @@
 # Daily Mac stack upgrade
 
-`wefty upgrade [--yes]` upgrades the per-user plain-process installation made
+`wefty upgrade [--yes] [--drain-timeout DURATION]` upgrades the per-user plain-process installation made
 by `wefty setup` to the latest `main` commit from
 `https://github.com/Derek-X-Wang/wefty.git`. It refuses root, other platforms,
 OCI installations, missing installation files, mismatched node identities and
@@ -16,7 +16,10 @@ Setup and upgrade serialize installation changes with the same exclusive lock
 on setup's state folder. Existing installs take it before preparation. A first
 setup validates without creating folders, then takes the lock and rechecks the
 installation before writing. A second operation that finds the lock held reports
-that another setup or upgrade is in progress. Under that lock, upgrade removes
+that another setup or upgrade is in progress. Status queries a companion POSIX
+lock with `F_GETLK`; it never acquires the installation lock and cannot make a
+concurrent upgrade fail. The companion `.setup-lock` file is retained in the
+state folder; process exit releases both locks. Under that lock, upgrade removes
 stale `.upgrade-*` folders before
 preparation. It checks an existing clone with a cheap Git repository check,
 then requires a successful fetch; it does not run a full object scan. It removes
@@ -24,7 +27,8 @@ and re-clones an invalid or incomplete clone only when a version 1
 `setup-files.json` receipt records `upgrade_source: true`. Without that ownership
 evidence, it refuses and asks the owner to inspect the folder and move it aside.
 It never removes an external source folder or follows a clone symlink. Only
-the clone and staging folder change during preparation. Upgrade removes the staging folder on success and on every returned failure.
+the clone, staging folder and installation lock companion may change during
+preparation. Upgrade removes the staging folder on success and on every returned failure.
 
 The build uses the `go` executable found on the login-shell `PATH` recorded in
 the installed node agent plist. It builds `wefty`, `wefty-l1`, `wefty-l3` and
@@ -60,12 +64,53 @@ never makes upgrade skip.
 
 ## Running work and activation
 
-Upgrade reads this node and run ledger through their public Fabric APIs. It
-lists the node's active job IDs, attempt IDs, classes and states. Running work
-returns the existing typed conflict exit **5** unless `--yes` is present.
-There is no interactive prompt. Upgrade checks again immediately before the
-first installed write, so work arriving during preparation also refuses an
-unconfirmed upgrade.
+Upgrade reads this node and run ledger through their public Fabric APIs.
+Build, binary verification, database preflight, shell capture and destination
+checks all finish before admission changes. A preparation failure never drains.
+Immediately before the first installed write, upgrade durably writes
+`upgrade-drain.json` in the configuration directory. The receipt names this
+node, the exact post-write intent revision, a unique
+`wefty upgrade TOKEN drain_deadline=TIMESTAMP` reason,
+and the previous intent. It then uses the existing intent CAS to set
+`claims_enabled=false`. This does not change node liveness or revoke resident
+attempts. An existing operator disable is retained without an intent mutation.
+The reason is bounded to 128 bytes and its deadline is UTC RFC3339Nano. Upgrade
+records that deadline before the disable CAS and uses it for the drain's wait
+and progress output. A pre-existing disable's reason does not set this new
+upgrade's deadline.
+
+Upgrade re-reads active attempts after disabling claims, including claimed
+attempts committed just before the CAS. It waits for **one-shot** attempts to
+finish normally; services continue running throughout this wait. Progress names
+the remaining one-shot count and deadline every five seconds. The default bound
+is five minutes; `--drain-timeout DURATION` accepts a Go duration of at least
+ten seconds. The first post-disable observation has its own probe budget, so
+an idle node cannot time out before its first observation completes.
+`--yes` skips this wait and permits the existing replacement to end one-shots
+at once. Before replacement, text output names each such job and attempt.
+There is no interactive prompt.
+
+On timeout without `--yes`, upgrade restores only its own intent revision,
+leaves the old installation running, and exits **5** with
+`drain timed out; installed stack unchanged`. If the intent revision changes
+during the drain, activation refuses with conflict and preserves the newer
+operator decision. The CLI never clears a pre-existing disable or overwrites a
+newer intent, including a disable racing its restoration CAS.
+
+New submissions queue while the upgrade owns admission. With reachable control
+services and an otherwise eligible alive node, `wefty status` returns exit 0
+and `busy, queued: upgrading; new runs wait and start when it ends`.
+Immediate capacity and `accepts_oneshot` still reflect disabled admission.
+Other operator disables keep their existing not-ready answer. `wefty exec`
+continues to queue without a new submission policy.
+
+During the restart window, a valid local upgrade receipt and a held installation
+lock also keep status at exit 0. Unreachable L1 or L3 reports
+`busy: upgrading; retry in a few seconds`. The old boot in `draining` reports
+the busy/queued answer before the ordinary no-alive-node check. Without both
+pieces of evidence, the usual readiness checks apply. In 14 real upgrades on
+the daily installation, the whole upgrade took 26 to 38 seconds; successful
+node lease renewal took 1 to 12 seconds after the control-plane restart.
 
 Upgrade uses setup's existing confined file and LaunchAgent converge. It keeps
 the stable node ID, connection profile settings, standard paths, shutdown
@@ -103,13 +148,48 @@ as it observes this evidence, including when a later node agent replacement
 fails. In text mode, it prints that renewal line once, on stderr. The final
 summary on stdout names the installed version and the node agent result, and
 does not repeat the renewal line. With `--json`, the report includes
-`running_work` and `lease_renewal_ns`, including available observations on
-refusal or activation failure. These are
+`running_work` (including late claims seen during drain) and `lease_renewal_ns`,
+including available observations on timeout or activation failure. These are
 JSON fields, with no plain-text running-work or renewal output on stderr.
 A missing renewal is a loud activation failure, never a success.
 
+Immediately before the node stage, upgrade re-reads intent and active attempts.
+The disable revision and reason must still match the receipt, including when
+the disable predates the upgrade. Without `--yes`, no one-shot may remain.
+A changed intent or late one-shot refuses node replacement with exit 5 and
+restores the old installation through activation rollback; the old agent and
+its one-shots remain running. Cleanup restores only upgrade-owned intent.
+
 Upgrade then publishes and converges the node agent last. Its existing drain
-and shutdown end running one-shot attempts; services requeue and come back.
+and shutdown end any remaining one-shots authorized by `--yes`.
+Immediately before replacement, upgrade records the active service job and
+attempt IDs and old boot session in its drain receipt. After replacement health,
+it uses the existing idempotent explicit-restart API for each still-desired
+running service. This includes `restart=never`: a planned upgrade is wefty's
+interruption, not an app failure. The service keeps its identity, binding, data,
+specification and published-port reservation. Services already running a newer
+attempt, explicitly stopped or removed, or stopped by payload policy are not
+restarted again. Computer lifecycle authority is unchanged.
+Upgrade names each service for which it requests a restart and includes those
+job IDs in `restarted_services` JSON. Claims reopen after recovery requests;
+services then claim their new attempts. A pre-existing operator disable stays
+closed, so service restart requests wait for the operator to re-enable it.
+Text output says that claims remain disabled instead of promising services
+have returned. A permanent service read or restart refusal (non-retryable 4xx,
+except transient 408/429) warns with that service's manual restart command,
+durably drops it from the receipt, and continues with other services.
+`capacity_exhausted` is also final for upgrade recovery even though L1 marks it
+retryable: upgrading cannot free another service's reserved slot. Transport,
+5xx and other retryable refusals retry within the first cleanup's budget and
+retain recovery evidence if they remain unresolved.
+
+On the next upgrade, recovery first settles its owned intent or preserves a
+newer operator decision. Once no admission restoration or disable fence is
+pending, it attempts each remaining service once; any failure warns with the
+manual restart command and durably drops that service, then continues. A
+service-only failure cannot block a new upgrade after admission is settled.
+Failed intent recovery or receipt persistence still retains the receipt and
+blocks preparation, because the required admission evidence is unresolved.
 Upgrade also requires the replacement node agent to register a new boot session
 and heartbeat within 20 s and report the expected commit. In the same observation,
 the CLI must reach the run ledger through its public API; this does not prove
@@ -117,10 +197,46 @@ the node agent's own ledger connection. An `Unchanged` converge action does not
 wait for a new boot session. Upgrade does not promise
 uninterrupted one-shot work across node agent replacement.
 
+## Intent restoration and interrupted upgrades
+
+After replacement health and installation completion, upgrade restores claims
+only when its receipt still owns the disabled revision and reason. The same
+cleanup runs after a drain failure, activation rollback or Ctrl-C. Cleanup uses
+an uncancelled context bounded to ten seconds and reads L1 independently of L3.
+Each intent mutation has a five-second budget within its caller's bound.
+Lost mutation replies are resolved by re-reading intent. If the disable may
+still commit at the original revision, cleanup fences it with an enabled CAS
+at that revision, then confirms the resulting intent before deleting evidence.
+A racing late disable must either lose that CAS or be observed and restored.
+Service recovery uses stable restart keys. Successful cleanup durably removes
+the receipt. JSON errors include failed restoration as well as the original
+failure, preserving the original failure's exit code.
+
+If cleanup cannot finish, the receipt stays and the command reports
+`run wefty upgrade to recover`. The next upgrade recovers the receipt before
+fetching or building, even if that preparation later fails or is already at the
+installed version. Recovery never re-enables a newer operator disable. A receipt
+also retains service restart identities across a hard kill after replacement.
+An unresolved receipt and a released installation lock identify a local
+interrupted upgrade. With matching L1 intent, `wefty status` names
+`claims disabled by an interrupted upgrade` and the recovery command; it does
+not report that state as an active upgrade that will finish on its own. If L1
+cannot verify the intent, status names the interrupted receipt without asserting
+the current claims state. A live upgrade holds the installation lock until
+cleanup finishes.
+If the receipt cannot be read, an upgrade reason with `drain_deadline` is busy
+until that deadline plus a 30-minute margin. This also covers configured drains
+longer than 30 minutes. Only legacy reasons without a deadline use the
+35-minute bound on `intent_updated_at` (the default five-minute drain plus the
+margin). An expired, malformed, zero or overlong deadline, or an older or
+undated legacy reason, reports an interrupted upgrade and `wefty upgrade` as
+the recovery command.
+
 ## Failed activation and authority
 
-An activation failure returns exit **1** and reports the failed stage and
+An activation failure normally returns exit **1** and reports the failed stage and
 recovery result. These are existing exit codes; upgrade adds no exit code.
+The pre-node intent/one-shot conflict retains exit **5** after rollback.
 Upgrade first unloads the run ledger and L1 to protect their databases, and
 confirms each is absent. It unloads the node agent only if its replacement stage
 began; otherwise the old node agent stays running. It compares fingerprints of

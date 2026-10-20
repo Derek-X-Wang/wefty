@@ -16,11 +16,11 @@ func TestUpgradeRealBinaryHelpAndUsage(t *testing.T) {
 	binary := buildWefty(t)
 	for _, args := range [][]string{{"upgrade", "--help"}, {"--json", "upgrade", "--help"}, {"--fabric=tsnet", "--profile=/missing-profile", "upgrade", "--help"}} {
 		code, stdout, stderr := runPolishBinary(t, binary, args...)
-		if code != 0 || len(stderr) != 0 || !bytes.Contains(stdout, []byte("-yes")) {
+		if code != 0 || len(stderr) != 0 || (!bytes.Contains(stdout, []byte("-yes")) || !bytes.Contains(stdout, []byte("-drain-timeout"))) {
 			t.Fatalf("help opens machine state or misses --yes: %d %s %s", code, stdout, stderr)
 		}
 	}
-	for _, args := range [][]string{{"upgrade", "--from=/tmp"}, {"upgrade", "extra"}, {"upgrade", "--yes=nope"}} {
+	for _, args := range [][]string{{"upgrade", "--from=/tmp"}, {"upgrade", "extra"}, {"upgrade", "--yes=nope"}, {"upgrade", "--drain-timeout=0"}, {"upgrade", "--drain-timeout=-1m"}, {"upgrade", "--drain-timeout=bad"}} {
 		code, _, stderr := runPolishBinary(t, binary, args...)
 		if code != exitUsage || len(stderr) == 0 {
 			t.Fatalf("usage exit: %v %d %s", args, code, stderr)

@@ -356,7 +356,7 @@ Every command uses typed exits: usage 2, unauthorized 3, not found 4,
 conflict 5, unavailable 13, accepted-mutation wait timeout 14, other failure 1. JSON errors go to stderr.
 
 Commands:
-  upgrade [--yes]           Build latest main and upgrade this Mac's installed stack
+  upgrade [--yes] [--drain-timeout DURATION]  Build latest main and upgrade this Mac's installed stack
   setup [--from DIR]         Install L1, L3 and a node agent as login services on
                              this Mac and write the connection profile
                              --remove keeps data and logs; --purge deletes them

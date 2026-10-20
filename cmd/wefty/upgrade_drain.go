@@ -1,0 +1,409 @@
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
+	"github.com/Derek-X-Wang/wefty/internal/durable"
+	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/l1"
+)
+
+const (
+	upgradeDrainTimeout        = 5 * time.Minute
+	upgradeDrainPoll           = 5 * time.Second
+	upgradeDrainRecoveryBudget = 10 * time.Second
+	upgradeMutationBudget      = 5 * time.Second
+	upgradeDrainMinimum        = 10 * time.Second
+	upgradeIntentMargin        = 30 * time.Minute
+	upgradeReasonMaxAge        = upgradeDrainTimeout + upgradeIntentMargin
+	upgradeDeadlineField       = " drain_deadline="
+	upgradeDrainFile           = "upgrade-drain.json"
+	upgradeIntentPrefix        = "wefty upgrade "
+	upgradeBusyMessage         = "busy, queued: upgrading; new runs wait and start when it ends"
+)
+
+type upgradeDrainReceipt struct {
+	Home           string                 `json:"home"`
+	Version        int                    `json:"version"`
+	NodeID         string                 `json:"node_id"`
+	Revision       int64                  `json:"intent_revision"`
+	Reason         string                 `json:"intent_reason"`
+	PreviousReason string                 `json:"previous_reason"`
+	RestoreClaims  bool                   `json:"restore_claims"`
+	OldBoot        string                 `json:"old_boot,omitempty"`
+	Services       []l1.NodeActiveAttempt `json:"services,omitempty"`
+	restarted      []string
+	claimsDisabled bool
+}
+
+func (receipt *upgradeDrainReceipt) ownsClaims(node l1.Node) bool {
+	return receipt.RestoreClaims && node.NodeID == receipt.NodeID && node.IntentRevision == receipt.Revision && node.IntentReason == receipt.Reason && !node.ClaimsEnabled
+}
+
+func writeUpgradeDrain(config string, receipt *upgradeDrainReceipt) error {
+	root, err := os.OpenRoot(config)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	payload, err := json.Marshal(receipt)
+	if err != nil {
+		return err
+	}
+	return durable.WriteFile(root, upgradeDrainFile, append(payload, '\n'), 0600)
+}
+
+func readUpgradeDrain(config string) (*upgradeDrainReceipt, error) {
+	root, err := os.OpenRoot(config)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	info, err := root.Lstat(upgradeDrainFile)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("upgrade drain receipt must be a regular file")
+	}
+	payload, err := root.ReadFile(upgradeDrainFile)
+	if err != nil {
+		return nil, err
+	}
+	var receipt upgradeDrainReceipt
+	if err := json.Unmarshal(payload, &receipt); err != nil {
+		return nil, err
+	}
+	if receipt.Version != 1 || !filepath.IsAbs(receipt.Home) || receipt.NodeID == "" || receipt.Revision < 0 || (receipt.RestoreClaims && !strings.HasPrefix(receipt.Reason, upgradeIntentPrefix)) {
+		return nil, errors.New("invalid upgrade drain receipt")
+	}
+	return &receipt, nil
+}
+
+func removeUpgradeDrain(config string) error {
+	root, err := os.OpenRoot(config)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := root.Remove(upgradeDrainFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return durable.SyncDir(root)
+}
+
+func beginUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, node l1.Node, timeout time.Duration) (*upgradeDrainReceipt, error) {
+	receipt := &upgradeDrainReceipt{Home: paths.home, Version: 1, NodeID: node.NodeID, Revision: node.IntentRevision, Reason: node.IntentReason, PreviousReason: node.IntentReason, RestoreClaims: node.ClaimsEnabled}
+	if node.ClaimsEnabled {
+		receipt.Revision++
+		receipt.Reason = upgradeIntentPrefix + rand.Text() + upgradeDeadlineField + op.now().Add(timeout).UTC().Format(time.RFC3339Nano)
+	}
+	// Write the expected *post-CAS* revision first. A lost mutation response or
+	// process death can then be recovered by comparing both revision and reason.
+	if err := writeUpgradeDrain(paths.config, receipt); err != nil {
+		return nil, err
+	}
+	if !receipt.RestoreClaims {
+		return receipt, nil
+	}
+	_, err := op.setClaims(ctx, profile, l1.NodeIntentRequest{ClaimsEnabled: false, IntentRevision: node.IntentRevision, Reason: receipt.Reason})
+	return receipt, err
+}
+
+// New reasons carry the configured deadline so remote readers need no receipt.
+// A malformed deadline is not a legacy reason and must not extend busy status.
+func upgradeReasonDeadline(reason string) (time.Time, error) {
+	_, value, found := strings.Cut(reason, upgradeDeadlineField)
+	if !found {
+		return time.Time{}, nil
+	}
+	if len(reason) > 128 {
+		return time.Time{}, errors.New("upgrade intent reason exceeds 128 bytes")
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, value)
+	if err == nil && deadline.IsZero() {
+		err = errors.New("upgrade drain deadline must not be zero")
+	}
+	return deadline, err
+}
+
+func upgradeReasonActive(node l1.Node, now time.Time) bool {
+	deadline, err := upgradeReasonDeadline(node.IntentReason)
+	if err != nil {
+		return false
+	}
+	if !deadline.IsZero() {
+		return !now.After(deadline.Add(upgradeIntentMargin))
+	}
+	return node.IntentUpdatedAt != nil && now.Sub(*node.IntentUpdatedAt) <= upgradeReasonMaxAge
+}
+
+func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.Profile, receipt *upgradeDrainReceipt, yes bool, timeout time.Duration, out io.Writer, work *[]l1.NodeActiveAttempt) (l1.Node, error) {
+	deadline := op.now().Add(timeout)
+	if receipt.RestoreClaims {
+		if recorded, err := upgradeReasonDeadline(receipt.Reason); err == nil && !recorded.IsZero() {
+			deadline = recorded
+		}
+	}
+	bounded, cancel := context.WithTimeout(ctx, deadline.Sub(op.now()))
+	defer cancel()
+	first := true
+	for {
+		if !first && !yes && (!op.now().Before(deadline) || errors.Is(bounded.Err(), context.DeadlineExceeded)) && ctx.Err() == nil {
+			return l1.Node{}, upgradeDrainTimedOut()
+		}
+		// Read after disabling, including claimed attempts committed just before CAS.
+		// The initial read has the observer's own budget, even on an idle node.
+		probe := bounded
+		if first {
+			probe = ctx
+		}
+		first = false
+		node, err := op.observe(probe, profile)
+		if err != nil {
+			if ctx.Err() == nil && errors.Is(bounded.Err(), context.DeadlineExceeded) {
+				return node, upgradeDrainTimedOut()
+			}
+			return node, err
+		}
+		if node.IntentRevision != receipt.Revision || node.ClaimsEnabled || node.IntentReason != receipt.Reason {
+			return node, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent changed during upgrade drain; installed stack unchanged"}}
+		}
+		remaining := 0
+		for _, attempt := range node.ActiveAttempts {
+			found := false
+			for _, old := range *work {
+				if old.AttemptID == attempt.AttemptID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				*work = append(*work, attempt)
+			}
+			if attempt.Class != contract.JobClassService {
+				remaining++
+			}
+		}
+		if yes || remaining == 0 {
+			return node, ctx.Err()
+		}
+		if _, err := fmt.Fprintf(out, "Draining: %d one-shot attempts remain; deadline %s.\n", remaining, deadline.Format(time.RFC3339)); err != nil {
+			return node, err
+		}
+		left := deadline.Sub(op.now())
+		if left <= 0 || errors.Is(bounded.Err(), context.DeadlineExceeded) {
+			return node, upgradeDrainTimedOut()
+		}
+		if err := op.wait(bounded, min(upgradeDrainPoll, left)); err != nil {
+			if ctx.Err() != nil {
+				return node, ctx.Err()
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				return node, upgradeDrainTimedOut()
+			}
+			return node, err
+		}
+	}
+}
+
+// Revalidate after control-plane renewal, before publishing or stopping the node.
+// An operator may reopen admission while we wait, and a late claim may appear.
+func checkUpgradeReplacement(node l1.Node, receipt *upgradeDrainReceipt, yes bool) error {
+	if node.NodeID != receipt.NodeID || node.ClaimsEnabled || node.IntentRevision != receipt.Revision || node.IntentReason != receipt.Reason {
+		return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent changed before node replacement; installed stack unchanged"}}
+	}
+	if !yes {
+		for _, attempt := range node.ActiveAttempts {
+			if attempt.Class != contract.JobClassService {
+				return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "one-shot became active before node replacement; installed stack unchanged"}}
+			}
+		}
+	}
+	return nil
+}
+
+func upgradeDrainTimedOut() error {
+	return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "drain timed out; installed stack unchanged"}}
+}
+
+func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, out io.Writer) error {
+	receipt, err := readUpgradeDrain(paths.config)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read interrupted upgrade receipt: %w", err)
+	}
+	if receipt.NodeID != profile.Identities.Node {
+		return errors.New("upgrade drain receipt names a different node")
+	}
+	if err := finishUpgradeDrain(ctx, op, paths, profile, receipt, true, out); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(out, "Restored intent from interrupted upgrade.")
+	return err
+}
+
+func finishUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, receipt *upgradeDrainReceipt, recovering bool, out io.Writer) (resultErr error) {
+	defer func() {
+		for _, jobID := range receipt.restarted {
+			if _, err := fmt.Fprintln(out, "Restarted service", jobID); err != nil {
+				resultErr = errors.Join(resultErr, err)
+				break
+			}
+		}
+	}()
+	// Ctrl-C and rollback must not cancel cleanup. Bound it independently.
+	recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), upgradeDrainRecoveryBudget)
+	defer cancel()
+	deadline := op.now().Add(upgradeDrainRecoveryBudget)
+	var lastErr error
+	for recovery.Err() == nil && op.now().Before(deadline) {
+		node, err := op.readNode(recovery, profile)
+		if err == nil {
+			pendingDisable := receipt.RestoreClaims && node.ClaimsEnabled && node.IntentRevision == receipt.Revision-1 && node.IntentReason == receipt.PreviousReason
+			// A new upgrade must not be held hostage by service-only failures.
+			// Once our intent is settled, retry each remaining service once and
+			// leave manual restart advice for any failure instead of blocking it.
+			finalServiceFailures := recovering && !receipt.ownsClaims(node) && !pendingDisable
+			serviceErr := resumeUpgradeServices(recovery, op, paths, profile, receipt, node, finalServiceFailures, out)
+			reason := receipt.PreviousReason
+			if strings.TrimSpace(reason) == "" {
+				reason = "wefty upgrade completed; claims restored"
+			}
+			if receipt.ownsClaims(node) {
+				_, err = op.setClaims(recovery, profile, l1.NodeIntentRequest{ClaimsEnabled: true, IntentRevision: receipt.Revision, Reason: reason})
+			} else if pendingDisable {
+				// The disable response may have been lost before its CAS committed.
+				// Fence that pending CAS with an enabled intent at the same old
+				// revision. Whichever CAS wins, a re-read resolves it before deletion.
+				_, err = op.setClaims(recovery, profile, l1.NodeIntentRequest{ClaimsEnabled: true, IntentRevision: node.IntentRevision, Reason: reason})
+			} else if err == nil && serviceErr == nil {
+				receipt.claimsDisabled = !node.ClaimsEnabled
+				return removeUpgradeDrain(paths.config)
+			}
+			if err == nil && serviceErr == nil {
+				continue // Confirm the restoration/fence revision before deleting evidence.
+			}
+			err = errors.Join(err, serviceErr)
+			// Resolve ambiguous replies by re-reading. A newer intent is never
+			// overwritten, even if an operator races the restoration CAS.
+		}
+		lastErr = err
+		if err := op.wait(recovery, min(time.Second, deadline.Sub(op.now()))); err != nil {
+			lastErr = err
+			break
+		}
+	}
+	return fmt.Errorf("restore upgrade intent failed; receipt kept at %s; run wefty upgrade to recover: %w", filepath.Join(paths.config, upgradeDrainFile), lastErr)
+}
+
+func withUpgradeClients(ctx context.Context, profile connprofile.Profile, action func(context.Context, *apiClients) error) error {
+	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: profile.Identities.CLI, Tags: []string{l1.DefaultClientPrincipalTag}}})
+	if err != nil {
+		return err
+	}
+	defer closeFabric()
+	clients, err := newAPIClients(participant, profile.L1Address, profile.L3Address)
+	if err != nil {
+		return err
+	}
+	defer clients.close()
+	probe, cancel := context.WithTimeout(ctx, upgradeMutationBudget)
+	defer cancel()
+	return action(probe, clients)
+}
+
+func setUpgradeClaims(ctx context.Context, profile connprofile.Profile, request l1.NodeIntentRequest) (node l1.Node, err error) {
+	err = withUpgradeClients(ctx, profile, func(ctx context.Context, clients *apiClients) error {
+		var err error
+		node, err = clients.setNodeClaims(ctx, profile.Identities.Node, request)
+		return err
+	})
+	return
+}
+
+func restartUpgradeService(ctx context.Context, profile connprofile.Profile, jobID, key string) (job l1.Job, err error) {
+	err = withUpgradeClients(ctx, profile, func(ctx context.Context, clients *apiClients) error {
+		var err error
+		job, err = clients.restartService(ctx, jobID, key)
+		return err
+	})
+	return
+}
+
+// A node replacement is our interruption, including for restart=never. Use the
+// existing explicit-restart API, whose durable key also covers lost replies.
+// Keep the binding, data directory, spec and published-port reservation intact.
+func resumeUpgradeServices(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, receipt *upgradeDrainReceipt, node l1.Node, finalFailures bool, out io.Writer) error {
+	if receipt.OldBoot == "" || (node.BootSessionID == receipt.OldBoot && node.State == contract.NodeAlive) {
+		return nil
+	}
+	for len(receipt.Services) > 0 {
+		old := receipt.Services[0]
+		job, err := op.readJob(ctx, profile, old.JobID)
+		if err == nil && job.ServiceJob != nil && job.ComputerID == "" && job.BoundNodeID == receipt.NodeID && job.DesiredState == contract.ServiceDesiredRunning && job.Removal == nil && job.PolicyStop == nil && (job.CurrentAttemptID == "" || job.CurrentAttemptID == old.AttemptID) {
+			_, err = op.restartService(ctx, profile, old.JobID, receipt.Reason+":"+old.AttemptID)
+			if err == nil {
+				receipt.restarted = append(receipt.restarted, old.JobID)
+			}
+		} else if err == nil && job.ServiceJob != nil && job.DesiredState == contract.ServiceDesiredRunning && (job.State == contract.JobClaimed || job.State == contract.JobRunning) && job.CurrentAttemptID != "" && job.CurrentAttemptID != old.AttemptID {
+			receipt.restarted = append(receipt.restarted, old.JobID)
+		}
+		if err != nil {
+			if !finalFailures && !permanentUpgradeRefusal(err) {
+				return err
+			}
+			if _, err := fmt.Fprintf(out, "Warning: service %s restart refused: %v; restart manually: wefty services restart %s --idempotency-key upgrade-recovery-%s\n", old.JobID, err, old.JobID, old.AttemptID); err != nil {
+				return err
+			}
+		}
+		receipt.Services = receipt.Services[1:]
+		if err := writeUpgradeDrain(paths.config, receipt); err != nil {
+			// Keep the in-memory queue consistent with the durable retry evidence.
+			receipt.Services = append([]l1.NodeActiveAttempt{old}, receipt.Services...)
+			return err
+		}
+	}
+	return nil
+}
+
+func permanentUpgradeRefusal(err error) bool {
+	var response *apiResponseError
+	return errors.As(err, &response) && (response.APIError.Code == contract.ErrorCapacityExhausted ||
+		response.StatusCode >= 400 && response.StatusCode < 500 && response.StatusCode != 408 && response.StatusCode != 429 && !response.APIError.Retryable)
+}
+
+type upgradeCleanupError struct{ primary, restore error }
+
+func (e *upgradeCleanupError) Error() string { return errors.Join(e.primary, e.restore).Error() }
+
+// Cleanup must remain visible without replacing the original command's exit code.
+func (e *upgradeCleanupError) Unwrap() error {
+	if e.primary != nil {
+		return e.primary
+	}
+	return e.restore
+}
+
+func readUpgradeIntent(ctx context.Context, profile connprofile.Profile) (node l1.Node, err error) {
+	err = withUpgradeClients(ctx, profile, func(ctx context.Context, clients *apiClients) error {
+		var err error
+		node, err = clients.getNode(ctx, profile.Identities.Node)
+		return err
+	})
+	return
+}

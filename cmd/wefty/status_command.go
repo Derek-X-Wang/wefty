@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -70,7 +71,9 @@ type nodeStatus struct {
 	State       contract.NodeState `json:"state"`
 	// ClaimsEnabled is durable operator intent. A node can be perfectly healthy
 	// and still be closed for work, and that is a different sentence.
-	ClaimsEnabled bool `json:"claims_enabled"`
+	ClaimsEnabled      bool `json:"claims_enabled"`
+	Upgrading          bool `json:"upgrading,omitempty"`
+	UpgradeInterrupted bool `json:"upgrade_interrupted,omitempty"`
 	// Kinds is what this node can execute: process, oci, computer. The names
 	// are the capability vocabulary's, shortened for reading.
 	Kinds        []string `json:"kinds"`
@@ -131,6 +134,7 @@ type localLoadStatus struct {
 
 // clusterStatus is the whole answer, and the shape `--json` publishes.
 type clusterStatus struct {
+	UpgradeRecovery  string           `json:"upgrade_recovery,omitempty"`
 	Busy             string           `json:"busy,omitempty"`
 	WaitingRuns      *int             `json:"waiting_runs,omitempty"`
 	LocalLoad        *localLoadStatus `json:"local_load,omitempty"`
@@ -299,6 +303,36 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 
 	status.Services = []serviceStatus{l1Status, l3Status}
 	status.Nodes = nodeStatuses(nodes)
+	receipt, upgradeActive := localUpgradeStatus(clients.nodeConfigPath)
+	if receipt != nil && !upgradeActive {
+		status.UpgradeRecovery = "interrupted upgrade receipt; run wefty upgrade to finish recovery"
+		for _, node := range nodes.Nodes {
+			if receipt.ownsClaims(node) {
+				status.UpgradeRecovery = "claims disabled by an interrupted upgrade; run wefty upgrade to restore admission"
+				// nodeStatuses sorts its result, so match by identity rather than index.
+				for j := range status.Nodes {
+					if status.Nodes[j].NodeID == node.NodeID {
+						status.Nodes[j].Upgrading = false
+						status.Nodes[j].UpgradeInterrupted = true
+					}
+				}
+			}
+		}
+	}
+	upgradeDraining := false
+	if receipt != nil && upgradeActive {
+		for i := range status.Nodes {
+			if status.Nodes[i].NodeID == receipt.NodeID {
+				for _, node := range nodes.Nodes {
+					if receipt.ownsClaims(node) {
+						status.Nodes[i].Upgrading = true
+						status.Nodes[i].UpgradeInterrupted = false
+					}
+				}
+				upgradeDraining = status.Nodes[i].State == contract.NodeDraining
+			}
+		}
+	}
 	if status.LocalNode != nil {
 		for i := range status.Nodes {
 			status.Nodes[i].ThisMachine = status.Nodes[i].NodeID == status.LocalNode.NodeID
@@ -318,12 +352,26 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 	status.WaitingRuns = waitingRuns
 	status.Capacity = capacityByKind(status.Nodes)
 	status.Reasons, status.Limitations = reasonsFor(l1Status, l3Status, status.Nodes, status.Capacity)
+	// The durable local receipt and live installation lock explain these brief
+	// restart outages. Keep reachability facts visible, but don't send agents to
+	// repair an installation that an upgrade is currently replacing.
+	if upgradeActive && (!l1Status.Reachable || !l3Status.Reachable) {
+		status.Reasons = nil
+		status.Busy = "busy: upgrading; retry in a few seconds"
+	} else if upgradeActive && upgradeDraining {
+		status.Reasons = nil
+		status.Busy = upgradeBusyMessage
+	}
 	if note, ok := unschedulableRunsNote(stuck); ok {
 		status.Limitations = append(status.Limitations, note)
 	}
 	status.Ready = len(status.Reasons) == 0
 	status.Verdict = verdictOf(status.Reasons)
-	if status.Ready && allOneshotSlotsBusy(status.Nodes) {
+	if status.Busy != "" {
+		// A restart-window answer takes precedence over ordinary slot occupancy.
+	} else if status.Ready && upgradeQueueOnly(status.Nodes) {
+		status.Busy = upgradeBusyMessage
+	} else if status.Ready && allOneshotSlotsBusy(status.Nodes) {
 		status.Busy = "busy: all one-shot slots in use; "
 		if waitingRuns != nil {
 			status.Busy += fmt.Sprintf("%d runs waiting; ", *waitingRuns)
@@ -391,10 +439,14 @@ func probeDetail(err error) string {
 func nodeStatuses(nodes l1.NodeList) []nodeStatus {
 	statuses := make([]nodeStatus, 0, len(nodes.Nodes))
 	for _, node := range nodes.Nodes {
+		upgradeReason := !node.ClaimsEnabled && strings.HasPrefix(node.IntentReason, upgradeIntentPrefix)
+		upgradeRecent := upgradeReasonActive(node, time.Now())
 		status := nodeStatus{
 			NodeID: node.NodeID, State: node.State, ClaimsEnabled: node.ClaimsEnabled,
-			Kinds:        executionKinds(node.Capabilities),
-			TotalOneshot: node.MaxOneshotSlots, TotalService: node.MaxServiceSlots,
+			Upgrading:          upgradeReason && upgradeRecent,
+			UpgradeInterrupted: upgradeReason && !upgradeRecent,
+			Kinds:              executionKinds(node.Capabilities),
+			TotalOneshot:       node.MaxOneshotSlots, TotalService: node.MaxServiceSlots,
 			FreeOneshot: freeSlots(node.MaxOneshotSlots, node.OneshotOccupancy),
 			FreeService: freeSlots(node.MaxServiceSlots, node.ServiceOccupancy),
 		}
@@ -510,8 +562,13 @@ func reasonsFor(l1Status, l3Status serviceStatus, nodes []nodeStatus,
 		}
 		return append(reasons, statusReason{Code: "no_alive_node", Detail: "no node is alive"}), nil
 	}
-	claiming := filterNodes(alive, func(node nodeStatus) bool { return node.ClaimsEnabled })
+	claiming := filterNodes(alive, func(node nodeStatus) bool { return node.ClaimsEnabled || node.Upgrading })
 	if len(claiming) == 0 {
+		for _, node := range alive {
+			if node.UpgradeInterrupted {
+				return append(reasons, statusReason{Code: "claims_disabled", Detail: "claims disabled by an interrupted upgrade; run wefty upgrade to restore admission"}), nil
+			}
+		}
 		return append(reasons, statusReason{Code: "claims_disabled",
 			Detail: "every alive node has claims disabled"}), nil
 	}
@@ -539,6 +596,22 @@ func reasonsFor(l1Status, l3Status serviceStatus, nodes []nodeStatus,
 		}
 	}
 	return reasons, short
+}
+
+// Upgrade admission is temporary. Keep actual eligibility and capacity at
+// zero, but let agents submit into the queue while the upgrade owns the gate.
+func upgradeQueueOnly(nodes []nodeStatus) bool {
+	upgrading := false
+	for _, node := range nodes {
+		if node.State != contract.NodeAlive || node.TotalOneshot <= 0 || len(nodeExecutableKinds(node.Kinds)) == 0 {
+			continue
+		}
+		if node.AcceptsOneshot {
+			return false
+		}
+		upgrading = upgrading || node.Upgrading
+	}
+	return upgrading
 }
 
 func allOneshotSlotsBusy(nodes []nodeStatus) bool {
@@ -594,6 +667,11 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 	}
 	if status.Busy != "" {
 		if _, err := fmt.Fprintln(writer, status.Busy); err != nil {
+			return err
+		}
+	}
+	if status.UpgradeRecovery != "" {
+		if _, err := fmt.Fprintln(writer, status.UpgradeRecovery); err != nil {
 			return err
 		}
 	}
@@ -709,4 +787,25 @@ func readLocalNodeLoad(clients *apiClients, node l1.Node) localLoadStatus {
 			len(nodeExecutableKinds(executionKinds(node.Capabilities))) > 0 && nodeload.Holding(node.OneshotOccupancy, load, limit)
 	}
 	return status
+}
+
+// Receipt + released installation lock identifies a local interrupted upgrade.
+// A live upgrader holds that directory lock through restoration and deletion.
+func localUpgradeStatus(nodeConfig string) (*upgradeDrainReceipt, bool) {
+	if nodeConfig == "" {
+		return nil, false
+	}
+	config, err := filepath.EvalSymlinks(filepath.Dir(nodeConfig))
+	if err != nil {
+		return nil, false
+	}
+	receipt, err := readUpgradeDrain(config)
+	if err != nil {
+		return nil, false
+	}
+	paths, err := resolveSetupPaths(receipt.Home)
+	if err != nil || paths.nodeConfig != filepath.Join(config, filepath.Base(nodeConfig)) {
+		return nil, false
+	}
+	return receipt, setupLockHeld(paths)
 }

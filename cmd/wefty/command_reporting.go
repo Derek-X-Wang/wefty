@@ -104,6 +104,14 @@ func classifyCommandReport(err error) commandReport {
 		report.errorDocument = contract.ErrorResponse{Error: apiError}
 	case errors.As(err, &responseErr):
 		apiError = responseErr.APIError
+		var cleanup *upgradeCleanupError
+		if errors.As(err, &cleanup) {
+			if cleanup.primary == nil {
+				apiError.Message = cleanup.restore.Error()
+			} else {
+				apiError.Message += "; " + cleanup.restore.Error()
+			}
+		}
 		report.errorDocument = contract.ErrorResponse{Error: apiError}
 		if responseErr.StatusCode >= 500 && apiError.Retryable &&
 			(apiError.Code == contract.ErrorInternal || apiError.Code == contract.ErrorRunLedgerUnavailable) {

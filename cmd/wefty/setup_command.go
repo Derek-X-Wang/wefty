@@ -44,6 +44,7 @@ import (
 // `wefty setup`. Upgrades own rebuilding; setup only installs what it is given.
 
 const (
+	setupLockProbeFile  = ".setup-lock"
 	setupL1Label        = "dev.wefty.l1"
 	setupL3Label        = "dev.wefty.l3"
 	setupNodeAgentLabel = "dev.wefty.node-agent"
@@ -107,6 +108,7 @@ type setupRequest struct {
 	installedVersion string
 	skillSource      fs.FS
 	beforeWrites     func() error
+	beforeService    func(int) error
 	serviceContext   func(int) context.Context
 	afterService     func(int, launchagent.Action) error
 	lockHeld         bool
@@ -644,6 +646,11 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	defer launchAgents.Close()
 	for index, service := range services {
+		if request.beforeService != nil {
+			if err := request.beforeService(index); err != nil {
+				return report, err
+			}
+		}
 		serviceCtx := ctx
 		if request.serviceContext != nil {
 			serviceCtx = request.serviceContext(index)
