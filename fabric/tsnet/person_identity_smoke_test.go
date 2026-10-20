@@ -23,6 +23,8 @@ func TestTSNetPersonWhoAmI(t *testing.T) {
 	if machineAuthKey == "" || personAuthKey == "" {
 		t.Skip("TS_AUTHKEY and TS_AUTHKEY_CI_TESTER are required")
 	}
+	// New clears the ambient key; restore the test fixture for the next smoke.
+	t.Setenv("TS_AUTHKEY", machineAuthKey)
 	controlURL := os.Getenv("TS_CONTROL_URL")
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 	serverName := "wefty://node/person-smoke-server-" + suffix

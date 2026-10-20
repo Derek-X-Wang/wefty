@@ -43,13 +43,13 @@ func Parse(address string) (Name, bool, error) {
 			return Name{}, true, fmt.Errorf("invalid run-ledger address %q", address)
 		}
 		return Name{kind: "run-ledger"}, true, nil
-	case "node":
+	case "node", "client", "person":
 		escapedID := strings.TrimPrefix(u.EscapedPath(), "/")
 		nodeID, err := url.PathUnescape(escapedID)
 		if err != nil || nodeID == "" || strings.Contains(escapedID, "/") {
 			return Name{}, true, fmt.Errorf("invalid node address %q", address)
 		}
-		return Name{kind: "node", nodeID: nodeID}, true, nil
+		return Name{kind: strings.ToLower(u.Hostname()), nodeID: nodeID}, true, nil
 	default:
 		return Name{}, true, fmt.Errorf("unknown wefty address %q", address)
 	}
@@ -61,7 +61,7 @@ func (n Name) String() string {
 	case "control-plane", "run-ledger":
 		return "wefty://" + n.kind
 	}
-	return "wefty://node/" + url.PathEscape(n.nodeID)
+	return "wefty://" + n.kind + "/" + url.PathEscape(n.nodeID)
 }
 
 // Hostname returns the private transport hostname for a logical address.
@@ -71,7 +71,7 @@ func (n Name) Hostname() string {
 		return n.kind
 	}
 	sum := sha256.Sum256([]byte(n.nodeID))
-	return fmt.Sprintf("node-%x", sum[:8])
+	return fmt.Sprintf("%s-%x", n.kind, sum[:8])
 }
 
 // TransportAddress returns the private transport target for a logical name.

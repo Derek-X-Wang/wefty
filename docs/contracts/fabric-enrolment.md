@@ -1,0 +1,58 @@
+# Fabric participant enrolment
+
+`fabric.Enroller` is a setup-only seam. `Enrol(ctx, EnrolSpec)` waits for the
+participant to run and returns `SelfIdentity`: opaque node, device, issuing
+Fabric and user IDs, authoritative tags, the granted Wefty logical name, and
+key expiry. `Logout(ctx, EnrolSpec)` supports rollback. The production adapter
+is `fabric/tsnet.Enroller`; the plain Fabric cannot enrol.
+
+| Participant | Required tags | Person identity |
+| --- | --- | --- |
+| node-agent | `tag:wefty-agent` | no |
+| client | `tag:wefty-client` | no |
+| l3 | `tag:wefty-client` | no |
+| l1 | `tag:wefty-control` | no |
+| person | none | required |
+
+Setup requires exactly the role's tag set. In particular, extra tags and a
+tagged person are refused. The adapter checks the granted private host label,
+not merely the requested host label. A name collision is
+`fabric.ErrGrantedNameMismatch`; no private host name crosses the seam.
+
+The setup step `enrolSetupParticipants` takes an explicit participant list,
+home, data folder and profile destination. Each machine participant uses its
+own single-use key. The input is one key per line on stdin, or a no-echo prompt
+on a TTY. A person takes no join key and receives a browser login URL through
+the caller's explicit callback. Credentials stay in memory, never in the
+profile, service arguments, service environment, or rendered service files.
+All ambient enrolment credentials and the force-login switch are removed and
+never restored. Legacy callers first capture their explicit join key in memory.
+Person enrolment exposes the login URL only through its callback; enrolment and
+rollback loggers suppress the ordinary command enrollment hint.
+Errors are scrubbed if a backend includes the key in its message.
+
+Folders live at `<data>/fabric/<participant>/` with mode `0700`. Paths stay
+inside the supplied home. Linked participant folders and unrecorded nonempty
+state are refused. A saved participant with matching name and folder is not
+started on a rerun and asks for no key. Missing saved state is refused rather
+than silently binding a new Fabric node ID to the old participant.
+
+Adding the first participant record selects the strict per-command identity
+rule described in [Connection profile](connection-profile.md). Legacy profiles
+without records retain their original request shape and submitting actor.
+
+Each successful enrolment is recorded before the next key is requested, so a
+later failure does not consume an earlier participant's key again. A tag or
+granted-name mismatch logs out the failing participant, removes its folder,
+and stops before the next participant. Previously saved participants remain.
+Cleanup has a bounded context independent of caller cancellation. Both logout
+and deletion errors are reported. `--remove` retains participant folders;
+`--purge` deletes only the known participant folders and preserves foreign
+entries and links.
+
+The step starts no service and creates no local listener or socket. #900 owns
+fleet roles and Mac/Linux service wiring. Its cutover caller must stop existing
+participants and use a staged profile destination until the whole role is
+ready to publish. Locks and the per-user client service remain slice 3 of #899;
+the step does not make concurrent use of one identity folder safe. Attended
+tsnet acceptance remains slice 4 and is not replaced by fake-enroller tests.

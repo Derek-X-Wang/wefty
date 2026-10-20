@@ -21,6 +21,8 @@ func TestTSNetSmoke(t *testing.T) {
 	if authKey == "" {
 		t.Skip("TS_AUTHKEY is not available")
 	}
+	// New clears the ambient key; restore the test fixture for the next smoke.
+	t.Setenv("TS_AUTHKEY", authKey)
 	controlURL := os.Getenv("TS_CONTROL_URL")
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 	serverName := "wefty://node/smoke-server-" + suffix

@@ -105,6 +105,9 @@ type statusReason struct {
 
 // fabricStatus is who this command was, as the control plane sees it.
 type fabricStatus struct {
+	// These are local configuration facts, not a person identity probe.
+	NodeID       string `json:"node_id,omitempty"`
+	PersonSignIn string `json:"person_sign_in,omitempty"`
 	// Kind says which sort of caller this is, so a reader never has to infer
 	// it from whether the other fields are empty: "person" when the control
 	// plane named one, "machine" when the caller is a machine principal, and
@@ -300,6 +303,8 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 		}
 	}()
 	group.Wait()
+	status.Identity.NodeID = clients.clientIdentityID
+	status.Identity.PersonSignIn = clients.localPersonSignIn
 
 	status.Services = []serviceStatus{l1Status, l3Status}
 	status.Nodes = nodeStatuses(nodes)
@@ -697,6 +702,15 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 		}
 	case status.Identity.Detail != "":
 		identity = status.Identity.Detail
+	}
+	if status.Identity.NodeID != "" {
+		identity = "client " + status.Identity.NodeID
+		if status.Identity.Detail != "" {
+			identity += "; " + status.Identity.Detail
+		}
+	}
+	if status.Identity.PersonSignIn != "" {
+		identity += "; local person sign-in: " + status.Identity.PersonSignIn
 	}
 	if _, err := fmt.Fprintf(writer, "identity: %s\n\n", identity); err != nil {
 		return err

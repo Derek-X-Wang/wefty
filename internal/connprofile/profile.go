@@ -23,7 +23,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -55,6 +57,8 @@ type Profile struct {
 	// everyone else dials.
 	L3Address  string     `json:"l3_address,omitempty"`
 	Identities Identities `json:"identities,omitzero"`
+	// Participants are independently enrolled identities. Absent on phase-1 profiles.
+	Participants map[string]Participant `json:"participants,omitempty"`
 	// AllowPlainPersonIdentities lets L1 accept the self-asserted plain person
 	// identity on person routes. Plain mode on one machine needs it.
 	AllowPlainPersonIdentities bool `json:"allow_plain_person_identities,omitempty"`
@@ -62,6 +66,24 @@ type Profile struct {
 	// claims, with their authoritative tags and slot limits.
 	NodeAdmission []NodeAdmission `json:"node_admission,omitempty"`
 }
+
+// Participant records only Wefty names, local state paths and opaque identity
+// fields. Join credentials are never part of the connection profile.
+type Participant struct {
+	Name           string    `json:"name"`
+	StateDirectory string    `json:"state_directory"`
+	NodeID         string    `json:"node_id"`
+	UserID         string    `json:"user_id,omitempty"`
+	KeyExpiry      time.Time `json:"key_expiry,omitzero"`
+}
+
+const (
+	ParticipantClient    = "client"
+	ParticipantPerson    = "person"
+	ParticipantNodeAgent = "node-agent"
+	ParticipantL1        = "l1"
+	ParticipantL3        = "l3"
+)
 
 // Identities are the plain Fabric identities the programs present.
 type Identities struct {
@@ -120,6 +142,25 @@ func (p Profile) Validate() error {
 		}
 	}
 	seen := make(map[string]bool, len(p.NodeAdmission))
+	stateFolders := make(map[string]bool)
+	for role, participant := range p.Participants {
+		if err := ValidateParticipantName(role, participant.Name); err != nil {
+			return err
+		}
+		if participant.Name == "" || participant.NodeID == "" || !filepath.IsAbs(participant.StateDirectory) ||
+			filepath.Clean(participant.StateDirectory) != participant.StateDirectory {
+			return fmt.Errorf("connection profile: participant %s needs a name, opaque node ID and absolute state directory", role)
+		}
+		for _, value := range []string{participant.Name, participant.NodeID, participant.UserID, participant.StateDirectory} {
+			if strings.TrimSpace(value) != value || strings.ContainsAny(value, "\r\n\t") {
+				return fmt.Errorf("connection profile: participant %s has invalid identity or path text", role)
+			}
+		}
+		if stateFolders[participant.StateDirectory] {
+			return fmt.Errorf("connection profile: participants must not share state directory %q", participant.StateDirectory)
+		}
+		stateFolders[participant.StateDirectory] = true
+	}
 	for _, admission := range p.NodeAdmission {
 		if strings.TrimSpace(admission.NodeID) == "" || strings.TrimSpace(admission.NodeID) != admission.NodeID {
 			return errors.New("connection profile: node_admission entries need a stable node_id")
@@ -360,4 +401,30 @@ func (l Layer) Enable(target *bool, flagName string, value bool) {
 	if value && !l.Explicit[flagName] {
 		*target = true
 	}
+}
+
+// ValidateParticipantName checks both the logical grammar and the role's name.
+func ValidateParticipantName(role, name string) error {
+	prefix := ""
+	switch role {
+	case ParticipantClient:
+		prefix = "wefty://client/"
+	case ParticipantPerson:
+		prefix = "wefty://person/"
+	case ParticipantNodeAgent:
+		prefix = "wefty://node/"
+	case ParticipantL1:
+		prefix = "wefty://control-plane"
+	case ParticipantL3:
+		prefix = "wefty://run-ledger"
+	default:
+		return fmt.Errorf("connection profile: unknown participant %q", role)
+	}
+	if err := fabric.ValidateLogicalName(name); err != nil {
+		return fmt.Errorf("connection profile: participant %s: %w", role, err)
+	}
+	if !strings.HasPrefix(name, prefix) || (!strings.HasSuffix(prefix, "/") && name != prefix) {
+		return fmt.Errorf("connection profile: participant %s needs logical name %s", role, prefix)
+	}
+	return nil
 }
