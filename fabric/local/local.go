@@ -123,11 +123,17 @@ func (d *Dialer) exchange(ctx context.Context, operation, network, address strin
 	req := request{Version: 1, Operation: operation, Participant: d.participant, NodeID: d.nodeID, Network: network, Address: address, TimeoutMillis: max(1, time.Until(deadline).Milliseconds())}
 	err = writeFrame(conn, req)
 	var reply response
+	received := &replyReader{Reader: conn}
 	if err == nil {
-		err = decodeFrame(conn, &reply, false)
+		err = decodeFrame(received, &reply, false)
 	}
 	if err != nil {
 		_ = conn.Close()
+		// An authenticated live service can close overflow without a reply.
+		// A partial reply is a protocol failure, not evidence of saturation.
+		if ctx.Err() == nil && received.bytes == 0 && (errors.Is(err, io.EOF) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)) {
+			return nil, &BusyError{}
+		}
 		return nil, establishmentError(ctx, err)
 	}
 	if reply.Code != "" {
@@ -141,6 +147,10 @@ func (d *Dialer) exchange(ctx context.Context, operation, network, address strin
 			return nil, &BusyError{}
 		case "fabric_destination_refused":
 			return nil, &fabric.DestinationRefusedError{}
+		case "invalid_request":
+			// Our own client only sends valid requests, so the running service
+			// speaks a different protocol version and needs the owner's repair.
+			return nil, &UnavailableError{Cause: errors.New("client service refused the request format")}
 		case "fabric_unreachable":
 			return nil, &fabric.ParticipantUnreachableError{Cause: errors.New("client service could not reach or confirm the participant or destination")}
 		default:
@@ -157,6 +167,18 @@ func (d *Dialer) exchange(ctx context.Context, operation, network, address strin
 	_ = conn.SetDeadline(time.Time{})
 	return &streamConn{Conn: conn}, nil
 }
+
+type replyReader struct {
+	io.Reader
+	bytes int
+}
+
+func (r *replyReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.bytes += n
+	return n, err
+}
+
 func validDestination(network, address string) bool {
 	return network == "tcp" && len(address) > 0 && len(address) <= 512 && strings.IndexFunc(address, func(r rune) bool { return r <= 32 || r == 127 }) < 0
 }

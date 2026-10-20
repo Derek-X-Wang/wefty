@@ -238,9 +238,11 @@ func TestClientToleratesReplyExtensionsButServerRequestsStayStrict(t *testing.T)
 	if err := writeFrame(conn, map[string]any{"version": 1, "operation": "check", "participant": Client, "node_id": "client", "timeout_ms": 1000, "unknown": true}); err != nil {
 		t.Fatal(err)
 	}
+	// The refusal is answered, so a client of another version is not told
+	// the service is busy, as a close without reply bytes would say.
 	var reply response
-	if err := readFrame(conn, &reply); err == nil {
-		t.Fatal("server accepted an unknown request field")
+	if err := readFrame(conn, &reply); err != nil || reply.Code != "invalid_request" {
+		t.Fatalf("unknown request field reply=%+v err=%v", reply, err)
 	}
 }
 func TestDestinationPolicyRefusalSurvivesService(t *testing.T) {

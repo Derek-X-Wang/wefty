@@ -32,17 +32,24 @@ func TestParticipantRefusesUnusableOrReplacedIdentityBeforeDial(t *testing.T) {
 		{"untagged-client", `{"BackendState":"Running","Self":{"ID":"saved","UserID":42}}`, true},
 		{"wrong-tag", `{"BackendState":"Running","Self":{"ID":"saved","Tags":["tag:wefty-control"]}}`, true},
 		{"extra-tag", `{"BackendState":"Running","Self":{"ID":"saved","Tags":["tag:wefty-client","tag:wefty-control"]}}`, true},
-		{"client", `{"BackendState":"Running","Self":{"ID":"saved","Tags":["tag:wefty-client"]}}`, false},
+		{"client", `{"BackendState":"Running","Self":{"ID":"saved","Tags":["tag:wefty-client"],"TailscaleIPs":["100.64.0.1"]}}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &Fabric{expectedIdentity: &fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}, client: statusClient(t, tc.status)}
+			if !tc.wantError {
+				status := destinationStatus()
+				if err := json.Unmarshal([]byte(tc.status), status); err != nil {
+					t.Fatal(err)
+				}
+				withDestinationStatus(t, f, status)
+			}
 			dialled := false
 			stop := errors.New("dial boundary")
 			f.dialNode = func(context.Context, string, string) (net.Conn, error) { dialled = true; return nil, stop }
 			f.dialPlan = func(context.Context, string, string) (netip.AddrPort, bool, error) {
-				return netip.MustParseAddrPort("100.64.0.1:80"), true, nil
+				return netip.MustParseAddrPort("100.64.0.3:80"), true, nil
 			}
-			_, err := f.Dial(t.Context(), "tcp", "wefty://control-plane")
+			_, err := f.Dial(t.Context(), "tcp", "100.64.0.3:80")
 			if tc.wantError {
 				var refused *fabric.ParticipantIdentityError
 				if dialled || !errors.As(err, &refused) || refused.Person {
