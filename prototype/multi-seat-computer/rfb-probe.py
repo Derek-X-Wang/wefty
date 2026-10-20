@@ -124,9 +124,10 @@ class RFB:
                 raise IOError("server msg %d" % t)
 
     def strip(self):
-        # mean colour of a 40x40 block at (20,20) inside the 120px top strip
+        # mean colour of a 40x40 block at (20,90) inside the 120px top strip
+        # (the page starts below Chromium's ~57px --no-sandbox infobar)
         r = g = b = 0
-        for y in range(20, 60, 4):
+        for y in range(90, 130, 4):
             for x in range(20, 60, 4):
                 o = (y * self.w + x) * 4
                 b += self.fb[o]; g += self.fb[o + 1]; r += self.fb[o + 2]
