@@ -99,7 +99,7 @@ func run() error {
 	} else {
 		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
-	participant, closeFabric, err := fabricconfig.Open(context.Background(), fabricconfig.Config{
+	config, err := fabricconfig.SavedService(profile, connprofile.ParticipantL3, fabricconfig.Config{
 		Mode:          *fabricMode,
 		PlainFabricID: *plainFabricID,
 		Identity: fabric.Identity{
@@ -112,7 +112,15 @@ func run() error {
 		ControlURL:     *controlURL,
 		Ephemeral:      *ephemeral,
 		Logf:           log.Printf,
-	})
+	}, connprofile.ExplicitFlags(flag.CommandLine))
+	if err != nil {
+		return err
+	}
+	*controlPlaneNodeID, err = fabricconfig.TrustedServicePeer(profile, connprofile.ParticipantL1, *controlPlaneNodeID, connprofile.ExplicitFlags(flag.CommandLine)["control-plane-node-id"])
+	if err != nil {
+		return err
+	}
+	participant, closeFabric, err := fabricconfig.Open(context.Background(), config)
 	if closeFabric != nil {
 		defer closeFabric()
 	}

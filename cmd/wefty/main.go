@@ -118,6 +118,7 @@ type globalOptions struct {
 	nodeConfigPath     string
 	oneshotLoadLimit   *float64
 	profilePath        string
+	profileFabric      string
 	participants       map[string]connprofile.Participant
 	// explicitFlags names the global flags the caller passed, so the
 	// connection profile never overrides one of them.
@@ -334,6 +335,7 @@ func applyConnectionProfile(options *globalOptions) error {
 	options.oneshotLoadLimit = &limit
 	settings := profile.CLI()
 	options.participants = profile.Participants
+	options.profileFabric = profile.Fabric
 	layer := connprofile.Layer{Explicit: options.explicitFlags}
 	layer.Fill(&options.fabricMode, "fabric", "", settings.Fabric)
 	layer.Fill(&options.l1Address, "l1", l1AddressEnv, settings.L1)

@@ -34,6 +34,12 @@ func SocketPath(home string) string {
 	if path := os.Getenv(SocketEnvironment); path != "" {
 		return path
 	}
+	return DefaultSocketPath(home)
+}
+
+// DefaultSocketPath is the installation's per-user endpoint, independent of
+// an interactive caller's environment override.
+func DefaultSocketPath(home string) string {
 	return filepath.Join(home, ".config", "wefty", "client", "service.sock")
 }
 
@@ -69,7 +75,7 @@ type Dialer struct {
 }
 
 func New(path, participant, nodeID string) (*Dialer, error) {
-	if err := validateSocketPath(path); err != nil {
+	if err := ValidateSocketPath(path); err != nil {
 		return nil, err
 	}
 	if participant != Client && participant != Person || nodeID == "" || len(nodeID) > 512 {
@@ -221,7 +227,9 @@ func decodeFrame(r io.Reader, value any, strict bool) error {
 	}
 	return nil
 }
-func validateSocketPath(path string) error {
+
+// ValidateSocketPath checks the shared socket address syntax and OS length bound.
+func ValidateSocketPath(path string) error {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || len(path) > 100 {
 		return fmt.Errorf("client-service socket needs an absolute path of at most 100 bytes; choose a shorter private folder")
 	}

@@ -36,7 +36,7 @@ type Server struct {
 }
 
 func NewServer(path string, participants map[string]Participant) (*Server, error) {
-	if err := validateSocketPath(path); err != nil {
+	if err := ValidateSocketPath(path); err != nil {
 		return nil, err
 	}
 	if _, ok := participants[Client]; !ok {

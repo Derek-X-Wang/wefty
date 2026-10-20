@@ -109,6 +109,14 @@ func New(config Config) (*Fabric, error) {
 			return nil, err
 		}
 	}
+	// Recheck saved state after taking ownership. The process-level profile
+	// check alone cannot fence deletion between that check and backend start.
+	if config.ExpectedIdentity != nil && !participantstate.HasSavedState(config.StateDir) {
+		if release != nil {
+			_ = release()
+		}
+		return nil, &fabric.ParticipantIdentityError{Person: config.ExpectedIdentity.UserID != "", Reason: "state is missing; restore this participant's original saved state"}
+	}
 	envknob.SetNoLogsNoSupport()
 	return &Fabric{
 		releaseState:     release,
