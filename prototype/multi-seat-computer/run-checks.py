@@ -348,6 +348,7 @@ echo "[shared folder]"; ls -l /wefty/service/shared
     frame5 = wait_frame(ports(5)[0], COLORS[5], t0, 60) if banner5 else None
     rc, ps5 = cexec(["sh", "-c", "ps -u 60005 -o pid,args | cut -c1-110 | head -20; echo ---; getent passwd 60005 || echo 'no passwd entry'; echo ---; tail -n 15 /run/seat-5.log"])
     shot("numeric_uid", 5)
+    dump_logs("numeric_uid")
     rec("e", "numeric-uid Seat (no passwd entry): desktop and Chromium start", "PASS" if frame5 else "FAIL",
         {"banner_s": banner5, "first_browser_frame_s": frame5, "ps_and_log": ps5})
     write_seats([seat_spec(1, True)])

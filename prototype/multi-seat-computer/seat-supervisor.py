@@ -173,6 +173,8 @@ def main():
     # A Computer restart ends every Seat: anything left on the disk is stale.
     shutil.rmtree(SEATS, ignore_errors=True)
     os.makedirs(SEATS, exist_ok=True)
+    os.makedirs("/tmp/.X11-unix", exist_ok=True)      # root-owned, sticky: Xvfb warns otherwise
+    os.chmod("/tmp/.X11-unix", 0o1777)
     os.makedirs(SHARED, exist_ok=True)
     os.chmod(SHARED, 0o1777)
     os.chmod(SEATS, 0o755)
