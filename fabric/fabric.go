@@ -37,6 +37,15 @@ type Fabric interface {
 	ConnectHost() string
 }
 
+// PublishedPortListener is implemented by a Fabric whose ordinary listeners
+// expect a wefty-only connection preface. A published port carries the
+// application's own protocol from ordinary clients, so such a Fabric opens it
+// here instead of through Listen. The listener it returns does no wefty-level
+// handshake; the Fabric decides who can reach it.
+type PublishedPortListener interface {
+	ListenPublishedPort(network, address string) (net.Listener, error)
+}
+
 // PersonIdentityTrust describes whether a Fabric authenticates person identity
 // or merely transports a development identity asserted by its peer.
 type PersonIdentityTrust string
