@@ -1221,8 +1221,10 @@ func reserveNativePublishedPort(t *testing.T) int {
 func waitNativePublishedServiceHealth(t *testing.T, clientFabric fabric.Fabric, port int, timeout time.Duration) time.Duration {
 	t.Helper()
 	address := net.JoinHostPort(clientFabric.ConnectHost(), fmt.Sprint(port))
+	// A published port takes the application's own protocol, so the probe dials
+	// it the way a browser would, with no Fabric preface (#1048).
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return clientFabric.Dial(ctx, network, address)
+		return (&net.Dialer{}).DialContext(ctx, network, address)
 	}}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
