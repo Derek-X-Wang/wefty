@@ -16,6 +16,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -1386,4 +1387,65 @@ func TestOpaqueReadinessTreatsHelperConnectionLimitAsInconclusive(t *testing.T) 
 	cancel()
 	outcomes <- serviceRunOutcome{}
 	<-done
+}
+
+// A portful service on the plain Fabric is reached by an ordinary client that
+// sends no Fabric preface, and that client is turned away while the service is
+// not ready.
+func TestPlainFabricPublishedPortServesRawClientOnlyWhenReady(t *testing.T) {
+	// Port zero lets each reservation take a free port and report it, so no
+	// released port can be taken by the backend or another process meanwhile.
+	port := 0
+	nodeAgent := &Agent{
+		fabric:       plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "node-plain-published"}),
+		registration: contract.NodeRegistration{NodeID: "node-plain-published"},
+	}
+	claim := l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Class: contract.JobClassService, PublishedPort: &port}}}
+	backend, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	go serveTestEcho(backend)
+
+	for _, ready := range []bool{true, false} {
+		listener, failure := nodeAgent.reservePublishedPort(claim)
+		if failure != nil {
+			t.Fatalf("reservePublishedPort() = %#v", failure)
+		}
+		address := listener.Addr().String()
+		clock := newManualClock(time.Unix(1_700_000_000, 0))
+		runtime := &opaqueEndpointRuntime{release: make(chan struct{})}
+		finished := make(chan serviceRunOutcome, 1)
+		dialer := &net.Dialer{}
+		go func() {
+			result, runErr := runPortfulService(
+				context.Background(), runtime, workloadRequest("plain-published"), nil, listener,
+				serviceRuntimeEndpoint{dial: func(ctx context.Context) (net.Conn, error) {
+					if !ready {
+						return nil, errors.New("backend is not ready")
+					}
+					return dialer.DialContext(ctx, "tcp4", backend.Addr().String())
+				}},
+				serviceSupervisorConfig{
+					clock: clock, startupReadinessDeadline: 10 * time.Second,
+					readinessProbeInterval: time.Second, readinessConnectTimeout: time.Second,
+				},
+			)
+			finished <- serviceRunOutcome{result: result, err: runErr}
+		}()
+		if ready {
+			waitForPublishedEcho(t, address, true)
+			close(runtime.release)
+			if outcome := waitServiceOutcome(t, finished); outcome.err != nil {
+				t.Fatalf("ready service outcome = %v", outcome.err)
+			}
+			continue
+		}
+		assertPublishedEcho(t, address, false)
+		clock.waitForDeadline(t, clock.Now().Add(10*time.Second))
+		clock.Advance(10 * time.Second)
+		waitServiceOutcome(t, finished)
+		assertPublishedEcho(t, address, false)
+	}
 }

@@ -881,6 +881,13 @@ door remains ignorant of guest addresses. Portless OCI
 services request no endpoint or probe and become running at authoritative
 `Started`.
 
+A published port carries the application's own protocol, so it never expects a
+wefty connection preface. On the localhost-only plain Fabric it is plain
+loopback TCP and accepts any local client, like a development server on
+127.0.0.1. On a Fabric that authenticates at the network layer, it admits the
+peers that Fabric admits. Computer front doors are unchanged: they identify
+their callers through the Fabric.
+
 A Computer request instead asks for exactly `view` and `control`. The helper
 protocol version that admits this request also carries the exact-authority
 `SetComputerControlState` verb and Computer-disk attachment semantics. Only a

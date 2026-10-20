@@ -95,6 +95,23 @@ func (n *Network) NewFabric(identity fabric.Identity) *Fabric {
 	return &Fabric{network: n, identity: identity}
 }
 
+// ListenPublishedPort listens on loopback for a service's published port. The
+// plain Fabric is localhost-only, so the port behaves like any local
+// development server: it accepts every local client and reads no identity
+// preface. Logical wefty names and non-loopback addresses are rejected.
+func (f *Fabric) ListenPublishedPort(network, address string) (net.Listener, error) {
+	if _, logical, err := naming.Parse(address); err != nil {
+		return nil, err
+	} else if logical {
+		return nil, fmt.Errorf("plain fabric: published port address %q must be a loopback port", address)
+	}
+	listenAddress, err := localAddress(address, true)
+	if err != nil {
+		return nil, err
+	}
+	return f.network.listen(network, listenAddress)
+}
+
 // Listen listens on localhost. A wefty logical address is registered in this
 // Network and backed by an ephemeral loopback port.
 func (f *Fabric) Listen(network, address string) (net.Listener, error) {

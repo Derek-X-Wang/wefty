@@ -759,3 +759,50 @@ func TestConnectHostProjectsPublishedLoopbackHost(t *testing.T) {
 		t.Fatalf("ConnectHost() = %q, want 127.0.0.1", got)
 	}
 }
+
+func TestListenPublishedPortAcceptsClientWithoutPreface(t *testing.T) {
+	network := NewNetwork()
+	server := network.NewFabric(fabric.Identity{NodeID: "node"})
+	ln, err := server.ListenPublishedPort("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	if ip := ln.Addr().(*net.TCPAddr).IP; !ip.IsLoopback() {
+		t.Fatalf("published port bound to %v, want loopback", ip)
+	}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(conn, conn)
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	const request = "GET / HTTP/1.0\r\n"
+	if _, err := conn.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(request))
+	if _, err := io.ReadFull(conn, got); err != nil || string(got) != request {
+		t.Fatalf("echo = %q, %v; want the bytes back unchanged", got, err)
+	}
+}
+
+func TestListenPublishedPortRejectsNonLoopbackAndLogicalAddresses(t *testing.T) {
+	server := NewNetwork().NewFabric(fabric.Identity{NodeID: "node"})
+	for _, address := range []string{"0.0.0.0:8080", "192.0.2.1:8080", "example.com:8080", "wefty://service"} {
+		ln, err := server.ListenPublishedPort("tcp", address)
+		if err == nil {
+			_ = ln.Close()
+			t.Fatalf("ListenPublishedPort(%q) succeeded, want rejection", address)
+		}
+	}
+}

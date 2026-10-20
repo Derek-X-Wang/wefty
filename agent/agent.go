@@ -827,7 +827,14 @@ func (a *Agent) reservePublishedPort(claim l1.Claim) (net.Listener, *contract.Sp
 			Code: contract.SpawnFailureProcessRequest, Message: "Fabric is required for a portful service",
 		}
 	}
-	listener, err := a.fabric.Listen("tcp", fmt.Sprintf(":%d", *port))
+	address := fmt.Sprintf(":%d", *port)
+	var listener net.Listener
+	var err error
+	if published, ok := a.fabric.(fabric.PublishedPortListener); ok {
+		listener, err = published.ListenPublishedPort("tcp", address)
+	} else {
+		listener, err = a.fabric.Listen("tcp", address)
+	}
 	if err != nil {
 		return nil, &contract.SpawnFailure{
 			Code:    contract.SpawnFailurePublishedPortOccupied,

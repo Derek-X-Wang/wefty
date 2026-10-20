@@ -73,7 +73,6 @@ func TestMain(main *testing.M) {
 
 type acceptanceHarness struct {
 	client              *http.Client
-	publishedFabric     fabric.Fabric
 	agent               *managedProcess
 	agents              []*managedProcess
 	controlPlane        *managedProcess
@@ -220,7 +219,7 @@ func newAcceptanceHarnessWithOptions(t *testing.T, options acceptanceHarnessOpti
 	}}
 	t.Cleanup(client.CloseIdleConnections)
 	return &acceptanceHarness{
-		client: client, publishedFabric: plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "service-client"}), agent: agentProcess,
+		client: client, agent: agentProcess,
 		agents: []*managedProcess{agentProcess}, controlPlane: controlPlane, runLedger: runLedger,
 		managedRoot: managedRoot, handoffRoot: handoffRoot,
 		l1Database: l1Database, spoolDirectory: spoolDirectory, controlPlaneAddress: address,
@@ -445,7 +444,7 @@ func (h *acceptanceHarness) publishedHTTPClient(t *testing.T, port int) *http.Cl
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return h.publishedFabric.Dial(ctx, network, address)
+			return (&net.Dialer{}).DialContext(ctx, network, address)
 		},
 	}}
 	t.Cleanup(client.CloseIdleConnections)
@@ -453,7 +452,7 @@ func (h *acceptanceHarness) publishedHTTPClient(t *testing.T, port int) *http.Cl
 }
 
 func (h *acceptanceHarness) dialPublished(ctx context.Context, port int) (net.Conn, error) {
-	return h.publishedFabric.Dial(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
 }
 
 func (h *acceptanceHarness) waitForJobState(t *testing.T, jobID, class string, state contract.JobState, timeout time.Duration) l1.Job {
