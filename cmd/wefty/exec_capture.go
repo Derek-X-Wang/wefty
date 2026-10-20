@@ -14,11 +14,13 @@ import (
 )
 
 type execCapture struct {
-	Storage string `json:"snapshot_storage"`
-	Base    string `json:"base_commit"`
-	Tree    string `json:"snapshot_tree"`
-	Dirty   bool   `json:"dirty"`
-	Folder  string `json:"relative_folder"`
+	CaptureSHA256 string `json:"capture_sha256,omitempty"`
+	CaptureSize   int64  `json:"capture_size_bytes,omitempty"`
+	Storage       string `json:"snapshot_storage"`
+	Base          string `json:"base_commit"`
+	Tree          string `json:"snapshot_tree"`
+	Dirty         bool   `json:"dirty"`
+	Folder        string `json:"relative_folder"`
 }
 
 type execGitError struct {

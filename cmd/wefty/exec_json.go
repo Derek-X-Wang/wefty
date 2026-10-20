@@ -210,16 +210,16 @@ func endExecObservation(clients *apiClients, capture execCapture, record contrac
 		event := execFinishedEvent(capture, record, outcome)
 		event.Reason = cause.Error()
 		if err := writeJSONLine(stdout, event); err != nil {
-			return lostExecObservation(stderr, record.RunID, capture.Storage, err)
+			return lostExecObservation(stderr, record.RunID, execCaptureLocation(capture), err)
 		}
 	}
-	return lostExecObservation(stderr, record.RunID, capture.Storage, cause)
+	return lostExecObservation(stderr, record.RunID, execCaptureLocation(capture), cause)
 }
 
 // Cancellation keeps the existing settlement and exit policy. JSON describes
 // the accepted cancellation separately from a command's own exit code.
 func cancelExecObservation(clients *apiClients, capture execCapture, runID string, jsonOutput bool, stdout, stderr io.Writer, cause error) error {
-	result := cancelExecRun(clients, runID, capture.Storage, cause, stderr)
+	result := cancelExecRun(clients, runID, capture.Storage, cause, stderr, execCaptureLocation(capture))
 	if !jsonOutput {
 		return result
 	}

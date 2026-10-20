@@ -160,6 +160,7 @@ func TestRunBridgeForwardsEveryRunTokenRoute(t *testing.T) {
 		{http.MethodGet, "/v1/runs/run-1/logs?limit=7&cursor=next"},
 		{http.MethodGet, "/v1/runs/run-1/execution"},
 		{http.MethodGet, "/v1/runs/run-1/result"},
+		{http.MethodGet, "/v1/runs/run-1/exec-capture"},
 		{http.MethodPost, "/v1/runs/run-1/envelopes"},
 		{http.MethodPost, "/v1/runs/run-1/gates"},
 	}

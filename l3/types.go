@@ -120,6 +120,7 @@ type CreateRunRequest struct {
 }
 
 type CreateRunInput struct {
+	FabricClient   bool // Set only after authenticating the Fabric client caller.
 	IdempotencyKey string
 	Actor          string
 	Request        CreateRunRequest
@@ -212,7 +213,16 @@ type RunLineage struct {
 	Descendants []LineageEntry `json:"descendants"`
 }
 
+// ExecCaptureReceipt confirms the durable bytes held for a cross-node exec.
+// This wire type belongs to the private exec transport, not the L1 contract.
+type ExecCaptureReceipt struct {
+	SHA256    string `json:"sha256"`
+	SizeBytes int64  `json:"size_bytes"`
+}
+
 type StoreOptions struct {
+	ExecCaptureMaxBytes         int64
+	ExecCaptureTotalBytes       int64
 	Clock                       Clock
 	RunTokenGrace               time.Duration
 	ComputerAuthorityInstanceID string

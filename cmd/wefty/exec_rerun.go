@@ -24,7 +24,7 @@ func execRunStorage(record contract.RunRecord) (string, bool) {
 	var params execParams
 	decoder := json.NewDecoder(bytes.NewReader(record.Params))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&params) != nil || (params.ExecVersion != 0 && params.ExecVersion != 1) {
+	if decoder.Decode(&params) != nil || (params.ExecVersion != 0 && params.ExecVersion != 1 && params.ExecVersion != 2) {
 		return "", false
 	}
 	if !filepath.IsAbs(params.Storage) || !strings.HasPrefix(filepath.Base(params.Storage), "wefty-exec-") ||
@@ -40,6 +40,10 @@ func execRunStorage(record contract.RunRecord) (string, bool) {
 }
 
 func checkExecRerunCapture(record contract.RunRecord) error {
+	var params execParams
+	if json.Unmarshal(record.Params, &params) == nil && params.ExecVersion == 2 {
+		return nil
+	}
 	storage, isExec := execRunStorage(record)
 	if !isExec {
 		return nil

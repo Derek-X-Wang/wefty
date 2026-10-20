@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -34,19 +35,20 @@ type ServerConfig struct {
 }
 
 type Server struct {
-	logf                func(string, ...any)
-	fabric              fabric.Fabric
-	store               *Store
-	callerPrincipalTag  string
-	controlPlaneNodeID  string
-	reconciler          *Reconciler
-	jobs                JobClient
-	logs                JobLogClient
-	results             JobResultClient
-	computerGrants      ComputerGrantVerifier
-	hostBootSessions    HostBootSessionVerifier
-	filterRunVisibility func(context.Context, string, string) (bool, error)
-	handler             http.Handler
+	execCaptureUploadIdle time.Duration
+	logf                  func(string, ...any)
+	fabric                fabric.Fabric
+	store                 *Store
+	callerPrincipalTag    string
+	controlPlaneNodeID    string
+	reconciler            *Reconciler
+	jobs                  JobClient
+	logs                  JobLogClient
+	results               JobResultClient
+	computerGrants        ComputerGrantVerifier
+	hostBootSessions      HostBootSessionVerifier
+	filterRunVisibility   func(context.Context, string, string) (bool, error)
+	handler               http.Handler
 }
 
 func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, error) {
@@ -85,7 +87,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if hostBootSessions == nil {
 		hostBootSessions, _ = jobs.(HostBootSessionVerifier)
 	}
-	server := &Server{fabric: f, store: store, callerPrincipalTag: tag, controlPlaneNodeID: controlPlaneNodeID,
+	server := &Server{execCaptureUploadIdle: 30 * time.Second, fabric: f, store: store, callerPrincipalTag: tag, controlPlaneNodeID: controlPlaneNodeID,
 		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, results: results, computerGrants: computerGrants,
 		hostBootSessions: hostBootSessions}
 	server.logf = config.Logf
@@ -150,6 +152,7 @@ type computerTokenContextKey struct{}
 
 func (s *Server) routes() http.Handler {
 	runs := http.NewServeMux()
+	runs.HandleFunc("GET /v1/runs/{run_id}/exec-capture", s.getExecCapture)
 	runs.HandleFunc("GET /v1/runs/{run_id}/execution", s.getRunExecution)
 	runs.HandleFunc("GET /v1/runs/{run_id}/result", s.getRunResult)
 	runs.HandleFunc("POST /v1/runs/{run_id}/envelopes", s.appendEnvelope)
@@ -162,6 +165,7 @@ func (s *Server) routes() http.Handler {
 	workflows.HandleFunc("GET /v1/workflows/{workflow_id}/versions/{version}", s.getWorkflowVersion)
 
 	root := http.NewServeMux()
+	root.Handle("POST /v1/exec-captures/{sha256}", s.authenticateFabric(s.authorize(http.HandlerFunc(s.uploadExecCapture))))
 	root.Handle("GET /v1/health", s.authenticateFabric(s.requireHealthCaller(s.authorize(http.HandlerFunc(s.getDispatchHealth)))))
 	root.Handle("/v1/computer-token/mint", s.authenticateFabric(http.HandlerFunc(s.mintComputerToken)))
 	root.Handle("/v1/computer-token/revoke", s.authenticateFabric(http.HandlerFunc(s.revokeComputerTokens)))
@@ -632,6 +636,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	record, replayed, err := s.store.CreateRun(r.Context(), CreateRunInput{
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 		Actor:          actor,
+		FabricClient:   r.Header.Get("Authorization") == "",
 		Request:        request,
 	})
 	if err != nil {

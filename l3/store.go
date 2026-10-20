@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,11 @@ var workflowIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 // Store is the L3-owned SQLite ledger. It intentionally has no access to the
 // L1 database; the outbox crosses that boundary only through the L1 protocol.
 type Store struct {
+	execCaptureMu               *sync.Mutex
+	execCaptureRoot             string
+	execCaptureMax              int64
+	execCaptureTotal            int64
+	execCaptureReserved         int64
 	db                          *sql.DB
 	clock                       Clock
 	tokenGrace                  time.Duration
@@ -76,7 +82,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if instanceID == "" {
 		instanceID = "default"
 	}
-	store := &Store{db: db, clock: clock, tokenGrace: tokenGrace, computerAuthorityInstanceID: instanceID}
+	store := &Store{execCaptureMu: &sync.Mutex{}, db: db, clock: clock, tokenGrace: tokenGrace, computerAuthorityInstanceID: instanceID}
 	if err := store.initialize(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -84,6 +90,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if err := store.migrateLegacyRunJobLinks(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("l3: migrate legacy Run job links: %w", err)
+	}
+	if err := store.initializeExecCaptures(context.Background(), path, options); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return store, nil
 }
@@ -770,6 +780,15 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 		return contract.RunRecord{}, false, err
 	}
 	input = normalized
+	if err := validateExecCaptureRun(input); err != nil {
+		return record, false, err
+	}
+	if _, present, err := parseExecCaptureReference(input.Request.Params); err != nil {
+		return record, false, err
+	} else if present {
+		s.execCaptureMu.Lock()
+		defer s.execCaptureMu.Unlock()
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -873,6 +892,10 @@ VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.R
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store run")
 	}
+	if err := s.attachExecCaptureTx(ctx, tx, input.Request.Params, runID, input.Actor); err != nil {
+		return record, false, err
+	}
+
 	if snapshot.Image == nil {
 		interpreterJSON, _ := json.Marshal(nonNilStrings(snapshot.Interpreter))
 		_, err = tx.ExecContext(ctx, `INSERT INTO run_scripts(run_id, content, sha256, interpreter_json, mode) VALUES(?, ?, ?, ?, ?)`,
@@ -948,11 +971,34 @@ func (s *Store) CreateRerun(ctx context.Context, input CreateRerunInput) (record
 	digest := sha256.Sum256(hashInput)
 	requestHash := hex.EncodeToString(digest[:])
 
+	var sourceParams []byte
+	if e := s.db.QueryRowContext(ctx, "SELECT params_json FROM runs WHERE run_id=?", input.SourceRunID).Scan(&sourceParams); e != nil && !errors.Is(e, sql.ErrNoRows) {
+		return record, false, internalError(e, "read rerun capture source")
+	}
+	if _, present, e := parseExecCaptureReference(sourceParams); e != nil {
+		return record, false, e
+	} else if present {
+		s.execCaptureMu.Lock()
+		defer s.execCaptureMu.Unlock()
+	}
+
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "begin rerun creation")
 	}
 	defer tx.Rollback()
+	// Deleted exec inputs are refused even when this key could replay a prior
+	// rerun. A replay is not permission to reuse capture bytes that no longer exist.
+	var execSourceParams []byte
+	sourceErr := tx.QueryRowContext(ctx, `SELECT params_json FROM runs WHERE run_id=?`, input.SourceRunID).Scan(&execSourceParams)
+	if sourceErr == nil {
+		if err := s.checkExecCaptureTx(ctx, tx, execSourceParams, input.Actor); err != nil {
+			return record, false, err
+		}
+	} else if !errors.Is(sourceErr, sql.ErrNoRows) {
+		return record, false, internalError(sourceErr, "read rerun capture source")
+	}
+
 	var existingID, existingHash string
 	err = tx.QueryRowContext(ctx, "SELECT run_id, request_hash FROM runs WHERE actor=? AND idempotency_key=?", input.Actor, input.IdempotencyKey).Scan(&existingID, &existingHash)
 	if err == nil {
@@ -1051,6 +1097,10 @@ VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, dispatchKey, inp
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store rerun")
 	}
+	if err := s.attachExecCaptureTx(ctx, tx, paramsJSON, runID, input.Actor); err != nil {
+		return record, false, err
+	}
+
 	if snapshot.Image == nil {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO run_scripts(run_id, content, sha256, interpreter_json, mode) VALUES(?, ?, ?, ?, ?)`,
 			runID, snapshot.Content, snapshot.SHA256, interpreterJSON, snapshot.Mode); err != nil {
