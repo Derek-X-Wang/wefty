@@ -90,7 +90,7 @@ class RFB:
         nl = struct.unpack(">I", self.ws.recv(4))[0]
         self.ws.recv(nl)
         # 32bpp depth24 little-endian BGRX; Raw only
-        self.ws.send(struct.pack(">BxxBBBBHHHBBBxxx", 0, 32, 24, 0, 1, 255, 255, 255, 16, 8, 0))
+        self.ws.send(struct.pack(">BxxxBBBBHHHBBBxxx", 0, 32, 24, 0, 1, 255, 255, 255, 16, 8, 0))
         self.ws.send(struct.pack(">BxHi", 2, 1, 0))
         self.fb = bytearray(self.w * self.h * 4)
 
