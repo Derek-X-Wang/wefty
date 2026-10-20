@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
+	"strings"
 )
 
 // packageTestDirectory is TestMain's temporary folder; it also holds what the
@@ -14,6 +16,7 @@ import (
 // the environment before any test changed it.
 var (
 	packageTestDirectory   string
+	packageTestSocket      string
 	packageTestEnvironment []string
 )
 
@@ -45,7 +48,25 @@ func TestMain(main *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	socketDir, err := os.MkdirTemp("/tmp", "ws-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	packageTestSocket = filepath.Join(socketDir, "s")
+	if err := os.Setenv(local.SocketEnvironment, packageTestSocket); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	filtered := packageTestEnvironment[:0]
+	for _, entry := range packageTestEnvironment {
+		if !strings.HasPrefix(entry, local.SocketEnvironment+"=") {
+			filtered = append(filtered, entry)
+		}
+	}
+	packageTestEnvironment = append(filtered, local.SocketEnvironment+"="+packageTestSocket)
 	code := main.Run()
+	_ = os.RemoveAll(socketDir)
 	_ = os.RemoveAll(directory)
 	os.Exit(code)
 }

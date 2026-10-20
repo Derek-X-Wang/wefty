@@ -9,6 +9,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/internal/naming"
+	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -27,13 +28,22 @@ type Enroller struct {
 
 func (e Enroller) node(config Config) (enrolNode, error) {
 	if e.newNode != nil {
-		return e.newNode(config)
+		release, err := participantstate.Acquire(config.StateDir, config.Name)
+		if err != nil {
+			return nil, err
+		}
+		node, err := e.newNode(config)
+		if err != nil {
+			_ = release()
+			return nil, err
+		}
+		return &lockedEnrolNode{enrolNode: node, release: release}, nil
 	}
 	f, err := New(config)
 	if err != nil {
 		return nil, err
 	}
-	return f.server, nil
+	return &ownedEnrolNode{Fabric: f}, nil
 }
 
 // Enrol holds the join credential only in memory and waits for Running. A
@@ -162,3 +172,16 @@ func (e Enroller) Logout(ctx context.Context, spec fabric.EnrolSpec) (result err
 }
 
 var _ fabric.Enroller = Enroller{}
+
+type lockedEnrolNode struct {
+	enrolNode
+	release func() error
+}
+
+func (n *lockedEnrolNode) Close() error { return errors.Join(n.enrolNode.Close(), n.release()) }
+
+// Keep the backend-local API inside this private enrolment adapter while
+// retaining Fabric.Close's ownership lock through backend shutdown.
+type ownedEnrolNode struct{ *Fabric }
+
+func (n *ownedEnrolNode) LocalClient() (*local.Client, error) { return n.localClient() }

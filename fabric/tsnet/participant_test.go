@@ -39,6 +39,9 @@ func TestParticipantRefusesUnusableOrReplacedIdentityBeforeDial(t *testing.T) {
 			dialled := false
 			stop := errors.New("dial boundary")
 			f.dialNode = func(context.Context, string, string) (net.Conn, error) { dialled = true; return nil, stop }
+			f.dialPlan = func(context.Context, string, string) (netip.AddrPort, bool, error) {
+				return netip.MustParseAddrPort("100.64.0.1:80"), true, nil
+			}
 			_, err := f.Dial(t.Context(), "tcp", "wefty://control-plane")
 			if tc.wantError {
 				var refused *fabric.ParticipantIdentityError
@@ -205,6 +208,10 @@ func TestLegacyOpaqueJoinWaitsThroughLoginStates(t *testing.T) {
 				stop := errors.New("transport boundary")
 				reached := false
 				f.dialNode = func(context.Context, string, string) (net.Conn, error) { reached = true; return nil, stop }
+				f.dialPlan = func(_ context.Context, _, address string) (netip.AddrPort, bool, error) {
+					ipp, err := netip.ParseAddrPort(address)
+					return ipp, err == nil, err
+				}
 				f.listenNode = func(string, string) (net.Listener, error) { reached = true; return nil, stop }
 				if operation == "dial" {
 					_, err = f.Dial(t.Context(), "tcp", "remote")

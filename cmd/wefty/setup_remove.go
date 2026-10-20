@@ -14,6 +14,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -334,7 +335,13 @@ func purgeSetupParticipants(root *os.Root, paths setupPaths, report *setupRemove
 			report.Warnings = append(report.Warnings, "left "+filepath.Join(paths.home, rel)+": this is not an enrolled participant folder; inspect it before removing it yourself")
 			continue
 		}
-		if err := root.RemoveAll(rel); err != nil {
+		release, err := participantstate.Acquire(filepath.Join(paths.home, rel), entry.Name())
+		if err != nil {
+			return err
+		}
+		removeErr := root.RemoveAll(rel)
+		releaseErr := release()
+		if err := errors.Join(removeErr, releaseErr); err != nil {
 			return err
 		}
 		report.Changes = append(report.Changes, filepath.Join(paths.home, rel))

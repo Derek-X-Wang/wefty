@@ -14,6 +14,7 @@ import (
 )
 
 func TestCancelFromAnotherMachineHintsWithoutPersonRetry(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
 	var requests atomic.Int32
 	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		requests.Add(1)
@@ -31,6 +32,11 @@ func TestCancelFromAnotherMachineHintsWithoutPersonRetry(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "profile.json")
 		if err := connprofile.Write(path, profile); err != nil {
 			t.Fatal(err)
+		}
+		if participantProfile {
+			socket := clientServiceSocketForTest(t)
+			t.Setenv("WEFTY_CLIENT_SOCKET", socket)
+			startClientServiceForTest(t, buildWefty(t), path, socket)
 		}
 		code, output := runWefty(t, buildWefty(t), 30*time.Second, "--profile="+path, "--l1="+address, "cancel", "job-other-machine")
 		hasHint := strings.Contains(output, "submitted from another machine")

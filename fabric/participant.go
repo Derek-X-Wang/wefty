@@ -24,3 +24,18 @@ func (e *ParticipantUnreachableError) Error() string {
 	return fmt.Sprintf("Fabric participant could not be reached or confirmed; check network reachability and retry with backoff: %v", e.Cause)
 }
 func (e *ParticipantUnreachableError) Unwrap() error { return e.Cause }
+
+// ParticipantInUseError refuses a second owner without revealing state paths.
+type ParticipantInUseError struct{ Participant string }
+
+func (e *ParticipantInUseError) Error() string {
+	return fmt.Sprintf("participant %q is already in use; stop its current owner before starting another process", e.Participant)
+}
+
+// DestinationRefusedError means an outbound target is outside the Fabric.
+// It is a policy refusal, never permission to use a host-network fallback.
+type DestinationRefusedError struct{}
+
+func (*DestinationRefusedError) Error() string {
+	return "outbound destination is not a Fabric peer; use a Fabric participant endpoint"
+}

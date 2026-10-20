@@ -1,10 +1,10 @@
 package main
 
 import (
-	"os"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/l3"
@@ -100,10 +100,5 @@ func localPersonSignIn(options globalOptions, now time.Time) string {
 }
 
 func hasSavedParticipantState(directory string) bool {
-	info, err := os.Lstat(directory)
-	if err != nil || !info.IsDir() {
-		return false
-	}
-	entries, err := os.ReadDir(directory)
-	return err == nil && len(entries) != 0
+	return participantstate.HasSavedState(directory)
 }
