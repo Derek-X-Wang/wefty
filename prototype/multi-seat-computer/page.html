@@ -1,0 +1,24 @@
+<!doctype html><meta charset=utf-8><title>seat page</title>
+<style>html,body{margin:0;height:100%;overflow:hidden}#top{height:120px}canvas{display:block}</style>
+<div id=top></div><canvas id=c width=1280 height=600></canvas>
+<script>
+// PROTOTYPE page. ?c=RRGGBB seat colour (top strip + body); &heavy=1 busy page.
+// Input oracle: mousedown -> strip turns 00ff00, keydown -> strip turns 0000ff.
+const q=new URLSearchParams(location.search);
+const col='#'+(q.get('c')||'808080');
+document.body.style.background=col;
+const strip=document.getElementById('top');strip.style.background=col;
+addEventListener('mousedown',()=>{strip.style.background='#00ff00'});
+addEventListener('keydown',()=>{strip.style.background='#0000ff'});
+if(q.get('heavy')==='1'){
+  const keep=[];                       // ~96 MB of JS heap
+  for(let i=0;i<12;i++){const a=new Float64Array(1<<20);a.fill(i+0.5);keep.push(a)}
+  window.keep=keep;
+  const host=document.createElement('div');
+  host.style.cssText='position:absolute;top:0;right:0;width:600px;font:10px monospace';
+  for(let i=0;i<4000;i++){const d=document.createElement('div');d.textContent='row '+i+' '+Math.random();host.appendChild(d)}
+  document.body.appendChild(host);
+  const g=document.getElementById('c').getContext('2d');let t=0;
+  (function f(){t++;for(let i=0;i<60;i++){g.fillStyle='hsl('+((t*3+i*17)%360)+',80%,50%)';g.fillRect((i*21+t*7)%1280,(i*37+t*3)%600,200,100)}requestAnimationFrame(f)})();
+}
+</script>
