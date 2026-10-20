@@ -19,7 +19,7 @@ L1 ignore the profile's `node_admission`.
 | Program | Finds the profile | Reads |
 | --- | --- | --- |
 | `wefty` (CLI) | `--profile`, else `$WEFTY_PROFILE`, else `~/.config/wefty/profile.json` when it exists | `fabric`, `plain_fabric_id`, `l1_address` (`--l1`), `l3_address` (`--l3`), `identities.cli`, `identities.person_user_id`, `identities.person_device_id`, `participants.client`, `participants.person` |
-| `wefty-l1` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--listen`), `l3_address` (`--run-ledger`), `allow_plain_person_identities`, `node_admission` |
+| `wefty-l1` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--listen`), `l3_address` (`--run-ledger`), `allow_plain_person_identities`, `node_admission`, `automatic_node_admission` |
 | `wefty-l3` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l3_address` (`--listen`), `l1_address` (`--control-plane`) |
 | `wefty-agent` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--control-plane`), `l3_address` (`--run-ledger`), `identities.node` (`--node-id`) |
 
@@ -34,6 +34,18 @@ it as a diagnostic check and uses its L1 settings only to verify the installed
 node. Setup reads its installation profile to preserve owner settings. OCI
 node commands keep their node-local control-socket path.
 
+`automatic_node_admission` is an optional boolean, false by default. It maps
+to L1's `--automatic-node-admission` flag; an explicit `=false` flag overrides
+a true profile value. It affects only L1's service input digest. Current setup
+does not turn this setting on. L1 refuses to enable it unless the
+Fabric reports authenticated identities through `PersonIdentityTrustProvider`.
+The plain-person development override does not bypass this requirement.
+The setting gates only new admissions. A marked Node keeps its default Pinned
+policy when the setting is turned off. A removed configured policy falls back
+to defaults derived from the Node's admission mark, never its old stored policy.
+See [automatic Node admission](lease-fencing-dispatch.md#automatic-node-admission)
+for first-registration policy and retirement.
+
 ## Format
 
 Version 1 is a JSON object. Unknown fields, trailing data, an unsupported
@@ -41,7 +53,8 @@ version or fabric, a `plain_fabric_id` without the `plain-` prefix, a node
 named twice, negative slots or an invalid tag are refused with the file's path.
 The optional `participants` object extends version 1. Existing phase-1 profiles
 need no migration and are still written without this object. Older binaries
-that reject unknown fields cannot read a profile containing `participants`;
+that reject unknown fields cannot read a profile containing `participants`
+or `automatic_node_admission`;
 fleet upgrade and rollback wiring must account for that limitation.
 
 ```json

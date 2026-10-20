@@ -112,6 +112,7 @@ func run() error {
 		initiateAdminBootstrap   = flag.Bool("initiate-admin-bootstrap", false, "create a short-lived local admin bootstrap challenge and exit")
 		resetAdminPolicy         = flag.Bool("reset-admin-policy", false, "locally clear the admin roster, reopen bootstrap, audit the reset, and exit")
 		allowPlainPersonIDs      = flag.Bool("allow-plain-person-identities", false, "DEVELOPMENT ONLY: allow self-asserted plain Fabric identities on person routes")
+		automaticNodeAdmission   = flag.Bool("automatic-node-admission", false, "admit new authenticated agent Nodes with their reserved Pinned tag and default slots")
 		runLedgerAddress         = flag.String("run-ledger", l1.DefaultRunLedgerAddress, "L3 run-ledger Fabric address; pass --run-ledger= for an installation that has no run ledger")
 		runLedgerNodeID          = flag.String("run-ledger-node-id", "run-ledger", "authenticated Fabric identity allowed to request Computer scope proofs and classified as run-ledger job provenance; on tsnet this is the run ledger's Tailscale StableID, not a friendly name")
 		profilePath              = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, listen and run-ledger addresses, the plain person identity rule and node admission not set by flags (default $"+connprofile.EnvironmentVariable+")")
@@ -133,7 +134,7 @@ func run() error {
 	}
 	if err := applyConnectionProfile(*profilePath, connprofile.ExplicitFlags(flag.CommandLine), l1Options{
 		fabricMode: fabricMode, plainFabricID: plainFabricID, listen: listenAddress, runLedger: runLedgerAddress,
-		allowPlainPersonIDs: allowPlainPersonIDs, nodePolicies: nodePolicies,
+		allowPlainPersonIDs: allowPlainPersonIDs, automaticNodeAdmission: automaticNodeAdmission, nodePolicies: nodePolicies,
 	}); err != nil {
 		return err
 	}
@@ -227,7 +228,8 @@ func run() error {
 	}
 	server, err := l1.NewServer(participant, store, l1.ServerConfig{
 		NodePolicies: nodePolicies, AllowSelfAssertedPersonIdentities: *allowPlainPersonIDs,
-		ComputerTokenRevoker: computerTokenRevoker, RunLedgerNodeID: *runLedgerNodeID,
+		AutomaticNodeAdmission: *automaticNodeAdmission,
+		ComputerTokenRevoker:   computerTokenRevoker, RunLedgerNodeID: *runLedgerNodeID,
 	})
 	if err != nil {
 		return err
@@ -262,6 +264,7 @@ func run() error {
 type l1Options struct {
 	fabricMode, plainFabricID, listen, runLedger *string
 	allowPlainPersonIDs                          *bool
+	automaticNodeAdmission                       *bool
 	nodePolicies                                 map[string]l1.NodePolicy
 }
 
@@ -280,6 +283,7 @@ func applyConnectionProfile(path string, explicit map[string]bool, options l1Opt
 	layer.Fill(options.listen, "listen", "", settings.Listen)
 	layer.Fill(options.runLedger, "run-ledger", "", settings.RunLedger)
 	layer.Enable(options.allowPlainPersonIDs, "allow-plain-person-identities", settings.AllowPlainPersonIdentities)
+	layer.Enable(options.automaticNodeAdmission, "automatic-node-admission", settings.AutomaticNodeAdmission)
 	if !explicit["node-tags"] && !explicit["node-max-oneshot-slots"] && !explicit["node-max-service-slots"] {
 		for nodeID, policy := range settings.NodePolicies() {
 			options.nodePolicies[nodeID] = policy
