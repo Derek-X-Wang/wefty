@@ -17,6 +17,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnstate"
 	tailscaletsnet "tailscale.com/tsnet"
 )
 
@@ -24,12 +25,13 @@ import (
 // node. Name is the node's wefty logical name, such as
 // wefty://control-plane or wefty://node/runner-1.
 type Config struct {
-	Name           string
-	StateDir       string
-	Credential     fabric.Credential
-	Ephemeral      bool
-	CoordinatorURL string
-	Logf           func(format string, args ...any)
+	Name             string
+	StateDir         string
+	Credential       fabric.Credential
+	Ephemeral        bool
+	CoordinatorURL   string
+	Logf             func(format string, args ...any)
+	ExpectedIdentity *fabric.Identity
 }
 
 // Fabric is an embedded production fabric node.
@@ -38,20 +40,38 @@ type Fabric struct {
 	localName      naming.Name
 	coordinatorURL string
 
-	clientMu sync.Mutex
-	client   *local.Client
-	fabricID string
+	clientMu         sync.Mutex
+	client           *local.Client
+	fabricID         string
+	expectedIdentity *fabric.Identity
+	// Transport calls stay injectable for secretless seam tests.
+	dialNode   func(context.Context, string, string) (net.Conn, error)
+	listenNode func(string, string) (net.Listener, error)
 }
 
 // New creates a tsnet-backed Fabric without starting it. The first Listen,
 // Dial, or WhoIs call starts the embedded node.
 func New(config Config) (*Fabric, error) {
+	// The embedding process owns enrolment. Never let the dependency consume
+	// an ambient join credential, or pass one on to later child processes.
+	if err := ClearAmbientCredentials(); err != nil {
+		return nil, err
+	}
 	name, logical, err := naming.Parse(config.Name)
 	if err != nil {
 		return nil, err
 	}
 	if !logical {
 		return nil, fmt.Errorf("tsnet fabric: Name %q is not a wefty logical name", config.Name)
+	}
+	if config.ExpectedIdentity != nil {
+		if config.Credential.Value != "" || config.Ephemeral || config.ExpectedIdentity.NodeID == "" {
+			return nil, fmt.Errorf("saved participant requires a recorded node ID and no enrolment credential or ephemeral lifetime")
+		}
+		// The dependency can initiate a login flow while starting a revoked node.
+		// Never expose that flow, even when legacy enrollment URL output is opted in.
+		// VerifyParticipant and every transport operation refuse unusable state.
+		config.Logf = func(string, ...any) {}
 	}
 	// Wefty owns its logs: the embedded node must never upload its log to
 	// the pinned tsnet dependency's log service. This must run before the
@@ -73,8 +93,9 @@ func New(config Config) (*Fabric, error) {
 	// with the variable's name) keeps that name inside the fabric seam.
 	envknob.SetNoLogsNoSupport()
 	return &Fabric{
-		localName:      name,
-		coordinatorURL: config.CoordinatorURL,
+		localName:        name,
+		expectedIdentity: config.ExpectedIdentity,
+		coordinatorURL:   config.CoordinatorURL,
 		server: &tailscaletsnet.Server{
 			Dir:        config.StateDir,
 			Hostname:   name.Hostname(),
@@ -98,6 +119,11 @@ func New(config Config) (*Fabric, error) {
 // Listen listens on the tailnet. Logical listeners must match the local name;
 // their private transport address is chosen inside this package.
 func (f *Fabric) Listen(network, address string) (net.Listener, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), participantStartTimeout)
+	defer cancel()
+	if err := f.checkParticipant(ctx); err != nil {
+		return nil, err
+	}
 	name, logical, err := naming.Parse(address)
 	if err != nil {
 		return nil, err
@@ -111,25 +137,78 @@ func (f *Fabric) Listen(network, address string) (net.Listener, error) {
 			return nil, err
 		}
 		address = net.JoinHostPort("", port)
+	} else if _, _, err := net.SplitHostPort(address); err != nil {
+		if _, err := f.opaqueAddress(ctx, address, true); err != nil {
+			return nil, err
+		}
+		address = ":80"
+	}
+	if f.listenNode != nil {
+		return f.listenNode(network, address)
 	}
 	return f.server.Listen(network, address)
 }
 
 // Dial connects over the tailnet, resolving wefty logical names internally.
 func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	if err := f.checkParticipant(ctx); err != nil {
+		return nil, err
+	}
 	name, logical, err := naming.Parse(address)
 	if err != nil {
 		return nil, err
 	}
 	if logical {
 		address = name.TransportAddress()
+	} else if _, _, err := net.SplitHostPort(address); err != nil {
+		address, err = f.opaqueAddress(ctx, address, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if f.dialNode != nil {
+		return f.dialNode(ctx, network, address)
 	}
 	return f.server.Dial(ctx, network, address)
+}
+
+// Opaque node IDs are resolved only from authenticated network state. They
+// are never treated as DNS names. A listener must name this very participant.
+func (f *Fabric) opaqueAddress(ctx context.Context, nodeID string, localOnly bool) (string, error) {
+	status, err := f.runningStatus(ctx)
+	if err != nil {
+		return "", err
+	}
+	var peer *ipnstate.PeerStatus
+	if status.Self != nil && string(status.Self.ID) == nodeID {
+		peer = status.Self
+	}
+	if !localOnly && peer == nil {
+		for _, candidate := range status.Peer {
+			if candidate != nil && string(candidate.ID) == nodeID {
+				peer = candidate
+				break
+			}
+		}
+	}
+	if peer == nil {
+		return "", fabric.ErrIdentityNotFound
+	}
+	if localOnly {
+		return ":80", nil
+	}
+	if len(peer.TailscaleIPs) == 0 {
+		return "", fabric.ErrIdentityIncomplete
+	}
+	return net.JoinHostPort(peer.TailscaleIPs[0].String(), "80"), nil
 }
 
 // WhoIs translates the embedded network's authenticated peer record into a
 // wefty-owned Identity.
 func (f *Fabric) WhoIs(ctx context.Context, remoteAddress string) (fabric.Identity, error) {
+	if err := f.checkParticipant(ctx); err != nil {
+		return fabric.Identity{}, err
+	}
 	client, err := f.localClient()
 	if err != nil {
 		return fabric.Identity{}, err

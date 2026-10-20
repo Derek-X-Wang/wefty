@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
@@ -67,8 +68,16 @@ func classifyCommandReport(err error) commandReport {
 	var localErr *ocicontrol.ResponseError
 	var responseErr *apiResponseError
 	var captureConflict *execCaptureConflictError
+	var personSignIn *personSignInRequiredError
+	var participantIdentity *fabric.ParticipantIdentityError
 	var apiError contract.APIError
 	switch {
+	case errors.As(err, &personSignIn), errors.As(err, &participantIdentity):
+		report.exitCode = exitUnauthorized
+		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{
+			Code: contract.ErrorPersonIdentityRequired, Message: err.Error(), Retryable: false,
+		}}
+		return report
 	case errors.As(err, &outcome):
 		report.exitCode, report.stdoutVerdict = exitRunFailed, true
 		return report

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -32,7 +33,7 @@ func executeCancel(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 		}
 		var run contract.RunRecord
 		if err := clients.l3.do(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(args[0])+"/cancel", nil, nil, &run, http.StatusOK); err != nil {
-			return err
+			return clients.cancelIdentityHint(err)
 		}
 		if jsonOutput {
 			return writeJSON(stdout, newRunRecordJSON(run, includeScript))
@@ -42,11 +43,24 @@ func executeCancel(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	}
 	var job l1.Job
 	if err := clients.l1.do(ctx, http.MethodPost, "/v1/jobs/"+url.PathEscape(args[0])+"/cancel", nil, nil, &job, http.StatusOK); err != nil {
-		return err
+		return clients.cancelIdentityHint(err)
 	}
 	if jsonOutput {
 		return writeJSON(stdout, job)
 	}
 	_, err := fmt.Fprintf(stdout, "JOB ID\tSTATE\tOUTCOME\n%s\t%s\t%s\n", job.JobID, job.State, job.Outcome)
+	return err
+}
+
+func (clients *apiClients) cancelIdentityHint(err error) error {
+	if !clients.participantProfile {
+		return err
+	}
+	var response *apiResponseError
+	if errors.As(err, &response) && (response.APIError.Code == contract.ErrorNotFound || response.APIError.Code == contract.ErrorForbidden) {
+		// L1 deliberately hides another submitter's job behind not_found. The
+		// conditional hint does not claim the target exists and never retries.
+		return fmt.Errorf("%w; if this was submitted from another machine, cancel it there; this command uses this machine's client identity", err)
+	}
 	return err
 }

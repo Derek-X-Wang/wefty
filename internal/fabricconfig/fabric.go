@@ -1,6 +1,7 @@
 package fabricconfig
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -10,15 +11,16 @@ import (
 )
 
 type Config struct {
-	Mode           string
-	Identity       fabric.Identity
-	PlainFabricID  string
-	Name           string
-	StateDirectory string
-	AuthKey        string
-	ControlURL     string
-	Ephemeral      bool
-	Logf           func(string, ...any)
+	Mode             string
+	Identity         fabric.Identity
+	PlainFabricID    string
+	Name             string
+	StateDirectory   string
+	AuthKey          string
+	ControlURL       string
+	Ephemeral        bool
+	Logf             func(string, ...any)
+	ExpectedIdentity *fabric.Identity
 }
 
 type CloseFunc func() error
@@ -41,15 +43,21 @@ func Open(config Config) (fabric.Fabric, CloseFunc, error) {
 			return nil, nil, errors.New("fabric config: tsnet name is required")
 		}
 		participant, err := tsnet.New(tsnet.Config{
-			Name:           config.Name,
-			StateDir:       config.StateDirectory,
-			Credential:     fabric.Credential{Value: config.AuthKey},
-			Ephemeral:      config.Ephemeral,
-			CoordinatorURL: config.ControlURL,
-			Logf:           config.Logf,
+			Name:             config.Name,
+			StateDir:         config.StateDirectory,
+			Credential:       fabric.Credential{Value: config.AuthKey},
+			Ephemeral:        config.Ephemeral,
+			CoordinatorURL:   config.ControlURL,
+			Logf:             config.Logf,
+			ExpectedIdentity: config.ExpectedIdentity,
 		})
 		if err != nil {
 			return nil, nil, err
+		}
+		if config.ExpectedIdentity != nil {
+			if err := participant.VerifyParticipant(context.Background()); err != nil {
+				return nil, nil, errors.Join(err, participant.Close())
+			}
 		}
 		return participant, participant.Close, nil
 	default:
