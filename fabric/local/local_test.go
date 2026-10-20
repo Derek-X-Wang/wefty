@@ -293,8 +293,8 @@ func TestLocalRejectsUnboundedOrUnknownWireRequests(t *testing.T) {
 	_ = conn.SetDeadline(time.Now().Add(time.Second))
 	_, _ = conn.Write([]byte{0, 1, 0, 0})
 	var reply response
-	if err := readFrame(conn, &reply); err == nil {
-		t.Fatal("oversized frame accepted")
+	if err := readFrame(conn, &reply); err != nil || reply.Code != "invalid_request" {
+		t.Fatalf("oversized frame refusal=%+v err=%v", reply, err)
 	}
 	select {
 	case <-calls:
