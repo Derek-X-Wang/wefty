@@ -1043,9 +1043,17 @@ func newCapabilityTestAgent(t *testing.T, network *plain.Network, nodeID string,
 	return nodeAgent
 }
 
+// capabilityWaitTimeout bounds the wait-until helpers below. They return as soon
+// as L1 shows the expected node, so the long bound only matters when a busy
+// machine delays the first heartbeat (#1058).
+const (
+	capabilityWaitTimeout = 30 * time.Second
+	capabilityWaitPoll    = 10 * time.Millisecond
+)
+
 func waitForAgentNode(t *testing.T, store *l1.Store, nodeID string, predicate func(l1.Node) bool) l1.Node {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(capabilityWaitTimeout)
 	for time.Now().Before(deadline) {
 		nodes, err := store.ListNodes(context.Background())
 		if err == nil {
@@ -1055,7 +1063,7 @@ func waitForAgentNode(t *testing.T, store *l1.Store, nodeID string, predicate fu
 				}
 			}
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(capabilityWaitPoll)
 	}
 	nodes, _ := store.ListNodes(context.Background())
 	t.Fatalf("node %q did not reach capability predicate: %#v", nodeID, nodes)
@@ -1121,10 +1129,10 @@ func assertAgentPublishesProbeWithdrawalByNextSuccessfulHeartbeat(t *testing.T) 
 	close(allowFailure)
 	select {
 	case <-failedProbe:
-	case <-time.After(5 * time.Second):
+	case <-time.After(capabilityWaitTimeout):
 		t.Fatal("heartbeat probe did not fail")
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(capabilityWaitTimeout)
 	for nodeAgent.CapabilitySnapshot().Capabilities["kind:oci"] && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
@@ -1138,14 +1146,14 @@ func assertAgentPublishesProbeWithdrawalByNextSuccessfulHeartbeat(t *testing.T) 
 		if err != nil {
 			t.Fatalf("agent run after capability withdrawal: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(capabilityWaitTimeout):
 		t.Fatal("agent did not stop")
 	}
 }
 
 func waitForNodeCapability(t *testing.T, store *l1.Store, wantOCI bool, minimumRevision int64) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(capabilityWaitTimeout)
 	for time.Now().Before(deadline) {
 		nodes, err := store.ListNodes(context.Background())
 		if err == nil && len(nodes) == 1 && nodes[0].CapabilityRevision >= minimumRevision &&
@@ -1156,7 +1164,7 @@ func waitForNodeCapability(t *testing.T, store *l1.Store, wantOCI bool, minimumR
 			}
 			return
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(capabilityWaitPoll)
 	}
 	nodes, _ := store.ListNodes(context.Background())
 	t.Fatalf("node OCI capability did not become %t at revision >= %d: %#v", wantOCI, minimumRevision, nodes)
