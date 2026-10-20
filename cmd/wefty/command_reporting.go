@@ -70,13 +70,22 @@ func classifyCommandReport(err error) commandReport {
 	var captureConflict *execCaptureConflictError
 	var personSignIn *personSignInRequiredError
 	var participantIdentity *fabric.ParticipantIdentityError
+	var participantUnreachable *fabric.ParticipantUnreachableError
 	var apiError contract.APIError
 	switch {
 	case errors.As(err, &personSignIn), errors.As(err, &participantIdentity):
+		code := contract.ErrorPersonIdentityRequired
+		if participantIdentity != nil && !participantIdentity.Person {
+			code = contract.ErrorMachineIdentityRequired
+		}
 		report.exitCode = exitUnauthorized
 		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{
-			Code: contract.ErrorPersonIdentityRequired, Message: err.Error(), Retryable: false,
+			Code: code, Message: err.Error(), Retryable: false,
 		}}
+		return report
+	case errors.As(err, &participantUnreachable):
+		report.exitCode = exitUnavailable
+		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorFabricUnreachable, Message: err.Error(), Retryable: true}}
 		return report
 	case errors.As(err, &outcome):
 		report.exitCode, report.stdoutVerdict = exitRunFailed, true
@@ -144,12 +153,12 @@ func classifyCommandReport(err error) commandReport {
 	switch apiError.Code {
 	case contract.ErrorRevocationWaitTimeout:
 		report.exitCode = exitMutationWaitTimeout
-	case contract.ErrorUnavailable:
+	case contract.ErrorUnavailable, contract.ErrorFabricUnreachable:
 		report.exitCode = exitUnavailable
 	case contract.ErrorInvalidRequest:
 		report.exitCode = exitUsage
 	case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorPrincipalForbidden,
-		contract.ErrorPersonIdentityRequired, contract.ErrorAdminRequired, contract.ErrorControlNotAuthorized:
+		contract.ErrorPersonIdentityRequired, contract.ErrorMachineIdentityRequired, contract.ErrorAdminRequired, contract.ErrorControlNotAuthorized:
 		report.exitCode = exitUnauthorized
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
 		report.exitCode = exitNotFound

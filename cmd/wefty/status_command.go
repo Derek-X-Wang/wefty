@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
@@ -178,6 +179,20 @@ type notReadyError struct {
 func (e *notReadyError) Error() string { return e.verdict }
 
 func executeStatus(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
+	budget, err := parseStatusBudget(args, jsonOutput, stderr)
+	if err != nil {
+		return err
+	}
+
+	bounded, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	status := collectStatus(bounded, clients)
+	status.InstalledVersion = installedStackVersion(clients.nodeConfigPath)
+
+	return writeStatusResult(stdout, status, jsonOutput)
+}
+
+func parseStatusBudget(args []string, jsonOutput bool, stderr io.Writer) (time.Duration, error) {
 	flags := flag.NewFlagSet("status", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var budget time.Duration
@@ -186,20 +201,19 @@ func executeStatus(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 		// This command's exit codes are part of what it promises, so a bad
 		// flag has to be a usage error rather than the generic failure a raw
 		// flag error becomes.
-		return flagUsageError(err)
+		return 0, flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
-		return usageError("usage: wefty status [--timeout D]")
+		return 0, usageError("usage: wefty status [--timeout D]")
 	}
 	if budget <= 0 {
-		return usageError("--timeout must be positive")
+		return 0, usageError("--timeout must be positive")
 	}
 
-	bounded, cancel := context.WithTimeout(ctx, budget)
-	defer cancel()
-	status := collectStatus(bounded, clients)
-	status.InstalledVersion = installedStackVersion(clients.nodeConfigPath)
+	return budget, nil
+}
 
+func writeStatusResult(stdout io.Writer, status clusterStatus, jsonOutput bool) error {
 	if jsonOutput {
 		if err := writeJSON(stdout, status); err != nil {
 			return err
@@ -211,6 +225,21 @@ func executeStatus(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 		return &notReadyError{verdict: status.Verdict}
 	}
 	return nil
+}
+
+// reportParticipantCheckFailure reports what is known without probing through
+// an unverified participant or making claims about the remote services.
+func reportParticipantCheckFailure(stdout io.Writer, options globalOptions, config fabricconfig.Config, cause error) error {
+	detail := cause.Error()
+	status := clusterStatus{
+		CheckedAt: time.Now().UTC(), InstalledVersion: installedStackVersion(options.nodeConfigPath),
+		Identity: fabricStatus{Kind: identityUnknown, NodeID: config.Identity.NodeID, PersonSignIn: localPersonSignIn(options, time.Now()), Detail: detail},
+		Reasons:  []statusReason{{Code: "participant_check_failed", Detail: detail}},
+		Services: []serviceStatus{{Name: "L1", Endpoint: options.l1Address, Detail: "not probed: participant check failed"}, {Name: "L3", Endpoint: options.l3Address, Detail: "not probed: participant check failed"}},
+		Nodes:    []nodeStatus{}, Capacity: map[string]int{},
+	}
+	status.Verdict = verdictOf(status.Reasons)
+	return writeStatusResult(stdout, status, options.jsonOutput)
 }
 
 // collectStatus probes everything at once. Concurrency is not for speed here:

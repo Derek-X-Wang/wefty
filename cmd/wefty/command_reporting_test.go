@@ -88,7 +88,7 @@ func TestCommandReportingCharacterization(t *testing.T) {
 	}{
 		{contract.ErrorInvalidRequest, 2},
 		{contract.ErrorUnauthorized, 3}, {contract.ErrorForbidden, 3}, {contract.ErrorPrincipalForbidden, 3},
-		{contract.ErrorPersonIdentityRequired, 3}, {contract.ErrorAdminRequired, 3}, {contract.ErrorControlNotAuthorized, 3},
+		{contract.ErrorPersonIdentityRequired, 3}, {"machine_identity_required", 3}, {contract.ErrorAdminRequired, 3}, {contract.ErrorControlNotAuthorized, 3},
 		{contract.ErrorNotFound, 4}, {contract.ErrorAttemptNotFound, 4}, {contract.ErrorTakeoverSessionEnded, 4},
 		{contract.ErrorCancelService, 5}, {contract.ErrorCancelNotQueued, 5}, {contract.ErrorConflict, 5},
 		{contract.ErrorStalePolicyRevision, 5}, {contract.ErrorStaleIntentRevision, 5}, {contract.ErrorStorageReferenceConflict, 5},
@@ -96,7 +96,7 @@ func TestCommandReportingCharacterization(t *testing.T) {
 		{contract.ErrorInstanceKeyNotSupported, 5}, {contract.ErrorFinalAdmin, 5}, {contract.ErrorCapacityExhausted, 5},
 		{contract.ErrorComputerResourceRequired, 5}, {contract.ErrorComputerTraitRequired, 5},
 		{contract.ErrorControllerBusy, 5}, {contract.ErrorControllerAlreadyHeld, 5},
-		{contract.ErrorRevocationWaitTimeout, 14}, {contract.ErrorUnavailable, 13},
+		{contract.ErrorRevocationWaitTimeout, 14}, {contract.ErrorUnavailable, 13}, {"fabric_unreachable", 13},
 		{contract.ErrorInternal, 1}, {contract.ErrorRunLedgerUnavailable, 1}, {contract.ErrorTenureUnavailable, 1},
 		{contract.ErrorRevocationObservationFailed, 1}, {contract.ErrorIdentityBound, 1},
 		{contract.ErrorNodeNotRegistered, 1}, {contract.ErrorNodeDead, 1}, {contract.ErrorNodeDraining, 1},

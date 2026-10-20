@@ -207,7 +207,7 @@ func TestUpgradeCanceledAttemptAcceptedOnPostRestartHeartbeatUnderYes(t *testing
 			deadline := f.now.Add(5 * time.Second)
 			f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "canceling-job", AttemptID: "canceling-attempt", LeaseExpiresAt: deadline}}
 			profile := f.profile(t)
-			participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: "control"}})
+			participant, closeFabric, err := fabricconfig.Open(t.Context(), fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: "control"}})
 			if err != nil {
 				t.Fatal(err)
 			}

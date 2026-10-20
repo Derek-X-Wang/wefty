@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
@@ -123,7 +124,11 @@ type globalOptions struct {
 	explicitFlags map[string]bool
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result error) {
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return runWithFabricOpener(ctx, args, stdout, stderr, fabricconfig.Open)
+}
+
+func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.Writer, openFabric func(context.Context, fabricconfig.Config) (fabric.Fabric, fabricconfig.CloseFunc, error)) (result error) {
 	defer func() {
 		var help *commandHelp
 		if errors.As(result, &help) {
@@ -183,11 +188,40 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) (result e
 	} else {
 		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
-	participant, closeFabric, err := fabricconfig.Open(config)
+	callerCtx := ctx
+	openCtx := ctx
+	if config.ExpectedIdentity != nil && commandArgs[0] == "status" {
+		budget, err := parseStatusBudget(commandArgs[1:], options.jsonOutput, stderr)
+		if err != nil {
+			return err
+		}
+		bounded, cancel := context.WithTimeout(ctx, budget)
+		defer cancel()
+		ctx = bounded
+		probe, stop := context.WithTimeout(ctx, statusProbeBudget)
+		defer stop()
+		openCtx = probe
+	}
+	participant, closeFabric, err := openFabric(openCtx, config)
+	if closeFabric != nil {
+		openingFailed := err != nil
+		defer func() {
+			if closeErr := closeFabric(); openingFailed && closeErr != nil {
+				result = errors.Join(result, closeErr)
+			}
+		}()
+	}
 	if err != nil {
+		if errors.Is(callerCtx.Err(), context.Canceled) {
+			return callerCtx.Err()
+		}
+		var identity *fabric.ParticipantIdentityError
+		var unreachable *fabric.ParticipantUnreachableError
+		if config.ExpectedIdentity != nil && commandArgs[0] == "status" && (errors.As(err, &identity) || errors.As(err, &unreachable)) {
+			return reportParticipantCheckFailure(stdout, options, config, err)
+		}
 		return err
 	}
-	defer closeFabric()
 	clients, err := newAPIClients(participant, options.l1Address, options.l3Address)
 	if err != nil {
 		return err
@@ -256,7 +290,7 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	flags.StringVar(&options.plainUserID, "plain-user-id", os.Getenv("WEFTY_DEV_PLAIN_USER_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person user ID")
 	flags.StringVar(&options.plainDeviceID, "plain-device-id", os.Getenv("WEFTY_DEV_PLAIN_DEVICE_ID"), "DEVELOPMENT ONLY: self-asserted plain Fabric person device ID")
 	flags.StringVar(&options.plainFabricID, "plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain- prefixed Fabric authority")
-	flags.StringVar(&options.fabricName, "fabric-name", "wefty-cli", "enrolled tsnet logical node name (must match the selected participant)")
+	flags.StringVar(&options.fabricName, "fabric-name", "wefty-cli", fabricNameHelp)
 	flags.StringVar(&options.stateDirectory, "state-dir", "", "tsnet state directory")
 	// The coordinator default is resolved after authoring dispatch. Join
 	// credentials belong only to setup, never an ordinary CLI participant.
@@ -341,7 +375,11 @@ func defaultNodeConfigPath() string {
 	return path
 }
 
+const fabricNameHelp = "Fabric node name (legacy default: wefty-cli; participant profiles must match the selected participant)"
+
 const rootUsage = `Usage: wefty [global flags] <command>
+
+--fabric-name NAME: ` + fabricNameHelp + `
 
 --json[=true|false] is accepted before or after a command and its arguments.
 Every command uses typed exits: usage 2, unauthorized 3, not found 4,

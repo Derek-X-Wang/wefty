@@ -21,10 +21,12 @@ func TestEveryCommandErrorContractFromRealBinary(t *testing.T) {
 	}{
 		{contract.ErrorInvalidRequest, exitUsage, 400},
 		{contract.ErrorForbidden, exitUnauthorized, 403},
+		{"machine_identity_required", 3, 403},
 		{contract.ErrorNotFound, exitNotFound, 404},
 		{contract.ErrorConflict, exitConflict, 409},
 		{contract.ErrorInternal, exitFailure, 503},
 		{contract.ErrorUnavailable, 13, 503},
+		{"fabric_unreachable", 13, 503},
 	}
 	commands := [][]string{
 		{"submit", "--workflow-ref=test/v1"}, {"rerun", "missing"},

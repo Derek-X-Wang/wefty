@@ -31,6 +31,15 @@ Person enrolment exposes the login URL only through its callback; enrolment and
 rollback loggers suppress the ordinary command enrollment hint.
 Errors are scrubbed if a backend includes the key in its message.
 
+Outside setup, a saved participant refuses login and machine-authorization
+states, using `person_identity_required` for a person or
+`machine_identity_required` for a machine (exit 3). Its command context bounds
+status reads and the running-state wait; an unreachable or unconfirmed backend
+is `fabric_unreachable` (exit 13), while caller cancellation stays exit 1.
+Saved participants suppress login URLs and enrollment hints but retain ordinary
+redacted diagnostics. Legacy bootstrap callers without an expected identity can
+wait through login states with their explicit join key.
+
 Folders live at `<data>/fabric/<participant>/` with mode `0700`. Paths stay
 inside the supplied home. Linked participant folders and unrecorded nonempty
 state are refused. A saved participant with matching name and folder is not
