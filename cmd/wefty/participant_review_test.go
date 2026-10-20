@@ -86,16 +86,52 @@ func TestMissingClientStateIsTypedFromRealBinary(t *testing.T) {
 	}
 	code, output := runWeftyWithEnv(t, buildWefty(t), 30*time.Second, []string{"HOME=" + home, "WEFTY_PROFILE="}, "--profile="+path, "--json", "status")
 	var response contract.ErrorResponse
-	if json.Unmarshal([]byte(output), &response) != nil || code != 3 || response.Error.Code != contract.ErrorPersonIdentityRequired || !strings.Contains(response.Error.Message, "restore") {
+	if json.Unmarshal([]byte(output), &response) != nil || code != 3 || response.Error.Code != "machine_identity_required" || !strings.Contains(response.Error.Message, "restore") {
 		t.Fatalf("missing client state: exit=%d output=%s", code, output)
 	}
 }
 
 func TestSavedBackendIdentityRefusalUsesTypedUnauthorizedExit(t *testing.T) {
-	err := errors.Join(errors.New("opening participant"), &fabric.ParticipantIdentityError{Reason: "does not match the recorded node ID"})
-	report := decideCommandReport(err)
-	response, ok := report.errorDocument.(contract.ErrorResponse)
-	if report.exitCode != 3 || !ok || response.Error.Code != contract.ErrorPersonIdentityRequired || response.Error.Retryable {
-		t.Fatalf("report=%+v", report)
+	for _, tc := range []struct {
+		person bool
+		code   contract.ErrorCode
+	}{{false, "machine_identity_required"}, {true, "person_identity_required"}} {
+		err := errors.Join(errors.New("opening participant"), &fabric.ParticipantIdentityError{Reason: "does not match the recorded node ID", Person: tc.person})
+		report := decideCommandReport(err)
+		response, ok := report.errorDocument.(contract.ErrorResponse)
+		if report.exitCode != 3 || !ok || response.Error.Code != tc.code || response.Error.Retryable {
+			t.Fatalf("report=%+v", report)
+		}
+	}
+}
+
+func TestMissingMachineParticipantIsTypedFromRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	for _, mode := range []string{"plain", "tsnet"} {
+		t.Run(mode, func(t *testing.T) {
+			home := t.TempDir()
+			path := filepath.Join(home, "profile.json")
+			profile := connprofile.Profile{Version: 1, Fabric: mode, Participants: map[string]connprofile.Participant{"person": {Name: "wefty://person/one", NodeID: "person", UserID: "42", StateDirectory: savedChoiceState(t, "person")}}}
+			if err := connprofile.Write(path, profile); err != nil {
+				t.Fatal(err)
+			}
+			code, output := runWeftyWithEnv(t, binary, 30*time.Second, []string{"HOME=" + home, "WEFTY_PROFILE="}, "--profile="+path, "--json", "nodes", "list")
+			var response contract.ErrorResponse
+			if json.Unmarshal([]byte(output), &response) != nil || code != 3 || response.Error.Code != "machine_identity_required" || response.Error.Retryable {
+				t.Fatalf("exit=%d output=%s", code, output)
+			}
+		})
+	}
+}
+
+func TestFabricNameHelpCoversLegacyAndParticipantProfiles(t *testing.T) {
+	var output bytes.Buffer
+	if err := run(t.Context(), []string{"--help"}, &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"--fabric-name", "legacy default: wefty-cli", "must match the selected participant"} {
+		if !strings.Contains(output.String(), text) {
+			t.Fatalf("help missing %q", text)
+		}
 	}
 }

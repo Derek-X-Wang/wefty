@@ -7,6 +7,138 @@
   },
   "servers": [{ "url": "wefty://run-ledger" }],
   "paths": {
+    "/v1/exec-captures/{sha256}": {
+      "parameters": [
+        {
+          "name": "sha256",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "uploadExecCapture",
+        "summary": "Upload a frozen cross-node exec capture (private to exec)",
+        "description": "Fabric client tag required; bearer tokens refused. Streams to private disk, enforcing configurable per-capture and total caps while reading. SHA-256 and exact size verified before acknowledgement. No list or client download route. Unreferenced uploads expire after one hour.",
+        "security": [
+          {
+            "fabricIdentity": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Durable capture receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "sha256",
+                    "size_bytes"
+                  ],
+                  "properties": {
+                    "sha256": {
+                      "type": "string"
+                    },
+                    "size_bytes": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          }
+        }
+      }
+    },
+    "/v1/runs/{run_id}/exec-capture": {
+      "parameters": [
+        {
+          "name": "run_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getExecCapture",
+        "summary": "Fetch the live run's exec capture",
+        "description": "Only the run token of the nonterminal run whose immutable version-2 exec params reference this capture is accepted. Fabric clients and other runs cannot download it. The node verifies SHA-256 and size before starting the wrapper.",
+        "security": [
+          {
+            "fabricIdentity": [],
+            "runToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Frozen git bundle.",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "getLedgerHealth",

@@ -7,6 +7,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
@@ -70,13 +71,49 @@ func classifyCommandReport(err error) commandReport {
 	var captureConflict *execCaptureConflictError
 	var personSignIn *personSignInRequiredError
 	var participantIdentity *fabric.ParticipantIdentityError
+	var participantUnreachable *fabric.ParticipantUnreachableError
+	var inUse *fabric.ParticipantInUseError
+	var serviceUnavailable *local.UnavailableError
+	var busy *local.BusyError
+	var alreadyRunning *local.AlreadyRunningError
+	var fenced *local.FencedCallerError
+	var peerIdentity *local.PeerIdentityError
+	var destinationRefused *fabric.DestinationRefusedError
 	var apiError contract.APIError
 	switch {
+	case errors.As(err, &fenced), errors.As(err, &peerIdentity), errors.As(err, &destinationRefused):
+		report.exitCode = exitUnauthorized
+		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorForbidden, Message: err.Error(), Retryable: false}}
+		return report
+	case errors.As(err, &busy):
+		report.exitCode = exitUnavailable
+		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorClientServiceBusy, Message: err.Error(), Retryable: true}}
+		return report
+	case errors.As(err, &alreadyRunning):
+		report.exitCode = exitConflict
+		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorConflict, Message: err.Error(), Retryable: false}}
+		return report
+	case errors.As(err, &inUse):
+		report.exitCode = exitUnauthorized
+		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorParticipantInUse, Message: err.Error(), Retryable: false}}
+		return report
+	case errors.As(err, &serviceUnavailable):
+		report.exitCode = exitUnavailable
+		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorFabricUnreachable, Message: serviceUnavailable.Error(), Retryable: false}}
+		return report
 	case errors.As(err, &personSignIn), errors.As(err, &participantIdentity):
+		code := contract.ErrorPersonIdentityRequired
+		if participantIdentity != nil && !participantIdentity.Person {
+			code = contract.ErrorMachineIdentityRequired
+		}
 		report.exitCode = exitUnauthorized
 		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{
-			Code: contract.ErrorPersonIdentityRequired, Message: err.Error(), Retryable: false,
+			Code: code, Message: err.Error(), Retryable: false,
 		}}
+		return report
+	case errors.As(err, &participantUnreachable):
+		report.exitCode = exitUnavailable
+		report.errorDocument = contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorFabricUnreachable, Message: err.Error(), Retryable: true}}
 		return report
 	case errors.As(err, &outcome):
 		report.exitCode, report.stdoutVerdict = exitRunFailed, true
@@ -144,12 +181,12 @@ func classifyCommandReport(err error) commandReport {
 	switch apiError.Code {
 	case contract.ErrorRevocationWaitTimeout:
 		report.exitCode = exitMutationWaitTimeout
-	case contract.ErrorUnavailable:
+	case contract.ErrorUnavailable, contract.ErrorFabricUnreachable, contract.ErrorClientServiceBusy:
 		report.exitCode = exitUnavailable
 	case contract.ErrorInvalidRequest:
 		report.exitCode = exitUsage
 	case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorPrincipalForbidden,
-		contract.ErrorPersonIdentityRequired, contract.ErrorAdminRequired, contract.ErrorControlNotAuthorized:
+		contract.ErrorParticipantInUse, contract.ErrorPersonIdentityRequired, contract.ErrorMachineIdentityRequired, contract.ErrorAdminRequired, contract.ErrorControlNotAuthorized:
 		report.exitCode = exitUnauthorized
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
 		report.exitCode = exitNotFound

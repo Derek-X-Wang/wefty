@@ -1,11 +1,18 @@
-# Local command runs (`wefty exec`)
+# Command runs (`wefty exec`)
 
-`wefty exec [--tag TAG ...] [--max-runtime D] [--keep-running | --detach]
+`wefty exec [--node NODE] [--tag TAG ...] [--max-runtime D] [--keep-running | --detach]
 [--json] -- <command...>` freezes a
-checkout before L3 submission. It uses the installed `node_id`, checked through
-L1 by `resolveLocalNode`, and always includes that node's reserved tag. Extra
-tags narrow this Pinned run. Before capture or submission, an extra `--tag`
-that the verified installed node does not carry is refused with usage exit 2
+checkout before L3 submission. By default it uses the installed `node_id`, checked through
+L1 by `resolveLocalNode`, and includes that node's reserved tag. `--node NODE`
+selects another owned Node by the ID shown in `wefty status` and Pins the run
+to it. An unknown Node ID is a usage error (exit 2) listing known Nodes.
+A known Node can queue work while offline, draining, or without free one-shot
+capacity, as the local path does. Before capturing or uploading, the CLI
+requires the target's `exec:capture-bundle` capability. A missing capability
+returns retryable conflict (exit 5), naming the Node and its required upgrade. Explicitly naming this machine's Node keeps the
+same local capture path as the default. Extra tags narrow the selected Node's
+Pinned run. Before capture or submission, an extra `--tag`
+that the selected Node does not carry is refused with usage exit 2
 and `invalid_request`; the message lists missing tags and the node's tags.
 It is an ordinary process one-shot without
 Workflow or dispatch authority. No default runtime cap is added.
@@ -56,7 +63,85 @@ waits of one and two seconds; if all change, exec submits nothing and reports
 retryable `conflict` (exit 5). The run does not read the source checkout after
 submission.
 
-L3 params record `base_commit`, `snapshot_tree`, `dirty`, `relative_folder`,
+## Cross-node capture transport
+
+Only a run Pinned to another Node uses the bundle transport. The CLI creates
+one full-history git bundle, including the frozen capture commit, in its
+private storage. A random private ref makes each call's bundle unique even
+when its code and commit timestamps match. This keeps independent calls from
+sharing a cleanup lifetime; it changes neither caller refs nor the snapshot
+tree. It streams the bundle to
+`POST /v1/exec-captures/{sha256}` through its existing Fabric connection.
+The route requires the client tag and refuses bearer tokens. L3 records the
+uploader's authenticated actor. Only that actor may attach the capture or
+create a rerun that references it. Attachment is restricted to root inline
+exec wrappers (version-2 marker, Bash interpreter, private executable mode,
+and frozen exec params) submitted by a Fabric client. Scoped bearer callers,
+saved Workflows and ordinary scripts cannot attach captures. Existing capture
+rows without an uploader remain fetchable by their live run tokens, but cannot
+be attached to a new run; unreferenced rows expire normally. The receipt
+confirms SHA-256 and byte size before submission. The CLI deletes its local
+capture with the existing retirement helper after acceptance is confirmed,
+including acceptance recovered after a lost reply. Uncertain acceptance keeps
+the local capture for recovery. The caller may sleep after submission returns.
+No new listener, local socket, loopback door, or L1 app capability is added.
+The fenced-caller rule remains unchanged: exec cannot bypass its caller's
+sandbox permissions.
+
+Cross-node params extend the existing fields with `exec_version=2`,
+`capture_sha256` and `capture_size_bytes`. Version 1 and legacy local runs keep
+the existing behavior. The permanent `snapshot_storage` value identifies the
+call for lost-acknowledgement recovery; the remote wrapper contains no
+submitter storage path and never reads it. `--tag` is checked against the
+selected Node's tags. Waiting for another Node never reports the caller's
+local CPU load as the target's load.
+
+L3 stores bundles under `exec-captures/` beside its database, with folder mode
+0700 and file mode 0600. Durable SQLite rows record upload time, size, uploader and run
+references. An acknowledgement follows file and directory sync and row commit.
+L3 and the CLI stream file contents; neither buffers the bundle in memory.
+The default per-capture cap is 256 MiB; `wefty-l3 --exec-capture-max-bytes`
+changes it. The default total cap is 2 GiB (eight maximum-size captures),
+configurable with `--exec-capture-total-bytes`. This bounds retained inputs on
+a personal control plane. Only admission and commit are serialized. In-memory reservations charge each
+in-flight upload against the remaining total, including a repeated hash.
+Streaming holds no capture mutex or SQL transaction. Failed uploads release
+their reservation. Socket read deadlines bound upload inactivity to 30 seconds;
+a progressing upload has no total transfer deadline. A stalled upload or
+download cannot block dispatch, run-state projection, cancellation or other
+captures. Capture cleanup skips a reconcile pass when its lock is busy.
+Fetch releases the capture lock after opening the file, before streaming. Streaming enforces
+both caps even without Content-Length. A per-capture refusal is
+`invalid_request` (exit 2); total-cap pressure is retryable `conflict` (exit 5).
+Client read failures remain invalid requests. L3 write failures are retryable
+internal errors (exit 13); public error messages contain no server file path.
+Both messages name the capture size (or the observed lower bound for an
+unknown-length stream) and cap. No run is submitted on upload refusal.
+
+The node agent fetches `GET /v1/runs/{run_id}/exec-capture` through its own
+Fabric connection with the run token it already holds. Only that exact live
+run's token can fetch its referenced hash. Client-tag access and another run's
+token are refused; there is no capture listing or client download route.
+The node writes a private staging file in the run mailbox, verifies SHA-256
+and exact byte size, then renames it to `capture.bundle`. A mismatch,
+truncation, or fetch error fails preparation with a capture diagnostic and
+never starts the command. The wrapper clones the verified mailbox bundle into
+node-local exec storage. The node agent removes the mailbox bundle when the
+attempt ends, including when the wrapper is killed. Local working changes
+remain unstaged/untracked and HEAD remains the caller's base commit, as below.
+
+Every reconciliation pass retires captures whose referencing runs have all
+ended. Unreferenced uploads expire after one hour. Startup removes interrupted
+staging files and uncommitted files, then applies the same durable expiry and
+terminal cleanup rules. A live reference prevents orphan expiry and another
+run's completion cannot delete its input. Rerun checks availability in L3 in
+the creation transaction and refuses a deleted bundle with usage exit 2;
+no new run is created. Deduplication protocols and a general input-file API
+remain deferred.
+
+## Local capture and common execution
+
+Local-run L3 params record `base_commit`, `snapshot_tree`, `dirty`, `relative_folder`,
 `snapshot_storage`, `argv` and `exec_version=1`. The version identifies new
 exec runs for rerun checks. Legacy inline exec runs are recognized by their
 complete original typed params, including Git identities and allocated capture

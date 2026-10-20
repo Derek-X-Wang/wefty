@@ -38,6 +38,8 @@ func run() error {
 		listenAddress             = flag.String("listen", l3.DefaultL3Address, "run-ledger Fabric listen address")
 		controlPlane              = flag.String("control-plane", l3.DefaultL1Address, "L1 control-plane Fabric address")
 		databasePath              = flag.String("db", "wefty-l3.sqlite", "SQLite database path")
+		captureMax                = flag.Int64("exec-capture-max-bytes", l3.DefaultExecCaptureMaxBytes, "maximum bytes per cross-node exec capture")
+		captureTotal              = flag.Int64("exec-capture-total-bytes", l3.DefaultExecCaptureTotalBytes, "maximum bytes held in exec captures")
 		reconcileEvery            = flag.Duration("reconcile-interval", l3.DefaultReconcileInterval, "dispatch and run-state reconciliation interval")
 		fabricName                = flag.String("fabric-name", l3.DefaultL3Address, "tsnet logical node name")
 		stateDirectory            = flag.String("state-dir", "", "tsnet state directory")
@@ -72,6 +74,9 @@ func run() error {
 	layer.Fill(plainFabricID, "plain-fabric-id", "WEFTY_DEV_PLAIN_FABRIC_ID", settings.PlainFabricID)
 	layer.Fill(listenAddress, "listen", "", settings.Listen)
 	layer.Fill(controlPlane, "control-plane", "", settings.ControlPlane)
+	if *captureMax <= 0 || *captureTotal <= 0 {
+		return fmt.Errorf("exec capture caps must be positive")
+	}
 	if *reconcileEvery <= 0 {
 		return fmt.Errorf("--reconcile-interval must be positive")
 	}
@@ -94,7 +99,7 @@ func run() error {
 	} else {
 		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
-	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
+	participant, closeFabric, err := fabricconfig.Open(context.Background(), fabricconfig.Config{
 		Mode:          *fabricMode,
 		PlainFabricID: *plainFabricID,
 		Identity: fabric.Identity{
@@ -108,11 +113,13 @@ func run() error {
 		Ephemeral:      *ephemeral,
 		Logf:           log.Printf,
 	})
+	if closeFabric != nil {
+		defer closeFabric()
+	}
 	if err != nil {
 		return err
 	}
-	defer closeFabric()
-	store, err := l3.OpenStore(*databasePath, l3.StoreOptions{ComputerAuthorityInstanceID: *computerAuthorityInstance})
+	store, err := l3.OpenStore(*databasePath, l3.StoreOptions{ComputerAuthorityInstanceID: *computerAuthorityInstance, ExecCaptureMaxBytes: *captureMax, ExecCaptureTotalBytes: *captureTotal})
 	if err != nil {
 		return err
 	}

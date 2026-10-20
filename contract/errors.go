@@ -41,6 +41,8 @@ const (
 	ErrorRunIdentityRequired         ErrorCode = "run_identity_required"
 	ErrorRunIdentityNotEntitled      ErrorCode = "run_identity_not_entitled"
 	ErrorPersonIdentityRequired      ErrorCode = "person_identity_required"
+	ErrorMachineIdentityRequired     ErrorCode = "machine_identity_required"
+	ErrorParticipantInUse            ErrorCode = "participant_in_use"
 	ErrorAdminRequired               ErrorCode = "admin_required"
 	ErrorAdminBootstrapInvalid       ErrorCode = "admin_bootstrap_invalid"
 	ErrorAdminBootstrapClosed        ErrorCode = "admin_bootstrap_closed"
@@ -70,8 +72,10 @@ const (
 	// until a human changed the deployment (wefty #548).
 	ErrorRunLedgerUnavailable ErrorCode = "run_ledger_unavailable"
 	// ErrorUnavailable names transport or service availability failures.
-	ErrorUnavailable ErrorCode = "unavailable"
-	ErrorInternal    ErrorCode = "internal"
+	ErrorUnavailable       ErrorCode = "unavailable"
+	ErrorFabricUnreachable ErrorCode = "fabric_unreachable"
+	ErrorClientServiceBusy ErrorCode = "client_service_busy"
+	ErrorInternal          ErrorCode = "internal"
 )
 
 // APIError is the single error shape shared by every HTTP protocol. Retryable

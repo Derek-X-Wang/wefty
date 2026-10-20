@@ -321,3 +321,47 @@ func wrapBackendLogf(sink func(string, ...any)) func(string, ...any) {
 		sink("%s", processFabricLine(fmt.Sprintf(format, args...)))
 	}
 }
+
+// participantLogSink suppresses login flows for saved participants while
+// preserving the ordinary diagnostics and redaction policy of both log hooks.
+func participantLogSink(sink func(string, ...any), saved bool) func(string, ...any) {
+	if !saved {
+		return sink
+	}
+	return func(format string, args ...any) {
+		lines := strings.Split(fmt.Sprintf(format, args...), "\n")
+		kept := lines[:0]
+		for _, line := range lines {
+			if !participantLoginLine(line) {
+				kept = append(kept, line)
+			}
+		}
+		if len(kept) > 0 {
+			sink("%s", strings.Join(kept, "\n"))
+		}
+	}
+}
+
+func participantLoginLine(line string) bool {
+	if strings.Contains(line, "--fabric-print-enrollment-url") || strings.Contains(line, "WEFTY_FABRIC_PRINT_ENROLLMENT_URL") || strings.Contains(strings.ToLower(line), "to authenticate, visit") {
+		return true
+	}
+	for {
+		start := nextHTTPURLStart(line)
+		if start < 0 {
+			return false
+		}
+		line = line[start:]
+		run := line[:httpURLRunLength(line)]
+		token, u, ok := parseHTTPURLToken(run)
+		if ok {
+			if isEnrollmentURL(u) {
+				return true
+			}
+			// A log field can contain multiple URLs without intervening spaces.
+			line = line[len(token):]
+		} else {
+			line = line[len(run):]
+		}
+	}
+}

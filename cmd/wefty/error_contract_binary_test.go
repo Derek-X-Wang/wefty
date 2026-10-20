@@ -21,10 +21,14 @@ func TestEveryCommandErrorContractFromRealBinary(t *testing.T) {
 	}{
 		{contract.ErrorInvalidRequest, exitUsage, 400},
 		{contract.ErrorForbidden, exitUnauthorized, 403},
+		{"machine_identity_required", 3, 403},
+		{"participant_in_use", 3, 403},
 		{contract.ErrorNotFound, exitNotFound, 404},
 		{contract.ErrorConflict, exitConflict, 409},
 		{contract.ErrorInternal, exitFailure, 503},
 		{contract.ErrorUnavailable, 13, 503},
+		{"fabric_unreachable", 13, 503},
+		{"client_service_busy", 13, 503},
 	}
 	commands := [][]string{
 		{"submit", "--workflow-ref=test/v1"}, {"rerun", "missing"},
@@ -37,7 +41,7 @@ func TestEveryCommandErrorContractFromRealBinary(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(c.status)
 			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{
-				Code: c.code, Message: "contract refusal", Retryable: c.code == contract.ErrorUnavailable,
+				Code: c.code, Message: "contract refusal", Retryable: c.code == contract.ErrorUnavailable || c.code == contract.ErrorClientServiceBusy,
 				Details: map[string]any{"reason": "test"}, RequestID: "upstream-test-id",
 			}})
 		})

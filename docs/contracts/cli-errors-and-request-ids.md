@@ -17,7 +17,7 @@ typed result.
 | 10 | Run failed (`exec`, `wait`) |
 | 11 | Wait timeout (`wait`) |
 | 12 | Cluster not ready (`status`) |
-| 13 | Transport or service unavailable (`unavailable`, or retryable server-unavailable envelope); for `exec`, a lost watch, an unconfirmed submission, a run infrastructure failure, or a missing command result |
+| 13 | Transport or service unavailable (`fabric_unreachable`, `unavailable`, or retryable server-unavailable envelope); for `exec`, a lost watch, an unconfirmed submission, a run infrastructure failure, or a missing command result |
 | 14 | Accepted-mutation observation timeout (`wait_timeout` or `revocation_wait_timeout`) |
 
 The protocol-code membership of the exit map remains authoritative. L1/L3 HTTP
@@ -31,13 +31,37 @@ as on view open.
 
 For a participant profile, a missing or expired local person sign-in is a typed
 `person_identity_required` refusal (exit 3), with recovery advice for the saved
-participant. A saved backend that needs login or machine authorization, or
-whose node ID or role identity differs from the profile, uses the same typed
-refusal. Commands do not expose enrollment URLs or retry another identity.
+participant. Missing machine participant records or saved state use
+`machine_identity_required` (exit 3). A saved backend that needs login or machine
+authorization, or whose node ID or role identity differs from the profile, uses
+the code for the selected participant: `person_identity_required` for a person,
+`machine_identity_required` for a machine. Commands do not expose enrollment
+URLs or retry another identity. Ordinary backend diagnostics remain available
+through the caller's logger, under the existing redaction policy.
 Recovery can restore the original state or retire the old device and enrol a
 new identity through fleet setup; public fleet setup is deferred to #900.
-The refusal is classified by the same command report used by `main`; it adds no new exit
-number and never retries using another identity.
+These refusals use the same command report as `main` and add no exit number.
+
+A saved participant that cannot be reached or confirmed within its start
+budget returns typed `fabric_unreachable`, `retryable=true`, exit 13. This
+includes failed status reads and running-state waits. Public messages retain
+only the context error or a generic backend reason, while the original cause
+remains available for error classification. Backend URLs and implementation
+names stay behind the Fabric seam. This error does not claim that
+the saved identity is invalid. The start budget is at most 30 seconds, bounded
+by the command's context. Caller cancellation, including Ctrl-C, ends the check
+at once and remains a local failure (exit 1, `internal`, `retryable=false`).
+A bare deadline elsewhere keeps its existing classification.
+
+For participant profiles, `wefty status` includes startup in its command
+budget (`--timeout`, default 5 seconds) and bounds the participant check to the
+existing 3-second probe budget, or the remaining command budget if shorter.
+If that check fails, text and JSON status report `participant_check_failed`,
+identity detail and local person sign-in state, with exit 12. L1 and L3 are
+marked as not probed; no request uses the unverified participant. Cancellation
+still exits 1. The verdict is written before backend cleanup; process shutdown
+can take longer than the probe budget. Local missing-profile/state refusals before opening the Fabric
+retain their typed exit 3. Legacy status behavior is unchanged.
 
 An L1 identity lookup that fails operationally returns `503 unavailable`,
 `retryable:true`, `details.reason="identity_unverifiable"`; the CLI preserves
@@ -319,3 +343,37 @@ adds `local_load` with `average` when known, `limit`, and `holding`.
 Status reads this machine directly with the agent's platform reader. It uses
 the local profile and environment limit; keep installed settings there so both
 commands agree. Other nodes' load is not reported in phase 1.
+
+## Client-service and participant ownership errors
+
+`participant_in_use` is an identity-ownership refusal (exit 3,
+`retryable=false`). It names the participant and advises stopping its current
+owner. It does not disclose the participant folder path. A second embedded
+backend or client-service process receives this error before it starts that
+participant. Advisory OS ownership releases after close or process death;
+removing a lock file is never a recovery step.
+
+A participant-profile CLI with no usable client service returns
+`fabric_unreachable` (exit 13, `retryable=false`), including on `status`. Its
+message asks the owner to start or repair `wefty client-service` with that
+profile before retrying. This owner action is not an automatic backoff loop. It never falls back to direct saved-state ownership. A running
+service preserves identity refusal and backend-unreachable types; `status`
+keeps its existing failed-check verdict for those backend failures. Unix peer
+refusal closes the socket without running a backend request. Caller cancellation
+remains exit 1. Legacy profiles never contact this socket. See
+[client service](client-service.md) for protocol limits and the accepted
+same-user caller boundary.
+
+The local service's capacity refusal is distinct: `client_service_busy`
+(exit 13, `retryable=true`), asking callers to wait for capacity instead of
+restarting the service. A socket publication conflict uses `conflict` (exit 5,
+`retryable=false`) and says the service is already running. A non-Fabric
+outbound destination, failed client-side server UID check, or intentional EPERM
+socket fence uses non-retryable `forbidden` (exit 3). Fence advice asks the owner
+and says not to look for another way in. The participant HTTP adapter preserves
+that advice instead of converting it into legacy connection-allowance advice.
+
+When participant ownership refusal joins an enrolment failure, classification
+still selects `participant_in_use` and exit 3, but the JSON message retains both
+the original enrolment cause and the ownership refusal. Response extensions on
+the local protocol are tolerated by older clients; server requests stay strict.

@@ -341,6 +341,7 @@ type runMailboxRefusal struct {
 
 // runMailbox owns one attempt's mailbox directory and publishes from it.
 type runMailbox struct {
+	captureCleanup func()
 	// directory is the absolute path handed to the workload. Every agent-side
 	// operation goes through these opened directories instead. They are opened
 	// once, identity-checked once, and never re-resolved by name: a workload
@@ -728,7 +729,14 @@ func (m *runMailbox) close() {
 	m.closeRoots()
 }
 
+func (m *runMailbox) removeExecCapture() {
+	if m.captureCleanup != nil {
+		m.captureCleanup()
+	}
+}
+
 func (m *runMailbox) closeRoots() {
+	m.removeExecCapture()
 	m.closeOnce.Do(func() {
 		m.cancelPublication()
 		if m.fs != nil {

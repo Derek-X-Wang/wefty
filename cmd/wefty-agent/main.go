@@ -553,7 +553,7 @@ func run() error {
 	} else {
 		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
-	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
+	participant, closeFabric, err := fabricconfig.Open(context.Background(), fabricconfig.Config{
 		Mode:          *fabricMode,
 		PlainFabricID: *plainFabricID,
 		Identity: fabric.Identity{
@@ -567,16 +567,18 @@ func run() error {
 		Ephemeral:      *ephemeral,
 		Logf:           log.Printf,
 	})
+	if closeFabric != nil {
+		defer closeFabric()
+	}
 	if err != nil {
 		return err
 	}
-	defer closeFabric()
 
 	bootSessionID, err := agent.NewBootSessionID()
 	if err != nil {
 		return err
 	}
-	capabilities := map[string]bool{"kind:process": true}
+	capabilities := defaultAgentCapabilities()
 	runtimes := make(map[string]workloadrunner.WorkloadRuntime)
 	var bootBarrier *ocihelper.BootBarrier
 	var agentBootBarrier agent.OCIBootBarrier
@@ -1232,4 +1234,8 @@ func (renewer ociAttemptDeadman) QueueSuccessfulRenewal(claim l1.Claim, expiresA
 		JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken,
 		Class: claim.Job.Spec.Class, RemovalGeneration: removalGeneration,
 	}, expiresAt)
+}
+
+func defaultAgentCapabilities() map[string]bool {
+	return map[string]bool{"kind:process": true, contract.CapabilityExecCaptureBundle: true}
 }

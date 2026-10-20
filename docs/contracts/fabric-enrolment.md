@@ -31,6 +31,15 @@ Person enrolment exposes the login URL only through its callback; enrolment and
 rollback loggers suppress the ordinary command enrollment hint.
 Errors are scrubbed if a backend includes the key in its message.
 
+Outside setup, a saved participant refuses login and machine-authorization
+states, using `person_identity_required` for a person or
+`machine_identity_required` for a machine (exit 3). Its command context bounds
+status reads and the running-state wait; an unreachable or unconfirmed backend
+is `fabric_unreachable` (exit 13), while caller cancellation stays exit 1.
+Saved participants suppress login URLs and enrollment hints but retain ordinary
+redacted diagnostics. Legacy bootstrap callers without an expected identity can
+wait through login states with their explicit join key.
+
 Folders live at `<data>/fabric/<participant>/` with mode `0700`. Paths stay
 inside the supplied home. Linked participant folders and unrecorded nonempty
 state are refused. A saved participant with matching name and folder is not
@@ -53,6 +62,10 @@ entries and links.
 The step starts no service and creates no local listener or socket. #900 owns
 fleet roles and Mac/Linux service wiring. Its cutover caller must stop existing
 participants and use a staged profile destination until the whole role is
-ready to publish. Locks and the per-user client service remain slice 3 of #899;
-the step does not make concurrent use of one identity folder safe. Attended
+ready to publish. Each embedded enrolment and logout backend holds the
+participant-folder OS lock until it closes. A competing owner is refused without deleting its
+state. Rollback reacquires participant ownership after logout closes and keeps
+it through deletion; state held by a new owner starting in that window is preserved.
+The original enrolment cause remains visible alongside an ownership refusal. A lock file alone is not saved state. See
+[client service](client-service.md) for ownership and concurrency rules. Attended
 tsnet acceptance remains slice 4 and is not replaced by fake-enroller tests.

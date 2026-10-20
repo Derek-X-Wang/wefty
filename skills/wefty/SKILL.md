@@ -120,11 +120,17 @@ Use `exec` for one build, test, or other command in your current Git checkout.
 Use a stored workflow for repeatable work that drives other runs, such as
 branch gates or issue-to-PR work on a committed ref. You do not need to write
 a workflow wrapper to offload one command.
-`exec` needs no `--tag`; it always runs on this machine's node.
+`exec` needs no `--tag`; by default it runs on this machine's Node.
+Use `--node NODE` to select another owned Node by the ID in `wefty status`.
+An unknown Node ID is refused with exit 2 and the known Node IDs. A known
+Node queues work while unavailable or busy. The target must advertise
+`exec:capture-bundle`; otherwise exec returns retryable exit 5 and names the
+Node that needs an upgrade, before uploading.
 A busy machine makes `exec` wait; this is normal, so agents should not cancel.
 
 ```sh
 wefty exec -- go test ./cmd/wefty/
+wefty exec --node NODE -- go test ./cmd/wefty/
 wefty exec --keep-running --max-runtime 30m -- go test ./cmd/wefty/
 wefty exec --json -- go test ./cmd/wefty/
 RUN_ID=$(wefty exec --detach --json -- go test ./cmd/wefty/ | jq -er '.run_id')
@@ -136,7 +142,7 @@ wefty cancel "$RUN_ID"
 that Git does not ignore before submission. Run it from inside a Git checkout
 with at least one commit. Unsupported checkouts are refused as usage errors
 (exit 2); `internal` means wefty itself failed. It runs in the same relative
-folder in a throwaway copy, on this machine's installed node. Later edits do
+folder in a throwaway copy, on the selected Node. Later edits do
 not change the run. If the checkout changes during capture, exec makes up to
 three fresh attempts with waits of one and two seconds, then refuses with
 retryable `conflict` (exit 5) if edits continue. The command inherits the node's
@@ -160,6 +166,16 @@ Do not share a project build folder, such as a Cargo `target/`, between runs and
 stdout and stderr are separate streams, so their order relative to each other
 is not kept. When order matters, merge them in the command: `sh -c '... 2>&1'`.
 
+For another Node, exec uploads one full-history git bundle to L3 before
+submission returns. The caller may then sleep. The default limits are 256 MiB
+per bundle and 2 GiB total on L3 (`--exec-capture-max-bytes` and
+`--exec-capture-total-bytes` on `wefty-l3`). A per-bundle refusal is exit 2;
+total-cap pressure is retryable exit 5. The node agent checks SHA-256 and size
+before starting the command. L3 deletes the bundle at run end, or after one
+hour if no run uses it. The CLI deletes its local capture after confirmed
+acceptance. Default and explicitly local runs keep the local capture path.
+Do not use exec for commands your sandbox blocks. This rule applies to `--node` too, because the command runs as the owner on that machine.
+
 **Stopping `exec` cancels the run unless `--keep-running` is set.** Ctrl-C,
 TERM, and HUP follow this rule. With `--keep-running`, streaming stays the
 same, but stopping ends only the watching. The CLI prints the run ID and
@@ -174,7 +190,8 @@ when the run must survive that limit. A hard kill cannot be caught.
 | `--detach` | Print the run ID after capture and L3 acceptance, then exit 0 without watching |
 | `--json` | Stream NDJSON: one `output`, `heartbeat`, or `finished` event per line; all observed logs precede `finished` |
 | `--detach --json` | Print exactly one line: `{"run_id":"..."}` |
-| `--tag TAG` | Narrow this machine's Pinned run with an extra tag; repeatable |
+| `--node NODE` | Pin to this owned Node ID; default is this machine's Node |
+| `--tag TAG` | Narrow the selected Node's Pinned run with an extra tag; repeatable |
 | `--max-runtime D` | Choose a runtime cap, such as `30m`; no cap by default |
 
 `--keep-running` and `--detach` are alternatives. Flags after `--` belong to

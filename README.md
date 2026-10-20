@@ -201,7 +201,8 @@ The full pass criteria and evidence commands are in the
 
 Use `wefty exec` for one build, test, or other command in your Git checkout.
 Use a stored workflow for repeatable work that drives other runs. Exec needs
-this machine's installed node. It freezes the base commit, tracked local
+this machine's installed node by default. `--node NODE` selects another owned
+Node using the ID shown by `wefty status`. It freezes the base commit, tracked local
 changes, and untracked files that Git does not ignore before submission, then
 runs in the same relative folder in a throwaway copy. Later edits do not
 change the run. It inherits the node's environment and `PATH`, removes the
@@ -209,12 +210,19 @@ run's `WEFTY_*` variables, and returns no files.
 
 ```sh
 wefty exec -- go test ./cmd/wefty/
+wefty exec --node NODE -- go test ./cmd/wefty/
 wefty exec --keep-running --max-runtime 30m -- go test ./cmd/wefty/
 wefty exec --json -- go test ./cmd/wefty/
 RUN_ID=$(wefty exec --detach --json -- go test ./cmd/wefty/ | jq -er '.run_id')
 wefty logs "$RUN_ID" --follow
 wefty cancel "$RUN_ID"
 ```
+
+For another Node, L3 holds a full-history git bundle before submission returns,
+so the submitting machine may sleep. The default limit is 256 MiB per bundle
+and 2 GiB total on L3, both configurable. The target verifies the bundle before
+running the command; L3 deletes it when the run ends. This transport stays
+inside the owned cluster. Same-machine runs keep their existing local path.
 
 Stopping `exec` with Ctrl-C, TERM, or HUP cancels the run unless
 `--keep-running` is set. With that flag, stopping ends only the watching;
@@ -230,8 +238,8 @@ an AI tool's time limit must not cancel the work. A hard kill cannot be caught.
 (whether local changes were included). Command outcomes are `pass` or `fail`;
 queued and infrastructure outcomes are distinct and have a null command exit
 code. `--detach --json` prints exactly one line with `run_id`. Flags after
-`--` belong to the command. Repeat `--tag TAG` to narrow this machine's Pinned
-run. Set `--max-runtime D` for a chosen cap; there is no default cap. Streaming
+`--` belong to the command. Repeat `--tag TAG` to narrow the selected Node's
+Pinned run. Set `--max-runtime D` for a chosen cap; there is no default cap. Streaming
 exits 0 on pass, 10 on run failure, and 13 on infrastructure or lost observation.
 
 Never put a secret on the command line: command text is stored permanently,
