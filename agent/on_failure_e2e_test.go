@@ -214,7 +214,35 @@ func TestAgentOnFailureShutdownRequeuesTermHandlingService(t *testing.T) {
 	}
 }
 
+// getOnFailureE2EService reads through the real L1 child process, which keeps
+// the production read-snapshot limit. A slow runner can get its typed retryable
+// unavailable answer; production clients retry it, and so does this helper
+// (#1065). Any other answer stays fatal.
 func getOnFailureE2EService(t *testing.T, client *http.Client, jobID string) l1.Job {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		status, raw := readOnFailureE2EService(t, client, jobID)
+		if status == http.StatusOK {
+			var job l1.Job
+			if err := json.Unmarshal(raw, &job); err != nil {
+				t.Fatal(err)
+			}
+			return job
+		}
+		var answer struct {
+			Error struct {
+				Retryable bool `json:"retryable"`
+			} `json:"error"`
+		}
+		if status != http.StatusServiceUnavailable || json.Unmarshal(raw, &answer) != nil || !answer.Error.Retryable || time.Now().After(deadline) {
+			t.Fatalf("service get = %d %s", status, raw)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func readOnFailureE2EService(t *testing.T, client *http.Client, jobID string) (int, []byte) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://control-plane.invalid/v1/jobs/"+jobID+"?class=service", nil)
 	if err != nil {
@@ -229,14 +257,7 @@ func getOnFailureE2EService(t *testing.T, client *http.Client, jobID string) l1.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("service get = %d %s", response.StatusCode, raw)
-	}
-	var job l1.Job
-	if err := json.Unmarshal(raw, &job); err != nil {
-		t.Fatal(err)
-	}
-	return job
+	return response.StatusCode, raw
 }
 func waitOnFailureE2EStopped(t *testing.T, client *http.Client, jobID string) {
 	t.Helper()
