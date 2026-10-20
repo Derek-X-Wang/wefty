@@ -247,6 +247,10 @@ func TestCancelSettledRenewalWithLiveLeaseExpires(t *testing.T) {
 	h := newIntegrationHarnessWithOptions(t, StoreOptions{LeaseDuration: 2 * time.Minute}, map[string]NodePolicy{
 		"node-1": {Tags: []string{"linux"}, MaxOneshotSlots: DefaultMaxOneshotSlots, MaxServiceSlots: DefaultMaxServiceSlots},
 	})
+	// This test pins cancel settlement, not snapshot hygiene. Keep the shared
+	// harness at the production limit and give only this test's post-change
+	// reads headroom on loaded runners (#1068).
+	h.store.SetReadSnapshotHardLimitForTest(2 * time.Second)
 	client := h.client(fabric.Identity{NodeID: "submitter", Tags: []string{DefaultClientPrincipalTag}})
 	agent := h.client(fabric.Identity{NodeID: "node-1", Tags: []string{DefaultAgentPrincipalTag}})
 	node := h.register(agent, "node-1")
