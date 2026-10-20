@@ -62,6 +62,10 @@ entries and links.
 The step starts no service and creates no local listener or socket. #900 owns
 fleet roles and Mac/Linux service wiring. Its cutover caller must stop existing
 participants and use a staged profile destination until the whole role is
-ready to publish. Locks and the per-user client service remain slice 3 of #899;
-the step does not make concurrent use of one identity folder safe. Attended
+ready to publish. Each embedded enrolment and logout backend holds the
+participant-folder OS lock until it closes. A competing owner is refused without deleting its
+state. Rollback reacquires participant ownership after logout closes and keeps
+it through deletion; state held by a new owner starting in that window is preserved.
+The original enrolment cause remains visible alongside an ownership refusal. A lock file alone is not saved state. See
+[client service](client-service.md) for ownership and concurrency rules. Attended
 tsnet acceptance remains slice 4 and is not replaced by fake-enroller tests.

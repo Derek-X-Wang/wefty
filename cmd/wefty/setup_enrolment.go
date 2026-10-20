@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/fabric/tsnet"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
@@ -120,8 +121,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			if saved.Name != participant.name || saved.StateDirectory != stateDir {
 				return profile, fmt.Errorf("saved %s participant differs; setup will not rebind its identity", participant.role)
 			}
-			entries, err := os.ReadDir(stateDir)
-			if err != nil || len(entries) == 0 {
+			if !hasSavedParticipantState(stateDir) {
 				return profile, fmt.Errorf("saved %s participant state is missing; restore its original saved state, or retire the old device and remove its stale participant record before enrolling a new identity", participant.role)
 			}
 			if err := root.Chmod(stateRel, 0o700); err != nil {
@@ -129,7 +129,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			}
 			continue
 		}
-		if entries, err := os.ReadDir(stateDir); err == nil && len(entries) != 0 {
+		if _, err := os.ReadDir(stateDir); err == nil && hasSavedParticipantState(stateDir) {
 			return profile, fmt.Errorf("unrecorded state for %s; inspect it before enrolling", participant.role)
 		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return profile, err
@@ -158,7 +158,16 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			logoutErr := request.enroller.Logout(cleanupCtx, spec)
 			cancel()
+			var inUse *fabric.ParticipantInUseError
+			if errors.As(logoutErr, &inUse) {
+				return scrubSetupEnrolmentError(errors.Join(cause, logoutErr), key)
+			}
+			release, lockErr := participantstate.Acquire(stateDir, spec.Name)
+			if lockErr != nil {
+				return scrubSetupEnrolmentError(errors.Join(cause, logoutErr, lockErr), key)
+			}
 			removeErr := root.RemoveAll(stateRel)
+			removeErr = errors.Join(removeErr, release())
 			return scrubSetupEnrolmentError(errors.Join(cause, logoutErr, removeErr), key)
 		}
 		if enrolErr == nil {
@@ -177,6 +186,10 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			}
 		}
 		if enrolErr != nil {
+			var inUse *fabric.ParticipantInUseError
+			if errors.As(enrolErr, &inUse) {
+				return profile, enrolErr
+			}
 			return profile, rollback(enrolErr)
 		}
 		previousL1, previousL3 := profile.L1Address, profile.L3Address

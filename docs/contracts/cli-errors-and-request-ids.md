@@ -343,3 +343,37 @@ adds `local_load` with `average` when known, `limit`, and `holding`.
 Status reads this machine directly with the agent's platform reader. It uses
 the local profile and environment limit; keep installed settings there so both
 commands agree. Other nodes' load is not reported in phase 1.
+
+## Client-service and participant ownership errors
+
+`participant_in_use` is an identity-ownership refusal (exit 3,
+`retryable=false`). It names the participant and advises stopping its current
+owner. It does not disclose the participant folder path. A second embedded
+backend or client-service process receives this error before it starts that
+participant. Advisory OS ownership releases after close or process death;
+removing a lock file is never a recovery step.
+
+A participant-profile CLI with no usable client service returns
+`fabric_unreachable` (exit 13, `retryable=false`), including on `status`. Its
+message asks the owner to start or repair `wefty client-service` with that
+profile before retrying. This owner action is not an automatic backoff loop. It never falls back to direct saved-state ownership. A running
+service preserves identity refusal and backend-unreachable types; `status`
+keeps its existing failed-check verdict for those backend failures. Unix peer
+refusal closes the socket without running a backend request. Caller cancellation
+remains exit 1. Legacy profiles never contact this socket. See
+[client service](client-service.md) for protocol limits and the accepted
+same-user caller boundary.
+
+The local service's capacity refusal is distinct: `client_service_busy`
+(exit 13, `retryable=true`), asking callers to wait for capacity instead of
+restarting the service. A socket publication conflict uses `conflict` (exit 5,
+`retryable=false`) and says the service is already running. A non-Fabric
+outbound destination, failed client-side server UID check, or intentional EPERM
+socket fence uses non-retryable `forbidden` (exit 3). Fence advice asks the owner
+and says not to look for another way in. The participant HTTP adapter preserves
+that advice instead of converting it into legacy connection-allowance advice.
+
+When participant ownership refusal joins an enrolment failure, classification
+still selects `participant_in_use` and exit 3, but the JSON message retains both
+the original enrolment cause and the ownership refusal. Response extensions on
+the local protocol are tolerated by older clients; server requests stay strict.

@@ -115,9 +115,21 @@ with no person fields. Missing or expired person sign-in produces typed
 Recovery restores the original saved state or retires the old device and enrols
 a new identity through fleet setup. Public fleet setup is deferred to #900;
 Plain-development identity flags do not repair participant profiles. The CLI
-never falls back to the client. Missing saved state is refused before opening the Fabric.
+never falls back to the client. Participant-profile cluster calls use the
+per-user [client service](client-service.md); they never open the saved backend
+themselves and never fall back to a direct backend when the service is absent.
+Missing saved state is refused before contacting the service. A lock file
+alone does not count as saved state.
 The fleet cutover starts with an empty control plane, so legacy run ownership
 never needs to cross into the strict rule.
+
+Legacy plain profiles never use the client service. Legacy tsnet calls with an
+explicit `--state-dir` still open their backend directly, but now hold exclusive
+participant-folder ownership; a second owner exits 3 with `participant_in_use`.
+All tsnet outbound dials must resolve to a Fabric route and use the checked
+literal IP:port, including legacy callers and Computer endpoints. See the
+[client-service contract](client-service.md) for the caller and destination
+boundaries and #900 lifecycle follow-ups.
 
 For an enrolled tsnet participant, the name and folder are one choice.
 Explicit `--fabric-name` and `--state-dir` must match it. `--auth-key` and
@@ -154,11 +166,15 @@ adds `identity.node_id` and
 `identity.person_sign_in`, with values `signed_in`, `not_signed_in`, or
 `expired`. This describes saved local state; it does not verify remote
 revocation and never opens the person identity. Participant status includes
-the saved client
-check within its command timeout and the 3-second probe limit. A failed backend
+the saved client check through the client service within its command timeout
+and the 3-second probe limit. A failed backend
 check is reported as `participant_check_failed` with identity detail and exit 12,
 without probing L1 or L3. Local profile or saved-state failures detected before
-opening the Fabric remain typed exit 3. Legacy status keeps the base
+contacting the service remain typed exit 3. An absent client service returns
+typed `fabric_unreachable` (exit 13),
+including on `status`. That service-availability error is non-retryable and
+asks the owner to start or repair the service. A busy running service instead
+uses retryable `client_service_busy` (exit 13). Legacy status keeps the base
 identity fields and text.
 
 Cancel keeps the chosen client request shape. For participant profiles, a

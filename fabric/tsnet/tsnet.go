@@ -9,15 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/internal/naming"
+	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/net/tsdial"
 	tailscaletsnet "tailscale.com/tsnet"
 )
 
@@ -36,6 +39,9 @@ type Config struct {
 
 // Fabric is an embedded production fabric node.
 type Fabric struct {
+	releaseState   func() error
+	closeOnce      sync.Once
+	closeErr       error
 	server         *tailscaletsnet.Server
 	localName      naming.Name
 	coordinatorURL string
@@ -45,12 +51,15 @@ type Fabric struct {
 	fabricID         string
 	expectedIdentity *fabric.Identity
 	// Transport calls stay injectable for secretless seam tests.
-	dialNode   func(context.Context, string, string) (net.Conn, error)
-	listenNode func(string, string) (net.Listener, error)
+	dialNode       func(context.Context, string, string) (net.Conn, error)
+	dialPlan       func(context.Context, string, string) (netip.AddrPort, bool, error)
+	outboundDialer *tsdial.Dialer
+	listenNode     func(string, string) (net.Listener, error)
 }
 
-// New creates a tsnet-backed Fabric without starting it. The first Listen,
-// Dial, or WhoIs call starts the embedded node.
+// New locks an explicit state folder and creates a tsnet-backed Fabric
+// without starting it. The first Listen, Dial, or WhoIs call starts the
+// embedded node. Call Close even when no transport operation was made.
 func New(config Config) (*Fabric, error) {
 	// The embedding process owns enrolment. Never let the dependency consume
 	// an ambient join credential, or pass one on to later child processes.
@@ -90,8 +99,16 @@ func New(config Config) (*Fabric, error) {
 	// earlier-cached read to race against as long as this runs before
 	// Start. Calling the dependency's own setter (rather than os.Setenv
 	// with the variable's name) keeps that name inside the fabric seam.
+	var release func() error
+	if config.StateDir != "" {
+		release, err = participantstate.Acquire(config.StateDir, config.Name)
+		if err != nil {
+			return nil, err
+		}
+	}
 	envknob.SetNoLogsNoSupport()
 	return &Fabric{
+		releaseState:     release,
 		localName:        name,
 		expectedIdentity: config.ExpectedIdentity,
 		coordinatorURL:   config.CoordinatorURL,
@@ -153,6 +170,9 @@ func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, e
 	if err := f.checkParticipant(ctx); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	name, logical, err := naming.Parse(address)
 	if err != nil {
 		return nil, err
@@ -165,10 +185,51 @@ func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, e
 			return nil, err
 		}
 	}
+	dialer := f.outboundDialer
+	plan := f.dialPlan
+	if plan == nil {
+		if dialer == nil {
+			if _, err := f.runningStatus(ctx); err != nil {
+				return nil, err
+			}
+			dialer = f.server.Sys().Dialer.Get()
+		}
+		plan = dialer.UserDialPlan
+	}
+	resolved, viaFabric, err := plan(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	if !viaFabric || !resolved.IsValid() {
+		return nil, &fabric.DestinationRefusedError{}
+	}
+	// Dial the plan's literal address. Passing a hostname again would permit a
+	// second DNS result to escape the checked route through the host network.
+	address = resolved.String()
 	if f.dialNode != nil {
 		return f.dialNode(ctx, network, address)
 	}
-	return f.server.Dial(ctx, network, address)
+	if dialer == nil {
+		if _, err := f.runningStatus(ctx); err != nil {
+			return nil, err
+		}
+		dialer = f.server.Sys().Dialer.Get()
+	}
+	// UserDial reclassifies even a literal IP and can fall back to the host if
+	// routes change after the plan. Use only the embedded peer transport.
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		if dialer.NetstackDialTCP != nil {
+			return dialer.NetstackDialTCP(ctx, resolved)
+		}
+	case "udp", "udp4", "udp6":
+		if dialer.NetstackDialUDP != nil {
+			return dialer.NetstackDialUDP(ctx, resolved)
+		}
+	default:
+		return nil, errors.New("unsupported Fabric dial network")
+	}
+	return nil, &fabric.ParticipantUnreachableError{Cause: errors.New("Fabric peer transport is unavailable")}
 }
 
 // Opaque node IDs are resolved only from authenticated network state. They
@@ -298,7 +359,13 @@ func coordinatorFabricID(coordinatorURL, identityDomain string) string {
 
 // Close shuts down the embedded node and its listeners.
 func (f *Fabric) Close() error {
-	return f.server.Close()
+	f.closeOnce.Do(func() {
+		f.closeErr = f.server.Close()
+		if f.releaseState != nil {
+			f.closeErr = errors.Join(f.closeErr, f.releaseState())
+		}
+	})
+	return f.closeErr
 }
 
 var _ fabric.Fabric = (*Fabric)(nil)

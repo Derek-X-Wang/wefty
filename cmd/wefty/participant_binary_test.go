@@ -36,6 +36,9 @@ func TestPlainBinaryUsesPersonForWhoamiAndClientForSubmitAndExec(t *testing.T) {
 		t.Fatal(err)
 	}
 	binary := buildWefty(t)
+	socket := clientServiceSocketForTest(t)
+	t.Setenv("WEFTY_CLIENT_SOCKET", socket)
+	startClientServiceForTest(t, binary, profilePath, socket)
 	invoke := func(args ...string) []byte {
 		t.Helper()
 		code, stdout, stderr := runPolishBinary(t, binary, append([]string{"--node-config=" + stack.clients.nodeConfigPath}, args...)...)

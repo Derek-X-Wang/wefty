@@ -18,6 +18,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/httpexchange"
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -131,6 +132,15 @@ func newAPIClient(name, flagName string, participant fabric.Fabric, address stri
 		defer cancel()
 		conn, err := participant.Dial(dialCtx, network, address)
 		if errors.Is(err, syscall.EPERM) {
+			var fenced *local.FencedCallerError
+			var peer *local.PeerIdentityError
+			if errors.As(err, &fenced) || errors.As(err, &peer) {
+				return conn, err
+			}
+			var localFailure *local.UnavailableError
+			if errors.As(err, &localFailure) {
+				return conn, &local.FencedCallerError{Cause: err}
+			}
 			return conn, &networkSandboxError{address: address, cause: err}
 		}
 		return conn, err
