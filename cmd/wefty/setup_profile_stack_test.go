@@ -88,7 +88,7 @@ func TestSetupProfileConnectsTheStackWithNoFlags(t *testing.T) {
 	if nodeSettings.NodeID != report.NodeID {
 		t.Fatalf("profile node %q, setup chose %q", nodeSettings.NodeID, report.NodeID)
 	}
-	nodeFabric, closeNodeFabric, err := fabricconfig.Open(fabricconfig.Config{
+	nodeFabric, closeNodeFabric, err := fabricconfig.Open(t.Context(), fabricconfig.Config{
 		Mode: nodeSettings.Fabric, PlainFabricID: nodeSettings.PlainFabricID,
 		Identity: fabric.Identity{NodeID: nodeSettings.NodeID, Tags: []string{l1.DefaultAgentPrincipalTag}},
 	})
@@ -264,14 +264,14 @@ func bindProfileStack(t *testing.T, occupy func(attempt int, addresses []string)
 		// L1 and L3 Fabrics, configured exactly as cmd/wefty-l1 and
 		// cmd/wefty-l3 configure them from the profile.
 		var closeL1Fabric, closeL3Fabric fabricconfig.CloseFunc
-		stack.l1Fabric, closeL1Fabric, err = fabricconfig.Open(fabricconfig.Config{
+		stack.l1Fabric, closeL1Fabric, err = fabricconfig.Open(t.Context(), fabricconfig.Config{
 			Mode: stack.profile.L1().Fabric, PlainFabricID: stack.profile.L1().PlainFabricID, Identity: fabric.Identity{NodeID: "control-plane"},
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = closeL1Fabric() })
-		stack.l3Fabric, closeL3Fabric, err = fabricconfig.Open(fabricconfig.Config{
+		stack.l3Fabric, closeL3Fabric, err = fabricconfig.Open(t.Context(), fabricconfig.Config{
 			Mode: stack.profile.L3().Fabric, PlainFabricID: stack.profile.L3().PlainFabricID,
 			Identity: fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}},
 		})

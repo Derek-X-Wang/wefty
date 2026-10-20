@@ -280,11 +280,13 @@ func verifyDoctorLocalNode(ctx context.Context, options globalOptions) error {
 	if options.fabricMode != "plain" {
 		return &localNodeError{Code: localNodeConfigInvalid, Detail: "plain-process doctor needs the plain Fabric profile"}
 	}
-	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{Mode: "plain", Identity: fabric.Identity{NodeID: options.plainIdentity, Tags: []string{l1.DefaultClientPrincipalTag}}, PlainFabricID: options.plainFabricID})
+	participant, closeFabric, err := fabricconfig.Open(ctx, fabricconfig.Config{Mode: "plain", Identity: fabric.Identity{NodeID: options.plainIdentity, Tags: []string{l1.DefaultClientPrincipalTag}}, PlainFabricID: options.plainFabricID})
+	if closeFabric != nil {
+		defer closeFabric()
+	}
 	if err != nil {
 		return &localNodeError{Code: localNodeConfigInvalid, Detail: err.Error(), Cause: err}
 	}
-	defer closeFabric()
 	clients, err := newAPIClients(participant, options.l1Address, "")
 	if err != nil {
 		return &localNodeError{Code: localNodeConfigInvalid, Detail: err.Error(), Cause: err}

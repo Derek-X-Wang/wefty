@@ -25,16 +25,29 @@ func (f *Fabric) checkParticipant(ctx context.Context) error {
 	if f.expectedIdentity == nil {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return err
+		}
+		return &fabric.ParticipantUnreachableError{Cause: participantStatusError{cause: err}}
+	}
 	status, err := f.runningStatus(ctx)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
 	if err != nil {
-		return err
+		var identity *fabric.ParticipantIdentityError
+		if errors.As(err, &identity) {
+			return err
+		}
+		return &fabric.ParticipantUnreachableError{Cause: participantStatusError{cause: err}}
 	}
 	expected, self := f.expectedIdentity, status.Self
 	if self == nil || string(self.ID) != expected.NodeID {
-		return &fabric.ParticipantIdentityError{Reason: "does not match the recorded node ID"}
+		return f.identityError("does not match the recorded node ID")
 	}
 	if self.Expired {
-		return &fabric.ParticipantIdentityError{Reason: "has an expired node identity"}
+		return f.identityError("has an expired node identity")
 	}
 	var tags []string
 	if self.Tags != nil {
@@ -44,7 +57,7 @@ func (f *Fabric) checkParticipant(ctx context.Context) error {
 	slices.Sort(tags)
 	slices.Sort(want)
 	if !slices.Equal(tags, want) || (len(want) == 0 && (expected.UserID == "" || strconv.FormatInt(int64(self.UserID), 10) != expected.UserID)) {
-		return &fabric.ParticipantIdentityError{Reason: "does not match the recorded role identity"}
+		return f.identityError("does not match the recorded role identity")
 	}
 	return nil
 }
@@ -60,7 +73,7 @@ func (f *Fabric) runningStatus(ctx context.Context) (*ipnstate.Status, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := refuseLogin(status.BackendState); err != nil {
+	if err := f.refuseLogin(status.BackendState); err != nil {
 		return nil, err
 	}
 	if status.BackendState == "Running" {
@@ -82,7 +95,7 @@ func (f *Fabric) runningStatus(ctx context.Context) (*ipnstate.Status, error) {
 		if notice.State == nil {
 			continue
 		}
-		if err := refuseLogin(notice.State.String()); err != nil {
+		if err := f.refuseLogin(notice.State.String()); err != nil {
 			return nil, err
 		}
 		if *notice.State == ipn.Running {
@@ -93,7 +106,7 @@ func (f *Fabric) runningStatus(ctx context.Context) (*ipnstate.Status, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := refuseLogin(status.BackendState); err != nil {
+	if err := f.refuseLogin(status.BackendState); err != nil {
 		return nil, err
 	}
 	if status.BackendState != "Running" {
@@ -102,12 +115,36 @@ func (f *Fabric) runningStatus(ctx context.Context) (*ipnstate.Status, error) {
 	return status, nil
 }
 
-func refuseLogin(state string) error {
+func (f *Fabric) refuseLogin(state string) error {
+	if f.expectedIdentity == nil {
+		return nil
+	}
 	switch state {
 	case "NeedsLogin":
-		return &fabric.ParticipantIdentityError{Reason: "needs sign-in; commands cannot enrol participants"}
+		return f.identityError("needs sign-in; commands cannot enrol participants")
 	case "NeedsMachineAuth":
-		return &fabric.ParticipantIdentityError{Reason: "needs machine authorization; commands cannot enrol participants"}
+		return f.identityError("needs machine authorization; commands cannot enrol participants")
 	}
 	return nil
 }
+
+func (f *Fabric) identityError(reason string) error {
+	return &fabric.ParticipantIdentityError{Reason: reason, Person: f.expectedIdentity != nil && len(f.expectedIdentity.Tags) == 0 && f.expectedIdentity.UserID != ""}
+}
+
+// participantStatusError keeps backend URLs and implementation names behind the
+// Fabric seam. The original cause remains available for error classification.
+type participantStatusError struct{ cause error }
+
+func (e participantStatusError) Error() string {
+	switch {
+	case errors.Is(e.cause, context.DeadlineExceeded):
+		return context.DeadlineExceeded.Error()
+	case errors.Is(e.cause, context.Canceled):
+		return context.Canceled.Error()
+	default:
+		return "backend status unavailable"
+	}
+}
+
+func (e participantStatusError) Unwrap() error { return e.cause }

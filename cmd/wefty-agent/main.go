@@ -553,7 +553,7 @@ func run() error {
 	} else {
 		_ = os.Setenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL", "0")
 	}
-	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{
+	participant, closeFabric, err := fabricconfig.Open(context.Background(), fabricconfig.Config{
 		Mode:          *fabricMode,
 		PlainFabricID: *plainFabricID,
 		Identity: fabric.Identity{
@@ -567,10 +567,12 @@ func run() error {
 		Ephemeral:      *ephemeral,
 		Logf:           log.Printf,
 	})
+	if closeFabric != nil {
+		defer closeFabric()
+	}
 	if err != nil {
 		return err
 	}
-	defer closeFabric()
 
 	bootSessionID, err := agent.NewBootSessionID()
 	if err != nil {

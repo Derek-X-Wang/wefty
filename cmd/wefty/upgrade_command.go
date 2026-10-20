@@ -617,11 +617,13 @@ func fetchUpgradeSource(ctx context.Context, operations upgradeHost, paths setup
 }
 
 func observeUpgradeNode(ctx context.Context, profile connprofile.Profile) (l1.Node, error) {
-	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: profile.Identities.CLI, Tags: []string{l1.DefaultClientPrincipalTag}}})
+	participant, closeFabric, err := fabricconfig.Open(ctx, fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: profile.Identities.CLI, Tags: []string{l1.DefaultClientPrincipalTag}}})
+	if closeFabric != nil {
+		defer closeFabric()
+	}
 	if err != nil {
 		return l1.Node{}, err
 	}
-	defer closeFabric()
 	clients, err := newAPIClients(participant, profile.L1Address, profile.L3Address)
 	if err != nil {
 		return l1.Node{}, err
@@ -643,11 +645,13 @@ func observeUpgradeNode(ctx context.Context, profile connprofile.Profile) (l1.No
 // Cancellation alone caps an attempt lease. Read its job through the existing
 // public client instead of adding a persisted renewal timestamp to L1.
 func observeUpgradeJob(ctx context.Context, profile connprofile.Profile, jobID string) (l1.Job, error) {
-	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: profile.Identities.CLI, Tags: []string{l1.DefaultClientPrincipalTag}}})
+	participant, closeFabric, err := fabricconfig.Open(ctx, fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: profile.Identities.CLI, Tags: []string{l1.DefaultClientPrincipalTag}}})
+	if closeFabric != nil {
+		defer closeFabric()
+	}
 	if err != nil {
 		return l1.Job{}, err
 	}
-	defer closeFabric()
 	clients, err := newAPIClients(participant, profile.L1Address, profile.L3Address)
 	if err != nil {
 		return l1.Job{}, err

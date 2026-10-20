@@ -71,7 +71,6 @@ func New(config Config) (*Fabric, error) {
 		// The dependency can initiate a login flow while starting a revoked node.
 		// Never expose that flow, even when legacy enrollment URL output is opted in.
 		// VerifyParticipant and every transport operation refuse unusable state.
-		config.Logf = func(string, ...any) {}
 	}
 	// Wefty owns its logs: the embedded node must never upload its log to
 	// the pinned tsnet dependency's log service. This must run before the
@@ -110,8 +109,8 @@ func New(config Config) (*Fabric, error) {
 			// the same way; wrapBackendLogf additionally discards backend
 			// output entirely when config.Logf is nil, since there is no
 			// caller-supplied sink to forward it to.
-			Logf:     wrapBackendLogf(config.Logf),
-			UserLogf: wrapUserLogf(config.Logf),
+			Logf:     participantLogSink(wrapBackendLogf(config.Logf), config.ExpectedIdentity != nil),
+			UserLogf: participantLogSink(wrapUserLogf(config.Logf), config.ExpectedIdentity != nil),
 		},
 	}, nil
 }

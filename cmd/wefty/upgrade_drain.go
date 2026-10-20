@@ -312,11 +312,13 @@ func finishUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, p
 }
 
 func withUpgradeClients(ctx context.Context, profile connprofile.Profile, action func(context.Context, *apiClients) error) error {
-	participant, closeFabric, err := fabricconfig.Open(fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: profile.Identities.CLI, Tags: []string{l1.DefaultClientPrincipalTag}}})
+	participant, closeFabric, err := fabricconfig.Open(ctx, fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: profile.Identities.CLI, Tags: []string{l1.DefaultClientPrincipalTag}}})
+	if closeFabric != nil {
+		defer closeFabric()
+	}
 	if err != nil {
 		return err
 	}
-	defer closeFabric()
 	clients, err := newAPIClients(participant, profile.L1Address, profile.L3Address)
 	if err != nil {
 		return err
