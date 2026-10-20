@@ -53,7 +53,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: harness up IMAGE | down")
 		os.Exit(2)
 	}
-	client, err := containerd.New("/run/containerd/containerd.sock", containerd.WithDefaultNamespace(ocihelper.ContainerdNamespace))
+	sock := os.Getenv("PROTO_CONTAINERD_SOCK")
+	if sock == "" {
+		sock = "/run/containerd/containerd.sock"
+	}
+	client, err := containerd.New(sock, containerd.WithDefaultNamespace(ocihelper.ContainerdNamespace))
 	must(err, "connect containerd")
 	defer client.Close()
 	ctx := namespaces.WithNamespace(context.Background(), ocihelper.ContainerdNamespace)

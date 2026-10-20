@@ -1,0 +1,98 @@
+name: prototype-multi-seat
+
+# THROWAWAY prototype lane (wefty #1028). Exists only on the prototype branch.
+# Not a gate; never merge this file to main.
+on:
+  push:
+    branches: [prototype/multi-seat-image]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prototype-multi-seat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  seats:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    env:
+      CONTAINERD_VERSION: 2.3.7
+      RUNC_VERSION: 1.5.1
+      PROTO_CONTAINERD_SOCK: /run/wefty-containerd/containerd.sock
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+        with:
+          go-version-file: go.mod
+      - name: Install pinned rootful containerd and runc
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            aarch64) arch=arm64 ;;
+            x86_64) arch=amd64 ;;
+            *) echo "unsupported arch"; exit 1 ;;
+          esac
+          echo "arch=$arch"
+          curl --fail --location --retry 5 --output containerd.tar.gz "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${arch}.tar.gz"
+          curl --fail --location --retry 5 --output containerd.sha256 "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-${arch}.tar.gz.sha256sum"
+          sed -i "s/containerd-${CONTAINERD_VERSION}-linux-${arch}.tar.gz/containerd.tar.gz/" containerd.sha256
+          sha256sum --check containerd.sha256
+          sudo tar --extract --gzip --file containerd.tar.gz --directory /usr/local
+          curl --fail --location --retry 5 --output "runc.${arch}" "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.${arch}"
+          curl --fail --location --retry 5 --output runc.sha256sum "https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}/runc.sha256sum"
+          grep " runc.${arch}\$" runc.sha256sum | sha256sum --check
+          sudo install --mode=0755 "runc.${arch}" /usr/local/sbin/runc
+          sudo modprobe overlay
+          sudo install --directory --mode=0700 /var/lib/wefty-containerd /run/wefty-containerd
+          sudo tee /etc/systemd/system/proto-containerd.service >/dev/null <<'UNIT'
+          [Unit]
+          Description=Prototype pinned containerd
+          [Service]
+          Type=simple
+          Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+          ExecStart=/usr/local/bin/containerd --address /run/wefty-containerd/containerd.sock --root /var/lib/wefty-containerd/root --state /run/wefty-containerd/state
+          Restart=no
+          KillMode=control-group
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl start proto-containerd.service
+          for _ in $(seq 1 60); do
+            sudo /usr/local/bin/ctr --address "$PROTO_CONTAINERD_SOCK" version >/dev/null 2>&1 && break
+            sleep 1
+          done
+          sudo /usr/local/bin/ctr --address "$PROTO_CONTAINERD_SOCK" version
+          uname -a; docker version --format '{{.Server.Version}}' || true; free -m; df -h /
+      - name: Build image with Docker and import into containerd
+        run: |
+          set -euo pipefail
+          docker build -t proto-seats:1 prototype/multi-seat-computer
+          docker save proto-seats:1 | sudo /usr/local/bin/ctr --address "$PROTO_CONTAINERD_SOCK" -n wefty images import -
+          sudo /usr/local/bin/ctr --address "$PROTO_CONTAINERD_SOCK" -n wefty images ls
+      - name: Build harness (real BuildRuntimeSpec)
+        run: |
+          go build -o proto-harness ./prototype/multi-seat-computer/harness
+          sudo install -m0755 proto-harness /usr/local/bin/proto-harness
+      - name: Run checks
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /tmp/proto-out
+          sudo env "PATH=$PATH" PROTO_CONTAINERD_SOCK="$PROTO_CONTAINERD_SOCK" PROTO_OUT=/tmp/proto-out \
+            python3 prototype/multi-seat-computer/run-checks.py 2>&1 | tee /tmp/run-checks.log
+      - name: Collect
+        if: always()
+        run: |
+          sudo mkdir -p /tmp/proto-out
+          sudo cp /tmp/run-checks.log /tmp/proto-out/ 2>/dev/null || true
+          sudo cp /var/lib/proto-oci/spec.json /tmp/proto-out/ 2>/dev/null || true
+          sudo cp /var/log/proto-container.log /tmp/proto-out/container.log 2>/dev/null || true
+          sudo journalctl -u proto-containerd.service --no-pager | tail -n 200 > /tmp/proto-out/containerd-journal.txt || true
+          sudo chmod -R a+rX /tmp/proto-out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        if: always()
+        with:
+          name: proto-multi-seat-evidence
+          path: /tmp/proto-out
+          if-no-files-found: warn

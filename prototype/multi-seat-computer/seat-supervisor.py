@@ -136,7 +136,7 @@ def start_seat(seat):
                              preexec_fn=drop, start_new_session=True,
                              stdout=open("/run/seat-%d.log" % sid, "ab"), stderr=subprocess.STDOUT)
     running[sid] = {"popen": popen, "uid": uid, "gid": gid, "t0": time.monotonic(),
-                    "ports": (seat["view_port"], seat["control_port"]), "ready_ms": None}
+                    "ports": (seat["view_port"], seat["control_port"]), "ready_ms": None, "spec": seat}
     status["seats"][str(sid)] = {"state": "starting", "uid": uid, "pid": popen.pid}
     log("start seat", sid, "uid", uid)
 
@@ -188,7 +188,7 @@ def main():
             doc, blob = None, None
         if doc is not None and blob != last_blob:
             want = {int(s["id"]): s for s in doc.get("seats", [])}
-            for sid in [s for s in running if s not in want]:
+            for sid in [s for s in running if s not in want or running[s]["spec"] != want[s]]:
                 stop_seat(sid)
             for sid, s in want.items():
                 if sid not in running:

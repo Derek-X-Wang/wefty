@@ -168,6 +168,18 @@ def main():
                 print(json.dumps({"strip": s, "timeout": True, "ms": int((time.monotonic() - t0) * 1000)}))
                 sys.exit(1)
             time.sleep(0.1)
+    elif mode == "shot":
+        c.request(0); c.read_update()
+        import zlib
+        rows = b"".join(b"\0" + b"".join(bytes((c.fb[o + 2], c.fb[o + 1], c.fb[o]))
+                        for o in range(y * c.w * 4, (y + 1) * c.w * 4, 4)) for y in range(c.h))
+        def chunk(t, d):
+            return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+        png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", c.w, c.h, 8, 2, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+        with open(sys.argv[3], "wb") as f:
+            f.write(png)
+        print(json.dumps({"shot": sys.argv[3], "strip": c.strip(), "digest": c.digest()}))
     elif mode == "click":
         c.pointer(640, 400, 0); c.pointer(640, 400, 1); time.sleep(0.1); c.pointer(640, 400, 0)
         time.sleep(0.5)
