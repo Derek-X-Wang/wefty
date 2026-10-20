@@ -437,6 +437,21 @@ func TestExecCaptureServerWriteFailureIsRetryableAndPrivate(t *testing.T) {
 	}
 }
 
+func TestExecCapturePathAcceptsOnlySHA256Digests(t *testing.T) {
+	root := t.TempDir()
+	store := &Store{execCaptureRoot: root}
+	digest := strings.Repeat("ab", 32)
+	path, err := store.execCapturePath(digest)
+	if err != nil || path != filepath.Join(root, digest+".bundle") {
+		t.Fatalf("valid digest path=%q err=%v", path, err)
+	}
+	for _, hash := range []string{"", "../" + digest[3:], digest[:63], strings.ToUpper(digest), digest + "/x", "a/../" + digest[5:]} {
+		if path, err := store.execCapturePath(hash); err == nil {
+			t.Fatalf("hash %q named %q", hash, path)
+		}
+	}
+}
+
 func TestExecCaptureAttachmentRequiresOwnerAndExecShape(t *testing.T) {
 	h := newIntegrationHarness(t)
 	payload := []byte("owned")

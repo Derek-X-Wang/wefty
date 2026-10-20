@@ -206,13 +206,17 @@ func (s *Store) uploadExecCapture(ctx context.Context, hash string, uploader str
 		ref.Size = size
 		return ref, nil
 	}
-	if err = os.Rename(file.Name(), s.execCapturePath(hash)); err != nil {
+	path, err := s.execCapturePath(hash)
+	if err != nil {
+		return ref, internalError(err, "name exec capture file")
+	}
+	if err = os.Rename(file.Name(), path); err != nil {
 		return ref, internalError(err, "commit exec capture file")
 	}
 	committed := false
 	defer func() {
 		if !committed {
-			_ = os.Remove(s.execCapturePath(hash))
+			_ = os.Remove(path)
 		}
 	}()
 	directory, err := os.Open(s.execCaptureRoot)
@@ -232,8 +236,15 @@ func (s *Store) uploadExecCapture(ctx context.Context, hash string, uploader str
 	ref.Size = size
 	return ref, nil
 }
-func (s *Store) execCapturePath(hash string) string {
-	return filepath.Join(s.execCaptureRoot, hash+".bundle")
+
+// execCapturePath names a capture's file under the capture root. Only a
+// lower-case SHA-256 hex digest is accepted, so the name can never leave the
+// root, whatever the caller checked before.
+func (s *Store) execCapturePath(hash string) (string, error) {
+	if !execCaptureHashPattern.MatchString(hash) {
+		return "", errors.New("exec capture hash is not a SHA-256 hex digest")
+	}
+	return filepath.Join(s.execCaptureRoot, hash+".bundle"), nil
 }
 func (s *Store) checkExecCaptureTx(ctx context.Context, tx *sql.Tx, raw []byte, actor string) error {
 	ref, present, err := parseExecCaptureReference(raw)
@@ -255,7 +266,11 @@ func (s *Store) checkExecCaptureTx(ctx context.Context, tx *sql.Tx, raw []byte, 
 	if size != ref.Size {
 		return protocolError(contract.ErrorInvalidRequest, "exec capture size %d bytes differs from uploaded size %d bytes", ref.Size, size)
 	}
-	info, err := os.Stat(s.execCapturePath(ref.SHA256))
+	path, err := s.execCapturePath(ref.SHA256)
+	if err != nil {
+		return protocolError(contract.ErrorInvalidRequest, "exec capture reference is invalid")
+	}
+	info, err := os.Stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return protocolError(contract.ErrorInvalidRequest, execCaptureDeleted)
 	}
@@ -311,7 +326,11 @@ func (s *Store) sweepExecCapturesLocked(ctx context.Context) error {
 		return err
 	}
 	for _, hash := range hashes {
-		if err = os.Remove(s.execCapturePath(hash)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		path, pathErr := s.execCapturePath(hash)
+		if pathErr != nil {
+			return internalError(pathErr, "name expired exec capture")
+		}
+		if err = os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return internalError(err, "delete expired exec capture")
 		}
 		if _, err = s.db.ExecContext(ctx, `DELETE FROM exec_captures WHERE sha256=?`, hash); err != nil {
@@ -363,7 +382,12 @@ func (s *Server) getExecCapture(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocolError(contract.ErrorNotFound, "run has no live exec capture"))
 		return
 	}
-	file, err := os.Open(s.store.execCapturePath(ref.SHA256))
+	path, err := s.store.execCapturePath(ref.SHA256)
+	if err != nil {
+		writeError(w, protocolError(contract.ErrorNotFound, "run has no live exec capture"))
+		return
+	}
+	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		writeError(w, protocolError(contract.ErrorNotFound, execCaptureDeleted))
 		return
