@@ -51,7 +51,11 @@ func NewServer(path string, participants map[string]Participant) (*Server, error
 	}
 	return &Server{path: path, participants: copyParticipants, peerUID: unixPeerUID, uid: uint32(os.Geteuid()), slots: make(chan struct{}, 128), busySlots: make(chan struct{}, 4), handshakeTimeout: handshakeBudget, listen: net.Listen}, nil
 }
-func (s *Server) Serve(ctx context.Context) error {
+func (s *Server) Serve(ctx context.Context) error { return s.ServeReady(ctx, nil) }
+
+// ServeReady calls ready after private socket publication and before accepting
+// requests. A failed ready callback closes and removes the socket.
+func (s *Server) ServeReady(ctx context.Context, ready func() error) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if err := privateDirectory(filepath.Dir(s.path)); err != nil {
@@ -91,6 +95,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	defer os.Remove(s.path)
 	if err := os.Chmod(s.path, 0o600); err != nil {
 		return err
+	}
+	if ready != nil {
+		if err := ready(); err != nil {
+			return err
+		}
 	}
 	// The parent is already private before bind, so the socket is never
 	// accessible to a different user, including between bind and chmod.

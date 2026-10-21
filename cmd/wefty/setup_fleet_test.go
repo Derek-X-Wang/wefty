@@ -41,7 +41,7 @@ func newFleetFixture(t *testing.T) (*setupFixture, *fakeSetupEnroller, *bytes.Bu
 			code := 200
 			switch {
 			case r.URL.Path == "/v1/nodes":
-				payload = l1.NodeList{Nodes: []l1.Node{{NodeRegistration: contract.NodeRegistration{NodeID: p.Identities.Node, BootSessionID: "boot-fixture"}, State: contract.NodeAlive, ClaimsEnabled: true, AuthoritativeTags: []string{contract.StableNodeTagPrefix + p.Identities.Node}, MaxOneshotSlots: 4, MaxServiceSlots: 2}}}
+				payload = l1.NodeList{Nodes: []l1.Node{{NodeRegistration: contract.NodeRegistration{NodeID: p.Identities.Node, BootSessionID: "boot-fixture"}, State: contract.NodeAlive, ClaimsEnabled: true, AutomaticallyAdmitted: len(p.NodeAdmission) == 0, AuthoritativeTags: []string{contract.StableNodeTagPrefix + p.Identities.Node}, MaxOneshotSlots: 4, MaxServiceSlots: 2}}}
 			case r.URL.Path == "/v1/runs" && r.Method == "GET":
 				payload = map[string]any{"runs": []any{}}
 			case r.URL.Path == "/v1/runs" && r.Method == "POST":

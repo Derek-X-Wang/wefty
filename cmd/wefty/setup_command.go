@@ -28,6 +28,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
+	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -87,6 +88,8 @@ var setupBinaries = []string{"wefty", "wefty-l1", "wefty-l3", "wefty-agent"}
 // can run it against a temporary home with fake launchctl and a fake shell.
 type setupHost struct {
 	bootTime        func() (time.Time, error)
+	peerLookup      func(context.Context, fabricconfig.Config) (fabric.PeerLookup, fabricconfig.CloseFunc, error)
+	ownerLogin      func(context.Context, string) error
 	enroller        fabric.Enroller
 	enrolmentInput  io.Reader
 	enrolmentOutput io.Writer
@@ -113,6 +116,8 @@ type setupHost struct {
 }
 
 type setupRequest struct {
+	joinCode            string
+	withPerson          bool
 	role                string
 	coordinatorURL      string
 	fleetCoordinatorURL string
@@ -280,6 +285,7 @@ type setupReport struct {
 	Changes      []string              `json:"changes"`
 	Services     []setupServiceReport  `json:"services"`
 	Notes        []string              `json:"notes,omitempty"`
+	JoinCode     string                `json:"join_code,omitempty"`
 }
 
 func executeSetup(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
@@ -287,7 +293,9 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	var request setupRequest
 	var remove, purge bool
-	flags.StringVar(&request.role, "role", "", "fleet role for a new install: control-plane")
+	flags.StringVar(&request.role, "role", "", "fleet role for a new install: control-plane or join")
+	flags.StringVar(&request.joinCode, "join-code", "", "non-secret join code from the control plane setup report")
+	flags.BoolVar(&request.withPerson, "with-person", false, "enrol the owner through browser sign-in on the owner laptop only")
 	flags.BoolVar(&request.skipSmokeRun, "skip-smoke-run", false, "skip the bounded pinned fleet smoke run")
 	flags.StringVar(&request.coordinatorURL, "coordinator-url", "", "non-default HTTPS enrolment coordinator (no credentials)")
 	flags.BoolVar(&remove, "remove", false, "remove the per-user install, keeping data and logs")
@@ -298,14 +306,20 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
-		return usageError("usage: wefty setup [--role control-plane] [--from DIR] [--node-id ID] | --remove [--purge]")
+		return usageError("usage: wefty setup [--role control-plane] [--from DIR] [--node-id ID] | --role join --join-code CODE [--with-person] | --remove [--purge]")
 	}
-	var fleetFlag bool
+	var fleetFlag, joinFlag bool
 	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "join-code" || f.Name == "with-person" {
+			joinFlag = true
+		}
 		if f.Name == "role" || f.Name == "coordinator-url" || f.Name == "skip-smoke-run" {
 			fleetFlag = true
 		}
 	})
+	if remove && joinFlag {
+		return usageError("--remove cannot use --join-code or --with-person")
+	}
 	if remove && fleetFlag {
 		return usageError("--remove cannot use --role, --coordinator-url or --skip-smoke-run")
 	}
@@ -424,6 +438,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	if role != serviceplan.Legacy {
 		return runFleetSetup(ctx, host, request, paths, role)
+	}
+	if request.joinCode != "" || request.withPerson {
+		return setupReport{}, usageError("--join-code and --with-person require --role join")
 	}
 	if request.coordinatorURL != "" || request.skipSmokeRun {
 		return setupReport{}, usageError("--coordinator-url and --skip-smoke-run require a fleet role")
@@ -1084,6 +1101,10 @@ func captureLoginPATH(ctx context.Context, host setupHost) (string, error) {
 // never counts as current. A binary that prints too much or does not answer in
 // time is stopped and gives no version; setup goes on without one.
 func reportedSetupVersion(ctx context.Context, host setupHost, home, directory string) (string, string) {
+	return reportedSetupBinaryVersion(ctx, host, home, directory, setupBinaries)
+}
+
+func reportedSetupBinaryVersion(ctx context.Context, host setupHost, home, directory string, binaries []string) (string, string) {
 	budget := host.versionProbeBudget
 	if budget <= 0 {
 		budget = setupVersionProbeBudget
@@ -1091,9 +1112,9 @@ func reportedSetupVersion(ctx context.Context, host setupHost, home, directory s
 	probe, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	environment := []string{"HOME=" + home, "PATH=" + setupServicePATH}
-	reports := make([]string, 0, len(setupBinaries))
+	reports := make([]string, 0, len(binaries))
 	agreed := true
-	for _, name := range setupBinaries {
+	for _, name := range binaries {
 		path := filepath.Join(directory, name)
 		output, err := runVersionProbe(probe, directory, environment, path)
 		switch {
@@ -1115,8 +1136,8 @@ func reportedSetupVersion(ctx context.Context, host setupHost, home, directory s
 		reports = append(reports, value)
 	}
 	if !agreed {
-		described := make([]string, len(setupBinaries))
-		for index, name := range setupBinaries {
+		described := make([]string, len(binaries))
+		for index, name := range binaries {
 			described[index] = name + " " + reports[index]
 		}
 		return "", "the binaries report different versions (" + strings.Join(described, ", ") + "); setup recorded no installed version"
@@ -1215,6 +1236,9 @@ func writeSetupReport(writer io.Writer, report setupReport) error {
 	var output strings.Builder
 	if report.Role != serviceplan.Legacy {
 		fmt.Fprintf(&output, "Installation role: %s\n", report.Role)
+		if report.JoinCode != "" {
+			fmt.Fprintf(&output, "Join code (non-secret): %s\n", report.JoinCode)
+		}
 		for _, role := range []string{"l1", "l3", "node-agent", "client", "person"} {
 			if name := report.Participants[role]; name != "" {
 				fmt.Fprintf(&output, "%s network name: %s\n", role, name)

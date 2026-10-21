@@ -57,7 +57,11 @@ func TestFleetServicePlanMacAdapterAndRoleMetadata(t *testing.T) {
 			t.Fatalf("%s labels=%v", tc.role, labels)
 		}
 		client := agents[len(agents)-1]
-		if client.Program != "/test/home/bin/wefty" || !reflect.DeepEqual(client.Arguments, []string{"--profile=/test/home/profile.json", "client-service", "--socket=/test/home/.config/wefty/client/service.sock"}) {
+		args := []string{"--profile=/test/home/profile.json", "client-service", "--socket=/test/home/.config/wefty/client/service.sock"}
+		if tc.role == serviceplan.Join {
+			args = append(args, "--ready-file=/test/home/data/setup-ready/client-service.json")
+		}
+		if client.Program != "/test/home/bin/wefty" || !reflect.DeepEqual(client.Arguments, args) {
 			t.Fatalf("client service=%+v", client)
 		}
 		receipt := setupManifest{Version: 1, Role: tc.role, Files: map[string]string{}}

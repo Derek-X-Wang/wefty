@@ -20,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/internal/serviceready"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
@@ -44,7 +45,7 @@ func setupFleetClients(ctx context.Context, paths setupPaths, profile connprofil
 
 // Poll only existing observers; never open a service's participant state.
 // One shared budget bounds startup, followed by a separate two-minute smoke.
-func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, p connprofile.Profile, services []launchagent.Agent, skipSmoke bool) []setupReadinessCheck {
+func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, p connprofile.Profile, services []launchagent.Agent, skipSmoke bool, role serviceplan.Role) []setupReadinessCheck {
 	budget := host.readinessBudget
 	if budget <= 0 {
 		budget = 30 * time.Second
@@ -88,7 +89,7 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 				checks[i].Detail = "LaunchAgent is not running"
 				continue
 			}
-			if strings.HasSuffix(service.Label, "client-service") {
+			if strings.HasSuffix(service.Label, "client-service") && role == serviceplan.ControlPlane {
 				continue
 			}
 			var metadata serviceready.Metadata
@@ -138,7 +139,7 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 		}
 		done()
 		if clients != nil {
-			if state, err := manager.State(bounded, services[len(services)-1].Label); err == nil && state.Running {
+			if state, err := manager.State(bounded, services[len(services)-1].Label); err == nil && state.Running && (role == serviceplan.ControlPlane || checks[len(services)-1].Status == "VERIFIED") {
 				checks[len(services)-1].Status, checks[len(services)-1].Detail = "VERIFIED", "LaunchAgent running; client service answered the saved-client identity check"
 			}
 			probe, done := context.WithTimeout(bounded, statusProbeBudget)
@@ -150,9 +151,19 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 			} else {
 				checks[l1Index].Status, checks[l1Index].Detail = "VERIFIED", "saved client read L1 nodes through the client service"
 				checks[nodeIndex].Status, checks[nodeIndex].Detail = "FAILED", "this node is not alive and admitted with its configured policy"
+				if role == serviceplan.Join {
+					checks[nodeIndex].Detail = "this node is not automatically admitted with claims enabled, its only Pinned tag and default slots. Ask the control-plane owner to check automatic admission; an identity already bound to another Node needs the owner set-claims action and explicit Pinned policy. To retire a machine, disable claims or drain it, then revoke its network identity. Joining setup never enables claims."
+				}
 				for _, node := range nodes.Nodes {
-					if currentBoot != "" && node.BootSessionID == currentBoot && setupNodeAdmitted(p, node) {
+					admitted := setupNodeAdmitted(p, node)
+					if role == serviceplan.Join {
+						admitted = setupJoinNodeAdmitted(p, node)
+					}
+					if currentBoot != "" && node.BootSessionID == currentBoot && admitted {
 						checks[nodeIndex].Status, checks[nodeIndex].Detail = "VERIFIED", "stable node is alive, claims enabled, configured admission and reserved Pinned tag match"
+						if role == serviceplan.Join {
+							checks[nodeIndex].Detail = "stable node is alive, automatically admitted, claims enabled, with only its Pinned tag and default slots"
+						}
 					}
 				}
 			}
@@ -178,7 +189,9 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 			break
 		}
 	}
-	checks = append(checks, setupReadinessCheck{Check: "L1 → L3 direction", Status: "NOT-RUN", Detail: "no read-only probe yet; covered by doctor later"})
+	if role == serviceplan.ControlPlane {
+		checks = append(checks, setupReadinessCheck{Check: "L1 → L3 direction", Status: "NOT-RUN", Detail: "no read-only probe yet; covered by doctor later"})
+	}
 	smoke := setupReadinessCheck{Check: "smoke run", Status: "NOT-RUN", Detail: "startup checks did not pass"}
 	ready := true
 	for _, check := range checks {
@@ -215,6 +228,9 @@ func setupNodeAdmitted(p connprofile.Profile, node l1.Node) bool {
 		}
 	}
 	return false
+}
+func setupJoinNodeAdmitted(p connprofile.Profile, node l1.Node) bool {
+	return node.NodeID == p.Identities.Node && node.State == contract.NodeAlive && node.ClaimsEnabled && node.AutomaticallyAdmitted && node.MaxOneshotSlots == l1.DefaultMaxOneshotSlots && node.MaxServiceSlots == l1.DefaultMaxServiceSlots && slices.Equal(node.AuthoritativeTags, []string{contract.StableNodeTagPrefix + p.Identities.Node})
 }
 
 func runSetupSmoke(ctx context.Context, clients *apiClients, nodeID string) (runID string, result error) {

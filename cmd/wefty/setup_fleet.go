@@ -18,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/fleetjoin"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -31,14 +32,17 @@ const fleetSetupProfileName = "fleet-setup-profile.json"
 // and staged participant records across interruptions. The profile, never the
 // informational markers, determines which participants have been saved.
 type fleetSetupRecord struct {
-	Version          int              `json:"version"`
-	Role             serviceplan.Role `json:"role"`
-	NodeID           string           `json:"node_id"`
-	StagedProfile    string           `json:"staged_profile"`
-	CoordinatorURL   string           `json:"coordinator_url,omitempty"`
-	Enrolled         []string         `json:"enrolled,omitempty"`
-	ProfilePublished bool             `json:"profile_published,omitempty"`
-	Committed        bool             `json:"committed,omitempty"`
+	JoinCode                string           `json:"join_code,omitempty"`
+	WithPerson              bool             `json:"with_person,omitempty"`
+	PeerVerificationFailure string           `json:"peer_verification_failure,omitempty"`
+	Version                 int              `json:"version"`
+	Role                    serviceplan.Role `json:"role"`
+	NodeID                  string           `json:"node_id"`
+	StagedProfile           string           `json:"staged_profile"`
+	CoordinatorURL          string           `json:"coordinator_url,omitempty"`
+	Enrolled                []string         `json:"enrolled,omitempty"`
+	ProfilePublished        bool             `json:"profile_published,omitempty"`
+	Committed               bool             `json:"committed,omitempty"`
 }
 
 func readFleetSetupRecord(paths setupPaths) (*fleetSetupRecord, error) {
@@ -73,6 +77,17 @@ func readFleetSetupRecord(paths setupPaths) (*fleetSetupRecord, error) {
 	}
 	if record.Version != 1 || record.Role.Validate() != nil || record.Role == serviceplan.Legacy || !validSetupNodeID(record.NodeID) || record.StagedProfile != filepath.Join(paths.config, fleetSetupProfileName) || connprofile.ValidateCoordinatorURL(record.CoordinatorURL) != nil {
 		return nil, errors.New("invalid fleet setup record; setup will not infer a role or replace saved identities")
+	}
+	if record.Role == serviceplan.Join {
+		d, err := fleetjoin.Parse(record.JoinCode)
+		if err != nil || d.CoordinatorURL != record.CoordinatorURL {
+			return nil, errors.New("invalid recorded join code; restore the fleet setup record")
+		}
+		if !validJoinVerificationFailure(record.PeerVerificationFailure) {
+			return nil, errors.New("invalid peer verification failure record")
+		}
+	} else if record.JoinCode != "" || record.WithPerson || record.PeerVerificationFailure != "" {
+		return nil, errors.New("control-plane record contains joining metadata")
 	}
 	return &record, nil
 }
@@ -128,10 +143,7 @@ func selectSetupRole(paths setupPaths, requested string) (serviceplan.Role, erro
 			return "", fmt.Errorf("setup refuses role %q over staged fleet role %q; role conversion is not available", role, record.Role)
 		}
 	}
-	if role == serviceplan.Join {
-		return "", errors.New("setup refuses recorded fleet role join here: joining-machine setup is not available yet (slice 3b)")
-	}
-	if role == serviceplan.ControlPlane && record == nil {
+	if role != serviceplan.Legacy && record == nil {
 		// A receipt without its durable setup record cannot reconstruct the
 		// old participants. An existing plain install is never a conversion.
 		for _, path := range []string{paths.profile, paths.nodeConfig, filepath.Join(paths.config, setupManifestName), filepath.Join(paths.data, "l1.sqlite"), filepath.Join(paths.data, "l3.sqlite")} {
@@ -173,6 +185,18 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		request.coordinatorURL = request.fleetCoordinatorURL
 	}
 
+	var join fleetjoin.Descriptor
+	if role == serviceplan.Join {
+		if request.coordinatorURL == "" {
+			request.coordinatorURL = os.Getenv("TS_CONTROL_URL")
+		}
+		join, err = selectJoinSetup(paths, &request, record)
+		if err != nil {
+			return report, err
+		}
+	} else if request.joinCode != "" || request.withPerson {
+		return report, usageError("--join-code and --with-person require --role join")
+	}
 	if record != nil {
 		if request.nodeID != "" && request.nodeID != record.NodeID {
 			return report, errors.New("setup keeps its recorded stable node ID; a conflicting --node-id is refused")
@@ -210,11 +234,20 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	if err != nil {
 		return report, err
 	}
+	binaries := []string{"wefty"}
+	for _, service := range plan.Services {
+		if !slices.Contains(binaries, service.Binary) {
+			binaries = append(binaries, service.Binary)
+		}
+	}
 	digests := map[string]string{}
-	for _, name := range setupBinaries {
+	for _, name := range binaries {
 		digest, err := executableDigest(filepath.Join(source, name))
 		if err != nil {
-			return report, fmt.Errorf("build all four setup binaries into one folder first: %w", err)
+			if role == serviceplan.ControlPlane {
+				return report, fmt.Errorf("build all four setup binaries into one folder first: %w", err)
+			}
+			return report, fmt.Errorf("build wefty and wefty-agent into one folder first: %w", err)
 		}
 		digests[name] = digest
 	}
@@ -239,7 +272,13 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		return report, usageError("--node-id must be a valid stable lowercase node ID")
 	}
 	if record == nil {
-		record = &fleetSetupRecord{Version: 1, Role: role, NodeID: nodeID, StagedProfile: filepath.Join(paths.config, fleetSetupProfileName), CoordinatorURL: request.coordinatorURL}
+		record = &fleetSetupRecord{Version: 1, Role: role, NodeID: nodeID, StagedProfile: filepath.Join(paths.config, fleetSetupProfileName), CoordinatorURL: request.coordinatorURL, JoinCode: request.joinCode, WithPerson: request.withPerson}
+	}
+	if role == serviceplan.Join {
+		if record.JoinCode != request.joinCode {
+			record.PeerVerificationFailure = ""
+		}
+		record.JoinCode = request.joinCode
 	}
 	report.NodeID = nodeID
 	participants, err := fleetSetupParticipants(plan, nodeID)
@@ -269,7 +308,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		folders = append(folders, file.folder)
 	}
 	destinations := []string{filepath.Join(paths.configRel, connprofile.FileName), filepath.Join(paths.configRel, "node.json"), filepath.Join(paths.configRel, setupManifestName), filepath.Join(paths.configRel, fleetSetupRecordName), filepath.Join(paths.configRel, fleetSetupProfileName)}
-	for _, name := range setupBinaries {
+	for _, name := range binaries {
 		destinations = append(destinations, filepath.Join(paths.binRel, name))
 	}
 	for _, file := range skills {
@@ -353,6 +392,9 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		return report, err
 	}
 
+	if committed && role == serviceplan.Join && record.WithPerson {
+		participants = append(participants, setupParticipant{connprofile.ParticipantPerson, "wefty://person/" + nodeID})
+	}
 	if !committed && record.Committed {
 		return report, errors.New("committed fleet role receipt is missing; restore its original receipt before setup")
 	}
@@ -398,7 +440,31 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			}
 		}
 
-		profile, err = enrolSetupParticipants(ctx, setupEnrolmentRequest{home: paths.home, data: paths.data, profilePath: record.StagedProfile, participants: participants, enroller: host.enroller, input: host.enrolmentInput, output: host.enrolmentOutput, controlURL: record.CoordinatorURL, deferNotices: true, afterSaved: func(role string) error {
+		if role == serviceplan.Join && record.WithPerson {
+			if _, saved := profile.Participants[connprofile.ParticipantPerson]; !saved && !request.withPerson {
+				// An unsaved optional person must not make machine setup mandatory sign-in.
+				// The prior consistency gate already refused a missing recorded participant.
+				if record.ProfilePublished {
+					return report, errors.New("published person choice cannot be changed; restore its saved profile")
+				}
+				if _, err := root.Lstat(filepath.Join(paths.configRel, connprofile.FileName)); err == nil {
+					return report, errors.New("published person choice cannot be changed; restore its saved profile")
+				} else if !errors.Is(err, fs.ErrNotExist) {
+					return report, err
+				}
+				record.WithPerson = false
+				if err := saveRecord(); err != nil {
+					return report, err
+				}
+			}
+			if record.WithPerson {
+				participants = append(participants, setupParticipant{connprofile.ParticipantPerson, "wefty://person/" + nodeID})
+			}
+		}
+		if host.ownerLogin == nil {
+			host.ownerLogin = openSetupOwnerLoginURL
+		}
+		profile, err = enrolSetupParticipants(ctx, setupEnrolmentRequest{home: paths.home, data: paths.data, profilePath: record.StagedProfile, participants: participants, enroller: host.enroller, input: host.enrolmentInput, output: host.enrolmentOutput, controlURL: record.CoordinatorURL, openLoginURL: host.ownerLogin, deferNotices: true, afterSaved: func(role string) error {
 			if !slices.Contains(record.Enrolled, role) {
 				record.Enrolled = append(record.Enrolled, role)
 			}
@@ -408,11 +474,39 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			return step("enrolled:" + role)
 		}})
 		if err != nil {
+			_, nodeSaved := profile.Participants[connprofile.ParticipantNodeAgent]
+			_, clientSaved := profile.Participants[connprofile.ParticipantClient]
+			_, personSaved := profile.Participants[connprofile.ParticipantPerson]
+			if role == serviceplan.Join && record.WithPerson && nodeSaved && clientSaved && !personSaved {
+				return report, fmt.Errorf("%w; to finish machine setup without person sign-in, rerun setup without --with-person, keeping the join code and explicit coordinator selection", err)
+			}
 			return report, err
 		}
 		profile.Identities.Node = nodeID
-		profile.AutomaticNodeAdmission = true
-		profile.NodeAdmission = []connprofile.NodeAdmission{{NodeID: nodeID, Tags: []string{contract.StableNodeTagPrefix + nodeID}, MaxOneshotSlots: l1.DefaultMaxOneshotSlots, MaxServiceSlots: l1.DefaultMaxServiceSlots}}
+		if role == serviceplan.ControlPlane {
+			profile.AutomaticNodeAdmission = true
+			profile.NodeAdmission = []connprofile.NodeAdmission{{NodeID: nodeID, Tags: []string{contract.StableNodeTagPrefix + nodeID}, MaxOneshotSlots: l1.DefaultMaxOneshotSlots, MaxServiceSlots: l1.DefaultMaxServiceSlots}}
+		} else {
+			profile.L1Address, profile.L3Address = join.L1, join.L3
+		}
+	}
+	if role == serviceplan.Join {
+		if profile.L1Address != join.L1 || profile.L3Address != join.L3 {
+			return report, errors.New("joining profile differs from its recorded join code; restore the original profile")
+		}
+		if !committed {
+			failure, verifyErr := verifySetupJoinPeers(ctx, host, profile)
+			record.PeerVerificationFailure = failure
+			if err := saveRecord(); err != nil {
+				return report, err
+			}
+			if err := step("peer-verification"); err != nil {
+				return report, err
+			}
+			if verifyErr != nil {
+				return report, verifyErr
+			}
+		}
 	}
 	if profile.Identities.Node != record.NodeID {
 		return report, errors.New("active profile differs from the recorded stable Node ID; restore it before setup")
@@ -453,13 +547,19 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		return report, err
 	}
 	report.L1Address, report.L3Address = profile.L1Address, profile.L3Address
+	if role == serviceplan.ControlPlane {
+		report.JoinCode, err = fleetjoin.Encode(fleetjoin.Descriptor{L1: profile.L1Address, L3: profile.L3Address, CoordinatorURL: record.CoordinatorURL})
+		if err != nil {
+			return report, err
+		}
+	}
 	files := append([]setupFile{}, skills...)
 	nodePayload, err := ocicontrol.EncodeInstalledConfig(ocicontrol.InstalledConfig{Version: ocicontrol.InstalledConfigVersion, NodeID: nodeID})
 	if err != nil {
 		return report, err
 	}
 	files = append(files, setupFile{folder: paths.configRel, name: "node.json", payload: nodePayload, mode: 0600, change: "recorded node " + nodeID})
-	for _, name := range setupBinaries {
+	for _, name := range binaries {
 		payload, err := os.ReadFile(filepath.Join(source, name))
 		if err != nil {
 			return report, err
@@ -502,7 +602,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			manifest.Files[filepath.Join(paths.launchAgentsRel, service.Label+".plist")] = payloadDigest(plists[i])
 		}
 		manifest.Files[filepath.Join(paths.configRel, connprofile.FileName)] = payloadDigest(profilePayload)
-		version, problem := reportedSetupVersion(ctx, host, paths.home, source)
+		version, problem := reportedSetupBinaryVersion(ctx, host, paths.home, source, binaries)
 		manifest.InstalledVersion = version
 		if problem != "" {
 			report.Notes = append(report.Notes, problem)
@@ -526,7 +626,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		if err != nil {
 			return report, err
 		}
-		if err := write(setupFile{folder: paths.configRel, name: setupManifestName, payload: append(payload, '\n'), mode: 0600, change: "committed control-plane role"}); err != nil {
+		if err := write(setupFile{folder: paths.configRel, name: setupManifestName, payload: append(payload, '\n'), mode: 0600, change: "committed " + string(role) + " role"}); err != nil {
 			return report, err
 		}
 		if err := step("receipt"); err != nil {
@@ -579,8 +679,18 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			}
 		}
 	}
-	report.Notes = append(report.Notes, "Retire a machine: disable claims or drain it, then revoke its network identity.", "Make each agent join key single-use with a short expiry, immediately before use. Only the first Node per network identity is admitted automatically.", "Joining machine next: fleet join setup is coming in slice 3b; do not copy this machine's full profile.")
-	report.Readiness = checkFleetReadiness(ctx, host, paths, profile, services, request.skipSmokeRun)
+	report.Notes = append(report.Notes, "Retire a machine: disable claims or drain it, then revoke its network identity.", "Make each agent join key single-use with a short expiry, immediately before use. Only the first Node per network identity is admitted automatically.")
+	if role == serviceplan.ControlPlane {
+		report.Notes = append(report.Notes, "On a fresh joining machine, use wefty setup --role join --join-code CODE with this report's non-secret join code; do not copy the full profile.")
+		if record.CoordinatorURL != "" {
+			report.Notes = append(report.Notes, "The code only cross-checks the coordinator. Explicitly select the same coordinator with --coordinator-url or TS_CONTROL_URL on the joining machine.")
+		}
+	} else if record.WithPerson {
+		report.Notes = append(report.Notes, "Owner person sign-in is configured for this laptop only.")
+	} else {
+		report.Notes = append(report.Notes, "No person participant was enrolled. Select --with-person only on the owner's laptop during first setup.")
+	}
+	report.Readiness = checkFleetReadiness(ctx, host, paths, profile, services, request.skipSmokeRun, role)
 	for _, check := range report.Readiness {
 		if check.Status == "FAILED" {
 			return report, &notReadyError{verdict: "fleet setup is published but not ready; fix the failed checks and rerun setup"}
@@ -614,6 +724,15 @@ func refuseUncommittedFleetServices(ctx context.Context, host setupHost, paths s
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				return err
 			}
+		}
+	}
+	// A fresh join must also refuse leftover local control-plane services.
+	// Inspect the complete fleet namespace without rendering or starting it.
+	if plan.Role == serviceplan.Join {
+		var err error
+		plan, err = setupRolePlan(paths, serviceplan.ControlPlane)
+		if err != nil {
+			return err
 		}
 	}
 	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid}

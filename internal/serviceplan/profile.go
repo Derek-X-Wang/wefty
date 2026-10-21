@@ -60,8 +60,20 @@ func ValidateProfile(role Role, p connprofile.Profile) error {
 		if !p.AutomaticNodeAdmission {
 			return errors.New("control-plane setup requires automatic node admission")
 		}
-	} else if p.AutomaticNodeAdmission {
-		return errors.New("joining setup cannot enable automatic node admission")
+	} else {
+		if p.AutomaticNodeAdmission || len(p.NodeAdmission) != 0 {
+			return errors.New("joining setup cannot configure node admission")
+		}
+		if _, ok := p.Participants[connprofile.ParticipantL1]; ok {
+			return errors.New("joining setup cannot carry an L1 participant")
+		}
+		if _, ok := p.Participants[connprofile.ParticipantL3]; ok {
+			return errors.New("joining setup cannot carry an L3 participant")
+		}
+		if p.L1Address == p.L3Address || seen[p.L1Address] || seen[p.L3Address] {
+			return errors.New("joining endpoints must select distinct remote peers")
+		}
+
 	}
 	return nil
 }

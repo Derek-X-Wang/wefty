@@ -316,3 +316,10 @@ Changing it restarts only that owner (client and person share the client
 service), even for L1 or L3: peer authorization still uses unchanged opaque IDs.
 Absent fields preserve the old profile, digest and service-rendering bytes.
 See [Fabric participant enrolment](fabric-enrolment.md) for the slug and grant rules.
+
+A joining Mac profile uses the join code's authenticated opaque peer IDs for
+`l1_address` and `l3_address`. It has node-agent and client participants, plus
+an optional explicitly enrolled person on the owner's laptop. It has no local
+L1/L3 participant, `node_admission` policy or `automatic_node_admission` setting.
+The explicit role and code recovery policy live in the
+[installation contract](installation-service-plan.md), not participant inference.

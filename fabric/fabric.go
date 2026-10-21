@@ -108,3 +108,10 @@ type Credential struct {
 	Value     string
 	ExpiresAt time.Time
 }
+
+// PeerLookup reads remote identity and tags from authenticated network state.
+// Names and dial addresses are never substitutes for the opaque node ID.
+// Implementations must exclude the local participant and expired peers.
+type PeerLookup interface {
+	LookupPeer(context.Context, string) (Identity, error)
+}

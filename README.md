@@ -45,9 +45,36 @@ Existing plain installations require a later conversion slice.
 Fleet setup prints bounded readiness checks and runs a short pinned one-shot
 smoke test by default (`--skip-smoke-run` marks it NOT-RUN). A readiness failure
 keeps the installation published: repair the cause and rerun setup. L1 → L3
-peer reachability remains explicitly NOT-RUN. Joining-machine setup, fleet
+peer reachability remains explicitly NOT-RUN on the control plane. Fleet
 removal/conversion and fleet upgrade are later slices. See the
 [installation contract](docs/contracts/installation-service-plan.md).
+
+For a **fresh joining Mac**, build `wefty` and `wefty-agent` together. Copy the
+non-secret join code printed by the control plane's setup report (rerun setup
+there to print it again), then run:
+
+```sh
+wefty setup --role join --join-code CODE
+# On the owner's laptop only, optionally add --with-person for browser sign-in.
+```
+
+The code never chooses where keys go. For a non-default coordinator, independently
+select the same URL with `--coordinator-url URL` or `TS_CONTROL_URL`; the code
+only cross-checks it. A mismatch refuses before keys. Setup prints the selected
+coordinator's host (or `default`) before its first key prompt.
+
+Setup asks for two single-use keys: node agent, then client. It verifies the
+code's opaque L1/L3 identities against authenticated peer state before publishing
+the profile. It starts only the node agent and client service, checks automatic
+admission and runs the same pinned smoke test. Without `--with-person`, no person
+is enrolled or prompted. If person sign-in fails before publication, rerun without
+`--with-person` to drop the unsaved person and finish machine setup with the saved
+node and client. Repeat the flag to continue that sign-in instead. An already
+saved person remains configured and needs no repeat prompt. Interrupted setup
+keeps saved participants; after a
+recorded peer-verification failure, a corrected code on the same coordinator can
+resume without replacement keys. Other changes of code are refused. Existing
+plain installs still require the later conversion slice.
 
 The following instructions install the original single-Mac plain stack.
 

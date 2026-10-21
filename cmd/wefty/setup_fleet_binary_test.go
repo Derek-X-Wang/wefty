@@ -12,26 +12,7 @@ import (
 )
 
 func TestSetupControlPlaneFlagAndReportFromRealBinary(t *testing.T) {
-	buildDir := t.TempDir()
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	overlay := filepath.Join(buildDir, "overlay.json")
-	payload, _ := json.Marshal(map[string]any{"Replace": map[string]string{filepath.Join(cwd, "setup_host.go"): filepath.Join(cwd, "testdata", "setup_host.go")}})
-	if err := os.WriteFile(overlay, payload, 0600); err != nil {
-		t.Fatal(err)
-	}
-	binary := filepath.Join(buildDir, "wefty")
-	build := exec.Command("go", "build", "-overlay", overlay, "-o", binary, ".")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build fixture binary: %v\n%s", err, output)
-	}
-	for _, name := range []string{"wefty-l1", "wefty-l3", "wefty-agent"} {
-		if err := os.WriteFile(filepath.Join(buildDir, name), []byte("#!/bin/sh\necho dev\n"), 0755); err != nil {
-			t.Fatal(err)
-		}
-	}
+	binary := buildFleetFixtureBinary(t)
 	home := newFleetTestHome(t)
 	command := func(input string, extraEnv []string, args ...string) (int, string, string) {
 		t.Helper()
@@ -119,4 +100,30 @@ func TestSetupControlPlaneFlagAndReportFromRealBinary(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func buildFleetFixtureBinary(t *testing.T) string {
+	t.Helper()
+	buildDir := t.TempDir()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(buildDir, "overlay.json")
+	payload, _ := json.Marshal(map[string]any{"Replace": map[string]string{filepath.Join(cwd, "setup_host.go"): filepath.Join(cwd, "testdata", "setup_host.go")}})
+	if err := os.WriteFile(overlay, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(buildDir, "wefty")
+	build := exec.Command("go", "build", "-overlay", overlay, "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fixture binary: %v\n%s", err, output)
+	}
+	for _, name := range []string{"wefty-l1", "wefty-l3", "wefty-agent"} {
+		if err := os.WriteFile(filepath.Join(buildDir, name), []byte("#!/bin/sh\necho dev\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return binary
 }

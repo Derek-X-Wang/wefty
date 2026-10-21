@@ -102,6 +102,9 @@ func Build(role Role, paths Paths) (Plan, error) {
 		add("client-service", "wefty", connprofile.ParticipantClient, "client-service", "--socket="+paths.ClientSocket)
 		plan.Services[len(plan.Services)-1].Removal.RuntimeFiles = []string{paths.ClientSocket, paths.ClientSocket + ".lock"}
 		plan.Services[len(plan.Services)-1].Removal.RuntimeDirectories = []string{filepath.Dir(paths.ClientSocket)}
+		if role == Join {
+			addReady("client-service")
+		}
 	}
 	return plan, nil
 }

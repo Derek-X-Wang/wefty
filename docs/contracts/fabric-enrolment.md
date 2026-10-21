@@ -133,3 +133,18 @@ it through deletion; state held by a new owner starting in that window is preser
 The original enrolment cause remains visible alongside an ownership refusal. A lock file alone is not saved state. See
 [client service](client-service.md) for ownership and concurrency rules. Attended
 tsnet acceptance remains slice 4 and is not replaced by fake-enroller tests.
+
+Joining Mac setup is available as `wefty setup --role join --join-code CODE`.
+It enrols node agent then client with two distinct single-use keys. Only an
+explicit first-install `--with-person` on the owner's laptop adds browser
+sign-in after the client, with no person key and no login URL in output or
+stored metadata. See the [installation contract](installation-service-plan.md)
+for the code format, authenticated peer check, correction exception and
+profile-before-receipt publication order.
+
+The join code cannot choose the coordinator. A non-default URL must match the
+owner's independent `--coordinator-url` or `TS_CONTROL_URL` selection; mismatches
+refuse before keys. Both fleet roles show the selected coordinator host or
+`default` before their first key prompt. Before publication, omitting
+`--with-person` drops an unsaved person and lets the saved node/client finish
+setup; an already saved person is retained without sign-in.

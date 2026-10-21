@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -30,6 +31,7 @@ type setupEnrolmentRequest struct {
 	input                   io.Reader
 	output                  io.Writer
 	loginURL                func(string)
+	openLoginURL            func(context.Context, string) error
 	controlURL              string
 	afterSaved              func(string) error
 	deferNotices            bool
@@ -81,7 +83,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, fmt.Errorf("invalid or duplicate setup participant %q", participant.role)
 		}
 		seen[participant.role] = true
-		if participant.role == connprofile.ParticipantPerson && request.loginURL == nil {
+		if participant.role == connprofile.ParticipantPerson && request.loginURL == nil && request.openLoginURL == nil {
 			return profile, errors.New("person enrolment needs an owner login-URL callback")
 		}
 	}
@@ -143,6 +145,21 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, err
 		}
 	}
+	// Name the destination only after every participant passes preflight and
+	// before reading any single-use credential. A keyless rerun prints nothing.
+	for _, participant := range request.participants {
+		if _, saved := profile.Participants[participant.role]; !saved && participant.role != connprofile.ParticipantPerson {
+			label := "default"
+			if request.controlURL != "" {
+				parsed, _ := url.Parse(request.controlURL)
+				label = parsed.Host
+			}
+			if _, err := fmt.Fprintf(request.output, "Join keys will go to coordinator: %s\n", label); err != nil {
+				return profile, err
+			}
+			break
+		}
+	}
 	// Validate every participant before consuming any single-use credential.
 	for _, participant := range request.participants {
 		if _, saved := profile.Participants[participant.role]; saved {
@@ -170,13 +187,44 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 		if err := root.Chmod(stateRel, 0o700); err != nil {
 			return profile, err
 		}
-		self, enrolErr := request.enroller.Enrol(ctx, spec)
+		enrolCtx, cancelEnrol := context.WithCancel(ctx)
+		var loginErr error
+		if participant.role == connprofile.ParticipantPerson && request.openLoginURL != nil {
+			spec.LoginURL = func(value string) {
+				if err := request.openLoginURL(enrolCtx, value); err != nil {
+					loginErr = errors.New("could not open owner sign-in; repair browser access and rerun setup")
+					cancelEnrol()
+				}
+			}
+		}
+		self, enrolErr := request.enroller.Enrol(enrolCtx, spec)
+		cancelEnrol()
+		if loginErr != nil {
+			enrolErr = loginErr
+		}
+		// Provider errors may contain browser URLs even when no callback arrived.
+		if enrolErr != nil && participant.role == connprofile.ParticipantPerson {
+			var inUse *fabric.ParticipantInUseError
+			if errors.As(enrolErr, &inUse) {
+				enrolErr = &fabric.ParticipantInUseError{Participant: participant.name}
+			} else {
+				enrolErr = errors.New("owner sign-in failed; repair browser sign-in and rerun setup")
+			}
+		}
 		key := spec.Credential.Value
 		spec.Credential = fabric.Credential{}
 		rollback := func(cause error) error {
 			// Cleanup has its own bounded context so Ctrl-C cannot skip logout.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			logoutErr := request.enroller.Logout(cleanupCtx, spec)
+			if logoutErr != nil && participant.role == connprofile.ParticipantPerson {
+				var inUse *fabric.ParticipantInUseError
+				if errors.As(logoutErr, &inUse) {
+					logoutErr = &fabric.ParticipantInUseError{Participant: participant.name}
+				} else {
+					logoutErr = errors.New("owner sign-in cleanup failed")
+				}
+			}
 			cancel()
 			var inUse *fabric.ParticipantInUseError
 			if errors.As(logoutErr, &inUse) {
