@@ -12,7 +12,8 @@ import (
 // then by #939's service_jobs_published_attempt and attempts_job_created
 // indexes, #942's service_jobs_healthy_node and service_jobs_stability_due
 // indexes, and #948's attempts_lease_expiry, attempts_node_state and
-// jobs_cancel_settlement indexes. A changed golden means an upgrade across it
+// jobs_cancel_settlement indexes, then #900's automatically_admitted Node
+// provenance column. A changed golden means an upgrade across it
 // cannot restore the old binaries (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
@@ -28,7 +29,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
-	const mainFingerprint = "20a0ec84b6e820457b428a88b0d262a631947b56dd459b43c1b1070cbecb6e07"
+	const mainFingerprint = "6fe63f28ece30608f97207262c3109e519fe92c24dfdf9ed0db360fc1ff2a499"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}

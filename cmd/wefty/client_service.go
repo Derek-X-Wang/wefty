@@ -41,6 +41,10 @@ func openCLIFabric(ctx context.Context, config fabricconfig.Config) (fabric.Fabr
 // client-service is an internal lifecycle entry point. #900 owns the rendered
 // LaunchAgent/systemd units; it never creates or enrols a participant.
 func executeClientService(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
+	return executeClientServiceWithOpener(ctx, options, args, stdout, stderr, fabricconfig.Open)
+}
+
+func executeClientServiceWithOpener(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer, openBackend func(context.Context, fabricconfig.Config) (fabric.Fabric, fabricconfig.CloseFunc, error)) error {
 	flags := flag.NewFlagSet("client-service", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	home, err := os.UserHomeDir()
@@ -79,27 +83,40 @@ func executeClientService(ctx context.Context, options globalOptions, args []str
 		if !exists && role == connprofile.ParticipantPerson {
 			continue
 		}
-		command := []string{"nodes", "list"}
-		if role == connprofile.ParticipantPerson {
-			command = []string{"whoami"}
+		input := fabricconfig.Config{
+			Mode: options.fabricMode, PlainFabricID: options.plainFabricID,
+			Name: options.fabricName, StateDirectory: options.stateDirectory,
+			AuthKey: options.authKey, ControlURL: options.controlURL, Ephemeral: options.ephemeral,
+			Identity: fabric.Identity{NodeID: options.plainIdentity},
 		}
-		config, configErr := commandFabricConfig(options, command)
+		explicit := options.explicitFlags
+		if role == connprofile.ParticipantPerson {
+			// Service overrides select its primary client backend. The optional
+			// person always comes from its own record, never the client's flags.
+			input.Name, input.StateDirectory = "", ""
+			input.Identity = fabric.Identity{}
+			explicit = nil
+		}
+		config, configErr := fabricconfig.SavedService(connprofile.Profile{Fabric: options.profileFabric, Participants: options.participants}, role, input, explicit)
 		if configErr != nil {
-			var signIn *personSignInRequiredError
-			if role == connprofile.ParticipantClient || !errors.As(configErr, &signIn) {
+			var identity *fabric.ParticipantIdentityError
+			if role == connprofile.ParticipantClient || !errors.As(configErr, &identity) {
 				return configErr
 			}
-			participants[role] = local.Participant{NodeID: saved.NodeID, Check: func(context.Context) error {
-				return &fabric.ParticipantIdentityError{Person: true, Reason: "sign-in is missing or expired"}
-			}}
+			participants[role] = missingPersonParticipant(saved.NodeID)
 			continue
 		}
-		config.DeferVerification = true
-		backend, closeBackend, err := fabricconfig.Open(ctx, config)
+		config.DeferVerification = role == connprofile.ParticipantPerson
+		backend, closeBackend, err := openBackend(ctx, config)
 		if closeBackend != nil {
 			closers = append(closers, closeBackend)
 		}
 		if err != nil {
+			var identity *fabric.ParticipantIdentityError
+			if role == connprofile.ParticipantPerson && errors.As(err, &identity) {
+				participants[role] = missingPersonParticipant(saved.NodeID)
+				continue
+			}
 			return err
 		}
 		check := func(probe context.Context) error {
@@ -121,4 +138,10 @@ func executeClientService(ctx context.Context, options globalOptions, args []str
 		return err
 	}
 	return server.Serve(ctx)
+}
+
+func missingPersonParticipant(nodeID string) local.Participant {
+	return local.Participant{NodeID: nodeID, Check: func(context.Context) error {
+		return &fabric.ParticipantIdentityError{Person: true, Reason: "sign-in is missing or expired"}
+	}}
 }

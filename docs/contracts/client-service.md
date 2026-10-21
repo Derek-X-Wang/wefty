@@ -8,9 +8,15 @@ identity. The socket peer's user ID is never substituted for that identity.
 
 `client-service` is an internal lifecycle subcommand. Start it with
 `wefty --profile PROFILE client-service`. It reads the existing participant
-records and never enrols, creates, or repairs a participant. The person remains
+records and never enrols, creates, or repairs a participant. Its client backend
+must match its saved identity before the service publishes its socket. Missing
+state and conflicting bootstrap overrides are typed startup refusals; see
+[connection profile](connection-profile.md#saved-identity-service-startup). The person remains
 optional and laptop-only. Missing or expired person sign-in does not prevent
-client operations. Each check and dial verifies the saved participant before
+client operations. This includes saved person state disappearing between local
+validation and backend construction: a typed person identity refusal keeps the
+client service running, and person requests retain their sign-in refusal.
+Each check and dial verifies the saved participant before
 an application connection is used. The service holds backend ownership even
 when a check fails, so a CLI process cannot replace or reopen the backend.
 A changed participant node ID requires restarting the service with the new
@@ -79,8 +85,7 @@ look for another way in. It does not advise starting the service or changing the
 sandbox.
 Manual checks recorded on #899 show that both the Codex sandbox with network
 off and the Claude Code sandbox with default settings refuse a Unix socket
-connect, and connect only when that socket is allowed by hand. Attended Fabric
-acceptance is not proved by these tests.
+connect. Attended Fabric acceptance is not proved by these tests.
 
 ## Bounded outbound protocol
 
@@ -88,7 +93,13 @@ One socket connection carries one request and one response, then either closes
 or becomes a bidirectional byte stream. Requests and responses are JSON framed
 by a four-byte unsigned big-endian length, with a maximum payload of 4096
 bytes. Requests reject unknown fields, trailing values, unsupported versions
-and operations, and oversized frames. Clients ignore unknown response fields,
+and operations, and oversized frames. Outside overflow, every such refusal is
+answered with `invalid_request`; only a caller that closed or sent nothing
+before the read deadline gets no reply. An overflow worker closes an
+undecodable request silently, so that caller sees a busy service once. The CLI reports `invalid_request` as non-retryable
+`fabric_unreachable` with owner-action advice, because its own requests are
+valid: the running service speaks another version and must be restarted or
+repaired. Clients ignore unknown response fields,
 while retaining the framing bound and rejecting trailing values. Version 1 requests contain:
 
 - `version: 1`, `operation: "check" | "dial"`;
@@ -97,26 +108,46 @@ while retaining the framing bound and rejecting trailing values. Version 1 reque
 - for `dial` only, `network: "tcp"` and `address`.
 
 The address is a nonempty Fabric address of at most 512 bytes with no spaces or
-control characters. The production adapter resolves the target through its
-outbound dial plan and refuses destinations classified outside the Fabric.
-Public internet, loopback, and link-local targets without a Fabric route cannot
-use the service as a host TCP proxy. The dial uses the plan's resolved IP:port,
-not the original hostname, so there is no second DNS lookup. It uses only the
-embedded peer transport after that check: a later route change cannot reclassify
-the target into an ordinary host dial. Logical names,
+control characters. For every production participant dial, the adapter resolves
+hostnames only from authenticated remote peer state. It accepts a peer's full
+network name or its short name within the authenticated network's name suffix.
+Unknown names and names matching more than one node are refused before outbound
+planning or any DNS resolver call. Planning receives only a literal IP:port.
+Both that target IP and the plan's resolved IP must be addresses assigned to a
+real remote peer in authenticated state, and the plan must select the Fabric
+transport. The adapter refuses its own node by name, opaque ID, or IP address,
+and refuses every node's built-in peer service endpoints listed in authenticated
+state. Built-in network DNS and service addresses are explicitly refused, even
+if listed in peer state. A route alone is not sufficient; public
+internet, loopback, link-local, subnet-route and unassigned network addresses
+cannot use the service as a host TCP proxy.
+The dial uses only the embedded peer transport after those checks: a later route
+change cannot reclassify the target into an ordinary host dial. Logical names,
 opaque node IDs, and peer endpoints for Computer take-over remain supported;
 there is no L1/L3-only allowlist. A refused destination retains its typed policy
 failure through the service and becomes non-retryable `forbidden` (exit 3).
 The plain adapter remains a localhost-only development transport used in tests.
-Fabric network policy still governs destination reachability. The service exposes
-no listen operation, shell
-execution, credentials, or writable backend API.
+The private network's access policy is the boundary for any other service a
+remote peer exposes, including another device's resolver or an exit node. The
+client service does not filter application requests to those peer services.
+It exposes no listen operation, shell execution, credentials, or writable
+backend API of its own.
 
 At most 128 streams or unfinished requests are served concurrently. Initial
 request reads have a five-second deadline, so a caller that sends no request
-cannot hold a slot forever. When capacity is full, one bounded overflow exchange
-at a time returns `client_service_busy` (exit 13, `retryable=true`), with advice
-to wait for capacity. It does not tell the operator to restart a healthy service.
+cannot hold a slot forever. When capacity is full, up to four separate workers
+read overflow requests and return `client_service_busy` (exit 13,
+`retryable=true`), with advice to wait for capacity. These exchanges have the
+same bounded read and write deadlines and never block the accept loop. If all
+four overflow workers are occupied too, the service closes an extra connection
+immediately without a reply. After the client has authenticated the service's
+peer user ID, a close with no reply bytes during request write or response read
+is treated as retryable `client_service_busy` (exit 13), with wait-and-retry
+advice. Failure to connect to a missing service retains non-retryable
+`fabric_unreachable` and its owner-action advice. A partial or malformed reply
+retains its protocol failure. Freeing a normal slot permits new admissions even
+while overflow workers are waiting. A busy reply does not tell the operator to
+restart a healthy service.
 Temporary accept failures, including process/system descriptor exhaustion, use
 cancellable backoff from 5 milliseconds up to one second and do not stop service.
 

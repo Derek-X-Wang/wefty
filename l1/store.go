@@ -492,6 +492,7 @@ CREATE TABLE IF NOT EXISTS nodes (
   max_service_slots INTEGER NOT NULL CHECK(max_service_slots >= 0),
   authority_generation INTEGER NOT NULL DEFAULT 0 CHECK(authority_generation >= 0),
   claims_enabled INTEGER NOT NULL DEFAULT 0 CHECK(claims_enabled IN (0, 1)),
+  automatically_admitted INTEGER NOT NULL DEFAULT 0 CHECK(automatically_admitted IN (0, 1)),
   intent_revision INTEGER NOT NULL DEFAULT 0 CHECK(intent_revision >= 0),
   intent_reason TEXT NOT NULL DEFAULT '',
   intent_updated_at INTEGER,
@@ -1247,6 +1248,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
 	if err := s.ensureColumn(ctx, "nodes", "last_condition_json", "BLOB"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn(ctx, "nodes", "automatically_admitted", "INTEGER NOT NULL DEFAULT 0 CHECK(automatically_admitted IN (0, 1))"); err != nil {
 		return err
 	}
 	if err := s.initializeNodeListing(ctx); err != nil {
@@ -2738,6 +2742,17 @@ func (r *databaseReads) nodes(ctx context.Context) ([]Node, error) {
 // RegisterNode records a boot session and replaces its eligibility policy with
 // the canonical operator-configured policy supplied by the server.
 func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, registration contract.NodeRegistration, policy NodePolicy, operatorExpected bool) (Node, error) {
+	return s.registerNode(ctx, identity, registration, policy, operatorExpected, nodeRegistrationAdmission{})
+}
+
+type nodeRegistrationAdmission struct {
+	automatic                 bool
+	refreshUnconfiguredPolicy bool
+}
+
+// automatic is set only by the server after authenticated agent authorization.
+// The absence check and initial intent are in the same write transaction.
+func (s *Store) registerNode(ctx context.Context, identity fabric.Identity, registration contract.NodeRegistration, policy NodePolicy, operatorExpected bool, admission nodeRegistrationAdmission) (Node, error) {
 	if registration.NodeID == "" || registration.BootSessionID == "" || registration.OS == "" || registration.Architecture == "" || registration.AgentVersion == "" {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "node registration fields must be non-empty")
 	}
@@ -2794,24 +2809,48 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	var storedCapabilitiesJSON, storedMissingJSON []byte
 	var storedRevision, storedObservedNS int64
 	var storedReason contract.CapabilityReasonCode
+	var storedAutomaticallyAdmitted bool
 	readErr := tx.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id, state, capabilities_json,
-		capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code
+		capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code, automatically_admitted
 		FROM nodes WHERE node_id=?`, registration.NodeID).Scan(
 		&storedIdentity, &storedBoot, &storedState, &storedCapabilitiesJSON, &storedRevision, &storedObservedNS, &storedMissingJSON, &storedReason,
+		&storedAutomaticallyAdmitted,
 	)
+	// Refresh unconfigured policy from durable provenance, not old policy or
+	// the setting that gates new admissions. Claim intent is never refreshed.
+	if admission.refreshUnconfiguredPolicy && readErr == nil {
+		policy = defaultNodePolicyForAdmission(registration.NodeID, storedAutomaticallyAdmitted)
+		tags = NormalizeTags(policy.Tags)
+	}
 	replaceCapabilities := true
 	advanceCapabilityObservedAt := false
 	switch {
 	case errors.Is(readErr, sql.ErrNoRows):
+		if admission.automatic {
+			// One enrolled identity approves at most its first Node binding.
+			// Check under the same write lock as INSERT so a different stable
+			// ID cannot bypass owner intent or race another first registration.
+			var binding int
+			bindingErr := tx.QueryRowContext(ctx, "SELECT 1 FROM nodes WHERE identity_node_id=? LIMIT 1", identity.NodeID).Scan(&binding)
+			switch {
+			case bindingErr == nil:
+				admission.automatic = false
+				policy = DefaultNodePolicy()
+				tags = NormalizeTags(policy.Tags)
+			case errors.Is(bindingErr, sql.ErrNoRows):
+			default:
+				return Node{}, internalError(bindingErr, "read existing Fabric identity binding")
+			}
+		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO nodes(
 			node_id, identity_node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version,
 			capabilities_json, capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code,
-			state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+			state, last_heartbeat_ns, max_oneshot_slots, max_service_slots, authority_generation, claims_enabled, automatically_admitted
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 			registration.NodeID, identity.NodeID, registration.BootSessionID, registration.ConnectHost, registration.RootInstanceID,
 			registration.OS, registration.Architecture, registration.AgentVersion,
 			incoming.capabilitiesJSON, incoming.observation.Revision, incoming.observation.ObservedAt.UnixNano(), incoming.missingJSON, incoming.observation.ReasonCode,
-			contract.NodeAlive, now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, operatorExpected)
+			contract.NodeAlive, now.UnixNano(), policy.MaxOneshotSlots, policy.MaxServiceSlots, operatorExpected || admission.automatic, admission.automatic)
 	case readErr != nil:
 		return Node{}, internalError(readErr, "read existing node registration")
 	case storedIdentity != identity.NodeID:
@@ -2869,18 +2908,13 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	if err != nil {
 		return Node{}, internalError(err, "store node registration")
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM node_tags WHERE node_id = ?", registration.NodeID); err != nil {
+	if err := replaceNodeTags(ctx, tx, registration.NodeID, tags); err != nil {
 		return Node{}, internalError(err, "replace node tags")
-	}
-	for _, tag := range tags {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO node_tags(node_id, tag) VALUES(?, ?)", registration.NodeID, tag); err != nil {
-			return Node{}, internalError(err, "store node tag")
-		}
 	}
 	code, scope := "node_registered", "node_session"
 	details := map[string]any{"boot_session_id": registration.BootSessionID}
 	if errors.Is(readErr, sql.ErrNoRows) {
-		details["claims_enabled"] = operatorExpected
+		details["claims_enabled"] = operatorExpected || admission.automatic
 	}
 	notable := errors.Is(readErr, sql.ErrNoRows) || storedBoot != registration.BootSessionID
 	if storedState != contract.NodeAlive && storedState != contract.NodeDraining && readErr == nil {
@@ -2915,25 +2949,37 @@ func (s *Store) RegisterNode(ctx context.Context, identity fabric.Identity, regi
 	return node, nil
 }
 
+func replaceNodeTags(ctx context.Context, tx *sql.Tx, nodeID string, tags []string) error {
+	if _, err := tx.ExecContext(ctx, "DELETE FROM node_tags WHERE node_id=?", nodeID); err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO node_tags(node_id, tag) VALUES(?, ?)", nodeID, tag); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // HeartbeatNode is retained for store tests that exercise liveness without the
 // live agent protocol's required capability observation.
 func (s *Store) HeartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string) (Node, error) {
-	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, nil, nil)
+	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, nil, nil, false)
 }
 
 // HeartbeatNodeWithPolicy is retained for tests that refresh effective policy
 // without going through the live agent protocol's required observation.
 func (s *Store) HeartbeatNodeWithPolicy(ctx context.Context, identityNodeID, nodeID, bootSessionID string, policy NodePolicy) (Node, error) {
-	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, nil, &policy)
+	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, nil, &policy, false)
 }
 
 // HeartbeatNodeWithCapabilityObservation atomically applies one complete
 // capability observation with liveness and configured capacity refresh.
 func (s *Store) HeartbeatNodeWithCapabilityObservation(ctx context.Context, identityNodeID, nodeID, bootSessionID string, observation contract.CapabilityObservation, policy NodePolicy) (Node, error) {
-	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, &observation, &policy)
+	return s.heartbeatNode(ctx, identityNodeID, nodeID, bootSessionID, &observation, &policy, false)
 }
 
-func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string, observation *contract.CapabilityObservation, policy *NodePolicy) (Node, error) {
+func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootSessionID string, observation *contract.CapabilityObservation, policy *NodePolicy, refreshUnconfiguredPolicy bool) (Node, error) {
 	now := canonicalTime(s.clock.Now())
 	if policy != nil && (policy.MaxOneshotSlots < 0 || policy.MaxServiceSlots < 0) {
 		return Node{}, protocolError(contract.ErrorInvalidRequest, "configured node slot limits must be non-negative")
@@ -2949,10 +2995,11 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	var storedCapabilitiesJSON, storedMissingJSON []byte
 	var storedRevision, storedObservedNS int64
 	var storedReason contract.CapabilityReasonCode
+	var storedAutomaticallyAdmitted bool
 	if err := tx.QueryRowContext(ctx, `SELECT identity_node_id, boot_session_id, state, capabilities_json,
-		capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code
+		capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code, automatically_admitted
 		FROM nodes WHERE node_id=?`, nodeID).Scan(&storedIdentity, &storedBoot, &storedState, &storedCapabilitiesJSON,
-		&storedRevision, &storedObservedNS, &storedMissingJSON, &storedReason); err != nil {
+		&storedRevision, &storedObservedNS, &storedMissingJSON, &storedReason, &storedAutomaticallyAdmitted); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Node{}, protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)
 		}
@@ -2961,6 +3008,10 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	if storedIdentity != identityNodeID || storedBoot != bootSessionID ||
 		(storedState != contract.NodeAlive && storedState != contract.NodeStale && storedState != contract.NodeDraining) {
 		return Node{}, s.nodeSessionError(ctx, tx, nodeID, identityNodeID, bootSessionID, "heartbeat")
+	}
+	if refreshUnconfiguredPolicy {
+		fallback := defaultNodePolicyForAdmission(nodeID, storedAutomaticallyAdmitted)
+		policy = &fallback
 	}
 	var incoming storedCapabilityObservation
 	replaceCapabilities := false
@@ -3006,6 +3057,13 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	}
 	if err != nil {
 		return Node{}, internalError(err, "update node heartbeat")
+	}
+	// Unmarked Nodes keep main's rule: tags refresh at registration, not at
+	// heartbeat. Only a marked Node's policy is derived here.
+	if refreshUnconfiguredPolicy && storedAutomaticallyAdmitted {
+		if err := replaceNodeTags(ctx, tx, nodeID, NormalizeTags(policy.Tags)); err != nil {
+			return Node{}, internalError(err, "refresh unconfigured node tags")
+		}
 	}
 	if state != storedState {
 		if err := recordNodeCondition(ctx, tx, nodeID, "node_"+string(state), "node_liveness", now, nil); err != nil {
@@ -5115,11 +5173,11 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	var intentUpdatedNS sql.NullInt64
 	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json,
 	capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code, state, max_oneshot_slots, max_service_slots,
-	authority_generation, claims_enabled, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns, last_condition_json
+	authority_generation, claims_enabled, automatically_admitted, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns, last_condition_json
 	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.ConnectHost, &node.RootInstanceID, &node.OS, &node.Architecture,
 		&node.AgentVersion, &capabilitiesJSON, &node.CapabilityRevision, &capabilityObservedNS, &missingCapabilitiesJSON,
 		&node.CapabilityReasonCode, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
-		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
+		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.AutomaticallyAdmitted, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
 		&node.IntentActor, &heartbeatNS, &conditionData)
 	if err != nil {
 		return Node{}, err

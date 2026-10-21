@@ -1,6 +1,7 @@
 package connprofile
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"os"
@@ -60,6 +61,44 @@ func TestProfileRoundTripsAndEachProgramReadsItsOwnSubset(t *testing.T) {
 	l1After, _ := Digest(edited.L1())
 	if before != after || l1Before == l1After {
 		t.Fatalf("digests: L3 %s/%s, L1 %s/%s", before, after, l1Before, l1After)
+	}
+}
+
+func TestAutomaticNodeAdmissionIsOptionalAndOnlyChangesL1Inputs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), FileName)
+	if err := os.WriteFile(path, []byte(`{"version":1,"automatic_node_admission":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profile, err := Read(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := json.MarshalIndent(profile.L1(), "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(settings), `"automatic_node_admission": true`) {
+		t.Fatalf("L1 settings omit automatic admission: %s", settings)
+	}
+	base := Profile{Version: Version}
+	before, _ := Digest(base.L1())
+	after, _ := Digest(profile.L1())
+	if before == after {
+		t.Fatal("automatic admission did not change L1's input digest")
+	}
+	for _, pair := range [][2]any{{base.L3(), profile.L3()}, {base.NodeAgent(), profile.NodeAgent()}, {base.CLI(), profile.CLI()}} {
+		before, _ := Digest(pair[0])
+		after, _ := Digest(pair[1])
+		if before != after {
+			t.Fatal("automatic admission changed another program's inputs")
+		}
+	}
+	legacy, err := json.MarshalIndent(base, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacy), "automatic_node_admission") {
+		t.Fatalf("legacy profile gained a field: %s", legacy)
 	}
 }
 

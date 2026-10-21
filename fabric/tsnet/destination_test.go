@@ -21,6 +21,7 @@ func TestDialRefusesNonFabricAndPinsResolvedPeer(t *testing.T) {
 		{"169.254.169.254:80", "169.254.169.254:80", false},
 		{"peer:443", "100.64.0.2:443", true},
 		{"100.64.0.2:8443", "100.64.0.2:8443", true},
+		{"100.64.0.2:443", "100.64.0.2:443", false},
 		{"wefty://control-plane", "100.64.0.3:80", true},
 	} {
 		t.Run(tc.address, func(t *testing.T) {
@@ -33,6 +34,7 @@ func TestDialRefusesNonFabricAndPinsResolvedPeer(t *testing.T) {
 				planned = address
 				return planner.UserDialPlan(ctx, network, address)
 			}, dialNode: func(_ context.Context, _, address string) (net.Conn, error) { dialled = address; return nil, stop }}
+			withDestinationStatus(t, f, destinationStatus())
 			_, err := f.Dial(t.Context(), "tcp", tc.address)
 			if tc.allowed {
 				if !errors.Is(err, stop) || dialled != tc.resolved || planned == "" {
@@ -64,7 +66,7 @@ func TestDialCannotFallBackToHostAfterPlanChanges(t *testing.T) {
 		return nil, errors.New("host transport reached")
 	})
 	defer planner.Close()
-	f := &Fabric{outboundDialer: planner}
+	f := withDestinationStatus(t, &Fabric{outboundDialer: planner}, destinationStatus())
 	_, err := f.Dial(t.Context(), "tcp", "100.64.0.2:443")
 	if hostDialled || !peerDialled || !errors.Is(err, stop) {
 		t.Fatalf("route change escaped Fabric: peer=%v host=%v err=%v", peerDialled, hostDialled, err)
@@ -78,7 +80,7 @@ func TestDialCancelledBeforePlanningDoesNotReachPeer(t *testing.T) {
 		return nil, errors.New("peer reached")
 	}}
 	defer planner.Close()
-	f := &Fabric{outboundDialer: planner}
+	f := withDestinationStatus(t, &Fabric{outboundDialer: planner}, destinationStatus())
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err := f.Dial(ctx, "tcp", "100.64.0.2:443")

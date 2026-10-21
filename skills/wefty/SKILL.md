@@ -152,11 +152,13 @@ keys) are not set in the run. Set what the command needs in the command, for exa
 `wefty exec -- env NAME=value make test`. The run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
 Each run has its own empty `$TMPDIR`, deleted when the run ends, so caches that tools keep in `$TMPDIR` (for example `bunx`) start cold.
+`$TMPDIR` is a short `/tmp/wefty-run.*` symlink to the run's private folder; a tool that refuses symlinked paths needs the resolved path, for example `cd "$TMPDIR" && pwd -P`.
 Inside the run, `git` sees your checkout: HEAD is your base commit and your local changes are uncommitted.
 
 The run gets the node's login-shell `PATH`, not the caller's; project-local tools need `bun run`, `npx`, `pnpm exec` or `uv run`, or a path such as `./node_modules/.bin/turbo`.
 `wefty exec -- sh -c 'echo $PATH'` shows the run's `PATH`.
 Git-ignored files such as `.env.local` and ignored generated code (codegen output and framework caches) are not copied; pass non-secret values as environment variables in the command, and generate code inside the command.
+Ignored build outputs, such as binaries in `bin/` or `dist/`, are not copied either; build them inside the command, for example `wefty exec -- make build test`.
 Never copy secrets into a run.
 
 Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied.

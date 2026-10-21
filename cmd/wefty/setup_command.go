@@ -24,9 +24,11 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/skills"
@@ -377,6 +379,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return setupReport{}, err
 	}
+	if err := refuseRecordedFleetRole(paths, "setup"); err != nil {
+		return setupReport{}, err
+	}
 	if !request.lockHeld {
 		if _, err := os.Stat(paths.data); err == nil {
 			unlock, err := lockSetup(paths, true)
@@ -537,6 +542,7 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	manifest := setupManifest{Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
 	if payload, err := homeRoot.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
 		if json.Unmarshal(payload, &previous) == nil && previous.Version == 1 {
+			manifest.Role = previous.Role
 			if request.installedVersion == "" {
 				manifest.UpgradeSource = previous.UpgradeSource
 				unchanged := true
@@ -950,64 +956,42 @@ func desiredSetupProfile(host setupHost, existing connprofile.Profile, nodeID st
 	return profile, profile.Validate()
 }
 
-// setupServices renders the three login services. Each one's input digest
-// covers its binary and exactly the profile settings that program reads, so
-// a change reloads only the services it affects.
+// setupServices keeps the legacy plan until fleet setup explicitly publishes
+// role metadata. Participant presence never selects an installation role.
 func setupServices(paths setupPaths, profile connprofile.Profile, binaries map[string]string, nodeAgentPATH string) ([]launchagent.Agent, error) {
-	digest := func(binary string, settings any) (string, error) {
-		return connprofile.Digest(struct {
+	return setupRoleServices(paths, profile, binaries, nodeAgentPATH, serviceplan.Legacy)
+}
+
+// setupRoleServices is the Mac adapter for the platform-neutral named plan.
+func setupRoleServices(paths setupPaths, profile connprofile.Profile, binaries map[string]string, nodeAgentPATH string, role serviceplan.Role) ([]launchagent.Agent, error) {
+	plan, err := serviceplan.Build(role, serviceplan.Paths{
+		Profile: paths.profile, Data: paths.data, Logs: paths.logs,
+		Spool: filepath.Join(paths.home, paths.nodeDataFolders[0]), Managed: filepath.Join(paths.home, paths.nodeDataFolders[1]),
+		ClientSocket: local.DefaultSocketPath(paths.home), NodeShutdownBudget: setupNodeAgentShutdownBudget,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var agents []launchagent.Agent
+	for _, entry := range plan.Services {
+		inputDigest, err := connprofile.Digest(struct {
 			Binary   string `json:"binary"`
 			Settings any    `json:"settings"`
-		}{binaries[binary], settings})
+		}{binaries[entry.Binary], entry.Settings(profile)})
+		if err != nil {
+			return nil, err
+		}
+		service := launchagent.Agent{Label: "dev.wefty." + entry.Name, Program: filepath.Join(paths.bin, entry.Binary), Arguments: entry.Arguments,
+			Environment: map[string]string{"HOME": paths.home, "PATH": setupServicePATH}, WorkingDirectory: paths.data, LogPath: entry.LogPath, InputDigest: inputDigest}
+		if entry.Name == "node-agent" {
+			service.Environment["PATH"] = nodeAgentPATH
+			service.Environment["WEFTY_LAUNCH_UNIT"] = setupNodeAgentLabel
+			service.ExitTimeOut = setupNodeAgentExitTimeout
+			service.ProcessType = "Interactive"
+		}
+		agents = append(agents, service)
 	}
-	l1Digest, err := digest("wefty-l1", profile.L1())
-	if err != nil {
-		return nil, err
-	}
-	l3Digest, err := digest("wefty-l3", profile.L3())
-	if err != nil {
-		return nil, err
-	}
-	nodeDigest, err := digest("wefty-agent", profile.NodeAgent())
-	if err != nil {
-		return nil, err
-	}
-	profileArgument := "--profile=" + paths.profile
-	return []launchagent.Agent{
-		{
-			Label: setupL1Label, Program: filepath.Join(paths.bin, "wefty-l1"),
-			Arguments:        []string{profileArgument, "--db=" + filepath.Join(paths.data, "l1.sqlite")},
-			Environment:      map[string]string{"HOME": paths.home, "PATH": setupServicePATH},
-			WorkingDirectory: paths.data, LogPath: filepath.Join(paths.logs, "l1.log"), InputDigest: l1Digest,
-		},
-		{
-			Label: setupL3Label, Program: filepath.Join(paths.bin, "wefty-l3"),
-			Arguments:        []string{profileArgument, "--db=" + filepath.Join(paths.data, "l3.sqlite")},
-			Environment:      map[string]string{"HOME": paths.home, "PATH": setupServicePATH},
-			WorkingDirectory: paths.data, LogPath: filepath.Join(paths.logs, "l3.log"), InputDigest: l3Digest,
-		},
-		{
-			Label: setupNodeAgentLabel, Program: filepath.Join(paths.bin, "wefty-agent"),
-			Arguments: []string{profileArgument,
-				"--log-spool-dir=" + filepath.Join(paths.home, paths.nodeDataFolders[0]),
-				"--managed-root=" + filepath.Join(paths.home, paths.nodeDataFolders[1]),
-				"--shutdown-budget=" + setupNodeAgentShutdownBudget.String(),
-			},
-			// Jobs inherit the node agent's environment, so the owner's
-			// login-shell PATH is what lets them find go, node, gh, claude
-			// and codex.
-			Environment: map[string]string{
-				"HOME": paths.home, "PATH": nodeAgentPATH,
-				"WEFTY_LAUNCH_UNIT": setupNodeAgentLabel,
-			},
-			WorkingDirectory: paths.data, LogPath: filepath.Join(paths.logs, "node-agent.log"),
-			ExitTimeOut: setupNodeAgentExitTimeout,
-			// Jobs are work the owner is waiting for; launchd's default class
-			// would throttle their CPU and I/O.
-			ProcessType: "Interactive",
-			InputDigest: nodeDigest,
-		},
-	}, nil
+	return agents, nil
 }
 
 // captureLoginPATH asks the owner's login shell for its PATH. A LaunchAgent

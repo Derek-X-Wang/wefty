@@ -103,3 +103,51 @@ func TestRelativeDatabasePathWorks(t *testing.T) {
 		t.Fatalf("stray files beside state/: %v", entries)
 	}
 }
+
+func TestAutomaticNodeAdmissionFlagRefusesUnauthenticatedFabric(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "wefty-l1")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build wefty-l1: %v\n%s", err, output)
+	}
+	home := t.TempDir()
+	profilePath := filepath.Join(home, "profile.json")
+	if err := os.WriteFile(profilePath, []byte(`{"version":1,"automatic_node_admission":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, args := range map[string][]string{
+		"flag":    {"--automatic-node-admission", "--profile="},
+		"profile": {"--profile=" + profilePath},
+	} {
+		t.Run(name, func(t *testing.T) {
+			args = append(args, "--fabric=plain", "--run-ledger=", "--db="+filepath.Join(t.TempDir(), "l1.sqlite"))
+			command := exec.Command(binary, args...)
+			command.Env = append(os.Environ(), "HOME="+home, "WEFTY_PROFILE=")
+			output, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), "automatic node admission requires authenticated Fabric identities") {
+				t.Fatalf("plain automatic admission: err=%v output=%s", err, output)
+			}
+		})
+	}
+}
+
+func TestAutomaticNodeAdmissionProfileFlagPrecedence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profile.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"automatic_node_admission":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, explicit := range []bool{false, true} {
+		var fabricMode, plainID, listen, ledger string
+		var allowPerson, automatic bool
+		err := applyConnectionProfile(path, map[string]bool{"automatic-node-admission": explicit}, l1Options{
+			fabricMode: &fabricMode, plainFabricID: &plainID, listen: &listen, runLedger: &ledger,
+			allowPlainPersonIDs: &allowPerson, automaticNodeAdmission: &automatic, nodePolicies: map[string]l1.NodePolicy{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if automatic == explicit {
+			t.Fatalf("automatic admission=%t explicit false flag=%t", automatic, explicit)
+		}
+	}
+}

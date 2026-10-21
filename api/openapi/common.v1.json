@@ -1804,6 +1804,11 @@
                 "readOnly": true,
                 "description": "Durable operator intent controlling admission of new claims."
               },
+              "automatically_admitted": {
+                "type": "boolean",
+                "readOnly": true,
+                "description": "True when L1 automatically admitted this Node on its first registration. Persisted provenance, independent of current claims intent. Omitted when false, including all pre-existing Nodes."
+              },
               "intent_revision": {
                 "type": "integer",
                 "minimum": 0,
