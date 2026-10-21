@@ -41,6 +41,9 @@ func TestAuthenticatedCloseBeforeReplyIsRetryable(t *testing.T) {
 		{name: "write-reset", writeErr: syscall.ECONNRESET, busy: true},
 		{name: "read-eof", readErr: io.EOF, busy: true},
 		{name: "read-reset", readErr: syscall.ECONNRESET, busy: true},
+		{name: "write-teardown", writeErr: syscall.EPROTOTYPE, busy: true},
+		{name: "write-not-connected", writeErr: syscall.ENOTCONN, busy: true},
+		{name: "read-not-connected", readErr: syscall.ENOTCONN, busy: true},
 		{name: "partial-reply-reset", readErr: syscall.ECONNRESET, prefix: []byte{0}, busy: false},
 		{name: "partial-reply-eof", readErr: io.EOF, prefix: []byte{0}, busy: false},
 	} {
