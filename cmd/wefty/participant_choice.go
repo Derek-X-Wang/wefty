@@ -68,6 +68,7 @@ func commandFabricConfig(options globalOptions, args []string) (fabricconfig.Con
 		}
 	}
 	config.Name, config.StateDirectory = participant.Name, participant.StateDirectory
+	config.NetworkName = participant.NetworkName
 	config.Identity = fabric.Identity{NodeID: participant.NodeID, Tags: []string{l3.DefaultCallerPrincipalTag}}
 	if person {
 		config.Identity = fabric.Identity{NodeID: participant.NodeID, DeviceID: participant.NodeID, UserID: participant.UserID}

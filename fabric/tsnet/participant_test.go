@@ -17,6 +17,7 @@ import (
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -354,6 +355,104 @@ func TestParticipantUnreachableHidesBackendDetails(t *testing.T) {
 					if strings.Contains(strings.ToLower(err.Error()), fragment) {
 						t.Errorf("public error exposes %q: %v", fragment, err)
 					}
+				}
+			})
+		}
+	}
+}
+
+func TestSavedParticipantRefusesLogicalPeerDefaults(t *testing.T) {
+	for _, saved := range []bool{true, false} {
+		for _, address := range []string{"wefty://control-plane", "wefty://run-ledger", "wefty://node/studio", "wefty://client/studio", "WEFTY://person/studio", "100.64.0.2:80"} {
+			t.Run(fmt.Sprintf("saved=%v/%s", saved, address), func(t *testing.T) {
+				// Advertise real remote peers as well: these cases must remain
+				// valid after authenticated peer-name resolution (#1075) lands.
+				peers := make(map[key.NodePublic]*ipnstate.PeerStatus)
+				for i, label := range []string{"control-plane", "run-ledger", "node-da0daaba4b156961", "client-da0daaba4b156961", "person-da0daaba4b156961"} {
+					peers[key.NewNode().Public()] = &ipnstate.PeerStatus{ID: tailcfg.StableNodeID(label), DNSName: label + ".identity-domain.", TailscaleIPs: []netip.Addr{netip.MustParseAddr(fmt.Sprintf("100.64.0.%d", i+2))}}
+				}
+				payload, err := json.Marshal(map[string]any{"BackendState": "Running", "CurrentTailnet": map[string]string{"MagicDNSSuffix": "identity-domain"}, "Self": map[string]any{"ID": "saved", "Tags": []string{"tag:wefty-client"}}, "Peer": peers})
+				if err != nil {
+					t.Fatal(err)
+				}
+				f := &Fabric{client: statusClient(t, string(payload))}
+				if saved {
+					f.expectedIdentity = &fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}
+				}
+				planned, dialled := false, false
+				stop := errors.New("transport boundary")
+				f.dialPlan = func(context.Context, string, string) (netip.AddrPort, bool, error) {
+					planned = true
+					return netip.MustParseAddrPort("100.64.0.2:80"), true, nil
+				}
+				f.dialNode = func(context.Context, string, string) (net.Conn, error) { dialled = true; return nil, stop }
+				_, err = f.Dial(t.Context(), "tcp", address)
+				if saved && address != "100.64.0.2:80" {
+					var refused *fabric.DestinationRefusedError
+					if !errors.As(err, &refused) || planned || dialled {
+						t.Fatalf("logical target reached transport: planned=%v dialled=%v err=%v", planned, dialled, err)
+					}
+				} else if !planned || !dialled || !errors.Is(err, stop) {
+					t.Fatalf("allowed target blocked: planned=%v dialled=%v err=%v", planned, dialled, err)
+				}
+			})
+		}
+	}
+}
+
+func TestSavedParticipantChecksRecordedNetworkName(t *testing.T) {
+	for _, role := range []string{"node", "client", "person"} {
+		person := role == "person"
+		for _, tc := range []struct {
+			recorded, granted string
+			refused           bool
+		}{
+			{"wefty-studio-client-2", "wefty-studio-client-2.identity-domain.", false},
+			{"wefty-studio-client-2", "wefty-studio-client-2.identity-domain", false},
+			{"wefty-studio-client-2", "wefty-renamed.identity-domain.", true},
+			{"wefty-studio-client-2", "wefty-studio-client-3.identity-domain.", true},
+			{"wefty-studio-client-2", "", true},
+			{"", "legacy-name.identity-domain.", false},
+			{"", "", false},
+		} {
+			t.Run(fmt.Sprintf("%s/%s/%s", role, tc.recorded, tc.granted), func(t *testing.T) {
+				expected := fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}
+				logical, roleFields := "wefty://client/studio", `"Tags":["tag:wefty-client"]`
+				if role == "node" {
+					expected.Tags = []string{"tag:wefty-agent"}
+					logical, roleFields = "wefty://node/studio", `"Tags":["tag:wefty-agent"]`
+				}
+				if person {
+					expected.Tags = nil
+					expected.UserID = "42"
+					logical = "wefty://person/studio"
+					roleFields = `"UserID":42`
+				}
+				f, err := New(Config{Name: logical, NetworkName: tc.recorded, StateDir: savedBackendState(t), ExpectedIdentity: &expected})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = f.Close() })
+				f.client = statusClient(t, fmt.Sprintf(`{"BackendState":"Running","Self":{"ID":"saved","DNSName":%q,%s}}`, tc.granted, roleFields))
+				err = f.VerifyParticipant(t.Context())
+				if tc.refused && role == "node" {
+					var refusal *fabric.ParticipantIdentityError
+					if !errors.As(err, &refusal) || refusal.Person != person || !strings.Contains(err.Error(), "restore") || !strings.Contains(err.Error(), "re-record") {
+						t.Fatalf("stale name not refused with recovery: %T %v", err, err)
+					}
+					f.dialPlan = func(context.Context, string, string) (netip.AddrPort, bool, error) {
+						t.Fatal("planned with stale name")
+						return netip.AddrPort{}, false, nil
+					}
+					f.listenNode = func(string, string) (net.Listener, error) { t.Fatal("listened with stale name"); return nil, nil }
+					if _, err := f.Dial(t.Context(), "tcp", "100.64.0.2:80"); !errors.As(err, &refusal) {
+						t.Fatalf("Dial error=%v", err)
+					}
+					if _, err := f.Listen("tcp", logical); !errors.As(err, &refusal) {
+						t.Fatalf("Listen error=%v", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
 				}
 			})
 		}

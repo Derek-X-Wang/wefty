@@ -181,3 +181,25 @@ func TestIdentityTranslationRejectsIncompleteResponse(t *testing.T) {
 		}
 	}
 }
+
+func TestRecordedNetworkNameStartsBackendAndConnectHost(t *testing.T) {
+	for _, tc := range []struct{ recorded, want string }{{"wefty-studio-2", "wefty-studio-2"}, {"", "node-a28bbc963ccacc17"}} {
+		t.Run(tc.recorded, func(t *testing.T) {
+			f, err := New(Config{Name: "wefty://node/runner-1", NetworkName: tc.recorded, StateDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = f.Close() })
+			// Inspect the constructor boundary without starting a real network node.
+			if f.server.Hostname != tc.want || f.ConnectHost() != tc.want {
+				t.Fatalf("backend=%q ConnectHost=%q want=%q", f.server.Hostname, f.ConnectHost(), tc.want)
+			}
+		})
+	}
+	for _, bad := range []string{"bad.name", "Bad", "bad_", strings.Repeat("a", 64)} {
+		if f, err := New(Config{Name: "wefty://node/studio", NetworkName: bad}); err == nil {
+			_ = f.Close()
+			t.Fatalf("invalid name %q accepted", bad)
+		}
+	}
+}

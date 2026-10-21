@@ -2,9 +2,9 @@
 
 `fabric.Enroller` is a setup-only seam. `Enrol(ctx, EnrolSpec)` waits for the
 participant to run and returns `SelfIdentity`: opaque node, device, issuing
-Fabric and user IDs, authoritative tags, the granted Wefty logical name, and
-key expiry. `Logout(ctx, EnrolSpec)` supports rollback. The production adapter
-is `fabric/tsnet.Enroller`; the plain Fabric cannot enrol.
+Fabric and user IDs, authoritative tags, the Wefty logical name, the checked
+granted network name, and key expiry. `Logout(ctx, EnrolSpec)` supports rollback.
+The production adapter is `fabric/tsnet.Enroller`; the plain Fabric cannot enrol.
 
 | Participant | Required tags | Person identity |
 | --- | --- | --- |
@@ -16,8 +16,49 @@ is `fabric/tsnet.Enroller`; the plain Fabric cannot enrol.
 
 Setup requires exactly the role's tag set. In particular, extra tags and a
 tagged person are refused. The adapter checks the granted private host label,
-not merely the requested host label. A name collision is
-`fabric.ErrGrantedNameMismatch`; no private host name crosses the seam.
+not merely the requested host label. New participants request a readable,
+namespaced network name through `fabric.RequestedNetworkName`:
+
+| Logical participant | Requested network name |
+| --- | --- |
+| `wefty://control-plane` | `wefty-control-plane` |
+| `wefty://run-ledger` | `wefty-run-ledger` |
+| `wefty://node/studio-0123abcd` | `wefty-studio` |
+| `wefty://client/studio-0123abcd` | `wefty-studio-client` |
+| `wefty://person/studio-0123abcd` | `wefty-studio-person` |
+
+The machine part comes from the stable logical ID, never a fresh OS hostname.
+An ID with setup's exact shape (1-32 lowercase alphanumeric characters with
+single internal hyphens, then `-` and eight lowercase hex digits) drops the
+random suffix. Other IDs use their whole input. Mapping uses lowercase ASCII
+letters, digits and single hyphens. Lossy mapping or truncation adds eight hex
+digits of SHA-256 of the original ID, so inputs such as `Studio_One` and
+`Studio.One` remain distinct. An empty mapped part uses `machine`. A machine
+slug equal to `control-plane`
+or `run-ledger`, or ending in `-client` or `-person`, also gets the hash to
+avoid service and participant-role label collisions. Labels are
+at most 63 bytes; only the machine part is shortened, keeping the hash and
+`-client` or `-person` role suffix intact.
+
+An exact grant is accepted. The production adapter also accepts the requested
+label followed by `-` and a positive decimal integer without leading zeros
+(the coordinator's numeric collision suffix). It returns the **granted** label
+in `SelfIdentity.NetworkName`, without a provider domain. Every other grant,
+including an invalid or overlong label, is `fabric.ErrGrantedNameMismatch`
+with the existing stale-device advice. A coordinator using another collision
+suffix form fails closed with the same advice. Setup records that grant as
+`participants.<role>.network_name`. A saved participant requests that exact
+recorded name on restart, and `ConnectHost()` returns it. Participants with no
+recorded name retain the legacy mapping; setup reruns never rename them.
+For a node agent, which advertises its name as its connect host, a recorded
+name that differs from authenticated status is a typed participant identity
+refusal; restore the network name or explicitly re-record its grant before
+using the participant. Other participants are never reached by name and are
+not refused for a renamed device. A successful collision grant prints one setup
+report line naming the granted and requested labels, with advice to retire
+the stale device to free the requested name. The notice follows durable
+profile publication; exact grants and saved-participant reruns print no notice.
+Network names are connection hints, never authenticated identity or authority.
 
 The setup step `enrolSetupParticipants` takes an explicit participant list,
 home, data folder and profile destination. Each machine participant uses its

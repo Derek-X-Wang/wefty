@@ -16,6 +16,7 @@ type Config struct {
 	Identity         fabric.Identity
 	PlainFabricID    string
 	Name             string
+	NetworkName      string
 	StateDirectory   string
 	AuthKey          string
 	ControlURL       string
@@ -86,6 +87,7 @@ func open(ctx context.Context, config Config, newParticipant func(tsnet.Config) 
 		}
 		participant, err := newParticipant(tsnet.Config{
 			Name:             config.Name,
+			NetworkName:      config.NetworkName,
 			StateDir:         config.StateDirectory,
 			Credential:       fabric.Credential{Value: config.AuthKey},
 			Ephemeral:        config.Ephemeral,

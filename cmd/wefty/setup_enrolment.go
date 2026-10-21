@@ -139,6 +139,10 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, err
 		}
 		spec := fabric.EnrolSpec{Name: participant.name, StateDirectory: stateDir, CoordinatorURL: request.controlURL}
+		requestedNetworkName, err := fabric.RequestedNetworkName(spec.Name)
+		if err != nil {
+			return profile, err
+		}
 		if participant.role == connprofile.ParticipantPerson {
 			spec.LoginURL = request.loginURL
 		} else {
@@ -176,7 +180,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			if !slices.Equal(actual, expected) {
 				enrolErr = errors.New("granted participant tags do not match the role")
 			}
-			if self.Name != participant.name {
+			if self.Name != participant.name || fabric.ValidateNetworkName(self.NetworkName) != nil {
 				enrolErr = fabric.ErrGrantedNameMismatch
 			}
 			if self.NodeID == "" || participant.role == connprofile.ParticipantPerson && (self.UserID == "" || self.Kind == fabric.IdentityKindMachine) {
@@ -191,7 +195,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, rollback(enrolErr)
 		}
 		previousL1, previousL3 := profile.L1Address, profile.L3Address
-		profile.Participants[participant.role] = connprofile.Participant{Name: self.Name, StateDirectory: stateDir, NodeID: self.NodeID, UserID: self.UserID, KeyExpiry: self.KeyExpiry}
+		profile.Participants[participant.role] = connprofile.Participant{Name: self.Name, NetworkName: self.NetworkName, StateDirectory: stateDir, NodeID: self.NodeID, UserID: self.UserID, KeyExpiry: self.KeyExpiry}
 		if participant.role == connprofile.ParticipantL1 {
 			profile.L1Address = self.NodeID
 		}
@@ -220,6 +224,11 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			delete(profile.Participants, participant.role)
 			profile.L1Address, profile.L3Address = previousL1, previousL3
 			return profile, rollback(err)
+		}
+		if self.NetworkName != requestedNetworkName {
+			if _, err := fmt.Fprintf(request.output, "The network gave %s because %s is taken; retire the stale device to free the name.\n", self.NetworkName, requestedNetworkName); err != nil {
+				return profile, err
+			}
 		}
 	}
 	return profile, nil

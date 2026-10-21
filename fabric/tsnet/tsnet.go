@@ -31,7 +31,9 @@ import (
 // node. Name is the node's wefty logical name, such as
 // wefty://control-plane or wefty://node/runner-1.
 type Config struct {
-	Name             string
+	Name string
+	// NetworkName reuses a recorded grant. Empty preserves the legacy mapping.
+	NetworkName      string
 	StateDir         string
 	Credential       fabric.Credential
 	Ephemeral        bool
@@ -49,10 +51,11 @@ type Fabric struct {
 	localName      naming.Name
 	coordinatorURL string
 
-	clientMu         sync.Mutex
-	client           *local.Client
-	fabricID         string
-	expectedIdentity *fabric.Identity
+	clientMu            sync.Mutex
+	client              *local.Client
+	fabricID            string
+	expectedIdentity    *fabric.Identity
+	recordedNetworkName string
 	// Transport calls stay injectable for secretless seam tests.
 	dialNode       func(context.Context, string, string) (net.Conn, error)
 	dialPlan       func(context.Context, string, string) (netip.AddrPort, bool, error)
@@ -75,6 +78,13 @@ func New(config Config) (*Fabric, error) {
 	}
 	if !logical {
 		return nil, fmt.Errorf("tsnet fabric: Name %q is not a wefty logical name", config.Name)
+	}
+	networkName := config.NetworkName
+	if networkName == "" {
+		networkName = name.Hostname()
+	}
+	if err := fabric.ValidateNetworkName(networkName); err != nil {
+		return nil, err
 	}
 	if config.ExpectedIdentity != nil {
 		if config.Credential.Value != "" || config.Ephemeral || config.ExpectedIdentity.NodeID == "" {
@@ -119,13 +129,14 @@ func New(config Config) (*Fabric, error) {
 	}
 	envknob.SetNoLogsNoSupport()
 	return &Fabric{
-		releaseState:     release,
-		localName:        name,
-		expectedIdentity: config.ExpectedIdentity,
-		coordinatorURL:   config.CoordinatorURL,
+		releaseState:        release,
+		localName:           name,
+		expectedIdentity:    config.ExpectedIdentity,
+		recordedNetworkName: config.NetworkName,
+		coordinatorURL:      config.CoordinatorURL,
 		server: &tailscaletsnet.Server{
 			Dir:        config.StateDir,
-			Hostname:   name.Hostname(),
+			Hostname:   networkName,
 			AuthKey:    config.Credential.Value,
 			Ephemeral:  config.Ephemeral,
 			ControlURL: config.CoordinatorURL,
@@ -200,6 +211,9 @@ func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, e
 		return nil, &fabric.ParticipantUnreachableError{Cause: participantStatusError{cause: err}}
 	}
 	if logical {
+		if f.expectedIdentity != nil {
+			return nil, &fabric.DestinationRefusedError{}
+		}
 		address = name.TransportAddress()
 	} else if _, _, err := net.SplitHostPort(address); err != nil {
 		address, err = opaquePeerAddress(status, address, false)
@@ -419,9 +433,9 @@ func (f *Fabric) PersonIdentityTrust() fabric.PersonIdentityTrust {
 	return fabric.PersonIdentityAuthenticated
 }
 
-// ConnectHost returns the private tailnet hostname owned by this Fabric
-// implementation. The logical wefty name remains behind the seam.
-func (f *Fabric) ConnectHost() string { return f.localName.Hostname() }
+// ConnectHost returns the recorded network name requested by this backend,
+// or the legacy mapping when no name was recorded. It performs no network IO.
+func (f *Fabric) ConnectHost() string { return f.server.Hostname }
 
 func (f *Fabric) localClient() (*local.Client, error) {
 	f.clientMu.Lock()
