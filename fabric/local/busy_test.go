@@ -134,6 +134,6 @@ func TestSaturatedServiceCloseIsRetryable(t *testing.T) {
 	err := d.Check(ctx)
 	var busy *BusyError
 	if !errors.As(err, &busy) {
-		t.Fatalf("saturated live service looked missing: %T %v", err, err)
+		t.Fatalf("saturated live service looked missing: %T %v (cause: %v)", err, err, errors.Unwrap(err))
 	}
 }

@@ -137,7 +137,7 @@ func (d *Dialer) exchange(ctx context.Context, operation, network, address strin
 		_ = conn.Close()
 		// An authenticated live service can close overflow without a reply.
 		// A partial reply is a protocol failure, not evidence of saturation.
-		if ctx.Err() == nil && received.bytes == 0 && (errors.Is(err, io.EOF) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET)) {
+		if ctx.Err() == nil && received.bytes == 0 && closedByPeer(err) {
 			return nil, &BusyError{}
 		}
 		return nil, establishmentError(ctx, err)
@@ -172,6 +172,17 @@ func (d *Dialer) exchange(ctx context.Context, operation, network, address strin
 	}
 	_ = conn.SetDeadline(time.Time{})
 	return &streamConn{Conn: conn}, nil
+}
+
+// closedByPeer reports the errors a socket gives when its peer has closed it.
+// macOS can report a write during Unix-socket teardown as EPROTOTYPE.
+func closedByPeer(err error) bool {
+	for _, closed := range []error{io.EOF, syscall.EPIPE, syscall.ECONNRESET, syscall.EPROTOTYPE, syscall.ENOTCONN} {
+		if errors.Is(err, closed) {
+			return true
+		}
+	}
+	return false
 }
 
 type replyReader struct {
