@@ -82,7 +82,10 @@ func TestProcessReachedLimitFailsThroughL1(t *testing.T) {
 						t.Errorf("agent shutdown: %v", err)
 					}
 				}()
-				deadline := time.Now().Add(10 * time.Second)
+				// The wait returns as soon as the job ends. Its bound covers the 1 s
+				// limit, the termination grace the stop may use, and a busy machine
+				// running the full suite (#1093).
+				deadline := time.Now().Add(time.Second + processrunner.DefaultTerminationGraceTime + 20*time.Second)
 				var got l1.Job
 				for {
 					if err := client.request(t.Context(), http.MethodGet, "/v1/jobs/"+job.JobID, nil, &got); err != nil {
