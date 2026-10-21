@@ -12,6 +12,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/serviceready"
 )
 
 // Legacy profiles retain their embedded backend. Participant profiles only
@@ -51,6 +52,7 @@ func executeClientServiceWithOpener(ctx context.Context, options globalOptions, 
 	if err != nil {
 		return err
 	}
+	readyFile := flags.String("ready-file", "", "optional local startup record")
 	socket := flags.String("socket", local.SocketPath(home), "private client-service socket path")
 	flags.Usage = func() {
 		_, _ = io.WriteString(flags.Output(), "Usage: wefty [--profile PATH] client-service [--socket PATH]\nInternal per-user Fabric client service.\n")
@@ -120,7 +122,7 @@ func executeClientServiceWithOpener(ctx context.Context, options globalOptions, 
 			return err
 		}
 		check := func(probe context.Context) error {
-			if !hasSavedParticipantState(saved.StateDirectory) {
+			if !fabricconfig.SavedStateAvailable(options.fabricMode, saved.StateDirectory) {
 				return &fabric.ParticipantIdentityError{Person: role == connprofile.ParticipantPerson, Reason: "state is missing"}
 			}
 			if role == connprofile.ParticipantPerson && !saved.KeyExpiry.IsZero() && !time.Now().Before(saved.KeyExpiry) {
@@ -137,7 +139,9 @@ func executeClientServiceWithOpener(ctx context.Context, options globalOptions, 
 	if err != nil {
 		return err
 	}
-	return server.Serve(ctx)
+	return server.ServeReady(ctx, func() error {
+		return serviceready.Publish(*readyFile, serviceready.Metadata{Address: *socket, NodeID: options.participants[connprofile.ParticipantClient].NodeID})
+	})
 }
 
 func missingPersonParticipant(nodeID string) local.Participant {

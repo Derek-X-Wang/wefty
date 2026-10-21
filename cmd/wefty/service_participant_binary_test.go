@@ -253,17 +253,20 @@ func TestServiceParticipantsStartAndAuthorizeEnrolledPeersFromRealBinaries(t *te
 	writeServicePlainIdentity(t, personState, f.profile.ServiceParticipant(connprofile.ParticipantPerson).ExpectedIdentity)
 	f.write(t)
 	l1Ready := filepath.Join(f.home, "l1-ready.json")
-	startSavedService(t, binaries, "wefty-l1", f, "--ready-file="+l1Ready)
+	l1PID := startSavedService(t, binaries, "wefty-l1", f, "--ready-file="+l1Ready)
 	l1Address := waitSavedServiceAddress(t, l1Ready)
+	assertSavedReadyProcess(t, l1Ready, l1PID, "", "")
 	f.profile.L1Address = l1Address
 	f.write(t)
 	// L3 owns a separate database but reads the very same enrolled profile.
 	l3Ready := filepath.Join(f.home, "l3-ready.json")
-	startSavedService(t, binaries, "wefty-l3", f, "--ready-file="+l3Ready)
+	l3PID := startSavedService(t, binaries, "wefty-l3", f, "--ready-file="+l3Ready)
 	l3Address := waitSavedServiceAddress(t, l3Ready)
+	assertSavedReadyProcess(t, l3Ready, l3PID, "", "")
 	f.profile.L3Address = l3Address
 	f.write(t)
-	startSavedService(t, binaries, "wefty-agent", f, "--heartbeat-interval=1s", "--claim-interval=1s", "--handoff-root="+filepath.Join(f.home, "handoff"))
+	agentReady := filepath.Join(f.home, "agent-ready.json")
+	agentPID := startSavedService(t, binaries, "wefty-agent", f, "--heartbeat-interval=1s", "--claim-interval=1s", "--handoff-root="+filepath.Join(f.home, "handoff"), "--ready-file="+agentReady)
 	startSavedService(t, binaries, "wefty", f)
 
 	network, err := plain.NewNetworkWithID(f.profile.PlainFabricID)
@@ -283,6 +286,7 @@ func TestServiceParticipantsStartAndAuthorizeEnrolledPeersFromRealBinaries(t *te
 	if node.BootSessionID == "" {
 		t.Fatal("matching saved node-agent identity never registered")
 	}
+	assertSavedReadyProcess(t, agentReady, agentPID, "stable-node", node.BootSessionID)
 	// The live node registration must be bound to the agent's opaque identity.
 	proof, _ := json.Marshal(l1.HostBootSessionProof{HostIdentityNodeID: f.profile.Participants[connprofile.ParticipantNodeAgent].NodeID, HostStableNodeID: "stable-node", BootSessionID: node.BootSessionID})
 	for _, tc := range []struct {
@@ -333,7 +337,7 @@ func TestServiceParticipantsStartAndAuthorizeEnrolledPeersFromRealBinaries(t *te
 	}
 }
 
-func startSavedService(t *testing.T, binaries, service string, f *serviceParticipantFixture, extra ...string) {
+func startSavedService(t *testing.T, binaries, service string, f *serviceParticipantFixture, extra ...string) int {
 	t.Helper()
 	role := map[string]string{"wefty-l1": "l1", "wefty-l3": "l3", "wefty-agent": "node-agent", "wefty": "client"}[service]
 	saved := f.profile.Participants[role]
@@ -373,6 +377,7 @@ func startSavedService(t *testing.T, binaries, service string, f *servicePartici
 		}
 		_ = logFile.Close()
 	})
+	return command.Process.Pid
 }
 func waitSavedServiceAddress(t *testing.T, path string) string {
 	t.Helper()
@@ -441,4 +446,22 @@ func TestServiceParticipantStatePreflightDoesNotOpenParticipant(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertSavedReadyProcess(t *testing.T, path string, pid int, nodeID, boot string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var ready struct {
+			PID           int    `json:"pid"`
+			NodeID        string `json:"node_id"`
+			BootSessionID string `json:"boot_session_id"`
+		}
+		b, err := os.ReadFile(path)
+		if err == nil && json.Unmarshal(b, &ready) == nil && ready.PID == pid && ready.NodeID == nodeID && ready.BootSessionID == boot {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("service did not publish its own ready process: %s pid=%d", filepath.Base(path), pid)
 }

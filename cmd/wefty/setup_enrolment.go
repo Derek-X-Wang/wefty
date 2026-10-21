@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -30,13 +31,19 @@ type setupEnrolmentRequest struct {
 	input                   io.Reader
 	output                  io.Writer
 	loginURL                func(string)
+	openLoginURL            func(context.Context, string) error
 	controlURL              string
+	afterSaved              func(string) error
+	deferNotices            bool
 }
 
 // enrolSetupParticipants is the setup step fleet role wiring (#900) can call.
 // It starts no services and no local listener. The caller must stop existing
 // services before a cutover; a rerun never starts an enrolled participant.
 func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) (connprofile.Profile, error) {
+	if err := connprofile.ValidateCoordinatorURL(request.controlURL); err != nil {
+		return connprofile.Profile{}, err
+	}
 	if err := tsnet.ClearAmbientCredentials(); err != nil {
 		return connprofile.Profile{}, err
 	}
@@ -76,7 +83,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, fmt.Errorf("invalid or duplicate setup participant %q", participant.role)
 		}
 		seen[participant.role] = true
-		if participant.role == connprofile.ParticipantPerson && request.loginURL == nil {
+		if participant.role == connprofile.ParticipantPerson && request.loginURL == nil && request.openLoginURL == nil {
 			return profile, errors.New("person enrolment needs an owner login-URL callback")
 		}
 	}
@@ -119,7 +126,10 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			if saved.Name != participant.name || saved.StateDirectory != stateDir {
 				return profile, fmt.Errorf("saved %s participant differs; setup will not rebind its identity", participant.role)
 			}
-			if !hasSavedParticipantState(stateDir) {
+			if saved.CoordinatorURL != request.controlURL {
+				return profile, fmt.Errorf("saved %s coordinator differs; setup will not rebind its identity", participant.role)
+			}
+			if !tsnet.HasSavedState(stateDir) {
 				return profile, fmt.Errorf("saved %s participant state is missing; restore its original saved state, or retire the old device and remove its stale participant record before enrolling a new identity", participant.role)
 			}
 			if err := root.Chmod(stateRel, 0o700); err != nil {
@@ -127,17 +137,36 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			}
 			continue
 		}
-		if _, err := os.ReadDir(stateDir); err == nil && hasSavedParticipantState(stateDir) {
-			return profile, fmt.Errorf("unrecorded state for %s; inspect it before enrolling", participant.role)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		if _, err := root.Lstat(stateRel); err == nil {
+			// A crash during enrolment can leave this folder. Only the owner can
+			// tell a leftover from another identity, so setup never deletes it.
+			return profile, fmt.Errorf("an unrecorded identity folder exists for %s (data folder fabric/%s); if it is left over from an interrupted setup and no wefty process is running, remove that folder and rerun setup; otherwise keep it and stop", participant.role, filepath.Base(stateRel))
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return profile, err
 		}
-		if err := root.MkdirAll(stateRel, 0o700); err != nil {
-			return profile, err
+	}
+	// Name the destination only after every participant passes preflight and
+	// before reading any single-use credential. A keyless rerun prints nothing.
+	for _, participant := range request.participants {
+		if _, saved := profile.Participants[participant.role]; !saved && participant.role != connprofile.ParticipantPerson {
+			label := "default"
+			if request.controlURL != "" {
+				parsed, _ := url.Parse(request.controlURL)
+				label = parsed.Host
+			}
+			if _, err := fmt.Fprintf(request.output, "Join keys will go to coordinator: %s\n", label); err != nil {
+				return profile, err
+			}
+			break
 		}
-		if err := root.Chmod(stateRel, 0o700); err != nil {
-			return profile, err
+	}
+	// Validate every participant before consuming any single-use credential.
+	for _, participant := range request.participants {
+		if _, saved := profile.Participants[participant.role]; saved {
+			continue
 		}
+		stateRel := filepath.Join(dataRel, "fabric", participant.role)
+		stateDir := filepath.Join(request.home, stateRel)
 		spec := fabric.EnrolSpec{Name: participant.name, StateDirectory: stateDir, CoordinatorURL: request.controlURL}
 		requestedNetworkName, err := fabric.RequestedNetworkName(spec.Name)
 		if err != nil {
@@ -152,13 +181,50 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			}
 			spec.Credential.Value = key
 		}
-		self, enrolErr := request.enroller.Enrol(ctx, spec)
+		if err := root.MkdirAll(stateRel, 0o700); err != nil {
+			return profile, err
+		}
+		if err := root.Chmod(stateRel, 0o700); err != nil {
+			return profile, err
+		}
+		enrolCtx, cancelEnrol := context.WithCancel(ctx)
+		var loginErr error
+		if participant.role == connprofile.ParticipantPerson && request.openLoginURL != nil {
+			spec.LoginURL = func(value string) {
+				if err := request.openLoginURL(enrolCtx, value); err != nil {
+					loginErr = errors.New("could not open owner sign-in; repair browser access and rerun setup")
+					cancelEnrol()
+				}
+			}
+		}
+		self, enrolErr := request.enroller.Enrol(enrolCtx, spec)
+		cancelEnrol()
+		if loginErr != nil {
+			enrolErr = loginErr
+		}
+		// Provider errors may contain browser URLs even when no callback arrived.
+		if enrolErr != nil && participant.role == connprofile.ParticipantPerson {
+			var inUse *fabric.ParticipantInUseError
+			if errors.As(enrolErr, &inUse) {
+				enrolErr = &fabric.ParticipantInUseError{Participant: participant.name}
+			} else {
+				enrolErr = errors.New("owner sign-in failed; repair browser sign-in and rerun setup")
+			}
+		}
 		key := spec.Credential.Value
 		spec.Credential = fabric.Credential{}
 		rollback := func(cause error) error {
 			// Cleanup has its own bounded context so Ctrl-C cannot skip logout.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			logoutErr := request.enroller.Logout(cleanupCtx, spec)
+			if logoutErr != nil && participant.role == connprofile.ParticipantPerson {
+				var inUse *fabric.ParticipantInUseError
+				if errors.As(logoutErr, &inUse) {
+					logoutErr = &fabric.ParticipantInUseError{Participant: participant.name}
+				} else {
+					logoutErr = errors.New("owner sign-in cleanup failed")
+				}
+			}
 			cancel()
 			var inUse *fabric.ParticipantInUseError
 			if errors.As(logoutErr, &inUse) {
@@ -173,6 +239,9 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return scrubSetupEnrolmentError(errors.Join(cause, logoutErr, removeErr), key)
 		}
 		if enrolErr == nil {
+			if !tsnet.HasSavedState(stateDir) {
+				enrolErr = errors.New("enrolment did not save private backend state")
+			}
 			_, expected, _ := setupParticipantPolicy(participant.role)
 			actual := slices.Clone(self.Tags)
 			slices.Sort(actual)
@@ -195,7 +264,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, rollback(enrolErr)
 		}
 		previousL1, previousL3 := profile.L1Address, profile.L3Address
-		profile.Participants[participant.role] = connprofile.Participant{Name: self.Name, NetworkName: self.NetworkName, StateDirectory: stateDir, NodeID: self.NodeID, UserID: self.UserID, KeyExpiry: self.KeyExpiry}
+		profile.Participants[participant.role] = connprofile.Participant{Name: self.Name, NetworkName: self.NetworkName, StateDirectory: stateDir, NodeID: self.NodeID, UserID: self.UserID, KeyExpiry: self.KeyExpiry, CoordinatorURL: request.controlURL}
 		if participant.role == connprofile.ParticipantL1 {
 			profile.L1Address = self.NodeID
 		}
@@ -225,8 +294,13 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			profile.L1Address, profile.L3Address = previousL1, previousL3
 			return profile, rollback(err)
 		}
-		if self.NetworkName != requestedNetworkName {
+		if self.NetworkName != requestedNetworkName && !request.deferNotices {
 			if _, err := fmt.Fprintf(request.output, "The network gave %s because %s is taken; retire the stale device to free the name.\n", self.NetworkName, requestedNetworkName); err != nil {
+				return profile, err
+			}
+		}
+		if request.afterSaved != nil {
+			if err := request.afterSaved(participant.role); err != nil {
 				return profile, err
 			}
 		}

@@ -208,6 +208,7 @@ const (
 type State struct {
 	Loaded  bool
 	Running bool
+	PID     int
 }
 
 // Manager loads plists into one owner's GUI login domain.
@@ -242,7 +243,14 @@ func (manager Manager) State(ctx context.Context, label string) (State, error) {
 	if err != nil {
 		return State{}, fmt.Errorf("cannot tell whether LaunchAgent %s is loaded: %w", label, err)
 	}
-	return State{Loaded: true, Running: printedRunning(output)}, nil
+	state := State{Loaded: true, Running: printedRunning(output)}
+	for _, line := range strings.Split(string(output), "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "pid = "); ok {
+			state.PID, _ = strconv.Atoi(strings.TrimSpace(value))
+			break
+		}
+	}
+	return state, nil
 }
 
 // printedRunning reads the service's own state line, the first one in

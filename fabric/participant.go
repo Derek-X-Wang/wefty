@@ -10,10 +10,15 @@ type ParticipantIdentityError struct {
 	// Person distinguishes person sign-in from a machine-participant refusal.
 	// The zero value describes a machine.
 	Person bool
+	// CoordinatorConflict needs override correction, not identity retirement.
+	CoordinatorConflict bool
 }
 
 func (e *ParticipantIdentityError) Error() string {
-	return "saved participant " + e.Reason + "; retire the old device and enrol a new identity through fleet setup (public fleet setup is not available yet)"
+	if e.CoordinatorConflict {
+		return "saved participant " + e.Reason + "; use the recorded coordinator URL or unset the conflicting coordinator override"
+	}
+	return "saved participant " + e.Reason + "; restore its original saved state, or retire the old device before enrolling a replacement identity through fleet setup"
 }
 
 // ParticipantUnreachableError means the saved participant could not be checked.

@@ -19,6 +19,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -73,6 +74,7 @@ type Profile struct {
 // Participant records logical and granted network names, local state paths
 // and opaque identity fields. Join credentials never enter the profile.
 type Participant struct {
+	CoordinatorURL string `json:"coordinator_url,omitempty"`
 	// NetworkName is the checked network grant. Absent records keep legacy names.
 	NetworkName    string    `json:"network_name,omitempty"`
 	Name           string    `json:"name"`
@@ -152,6 +154,9 @@ func (p Profile) Validate() error {
 	seen := make(map[string]bool, len(p.NodeAdmission))
 	stateFolders := make(map[string]bool)
 	for role, participant := range p.Participants {
+		if err := ValidateCoordinatorURL(participant.CoordinatorURL); err != nil {
+			return fmt.Errorf("connection profile: participant %s: %w", role, err)
+		}
 		if participant.NetworkName != "" {
 			if err := fabric.ValidateNetworkName(participant.NetworkName); err != nil {
 				return fmt.Errorf("connection profile: participant %s: %w", role, err)
@@ -449,6 +454,20 @@ func ValidateParticipantName(role, name string) error {
 	}
 	if !strings.HasPrefix(name, prefix) || (!strings.HasSuffix(prefix, "/") && name != prefix) {
 		return fmt.Errorf("connection profile: participant %s needs logical name %s", role, prefix)
+	}
+	return nil
+}
+
+// ValidateCoordinatorURL permits only a non-secret HTTPS coordinator address.
+// Query strings, fragments and userinfo can carry credentials and are never
+// installation metadata. Empty selects the backend's default coordinator.
+func ValidateCoordinatorURL(value string) error {
+	if value == "" {
+		return nil
+	}
+	u, err := url.Parse(value)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(value, "\r\n\t ") {
+		return errors.New("coordinator URL must be an HTTPS address without credentials, query or fragment")
 	}
 	return nil
 }

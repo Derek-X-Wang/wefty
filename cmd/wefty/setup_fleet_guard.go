@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 )
 
-// refuseRecordedFleetRole fences the legacy installers before locks, recovery,
+// refuseRecordedFleetRole fences legacy upgrade/removal before locks, recovery,
 // staging or service-manager calls. Participant shape never determines role.
 func refuseRecordedFleetRole(paths setupPaths, command string) error {
 	root, err := os.OpenRoot(paths.home)

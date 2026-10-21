@@ -11,16 +11,16 @@ import (
 // Keep this vocabulary in sync with command registrations (including authoring
 // and platform-specific commands); TestJSONValueFlagVocabulary checks it.
 const jsonValueFlags = `agent-path allowed-mount-root argv auth-key backup-cap cap
-capability claims-enabled class control-url cpu-millicores cursor dir disk-bytes drain-timeout
+capability claims-enabled class control-url coordinator-url cpu-millicores cursor dir disk-bytes drain-timeout
 envelope-schema envelope-schema-file evidence-file fabric fabric-id fabric-name
 file follow-for from helper-checksum idempotency-key image install-manifest instance-key
-intent-file intent-revision interpreter key kind l1 l3 lang limit manifest
+intent-file intent-revision interpreter join-code key kind l1 l3 lang limit manifest
 manifest-digest max-cost max-inflight max-runtime memory-bytes memory-capacity-bytes
 memory-reserve-bytes mode mount name node node-config node-id operator-user origin
 out outcome params params-file path payload-file payload-json-file permission
 plain-device-id plain-fabric-id plain-identity plain-user-id policy-revision
-poll-interval probe-archive probe-digest probe-reference profile published-port reason
-reference restart revision runtime-handler script session-token-file setup-state
+poll-interval probe-archive probe-digest probe-reference profile published-port ready-file reason
+reference restart revision role runtime-handler script session-token-file setup-state
 socket state state-dir status step storage-generation storage-id submit-intent-revision
 submitter summary tag tail timeout unit-directory wait wait-timeout workflow-ref
 vm-memory vm-cpus vm-disk working-directory`

@@ -15,7 +15,7 @@ import (
 type personSignInRequiredError struct{}
 
 func (*personSignInRequiredError) Error() string {
-	return "person sign-in is missing or expired; restore this participant's saved state or retire the old device and enrol a new person identity through fleet setup (public fleet setup is not available yet)"
+	return "person sign-in is missing or expired; restore this participant's saved state or retire the old device and enrol a new person identity through fleet setup"
 }
 
 // commandFabricConfig is the one identity choice for both Fabric modes.
@@ -53,7 +53,7 @@ func commandFabricConfig(options globalOptions, args []string) (fabricconfig.Con
 		}
 		return fabricconfig.Config{}, &fabric.ParticipantIdentityError{Reason: "is missing from the profile"}
 	}
-	if !hasSavedParticipantState(participant.StateDirectory) {
+	if !fabricconfig.SavedStateAvailable(options.fabricMode, participant.StateDirectory) {
 		if person {
 			return fabricconfig.Config{}, &personSignInRequiredError{}
 		}
@@ -69,6 +69,10 @@ func commandFabricConfig(options globalOptions, args []string) (fabricconfig.Con
 	}
 	config.Name, config.StateDirectory = participant.Name, participant.StateDirectory
 	config.NetworkName = participant.NetworkName
+	if options.controlURL != "" && options.controlURL != participant.CoordinatorURL {
+		return fabricconfig.Config{}, &fabric.ParticipantIdentityError{Person: person, CoordinatorConflict: true, Reason: "coordinator URL override conflicts with its record"}
+	}
+	config.ControlURL = participant.CoordinatorURL
 	config.Identity = fabric.Identity{NodeID: participant.NodeID, Tags: []string{l3.DefaultCallerPrincipalTag}}
 	if person {
 		config.Identity = fabric.Identity{NodeID: participant.NodeID, DeviceID: participant.NodeID, UserID: participant.UserID}
@@ -91,7 +95,7 @@ func localPersonSignIn(options globalOptions, now time.Time) string {
 	if !ok || person.NodeID == "" || person.UserID == "" {
 		return "not_signed_in"
 	}
-	if !hasSavedParticipantState(person.StateDirectory) {
+	if !fabricconfig.SavedStateAvailable(options.fabricMode, person.StateDirectory) {
 		return "not_signed_in"
 	}
 	if !person.KeyExpiry.IsZero() && !now.Before(person.KeyExpiry) {

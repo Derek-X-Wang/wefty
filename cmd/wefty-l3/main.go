@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -10,12 +9,12 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
+	"github.com/Derek-X-Wang/wefty/internal/serviceready"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
@@ -183,22 +182,5 @@ func requireReachableControlPlane(fabricMode, controlPlane string) error {
 }
 
 func publishReadyFile(path, address string) error {
-	if path == "" {
-		return nil
-	}
-	payload, err := json.Marshal(struct {
-		Address string    `json:"address"`
-		ReadyAt time.Time `json:"ready_at"`
-	}{Address: address, ReadyAt: time.Now().UTC()})
-	if err != nil {
-		return err
-	}
-	temporaryPath := path + ".tmp"
-	if err := os.WriteFile(temporaryPath, payload, 0o600); err != nil {
-		return fmt.Errorf("write ready file: %w", err)
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("publish ready file: %w", err)
-	}
-	return nil
+	return serviceready.Publish(path, serviceready.Metadata{Address: address})
 }

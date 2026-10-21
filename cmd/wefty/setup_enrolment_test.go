@@ -15,12 +15,15 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/fabric/tsnet"
+	"github.com/Derek-X-Wang/wefty/fabric/tsnet/teststate"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 )
 
 type fakeSetupEnroller struct {
 	roles                []string
+	coordinators         []string
+	collisionRole        string
 	keys                 []string
 	loggedOut            []string
 	wrongTag, wrongName  string
@@ -31,13 +34,17 @@ type fakeSetupEnroller struct {
 func (e *fakeSetupEnroller) Enrol(_ context.Context, spec fabric.EnrolSpec) (fabric.SelfIdentity, error) {
 	role := filepath.Base(spec.StateDirectory)
 	e.roles = append(e.roles, role)
+	e.coordinators = append(e.coordinators, spec.CoordinatorURL)
 	e.keys = append(e.keys, spec.Credential.Value)
-	if err := os.WriteFile(filepath.Join(spec.StateDirectory, "saved-identity"), []byte("opaque-saved-state"), 0o600); err != nil {
+	if err := teststate.Write(spec.StateDirectory); err != nil {
 		return fabric.SelfIdentity{}, err
 	}
 	networkName, err := fabric.RequestedNetworkName(spec.Name)
 	if err != nil {
 		return fabric.SelfIdentity{}, err
+	}
+	if role == e.collisionRole {
+		networkName += "-2"
 	}
 	identity := fabric.SelfIdentity{Identity: fabric.Identity{NodeID: "opaque-" + role, DeviceID: "opaque-" + role, Kind: fabric.IdentityKindMachine}, Name: spec.Name, NetworkName: networkName}
 	switch role {
@@ -284,10 +291,18 @@ func TestSetupEnrolLockRefusalPreservesOwnerFolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
-	_, err = enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"client", "wefty://client/test"}}, enroller: tsnet.Enroller{}, input: strings.NewReader("unused-key\n")})
+	input, output := strings.NewReader("unused-key\n"), &bytes.Buffer{}
+	_, err = enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"client", "wefty://client/test"}}, enroller: tsnet.Enroller{}, input: input, output: output})
+	if err == nil || !strings.Contains(err.Error(), "unrecorded identity folder") || !strings.Contains(err.Error(), "remove that folder and rerun setup") || input.Len() != len("unused-key\n") || output.Len() != 0 {
+		t.Fatalf("owned unrecorded folder was not preflighted: %v prompts=%s", err, output)
+	}
 	var inUse *fabric.ParticipantInUseError
+	other, err := participantstate.Acquire(state, "wefty://client/test")
+	if other != nil {
+		_ = other()
+	}
 	if !errors.As(err, &inUse) {
-		t.Fatalf("locked enrolment=%v", err)
+		t.Fatalf("setup disturbed the original participant lock: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(state, participantstate.LockName)); err != nil {
 		t.Fatalf("deleted another owner's folder: %v", err)
@@ -340,8 +355,8 @@ func TestSetupRollbackLockRefusalPreservesOwnerState(t *testing.T) {
 	if !errors.As(err, &inUse) {
 		t.Fatalf("rollback refusal=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(state, "saved-identity")); err != nil {
-		t.Fatalf("deleted the new owner's saved state: %v", err)
+	if !tsnet.HasSavedState(state) {
+		t.Fatal("deleted the new owner's saved state")
 	}
 }
 

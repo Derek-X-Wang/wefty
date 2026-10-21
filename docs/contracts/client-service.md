@@ -196,3 +196,10 @@ logout and deletion, deletion is refused. A held folder returns
 `participant_in_use` and is preserved.
 If that refusal joins an enrolment failure, the JSON message keeps the original
 enrolment cause as well as the ownership refusal.
+
+For a joining Mac, the installation plan supplies `--ready-file PATH`.
+The client service durably publishes PID, startup time, saved client node ID
+and private socket address after saved-client verification and socket creation,
+before accepting requests. A publication failure closes and removes the socket.
+This is a local startup point, not continuing health evidence; setup also checks
+the live saved-client protocol. Without the flag, existing startup is unchanged.
