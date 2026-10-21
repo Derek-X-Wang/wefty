@@ -72,6 +72,18 @@ Person enrolment exposes the login URL only through its callback; enrolment and
 rollback loggers suppress the ordinary command enrollment hint.
 Errors are scrubbed if a backend includes the key in its message.
 
+Mac control-plane setup invokes this step against a durable staged profile in
+L1, L3, node agent, client order. `--coordinator-url HTTPS_URL` selects a
+non-default coordinator. Its non-secret URL is recorded separately in each
+participant as `coordinator_url`; credentials, queries and fragments are refused
+before staging or enrolment. An absent URL selects the backend default. Resume
+preserves the saved coordinator and refuses a conflict. Before the first key,
+setup also checks the ambient coordinator even when a flag selected the URL.
+Startup uses the record and accepts only equal explicit/environment overrides.
+Coordinator-conflict advice is to use the recorded URL or unset the conflicting
+override; it does not require identity retirement.
+
+
 Outside setup, a saved participant refuses login and machine-authorization
 states, using `person_identity_required` for a person or
 `machine_identity_required` for a machine (exit 3). Its command context bounds
@@ -82,10 +94,21 @@ redacted diagnostics. Legacy bootstrap callers without an expected identity can
 wait through login states with their explicit join key.
 
 Folders live at `<data>/fabric/<participant>/` with mode `0700`. Paths stay
-inside the supplied home. Linked participant folders and unrecorded nonempty
-state are refused. A saved participant with matching name and folder is not
-started on a rerun and asks for no key. Missing saved state is refused rather
+inside the supplied home. All participant folders are checked before any key is
+asked. Linked folders and any unrecorded folder (including an empty one) are
+refused. A missing resume record is refused even when its staged profile still
+exists. A saved participant with matching name and folder is not started on a
+rerun and asks for no key. Missing saved state is refused rather
 than silently binding a new Fabric node ID to the old participant.
+
+For the production adapter, saved state requires its actual unlinked, regular,
+nonempty private state file in a private participant folder. Logs, configuration
+and lock files are insufficient. The backend owns its JSON state-map format;
+setup does not copy or decode the credentials inside it. File presence is only
+an existence check. The backend parses and authenticates that state before a
+saved participant can listen or dial. Invalid nonempty content cannot authorize
+a new identity or silent re-enrolment.
+
 
 Adding the first participant record selects the strict per-command identity
 rule described in [Connection profile](connection-profile.md). Legacy profiles

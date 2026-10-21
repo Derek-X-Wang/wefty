@@ -68,6 +68,15 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 	if purge && (paths.dataRel != setupFolders.data || paths.logsRel != setupFolders.logs) {
 		return report, errors.New("purge requires standard data and log folders without redirected paths; move their symbolic links aside first")
 	}
+
+	if err := refuseRecordedFleetRole(paths, "setup --remove"); err != nil {
+		return report, err
+	}
+	if record, err := readFleetSetupRecord(paths); err != nil {
+		return report, err
+	} else if record != nil {
+		return report, errors.New("fleet setup is staged; removal is not available yet; resume setup with its recorded role")
+	}
 	unlock, err := lockSetup(paths, false)
 	if err != nil {
 		return report, err

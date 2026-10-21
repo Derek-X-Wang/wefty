@@ -77,11 +77,27 @@ func Build(role Role, paths Paths) (Plan, error) {
 		}
 		plan.Services = append(plan.Services, Service{Name: name, Binary: binary, Participant: participant, Arguments: append([]string{"--profile=" + paths.Profile}, args...), LogPath: filepath.Join(paths.Logs, name+".log"), Removal: Removal{Service: name, Binary: binary}})
 	}
+	addReady := func(name string) {
+		path := filepath.Join(paths.Data, "setup-ready", name+".json")
+		service := &plan.Services[len(plan.Services)-1]
+		service.Arguments = append(service.Arguments, "--ready-file="+path)
+		service.Removal.RuntimeFiles = append(service.Removal.RuntimeFiles, path)
+		service.Removal.RuntimeDirectories = append(service.Removal.RuntimeDirectories, filepath.Dir(path))
+	}
 	if role != Join {
 		add("l1", "wefty-l1", connprofile.ParticipantL1, "--db="+filepath.Join(paths.Data, "l1.sqlite"))
+		if role != Legacy {
+			addReady("l1")
+		}
 		add("l3", "wefty-l3", connprofile.ParticipantL3, "--db="+filepath.Join(paths.Data, "l3.sqlite"))
+		if role != Legacy {
+			addReady("l3")
+		}
 	}
 	add("node-agent", "wefty-agent", connprofile.ParticipantNodeAgent, "--log-spool-dir="+paths.Spool, "--managed-root="+paths.Managed, "--shutdown-budget="+paths.NodeShutdownBudget.String())
+	if role != Legacy {
+		addReady("node-agent")
+	}
 	if role != Legacy {
 		add("client-service", "wefty", connprofile.ParticipantClient, "client-service", "--socket="+paths.ClientSocket)
 		plan.Services[len(plan.Services)-1].Removal.RuntimeFiles = []string{paths.ClientSocket, paths.ClientSocket + ".lock"}

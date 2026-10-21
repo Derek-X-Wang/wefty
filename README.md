@@ -32,6 +32,25 @@ order.
 
 ## Daily use on this Mac: `wefty setup`
 
+For a **fresh fleet control-plane Mac**, build the same four binaries and run
+`wefty setup --role control-plane`. Setup prompts without echo for four separate
+single-use keys: L1, L3, node agent, then client. Make agent keys immediately
+before use with a short expiry. Interrupted enrolment resumes with the same
+command and asks only for participants not yet saved. A completed fleet rerun
+needs no keys. Keep both private staging files for resume. Missing resume records,
+unrecorded participant folders and coordinator conflicts refuse before any key.
+After commit, setup refuses profile edits; fleet upgrade owns profile changes.
+Existing plain installations require a later conversion slice.
+
+Fleet setup prints bounded readiness checks and runs a short pinned one-shot
+smoke test by default (`--skip-smoke-run` marks it NOT-RUN). A readiness failure
+keeps the installation published: repair the cause and rerun setup. L1 → L3
+peer reachability remains explicitly NOT-RUN. Joining-machine setup, fleet
+removal/conversion and fleet upgrade are later slices. See the
+[installation contract](docs/contracts/installation-service-plan.md).
+
+The following instructions install the original single-Mac plain stack.
+
 Build the four binaries into one folder and run that folder's `wefty setup`.
 It copies them to `~/.local/bin`, installs L1, the run ledger and a node agent
 as per-user LaunchAgents that start at login and restart after a crash (plain

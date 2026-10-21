@@ -24,6 +24,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
@@ -85,17 +86,24 @@ var setupBinaries = []string{"wefty", "wefty-l1", "wefty-l3", "wefty-agent"}
 // setupHost is everything setup reads from or does to the machine, so a test
 // can run it against a temporary home with fake launchctl and a fake shell.
 type setupHost struct {
-	goos       string
-	euid       int
-	uid        int
-	home       string
-	username   string
-	hostname   string
-	shell      string
-	executable string
-	launchctl  launchagent.Runner
-	loginShell func(ctx context.Context, shell string, args ...string) ([]byte, error)
-	random     io.Reader
+	bootTime        func() (time.Time, error)
+	enroller        fabric.Enroller
+	enrolmentInput  io.Reader
+	enrolmentOutput io.Writer
+	fleetClients    func(context.Context, setupPaths, connprofile.Profile) (*apiClients, error)
+	readinessBudget time.Duration
+	smokeBudget     time.Duration
+	goos            string
+	euid            int
+	uid             int
+	home            string
+	username        string
+	hostname        string
+	shell           string
+	executable      string
+	launchctl       launchagent.Runner
+	loginShell      func(ctx context.Context, shell string, args ...string) ([]byte, error)
+	random          io.Reader
 	// l1Address and l3Address are the ports a new profile gets.
 	l1Address, l3Address string
 	unloadBound          time.Duration
@@ -105,18 +113,23 @@ type setupHost struct {
 }
 
 type setupRequest struct {
-	from             string
-	nodeID           string
-	installedVersion string
-	skillSource      fs.FS
-	beforeWrites     func() error
-	beforeService    func(int) error
-	serviceContext   func(int) context.Context
-	afterService     func(int, launchagent.Action) error
-	lockHeld         bool
-	wroteFile        func(string, []byte)
-	deferNodeBinary  bool
-	deferSkills      bool
+	role                string
+	coordinatorURL      string
+	fleetCoordinatorURL string
+	skipSmokeRun        bool
+	afterFleetStep      func(string) error
+	from                string
+	nodeID              string
+	installedVersion    string
+	skillSource         fs.FS
+	beforeWrites        func() error
+	beforeService       func(int) error
+	serviceContext      func(int) context.Context
+	afterService        func(int, launchagent.Action) error
+	lockHeld            bool
+	wroteFile           func(string, []byte)
+	deferNodeBinary     bool
+	deferSkills         bool
 }
 
 // setupPaths are the standard locations under one owner's home. Every
@@ -253,17 +266,20 @@ type setupServiceReport struct {
 }
 
 type setupReport struct {
-	NodeID     string               `json:"node_id"`
-	Profile    string               `json:"profile"`
-	NodeConfig string               `json:"node_config"`
-	L1Address  string               `json:"l1_address"`
-	L3Address  string               `json:"l3_address"`
-	BinDir     string               `json:"bin_dir"`
-	DataDir    string               `json:"data_dir"`
-	LogDir     string               `json:"log_dir"`
-	Changes    []string             `json:"changes"`
-	Services   []setupServiceReport `json:"services"`
-	Notes      []string             `json:"notes,omitempty"`
+	Role         serviceplan.Role      `json:"role,omitempty"`
+	Participants map[string]string     `json:"participants,omitempty"`
+	Readiness    []setupReadinessCheck `json:"readiness,omitempty"`
+	NodeID       string                `json:"node_id"`
+	Profile      string                `json:"profile"`
+	NodeConfig   string                `json:"node_config"`
+	L1Address    string                `json:"l1_address"`
+	L3Address    string                `json:"l3_address"`
+	BinDir       string                `json:"bin_dir"`
+	DataDir      string                `json:"data_dir"`
+	LogDir       string                `json:"log_dir"`
+	Changes      []string              `json:"changes"`
+	Services     []setupServiceReport  `json:"services"`
+	Notes        []string              `json:"notes,omitempty"`
 }
 
 func executeSetup(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
@@ -271,6 +287,9 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	var request setupRequest
 	var remove, purge bool
+	flags.StringVar(&request.role, "role", "", "fleet role for a new install: control-plane")
+	flags.BoolVar(&request.skipSmokeRun, "skip-smoke-run", false, "skip the bounded pinned fleet smoke run")
+	flags.StringVar(&request.coordinatorURL, "coordinator-url", "", "non-default HTTPS enrolment coordinator (no credentials)")
 	flags.BoolVar(&remove, "remove", false, "remove the per-user install, keeping data and logs")
 	flags.BoolVar(&purge, "purge", false, "also delete data and logs (requires --remove)")
 	flags.StringVar(&request.from, "from", "", "folder holding wefty, wefty-l1, wefty-l3 and wefty-agent (default: the folder of this wefty)")
@@ -279,12 +298,21 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
-		return usageError("usage: wefty setup [--from DIR] [--node-id ID] | --remove [--purge]")
+		return usageError("usage: wefty setup [--role control-plane] [--from DIR] [--node-id ID] | --remove [--purge]")
+	}
+	var fleetFlag bool
+	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "role" || f.Name == "coordinator-url" || f.Name == "skip-smoke-run" {
+			fleetFlag = true
+		}
+	})
+	if remove && fleetFlag {
+		return usageError("--remove cannot use --role, --coordinator-url or --skip-smoke-run")
 	}
 	if purge && !remove || remove && (request.from != "" || request.nodeID != "") {
 		return usageError("--purge requires --remove; --remove cannot use --from or --node-id")
 	}
-	host, err := realSetupHost()
+	host, err := setupCommandHost()
 	if err != nil {
 		return err
 	}
@@ -314,14 +342,25 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 		}
 		return nil
 	}
+	host.enrolmentOutput = stderr
+	request.fleetCoordinatorURL = options.controlURL
+	if request.fleetCoordinatorURL == "" {
+		request.fleetCoordinatorURL = os.Getenv("TS_CONTROL_URL")
+	}
 	report, err := runSetup(ctx, host, request)
-	if err != nil {
+	if err != nil && len(report.Readiness) == 0 {
 		return err
 	}
+	var writeErr error
 	if options.jsonOutput {
-		return writeJSON(stdout, report)
+		writeErr = writeJSON(stdout, report)
+	} else {
+		writeErr = writeSetupReport(stdout, report)
 	}
-	return writeSetupReport(stdout, report)
+	if writeErr != nil {
+		return writeErr
+	}
+	return err
 }
 
 func realSetupHost() (setupHost, error) {
@@ -379,8 +418,15 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return setupReport{}, err
 	}
-	if err := refuseRecordedFleetRole(paths, "setup"); err != nil {
+	role, err := selectSetupRole(paths, request.role)
+	if err != nil {
 		return setupReport{}, err
+	}
+	if role != serviceplan.Legacy {
+		return runFleetSetup(ctx, host, request, paths, role)
+	}
+	if request.coordinatorURL != "" || request.skipSmokeRun {
+		return setupReport{}, usageError("--coordinator-url and --skip-smoke-run require a fleet role")
 	}
 	if !request.lockHeld {
 		if _, err := os.Stat(paths.data); err == nil {
@@ -964,11 +1010,7 @@ func setupServices(paths setupPaths, profile connprofile.Profile, binaries map[s
 
 // setupRoleServices is the Mac adapter for the platform-neutral named plan.
 func setupRoleServices(paths setupPaths, profile connprofile.Profile, binaries map[string]string, nodeAgentPATH string, role serviceplan.Role) ([]launchagent.Agent, error) {
-	plan, err := serviceplan.Build(role, serviceplan.Paths{
-		Profile: paths.profile, Data: paths.data, Logs: paths.logs,
-		Spool: filepath.Join(paths.home, paths.nodeDataFolders[0]), Managed: filepath.Join(paths.home, paths.nodeDataFolders[1]),
-		ClientSocket: local.DefaultSocketPath(paths.home), NodeShutdownBudget: setupNodeAgentShutdownBudget,
-	})
+	plan, err := setupRolePlan(paths, role)
 	if err != nil {
 		return nil, err
 	}
@@ -1171,6 +1213,17 @@ func setupSkillFilesFrom(paths setupPaths, source fs.FS) ([]setupFile, error) {
 
 func writeSetupReport(writer io.Writer, report setupReport) error {
 	var output strings.Builder
+	if report.Role != serviceplan.Legacy {
+		fmt.Fprintf(&output, "Installation role: %s\n", report.Role)
+		for _, role := range []string{"l1", "l3", "node-agent", "client", "person"} {
+			if name := report.Participants[role]; name != "" {
+				fmt.Fprintf(&output, "%s network name: %s\n", role, name)
+			}
+		}
+		for _, check := range report.Readiness {
+			fmt.Fprintf(&output, "%s: %s (%s)\n", check.Check, check.Status, check.Detail)
+		}
+	}
 	fmt.Fprintf(&output, "This machine is node %s.\n", report.NodeID)
 	fmt.Fprintf(&output, "Connection profile: %s (L1 %s, L3 %s)\n", report.Profile, report.L1Address, report.L3Address)
 	if len(report.Changes) == 0 {
@@ -1188,4 +1241,12 @@ func writeSetupReport(writer io.Writer, report setupReport) error {
 	output.WriteString("Next: run `wefty status` in a new shell.\n")
 	_, err := io.WriteString(writer, output.String())
 	return err
+}
+
+func setupRolePlan(paths setupPaths, role serviceplan.Role) (serviceplan.Plan, error) {
+	return serviceplan.Build(role, serviceplan.Paths{
+		Profile: paths.profile, Data: paths.data, Logs: paths.logs,
+		Spool: filepath.Join(paths.home, paths.nodeDataFolders[0]), Managed: filepath.Join(paths.home, paths.nodeDataFolders[1]),
+		ClientSocket: local.DefaultSocketPath(paths.home), NodeShutdownBudget: setupNodeAgentShutdownBudget,
+	})
 }

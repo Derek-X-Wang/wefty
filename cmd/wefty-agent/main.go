@@ -26,6 +26,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
+	"github.com/Derek-X-Wang/wefty/internal/serviceready"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
@@ -451,6 +452,7 @@ func run() error {
 		oneshotLoadLimit      = flag.Float64("oneshot-load-limit", nodeload.DefaultLimit(), "one-minute load limit for additional one-shot work; 0 disables the load gate (also WEFTY_ONESHOT_LOAD_LIMIT)")
 		maxOneshotSlots       = flag.Int("max-oneshot-slots", l1.DefaultMaxOneshotSlots, "local ceiling for concurrent one-shot attempts")
 		maxServiceSlots       = flag.Int("max-service-slots", l1.DefaultMaxServiceSlots, "local ceiling for concurrent service attempts")
+		readyFile             = flag.String("ready-file", "", "write process metadata after first node registration")
 		logSpoolDirectory     = flag.String("log-spool-dir", "", "durable log spool directory (defaults to the user cache directory)")
 		logSpoolMaxBytes      = flag.Int64("log-spool-max-bytes", agent.DefaultLogSpoolMaxBytes, "maximum unacknowledged one-shot log payload bytes retained on disk (service logs use a 32 MiB ring)")
 		managedRoot           = flag.String("managed-root", managedRootDefault, "persistent state root for agent-managed service resources")
@@ -510,6 +512,7 @@ func run() error {
 	// weaken it. The agent's own state directories resolve against where it
 	// was started, like the control plane's --db (#604).
 	if err := pathflags.Absolutize(
+		pathflags.Flag{Name: "ready-file", Value: readyFile},
 		pathflags.Flag{Name: "log-spool-dir", Value: logSpoolDirectory},
 		pathflags.Flag{Name: "managed-root", Value: managedRoot},
 		pathflags.Flag{Name: "handoff-root", Value: handoffRoot},
@@ -961,9 +964,27 @@ func run() error {
 			return err
 		}, cancel, log.Printf)
 	}()
+	if *readyFile == "" {
+		err = nodeAgent.Run(ctx)
+		cancel()
+		return err
+	}
+	readyDone := make(chan error, 1)
+	go func() {
+		select {
+		case <-ctx.Done():
+			readyDone <- nil
+		case <-nodeAgent.Registered():
+			publishErr := serviceready.Publish(*readyFile, serviceready.Metadata{NodeID: *nodeID, BootSessionID: bootSessionID})
+			if publishErr != nil {
+				cancel()
+			}
+			readyDone <- publishErr
+		}
+	}()
 	err = nodeAgent.Run(ctx)
 	cancel()
-	return err
+	return errors.Join(err, <-readyDone)
 }
 
 // handleShutdownSignals drains on the first signal and cancels resident

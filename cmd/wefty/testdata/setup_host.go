@@ -1,0 +1,121 @@
+package main
+
+// This source is used only by the setup binary test's Go build overlay.
+// It is not part of any shipped package or production build.
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/tsnet/teststate"
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
+	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/l1"
+)
+
+type fixtureEnroller struct{}
+
+func (fixtureEnroller) Enrol(_ context.Context, s fabric.EnrolSpec) (fabric.SelfIdentity, error) {
+	if !strings.HasPrefix(s.Credential.Value, "single-use-") {
+		return fabric.SelfIdentity{}, errors.New("fixture key refused")
+	}
+	if err := teststate.Write(s.StateDirectory); err != nil {
+		return fabric.SelfIdentity{}, err
+	}
+	role := filepath.Base(s.StateDirectory)
+	name, err := fabric.RequestedNetworkName(s.Name)
+	if err != nil {
+		return fabric.SelfIdentity{}, err
+	}
+	return fabric.SelfIdentity{Identity: fabric.Identity{NodeID: "opaque-" + role, Tags: connprofile.ParticipantRoleTags(role), Kind: fabric.IdentityKindMachine}, Name: s.Name, NetworkName: name}, nil
+}
+func (fixtureEnroller) Logout(context.Context, fabric.EnrolSpec) error { return nil }
+
+type fixtureTransport func(*http.Request) (*http.Response, error)
+
+func (f fixtureTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func setupCommandHost() (setupHost, error) {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return setupHost{}, errors.New("fixture needs a temporary home")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return setupHost{}, err
+	}
+	loaded := map[string]bool{}
+	stateFile := filepath.Join(home, "fixture-launchd.json")
+	if b, err := os.ReadFile(stateFile); err == nil {
+		_ = json.Unmarshal(b, &loaded)
+	}
+	run := func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name != launchagent.Launchctl {
+			return nil, errors.New("unexpected fixture runner")
+		}
+		label := filepath.Base(args[len(args)-1])
+		label = strings.TrimSuffix(label, ".plist")
+		switch args[0] {
+		case "print":
+			if !loaded[label] {
+				return nil, launchagent.ErrServiceNotFound
+			}
+			return []byte("service = {\n state = running\n pid = 4242\n}\n"), nil
+		case "enable":
+			return nil, nil
+		case "bootstrap":
+			loaded[label] = true
+			if label != "dev.wefty.client-service" {
+				b := []byte(`{"ready_at":"2026-10-20T12:00:00Z","pid":4242,"address":"opaque-listener","node_id":"studio-0123abcd","boot_session_id":"fixture-boot"}`)
+				if err := os.WriteFile(filepath.Join(home, setupFolders.data, "setup-ready", strings.TrimPrefix(label, "dev.wefty.")+".json"), b, 0600); err != nil {
+					return nil, err
+				}
+			}
+		case "bootout":
+			delete(loaded, label)
+		case "kickstart":
+			loaded[label] = true
+		default:
+			return nil, errors.New("unexpected fixture verb")
+		}
+		b, _ := json.Marshal(loaded)
+		return nil, os.WriteFile(stateFile, b, 0600)
+	}
+	clients := func(_ context.Context, _ setupPaths, p connprofile.Profile) (*apiClients, error) {
+		if os.Getenv("WEFTY_FIXTURE_NOT_READY") == "1" {
+			return nil, errors.New("fixture service unavailable")
+		}
+		rt := fixtureTransport(func(r *http.Request) (*http.Response, error) {
+			var body any
+			status := 200
+			switch {
+			case r.URL.Path == "/v1/nodes":
+				body = l1.NodeList{Nodes: []l1.Node{{NodeRegistration: contract.NodeRegistration{NodeID: p.Identities.Node, BootSessionID: "fixture-boot"}, State: contract.NodeAlive, ClaimsEnabled: true, AuthoritativeTags: []string{contract.StableNodeTagPrefix + p.Identities.Node}, MaxOneshotSlots: 4, MaxServiceSlots: 2}}}
+			case r.URL.Path == "/v1/runs" && r.Method == "GET":
+				body = map[string]any{"runs": []any{}}
+			case r.URL.Path == "/v1/runs" && r.Method == "POST":
+				body, status = map[string]string{"run_id": "fixture-smoke"}, 201
+			case r.URL.Path == "/v1/runs/fixture-smoke":
+				body = contract.RunRecord{RunID: "fixture-smoke", Status: contract.RunSucceeded, NodeID: p.Identities.Node}
+			default:
+				return nil, fmt.Errorf("unexpected fixture request: %s", r.URL.Path)
+			}
+			b, _ := json.Marshal(body)
+			return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(b))}, nil
+		})
+		return &apiClients{l1: &apiClient{name: "L1", address: p.L1Address, client: &http.Client{Transport: rt}}, l3: &apiClient{name: "L3", address: p.L3Address, client: &http.Client{Transport: rt}}, wait: waitForContext}, nil
+	}
+	return setupHost{bootTime: func() (time.Time, error) { return time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), nil }, goos: "darwin", euid: 501, uid: 501, home: home, username: "owner", hostname: "studio", shell: "/bin/sh", executable: exe, launchctl: run, loginShell: func(context.Context, string, ...string) ([]byte, error) {
+		return []byte(setupPATHBegin + "\n/usr/bin:/bin\n" + setupPATHEnd + "\n"), nil
+	}, random: strings.NewReader(strings.Repeat("a", 512)), enroller: fixtureEnroller{}, enrolmentInput: os.Stdin, fleetClients: clients, readinessBudget: 30 * time.Millisecond}, nil
+}

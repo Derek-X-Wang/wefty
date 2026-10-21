@@ -29,6 +29,14 @@ type Config struct {
 
 type CloseFunc func() error
 
+// SavedStateAvailable delegates the state format to the selected adapter.
+func SavedStateAvailable(mode, directory string) bool {
+	if mode == "tsnet" {
+		return tsnet.HasSavedState(directory)
+	}
+	return participantstate.HasSavedState(directory)
+}
+
 type savedParticipant interface {
 	fabric.Fabric
 	VerifyParticipant(context.Context) error

@@ -553,6 +553,10 @@ func (a *Agent) Register(ctx context.Context) (l1.Node, error) {
 	return a.session.register(ctx)
 }
 
+// Registered closes after Run's first successful registration. Observers must
+// still check live node state; this signal is only a process startup point.
+func (a *Agent) Registered() <-chan struct{} { return a.session.registrationSignal() }
+
 // Drain stops new claims locally and marks the current boot session draining
 // at the control plane. Attempts already executing are not canceled; Run
 // returns after both class loops finish their resident attempt, if any.

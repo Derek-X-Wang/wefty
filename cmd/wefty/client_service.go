@@ -120,7 +120,7 @@ func executeClientServiceWithOpener(ctx context.Context, options globalOptions, 
 			return err
 		}
 		check := func(probe context.Context) error {
-			if !hasSavedParticipantState(saved.StateDirectory) {
+			if !fabricconfig.SavedStateAvailable(options.fabricMode, saved.StateDirectory) {
 				return &fabric.ParticipantIdentityError{Person: role == connprofile.ParticipantPerson, Reason: "state is missing"}
 			}
 			if role == connprofile.ParticipantPerson && !saved.KeyExpiry.IsZero() && !time.Now().Before(saved.KeyExpiry) {

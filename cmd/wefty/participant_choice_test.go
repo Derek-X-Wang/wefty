@@ -13,6 +13,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/tsnet/teststate"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 )
 
@@ -129,7 +130,7 @@ func savedChoiceState(t *testing.T, role string) string {
 	if err := os.MkdirAll(folder, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(folder, "saved-state"), []byte("opaque"), 0o600); err != nil {
+	if err := teststate.Write(folder); err != nil {
 		t.Fatal(err)
 	}
 	return folder
@@ -164,7 +165,7 @@ func TestPersonSignInRequiresSavedStateAndHonoursExpiry(t *testing.T) {
 	if got := localPersonSignIn(options, now); got != "not_signed_in" {
 		t.Fatalf("empty state = %s", got)
 	}
-	if err := os.WriteFile(filepath.Join(state, "saved-state"), []byte("opaque"), 0o600); err != nil {
+	if err := teststate.Write(state); err != nil {
 		t.Fatal(err)
 	}
 	if got := localPersonSignIn(options, now); got != "signed_in" {
@@ -191,5 +192,15 @@ func TestLegacyEnvironmentJoinKeyIsCapturedBeforeOpening(t *testing.T) {
 	}
 	if config.AuthKey != "legacy-single-use-key" {
 		t.Fatal("legacy environment join key was not captured explicitly")
+	}
+}
+
+func TestCommandParticipantCoordinatorConflictAdvice(t *testing.T) {
+	options := globalOptions{fabricMode: "tsnet", controlURL: "https://other.example.test", participants: map[string]connprofile.Participant{
+		"client": {Name: "wefty://client/machine-1", StateDirectory: savedChoiceState(t, "client"), NodeID: "client-opaque", CoordinatorURL: "https://coordinator.example.test"},
+	}}
+	_, err := commandFabricConfig(options, []string{"status"})
+	if err == nil || !strings.Contains(err.Error(), "recorded coordinator URL") || !strings.Contains(err.Error(), "unset") || strings.Contains(err.Error(), "retire") || strings.Contains(err.Error(), "not available yet") {
+		t.Fatalf("wrong coordinator recovery advice: %v", err)
 	}
 }

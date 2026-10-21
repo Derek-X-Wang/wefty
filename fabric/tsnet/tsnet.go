@@ -121,7 +121,7 @@ func New(config Config) (*Fabric, error) {
 	}
 	// Recheck saved state after taking ownership. The process-level profile
 	// check alone cannot fence deletion between that check and backend start.
-	if config.ExpectedIdentity != nil && !participantstate.HasSavedState(config.StateDir) {
+	if config.ExpectedIdentity != nil && !HasSavedState(config.StateDir) {
 		if release != nil {
 			_ = release()
 		}

@@ -37,8 +37,7 @@ node commands keep their node-local control-socket path.
 
 `automatic_node_admission` is an optional boolean, false by default. It maps
 to L1's `--automatic-node-admission` flag; an explicit `=false` flag overrides
-a true profile value. It affects only L1's service input digest. Current setup
-does not turn this setting on. L1 refuses to enable it unless the
+a true profile value. It affects only L1's service input digest. Fleet control-plane setup turns this setting on; plain setup does not. L1 refuses to enable it unless the
 Fabric reports authenticated identities through `PersonIdentityTrustProvider`.
 The plain-person development override does not bypass this requirement.
 The setting gates only new admissions. A marked Node keeps its default Pinned
@@ -91,7 +90,13 @@ For tsnet, `participants` records `node-agent`, `client`, optional `person`, and
 on a control-plane machine `l1` and `l3`. Each entry contains `name` (a Wefty
 logical name), `state_directory` (an absolute local folder), `node_id` (an opaque
 Fabric node ID), optional `user_id`, optional `key_expiry` (an RFC 3339 time),
-and optional `network_name` (the checked granted network label, without a domain).
+and optional `network_name` (the checked granted network label, without a domain),
+and `coordinator_url` (a non-default HTTPS coordinator without credentials,
+query or fragment). The saved coordinator is part of the owning service digest.
+For a committed control-plane installation, setup also requires the active
+profile bytes to match the receipt's digest. Profile changes belong to fleet
+upgrade (#901). Complete control-plane validation requires the stable local
+Node's own `node_admission` entry.
 Unknown participant roles, logical names that do not match their role,
 incomplete entries, relative paths, and shared state folders are refused.
 A network name must be a lowercase ASCII DNS label of 1-63 bytes. An absent
@@ -142,7 +147,7 @@ fields are ignored. A client carries its participant node ID and client tag,
 with no person fields. Missing or expired person sign-in produces typed
 `person_identity_required` (exit 3) with participant-specific recovery advice.
 Recovery restores the original saved state or retires the old device and enrols
-a new identity through fleet setup. Public fleet setup is deferred to #900;
+a new identity through fleet setup. Mac control-plane setup is available through `setup --role control-plane`;
 Plain-development identity flags do not repair participant profiles. The CLI
 never falls back to the client. Participant-profile cluster calls use the
 per-user [client service](client-service.md); they never open the saved backend
@@ -213,8 +218,9 @@ hint. Neither shape retries as the person; JSON preserves the server's error
 envelope.
 
 The setup enrolment step is callable independently of service installation.
-The current plain `wefty setup` flow is unchanged. Fleet role flags, service
-configuration for Mac and Linux, and cutover/rollback orchestration are #900.
+The plain `wefty setup` flow is unchanged. Mac control-plane setup uses a durable
+staged profile and ordered publication; joining, Linux and conversion remain
+later #900 slices. See [installation roles](installation-service-plan.md).
 See [Fabric enrolment](fabric-enrolment.md) for the step's contract.
 
 ## Saved-identity service startup
@@ -239,12 +245,18 @@ Missing own records, missing saved state, and mismatching live node IDs or exact
 tags refuse startup with `fabric.ParticipantIdentityError`. Services do not
 start a login or enrolment path. Saved state is checked again while holding the
 participant-folder lock, before backend construction. A lock file alone is not
-saved state. No database or service listener is opened on these refusals.
+saved state. Production participants require the backend's actual private,
+unlinked, regular, nonempty state file; the adapter owns the filename and format.
+No database or service listener is opened on these refusals.
 L1/L3 database-only `--state-preflight` does not open a participant.
 
 Saved service identity is authoritative over bootstrap flags. A join key
-(`--auth-key`, either ambient join-key alias), any control URL override
+(`--auth-key`, either ambient join-key alias), a conflicting coordinator URL
 (`--control-url` or its environment variable), or `--ephemeral=true` is refused.
+An absent override uses the recorded `coordinator_url`; an equal override is
+accepted. A missing record selects the default coordinator and refuses a
+nonempty override. Coordinator conflicts advise using the recorded URL or
+unsetting the conflicting override, without retiring the enrolled identity.
 An explicit name or state folder must match the selected record, including an
 explicit empty folder. A different Fabric mode, explicit plain identity, or
 trusted-peer ID is also refused. Matching name/folder flags and
@@ -278,8 +290,8 @@ explicit role metadata, platform adapter seam, and participant-aware digests.
 
 ## What setup keeps
 
-A rerun keeps every value the profile already has, including the owner's own
-edits, and fills only what is missing. It always sets `identities.node` to the
+A legacy plain rerun keeps every value the profile already has, including the
+owner's own edits, and fills only what is missing. It always sets `identities.node` to the
 node configuration's ID, sets `allow_plain_person_identities`, and makes sure
 `node_admission` admits that node with its reserved `wefty:node:<ID>` tag.
 Each LaunchAgent records a digest of its binary and of exactly the settings

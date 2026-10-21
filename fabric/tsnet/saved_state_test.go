@@ -12,6 +12,9 @@ import (
 
 func TestSavedParticipantRequiresStateWhileHoldingOwnership(t *testing.T) {
 	state := t.TempDir()
+	if err := os.Chmod(state, 0700); err != nil {
+		t.Fatal(err)
+	}
 	backend, err := New(Config{Name: "wefty://client/test", StateDir: state, ExpectedIdentity: &fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}})
 	if backend != nil {
 		defer backend.Close()
@@ -33,7 +36,10 @@ func TestSavedParticipantRequiresStateWhileHoldingOwnership(t *testing.T) {
 func savedBackendState(t *testing.T) string {
 	t.Helper()
 	state := t.TempDir()
-	if err := os.WriteFile(filepath.Join(state, "state"), []byte("saved test backend"), 0o600); err != nil {
+	if err := os.Chmod(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "tailscaled.state"), []byte("saved test backend"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return state

@@ -4,7 +4,6 @@ import (
 	"os"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
-	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 )
 
@@ -22,11 +21,16 @@ func SavedService(profile connprofile.Profile, role string, config Config, expli
 	if saved == nil {
 		return refused("is missing from the profile for " + role)
 	}
+	if connprofile.ValidateCoordinatorURL(saved.CoordinatorURL) != nil {
+		return refused("recorded coordinator URL is invalid")
+	}
 	if config.AuthKey != "" || os.Getenv("TS_AUTHKEY") != "" || os.Getenv("TS_AUTH_KEY") != "" {
 		return refused("cannot start with a join key override")
 	}
-	if config.ControlURL != "" || os.Getenv("TS_CONTROL_URL") != "" {
-		return refused("cannot start with a control URL override")
+	for _, value := range []string{config.ControlURL, os.Getenv("TS_CONTROL_URL")} {
+		if value != "" && value != saved.CoordinatorURL {
+			return Config{}, &fabric.ParticipantIdentityError{Person: role == connprofile.ParticipantPerson, CoordinatorConflict: true, Reason: "coordinator URL override conflicts with its record"}
+		}
 	}
 	if config.Ephemeral {
 		return refused("cannot start with an ephemeral lifetime")
@@ -43,14 +47,14 @@ func SavedService(profile connprofile.Profile, role string, config Config, expli
 	if profile.Fabric != "" && config.Mode != profile.Fabric {
 		return refused("Fabric mode override conflicts with its profile")
 	}
-	if !participantstate.HasSavedState(saved.StateDirectory) {
+	if !SavedStateAvailable(config.Mode, saved.StateDirectory) {
 		return refused("state is missing; restore this participant's original saved state")
 	}
 	config.Name, config.StateDirectory = saved.Name, saved.StateDirectory
 	config.NetworkName = saved.NetworkName
 	config.Identity = saved.ExpectedIdentity
 	config.ExpectedIdentity = &saved.ExpectedIdentity
-	config.AuthKey, config.ControlURL = "", ""
+	config.AuthKey, config.ControlURL = "", saved.CoordinatorURL
 	config.Ephemeral = false
 	return config, nil
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
+	"github.com/Derek-X-Wang/wefty/internal/serviceready"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -248,22 +249,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if *readyFile != "" {
-		metadata := struct {
-			Address string `json:"address"`
-		}{Address: listener.Addr().String()}
-		payload, err := json.Marshal(metadata)
-		if err != nil {
-			return err
-		}
-		temporaryReadyFile := *readyFile + ".tmp"
-		if err := os.WriteFile(temporaryReadyFile, payload, 0o600); err != nil {
-			return fmt.Errorf("write ready file: %w", err)
-		}
-		if err := os.Rename(temporaryReadyFile, *readyFile); err != nil {
-			return fmt.Errorf("publish ready file: %w", err)
-		}
+	if err := serviceready.Publish(*readyFile, serviceready.Metadata{Address: listener.Addr().String()}); err != nil {
+		return err
 	}
+
 	log.Printf("listening on %s", listener.Addr())
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

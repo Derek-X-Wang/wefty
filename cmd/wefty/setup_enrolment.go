@@ -31,12 +31,17 @@ type setupEnrolmentRequest struct {
 	output                  io.Writer
 	loginURL                func(string)
 	controlURL              string
+	afterSaved              func(string) error
+	deferNotices            bool
 }
 
 // enrolSetupParticipants is the setup step fleet role wiring (#900) can call.
 // It starts no services and no local listener. The caller must stop existing
 // services before a cutover; a rerun never starts an enrolled participant.
 func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) (connprofile.Profile, error) {
+	if err := connprofile.ValidateCoordinatorURL(request.controlURL); err != nil {
+		return connprofile.Profile{}, err
+	}
 	if err := tsnet.ClearAmbientCredentials(); err != nil {
 		return connprofile.Profile{}, err
 	}
@@ -119,7 +124,10 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			if saved.Name != participant.name || saved.StateDirectory != stateDir {
 				return profile, fmt.Errorf("saved %s participant differs; setup will not rebind its identity", participant.role)
 			}
-			if !hasSavedParticipantState(stateDir) {
+			if saved.CoordinatorURL != request.controlURL {
+				return profile, fmt.Errorf("saved %s coordinator differs; setup will not rebind its identity", participant.role)
+			}
+			if !tsnet.HasSavedState(stateDir) {
 				return profile, fmt.Errorf("saved %s participant state is missing; restore its original saved state, or retire the old device and remove its stale participant record before enrolling a new identity", participant.role)
 			}
 			if err := root.Chmod(stateRel, 0o700); err != nil {
@@ -127,17 +135,21 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			}
 			continue
 		}
-		if _, err := os.ReadDir(stateDir); err == nil && hasSavedParticipantState(stateDir) {
-			return profile, fmt.Errorf("unrecorded state for %s; inspect it before enrolling", participant.role)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		if _, err := root.Lstat(stateRel); err == nil {
+			// A crash during enrolment can leave this folder. Only the owner can
+			// tell a leftover from another identity, so setup never deletes it.
+			return profile, fmt.Errorf("an unrecorded identity folder exists for %s (data folder fabric/%s); if it is left over from an interrupted setup and no wefty process is running, remove that folder and rerun setup; otherwise keep it and stop", participant.role, filepath.Base(stateRel))
+		} else if !errors.Is(err, os.ErrNotExist) {
 			return profile, err
 		}
-		if err := root.MkdirAll(stateRel, 0o700); err != nil {
-			return profile, err
+	}
+	// Validate every participant before consuming any single-use credential.
+	for _, participant := range request.participants {
+		if _, saved := profile.Participants[participant.role]; saved {
+			continue
 		}
-		if err := root.Chmod(stateRel, 0o700); err != nil {
-			return profile, err
-		}
+		stateRel := filepath.Join(dataRel, "fabric", participant.role)
+		stateDir := filepath.Join(request.home, stateRel)
 		spec := fabric.EnrolSpec{Name: participant.name, StateDirectory: stateDir, CoordinatorURL: request.controlURL}
 		requestedNetworkName, err := fabric.RequestedNetworkName(spec.Name)
 		if err != nil {
@@ -151,6 +163,12 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 				return profile, err
 			}
 			spec.Credential.Value = key
+		}
+		if err := root.MkdirAll(stateRel, 0o700); err != nil {
+			return profile, err
+		}
+		if err := root.Chmod(stateRel, 0o700); err != nil {
+			return profile, err
 		}
 		self, enrolErr := request.enroller.Enrol(ctx, spec)
 		key := spec.Credential.Value
@@ -173,6 +191,9 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return scrubSetupEnrolmentError(errors.Join(cause, logoutErr, removeErr), key)
 		}
 		if enrolErr == nil {
+			if !tsnet.HasSavedState(stateDir) {
+				enrolErr = errors.New("enrolment did not save private backend state")
+			}
 			_, expected, _ := setupParticipantPolicy(participant.role)
 			actual := slices.Clone(self.Tags)
 			slices.Sort(actual)
@@ -195,7 +216,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, rollback(enrolErr)
 		}
 		previousL1, previousL3 := profile.L1Address, profile.L3Address
-		profile.Participants[participant.role] = connprofile.Participant{Name: self.Name, NetworkName: self.NetworkName, StateDirectory: stateDir, NodeID: self.NodeID, UserID: self.UserID, KeyExpiry: self.KeyExpiry}
+		profile.Participants[participant.role] = connprofile.Participant{Name: self.Name, NetworkName: self.NetworkName, StateDirectory: stateDir, NodeID: self.NodeID, UserID: self.UserID, KeyExpiry: self.KeyExpiry, CoordinatorURL: request.controlURL}
 		if participant.role == connprofile.ParticipantL1 {
 			profile.L1Address = self.NodeID
 		}
@@ -225,8 +246,13 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			profile.L1Address, profile.L3Address = previousL1, previousL3
 			return profile, rollback(err)
 		}
-		if self.NetworkName != requestedNetworkName {
+		if self.NetworkName != requestedNetworkName && !request.deferNotices {
 			if _, err := fmt.Fprintf(request.output, "The network gave %s because %s is taken; retire the stale device to free the name.\n", self.NetworkName, requestedNetworkName); err != nil {
+				return profile, err
+			}
+		}
+		if request.afterSaved != nil {
+			if err := request.afterSaved(participant.role); err != nil {
 				return profile, err
 			}
 		}
