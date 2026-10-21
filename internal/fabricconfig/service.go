@@ -47,6 +47,7 @@ func SavedService(profile connprofile.Profile, role string, config Config, expli
 		return refused("state is missing; restore this participant's original saved state")
 	}
 	config.Name, config.StateDirectory = saved.Name, saved.StateDirectory
+	config.NetworkName = saved.NetworkName
 	config.Identity = saved.ExpectedIdentity
 	config.ExpectedIdentity = &saved.ExpectedIdentity
 	config.AuthKey, config.ControlURL = "", ""

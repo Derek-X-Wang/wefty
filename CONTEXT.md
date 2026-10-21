@@ -264,6 +264,12 @@ The stable, memorable, wefty-owned name presented as the primary handle for a
 Computer connection. It is the Computer name supplied by the operator.
 _Avoid_: connect host, hostname, network name, display name
 
+**Network name**:
+The network-granted label for one Fabric participant. New participants request
+a readable name in the `wefty-` namespace; the network may add a collision
+suffix. It is a connection hint, never identity or authority.
+_Avoid_: Node ID, Computer name, friendly name, provider domain
+
 **Connect host**:
 The raw Fabric-produced address used to reach a published listener. It is a
 secondary connection field and never identity, authority, or a primary handle.

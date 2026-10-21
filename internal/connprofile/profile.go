@@ -70,9 +70,11 @@ type Profile struct {
 	AutomaticNodeAdmission bool `json:"automatic_node_admission,omitempty"`
 }
 
-// Participant records only Wefty names, local state paths and opaque identity
-// fields. Join credentials are never part of the connection profile.
+// Participant records logical and granted network names, local state paths
+// and opaque identity fields. Join credentials never enter the profile.
 type Participant struct {
+	// NetworkName is the checked network grant. Absent records keep legacy names.
+	NetworkName    string    `json:"network_name,omitempty"`
 	Name           string    `json:"name"`
 	StateDirectory string    `json:"state_directory"`
 	NodeID         string    `json:"node_id"`
@@ -150,6 +152,11 @@ func (p Profile) Validate() error {
 	seen := make(map[string]bool, len(p.NodeAdmission))
 	stateFolders := make(map[string]bool)
 	for role, participant := range p.Participants {
+		if participant.NetworkName != "" {
+			if err := fabric.ValidateNetworkName(participant.NetworkName); err != nil {
+				return fmt.Errorf("connection profile: participant %s: %w", role, err)
+			}
+		}
 		if err := ValidateParticipantName(role, participant.Name); err != nil {
 			return err
 		}

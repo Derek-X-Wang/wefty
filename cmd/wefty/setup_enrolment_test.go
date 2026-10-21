@@ -20,11 +20,12 @@ import (
 )
 
 type fakeSetupEnroller struct {
-	roles               []string
-	keys                []string
-	loggedOut           []string
-	wrongTag, wrongName string
-	afterEnrol          func() error
+	roles                []string
+	keys                 []string
+	loggedOut            []string
+	wrongTag, wrongName  string
+	rejectedNetworkGrant string
+	afterEnrol           func() error
 }
 
 func (e *fakeSetupEnroller) Enrol(_ context.Context, spec fabric.EnrolSpec) (fabric.SelfIdentity, error) {
@@ -34,7 +35,11 @@ func (e *fakeSetupEnroller) Enrol(_ context.Context, spec fabric.EnrolSpec) (fab
 	if err := os.WriteFile(filepath.Join(spec.StateDirectory, "saved-identity"), []byte("opaque-saved-state"), 0o600); err != nil {
 		return fabric.SelfIdentity{}, err
 	}
-	identity := fabric.SelfIdentity{Identity: fabric.Identity{NodeID: "opaque-" + role, DeviceID: "opaque-" + role, Kind: fabric.IdentityKindMachine}, Name: spec.Name}
+	networkName, err := fabric.RequestedNetworkName(spec.Name)
+	if err != nil {
+		return fabric.SelfIdentity{}, err
+	}
+	identity := fabric.SelfIdentity{Identity: fabric.Identity{NodeID: "opaque-" + role, DeviceID: "opaque-" + role, Kind: fabric.IdentityKindMachine}, Name: spec.Name, NetworkName: networkName}
 	switch role {
 	case "node-agent":
 		identity.Tags = []string{"tag:wefty-agent"}
@@ -48,6 +53,9 @@ func (e *fakeSetupEnroller) Enrol(_ context.Context, spec fabric.EnrolSpec) (fab
 			return fabric.SelfIdentity{}, errors.New("person login callback missing")
 		}
 		spec.LoginURL("https://login.invalid/one-use")
+	}
+	if role == e.rejectedNetworkGrant {
+		return fabric.SelfIdentity{}, fabric.ErrGrantedNameMismatch
 	}
 	if role == e.wrongTag {
 		identity.Tags = []string{"tag:wefty-control"}
@@ -185,7 +193,7 @@ func (r failingSetupKeyInput) Read([]byte) (int, error) {
 }
 
 func TestSetupRollsBackWrongParticipantTagsOrGrantedName(t *testing.T) {
-	for _, mismatch := range []string{"tags", "name"} {
+	for _, mismatch := range []string{"tags", "name", "network-grant"} {
 		t.Run(mismatch, func(t *testing.T) {
 			f := newSetupFixture(t)
 			paths, err := resolveSetupPaths(f.home)
@@ -195,6 +203,8 @@ func TestSetupRollsBackWrongParticipantTagsOrGrantedName(t *testing.T) {
 			e := &fakeSetupEnroller{}
 			if mismatch == "tags" {
 				e.wrongTag = "client"
+			} else if mismatch == "network-grant" {
+				e.rejectedNetworkGrant = "client"
 			} else {
 				e.wrongName = "client"
 			}
@@ -204,6 +214,9 @@ func TestSetupRollsBackWrongParticipantTagsOrGrantedName(t *testing.T) {
 			})
 			if err == nil {
 				t.Fatal("mismatch accepted")
+			}
+			if mismatch == "network-grant" && !errors.Is(err, fabric.ErrGrantedNameMismatch) {
+				t.Fatalf("network rejection lost: %v", err)
 			}
 			if !slices.Equal(e.roles, []string{"node-agent", "client"}) || !slices.Equal(e.loggedOut, []string{"client"}) {
 				t.Fatalf("rollback roles=%v logout=%v", e.roles, e.loggedOut)
@@ -366,4 +379,87 @@ func TestRollbackRefusesNewOwnerAfterLogoutCloses(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.state, "new-owner")); err != nil {
 		t.Fatalf("rollback deleted new owner's state: %v", err)
 	}
+}
+
+// A grant is authenticated and checked by the enroller. Setup must persist
+// the returned grant, including the coordinator's collision suffix.
+func TestSetupRecordsGrantedNetworkNameAndPreservesLegacy(t *testing.T) {
+	for _, grant := range []string{"wefty-studio-client", "wefty-studio-client-2", "", "Bad.Name"} {
+		t.Run(grant, func(t *testing.T) {
+			f := newSetupFixture(t)
+			paths, err := resolveSetupPaths(f.home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e := &networkNameSetupEnroller{grant: grant}
+			var report bytes.Buffer
+			request := setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"client", "wefty://client/studio-0123abcd"}}, enroller: e, input: strings.NewReader("fake-key\n"), output: &report}
+			profile, err := enrolSetupParticipants(t.Context(), request)
+			if grant == "" || grant == "Bad.Name" {
+				if !errors.Is(err, fabric.ErrGrantedNameMismatch) || !slices.Equal(e.loggedOut, []string{"client"}) {
+					t.Fatalf("invalid grant: err=%v logout=%v", err, e.loggedOut)
+				}
+				if len(profile.Participants) != 0 {
+					t.Fatal("invalid grant recorded")
+				}
+				if _, err := os.Stat(filepath.Join(paths.data, "fabric", "client")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("invalid participant state remains: %v", err)
+				}
+				if _, err := os.Stat(paths.profile); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("invalid profile published: %v", err)
+				}
+				if strings.Contains(report.String(), "The network gave") {
+					t.Fatal("invalid grant reported as success")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if grant == "wefty-studio-client-2" {
+				want := "The network gave wefty-studio-client-2 because wefty-studio-client is taken; retire the stale device to free the name.\n"
+				if strings.Count(report.String(), want) != 1 || strings.Contains(report.String(), "fake-key") {
+					t.Fatalf("collision report=%q", report.String())
+				}
+			} else if strings.Contains(report.String(), "The network gave") {
+				t.Fatalf("exact grant reported as collision: %q", report.String())
+			}
+			// Observe the persisted public format, not the fake's returned identity.
+			raw, err := os.ReadFile(paths.profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(raw, []byte(`"network_name": "`+grant+`"`)) {
+				t.Fatalf("grant missing from saved profile: %s", raw)
+			}
+			// A saved record from before readable names must remain absent on rerun.
+			saved := profile.Participants["client"]
+			saved.NetworkName = ""
+			profile.Participants["client"] = saved
+			if err := connprofile.Write(paths.profile, profile); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := os.ReadFile(paths.profile)
+			report.Reset()
+			request.input = failingSetupKeyInput{t}
+			if _, err := enrolSetupParticipants(t.Context(), request); err != nil {
+				t.Fatal(err)
+			}
+			after, _ := os.ReadFile(paths.profile)
+			if !bytes.Equal(before, after) || len(e.roles) != 1 || report.Len() != 0 {
+				t.Fatal("rerun renamed or reopened saved participant")
+			}
+		})
+	}
+}
+
+type networkNameSetupEnroller struct {
+	fakeSetupEnroller
+	grant string
+}
+
+func (e *networkNameSetupEnroller) Enrol(ctx context.Context, spec fabric.EnrolSpec) (fabric.SelfIdentity, error) {
+	self, err := e.fakeSetupEnroller.Enrol(ctx, spec)
+	self.NetworkName = e.grant
+	return self, err
 }

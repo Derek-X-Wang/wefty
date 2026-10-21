@@ -46,12 +46,12 @@ func TestEnrolWaitsForRunningAndTranslatesSelfIdentity(t *testing.T) {
 	for _, person := range []bool{false, true} {
 		t.Run(map[bool]string{false: "machine", true: "person"}[person], func(t *testing.T) {
 			spec := fabric.EnrolSpec{Name: "wefty://control-plane", StateDirectory: t.TempDir(), Credential: fabric.Credential{Value: "one-use-key"}}
-			status := `{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"identity-domain"},"Self":{"ID":"opaque-device","HostName":"control-plane","DNSName":"control-plane.identity-domain.","TailscaleIPs":["100.64.0.1"],"Tags":["tag:wefty-control"]}}`
+			status := `{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"identity-domain"},"Self":{"ID":"opaque-device","HostName":"control-plane","DNSName":"wefty-control-plane.identity-domain.","TailscaleIPs":["100.64.0.1"],"Tags":["tag:wefty-control"]}}`
 			var loginURL string
 			if person {
 				spec.Name, spec.Credential = "wefty://person/runner-1", fabric.Credential{}
 				spec.LoginURL = func(url string) { loginURL = url }
-				status = `{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"identity-domain"},"Self":{"ID":"opaque-person","DNSName":"person-a28bbc963ccacc17.identity-domain.","TailscaleIPs":["100.64.0.2"],"UserID":42,"KeyExpiry":"2027-01-01T00:00:00Z"}}`
+				status = `{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"identity-domain"},"Self":{"ID":"opaque-person","DNSName":"wefty-runner-1-person.identity-domain.","TailscaleIPs":["100.64.0.2"],"UserID":42,"KeyExpiry":"2027-01-01T00:00:00Z"}}`
 			}
 			starting, running := ipn.Starting, ipn.Running
 			url := "https://login.invalid/one-use"
@@ -116,5 +116,45 @@ func TestEnrolRejectsGrantedNameCollisionAndScrubsKeyErrors(t *testing.T) {
 		if collision && !errors.Is(err, fabric.ErrGrantedNameMismatch) {
 			t.Fatalf("collision = %v", err)
 		}
+	}
+}
+
+func TestEnrolReadableNetworkName(t *testing.T) {
+	for _, tc := range []struct {
+		grant string
+		ok    bool
+	}{
+		{"wefty-studio", true}, {"wefty-studio-1", true}, {"wefty-studio-12", true},
+		{"studio", false}, {"wefty-other", false}, {"wefty-studio-0", false},
+		{"wefty-studio-01", false}, {"wefty-studio-x", false}, {"wefty-studio-1-extra", false},
+		{"wefty-studio-", false}, {"wefty-studio-+1", false},
+		{"wefty-studio-" + strings.Repeat("1", 51), false},
+	} {
+		t.Run(tc.grant, func(t *testing.T) {
+			node := &fakeEnrolNode{client: &local.Client{OmitAuth: true, Transport: identityRoundTripper(func(r *http.Request) (*http.Response, error) {
+				body := `{"State":6}`
+				if r.URL.Path == "/localapi/v0/status" {
+					body = `{"BackendState":"Running","CurrentTailnet":{"MagicDNSSuffix":"identity-domain"},"Self":{"ID":"opaque-device","HostName":"wefty-studio","DNSName":"` + tc.grant + `.identity-domain.","TailscaleIPs":["100.64.0.1"],"Tags":["tag:wefty-agent"]}}`
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+			})}}
+			enroller := Enroller{newNode: func(config Config) (enrolNode, error) {
+				if config.NetworkName != "wefty-studio" {
+					t.Errorf("requested name=%q", config.NetworkName)
+				}
+				return node, nil
+			}}
+			self, err := enroller.Enrol(t.Context(), fabric.EnrolSpec{Name: "wefty://node/studio-0123abcd", StateDirectory: t.TempDir(), Credential: fabric.Credential{Value: "fake-key"}})
+			if !node.closed {
+				t.Fatal("backend remained open")
+			}
+			if tc.ok {
+				if err != nil || self.NetworkName != tc.grant || self.Name != "wefty://node/studio-0123abcd" {
+					t.Fatalf("self=%+v err=%v", self, err)
+				}
+			} else if !errors.Is(err, fabric.ErrGrantedNameMismatch) {
+				t.Fatalf("unexpected grant accepted: %+v err=%v", self, err)
+			}
+		})
 	}
 }

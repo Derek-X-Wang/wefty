@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -45,6 +46,14 @@ func (f *Fabric) checkParticipant(ctx context.Context) error {
 	expected, self := f.expectedIdentity, status.Self
 	if self == nil || string(self.ID) != expected.NodeID {
 		return f.identityError("does not match the recorded node ID")
+	}
+	// Only a node agent advertises its name to other machines. Elsewhere the
+	// name reaches nobody, so a renamed device must not stop the service.
+	if f.recordedNetworkName != "" && f.localName.AdvertisesNetworkName() {
+		granted, _, _ := strings.Cut(strings.TrimSuffix(self.DNSName, "."), ".")
+		if granted != f.recordedNetworkName {
+			return f.identityError("network name differs from its record; restore the recorded name on the network or re-record the granted name in the connection profile")
+		}
 	}
 	if self.Expired {
 		return f.identityError("has an expired node identity")

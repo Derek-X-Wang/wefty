@@ -90,16 +90,42 @@ has no `control_socket`; see [agent-local-lifecycle](agent-local-lifecycle.md)).
 For tsnet, `participants` records `node-agent`, `client`, optional `person`, and
 on a control-plane machine `l1` and `l3`. Each entry contains `name` (a Wefty
 logical name), `state_directory` (an absolute local folder), `node_id` (an opaque
-Fabric node ID), optional `user_id`, and optional `key_expiry` (an RFC 3339 time).
+Fabric node ID), optional `user_id`, optional `key_expiry` (an RFC 3339 time),
+and optional `network_name` (the checked granted network label, without a domain).
 Unknown participant roles, logical names that do not match their role,
 incomplete entries, relative paths, and shared state folders are refused.
+A network name must be a lowercase ASCII DNS label of 1-63 bytes. An absent
+`network_name` preserves the original hashed mapping (or the original fixed
+control-service label); no existing participant is renamed. New enrolments
+record the granted readable name, including a coordinator collision suffix.
+When a saved node agent has a recorded network name, startup and each
+participant check compare it with the current grant from authenticated status,
+because the node agent advertises that name to other machines as its connect
+host. A different or missing grant is a typed participant identity refusal,
+before transport or listener use. The owner must restore the recorded name on
+the network or explicitly re-record the grant in the connection profile. Wefty
+never silently updates it or publishes a stale name after a failed check.
+Other participants are never reached by name, so a renamed L1, L3, client or
+person device keeps working.
+Absent network names retain the previous name-check behavior.
+Older binaries that reject unknown fields cannot read the added field.
 Service names must be exact; a suffix such as `control-plane-x` is invalid. State folders are `<data>/fabric/<participant>/`, mode `0700`.
 
 The names are `wefty://node/<id>`, `wefty://client/<id>`,
 `wefty://person/<id>`, `wefty://control-plane`, and `wefty://run-ledger`.
 `l1_address` and `l3_address` hold the corresponding opaque enrolled node IDs.
 The Fabric resolves those IDs internally; callers must not parse them or
-replace them with private network names. No join key or login URL is stored.
+replace them with network names. A backend started from a saved participant
+record refuses every logical `wefty://` dial target with a typed destination
+refusal, including the control-plane and run-ledger defaults. This also applies
+to saved records without `network_name`: an empty address or a logical flag
+override cannot route fleet traffic to a device holding a legacy label.
+Legacy tsnet callers without a saved participant retain logical dialing.
+Profile validation permits empty endpoint fields while setup records each
+staged enrolment; the refusal is enforced at the outbound Fabric dial seam.
+Node registration and Computer front doors use the agent-registered
+`ConnectHost`, which reuses the recorded network name.
+No join key or login URL is stored.
 
 The profile's shape selects the identity rule at one CLI decision point.
 A **legacy profile** has no participant records. It retains the base request
@@ -272,3 +298,9 @@ Setup also records installed file digests in `~/.config/wefty/setup-files.json`
 (mode `0600`). Removal uses these digests to preserve binaries, plists and skills the owner
 replaced or edited. Regular profile and node configuration files are removed
 even after owner edits; links remain. See [plain-node-maintenance](plain-node-maintenance.md).
+
+A participant's `network_name` is part of its owning service's input digest.
+Changing it restarts only that owner (client and person share the client
+service), even for L1 or L3: peer authorization still uses unchanged opaque IDs.
+Absent fields preserve the old profile, digest and service-rendering bytes.
+See [Fabric participant enrolment](fabric-enrolment.md) for the slug and grant rules.

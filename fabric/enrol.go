@@ -16,13 +16,14 @@ type EnrolSpec struct {
 	LoginURL       func(string) `json:"-"`
 }
 
-// SelfIdentity is authenticated local enrolment evidence. Name is the granted
-// Wefty logical name after the implementation checks its private host name.
-// Neither private transport names nor provider types cross this boundary.
+// SelfIdentity is authenticated local enrolment evidence. Name is the Wefty
+// logical name; NetworkName is the checked label granted by the network.
+// Provider-specific domains and types stay behind the Fabric seam.
 type SelfIdentity struct {
 	Identity
-	Name      string
-	KeyExpiry time.Time
+	Name        string
+	NetworkName string
+	KeyExpiry   time.Time
 }
 
 var ErrGrantedNameMismatch = errors.New("fabric granted a different participant name; retire the stale device before enrolling again")

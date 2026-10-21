@@ -1,5 +1,5 @@
-// Package naming owns the implementation details of wefty logical addresses.
-// It is internal so concrete network names never become part of the seam.
+// Package naming owns Wefty logical addresses and network-label derivation.
+// Its representation stays behind the public Fabric helpers.
 package naming
 
 import (
@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -74,7 +75,55 @@ func (n Name) Hostname() string {
 	return fmt.Sprintf("%s-%x", n.kind, sum[:8])
 }
 
+// AdvertisesNetworkName reports whether other machines reach this participant
+// by its network name: only a node agent registers it as its connect host.
+func (n Name) AdvertisesNetworkName() bool { return n.kind == "node" }
+
 // TransportAddress returns the private transport target for a logical name.
 func (n Name) TransportAddress() string {
 	return net.JoinHostPort(n.Hostname(), servicePort)
 }
+
+// ReadableHostname requests a namespaced machine-first label for a new
+// participant. Hostname deliberately remains the legacy saved-state mapping.
+func (n Name) ReadableHostname() string {
+	switch n.kind {
+	case "control-plane", "run-ledger":
+		return "wefty-" + n.kind
+	}
+	suffix := ""
+	if n.kind != "node" {
+		suffix = "-" + n.kind
+	}
+	machine := n.nodeID
+	if len(machine) <= 41 && setupNodeID.MatchString(machine) {
+		machine = machine[:len(machine)-9]
+	}
+	var slug strings.Builder
+	for _, r := range strings.ToLower(machine) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			slug.WriteRune(r)
+		} else if slug.Len() > 0 && !strings.HasSuffix(slug.String(), "-") {
+			slug.WriteByte('-')
+		}
+	}
+	base := strings.Trim(slug.String(), "-")
+	if base == "" {
+		base = "machine"
+	}
+	limit := 63 - len("wefty-") - len(suffix)
+	reserved := base == "control-plane" || base == "run-ledger" || strings.HasSuffix(base, "-client") || strings.HasSuffix(base, "-person")
+	if base != machine || len(base) > limit || reserved {
+		sum := sha256.Sum256([]byte(n.nodeID))
+		hash := fmt.Sprintf("-%x", sum[:4])
+		if len(base) > limit-len(hash) {
+			base = strings.TrimRight(base[:limit-len(hash)], "-")
+		}
+		base += hash
+	}
+	return "wefty-" + base + suffix
+}
+
+// Setup emits 1-32 lowercase alphanumeric characters with single internal
+// hyphens, then a random eight-hex suffix. Other IDs retain their whole input.
+var setupNodeID = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9]|-[a-z0-9]){0,31}-[0-9a-f]{8}$`)

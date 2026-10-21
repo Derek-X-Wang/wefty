@@ -48,8 +48,8 @@ func (e Enroller) node(config Config) (enrolNode, error) {
 
 // Enrol holds the join credential only in memory and waits for Running. A
 // person has no credential and receives login URLs only through its explicit
-// callback. The returned name is logical, after checking the granted DNS label
-// inside this package; a collision never escapes as a usable enrolment.
+// callback. The granted network label is checked against the readable request
+// before crossing the seam, including the coordinator collision suffix.
 func Enrol(ctx context.Context, spec fabric.EnrolSpec) (fabric.SelfIdentity, error) {
 	return (Enroller{}).Enrol(ctx, spec)
 }
@@ -73,7 +73,7 @@ func (e Enroller) Enrol(ctx context.Context, spec fabric.EnrolSpec) (self fabric
 	if spec.Credential.Value == "" && spec.LoginURL == nil {
 		return self, errors.New("enrolment requires a join credential or person login callback")
 	}
-	node, err := e.node(Config{Name: spec.Name, StateDir: spec.StateDirectory, Credential: spec.Credential, CoordinatorURL: spec.CoordinatorURL, Logf: func(string, ...any) {}})
+	node, err := e.node(Config{Name: spec.Name, NetworkName: name.ReadableHostname(), StateDir: spec.StateDirectory, Credential: spec.Credential, CoordinatorURL: spec.CoordinatorURL, Logf: func(string, ...any) {}})
 	if err != nil {
 		return self, err
 	}
@@ -123,13 +123,13 @@ func selfIdentityFromStatus(status *ipnstate.Status, name naming.Name) (fabric.S
 	// HostName is merely the requested label. DNSName is the granted unique
 	// label: a stale device can make it differ even when HostName matches.
 	granted, _, _ := strings.Cut(strings.TrimSuffix(peer.DNSName, "."), ".")
-	if granted != name.Hostname() {
+	if !acceptedNetworkGrant(name.ReadableHostname(), granted) {
 		return fabric.SelfIdentity{}, fabric.ErrGrantedNameMismatch
 	}
 	if status.CurrentTailnet == nil || status.CurrentTailnet.MagicDNSSuffix == "" {
 		return fabric.SelfIdentity{}, fabric.ErrIssuingFabricUnavailable
 	}
-	self := fabric.SelfIdentity{Identity: fabric.Identity{NodeID: string(peer.ID), DeviceID: string(peer.ID)}, Name: name.String()}
+	self := fabric.SelfIdentity{Identity: fabric.Identity{NodeID: string(peer.ID), DeviceID: string(peer.ID)}, Name: name.String(), NetworkName: granted}
 	if peer.Tags != nil {
 		self.Tags = append([]string(nil), peer.Tags.AsSlice()...)
 	}
@@ -156,7 +156,11 @@ func (e Enroller) Logout(ctx context.Context, spec fabric.EnrolSpec) (result err
 	if err := ClearAmbientCredentials(); err != nil {
 		return err
 	}
-	node, err := e.node(Config{Name: spec.Name, StateDir: spec.StateDirectory, CoordinatorURL: spec.CoordinatorURL, Logf: func(string, ...any) {}})
+	requested, err := fabric.RequestedNetworkName(spec.Name)
+	if err != nil {
+		return err
+	}
+	node, err := e.node(Config{Name: spec.Name, NetworkName: requested, StateDir: spec.StateDirectory, CoordinatorURL: spec.CoordinatorURL, Logf: func(string, ...any) {}})
 	if err != nil {
 		return err
 	}
@@ -185,3 +189,26 @@ func (n *lockedEnrolNode) Close() error { return errors.Join(n.enrolNode.Close()
 type ownedEnrolNode struct{ *Fabric }
 
 func (n *ownedEnrolNode) LocalClient() (*local.Client, error) { return n.localClient() }
+
+// The coordinator assigns DNSName; the embedded backend does not allocate it.
+// Its documented de-duplication form is <requested>-1, -2, ...:
+// https://tailscale.com/docs/concepts/machine-names#machine-name-conflicts
+// Do not accept arbitrary renames or a match on the requested HostName alone.
+func acceptedNetworkGrant(requested, granted string) bool {
+	if fabric.ValidateNetworkName(granted) != nil {
+		return false
+	}
+	if granted == requested {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(granted, requested+"-")
+	if !ok || len(suffix) == 0 || suffix[0] < '1' || suffix[0] > '9' {
+		return false
+	}
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}

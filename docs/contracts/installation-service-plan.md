@@ -50,7 +50,8 @@ Every service projection includes `participant_profile: true` when any participa
 record exists. Legacy projections omit this marker. Adding the first record
 therefore invalidates every service, even those whose own record is still absent:
 their startup rule has changed to strict refusal.
-L1, L3, and the node agent include their own participant's name, state folder,
+L1, L3, and the node agent include their own participant's logical name,
+optional granted network name, state folder,
 opaque node ID, expected exact tags, and saved expiry. The client service includes
 its client and optional person records and expectations. A folder/name change
 restarts only its owning service. A client or person identity change affects only
