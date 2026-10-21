@@ -583,9 +583,17 @@ func (runtime *stopObservingAgentRuntime) StopOCIRuntime(ctx context.Context) er
 	return runtime.Agent.StopOCIRuntime(ctx)
 }
 
+// mainTestNodeWait bounds waitForMainTestNode. The wait returns as soon as L1
+// shows the expected node, so the long bound only matters when a busy machine
+// running the full suite delays the agent's first registration (#1097).
+const (
+	mainTestNodeWait = 30 * time.Second
+	mainTestNodePoll = 10 * time.Millisecond
+)
+
 func waitForMainTestNode(t *testing.T, store *l1.Store, nodeID string, predicate func(l1.Node) bool) l1.Node {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(mainTestNodeWait)
 	for time.Now().Before(deadline) {
 		nodes, err := store.ListNodes(t.Context())
 		if err == nil {
@@ -595,7 +603,7 @@ func waitForMainTestNode(t *testing.T, store *l1.Store, nodeID string, predicate
 				}
 			}
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(mainTestNodePoll)
 	}
 	nodes, _ := store.ListNodes(t.Context())
 	t.Fatalf("node %q did not reach capability predicate: %+v", nodeID, nodes)
