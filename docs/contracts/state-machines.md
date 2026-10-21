@@ -1636,6 +1636,11 @@ recorded state.
 
 The remaining Node facts retain their recorded meaning:
 
+- `automatically_admitted`, when true, records first-registration admission
+  through the owner's opt-in enrolled-agent policy. It persists independently
+  of claims intent and is omitted when false. See
+  [automatic Node admission](lease-fencing-dispatch.md#automatic-node-admission).
+
 - `active_attempts`: nonterminal persisted attempts (`claimed`, `running`,
   `awaiting-input`), ordered by creation time and attempt ID. Each includes
   `job_id`, `attempt_id`, `boot_session_id`, `kind`, `class`, `state`, and

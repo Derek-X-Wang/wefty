@@ -58,6 +58,10 @@ const (
 // PersonIdentityTrustProvider lets an L1 deployment fail closed when a Fabric
 // cannot authenticate person identity. Implementations that omit this seam are
 // treated as self-asserted.
+// An authenticated provider must also authenticate machine Node IDs and their
+// principal tags: L1 relies on this guarantee for automatic Node admission.
+// A provider whose machine identity or tags are peer-asserted must not return
+// PersonIdentityAuthenticated, even if it authenticates people separately.
 type PersonIdentityTrustProvider interface {
 	PersonIdentityTrust() PersonIdentityTrust
 }

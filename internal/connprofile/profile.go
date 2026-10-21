@@ -65,6 +65,9 @@ type Profile struct {
 	// NodeAdmission is L1's node admission policy: the nodes it accepts for
 	// claims, with their authoritative tags and slot limits.
 	NodeAdmission []NodeAdmission `json:"node_admission,omitempty"`
+	// AutomaticNodeAdmission treats authenticated agent enrolment as approval
+	// for a previously unseen Node. It is off unless explicitly enabled.
+	AutomaticNodeAdmission bool `json:"automatic_node_admission,omitempty"`
 }
 
 // Participant records only Wefty names, local state paths and opaque identity
@@ -276,6 +279,7 @@ type L1Settings struct {
 	RunLedger                  string          `json:"run_ledger,omitempty"`
 	AllowPlainPersonIdentities bool            `json:"allow_plain_person_identities,omitempty"`
 	NodeAdmission              []NodeAdmission `json:"node_admission,omitempty"`
+	AutomaticNodeAdmission     bool            `json:"automatic_node_admission,omitempty"`
 }
 
 // L3Settings is everything the run ledger reads from the profile.
@@ -312,6 +316,7 @@ func (p Profile) L1() L1Settings {
 		Fabric: p.Fabric, PlainFabricID: p.PlainFabricID, Listen: p.L1Address, RunLedger: p.L3Address,
 		AllowPlainPersonIdentities: p.AllowPlainPersonIdentities,
 		NodeAdmission:              slices.Clone(p.NodeAdmission),
+		AutomaticNodeAdmission:     p.AutomaticNodeAdmission,
 	}
 }
 
