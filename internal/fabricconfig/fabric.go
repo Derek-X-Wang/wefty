@@ -60,9 +60,26 @@ func open(ctx context.Context, config Config, newParticipant func(tsnet.Config) 
 			if err != nil {
 				return nil, nil, err
 			}
+			if !participantstate.HasSavedState(config.StateDirectory) {
+				return nil, release, &fabric.ParticipantIdentityError{Person: config.ExpectedIdentity.UserID != "", Reason: "state is missing; restore this participant's original saved state"}
+			}
 		}
-		participant := network.NewFabric(config.Identity)
-		return participant, release, nil
+		identity := config.Identity
+		if config.ExpectedIdentity != nil {
+			var err error
+			identity, err = plainSavedIdentity(config.StateDirectory, identity)
+			if err != nil {
+				return nil, release, err
+			}
+			participant := &plainParticipant{Fabric: network.NewFabric(identity), expected: *config.ExpectedIdentity, actual: identity, stateDirectory: config.StateDirectory}
+			if !config.DeferVerification {
+				if err := participant.VerifyParticipant(ctx); err != nil {
+					return nil, release, err
+				}
+			}
+			return participant, release, nil
+		}
+		return network.NewFabric(identity), release, nil
 	case "tsnet":
 		if config.Name == "" {
 			return nil, nil, errors.New("fabric config: tsnet name is required")

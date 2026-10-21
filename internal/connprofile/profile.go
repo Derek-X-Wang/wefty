@@ -65,6 +65,9 @@ type Profile struct {
 	// NodeAdmission is L1's node admission policy: the nodes it accepts for
 	// claims, with their authoritative tags and slot limits.
 	NodeAdmission []NodeAdmission `json:"node_admission,omitempty"`
+	// AutomaticNodeAdmission treats authenticated agent enrolment as approval
+	// for a previously unseen Node. It is off unless explicitly enabled.
+	AutomaticNodeAdmission bool `json:"automatic_node_admission,omitempty"`
 }
 
 // Participant records only Wefty names, local state paths and opaque identity
@@ -122,6 +125,9 @@ func (p Profile) Validate() error {
 	}
 	if p.Version != Version {
 		return fmt.Errorf("connection profile: unsupported version %d, want %d", p.Version, Version)
+	}
+	if len(p.Participants) > 0 && p.Fabric == "" {
+		return errors.New("connection profile: participant profiles require an explicit fabric mode")
 	}
 	switch p.Fabric {
 	case "", "plain", "tsnet":
@@ -270,30 +276,39 @@ func Resolve(named, fallback string) (Profile, string, error) {
 
 // L1Settings is everything L1 reads from the profile.
 type L1Settings struct {
-	Fabric                     string          `json:"fabric,omitempty"`
-	PlainFabricID              string          `json:"plain_fabric_id,omitempty"`
-	Listen                     string          `json:"listen,omitempty"`
-	RunLedger                  string          `json:"run_ledger,omitempty"`
-	AllowPlainPersonIdentities bool            `json:"allow_plain_person_identities,omitempty"`
-	NodeAdmission              []NodeAdmission `json:"node_admission,omitempty"`
+	ParticipantProfile         bool                `json:"participant_profile,omitempty"`
+	Participant                *ServiceParticipant `json:"participant,omitempty"`
+	RunLedgerNodeID            string              `json:"run_ledger_node_id,omitempty"`
+	Fabric                     string              `json:"fabric,omitempty"`
+	PlainFabricID              string              `json:"plain_fabric_id,omitempty"`
+	Listen                     string              `json:"listen,omitempty"`
+	RunLedger                  string              `json:"run_ledger,omitempty"`
+	AllowPlainPersonIdentities bool                `json:"allow_plain_person_identities,omitempty"`
+	NodeAdmission              []NodeAdmission     `json:"node_admission,omitempty"`
+	AutomaticNodeAdmission     bool                `json:"automatic_node_admission,omitempty"`
 }
 
 // L3Settings is everything the run ledger reads from the profile.
 type L3Settings struct {
-	Fabric        string `json:"fabric,omitempty"`
-	PlainFabricID string `json:"plain_fabric_id,omitempty"`
-	Listen        string `json:"listen,omitempty"`
-	ControlPlane  string `json:"control_plane,omitempty"`
+	ParticipantProfile bool                `json:"participant_profile,omitempty"`
+	Participant        *ServiceParticipant `json:"participant,omitempty"`
+	ControlPlaneNodeID string              `json:"control_plane_node_id,omitempty"`
+	Fabric             string              `json:"fabric,omitempty"`
+	PlainFabricID      string              `json:"plain_fabric_id,omitempty"`
+	Listen             string              `json:"listen,omitempty"`
+	ControlPlane       string              `json:"control_plane,omitempty"`
 }
 
 // NodeAgentSettings is everything the node agent reads from the profile.
 type NodeAgentSettings struct {
-	OneshotLoadLimit *float64 `json:"oneshot_load_limit,omitempty"`
-	Fabric           string   `json:"fabric,omitempty"`
-	PlainFabricID    string   `json:"plain_fabric_id,omitempty"`
-	ControlPlane     string   `json:"control_plane,omitempty"`
-	RunLedger        string   `json:"run_ledger,omitempty"`
-	NodeID           string   `json:"node_id,omitempty"`
+	ParticipantProfile bool                `json:"participant_profile,omitempty"`
+	Participant        *ServiceParticipant `json:"participant,omitempty"`
+	OneshotLoadLimit   *float64            `json:"oneshot_load_limit,omitempty"`
+	Fabric             string              `json:"fabric,omitempty"`
+	PlainFabricID      string              `json:"plain_fabric_id,omitempty"`
+	ControlPlane       string              `json:"control_plane,omitempty"`
+	RunLedger          string              `json:"run_ledger,omitempty"`
+	NodeID             string              `json:"node_id,omitempty"`
 }
 
 // CLISettings is everything the CLI reads from the profile.
@@ -308,21 +323,23 @@ type CLISettings struct {
 }
 
 func (p Profile) L1() L1Settings {
-	return L1Settings{
+	return L1Settings{ParticipantProfile: len(p.Participants) > 0,
+		Participant: p.ServiceParticipant(ParticipantL1), RunLedgerNodeID: p.PeerNodeID(ParticipantL3),
 		Fabric: p.Fabric, PlainFabricID: p.PlainFabricID, Listen: p.L1Address, RunLedger: p.L3Address,
 		AllowPlainPersonIdentities: p.AllowPlainPersonIdentities,
 		NodeAdmission:              slices.Clone(p.NodeAdmission),
+		AutomaticNodeAdmission:     p.AutomaticNodeAdmission,
 	}
 }
 
 func (p Profile) L3() L3Settings {
-	return L3Settings{Fabric: p.Fabric, PlainFabricID: p.PlainFabricID, Listen: p.L3Address, ControlPlane: p.L1Address}
+	return L3Settings{ParticipantProfile: len(p.Participants) > 0, Participant: p.ServiceParticipant(ParticipantL3), ControlPlaneNodeID: p.PeerNodeID(ParticipantL1), Fabric: p.Fabric, PlainFabricID: p.PlainFabricID, Listen: p.L3Address, ControlPlane: p.L1Address}
 }
 
 func (p Profile) NodeAgent() NodeAgentSettings {
-	return NodeAgentSettings{
+	return NodeAgentSettings{ParticipantProfile: len(p.Participants) > 0,
 		Fabric: p.Fabric, PlainFabricID: p.PlainFabricID, ControlPlane: p.L1Address, RunLedger: p.L3Address,
-		NodeID: p.Identities.Node, OneshotLoadLimit: p.OneshotLoadLimit,
+		NodeID: p.Identities.Node, OneshotLoadLimit: p.OneshotLoadLimit, Participant: p.ServiceParticipant(ParticipantNodeAgent),
 	}
 }
 

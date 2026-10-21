@@ -30,12 +30,13 @@ type Server struct {
 	peerUID          func(net.Conn) (uint32, error)
 	uid              uint32
 	slots            chan struct{}
+	busySlots        chan struct{}
 	handshakeTimeout time.Duration
 	listen           func(string, string) (net.Listener, error)
 }
 
 func NewServer(path string, participants map[string]Participant) (*Server, error) {
-	if err := validateSocketPath(path); err != nil {
+	if err := ValidateSocketPath(path); err != nil {
 		return nil, err
 	}
 	if _, ok := participants[Client]; !ok {
@@ -48,7 +49,7 @@ func NewServer(path string, participants map[string]Participant) (*Server, error
 		}
 		copyParticipants[role] = p
 	}
-	return &Server{path: path, participants: copyParticipants, peerUID: unixPeerUID, uid: uint32(os.Geteuid()), slots: make(chan struct{}, 128), handshakeTimeout: handshakeBudget, listen: net.Listen}, nil
+	return &Server{path: path, participants: copyParticipants, peerUID: unixPeerUID, uid: uint32(os.Geteuid()), slots: make(chan struct{}, 128), busySlots: make(chan struct{}, 4), handshakeTimeout: handshakeBudget, listen: net.Listen}, nil
 }
 func (s *Server) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -131,7 +132,17 @@ func (s *Server) Serve(ctx context.Context) error {
 		select {
 		case s.slots <- struct{}{}:
 		default:
-			s.rejectBusy(ctx, conn)
+			select {
+			case s.busySlots <- struct{}{}:
+				workers.Add(1)
+				go func() {
+					defer workers.Done()
+					defer func() { <-s.busySlots }()
+					s.rejectBusy(ctx, conn)
+				}()
+			default:
+				_ = conn.Close()
+			}
 			continue
 		}
 		workers.Add(1)
@@ -161,6 +172,13 @@ func (s *Server) handle(serviceCtx context.Context, conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Now().Add(s.handshakeTimeout))
 	var req request
 	if err := readFrame(conn, &req); err != nil {
+		// A caller that left or stayed silent gets no reply. Any other decode
+		// failure answers, so a client of a different version is not told the
+		// service is busy when it closes without reply bytes.
+		var timeout net.Error
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !(errors.As(err, &timeout) && timeout.Timeout()) {
+			_ = s.writeReply(conn, response{Code: "invalid_request"})
+		}
 		return
 	}
 	if req.Version != 1 || req.TimeoutMillis <= 0 || req.TimeoutMillis > dialBudget.Milliseconds() ||
@@ -250,8 +268,8 @@ func (s *Server) writeReply(conn net.Conn, reply response) error {
 	return writeFrame(conn, reply)
 }
 
-// Overflow is handled synchronously with a bounded read, keeping the admission
-// path bounded too. Consume the request so closing the socket cannot discard
+// A bounded worker handles overflow outside the accept loop. Consume the
+// request so closing the socket cannot discard
 // the busy reply while the client is still sending its small frame.
 func (s *Server) rejectBusy(ctx context.Context, conn net.Conn) {
 	defer conn.Close()

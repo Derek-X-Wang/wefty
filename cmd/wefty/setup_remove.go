@@ -17,12 +17,14 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
 const setupManifestName = "setup-files.json"
 
 type setupManifest struct {
+	Role             serviceplan.Role  `json:"role,omitempty"`
 	InstalledVersion string            `json:"installed_version,omitempty"`
 	UpgradeSource    bool              `json:"upgrade_source,omitempty"`
 	Version          int               `json:"version"`
