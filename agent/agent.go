@@ -1052,3 +1052,13 @@ func (a *Agent) log(format string, args ...any) {
 		a.logf(format, args...)
 	}
 }
+
+// RequestHeartbeat wakes the existing serialized heartbeat loop. Requests
+// coalesce and do not create concurrent heartbeats or grant new authority.
+// Active attempts keep their existing, independently fenced renewal cadence.
+func (a *Agent) RequestHeartbeat() {
+	select {
+	case a.session.heartbeatWake <- struct{}{}:
+	default:
+	}
+}

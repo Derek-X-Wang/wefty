@@ -184,7 +184,7 @@ func TestSetupConvertPlainFullHistoryAndJoin(t *testing.T) {
 			paths, _ := resolveSetupPaths(f.home)
 			root, _ := os.OpenRoot(f.home)
 			defer root.Close()
-			if err := verifyPlainHistory(root, filepath.Join(paths.dataRel, plainHistoryFolder, report.NodeID), *report.History, true); err != nil {
+			if err := verifyRetiredPlainHistory(root, filepath.Join(paths.dataRel, plainHistoryFolder, report.NodeID), *report.History); err != nil {
 				t.Fatal(err)
 			}
 			for _, label := range []string{setupL1Label, setupL3Label} {
@@ -345,8 +345,12 @@ func TestSetupConvertPlainActivationResumes(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := runSetup(t.Context(), f.host, r); err == nil {
+			report, err := runSetup(t.Context(), f.host, r)
+			if err == nil {
 				t.Fatal("missing activation failure")
+			}
+			if report.History == nil || report.JoinResult != "incomplete" {
+				t.Fatalf("failed activation lost conversion outcome: %+v", report)
 			}
 			r.afterService = nil
 			if _, err := runSetup(t.Context(), f.host, r); err != nil {
@@ -377,7 +381,7 @@ func TestSetupConvertPlainPurgeNeverDeletesHistory(t *testing.T) {
 	if err := purgeSetupEntries(root, paths, &removal); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyPlainHistory(root, filepath.Join(paths.dataRel, plainHistoryFolder, report.NodeID), *report.History, true); err != nil {
+	if err := verifyRetiredPlainHistory(root, filepath.Join(paths.dataRel, plainHistoryFolder, report.NodeID), *report.History); err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range removal.Changes {

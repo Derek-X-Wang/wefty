@@ -166,7 +166,7 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 		if resultErr != nil {
 			report.JoinResult = "incomplete"
 		}
-		report.Notes = append(report.Notes, "History is read-only and never restored (ADR-0003).", "wefty upgrade refuses fleet roles until role-aware upgrade (#901).")
+		report.Notes = append(report.Notes, "History is read-only and never restored (ADR-0003).", "wefty upgrade refuses until this conversion is committed (#901).")
 	}()
 	if record == nil || !conversionForward(record) {
 		if !request.convertPlain || request.role != "join" {

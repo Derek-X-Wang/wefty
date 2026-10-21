@@ -58,10 +58,13 @@ setup requires only `wefty` and `wefty-agent` in the source folder and installs
 only those binaries. It renders and starts only node agent, then client service.
 Removal refuses both staged and committed
 fleet roles until role-aware removal can stop the client service and retain
-identity records. Upgrade continues to refuse any recorded
-fleet role until #901. It also refuses a non-plain profile in the uncommitted
-publication window described below. Role-aware removal, doctor, upgrade,
-and Linux adapters remain their own slices.
+identity records. Mac upgrade uses this same recorded role and service order;
+see [fleet upgrade](fleet-upgrade.md). It refuses uncommitted setup, incomplete conversion
+records, or a receipt/profile disagreement before recovery or preparation.
+A joining upgrade builds only CLI and agent, and restarts only node agent then
+client service. A control-plane upgrade builds all four binaries and restarts
+L1, L3, node agent, then client service. Neither changes participant records.
+Role-aware removal, doctor, and Linux adapters remain their own slices.
 
 ## Durable setup and publication
 
@@ -184,7 +187,15 @@ fences apply. Only the authenticated control plane enables automatic admission.
 
 L1 and L3 publish their existing `--ready-file` records after saved-identity
 verification and listener creation. The node agent publishes its `--ready-file`
-after its first successful registration. Setup matches each record's PID against
+after its first successful registration. Fleet node-agent records also include
+`node_id`, `boot_session_id` and `immediate_heartbeat: true`. This capability is
+published only after the process installs its `SIGUSR1` handler. It coalesces an
+immediate request into the ordinary serialized heartbeat loop, without changing
+L1 APIs or authority. Upgrade matches the running PID, L1 Node/boot and this
+system boot before signaling; absent capability, invalid evidence or a signal
+error keeps the normal renewal window. Requests follow successful post-restart
+L1 observations, at most once per second. See the
+[agent signal contract](agent-local-lifecycle.md). Setup matches each record's PID against
 the running LaunchAgent and requires `ready_at` strictly later than the system
 boot time (macOS `kern.boottime`). A same-PID record from a prior boot, a missing
 timestamp or an unavailable boot-time check fails readiness. Setup recreates the
@@ -386,6 +397,21 @@ owner write permission on read-only directories first if needed. Receipt metadat
 remains the record of the cutover dataset, not a current existence/hash claim.
 Wefty itself never restores that data as authority or deletes it during setup,
 remove or purge.
+Once the joining profile is published and its setup record is committed, setup
+retires `plain-conversion.json` from configuration into that conversion's history
+folder as `conversion-record.json`, with mode `0400`. It durably publishes the
+archive, binds its history inventory with `conversion_history_sha256` in the
+committed setup record, and restores the history folder to `0500` before removing and syncing
+the configuration record. An interrupted retirement accepts only an identical
+archive; a differing record refuses without replacing it. A leftover completed
+record from an older build is retired on the next join setup rerun or upgrade,
+under the installation lock and after checking the profile, receipt, role and
+history metadata. Subsequent setup and upgrade require the receipt's history
+metadata to match that digest even if the owner removes historical files.
+This does not inspect or restore historical databases. If the
+owner already moved or deleted the history folder, retirement recreates only its
+fixed metadata directory, never the historical data. An incomplete conversion
+keeps its configuration record and still refuses upgrade.
 A completed conversion rerun continues the recorded join role without keys.
 Publication and activation retain the same ordered commit points and readiness
 limits as fresh joining setup.
@@ -393,8 +419,8 @@ limits as fresh joining setup.
 The conversion report adds `history` and `join_result` (`joined` or
 `incomplete`) to setup JSON. Text names the location and byte size, states that
 history is read-only and never restored, and reports the joining result and
-existing readiness checks. Both formats remind the operator that `wefty upgrade`
-refuses fleet roles until role-aware upgrade (#901). A post-history failure
+existing readiness checks. Both formats report that upgrade is available after completion; an incomplete
+conversion still reports the upgrade refusal. A post-history failure
 still prints the retained-history report, with the existing error exit.
 
 Removal remains refused for fleet installations and incomplete conversions.

@@ -45,6 +45,7 @@ type agentSession struct {
 	client            *Client
 	registration      contract.NodeRegistration
 	heartbeatInterval time.Duration
+	heartbeatWake     chan struct{}
 	claimInterval     time.Duration
 	clock             Clock
 	observer          *lifecycleObserver
@@ -158,7 +159,7 @@ func newAgentSession(
 	maxOneshotSlots, maxServiceSlots int,
 ) *agentSession {
 	session := &agentSession{
-		client: client, registration: registration,
+		client: client, registration: registration, heartbeatWake: make(chan struct{}, 1),
 		readLoad: nodeload.Read, oneshotLoadLimit: nodeload.DefaultLimit(), oneshotClaimClock: clock,
 		heartbeatInterval: heartbeatInterval, claimInterval: claimInterval,
 		clock: clock, observer: observer, logf: logf, capabilities: capabilities,
@@ -1328,87 +1329,89 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			stopTimer(timer)
 			return
 		case <-timer.C():
-			var response l1.HeartbeatResponse
-			var err error
-			if session.ociBootBarrier == nil {
-				if refreshErr := session.capabilities.refresh(ctx); refreshErr != nil && !capabilityProbeWasSkipped(refreshErr) && session.logf != nil {
-					session.logf("agent: capability probe before heartbeat: %v", refreshErr)
-				}
-				response, err = session.publishCapabilityHeartbeatResponse(ctx, nil)
-			} else {
-				response, err = session.heartbeatOCIPinned(ctx)
-			}
-			if err != nil {
-				classification := classifyAgentProtocolError(err)
-				if classification.destination == errorDestinationTransient {
-					nextDelay = backoff.next()
-					session.observer.setSession(LifecycleRejoining, nextDelay, err)
-					continue
-				}
-				select {
-				case failures <- destinationError{destination: classification.destination, err: fmt.Errorf("agent: heartbeat: %w", err)}:
-				default:
-				}
-				return
-			}
-			if session.computerPolicy != nil && !session.computerPolicy.Valid() && response.ComputerPolicy != nil {
-				if policyErr := session.installComputerPolicy(ctx, response.ComputerPolicy); policyErr != nil {
-					session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
-					if session.logf != nil {
-						session.logf("agent: Computer policy heartbeat bootstrap failed closed: %v", policyErr)
-					}
-				}
-			}
-			session.observeGrantedCapacity(response.Node)
-			session.processCancelDirectives(response.OneShotCancelDirectives)
-			// The same exclusion the boot sequence makes: a stalled removal's
-			// retained resources belong to its own durable backoff, and the
-			// ordinary directive lists must not reconcile them a second time.
-			retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
-			if session.removals != nil {
-				for _, directive := range response.RemovalDirectives {
-					session.removals.enqueue(ctx, directive, failures)
-				}
-			}
-			if session.storageResets != nil {
-				for _, directive := range response.StorageResetDirectives {
-					session.storageResets.enqueue(ctx, directive, failures)
-				}
-			}
-			if session.storageGrows != nil {
-				for _, directive := range response.StorageGrowDirectives {
-					session.storageGrows.enqueue(ctx, directive, failures)
-				}
-			}
-			if session.reimagePreflights != nil {
-				for _, directive := range response.ReimageDirectives {
-					session.reimagePreflights.enqueue(ctx, directive, failures)
-				}
-			}
-			if session.backups != nil {
-				for _, directive := range response.BackupDirectives {
-					session.backups.enqueueCreate(ctx, directive, failures)
-				}
-				for _, directive := range retention.excludeBackupPrunes(response.BackupPruneDirectives) {
-					directive := directive
-					session.backups.enqueue(ctx, "prune\x00"+directive.CopyID,
-						func(runContext context.Context) error { return session.backups.processPrune(runContext, directive) }, failures)
-				}
-			}
-			if session.storageCopies != nil {
-				for _, directive := range response.StorageCopyDirectives {
-					session.storageCopies.enqueue(ctx, directive, failures)
-				}
-			}
-			if session.custody != nil {
-				for _, directive := range response.CustodyExportDirectives {
-					session.custody.enqueue(ctx, directive, failures)
-				}
-			}
-			backoff.reset()
-			nextDelay = session.heartbeatInterval
-			session.markReady()
+		case <-session.heartbeatWake:
 		}
+		stopTimer(timer)
+		var response l1.HeartbeatResponse
+		var err error
+		if session.ociBootBarrier == nil {
+			if refreshErr := session.capabilities.refresh(ctx); refreshErr != nil && !capabilityProbeWasSkipped(refreshErr) && session.logf != nil {
+				session.logf("agent: capability probe before heartbeat: %v", refreshErr)
+			}
+			response, err = session.publishCapabilityHeartbeatResponse(ctx, nil)
+		} else {
+			response, err = session.heartbeatOCIPinned(ctx)
+		}
+		if err != nil {
+			classification := classifyAgentProtocolError(err)
+			if classification.destination == errorDestinationTransient {
+				nextDelay = backoff.next()
+				session.observer.setSession(LifecycleRejoining, nextDelay, err)
+				continue
+			}
+			select {
+			case failures <- destinationError{destination: classification.destination, err: fmt.Errorf("agent: heartbeat: %w", err)}:
+			default:
+			}
+			return
+		}
+		if session.computerPolicy != nil && !session.computerPolicy.Valid() && response.ComputerPolicy != nil {
+			if policyErr := session.installComputerPolicy(ctx, response.ComputerPolicy); policyErr != nil {
+				session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
+				if session.logf != nil {
+					session.logf("agent: Computer policy heartbeat bootstrap failed closed: %v", policyErr)
+				}
+			}
+		}
+		session.observeGrantedCapacity(response.Node)
+		session.processCancelDirectives(response.OneShotCancelDirectives)
+		// The same exclusion the boot sequence makes: a stalled removal's
+		// retained resources belong to its own durable backoff, and the
+		// ordinary directive lists must not reconcile them a second time.
+		retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
+		if session.removals != nil {
+			for _, directive := range response.RemovalDirectives {
+				session.removals.enqueue(ctx, directive, failures)
+			}
+		}
+		if session.storageResets != nil {
+			for _, directive := range response.StorageResetDirectives {
+				session.storageResets.enqueue(ctx, directive, failures)
+			}
+		}
+		if session.storageGrows != nil {
+			for _, directive := range response.StorageGrowDirectives {
+				session.storageGrows.enqueue(ctx, directive, failures)
+			}
+		}
+		if session.reimagePreflights != nil {
+			for _, directive := range response.ReimageDirectives {
+				session.reimagePreflights.enqueue(ctx, directive, failures)
+			}
+		}
+		if session.backups != nil {
+			for _, directive := range response.BackupDirectives {
+				session.backups.enqueueCreate(ctx, directive, failures)
+			}
+			for _, directive := range retention.excludeBackupPrunes(response.BackupPruneDirectives) {
+				directive := directive
+				session.backups.enqueue(ctx, "prune\x00"+directive.CopyID,
+					func(runContext context.Context) error { return session.backups.processPrune(runContext, directive) }, failures)
+			}
+		}
+		if session.storageCopies != nil {
+			for _, directive := range response.StorageCopyDirectives {
+				session.storageCopies.enqueue(ctx, directive, failures)
+			}
+		}
+		if session.custody != nil {
+			for _, directive := range response.CustodyExportDirectives {
+				session.custody.enqueue(ctx, directive, failures)
+			}
+		}
+		backoff.reset()
+		nextDelay = session.heartbeatInterval
+		session.markReady()
 	}
 }
 

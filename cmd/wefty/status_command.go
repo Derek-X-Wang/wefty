@@ -67,9 +67,10 @@ type serviceStatus struct {
 
 // nodeStatus is a node's ability to take work, not its whole projection.
 type nodeStatus struct {
-	NodeID      string             `json:"node_id"`
-	ThisMachine bool               `json:"this_machine,omitempty"`
-	State       contract.NodeState `json:"state"`
+	AgentVersion string             `json:"agent_version,omitempty"`
+	NodeID       string             `json:"node_id"`
+	ThisMachine  bool               `json:"this_machine,omitempty"`
+	State        contract.NodeState `json:"state"`
 	// ClaimsEnabled is durable operator intent. A node can be perfectly healthy
 	// and still be closed for work, and that is a different sentence.
 	ClaimsEnabled      bool `json:"claims_enabled"`
@@ -138,6 +139,7 @@ type localLoadStatus struct {
 
 // clusterStatus is the whole answer, and the shape `--json` publishes.
 type clusterStatus struct {
+	VersionWarnings  []statusReason   `json:"version_warnings,omitempty"`
 	UpgradeRecovery  string           `json:"upgrade_recovery,omitempty"`
 	Busy             string           `json:"busy,omitempty"`
 	WaitingRuns      *int             `json:"waiting_runs,omitempty"`
@@ -337,6 +339,7 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 
 	status.Services = []serviceStatus{l1Status, l3Status}
 	status.Nodes = nodeStatuses(nodes)
+	status.VersionWarnings = nodeVersionWarnings(nodes)
 	receipt, upgradeActive := localUpgradeStatus(clients.nodeConfigPath)
 	if receipt != nil && !upgradeActive {
 		status.UpgradeRecovery = "interrupted upgrade receipt; run wefty upgrade to finish recovery"
@@ -476,7 +479,7 @@ func nodeStatuses(nodes l1.NodeList) []nodeStatus {
 		upgradeReason := !node.ClaimsEnabled && strings.HasPrefix(node.IntentReason, upgradeIntentPrefix)
 		upgradeRecent := upgradeReasonActive(node, time.Now())
 		status := nodeStatus{
-			NodeID: node.NodeID, State: node.State, ClaimsEnabled: node.ClaimsEnabled,
+			NodeID: node.NodeID, AgentVersion: node.AgentVersion, State: node.State, ClaimsEnabled: node.ClaimsEnabled,
 			Upgrading:          upgradeReason && upgradeRecent,
 			UpgradeInterrupted: upgradeReason && !upgradeRecent,
 			Kinds:              executionKinds(node.Capabilities),
@@ -712,6 +715,18 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 	if status.InstalledVersion != "" {
 		if _, err := fmt.Fprintln(writer, "installed version:", status.InstalledVersion); err != nil {
 			return err
+		}
+	}
+	for _, warning := range status.VersionWarnings {
+		if _, err := fmt.Fprintln(writer, "warning:", warning.Detail); err != nil {
+			return err
+		}
+	}
+	for _, node := range status.Nodes {
+		if node.AgentVersion != "" {
+			if _, err := fmt.Fprintf(writer, "node version: %s %s\n", node.NodeID, node.AgentVersion); err != nil {
+				return err
+			}
 		}
 	}
 	for _, limitation := range status.Limitations {

@@ -14,11 +14,12 @@ import (
 )
 
 type Metadata struct {
-	Address       string    `json:"address,omitempty"`
-	PID           int       `json:"pid"`
-	ReadyAt       time.Time `json:"ready_at"`
-	NodeID        string    `json:"node_id,omitempty"`
-	BootSessionID string    `json:"boot_session_id,omitempty"`
+	ImmediateHeartbeat bool      `json:"immediate_heartbeat,omitempty"`
+	Address            string    `json:"address,omitempty"`
+	PID                int       `json:"pid"`
+	ReadyAt            time.Time `json:"ready_at"`
+	NodeID             string    `json:"node_id,omitempty"`
+	BootSessionID      string    `json:"boot_session_id,omitempty"`
 }
 
 func Publish(path string, metadata Metadata) error {

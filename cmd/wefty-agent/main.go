@@ -26,6 +26,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/internal/serviceready"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -423,6 +424,9 @@ func (remover macBootstrapRemover) removeBootstrap(instance, limactl, factsPath,
 }
 
 func run() error {
+	if handled, err := serviceplan.ProfilePreflight(os.Args[1:], os.Stdout); handled {
+		return err
+	}
 	printVersion := flag.Bool("version", false, "print the build commit and exit")
 	agentExecutable, err := os.Executable()
 	if err != nil {
@@ -955,6 +959,24 @@ func run() error {
 		}
 		go writeMinimalDoctorFactsLoop(ctx, *ociDoctorFacts, nodeAgent, limaSupervisor, bootBarrier, log.Printf)
 	}
+	// Only fleet agents advertise and accept this local maintenance trigger.
+	// Install the handler before publishing its capability in the ready record.
+	immediateHeartbeat := len(profile.Participants) > 0
+	if immediateHeartbeat {
+		heartbeatSignals := make(chan os.Signal, 1)
+		signal.Notify(heartbeatSignals, syscall.SIGUSR1)
+		defer signal.Stop(heartbeatSignals)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-heartbeatSignals:
+					nodeAgent.RequestHeartbeat()
+				}
+			}
+		}()
+	}
 	signals := make(chan os.Signal, 2)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
@@ -975,7 +997,7 @@ func run() error {
 		case <-ctx.Done():
 			readyDone <- nil
 		case <-nodeAgent.Registered():
-			publishErr := serviceready.Publish(*readyFile, serviceready.Metadata{NodeID: *nodeID, BootSessionID: bootSessionID})
+			publishErr := serviceready.Publish(*readyFile, serviceready.Metadata{NodeID: *nodeID, BootSessionID: bootSessionID, ImmediateHeartbeat: immediateHeartbeat})
 			if publishErr != nil {
 				cancel()
 			}

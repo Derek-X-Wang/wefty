@@ -14,6 +14,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/internal/serviceready"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
@@ -29,6 +30,9 @@ func main() {
 }
 
 func run() error {
+	if handled, err := serviceplan.ProfilePreflight(os.Args[1:], os.Stdout); handled {
+		return err
+	}
 	var (
 		printVersion              = flag.Bool("version", false, "print the build commit and exit")
 		statePreflight            = flag.Bool("state-preflight", false, "open --db for upgrade preflight and exit; use only a temporary copy")
