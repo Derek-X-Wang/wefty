@@ -12,6 +12,11 @@ import (
 // refuseRecordedFleetRole fences legacy upgrade/removal before locks, recovery,
 // staging or service-manager calls. Participant shape never determines role.
 func refuseRecordedFleetRole(paths setupPaths, command string) error {
+	if _, err := os.Lstat(filepath.Join(paths.config, plainConversionName)); err == nil {
+		return fmt.Errorf("%s refuses a plain-to-join conversion; resume setup with --role join --convert-plain (fleet upgrade is #901)", command)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	root, err := os.OpenRoot(paths.home)
 	if err != nil {
 		return err

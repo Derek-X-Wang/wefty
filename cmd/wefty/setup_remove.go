@@ -24,6 +24,7 @@ import (
 const setupManifestName = "setup-files.json"
 
 type setupManifest struct {
+	History          *plainHistory     `json:"history,omitempty"`
 	Role             serviceplan.Role  `json:"role,omitempty"`
 	InstalledVersion string            `json:"installed_version,omitempty"`
 	UpgradeSource    bool              `json:"upgrade_source,omitempty"`
@@ -302,6 +303,10 @@ func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveRepor
 		}
 		for _, entry := range entries {
 			name := entry.Name()
+			// Retained authority is never a purge target, including future entries.
+			if folder == paths.dataRel && name == plainHistoryFolder {
+				continue
+			}
 			if folder == paths.dataRel && name == "fabric" && entry.IsDir() {
 				if err := purgeSetupParticipants(root, paths, report); err != nil {
 					return err

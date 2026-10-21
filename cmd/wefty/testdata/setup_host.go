@@ -110,6 +110,8 @@ func setupCommandHost() (setupHost, error) {
 			var body any
 			status := 200
 			switch {
+			case r.URL.Path == "/v1/jobs":
+				body = l1.JobList{}
 			case r.URL.Path == "/v1/nodes":
 				body = l1.NodeList{Nodes: []l1.Node{{NodeRegistration: contract.NodeRegistration{NodeID: p.Identities.Node, BootSessionID: "fixture-boot"}, State: contract.NodeAlive, ClaimsEnabled: os.Getenv("WEFTY_FIXTURE_NOT_ADMITTED") != "1", AutomaticallyAdmitted: len(p.NodeAdmission) == 0, AuthoritativeTags: []string{contract.StableNodeTagPrefix + p.Identities.Node}, MaxOneshotSlots: 4, MaxServiceSlots: 2}}}
 			case r.URL.Path == "/v1/runs" && r.Method == "GET":
@@ -126,7 +128,42 @@ func setupCommandHost() (setupHost, error) {
 		})
 		return &apiClients{l1: &apiClient{name: "L1", address: p.L1Address, client: &http.Client{Transport: rt}}, l3: &apiClient{name: "L3", address: p.L3Address, client: &http.Client{Transport: rt}}, wait: waitForContext}, nil
 	}
-	return setupHost{ownerLogin: func(context.Context, string) error { return nil }, peerLookup: func(_ context.Context, c fabricconfig.Config) (fabric.PeerLookup, fabricconfig.CloseFunc, error) {
+	node := l1.Node{NodeRegistration: contract.NodeRegistration{NodeID: "studio-0123abcd"}, ClaimsEnabled: true}
+	drainFile := filepath.Join(home, "fixture-drain.json")
+	if payload, err := os.ReadFile(drainFile); err == nil {
+		_ = json.Unmarshal(payload, &node)
+	}
+	switch os.Getenv("WEFTY_FIXTURE_BUSY") {
+	case "one-shot":
+		node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "fixture-busy-one-shot", AttemptID: "fixture-busy-attempt", Class: contract.JobClassOneShot}}
+	case "service":
+		node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "fixture-busy-service", AttemptID: "fixture-busy-attempt", Class: contract.JobClassService}}
+	default:
+		node.ActiveAttempts = nil
+	}
+	now := time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)
+	observe := func(context.Context, connprofile.Profile) (l1.Node, error) { return node, nil }
+	drain := &upgradeHost{observe: observe, readNode: observe, now: func() time.Time { return now }, wait: func(_ context.Context, d time.Duration) error { now = now.Add(d); return nil }, setClaims: func(_ context.Context, _ connprofile.Profile, request l1.NodeIntentRequest) (l1.Node, error) {
+		if request.IntentRevision != node.IntentRevision {
+			return l1.Node{}, errors.New("fixture claim conflict")
+		}
+		node.IntentRevision++
+		node.IntentReason = request.Reason
+		node.ClaimsEnabled = request.ClaimsEnabled
+		payload, err := json.Marshal(node)
+		if err != nil {
+			return l1.Node{}, err
+		}
+		return node, os.WriteFile(drainFile, payload, 0600)
+	}}
+	return setupHost{conversionFilesClosed: func(context.Context, []string) error { return nil }, conversionClients: func(ctx context.Context, p connprofile.Profile) (*apiClients, error) {
+		return clients(ctx, setupPaths{}, p)
+	}, upgrade: drain, conversionComputers: func(context.Context, connprofile.Profile) ([]l1.Computer, error) {
+		if os.Getenv("WEFTY_FIXTURE_BUSY") == "computer" {
+			return []l1.Computer{{ComputerID: "fixture-busy-computer", BoundNodeID: node.NodeID}}, nil
+		}
+		return nil, nil
+	}, ownerLogin: func(context.Context, string) error { return nil }, peerLookup: func(_ context.Context, c fabricconfig.Config) (fabric.PeerLookup, fabricconfig.CloseFunc, error) {
 		return fixturePeers{}, func() error { return nil }, nil
 	}, bootTime: func() (time.Time, error) { return time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), nil }, goos: "darwin", euid: 501, uid: 501, home: home, username: "owner", hostname: "studio", shell: "/bin/sh", executable: exe, launchctl: run, loginShell: func(context.Context, string, ...string) ([]byte, error) {
 		return []byte(setupPATHBegin + "\n/usr/bin:/bin\n" + setupPATHEnd + "\n"), nil

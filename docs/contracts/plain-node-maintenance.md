@@ -99,3 +99,9 @@ warnings. Warnings return the typed not-ready exit 12, including when other
 entries were removed successfully. The report is the stdout verdict; no second
 JSON error is written to stderr. Refusals before a removal report use the usual
 CLI error document and exit convention.
+
+Plain-to-join conversion retains `plain-history/<stable-node-id>/` under the
+standard data folder. History is never on the purge allowlist; this entire entry
+is also skipped explicitly, with or without a manifest record. Removal refuses
+converted fleet roles; even direct purge enumeration
+keeps history and its files. See the [conversion contract](installation-service-plan.md#explicit-plain-mac-conversion).

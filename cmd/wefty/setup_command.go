@@ -87,26 +87,29 @@ var setupBinaries = []string{"wefty", "wefty-l1", "wefty-l3", "wefty-agent"}
 // setupHost is everything setup reads from or does to the machine, so a test
 // can run it against a temporary home with fake launchctl and a fake shell.
 type setupHost struct {
-	bootTime        func() (time.Time, error)
-	peerLookup      func(context.Context, fabricconfig.Config) (fabric.PeerLookup, fabricconfig.CloseFunc, error)
-	ownerLogin      func(context.Context, string) error
-	enroller        fabric.Enroller
-	enrolmentInput  io.Reader
-	enrolmentOutput io.Writer
-	fleetClients    func(context.Context, setupPaths, connprofile.Profile) (*apiClients, error)
-	readinessBudget time.Duration
-	smokeBudget     time.Duration
-	goos            string
-	euid            int
-	uid             int
-	home            string
-	username        string
-	hostname        string
-	shell           string
-	executable      string
-	launchctl       launchagent.Runner
-	loginShell      func(ctx context.Context, shell string, args ...string) ([]byte, error)
-	random          io.Reader
+	conversionClients     func(context.Context, connprofile.Profile) (*apiClients, error)
+	conversionFilesClosed func(context.Context, []string) error
+	conversionComputers   func(context.Context, connprofile.Profile) ([]l1.Computer, error)
+	bootTime              func() (time.Time, error)
+	peerLookup            func(context.Context, fabricconfig.Config) (fabric.PeerLookup, fabricconfig.CloseFunc, error)
+	ownerLogin            func(context.Context, string) error
+	enroller              fabric.Enroller
+	enrolmentInput        io.Reader
+	enrolmentOutput       io.Writer
+	fleetClients          func(context.Context, setupPaths, connprofile.Profile) (*apiClients, error)
+	readinessBudget       time.Duration
+	smokeBudget           time.Duration
+	goos                  string
+	euid                  int
+	uid                   int
+	home                  string
+	username              string
+	hostname              string
+	shell                 string
+	executable            string
+	launchctl             launchagent.Runner
+	loginShell            func(ctx context.Context, shell string, args ...string) ([]byte, error)
+	random                io.Reader
 	// l1Address and l3Address are the ports a new profile gets.
 	l1Address, l3Address string
 	unloadBound          time.Duration
@@ -116,6 +119,8 @@ type setupHost struct {
 }
 
 type setupRequest struct {
+	abandonConversion   bool
+	convertPlain        bool
 	joinCode            string
 	withPerson          bool
 	role                string
@@ -271,6 +276,8 @@ type setupServiceReport struct {
 }
 
 type setupReport struct {
+	History      *plainHistory         `json:"history,omitempty"`
+	JoinResult   string                `json:"join_result,omitempty"`
 	Role         serviceplan.Role      `json:"role,omitempty"`
 	Participants map[string]string     `json:"participants,omitempty"`
 	Readiness    []setupReadinessCheck `json:"readiness,omitempty"`
@@ -295,6 +302,8 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 	var remove, purge bool
 	flags.StringVar(&request.role, "role", "", "fleet role for a new install: control-plane or join")
 	flags.StringVar(&request.joinCode, "join-code", "", "non-secret join code from the control plane setup report")
+	flags.BoolVar(&request.convertPlain, "convert-plain", false, "explicitly convert an existing plain Mac into a joining machine, retaining read-only history")
+	flags.BoolVar(&request.abandonConversion, "abandon-conversion", false, "restore and abandon an incomplete conversion before history is committed")
 	flags.BoolVar(&request.withPerson, "with-person", false, "enrol the owner through browser sign-in on the owner laptop only")
 	flags.BoolVar(&request.skipSmokeRun, "skip-smoke-run", false, "skip the bounded pinned fleet smoke run")
 	flags.StringVar(&request.coordinatorURL, "coordinator-url", "", "non-default HTTPS enrolment coordinator (no credentials)")
@@ -306,11 +315,11 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
-		return usageError("usage: wefty setup [--role control-plane] [--from DIR] [--node-id ID] | --role join --join-code CODE [--with-person] | --remove [--purge]")
+		return usageError("usage: wefty setup [--role control-plane] [--from DIR] [--node-id ID] | --role join --join-code CODE [--with-person] [--convert-plain] | --role join --convert-plain --abandon-conversion | --remove [--purge]")
 	}
 	var fleetFlag, joinFlag bool
 	flags.Visit(func(f *flag.Flag) {
-		if f.Name == "join-code" || f.Name == "with-person" {
+		if f.Name == "join-code" || f.Name == "with-person" || f.Name == "convert-plain" || f.Name == "abandon-conversion" {
 			joinFlag = true
 		}
 		if f.Name == "role" || f.Name == "coordinator-url" || f.Name == "skip-smoke-run" {
@@ -318,10 +327,16 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 		}
 	})
 	if remove && joinFlag {
-		return usageError("--remove cannot use --join-code or --with-person")
+		return usageError("--remove cannot use --join-code or --with-person or --convert-plain or --abandon-conversion")
 	}
 	if remove && fleetFlag {
 		return usageError("--remove cannot use --role, --coordinator-url or --skip-smoke-run")
+	}
+	if request.convertPlain && request.role != "join" {
+		return usageError("--convert-plain requires --role join")
+	}
+	if request.abandonConversion && (!request.convertPlain || request.role != "join") {
+		return usageError("--abandon-conversion requires --role join --convert-plain")
 	}
 	if purge && !remove || remove && (request.from != "" || request.nodeID != "") {
 		return usageError("--purge requires --remove; --remove cannot use --from or --node-id")
@@ -362,7 +377,7 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 		request.fleetCoordinatorURL = os.Getenv("TS_CONTROL_URL")
 	}
 	report, err := runSetup(ctx, host, request)
-	if err != nil && len(report.Readiness) == 0 {
+	if err != nil && len(report.Readiness) == 0 && report.History == nil {
 		return err
 	}
 	var writeErr error
@@ -431,6 +446,19 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	paths, err := resolveSetupPaths(home)
 	if err != nil {
 		return setupReport{}, err
+	}
+	if request.convertPlain && request.role != "join" {
+		return setupReport{}, usageError("--convert-plain requires --role join")
+	}
+	if request.abandonConversion && (!request.convertPlain || request.role != "join") {
+		return setupReport{}, usageError("--abandon-conversion requires --role join --convert-plain")
+	}
+	conversion, err := readPlainConversion(paths)
+	if err != nil {
+		return setupReport{}, err
+	}
+	if request.convertPlain || conversion != nil {
+		return runPlainConversion(ctx, host, request, paths, conversion)
 	}
 	role, err := selectSetupRole(paths, request.role)
 	if err != nil {
@@ -1234,6 +1262,10 @@ func setupSkillFilesFrom(paths setupPaths, source fs.FS) ([]setupFile, error) {
 
 func writeSetupReport(writer io.Writer, report setupReport) error {
 	var output strings.Builder
+	if report.History != nil {
+		fmt.Fprintf(&output, "Join result: %s\n", report.JoinResult)
+		fmt.Fprintf(&output, "Retained history: %s (%d bytes). Read-only; never restored (ADR-0003).\n", report.History.Directory, report.History.Size)
+	}
 	if report.Role != serviceplan.Legacy {
 		fmt.Fprintf(&output, "Installation role: %s\n", report.Role)
 		if report.JoinCode != "" {

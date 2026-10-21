@@ -1,8 +1,13 @@
 # Daily Mac stack upgrade
 
-A recorded fleet installation role is refused before upgrade preparation or
-recovery. Role-aware fleet upgrade belongs to #901; a fleet receipt never
-selects legacy control-plane service rendering.
+A recorded fleet installation role or plain-to-join conversion record is refused
+before upgrade preparation or recovery. Resume an incomplete conversion with
+the new CLI's full-path `setup --role join --convert-plain`; use
+`--abandon-conversion` to finish a pre-history restore without continuing into
+the fleet. Successful plain restoration deletes the conversion record and
+reopens plain maintenance. Its old drain receipt must never be
+replayed against fleet authority. Role-aware fleet upgrade belongs to #901; a
+fleet receipt never selects legacy control-plane service rendering.
 
 `wefty upgrade [--yes] [--drain-timeout DURATION]` upgrades the per-user plain-process installation made
 by `wefty setup` to the latest `main` commit from
