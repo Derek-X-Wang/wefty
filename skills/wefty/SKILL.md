@@ -165,6 +165,9 @@ Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied
 Install dependencies inside the command (for example `pnpm install --frozen-lockfile && ...`), or point the tool at an absolute cache path.
 Share only dependency caches, which are keyed by content: `CARGO_HOME`, the pnpm store, `GOMODCACHE`, `GOCACHE`.
 Do not share a project build folder, such as a Cargo `target/`, between runs and the real checkout: builds there can keep the deleted run copy's paths. Use a separate build folder per run, for example under `$TMPDIR`.
+
+A run shares its machine with other runs and with the agents' own work. Test runners that start one worker per CPU (Vitest, Jest, `go test`, `cargo test`) can then hit their own timeouts. When timing matters, cap the workers, for example `VITEST_MAX_WORKERS=2`, Jest `--maxWorkers=2`, `GOFLAGS=-p=4` or `cargo test -- --test-threads=4`, and rerun a timing failure alone before you call it a regression.
+
 stdout and stderr are separate streams, so their order relative to each other
 is not kept. When order matters, merge them in the command: `sh -c '... 2>&1'`.
 
