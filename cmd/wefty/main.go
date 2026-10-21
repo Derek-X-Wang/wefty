@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l3"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
@@ -130,6 +131,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.Writer, openFabric func(context.Context, fabricconfig.Config) (fabric.Fabric, fabricconfig.CloseFunc, error)) (result error) {
+	if handled, err := serviceplan.ProfilePreflight(args, stdout); handled {
+		return err
+	}
 	defer func() {
 		var help *commandHelp
 		if errors.As(result, &help) {

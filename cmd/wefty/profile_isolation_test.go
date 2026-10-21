@@ -48,7 +48,7 @@ func TestMain(main *testing.M) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	socketDir, err := os.MkdirTemp("/tmp", "ws-")
+	socketDir, err := os.MkdirTemp(os.TempDir(), "ws-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

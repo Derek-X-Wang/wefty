@@ -46,6 +46,25 @@ kills after a fixed timeout must allow `D` plus that bound; `wefty setup`
 passes a budget to the installed node agent and derives launchd's `ExitTimeOut`
 from both, with slack.
 
+## Immediate fleet heartbeat signal
+
+A fleet-profile node agent handles `SIGUSR1` by coalescing a wake-up for its
+existing serialized heartbeat loop. The signal does not drain, stop, register a
+new boot, change claims intent or introduce an L1 API. Attempt renewal keeps its
+independent cadence. The handler is installed before readiness can advertise
+`immediate_heartbeat: true`. The private node-agent ready record also includes
+`pid`, `ready_at`, `node_id` and `boot_session_id`.
+
+A local upgrader may request this heartbeat only after successfully observing
+L1 after restart. It must verify that the ready record is a private regular file,
+that its PID matches the running LaunchAgent, that its Node/boot match L1, and
+that `ready_at` is after this system boot. It sends `SIGUSR1` through launchctl
+to that verified local node agent. Missing capability sends no signal. Invalid
+receiver evidence sends no signal and logs one fallback notice; a signal error
+uses the same fallback. The normal renewal proof and time budget remain in
+force. Requests retry at most once per second until renewal is observed.
+Legacy plain upgrade does not use this signal.
+
 ## Capability observation and local admission
 
 One synchronized agent-owned snapshot contains the complete advertised

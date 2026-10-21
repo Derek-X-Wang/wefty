@@ -67,6 +67,7 @@ type upgradeHost struct {
 }
 
 type upgradeReport struct {
+	VersionWarnings   []statusReason         `json:"version_warnings,omitempty"`
 	Version           string                 `json:"version"`
 	LeaseRenewal      time.Duration          `json:"lease_renewal_ns"`
 	Setup             setupReport            `json:"setup"`
@@ -233,6 +234,13 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	paths, err := resolveSetupPaths(home)
 	if err != nil {
 		return upgradeReport{}, err
+	}
+	role, err := selectUpgradeRole(paths)
+	if err != nil {
+		return upgradeReport{}, err
+	}
+	if role != "" {
+		return runFleetUpgrade(ctx, host, paths, role, yes, warnings, drainTimeout...)
 	}
 	if err := refuseRecordedFleetRole(paths, "upgrade"); err != nil {
 		return upgradeReport{}, err
@@ -502,7 +510,10 @@ func upgradeAlreadyInstalled(paths setupPaths, staged, commit string) bool {
 	return true
 }
 
-func upgradeObservationError(ctx context.Context, host setupHost, cause error) error {
+func upgradeObservationError(ctx context.Context, host setupHost, cause error, fleet ...bool) error {
+	if len(fleet) > 0 && fleet[0] {
+		return fmt.Errorf("cannot list running work; check the local client service and fleet L1; repair the client service or start L1 on its control plane: %w", cause)
+	}
 	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid}
 	_, err := manager.Run(ctx, launchagent.Launchctl, "print", fmt.Sprintf("gui/%d/%s", host.uid, setupL1Label))
 	if errors.Is(err, launchagent.ErrServiceNotFound) {

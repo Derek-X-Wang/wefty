@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,7 @@ const fleetSetupProfileName = "fleet-setup-profile.json"
 // and staged participant records across interruptions. The profile, never the
 // informational markers, determines which participants have been saved.
 type fleetSetupRecord struct {
+	ConversionHistoryDigest string           `json:"conversion_history_sha256,omitempty"`
 	JoinCode                string           `json:"join_code,omitempty"`
 	WithPerson              bool             `json:"with_person,omitempty"`
 	PeerVerificationFailure string           `json:"peer_verification_failure,omitempty"`
@@ -77,6 +80,13 @@ func readFleetSetupRecord(paths setupPaths) (*fleetSetupRecord, error) {
 	}
 	if record.Version != 1 || record.Role.Validate() != nil || record.Role == serviceplan.Legacy || !validSetupNodeID(record.NodeID) || record.StagedProfile != filepath.Join(paths.config, fleetSetupProfileName) || connprofile.ValidateCoordinatorURL(record.CoordinatorURL) != nil {
 		return nil, errors.New("invalid fleet setup record; setup will not infer a role or replace saved identities")
+	}
+	if record.ConversionHistoryDigest != "" {
+		digest, prefixed := strings.CutPrefix(record.ConversionHistoryDigest, "sha256:")
+		decoded, err := hex.DecodeString(digest)
+		if !prefixed || err != nil || len(decoded) != sha256.Size || record.ConversionHistoryDigest != strings.ToLower(record.ConversionHistoryDigest) || record.Role != serviceplan.Join || !record.Committed || !record.ProfilePublished {
+			return nil, errors.New("invalid committed conversion history digest")
+		}
 	}
 	if record.Role == serviceplan.Join {
 		d, err := fleetjoin.Parse(record.JoinCode)
@@ -172,8 +182,13 @@ func fleetSetupParticipants(plan serviceplan.Plan, nodeID string) ([]setupPartic
 	return participants, nil
 }
 
-func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, paths setupPaths, role serviceplan.Role) (setupReport, error) {
-	report := setupReport{Role: role, Profile: paths.profile, NodeConfig: paths.nodeConfig, BinDir: paths.bin, DataDir: paths.data, LogDir: paths.logs, Changes: []string{}, Participants: map[string]string{}}
+func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, paths setupPaths, role serviceplan.Role) (report setupReport, resultErr error) {
+	defer func() {
+		if resultErr != nil && report.History != nil {
+			report.JoinResult = "incomplete"
+		}
+	}()
+	report = setupReport{Role: role, Profile: paths.profile, NodeConfig: paths.nodeConfig, BinDir: paths.bin, DataDir: paths.data, LogDir: paths.logs, Changes: []string{}, Participants: map[string]string{}}
 	record, err := readFleetSetupRecord(paths)
 	if err != nil {
 		return report, err
@@ -378,8 +393,8 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		if json.Unmarshal(payload, &manifest) != nil || manifest.Version != 1 || manifest.Role != role || manifest.Files == nil {
 			return report, errors.New("invalid recorded fleet role receipt; restore it before setup")
 		}
-		if manifest.History != nil || conversion != nil {
-			if manifest.History == nil || conversion == nil {
+		if conversion != nil {
+			if manifest.History == nil {
 				return report, errors.New("converted role receipt or plain conversion record is missing history metadata; restore the original records")
 			}
 			recorded, err := json.Marshal(manifest.History)
@@ -394,6 +409,12 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 				return report, errors.New("converted role receipt history differs from its conversion record; restore the original receipt")
 			}
 		}
+		if err := checkFleetConversionHistory(record, manifest.History); err != nil {
+			return report, err
+		}
+		if conversion == nil && manifest.History != nil && record.ConversionHistoryDigest == "" {
+			return report, errors.New("converted role receipt is missing history metadata binding; restore the original records")
+		}
 		committed = true
 		if err := checkFleetProfileFile(paths.profile); err != nil {
 			return report, err
@@ -404,7 +425,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			return report, err
 		}
 		if digest := manifest.Files[profilePath]; digest == "" || payloadDigest(activePayload) != digest {
-			return report, errors.New("completed fleet profile differs from its receipt; restore the recorded profile (fleet upgrade is #901)")
+			return report, errors.New("completed fleet profile differs from its receipt; restore the recorded profile")
 		}
 		profile, err = readSetupProfile(paths.profile)
 		if err != nil {
@@ -605,11 +626,11 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			relative := filepath.Join(file.folder, file.name)
 			info, statErr := root.Lstat(relative)
 			if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != file.mode.Perm() {
-				return report, errors.New("completed fleet installation differs from setup inputs; restore the recorded files (fleet upgrade is #901)")
+				return report, errors.New("completed fleet installation differs from setup inputs; restore the recorded files")
 			}
 			current, err := root.ReadFile(relative)
 			if err != nil || !bytes.Equal(current, file.payload) {
-				return report, errors.New("completed fleet installation differs from setup inputs; restore the recorded files (fleet upgrade is #901)")
+				return report, errors.New("completed fleet installation differs from setup inputs; restore the recorded files")
 			}
 		}
 	} else {
@@ -670,6 +691,15 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	}
 	if err := step("committed"); err != nil {
 		return report, err
+	}
+	if conversion != nil {
+		if err := retireCompletedPlainConversion(paths); err != nil {
+			return report, err
+		}
+	}
+	if manifest.History != nil {
+		report.History, report.JoinResult = manifest.History, "joined"
+		report.Notes = append(report.Notes, "History is read-only and never restored (ADR-0003).", "Completed conversion record retired to history; wefty upgrade is available (#901).")
 	}
 	// Runtime evidence can be deleted independently of the retained install.
 	// Recreate its private folder before any service can publish readiness.

@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/internal/serviceready"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
@@ -85,6 +86,9 @@ func main() {
 }
 
 func run() error {
+	if handled, err := serviceplan.ProfilePreflight(os.Args[1:], os.Stdout); handled {
+		return err
+	}
 	nodePolicies := make(map[string]l1.NodePolicy)
 	var (
 		printVersion             = flag.Bool("version", false, "print the build commit and exit")

@@ -457,6 +457,15 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return setupReport{}, err
 	}
+	if request.convertPlain && !request.abandonConversion && conversion == nil {
+		stage, err := readFleetSetupRecord(paths)
+		if err != nil {
+			return setupReport{}, err
+		}
+		if stage != nil && stage.Role == serviceplan.Join && stage.Committed && stage.ProfilePublished && stage.ConversionHistoryDigest != "" {
+			request.convertPlain = false
+		}
+	}
 	if request.convertPlain || conversion != nil {
 		return runPlainConversion(ctx, host, request, paths, conversion)
 	}

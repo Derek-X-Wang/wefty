@@ -707,7 +707,7 @@ func TestSetupControlPlaneRefusesCommittedProfileEditsBeforeServices(t *testing.
 			prompts.Reset()
 			f.host.readinessBudget = 20 * time.Millisecond
 			_, err := runSetup(t.Context(), f.host, setupRequest{})
-			if err == nil || !strings.Contains(err.Error(), "profile") || !strings.Contains(err.Error(), "#901") || len(f.launchd.mutating()) != 0 || prompts.Len() != 0 {
+			if err == nil || !strings.Contains(err.Error(), "profile differs from its receipt") || !strings.Contains(err.Error(), "restore the recorded profile") || len(f.launchd.mutating()) != 0 || prompts.Len() != 0 {
 				t.Fatalf("changed profile was not refused before services: %v commands=%v prompts=%s", err, f.launchd.commands, prompts)
 			}
 		})
