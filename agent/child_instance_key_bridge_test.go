@@ -177,6 +177,7 @@ func TestChildInstanceKeysThroughAttemptBridge(t *testing.T) {
 				// A database close/reopen preserves both the live bearer and key.
 				app.CloseIdleConnections()
 				agentClient.Close()
+				bridge.l1.CloseIdleConnections()
 				stopServer()
 				stopServer = startServer()
 				probe := childKeyBridgeSpec("after-reopen", class, &key)
