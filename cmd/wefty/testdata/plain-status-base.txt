@@ -1,0 +1,14 @@
+ready
+
+identity: machine principal
+
+this machine: no installed node
+
+SERVICE  ENDPOINT  REACHABLE  DETAIL
+L1       control   true       N/A
+L3       ledger    true       N/A
+
+free one-shot slots by kind: process=4 oci=0
+
+NODE        STATE  CLAIMS   KINDS    ONE-SHOT  SERVICE
+plain-node  alive  enabled  process  4/4 free  2/2 free

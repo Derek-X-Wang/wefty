@@ -67,10 +67,13 @@ type serviceStatus struct {
 
 // nodeStatus is a node's ability to take work, not its whole projection.
 type nodeStatus struct {
-	AgentVersion string             `json:"agent_version,omitempty"`
-	NodeID       string             `json:"node_id"`
-	ThisMachine  bool               `json:"this_machine,omitempty"`
-	State        contract.NodeState `json:"state"`
+	ConnectHost           string             `json:"connect_host,omitempty"`
+	AutomaticallyAdmitted bool               `json:"automatically_admitted"`
+	ActiveAttemptsByClass map[string]int     `json:"active_attempts_by_class"`
+	AgentVersion          string             `json:"agent_version,omitempty"`
+	NodeID                string             `json:"node_id"`
+	ThisMachine           bool               `json:"this_machine,omitempty"`
+	State                 contract.NodeState `json:"state"`
 	// ClaimsEnabled is durable operator intent. A node can be perfectly healthy
 	// and still be closed for work, and that is a different sentence.
 	ClaimsEnabled      bool `json:"claims_enabled"`
@@ -139,6 +142,7 @@ type localLoadStatus struct {
 
 // clusterStatus is the whole answer, and the shape `--json` publishes.
 type clusterStatus struct {
+	fleetView        bool
 	VersionWarnings  []statusReason   `json:"version_warnings,omitempty"`
 	UpgradeRecovery  string           `json:"upgrade_recovery,omitempty"`
 	Busy             string           `json:"busy,omitempty"`
@@ -248,7 +252,7 @@ func reportParticipantCheckFailure(stdout io.Writer, options globalOptions, conf
 // it is so one unreachable service cannot hide the state of the others, which
 // is exactly the case a person runs this command in.
 func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
-	status := clusterStatus{CheckedAt: time.Now().UTC()}
+	status := clusterStatus{CheckedAt: time.Now().UTC(), fleetView: clients.clientIdentityID != ""}
 	l1Status := serviceStatus{Name: "L1", Endpoint: clients.l1.address}
 	l3Status := serviceStatus{Name: "L3", Endpoint: clients.l3.address}
 
@@ -480,6 +484,7 @@ func nodeStatuses(nodes l1.NodeList) []nodeStatus {
 		upgradeRecent := upgradeReasonActive(node, time.Now())
 		status := nodeStatus{
 			NodeID: node.NodeID, AgentVersion: node.AgentVersion, State: node.State, ClaimsEnabled: node.ClaimsEnabled,
+			ConnectHost: node.ConnectHost, AutomaticallyAdmitted: node.AutomaticallyAdmitted, ActiveAttemptsByClass: activeAttemptsByClass(node.ActiveAttempts),
 			Upgrading:          upgradeReason && upgradeRecent,
 			UpgradeInterrupted: upgradeReason && !upgradeRecent,
 			Kinds:              executionKinds(node.Capabilities),
@@ -801,6 +806,9 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 	}
 	if _, err := fmt.Fprintf(writer, "\nfree one-shot slots by kind: %s\n", strings.Join(kinds, " ")); err != nil {
 		return err
+	}
+	if status.fleetView {
+		return writeFleetNodes(writer, status.Nodes)
 	}
 	nodes := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
 	if _, err := fmt.Fprintln(nodes, "\nNODE\tSTATE\tCLAIMS\tKINDS\tONE-SHOT\tSERVICE"); err != nil {

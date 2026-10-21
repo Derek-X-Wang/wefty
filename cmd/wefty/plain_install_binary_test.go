@@ -27,6 +27,10 @@ import (
 // doctor platform selection also uses the simulated Mac on Linux test hosts. The injected runner is a subprocess fake, never real launchctl.
 // There are no test environment hooks in the shipped binary.
 func buildPlainInstallCLI(t *testing.T) string {
+	return buildPlainInstallCLIForPlatform(t, "darwin")
+}
+
+func buildPlainInstallCLIForPlatform(t *testing.T, goos string) string {
 	t.Helper()
 	dir := t.TempDir()
 	source, err := os.ReadFile("setup_command.go")
@@ -41,7 +45,7 @@ func buildPlainInstallCLI(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodeModified, err := plainDoctorOverlay(string(nodeSource))
+	nodeModified, err := plainDoctorOverlayForPlatform(string(nodeSource), goos)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +107,15 @@ func replacePlainAdapter(source, expression, replacement string) (string, error)
 }
 
 func plainDoctorOverlay(source string) (string, error) {
-	return replacePlainAdapter(source, regexp.QuoteMeta("plainDoctorSelected(runtime.GOOS, options.nodeConfigPath)"), `plainDoctorSelected(func() string { _ = runtime.GOOS; return "darwin" }(), options.nodeConfigPath)`)
+	return plainDoctorOverlayForPlatform(source, "darwin")
+}
+func plainDoctorOverlayForPlatform(source, goos string) (string, error) {
+	pattern := regexp.MustCompile(regexp.QuoteMeta("plainDoctorSelected(runtime.GOOS, options.nodeConfigPath)"))
+	if count := len(pattern.FindAllStringIndex(source, -1)); count != 2 {
+		return "", fmt.Errorf("unsafe doctor platform overlay: matched %d selectors, want exactly two", count)
+	}
+	replacement := fmt.Sprintf(`plainDoctorSelected(func() string { _ = runtime.GOOS; return %q }(), options.nodeConfigPath)`, goos)
+	return pattern.ReplaceAllStringFunc(source, func(string) string { return replacement }), nil
 }
 
 func TestPlainInstallOverlayRejectsSourceDrift(t *testing.T) {
@@ -234,6 +246,23 @@ func TestPlainDoctorRealBinary(t *testing.T) {
 				mustRemove(t, filepath.Join(f.state, label))
 			}
 			f.stopL1()
+		}},
+		{name: "config linked outside home", check: "path:" + setupFolders.config, severity: "error", detail: "outside the home", damage: func(t *testing.T, f *plainBinaryFixture) {
+			config := filepath.Join(f.setup.home, setupFolders.config)
+			outside := filepath.Join(f.state, "outside-config")
+			if err := os.Rename(config, outside); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, config); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unreadable receipt", check: "connection-profile", severity: "error", detail: "unexpected EOF", damage: func(t *testing.T, f *plainBinaryFixture) {
+			// Keep an independent local finding which the receipt must not hide.
+			mustWrite(t, filepath.Join(f.setup.home, setupFolders.config, "profile.json"), "{")
+			if err := os.Chmod(filepath.Join(f.setup.home, setupFolders.config, setupManifestName), 0000); err != nil {
+				t.Fatal(err)
+			}
 		}},
 		{name: "bad profile", check: "connection-profile", severity: "error", damage: func(t *testing.T, f *plainBinaryFixture) {
 			mustWrite(t, filepath.Join(f.setup.home, ".config/wefty/profile.json"), "{")
@@ -413,6 +442,19 @@ func TestPlainDoctorRealBinary(t *testing.T) {
 			}
 			if code != 12 || report.Healthy || errOut != "" {
 				t.Fatalf("broken exit=%d report=%s stderr=%s", code, out, errOut)
+			}
+			if test.name == "config linked outside home" || test.name == "unreadable receipt" {
+				textCode, text, textErr := f.run(t, "node", "doctor")
+				if textCode != 12 {
+					t.Fatalf("damaged plain text exit=%d stdout=%s stderr=%s", textCode, text, textErr)
+				}
+				if textErr != "wefty: plain-process node doctor found issues; follow the fix hints\n" {
+					t.Fatalf("plain doctor stderr changed: %s", textErr)
+				}
+				text = strings.ReplaceAll(text, f.setup.home, "<HOME>")
+				text = strings.ReplaceAll(text, f.state, "<STATE>")
+				name := "plain-doctor-" + strings.ReplaceAll(test.name, " ", "-") + "-base.txt"
+				assertPlainBaseBytes(t, name, text)
 			}
 			if test.name == "services down" {
 				for _, label := range []string{setupL1Label, setupL3Label, setupNodeAgentLabel} {

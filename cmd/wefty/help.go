@@ -126,7 +126,7 @@ var positionalCommandUsage = map[string]string{
 	"admin policy get":                "usage: wefty admin policy get",
 	"admins get":                      "usage: wefty admins get",
 	"admins list":                     "usage: wefty admins list",
-	"node doctor":                     "usage: wefty node doctor",
+	"node doctor":                     "usage: wefty node doctor [--print-policy]",
 	"node oci start":                  "usage: wefty node oci start",
 	"node oci stop":                   "usage: wefty node oci stop",
 	"node oci removals":               "usage: wefty node oci removals",
@@ -151,6 +151,9 @@ var commandHelpGroups = map[string]bool{
 // Fabric identity nor installed node state. Every flag-bearing command returns
 // at Parse, before touching the nil client; commands without flags are above.
 func executeCommandHelp(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
+	if args[0] == "doctor" {
+		return executeDoctor(ctx, options, args[1:], stdout, stderr)
+	}
 	// The authoring helpers recognize fewer spellings than flag.Parse. The
 	// routing scan has already excluded flag values and arguments after --.
 	if args[0] == "run" {

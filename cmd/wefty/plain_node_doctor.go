@@ -18,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
@@ -29,10 +30,12 @@ type plainDoctorFinding struct {
 	Fix      string `json:"fix"`
 }
 type plainDoctorReport struct {
-	Version  int                  `json:"version"`
-	Install  string               `json:"install"`
-	Healthy  bool                 `json:"healthy"`
-	Findings []plainDoctorFinding `json:"findings"`
+	Role           serviceplan.Role      `json:"role,omitempty"`
+	PolicyEvidence []setupReadinessCheck `json:"policy_evidence,omitempty"`
+	Version        int                   `json:"version"`
+	Install        string                `json:"install"`
+	Healthy        bool                  `json:"healthy"`
+	Findings       []plainDoctorFinding  `json:"findings"`
 }
 
 func executePlainDoctor(ctx context.Context, options globalOptions, args []string, stdout io.Writer) error {
