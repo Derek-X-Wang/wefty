@@ -16,7 +16,7 @@ typed result.
 | 6–9 | Custody import deferred, quarantined, failed, or superseded |
 | 10 | Run failed (`exec`, `wait`) |
 | 11 | Wait timeout (`wait`) |
-| 12 | Cluster not ready (`status`) |
+| 12 | Cluster not ready (`status`) or doctor findings |
 | 13 | Transport or service unavailable (`fabric_unreachable`, `unavailable`, or retryable server-unavailable envelope); for `exec`, a lost watch, an unconfirmed submission, a run infrastructure failure, or a missing command result |
 | 14 | Accepted-mutation observation timeout (`wait_timeout` or `revocation_wait_timeout`) |
 
@@ -41,6 +41,11 @@ through the caller's logger, under the existing redaction policy.
 Recovery can restore the original state or retire the old device and enrol a
 new identity through fleet setup; public fleet setup is deferred to #900.
 These refusals use the same command report as `main` and add no exit number.
+
+[Fleet doctor](fleet-doctor.md) prints its findings before returning the same
+identity-refusal exit 3 or transport-uncertainty exit 13. Local checklist findings
+use exit 12; JSON stderr never adds a second error document after this report.
+Legacy plain doctor and status text remain unchanged.
 
 A saved participant that cannot be reached or confirmed within its start
 budget returns typed `fabric_unreachable`, `retryable=true`, exit 13. This

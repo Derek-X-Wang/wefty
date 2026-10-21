@@ -24,6 +24,22 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 		return err
 	}
 	if args[0] == "doctor" {
+		if len(args) > 1 {
+			return executeDoctor(ctx, options, args[1:], stdout, stderr)
+		}
+		// A selected OCI control socket retains its original local route,
+		// without consulting fleet metadata or requiring a home folder.
+		processInstall, inspectErr := plainDoctorSelected(runtime.GOOS, options.nodeConfigPath)
+		// Inspection errors stay with the original platform-specific route.
+		if inspectErr == nil && processInstall {
+			host, err := setupCommandHost()
+			if err != nil {
+				return err
+			}
+			if handled, err := maybeExecuteFleetDoctor(ctx, host, options, stdout); handled {
+				return err
+			}
+		}
 		plain, err := plainDoctorSelected(runtime.GOOS, options.nodeConfigPath)
 		if err != nil {
 			return err

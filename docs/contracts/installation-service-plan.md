@@ -64,7 +64,10 @@ records, or a receipt/profile disagreement before recovery or preparation.
 A joining upgrade builds only CLI and agent, and restarts only node agent then
 client service. A control-plane upgrade builds all four binaries and restarts
 L1, L3, node agent, then client service. Neither changes participant records.
-Role-aware removal, doctor, and Linux adapters remain their own slices.
+Role-aware removal and Linux adapters remain their own slices.
+[Doctor](fleet-doctor.md) consumes the same recorded role and named plan,
+checks local files independently of services, and uses the running client
+service for live network evidence.
 
 ## Durable setup and publication
 

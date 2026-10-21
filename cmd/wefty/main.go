@@ -170,6 +170,9 @@ func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.W
 	if wantsCommandHelp(commandArgs) {
 		return executeCommandHelp(ctx, options, commandArgs, stdout, stderr)
 	}
+	if commandArgs[0] == "doctor" {
+		return executeDoctor(ctx, options, commandArgs[1:], stdout, stderr)
+	}
 	if commandArgs[0] == "node" {
 		return executeLocalNode(ctx, options, commandArgs[1:], stdout, stderr)
 	}
@@ -406,7 +409,8 @@ Commands:
   admin policy add|remove    Mutate administrator membership with an observed revision
   admins list|add|remove     Alias for the administrator policy commands
   node setup-oci             Configure the installed node's OCI runtime
-  node doctor                Check the plain-process install or read OCI diagnostics
+  doctor [--print-policy]    Check the installation or print private network policy
+  node doctor                Check the installed role, plain process or OCI node
   node oci start|stop        Set durable node-local OCI intent
   node oci removals          Read durable runtime removal manifests, phases, and attestations
   node load-image FILE       Import an OCI archive through the live agent

@@ -31,6 +31,12 @@ func decideCommandReport(err error) commandReport {
 }
 
 func classifyCommandReport(err error) commandReport {
+	var doctor *doctorResultError
+	if errors.As(err, &doctor) {
+		report := classifyCommandReport(doctor.cause)
+		report.stdoutVerdict = true
+		return report
+	}
 	report := commandReport{exitCode: exitFailure, err: err}
 	var takeoverErr *takeoverActionError
 	isTakeover := errors.As(err, &takeoverErr)

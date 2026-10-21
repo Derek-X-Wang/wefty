@@ -87,6 +87,7 @@ var setupBinaries = []string{"wefty", "wefty-l1", "wefty-l3", "wefty-agent"}
 // setupHost is everything setup reads from or does to the machine, so a test
 // can run it against a temporary home with fake launchctl and a fake shell.
 type setupHost struct {
+	doctorCommand         func(context.Context, string, ...string) ([]byte, error)
 	conversionClients     func(context.Context, connprofile.Profile) (*apiClients, error)
 	conversionFilesClosed func(context.Context, []string) error
 	conversionComputers   func(context.Context, connprofile.Profile) ([]l1.Computer, error)
@@ -276,23 +277,24 @@ type setupServiceReport struct {
 }
 
 type setupReport struct {
-	History      *plainHistory         `json:"history,omitempty"`
-	JoinResult   string                `json:"join_result,omitempty"`
-	Role         serviceplan.Role      `json:"role,omitempty"`
-	Participants map[string]string     `json:"participants,omitempty"`
-	Readiness    []setupReadinessCheck `json:"readiness,omitempty"`
-	NodeID       string                `json:"node_id"`
-	Profile      string                `json:"profile"`
-	NodeConfig   string                `json:"node_config"`
-	L1Address    string                `json:"l1_address"`
-	L3Address    string                `json:"l3_address"`
-	BinDir       string                `json:"bin_dir"`
-	DataDir      string                `json:"data_dir"`
-	LogDir       string                `json:"log_dir"`
-	Changes      []string              `json:"changes"`
-	Services     []setupServiceReport  `json:"services"`
-	Notes        []string              `json:"notes,omitempty"`
-	JoinCode     string                `json:"join_code,omitempty"`
+	PrivateNetworkPolicy *fabric.PrivateNetworkPolicy `json:"private_network_policy,omitempty"`
+	History              *plainHistory                `json:"history,omitempty"`
+	JoinResult           string                       `json:"join_result,omitempty"`
+	Role                 serviceplan.Role             `json:"role,omitempty"`
+	Participants         map[string]string            `json:"participants,omitempty"`
+	Readiness            []setupReadinessCheck        `json:"readiness,omitempty"`
+	NodeID               string                       `json:"node_id"`
+	Profile              string                       `json:"profile"`
+	NodeConfig           string                       `json:"node_config"`
+	L1Address            string                       `json:"l1_address"`
+	L3Address            string                       `json:"l3_address"`
+	BinDir               string                       `json:"bin_dir"`
+	DataDir              string                       `json:"data_dir"`
+	LogDir               string                       `json:"log_dir"`
+	Changes              []string                     `json:"changes"`
+	Services             []setupServiceReport         `json:"services"`
+	Notes                []string                     `json:"notes,omitempty"`
+	JoinCode             string                       `json:"join_code,omitempty"`
 }
 
 func executeSetup(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
@@ -1288,6 +1290,16 @@ func writeSetupReport(writer io.Writer, report setupReport) error {
 		for _, check := range report.Readiness {
 			fmt.Fprintf(&output, "%s: %s (%s)\n", check.Check, check.Status, check.Detail)
 		}
+	}
+	if report.PrivateNetworkPolicy != nil {
+		output.WriteString("Private network policy\n")
+		for _, requirement := range report.PrivateNetworkPolicy.Requirements {
+			fmt.Fprintln(&output, "-", requirement)
+		}
+		for _, note := range report.PrivateNetworkPolicy.Notes {
+			fmt.Fprintln(&output, "Note:", note)
+		}
+		output.WriteString(report.PrivateNetworkPolicy.Snippet)
 	}
 	fmt.Fprintf(&output, "This machine is node %s.\n", report.NodeID)
 	fmt.Fprintf(&output, "Connection profile: %s (L1 %s, L3 %s)\n", report.Profile, report.L1Address, report.L3Address)

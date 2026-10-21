@@ -1,0 +1,26 @@
+dev.wefty.l1	ok	loaded and running
+dev.wefty.l3	ok	loaded and running
+dev.wefty.node-agent	ok	loaded and running
+path:.config/wefty	error	<HOME>/.config/wefty leads outside the home folder <HOME> through a symbolic link; setup writes only inside the home folder
+  Fix: move the link aside or restore access, then run `wefty setup`
+connection-profile	error	<HOME>/.config/wefty leads outside the home folder <HOME> through a symbolic link; setup writes only inside the home folder
+  Fix: fix or move the broken profile aside, then run `wefty setup`
+path:.local/bin	ok	exists and writable
+path:Library/Application Support/wefty	ok	exists and writable
+path:Library/Logs/wefty	ok	exists and writable
+path:Library/LaunchAgents	ok	exists and writable
+path:Library/Application Support/wefty/node-agent/log-spool	ok	exists and writable
+path:Library/Application Support/wefty/node-agent/managed	ok	exists and writable
+path:.claude/skills/wefty	ok	exists and writable
+path:.agents/skills/wefty	ok	exists and writable
+node-config	ok	node.json names test-mac
+local-node	warning	NOT-RUN: node configuration or connection profile is invalid
+  Fix: repair these files and rerun doctor
+tool:go	ok	found on the node agent's recorded login-shell PATH
+tool:git	ok	found on the node agent's recorded login-shell PATH
+tool:node	ok	found on the node agent's recorded login-shell PATH
+tool:gh	ok	found on the node agent's recorded login-shell PATH
+tool:claude	ok	found on the node agent's recorded login-shell PATH
+tool:codex	ok	found on the node agent's recorded login-shell PATH
+skill:.claude/skills/wefty/SKILL.md	ok	matches the embedded wefty skill
+skill:.agents/skills/wefty/SKILL.md	ok	matches the embedded wefty skill

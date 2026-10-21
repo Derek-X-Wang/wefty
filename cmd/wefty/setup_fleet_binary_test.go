@@ -110,7 +110,22 @@ func buildFleetFixtureBinary(t *testing.T) string {
 		t.Fatal(err)
 	}
 	overlay := filepath.Join(buildDir, "overlay.json")
-	payload, _ := json.Marshal(map[string]any{"Replace": map[string]string{filepath.Join(cwd, "setup_host.go"): filepath.Join(cwd, "testdata", "setup_host.go")}})
+	nodeSource, err := os.ReadFile("local_node_command.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	simulatedNode, err := plainDoctorOverlay(string(nodeSource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodePath := filepath.Join(buildDir, "local_node_command.go")
+	if err := os.WriteFile(nodePath, []byte(simulatedNode), 0600); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"Replace": map[string]string{
+		filepath.Join(cwd, "setup_host.go"):         filepath.Join(cwd, "testdata", "setup_host.go"),
+		filepath.Join(cwd, "local_node_command.go"): nodePath,
+	}})
 	if err := os.WriteFile(overlay, payload, 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -749,6 +749,13 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	} else {
 		report.Notes = append(report.Notes, "No person participant was enrolled. Select --with-person only on the owner's laptop during first setup.")
 	}
+	if role == serviceplan.ControlPlane {
+		policy, err := fabricconfig.PrivateNetworkPolicy(profile.Fabric)
+		if err != nil {
+			return report, err
+		}
+		report.PrivateNetworkPolicy = &policy
+	}
 	report.Readiness = checkFleetReadiness(ctx, host, paths, profile, services, request.skipSmokeRun, role)
 	for _, check := range report.Readiness {
 		if check.Status == "FAILED" {

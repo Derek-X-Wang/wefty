@@ -1,0 +1,15 @@
+ready
+node version: plain-node base-version
+
+identity: no person identity
+
+this machine: no installed node configuration at <HOME>/absent.json; install a node or select its metadata with --node-config or WEFTY_NODE_CONFIG
+
+SERVICE  ENDPOINT         REACHABLE  DETAIL
+L1       <ENDPOINT>  true       N/A
+L3       <ENDPOINT>  true       N/A
+
+free one-shot slots by kind: process=3 oci=3
+
+NODE        STATE  CLAIMS   KINDS        ONE-SHOT  SERVICE
+plain-node  alive  enabled  oci,process  3/4 free  0/2 free
