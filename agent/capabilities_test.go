@@ -326,9 +326,11 @@ func TestHungCapabilityProbeTimesOutWithoutStoppingHeartbeats(t *testing.T) {
 	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-timeout": nil})
 	defer stopServer()
 	probeCanceled := make(chan struct{}, 1)
-	var calls atomic.Int32
+	// The probe keeps answering kind:oci until the test has seen it, so a
+	// slow poll on a busy runner cannot miss a short-lived state (#1077).
+	var seen atomic.Bool
 	probe := capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
-		if calls.Add(1) == 1 {
+		if !seen.Load() {
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 		}
 		<-ctx.Done()
@@ -346,6 +348,7 @@ func TestHungCapabilityProbeTimesOutWithoutStoppingHeartbeats(t *testing.T) {
 	initial := waitForAgentNode(t, store, "node-timeout", func(node l1.Node) bool {
 		return node.CapabilityRevision >= 3 && node.Capabilities["kind:oci"]
 	})
+	seen.Store(true)
 	withdrawn := waitForAgentNode(t, store, "node-timeout", func(node l1.Node) bool {
 		return node.CapabilityRevision > initial.CapabilityRevision && !node.Capabilities["kind:oci"]
 	})

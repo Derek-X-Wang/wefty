@@ -202,6 +202,13 @@ credential is refused by L1 regardless of how it reached the bridge. Callers
 must still send the run token or the attempt credential, and no Fabric
 privilege of the agent is projected into the workflow process.
 
+If the `/l1` upstream transport fails before receiving a response, the bridge
+answers HTTP `503` with `unavailable`, `retryable=true`, and
+`details.reason="l1_upstream_unreachable"`. Caller cancellation or a caller
+deadline keeps the existing non-retryable `502 internal` answer. The bridge
+does not replay requests. No response does not prove that L1 did not commit;
+callers retry with the identical body, dispatch key, and attempt credential.
+
 Linux and process workloads receive the loopback bridge URL. A Mac OCI
 workload receives `host.lima.internal:<port>` after the agent discovers and
 binds that Lima gateway surface. If that exact bind fails, the helper replaces

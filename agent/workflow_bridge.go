@@ -229,7 +229,7 @@ func newWorkflowBridgeWithBindingAndSurface(ctx context.Context, participant fab
 		}
 		if bridge.l1 != nil {
 			mux.Handle("/l1/", bridge.controlPlaneHandler(
-				workflowReverseProxy(bridge.l1, "/l1", contract.ErrorInternal)))
+				newControlPlaneBridgeProxy(bridge.l1)))
 		}
 		handler = mux
 	}
@@ -561,6 +561,40 @@ func workflowBridgeTransport(participant fabric.Fabric, address string) *http.Tr
 	}}
 }
 
+// Only transport failures without a response get the availability mapping.
+// ReverseProxy also sends protocol upgrade errors to its ErrorHandler.
+type l1BridgeTransport struct{ next http.RoundTripper }
+
+type l1BridgeUpstreamError struct{ error }
+
+func (e *l1BridgeUpstreamError) Unwrap() error { return e.error }
+
+func (transport l1BridgeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.next.RoundTrip(request)
+	if err != nil && response == nil {
+		return nil, &l1BridgeUpstreamError{err}
+	}
+	return response, err
+}
+
+func newControlPlaneBridgeProxy(transport http.RoundTripper) *httputil.ReverseProxy {
+	proxy := workflowReverseProxy(l1BridgeTransport{next: transport}, "/l1", contract.ErrorInternal)
+	proxy.ErrorHandler = func(w http.ResponseWriter, request *http.Request, err error) {
+		var upstream *l1BridgeUpstreamError
+		if errors.As(err, &upstream) && request.Context().Err() == nil {
+			// L1 may have committed before the connection died. Report availability
+			// without replaying the request or changing its dispatch identity.
+			writeWorkflowBridgeAPIError(w, http.StatusServiceUnavailable, contract.APIError{
+				Code: contract.ErrorUnavailable, Message: err.Error(), Retryable: true,
+				Details: map[string]any{"reason": "l1_upstream_unreachable"},
+			})
+			return
+		}
+		writeWorkflowBridgeError(w, http.StatusBadGateway, contract.ErrorInternal, err.Error())
+	}
+	return proxy
+}
+
 func workflowReverseProxy(transport http.RoundTripper, prefix string, errorCode contract.ErrorCode) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Director: func(request *http.Request) {
@@ -577,9 +611,13 @@ func workflowReverseProxy(transport http.RoundTripper, prefix string, errorCode 
 }
 
 func writeWorkflowBridgeError(w http.ResponseWriter, status int, code contract.ErrorCode, message string) {
+	writeWorkflowBridgeAPIError(w, status, contract.APIError{Code: code, Message: message})
+}
+
+func writeWorkflowBridgeAPIError(w http.ResponseWriter, status int, apiError contract.APIError) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: code, Message: message}})
+	_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: apiError})
 }
 
 func (b *workflowBridge) close() error {
