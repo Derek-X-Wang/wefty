@@ -1,6 +1,6 @@
 # Plain-process node maintenance
 
-`wefty node doctor` diagnoses the daily per-user Mac install made by
+`wefty doctor` (also `wefty node doctor`) diagnoses the daily per-user Mac install made by
 `wefty setup`. A selected `node.json` that names a `control_socket` keeps
 the existing OCI doctor path, response, checks and exits unchanged, including
 invalid OCI configuration errors. On macOS, a missing configuration or a valid
@@ -39,6 +39,9 @@ JSON is a version 1 object with
 all checks passed. Warnings and errors return the existing typed not-ready
 exit 12. The report is the JSON stdout verdict; no second JSON error is written
 to stderr. CLI usage errors retain the existing exit convention.
+
+Fleet installations use the [role-aware doctor](fleet-doctor.md). Legacy plain
+findings and human output remain byte-identical.
 
 ## Removal
 

@@ -103,6 +103,9 @@ func setupCommandHost() (setupHost, error) {
 		return nil, os.WriteFile(stateFile, b, 0600)
 	}
 	clients := func(_ context.Context, _ setupPaths, p connprofile.Profile) (*apiClients, error) {
+		if os.Getenv("WEFTY_FIXTURE_IDENTITY_REFUSED") == "1" {
+			return nil, &fabric.ParticipantIdentityError{Reason: "does not match the recorded node ID"}
+		}
 		if os.Getenv("WEFTY_FIXTURE_NOT_READY") == "1" {
 			return nil, errors.New("fixture service unavailable")
 		}
@@ -156,7 +159,18 @@ func setupCommandHost() (setupHost, error) {
 		}
 		return node, os.WriteFile(drainFile, payload, 0600)
 	}}
-	return setupHost{conversionFilesClosed: func(context.Context, []string) error { return nil }, conversionClients: func(ctx context.Context, p connprofile.Profile) (*apiClients, error) {
+	return setupHost{doctorCommand: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if filepath.Base(name) == "pmset" && strings.Join(args, " ") == "-g custom" {
+			return []byte("AC Power:\n sleep 0\n"), nil
+		}
+		if filepath.Base(name) == "fdesetup" && strings.Join(args, " ") == "status" {
+			if os.Getenv("WEFTY_FIXTURE_FILEVAULT_ON") == "1" {
+				return []byte("FileVault is On.\n"), nil
+			}
+			return []byte("FileVault is Off.\n"), nil
+		}
+		return nil, errors.New("unexpected fixture host probe")
+	}, conversionFilesClosed: func(context.Context, []string) error { return nil }, conversionClients: func(ctx context.Context, p connprofile.Profile) (*apiClients, error) {
 		return clients(ctx, setupPaths{}, p)
 	}, upgrade: drain, conversionComputers: func(context.Context, connprofile.Profile) ([]l1.Computer, error) {
 		if os.Getenv("WEFTY_FIXTURE_BUSY") == "computer" {
@@ -166,7 +180,11 @@ func setupCommandHost() (setupHost, error) {
 	}, ownerLogin: func(context.Context, string) error { return nil }, peerLookup: func(_ context.Context, c fabricconfig.Config) (fabric.PeerLookup, fabricconfig.CloseFunc, error) {
 		return fixturePeers{}, func() error { return nil }, nil
 	}, bootTime: func() (time.Time, error) { return time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), nil }, goos: "darwin", euid: 501, uid: 501, home: home, username: "owner", hostname: "studio", shell: "/bin/sh", executable: exe, launchctl: run, loginShell: func(context.Context, string, ...string) ([]byte, error) {
-		return []byte(setupPATHBegin + "\n/usr/bin:/bin\n" + setupPATHEnd + "\n"), nil
+		loginPATH := os.Getenv("WEFTY_FIXTURE_LOGIN_PATH")
+		if loginPATH == "" {
+			loginPATH = "/usr/bin:/bin"
+		}
+		return []byte(setupPATHBegin + "\n" + loginPATH + "\n" + setupPATHEnd + "\n"), nil
 	}, random: strings.NewReader(strings.Repeat("a", 512)), enroller: fixtureEnroller{}, enrolmentInput: os.Stdin, fleetClients: clients, readinessBudget: 30 * time.Millisecond}, nil
 }
 
