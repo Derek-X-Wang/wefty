@@ -102,6 +102,14 @@ test is not stretchable.
   unless the node is operator-expected via the configured
   `authoritativeNodeTags` map (`l1/server.go:52-54`, `:275`). A dropped call
   rejoins; an amputation does not silently regrow.
+  The owner's [#900 decision](https://github.com/Derek-X-Wang/wefty/issues/900)
+  adds an explicit opt-in: issuing the single-use, agent-tagged join key is
+  initial approval for an unseen Node whose authenticated agent identity has
+  no Node binding at all. A new stable ID cannot bypass an existing binding
+  or its disabled claims intent. Automatic admission must never overwrite an
+  existing Node's stored intent or re-admit a Node after the owner disables
+  claims. Default installations retain the rule above; see the
+  [admission contract](../contracts/lease-fencing-dispatch.md#automatic-node-admission).
 - **Errors and reads must instruct.** Semantic error codes over HTTP status,
   a truthful `Retryable`, enumerable state, and a node projection that can
   answer *why* — tracked in #56, which is deliberately **not** a blocker for

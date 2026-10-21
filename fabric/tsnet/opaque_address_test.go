@@ -33,6 +33,10 @@ func TestOpaqueNodeAddressesReachTheEnrolledPeer(t *testing.T) {
 		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(payload)))}, nil
 	})}}
+	f.dialPlan = func(_ context.Context, _, address string) (netip.AddrPort, bool, error) {
+		ipp, err := netip.ParseAddrPort(address)
+		return ipp, err == nil, err
+	}
 	var dialled, listened string
 	stop := errors.New("test transport boundary")
 	f.dialNode = func(_ context.Context, _, address string) (net.Conn, error) { dialled = address; return nil, stop }

@@ -234,6 +234,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if err != nil {
 		return upgradeReport{}, err
 	}
+	if err := refuseRecordedFleetRole(paths, "upgrade"); err != nil {
+		return upgradeReport{}, err
+	}
 	unlock, err := lockSetup(paths, true)
 	if err != nil {
 		return result, err

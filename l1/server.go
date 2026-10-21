@@ -28,6 +28,7 @@ type ServerConfig struct {
 	ClientPrincipalTag                string
 	AgentPrincipalTag                 string
 	NodePolicies                      map[string]NodePolicy
+	AutomaticNodeAdmission            bool
 	ReconcileInterval                 time.Duration
 	AllowSelfAssertedPersonIdentities bool
 	ComputerPolicyFreshness           time.Duration
@@ -51,6 +52,13 @@ func DefaultNodePolicy(tags ...string) NodePolicy {
 	}
 }
 
+func defaultNodePolicyForAdmission(nodeID string, automaticallyAdmitted bool) NodePolicy {
+	if automaticallyAdmitted {
+		return DefaultNodePolicy(contract.StableNodeTagPrefix + nodeID)
+	}
+	return DefaultNodePolicy()
+}
+
 func (s *Server) effectiveNodePolicy(nodeID string) (NodePolicy, bool) {
 	policy, configured := s.nodePolicies[nodeID]
 	if !configured {
@@ -68,6 +76,7 @@ type Server struct {
 	clientPrincipalTag      string
 	agentPrincipalTag       string
 	nodePolicies            map[string]NodePolicy
+	automaticNodeAdmission  bool
 	reconcileInterval       time.Duration
 	allowPersonIdentities   bool
 	computerPolicyFreshness time.Duration
@@ -95,6 +104,11 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	agentTag := normalizePrincipalTag(config.AgentPrincipalTag, DefaultAgentPrincipalTag)
 	if clientTag == agentTag {
 		return nil, fmt.Errorf("l1: client and agent principal tags must differ")
+	}
+	// This Fabric seam authenticates both peer identity and its principal tags.
+	// The person-development override must never authorize node admission.
+	if config.AutomaticNodeAdmission && !machineIdentitiesAuthenticated(f) {
+		return nil, fmt.Errorf("l1: automatic node admission requires authenticated Fabric identities")
 	}
 	nodePolicies := make(map[string]NodePolicy, len(config.NodePolicies))
 	for nodeID, policy := range config.NodePolicies {
@@ -133,6 +147,7 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 		fabric: f, store: store,
 		clientPrincipalTag: clientTag, agentPrincipalTag: agentTag,
 		nodePolicies:            nodePolicies,
+		automaticNodeAdmission:  config.AutomaticNodeAdmission,
 		reconcileInterval:       reconcileInterval,
 		allowPersonIdentities:   personIdentitiesAllowed(f, config.AllowSelfAssertedPersonIdentities),
 		computerPolicyFreshness: policyFreshness,
@@ -157,6 +172,11 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 func personIdentitiesAllowed(f fabric.Fabric, allowSelfAsserted bool) bool {
 	provider, ok := f.(fabric.PersonIdentityTrustProvider)
 	return ok && (provider.PersonIdentityTrust() == fabric.PersonIdentityAuthenticated || allowSelfAsserted)
+}
+
+func machineIdentitiesAuthenticated(f fabric.Fabric) bool {
+	provider, ok := f.(fabric.PersonIdentityTrustProvider)
+	return ok && provider.PersonIdentityTrust() == fabric.PersonIdentityAuthenticated
 }
 
 func normalizePrincipalTag(tag, fallback string) string {
@@ -2296,7 +2316,15 @@ func (s *Server) registerNode(w http.ResponseWriter, r *http.Request) {
 	}
 	identity := identityFromRequest(r)
 	policy, configured := s.effectiveNodePolicy(registration.NodeID)
-	node, err := s.store.RegisterNode(r.Context(), identity, registration, policy, configured)
+	admission := nodeRegistrationAdmission{refreshUnconfiguredPolicy: !configured}
+	pinnedTag := contract.StableNodeTagPrefix + registration.NodeID
+	// Require the exact reserved tag to be canonical: case folding must not
+	// let a different stable ID receive another Node's Pinned work.
+	admission.automatic = s.automaticNodeAdmission && !configured && taggedIdentityDecision(identity, s.agentPrincipalTag) == nil && validTag(pinnedTag)
+	if admission.automatic {
+		policy = DefaultNodePolicy(pinnedTag)
+	}
+	node, err := s.store.registerNode(r.Context(), identity, registration, policy, configured, admission)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -2312,10 +2340,9 @@ func (s *Server) heartbeatNode(w http.ResponseWriter, r *http.Request) {
 	}
 	identity := identityFromRequest(r)
 	nodeID := r.PathValue("node_id")
-	policy, _ := s.effectiveNodePolicy(nodeID)
-	node, err := s.store.HeartbeatNodeWithCapabilityObservation(
-		r.Context(), identity.NodeID, nodeID, request.BootSessionID, heartbeatCapabilityObservation(request), policy,
-	)
+	policy, configured := s.effectiveNodePolicy(nodeID)
+	observation := heartbeatCapabilityObservation(request)
+	node, err := s.store.heartbeatNode(r.Context(), identity.NodeID, nodeID, request.BootSessionID, &observation, &policy, !configured)
 	if err != nil {
 		writeError(w, err)
 		return

@@ -675,9 +675,91 @@ eligibility.
 An operator intent write supplies the revision it observed and conflicts if the
 revision moved. The write is valid regardless of whether the node is alive,
 stale, draining, or dead, so an operator can forbid work before a dead node
-rejoins. A first registration is claims-enabled only when its stable node ID is
-present in operator-owned node policy; an unexpected node is registered and
-visible with claims disabled.
+rejoins. By default, a first registration is claims-enabled only when its stable
+node ID is present in operator-owned node policy; an unexpected node is
+registered and visible with claims disabled. An owner may opt into automatic
+Node admission as described below.
+
+### Automatic Node admission
+
+`ServerConfig.AutomaticNodeAdmission`, the L1 flag
+`--automatic-node-admission`, and profile `automatic_node_admission` express
+the same opt-in, off by default. Creating a single-use, agent-tagged join key
+is the owner's approval under [#900](https://github.com/Derek-X-Wang/wefty/issues/900).
+L1 does not receive or store that key. It relies on the Fabric to authenticate
+the enrolled caller and its agent principal tag. Startup refuses this opt-in
+unless `PersonIdentityTrustProvider.PersonIdentityTrust()` returns
+`PersonIdentityAuthenticated`. Plain Fabric, an absent trust provider, and
+other trust values are refused. The person-development override has no effect
+on this check. Tests inject an authenticated Fabric double; there is no
+production override for automatic admission.
+
+The owner must create each agent-tagged join key immediately before use,
+make it single-use, and choose a short expiry. Ownership of the agent tag
+must be restricted to private-network administrators. A reusable key is a
+standing admission credential. L1 cannot inspect the key's reuse setting,
+expiry, creation time, or the network's tag-owner policy; these are owner
+preconditions, not facts verified by the admission check. See the
+[fleet setup checklist](../acceptance/v0.2-setup-checklist.md).
+
+Automatic admission requires an authorized agent, a stable Node ID with no
+stored row or configured policy, and an authenticated Fabric identity with no
+Node binding at all. A binding to an unmarked or disabled Node also prevents
+automatic admission. The Node and identity absence checks,
+identity binding, tags, slots, admission mark and initial claims intent commit
+in one write transaction. L1 sets `claims_enabled=true`, assigns only
+`contract.StableNodeTagPrefix + node_id`,
+and uses `DefaultNodePolicy` class capacities: four one-shot Slots and two
+service Slots. The exact reserved tag must already be canonical: an uppercase
+or otherwise invalid ID retains default registration with claims disabled,
+so case folding cannot give two stable IDs the same Pinned tag.
+Neither tags nor capacity come from the
+registration body; capacity capability keys remain invalid.
+
+An existing Node is never automatically admitted later. Without configured
+policy, an identity with any Node binding that registers another stable ID
+receives legacy registration:
+claims disabled, no tags and no admission mark. A reinstall that keeps its
+Fabric identity but selects a new stable Node ID therefore needs the owner's
+`set-claims` action. Setup preserves stable Node IDs, so this is unusual. Add
+an explicit configured Node policy if that replacement needs Pinned routing.
+
+Claim intent never changes on re-registration or heartbeat. A configured
+policy wins. Without one, registration and heartbeat derive fresh default
+policy from the durable admission mark: marked Nodes get their reserved
+Pinned tag and default class slots; unmarked Nodes get no tags and default
+class slots. Removing a configured entry therefore removes its custom slots
+at the next registration or heartbeat, and its custom tags at the next
+registration; a marked Node's tags are also refreshed at heartbeat. An
+unmarked Node's tags refresh only at registration, as before automatic
+admission existed. Stored policy values are not a fallback. Registration cannot re-enable claims after an owner disables
+them, and a different Fabric identity is still refused with `identity_bound`.
+The opt-in gates only new automatic admissions. Turning it off keeps an
+admitted Node's claims intent, Pinned tag and default slots. Use the owner
+intent action to retire one.
+
+The durable optional Node field `automatically_admitted=true` records admission
+provenance on registration, heartbeat, detail and list responses, including
+`wefty --json nodes list` and `wefty --json nodes inspect NODE_ID`. It stays true
+after claim intent changes or a restart. False is omitted, preserving legacy
+response bytes and leaving all pre-existing rows unmarked. The mark records
+provenance and selects the default policy when no configured entry exists;
+it never enables claims on an existing Node.
+The additive SQLite column has a false default. It changes L1's schema
+fingerprint, so the existing upgrade rollback guard refuses to restore older
+binaries across this migration; it never restores an old authority database.
+
+To retire an unexpected Node, use `wefty drain NODE_ID --reason REASON`, or the
+guarded `set-claims` API with `claims_enabled=false` and the observed
+`intent_revision` (CLI: `wefty nodes set-claims NODE_ID --claims-enabled=false
+--intent-revision REV --reason REASON`). Both block new claims durably, even
+across a new boot.
+They allow resident attempts to finish; they do not kill or revoke existing
+work. Inspect resident work and stop or remove it through its own resource
+actions as needed. Then revoke the machine's private-network identity in the
+network's admin page and stop its node agent. Keep the Node record and identity
+binding; L1 has no Node delete/forget verb. Revoking one machine does not
+disable automatic admission for other valid enrolled agents.
 
 `wefty upgrade` uses this same gate after successful build and state preflight,
 with a unique `wefty upgrade ... drain_deadline=TIMESTAMP` intent reason and a durable local receipt of

@@ -1,5 +1,9 @@
 # Daily Mac stack upgrade
 
+A recorded fleet installation role is refused before upgrade preparation or
+recovery. Role-aware fleet upgrade belongs to #901; a fleet receipt never
+selects legacy control-plane service rendering.
+
 `wefty upgrade [--yes] [--drain-timeout DURATION]` upgrades the per-user plain-process installation made
 by `wefty setup` to the latest `main` commit from
 `https://github.com/Derek-X-Wang/wefty.git`. It refuses root, other platforms,

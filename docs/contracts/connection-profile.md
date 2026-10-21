@@ -11,7 +11,8 @@ profile every program needs the same endpoint and identity flags.
 
 Every value a program takes from the profile follows one precedence: an
 explicit flag, then a non-blank environment variable, then the profile, then
-the built-in default. An explicit empty flag (for example `--l3=`) is still an
+the built-in default. Saved service identities have the stricter constraints
+below. An explicit empty flag (for example `--l3=`) is still an
 explicit choice. L1's node admission is replaced whole: any of
 `--node-tags`, `--node-max-oneshot-slots` or `--node-max-service-slots` makes
 L1 ignore the profile's `node_admission`.
@@ -19,9 +20,9 @@ L1 ignore the profile's `node_admission`.
 | Program | Finds the profile | Reads |
 | --- | --- | --- |
 | `wefty` (CLI) | `--profile`, else `$WEFTY_PROFILE`, else `~/.config/wefty/profile.json` when it exists | `fabric`, `plain_fabric_id`, `l1_address` (`--l1`), `l3_address` (`--l3`), `identities.cli`, `identities.person_user_id`, `identities.person_device_id`, `participants.client`, `participants.person` |
-| `wefty-l1` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--listen`), `l3_address` (`--run-ledger`), `allow_plain_person_identities`, `node_admission` |
-| `wefty-l3` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l3_address` (`--listen`), `l1_address` (`--control-plane`) |
-| `wefty-agent` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--control-plane`), `l3_address` (`--run-ledger`), `identities.node` (`--node-id`) |
+| `wefty-l1` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--listen`), `l3_address` (`--run-ledger`), `allow_plain_person_identities`, `node_admission`, `automatic_node_admission`, own `participants.l1`, trusted L3 ID |
+| `wefty-l3` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l3_address` (`--listen`), `l1_address` (`--control-plane`), own `participants.l3`, trusted L1 ID |
+| `wefty-agent` | `--profile`, else `$WEFTY_PROFILE` | `fabric`, `plain_fabric_id`, `l1_address` (`--control-plane`), `l3_address` (`--run-ledger`), `identities.node` (`--node-id`), own `participants.node-agent` |
 
 A named profile must exist. The CLI's default path is optional: when it is
 absent the CLI behaves exactly as before setup. The services read a profile
@@ -34,14 +35,29 @@ it as a diagnostic check and uses its L1 settings only to verify the installed
 node. Setup reads its installation profile to preserve owner settings. OCI
 node commands keep their node-local control-socket path.
 
+`automatic_node_admission` is an optional boolean, false by default. It maps
+to L1's `--automatic-node-admission` flag; an explicit `=false` flag overrides
+a true profile value. It affects only L1's service input digest. Current setup
+does not turn this setting on. L1 refuses to enable it unless the
+Fabric reports authenticated identities through `PersonIdentityTrustProvider`.
+The plain-person development override does not bypass this requirement.
+The setting gates only new admissions. A marked Node keeps its default Pinned
+policy when the setting is turned off. A removed configured policy falls back
+to defaults derived from the Node's admission mark, never its old stored policy.
+See [automatic Node admission](lease-fencing-dispatch.md#automatic-node-admission)
+for first-registration policy and retirement.
+
 ## Format
 
 Version 1 is a JSON object. Unknown fields, trailing data, an unsupported
 version or fabric, a `plain_fabric_id` without the `plain-` prefix, a node
 named twice, negative slots or an invalid tag are refused with the file's path.
 The optional `participants` object extends version 1. Existing phase-1 profiles
-need no migration and are still written without this object. Older binaries
-that reject unknown fields cannot read a profile containing `participants`;
+need no migration and are still written without this object. A profile with
+participant records must explicitly name its `fabric` mode (`plain` or `tsnet`);
+flags cannot supply a missing mode. Older binaries
+that reject unknown fields cannot read a profile containing `participants`
+or `automatic_node_admission`;
 fleet upgrade and rollback wiring must account for that limitation.
 
 ```json
@@ -102,9 +118,21 @@ with no person fields. Missing or expired person sign-in produces typed
 Recovery restores the original saved state or retires the old device and enrols
 a new identity through fleet setup. Public fleet setup is deferred to #900;
 Plain-development identity flags do not repair participant profiles. The CLI
-never falls back to the client. Missing saved state is refused before opening the Fabric.
+never falls back to the client. Participant-profile cluster calls use the
+per-user [client service](client-service.md); they never open the saved backend
+themselves and never fall back to a direct backend when the service is absent.
+Missing saved state is refused before contacting the service. A lock file
+alone does not count as saved state.
 The fleet cutover starts with an empty control plane, so legacy run ownership
 never needs to cross into the strict rule.
+
+Legacy plain profiles never use the client service. Legacy tsnet calls with an
+explicit `--state-dir` still open their backend directly, but now hold exclusive
+participant-folder ownership; a second owner exits 3 with `participant_in_use`.
+All tsnet outbound dials must resolve to a Fabric route and use the checked
+literal IP:port, including legacy callers and Computer endpoints. See the
+[client-service contract](client-service.md) for the caller and destination
+boundaries and #900 lifecycle follow-ups.
 
 For an enrolled tsnet participant, the name and folder are one choice.
 Explicit `--fabric-name` and `--state-dir` must match it. `--auth-key` and
@@ -141,11 +169,15 @@ adds `identity.node_id` and
 `identity.person_sign_in`, with values `signed_in`, `not_signed_in`, or
 `expired`. This describes saved local state; it does not verify remote
 revocation and never opens the person identity. Participant status includes
-the saved client
-check within its command timeout and the 3-second probe limit. A failed backend
+the saved client check through the client service within its command timeout
+and the 3-second probe limit. A failed backend
 check is reported as `participant_check_failed` with identity detail and exit 12,
 without probing L1 or L3. Local profile or saved-state failures detected before
-opening the Fabric remain typed exit 3. Legacy status keeps the base
+contacting the service remain typed exit 3. An absent client service returns
+typed `fabric_unreachable` (exit 13),
+including on `status`. That service-availability error is non-retryable and
+asks the owner to start or repair the service. A busy running service instead
+uses retryable `client_service_busy` (exit 13). Legacy status keeps the base
 identity fields and text.
 
 Cancel keeps the chosen client request shape. For participant profiles, a
@@ -158,6 +190,65 @@ The setup enrolment step is callable independently of service installation.
 The current plain `wefty setup` flow is unchanged. Fleet role flags, service
 configuration for Mac and Linux, and cutover/rollback orchestration are #900.
 See [Fabric enrolment](fabric-enrolment.md) for the step's contract.
+
+## Saved-identity service startup
+
+A participant profile selects the strict identity rule for services as well as
+CLI commands. Each process selects only its own record:
+
+| Process | Record | Exact expected tags |
+| --- | --- | --- |
+| L1 | `participants.l1` | `tag:wefty-control` |
+| L3 | `participants.l3` | `tag:wefty-client` |
+| Node agent | `participants.node-agent` | `tag:wefty-agent` |
+| Client service | `participants.client` | `tag:wefty-client` |
+
+The client service also owns the optional, untagged person participant with its
+saved user ID. Each process supplies the record's logical name, state folder
+and opaque node ID to `fabricconfig.Open` with `ExpectedIdentity`. The client
+backend is verified before the service publishes its socket. Optional person
+sign-in remains checked per operation and does not prevent client operations.
+
+Missing own records, missing saved state, and mismatching live node IDs or exact
+tags refuse startup with `fabric.ParticipantIdentityError`. Services do not
+start a login or enrolment path. Saved state is checked again while holding the
+participant-folder lock, before backend construction. A lock file alone is not
+saved state. No database or service listener is opened on these refusals.
+L1/L3 database-only `--state-preflight` does not open a participant.
+
+Saved service identity is authoritative over bootstrap flags. A join key
+(`--auth-key`, either ambient join-key alias), any control URL override
+(`--control-url` or its environment variable), or `--ephemeral=true` is refused.
+An explicit name or state folder must match the selected record, including an
+explicit empty folder. A different Fabric mode, explicit plain identity, or
+trusted-peer ID is also refused. Matching name/folder flags and
+`--ephemeral=false` are accepted. For the client service these flags select its
+primary client backend; the optional person always uses its own saved name and
+folder. These failures are typed identity refusals,
+not permission to enrol or retry as a different participant. The standalone
+service binaries retain exit 1 for startup errors; `wefty client-service` uses
+the existing identity refusal exit 3. No new exit code is introduced.
+Legacy profiles with no participant records retain their exact flags,
+precedence, identity shape, and bootstrap behavior.
+
+L1 trusts only the opaque node ID in `participants.l3`; L3 trusts only the ID
+in `participants.l1`. A control-plane profile needs both enrolled records.
+Missing peer records or IDs are refused. `l1_address` and `l3_address` select
+transport destinations only; they never supply authorization IDs. Participant profiles never use `run-ledger` or
+`control-plane` as authorization defaults, and never substitute a display name.
+Plain development tests can retain loopback dial addresses alongside the local
+peer participant records. No L1/L3 public HTTP API changes.
+
+For secretless process acceptance, plain participant mode can read an optional
+`plain-identity.json` in each saved folder. It contains a `fabric.Identity` JSON
+object and lets tests vary saved identity independently of profile expectations.
+Wrong node IDs and wrong or extra tags are refused before service startup.
+Existing plain fixtures without that file retain their configured, self-asserted
+identity. This DEVELOPMENT ONLY evidence is not production authentication or an
+attended private-network acceptance result.
+
+See [Installation role and service plan](installation-service-plan.md) for the
+explicit role metadata, platform adapter seam, and participant-aware digests.
 
 ## What setup keeps
 

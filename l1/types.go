@@ -444,23 +444,24 @@ type NodeActiveAttempt struct {
 // for its authenticated caller, never by a store read.
 type Node struct {
 	contract.NodeRegistration
-	State               contract.NodeState       `json:"state"`
-	AuthoritativeTags   []string                 `json:"authoritative_tags"`
-	MaxOneshotSlots     int                      `json:"max_oneshot_slots"`
-	MaxServiceSlots     int                      `json:"max_service_slots"`
-	OneshotOccupancy    int                      `json:"oneshot_occupancy"`
-	ServiceOccupancy    int                      `json:"service_occupancy"`
-	Overcommitted       bool                     `json:"overcommitted"`
-	AuthorityGeneration int64                    `json:"authority_generation"`
-	ClaimsEnabled       bool                     `json:"claims_enabled"`
-	IntentRevision      int64                    `json:"intent_revision"`
-	IntentReason        string                   `json:"intent_reason"`
-	IntentUpdatedAt     *time.Time               `json:"intent_updated_at"`
-	IntentActor         string                   `json:"intent_actor"`
-	LastHeartbeatAt     time.Time                `json:"last_heartbeat_at"`
-	ActiveAttempts      []NodeActiveAttempt      `json:"active_attempts"`
-	LastCondition       *contract.Condition      `json:"last_condition"`
-	AllowedActions      []contract.AllowedAction `json:"allowed_actions"`
+	State                 contract.NodeState       `json:"state"`
+	AuthoritativeTags     []string                 `json:"authoritative_tags"`
+	MaxOneshotSlots       int                      `json:"max_oneshot_slots"`
+	MaxServiceSlots       int                      `json:"max_service_slots"`
+	OneshotOccupancy      int                      `json:"oneshot_occupancy"`
+	ServiceOccupancy      int                      `json:"service_occupancy"`
+	Overcommitted         bool                     `json:"overcommitted"`
+	AuthorityGeneration   int64                    `json:"authority_generation"`
+	ClaimsEnabled         bool                     `json:"claims_enabled"`
+	AutomaticallyAdmitted bool                     `json:"automatically_admitted,omitempty"`
+	IntentRevision        int64                    `json:"intent_revision"`
+	IntentReason          string                   `json:"intent_reason"`
+	IntentUpdatedAt       *time.Time               `json:"intent_updated_at"`
+	IntentActor           string                   `json:"intent_actor"`
+	LastHeartbeatAt       time.Time                `json:"last_heartbeat_at"`
+	ActiveAttempts        []NodeActiveAttempt      `json:"active_attempts"`
+	LastCondition         *contract.Condition      `json:"last_condition"`
+	AllowedActions        []contract.AllowedAction `json:"allowed_actions"`
 }
 
 // OneShotCancelDirective is standing stop delivery for exactly one attempt.

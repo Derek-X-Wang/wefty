@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/fabric/tsnet"
 )
@@ -21,6 +22,8 @@ type Config struct {
 	Ephemeral        bool
 	Logf             func(string, ...any)
 	ExpectedIdentity *fabric.Identity
+	// DeferVerification is for a long-lived owner that checks on every dial.
+	DeferVerification bool
 }
 
 type CloseFunc func() error
@@ -31,7 +34,8 @@ type savedParticipant interface {
 	Close() error
 }
 
-// Open constructs the Fabric and verifies an expected participant before use.
+// Open constructs the Fabric and verifies an expected participant unless its
+// long-lived owner takes responsibility through DeferVerification.
 // The caller must call any non-nil CloseFunc, including on error. Returning
 // cleanup separately lets diagnostics report a failed check before shutdown.
 func Open(ctx context.Context, config Config) (fabric.Fabric, CloseFunc, error) {
@@ -49,8 +53,33 @@ func open(ctx context.Context, config Config, newParticipant func(tsnet.Config) 
 				return nil, nil, fmt.Errorf("fabric config: DEVELOPMENT ONLY plain Fabric ID: %w", err)
 			}
 		}
-		participant := network.NewFabric(config.Identity)
-		return participant, func() error { return nil }, nil
+		release := func() error { return nil }
+		if config.ExpectedIdentity != nil {
+			var err error
+			release, err = participantstate.Acquire(config.StateDirectory, config.Name)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !participantstate.HasSavedState(config.StateDirectory) {
+				return nil, release, &fabric.ParticipantIdentityError{Person: config.ExpectedIdentity.UserID != "", Reason: "state is missing; restore this participant's original saved state"}
+			}
+		}
+		identity := config.Identity
+		if config.ExpectedIdentity != nil {
+			var err error
+			identity, err = plainSavedIdentity(config.StateDirectory, identity)
+			if err != nil {
+				return nil, release, err
+			}
+			participant := &plainParticipant{Fabric: network.NewFabric(identity), expected: *config.ExpectedIdentity, actual: identity, stateDirectory: config.StateDirectory}
+			if !config.DeferVerification {
+				if err := participant.VerifyParticipant(ctx); err != nil {
+					return nil, release, err
+				}
+			}
+			return participant, release, nil
+		}
+		return network.NewFabric(identity), release, nil
 	case "tsnet":
 		if config.Name == "" {
 			return nil, nil, errors.New("fabric config: tsnet name is required")
@@ -67,7 +96,7 @@ func open(ctx context.Context, config Config, newParticipant func(tsnet.Config) 
 		if err != nil {
 			return nil, nil, err
 		}
-		if config.ExpectedIdentity != nil {
+		if config.ExpectedIdentity != nil && !config.DeferVerification {
 			if err := participant.VerifyParticipant(ctx); err != nil {
 				return nil, participant.Close, err
 			}

@@ -32,14 +32,24 @@ func TestParticipantRefusesUnusableOrReplacedIdentityBeforeDial(t *testing.T) {
 		{"untagged-client", `{"BackendState":"Running","Self":{"ID":"saved","UserID":42}}`, true},
 		{"wrong-tag", `{"BackendState":"Running","Self":{"ID":"saved","Tags":["tag:wefty-control"]}}`, true},
 		{"extra-tag", `{"BackendState":"Running","Self":{"ID":"saved","Tags":["tag:wefty-client","tag:wefty-control"]}}`, true},
-		{"client", `{"BackendState":"Running","Self":{"ID":"saved","Tags":["tag:wefty-client"]}}`, false},
+		{"client", `{"BackendState":"Running","Self":{"ID":"saved","Tags":["tag:wefty-client"],"TailscaleIPs":["100.64.0.1"]}}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &Fabric{expectedIdentity: &fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}, client: statusClient(t, tc.status)}
+			if !tc.wantError {
+				status := destinationStatus()
+				if err := json.Unmarshal([]byte(tc.status), status); err != nil {
+					t.Fatal(err)
+				}
+				withDestinationStatus(t, f, status)
+			}
 			dialled := false
 			stop := errors.New("dial boundary")
 			f.dialNode = func(context.Context, string, string) (net.Conn, error) { dialled = true; return nil, stop }
-			_, err := f.Dial(t.Context(), "tcp", "wefty://control-plane")
+			f.dialPlan = func(context.Context, string, string) (netip.AddrPort, bool, error) {
+				return netip.MustParseAddrPort("100.64.0.3:80"), true, nil
+			}
+			_, err := f.Dial(t.Context(), "tcp", "100.64.0.3:80")
 			if tc.wantError {
 				var refused *fabric.ParticipantIdentityError
 				if dialled || !errors.As(err, &refused) || refused.Person {
@@ -120,7 +130,7 @@ func TestOpaqueListenBoundsWaitAndRefusesLogin(t *testing.T) {
 func TestSavedParticipantAndEnrollerNeverPrintLoginHints(t *testing.T) {
 	t.Setenv(printEnrollmentURLEnv, "1")
 	var lines []string
-	f, err := New(Config{Name: "wefty://client/one", StateDir: t.TempDir(), ExpectedIdentity: &fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}, Logf: func(format string, args ...any) { lines = append(lines, format) }})
+	f, err := New(Config{Name: "wefty://client/one", StateDir: savedBackendState(t), ExpectedIdentity: &fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}, Logf: func(format string, args ...any) { lines = append(lines, format) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,6 +215,10 @@ func TestLegacyOpaqueJoinWaitsThroughLoginStates(t *testing.T) {
 				stop := errors.New("transport boundary")
 				reached := false
 				f.dialNode = func(context.Context, string, string) (net.Conn, error) { reached = true; return nil, stop }
+				f.dialPlan = func(_ context.Context, _, address string) (netip.AddrPort, bool, error) {
+					ipp, err := netip.ParseAddrPort(address)
+					return ipp, err == nil, err
+				}
 				f.listenNode = func(string, string) (net.Listener, error) { reached = true; return nil, stop }
 				if operation == "dial" {
 					_, err = f.Dial(t.Context(), "tcp", "remote")
@@ -224,7 +238,7 @@ func TestSavedParticipantKeepsOrdinaryDiagnostics(t *testing.T) {
 		t.Run(optedIn, func(t *testing.T) {
 			t.Setenv(printEnrollmentURLEnv, optedIn)
 			var lines []string
-			f, err := New(Config{Name: "wefty://client/one", StateDir: t.TempDir(), ExpectedIdentity: &fabric.Identity{NodeID: "saved"}, Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }})
+			f, err := New(Config{Name: "wefty://client/one", StateDir: savedBackendState(t), ExpectedIdentity: &fabric.Identity{NodeID: "saved"}, Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -306,7 +320,7 @@ func (*participantWaitBody) Close() error { return nil }
 func TestParticipantLoginFilterHandlesMultipleURLsAndLines(t *testing.T) {
 	t.Setenv(printEnrollmentURLEnv, "1")
 	var lines []string
-	f, err := New(Config{Name: "wefty://client/one", StateDir: t.TempDir(), ExpectedIdentity: &fabric.Identity{NodeID: "saved"}, Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }})
+	f, err := New(Config{Name: "wefty://client/one", StateDir: savedBackendState(t), ExpectedIdentity: &fabric.Identity{NodeID: "saved"}, Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -118,6 +118,7 @@ type globalOptions struct {
 	nodeConfigPath     string
 	oneshotLoadLimit   *float64
 	profilePath        string
+	profileFabric      string
 	participants       map[string]connprofile.Participant
 	// explicitFlags names the global flags the caller passed, so the
 	// connection profile never overrides one of them.
@@ -125,7 +126,7 @@ type globalOptions struct {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	return runWithFabricOpener(ctx, args, stdout, stderr, fabricconfig.Open)
+	return runWithFabricOpener(ctx, args, stdout, stderr, openCLIFabric)
 }
 
 func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.Writer, openFabric func(context.Context, fabricconfig.Config) (fabric.Fabric, fabricconfig.CloseFunc, error)) (result error) {
@@ -158,6 +159,9 @@ func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.W
 	}
 	if commandArgs[0] == "setup" {
 		return executeSetup(ctx, options, commandArgs[1:], stdout, stderr)
+	}
+	if commandArgs[0] == "client-service" {
+		return executeClientService(ctx, options, commandArgs[1:], stdout, stderr)
 	}
 	if wantsCommandHelp(commandArgs) {
 		return executeCommandHelp(ctx, options, commandArgs, stdout, stderr)
@@ -331,6 +335,7 @@ func applyConnectionProfile(options *globalOptions) error {
 	options.oneshotLoadLimit = &limit
 	settings := profile.CLI()
 	options.participants = profile.Participants
+	options.profileFabric = profile.Fabric
 	layer := connprofile.Layer{Explicit: options.explicitFlags}
 	layer.Fill(&options.fabricMode, "fabric", "", settings.Fabric)
 	layer.Fill(&options.l1Address, "l1", l1AddressEnv, settings.L1)

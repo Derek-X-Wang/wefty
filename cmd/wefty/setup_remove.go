@@ -14,14 +14,17 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
 const setupManifestName = "setup-files.json"
 
 type setupManifest struct {
+	Role             serviceplan.Role  `json:"role,omitempty"`
 	InstalledVersion string            `json:"installed_version,omitempty"`
 	UpgradeSource    bool              `json:"upgrade_source,omitempty"`
 	Version          int               `json:"version"`
@@ -334,7 +337,13 @@ func purgeSetupParticipants(root *os.Root, paths setupPaths, report *setupRemove
 			report.Warnings = append(report.Warnings, "left "+filepath.Join(paths.home, rel)+": this is not an enrolled participant folder; inspect it before removing it yourself")
 			continue
 		}
-		if err := root.RemoveAll(rel); err != nil {
+		release, err := participantstate.Acquire(filepath.Join(paths.home, rel), entry.Name())
+		if err != nil {
+			return err
+		}
+		removeErr := root.RemoveAll(rel)
+		releaseErr := release()
+		if err := errors.Join(removeErr, releaseErr); err != nil {
 			return err
 		}
 		report.Changes = append(report.Changes, filepath.Join(paths.home, rel))

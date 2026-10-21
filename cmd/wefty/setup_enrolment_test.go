@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
+	"github.com/Derek-X-Wang/wefty/fabric/tsnet"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 )
@@ -254,5 +256,114 @@ func TestSetupMissingRecordedParticipantExplainsRecovery(t *testing.T) {
 	_, err = enrolSetupParticipants(t.Context(), request)
 	if err == nil || !strings.Contains(err.Error(), "restore") || !strings.Contains(err.Error(), "participant record") || len(e.roles) != 1 {
 		t.Fatalf("roles=%v recovery=%v", e.roles, err)
+	}
+}
+
+func TestSetupEnrolLockRefusalPreservesOwnerFolder(t *testing.T) {
+	f := newSetupFixture(t)
+	paths, err := resolveSetupPaths(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(paths.data, "fabric", "client")
+	release, err := participantstate.Acquire(state, "wefty://client/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	_, err = enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"client", "wefty://client/test"}}, enroller: tsnet.Enroller{}, input: strings.NewReader("unused-key\n")})
+	var inUse *fabric.ParticipantInUseError
+	if !errors.As(err, &inUse) {
+		t.Fatalf("locked enrolment=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, participantstate.LockName)); err != nil {
+		t.Fatalf("deleted another owner's folder: %v", err)
+	}
+}
+
+func TestSetupRecordedLockFileIsNotSavedIdentity(t *testing.T) {
+	f := newSetupFixture(t)
+	paths, err := resolveSetupPaths(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(paths.data, "fabric", "client")
+	release, err := participantstate.Acquire(state, "wefty://client/test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = release()
+	if err := connprofile.Write(paths.profile, connprofile.Profile{Version: 1, Fabric: "tsnet", Participants: map[string]connprofile.Participant{"client": {Name: "wefty://client/test", NodeID: "client", StateDirectory: state}}}); err != nil {
+		t.Fatal(err)
+	}
+	enroller := &fakeSetupEnroller{}
+	_, err = enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"client", "wefty://client/test"}}, enroller: enroller, input: strings.NewReader("unused-key\n")})
+	if err == nil || !strings.Contains(err.Error(), "state is missing") || len(enroller.roles) != 0 {
+		t.Fatalf("lock-only record accepted: %v", err)
+	}
+}
+
+type busyRollbackEnroller struct{ fakeSetupEnroller }
+
+func (e *busyRollbackEnroller) Logout(ctx context.Context, spec fabric.EnrolSpec) error {
+	return (tsnet.Enroller{}).Logout(ctx, spec)
+}
+func TestSetupRollbackLockRefusalPreservesOwnerState(t *testing.T) {
+	f := newSetupFixture(t)
+	paths, err := resolveSetupPaths(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(paths.data, "fabric", "client")
+	enroller := &busyRollbackEnroller{fakeSetupEnroller{wrongTag: "client", afterEnrol: func() error {
+		release, err := participantstate.Acquire(state, "wefty://client/test")
+		if err == nil {
+			t.Cleanup(func() { _ = release() })
+		}
+		return err
+	}}}
+	_, err = enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"client", "wefty://client/test"}}, enroller: enroller, input: strings.NewReader("unused-key\n")})
+	var inUse *fabric.ParticipantInUseError
+	if !errors.As(err, &inUse) {
+		t.Fatalf("rollback refusal=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "saved-identity")); err != nil {
+		t.Fatalf("deleted the new owner's saved state: %v", err)
+	}
+}
+
+type newOwnerAfterLogoutEnroller struct {
+	fakeSetupEnroller
+	state   string
+	release func() error
+}
+
+func (e *newOwnerAfterLogoutEnroller) Logout(context.Context, fabric.EnrolSpec) error {
+	release, err := participantstate.Acquire(e.state, "wefty://client/test")
+	if err != nil {
+		return err
+	}
+	e.release = release
+	return os.WriteFile(filepath.Join(e.state, "new-owner"), []byte("keep"), 0o600)
+}
+func TestRollbackRefusesNewOwnerAfterLogoutCloses(t *testing.T) {
+	f := newSetupFixture(t)
+	paths, err := resolveSetupPaths(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &newOwnerAfterLogoutEnroller{fakeSetupEnroller: fakeSetupEnroller{wrongTag: "client"}, state: filepath.Join(paths.data, "fabric", "client")}
+	defer func() {
+		if e.release != nil {
+			_ = e.release()
+		}
+	}()
+	_, err = enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"client", "wefty://client/test"}}, enroller: e, input: strings.NewReader("unused-key\n")})
+	var inUse *fabric.ParticipantInUseError
+	if !errors.As(err, &inUse) {
+		t.Fatalf("rollback did not refuse new owner: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.state, "new-owner")); err != nil {
+		t.Fatalf("rollback deleted new owner's state: %v", err)
 	}
 }

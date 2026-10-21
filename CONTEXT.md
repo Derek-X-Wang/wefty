@@ -69,6 +69,15 @@ interpret into runs. Named for what a loom follows. Reserved so it can never
 be confused with a workflow, which is executable code.
 _Avoid_: calling any future declarative layer a "workflow"
 
+### Installation
+
+**Installation role**:
+The explicit choice of which Wefty processes one installation runs.
+`control-plane` runs L1, L3, the node agent and the client service. `join`
+runs the node agent and client service. An existing plain installation has no
+fleet role. Partial participant enrolment never determines a role.
+_Avoid_: inferred role, participant role, Node role
+
 ### Scheduling and execution (L1, the cluster)
 
 **Read snapshot**:
