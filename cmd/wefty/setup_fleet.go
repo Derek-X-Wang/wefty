@@ -364,10 +364,35 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	// Validate a completed installation without rewriting its active profile.
 	var profile connprofile.Profile
 	manifest := setupManifest{Version: 1, Role: role, Files: map[string]string{}}
+	conversion, err := readPlainConversion(paths)
+	if err != nil {
+		return report, err
+	}
+	if conversion != nil {
+		if !conversionForward(conversion) {
+			return report, errors.New("conversion history is incomplete")
+		}
+	}
 	committed := false
 	if payload, err := root.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
 		if json.Unmarshal(payload, &manifest) != nil || manifest.Version != 1 || manifest.Role != role || manifest.Files == nil {
 			return report, errors.New("invalid recorded fleet role receipt; restore it before setup")
+		}
+		if manifest.History != nil || conversion != nil {
+			if manifest.History == nil || conversion == nil {
+				return report, errors.New("converted role receipt or plain conversion record is missing history metadata; restore the original records")
+			}
+			recorded, err := json.Marshal(manifest.History)
+			if err != nil {
+				return report, err
+			}
+			expected, err := json.Marshal(conversion.History)
+			if err != nil {
+				return report, err
+			}
+			if !bytes.Equal(recorded, expected) {
+				return report, errors.New("converted role receipt history differs from its conversion record; restore the original receipt")
+			}
 		}
 		committed = true
 		if err := checkFleetProfileFile(paths.profile); err != nil {
@@ -390,6 +415,10 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return report, err
+	}
+
+	if !committed && conversion != nil {
+		manifest.History = &conversion.History
 	}
 
 	if committed && role == serviceplan.Join && record.WithPerson {

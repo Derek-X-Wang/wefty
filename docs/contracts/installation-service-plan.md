@@ -33,17 +33,18 @@ bytes and input digests remain unchanged.
 
 Removal targets identify the service and binary, plus the client socket and
 its publication lock and their private runtime folder (only when empty). They
-do not authorize deletion of databases, participant state, or retained history. The later removal caller must stop each selected
-service and confirm absence before deleting runtime files. Unknown files stay.
+do not authorize deletion of databases, participant state, or retained history.
+The later removal caller must stop each selected service and confirm absence
+before deleting runtime files. Unknown files stay.
 
 On a fresh Mac, `wefty setup --role control-plane` selects the fleet control
 plane. Without a role, a new installation still uses the byte-identical legacy
 plain plan. A committed fleet receipt continues its explicit role on a rerun.
 A different role, an unknown role, a missing fleet resume record, or fleet setup
-over an existing plain installation is refused before mutation. An uncommitted
-role also refuses existing LaunchAgent definitions or loaded services, databases
-and SQLite recovery sidecars; it must not adopt stale authority. Plain conversion
-remains a later slice. A fresh Mac can join using
+over an existing plain installation without explicit conversion is refused before
+mutation. An uncommitted role also refuses existing LaunchAgent definitions or
+loaded services, databases and SQLite recovery sidecars; it must not adopt stale
+authority. Explicit plain-to-join conversion is described below. A fresh Mac can join using
 `wefty setup --role join --join-code CODE`. The control plane prints its
 non-secret `join_code` in JSON and labelled text on first setup and every
 committed setup rerun. The code never selects an enrolment coordinator. A
@@ -59,7 +60,7 @@ Removal refuses both staged and committed
 fleet roles until role-aware removal can stop the client service and retain
 identity records. Upgrade continues to refuse any recorded
 fleet role until #901. It also refuses a non-plain profile in the uncommitted
-publication window described below. Role-aware removal, history, doctor, upgrade,
+publication window described below. Role-aware removal, doctor, upgrade,
 and Linux adapters remain their own slices.
 
 ## Durable setup and publication
@@ -244,3 +245,163 @@ L1 also fingerprints the enrolled L3 node ID it trusts. L3 fingerprints the
 enrolled L1 node ID it trusts. Changing either control-service ID therefore
 invalidates that service and its trusting peer. No other service's local state
 is included. Legacy projections omit all added fields, preserving their bytes.
+
+## Explicit plain Mac conversion
+
+`wefty setup --role join --join-code CODE --convert-plain [--with-person]`
+converts the existing plain Mac installation. The flag is required for the
+first conversion and for every pre-history recovery. Plain setup reruns never
+infer conversion. `--role join` without the flag and `--role control-plane`
+continue to refuse an existing plain installation. The new control plane starts
+empty. Conversion keeps the scheduling Node ID from `node.json`; it refuses a
+conflicting `--node-id`, OCI configuration, or a non-plain source profile.
+The three existing plain LaunchAgents must be running for the initial verified
+drain. If they are not, repair the plain installation with plain setup first.
+
+For the attended cutover (#903), run the **new** CLI by its full path for both
+conversion and recovery, for example `/absolute/path/to/new/wefty setup ...`.
+The installed pre-conversion CLI does not understand the conversion record and
+must not be used for maintenance during an incomplete cutover.
+
+Before changing admission, conversion validates the join code and independently
+selected coordinator, source CLI/agent binaries and service plan. It acquires
+the same installation lock as setup and upgrade. A private version-1
+`plain-conversion.json` in the configuration directory records the original
+plain profile, exact LaunchAgent definitions, stable Node ID, join code,
+optional person choice, phase, and history inventory. It is durable **before
+claims are disabled or any service stops**. No key or login URL goes into it.
+Before the history boundary, a retry may choose a different join code or person
+option: no fleet participant has been enrolled yet. Interrupted upgrade staging
+(`.upgrade-*`, including preflight database copies) refuses conversion before
+draining or creating a conversion record. Recover it with plain `wefty upgrade`
+first, then retry conversion.
+
+Conversion reuses plain upgrade's revision-fenced drain receipt and recovery
+path. It disables new claims, waits up to five minutes for one-shots and
+rechecks intent and attempts immediately before stopping. There is no forced
+conversion or `--yes`. Timeout returns existing conflict exit 5 with advice to
+retry later. A service attempt blocks conversion and is listed by job/attempt
+ID. A Computer placed or bound on this Node also blocks it, even when stopped
+or removal is pending. Retired Computers with desired state `removed` are
+skipped, as in L1's policy, except while their removal outcome or current job
+still says `removal_pending`. Removal intent already sets desired state to
+`removed` before cleanup finishes. Conversion lists blocking IDs and advises
+normal lifecycle completion or retirement.
+Computer inventory uses the existing paginated public API, with no authority
+store open. An unavailable or incomplete inventory refuses conversion.
+Refusal restores only conversion-owned claim intent; an earlier or newer
+operator disable remains disabled. No service restart API is called.
+
+An empty resident-attempt list alone is not enough. Before stopping, conversion
+reads every page of L1 jobs and L3 runs through the existing APIs within one
+five-second budget. It refuses queued one-shots, services with desired state
+`running` (including restart backoff with no attempt), and runs in `pending`,
+`dispatching`, `queued`, `running` or `awaiting-input`. Refusal is exit 5 and
+lists job/run IDs with `wefty cancel` and `wefty services stop` advice. Unknown,
+incomplete or repeated-cursor inventories refuse rather than imply emptiness.
+After the node agent stops, while L1/L3 are still available, the same inventory
+is checked again before stopping those authorities and moving any history.
+
+With claims disabled and resident one-shots drained, conversion waits up to
+30 seconds for the node agent's pending evidence outbox to empty. A read-only
+SQLite inspection uses the agent's existing pending-delivery semantics, without
+initialization or migrations; pending removal evidence also blocks conversion.
+Delivered receipts, suppressed completions and sealed tombstone history are
+not pending delivery. Timeout refuses before stopping, retains all evidence in
+the plain outbox and restores owned claims. Unreadable outbox state refuses.
+The outbox is checked again after the agent stops; late evidence refuses the
+cutover and restores the plain stack instead of being sent to a new authority.
+
+After drain, conversion unloads node agent, L3 and L1, and confirms each absent
+through the LaunchAgent manager. Only then does it remove their active plist
+files. Their exact bytes remain in the conversion record for pre-history
+recovery. Missing restart definitions prevent login from starting an authority
+store during the move. Conversion inventories the closed files without calling
+`l1.OpenStore`, `l3.OpenStore`, migrations or database preflight.
+Before inventory, bounded `lsof` inspection verifies that no other process has
+the L1/L3 database files or known sidecars open, including read handles. An open
+file refuses conversion; failed inspection is unverified and also refuses.
+
+History lives at
+`~/Library/Application Support/wefty/plain-history/<stable-node-id>/`.
+The fixed dataset is `l1.sqlite`, `l3.sqlite`, each database's `-wal`, `-shm`
+and `-journal` sidecars, `l1.sqlite.authority-instance`, its durable creation
+staging files (`l1.sqlite.authority-instance.tmp-` plus exactly sixteen lowercase
+hexadecimal digits), and the whole `exec-captures/` tree, including incomplete
+uploads. Missing optional files are allowed. Both main database files must exist.
+Unknown data entries and all logs stay where they are. Symbolic links, hard links
+and special files in this dataset refuse conversion, with one narrow exception:
+if the authority identity has exactly two links and the second is an exact
+known durable creation staging name in the same folder, conversion removes and
+syncs that staging link. This is the crash window between durable publication's
+link and unlink. The canonical identity bytes stay unchanged. Unknown link names,
+different inodes or additional links still refuse.
+Each file's relative name, original mode, size and SHA-256 hash is recorded
+before any rename. Directories, including empty directories, are recorded too.
+Every move syncs both parent directories. Conversion verifies the closed
+inventory after moving, changes files to `0400` and directories to `0500`,
+syncs the permission changes and verifies the hashes and read-only modes again.
+The installation receipt records the history location, total file bytes,
+`read_only: true`, `never_restore: true` and full inventory.
+
+The restore-versus-forward boundary is the durable `history` phase in
+`plain-conversion.json`, after the entire dataset has moved and is read-only:
+
+- Before this phase, an error restores the original file locations and modes,
+  restarts the exact plain definitions and restores owned claims. A hard kill
+  leaves the phase and rename inventory; the next explicit conversion first
+  completes this recovery, then retries drain. Recovery records `restoring`
+  before restarting plain services, so later crashes never compare a running
+  database against the earlier closed inventory. Once original services are
+  confirmed running, owned claims are restored and the drain receipt is gone,
+  conversion durably deletes its record. Plain setup, upgrade and removal are
+  then available again. Failed restoration retains both recovery records and
+  gives conversion-specific advice, not an upgrade command that would refuse.
+- At and after this phase, conversion **only moves forward**. It never puts
+  history back in active locations, opens it through store code, or restarts
+  the old L1/L3. This is retained evidence, never recovery authority
+  ([ADR-0003](../adr/0003-never-restore-stale-authority.md)). A failure to verify
+  the durable boundary fails closed.
+
+To abandon a pre-history conversion after a crash or failed restoration, run
+`/absolute/path/to/new/wefty setup --role join --convert-plain --abandon-conversion`.
+This requires no join code or keys. Repair plain L1/service reachability first
+if needed; the command finishes the recorded restoration and deletes the record
+only after success. A normal explicit conversion retry also completes that
+restoration first, then starts a new recorded drain with the selected join
+inputs. Abandon is refused after the history boundary and never restores
+historical authority.
+
+Forward setup removes the old active profile and plain receipt, retires the old
+claim receipt without replaying it against the fleet, and records `joining`.
+It then uses the existing join stage: node agent → client → optional person,
+each saved before the next enrolment; peer verification; complete profile;
+role receipt; then node agent and client service activation. No old L1/L3
+LaunchAgent is rendered or started. Each forward rerun confirms old L1/L3 are
+unloaded and resumes existing staged participants. History hashes and read-only
+modes are verified only until the joining profile is published. After
+publication, setup does not rehash history or block on its contents or absence.
+The owner may archive it elsewhere, edit it or deliberately delete it, granting
+owner write permission on read-only directories first if needed. Receipt metadata
+remains the record of the cutover dataset, not a current existence/hash claim.
+Wefty itself never restores that data as authority or deletes it during setup,
+remove or purge.
+A completed conversion rerun continues the recorded join role without keys.
+Publication and activation retain the same ordered commit points and readiness
+limits as fresh joining setup.
+
+The conversion report adds `history` and `join_result` (`joined` or
+`incomplete`) to setup JSON. Text names the location and byte size, states that
+history is read-only and never restored, and reports the joining result and
+existing readiness checks. Both formats remind the operator that `wefty upgrade`
+refuses fleet roles until role-aware upgrade (#901). A post-history failure
+still prints the retained-history report, with the existing error exit.
+
+Removal remains refused for fleet installations and incomplete conversions.
+History is never on the purge allowlist. The code also skips the entire
+`plain-history/` entry explicitly, with or without any manifest/history record,
+including its directories and any future files. Neither `--remove` nor
+`--purge` deletes retained history. Future role-aware removal must preserve the
+history record as well as the data; it must not treat receipt paths as deletion
+authority. Installs that never convert keep their existing setup, service,
+removal, purge and upgrade behavior and file bytes.

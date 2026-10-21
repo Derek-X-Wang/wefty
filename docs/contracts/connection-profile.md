@@ -219,8 +219,9 @@ envelope.
 
 The setup enrolment step is callable independently of service installation.
 The plain `wefty setup` flow is unchanged. Mac control-plane setup uses a durable
-staged profile and ordered publication; joining, Linux and conversion remain
-later #900 slices. See [installation roles](installation-service-plan.md).
+staged profile and ordered publication. Joining and explicit plain-to-join
+conversion use the same staged publication; Linux remains a later #900 slice.
+See [installation roles](installation-service-plan.md).
 See [Fabric enrolment](fabric-enrolment.md) for the step's contract.
 
 ## Saved-identity service startup
