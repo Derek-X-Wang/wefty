@@ -18,8 +18,6 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/tsnet"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
-	"github.com/Derek-X-Wang/wefty/l1"
-	"github.com/Derek-X-Wang/wefty/l3"
 	"golang.org/x/term"
 )
 
@@ -237,15 +235,15 @@ func scrubSetupEnrolmentError(err error, key string) error {
 func setupParticipantPolicy(role string) (string, []string, bool) {
 	switch role {
 	case connprofile.ParticipantClient:
-		return "wefty://client/", []string{l1.DefaultClientPrincipalTag}, true
+		return "wefty://client/", connprofile.ParticipantRoleTags(role), true
 	case connprofile.ParticipantPerson:
-		return "wefty://person/", nil, true
+		return "wefty://person/", connprofile.ParticipantRoleTags(role), true
 	case connprofile.ParticipantNodeAgent:
-		return "wefty://node/", []string{l1.DefaultAgentPrincipalTag}, true
+		return "wefty://node/", connprofile.ParticipantRoleTags(role), true
 	case connprofile.ParticipantL1:
-		return "wefty://control-plane", []string{"tag:wefty-control"}, true
+		return "wefty://control-plane", connprofile.ParticipantRoleTags(role), true
 	case connprofile.ParticipantL3:
-		return "wefty://run-ledger", []string{l3.DefaultCallerPrincipalTag}, true
+		return "wefty://run-ledger", connprofile.ParticipantRoleTags(role), true
 	default:
 		return "", nil, false
 	}

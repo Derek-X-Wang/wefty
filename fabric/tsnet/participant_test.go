@@ -130,7 +130,7 @@ func TestOpaqueListenBoundsWaitAndRefusesLogin(t *testing.T) {
 func TestSavedParticipantAndEnrollerNeverPrintLoginHints(t *testing.T) {
 	t.Setenv(printEnrollmentURLEnv, "1")
 	var lines []string
-	f, err := New(Config{Name: "wefty://client/one", StateDir: t.TempDir(), ExpectedIdentity: &fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}, Logf: func(format string, args ...any) { lines = append(lines, format) }})
+	f, err := New(Config{Name: "wefty://client/one", StateDir: savedBackendState(t), ExpectedIdentity: &fabric.Identity{NodeID: "saved", Tags: []string{"tag:wefty-client"}}, Logf: func(format string, args ...any) { lines = append(lines, format) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestSavedParticipantKeepsOrdinaryDiagnostics(t *testing.T) {
 		t.Run(optedIn, func(t *testing.T) {
 			t.Setenv(printEnrollmentURLEnv, optedIn)
 			var lines []string
-			f, err := New(Config{Name: "wefty://client/one", StateDir: t.TempDir(), ExpectedIdentity: &fabric.Identity{NodeID: "saved"}, Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }})
+			f, err := New(Config{Name: "wefty://client/one", StateDir: savedBackendState(t), ExpectedIdentity: &fabric.Identity{NodeID: "saved"}, Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -320,7 +320,7 @@ func (*participantWaitBody) Close() error { return nil }
 func TestParticipantLoginFilterHandlesMultipleURLsAndLines(t *testing.T) {
 	t.Setenv(printEnrollmentURLEnv, "1")
 	var lines []string
-	f, err := New(Config{Name: "wefty://client/one", StateDir: t.TempDir(), ExpectedIdentity: &fabric.Identity{NodeID: "saved"}, Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }})
+	f, err := New(Config{Name: "wefty://client/one", StateDir: savedBackendState(t), ExpectedIdentity: &fabric.Identity{NodeID: "saved"}, Logf: func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }})
 	if err != nil {
 		t.Fatal(err)
 	}

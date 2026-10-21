@@ -8,9 +8,15 @@ identity. The socket peer's user ID is never substituted for that identity.
 
 `client-service` is an internal lifecycle subcommand. Start it with
 `wefty --profile PROFILE client-service`. It reads the existing participant
-records and never enrols, creates, or repairs a participant. The person remains
+records and never enrols, creates, or repairs a participant. Its client backend
+must match its saved identity before the service publishes its socket. Missing
+state and conflicting bootstrap overrides are typed startup refusals; see
+[connection profile](connection-profile.md#saved-identity-service-startup). The person remains
 optional and laptop-only. Missing or expired person sign-in does not prevent
-client operations. Each check and dial verifies the saved participant before
+client operations. This includes saved person state disappearing between local
+validation and backend construction: a typed person identity refusal keeps the
+client service running, and person requests retain their sign-in refusal.
+Each check and dial verifies the saved participant before
 an application connection is used. The service holds backend ownership even
 when a check fails, so a CLI process cannot replace or reopen the backend.
 A changed participant node ID requires restarting the service with the new
