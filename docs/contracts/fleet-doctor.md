@@ -23,6 +23,7 @@ a `role-receipt` error finding with advice and exit 12, not a bare command error
 | Participant files | Each recorded local participant, including optional person | Each recorded local participant, including optional person |
 | Node metadata, recorded PATH, skill copies | Required | Required |
 | Client reachability | L1 and L3 through the running client service | Same |
+| Control-service peers | Both directions through service-owned read-only peer probes | Same |
 | Local admission | Alive, claims enabled, configured Pinned tag and class slots | Alive, claims enabled, automatic-admission mark, only its Pinned tag, default class slots |
 | Mac host | Read-only system sleep and FileVault probes | Not run |
 
@@ -58,7 +59,9 @@ Fleet JSON adds `role` and `policy_evidence` to the existing version-1 finding
 shape and uses `install: "fleet-process"`. Findings retain `check`, `severity`,
 `detail` and `fix`; every warning or error has advice. `healthy` covers the local
 checklist and client reachability, not full private-network policy enforcement.
-Expected missing peer evidence does not itself make a healthy checklist fail.
+Missing-version peer evidence does not itself make a healthy checklist fail.
+A FAILED peer observation makes the checklist fail; VERIFIED requires the
+service to reach its configured enrolled peer. See [peer health](peer-health.md).
 
 Non-advisory local doctor findings return the existing not-ready exit 12. Live
 identity or permission refusals retain exit 3; missing client service and uncertain remote
@@ -66,7 +69,7 @@ transport retain exit 13. Identity refusal takes precedence over transport
 uncertainty when both are observed. Invalid local profile/configuration remains
 a doctor finding. A missing saved client identity retains exit 3. Cancellation
 retains exit 1. After a diagnosis is printed, JSON stderr does not contain a
-second error document. No new exit code or L1/L3 API is introduced.
+second error document. No new exit code is introduced. The additive read-only peer APIs are published in the L1 client and L3 contracts.
 
 ## Private network policy
 
@@ -107,8 +110,17 @@ Each policy evidence entry carries `check`, `status` and `detail`. A successful
 client-service read of L1 nodes or L3 runs is `VERIFIED` allow evidence for that
 direction only. A live permission or identity refusal is `REFUSED`, with an
 explicit note that an application refusal does not prove a network-policy deny.
-Transport uncertainty stays `NOT-RUN`. Node-agent directions, L1↔L3 control
-traffic (slice 6b), owner L1 person-command access, owner publication access,
+Transport uncertainty in these client-to-service reads stays `NOT-RUN`.
+The separate `L1 → L3 direction` and `L3 → L1 direction` entries read each
+service's client-only peer observer through the running client service. They
+report VERIFIED or FAILED only from a 200 observation. An unreadable observer
+is NOT-RUN with `peer observer could not be read; direction unverified`;
+a client 401/403 is REFUSED. If the shared doctor budget expires, the direction
+is NOT-RUN with `doctor time budget expired`, and remaining peer requests do
+not start. A missing observer or ping on an older version is NOT-RUN with
+`peer probe unavailable on this version`. No person or service
+participant backend is opened again. Node-agent directions, owner L1
+person-command access, owner publication access,
 cross-machine publication denial, and tag ownership remain `NOT-RUN` unless their own cooperating-peer or owner
 checks exist. Doctor never declares a deny verified from one machine's evidence.
 The attended run must check allowed and refused traffic against the full policy,

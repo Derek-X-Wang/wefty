@@ -235,11 +235,14 @@ client → L3, L3 → L1 dispatch as the saved ledger, and node claim/completion
 not-ready exit 12, keeps the installation published and prints all results.
 Rerun setup after repair without re-enrolling.
 
-Each check is VERIFIED, FAILED or NOT-RUN. The control-plane report includes
-`L1 → L3 direction: NOT-RUN (no read-only probe yet; covered by doctor later)`.
-The joining report omits that control-plane-only direction. Neither client
-reachability nor an empty dispatch hold proves that direction.
-No L1/L3 public API or live daemon health report is added by this slice.
+Each check is VERIFIED, FAILED or NOT-RUN. Both fleet roles read the
+[service-owned peer probes](peer-health.md) through the running client service
+as its saved client. `L1 → L3 direction` and `L3 → L1 direction` are VERIFIED
+only when the service reached and authenticated its configured peer. Failed
+observations are FAILED. An older service without the observer or peer ping
+route is NOT-RUN with `peer probe unavailable on this version`; this alone
+does not fail readiness. Neither client reachability nor an empty dispatch
+hold proves a peer direction. Plain setup does not use these probes.
 
 ## Service input digests
 

@@ -8,6 +8,32 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/peer-health": {
+      "get": {
+        "operationId": "getL1PeerHealth",
+        "summary": "Observe the configured peer from L1",
+        "description": "Client principal only; bearer and person authority do not grant access. One read-only peer ping through this service's own Fabric, with a two-second ceiling and overlapping requests coalesced. The authenticated network dials only the enrolled opaque peer ID; answering identity is also checked through Fabric WhoIs. Plain in-process identity is self-asserted development evidence. No database, lease or authority change. A 200 result can report unreachable; error_class contains only a bounded protocol class. not_found means the peer ping is unavailable on that version.",
+        "responses": {
+          "200": { "description": "Fresh peer observation", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/PeerHealth" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/peer/ping": {
+      "get": {
+        "operationId": "pingL1Peer",
+        "summary": "Read-only configured-peer ping",
+        "description": "Only the exact trusted run ledger opaque Fabric node ID may call. No principal rule on another route changes. Returns a minimal pong without reading or writing the database, granting authority, renewing anything or initiating another request.",
+        "responses": {
+          "200": { "description": "Configured peer accepted", "content": { "application/json": { "schema": { "$ref": "./common.v1.json#/components/schemas/PeerPong" } } } },
+          "401": { "$ref": "./common.v1.json#/components/responses/Unauthorized" },
+          "403": { "$ref": "./common.v1.json#/components/responses/Forbidden" },
+          "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" }
+        }
+      }
+    },
     "/v1/computer-handle-resolutions/{computer}": {
       "parameters": [
         { "name": "computer", "in": "path", "required": true, "schema": { "type": "string", "minLength": 1 } },

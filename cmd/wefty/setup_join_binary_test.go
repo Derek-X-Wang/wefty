@@ -49,7 +49,7 @@ func TestSetupJoinFlagsExitsAndReportsFromRealBinary(t *testing.T) {
 			t.Fatalf("join: %d %s %s", exit, out, diagnostics)
 		}
 		var report setupReport
-		if json.Unmarshal([]byte(out), &report) != nil || report.Role != "join" || len(report.Services) != 2 || len(report.Readiness) != 6 || len(report.Participants) != 2+boolInt(person) {
+		if json.Unmarshal([]byte(out), &report) != nil || report.Role != "join" || len(report.Services) != 2 || len(report.Readiness) != 8 || len(report.Participants) != 2+boolInt(person) {
 			t.Fatalf("report: %s", out)
 		}
 		assertJoinArtifactsPrivate(t, home, diagnostics, report, "single-use-node", "single-use-client", "https://login.invalid/one-use")

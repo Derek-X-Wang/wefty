@@ -132,7 +132,7 @@ func TestSetupJoinPublishesTwoServicesAndResumes(t *testing.T) {
 		t.Fatalf("start order: %v", started)
 	}
 	for _, check := range report.Readiness {
-		if check.Status != "VERIFIED" || strings.Contains(check.Check, "L1 → L3") {
+		if check.Status != "VERIFIED" {
 			t.Fatalf("join readiness: %+v", report.Readiness)
 		}
 	}

@@ -18,20 +18,22 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/peerprobe"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 type ServerConfig struct {
 	// Logf receives error request completion events; nil uses log.Printf.
-	Logf               func(string, ...any)
-	CallerPrincipalTag string
-	ControlPlaneNodeID string
-	Reconciler         *Reconciler
-	Jobs               JobClient
-	Logs               JobLogClient
-	Results            JobResultClient
-	ComputerGrants     ComputerGrantVerifier
-	HostBootSessions   HostBootSessionVerifier
+	Logf                func(string, ...any)
+	CallerPrincipalTag  string
+	ControlPlaneNodeID  string
+	ControlPlaneAddress string
+	Reconciler          *Reconciler
+	Jobs                JobClient
+	Logs                JobLogClient
+	Results             JobResultClient
+	ComputerGrants      ComputerGrantVerifier
+	HostBootSessions    HostBootSessionVerifier
 }
 
 type Server struct {
@@ -41,6 +43,7 @@ type Server struct {
 	store                 *Store
 	callerPrincipalTag    string
 	controlPlaneNodeID    string
+	peerProbe             *peerprobe.Probe
 	reconciler            *Reconciler
 	jobs                  JobClient
 	logs                  JobLogClient
@@ -90,6 +93,11 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	server := &Server{execCaptureUploadIdle: 30 * time.Second, fabric: f, store: store, callerPrincipalTag: tag, controlPlaneNodeID: controlPlaneNodeID,
 		reconciler: config.Reconciler, jobs: jobs, logs: config.Logs, results: results, computerGrants: computerGrants,
 		hostBootSessions: hostBootSessions}
+	address := config.ControlPlaneAddress
+	if address == "" {
+		address = DefaultL1Address
+	}
+	server.peerProbe = peerprobe.New(f, address, controlPlaneNodeID)
 	server.logf = config.Logf
 	if server.logf == nil {
 		server.logf = log.Printf
@@ -165,6 +173,8 @@ func (s *Server) routes() http.Handler {
 	workflows.HandleFunc("GET /v1/workflows/{workflow_id}/versions/{version}", s.getWorkflowVersion)
 
 	root := http.NewServeMux()
+	root.Handle("GET /v1/peer-health", s.authenticateFabric(s.requireHealthCaller(s.authorize(http.HandlerFunc(s.getPeerHealth)))))
+	root.Handle("GET /v1/peer/ping", s.authenticateFabric(http.HandlerFunc(s.peerPing)))
 	root.Handle("POST /v1/exec-captures/{sha256}", s.authenticateFabric(s.authorize(http.HandlerFunc(s.uploadExecCapture))))
 	root.Handle("GET /v1/health", s.authenticateFabric(s.requireHealthCaller(s.authorize(http.HandlerFunc(s.getDispatchHealth)))))
 	root.Handle("/v1/computer-token/mint", s.authenticateFabric(http.HandlerFunc(s.mintComputerToken)))

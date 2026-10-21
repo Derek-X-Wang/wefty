@@ -40,6 +40,8 @@ func newFleetFixture(t *testing.T) (*setupFixture, *fakeSetupEnroller, *bytes.Bu
 			var payload any
 			code := 200
 			switch {
+			case r.URL.Path == "/v1/peer-health":
+				payload = contract.PeerHealth{Reachable: true, CheckedAt: time.Now().UTC()}
 			case r.URL.Path == "/v1/nodes":
 				payload = l1.NodeList{Nodes: []l1.Node{{NodeRegistration: contract.NodeRegistration{NodeID: p.Identities.Node, BootSessionID: "boot-fixture"}, State: contract.NodeAlive, ClaimsEnabled: true, AutomaticallyAdmitted: len(p.NodeAdmission) == 0, AuthoritativeTags: []string{contract.StableNodeTagPrefix + p.Identities.Node}, MaxOneshotSlots: 4, MaxServiceSlots: 2}}}
 			case r.URL.Path == "/v1/runs" && r.Method == "GET":
@@ -121,7 +123,7 @@ func TestSetupControlPlanePublishesAndResumesWithoutKeys(t *testing.T) {
 	if err := writeSetupReport(&text, report); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(text.String(), "L1 → L3 direction: NOT-RUN") || !strings.Contains(text.String(), "smoke run: VERIFIED") {
+	if !strings.Contains(text.String(), "L1 → L3 direction: VERIFIED") || !strings.Contains(text.String(), "smoke run: VERIFIED") {
 		t.Fatalf("readiness report: %s", &text)
 	}
 	before := installedUpgradeFiles(t, &upgradeFixture{setupFixture: f})
@@ -356,7 +358,7 @@ func TestSetupControlPlaneServiceStartFailureReportsAllChecksAndResumes(t *testi
 	f.launchd.failOnce["bootstrap"] = errors.New("fixture activation failure")
 	report, err := runSetup(t.Context(), f.host, setupRequest{role: "control-plane", nodeID: "studio-0123abcd"})
 	var notReady *notReadyError
-	if !errors.As(err, &notReady) || len(report.Readiness) != 9 || report.Readiness[0].Status != "FAILED" {
+	if !errors.As(err, &notReady) || len(report.Readiness) != 10 || report.Readiness[0].Status != "FAILED" {
 		t.Fatalf("service failure lost report: %+v %v", report, err)
 	}
 	var text bytes.Buffer
@@ -384,7 +386,7 @@ func TestSetupControlPlaneRefusesStaleReadyPID(t *testing.T) {
 		return nil
 	}})
 	var notReady *notReadyError
-	if !errors.As(err, &notReady) || report.Readiness[0].Status != "FAILED" || report.Readiness[4].Status != "VERIFIED" || report.Readiness[8].Status != "NOT-RUN" {
+	if !errors.As(err, &notReady) || report.Readiness[0].Status != "FAILED" || report.Readiness[4].Status != "VERIFIED" || report.Readiness[len(report.Readiness)-1].Status != "NOT-RUN" {
 		t.Fatalf("client reachability hid stale PID: %+v %v", report.Readiness, err)
 	}
 }
@@ -402,6 +404,9 @@ func TestSetupControlPlaneChecksConfiguredNodeAdmission(t *testing.T) {
 				}
 				base := clients.l1.client.Transport
 				clients.l1.client.Transport = fleetRoundTripper(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Path != "/v1/nodes" {
+						return base.RoundTrip(r)
+					}
 					response, err := base.RoundTrip(r)
 					if err != nil {
 						return response, err
@@ -433,7 +438,7 @@ func TestSetupControlPlaneChecksConfiguredNodeAdmission(t *testing.T) {
 			}
 			report, err := runSetup(t.Context(), f.host, setupRequest{role: "control-plane", nodeID: "studio-0123abcd"})
 			var notReady *notReadyError
-			if !errors.As(err, &notReady) || report.Readiness[6].Status != "FAILED" || report.Readiness[8].Status != "NOT-RUN" {
+			if !errors.As(err, &notReady) || report.Readiness[6].Status != "FAILED" || report.Readiness[len(report.Readiness)-1].Status != "NOT-RUN" {
 				t.Fatalf("bad admission accepted: %+v %v", report.Readiness, err)
 			}
 		})

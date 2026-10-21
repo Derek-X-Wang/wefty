@@ -148,7 +148,7 @@ func run() error {
 		return err
 	}
 	server, err := l3.NewServer(participant, store, l3.ServerConfig{Reconciler: reconciler, Logs: l1Client,
-		ControlPlaneNodeID: *controlPlaneNodeID})
+		ControlPlaneNodeID: *controlPlaneNodeID, ControlPlaneAddress: *controlPlane})
 	if err != nil {
 		return err
 	}

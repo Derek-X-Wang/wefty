@@ -63,6 +63,8 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 	}
 	checks = append(checks, setupReadinessCheck{Check: "client → L1", Status: "NOT-RUN", Detail: "client service not ready"}, setupReadinessCheck{Check: "client → L3", Status: "NOT-RUN", Detail: "client service not ready"}, setupReadinessCheck{Check: "node registration and admission", Status: "NOT-RUN", Detail: "L1 not yet reachable"})
 	l1Index, l3Index, nodeIndex := len(services), len(services)+1, len(services)+2
+	peerIndex := len(checks)
+	checks = append(checks, setupReadinessCheck{Check: "L1 → L3 direction", Status: "NOT-RUN", Detail: "client service not ready"}, setupReadinessCheck{Check: "L3 → L1 direction", Status: "NOT-RUN", Detail: "client service not ready"})
 	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid}
 	open := host.fleetClients
 	if open == nil {
@@ -120,7 +122,7 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 			checks[i].Status, checks[i].Detail = "VERIFIED", "LaunchAgent running; current process reached its saved-identity ready point"
 		}
 
-		for _, index := range []int{l1Index, l3Index, nodeIndex} {
+		for _, index := range []int{l1Index, l3Index, nodeIndex, peerIndex, peerIndex + 1} {
 			checks[index].Status, checks[index].Detail = "NOT-RUN", "client service identity not verified in this pass"
 		}
 		if clients != nil {
@@ -175,9 +177,17 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 			} else {
 				checks[l3Index].Status, checks[l3Index].Detail = "VERIFIED", "saved client read L3 runs through the client service"
 			}
+			for i, client := range []*apiClient{clients.l1, clients.l3} {
+				probe, done := context.WithTimeout(bounded, statusProbeBudget)
+				checks[peerIndex+i], _ = readFleetPeerHealth(probe, client, checks[peerIndex+i].Check)
+				done()
+			}
 		}
 		ready := true
-		for _, check := range checks {
+		for i, check := range checks {
+			if i >= peerIndex && check.Status == "NOT-RUN" && check.Detail == peerProbeUnavailable {
+				continue
+			}
 			if check.Status != "VERIFIED" {
 				ready = false
 			}
@@ -188,9 +198,6 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 		if waitForContext(bounded, 100*time.Millisecond) != nil {
 			break
 		}
-	}
-	if role == serviceplan.ControlPlane {
-		checks = append(checks, setupReadinessCheck{Check: "L1 → L3 direction", Status: "NOT-RUN", Detail: "no read-only probe yet; covered by doctor later"})
 	}
 	smoke := setupReadinessCheck{Check: "smoke run", Status: "NOT-RUN", Detail: "startup checks did not pass"}
 	ready := true

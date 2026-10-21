@@ -380,6 +380,8 @@ func TestFleetDoctorUsesRunningClientServiceWithoutBackendOpen(t *testing.T) {
 		}
 		var payload any
 		switch r.URL.Path {
+		case "/v1/peer-health":
+			payload = contract.PeerHealth{Reachable: true, CheckedAt: time.Now().UTC()}
 		case "/v1/nodes":
 			payload = l1.NodeList{Nodes: []l1.Node{{NodeRegistration: contract.NodeRegistration{NodeID: p.Identities.Node}, State: contract.NodeAlive, ClaimsEnabled: true, AutomaticallyAdmitted: true, AuthoritativeTags: []string{contract.StableNodeTagPrefix + p.Identities.Node}, MaxOneshotSlots: 4, MaxServiceSlots: 2}}}
 		case "/v1/runs":
