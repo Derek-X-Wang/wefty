@@ -82,6 +82,12 @@ const (
 
 var driftRows = []driftRow{
 	// Shared components.
+	{component(commonDoc, "PeerHealth"), typeOf[contract.PeerHealth]()},
+	{component(commonDoc, "PeerPong"), typeOf[contract.PeerPong]()},
+	{responseBody(clientDoc, "get", "/v1/peer-health", "200"), typeOf[contract.PeerHealth]()},
+	{responseBody(clientDoc, "get", "/v1/peer/ping", "200"), typeOf[contract.PeerPong]()},
+	{responseBody(l3Doc, "get", "/v1/peer-health", "200"), typeOf[contract.PeerHealth]()},
+	{responseBody(l3Doc, "get", "/v1/peer/ping", "200"), typeOf[contract.PeerPong]()},
 	{component(commonDoc, "ComputerTokenRevocationReceipt"), typeOf[contract.ComputerTokenRevocationReceipt]()},
 	{component(commonDoc, "ErrorResponse"), typeOf[contract.ErrorResponse]()},
 	{component(commonDoc, "Error"), typeOf[contract.APIError]()},

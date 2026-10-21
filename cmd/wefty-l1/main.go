@@ -244,7 +244,7 @@ func run() error {
 	server, err := l1.NewServer(participant, store, l1.ServerConfig{
 		NodePolicies: nodePolicies, AllowSelfAssertedPersonIdentities: *allowPlainPersonIDs,
 		AutomaticNodeAdmission: *automaticNodeAdmission,
-		ComputerTokenRevoker:   computerTokenRevoker, RunLedgerNodeID: *runLedgerNodeID,
+		ComputerTokenRevoker:   computerTokenRevoker, RunLedgerNodeID: *runLedgerNodeID, RunLedgerAddress: *runLedgerAddress,
 	})
 	if err != nil {
 		return err

@@ -45,7 +45,11 @@ These refusals use the same command report as `main` and add no exit number.
 [Fleet doctor](fleet-doctor.md) prints its findings before returning the same
 identity-refusal exit 3 or transport-uncertainty exit 13. Local checklist findings
 use exit 12; JSON stderr never adds a second error document after this report.
-Legacy plain doctor and status text remain unchanged.
+Legacy plain doctor and status text remain unchanged. Fleet peer observations
+that report unreachable are doctor findings (exit 12). Reading an observer
+retains the same identity/transport exit precedence. Missing observer or ping
+routes during a staged upgrade are NOT-RUN, never FAILED; see
+[peer health](peer-health.md).
 
 A saved participant that cannot be reached or confirmed within its start
 budget returns typed `fabric_unreachable`, `retryable=true`, exit 13. This

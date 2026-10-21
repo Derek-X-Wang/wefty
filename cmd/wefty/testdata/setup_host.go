@@ -115,6 +115,17 @@ func setupCommandHost() (setupHost, error) {
 			switch {
 			case r.URL.Path == "/v1/jobs":
 				body = l1.JobList{}
+			case r.URL.Path == "/v1/peer-health":
+				observation := contract.PeerHealth{Reachable: true, CheckedAt: time.Now().UTC()}
+				if os.Getenv("WEFTY_FIXTURE_PEER_NOT_READY") == "1" {
+					observation.Reachable = false
+					observation.ErrorClass = "unavailable"
+				}
+				body = observation
+				if os.Getenv("WEFTY_FIXTURE_PEER_UNAVAILABLE") == "1" {
+					status = 404
+					body = contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorNotFound, Message: "route not found"}}
+				}
 			case r.URL.Path == "/v1/nodes":
 				body = l1.NodeList{Nodes: []l1.Node{{NodeRegistration: contract.NodeRegistration{NodeID: p.Identities.Node, BootSessionID: "fixture-boot"}, State: contract.NodeAlive, ClaimsEnabled: os.Getenv("WEFTY_FIXTURE_NOT_ADMITTED") != "1", AutomaticallyAdmitted: len(p.NodeAdmission) == 0, AuthoritativeTags: []string{contract.StableNodeTagPrefix + p.Identities.Node}, MaxOneshotSlots: 4, MaxServiceSlots: 2}}}
 			case r.URL.Path == "/v1/runs" && r.Method == "GET":

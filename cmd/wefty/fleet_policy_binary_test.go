@@ -86,6 +86,8 @@ func TestFleetDoctorReportsAndExitsRealBinary(t *testing.T) {
 		detail string
 	}{
 		{nil, 0, "private network policy"},
+		{[]string{"WEFTY_FIXTURE_PEER_NOT_READY=1"}, 12, "FAILED"},
+		{[]string{"WEFTY_FIXTURE_PEER_UNAVAILABLE=1"}, 0, peerProbeUnavailable},
 		{[]string{"WEFTY_FIXTURE_FILEVAULT_ON=1"}, 0, "FileVault is on"},
 		{[]string{"WEFTY_FIXTURE_IDENTITY_REFUSED=1"}, 3, "REFUSED"},
 		{[]string{"WEFTY_FIXTURE_NOT_READY=1"}, 13, "NOT-RUN"},
@@ -102,8 +104,15 @@ func TestFleetDoctorReportsAndExitsRealBinary(t *testing.T) {
 			}
 			if jsonMode {
 				var report plainDoctorReport
-				if err := json.Unmarshal([]byte(out), &report); err != nil || report.Install != "fleet-process" || report.Role != "control-plane" || len(report.PolicyEvidence) != 8 || diagnostics != "" {
+				if err := json.Unmarshal([]byte(out), &report); err != nil || report.Install != "fleet-process" || report.Role != "control-plane" || len(report.PolicyEvidence) != 9 || diagnostics != "" {
 					t.Fatalf("doctor JSON report: %s stderr=%s err=%v", out, diagnostics, err)
+				}
+				if tc.detail == peerProbeUnavailable {
+					assertFleetPeerChecks(t, report.PolicyEvidence, "NOT-RUN")
+				} else if tc.want == 0 {
+					assertFleetPeerChecks(t, report.PolicyEvidence, "VERIFIED")
+				} else if strings.Contains(strings.Join(tc.env, " "), "WEFTY_FIXTURE_PEER_NOT_READY") {
+					assertFleetPeerChecks(t, report.PolicyEvidence, "FAILED")
 				}
 				if tc.want == 0 && !report.Healthy {
 					t.Fatalf("advisory host warning made doctor unhealthy: %s", out)

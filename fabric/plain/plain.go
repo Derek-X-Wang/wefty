@@ -23,10 +23,11 @@ import (
 // Network isolates logical names and injected identities for a set of plain
 // Fabric instances. Tests should create a fresh Network to avoid shared state.
 type Network struct {
-	mu       sync.RWMutex
-	names    map[string]*nameRegistration
-	peers    map[string]fabric.Identity
-	fabricID string
+	mu        sync.RWMutex
+	names     map[string]*nameRegistration
+	peers     map[string]fabric.Identity
+	listeners map[string]*listener
+	fabricID  string
 	// listenFn is a test-only seam for controlling localhost bind completion.
 	// Access it through listen and setListenFuncForTest so concurrent tests do
 	// not race with listener creation.
@@ -140,7 +141,13 @@ func (f *Fabric) Listen(network, address string) (net.Listener, error) {
 		}
 		return nil, err
 	}
-	l := &listener{Listener: ln, network: f.network, registration: registration}
+	l := &listener{Listener: ln, network: f.network, registration: registration, identity: f.identity}
+	f.network.mu.Lock()
+	if f.network.listeners == nil {
+		f.network.listeners = make(map[string]*listener)
+	}
+	f.network.listeners[ln.Addr().String()] = l
+	f.network.mu.Unlock()
 	if logical {
 		l.name = name.String()
 		if err := f.network.completeNameRegistration(l.name, registration, ln.Addr().String()); err != nil {
@@ -167,6 +174,11 @@ func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, e
 		return nil, err
 	}
 
+	// Capture the actual bound listener, not a logical name's claimed identity.
+	// This in-process evidence is self-asserted, just like incoming plain identity.
+	f.network.mu.RLock()
+	target := f.network.listeners[address]
+	f.network.mu.RUnlock()
 	conn, err := (&net.Dialer{}).DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
@@ -174,6 +186,25 @@ func (f *Fabric) Dial(ctx context.Context, network, address string) (net.Conn, e
 	if err := writeIdentity(conn, f.identity); err != nil {
 		_ = conn.Close()
 		return nil, err
+	}
+	if target != nil {
+		token, err := newPeerToken()
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		remote := peerAddress{Addr: conn.RemoteAddr(), token: token}
+		f.network.mu.Lock()
+		// A close/rebind during Dial invalidates this evidence. Never attribute a
+		// connection accepted by one listener to a replacement at the same address.
+		if f.network.listeners[address] == target {
+			identity := target.identity
+			identity.Tags = append([]string(nil), identity.Tags...)
+			f.network.peers[remote.String()] = identity
+			f.network.mu.Unlock()
+			return &connWithIdentity{Conn: conn, network: f.network, key: remote.String(), remoteAddress: remote}, nil
+		}
+		f.network.mu.Unlock()
 	}
 	return conn, nil
 }
@@ -341,6 +372,7 @@ type listener struct {
 	network      *Network
 	name         string
 	registration *nameRegistration
+	identity     fabric.Identity
 	once         sync.Once
 }
 
@@ -379,6 +411,11 @@ func (l *listener) Accept() (net.Conn, error) {
 
 func (l *listener) Close() error {
 	l.once.Do(func() {
+		l.network.mu.Lock()
+		if l.network.listeners[l.Addr().String()] == l {
+			delete(l.network.listeners, l.Addr().String())
+		}
+		l.network.mu.Unlock()
 		if l.name != "" {
 			l.network.unregisterName(l.name, l.registration)
 		}

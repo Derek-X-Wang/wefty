@@ -18,6 +18,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/peerprobe"
 )
 
 // MaxRequestBodyBytes is the JSON body limit shared by ordinary L1 routes and
@@ -35,6 +36,7 @@ type ServerConfig struct {
 	ComputerPolicyWatchWait           time.Duration
 	ComputerTokenRevoker              ComputerTokenRevoker
 	RunLedgerNodeID                   string
+	RunLedgerAddress                  string
 }
 
 // NodePolicy is authoritative control-plane configuration for one stable node.
@@ -84,6 +86,7 @@ type Server struct {
 	computerTokenRevoker    ComputerTokenRevoker
 	restoreRevocationBudget time.Duration
 	runLedgerNodeID         string
+	peerProbe               *peerprobe.Probe
 	handler                 http.Handler
 	reconcile               func(context.Context) (ReconcileResult, error)
 	sweepScrubbedSecrets    func(context.Context) (SecretScrubSweep, error)
@@ -165,6 +168,11 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 			s.logf(format, args...)
 		}
 	}
+	address := config.RunLedgerAddress
+	if address == "" {
+		address = DefaultRunLedgerAddress
+	}
+	s.peerProbe = peerprobe.New(f, address, runLedgerNodeID)
 	s.handler = s.routes()
 	return s, nil
 }
@@ -496,6 +504,8 @@ func (s *Server) routes() http.Handler {
 	credential.HandleFunc("/", s.attemptCredentialOutOfScope)
 
 	root := http.NewServeMux()
+	root.Handle("GET /v1/peer-health", s.authorize(clientPrincipal, http.HandlerFunc(s.getPeerHealth)))
+	root.HandleFunc("GET /v1/peer/ping", s.peerPing)
 	root.Handle("/v1/agent/", s.authorize(agentPrincipal, agent))
 	root.Handle("/v1/dispatch-keys/", s.authorize(clientPrincipal, client))
 	root.Handle("POST /v1/jobs/{job_id}/cancel", s.authorizeCancelProtocol(client, credential))
