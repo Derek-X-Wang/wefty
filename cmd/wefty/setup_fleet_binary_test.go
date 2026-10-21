@@ -49,7 +49,7 @@ func TestSetupControlPlaneFlagAndReportFromRealBinary(t *testing.T) {
 		t.Fatalf("setup exit=%d stdout=%s stderr=%s", code, out, diagnostics)
 	}
 	var report setupReport
-	if err := json.Unmarshal([]byte(out), &report); err != nil || report.Role != "control-plane" || len(report.Readiness) != 9 {
+	if err := json.Unmarshal([]byte(out), &report); err != nil || report.Role != "control-plane" || len(report.Readiness) != 10 {
 		t.Fatalf("report shape: %s %v", out, err)
 	}
 	for _, key := range strings.Fields(keys) {
@@ -60,6 +60,17 @@ func TestSetupControlPlaneFlagAndReportFromRealBinary(t *testing.T) {
 	code, out, diagnostics = command("", nil, "setup", "--skip-smoke-run")
 	if code != 0 || strings.Contains(diagnostics, "join key") || !strings.Contains(out, "smoke run: NOT-RUN (skipped by --skip-smoke-run)") {
 		t.Fatalf("completed rerun: %d %s %s", code, out, diagnostics)
+	}
+	for _, tc := range []struct {
+		env    string
+		exit   int
+		status string
+	}{{"WEFTY_FIXTURE_PEER_NOT_READY=1", 12, "FAILED"}, {"WEFTY_FIXTURE_PEER_UNAVAILABLE=1", 0, "NOT-RUN"}} {
+		code, out, diagnostics = command("", []string{tc.env}, "--json", "setup", "--skip-smoke-run")
+		if code != tc.exit || json.Unmarshal([]byte(out), &report) != nil || diagnostics != "" {
+			t.Fatalf("peer report: exit=%d stdout=%s stderr=%s", code, out, diagnostics)
+		}
+		assertFleetPeerChecks(t, report.Readiness, tc.status)
 	}
 	code, out, diagnostics = command("", nil, "setup", "--role", "unknown")
 	if code != 2 {

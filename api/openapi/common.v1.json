@@ -7,6 +7,19 @@
   "paths": {},
   "components": {
     "schemas": {
+      "PeerHealth": {
+        "type": "object", "additionalProperties": false,
+        "required": ["reachable", "error_class", "checked_at"],
+        "properties": {
+          "reachable": { "type": "boolean" },
+          "error_class": { "type": "string", "enum": ["", "unavailable", "forbidden", "not_found", "internal"] },
+          "checked_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PeerPong": {
+        "type": "object", "additionalProperties": false,
+        "required": ["ok"], "properties": { "ok": { "type": "boolean", "const": true } }
+      },
       "DispatchHold": {
         "description": "Ledger-wide admission condition, projected only onto Runs waiting to submit. Never a Run outcome.",
         "type": "object", "additionalProperties": false,

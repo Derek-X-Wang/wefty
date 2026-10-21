@@ -283,7 +283,8 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 		{Check: "client → L1", Status: "NOT-RUN", Detail: "client identity has not been verified"},
 		{Check: "client → L3", Status: "NOT-RUN", Detail: "client identity has not been verified"},
 		{Check: "node agent → L1/L3", Status: "NOT-RUN", Detail: "requires cooperating participants in the attended run"},
-		{Check: "L1 ↔ L3", Status: "NOT-RUN", Detail: "requires the control-service probe (slice 6b)"},
+		{Check: "L1 → L3 direction", Status: "NOT-RUN", Detail: "client identity has not been verified"},
+		{Check: "L3 → L1 direction", Status: "NOT-RUN", Detail: "client identity has not been verified"},
 		{Check: "owner → L1 (person commands)", Status: "NOT-RUN", Detail: "requires the owner's laptop in the attended run; run `wefty whoami` through its person identity"},
 		{Check: "owner → published ports", Status: "NOT-RUN", Detail: "requires the owner's untagged device and Computer front-door/published-port checks in the attended run"},
 		{Check: "machines → other machines' published ports denied", Status: "NOT-RUN", Detail: "a single machine cannot prove denial; check cooperating peers and overlapping policy grants in the attended run"},
@@ -360,6 +361,27 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 						check.Status, check.Detail = "REFUSED", "the request was refused; this does not prove a network-policy denial"
 					}
 					add(check.Check, "error", check.Status+": "+check.Detail, "check the remote service, saved identity and private network policy; rerun doctor")
+				}
+			}
+			for i, client := range []*apiClient{clients.l1, clients.l3} {
+				check, err := readDoctorPeerHealth(budget, client, report.PolicyEvidence[3+i].Check)
+				report.PolicyEvidence[3+i] = check
+				if err != nil {
+					keepErr(err)
+				}
+				switch check.Status {
+				case "VERIFIED":
+					add(check.Check, "ok", check.Detail, "")
+				case "FAILED":
+					add(check.Check, "error", "FAILED: "+check.Detail, "check both control services, their enrolled peer IDs and private network policy; rerun doctor")
+				case "NOT-RUN", "REFUSED":
+					if err != nil {
+						fix := "restore saved client access to the observer service, then rerun doctor"
+						if check.Detail == doctorPeerBudgetExpired {
+							fix = "rerun doctor when service reads can finish within its time budget"
+						}
+						add(check.Check, "error", check.Status+": "+check.Detail, fix)
+					}
 				}
 			}
 			admitted := false
