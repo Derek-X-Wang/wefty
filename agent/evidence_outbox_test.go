@@ -20,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
@@ -1982,17 +1983,13 @@ func TestEvidenceRecoveryWakesForCompletionStoredAfterInitialScan(t *testing.T) 
 	case <-time.After(2 * time.Second):
 		t.Fatal("same-attempt completion wake was swallowed at active recovery retirement")
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	testwait.Until(t, "late completion delivered", func() (bool, error) {
 		receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 		if receipt.State == "delivered" {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("late completion receipt = %+v, want delivered", receipt)
-		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("late completion receipt = %+v", receipt)
+	})
 }
 
 type boundedReplayL1Clock struct{ now time.Time }
@@ -2145,19 +2142,15 @@ func TestEvidenceRecoveryDrainsLiveLogBacklogBeforeCompletion(t *testing.T) {
 		t.Fatal("completion was not delivered at the bounded first-pass edge")
 	}
 	releaseFirstPassNow()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
+	testwait.Until(t, "complete live recovery log backlog", func() (bool, error) {
 		mu.Lock()
 		calls := logCalls
 		mu.Unlock()
 		if calls == wantLogCalls {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("remaining durable log batch was not continued on a later pass")
-		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("log calls = %d, want %d", calls, wantLogCalls)
+	})
 	mu.Lock()
 	defer mu.Unlock()
 	if logCalls != wantLogCalls || completionCalls != 1 {
@@ -2336,30 +2329,22 @@ func TestEvidenceRecoveryBoundsLostLogBacklogBeforeCompletion(t *testing.T) {
 	}
 	releaseFirstPassNow()
 	wantLogCalls := (backlogEvents + outbox.batchSize - 1) / outbox.batchSize
-	deadline := time.Now().Add(10 * time.Second)
-	for {
+	testwait.Until(t, "complete lost recovery log backlog", func() (bool, error) {
 		mu.Lock()
 		calls := logCalls
 		mu.Unlock()
 		if calls == wantLogCalls {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("lost recovery did not continue all batches: got %d, want %d", calls, wantLogCalls)
-		}
-		time.Sleep(time.Millisecond)
-	}
-	deadline = time.Now().Add(10 * time.Second)
-	for {
+		return false, fmt.Errorf("log calls = %d, want %d", calls, wantLogCalls)
+	})
+	testwait.Until(t, "lost recovery delivered with drained row", func() (bool, error) {
 		receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 		if receipt.State == "delivered" && receipt.EventCount == 0 {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("lost recovery receipt = %+v, want delivered with drained row", receipt)
-		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("lost recovery receipt = %+v", receipt)
+	})
 	page, err := store.GetJobLogs(t.Context(), job.JobID, "", backlogEvents)
 	if err != nil {
 		t.Fatal(err)

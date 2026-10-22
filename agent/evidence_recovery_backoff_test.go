@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -81,17 +82,13 @@ func storeRecoveryCompletion(t *testing.T, outbox *evidenceOutbox, attemptID str
 
 func waitForCompletionState(t *testing.T, outbox *evidenceOutbox, attemptID, want string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	testwait.Until(t, fmt.Sprintf("attempt %s completion state %s", attemptID, want), func() (bool, error) {
 		receipt := outbox.spool.inspectCompletion(t.Context(), attemptID)
 		if receipt.State == want {
-			return
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("attempt %s completion receipt = %+v, want %s", attemptID, receipt, want)
-		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("completion receipt = %+v", receipt)
+	})
 }
 
 // deliverBarrier stores a fresh completion, wakes the reconciler and waits for
@@ -120,13 +117,13 @@ func receiveReport(t *testing.T, reports <-chan error, want ...string) {
 
 func waitForCompletionCalls(t *testing.T, counter *completionCounter, attemptID string, want int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for counter.count(attemptID) < want {
-		if time.Now().After(deadline) {
-			t.Fatalf("attempt %s was asked %d times, want %d", attemptID, counter.count(attemptID), want)
+	testwait.Until(t, fmt.Sprintf("attempt %s completion calls >= %d", attemptID, want), func() (bool, error) {
+		got := counter.count(attemptID)
+		if got >= want {
+			return true, nil
 		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("completion calls = %d", got)
+	})
 }
 
 // #549: a node whose registration moved on kept asking L1 to replay a
@@ -429,13 +426,13 @@ func countRecoveryPasses(outbox *evidenceOutbox) *atomic.Int64 {
 
 func waitForCount(t *testing.T, what string, count *atomic.Int64, want int64) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for count.Load() < want {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: %d, want %d", what, count.Load(), want)
+	testwait.Until(t, what, func() (bool, error) {
+		got := count.Load()
+		if got >= want {
+			return true, nil
 		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("count = %d, want >= %d", got, want)
+	})
 }
 
 // assertRecoveryWaits runs after the recovery pass that found a retry due but
