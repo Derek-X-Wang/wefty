@@ -1941,6 +1941,111 @@
           "500": { "$ref": "./common.v1.json#/components/responses/Internal" }
         }
       }
+    },
+    "/v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt": {
+      "parameters": [
+        {
+          "name": "node_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "attempt_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "interruptRestartableAttempt",
+        "summary": "Request controlled interruption of an exact restartable Attempt",
+        "description": "Requires tagged Fabric client authority, disabled claims and exact Node intent_revision. Valid only for a live restartable process one-shot on this Node and boot. Persists exact-Attempt intent delivered by renewal restart with interruption_reason and interruption_request_key. Cancellation wins. Identical request replay is read-only and returns Idempotent-Replay: true even after settlement; a different request for the same Attempt conflicts. Never substitutes a successor. Natural payload exit keeps its verdict. Completion must echo this request and prove runtime quiescence.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "job_id",
+                  "boot_session_id",
+                  "intent_revision",
+                  "idempotency_key",
+                  "reason"
+                ],
+                "properties": {
+                  "job_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "boot_session_id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "intent_revision": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "idempotency_key": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "reason": {
+                    "const": "upgrade",
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          },
+          "200": {
+            "description": "Current Job; replay does not request another interruption.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/Job"
+                }
+              }
+            },
+            "headers": {
+              "Idempotent-Replay": {
+                "schema": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          }
+        }
+      }
     }
   },
   "components": {

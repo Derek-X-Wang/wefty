@@ -90,13 +90,14 @@ type Job struct {
 	// set once at creation and never mutated. They are derived from the
 	// presented attempt credential, never from the request body, so a caller
 	// cannot forge a parent. A root job has no parent and spawn depth zero.
-	ParentJobID          string    `json:"parent_job_id,omitempty"`
-	ParentAttemptID      string    `json:"parent_attempt_id,omitempty"`
-	OriginatingSubmitter string    `json:"originating_submitter,omitempty"`
-	SpawnDepth           int       `json:"spawn_depth,omitempty"`
-	Attempts             []Attempt `json:"attempts,omitempty"`
-	UnschedulableReason  string    `json:"unschedulable_reason,omitempty"`
-	FailureReason        string    `json:"failure_reason,omitempty"`
+	ParentJobID          string               `json:"parent_job_id,omitempty"`
+	ParentAttemptID      string               `json:"parent_attempt_id,omitempty"`
+	OriginatingSubmitter string               `json:"originating_submitter,omitempty"`
+	SpawnDepth           int                  `json:"spawn_depth,omitempty"`
+	Attempts             []Attempt            `json:"attempts,omitempty"`
+	UnschedulableReason  string               `json:"unschedulable_reason,omitempty"`
+	FailureReason        string               `json:"failure_reason,omitempty"`
+	RestartRecovery      *OneshotRestartFacts `json:"restart,omitempty"`
 	// SecretsScrubbedAt is when a terminal one-shot's spec lost its sensitive
 	// environment, inline executable bytes, and run parameter label (#52).
 	// What remains of the spec is the permanent record, not a resubmittable
@@ -114,15 +115,16 @@ type Job struct {
 // generation: those grant or identify write authority rather than explain an
 // execution. Result and LateResult are mutually exclusive by contract.
 type Attempt struct {
-	AttemptID      string                `json:"attempt_id"`
-	NodeID         string                `json:"node_id"`
-	State          contract.AttemptState `json:"state"`
-	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
-	Result         *ProcessResult        `json:"result,omitempty"`
-	LateResult     *LateResultEvidence   `json:"late_result,omitempty"`
-	Image          *OCIImageEvidence     `json:"image,omitempty"`
-	CreatedAt      time.Time             `json:"created_at"`
-	UpdatedAt      time.Time             `json:"updated_at"`
+	AttemptID          string                `json:"attempt_id"`
+	NodeID             string                `json:"node_id"`
+	State              contract.AttemptState `json:"state"`
+	LeaseExpiresAt     time.Time             `json:"lease_expires_at"`
+	Result             *ProcessResult        `json:"result,omitempty"`
+	InterruptionReason InterruptionReason    `json:"interruption_reason,omitempty"`
+	LateResult         *LateResultEvidence   `json:"late_result,omitempty"`
+	Image              *OCIImageEvidence     `json:"image,omitempty"`
+	CreatedAt          time.Time             `json:"created_at"`
+	UpdatedAt          time.Time             `json:"updated_at"`
 }
 
 // ServiceRemoval is the operator projection for an irreversible service
@@ -349,11 +351,13 @@ type JobList struct {
 
 // AttemptLease is the authority returned by a successful claim or renewal.
 type AttemptLease struct {
-	AttemptID    string           `json:"attempt_id"`
-	FencingToken string           `json:"fencing_token"`
-	LeaseExpires time.Time        `json:"lease_expires_at"`
-	LeaseTTL     time.Duration    `json:"lease_ttl"`
-	Directive    AttemptDirective `json:"directive,omitempty"`
+	AttemptID              string             `json:"attempt_id"`
+	FencingToken           string             `json:"fencing_token"`
+	LeaseExpires           time.Time          `json:"lease_expires_at"`
+	LeaseTTL               time.Duration      `json:"lease_ttl"`
+	Directive              AttemptDirective   `json:"directive,omitempty"`
+	InterruptionReason     InterruptionReason `json:"interruption_reason,omitempty"`
+	InterruptionRequestKey string             `json:"interruption_request_key,omitempty"`
 }
 
 // AttemptDirective carries lifecycle intent to the currently fenced payload.
@@ -435,6 +439,7 @@ type NodeActiveAttempt struct {
 	BootSessionID  string                `json:"boot_session_id"`
 	Kind           string                `json:"kind"`
 	Class          string                `json:"class"`
+	Restartable    bool                  `json:"restartable,omitempty"`
 	State          contract.AttemptState `json:"state"`
 	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
 }
@@ -568,6 +573,10 @@ type StartedRequest struct {
 }
 
 type CompletionRequest struct {
+	// InterruptionReason is positive agent evidence of a controlled stop, not
+	// an inference from a signal. Upgrade must echo the exact durable request.
+	InterruptionReason        InterruptionReason        `json:"interruption_reason,omitempty"`
+	InterruptionRequestKey    string                    `json:"interruption_request_key,omitempty"`
 	FencingToken              string                    `json:"fencing_token"`
 	IdempotencyKey            string                    `json:"idempotency_key"`
 	Result                    ProcessResult             `json:"result"`

@@ -28,13 +28,69 @@ Infrastructure requeues persist a jittered due time rather than becoming
 immediately claimable. The `runtime_unavailable` infrastructure classification
 is OCI-only; the same code on a process service defaults terminal.
 
-An active one-shot attempt whose lease expires transitions to `lost` while its
-job transitions to `failed` in the same transaction. A service attempt still
+An ordinary active one-shot attempt whose lease expires transitions to `lost`
+while its Job transitions to `failed` in the same transaction. Explicitly
+Restartable process one-shots use the recovery table below. A service attempt still
 becomes terminal `lost`, but a desired-running service job re-enters `queued`
 without changing its restart streak; the atomic claim path alone may create a
 fresh attempt and fence. A stopping service whose quiescence cannot be
 confirmed latches `failed`. The job does not itself use a `lost` state because
 `lost` describes what is known about one execution attempt.
+
+### Restartable process one-shot Jobs
+
+`JobSpec.restartable` defaults to false. L1 rejects true for services, OCI Jobs
+and other kinds or classes. A flagged Job durably requires
+`oneshot:restartable` in addition to `kind:process`. Agents must advertise this
+capability only after their complete interruption and input-retention support
+is available. This policy does not change ordinary one-shots or service policy.
+
+| Job state | Additional allowed next state | Condition |
+| --- | --- | --- |
+| `claimed` | `queued` | Acknowledged infrastructure interruption or Lease loss |
+| `running` | `queued` | Acknowledged infrastructure interruption or Lease loss |
+| `awaiting-input` | `queued` | Acknowledged infrastructure interruption or Lease loss |
+
+The same transaction settles the old Attempt and queues its Job. The Job never
+passes through `failed` while recovery is pending, so executable bytes, params
+and the Run token remain available. The Run and Job identity do not change.
+There is no new Job or Run state and no service binding. One-shot Slot occupancy
+ends with the old Attempt. Ordinary atomic claim alone creates the successor,
+with a fresh Attempt ID, fence, Lease and Attempt credential. Disabled Node
+admission holds queued work until the operator restores it. A Run that already
+started remains `running` while its Job recovers, under the existing L3
+projection rule.
+
+A controlled interruption requires explicit completion metadata and positive
+runtime quiescence evidence. It ends the Attempt as terminal `interrupted`,
+with `interruption_reason=upgrade` or `agent_shutdown`. Lease expiry instead
+ends the Attempt as `lost` with `interruption_reason=lease_expired`. L1 uses
+one recovery decision for both paths. Cancellation takes precedence. A natural
+payload exit retains its normal verdict, even with a standing request. Command
+failure, runtime or idle limits and preparation failure do not become
+infrastructure interruptions. Additive incomplete log evidence does not erase
+an explicitly acknowledged infrastructure interruption with proven quiescence.
+
+L1 persists `restart_count`, `next_restart_at_ns`, `restart_terminal_reason`,
+`restart_last_reason` and `restart_previous_attempt_id` on the Job. The count
+increases only when a successor is actually claimed. Ten automatic restarts
+allow at most eleven Attempts. When another interruption would exceed this
+budget, the Job becomes `failed`, with
+`restart_terminal_reason=restart_limit_reached` and human failure reason
+`restart limit reached (10 restarts)`. The ordinary L3 projection fails its Run.
+This terminal transition scrubs secrets in the same transaction.
+
+Acknowledged upgrade and shutdown interruptions have zero scheduling delay.
+Lease loss persists a jittered due time: 1 second, doubling for each successor
+restart number, capped at 60 seconds after jitter (minimum 1 second). The
+injected jitter is drawn once in the settlement transaction. Reconciliation,
+reopen and reads do not redraw it. Successful intervals do not reset the
+budget or backoff sequence. The Job response's `restart` object reports
+`count`, `limit=10`, `pending`, and nullable `last_reason`,
+`previous_attempt_id`, `current_attempt_id`, `next_restart_at` and
+`terminal_reason`, from the same Read snapshot. Absent optional facts are
+null. Attempt summaries include `interruption_reason`; Node active Attempt
+summaries include `restartable` when true.
 
 A one-shot job's secrets do not outlive its execution. The transaction that
 moves a one-shot to `succeeded` or `failed` -- completion, lease expiry, an
@@ -1140,7 +1196,8 @@ names the five modes and their endpoint check order:
 - Original-evidence provenance (O): identity → path → original fence, without
   requiring current binding, registration, phase or lease.
 - Accepted-completion replay (R): provenance, no standing removal, identical
-  stored key and body, Attempt not lost, and current or retained replay binding.
+  stored key and body, Attempt not lost, and current or retained replay binding
+  (or terminal `interrupted` for accepted Restartable one-shot recovery).
   Removal precedes provenance; phase and expiry handling precede key/body,
   lost refusal and binding. Replay applies no completion/accounting effects;
   exact-Attempt Computer revocation is re-driven.
@@ -1163,9 +1220,10 @@ lease/deadline settlement retains its existing lease and accounting rules.
 
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
-| `claimed` | Created by the atomic claim with its own ID, fence, and lease. | `running`, `failed`, `lost` |
-| `running` | The node acknowledged execution. | `awaiting-input`, `succeeded`, `failed`, `lost` |
-| `awaiting-input` | Reserved live attempt awaiting a future prompt verb. | `running`, `failed`, `lost` |
+| `claimed` | Created by the atomic claim with its own ID, fence, and lease. | `running`, `failed`, `lost`, `interrupted` |
+| `running` | The node acknowledged execution. | `awaiting-input`, `succeeded`, `failed`, `lost`, `interrupted` |
+| `awaiting-input` | Reserved live attempt awaiting a future prompt verb. | `running`, `failed`, `lost`, `interrupted` |
+| `interrupted` | A Restartable process one-shot acknowledged an infrastructure stop with positive runtime quiescence evidence. Terminal. | none |
 | `succeeded` | A matching, in-lease completion was accepted. Terminal. | none |
 | `failed` | A matching, in-lease failure was accepted. Terminal. | none |
 | `lost` | The control plane's clock observed lease expiry, or L1 revoked the attempt's authority: an image-reconciliation latch, a Computer reconfiguration abort, or removal of its service or Computer. Terminal; a desired-running service may requeue its containing job, never this attempt. | none |
@@ -1177,7 +1235,8 @@ Logs instead use the original attempt's evidence provenance: lost attempts may
 append late evidence within the documented window, and recorded events remain
 replayable under the log-continuity rules. Late evidence never changes current
 service health or authority. An exact accepted completion remains acknowledgeable
-while its attempt is current or retained as the completion replay binding,
+while its Attempt is current, retained as the completion replay binding, or
+terminal `interrupted` after accepted controlled recovery,
 including after node re-registration or queued Computer stop detaches it. These
 exceptions retain history and acknowledge prior writes; they do not grant live
 authority. See `lease-fencing-dispatch.md` for their windows and replay rules.

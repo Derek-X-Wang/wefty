@@ -312,6 +312,15 @@ func (c *apiClients) setNodeClaims(ctx context.Context, nodeID string, request l
 	return node, err
 }
 
+// interruptRestartableAttempt requests an exact-Attempt stop through L1's
+// durable client protocol. Upgrade drain integration is owned separately.
+func (c *apiClients) interruptRestartableAttempt(ctx context.Context, nodeID, attemptID string, request l1.InterruptRestartableAttemptRequest) (l1.Job, error) {
+	var job l1.Job
+	path := "/v1/nodes/" + url.PathEscape(nodeID) + "/restartable-attempts/" + url.PathEscape(attemptID) + "/interrupt"
+	err := c.l1.do(ctx, http.MethodPost, path, request, nil, &job, http.StatusOK)
+	return job, err
+}
+
 func (c *apiClients) createService(ctx context.Context, spec contract.JobSpec) (l1.Job, error) {
 	var job l1.Job
 	err := c.l1.do(ctx, http.MethodPost, "/v1/jobs", spec, nil, &job, http.StatusCreated, http.StatusOK)

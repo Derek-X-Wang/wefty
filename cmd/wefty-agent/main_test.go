@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
@@ -514,20 +516,16 @@ func TestControllerStopWaitsForRealInFlightCompletionRequest(t *testing.T) {
 		response, stopErr := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 1})
 		stopDone <- stopResult{response: response, err: stopErr}
 	}()
-	deadline := time.Now().Add(time.Second)
-	for {
+	testwait.Until(t, "durably disabled controller intent", func() (bool, error) {
 		intent, readErr := intentSource.ReadIntent(t.Context())
 		if readErr != nil {
 			t.Fatal(readErr)
 		}
 		if !intent.Enabled && intent.Revision == 2 {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("controller did not durably disable intent: %+v", intent)
-		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("controller intent = %+v", intent)
+	})
 	select {
 	case <-observedRuntime.stopEntered:
 		t.Fatal("StopOCIRuntime overtook the in-flight completion")
@@ -583,31 +581,23 @@ func (runtime *stopObservingAgentRuntime) StopOCIRuntime(ctx context.Context) er
 	return runtime.Agent.StopOCIRuntime(ctx)
 }
 
-// mainTestNodeWait bounds waitForMainTestNode. The wait returns as soon as L1
-// shows the expected node, so the long bound only matters when a busy machine
-// running the full suite delays the agent's first registration (#1097).
-const (
-	mainTestNodeWait = 30 * time.Second
-	mainTestNodePoll = 10 * time.Millisecond
-)
-
 func waitForMainTestNode(t *testing.T, store *l1.Store, nodeID string, predicate func(l1.Node) bool) l1.Node {
 	t.Helper()
-	deadline := time.Now().Add(mainTestNodeWait)
-	for time.Now().Before(deadline) {
+	var matched l1.Node
+	testwait.Until(t, fmt.Sprintf("node %q capability predicate", nodeID), func() (bool, error) {
 		nodes, err := store.ListNodes(t.Context())
-		if err == nil {
-			for _, node := range nodes {
-				if node.NodeID == nodeID && predicate(node) {
-					return node
-				}
+		if err != nil {
+			return false, err
+		}
+		for _, node := range nodes {
+			if node.NodeID == nodeID && predicate(node) {
+				matched = node
+				return true, nil
 			}
 		}
-		time.Sleep(mainTestNodePoll)
-	}
-	nodes, _ := store.ListNodes(t.Context())
-	t.Fatalf("node %q did not reach capability predicate: %+v", nodeID, nodes)
-	return l1.Node{}
+		return false, fmt.Errorf("nodes = %+v", nodes)
+	})
+	return matched
 }
 
 func TestConsoleOutputIsAttributedAndSerialized(t *testing.T) {

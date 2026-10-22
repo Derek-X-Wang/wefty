@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -64,17 +65,13 @@ func TestProcessManagedHandoffThroughL1WithoutL3(t *testing.T) {
 		}
 	}()
 	var result l1.JobResult
-	deadline := time.Now().Add(10 * time.Second)
-	for {
+	testwait.Until(t, "L1 job result", func() (bool, error) {
 		err = submitter.request(t.Context(), http.MethodGet, "/v1/jobs/"+job.JobID+"/result", nil, &result)
 		if err == nil {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("result unavailable: %v status=%+v", err, node.Status())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		return false, fmt.Errorf("result unavailable: %w; agent=%+v", err, node.Status())
+	})
 	path := filepath.Join(root, "handoffs", job.JobID)
 	var document struct {
 		Dir string `json:"dir"`
@@ -97,16 +94,13 @@ func TestProcessManagedHandoffThroughL1WithoutL3(t *testing.T) {
 		t.Fatalf("identical replay=%+v err=%v", replay, err)
 	}
 	// L1 accepts the upload before the agent commits its local retention fact.
-	for {
+	testwait.Until(t, "finalized local handoff retention", func() (bool, error) {
 		records := node.handoffs.loadRecords()
 		if len(records) == 1 && !records[0].RetainUntil.IsZero() {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("local retention did not finalize")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		return false, fmt.Errorf("retention records = %+v", records)
+	})
 	record := requireRetentionRecord(t, node.handoffs, job.JobID)
 	if record.Directory != path || record.HandoffOwnerKey != job.JobID || !record.evidenceReachedLedger() {
 		t.Fatalf("retention=%+v", record)

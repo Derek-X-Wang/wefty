@@ -20,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -1146,17 +1147,15 @@ func tenureCode(err error) ComputerTenureErrorCode {
 
 func waitForControllerFree(t *testing.T, tenure *controllerTenure) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	testwait.Until(t, "Controller tenure Free", func() (bool, error) {
 		tenure.mu.Lock()
 		free := tenure.held == nil && tenure.op == nil
 		tenure.mu.Unlock()
 		if free {
-			return
+			return true, nil
 		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("timed out waiting for Controller tenure to return Free")
+		return false, fmt.Errorf("Controller tenure free = %t", free)
+	})
 }
 
 // The OCI helper refusing a take's control-leg stream for want of a
