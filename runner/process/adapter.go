@@ -58,6 +58,10 @@ func (adapter *Adapter) Preflight(_ context.Context, request workloadrunner.Requ
 		err := errors.New("process runtime executor is not configured")
 		return admission, workloadrunner.Result{Outcome: spawnFailure(contract.SpawnFailureRuntimeUnavailable, err)}, err
 	}
+	if request.RequireGuardian && !adapter.GuardianAvailable() {
+		err := errors.New("restartable process requires a usable Guardian")
+		return admission, workloadrunner.Result{Outcome: spawnFailure(contract.SpawnFailureRuntimeUnavailable, err)}, err
+	}
 	if request.RuntimeHandler != "" {
 		err := fmt.Errorf("runtime handler %q is not supported for process jobs", request.RuntimeHandler)
 		return admission, workloadrunner.Result{Outcome: spawnFailure(contract.SpawnFailureUnsupportedRuntimeHandler, err)}, err
@@ -81,8 +85,10 @@ func (adapter *Adapter) Run(ctx context.Context, request workloadrunner.Request,
 		CompletionSignal: request.CompletionSignal,
 		Started:          request.Started,
 		ProcessStarted:   request.ProcessStarted,
+		StopInitiated:    request.StopInitiated,
 		ServiceAddress:   request.ServiceAddress,
 		ReadinessChanged: request.ReadinessChanged,
+		RequireGuardian:  request.RequireGuardian,
 		Guarded:          request.LifetimeBoundary == workloadrunner.AgentBootLifetime,
 	}, OutputSink(sink))
 	adapter.recordReap(request.Authority, err)
@@ -193,3 +199,11 @@ func validateAuthority(authority workloadrunner.AttemptAuthority) error {
 
 var _ workloadrunner.WorkloadRuntime = (*Adapter)(nil)
 var _ workloadrunner.PriorBootReaper = (*Adapter)(nil)
+
+func (adapter *Adapter) GuardianAvailable() bool {
+	if adapter == nil {
+		return false
+	}
+	guardian, ok := adapter.executor.(interface{ GuardianAvailable() bool })
+	return ok && guardian.GuardianAvailable()
+}

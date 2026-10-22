@@ -150,8 +150,10 @@ _Avoid_: conflating kind with class; "sandboxed" as a lifecycle word;
 treating `service` as a peer noun to Job
 
 **Guardian**:
-The agent-owned lifetime boundary for one service payload. It prevents the
-payload from outliving the agent boot session that launched it.
+The agent-owned lifetime boundary for one service or Restartable process
+one-shot payload. While alive, it ends the managed runtime after losing the
+agent boot session that launched it. For process payloads, this boundary covers
+the command's process group; descendants that leave the group are outside it.
 _Avoid_: supervisor, babysitter, wrapper, shim
 
 **Desired state**:

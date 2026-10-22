@@ -791,6 +791,11 @@ claim about the writer's own run and nothing else. The directory is scoped by
 run ID because a cold rerun reuses the handoff directory: a rerun gets its own
 mailbox; the agent does not import the previous run's evidence into it.
 
+Restartable process exec adds the Attempt ID:
+`<handoff directory>/.wefty/<run id>/<attempt id>`. Each successor receives
+its own mailbox, including exec work and TMPDIR storage beneath that mailbox.
+Run identity and the Run's handoff/result paths remain stable.
+
 The layout is fixed:
 
 ```
@@ -807,7 +812,7 @@ a document larger than 64 KiB is left in the ledger rather than delivered.
 The agent opens `tmp/` only during preparation to place `params.json`; it does
 not read staged events there.
 
-A version-2 cross-node exec also receives `capture.bundle`. The node agent
+A version-2 cross-node or Restartable exec also receives `capture.bundle`. The node agent
 fetches this file over its existing Fabric transport with its agent-held run
 token and checks the `capture_sha256` and `capture_size_bytes` in the params
 before it makes the file visible or starts the wrapper. Download errors or
@@ -1854,3 +1859,17 @@ narrower than the child-read route's parent-Job check. Dispatch replay
 and tombstones resolve before instance-key handling and retain their existing
 scope checks. Keyed children follow the same one-shot release and service removal
 rules as roots. See [the key contract](lease-fencing-dispatch.md#instance-keys).
+
+## Restartable capture scope
+
+`CreateRunRequest.restartable` is persisted as `RunRecord.restartable`. For
+version 2 captured exec it must equal `params.restartable`. True requires a version 2 captured exec inline
+script and no dispatch authority. The immutable capture and argv survive
+nonterminal interruption; no live checkout is read to prepare a successor.
+Successor preparation clears the Run's result under the handoff path lock and
+uses an Attempt-specific mailbox. It does not remove and recreate a predecessor
+path that a delayed cleanup helper may still reference. The new Attempt creates
+a fresh workspace and TMPDIR beneath its own mailbox.
+L1 supplies a fresh fence and Attempt credential. Run identity, Job identity,
+and the Run log cursor remain stable. Restart inspect facts come from a fresh
+L1 execution read; Attempt interruption evidence is distinct from command exit.

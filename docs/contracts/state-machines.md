@@ -81,8 +81,10 @@ budget, the Job becomes `failed`, with
 This terminal transition scrubs secrets in the same transaction.
 
 Acknowledged upgrade and shutdown interruptions have zero scheduling delay.
-Lease loss persists a jittered due time: 1 second, doubling for each successor
-restart number, capped at 60 seconds after jitter (minimum 1 second). The
+Lease loss persists an exponential due time: a 1-second base doubles for each
+successor restart number, then the jittered delay is clamped to 11–60 seconds.
+The minimum covers the default Guardian's 5-second TERM grace, 5-second reap
+bound and one second of scheduling margin, including with short Leases. The
 injected jitter is drawn once in the settlement transaction. Reconciliation,
 reopen and reads do not redraw it. Successful intervals do not reset the
 budget or backoff sequence. The Job response's `restart` object reports

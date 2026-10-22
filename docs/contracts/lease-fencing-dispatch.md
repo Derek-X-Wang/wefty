@@ -1463,7 +1463,7 @@ runtime failures and resource exhaustion retain their ordinary terminal
 verdicts. Additive incomplete log evidence does not erase a proven interruption. Accepted controlled interruption ends only the
 Attempt as `interrupted`; the shared recovery decision queues its nonterminal
 Job with zero delay. Expiry ends the Attempt as `lost` and queues the same Job
-with persisted 1-second exponential backoff up to 60 seconds, with injected
+with persisted exponential backoff clamped to 11–60 seconds after injected
 jitter. Cancellation takes precedence over either recovery path. The ten-restart
 budget and terminal scrubbing follow `state-machines.md`.
 

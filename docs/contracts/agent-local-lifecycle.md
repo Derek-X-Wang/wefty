@@ -22,8 +22,9 @@ semantic code.
 
 The first SIGINT or SIGTERM starts a graceful drain. The 30-second bound
 applies to the drain request to L1, which moves the node to `draining`; the
-agent then stops claiming and waits for every resident attempt to finish, which
-is bounded only by each attempt's own max runtime. Until the process exits its
+agent stops claiming, interrupts Restartable process one-shots, and waits for
+the other resident attempts to finish. Waiting for those other attempts is
+bounded only by each attempt's own max runtime. Until the process exits its
 node lock is held, so a replacement agent for the same stable node ID is
 refused. A second signal is an explicit forced-shutdown transition: it cancels
 resident attempts immediately. While Drain is joining residents it emits
@@ -31,7 +32,7 @@ resident attempts immediately. While Drain is joining residents it emits
 Drain returns it emits
 `forced_shutdown transition=drained_to_forced reason=second_signal`. These
 exact tokens distinguish operator abort from clean drain completion.
-`--shutdown-budget D` (default `0`, which keeps the behavior above) makes the
+`--shutdown-budget D` (default `0`, which keeps that behavior for ordinary residents) makes the
 agent take that same forced transition itself once `D` has passed since the
 first signal, emitting `reason=shutdown_budget` in place of
 `reason=second_signal`. Resident attempts are then cancelled in order: each is
@@ -1327,3 +1328,50 @@ Empty responses and errors do not move it. The clock is injectable. Claim
 loops share the interval, so parallel loops cannot burst. An empty node can
 start immediately even if its last run just finished. Services use their
 existing admission and placement rules.
+
+## Restartable process one-shots
+
+A Restartable process one-shot uses Guardian with `AgentBootLifetime`. The
+process runtime refuses admission without a usable Guardian and never silently
+runs it unguarded. The Node advertises `oneshot:restartable` only when the
+process runtime has a usable Guardian and version 2 exec capture support.
+Ordinary one-shots retain their existing lifetime behavior.
+
+Use `--restartable` only for commands that are safe to repeat and harmless
+if two copies briefly overlap, for example read-only watchers. After a
+controlled stop, wefty confirms that the command's process group ended before
+restarting. After an agent crash, the existing Guardian ends the group on
+control EOF within its teardown bound: 5 seconds of TERM grace plus 5 seconds
+to reap after KILL. This normally finishes long before the Lease expires:
+with healthy renewals until the crash, the default 30-second Lease and
+10-second renewal interval leave at least 20 seconds from agent death to expiry. Shorter configured Leases may leave
+less time, so lease-loss restart backoff has an 11-second minimum (teardown
+plus one second of margin), even after jitter. Recovery also waits for Lease
+expiry. Acknowledged controlled stops retain zero restart delay.
+
+This timing fence is not positive proof of predecessor absence after a crash.
+If the Guardian itself is killed, the old command may briefly overlap the new
+Attempt. Quiescence covers the command's process group only. Descendants that leave the
+group, for example via `setsid` or a daemonizing fork, are not tracked, exactly
+as for ordinary one-shots. Restartable commands must not daemonize.
+Ordinary preparation errors complete as failures.
+
+Restartable mailboxes use `<handoff>/.wefty/<run_id>/<attempt_id>`. Exec work
+and TMPDIR storage are beneath that mailbox, so a delayed cleanup helper can
+touch only its own Attempt's directory. The Run's handoff and result paths
+remain stable; observers read only the latest Attempt's result.
+
+An exact renewal `restart` directive carries `interruption_reason=upgrade`
+and `interruption_request_key`. The agent terminates and reaps the payload,
+finalizes its mailbox and logs, and echoes both fields in durable completion.
+A node agent shutdown signal interrupts Restartable residents, including an
+in-flight claim, with reason `agent_shutdown`. Only positive process-group absence
+and an agent/Guardian initiated termination qualify. Other agent failures,
+runtime limits and natural exits keep their own verdict. The first stop cause
+that wins the fence determines interruption metadata. A supervision or
+preparation failure that starts termination first remains a failure if a
+shutdown signal or restart directive arrives during reaping or finalization.
+Cancellation wins.
+The interruption fields survive completion spool replay unchanged. After Lease
+loss L1 recovers through the persisted restart backoff rather than inventing
+shutdown evidence.
