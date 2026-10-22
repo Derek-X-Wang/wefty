@@ -70,7 +70,7 @@ func TestDefaultComputerSeatsAtProductionTimings(t *testing.T) {
 	// must get a fresh budget rather than inherit the Computer boot deadline.
 	h.directive(1, 1)
 	h.ready(1)
-	h.probe("frame", 7102, "ff0000")
+	h.probe("frame", 1, "ff0000")
 	evidence.Observations["own_display"] = h.exec("2001:2001", "sh", "-c", seatEnv(1)+"xdpyinfo | grep '1280x800 pixels'") != ""
 	h.exec("2001:2001", "sh", "-c", seatEnv(1)+"echo keep > /wefty/service/shared/keep")
 	h.exec("2001:2001", "sh", "-c", seatEnv(1)+"cp -R /opt/seat-install-kit \"$HOME/test-kit\"; du -sb \"$HOME/test-kit\" | cut -f1")
@@ -89,7 +89,7 @@ func TestDefaultComputerSeatsAtProductionTimings(t *testing.T) {
 	}
 	h.directive(2, 1, 2)
 	h.ready(2)
-	h.probe("frame", 7104, "0000aa")
+	h.probe("frame", 2, "0000aa")
 	evidence.Observations["second_browser"] = true
 	evidence.Observations["deadline_per_seat"] = true
 
@@ -101,7 +101,7 @@ func TestDefaultComputerSeatsAtProductionTimings(t *testing.T) {
 		h.wait(component+" restarted", func() bool { return h.exec("0:0", "cat", path) != original })
 		lastProbe := "probe not completed"
 		h.wait(component+" screen recovered after component exit", func() bool {
-			out, err := h.probeCommand("frame", 7102, "ff0000").CombinedOutput()
+			out, err := h.probeCommand("frame", 1, "ff0000").CombinedOutput()
 			lastProbe = fmt.Sprintf("error=%v output=%s", err, out)
 			return err == nil
 		}, func() string { return lastProbe })
@@ -109,12 +109,12 @@ func TestDefaultComputerSeatsAtProductionTimings(t *testing.T) {
 		if h.exec("2001:2001", "cat", "/wefty/service/seats/1/home/restart-marker") != "live" {
 			t.Fatal("transient component exit ended the Seat")
 		}
-		h.probe("frame", 7104, "0000aa")
+		h.probe("frame", 2, "0000aa")
 	}
-	h.probe("view-input", 7102, "ff0000")
+	h.probe("view-input", 1, "ff0000")
 	evidence.Observations["view_ignores_input"] = true
-	h.probe("input", 7102, "00ff00")
-	h.probe("frame", 7104, "0000aa")
+	h.probe("input", 1, "00ff00")
+	h.probe("frame", 2, "0000aa")
 	evidence.Observations["own_screen_input"] = true
 	evidence.Observations["other_files_refused"] = h.exec("2002:2002", "sh", "-c", "if cat /wefty/service/seats/1/.Xauthority 2>/dev/null; then exit 1; fi; echo refused") == "refused"
 	evidence.Observations["other_display_refused"] = h.exec("2002:2002", "sh", "-c", seatEnv(2)+"if DISPLAY=:1 xdpyinfo >/dev/null 2>&1; then exit 1; fi; echo refused") == "refused"
@@ -210,7 +210,7 @@ assert all(int(row.split()[index])!=%d for row in rows[1:])`, kind, map[string]s
 	})
 	evidence.MemoryAfterRemovalBytes = after
 	evidence.Observations["memory_returns"] = true
-	h.probe("frame", 7102, "00ff00")
+	h.probe("frame", 1, "00ff00")
 	h.stop()
 	// A new attempt gets fresh control and status folders, the same Storage.
 	h = startSeatComputer(t, ctx, client, image, filepath.Join(root, "restart"), service, kit)
@@ -499,14 +499,15 @@ func (h *seatComputer) driver(place int, human bool) {
 	seatMust(h.t, os.MkdirAll(filepath.Dir(path), 0755))
 	seatAtomic(h.t, path, []byte(fmt.Sprintf(`{"version":1,"human_driving":%t}`, human)))
 }
-func (h *seatComputer) probeCommand(mode string, port int, colour string) *exec.Cmd {
-	script, err := filepath.Abs("../../examples/computer/seat-probe.py")
+func (h *seatComputer) probeCommand(mode string, place int, colour string) *exec.Cmd {
+	command, err := seatScreenProbeCommand(h.ctx, h.pid, place, mode, colour)
 	seatMust(h.t, err)
-	return exec.CommandContext(h.ctx, "nsenter", "-t", fmt.Sprint(h.pid), "-n", "python3", script, mode, fmt.Sprint(port), colour)
+	return command
 }
-func (h *seatComputer) probe(mode string, port int, colour string) {
+func (h *seatComputer) probe(mode string, place int, colour string) {
 	h.t.Helper()
-	out, err := h.probeCommand(mode, port, colour).CombinedOutput()
+	out, err := h.probeCommand(mode, place, colour).CombinedOutput()
+	h.t.Logf("Seat %d screen probe %s: %s", place, mode, out)
 	if err != nil {
 		h.t.Fatalf("screen probe %s: %v %s", mode, err, out)
 	}

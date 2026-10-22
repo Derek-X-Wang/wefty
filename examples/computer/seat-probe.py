@@ -178,6 +178,21 @@ class RFB:
     def key(self, sym, down):
         self.ws.send(struct.pack(">BBxxI", 4, down, sym))
 
+    def input_target(self, colour):
+        # Hit the observed page band, not browser chrome or an assumed body
+        # height. Prefer its centre but avoid pixels covered by an overlay.
+        rows = [row['y'] for row in self.strip_rows
+                if row['band_row'] and row['colour'] == colour]
+        if len(rows) < 3:
+            raise IOError("no clear page band for input")
+        y = rows[len(rows) // 2]
+        for x in sorted(range(32, self.w - 32, 32), key=lambda x: abs(x - self.w // 2)):
+            offset = (y * self.w + x) * 4
+            b, g, r = self.fb[offset:offset + 3]
+            if '%02x%02x%02x' % (r, g, b) == colour:
+                return x, y
+        raise IOError("no clear page pixel for input")
+
 
 def main():
     mode, port, expected = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -189,17 +204,33 @@ def main():
         client.request(0)
         client.read_update()
         return client.strip(expected)
-    if mode in ("input", "view-input"):
-        client.pointer(640, 400, 1)
-        client.pointer(640, 400, 0)
-        client.key(0x61, 1)
-        client.key(0x61, 0)
-    observe_until = time.monotonic() + 2 if mode == "view-input" else None
     colour = None
+    before_colour, input_target = None, None
     def last_observation():
-        return json.dumps({'expected': expected, 'colour': colour,
+        return json.dumps({'mode': mode, 'port': port, 'expected': expected,
+                           'before_colour': before_colour, 'colour': colour,
+                           'input_target': input_target,
                            'rows': getattr(client, 'strip_rows', [])}, separators=(',', ':'))
     try:
+        if mode in ("input", "view-input"):
+            while time.monotonic() < deadline:
+                colour = frame()
+                if colour and client.strip(colour) == colour:
+                    break
+                time.sleep(0.05)
+            else:
+                raise TimeoutError("page band not observed before input")
+            before_colour = colour
+            if mode == "input" and before_colour == expected:
+                raise IOError("control sentinel already present before input")
+            if mode == "view-input" and before_colour != expected:
+                raise IOError("view colour changed before input")
+            input_target = client.input_target(before_colour)
+            client.pointer(*input_target, 1)
+            client.pointer(*input_target, 0)
+            client.key(0x61, 1)
+            client.key(0x61, 0)
+        observe_until = time.monotonic() + 2 if mode == "view-input" else None
         while time.monotonic() < deadline:
             colour = frame()
             if mode == "view-input":
@@ -214,7 +245,8 @@ def main():
             time.sleep(0.05)
         else:
             raise TimeoutError("browser colour not observed")
-        print(json.dumps({"colour": colour, "width": client.w, "height": client.h,
+        print(json.dumps({"mode": mode, "port": port, "before_colour": before_colour,
+                          "input_target": input_target, "colour": colour, "width": client.w, "height": client.h,
                           "rows": client.strip_rows}))
     except (OSError, EOFError) as error:
         raise type(error)(str(error) + "; last observation: " + last_observation()) from error

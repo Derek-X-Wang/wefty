@@ -704,8 +704,14 @@ small vertical shifts and narrow overlays. At least three rows must contain
 80 percent expected-colour pixels, and at least 80 percent of clear coloured
 rows must agree. View-input still observes the full two-second window and
 fails on any observed green band row, even for one frame; the control-input
-probe waits for green. Failures retain the last completed samples when a
-frame has been observed.
+probe waits for green. Both input probes first observe the page and click a
+matching pixel near the centre of its visible colour band, below browser
+chrome and clear of narrow overlays. Control input must change the colour;
+an already-green baseline cannot prove input delivery. The lane selects the
+Seat's control port for control input and its view port for view-input and
+screen observations. Probe output records the endpoint port, click position,
+and colours before and after input on success or failure. Failures retain the
+last completed samples when a frame has been observed.
 
 P8 reads the Seat's own read-only
 `/wefty/control/seats/<place>/driver.json`. Its body remains exactly
