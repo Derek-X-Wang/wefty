@@ -24,6 +24,7 @@ import (
 const setupManifestName = "setup-files.json"
 
 type setupManifest struct {
+	LinuxLogRoot     string            `json:"linux_log_root,omitempty"`
 	History          *plainHistory     `json:"history,omitempty"`
 	Role             serviceplan.Role  `json:"role,omitempty"`
 	InstalledVersion string            `json:"installed_version,omitempty"`
@@ -48,6 +49,9 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 	report := setupRemoveReport{Changes: []string{}, Warnings: []string{}}
 	if host.euid == 0 {
 		return report, errors.New("wefty setup --remove must not run as root; run it as yourself without sudo")
+	}
+	if host.goos == "linux" {
+		return report, refuseLinuxFleetRemoval(host)
 	}
 	if host.goos != "darwin" {
 		return report, fmt.Errorf("wefty setup --remove needs macOS; this machine runs %s", host.goos)

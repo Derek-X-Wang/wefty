@@ -31,6 +31,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
+	"github.com/Derek-X-Wang/wefty/internal/systemduser"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/skills"
@@ -94,6 +95,7 @@ type setupHost struct {
 	bootTime              func() (time.Time, error)
 	peerLookup            func(context.Context, fabricconfig.Config) (fabric.PeerLookup, fabricconfig.CloseFunc, error)
 	ownerLogin            func(context.Context, string) error
+	browserCommand        func(context.Context, string, ...string) error
 	enroller              fabric.Enroller
 	enrolmentInput        io.Reader
 	enrolmentOutput       io.Writer
@@ -101,6 +103,10 @@ type setupHost struct {
 	readinessBudget       time.Duration
 	smokeBudget           time.Duration
 	goos                  string
+	xdgStateHome          string
+	xdgRuntimeDir         string
+	linuxFiles            systemduser.FileSystem
+	systemctl             systemduser.Runner
 	euid                  int
 	uid                   int
 	home                  string
@@ -184,8 +190,27 @@ type setupPathIssue struct {
 // excluded so neither diagnosis nor removal can follow a link into a checkout.
 // Other unusable paths stay named for findings but must not be accessed.
 func resolveMaintenancePaths(home string) (setupPaths, []setupPathIssue) {
-	paths := setupPaths{home: home}
+	return resolvePlatformMaintenancePaths(home, "darwin", "")
+}
+
+func resolvePlatformMaintenancePaths(home, goos, stateHome string) (setupPaths, []setupPathIssue) {
 	var issues []setupPathIssue
+	folders := setupFolders
+	if goos == "linux" {
+		folders.data = filepath.Join(".local", "share", "wefty")
+		folders.logs = filepath.Join(".local", "state", "wefty")
+		folders.launchAgents = filepath.Join(".config", "systemd", "user")
+		if stateHome == "" {
+			stateHome = filepath.Join(home, ".local", "state")
+		}
+		rel, err := canonicalLinuxStateHome(home, stateHome)
+		if err != nil {
+			issues = append(issues, setupPathIssue{"XDG_STATE_HOME", err})
+		} else {
+			folders.logs = filepath.Join(rel, "wefty")
+		}
+	}
+	paths := setupPaths{home: home}
 	resolve := func(wanted string) string {
 		rel, err := canonicalHomeFolder(home, wanted)
 		if err != nil {
@@ -198,8 +223,8 @@ func resolveMaintenancePaths(home string) (setupPaths, []setupPathIssue) {
 		rel    *string
 		wanted string
 	}{
-		{&paths.binRel, setupFolders.bin}, {&paths.configRel, setupFolders.config}, {&paths.dataRel, setupFolders.data},
-		{&paths.logsRel, setupFolders.logs}, {&paths.launchAgentsRel, setupFolders.launchAgents},
+		{&paths.binRel, folders.bin}, {&paths.configRel, folders.config}, {&paths.dataRel, folders.data},
+		{&paths.logsRel, folders.logs}, {&paths.launchAgentsRel, folders.launchAgents},
 	} {
 		*folder.rel = resolve(folder.wanted)
 	}
@@ -211,10 +236,10 @@ func resolveMaintenancePaths(home string) (setupPaths, []setupPathIssue) {
 	// The node agent refuses a state root reached through a link, so its
 	// folders are resolved on their own rather than assumed to sit under data.
 	for _, wanted := range []string{"log-spool", "managed"} {
-		paths.nodeDataFolders = append(paths.nodeDataFolders, resolve(filepath.Join(setupFolders.data, "node-agent", wanted)))
+		paths.nodeDataFolders = append(paths.nodeDataFolders, resolve(filepath.Join(folders.data, "node-agent", wanted)))
 	}
 	paths.nodeData = filepath.Join(home, filepath.Dir(paths.nodeDataFolders[0]))
-	for _, wanted := range setupFolders.skills {
+	for _, wanted := range folders.skills {
 		// A link here could point into a checkout, even one inside home, and
 		// setup would then write the skill into that checkout.
 		if info, err := os.Lstat(filepath.Join(home, wanted)); err == nil && info.Mode()&os.ModeSymlink != 0 {
@@ -271,7 +296,8 @@ type setupFile struct {
 
 type setupServiceReport struct {
 	Label  string             `json:"label"`
-	Plist  string             `json:"plist"`
+	Plist  string             `json:"plist,omitempty"`
+	Unit   string             `json:"unit,omitempty"`
 	Log    string             `json:"log"`
 	Action launchagent.Action `json:"action"`
 }
@@ -413,7 +439,8 @@ func realSetupHost() (setupHost, error) {
 	return setupHost{
 		goos: runtime.GOOS, euid: os.Geteuid(), uid: os.Getuid(), home: home, username: username,
 		hostname: hostname, shell: os.Getenv("SHELL"), executable: executable,
-		launchctl: launchagent.ExecRunner, loginShell: runLoginShell, random: rand.Reader,
+		xdgRuntimeDir: os.Getenv("XDG_RUNTIME_DIR"),
+		launchctl:     launchagent.ExecRunner, systemctl: systemduser.ExecRunner, xdgStateHome: os.Getenv("XDG_STATE_HOME"), loginShell: runLoginShell, random: rand.Reader,
 		l1Address: defaultSetupL1Address, l3Address: defaultSetupL3Address,
 	}, nil
 }
@@ -433,7 +460,7 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if host.euid == 0 {
 		return setupReport{}, errors.New("wefty setup must not run as root: it installs per-user login services for the account that runs it and never needs sudo; run it as yourself")
 	}
-	if host.goos != "darwin" {
+	if host.goos != "darwin" && host.goos != "linux" {
 		return setupReport{}, fmt.Errorf("wefty setup installs macOS login services; this machine runs %s", host.goos)
 	}
 	if !filepath.IsAbs(host.home) {
@@ -445,9 +472,16 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return setupReport{}, fmt.Errorf("resolve home folder: %w", err)
 	}
-	paths, err := resolveSetupPaths(home)
-	if err != nil {
-		return setupReport{}, err
+	paths, issues := resolveFleetMaintenancePaths(home, host)
+	if len(issues) > 0 {
+		return setupReport{}, issues[0].err
+	}
+	if host.goos == "linux" && (request.convertPlain || request.abandonConversion) {
+		flag := "--convert-plain"
+		if request.abandonConversion {
+			flag = "--abandon-conversion"
+		}
+		return setupReport{}, fmt.Errorf("plain conversion is Mac-only; %s is not supported on Linux", flag)
 	}
 	if request.convertPlain && request.role != "join" {
 		return setupReport{}, usageError("--convert-plain requires --role join")
@@ -468,6 +502,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			request.convertPlain = false
 		}
 	}
+	if host.goos == "linux" && conversion != nil {
+		return setupReport{}, errors.New("plain conversion is Mac-only; restore the original Mac installation")
+	}
 	if request.convertPlain || conversion != nil {
 		return runPlainConversion(ctx, host, request, paths, conversion)
 	}
@@ -477,6 +514,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	if role != serviceplan.Legacy {
 		return runFleetSetup(ctx, host, request, paths, role)
+	}
+	if host.goos == "linux" {
+		return setupReport{}, errors.New("plain setup is Mac-only; on Linux use wefty setup --role control-plane or --role join --join-code CODE")
 	}
 	if request.joinCode != "" || request.withPerson {
 		return setupReport{}, usageError("--join-code and --with-person require --role join")
@@ -1100,6 +1140,9 @@ func captureLoginPATH(ctx context.Context, host setupHost) (string, error) {
 	shell := host.shell
 	if shell == "" {
 		shell = "/bin/zsh"
+		if host.goos == "linux" {
+			shell = "/bin/sh"
+		}
 	}
 	if !filepath.IsAbs(shell) {
 		return "", fmt.Errorf("SHELL=%s is not an absolute path; setup reads the login-shell PATH from it", shell)

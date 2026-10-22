@@ -20,8 +20,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
-	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
+	"github.com/Derek-X-Wang/wefty/internal/systemduser"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
@@ -115,6 +115,16 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 		}
 		report.Findings = append(report.Findings, plainDoctorFinding{check, severity, detail, fix})
 	}
+	if host.goos == "linux" {
+		pinned, issues := resolveFleetMaintenancePaths(paths.home, host)
+		paths = pinned
+		for _, issue := range issues {
+			add("path:"+issue.folder, "error", "cannot verify the recorded Linux log root", issue.err.Error())
+		}
+		if err := validateLinuxLogFolders(paths, host.euid); err != nil {
+			add("log-folder", "error", "unsafe Linux log folder or parent", err.Error())
+		}
+	}
 	budget, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	plan, planErr := setupRolePlan(paths, role)
@@ -128,13 +138,17 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 		}
 		plan.Services = append(plan.Services, serviceplan.Service{Name: "node-agent"}, serviceplan.Service{Name: "client-service"})
 	}
+	manager := fleetServiceManager{host: host}
 	for _, service := range plan.Services {
 		detail, severity := "loaded and running", "ok"
 		probe, done := context.WithTimeout(budget, statusProbeBudget)
-		if host.goos != "darwin" {
+		if host.goos != "darwin" && host.goos != "linux" {
 			detail, severity = "service-manager checks are unverified on this platform", "warning"
 		} else {
-			state, err := (launchagent.Manager{UID: host.uid, Run: host.launchctl}).State(probe, "dev.wefty."+service.Name)
+			state, notes, err := manager.stateWithNotes(probe, "dev.wefty."+service.Name)
+			if err == nil && len(notes) > 0 {
+				add(manager.name("dev.wefty."+service.Name)+":system-drop-ins", "ok", "Informational: trusted root-owned system policy: "+strings.Join(notes, ", "), "")
+			}
 			switch {
 			case err != nil:
 				detail, severity = "cannot verify service state", "error"
@@ -145,7 +159,7 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 			}
 		}
 		done()
-		add("dev.wefty."+service.Name, severity, detail, "run `wefty setup` with the recorded role; inspect this service's log if it stops again")
+		add(manager.name("dev.wefty."+service.Name), severity, detail, "run `wefty setup` with the recorded role; inspect this service's log if it stops again")
 	}
 	root, err := os.OpenRoot(paths.home)
 	if err != nil {
@@ -153,7 +167,7 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 		return report, &notReadyError{verdict: "fleet doctor found issues; follow the fix hints"}
 	}
 	defer root.Close()
-	_, issues := resolveMaintenancePaths(paths.home)
+	_, issues := resolveFleetMaintenancePaths(paths.home, host)
 	for _, issue := range issues {
 		add("path:"+issue.folder, "error", "folder is linked or inaccessible", "restore the original installation folder without links")
 	}
@@ -231,10 +245,10 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 	} else {
 		add("node-config", "ok", "node.json agrees with the profile's stable node ID", "")
 	}
-	plist, err := root.ReadFile(filepath.Join(paths.launchAgentsRel, setupNodeAgentLabel+".plist"))
+	plist, err := root.ReadFile(filepath.Join(paths.launchAgentsRel, manager.file(setupNodeAgentLabel)))
 	loginPATH := ""
 	if err == nil {
-		loginPATH, err = recordedNodePATH(plist)
+		loginPATH, err = manager.recordedPATH(plist)
 	}
 	if err != nil {
 		add("node-agent-PATH", "error", "cannot read the node agent's recorded login-shell PATH", "rerun setup to capture the login-shell PATH")
@@ -275,6 +289,14 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 			if severity == "warning" {
 				report.Healthy = healthy
 			}
+		})
+	}
+	if host.goos == "linux" {
+		doctorLinuxLingering(budget, host, func(check, severity, detail, fix string) {
+			healthy := report.Healthy
+			add(check, severity, detail, fix)
+			// Logout survival is advisory, independent of current service health.
+			report.Healthy = healthy
 		})
 	}
 	// Policy evidence is independent of the local healthy verdict. Missing deny
@@ -511,4 +533,43 @@ func parseDoctorSystemSleep(output string) (enabled, verified bool) {
 		enabled = enabled || value > 0
 	}
 	return enabled, profiles > 0 && timers == profiles && haveTimer
+}
+
+// Only read logind state. Enabling lingering is always an explicit owner action.
+func doctorLinuxLingering(ctx context.Context, host setupHost, add func(string, string, string, string)) {
+	run := host.doctorCommand
+	if run == nil {
+		run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+			cmd := exec.CommandContext(ctx, name, args...)
+			cmd.WaitDelay = time.Second
+			return cmd.Output()
+		}
+	}
+	user := host.username
+	if user == "" {
+		user = strconv.Itoa(host.uid)
+	}
+	quoted := "'" + strings.ReplaceAll(user, "'", "'\"'\"'") + "'"
+	enable := "loginctl enable-linger " + quoted
+	probe, done := context.WithTimeout(ctx, statusProbeBudget)
+	tool, err := systemduser.ResolveTool("loginctl", host.linuxFiles)
+	var output []byte
+	if err == nil {
+		output, err = run(probe, tool, "show-user", user, "-p", "Linger")
+	}
+	done()
+	severity, detail := "warning", "unverified: cannot confirm whether user services survive logout"
+	if tool == "" && err != nil {
+		detail += "; " + err.Error()
+	}
+	fix := "inspect `loginctl show-user " + quoted + " -p Linger`; if Linger=no, run `" + enable + "`; doctor and setup never change lingering"
+	if err == nil {
+		switch strings.TrimSpace(string(output)) {
+		case "Linger=yes":
+			severity, detail, fix = "ok", "lingering is enabled; user services can survive logout", ""
+		case "Linger=no":
+			detail, fix = "lingering is disabled; user services do not survive the last logout", "to keep services after logout, run `"+enable+"`; doctor and setup never change lingering"
+		}
+	}
+	add("lingering", severity, detail, fix)
 }
