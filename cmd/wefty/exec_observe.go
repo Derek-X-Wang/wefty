@@ -104,7 +104,7 @@ func lostExecObservation(stderr io.Writer, runID, storage string, cause error) e
 
 // Mailbox result delivery may trail terminal projection. Startup failures have
 // their own result field, so they cannot be mistaken for the command's exit code.
-func reportExecRun(ctx context.Context, clients *apiClients, record contract.RunRecord, stderr io.Writer) error {
+func reportExecRun(ctx context.Context, clients *apiClients, record contract.RunRecord, capture execCapture, stderr io.Writer) error {
 	// Plain success keeps its existing policy: terminal projection is enough.
 	if record.Status != contract.RunFailed {
 		return reportTerminalRun(stderr, record, runFailureReason(context.WithoutCancel(ctx), clients, record), false, false)
@@ -124,6 +124,7 @@ func reportExecRun(ctx context.Context, clients *apiClients, record contract.Run
 		return result
 	}
 	writeExecPathHint(stderr, event)
+	writeExecDependencyHints(ctx, stderr, event, capture)
 	return reportTerminalRun(stderr, record, event.Reason, false, false)
 }
 

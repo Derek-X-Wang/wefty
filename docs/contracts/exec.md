@@ -212,7 +212,19 @@ stdout. Success exits 0. Failure uses the shared
 `runOutcomeError` typed-exit entry and exits 10. When the command itself exits
 127, exec prints one `wefty:` hint on stderr, before the verdict, that the
 command was likely not on the run's PATH; `--json` prints the same line on
-stderr. SIGINT, SIGTERM and SIGHUP cancel
+stderr. On failure (`outcome=fail`), exec also checks the caller's captured
+checkout folder and its ancestors up to the repo root for existing,
+Git-ignored dependency folders. It prints at most one line per kind on stderr
+in plain and JSON modes, after the PATH hint when present:
+
+```text
+wefty: this checkout's node_modules is Git-ignored, so the run did not get it; install inside the command, for example "bun install --frozen-lockfile && ..." or "pnpm install --frozen-lockfile && ...".
+wefty: this checkout's .venv is Git-ignored, so the run did not get it; install inside the command, for example "uv sync && ...".
+```
+
+These checks are best effort: an error prints no dependency hints and never
+changes the command's exit code. Success prints no dependency hints.
+SIGINT, SIGTERM and SIGHUP cancel
 the run unless `--keep-running` or `--detach` is set. The CLI prints `wefty: cancelling run <id>` before the cancel request.
 An accepted cancellation is reported as cancelled; later observation serves
 only cleanup. A terminal run with recorded cancellation is reported as
@@ -323,7 +335,7 @@ removed merely because watching ended.
 
 `--json` writes NDJSON to stdout with one event per line. Command stderr also
 travels in stdout JSON; CLI diagnostics, queued notices, and retention warnings
-stay on stderr, including the exit-127 PATH hint. The event
+stay on stderr, including the exit-127 PATH hint and ignored-dependency hints. The event
 discriminator is `type`:
 
 | Type | Fields |
