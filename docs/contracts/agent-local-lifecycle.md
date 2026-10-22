@@ -271,6 +271,43 @@ convergence, so doctor derives unchanged, live-safe, restart-required, or
 recreate-required by comparing current with desired rather than echoing the
 last probe reason.
 
+Every host VM recreate, including a per-user installation's recreate, passes
+the same guard immediately before Lima deletion, under the Lima lifecycle
+lock and after OCI admission and resident work have quiesced. Zero live
+attempts alone never authorize deletion. Any Computer Storage generation or
+Backup copy on that disk refuses the recreate, including stopped Computers,
+staging and retired generations, quarantined Storage, and unresolved reset
+records. There is no acknowledged-loss override.
+
+The guard reads the helper's durable guest files. The node agent's local spool
+records removal acknowledgements, not a complete inventory of physical copies;
+the helper's namespace Verify inventory also omits Backup copies. Neither an
+empty spool nor an empty runtime inventory proves an empty host VM disk. The
+shipped Lima helper uses `/var/lib/wefty/oci`; a different helper command or
+runtime-root override is unknown and refuses. With the host VM known running,
+the guard stops both the helper socket and service, joins their stop, and
+inspects `computer-disks`, `computer-backups`, `computer-disk-quarantine` and
+`computer-storage-resets`. Any entry blocks. A missing namespace directory is
+absence only after successful enumeration of its parent; an empty namespace
+needs a successful directory read. A missing runtime root is unknown.
+Symlinks, non-directories, failed reads, malformed or incomplete answers and
+unavailable inventory all refuse. Socket activation is restored on inspection
+refusal; an empty inventory leaves the helper stopped until host VM deletion,
+so no helper operation can create bytes between the check and deletion.
+
+A stopped, broken or unknown host VM never starts just to answer this guard.
+Without a complete durable host-side absence record its inventory is unknown,
+so recreation refuses and explains that the owner must start OCI before a new
+inspection. A proven empty disk still permits recreation through the ordinary
+template/start/recovery path. No Storage or Backup is moved or deleted to make
+recreation pass.
+
+The node-local refusal is HTTP 409 `host_vm_recreate_blocked`, CLI exit 5,
+`retryable=false`. Its message and `details.blockers` name the blocking
+helper-owned Storage generation, Backup copy or unresolved record identities;
+`details.reason` explains an unknown inventory. Raw guest command output is
+never part of the refusal. The real CLI binary checks this typed exit.
+
 Singular `wefty node` commands resolve the installed node configuration before
 Fabric initialization and use only the live agent's Unix control socket. The
 configuration has two valid shapes: an OCI installation names its absolute

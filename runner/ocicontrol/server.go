@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
@@ -344,6 +345,13 @@ func decodeControlJSON(writer http.ResponseWriter, request *http.Request, target
 
 func writeControlResponse(writer http.ResponseWriter, value any, err error) {
 	if err != nil {
+		var blocked *lima.RecreateBlockedError
+		if errors.As(err, &blocked) {
+			writeControlErrorDetails(writer, http.StatusConflict, ErrorHostVMRecreateBlocked, blocked.Error(), map[string]any{
+				"blockers": blocked.Blockers, "reason": blocked.Reason,
+			})
+			return
+		}
 		failure := &ControlError{Code: ErrorInternal, Status: http.StatusInternalServerError, Message: "node-local OCI control failed", Cause: err}
 		if !errors.As(err, &failure) {
 			failure.Cause = err
