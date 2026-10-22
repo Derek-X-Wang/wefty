@@ -48,6 +48,8 @@ type upgradeDrainReceipt struct {
 	restarted      []string
 	claimsDisabled bool
 	counts         upgradeDrainCounts
+	deadline       time.Time
+	disableNotSent bool
 }
 
 func (receipt *upgradeDrainReceipt) ownsClaims(node l1.Node) bool {
@@ -106,21 +108,80 @@ func removeUpgradeDrain(config string) error {
 	return durable.SyncDir(root)
 }
 
-func beginUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, node l1.Node, timeout time.Duration) (*upgradeDrainReceipt, error) {
-	receipt := &upgradeDrainReceipt{Home: paths.home, Version: 1, NodeID: node.NodeID, Revision: node.IntentRevision, Reason: node.IntentReason, PreviousReason: node.IntentReason, RestoreClaims: node.ClaimsEnabled}
+// An absolute deadline from the gap phase includes receipt persistence and the
+// disable RPC. Duration-only callers retain the single-phase entry point.
+func beginUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, node l1.Node, timeout time.Duration, absoluteDeadline ...time.Time) (*upgradeDrainReceipt, error) {
+	var deadline time.Time
+	if len(absoluteDeadline) > 0 {
+		deadline = absoluteDeadline[0]
+	} else {
+		deadline = op.now().Add(timeout)
+	}
+	left := deadline.Sub(op.now())
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if left <= 0 {
+		return nil, upgradeDrainTimedOut()
+	}
+	bounded, cancel := context.WithTimeout(ctx, left)
+	defer cancel()
+	budgetError := func() error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !op.now().Before(deadline) || errors.Is(bounded.Err(), context.DeadlineExceeded) {
+			return upgradeDrainTimedOut()
+		}
+		return bounded.Err()
+	}
+	receipt := &upgradeDrainReceipt{Home: paths.home, Version: 1, NodeID: node.NodeID, Revision: node.IntentRevision, Reason: node.IntentReason, PreviousReason: node.IntentReason, RestoreClaims: node.ClaimsEnabled, deadline: deadline, disableNotSent: true}
 	if node.ClaimsEnabled {
 		receipt.Revision++
-		receipt.Reason = upgradeIntentPrefix + rand.Text() + upgradeDeadlineField + op.now().Add(timeout).UTC().Format(time.RFC3339Nano)
+		receipt.Reason = upgradeIntentPrefix + rand.Text() + upgradeDeadlineField + deadline.UTC().Format(time.RFC3339Nano)
 	}
-	// Write the expected *post-CAS* revision first. A lost mutation response or
-	// process death can then be recovered by comparing both revision and reason.
-	if err := writeUpgradeDrain(paths.config, receipt); err != nil {
+	if err := budgetError(); err != nil {
 		return nil, err
 	}
+	// Persist expected post-CAS ownership before sending the disable. A lost
+	// response or process death still uses the existing receipt recovery.
+	persist := op.writeDrain
+	if persist == nil {
+		persist = func(ctx context.Context, config string, r *upgradeDrainReceipt) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return writeUpgradeDrain(config, r)
+		}
+	}
+	if err := persist(bounded, paths.config, receipt); err != nil {
+		if budgetErr := budgetError(); budgetErr != nil {
+			return receipt, budgetErr
+		}
+		return receipt, err
+	}
+	// A slow fsync must consume the budget, never create a fresh disable window.
+	if err := budgetError(); err != nil {
+		return receipt, err
+	}
 	if !receipt.RestoreClaims {
+		receipt.disableNotSent = false
 		return receipt, nil
 	}
-	_, err := op.setClaims(ctx, profile, l1.NodeIntentRequest{ClaimsEnabled: false, IntentRevision: node.IntentRevision, Reason: receipt.Reason})
+	mutationBudget := deadline.Sub(op.now())
+	if mutationBudget <= 0 {
+		return receipt, upgradeDrainTimedOut()
+	}
+	mutation, cancelMutation := context.WithTimeout(bounded, mutationBudget)
+	defer cancelMutation()
+	if err := budgetError(); err != nil {
+		return receipt, err
+	}
+	receipt.disableNotSent = false
+	_, err := op.setClaims(mutation, profile, l1.NodeIntentRequest{ClaimsEnabled: false, IntentRevision: node.IntentRevision, Reason: receipt.Reason})
+	if budgetErr := budgetError(); budgetErr != nil {
+		return receipt, budgetErr
+	}
 	return receipt, err
 }
 
@@ -153,7 +214,10 @@ func upgradeReasonActive(node l1.Node, now time.Time) bool {
 }
 
 func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.Profile, receipt *upgradeDrainReceipt, yes bool, timeout time.Duration, out io.Writer, work *[]l1.NodeActiveAttempt) (l1.Node, error) {
-	deadline := op.now().Add(timeout)
+	deadline := receipt.deadline
+	if deadline.IsZero() {
+		deadline = op.now().Add(timeout)
+	}
 	if receipt.RestoreClaims {
 		if recorded, err := upgradeReasonDeadline(receipt.Reason); err == nil && !recorded.IsZero() {
 			deadline = recorded
@@ -368,6 +432,11 @@ func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, 
 }
 
 func finishUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, receipt *upgradeDrainReceipt, recovering bool, out io.Writer) (resultErr error) {
+	// This invocation knows no CAS was sent. Remove the receipt without an
+	// admission fence; a receipt read after a crash keeps conservative recovery.
+	if receipt.disableNotSent {
+		return removeUpgradeDrain(paths.config)
+	}
 	defer func() {
 		for _, jobID := range receipt.restarted {
 			if _, err := fmt.Fprintln(out, "Restarted service", jobID); err != nil {

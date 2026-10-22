@@ -36,8 +36,8 @@ func TestUpgradeDrainWaitsForOneShotAndLateClaim(t *testing.T) {
 			waited := false
 			f.operations.wait = func(ctx context.Context, d time.Duration) error {
 				if d == 5*time.Second {
-					if f.restarted || f.node.ClaimsEnabled {
-						t.Fatal("wait after installation or without drain")
+					if f.restarted || f.node.ClaimsEnabled == late {
+						t.Fatal("wait after installation or wrong admission state")
 					}
 					waited = true
 					late = false
@@ -231,7 +231,7 @@ func TestUpgradeDrainFailureAndCancelRestoreIntent(t *testing.T) {
 			if _, err := runUpgrade(ctx, f.host, false, io.Discard); err == nil {
 				t.Fatal("expected failure")
 			}
-			if !restored || !f.node.ClaimsEnabled {
+			if (!restored && failure != "ctrl-c-drain") || !f.node.ClaimsEnabled {
 				t.Fatal("claims left disabled")
 			}
 			assertNoUpgradeDrainReceipt(t, f)

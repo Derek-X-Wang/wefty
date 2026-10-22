@@ -54,6 +54,7 @@ const (
 // These machine operations extend setupHost, rather than adding public flags.
 // Tests use a local bare repository, a fake build, runner and clock.
 type upgradeHost struct {
+	writeDrain       func(context.Context, string, *upgradeDrainReceipt) error
 	remote           string
 	build            func(context.Context, string, string, string, string) error
 	command          func(context.Context, string, []string, string, ...string) ([]byte, error)
@@ -409,7 +410,12 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		if len(drainTimeout) > 0 {
 			bound = drainTimeout[0]
 		}
-		drain, err = beginUpgradeDrain(ctx, operations, paths, profile, current, bound)
+		var deadline time.Time
+		current, deadline, err = waitUpgradeGap(ctx, operations, profile, current, yes, bound, warnings, &report.RunningWork, &report.upgradeDrainCounts)
+		if err != nil {
+			return err
+		}
+		drain, err = beginUpgradeDrain(ctx, operations, paths, profile, current, bound, deadline)
 		if err != nil {
 			return err
 		}

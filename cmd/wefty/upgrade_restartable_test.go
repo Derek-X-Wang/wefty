@@ -95,6 +95,10 @@ func TestUpgradeRestartableDrain(t *testing.T) {
 			wait := f.operations.wait
 			f.operations.wait = func(ctx context.Context, d time.Duration) error {
 				if d == upgradeDrainPoll {
+					if f.node.ClaimsEnabled && scenario == "mixed" {
+						f.node.ActiveAttempts = []l1.NodeActiveAttempt{restart}
+						return wait(ctx, d)
+					}
 					waits++
 					if calls == 0 {
 						t.Fatal("waited before initiating restartable interruption")
@@ -166,7 +170,7 @@ func TestUpgradeRestartableDrain(t *testing.T) {
 			if !fail && (report.WaitingNonrestartable != 0 || report.StoppingRestartable != 0) {
 				t.Fatalf("unsettled report: %+v", report)
 			}
-			if scenario == "mixed" && !strings.Contains(out.String(), "waiting_nonrestartable=1 stopping_restartable=1") {
+			if scenario == "mixed" && !strings.Contains(out.String(), "waiting_nonrestartable=1 stopping_restartable=0 restart_pending=0; claims remain open") {
 				t.Fatalf("missing split counts: %s", &out)
 			}
 			if !strings.Contains(out.String(), "stopping_restartable=1") {

@@ -453,7 +453,12 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 	if len(drainTimeout) > 0 {
 		bound = drainTimeout[0]
 	}
-	drain, err := beginUpgradeDrain(ctx, op, paths, profile, baseline, bound)
+	var deadline time.Time
+	baseline, deadline, err = waitUpgradeGap(ctx, op, profile, baseline, yes, bound, warnings, &report.RunningWork, &report.upgradeDrainCounts)
+	if err != nil {
+		return report, err
+	}
+	drain, err := beginUpgradeDrain(ctx, op, paths, profile, baseline, bound, deadline)
 	if drain != nil {
 		defer func() {
 			if err := finishUpgradeDrain(ctx, op, paths, profile, drain, false, warnings); err != nil {

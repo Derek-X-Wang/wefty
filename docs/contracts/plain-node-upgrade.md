@@ -78,6 +78,18 @@ never makes upgrade skip.
 Upgrade reads this node and run ledger through their public Fabric APIs.
 Build, binary verification, database preflight, shell capture and destination
 checks all finish before admission changes. A preparation failure never drains.
+Before disabling claims, upgrade waits for a gap with no non-restartable
+one-shots. Claims stay open during this wait; restartable one-shots and services
+do not prevent a gap. It observes every five seconds within the configured
+drain timeout. If no gap appears, it exits 5 with
+`drain timed out; installed stack unchanged` without disabling claims or writing
+a drain receipt. Intent or boot changes refuse activation. The gap wait, durable receipt persistence, admission disable and post-disable
+wait share one absolute deadline. Upgrade checks it again before sending the
+disable; receipt latency consumes the remaining budget. If the budget expires
+before the disable is sent, it removes its receipt without changing admission. A late non-restartable claim committed
+before the disable is still waited for within the remaining time. `--yes`
+skips the gap wait; a pre-existing disable remains closed.
+
 Immediately before the first installed write, upgrade durably writes
 `upgrade-drain.json` in the configuration directory. The receipt names this
 node, the exact post-write intent revision, a unique

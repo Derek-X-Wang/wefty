@@ -72,7 +72,13 @@ Upgrade reuses plain upgrade's revision-fenced claim disable, durable drain
 receipt, wait bounds, `--yes`, late-attempt and intent rechecks, service-job
 recovery, independent cleanup budget, and interrupted-upgrade recovery. It
 drains only its own Node. A previous or newer operator disable stays disabled.
-After disabling admission and observing late claims, it immediately requests
+Before disabling admission it waits for a gap with no non-restartable one-shots,
+leaving claims open. Restartable work does not prevent a gap. This wait carries one absolute deadline through receipt persistence,
+admission disable and post-disable settlement. Receipt time consumes the budget;
+expiry before the disable removes the receipt without an admission mutation. Expiry returns the existing
+timeout result without disabling claims or writing a drain receipt; `--yes`
+skips it, and pre-existing disables stay closed. Intent and boot changes refuse
+activation. After disabling admission and observing late claims, it immediately requests
 exact-Attempt interruption for all restartable one-shots through that same saved
 client connection. It retains pre-disable restartable identities even when they disappear before
 the disabled observation, and explicitly resolves their exact settlement;

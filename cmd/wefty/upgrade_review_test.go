@@ -300,13 +300,16 @@ func TestStatusUpgradeReasonExpiresWithoutReceipt(t *testing.T) {
 
 func TestUpgradeJSONIncludesRestoreFailure(t *testing.T) {
 	f := newUpgradeFixture(t)
-	f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "long", AttemptID: "long"}}
 	set := f.operations.setClaims
 	f.operations.setClaims = func(ctx context.Context, p connprofile.Profile, r l1.NodeIntentRequest) (l1.Node, error) {
 		if r.ClaimsEnabled {
 			return l1.Node{}, &unavailableError{cause: errors.New("restore transport unavailable")}
 		}
-		return set(ctx, p, r)
+		node, err := set(ctx, p, r)
+		if err == nil && !r.ClaimsEnabled {
+			f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "long", AttemptID: "long"}}
+		}
+		return node, err
 	}
 	_, err := runUpgrade(t.Context(), f.host, false, io.Discard, 10*time.Second)
 	var out bytes.Buffer
