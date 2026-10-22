@@ -488,3 +488,16 @@ func TestStatusInterruptedUpgradeThroughConfinedConfigLink(t *testing.T) {
 		t.Fatalf("linked config hid interrupted upgrade: %v %s", err, output.String())
 	}
 }
+
+// Restartable one-shots and services never block a drain, so the retry hint
+// names only ordinary one-shots, on every path that reports a timeout.
+func TestUpgradeDrainTimeoutHintNamesOnlyBlockingJobs(t *testing.T) {
+	err := upgradeDrainTimedOut(true, []l1.NodeActiveAttempt{
+		{JobID: "ordinary", AttemptID: "attempt-1"},
+		{JobID: "restartable", AttemptID: "attempt-2", Restartable: true},
+		{JobID: "service", AttemptID: "attempt-3", Class: contract.JobClassService},
+	})
+	if !err.APIError.Retryable || !strings.Contains(err.APIError.Message, "(jobs: ordinary)") {
+		t.Fatalf("hint = %q retryable=%v, want only the ordinary Job", err.APIError.Message, err.APIError.Retryable)
+	}
+}

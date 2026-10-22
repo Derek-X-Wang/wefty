@@ -434,7 +434,7 @@ func (e *upgradeDrainTimeoutError) setRetryable(claimsOpen bool) {
 func upgradeDrainTimedOut(claimsOpen bool, attempts []l1.NodeActiveAttempt) *upgradeDrainTimeoutError {
 	var jobs []string
 	for _, attempt := range attempts {
-		if attempt.Class == contract.JobClassService || attempt.JobID == "" {
+		if attempt.Class == contract.JobClassService || attempt.Restartable || attempt.JobID == "" {
 			continue
 		}
 		if !slices.Contains(jobs, attempt.JobID) {
