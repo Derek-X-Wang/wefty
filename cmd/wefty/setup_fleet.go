@@ -614,7 +614,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		if !committed {
 			requestedName, _ := fabric.RequestedNetworkName(part.name)
 			if granted := profile.Participants[part.role].NetworkName; granted != requestedName {
-				report.Notes = append(report.Notes, fmt.Sprintf("The network gave %s because %s is taken; retire the stale device to free the name.", granted, requestedName))
+				report.Notes = append(report.Notes, setupNetworkNameCollisionNotice(part.role, granted, requestedName))
 			}
 		}
 
