@@ -34,7 +34,7 @@ The owner decided on 2026-10-22 to match the phase numbers to what happens. This
 - Buzz is **phase 4**.
 - The daily-use trial ([#897](https://github.com/Derek-X-Wang/wefty/issues/897)) does not change.
 
-Stage A may start once the owner ratifies this spec, beside the fleet work, because it does not need it. Like the fleet work, it does not wait for the phase-1 exit (#897). The owner's Mac runs one test-heavy worker at a time, shared with the fleet work. Stage B comes after the fleet tickets that it depends on: #899 (Fabric identities per machine), #900 (fleet setup) and #902 (`wefty exec` on another machine).
+Stage A may start once the owner ratifies this spec, beside the fleet work, because it does not need it. Like the fleet work, it does not wait for the phase-1 exit (#897). The owner's Mac runs one test-heavy worker at a time, shared with the fleet work. Stage B's cross-Mac parts come after the fleet tickets that they depend on: #899 (Fabric identities per machine), #900 (fleet setup) and #902 (`wefty exec` on another machine). Its *by name* part needs only stage A (section 10.4).
 
 ### 0.4 The base
 
@@ -59,12 +59,12 @@ A Computer has three settings:
 |---|---|---|---|---|
 | Shared, on demand | a Seat request (*any*) | 2 by default | *delete* | what the request names |
 | Dedicated, on demand | a Seat request (*dedicated*) | 1 | *delete* | what the request names |
-| Owner-made | the owner (`wefty services create --computer`) | the owner's choice, 2 by default | the owner's choice: *nothing* (default), *stop* or *delete* | *with internet* (today's public egress) |
+| Owner-made | the owner (`wefty services create --computer`) | stage A: takes no Seats; stage B: the owner's choice, 2 by default | stage A: *nothing*; stage B: the owner's choice, *nothing* (default), *stop* or *delete* | *with internet* (today's public egress) |
 
 - **The default request** is a Seat on a shared on-demand Computer (charting decision 4).
 - **A dedicated Computer gives no neighbours:** all its memory, its own background programs, and reset; not system changes, which on every Computer come only through a new image. "System settings" in charting decision 4 now means the AI agent's own settings ([#1028](https://github.com/Derek-X-Wang/wefty/issues/1028)).
 - **A setting caps the dedicated Computers on a Mac:** 1 by default (#1015). It counts those that run now and that a Seat request made, not owner-made ones. Memory admission still guards every Computer ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)).
-- **Owner-made Computers keep working as now by default** ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). The owner sets their Seat limit and idle action at creation; this is how a Computer gets idle action *stop*. Their Seats share the memory limit that the owner gave the Computer and take no extra room. A Seat still needs an image that supports Seats; how wefty detects that is an engineering choice in the image ticket (owner, 2026-10-22).
+- **Owner-made Computers keep working as now** ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). In stage A they take idle action *nothing* and take no Seats: only a *by name* request reaches them, and *by name* comes in stage B. In stage B the owner sets their Seat limit and idle action at creation, which is how a Computer gets idle action *stop*; their Seats share the memory limit that the owner gave the Computer and take no extra room; a Seat still needs an image that supports Seats (owner, 2026-10-22; section 10.4).
 
 ### 1.3 Rules that hold everywhere
 
@@ -80,11 +80,13 @@ A Computer has three settings:
 
 ### 1.4 Request forms (charting decision 9; #1025)
 
-| Form | What it gets |
-|---|---|
-| *any* (the default) | A Seat on a shared Computer with the same network and room, or else a new shared Computer. |
-| *dedicated* | A new Computer with a Seat limit of 1, within the cap. |
-| *by name* | A Seat on one existing Computer, such as an always-on one or a stopped one that kept its Storage. |
+Charting decision 9 is the full model. The owner split it into stages on 2026-10-22 (section 12.3).
+
+| Form | What it gets | Stage |
+|---|---|---|
+| *any* (the default) | A Seat on a shared on-demand Computer with the same network and room, or else a new shared Computer. | A |
+| *dedicated* | A new Computer with a Seat limit of 1, within the cap. | A |
+| *by name* | A Seat on one existing Computer, such as an always-on one or a stopped one that kept its Storage. | B (section 10.4) |
 
 ### 1.5 Who holds what
 
@@ -100,7 +102,7 @@ Spirit ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)): every reque
 
 1. An AI agent runs `wefty seat request`. Every Seat command is in one `wefty seat` family, so `wefty seat --help` finds them all (owner, 2026-10-22; section 12.3).
 2. **It names its network**, *with internet* or *without internet*. There is no default; a request that does not say is a usage error that shows the fix ([#1017](https://github.com/Derek-X-Wang/wefty/issues/1017)).
-3. **It names its form:** *any* (the default), *dedicated*, or *by name* with a Computer's name. It may ask for an approval window instead of one Seat (section 2.3).
+3. **It names its form:** *any* (the default) or *dedicated*; *by name* with a Computer's name comes in stage B. Proposed: stage A's `wefty seat request` does not offer `--computer` yet, so the CLI's usage error lists the flags it has (P19). It may ask for an approval window instead of one Seat (section 2.3).
 4. **The harness name is a label.** Wefty reads it from the `CLAUDECODE` or `CODEX_SANDBOX` markers, or the AI agent states it. Wefty shows it in the dialog and the records, marked "not verified". It picks no rule, and a contradicting marker does not refuse (#1017, superseding point 6 of [#1014](https://github.com/Derek-X-Wang/wefty/issues/1014)).
 5. **One ID from the start.** The request prints its Seat ID (`seat_…`, P2) at once, then waits until the Seat is ready or the request is refused ([#1052](https://github.com/Derek-X-Wang/wefty/issues/1052); section 12.2). Once approved, the same ID names the Seat; a refused request keeps the ID in its record.
 6. **A cut-off call waits again by that ID** (`wefty seat wait SEAT_ID`). That shows no second dialog and makes no second Seat. The model is L1's dispatch-key replay (`docs/contracts/lease-fencing-dispatch.md`).
@@ -108,8 +110,8 @@ Spirit ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)): every reque
 ### 2.2 Room comes first
 
 1. **Wefty checks for room before it shows the dialog**, also when the host VM is stopped ([#1027](https://github.com/Derek-X-Wang/wefty/issues/1027)). A Mac without room refuses at once, without asking the owner: "out of room, try again later" ([#1015](https://github.com/Derek-X-Wang/wefty/issues/1015)). The AI agent may retry. There is no wait queue (charting decision 10).
-2. **Also refused at once:** any request while the host VM switch is *off* ("the host VM is off", #1027); a *by name* request whose network differs from the Computer's, with the reason naming the Computer's network (#1017).
-3. **Also refused, each with its reason:** a *by name* request to a Computer whose image does not support Seats ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)); a *by name* request to a Computer that failed or was removed, about which the owner decides; a *dedicated* request while the dedicated cap is full. Proposed: these checks run before the dialog too (P12).
+2. **Also refused at once:** any request while the host VM switch is *off* ("the host VM is off", #1027).
+3. **Also refused with its reason:** a *dedicated* request while the dedicated cap is full. Proposed: this check runs before the dialog too (P12). The *by name* refusals come with *by name* in stage B (section 10.4).
 4. **The approval does not hold the room.** The first approved request takes it. A later one is refused for lack of room, and its AI agent may retry.
 
 ### 2.3 The approval dialog
@@ -117,7 +119,7 @@ Spirit ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)): every reque
 Spirit (#1017): wefty does not guess an AI agent's sandbox. It keeps no list of harness names and no default network. An AI agent asks, and says if it needs the internet; wefty asks the owner a yes-or-no question on the Mac; the owner's answer is the rule, for every harness. The owner: "If the agents want to use computer then he need to ask: can you grant me the access to this computer, with network or without network?"
 
 1. **The node agent shows the dialog.** It runs in the owner's login session as a per-user LaunchAgent, so it can show a native Mac dialog. This is new node-agent work (way: P4).
-2. **The dialog says** which harness asks, marked "not verified"; the AI agent's folder; the form (*by name* with the Computer's name, plus "and start it" for a stopped Computer); the network; and a window's length.
+2. **The dialog says** which harness asks, marked "not verified"; the AI agent's folder; the form (*any* or *dedicated*; in stage B also *by name* with the Computer's name, plus "and start it" for a stopped Computer); the network; and a window's length.
 3. **Two buttons only: Approve and Deny.** To give less, the owner denies, and the AI agent asks again for less.
 4. **No Touch ID or password.** The dialog stops an AI agent from approving itself; it does not prove who sits at the keyboard. A sandboxed AI agent cannot click a Mac window, and an unsandboxed one can already do anything the owner can. The owner: "no one can make that promise anyway."
 5. **Approval happens only in the dialog.** No `wefty` command, flag, settings file or web page can approve, because the AI agent can run all of those. A command may only take approval away, for example `wefty seat window close`.
@@ -141,7 +143,7 @@ In a run that the harness approved outside its sandbox, the sandbox does not lim
 ### 2.4 The start
 
 1. **Nothing starts before the owner approves:** no Computer and no host VM.
-2. **By form:** *any* takes a shared Computer with the same network and room first, and starts another shared Computer when those are full but the Mac has room (#1015). *dedicated* creates a new Computer with a Seat limit of 1 and the requested network. *by name* takes a Seat on that Computer; for a stopped Computer the approval starts it, and as the owner's intent this keeps ADR-0004 (#1016).
+2. **By form:** *any* takes a shared Computer with the same network and room first, and starts another shared Computer when those are full but the Mac has room (#1015). *dedicated* creates a new Computer with a Seat limit of 1 and the requested network. *by name* comes in stage B (section 10.4).
 3. **A new Computer** takes the newest default image at its creation ([#1028](https://github.com/Derek-X-Wang/wefty/issues/1028)) and its own Storage, 8 GiB by default.
 4. **A stopped host VM** gives the reply "starting the host VM, about 1 minute" and a 3-minute limit (section 9.4).
 5. **A new Computer that fails to start** is deleted at once, with its Storage. The request is refused with the reason, and nothing latches. **An existing Computer that fails to start** keeps today's latch (M3.5 spec, section 4), and the request is refused with the reason.
@@ -161,7 +163,7 @@ A Seat ends on release, on expiry, on a Computer restart, or through an owner co
 - its running commands are cancelled, and its desktop and programs stop, background programs included;
 - its own folder is deleted, so the next Seat starts clean. Results leave by copy-out first;
 - its Seat credential stops working at once for commands, input, copies and the screen. Later calls get "Seat ended" with the reason (released, expired, or Computer restarted). It keeps read-only access to that Seat's log for the log's retention, and nothing else (owner, 2026-10-22);
-- its room returns once wefty confirms the cleanup, and only as far as its Computer's memory limit actually shrinks. If the remaining Seats use more than their share, the Computer keeps the larger limit, and the extra room stays held until a later shrink succeeds or the Computer ends. Room and the runtime limit change together, because today's reservation rejects a changed declaration (`runner/ocihelper/capacity_linux.go`). An owner-made Computer keeps its fixed limit and never shrinks;
+- its room returns once wefty confirms the cleanup, and only as far as its Computer's memory limit actually shrinks. If the remaining Seats use more than their share, the Computer keeps the larger limit, and the extra room stays held until a later shrink succeeds or the Computer ends. Room and the runtime limit change together, because today's reservation rejects a changed declaration (`runner/ocihelper/capacity_linux.go`). An owner-made Computer (which takes Seats only in stage B) keeps its fixed limit and never shrinks;
 - a release still ends the Seat while a person watches or drives it, and the viewer says so.
 
 Who ends Seats besides the AI agent:
@@ -178,7 +180,7 @@ A Computer with no Seats is idle. Its idle wait is 10 minutes after its last Sea
 | Idle action | What wefty does | Source |
 |---|---|---|
 | *delete* | Deletes the Computer and its Storage through today's removal path and proof, ending with `removed_verified` before the host VM stops. | #1016 |
-| *stop* | Stops the Computer and keeps its Storage. | charting decision 2 |
+| *stop* | Stops the Computer and keeps its Storage. Stage B: only owner-made Computers take it. | charting decision 2; owner, 2026-10-22 |
 | *nothing* | Nothing. The Desired state that the owner set stays. | #1016 |
 
 Races and the owner (#1016):
@@ -206,8 +208,8 @@ The "Setting" column says which values the owner may change later, for example i
 | Host VM memory and CPUs | a quarter of the Mac's memory (4 GiB; 8 GiB on a 32 GiB Mac), 4 CPUs | yes | [#1015](https://github.com/Derek-X-Wang/wefty/issues/1015) |
 | Memory for Computers | the host VM's memory minus 1 GiB (3 GiB) | yes | #1015 |
 | Room per Seat | 1 GiB, so 3 Seats at once, in any mix of shared and dedicated Computers. In stage A a Seat request cannot ask for more. | yes | #1015 |
-| Memory limit of an owner-made Computer | its own, 1 GiB by default; it uses the same room, and its Seats share it with no extra room | yes | #1015; owner, 2026-10-22 |
-| Seat limit and idle action of an owner-made Computer | 2 and *nothing* | yes, set by the owner at creation | owner, 2026-10-22 |
+| Memory limit of an owner-made Computer | its own, 1 GiB by default; it uses the same room. In stage B its Seats share it with no extra room. | yes | #1015; owner, 2026-10-22 |
+| Seat limit and idle action of an owner-made Computer (stage B) | 2 and *nothing* | yes, set by the owner at creation | owner, 2026-10-22 |
 | Seat limit of a shared Computer | 2; never more than the Seat users in its image | yes | #1015; [#1028](https://github.com/Derek-X-Wang/wefty/issues/1028) |
 | Dedicated Computers at once | 1 (counts only those that a Seat request made) | yes | #1015; [#1025](https://github.com/Derek-X-Wang/wefty/issues/1025) |
 | Storage of an on-demand Computer | 8 GiB | yes (today's default) | [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016) |
@@ -379,7 +381,7 @@ Each change appears once. "Way" is "decided" when a ticket chose the mechanism, 
 
 | M3.5 part | Change | Way | Contract text |
 |---|---|---|---|
-| §4 capacity | Room is counted per Seat at 1 GiB, taken at start and returned after confirmed cleanup. A Computer still takes one service Slot. Owner-made Computers keep their own memory limit and use the same room; their Seats share that limit and take no extra room (owner, 2026-10-22). The [#122](https://github.com/Derek-X-Wang/wefty/issues/122) rule stays ([#1015](https://github.com/Derek-X-Wang/wefty/issues/1015)). | decided | M3.5 §4; `state-machines.md` |
+| §4 capacity | Room is counted per Seat at 1 GiB, taken at start and returned after confirmed cleanup. A Computer still takes one service Slot. Owner-made Computers keep their own memory limit and use the same room; in stage B their Seats share that limit and take no extra room (owner, 2026-10-22). The [#122](https://github.com/Derek-X-Wang/wefty/issues/122) rule stays ([#1015](https://github.com/Derek-X-Wang/wefty/issues/1015)). | decided | M3.5 §4; `state-machines.md` |
 | §0.2, §4 ceiling | The host VM's memory minus 1 GiB, not a fixed 4 GiB with a quarter in reserve (`runner/lima/template.go`). | decided | M3.5 §0.2, §4 |
 | §4 live memory limit | A shared Computer's limit grows when a Seat joins and shrinks after its cleanup, together with the room: room returns only as far as the limit shrinks (section 2.6). An owner-made Computer's limit never changes. | new helper operation | `oci-helper-protocol.md`; `state-machines.md` |
 | §4 Computer count | Today 2 per node; it must grow with the room. | P11 | `state-machines.md` |
@@ -387,8 +389,8 @@ Each change appears once. "Way" is "decided" when a ticket chose the mechanism, 
 | §4 OOM | One heavy Seat can still end every Seat on its Computer; the Seat limit of 2 bounds it. | accepted | — |
 | §4 latch | A new on-demand Computer that fails to start is deleted with its Storage; an existing one keeps the latch ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)). | decided | `state-machines.md` |
 | §1.2 durable data | Seat folders and the shared folder live on `/wefty/service`, the only persistent path. | P9 | `computer-image.md` |
-| §2 settings and verbs | Seat limit, idle action and network (fixed at creation). For an owner-made Computer, the owner sets the Seat limit (default 2) and the idle action (*nothing* by default, *stop* or *delete*) at creation (owner, 2026-10-22). The owner's `wefty services … --computer` commands run at once and end the Seats that they touch. The Seat commands for AI agents are the `wefty seat` family. | decided; flag names P17 | `state-machines.md` |
-| §2, ADR-0004 | *nothing* keeps the owner's Desired state; an owner-stopped Computer is never deleted by the timer; approval of a *by name* request may start a stopped Computer. | decided | `state-machines.md` |
+| §2 settings and verbs | Seat limit, idle action and network (fixed at creation). In stage B, for an owner-made Computer, the owner sets the Seat limit (default 2) and the idle action (*nothing* by default, *stop* or *delete*) at creation (owner, 2026-10-22). The owner's `wefty services … --computer` commands run at once and end the Seats that they touch. The Seat commands for AI agents are the `wefty seat` family. | decided; flag names P17 | `state-machines.md` |
+| §2, ADR-0004 | *nothing* keeps the owner's Desired state; an owner-stopped Computer is never deleted by the timer; in stage B, approval of a *by name* request may start a stopped Computer. | decided | `state-machines.md` |
 | §3 Storage | Every Computer has Storage (8 GiB for an on-demand one), deleted with it through today's removal path. A recreate is refused while any Computer Storage or Backup lives on the host VM's disk ([#1021](https://github.com/Derek-X-Wang/wefty/issues/1021)). | decided | `state-machines.md`; `agent-local-lifecycle.md` |
 | §5 take-over | Only the owner (admins) watches and drives Seats in stage A, with the one-hour limit. A Take-over session may open one Seat's screen. | decided | `state-machines.md` |
 | §6 input arbitration | Tenure, the driver signal and the endpoints are per Seat. The AI agent's input with its Seat credential is refused while a person holds the tenure. Wefty never pauses the tenant and records no clicks, keys or screen. The take-over audit and the Seat's log are one record, kept 90 days ([#1014](https://github.com/Derek-X-Wang/wefty/issues/1014)). | signal: P8 | `computer-image.md`; `state-machines.md` |
@@ -397,7 +399,7 @@ Each change appears once. "Way" is "decided" when a ticket chose the mechanism, 
 | §7 Seat endpoints | View and control endpoints per Seat, also for a Seat added later, closed to other Seats (gaps 3, 5). Today one pair per attempt comes through the environment. | P7 | `computer-image.md`; `oci-helper-protocol.md` |
 | §7 command as a Seat's user | Run a command inside a running Computer as a Seat's user, in its folder, with its screen (gap 4; containerd can, the helper cannot yet). | new helper operation | `oci-helper-protocol.md` |
 | §7 Seat end | Every process of the Seat's user stops, and its folder goes. | supervisor; helper confirms | `computer-image.md` |
-| §7 default image | One default image for on-demand Computers (section 7.1). Older images keep today's single-screen contract; no current-version Computer exists, so nothing migrates (#1016). How wefty detects Seat support is an engineering choice in the image ticket. | decided | `computer-image.md` |
+| §7 default image | One default image for on-demand Computers (section 7.1). Older images keep today's single-screen contract; no current-version Computer exists, so nothing migrates (#1016). How wefty detects Seat support on an owner's image is an engineering choice in stage B (section 10.4). | decided | `computer-image.md` |
 | §8 guest authority | No change. The [#126](https://github.com/Derek-X-Wang/wefty/issues/126) path is owner-created: the owner makes the Computer and turns on submission, so it is owner-made, with the owner's idle action (*nothing* by default). Installing an AI agent inside a Seat never changes a Computer's kind or idle action. | decided | — |
 | §9 removal | No new path. *delete* uses today's path, with `removed_verified` before the host VM stops. A copied file is not a Custody export ([#1026](https://github.com/Derek-X-Wang/wefty/issues/1026)). | decided | `state-machines.md`; `exec.md` |
 | Network | Today's Computers have public egress, so they are *with internet*. *Without internet* is loopback only, with no proxy or DNS and IP filter in the guest ([#1017](https://github.com/Derek-X-Wang/wefty/issues/1017)). | decided | `computer-image.md` |
@@ -482,7 +484,16 @@ Spirit ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)): stage B wor
 
 - **The AI agent's Mac sleeps.** A command that already runs on the Seat continues until it ends or reaches its time limit. Then the expiry rule applies: a Seat ends 30 minutes after the latest of its last Seat call, the end of its last command, and a person's release of its screen; it never ends while a command runs or a person drives. A Mac that sleeps longer loses its Seat.
 - **The hosting Mac loses the control plane.** It stops taking the AI agent's screen input until the connection is back (fail closed). Check-ins go to L1 on the control-plane Mac.
-- **Dependencies:** the stage B build needs #899, [#900](https://github.com/Derek-X-Wang/wefty/issues/900) and #902. Stage A does not.
+- **Dependencies:** the cross-Mac stage B build needs #899, [#900](https://github.com/Derek-X-Wang/wefty/issues/900) and #902. Stage A does not, and neither does *by name* (section 10.4).
+
+### 10.4 By name and owner-made Computers (owner, 2026-10-22)
+
+These parts of the model come in stage B. They run on one Mac and need no fleet ticket, so they may start after the stage A acceptance.
+- **The *by name* form:** `wefty seat request --computer NAME` takes a Seat on one existing Computer. A *by name* request whose network differs from the Computer's is refused at once, and the reason names the Computer's network ([#1017](https://github.com/Derek-X-Wang/wefty/issues/1017)). A *by name* request to a Computer whose image does not support Seats is refused with the reason ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). A *by name* request to a Computer that failed or was removed is refused with the reason; the owner decides about those ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)).
+- **Starting a stopped Computer:** the dialog says "and start it", and the owner's approval starts the Computer. The approval is the owner's intent, so this keeps ADR-0004 (#1016).
+- **Owner-made Computers taking Seats:** at creation the owner sets the Seat limit (default 2) and the idle action (*nothing* by default, *stop* or *delete*). Their Seats share the memory limit that the owner gave the Computer and take no extra room; the limit is fixed and never shrinks. A Seat still needs an image that supports Seats; how wefty detects that is an engineering choice.
+- **Idle action *stop*:** only owner-made Computers take it; the Computer stops after its idle wait and keeps its Storage.
+- On another Mac, a *by name* request goes to the Mac where that Computer lives (section 10.2).
 
 ## 11. Acceptance
 
@@ -591,7 +602,6 @@ Spirit ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)): stage B wor
 | CT-3 | The owner's `stop` of a Computer with Seats ends them at once. The command lists them, and each Seat's log says why. |
 | CT-4 | A Computer that the owner stopped is still there after its idle wait. |
 | CT-5 | A Seat that arrives before the idle action starts keeps the Computer. One that arrives after gets another Computer or "out of room". |
-| CT-6 | A *by name* request to a Computer whose image does not support Seats is refused with the reason. |
 
 ### 11.11 The host VM on demand ([#1027](https://github.com/Derek-X-Wang/wefty/issues/1027))
 
@@ -633,6 +643,16 @@ Spirit ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)): stage B wor
 | RC-2 | Two approvals race for the last room: exactly one wins, and the other is refused for lack of room. |
 | RC-3 | A full host VM disk during cleanup keeps the room charged until the cleanup succeeds. |
 | RC-4 | A Seat that becomes ready after its deadline is cleaned up and not handed out. |
+
+### 11.15 Stage B: by name and owner-made Computers (owner, 2026-10-22)
+
+| ID | Check |
+|---|---|
+| CT-6 | A *by name* request to a Computer whose image does not support Seats is refused with the reason (moved from section 11.10; #1016). |
+| BN-1 | An owner-made Computer with a Seat limit of 2 holds 2 Seats within its own memory limit, and the Mac's room does not change when they join or leave. |
+| BN-2 | A *by name* request to a stopped Computer shows "and start it" in the dialog, and the approval starts the Computer. |
+| BN-3 | An owner-made Computer with idle action *stop* stops after its idle wait and keeps its Storage. |
+| BN-4 | A *by name* request whose network differs from the Computer's is refused at once, and the reason names the Computer's network. |
 
 ## 12. Decision log
 
@@ -694,9 +714,10 @@ This section is normative.
 | Point | Owner answer | Spec sections |
 |---|---|---|
 | Phase numbers | The fleet work is phase 2 (started 2026-10-19); this effort is phase 3; Buzz is phase 4; [#897](https://github.com/Derek-X-Wang/wefty/issues/897) does not change. Stage A starts after ratification, beside the fleet work, and does not wait for the phase-1 exit. The owner's Mac runs one test-heavy worker at a time, shared with the fleet work. Stage B follows the fleet tickets it needs. This revises the map's 2026-10-16 note. | §0.3 |
-| Seat commands | One `wefty seat` family: `wefty seat request --network internet\|none [--dedicated \| --computer NAME] [--window 1h\|8h\|24h] [--node NODE]`, `wefty seat wait SEAT_ID`, `wefty seat release SEAT_ID`, `wefty seat screenshot\|click\|move\|drag\|scroll\|type\|key SEAT_ID …`, `wefty seat view SEAT_ID`, `wefty seat window close`. Kept: `wefty exec --seat`, `wefty cp`, `wefty logs`. Why: an AI agent finds everything with `wefty seat --help`, and the top-level command list stays short. | §2.1, §2.3, §4.1, §4.2 |
+| Seat commands | One `wefty seat` family: `wefty seat request --network internet\|none [--dedicated \| --computer NAME] [--window 1h\|8h\|24h] [--node NODE]`, `wefty seat wait SEAT_ID`, `wefty seat release SEAT_ID`, `wefty seat screenshot\|click\|move\|drag\|scroll\|type\|key SEAT_ID …`, `wefty seat view SEAT_ID`, `wefty seat window close`. `--computer` comes with *by name* in stage B. Kept: `wefty exec --seat`, `wefty cp`, `wefty logs`. Why: an AI agent finds everything with `wefty seat --help`, and the top-level command list stays short. | §2.1, §2.3, §4.1, §4.2 |
 | Owner-settings command names | Engineering names, built as written after ratification (P17). Not an owner question. | §13.2 |
-| Owner-made Computers | At creation the owner sets the Seat limit (default 2) and the idle action: *nothing* (default), *stop* or *delete*. This is how a Computer gets *stop*. Its Seats share the memory limit that the owner gave it and take no extra room. A Seat still needs an image that supports Seats; detection is an engineering choice in the image ticket. | §1.2, §3, §8 |
+| Owner-made Computers | At creation the owner sets the Seat limit (default 2) and the idle action: *nothing* (default), *stop* or *delete*. This is how a Computer gets *stop*. Its Seats share the memory limit that the owner gave it and take no extra room. A Seat still needs an image that supports Seats; detection is an engineering choice. All of this comes in stage B (next row). | §1.2, §3, §8, §10.4 |
+| Stage split | Stage A keeps the *any* and *dedicated* forms. The *by name* form moves to stage B, and with it owner-made Computers taking Seats, starting a stopped Computer ("and start it"), and idle action *stop*. Approval windows stay in stage A. Charting decision 9 still holds as the full model; this is a stage split, not a removal. Why: *by name* exists for Computers that the owner makes and keeps, such as always-on Computers on the server Mac; the owner has none on the laptop, and the arrival test needs only *any*. *Dedicated* stays: it is a Computer with a Seat limit of 1. Today's owner-made Computers take idle action *nothing* in stage A (#1016). | §1.4, §2, §10.4, §11.15 |
 | Default image | A desktop, Chromium, `git`, `curl`, Python 3, Node.js, the system libraries that Playwright's browsers need, and 4 Seat users. AI agents install Playwright's own browsers into their Seat folder. | §7.1 |
 | Screen speed | On the owner's Mac, without model time: one click with its screenshot within 1 s (wefty's own part), and Take control to the first refusal within 1 s. The 10-step test, through the screen and as a Playwright command, is recorded with no threshold. Over a threshold, the check fails, and the CDP relay question returns to the owner. | §4.5, §11.3 |
 | The settled points of §12.2 | Accepted, with the ended Seat's read-only log access and the relaxed proof gate. | §2.6, §12.2, the wave doc |
@@ -722,11 +743,12 @@ No ticket chose these engineering mechanisms. They are built as written once the
 | P8 | **The driver signal.** One read-only `/wefty/control/seats/<place>/driver.json` per Seat place, with today's body: `{"version":1,"human_driving":true}` or `false`. |
 | P9 | **Folders.** `/wefty/service/seats/<place>` per Seat and `/wefty/service/shared`, as in the prototype. |
 | P11 | **The Computer count.** A Mac node's service-Slot count follows its room: at least one Slot per Seat that fits. |
-| P12 | **Checks before the dialog.** The dedicated cap, image support for Seats, and a failed or removed Computer, like the room, so the owner is never asked about a request that cannot succeed. |
+| P12 | **Checks before the dialog.** The dedicated cap (stage A), and, in stage B, image support for Seats and a failed or removed Computer, like the room, so the owner is never asked about a request that cannot succeed. |
 | P13 | **The stage B routing setting** lives in the machine's connection profile (`docs/contracts/connection-profile.md`), set by a `wefty` settings command. |
 | P14 | **The switch and today's marker.** *enabled* reads as *always on* ([#1027](https://github.com/Derek-X-Wang/wefty/issues/1027): "*Always on:* today's *enabled*"); missing or disabled reads as *off*; a new per-user install writes *on demand*. |
-| P17 | **Owner-settings commands.** The host VM switch: `wefty node oci off\|on-demand\|always-on`, replacing `start\|stop`. An owner-made Computer: `wefty services create --computer … [--seat-limit N] [--idle-action nothing\|stop\|delete]`. The other settings in section 3 are startup flags, like today's `wefty-l1 --computer-backup-cap`: cluster values (the default image, the Seat and Computer idle waits, the Seat command time limit, the warning time) on L1, and node values (room per Seat, the dedicated cap, the host VM size and idle wait, the answer wait, the window lengths) on the node agent. `wefty setup` writes them into the installed services, and the owner changes one by running `wefty setup` again with the new value. The stage B routing setting is P13. |
+| P17 | **Owner-settings commands.** The host VM switch: `wefty node oci off\|on-demand\|always-on`, replacing `start\|stop`. An owner-made Computer (stage B): `wefty services create --computer … [--seat-limit N] [--idle-action nothing\|stop\|delete]`. The other settings in section 3 are startup flags, like today's `wefty-l1 --computer-backup-cap`: cluster values (the default image, the Seat and Computer idle waits, the Seat command time limit, the warning time) on L1, and node values (room per Seat, the dedicated cap, the host VM size and idle wait, the answer wait, the window lengths) on the node agent. `wefty setup` writes them into the installed services, and the owner changes one by running `wefty setup` again with the new value. The stage B routing setting is P13. |
 | P18 | **Seat states and recovery.** The state names *requested*, *approved*, *starting*, *live*, *ending*, *ended* and *refused*; a fenced room reservation per request and Computer; refusal of a pending approval whose dialog was lost; and the reconciliation rules of section 2.8. |
+| P19 | **No `--computer` in stage A.** Stage A's `wefty seat request` does not offer `--computer`; the CLI's usage error lists the flags it has. This needs less code than a special refusal. Stage B adds the flag. |
 
 ## 14. Out of scope, and not yet specified
 

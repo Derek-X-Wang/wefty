@@ -8,7 +8,7 @@ This is paste-ready issue text, not implementation. It builds the spec `docs/spe
 
 - **Order: #1021 first; the proof before any ticket that builds on the per-user host VM.** [#1021](https://github.com/Derek-X-Wang/wefty/issues/1021) must land before any delivery work that sets up or recreates the host VM ([#1019](https://github.com/Derek-X-Wang/wefty/issues/1019)). The proof ticket (Ticket 2) blocks the host VM ticket (Ticket 3), and through it the cold-start ticket (Ticket 14) and the stage A acceptance (Ticket 24). Tickets that do not touch the host VM setup wait only on Ticket 1 or on their own code dependencies. Stage B tickets come last.
 - **Beside the fleet work.** Stage A starts once the owner ratifies the spec, beside the phase-2 fleet work, because it does not need it. Like the fleet work, it does not wait for the phase-1 exit ([#897](https://github.com/Derek-X-Wang/wefty/issues/897)). The owner's Mac runs one test-heavy worker at a time, shared with the fleet work.
-- **Stage B tickets carry the fleet dependencies** [#899](https://github.com/Derek-X-Wang/wefty/issues/899), [#900](https://github.com/Derek-X-Wang/wefty/issues/900) and [#902](https://github.com/Derek-X-Wang/wefty/issues/902), and come after those fleet tickets. Stage A tickets do not ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)).
+- **Stage B tickets that cross Macs carry the fleet dependencies** [#899](https://github.com/Derek-X-Wang/wefty/issues/899), [#900](https://github.com/Derek-X-Wang/wefty/issues/900) and [#902](https://github.com/Derek-X-Wang/wefty/issues/902), and come after those fleet tickets. Stage A tickets do not ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)). The *by name* ticket (Ticket 25) runs on one Mac, needs no fleet ticket, and starts after the stage A acceptance (owner, 2026-10-22).
 - **Size.** Each ticket fits about one AI agent session and lands its own acceptance slice.
 - **One primary owner per check.** Each acceptance check in spec section 11 has exactly one primary owning ticket, which makes it pass and first proves it. Other tickets and lanes may add secondary evidence (see "Acceptance owners" below).
 - **Tests check what an owner or an AI agent can see:** files, commands, exit codes, CLI output, L1 state and Seat log lines. Each new test fails on the code before the change ([#893](https://github.com/Derek-X-Wang/wefty/issues/893), testing decisions).
@@ -24,7 +24,7 @@ This is paste-ready issue text, not implementation. It builds the spec `docs/spe
 
 All are closed: charting decisions 1–14 on map [#1008](https://github.com/Derek-X-Wang/wefty/issues/1008), and tickets [#1014](https://github.com/Derek-X-Wang/wefty/issues/1014), [#1017](https://github.com/Derek-X-Wang/wefty/issues/1017), [#1025](https://github.com/Derek-X-Wang/wefty/issues/1025), [#1052](https://github.com/Derek-X-Wang/wefty/issues/1052), [#1026](https://github.com/Derek-X-Wang/wefty/issues/1026), [#1028](https://github.com/Derek-X-Wang/wefty/issues/1028), [#1015](https://github.com/Derek-X-Wang/wefty/issues/1015), [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016), [#1027](https://github.com/Derek-X-Wang/wefty/issues/1027) and [#1018](https://github.com/Derek-X-Wang/wefty/issues/1018), plus the owner's answers of 2026-10-22 (spec, section 12.3). The spec's section 12 links each decision; its section 12.2 records the settled points, which the owner accepted, and the review round 2 resolutions.
 
-The wave has 27 tickets: 1 existing ticket, 1 proof ticket, 22 stage A tickets and 3 stage B tickets.
+The wave has 28 tickets: 1 existing ticket, 1 proof ticket, 22 stage A tickets and 4 stage B tickets.
 
 ## Ticket list
 
@@ -54,9 +54,10 @@ The wave has 27 tickets: 1 existing ticket, 1 proof ticket, 22 stage A tickets a
 | 22 | Seat working copy and program lifetime | 21 |
 | 23 | `wefty cp`: copies in and out of a Seat | 9, 15 |
 | 24 | Stage A attended acceptance on the owner's Mac | 3, 11, 14, 16, 18, 19, 22, 23 |
-| 25 | Stage B: which Mac serves a Seat request | 24, #899, #900, #902 |
-| 26 | Stage B: an AI agent uses a Seat on another Mac | 24, #899, #900, #902 |
-| 27 | Stage B attended acceptance on two Macs | 25, 26, #899, #900, #902 |
+| 25 | Stage B: by-name requests and owner-made Computers with Seats | 24 |
+| 26 | Stage B: which Mac serves a Seat request | 24, 25, #899, #900, #902 |
+| 27 | Stage B: an AI agent uses a Seat on another Mac | 24, #899, #900, #902 |
+| 28 | Stage B attended acceptance on two Macs | 26, 27, #899, #900, #902 |
 
 ## Dependency graph
 
@@ -109,20 +110,22 @@ flowchart TD
   T23 --> T24
   OwnerMac["Owner-attended Mac access"] --> T02
   OwnerMac --> T24
-  F899["#899 Fabric identities per machine"] --> T25[25 Stage B: which Mac serves]
-  F900["#900 wefty setup for the fleet"] --> T25
-  F902["#902 wefty exec on another machine"] --> T25
-  T24 --> T25
-  F899 --> T26[26 Stage B: Seat on another Mac]
-  F900 --> T26
-  F902 --> T26
+  T24 --> T25[25 Stage B: by name and owner-made Computers]
+  F899["#899 Fabric identities per machine"] --> T26[26 Stage B: which Mac serves]
+  F900["#900 wefty setup for the fleet"] --> T26
+  F902["#902 wefty exec on another machine"] --> T26
   T24 --> T26
-  T25 --> T27[27 Stage B attended acceptance]
-  T26 --> T27
-  F899 --> T27
+  T25 --> T26
+  F899 --> T27[27 Stage B: Seat on another Mac]
   F900 --> T27
   F902 --> T27
-  OwnerMac --> T27
+  T24 --> T27
+  T26 --> T28[28 Stage B attended acceptance]
+  T27 --> T28
+  F899 --> T28
+  F900 --> T28
+  F902 --> T28
+  OwnerMac --> T28
 ```
 
 ## Acceptance owners
@@ -184,7 +187,6 @@ Each check ID from spec section 11 has exactly one primary owner. "Secondary" li
 | CT-3 | 16 | — |
 | CT-4 | 16 | — |
 | CT-5 | 16 | — |
-| CT-6 | 13 | — |
 | HV-1 | 3 | 24 (live) |
 | HV-2 | 3 | 24 |
 | HV-3 | 3 | 24 |
@@ -196,12 +198,17 @@ Each check ID from spec section 11 has exactly one primary owner. "Secondary" li
 | PR-3 | 2 | — |
 | PR-4 | 2 | — |
 | PR-5 | 2 | — |
-| SB-1 | 25 | 27 (live) |
-| SB-2 | 25 | 27 |
-| SB-3 | 25 | 27 |
-| SB-4 | 26 | 27 |
-| SB-5 | 26 | 27 |
-| SB-6 | 26 | 27 |
+| SB-1 | 26 | 28 (live) |
+| SB-2 | 26 | 28 |
+| SB-3 | 26 | 28 |
+| SB-4 | 27 | 28 |
+| SB-5 | 27 | 28 |
+| SB-6 | 27 | 28 |
+| CT-6 | 25 | — |
+| BN-1 | 25 | 10 (live limit) |
+| BN-2 | 25 | 5 (dialog) |
+| BN-3 | 25 | 16 (idle timer) |
+| BN-4 | 25 | — |
 | RC-1 | 12 | — |
 | RC-2 | 12 | 13 |
 | RC-3 | 12 | 16 |
@@ -303,7 +310,7 @@ How do L1 and the node record a Computer's Seat limit, idle action and network? 
 ### Deliverable
 
 - **Computer settings:** Seat limit, idle action (*delete*, *stop*, *nothing*) and network (*with internet*, *without internet*, fixed at creation). The image digest is recorded at creation, as today.
-- **Owner-made Computers** (owner, 2026-10-22): the owner sets the Seat limit (default 2) and the idle action (*nothing* by default, *stop* or *delete*) at creation, with `wefty services create --computer … [--seat-limit N] [--idle-action nothing|stop|delete]` (spec P17). They keep their own fixed memory limit, 1 GiB by default, and use the same room; their Seats share that limit and take no extra room. A Seat on one still needs an image that supports Seats; Ticket 6 chooses how wefty detects that.
+- **Owner-made Computers** keep their own fixed memory limit, 1 GiB by default, use the same room, and take idle action *nothing* ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). They take no Seats in stage A; their Seat limit, idle-action choice and shared memory come with *by name* in Ticket 25.
 - **The default Computer image** as an L1 cluster setting that the owner may change, like the cluster Backup-cap default (spec, section 7.1). A new on-demand Computer takes the newest default at its creation.
 - **The owner's settings** as startup flags that `wefty setup` writes into the installed services (spec P17).
 - **Room per Seat**, 1 GiB each (a setting). The serving Mac counts room node-locally, so the count works while the host VM is stopped. How room returns on a shrink is Ticket 10's; its reservation fencing is Ticket 12's.
@@ -316,7 +323,6 @@ How do L1 and the node record a Computer's Seat limit, idle action and network? 
 
 - RM-3 (primary) at the room check.
 - A room matrix for a 16 GiB and a 32 GiB Mac: 3 and 7 Seats, in any mix of shared and dedicated Computers.
-- An owner-made Computer with a Seat limit of 2 holds 2 Seats within its own memory limit, and the Mac's room does not change when they join.
 - The room count is right with the host VM stopped. Today's Computers keep working unchanged.
 
 ### Out-of-scope
@@ -335,7 +341,7 @@ How does the node agent ask the owner Approve or Deny, so that nothing an AI age
 
 ### Deliverable
 
-- **The dialog** (spec P4): a native macOS alert that the node agent shows in the owner's login session. It shows the harness label ("not verified"), the folder, the request form ("and start it" for a stopped Computer), the network, and a window's length. Two buttons only.
+- **The dialog** (spec P4): a native macOS alert that the node agent shows in the owner's login session. It shows the harness label ("not verified"), the folder, the request form (*any* or *dedicated*; Ticket 25 adds *by name* and "and start it"), the network, and a window's length. Two buttons only.
 - **The wait:** 5 minutes (a setting), then "no answer from the owner". When nobody is logged in or the screen is locked, the request waits, then is refused the same way.
 - **Approval windows:** 1, 8 or 24 hours, never longer (settings). A window covers every request form for its network, and requests without internet (spec, section 12.2). `wefty status` shows an open window. `wefty seat window close` closes a window early. No command opens one.
 - **The answer goes to L1 under the node agent's own identity.** No CLI command and no control-socket verb carries an approval.
@@ -348,7 +354,7 @@ How does the node agent ask the owner Approve or Deny, so that nothing an AI age
 
 ### Out-of-scope
 
-Touch ID or a password. Approval from a phone. Which Mac serves a request (Ticket 25). The window's behaviour across a sleep (Ticket 16).
+Touch ID or a password. Approval from a phone. Which Mac serves a request (Ticket 26). The window's behaviour across a sleep (Ticket 16).
 
 **Spec sections:** §2.3, §11.4.
 
@@ -364,7 +370,6 @@ What does the default Computer image hold, and how does conformance prove its Se
 
 - **The default Computer image** (owner, 2026-10-22; spec, section 7.1): a desktop, Chromium, `git`, `curl`, Python 3, Node.js, the system libraries that Playwright's browsers need, and 4 Seat users. AI agents install Playwright's own browsers into their Seat folder. It is built from `examples/computer/` and published digest-pinned for amd64 and arm64 through the existing acceptance-image CI. The throwaway prototype on branch `prototype/multi-seat-image` (`prototype/multi-seat-computer/`) shows one way to build it, and a harness that runs it under the real Computer profile.
 - **Its Seat duties** ([#1028](https://github.com/Derek-X-Wang/wefty/issues/1028)): a root supervisor that follows the Seat directive (P5) and writes ready or failed answers (P6); Seat users `seat1` to `seat4`, each with a passwd entry; per Seat, its own display and key, a 1280×800 desktop with a browser, view and control endpoints (their transport is Ticket 8's), a reader of its own `driver.json` (P8), and its folders (P9); on Seat end, every process of the Seat's user stops, double-forked ones included, its folder is deleted and its endpoints are freed; after a Computer restart, no Seats.
-- **Seat support detection** (an engineering choice, owner 2026-10-22): choose how wefty knows, before the dialog, that an image supports Seats, also for an owner's own image, and record it in `docs/contracts/computer-image.md`.
 - **Temp space sizing** (engineering, spec section 12.2): memory-backed temp space fits inside the Computer's memory limit, for example each Seat's temp folder on its disk folder, as the prototype did. Record the sizes chosen.
 - **`wefty-computer-conformance` Seat checks**, with a negative fixture for a Seat user with no passwd entry.
 - **Measurements:** what a typical install, such as a browser test kit, adds to a Seat's folder.
@@ -473,14 +478,12 @@ How does a shared Computer's memory limit grow when a Seat joins and shrink afte
 - **A helper operation** that changes a running Computer's memory limit and reads it back, like today's `memory.max` set before `Started` ([#1015](https://github.com/Derek-X-Wang/wefty/issues/1015)).
 - **Room and the runtime limit change together.** Today's reservation rejects a changed declaration (`runner/ocihelper/capacity_linux.go`), so this ticket changes the reservation with the limit.
 - **Grow before a Seat starts. Shrink only after its cleanup is confirmed.** A Seat's room returns only as far as the limit actually shrinks. If the remaining Seats use more than their share, the Computer keeps the larger limit, and the extra room stays held until a later shrink succeeds or the Computer ends (spec, section 2.6).
-- **An owner-made Computer** keeps its fixed limit and never shrinks.
 - A failed grow refuses the Seat with the reason and leaves the old limit.
 
 ### Acceptance
 
 - RM-5 (primary) on the real-time Linux lane.
 - A shrink that cannot go below the remaining Seats' use keeps the larger limit, and the room count shows the held room until a later shrink.
-- An owner-made Computer's limit does not change when its Seats come and go.
 
 ### Out-of-scope
 
@@ -551,20 +554,20 @@ How does a Seat request go from the AI agent's call to a ready Seat or a refusal
 ### Deliverable
 
 - **One ID:** the request and the Seat share `seat_<32 hex>` (spec P2; section 12.2), on Ticket 12's state machine. The request prints it at once; once approved, it names the Seat; a refused request keeps it in its record. A cut-off call waits again by that ID, on the model of the dispatch-key replay. The harness label is stored, marked not verified.
-- **CLI** (the `wefty seat` family, owner 2026-10-22): `wefty seat request --network internet|none [--dedicated | --computer NAME] [--window 1h|8h|24h] [--node NODE]` and `wefty seat wait SEAT_ID`. `wefty seat --help` lists the whole family. A request without a network is a usage error that shows the fix. Both networks work, because Ticket 11 lands first.
+- **CLI** (the `wefty seat` family, owner 2026-10-22): `wefty seat request --network internet|none [--dedicated] [--window 1h|8h|24h]` and `wefty seat wait SEAT_ID`; `--computer` comes in Ticket 25 (spec P19) and `--node` in Ticket 26. `wefty seat --help` lists the whole family. A request without a network is a usage error that shows the fix. Both networks work, because Ticket 11 lands first.
 - **The Seat credential:** L1 mints it, and the CLI stores it (spec P3). Check the storage place inside the Claude Code and Codex sandboxes. A sandbox that blocks the wefty socket is refused, as today; this ticket adds no door.
-- **The flow** (spec, sections 2.2 to 2.4): the room check and the other checks before the dialog (P12); the dialog through Ticket 5, the first approved request takes the room; the start by form, *by name* with its refusals and "and start it"; the newest default image and 8 GiB of Storage for a new on-demand Computer; a new Computer that fails to start is deleted with its Storage and nothing latches, an existing one keeps today's latch. This ticket runs on a running host VM; Ticket 14 adds the stopped-host-VM path.
-- **Typed refusals** in `docs/contracts/cli-errors-and-request-ids.md`: out of room ("out of room, try again later"), no answer from the owner, denied, network mismatch, image without Seats, dedicated cap, failed or removed Computer.
+- **The flow** (spec, sections 2.2 to 2.4): the room check and the other checks before the dialog (P12); the dialog through Ticket 5, the first approved request takes the room; the start by form, *any* or *dedicated*; the newest default image and 8 GiB of Storage for a new on-demand Computer; a new Computer that fails to start is deleted with its Storage and nothing latches, an existing one keeps today's latch. This ticket runs on a running host VM; Ticket 14 adds the stopped-host-VM path.
+- **Typed refusals** in `docs/contracts/cli-errors-and-request-ids.md`: out of room ("out of room, try again later"), no answer from the owner, denied, dedicated cap.
 - **The wefty skill:** how to request and wait, and that the network must be named.
 
 ### Acceptance
 
-- SL-1, SL-2, RM-1, RM-2 and CT-6 (primary). RM-1 runs with fakes here and live in Ticket 24.
+- SL-1, SL-2, RM-1 and RM-2 (primary). RM-1 runs with fakes here and live in Ticket 24.
 - RM-3 end to end (secondary).
 
 ### Out-of-scope
 
-The stopped host VM (Ticket 14). Release, expiry and the Seat's end (Ticket 16). The screen (Tickets 17 and 18).
+The stopped host VM (Ticket 14). Release, expiry and the Seat's end (Ticket 16). *By name* (Ticket 25). The screen (Tickets 17 and 18).
 
 **Spec sections:** §1.4, §1.5, §2.1–§2.4, §6.4, §11.5, §11.9.
 
@@ -641,7 +644,7 @@ When does a Seat end, what ends with it, and what does wefty do with an idle Com
 - **The "ends soon" event**, once, 5 minutes before the end (a setting).
 - **The end:** release, expiry, a Computer restart, or an owner command, through Ticket 12's states. Cancel its commands, stop its programs, delete its folder, and stop its credential at once for everything but reading its log ("Seat ended" with the reason). Return its room only after the helper confirms the cleanup, and only as far as the limit shrinks (Ticket 10).
 - **The owner's commands** (`stop`, `restart`, `reimage`, `reset`, `remove`) run at once, end the Seats, and list them in their output. Each Seat's log says why.
-- **The idle timer**, 10 minutes after the last Seat leaves (a setting), and the idle actions: *delete* through today's removal path to `removed_verified`, *stop*, and *nothing*. A Seat before the idle action starts cancels the timer; after it starts, the request gets another Computer or "out of room". An owner-stopped Computer is never deleted by the timer. A changed setting applies at the next check.
+- **The idle timer**, 10 minutes after the last Seat leaves (a setting), and the idle actions *delete* (through today's removal path to `removed_verified`) and *nothing*; *stop* comes with owner-made Computers in Ticket 25. A Seat before the idle action starts cancels the timer; after it starts, the request gets another Computer or "out of room". An owner-stopped Computer is never deleted by the timer. A changed setting applies at the next check.
 
 ### Acceptance
 
@@ -733,7 +736,7 @@ How does the owner watch a Seat live and take the wheel from a browser?
 
 ### Out-of-scope
 
-Grants for other people. A person proof on Take control. The viewer from another Mac (Ticket 26).
+Grants for other people. A person proof on Take control. The viewer from another Mac (Ticket 27).
 
 **Spec sections:** §4.2, §4.3.
 
@@ -788,7 +791,7 @@ How does an AI agent run a command on its Seat from its own shell?
 
 ### Out-of-scope
 
-The working copy and background programs (Ticket 22). Commands from another Mac (Ticket 26).
+The working copy and background programs (Ticket 22). Commands from another Mac (Ticket 27).
 
 **Spec sections:** §5.1, §5.3, §11.7.
 
@@ -813,7 +816,7 @@ How does a Seat keep its state between commands: one working copy, its dependenc
 
 ### Out-of-scope
 
-Copies between Macs (Ticket 26).
+Copies between Macs (Ticket 27).
 
 **Spec sections:** §5.2, §5.3, §11.7.
 
@@ -842,7 +845,7 @@ How does an AI agent copy files into and out of its Seat with one command?
 
 ### Out-of-scope
 
-Copies between Macs (Ticket 26).
+Copies between Macs (Ticket 27).
 
 **Spec sections:** §5.4, §11.7.
 
@@ -874,7 +877,34 @@ Stage B rows. New behaviour.
 
 **Blocked by:** Host VM switch with three positions, node-owned demand and a gentle idle stop; A Computer without internet; Cold start: L1 wait hint, the idle-stop race and the stopped-host-VM reply; Seat life: release, expiry, end, cleanup and idle actions; `wefty seat` screen commands for AI agents; The owner's browser viewer; Seat working copy and program lifetime; `wefty cp`: copies in and out of a Seat; Owner-attended Mac access.
 
-## Ticket 25 — Stage B: which Mac serves a Seat request
+## Ticket 25 — Stage B: by-name requests and owner-made Computers with Seats
+
+### Question
+
+How does an AI agent take a Seat on one existing Computer by name, and how do the owner's own Computers take Seats?
+
+### Deliverable
+
+- **The *by name* form** (owner, 2026-10-22; spec, section 10.4): `wefty seat request --computer NAME` (removes P19's stage A limit). The refusals, each with its reason: a network that differs from the Computer's (at once, naming the Computer's network); an image that does not support Seats; a Computer that failed or was removed. These checks run before the dialog (spec P12).
+- **Starting a stopped Computer:** the dialog says "and start it", and the owner's approval starts the Computer (ADR-0004: the approval is the owner's intent).
+- **Owner-made Computers taking Seats:** `wefty services create --computer … [--seat-limit N] [--idle-action nothing|stop|delete]` (spec P17), with Seat limit 2 and idle action *nothing* by default. Their Seats share the Computer's fixed memory limit and take no extra room; the limit never shrinks.
+- **Idle action *stop*:** an owner-made Computer with *stop* stops after its idle wait and keeps its Storage.
+- **Seat support detection** (an engineering choice, owner 2026-10-22): choose how wefty knows, before the dialog, that an owner's image supports Seats, and record it in `docs/contracts/computer-image.md`.
+- It runs on one Mac and needs no fleet ticket. Typed refusals land in `docs/contracts/cli-errors-and-request-ids.md`.
+
+### Acceptance
+
+- CT-6, BN-1, BN-2, BN-3 and BN-4 (primary).
+
+### Out-of-scope
+
+*By name* across Macs (Ticket 26). Grants for other people.
+
+**Spec sections:** §1.2, §1.4, §2.2–§2.4, §10.4, §11.15.
+
+**Blocked by:** Stage A attended acceptance on the owner's Mac.
+
+## Ticket 26 — Stage B: which Mac serves a Seat request
 
 ### Question
 
@@ -882,13 +912,13 @@ How does a Seat request from one Mac reach the Mac that serves it, while the own
 
 ### Deliverable
 
-- **A per-machine setting** (spec P13): Seat requests go to *this Mac* (the default) or to one named Mac ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)). `--node NODE` overrides it for one request. A *by name* request goes to its Computer's node pin.
+- **A per-machine setting** (spec P13): Seat requests go to *this Mac* (the default) or to one named Mac ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)). `--node NODE` overrides it for one request. A *by name* request (Ticket 25) goes to its Computer's node pin.
 - **The serving Mac checks room.** A full serving Mac refuses at once, and the refusal names it. Wefty never tries another Mac on its own.
 - **The dialog appears on the AI agent's Mac**, never on the hosting Mac. When nobody is logged in to the AI agent's Mac, or the AI agent runs on Linux, the request waits, then is refused. The answer goes to L1 under the AI agent's Mac's node identity.
 
 ### Acceptance
 
-- SB-1, SB-2 and SB-3 (primary), with two in-process nodes over the plain Fabric. The live forms run in Ticket 27.
+- SB-1, SB-2 and SB-3 (primary), with two in-process nodes over the plain Fabric. The live forms run in Ticket 28.
 
 ### Out-of-scope
 
@@ -896,9 +926,9 @@ Any Mac with room. Approval from a phone or on a node with no dialog.
 
 **Spec sections:** §10.2, §11.13.
 
-**Blocked by:** Stage A attended acceptance on the owner's Mac; Fabric identities per machine: machine participants plus the owner's sign-in, chosen per command (#899); wefty setup for the fleet: control-plane and joining roles on Mac and Linux (#900); wefty exec on another owned machine (#902).
+**Blocked by:** Stage A attended acceptance on the owner's Mac; Stage B: by-name requests and owner-made Computers with Seats; Fabric identities per machine: machine participants plus the owner's sign-in, chosen per command (#899); wefty setup for the fleet: control-plane and joining roles on Mac and Linux (#900); wefty exec on another owned machine (#902).
 
-## Ticket 26 — Stage B: an AI agent uses a Seat on another Mac
+## Ticket 27 — Stage B: an AI agent uses a Seat on another Mac
 
 ### Question
 
@@ -914,7 +944,7 @@ How does an AI agent on one Mac use its Seat on another Mac, and reach nothing e
 
 ### Acceptance
 
-- SB-4, SB-5 and SB-6 (primary), with fixtures. The live forms run in Ticket 27.
+- SB-4, SB-5 and SB-6 (primary), with fixtures. The live forms run in Ticket 28.
 
 ### Out-of-scope
 
@@ -924,7 +954,7 @@ A port relay. Any other port of the Computer.
 
 **Blocked by:** Stage A attended acceptance on the owner's Mac; Fabric identities per machine: machine participants plus the owner's sign-in, chosen per command (#899); wefty setup for the fleet: control-plane and joining roles on Mac and Linux (#900); wefty exec on another owned machine (#902).
 
-## Ticket 27 — Stage B attended acceptance on two Macs
+## Ticket 28 — Stage B attended acceptance on two Macs
 
 ### Question
 
@@ -938,7 +968,7 @@ Does stage B work on two of the owner's Macs, with the dialog on the AI agent's 
 
 ### Acceptance
 
-- SB-1 to SB-6 live (secondary evidence for Tickets 25 and 26), with a kept receipt, or `NOT-RUN` with the cause.
+- SB-1 to SB-6 live (secondary evidence for Tickets 26 and 27), with a kept receipt, or `NOT-RUN` with the cause.
 
 ### Out-of-scope
 
