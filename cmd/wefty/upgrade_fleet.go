@@ -292,15 +292,22 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 	if err != nil {
 		return report, err
 	}
+	// Preserve the Mac upgrade's existing stop budget and command order.
+	managerHost := host
+	managerHost.unloadBound = time.Duration(setupNodeAgentExitTimeout+15) * time.Second
+	manager := fleetServiceManager{host: managerHost}
 	op := fleetUpgradeOperations(host, paths, profile, plan)
 	if err := recoverUpgradeDrain(ctx, op, paths, profile, warnings); err != nil {
 		return report, err
 	}
-	plist, err := os.ReadFile(filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist"))
+	if err := manager.preflightUpgrade(ctx, paths, role); err != nil {
+		return report, err
+	}
+	plist, err := os.ReadFile(filepath.Join(paths.launchAgents, manager.file(setupNodeAgentLabel)))
 	if err != nil {
 		return report, err
 	}
-	loginPATH, err := recordedNodePATH(plist)
+	loginPATH, err := manager.recordedPATH(plist)
 	if err != nil {
 		return report, err
 	}
@@ -433,13 +440,15 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 		folders = append(folders, file.folder)
 		destinations = append(destinations, filepath.Join(file.folder, file.name))
 	}
+	previous := ""
 	for _, service := range services {
-		payload, err := launchagent.Render(service)
+		payload, err := manager.render(service, previous)
+		previous = service.Label
 		if err != nil {
 			return report, err
 		}
 		plists = append(plists, payload)
-		destinations = append(destinations, filepath.Join(paths.launchAgentsRel, service.Label+".plist"))
+		destinations = append(destinations, filepath.Join(paths.launchAgentsRel, manager.file(service.Label)))
 	}
 	if err := checkSetupDestinations(root, paths.home, folders, destinations); err != nil {
 		return report, err
@@ -482,12 +491,15 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 		}
 		before = append(before, fingerprint)
 	}
-	saved, err := saveFleetUpgradeInstall(paths, files, services, skills)
+	saved, err := saveFleetUpgradeInstall(paths, manager, files, services, skills)
 	if err != nil {
 		return report, err
 	}
 	// Recheck after a potentially long drain, directly before first activation.
 	if _, _, err := readFleetUpgradeInstall(paths, role); err != nil {
+		return report, err
+	}
+	if err := manager.preflightUpgrade(ctx, paths, role); err != nil {
 		return report, err
 	}
 	if err := checkFleetUpgradeBinaries(ctx, op, paths, role, dest, loginPATH, names); err != nil {
@@ -534,7 +546,6 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 		return report, err
 	}
 	defer folder.Close()
-	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid, UnloadBound: time.Duration(setupNodeAgentExitTimeout+15) * time.Second}
 	heartbeat := fleetUpgradeHeartbeatRequester(host, paths, op, warnings)
 	nodeAction := launchagent.Unchanged
 	started := op.now()
@@ -581,15 +592,15 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 		if service.Label == setupL1Label || service.Label == setupL3Label {
 			serviceCtx = controls
 		}
-		action, err := manager.Converge(serviceCtx, folder, filepath.Join(paths.launchAgents, service.Label+".plist"), service.Label, plists[i])
+		action, err := manager.converge(serviceCtx, folder, paths, service, plists[i])
 		if err != nil {
 			return report, err
 		}
-		written[filepath.Join(paths.launchAgentsRel, service.Label+".plist")] = payloadDigest(plists[i])
+		written[filepath.Join(paths.launchAgentsRel, manager.file(service.Label))] = payloadDigest(plists[i])
 		if service.Label == setupNodeAgentLabel {
 			nodeAction = action
 		}
-		report.Setup.Services = append(report.Setup.Services, setupServiceReport{Label: service.Label, Action: action, Plist: filepath.Join(paths.launchAgents, service.Label+".plist"), Log: service.LogPath})
+		report.Setup.Services = append(report.Setup.Services, manager.report(paths, service, action))
 		if service.Label == setupL3Label {
 			restarted := op.now()
 			elapsed, err := waitFleetUpgradeRenewal(controls, op, profile, baseline, started, restarted, heartbeat)
@@ -676,13 +687,13 @@ func finishFleetUpgradeWarnings(ctx context.Context, host setupHost, paths setup
 	return nil
 }
 
-func saveFleetUpgradeInstall(paths setupPaths, files []setupFile, services []launchagent.Agent, skills []setupFile) ([]setupFile, error) {
+func saveFleetUpgradeInstall(paths setupPaths, manager fleetServiceManager, files []setupFile, services []launchagent.Agent, skills []setupFile) ([]setupFile, error) {
 	names := []string{filepath.Join(paths.configRel, setupManifestName)}
 	for _, file := range append(slices.Clone(files), skills...) {
 		names = append(names, filepath.Join(file.folder, file.name))
 	}
 	for _, service := range services {
-		names = append(names, filepath.Join(paths.launchAgentsRel, service.Label+".plist"))
+		names = append(names, filepath.Join(paths.launchAgentsRel, manager.file(service.Label)))
 	}
 	root, err := os.OpenRoot(paths.home)
 	if err != nil {
@@ -729,7 +740,9 @@ func recoverFleetUpgrade(ctx context.Context, host setupHost, op upgradeHost, pa
 	if err := checkFleetUpgradeRollback(ctx, op, paths, role, saved, stage, loginPATH, fleetUpgradeBinaries(plan)); err != nil {
 		return refuse(err)
 	}
-	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid, UnloadBound: time.Duration(setupNodeAgentExitTimeout+15) * time.Second}
+	managerHost := host
+	managerHost.unloadBound = time.Duration(setupNodeAgentExitTimeout+15) * time.Second
+	manager := fleetServiceManager{host: managerHost}
 	// The client is CLI-backed, so stop it before a possible CLI rollback. Never
 	// touch a control service that the local role does not own.
 	var stops []error
@@ -737,7 +750,7 @@ func recoverFleetUpgrade(ctx context.Context, host setupHost, op upgradeHost, pa
 		if service.Name == "node-agent" && !nodeStage {
 			continue
 		}
-		if err := manager.Unload(ctx, "dev.wefty."+service.Name); err != nil {
+		if err := manager.unload(ctx, paths, "dev.wefty."+service.Name); err != nil {
 			stops = append(stops, err)
 		}
 	}
@@ -768,6 +781,9 @@ func recoverFleetUpgrade(ctx context.Context, host setupHost, op upgradeHost, pa
 			return fmt.Errorf("fleet rollback failed; stack stopped: %w", err)
 		}
 	}
+	if err := manager.reload(ctx, paths); err != nil {
+		return fmt.Errorf("fleet rollback failed; stack stopped: %w", err)
+	}
 	folder, err := root.OpenRoot(paths.launchAgentsRel)
 	if err != nil {
 		return err
@@ -778,11 +794,11 @@ func recoverFleetUpgrade(ctx context.Context, host setupHost, op upgradeHost, pa
 			continue
 		}
 		label := "dev.wefty." + service.Name
-		payload, err := folder.ReadFile(label + ".plist")
+		payload, err := folder.ReadFile(manager.file(label))
 		if err != nil {
 			return err
 		}
-		if _, err := manager.Converge(ctx, folder, filepath.Join(paths.launchAgents, label+".plist"), label, payload); err != nil {
+		if _, err := manager.converge(ctx, folder, paths, launchagent.Agent{Label: label}, payload); err != nil {
 			return err
 		}
 	}

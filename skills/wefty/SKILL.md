@@ -74,6 +74,9 @@ The old node boot in `draining` during replacement also keeps the busy/queued
 answer. A local interrupted upgrade instead names
 `claims disabled by an interrupted upgrade` and `wefty upgrade` as recovery.
 Report that advice to the owner; running upgrades remains an owner action.
+Upgrade supports Mac plain installations and recorded Mac/Linux fleet roles;
+Linux uses systemd user units. See [fleet upgrade](../../docs/contracts/fleet-upgrade.md)
+for the role order and attended checks.
 Other operator disables keep their existing not-ready answer.
 Without a readable receipt, an upgrade intent stays busy until its
 `drain_deadline` plus 30 minutes, including for a long configured drain. Only
@@ -447,6 +450,19 @@ Steps: a workflow brackets its work with `wefty run step --name NAME` and
 shows the run's current step — the most recently started step that has not
 ended — and `inspect` shows every step with how long it took. A step still
 running has no duration, because the time so far is not the time it took.
+
+## Opening a hosted service
+
+| Command | What it tells you |
+| --- | --- |
+| `open SERVICE [--local-port N] [--no-browser]` | Open a running published service. A fleet shortcut needs the owner's person sign-in on this laptop, listens on loopback while the foreground command runs, and stops with Ctrl-C. The default local port is the published port; a busy port exits 5; use another port or `0` for a free one. Plain installs open localhost directly with no proxy. |
+| `services status SERVICE` | Read the service state. Fleet output also gives the granted machine-name address for another owned device, whose network app must be signed in to the owner's account. Otherwise use `open` on the owner's laptop. An unavailable address does not hide the service state. |
+
+`open --json` emits one ready event with `service`, `node`, `local_url`, and
+`remote_port` before serving. It launches the default browser unless
+`--no-browser` is set (Linux without `xdg-open` prints only). A ready listener
+does not prove the next remote dial will succeed. A machine without the person
+participant exits 3; never retry through the client participant.
 
 ## Recipe: an issue to a draft PR
 

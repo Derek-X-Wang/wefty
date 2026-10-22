@@ -416,3 +416,26 @@ func TestManagerUsesAbsoluteSystemctl(t *testing.T) {
 		t.Fatalf("PATH lookup for manager tool: %s", command)
 	}
 }
+
+func TestManagerReloadBeforeRestoredUnitStarts(t *testing.T) {
+	root, path := managerFixture(t)
+	if err := root.WriteFile(filepath.Base(path), []byte("restored"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeManager{loaded: true, fragment: path}
+	m := Manager{Run: f.run, UnitDirectory: filepath.Dir(path)}
+	if err := m.Reload(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Converge(t.Context(), root, path, "dev.wefty.l1.service", []byte("restored")); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.mutations(), []string{"--user daemon-reload", "--user enable dev.wefty.l1.service", "--user start dev.wefty.l1.service"}) {
+		t.Fatal(f.calls)
+	}
+	injected := errors.New("reload refused")
+	m.Run = func(context.Context, string, ...string) ([]byte, error) { return nil, injected }
+	if err := m.Reload(t.Context()); !errors.Is(err, injected) {
+		t.Fatalf("reload error hidden: %v", err)
+	}
+}

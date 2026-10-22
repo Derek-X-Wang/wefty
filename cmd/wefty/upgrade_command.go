@@ -130,7 +130,7 @@ func executeUpgradeWithHost(ctx context.Context, host setupHost, options globalO
 		nodeMessage = "Node agent replaced; claims remain disabled; service restart requests wait for the operator to enable claims."
 	}
 	for _, service := range report.Setup.Services {
-		if service.Label == setupNodeAgentLabel && service.Action == launchagent.Unchanged {
+		if service.Label == (fleetServiceManager{host: host}).name(setupNodeAgentLabel) && service.Action == launchagent.Unchanged {
 			nodeMessage = "Node agent unchanged."
 		}
 	}
@@ -232,11 +232,8 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if host.euid == 0 {
 		return upgradeReport{}, errors.New("wefty upgrade must run as the owner, never as root")
 	}
-	if host.goos == "linux" {
-		return upgradeReport{}, errors.New("role-aware upgrade on Linux is a later slice; the current upgrade supports macOS only")
-	}
-	if host.goos != "darwin" {
-		return upgradeReport{}, fmt.Errorf("wefty upgrade supports the daily macOS install; this machine runs %s", host.goos)
+	if host.goos != "darwin" && host.goos != "linux" {
+		return upgradeReport{}, fmt.Errorf("wefty upgrade supports macOS and Linux fleet installs; this machine runs %s", host.goos)
 	}
 	if !filepath.IsAbs(host.home) {
 		return upgradeReport{}, errors.New("wefty upgrade needs an absolute home folder")
@@ -246,9 +243,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return upgradeReport{}, err
 	}
 	host.home = home
-	paths, err := resolveSetupPaths(home)
-	if err != nil {
-		return upgradeReport{}, err
+	paths, issues := resolveFleetMaintenancePaths(home, host)
+	if len(issues) > 0 {
+		return upgradeReport{}, issues[0].err
 	}
 	role, err := selectUpgradeRole(paths)
 	if err != nil {
@@ -256,6 +253,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	}
 	if role != "" {
 		return runFleetUpgrade(ctx, host, paths, role, yes, warnings, drainTimeout...)
+	}
+	if host.goos == "linux" {
+		return upgradeReport{}, errors.New("plain upgrade is Mac-only; on Linux use wefty setup --role control-plane or --role join --join-code CODE")
 	}
 	if err := refuseRecordedFleetRole(paths, "upgrade"); err != nil {
 		return upgradeReport{}, err
