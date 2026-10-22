@@ -2,6 +2,7 @@ package tsnet
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -61,8 +62,10 @@ func TestPrivateNetworkPolicy(t *testing.T) {
 	if !allows("autogroup:owner", "tag:wefty-control:80") {
 		t.Error("owner cannot reach L1 for person commands")
 	}
-	for _, port := range []string{"80", "443", "8080", "5432"} {
-		target := "tag:wefty-agent:" + port
+	// #1049: publication may use any TCP port, including the control port.
+	// Prove the complete port range, while retaining the control paths above.
+	for port := 1; port <= 65535; port++ {
+		target := "tag:wefty-agent:" + strconv.Itoa(port)
 		if !allows("autogroup:owner", target) {
 			t.Errorf("owner cannot reach %s", target)
 		}

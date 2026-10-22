@@ -1,0 +1,26 @@
+{
+  "job_id": "service-1",
+  "state": "running",
+  "spec": {
+    "schema_version": 0,
+    "dispatch_key": "",
+    "kind": "",
+    "class": "service",
+    "published_port": 18480,
+    "execution": {}
+  },
+  "created_at": "0001-01-01T00:00:00Z",
+  "updated_at": "0001-01-01T00:00:00Z",
+  "holds_slot": false,
+  "restart_streak": 0,
+  "lifetime_restart_count": 0,
+  "lease_loss_count": 0,
+  "published_port": 18480,
+  "status": "running",
+  "desired_state": "",
+  "bound_node_id": "studio-0123abcd",
+  "ready": null,
+  "managed_data_path": "\u003cmanaged-root\u003e/agent/nodes/sha256-515c233488bd62e72c197bca72b1683677b461362f9c9880b0a96c7804d0598d/services/sha256-266ff5f617ec141c3c7e4fd23a181d8d6b4ddf499d7e334ff8bfdb74c2ffc3dd/data",
+  "working_directory": null,
+  "working_directory_policy": "external; never deleted"
+}

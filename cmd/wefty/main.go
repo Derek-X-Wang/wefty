@@ -228,6 +228,9 @@ func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.W
 		}
 		var identity *fabric.ParticipantIdentityError
 		var unreachable *fabric.ParticipantUnreachableError
+		if commandArgs[0] == "open" && errors.As(err, &identity) && identity.Person {
+			return fmt.Errorf("this shortcut needs the owner's person sign-in on this laptop: %w", err)
+		}
 		if config.ExpectedIdentity != nil && commandArgs[0] == "status" && (errors.As(err, &identity) || errors.As(err, &unreachable)) {
 			return reportParticipantCheckFailure(stdout, options, config, err)
 		}
@@ -244,6 +247,30 @@ func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.W
 	if clients.participantProfile {
 		clients.clientIdentityID = config.Identity.NodeID
 		clients.localPersonSignIn = localPersonSignIn(options, time.Now())
+	}
+	if commandArgs[0] == "open" && clients.participantProfile {
+		// L1 lookups keep the client participant selected above. Only the
+		// publication stream uses the independently checked saved person.
+		personOptions := options
+		// Primary name/folder flags apply to the client. The secondary person
+		// always uses its own saved record, as in the client service.
+		personOptions.explicitFlags = nil
+		personConfig, err := commandFabricConfig(personOptions, []string{"whoami"})
+		if err != nil {
+			return fmt.Errorf("this shortcut needs the owner's person sign-in on this laptop: %w", err)
+		}
+		person, closePerson, err := openFabric(ctx, personConfig)
+		if closePerson != nil {
+			defer func() { _ = closePerson() }()
+		}
+		if err != nil {
+			var identity *fabric.ParticipantIdentityError
+			if errors.As(err, &identity) && identity.Person {
+				return fmt.Errorf("this shortcut needs the owner's person sign-in on this laptop: %w", err)
+			}
+			return err
+		}
+		clients.servicePerson = person
 	}
 	return execute(ctx, clients, options.jsonOutput, commandArgs, stdout, stderr)
 }
@@ -421,6 +448,8 @@ Commands:
   jobs list                  List readable jobs with filters and cursor paging
     [--class CLASS --kind KIND --state STATE --submitter me --limit N --cursor CURSOR]
   computers list             List Computers with --cursor, --limit, --all
+  open SERVICE [--local-port N] [--no-browser]
+                             Open a published service; fleet shortcuts stop with Ctrl-C
   services <verb>            Create and operate service-class jobs
     create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
     list [--limit COUNT --cursor CURSOR]

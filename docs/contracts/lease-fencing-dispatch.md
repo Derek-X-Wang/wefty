@@ -429,6 +429,72 @@ either bound, stops the payload as a refused post-start mutation. A one-shot's
 acknowledgement and its retries are not abandoned when the attempt is
 canceled; L1 arbitrates a pending cancel against an earlier durable start.
 
+## Opening a published service
+
+`wefty open SERVICE [--local-port N] [--no-browser]` resolves the same Job ID,
+Computer ID, current Job ID, or unique Computer friendly name as
+`wefty services status`. It requires a running service with an observed published
+port, not merely a requested port in its spec. Otherwise it returns `conflict`
+(exit 5) with a `wefty services status SERVICE` hint.
+
+For a participant-profile fleet installation, the CLI reads service and node
+facts as the client participant. Published-port streams separately select the
+owner's person participant through the client service. Missing or expired person
+sign-in is `person_identity_required` (exit 3), before any local listener.
+The listener binds only `127.0.0.1`. Each connection dials the node's registered
+connect host and published port as the person and copies bytes in both
+directions. A failed dial closes only that connection. The command runs in the
+foreground; Ctrl-C or SIGTERM closes the listener and every active connection.
+It does not change sandbox or network allowances.
+
+The fleet shortcut URL uses the literal IPv4 address `127.0.0.1`, which browsers
+treat as a secure context. A program listening on `::1` cannot take this
+connection through IPv6 resolution of `localhost`.
+
+The shortcut does not support TCP half-close: a client that calls `CloseWrite`
+gets no reply. Browsers, curl, downloads and WebSockets are not affected.
+
+Accepted risks:
+
+- Any local process, including another local user and browser DNS-rebinding
+  pages, can connect to the loopback port while the command runs.
+- The destination is the node agent's registered `connect_host`.
+
+The local port defaults to the published port. A busy port returns `conflict`
+(exit 5) and advises `--local-port N`; `--local-port 0` selects a free port.
+Every listen failure includes the port-selection hint. Other listen failures
+retain their existing exit instead of becoming conflicts.
+Human output includes the final URL, service, machine and stop instruction.
+JSON emits exactly one newline-delimited ready event before serving:
+`{"event":"ready","service":"SERVICE_ID","node":"NODE_ID","local_url":"http://127.0.0.1:PORT","remote_port":18480}`.
+Readiness means the listener is bound and the person was checked, not that a
+future remote dial will succeed.
+
+A legacy plain installation already publishes on this machine's loopback.
+`open` prints or opens `http://localhost:PORT`, says no proxy was started, and
+returns without a listener. `--local-port` controls fleet shortcuts only.
+Plain JSON uses the same ready-event fields and localhost URL, then returns.
+
+By default the command launches the default browser with `open` on macOS or
+`xdg-open` on Linux. Linux without `xdg-open` on PATH prints only.
+`--no-browser` prints only on every platform. Browser launch failure stops the
+shortcut and closes its listener.
+On Unix the opener starts in its own process group, so Ctrl-C on the shortcut
+does not stop a browser it launched.
+
+Fleet `services status SERVICE` adds `network_url` (omitted when unpublished)
+to service JSON and prints `http://NETWORK_NAME:PUBLISHED_PORT` in human output.
+The network name is L1's registered `connect_host`, supplied by the node
+backend from its saved, checked grant, including any collision suffix. It is
+never derived from the Node ID. If the node read fails or its registered name
+is absent or invalid, status still prints the normal service state and returns
+its normal exit. JSON omits `network_url`; human output adds one line saying
+the address is unavailable, with a reason. `open` still refuses those cases.
+The human note for an available address explains that another
+owned device needs its network app signed in to the owner's account; otherwise
+use `wefty open` on the owner's laptop. The address can change if the service
+moves. Plain status has no new reads or fields and retains its exact bytes.
+
 ## Service stability
 
 Every trigger applies one rule for setting `healthy_since_at`, inside its
