@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
@@ -34,6 +35,8 @@ func (f upgradeFixtureFabric) Dial(ctx context.Context, network, address string)
 func TestFleetUpgradeJoinDrainsThroughClientServiceAndRemoteL1Fake(t *testing.T) {
 	f := newFleetUpgradeFixture(t, serviceplan.Join)
 	p := f.profile(t)
+	f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "restartable", AttemptID: "old-attempt", BootSessionID: f.node.BootSessionID, Restartable: true}}
+	var interrupted atomic.Int32
 	observe := f.operations.observe
 	setClaims := f.operations.setClaims
 	var disables, restores, checks, l1Dials, l3Dials atomic.Int32
@@ -41,6 +44,22 @@ func TestFleetUpgradeJoinDrainsThroughClientServiceAndRemoteL1Fake(t *testing.T)
 		w.Header().Set("Content-Type", "application/json")
 		var payload any
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/restartable-attempts/old-attempt/interrupt"):
+			var request l1.InterruptRestartableAttemptRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			if f.node.ClaimsEnabled || request.JobID != "restartable" || request.BootSessionID != f.node.BootSessionID || request.IntentRevision != f.node.IntentRevision || request.Reason != l1.InterruptionUpgrade || request.IdempotencyKey == "" {
+				t.Errorf("wrong interruption: %+v", request)
+			}
+			interrupted.Add(1)
+			payload = l1.Job{JobID: "restartable", State: contract.JobRunning}
+		case r.URL.Path == "/v1/jobs/restartable":
+			if interrupted.Load() == 0 {
+				t.Error("read before interruption")
+			}
+			f.node.ActiveAttempts = nil
+			payload = l1.Job{JobID: "restartable", State: contract.JobQueued, Attempts: []l1.Attempt{{AttemptID: "old-attempt", State: contract.AttemptInterrupted}}}
 		case strings.HasSuffix(r.URL.Path, "/claims"):
 			var request l1.NodeIntentRequest
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
@@ -143,12 +162,16 @@ func TestFleetUpgradeJoinDrainsThroughClientServiceAndRemoteL1Fake(t *testing.T)
 	f.operations.observe = nil
 	f.operations.readNode = nil
 	f.operations.setClaims = nil
+	f.operations.readJob = nil
 	report, err := runUpgrade(t.Context(), f.host, false, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if disables.Load() != 1 || restores.Load() != 1 || checks.Load() == 0 || l1Dials.Load() == 0 || l3Dials.Load() == 0 {
 		t.Fatalf("fleet drain or renewal bypassed client: disable=%d restore=%d checks=%d L1=%d L3=%d", disables.Load(), restores.Load(), checks.Load(), l1Dials.Load(), l3Dials.Load())
+	}
+	if interrupted.Load() != 1 || report.RestartPending != 1 {
+		t.Fatalf("interruption bypassed saved client: calls=%d report=%+v", interrupted.Load(), report)
 	}
 	if len(report.VersionWarnings) == 0 || !strings.Contains(report.VersionWarnings[len(report.VersionWarnings)-1].Detail, "other-machine") {
 		t.Fatalf("missing remaining machine: %+v", report.VersionWarnings)
