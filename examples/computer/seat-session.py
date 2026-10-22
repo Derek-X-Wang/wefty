@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Keep desktop components alive without ending a Seat on a transient exit."""
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -17,9 +18,11 @@ class Session:
         self.failure, self.changed = None, False
         self.started = set()
         self.ready = False
+        self.browser_changed = False
 
     def tick(self):
         self.changed = False
+        self.browser_changed = False
         if self.failure:
             return
         if not self.display_alive():
@@ -41,6 +44,7 @@ class Session:
                 recent.append(self.clock())
             self.started.add(name)
             self.changed = True
+            self.browser_changed |= name == 'browser'
             try:
                 self.processes[name] = self.start(name)
             except OSError:
@@ -50,7 +54,7 @@ class Session:
                     self.failure = 'restart_limit'
 
     def poll_readiness(self, marker, probe):
-        if self.changed:
+        if self.browser_changed:
             self.ready = False
             marker.unlink(missing_ok=True)
         if not self.failure and not self.ready and probe():
@@ -88,27 +92,52 @@ def browser_ready():
     return False
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--display-pid', type=int, required=True)
-    args = parser.parse_args()
-    runtime = Path(os.environ['XDG_RUNTIME_DIR'])
-    commands = {
+def component_commands():
+    return {
         'desktop': ['xfce4-session'],
         'browser': ['chromium', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
                     '--no-first-run', '--no-default-browser-check', '--start-fullscreen',
+                    '--hide-crash-restore-bubble', '--profile-directory=Default',
                     '--user-data-dir=' + os.environ['HOME'] + '/.config/chromium',
                     'file:///opt/wefty-computer/seat.html?place=' + os.environ['SEAT_ID']],
         'driver': ['/usr/local/libexec/wefty-watch-driver'],
         'edges': ['/usr/local/libexec/wefty-seat-endpoints'],
     }
 
+
+def launch_component(name, command, runtime):
+    if name == 'browser':
+        # The old browser's process group has stopped before this launch.
+        # Keep cookies/preferences, but suppress crash-session UI on recovery.
+        preferences = Path(os.environ['HOME']) / '.config/chromium/Default/Preferences'
+        try:
+            value = json.loads(preferences.read_text())
+        except (FileNotFoundError, ValueError, UnicodeError):
+            value = None  # Let Chromium create/repair a missing or invalid file.
+        if isinstance(value, dict) and isinstance(value.get('profile', {}), dict):
+            profile = value.setdefault('profile', {})
+            profile.update(exit_type='Normal', exited_cleanly=True)
+            temporary = preferences.with_name('Preferences.wefty-new')
+            with temporary.open('w') as target:
+                os.fchmod(target.fileno(), 0o600)
+                json.dump(value, target, separators=(',', ':'))
+            os.replace(temporary, preferences)
+    process = subprocess.Popen(command, start_new_session=True)
+    temporary = runtime / (name + '.pid.new')
+    temporary.write_text(str(process.pid))
+    os.replace(temporary, runtime / (name + '.pid'))
+    return process
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--display-pid', type=int, required=True)
+    args = parser.parse_args()
+    runtime = Path(os.environ['XDG_RUNTIME_DIR'])
+    commands = component_commands()
+
     def start(name):
-        process = subprocess.Popen(commands[name], start_new_session=True)
-        temporary = runtime / (name + '.pid.new')
-        temporary.write_text(str(process.pid))
-        os.replace(temporary, runtime / (name + '.pid'))
-        return process
+        return launch_component(name, commands[name], runtime)
 
     session = Session(commands, start, stop_process, lambda: display_alive(args.display_pid))
     ready = runtime / 'desktop-ready'

@@ -99,6 +99,47 @@ func openSeatStatusDirectory(root string) (*os.File, error) {
 	return os.NewFile(uintptr(owned), seatStatusPath), nil
 }
 
+// This is the lane's validated-open boundary, including the mountinfo check.
+func openValidatedSeatStatusDirectory(root string, mountinfo []byte) (*os.File, error) {
+	if err := validateSeatStatusMount(mountinfo); err != nil {
+		return nil, err
+	}
+	var major, minor uint64
+	for _, line := range strings.Split(string(mountinfo), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 10 || fields[4] != seatStatusPath {
+			continue
+		}
+		a, b, ok := strings.Cut(fields[2], ":")
+		if !ok {
+			return nil, errors.New("invalid status mount device")
+		}
+		var err error
+		major, err = strconv.ParseUint(a, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		minor, err = strconv.ParseUint(b, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+	}
+	directory, err := openSeatStatusDirectory(root)
+	if err != nil {
+		return nil, err
+	}
+	var st unix.Stat_t
+	err = unix.Fstat(int(directory.Fd()), &st)
+	if err == nil && (uint64(unix.Major(uint64(st.Dev))) != major || uint64(unix.Minor(uint64(st.Dev))) != minor) {
+		err = errors.New("opened status directory does not match mountinfo device")
+	}
+	if err != nil {
+		directory.Close()
+		return nil, err
+	}
+	return directory, nil
+}
+
 func readSeatStatusAnswer(directory *os.File, name string) ([]byte, error) {
 	if name == "" || name == "." || name == ".." || strings.Contains(name, "/") {
 		return nil, errors.New("invalid answer name")
@@ -211,5 +252,35 @@ func TestSeatStatusMountMustBePrivateBoundedWritableTmpfs(t *testing.T) {
 				t.Fatal(fmt.Sprintf("unsafe status mount accepted: %s", name))
 			}
 		})
+	}
+}
+
+func TestSeatStatusDirectoryMustMatchValidatedMountDevice(t *testing.T) {
+	root := t.TempDir()
+	directory := filepath.Join(root, "wefty", "seat-status")
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		t.Fatal(err)
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(directory, &st); err != nil {
+		t.Fatal(err)
+	}
+	major, minor := unix.Major(uint64(st.Dev)), unix.Minor(uint64(st.Dev))
+	mountinfo := func(major, minor uint32) []byte {
+		return []byte(fmt.Sprintf("40 30 %d:%d / /wefty/seat-status rw,nosuid,nodev,noexec - tmpfs tmpfs rw,size=1024k,mode=700\n", major, minor))
+	}
+	f, err := openValidatedSeatStatusDirectory(root, mountinfo(major, minor))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	for _, device := range [][2]uint32{{major + 1, minor}, {major, minor + 1}} {
+		f, err = openValidatedSeatStatusDirectory(root, mountinfo(device[0], device[1]))
+		if f != nil {
+			f.Close()
+		}
+		if err == nil {
+			t.Fatal("opened directory did not belong to the validated status mount")
+		}
 	}
 }

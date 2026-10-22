@@ -385,8 +385,11 @@ IPC namespaces. Their pages count against its cgroup memory limit. At the
 16 MiB, `/run` 32 MiB, `/dev` 32 MiB and `/wefty/seat-status` 1 MiB: 465 MiB
 in total. This applies to single-desktop Computers as well as Seat images.
 The Docker approximation tests reference images at this same 1 GiB cap and
-these scaled sizes. The XFCE reference image puts `TMPDIR`, Playwright browser
-installs and temporary browser profiles on its disk home; Chromium uses
+matches the scaled `/tmp`, `/var/tmp`, `/run`, `/dev/shm` and status sizes.
+It leaves Docker's `/dev`, `/dev/pts` and `/dev/mqueue` setup intact and does
+not assert `/dev` size; the six-mount total above is real-profile evidence.
+The XFCE reference image puts `TMPDIR`, Playwright browser installs and
+temporary browser profiles on its disk home; Chromium uses
 `--disable-dev-shm-usage` to avoid putting large temp files in the 256 MiB shm.
 The 256 MiB shared-memory ceiling leaves Chromium more room than a common
 64 MiB mount while reserving at least half the cap for program memory.
@@ -611,7 +614,11 @@ exactly one private writable tmpfs, `nosuid,nodev,noexec`, bounded to at most
 1 MiB, with no shadowing mounts beneath it. It anchors reads at the live
 attempt's kernel root descriptor, then uses
 `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)` or `O_NOFOLLOW` on every path
-component. Each answer opens with `O_NONBLOCK`, must be a regular file, and
+component. Before reading answers, it compares the opened status directory's
+`fstat` `st_dev` major/minor to the validated mountinfo `major:minor`; a
+mismatch closes the descriptor and refuses the read. This binds the no-follow
+opened directory to the mount that was checked. Each answer opens with
+`O_NONBLOCK`, must be a regular file, and
 is limited to 8192 bytes (including a bounded read if it grows after `stat`).
 Links, FIFOs, devices and oversized files never count as cleanup evidence.
 The native Seat lane uses the same reader rule. Answers include:
@@ -652,9 +659,13 @@ add directive was replaced before the image observed it. It does not say that
 wanted desktops are ready. A stale applied generation never releases Room.
 Changing the config of an already wanted place in place is refused as
 `in_place_change_requires_remove`. Like other refused directives this stops
-existing Seats with `failed/directive_refused`, never a `removed` answer for
-the still-wanted config. The helper must remove the place, observe positive
-cleanup, then add its new config in a later generation.
+**all currently wanted Seats**, including unchanged places, with
+`failed/directive_refused`, never a `removed` answer for the still-wanted
+config. For helper #1137: **never send an in-place config change**. Send a
+new generation omitting the place and retaining the other unchanged entries;
+observe that generation's positive cleanup proof, then add the new config in
+a later generation. Even after refusal cleanup succeeds, a valid directive
+omitting the refused place is required before another add.
 Helper/L1 binding and Room updates remain with their wave owners.
 
 ### Desktop recovery, folders and root path safety
@@ -674,8 +685,27 @@ ends it immediately. The root supervisor then cleans the Seat and reports
 exit is `desktop_exited`. The session controller runs under the Seat uid.
 A Seat's own `killall python3` or `pkill -u` can kill that controller and ends
 the Seat; the root supervisor cleans all its remaining processes. Browser
-readiness is polled only until the first ready after each component start.
-Restart policy uses an injected clock in unit tests; the Linux lane kills a browser and the edge process and checks that the same Seat recovers.
+readiness is polled only until the first ready after a browser start. Only a
+browser restart resets that polling; edge and driver restarts after the user
+navigates elsewhere must not restart page-title polling.
+
+Before browser relaunch, the launcher marks the existing Default profile's
+exit type `Normal` and `exited_cleanly:true`, and passes
+`--hide-crash-restore-bubble`. Cookies and unrelated preferences stay intact.
+The old browser process group has stopped before these changes and relaunch.
+Restart policy uses an injected clock in unit tests; the Linux lane kills a
+browser and the edge process and checks that the same Seat recovers. Its wait
+failure names the component and retains the last probe output, including
+observed colours; each started attempt's Computer log is copied into CI evidence
+before temporary cleanup, on both success and failure.
+
+The lane's screen probe samples several rows across the band width, allowing
+small vertical shifts and narrow overlays. At least three rows must contain
+80 percent expected-colour pixels, and at least 80 percent of clear coloured
+rows must agree. View-input still observes the full two-second window and
+fails on any observed green band row, even for one frame; the control-input
+probe waits for green. Failures retain the last completed samples when a
+frame has been observed.
 
 P8 reads the Seat's own read-only
 `/wefty/control/seats/<place>/driver.json`. Its body remains exactly

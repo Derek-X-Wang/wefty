@@ -1605,6 +1605,11 @@ func TestReferenceRuntimeUsesOneGiBComputerScratchBudget(t *testing.T) {
 	if err := runner.startContainer(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	for i, argument := range arguments {
+		if argument == "--tmpfs" && i+1 < len(arguments) && strings.SplitN(arguments[i+1], ":", 2)[0] == "/dev" {
+			t.Fatal("Docker /dev override hides its devices, devpts and mqueue mounts")
+		}
+	}
 	got := strings.Join(arguments, " ")
 	for _, want := range []string{"--memory 1073741824", "--memory-swap 1073741824", "/tmp:rw,nosuid,nodev,size=134217728,mode=1777", "/var/tmp:rw,nosuid,nodev,size=16777216,mode=1777", "/run:rw,nosuid,nodev,size=33554432,mode=0755", "/dev/shm:rw,nosuid,nodev,noexec,size=268435456,mode=1777", "--shm-size 268435456", "/wefty/seat-status:rw,nosuid,nodev,noexec,size=1048576,mode=0700"} {
 		if !strings.Contains(got, want) {

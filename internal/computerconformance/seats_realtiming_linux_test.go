@@ -98,8 +98,13 @@ func TestDefaultComputerSeatsAtProductionTimings(t *testing.T) {
 		path := "/wefty/service/seats/1/run/" + component + ".pid"
 		original := h.exec("0:0", "cat", path)
 		h.exec("0:0", "kill", "-KILL", original)
-		h.wait("component restarted", func() bool { return h.exec("0:0", "cat", path) != original })
-		h.wait("screen recovered after component exit", func() bool { return h.probeCommand("frame", 7102, "ff0000").Run() == nil })
+		h.wait(component+" restarted", func() bool { return h.exec("0:0", "cat", path) != original })
+		lastProbe := "probe not completed"
+		h.wait(component+" screen recovered after component exit", func() bool {
+			out, err := h.probeCommand("frame", 7102, "ff0000").CombinedOutput()
+			lastProbe = fmt.Sprintf("error=%v output=%s", err, out)
+			return err == nil
+		}, func() string { return lastProbe })
 		h.ready(1)
 		if h.exec("2001:2001", "cat", "/wefty/service/seats/1/home/restart-marker") != "live" {
 			t.Fatal("transient component exit ended the Seat")
@@ -263,6 +268,18 @@ type seatComputer struct {
 func startSeatComputer(t *testing.T, ctx context.Context, client *containerd.Client, reference, root, service, kit string) *seatComputer {
 	t.Helper()
 	h := &seatComputer{t: t, ctx: ctx, client: client, id: "seat-" + filepath.Base(t.TempDir()), control: filepath.Join(root, "managed", "control")}
+	logPath := filepath.Join(root, "computer.log")
+	// Registered before stop: LIFO cleanup stops and flushes the Computer first,
+	// then retains logs before TempDir cleanup, including after a failed wait.
+	t.Cleanup(func() {
+		data, err := os.ReadFile(logPath)
+		if os.IsNotExist(err) {
+			return
+		}
+		seatMust(t, err)
+		evidenceDir := filepath.Dir(requiredSeatEnv(t, "WEFTY_SEAT_EVIDENCE"))
+		seatMust(t, os.WriteFile(filepath.Join(evidenceDir, runtime.GOARCH+"-"+h.id+"-computer.log"), data, 0600))
+	})
 	managed := filepath.Join(root, "managed")
 	for _, dir := range []string{h.control, filepath.Join(service, "etc")} {
 		seatMust(t, os.MkdirAll(dir, 0755))
@@ -328,7 +345,7 @@ func startSeatComputer(t *testing.T, ctx context.Context, client *containerd.Cli
 			}
 		}
 	}
-	// Keep exact profile evidence, without owner paths or process logs.
+	// Keep exact profile evidence separate from the retained Computer logs.
 	if evidenceDir := os.Getenv("WEFTY_SEAT_PROFILE_RECEIPT"); evidenceDir != "" {
 		profile, err := document.ProfileReceipt()
 		seatMust(t, err)
@@ -348,13 +365,12 @@ func startSeatComputer(t *testing.T, ctx context.Context, client *containerd.Cli
 	if !h.profileUnmodified {
 		t.Fatal("containerd changed the generated Computer profile")
 	}
-	h.task, err = h.container.NewTask(ctx, cio.LogFile(filepath.Join(root, "computer.log")))
+	h.task, err = h.container.NewTask(ctx, cio.LogFile(logPath))
 	seatMust(t, err)
 	h.pid = h.task.Pid()
 	mountinfo, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", h.pid))
 	seatMust(t, err)
-	seatMust(t, validateSeatStatusMount(mountinfo))
-	h.status, err = openSeatStatusDirectory(fmt.Sprintf("/proc/%d/root", h.pid))
+	h.status, err = openValidatedSeatStatusDirectory(fmt.Sprintf("/proc/%d/root", h.pid), mountinfo)
 	seatMust(t, err)
 	t.Cleanup(func() { seatMust(t, h.status.Close()) })
 	out, err := exec.CommandContext(ctx, "nsenter", "-t", fmt.Sprint(h.pid), "-n", "ip", "link", "set", "lo", "up").CombinedOutput()
@@ -432,8 +448,14 @@ func (h *seatComputer) exec(user string, args ...string) string {
 func (h *seatComputer) tryExec(user string, args ...string) error {
 	return h.command(user, args...).Run()
 }
-func (h *seatComputer) wait(description string, predicate func() bool) {
+func (h *seatComputer) wait(description string, predicate func() bool, details ...func() string) {
 	h.t.Helper()
+	failure := func(reason string) {
+		for _, detail := range details {
+			reason += "; last probe: " + detail()
+		}
+		h.t.Fatal(reason)
+	}
 	deadline := time.NewTimer(65 * time.Second)
 	defer deadline.Stop()
 	for {
@@ -442,9 +464,9 @@ func (h *seatComputer) wait(description string, predicate func() bool) {
 		}
 		select {
 		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
+			failure(fmt.Sprintf("%s: %v", description, h.ctx.Err()))
 		case <-deadline.C:
-			h.t.Fatal("deadline: " + description)
+			failure("deadline: " + description)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

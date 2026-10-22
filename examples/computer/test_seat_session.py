@@ -3,6 +3,9 @@ import importlib.util
 from pathlib import Path
 import unittest
 import tempfile
+import json
+import os
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('seat_session', Path(__file__).with_name('seat-session.py'))
 session = importlib.util.module_from_spec(spec)
@@ -93,7 +96,46 @@ class SessionTest(unittest.TestCase):
                 self.session.poll_readiness(marker, probe)
             self.assertEqual(probes, [1])
             self.assertTrue(marker.exists())
-            self.session.processes['edges'].code = 1
+            self.session.processes['browser'].code = 1
             self.session.tick()
             self.session.poll_readiness(marker, probe)
             self.assertEqual(probes, [1, 1])
+
+    def test_edge_or_driver_restart_after_navigation_does_not_poll_readiness(self):
+        for component in ('edges', 'driver'):
+            with self.subTest(component=component), tempfile.TemporaryDirectory() as d:
+                marker = Path(d) / 'ready'
+                current = session.Session(['browser', component], lambda _name: Process(),
+                    lambda _name, _process: None, lambda: True, clock=lambda: self.now)
+                current.tick()
+                current.poll_readiness(marker, lambda: True)
+                probes = []
+                current.processes[component].code = 1
+                for _ in range(5):
+                    current.tick()
+                    current.poll_readiness(marker, lambda: probes.append(1))
+                self.assertEqual(probes, [])
+                self.assertTrue(marker.exists())
+
+    def test_browser_relaunch_marks_profile_clean_before_spawn_and_keeps_data(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {'HOME': d, 'SEAT_ID': '1'}):
+            home = Path(d)
+            preferences = home / '.config/chromium/Default/Preferences'
+            preferences.parent.mkdir(parents=True)
+            preferences.write_text(json.dumps({'profile': {'exit_type': 'Crashed', 'exited_cleanly': False, 'name': 'keep'}, 'session': {'restore_on_startup': 1}}))
+            (preferences.parent / 'Cookies').write_text('keep cookies')
+            def spawn(command, **kwargs):
+                value = json.loads(preferences.read_text())
+                self.assertEqual(value['profile']['exit_type'], 'Normal')
+                self.assertTrue(value['profile']['exited_cleanly'])
+                self.assertEqual(value['profile']['name'], 'keep')
+                self.assertEqual(value['session']['restore_on_startup'], 1)
+                self.assertIn('--hide-crash-restore-bubble', command)
+                self.assertTrue(kwargs['start_new_session'])
+                process = Process()
+                process.pid = 42
+                return process
+            with mock.patch.object(session.subprocess, 'Popen', side_effect=spawn):
+                session.launch_component('browser', session.component_commands()['browser'], home)
+            self.assertEqual((home / 'browser.pid').read_text(), '42')
+            self.assertEqual((preferences.parent / 'Cookies').read_text(), 'keep cookies')

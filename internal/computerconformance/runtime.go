@@ -330,7 +330,8 @@ func (r *runtimeRunner) startContainer(ctx context.Context) error {
 		args = append(args, "--cap-add", "SYS_ADMIN")
 	}
 	// Match the shipped 1 GiB Computer profile, including disk-backed
-	// browser temp in the reference image. These are ceilings, not reservations.
+	// browser temp in the reference image. Leave Docker's /dev, devpts and
+	// mqueue setup intact; its /dev ceiling is outside this approximation.
 	args = append(args, "--memory", "1073741824", "--memory-swap", "1073741824")
 	shmSize := "268435456"
 	if r.config.MutationProfile == "shm-too-small" {
@@ -338,7 +339,6 @@ func (r *runtimeRunner) startContainer(ctx context.Context) error {
 	}
 	args = append(args,
 		"--shm-size", shmSize,
-		"--tmpfs", "/dev:rw,nosuid,strictatime,size=33554432,mode=0755",
 		"--tmpfs", "/tmp:rw,nosuid,nodev,size=134217728,mode=1777",
 		"--tmpfs", "/var/tmp:rw,nosuid,nodev,size=16777216,mode=1777",
 		"--tmpfs", "/run:rw,nosuid,nodev,size=33554432,mode=0755",

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded RFB screen/input probe for the real-profile Seat conformance lane."""
 import base64
+from collections import Counter
 import json
 import os
 import socket
@@ -144,15 +145,32 @@ class RFB:
             else:
                 raise IOError("server msg %d" % t)
 
-    def strip(self):
-        # mean colour of a 40x40 block at (20,90) inside the 160px top strip
-        # (the page starts below Chromium's ~57px --no-sandbox infobar)
-        r = g = b = 0
-        for y in range(90, 130, 4):
-            for x in range(20, 60, 4):
-                o = (y * self.w + x) * 4
-                b += self.fb[o]; g += self.fb[o + 1]; r += self.fb[o + 2]
-        return "%02x%02x%02x" % (r // 100, g // 100, b // 100)
+    def strip(self, expected):
+        # The 160px page band can move below Chromium's infobars. Require
+        # at least three rows with >=80% expected pixels across the width.
+        # A few correct pixels, cursor, or one noisy row cannot pass.
+        self.strip_rows = []
+        matches = 0
+        for y in range(60, 261, 20):
+            samples = []
+            for x in range(32, self.w - 32, 32):
+                offset = (y * self.w + x) * 4
+                b, g, r = self.fb[offset:offset + 3]
+                samples.append('%02x%02x%02x' % (r, g, b))
+            counts = Counter(samples)
+            colour, count = counts.most_common(1)[0]
+            rgb = bytes.fromhex(colour)
+            band_row = max(rgb) - min(rgb) >= 64 and count * 5 >= len(samples) * 4
+            self.strip_rows.append({'y': y, 'colour': colour, 'band_row': band_row,
+                                    'count': count, 'samples': len(samples)})
+            if band_row and counts[expected] * 5 >= len(samples) * 4:
+                matches += 1
+        band = [row['colour'] for row in self.strip_rows if row['band_row']]
+        if matches >= 3 and matches * 5 >= len(band) * 4:
+            return expected
+        observed = Counter(band or [row['colour'] for row in self.strip_rows]).most_common(1)[0][0]
+        # Never let a weak expected-colour plurality satisfy the probe.
+        return observed if observed != expected else None
 
     def pointer(self, x, y, mask):
         self.ws.send(struct.pack(">BBHH", 5, mask, x, y))
@@ -170,19 +188,25 @@ def main():
         client.ws.s.settimeout(max(0.01, deadline - time.monotonic()))
         client.request(0)
         client.read_update()
-        return client.strip()
+        return client.strip(expected)
     if mode in ("input", "view-input"):
         client.pointer(640, 400, 1)
         client.pointer(640, 400, 0)
         client.key(0x61, 1)
         client.key(0x61, 0)
     observe_until = time.monotonic() + 2 if mode == "view-input" else None
+    colour = None
+    def last_observation():
+        return json.dumps({'expected': expected, 'colour': colour,
+                           'rows': getattr(client, 'strip_rows', [])}, separators=(',', ':'))
     try:
         while time.monotonic() < deadline:
             colour = frame()
             if mode == "view-input":
-                if colour != expected:
-                    raise IOError("view endpoint accepted input")
+                changed = any(row['band_row'] and row['colour'] == '00ff00'
+                              for row in client.strip_rows) and expected != '00ff00'
+                if colour != expected or changed:
+                    raise IOError("view colour changed or disappeared")
                 if time.monotonic() >= observe_until:
                     break
             elif colour == expected:
@@ -190,7 +214,10 @@ def main():
             time.sleep(0.05)
         else:
             raise TimeoutError("browser colour not observed")
-        print(json.dumps({"colour": colour, "width": client.w, "height": client.h}))
+        print(json.dumps({"colour": colour, "width": client.w, "height": client.h,
+                          "rows": client.strip_rows}))
+    except (OSError, EOFError) as error:
+        raise type(error)(str(error) + "; last observation: " + last_observation()) from error
     finally:
         client.ws.s.close()
 
