@@ -40,6 +40,14 @@ avoid service and participant-role label collisions. Labels are
 at most 63 bytes; only the machine part is shortened, keeping the hash and
 `-client` or `-person` role suffix intact.
 
+Default Node IDs include four random bytes, but their readable network names
+drop that suffix, so machines with the same host-derived slug can request the
+same network name. Setup has no pre-enrolment availability lookup. When a
+granted node-agent, client or person name carries a numeric collision suffix,
+its existing publication-time notice also advises choosing a
+`--node-id` with a different machine-name part, such as `studio-desk`, for a new
+installation; changing an already staged or installed Node ID remains refused.
+
 An exact grant is accepted. The production adapter also accepts the requested
 label followed by `-` and a positive decimal integer without leading zeros
 (the coordinator's numeric collision suffix). It returns the **granted** label
@@ -56,9 +64,45 @@ refusal; restore the network name or explicitly re-record its grant before
 using the participant. Other participants are never reached by name and are
 not refused for a renamed device. A successful collision grant prints one setup
 report line naming the granted and requested labels, with advice to retire
-the stale device to free the requested name. The notice follows durable
-profile publication; exact grants and saved-participant reruns print no notice.
+the stale device to free the requested name, or choose a `--node-id` with a
+different machine-name part, such as `studio-desk`,
+for a new installation when the participant name uses the Node ID (L1 and L3
+have fixed names). Changing only the eight-hex suffix does not change that
+machine-name part. The notice follows durable profile publication; exact grants and saved-participant reruns print no notice.
 Network names are connection hints, never authenticated identity or authority.
+
+`EnrolSpec.Progress` is an optional, synchronous callback beside `LoginURL`.
+It carries only the neutral states `starting`, `waiting_for_sign_in`,
+`waiting_for_device_approval`, and `connecting`. The production adapter emits
+an initial state, each changed state, and the unchanged state at most once
+per 30 seconds while waiting. Repeated backend notifications do not restart
+that interval. A state change restarts the interval for the new state. Setup
+prints the state with the participant role. The first `starting` or `connecting`
+line is short; its 30-second repeats add fixed troubleshooting advice. Sign-in
+and approval show their action immediately, and retain it on repeats. A keyed
+participant's initial backend login state maps to `starting`, not browser
+sign-in. Only a keyless person receives sign-in progress from a login state or
+browser URL notification. Progress contains no credentials, browser URLs, backend state names or backend types;
+`LoginURL` remains the only sign-in URL callback. Callbacks must return promptly.
+
+Each new participant has a fixed 15-minute enrolment limit, including a person
+waiting for browser sign-in. Tests use Go's virtual clock and an injected limit;
+no flag changes the production limit. Expiry returns typed
+`fabric.EnrolTimeoutError` with the last neutral state and actual limit; whole
+minutes read as words ("15 minutes"), any other limit as a Go duration. Its recovery advice is separate from live-wait advice: after
+rollback, a keyed participant needs a new join key; a person signs in again.
+Approval recovery asks to approve the newly enrolled device within the limit,
+or use a pre-approved key for a keyed participant. Starting/connecting recovery
+asks to check network access and the coordinator before the new enrolment.
+Setup names the failed participant, retains the existing generic failure exit
+code 1, and uses its existing rollback and staged resume path.
+Earlier saved participants are kept, the failed participant is cleaned up, and
+a rerun asks only for unsaved participants' keys. Publication and service order
+are unchanged. Caller cancellation remains cancellation, not a time-limit
+failure. Only a context-cancellation result caused by the adapter's own limit
+becomes a timeout. Success and concrete backend errors are preserved if expiry
+arrives at the same time; cleanup errors are joined afterward. Legacy plain
+setup does not call this seam and is unchanged.
 
 The setup step `enrolSetupParticipants` takes an explicit participant list,
 home, data folder and profile destination. Each machine participant uses its

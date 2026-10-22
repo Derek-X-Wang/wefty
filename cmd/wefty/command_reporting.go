@@ -192,7 +192,7 @@ func classifyCommandReport(err error) commandReport {
 	case contract.ErrorInvalidRequest:
 		report.exitCode = exitUsage
 	case contract.ErrorUnauthorized, contract.ErrorForbidden, contract.ErrorPrincipalForbidden,
-		contract.ErrorParticipantInUse, contract.ErrorPersonIdentityRequired, contract.ErrorMachineIdentityRequired, contract.ErrorAdminRequired, contract.ErrorControlNotAuthorized:
+		contract.ErrorParticipantInUse, contract.ErrorPersonIdentityRequired, contract.ErrorPersonDeviceMismatch, contract.ErrorMachineIdentityRequired, contract.ErrorAdminRequired, contract.ErrorControlNotAuthorized:
 		report.exitCode = exitUnauthorized
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
 		report.exitCode = exitNotFound

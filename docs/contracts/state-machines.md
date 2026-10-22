@@ -28,13 +28,69 @@ Infrastructure requeues persist a jittered due time rather than becoming
 immediately claimable. The `runtime_unavailable` infrastructure classification
 is OCI-only; the same code on a process service defaults terminal.
 
-An active one-shot attempt whose lease expires transitions to `lost` while its
-job transitions to `failed` in the same transaction. A service attempt still
+An ordinary active one-shot attempt whose lease expires transitions to `lost`
+while its Job transitions to `failed` in the same transaction. Explicitly
+Restartable process one-shots use the recovery table below. A service attempt still
 becomes terminal `lost`, but a desired-running service job re-enters `queued`
 without changing its restart streak; the atomic claim path alone may create a
 fresh attempt and fence. A stopping service whose quiescence cannot be
 confirmed latches `failed`. The job does not itself use a `lost` state because
 `lost` describes what is known about one execution attempt.
+
+### Restartable process one-shot Jobs
+
+`JobSpec.restartable` defaults to false. L1 rejects true for services, OCI Jobs
+and other kinds or classes. A flagged Job durably requires
+`oneshot:restartable` in addition to `kind:process`. Agents must advertise this
+capability only after their complete interruption and input-retention support
+is available. This policy does not change ordinary one-shots or service policy.
+
+| Job state | Additional allowed next state | Condition |
+| --- | --- | --- |
+| `claimed` | `queued` | Acknowledged infrastructure interruption or Lease loss |
+| `running` | `queued` | Acknowledged infrastructure interruption or Lease loss |
+| `awaiting-input` | `queued` | Acknowledged infrastructure interruption or Lease loss |
+
+The same transaction settles the old Attempt and queues its Job. The Job never
+passes through `failed` while recovery is pending, so executable bytes, params
+and the Run token remain available. The Run and Job identity do not change.
+There is no new Job or Run state and no service binding. One-shot Slot occupancy
+ends with the old Attempt. Ordinary atomic claim alone creates the successor,
+with a fresh Attempt ID, fence, Lease and Attempt credential. Disabled Node
+admission holds queued work until the operator restores it. A Run that already
+started remains `running` while its Job recovers, under the existing L3
+projection rule.
+
+A controlled interruption requires explicit completion metadata and positive
+runtime quiescence evidence. It ends the Attempt as terminal `interrupted`,
+with `interruption_reason=upgrade` or `agent_shutdown`. Lease expiry instead
+ends the Attempt as `lost` with `interruption_reason=lease_expired`. L1 uses
+one recovery decision for both paths. Cancellation takes precedence. A natural
+payload exit retains its normal verdict, even with a standing request. Command
+failure, runtime or idle limits and preparation failure do not become
+infrastructure interruptions. Additive incomplete log evidence does not erase
+an explicitly acknowledged infrastructure interruption with proven quiescence.
+
+L1 persists `restart_count`, `next_restart_at_ns`, `restart_terminal_reason`,
+`restart_last_reason` and `restart_previous_attempt_id` on the Job. The count
+increases only when a successor is actually claimed. Ten automatic restarts
+allow at most eleven Attempts. When another interruption would exceed this
+budget, the Job becomes `failed`, with
+`restart_terminal_reason=restart_limit_reached` and human failure reason
+`restart limit reached (10 restarts)`. The ordinary L3 projection fails its Run.
+This terminal transition scrubs secrets in the same transaction.
+
+Acknowledged upgrade and shutdown interruptions have zero scheduling delay.
+Lease loss persists a jittered due time: 1 second, doubling for each successor
+restart number, capped at 60 seconds after jitter (minimum 1 second). The
+injected jitter is drawn once in the settlement transaction. Reconciliation,
+reopen and reads do not redraw it. Successful intervals do not reset the
+budget or backoff sequence. The Job response's `restart` object reports
+`count`, `limit=10`, `pending`, and nullable `last_reason`,
+`previous_attempt_id`, `current_attempt_id`, `next_restart_at` and
+`terminal_reason`, from the same Read snapshot. Absent optional facts are
+null. Attempt summaries include `interruption_reason`; Node active Attempt
+summaries include `restartable` when true.
 
 A one-shot job's secrets do not outlive its execution. The transaction that
 moves a one-shot to `succeeded` or `failed` -- completion, lease expiry, an
@@ -750,9 +806,11 @@ Fabric WhoIs projects opaque stable `UserID`, `DeviceID`, and issuing
 `FabricID` into wefty-owned types. Administrator membership is keyed by
 `(FabricID, UserID)`, so repointing an L1 deployment to a different Fabric
 issuer cannot silently reinterpret existing authority. A login or
-display-name change cannot alter authority and two devices for one person share
-membership while retaining distinct device evidence. No display value, network
-hostname, or device ID is accepted as a person-policy key.
+display-name change cannot alter authority. On a Fabric reporting
+`PersonIdentityAuthenticated`, each administrator roster row also stores exactly
+one bound opaque person-device ID from WhoIs. A current administrator may act
+only from that device. No display value or network hostname determines authority.
+The person remains the membership key; the device binding limits its use.
 
 A Fabric identity also records whether the peer is a machine principal.
 Machine principals, including identities carrying configured client or agent
@@ -762,8 +820,32 @@ data: L1 refuses person routes unless the operator explicitly enables
 `-allow-plain-person-identities`, and they must never be treated as production
 admin authority.
 
-Every person-route authentication checks the stable `(FabricID, UserID)` plus
-latest device evidence in L1; `GET /v1/whoami` is the explicit touch route.
+On authenticated-trust L1, central person-route authentication checks the current
+admin roster through a read-only snapshot before any person observation or route
+handler runs. A current administrator with a different or absent bound device
+receives `403 person_device_mismatch`, with no device IDs in the error. This
+covers all person paths, including admin reads and mutations, Computer grants,
+take-over, submission policy, handle resolution and person cancellation. A
+refused request writes no database state: it does not refresh `authenticated_people`.
+Legacy unbound administrator rows fail closed with the same error; only an
+explicit local rebind or reset recovers them. Observation never creates or
+changes a binding. If the read snapshot is unavailable, authenticated-trust
+L1 refuses every person request except `GET /v1/whoami` with `503 unavailable`,
+before the person-observation write fallback. Whoami retains that existing
+fallback and its ordinary observation behavior.
+Nonadministrator grantees remain keyed by person and can
+use their grants from any authenticated device of that person.
+
+`GET /v1/whoami` is the exception: it answers from any authenticated person
+device and performs the existing person observation. It returns identity and
+observation time only, never administrator authority; its response has no new
+fields. Plain/self-asserted trust keeps its existing development behavior:
+bootstrap creates no binding, add ignores any supplied device ID, and no device
+binding is enforced. Absent additive fields, plain request/response and CLI
+output bytes remain unchanged.
+
+Every allowed person-route authentication checks the stable `(FabricID, UserID)`
+plus latest device evidence in L1; `GET /v1/whoami` is the explicit touch route.
 Only the check uses the read snapshot; recording happens on the write door,
 and mutation audit stays transactional. The record refresh is
 dirty-then-stale: a person view writes only when the observation is new, a
@@ -792,11 +874,17 @@ authority generation, so a database copy cannot redeem a live nonce minted by
 another deployment. Restoring a pre-bootstrap database reopens bootstrap on
 that copy; this is inherent because the copy has no established administrator.
 Fabric WhoIs supplies the actor FabricID, UserID, and DeviceID at redemption;
-request data cannot supply them.
+request data cannot supply them. On authenticated trust, bootstrap binds the new
+administrator to that redeeming WhoIs device, never to request data.
 
 Every later add or remove requires a current administrator and the exact
 observed policy revision. A stale revision, nonadministrator caller, missing
 member, duplicate member, or attempted final-admin removal changes no row.
+Authenticated-trust add also requires an explicit subject `device_id`, supplied
+by that subject from their own `wefty whoami`; omission or an invalid value is
+`invalid_request`. `wefty admin policy add USER_ID --policy-revision REVISION
+--device-id DEVICE_ID` (also `admins add`) sends this
+field. It is optional and ignored on self-asserted trust.
 Membership is limited to 32 administrators. Nonadministrators may read only
 the current revision; the roster and audit stream require current admin
 authority. A local database-access-gated reset writes durable `none` for every
@@ -804,11 +892,24 @@ known grantee and administrator on every live Computer before it clears an
 unusable roster, advances the authority generation, reopens bootstrap, and
 records immutable local-operator audit with no fabricated person actor.
 
-Each accepted bootstrap/add/remove/reset advances the policy revision exactly
+Local recovery also offers `wefty-l1 -db PATH -rebind-admin USER_ID
+-admin-device-id DEVICE_ID`. Both identity values must be explicit. It is
+mutually exclusive with the other offline flags, opens no Fabric, and has no
+network route. It refuses unknown administrators (and an ambiguous user ID
+across issuing Fabrics), updates the bound device, advances the revision once,
+and appends exactly one immutable `local_operator` audit row with operation
+`rebind`, all in one transaction. It does not invent a person actor or change
+the authority generation, bootstrap state, or added-membership revision.
+
+Each accepted bootstrap/add/remove/reset/rebind advances the policy revision exactly
 once and commits the membership change plus one immutable audit row in the same
 transaction. Audit retains revision, operation, actor UserID, actor DeviceID,
-issuing Fabric IDs, subject UserID, actor kind, and L1 time; current membership
-remains bounded and person based.
+issuing Fabric IDs, subject UserID, actor kind, and L1 time. Bootstrap, add and
+rebind additionally record the bound `subject_device_id`; this field and roster
+`device_id` are additive and omitted when empty, preserving plain bytes. Actor
+device evidence retains its existing meaning. Current membership remains
+bounded and person based. A named additive migration leaves old roster bindings
+and audit subject devices empty and preserves all existing audit evidence.
 
 ### Computer grant policy and live revocation
 
@@ -840,6 +941,33 @@ snapshot can reinstall access after watch loss. An installation
 acknowledgement is accepted only from the snapshot's current authenticated boot
 and cannot regress its installed revision.
 
+On authenticated person trust, both heartbeat and watch snapshots carry
+`admin_device_required: true` and each administrator's bound `device_id`.
+L1 derives the requirement from its Fabric trust, never request data. A missing
+legacy binding remains empty. The shared admission evaluator gives a rostered
+administrator on a different or unbound device `none` for all Computer access,
+with no administrator capability and no fallback to an explicit person grant.
+The enrolled device retains control authority. Nonadministrator grants remain
+person-scoped. Self-asserted/plain snapshots omit both additive fields and keep
+their exact existing bytes and digest.
+
+The snapshot digest covers both new fields. An older agent that drops them
+while decoding computes a different digest, refuses the snapshot, invalidates
+its cache and signals live authorizations through the existing `watch_lost`
+path. It does not acknowledge the refused snapshot and cannot use it to admit
+a device. Such agents need an upgrade before authenticated Computer access
+can resume; no new compatibility marker or alternate admission path exists.
+
+The first binding-aware snapshot can strengthen an existing snapshot at the
+same durable revision. Once required, a device binding or that requirement
+cannot change at the same revision, including after watch loss: the existing
+same-revision authority guard
+refuses the snapshot and invalidates the cache. Local rebind advances the
+revision. Installing a first binding-aware snapshot or a rebind that denies a
+live session's device uses the existing downgrade/revocation mechanism:
+reevaluate that lease's saved WhoIs device, signal it under the admission lock,
+close both relay legs, and wait for its release before acknowledging install.
+
 A downgrade or revoke is `pending` until the current hosting boot has installed
 that revision and every affected authorization lease has released. A
 replacement boot cannot complete it while an older boot still has an unexpired
@@ -856,7 +984,8 @@ tenure arbitrates the wheel.
 
 The private Computer front door accepts only `GET /websockify` with exactly the
 `binary` WebSocket subprotocol. It authenticates every accepted connection with
-`Fabric.WhoIs`, acquires the authorization lease above, dials only the
+`Fabric.WhoIs`, applies the administrator device binding in its own installed
+policy snapshot, acquires the authorization lease above, dials only the
 helper-returned `view` endpoint, upgrades the client, and durably records
 `session_open` before forwarding any bytes. A control-authorized admission
 exposes only `CanTake` and a sealed capability bound to that live session.
@@ -874,6 +1003,9 @@ nonadministrator receives typed `controller_busy`. An administrator still
 begins as a viewer and overrides only through an explicit take: the old input
 leg is closed and observed before the replacement backend is dialed. The server
 never consults client headers for role, mode, backend, or control authority.
+A direct connection to the node cannot bypass the binding by skipping L1
+take-over discovery. Discovery and friendly-name resolution also use the same
+binding-aware administrator lookup as other L1 policy decisions.
 The agent owns replacement-leg handshake state: it completes RFB version,
 security, and ClientInit negotiation with the fresh control backend before the
 leg swap becomes visible. The client keeps its existing handshake state and
@@ -1140,7 +1272,8 @@ names the five modes and their endpoint check order:
 - Original-evidence provenance (O): identity → path → original fence, without
   requiring current binding, registration, phase or lease.
 - Accepted-completion replay (R): provenance, no standing removal, identical
-  stored key and body, Attempt not lost, and current or retained replay binding.
+  stored key and body, Attempt not lost, and current or retained replay binding
+  (or terminal `interrupted` for accepted Restartable one-shot recovery).
   Removal precedes provenance; phase and expiry handling precede key/body,
   lost refusal and binding. Replay applies no completion/accounting effects;
   exact-Attempt Computer revocation is re-driven.
@@ -1163,9 +1296,10 @@ lease/deadline settlement retains its existing lease and accounting rules.
 
 | State | Meaning | Allowed next states |
 | --- | --- | --- |
-| `claimed` | Created by the atomic claim with its own ID, fence, and lease. | `running`, `failed`, `lost` |
-| `running` | The node acknowledged execution. | `awaiting-input`, `succeeded`, `failed`, `lost` |
-| `awaiting-input` | Reserved live attempt awaiting a future prompt verb. | `running`, `failed`, `lost` |
+| `claimed` | Created by the atomic claim with its own ID, fence, and lease. | `running`, `failed`, `lost`, `interrupted` |
+| `running` | The node acknowledged execution. | `awaiting-input`, `succeeded`, `failed`, `lost`, `interrupted` |
+| `awaiting-input` | Reserved live attempt awaiting a future prompt verb. | `running`, `failed`, `lost`, `interrupted` |
+| `interrupted` | A Restartable process one-shot acknowledged an infrastructure stop with positive runtime quiescence evidence. Terminal. | none |
 | `succeeded` | A matching, in-lease completion was accepted. Terminal. | none |
 | `failed` | A matching, in-lease failure was accepted. Terminal. | none |
 | `lost` | The control plane's clock observed lease expiry, or L1 revoked the attempt's authority: an image-reconciliation latch, a Computer reconfiguration abort, or removal of its service or Computer. Terminal; a desired-running service may requeue its containing job, never this attempt. | none |
@@ -1177,7 +1311,8 @@ Logs instead use the original attempt's evidence provenance: lost attempts may
 append late evidence within the documented window, and recorded events remain
 replayable under the log-continuity rules. Late evidence never changes current
 service health or authority. An exact accepted completion remains acknowledgeable
-while its attempt is current or retained as the completion replay binding,
+while its Attempt is current, retained as the completion replay binding, or
+terminal `interrupted` after accepted controlled recovery,
 including after node re-registration or queued Computer stop detaches it. These
 exceptions retain history and acknowledge prior writes; they do not grant live
 authority. See `lease-fencing-dispatch.md` for their windows and replay rules.

@@ -99,10 +99,10 @@ Owners, Admins and Network admins implicitly own all tags; `tagOwners` alone
 does not limit tagging to admins. Restrict all of these privileged roles to
 trusted administrators.
 
-Any device signed in to the Owner account can act as the fleet admin until L1
-pins the person device. Do not sign the control-plane Mac's network app, or any
-machine where AI agents run as you, into the Owner account. Device pinning is a
-separate change and is not implemented here.
+Keep the Owner person identity on the owner's laptop. Do not sign the
+control-plane machine's network app, or any machine where AI agents run as you,
+into the Owner account. L1 binds each administrator to one enrolled person
+device; nonadministrator grants remain person based.
 
 The snippet allows only TCP port 80 for control traffic. It stores no keys or
 admin credentials and changes no network settings.

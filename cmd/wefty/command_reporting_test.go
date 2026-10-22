@@ -88,7 +88,7 @@ func TestCommandReportingCharacterization(t *testing.T) {
 	}{
 		{contract.ErrorInvalidRequest, 2},
 		{contract.ErrorUnauthorized, 3}, {contract.ErrorForbidden, 3}, {contract.ErrorPrincipalForbidden, 3},
-		{contract.ErrorPersonIdentityRequired, 3}, {"machine_identity_required", 3}, {contract.ErrorAdminRequired, 3}, {contract.ErrorControlNotAuthorized, 3},
+		{contract.ErrorPersonIdentityRequired, 3}, {"person_device_mismatch", 3}, {"machine_identity_required", 3}, {contract.ErrorAdminRequired, 3}, {contract.ErrorControlNotAuthorized, 3},
 		{contract.ErrorNotFound, 4}, {contract.ErrorAttemptNotFound, 4}, {contract.ErrorTakeoverSessionEnded, 4},
 		{contract.ErrorCancelService, 5}, {contract.ErrorCancelNotQueued, 5}, {contract.ErrorConflict, 5},
 		{contract.ErrorStalePolicyRevision, 5}, {contract.ErrorStaleIntentRevision, 5}, {contract.ErrorStorageReferenceConflict, 5},

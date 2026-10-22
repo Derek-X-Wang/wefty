@@ -50,12 +50,16 @@ func executeAdminPolicy(ctx context.Context, clients *apiClients, jsonOutput boo
 		return writeAdminPolicy(stdout, policy, jsonOutput)
 	}
 	if len(args) == 0 || (args[0] != "add" && args[0] != "remove") {
-		return usageError("usage: wefty admin policy get | wefty admin policy add|remove USER_ID --policy-revision REVISION")
+		return usageError("usage: wefty admin policy get | wefty admin policy add USER_ID --policy-revision REVISION [--device-id DEVICE_ID] | wefty admin policy remove USER_ID --policy-revision REVISION")
 	}
 	mutationArgs := moveFirstPositionalToEnd(args[1:])
 	flags := flag.NewFlagSet("admin policy "+args[0], flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	var revision int64
+	var deviceID string
+	if args[0] == "add" {
+		flags.StringVar(&deviceID, "device-id", "", "subject person device ID from their wefty whoami (required on authenticated Fabric)")
+	}
 	flags.Int64Var(&revision, "policy-revision", 0, "policy revision observed by admin policy get")
 	if err := parseCommandFlags(flags, mutationArgs, false); err != nil {
 		return flagUsageError(err)
@@ -63,9 +67,9 @@ func executeAdminPolicy(ctx context.Context, clients *apiClients, jsonOutput boo
 	seenRevision := false
 	flags.Visit(func(visited *flag.Flag) { seenRevision = seenRevision || visited.Name == "policy-revision" })
 	if flags.NArg() != 1 || strings.TrimSpace(flags.Arg(0)) == "" || !seenRevision || revision < 1 {
-		return usageError("usage: wefty admin policy add|remove USER_ID --policy-revision REVISION")
+		return usageError("usage: wefty admin policy add USER_ID --policy-revision REVISION [--device-id DEVICE_ID] | wefty admin policy remove USER_ID --policy-revision REVISION")
 	}
-	policy, err := clients.mutateAdmin(ctx, flags.Arg(0), revision, args[0] == "remove")
+	policy, err := clients.mutateAdmin(ctx, flags.Arg(0), revision, args[0] == "remove", deviceID)
 	if err != nil {
 		return err
 	}

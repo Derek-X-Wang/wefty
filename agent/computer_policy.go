@@ -298,7 +298,9 @@ func (cache *ComputerPolicyCache) Install(snapshot l1.ComputerPolicySnapshot) (C
 		cache.invalidateLocked(ComputerPolicyRevisionRegressed)
 		return ComputerPolicyInstallReceipt{}, errors.New("agent: Computer policy revision regressed")
 	}
-	if cache.valid && snapshot.PolicyGeneration == cache.snapshot.PolicyGeneration && snapshot.PolicyRevision == cache.snapshot.PolicyRevision {
+	// A watch loss cannot forget an installed device restriction: an older
+	// same-revision heartbeat must not reopen account-wide administrator access.
+	if (cache.valid || cache.snapshot.AdminDeviceRequired) && snapshot.PolicyGeneration == cache.snapshot.PolicyGeneration && snapshot.PolicyRevision == cache.snapshot.PolicyRevision {
 		if err := validateSameRevisionPolicy(cache.snapshot, snapshot); err != nil {
 			cache.invalidateLocked(ComputerPolicyRevisionRegressed)
 			return ComputerPolicyInstallReceipt{}, err
@@ -338,15 +340,21 @@ func (cache *ComputerPolicyCache) Install(snapshot l1.ComputerPolicySnapshot) (C
 }
 
 func validateSameRevisionPolicy(current, next l1.ComputerPolicySnapshot) error {
-	currentAdmins := make(map[string]struct{}, len(current.Admins))
+	// Enabling device binding on the first post-upgrade snapshot only removes
+	// authority, so it can share the durable roster revision. Once enabled,
+	// bindings and the requirement cannot change silently at that revision.
+	if current.AdminDeviceRequired && !next.AdminDeviceRequired {
+		return errors.New("agent: Computer admin device requirement changed without a revision")
+	}
+	currentAdmins := make(map[string]string, len(current.Admins))
 	for _, admin := range current.Admins {
-		currentAdmins[admin.FabricID+"\x00"+admin.UserID] = struct{}{}
+		currentAdmins[admin.FabricID+"\x00"+admin.UserID] = admin.DeviceID
 	}
 	if len(currentAdmins) != len(next.Admins) {
 		return errors.New("agent: Computer policy changed administrators without a revision")
 	}
 	for _, admin := range next.Admins {
-		if _, ok := currentAdmins[admin.FabricID+"\x00"+admin.UserID]; !ok {
+		if deviceID, ok := currentAdmins[admin.FabricID+"\x00"+admin.UserID]; !ok || current.AdminDeviceRequired && deviceID != admin.DeviceID {
 			return errors.New("agent: Computer policy changed administrators without a revision")
 		}
 	}

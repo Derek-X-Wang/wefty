@@ -526,7 +526,15 @@
                     },
                     "attempt_state": {
                       "type": "string",
-                      "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost"]
+                      "enum": [
+                        "claimed",
+                        "running",
+                        "awaiting-input",
+                        "succeeded",
+                        "failed",
+                        "lost",
+                        "interrupted"
+                      ]
                     }
                   }
                 }
@@ -634,6 +642,16 @@
                     "type": "string",
                     "enum": ["agent", "guardian"],
                     "description": "The agent's report that it, or its guardian, asked the payload to end and the payload answered with the exit code in result: shutdown, an attempt directive, lost authority, or the agent's own supervision. Set only when the stop was confirmed delivered to a payload that was still running; when the payload's own exit raced the stop, it is omitted and the exit counts as the payload's own. Valid only with an exit_code result; a signal result names its initiator in termination_cause, and a spontaneous exit omits this. Service policy treats such a completion as an infrastructure interruption, never as a payload failure or a policy stop. Always and on-failure requeue without consuming the restart streak. Never leaves a durably started attempt failed without automatic requeue or restart accounting and exposes the completion as last_failure, unless explicit restart targets that attempt. Without the durable start marker, existing per-kind infrastructure retry applies. Explicit start or restart may resume a failed never service; terminal latches retain precedence. L1 stores the initiator with the attempt, so a failed never service's restart_suppressed_reason names agent or guardian interruption exactly; an exit without it is the payload's own, as a spontaneous signal is."
+                  },
+                  "interruption_reason": {
+                    "enum": [
+                      "upgrade",
+                      "agent_shutdown"
+                    ]
+                  },
+                  "interruption_request_key": {
+                    "type": "string",
+                    "minLength": 1
                   }
                 }
               }

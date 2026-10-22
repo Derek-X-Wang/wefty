@@ -82,6 +82,11 @@
       "description": "Optional maximum consecutive restartable terminations; omission means unlimited.",
       "type": "integer",
       "minimum": 1
+    },
+    "restartable": {
+      "type": "boolean",
+      "default": false,
+      "description": "Permission for L1 to restart after infrastructure interruption. Valid only for process one-shots; requires oneshot:restartable. Does not retry command failures or cancellation."
     }
   },
   "allOf": [
@@ -219,7 +224,8 @@
         },
         "not": { "anyOf": [{ "required": ["published_port"] }, { "required": ["instance_key"] }] }
       }
-    }
+    },
+    {"if": {"properties": {"restartable": {"const": true}}, "required": ["restartable"]}, "then": {"properties": {"kind": {"pattern": "^\\s*[Pp][Rr][Oo][Cc][Ee][Ss][Ss]\\s*$"}, "class": {"const": "one-shot"}}}}
   ],
   "$defs": {
     "executable": {

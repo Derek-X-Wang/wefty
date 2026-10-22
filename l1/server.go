@@ -443,6 +443,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("GET /v1/nodes/{node_id}", s.getNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/drain", s.operatorDrainNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/claims", s.setNodeClaims)
+	client.HandleFunc("POST /v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt", s.interruptRestartableAttempt)
 
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST /v1/agent/nodes/register", s.registerNode)
@@ -976,6 +977,11 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			writeError(w, err)
 			return
 		}
+		// Both person decisions and agent policy issuance derive the requirement
+		// from this server's authenticated Fabric, never from request data.
+		if machineIdentitiesAuthenticated(s.fabric) {
+			r = r.WithContext(context.WithValue(r.Context(), personDeviceBindingContextKey{}, true))
+		}
 		if principal == personPrincipal || principal == cancelPrincipal && !slices.Contains(NormalizeTags(identity.Tags), s.clientPrincipalTag) {
 			if !s.allowPersonIdentities {
 				writeError(w, protocolError(contract.ErrorPrincipalForbidden,
@@ -992,6 +998,14 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			if err := validatePersonIdentity(identity); err != nil {
 				writeError(w, err)
 				return
+			}
+			if personDeviceBindingRequired(r.Context()) {
+				if !(r.Method == http.MethodGet && r.URL.Path == "/v1/whoami") {
+					if err := s.store.checkPersonDevice(r.Context(), identity); err != nil {
+						writeError(w, err)
+						return
+					}
+				}
 			}
 			if _, err := s.store.ObserveAuthenticatedPerson(r.Context(), identity); err != nil {
 				writeError(w, err)
@@ -1069,7 +1083,7 @@ func (s *Server) addAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	policy, err := s.store.AddAdmin(r.Context(), identityFromRequest(r),
-		r.PathValue("user_id"), request.PolicyRevision)
+		r.PathValue("user_id"), request.PolicyRevision, request.DeviceID)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -3027,7 +3041,7 @@ func writeError(w http.ResponseWriter, err error) {
 	case contract.ErrorUnauthorized, contract.ErrorPersonIdentityRequired:
 		status = http.StatusUnauthorized
 	case contract.ErrorForbidden, contract.ErrorPrincipalForbidden, contract.ErrorIdentityBound, contract.ErrorAttemptNotOwned,
-		contract.ErrorAdminRequired, contract.ErrorAdminBootstrapInvalid, contract.ErrorRunIdentityNotEntitled:
+		contract.ErrorAdminRequired, contract.ErrorPersonDeviceMismatch, contract.ErrorAdminBootstrapInvalid, contract.ErrorRunIdentityNotEntitled:
 		status = http.StatusForbidden
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound:
 		status = http.StatusNotFound

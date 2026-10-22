@@ -1,5 +1,11 @@
 [
   {
+    "site": "admin_device_migration.go:*Store.migrateAdminPersonDevice | s.db",
+    "count": 2,
+    "reason": "Infrastructure: inspect and migrate the administrator device schema before serving requests.",
+    "slice": "permanent"
+  },
+  {
     "site": "backups.go:*Store.ListNodeComputerBackupDirectives | s.db",
     "count": 2,
     "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",

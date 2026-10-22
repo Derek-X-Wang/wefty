@@ -952,6 +952,7 @@ VALUES(1, 0, 1, 1, 0);
 CREATE TABLE IF NOT EXISTS admins (
   fabric_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
+  device_id TEXT NOT NULL DEFAULT '',
   added_revision INTEGER NOT NULL CHECK(added_revision > 0),
   added_ns INTEGER NOT NULL,
   PRIMARY KEY(fabric_id, user_id)
@@ -967,8 +968,9 @@ CREATE TRIGGER IF NOT EXISTS admins_bounded_before_insert
 BEFORE INSERT ON admins WHEN (SELECT COUNT(*) FROM admins) >= 32
 BEGIN SELECT RAISE(ABORT, 'admin policy limit reached'); END;
 CREATE TABLE IF NOT EXISTS admin_policy_audit (
+  subject_device_id TEXT NOT NULL DEFAULT '',
   revision INTEGER PRIMARY KEY CHECK(revision > 0),
-  operation TEXT NOT NULL CHECK(operation IN ('bootstrap', 'add', 'remove', 'reset')),
+  operation TEXT NOT NULL CHECK(operation IN ('bootstrap', 'add', 'remove', 'reset', 'rebind')),
   actor_kind TEXT NOT NULL CHECK(actor_kind IN ('fabric_person', 'local_operator')),
   actor_fabric_id TEXT NOT NULL,
   actor_user_id TEXT NOT NULL,
@@ -1247,6 +1249,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
+	if err := s.migrateAdminPersonDevice(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "nodes", "last_condition_json", "BLOB"); err != nil {
 		return err
 	}
@@ -1286,6 +1291,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 		if err := s.ensureColumn(ctx, "service_tombstones", column, "TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err
 		}
+	}
+	if err := s.initializeOneshotRestart(ctx); err != nil {
+		return err
 	}
 	if err := s.ensureColumn(ctx, "jobs", "completion_replay_attempt_id", "TEXT"); err != nil {
 		return err
@@ -2648,7 +2656,7 @@ func (s *Store) ListJobAttempts(ctx context.Context, jobID string) (attempts []A
 
 func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, error) {
 	rows, err := q.QueryContext(ctx, `SELECT attempt_id, node_id, state, lease_expires_ns,
-		result_json, late_result_json, image_observation_json, created_ns, updated_ns
+		result_json, late_result_json, image_observation_json, created_ns, updated_ns, COALESCE(interruption_reason, '')
 		FROM attempts WHERE job_id=? ORDER BY created_ns, attempt_id`, jobID)
 	if err != nil {
 		return nil, internalError(err, "list job attempts")
@@ -2660,7 +2668,7 @@ func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, e
 		var resultJSON, lateResultJSON, imageJSON []byte
 		var leaseExpiresNS, createdNS, updatedNS int64
 		if err := rows.Scan(&attempt.AttemptID, &attempt.NodeID, &attempt.State, &leaseExpiresNS,
-			&resultJSON, &lateResultJSON, &imageJSON, &createdNS, &updatedNS); err != nil {
+			&resultJSON, &lateResultJSON, &imageJSON, &createdNS, &updatedNS, &attempt.InterruptionReason); err != nil {
 			return nil, internalError(err, "scan job attempt")
 		}
 		attempt.LeaseExpiresAt = time.Unix(0, leaseExpiresNS).UTC()
@@ -3187,7 +3195,9 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	claimQuery := `
 UPDATE jobs
 SET state=@job_claimed, current_attempt_id=@attempt_id, completion_replay_attempt_id=NULL,
-    fence_counter=fence_counter+1, updated_ns=@now_ns
+    fence_counter=fence_counter+1, updated_ns=@now_ns,
+    restart_count=restart_count+CASE WHEN next_restart_at_ns IS NOT NULL THEN 1 ELSE 0 END,
+    next_restart_at_ns=NULL
 WHERE job_id=(
   SELECT j.job_id
 	  FROM jobs j
@@ -3216,6 +3226,7 @@ WHERE job_id=(
 	      (
 	        @class='one-shot'
 	        AND candidate_service.job_id IS NULL
+	        AND (j.next_restart_at_ns IS NULL OR j.next_restart_at_ns<=@now_ns)
 	        AND (j.prestart_next_retry_at_ns IS NULL OR j.prestart_next_retry_at_ns<=@now_ns)
 	        AND (j.prestart_budget_deadline_ns IS NULL OR j.prestart_budget_deadline_ns>@now_ns)
 	        AND (
@@ -3348,6 +3359,15 @@ AND state=@job_queued
 	}
 	fencingToken := strconv.FormatInt(fence, 10)
 	attemptCreatedNS := now.UnixNano()
+	if spec.Restartable {
+		var latest sql.NullInt64
+		if err := tx.QueryRowContext(ctx, "SELECT MAX(created_ns) FROM attempts WHERE job_id=?", jobID).Scan(&latest); err != nil {
+			return nil, internalError(err, "read predecessor Attempt timestamp")
+		}
+		if latest.Valid && latest.Int64 >= attemptCreatedNS {
+			attemptCreatedNS = latest.Int64 + 1
+		}
+	}
 	var latestRestartNS sql.NullInt64
 	if err := tx.QueryRowContext(ctx, "SELECT MAX(created_ns) FROM service_restart_requests WHERE job_id=?", jobID).Scan(&latestRestartNS); err != nil {
 		return nil, internalError(err, "read latest service restart request")
@@ -3428,6 +3448,13 @@ AND state=@job_queued
 	if err := pruneAttemptCredentials(ctx, tx); err != nil {
 		return nil, err
 	}
+	var restartJob Job
+	if spec.Restartable {
+		restartJob = Job{JobID: jobID, State: contract.JobClaimed, Spec: spec, CurrentAttemptID: attemptID}
+		if err := populateOneshotRestart(ctx, tx, &restartJob); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, internalError(err, "commit job claim")
 	}
@@ -3446,6 +3473,7 @@ AND state=@job_queued
 		AttemptToken:    attemptToken,
 		ComputerStorage: computerStorage,
 	}
+	claim.Job.RestartRecovery = restartJob.RestartRecovery
 	if prestartDeadlineNS.Valid {
 		deadline := time.Unix(0, prestartDeadlineNS.Int64).UTC()
 		claim.PrestartDeadline = &deadline
@@ -3529,6 +3557,13 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	if err != nil {
 		return AttemptLease{}, err
 	}
+	var interruptionReason InterruptionReason
+	var interruptionKey string
+	if directive == AttemptDirectiveRestart && attempt.spec.Restartable {
+		if err := tx.QueryRowContext(ctx, "SELECT interruption_request_reason, interruption_request_key FROM attempts WHERE attempt_id=?", attemptID).Scan(&interruptionReason, &interruptionKey); err != nil {
+			return AttemptLease{}, internalError(err, "read one-shot restart directive identity")
+		}
+	}
 	expires := canonicalTime(now.Add(s.leaseDuration))
 	if canceled {
 		if settleBy.Before(expires) {
@@ -3557,6 +3592,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	return AttemptLease{
 		AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: expires,
 		LeaseTTL: expires.Sub(now), Directive: directive,
+		InterruptionReason: interruptionReason, InterruptionRequestKey: interruptionKey,
 	}, nil
 }
 
@@ -3984,6 +4020,13 @@ func readAttemptDirective(ctx context.Context, tx *sql.Tx, jobID, attemptID stri
 	}
 	if canceled {
 		return AttemptDirectiveCancel, nil
+	}
+	var interruptionKey sql.NullString
+	if err := tx.QueryRowContext(ctx, "SELECT interruption_request_key FROM attempts WHERE attempt_id=? AND job_id=?", attemptID, jobID).Scan(&interruptionKey); err != nil {
+		return "", internalError(err, "read one-shot interruption directive")
+	}
+	if interruptionKey.Valid {
+		return AttemptDirectiveRestart, nil
 	}
 	var desiredState string
 	var restartRequested bool
@@ -4566,6 +4609,20 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if canceled {
 		finalJobState = contract.JobFailed
 	}
+	var interruptionReason InterruptionReason
+	if !canceled {
+		interruptionReason, err = classifyOneshotInterruption(ctx, tx, attempt, request)
+		if err != nil {
+			return CompletionOutcome{}, err
+		}
+	}
+	if !canceled && interruptionReason != "" {
+		finalAttemptState = contract.AttemptInterrupted
+		finalJobState, err = recoverOneshot(ctx, tx, attempt, interruptionReason, now, s.restartJitter)
+		if err != nil {
+			return CompletionOutcome{}, err
+		}
+	}
 	var servicePolicy *serviceCompletionPolicy
 	if jobBeforeCompletion.ServiceJob != nil {
 		directive, err := readAttemptDirective(ctx, tx, jobID, attemptID)
@@ -4613,12 +4670,13 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	}
 	// The initiator is kept with the result: it is the only durable fact that
 	// tells a payload's own exit from one it gave because it was asked to end.
-	_, err = tx.ExecContext(ctx, `UPDATE attempts SET state=?, completion_key=?, completion_hash=?, result_json=?, termination_initiator=?, updated_ns=? WHERE attempt_id=?`,
-		finalAttemptState, request.IdempotencyKey, completionHash, resultJSON, string(request.TerminationInitiator), now.UnixNano(), attemptID)
+	_, err = tx.ExecContext(ctx, `UPDATE attempts SET state=?, completion_key=?, completion_hash=?, result_json=?, termination_initiator=?, interruption_reason=?, updated_ns=? WHERE attempt_id=?`,
+		finalAttemptState, request.IdempotencyKey, completionHash, resultJSON, string(request.TerminationInitiator), string(interruptionReason), now.UnixNano(), attemptID)
 	if err != nil {
 		return CompletionOutcome{}, internalError(err, "complete attempt")
 	}
-	if (prestartRequeue && finalJobState == contract.JobQueued) ||
+	if (finalAttemptState == contract.AttemptInterrupted && finalJobState == contract.JobQueued) ||
+		(prestartRequeue && finalJobState == contract.JobQueued) ||
 		(jobBeforeCompletion.ComputerID != "" && servicePolicy != nil && finalJobState == contract.JobStopped &&
 			validRuntimeQuiescenceEvidence(request.RuntimeQuiescenceEvidence)) {
 		// Accepted pre-start requeue and positive Computer quiescence bind the
@@ -4888,9 +4946,23 @@ func expireAttempt(ctx context.Context, tx *sql.Tx, attempt attemptAuthority, no
 				nextState = contract.JobQueued
 			}
 		}
+		if !canceled && attempt.spec.Restartable && !desiredState.Valid {
+			nextState, err = recoverOneshot(ctx, tx, attempt, InterruptionLeaseExpired, now, jitter)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, "UPDATE attempts SET interruption_reason=? WHERE attempt_id=?", InterruptionLeaseExpired, attempt.attemptID); err != nil {
+				return internalError(err, "record lost one-shot interruption")
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=?
 			WHERE job_id=? AND current_attempt_id=?`, nextState, now.UnixNano(), attempt.jobID, attempt.attemptID); err != nil {
 			return internalError(err, "transition job after lease expiry")
+		}
+		if attempt.spec.Restartable && nextState == contract.JobQueued {
+			if err := detachAttempt(ctx, tx, attempt.jobID, "", detachOneshotRecovery); err != nil {
+				return internalError(err, "detach lost restartable attempt")
+			}
 		}
 		if desiredState.Valid {
 			// Lease loss proves that execution authority ended, not that the
@@ -5065,6 +5137,9 @@ WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql
 	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns, spawnColumns); err != nil {
 		return Job{}, "", err
 	}
+	if err := populateOneshotRestart(ctx, q, &job); err != nil {
+		return Job{}, "", err
+	}
 	if failureReason.Valid {
 		job.FailureReason = failureReason.String
 	}
@@ -5124,6 +5199,9 @@ WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_
 		return Job{}, err
 	}
 	if err := populateJob(&job, specJSON, currentAttempt, createdNS, updatedNS, serviceColumns, spawnColumns); err != nil {
+		return Job{}, err
+	}
+	if err := populateOneshotRestart(ctx, q, &job); err != nil {
 		return Job{}, err
 	}
 	if failureReason.Valid {
@@ -5238,7 +5316,7 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	}
 	node.ActiveAttempts = make([]NodeActiveAttempt, 0)
 	attempts, err := q.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.boot_session_id, json_extract(CAST(j.spec_json AS TEXT),'$.kind'),
-		json_extract(CAST(j.spec_json AS TEXT),'$.class'), a.state, a.lease_expires_ns
+		json_extract(CAST(j.spec_json AS TEXT),'$.class'), a.state, a.lease_expires_ns, COALESCE(json_extract(CAST(j.spec_json AS TEXT),'$.restartable'), 0)
 		FROM attempts a JOIN jobs j ON j.job_id=a.job_id
 		WHERE a.node_id=? AND a.state IN (?, ?, ?) ORDER BY a.created_ns, a.attempt_id`, nodeID,
 		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput)
@@ -5249,7 +5327,7 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	for attempts.Next() {
 		var attempt NodeActiveAttempt
 		var leaseNS int64
-		if err := attempts.Scan(&attempt.JobID, &attempt.AttemptID, &attempt.BootSessionID, &attempt.Kind, &attempt.Class, &attempt.State, &leaseNS); err != nil {
+		if err := attempts.Scan(&attempt.JobID, &attempt.AttemptID, &attempt.BootSessionID, &attempt.Kind, &attempt.Class, &attempt.State, &leaseNS, &attempt.Restartable); err != nil {
 			return Node{}, err
 		}
 		attempt.LeaseExpiresAt = time.Unix(0, leaseNS).UTC()

@@ -49,6 +49,9 @@ func ValidateJobSpec(spec *JobSpec) error {
 	if strings.IndexFunc(spec.Kind, unicode.IsSpace) >= 0 || strings.IndexFunc(spec.RuntimeHandler, unicode.IsSpace) >= 0 {
 		return invalidJobSpecf("kind and runtime_handler cannot contain whitespace")
 	}
+	if spec.Restartable && (spec.Kind != JobKindProcess || spec.Class != JobClassOneShot) {
+		return invalidJobSpecf("restartable requires a process one-shot job")
+	}
 	if err := validateEnvironment(spec.Execution.Env); err != nil {
 		return invalidJobSpecf("execution env: %v", err)
 	}

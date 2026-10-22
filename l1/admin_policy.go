@@ -24,6 +24,7 @@ const (
 	AdminPolicyAdd       AdminPolicyOperation = "add"
 	AdminPolicyRemove    AdminPolicyOperation = "remove"
 	AdminPolicyReset     AdminPolicyOperation = "reset"
+	AdminPolicyRebind    AdminPolicyOperation = "rebind"
 	MaxAdministrators                         = 32
 )
 
@@ -35,7 +36,7 @@ const (
 )
 
 // AdminPolicy is the bounded current person-based administrator policy.
-// Device evidence is deliberately retained only in immutable audit rows.
+// Authenticated Fabric administrators are bound to one person device.
 type AdminPolicy struct {
 	Revision    int64                      `json:"revision"`
 	Admins      []Admin                    `json:"admins,omitempty"`
@@ -43,6 +44,7 @@ type AdminPolicy struct {
 }
 
 type Admin struct {
+	DeviceID      string    `json:"device_id,omitempty"`
 	FabricID      string    `json:"fabric_id"`
 	UserID        string    `json:"user_id"`
 	AddedRevision int64     `json:"added_revision"`
@@ -58,6 +60,7 @@ type AdminPolicyAudit struct {
 	ActorDeviceID   string               `json:"actor_device_id"`
 	SubjectFabricID string               `json:"subject_fabric_id"`
 	SubjectUserID   string               `json:"subject_user_id"`
+	SubjectDeviceID string               `json:"subject_device_id,omitempty"`
 	CreatedAt       time.Time            `json:"created_at"`
 }
 
@@ -87,7 +90,17 @@ type BootstrapAdminRequest struct {
 }
 
 type AdminPolicyMutationRequest struct {
-	PolicyRevision int64 `json:"policy_revision"`
+	DeviceID       string `json:"device_id,omitempty"`
+	PolicyRevision int64  `json:"policy_revision"`
+}
+
+// personDeviceBindingContextKey is set only by authenticated Fabric person
+// authentication, never by request data or the self-asserted development override.
+type personDeviceBindingContextKey struct{}
+
+func personDeviceBindingRequired(ctx context.Context) bool {
+	required, _ := ctx.Value(personDeviceBindingContextKey{}).(bool)
+	return required
 }
 
 func validatePersonIdentity(identity fabric.Identity) error {
@@ -176,6 +189,13 @@ func validateAdminUserID(userID string) (string, error) {
 			"admin user_id must contain between 1 and 255 bytes")
 	}
 	return userID, nil
+}
+
+func validateAdminDeviceID(deviceID string) (string, error) {
+	if deviceID == "" || deviceID != strings.TrimSpace(deviceID) || len(deviceID) > 255 {
+		return "", protocolError(contract.ErrorInvalidRequest, "admin device_id must contain between 1 and 255 bytes; use the subject person's wefty whoami")
+	}
+	return deviceID, nil
 }
 
 func bootstrapNonceHash(nonce, deploymentID string, authorityGeneration int64) string {
@@ -288,12 +308,16 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 		return AdminPolicy{}, protocolError(contract.ErrorAdminBootstrapClosed,
 			"admin bootstrap is closed for the current authority generation")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO admins(fabric_id, user_id, added_revision, added_ns)
-		VALUES(?, ?, ?, ?)`, identity.FabricID, identity.UserID, nextRevision, now.UnixNano()); err != nil {
+	deviceID := ""
+	if personDeviceBindingRequired(ctx) {
+		deviceID = identity.DeviceID
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO admins(fabric_id, user_id, device_id, added_revision, added_ns)
+		VALUES(?, ?, ?, ?, ?)`, identity.FabricID, identity.UserID, deviceID, nextRevision, now.UnixNano()); err != nil {
 		return AdminPolicy{}, internalError(err, "store first admin")
 	}
 	if err := insertAdminPolicyAudit(ctx, tx, nextRevision, AdminPolicyBootstrap, identity,
-		identity.UserID, now); err != nil {
+		identity.UserID, now, deviceID); err != nil {
 		return AdminPolicy{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM admin_bootstrap_challenges WHERE singleton=1`); err != nil {
@@ -354,7 +378,7 @@ func readAdminPolicy(ctx context.Context, q queryer) (AdminPolicy, error) {
 	if err := q.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&policy.Revision); err != nil {
 		return AdminPolicy{}, err
 	}
-	rows, err := q.QueryContext(ctx, `SELECT fabric_id, user_id, added_revision, added_ns
+	rows, err := q.QueryContext(ctx, `SELECT fabric_id, user_id, device_id, added_revision, added_ns
 		FROM admins ORDER BY fabric_id, user_id`)
 	if err != nil {
 		return AdminPolicy{}, err
@@ -364,7 +388,7 @@ func readAdminPolicy(ctx context.Context, q queryer) (AdminPolicy, error) {
 	for rows.Next() {
 		var admin Admin
 		var addedNS int64
-		if err := rows.Scan(&admin.FabricID, &admin.UserID, &admin.AddedRevision, &addedNS); err != nil {
+		if err := rows.Scan(&admin.FabricID, &admin.UserID, &admin.DeviceID, &admin.AddedRevision, &addedNS); err != nil {
 			return AdminPolicy{}, err
 		}
 		admin.AddedAt = time.Unix(0, addedNS).UTC()
@@ -373,18 +397,58 @@ func readAdminPolicy(ctx context.Context, q queryer) (AdminPolicy, error) {
 	return policy, rows.Err()
 }
 
-func requireCurrentAdmin(ctx context.Context, q queryer, identity fabric.Identity) error {
+// currentAdminPerson distinguishes a nonadministrator from a rostered person
+// whose device is refused. Callers must never turn that refusal into a grant.
+func currentAdminPerson(ctx context.Context, q queryer, identity fabric.Identity) (bool, error) {
 	if err := validatePersonIdentity(identity); err != nil {
+		return false, err
+	}
+	var deviceID string
+	err := q.QueryRowContext(ctx, `SELECT device_id FROM admins WHERE fabric_id=? AND user_id=?`, identity.FabricID, identity.UserID).Scan(&deviceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, internalError(err, "read current admin")
+	}
+	if personDeviceBindingRequired(ctx) {
+		if err := requireBoundPersonDevice(identity, deviceID); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func requireCurrentAdmin(ctx context.Context, q queryer, identity fabric.Identity) error {
+	current, err := currentAdminPerson(ctx, q, identity)
+	if err != nil {
 		return err
 	}
-	var current bool
-	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
-		identity.FabricID, identity.UserID).Scan(&current); err != nil {
-		return internalError(err, "read current admin")
-	}
 	if !current {
-		return protocolError(contract.ErrorAdminRequired,
-			"person %q is not a current administrator", identity.UserID)
+		return protocolError(contract.ErrorAdminRequired, "person %q is not a current administrator", identity.UserID)
+	}
+	return nil
+}
+
+// checkPersonDevice refuses current administrators on any device other than
+// their explicit binding. Nonadministrators retain person-scoped grants.
+func (s *Store) checkPersonDevice(ctx context.Context, identity fabric.Identity) error {
+	policy, err := s.GetAdminPolicy(ctx)
+	if err != nil {
+		return err
+	}
+	for _, admin := range policy.Admins {
+		if admin.FabricID == identity.FabricID && admin.UserID == identity.UserID {
+			return requireBoundPersonDevice(identity, admin.DeviceID)
+		}
+	}
+	return nil
+}
+
+func requireBoundPersonDevice(identity fabric.Identity, deviceID string) error {
+	if deviceID == "" || identity.DeviceID != deviceID {
+		return protocolError(contract.ErrorPersonDeviceMismatch,
+			"this person is an administrator bound to another device; use the enrolled person device, or rebind it locally on the control plane")
 	}
 	return nil
 }
@@ -406,12 +470,24 @@ func (s *Store) AddAdmin(
 	identity fabric.Identity,
 	userID string,
 	observedRevision int64,
+	deviceID string,
 ) (AdminPolicy, error) {
 	userID, err := validateAdminUserID(userID)
 	if err != nil {
 		return AdminPolicy{}, err
 	}
-	return s.mutateAdmin(ctx, identity, userID, observedRevision, AdminPolicyAdd)
+	if personDeviceBindingRequired(ctx) {
+		if deviceID == "" {
+			return AdminPolicy{}, protocolError(contract.ErrorInvalidRequest, "admin add requires device_id from the subject person's wefty whoami")
+		}
+		deviceID, err = validateAdminDeviceID(deviceID)
+		if err != nil {
+			return AdminPolicy{}, err
+		}
+	} else {
+		deviceID = ""
+	}
+	return s.mutateAdmin(ctx, identity, userID, observedRevision, AdminPolicyAdd, deviceID)
 }
 
 func (s *Store) RemoveAdmin(
@@ -424,7 +500,7 @@ func (s *Store) RemoveAdmin(
 	if err != nil {
 		return AdminPolicy{}, err
 	}
-	return s.mutateAdmin(ctx, identity, userID, observedRevision, AdminPolicyRemove)
+	return s.mutateAdmin(ctx, identity, userID, observedRevision, AdminPolicyRemove, "")
 }
 
 func (s *Store) mutateAdmin(
@@ -433,6 +509,7 @@ func (s *Store) mutateAdmin(
 	userID string,
 	observedRevision int64,
 	operation AdminPolicyOperation,
+	deviceID string,
 ) (AdminPolicy, error) {
 	now := canonicalTime(s.clock.Now())
 	write, err := s.beginWriteTransaction(ctx, nil, now)
@@ -472,8 +549,8 @@ func (s *Store) mutateAdmin(
 			return AdminPolicy{}, protocolError(contract.ErrorCapacityExhausted,
 				"admin policy is limited to %d members", MaxAdministrators)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO admins(fabric_id, user_id, added_revision, added_ns)
-			VALUES(?, ?, ?, ?)`, identity.FabricID, userID, nextRevision, now.UnixNano()); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO admins(fabric_id, user_id, device_id, added_revision, added_ns)
+			VALUES(?, ?, ?, ?, ?)`, identity.FabricID, userID, deviceID, nextRevision, now.UnixNano()); err != nil {
 			return AdminPolicy{}, internalError(err, "add administrator")
 		}
 	case AdminPolicyRemove:
@@ -515,7 +592,7 @@ func (s *Store) mutateAdmin(
 		return AdminPolicy{}, protocolError(contract.ErrorStalePolicyRevision,
 			"admin policy revision changed from %d", observedRevision)
 	}
-	if err := insertAdminPolicyAudit(ctx, tx, nextRevision, operation, identity, userID, now); err != nil {
+	if err := insertAdminPolicyAudit(ctx, tx, nextRevision, operation, identity, userID, now, deviceID); err != nil {
 		return AdminPolicy{}, err
 	}
 	policy, err := readAdminPolicy(ctx, tx)
@@ -600,13 +677,14 @@ func insertAdminPolicyAudit(
 	identity fabric.Identity,
 	subjectUserID string,
 	now time.Time,
+	subjectDeviceID string,
 ) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO admin_policy_audit(
 		revision, operation, actor_kind, actor_fabric_id, actor_user_id, actor_device_id,
-		subject_fabric_id, subject_user_id, created_ns
-	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`, revision, operation, AdminPolicyActorFabricPerson,
+		subject_fabric_id, subject_user_id, created_ns, subject_device_id
+	) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, revision, operation, AdminPolicyActorFabricPerson,
 		identity.FabricID, identity.UserID, identity.DeviceID, identity.FabricID,
-		subjectUserID, now.UnixNano()); err != nil {
+		subjectUserID, now.UnixNano(), subjectDeviceID); err != nil {
 		return internalError(err, "append admin policy audit")
 	}
 	return nil

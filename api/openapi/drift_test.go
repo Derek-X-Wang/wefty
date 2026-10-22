@@ -142,6 +142,8 @@ var driftRows = []driftRow{
 	{component(commonDoc, "Attempt"), typeOf[l1.Attempt]()},
 	{component(commonDoc, "LateResultEvidence"), typeOf[l1.LateResultEvidence]()},
 	{component(commonDoc, "AttemptLease"), typeOf[l1.AttemptLease]()},
+	{component(commonDoc, "OneshotRestartFacts"), typeOf[l1.OneshotRestartFacts]()},
+	{requestBody(clientDoc, "post", "/v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt"), typeOf[l1.InterruptRestartableAttemptRequest]()},
 	{component(commonDoc, "LogGap"), typeOf[contract.LogGap]()},
 	{component(commonDoc, "LogEvent"), typeOf[contract.LogEvent]()},
 	{component(commonDoc, "LogTruncation"), typeOf[l1.LogTruncation]()},
@@ -338,6 +340,10 @@ type driftEnumException struct {
 
 // driftEnumExceptions is keyed by "<go type>@<schema location>".
 var driftEnumExceptions = map[string]driftEnumException{
+	"l1.InterruptionReason@" + component(commonDoc, "AttemptLease") + "/properties/interruption_reason":                                                    {subset: []string{"upgrade"}, reason: "renewal delivers only durable client upgrade requests; shutdown is agent evidence and Lease expiry is L1 evidence"},
+	"l1.InterruptionReason@" + requestBody(clientDoc, "post", "/v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt") + "/properties/reason":    {subset: []string{"upgrade"}, reason: "client requests authorize upgrade interruption only"},
+	"l1.InterruptionReason@" + requestBody(agentDoc, "post", "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete") + "/properties/interruption_reason": {subset: []string{"upgrade", "agent_shutdown"}, reason: "Lease expiry is L1 evidence and cannot be asserted by completion"},
+
 	"contract.ServiceDesiredState@" + component(commonDoc, "Job") + "/properties/removal/properties/desired_state": {
 		subset: []string{"removed"}, reason: "a removal projection is always desired_state removed",
 	},

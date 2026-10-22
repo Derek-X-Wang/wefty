@@ -224,7 +224,10 @@
             }
           },
           "created_at": { "type": "string", "format": "date-time" },
-          "updated_at": { "type": "string", "format": "date-time" }
+          "updated_at": { "type": "string", "format": "date-time" },
+          "restart": {
+            "$ref": "#/components/schemas/OneshotRestartFacts"
+          }
         }
       },
       "AdminPolicy": {
@@ -245,7 +248,8 @@
                 "fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "user_id": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "added_revision": { "type": "integer", "minimum": 1 },
-                "added_at": { "type": "string", "format": "date-time" }
+                "added_at": { "type": "string", "format": "date-time" },
+                "device_id": { "type": "string", "minLength": 1, "maxLength": 255, "description": "Bound person device on authenticated person trust. Absent on self-asserted trust and for a legacy unbound administrator, which fails closed until a local rebind." }
               }
             }
           },
@@ -255,7 +259,7 @@
             "items": { "$ref": "#/components/schemas/ComputerPolicyRevocation" }
           }
         },
-        "description": "Current bounded person-based administrator policy. Membership is scoped to the issuing Fabric; device identity is audit evidence, never membership."
+        "description": "Current bounded person-based administrator policy. Membership is scoped to the issuing Fabric. On authenticated person trust each administrator is bound to one person device and other devices of that person are refused; on self-asserted trust device identity is audit evidence only."
       },
       "AdminPolicyAudit": {
         "type": "object",
@@ -263,13 +267,14 @@
         "required": ["revision", "operation", "actor_kind", "actor_fabric_id", "actor_user_id", "actor_device_id", "subject_fabric_id", "subject_user_id", "created_at"],
         "properties": {
           "revision": { "type": "integer", "minimum": 1 },
-          "operation": { "enum": ["bootstrap", "add", "remove", "reset"] },
+          "operation": { "enum": ["bootstrap", "add", "remove", "reset", "rebind"] },
           "actor_kind": { "enum": ["fabric_person", "local_operator"] },
           "actor_fabric_id": { "type": "string" },
           "actor_user_id": { "type": "string" },
           "actor_device_id": { "type": "string" },
           "subject_fabric_id": { "type": "string" },
           "subject_user_id": { "type": "string" },
+          "subject_device_id": { "type": "string", "description": "Person device bound by this bootstrap, add, or rebind on authenticated person trust; absent otherwise." },
           "created_at": { "type": "string", "format": "date-time" }
         }
       },
@@ -394,10 +399,12 @@
               "required": ["fabric_id", "user_id"],
               "properties": {
                 "fabric_id": { "type": "string", "minLength": 1 },
-                "user_id": { "type": "string", "minLength": 1 }
+                "user_id": { "type": "string", "minLength": 1 },
+                "device_id": { "type": "string", "minLength": 1, "description": "Bound person device; present only when admin_device_required is true and the administrator is bound." }
               }
             }
           },
+          "admin_device_required": { "type": "boolean", "description": "Set only on authenticated person trust. When true, an administrator's request from any device other than its bound device_id, or an administrator without one, receives no Computer authority. Absent on self-asserted trust." },
           "computers": {
             "type": "array",
             "items": {
@@ -1085,13 +1092,28 @@
         "properties": {
           "attempt_id": { "type": "string" },
           "node_id": { "type": "string" },
-          "state": { "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost"] },
+          "state": { "enum": [
+            "claimed",
+            "running",
+            "awaiting-input",
+            "succeeded",
+            "failed",
+            "lost",
+            "interrupted"
+          ] },
           "lease_expires_at": { "type": "string", "format": "date-time" },
           "result": { "$ref": "#/components/schemas/ProcessResult" },
           "late_result": { "$ref": "#/components/schemas/LateResultEvidence" },
           "image": { "$ref": "#/components/schemas/OCIImageEvidence" },
           "created_at": { "type": "string", "format": "date-time" },
-          "updated_at": { "type": "string", "format": "date-time" }
+          "updated_at": { "type": "string", "format": "date-time" },
+          "interruption_reason": {
+            "enum": [
+              "upgrade",
+              "agent_shutdown",
+              "lease_expired"
+            ]
+          }
         }
       },
       "LateResultEvidence": {
@@ -1140,6 +1162,15 @@
           "directive": {
             "enum": ["stop", "restart", "cancel"],
             "description": "Attempt-scoped intent: stop/restart for services, cancel for process and OCI one-shots. Cancel uses TERM, a five-second grace, then KILL. Omission means no lifecycle change is requested."
+          },
+          "interruption_reason": {
+            "enum": [
+              "upgrade"
+            ]
+          },
+          "interruption_request_key": {
+            "type": "string",
+            "minLength": 1
           }
         }
       },
@@ -1743,12 +1774,17 @@
               "awaiting-input",
               "succeeded",
               "failed",
-              "lost"
+              "lost",
+              "interrupted"
             ]
           },
           "lease_expires_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "restartable": {
+            "type": "boolean",
+            "default": false
           }
         },
         "description": "Nonterminal persisted attempt on this Node, including prior boots until reconciled. Read routes preserve attempts whose leases have expired until background reconciliation records their expiry. Reports execution state and lease, never a credential, fence or proof that a payload is physically running."
@@ -1946,6 +1982,91 @@
       },
       "GateResult": {
         "$ref": "../../contract/schemas/v1/gate-result.schema.json"
+      },
+      "OneshotRestartFacts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "count",
+          "limit",
+          "pending",
+          "last_reason",
+          "previous_attempt_id",
+          "current_attempt_id",
+          "next_restart_at",
+          "terminal_reason"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10
+          },
+          "limit": {
+            "type": "integer",
+            "const": 10
+          },
+          "pending": {
+            "type": "boolean"
+          },
+          "last_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "upgrade",
+                  "agent_shutdown",
+                  "lease_expired"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "previous_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "current_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_restart_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "terminal_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "restart_limit_reached"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
       }
     },
     "headers": {

@@ -205,6 +205,9 @@ func advertisedRuntimePlatform(capabilitiesJSON []byte) (string, string, bool) {
 // set.
 func RequiredCapabilities(spec contract.JobSpec) []string {
 	required := []string{capabilityKindPrefix + spec.Kind}
+	if spec.Restartable {
+		required = append(required, CapabilityOneshotRestartable)
+	}
 	if spec.RuntimeHandler != "" {
 		required = append(required, capabilityRuntimeHandlerPrefix+spec.RuntimeHandler)
 	}

@@ -116,6 +116,8 @@ func run() error {
 		readyFile                = flag.String("ready-file", "", "write listener metadata after the server is ready")
 		initiateAdminBootstrap   = flag.Bool("initiate-admin-bootstrap", false, "create a short-lived local admin bootstrap challenge and exit")
 		resetAdminPolicy         = flag.Bool("reset-admin-policy", false, "locally clear the admin roster, reopen bootstrap, audit the reset, and exit")
+		rebindAdmin              = flag.String("rebind-admin", "", "locally rebind this administrator user ID; requires -admin-device-id; audit and exit")
+		adminDeviceID            = flag.String("admin-device-id", "", "explicit person device ID for -rebind-admin, from the subject person's wefty whoami")
 		allowPlainPersonIDs      = flag.Bool("allow-plain-person-identities", false, "DEVELOPMENT ONLY: allow self-asserted plain Fabric identities on person routes")
 		automaticNodeAdmission   = flag.Bool("automatic-node-admission", false, "admit new authenticated agent Nodes with their reserved Pinned tag and default slots")
 		runLedgerAddress         = flag.String("run-ledger", l1.DefaultRunLedgerAddress, "L3 run-ledger Fabric address; pass --run-ledger= for an installation that has no run ledger")
@@ -126,6 +128,16 @@ func run() error {
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies, service: true}, "node-max-service-slots", "authoritative service capacity as node-id=slots (repeatable)")
 	flag.Parse()
+	explicit := connprofile.ExplicitFlags(flag.CommandLine)
+	rebindRequested := explicit["rebind-admin"] || explicit["admin-device-id"]
+	if rebindRequested {
+		if !explicit["rebind-admin"] || !explicit["admin-device-id"] || strings.TrimSpace(*rebindAdmin) == "" || strings.TrimSpace(*adminDeviceID) == "" {
+			return errors.New("-rebind-admin USER_ID requires an explicit -admin-device-id DEVICE_ID")
+		}
+		if *statePreflight || *initiateAdminBootstrap || *resetAdminPolicy || *printVersion {
+			return errors.New("-rebind-admin is mutually exclusive with the other offline flags")
+		}
+	}
 	if *printVersion {
 		fmt.Println(version)
 		return nil
@@ -167,12 +179,19 @@ func run() error {
 	if *initiateAdminBootstrap && *resetAdminPolicy {
 		return errors.New("-initiate-admin-bootstrap and -reset-admin-policy are mutually exclusive")
 	}
-	if *initiateAdminBootstrap || *resetAdminPolicy {
+	if *initiateAdminBootstrap || *resetAdminPolicy || rebindRequested {
 		store, err := l1.OpenStore(*databasePath, storeOptions)
 		if err != nil {
 			return err
 		}
 		defer store.Close()
+		if rebindRequested {
+			policy, err := store.RebindAdminDevice(context.Background(), *rebindAdmin, *adminDeviceID)
+			if err != nil {
+				return err
+			}
+			return json.NewEncoder(os.Stdout).Encode(policy)
+		}
 		if *resetAdminPolicy {
 			policy, err := store.ResetAdminPolicy(context.Background())
 			if err != nil {
