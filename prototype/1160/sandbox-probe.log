@@ -1,0 +1,6 @@
+=== RUN   TestIdentityHandoff
+    identity_handoff_test.go:459: tsnet.Up: tsnet: operation not permitted
+--- FAIL: TestIdentityHandoff (0.00s)
+FAIL
+FAIL	github.com/Derek-X-Wang/wefty/prototype/1160	0.257s
+FAIL
