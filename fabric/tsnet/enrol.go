@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/internal/naming"
@@ -20,10 +21,17 @@ type enrolNode interface {
 	Close() error
 }
 
+type enrolWatcher interface {
+	Next() (ipn.Notify, error)
+	Close() error
+}
+
 // Enroller implements the setup-only enrolment seam. The constructor seam
 // allows secretless tests to drive the real local API translation path.
 type Enroller struct {
-	newNode func(Config) (enrolNode, error)
+	newNode   func(Config) (enrolNode, error)
+	watch     func(context.Context, *local.Client) (enrolWatcher, error)
+	timeLimit time.Duration
 }
 
 func (e Enroller) node(config Config) (enrolNode, error) {
@@ -63,6 +71,7 @@ func (e Enroller) Enrol(ctx context.Context, spec fabric.EnrolSpec) (self fabric
 			result = errors.New(strings.ReplaceAll(result.Error(), spec.Credential.Value, "[redacted]"))
 		}
 	}()
+	lastProgress := fabric.EnrolStarting
 	name, logical, err := naming.Parse(spec.Name)
 	if err != nil {
 		return self, err
@@ -73,28 +82,105 @@ func (e Enroller) Enrol(ctx context.Context, spec fabric.EnrolSpec) (self fabric
 	if spec.Credential.Value == "" && spec.LoginURL == nil {
 		return self, errors.New("enrolment requires a join credential or person login callback")
 	}
+	limit := e.timeLimit
+	if limit <= 0 {
+		limit = fabric.EnrolTimeLimit
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	limitReached := errors.New("enrolment time limit")
+	deadline := time.AfterFunc(limit, func() { cancel(limitReached) })
+	defer deadline.Stop()
+	var closeErr error
+	defer func() {
+		// net/http reports a cancelled request with the context cause, not
+		// context.Canceled, so a limit hit inside a local API call is a timeout too.
+		if errors.Is(context.Cause(ctx), limitReached) && (errors.Is(result, context.Canceled) || errors.Is(result, limitReached)) {
+			result = &fabric.EnrolTimeoutError{State: lastProgress, Limit: limit, NeedsJoinKey: spec.Credential.Value != ""}
+		}
+		result = errors.Join(result, closeErr)
+	}()
+	if spec.Progress != nil {
+		spec.Progress(lastProgress)
+	}
 	node, err := e.node(Config{Name: spec.Name, NetworkName: name.ReadableHostname(), StateDir: spec.StateDirectory, Credential: spec.Credential, CoordinatorURL: spec.CoordinatorURL, Logf: func(string, ...any) {}})
 	if err != nil {
 		return self, err
 	}
+	defer func() { closeErr = node.Close() }()
 	client, err := node.LocalClient() // starts the embedded node
-	if err != nil {
-		return self, errors.Join(err, node.Close())
-	}
-	defer func() { result = errors.Join(result, node.Close()) }()
-	watcher, err := client.WatchIPNBus(ctx, ipn.NotifyInitialState)
 	if err != nil {
 		return self, err
 	}
-	defer watcher.Close()
+	watch := e.watch
+	if watch == nil {
+		watch = func(ctx context.Context, client *local.Client) (enrolWatcher, error) {
+			return client.WatchIPNBus(ctx, ipn.NotifyInitialState)
+		}
+	}
+	watcher, err := watch(ctx, client)
+	if err != nil {
+		return self, err
+	}
+	// Next blocks while the backend is silent. Keep one reader and join it
+	// before returning, including cancellation and deadline paths.
+	type event struct {
+		notice ipn.Notify
+		err    error
+	}
+	events := make(chan event)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			notice, err := watcher.Next()
+			select {
+			case events <- event{notice, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	defer func() { cancel(nil); _ = watcher.Close(); <-stopped }()
+	repeat := time.NewTimer(30 * time.Second)
+	defer repeat.Stop()
+	report := func(progress fabric.EnrolProgress) {
+		if progress != lastProgress {
+			lastProgress = progress
+			if spec.Progress != nil {
+				spec.Progress(progress)
+			}
+			repeat.Reset(30 * time.Second)
+		}
+	}
 	lastURL := ""
 	for {
-		notice, err := watcher.Next()
-		if err != nil {
-			return self, err
+		var notice ipn.Notify
+		select {
+		case <-ctx.Done():
+			return self, ctx.Err()
+		case <-repeat.C:
+			if spec.Progress != nil {
+				spec.Progress(lastProgress)
+			}
+			repeat.Reset(30 * time.Second)
+			continue
+		case received := <-events:
+			if received.err != nil {
+				return self, received.err
+			}
+			notice = received.notice
 		}
 		if notice.ErrMessage != nil {
 			return self, errors.New("Fabric enrolment: " + *notice.ErrMessage)
+		}
+		if spec.Credential.Value == "" && notice.BrowseToURL != nil && *notice.BrowseToURL != "" {
+			report(fabric.EnrolWaitingForSignIn)
+		} else if notice.State != nil {
+			report(enrolProgress(*notice.State, spec.Credential.Value != ""))
 		}
 		if notice.BrowseToURL != nil && *notice.BrowseToURL != "" && *notice.BrowseToURL != lastURL && spec.LoginURL != nil {
 			lastURL = *notice.BrowseToURL
@@ -211,4 +297,20 @@ func acceptedNetworkGrant(requested, granted string) bool {
 		}
 	}
 	return true
+}
+
+func enrolProgress(state ipn.State, hasCredential bool) fabric.EnrolProgress {
+	switch state {
+	case ipn.NeedsLogin:
+		if hasCredential {
+			return fabric.EnrolStarting
+		}
+		return fabric.EnrolWaitingForSignIn
+	case ipn.NeedsMachineAuth:
+		return fabric.EnrolWaitingForDeviceApproval
+	case ipn.Starting, ipn.Running:
+		return fabric.EnrolConnecting
+	default:
+		return fabric.EnrolStarting
+	}
 }

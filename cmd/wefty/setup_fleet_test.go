@@ -321,7 +321,7 @@ func TestSetupControlPlaneCoordinatorAndCollisionReport(t *testing.T) {
 	if err := writeSetupReport(&output, report); err != nil {
 		t.Fatal(err)
 	}
-	notice := "The network gave wefty-studio-2 because wefty-studio is taken; retire the stale device to free the name."
+	notice := "The network gave wefty-studio-2 because wefty-studio is taken; retire the stale device to free the name, or choose a --node-id with a different machine name, such as studio-desk, for a new installation."
 	if strings.Count(output.String(), notice) != 1 || strings.Contains(prompts.String(), notice) {
 		t.Fatalf("collision notice missing or duplicated: %s %s", &output, prompts)
 	}
