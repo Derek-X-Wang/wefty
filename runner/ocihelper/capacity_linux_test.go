@@ -230,7 +230,7 @@ func TestDiskRefusalIsAtomicWithMemoryAndUsesDiskRootFilesystem(t *testing.T) {
 	}
 }
 
-func TestAdmissionReceiptUsesInjectedClockAndCarriesTmpfsWarnings(t *testing.T) {
+func TestAdmissionReceiptUsesInjectedClockAndScaledTmpfsCeiling(t *testing.T) {
 	root := t.TempDir()
 	meminfo := filepath.Join(root, "meminfo")
 	if err := os.WriteFile(meminfo, []byte("MemTotal: 4194304 kB\nMemAvailable: 2097152 kB\n"), 0o600); err != nil {
@@ -245,8 +245,8 @@ func TestAdmissionReceiptUsesInjectedClockAndCarriesTmpfsWarnings(t *testing.T) 
 		Authority: AttemptAuthority{NodeID: "node", JobID: "computer", AttemptID: "attempt", FencingToken: "fence", BootSessionID: "boot", Class: "service", RemovalGeneration: "0"},
 		Workload:  WorkloadInput{Computer: true, Limits: WorkloadLimits{MemoryBytes: 512 << 20}},
 	})
-	if err != nil || !receipt.ObservedAt.Equal(clock.Now()) || len(receipt.Warnings) != 2 {
-		t.Fatalf("clocked warning receipt = %+v err=%v", receipt, err)
+	if err != nil || !receipt.ObservedAt.Equal(clock.Now()) || len(receipt.Warnings) != 0 || receipt.ComputerTmpfsCeilingBytes != 233<<20 {
+		t.Fatalf("clocked scaled receipt = %+v err=%v", receipt, err)
 	}
 }
 

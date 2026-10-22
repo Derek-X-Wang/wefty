@@ -21,7 +21,12 @@ DISPLAY=:$view_port
 export DISPLAY
 
 mkdir -p /wefty/service/home/wefty
-mkdir -p "$HOME/.config/chromium" "$XDG_RUNTIME_DIR" /tmp/wefty-computer
+# Browser profiles and large temporary files use Storage, not the bounded
+# memory-backed scratch mounts. Playwright's temporary profiles use TMPDIR.
+TMPDIR="$HOME/.cache/tmp"
+PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright"
+export TMPDIR PLAYWRIGHT_BROWSERS_PATH
+mkdir -p "$TMPDIR" "$PLAYWRIGHT_BROWSERS_PATH" "$HOME/.config/chromium" "$XDG_RUNTIME_DIR" /tmp/wefty-computer
 chmod 0700 "$HOME" "$XDG_RUNTIME_DIR"
 
 pids=
@@ -52,7 +57,7 @@ fi
 # shellcheck disable=SC2016 # HOME expands in the dbus-run-session child shell.
 start dbus-run-session -- sh -c '
   xfce4-session &
-  exec chromium --no-sandbox --disable-gpu \
+  exec chromium --no-sandbox --disable-gpu --disable-dev-shm-usage \
     --no-first-run --no-default-browser-check --start-fullscreen \
     --user-data-dir="$HOME/.config/chromium" file:///opt/wefty-computer/oracle.html
 '

@@ -50,6 +50,8 @@ class Supervisor:
     def __init__(self, status, backend, clock=time.monotonic):
         self.status, self.backend, self.clock = status, backend, clock
         self.running, self.wanted, self.blocked = {}, {}, {}
+        self.cleanup_delays = {}
+        self.required_removals = set()
         self.generation = 0
         self.directive_valid = False
         self.applied_generation = 0
@@ -59,16 +61,26 @@ class Supervisor:
                  "state": state, "reason": reason, "cleanup_complete": cleanup}
         atomic_answer(self.status, str(place) + ".json", value)
 
-    def stop(self, place, state="removed", reason=""):
+    def initialize(self):
+        # Clean known places independently. One damaged place must not stop
+        # startup or produce synthetic removed answers for unused places.
+        for place in range(1, 5):
+            self.stop(place, "failed", "startup_cleanup", publish=False)
+
+    def stop(self, place, state="removed", reason="", publish=True):
         try:
             self.backend.stop(place)
-        except (SeatFailure, OSError, subprocess.SubprocessError):
-            self.blocked[place] = (state, reason, self.clock() + 1)
+        except Exception:
+            delay = self.cleanup_delays.get(place, 30)
+            self.cleanup_delays[place] = min(delay * 2, 300)
+            self.blocked[place] = (state, reason, self.clock() + delay)
             self.answer(place, "failed", "cleanup_failed")
             return False
         self.running.pop(place, None)
         self.blocked.pop(place, None)
-        self.answer(place, state, reason, cleanup=True)
+        self.cleanup_delays.pop(place, None)
+        if publish:
+            self.answer(place, state, reason, cleanup=True)
         return True
 
     def close(self, reason="directive_refused"):
@@ -84,11 +96,19 @@ class Supervisor:
                 raise SeatFailure("stale_directive")
             self.generation = candidate
             wanted = validate(document)
+            changed = {place for place in wanted.keys() & self.wanted.keys()
+                       if wanted[place] != self.wanted[place]}
+            self.required_removals.update(changed)
+            if wanted.keys() & self.required_removals:
+                raise SeatFailure("in_place_change_requires_remove")
+            # Only a valid directive omitting every refused place authorizes
+            # subsequent add. Cleanup on refusal alone is not that directive.
+            self.required_removals.clear()
         except SeatFailure:
             self.close("directive_refused")
             raise
         for place in set(self.running) | set(self.blocked) | set(self.wanted):
-            if wanted.get(place) != self.wanted.get(place):
+            if place not in self.blocked and wanted.get(place) != self.wanted.get(place):
                 self.stop(place)
         for place, seat in wanted.items():
             if place in self.blocked:
@@ -132,13 +152,15 @@ class Supervisor:
     def tick(self):
         for place, (state, reason, retry_at) in list(self.blocked.items()):
             if self.clock() >= retry_at:
+                if state == "removed" and place in self.wanted:
+                    state, reason = "failed", "place_blocked"
                 self.stop(place, state, reason)
         for place, state in list(self.running.items()):
             if place in self.blocked:
                 continue
             reason = None
             if not self.backend.healthy(place):
-                reason = "desktop_exited"
+                reason = self.backend.failure_reason(place)
             elif not state["ready"]:
                 if self.clock() >= state["deadline"]:
                     reason = "readiness_deadline"
@@ -173,24 +195,61 @@ def open_directory(path):
 
 
 def remove_at(parent, name):
-    """Delete through held directory descriptors; links are only unlinked."""
+    """Iterative no-follow deletion with at most three extra descriptors.
+
+    Parent identities are checked on ascent, so a renamed directory cannot
+    redirect cleanup. Depth consumes metadata, never Python stack or fds.
+    """
+    current = os.dup(parent)
+    frames = []
+    entries = iter([name])
     try:
-        original = os.stat(name, dir_fd=parent, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    if not stat.S_ISDIR(original.st_mode):
-        os.unlink(name, dir_fd=parent)
-        return
-    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-    try:
-        observed = os.fstat(child)
-        if (original.st_dev, original.st_ino) != (observed.st_dev, observed.st_ino):
-            raise SeatFailure("cleanup_path_replaced")
-        for entry in os.listdir(child):
-            remove_at(child, entry)
+        while True:
+            try:
+                name = next(entries)
+            except StopIteration:
+                if not frames:
+                    return
+                name, expected_parent, expected_child, entries = frames.pop()
+                upper = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                try:
+                    observed = os.fstat(upper)
+                    child = os.stat(name, dir_fd=upper, follow_symlinks=False)
+                    if ((observed.st_dev, observed.st_ino) != expected_parent
+                            or (child.st_dev, child.st_ino) != expected_child):
+                        raise SeatFailure("cleanup_path_replaced")
+                    os.rmdir(name, dir_fd=upper)
+                except BaseException:
+                    os.close(upper)
+                    raise
+                os.close(current)
+                current = upper
+                continue
+            try:
+                info = os.stat(name, dir_fd=current, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                os.unlink(name, dir_fd=current)
+                continue
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            try:
+                observed, upper = os.fstat(child), os.fstat(current)
+                if ((info.st_dev, info.st_ino) != (observed.st_dev, observed.st_ino)
+                        or observed.st_dev != upper.st_dev):
+                    raise SeatFailure("cleanup_path_replaced")
+                # Enumerate each directory once. Retain names, never an open
+                # directory iterator/fd at every level or repeated wide scans.
+                children = iter(os.listdir(child))
+                frames.append((name, (upper.st_dev, upper.st_ino),
+                               (observed.st_dev, observed.st_ino), entries))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(current)
+            current, entries = child, children
     finally:
-        os.close(child)
-    os.rmdir(name, dir_fd=parent)
+        os.close(current)
 
 
 def atomic_answer(folder, name, value):
@@ -439,15 +498,33 @@ class DesktopBackend:
         process = self.processes.pop(place, None)
         if process:
             process.wait(timeout=5)
-        subprocess.run(["/usr/bin/python3", "/usr/local/libexec/wefty-seat-clean-ipc"],
+        subprocess.run(["/usr/bin/python3", "-I", "-S", "/usr/local/libexec/wefty-seat-clean-ipc"],
                        user=2000 + place, group=2000 + place, extra_groups=[],
-                       check=True, timeout=5, env={"PATH": "/usr/bin:/bin"})
+                       check=True, timeout=5, cwd="/", env={"PATH": "/usr/bin:/bin"})
         kill_uid(2000 + place)
         sweep_scratch(2000 + place)
         self.storage.remove_seat(place)
 
     def healthy(self, place):
         return self.processes[place].poll() is None
+
+    def failure_reason(self, place):
+        try:
+            parent = open_directory(SEATS / str(place) / "run")
+            try:
+                descriptor = os.open("launcher-failure", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                     dir_fd=parent)
+                with os.fdopen(descriptor, "r") as source:
+                    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        return "desktop_exited"
+                    reason = source.read(64)
+            finally:
+                os.close(parent)
+            if reason in ("restart_limit", "display_exited"):
+                return reason
+        except (OSError, UnicodeError):
+            pass
+        return "desktop_exited"
 
     def is_ready(self, seat):
         try:
@@ -522,9 +599,7 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     try:
-        for place in range(1, 5):
-            engine.backend.stop(place)
-        storage.reset()
+        engine.initialize()
         prepare_x11()
         atomic_answer(Path("/run"), "wefty-seat-supervisor.json", {"version": 1, "state": "ready"})
         run_loop(engine, CONTROL, lambda: stopping)

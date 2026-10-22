@@ -251,8 +251,8 @@ Chromium is launched with `--no-sandbox`; that is a disclosed limitation of
 this example, not an expansion of the OCI security profile. Wefty adds no GPU,
 device, capability,
 ptrace, privilege, browser-sandbox exception, font, locale, or D-Bus policy.
-The helper retains the ordinary `wefty-v1` walls and supplies the private 1 GiB
-`/dev/shm` defined by the Computer image contract.
+The helper retains the ordinary `wefty-v1` walls and supplies the private scaled
+`/dev/shm` (256 MiB at a 1 GiB Computer cap, at most 1 GiB) defined by the Computer image contract.
 
 The second image runs headless Sway/pixman and native wayvnc. Both images leave
 deterministic focused input and driver oracle surfaces for

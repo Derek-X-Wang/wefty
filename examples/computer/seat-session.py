@@ -16,6 +16,7 @@ class Session:
         self.processes, self.restarts = {}, {name: [] for name in names}
         self.failure, self.changed = None, False
         self.started = set()
+        self.ready = False
 
     def tick(self):
         self.changed = False
@@ -47,6 +48,14 @@ class Session:
                 # per attempt rather than counting both exit and spawn error.
                 if len(self.restarts[name]) >= 3:
                     self.failure = 'restart_limit'
+
+    def poll_readiness(self, marker, probe):
+        if self.changed:
+            self.ready = False
+            marker.unlink(missing_ok=True)
+        if not self.failure and not self.ready and probe():
+            marker.touch()
+            self.ready = True
 
 
 def display_alive(pid):
@@ -106,10 +115,7 @@ def main():
     try:
         while not session.failure:
             session.tick()
-            if session.changed:
-                ready.unlink(missing_ok=True)
-            if not session.failure and browser_ready():
-                ready.touch()
+            session.poll_readiness(ready, browser_ready)
             time.sleep(0.1)
     finally:
         ready.unlink(missing_ok=True)

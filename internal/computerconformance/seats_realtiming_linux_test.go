@@ -159,7 +159,7 @@ os.waitpid(p,0)`)
 	evidence.MemoryBeforeRemovalBytes = before
 	h.directive(3, 1)
 	h.wait("generation-bound cleanup proof", func() bool {
-		b, err := os.ReadFile(filepath.Join(h.status, "2.json"))
+		b, err := readSeatStatusAnswer(h.status, "2.json")
 		if err != nil {
 			return false
 		}
@@ -214,7 +214,7 @@ assert all(int(row.split()[index])!=%d for row in rows[1:])`, kind, map[string]s
 	})
 	evidence.Observations["restart_folders_absent"] = true
 	evidence.Observations["restart_processes_absent"] = h.exec("0:0", "sh", "-c", `if ps -eo uid= | awk '$1>=2001 && $1<=2004 {found=1} END {exit !found}'; then exit 1; fi; echo absent`) == "absent"
-	entries, err := os.ReadDir(h.status)
+	entries, err := h.status.ReadDir(-1)
 	seatMust(t, err)
 	evidence.Observations["restart_answers_absent"] = len(entries) == 0
 	if h.exec("0:0", "cat", "/wefty/service/shared/keep") != "keep" {
@@ -225,7 +225,7 @@ assert all(int(row.split()[index])!=%d for row in rows[1:])`, kind, map[string]s
 	h = startSeatComputer(t, ctx, client, negative, filepath.Join(root, "negative"), service, kit)
 	h.directive(1, 4)
 	h.wait("missing passwd refusal", func() bool {
-		b, err := os.ReadFile(filepath.Join(h.status, "4.json"))
+		b, err := readSeatStatusAnswer(h.status, "4.json")
 		if err != nil {
 			return false
 		}
@@ -247,21 +247,22 @@ assert all(int(row.split()[index])!=%d for row in rows[1:])`, kind, map[string]s
 }
 
 type seatComputer struct {
-	t                           *testing.T
-	ctx                         context.Context
-	client                      *containerd.Client
-	container                   containerd.Container
-	task                        containerd.Task
-	id, control, status, cgroup string
-	pid                         uint32
-	tmpfsBytes                  int64
-	stopped                     bool
-	profileUnmodified           bool
+	t                   *testing.T
+	ctx                 context.Context
+	client              *containerd.Client
+	container           containerd.Container
+	task                containerd.Task
+	id, control, cgroup string
+	status              *os.File
+	pid                 uint32
+	tmpfsBytes          int64
+	stopped             bool
+	profileUnmodified   bool
 }
 
 func startSeatComputer(t *testing.T, ctx context.Context, client *containerd.Client, reference, root, service, kit string) *seatComputer {
 	t.Helper()
-	h := &seatComputer{t: t, ctx: ctx, client: client, id: "seat-" + filepath.Base(t.TempDir()), control: filepath.Join(root, "managed", "control"), status: ""}
+	h := &seatComputer{t: t, ctx: ctx, client: client, id: "seat-" + filepath.Base(t.TempDir()), control: filepath.Join(root, "managed", "control")}
 	managed := filepath.Join(root, "managed")
 	for _, dir := range []string{h.control, filepath.Join(service, "etc")} {
 		seatMust(t, os.MkdirAll(dir, 0755))
@@ -302,18 +303,9 @@ func startSeatComputer(t *testing.T, ctx context.Context, client *containerd.Cli
 	var document *ocihelper.RuntimeSpecDocument
 	seatMust(t, mount.WithTempMount(ctx, mounts, func(rootfs string) error {
 		var err error
-		document, err = ocihelper.BuildRuntimeSpec(ctx, ocihelper.RuntimeSpecInput{
-			ContainerID: h.id, CgroupPath: "/" + h.id, RootfsPath: rootfs, ManagedRoot: managed,
-			Image: ocihelper.ImageRuntimeConfig{User: config.Config.User, Environment: config.Config.Env, Entrypoint: config.Config.Entrypoint, Command: config.Config.Cmd, WorkingDirectory: config.Config.WorkingDir},
-			Workload: ocihelper.WorkloadInput{ImageReference: reference, ImageDigest: image.Target().Digest.String(), Computer: true,
-				Limits:         ocihelper.WorkloadLimits{MemoryBytes: 1 << 30},
-				ManagedVolumes: []ocihelper.ManagedVolumeDescriptor{{Kind: ocihelper.ManagedVolumeComputerDisk, ComputerStorage: &ocihelper.ComputerStorageReference{ComputerID: "seat-conformance", StorageID: "seat-conformance", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 2 << 30}}},
-				OperatorMounts: []ocihelper.OperatorMount{{NodePath: kit, ContainerPath: "/opt/seat-install-kit", ReadOnly: true}}},
-			Guest:        ocihelper.GuestKernelFacts{Architecture: runtime.GOARCH, KernelRelease: seatKernelRelease()},
-			ResolverPath: resolver, HostsPath: hosts, ComputerControlSource: h.control,
-			ManagedVolumeSources: map[ocihelper.ManagedVolumeKind]string{ocihelper.ManagedVolumeComputerDisk: service},
-			AllowedMountRoots:    []string{kit}, OperatorMountSources: []string{kit},
-		})
+		document, err = ocihelper.BuildRuntimeSpec(ctx, seatProfileInput(h.id, reference, image.Target().Digest.String(), config.Config,
+			seatProfilePaths{rootfs: rootfs, managed: managed, service: service, control: h.control,
+				kit: kit, resolver: resolver, hosts: hosts}, seatKernelRelease()))
 		return err
 	}))
 	defer document.Close()
@@ -359,7 +351,12 @@ func startSeatComputer(t *testing.T, ctx context.Context, client *containerd.Cli
 	h.task, err = h.container.NewTask(ctx, cio.LogFile(filepath.Join(root, "computer.log")))
 	seatMust(t, err)
 	h.pid = h.task.Pid()
-	h.status = fmt.Sprintf("/proc/%d/root/wefty/seat-status", h.pid)
+	mountinfo, err := os.ReadFile(fmt.Sprintf("/proc/%d/mountinfo", h.pid))
+	seatMust(t, err)
+	seatMust(t, validateSeatStatusMount(mountinfo))
+	h.status, err = openSeatStatusDirectory(fmt.Sprintf("/proc/%d/root", h.pid))
+	seatMust(t, err)
+	t.Cleanup(func() { seatMust(t, h.status.Close()) })
 	out, err := exec.CommandContext(ctx, "nsenter", "-t", fmt.Sprint(h.pid), "-n", "ip", "link", "set", "lo", "up").CombinedOutput()
 	if err != nil {
 		t.Fatalf("loopback: %v %s", err, out)
@@ -463,7 +460,7 @@ func (h *seatComputer) directive(generation int, places ...int) {
 }
 func (h *seatComputer) ready(place int) {
 	h.wait("Seat ready", func() bool {
-		b, err := os.ReadFile(filepath.Join(h.status, fmt.Sprintf("%d.json", place)))
+		b, err := readSeatStatusAnswer(h.status, fmt.Sprintf("%d.json", place))
 		if err != nil {
 			return false
 		}

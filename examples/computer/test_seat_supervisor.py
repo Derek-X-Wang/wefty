@@ -1,6 +1,9 @@
 """Directive and answer tests; clocks and desktop processes are injected."""
 import importlib.util
 import json
+import os
+import resource
+from unittest import mock
 from pathlib import Path
 import tempfile
 import unittest
@@ -27,6 +30,9 @@ class Backend:
 
     def healthy(self, place):
         return place in self.live
+
+    def failure_reason(self, _place):
+        return "desktop_exited"
 
     def is_ready(self, seat):
         return seat["place"] in self.ready
@@ -159,11 +165,69 @@ class SupervisorTest(unittest.TestCase):
         self.engine.apply(directive(3, 1, 2))
         self.assertIn(1, self.engine.blocked)
         self.backend.stop = original
-        self.clock = 10
+        self.clock = 30
         self.engine.tick()
         self.assertTrue(self.answer(1)["cleanup_complete"])
+        self.assertEqual(self.answer(1)["state"], "failed")
         applied = json.loads((Path(self.tmp.name).resolve() / 'applied.json').read_text())
         self.assertEqual(applied['generation'], 3)
+
+    def test_in_place_change_is_refused_without_removed_answer(self):
+        self.engine.apply(directive(1, 1))
+        changed = directive(2, 1)
+        changed['seats'][0]['view_port'] = 7200
+        with self.assertRaisesRegex(supervisor.SeatFailure, 'in_place_change_requires_remove'):
+            self.engine.apply(changed)
+        self.assertEqual(self.answer(1)['state'], 'failed')
+        self.assertEqual(self.answer(1)['reason'], 'directive_refused')
+        self.assertTrue(self.answer(1)['cleanup_complete'])
+        changed['generation'] = 3
+        with self.assertRaisesRegex(supervisor.SeatFailure, 'in_place_change_requires_remove'):
+            self.engine.apply(changed)
+        self.engine.apply(directive(4))
+        changed['generation'] = 5
+        self.engine.apply(changed)
+        self.assertIn(1, self.backend.live)
+
+    def test_unexpected_cleanup_exception_is_blocked_and_backed_off(self):
+        self.engine.apply(directive(1, 1, 2))
+        calls = []
+        original = self.backend.stop
+        def broken(place):
+            if place == 1:
+                calls.append(place)
+                raise RuntimeError('unexpected cleanup error')
+            original(place)
+        self.backend.stop = broken
+        self.engine.apply(directive(2, 2))
+        for self.clock in range(1, 30):
+            self.engine.tick()
+        self.assertEqual(calls, [1])
+        self.clock = 30
+        self.engine.tick()
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(self.answer(1)['reason'], 'cleanup_failed')
+        self.assertIn(2, self.backend.live)
+
+    def test_launcher_reason_is_reported(self):
+        self.engine.apply(directive(1, 1))
+        self.backend.failure_reason = lambda _place: 'restart_limit'
+        self.backend.live.clear()
+        self.engine.tick()
+        self.assertEqual(self.answer(1)['reason'], 'restart_limit')
+
+    def test_startup_cleanup_failure_does_not_prevent_other_places(self):
+        original = self.backend.stop
+        def broken(place):
+            if place == 1:
+                raise RuntimeError('unexpected startup cleanup error')
+            original(place)
+        self.backend.stop = broken
+        self.engine.initialize()
+        self.assertEqual(self.answer(1)['reason'], 'cleanup_failed')
+        self.engine.apply(directive(1, 2))
+        self.assertIn(2, self.backend.live)
+        self.assertIn(1, self.engine.blocked)
 
     def test_main_loop_logs_one_refusal_and_retries_after_a_read_error(self):
         control = Path(self.tmp.name).resolve() / "seats.json"
@@ -222,6 +286,46 @@ class StorageSafetyTest(unittest.TestCase):
             storage.remove_seat(1)
             self.assertFalse(seat.exists())
             self.assertEqual((outside / "keep").read_text(), "safe")
+
+    def test_deep_tree_cleanup_uses_bounded_descriptors(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            parent = supervisor.open_directory(root)
+            os.mkdir('tree', dir_fd=parent)
+            leaf = os.open('tree', os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent)
+            depth = 1500
+            for _ in range(depth):
+                os.mkdir('d', dir_fd=leaf)
+                child = os.open('d', os.O_RDONLY | os.O_DIRECTORY, dir_fd=leaf)
+                os.close(leaf)
+                leaf = child
+            before = resource.getrlimit(resource.RLIMIT_NOFILE)
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (64, before[1]))
+                supervisor.remove_at(parent, 'tree')
+                self.assertFalse((root / 'tree').exists())
+            finally:
+                resource.setrlimit(resource.RLIMIT_NOFILE, before)
+                # Keep test failure cleanup independent of the implementation.
+                if (root / 'tree').exists():
+                    for _ in range(depth):
+                        upper = os.open('..', os.O_RDONLY | os.O_DIRECTORY, dir_fd=leaf)
+                        os.close(leaf)
+                        os.rmdir('d', dir_fd=upper)
+                        leaf = upper
+                    os.rmdir('tree', dir_fd=parent)
+                os.close(leaf)
+                os.close(parent)
+
+    def test_ipc_cleaner_ignores_user_python_startup_and_cwd(self):
+        backend = supervisor.DesktopBackend(mock.Mock())
+        with mock.patch.object(supervisor, 'kill_uid'), mock.patch.object(supervisor, 'sweep_scratch'), mock.patch.object(supervisor.subprocess, 'run') as run:
+            backend.stop(1)
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ['/usr/bin/python3', '-I', '-S', '/usr/local/libexec/wefty-seat-clean-ipc'])
+        self.assertEqual(kwargs['cwd'], '/')
+        self.assertEqual(kwargs['env'], {'PATH': '/usr/bin:/bin'})
+        self.assertEqual(kwargs['user'], 2001)
 
     def test_missing_status_mount_has_a_typed_reason(self):
         with tempfile.TemporaryDirectory() as d:

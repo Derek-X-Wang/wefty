@@ -12,7 +12,12 @@ import (
 
 func validateSeatWorkflow(payload []byte) error {
 	var workflow struct {
-		On   map[string]any `yaml:"on"`
+		On map[string]struct {
+			Paths []string `yaml:"paths"`
+		} `yaml:"on"`
+		Concurrency struct {
+			Cancel string `yaml:"cancel-in-progress"`
+		} `yaml:"concurrency"`
 		Jobs map[string]struct {
 			RunsOn   string `yaml:"runs-on"`
 			Strategy struct {
@@ -28,6 +33,9 @@ func validateSeatWorkflow(payload []byte) error {
 	}
 	if err := yaml.Unmarshal(payload, &workflow); err != nil {
 		return err
+	}
+	if workflow.Concurrency.Cancel != "${{ github.event_name == 'pull_request' }}" {
+		return fmt.Errorf("main promotion can be cancelled")
 	}
 	lane, ok := workflow.Jobs["default-computer-seats"]
 	if !ok || !slices.Equal(lane.Strategy.Matrix.Arch, []string{"amd64", "arm64"}) {
@@ -45,8 +53,13 @@ func validateSeatWorkflow(payload []byte) error {
 			return fmt.Errorf("missing event %s", event)
 		}
 	}
+	for _, required := range []string{"examples/computer/**", "internal/computerconformance/**", "cmd/wefty-computer-conformance/**", "runner/ocihelper/**", "contract/**", "go.mod", "go.sum", "scripts/verify-acceptance-image.sh", "scripts/oci-tested-versions.env", ".github/workflows/computer-seats.yml"} {
+		if !slices.Contains(workflow.On["pull_request"].Paths, required) {
+			return fmt.Errorf("missing PR path filter %s", required)
+		}
+	}
 	text := string(payload)
-	for _, required := range []string{"examples/computer/**", "internal/computerconformance/**", "cmd/wefty-computer-conformance/**", "runner/ocihelper/profile.go", ".github/workflows/computer-seats.yml", "--build-arg BASE_IMAGE=\"$pinned\"", "TestDefaultComputerSeatsAtProductionTimings", "--seat-evidence"} {
+	for _, required := range []string{"examples/computer/**", "internal/computerconformance/**", "cmd/wefty-computer-conformance/**", "runner/ocihelper/**", "contract/**", "go.mod", "go.sum", "scripts/verify-acceptance-image.sh", "scripts/oci-tested-versions.env", ".github/workflows/computer-seats.yml", "--build-arg BASE_IMAGE=\"$pinned\"", "TestDefaultComputerSeatsAtProductionTimings", "--seat-evidence"} {
 		if !strings.Contains(text, required) {
 			return fmt.Errorf("missing %s", required)
 		}
@@ -80,9 +93,11 @@ func TestDefaultComputerSeatsRunBothNativeArchitecturesBeforePublication(t *test
 		t.Fatal(err)
 	}
 	for name, mutation := range map[string][]byte{
-		"architecture":   bytes.Replace(payload, []byte("arch: [amd64, arm64]"), []byte("arch: [amd64]"), 1),
-		"runner":         bytes.Replace(payload, []byte("'ubuntu-24.04-arm'"), []byte("'ubuntu-latest'"), 1),
-		"promotion gate": bytes.Replace(payload, []byte("needs: [default-computer-seats]"), []byte("needs: []"), 1),
+		"profile dependency filter": bytes.Replace(payload, []byte("      - contract/**\n"), nil, 1),
+		"architecture":              bytes.Replace(payload, []byte("arch: [amd64, arm64]"), []byte("arch: [amd64]"), 1),
+		"runner":                    bytes.Replace(payload, []byte("'ubuntu-24.04-arm'"), []byte("'ubuntu-latest'"), 1),
+		"main cancellation":         bytes.Replace(payload, []byte("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"), []byte("cancel-in-progress: true"), 1),
+		"promotion gate":            bytes.Replace(payload, []byte("needs: [default-computer-seats]"), []byte("needs: []"), 1),
 	} {
 		if bytes.Equal(payload, mutation) || validateSeatWorkflow(mutation) == nil {
 			t.Fatalf("%s drift was accepted", name)

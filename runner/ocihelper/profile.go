@@ -37,7 +37,7 @@ const (
 	containerRootfsPath          = "rootfs"
 	containerdRuntimeSpecTypeURL = "types.containerd.io/opencontainers/runtime-spec/1/Spec"
 	defaultCPUPeriodMicroseconds = uint64(100_000)
-	// Upper bounds retained for capacity diagnostics. Computer mounts scale
+	// Upper bounds for scratch scaling. Computer mounts scale
 	// with the actual cap; all six tmpfs ceilings stay within half of it.
 	computerTmpKilobytes    = 512 * 1024
 	computerVarTmpKilobytes = 64 * 1024

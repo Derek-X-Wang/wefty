@@ -420,7 +420,7 @@ var CheckCatalog = []CheckDefinition{
 	{ID: "harness.no-new-privileges", Scope: ScopeHarness, Summary: "Docker harness enables noNewPrivileges"},
 	{ID: "harness.forbidden-privilege", Scope: ScopeHarness, Summary: "Docker harness adds no forbidden privilege"},
 	{ID: "harness.shm-private", Scope: ScopeHarness, Summary: "/dev/shm is attempt-private"},
-	{ID: "harness.shm-size", Scope: ScopeHarness, Summary: "/dev/shm ceiling is exactly 1 GiB"},
+	{ID: "harness.shm-size", Scope: ScopeHarness, Summary: "/dev/shm ceiling is 256 MiB at the harness 1 GiB Computer cap"},
 	{ID: "harness.shm-flags", Scope: ScopeHarness, Summary: "/dev/shm is mode 1777,nosuid,nodev,noexec"},
 	{ID: "harness.tmp-ceilings", Scope: ScopeHarness, Summary: "/tmp and /var/tmp retain bounded ceilings"},
 	{ID: "profile.capabilities", Scope: ScopeProfile, Summary: "containerd capability sets match wefty-v1"},

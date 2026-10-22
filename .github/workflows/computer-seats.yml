@@ -8,9 +8,12 @@ on:
       - examples/computer/**
       - internal/computerconformance/**
       - cmd/wefty-computer-conformance/**
-      - runner/ocihelper/profile.go
-      - runner/ocihelper/profile*_test.go
-      - runner/ocihelper/testdata/containerd-v2.3.7/wefty-v1-computer-linux-amd64.json
+      - runner/ocihelper/**
+      - contract/**
+      - go.mod
+      - go.sum
+      - scripts/verify-acceptance-image.sh
+      - scripts/oci-tested-versions.env
       - docs/contracts/computer-image.md
       - docs/guides/computer-images.md
       - scripts/computer_seats_contract_test.go
@@ -24,7 +27,7 @@ permissions:
 
 concurrency:
   group: computer-seats-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -133,6 +136,8 @@ jobs:
           set -euo pipefail
           evidence="$RUNNER_TEMP/default-computer"
           python3 -m unittest discover -s examples/computer -p 'test_*.py'
+          GOFLAGS=-p=1 GOMAXPROCS=2 go test -count=1 ./runner/ocihelper \
+            -run '^TestAdmissionReceiptUsesInjectedClockAndScaledTmpfsCeiling$'
           GOFLAGS=-p=1 GOMAXPROCS=2 go test -c -tags service_acceptance_realtiming \
             -o "$RUNNER_TEMP/seat-conformance.test" ./internal/computerconformance
           (
@@ -145,7 +150,7 @@ jobs:
               WEFTY_SEAT_EVIDENCE="$evidence/$ARCH-seats-observed.json" \
               WEFTY_SEAT_PROFILE_RECEIPT="$evidence/$ARCH-profile.json" \
               "$RUNNER_TEMP/seat-conformance.test" -test.v \
-              -test.run '^TestDefaultComputerSeatsAtProductionTimings$' -test.timeout 10m
+              -test.run '^(TestDefaultComputerSeatsAtProductionTimings|TestSeatLaneSetupPassesRealProfileValidationForFreshAndRestartedStorage|TestSeatStatus.*)$' -test.timeout 10m
           )
           sudo chown -R "$(id -u):$(id -g)" "$evidence"
           go run ./cmd/wefty-computer-conformance --seat-evidence "$evidence/$ARCH-seats-observed.json" \

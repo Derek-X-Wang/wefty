@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import unittest
+import tempfile
 
 spec = importlib.util.spec_from_file_location('seat_session', Path(__file__).with_name('seat-session.py'))
 session = importlib.util.module_from_spec(spec)
@@ -77,3 +78,22 @@ class SessionTest(unittest.TestCase):
         self.session.tick()
         self.assertEqual(self.session.failure, 'display_exited')
         self.assertEqual(len(self.starts), 2)
+
+    def test_readiness_poll_stops_after_ready_and_resumes_after_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d) / 'ready'
+            probes = []
+            def probe():
+                probes.append(1)
+                return True
+            self.session.tick()
+            self.session.poll_readiness(marker, probe)
+            for _ in range(5):
+                self.session.tick()
+                self.session.poll_readiness(marker, probe)
+            self.assertEqual(probes, [1])
+            self.assertTrue(marker.exists())
+            self.session.processes['edges'].code = 1
+            self.session.tick()
+            self.session.poll_readiness(marker, probe)
+            self.assertEqual(probes, [1, 1])

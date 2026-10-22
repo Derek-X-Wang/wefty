@@ -384,6 +384,10 @@ IPC namespaces. Their pages count against its cgroup memory limit. At the
 1 GiB default the ceilings are `/dev/shm` 256 MiB, `/tmp` 128 MiB, `/var/tmp`
 16 MiB, `/run` 32 MiB, `/dev` 32 MiB and `/wefty/seat-status` 1 MiB: 465 MiB
 in total. This applies to single-desktop Computers as well as Seat images.
+The Docker approximation tests reference images at this same 1 GiB cap and
+these scaled sizes. The XFCE reference image puts `TMPDIR`, Playwright browser
+installs and temporary browser profiles on its disk home; Chromium uses
+`--disable-dev-shm-usage` to avoid putting large temp files in the 256 MiB shm.
 The 256 MiB shared-memory ceiling leaves Chromium more room than a common
 64 MiB mount while reserving at least half the cap for program memory.
 
@@ -411,10 +415,11 @@ cgroup before `Started`: `memory.max` equals the declared cap,
 contains those read-back values. The separate atomic admission receipt records
 setup-configured capacity, declared memory/disk arithmetic, plus timestamped
 `MemTotal`, `MemAvailable`, and disk-root filesystem-free observations;
-`MemAvailable` and the capacity diagnostic's static maximum-ceiling estimate
-remain advisory facts and never reject admission; the per-attempt profile
-receipt reports the scaled ceilings actually mounted. Disk-root free bytes participate only in the serialized
-preallocation decision and never prove post-`Started` exhaustion.
+`MemAvailable` and temp ceilings remain advisory facts and never reject
+admission. Both the admission receipt's `computer_tmpfs_ceiling_bytes` and
+per-attempt profile receipt report the sum of all six scaled ceilings for the
+declared memory limit, including `/dev`, `/run` and status. Disk-root free bytes participate only in
+the serialized preallocation decision and never prove post-`Started` exhaustion.
 
 ## Tenant `driver.json` consumer contract
 
@@ -600,7 +605,16 @@ remove the place before reuse.
 
 P6 uses the profile's private 1 MiB `/wefty/seat-status` tmpfs, not a writable
 operator mount. The supervisor atomically replaces `<place>.json` with mode
-`0600`, using descriptor-based, no-follow operations. Answers include:
+`0600`, using descriptor-based, no-follow operations. Before reading, the
+helper verifies the attempt's `/wefty/seat-status` mount in its mountinfo:
+exactly one private writable tmpfs, `nosuid,nodev,noexec`, bounded to at most
+1 MiB, with no shadowing mounts beneath it. It anchors reads at the live
+attempt's kernel root descriptor, then uses
+`openat2(RESOLVE_IN_ROOT|RESOLVE_NO_SYMLINKS)` or `O_NOFOLLOW` on every path
+component. Each answer opens with `O_NONBLOCK`, must be a regular file, and
+is limited to 8192 bytes (including a bounded read if it grows after `stat`).
+Links, FIFOs, devices and oversized files never count as cleanup evidence.
+The native Seat lane uses the same reader rule. Answers include:
 
 ```json
 {"version":1,"generation":1,"place":1,"state":"ready","reason":"","cleanup_complete":false}
@@ -619,8 +633,10 @@ Removal keeps a generation-bound `removed` answer instead of deleting proof.
 If the image stops a Seat itself, it writes `failed` and its reason, with
 `cleanup_complete:true` only after cleanup succeeds. If cleanup fails, it
 writes `failed/cleanup_failed`, keeps that place blocked and retries cleanup
-at a bounded cadence. Other Seats keep running. No new desktop starts in a
-blocked place. **Room returns only after positive cleanup evidence** for that
+after 30 seconds, doubling each failed retry up to 300 seconds. An
+unexpected cleanup exception has the same per-place result, including during
+startup; it does not end other Seats. No new desktop starts in a blocked
+place. **Room returns only after positive cleanup evidence** for that
 attempt, directive generation and place; a missing file, a failed cleanup or
 an elapsed deadline is not such evidence (spec 2.8.3).
 
@@ -634,6 +650,11 @@ also atomically writes `applied.json`:
 This proves absence for places omitted by that generation, even if an earlier
 add directive was replaced before the image observed it. It does not say that
 wanted desktops are ready. A stale applied generation never releases Room.
+Changing the config of an already wanted place in place is refused as
+`in_place_change_requires_remove`. Like other refused directives this stops
+existing Seats with `failed/directive_refused`, never a `removed` answer for
+the still-wanted config. The helper must remove the place, observe positive
+cleanup, then add its new config in a later generation.
 Helper/L1 binding and Room updates remain with their wave owners.
 
 ### Desktop recovery, folders and root path safety
@@ -649,8 +670,12 @@ driver, desktop session or endpoint exit restarts that component and its
 process group without ending the Seat. Three restarts per component within
 60 seconds are allowed; the next failure ends the launcher. A dead display
 ends it immediately. The root supervisor then cleans the Seat and reports
-failure. Restart policy uses an injected clock in unit tests; the Linux lane
-kills a browser and the edge process and checks that the same Seat recovers.
+`restart_limit` or `display_exited` from the launcher; an unreported launcher
+exit is `desktop_exited`. The session controller runs under the Seat uid.
+A Seat's own `killall python3` or `pkill -u` can kill that controller and ends
+the Seat; the root supervisor cleans all its remaining processes. Browser
+readiness is polled only until the first ready after each component start.
+Restart policy uses an injected clock in unit tests; the Linux lane kills a browser and the edge process and checks that the same Seat recovers.
 
 P8 reads the Seat's own read-only
 `/wefty/control/seats/<place>/driver.json`. Its body remains exactly
@@ -668,13 +693,25 @@ At startup the root supervisor refuses a non-root-owned or group/other-writable
 `/wefty/service`. It `lstat`-checks `seats` and `shared`, refuses links or wrong
 owners, and secures directories through held file descriptors. Every path
 component is opened with `O_NOFOLLOW`; mode and owner changes use `fchmod` and
-`fchown`. Recursive deletion works relative to directory descriptors, unlinks
-links and never follows their targets.
+`fchown`. Deletion walks iteratively through verified directory descriptors,
+uses a bounded number of descriptors at any depth, unlinks links, and never
+follows their targets or crosses filesystems.
+
+If an older image left the Storage root mode `0777`, stop the Computer.
+A Node owner with maintenance access to the offline Storage filesystem must
+verify the attached Storage root, then restore that root's numeric ownership
+to `0:0` and mode to `0755` (or stricter) before starting the Computer again.
+On Linux this is `chown 0:0 <storage-root>` and `chmod 0755 <storage-root>`.
+Fix the root only; do not recursively change Seat or shared-file ownership.
+The root supervisor refuses unsafe ownership or write permission rather than
+silently trusting a tenant-writable parent.
 
 Cleanup kills every process carrying the Seat uid, including detached and
 double-forked children. It removes that uid's SysV shared memory, semaphore
 sets and message queues, and POSIX `/dev/mqueue` entries **as the Seat uid**;
-root intentionally has no `CAP_IPC_OWNER`. It then proves process absence
+root intentionally has no `CAP_IPC_OWNER`. The cleaner runs as
+`/usr/bin/python3 -I -S`, with cwd `/` and a clean environment, so Seat Python
+user-site hooks cannot run during cleanup. It then proves process absence
 again, removes uid-owned scratch (including X sockets/locks and POSIX shared
 memory), and deletes the Seat folder. `/wefty/service/shared` is mode `1777`
 and survives. A new attempt has a fresh status tmpfs and control directory;
