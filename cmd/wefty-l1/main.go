@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
@@ -92,6 +93,9 @@ func run() error {
 	nodePolicies := make(map[string]l1.NodePolicy)
 	var (
 		printVersion             = flag.Bool("version", false, "print the build commit and exit")
+		conversionInventory      = flag.Bool("conversion-inventory", false, "print read-only plain conversion inventory as JSON and exit; use only temporary L1/L3 copies")
+		conversionLedgerDB       = flag.String("conversion-ledger-db", "", "temporary L3 database copy for -conversion-inventory")
+		conversionNodeID         = flag.String("conversion-node-id", "", "plain scheduling Node ID for -conversion-inventory")
 		statePreflight           = flag.Bool("state-preflight", false, "open --db for upgrade preflight and exit; use only a temporary copy")
 		fabricMode               = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
 		plainFabricID            = flag.String("plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain Fabric ID (must start with plain-)")
@@ -130,6 +134,24 @@ func run() error {
 	flag.Parse()
 	explicit := connprofile.ExplicitFlags(flag.CommandLine)
 	rebindRequested := explicit["rebind-admin"] || explicit["admin-device-id"]
+	if *conversionInventory {
+		if *statePreflight || *initiateAdminBootstrap || *resetAdminPolicy || *printVersion || rebindRequested {
+			return errors.New("-conversion-inventory is mutually exclusive with the other offline flags")
+		}
+		if !explicit["db"] || strings.TrimSpace(*databasePath) == "" || strings.TrimSpace(*conversionLedgerDB) == "" || strings.TrimSpace(*conversionNodeID) == "" {
+			return errors.New("-conversion-inventory requires explicit -db, -conversion-ledger-db and -conversion-node-id; use only temporary copies")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		result, err := inventoryPlainConversion(ctx, *databasePath, *conversionLedgerDB, *conversionNodeID)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+	if explicit["conversion-ledger-db"] || explicit["conversion-node-id"] {
+		return errors.New("-conversion-ledger-db and -conversion-node-id require -conversion-inventory")
+	}
 	if rebindRequested {
 		if !explicit["rebind-admin"] || !explicit["admin-device-id"] || strings.TrimSpace(*rebindAdmin) == "" || strings.TrimSpace(*adminDeviceID) == "" {
 			return errors.New("-rebind-admin USER_ID requires an explicit -admin-device-id DEVICE_ID")
