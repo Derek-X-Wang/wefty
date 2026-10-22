@@ -302,6 +302,7 @@ type JobSpec struct {
 	Kind             string            `json:"kind"`
 	Class            string            `json:"class"`
 	PublishedPort    *int              `json:"published_port,omitempty"`
+	Restartable      bool              `json:"restartable,omitempty"`
 	Restart          string            `json:"restart,omitempty"`
 	MaxRestartStreak *int              `json:"max_restart_streak,omitempty"`
 	RuntimeHandler   string            `json:"runtime_handler,omitempty"`
@@ -316,6 +317,7 @@ type JobSpec struct {
 // UnmarshalJSON records wire presence for published_port and instance_key.
 // Plain services retain their historical null-or-absent port contract;
 // Computers forbid that member, and instance keys reject explicit null.
+// restartable is a boolean: omission defaults false, while null is invalid.
 func (s *JobSpec) UnmarshalJSON(data []byte) error {
 	type wire JobSpec
 	var decoded wire
@@ -325,6 +327,9 @@ func (s *JobSpec) UnmarshalJSON(data []byte) error {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(data, &members); err != nil {
 		return err
+	}
+	if rawJSONNull(members["restartable"]) {
+		return invalidJobSpecf("restartable must be a boolean; omit it for the default false")
 	}
 	*s = JobSpec(decoded)
 	_, s.publishedPortSet = members["published_port"]

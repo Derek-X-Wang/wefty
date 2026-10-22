@@ -54,6 +54,17 @@ var ServiceJobTransitions = map[JobState][]JobState{
 	JobStalledCleanupUnverified:   {},
 }
 
+// RestartableJobTransitions adds infrastructure recovery only for explicitly
+// restartable process one-shots. Terminal Jobs never resume.
+var RestartableJobTransitions = map[JobState][]JobState{
+	JobQueued:        {JobClaimed, JobFailed},
+	JobClaimed:       {JobRunning, JobQueued, JobFailed},
+	JobRunning:       {JobAwaitingInput, JobQueued, JobSucceeded, JobFailed},
+	JobAwaitingInput: {JobRunning, JobQueued, JobFailed},
+	JobSucceeded:     {},
+	JobFailed:        {},
+}
+
 type ServiceDesiredState string
 
 const (
@@ -71,15 +82,17 @@ const (
 	AttemptSucceeded     AttemptState = "succeeded"
 	AttemptFailed        AttemptState = "failed"
 	AttemptLost          AttemptState = "lost"
+	AttemptInterrupted   AttemptState = "interrupted"
 )
 
 var AttemptTransitions = map[AttemptState][]AttemptState{
-	AttemptClaimed:       {AttemptRunning, AttemptFailed, AttemptLost},
-	AttemptRunning:       {AttemptAwaitingInput, AttemptSucceeded, AttemptFailed, AttemptLost},
-	AttemptAwaitingInput: {AttemptRunning, AttemptFailed, AttemptLost},
+	AttemptClaimed:       {AttemptRunning, AttemptFailed, AttemptLost, AttemptInterrupted},
+	AttemptRunning:       {AttemptAwaitingInput, AttemptSucceeded, AttemptFailed, AttemptLost, AttemptInterrupted},
+	AttemptAwaitingInput: {AttemptRunning, AttemptFailed, AttemptLost, AttemptInterrupted},
 	AttemptSucceeded:     {},
 	AttemptFailed:        {},
 	AttemptLost:          {},
+	AttemptInterrupted:   {},
 }
 
 type NodeState string

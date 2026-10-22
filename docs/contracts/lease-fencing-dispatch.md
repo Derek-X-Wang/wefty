@@ -55,7 +55,8 @@ answer distinct questions; evidence provenance is not live authority:
 - **Accepted-completion replay (R):** original provenance, no standing removal,
   identical stored key and canonical body, an Attempt not `lost`, and either
   the current binding or, only when current is NULL, the retained replay
-  binding. Removal is checked before provenance; provenance and OCI completion
+  binding, or a terminal `interrupted` Attempt from accepted Restartable
+  one-shot recovery. Removal is checked before provenance; provenance and OCI completion
   phase are checked before expiry handling, key/body comparison, lost refusal
   and replay binding. Replay applies no completion or accounting effects.
   Computer revocation remains scoped to that exact Attempt and is re-driven
@@ -72,7 +73,8 @@ Detach causes keep their existing binding rules: queued Computer stop,
 Computer abort and image latch retain `COALESCE(current_attempt_id,
 completion_replay_attempt_id)`; accepted stopped Computer completion with
 quiescence evidence and pre-start requeue explicitly bind the completed
-Attempt. Storage destinations clear current without creating a replay binding
+Attempt. Storage destinations and lost Restartable one-shot recovery clear
+current without creating a replay binding
 and leave an existing replay binding untouched. Claim installs the successor
 and clears predecessor replay. Queued one-shot cancellation and exhausted
 pre-start budget clear current and leave replay untouched.
@@ -1414,3 +1416,60 @@ See [run-execution-context.md](run-execution-context.md#run-job-link) for reader
 rules and [L1 error and recovery boundary](run-execution-context.md#l1-error-and-recovery-boundary)
 for migration rules, and [state-machines.md](state-machines.md#run-cancellation-691)
 for cancellation delivery and the reason `canceled before dispatch was confirmed`.
+
+## Restartable one-shot interruption and durable recovery
+
+`restartable=true` is permission for L1 to start a fresh Attempt after
+infrastructure interruption. It is valid only for process one-shots and adds
+`oneshot:restartable` to persisted `RequiredCapabilities`. Omission is false.
+No capability advertisement, exec flag or upgrade-drain behavior is implied
+by the L1 protocol alone.
+
+A tagged Fabric client may request:
+
+`POST /v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt`
+
+The closed JSON body requires `job_id`, `boot_session_id`, `intent_revision`,
+`idempotency_key` (nonempty), and `reason="upgrade"`. For a new request, L1
+requires disabled claims, the exact current Node intent revision, current live
+Attempt authority under that Node registration, the named Job and boot session,
+a live Lease, and a Restartable process one-shot Job. A different Node, boot or
+Job never substitutes the Job's successor. Cancellation refuses new requests.
+Stale intent is `stale_intent_revision`; unsupported policy, enabled admission
+or terminal state is `conflict`; an expired Lease is settled through ordinary
+expiry and returns `lease_expired`.
+
+The request key, canonical body, reason and timestamp persist on the exact
+Attempt. An identical request replay is read-only, including after settlement
+or later intent changes, and returns HTTP 200 with `Idempotent-Replay: true`.
+A different request for that Attempt returns `idempotency_conflict`. The
+response is the current Job, with secrets redacted. The request is durable
+intent, not proof of runtime termination.
+
+Renewal delivers the existing `restart` directive together with
+`interruption_reason="upgrade"` and `interruption_request_key`. Cancellation
+has priority and omits these interruption fields. A successor receives no
+predecessor directive. The agent must positively terminate, reap and finalize
+before completing with `interruption_reason`, `interruption_request_key` and
+`runtime_quiescence_evidence="attempt"` or `"no_runtime_resources"`. Completion
+must report an agent/Guardian initiated signal, or an exit code with
+`termination_initiator=agent|guardian`. An independently acknowledged shutdown
+may instead report `interruption_reason="agent_shutdown"` without a request key.
+`lease_expired` is an L1-only reason, never accepted as completion intent.
+
+The payload's natural exit retains its normal verdict. Limits, preparation or
+runtime failures and resource exhaustion retain their ordinary terminal
+verdicts. Additive incomplete log evidence does not erase a proven interruption. Accepted controlled interruption ends only the
+Attempt as `interrupted`; the shared recovery decision queues its nonterminal
+Job with zero delay. Expiry ends the Attempt as `lost` and queues the same Job
+with persisted 1-second exponential backoff up to 60 seconds, with injected
+jitter. Cancellation takes precedence over either recovery path. The ten-restart
+budget and terminal scrubbing follow `state-machines.md`.
+
+Identical accepted `interrupted` completion replay requires original identity,
+path, fence and exact stored completion key/body. It remains acknowledgeable
+after a successor claim or Node re-registration. It writes nothing, grants no
+Attempt authority and never increments restart accounting. Other completion
+replay rules remain unchanged. Lost predecessor completion remains late evidence
+and cannot change the queued or successor Job. Prior-boot claim embargo, expiry
+boundaries, log provenance and latest-Attempt result fencing remain unchanged.

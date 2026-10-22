@@ -443,6 +443,7 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("GET /v1/nodes/{node_id}", s.getNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/drain", s.operatorDrainNode)
 	client.HandleFunc("POST /v1/nodes/{node_id}/claims", s.setNodeClaims)
+	client.HandleFunc("POST /v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt", s.interruptRestartableAttempt)
 
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST /v1/agent/nodes/register", s.registerNode)
