@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"slices"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -319,17 +321,15 @@ func TestComputerSubmissionChangeRepublishesSameAttemptDisplay(t *testing.T) {
 		// L1 shows the screen as soon as the publication commits, but
 		// publish:true is recorded only after SetAttemptPublication returns,
 		// and awaitScreen polls L1 every 20 ms, so it can win that race.
-		// Give the record its arrival under a 10 s watchdog before judging
-		// the order.
+		// Wait for the retained event before judging the order.
 		after := h.events.since(mark)
-		deadline := time.Now().Add(10 * time.Second)
-		for !slices.Contains(after, "publish:true") {
-			if time.Now().After(deadline) {
-				t.Fatalf("%s: publish:true was not recorded within 10s: %v", step.name, after)
-			}
-			time.Sleep(20 * time.Millisecond)
+		testwait.Until(t, step.name+": recorded publication", func() (bool, error) {
 			after = h.events.since(mark)
-		}
+			if slices.Contains(after, "publish:true") {
+				return true, nil
+			}
+			return false, fmt.Errorf("publication events = %v", after)
+		})
 		filesAt, publishAt := -1, -1
 		for index, event := range after {
 			if event == wantFiles {

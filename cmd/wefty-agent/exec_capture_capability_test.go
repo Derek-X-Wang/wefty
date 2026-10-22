@@ -10,6 +10,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -48,18 +49,14 @@ func TestDefaultAgentAdvertisesExecCaptureBundle(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- node.Run(ctx) }()
 	defer func() { cancel(); <-done }()
-	deadline := time.Now().Add(3 * time.Second)
-	for {
+	testwait.Until(t, "bundle node advertisement", func() (bool, error) {
 		record, e := store.GetNode(ctx, "bundle-node")
-		if e == nil {
-			if !record.Capabilities[contract.CapabilityExecCaptureBundle] {
-				t.Fatal("node-agent command omitted bundle capability from its L1 advertisement")
-			}
-			return
+		if e != nil {
+			return false, e
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("node did not advertise: %v", e)
+		if !record.Capabilities[contract.CapabilityExecCaptureBundle] {
+			t.Fatal("node-agent command omitted bundle capability from its L1 advertisement")
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return true, nil
+	})
 }

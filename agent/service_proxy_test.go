@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -381,13 +382,13 @@ func TestPortfulServiceThatWasServingStaysReapingAtTeardown(t *testing.T) {
 	for _, test := range portfulTeardownCases {
 		t.Run(test.kind+"/"+test.restart, func(t *testing.T) {
 			service := startPortfulTeardownService(t, test.kind, test.restart, true)
-			deadline := time.Now().Add(5 * time.Second)
-			for service.status().State != AttemptServing {
-				if time.Now().After(deadline) {
-					t.Fatalf("attempt state = %s, want serving once the service is ready", service.status().State)
+			testwait.Until(t, "ready service Serving", func() (bool, error) {
+				state := service.status().State
+				if state == AttemptServing {
+					return true, nil
 				}
-				time.Sleep(time.Millisecond)
-			}
+				return false, fmt.Errorf("attempt state = %s", state)
+			})
 			service.stop(t)
 			service.assertTornDown(t, true)
 		})
@@ -1159,14 +1160,13 @@ func assertPublishedEcho(t *testing.T, address string, wantForwarded bool) {
 
 func waitForPublishedEcho(t *testing.T, address string, wantForwarded bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if publishedEchoForwarded(address) == wantForwarded {
-			return
+	testwait.Until(t, fmt.Sprintf("published forwarding %t", wantForwarded), func() (bool, error) {
+		forwarded := publishedEchoForwarded(address)
+		if forwarded == wantForwarded {
+			return true, nil
 		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("published forwarding did not become %v", wantForwarded)
+		return false, fmt.Errorf("published forwarding = %t", forwarded)
+	})
 }
 
 func publishedEchoForwarded(address string) bool {

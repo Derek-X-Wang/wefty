@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -73,18 +74,14 @@ func TestOCIHandoffResultWithoutL3ThroughL1(t *testing.T) {
 			t.Errorf("agent Run: %v", err)
 		}
 	}()
-	deadline := time.Now().Add(5 * time.Second)
 	var result l1.JobResult
-	for {
+	testwait.Until(t, "L1 job result", func() (bool, error) {
 		err = submitter.request(t.Context(), http.MethodGet, "/v1/jobs/"+job.JobID+"/result", nil, &result)
 		if err == nil {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("L1 result unavailable: %v; agent=%+v", err, nodeAgent.Status())
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		return false, fmt.Errorf("result unavailable: %w; agent=%+v", err, nodeAgent.Status())
+	})
 	if string(result.Document) != `{"ok":true}` || result.SkipReason != "" || result.JobID != job.JobID || result.AttemptID == "" {
 		t.Fatalf("L1 result = %+v", result)
 	}

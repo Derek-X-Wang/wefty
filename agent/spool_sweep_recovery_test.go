@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -151,13 +152,12 @@ func advanceRecoveryDays(t *testing.T, driver *recoveryDriver, days int) {
 
 func waitForSpoolRowGone(t *testing.T, outbox *evidenceOutbox, attemptID string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for spoolRowExists(t, outbox.spool, attemptID) {
-		if time.Now().After(deadline) {
-			t.Fatalf("spool row %s was not swept", attemptID)
+	testwait.Until(t, "swept spool row "+attemptID, func() (bool, error) {
+		if !spoolRowExists(t, outbox.spool, attemptID) {
+			return true, nil
 		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("spool row %s still exists", attemptID)
+	})
 }
 
 // #52 S3 review P1: L1's late-evidence window runs from when L1 records the
