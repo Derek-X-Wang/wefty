@@ -81,8 +81,10 @@ budget, the Job becomes `failed`, with
 This terminal transition scrubs secrets in the same transaction.
 
 Acknowledged upgrade and shutdown interruptions have zero scheduling delay.
-Lease loss persists a jittered due time: 1 second, doubling for each successor
-restart number, capped at 60 seconds after jitter (minimum 1 second). The
+Lease loss persists an exponential due time: a 1-second base doubles for each
+successor restart number, then the jittered delay is clamped to 11–60 seconds.
+The minimum covers the default Guardian's 5-second TERM grace, 5-second reap
+bound and one second of scheduling margin, including with short Leases. The
 injected jitter is drawn once in the settlement transaction. Reconciliation,
 reopen and reads do not redraw it. Successful intervals do not reset the
 budget or backoff sequence. The Job response's `restart` object reports
@@ -811,6 +813,10 @@ display-name change cannot alter authority. On a Fabric reporting
 one bound opaque person-device ID from WhoIs. A current administrator may act
 only from that device. No display value or network hostname determines authority.
 The person remains the membership key; the device binding limits its use.
+Authenticated Server construction enables a one-way device-binding requirement
+on its Store. Store decisions enforce it even with a bare background context;
+later Server construction cannot disable it. A Store opened only for offline
+bootstrap, reset, or rebind retains its existing behavior.
 
 A Fabric identity also records whether the peer is a machine principal.
 Machine principals, including identities carrying configured client or agent
@@ -943,7 +949,9 @@ and cannot regress its installed revision.
 
 On authenticated person trust, both heartbeat and watch snapshots carry
 `admin_device_required: true` and each administrator's bound `device_id`.
-L1 derives the requirement from its Fabric trust, never request data. A missing
+L1 derives the requirement from its Store's one-way Fabric-trust latch, never
+from request data or the presence of a request-context flag. Direct Store
+issuance with a background context carries the same requirement. A missing
 legacy binding remains empty. The shared admission evaluator gives a rostered
 administrator on a different or unbound device `none` for all Computer access,
 with no administrator capability and no fallback to an explicit person grant.

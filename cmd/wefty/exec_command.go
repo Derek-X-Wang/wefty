@@ -57,6 +57,7 @@ type execParams struct {
 	execCapture
 	Argv        []string `json:"argv"`
 	ExecVersion int      `json:"exec_version,omitempty"`
+	Restartable bool     `json:"restartable,omitempty"`
 }
 
 func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
@@ -65,15 +66,16 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	var tags stringListFlag
 	var maxRuntime time.Duration
 	var targetNode string
-	var keepRunning, detach bool
+	var keepRunning, detach, restartable bool
 	flags.BoolVar(&keepRunning, "keep-running", false, "stopping ends only watching; the run continues")
+	flags.BoolVar(&restartable, "restartable", false, "restart interrupted commands from the same frozen inputs (up to ten restarts)")
 	flags.BoolVar(&detach, "detach", false, "return the run ID after acceptance without watching")
 	flags.BoolVar(&jsonOutput, "json", jsonOutput, "stream one JSON event per line")
 	flags.StringVar(&targetNode, "node", "", "run on this owned Node ID (default: this machine)")
 	flags.Var(&tags, "tag", "additional tag that narrows the selected node's Pinned run (repeatable)")
-	flags.DurationVar(&maxRuntime, "max-runtime", 0, "optional runtime cap (no cap by default)")
+	flags.DurationVar(&maxRuntime, "max-runtime", 0, "optional per-Attempt runtime cap (no cap by default)")
 	flags.Usage = func() {
-		fmt.Fprintln(flags.Output(), "Usage: wefty exec [--tag TAG] [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>\nFreeze the checkout and local changes; run on this machine's node by default. Use --node NODE for another owned node.\nStream output; exit 0 on pass or 10 on failure. Stopping cancels the run unless --keep-running is set.")
+		fmt.Fprintln(flags.Output(), "Usage: wefty exec [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>\nFreeze the checkout and local changes; run on this machine's node by default. Use --node NODE for another owned node.\nStream output; exit 0 on pass, 10 on command failure, or 13 for unavailable evidence/restart limit. Stopping cancels the run unless --keep-running is set.")
 		flags.PrintDefaults()
 	}
 	if err := parseCommandFlags(flags, args, false); err != nil {
@@ -81,7 +83,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	separator := len(args) - flags.NArg() - 1
 	if separator < 0 || flags.NArg() == 0 || args[separator] != "--" {
-		return usageError("usage: wefty exec [--node NODE] [--tag TAG] [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>")
+		return usageError("usage: wefty exec [--node NODE] [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>")
 	}
 	if keepRunning && detach {
 		return usageError("--keep-running and --detach are alternatives")
@@ -125,6 +127,9 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	if err != nil {
 		return err
 	}
+	if restartable && !node.Capabilities[l1.CapabilityOneshotRestartable] {
+		return &apiResponseError{Service: "L1", StatusCode: http.StatusConflict, APIError: contract.APIError{Code: contract.ErrorConflict, Retryable: true, Message: fmt.Sprintf("node %q needs an upgrade before restartable exec (missing %s)", node.NodeID, l1.CapabilityOneshotRestartable)}}
+	}
 	carried := l1NormalizedTags(node.AuthoritativeTags)
 	var missing []string
 	for _, tag := range l1NormalizedTags(tags) {
@@ -154,14 +159,14 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return err
 	}
 	execVersion := 1
-	if crossNode {
+	if crossNode || restartable {
 		capture, err = uploadExecBundle(ctx, clients, capture)
 		if err != nil {
 			return errorsWithCleanup(err, capture.Storage)
 		}
 		execVersion = 2
 	}
-	params, err := json.Marshal(execParams{execCapture: capture, Argv: argv, ExecVersion: execVersion})
+	params, err := json.Marshal(execParams{execCapture: capture, Argv: argv, ExecVersion: execVersion, Restartable: restartable})
 	if err != nil {
 		return errorsWithCleanup(err, capture.Storage)
 	}
@@ -173,7 +178,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return errorsWithCleanup(err, capture.Storage)
 	}
 	script := buildExecWrapper(capture, argv)
-	if crossNode {
+	if crossNode || restartable {
 		script, err = buildExecBundleWrapper(capture, argv)
 		if err != nil {
 			return errorsWithCleanup(err, capture.Storage)
@@ -181,7 +186,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	digest := sha256.Sum256([]byte(script))
 	mode := uint32(0700)
-	request := l3.CreateRunRequest{Params: params, Tags: resolvedTags, InlineScript: &l3.InlineScriptInput{Content: script, SHA256: hex.EncodeToString(digest[:]), Interpreter: []string{"/bin/bash"}, Mode: &mode}}
+	request := l3.CreateRunRequest{Restartable: restartable, Params: params, Tags: resolvedTags, InlineScript: &l3.InlineScriptInput{Content: script, SHA256: hex.EncodeToString(digest[:]), Interpreter: []string{"/bin/bash"}, Mode: &mode}}
 	if seconds > 0 {
 		request.Limits = &contract.RunLimits{MaxRuntimeSeconds: seconds}
 	}

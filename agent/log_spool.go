@@ -1168,6 +1168,8 @@ ORDER BY a.created_ns, a.attempt_id`)
 }
 
 type durableCompletion struct {
+	InterruptionReason        l1.InterruptionReason        `json:"interruption_reason,omitempty"`
+	InterruptionRequestKey    string                       `json:"interruption_request_key,omitempty"`
 	Result                    l1.ProcessResult             `json:"result"`
 	RuntimeQuiescenceEvidence l1.RuntimeQuiescenceEvidence `json:"runtime_quiescence_evidence,omitempty"`
 	// TerminationInitiator is replayed with the result so a completion
@@ -1181,6 +1183,7 @@ func durableCompletionOf(request l1.CompletionRequest) durableCompletion {
 	return durableCompletion{
 		Result: request.Result, RuntimeQuiescenceEvidence: request.RuntimeQuiescenceEvidence,
 		TerminationInitiator: request.TerminationInitiator,
+		InterruptionReason:   request.InterruptionReason, InterruptionRequestKey: request.InterruptionRequestKey,
 	}
 }
 

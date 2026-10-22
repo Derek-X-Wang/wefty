@@ -93,10 +93,16 @@ func (runner *Runner) runGuarded(
 		result.LogEvidenceIncomplete = true
 		return result, errors.Join(err, ErrGuardianLost)
 	}
-	stopGuardian := func() {
+	stopGuardian := func(cause error) {
+		if request.StopInitiated != nil {
+			request.StopInitiated(cause)
+		}
 		_ = json.NewEncoder(agentEndpoint).Encode(guardianControlMessage{Type: guardianMessageStop})
 	}
 	failGuardian := func(err error) (contract.ProcessResult, error) {
+		if request.StopInitiated != nil {
+			request.StopInitiated(err)
+		}
 		_ = agentEndpoint.Close()
 		cancelOutput()
 		select {
@@ -137,7 +143,7 @@ func (runner *Runner) runGuarded(
 	}
 	if request.ProcessStarted != nil {
 		if err := request.ProcessStarted(started.ProcessGroupID); err != nil {
-			stopGuardian()
+			stopGuardian(err)
 			return failGuardian(fmt.Errorf("persist guardian started group: %w", err))
 		}
 	}
@@ -248,7 +254,7 @@ func (runner *Runner) runGuarded(
 			if remaining <= 0 {
 				supervisionErr = ErrIdleTimeout
 				stopping = true
-				stopGuardian()
+				stopGuardian(supervisionErr)
 				continue
 			}
 			resetTimer(idleTimer, remaining)
@@ -264,7 +270,7 @@ func (runner *Runner) runGuarded(
 			}
 			supervisionErr = ErrIdleTimeout
 			stopping = true
-			stopGuardian()
+			stopGuardian(supervisionErr)
 
 		case <-completionSignal:
 			completionSignal = nil
@@ -278,28 +284,28 @@ func (runner *Runner) runGuarded(
 			if !stopping {
 				supervisionErr = ErrCompletionTimeout
 				stopping = true
-				stopGuardian()
+				stopGuardian(supervisionErr)
 			}
 
 		case <-maxRuntimeChannel:
 			if !stopping {
 				supervisionErr = ErrMaxRuntime
 				stopping = true
-				stopGuardian()
+				stopGuardian(supervisionErr)
 			}
 
 		case <-failure.Changed():
 			if !stopping {
 				supervisionErr = fmt.Errorf("output sink: %w", failure.Err())
 				stopping = true
-				stopGuardian()
+				stopGuardian(supervisionErr)
 			}
 
 		case <-ctx.Done():
 			if !stopping {
 				supervisionErr = ctx.Err()
 				stopping = true
-				stopGuardian()
+				stopGuardian(supervisionErr)
 			}
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -133,8 +134,10 @@ type attemptLifecycle struct {
 	// mailbox is this attempt's run mailbox, published by the workload path and
 	// read by the authority and completion paths. One lifecycle owns one
 	// attempt, so a single slot is the whole lifetime.
-	mailbox    atomic.Pointer[runMailbox]
-	fenceCause atomic.Pointer[error]
+	mailbox      atomic.Pointer[runMailbox]
+	fenceCause   atomic.Pointer[error]
+	interruption atomic.Pointer[restartInterruption]
+	completion   atomic.Pointer[l1.CompletionRequest]
 	// resultsRetained latches the one retention this attempt performs. The
 	// completion path records the real verdict; every other exit -- an
 	// authority loss, a cancelled context, a completion that never landed --
@@ -556,7 +559,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 		outcome.durabilityErr = lifecycle.dependencies.outbox.storeDurableCompletion(
 			context.WithoutCancel(attemptContext), attemptID,
-			durableCompletionOf(completionRequest(claim, outcome.result, outcome.reapEvidence)), lifecycle.dependencies.clock.Now(),
+			durableCompletionOf(lifecycle.deliveryCompletionRequest(claim, outcome.result, outcome.reapEvidence)), lifecycle.dependencies.clock.Now(),
 		)
 		return outcome.durabilityErr
 	}
@@ -565,6 +568,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	case <-ctx.Done():
 		cause := context.Cause(ctx)
 		lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, cause)
+		if claim.Job.Spec.Restartable {
+			lifecycle.fenceCause.CompareAndSwap(nil, &cause)
+		}
 		cancelExecution()
 		cancelAttempt(cause)
 		if errors.Is(cause, errServiceRemovalRequested) {
@@ -603,7 +609,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			cancelRecovery()
 			failure.destination = classifyAgentProtocolError(failure.err).destination
 		case completionRouteLive:
-			request := completionRequest(claim, result, outcome.reapEvidence)
+			request := lifecycle.deliveryCompletionRequest(claim, result, outcome.reapEvidence)
 			finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 			defer cancelFinalization()
 			failure = lifecycle.completeWithRetry(finalizationContext, claim, request)
@@ -627,6 +633,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	case failure := <-renewalErrors:
 		if errors.Is(failure.err, errAttemptDirectiveCancel) || errors.Is(failure.err, errAttemptDirectiveStop) || errors.Is(failure.err, errAttemptDirectiveRestart) {
 			lifecycle.dependencies.observer.setAttempt(attemptID, AttemptReaping, failure.err)
+			if claim.Job.Spec.Restartable {
+				lifecycle.fenceCause.CompareAndSwap(nil, &failure.err)
+			}
 			cancelExecution()
 			cancelAttempt(failure.err)
 			outcome := <-completed
@@ -648,7 +657,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 				cancelRecovery()
 				completionFailure.destination = classifyAgentProtocolError(completionFailure.err).destination
 			case completionRouteLive:
-				request := completionRequest(claim, result, outcome.reapEvidence)
+				request := lifecycle.deliveryCompletionRequest(claim, result, outcome.reapEvidence)
 				finalizationContext, cancelFinalization := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
 				defer cancelFinalization()
 				completionFailure = lifecycle.completeWithRetry(finalizationContext, claim, request)
@@ -751,7 +760,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		}
 		return lifecycle.finishCompletedAttempt(ctx, claim, outcome.result, outcome.err)
 	}
-	request := completionRequest(claim, outcome.result, outcome.reapEvidence)
+	request := lifecycle.deliveryCompletionRequest(claim, outcome.result, outcome.reapEvidence)
 	completionDone := make(chan destinationError, 1)
 	completionContext := attemptContext
 	if cause := context.Cause(attemptContext); errors.Is(cause, errAttemptDirectiveCancel) || errors.Is(cause, errAttemptDirectiveStop) || errors.Is(cause, errAttemptDirectiveRestart) ||
@@ -1216,9 +1225,13 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return nil
 		}
 	}
-	if claim.Job.Spec.Class == contract.JobClassService {
+	if claim.Job.Spec.Class == contract.JobClassService || claim.Job.Spec.Restartable {
+		request.RequireGuardian = claim.Job.Spec.Restartable
 		request.LifetimeBoundary = workloadrunner.AgentBootLifetime
 		request.TerminationGrace = processrunner.DefaultTerminationGraceTime
+	}
+	if claim.Job.Spec.Restartable {
+		request.StopInitiated = lifecycle.fenceMailbox
 	}
 	portfulService := claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.PublishedPort != nil
 	computerService := claim.Job.Spec.Kind == contract.JobKindOCI && claim.Job.Spec.Class == contract.JobClassService &&
@@ -1340,6 +1353,13 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	var mailbox *runMailbox
 	var handoffReader handoffFileReader
 	finish := func(result contract.ProcessResult, runErr error) (contract.ProcessResult, error) {
+		if claim.Job.Spec.Restartable && runErr != nil {
+			lifecycle.fenceMailbox(runErr)
+			cause := lifecycle.fenceCause.Load()
+			if cause != nil && !controlledRestartCause(*cause) && agentInitiatedProcessStop(result) && result.SpawnError == nil && result.RuntimeFailure == nil && result.LimitReached == "" {
+				result = contract.ProcessResult{OutputError: runErr.Error(), LogEvidenceIncomplete: result.LogEvidenceIncomplete}
+			}
+		}
 		// No renewal may cross the terminal/reap boundary. Closing before
 		// ReapAndVerify also discards a pre-admission renewal when Started
 		// validation failed and the helper is withdrawing the attempt.
@@ -1430,9 +1450,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if lifecycle.dependencies.runtimeReaped != nil {
 			lifecycle.dependencies.runtimeReaped(claim.Job.JobID, reapReceipt, reapErr)
 		}
-		// The workload is quiesced here and the handoff directory still
-		// exists: this is the only point at which every event it wrote can be
-		// published. finishCompletedAttempt may remove the directory once this
+		// The runtime's reap has returned and the handoff directory still
+		// exists. For process jobs a successful receipt proves group absence, not
+		// containment of descendants that left the group. Drain this Attempt's
+		// available events now. finishCompletedAttempt may remove the directory once this
 		// returns, so the final sweep is not optional and not asynchronous. A
 		// mailbox read through the runtime has already drained above, while its
 		// attempt was still live.
@@ -1443,8 +1464,11 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			reapErr = fmt.Errorf("reap and verify workload runtime: %w", reapErr)
 		}
 		var outputErr error
+		if interruption := lifecycle.restartCompletionRequest(claim, result, reapReceipt.Evidence); reapErr == nil && interruption.InterruptionReason != "" && redactingSink != nil {
+			outputErr = redactingSink.WriteOutput(finalizationContext, contract.LogEvent{AttemptID: claim.Lease.AttemptID, Stream: contract.LogStderr, Timestamp: lifecycle.dependencies.clock.Now(), Bytes: []byte(fmt.Sprintf("wefty: attempt %s interrupted; restart pending (reason=%s)\n", claim.Lease.AttemptID, interruption.InterruptionReason))})
+		}
 		if redactingSink != nil {
-			outputErr = redactingSink.Flush(finalizationContext)
+			outputErr = errors.Join(outputErr, redactingSink.Flush(finalizationContext))
 		}
 		var uploadErr error
 		if uploader != nil {
@@ -1643,6 +1667,14 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
 	}
+	if claim.Job.Spec.Restartable && lifecycle.dependencies.handoffs != nil {
+		if err := prepareRestartableResults(claim.Job.Spec, claim.Lease.AttemptID); err != nil {
+			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
+		}
+		executionSpec.Env = cloneEnvironment(executionSpec.Env)
+		directory := filepath.Join(claim.Job.Spec.Execution.HandoffDirectory, restartableResultPath(claim.Lease.AttemptID))
+		executionSpec.Env[contract.EnvHandoffDir] = directory
+	}
 	// The run mailbox is prepared before the workload starts, so a job that
 	// writes its first event immediately has somewhere to write it. Mailbox
 	// reporting does not require or use the workload's credential, which is
@@ -1814,8 +1846,16 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	// moment a credential stops travelling in the job environment.
 	redactingSink = newRedactingOutputSink(sink, executionSpec.SensitiveEnv,
 		append(mailbox.secrets(), withheldCredentials...)...)
+	if claim.Job.Spec.Restartable && redactingSink == nil && sink != nil {
+		redactingSink = &redactingOutputSink{sink: sink, streams: make(map[contract.LogStream]*redactionStream)}
+	}
 	if redactingSink != nil {
 		sink = redactingSink
+	}
+	if facts := claim.Job.RestartRecovery; claim.Job.Spec.Restartable && facts != nil && facts.Count > 0 && facts.PreviousAttemptID != nil && facts.LastReason != nil && sink != nil {
+		if err := sink.WriteOutput(ctx, contract.LogEvent{AttemptID: claim.Lease.AttemptID, Stream: contract.LogStderr, Timestamp: lifecycle.dependencies.clock.Now(), Bytes: []byte(fmt.Sprintf("wefty: restart %d/10 attempt=%s previous_attempt=%s reason=%s\n", facts.Count, claim.Lease.AttemptID, *facts.PreviousAttemptID, *facts.LastReason))}); err != nil {
+			return finish(spawnFailure(contract.SpawnFailureLogSinkSetup, err), err)
+		}
 	}
 	if mailbox != nil && !mailbox.readsThroughRuntime() {
 		// A mailbox this process opened can be swept immediately: the
@@ -2362,6 +2402,13 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 			return
 		}
 		if updated.Directive == l1.AttemptDirectiveRestart {
+			if claim.Job.Spec.Restartable {
+				if updated.AttemptID != claim.Lease.AttemptID || updated.FencingToken != claim.Lease.FencingToken || updated.InterruptionReason != l1.InterruptionUpgrade || updated.InterruptionRequestKey == "" {
+					returnWithDirective(failures, errors.New("invalid restartable interruption directive"))
+					return
+				}
+				lifecycle.interruption.CompareAndSwap(nil, &restartInterruption{reason: updated.InterruptionReason, key: updated.InterruptionRequestKey})
+			}
 			deadmanAdmission.terminate()
 			returnWithDirective(failures, errAttemptDirectiveRestart)
 			return

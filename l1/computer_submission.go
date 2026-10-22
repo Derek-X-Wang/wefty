@@ -131,7 +131,7 @@ func (s *Store) GetComputerSubmissionState(ctx context.Context, identity fabric.
 }
 
 func (r *databaseReads) computerViewGetComputerSubmissionState(ctx context.Context, identity fabric.Identity, computerID string) (ComputerSubmissionState, error) {
-	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
+	if err := r.personDeviceBinding.requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerSubmissionState{}, err
 	}
 	computer, err := r.computerViewGetComputer(ctx, computerID)
@@ -221,7 +221,7 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 	}
 	tx := write.tx
 	defer write.rollback()
-	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
+	if err := s.personDeviceBinding.requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return Computer{}, false, false, err
 	}
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)

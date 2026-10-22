@@ -436,6 +436,24 @@ func humanRunStatus(status contract.RunState, cancelStatus string) string {
 }
 
 func writeRunInspection(writer io.Writer, inspection runInspection) error {
+	if facts := inspection.Restart; facts != nil {
+		pending := "no"
+		if facts.Pending {
+			pending = "yes"
+		}
+		if _, err := fmt.Fprintf(writer, "restartable: yes; restarts: %d/%d; restart pending: %s", facts.Count, facts.Limit, pending); err != nil {
+			return err
+		}
+		if facts.LastReason != nil {
+			if _, err := fmt.Fprintf(writer, "; last reason: %s", *facts.LastReason); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintln(writer); err != nil {
+			return err
+		}
+	}
+
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
 	// Dispatch authority is shown because it is the one column that says
 	// whether the workload held a credential, and "-" keeps the ordinary run
@@ -553,11 +571,11 @@ func writeRunExecution(writer io.Writer, execution l3.RunExecution) error {
 	if _, err := fmt.Fprintf(table, "%s\t%s\t%s\n", execution.Job.State, execution.Job.NodeID, execution.Job.CurrentAttemptID); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintln(table, "ATTEMPT ID\tNODE\tSTATE / EVIDENCE"); err != nil {
+	if _, err := fmt.Fprintln(table, "ATTEMPT ID\tNODE\tSTATE\tINTERRUPTION REASON\tEVIDENCE"); err != nil {
 		return err
 	}
 	for _, attempt := range execution.Job.Attempts {
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\n", attempt.AttemptID, attempt.NodeID, formatAttemptEvidence(attempt)); err != nil {
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\n", attempt.AttemptID, attempt.NodeID, attempt.State, attempt.InterruptionReason, formatAttemptEvidence(attempt)); err != nil {
 			return err
 		}
 	}

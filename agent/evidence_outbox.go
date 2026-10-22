@@ -721,6 +721,7 @@ func (outbox *evidenceOutbox) recoverCompletion(ctx context.Context, client *Cli
 		FencingToken: attempt.fencingToken, IdempotencyKey: "completion:" + attempt.attemptID,
 		Result: completion.Result, RuntimeQuiescenceEvidence: completion.RuntimeQuiescenceEvidence,
 		TerminationInitiator: completion.TerminationInitiator,
+		InterruptionReason:   completion.InterruptionReason, InterruptionRequestKey: completion.InterruptionRequestKey,
 	}
 	verdict := outbox.deliverCompletion(ctx, client, attempt, request, completionDeliveryReplay)
 	switch verdict.kind {

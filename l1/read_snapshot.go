@@ -91,19 +91,20 @@ type readModel interface {
 // databaseReads is private SQL plumbing; callers see only readModel.
 // A write gets a fresh memo at each decision, never across writes.
 type databaseReads struct {
-	pageDeadline    time.Time
-	q               queryer
-	at              time.Time
-	actor           *serviceActionActor
-	reads           *serviceOperatorReads
-	nodeIDs         []string
-	placements      map[string]placementRead
-	requirements    map[string]placementRequirements
-	occupancy       map[string]int
-	occupancyLoaded bool
-	occupancyErr    error
-	nodesLoaded     bool
-	nodesErr        error
+	personDeviceBinding *personDeviceBinding
+	pageDeadline        time.Time
+	q                   queryer
+	at                  time.Time
+	actor               *serviceActionActor
+	reads               *serviceOperatorReads
+	nodeIDs             []string
+	placements          map[string]placementRead
+	requirements        map[string]placementRequirements
+	occupancy           map[string]int
+	occupancyLoaded     bool
+	occupancyErr        error
+	nodesLoaded         bool
+	nodesErr            error
 }
 type nodeRead struct {
 	value Node
@@ -386,7 +387,7 @@ func (r *databaseReads) adminPolicyRevision(ctx context.Context) (int64, error) 
 	return revision, nil
 }
 func (r *databaseReads) currentAdmin(ctx context.Context, identity fabric.Identity) error {
-	return requireCurrentAdmin(ctx, r.q, identity)
+	return r.personDeviceBinding.requireCurrentAdmin(ctx, r.q, identity)
 }
 func (r *databaseReads) adminAuditPage(ctx context.Context, afterRevision int64, limit int) (AdminPolicyAuditList, error) {
 	page := AdminPolicyAuditList{Entries: []AdminPolicyAudit{}}
@@ -533,6 +534,7 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 		return err
 	}
 	reads := newDatabaseReads(tx, canonicalTime(s.clock.Now()), caller)
+	reads.personDeviceBinding = &s.personDeviceBinding
 	cutoff := readSnapshotPageCutoff
 	if override, ok := ctx.Value(readPageCutoffContextKey{}).(time.Duration); ok {
 		cutoff = override
@@ -596,9 +598,10 @@ func projectJobWithReads(ctx context.Context, reads readModel, job Job, parts jo
 // writeTransaction keeps mutation authority and one pinned clock. Each
 // decision gets a new read set, so earlier decisions cannot hide later writes.
 type writeTransaction struct {
-	tx    *sql.Tx
-	at    time.Time
-	actor *serviceActionActor
+	personDeviceBinding *personDeviceBinding
+	tx                  *sql.Tx
+	at                  time.Time
+	actor               *serviceActionActor
 }
 
 // A caller that already sampled its write clock supplies it here. This keeps
@@ -617,7 +620,7 @@ func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceAction
 	} else {
 		at = canonicalTime(s.clock.Now())
 	}
-	return &writeTransaction{tx: tx, at: at, actor: caller}, nil
+	return &writeTransaction{tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
 }
 
 // beginSettlementWriteTransaction is the write door for heartbeat revocation
@@ -637,12 +640,13 @@ func (s *Store) beginSettlementWriteTransaction(ctx context.Context, caller *ser
 	} else {
 		at = canonicalTime(s.clock.Now())
 	}
-	return &writeTransaction{tx: tx, at: at, actor: caller}, nil
+	return &writeTransaction{tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
 }
 
 func (w *writeTransaction) decisionReads() readModel {
 	reads := transactionReads(w.tx, w.at).(*databaseReads)
 	reads.actor = w.actor
+	reads.personDeviceBinding = w.personDeviceBinding
 	return reads
 }
 func (w *writeTransaction) commit() error   { return w.tx.Commit() }

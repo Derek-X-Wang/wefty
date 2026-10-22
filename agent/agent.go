@@ -261,7 +261,13 @@ func New(config Config) (*Agent, error) {
 		OS:            osName,
 		Architecture:  architecture,
 		AgentVersion:  config.Version,
-		Capabilities:  cloneCapabilities(config.Capabilities),
+		Capabilities:  normalizeConfiguredCapabilities(config.Capabilities),
+	}
+	processRuntime, _ := runtimes.selectKind(contract.JobKindProcess)
+	guardian, guardianOK := processRuntime.(interface{ GuardianAvailable() bool })
+	delete(registration.Capabilities, l1.CapabilityOneshotRestartable)
+	if guardianOK && guardian.GuardianAvailable() && registration.Capabilities["kind:process"] && registration.Capabilities[contract.CapabilityExecCaptureBundle] {
+		registration.Capabilities[l1.CapabilityOneshotRestartable] = true
 	}
 	if managedResource != nil {
 		registration.RootInstanceID = managedResource.rootInstanceID()
@@ -358,7 +364,7 @@ func New(config Config) (*Agent, error) {
 		client.Close()
 		return nil, err
 	}
-	capabilities := newCapabilityState(config.Capabilities, config.CapabilityProbe, clock, config.CapabilityProbeTimeout, revisionFloor)
+	capabilities := newCapabilityState(registration.Capabilities, config.CapabilityProbe, clock, config.CapabilityProbeTimeout, revisionFloor)
 	registration = applyCapabilityObservation(registration, capabilities.snapshot())
 	session := newAgentSession(
 		client, registration, capabilities, heartbeatInterval, claimInterval, clock, observer, logf,

@@ -134,6 +134,7 @@ const runTableSchema = `CREATE TABLE IF NOT EXISTS runs (
   envelope_schema_json BLOB,
   required_envelope INTEGER NOT NULL DEFAULT 0,
   dispatch_authority INTEGER NOT NULL DEFAULT 0,
+  restartable INTEGER NOT NULL DEFAULT 0,
   l1_job_id TEXT,
   node_id TEXT,
   failure_reason TEXT,
@@ -377,6 +378,9 @@ BEFORE DELETE ON protocol_rejections BEGIN SELECT RAISE(ABORT, 'protocol rejecti
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l3: apply SQLite schema: %w", err)
+	}
+	if err := ensureSQLiteColumn(ctx, s.db, "runs", "restartable", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return fmt.Errorf("l3: migrate run restartable policy: %w", err)
 	}
 	for _, column := range []struct{ name, definition string }{
 		{"failures", "INTEGER NOT NULL DEFAULT 0"},
@@ -885,10 +889,10 @@ func (s *Store) CreateRun(ctx context.Context, input CreateRunInput) (record con
 		limitsJSON, _ = json.Marshal(input.Request.Limits)
 	}
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO runs(run_id, parent_run_id, dispatch_key, actor, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, dispatch_authority, created_ns, updated_ns)
-VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.Request.ParentRunID, dispatchKey, input.Actor, input.IdempotencyKey, requestHash,
+INSERT INTO runs(run_id, parent_run_id, dispatch_key, actor, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, dispatch_authority, restartable, created_ns, updated_ns)
+VALUES(?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, input.Request.ParentRunID, dispatchKey, input.Actor, input.IdempotencyKey, requestHash,
 		contract.RunPending, []byte(input.Request.Params), tagsJSON, nullableBytes(limitsJSON), nullableBytes(input.Request.EnvelopeSchema), input.Request.RequiredEnvelope,
-		input.Request.DispatchAuthority, now.UnixNano(), now.UnixNano())
+		input.Request.DispatchAuthority, input.Request.Restartable, now.UnixNano(), now.UnixNano())
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store run")
 	}
@@ -1014,7 +1018,7 @@ func (s *Store) CreateRerun(ctx context.Context, input CreateRerunInput) (record
 	}
 
 	var paramsJSON, tagsJSON, limitsJSON, envelopeSchemaJSON []byte
-	var requiredEnvelope, dispatchAuthority bool
+	var requiredEnvelope, dispatchAuthority, restartable bool
 	var snapshot workflowSnapshot
 	var content, interpreterJSON, imageJSON []byte
 	var sha sql.NullString
@@ -1028,12 +1032,12 @@ func (s *Store) CreateRerun(ctx context.Context, input CreateRerunInput) (record
 		sourceAttempt string
 	}
 	err = tx.QueryRowContext(ctx, `
-SELECT r.params_json, r.tags_json, r.limits_json, r.envelope_schema_json, r.required_envelope, r.dispatch_authority,
+SELECT r.params_json, r.tags_json, r.limits_json, r.envelope_schema_json, r.required_envelope, r.dispatch_authority, r.restartable,
        s.content, s.sha256, s.interpreter_json, s.mode, i.program_json, w.workflow_ref
 FROM runs r LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
-WHERE r.run_id=?`, input.SourceRunID).Scan(&paramsJSON, &tagsJSON, &limitsJSON, &envelopeSchemaJSON, &requiredEnvelope, &dispatchAuthority,
+WHERE r.run_id=?`, input.SourceRunID).Scan(&paramsJSON, &tagsJSON, &limitsJSON, &envelopeSchemaJSON, &requiredEnvelope, &dispatchAuthority, &restartable,
 		&content, &sha, &interpreterJSON, &mode, &imageJSON, &workflowRef)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, false, protocolError(contract.ErrorNotFound, "run %q was not found", input.SourceRunID)
@@ -1091,9 +1095,9 @@ WHERE r.run_id=?`, input.SourceRunID).Scan(&paramsJSON, &tagsJSON, &limitsJSON, 
 	dispatchKey := "run:" + runID
 	now := canonicalTime(s.clock.Now())
 	_, err = tx.ExecContext(ctx, `
-INSERT INTO runs(run_id, parent_run_id, dispatch_key, actor, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, dispatch_authority, created_ns, updated_ns)
-VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, dispatchKey, input.Actor, input.IdempotencyKey, requestHash, contract.RunPending,
-		paramsJSON, tagsJSON, nullableBytes(limitsJSON), nullableBytes(envelopeSchemaJSON), requiredEnvelope, dispatchAuthority, now.UnixNano(), now.UnixNano())
+INSERT INTO runs(run_id, parent_run_id, dispatch_key, actor, idempotency_key, request_hash, status, params_json, tags_json, limits_json, envelope_schema_json, required_envelope, dispatch_authority, restartable, created_ns, updated_ns)
+VALUES(?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, runID, dispatchKey, input.Actor, input.IdempotencyKey, requestHash, contract.RunPending,
+		paramsJSON, tagsJSON, nullableBytes(limitsJSON), nullableBytes(envelopeSchemaJSON), requiredEnvelope, dispatchAuthority, restartable, now.UnixNano(), now.UnixNano())
 	if err != nil {
 		return contract.RunRecord{}, false, internalError(err, "store rerun")
 	}
@@ -1382,7 +1386,7 @@ func (s *Store) GetRun(ctx context.Context, runID string) (contract.RunRecord, e
 	var startedNS, finishedNS sql.NullInt64
 	err = tx.QueryRowContext(ctx, `
 SELECT r.run_id, r.parent_run_id, r.node_id, r.failure_reason, r.dispatch_key, r.status, r.params_json, r.tags_json, r.limits_json,
-       r.dispatch_authority, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
+       r.dispatch_authority, r.restartable, r.created_ns, r.updated_ns, r.started_ns, r.finished_ns,
 	       s.content, s.sha256, i.program_json, w.workflow_ref, t.actor, t.source, t.source_run_id,
 	       t.computer_id, t.computer_attempt_id, t.computer_storage_generation, t.submit_intent_revision
 FROM runs r LEFT JOIN run_scripts s ON s.run_id=r.run_id
@@ -1390,7 +1394,7 @@ LEFT JOIN run_images i ON i.run_id=r.run_id
 LEFT JOIN run_workflow_refs w ON w.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
 WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &nodeID, &failureReason, &record.DispatchKey, &record.Status, &paramsJSON, &tagsJSON, &limitsJSON,
-		&record.DispatchAuthority, &createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &imageJSON, &workflowRef, &actor, &source, &sourceRun,
+		&record.DispatchAuthority, &record.Restartable, &createdNS, &updatedNS, &startedNS, &finishedNS, &content, &sha, &imageJSON, &workflowRef, &actor, &source, &sourceRun,
 		&computerID, &computerAttemptID, &computerStorageGeneration, &submitIntentRevision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return contract.RunRecord{}, protocolError(contract.ErrorNotFound, "run %q was not found", runID)
@@ -2211,6 +2215,7 @@ func (intent dispatchIntent) jobSpec(runToken string) contract.JobSpec {
 		SchemaVersion: contract.SchemaVersionV1,
 		DispatchKey:   intent.DispatchKey,
 		Kind:          contract.JobKindProcess,
+		Restartable:   intent.Restartable,
 		Class:         contract.JobClassOneShot,
 		RoutingTags:   append([]string(nil), intent.Tags...),
 		Execution: contract.ExecutionSpec{

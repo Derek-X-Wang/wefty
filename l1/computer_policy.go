@@ -301,7 +301,7 @@ func (s *Store) MutateComputerGrant(ctx context.Context, identity fabric.Identit
 	}
 	tx := write.tx
 	defer write.rollback()
-	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
+	if err := s.personDeviceBinding.requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return ComputerGrantMutationResult{}, err
 	}
 	if request.delete && request.FabricID == identity.FabricID {
@@ -466,7 +466,7 @@ func (s *Store) ListComputerGrants(ctx context.Context, identity fabric.Identity
 }
 
 func (r *databaseReads) computerViewListComputerGrants(ctx context.Context, identity fabric.Identity, computerID string) (ComputerGrantList, error) {
-	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
+	if err := r.personDeviceBinding.requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerGrantList{}, err
 	}
 	var result ComputerGrantList
@@ -508,7 +508,7 @@ func (r *databaseReads) computerViewGetComputerTakeoverAvailability(ctx context.
 	if err := r.q.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&access.PolicyRevision); err != nil {
 		return ComputerTakeoverAvailability{}, internalError(err, "read Computer take-over policy revision")
 	}
-	administrator, err := currentAdminPerson(ctx, r.q, identity)
+	administrator, err := r.personDeviceBinding.currentAdminPerson(ctx, r.q, identity)
 	if err != nil {
 		return ComputerTakeoverAvailability{}, err
 	}
@@ -555,7 +555,7 @@ func (r *databaseReads) computerViewResolvePersonComputerHandle(ctx context.Cont
 	if err := validatePersonIdentity(identity); err != nil {
 		return ComputerHandleResolution{}, err
 	}
-	administrator, err := currentAdminPerson(ctx, r.q, identity)
+	administrator, err := r.personDeviceBinding.currentAdminPerson(ctx, r.q, identity)
 	if err != nil {
 		return ComputerHandleResolution{}, err
 	}
@@ -661,7 +661,7 @@ func (s *Store) ListComputerPolicyAudit(ctx context.Context, identity fabric.Ide
 }
 
 func (r *databaseReads) computerViewListComputerPolicyAudit(ctx context.Context, identity fabric.Identity, computerID, cursor string, limit int) (ComputerPolicyAuditList, error) {
-	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
+	if err := r.personDeviceBinding.requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerPolicyAuditList{}, err
 	}
 	if limit < 1 || limit > MaxJobPageLimit {
@@ -850,7 +850,7 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 			adminRows.Close()
 			return nil, internalError(err, "scan Computer policy administrator")
 		}
-		if !personDeviceBindingRequired(ctx) {
+		if !s.personDeviceBinding.required(ctx) {
 			admin.DeviceID = ""
 		}
 		admins = append(admins, admin)
@@ -875,7 +875,7 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 	}
 	snapshot := ComputerPolicySnapshot{PolicyGeneration: generation, PolicyRevision: revision, IssuingFabricID: issuingFabricID,
 		NodeID: nodeID, BootSessionID: bootSessionID, IssuedAt: now, FreshUntil: canonicalTime(now.Add(freshness)),
-		Admins: admins, Computers: computers, AdminDeviceRequired: personDeviceBindingRequired(ctx)}
+		Admins: admins, Computers: computers, AdminDeviceRequired: s.personDeviceBinding.required(ctx)}
 	snapshot.SnapshotDigest, err = ComputeComputerPolicySnapshotDigest(snapshot)
 	if err != nil {
 		return nil, internalError(err, "digest Computer policy snapshot")
@@ -995,7 +995,7 @@ func (s *Store) GetComputerPolicyRevocation(ctx context.Context, identity fabric
 }
 
 func (r *databaseReads) computerViewGetComputerPolicyRevocation(ctx context.Context, identity fabric.Identity, revision int64, computerID, fabricID, userID string) (ComputerPolicyRevocation, error) {
-	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
+	if err := r.personDeviceBinding.requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerPolicyRevocation{}, err
 	}
 	revocation, err := readComputerPolicyRevocation(ctx, r.q, revision, computerID, fabricID, userID)
