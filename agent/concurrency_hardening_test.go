@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -52,8 +53,8 @@ func assertHandoffPathLockSpansPrepareThroughFinish(t *testing.T) {
 		<-releaseSecond
 	}()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	defer unlockFirst.release()
+	testwait.Until(t, "second attempt waiting on shared handoff path", func() (bool, error) {
 		manager.mu.Lock()
 		refs := 0
 		if pathLock := manager.paths[handoffPathLeaseKey(path)]; pathLock != nil {
@@ -61,14 +62,10 @@ func assertHandoffPathLockSpansPrepareThroughFinish(t *testing.T) {
 		}
 		manager.mu.Unlock()
 		if refs == 2 {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			unlockFirst.release()
-			t.Fatal("second attempt did not wait on the shared handoff path")
-		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("path lock references = %d", refs)
+	})
 	select {
 	case err := <-secondPrepared:
 		unlockFirst.release()
@@ -87,19 +84,15 @@ func assertHandoffPathLockSpansPrepareThroughFinish(t *testing.T) {
 	}
 	close(releaseSecond)
 
-	deadline = time.Now().Add(5 * time.Second)
-	for {
+	testwait.Until(t, "empty handoff path lock registry", func() (bool, error) {
 		manager.mu.Lock()
 		remaining := len(manager.paths)
 		manager.mu.Unlock()
 		if remaining == 0 {
-			break
+			return true, nil
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("handoff path lock registry retained %d entries", remaining)
-		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("handoff path lock registry retained %d entries", remaining)
+	})
 }
 
 func TestOutputSinkFactorySupportsConcurrentAttemptIsolation(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -277,24 +279,23 @@ func assertAgentBootDeliversDurableLateEvidenceWithoutCrashLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer inspection.Close()
-	deadline := time.Now().Add(5 * time.Second)
 	var lateResultJSON []byte
-	for time.Now().Before(deadline) {
+	testwait.Until(t, "late completion evidence, restarted registration and swept spool row", func() (bool, error) {
 		var bootSessionID string
 		var localRows int
 		lateErr := inspection.QueryRow("SELECT late_result_json FROM attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&lateResultJSON)
 		bootErr := inspection.QueryRow("SELECT boot_session_id FROM nodes WHERE node_id=?", "stable-node").Scan(&bootSessionID)
 		localErr := restarted.logSpool.db.QueryRow("SELECT COUNT(*) FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&localRows)
 		if lateErr == nil && bootErr == nil && localErr == nil && len(lateResultJSON) != 0 && bootSessionID == "boot-2" && localRows == 0 {
-			break
+			return true, nil
 		}
 		select {
 		case err := <-runDone:
 			t.Fatalf("agent exited during evidence recovery: %v", err)
 		default:
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return false, fmt.Errorf("late result = %s (error %v), boot = %q (error %v), local rows = %d (error %v)", lateResultJSON, lateErr, bootSessionID, bootErr, localRows, localErr)
+	})
 	if len(lateResultJSON) == 0 {
 		t.Fatal("durable completion was not retained as late L1 evidence")
 	}
@@ -410,17 +411,17 @@ func waitForSpoolHighWater(t *testing.T, spool *logSpool, attemptID string, stre
 
 func waitForJobAttempt(t *testing.T, store *l1.Store, jobID string) string {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	var attemptID string
+	testwait.Until(t, "job attempt", func() (bool, error) {
 		job, err := store.GetJob(context.Background(), jobID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if job.CurrentAttemptID != "" {
-			return job.CurrentAttemptID
+			attemptID = job.CurrentAttemptID
+			return true, nil
 		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("timed out waiting for job attempt")
-	return ""
+		return false, fmt.Errorf("job = %#v", job)
+	})
+	return attemptID
 }

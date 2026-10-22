@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -114,14 +116,13 @@ func assertAgentResizesPoolFromHeartbeatGrantedCapacity(t *testing.T) {
 		}
 	}
 	heartbeats <- l1.Node{MaxOneshotSlots: 1, MaxServiceSlots: 1}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	testwait.Until(t, "heartbeat-reduced one-shot pool", func() (bool, error) {
 		occupancy := gate.occupancy()
 		if occupancy.Limit == 1 && occupancy.Overcommitted {
-			break
+			return true, nil
 		}
-		time.Sleep(time.Millisecond)
-	}
+		return false, fmt.Errorf("occupancy = %#v", occupancy)
+	})
 	if occupancy := gate.occupancy(); occupancy.Limit != 1 || occupancy.Occupied != 3 || !occupancy.Overcommitted {
 		t.Fatalf("heartbeat-reduced pool = %#v, want visible 3/1 overcommit", occupancy)
 	}
@@ -144,12 +145,11 @@ func assertAgentResizesPoolFromHeartbeatGrantedCapacity(t *testing.T) {
 
 func waitForClassLimit(t *testing.T, session *agentSession, class workloadClass, want int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if session.gates[class].occupancy().Limit == want {
-			return
+	testwait.Until(t, fmt.Sprintf("class %d limit %d", class, want), func() (bool, error) {
+		got := session.gates[class].occupancy().Limit
+		if got == want {
+			return true, nil
 		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatalf("class %d limit = %d, want %d", class, session.gates[class].occupancy().Limit, want)
+		return false, fmt.Errorf("limit = %d", got)
+	})
 }

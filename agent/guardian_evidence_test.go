@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/agent/managedroot"
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	wr "github.com/Derek-X-Wang/wefty/runner"
 	p "github.com/Derek-X-Wang/wefty/runner/process"
@@ -69,10 +71,13 @@ func TestGuardianCrashCancelsBlockedProductionSpool(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("production spool did not reach blocked append")
 	}
-	deadline := time.Now().Add(time.Second)
-	for spool.appendDB.Stats().WaitCount == 0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	testwait.Until(t, "SQL-blocked spool append", func() (bool, error) {
+		waitCount := spool.appendDB.Stats().WaitCount
+		if waitCount > 0 {
+			return true, nil
+		}
+		return false, fmt.Errorf("SQL wait count = %d", waitCount)
+	})
 	if spool.appendDB.Stats().WaitCount == 0 {
 		t.Fatal("spool append was not actually SQL-blocked")
 	}
