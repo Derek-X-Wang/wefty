@@ -4,7 +4,7 @@
 
 An AI agent's own sandbox keeps it from breaking the owner's Mac. Wefty gives it a safe place to do the real work. That place is a **Computer**: a plain Linux system with a screen, a keyboard and a mouse, kept apart from the Mac. The AI agent does not live inside it. It works from outside, through `wefty` commands. It gets a **Seat**: its own desktop on a Computer.
 
-**Stage A, one Mac.** An AI agent on the owner's Mac asks for a Seat. It says whether it needs the internet. Wefty checks for room first, and a full Mac says no at once. Otherwise the owner sees a dialog on the Mac and clicks Approve or Deny. Nothing starts before the owner says yes. Then the AI agent gets its Seat. It takes screenshots, clicks and types with `wefty` screen commands. It runs commands there with `wefty exec --seat`, and it moves files with `wefty cp`. The owner can watch the same screen in a browser and take the wheel at once. While a person drives, wefty refuses the AI agent's screen input and tells it why. Its commands keep running. When the AI agent releases its Seat, or stops calling for 30 minutes with nothing running, the Seat ends and its folder goes. An on-demand Computer is deleted 10 minutes after its last Seat leaves, and wefty shows the proof. The host VM stops 10 minutes after nothing needs it, so the Mac gets its memory back.
+**Stage A, one Mac.** An AI agent on the owner's Mac asks for a Seat. It says whether it needs the internet. Wefty checks for room first, and a full Mac says no at once. Otherwise the owner sees a dialog on the Mac and clicks Approve or Deny. Nothing starts before the owner says yes. Then the AI agent gets its Seat. It takes screenshots, clicks and types with `wefty` screen commands. It runs commands there with `wefty exec --seat`, and it moves files with `wefty cp`. The owner can watch the same screen in a browser and take the wheel at once. While a person drives, wefty refuses the AI agent's screen input and tells it why. Its commands keep running. The Seat ends when the AI agent releases it; otherwise a Seat ends 30 minutes after the latest of its last Seat call, the end of its last command, and a person's release of its screen; it never ends while a command runs or a person drives. Then its folder goes. An on-demand Computer is deleted 10 minutes after its last Seat leaves, and wefty shows the proof. The host VM stops 10 minutes after nothing needs it, so the Mac gets its memory back.
 
 **Stage B, the owned fleet.** It works like stage A, with one more choice: which Mac. The owner points the laptop at a server Mac once. An AI agent on the laptop then gets its Seat on the server Mac. The dialog still appears on the laptop, in front of the owner. The AI agent reaches only its own Seat, through wefty's front door.
 
@@ -19,7 +19,7 @@ An AI agent's own sandbox keeps it from breaking the owner's Mac. Wefty gives it
 ### 0.1 Why
 
 - **Owner, 2026-10-16:** "Your AI agent's sandbox keeps it from breaking your machine; wefty gives it a safe place to do the real work."
-- **The phase-2 rule** ([#973](https://github.com/Derek-X-Wang/wefty/issues/973), recorded on [#899](https://github.com/Derek-X-Wang/wefty/issues/899) and [#902](https://github.com/Derek-X-Wang/wefty/issues/902)): a command that a fenced AI agent has no permission to run may run only in a wefty sandbox isolated from the host, never on the host as the owner. A Computer is the place where that work runs.
+- **The phase-2 rule** ([#973](https://github.com/Derek-X-Wang/wefty/issues/973), recorded on [#899](https://github.com/Derek-X-Wang/wefty/issues/899) and [#902](https://github.com/Derek-X-Wang/wefty/issues/902)): a command that a fenced AI agent has no permission to run may run only in a wefty sandbox isolated from the host, never on the host as the owner. A Computer is such a sandbox. The guarded door that keeps a fenced AI agent's command off the host is phase-2 work, not this spec (section 2.3).
 - **Daily use, 2026-10-16:** AI agents in other projects hit walls that a Computer removes. Their own sandbox blocked headful and headless Chromium. Two tests needed a blocked `sysctl` call and could run nowhere. An owner-approved browser run worked, but each batch needed a manual approval.
 
 ### 0.2 Evidence
@@ -131,8 +131,10 @@ Every kind of sandbox meets the same dialog; no new door is added, and [#973](ht
 | The AI agent's sandbox | How it reaches wefty ([#1012](https://github.com/Derek-X-Wang/wefty/issues/1012)) | Its Computer's network |
 |---|---|---|
 | Open network (OpenCode; Codex with network on; Claude Code with its sandbox off) | directly | what the owner approves |
-| Domain list (Claude Code with its sandbox on) | a loopback or Unix socket allowance | what the owner approves; the list is not copied |
+| Domain list (Claude Code with its sandbox on) | cannot today: its sandbox refuses the wefty socket ([#899](https://github.com/Derek-X-Wang/wefty/issues/899) checks); it is refused, as today | what the owner approves; the list is not copied |
 | No network (Codex's default) | only through a run that its harness approves | what the owner approves |
+
+Seats add no door. An AI agent that can reach wefty can already run plain `wefty exec` on the host; keeping a fenced AI agent's command off the host is the phase-2 guarded door (#973, #899, [#902](https://github.com/Derek-X-Wang/wefty/issues/902)), not this spec. A sandbox that blocks the wefty socket is refused, and the AI agent asks the owner; nobody suggests a socket allowance (`docs/contracts/client-service.md`, "The socket does not distinguish programs running as the owner").
 
 In a run that the harness approved outside its sandbox, the sandbox does not limit where copy-out writes, because the owner trusted that run.
 
@@ -147,11 +149,11 @@ In a run that the harness approved outside its sandbox, the sandbox does not lim
 
 ### 2.5 The Seat lives
 
-A Seat stays alive while any of these is true: the AI agent made a Seat call in the last 30 minutes; one of its commands runs; a person drives its screen. When none is true, the Seat ends. An AI agent that dies or forgets to release loses its Seat this way.
+**The expiry rule:** a Seat ends 30 minutes after the latest of its last Seat call, the end of its last command, and a person's release of its screen; it never ends while a command runs or a person drives (#1025; section 12.2). An AI agent that dies or forgets to release loses its Seat this way. Wefty measures these waits, and approval windows, with a monotonic clock that keeps counting across sleep, so a change of the wall clock does not end a Seat early, and a window ends on time after a sleep.
 
 - **A Seat call** is every one-time Seat command with the Seat credential, a one-time `wefty logs SEAT_ID` included. A `wefty logs SEAT_ID --follow` counts once, when it starts; while it runs, it does not keep the Seat alive (#1052; section 12.2).
 - A background program that a command started does not keep the Seat alive ([#1026](https://github.com/Derek-X-Wang/wefty/issues/1026)).
-- The "ends soon" event comes once, 5 minutes before the end. Any Seat call then resets the 30 minutes.
+- The "ends soon" event comes once, 5 minutes before the end. Any Seat call then starts the 30 minutes again.
 
 ### 2.6 The Seat ends
 
@@ -159,7 +161,7 @@ A Seat ends on release, on expiry, on a Computer restart, or through an owner co
 - its running commands are cancelled, and its desktop and programs stop, background programs included;
 - its own folder is deleted, so the next Seat starts clean. Results leave by copy-out first;
 - its Seat credential stops working at once for commands, input, copies and the screen. Later calls get "Seat ended" with the reason (released, expired, or Computer restarted). It keeps read-only access to that Seat's log for the log's retention, and nothing else (owner, 2026-10-22);
-- its room returns once wefty confirms the cleanup;
+- its room returns once wefty confirms the cleanup, and only as far as its Computer's memory limit actually shrinks. If the remaining Seats use more than their share, the Computer keeps the larger limit, and the extra room stays held until a later shrink succeeds or the Computer ends. Room and the runtime limit change together, because today's reservation rejects a changed declaration (`runner/ocihelper/capacity_linux.go`). An owner-made Computer keeps its fixed limit and never shrinks;
 - a release still ends the Seat while a person watches or drives it, and the viewer says so.
 
 Who ends Seats besides the AI agent:
@@ -185,6 +187,15 @@ Races and the owner (#1016):
 - A changed setting applies the next time the timer checks.
 
 An on-demand Computer's Storage uses today's `storage_id@generation` identity. Backups stay off by default (cap 0). The owner's storage commands (backup, clone, Custody export, reset, resize) work as today, and a Custody export weakens the removal proof, as today.
+
+### 2.8 Restarts and failures
+
+Seat state must survive a restart of the node agent, the helper or L1, and a failure halfway through a step. The rules (state and mechanism names proposed, P18):
+1. **Seat state is durable in L1.** A Seat moves through *requested*, *approved*, *starting*, *live*, *ending* and *ended*, or ends early as *refused*. *ended* and *refused* are final.
+2. **Room is reserved under a fence.** A reservation names one request and one Computer. When two approvals race for the last room, exactly one wins; the other is refused for lack of room.
+3. **Room stays charged until positive cleanup evidence.** A lost helper, a restart or a full host VM disk during cleanup never returns room early. Cleanup resumes, and the room returns when the helper proves the Seat gone.
+4. **Reconciliation after a restart.** A pending approval whose dialog was lost is refused with the reason, and leaves nothing behind. A held room whose request has ended is released only after cleanup evidence. A Seat that becomes ready after its deadline is cleaned up, not handed out, and its request is refused. A half-done cleanup resumes.
+5. **An ended Seat never comes back.** Reapplying L1's Seat list only carries *starting* and *live* Seats, and a Seat ID is never reused.
 
 ## 3. Defaults
 
@@ -215,7 +226,7 @@ The "Setting" column says which values the owner may change later, for example i
 | Copy size between Macs (stage B) | 256 MiB per copy; a waiting file is deleted after 1 h | no, the remote `exec` limit | [#1018](https://github.com/Derek-X-Wang/wefty/issues/1018) |
 | Where Seat requests go (stage B) | *this Mac* | yes, per Mac | #1018 |
 
-At worst, the Mac gets its memory back about 50 minutes after an AI agent forgets its Seat: 30 minutes for the Seat, 10 for the Computer, the removal, then 10 for the host VM ([#1010](https://github.com/Derek-X-Wang/wefty/issues/1010)).
+At worst, when nothing runs on the Seat, the Mac gets its memory back about 50 minutes after an AI agent forgets its Seat: 30 minutes for the Seat, 10 for the Computer, the removal, then 10 for the host VM ([#1010](https://github.com/Derek-X-Wang/wefty/issues/1010)).
 
 Why (#1015): #1028 measured 0.3 to 0.45 GiB per Seat on light pages, and real web apps can need two or three times more. Counting room per Seat holds nothing for Seats that do not exist yet. With a Seat limit of 2, one runaway Seat can stop only one neighbour, because a Computer out of memory stops all its Seats. With a dedicated cap of 1, a shared Computer can always start (a node runs at most 2 Computers today, `DefaultMaxServiceSlots` in `l1/types.go`). A second shared Computer costs about 0.1 GiB and a 5 to 10 s start, against about 1.5 s to join a running one.
 
@@ -370,7 +381,7 @@ Each change appears once. "Way" is "decided" when a ticket chose the mechanism, 
 |---|---|---|---|
 | §4 capacity | Room is counted per Seat at 1 GiB, taken at start and returned after confirmed cleanup. A Computer still takes one service Slot. Owner-made Computers keep their own memory limit and use the same room; their Seats share that limit and take no extra room (owner, 2026-10-22). The [#122](https://github.com/Derek-X-Wang/wefty/issues/122) rule stays ([#1015](https://github.com/Derek-X-Wang/wefty/issues/1015)). | decided | M3.5 §4; `state-machines.md` |
 | §0.2, §4 ceiling | The host VM's memory minus 1 GiB, not a fixed 4 GiB with a quarter in reserve (`runner/lima/template.go`). | decided | M3.5 §0.2, §4 |
-| §4 live memory limit | A shared Computer's limit grows when a Seat joins and shrinks after its cleanup. | new helper operation | `oci-helper-protocol.md` |
+| §4 live memory limit | A shared Computer's limit grows when a Seat joins and shrinks after its cleanup, together with the room: room returns only as far as the limit shrinks (section 2.6). An owner-made Computer's limit never changes. | new helper operation | `oci-helper-protocol.md`; `state-machines.md` |
 | §4 Computer count | Today 2 per node; it must grow with the room. | P11 | `state-machines.md` |
 | §4 temp space | `/tmp` (512 MiB), `/var/tmp` (64 MiB) and `/dev/shm` (1 GiB) are shared and larger than one Seat's room (`runner/ocihelper/profile.go`). The image ticket fits memory-backed temp space inside the memory limit, for example each Seat's temp folder on its disk folder, as the prototype did. | engineering (section 12.2) | `computer-image.md` |
 | §4 OOM | One heavy Seat can still end every Seat on its Computer; the Seat limit of 2 bounds it. | accepted | — |
@@ -443,8 +454,8 @@ Around the stop: a stopped host VM with no demand gets a new closed reason, `hos
 ### 9.6 The install, the proof and the fallback
 
 1. **The daily install gets the host VM as the owner's own user, with no admin password.** `wefty setup` can add it to the per-user install. Lima comes from Homebrew with no sudo. Inside the guest, the helper is still installed as the guest's root, which needs no admin password on the Mac.
-2. **Proof first.** Nobody has proved that a `vz` VM starts from a per-user LaunchAgent. The proof ticket proves it on the owner's Mac, at a quiet time with the memory guard on, before any ticket builds on the per-user host VM. GitHub's Mac runners cannot run a VM. The proof also takes the open measurements (PR-2 to PR-5).
-3. **Fallback.** If the proof fails, the host VM alone uses today's admin install (the LaunchDaemon), and the rest of the daily install stays per-user. So this spec does not wait for the proof.
+2. **Proof first.** Nobody has proved that a `vz` VM starts from a per-user LaunchAgent. The proof ticket proves, on the owner's Mac, at a quiet time with the memory guard on, that one per-user node agent starts the host VM, shows a dialog in the owner's login session, and receives one Seat, before any ticket builds on the per-user host VM. GitHub's Mac runners cannot run a VM. The proof also takes the open measurements (PR-2 to PR-5).
+3. **Fallback.** Today the LaunchDaemon launches `wefty-agent` itself, and that process owns the host VM's supervision (`runner/lima/bootstrap.go`, `cmd/wefty-agent/main.go`), while the dialog needs a node agent in the owner's login session. So the fallback is not one component moved: if the proof fails, the fallback needs its own small design. One node agent stays per-user for the dialog, and a privileged helper only starts and stops the host VM on its request. The proof ticket records the failure and drafts that shape for the owner. This spec does not wait for the proof.
 4. **A host VM recreate keeps the Computers' Storage and Backups**, which live on the host VM's disk. Today `node setup-oci --recreate` checks only that no attempt runs. [#1021](https://github.com/Derek-X-Wang/wefty/issues/1021) lands first, before any work that sets up or recreates the host VM ([#1019](https://github.com/Derek-X-Wang/wefty/issues/1019)), and refuses a recreate while any Computer Storage or Backup lives there (section 12.2).
 5. **Memory stays with the host VM while it runs:** a `vz` VM gives freed memory back to macOS only when it stops ([#1009](https://github.com/Derek-X-Wang/wefty/issues/1009)).
 
@@ -469,7 +480,7 @@ Spirit ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)): stage B wor
 
 ### 10.3 Consequences of earlier rules
 
-- **The AI agent's Mac sleeps.** A command that already runs on the Seat continues until it ends or reaches its time limit. After that, the 30-minute check-in wait runs. A Mac that sleeps longer loses its Seat.
+- **The AI agent's Mac sleeps.** A command that already runs on the Seat continues until it ends or reaches its time limit. Then the expiry rule applies: a Seat ends 30 minutes after the latest of its last Seat call, the end of its last command, and a person's release of its screen; it never ends while a command runs or a person drives. A Mac that sleeps longer loses its Seat.
 - **The hosting Mac loses the control plane.** It stops taking the AI agent's screen input until the connection is back (fail closed). Check-ins go to L1 on the control-plane Mac.
 - **Dependencies:** the stage B build needs #899, [#900](https://github.com/Derek-X-Wang/wefty/issues/900) and #902. Stage A does not.
 
@@ -513,7 +524,7 @@ Spirit ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)): stage B wor
 | AP-5 | Dialog: an unanswered request is refused after the wait. |
 | AP-6 | Dialog: a window ends on time. |
 
-### 11.5 A Seat's life ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025))
+### 11.5 A Seat's life ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025); SL-5 to SL-8 added after review)
 
 | ID | Check |
 |---|---|
@@ -521,6 +532,10 @@ Spirit ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)): stage B wor
 | SL-2 | A refused request leaves nothing behind. |
 | SL-3 | A Seat's room returns only after its cleanup is confirmed. |
 | SL-4 | A Computer restart ends its Seats, and the next call says why. |
+| SL-5 | A long command keeps its Seat alive, and the 30 minutes start at the command's end. |
+| SL-6 | The owner's Mac sleeps and wakes: no Seat ends early, the "ends soon" event still comes before an end, and each end records its reason. |
+| SL-7 | A change of the wall clock does not end a Seat early. |
+| SL-8 | An approval window that spans a sleep of the owner's Mac ends on time. |
 
 ### 11.6 Logs ([#1052](https://github.com/Derek-X-Wang/wefty/issues/1052))
 
@@ -610,6 +625,15 @@ Spirit ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)): stage B wor
 | SB-5 | An AI agent on the laptop cannot reach any other port of the Computer, or its hosted services. |
 | SB-6 | The owner drives the Seat from the laptop's browser while the AI agent's input is refused. |
 
+### 11.14 Restarts and failures (added after review)
+
+| ID | Check |
+|---|---|
+| RC-1 | A crash of the node agent, the helper or L1 at each Seat transition leaves a defined state, and no ended Seat comes back. |
+| RC-2 | Two approvals race for the last room: exactly one wins, and the other is refused for lack of room. |
+| RC-3 | A full host VM disk during cleanup keeps the room charged until the cleanup succeeds. |
+| RC-4 | A Seat that becomes ready after its deadline is cleaned up and not handed out. |
+
 ## 12. Decision log
 
 This section is normative.
@@ -660,6 +684,10 @@ This section is normative.
 | "A refused request leaves nothing behind" (#1025) and "requests are recorded" (charting decision 11). | **No runtime resources stay**; the request record stays. |
 | A Seat ID and a request's name both start with `seat` (#1052). | **One ID**: the request prints `seat_<32 hex>` at once, `wefty seat wait` takes it, and once approved it names the Seat; a refused request keeps it in its record. |
 | Where the CLI keeps the Seat credential in a sandbox. | **P3 stays proposed** (the system temp folder, checked per harness); not an owner point. |
+| Research [#1012](https://github.com/Derek-X-Wang/wefty/issues/1012) listed a loopback or Unix socket allowance as a way in; the client-service contract refuses a sandbox that blocks the wefty socket. | **The contract wins** (review round 2): such a sandbox is refused and the AI agent asks the owner. Seats add no door. |
+| #1025's three alive conditions and the 30-minute wait. | **One expiry rule** (review round 2): a Seat ends 30 minutes after the latest of its last Seat call, the end of its last command, and a person's release of its screen; never while a command runs or a person drives. |
+| Room returns after cleanup (#1015), but a limit cannot shrink below what the remaining Seats use. | **Room returns only as far as the limit shrinks** (review round 2); the rest stays held until a later shrink or the Computer's end. |
+| #1027: on a failed proof, "the host VM alone" uses the LaunchDaemon; today the LaunchDaemon runs the node agent itself. | **The fallback needs its own small design** (review round 2), which the proof ticket drafts for the owner: a per-user node agent for the dialog, and a privileged helper that only starts and stops the host VM. |
 
 ### 12.3 Owner answers, 2026-10-22
 
@@ -690,7 +718,7 @@ No ticket chose these engineering mechanisms. They are built as written once the
 | P4 | **The dialog.** A native macOS alert that the node agent shows in the owner's login session, with two buttons and a timeout (for example a CoreFoundation user-notification alert); not a banner, not a web page. The node agent sends the answer to L1 under its own node identity. No CLI command or control-socket verb carries an approval. |
 | P5 | **The Seat directive.** The helper writes `/wefty/control/seats.json` by atomic rename and mounts the control folder, not the file, so the image sees each new file (the prototype's shape). |
 | P6 | **Ready or failed, per Seat.** A helper-owned, attempt-local status folder that the image may write, apart from the read-only control folder: one file per Seat place, `ready` or `failed` with a reason. The helper then checks the Seat's two endpoints with today's `rfb-websocket-v1` readiness. Each Seat gets a fresh readiness deadline, 60 s like today's, that starts when the directive adds the Seat; today's deadline starts at the Computer task's start and cannot govern Seats added later. |
-| P7 | **Seat endpoints.** Unix sockets in the Seat's runtime folder, which only the Seat's user and root can open. The directive names their paths; the helper returns and dials them by Seat. This closes them to other Seats without tokens. The view endpoint still ignores input. |
+| P7 | **Seat endpoints.** Unix sockets in the Seat's runtime folder, which only the Seat's user and root can open. The directive names their paths; the helper returns and dials them by Seat. This closes them to other Seats without tokens. The view endpoint still ignores input. Risk: today's endpoints are numeric ports dialled inside the Computer's network namespace (`runner/ocihelper/protocol.go`, `containerd_engine_linux.go`), so file-system sockets need a new dial path. The endpoint ticket starts with a short spike and may pick per-Seat sockets or per-Seat endpoint credentials instead (for example a per-Seat VNC password file that only that Seat's user and root can read). Either way it needs exact attempt-and-Seat binding, refusals for symlink and replacement races, and cross-Computer tests per `docs/adr/0005-computer-isolation-boundary.md`. |
 | P8 | **The driver signal.** One read-only `/wefty/control/seats/<place>/driver.json` per Seat place, with today's body: `{"version":1,"human_driving":true}` or `false`. |
 | P9 | **Folders.** `/wefty/service/seats/<place>` per Seat and `/wefty/service/shared`, as in the prototype. |
 | P11 | **The Computer count.** A Mac node's service-Slot count follows its room: at least one Slot per Seat that fits. |
@@ -698,6 +726,7 @@ No ticket chose these engineering mechanisms. They are built as written once the
 | P13 | **The stage B routing setting** lives in the machine's connection profile (`docs/contracts/connection-profile.md`), set by a `wefty` settings command. |
 | P14 | **The switch and today's marker.** *enabled* reads as *always on* ([#1027](https://github.com/Derek-X-Wang/wefty/issues/1027): "*Always on:* today's *enabled*"); missing or disabled reads as *off*; a new per-user install writes *on demand*. |
 | P17 | **Owner-settings commands.** The host VM switch: `wefty node oci off\|on-demand\|always-on`, replacing `start\|stop`. An owner-made Computer: `wefty services create --computer … [--seat-limit N] [--idle-action nothing\|stop\|delete]`. The other settings in section 3 are startup flags, like today's `wefty-l1 --computer-backup-cap`: cluster values (the default image, the Seat and Computer idle waits, the Seat command time limit, the warning time) on L1, and node values (room per Seat, the dedicated cap, the host VM size and idle wait, the answer wait, the window lengths) on the node agent. `wefty setup` writes them into the installed services, and the owner changes one by running `wefty setup` again with the new value. The stage B routing setting is P13. |
+| P18 | **Seat states and recovery.** The state names *requested*, *approved*, *starting*, *live*, *ending*, *ended* and *refused*; a fenced room reservation per request and Computer; refusal of a pending approval whose dialog was lost; and the reconciliation rules of section 2.8. |
 
 ## 14. Out of scope, and not yet specified
 

@@ -258,7 +258,8 @@ _Avoid_: timeout policy, TTL, keep-alive
 **Room**:
 The part of a Node's memory for Computers that is still free, counted in
 Seats. A Seat takes its share when it starts and gives it back once its
-cleanup is confirmed. A Seat request that does not fit is refused at once.
+cleanup is confirmed, as far as its Computer's memory limit actually shrinks.
+A Seat request that does not fit is refused at once.
 _Avoid_: capacity, headroom, Slot, free memory (a measurement)
 
 **Seat log**:
