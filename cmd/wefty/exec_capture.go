@@ -21,6 +21,9 @@ type execCapture struct {
 	Tree          string `json:"snapshot_tree"`
 	Dirty         bool   `json:"dirty"`
 	Folder        string `json:"relative_folder"`
+
+	// Caller-only context for failure hints; never sent to the run.
+	localRoot string
 }
 
 type execGitError struct {
@@ -141,7 +144,7 @@ func captureExecAttempt(ctx context.Context, cwd string) (capture execCapture, e
 		return capture, err
 	}
 
-	capture = execCapture{Storage: storage, Base: strings.TrimSpace(base), Dirty: status != "", Folder: folder}
+	capture = execCapture{Storage: storage, Base: strings.TrimSpace(base), Dirty: status != "", Folder: folder, localRoot: root}
 	defer func() {
 		if err != nil {
 			err = errorsWithCleanup(err, storage)

@@ -22,6 +22,11 @@ func TestFleetDoctorPolicyFlagRealBinary(t *testing.T) {
 		if err := cmd.Run(); err != nil {
 			t.Fatalf("%v: %v stdout=%s stderr=%s", args, err, &out, &diagnostics)
 		}
+		if !strings.Contains(out.String(), "Keep the Owner person identity on the owner's laptop.") ||
+			!strings.Contains(out.String(), "Do not sign the control-plane machine's network app") ||
+			strings.Contains(out.String(), "until L1 pins the person device") {
+			t.Fatalf("obsolete person-device policy guidance: %s", &out)
+		}
 		if strings.Contains(strings.Join(args, " "), "--json") {
 			var report struct {
 				Snippet      string   `json:"snippet"`

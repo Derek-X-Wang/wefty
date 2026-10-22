@@ -41,6 +41,7 @@ const (
 	ErrorRunIdentityRequired         ErrorCode = "run_identity_required"
 	ErrorRunIdentityNotEntitled      ErrorCode = "run_identity_not_entitled"
 	ErrorPersonIdentityRequired      ErrorCode = "person_identity_required"
+	ErrorPersonDeviceMismatch        ErrorCode = "person_device_mismatch"
 	ErrorMachineIdentityRequired     ErrorCode = "machine_identity_required"
 	ErrorParticipantInUse            ErrorCode = "participant_in_use"
 	ErrorAdminRequired               ErrorCode = "admin_required"

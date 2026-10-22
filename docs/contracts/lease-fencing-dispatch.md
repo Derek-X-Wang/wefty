@@ -243,6 +243,7 @@ require different reactions.
 | --- | ---: | --- | --- |
 | Fabric identity lacks the route group's principal tag | 403 | `principal_forbidden` | false |
 | Stable node ID is bound to another Fabric identity | 403 | `identity_bound` | false |
+| Current administrator uses another person device, or has a legacy unbound roster row | 403 | `person_device_mismatch` | false |
 | Stable node ID has no registration | 409 | `node_not_registered` | false |
 | Registered node is dead | 409 | `node_dead` | false |
 | Registered node's boot session is draining | 409 | `node_draining` | false |

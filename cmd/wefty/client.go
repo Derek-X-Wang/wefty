@@ -209,14 +209,18 @@ func (c *apiClients) getAdminPolicy(ctx context.Context) (l1.AdminPolicy, error)
 	return policy, err
 }
 
-func (c *apiClients) mutateAdmin(ctx context.Context, userID string, revision int64, remove bool) (l1.AdminPolicy, error) {
+func (c *apiClients) mutateAdmin(ctx context.Context, userID string, revision int64, remove bool, deviceIDs ...string) (l1.AdminPolicy, error) {
 	method := http.MethodPut
 	if remove {
 		method = http.MethodDelete
 	}
 	var policy l1.AdminPolicy
 	path := "/v1/admin-policy/admins/" + url.PathEscape(userID)
-	err := c.l1.do(ctx, method, path, l1.AdminPolicyMutationRequest{PolicyRevision: revision}, nil, &policy, http.StatusOK)
+	request := l1.AdminPolicyMutationRequest{PolicyRevision: revision}
+	if !remove && len(deviceIDs) > 0 {
+		request.DeviceID = deviceIDs[0]
+	}
+	err := c.l1.do(ctx, method, path, request, nil, &policy, http.StatusOK)
 	return policy, err
 }
 

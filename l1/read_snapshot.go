@@ -391,7 +391,7 @@ func (r *databaseReads) currentAdmin(ctx context.Context, identity fabric.Identi
 func (r *databaseReads) adminAuditPage(ctx context.Context, afterRevision int64, limit int) (AdminPolicyAuditList, error) {
 	page := AdminPolicyAuditList{Entries: []AdminPolicyAudit{}}
 	rows, err := r.q.QueryContext(ctx, `SELECT revision, operation, actor_kind, actor_fabric_id,
-		actor_user_id, actor_device_id, subject_fabric_id, subject_user_id, created_ns FROM admin_policy_audit
+		actor_user_id, actor_device_id, subject_fabric_id, subject_user_id, created_ns, subject_device_id FROM admin_policy_audit
 		WHERE revision>? ORDER BY revision LIMIT ?`, afterRevision, limit+1)
 	if err != nil {
 		return AdminPolicyAuditList{}, internalError(err, "list admin policy audit")
@@ -402,7 +402,7 @@ func (r *databaseReads) adminAuditPage(ctx context.Context, afterRevision int64,
 		var createdNS int64
 		if err := rows.Scan(&entry.Revision, &entry.Operation, &entry.ActorKind,
 			&entry.ActorFabricID, &entry.ActorUserID, &entry.ActorDeviceID,
-			&entry.SubjectFabricID, &entry.SubjectUserID, &createdNS); err != nil {
+			&entry.SubjectFabricID, &entry.SubjectUserID, &createdNS, &entry.SubjectDeviceID); err != nil {
 			return AdminPolicyAuditList{}, internalError(err, "scan admin policy audit")
 		}
 		entry.CreatedAt = time.Unix(0, createdNS).UTC()

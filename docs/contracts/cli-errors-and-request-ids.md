@@ -29,6 +29,12 @@ authority refusal or an unknown protocol code's exit. Structured take-over
 refusals map by server code for every HTTP status, including on take and release
 as on view open.
 
+`person_device_mismatch` is a non-retryable L1 person-route authorization
+refusal (`403`, existing exit 3). It means a current administrator is bound to
+another device, or has a legacy unbound roster row. Its message contains no
+device IDs and directs the caller to the enrolled person device or an explicit
+local control-plane rebind. `GET /v1/whoami` remains available from any device.
+
 For a participant profile, a missing or expired local person sign-in is a typed
 `person_identity_required` refusal (exit 3), with recovery advice for the saved
 participant. Missing machine participant records or saved state use

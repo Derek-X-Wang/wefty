@@ -248,7 +248,8 @@
                 "fabric_id": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "user_id": { "type": "string", "minLength": 1, "maxLength": 255 },
                 "added_revision": { "type": "integer", "minimum": 1 },
-                "added_at": { "type": "string", "format": "date-time" }
+                "added_at": { "type": "string", "format": "date-time" },
+                "device_id": { "type": "string", "minLength": 1, "maxLength": 255, "description": "Bound person device on authenticated person trust. Absent on self-asserted trust and for a legacy unbound administrator, which fails closed until a local rebind." }
               }
             }
           },
@@ -258,7 +259,7 @@
             "items": { "$ref": "#/components/schemas/ComputerPolicyRevocation" }
           }
         },
-        "description": "Current bounded person-based administrator policy. Membership is scoped to the issuing Fabric; device identity is audit evidence, never membership."
+        "description": "Current bounded person-based administrator policy. Membership is scoped to the issuing Fabric. On authenticated person trust each administrator is bound to one person device and other devices of that person are refused; on self-asserted trust device identity is audit evidence only."
       },
       "AdminPolicyAudit": {
         "type": "object",
@@ -266,13 +267,14 @@
         "required": ["revision", "operation", "actor_kind", "actor_fabric_id", "actor_user_id", "actor_device_id", "subject_fabric_id", "subject_user_id", "created_at"],
         "properties": {
           "revision": { "type": "integer", "minimum": 1 },
-          "operation": { "enum": ["bootstrap", "add", "remove", "reset"] },
+          "operation": { "enum": ["bootstrap", "add", "remove", "reset", "rebind"] },
           "actor_kind": { "enum": ["fabric_person", "local_operator"] },
           "actor_fabric_id": { "type": "string" },
           "actor_user_id": { "type": "string" },
           "actor_device_id": { "type": "string" },
           "subject_fabric_id": { "type": "string" },
           "subject_user_id": { "type": "string" },
+          "subject_device_id": { "type": "string", "description": "Person device bound by this bootstrap, add, or rebind on authenticated person trust; absent otherwise." },
           "created_at": { "type": "string", "format": "date-time" }
         }
       },
@@ -397,10 +399,12 @@
               "required": ["fabric_id", "user_id"],
               "properties": {
                 "fabric_id": { "type": "string", "minLength": 1 },
-                "user_id": { "type": "string", "minLength": 1 }
+                "user_id": { "type": "string", "minLength": 1 },
+                "device_id": { "type": "string", "minLength": 1, "description": "Bound person device; present only when admin_device_required is true and the administrator is bound." }
               }
             }
           },
+          "admin_device_required": { "type": "boolean", "description": "Set only on authenticated person trust. When true, an administrator's request from any device other than its bound device_id, or an administrator without one, receives no Computer authority. Absent on self-asserted trust." },
           "computers": {
             "type": "array",
             "items": {

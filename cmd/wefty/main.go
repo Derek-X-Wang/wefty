@@ -406,7 +406,7 @@ Commands:
   whoami                    Observe the current Fabric-scoped person identity in L1
   admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
   admin policy get           Read the current administrator policy revision and members
-  admin policy add|remove    Mutate administrator membership with an observed revision
+  admin policy add|remove    Mutate membership with --policy-revision REVISION; add accepts --device-id DEVICE_ID
   admins list|add|remove     Alias for the administrator policy commands
   node setup-oci             Configure the installed node's OCI runtime
   doctor [--print-policy]    Check the installation or print private network policy
