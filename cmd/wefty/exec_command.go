@@ -128,7 +128,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return err
 	}
 	if restartable && !node.Capabilities[l1.CapabilityOneshotRestartable] {
-		return usageError(fmt.Sprintf("node %q needs an upgrade before restartable exec (missing %s)", node.NodeID, l1.CapabilityOneshotRestartable))
+		return &apiResponseError{Service: "L1", StatusCode: http.StatusConflict, APIError: contract.APIError{Code: contract.ErrorConflict, Retryable: true, Message: fmt.Sprintf("node %q needs an upgrade before restartable exec (missing %s)", node.NodeID, l1.CapabilityOneshotRestartable)}}
 	}
 	carried := l1NormalizedTags(node.AuthoritativeTags)
 	var missing []string

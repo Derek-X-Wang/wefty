@@ -1358,8 +1358,12 @@ Ordinary preparation errors complete as failures.
 
 Restartable mailboxes use `<handoff>/.wefty/<run_id>/<attempt_id>`. Exec work
 and TMPDIR storage are beneath that mailbox, so a delayed cleanup helper can
-touch only its own Attempt's directory. The Run's handoff and result paths
-remain stable; observers read only the latest Attempt's result.
+touch only its own Attempt's directory. Restartable result writes and reads
+use `<handoff>/.wefty-attempts/<attempt_id>` via `WEFTY_HANDOFF_DIR`;
+the Run result API remains stable and serves only the latest Attempt's result.
+Restartable execution is at-least-once. A restartable command that ends while
+wefty is stopping its Attempt may run once more; the latest Attempt's result is
+the Run's verdict.
 
 An exact renewal `restart` directive carries `interruption_reason=upgrade`
 and `interruption_request_key`. The agent terminates and reaps the payload,
@@ -1367,7 +1371,7 @@ finalizes its mailbox and logs, and echoes both fields in durable completion.
 A node agent shutdown signal interrupts Restartable residents, including an
 in-flight claim, with reason `agent_shutdown`. Only positive process-group absence
 and an agent/Guardian initiated termination qualify. Other agent failures,
-runtime limits and natural exits keep their own verdict. The first stop cause
+runtime limits and naturally completed Attempts keep their own verdict. The first stop cause
 that wins the fence determines interruption metadata. A supervision or
 preparation failure that starts termination first remains a failure if a
 shutdown signal or restart directive arrives during reaping or finalization.

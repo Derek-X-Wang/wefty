@@ -59,7 +59,7 @@ shape. The CLI preserves the run ID and URLs, adds `idempotent_replay` (always
 | `WEFTY_L3_ENDPOINT` | public | A job-local HTTP base URL for the L3 run ledger. |
 | `WEFTY_ATTEMPT_TOKEN` | sensitive | The opaque, attempt-bound credential for in-job L1 calls. Opt-in; see below. |
 | `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. Opt-in; see below. |
-| `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
+| `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory; Restartable process one-shots use its `.wefty-attempts/<attempt_id>` result directory. |
 | `WEFTY_RUN_DIR` | public | The run mailbox: the job-owned directory the workload writes protocol events into and the node agent publishes from. |
 
 The first four L3 variables are delivered only when L3 dispatched the job.
@@ -1095,6 +1095,13 @@ labels or changes the canonical request hash; identical dispatch-key replay
 still returns the original job. The label-only resolver remains the sole input
 to run-identity entitlement: a child of a job-owned parent cannot name its
 parent's Job ID in `run_id` or `handoff_owner_run_id`.
+Restartable process one-shots keep this owner and lock at the Run directory,
+but inject `WEFTY_HANDOFF_DIR=<adopted-directory>/.wefty-attempts/<attempt_id>`
+and read `result.json` from that Attempt's directory. This isolates overlapping
+predecessor writes while the Run result API continues serving the latest
+Attempt's uploaded document. Retention covers the adopted directory and all
+its Attempt subdirectories.
+
 Managed handoff directories require the updated agent: L1 and agents upgrade together; a pre-#646 agent permanently fails a pathless process one-shot with `handoff_preparation_failed`.
 
 A process submission with an explicit absolute path and no run identity keeps

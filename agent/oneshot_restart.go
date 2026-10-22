@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -64,21 +65,32 @@ func (lifecycle *attemptLifecycle) restartCompletionRequest(claim l1.Claim, resu
 	return request
 }
 
-// The caller holds the execution handoff path lock through finalization and
-// completion. The result path stays Run-scoped; mailboxes and exec work are
-// Attempt-scoped and must never be removed/recreated under an old helper.
-func resetRestartableHandoff(spec contract.JobSpec) error {
+const restartableResultsDirectory = ".wefty-attempts"
+
+func restartableResultPath(attemptID string) string {
+	return filepath.Join(restartableResultsDirectory, attemptID)
+}
+
+// Keep results outside exec storage: cleanup can outlive the command, and a
+// predecessor can overlap a successor. Neither may publish into the other's file.
+func prepareRestartableResults(spec contract.JobSpec, attemptID string) error {
+	if !validRunMailboxSegment(attemptID) {
+		return fmt.Errorf("invalid restartable Attempt ID %q", attemptID)
+	}
 	root, err := os.OpenRoot(spec.Execution.HandoffDirectory)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
-	if runID := spec.Execution.Env[contract.EnvRunID]; runID != "" {
-		if !validRunMailboxSegment(runID) {
-			return fmt.Errorf("invalid restartable run ID %q", runID)
-		}
+	if err := ensureMailboxSubdirectory(root, restartableResultsDirectory); err != nil {
+		return err
 	}
-	return root.RemoveAll(handoffResultName)
+	parent, err := root.OpenRoot(restartableResultsDirectory)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	return ensureMailboxSubdirectory(parent, attemptID)
 }
 
 // Freeze the canonical completion before persistence. A later cancel can win

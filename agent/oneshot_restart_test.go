@@ -94,14 +94,6 @@ func TestRestartableHandoffExcludesPredecessor(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "unrelated"), []byte("keep"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := resetRestartableHandoff(spec); err != nil {
-		t.Fatal(err)
-	}
-	for _, path := range []string{filepath.Join(dir, "result.json")} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("stale path retained %s: %v", path, err)
-		}
-	}
 	prepared, err := prepareRunMailbox(spec, "successor", newRecordingAppender(""), time.Hour, nil, t.Logf)
 	if err != nil {
 		t.Fatal(err)

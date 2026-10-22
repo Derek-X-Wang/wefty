@@ -401,9 +401,13 @@ Every Attempt fetches the same capture and uses the same argv. A successor
 gets a fresh checkout and TMPDIR. Its mailbox is
 `<handoff>/.wefty/<run_id>/<attempt_id>`; exec work and the TMPDIR target live
 under that Attempt's mailbox. A delayed predecessor cleanup helper can retire
-only its own Attempt's storage. The Run's handoff and result paths stay stable.
-Under the execution handoff path lock the agent removes `result.json` before
-preparation and reads only the current Attempt's mailbox.
+only its own Attempt's storage. The Run's result API stays stable. For a
+restartable Attempt, `WEFTY_HANDOFF_DIR` points to
+`<handoff>/.wefty-attempts/<attempt_id>`; both wrapper writes and agent result
+reads use that directory. A late predecessor write cannot become the successor's
+result. Restartable execution is at-least-once. A restartable command that ends
+while wefty is stopping its Attempt may run once more; the latest Attempt's
+result is the Run's verdict.
 Results belong to the latest Attempt. A restart preserves the Run and Job IDs;
 the Run stays `running` through recovery. `--max-runtime` bounds each Attempt.
 

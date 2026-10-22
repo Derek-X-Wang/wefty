@@ -144,9 +144,6 @@ func TestRestartableDelayedCleanupCannotTouchSuccessor(t *testing.T) {
 	go func() { done <- command.Run() }()
 	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0600) })
 	waitRestartRecoveryPath(t, observed)
-	if err := resetRestartableHandoff(spec); err != nil {
-		t.Fatal(err)
-	}
 	next, storage, tmp := prepare("successor")
 	if storage == previous {
 		t.Fatal("exec storage reused across Attempts")

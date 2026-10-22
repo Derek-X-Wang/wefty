@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -15,13 +16,21 @@ import (
 )
 
 func TestExecRestartableRefusesOldAgentBeforeCapture(t *testing.T) {
+	binary := buildWefty(t)
 	stack := newExecStack(t, execRealBinaryIdleLimit)
 	// No checkout is required for refusal, so capture (and upload) cannot run.
 	t.Chdir(t.TempDir())
 	var out, stderr bytes.Buffer
 	err := executeExec(t.Context(), stack.clients, true, []string{"--restartable", "--detach", "--", "true"}, &out, &stderr)
-	if err == nil || !strings.Contains(err.Error(), l1.CapabilityOneshotRestartable) || len(stack.requests) != 0 {
+	if commandExitCode(err) != exitConflict || !strings.Contains(err.Error(), l1.CapabilityOneshotRestartable) || len(stack.requests) != 0 {
 		t.Fatalf("refusal=%v requests=%+v stdout=%s", err, stack.requests, out.String())
+	}
+	code, output := runWefty(t, binary, 30*time.Second,
+		"--l1="+stack.l1Address, "--l3="+stack.l3Address, "--node-config="+stack.clients.nodeConfigPath,
+		"exec", "--json", "--restartable", "--detach", "--", "true")
+	var envelope contract.ErrorResponse
+	if json.Unmarshal([]byte(output), &envelope) != nil || code != exitConflict || envelope.Error.Code != contract.ErrorConflict || !envelope.Error.Retryable || !strings.Contains(envelope.Error.Message, l1.CapabilityOneshotRestartable) {
+		t.Fatalf("real binary refusal: exit=%d output=%s", code, output)
 	}
 }
 

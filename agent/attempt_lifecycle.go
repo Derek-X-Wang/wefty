@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1667,9 +1668,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		}
 	}
 	if claim.Job.Spec.Restartable && lifecycle.dependencies.handoffs != nil {
-		if err := resetRestartableHandoff(claim.Job.Spec); err != nil {
+		if err := prepareRestartableResults(claim.Job.Spec, claim.Lease.AttemptID); err != nil {
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
+		executionSpec.Env = cloneEnvironment(executionSpec.Env)
+		directory := filepath.Join(claim.Job.Spec.Execution.HandoffDirectory, restartableResultPath(claim.Lease.AttemptID))
+		executionSpec.Env[contract.EnvHandoffDir] = directory
 	}
 	// The run mailbox is prepared before the workload starts, so a job that
 	// writes its first event immediately has somewhere to write it. Mailbox
