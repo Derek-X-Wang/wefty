@@ -188,7 +188,22 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, err
 		}
 		enrolCtx, cancelEnrol := context.WithCancel(ctx)
-		var loginErr error
+		var loginErr, progressErr error
+		var lastProgress fabric.EnrolProgress
+		spec.Progress = func(progress fabric.EnrolProgress) {
+			if progressErr != nil {
+				return
+			}
+			message := fmt.Sprintf("%s (%s participant)", progress.Description(), participant.role)
+			if progress == lastProgress || progress == fabric.EnrolWaitingForSignIn || progress == fabric.EnrolWaitingForDeviceApproval {
+				message += "; " + progress.Advice()
+			}
+			lastProgress = progress
+			_, progressErr = fmt.Fprintln(request.output, message)
+			if progressErr != nil {
+				cancelEnrol()
+			}
+		}
 		if participant.role == connprofile.ParticipantPerson && request.openLoginURL != nil {
 			spec.LoginURL = func(value string) {
 				if err := request.openLoginURL(enrolCtx, value); err != nil {
@@ -199,11 +214,24 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 		}
 		self, enrolErr := request.enroller.Enrol(enrolCtx, spec)
 		cancelEnrol()
-		if loginErr != nil {
+		// A browser opener can also be cancelled as enrolment expires. Keep the
+		// adapter's typed expiry instead of replacing it with that secondary error.
+		var timeout *fabric.EnrolTimeoutError
+		if loginErr != nil && !errors.As(enrolErr, &timeout) {
 			enrolErr = loginErr
 		}
+		if progressErr != nil {
+			enrolErr = errors.New("could not write enrolment progress; rerun setup to resume")
+		}
+		timedOut := errors.As(enrolErr, &timeout)
+		if timedOut {
+			if participant.role == connprofile.ParticipantPerson {
+				enrolErr = timeout
+			}
+			enrolErr = fmt.Errorf("%s participant: %w", participant.role, enrolErr)
+		}
 		// Provider errors may contain browser URLs even when no callback arrived.
-		if enrolErr != nil && participant.role == connprofile.ParticipantPerson {
+		if enrolErr != nil && participant.role == connprofile.ParticipantPerson && !timedOut {
 			var inUse *fabric.ParticipantInUseError
 			if errors.As(enrolErr, &inUse) {
 				enrolErr = &fabric.ParticipantInUseError{Participant: participant.name}
@@ -295,7 +323,7 @@ func enrolSetupParticipants(ctx context.Context, request setupEnrolmentRequest) 
 			return profile, rollback(err)
 		}
 		if self.NetworkName != requestedNetworkName && !request.deferNotices {
-			if _, err := fmt.Fprintf(request.output, "The network gave %s because %s is taken; retire the stale device to free the name.\n", self.NetworkName, requestedNetworkName); err != nil {
+			if _, err := fmt.Fprintln(request.output, setupNetworkNameCollisionNotice(participant.role, self.NetworkName, requestedNetworkName)); err != nil {
 				return profile, err
 			}
 		}
@@ -361,4 +389,12 @@ func readSetupJoinKey(ctx context.Context, input io.Reader, reader *bufio.Reader
 		return "", fmt.Errorf("join key for %s is empty", role)
 	}
 	return key, nil
+}
+
+func setupNetworkNameCollisionNotice(role, granted, requested string) string {
+	advice := "retire the stale device to free the name"
+	if role == connprofile.ParticipantNodeAgent || role == connprofile.ParticipantClient || role == connprofile.ParticipantPerson {
+		advice += ", or choose a --node-id with a different machine name, such as studio-desk, for a new installation"
+	}
+	return fmt.Sprintf("The network gave %s because %s is taken; %s.", granted, requested, advice)
 }

@@ -432,7 +432,7 @@ func TestSetupRecordsGrantedNetworkNameAndPreservesLegacy(t *testing.T) {
 				t.Fatal(err)
 			}
 			if grant == "wefty-studio-client-2" {
-				want := "The network gave wefty-studio-client-2 because wefty-studio-client is taken; retire the stale device to free the name.\n"
+				want := "The network gave wefty-studio-client-2 because wefty-studio-client is taken; retire the stale device to free the name, or choose a --node-id with a different machine name, such as studio-desk, for a new installation.\n"
 				if strings.Count(report.String(), want) != 1 || strings.Contains(report.String(), "fake-key") {
 					t.Fatalf("collision report=%q", report.String())
 				}
@@ -477,4 +477,205 @@ func (e *networkNameSetupEnroller) Enrol(ctx context.Context, spec fabric.EnrolS
 	self, err := e.fakeSetupEnroller.Enrol(ctx, spec)
 	self.NetworkName = e.grant
 	return self, err
+}
+
+type progressSetupEnroller struct {
+	fakeSetupEnroller
+	failRole string
+	states   []fabric.EnrolProgress
+}
+
+func (e *progressSetupEnroller) Enrol(ctx context.Context, spec fabric.EnrolSpec) (fabric.SelfIdentity, error) {
+	states := e.states
+	if states == nil {
+		states = []fabric.EnrolProgress{fabric.EnrolStarting, fabric.EnrolWaitingForSignIn, fabric.EnrolWaitingForDeviceApproval, fabric.EnrolConnecting}
+	}
+	for _, state := range states {
+		if spec.Progress != nil {
+			spec.Progress(state)
+		}
+	}
+	self, err := e.fakeSetupEnroller.Enrol(ctx, spec)
+	if err == nil && filepath.Base(spec.StateDirectory) == e.failRole {
+		state := fabric.EnrolWaitingForDeviceApproval
+		if e.failRole == "person" {
+			state = fabric.EnrolWaitingForSignIn
+		}
+		return fabric.SelfIdentity{}, &fabric.EnrolTimeoutError{State: state, NeedsJoinKey: spec.Credential.Value != ""}
+	}
+	return self, err
+}
+
+func TestSetupEnrolmentProgressNamesEveryParticipantAndHidesSecrets(t *testing.T) {
+	f := newSetupFixture(t)
+	paths, _ := resolveSetupPaths(f.home)
+	e := &progressSetupEnroller{}
+	var output bytes.Buffer
+	participants := []setupParticipant{{"l1", "wefty://control-plane"}, {"l3", "wefty://run-ledger"}, {"node-agent", "wefty://node/studio"}, {"client", "wefty://client/studio"}, {"person", "wefty://person/studio"}}
+	_, err := enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: participants, enroller: e, input: strings.NewReader("secret-progress-l1\nsecret-progress-l3\nsecret-progress-node\nsecret-progress-client\n"), output: &output, loginURL: func(string) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range participants {
+		for _, text := range []string{"starting network enrolment", "waiting for browser sign-in", "waiting for the network to approve this device", "connecting to the network"} {
+			if !strings.Contains(output.String(), text+" ("+part.role+" participant)") {
+				t.Errorf("missing progress %s/%s", part.role, text)
+			}
+		}
+	}
+	for _, secret := range []string{"secret-progress-l1", "secret-progress-l3", "secret-progress-node", "secret-progress-client", "https://login.invalid/one-use"} {
+		if bytes.Contains(output.Bytes(), []byte(secret)) {
+			t.Fatal("secret in progress output")
+		}
+	}
+}
+
+func TestSetupFleetEnrolmentTimeoutResumes(t *testing.T) {
+	for _, person := range []bool{false, true} {
+		t.Run(map[bool]string{false: "l3", true: "person"}[person], func(t *testing.T) {
+			f, base, output := newFleetFixture(t)
+			request := setupRequest{role: "control-plane", nodeID: "studio-0123abcd"}
+			failRole := "l3"
+			if person {
+				f, base, output = newJoinFixture(t)
+				request = setupRequest{role: "join", nodeID: "studio-0123abcd", joinCode: joinCodeForTest(t, "opaque-l1", "opaque-l3", ""), withPerson: true}
+				f.host.ownerLogin = func(context.Context, string) error { return nil }
+				failRole = "person"
+			}
+			e := &progressSetupEnroller{fakeSetupEnroller: *base, failRole: failRole}
+			f.host.enroller = e
+			_, err := runSetup(t.Context(), f.host, request)
+			var timeout *fabric.EnrolTimeoutError
+			if !errors.As(err, &timeout) || commandExitCode(err) != exitFailure || !strings.Contains(err.Error(), failRole+" participant") || !strings.Contains(err.Error(), "rerun setup") {
+				t.Fatalf("typed timeout lost: %v", err)
+			}
+			paths, _ := resolveSetupPaths(f.home)
+			stage, readErr := connprofile.Read(filepath.Join(paths.config, fleetSetupProfileName))
+			savedCount := 1
+			if person {
+				savedCount = 2
+			}
+			if readErr != nil || len(stage.Participants) != savedCount {
+				t.Fatalf("lost earlier progress: %+v %v", stage, readErr)
+			}
+			if _, err := os.Stat(paths.profile); !os.IsNotExist(err) {
+				t.Fatal("published profile before completion")
+			}
+			if _, err := os.Stat(filepath.Join(paths.config, setupManifestName)); !os.IsNotExist(err) {
+				t.Fatal("published receipt before completion")
+			}
+			if len(f.launchd.mutating()) != 0 {
+				t.Fatal("started service before completion")
+			}
+			if _, err := os.Stat(filepath.Join(paths.data, "fabric", failRole)); !os.IsNotExist(err) {
+				t.Fatal("failed enrolment folder prevents resume")
+			}
+			failedOutput := append([]byte(nil), output.Bytes()...)
+			for _, secret := range []string{"secret-l1", "secret-l3", "secret-node", "secret-client", "https://login.invalid/one-use"} {
+				if bytes.Contains(failedOutput, []byte(secret)) || strings.Contains(err.Error(), secret) {
+					t.Fatal("secret in timeout output")
+				}
+			}
+			e.failRole = ""
+			output.Reset()
+			if person {
+				f.host.enrolmentInput = failingSetupKeyInput{t}
+			} else {
+				f.host.enrolmentInput = strings.NewReader("retry-l3\nretry-node\nretry-client\n")
+			}
+			request.nodeID = ""
+			report, err := runSetup(t.Context(), f.host, request)
+			if err != nil || len(report.Services) != map[bool]int{false: 4, true: 2}[person] {
+				t.Fatalf("resume failed: %+v %v", report, err)
+			}
+			want := []string{"l1", "l3", "l3", "node-agent", "client"}
+			if person {
+				want = []string{"node-agent", "client", "person", "person"}
+			}
+			if !slices.Equal(e.roles, want) {
+				t.Fatal("saved participants reenrolled", e.roles)
+			}
+		})
+	}
+}
+
+func TestSetupDefaultNodeIDsCanShareNetworkName(t *testing.T) {
+	first, err := newSetupNodeID("studio.local", bytes.NewReader([]byte{1, 2, 3, 4}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newSetupNodeID("studio.local", bytes.NewReader([]byte{5, 6, 7, 8}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != "studio-01020304" || second != "studio-05060708" {
+		t.Fatal(first, second)
+	}
+	distinct, err := fabric.RequestedNetworkName("wefty://node/studio-desk")
+	if err != nil || distinct != "wefty-studio-desk" {
+		t.Fatalf("different machine name=%q err=%v", distinct, err)
+	}
+	for _, id := range []string{first, second} {
+		name, err := fabric.RequestedNetworkName("wefty://node/" + id)
+		if err != nil || name != "wefty-studio" {
+			t.Fatalf("network name=%q err=%v", name, err)
+		}
+	}
+}
+
+func TestSetupEnrolmentFixedServiceCollisionKeepsRelevantAdvice(t *testing.T) {
+	for _, part := range []setupParticipant{{"l1", "wefty://control-plane"}, {"l3", "wefty://run-ledger"}} {
+		t.Run(part.role, func(t *testing.T) {
+			f := newSetupFixture(t)
+			paths, _ := resolveSetupPaths(f.home)
+			name, _ := fabric.RequestedNetworkName(part.name)
+			e := &networkNameSetupEnroller{grant: name + "-2"}
+			var output bytes.Buffer
+			_, err := enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{part}, enroller: e, input: strings.NewReader("secret-fixed-name-key\n"), output: &output})
+			if err != nil || !strings.Contains(output.String(), "retire the stale device") || strings.Contains(output.String(), "--node-id") {
+				t.Fatalf("fixed service name advice=%q err=%v", output.String(), err)
+			}
+		})
+	}
+}
+
+func TestSetupEnrolmentTimeoutKeepsTypeWhenBrowserIsCancelled(t *testing.T) {
+	f := newSetupFixture(t)
+	paths, _ := resolveSetupPaths(f.home)
+	e := &progressSetupEnroller{failRole: "person"}
+	var output bytes.Buffer
+	_, err := enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"person", "wefty://person/studio"}}, enroller: e, output: &output, openLoginURL: func(context.Context, string) error { return context.Canceled }})
+	var timeout *fabric.EnrolTimeoutError
+	if !errors.As(err, &timeout) || timeout.State != fabric.EnrolWaitingForSignIn {
+		t.Fatalf("browser cancellation hid the enrolment time limit: %v", err)
+	}
+	if bytes.Contains(output.Bytes(), []byte("https://login.invalid/one-use")) || strings.Contains(err.Error(), "https://login.invalid/one-use") {
+		t.Fatal("browser URL exposed")
+	}
+}
+
+func TestSetupEnrolmentProgressKeepsHealthyStatesShortAndRepeatAdviceUseful(t *testing.T) {
+	f := newSetupFixture(t)
+	paths, _ := resolveSetupPaths(f.home)
+	e := &progressSetupEnroller{states: []fabric.EnrolProgress{fabric.EnrolStarting, fabric.EnrolStarting, fabric.EnrolConnecting, fabric.EnrolConnecting, fabric.EnrolWaitingForDeviceApproval, fabric.EnrolWaitingForSignIn}}
+	var output bytes.Buffer
+	_, err := enrolSetupParticipants(t.Context(), setupEnrolmentRequest{home: f.home, data: paths.data, profilePath: paths.profile, participants: []setupParticipant{{"l3", "wefty://run-ledger"}}, enroller: e, input: strings.NewReader("secret-quiet-key\n"), output: &output})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"starting network enrolment (l3 participant)\n",
+		"starting network enrolment (l3 participant); check network access, the coordinator, and the join key if used\n",
+		"connecting to the network (l3 participant)\n",
+		"connecting to the network (l3 participant); check network access, the coordinator, and the join key if used\n",
+		"waiting for the network to approve this device (l3 participant); approve it in your network's admin console, or use a pre-approved key\n",
+		"waiting for browser sign-in (l3 participant); complete sign-in in the browser\n",
+	} {
+		if strings.Count(output.String(), want) != 1 {
+			t.Errorf("expected one progress line %q: %q", want, output.String())
+		}
+	}
+	if bytes.Contains(output.Bytes(), []byte("secret-quiet-key")) {
+		t.Fatal("progress exposed key")
+	}
 }

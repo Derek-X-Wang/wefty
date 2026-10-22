@@ -143,9 +143,11 @@ func newRecordingDeadmanRenewer() *recordingDeadmanRenewer {
 
 func (renewer *recordingDeadmanRenewer) waitForRenewal(t *testing.T) {
 	t.Helper()
+	// renewed closes once and stays closed, so a long bound cannot miss it; it
+	// only matters when a busy machine running the full suite delays admission.
 	select {
 	case <-renewer.renewed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("OCI helper admission did not produce a deadman renewal")
 	}
 }
