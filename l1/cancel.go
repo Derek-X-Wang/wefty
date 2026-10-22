@@ -110,7 +110,7 @@ func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCal
 			return Job{}, protocolError(contract.ErrorCancelNotQueued, "only queued one-shots can be canceled")
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state='failed', outcome='canceled',
-			current_attempt_id=NULL, prestart_terminal_reason=NULL, prestart_next_retry_at_ns=NULL,
+			current_attempt_id=NULL, prestart_terminal_reason=NULL, prestart_next_retry_at_ns=NULL, next_restart_at_ns=NULL,
 			updated_ns=? WHERE job_id=? AND state='queued'`, now.UnixNano(), jobID); err != nil {
 			return Job{}, internalError(err, "cancel queued job")
 		}

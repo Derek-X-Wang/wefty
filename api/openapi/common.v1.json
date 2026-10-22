@@ -224,7 +224,10 @@
             }
           },
           "created_at": { "type": "string", "format": "date-time" },
-          "updated_at": { "type": "string", "format": "date-time" }
+          "updated_at": { "type": "string", "format": "date-time" },
+          "restart": {
+            "$ref": "#/components/schemas/OneshotRestartFacts"
+          }
         }
       },
       "AdminPolicy": {
@@ -1085,13 +1088,28 @@
         "properties": {
           "attempt_id": { "type": "string" },
           "node_id": { "type": "string" },
-          "state": { "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost"] },
+          "state": { "enum": [
+            "claimed",
+            "running",
+            "awaiting-input",
+            "succeeded",
+            "failed",
+            "lost",
+            "interrupted"
+          ] },
           "lease_expires_at": { "type": "string", "format": "date-time" },
           "result": { "$ref": "#/components/schemas/ProcessResult" },
           "late_result": { "$ref": "#/components/schemas/LateResultEvidence" },
           "image": { "$ref": "#/components/schemas/OCIImageEvidence" },
           "created_at": { "type": "string", "format": "date-time" },
-          "updated_at": { "type": "string", "format": "date-time" }
+          "updated_at": { "type": "string", "format": "date-time" },
+          "interruption_reason": {
+            "enum": [
+              "upgrade",
+              "agent_shutdown",
+              "lease_expired"
+            ]
+          }
         }
       },
       "LateResultEvidence": {
@@ -1140,6 +1158,15 @@
           "directive": {
             "enum": ["stop", "restart", "cancel"],
             "description": "Attempt-scoped intent: stop/restart for services, cancel for process and OCI one-shots. Cancel uses TERM, a five-second grace, then KILL. Omission means no lifecycle change is requested."
+          },
+          "interruption_reason": {
+            "enum": [
+              "upgrade"
+            ]
+          },
+          "interruption_request_key": {
+            "type": "string",
+            "minLength": 1
           }
         }
       },
@@ -1743,12 +1770,17 @@
               "awaiting-input",
               "succeeded",
               "failed",
-              "lost"
+              "lost",
+              "interrupted"
             ]
           },
           "lease_expires_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "restartable": {
+            "type": "boolean",
+            "default": false
           }
         },
         "description": "Nonterminal persisted attempt on this Node, including prior boots until reconciled. Read routes preserve attempts whose leases have expired until background reconciliation records their expiry. Reports execution state and lease, never a credential, fence or proof that a payload is physically running."
@@ -1946,6 +1978,91 @@
       },
       "GateResult": {
         "$ref": "../../contract/schemas/v1/gate-result.schema.json"
+      },
+      "OneshotRestartFacts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "count",
+          "limit",
+          "pending",
+          "last_reason",
+          "previous_attempt_id",
+          "current_attempt_id",
+          "next_restart_at",
+          "terminal_reason"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10
+          },
+          "limit": {
+            "type": "integer",
+            "const": 10
+          },
+          "pending": {
+            "type": "boolean"
+          },
+          "last_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "upgrade",
+                  "agent_shutdown",
+                  "lease_expired"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "previous_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "current_attempt_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_restart_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "terminal_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "restart_limit_reached"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
       }
     },
     "headers": {

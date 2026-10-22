@@ -292,6 +292,7 @@ const (
 	detachImageLatch         detachCause = "image-latch"
 	detachCompletion         detachCause = "completion"
 	detachStorageDestination detachCause = "storage-destination"
+	detachOneshotRecovery    detachCause = "oneshot-recovery"
 )
 
 // detachAttempt changes only the bindings. The caller owns Job settlement and
@@ -308,8 +309,8 @@ func detachAttempt(ctx context.Context, tx *sql.Tx, jobID, completedAttemptID st
 		}
 		query += ", completion_replay_attempt_id=?"
 		args = append(args, completedAttemptID)
-	case detachStorageDestination:
-		// Storage destinations clear the runtime binding without retaining it
+	case detachStorageDestination, detachOneshotRecovery:
+		// Storage destinations and lost one-shot recovery clear the runtime binding without retaining it
 		// for replay. Leave any existing replay binding untouched, as before.
 	default:
 		return fmt.Errorf("unknown detach cause %q", cause)
@@ -364,6 +365,12 @@ func invalidateAttempts(ctx context.Context, tx *sql.Tx, targetID string, cause 
 // completion accepted under one registration stays accepted under the next.
 // Identity, path, and fence are checked by validateAttemptEvidence first.
 func validateCompletionReplayBinding(attemptID string, a attemptAuthority) error {
+	// The caller already checked original provenance and exact accepted key/body.
+	// An interrupted one-shot's successor cannot revoke that read-only receipt.
+	if a.state == contract.AttemptInterrupted && a.spec.Restartable && a.completionKey.Valid {
+		return nil
+	}
+
 	if a.currentAttempt.Valid && a.currentAttempt.String != attemptID {
 		return protocolError(contract.ErrorAttemptMismatch, "attempt is not the job's current attempt")
 	}

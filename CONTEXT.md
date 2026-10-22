@@ -115,6 +115,11 @@ One node's leased, fenced execution of a job. A job may outlive a lost
 attempt; an attempt never outlives its lease.
 _Avoid_: try, execution instance
 
+**Restartable**:
+Permission for a Job to start a fresh Attempt after infrastructure interruption.
+Command failure and cancellation do not grant this permission.
+_Avoid_: retry, service restart policy, resumable
+
 **Attempt credential**:
 An opaque bearer L1 mints when a node agent claims an attempt and delivers to
 the workload. It lets the workload act as a delegate of the job's original
