@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -94,13 +95,20 @@ type AdminPolicyMutationRequest struct {
 	PolicyRevision int64  `json:"policy_revision"`
 }
 
-// personDeviceBindingContextKey is set only by authenticated Fabric person
-// authentication, never by request data or the self-asserted development override.
-type personDeviceBindingContextKey struct{}
+// personDeviceBinding is the Store's one-way authenticated-trust latch.
+// Read models share it rather than copying a possibly stale requirement.
+type personDeviceBinding struct {
+	enabled atomic.Bool
+}
 
-func personDeviceBindingRequired(ctx context.Context) bool {
-	required, _ := ctx.Value(personDeviceBindingContextKey{}).(bool)
-	return required
+func (s *Store) requirePersonDeviceBinding() {
+	s.personDeviceBinding.enabled.Store(true)
+}
+
+// required reports the Store's latch. The context is not consulted: no request
+// value can add or remove the requirement.
+func (b *personDeviceBinding) required(context.Context) bool {
+	return b != nil && b.enabled.Load()
 }
 
 func validatePersonIdentity(identity fabric.Identity) error {
@@ -309,7 +317,7 @@ func (s *Store) BootstrapAdmin(ctx context.Context, identity fabric.Identity, no
 			"admin bootstrap is closed for the current authority generation")
 	}
 	deviceID := ""
-	if personDeviceBindingRequired(ctx) {
+	if s.personDeviceBinding.required(ctx) {
 		deviceID = identity.DeviceID
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO admins(fabric_id, user_id, device_id, added_revision, added_ns)
@@ -399,9 +407,14 @@ func readAdminPolicy(ctx context.Context, q queryer) (AdminPolicy, error) {
 
 // currentAdminPerson distinguishes a nonadministrator from a rostered person
 // whose device is refused. Callers must never turn that refusal into a grant.
-func currentAdminPerson(ctx context.Context, q queryer, identity fabric.Identity) (bool, error) {
+func (b *personDeviceBinding) currentAdminPerson(ctx context.Context, q queryer, identity fabric.Identity) (bool, error) {
 	if err := validatePersonIdentity(identity); err != nil {
 		return false, err
+	}
+	if b == nil {
+		// A read model built without the Store's latch cannot know whether the
+		// device is required, so it refuses rather than skip the binding.
+		return false, internalError(errors.New("person-device binding is not wired into this read model"), "read current admin")
 	}
 	var deviceID string
 	err := q.QueryRowContext(ctx, `SELECT device_id FROM admins WHERE fabric_id=? AND user_id=?`, identity.FabricID, identity.UserID).Scan(&deviceID)
@@ -411,7 +424,7 @@ func currentAdminPerson(ctx context.Context, q queryer, identity fabric.Identity
 	if err != nil {
 		return false, internalError(err, "read current admin")
 	}
-	if personDeviceBindingRequired(ctx) {
+	if b.required(ctx) {
 		if err := requireBoundPersonDevice(identity, deviceID); err != nil {
 			return false, err
 		}
@@ -419,8 +432,8 @@ func currentAdminPerson(ctx context.Context, q queryer, identity fabric.Identity
 	return true, nil
 }
 
-func requireCurrentAdmin(ctx context.Context, q queryer, identity fabric.Identity) error {
-	current, err := currentAdminPerson(ctx, q, identity)
+func (b *personDeviceBinding) requireCurrentAdmin(ctx context.Context, q queryer, identity fabric.Identity) error {
+	current, err := b.currentAdminPerson(ctx, q, identity)
 	if err != nil {
 		return err
 	}
@@ -476,7 +489,7 @@ func (s *Store) AddAdmin(
 	if err != nil {
 		return AdminPolicy{}, err
 	}
-	if personDeviceBindingRequired(ctx) {
+	if s.personDeviceBinding.required(ctx) {
 		if deviceID == "" {
 			return AdminPolicy{}, protocolError(contract.ErrorInvalidRequest, "admin add requires device_id from the subject person's wefty whoami")
 		}
@@ -518,7 +531,7 @@ func (s *Store) mutateAdmin(
 	}
 	tx := write.tx
 	defer write.rollback()
-	if err := requireCurrentAdmin(ctx, tx, identity); err != nil {
+	if err := s.personDeviceBinding.requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return AdminPolicy{}, err
 	}
 	var revision int64

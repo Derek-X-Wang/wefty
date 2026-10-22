@@ -450,7 +450,9 @@ func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Cont
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&anchor); err != nil {
 		return err
 	}
-	return use(ctx, transactionReads(tx, canonicalTime(s.clock.Now())))
+	reads := newDatabaseReads(tx, canonicalTime(s.clock.Now()), nil)
+	reads.personDeviceBinding = &s.personDeviceBinding
+	return use(ctx, reads)
 }
 
 func (s *Server) writeAgentComputer(w http.ResponseWriter, r *http.Request, status int, computer Computer) {
