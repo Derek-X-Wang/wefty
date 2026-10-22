@@ -10,6 +10,7 @@ import (
 )
 
 var helpCommands = []string{
+	"open",
 	"", "help", "exec", "setup", "submit", "status", "whoami", "cancel", "rerun", "logs", "wait", "results", "inspect", "drain",
 	"nodes", "nodes list", "nodes inspect", "nodes set-claims", "jobs", "jobs list", "computers", "computers list", "runs", "runs list",
 	"admin", "admin bootstrap", "admin policy", "admin policy get", "admin policy add", "admin policy remove",
@@ -111,6 +112,8 @@ func expectedHelpFirstLine(command string) string {
 		return "usage: wefty " + command
 	}
 	switch {
+	case command == "open":
+		return "Usage: wefty open SERVICE [--local-port N] [--no-browser]"
 	case command == "exec":
 		return "Usage: wefty exec [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>"
 	case command == "run" || strings.HasPrefix(command, "run "):

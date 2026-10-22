@@ -142,6 +142,16 @@ func TestUpgradeDrainRealL1KeepsResultsQueueServiceDataAndPort(t *testing.T) {
 				t.Fatalf("service interrupted during drain: %+v %v", active, err)
 			}
 			for _, c := range []*l1.Claim{residentClaim, lateClaim} {
+				if c == nil {
+					continue
+				}
+				job, err := h.store.GetJob(ctx, c.Job.JobID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if job.State == contract.JobSucceeded {
+					continue
+				}
 				zero := 0
 				if _, err := h.store.CompleteAttempt(ctx, registered.identity.NodeID, c.Job.JobID, c.Lease.AttemptID, l1.CompletionRequest{FencingToken: c.Lease.FencingToken, IdempotencyKey: "normal-completion", Result: l1.ProcessResult{ExitCode: &zero}}); err != nil {
 					t.Fatal(err)

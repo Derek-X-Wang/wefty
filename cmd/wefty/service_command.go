@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -324,7 +325,32 @@ func executeServiceStatus(ctx context.Context, clients *apiClients, jsonOutput b
 	if computer != nil {
 		return writeComputerProjection(stdout, newComputerProjection(*computer, nil, nil), jsonOutput)
 	}
-	return writeServiceResult(stdout, *job, jsonOutput)
+	if !clients.participantProfile || job.ServiceJob == nil || job.PublishedPort == nil || job.BoundNodeID == "" {
+		return writeServiceResult(stdout, *job, jsonOutput)
+	}
+	node, err := clients.getNode(ctx, job.BoundNodeID)
+	unavailableReason := ""
+	if err != nil {
+		unavailableReason = "node lookup failed"
+	} else if fabric.ValidateNetworkName(node.ConnectHost) != nil {
+		unavailableReason = "no valid registered network name"
+	}
+	service := newServiceOutput(*job)
+	if unavailableReason == "" {
+		service.NetworkURL = fmt.Sprintf("http://%s:%d", node.ConnectHost, *job.PublishedPort)
+	}
+	if err := writeServiceOutput(stdout, service, jsonOutput); err != nil {
+		return err
+	}
+	if jsonOutput {
+		return nil
+	}
+	if unavailableReason != "" {
+		_, err = fmt.Fprintf(stdout, "address from other devices: unavailable (%s)\n", unavailableReason)
+		return err
+	}
+	_, err = fmt.Fprintf(stdout, "Other owned devices: %s\nThis address works only while that device's network app is signed in to the owner's account. Otherwise use wefty open %s on the owner's laptop.\n", service.NetworkURL, job.JobID)
+	return err
 }
 
 func resolveServiceTarget(ctx context.Context, clients *apiClients, target string) (*l1.Job, *l1.Computer, error) {

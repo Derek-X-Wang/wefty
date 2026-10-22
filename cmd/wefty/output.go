@@ -221,6 +221,7 @@ type serviceOutput struct {
 	ManagedDataPath        *string                      `json:"managed_data_path"`
 	WorkingDirectory       *string                      `json:"working_directory"`
 	WorkingDirectoryPolicy string                       `json:"working_directory_policy"`
+	NetworkURL             string                       `json:"network_url,omitempty"`
 }
 
 type serviceListOutput struct {

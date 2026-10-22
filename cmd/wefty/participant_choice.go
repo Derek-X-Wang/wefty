@@ -23,6 +23,11 @@ func (*personSignInRequiredError) Error() string {
 // select exactly one enrolled identity, without carrying legacy person fields.
 func commandFabricConfig(options globalOptions, args []string) (fabricconfig.Config, error) {
 	person := usesPersonProtocol(args)
+	openCommand := len(args) > 0 && args[0] == "open"
+	openShortcut := len(options.participants) != 0 && openCommand
+	if openCommand && (openShortcut && localPersonSignIn(options, time.Now()) != "signed_in" || len(options.participants) == 0 && options.fabricMode != "plain") {
+		return fabricconfig.Config{}, &fabric.ParticipantIdentityError{Person: true, Reason: "is required: this shortcut needs the owner's person sign-in on this laptop"}
+	}
 	config := fabricconfig.Config{
 		Mode: options.fabricMode, PlainFabricID: options.plainFabricID,
 		Name: options.fabricName, StateDirectory: options.stateDirectory,

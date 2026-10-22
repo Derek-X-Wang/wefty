@@ -228,6 +228,9 @@ func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.W
 		}
 		var identity *fabric.ParticipantIdentityError
 		var unreachable *fabric.ParticipantUnreachableError
+		if commandArgs[0] == "open" && errors.As(err, &identity) && identity.Person {
+			return fmt.Errorf("this shortcut needs the owner's person sign-in on this laptop: %w", err)
+		}
 		if config.ExpectedIdentity != nil && commandArgs[0] == "status" && (errors.As(err, &identity) || errors.As(err, &unreachable)) {
 			return reportParticipantCheckFailure(stdout, options, config, err)
 		}
@@ -244,6 +247,30 @@ func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.W
 	if clients.participantProfile {
 		clients.clientIdentityID = config.Identity.NodeID
 		clients.localPersonSignIn = localPersonSignIn(options, time.Now())
+	}
+	if commandArgs[0] == "open" && clients.participantProfile {
+		// L1 lookups keep the client participant selected above. Only the
+		// publication stream uses the independently checked saved person.
+		personOptions := options
+		// Primary name/folder flags apply to the client. The secondary person
+		// always uses its own saved record, as in the client service.
+		personOptions.explicitFlags = nil
+		personConfig, err := commandFabricConfig(personOptions, []string{"whoami"})
+		if err != nil {
+			return fmt.Errorf("this shortcut needs the owner's person sign-in on this laptop: %w", err)
+		}
+		person, closePerson, err := openFabric(ctx, personConfig)
+		if closePerson != nil {
+			defer func() { _ = closePerson() }()
+		}
+		if err != nil {
+			var identity *fabric.ParticipantIdentityError
+			if errors.As(err, &identity) && identity.Person {
+				return fmt.Errorf("this shortcut needs the owner's person sign-in on this laptop: %w", err)
+			}
+			return err
+		}
+		clients.servicePerson = person
 	}
 	return execute(ctx, clients, options.jsonOutput, commandArgs, stdout, stderr)
 }
@@ -306,7 +333,7 @@ func parseGlobalOptions(args []string, stderr io.Writer) (globalOptions, []strin
 	// The coordinator default is resolved after authoring dispatch. Join
 	// credentials belong only to setup, never an ordinary CLI participant.
 	flags.StringVar(&options.authKey, "auth-key", "", "legacy tsnet join key (default $TS_AUTHKEY); participant enrolment belongs to setup")
-	flags.StringVar(&options.controlURL, "control-url", "", "optional tsnet coordination URL (default $TS_CONTROL_URL)")
+	flags.StringVar(&options.controlURL, "control-url", "", "optional coordination URL, also selects the fleet setup coordinator (default $TS_CONTROL_URL)")
 	flags.BoolVar(&options.ephemeral, "ephemeral", false, "register an ephemeral tsnet node")
 	flags.BoolVar(&options.printEnrollmentURL, "fabric-print-enrollment-url", os.Getenv("WEFTY_FABRIC_PRINT_ENROLLMENT_URL") == "1", "print the raw tsnet enrollment URL instead of the wefty-owned notice on first login (also WEFTY_FABRIC_PRINT_ENROLLMENT_URL=1)")
 	flags.StringVar(&options.nodeConfigPath, "node-config", defaultNodeConfigPath(), "installed node configuration used by exec, status and singular node commands")
@@ -392,6 +419,7 @@ const fabricNameHelp = "Fabric node name (legacy default: wefty-cli; participant
 const rootUsage = `Usage: wefty [global flags] <command>
 
 --fabric-name NAME: ` + fabricNameHelp + `
+--control-url URL: Select the coordinator, including for fleet setup (default $TS_CONTROL_URL).
 
 --json[=true|false] is accepted before or after a command and its arguments.
 Every command uses typed exits: usage 2, unauthorized 3, not found 4,
@@ -399,9 +427,17 @@ conflict 5, unavailable 13, accepted-mutation wait timeout 14, other failure 1. 
 
 Commands:
   upgrade [--yes] [--drain-timeout DURATION]  Build latest main and upgrade this Mac's installed stack
-  setup [--from DIR]         Install L1, L3 and a node agent as login services on
-                             this Mac and write the connection profile
-                             --remove keeps data and logs; --purge deletes them
+  setup [--from DIR] [--node-id ID]
+                             Install the daily plain Mac stack and connection profile
+    --role control-plane|join
+                             Install a fleet role on Mac or Linux
+    --join-code CODE [--with-person]
+                             Join a fleet; person sign-in is for the owner's laptop only
+    --role join --join-code CODE --convert-plain
+                             Convert this Mac's plain install, retaining read-only history
+                             --node-id chooses a stable ID on first install
+                             Plain Mac only: --remove keeps data and logs; --purge deletes them
+                             Fleet removal is not supported yet
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
   whoami                    Observe the current Fabric-scoped person identity in L1
   admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
@@ -421,6 +457,8 @@ Commands:
   jobs list                  List readable jobs with filters and cursor paging
     [--class CLASS --kind KIND --state STATE --submitter me --limit N --cursor CURSOR]
   computers list             List Computers with --cursor, --limit, --all
+  open SERVICE [--local-port N] [--no-browser]
+                             Open a published service; fleet shortcuts stop with Ctrl-C
   services <verb>            Create and operate service-class jobs
     create [--computer --name NAME --image IMAGE --node NODE_ID --argv ARG --working-directory PATH --mount SPEC --memory-bytes BYTES --cpu-millicores VALUE --runtime-handler NAME --disk-bytes BYTES --backup-cap COUNT --idempotency-key KEY]
     list [--limit COUNT --cursor CURSOR]

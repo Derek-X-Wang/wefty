@@ -154,6 +154,15 @@ per-user [client service](client-service.md); they never open the saved backend
 themselves and never fall back to a direct backend when the service is absent.
 Missing saved state is refused before contacting the service. A lock file
 alone does not count as saved state.
+
+`open` uses the client participant for L1 service and node reads, then a
+separate saved person participant for published-port streams through the client
+service. Both participants must pass their existing checks before a local
+listener opens. Missing client state retains `machine_identity_required` (exit
+3); missing or expired person sign-in retains `person_identity_required` (exit
+3). Primary name/folder flags select the client; the secondary person always
+uses its own saved record. Neither participant substitutes for the other.
+
 The fleet cutover starts with an empty control plane, so legacy run ownership
 never needs to cross into the strict rule.
 
@@ -218,9 +227,10 @@ hint. Neither shape retries as the person; JSON preserves the server's error
 envelope.
 
 The setup enrolment step is callable independently of service installation.
-The plain `wefty setup` flow is unchanged. Mac control-plane setup uses a durable
-staged profile and ordered publication. Joining and explicit plain-to-join
-conversion use the same staged publication; Linux remains a later #900 slice.
+The plain `wefty setup` flow is unchanged. Fleet control-plane setup on Mac and
+Linux uses a durable staged profile and ordered publication. Joining (Mac and
+Linux) and explicit plain-to-join conversion (Mac only) use the same staged
+publication.
 See [installation roles](installation-service-plan.md).
 See [Fabric enrolment](fabric-enrolment.md) for the step's contract.
 

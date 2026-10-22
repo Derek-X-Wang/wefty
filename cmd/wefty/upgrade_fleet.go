@@ -242,6 +242,16 @@ func fleetUpgradeOperations(host setupHost, paths setupPaths, p connprofile.Prof
 			return
 		}
 	}
+	if host.upgrade == nil || host.upgrade.interruptAttempt == nil {
+		op.interruptAttempt = func(ctx context.Context, _ connprofile.Profile, attempt string, request l1.InterruptRestartableAttemptRequest) (job l1.Job, err error) {
+			err = with(ctx, func(ctx context.Context, c *apiClients) error {
+				var err error
+				job, err = c.interruptRestartableAttempt(ctx, p.Identities.Node, attempt, request)
+				return err
+			})
+			return
+		}
+	}
 	return op
 }
 
@@ -443,7 +453,12 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 	if len(drainTimeout) > 0 {
 		bound = drainTimeout[0]
 	}
-	drain, err := beginUpgradeDrain(ctx, op, paths, profile, baseline, bound)
+	var deadline time.Time
+	baseline, deadline, err = waitUpgradeGap(ctx, op, profile, baseline, yes, bound, warnings, &report.RunningWork, &report.upgradeDrainCounts)
+	if err != nil {
+		return report, err
+	}
+	drain, err := beginUpgradeDrain(ctx, op, paths, profile, baseline, bound, deadline)
 	if drain != nil {
 		defer func() {
 			if err := finishUpgradeDrain(ctx, op, paths, profile, drain, false, warnings); err != nil {
@@ -451,6 +466,7 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 			}
 			report.RestartedServices = slices.Clone(drain.restarted)
 			report.ClaimsDisabled = drain.claimsDisabled
+			report.upgradeDrainCounts = drain.counts
 		}()
 	}
 	if err != nil {
@@ -530,6 +546,9 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 			current, err := op.observe(ctx, profile)
 			if err != nil {
 				return report, err
+			}
+			for _, attempt := range current.ActiveAttempts {
+				recordUpgradeWork(&report.RunningWork, attempt)
 			}
 			if err := checkUpgradeReplacement(current, drain, yes); err != nil {
 				return report, err

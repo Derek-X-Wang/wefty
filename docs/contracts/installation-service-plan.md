@@ -283,7 +283,7 @@ The installed pre-conversion CLI does not understand the conversion record and
 must not be used for maintenance during an incomplete cutover.
 
 Before changing admission, conversion validates the join code and independently
-selected coordinator, source CLI/agent binaries and service plan. It acquires
+selected coordinator, source CLI/agent/L1 binaries and service plan. It acquires
 the same installation lock as setup and upgrade. A private version-1
 `plain-conversion.json` in the configuration directory records the original
 plain profile, exact LaunchAgent definitions, stable Node ID, join code,
@@ -313,13 +313,96 @@ operator disable remains disabled. No service restart API is called.
 
 An empty resident-attempt list alone is not enough. Before stopping, conversion
 reads every page of L1 jobs and L3 runs through the existing APIs within one
-five-second budget. It refuses queued one-shots, services with desired state
-`running` (including restart backoff with no attempt), and runs in `pending`,
+five-second budget. The service check also runs at each resident-attempt and
+Computer blocker checkpoint, without skipping the one-shot drain wait. It
+refuses queued or claimed one-shots, services with desired state `running`
+(including restart backoff with no attempt), services in `stopping` or
+`removal_pending` even when their desired state is `stopped` or `removed`,
+and runs in `pending`,
 `dispatching`, `queued`, `running` or `awaiting-input`. Refusal is exit 5 and
 lists job/run IDs with `wefty cancel` and `wefty services stop` advice. Unknown,
 incomplete or repeated-cursor inventories refuse rather than imply emptiness.
 After the node agent stops, while L1/L3 are still available, the same inventory
 is checked again before stopping those authorities and moving any history.
+
+After all three plain services are confirmed absent and the database open-files
+check succeeds, conversion checks unfinished work once more, before inventorying
+or moving history. Submissions accepted after the last live check are therefore
+refused and listed with exit 5. An unavailable or invalid post-stop inventory
+also refuses with exit 5. Any blocker or inventory failure takes the
+existing pre-history restore path: restart the exact plain stack and recover
+conversion-owned claim intent. The durable phase remains `stop` during this
+check; an interrupted check can resume or use `--abandon-conversion`. There is
+no new L1 submission fence and no restore after the history boundary.
+
+Before any drain, the CLI runs the selected source `wefty-l1 --version`
+(beside the CLI, or in `--from DIR`) and compares it with its own build commit.
+A mismatch or unavailable version refuses with exit 5 before changing admission
+or stopping services; use CLI and L1 binaries from the same build. The inventory
+uses this source binary, not the old installed L1. A schema error advises
+"upgrade the plain install to this build first". It copies `l1.sqlite`,
+`l3.sqlite` and
+any `-wal` or `-journal` files into one private `0700` temporary folder under
+the home-confined data directory; copies are `0600`. The conversion record
+durably reserves its exact `wefty-conversion-inventory-<random-hex>` path
+**before** folder creation. Success, failure, pre-history resume and
+`--abandon-conversion` remove that recorded folder and clear the reservation.
+Thus a hard kill leaves recoverable copy-cleanup evidence; recovery never
+sweeps unrelated folders or uses a copy as authority. On macOS it first uses an
+APFS clone (`fclonefileat` with `CLONE_NOFOLLOW`) from the descriptor opened
+through the home-confined handle. The clone shares data blocks; it does not
+allocate a second database's worth of storage. Its separate inode, size and
+SHA-256 bytes are verified before SQLite reads it. Original bytes, mtimes and
+permissions stay unchanged. Verification is still proportional to file size.
+
+If cloning is unsupported or crosses volumes (`ENOTSUP`, `ENOSYS`, `EXDEV`),
+conversion falls back to a byte copy. Before each fallback it checks available
+unprivileged space on the destination volume. It requires the file's logical
+size plus a margin of the greater of 64 MiB or 10% of that size. Unknown or
+insufficient free space refuses with a clear message, restores the plain stack
+and exits 5. Other clone errors also refuse rather than hide an inspection or
+permission failure. Both clone and fallback copies receive byte verification.
+
+Preparation has its own size-based bound: 30 seconds plus three read passes over
+the total L1/L3/database-sidecar bytes at 50 MiB/s. The passes budget a fallback
+copy and verification of source/copy; cloning avoids the copy pass. A fresh
+five-second query budget begins only after preparation succeeds. Cancellation
+still stops copying or verification between bounded chunks and restores the
+plain stack. The existing history hashing and read-only boundary stay intact.
+
+Conversion never opens the originals with SQLite, checkpoints them, creates
+their WAL/SHM files or changes their
+bytes or mtimes. SHM is rebuilt only in the temporary folder. Copying a rollback
+journal preserves recovery evidence; if SQLite cannot read it without recovery,
+the read-only inventory refuses and restores the plain stack. Missing databases,
+linked/special files, unsupported schema, invalid output or timeout refuse.
+
+`wefty-l1 --conversion-inventory --db=L1_COPY --conversion-ledger-db=L3_COPY
+--conversion-node-id=NODE` is a narrow offline entry point. All three arguments
+are required. It uses SQLite read-only/query-only connections, with no store
+initialization, migrations, profile load, participant or network. It is mutually
+exclusive with `--version`, `--state-preflight`, `--initiate-admin-bootstrap`,
+`--reset-admin-policy` and `--rebind-admin`/`--admin-device-id`; its two conversion
+arguments require `--conversion-inventory`. Use it only on temporary copies:
+SQLite may create temporary SHM there to read copied WAL. Within a five-second
+budget it reads L1 jobs and local placed/bound Computers, plus L3's unfinished
+run states. Job rows project the live `GetJob` removal overlay: a
+`service_removals` row replaces the stored job state with its status and clears
+the effective desired state, even if `service_jobs.desired_state` still says
+`running`. SQL filtering uses these same projected fields; the live and offline
+paths then call the same Go `JobBlocker` function. Thus `removal_pending` blocks,
+while `agent_cleaned`, `removed_verified`, `stalled_cleanup_unverified` and
+`forgotten_cleanup_unverified` follow the live verdict instead of reviving old
+desired state. The retired-Computer-projection exclusion also matches the live
+check. A missing Computer job conservatively blocks instead of scanning a NULL
+state. Computer blockers give the same normal-lifecycle retirement advice as
+the live check; mixed inventories retain the job/run advice as well. L3 is
+required because an unfinished run may have no L1 job. It prints exactly the version-1 JSON shape
+`{"version":1,"blockers":[]}` (one line, sorted unique strings; an empty inventory
+is an array, never `null`) and exits without starting a service. Entries are
+`queued job ID`, `claimed job ID`, `service job ID`, `run ID` or `Computer ID`.
+Malformed or unavailable inventory never implies an empty installation. This
+private offline JSON is not a new HTTP API or exit code.
 
 With claims disabled and resident one-shots drained, conversion waits up to
 30 seconds for the node agent's pending evidence outbox to empty. A read-only
