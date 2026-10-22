@@ -598,7 +598,11 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		return report, err
 	}
 	files = append(files, skillFiles...)
-	request.computer, err = resolveSetupComputerSettings(paths, request.computer)
+	var computerNote string
+	request.computer, computerNote, err = resolveSetupComputerSettingsForRole(paths, serviceplan.Legacy, request.computer)
+	if computerNote != "" {
+		report.Notes = append(report.Notes, computerNote)
+	}
 	if err != nil {
 		return report, err
 	}
@@ -1136,7 +1140,7 @@ func setupRoleServices(paths setupPaths, profile connprofile.Profile, binaries m
 		}
 		agents = append(agents, service)
 	}
-	return applySetupComputerSettings(paths, profile, agents, computer...)
+	return applySetupComputerSettings(paths, profile, agents, role, computer...)
 }
 
 // captureLoginPATH asks the owner's login shell for its PATH. A LaunchAgent

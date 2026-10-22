@@ -130,7 +130,7 @@ func selectSetupRole(paths setupPaths, requested string) (serviceplan.Role, erro
 				}
 			}
 		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
+	} else if !errors.Is(err, fs.ErrNotExist) && !canRepairPlainSetupReceipt(paths) {
 		return "", fmt.Errorf("setup cannot verify the installation role: %w", err)
 	}
 	record, err := readFleetSetupRecord(paths)

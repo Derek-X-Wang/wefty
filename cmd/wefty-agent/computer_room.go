@@ -103,7 +103,7 @@ func computerRoomServiceSlots(room l1.ComputerRoomConfig, count int, explicit bo
 	if !explicit {
 		if policy, ok := profile.L1().NodePolicies()[nodeID]; ok {
 			count = policy.MaxServiceSlots
-			explicit = true
+			explicit = count != l1.DefaultMaxServiceSlots
 		}
 	}
 	policy, err := (l1.NodePolicy{MaxServiceSlots: count}).WithComputerRoom(room)

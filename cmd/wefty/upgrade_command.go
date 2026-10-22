@@ -800,6 +800,11 @@ func saveUpgradeInstall(paths setupPaths, skillSource fs.FS) ([]setupFile, error
 		}
 		payload, err := root.ReadFile(name)
 		if err != nil {
+			// Setup repairs an unreadable plain receipt; it is not a rollback
+			// authority. Every other installed file still requires a snapshot.
+			if name == filepath.Join(paths.configRel, setupManifestName) && canRepairPlainSetupReceipt(paths) {
+				continue
+			}
 			return nil, err
 		}
 		saved = append(saved, setupFile{folder: filepath.Dir(name), name: filepath.Base(name), payload: payload, mode: info.Mode().Perm()})

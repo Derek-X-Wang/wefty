@@ -66,6 +66,7 @@ type plainConversionService struct {
 }
 
 type plainConversion struct {
+	Computer           *setupComputerOptions    `json:"computer,omitempty"`
 	Version            int                      `json:"version"`
 	NodeID             string                   `json:"node_id"`
 	Phase              string                   `json:"phase"`
@@ -106,6 +107,9 @@ func readPlainConversion(paths setupPaths) (*plainConversion, error) {
 	}
 	if decoder.Decode(new(any)) != io.EOF || r.Version != 1 || !validSetupNodeID(r.NodeID) || r.Profile.Fabric != "plain" || len(r.Profile.Participants) != 0 || r.Profile.Identities.Node != r.NodeID || r.Profile.Validate() != nil || r.History.Directory != filepath.Join(paths.data, plainHistoryFolder, r.NodeID) || !r.History.NeverRestore || len(r.Services) != 3 {
 		return nil, errors.New("invalid plain conversion record; setup will not infer or restore authority")
+	}
+	if r.Computer != nil && (r.Computer.Image != nil || r.Computer.SharedSeatLimit != nil || r.Computer.validate() != nil) {
+		return nil, errors.New("invalid conversion Computer node settings")
 	}
 	if !slices.Contains([]string{"prepared", "drain", "stop", "moving", "restoring", "history", "joining"}, r.Phase) {
 		return nil, errors.New("invalid plain conversion phase")
@@ -209,6 +213,14 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			}
 		}
 		return setupReport{NodeID: record.NodeID, Profile: paths.profile, NodeConfig: paths.nodeConfig, BinDir: paths.bin, DataDir: paths.data, LogDir: paths.logs, Notes: notes}, nil
+	}
+	// A valid flag value can still belong only to L1. Refuse it before
+	// conversion can move the plain authority into committed history.
+	if err := request.computer.validate(); err != nil {
+		return report, err
+	}
+	if request.computer.Image != nil || request.computer.SharedSeatLimit != nil {
+		return report, errors.New("cluster Computer settings require the control-plane installation")
 	}
 	// Validate the independently selected coordinator and code before draining.
 	// Once the fleet stage exists its own exact-code recovery rules apply.
@@ -319,7 +331,14 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 		if _, err := root.Lstat(filepath.Join(paths.dataRel, plainHistoryFolder)); !errors.Is(err, fs.ErrNotExist) {
 			return report, errors.New("unrecorded plain history folder exists or cannot be inspected; restore its conversion record")
 		}
+		stored, err := resolveSetupComputerSettings(paths)
+		if err != nil {
+			return report, err
+		}
+		nodeSettings := setupComputerOptions{SeatMemoryBytes: stored.SeatMemoryBytes, DedicatedCap: stored.DedicatedCap}
+		nodeSettings.merge(request.computer)
 		record = &plainConversion{Version: 1, NodeID: node.NodeID, Phase: "prepared", Profile: profile, History: history, JoinCode: request.joinCode, WithPerson: request.withPerson}
+		record.Computer = nodeSettings.recorded()
 		manager := launchagent.Manager{Run: host.launchctl, UID: host.uid}
 		for _, label := range []string{setupL1Label, setupL3Label, setupNodeAgentLabel} {
 			state, err := manager.State(ctx, label)
@@ -350,6 +369,15 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			return report, errors.Join(err, restorePlainConversion(ctx, host, paths, record, op, out))
 		}
 	}
+	// The plain receipt is removed after the history boundary. Its node
+	// settings must survive in the conversion record for a forward resume.
+	nodeSettings := setupComputerOptions{}
+	if record.Computer != nil {
+		nodeSettings = *record.Computer
+	}
+	nodeSettings.merge(request.computer)
+	request.computer = nodeSettings
+	record.Computer = nodeSettings.recorded()
 	if request.nodeID != "" && request.nodeID != record.NodeID {
 		return report, errors.New("conversion keeps its recorded stable node ID")
 	}

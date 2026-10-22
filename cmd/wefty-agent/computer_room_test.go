@@ -144,7 +144,7 @@ func TestComputerRoomServiceSlotsHonorExplicitFlagAndProfile(t *testing.T) {
 	}{
 		{name: "default", want: 7},
 		{name: "explicit default-valued flag", flag: true, want: 2},
-		{name: "explicit default-valued profile", profile: []connprofile.NodeAdmission{{NodeID: "local", MaxServiceSlots: 2}}, want: 2},
+		{name: "setup default-valued profile", profile: []connprofile.NodeAdmission{{NodeID: "local", MaxServiceSlots: 2}}, want: 7},
 		{name: "explicit lower profile", profile: []connprofile.NodeAdmission{{NodeID: "local", MaxServiceSlots: 1}}, want: 1},
 		{name: "flag wins profile", flag: true, profile: []connprofile.NodeAdmission{{NodeID: "local", MaxServiceSlots: 1}}, want: 2},
 	} {
@@ -156,6 +156,9 @@ func TestComputerRoomServiceSlotsHonorExplicitFlagAndProfile(t *testing.T) {
 			count, err := computerRoomServiceSlots(l1.DefaultComputerRoomConfig(7<<30), 2, tc.flag, connprofile.Profile{NodeAdmission: tc.profile}, "local")
 			if err != nil || count != tc.want {
 				t.Fatalf("service Slots=%d, %v; want %d", count, err, tc.want)
+			}
+			if tc.want == 7 && strings.Contains(output.String(), "service_slots_owner_override") {
+				t.Fatalf("default count warned as owner override: %s", output.String())
 			}
 			if tc.want < 7 && !strings.Contains(output.String(), "service_slots_owner_override") {
 				t.Fatalf("owner override lacks warning: %s", output.String())

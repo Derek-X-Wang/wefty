@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +13,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
@@ -106,7 +110,7 @@ func TestSetupRoomFloorUsesConfiguredPlanAndPreservesOtherNodePolicy(t *testing.
 	services, err := applySetupComputerSettings(paths, profile, []launchagent.Agent{
 		{Label: setupL1Label, Environment: map[string]string{}},
 		{Label: setupNodeAgentLabel, Arguments: []string{"--oci-setup-state=" + statePath}, Environment: map[string]string{}},
-	})
+	}, serviceplan.Legacy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,16 +124,68 @@ func TestSetupRoomFloorUsesConfiguredPlanAndPreservesOtherNodePolicy(t *testing.
 }
 
 func TestSetupComputerSettingsValidateBeforeEnrolment(t *testing.T) {
-	f, e, _ := newFleetFixture(t)
-	invalid := 1
-	_, err := runSetup(t.Context(), f.host, setupRequest{role: "control-plane", nodeID: "studio-0123abcd", computer: setupComputerOptions{SharedSeatLimit: &invalid}})
-	if err == nil {
-		t.Fatal("invalid settings accepted")
+	for _, tc := range []struct {
+		role  string
+		limit int
+		want  string
+	}{
+		{"control-plane", 1, "shared Computer Seat limit must be at least 2"},
+		{"join", 3, "cluster Computer settings require the control-plane installation"},
+	} {
+		t.Run(tc.role, func(t *testing.T) {
+			f, e, _ := newFleetFixture(t)
+			request := setupRequest{role: tc.role, nodeID: "studio-0123abcd", computer: setupComputerOptions{SharedSeatLimit: &tc.limit}}
+			if tc.role == "join" {
+				request.joinCode = joinCodeForTest(t, "opaque-l1", "opaque-l3", "")
+			}
+			_, err := runSetup(t.Context(), f.host, request)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("wrong preflight refusal: %v; want %q", err, tc.want)
+			}
+			if len(e.roles) != 0 {
+				t.Fatalf("settings refused after enrolment: %v", e.roles)
+			}
+		})
 	}
-	if len(e.roles) != 0 {
-		t.Fatalf("settings refused after enrolment: %v", e.roles)
-	}
+	t.Run("unreadable setup state", func(t *testing.T) {
+		f, e, _ := newFleetFixture(t)
+		paths, err := resolveSetupPaths(f.home)
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(f.home, "setup.json")
+		if err := ocicontrol.WriteSetupState(path, ocicontrol.SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: f.home, ProbeDigest: "sha256:" + strings.Repeat("a", 64)}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0600) })
+		if _, err := os.ReadFile(path); !errors.Is(err, os.ErrPermission) {
+			if os.Geteuid() == 0 {
+				t.Skip("root bypasses operator file permissions")
+			}
+			t.Fatalf("setup state not unreadable: %v", err)
+		}
+		plan, err := setupRolePlan(paths, serviceplan.ControlPlane)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range plan.Services {
+			if plan.Services[i].Name == "node-agent" {
+				plan.Services[i].Arguments = append(plan.Services[i].Arguments, "--oci-setup-state="+path)
+			}
+		}
+		_, err = validateSetupComputerPlan(paths, plan, setupComputerOptions{})
+		if !errors.Is(err, os.ErrPermission) || !strings.Contains(err.Error(), "read configured Computer room") {
+			t.Fatalf("wrong state preflight refusal: %v", err)
+		}
+		if len(e.roles) != 0 {
+			t.Fatalf("state read followed enrolment: %v", e.roles)
+		}
+	})
 }
+
 func TestSetupComputerSettingsRejectTinySeatFlag(t *testing.T) {
 	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
 	var options setupComputerOptions
@@ -155,23 +211,150 @@ func TestSetupRoomPreservesExplicitSlotsAndHandlesNilPolicies(t *testing.T) {
 			profile := f.profile(t)
 			profile.NodeAdmission = nil
 			if explicit {
-				profile.NodeAdmission = []connprofile.NodeAdmission{{NodeID: profile.Identities.Node, MaxOneshotSlots: 4, MaxServiceSlots: 2}}
+				profile.NodeAdmission = []connprofile.NodeAdmission{{NodeID: profile.Identities.Node, MaxOneshotSlots: 4, MaxServiceSlots: 1}}
 			}
 			path := filepath.Join(f.home, "room.json")
 			if err := ocicontrol.WriteSetupState(path, ocicontrol.SetupState{VMMemory: "8GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: f.home, ProbeDigest: "sha256:" + strings.Repeat("a", 64), MemoryCapacityBytes: 8 << 30, MemoryReserveBytes: 1 << 30}); err != nil {
 				t.Fatal(err)
 			}
-			services, err := applySetupComputerSettings(paths, profile, []launchagent.Agent{{Label: setupL1Label}, {Label: setupNodeAgentLabel, Arguments: []string{"--oci-setup-state=" + path}}})
+			services, err := applySetupComputerSettings(paths, profile, []launchagent.Agent{{Label: setupL1Label}, {Label: setupNodeAgentLabel, Arguments: []string{"--oci-setup-state=" + path}}}, serviceplan.Legacy)
 			if err != nil {
 				t.Fatal(err)
 			}
 			count := "7"
 			if explicit {
-				count = "2"
+				count = "1"
 			}
 			if got := strings.Join(services[0].Arguments, " "); !strings.Contains(got, "--node-max-service-slots="+profile.Identities.Node+"="+count) {
 				t.Fatalf("wrong Slots: %s", got)
 			}
 		})
+	}
+}
+
+func TestSetupRoomFloorAppliesToFreshSetupProfile(t *testing.T) {
+	f := newSetupFixture(t)
+	f.setup(t, setupRequest{})
+	paths, err := resolveSetupPaths(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := f.profile(t)
+	if len(profile.NodeAdmission) != 1 || profile.NodeAdmission[0].MaxServiceSlots != 2 {
+		t.Fatalf("fresh setup policy: %+v", profile.NodeAdmission)
+	}
+	path := filepath.Join(f.home, "room.json")
+	if err := ocicontrol.WriteSetupState(path, ocicontrol.SetupState{VMMemory: "4GiB", VMCPUs: 4, VMDisk: "32GiB", VMType: "vz", HostMountRoot: f.home, ProbeDigest: "sha256:" + strings.Repeat("a", 64), MemoryCapacityBytes: 4 << 30, MemoryReserveBytes: 1 << 30}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	prior := log.Writer()
+	log.SetOutput(&output)
+	defer log.SetOutput(prior)
+	for range 2 {
+		services, err := applySetupComputerSettings(paths, profile, []launchagent.Agent{{Label: setupL1Label}, {Label: setupNodeAgentLabel, Arguments: []string{"--oci-setup-state=" + path}}}, serviceplan.Legacy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.Join(services[0].Arguments, " "); !strings.Contains(got, "--node-max-service-slots="+profile.Identities.Node+"=3") {
+			t.Fatalf("fresh setup room floor: %s", got)
+		}
+	}
+	if strings.Contains(output.String(), "owner_override") {
+		t.Fatalf("default reruns warn as owner override: %s", output.String())
+	}
+}
+
+func breakComputerSettingsReceipt(t *testing.T, home, kind string) string {
+	t.Helper()
+	paths, err := resolveSetupPaths(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(paths.config, setupManifestName)
+	switch kind {
+	case "malformed":
+		if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	case "version":
+		if err := os.WriteFile(path, []byte(`{"version":99,"computer":{"seat_memory_bytes":536870912,"dedicated_cap":99}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+	case "unreadable":
+		if err := os.Chmod(path, 0000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0600) })
+		if _, err := os.ReadFile(path); !errors.Is(err, os.ErrPermission) {
+			if os.Geteuid() == 0 {
+				t.Skip("root bypasses operator file permissions")
+			}
+			t.Fatalf("not unreadable: %v", err)
+		}
+	}
+	return path
+}
+func TestSetupComputerSettingsReceiptRepair(t *testing.T) {
+	for _, kind := range []string{"malformed", "version", "unreadable"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newSetupFixture(t)
+			f.setup(t, setupRequest{})
+			breakComputerSettingsReceipt(t, f.home, kind)
+			cap := 2
+			report, err := runSetup(t.Context(), f.host, setupRequest{computer: setupComputerOptions{DedicatedCap: &cap}})
+			if err != nil {
+				t.Fatalf("plain setup did not repair receipt: %v", err)
+			}
+			if !strings.Contains(strings.Join(report.Notes, " "), "recorded Computer settings were not retained") {
+				t.Fatalf("repair lacks note: %v", report.Notes)
+			}
+			receipt := readSetupReceipt(t, f.home)
+			if receipt.Version != 1 || receipt.Computer == nil || receipt.Computer.SeatMemoryBytes != nil || receipt.Computer.DedicatedCap == nil || *receipt.Computer.DedicatedCap != 2 {
+				t.Fatalf("repaired receipt: %+v", receipt)
+			}
+		})
+	}
+}
+func TestUpgradeComputerSettingsReceiptRepair(t *testing.T) {
+	for _, kind := range []string{"malformed", "version", "unreadable"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newUpgradeFixture(t)
+			breakComputerSettingsReceipt(t, f.home, kind)
+			var output bytes.Buffer
+			report, err := runUpgrade(t.Context(), f.host, true, &output)
+			if err != nil {
+				t.Fatalf("plain upgrade did not repair receipt: %v", err)
+			}
+			if !strings.Contains(output.String(), "recorded Computer settings were not retained") {
+				t.Fatalf("repair lacks warning: %s", output.String())
+			}
+			receipt := readSetupReceipt(t, f.home)
+			if receipt.Version != 1 || receipt.Computer != nil || receipt.InstalledVersion != report.Version {
+				t.Fatalf("repaired receipt: %+v", receipt)
+			}
+		})
+	}
+}
+func TestSetupComputerReceiptReadStaysInsideHome(t *testing.T) {
+	f := newSetupFixture(t)
+	f.setup(t, setupRequest{})
+	paths, err := resolveSetupPaths(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, []byte(`{"version":1,"computer":{"dedicated_cap":99}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(paths.config, setupManifestName)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Fatal(err)
+	}
+	if values, err := resolveSetupComputerSettings(paths); err == nil {
+		t.Fatalf("receipt reader escaped home: %+v", values)
 	}
 }

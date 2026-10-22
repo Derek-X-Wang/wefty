@@ -113,8 +113,8 @@ func (values setupComputerOptions) arguments(cluster, node bool) []string {
 	return args
 }
 
-func applySetupComputerSettings(paths setupPaths, profile connprofile.Profile, services []launchagent.Agent, changes ...setupComputerOptions) ([]launchagent.Agent, error) {
-	values, err := resolveSetupComputerSettings(paths, changes...)
+func applySetupComputerSettings(paths setupPaths, profile connprofile.Profile, services []launchagent.Agent, role serviceplan.Role, changes ...setupComputerOptions) ([]launchagent.Agent, error) {
+	values, _, err := resolveSetupComputerSettingsForRole(paths, role, changes...)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +147,8 @@ func applySetupComputerSettings(paths setupPaths, profile connprofile.Profile, s
 				policy, ok := policies[nodeID]
 				if !ok {
 					policy = l1.DefaultNodePolicy(contract.StableNodeTagPrefix + nodeID)
+				}
+				if policy.MaxServiceSlots == l1.DefaultMaxServiceSlots {
 					policy, err = policy.WithComputerRoom(*room)
 					if err != nil {
 						return nil, err
@@ -191,26 +193,54 @@ func applySetupComputerSettings(paths setupPaths, profile connprofile.Profile, s
 // The receipt is the only persistence authority. No plist parsing is needed,
 // including when launchd has converted a definition to a binary plist.
 func resolveSetupComputerSettings(paths setupPaths, changes ...setupComputerOptions) (setupComputerOptions, error) {
+	values, _, err := resolveSetupComputerSettingsForRole(paths, serviceplan.ControlPlane, changes...)
+	return values, err
+}
+
+func readSetupComputerSettings(paths setupPaths) (setupComputerOptions, error) {
 	var values setupComputerOptions
-	payload, err := os.ReadFile(filepath.Join(paths.config, setupManifestName))
-	if err == nil {
-		var receipt setupManifest
-		if err := json.Unmarshal(payload, &receipt); err != nil {
-			return values, err
-		}
-		if receipt.Version != 1 {
-			return values, errors.New("unsupported setup receipt version")
-		}
-		if receipt.Computer != nil {
-			values = *receipt.Computer
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	root, err := os.OpenRoot(paths.home)
+	if errors.Is(err, os.ErrNotExist) {
+		return values, nil
+	}
+	if err != nil {
 		return values, err
+	}
+	defer root.Close()
+	payload, err := root.ReadFile(filepath.Join(paths.configRel, setupManifestName))
+	if errors.Is(err, os.ErrNotExist) {
+		return values, nil
+	}
+	if err != nil {
+		return values, err
+	}
+	var receipt setupManifest
+	if err := json.Unmarshal(payload, &receipt); err != nil {
+		return values, err
+	}
+	if receipt.Version != 1 {
+		return values, errors.New("unsupported setup receipt version")
+	}
+	if receipt.Computer != nil {
+		values = *receipt.Computer
+	}
+	return values, nil
+}
+
+func resolveSetupComputerSettingsForRole(paths setupPaths, role serviceplan.Role, changes ...setupComputerOptions) (setupComputerOptions, string, error) {
+	values, err := readSetupComputerSettings(paths)
+	note := ""
+	if err != nil {
+		if role != serviceplan.Legacy {
+			return values, note, err
+		}
+		values = setupComputerOptions{}
+		note = "The setup receipt was invalid or unreadable; recorded Computer settings were not retained."
 	}
 	for _, next := range changes {
 		values.merge(next)
 	}
-	return values, values.validate()
+	return values, note, values.validate()
 }
 
 func (values setupComputerOptions) recorded() *setupComputerOptions {
