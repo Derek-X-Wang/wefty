@@ -56,7 +56,7 @@ func maybeExecuteFleetDoctor(ctx context.Context, host setupHost, options global
 	if err != nil {
 		return false, nil
 	}
-	paths, _ := resolveMaintenancePaths(home)
+	paths, _ := resolveFleetMaintenancePaths(home, host)
 	role, err := doctorRole(paths)
 	if err != nil {
 		report := plainDoctorReport{Version: 1, Install: "fleet-process", Role: role, Healthy: false, Findings: []plainDoctorFinding{{Check: "role-receipt", Severity: "error", Detail: "cannot verify the recorded fleet installation role", Fix: "restore the original installation receipt or resume setup with its recorded role"}}}

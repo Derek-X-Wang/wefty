@@ -30,14 +30,22 @@ func executeLocalNode(ctx context.Context, options globalOptions, args []string,
 		// A selected OCI control socket retains its original local route,
 		// without consulting fleet metadata or requiring a home folder.
 		processInstall, inspectErr := plainDoctorSelected(runtime.GOOS, options.nodeConfigPath)
+		linuxProcess := false
+		if runtime.GOOS == "linux" && !processInstall && inspectErr == nil {
+			linuxProcess, inspectErr = processDoctorConfigured(options.nodeConfigPath)
+		}
 		// Inspection errors stay with the original platform-specific route.
-		if inspectErr == nil && processInstall {
+		// Check the raw config before locating home: OCI sockets keep their
+		// existing route without requiring an installation home.
+		if inspectErr == nil && (processInstall || linuxProcess) {
 			host, err := setupCommandHost()
 			if err != nil {
 				return err
 			}
-			if handled, err := maybeExecuteFleetDoctor(ctx, host, options, stdout); handled {
-				return err
+			if processInstall || host.goos == "linux" {
+				if handled, err := maybeExecuteFleetDoctor(ctx, host, options, stdout); handled {
+					return err
+				}
 			}
 		}
 		plain, err := plainDoctorSelected(runtime.GOOS, options.nodeConfigPath)
@@ -86,6 +94,10 @@ func plainDoctorSelected(goos, configPath string) (bool, error) {
 	if goos != "darwin" {
 		return false, nil
 	}
+	return processDoctorConfigured(configPath)
+}
+
+func processDoctorConfigured(configPath string) (bool, error) {
 	if configPath == "" {
 		return true, nil
 	}

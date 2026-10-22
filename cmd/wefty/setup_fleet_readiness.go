@@ -65,7 +65,7 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 	l1Index, l3Index, nodeIndex := len(services), len(services)+1, len(services)+2
 	peerIndex := len(checks)
 	checks = append(checks, setupReadinessCheck{Check: "L1 → L3 direction", Status: "NOT-RUN", Detail: "client service not ready"}, setupReadinessCheck{Check: "L3 → L1 direction", Status: "NOT-RUN", Detail: "client service not ready"})
-	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid}
+	manager := fleetServiceManager{host: host}
 	open := host.fleetClients
 	if open == nil {
 		open = setupFleetClients
@@ -80,15 +80,15 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 		currentBoot := ""
 		for i, service := range services {
 			probe, done := context.WithTimeout(bounded, statusProbeBudget)
-			state, err := manager.State(probe, service.Label)
+			state, err := manager.state(probe, service.Label)
 			done()
 			checks[i].Status = "FAILED"
 			if err != nil {
-				checks[i].Detail = "cannot verify LaunchAgent state"
+				checks[i].Detail = manager.readinessDetail("cannot verify LaunchAgent state")
 				continue
 			}
 			if !state.Running {
-				checks[i].Detail = "LaunchAgent is not running"
+				checks[i].Detail = manager.readinessDetail("LaunchAgent is not running")
 				continue
 			}
 			if strings.HasSuffix(service.Label, "client-service") && role == serviceplan.ControlPlane {
@@ -119,7 +119,7 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 			if strings.HasSuffix(service.Label, "node-agent") {
 				currentBoot = metadata.BootSessionID
 			}
-			checks[i].Status, checks[i].Detail = "VERIFIED", "LaunchAgent running; current process reached its saved-identity ready point"
+			checks[i].Status, checks[i].Detail = "VERIFIED", manager.readinessDetail("LaunchAgent running; current process reached its saved-identity ready point")
 		}
 
 		for _, index := range []int{l1Index, l3Index, nodeIndex, peerIndex, peerIndex + 1} {
@@ -141,8 +141,8 @@ func checkFleetReadiness(ctx context.Context, host setupHost, paths setupPaths, 
 		}
 		done()
 		if clients != nil {
-			if state, err := manager.State(bounded, services[len(services)-1].Label); err == nil && state.Running && (role == serviceplan.ControlPlane || checks[len(services)-1].Status == "VERIFIED") {
-				checks[len(services)-1].Status, checks[len(services)-1].Detail = "VERIFIED", "LaunchAgent running; client service answered the saved-client identity check"
+			if state, err := manager.state(bounded, services[len(services)-1].Label); err == nil && state.Running && (role == serviceplan.ControlPlane || checks[len(services)-1].Status == "VERIFIED") {
+				checks[len(services)-1].Status, checks[len(services)-1].Detail = "VERIFIED", manager.readinessDetail("LaunchAgent running; client service answered the saved-client identity check")
 			}
 			probe, done := context.WithTimeout(bounded, statusProbeBudget)
 			nodes, err := clients.listNodes(probe)

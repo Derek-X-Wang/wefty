@@ -14,14 +14,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/fleetjoin"
-	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -34,6 +32,7 @@ const fleetSetupProfileName = "fleet-setup-profile.json"
 // and staged participant records across interruptions. The profile, never the
 // informational markers, determines which participants have been saved.
 type fleetSetupRecord struct {
+	LinuxLogRoot            string           `json:"linux_log_root,omitempty"`
 	ConversionHistoryDigest string           `json:"conversion_history_sha256,omitempty"`
 	JoinCode                string           `json:"join_code,omitempty"`
 	WithPerson              bool             `json:"with_person,omitempty"`
@@ -188,6 +187,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			report.JoinResult = "incomplete"
 		}
 	}()
+	manager := fleetServiceManager{host: host}
 	report = setupReport{Role: role, Profile: paths.profile, NodeConfig: paths.nodeConfig, BinDir: paths.bin, DataDir: paths.data, LogDir: paths.logs, Changes: []string{}, Participants: map[string]string{}}
 	record, err := readFleetSetupRecord(paths)
 	if err != nil {
@@ -273,6 +273,11 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	if !slices.Contains(filepath.SplitList(loginPATH), paths.bin) {
 		loginPATH += string(filepath.ListSeparator) + paths.bin
 	}
+	if host.goos == "linux" {
+		if err := preflightLinuxFleet(ctx, host, paths, digests, loginPATH, role); err != nil {
+			return report, err
+		}
+	}
 	nodeID := request.nodeID
 	if record != nil {
 		nodeID = record.NodeID
@@ -288,6 +293,12 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	}
 	if record == nil {
 		record = &fleetSetupRecord{Version: 1, Role: role, NodeID: nodeID, StagedProfile: filepath.Join(paths.config, fleetSetupProfileName), CoordinatorURL: request.coordinatorURL, JoinCode: request.joinCode, WithPerson: request.withPerson}
+	}
+	if host.goos == "linux" {
+		record.LinuxLogRoot = paths.logs
+		if record.WithPerson {
+			report.Notes = append(report.Notes, linuxPersonWarning)
+		}
 	}
 	if role == serviceplan.Join {
 		if record.JoinCode != request.joinCode {
@@ -330,7 +341,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		destinations = append(destinations, filepath.Join(file.folder, file.name))
 	}
 	for _, service := range plan.Services {
-		destinations = append(destinations, filepath.Join(paths.launchAgentsRel, "dev.wefty."+service.Name+".plist"))
+		destinations = append(destinations, filepath.Join(paths.launchAgentsRel, manager.file("dev.wefty."+service.Name)))
 	}
 	if err := checkSetupDestinations(root, paths.home, folders, destinations); err != nil {
 		return report, err
@@ -379,6 +390,9 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	// Validate a completed installation without rewriting its active profile.
 	var profile connprofile.Profile
 	manifest := setupManifest{Version: 1, Role: role, Files: map[string]string{}}
+	if host.goos == "linux" {
+		manifest.LinuxLogRoot = paths.logs
+	}
 	conversion, err := readPlainConversion(paths)
 	if err != nil {
 		return report, err
@@ -448,6 +462,14 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	if !committed && record.Committed {
 		return report, errors.New("committed fleet role receipt is missing; restore its original receipt before setup")
 	}
+	if committed && host.goos == "linux" {
+		if err := validateLinuxLogFolders(paths, host.euid); err != nil {
+			return report, err
+		}
+		if err := root.Chmod(paths.logsRel, 0700); err != nil {
+			return report, err
+		}
+	}
 	if !committed {
 		for _, folder := range folders {
 			mode := os.FileMode(0700)
@@ -455,6 +477,14 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 				mode = 0755
 			}
 			if err := root.MkdirAll(folder, mode); err != nil {
+				return report, err
+			}
+		}
+		if host.goos == "linux" {
+			if err := validateLinuxLogFolders(paths, host.euid); err != nil {
+				return report, err
+			}
+			if err := root.Chmod(paths.logsRel, 0700); err != nil {
 				return report, err
 			}
 		}
@@ -511,8 +541,16 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 				participants = append(participants, setupParticipant{connprofile.ParticipantPerson, "wefty://person/" + nodeID})
 			}
 		}
+		if host.goos == "linux" && record.WithPerson && host.enrolmentOutput != nil {
+			if _, err := fmt.Fprintln(host.enrolmentOutput, linuxPersonWarning); err != nil {
+				return report, err
+			}
+		}
 		if host.ownerLogin == nil {
 			host.ownerLogin = openSetupOwnerLoginURL
+			if host.goos == "linux" {
+				host.ownerLogin = setupOwnerLoginBrowser("linux", host.browserCommand, host.linuxFiles)
+			}
 		}
 		profile, err = enrolSetupParticipants(ctx, setupEnrolmentRequest{home: paths.home, data: paths.data, profilePath: record.StagedProfile, participants: participants, enroller: host.enroller, input: host.enrolmentInput, output: host.enrolmentOutput, controlURL: record.CoordinatorURL, openLoginURL: host.ownerLogin, deferNotices: true, afterSaved: func(role string) error {
 			if !slices.Contains(record.Enrolled, role) {
@@ -587,7 +625,11 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	}
 	plists := make([][]byte, len(services))
 	for i, service := range services {
-		plists[i], err = launchagent.Render(service)
+		previous := ""
+		if i > 0 {
+			previous = services[i-1].Label
+		}
+		plists[i], err = manager.render(service, previous)
 		if err != nil {
 			return report, err
 		}
@@ -649,7 +691,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			manifest.Files[filepath.Join(file.folder, file.name)] = payloadDigest(file.payload)
 		}
 		for i, service := range services {
-			manifest.Files[filepath.Join(paths.launchAgentsRel, service.Label+".plist")] = payloadDigest(plists[i])
+			manifest.Files[filepath.Join(paths.launchAgentsRel, manager.file(service.Label))] = payloadDigest(plists[i])
 		}
 		manifest.Files[filepath.Join(paths.configRel, connprofile.FileName)] = payloadDigest(profilePayload)
 		version, problem := reportedSetupBinaryVersion(ctx, host, paths.home, source, binaries)
@@ -714,7 +756,6 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		return report, err
 	}
 	defer folder.Close()
-	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid, UnloadBound: host.unloadBound}
 	for i, service := range services {
 		if request.beforeService != nil {
 			if err := request.beforeService(i); err != nil {
@@ -722,16 +763,12 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			}
 		}
 
-		serviceManager := manager
-		if serviceManager.UnloadBound == 0 && service.ExitTimeOut > 0 {
-			serviceManager.UnloadBound = time.Duration(service.ExitTimeOut+15) * time.Second
-		}
-		action, err := serviceManager.Converge(ctx, folder, filepath.Join(paths.launchAgents, service.Label+".plist"), service.Label, plists[i])
+		action, err := manager.converge(ctx, folder, paths, service, plists[i])
 		if err != nil {
-			report.Notes = append(report.Notes, fmt.Sprintf("LaunchAgent %s activation failed: %v; installation stays published. Repair it and rerun setup.", service.Label, err))
+			report.Notes = append(report.Notes, fmt.Sprintf("%s %s activation failed: %v; installation stays published. Repair it and rerun setup.", manager.description(), manager.name(service.Label), err))
 			break
 		}
-		report.Services = append(report.Services, setupServiceReport{Label: service.Label, Plist: filepath.Join(paths.launchAgents, service.Label+".plist"), Log: service.LogPath, Action: action})
+		report.Services = append(report.Services, manager.report(paths, service, action))
 		if request.afterService != nil {
 			if err := request.afterService(i, action); err != nil {
 				return report, err
@@ -755,6 +792,15 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			return report, err
 		}
 		report.PrivateNetworkPolicy = &policy
+	}
+	if host.goos == "linux" {
+		doctorLinuxLingering(ctx, host, func(_, _, detail, fix string) {
+			note := "Linux logout survival: " + detail
+			if fix != "" {
+				note += "; " + fix
+			}
+			report.Notes = append(report.Notes, note)
+		})
 	}
 	report.Readiness = checkFleetReadiness(ctx, host, paths, profile, services, request.skipSmokeRun, role)
 	for _, check := range report.Readiness {
@@ -801,22 +847,22 @@ func refuseUncommittedFleetServices(ctx context.Context, host setupHost, paths s
 			return err
 		}
 	}
-	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid}
+	manager := fleetServiceManager{host: host}
 	for _, service := range plan.Services {
 		label := "dev.wefty." + service.Name
-		if _, err := os.Lstat(filepath.Join(paths.launchAgents, label+".plist")); err == nil {
-			return errors.New("fresh fleet setup refuses existing LaunchAgent definitions; plain conversion is a later slice")
+		if _, err := os.Lstat(filepath.Join(paths.launchAgents, manager.file(label))); err == nil {
+			return fmt.Errorf("fresh fleet setup refuses existing %s definitions; plain conversion is a later slice", manager.description())
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 		probe, cancel := context.WithTimeout(ctx, statusProbeBudget)
-		state, err := manager.State(probe, label)
+		state, err := manager.state(probe, label)
 		cancel()
 		if err != nil {
-			return fmt.Errorf("cannot verify existing LaunchAgent %s before fleet setup: %w", label, err)
+			return fmt.Errorf("cannot verify existing %s %s before fleet setup: %w", manager.description(), manager.name(label), err)
 		}
 		if state.Loaded {
-			return errors.New("fresh fleet setup refuses existing loaded LaunchAgents; plain conversion is a later slice")
+			return fmt.Errorf("fresh fleet setup refuses existing loaded %ss; plain conversion is a later slice", manager.description())
 		}
 	}
 	return nil

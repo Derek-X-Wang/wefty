@@ -43,15 +43,20 @@ transport, identity shape, and behavior. A legacy `tsnet` process with an explic
 using that folder are refused with `participant_in_use` (exit 3). The production
 adapter's outbound destination restriction below also applies to legacy calls.
 Local authoring, setup, upgrade, and node commands keep their existing dispatch.
-Rendering and managing the service as a LaunchAgent or systemd user unit belongs
-to #900. That work must stop the client service before removal or purge, add the
-client socket folder and its publication lock to the removal plan, and decide
-the Linux runtime-folder policy (including `$XDG_RUNTIME_DIR`). This slice keeps
-the current default location and starts the subcommand directly in tests.
+Fleet setup manages the client process as a per-user LaunchAgent on Mac or a
+systemd user unit on Linux. The shared removal plan includes the client socket
+folder and its publication lock. Role-aware removal remains refused on both
+platforms; the later removal caller must stop and confirm the client service
+before removing runtime files. Linux runtime-folder policy is described below.
 
 ## Socket and caller boundary
 
-The default socket is `~/.config/wefty/client/service.sock`.
+The default socket is `~/.config/wefty/client/service.sock` on both Mac and
+Linux. Linux fleet setup keeps this fixed endpoint instead of
+`$XDG_RUNTIME_DIR`: clients and lingering services share one path across login
+sessions and use the existing private-folder and socket-publication checks.
+`XDG_CONFIG_HOME` does not change it. The folder persists, but a stale endpoint
+is still probed and replaced only under the existing crash-recovery rules.
 `WEFTY_CLIENT_SOCKET` selects an explicit socket for local clients and the
 service; `client-service --socket PATH` overrides the service endpoint. Use the
 same endpoint for both. Paths must be absolute, clean, and at most 100 bytes,
@@ -197,7 +202,7 @@ logout and deletion, deletion is refused. A held folder returns
 If that refusal joins an enrolment failure, the JSON message keeps the original
 enrolment cause as well as the ownership refusal.
 
-For a joining Mac, the installation plan supplies `--ready-file PATH`.
+For a joining Mac or Linux installation, the installation plan supplies `--ready-file PATH`.
 The client service durably publishes PID, startup time, saved client node ID
 and private socket address after saved-client verification and socket creation,
 before accepting requests. A publication failure closes and removes the socket.
