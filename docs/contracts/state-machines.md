@@ -2158,3 +2158,66 @@ also evaluate those later predicates before advertising a new operation.
 `LAST CONDITION` and `ALLOWED ACTIONS` columns; the latter preserves the exact
 preconditions, typed inputs, and typed refusal rather than reducing them to a
 recommendation.
+
+## Seat approval (stage A)
+
+The Seat-request controller checks room, the dedicated cap and OCI intent
+before calling the node agent's `SeatApprover.RequestApproval` interface.
+This interface starts no Computer and reserves no room. The Seat request and
+its approval use the same `seat_<32 hex>` ID. The approval context belongs to
+the node-owned request, so disconnecting a CLI waiter does not cancel it.
+
+| Approval state | Allowed next state | Condition |
+| --- | --- | --- |
+| `requested` | `approved` | The native login-session dialog returns Approve before the answer deadline. |
+| `requested` | `refused` | Deny, no answer by the deadline, dialog failure, or cancellation. |
+| `approved` | none | The recorded answer covers this Seat for its lifetime. |
+| `refused` | none | The refusal stays in the record. No runtime resources start. |
+
+L1 accepts the immutable dialog input and its answer only on the node protocol:
+`POST /v1/agent/seat-approvals` and
+`POST /v1/agent/seat-approvals/{seat_id}/answer`. Both bind the authenticated
+Fabric node identity to the registered stable node and current boot session.
+The answer also binds to the original Seat ID and dialog input. Neither the
+client protocol nor a control-socket verb can carry an answer. Repeated
+answers return the original outcome and never renew or reopen a window.
+
+The native macOS alert runs from the per-user node agent. It shows a quoted
+harness label marked **not verified**, the quoted folder, the form (`any` or
+`dedicated`), the network (`internet` or `none`), and either one Seat or the
+requested window length and scope. Its only buttons are **Approve** and
+**Deny**; Deny is the default. No admin password or GUI automation is needed.
+The native alert and its subprocess both have their own timeout, in addition
+to the node controller's injected-clock timer. A locked screen or absent
+owner login session returns no answer and waits out the same deadline.
+
+The answer wait defaults to five minutes. On timeout the retained refusal is
+`no answer from the owner`. L1 independently refuses an affirmative received
+at or after its recorded answer deadline. A node controller shares one dialog
+among concurrent calls for the same Seat ID. Its cancellation dismisses the
+dialog and records `approval dialog lost` where L1 is reachable. General
+restart reconciliation of lost pending dialogs belongs to the Seat-request
+recovery controller.
+
+An explicit window request always requires a dialog, even during an open
+window. Only Approve opens it, atomically with the answer in L1. The node
+startup settings are `--seat-approval-answer-wait` (default `5m`) and
+`--seat-approval-window-hours` (default `1,8,24`). The latter can restrict the
+available lengths to a subset of 1, 8 and 24 hours; no setting opens a window
+or allows a longer one. The setup service renderer must preserve these
+settings when installing or updating the per-user node agent.
+
+A window covers every form for its node and network. An `internet` window
+also covers `none`; a `none` window never covers `internet`. New requests
+check L1 inside the approval write, with no cached allow. At the exact expiry
+boundary the next request needs a dialog. Window expiry does not stop running
+Seats. Windows are boot-scoped, so replacing a node boot cannot inherit one.
+L1 records expiry from its injected clock; the cross-sleep monotonic time
+source is the separate #1146 integration.
+
+`GET /v1/seat-approval-windows` supplies the coherent L1 read used by
+`wefty status`, including each open window's node, network and end time.
+A read failure is shown as unverified. `wefty seat window close` resolves this
+installation's stable node and calls
+`POST /v1/seat-approval-windows/close` to remove its windows early. This command
+can only remove approval; it cannot accept an answer or open a window.

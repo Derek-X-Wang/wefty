@@ -15,7 +15,8 @@ import (
 // jobs_cancel_settlement indexes, then #900's automatically_admitted Node
 // provenance column, then #1085's additive one-shot restart columns, then
 // #1090's admin person-device binding and immutable rebind audit schema, then
-// #1134's Computer Seat settings and creation provenance columns. A changed
+// #1134's Computer Seat settings and creation provenance columns, then
+// #1135's boot-scoped Seat approval records and windows. A changed
 // golden means an upgrade across it
 // cannot restore the old binaries (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {

@@ -480,10 +480,19 @@ func run() error {
 		profilePath           = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, control-plane and run-ledger addresses and the node ID not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
 	computerRoomFlags := bindComputerRoomFlags(flag.CommandLine)
+	seatApprovalAnswerWait := flag.Duration("seat-approval-answer-wait", agent.DefaultSeatApprovalWait, "wait for the owner to answer a native Seat approval dialog")
+	seatApprovalWindowHours := flag.String("seat-approval-window-hours", "1,8,24", "allowed Seat approval window lengths in hours (subset of 1,8,24)")
 	flag.Parse()
 	if *printVersion {
 		fmt.Println(version)
 		return nil
+	}
+	if *seatApprovalAnswerWait <= 0 {
+		return errors.New("Seat approval answer wait must be positive")
+	}
+	approvalWindowHours, err := agent.ParseSeatApprovalWindowHours(*seatApprovalWindowHours)
+	if err != nil {
+		return err
 	}
 	profile, _, err := connprofile.Resolve(*profilePath, "")
 	if err != nil {
@@ -674,6 +683,7 @@ func run() error {
 		deadman = ociAttemptDeadman{barrier: bootBarrier, nodeID: *nodeID, bootSessionID: bootSessionID}
 	}
 	nodeAgent, err := agent.New(agent.Config{
+		SeatApprovalSettings:    agent.SeatApprovalSettings{AnswerWait: *seatApprovalAnswerWait, WindowHours: approvalWindowHours},
 		Fabric:                  participant,
 		ControlPlaneAddress:     *controlPlane,
 		RunLedgerAddress:        *runLedger,

@@ -121,6 +121,9 @@ func wantsCommandHelp(args []string) bool {
 // These commands have no flag parser. Their help must be answered before a
 // positional --help can become a resource ID or a request to open local state.
 var positionalCommandUsage = map[string]string{
+	"seat window close":               seatWindowUsage,
+	"seat window":                     seatWindowUsage,
+	"seat":                            seatWindowUsage,
 	"whoami":                          "usage: wefty whoami",
 	"admin bootstrap":                 "usage: wefty admin bootstrap NONCE",
 	"admin policy get":                "usage: wefty admin policy get",
