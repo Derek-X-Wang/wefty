@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -290,8 +291,16 @@ func (*selfAssertedPersonAnswerFabric) PersonIdentityTrust() fabric.PersonIdenti
 
 func TestSelfAssertedAdminIgnoresDeviceBinding(t *testing.T) {
 	f := &identityAnswerFabric{identity: fabric.Identity{FabricID: "plain-fixture", UserID: "owner", DeviceID: "first-device"}}
-	original := newIdentityAnswerServer(t, f)
-	s, err := NewServer(&selfAssertedPersonAnswerFabric{f}, original.store, ServerConfig{AllowSelfAssertedPersonIdentities: true})
+	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	s, err := NewServer(&selfAssertedPersonAnswerFabric{f}, store, ServerConfig{AllowSelfAssertedPersonIdentities: true})
 	if err != nil {
 		t.Fatal(err)
 	}

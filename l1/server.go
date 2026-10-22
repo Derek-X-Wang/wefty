@@ -146,6 +146,9 @@ func NewServer(f fabric.Fabric, store *Store, config ServerConfig) (*Server, err
 	if policyWatchWait >= ComputerPolicyClientTimeout {
 		return nil, fmt.Errorf("l1: Computer policy watch wait must be shorter than the shared client timeout")
 	}
+	if machineIdentitiesAuthenticated(f) {
+		store.requirePersonDeviceBinding()
+	}
 	s := &Server{
 		fabric: f, store: store,
 		clientPrincipalTag: clientTag, agentPrincipalTag: agentTag,
@@ -977,11 +980,6 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 			writeError(w, err)
 			return
 		}
-		// Both person decisions and agent policy issuance derive the requirement
-		// from this server's authenticated Fabric, never from request data.
-		if machineIdentitiesAuthenticated(s.fabric) {
-			r = r.WithContext(context.WithValue(r.Context(), personDeviceBindingContextKey{}, true))
-		}
 		if principal == personPrincipal || principal == cancelPrincipal && !slices.Contains(NormalizeTags(identity.Tags), s.clientPrincipalTag) {
 			if !s.allowPersonIdentities {
 				writeError(w, protocolError(contract.ErrorPrincipalForbidden,
@@ -999,7 +997,7 @@ func (s *Server) authorize(principal principal, next http.Handler) http.Handler 
 				writeError(w, err)
 				return
 			}
-			if personDeviceBindingRequired(r.Context()) {
+			if s.store.personDeviceBinding.required(r.Context()) {
 				if !(r.Method == http.MethodGet && r.URL.Path == "/v1/whoami") {
 					if err := s.store.checkPersonDevice(r.Context(), identity); err != nil {
 						writeError(w, err)

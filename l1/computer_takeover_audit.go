@@ -281,7 +281,7 @@ func (s *Store) ListComputerTakeoverAudit(ctx context.Context, identity fabric.I
 }
 
 func (r *databaseReads) computerViewListComputerTakeoverAudit(ctx context.Context, identity fabric.Identity, computerID, cursor string, limit int, tail bool) (ComputerTakeoverAuditList, error) {
-	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
+	if err := r.personDeviceBinding.requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerTakeoverAuditList{}, err
 	}
 	if limit < 1 || limit > MaxJobPageLimit {
@@ -394,7 +394,7 @@ func (s *Store) ListComputerTakeoverSessions(ctx context.Context, identity fabri
 }
 
 func (r *databaseReads) computerViewListComputerTakeoverSessions(ctx context.Context, identity fabric.Identity, computerID string) (ComputerTakeoverSessionList, error) {
-	if err := requireCurrentAdmin(ctx, r.q, identity); err != nil {
+	if err := r.personDeviceBinding.requireCurrentAdmin(ctx, r.q, identity); err != nil {
 		return ComputerTakeoverSessionList{}, err
 	}
 	if _, err := r.computerViewGetComputer(ctx, computerID); err != nil {
