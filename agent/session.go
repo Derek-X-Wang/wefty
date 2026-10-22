@@ -82,6 +82,7 @@ type agentSession struct {
 	residentJobID             map[string]struct{}
 	residentKind              map[string]string
 	resident                  map[string]*residentAttempt
+	shutdownRestartable       bool
 	residentSuppressionErrors map[string]error
 	serviceReaps              map[string]runtimeReapOutcome
 	serviceBoots              map[string]string
@@ -120,6 +121,7 @@ type agentSession struct {
 }
 
 type residentAttempt struct {
+	restartable   bool
 	attemptID     string
 	fencingToken  string
 	class         string
@@ -1117,7 +1119,7 @@ func (session *agentSession) executeResident(
 	attemptContext, cancelAttempt := context.WithCancelCause(ctx)
 	resident := &residentAttempt{
 		attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken,
-		class: claim.Job.Spec.Class, kind: claim.Job.Spec.Kind, cancel: cancelAttempt,
+		restartable: claim.Job.Spec.Restartable, class: claim.Job.Spec.Class, kind: claim.Job.Spec.Kind, cancel: cancelAttempt,
 		done: make(chan struct{}), runtimeReaped: make(chan runtimeReapOutcome, 1),
 	}
 	session.claimMu.Lock()
@@ -1126,6 +1128,9 @@ func (session *agentSession) executeResident(
 		session.serviceBoots[claim.Job.JobID] = session.registration.BootSessionID
 	}
 	session.resident[claim.Job.JobID] = resident
+	if session.shutdownRestartable && resident.restartable {
+		resident.cancel(ErrAgentShutdown)
+	}
 	session.notifyResidentChangedLocked()
 	session.claimMu.Unlock()
 	defer cancelAttempt(nil)

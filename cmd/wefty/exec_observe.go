@@ -11,7 +11,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// Exec alone outlasts transient transport failures during a service restart.
+// Attached exec outlasts transient transport failures during a service restart.
 // Each read has a bounded recovery window; successful reads reset the window.
 // Keep the log cursor outside retries so already delivered output is not replayed.
 func readExec[T any](caller context.Context, clients *apiClients, read func(context.Context) (T, error)) (T, error) {

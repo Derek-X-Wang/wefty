@@ -645,6 +645,20 @@ func (m *handoffManager) readExecutionResult(owner *handoffOwnership, execution 
 	if !m.holdsReceipt(owner, path) || owner.runID != execution.ownerKey || owner.nodeID != nodeID {
 		return attemptResult{skip: contract.ResultUploadSkipAbsent}
 	}
+	if execution.spec.Restartable {
+		if !validRunMailboxSegment(owner.attemptID) {
+			return attemptResult{skip: contract.ResultUploadSkipAbsent}
+		}
+		root, err := owner.run.OpenRoot(restartableResultPath(owner.attemptID))
+		if errors.Is(err, os.ErrNotExist) {
+			return attemptResult{skip: contract.ResultUploadSkipAbsent}
+		}
+		if err != nil {
+			return attemptResult{skip: contract.ResultUploadSkipUnreadable}
+		}
+		defer root.Close()
+		return readHandoffResult(root)
+	}
 	return readHandoffResult(owner.run)
 }
 

@@ -428,6 +428,7 @@
                     "description": "Restricted JSON Schema 2020-12 dialect. Local fragment references are allowed; remote references, dynamic references, vocabularies, and content decoders are forbidden."
                   },
                   "required_envelope": { "type": "boolean", "default": false },
+                  "restartable": { "type": "boolean", "default": false, "description": "Restart interrupted captured process exec. Requires exec_version=2, matching params.restartable=true, and no dispatch authority. Defaults off." },
                   "dispatch_authority": {
                     "type": "boolean",
                     "default": false,

@@ -730,7 +730,7 @@ func (s *Store) pendingDispatches(ctx context.Context) ([]dispatchIntent, error)
 SELECT r.run_id, r.dispatch_key, COALESCE(r.parent_run_id, ''),
        CASE WHEN t.source='rerun' THEN t.source_run_id ELSE r.run_id END,
        s.content, s.sha256, s.interpreter_json, s.mode, i.program_json, r.tags_json, r.limits_json,
-       r.params_json, r.dispatch_authority
+       r.params_json, r.dispatch_authority, r.restartable
 FROM dispatch_outbox o JOIN runs r ON r.run_id=o.run_id LEFT JOIN run_scripts s ON s.run_id=r.run_id
 LEFT JOIN run_images i ON i.run_id=r.run_id
 JOIN run_triggers t ON t.run_id=r.run_id
@@ -749,7 +749,7 @@ ORDER BY r.created_ns, r.run_id`, contract.RunPending, contract.RunDispatching, 
 		var content, interpreterJSON, imageJSON, tagsJSON, limitsJSON, paramsJSON []byte
 		var sha sql.NullString
 		var mode sql.NullInt64
-		if err := rows.Scan(&intent.RunID, &intent.DispatchKey, &intent.ParentRunID, &intent.HandoffOwnerID, &content, &sha, &interpreterJSON, &mode, &imageJSON, &tagsJSON, &limitsJSON, &paramsJSON, &intent.DispatchAuthority); err != nil {
+		if err := rows.Scan(&intent.RunID, &intent.DispatchKey, &intent.ParentRunID, &intent.HandoffOwnerID, &content, &sha, &interpreterJSON, &mode, &imageJSON, &tagsJSON, &limitsJSON, &paramsJSON, &intent.DispatchAuthority, &intent.Restartable); err != nil {
 			return nil, internalError(err, "scan pending dispatch")
 		}
 		if len(imageJSON) > 0 {
@@ -901,6 +901,7 @@ type dispatchIntent struct {
 	// withhold_workload_credentials instruction when it is false — which the
 	// node agent reads alongside L1's own record of who submitted the job.
 	DispatchAuthority bool
+	Restartable       bool
 	Content           []byte
 	SHA256            string
 	Interpreter       []string

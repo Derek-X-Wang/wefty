@@ -16,7 +16,11 @@ const (
 	CapabilityOneshotRestartable = "oneshot:restartable"
 	MaximumOneshotRestarts       = 10
 	MaximumOneshotRestartDelay   = 60 * time.Second
-	RestartLimitReached          = "restart_limit_reached"
+	// MinimumOneshotRestartDelay covers the node agent's default Guardian TERM
+	// grace (5s), final reap bound (5s), and a 1s scheduling margin. Short Leases
+	// must not allow a lease-loss successor ahead of ordinary EOF teardown.
+	MinimumOneshotRestartDelay = 11 * time.Second
+	RestartLimitReached        = "restart_limit_reached"
 )
 
 type InterruptionReason string
@@ -243,8 +247,8 @@ func oneshotRestartDelay(restart int, jitter func(time.Duration) time.Duration) 
 	if jitter != nil {
 		delay = jitter(delay)
 	}
-	if delay < time.Second {
-		delay = time.Second
+	if delay < MinimumOneshotRestartDelay {
+		delay = MinimumOneshotRestartDelay
 	}
 	if delay > MaximumOneshotRestartDelay {
 		delay = MaximumOneshotRestartDelay

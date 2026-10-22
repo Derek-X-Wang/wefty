@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -57,6 +58,7 @@ type OutputSinkFunc = workloadrunner.OutputSinkFunc
 // must not call it for a spawn failure.
 type Request struct {
 	ProcessStarted   func(processGroupID int) error
+	StopInitiated    func(error)
 	AttemptID        string
 	Execution        contract.ExecutionSpec
 	Limits           *contract.JobLimits
@@ -69,7 +71,8 @@ type Request struct {
 	ReadinessChanged func(startupSatisfied, ready bool)
 	// Guarded requests preserve the payload across the agent/Guardian process
 	// boundary so loss of the agent boot still reaps it.
-	Guarded bool
+	Guarded         bool
+	RequireGuardian bool
 }
 
 // Config holds process-runner dependencies and defaults. A nil Clock uses the
@@ -141,6 +144,13 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 
 	if err := validateRequest(ctx, request); err != nil {
 		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+	}
+	if request.RequireGuardian {
+		if !runner.GuardianAvailable() {
+			err := errors.New("restartable process requires a usable Guardian")
+			return spawnFailure(contract.SpawnFailureRuntimeUnavailable, err), err
+		}
+		request.Guarded = true
 	}
 	if request.ServiceAddress != "" && runner.guardianExecutable == "" {
 		err := errors.New("process service readiness requires guardian supervision")
@@ -219,6 +229,13 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 	var completionTimerChannel <-chan time.Time
 	completionSignal := request.CompletionSignal
 
+	terminate := func(cause error) (contract.ProcessResult, error) {
+		if request.StopInitiated != nil {
+			request.StopInitiated(cause)
+		}
+		return runner.terminate(command.Process.Pid, wait, cause)
+	}
+
 	for {
 		select {
 		case outcome := <-wait:
@@ -235,7 +252,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			}
 			remaining := activity.Remaining(runner.clock.Now(), idleTimeout)
 			if remaining <= 0 {
-				return runner.terminate(command.Process.Pid, wait, ErrIdleTimeout)
+				return terminate(ErrIdleTimeout)
 			}
 			resetTimer(idleTimer, remaining)
 
@@ -245,7 +262,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 				resetTimer(idleTimer, remaining)
 				continue
 			}
-			return runner.terminate(command.Process.Pid, wait, ErrIdleTimeout)
+			return terminate(ErrIdleTimeout)
 
 		case <-completionSignal:
 			completionSignal = nil
@@ -256,16 +273,16 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			defer stopTimer(completionTimer)
 
 		case <-completionTimerChannel:
-			return runner.terminate(command.Process.Pid, wait, ErrCompletionTimeout)
+			return terminate(ErrCompletionTimeout)
 
 		case <-maxRuntimeChannel:
-			return runner.terminate(command.Process.Pid, wait, ErrMaxRuntime)
+			return terminate(ErrMaxRuntime)
 
 		case <-failure.Changed():
-			return runner.terminate(command.Process.Pid, wait, fmt.Errorf("output sink: %w", failure.Err()))
+			return terminate(fmt.Errorf("output sink: %w", failure.Err()))
 
 		case <-ctx.Done():
-			return runner.terminate(command.Process.Pid, wait, ctx.Err())
+			return terminate(ctx.Err())
 		}
 	}
 }
@@ -570,3 +587,12 @@ func (failure *sinkFailure) Err() error {
 }
 
 func (failure *sinkFailure) Changed() <-chan struct{} { return failure.changed }
+
+// GuardianAvailable reports whether this runner can start its Guardian.
+func (runner *Runner) GuardianAvailable() bool {
+	if runner == nil || (runtime.GOOS != "darwin" && runtime.GOOS != "linux") || runner.guardianExecutable == "" {
+		return false
+	}
+	info, err := os.Stat(runner.guardianExecutable)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0
+}

@@ -982,6 +982,7 @@ func run() error {
 	defer signal.Stop(signals)
 	go func() {
 		handleShutdownSignals(ctx, signals, *shutdownBudget, func(drainContext context.Context) error {
+			nodeAgent.InterruptRestartableForShutdown()
 			_, err := nodeAgent.Drain(drainContext)
 			return err
 		}, cancel, log.Printf)

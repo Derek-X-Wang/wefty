@@ -112,6 +112,25 @@ func resolveExecFinished(ctx context.Context, clients *apiClients, record contra
 		event.Reason = "cancelled"
 		return event, &runOutcomeError{runID: record.RunID, status: record.Status, reason: event.Reason}
 	}
+	if record.Restartable {
+		execution, err := readExec(ctx, clients, func(readCtx context.Context) (l3.RunExecution, error) {
+			return clients.getRunExecution(readCtx, record.RunID)
+		})
+		if err != nil || execution.Job == nil || execution.Job.RestartRecovery == nil {
+			event.Outcome = "infrastructure_error"
+			event.Reason = "restart evidence unavailable"
+			cause := fmt.Errorf("run %s: %s", record.RunID, event.Reason)
+			if err != nil {
+				cause = fmt.Errorf("%w: %w", cause, err)
+			}
+			return event, &unavailableError{cause: cause}
+		}
+		if reason := execution.Job.RestartRecovery.TerminalReason; reason != nil {
+			event.Outcome = "infrastructure_error"
+			event.Reason = *reason
+			return event, &unavailableError{cause: fmt.Errorf("run %s: %s", record.RunID, *reason)}
+		}
+	}
 	event.Reason = runFailureReason(ctx, clients, record)
 	if record.Status == contract.RunFailed {
 		event.Outcome = "fail"

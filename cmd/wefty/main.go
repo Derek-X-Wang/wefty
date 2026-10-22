@@ -452,7 +452,7 @@ Commands:
   runs list [--status STATUS] [--mine] [--limit LIMIT] [--cursor CURSOR] [--all]
                              List Runs, newest first; --all walks every remaining page
     --origin computer:ID     List Runs by immutable Computer origin instead
-  exec [--tag TAG] [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>
+  exec [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>
                              Run this checkout on this machine's node; exit 0 or 10
   submit [--again] [--idempotency-key KEY]
                              Submit a saved Workflow or an inline-script/image run
