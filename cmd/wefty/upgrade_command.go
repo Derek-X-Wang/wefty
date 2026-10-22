@@ -220,6 +220,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if host.euid == 0 {
 		return upgradeReport{}, errors.New("wefty upgrade must run as the owner, never as root")
 	}
+	if host.goos == "linux" {
+		return upgradeReport{}, errors.New("role-aware upgrade on Linux is a later slice; the current upgrade supports macOS only")
+	}
 	if host.goos != "darwin" {
 		return upgradeReport{}, fmt.Errorf("wefty upgrade supports the daily macOS install; this machine runs %s", host.goos)
 	}

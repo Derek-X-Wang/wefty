@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/fleetjoin"
+	"github.com/Derek-X-Wang/wefty/internal/systemduser"
 )
 
 // Read-only selection runs again under the installation lock before any keys.
@@ -127,4 +128,52 @@ func openSetupOwnerLoginURL(ctx context.Context, value string) error {
 		return errors.New("could not open owner sign-in in the browser; repair browser access and rerun setup")
 	}
 	return nil
+}
+
+// setupOwnerLoginBrowser keeps the one-use address exclusively in a browser
+// argument. A headless Linux machine can finish setup without --with-person;
+// neither the address nor command output is copied into an error or receipt.
+// Mac's existing default opener above remains unchanged.
+func setupOwnerLoginBrowser(goos string, run func(context.Context, string, ...string) error, files ...systemduser.FileSystem) func(context.Context, string) error {
+	if run == nil {
+		run = func(ctx context.Context, name string, args ...string) error {
+			command := exec.CommandContext(ctx, name, args...)
+			command.WaitDelay = time.Second
+			return command.Run()
+		}
+	}
+	return func(ctx context.Context, value string) error {
+		u, err := url.Parse(value)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || strings.ContainsAny(value, "\x00\r\n\t ") {
+			return errors.New("owner sign-in returned an invalid browser address")
+		}
+		command := "/usr/bin/open"
+		if goos == "linux" {
+			fileSystem := systemduser.FileSystem{}
+			if len(files) > 0 {
+				fileSystem = files[0]
+			}
+			command, err = systemduser.ResolveTool("xdg-open", fileSystem)
+			if err != nil {
+				return err
+			}
+		} else if goos != "darwin" {
+			return errors.New("owner browser sign-in is not supported on this platform")
+		}
+		openCtx := ctx
+		if goos == "linux" {
+			var cancel context.CancelFunc
+			openCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+		}
+		if err := run(openCtx, command, value); err != nil {
+			// Generic xdg-open may remain attached to a foreground browser. Its
+			// deadline says nothing about sign-in: enrollment confirms the identity.
+			if goos == "linux" && errors.Is(openCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return nil
+			}
+			return errors.New("could not open owner sign-in in the browser; repair browser access and rerun setup")
+		}
+		return nil
+	}
 }

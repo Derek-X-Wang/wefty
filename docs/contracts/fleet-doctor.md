@@ -3,10 +3,10 @@
 `wefty doctor` (also `wefty node doctor`) diagnoses the explicit installation
 role recorded in `setup-files.json`, or an explicit durable fleet setup stage.
 Participant shape never selects a role. A legacy plain or OCI installation
-retains its existing diagnosis, human output and exits. This slice implements
-the Mac role plan; Linux user-manager and lingering evidence belong to the
-Linux installation slice. On Linux the existing OCI/node-configuration route
-and messages remain unchanged, including when a role receipt cannot be read.
+retains its existing diagnosis, human output and exits. Fleet roles use the
+same plan on Mac and Linux, through their per-user service adapters. Linux
+without explicit fleet role evidence retains the existing OCI/node-configuration
+route and messages.
 Doctor never changes service, power or disk settings.
 
 If an installation receipt cannot be read and there is no accessible fleet stage,
@@ -18,7 +18,7 @@ a `role-receipt` error finding with advice and exit 12, not a bare command error
 
 | Check | Control plane | Joining machine |
 | --- | --- | --- |
-| Running LaunchAgents | L1, L3, node agent, client service | Node agent, client service |
+| Running per-user services | L1, L3, node agent, client service | Node agent, client service |
 | Complete profile | All four participants, enrolled endpoints, configured local admission, automatic admission enabled | Node agent and client, remote enrolled endpoints, no control-plane admission policy |
 | Participant files | Each recorded local participant, including optional person | Each recorded local participant, including optional person |
 | Node metadata, recorded PATH, skill copies | Required | Required |
@@ -26,6 +26,7 @@ a `role-receipt` error finding with advice and exit 12, not a bare command error
 | Control-service peers | Both directions through service-owned read-only peer probes | Same |
 | Local admission | Alive, claims enabled, configured Pinned tag and class slots | Alive, claims enabled, automatic-admission mark, only its Pinned tag, default class slots |
 | Mac host | Read-only system sleep and FileVault probes | Not run |
+| Linux host | Read-only lingering check | Read-only lingering check |
 
 Directory checks inspect existence and modes. A participant directory must be
 private (`0700`) and match this installation's recorded role path. Saved-state
@@ -34,7 +35,7 @@ file kind and permissions. They never read state payloads, open a backend, acqui
 its ownership lock, or open an authority database. Files, recorded PATH and
 skills remain inspectable when services are down. PATH checks locate tools but
 never run them. Required private install folders use `0700`; shared binary,
-LaunchAgent and skill folders retain setup's `0755` modes.
+per-user service and skill folders retain setup's `0755` modes.
 
 Only the running client service supplies live client identity and outbound
 transport. There is no direct-state fallback and no person identity probe.
@@ -145,3 +146,37 @@ network name, automatic-admission mark, agent version and active class counts.
 Legacy plain text keeps its original bytes for both single-node and multi-node
 installs. JSON changes are additive;
 there is no new L1/L3 read, public field, or mutation.
+
+
+## Linux fleet checks
+
+Linux fleet doctor uses the recorded role and same independent file, participant,
+node configuration, captured PATH, skill, client-service, admission and peer-probe
+checklist. Service inspection uses `systemctl --user show` through the Linux
+adapter, never launchctl. An inspection error is unverified, not absence. Stopped
+services do not suppress the local file checklist. A selected OCI control socket
+keeps its existing OCI doctor route. Legacy Linux without a recorded fleet role
+keeps the existing route; doctor does not infer a fleet from participant shape.
+
+For either Linux fleet role, the injected read-only host probe is
+`loginctl show-user USER -p Linger`. Exact `Linger=yes` reports that services can
+survive logout. Exact `Linger=no` warns that services do not survive the last
+logout and prints `loginctl enable-linger 'USER'` with the actual account name
+safely shell-quoted. A failed command or unknown output remains unverified and
+prints the read command plus conditional enable advice. These host findings are
+advisory and do not override the verdict about current service readiness.
+Neither setup nor doctor changes lingering. Mac sleep and FileVault probes never
+run on Linux. Linux path defaults and the XDG state override are specified in
+[the installation contract](installation-service-plan.md#linux-fleet-installation).
+
+Linux doctor uses the canonical `linux_log_root` saved in the setup record and
+role receipt. The current `XDG_STATE_HOME` cannot change the installation being
+checked. Missing/conflicting roots, unsafe log-folder ownership, linked log
+folders or a writable shared parent produce repair findings. Unit inspection
+also compares fragment file identity, accepts linked-home/stow aliases, and
+rejects unit-specific or user-writable drop-ins. Shared root-owned system
+drop-ins with protected files, targets and directories are listed in an
+informational severity-`ok` finding; they do not change current health. Tools
+are resolved from trusted `/usr/bin` then `/bin` candidates without PATH lookup. Linux setup includes the same
+read-only lingering result and enable command in its report, so an SSH install
+shows whether services survive logout before the owner closes the session.

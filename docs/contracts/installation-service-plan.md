@@ -9,9 +9,10 @@ a joining role. Unknown roles are refused when building a plan.
 
 `internal/serviceplan` builds one named, platform-neutral plan from the recorded
 role and supplied paths. A service entry names its service, binary, participant,
-arguments, log, and removal targets. The Mac renderer consumes this plan.
+arguments, log, and removal targets. The Mac and Linux renderers consume this plan.
 The platform supplies paths and service-manager details; the plan contains no
-LaunchAgent or systemd type. Linux user units remain a later slice.
+LaunchAgent or systemd type. Linux fleet roles use systemd user units. The
+legacy plain stack remains Mac-only.
 Every consumed path must be absolute and clean. Fleet socket paths also share
 the local transport's length bound and need a private parent folder. A socket
 directly in a shared system folder is refused; an existing parent must be an
@@ -64,7 +65,8 @@ records, or a receipt/profile disagreement before recovery or preparation.
 A joining upgrade builds only CLI and agent, and restarts only node agent then
 client service. A control-plane upgrade builds all four binaries and restarts
 L1, L3, node agent, then client service. Neither changes participant records.
-Role-aware removal and Linux adapters remain their own slices.
+Role-aware removal remains a later slice on both platforms. Linux upgrade
+refuses with `role-aware upgrade on Linux is a later slice`.
 [Doctor](fleet-doctor.md) consumes the same recorded role and named plan,
 checks local files independently of services, and uses the running client
 service for live network evidence.
@@ -109,7 +111,7 @@ is ordered, **not a two-file atomic transaction**:
 
 1. Atomically replace the active profile with the complete validated profile.
 2. Atomically replace `setup-files.json` with the role receipt. This is the commit point.
-3. Converge the role's LaunchAgents in dependency order, then check readiness.
+3. Converge the role's services in dependency order, then check readiness.
 
 A crash between the first two writes leaves a complete non-plain profile and
 no role receipt. Plain setup and upgrade refuse it. Resume explicitly with
@@ -437,3 +439,131 @@ including its directories and any future files. Neither `--remove` nor
 history record as well as the data; it must not treat receipt paths as deletion
 authority. Installs that never convert keep their existing setup, service,
 removal, purge and upgrade behavior and file bytes.
+
+
+## Linux fleet installation
+
+Linux supports the same staged control-plane and join setup, enrollment order,
+ordered publication, saved-identity readiness and authenticated L1/L3 peer
+probes as Mac fleet setup. It never uses sudo, changes groups, installs system
+units or configures an OCI helper. Plain setup and `--convert-plain` remain
+Mac-only. Both staged and committed Linux fleet removal refuse, as Mac fleet
+removal does, until removal can retain participant records with their state.
+`--with-person` remains available on joining Linux installations and warns that
+it is meant for the owner's laptop. The warning is printed before browser sign-in
+and retained in the setup report. It uses the trusted fixed-list `xdg-open`
+for browser sign-in,
+never another key. If a desktop browser cannot open, the sanitized error explains
+how to finish machine setup without `--with-person`; it never prints the URL.
+The Linux opener has a five-second deadline so it cannot hold enrollment open.
+A foreground opener reaching that deadline counts as launched, since generic
+`xdg-open` may wait for the browser. The enrollment flow confirms person sign-in;
+the opener's lifetime does not. Other launch failures and parent cancellation
+still return sanitized recovery advice.
+
+Linux locations are:
+
+| Content | Location |
+| --- | --- |
+| Binaries | `~/.local/bin` |
+| Configuration | `~/.config/wefty` |
+| Data and participant state | `~/.local/share/wefty` |
+| Logs | `~/.local/state/wefty` |
+| Units | `~/.config/systemd/user` |
+| Client socket | `~/.config/wefty/client/service.sock` |
+
+Existing agent/exec storage already recognizes `XDG_STATE_HOME`. Linux fleet
+setup and doctor therefore use `$XDG_STATE_HOME/wefty` for logs when set. It
+must be an absolute clean path within the installation home, as all setup
+writes remain home-confined. Existing ancestors are resolved before checking
+confinement, including a login home linked to its canonical location. Relative,
+external or escaping roots are refused before mutation. The log folder and its
+state-home parent must be real directories owned by the setup user; an existing
+group- or world-writable parent is refused. Setup makes the wefty log folder
+mode 0700, including on a committed rerun, without changing its parent's mode.
+
+The canonical log root is saved as `linux_log_root` in both the staged setup
+record and role receipt before services start. Reruns and doctor use that root,
+even if `XDG_STATE_HOME` changes or is unset. Conflicting, missing or redirected
+recorded roots require repair of the original records/folders; setup never
+silently migrates logs. This Linux log root is also the parent of `wefty exec`
+storage. A future Linux purge must not delete it blindly.
+
+No existing configuration/data resolver recognizes
+`XDG_CONFIG_HOME` or `XDG_DATA_HOME`; those variables do not change these fixed
+installation paths. `$XDG_RUNTIME_DIR` does not relocate the client socket.
+The socket stays at the shared CLI/service default so login and lingering
+services use the same endpoint. Its private mode-0700 folder, ownership checks,
+mode-0600 socket, publication lock and 100-byte path bound remain required.
+
+Preflight requires **systemd 242 or newer** and fails closed on unrecognized
+`systemctl --version` output before enrollment (using the trusted path below). `StandardOutput=append:`
+requires v240; the `:` ExecStart prefix appears in the
+[systemd v242 parser](https://github.com/systemd/systemd/blob/v242/src/core/load-fragment.c)
+(`EXEC_COMMAND_NO_ENV_EXPAND`) and is absent from the
+[v241 parser](https://github.com/systemd/systemd/blob/v241/src/core/load-fragment.c).
+All role units are rendered and validated before any enrollment key is used.
+Executable paths cannot contain quotes, backslashes or control characters,
+which systemd rejects even when quoted. Argument values retain their full
+word-list quoting support.
+
+The same-user tools `systemctl`, `loginctl` and `xdg-open` are resolved from a
+fixed list: `/usr/bin/NAME`, then `/bin/NAME`, including unmerged `/usr` layouts.
+No PATH lookup occurs. Lstat must find a regular file or root-owned symlink;
+the resolved regular executable and its ancestor directories must be root-owned
+and not group- or world-writable. Symlink permission bits are ignored because
+Linux symlinks normally have mode 0777; target permissions are checked instead.
+Missing or unsafe candidates produce `NAME not found at /usr/bin or /bin`,
+separately from an old or unknown systemd version. Parsing consumes stdout only.
+Stderr is retained in structured command errors and never copied into reports.
+
+Unit names are `dev.wefty.l1.service`, `dev.wefty.l3.service`,
+`dev.wefty.node-agent.service` and `dev.wefty.client-service.service`. Join
+installs only the last two. These differ from the privileged OCI installer.
+The adapter quotes each argument independently, escapes systemd percent
+specifiers and disables ExecStart environment expansion with the `:` prefix.
+It includes the same per-service binary/profile input digest as the Mac adapter. Captured node-agent PATH is
+recorded literally in `Environment=`. No keys or browser URLs enter units.
+
+Each unit uses `Type=simple`, `Restart=on-failure`, a ten-second restart delay,
+`KillMode=mixed`, and `WantedBy=default.target`. The node agent has its existing
+shutdown bound as `TimeoutStopSec`; every other unit explicitly uses 20 seconds.
+The stop wait allows that effective timeout plus a 15-second confirmation margin.
+Each service orders itself `After=` its previous plan entry; ordering does not pull in or restart other entries.
+Setup also activates entries in plan order. Scalar working/log paths use
+systemd path syntax, not argument-list quotes (see the
+[systemd v252 parser](https://github.com/systemd/systemd/blob/v252/src/core/load-fragment.c),
+`config_parse_working_directory` and `config_parse_exec_output`).
+Unit paths appear as `unit` in setup's service report; the Mac `plist` report is
+unchanged.
+
+The injected manager runs only `systemctl --user`: inspect with `show --all`
+and explicitly named properties (including unset ones and `FragmentPath`/
+`DropInPaths`), reload with `daemon-reload`, enable/start, and confirmed stop/disable. An explicit
+coherent `LoadState=not-found` is absence. Inspection failures, masked or broken
+units, missing properties and unrecognized state output refuse convergence.
+A loaded fragment must be the same regular file as the published unit, checked
+with `os.SameFile` after Lstat/Stat. Different spellings from linked homes or
+stow-linked systemd directories are accepted without restarting services.
+
+Unit-specific drop-ins are refused anywhere. Drop-ins under the home,
+`XDG_RUNTIME_DIR`, or the home `systemd/user.control` directory are refused.
+Other drop-ins must be shared `service.d` or prefix policy, root-owned and not
+group- or world-writable, including their targets and parent directories.
+Trusted system-wide policy in `/etc`, `/usr/lib` and `/run/systemd/user` is
+allowed and listed as an informational doctor finding (severity `ok`). Known
+system/user/runtime search directories are scanned in preflight as well, since
+not-found units do not report effective drop-ins before first activation.
+Unknown or inaccessible metadata fails closed with override repair advice. A loaded but idle unit
+starts; matching enabled/running bytes do not restart.
+Changed definitions are staged and synced, the old process is confirmed stopped,
+and only then are the new bytes published and the manager reloaded. A successful
+stop ending in `failed/failed` with `MainPID=0` also confirms termination;
+`reset-failed NAME` must succeed before publication or restart. A publish
+failure restores the old definition. A pending daemon reload is detected even
+when on-disk bytes match, so interrupted publication can resume safely.
+Readiness still requires saved-client protocol evidence and current-PID ready
+records after the Linux boot time from `/proc/stat`; manager activation alone
+is not readiness. Setup and doctor both report read-only lingering advice,
+including the exact `loginctl enable-linger` command when logout survival is
+disabled or unverified. Neither changes lingering.
