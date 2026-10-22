@@ -347,9 +347,14 @@ func writeControlResponse(writer http.ResponseWriter, value any, err error) {
 	if err != nil {
 		var blocked *lima.RecreateBlockedError
 		if errors.As(err, &blocked) {
-			writeControlErrorDetails(writer, http.StatusConflict, ErrorHostVMRecreateBlocked, blocked.Error(), map[string]any{
-				"blockers": blocked.Blockers, "reason": blocked.Reason,
-			})
+			details := map[string]any{}
+			if len(blocked.Blockers) != 0 {
+				details["blockers"] = blocked.Blockers
+			}
+			if blocked.Reason != "" {
+				details["reason"] = blocked.Reason
+			}
+			writeControlErrorDetails(writer, http.StatusConflict, ErrorHostVMRecreateBlocked, blocked.Error(), details)
 			return
 		}
 		failure := &ControlError{Code: ErrorInternal, Status: http.StatusInternalServerError, Message: "node-local OCI control failed", Cause: err}

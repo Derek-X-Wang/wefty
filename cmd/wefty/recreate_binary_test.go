@@ -82,12 +82,20 @@ func TestHostVMRecreateRefusalFromRealBinary(t *testing.T) {
 					t.Fatalf("output=%s decode=%v", output, err)
 				}
 				if test.name == "retained" {
+					if _, ok := response.Error.Details["reason"]; ok {
+						t.Fatalf("empty reason: %s", output)
+					}
 					blockers, ok := response.Error.Details["blockers"].([]any)
 					if !ok || len(blockers) != 2 || !strings.Contains(response.Error.Message, "kept-copy") {
 						t.Fatalf("lost blockers: %s", output)
 					}
-				} else if response.Error.Details["reason"] != test.failure.Reason {
-					t.Fatalf("lost unknown-inventory reason: %s", output)
+				} else {
+					if response.Error.Details["reason"] != test.failure.Reason {
+						t.Fatalf("lost unknown-inventory reason: %s", output)
+					}
+					if _, ok := response.Error.Details["blockers"]; ok {
+						t.Fatalf("empty blockers: %s", output)
+					}
 				}
 			}
 		})
