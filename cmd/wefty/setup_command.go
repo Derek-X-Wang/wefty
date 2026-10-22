@@ -328,16 +328,16 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	var request setupRequest
 	var remove, purge bool
-	flags.StringVar(&request.role, "role", "", "fleet role for a new install: control-plane or join")
+	flags.StringVar(&request.role, "role", "", "fleet role on Mac or Linux: control-plane or join; omit for the daily plain Mac install")
 	flags.StringVar(&request.joinCode, "join-code", "", "non-secret join code from the control plane setup report")
 	flags.BoolVar(&request.convertPlain, "convert-plain", false, "explicitly convert an existing plain Mac into a joining machine, retaining read-only history")
 	flags.BoolVar(&request.abandonConversion, "abandon-conversion", false, "restore and abandon an incomplete conversion before history is committed")
 	flags.BoolVar(&request.withPerson, "with-person", false, "enrol the owner through browser sign-in on the owner laptop only")
 	flags.BoolVar(&request.skipSmokeRun, "skip-smoke-run", false, "skip the bounded pinned fleet smoke run")
-	flags.StringVar(&request.coordinatorURL, "coordinator-url", "", "non-default HTTPS enrolment coordinator (no credentials)")
-	flags.BoolVar(&remove, "remove", false, "remove the per-user install, keeping data and logs")
+	flags.StringVar(&request.coordinatorURL, "coordinator-url", "", "non-default HTTPS enrolment coordinator (no credentials); global --control-url or $TS_CONTROL_URL also selects it; selections must agree")
+	flags.BoolVar(&remove, "remove", false, "remove the plain Mac install, keeping data and logs; fleet removal is not supported yet")
 	flags.BoolVar(&purge, "purge", false, "also delete data and logs (requires --remove)")
-	flags.StringVar(&request.from, "from", "", "folder holding wefty, wefty-l1, wefty-l3 and wefty-agent (default: the folder of this wefty)")
+	flags.StringVar(&request.from, "from", "", "folder holding wefty and wefty-agent, plus wefty-l1 and wefty-l3 for plain or control-plane setup (default: the folder of this wefty)")
 	flags.StringVar(&request.nodeID, "node-id", "", "stable node ID for a first install (default: chosen once from the host name and kept)")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)

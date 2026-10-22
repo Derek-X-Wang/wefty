@@ -218,9 +218,10 @@ hint. Neither shape retries as the person; JSON preserves the server's error
 envelope.
 
 The setup enrolment step is callable independently of service installation.
-The plain `wefty setup` flow is unchanged. Mac control-plane setup uses a durable
-staged profile and ordered publication. Joining and explicit plain-to-join
-conversion use the same staged publication; Linux remains a later #900 slice.
+The plain `wefty setup` flow is unchanged. Fleet control-plane setup on Mac and
+Linux uses a durable staged profile and ordered publication. Joining (Mac and
+Linux) and explicit plain-to-join conversion (Mac only) use the same staged
+publication.
 See [installation roles](installation-service-plan.md).
 See [Fabric enrolment](fabric-enrolment.md) for the step's contract.
 

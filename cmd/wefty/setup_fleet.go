@@ -157,7 +157,7 @@ func selectSetupRole(paths setupPaths, requested string) (serviceplan.Role, erro
 		// old participants. An existing plain install is never a conversion.
 		for _, path := range []string{paths.profile, paths.nodeConfig, filepath.Join(paths.config, setupManifestName), filepath.Join(paths.data, "l1.sqlite"), filepath.Join(paths.data, "l3.sqlite")} {
 			if _, err := os.Lstat(path); err == nil {
-				return "", errors.New("setup refuses recorded fleet role without its resume record, or a fleet role over an existing plain installation; restore the fleet setup record, or use a fresh install (plain conversion is a later slice)")
+				return "", errors.New("setup refuses recorded fleet role without its resume record, or a fleet role over an existing plain installation; restore missing fleet records; for an existing plain install use --role join --join-code CODE --convert-plain on Mac, or a fresh install on Linux")
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				return "", err
 			}
@@ -832,7 +832,7 @@ func refuseUncommittedFleetServices(ctx context.Context, host setupHost, paths s
 	for _, database := range []string{"l1.sqlite", "l3.sqlite"} {
 		for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
 			if _, err := os.Lstat(filepath.Join(paths.data, database+suffix)); err == nil {
-				return errors.New("fresh control-plane setup refuses existing authority data; plain conversion is a later slice")
+				return errors.New("fresh control-plane setup refuses existing authority data; restore the original installation and resume its setup, or use a fresh install")
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				return err
 			}
@@ -851,7 +851,7 @@ func refuseUncommittedFleetServices(ctx context.Context, host setupHost, paths s
 	for _, service := range plan.Services {
 		label := "dev.wefty." + service.Name
 		if _, err := os.Lstat(filepath.Join(paths.launchAgents, manager.file(label))); err == nil {
-			return fmt.Errorf("fresh fleet setup refuses existing %s definitions; plain conversion is a later slice", manager.description())
+			return fmt.Errorf("fresh fleet setup refuses existing %s definitions; restore the original installation and resume its setup, or use a fresh install", manager.description())
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
@@ -862,7 +862,7 @@ func refuseUncommittedFleetServices(ctx context.Context, host setupHost, paths s
 			return fmt.Errorf("cannot verify existing %s %s before fleet setup: %w", manager.description(), manager.name(label), err)
 		}
 		if state.Loaded {
-			return fmt.Errorf("fresh fleet setup refuses existing loaded %ss; plain conversion is a later slice", manager.description())
+			return fmt.Errorf("fresh fleet setup refuses existing loaded %ss; restore the original installation and resume its setup, or use a fresh install", manager.description())
 		}
 	}
 	return nil
