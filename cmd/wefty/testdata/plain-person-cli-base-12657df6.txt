@@ -1,0 +1,102 @@
+whoami json=false
+GET /v1/whoami
+FABRIC ID	USER ID	DEVICE ID	SEEN
+plain-fixture	owner	owner-device	2026-10-21T12:00:00Z
+whoami json=true
+GET /v1/whoami
+{
+  "fabric_id": "plain-fixture",
+  "user_id": "owner",
+  "device_id": "owner-device",
+  "seen_at": "2026-10-21T12:00:00Z"
+}
+admin policy get json=false
+GET /v1/admin-policy
+POLICY REVISION	2
+FABRIC ID	USER ID	ADDED REVISION	ADDED
+plain-fixture	owner	1	2026-10-21T12:00:00Z
+admin policy get json=true
+GET /v1/admin-policy
+{
+  "revision": 2,
+  "admins": [
+    {
+      "fabric_id": "plain-fixture",
+      "user_id": "owner",
+      "added_revision": 1,
+      "added_at": "2026-10-21T12:00:00Z"
+    }
+  ]
+}
+admins list json=false
+GET /v1/admin-policy
+POLICY REVISION	2
+FABRIC ID	USER ID	ADDED REVISION	ADDED
+plain-fixture	owner	1	2026-10-21T12:00:00Z
+admins list json=true
+GET /v1/admin-policy
+{
+  "revision": 2,
+  "admins": [
+    {
+      "fabric_id": "plain-fixture",
+      "user_id": "owner",
+      "added_revision": 1,
+      "added_at": "2026-10-21T12:00:00Z"
+    }
+  ]
+}
+admin bootstrap fixture-nonce json=false
+POST /v1/admin-bootstrap {"nonce":"fixture-nonce"}
+POLICY REVISION	2
+FABRIC ID	USER ID	ADDED REVISION	ADDED
+plain-fixture	owner	1	2026-10-21T12:00:00Z
+admin bootstrap fixture-nonce json=true
+POST /v1/admin-bootstrap {"nonce":"fixture-nonce"}
+{
+  "revision": 2,
+  "admins": [
+    {
+      "fabric_id": "plain-fixture",
+      "user_id": "owner",
+      "added_revision": 1,
+      "added_at": "2026-10-21T12:00:00Z"
+    }
+  ]
+}
+admin policy add second --policy-revision 1 json=false
+PUT /v1/admin-policy/admins/second {"policy_revision":1}
+POLICY REVISION	2
+FABRIC ID	USER ID	ADDED REVISION	ADDED
+plain-fixture	owner	1	2026-10-21T12:00:00Z
+admin policy add second --policy-revision 1 json=true
+PUT /v1/admin-policy/admins/second {"policy_revision":1}
+{
+  "revision": 2,
+  "admins": [
+    {
+      "fabric_id": "plain-fixture",
+      "user_id": "owner",
+      "added_revision": 1,
+      "added_at": "2026-10-21T12:00:00Z"
+    }
+  ]
+}
+admin policy remove second --policy-revision 2 json=false
+DELETE /v1/admin-policy/admins/second {"policy_revision":2}
+POLICY REVISION	2
+FABRIC ID	USER ID	ADDED REVISION	ADDED
+plain-fixture	owner	1	2026-10-21T12:00:00Z
+admin policy remove second --policy-revision 2 json=true
+DELETE /v1/admin-policy/admins/second {"policy_revision":2}
+{
+  "revision": 2,
+  "admins": [
+    {
+      "fabric_id": "plain-fixture",
+      "user_id": "owner",
+      "added_revision": 1,
+      "added_at": "2026-10-21T12:00:00Z"
+    }
+  ]
+}

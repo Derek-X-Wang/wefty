@@ -143,7 +143,7 @@ func TestAdminRemovalWritesCurrentNoneBeforeDroppingOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy, err = h.store.AddAdmin(context.Background(), alice, bob.UserID, policy.Revision)
+	policy, err = h.store.AddAdmin(context.Background(), alice, bob.UserID, policy.Revision, "")
 	if err != nil {
 		t.Fatal(err)
 	}

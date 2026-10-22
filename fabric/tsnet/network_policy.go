@@ -13,7 +13,7 @@ func PrivateNetworkPolicy() fabric.PrivateNetworkPolicy {
 		Notes: []string{
 			"Review the complete private network policy before applying this snippet. Existing overlapping allow rules, including a default allow-all rule, can defeat published-port isolation; this snippet cannot revoke another allow rule.",
 			"The owner selector means the network's Owner role on untagged devices. Tagged machine participants do not acquire that identity. Owners, Admins and Network admins implicitly own all tags; tagOwners alone does not limit tagging to admins. Keep all of these privileged roles restricted to trusted administrators.",
-			"Any device signed in to the Owner account can act as the fleet admin until L1 pins the person device. Do not sign the control-plane Mac's network app, or any machine where AI agents run as you, into the Owner account.",
+			"Keep the Owner person identity on the owner's laptop. Do not sign the control-plane machine's network app, or any machine where AI agents run as you, into the Owner account.",
 			"The snippet permits only TCP port 80 for control traffic. Computer front doors and published ports on node agents are reachable only by the owner's untagged identity. Attended peer tests must confirm both allowed and refused connections.",
 			"Doctor prints guidance and observed evidence; it never reads or stores an admin credential and never changes the network policy.",
 		},

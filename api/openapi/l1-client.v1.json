@@ -735,10 +735,13 @@
       "put": {
         "operationId": "addAdmin",
         "summary": "Add one person as an administrator under policy CAS",
-        "description": "Current administrators only. The actor is derived from Fabric WhoIs and the accepted mutation advances revision with an atomic audit row.",
+        "description": "Current administrators only. The actor is derived from Fabric WhoIs and the accepted mutation advances revision with an atomic audit row. On authenticated person trust, device_id is required and binds the new administrator to that person device; on self-asserted trust it is ignored.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false, "required": ["policy_revision"],
-          "properties": { "policy_revision": { "type": "integer", "minimum": 1 } }
+          "properties": {
+            "policy_revision": { "type": "integer", "minimum": 1 },
+            "device_id": { "type": "string", "minLength": 1, "maxLength": 255, "description": "Subject person device ID, read from the subject's own whoami." }
+          }
         } } } },
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },
@@ -756,7 +759,10 @@
         "description": "Current administrators only. The final administrator is protected and a rejected mutation writes neither policy nor audit.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": {
           "type": "object", "additionalProperties": false, "required": ["policy_revision"],
-          "properties": { "policy_revision": { "type": "integer", "minimum": 1 } }
+          "properties": {
+            "policy_revision": { "type": "integer", "minimum": 1 },
+            "device_id": { "type": "string", "minLength": 1, "maxLength": 255, "description": "Shares the add request shape; not used by removal." }
+          }
         } } } },
         "responses": {
           "503": { "$ref": "./common.v1.json#/components/responses/Unavailable" },

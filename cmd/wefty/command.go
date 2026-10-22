@@ -93,7 +93,7 @@ func executeAdmin(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	if len(args) > 0 && args[0] == "policy" {
 		return executeAdminPolicy(ctx, clients, jsonOutput, args[1:], stdout)
 	}
-	return usageError("usage: wefty admin bootstrap NONCE | wefty admin policy get|add|remove")
+	return usageError("usage: wefty admin bootstrap NONCE | wefty admin policy get | wefty admin policy add USER_ID --policy-revision REVISION [--device-id DEVICE_ID] | wefty admin policy remove USER_ID --policy-revision REVISION")
 }
 
 type runInspection struct {

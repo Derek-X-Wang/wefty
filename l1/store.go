@@ -952,6 +952,7 @@ VALUES(1, 0, 1, 1, 0);
 CREATE TABLE IF NOT EXISTS admins (
   fabric_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
+  device_id TEXT NOT NULL DEFAULT '',
   added_revision INTEGER NOT NULL CHECK(added_revision > 0),
   added_ns INTEGER NOT NULL,
   PRIMARY KEY(fabric_id, user_id)
@@ -967,8 +968,9 @@ CREATE TRIGGER IF NOT EXISTS admins_bounded_before_insert
 BEFORE INSERT ON admins WHEN (SELECT COUNT(*) FROM admins) >= 32
 BEGIN SELECT RAISE(ABORT, 'admin policy limit reached'); END;
 CREATE TABLE IF NOT EXISTS admin_policy_audit (
+  subject_device_id TEXT NOT NULL DEFAULT '',
   revision INTEGER PRIMARY KEY CHECK(revision > 0),
-  operation TEXT NOT NULL CHECK(operation IN ('bootstrap', 'add', 'remove', 'reset')),
+  operation TEXT NOT NULL CHECK(operation IN ('bootstrap', 'add', 'remove', 'reset', 'rebind')),
   actor_kind TEXT NOT NULL CHECK(actor_kind IN ('fabric_person', 'local_operator')),
   actor_fabric_id TEXT NOT NULL,
   actor_user_id TEXT NOT NULL,
@@ -1246,6 +1248,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 `
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
+	}
+	if err := s.migrateAdminPersonDevice(ctx); err != nil {
+		return err
 	}
 	if err := s.ensureColumn(ctx, "nodes", "last_condition_json", "BLOB"); err != nil {
 		return err

@@ -243,7 +243,7 @@ func assertComputerSubmissionAndOriginCLIOverRealRoutes(t *testing.T) {
 	}
 
 	adminIdentity := fabric.Identity{FabricID: policy.Admins[0].FabricID, UserID: "admin-one", DeviceID: "device-one"}
-	policy, err = l1Store.AddAdmin(ctx, adminIdentity, "admin-two", reenabled.PolicyRevision)
+	policy, err = l1Store.AddAdmin(ctx, adminIdentity, "admin-two", reenabled.PolicyRevision, "")
 	if err != nil {
 		t.Fatal(err)
 	}
