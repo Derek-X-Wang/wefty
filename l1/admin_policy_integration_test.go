@@ -288,7 +288,7 @@ func TestAdminPolicyConcurrentCASHasOneAuditWinner(t *testing.T) {
 		target := target
 		go func() {
 			start.Wait()
-			_, err := h.store.AddAdmin(context.Background(), identity, target, policy.Revision)
+			_, err := h.store.AddAdmin(context.Background(), identity, target, policy.Revision, "")
 			results <- err
 		}()
 	}
@@ -326,7 +326,7 @@ func TestAdminAuthorityIsScopedToIssuingFabric(t *testing.T) {
 	}
 	repointed := admin
 	repointed.FabricID = "fabric-two"
-	if _, err := h.store.AddAdmin(context.Background(), repointed, "person-bob", policy.Revision); errorCode(err) != contract.ErrorAdminRequired {
+	if _, err := h.store.AddAdmin(context.Background(), repointed, "person-bob", policy.Revision, ""); errorCode(err) != contract.ErrorAdminRequired {
 		t.Fatalf("repointed Fabric mutation error = %v, want %q", err, contract.ErrorAdminRequired)
 	}
 }
@@ -346,7 +346,7 @@ func TestAdminPolicyBoundAndAuditFailureRollback(t *testing.T) {
 		WHEN NEW.operation='add' BEGIN SELECT RAISE(ABORT, 'forced audit failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.AddAdmin(context.Background(), identity, "person-bob", policy.Revision); errorCode(err) != contract.ErrorInternal {
+	if _, err := h.store.AddAdmin(context.Background(), identity, "person-bob", policy.Revision, ""); errorCode(err) != contract.ErrorInternal {
 		t.Fatalf("audit failure error = %v, want internal", err)
 	}
 	assertAdminPolicyRevisionAndAuditCount(t, h, 1, 1)
@@ -359,12 +359,12 @@ func TestAdminPolicyBoundAndAuditFailureRollback(t *testing.T) {
 	}
 	for index := 2; index <= MaxAdministrators; index++ {
 		current, err = h.store.AddAdmin(context.Background(), identity,
-			fmt.Sprintf("person-%02d", index), current.Revision)
+			fmt.Sprintf("person-%02d", index), current.Revision, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := h.store.AddAdmin(context.Background(), identity, "person-over-limit", current.Revision); errorCode(err) != contract.ErrorCapacityExhausted {
+	if _, err := h.store.AddAdmin(context.Background(), identity, "person-over-limit", current.Revision, ""); errorCode(err) != contract.ErrorCapacityExhausted {
 		t.Fatalf("over-limit error = %v, want %q", err, contract.ErrorCapacityExhausted)
 	}
 	if _, err := h.store.db.Exec(`INSERT INTO admins(fabric_id, user_id, added_revision, added_ns)

@@ -109,6 +109,9 @@ func EvaluateComputerPolicyPerson(snapshot ComputerPolicySnapshot, valid bool, c
 		}
 		for _, admin := range snapshot.Admins {
 			if admin.FabricID == identity.FabricID && admin.UserID == identity.UserID {
+				if snapshot.AdminDeviceRequired && requireBoundPersonDevice(identity, admin.DeviceID) != nil {
+					return ComputerPolicyDecision{Permission: ComputerGrantNone}
+				}
 				decision.Permission = ComputerGrantControl
 				decision.Administrator = true
 				return decision
@@ -168,6 +171,7 @@ type ComputerPolicyRevocation struct {
 type ComputerPolicyAdmin struct {
 	FabricID string `json:"fabric_id"`
 	UserID   string `json:"user_id"`
+	DeviceID string `json:"device_id,omitempty"`
 }
 
 type ComputerPolicyComputer struct {
@@ -182,16 +186,17 @@ type ComputerPolicyComputer struct {
 // ComputerPolicySnapshot is issued only to the authenticated agent for the
 // named current boot. It is deliberately an in-memory lease at the node.
 type ComputerPolicySnapshot struct {
-	PolicyGeneration int64                    `json:"policy_generation"`
-	PolicyRevision   int64                    `json:"policy_revision"`
-	IssuingFabricID  string                   `json:"issuing_fabric_id"`
-	NodeID           string                   `json:"node_id"`
-	BootSessionID    string                   `json:"boot_session_id"`
-	IssuedAt         time.Time                `json:"issued_at"`
-	FreshUntil       time.Time                `json:"fresh_until"`
-	Admins           []ComputerPolicyAdmin    `json:"admins"`
-	Computers        []ComputerPolicyComputer `json:"computers"`
-	SnapshotDigest   string                   `json:"snapshot_digest"`
+	PolicyGeneration    int64                    `json:"policy_generation"`
+	PolicyRevision      int64                    `json:"policy_revision"`
+	IssuingFabricID     string                   `json:"issuing_fabric_id"`
+	NodeID              string                   `json:"node_id"`
+	BootSessionID       string                   `json:"boot_session_id"`
+	IssuedAt            time.Time                `json:"issued_at"`
+	FreshUntil          time.Time                `json:"fresh_until"`
+	Admins              []ComputerPolicyAdmin    `json:"admins"`
+	Computers           []ComputerPolicyComputer `json:"computers"`
+	AdminDeviceRequired bool                     `json:"admin_device_required,omitempty"`
+	SnapshotDigest      string                   `json:"snapshot_digest"`
 }
 
 type ComputerPolicyInstallAcknowledgement struct {
@@ -503,10 +508,9 @@ func (r *databaseReads) computerViewGetComputerTakeoverAvailability(ctx context.
 	if err := r.q.QueryRowContext(ctx, `SELECT revision FROM admin_policy WHERE singleton=1`).Scan(&access.PolicyRevision); err != nil {
 		return ComputerTakeoverAvailability{}, internalError(err, "read Computer take-over policy revision")
 	}
-	var administrator bool
-	if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
-		identity.FabricID, identity.UserID).Scan(&administrator); err != nil {
-		return ComputerTakeoverAvailability{}, internalError(err, "read Computer administrator access")
+	administrator, err := currentAdminPerson(ctx, r.q, identity)
+	if err != nil {
+		return ComputerTakeoverAvailability{}, err
 	}
 	if !administrator {
 		var permission ComputerGrantPermission
@@ -551,10 +555,9 @@ func (r *databaseReads) computerViewResolvePersonComputerHandle(ctx context.Cont
 	if err := validatePersonIdentity(identity); err != nil {
 		return ComputerHandleResolution{}, err
 	}
-	var administrator bool
-	if err := r.q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM admins WHERE fabric_id=? AND user_id=?)`,
-		identity.FabricID, identity.UserID).Scan(&administrator); err != nil {
-		return ComputerHandleResolution{}, internalError(err, "read Computer handle administrator access")
+	administrator, err := currentAdminPerson(ctx, r.q, identity)
+	if err != nil {
+		return ComputerHandleResolution{}, err
 	}
 	if administratorRequired && !administrator {
 		return ComputerHandleResolution{}, protocolError(contract.ErrorAdminRequired,
@@ -564,7 +567,7 @@ func (r *databaseReads) computerViewResolvePersonComputerHandle(ctx context.Cont
 	var currentJobID string
 	// Durable IDs continue to address retained take-over evidence after removal;
 	// the reusable friendly name is only actionable for a live Computer.
-	err := r.q.QueryRowContext(ctx, `SELECT computer_id, name, current_job_id FROM computers
+	err = r.q.QueryRowContext(ctx, `SELECT computer_id, name, current_job_id FROM computers
 		WHERE computer_id=? OR current_job_id=? OR (name=? AND desired_state<>'removed')
 		ORDER BY CASE WHEN computer_id=? THEN 0 WHEN current_job_id=? THEN 1 ELSE 2 END LIMIT 1`,
 		handle, handle, handle, handle, handle).Scan(&result.ComputerID, &result.FriendlyName, &currentJobID)
@@ -836,16 +839,19 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 		WHERE node_id=? AND expires_ns<=?`, nodeID, now.UnixNano()); err != nil {
 		return nil, internalError(err, "expire old Computer policy issuances")
 	}
-	adminRows, err := tx.QueryContext(ctx, `SELECT fabric_id, user_id FROM admins ORDER BY fabric_id, user_id`)
+	adminRows, err := tx.QueryContext(ctx, `SELECT fabric_id, user_id, device_id FROM admins ORDER BY fabric_id, user_id`)
 	if err != nil {
 		return nil, internalError(err, "list Computer policy administrators")
 	}
 	admins := []ComputerPolicyAdmin{}
 	for adminRows.Next() {
 		var admin ComputerPolicyAdmin
-		if err := adminRows.Scan(&admin.FabricID, &admin.UserID); err != nil {
+		if err := adminRows.Scan(&admin.FabricID, &admin.UserID, &admin.DeviceID); err != nil {
 			adminRows.Close()
 			return nil, internalError(err, "scan Computer policy administrator")
+		}
+		if !personDeviceBindingRequired(ctx) {
+			admin.DeviceID = ""
 		}
 		admins = append(admins, admin)
 	}
@@ -869,7 +875,7 @@ func (s *Store) IssueComputerPolicySnapshot(ctx context.Context, identityNodeID,
 	}
 	snapshot := ComputerPolicySnapshot{PolicyGeneration: generation, PolicyRevision: revision, IssuingFabricID: issuingFabricID,
 		NodeID: nodeID, BootSessionID: bootSessionID, IssuedAt: now, FreshUntil: canonicalTime(now.Add(freshness)),
-		Admins: admins, Computers: computers}
+		Admins: admins, Computers: computers, AdminDeviceRequired: personDeviceBindingRequired(ctx)}
 	snapshot.SnapshotDigest, err = ComputeComputerPolicySnapshotDigest(snapshot)
 	if err != nil {
 		return nil, internalError(err, "digest Computer policy snapshot")

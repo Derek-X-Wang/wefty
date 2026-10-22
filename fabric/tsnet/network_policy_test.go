@@ -76,7 +76,7 @@ func TestPrivateNetworkPolicy(t *testing.T) {
 	for _, want := range []string{
 		"Owners, Admins and Network admins implicitly own all tags",
 		"tagOwners alone does not limit tagging to admins",
-		"Any device signed in to the Owner account can act as the fleet admin until L1 pins the person device. Do not sign the control-plane Mac's network app, or any machine where AI agents run as you, into the Owner account.",
+		"Keep the Owner person identity on the owner's laptop. Do not sign the control-plane machine's network app, or any machine where AI agents run as you, into the Owner account.",
 	} {
 		if !strings.Contains(notes, want) {
 			t.Errorf("policy guidance missing %q", want)
