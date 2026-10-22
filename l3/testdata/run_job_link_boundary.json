@@ -140,7 +140,7 @@
   {
     "file": "run_idempotency_migration.go",
     "function": "*Store.migrateRunActorKeys",
-    "fingerprint": "fa4dee398fe3659da5e9d36c2d4c6ee869efa71e1162888e06f37edeee337bee",
+    "fingerprint": "ae506af79006e3538e809378cbe6b7f9cba560ac7a1d8ddfbac6cef785f25af3",
     "count": 1,
     "reason": "Copies every existing Run column into runs_actor_scoped and restores runs schema objects selected by tbl_name=runs.",
     "category": "table-copy",
@@ -509,7 +509,25 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "022354d632fa577f82265d804529439aa1c650aae1edbdd7fe33112d5837d9fb",
+    "fingerprint": "0181a9e059654374af87f96184206bac145451a918d77772cb235ad4066af251",
+    "count": 1,
+    "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
+    "category": "schema/bootstrap",
+    "destination": "runs, dispatch_outbox, run_cancellations"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "104ce524140254046ea5e28a7449f433306f54fc706bd47ca1a7b818949fcb76",
+    "count": 1,
+    "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
+    "category": "schema/bootstrap",
+    "destination": "runs, dispatch_outbox, run_cancellations"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "188cc024929bb7233257f779a42cdcfff2808ef2e4407368f770c08ab1702b3b",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -527,7 +545,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "27b8f76c6dce8fa577c2f1de9141016b089f91e8926667f99ce815a62d65e34e",
+    "fingerprint": "3d89052df8a355f96f41d3b29ee1b86b7a2fd0607f06db1186574fc7a596291f",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -536,7 +554,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "383a29421e22eff3256909f1eaaf412f8f76a648773377eaa3099eaba958a7b1",
+    "fingerprint": "42f626efd1e4bb2ca39cab9e0c853cc7588e8b83600256a5831c0415ba72a1e7",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -545,7 +563,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "4042b8d96590afd785c08ae6ee32c565f9b98dedaa056be82a6b271a271207c3",
+    "fingerprint": "5a4c19ea73d84f77f8c11edeae750324b809405c9aba6deb2b4620a7a3fa0cca",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -554,7 +572,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "46eb149edef8d3faff142bb00fc6d60a5add84d7858569bd127f449dc97a89ef",
+    "fingerprint": "5e2a35716c7576f3dbb99f73d445af17b6fbf7bbc5417fc20c2514c0e667bcc1",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -563,16 +581,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "5c3d29f18deacf80348cb6c1e428577efb89091a3b76a0308b194b986e5d2db5",
-    "count": 1,
-    "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
-    "category": "schema/bootstrap",
-    "destination": "runs, dispatch_outbox, run_cancellations"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.initialize",
-    "fingerprint": "5dfbba108f57cc123e7f9035bf60913523b12c789874b41a2caf99190021bf86",
+    "fingerprint": "637ac2515c221090900dbaab89383abfa4666d37f80f46f38ae489911e021716",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -590,7 +599,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "6b102e262392e90ff18ea3d4a0b1af273e24be994706422ae2de082ba236f029",
+    "fingerprint": "6e83426ffaea1aa9eb27ecc5f06b59a12497004b636ff79c6e787de4ade6aa1d",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -599,7 +608,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "7baad0d1ed7b951097f7e50864b0ac8c138696be29dc388ab0aead8c90771345",
+    "fingerprint": "7d6445b29dc4682d7f29e8c5077e1cb349e854bfe895172fb38fb3d19445ee48",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -608,7 +617,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "8d92b2db6f09452a424ebfd1f548059a161328e652ec08de9d59154a7b658dd4",
+    "fingerprint": "7e07291fcd228c1d5f8af67ed12f8e1b6bc69e3776d6eda8212ebfbfd02d7a20",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -617,7 +626,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "8eebafe3cde2e86fac90a4f6b5cedb1d43a5db00ceab05bde8296f82bd6e2e21",
+    "fingerprint": "c87082f4cb7e728bf184d89439b9ee9ddfcaf1eb27c779ee3d5e827593795591",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -626,7 +635,7 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "d3ea810c29c2652cd828b8c34e29ac6d1b3b7f306632de126f702f2068764a18",
+    "fingerprint": "da9a78e04bce152e8e9a6edf56387e9f36f9092afe08fa6a7bfd79320face1b0",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -635,7 +644,16 @@
   {
     "file": "store.go",
     "function": "*Store.initialize",
-    "fingerprint": "df2b9d3507206dc4e91166a0c3ad218c9f40e15e53c7bbd712fc015abbd76e9d",
+    "fingerprint": "db8c86538ca17dd7f971948f9e5fdb87a7e341f3c9e6859afce7dc5893481dcf",
+    "count": 1,
+    "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
+    "category": "schema/bootstrap",
+    "destination": "runs, dispatch_outbox, run_cancellations"
+  },
+  {
+    "file": "store.go",
+    "function": "*Store.initialize",
+    "fingerprint": "dbcd1bcfe2d61aef9870167a339afac6398cfd4992a6e250fadc741f3bd0f4bf",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",
@@ -645,15 +663,6 @@
     "file": "store.go",
     "function": "*Store.initialize",
     "fingerprint": "eb354f2fce85ce5e19bc65d61671e4e2f6d327e9a54af56b6b53031a0685bb07",
-    "count": 1,
-    "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
-    "category": "schema/bootstrap",
-    "destination": "runs, dispatch_outbox, run_cancellations"
-  },
-  {
-    "file": "store.go",
-    "function": "*Store.initialize",
-    "fingerprint": "ec1c73630c25e8a63c44ac56052e7d07746d05acfc8249ef9c9243ee91399046",
     "count": 1,
     "reason": "Ledger schema/bootstrap and additive prerequisite backfills, explicitly targeting runs, dispatch_outbox and run_cancellations.",
     "category": "schema/bootstrap",

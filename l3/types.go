@@ -109,6 +109,8 @@ type CreateRunRequest struct {
 	Limits           *contract.RunLimits    `json:"limits,omitempty"`
 	EnvelopeSchema   json.RawMessage        `json:"envelope_schema,omitempty"`
 	RequiredEnvelope bool                   `json:"required_envelope,omitempty"`
+	// Restartable permits recovery of interrupted captured process exec.
+	Restartable bool `json:"restartable,omitempty"`
 	// DispatchAuthority declares that this run's workload dispatches child
 	// work. Declaring it delivers the in-job credentials to the workload;
 	// leaving it false — the default — means the job reports through its run

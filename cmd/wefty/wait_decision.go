@@ -58,3 +58,13 @@ func isRetryableL1Answer(err error) bool {
 	return errors.As(err, &response) && response.APIError.Code == contract.ErrorUnavailable &&
 		response.APIError.Retryable
 }
+
+// Observation retries preserve the caller's total wait window and log cursor.
+func isRetryableObservation(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	var transport *unavailableError
+	var response *apiResponseError
+	return errors.As(err, &transport) || errors.Is(err, context.DeadlineExceeded) || isRetryableL1Answer(err) || (errors.As(err, &response) && response.StatusCode >= 500 && response.APIError.Retryable)
+}

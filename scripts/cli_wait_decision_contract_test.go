@@ -16,6 +16,8 @@ func TestCLIWaitDecisionCallSites(t *testing.T) {
 		"exec_command.go:submitExecRun:isRetryableL1Answer":                     true,
 		"wait_decision.go:decideWaitFailure:isRetryableL1Answer":                true,
 		"client.go:do:isRetryableL1Answer":                                      true,
+		"wait_decision.go:isRetryableObservation:isRetryableL1Answer":           true,
+		"command.go:executeLogs:isRetryableObservation":                         true,
 		"command.go:executeLogs:isRetryableL1Answer":                            true,
 		"service_command.go:executeServiceLogs:isRetryableL1Answer":             true,
 		"computer_storage_command.go:pollStorageObservation:decideWaitFailure":  true,
@@ -54,7 +56,7 @@ func TestCLIWaitDecisionCallSites(t *testing.T) {
 					return true
 				}
 				switch name.Name {
-				case "isRetryableL1Answer", "decideWaitFailure", "openWaitWindow":
+				case "isRetryableL1Answer", "isRetryableObservation", "decideWaitFailure", "openWaitWindow":
 					key := site + ":" + name.Name
 					if _, ok := allowed[key]; !ok {
 						t.Errorf("unapproved wait helper call: %s", key)

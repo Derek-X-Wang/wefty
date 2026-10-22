@@ -451,9 +451,30 @@ func copyExecCapture(dst io.Writer, src io.Reader) (int64, error) {
 }
 
 func validateExecCaptureRun(input CreateRunInput) error {
-	_, present, e := parseExecCaptureReference(input.Request.Params)
-	if e != nil || !present {
+	ref, present, e := parseExecCaptureReference(input.Request.Params)
+	if e != nil {
 		return e
+	}
+	if !present && !input.Request.Restartable {
+		return nil
+	}
+	var policy struct {
+		Restartable bool `json:"restartable"`
+	}
+	if err := json.Unmarshal(input.Request.Params, &policy); err != nil {
+		return protocolError(contract.ErrorInvalidRequest, "invalid exec params: %v", err)
+	}
+	if policy.Restartable != input.Request.Restartable {
+		return protocolError(contract.ErrorInvalidRequest, "restartable must agree with exec params")
+	}
+	if input.Request.Restartable {
+		if !present || ref.Version != 2 || input.Request.DispatchAuthority {
+			return protocolError(contract.ErrorInvalidRequest, "restartable requires version 2 captured exec without dispatch authority")
+		}
+	}
+
+	if !present {
+		return nil
 	}
 	request := input.Request
 	if !input.FabricClient || input.ComputerScope != nil || request.ParentRunID != "" || request.InlineScript == nil || request.Image != nil || request.WorkflowRef != "" {

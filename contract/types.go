@@ -739,6 +739,8 @@ type RunRecord struct {
 	Trigger       Trigger         `json:"trigger"`
 	Workflow      WorkflowSource  `json:"workflow"`
 	Params        json.RawMessage `json:"params"`
+	// Restartable permits recovery of interrupted captured process exec.
+	Restartable bool `json:"restartable,omitempty"`
 	// DispatchAuthority records that this run was submitted as one that
 	// dispatches child work, so its workload receives the in-job credentials
 	// instead of reporting through the run mailbox alone.

@@ -451,7 +451,9 @@ type OCIComputerControlRuntime interface {
 type Request struct {
 	// ProcessStarted stores Guardian's payload group before Started is called.
 	// A persistence failure prevents Started and stops the guarded payload.
-	ProcessStarted   func(processGroupID int) error
+	ProcessStarted func(processGroupID int) error
+	// StopInitiated records the cause before process supervision starts reaping.
+	StopInitiated    func(error)
 	Authority        AttemptAuthority
 	RuntimeHandler   string
 	Execution        contract.ExecutionSpec
@@ -462,6 +464,8 @@ type Request struct {
 	// only for a runtime whose handoff storage the agent cannot reach.
 	RunMailbox       *RunMailboxSeed
 	LifetimeBoundary LifetimeBoundary
+	// RequireGuardian forbids an unguarded process fallback.
+	RequireGuardian bool
 	// TerminationGrace is the agent-compiled interval between TERM and KILL
 	// for runtimes whose lifetime is bound to the agent boot. It is ignored
 	// for caller-lifetime work.
