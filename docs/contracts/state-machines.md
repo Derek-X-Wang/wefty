@@ -400,6 +400,21 @@ Computer-trait Job is invalid at L1 construction time: it must be created in
 the same transaction as its Computer. `computer_id`, `storage_id`, and every
 successive `job_id` are distinct identities.
 
+The Computer also stores `seat_limit`, `idle_action` (`delete`, `stop`, or
+`nothing`), `network` (`internet` or `none`), and `seat_request_made`. Network
+is fixed at creation; replacing a Job projection never changes these fields.
+Stage A owner-made Computers, including pre-Seat database rows, have Seat
+limit 0 (no Seats), idle action `nothing`, network `internet`, and
+`seat_request_made=false`. Their existing memory limit, image, Storage and
+desired state are preserved. The owner's create API cannot supply
+Seat-request settings. The trusted Seat-request flow creates Computers with
+a positive Seat limit, idle action `delete`, the explicitly requested
+network, and `seat_request_made=true`. Creation replay compares these
+settings as well as the existing Job and owner identity. Start claims carry
+the recorded settings beside the Computer Storage identity, so the node
+agent receives the same policy as L1. These fields record policy; the Seat
+request, idle-action and network-enforcement flows have their own contracts.
+
 Start, stop, restart, reset, reimage, grow, Backup-cap mutation, removal, and projection replacement require the exact observed
 `intent_revision` and `storage_id@generation`. The transaction returns
 `stale_intent_revision` or `storage_reference_conflict` without changing any

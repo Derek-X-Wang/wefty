@@ -394,6 +394,10 @@ type Claim struct {
 // ComputerStorageClaim is the exact durable Storage identity a claimed
 // Computer projection may attach. It is absent for every ordinary Job.
 type ComputerStorageClaim struct {
+	// Settings travel with a start claim so the node agent records the same
+	// Computer policy as L1. Removal-only Storage identities omit them.
+	*ComputerSettings
+	SeatRequestMade      bool   `json:"seat_request_made,omitempty"`
 	ComputerID           string `json:"computer_id"`
 	StorageID            string `json:"storage_id"`
 	StorageGeneration    int64  `json:"storage_generation"`

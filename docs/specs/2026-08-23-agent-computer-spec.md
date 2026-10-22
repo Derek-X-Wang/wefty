@@ -94,7 +94,18 @@ V1 provides no application-layer encryption at rest: live disks and managed Back
 
 ## 4. Capacity and failure latch
 
-Computers consume one ordinary service Slot; there are no seats, profiles, bin packing, fit forecasts, numeric capabilities, or claim-query arithmetic. Eligibility remains `kind:oci`, `cgroup_v2`, and `computer`; admission of a new runtime is node-local and deterministic. (#122 agent-computer)
+Computers consume one ordinary service Slot; there are no profiles, bin packing, fit forecasts, numeric capabilities, or claim-query arithmetic. Eligibility remains `kind:oci`, `cgroup_v2`, and `computer`; admission of a new runtime is node-local and deterministic. (#122 agent-computer)
+
+**M3.7 settings amendment (#1134, Computer request spec §1.2 and §8):** a
+Computer durably records its Seat limit, idle action (`delete`, `stop`, or
+`nothing`), network (`internet` or `none`, fixed at creation), and whether a
+Seat request made it. Stage A owner-made Computers take no Seats (recorded
+Seat limit 0), take idle action `nothing`, and keep today's internet network
+and their fixed memory limit (1 GiB by CLI default). Database upgrade leaves
+their image, memory limit, Storage and desired state unchanged. Computers
+made by the trusted Seat-request flow have a positive Seat limit and idle
+action `delete`; start claims carry their recorded settings to the node
+agent. The owner-facing create API does not accept those settings in stage A.
 
 Before `Started`, the helper sets and reads back `memory.max=<cap>`, `memory.oom.group=1`, and `memory.swap.max=0`. It atomically refuses a newcomer when its cap exceeds the configured Node/VM ceiling or the sum of running Computer caps plus the newcomer would exceed that ceiling. The Mac shared-VM default ceiling is configured as 4 GiB and changes only through `--apply-restart`; with the proposed 1 GiB per-Computer CLI default, the admission arithmetic permits about three Computers while retaining 1 GiB outside the admitted cap sum. `MemAvailable` is reported with a timestamp but never gates admission; CPU remains uncapped unless the generic optional limit is set. (#122 agent-computer)
 

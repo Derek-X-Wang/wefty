@@ -90,6 +90,8 @@ type ComputerIntent struct {
 // Runtime state remains on CurrentJob; intent and identity survive projection
 // replacement.
 type Computer struct {
+	ComputerSettings
+	SeatRequestMade           bool                               `json:"seat_request_made"`
 	ComputerID                string                             `json:"computer_id"`
 	Name                      string                             `json:"name"`
 	PlacementNodeID           string                             `json:"placement_node_id"`
@@ -142,6 +144,9 @@ type CreateComputerRequest struct {
 	Spec      contract.JobSpec `json:"spec"`
 	BackupCap *int64           `json:"backup_cap,omitempty"`
 	Actor     string           `json:"-"`
+	// SeatRequestSettings is supplied only by the trusted Seat-request flow.
+	// The owner-facing create API cannot turn a Computer into an on-demand one.
+	SeatRequestSettings *ComputerSettings `json:"-"`
 }
 
 type ComputerMutationPrecondition struct {
@@ -342,6 +347,13 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	if backupCap < 0 {
 		return Computer{}, false, protocolError(contract.ErrorInvalidRequest, "backup_cap must be non-negative")
 	}
+	settings := ownerComputerSettings()
+	if request.SeatRequestSettings != nil {
+		settings = *request.SeatRequestSettings
+		if err := settings.validateSeatRequest(); err != nil {
+			return Computer{}, false, err
+		}
+	}
 	request.Spec.RoutingTags = NormalizeTags(request.Spec.RoutingTags)
 	if err := validateJobSpec(&request.Spec); err != nil {
 		return Computer{}, false, err
@@ -379,7 +391,8 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 				WHERE computer_id=? AND intent_revision=?`, computer.ComputerID, initialComputerRevision).Scan(&creationActor)
 		}
 		capMismatch := request.BackupCap != nil && computer.BackupCap != *request.BackupCap
-		if computerErr != nil || computer.Name != request.Name || creationActor != request.Actor || capMismatch {
+		settingsMismatch := computer.ComputerSettings != settings || computer.SeatRequestMade != (request.SeatRequestSettings != nil)
+		if computerErr != nil || computer.Name != request.Name || creationActor != request.Actor || capMismatch || settingsMismatch {
 			return Computer{}, false, protocolError(contract.ErrorDispatchKeyConflict,
 				"dispatch key %q does not identify this Computer", request.Spec.DispatchKey)
 		}
@@ -426,11 +439,11 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computers(
 		computer_id, name, placement_node_id, grants_json, storage_id, storage_generation, desired_disk_bytes, backup_cap,
 		desired_state, intent_revision, applied_revision, current_job_id, current_spec_revision,
-		reconfiguration_phase, created_ns, updated_ns
-	) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, 1, 1, ?, 1, ?, ?, ?)`,
+		reconfiguration_phase, created_ns, updated_ns, seat_limit, idle_action, network, seat_request_made
+	) VALUES(?, ?, ?, ?, ?, 1, ?, ?, ?, 1, 1, ?, 1, ?, ?, ?, ?, ?, ?, ?)`,
 		computerID, request.Name, placementNodeID, grantsJSON, storageID, request.Spec.Execution.OCI.Computer.DiskBytes, backupCap,
 		contract.ServiceDesiredRunning, job.JobID, ComputerReconfigurationStable,
-		now.UnixNano(), now.UnixNano()); err != nil {
+		now.UnixNano(), now.UnixNano(), settings.SeatLimit, settings.IdleAction, settings.Network, request.SeatRequestSettings != nil); err != nil {
 		return Computer{}, false, internalError(err, "store Computer")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_job_projections(
@@ -727,14 +740,15 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 		grants_json, storage_id, storage_generation, desired_disk_bytes, backup_cap, desired_state, intent_revision,
 		applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
 		reconfiguration_revision, submit_enabled, submit_intent_revision, submit_max_inflight,
-		submit_policy_revision, removal_outcome, created_ns, updated_ns
+		submit_policy_revision, removal_outcome, created_ns, updated_ns, seat_limit, idle_action, network, seat_request_made
 		FROM computers WHERE computer_id=?`, computerID).Scan(
 		&computer.ComputerID, &computer.Name, &computer.PlacementNodeID, &boundNodeID,
 		&grantsJSON, &computer.StorageID, &computer.StorageGeneration, &computer.DesiredDiskBytes, &computer.BackupCap, &computer.DesiredState,
 		&computer.IntentRevision, &computer.AppliedRevision, &computer.CurrentJobID,
 		&computer.CurrentSpecRevision, &computer.ReconfigurationPhase,
 		&reconfigurationRevision, &computer.SubmitEnabled, &computer.SubmitIntentRevision,
-		&computer.SubmitMaxInflight, &computer.SubmitPolicyRevision, &computer.RemovalOutcome, &createdNS, &updatedNS)
+		&computer.SubmitMaxInflight, &computer.SubmitPolicyRevision, &computer.RemovalOutcome, &createdNS, &updatedNS,
+		&computer.SeatLimit, &computer.IdleAction, &computer.Network, &computer.SeatRequestMade)
 	if err != nil {
 		return Computer{}, err
 	}

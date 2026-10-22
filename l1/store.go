@@ -592,6 +592,10 @@ CREATE TABLE IF NOT EXISTS computers (
   storage_generation INTEGER NOT NULL CHECK(storage_generation > 0),
 	desired_disk_bytes INTEGER NOT NULL CHECK(desired_disk_bytes > 0),
 	backup_cap INTEGER NOT NULL DEFAULT 0 CHECK(backup_cap >= 0),
+  seat_limit INTEGER NOT NULL DEFAULT 0 CHECK(seat_limit >= 0),
+  idle_action TEXT NOT NULL DEFAULT 'nothing' CHECK(idle_action IN ('delete', 'stop', 'nothing')),
+  network TEXT NOT NULL DEFAULT 'internet' CHECK(network IN ('internet', 'none')),
+  seat_request_made INTEGER NOT NULL DEFAULT 0 CHECK(seat_request_made IN (0, 1)),
   desired_state TEXT NOT NULL CHECK(desired_state IN ('running', 'stopped', 'removed')),
   intent_revision INTEGER NOT NULL CHECK(intent_revision > 0),
   applied_revision INTEGER NOT NULL CHECK(applied_revision >= 0 AND applied_revision <= intent_revision),
@@ -1534,6 +1538,10 @@ CREATE INDEX IF NOT EXISTS backups_computer_status
 		return fmt.Errorf("l1: ensure Storage provenance indexes: %w", err)
 	}
 	for _, column := range []struct{ name, definition string }{
+		{"seat_limit", "INTEGER NOT NULL DEFAULT 0 CHECK(seat_limit >= 0)"},
+		{"idle_action", "TEXT NOT NULL DEFAULT 'nothing' CHECK(idle_action IN ('delete', 'stop', 'nothing'))"},
+		{"network", "TEXT NOT NULL DEFAULT 'internet' CHECK(network IN ('internet', 'none'))"},
+		{"seat_request_made", "INTEGER NOT NULL DEFAULT 0 CHECK(seat_request_made IN (0, 1))"},
 		{"submit_enabled", "INTEGER NOT NULL DEFAULT 0 CHECK(submit_enabled IN (0, 1))"},
 		{"submit_intent_revision", "INTEGER NOT NULL DEFAULT 0 CHECK(submit_intent_revision >= 0)"},
 		{"submit_max_inflight", "INTEGER NOT NULL DEFAULT 20 CHECK(submit_max_inflight > 0)"},
@@ -3429,15 +3437,17 @@ AND state=@job_queued
 				return nil, err
 			}
 			var storage ComputerStorageClaim
+			storage.ComputerSettings = &ComputerSettings{}
 			if err := tx.QueryRowContext(ctx, `SELECT c.computer_id, c.storage_id, c.storage_generation, c.intent_revision,
 				c.submit_enabled, c.submit_intent_revision, c.submit_max_inflight, c.submit_policy_revision,
 				c.desired_disk_bytes,
-				p.chown
+				p.chown, c.seat_limit, c.idle_action, c.network, c.seat_request_made
 				FROM computers c JOIN computer_job_projections p ON p.computer_id=c.computer_id AND p.job_id=c.current_job_id
 				WHERE c.computer_id=? AND c.current_job_id=?`, computerID, jobID).
 				Scan(&storage.ComputerID, &storage.StorageID, &storage.StorageGeneration, &storage.IntentRevision,
 					&storage.SubmitEnabled, &storage.SubmitIntentRevision, &storage.SubmitMaxInflight,
-					&storage.SubmitPolicyRevision, &storage.DiskBytes, &storage.Chown); err != nil {
+					&storage.SubmitPolicyRevision, &storage.DiskBytes, &storage.Chown,
+					&storage.SeatLimit, &storage.IdleAction, &storage.Network, &storage.SeatRequestMade); err != nil {
 				return nil, internalError(err, "read claimed Computer Storage identity")
 			}
 			computerStorage = &storage
