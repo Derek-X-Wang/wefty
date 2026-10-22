@@ -51,6 +51,16 @@ class DriverWatcherTest(unittest.TestCase):
                 self.assertEqual(classification, "malformed")
                 self.assertEqual(opened, 1, "watcher re-read a different driver generation")
 
+class SeatDriverWatcherTest(unittest.TestCase):
+    def test_seat_paths_select_only_its_driver_and_runtime_folder(self):
+        with mock.patch.dict("os.environ", {
+            "WEFTY_DRIVER_SOURCE": "/wefty/control/seats/2/driver.json",
+            "WEFTY_DRIVER_TARGET": "/wefty/service/seats/2/run/driver-state.json",
+        }):
+            watcher = load_watcher(WATCHERS[0])
+        self.assertEqual(watcher.SOURCE, "/wefty/control/seats/2/driver.json")
+        self.assertEqual(watcher.TARGET, "/wefty/service/seats/2/run/driver-state.json")
+
 
 if __name__ == "__main__":
     unittest.main()

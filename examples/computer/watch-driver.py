@@ -6,8 +6,8 @@ import json
 import os
 import time
 
-SOURCE = "/wefty/control/driver.json"
-TARGET = "/tmp/wefty-computer/driver-state.json"
+SOURCE = os.environ.get("WEFTY_DRIVER_SOURCE", "/wefty/control/driver.json")
+TARGET = os.environ.get("WEFTY_DRIVER_TARGET", "/tmp/wefty-computer/driver-state.json")
 def read_document() -> tuple[bool, str, str]:
     try:
         with open(SOURCE, "rb") as source:
