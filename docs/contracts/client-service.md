@@ -36,6 +36,20 @@ check retains `machine_identity_required` or `person_identity_required`
 check, within its command and probe budgets. Local missing-state and
 missing-person refusals remain exit 3. Caller cancellation remains exit 1.
 
+`wefty open SERVICE` reads L1 as the client participant, including service
+resolution and the node's registered connect host. L1 requires client-principal
+authority for those job and node reads; an untagged person is refused. Each
+published-port dial separately uses the person participant. It checks both
+saved participants through the client service before creating a loopback
+listener. Published-port access needs the owner's person sign-in on this laptop;
+it never retries with the client participant or opens the participant backend
+directly. Each accepted local connection uses the
+existing version-1 `dial` operation with `participant: "person"`, the saved
+person node ID, and the service node's L1-registered connect host plus published
+port. No socket protocol change is needed. Cancelling the foreground command
+closes its listener and all streams. See the
+[service access contract](lease-fencing-dispatch.md#opening-a-published-service).
+
 Legacy profiles have no participant records and never contact the client
 service. Plain legacy profiles (every current installation) keep their previous
 transport, identity shape, and behavior. A legacy `tsnet` process with an explicit

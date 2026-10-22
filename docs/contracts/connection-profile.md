@@ -154,6 +154,15 @@ per-user [client service](client-service.md); they never open the saved backend
 themselves and never fall back to a direct backend when the service is absent.
 Missing saved state is refused before contacting the service. A lock file
 alone does not count as saved state.
+
+`open` uses the client participant for L1 service and node reads, then a
+separate saved person participant for published-port streams through the client
+service. Both participants must pass their existing checks before a local
+listener opens. Missing client state retains `machine_identity_required` (exit
+3); missing or expired person sign-in retains `person_identity_required` (exit
+3). Primary name/folder flags select the client; the secondary person always
+uses its own saved record. Neither participant substitutes for the other.
+
 The fleet cutover starts with an empty control plane, so legacy run ownership
 never needs to cross into the strict rule.
 
