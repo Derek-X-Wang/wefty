@@ -100,7 +100,8 @@ func TestAuthenticatedPersonStoreDiscoveryChecksAdminDevice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := context.WithValue(t.Context(), personDeviceBindingContextKey{}, true)
+	// The authenticated Server latched the Store; a bare context still binds.
+	ctx := context.Background()
 	wrong := f.identity
 	wrong.DeviceID = "other-device"
 	if _, err := s.store.GetComputerTakeoverAvailability(ctx, wrong, computer.ComputerID); errorCode(err) != contract.ErrorPersonDeviceMismatch {

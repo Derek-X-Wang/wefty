@@ -71,7 +71,7 @@ func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCal
 	case caller.Parent != nil:
 		allowed = job.ParentJobID == caller.Parent.JobID
 	case caller.Person != nil:
-		err := requireCurrentAdmin(ctx, tx, *caller.Person)
+		err := s.personDeviceBinding.requireCurrentAdmin(ctx, tx, *caller.Person)
 		if err != nil && errorCode(err) != contract.ErrorAdminRequired && errorCode(err) != contract.ErrorPersonIdentityRequired {
 			return Job{}, err
 		}
