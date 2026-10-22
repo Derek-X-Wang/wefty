@@ -218,18 +218,19 @@ _Avoid_: lease (an Attempt's lease), session, Take-over session, login, Slot,
 the input "seat" of a Wayland desktop
 
 **Seat request**:
-An AI agent's named ask for one Seat. It names its network and one form:
-any (a Seat on a shared Computer with room, or a new one), dedicated (a new
-Computer with a Seat limit of 1), or by name (a Seat on one existing
-Computer). It ends with a Seat or with a refusal and its reason; waiting again
-by its name never makes a second Seat.
+An AI agent's ask for one Seat, under one ID from the start that names the
+Seat once it is approved. It names its network and one form: any (a Seat on a
+shared Computer with room, or a new one), dedicated (a new Computer with a
+Seat limit of 1), or by name (a Seat on one existing Computer). It ends with a
+Seat or with a refusal and its reason; waiting again by its ID never makes a
+second Seat.
 _Avoid_: job, claim, booking, reservation, queue entry
 
 **Seat credential**:
 The secret wefty gives an AI agent with its Seat. Wefty treats screen input
-and Seat calls that carry it as that AI agent's, never as a person's. It is
-valid only while its Seat lasts. On one Mac it keeps order between the AI agent
-and the owner; it does not prove who acts.
+and Seat calls that carry it as that AI agent's, never as a person's. Its
+power to act on the Seat ends when the Seat ends. On one Mac it keeps order
+between the AI agent and the owner; it does not prove who acts.
 _Avoid_: Seat pass, Seat token, Attempt credential, take-over bearer
 
 **Seat approval**:
