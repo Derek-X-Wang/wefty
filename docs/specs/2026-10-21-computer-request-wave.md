@@ -2,25 +2,26 @@
 
 This is paste-ready issue text, not implementation. It builds the spec `docs/specs/2026-10-21-computer-request-spec.md` (map [#1008](https://github.com/Derek-X-Wang/wefty/issues/1008), destination ticket [#1019](https://github.com/Derek-X-Wang/wefty/issues/1019)). Titles are stable dependency keys: copy every `Blocked by:` title exactly when you create the GitHub dependency edges. Ticket 1 already exists as [#1021](https://github.com/Derek-X-Wang/wefty/issues/1021). Create the other tickets only after the owner ratifies the spec.
 
-> **Status:** draft for ratification, with the spec.
+> **Status:** draft for ratification, with the spec; all open points answered 2026-10-22. This wave is M3.7 **phase 3** (owner, 2026-10-22): the fleet work is phase 2 and Buzz is phase 4.
 
 ## Wave rules
 
 - **Order: #1021 first; the proof before any ticket that builds on the per-user host VM.** [#1021](https://github.com/Derek-X-Wang/wefty/issues/1021) must land before any delivery work that sets up or recreates the host VM ([#1019](https://github.com/Derek-X-Wang/wefty/issues/1019)). The proof ticket (Ticket 2) blocks the host VM ticket (Ticket 3), and through it the cold-start ticket (Ticket 12) and the stage A acceptance (Ticket 21). Tickets that do not touch the host VM setup wait only on Ticket 1 or on their own code dependencies. Stage B tickets come last.
-- **Stage B tickets carry the fleet dependencies** [#899](https://github.com/Derek-X-Wang/wefty/issues/899), [#900](https://github.com/Derek-X-Wang/wefty/issues/900) and [#902](https://github.com/Derek-X-Wang/wefty/issues/902). Stage A tickets do not ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)).
+- **Beside the fleet work.** Stage A starts once the owner ratifies the spec, beside the phase-2 fleet work, because it does not need it. Like the fleet work, it does not wait for the phase-1 exit ([#897](https://github.com/Derek-X-Wang/wefty/issues/897)). The owner's Mac runs one test-heavy worker at a time, shared with the fleet work.
+- **Stage B tickets carry the fleet dependencies** [#899](https://github.com/Derek-X-Wang/wefty/issues/899), [#900](https://github.com/Derek-X-Wang/wefty/issues/900) and [#902](https://github.com/Derek-X-Wang/wefty/issues/902), and come after those fleet tickets. Stage A tickets do not ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)).
 - **Size.** Each ticket fits about one AI agent session and lands its own acceptance slice.
 - **Tests check what an owner or an AI agent can see:** files, commands, exit codes, CLI output, L1 state and Seat log lines. Each new test fails on the code before the change ([#893](https://github.com/Derek-X-Wang/wefty/issues/893), testing decisions).
 - **Lanes** (spec, section 11.1). Every code ticket grows the tagged `service_acceptance` suite. Linux runtime behaviour also grows the real-time Linux lane. Mac behaviour is proved only in attended runs on the owner's Mac, each with the owner's approval, at a quiet time, with the memory guard on. GitHub's Mac runners cannot run a VM. A check that could not run is `NOT-RUN`, never PASS.
 - **Docs land with their code:** contracts, OpenAPI, schema, state machines, helper protocol, CLI usage and the wefty skill. A contract-doc change also runs the contract tests in `./scripts`.
 - **A new exit code** needs a typed-exit whitelist entry and a real-binary test (#893, seam 1).
 - **No ticket adds** a `kind=computer`, a `computers` CLI family, a wait queue, a wefty MCP server, a CDP relay, a proxy or a DNS and IP filter in the guest, public ingress, or a second removal state machine.
-- **Open points first.** A ticket that depends on an open point (spec, section 13.1) asks the owner before it builds that part. A "proposed" mechanism (spec, section 13.2) is built as written once the owner ratifies the spec.
+- **No open points remain** (spec, section 12.3). Each "proposed" mechanism (spec, section 13.2) is built as written once the owner ratifies the spec.
 - **Vocabulary.** Write "AI agent" and "node agent", never a bare "agent". Never call a Computer a VM.
 - **Commits** are DCO-signed and have a why body.
 
 ## Decisions this wave rests on
 
-All are closed: charting decisions 1–14 on map [#1008](https://github.com/Derek-X-Wang/wefty/issues/1008), and tickets [#1014](https://github.com/Derek-X-Wang/wefty/issues/1014), [#1017](https://github.com/Derek-X-Wang/wefty/issues/1017), [#1025](https://github.com/Derek-X-Wang/wefty/issues/1025), [#1052](https://github.com/Derek-X-Wang/wefty/issues/1052), [#1026](https://github.com/Derek-X-Wang/wefty/issues/1026), [#1028](https://github.com/Derek-X-Wang/wefty/issues/1028), [#1015](https://github.com/Derek-X-Wang/wefty/issues/1015), [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016), [#1027](https://github.com/Derek-X-Wang/wefty/issues/1027) and [#1018](https://github.com/Derek-X-Wang/wefty/issues/1018). The spec's section 12 links each decision, and its section 12.2 records the points that review round 1 settled.
+All are closed: charting decisions 1–14 on map [#1008](https://github.com/Derek-X-Wang/wefty/issues/1008), and tickets [#1014](https://github.com/Derek-X-Wang/wefty/issues/1014), [#1017](https://github.com/Derek-X-Wang/wefty/issues/1017), [#1025](https://github.com/Derek-X-Wang/wefty/issues/1025), [#1052](https://github.com/Derek-X-Wang/wefty/issues/1052), [#1026](https://github.com/Derek-X-Wang/wefty/issues/1026), [#1028](https://github.com/Derek-X-Wang/wefty/issues/1028), [#1015](https://github.com/Derek-X-Wang/wefty/issues/1015), [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016), [#1027](https://github.com/Derek-X-Wang/wefty/issues/1027) and [#1018](https://github.com/Derek-X-Wang/wefty/issues/1018), plus the owner's answers of 2026-10-22 (spec, section 12.3). The spec's section 12 links each decision; its section 12.2 records the settled points, which the owner accepted.
 
 The wave has 24 tickets: 1 existing ticket, 1 proof ticket, 19 stage A tickets and 3 stage B tickets.
 
@@ -183,7 +184,7 @@ How does the node keep the host VM on only while work needs it, without overridi
 
 ### Deliverable
 
-- **The switch** gets three positions: *off*, *on demand* (the new default) and *always on* ([#1027](https://github.com/Derek-X-Wang/wefty/issues/1027)). Today's marker maps as the spec proposes (P14). The command that sets a position replaces today's `wefty node oci start|stop` shape; its name is open point 2.
+- **The switch** gets three positions: *off*, *on demand* (the new default) and *always on* ([#1027](https://github.com/Derek-X-Wang/wefty/issues/1027)). Today's marker maps as the spec proposes (P14). `wefty node oci off|on-demand|always-on` sets a position and replaces today's `start|stop` (spec P17).
 - **Demand, computed by the node** and never written into the intent: a running Computer; an OCI one-shot; queued OCI work that waits for this node (the hint from Ticket 12; a fake until then); an unfinished helper directive (removal, Backup, prune, restore, clone, reset, grow); an owner `load-image`.
 - **The idle stop**, 10 minutes after the last demand ends (a setting): publish the reduced capability and wait for L1's acknowledgement; check demand again under the claim lock; take the cycle lock; run a graceful `limactl stop`, with `--force` only after a timeout. Raise today's 30 s Lima command timeout for this step.
 - **The reason `host_vm_idle`**: `wefty node doctor` treats it as healthy, never starts the host VM, and shows what keeps it on. The watchdog still repairs a broken host VM.
@@ -214,17 +215,19 @@ How do L1 and the node record a Computer's Seat limit, idle action and network? 
 ### Deliverable
 
 - **Computer settings:** Seat limit, idle action (*delete*, *stop*, *nothing*) and network (*with internet*, *without internet*, fixed at creation). The image digest is recorded at creation, as today. Owner-made Computers take *nothing* and *with internet*.
-- **The default Computer image** as a setting that the owner may change (spec P10). A new on-demand Computer takes the newest default at its creation.
+- **The default Computer image** as an L1 cluster setting that the owner may change, like the cluster Backup-cap default (spec, section 7.1). A new on-demand Computer takes the newest default at its creation.
+- **The owner's settings** as startup flags that `wefty setup` writes into the installed services (spec P17).
 - **Room per Seat**, 1 GiB each (a setting). A Seat takes its room when it starts and gives it back after its cleanup is confirmed. The serving Mac counts room node-locally, so the count works while the host VM is stopped.
 - **The ceiling** is the host VM's memory minus 1 GiB, read from the configured host VM size. It replaces the fixed 4 GiB and the quarter reserve (`DefaultMacComputerCapacity`). This ticket changes no host VM setup; Ticket 2 sets the size default.
 - **The dedicated cap**, 1 by default. It counts the dedicated Computers that run now and that a Seat request made.
 - **The Computer count** follows the room (spec P11).
-- **Owner-made Computers** keep their own memory limit, 1 GiB by default, and use the same room. Their Seat limit, idle action *stop*, and how wefty knows that their image supports Seats are open point 3: ask the owner first.
+- **Owner-made Computers** (owner, 2026-10-22): the owner sets the Seat limit (default 2) and the idle action (*nothing* by default, *stop* or *delete*) at creation, with `wefty services create --computer … [--seat-limit N] [--idle-action nothing|stop|delete]` (spec P17). They keep their own memory limit, 1 GiB by default, and use the same room; their Seats share that limit and take no extra room. A Seat on one still needs an image that supports Seats; Ticket 6 chooses how wefty detects that.
 - The rules land in `docs/contracts/state-machines.md` and the M3.5 §4 amendment.
 
 ### Acceptance
 
 - RM-3 at the room check.
+- An owner-made Computer with a Seat limit of 2 holds 2 Seats within its own memory limit, and the Mac's room does not change when they join.
 - A room matrix for a 16 GiB and a 32 GiB Mac: 3 and 7 Seats, in any mix of shared and dedicated Computers.
 - A fourth Seat's room check on a 16 GiB Mac refuses at once (RM-1 runs live in Ticket 21).
 - The room count is right with the host VM stopped. Today's Computers keep working unchanged.
@@ -247,7 +250,7 @@ How does the node agent ask the owner Approve or Deny, so that nothing an AI age
 
 - **The dialog** (spec P4): a native macOS alert that the node agent shows in the owner's login session. It shows the harness label ("not verified"), the folder, the request form ("and start it" for a stopped Computer), the network, and a window's length. Two buttons only.
 - **The wait:** 5 minutes (a setting), then "no answer from the owner". When nobody is logged in or the screen is locked, the request waits, then is refused the same way.
-- **Approval windows:** 1, 8 or 24 hours, never longer (settings). A window covers every request form for its network, and requests without internet (spec, section 12.2). `wefty status` shows an open window. A command closes a window early (spec P1). No command opens one.
+- **Approval windows:** 1, 8 or 24 hours, never longer (settings). A window covers every request form for its network, and requests without internet (spec, section 12.2). `wefty status` shows an open window. `wefty seat window close` closes a window early. No command opens one.
 - **The answer goes to L1 under the node agent's own identity.** No CLI command and no control-socket verb carries an approval.
 - An interface that Ticket 11 calls, and a fake dialog for CI.
 
@@ -273,8 +276,9 @@ What does the default Computer image hold, and how does conformance prove its Se
 
 ### Deliverable
 
-- **The default Computer image** (spec P10; its tool list is open point 5), built from `examples/computer/` and published digest-pinned for amd64 and arm64 through the existing acceptance-image CI. The throwaway prototype on branch `prototype/multi-seat-image` (`prototype/multi-seat-computer/`) shows one way to build it, and a harness that runs it under the real Computer profile.
+- **The default Computer image** (owner, 2026-10-22; spec, section 7.1): a desktop, Chromium, `git`, `curl`, Python 3, Node.js, the system libraries that Playwright's browsers need, and 4 Seat users. AI agents install Playwright's own browsers into their Seat folder. It is built from `examples/computer/` and published digest-pinned for amd64 and arm64 through the existing acceptance-image CI. The throwaway prototype on branch `prototype/multi-seat-image` (`prototype/multi-seat-computer/`) shows one way to build it, and a harness that runs it under the real Computer profile.
 - **Its Seat duties** ([#1028](https://github.com/Derek-X-Wang/wefty/issues/1028)): a root supervisor that follows the Seat directive (P5) and writes ready or failed answers (P6); Seat users `seat1` to `seat4`, each with a passwd entry; per Seat, its own display and key, a 1280×800 desktop with a browser, view and control endpoints as Unix sockets (P7), a reader of its own `driver.json` (P8), and its folders (P9); on Seat end, every process of the Seat's user stops, double-forked ones included, its folder is deleted and its endpoints are freed; after a Computer restart, no Seats.
+- **Seat support detection** (an engineering choice, owner 2026-10-22): choose how wefty knows, before the dialog, that an image supports Seats, also for an owner's own image, and record it in `docs/contracts/computer-image.md`.
 - **Temp space sizing** (engineering, spec section 12.2): memory-backed temp space fits inside the Computer's memory limit, for example each Seat's temp folder on its disk folder, as the prototype did. Record the sizes chosen.
 - **`wefty-computer-conformance` Seat checks**, with negative fixtures: a Seat user with no passwd entry, and a Seat endpoint that another Seat can open.
 - **Measurements:** what a typical install, such as a browser test kit, adds to a Seat's folder.
@@ -405,7 +409,7 @@ How does a Seat request go from the AI agent's call to a ready Seat or a refusal
 ### Deliverable
 
 - **Records in L1:** the Seat request and the Seat share one ID, `seat_<32 hex>` (spec P2; section 12.2). The request prints it at once; once approved, it names the Seat; a refused request keeps it in its record. A cut-off call waits again by that ID, on the model of the dispatch-key replay. The harness label is stored, marked not verified.
-- **CLI** (spec P1): `wefty seat request` and `wefty seat wait SEAT_ID`. A request without a network is a usage error that shows the fix. Both networks work, because Ticket 10 lands first.
+- **CLI** (the `wefty seat` family, owner 2026-10-22): `wefty seat request --network internet|none [--dedicated | --computer NAME] [--window 1h|8h|24h] [--node NODE]` and `wefty seat wait SEAT_ID`. `wefty seat --help` lists the whole family. A request without a network is a usage error that shows the fix. Both networks work, because Ticket 10 lands first.
 - **The Seat credential:** L1 mints it, and the CLI stores it (spec P3). Check the storage place inside the Claude Code and Codex sandboxes.
 - **The flow** (spec, sections 2.2 to 2.4): the room check and the other checks before the dialog (P12); the dialog through Ticket 5, the first approved request takes the room; the start by form, *by name* with its refusals and "and start it"; the newest default image and 8 GiB of Storage for a new on-demand Computer; a new Computer that fails to start is deleted with its Storage and nothing latches, an existing one keeps today's latch. This ticket runs on a running host VM; Ticket 12 adds the stopped-host-VM path.
 - **Typed refusals** in `docs/contracts/cli-errors-and-request-ids.md`: out of room ("out of room, try again later"), no answer from the owner, denied, network mismatch, image without Seats, dedicated cap, failed or removed Computer.
@@ -464,7 +468,7 @@ How does one `wefty logs ID` read a Run or a Seat? How does every Seat reply tel
 
 - **The Seat log in L1**, one record with the take-over audit, kept 90 days ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). An event writer that other tickets use: request and release, the end and its reason, owner stop and restart, commands started and finished, copies, control taken and released with the note.
 - **`wefty logs ID`** reads the kind from the ID's prefix. `--follow`, `--cursor` and `--tail` work for Runs and Seats. A Seat follow stops when the Seat ends, and its last line says why.
-- **After the Seat ends**, its credential still reads that Seat's log, read-only, for the log's retention, and does nothing else (spec P15).
+- **After the Seat ends**, its credential still reads that Seat's log, read-only, for the log's retention, and does nothing else (owner, 2026-10-22; spec, section 2.6).
 - **The unread-events line** on every Seat reply, in one shared reply path.
 - **Typed-ID parsing**, shared with `wefty cancel`.
 
@@ -490,7 +494,7 @@ When does a Seat end, what ends with it, and what does wefty do with an idle Com
 
 ### Deliverable
 
-- **`wefty seat release SEAT_ID`** (spec P1), and the wefty skill text for release.
+- **`wefty seat release SEAT_ID`**, and the wefty skill text for release.
 - **The alive rule** ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)): a Seat call in the last 30 minutes (a setting), a running command (Ticket 18 feeds it), or a person driving (Ticket 15 feeds it). A Seat call is every one-time Seat command with the credential, a one-time `wefty logs SEAT_ID` included; a `--follow` counts once, when it starts (spec, section 12.2).
 - **The "ends soon" event**, once, 5 minutes before the end (a setting).
 - **The end:** release, expiry, a Computer restart, or an owner command. Cancel its commands, stop its programs, delete its folder, and stop its credential at once for everything but reading its log ("Seat ended" with the reason). Return its room only after the helper confirms the cleanup.
@@ -548,10 +552,10 @@ How does an AI agent take screenshots, and click, type and scroll on its Seat, f
 
 ### Deliverable
 
-- **CLI** (spec P1): screenshot (a PNG file), click (left, right, double), move, drag, scroll, type and key. An action may take a screenshot in the same call. The screen is 1280×800.
+- **CLI:** `wefty seat screenshot|click|move|drag|scroll|type|key SEAT_ID …`. A screenshot is a PNG file; click is left, right or double. An action may take a screenshot in the same call. The screen is 1280×800.
 - **The refusal** "a person is driving" is typed, with an exit code in the whitelist and a real-binary test. The unread-events line comes on every reply.
 - **The wefty skill:** read a screenshot with the harness's own image tool; do not drive the screen with commands while a person drives.
-- **Two timings with their proposed thresholds** (spec P16): SC-1 (wefty's own part of one click with its screenshot, within 1 s) and SC-4 (Take control to the first refusal, within 1 s), on the owner's Mac without model time. Over a threshold, the check fails, and the CDP relay comes back for the owner's decision.
+- **Two timings with the owner's thresholds** (owner, 2026-10-22): SC-1 (wefty's own part of one click with its screenshot, within 1 s) and SC-4 (Take control to the first refusal, within 1 s), on the owner's Mac without model time. Over a threshold, the check fails, and the CDP relay question returns to the owner.
 
 ### Acceptance
 
@@ -576,7 +580,7 @@ How does the owner watch a Seat live and take the wheel from a browser?
 ### Deliverable
 
 - **The front door serves the viewer page** and gives the browser its session bearer, because a browser cannot read WebSocket response headers.
-- **One command opens it** (spec P1).
+- **`wefty seat view SEAT_ID` opens it.**
 - **The page** shows the Seat live, who drives (the AI agent or a person), Take control and Release, and a field for the release note. It says when the Seat ended, also after a release while the owner watches.
 - **The one-hour limit** stays; the owner reconnects.
 
@@ -687,7 +691,7 @@ Does stage A pass the arrival test on the owner's Mac, under the real host VM, d
 
 - **An attended runbook and tagged harness** in `docs/acceptance/` for the owner's Mac, with the owner's approval, at a quiet time, with the memory guard on.
 - **The live rows:** AR-1 to AR-5; AP-1 to AP-6; RM-1 and RM-4; HV-1 to HV-6; CT-1.
-- **The screen timing comparison:** SC-2 (the 10-step browser test through the screen) and SC-3 (the same test as a Playwright command on the Seat), time and tokens, recorded side by side for the owner to read, with no threshold; and SC-1 and SC-4 live if not yet recorded.
+- **The screen timing comparison:** SC-2 (the 10-step browser test through the screen) and SC-3 (the same test as a Playwright command on the Seat), time and tokens, recorded side by side for the owner to read, with no pass/fail threshold; and SC-1 and SC-4 live if not yet recorded.
 - **One matrix** that folds the CI, real-time Linux and attended evidence and maps every stage A row of spec section 11 to its proof. A gap goes to its owning ticket. This ticket adds no behaviour.
 
 ### Acceptance

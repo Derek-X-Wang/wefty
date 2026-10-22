@@ -12,7 +12,7 @@ An AI agent's own sandbox keeps it from breaking the owner's Mac. Wefty gives it
 - **The owner** gets a fixed share of the Mac for AI agents, a yes-or-no on every Seat, a live view of every Seat, and the wheel at any moment. The owner's own commands always win over an automatic action.
 - **An AI agent** gets a real computer for the work that its sandbox blocks: a browser with a screen, system calls such as `sysctl`, and installs. It gets a clear answer every time: a Seat, or a refusal with its reason. It hears about events through one log command that works in every harness.
 
-> **Status:** draft for ratification, after a spirit skim and a cross-model review. Every decision comes from a closed ticket of map [#1008](https://github.com/Derek-X-Wang/wefty/issues/1008); section 12 links each one to its ticket and resolves conflicts between sources. Section 13 lists the open points for the owner and every mechanism marked "proposed".
+> **Status:** draft for ratification; all open points answered 2026-10-22. Every decision comes from a closed ticket of map [#1008](https://github.com/Derek-X-Wang/wefty/issues/1008) or from the owner's answers of 2026-10-22; section 12 links each one and resolves conflicts between sources. Section 13 lists the engineering mechanisms marked "proposed".
 
 ## 0. Why, evidence and placement
 
@@ -28,7 +28,13 @@ Research [#1009](https://github.com/Derek-X-Wang/wefty/issues/1009), [#1010](htt
 
 ### 0.3 Placement in M3.7
 
-The owner's ruling of 2026-10-16 on [#893](https://github.com/Derek-X-Wang/wefty/issues/893): this effort is **M3.7 phase 2** (stage A); the fleet work becomes **phase 3** and takes in stage B; Buzz becomes **phase 4**; the daily-use trial ([#897](https://github.com/Derek-X-Wang/wefty/issues/897)) does not change. The owner is reviewing these phase numbers (open point 4). Stage A depends on no fleet ticket. Stage B depends on #899 (Fabric identities per machine), [#900](https://github.com/Derek-X-Wang/wefty/issues/900) (fleet setup) and #902 (`wefty exec` on another machine).
+The owner decided on 2026-10-22 to match the phase numbers to what happens. This revises the map's 2026-10-16 "Place in the plan" note on [#893](https://github.com/Derek-X-Wang/wefty/issues/893).
+- The fleet work (#899, [#900](https://github.com/Derek-X-Wang/wefty/issues/900), [#901](https://github.com/Derek-X-Wang/wefty/issues/901), #902, [#903](https://github.com/Derek-X-Wang/wefty/issues/903), [#1049](https://github.com/Derek-X-Wang/wefty/issues/1049)) is M3.7 **phase 2**. The owner started it on 2026-10-19, before the phase-1 exit.
+- This effort is **phase 3**.
+- Buzz is **phase 4**.
+- The daily-use trial ([#897](https://github.com/Derek-X-Wang/wefty/issues/897)) does not change.
+
+Stage A may start once the owner ratifies this spec, beside the fleet work, because it does not need it. Like the fleet work, it does not wait for the phase-1 exit (#897). The owner's Mac runs one test-heavy worker at a time, shared with the fleet work. Stage B comes after the fleet tickets that it depends on: #899 (Fabric identities per machine), #900 (fleet setup) and #902 (`wefty exec` on another machine).
 
 ### 0.4 The base
 
@@ -53,13 +59,12 @@ A Computer has three settings:
 |---|---|---|---|---|
 | Shared, on demand | a Seat request (*any*) | 2 by default | *delete* | what the request names |
 | Dedicated, on demand | a Seat request (*dedicated*) | 1 | *delete* | what the request names |
-| Owner-made | the owner (`wefty services create --computer`) | open point 3 | *nothing* | *with internet* (today's public egress) |
+| Owner-made | the owner (`wefty services create --computer`) | the owner's choice, 2 by default | the owner's choice: *nothing* (default), *stop* or *delete* | *with internet* (today's public egress) |
 
 - **The default request** is a Seat on a shared on-demand Computer (charting decision 4).
 - **A dedicated Computer gives no neighbours:** all its memory, its own background programs, and reset; not system changes, which on every Computer come only through a new image. "System settings" in charting decision 4 now means the AI agent's own settings ([#1028](https://github.com/Derek-X-Wang/wefty/issues/1028)).
 - **A setting caps the dedicated Computers on a Mac:** 1 by default (#1015). It counts those that run now and that a Seat request made, not owner-made ones. Memory admission still guards every Computer ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)).
-- **Owner-made Computers keep working exactly as now** ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)).
-- **No Seat request makes a Computer with idle action *stop*** (open point 3).
+- **Owner-made Computers keep working as now by default** ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). The owner sets their Seat limit and idle action at creation; this is how a Computer gets idle action *stop*. Their Seats share the memory limit that the owner gave the Computer and take no extra room. A Seat still needs an image that supports Seats; how wefty detects that is an engineering choice in the image ticket (owner, 2026-10-22).
 
 ### 1.3 Rules that hold everywhere
 
@@ -93,7 +98,7 @@ Spirit ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)): every reque
 
 ### 2.1 The request
 
-1. An AI agent runs the request command (names: open point 1, P1).
+1. An AI agent runs `wefty seat request`. Every Seat command is in one `wefty seat` family, so `wefty seat --help` finds them all (owner, 2026-10-22; section 12.3).
 2. **It names its network**, *with internet* or *without internet*. There is no default; a request that does not say is a usage error that shows the fix ([#1017](https://github.com/Derek-X-Wang/wefty/issues/1017)).
 3. **It names its form:** *any* (the default), *dedicated*, or *by name* with a Computer's name. It may ask for an approval window instead of one Seat (section 2.3).
 4. **The harness name is a label.** Wefty reads it from the `CLAUDECODE` or `CODEX_SANDBOX` markers, or the AI agent states it. Wefty shows it in the dialog and the records, marked "not verified". It picks no rule, and a contradicting marker does not refuse (#1017, superseding point 6 of [#1014](https://github.com/Derek-X-Wang/wefty/issues/1014)).
@@ -115,7 +120,7 @@ Spirit (#1017): wefty does not guess an AI agent's sandbox. It keeps no list of 
 2. **The dialog says** which harness asks, marked "not verified"; the AI agent's folder; the form (*by name* with the Computer's name, plus "and start it" for a stopped Computer); the network; and a window's length.
 3. **Two buttons only: Approve and Deny.** To give less, the owner denies, and the AI agent asks again for less.
 4. **No Touch ID or password.** The dialog stops an AI agent from approving itself; it does not prove who sits at the keyboard. A sandboxed AI agent cannot click a Mac window, and an unsandboxed one can already do anything the owner can. The owner: "no one can make that promise anyway."
-5. **Approval happens only in the dialog.** No `wefty` command, flag, settings file or web page can approve, because the AI agent can run all of those. A command may only take approval away, for example close a window early.
+5. **Approval happens only in the dialog.** No `wefty` command, flag, settings file or web page can approve, because the AI agent can run all of those. A command may only take approval away, for example `wefty seat window close`.
 6. **One approval covers one Seat**, for as long as that Seat lives.
 7. **An approval window** is for unattended work, for example "allow Computer requests with internet for 8 hours". Its lengths are 1, 8 or 24 hours, never longer: a window with no end would be the "default open" that the owner rejected. A window covers every request form for its network, and requests without internet (section 12.2). Any program on the Mac can use it, so the owner opens one only on purpose. `wefty status` shows it. When it ends, running Seats keep running, and the next request meets the dialog again.
 8. **No answer in 5 minutes** refuses the request with "no answer from the owner". When nobody is logged in or the screen is locked, the request waits, then is refused the same way ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)). The wait and the window lengths are settings.
@@ -153,7 +158,7 @@ A Seat stays alive while any of these is true: the AI agent made a Seat call in 
 A Seat ends on release, on expiry, on a Computer restart, or through an owner command on its Computer. Then:
 - its running commands are cancelled, and its desktop and programs stop, background programs included;
 - its own folder is deleted, so the next Seat starts clean. Results leave by copy-out first;
-- its Seat credential stops working at once for commands, input, copies and the screen. Later calls get "Seat ended" with the reason (released, expired, or Computer restarted). Proposed: it keeps read-only access to that Seat's log for the log's retention, and nothing else (P15);
+- its Seat credential stops working at once for commands, input, copies and the screen. Later calls get "Seat ended" with the reason (released, expired, or Computer restarted). It keeps read-only access to that Seat's log for the log's retention, and nothing else (owner, 2026-10-22);
 - its room returns once wefty confirms the cleanup;
 - a release still ends the Seat while a person watches or drives it, and the viewer says so.
 
@@ -190,7 +195,8 @@ The "Setting" column says which values the owner may change later, for example i
 | Host VM memory and CPUs | a quarter of the Mac's memory (4 GiB; 8 GiB on a 32 GiB Mac), 4 CPUs | yes | [#1015](https://github.com/Derek-X-Wang/wefty/issues/1015) |
 | Memory for Computers | the host VM's memory minus 1 GiB (3 GiB) | yes | #1015 |
 | Room per Seat | 1 GiB, so 3 Seats at once, in any mix of shared and dedicated Computers. In stage A a Seat request cannot ask for more. | yes | #1015 |
-| Memory limit of an owner-made Computer | its own, 1 GiB by default; it uses the same room | yes | #1015 |
+| Memory limit of an owner-made Computer | its own, 1 GiB by default; it uses the same room, and its Seats share it with no extra room | yes | #1015; owner, 2026-10-22 |
+| Seat limit and idle action of an owner-made Computer | 2 and *nothing* | yes, set by the owner at creation | owner, 2026-10-22 |
 | Seat limit of a shared Computer | 2; never more than the Seat users in its image | yes | #1015; [#1028](https://github.com/Derek-X-Wang/wefty/issues/1028) |
 | Dedicated Computers at once | 1 (counts only those that a Seat request made) | yes | #1015; [#1025](https://github.com/Derek-X-Wang/wefty/issues/1025) |
 | Storage of an on-demand Computer | 8 GiB | yes (today's default) | [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016) |
@@ -219,7 +225,7 @@ Spirit ([#1014](https://github.com/Derek-X-Wang/wefty/issues/1014)): the AI agen
 
 ### 4.1 The AI agent's screen commands
 
-1. **Stage A gives the AI agent `wefty` CLI screen commands only:** screenshot; click (left, right, double); move; drag; scroll; type; key. An action may also take a screenshot in the same call (names: P1).
+1. **Stage A gives the AI agent `wefty` CLI screen commands only:** `wefty seat screenshot|click|move|drag|scroll|type|key SEAT_ID …`, with click left, right or double. An action may also take a screenshot in the same call.
 2. A screenshot is a PNG file. The AI agent reads it with its normal image tool, for example `Read` in Claude Code or `view_image` in Codex ([#1011](https://github.com/Derek-X-Wang/wefty/issues/1011)).
 3. **A Seat's screen is 1280×800** by default, so a screenshot fits every current model's image limit without a resize, and click positions stay right.
 4. Input goes through the Computer front door, the same door that a person uses, and carries the Seat credential. Through wefty, an AI agent sees and drives only its own Seat.
@@ -227,7 +233,7 @@ Spirit ([#1014](https://github.com/Derek-X-Wang/wefty/issues/1014)): the AI agen
 
 ### 4.2 The owner's viewer
 
-1. **A browser viewer that wefty serves**, opened by one command. It shows the Seat live, who drives (the AI agent or a person), and **Take control** / **Release**.
+1. **A browser viewer that wefty serves**, opened by `wefty seat view SEAT_ID`. It shows the Seat live, who drives (the AI agent or a person), and **Take control** / **Release**.
 2. **Only the owner watches and drives Seats in stage A**, as today: admins see and control every Computer, and everyone else is refused (M3.5 spec, section 5.1; [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). The owner can open any Seat on their Computers; grants for other people stay in the fog.
 3. **The one-hour limit on view and control stays.** A person who watches or drives longer reconnects.
 4. The front door serves the viewer page and gives the browser its session bearer, because a browser cannot read WebSocket response headers.
@@ -252,7 +258,10 @@ Spirit ([#1014](https://github.com/Derek-X-Wang/wefty/issues/1014)): the AI agen
 
 ### 4.5 Speed is an acceptance check
 
-There is no prototype of the screen path. Four timings are acceptance checks (section 11.3). #1014 point 8: if the screen path is too slow, the check "fails loudly and the CDP relay comes back". The thresholds are proposed (P16; open point 6).
+There is no prototype of the screen path. Four timings are acceptance checks (section 11.3). #1014 point 8: if the screen path is too slow, the check "fails loudly and the CDP relay comes back". The owner set the thresholds on 2026-10-22:
+- on the owner's Mac, without model time, wefty's own part of one click with its screenshot within 1 s, and Take control to the AI agent's first refusal within 1 s;
+- the 10-step browser test through the screen, and the same test as a Playwright command, are recorded (time and tokens) for the owner to read, with no pass/fail threshold;
+- over a threshold, the check fails, and the CDP relay question returns to the owner.
 
 ## 5. Commands and files
 
@@ -300,7 +309,7 @@ Spirit ([#1052](https://github.com/Derek-X-Wang/wefty/issues/1052)): an AI agent
 
 1. **A Seat's log holds wefty's own events about the Seat, never program output**, which stays in each Run's log. It and the audit records of charting decision 11 are one record, so they cannot disagree.
 2. **The events:** a person took control, or released it, with the optional release note; the Seat ends soon (once, 5 minutes before the end); the Seat ended, and why (released, expired, or Computer restarted); the owner stops or restarts the Computer; a command started or finished, with its Run ID and exit status; a file was copied in or out, with its path and size ([#1026](https://github.com/Derek-X-Wang/wefty/issues/1026)).
-3. **The log outlives the Seat**, so the AI agent can still read the end and its reason. It is kept 90 days, like today's take-over audit (`DefaultComputerTakeoverAuditRetentionAge` in `l1/types.go`; [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). After the end, the AI agent reads it with its Seat credential (P15). Today's other retention stays: one-shot logs 30 days, service logs 7 days, and 5 GB for all logs.
+3. **The log outlives the Seat**, so the AI agent can still read the end and its reason. It is kept 90 days, like today's take-over audit (`DefaultComputerTakeoverAuditRetentionAge` in `l1/types.go`; [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)). After the end, the AI agent reads it with its Seat credential (section 2.6). Today's other retention stays: one-shot logs 30 days, service logs 7 days, and 5 GB for all logs.
 
 ### 6.2 One command: `wefty logs ID`
 
@@ -330,7 +339,8 @@ The throwaway prototype on branch `prototype/multi-seat-image` (`prototype/multi
 
 1. **Wefty ships one default Computer image** with a desktop, a browser and the usual test tools; the owner may set another. An AI agent that asks for *any* Computer then gets a working one at once, with no need to know about images.
 2. **A new on-demand Computer starts from the newest default at its creation**, recorded by digest (M3.5 spec, section 1.1). A long-lived Computer changes its image only through the owner's `services reimage` ([#1016](https://github.com/Derek-X-Wang/wefty/issues/1016)).
-3. What the image holds, and how the owner sets another, are proposed (P10; open point 5). The default is not a required base: the M3 rule "no blessed base image" still holds for generic OCI work.
+3. **What it holds** (owner, 2026-10-22): a desktop, Chromium, `git`, `curl`, Python 3, Node.js, the system libraries that Playwright's browsers need, and 4 Seat users (`seat1` to `seat4`). AI agents install Playwright's own browsers into their Seat folder (#1028). It is built from today's reference image (`examples/computer/`: Debian, XFCE, Xvfb, x11vnc, websockify) plus the Seat supervisor, and published digest-pinned for amd64 and arm64. The owner sets another default as an L1 cluster setting, like the cluster Backup-cap default.
+4. The default is not a required base: the M3 rule "no blessed base image" still holds for generic OCI work.
 
 ### 7.2 What a multi-Seat image provides
 
@@ -358,7 +368,7 @@ Each change appears once. "Way" is "decided" when a ticket chose the mechanism, 
 
 | M3.5 part | Change | Way | Contract text |
 |---|---|---|---|
-| §4 capacity | Room is counted per Seat at 1 GiB, taken at start and returned after confirmed cleanup. A Computer still takes one service Slot. Owner-made Computers keep their own memory limit and use the same room. The [#122](https://github.com/Derek-X-Wang/wefty/issues/122) rule stays ([#1015](https://github.com/Derek-X-Wang/wefty/issues/1015)). | decided | M3.5 §4; `state-machines.md` |
+| §4 capacity | Room is counted per Seat at 1 GiB, taken at start and returned after confirmed cleanup. A Computer still takes one service Slot. Owner-made Computers keep their own memory limit and use the same room; their Seats share that limit and take no extra room (owner, 2026-10-22). The [#122](https://github.com/Derek-X-Wang/wefty/issues/122) rule stays ([#1015](https://github.com/Derek-X-Wang/wefty/issues/1015)). | decided | M3.5 §4; `state-machines.md` |
 | §0.2, §4 ceiling | The host VM's memory minus 1 GiB, not a fixed 4 GiB with a quarter in reserve (`runner/lima/template.go`). | decided | M3.5 §0.2, §4 |
 | §4 live memory limit | A shared Computer's limit grows when a Seat joins and shrinks after its cleanup. | new helper operation | `oci-helper-protocol.md` |
 | §4 Computer count | Today 2 per node; it must grow with the room. | P11 | `state-machines.md` |
@@ -366,7 +376,7 @@ Each change appears once. "Way" is "decided" when a ticket chose the mechanism, 
 | §4 OOM | One heavy Seat can still end every Seat on its Computer; the Seat limit of 2 bounds it. | accepted | — |
 | §4 latch | A new on-demand Computer that fails to start is deleted with its Storage; an existing one keeps the latch ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)). | decided | `state-machines.md` |
 | §1.2 durable data | Seat folders and the shared folder live on `/wefty/service`, the only persistent path. | P9 | `computer-image.md` |
-| §2 settings and verbs | Seat limit, idle action and network (fixed at creation). The owner's `wefty services … --computer` commands run at once and end the Seats that they touch. The Seat commands are new and are for AI agents. | decided; names P1 | `state-machines.md` |
+| §2 settings and verbs | Seat limit, idle action and network (fixed at creation). For an owner-made Computer, the owner sets the Seat limit (default 2) and the idle action (*nothing* by default, *stop* or *delete*) at creation (owner, 2026-10-22). The owner's `wefty services … --computer` commands run at once and end the Seats that they touch. The Seat commands for AI agents are the `wefty seat` family. | decided; flag names P17 | `state-machines.md` |
 | §2, ADR-0004 | *nothing* keeps the owner's Desired state; an owner-stopped Computer is never deleted by the timer; approval of a *by name* request may start a stopped Computer. | decided | `state-machines.md` |
 | §3 Storage | Every Computer has Storage (8 GiB for an on-demand one), deleted with it through today's removal path. A recreate is refused while any Computer Storage or Backup lives on the host VM's disk ([#1021](https://github.com/Derek-X-Wang/wefty/issues/1021)). | decided | `state-machines.md`; `agent-local-lifecycle.md` |
 | §5 take-over | Only the owner (admins) watches and drives Seats in stage A, with the one-hour limit. A Take-over session may open one Seat's screen. | decided | `state-machines.md` |
@@ -376,11 +386,11 @@ Each change appears once. "Way" is "decided" when a ticket chose the mechanism, 
 | §7 Seat endpoints | View and control endpoints per Seat, also for a Seat added later, closed to other Seats (gaps 3, 5). Today one pair per attempt comes through the environment. | P7 | `computer-image.md`; `oci-helper-protocol.md` |
 | §7 command as a Seat's user | Run a command inside a running Computer as a Seat's user, in its folder, with its screen (gap 4; containerd can, the helper cannot yet). | new helper operation | `oci-helper-protocol.md` |
 | §7 Seat end | Every process of the Seat's user stops, and its folder goes. | supervisor; helper confirms | `computer-image.md` |
-| §7 default image | One default image for on-demand Computers. Older images keep today's single-screen contract; no current-version Computer exists, so nothing migrates (#1016). | P10 | `computer-image.md` |
-| §8 guest authority | No change. The [#126](https://github.com/Derek-X-Wang/wefty/issues/126) path is owner-created: the owner makes the Computer and turns on submission, so it is owner-made with idle action *nothing*. Installing an AI agent inside a Seat never changes a Computer's kind or idle action. | decided | — |
+| §7 default image | One default image for on-demand Computers (section 7.1). Older images keep today's single-screen contract; no current-version Computer exists, so nothing migrates (#1016). How wefty detects Seat support is an engineering choice in the image ticket. | decided | `computer-image.md` |
+| §8 guest authority | No change. The [#126](https://github.com/Derek-X-Wang/wefty/issues/126) path is owner-created: the owner makes the Computer and turns on submission, so it is owner-made, with the owner's idle action (*nothing* by default). Installing an AI agent inside a Seat never changes a Computer's kind or idle action. | decided | — |
 | §9 removal | No new path. *delete* uses today's path, with `removed_verified` before the host VM stops. A copied file is not a Custody export ([#1026](https://github.com/Derek-X-Wang/wefty/issues/1026)). | decided | `state-machines.md`; `exec.md` |
 | Network | Today's Computers have public egress, so they are *with internet*. *Without internet* is loopback only, with no proxy or DNS and IP filter in the guest ([#1017](https://github.com/Derek-X-Wang/wefty/issues/1017)). | decided | `computer-image.md` |
-| Host VM | The switch, demand, the idle stop, `host_vm_idle`, the per-user install (section 9). | decided; marker P14 | `agent-local-lifecycle.md` |
+| Host VM | The switch, demand, the idle stop, `host_vm_idle`, the per-user install (section 9). | decided; marker P14; command P17 | `agent-local-lifecycle.md` |
 | Commands and files | Seat Runs, the working copy, the time limit, `wefty cp` (section 5). | decided | `exec.md` |
 | CLI refusals | Out of room, the host VM is off, no answer from the owner, denied, Seat ended, network mismatch, image without Seats, dedicated cap. | decided | `cli-errors-and-request-ids.md` |
 
@@ -487,10 +497,10 @@ Spirit ([#1018](https://github.com/Derek-X-Wang/wefty/issues/1018)): stage B wor
 
 | ID | Check |
 |---|---|
-| SC-1 | One click and one screenshot: time. Proposed threshold: wefty's own part within 1 s (P16). |
-| SC-2 | A 10-step browser test through the screen: time and tokens, recorded. |
-| SC-3 | The same test as a Playwright command on the Seat: time and tokens, recorded. |
-| SC-4 | Take control to the AI agent's first refusal: time. Proposed threshold: within 1 s (P16). |
+| SC-1 | One click and one screenshot: time. Threshold: wefty's own part within 1 s. |
+| SC-2 | A 10-step browser test through the screen: time and tokens, recorded, no threshold. |
+| SC-3 | The same test as a Playwright command on the Seat: time and tokens, recorded, no threshold. |
+| SC-4 | Take control to the AI agent's first refusal: time. Threshold: within 1 s. |
 
 ### 11.4 Approval and network ([#1017](https://github.com/Derek-X-Wang/wefty/issues/1017))
 
@@ -625,10 +635,11 @@ This section is normative.
 | The M3.5 contract | [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016) | §2.6, §2.7, §8, §11.10 |
 | The host VM on demand | [#1027](https://github.com/Derek-X-Wang/wefty/issues/1027) | §9, §11.11, §11.12 |
 | Stage B | [#1018](https://github.com/Derek-X-Wang/wefty/issues/1018) | §10, §11.13 |
-| Phase placement | owner ruling on [#893](https://github.com/Derek-X-Wang/wefty/issues/893), 2026-10-16 | §0.3 |
+| Phase placement | owner, 2026-10-22 (revises the 2026-10-16 ruling on [#893](https://github.com/Derek-X-Wang/wefty/issues/893)) | §0.3 |
+| Answers to the open points | owner, 2026-10-22 | §12.3 |
 | Wave order; done only when the owner ratifies | [#1019](https://github.com/Derek-X-Wang/wefty/issues/1019) | §9.6, the wave doc |
 
-### 12.2 Conflicts and settled points
+### 12.2 Conflicts and settled points (accepted by the owner, 2026-10-22)
 
 | Conflict or gap | Resolution and reason |
 |---|---|
@@ -650,26 +661,30 @@ This section is normative.
 | A Seat ID and a request's name both start with `seat` (#1052). | **One ID**: the request prints `seat_<32 hex>` at once, `wefty seat wait` takes it, and once approved it names the Seat; a refused request keeps it in its record. |
 | Where the CLI keeps the Seat credential in a sandbox. | **P3 stays proposed** (the system temp folder, checked per harness); not an owner point. |
 
+### 12.3 Owner answers, 2026-10-22
+
+| Point | Owner answer | Spec sections |
+|---|---|---|
+| Phase numbers | The fleet work is phase 2 (started 2026-10-19); this effort is phase 3; Buzz is phase 4; [#897](https://github.com/Derek-X-Wang/wefty/issues/897) does not change. Stage A starts after ratification, beside the fleet work, and does not wait for the phase-1 exit. The owner's Mac runs one test-heavy worker at a time, shared with the fleet work. Stage B follows the fleet tickets it needs. This revises the map's 2026-10-16 note. | §0.3 |
+| Seat commands | One `wefty seat` family: `wefty seat request --network internet\|none [--dedicated \| --computer NAME] [--window 1h\|8h\|24h] [--node NODE]`, `wefty seat wait SEAT_ID`, `wefty seat release SEAT_ID`, `wefty seat screenshot\|click\|move\|drag\|scroll\|type\|key SEAT_ID …`, `wefty seat view SEAT_ID`, `wefty seat window close`. Kept: `wefty exec --seat`, `wefty cp`, `wefty logs`. Why: an AI agent finds everything with `wefty seat --help`, and the top-level command list stays short. | §2.1, §2.3, §4.1, §4.2 |
+| Owner-settings command names | Engineering names, built as written after ratification (P17). Not an owner question. | §13.2 |
+| Owner-made Computers | At creation the owner sets the Seat limit (default 2) and the idle action: *nothing* (default), *stop* or *delete*. This is how a Computer gets *stop*. Its Seats share the memory limit that the owner gave it and take no extra room. A Seat still needs an image that supports Seats; detection is an engineering choice in the image ticket. | §1.2, §3, §8 |
+| Default image | A desktop, Chromium, `git`, `curl`, Python 3, Node.js, the system libraries that Playwright's browsers need, and 4 Seat users. AI agents install Playwright's own browsers into their Seat folder. | §7.1 |
+| Screen speed | On the owner's Mac, without model time: one click with its screenshot within 1 s (wefty's own part), and Take control to the first refusal within 1 s. The 10-step test, through the screen and as a Playwright command, is recorded with no threshold. Over a threshold, the check fails, and the CDP relay question returns to the owner. | §4.5, §11.3 |
+| The settled points of §12.2 | Accepted, with the ended Seat's read-only log access and the relaxed proof gate. | §2.6, §12.2, the wave doc |
+
 ## 13. Open points and proposed mechanisms
 
 ### 13.1 Open points for the owner
 
-| # | Open point | Sources | This draft |
-|---|---|---|---|
-| 1 | **Seat command names**: request, wait, release, the screen actions, the viewer, closing a window. | map, "Not yet specified"; [#1016](https://github.com/Derek-X-Wang/wefty/issues/1016) | P1 |
-| 2 | **Owner-settings command names**: the switch positions, the default image, the dedicated cap, the per-Seat room, the other settings in section 3, and the stage B routing setting. | [#1015](https://github.com/Derek-X-Wang/wefty/issues/1015); [#1027](https://github.com/Derek-X-Wang/wefty/issues/1027); [#1018](https://github.com/Derek-X-Wang/wefty/issues/1018) | P10, P11, P13, P14 |
-| 3 | **Owner-made Computers and Seats:** their Seat limit and how the owner sets it; which Computers get idle action *stop* (no Seat request makes one, and owner-made ones take *nothing*); how wefty knows before the dialog that an owner's image supports Seats (image labels are no contract input, M3.5 §7); whether a *by name* Seat on one takes 1 GiB of room and grows its memory limit. | charting decisions 2 and 9; #1015 decision 3; #1016 decision 2; [#1025](https://github.com/Derek-X-Wang/wefty/issues/1025); [#1028](https://github.com/Derek-X-Wang/wefty/issues/1028) | open; the room ticket asks before it builds this case |
-| 4 | **Phase numbers.** The 2026-10-16 ruling (phase 2 this effort, 3 fleet with stage B, 4 Buzz) is under review. [#893](https://github.com/Derek-X-Wang/wefty/issues/893) blocks phase-2 tickets on the phase-1 exit ([#897](https://github.com/Derek-X-Wang/wefty/issues/897)), which the ruling leaves unchanged; the fleet tickets are already in progress. | #893, "Order of work" and the 2026-10-16 comment | keeps the ruling's numbers; does not block the wave on #897 |
-| 5 | **The default image's contents**: which "usual test tools", and how many Seat users. | #1028 decision 1 | P10 |
-| 6 | **Screen speed.** [#1014](https://github.com/Derek-X-Wang/wefty/issues/1014) point 8: a too-slow screen path "fails loudly and the CDP relay comes back". | #1014 point 8 | P16 |
+None. The owner answered every open point on 2026-10-22 (section 12.3).
 
 ### 13.2 Proposed mechanisms
 
-No ticket chose these. The owner ratifies or changes them.
+No ticket chose these engineering mechanisms. They are built as written once the owner ratifies the spec. The numbers stay from earlier drafts; P1, P10, P15 and P16 are now decisions (section 12.3).
 
 | ID | Proposed |
 |---|---|
-| P1 | **Seat commands.** `wefty seat request --network internet\|none [--dedicated \| --computer NAME] [--window 1h\|8h\|24h] [--node NODE]` prints the Seat ID, then waits. `wefty seat wait SEAT_ID`. `wefty seat release SEAT_ID`. `wefty seat screenshot SEAT_ID [--out FILE]`; `wefty seat click SEAT_ID X Y [--right \| --double] [--screenshot]`; `move`, `drag`, `scroll`, `type` and `key` in the same shape. `wefty seat view SEAT_ID` opens the owner's viewer. `wefty seat window close`. (`--node` is from #1018.) |
 | P2 | **The ID format.** `seat_<32 hex>`, from `newID`, shared by the request and the Seat. Commands read the kind from the prefix before the first `_`. |
 | P3 | **The Seat credential.** L1 mints it, as it mints the Attempt credential ([#1013](https://github.com/Derek-X-Wang/wefty/issues/1013)). The request command stores it in a private file keyed by Seat ID in the system temp folder, where the Claude Code and Codex sandboxes let the CLI write; every Seat command reads it there. The ticket checks this in each harness's sandbox. |
 | P4 | **The dialog.** A native macOS alert that the node agent shows in the owner's login session, with two buttons and a timeout (for example a CoreFoundation user-notification alert); not a banner, not a web page. The node agent sends the answer to L1 under its own node identity. No CLI command or control-socket verb carries an approval. |
@@ -678,13 +693,11 @@ No ticket chose these. The owner ratifies or changes them.
 | P7 | **Seat endpoints.** Unix sockets in the Seat's runtime folder, which only the Seat's user and root can open. The directive names their paths; the helper returns and dials them by Seat. This closes them to other Seats without tokens. The view endpoint still ignores input. |
 | P8 | **The driver signal.** One read-only `/wefty/control/seats/<place>/driver.json` per Seat place, with today's body: `{"version":1,"human_driving":true}` or `false`. |
 | P9 | **Folders.** `/wefty/service/seats/<place>` per Seat and `/wefty/service/shared`, as in the prototype. |
-| P10 | **The default image.** Today's reference image (`examples/computer/`: Debian, XFCE, Chromium, Xvfb, x11vnc, websockify) plus the Seat supervisor; Seat users `seat1` to `seat4`; `git`, `curl`, Python 3, Node.js and the system libraries that Playwright's browsers need; digest-pinned for amd64 and arm64. The owner sets another as an L1 cluster setting, like the cluster Backup-cap default. |
 | P11 | **The Computer count.** A Mac node's service-Slot count follows its room: at least one Slot per Seat that fits. |
 | P12 | **Checks before the dialog.** The dedicated cap, image support for Seats, and a failed or removed Computer, like the room, so the owner is never asked about a request that cannot succeed. |
 | P13 | **The stage B routing setting** lives in the machine's connection profile (`docs/contracts/connection-profile.md`), set by a `wefty` settings command. |
-| P14 | **The switch and today's marker.** *enabled* reads as *always on* (#1027: "*Always on:* today's *enabled*"); missing or disabled reads as *off*; a new per-user install writes *on demand*. |
-| P15 | **An ended Seat's log.** After a Seat ends, its credential keeps read-only access to that Seat's log for the log's retention (90 days), and nothing else: no commands, input, copies or screen. |
-| P16 | **Screen speed thresholds.** On the owner's Mac, without model time: wefty's own part of one click with its screenshot within 1 s, and Take control to the AI agent's first refusal within 1 s. The 10-step browser test and the same test as a Playwright command are recorded (time and tokens) for the owner to read, with no threshold. Over a threshold, the check fails, and the CDP relay comes back for the owner's decision. |
+| P14 | **The switch and today's marker.** *enabled* reads as *always on* ([#1027](https://github.com/Derek-X-Wang/wefty/issues/1027): "*Always on:* today's *enabled*"); missing or disabled reads as *off*; a new per-user install writes *on demand*. |
+| P17 | **Owner-settings commands.** The host VM switch: `wefty node oci off\|on-demand\|always-on`, replacing `start\|stop`. An owner-made Computer: `wefty services create --computer … [--seat-limit N] [--idle-action nothing\|stop\|delete]`. The other settings in section 3 are startup flags, like today's `wefty-l1 --computer-backup-cap`: cluster values (the default image, the Seat and Computer idle waits, the Seat command time limit, the warning time) on L1, and node values (room per Seat, the dedicated cap, the host VM size and idle wait, the answer wait, the window lengths) on the node agent. `wefty setup` writes them into the installed services, and the owner changes one by running `wefty setup` again with the new value. The stage B routing setting is P13. |
 
 ## 14. Out of scope, and not yet specified
 
@@ -702,7 +715,6 @@ No ticket chose these. The owner ratifies or changes them.
 
 ### 14.2 Not yet specified (the map's fog)
 
-- Command names for request, release and screen (open point 1).
 - A wait queue when the Mac is full. This version refuses at once.
 - Viewers other than the owner on shared Computers: grants per Seat or per Computer.
 - Recording clicks, keys or screen contents for audit. The owner is open to it, because the data stays on owned machines. It would reverse [#124](https://github.com/Derek-X-Wang/wefty/issues/124)'s rule that wefty never records clicks or the screen.
