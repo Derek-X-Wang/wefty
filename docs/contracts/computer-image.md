@@ -379,16 +379,31 @@ but complete crossover-refusal coverage for those categories remains a known
 gap. Shared operator-selected mounts in particular are not reclassified as
 isolated by this change.
 
-The Computer-specific profile adds a private `/dev/shm` tmpfs with a 1 GiB
-size ceiling, mode `1777`, and `nosuid,nodev,noexec`. It is created in the
-attempt's private mount and IPC namespaces, and its pages count against the
-attempt's cgroup memory limit. The existing bounded `/tmp` (512 MiB),
-`/var/tmp` (64 MiB), `/dev`, and `/run` mounts remain unchanged. The three
-Computer-specific ceilings total 1600 MiB. They are caps rather than
-reservations: a smaller memory limit remains admissible and the cgroup limit
-is enforcement. The assertion-derived profile receipt and node doctor expose
-the exact ceiling/limit comparison as typed warnings; the production sizing
-OWNER-CALL remains open.
+The Computer profile creates private, bounded tmpfs mounts in its mount and
+IPC namespaces. Their pages count against its cgroup memory limit. At the
+1 GiB default the ceilings are `/dev/shm` 256 MiB, `/tmp` 128 MiB, `/var/tmp`
+16 MiB, `/run` 32 MiB, `/dev` 32 MiB and `/wefty/seat-status` 1 MiB: 465 MiB
+in total. This applies to single-desktop Computers as well as Seat images.
+The 256 MiB shared-memory ceiling leaves Chromium more room than a common
+64 MiB mount while reserving at least half the cap for program memory.
+
+All six ceilings are page-aligned and their sum stays at or below half of the
+Computer's declared memory cap. `/dev/shm`, `/tmp`, `/var/tmp`, `/run` and
+`/dev` scale at 1/4, 1/8, 1/64, 1/32 and 1/32 of memory, with maxima of
+1 GiB, 512 MiB, 64 MiB, 64 MiB and 64 MiB. Normal floors are respectively
+64, 16, 4, 4 and 4 MiB. For tiny caps the floors yield proportionally to the
+half-cap budget; each mount keeps at least one 4 KiB page. Status is at most
+1 MiB and shrinks for tiny caps. A cap below 48 KiB cannot hold these six
+bounded mounts and is rejected. These are ceilings, not reservations.
+The profile receipt reports their actual sum and largest mount.
+
+The status tmpfs is helper-created, root-owned mode `0700`, with
+`nosuid,nodev,noexec`. It is writable by the image's root supervisor and is
+fresh on each attempt. It has no Node path and is never an operator bind.
+Operator mounts remain read-only on Computers, and an operator cannot shadow
+the status target or a descendant. The image reports
+`attempt_status_mount_required` if this bounded writable tmpfs is absent,
+instead of attempting writes through the read-only root filesystem.
 
 The helper sets the Computer's whole-cgroup OOM policy and verifies the live
 cgroup before `Started`: `memory.max` equals the declared cap,
@@ -396,8 +411,9 @@ cgroup before `Started`: `memory.max` equals the declared cap,
 contains those read-back values. The separate atomic admission receipt records
 setup-configured capacity, declared memory/disk arithmetic, plus timestamped
 `MemTotal`, `MemAvailable`, and disk-root filesystem-free observations;
-`MemAvailable` and the 1600 MiB tmpfs ceiling remain warnings/facts and never
-reject admission. Disk-root free bytes participate only in the serialized
+`MemAvailable` and the capacity diagnostic's static maximum-ceiling estimate
+remain advisory facts and never reject admission; the per-attempt profile
+receipt reports the scaled ceilings actually mounted. Disk-root free bytes participate only in the serialized
 preallocation decision and never prove post-`Started` exhaustion.
 
 ## Tenant `driver.json` consumer contract
@@ -435,7 +451,7 @@ flight. This oracle is diagnostic image-owned evidence, not runtime authority.
 ## Conformance seam and evidence
 
 The transport-neutral Go contract exports the endpoint names, path,
-subprotocol, RFB-banner length/validator, 60-second deadline, and 1 GiB shm
+subprotocol, RFB-banner length/validator, 60-second deadline, and maximum 1 GiB shm
 size. Runtime endpoint aliases and the helper consume those values. The
 complete serialized Computer profile is pinned at
 `runner/ocihelper/testdata/containerd-v2.3.7/wefty-v1-computer-linux-amd64.json`.
@@ -444,7 +460,7 @@ Portable tests prove reserved-value stripping, exact endpoint admission,
 wire-negative cases, atomic loss/recovery, injected-clock deadline behavior,
 and the serialized profile. The Linux `service_acceptance_realtiming` lane
 asserts `/dev/shm` mode, flags, size, and a rising cgroup `memory.current` after
-a guest write. The optional `examples/computer/` XFCE image and
+a guest write. The optional `examples/computer/` **`single-seat` target** XFCE image and
 `examples/computer-wayland/` GPU-free Wayland image independently implement
 this minimum contract as image-author and acceptance examples. Each exact
 platform digest runs the same checker and 21-row broken-image matrix before a
@@ -548,162 +564,170 @@ forwarded; a client may time out rather than receive the upstream error.
 
 ## Default image and Seats (Computer request P5, P6, P8, P9)
 
-The default Computer image is built from `examples/computer/Dockerfile` (final
-`seats` target). It contains Debian, XFCE, Xvfb, Chromium, `git`, `curl`, Python
-3, Node.js and npm. Its system libraries cover Chromium, Firefox and WebKit
-from Playwright 1.56.1's Debian 12 `nativeDeps.js`, on amd64 and arm64. Browser
-binaries are installed by the AI agent in its Seat folder. Generic OCI images
-need not derive from this image. The `single-seat` target retains the earlier
-optional XFCE reference image and its separate acceptance contract.
+The final `seats` target in `examples/computer/Dockerfile` is the default
+Computer image. It holds Debian, XFCE, Xvfb, Chromium, `git`, `curl`, Python 3,
+Node.js **24.22.1 LTS** and its bundled npm. Both Node.js archive checksums
+are pinned from the official `v24.22.1/SHASUMS256.txt`; Debian's Node 18 is
+not installed. Its browser system libraries cover Playwright 1.56.1's Debian
+12 Chromium, Firefox and WebKit dependency lists on amd64 and arm64. AI agents
+install browser binaries in their Seat folder. Generic OCI images need not
+derive from it. The separate `single-seat` target retains the earlier optional
+XFCE reference image and acceptance contract.
 
-The image's root supervisor has four pre-created passwd and group identities:
-`seat1`–`seat4`, uid/gid 2001–2004. Each passwd home is
+Four passwd/group identities, `seat1`–`seat4` (uid/gid 2001–2004), set this
+image's highest Seat limit. Their homes are
 `/wefty/service/seats/<place>/home`. A numeric uid without a passwd entry is
-refused as `passwd_entry_missing`, before any desktop or Seat folder is made.
-This matters because the desktop's session bus resolves the user's passwd entry.
-The image filesystem remains read-only; it never adds users at runtime.
+refused as `passwd_entry_missing` before desktop startup. User creation stays
+in the read-only image; password age uses fixed non-zero day 20000.
 
-### Directive and answers
+### Directive, readiness and positive cleanup proof
 
-The helper binds the **directory** `/wefty/control` read-only and publishes
-`seats.json` by same-directory atomic rename. The image reopens the path on
-every poll. The version 1 directive is:
+P5 binds the **directory** `/wefty/control` read-only. The helper atomically
+replaces `seats.json`; the supervisor reopens it on every poll:
 
 ```json
-{"version":1,"generation":1,"seats":[{"id":1,"user":"seat1","view_port":7102,"control_port":7103}]}
+{"version":1,"generation":1,"seats":[{"place":1,"user":"seat1","view_port":7102,"control_port":7103}]}
 ```
 
-`id` is the numeric Seat **place**, 1–4, rather than the public Seat ID.
-`generation` is a positive, increasing attempt-local integer. An unchanged
-Seat place keeps its desktop and its original readiness deadline when another
-Seat is added. A removed or changed place is cleaned before it can be started
-again. Duplicate places, duplicate ports, incorrect users, unknown fields,
-malformed documents, missing directives and replayed generations fail closed:
-the running Seats stop. An unchanged failed Seat does not retry when an
-unrelated Seat is added. Remove that place before reusing it.
+`place` is 1–4. A public Seat ID remains `seat_<hex>` and is never the place.
+The positive attempt-local generation increases on each directive. Duplicate
+places or ports, incorrect users, unknown fields, malformed documents, missing
+directives and replayed generations fail closed. A refused document logs
+once per replacement, not once per poll. Only a read error resets that
+observation. An unchanged starting Seat keeps its original 60-second deadline
+when another Seat is added. Failed Seats do not retry on an unrelated change;
+remove the place before reuse.
 
-P6 uses a separate helper-owned, attempt-local directory mounted writable at
-`/wefty/seat-status`, root-owned mode `0700`, apart from the read-only control
-mount and from Storage. The supervisor atomically replaces `<place>.json`,
-mode `0600`. Its answer is one of:
+P6 uses the profile's private 1 MiB `/wefty/seat-status` tmpfs, not a writable
+operator mount. The supervisor atomically replaces `<place>.json` with mode
+`0600`, using descriptor-based, no-follow operations. Answers include:
 
 ```json
-{"version":1,"generation":1,"place":1,"state":"ready","reason":""}
-{"version":1,"generation":1,"place":1,"state":"failed","reason":"readiness_deadline"}
+{"version":1,"generation":1,"place":1,"state":"ready","reason":"","cleanup_complete":false}
+{"version":1,"generation":2,"place":1,"state":"removed","reason":"","cleanup_complete":true}
+{"version":1,"generation":2,"place":1,"state":"failed","reason":"directive_refused","cleanup_complete":true}
+{"version":1,"generation":2,"place":1,"state":"failed","reason":"cleanup_failed","cleanup_complete":false}
 ```
 
-No answer means that readiness has not yet been proved. Each added Seat gets
-60 seconds from observing its directive, independent of the Computer's boot
-and other Seats. A ready answer requires a running browser, the 1280×800
-screen and both endpoints' binary `rfb-websocket-v1` greetings. Readiness
-probes that finish at or after the deadline cannot publish ready. A failed or
-exited desktop is cleaned before its failed answer. Cleanup failure never
-claims that the Seat is gone. A removed Seat's answer is removed.
+Readiness requires the browser, a 1280×800 desktop and both endpoints' binary
+`rfb-websocket-v1` greetings before that Seat's own deadline. A readiness probe
+which crosses the deadline cannot publish ready. The helper independently
+checks the endpoints and its own deadline, bound to the exact attempt,
+generation and place. A ready file alone never publishes a Seat.
 
-The helper must bind an answer to the exact attempt, directive generation and
-Seat place, enforce its own deadline, then independently probe both endpoints
-before publishing the Seat. A ready file alone is insufficient. Helper-side
-binding and Seat operations are implemented by their own wave tickets; this
-image ticket does not claim those paths run. The Linux lane supplies the P6
-mount as a validated operator bind through `BuildRuntimeSpec`, without
-changing its output profile.
+Removal keeps a generation-bound `removed` answer instead of deleting proof.
+If the image stops a Seat itself, it writes `failed` and its reason, with
+`cleanup_complete:true` only after cleanup succeeds. If cleanup fails, it
+writes `failed/cleanup_failed`, keeps that place blocked and retries cleanup
+at a bounded cadence. Other Seats keep running. No new desktop starts in a
+blocked place. **Room returns only after positive cleanup evidence** for that
+attempt, directive generation and place; a missing file, a failed cleanup or
+an elapsed deadline is not such evidence (spec 2.8.3).
 
-### Per-Seat desktop, driver and cleanup
+After a valid directive is fully applied without blocked cleanup, the image
+also atomically writes `applied.json`:
 
-Each Seat runs as its own uid/gid, without supplementary groups. It owns an X
-cookie (`.Xauthority`) and display `:<place>`, with X TCP disabled. Its folder
-has mode `0700`. Its home, runtime folder and temp folder are respectively
-`home`, `run`, and `tmp` inside `/wefty/service/seats/<place>`. Browser profiles,
-package caches and `PLAYWRIGHT_BROWSERS_PATH` stay there too. Installs belong
-there on every Computer. System software changes through a new image.
+```json
+{"version":1,"generation":2,"wanted_places":[],"cleanup_complete":true}
+```
 
-The Seat's driver reader reopens its own read-only
-`/wefty/control/seats/<place>/driver.json`. Its version 1 body remains exactly
-`{"version":1,"human_driving":true}` or `false`; missing or invalid data produces
-local false state. Its observed state is written only to that Seat's
-`run/driver-state.json`. There is no shared Computer-wide driver state for
-Seats.
+This proves absence for places omitted by that generation, even if an earlier
+add directive was replaced before the image observed it. It does not say that
+wanted desktops are ready. A stale applied generation never releases Room.
+Helper/L1 binding and Room updates remain with their wave owners.
 
-`seat-endpoints.sh` is the temporary P7 replacement seam. Each Seat has distinct
-view and control WebSocket ports on IPv4 loopback. Both use `/websockify` and
-the `binary` subprotocol. The view backend discards pointer and key input
-server-side; control accepts it. Backend Unix sockets are private files in the
-Seat's runtime folder. **Loopback ports are still reachable from other Seats.**
-This ticket claims display-cookie and file separation only for IM-4; endpoint
-confinement and its final directive fields belong to #1138. The Computer
-isolation boundary remains enforced by the existing Computer runtime profile.
+### Desktop recovery, folders and root path safety
 
-On Seat removal the root supervisor repeatedly kills every process carrying
-its uid, including detached and double-forked children, and waits for the Seat
-launcher. It removes uid-owned shared scratch entries (including X locks and
-sockets), the Seat folder, and its answer. Endpoint processes die with that
-uid. A cleanup that cannot prove process absence fails; it does not silently
-remove the folder and report success. Files under `/wefty/service/shared`
-survive. That directory has mode `1777`. Each new Computer attempt gets fresh
-control and status directories; the supervisor clears stale Seat folders and
-starts no Seat until a fresh directive adds one. Shared files survive restart.
+Each Seat runs under its own uid/gid with no supplementary groups. Its private
+X cookie and display `:<place>` use X TCP disabled. Its mode-`0700` disk folder
+contains `home`, `run`, and `tmp`; browser profiles, package caches and
+`PLAYWRIGHT_BROWSERS_PATH` stay there too. All installs belong there. System
+software changes only through a new image.
 
-### Temp space and install measurement
+The launcher proves that its own Xvfb is alive after the display wait. A browser,
+driver, desktop session or endpoint exit restarts that component and its
+process group without ending the Seat. Three restarts per component within
+60 seconds are allowed; the next failure ends the launcher. A dead display
+ends it immediately. The root supervisor then cleans the Seat and reports
+failure. Restart policy uses an injected clock in unit tests; the Linux lane
+kills a browser and the edge process and checks that the same Seat recovers.
 
-Seat `TMPDIR`, `XDG_RUNTIME_DIR`, npm cache, pip cache and browser cache all use
-the Seat's disk folder. Chromium also uses `--disable-dev-shm-usage`, so its
-large temporary files use that disk temp folder. These paths reserve **zero
-memory-backed temp bytes per Seat**; their disk use is charged to Storage.
+P8 reads the Seat's own read-only
+`/wefty/control/seats/<place>/driver.json`. Its body remains exactly
+`{"version":1,"human_driving":true}` or `false`. Missing or invalid data
+produces local false state in that Seat's `run/driver-state.json`.
 
-The unmodified current Computer profile has shared tmpfs ceilings of 1 GiB
-(`/dev/shm`), 512 MiB (`/tmp`), 64 MiB (`/var/tmp`), 64 MiB (`/run`) and 64 MiB
-(`/dev`): 1728 MiB total, below the Linux lane's 2 GiB memory cap. Ceilings are
-limits, not preallocated RAM. They exceed a 1 GiB single-Seat Computer cap;
-this image moves Seat temp usage to disk but does not change those helper
-profile ceilings. Validation of smaller-cap profile sizing remains separate
-from this two-Seat lane and must not be inferred from it.
+`seat-endpoints.sh` remains the P7 replacement seam for #1138. Distinct IPv4
+loopback view/control ports use `/websockify` and the `binary` subprotocol.
+View discards pointer and key input server-side; control accepts it. The
+backend Unix sockets are private Seat files. **Other Seats can still reach
+these loopback ports.** This ticket claims only display-cookie and file
+separation for IM-4; endpoint confinement remains `NOT-RUN`.
 
-The lane prefetches `playwright@1.56.1` and its Chromium browser into a read-only
-fixture because its Computer has only loopback networking. The Seat copies
-the kit to its own home and launches that browser under the real profile.
-`<arch>-seats-observed.json` records `install_bytes` as the additional apparent
-disk bytes (`du -sb`) of `home/test-kit` (npm package, lockfile and browser
-binaries). It excludes npm download cache and the preinstalled desktop. A
-numeric install measurement is **NOT-RUN until that CI artifact exists**;
-source size or a prototype's memory number is not an install measurement.
+At startup the root supervisor refuses a non-root-owned or group/other-writable
+`/wefty/service`. It `lstat`-checks `seats` and `shared`, refuses links or wrong
+owners, and secures directories through held file descriptors. Every path
+component is opened with `O_NOFOLLOW`; mode and owner changes use `fchmod` and
+`fchown`. Recursive deletion works relative to directory descriptors, unlinks
+links and never follows their targets.
 
-### Acceptance and publication
+Cleanup kills every process carrying the Seat uid, including detached and
+double-forked children. It removes that uid's SysV shared memory, semaphore
+sets and message queues, and POSIX `/dev/mqueue` entries **as the Seat uid**;
+root intentionally has no `CAP_IPC_OWNER`. It then proves process absence
+again, removes uid-owned scratch (including X sockets/locks and POSIX shared
+memory), and deletes the Seat folder. `/wefty/service/shared` is mode `1777`
+and survives. A new attempt has a fresh status tmpfs and control directory;
+startup clears stale Seat folders and starts no Seat without a fresh directive.
 
-`acceptance-image-build / default-computer-seats / linux/amd64` and
-`linux/arm64` run natively and execute
-`TestDefaultComputerSeatsAtProductionTimings` with
-`-tags service_acceptance_realtiming` in `internal/computerconformance`.
-They use the real `ocihelper.BuildRuntimeSpec` and containerd 2.3.7/runc 1.5.1,
-with its read-only root, namespaces, capabilities, seccomp and 2 GiB cgroup cap
-unchanged. They verify `memory.max`, `memory.swap.max`, and `memory.oom.group`.
-They own IM-1, IM-2 and IM-6, plus secondary display/file evidence for IM-4 and
-cleanup/memory/shared-file evidence for IM-5. The missing-passwd negative
-image runs under the same profile. Pure deadline logic uses injected clocks;
-the Linux lane also adds the second Seat more than 60 seconds after startup.
+### Temp space, install measurement and acceptance
 
-This lane is an image harness, not a helper/L1/CLI integration proof. It uses
-a directory for Storage instead of the loop-mounted disk, explicit control and
-answer binds, and loopback only (no NAT/DNS or host bridge). It omits lease,
-renewal and ownership machinery. Those paths remain with their primary wave
-owners. The view-input observation is bounded to two seconds and is followed
-by a successful control-input check using the same input bytes.
+Seat `TMPDIR`, runtime data, npm/pip caches and browser caches use its disk
+folder, reserving zero additional memory-backed temp bytes. Chromium's
+`--disable-dev-shm-usage` also moves large browser temp files there. The shared
+profile ceilings above total **465 MiB at a 1 GiB cap**, with **256 MiB shm**.
+The receipt judges temp ceilings against at most a **1 GiB Computer**, even
+if input evidence claims a larger cap; more than half of that cap cannot PASS.
 
-The checker can re-evaluate the collected observations without a runtime:
+The Linux lane prefetches `playwright@1.56.1` and Chromium into a read-only
+fixture because the test Computer has loopback networking only. Its Seat
+copies the kit into its own home and launches it there. `install_bytes` records
+`du -sb home/test-kit` (package, lockfile and browsers), excluding npm download
+cache and the installed desktop. A numeric install result remains `NOT-RUN`
+until CI produces it. Reclaimed memory requires at least **64 MiB**, sustained
+for three samples; the receipt keeps before/after byte counts and rejects
+ordinary sample noise.
+
+The independent **`computer-seats`** workflow runs
+`default-computer-seats / linux/amd64` and `/ linux/arm64` natively. Relevant
+pull requests trigger it once; main pushes and manual dispatch also run it.
+It is absent from `acceptance-image-build`, `all-tests-pass` and the existing
+realtiming lane's dependencies. On main only, its publisher promotes the
+exact tested archives after rechecking both platform digests and observations.
+Failures repair root-owned evidence permissions before artifact upload.
+
+`TestDefaultComputerSeatsAtProductionTimings` calls the real
+`ocihelper.BuildRuntimeSpec`, uses its returned bytes unchanged, and compares
+them with containerd's stored spec. The **1 GiB** live cgroup must report the
+same `memory.max`, `memory.swap.max=0` and `memory.oom.group=1`. The lane owns
+IM-1, IM-2 and IM-6, plus secondary IM-4 display/file and IM-5 cleanup/memory
+proof. It also checks IPC removal, X socket/lock absence, component recovery,
+and the missing-passwd negative image under that same profile.
+
+This is image evidence, not helper/L1/CLI integration. Storage is a directory
+instead of a loop-mounted disk; control is an explicit read-only bind and
+networking is loopback only. Lease, renewal, ownership, NAT/DNS and the host
+bridge remain with their primary owners. The view-input observation lasts
+two seconds and is followed by control input using the same bytes.
 
 ```sh
 wefty-computer-conformance --seat-evidence amd64-seats-observed.json --receipt seats.json
 ```
 
-It emits a separate version 1 Seat report. Absent observations stay `NOT-RUN`,
-false observations fail, and the P7 endpoint-confinement cell always remains
-`NOT-RUN`. Overall Seat-image PASS covers only this ticket's listed cells.
-This mode evaluates supplied evidence; it does not itself launch the image.
-
-`acceptance-image` runs the same two native jobs on main. Its
-`publish-default-computer-index-and-archive` job revalidates both observations,
-checks the tested archive digests, promotes those bytes without rebuilding,
-and publishes `ghcr.io/derek-x-wang/wefty-computer-default`. The release artifact
-`wefty-computer-default-<commit>` contains the digest-pinned index reference,
+This mode evaluates supplied runtime observations; it does not launch the
+image. Missing proof stays `NOT-RUN`, false proof fails, and P7 always stays
+`NOT-RUN`. The main-only publisher emits
+`ghcr.io/derek-x-wang/wefty-computer-default` and the artifact
+`wefty-computer-default-<commit>` with the digest-pinned index reference,
 verified multi-platform OCI archive and both Seat reports. Anonymous manifest
-retrieval must succeed. No publication or runtime acceptance is implied by
-local Go tests or Python syntax checks.
+retrieval must succeed. Local checks do not imply image or publication PASS.

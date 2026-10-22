@@ -38,13 +38,15 @@ func CheckSeatUsers(passwd []byte) error {
 // separate from the single-desktop Docker approximation's v2 receipt.
 // Missing observations stay NOT-RUN; endpoint confinement belongs to P7.
 type SeatEvidence struct {
-	Version           int             `json:"version"`
-	Image             string          `json:"image"`
-	Platform          string          `json:"platform"`
-	Observations      map[string]bool `json:"observations"`
-	InstallBytes      int64           `json:"install_bytes"`
-	MemoryLimitBytes  int64           `json:"memory_limit_bytes"`
-	TmpfsCeilingBytes int64           `json:"tmpfs_ceiling_bytes"`
+	Version                  int             `json:"version"`
+	Image                    string          `json:"image"`
+	Platform                 string          `json:"platform"`
+	Observations             map[string]bool `json:"observations"`
+	MemoryBeforeRemovalBytes int64           `json:"memory_before_removal_bytes"`
+	MemoryAfterRemovalBytes  int64           `json:"memory_after_removal_bytes"`
+	InstallBytes             int64           `json:"install_bytes"`
+	MemoryLimitBytes         int64           `json:"memory_limit_bytes"`
+	TmpfsCeilingBytes        int64           `json:"tmpfs_ceiling_bytes"`
 }
 
 type SeatReport struct {
@@ -87,12 +89,22 @@ func CheckSeats(e SeatEvidence) SeatReport {
 				check.Detail += name + " failed; "
 			}
 		}
+		if row.id == "IM-5" && e.Observations["memory_returns"] {
+			if e.MemoryBeforeRemovalBytes <= 0 || e.MemoryAfterRemovalBytes <= 0 {
+				if check.Status != StatusFail {
+					check.Status = StatusNotRun
+				}
+			} else if !MemoryReclaimed(e.MemoryBeforeRemovalBytes, e.MemoryAfterRemovalBytes) {
+				check.Status = StatusFail
+				check.Detail += "memory drop is below 64 MiB"
+			}
+		}
 		r.Checks = append(r.Checks, check)
 	}
 	measurements := Check{ID: "seats.measurements", Scope: ScopeImage, Status: StatusNotRun, Summary: "disk install and bounded memory-backed temp space"}
 	if e.InstallBytes > 0 && e.MemoryLimitBytes > 0 && e.TmpfsCeilingBytes > 0 {
 		measurements.Status = StatusPass
-		if e.TmpfsCeilingBytes >= e.MemoryLimitBytes {
+		if e.TmpfsCeilingBytes > min(e.MemoryLimitBytes, int64(1<<30))/2 {
 			measurements.Status = StatusFail
 		}
 	}
@@ -112,4 +124,9 @@ func CheckSeats(e SeatEvidence) SeatReport {
 	r.Checks = append(r.Checks, Check{ID: "IM-4.endpoints", Scope: ScopeImage, Status: StatusNotRun,
 		Summary: "per-Seat endpoint confinement", Detail: "P7 belongs to #1138; loopback is shared"})
 	return r
+}
+
+// MemoryReclaimed requires a meaningful drop, beyond ordinary sample noise.
+func MemoryReclaimed(before, after int64) bool {
+	return before > 0 && after > 0 && before-after >= 64<<20
 }

@@ -65,7 +65,7 @@ USER root
 # Playwright 1.56.1: Debian 12 tools/chromium/firefox/webkit nativeDeps.js union.
 RUN apt-get -o Acquire::Check-Valid-Until=false update \
     && apt-get install --yes --no-install-recommends \
-        git curl ca-certificates nodejs npm xauth util-linux procps \
+        git curl ca-certificates xz-utils xauth util-linux procps \
         fonts-freefont-ttf fonts-ipafont-gothic fonts-liberation fonts-noto-color-emoji fonts-tlwg-loma-otf fonts-unifont \
         fonts-wqy-zenhei gstreamer1.0-libav gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good libasound2 \
         libatk-bridge2.0-0 libatk1.0-0 libatomic1 libatspi2.0-0 libavif15 libcairo-gobject2 \
@@ -86,10 +86,24 @@ RUN apt-get -o Acquire::Check-Valid-Until=false update \
          groupadd --gid $((2000+n)) seat$n; \
          useradd --no-log-init --uid $((2000+n)) --gid $((2000+n)) \
            --home-dir /wefty/service/seats/$n/home --shell /bin/sh --no-create-home seat$n; \
-         chage --lastday 0 seat$n; \
+         chage --lastday 20000 seat$n; \
        done \
     && rm -f /etc/passwd- /etc/group- /etc/shadow- /etc/gshadow- \
     && mkdir -p /opt/wefty-computer /wefty/seat-status
+# Official Node.js LTS archives; checksums pinned from v24.22.1/SHASUMS256.txt.
+ARG TARGETARCH
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) node_arch=x64; node_sha=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6 ;; \
+      arm64) node_arch=arm64; node_sha=dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e ;; \
+      *) exit 1 ;; \
+    esac; \
+    curl -fLsS --retry 5 "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-$node_arch.tar.xz" -o /tmp/node.tar.xz; \
+    printf '%s  %s\n' "$node_sha" /tmp/node.tar.xz | sha256sum --check; \
+    tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1; \
+    rm /tmp/node.tar.xz
+COPY --chmod=0755 examples/computer/seat-session.py /usr/local/libexec/wefty-seat-session
+COPY --chmod=0755 examples/computer/seat-clean-ipc.py /usr/local/libexec/wefty-seat-clean-ipc
 COPY --chmod=0755 examples/computer/seat-supervisor.py /usr/local/bin/wefty-seat-supervisor
 COPY --chmod=0755 examples/computer/seat-run.sh /usr/local/libexec/wefty-seat-run
 COPY --chmod=0755 examples/computer/seat-endpoints.sh /usr/local/libexec/wefty-seat-endpoints

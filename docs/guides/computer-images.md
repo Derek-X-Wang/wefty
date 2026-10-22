@@ -29,7 +29,7 @@ docker buildx inspect --bootstrap
 
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
-  --file examples/computer/Dockerfile \
+  --file examples/computer/Dockerfile --target single-seat \
   --provenance=false --sbom=false \
   --output type=oci,dest=wefty-computer.oci.tar,rewrite-timestamp=true .
 

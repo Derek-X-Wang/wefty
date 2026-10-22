@@ -50,7 +50,7 @@ func TestSeatEvidenceDetectsViewInputAndStaleRestartSeats(t *testing.T) {
 		"restart_answers_absent": true, "passwd_entries": true, "missing_passwd_refused": true,
 		"driver_per_seat": true, "deadline_per_seat": true, "tools_present": true,
 		"readonly_root": true, "profile_unmodified": true,
-	}, InstallBytes: 1, MemoryLimitBytes: 2 << 30, TmpfsCeilingBytes: 1728 << 20}
+	}, InstallBytes: 1, MemoryLimitBytes: 1 << 30, TmpfsCeilingBytes: 465 << 20, MemoryBeforeRemovalBytes: 512 << 20, MemoryAfterRemovalBytes: 256 << 20}
 	if r := CheckSeats(evidence); r.Status != StatusPass {
 		t.Fatalf("complete evidence: %+v", r)
 	}
@@ -76,4 +76,25 @@ func TestSeatEvidenceRejectsTempCeilingsAboveOneSeatRoom(t *testing.T) {
 		}
 	}
 	t.Fatal("missing temp-space evidence cell")
+}
+
+func TestSeatTempEvidenceCannotHideOneGiBLimitByClaimingLargerComputer(t *testing.T) {
+	evidence := SeatEvidence{Version: 1, Image: "example.invalid/image", InstallBytes: 1, MemoryLimitBytes: 2 << 30, TmpfsCeilingBytes: 768 << 20}
+	for _, check := range CheckSeats(evidence).Checks {
+		if check.ID == "seats.measurements" && check.Status != StatusFail {
+			t.Fatalf("oversized one-Seat temp space accepted: %+v", check)
+		}
+	}
+}
+
+func TestSeatMemoryReturnsRejectsNoise(t *testing.T) {
+	if MemoryReclaimed(300<<20, 299<<20) {
+		t.Fatal("one MiB of sampling noise claimed memory returns")
+	}
+	if !MemoryReclaimed(300<<20, 200<<20) {
+		t.Fatal("substantial Seat memory drop rejected")
+	}
+	if MemoryReclaimed(100<<20, 200<<20) {
+		t.Fatal("memory growth claimed reclamation")
+	}
 }

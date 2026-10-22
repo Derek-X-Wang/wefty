@@ -1,0 +1,252 @@
+name: computer-seats
+
+# Independent image evidence. This is not an all-tests-pass dependency.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - examples/computer/**
+      - internal/computerconformance/**
+      - cmd/wefty-computer-conformance/**
+      - runner/ocihelper/profile.go
+      - runner/ocihelper/profile*_test.go
+      - runner/ocihelper/testdata/containerd-v2.3.7/wefty-v1-computer-linux-amd64.json
+      - docs/contracts/computer-image.md
+      - docs/guides/computer-images.md
+      - scripts/computer_seats_contract_test.go
+      - .github/workflows/computer-seats.yml
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: computer-seats-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  default-computer-seats:
+    name: default-computer-seats / linux/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 35
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports: [5000:5000]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+        with:
+          version: v0.36.1
+          driver-opts: |
+            image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
+            network=host
+      - name: Build digest-identical default Seat image archives
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/default-computer"
+          mkdir -p "$evidence"
+          reference="localhost:5000/wefty-computer-default:${CANDIDATE_SHA}-${ARCH}"
+          docker buildx build --no-cache --platform "linux/$ARCH" --provenance=false --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
+            --output "type=oci,dest=$evidence/$ARCH.oci.tar,rewrite-timestamp=true" .
+          docker buildx build --no-cache --platform "linux/$ARCH" --provenance=false --sbom=false \
+            --build-arg SOURCE_DATE_EPOCH=0 --file examples/computer/Dockerfile \
+            --output "type=registry,registry.insecure=true,name=$reference,rewrite-timestamp=true" .
+          scripts/verify-acceptance-image.sh --archive "$evidence/$ARCH.oci.tar" \
+            --expected-platform "linux/$ARCH" --platform-digest-output "$evidence/$ARCH.digest" \
+            --receipt-output "$evidence/$ARCH-oci.json"
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
+          crane="$(go env GOPATH)/bin/crane"
+          digest="$(cat "$evidence/$ARCH.digest")"
+          test "$("$crane" digest --insecure "$reference")" = "$digest"
+          pinned="$reference@$digest"
+          printf 'WEFTY_SEAT_IMAGE=%s\n' "$pinned" >> "$GITHUB_ENV"
+          docker pull "$pinned"
+          docker build --build-arg BASE_IMAGE="$pinned" \
+            --file examples/computer/fixtures/Dockerfile.missing-seat-passwd --tag wefty-seat-negative:ci .
+          docker save wefty-seat-negative:ci -o "$RUNNER_TEMP/seat-negative.tar"
+      - name: Prepare an offline browser test kit for the Seat install measurement
+        run: |
+          set -euo pipefail
+          kit="$RUNNER_TEMP/seat-install-kit"
+          mkdir -p "$kit"
+          chmod 0755 "$kit"
+          docker run --rm --user "$(id -u):$(id -g)" --entrypoint /bin/sh \
+            --env HOME=/kit --env npm_config_cache=/tmp/npm-cache \
+            --mount "type=bind,src=$kit,dst=/kit" "$WEFTY_SEAT_IMAGE" -ec '
+              cd /kit
+              npm install --ignore-scripts --no-audit --no-fund --save-exact playwright@1.56.1
+              PLAYWRIGHT_BROWSERS_PATH=/kit/browsers ./node_modules/.bin/playwright install chromium
+            '
+      - name: Prepare the pinned Linux real-time runtime
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          source scripts/oci-tested-versions.env
+          containerd_version="$(printf '%s' "$WEFTY_OCI_TESTED_VERSIONS" | sed -n 's/.*containerd=\([^ ]*\).*/\1/p')"
+          runc_version="$(printf '%s' "$WEFTY_OCI_TESTED_VERSIONS" | sed -n 's/.*runc=\([^ ]*\).*/\1/p')"
+          cd "$RUNNER_TEMP"
+          curl -fLsS --retry 5 -o containerd.tar.gz "https://github.com/containerd/containerd/releases/download/v$containerd_version/containerd-$containerd_version-linux-$ARCH.tar.gz"
+          curl -fLsS --retry 5 -o containerd.sha256 "https://github.com/containerd/containerd/releases/download/v$containerd_version/containerd-$containerd_version-linux-$ARCH.tar.gz.sha256sum"
+          sed -i "s/containerd-$containerd_version-linux-$ARCH.tar.gz/containerd.tar.gz/" containerd.sha256
+          sha256sum --check containerd.sha256
+          sudo tar -xzf containerd.tar.gz -C /usr/local
+          curl -fLsS --retry 5 -o "runc.$ARCH" "https://github.com/opencontainers/runc/releases/download/v$runc_version/runc.$ARCH"
+          curl -fLsS --retry 5 -o runc.sha256 "https://github.com/opencontainers/runc/releases/download/v$runc_version/runc.sha256sum"
+          grep " runc.$ARCH$" runc.sha256 | sha256sum --check
+          sudo install -m0755 "runc.$ARCH" /usr/local/sbin/runc
+          sudo modprobe overlay
+          sudo systemd-run --unit=wefty-seat-containerd --property=KillMode=control-group \
+            /usr/local/bin/containerd --address /run/wefty-seat-containerd.sock \
+            --root /var/lib/wefty-seat-containerd --state /run/wefty-seat-containerd
+          for _ in $(seq 1 60); do
+            if sudo /usr/local/bin/ctr --address /run/wefty-seat-containerd.sock version; then break; fi
+            sleep 1
+          done
+          sudo /usr/local/bin/ctr --address /run/wefty-seat-containerd.sock --namespace wefty images pull --plain-http "$WEFTY_SEAT_IMAGE"
+          sudo /usr/local/bin/ctr --address /run/wefty-seat-containerd.sock --namespace wefty images import "$RUNNER_TEMP/seat-negative.tar"
+      - name: Prove IM-1 IM-2 IM-6 with BuildRuntimeSpec and collect secondary evidence
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/default-computer"
+          python3 -m unittest discover -s examples/computer -p 'test_*.py'
+          GOFLAGS=-p=1 GOMAXPROCS=2 go test -c -tags service_acceptance_realtiming \
+            -o "$RUNNER_TEMP/seat-conformance.test" ./internal/computerconformance
+          (
+            cd internal/computerconformance
+            sudo env PATH="/usr/local/bin:/usr/local/sbin:$PATH" \
+              WEFTY_SEAT_IMAGE="$WEFTY_SEAT_IMAGE" \
+              WEFTY_SEAT_NEGATIVE_IMAGE=docker.io/library/wefty-seat-negative:ci \
+              WEFTY_SEAT_CONTAINERD=/run/wefty-seat-containerd.sock \
+              WEFTY_SEAT_INSTALL_KIT="$RUNNER_TEMP/seat-install-kit" \
+              WEFTY_SEAT_EVIDENCE="$evidence/$ARCH-seats-observed.json" \
+              WEFTY_SEAT_PROFILE_RECEIPT="$evidence/$ARCH-profile.json" \
+              "$RUNNER_TEMP/seat-conformance.test" -test.v \
+              -test.run '^TestDefaultComputerSeatsAtProductionTimings$' -test.timeout 10m
+          )
+          sudo chown -R "$(id -u):$(id -g)" "$evidence"
+          go run ./cmd/wefty-computer-conformance --seat-evidence "$evidence/$ARCH-seats-observed.json" \
+            --receipt "$evidence/$ARCH-seats.json"
+      - name: Make Seat evidence readable after every outcome
+        if: always()
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/default-computer"
+          if [[ -d "$evidence" ]]; then
+            sudo chown -R "$(id -u):$(id -g)" "$evidence"
+            sudo chmod -R u+rwX,go+rX "$evidence"
+          fi
+      - name: Upload default Computer image and real-profile receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: wefty-computer-default-platform-${{ matrix.arch }}-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/default-computer
+          if-no-files-found: error
+      - name: Stop the CI-owned runtime
+        if: always()
+        run: sudo systemctl stop wefty-seat-containerd.service
+
+  publish-default-computer:
+    name: publish-default-computer-index-and-archive
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [default-computer-seats]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      DEFAULT_COMPUTER_IMAGE: ghcr.io/derek-x-wang/wefty-computer-default
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: wefty-computer-default-platform-*-${{ github.sha }}
+          path: ${{ runner.temp }}/default-platforms
+          merge-multiple: true
+      - name: Revalidate both real-profile Seat receipts before publication
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            evidence="$RUNNER_TEMP/default-platforms"
+            digest="$(cat "$evidence/$arch.digest")"
+            jq -e --arg digest "$digest" --arg platform "linux/$arch" \
+              '.platform == $platform and (.image | endswith("@" + $digest))' "$evidence/$arch-seats-observed.json"
+            go run ./cmd/wefty-computer-conformance --seat-evidence "$evidence/$arch-seats-observed.json" \
+              --receipt "$evidence/$arch-seats.json"
+            scripts/verify-acceptance-image.sh --archive "$evidence/$arch.oci.tar" \
+              --expected-platform "linux/$arch" --expected-platform-digest "linux/$arch=$digest" \
+              --receipt-output "$evidence/$arch-oci.json"
+          done
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Promote the tested default Computer archives and pin the index
+        run: |
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
+          crane="$(go env GOPATH)/bin/crane"
+          for arch in amd64 arm64; do
+            layout="$RUNNER_TEMP/default-$arch.oci"
+            mkdir -p "$layout"
+            tar -xf "$RUNNER_TEMP/default-platforms/$arch.oci.tar" -C "$layout"
+            "$crane" push "$layout" "$DEFAULT_COMPUTER_IMAGE:${GITHUB_SHA}-$arch"
+            test "$("$crane" digest "$DEFAULT_COMPUTER_IMAGE:${GITHUB_SHA}-$arch")" = "$(cat "$RUNNER_TEMP/default-platforms/$arch.digest")"
+          done
+          "$crane" index append \
+            -m "$DEFAULT_COMPUTER_IMAGE@$(cat "$RUNNER_TEMP/default-platforms/amd64.digest")" \
+            -m "$DEFAULT_COMPUTER_IMAGE@$(cat "$RUNNER_TEMP/default-platforms/arm64.digest")" \
+            -t "$DEFAULT_COMPUTER_IMAGE:$GITHUB_SHA"
+          digest="$("$crane" digest "$DEFAULT_COMPUTER_IMAGE:$GITHUB_SHA")"
+          release="$RUNNER_TEMP/default-computer-release"
+          mkdir -p "$release"
+          printf '%s@%s\n' "$DEFAULT_COMPUTER_IMAGE" "$digest" > "$release/default-computer-reference.txt"
+          "$crane" manifest "$DEFAULT_COMPUTER_IMAGE@$digest" > "$release/index.json"
+          for arch in amd64 arm64; do
+            jq -e --arg arch "$arch" --arg digest "$(cat "$RUNNER_TEMP/default-platforms/$arch.digest")" \
+              '([.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch and .digest == $digest)] | length) == 1' "$release/index.json"
+            cp "$RUNNER_TEMP/default-platforms/$arch-seats.json" "$release/"
+          done
+          "$crane" pull "$DEFAULT_COMPUTER_IMAGE@$digest" "$RUNNER_TEMP/default.oci" --format=oci --annotate-ref
+          tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$RUNNER_TEMP/default.oci" -cf "$release/default-computer.oci.tar" .
+          scripts/verify-acceptance-image.sh --archive "$release/default-computer.oci.tar" --expected-top-digest "$digest" \
+            --expected-platform linux/amd64 --expected-platform linux/arm64 \
+            --expected-platform-digest "linux/amd64=$(cat "$RUNNER_TEMP/default-platforms/amd64.digest")" \
+            --expected-platform-digest "linux/arm64=$(cat "$RUNNER_TEMP/default-platforms/arm64.digest")" \
+            --receipt-output "$release/archive.json"
+          mkdir -p "$RUNNER_TEMP/anonymous-default-docker"
+          DOCKER_CONFIG="$RUNNER_TEMP/anonymous-default-docker" "$crane" manifest "$DEFAULT_COMPUTER_IMAGE@$digest" >/dev/null
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: wefty-computer-default-${{ github.sha }}
+          path: ${{ runner.temp }}/default-computer-release
+          if-no-files-found: error

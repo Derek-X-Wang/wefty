@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -409,7 +410,7 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 	if spec.Root == nil || !spec.Root.Readonly {
 		t.Fatalf("Computer root = %#v, want read-only", spec.Root)
 	}
-	writable := map[string]string{"/wefty/service": "", "/dev/shm": "size=1048576k", "/tmp": "size=524288k", "/var/tmp": "size=65536k"}
+	writable := map[string]string{"/wefty/service": "", "/dev/shm": "size=131072k", "/tmp": "size=65536k", "/var/tmp": "size=8192k", "/wefty/seat-status": "size=1024k"}
 	bounded := map[string]bool{}
 	controlReadOnly := false
 	identityMounts := map[string]string{
@@ -472,13 +473,13 @@ func TestComputerDiskMakesRootReadOnlyAndBoundsWritableScratch(t *testing.T) {
 func TestComputerProfileReceiptExposesTmpfsCeilingsWithoutAdmissionRejection(t *testing.T) {
 	workload := WorkloadInput{Computer: true, Limits: WorkloadLimits{MemoryBytes: 512 << 20}}
 	receipt := profileReceipt(workload)
-	if receipt.ComputerTmpfsCeilingBytes != 1600<<20 || receipt.LargestTmpfsTarget != "/dev/shm" || receipt.LargestTmpfsCeilingBytes != 1<<30 {
+	if receipt.ComputerTmpfsCeilingBytes != 233<<20 || receipt.LargestTmpfsTarget != "/dev/shm" || receipt.LargestTmpfsCeilingBytes != 128<<20 {
 		t.Fatalf("Computer profile receipt = %+v", receipt)
 	}
 	if receipt.NetworkNamespacePresent || receipt.HelperNetworkNamespaceInode != "" || receipt.TaskNetworkNamespaceInode != "" || receipt.HostAbstractSocketVisible {
 		t.Fatalf("serialized profile inferred runtime isolation facts: %+v", receipt)
 	}
-	if len(receipt.Warnings) != 2 || receipt.Warnings[0].Code != ProfileWarningTmpfsCeilingExceedsMemory || receipt.Warnings[1].Code != ProfileWarningTmpfsCombinedExceedsMemory {
+	if len(receipt.Warnings) != 0 {
 		t.Fatalf("typed profile warnings = %+v", receipt.Warnings)
 	}
 	ordinary := profileReceipt(WorkloadInput{Limits: WorkloadLimits{MemoryBytes: 64 << 20}})
@@ -1232,4 +1233,82 @@ func assertExactMount(t *testing.T, mounts []specs.Mount, expected specs.Mount) 
 		}
 	}
 	t.Fatalf("mount %q is absent", expected.Destination)
+}
+
+func TestComputerScratchAndSeatStatusStayWithinHalfMemory(t *testing.T) {
+	for _, limit := range []int64{64 << 20, 256 << 20, 512 << 20, 1 << 30, 2 << 30, 4 << 30} {
+		input := goldenRuntimeSpecInput(t, "amd64")
+		for _, c := range runtimeSpecGoldenCases() {
+			if c.computer {
+				c.configure(&input)
+				break
+			}
+		}
+		input.Workload.Limits.MemoryBytes = limit
+		spec, err := buildRuntimeSpec(context.Background(), input, goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var total, shm int64
+		status := false
+		for _, m := range spec.Mounts {
+			if m.Type != "tmpfs" {
+				continue
+			}
+			var size int64
+			for _, o := range m.Options {
+				if strings.HasPrefix(o, "size=") {
+					n, err := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(o, "size="), "k"), 10, 64)
+					if err != nil {
+						t.Fatal(err)
+					}
+					size = n * 1024
+				}
+			}
+			if size <= 0 {
+				t.Fatalf("unbounded tmpfs: %+v", m)
+			}
+			total += size
+			if m.Destination == "/dev/shm" {
+				shm = size
+			}
+			if m.Destination == "/wefty/seat-status" {
+				status = size == 1<<20 && slices.Contains(m.Options, "mode=0700") && slices.Contains(m.Options, "nosuid") && slices.Contains(m.Options, "nodev") && slices.Contains(m.Options, "noexec")
+			}
+		}
+		if !status {
+			t.Fatal("missing helper-owned bounded P6 tmpfs")
+		}
+		if total > limit/2 {
+			t.Fatalf("memory=%d tmpfs=%d exceeds half the Computer cap", limit, total)
+		}
+		if limit == 1<<30 && shm != 256<<20 {
+			t.Fatalf("1 GiB Computer shm=%d, want browser-sized 256 MiB", shm)
+		}
+		receipt := profileReceipt(input.Workload)
+		if receipt.ComputerTmpfsCeilingBytes != total {
+			t.Fatalf("receipt=%d actual=%d", receipt.ComputerTmpfsCeilingBytes, total)
+		}
+	}
+}
+
+func TestComputerStatusCannotBeShadowedByOperatorMount(t *testing.T) {
+	input := goldenRuntimeSpecInput(t, "amd64")
+	for _, c := range runtimeSpecGoldenCases() {
+		if c.computer {
+			c.configure(&input)
+			break
+		}
+	}
+	for _, target := range []string{"/wefty/seat-status", "/wefty/seat-status/1.json"} {
+		input.Workload.OperatorMounts = []OperatorMount{{NodePath: "/host/status", ContainerPath: target, ReadOnly: true}}
+		input.OperatorMountSources = []string{"/mnt/wefty/operator/status"}
+		if _, err := buildRuntimeSpec(context.Background(), input, goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json"))); err == nil {
+			t.Fatalf("status mount shadow accepted: %s", target)
+		}
+	}
+	input.Workload.OperatorMounts = []OperatorMount{{NodePath: "/host/status", ContainerPath: "/data"}}
+	if _, err := buildRuntimeSpec(context.Background(), input, goldenDependencies(t, filepath.Join("testdata", "containerd-v2.3.7", "seccomp-linux-amd64.json"))); err == nil || !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("writable operator mount accepted: %v", err)
+	}
 }

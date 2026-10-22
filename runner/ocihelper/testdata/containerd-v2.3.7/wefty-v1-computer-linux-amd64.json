@@ -751,7 +751,7 @@
         "nosuid",
         "strictatime",
         "mode=755",
-        "size=65536k"
+        "size=16384k"
       ],
       "source": "tmpfs",
       "type": "tmpfs"
@@ -776,7 +776,7 @@
         "noexec",
         "nodev",
         "mode=1777",
-        "size=1048576k"
+        "size=131072k"
       ],
       "source": "shm",
       "type": "tmpfs"
@@ -820,7 +820,7 @@
         "nosuid",
         "strictatime",
         "mode=755",
-        "size=65536k"
+        "size=16384k"
       ],
       "source": "tmpfs",
       "type": "tmpfs"
@@ -865,12 +865,24 @@
       "type": "bind"
     },
     {
+      "destination": "/wefty/seat-status",
+      "options": [
+        "nosuid",
+        "nodev",
+        "noexec",
+        "mode=0700",
+        "size=1024k"
+      ],
+      "source": "tmpfs",
+      "type": "tmpfs"
+    },
+    {
       "destination": "/tmp",
       "options": [
         "nosuid",
         "nodev",
         "mode=1777",
-        "size=524288k"
+        "size=65536k"
       ],
       "source": "tmpfs",
       "type": "tmpfs"
@@ -881,7 +893,7 @@
         "nosuid",
         "nodev",
         "mode=1777",
-        "size=65536k"
+        "size=8192k"
       ],
       "source": "tmpfs",
       "type": "tmpfs"

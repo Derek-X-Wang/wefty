@@ -110,7 +110,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 	if waylandPublish.Permissions["packages"] != "write" || !strings.Contains(waylandPublish.If, "github.event_name == 'push'") || !strings.Contains(waylandPublish.If, "refs/heads/main") {
 		t.Fatalf("Wayland Computer publisher permissions/guard = %+v if=%q", waylandPublish.Permissions, waylandPublish.If)
 	}
-	for name, job := range map[string]workflowJob{"publish": publish, "publish-reference-computer": computerPublish, "publish-wayland-reference-computer": waylandPublish, "publish-default-computer": image.Jobs["publish-default-computer"]} {
+	for name, job := range map[string]workflowJob{"publish": publish, "publish-reference-computer": computerPublish, "publish-wayland-reference-computer": waylandPublish} {
 		text := marshalJob(t, job)
 		for _, required := range []string{"crane\" push", "crane\" index append", ".oci.tar"} {
 			if !strings.Contains(text, required) {
@@ -122,7 +122,7 @@ func TestAcceptanceImageWorkflowContract(t *testing.T) {
 		}
 	}
 	for name, job := range image.Jobs {
-		if name != "publish" && name != "publish-reference-computer" && name != "publish-wayland-reference-computer" && name != "publish-default-computer" && job.Permissions["packages"] != "" {
+		if name != "publish" && name != "publish-reference-computer" && name != "publish-wayland-reference-computer" && job.Permissions["packages"] != "" {
 			t.Fatalf("PR-callable job %s grants package permissions", name)
 		}
 	}

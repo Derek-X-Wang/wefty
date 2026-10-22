@@ -17,9 +17,9 @@ class Backend:
         self.stopped = []
 
     def start(self, seat):
-        if seat["id"] == 4:
+        if seat["place"] == 4:
             raise supervisor.SeatFailure("passwd_entry_missing")
-        self.live.add(seat["id"])
+        self.live.add(seat["place"])
 
     def stop(self, place):
         self.stopped.append(place)
@@ -29,12 +29,12 @@ class Backend:
         return place in self.live
 
     def is_ready(self, seat):
-        return seat["id"] in self.ready
+        return seat["place"] in self.ready
 
 
 def directive(generation, *places):
     return {"version": 1, "generation": generation, "seats": [
-        {"id": n, "user": "seat%d" % n, "view_port": 7100 + n * 2,
+        {"place": n, "user": "seat%d" % n, "view_port": 7100 + n * 2,
          "control_port": 7101 + n * 2} for n in places]}
 
 
@@ -44,11 +44,11 @@ class SupervisorTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.clock = 0
         self.backend = Backend()
-        self.engine = supervisor.Supervisor(Path(self.tmp.name), self.backend,
+        self.engine = supervisor.Supervisor(Path(self.tmp.name).resolve(), self.backend,
                                              clock=lambda: self.clock)
 
     def answer(self, place):
-        return json.loads((Path(self.tmp.name) / (str(place) + ".json")).read_text())
+        return json.loads((Path(self.tmp.name).resolve() / (str(place) + ".json")).read_text())
 
     def test_new_seat_has_its_own_deadline_and_late_ready_is_cleaned(self):
         self.engine.apply(directive(1, 1))
@@ -91,7 +91,9 @@ class SupervisorTest(unittest.TestCase):
         self.engine.tick()
         self.engine.apply(directive(2, 1))
         self.assertEqual(self.backend.stopped, [2])
-        self.assertFalse((Path(self.tmp.name) / "2.json").exists())
+        self.assertEqual(self.answer(2)["state"], "removed")
+        self.assertEqual(self.answer(2)["generation"], 2)
+        self.assertTrue(self.answer(2)["cleanup_complete"])
         self.assertIn(1, self.backend.live)
 
     def test_dead_desktop_is_cleaned_and_failed(self):
@@ -115,6 +117,116 @@ class SupervisorTest(unittest.TestCase):
         with self.assertRaises(supervisor.SeatFailure):
             self.engine.apply(directive(2, 1))
         self.assertFalse(self.backend.live)
+
+    def test_empty_directive_has_positive_generation_ack_even_if_add_was_not_seen(self):
+        self.engine.apply(directive(2))
+        answer = json.loads((Path(self.tmp.name).resolve() / 'applied.json').read_text())
+        self.assertEqual(answer['generation'], 2)
+        self.assertEqual(answer['wanted_places'], [])
+        self.assertTrue(answer['cleanup_complete'])
+
+    def test_starting_seat_keeps_its_deadline_when_another_is_added(self):
+        self.engine.apply(directive(1, 1))
+        self.clock = 50
+        self.engine.apply(directive(2, 1, 2))
+        self.clock = 60
+        self.engine.tick()
+        self.assertEqual(self.answer(1)["reason"], "readiness_deadline")
+        self.assertIn(2, self.backend.live)
+
+    def test_refusal_publishes_positive_cleanup_proof(self):
+        self.engine.apply(directive(1, 1))
+        with self.assertRaises(supervisor.SeatFailure):
+            self.engine.apply({"version": 9, "generation": 2, "seats": []})
+        self.assertEqual(self.answer(1)["state"], "failed")
+        self.assertEqual(self.answer(1)["reason"], "directive_refused")
+        self.assertTrue(self.answer(1)["cleanup_complete"])
+        self.assertEqual(self.answer(1)["generation"], 2)
+
+    def test_cleanup_failure_blocks_only_that_place_and_keeps_other_seat_live(self):
+        self.engine.apply(directive(1, 1, 2))
+        original = self.backend.stop
+        def fail(place):
+            if place == 1:
+                raise supervisor.SeatFailure("cannot_stop")
+            original(place)
+        self.backend.stop = fail
+        self.engine.apply(directive(2, 2))
+        self.engine.tick()
+        self.assertEqual(self.answer(1)["reason"], "cleanup_failed")
+        self.assertFalse(self.answer(1)["cleanup_complete"])
+        self.assertIn(2, self.backend.live)
+        self.engine.apply(directive(3, 1, 2))
+        self.assertIn(1, self.engine.blocked)
+        self.backend.stop = original
+        self.clock = 10
+        self.engine.tick()
+        self.assertTrue(self.answer(1)["cleanup_complete"])
+        applied = json.loads((Path(self.tmp.name).resolve() / 'applied.json').read_text())
+        self.assertEqual(applied['generation'], 3)
+
+    def test_main_loop_logs_one_refusal_and_retries_after_a_read_error(self):
+        control = Path(self.tmp.name).resolve() / "seats.json"
+        control.write_text('{"version":9,"generation":2,"seats":[]}')
+        self.engine.apply(directive(1, 1))
+        turns, logs = [], []
+        def sleep(_delay):
+            turns.append(1)
+            if len(turns) == 2:
+                control.unlink()
+            elif len(turns) == 3:
+                control.write_text(json.dumps(directive(3, 2)))
+        supervisor.run_loop(self.engine, control, lambda: len(turns) == 5,
+                            sleep=sleep, log=logs.append)
+        self.assertEqual(sum('refused' in line for line in logs), 1)
+        self.assertIn(2, self.backend.live)
+
+
+class StorageSafetyTest(unittest.TestCase):
+    def test_writable_service_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            service = Path(d).resolve() / "service"
+            service.mkdir(mode=0o777)
+            service.chmod(0o777)
+            with self.assertRaisesRegex(supervisor.SeatFailure, "unsafe_service"):
+                supervisor.prepare_storage(service, owner=__import__('os').geteuid())
+
+    def test_storage_symlinks_never_change_their_target(self):
+        for name in ("seats", "shared"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as d:
+                root = Path(d).resolve()
+                service = root / "service"
+                service.mkdir()
+                outside = root / "outside"
+                outside.mkdir(mode=0o700)
+                (outside / "keep").write_text("safe")
+                (service / name).symlink_to(outside, target_is_directory=True)
+                with self.assertRaises(supervisor.SeatFailure):
+                    supervisor.prepare_storage(service, owner=__import__('os').geteuid())
+                self.assertEqual((outside / "keep").read_text(), "safe")
+                self.assertEqual(outside.stat().st_mode & 0o777, 0o700)
+
+    def test_recursive_delete_unlinks_links_and_keeps_outside_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            service = root / "service"
+            service.mkdir()
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "keep").write_text("safe")
+            storage = supervisor.prepare_storage(service, owner=__import__('os').geteuid())
+            self.addCleanup(storage.close)
+            seat = service / "seats" / "1"
+            seat.mkdir()
+            (seat / "link").symlink_to(outside, target_is_directory=True)
+            storage.remove_seat(1)
+            self.assertFalse(seat.exists())
+            self.assertEqual((outside / "keep").read_text(), "safe")
+
+    def test_missing_status_mount_has_a_typed_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(supervisor.SeatFailure, "attempt_status_mount_required"):
+                supervisor.require_status_mount(Path(d), mounts="")
 
 
 if __name__ == "__main__":

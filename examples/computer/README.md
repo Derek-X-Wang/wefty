@@ -2,7 +2,7 @@
 
 The final `seats` target is the default multi-Seat Computer image. It starts
 a root supervisor and waits for `/wefty/control/seats.json`. It requires the
-helper-owned writable `/wefty/seat-status` bind beside the read-only control
+profile-owned, bounded `/wefty/seat-status` tmpfs beside the read-only control
 bind. It provides four named Seat users, 1280×800 desktops, test tools and
 disk-backed Seat temp folders. See the [Seat contract](../../docs/contracts/computer-image.md#default-image-and-seats-computer-request-p5-p6-p8-p9)
 for directive fields, answers, deadlines and current P7 limits.
