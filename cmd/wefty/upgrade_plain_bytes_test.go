@@ -8,8 +8,8 @@ import (
 	"testing"
 )
 
-// This exact test is also run against the dispatch base. Optional capture is
-// only a test artifact for byte comparison; it is not a CLI or product flag.
+// Hold the human report bytes, including the separately reported drain counts.
+// Optional capture is a test artifact, not a CLI or product flag.
 func TestUpgradePlainByteComparison(t *testing.T) {
 	type output struct{ Stdout, Stderr string }
 	captured := map[string]output{}
@@ -25,7 +25,7 @@ func TestUpgradePlainByteComparison(t *testing.T) {
 		}
 		normalize := func(s string) string { return strings.ReplaceAll(s, f.home, "<HOME>") }
 		captured[name] = output{normalize(stdout.String()), normalize(stderr.String())}
-		if !jsonMode && stdout.String() != "Installed version: "+f.commit+"\nNode agent replaced; services come back.\n" {
+		if !jsonMode && stdout.String() != "Installed version: "+f.commit+"\nNode agent replaced; services come back.\nwaiting_nonrestartable=0 stopping_restartable=0 restart_pending=0\n" {
 			t.Fatalf("plain stdout changed: %q", stdout.String())
 		}
 		stdout.Reset()

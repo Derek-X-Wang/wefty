@@ -170,7 +170,7 @@ func TestUpgradeRechecksBeforeNodeReplacement(t *testing.T) {
 				}
 				return observe(ctx, p)
 			}
-			_, err := runUpgrade(t.Context(), f.host, false, io.Discard)
+			report, err := runUpgrade(t.Context(), f.host, false, io.Discard)
 			if err == nil || commandExitCode(err) != exitConflict || !strings.Contains(err.Error(), "before node replacement") {
 				t.Fatalf("race not refused: %v", err)
 			}
@@ -179,6 +179,9 @@ func TestUpgradeRechecksBeforeNodeReplacement(t *testing.T) {
 			}
 			if race == "late-one-shot" && (!f.node.ClaimsEnabled || len(f.node.ActiveAttempts) != 1) {
 				t.Fatal("late run not preserved/claims not restored")
+			}
+			if race == "late-one-shot" && (len(report.RunningWork) != 1 || report.RunningWork[0].AttemptID != "late") {
+				t.Fatalf("late replacement observation omitted: %+v", report.RunningWork)
 			}
 			assertNoUpgradeDrainReceipt(t, f)
 		})
@@ -297,13 +300,16 @@ func TestStatusUpgradeReasonExpiresWithoutReceipt(t *testing.T) {
 
 func TestUpgradeJSONIncludesRestoreFailure(t *testing.T) {
 	f := newUpgradeFixture(t)
-	f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "long", AttemptID: "long"}}
 	set := f.operations.setClaims
 	f.operations.setClaims = func(ctx context.Context, p connprofile.Profile, r l1.NodeIntentRequest) (l1.Node, error) {
 		if r.ClaimsEnabled {
 			return l1.Node{}, &unavailableError{cause: errors.New("restore transport unavailable")}
 		}
-		return set(ctx, p, r)
+		node, err := set(ctx, p, r)
+		if err == nil && !r.ClaimsEnabled {
+			f.node.ActiveAttempts = []l1.NodeActiveAttempt{{JobID: "long", AttemptID: "long"}}
+		}
+		return node, err
 	}
 	_, err := runUpgrade(t.Context(), f.host, false, io.Discard, 10*time.Second)
 	var out bytes.Buffer

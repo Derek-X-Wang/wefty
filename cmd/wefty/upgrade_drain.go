@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
@@ -46,6 +47,9 @@ type upgradeDrainReceipt struct {
 	Services       []l1.NodeActiveAttempt `json:"services,omitempty"`
 	restarted      []string
 	claimsDisabled bool
+	counts         upgradeDrainCounts
+	deadline       time.Time
+	disableNotSent bool
 }
 
 func (receipt *upgradeDrainReceipt) ownsClaims(node l1.Node) bool {
@@ -104,21 +108,80 @@ func removeUpgradeDrain(config string) error {
 	return durable.SyncDir(root)
 }
 
-func beginUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, node l1.Node, timeout time.Duration) (*upgradeDrainReceipt, error) {
-	receipt := &upgradeDrainReceipt{Home: paths.home, Version: 1, NodeID: node.NodeID, Revision: node.IntentRevision, Reason: node.IntentReason, PreviousReason: node.IntentReason, RestoreClaims: node.ClaimsEnabled}
+// An absolute deadline from the gap phase includes receipt persistence and the
+// disable RPC. Duration-only callers retain the single-phase entry point.
+func beginUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, node l1.Node, timeout time.Duration, absoluteDeadline ...time.Time) (*upgradeDrainReceipt, error) {
+	var deadline time.Time
+	if len(absoluteDeadline) > 0 {
+		deadline = absoluteDeadline[0]
+	} else {
+		deadline = op.now().Add(timeout)
+	}
+	left := deadline.Sub(op.now())
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if left <= 0 {
+		return nil, upgradeDrainTimedOut()
+	}
+	bounded, cancel := context.WithTimeout(ctx, left)
+	defer cancel()
+	budgetError := func() error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !op.now().Before(deadline) || errors.Is(bounded.Err(), context.DeadlineExceeded) {
+			return upgradeDrainTimedOut()
+		}
+		return bounded.Err()
+	}
+	receipt := &upgradeDrainReceipt{Home: paths.home, Version: 1, NodeID: node.NodeID, Revision: node.IntentRevision, Reason: node.IntentReason, PreviousReason: node.IntentReason, RestoreClaims: node.ClaimsEnabled, deadline: deadline, disableNotSent: true}
 	if node.ClaimsEnabled {
 		receipt.Revision++
-		receipt.Reason = upgradeIntentPrefix + rand.Text() + upgradeDeadlineField + op.now().Add(timeout).UTC().Format(time.RFC3339Nano)
+		receipt.Reason = upgradeIntentPrefix + rand.Text() + upgradeDeadlineField + deadline.UTC().Format(time.RFC3339Nano)
 	}
-	// Write the expected *post-CAS* revision first. A lost mutation response or
-	// process death can then be recovered by comparing both revision and reason.
-	if err := writeUpgradeDrain(paths.config, receipt); err != nil {
+	if err := budgetError(); err != nil {
 		return nil, err
 	}
+	// Persist expected post-CAS ownership before sending the disable. A lost
+	// response or process death still uses the existing receipt recovery.
+	persist := op.writeDrain
+	if persist == nil {
+		persist = func(ctx context.Context, config string, r *upgradeDrainReceipt) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return writeUpgradeDrain(config, r)
+		}
+	}
+	if err := persist(bounded, paths.config, receipt); err != nil {
+		if budgetErr := budgetError(); budgetErr != nil {
+			return receipt, budgetErr
+		}
+		return receipt, err
+	}
+	// A slow fsync must consume the budget, never create a fresh disable window.
+	if err := budgetError(); err != nil {
+		return receipt, err
+	}
 	if !receipt.RestoreClaims {
+		receipt.disableNotSent = false
 		return receipt, nil
 	}
-	_, err := op.setClaims(ctx, profile, l1.NodeIntentRequest{ClaimsEnabled: false, IntentRevision: node.IntentRevision, Reason: receipt.Reason})
+	mutationBudget := deadline.Sub(op.now())
+	if mutationBudget <= 0 {
+		return receipt, upgradeDrainTimedOut()
+	}
+	mutation, cancelMutation := context.WithTimeout(bounded, mutationBudget)
+	defer cancelMutation()
+	if err := budgetError(); err != nil {
+		return receipt, err
+	}
+	receipt.disableNotSent = false
+	_, err := op.setClaims(mutation, profile, l1.NodeIntentRequest{ClaimsEnabled: false, IntentRevision: node.IntentRevision, Reason: receipt.Reason})
+	if budgetErr := budgetError(); budgetErr != nil {
+		return receipt, budgetErr
+	}
 	return receipt, err
 }
 
@@ -151,7 +214,10 @@ func upgradeReasonActive(node l1.Node, now time.Time) bool {
 }
 
 func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.Profile, receipt *upgradeDrainReceipt, yes bool, timeout time.Duration, out io.Writer, work *[]l1.NodeActiveAttempt) (l1.Node, error) {
-	deadline := op.now().Add(timeout)
+	deadline := receipt.deadline
+	if deadline.IsZero() {
+		deadline = op.now().Add(timeout)
+	}
 	if receipt.RestoreClaims {
 		if recorded, err := upgradeReasonDeadline(receipt.Reason); err == nil && !recorded.IsZero() {
 			deadline = recorded
@@ -160,6 +226,21 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 	bounded, cancel := context.WithTimeout(ctx, deadline.Sub(op.now()))
 	defer cancel()
 	first := true
+	interruptions := map[string]*upgradeInterruption{}
+	track := func(attempt l1.NodeActiveAttempt) {
+		if !yes && attempt.Restartable && attempt.Class != contract.JobClassService && interruptions[attempt.AttemptID] == nil {
+			interruptions[attempt.AttemptID] = &upgradeInterruption{
+				attempt:  attempt,
+				deadline: minTime(deadline, op.now().Add(agent.DefaultRenewalInterval+agent.ForcedShutdownBound(agent.ShutdownTimeouts{}))),
+				key:      "upgrade:" + rand.Text(),
+			}
+		}
+	}
+	// Admission can close after an observed Attempt expires. Retain its exact
+	// identity even when the first disabled snapshot no longer lists it.
+	for _, attempt := range *work {
+		track(attempt)
+	}
 	for {
 		if !first && !yes && (!op.now().Before(deadline) || errors.Is(bounded.Err(), context.DeadlineExceeded)) && ctx.Err() == nil {
 			return l1.Node{}, upgradeDrainTimedOut()
@@ -181,31 +262,86 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 		if node.IntentRevision != receipt.Revision || node.ClaimsEnabled || node.IntentReason != receipt.Reason {
 			return node, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent changed during upgrade drain; installed stack unchanged"}}
 		}
-		remaining := 0
+		receipt.counts = upgradeDrainCounts{}
+		for _, stop := range interruptions {
+			stop.active = false
+		}
 		for _, attempt := range node.ActiveAttempts {
-			found := false
-			for _, old := range *work {
-				if old.AttemptID == attempt.AttemptID {
-					found = true
-					break
-				}
+			recordUpgradeWork(work, attempt)
+			if attempt.Class == contract.JobClassService {
+				continue
 			}
-			if !found {
-				*work = append(*work, attempt)
-			}
-			if attempt.Class != contract.JobClassService {
-				remaining++
+			if !attempt.Restartable {
+				receipt.counts.WaitingNonrestartable++
+			} else if yes {
+				receipt.counts.StoppingRestartable++
+			} else {
+				track(attempt)
+				interruptions[attempt.AttemptID].active = true
 			}
 		}
-		if yes || remaining == 0 {
+		if yes {
 			return node, ctx.Err()
 		}
-		if _, err := fmt.Fprintf(out, "Draining: %d one-shot attempts remain; deadline %s.\n", remaining, deadline.Format(time.RFC3339)); err != nil {
+		// Initiate every stop before waiting for any of them. Retries always name
+		// the same Attempt, boot, intent and key, including after a lost reply.
+		for _, stop := range interruptions {
+			if !stop.active || stop.acknowledged || stop.settled {
+				continue
+			}
+			probe, cancel := context.WithTimeout(bounded, min(upgradeMutationBudget, stop.deadline.Sub(op.now())))
+			_, err := op.interruptAttempt(probe, profile, stop.attempt.AttemptID, l1.InterruptRestartableAttemptRequest{
+				JobID: stop.attempt.JobID, BootSessionID: stop.attempt.BootSessionID,
+				IntentRevision: receipt.Revision, IdempotencyKey: stop.key, Reason: l1.InterruptionUpgrade,
+			})
+			cancel()
+			if ctx.Err() != nil {
+				return node, ctx.Err()
+			}
+			stop.acknowledged = err == nil
+			// A natural exit or cancellation may race the request. Resolve even a
+			// refused request by reading its exact Attempt below.
+		}
+		for _, stop := range interruptions {
+			if stop.settled {
+				if stop.pending {
+					receipt.counts.RestartPending++
+				}
+				continue
+			}
+			probe, cancel := context.WithTimeout(bounded, min(upgradeMutationBudget, stop.deadline.Sub(op.now())))
+			job, err := op.readJob(probe, profile, stop.attempt.JobID)
+			cancel()
+			if err == nil {
+				stop.settled = upgradeAttemptSettled(job, stop.attempt.AttemptID)
+				if stop.settled && job.State == contract.JobQueued {
+					receipt.counts.RestartPending++
+					stop.pending = true
+				}
+			}
+			if !stop.settled {
+				receipt.counts.StoppingRestartable++
+				if !op.now().Before(stop.deadline) {
+					return node, upgradeDrainTimedOut()
+				}
+			}
+		}
+		if _, err := fmt.Fprintf(out, "Draining: %d one-shot attempts remain; waiting_nonrestartable=%d stopping_restartable=%d restart_pending=%d; deadline %s.\n",
+			receipt.counts.WaitingNonrestartable+receipt.counts.StoppingRestartable, receipt.counts.WaitingNonrestartable,
+			receipt.counts.StoppingRestartable, receipt.counts.RestartPending, deadline.Format(time.RFC3339)); err != nil {
 			return node, err
+		}
+		if receipt.counts.WaitingNonrestartable == 0 && receipt.counts.StoppingRestartable == 0 {
+			return node, ctx.Err()
 		}
 		left := deadline.Sub(op.now())
 		if left <= 0 || errors.Is(bounded.Err(), context.DeadlineExceeded) {
 			return node, upgradeDrainTimedOut()
+		}
+		for _, stop := range interruptions {
+			if !stop.settled {
+				left = min(left, stop.deadline.Sub(op.now()))
+			}
 		}
 		if err := op.wait(bounded, min(upgradeDrainPoll, left)); err != nil {
 			if ctx.Err() != nil {
@@ -217,6 +353,44 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 			return node, err
 		}
 	}
+}
+
+type upgradeInterruption struct {
+	active       bool
+	attempt      l1.NodeActiveAttempt
+	deadline     time.Time
+	key          string
+	acknowledged bool
+	settled      bool
+	pending      bool
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
+}
+
+func recordUpgradeWork(work *[]l1.NodeActiveAttempt, attempt l1.NodeActiveAttempt) {
+	for _, old := range *work {
+		if old.AttemptID == attempt.AttemptID {
+			return
+		}
+	}
+	*work = append(*work, attempt)
+}
+
+// Absence from active_attempts is insufficient: Lease expiry can hide a live
+// process. Require positive settlement of the exact old Attempt. Natural exit
+// and cancellation retain their normal terminal results.
+func upgradeAttemptSettled(job l1.Job, id string) bool {
+	for _, attempt := range job.Attempts {
+		if attempt.AttemptID == id {
+			return attempt.State == contract.AttemptInterrupted || attempt.State == contract.AttemptSucceeded || attempt.State == contract.AttemptFailed
+		}
+	}
+	return false
 }
 
 // Revalidate after control-plane renewal, before publishing or stopping the node.
@@ -258,6 +432,11 @@ func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, 
 }
 
 func finishUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, receipt *upgradeDrainReceipt, recovering bool, out io.Writer) (resultErr error) {
+	// This invocation knows no CAS was sent. Remove the receipt without an
+	// admission fence; a receipt read after a crash keeps conservative recovery.
+	if receipt.disableNotSent {
+		return removeUpgradeDrain(paths.config)
+	}
 	defer func() {
 		for _, jobID := range receipt.restarted {
 			if _, err := fmt.Fprintln(out, "Restarted service", jobID); err != nil {
@@ -333,6 +512,15 @@ func setUpgradeClaims(ctx context.Context, profile connprofile.Profile, request 
 	err = withUpgradeClients(ctx, profile, func(ctx context.Context, clients *apiClients) error {
 		var err error
 		node, err = clients.setNodeClaims(ctx, profile.Identities.Node, request)
+		return err
+	})
+	return
+}
+
+func interruptUpgradeAttempt(ctx context.Context, profile connprofile.Profile, attempt string, request l1.InterruptRestartableAttemptRequest) (job l1.Job, err error) {
+	err = withUpgradeClients(ctx, profile, func(ctx context.Context, clients *apiClients) error {
+		var err error
+		job, err = clients.interruptRestartableAttempt(ctx, profile.Identities.Node, attempt, request)
 		return err
 	})
 	return

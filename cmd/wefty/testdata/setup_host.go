@@ -157,7 +157,9 @@ func setupCommandHost() (setupHost, error) {
 	}
 	now := time.Date(2026, 10, 21, 0, 0, 0, 0, time.UTC)
 	observe := func(context.Context, connprofile.Profile) (l1.Node, error) { return node, nil }
-	drain := &upgradeHost{observe: observe, readNode: observe, now: func() time.Time { return now }, wait: func(_ context.Context, d time.Duration) error { now = now.Add(d); return nil }, setClaims: func(_ context.Context, _ connprofile.Profile, request l1.NodeIntentRequest) (l1.Node, error) {
+	drain := &upgradeHost{command: func(context.Context, string, []string, string, ...string) ([]byte, error) {
+		return []byte(`{"version":1,"blockers":[]}`), nil
+	}, observe: observe, readNode: observe, now: func() time.Time { return now }, wait: func(_ context.Context, d time.Duration) error { now = now.Add(d); return nil }, setClaims: func(_ context.Context, _ connprofile.Profile, request l1.NodeIntentRequest) (l1.Node, error) {
 		if request.IntentRevision != node.IntentRevision {
 			return l1.Node{}, errors.New("fixture claim conflict")
 		}
@@ -181,7 +183,30 @@ func setupCommandHost() (setupHost, error) {
 			return []byte("FileVault is Off.\n"), nil
 		}
 		return nil, errors.New("unexpected fixture host probe")
-	}, conversionFilesClosed: func(context.Context, []string) error { return nil }, conversionClients: func(ctx context.Context, p connprofile.Profile) (*apiClients, error) {
+	}, conversionCopy: &plainConversionCopyOps{clone: func(ctx context.Context, source *os.File, to string) error {
+		err := cloneConversionInventoryFile(ctx, source, to)
+		if os.Getenv("WEFTY_FIXTURE_KILL_CONVERSION_COPY") == "1" {
+			if err != nil {
+				// Cloning is unavailable here (for example on Linux CI), so write
+				// the copy directly: the abrupt exit must still leave a real copy.
+				target, createErr := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+				if createErr != nil {
+					return createErr
+				}
+				if _, copyErr := io.Copy(target, io.NewSectionReader(source, 0, 1<<40)); copyErr != nil {
+					return errors.Join(copyErr, target.Close())
+				}
+				if closeErr := target.Close(); closeErr != nil {
+					return closeErr
+				}
+			}
+			if err := os.WriteFile(filepath.Join(home, "fixture-killed-copy"), []byte(filepath.Dir(to)), 0600); err != nil {
+				return err
+			}
+			os.Exit(86)
+		}
+		return err
+	}}, conversionFilesClosed: func(context.Context, []string) error { return nil }, conversionClients: func(ctx context.Context, p connprofile.Profile) (*apiClients, error) {
 		return clients(ctx, setupPaths{}, p)
 	}, upgrade: drain, conversionComputers: func(context.Context, connprofile.Profile) ([]l1.Computer, error) {
 		if os.Getenv("WEFTY_FIXTURE_BUSY") == "computer" {

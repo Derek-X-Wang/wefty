@@ -170,6 +170,8 @@ func parseSkillCommand(line string) ([]string, []string, bool) {
 	var command, flags []string
 	for _, field := range fields[1:] {
 		switch {
+		case field == "--":
+			return command, flags, len(command) > 0
 		case field == "--json":
 			continue
 		case strings.HasPrefix(field, "--"):
@@ -192,6 +194,13 @@ func parseSkillCommand(line string) ([]string, []string, bool) {
 		return nil, nil, false
 	}
 	return command, flags, true
+}
+
+func TestSkillExecPayloadFlagsFollowSeparator(t *testing.T) {
+	command, flags, ok := parseSkillCommand("wefty exec --restartable --detach -- gh run watch RUN_ID --exit-status")
+	if !ok || strings.Join(command, " ") != "exec" || strings.Join(flags, " ") != "restartable detach" {
+		t.Fatalf("command=%v flags=%v ok=%v", command, flags, ok)
+	}
 }
 
 // isSkillSubcommand keeps run IDs and file paths from being read as verbs.

@@ -56,9 +56,9 @@ func TestTheLogSpoolCarriesTheDurabilityPragmas(t *testing.T) {
 	}
 }
 
-// TestOutputAppendsDoNotPayAFullSyncEach: on the production DSN a full sync
-// costs about 4 ms on darwin, so 500 appends each paying one would take about
-// 2 s. They go through the NORMAL handle and must take well under that.
+// TestOutputAppendsDoNotPayAFullSyncEach: NORMAL output appends must cost
+// much less per operation than appends through the FULL handle on the same
+// spool. Measure real F_FULLFSYNC commits instead of assuming a machine speed.
 func TestOutputAppendsDoNotPayAFullSyncEach(t *testing.T) {
 	durable.EnableSQLiteFullFsyncForTests()
 	t.Cleanup(durable.DisableSQLiteFullFsyncForTests)
@@ -84,8 +84,26 @@ func TestOutputAppendsDoNotPayAFullSyncEach(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("the full-sync cost this bounds is darwin's F_FULLFSYNC; elsewhere fsync is cheap and the timing proves nothing")
 	}
-	if elapsed >= time.Second {
-		t.Fatalf("%d output appends took %s; each is paying a full sync", appends, elapsed)
+	const fullSyncs = 25
+	// Use the same append work for calibration: under -race its SQL and
+	// retention scan cost is significant even without a sync. The FULL handle
+	// also serves upload barriers, so each of these writes pays F_FULLFSYNC.
+	appendDB := spool.appendDB
+	spool.appendDB = spool.db
+	defer func() { spool.appendDB = appendDB }()
+	started = time.Now()
+	for sequence := range fullSyncs {
+		event := spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(appends+sequence), fmt.Sprintf("line %d\n", appends+sequence))
+		if err := spool.append(t.Context(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fullSyncElapsed := time.Since(started)
+	appendCost := elapsed / appends
+	fullSyncCost := fullSyncElapsed / fullSyncs
+	t.Logf("per operation: output append %s, FULL-handle append %s (%d commits took %s)", appendCost, fullSyncCost, fullSyncs, fullSyncElapsed)
+	if appendCost >= fullSyncCost/2 {
+		t.Fatalf("output append cost %s/op (%d appends took %s), want less than half of FULL sync cost %s/op (%d commits took %s); appends must not pay a full sync each", appendCost, appends, elapsed, fullSyncCost, fullSyncs, fullSyncElapsed)
 	}
 }
 

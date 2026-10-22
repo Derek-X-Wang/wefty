@@ -212,6 +212,9 @@ func TestSetupConvertRound2UnfinishedWorkRefused(t *testing.T) {
 		run  *l3.RunSummary
 	}{
 		{name: "queued one-shot", job: &l1.Job{JobID: "queued-job", State: contract.JobQueued, Spec: contract.JobSpec{Class: contract.JobClassOneShot}}},
+		{name: "claimed one-shot", job: &l1.Job{JobID: "claimed-job", State: contract.JobClaimed, Spec: contract.JobSpec{Class: contract.JobClassOneShot}}},
+		{name: "service stopping", job: &l1.Job{JobID: "stopping-job", State: contract.JobStopping, Spec: contract.JobSpec{Class: contract.JobClassService}, ServiceJob: &l1.ServiceJob{DesiredState: contract.ServiceDesiredStopped}}},
+		{name: "service removing", job: &l1.Job{JobID: "removing-job", State: contract.JobRemovalPending, Spec: contract.JobSpec{Class: contract.JobClassService}, Removal: &l1.ServiceRemoval{RemovalDesiredState: contract.ServiceDesiredRemoved}}},
 		{name: "service backoff", job: &l1.Job{JobID: "backoff-job", State: contract.JobQueued, Spec: contract.JobSpec{Class: contract.JobClassService}, ServiceJob: &l1.ServiceJob{DesiredState: contract.ServiceDesiredRunning}}},
 	}
 	for _, state := range []contract.RunState{contract.RunPending, contract.RunDispatching, contract.RunQueued, contract.RunRunning, contract.RunAwaitingInput} {
