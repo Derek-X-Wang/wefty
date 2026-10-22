@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -293,6 +294,93 @@ func TestOneshotRestartLeaseExpiryBoundary(t *testing.T) {
 			next := f.claim(t)
 			if next.Job.RestartRecovery.Count != 1 || next.Lease.FencingToken == c.Lease.FencingToken || next.AttemptToken == c.AttemptToken {
 				t.Fatal("successor authority/counter not renewed")
+			}
+		})
+	}
+}
+
+func TestOneshotRestartLostPredecessorCompletionAfterSuccessorClaim(t *testing.T) {
+	spec := secretBearingOneShot("lost-predecessor-completion")
+	spec.RoutingTags = nil
+	f := newOneshotFixtureWithSpec(t, true, spec)
+	predecessor := f.claim(t)
+	f.h.clock.Advance(DefaultLeaseDuration)
+	if _, err := f.h.store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	f.h.clock.Advance(time.Second)
+	successor := f.claim(t)
+	if _, err := f.h.store.StartAttempt(t.Context(), "agent", f.job.JobID, successor.Lease.AttemptID, StartedRequest{FencingToken: successor.Lease.FencingToken}); err != nil {
+		t.Fatal(err)
+	}
+	before := f.get(t)
+	if before.State != contract.JobRunning || before.CurrentAttemptID != successor.Lease.AttemptID || before.RestartRecovery.Count != 1 ||
+		before.SecretsScrubbedAt != nil || before.Spec.Execution.SensitiveEnv[contract.EnvRunToken] != scrubRunTokenSecret ||
+		before.Spec.Execution.Executable.InlineBase64 != spec.Execution.Executable.InlineBase64 || before.Spec.Labels[contract.LabelRunParams] != spec.Labels[contract.LabelRunParams] {
+		t.Fatal("successor must start with one restart and retained executable, params and Run token")
+	}
+	authorityBefore, err := readAttemptAuthority(t.Context(), f.h.store.db, successor.Lease.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	predecessorAuthority, err := readAttemptAuthority(t.Context(), f.h.store.db, predecessor.Lease.AttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if predecessorAuthority.state != contract.AttemptLost || predecessorAuthority.completionKey.Valid || predecessorAuthority.currentAttempt.String != successor.Lease.AttemptID {
+		t.Fatal("predecessor must be lost, non-current and have no accepted completion")
+	}
+	attemptsBefore, err := f.h.store.ListJobAttempts(t.Context(), f.job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attemptsBefore) != 2 {
+		t.Fatalf("attempt count = %d, want 2", len(attemptsBefore))
+	}
+	exit := 0
+	request := CompletionRequest{FencingToken: predecessor.Lease.FencingToken, IdempotencyKey: "late-predecessor-success", Result: ProcessResult{ExitCode: &exit}}
+	var firstEvidence *LateResultEvidence
+	for _, delivery := range []string{"first completion", "identical replay"} {
+		t.Run(delivery, func(t *testing.T) {
+			f.h.clock.Advance(time.Second)
+			if _, err := f.h.store.CompleteAttempt(t.Context(), "agent", f.job.JobID, predecessor.Lease.AttemptID, request); errorCode(err) != contract.ErrorLeaseExpired {
+				t.Fatalf("lost predecessor completion = %v, want lease_expired", err)
+			}
+			after := f.get(t)
+			if after.CurrentAttemptID != before.CurrentAttemptID || after.State != before.State || !after.UpdatedAt.Equal(before.UpdatedAt) ||
+				!reflect.DeepEqual(after.RestartRecovery, before.RestartRecovery) || !reflect.DeepEqual(after.Spec, before.Spec) || after.SecretsScrubbedAt != nil {
+				t.Fatal("lost predecessor completion changed the successor binding, Job state, restart facts or retained inputs")
+			}
+			authorityAfter, err := readAttemptAuthority(t.Context(), f.h.store.db, successor.Lease.AttemptID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(authorityAfter, authorityBefore) {
+				t.Fatal("lost predecessor completion changed successor authority, state or fence")
+			}
+			attempts, err := f.h.store.ListJobAttempts(t.Context(), f.job.JobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(attempts) != 2 {
+				t.Fatalf("attempt count = %d, want 2", len(attempts))
+			}
+			old := attempts[0]
+			if old.AttemptID != predecessor.Lease.AttemptID || old.State != contract.AttemptLost || old.Result != nil ||
+				old.LateResult == nil || old.LateResult.Kind != LateResultObservation || !old.LateResult.Late ||
+				!reflect.DeepEqual(old.LateResult.Result, &request.Result) || !old.LateResult.AuthorityLostAt.Equal(attemptsBefore[0].UpdatedAt) {
+				t.Fatal("lost predecessor completion must retain only non-authoritative late result evidence")
+			}
+			if !reflect.DeepEqual(attempts[1], attemptsBefore[1]) {
+				t.Fatal("lost predecessor completion changed the successor Attempt summary")
+			}
+			if firstEvidence == nil {
+				if !old.LateResult.ObservedAt.Equal(f.h.clock.Now()) {
+					t.Fatal("first late completion observation timestamp was not recorded")
+				}
+				firstEvidence = old.LateResult
+			} else if !reflect.DeepEqual(old.LateResult, firstEvidence) {
+				t.Fatal("completion replay changed accepted late evidence")
 			}
 		})
 	}
