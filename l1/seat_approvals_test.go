@@ -93,3 +93,14 @@ func TestSeatApprovalWindowAuthorityAndExpiry(t *testing.T) {
 		t.Fatalf("late=%+v err=%v", late, err)
 	}
 }
+
+func TestSeatApprovalAnswerWaitCapped(t *testing.T) {
+	request := SeatApprovalRequest{SeatID: "seat_" + strings.Repeat("a", 32), NodeID: "mac", BootSessionID: "boot", Harness: "test", Folder: "/workspace", Form: "any", Network: "none", AnswerWait: time.Hour}
+	if err := request.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	request.AnswerWait = time.Hour + time.Nanosecond
+	if err := request.Validate(); err == nil {
+		t.Fatal("L1 accepted an answer wait longer than one hour")
+	}
+}

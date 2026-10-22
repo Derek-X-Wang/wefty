@@ -7,6 +7,7 @@ import (
 	"errors"
 	"regexp"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -72,13 +73,15 @@ type seatApprovalQuery interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
+const MaxSeatApprovalWait = time.Hour
+
 var seatApprovalID = regexp.MustCompile(`^seat_[0-9a-f]{32}$`)
 
 func (r SeatApprovalRequest) Validate() error {
 	if !seatApprovalID.MatchString(r.SeatID) || r.NodeID == "" || r.BootSessionID == "" ||
-		len(r.Harness) > 256 || r.Folder == "" || len(r.Folder) > 4096 ||
+		utf8.RuneCountInString(r.Harness) > 256 || r.Folder == "" || len(r.Folder) > 4096 ||
 		(r.Form != "any" && r.Form != "dedicated") || (r.Network != "internet" && r.Network != "none") ||
-		r.AnswerWait <= 0 || (r.WindowHours != 0 && r.WindowHours != 1 && r.WindowHours != 8 && r.WindowHours != 24) {
+		r.AnswerWait <= 0 || r.AnswerWait > MaxSeatApprovalWait || (r.WindowHours != 0 && r.WindowHours != 1 && r.WindowHours != 8 && r.WindowHours != 24) {
 		return protocolError(contract.ErrorInvalidRequest, "invalid Seat approval request")
 	}
 	return nil

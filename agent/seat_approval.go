@@ -24,6 +24,9 @@ func (s SeatApprovalSettings) defaults() (SeatApprovalSettings, error) {
 	if s.AnswerWait == 0 {
 		s.AnswerWait = DefaultSeatApprovalWait
 	}
+	if s.AnswerWait > l1.MaxSeatApprovalWait {
+		return s, fmt.Errorf("Seat approval answer wait must not exceed 1h")
+	}
 	if s.AnswerWait < 0 {
 		return s, fmt.Errorf("Seat approval answer wait must be positive")
 	}
@@ -68,8 +71,10 @@ type SeatApprovalPrompt struct {
 	Wait    time.Duration
 }
 
-// SeatApprovalDialog is the only source of a positive answer. Production uses
+// SeatApprovalDialog supplies the owner's answer. Production uses
 // the native login-session dialog; tests supply SeatApprovalDialogFunc.
+// Show must honor cancellation. Unavailable without an error means the owner
+// session is absent; operational failures return an error and refuse at once.
 type SeatApprovalDialog interface {
 	Show(context.Context, SeatApprovalPrompt) (SeatApprovalChoice, error)
 }
@@ -105,6 +110,7 @@ type SeatApprovalController struct {
 	clock                 Clock
 	mu                    sync.Mutex
 	calls                 map[string]*seatApprovalCall
+	dialogSlot            chan struct{}
 }
 
 func NewSeatApprovalController(client SeatApprovalClient, nodeID, boot string, settings SeatApprovalSettings, dialog SeatApprovalDialog, clock Clock) (*SeatApprovalController, error) {
@@ -121,7 +127,7 @@ func NewSeatApprovalController(client SeatApprovalClient, nodeID, boot string, s
 	if clock == nil {
 		clock = systemClock{}
 	}
-	return &SeatApprovalController{client: client, nodeID: nodeID, bootSessionID: boot, settings: settings, dialog: dialog, clock: clock, calls: make(map[string]*seatApprovalCall)}, nil
+	return &SeatApprovalController{client: client, nodeID: nodeID, bootSessionID: boot, settings: settings, dialog: dialog, clock: clock, calls: make(map[string]*seatApprovalCall), dialogSlot: make(chan struct{}, 1)}, nil
 }
 func (c *SeatApprovalController) RequestApproval(ctx context.Context, request l1.SeatApprovalRequest) (l1.SeatApproval, error) {
 	// Authority and settings come from the node, never from the Seat request.
@@ -158,15 +164,46 @@ func (c *SeatApprovalController) RequestApproval(ctx context.Context, request l1
 	return call.result, call.err
 }
 func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1.SeatApprovalRequest) (l1.SeatApproval, error) {
+	started := c.clock.Now()
 	pending, err := c.client.BeginSeatApproval(ctx, request)
 	if err != nil || pending.State != "requested" {
 		return pending, err
 	}
-	remaining := pending.Deadline.Sub(wallNow(c.clock))
+	// A queued request keeps its deadline from request start. The L1 deadline
+	// independently limits it, including time spent in the initial exchange.
+	deadline := started.Add(request.AnswerWait)
+	serverDeadline := c.clock.Now().Add(pending.Deadline.Sub(wallNow(c.clock)))
+	if serverDeadline.Before(deadline) {
+		deadline = serverDeadline
+	}
+	remaining := deadline.Sub(c.clock.Now())
 	answer := l1.SeatApprovalAnswer{NodeID: c.nodeID, BootSessionID: c.bootSessionID, Reason: "no answer from the owner"}
 	if remaining > 0 {
 		timer := c.clock.NewTimer(remaining)
 		defer stopTimer(timer)
+		select {
+		case c.dialogSlot <- struct{}{}:
+			defer func() { <-c.dialogSlot }()
+			answer.Approved, answer.Reason = c.awaitSeatApprovalDialog(ctx, request, deadline, timer)
+		case <-ctx.Done():
+			answer.Reason = "approval dialog lost"
+		case <-timer.C():
+		}
+	}
+	return c.client.AnswerSeatApproval(context.WithoutCancel(ctx), request.SeatID, answer)
+}
+
+// The node owns the slot until Show has returned, including after cancellation.
+// This prevents a second native alert from overlapping a closing subprocess.
+func (c *SeatApprovalController) awaitSeatApprovalDialog(ctx context.Context, request l1.SeatApprovalRequest, deadline time.Time, timer Timer) (bool, string) {
+	for {
+		remaining := deadline.Sub(c.clock.Now())
+		if remaining <= 0 {
+			return false, "no answer from the owner"
+		}
+		if ctx.Err() != nil {
+			return false, "approval dialog lost"
+		}
 		dialogCtx, cancel := context.WithCancel(ctx)
 		type response struct {
 			choice SeatApprovalChoice
@@ -177,35 +214,58 @@ func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1
 			choice, err := c.dialog.Show(dialogCtx, SeatApprovalPrompt{Message: seatApprovalMessage(request), Wait: remaining})
 			result <- response{choice, err}
 		}()
+		var reply response
+		returned := false
+		reason := ""
 		select {
 		case <-ctx.Done():
-			answer.Reason = "approval dialog lost"
+			reason = "approval dialog lost"
 		case <-timer.C():
-		case reply := <-result:
-			switch {
-			case reply.err != nil:
-				answer.Reason = "approval dialog unavailable"
-			case reply.choice == SeatApprovalApprove:
-				answer.Approved = true
-				answer.Reason = ""
-			case reply.choice == SeatApprovalDeny:
-				answer.Reason = "denied by the owner"
-			default:
-				// A locked screen, no login session, and the native timeout all use
-				// the same deadline and the same refusal; none means Deny was clicked.
-				select {
-				case <-ctx.Done():
-					answer.Reason = "approval dialog lost"
-				case <-timer.C():
-				}
+			reason = "no answer from the owner"
+		case reply = <-result:
+			returned = true
+		}
+		cancel()
+		if !returned {
+			<-result
+		} // Native Show respects context cancellation.
+		if reason != "" {
+			return false, reason
+		}
+		if !c.clock.Now().Before(deadline) {
+			return false, "no answer from the owner"
+		}
+		switch {
+		case reply.err != nil:
+			return false, "approval dialog unavailable"
+		case reply.choice == SeatApprovalApprove:
+			return true, ""
+		case reply.choice == SeatApprovalDeny:
+			return false, "denied by the owner"
+		case reply.choice == SeatApprovalUnavailable:
+			// No owner session yet. Probe again without resetting the deadline.
+			retry := c.clock.NewTimer(min(time.Second, deadline.Sub(c.clock.Now())))
+			select {
+			case <-ctx.Done():
+				stopTimer(retry)
+				return false, "approval dialog lost"
+			case <-timer.C():
+				stopTimer(retry)
+				return false, "no answer from the owner"
+			case <-retry.C():
+				stopTimer(retry)
+			}
+		default:
+			select {
+			case <-ctx.Done():
+				return false, "approval dialog lost"
+			case <-timer.C():
+				return false, "no answer from the owner"
 			}
 		}
-		cancel() // dismiss the native dialog before publishing the answer
 	}
-	// Cancellation must not leave a requested row waiting forever. Client HTTP
-	// operations still have their own finite timeout.
-	return c.client.AnswerSeatApproval(context.WithoutCancel(ctx), request.SeatID, answer)
 }
+
 func seatApprovalMessage(r l1.SeatApprovalRequest) string {
 	network := "without internet"
 	if r.Network == "internet" {
@@ -213,9 +273,23 @@ func seatApprovalMessage(r l1.SeatApprovalRequest) string {
 	}
 	window := "one Seat"
 	if r.WindowHours != 0 {
-		window = fmt.Sprintf("%d hours; every request form %s, and requests without internet", r.WindowHours, network)
+		unit := "hours"
+		if r.WindowHours == 1 {
+			unit = "hour"
+		}
+		window = fmt.Sprintf("%d %s; every request form %s", r.WindowHours, unit, network)
+		if r.Network == "internet" {
+			window += ", and requests without internet"
+		}
 	}
-	return fmt.Sprintf("Harness (not verified): %q\nFolder: %q\nRequest form: %s\nNetwork: %s\nApproval: %s", r.Harness, r.Folder, r.Form, network, window)
+	return fmt.Sprintf("Network: %s\nForm: %s\nApproval: %s\nHarness (not verified): %s\nFolder: %s", network, r.Form, window, seatApprovalDisplayText(r.Harness), seatApprovalDisplayText(r.Folder))
+}
+func seatApprovalDisplayText(value string) string {
+	text := []rune(strconv.Quote(strings.Join(strings.Fields(value), " ")))
+	if len(text) > 200 {
+		return string(text[:198]) + "…\""
+	}
+	return string(text)
 }
 func (c *Client) BeginSeatApproval(ctx context.Context, request l1.SeatApprovalRequest) (l1.SeatApproval, error) {
 	var result l1.SeatApproval

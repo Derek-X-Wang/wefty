@@ -480,12 +480,15 @@ func run() error {
 		profilePath           = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, control-plane and run-ledger addresses and the node ID not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
 	computerRoomFlags := bindComputerRoomFlags(flag.CommandLine)
-	seatApprovalAnswerWait := flag.Duration("seat-approval-answer-wait", agent.DefaultSeatApprovalWait, "wait for the owner to answer a native Seat approval dialog")
+	seatApprovalAnswerWait := flag.Duration("seat-approval-answer-wait", agent.DefaultSeatApprovalWait, "wait for the owner to answer a native Seat approval dialog (maximum 1h)")
 	seatApprovalWindowHours := flag.String("seat-approval-window-hours", "1,8,24", "allowed Seat approval window lengths in hours (subset of 1,8,24)")
 	flag.Parse()
 	if *printVersion {
 		fmt.Println(version)
 		return nil
+	}
+	if *seatApprovalAnswerWait > l1.MaxSeatApprovalWait {
+		return errors.New("Seat approval answer wait must not exceed 1h")
 	}
 	if *seatApprovalAnswerWait <= 0 {
 		return errors.New("Seat approval answer wait must be positive")

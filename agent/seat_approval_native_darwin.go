@@ -45,41 +45,61 @@ func (NativeSeatApprovalDialog) Show(ctx context.Context, prompt SeatApprovalPro
 		return SeatApprovalDeny, nil
 	case "no-answer":
 		return SeatApprovalNoAnswer, nil
-	case "unavailable":
+	case "session-unavailable":
 		return SeatApprovalUnavailable, nil
+	case "unavailable":
+		return SeatApprovalUnavailable, fmt.Errorf("native Seat approval dialog unavailable")
 	default:
 		return SeatApprovalUnavailable, fmt.Errorf("native Seat approval dialog returned an unknown answer")
 	}
 }
 
-const seatApprovalScript = `
+// This fragment is also run by the non-dialog session probe in macOS CI.
+const seatApprovalSessionScript = `
 ObjC.import('Foundation');
 ObjC.import('CoreGraphics');
+function ownerSessionAvailable(session, username) {
+    return !!(session && session.kCGSSessionOnConsoleKey === true &&
+        session.kCGSessionLoginDoneKey === true &&
+        session.kCGSSessionUserNameKey === username &&
+        !session.CGSSessionScreenIsLocked);
+}
 function ownerSession() {
     try {
-    var session = ObjC.deepUnwrap($.CGSessionCopyCurrentDictionary());
-    return session && session.kCGSSessionOnConsoleKey === true &&
-        session.kCGSessionLoginDoneKey === true &&
-        session.kCGSSessionUserNameKey === ObjC.unwrap($.NSUserName()) &&
-        session.CGSSessionScreenIsLocked !== true;
+        var ref = $.CGSessionCopyCurrentDictionary();
+        var session = ref ? ObjC.deepUnwrap(ObjC.castRefToObject(ref)) : null;
+        return ownerSessionAvailable(session, ObjC.unwrap($.NSUserName()));
     } catch (error) { return false; }
 }
-function run(argv) {
-    var prompt = JSON.parse(argv[0]);
-    if (!ownerSession()) return 'unavailable';
-    var app = Application.currentApplication();
-    app.includeStandardAdditions = true;
+`
+
+// The presentation function accepts an app so the probe can use an ordinary
+// JavaScript fake, with no reference to a native application or actual dialog.
+const seatApprovalPresentationScript = `
+function presentSeatApproval(app, prompt) {
     try {
+        app.activate();
         var reply = app.displayDialog(prompt.message, {
             withTitle: 'Wefty Computer request',
             buttons: ['Deny', 'Approve'], defaultButton: 'Deny',
             cancelButton: 'Deny', givingUpAfter: prompt.seconds
         });
         if (reply.gaveUp) return 'no-answer';
-        if (!ownerSession()) return 'unavailable';
         return reply.buttonReturned === 'Approve' ? 'approve' : 'deny';
     } catch (error) {
-        return 'deny';
+        return Number(error.errorNumber) === -128 ? 'deny' : 'unavailable';
     }
+}
+`
+
+const seatApprovalScript = seatApprovalSessionScript + seatApprovalPresentationScript + `
+function run(argv) {
+    var prompt = JSON.parse(argv[0]);
+    if (!ownerSession()) return 'session-unavailable';
+    var app = Application.currentApplication();
+    app.includeStandardAdditions = true;
+    var answer = presentSeatApproval(app, prompt);
+    if (answer === 'approve' && !ownerSession()) return 'session-unavailable';
+    return answer;
 }
 `

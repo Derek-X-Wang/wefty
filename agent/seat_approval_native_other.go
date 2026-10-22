@@ -2,10 +2,13 @@
 
 package agent
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 type NativeSeatApprovalDialog struct{}
 
 func (NativeSeatApprovalDialog) Show(context.Context, SeatApprovalPrompt) (SeatApprovalChoice, error) {
-	return SeatApprovalUnavailable, nil
+	return SeatApprovalUnavailable, fmt.Errorf("native Seat approval dialog requires macOS")
 }

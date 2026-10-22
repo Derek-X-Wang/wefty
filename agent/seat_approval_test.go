@@ -9,8 +9,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -58,14 +61,15 @@ func TestSeatApprovalUnansweredRefusedWithInjectedClock(t *testing.T) {
 			client, store := approvalTestClient(t, clock)
 			shown := make(chan SeatApprovalPrompt, 1)
 			closed := make(chan struct{})
+			var closeOnce sync.Once
 			dialog := SeatApprovalDialogFunc(func(ctx context.Context, prompt SeatApprovalPrompt) (SeatApprovalChoice, error) {
 				shown <- prompt
 				if kind != "unanswered" {
-					close(closed)
+					closeOnce.Do(func() { close(closed) })
 					return SeatApprovalUnavailable, nil
 				}
 				<-ctx.Done()
-				close(closed)
+				closeOnce.Do(func() { close(closed) })
 				return SeatApprovalNoAnswer, nil
 			})
 			controller, err := NewSeatApprovalController(client, "mac", "boot", SeatApprovalSettings{}, dialog, clock)
@@ -191,7 +195,7 @@ func TestSeatApprovalNodeSettingsFromBinary(t *testing.T) {
 	if err != nil || !strings.Contains(string(help), "seat-approval-answer-wait") || !strings.Contains(string(help), "seat-approval-window-hours") {
 		t.Fatalf("settings flags absent: %v %s", err, help)
 	}
-	for _, value := range []struct{ arg, want string }{{"--seat-approval-answer-wait=0s", "answer wait must be positive"}, {"--seat-approval-window-hours=48", "windows must be 1, 8 or 24 hours"}} {
+	for _, value := range []struct{ arg, want string }{{"--seat-approval-answer-wait=0s", "answer wait must be positive"}, {"--seat-approval-answer-wait=1h1ns", "must not exceed 1h"}, {"--seat-approval-window-hours=48", "windows must be 1, 8 or 24 hours"}} {
 		output, err := exec.Command(agentBinaryPath, value.arg).CombinedOutput()
 		if err == nil || !strings.Contains(string(output), value.want) {
 			t.Fatalf("%s: err=%v output=%s", value.arg, err, output)
@@ -209,5 +213,204 @@ func awaitSeatApprovalTest[T any](t *testing.T, channel <-chan T) T {
 		t.Fatal("Seat approval did not finish after the injected deadline")
 		var zero T
 		return zero
+	}
+}
+
+func TestSeatApprovalUnlockUsesRemainingTime(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC))
+	client, _ := approvalTestClient(t, clock)
+	var locked atomic.Bool
+	locked.Store(true)
+	probed := make(chan SeatApprovalPrompt, 1)
+	shown := make(chan SeatApprovalPrompt, 1)
+	dialog := SeatApprovalDialogFunc(func(ctx context.Context, p SeatApprovalPrompt) (SeatApprovalChoice, error) {
+		if locked.Load() {
+			probed <- p
+			return SeatApprovalUnavailable, nil
+		}
+		shown <- p
+		return SeatApprovalApprove, nil
+	})
+	controller, err := NewSeatApprovalController(client, "mac", "boot", SeatApprovalSettings{}, dialog, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan l1.SeatApproval, 1)
+	go func() {
+		value, err := controller.RequestApproval(t.Context(), seatApprovalTestRequest(20))
+		if err != nil {
+			t.Error(err)
+		}
+		result <- value
+	}()
+	awaitSeatApprovalTest(t, probed)
+	clock.waitForDeadline(t, clock.Now().Add(time.Second))
+	locked.Store(false)
+	clock.Advance(time.Minute)
+	prompt := awaitSeatApprovalTest(t, shown)
+	if prompt.Wait != 4*time.Minute {
+		t.Fatalf("unlock prompt wait=%s, want 4m", prompt.Wait)
+	}
+	if value := awaitSeatApprovalTest(t, result); value.State != "approved" {
+		t.Fatalf("unlock result=%+v", value)
+	}
+}
+
+type seatApprovalBeginObserver struct {
+	SeatApprovalClient
+	started chan string
+}
+
+func (c seatApprovalBeginObserver) BeginSeatApproval(ctx context.Context, r l1.SeatApprovalRequest) (l1.SeatApproval, error) {
+	value, err := c.SeatApprovalClient.BeginSeatApproval(ctx, r)
+	c.started <- r.SeatID
+	return value, err
+}
+func seatApprovalTestRequest(id int) l1.SeatApprovalRequest {
+	return l1.SeatApprovalRequest{SeatID: fmt.Sprintf("seat_%032x", id), Harness: "test", Folder: "/workspace", Form: "any", Network: "none"}
+}
+
+func TestSeatApprovalSerialDialogsKeepOriginalDeadlines(t *testing.T) {
+	for _, expire := range []bool{false, true} {
+		name := "remaining time"
+		if expire {
+			name = "expires while queued"
+		}
+		t.Run(name, func(t *testing.T) {
+			clock := newManualClock(time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC))
+			client, _ := approvalTestClient(t, clock)
+			started := make(chan string, 2)
+			shown := make(chan SeatApprovalPrompt, 2)
+			release := make(chan struct{})
+			var active, peak, calls atomic.Int32
+			dialog := SeatApprovalDialogFunc(func(ctx context.Context, p SeatApprovalPrompt) (SeatApprovalChoice, error) {
+				n := active.Add(1)
+				defer active.Add(-1)
+				for old := peak.Load(); n > old && !peak.CompareAndSwap(old, n); old = peak.Load() {
+				}
+				index := calls.Add(1)
+				shown <- p
+				if index == 1 {
+					select {
+					case <-release:
+					case <-ctx.Done():
+						return SeatApprovalNoAnswer, nil
+					}
+				}
+				return SeatApprovalDeny, nil
+			})
+			controller, err := NewSeatApprovalController(seatApprovalBeginObserver{client, started}, "mac", "boot", SeatApprovalSettings{}, dialog, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, second := make(chan l1.SeatApproval, 1), make(chan l1.SeatApproval, 1)
+			request := func(id int, ch chan l1.SeatApproval) {
+				value, err := controller.RequestApproval(t.Context(), seatApprovalTestRequest(id))
+				if err != nil {
+					t.Error(err)
+				}
+				ch <- value
+			}
+			go request(30, first)
+			awaitSeatApprovalTest(t, started)
+			awaitSeatApprovalTest(t, shown)
+			if !expire {
+				clock.Advance(time.Minute)
+			}
+			go request(31, second)
+			awaitSeatApprovalTest(t, started)
+			if expire {
+				clock.Advance(5 * time.Minute)
+				for _, ch := range []chan l1.SeatApproval{first, second} {
+					if value := awaitSeatApprovalTest(t, ch); value.Reason != "no answer from the owner" {
+						t.Fatalf("expiry result=%+v", value)
+					}
+				}
+				if calls.Load() != 1 {
+					t.Fatalf("expired queued request showed a dialog; calls=%d", calls.Load())
+				}
+			} else {
+				clock.Advance(2 * time.Minute)
+				close(release)
+				awaitSeatApprovalTest(t, first)
+				prompt := awaitSeatApprovalTest(t, shown)
+				if prompt.Wait != 3*time.Minute {
+					t.Fatalf("queued dialog wait=%s want 3m", prompt.Wait)
+				}
+				awaitSeatApprovalTest(t, second)
+			}
+			if peak.Load() != 1 {
+				t.Fatalf("concurrent native dialogs=%d, want 1", peak.Load())
+			}
+		})
+	}
+}
+
+func TestSeatApprovalTrustedTextFirstAndBounded(t *testing.T) {
+	clock := newManualClock(time.Now())
+	client, _ := approvalTestClient(t, clock)
+	shown := make(chan SeatApprovalPrompt, 1)
+	controller, err := NewSeatApprovalController(client, "mac", "boot", SeatApprovalSettings{}, SeatApprovalDialogFunc(func(_ context.Context, p SeatApprovalPrompt) (SeatApprovalChoice, error) {
+		shown <- p
+		return SeatApprovalDeny, nil
+	}), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := seatApprovalTestRequest(40)
+	req.Harness = "hostile\n\t" + strings.Repeat("界", 220)
+	req.Folder = "/workspace\n\t" + strings.Repeat("界", 220)
+	req.WindowHours = 1
+	value, err := controller.RequestApproval(t.Context(), req)
+	if err != nil || value.State != "refused" {
+		t.Fatalf("result=%+v err=%v", value, err)
+	}
+	lines := strings.Split(awaitSeatApprovalTest(t, shown).Message, "\n")
+	if len(lines) != 5 || !strings.HasPrefix(lines[0], "Network: without internet") || !strings.HasPrefix(lines[1], "Form: any") || !strings.HasPrefix(lines[2], "Approval: 1 hour; every request form without internet") {
+		t.Fatalf("trusted lines=%q", lines)
+	}
+	if strings.Count(lines[2], "without internet") != 1 {
+		t.Fatalf("repeated network: %s", lines[2])
+	}
+	for _, line := range lines[3:] {
+		if !strings.Contains(line, "…") || strings.Contains(line, `\n`) || strings.Contains(line, `\t`) || utf8.RuneCountInString(line) > 230 {
+			t.Fatalf("unbounded label: %s", line)
+		}
+	}
+	req = seatApprovalTestRequest(41)
+	req.Harness = strings.Repeat("\"", 220)
+	req.Folder = strings.Repeat("\x00", 220)
+	if _, err := controller.RequestApproval(t.Context(), req); err != nil {
+		t.Fatal(err)
+	}
+	escaped := strings.Split(awaitSeatApprovalTest(t, shown).Message, "\n")
+	for _, line := range escaped[3:] {
+		if utf8.RuneCountInString(line) > 230 {
+			t.Fatalf("escaped display text exceeds cap: %d characters", utf8.RuneCountInString(line))
+		}
+	}
+
+}
+
+func TestSeatApprovalDialogErrorRefusesImmediately(t *testing.T) {
+	clock := newManualClock(time.Now())
+	client, _ := approvalTestClient(t, clock)
+	controller, err := NewSeatApprovalController(client, "mac", "boot", SeatApprovalSettings{}, SeatApprovalDialogFunc(func(context.Context, SeatApprovalPrompt) (SeatApprovalChoice, error) {
+		return SeatApprovalUnavailable, fmt.Errorf("native dialog failed")
+	}), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan l1.SeatApproval, 1)
+	go func() {
+		value, err := controller.RequestApproval(t.Context(), seatApprovalTestRequest(51))
+		if err != nil {
+			t.Error(err)
+		}
+		result <- value
+	}()
+	value := awaitSeatApprovalTest(t, result)
+	if value.State != "refused" || value.Reason != "approval dialog unavailable" {
+		t.Fatalf("dialog failure=%+v", value)
 	}
 }

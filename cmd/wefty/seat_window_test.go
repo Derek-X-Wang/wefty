@@ -81,11 +81,12 @@ func TestSeatWindowVisibleAndCloseOnly(t *testing.T) {
 	}
 }
 
-// AP-4 inventories all production CLI switch arms, flag registrations and
-// outbound approval calls, plus every node control-socket route. Adding a
+// AP-4 checks the compiler principal invariant and adds a source inventory
+// of CLI dispatch, outbound calls and every node control-socket route. Adding a
 // control verb requires updating the reviewed inventory. This is paired with
 // L1 protocol tests that reject answers from CLI identities.
 func TestSeatApprovalNoCLIOrControlSocketAnswer(t *testing.T) {
+	TestSeatApprovalCLIPrincipalStructure(t)
 	if !strings.Contains(rootUsage, "seat window close") {
 		t.Fatal("the only approval mutation command must be window close")
 	}
@@ -112,10 +113,6 @@ func TestSeatApprovalNoCLIOrControlSocketAnswer(t *testing.T) {
 					for _, expression := range clause.List {
 						if literal, ok := expression.(*ast.BasicLit); ok && literal.Kind == token.STRING {
 							commands++
-							value, _ := strconv.Unquote(literal.Value)
-							if value == "approve" || value == "answer" || value == "allow" {
-								t.Errorf("CLI approval arm in %s: %s", path, value)
-							}
 						}
 					}
 				}
@@ -144,9 +141,6 @@ func TestSeatApprovalNoCLIOrControlSocketAnswer(t *testing.T) {
 				value, _ := strconv.Unquote(literal.Value)
 				if !control && (strings.HasSuffix(selector.Sel.Name, "Var") || selector.Sel.Name == "Bool" || selector.Sel.Name == "String") {
 					flags++
-					if value == "approve" || value == "approved" || value == "answer" {
-						t.Errorf("CLI approval flag in %s: %s", path, value)
-					}
 				}
 				if control && selector.Sel.Name == "HandleFunc" {
 					if !seatReviewedControlVerbs[value] {
