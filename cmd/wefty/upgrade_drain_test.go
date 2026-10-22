@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -71,6 +73,73 @@ func TestUpgradeDrainTimeoutPreservesStack(t *testing.T) {
 	}
 	if !f.node.ClaimsEnabled || !reflect.DeepEqual(before, installedUpgradeFiles(t, f)) || len(f.launchd.mutating()) != 0 {
 		t.Fatal("timeout changed installation or left claims disabled")
+	}
+}
+
+func TestUpgradeDrainTimeoutRetryabilityAfterRestore(t *testing.T) {
+	for _, transport := range []string{"plain", "fleet"} {
+		for _, outcome := range []string{"restored", "restore-failed", "pre-existing-disable", "new-disable"} {
+			t.Run(transport+"/"+outcome, func(t *testing.T) {
+				var f *upgradeFixture
+				if transport == "fleet" {
+					f = newFleetUpgradeFixture(t, serviceplan.Join)
+				} else {
+					f = newUpgradeFixture(t)
+				}
+				attempt := l1.NodeActiveAttempt{JobID: "late-job", AttemptID: "late-attempt"}
+				if outcome == "pre-existing-disable" {
+					f.node.ClaimsEnabled = false
+					f.node.IntentReason = "operator maintenance"
+					f.node.ActiveAttempts = []l1.NodeActiveAttempt{attempt}
+				}
+				set := f.operations.setClaims
+				f.operations.setClaims = func(ctx context.Context, p connprofile.Profile, request l1.NodeIntentRequest) (l1.Node, error) {
+					if request.ClaimsEnabled {
+						if outcome == "restore-failed" {
+							return l1.Node{}, errors.New("restore unavailable")
+						}
+						if outcome == "new-disable" {
+							f.node.IntentRevision++
+							f.node.IntentReason = "new operator disable"
+							return f.node, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict}}
+						}
+					}
+					node, err := set(ctx, p, request)
+					if err == nil && !request.ClaimsEnabled {
+						f.node.ActiveAttempts = []l1.NodeActiveAttempt{attempt}
+					}
+					return node, err
+				}
+				before := installedUpgradeFiles(t, f)
+				_, err := runUpgrade(t.Context(), f.host, false, io.Discard, 12*time.Second)
+				var out bytes.Buffer
+				writeCommandError(&out, err, true)
+				var envelope struct {
+					Error contract.APIError `json:"error"`
+				}
+				if decodeErr := json.Unmarshal(out.Bytes(), &envelope); decodeErr != nil {
+					t.Fatal(decodeErr)
+				}
+				wantRetryable := outcome == "restored"
+				if commandExitCode(err) != 5 || envelope.Error.Code != contract.ErrorConflict || envelope.Error.Retryable != wantRetryable || strings.Contains(envelope.Error.Message, "try again when") != wantRetryable || f.node.ClaimsEnabled != wantRetryable {
+					t.Fatalf("wrong timeout recovery advice: err=%v claims=%v JSON=%s", err, f.node.ClaimsEnabled, out.String())
+				}
+				if wantRetryable && !strings.Contains(envelope.Error.Message, attempt.JobID) {
+					t.Fatalf("missing blocking Job: %s", out.String())
+				}
+				if f.replaced || !reflect.DeepEqual(before, installedUpgradeFiles(t, f)) || len(f.launchd.mutating()) != 0 {
+					t.Fatal("timeout changed installation")
+				}
+				if outcome == "restore-failed" {
+					paths, _ := resolveSetupPaths(f.home)
+					if _, readErr := readUpgradeDrain(paths.config); readErr != nil || !strings.Contains(envelope.Error.Message, "restore upgrade intent failed") {
+						t.Fatalf("restore failure lost recovery evidence: %v %s", readErr, out.String())
+					}
+				} else {
+					assertNoUpgradeDrainReceipt(t, f)
+				}
+			})
+		}
 	}
 }
 

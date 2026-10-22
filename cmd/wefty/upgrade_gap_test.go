@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"strings"
 	"testing"
@@ -9,8 +11,56 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
+
+func TestUpgradeGapTimeoutJSONIsRetryable(t *testing.T) {
+	for _, transport := range []string{"plain", "fleet"} {
+		t.Run(transport, func(t *testing.T) {
+			var f *upgradeFixture
+			if transport == "fleet" {
+				f = newFleetUpgradeFixture(t, serviceplan.Join)
+			} else {
+				f = newUpgradeFixture(t)
+			}
+			f.node.ActiveAttempts = []l1.NodeActiveAttempt{
+				{JobID: "ordinary-1", AttemptID: "attempt-1"},
+				{JobID: "ordinary-2", AttemptID: "attempt-2"},
+				{JobID: "ordinary-3", AttemptID: "attempt-3"},
+				{JobID: "ordinary-4", AttemptID: "attempt-4"},
+				{JobID: "service", Class: contract.JobClassService},
+				{JobID: "restartable", Restartable: true},
+			}
+			_, err := runUpgrade(t.Context(), f.host, false, io.Discard, 12*time.Second)
+			var out bytes.Buffer
+			writeCommandError(&out, err, hasJSONFlag([]string{"upgrade", "--json"}))
+			var envelope struct {
+				Error contract.APIError `json:"error"`
+			}
+			if decodeErr := json.Unmarshal(out.Bytes(), &envelope); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if commandExitCode(err) != 5 || envelope.Error.Code != contract.ErrorConflict || !envelope.Error.Retryable || !strings.HasPrefix(envelope.Error.Message, "drain timed out; installed stack unchanged; try again when the running one-shots finish") {
+				t.Fatalf("wrong retry advice: err=%v JSON=%s", err, out.String())
+			}
+			for _, id := range []string{"ordinary-1", "ordinary-2", "ordinary-3"} {
+				if !strings.Contains(envelope.Error.Message, id) {
+					t.Fatalf("missing blocking Job %s: %s", id, out.String())
+				}
+			}
+			for _, id := range []string{"ordinary-4", "service", "restartable"} {
+				if strings.Contains(envelope.Error.Message, id) {
+					t.Fatalf("extra or nonblocking Job %s: %s", id, out.String())
+				}
+			}
+			if !f.node.ClaimsEnabled || f.replaced || len(f.launchd.mutating()) != 0 {
+				t.Fatal("gap timeout changed admission or installation")
+			}
+			assertNoUpgradeDrainReceipt(t, f)
+		})
+	}
+}
 
 func TestUpgradeGapKeepsClaimsOpen(t *testing.T) {
 	for _, finish := range []bool{false, true} {
