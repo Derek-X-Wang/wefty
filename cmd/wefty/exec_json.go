@@ -165,13 +165,14 @@ func resolveExecFinished(ctx context.Context, clients *apiClients, record contra
 func reportExecFinished(ctx context.Context, clients *apiClients, record contract.RunRecord, capture execCapture, jsonOutput bool, stdout, stderr io.Writer) error {
 	// Preserve the original plain verdict and recovery policy.
 	if !jsonOutput {
-		return reportExecRun(ctx, clients, record, stderr)
+		return reportExecRun(ctx, clients, record, capture, stderr)
 	}
 	event, result := resolveExecFinished(ctx, clients, record, capture)
 	if err := writeJSONLine(stdout, event); err != nil {
 		return err
 	}
 	writeExecPathHint(stderr, event)
+	writeExecDependencyHints(ctx, stderr, event, capture)
 	return result
 }
 
