@@ -155,10 +155,18 @@ func (m Manager) State(ctx context.Context, name string) (State, error) {
 	return s, nil
 }
 
+// Reload makes restored definitions visible before recovery starts old services.
+func (m Manager) Reload(ctx context.Context) error {
+	if _, err := m.command(ctx, "daemon-reload"); err != nil {
+		return fmt.Errorf("reload user manager: %w", err)
+	}
+	return nil
+}
+
 func (m Manager) start(ctx context.Context, name string, reload bool) error {
 	if reload {
-		if _, err := m.command(ctx, "daemon-reload"); err != nil {
-			return fmt.Errorf("reload user manager: %w", err)
+		if err := m.Reload(ctx); err != nil {
+			return err
 		}
 	}
 	if _, err := m.command(ctx, "enable", name); err != nil {
