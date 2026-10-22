@@ -6,7 +6,9 @@ import (
 	"testing"
 )
 
-func TestComputerRoomMatrixDoesNotNeedTheHostVM(t *testing.T) {
+// These are configured ceilings, not proof of host sizing defaults. The
+// 32 GiB Mac row requires #1132 to supply the 8 GiB host VM default.
+func TestComputerRoomConfiguredSeatMixMatrix(t *testing.T) {
 	for _, test := range []struct {
 		macGiB int
 		room   int
@@ -91,5 +93,21 @@ func TestDedicatedComputerCapCountsOnlyRunningSeatRequestComputers(t *testing.T)
 	usage = append(usage, ComputerRoomUsage{ComputerID: "owner", MemoryBytes: 1 << 30})
 	if _, err := room.Check(usage, false); !errors.Is(err, ErrComputerRoomFull) {
 		t.Fatalf("owner memory did not use the same room: %v", err)
+	}
+}
+
+func TestComputerRoomRespectsOwnerServiceSlots(t *testing.T) {
+	for _, count := range []int{0, 1, 9} {
+		policy, err := (NodePolicy{MaxServiceSlots: count}).WithComputerRoom(DefaultComputerRoomConfig(7 << 30))
+		if err != nil || policy.MaxServiceSlots != count {
+			t.Errorf("owner Slots %d changed to %d: %v", count, policy.MaxServiceSlots, err)
+		}
+	}
+}
+func TestComputerRoomRejectsTinySeatMemory(t *testing.T) {
+	room := DefaultComputerRoomConfig(7 << 30)
+	room.SeatMemoryBytes = (256 << 20) - 1
+	if err := room.Validate(); err == nil {
+		t.Fatal("Seat memory below 256 MiB accepted")
 	}
 }

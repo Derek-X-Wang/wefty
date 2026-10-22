@@ -406,7 +406,9 @@ is fixed at creation; replacing a Job projection never changes these fields.
 Stage A owner-made Computers, including pre-Seat database rows, have Seat
 limit 0 (no Seats), idle action `nothing`, network `internet`, and
 `seat_request_made=false`. Their existing memory limit, image, Storage and
-desired state are preserved. The owner's create API cannot supply
+desired state are preserved. Clones and imports of on-demand Computers become
+owner-made Computers with idle action `nothing` and no Seats in stage A.
+The owner's create API cannot supply
 Seat-request settings. The trusted Seat-request flow creates Computers with
 a positive Seat limit, idle action `delete`, the explicitly requested
 network, and `seat_request_made=true`. Creation replay compares these
@@ -417,8 +419,8 @@ request, idle-action and network-enforcement flows have their own contracts.
 
 Computer room is checked on the serving node from its configured ceiling and
 coherent local Computer records, without a helper call or a running host VM.
-`ComputerRoomConfig.Check` takes 1 GiB per Seat by default (a node setting),
-charging at least that share for starting or live Seats. An effective memory
+`ComputerRoomConfig.Check` takes 1 GiB per Seat by default (a node setting,
+with a minimum of 256 MiB), charging at least that share for starting or live Seats. An effective memory
 limit that remains larger stays charged until confirmed shrink or absence;
 ending a Seat alone does not free it. Owner-made Computers charge their fixed
 memory limit once and do not acquire an additional per-Seat charge. Invalid,
@@ -431,55 +433,70 @@ The dedicated cap defaults to 1 and counts only currently running Computers
 with `seat_request_made=true` and Seat limit 1. A full dedicated cap refuses
 only a dedicated request, before approval. Owner-made and stopped Computers
 do not count against it. All Computers still share the same memory ceiling.
-`NodePolicy.WithComputerRoom` applies P11: service Slots are at least the
-number of whole Seats that fit the configured total Computer memory, while
-retaining any larger configured service count. Node startup applies the same
-floor locally; setup installs the matching authoritative L1 service count.
-Nodes without configured Computer room keep today's Slot policy.
+`NodePolicy.WithComputerRoom` applies P11's service-Slot floor to the default
+count: the number of whole Seats that fit the configured total Computer memory.
+An explicit owner count, including a lower `--max-service-slots` or profile
+`max_service_slots`, stays authoritative (ADR-0004). Node startup and setup
+warn when that count is below the room-derived floor. Setup installs a matching
+L1 count only when its service plan supplies readable setup state and the local
+profile has no explicit count. It preserves every other node's policy. Nodes
+without configured Computer room keep today's Slot policy. Missing or unreadable
+node setup state logs `computer_room_unconfigured` and keeps the node agent and
+process jobs running with that policy; doctor still reports
+`oci_convergence_state_unavailable`.
 
-On a Mac, the usable ceiling is the configured host VM memory minus a fixed
-1 GiB infrastructure reserve. `DefaultMacComputerCapacity` passes the total
+On a Mac (`VMType == "vz"`), the usable ceiling is the smaller of configured
+host VM memory minus a fixed 1 GiB infrastructure reserve and the installed
+helper capacity minus its configured reserve. On native Linux, only the
+configured capacity minus reserve applies; host VM sizing does not apply.
+`DefaultMacComputerCapacity` passes the total
 configured VM bytes and that reserve separately to the existing helper
 admission arithmetic. It no longer applies a fixed 4 GiB ceiling or a quarter
 reserve. The configured size is read from durable setup state even while the
 VM is stopped; `MemAvailable` is never used for room. A 4 GiB host VM on a
 16 GiB Mac has room for 3 default Seats; an 8 GiB host VM on a 32 GiB Mac has
 room for 7, in any mix allowed by the dedicated cap. Host VM size defaults
-and setup/recreation are separate work (#1132, #1021).
+and setup/recreation are separate work (#1132, #1021). The 32 GiB Mac row
+requires #1132 to supply the 8 GiB host VM default. Existing installs retain
+their installed helper ceiling, including after a host VM resize, until OCI
+bootstrap runs again; room cannot exceed that ceiling in the meantime.
 
 The default Computer image is an L1 startup setting, like the cluster Backup
-cap. `Store.ComputerDefaultImage` gives the trusted request flow the current
+cap. The setting must include a digest pin (`repository[:tag]@sha256:...`).
+`Store.ComputerDefaultImage` gives the trusted request flow that pinned
 reference; the serving node resolves it and creation records the immutable
 digest, as for today's Computers. Creation rechecks that a new on-demand
-Computer names the current default. If the owner changed it while the node
+Computer names the current default, comparing normalized repository names
+and the immutable digest. If the owner changed it while the node
 resolved the image, creation conflicts and asks the caller to resolve the new
 reference. An identical creation replay keeps its original image even after
 the default changes. An existing Computer changes its image only by reimage;
 an owner-made Computer keeps its explicitly selected image. The setting is
-validated as an OCI reference without contacting a registry. An unconfigured
-default is reported explicitly, rather than inventing a release image or
+validated as a digest-pinned OCI reference without contacting a registry. An
+unconfigured default is reported explicitly, rather than inventing a release image or
 digest; the shipped multi-Seat image and release pin are #1136's.
 
 For #1134's settings, P17 installs `--computer-default-image` and
 `--computer-shared-seat-limit` (default 2) on L1, and
 `--computer-seat-memory-bytes` (default 1073741824) and
 `--computer-dedicated-cap` (default 1; 0 disables dedicated requests) on the
-node agent. `wefty setup` accepts the same flags. Its optional
-`--oci-setup-state` forwards the existing node startup flag and reads the
-configured host VM size; it never creates, resizes, starts or recreates the
-host VM. An OCI-configured installation plan can also supply that path.
-Setup writes the derived service-Slot floor to L1's existing node-policy
-flags, retaining every node's tags and one-shot and larger service counts.
+node agent. `wefty setup` accepts the same four settings flags. Setup does
+not accept or record `--oci-setup-state`; #1132 owns the per-user host VM path.
+An OCI-configured installation plan can supply the node's existing startup
+flag. Only then can setup read room and install the default L1 service-Slot
+floor, retaining explicit owner counts, every node's tags and one-shot Slots.
+It validates settings against the role and reads any plan-owned setup state
+before Fabric enrolment.
 
-Installed service definitions retain their own Computer settings in a
-versioned, non-secret environment record beside the startup arguments.
-Setup reruns preserve omitted values, reject unreadable or unknown settings,
-and change only the service that consumes the changed value. In particular,
-changing the cluster default image does not restart the node agent. The
-same rules apply to LaunchAgent plists and systemd user units. An install
-with no Computer settings or configured room retains its prior service
-definition bytes. Host VM setup and lifecycle, dialog waits and Seat lifetime
-timers remain with their respective wave tickets.
+The setup receipt retains explicit Computer settings outside the service
+environment. Setup reruns preserve omitted values, reject unreadable or invalid
+settings, and change only the service that consumes the changed value. In
+particular, changing the cluster default image does not restart the node agent.
+No settings record is inherited by process jobs, and setup need not parse
+installed plists. The same rules apply to LaunchAgent plists and systemd user
+units. An install with no Computer settings or configured room retains its
+prior service definition bytes. Host VM setup and lifecycle, dialog waits and
+Seat lifetime timers remain with their respective wave tickets.
 
 Start, stop, restart, reset, reimage, grow, Backup-cap mutation, removal, and projection replacement require the exact observed
 `intent_revision` and `storage_id@generation`. The transaction returns

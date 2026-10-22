@@ -3,9 +3,11 @@ package main
 import (
 	"errors"
 	"flag"
-	"fmt"
+	"log"
 	"os"
+	"strconv"
 
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/l1"
 	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -17,8 +19,15 @@ type computerRoomFlags struct {
 }
 
 func bindComputerRoomFlags(flags *flag.FlagSet) *computerRoomFlags {
-	values := &computerRoomFlags{}
-	flags.Int64Var(&values.seatMemoryBytes, "computer-seat-memory-bytes", l1.DefaultSeatMemoryBytes, "node-local room charged per Seat")
+	values := &computerRoomFlags{seatMemoryBytes: l1.DefaultSeatMemoryBytes}
+	flags.Func("computer-seat-memory-bytes", "node-local room charged per Seat (minimum 268435456; default 1073741824)", func(value string) error {
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || n < l1.MinimumSeatMemoryBytes {
+			return errors.New("room per Seat must be at least 256 MiB")
+		}
+		values.seatMemoryBytes = n
+		return nil
+	})
 	flags.IntVar(&values.dedicatedCap, "computer-dedicated-cap", l1.DefaultDedicatedComputerCap, "running Seat-request-made dedicated Computer cap; 0 disables dedicated requests")
 	return values
 }
@@ -34,16 +43,23 @@ func (values *computerRoomFlags) configured(path string, capacity, reserve int64
 // must work before a stopped host VM has a helper or can publish capabilities.
 // A legacy node without a configured ceiling keeps its existing admission.
 func configuredComputerRoom(setupPath string, capacity, reserve, seatMemory int64, dedicatedCap int) (*l1.ComputerRoomConfig, error) {
+	var vmRoom *int64
 	if setupPath != "" {
 		state, err := ocicontrol.ReadSetupState(setupPath)
 		if err != nil {
-			return nil, fmt.Errorf("read configured host VM size for Computer room: %w", err)
+			log.Printf("event=computer_room_unconfigured reason=setup_state_unavailable error=%q", err)
+			return nil, nil
 		}
-		capacity, reserve, err = limarunner.DefaultMacComputerCapacity(limarunner.Sizing{
-			Memory: state.VMMemory, CPUs: state.VMCPUs, Disk: state.VMDisk,
-		})
-		if err != nil {
-			return nil, err
+		if capacity == 0 {
+			capacity, reserve = state.MemoryCapacityBytes, state.MemoryReserveBytes
+		}
+		if state.VMType == "vz" {
+			total, infra, err := limarunner.DefaultMacComputerCapacity(limarunner.Sizing{Memory: state.VMMemory, CPUs: state.VMCPUs, Disk: state.VMDisk})
+			if err != nil {
+				return nil, err
+			}
+			available := total - infra
+			vmRoom = &available
 		}
 	}
 	if capacity == 0 {
@@ -52,7 +68,11 @@ func configuredComputerRoom(setupPath string, capacity, reserve, seatMemory int6
 	if capacity < 0 || reserve < 0 {
 		return nil, errors.New("Computer capacity and infrastructure reserve must be non-negative")
 	}
-	room := l1.ComputerRoomConfig{MemoryBytes: max(int64(0), capacity-reserve),
+	available := max(int64(0), capacity-reserve)
+	if vmRoom != nil {
+		available = min(available, *vmRoom)
+	}
+	room := l1.ComputerRoomConfig{MemoryBytes: available,
 		SeatMemoryBytes: seatMemory, DedicatedCap: dedicatedCap}
 	if err := room.Validate(); err != nil {
 		return nil, err
@@ -77,4 +97,24 @@ func configuredMacSizing(setupPath string, defaults func() (limarunner.Sizing, e
 		return limarunner.Sizing{}, err
 	}
 	return sizing, sizing.Validate()
+}
+
+func computerRoomServiceSlots(room l1.ComputerRoomConfig, count int, explicit bool, profile connprofile.Profile, nodeID string) (int, error) {
+	if !explicit {
+		if policy, ok := profile.L1().NodePolicies()[nodeID]; ok {
+			count = policy.MaxServiceSlots
+			explicit = true
+		}
+	}
+	policy, err := (l1.NodePolicy{MaxServiceSlots: count}).WithComputerRoom(room)
+	if err != nil {
+		return 0, err
+	}
+	if !explicit {
+		return policy.MaxServiceSlots, nil
+	}
+	if count < int(room.MemoryBytes/room.SeatMemoryBytes) {
+		log.Printf("event=computer_room_service_slots_owner_override service_slots=%d room_seats=%d", count, room.MemoryBytes/room.SeatMemoryBytes)
+	}
+	return count, nil
 }

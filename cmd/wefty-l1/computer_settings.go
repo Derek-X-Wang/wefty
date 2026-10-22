@@ -14,7 +14,7 @@ type computerStartupFlags struct {
 
 func bindComputerStartupFlags(flags *flag.FlagSet) *computerStartupFlags {
 	values := &computerStartupFlags{}
-	flags.StringVar(&values.image, "computer-default-image", "", "cluster default on-demand Computer image reference; the serving node resolves its digest")
+	flags.StringVar(&values.image, "computer-default-image", "", "digest-pinned cluster default on-demand Computer image reference")
 	flags.IntVar(&values.sharedSeatLimit, "computer-shared-seat-limit", l1.DefaultSharedComputerSeatLimit, "default Seat limit of a new shared Computer; bounded by its image")
 	return values
 }

@@ -551,11 +551,10 @@ func run() error {
 		return err
 	}
 	if computerRoom != nil {
-		policy, err := (l1.NodePolicy{MaxServiceSlots: *maxServiceSlots}).WithComputerRoom(*computerRoom)
+		*maxServiceSlots, err = computerRoomServiceSlots(*computerRoom, *maxServiceSlots, layer.Explicit["max-service-slots"], profile, *nodeID)
 		if err != nil {
 			return err
 		}
-		*maxServiceSlots = policy.MaxServiceSlots
 		log.Printf("event=computer_room_configured memory_bytes=%d seat_memory_bytes=%d dedicated_cap=%d service_slots=%d",
 			computerRoom.MemoryBytes, computerRoom.SeatMemoryBytes, computerRoom.DedicatedCap, *maxServiceSlots)
 	}

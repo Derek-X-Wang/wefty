@@ -8,6 +8,7 @@ import (
 
 const (
 	DefaultSeatMemoryBytes      int64 = 1 << 30
+	MinimumSeatMemoryBytes      int64 = 256 << 20
 	DefaultDedicatedComputerCap       = 1
 )
 
@@ -31,8 +32,8 @@ func DefaultComputerRoomConfig(memoryBytes int64) ComputerRoomConfig {
 }
 
 func (config ComputerRoomConfig) Validate() error {
-	if config.MemoryBytes < 0 || config.SeatMemoryBytes <= 0 || config.DedicatedCap < 0 {
-		return errors.New("Computer room requires non-negative memory and dedicated cap, and positive memory per Seat")
+	if config.MemoryBytes < 0 || config.SeatMemoryBytes < MinimumSeatMemoryBytes || config.DedicatedCap < 0 {
+		return errors.New("Computer room requires non-negative memory and dedicated cap, and at least 256 MiB per Seat")
 	}
 	if config.MemoryBytes/config.SeatMemoryBytes > int64(int(^uint(0)>>1)) {
 		return errors.New("Computer room exceeds the service-Slot count range")
@@ -105,7 +106,8 @@ func (config ComputerRoomConfig) Check(usage []ComputerRoomUsage, dedicated bool
 
 // WithComputerRoom applies P11's service-Slot floor without changing routing,
 // one-shot Slots, claims intent, or the room of other nodes. Setup writes this
-// effective service count into L1's installed startup flags.
+// effective service count into L1's installed startup flags. Explicit owner
+// counts are authoritative; callers also preserve explicit default-valued counts.
 func (policy NodePolicy) WithComputerRoom(config ComputerRoomConfig) (NodePolicy, error) {
 	if err := config.Validate(); err != nil {
 		return NodePolicy{}, err
@@ -113,6 +115,8 @@ func (policy NodePolicy) WithComputerRoom(config ComputerRoomConfig) (NodePolicy
 	if policy.MaxServiceSlots < 0 {
 		return NodePolicy{}, errors.New("configured service Slots must be non-negative")
 	}
-	policy.MaxServiceSlots = max(policy.MaxServiceSlots, int(config.MemoryBytes/config.SeatMemoryBytes))
+	if policy.MaxServiceSlots == DefaultMaxServiceSlots {
+		policy.MaxServiceSlots = max(policy.MaxServiceSlots, int(config.MemoryBytes/config.SeatMemoryBytes))
+	}
 	return policy, nil
 }

@@ -598,6 +598,10 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		return report, err
 	}
 	files = append(files, skillFiles...)
+	request.computer, err = resolveSetupComputerSettings(paths, request.computer)
+	if err != nil {
+		return report, err
+	}
 	services, err := setupServices(paths, profile, sourceDigests, nodeAgentPATH, request.computer)
 	if err != nil {
 		return report, err
@@ -684,7 +688,7 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			change: "installed " + filepath.Join(paths.bin, name)}}, files...)
 	}
 	previous := setupManifest{Version: 1, Files: map[string]string{}}
-	manifest := setupManifest{Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
+	manifest := setupManifest{Computer: request.computer.recorded(), Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
 	if payload, err := homeRoot.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
 		if json.Unmarshal(payload, &previous) == nil && previous.Version == 1 {
 			manifest.Role = previous.Role

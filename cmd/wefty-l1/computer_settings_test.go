@@ -10,7 +10,7 @@ import (
 func TestComputerStartupFlagsSetClusterDefaults(t *testing.T) {
 	flags := flag.NewFlagSet("l1", flag.ContinueOnError)
 	values := bindComputerStartupFlags(flags)
-	if err := flags.Parse([]string{"--computer-default-image=ghcr.io/example/desktop:current", "--computer-shared-seat-limit=3"}); err != nil {
+	if err := flags.Parse([]string{"--computer-default-image=ghcr.io/example/desktop:current@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "--computer-shared-seat-limit=3"}); err != nil {
 		t.Fatal(err)
 	}
 	var options l1.StoreOptions
@@ -23,7 +23,7 @@ func TestComputerStartupFlagsSetClusterDefaults(t *testing.T) {
 	}
 	defer store.Close()
 	image, err := store.ComputerDefaultImage()
-	if err != nil || image != "ghcr.io/example/desktop:current" || store.ComputerSharedSeatLimit() != 3 {
+	if err != nil || image != "ghcr.io/example/desktop:current@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" || store.ComputerSharedSeatLimit() != 3 {
 		t.Fatalf("cluster defaults = %q / %d, %v", image, store.ComputerSharedSeatLimit(), err)
 	}
 }

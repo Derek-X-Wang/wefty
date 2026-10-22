@@ -232,6 +232,10 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 	if err != nil {
 		return report, err
 	}
+	request.computer, err = validateSetupComputerPlan(paths, plan, request.computer)
+	if err != nil {
+		return report, err
+	}
 	_, receiptErr := os.Lstat(filepath.Join(paths.config, setupManifestName))
 	if receiptErr != nil && !errors.Is(receiptErr, fs.ErrNotExist) {
 		return report, receiptErr
@@ -619,6 +623,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		}
 
 	}
+	manifest.Computer = request.computer.recorded()
 	services, err := setupRoleServices(paths, profile, digests, loginPATH, role, request.computer)
 	if err != nil {
 		return report, err
@@ -722,6 +727,20 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			return report, err
 		}
 		if err := step("receipt"); err != nil {
+			return report, err
+		}
+	}
+	// A settings-only rerun retains its values in the receipt as well as the
+	// service arguments. All non-service files were verified above.
+	if committed && manifest.Computer != nil {
+		for i, service := range services {
+			manifest.Files[filepath.Join(paths.launchAgentsRel, manager.file(service.Label))] = payloadDigest(plists[i])
+		}
+		payload, err := json.MarshalIndent(manifest, "", "  ")
+		if err != nil {
+			return report, err
+		}
+		if err := write(setupFile{folder: paths.configRel, name: setupManifestName, payload: append(payload, '\n'), mode: 0600}); err != nil {
 			return report, err
 		}
 	}
