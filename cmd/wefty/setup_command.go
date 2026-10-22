@@ -92,6 +92,7 @@ type setupHost struct {
 	conversionClients     func(context.Context, connprofile.Profile) (*apiClients, error)
 	conversionFilesClosed func(context.Context, []string) error
 	conversionComputers   func(context.Context, connprofile.Profile) ([]l1.Computer, error)
+	conversionCopy        *plainConversionCopyOps
 	bootTime              func() (time.Time, error)
 	peerLookup            func(context.Context, fabricconfig.Config) (fabric.PeerLookup, fabricconfig.CloseFunc, error)
 	ownerLogin            func(context.Context, string) error

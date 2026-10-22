@@ -18,6 +18,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
+	"github.com/Derek-X-Wang/wefty/internal/conversioninventory"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
@@ -65,14 +66,15 @@ type plainConversionService struct {
 }
 
 type plainConversion struct {
-	Version    int                      `json:"version"`
-	NodeID     string                   `json:"node_id"`
-	Phase      string                   `json:"phase"`
-	Profile    connprofile.Profile      `json:"plain_profile"`
-	Services   []plainConversionService `json:"plain_services"`
-	History    plainHistory             `json:"history"`
-	JoinCode   string                   `json:"join_code"`
-	WithPerson bool                     `json:"with_person,omitempty"`
+	Version            int                      `json:"version"`
+	NodeID             string                   `json:"node_id"`
+	Phase              string                   `json:"phase"`
+	Profile            connprofile.Profile      `json:"plain_profile"`
+	Services           []plainConversionService `json:"plain_services"`
+	History            plainHistory             `json:"history"`
+	JoinCode           string                   `json:"join_code"`
+	WithPerson         bool                     `json:"with_person,omitempty"`
+	InventoryDirectory string                   `json:"inventory_directory,omitempty"`
 }
 
 func readPlainConversion(paths setupPaths) (*plainConversion, error) {
@@ -107,6 +109,9 @@ func readPlainConversion(paths setupPaths) (*plainConversion, error) {
 	}
 	if !slices.Contains([]string{"prepared", "drain", "stop", "moving", "restoring", "history", "joining"}, r.Phase) {
 		return nil, errors.New("invalid plain conversion phase")
+	}
+	if r.InventoryDirectory != "" && (!validPlainConversionInventoryDirectory(paths, r.InventoryDirectory) || (r.Phase != "stop" && r.Phase != "restoring")) {
+		return nil, errors.New("invalid plain conversion inventory directory")
 	}
 	for i, label := range []string{setupL1Label, setupL3Label, setupNodeAgentLabel} {
 		if r.Services[i].Label != label || len(r.Services[i].Plist) == 0 {
@@ -193,10 +198,17 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			}
 			return runPlainConversion(ctx, host, request, paths, current)
 		}
-		if err := restorePlainConversion(ctx, host, paths, record, upgradeOperations(host), io.Discard); err != nil {
+		var warnings strings.Builder
+		if err := restorePlainConversion(ctx, host, paths, record, upgradeOperations(host), &warnings); err != nil {
 			return report, err
 		}
-		return setupReport{NodeID: record.NodeID, Profile: paths.profile, NodeConfig: paths.nodeConfig, BinDir: paths.bin, DataDir: paths.data, LogDir: paths.logs, Notes: []string{"Conversion abandoned; the plain installation and maintenance commands are restored."}}, nil
+		notes := []string{"Conversion abandoned; the plain installation and maintenance commands are restored."}
+		for _, line := range strings.Split(strings.TrimSpace(warnings.String()), "\n") {
+			if strings.HasPrefix(line, "warning: ") {
+				notes = append(notes, line)
+			}
+		}
+		return setupReport{NodeID: record.NodeID, Profile: paths.profile, NodeConfig: paths.nodeConfig, BinDir: paths.bin, DataDir: paths.data, LogDir: paths.logs, Notes: notes}, nil
 	}
 	// Validate the independently selected coordinator and code before draining.
 	// Once the fleet stage exists its own exact-code recovery rules apply.
@@ -258,6 +270,7 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 	if out == nil {
 		out = io.Discard
 	}
+	buildChecked := false
 	if record == nil {
 		if err := refuseConversionUpgradeStage(root, paths); err != nil {
 			return report, err
@@ -287,11 +300,15 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 		if err != nil {
 			return report, err
 		}
-		for _, name := range []string{"wefty", "wefty-agent"} {
+		for _, name := range []string{"wefty", "wefty-agent", "wefty-l1"} {
 			if _, err := executableDigest(filepath.Join(source, name)); err != nil {
 				return report, err
 			}
 		}
+		if err := checkPlainConversionBuild(ctx, host, request); err != nil {
+			return report, err
+		}
+		buildChecked = true
 		if _, err := captureLoginPATH(ctx, host); err != nil {
 			return report, err
 		}
@@ -340,6 +357,11 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 	// boundary, recover the original plain stack and its fenced claims first.
 	if !conversionForward(record) && record.Phase != "prepared" {
 		if err := restorePlainConversion(ctx, host, paths, record, op, out); err != nil {
+			return report, err
+		}
+	}
+	if !conversionForward(record) && !buildChecked {
+		if err := checkPlainConversionBuild(ctx, host, request); err != nil {
 			return report, err
 		}
 	}
@@ -478,6 +500,16 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			}
 		}
 		if err := closed(ctx, databaseFiles); err != nil {
+			return report, err
+		}
+		if err := checkQuiescentPlainConversionWork(ctx, host, request, paths, record); err != nil {
+			var refusal *apiResponseError
+			if errors.As(err, &refusal) {
+				return report, err
+			}
+			return report, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "conversion refused; quiescent unfinished-work inventory is unverified: " + err.Error() + "; repair inventory and retry later"}}
+		}
+		if err := step("convert:quiescent"); err != nil {
 			return report, err
 		}
 		if err := removeConversionIdentityStagingLink(root, paths.dataRel); err != nil {
@@ -636,7 +668,7 @@ func conversionBlockers(ctx context.Context, host setupHost, profile connprofile
 	for _, c := range computers {
 		// Removal intent is also 'removed' while cleanup is pending. Only
 		// retired records can be ignored; their unfinished cleanup still blocks.
-		if c.DesiredState == contract.ServiceDesiredRemoved && c.RemovalOutcome != "removal_pending" && c.CurrentJob.State != contract.JobRemovalPending {
+		if conversioninventory.ComputerRetired(c.DesiredState, c.RemovalOutcome, c.CurrentJob.State) {
 			continue
 		}
 		if c.BoundNodeID == node.NodeID || c.PlacementNodeID == node.NodeID {
@@ -644,9 +676,11 @@ func conversionBlockers(ctx context.Context, host setupHost, profile connprofile
 		}
 	}
 	if len(blockers) != 0 {
-		return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "conversion blocked by " + strings.Join(blockers, ", ") + "; stop or retire these through their normal lifecycle, then retry later"}}
+		return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "conversion blocked by " + strings.Join(blockers, ", ") + "; " + plainConversionComputerAdvice}}
 	}
-	return nil
+	// Include non-resident service stop/removal at every blocker checkpoint,
+	// not only in the last live inventory before the authorities stop.
+	return checkPlainConversionServices(ctx, host, profile)
 }
 
 func listPlainConversionComputers(ctx context.Context, profile connprofile.Profile) (result []l1.Computer, err error) {
@@ -782,6 +816,20 @@ func restorePlainConversion(ctx context.Context, host setupHost, paths setupPath
 	}
 	if err := recoverUpgradeDrain(recovery, op, paths, r.Profile, out); err != nil {
 		return err
+	}
+	// The plain stack runs again before the private inventory copy is removed.
+	// A failed removal must not keep the owner's daily install stopped or in
+	// recovery, so it only warns.
+	if folder := r.InventoryDirectory; folder != "" {
+		if err := cleanupPlainConversionInventory(root, paths, r); err != nil {
+			if validPlainConversionInventoryDirectory(paths, folder) {
+				fmt.Fprintf(out, "warning: the plain installation is restored, but the temporary conversion inventory copy %s was not removed (%v); delete that folder by hand\n", folder, err)
+			} else {
+				fmt.Fprintf(out, "warning: the plain installation is restored; the recorded conversion inventory folder is invalid and was left untouched (%v)\n", err)
+			}
+			// The warning names the folder; a resumed run must not carry it on.
+			r.InventoryDirectory = ""
+		}
 	}
 	r.Phase, r.History.Files, r.History.Size, r.History.ReadOnly = "prepared", nil, 0, false
 	if err := root.Remove(filepath.Join(paths.configRel, plainConversionName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
