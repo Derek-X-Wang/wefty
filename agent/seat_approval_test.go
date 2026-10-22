@@ -414,3 +414,54 @@ func TestSeatApprovalDialogErrorRefusesImmediately(t *testing.T) {
 		t.Fatalf("dialog failure=%+v", value)
 	}
 }
+
+// A slow L1 answer must not hold the only dialog slot. Domain time stays
+// fixed while the first post is blocked; the second request can still show.
+type seatApprovalSlowAnswerClient struct {
+	SeatApprovalClient
+	posting chan struct{}
+	release <-chan struct{}
+}
+
+func (c seatApprovalSlowAnswerClient) AnswerSeatApproval(ctx context.Context, seatID string, answer l1.SeatApprovalAnswer) (l1.SeatApproval, error) {
+	if seatID == seatApprovalTestRequest(60).SeatID {
+		close(c.posting)
+		<-c.release
+	}
+	return c.SeatApprovalClient.AnswerSeatApproval(ctx, seatID, answer)
+}
+
+func TestSeatApprovalReleasesDialogBeforePostingAnswer(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC))
+	client, _ := approvalTestClient(t, clock)
+	posting, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	shown := make(chan SeatApprovalPrompt, 2)
+	controller, err := NewSeatApprovalController(seatApprovalSlowAnswerClient{client, posting, release}, "mac", "boot", SeatApprovalSettings{}, SeatApprovalDialogFunc(func(_ context.Context, p SeatApprovalPrompt) (SeatApprovalChoice, error) {
+		shown <- p
+		return SeatApprovalDeny, nil
+	}), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	request := func(id int) {
+		_, err := controller.RequestApproval(t.Context(), seatApprovalTestRequest(id))
+		results <- err
+	}
+	go request(60)
+	awaitSeatApprovalTest(t, shown)
+	awaitSeatApprovalTest(t, posting)
+	go request(61)
+	if p := awaitSeatApprovalTest(t, shown); p.Wait != 5*time.Minute {
+		t.Fatalf("second dialog wait=%s", p.Wait)
+	}
+	if err := awaitSeatApprovalTest(t, results); err != nil {
+		t.Fatal(err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := awaitSeatApprovalTest(t, results); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -183,8 +183,9 @@ func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1
 		defer stopTimer(timer)
 		select {
 		case c.dialogSlot <- struct{}{}:
-			defer func() { <-c.dialogSlot }()
 			answer.Approved, answer.Reason = c.awaitSeatApprovalDialog(ctx, request, deadline, timer)
+			// Show has returned. A slow L1 post must not hold up the next dialog.
+			<-c.dialogSlot
 		case <-ctx.Done():
 			answer.Reason = "approval dialog lost"
 		case <-timer.C():

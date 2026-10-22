@@ -113,7 +113,10 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	if agentMounts != 1 {
 		t.Fatalf("node-principal mux mounts=%d", agentMounts)
 	}
-	allowed := map[string]bool{"GET /v1/seat-approval-windows": true, "POST /v1/seat-approval-windows/close": true}
+	allowed := map[string]string{
+		"GET /v1/seat-approval-windows":        "listSeatApprovalWindows",
+		"POST /v1/seat-approval-windows/close": "closeSeatApprovalWindows",
+	}
 	seen := map[string]bool{}
 	for _, file := range files {
 		ast.Inspect(file, func(n ast.Node) bool {
@@ -159,8 +162,11 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 				return true
 			}
 			route := constant.StringVal(pattern)
-			if !allowed[route] {
+			expected, allowedRoute := allowed[route]
+			if !allowedRoute {
 				t.Errorf("non-node route reaches approval SQL: %s", route)
+			} else if handlers := byName[expected]; len(handlers) != 1 || calls.function(call.Args[1]) != handlers[0] {
+				t.Errorf("approval route %s must use its exact reviewed handler %s", route, expected)
 			} else {
 				seen[route] = true
 			}

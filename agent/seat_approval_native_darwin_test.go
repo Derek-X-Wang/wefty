@@ -57,6 +57,9 @@ function run() {
   var app={activate:function(){calls.push('activate');},displayDialog:function(){calls.push('dialog');throw {errorNumber:code};}};
   results.push({answer:presentSeatApproval(app,{message:'test',seconds:1}),calls:calls});
  });
+ var calls=[];
+ var app={activate:function(){calls.push('activate');throw {errorNumber:-1708};},displayDialog:function(){calls.push('dialog');return {buttonReturned:'Approve'};}};
+ results.push({answer:presentSeatApproval(app,{message:'test',seconds:1}),calls:calls});
  return JSON.stringify(results);
 }`
 	if strings.Contains(script, "Application") {
@@ -70,10 +73,10 @@ function run() {
 		Answer string
 		Calls  []string
 	}
-	if err := json.Unmarshal(output, &result); err != nil || len(result) != 2 {
+	if err := json.Unmarshal(output, &result); err != nil || len(result) != 3 {
 		t.Fatalf("presentation probe: %v %s", err, output)
 	}
-	for i, want := range []string{"deny", "unavailable"} {
+	for i, want := range []string{"deny", "unavailable", "approve"} {
 		if result[i].Answer != want || strings.Join(result[i].Calls, ",") != "activate,dialog" {
 			t.Fatalf("probe[%d]=%+v", i, result[i])
 		}

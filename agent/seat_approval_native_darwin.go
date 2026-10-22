@@ -77,8 +77,8 @@ function ownerSession() {
 // JavaScript fake, with no reference to a native application or actual dialog.
 const seatApprovalPresentationScript = `
 function presentSeatApproval(app, prompt) {
+    try { app.activate(); } catch (error) {}
     try {
-        app.activate();
         var reply = app.displayDialog(prompt.message, {
             withTitle: 'Wefty Computer request',
             buttons: ['Deny', 'Approve'], defaultButton: 'Deny',

@@ -104,3 +104,14 @@ func TestSeatApprovalAnswerWaitCapped(t *testing.T) {
 		t.Fatal("L1 accepted an answer wait longer than one hour")
 	}
 }
+
+func TestSeatApprovalFolderLimitCountsRunes(t *testing.T) {
+	request := SeatApprovalRequest{SeatID: "seat_" + strings.Repeat("a", 32), NodeID: "mac", BootSessionID: "boot", Harness: "test", Folder: strings.Repeat("界", 4096), Form: "any", Network: "none", AnswerWait: 5 * time.Minute}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("4096-character folder refused: %v", err)
+	}
+	request.Folder += "界"
+	if err := request.Validate(); err == nil {
+		t.Fatal("4097-character folder accepted")
+	}
+}
