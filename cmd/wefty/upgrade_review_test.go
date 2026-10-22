@@ -170,7 +170,7 @@ func TestUpgradeRechecksBeforeNodeReplacement(t *testing.T) {
 				}
 				return observe(ctx, p)
 			}
-			_, err := runUpgrade(t.Context(), f.host, false, io.Discard)
+			report, err := runUpgrade(t.Context(), f.host, false, io.Discard)
 			if err == nil || commandExitCode(err) != exitConflict || !strings.Contains(err.Error(), "before node replacement") {
 				t.Fatalf("race not refused: %v", err)
 			}
@@ -179,6 +179,9 @@ func TestUpgradeRechecksBeforeNodeReplacement(t *testing.T) {
 			}
 			if race == "late-one-shot" && (!f.node.ClaimsEnabled || len(f.node.ActiveAttempts) != 1) {
 				t.Fatal("late run not preserved/claims not restored")
+			}
+			if race == "late-one-shot" && (len(report.RunningWork) != 1 || report.RunningWork[0].AttemptID != "late") {
+				t.Fatalf("late replacement observation omitted: %+v", report.RunningWork)
 			}
 			assertNoUpgradeDrainReceipt(t, f)
 		})

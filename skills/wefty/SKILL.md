@@ -63,8 +63,10 @@ During an active upgrade drain, status also exits 0 and says:
 busy, queued: upgrading; new runs wait and start when it ends
 ```
 
-Submit with `--detach` and wait. Resident one-shots finish while services keep
-running; new runs wait for upgrade completion. Do not treat this busy answer as
+Submit with `--detach` and wait. Ordinary one-shots finish while services keep
+running. Restartable ones stop and settle, then queue behind disabled claims
+until replacement health and admission restoration. New runs also wait for
+upgrade completion; the first claim need not be immediate. Do not treat this busy answer as
 a request to repair the cluster. During the brief control-plane restart, status
 may instead exit 0 with `busy: upgrading; retry in a few seconds`. Retry status
 after a few seconds before submitting if the control services are unreachable.
@@ -132,11 +134,20 @@ A busy machine makes `exec` wait; this is normal, so agents should not cancel.
 wefty exec -- go test ./cmd/wefty/
 wefty exec --node NODE -- go test ./cmd/wefty/
 wefty exec --keep-running --max-runtime 30m -- go test ./cmd/wefty/
+wefty exec --restartable --detach -- gh run watch RUN_ID --exit-status
 wefty exec --json -- go test ./cmd/wefty/
 RUN_ID=$(wefty exec --detach --json -- go test ./cmd/wefty/ | jq -er '.run_id')
 wefty logs "$RUN_ID" --follow
 wefty cancel "$RUN_ID"
 ```
+
+Use `--restartable` only for commands safe to repeat and harmless if two copies
+briefly overlap, such as the read-only CI watcher above. It permits wefty to
+stop and repeat the command after an upgrade, reboot or agent failure with the
+same captured files. Never use it for work that must not repeat, such as
+"wait for CI, then merge". It does not retry command failures. The Run ID stays
+the same; `--max-runtime` is per Attempt; at most 10 automatic restarts are
+allowed. A command that ends while wefty stops it may run once more.
 
 `exec` freezes the base commit, tracked local changes, and untracked files
 that Git does not ignore before submission. Run it from inside a Git checkout
@@ -171,7 +182,7 @@ A run shares its machine with other runs and with the agents' own work. Test run
 stdout and stderr are separate streams, so their order relative to each other
 is not kept. When order matters, merge them in the command: `sh -c '... 2>&1'`.
 
-For another Node, exec uploads one full-history git bundle to L3 before
+For another Node or any `--restartable` exec (including local), exec uploads one full-history git bundle to L3 before
 submission returns. The caller may then sleep. The default limits are 256 MiB
 per bundle and 2 GiB total on L3 (`--exec-capture-max-bytes` and
 `--exec-capture-total-bytes` on `wefty-l3`). A per-bundle refusal is exit 2;
@@ -197,7 +208,8 @@ when the run must survive that limit. A hard kill cannot be caught.
 | `--detach --json` | Print exactly one line: `{"run_id":"..."}` |
 | `--node NODE` | Pin to this owned Node ID; default is this machine's Node |
 | `--tag TAG` | Narrow the selected Node's Pinned run with an extra tag; repeatable |
-| `--max-runtime D` | Choose a runtime cap, such as `30m`; no cap by default |
+| `--restartable` | Permit safe repetition after infrastructure interruption; same Run ID, at most 10 restarts; no command-failure retry |
+| `--max-runtime D` | Choose a per-Attempt runtime cap, such as `30m`; no cap by default |
 
 `--keep-running` and `--detach` are alternatives. Flags after `--` belong to
 the command. In JSON mode, `output` has `stream` and `text`. `finished` has

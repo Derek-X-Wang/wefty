@@ -72,8 +72,23 @@ Upgrade reuses plain upgrade's revision-fenced claim disable, durable drain
 receipt, wait bounds, `--yes`, late-attempt and intent rechecks, service-job
 recovery, independent cleanup budget, and interrupted-upgrade recovery. It
 drains only its own Node. A previous or newer operator disable stays disabled.
-No #1085 decision is assumed: long one-shots can still exhaust the drain bound,
-and `--yes` still authorizes ending them during node-agent replacement.
+After disabling admission and observing late claims, it immediately requests
+exact-Attempt interruption for all restartable one-shots through that same saved
+client connection. It retains pre-disable restartable identities even when they disappear before
+the disabled observation, and explicitly resolves their exact settlement;
+`lost` or unknown evidence refuses replacement. It waits for ordinary one-shots to finish and for positive
+settlement of interrupted Attempts, bounded by the 10 s renewal interval plus
+the 70 s agent teardown bound within the remaining drain deadline. A lost
+Lease is not settlement. Ambiguous replies reuse the same request key. The
+human and JSON reports separate `waiting_nonrestartable`,
+`stopping_restartable` and `restart_pending`, retaining all observed Attempts in
+`running_work`. Unknown settlement fails with the existing timeout result and
+restores only upgrade-owned admission. Queued restartable Jobs start through
+ordinary claims after replacement health and admission restoration; no immediate
+first claim is promised (#1072). Rollback or interrupted-upgrade cleanup restores
+owned admission without undoing the interruption; the old agent can claim the
+queued Jobs again. `--yes` still authorizes ending one-shots during replacement
+without waiting.
 
 The control plane publishes CLI/L1/L3 first, restarts L1 then L3, and proves
 renewal before replacing its own node agent. It retains the 23-second window,

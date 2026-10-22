@@ -90,15 +90,37 @@ records that deadline before the disable CAS and uses it for the drain's wait
 and progress output. A pre-existing disable's reason does not set this new
 upgrade's deadline.
 
+Every restartable Attempt observed before admission closes remains in the
+settlement set, even if it disappears from the first disabled snapshot. Upgrade
+reads that exact Attempt explicitly; `lost` or unavailable evidence cannot
+permit replacement. Earlier observations remain subject to this check.
+
 Upgrade re-reads active attempts after disabling claims, including claimed
-attempts committed just before the CAS. It waits for **one-shot** attempts to
-finish normally; services continue running throughout this wait. Progress names
-the remaining one-shot count and deadline every five seconds. The default bound
-is five minutes; `--drain-timeout DURATION` accepts a Go duration of at least
-ten seconds. The first post-disable observation has its own probe budget, so
-an idle node cannot time out before its first observation completes.
-`--yes` skips this wait and permits the existing replacement to end one-shots
-at once. Before replacement, text output names each such job and attempt.
+attempts committed just before the CAS. It immediately requests interruption of
+every restartable process one-shot through the exact-Attempt interruption API,
+with that Attempt's Job, boot session, disabled intent revision, a stable retry
+key and `reason=upgrade`. All requests begin before settlement polling. Services
+continue running; non-restartable one-shots finish normally.
+
+An interruption acknowledgement is not settlement. Upgrade reads the exact old
+Attempt until it is `interrupted`, or has a normal terminal result because a
+natural exit or cancellation won. Absence from the Node's active list, a lost
+Lease, or a Job queued by Lease expiry does not prove termination. Each stop
+has at most the renewal interval (10 s) plus `agent.ForcedShutdownBound` with
+default timeouts (70 s), capped by the remaining drain deadline. An ambiguous
+request reply is retried with the same exact-Attempt identity and key. Unknown
+settlement fails the drain with the existing timeout result.
+
+Progress reports `waiting_nonrestartable`, `stopping_restartable` and
+`restart_pending` separately every five seconds. These counts also appear in
+human and JSON reports; pending counts describe Jobs queued when their old
+Attempts settled. Every observed Attempt remains in `running_work`; queued
+successors are not resident work. The default drain bound is five minutes;
+`--drain-timeout DURATION` accepts a Go duration of at least ten seconds.
+The first post-disable observation has its own probe budget, so an idle node
+cannot time out before its first observation completes. `--yes` keeps its
+existing behavior: skip the wait and permit replacement to end one-shots at
+once. Before replacement, text output names each such Job and Attempt.
 There is no interactive prompt.
 
 On timeout without `--yes`, upgrade restores only its own intent revision,
@@ -205,8 +227,15 @@ Upgrade also requires the replacement node agent to register a new boot session
 and heartbeat within 20 s and report the expected commit. In the same observation,
 the CLI must reach the run ledger through its public API; this does not prove
 the node agent's own ledger connection. An `Unchanged` converge action does not
-wait for a new boot session. Upgrade does not promise
-uninterrupted one-shot work across node agent replacement.
+wait for a new boot session. Restartable Jobs queue atomically as their old Attempts settle. Disabled
+admission holds them until replacement health succeeds and cleanup restores
+upgrade-owned admission. Ordinary claims then start fresh Attempts with the
+same Run and Job IDs. This does not promise an immediate first claim (#1072).
+If a drain or activation fails, restoring owned admission lets the old agent
+claim these queued Jobs again; rollback never reverses an interruption or
+recreates a finished Attempt. A pre-existing or newer operator disable holds
+queued Jobs until the operator reopens admission. Interrupted-upgrade recovery
+uses the same receipt and ownership checks; L1 owns the queued recovery state.
 
 ## Intent restoration and interrupted upgrades
 

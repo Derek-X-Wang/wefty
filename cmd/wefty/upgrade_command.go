@@ -54,19 +54,27 @@ const (
 // These machine operations extend setupHost, rather than adding public flags.
 // Tests use a local bare repository, a fake build, runner and clock.
 type upgradeHost struct {
-	remote         string
-	build          func(context.Context, string, string, string, string) error
-	command        func(context.Context, string, []string, string, ...string) ([]byte, error)
-	observe        func(context.Context, connprofile.Profile) (l1.Node, error)
-	setClaims      func(context.Context, connprofile.Profile, l1.NodeIntentRequest) (l1.Node, error)
-	readNode       func(context.Context, connprofile.Profile) (l1.Node, error)
-	readJob        func(context.Context, connprofile.Profile, string) (l1.Job, error)
-	restartService func(context.Context, connprofile.Profile, string, string) (l1.Job, error)
-	now            func() time.Time
-	wait           func(context.Context, time.Duration) error
+	remote           string
+	build            func(context.Context, string, string, string, string) error
+	command          func(context.Context, string, []string, string, ...string) ([]byte, error)
+	observe          func(context.Context, connprofile.Profile) (l1.Node, error)
+	setClaims        func(context.Context, connprofile.Profile, l1.NodeIntentRequest) (l1.Node, error)
+	readNode         func(context.Context, connprofile.Profile) (l1.Node, error)
+	readJob          func(context.Context, connprofile.Profile, string) (l1.Job, error)
+	restartService   func(context.Context, connprofile.Profile, string, string) (l1.Job, error)
+	interruptAttempt func(context.Context, connprofile.Profile, string, l1.InterruptRestartableAttemptRequest) (l1.Job, error)
+	now              func() time.Time
+	wait             func(context.Context, time.Duration) error
+}
+
+type upgradeDrainCounts struct {
+	WaitingNonrestartable int `json:"waiting_nonrestartable"`
+	StoppingRestartable   int `json:"stopping_restartable"`
+	RestartPending        int `json:"restart_pending"`
 }
 
 type upgradeReport struct {
+	upgradeDrainCounts
 	VersionWarnings   []statusReason         `json:"version_warnings,omitempty"`
 	Version           string                 `json:"version"`
 	LeaseRenewal      time.Duration          `json:"lease_renewal_ns"`
@@ -127,7 +135,7 @@ func executeUpgradeWithHost(ctx context.Context, host setupHost, options globalO
 	}
 	// The renewal line was already printed when it was observed, so a later
 	// node agent failure still shows it. The summary does not repeat it.
-	_, err = fmt.Fprintf(stdout, "Installed version: %s\n%s\n", report.Version, nodeMessage)
+	_, err = fmt.Fprintf(stdout, "Installed version: %s\n%s\nwaiting_nonrestartable=%d stopping_restartable=%d restart_pending=%d\n", report.Version, nodeMessage, report.WaitingNonrestartable, report.StoppingRestartable, report.RestartPending)
 	return err
 }
 
@@ -166,6 +174,9 @@ func upgradeOperations(host setupHost) upgradeHost {
 	}
 	if operations.restartService == nil {
 		operations.restartService = restartUpgradeService
+	}
+	if operations.interruptAttempt == nil {
+		operations.interruptAttempt = interruptUpgradeAttempt
 	}
 	if operations.now == nil {
 		operations.now = time.Now
@@ -295,6 +306,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 			}
 			result.RestartedServices = slices.Clone(drain.restarted)
 			result.ClaimsDisabled = drain.claimsDisabled
+			result.upgradeDrainCounts = drain.counts
 		}
 	}()
 	// Refuse linked work folders, even links to another folder inside home.
@@ -390,6 +402,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		if err != nil {
 			return upgradeObservationError(ctx, host, err)
 		}
+		for _, attempt := range current.ActiveAttempts {
+			recordUpgradeWork(&report.RunningWork, attempt)
+		}
 		bound := upgradeDrainTimeout
 		if len(drainTimeout) > 0 {
 			bound = drainTimeout[0]
@@ -435,6 +450,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		current, err := operations.observe(ctx, profile)
 		if err != nil {
 			return err
+		}
+		for _, attempt := range current.ActiveAttempts {
+			recordUpgradeWork(&report.RunningWork, attempt)
 		}
 		if err := checkUpgradeReplacement(current, drain, yes); err != nil {
 			return err
