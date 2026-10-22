@@ -14,7 +14,7 @@ const jsonValueFlags = `agent-path allowed-mount-root argv auth-key backup-cap c
 capability claims-enabled class control-url coordinator-url cpu-millicores cursor device-id dir disk-bytes drain-timeout
 envelope-schema envelope-schema-file evidence-file fabric fabric-id fabric-name
 file follow-for from helper-checksum idempotency-key image install-manifest instance-key
-intent-file intent-revision interpreter join-code key kind l1 l3 lang limit manifest
+intent-file intent-revision interpreter join-code key kind l1 l3 lang limit local-port manifest
 manifest-digest max-cost max-inflight max-runtime memory-bytes memory-capacity-bytes
 memory-reserve-bytes mode mount name node node-config node-id operator-user origin
 out outcome params params-file path payload-file payload-json-file permission

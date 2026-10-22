@@ -42,6 +42,7 @@ func newConversionFixture(t *testing.T) *conversionFixture {
 	if _, err := runSetup(t.Context(), plainHost, setupRequest{nodeID: "studio-0123abcd"}); err != nil {
 		t.Fatal(err)
 	}
+	f.writeBinary(t, "wefty-l1", version)
 	paths, _ := resolveSetupPaths(f.home)
 	if err := os.MkdirAll(filepath.Join(paths.data, "setup-ready"), 0700); err != nil {
 		t.Fatal(err)
@@ -62,7 +63,9 @@ func newConversionFixture(t *testing.T) *conversionFixture {
 		t.Fatal(err)
 	}
 	observe := func(context.Context, connprofile.Profile) (l1.Node, error) { return x.node, nil }
-	f.host.upgrade = &upgradeHost{now: func() time.Time { return x.now }, wait: func(_ context.Context, d time.Duration) error {
+	f.host.upgrade = &upgradeHost{command: func(context.Context, string, []string, string, ...string) ([]byte, error) {
+		return []byte(`{"version":1,"blockers":[]}`), nil
+	}, now: func() time.Time { return x.now }, wait: func(_ context.Context, d time.Duration) error {
 		x.now = x.now.Add(d)
 		x.waits++
 		if x.finishOnWait {
@@ -272,7 +275,7 @@ func TestSetupConvertPlainRunningWorkRefusedAndClaimsRestored(t *testing.T) {
 }
 
 func TestSetupConvertPlainFailureAndCrashRecovery(t *testing.T) {
-	beforeSteps := []string{"convert:record", "convert:claims", "convert:drain", "convert:stop", "convert:inventory", "convert:readonly:exec-captures/nested/b.bundle", "convert:readonly"}
+	beforeSteps := []string{"convert:record", "convert:claims", "convert:drain", "convert:stop", "convert:quiescent", "convert:inventory", "convert:readonly:exec-captures/nested/b.bundle", "convert:readonly"}
 	for _, label := range []string{setupNodeAgentLabel, setupL3Label, setupL1Label} {
 		beforeSteps = append(beforeSteps, "convert:stopped:"+label)
 	}

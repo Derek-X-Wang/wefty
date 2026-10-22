@@ -36,7 +36,10 @@ type apiClients struct {
 	l3                 *apiClient
 	images             imageDigestResolver
 	fabric             fabric.Fabric
-	wait               func(context.Context, time.Duration) error
+	// Published-port traffic has person authority; L1 reads retain fabric's
+	// client participant. Never substitute the client when this is absent.
+	servicePerson fabric.Fabric
+	wait          func(context.Context, time.Duration) error
 }
 
 type apiClient struct {
