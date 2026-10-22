@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/internal/systemduser"
 )
 
@@ -124,4 +125,81 @@ func (m fleetServiceManager) readinessDetail(detail string) string {
 		return strings.ReplaceAll(detail, "LaunchAgent", "systemd user unit")
 	}
 	return detail
+}
+
+// unload retains the definition so rollback can restore it before restart.
+func (m fleetServiceManager) unload(ctx context.Context, paths setupPaths, label string) error {
+	if m.host.goos != "linux" {
+		return (launchagent.Manager{Run: m.host.launchctl, UID: m.host.uid, UnloadBound: m.host.unloadBound}).Unload(ctx, label)
+	}
+	manager, err := m.linuxManager(paths)
+	if err != nil {
+		return err
+	}
+	manager.StopBound = m.host.unloadBound
+	return manager.Unload(ctx, m.name(label))
+}
+
+// Restored files may have the same timestamp as the cached definition. Recovery
+// must not depend on NeedDaemonReload noticing the replacement.
+func (m fleetServiceManager) reload(ctx context.Context, paths setupPaths) error {
+	if m.host.goos != "linux" {
+		return nil
+	}
+	manager, err := m.linuxManager(paths)
+	if err != nil {
+		return err
+	}
+	return manager.Reload(ctx)
+}
+
+// The caller verifies the current PID/boot and advertised capability first.
+func (m fleetServiceManager) heartbeat(ctx context.Context, paths setupPaths, label string) error {
+	if m.host.goos != "linux" {
+		_, err := m.host.launchctl(ctx, launchagent.Launchctl, "kill", "SIGUSR1", fmt.Sprintf("gui/%d/%s", m.host.uid, label))
+		return err
+	}
+	manager, err := m.linuxManager(paths)
+	if err != nil {
+		return err
+	}
+	_, err = manager.Run(ctx, manager.ToolPath, "--user", "kill", "--kill-who=main", "--signal=SIGUSR1", m.name(label))
+	return err
+}
+
+// Upgrade uses the same trusted tools, home-confined paths, log ownership and
+// override policy as Linux setup, after drain recovery and before preparation.
+func (m fleetServiceManager) preflightUpgrade(ctx context.Context, paths setupPaths, role serviceplan.Role) error {
+	if m.host.goos != "linux" {
+		return nil
+	}
+	payload, err := os.ReadFile(filepath.Join(paths.launchAgents, m.file(setupNodeAgentLabel)))
+	if err != nil {
+		return err
+	}
+	loginPATH, err := m.recordedPATH(payload)
+	if err != nil {
+		return err
+	}
+	if err := preflightLinuxFleet(ctx, m.host, paths, nil, loginPATH, role); err != nil {
+		return err
+	}
+	plan, err := setupRolePlan(paths, role)
+	if err != nil {
+		return err
+	}
+	manager, err := m.linuxManager(paths)
+	if err != nil {
+		return err
+	}
+	for _, service := range plan.Services {
+		unit := m.name("dev.wefty." + service.Name)
+		probe, cancel := context.WithTimeout(ctx, statusProbeBudget)
+		_, err := manager.State(probe, unit)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("cannot verify Linux fleet unit %s; the user service manager is unreachable from this shell or the unit definition is not the one setup wrote; restore manager access and setup's original units before retrying upgrade: %w", unit, err)
+		}
+	}
+	return nil
 }

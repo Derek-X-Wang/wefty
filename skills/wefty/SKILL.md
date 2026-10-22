@@ -74,6 +74,9 @@ The old node boot in `draining` during replacement also keeps the busy/queued
 answer. A local interrupted upgrade instead names
 `claims disabled by an interrupted upgrade` and `wefty upgrade` as recovery.
 Report that advice to the owner; running upgrades remains an owner action.
+Upgrade supports Mac plain installations and recorded Mac/Linux fleet roles;
+Linux uses systemd user units. See [fleet upgrade](../../docs/contracts/fleet-upgrade.md)
+for the role order and attended checks.
 Other operator disables keep their existing not-ready answer.
 Without a readable receipt, an upgrade intent stays busy until its
 `drain_deadline` plus 30 minutes, including for a long configured drain. Only

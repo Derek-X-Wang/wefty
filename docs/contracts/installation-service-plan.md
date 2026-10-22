@@ -59,14 +59,15 @@ setup requires only `wefty` and `wefty-agent` in the source folder and installs
 only those binaries. It renders and starts only node agent, then client service.
 Removal refuses both staged and committed
 fleet roles until role-aware removal can stop the client service and retain
-identity records. Mac upgrade uses this same recorded role and service order;
+identity records. Mac and Linux upgrade use this same recorded role and service order;
 see [fleet upgrade](fleet-upgrade.md). It refuses uncommitted setup, incomplete conversion
 records, or a receipt/profile disagreement before recovery or preparation.
 A joining upgrade builds only CLI and agent, and restarts only node agent then
 client service. A control-plane upgrade builds all four binaries and restarts
 L1, L3, node agent, then client service. Neither changes participant records.
 Role-aware removal remains a later slice on both platforms. Linux upgrade
-refuses with `role-aware upgrade on Linux is a later slice`.
+uses the same steps through systemd user units, including a daemon reload after
+publishing changed units and after restoring old units during rollback.
 [Doctor](fleet-doctor.md) consumes the same recorded role and named plan,
 checks local files independently of services, and uses the running client
 service for live network evidence.

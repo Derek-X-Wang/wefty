@@ -82,7 +82,7 @@ must be enabled for services to survive logout. Setup never changes it;
 To convert this Mac's existing plain install into a joining machine, run
 `wefty setup --role join --join-code CODE --convert-plain`. Conversion is Mac-only
 and retains read-only history. [Fleet upgrade](docs/contracts/fleet-upgrade.md)
-works on macOS; Linux upgrade is not supported yet (#1107). Fleet removal is
+works on macOS and Linux. Fleet removal is
 not supported yet on either platform. See the
 [installation](docs/contracts/installation-service-plan.md),
 [enrolment](docs/contracts/fabric-enrolment.md), and

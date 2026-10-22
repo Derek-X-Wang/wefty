@@ -48,7 +48,7 @@ func TestSetupLinuxUpgradeRefusal(t *testing.T) {
 	f := newSetupFixture(t)
 	f.host.goos = "linux"
 	_, err := runUpgrade(t.Context(), f.host, false, nil)
-	if err == nil || !strings.Contains(err.Error(), "role-aware upgrade on Linux is a later slice") {
+	if err == nil || !strings.Contains(err.Error(), "plain upgrade is Mac-only; on Linux use wefty setup --role control-plane or --role join --join-code CODE") {
 		t.Fatalf("Linux upgrade advice: %v", err)
 	}
 }

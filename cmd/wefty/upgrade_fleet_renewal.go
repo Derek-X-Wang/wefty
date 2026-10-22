@@ -20,7 +20,7 @@ import (
 )
 
 // A ready record opts this running boot into SIGUSR1. Old agents never
-// advertise it, so they keep the existing window. Match launchd PID and L1 boot.
+// advertise it, so they keep the existing window. Match the service PID and L1 boot.
 func requestFleetUpgradeHeartbeat(ctx context.Context, host setupHost, paths setupPaths, node l1.Node) error {
 	_, err := tryFleetUpgradeHeartbeat(ctx, host, paths, node)
 	return err
@@ -49,8 +49,8 @@ func tryFleetUpgradeHeartbeat(ctx context.Context, host setupHost, paths setupPa
 	if !ready.ImmediateHeartbeat {
 		return false, nil
 	}
-	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid}
-	state, err := manager.State(ctx, setupNodeAgentLabel)
+	manager := fleetServiceManager{host: host}
+	state, err := manager.state(ctx, setupNodeAgentLabel)
 	if err != nil {
 		return false, err
 	}
@@ -68,7 +68,7 @@ func tryFleetUpgradeHeartbeat(ctx context.Context, host setupHost, paths setupPa
 	if !ready.ReadyAt.After(boot) {
 		return false, errors.New("immediate-heartbeat ready record predates this system boot")
 	}
-	_, err = manager.Run(ctx, launchagent.Launchctl, "kill", "SIGUSR1", fmt.Sprintf("gui/%d/%s", host.uid, setupNodeAgentLabel))
+	err = manager.heartbeat(ctx, paths, setupNodeAgentLabel)
 	return err == nil, err
 }
 

@@ -520,12 +520,12 @@ func TestUpgradeRefusesUnsupportedInstallBeforeAnyWork(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			f := newUpgradeFixture(t)
 			paths, _ := resolveSetupPaths(f.home)
-			expected := map[string]string{"root": "never as root", "platform": "macOS", "source-link": "real folder", "database-link": "snapshot", "identity": "matching connection profile", "shell": "login-shell PATH"}[kind]
+			expected := map[string]string{"root": "never as root", "platform": "macOS and Linux fleet installs", "source-link": "real folder", "database-link": "snapshot", "identity": "matching connection profile", "shell": "login-shell PATH"}[kind]
 			switch kind {
 			case "root":
 				f.host.euid = 0
 			case "platform":
-				f.host.goos = "linux"
+				f.host.goos = "freebsd"
 			case "source-link":
 				if err := os.Symlink(t.TempDir(), filepath.Join(paths.data, upgradeSourceName)); err != nil {
 					t.Fatal(err)
