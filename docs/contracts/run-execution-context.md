@@ -59,7 +59,7 @@ shape. The CLI preserves the run ID and URLs, adds `idempotent_replay` (always
 | `WEFTY_L3_ENDPOINT` | public | A job-local HTTP base URL for the L3 run ledger. |
 | `WEFTY_ATTEMPT_TOKEN` | sensitive | The opaque, attempt-bound credential for in-job L1 calls. Opt-in; see below. |
 | `WEFTY_RUN_TOKEN` | sensitive | The opaque, attempt-bound credential for in-run L3 calls. Opt-in; see below. |
-| `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory. |
+| `WEFTY_HANDOFF_DIR` | public | The run's node-local handoff directory; Restartable process one-shots use its `.wefty-attempts/<attempt_id>` result directory. |
 | `WEFTY_RUN_DIR` | public | The run mailbox: the job-owned directory the workload writes protocol events into and the node agent publishes from. |
 
 The first four L3 variables are delivered only when L3 dispatched the job.
@@ -791,6 +791,11 @@ claim about the writer's own run and nothing else. The directory is scoped by
 run ID because a cold rerun reuses the handoff directory: a rerun gets its own
 mailbox; the agent does not import the previous run's evidence into it.
 
+Restartable process exec adds the Attempt ID:
+`<handoff directory>/.wefty/<run id>/<attempt id>`. Each successor receives
+its own mailbox, including exec work and TMPDIR storage beneath that mailbox.
+Run identity and the Run's handoff/result paths remain stable.
+
 The layout is fixed:
 
 ```
@@ -807,7 +812,7 @@ a document larger than 64 KiB is left in the ledger rather than delivered.
 The agent opens `tmp/` only during preparation to place `params.json`; it does
 not read staged events there.
 
-A version-2 cross-node exec also receives `capture.bundle`. The node agent
+A version-2 cross-node or Restartable exec also receives `capture.bundle`. The node agent
 fetches this file over its existing Fabric transport with its agent-held run
 token and checks the `capture_sha256` and `capture_size_bytes` in the params
 before it makes the file visible or starts the wrapper. Download errors or
@@ -1090,6 +1095,13 @@ labels or changes the canonical request hash; identical dispatch-key replay
 still returns the original job. The label-only resolver remains the sole input
 to run-identity entitlement: a child of a job-owned parent cannot name its
 parent's Job ID in `run_id` or `handoff_owner_run_id`.
+Restartable process one-shots keep this owner and lock at the Run directory,
+but inject `WEFTY_HANDOFF_DIR=<adopted-directory>/.wefty-attempts/<attempt_id>`
+and read `result.json` from that Attempt's directory. This isolates overlapping
+predecessor writes while the Run result API continues serving the latest
+Attempt's uploaded document. Retention covers the adopted directory and all
+its Attempt subdirectories.
+
 Managed handoff directories require the updated agent: L1 and agents upgrade together; a pre-#646 agent permanently fails a pathless process one-shot with `handoff_preparation_failed`.
 
 A process submission with an explicit absolute path and no run identity keeps
@@ -1854,3 +1866,17 @@ narrower than the child-read route's parent-Job check. Dispatch replay
 and tombstones resolve before instance-key handling and retain their existing
 scope checks. Keyed children follow the same one-shot release and service removal
 rules as roots. See [the key contract](lease-fencing-dispatch.md#instance-keys).
+
+## Restartable capture scope
+
+`CreateRunRequest.restartable` is persisted as `RunRecord.restartable`. For
+version 2 captured exec it must equal `params.restartable`. True requires a version 2 captured exec inline
+script and no dispatch authority. The immutable capture and argv survive
+nonterminal interruption; no live checkout is read to prepare a successor.
+Successor preparation clears the Run's result under the handoff path lock and
+uses an Attempt-specific mailbox. It does not remove and recreate a predecessor
+path that a delayed cleanup helper may still reference. The new Attempt creates
+a fresh workspace and TMPDIR beneath its own mailbox.
+L1 supplies a fresh fence and Attempt credential. Run identity, Job identity,
+and the Run log cursor remain stable. Restart inspect facts come from a fresh
+L1 execution read; Attempt interruption evidence is distinct from command exit.

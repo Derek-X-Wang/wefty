@@ -283,14 +283,14 @@ func TestOneshotRestartLeaseExpiryBoundary(t *testing.T) {
 				}
 				return
 			}
-			if job.RestartRecovery.Count != 0 || (job.RestartRecovery.LastReason == nil || *job.RestartRecovery.LastReason != InterruptionLeaseExpired) || !job.RestartRecovery.NextRestartAt.Equal(f.h.clock.Now().Add(time.Second)) {
+			if job.RestartRecovery.Count != 0 || (job.RestartRecovery.LastReason == nil || *job.RestartRecovery.LastReason != InterruptionLeaseExpired) || !job.RestartRecovery.NextRestartAt.Equal(f.h.clock.Now().Add(MinimumOneshotRestartDelay)) {
 				t.Fatalf("backoff=%+v", job.RestartRecovery)
 			}
 			before, err := f.h.store.ClaimJob(t.Context(), "agent", "node", f.node.BootSessionID, contract.JobClassOneShot)
 			if err != nil || before != nil {
 				t.Fatalf("claim before due=%v %v", before, err)
 			}
-			f.h.clock.Advance(time.Second)
+			f.h.clock.Advance(MinimumOneshotRestartDelay)
 			next := f.claim(t)
 			if next.Job.RestartRecovery.Count != 1 || next.Lease.FencingToken == c.Lease.FencingToken || next.AttemptToken == c.AttemptToken {
 				t.Fatal("successor authority/counter not renewed")
@@ -308,7 +308,7 @@ func TestOneshotRestartLostPredecessorCompletionAfterSuccessorClaim(t *testing.T
 	if _, err := f.h.store.Reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	f.h.clock.Advance(time.Second)
+	f.h.clock.Advance(MinimumOneshotRestartDelay)
 	successor := f.claim(t)
 	if _, err := f.h.store.StartAttempt(t.Context(), "agent", f.job.JobID, successor.Lease.AttemptID, StartedRequest{FencingToken: successor.Lease.FencingToken}); err != nil {
 		t.Fatal(err)
@@ -444,12 +444,12 @@ func TestOneshotRestartLimitAndPersistedBackoff(t *testing.T) {
 	for _, test := range []struct {
 		restart int
 		want    time.Duration
-	}{{1, time.Second}, {2, 2 * time.Second}, {6, 32 * time.Second}, {7, time.Minute}, {10, time.Minute}} {
+	}{{1, 11 * time.Second}, {2, 11 * time.Second}, {4, 11 * time.Second}, {5, 16 * time.Second}, {6, 32 * time.Second}, {7, time.Minute}, {10, time.Minute}} {
 		if got := oneshotRestartDelay(test.restart, func(d time.Duration) time.Duration { return d }); got != test.want {
 			t.Fatalf("delay(%d)=%s", test.restart, got)
 		}
 	}
-	if oneshotRestartDelay(2, func(time.Duration) time.Duration { return 3 * time.Second }) != 3*time.Second {
+	if oneshotRestartDelay(2, func(time.Duration) time.Duration { return 15 * time.Second }) != 15*time.Second {
 		t.Fatal("jitter not injected")
 	}
 }
@@ -552,5 +552,28 @@ func TestOneshotRestartPendingCancellationStaysTerminal(t *testing.T) {
 	next, err := f.h.store.ClaimJob(t.Context(), "agent", "node", f.node.BootSessionID, contract.JobClassOneShot)
 	if err != nil || next != nil {
 		t.Fatalf("canceled successor claimed=%v err=%v", next, err)
+	}
+}
+
+func TestOneshotRestartLeaseLossTeardownFloor(t *testing.T) {
+	f := newOneshotFixture(t, true)
+	f.h.store.restartJitter = func(time.Duration) time.Duration { return -time.Hour }
+	first := f.claim(t)
+	f.h.clock.Advance(first.Lease.LeaseTTL)
+	if _, err := f.h.store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	job := f.get(t)
+	if !job.RestartRecovery.NextRestartAt.Equal(f.h.clock.Now().Add(11 * time.Second)) {
+		t.Fatalf("jitter removed teardown margin: %+v", job.RestartRecovery)
+	}
+	f.h.clock.Advance(11*time.Second - time.Nanosecond)
+	early, err := f.h.store.ClaimJob(t.Context(), "agent", "node", f.node.BootSessionID, contract.JobClassOneShot)
+	if err != nil || early != nil {
+		t.Fatalf("claimed before teardown floor: %v %v", early, err)
+	}
+	f.h.clock.Advance(time.Nanosecond)
+	if next := f.claim(t); next.Job.RestartRecovery.Count != 1 {
+		t.Fatalf("successor count: %+v", next.Job.RestartRecovery)
 	}
 }

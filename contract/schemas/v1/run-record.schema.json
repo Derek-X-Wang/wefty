@@ -33,6 +33,7 @@
     "node_id": { "$ref": "#/$defs/id" },
     "parent_run_id": { "$ref": "#/$defs/id" },
     "dispatch_key": { "$ref": "#/$defs/id" },
+    "restartable": { "type": "boolean", "default": false, "description": "Repeat a captured process exec after interruption, at most ten times, using the same immutable version 2 capture." },
     "dispatch_authority": { "type": "boolean" },
     "status": {
       "enum": ["pending", "dispatching", "queued", "running", "awaiting-input", "succeeded", "failed"]

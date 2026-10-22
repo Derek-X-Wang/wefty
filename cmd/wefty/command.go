@@ -104,9 +104,10 @@ type runInspection struct {
 	// It is what "how long did each part take" is answered with, and it is
 	// computed here from the record already fetched rather than by asking the
 	// ledger a second question.
-	Steps     l3.RunSteps      `json:"steps"`
-	Results   *runResults      `json:"results,omitempty"`
-	Execution *l3.RunExecution `json:"execution,omitempty"`
+	Restart   *l1.OneshotRestartFacts `json:"restart,omitempty"`
+	Steps     l3.RunSteps             `json:"steps"`
+	Results   *runResults             `json:"results,omitempty"`
+	Execution *l3.RunExecution        `json:"execution,omitempty"`
 	// FailureReason is why the root run failed, in one line: the ledger's
 	// recorded reason, or for a run failed before the ledger recorded one,
 	// the L1 job's own evidence. Empty for a run that did not fail.
@@ -323,12 +324,20 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 		}
 		inspection.Runs = append(inspection.Runs, record)
 	}
-	if includeExecution {
+	if includeExecution || root.Restartable {
 		execution, err := clients.getRunExecution(ctx, runID)
 		if err != nil {
 			return err
 		}
-		inspection.Execution = &execution
+		if root.Restartable {
+			if execution.Job == nil || execution.Job.RestartRecovery == nil {
+				return &unavailableError{cause: fmt.Errorf("restart facts unavailable for run %s", runID)}
+			}
+			inspection.Restart = execution.Job.RestartRecovery
+		}
+		if includeExecution {
+			inspection.Execution = &execution
+		}
 	}
 	switch {
 	case root.Status != contract.RunFailed:
@@ -648,7 +657,7 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			// A follow has no deadline: a retryable 503 is one bad poll, not
 			// a verdict (#763). Keep following at the normal interval; only
 			// the caller's cancellation or a non-retryable answer ends it.
-			if (follow || walking) && isRetryableL1Answer(err) {
+			if (follow && isRetryableObservation(err)) || (walking && isRetryableL1Answer(err)) {
 				if walking {
 					walkRetries++
 					if walkRetries > logWalkRetryLimit {
@@ -732,7 +741,7 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			if ctx.Err() != nil {
 				return stopped()
 			}
-			if isRetryableL1Answer(err) {
+			if isRetryableObservation(err) {
 				if sleepFollowRetry(ctx, pollInterval) {
 					continue
 				}

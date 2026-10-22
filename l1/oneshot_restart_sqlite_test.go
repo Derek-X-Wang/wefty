@@ -124,14 +124,14 @@ func TestOneshotRestartSQLiteRecoverySurvivesReopen(t *testing.T) {
 	}
 	defer store.Close()
 	got, err := store.GetJob(t.Context(), job.JobID)
-	if err != nil || !got.RestartRecovery.NextRestartAt.Equal(clock.Now().Add(time.Second)) || got.RestartRecovery.Count != 0 {
+	if err != nil || !got.RestartRecovery.NextRestartAt.Equal(clock.Now().Add(MinimumOneshotRestartDelay)) || got.RestartRecovery.Count != 0 {
 		t.Fatalf("persisted=%+v err=%v", got, err)
 	}
 	early, err := store.ClaimJob(t.Context(), "agent", "node", "boot", contract.JobClassOneShot)
 	if err != nil || early != nil {
 		t.Fatalf("early=%v err=%v", early, err)
 	}
-	clock.Advance(time.Second)
+	clock.Advance(MinimumOneshotRestartDelay)
 	next, err := store.ClaimJob(t.Context(), "agent", "node", "boot", contract.JobClassOneShot)
 	if err != nil || next == nil || next.Job.RestartRecovery.Count != 1 || next.Lease.FencingToken == first.Lease.FencingToken || next.AttemptToken == first.AttemptToken {
 		t.Fatalf("reopened successor=%v err=%v", next, err)

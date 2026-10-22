@@ -93,10 +93,11 @@ so a restart does not replay a revision an operator has already seen.
 _Avoid_: capability version, feature flag, health generation
 
 **OCI intent**:
-The revisioned node-local operator decision that the OCI runtime is enabled
-or disabled. Capability reports what the node can do now; OCI intent records
-whether the agent is allowed to make it available.
-_Avoid_: runtime status, capability toggle, autostart preference
+The revisioned node-local operator decision of how the OCI runtime may run:
+off, on demand (only while work needs it), or always on. Capability reports
+what the node can do now; OCI intent records what the node agent is allowed to
+make available. Demand that the node computes never changes it.
+_Avoid_: runtime status, capability toggle, autostart preference, demand
 
 **Job**:
 The L1 schedulable unit, routed to nodes by subset tag matching.
@@ -150,8 +151,10 @@ _Avoid_: conflating kind with class; "sandboxed" as a lifecycle word;
 treating `service` as a peer noun to Job
 
 **Guardian**:
-The agent-owned lifetime boundary for one service payload. It prevents the
-payload from outliving the agent boot session that launched it.
+The agent-owned lifetime boundary for one service or Restartable process
+one-shot payload. While alive, it ends the managed runtime after losing the
+agent boot session that launched it. For process payloads, this boundary covers
+the command's process group; descendants that leave the group are outside it.
 _Avoid_: supervisor, babysitter, wrapper, shim
 
 **Desired state**:
@@ -201,10 +204,90 @@ _Avoid_: pin, affinity, ownership, permanent placement
 ### Agent computers and storage
 
 **Computer**:
-A durable, Pinned service resource whose storage identity, name, placement,
-and grants persist across runtime attempts and image changes. Its tenant image
+A Pinned unit of compute with a screen and input, which wefty hosts so that
+AI agents can do work made for people and work beside a person. Its name,
+placement, grants, and Storage persist while it exists, and its Storage keeps
+one identity across runtime attempts and image changes. Its settings — Seat
+limit, Idle action, and a network with or without internet that is fixed when
+it is created — decide whom it holds and how long it lives. Its tenant image
 may change without changing the Computer.
 _Avoid_: node, machine, VM, container, tenant, service job
+
+**Seat**:
+One AI agent's place on a Computer, with its own desktop: screen, input,
+user, and folder. The AI agent works it from outside the Computer. A Seat
+lives while its AI agent calls, one of its commands runs, or a person drives
+its screen; it ends on release, on expiry, or when its Computer restarts, and
+its folder goes with it. Seats on one Computer belong to one owner and are
+kept apart for order, not as a security wall; the Computer isolation boundary
+lies between Computers. A Computer with no Seats is idle.
+_Avoid_: lease (an Attempt's lease), session, Take-over session, login, Slot,
+the input "seat" of a Wayland desktop
+
+**Seat request**:
+An AI agent's ask for one Seat, under one ID from the start that names the
+Seat once it is approved. It names its network and one form: any (a Seat on a
+shared Computer with room, or a new one), dedicated (a new Computer with a
+Seat limit of 1), or by name (a Seat on one existing Computer). It ends with a
+Seat or with a refusal and its reason; waiting again by its ID never makes a
+second Seat.
+_Avoid_: job, claim, booking, reservation, queue entry
+
+**Seat credential**:
+The secret wefty gives an AI agent with its Seat. Wefty treats screen input
+and Seat calls that carry it as that AI agent's, never as a person's. Its
+power to act on the Seat ends when the Seat ends. On one Mac it keeps order
+between the AI agent and the owner; it does not prove who acts.
+_Avoid_: Seat pass, Seat token, Attempt credential, take-over bearer
+
+**Seat approval**:
+The owner's Approve, in a dialog that wefty shows on the AI agent's own
+machine, for one Seat request and the network it names. It lasts as long as
+that Seat. An approval window is a Seat approval that, for a set time, covers
+the requests for its network and the requests without internet. Nothing an
+AI agent can run gives a Seat approval.
+_Avoid_: grant (a person's take-over right), trust, the harness's approval of a
+command, permission
+
+**Seat limit**:
+The most Seats a Computer holds at once. A Computer with a Seat limit of 1 is
+a dedicated Computer; a higher limit makes it a shared Computer. Its image
+sets the highest Seat limit it allows.
+_Avoid_: sharing mode, capacity, Slot
+
+**Idle action**:
+What wefty does to a Computer that stays idle past its idle wait: delete it
+with its Storage (an on-demand Computer), stop it and keep its Storage, or
+nothing (an always-on Computer, which keeps the Desired state its owner sets).
+The owner's own commands always win over it.
+_Avoid_: timeout policy, TTL, keep-alive
+
+**Room**:
+The part of a Node's memory for Computers that is still free, counted in
+Seats. A Seat takes its share when it starts and gives it back once its
+cleanup is confirmed, as far as its Computer's memory limit actually shrinks.
+A Seat request that does not fit is refused at once.
+_Avoid_: capacity, headroom, Slot, free memory (a measurement)
+
+**Seat log**:
+Wefty's own record of events about one Seat: control taken and released, its
+coming and actual end, owner actions on its Computer, commands started and
+finished, and files copied in or out. It is the same record as that Seat's
+take-over audit, it never holds program output, and it outlives its Seat.
+_Avoid_: Run log, program output, service logs
+
+**Default Computer image**:
+The image that a new on-demand Computer starts from: the newest one when that
+Computer is created. Wefty ships one with a desktop, a browser, and the usual
+test tools; the owner may set another. A Computer changes its image later only
+when its owner says so.
+_Avoid_: base image, blessed image, reference image
+
+**Host VM**:
+The Linux virtual machine on a macOS Node that holds that Node's OCI
+workloads, Computers included. Its OCI intent decides whether it is off, runs
+on demand while work needs it, or runs always. It is never a Computer.
+_Avoid_: computer VM, Lima instance
 
 **Computer isolation boundary**:
 The invariant that a Computer may reach its orchestrator channel, its own
@@ -249,19 +332,22 @@ _Avoid_: Lineage, run lineage, ancestry, parent disk, attachment history
 
 **Custody export**:
 The recorded transfer of storage bytes outside wefty ownership, permanently
-reducing what removal can prove.
-_Avoid_: Backup, managed copy, verified deletion
+reducing what removal can prove. Copying chosen files into or out of a Seat is
+not a Custody export.
+_Avoid_: Backup, managed copy, verified deletion, file copy
 
 ### Human take-over
 
 **Take-over session**:
 One authenticated, bounded viewing or control connection from a person to a
-Computer through the Fabric.
-_Avoid_: Run, login, VNC session, tenant session
+Seat's screen, or to the screen of a Computer whose image has no Seats,
+through the Fabric.
+_Avoid_: Run, Seat, login, VNC session, tenant session
 
 **Controller tenure**:
 The exclusive, attempt-scoped period in which one Take-over session holds a
-Computer's human input path.
+Seat's human input path, or the input path of a Computer whose image has no
+Seats. While it lasts, wefty refuses that Seat's AI agent screen input.
 _Avoid_: grant, control role, lock, idle session
 
 **Friendly name**:
@@ -289,7 +375,8 @@ occupied by a service binding, and is retained through restart backoff.
 Slots have no identity — occupancy is a count, never an assignment, and
 there is no slot ID and no slots table. Slots are never shared across
 classes.
-_Avoid_: lane, pool, worker, CPU, core, "execution path" as a countable noun
+_Avoid_: lane, pool, worker, CPU, core, Seat, Seat limit, Room, "execution
+path" as a countable noun
 
 **Fabric**:
 The network seam — transport, identity, naming, provisioning — behind which

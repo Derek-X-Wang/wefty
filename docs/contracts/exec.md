@@ -1,6 +1,6 @@
 # Command runs (`wefty exec`)
 
-`wefty exec [--node NODE] [--tag TAG ...] [--max-runtime D] [--keep-running | --detach]
+`wefty exec [--node NODE] [--tag TAG ...] [--max-runtime D] [--restartable] [--keep-running | --detach]
 [--json] -- <command...>` freezes a
 checkout before L3 submission. By default it uses the installed `node_id`, checked through
 L1 by `resolveLocalNode`, and includes that node's reserved tag. `--node NODE`
@@ -8,9 +8,10 @@ selects another owned Node by the ID shown in `wefty status` and Pins the run
 to it. An unknown Node ID is a usage error (exit 2) listing known Nodes.
 A known Node can queue work while offline, draining, or without free one-shot
 capacity, as the local path does. Before capturing or uploading, the CLI
-requires the target's `exec:capture-bundle` capability. A missing capability
+requires another Node's `exec:capture-bundle` capability. Restartable exec
+requires `oneshot:restartable` on its target, including the local Node. A missing capability
 returns retryable conflict (exit 5), naming the Node and its required upgrade. Explicitly naming this machine's Node keeps the
-same local capture path as the default. Extra tags narrow the selected Node's
+same local capture path as the default unless `--restartable` is set. Extra tags narrow the selected Node's
 Pinned run. Before capture or submission, an extra `--tag`
 that the selected Node does not carry is refused with usage exit 2
 and `invalid_request`; the message lists missing tags and the node's tags.
@@ -88,8 +89,9 @@ No new listener, local socket, loopback door, or L1 app capability is added.
 The fenced-caller rule remains unchanged: exec cannot bypass its caller's
 sandbox permissions.
 
-Cross-node params extend the existing fields with `exec_version=2`,
-`capture_sha256` and `capture_size_bytes`. Version 1 and legacy local runs keep
+Cross-node and Restartable exec params extend the existing fields with `exec_version=2`,
+`capture_sha256` and `capture_size_bytes`. Restartable exec also stores
+`restartable=true`. Ordinary version 1 and legacy local runs keep
 the existing behavior. The permanent `snapshot_storage` value identifies the
 call for lost-acknowledgement recovery; the remote wrapper contains no
 submitter storage path and never reads it. `--tag` is checked against the
@@ -383,3 +385,69 @@ Exit codes keep the existing policy: 0 on success/detach, 10 on a terminal run
 failure, 13 on infrastructure or unavailable observation, and existing usage
 and cancellation codes. JSON does not change the default signal cancellation
 policy.
+
+## Restartable captured exec
+
+`wefty exec --restartable -- <command...>` opts a process one-shot into at
+most ten restarts. The default is false. Before capture upload the CLI refuses
+a target Node without `oneshot:restartable`, with an upgrade message.
+Restartable exec always uses the version 2 capture, including on the local
+Node. L3 persists `restartable` on the Run, requires it to agree with the frozen
+exec params, and dispatches `JobSpec.restartable=true`. Only captured inline
+exec is supported; Workflow refs, OCI, child Runs and dispatch authority are
+refused. L1 requires `oneshot:restartable` for the Job.
+
+Every Attempt fetches the same capture and uses the same argv. A successor
+gets a fresh checkout and TMPDIR. Its mailbox is
+`<handoff>/.wefty/<run_id>/<attempt_id>`; exec work and the TMPDIR target live
+under that Attempt's mailbox. A delayed predecessor cleanup helper can retire
+only its own Attempt's storage. The Run's result API stays stable. For a
+restartable Attempt, `WEFTY_HANDOFF_DIR` points to
+`<handoff>/.wefty-attempts/<attempt_id>`; both wrapper writes and agent result
+reads use that directory. A late predecessor write cannot become the successor's
+result. Restartable execution is at-least-once. A restartable command that ends
+while wefty is stopping its Attempt may run once more; the latest Attempt's
+result is the Run's verdict.
+Results belong to the latest Attempt. A restart preserves the Run and Job IDs;
+the Run stays `running` through recovery. `--max-runtime` bounds each Attempt.
+
+Use `--restartable` only for commands that are safe to repeat and harmless
+if two copies briefly overlap, for example read-only watchers. After a
+controlled stop, wefty confirms that the command's process group ended before
+restarting. After an agent crash, the existing Guardian ends the group on
+control EOF within its teardown bound: 5 seconds of TERM grace plus 5 seconds
+to reap after KILL. This normally finishes long before the Lease expires:
+with healthy renewals until the crash, the default 30-second Lease and
+10-second renewal interval leave at least 20 seconds from agent death to expiry. Shorter configured Leases may leave
+less time, so lease-loss restart backoff has an 11-second minimum (teardown
+plus one second of margin), even after jitter. Recovery also waits for Lease
+expiry. Acknowledged controlled stops retain zero restart delay.
+
+This timing fence is not positive proof of predecessor absence after a crash.
+If the Guardian itself is killed, the old command may briefly overlap the new
+Attempt. Quiescence covers the command's process group only. Descendants that leave the
+group, for example via `setsid` or a daemonizing fork, are not tracked, exactly
+as for ordinary one-shots. Restartable commands must not daemonize.
+Ordinary preparation errors complete as failures.
+
+After verified controlled interruption the agent emits stderr:
+`wefty: attempt <old_attempt_id> interrupted; restart pending (reason=<reason>)`
+Every successor emits, before workload output:
+`wefty: restart <n>/10 attempt=<new_attempt_id> previous_attempt=<old_attempt_id> reason=<reason>`
+Each marker ends in one newline and uses the existing redacting, sequence
+assigning durable sink. A crash can omit the interruption marker; it is never
+fabricated on recovery. Attached exec and log followers keep the Run cursor
+across Attempts. Observers retry transport and retryable server failures;
+attached exec retains its bounded 40 second read recovery window and `wait`
+retains its total timeout. No intermediate `finished` event is emitted.
+
+Attached exec exits 0 for success, 10 for command failure or runtime limit,
+and 13 for restart limit or unavailable evidence. Infrastructure outcomes have
+a null command exit code. Cancellation retains its existing exit behavior.
+Normal inspect fetches fresh L1 facts for Restartable Runs and exposes
+`restart: {count, limit, pending, last_reason, previous_attempt_id,
+current_attempt_id, next_restart_at, terminal_reason}`. Limit is 10; missing
+reasons, IDs and timestamps are null. Human output includes
+`restartable: yes; restarts: N/10; restart pending: yes|no` and the last reason.
+Required execution observation failure is an error, never cached counters.
+`inspect --execution` also shows Attempt `state` and `interruption_reason`.

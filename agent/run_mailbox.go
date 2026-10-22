@@ -439,7 +439,14 @@ func prepareRunMailbox(spec contract.JobSpec, attemptID string, appender runLedg
 		return nil, fmt.Errorf("open handoff directory %q: %w", handoff, err)
 	}
 	defer handoffRoot.Close()
-	mailboxRoot, err := openRunMailboxDirectory(handoffRoot, runMailboxDirectoryName, runID)
+	segments := []string{runMailboxDirectoryName, runID}
+	if spec.Restartable {
+		if !validRunMailboxSegment(attemptID) {
+			return nil, errors.New("invalid restartable Attempt ID")
+		}
+		segments = append(segments, attemptID)
+	}
+	mailboxRoot, err := openRunMailboxDirectory(handoffRoot, segments...)
 	if err != nil {
 		return nil, err
 	}
@@ -461,7 +468,7 @@ func prepareRunMailbox(spec contract.JobSpec, attemptID string, appender runLedg
 		return nil, fmt.Errorf("open run mailbox cursor directory: %w", err)
 	}
 	mailbox := newRunMailbox(runMailboxSettings{
-		directory: filepath.Join(handoff, runMailboxDirectoryName, runID),
+		directory: filepath.Join(append([]string{handoff}, segments...)...),
 		runID:     runID,
 		attemptID: attemptID,
 		runToken:  strings.TrimSpace(spec.Execution.SensitiveEnv[contract.EnvRunToken]),

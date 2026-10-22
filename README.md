@@ -30,27 +30,27 @@ directly to nodes, and L1 remains the only job queue. See the
 [v1 design](docs/2026-08-06-wefty-v1-design.md) for the architecture and build
 order.
 
-## Daily use on this Mac: `wefty setup`
+## Daily installation: `wefty setup`
 
-For a **fresh fleet control-plane Mac**, build the same four binaries and run
-`wefty setup --role control-plane`. Setup prompts without echo for four separate
+For a **fresh fleet control-plane Mac or Linux machine**, build the four binaries
+below and run `wefty setup --role control-plane`. Setup prompts without echo for four separate
 single-use keys: L1, L3, node agent, then client. Make agent keys immediately
-before use with a short expiry. Interrupted enrolment resumes with the same
-command and asks only for participants not yet saved. A completed fleet rerun
-needs no keys. Keep both private staging files for resume. Missing resume records,
+before use with a short expiry. Enrolment shows progress and stops after
+15 minutes per participant. Rerun setup to resume; it keeps saved participants
+and asks only for unsaved participants' keys. A completed fleet rerun needs no
+keys. Keep both private staging files for resume. Missing resume records,
 unrecorded participant folders and coordinator conflicts refuse before any key.
-After commit, setup refuses profile edits; fleet upgrade owns profile changes.
-Existing plain installations require a later conversion slice.
+After commit, setup refuses profile edits; use `wefty upgrade` for binary
+replacement.
 
 Fleet setup prints bounded readiness checks and runs a short pinned one-shot
 smoke test by default (`--skip-smoke-run` marks it NOT-RUN). A readiness failure
-keeps the installation published: repair the cause and rerun setup. L1 → L3
-peer reachability remains explicitly NOT-RUN on the control plane. Fleet
-removal/conversion and fleet upgrade are later slices. See the
-[installation contract](docs/contracts/installation-service-plan.md).
+keeps the installation published: repair the cause and rerun setup. Both fleet
+roles check L1 ↔ L3 reachability through the service-owned peer probes.
+`wefty doctor --print-policy` prints the private-network policy snippet.
 
-For a **fresh joining Mac**, build `wefty` and `wefty-agent` together. Copy the
-non-secret join code printed by the control plane's setup report (rerun setup
+For a **fresh joining Mac or Linux machine**, build `wefty` and `wefty-agent`
+together. Copy the non-secret join code printed by the control plane's setup report (rerun setup
 there to print it again), then run:
 
 ```sh
@@ -59,9 +59,9 @@ wefty setup --role join --join-code CODE
 ```
 
 The code never chooses where keys go. For a non-default coordinator, independently
-select the same URL with `--coordinator-url URL` or `TS_CONTROL_URL`; the code
-only cross-checks it. A mismatch refuses before keys. Setup prints the selected
-coordinator's host (or `default`) before its first key prompt.
+select the same URL with `--coordinator-url URL`, global `--control-url URL`, or
+`TS_CONTROL_URL`; the code only cross-checks it. A mismatch refuses before keys.
+Setup prints the selected coordinator's host (or `default`) before its first key prompt.
 
 Setup asks for two single-use keys: node agent, then client. It verifies the
 code's opaque L1/L3 identities against authenticated peer state before publishing
@@ -71,10 +71,22 @@ is enrolled or prompted. If person sign-in fails before publication, rerun witho
 `--with-person` to drop the unsaved person and finish machine setup with the saved
 node and client. Repeat the flag to continue that sign-in instead. An already
 saved person remains configured and needs no repeat prompt. Interrupted setup
-keeps saved participants; after a
-recorded peer-verification failure, a corrected code on the same coordinator can
-resume without replacement keys. Other changes of code are refused. Existing
-plain installs still require the later conversion slice.
+keeps saved participants; see the [installation contract](docs/contracts/installation-service-plan.md)
+for join-code recovery. Keep person sign-in on the owner's laptop; each
+administrator is bound to one enrolled person device.
+
+Linux uses systemd user units (systemd 242 or newer), with no sudo. Lingering
+must be enabled for services to survive logout. Setup never changes it;
+`wefty doctor` checks it and prints the `loginctl enable-linger` command.
+
+To convert this Mac's existing plain install into a joining machine, run
+`wefty setup --role join --join-code CODE --convert-plain`. Conversion is Mac-only
+and retains read-only history. [Fleet upgrade](docs/contracts/fleet-upgrade.md)
+works on macOS; Linux upgrade is not supported yet (#1107). Fleet removal is
+not supported yet on either platform. See the
+[installation](docs/contracts/installation-service-plan.md),
+[enrolment](docs/contracts/fabric-enrolment.md), and
+[doctor and policy](docs/contracts/fleet-doctor.md) contracts for details.
 
 The following instructions install the original single-Mac plain stack.
 

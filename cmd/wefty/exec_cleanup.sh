@@ -7,6 +7,8 @@ retire_exec_storage() {
   else
     trash="${source%/*}/.wefty-trash-${source##*/}-$$"
   fi
+  # For restartable exec, source is beneath an Attempt-specific mailbox. A
+  # delayed helper must never receive a successor's storage path.
   # The process runner reaps the wrapper's process group at attempt end.
   # Job control gives this helper a separate group, also on macOS Bash 3.2
   # where setsid is unavailable. No inherited output pipe may keep a run open.
