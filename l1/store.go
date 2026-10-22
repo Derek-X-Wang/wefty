@@ -65,6 +65,10 @@ type StoreOptions struct {
 	// ComputerBackupCap is the explicit cluster default materialized onto each
 	// Computer at creation. Zero is the shipped fail-closed default.
 	ComputerBackupCap int64
+	// ComputerDefaultImage is the cluster's current on-demand image reference.
+	// The serving node resolves it to a digest before Computer creation.
+	ComputerDefaultImage    string
+	ComputerSharedSeatLimit int
 	// ReconfigurationHook injects deterministic state-machine crash boundaries.
 	// Production callers leave it nil.
 	ReconfigurationHook func(string) error
@@ -98,6 +102,8 @@ type Store struct {
 	adminBootstrapTTL                 time.Duration
 	computerTakeoverAuditRetentionAge time.Duration
 	computerBackupCap                 int64
+	computerDefaultImage              string
+	computerSharedSeatLimit           int
 	reconfigurationHook               func(string) error
 	deploymentID                      string
 	policyChangeMu                    sync.Mutex
@@ -213,6 +219,16 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if options.ComputerBackupCap < 0 {
 		return nil, fmt.Errorf("l1: Computer Backup cap must be non-negative")
 	}
+	if err := ValidateComputerDefaultImage(options.ComputerDefaultImage); err != nil {
+		return nil, fmt.Errorf("l1: default Computer image: %w", err)
+	}
+	sharedSeatLimit := options.ComputerSharedSeatLimit
+	if sharedSeatLimit == 0 {
+		sharedSeatLimit = DefaultSharedComputerSeatLimit
+	}
+	if sharedSeatLimit < 2 {
+		return nil, fmt.Errorf("l1: shared Computer Seat limit must be at least 2")
+	}
 	deploymentID, err := loadOrCreateDeploymentID(path)
 	if err != nil {
 		return nil, err
@@ -233,6 +249,8 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		adminBootstrapTTL:                 adminBootstrapTTL,
 		computerTakeoverAuditRetentionAge: computerTakeoverAuditRetentionAge,
 		computerBackupCap:                 options.ComputerBackupCap,
+		computerDefaultImage:              options.ComputerDefaultImage,
+		computerSharedSeatLimit:           sharedSeatLimit,
 		reconfigurationHook:               options.ReconfigurationHook,
 		deploymentID:                      deploymentID,
 		policyChanged:                     make(chan struct{}),

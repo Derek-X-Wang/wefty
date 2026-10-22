@@ -192,8 +192,8 @@ func runMacBootstrap(arguments []string) error {
 	controlSocket := flags.String("control-socket", "", "absolute operator-only OCI control socket")
 	nodeConfig := flags.String("node-config", "", "absolute installed node configuration for singular CLI commands")
 	setupState := flags.String("setup-state", "", "absolute durable OCI setup convergence state")
-	memoryCapacityBytes := flags.Int64("memory-capacity-bytes", 0, "setup-converged Computer memory ceiling in bytes; zero uses 4 GiB")
-	memoryReserveBytes := flags.Int64("memory-reserve-bytes", 0, "setup-converged Lima infrastructure reserve in bytes; zero derives 25 percent of VM memory")
+	memoryCapacityBytes := flags.Int64("memory-capacity-bytes", 0, "setup-converged Computer memory capacity in bytes; zero uses the configured host VM memory")
+	memoryReserveBytes := flags.Int64("memory-reserve-bytes", 0, "setup-converged infrastructure reserve in bytes; zero uses 1 GiB")
 	stdoutPath := flags.String("stdout-path", "", "absolute LaunchDaemon stdout log path")
 	stderrPath := flags.String("stderr-path", "", "absolute LaunchDaemon stderr log path")
 	remove := flags.Bool("remove", false, "remove the interim Mac bootstrap idempotently and emit JSON evidence")
@@ -256,9 +256,9 @@ func runMacBootstrap(arguments []string) error {
 	if err != nil {
 		return err
 	}
-	defaultSizing, sizingErr := limarunner.HostDefaultSizing()
-	if sizingErr != nil {
-		return fmt.Errorf("resolve default Lima sizing for capacity setup: %w", sizingErr)
+	defaultSizing, err := configuredMacSizing(*setupState, limarunner.HostDefaultSizing)
+	if err != nil {
+		return fmt.Errorf("read configured host VM sizing for capacity setup: %w", err)
 	}
 	defaultCapacityBytes, defaultReserveBytes, err := limarunner.DefaultMacComputerCapacity(defaultSizing)
 	if err != nil {
@@ -479,6 +479,7 @@ func run() error {
 		shutdownBudget        = flag.Duration("shutdown-budget", 0, "after the first SIGINT or SIGTERM, cancel resident attempts in order once this long has passed; 0 waits for them (a second signal still cancels at once)")
 		profilePath           = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, control-plane and run-ledger addresses and the node ID not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
+	computerRoomFlags := bindComputerRoomFlags(flag.CommandLine)
 	flag.Parse()
 	if *printVersion {
 		fmt.Println(version)
@@ -544,6 +545,19 @@ func run() error {
 	}
 	if *ociMemoryCapacity < 0 || *ociMemoryReserve < 0 {
 		return errors.New("--oci-memory-capacity-bytes and --oci-memory-reserve-bytes must be nonnegative")
+	}
+	computerRoom, err := computerRoomFlags.configured(*ociSetupState, *ociMemoryCapacity, *ociMemoryReserve)
+	if err != nil {
+		return err
+	}
+	if computerRoom != nil {
+		policy, err := (l1.NodePolicy{MaxServiceSlots: *maxServiceSlots}).WithComputerRoom(*computerRoom)
+		if err != nil {
+			return err
+		}
+		*maxServiceSlots = policy.MaxServiceSlots
+		log.Printf("event=computer_room_configured memory_bytes=%d seat_memory_bytes=%d dedicated_cap=%d service_slots=%d",
+			computerRoom.MemoryBytes, computerRoom.SeatMemoryBytes, computerRoom.DedicatedCap, *maxServiceSlots)
 	}
 	if *ociImageCacheMaxBytes <= 0 {
 		return fmt.Errorf("--oci-image-cache-max-bytes must be positive")

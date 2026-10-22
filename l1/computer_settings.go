@@ -2,6 +2,28 @@ package l1
 
 import "github.com/Derek-X-Wang/wefty/contract"
 
+const DefaultSharedComputerSeatLimit = 2
+
+func ValidateComputerDefaultImage(reference string) error {
+	if reference == "" {
+		return nil
+	}
+	return contract.ValidateImageProgram(contract.ImageProgram{Reference: reference}, contract.JobClassOneShot)
+}
+
+func (s *Store) ComputerSharedSeatLimit() int { return s.computerSharedSeatLimit }
+
+// ComputerDefaultImage supplies the current cluster setting to the trusted
+// Seat-request flow. The node resolves the reference, then passes that digest
+// to CreateComputer. A changed default is checked again in that transaction.
+func (s *Store) ComputerDefaultImage() (string, error) {
+	if s.computerDefaultImage == "" {
+		return "", protocolError(contract.ErrorInvalidRequest,
+			"default Computer image is not configured; set --computer-default-image on L1")
+	}
+	return s.computerDefaultImage, nil
+}
+
 type ComputerIdleAction string
 
 const (

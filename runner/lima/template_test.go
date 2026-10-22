@@ -38,16 +38,22 @@ func TestDefaultSizingIsResolvedOnceFromOwnerDefaults(t *testing.T) {
 	}
 }
 
-func TestShippedMacSizingStartsAndAdmitsThreeDefaultComputers(t *testing.T) {
-	for _, hostMemory := range []int64{4 << 30, 8 << 30} {
-		sizing, err := DefaultSizing(hostMemory, 8)
-		if err != nil {
-			t.Fatal(err)
-		}
+func TestConfiguredMacMemoryLeavesOneGiBForTheHostVM(t *testing.T) {
+	// The size is the persisted host VM setting, not a live memory reading.
+	// A 16 GiB Mac uses 4 GiB; a 32 GiB Mac uses 8 GiB (#1132).
+	for _, test := range []struct {
+		memory string
+		room   int64
+	}{{"4GiB", 3 << 30}, {"8GiB", 7 << 30}, {"6GiB", 5 << 30}} {
+		sizing := Sizing{Memory: test.memory, CPUs: 4, Disk: DefaultDisk}
 		capacity, reserve, err := DefaultMacComputerCapacity(sizing)
-		if err != nil || capacity != 4<<30 || reserve <= 0 || 3<<30 > capacity-reserve {
-			t.Fatalf("host=%d sizing=%+v capacity=%d reserve=%d err=%v", hostMemory, sizing, capacity, reserve, err)
+		if err != nil || reserve != 1<<30 || capacity-reserve != test.room {
+			t.Fatalf("sizing=%+v capacity=%d reserve=%d err=%v; want room=%d", sizing, capacity, reserve, err, test.room)
 		}
+	}
+	capacity, reserve, err := DefaultMacComputerCapacity(Sizing{Memory: "1GiB", CPUs: 4, Disk: DefaultDisk})
+	if err != nil || capacity != 1<<30 || reserve != 1<<30 {
+		t.Fatalf("a small host VM must still support non-Computer OCI work, with zero Computer room: %d/%d, %v", capacity, reserve, err)
 	}
 }
 

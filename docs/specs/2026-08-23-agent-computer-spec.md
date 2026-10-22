@@ -23,7 +23,7 @@ The promise is deliberately concrete and local-first: one Computer on an owned M
 
 The design build-order amendment inserts `M3.5 — Agent computers | Persistent headful OCI service Computers on owned Nodes; take-over, Storage provenance, and removal proof.` between M3 OCI and M4 Daytona while leaving M4/M5 names and numbers untouched. (#115 map; #127 owner ruling; design §4)
 
-**Ratified 2026-08-23 defaults:** the CLI materializes 1 GiB `memory_bytes` and 8 GiB fully allocated `disk_bytes`. The shipped cluster-level Backup-cap default is 0, so a Computer admits no Backup until an operator configures a positive cluster default or per-Computer cap; construction stores the effective value explicitly and APIs retain no hidden default. A Mac Node's shared Lima VM defaults to a configured 4 GiB Computer-memory ceiling, raised only through `--apply-restart`; therefore about three 1 GiB Computers fit the stated admission arithmetic. The prototype's roughly 436 MiB single-Computer and 1,478 MiB (about 1.44 GiB) four-Computer observations remain evidence, not a capacity guarantee. (#118 prototype; #121 agent-computer; #122 agent-computer; #127 owner ruling)
+**Ratified 2026-08-23 defaults:** the CLI materializes 1 GiB `memory_bytes` and 8 GiB fully allocated `disk_bytes`. The shipped cluster-level Backup-cap default is 0, so a Computer admits no Backup until an operator configures a positive cluster default or per-Computer cap; construction stores the effective value explicitly and APIs retain no hidden default. M3.7 amends the Mac Computer-memory ceiling to the configured host VM memory minus 1 GiB (#1134). A 4 GiB host VM has room for 3 default Seats; an 8 GiB host VM has room for 7. The host VM sizing default is owned by #1132; #1134 changes no host VM setup. The prototype's roughly 436 MiB single-Computer and 1,478 MiB (about 1.44 GiB) four-Computer observations remain evidence, not a capacity guarantee. (#118 prototype; #121 agent-computer; #122 agent-computer; #127 owner ruling)
 
 ## 1. The `computer` trait on `JobSpec`
 
@@ -107,7 +107,24 @@ made by the trusted Seat-request flow have a positive Seat limit and idle
 action `delete`; start claims carry their recorded settings to the node
 agent. The owner-facing create API does not accept those settings in stage A.
 
-Before `Started`, the helper sets and reads back `memory.max=<cap>`, `memory.oom.group=1`, and `memory.swap.max=0`. It atomically refuses a newcomer when its cap exceeds the configured Node/VM ceiling or the sum of running Computer caps plus the newcomer would exceed that ceiling. The Mac shared-VM default ceiling is configured as 4 GiB and changes only through `--apply-restart`; with the proposed 1 GiB per-Computer CLI default, the admission arithmetic permits about three Computers while retaining 1 GiB outside the admitted cap sum. `MemAvailable` is reported with a timestamp but never gates admission; CPU remains uncapped unless the generic optional limit is set. (#122 agent-computer)
+The default Computer image is an L1 cluster startup setting, like the Backup
+cap. The trusted Seat-request flow reads its current reference, resolves it
+on the serving node, and creates a digest-pinned Computer. Creation rejects
+a reference superseded by a changed default, but an identical creation replay
+keeps its original image. Existing and owner-made Computers keep their own
+image; the default never reimages them (#1134; Computer request spec §7.1).
+
+P17's startup flags for these settings are `--computer-default-image` and
+`--computer-shared-seat-limit` on L1, and `--computer-seat-memory-bytes` and
+`--computer-dedicated-cap` on the node agent. `wefty setup` writes those flags
+into the installed services and preserves omitted settings on rerun. It also
+accepts the node's existing `--oci-setup-state` path to derive room and the
+matching L1 service count without changing the host VM. A cluster-only
+image change reloads L1 without restarting the node agent. These additions
+apply to per-user Mac and Linux service definitions; they do not change host
+VM setup or add Seat lifecycle timers (#1134).
+
+Before `Started`, the helper sets and reads back `memory.max=<cap>`, `memory.oom.group=1`, and `memory.swap.max=0`. It atomically refuses a newcomer when its cap exceeds the configured Node/VM ceiling or the sum of running Computer caps plus the newcomer would exceed that ceiling. M3.7 replaces the Mac's fixed 4 GiB ceiling and quarter reserve with the configured host VM memory minus a fixed 1 GiB reserve (#1134); the helper receives the configured VM total and reserve separately. Room is checked node-locally, even with the host VM stopped, at 1 GiB per Seat by default. A live Seat holds at least that share; a larger effective limit remains charged until confirmed shrink or absence (#1140, #1142). Owner-made Computers keep their fixed memory limit and use the same room. Each Computer still takes one service Slot, and P11 sets the service-Slot floor to the number of whole Seats that fit. The dedicated cap defaults to 1 and counts only running dedicated Computers made by Seat requests. A shared request and owner-made Computers do not consume that cap. The room matrix is 3 Seats for a 4 GiB host VM (16 GiB Mac) and 7 for an 8 GiB host VM (32 GiB Mac). The room policy supplies the check; #1142 owns reservation fencing and #1143 connects the request flow. `MemAvailable` is reported with a timestamp but never gates admission; CPU remains uncapped unless the generic optional limit is set. (#122 agent-computer)
 
 Disk capacity is paid at full allocation. A stopped Computer retains the charge; resizing reserves the increment before mutation. A Computer that exceeds its memory cap is OOM-reaped as a whole without killing neighbors, while disk exhaustion becomes tenant-local `ENOSPC` inside its image. (#122 agent-computer)
 

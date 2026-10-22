@@ -420,6 +420,13 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	if err := refuseComputerRunIdentity(request.Spec); err != nil {
 		return Computer{}, false, err
 	}
+	// Resolve replay first: changing the default must never reimage an
+	// existing Computer or invalidate an identical creation retry.
+	if request.SeatRequestSettings != nil && s.computerDefaultImage != "" &&
+		request.Spec.Execution.OCI.Image.Reference != s.computerDefaultImage {
+		return Computer{}, false, protocolError(contract.ErrorConflict,
+			"default Computer image changed; resolve %q and retry creation", s.computerDefaultImage)
+	}
 	var existingID string
 	if err := tx.QueryRowContext(ctx, "SELECT computer_id FROM computers WHERE name=?", request.Name).Scan(&existingID); err == nil {
 		return Computer{}, false, protocolError(contract.ErrorConflict,

@@ -619,7 +619,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 		}
 
 	}
-	services, err := setupRoleServices(paths, profile, digests, loginPATH, role)
+	services, err := setupRoleServices(paths, profile, digests, loginPATH, role, request.computer)
 	if err != nil {
 		return report, err
 	}

@@ -131,6 +131,7 @@ func run() error {
 	flag.Var(nodeTagsFlag{policies: nodePolicies}, "node-tags", "authoritative routing tags as node-id=tag,tag (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies}, "node-max-oneshot-slots", "authoritative one-shot capacity as node-id=slots (repeatable)")
 	flag.Var(nodeSlotsFlag{policies: nodePolicies, service: true}, "node-max-service-slots", "authoritative service capacity as node-id=slots (repeatable)")
+	computerSettings := bindComputerStartupFlags(flag.CommandLine)
 	flag.Parse()
 	explicit := connprofile.ExplicitFlags(flag.CommandLine)
 	rebindRequested := explicit["rebind-admin"] || explicit["admin-device-id"]
@@ -197,6 +198,9 @@ func run() error {
 		OneshotLogRetentionAge:       *oneshotLogRetentionAge,
 		LogRetentionTotalBytes:       *logRetentionTotalBytes,
 		ComputerBackupCap:            *computerBackupCap,
+	}
+	if err := computerSettings.apply(&storeOptions); err != nil {
+		return err
 	}
 	if *initiateAdminBootstrap && *resetAdminPolicy {
 		return errors.New("-initiate-admin-bootstrap and -reset-admin-policy are mutually exclusive")
