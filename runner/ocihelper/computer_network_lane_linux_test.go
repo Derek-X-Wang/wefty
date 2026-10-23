@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,6 +36,15 @@ func TestHelperComputerNetworkNoneAP1AP2AP3(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+		}
+		_, bridgeErr := engine.Run(ctx, RunRequest{Workload: WorkloadInput{Computer: true, ComputerNetwork: ComputerNetworkNone}, EnableHostBridgeFallback: true})
+		var refusal *RPCError
+		if !errors.As(bridgeErr, &refusal) || refusal.Code != CodeInvalidRequest {
+			t.Fatalf("none helper prepared a submission bridge: %v", bridgeErr)
+		}
+		bridgeErr = engine.SetComputerToken(ctx, SetComputerTokenRequest{Authority: authority, Token: "forged", L3Endpoint: "http://127.0.0.1:1234/l3"})
+		if !errors.As(bridgeErr, &refusal) || refusal.Code != CodeInvalidRequest {
+			t.Fatalf("none helper published submission authority: %v", bridgeErr)
 		}
 		applied, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{{1, "seat1", 7102, 7103}}})
 		must(err)
@@ -123,11 +133,53 @@ sys.stdout.buffer.write(pathlib.Path('copied-out.bin').read_bytes())
 		if !bytes.Equal(got, want) {
 			t.Fatal("none copy lost bytes")
 		}
-		proof := run(`import socket,errno,urllib.request,json
-assert [name for _,name in socket.if_nameindex()]==['lo']
+		proof := run(`import socket,errno,urllib.request,json,struct,pathlib
+def attributes(data):
+ result={}
+ while len(data)>=4:
+  length,kind=struct.unpack_from('=HH',data)
+  assert 4<=length<=len(data)
+  result[kind&0x3fff]=data[4:length]
+  data=data[(length+3)&~3:]
+ return result
+def dump(kind,size):
+ with socket.socket(socket.AF_NETLINK,socket.SOCK_RAW,socket.NETLINK_ROUTE) as s:
+  s.settimeout(2)
+  payload=bytes(size)
+  s.sendto(struct.pack('=IHHII',16+size,kind,0x301,1,0)+payload,(0,0))
+  while True:
+   data=s.recv(65536)
+   while len(data)>=16:
+    length,typ,flags,seq,pid=struct.unpack_from('=IHHII',data)
+    assert 16<=length<=len(data)
+    body=data[16:length];data=data[(length+3)&~3:]
+    if typ==3:return
+    assert typ!=2,('netlink error',body)
+    yield body
+links=[]
+for record in dump(18,16):
+ family,pad,hardware,index,flags,change=struct.unpack_from('=BBHiII',record)
+ attrs=attributes(record[16:]);name=attrs[3].rstrip(b'\0').decode()
+ info=attributes(attrs.get(18,b''));kind=info.get(1,b'').rstrip(b'\0').decode()
+ links.append((index,name,kind,flags))
+addresses={}
+for record in dump(22,8):
+ index=struct.unpack_from('=BBBBI',record)[4]
+ addresses[index]=addresses.get(index,0)+1
+fallbacks={'tunl0':'ipip','sit0':'sit','ip6tnl0':'ip6tnl','gre0':'gre','gretap0':'gretap','erspan0':'erspan','ip6gre0':'ip6gre','ip6gretap0':'ip6gretap','ip6erspan0':'ip6erspan'}
+assert set(socket.if_nameindex())=={(i,n) for i,n,k,f in links}
+assert len([n for i,n,k,f in links if n=='lo' and f&1 and f&8])==1
+for index,name,kind,flags in links:
+ if name!='lo':assert not flags&1 and addresses.get(index,0)==0 and fallbacks.get(name)==kind,(name,kind,flags,addresses)
+assert not pathlib.Path('/wefty/control/computer-token').exists()
+assert not pathlib.Path('/wefty/control/l3-endpoint').exists()
 assert len(open('/proc/net/route').read().splitlines())==1
 assert open('/etc/resolv.conf').read()=='nameserver 127.0.0.1\noptions timeout:1 attempts:1\n'
 assert open('/etc/hosts').read()=='127.0.0.1 localhost\n::1 localhost\n'
+with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as s:
+ try:s.sendto(bytes(12),('8.8.8.8',53))
+ except OSError as e:assert e.errno==errno.ENETUNREACH,e
+ else:raise AssertionError('outbound UDP DNS reached the network')
 for family,address in ((socket.AF_INET,('1.1.1.1',443)),(socket.AF_INET6,('2606:4700:4700::1111',443))):
  with socket.socket(family,socket.SOCK_STREAM) as s:
   s.settimeout(1)
@@ -147,7 +199,7 @@ with socket.socket() as listener:
   with server:
    server.sendall(b'loopback works')
    assert client.recv(64)==b'loopback works'
-print(json.dumps({'loopback':True,'outbound_tcp_refused':True,'web_refused':True,'dns_refused':True,'interfaces':['lo']}))
+print(json.dumps({'loopback':True,'outbound_tcp_refused':True,'outbound_udp_dns_unreachable':True,'web_refused':True,'dns_refused':True,'submission_bridge_closed':True,'interfaces':[n for i,n,k,f in links]}))
 `)
 		// Repeat real endpoint probes after the network refusals. Missing internet
 		// must neither revoke readiness nor kill the Computer's task.

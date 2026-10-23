@@ -89,6 +89,7 @@ type containerdAttempt struct {
 	computerGID      uint32
 	networkNamespace *pinnedNetworkNamespace
 	computerNetwork  *computerNetworkAttachment
+	networkMode      string
 	controlMu        sync.Mutex
 	lost             bool
 	mu               sync.Mutex
@@ -1015,6 +1016,9 @@ func classifyImageOperationError(err error, resolvedDigest string) error {
 }
 
 func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ RunResponse, runErr error) {
+	if rpcErr := validateComputerSubmissionBridge(request); rpcErr != nil {
+		return RunResponse{}, rpcErr
+	}
 	ctx = engineContext(ctx)
 	if err := os.MkdirAll(engine.config.RuntimeRoot, 0o700); err != nil {
 		return RunResponse{}, err
@@ -1368,7 +1372,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 			return nil
 		}
 		return deleteErr
-	}, observeTaskAbsence: engine.attemptTaskAbsenceObserver(task, startEngine), stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork}
+	}, observeTaskAbsence: engine.attemptTaskAbsenceObserver(task, startEngine), stdout: stdout, stderr: stderr, cancel: attemptCancel, terminalReady: make(chan struct{}), logAcknowledged: make(map[string]uint64), hostBridge: hostBridge, endpoints: endpoints, endpointHolds: endpointHolds, controlDirectory: controlDirectory, computerUID: computerUID, computerGID: computerGID, networkNamespace: networkNamespace, computerNetwork: computerNetwork, networkMode: request.Workload.ComputerNetwork}
 	engine.watchOOM(attempt)
 	go attempt.cacheTerminal(wait, engine.config.CgroupRoot, engine.config.TaskReleaseTimeout)
 	// The durable ownership record was published before NewTask and the
@@ -3164,6 +3168,9 @@ func (engine *ContainerdEngine) SetComputerToken(_ context.Context, request SetC
 	attempt, err := engine.attempt(request.Authority)
 	if err != nil {
 		return err
+	}
+	if attempt.networkMode == ComputerNetworkNone && request.Token != "" {
+		return &RPCError{Code: CodeInvalidRequest, Message: "Computer network none refuses submission authority"}
 	}
 	attempt.controlMu.Lock()
 	defer attempt.controlMu.Unlock()

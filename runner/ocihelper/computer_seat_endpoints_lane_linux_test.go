@@ -168,7 +168,7 @@ func withSeatEndpointComputerNetwork(t *testing.T, imageRef, address, network st
 	authority.Class = "service"
 	authority.AttemptID = id
 	authority.JobID = id
-	attempt := &containerdAttempt{authority: authority, task: task, networkNamespace: namespace, controlDirectory: control}
+	attempt := &containerdAttempt{authority: authority, task: task, networkNamespace: namespace, controlDirectory: control, networkMode: network}
 	engine := &ContainerdEngine{config: NativeEngineConfig{Clock: systemClock{}}, attempts: map[string]*containerdAttempt{authority.key(): attempt}}
 
 	defer func() {

@@ -732,6 +732,13 @@ listings also support `--all`, retaining their ordering and filters.
 
 ### Computer pass Run scope
 
+Only a Computer with network `internet` may enable submission. Enabling it
+for network `none` returns L1 HTTP 409 `conflict` without changing authority.
+The node agent and OCI helper also keep the guest-to-host submission bridge
+closed and deliver no Computer pass for `none`, including for a stale claim
+that says submission is enabled. Screen, command and file transports remain
+available from outside the Computer; they grant no guest-to-host L3 channel.
+
 The pass may create only root Runs. L3 derives immutable `computer` trigger
 provenance (`computer_id`, `computer_attempt_id`,
 `computer_storage_generation`, and `submit_intent_revision`); callers cannot

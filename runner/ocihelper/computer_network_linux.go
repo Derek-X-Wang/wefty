@@ -4,7 +4,6 @@ package ocihelper
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 
@@ -24,14 +23,29 @@ func (engine *ContainerdEngine) prepareComputerWorkloadNetwork(ctx context.Conte
 	// The runtime spec creates a fresh network namespace. No veth, default
 	// route, NAT, DNS proxy, egress probe or firewall is installed for none.
 	if err := inNetworkNamespace(namespace, func() error {
+		loopback, err := netlink.LinkByName("lo")
+		if err != nil {
+			return &RuntimeSpecRejectionError{err: fmt.Errorf("Computer network none requires loopback: %w", err)}
+		}
+		if err := netlink.LinkSetUp(loopback); err != nil {
+			return err
+		}
 		links, err := netlink.LinkList()
 		if err != nil {
 			return err
 		}
-		if len(links) != 1 || links[0].Attrs().Name != "lo" || links[0].Attrs().Flags&net.FlagLoopback == 0 {
-			return errors.New("Computer network none requires a fresh loopback-only namespace")
+		facts := make([]computerNetworkLink, 0, len(links))
+		for _, link := range links {
+			addresses, err := netlink.AddrList(link, netlink.FAMILY_ALL)
+			if err != nil {
+				return err
+			}
+			attrs := link.Attrs()
+			facts = append(facts, computerNetworkLink{name: attrs.Name, kind: link.Type(), index: attrs.Index,
+				up: attrs.Flags&net.FlagUp != 0, loopback: attrs.Flags&net.FlagLoopback != 0, addresses: len(addresses)})
 		}
-		if err := netlink.LinkSetUp(links[0]); err != nil {
+		loopbackIndex, err := validateComputerNoneNetworkLinks(facts)
+		if err != nil {
 			return err
 		}
 		routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
@@ -42,8 +56,8 @@ func (engine *ContainerdEngine) prepareComputerWorkloadNetwork(ctx context.Conte
 			// Local loopback routes are created by the kernel when lo goes up.
 			// They cannot leave this namespace. No default or outward route is
 			// accepted, including an IPv6 route.
-			if route.LinkIndex != links[0].Attrs().Index || route.Gw != nil || route.Dst == nil || !route.Dst.IP.IsLoopback() {
-				return fmt.Errorf("Computer network none has an outward route: %s", route.String())
+			if route.LinkIndex != loopbackIndex || route.Gw != nil || route.Dst == nil || !route.Dst.IP.IsLoopback() {
+				return &RuntimeSpecRejectionError{err: fmt.Errorf("Computer network none has an outward route: %s", route.String())}
 			}
 		}
 		return nil

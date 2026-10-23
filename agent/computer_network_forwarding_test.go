@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"net"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -19,6 +21,73 @@ import (
 type computerNetworkForwardingEngine struct {
 	*preAdmissionRenewalEngine
 	inputs chan ocihelper.WorkloadInput
+}
+
+type computerNetworkClosedRuntime struct {
+	*ocirunner.Adapter
+	request workloadrunner.Request
+	called  bool
+}
+
+func (r *computerNetworkClosedRuntime) Preflight(_ context.Context, request workloadrunner.Request) (workloadrunner.Admission, workloadrunner.Result, error) {
+	return workloadrunner.Admission{Request: request}, workloadrunner.Result{}, nil
+}
+func (r *computerNetworkClosedRuntime) Run(_ context.Context, request workloadrunner.Request, _ workloadrunner.OutputSink) (workloadrunner.Result, error) {
+	r.called, r.request = true, request
+	zero := 0
+	return workloadrunner.Result{Outcome: contract.ProcessResult{ExitCode: &zero}}, nil
+}
+func (*computerNetworkClosedRuntime) ReapAndVerify(context.Context, workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+	return workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt}, nil
+}
+
+func TestComputerNoneClaimKeepsSubmissionBridgeClosed(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, err := initializeManagedResource(root, "network-node", "network-boot", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &computerNetworkClosedRuntime{}
+	minter := &recordingComputerTokenMinter{grant: l3.ComputerTokenGrant{
+		Token: "unexpected-pass", ComputerID: "network-computer", ComputerAttemptID: "network-attempt", ComputerStorageGeneration: 1,
+	}}
+	bridges := 0
+	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
+		nodeID: "network-node", bootSessionID: "network-boot", clock: systemClock{}, managedResource: managed,
+		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, computerTokens: minter,
+		workflowBridge: func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error) {
+			bridges++
+			return nil, errors.New("unexpected submission bridge")
+		},
+	})
+	digest := preAdmissionImageDigest
+	memory := int64(1 << 30)
+	claim := l1.Claim{
+		Job: l1.Job{JobID: "network-job", Spec: contract.JobSpec{Kind: contract.JobKindOCI, Class: contract.JobClassService,
+			Execution: contract.ExecutionSpec{OCI: &contract.OCIExecutionSpec{
+				Image:    contract.OCIImageSpec{Reference: preAdmissionImageReference, Digest: &digest},
+				Computer: &contract.OCIComputerSpec{DiskBytes: 8 << 30}, Limits: &contract.OCILimits{MemoryBytes: &memory},
+			}},
+		}},
+		Lease: l1.AttemptLease{AttemptID: "network-attempt", FencingToken: "network-fence", LeaseTTL: time.Second},
+		ComputerStorage: &l1.ComputerStorageClaim{
+			ComputerSettings: &l1.ComputerSettings{Network: l1.ComputerNetworkNone}, SeatRequestMade: true,
+			ComputerID: "network-computer", StorageID: "network-storage", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 8 << 30,
+			// A stale or inconsistent claim must not bypass the fixed setting.
+			SubmitEnabled: true,
+		},
+	}
+	_, err = lifecycle.runWorkload(t.Context(), claim)
+	if err != nil || !runtime.called || minter.calls != 0 || bridges != 0 {
+		t.Fatalf("none submission path used: ran=%t mint=%d bridges=%d error=%v", runtime.called, minter.calls, bridges, err)
+	}
+	r := runtime.request
+	if r.HostBridgeDial != nil || r.HostBridgeEndpointReady != nil || r.HostBridgeFallbackActive || r.Execution.SensitiveEnv[contract.EnvComputerToken] != "" || r.Execution.Env[contract.EnvL3Endpoint] != "" {
+		t.Fatal("none Computer received submission transport or authority")
+	}
 }
 
 func (e *computerNetworkForwardingEngine) Run(ctx context.Context, request ocihelper.RunRequest) (ocihelper.RunResponse, error) {
@@ -37,8 +106,10 @@ func (r computerNetworkForwardingRuntime) Preflight(ctx context.Context, request
 	// and helper before the unrelated desktop lifecycle. Replace only the L1
 	// image-observation callback and the unused private submission dial.
 	request.OCIImageResolved = func(context.Context, workloadrunner.OCIImageObservation) error { return nil }
-	request.HostBridgeDial = func(context.Context) (net.Conn, error) { return nil, errors.New("unexpected bridge dial") }
-	request.HostBridgeFallbackActive = true
+	if request.ComputerNetwork != ocihelper.ComputerNetworkNone {
+		request.HostBridgeDial = func(context.Context) (net.Conn, error) { return nil, errors.New("unexpected bridge dial") }
+		request.HostBridgeFallbackActive = true
+	}
 	result, err := r.Adapter.Run(ctx, request, nil)
 	return workloadrunner.Admission{Request: request}, result, err
 }

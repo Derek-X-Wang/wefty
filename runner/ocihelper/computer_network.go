@@ -19,12 +19,23 @@ func validateComputerNetwork(workload WorkloadInput) error {
 	if workload.ComputerNetwork != "" && !workload.Computer {
 		return errors.New("Computer network requires a Computer workload")
 	}
+	if workload.ComputerNetwork == ComputerNetworkNone && (workload.ComputerToken != "" || workload.L3Endpoint != "") {
+		return errors.New("Computer network none refuses submission authority")
+	}
 	switch workload.ComputerNetwork {
 	case "", ComputerNetworkInternet, ComputerNetworkNone:
 		return nil
 	default:
 		return errors.New("Computer network must be internet or none")
 	}
+}
+
+func validateComputerSubmissionBridge(request RunRequest) *RPCError {
+	if request.Workload.ComputerNetwork == ComputerNetworkNone &&
+		(request.EnableHostBridgeFallback || request.ActivateHostBridgeFallback || request.Workload.ComputerToken != "" || request.Workload.L3Endpoint != "") {
+		return &RPCError{Code: CodeInvalidRequest, Message: "Computer network none refuses the submission bridge"}
+	}
+	return nil
 }
 
 // Publish constant helper-owned files without replacing identities retained by

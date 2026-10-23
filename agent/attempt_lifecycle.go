@@ -1175,6 +1175,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			request.ComputerNetwork = string(claim.ComputerStorage.Network)
 		}
 	}
+	computerTokens := lifecycle.dependencies.computerTokens
+	if request.ComputerNetwork == ocihelper.ComputerNetworkNone {
+		computerTokens = nil
+	}
 	var ociRuntimeLoss ociRuntimeLossLatch
 	preRunObservationRefused := false
 	if claim.Job.Spec.Kind == contract.JobKindOCI {
@@ -1383,12 +1387,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	if computerService {
 		request.Execution = withoutComputerReservedOperatorEnvironment(request.Execution)
-		if claim.ComputerStorage.SubmitEnabled {
-			if lifecycle.dependencies.computerTokens == nil {
+		if claim.ComputerStorage.SubmitEnabled && request.ComputerNetwork != ocihelper.ComputerNetworkNone {
+			if computerTokens == nil {
 				err := errors.New("Computer submission is enabled but the L3 token minter is unavailable")
 				return spawnFailure(contract.SpawnFailurePassUnavailable, err), err
 			}
-			grant, err := lifecycle.dependencies.computerTokens.MintComputerToken(ctx, l3.ComputerTokenMintRequest{
+			grant, err := computerTokens.MintComputerToken(ctx, l3.ComputerTokenMintRequest{
 				ComputerID: claim.ComputerStorage.ComputerID, ComputerAttemptID: claim.Lease.AttemptID,
 			})
 			if err != nil {
@@ -1814,7 +1818,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	var err error
 	var computerBridge *computerAttemptBridgeController
-	if computerService {
+	if computerService && request.ComputerNetwork != ocihelper.ComputerNetworkNone {
 		computerBridge = newComputerAttemptBridgeController(ctx, lifecycle.dependencies.workflowBridge, claim.Job.Spec.Kind, executionSpec)
 		defer computerBridge.disable(errComputerAttemptClosed)
 		if claim.ComputerStorage.SubmitEnabled {
@@ -1954,10 +1958,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			clock: lifecycle.dependencies.clock, fabric: lifecycle.dependencies.fabric,
 			publicationOperation: lifecycle.dependencies.client.boundedContext,
 			authorizer:           lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
-			computerTokens: lifecycle.dependencies.computerTokens, computerBridge: computerBridge,
+			computerTokens: computerTokens, computerBridge: computerBridge,
 			controlTokens: lifecycle.dependencies.computerControlTokens,
 			submission: ComputerSubmissionAuthority{ComputerID: claim.ComputerStorage.ComputerID,
-				Enabled: claim.ComputerStorage.SubmitEnabled, SubmitIntentRevision: claim.ComputerStorage.SubmitIntentRevision,
+				Enabled: claim.ComputerStorage.SubmitEnabled && request.ComputerNetwork != ocihelper.ComputerNetworkNone, SubmitIntentRevision: claim.ComputerStorage.SubmitIntentRevision,
 				SubmitMaxInflight: claim.ComputerStorage.SubmitMaxInflight, SubmitPolicyRevision: claim.ComputerStorage.SubmitPolicyRevision},
 			computerID: claim.ComputerStorage.ComputerID, jobID: claim.Job.JobID,
 			storageID: claim.ComputerStorage.StorageID, storageGeneration: claim.ComputerStorage.StorageGeneration,

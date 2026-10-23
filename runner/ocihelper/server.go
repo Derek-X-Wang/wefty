@@ -142,6 +142,7 @@ type serverAttempt struct {
 	cgroupID         string
 	bridgeCapability string
 	computer         bool
+	computerNetwork  string
 	deadline         time.Time
 	deadlineChanged  chan struct{}
 	watchDone        chan struct{}
@@ -971,10 +972,13 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: "active host bridge fallback was not prepared"}
 	}
 	computer := request.Workload.Computer
+	if rpcErr := validateComputerSubmissionBridge(request); rpcErr != nil {
+		return nil, rpcErr
+	}
 	if computer && request.Authority.Class != contract.JobClassService {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require service attempt authority"}
 	}
-	if computer && (!request.EnableHostBridgeFallback || !request.ActivateHostBridgeFallback) {
+	if computer && request.Workload.ComputerNetwork != ComputerNetworkNone && (!request.EnableHostBridgeFallback || !request.ActivateHostBridgeFallback) {
 		return nil, &RPCError{Code: CodeInvalidRequest, Message: "Computer mechanics require the private network namespace bridge"}
 	}
 	if err := validateRunEndpointContract(computer, request.AllocateEndpoints); err != nil {
@@ -983,6 +987,7 @@ func (session *serverSession) reserveAttempt(request RunRequest, runCancel conte
 	attempt := &serverAttempt{
 		authority: request.Authority, state: attemptStarting,
 		computer:        computer,
+		computerNetwork: request.Workload.ComputerNetwork,
 		deadline:        session.server.config.Clock.Now().Add(request.InitialDeadman),
 		deadlineChanged: make(chan struct{}, 1), watchDone: make(chan struct{}), reaped: make(chan struct{}),
 		runCancel: runCancel,
@@ -1796,6 +1801,10 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		}
 		if (body.Token == "") != (body.L3Endpoint == "") {
 			_ = writeFailure(wire, CodeInvalidRequest, "Computer token and L3 endpoint must be published or removed together")
+			return
+		}
+		if attempt.computerNetwork == ComputerNetworkNone && body.Token != "" {
+			_ = writeFailure(wire, CodeInvalidRequest, "Computer network none refuses submission authority")
 			return
 		}
 		engine, ok := server.engine.(ComputerControlEngine)

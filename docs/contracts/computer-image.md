@@ -137,7 +137,9 @@ The other reserved OCI names remain governed by the run-execution-context
 contract. In particular, a Computer never receives `WEFTY_RUN_TOKEN` merely
 because it is a Computer.
 
-Submission is disabled by default. When an administrator enables the
+Submission is disabled by default and cannot be enabled for `network=none`:
+L1 returns HTTP 409 `conflict`, and neither the node agent nor the helper opens
+a submission bridge or delivers a pass for that network. When an administrator enables the
 revisioned submission intent, the agent must obtain an L3-verified pass bound
 to the exact Computer, attempt, Storage generation, submit-intent revision,
 host Node, and L3 authority generation before helper preflight. Mint failure
@@ -307,8 +309,13 @@ the copied bytes.
 The Computer's fixed network setting selects `internet` or `none`. An omitted
 helper setting preserves `internet` for existing callers. Both settings create
 a fresh private network namespace. With `network=none`, that namespace has
-loopback only: the helper brings `lo` up and verifies that no other interface,
-default route or outward route exists, for either IP family. Kernel-local
+loopback only: the helper brings `lo` up and verifies that no outward interface,
+default route or outward route exists, for either IP family. Kernel-created
+fallback tunnels may remain only under their known fallback name and kind
+(`tunl0`/`ipip`, `sit0`/`sit`, `ip6tnl0`/`ip6tnl`, `gre0`/`gre`, and the
+corresponding GRE tap/ERSPAN and IPv6 fallback devices), down and with no IPv4
+or IPv6 address. Any other link, active fallback, or addressed fallback is a
+typed `oci_spec_rejected` refusal. Kernel-local
 loopback routes remain. It creates no veth, NAT, egress proof listener or DNS
 proxy. The helper mounts fixed read-only files from its managed
 `network/none/` directory: `resolv.conf` names only `127.0.0.1`, with one
@@ -401,8 +408,19 @@ observed as disabled. The authority-bound
 view, control, and directive paths remain private loopback bridges. Ordinary OCI
 jobs keep shared networking unchanged.
 
-Computer submission uses the helper reverse bridge as its only transport on
-every platform. Exactly four bridge pumps may be active per Computer attempt;
+Computer submission is available only with `network=internet`. L1 refuses an
+admin's enable request for `network=none` with HTTP 409 `conflict`, without
+changing submission intent, policy revision, or audit. Disabling remains
+available. The node agent does not mint or synchronize a pass, create a
+submission bridge, or request a helper bridge for `none`, even if a stale
+claim says submission is enabled. The helper independently refuses bridge
+preparation and nonempty submission authority for `none`, including later
+`SetComputerToken` calls. It exposes no bridge capability or endpoint. Screen,
+command, and copy transports continue to work from outside the Computer.
+There is no submission exception to the loopback-only rule.
+
+For `internet`, Computer submission uses the helper reverse bridge as its only
+transport on every platform. Exactly four bridge pumps may be active per Computer attempt;
 additional guest connections wait behind that fixed concurrency bound.
 
 This screen mechanism does not by itself prove the complete isolation boundary.

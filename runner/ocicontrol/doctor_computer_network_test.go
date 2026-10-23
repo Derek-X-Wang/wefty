@@ -1,7 +1,9 @@
 package ocicontrol
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +46,13 @@ func TestDoctorAcceptsProvenComputerWithoutInternet(t *testing.T) {
 			report := BuildDoctor(t.Context(), config)
 			if report.ComputerScreenIsolation.Outcome != scenario.want {
 				t.Fatalf("none Computer health = %s; want %s: %+v", report.ComputerScreenIsolation.Outcome, scenario.want, report.ComputerScreenIsolation)
+			}
+			var human bytes.Buffer
+			if err := WriteDoctorHuman(&human, report); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(human.String(), "computer_network=none loopback_only="+map[bool]string{true: "true", false: "false"}[scenario.proof]) {
+				t.Fatalf("human doctor omitted the intended network: %s", human.String())
 			}
 		})
 	}
