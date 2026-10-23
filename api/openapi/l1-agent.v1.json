@@ -8,6 +8,110 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/agent/seat-approvals": {
+      "post": {
+        "operationId": "beginSeatApproval",
+        "summary": "Begin a node-owned Seat approval request or consume an open window",
+        "description": "Node agent principal only, bound to the registered node identity and current boot session. Repeating an identical Seat ID is idempotent; different immutable input conflicts. A covering open window can approve a request only when window_hours is zero. A new window always requires the native owner dialog. answer_wait is the node setting in nanoseconds, capped at one hour. The harness label is not verified. On the plain Fabric, identities are self-asserted; per-machine participants are required for real identity enforcement.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatApprovalRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Current approval state and its original answer deadline.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatApproval"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/agent/seat-approvals/{seat_id}/answer": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "answerSeatApproval",
+        "summary": "Record the node-owned native dialog outcome",
+        "description": "Node agent principal only, bound to the request's node identity and current boot session. A late answer becomes a refusal with no answer from the owner. A repeated answer returns the terminal record without extending a window. Approval may open only the requested 1, 8 or 24 hour window. The node agent supplies this answer; no CLI or control-socket approval verb exists.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatApprovalAnswer"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Terminal approval or refusal record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatApproval"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
     "/v1/agent/nodes/register": {
       "post": {
         "operationId": "registerNode",

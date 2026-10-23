@@ -7,6 +7,201 @@
   "paths": {},
   "components": {
     "schemas": {
+      "SeatApprovalRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "seat_id",
+          "node_id",
+          "boot_session_id",
+          "harness",
+          "folder",
+          "form",
+          "network",
+          "window_hours",
+          "answer_wait"
+        ],
+        "properties": {
+          "seat_id": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          },
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "boot_session_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "harness": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Self-reported harness label, not verified."
+          },
+          "folder": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "form": {
+            "type": "string",
+            "enum": [
+              "any",
+              "dedicated"
+            ]
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "internet",
+              "none"
+            ],
+            "description": "internet means with internet; none means without internet."
+          },
+          "window_hours": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              8,
+              24
+            ],
+            "description": "Zero asks for one Seat; a nonzero value explicitly requests a new approval window."
+          },
+          "answer_wait": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 3600000000000,
+            "description": "Answer wait in nanoseconds, supplied by the node agent settings; at most one hour."
+          }
+        }
+      },
+      "SeatApproval": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "request",
+          "state",
+          "deadline"
+        ],
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/SeatApprovalRequest"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "requested",
+              "approved",
+              "refused"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "dialog",
+              "window"
+            ]
+          },
+          "deadline": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "SeatApprovalAnswer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "boot_session_id",
+          "approved"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "boot_session_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "approved": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "SeatApprovalWindow": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "network",
+          "expires_at"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "internet",
+              "none"
+            ],
+            "description": "internet means with internet; none means without internet."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CloseSeatApprovalWindowsRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "",
+              "internet",
+              "none"
+            ],
+            "default": "",
+            "description": "Omitted or empty closes both scopes; internet closes windows with internet, none closes windows without internet."
+          }
+        }
+      },
+      "CloseSeatApprovalWindowsResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "closed"
+        ],
+        "properties": {
+          "closed": {
+            "type": "boolean",
+            "const": true
+          }
+        }
+      },
       "PeerHealth": {
         "type": "object", "additionalProperties": false,
         "required": ["reachable", "error_class", "checked_at"],

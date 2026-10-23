@@ -15,7 +15,8 @@ import (
 // jobs_cancel_settlement indexes, then #900's automatically_admitted Node
 // provenance column, then #1085's additive one-shot restart columns, then
 // #1090's admin person-device binding and immutable rebind audit schema, then
-// #1134's Computer Seat settings and creation provenance columns. A changed
+// #1134's Computer Seat settings and creation provenance columns, then
+// #1135's boot-scoped Seat approval records and windows. A changed
 // golden means an upgrade across it
 // cannot restore the old binaries (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -32,7 +33,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
-	const mainFingerprint = "61d4a75f9d1b7dcc2036e321689f232e74668129b939bcb67c5e7db100a7217f"
+	const mainFingerprint = "f627262d8bf126cc155139ab57bdb8f0503451bd62ce98be7eb937a9f16ffbf6"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}
