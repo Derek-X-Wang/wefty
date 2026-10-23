@@ -38,11 +38,11 @@ const (
 	connectionLimitLogInterval = time.Minute
 )
 
-// dataStreamMethod names the requests that become long-lived raw streams once
-// admitted. They are the only connections whose count grows with a workload's
-// own traffic, so they alone are held below the control reserve.
+// dataStreamMethod names long-lived endpoint and command-output streams.
+// Their counts grow with workload traffic, so they stay below the control
+// reserve even when many commands or endpoint clients run at once.
 func dataStreamMethod(method Method) bool {
-	return method == MethodDialAttemptPort || method == MethodDialHostBridge
+	return method == MethodDialAttemptPort || method == MethodDialHostBridge || method == MethodExecComputerSeat || method == MethodDialSeatEndpoint
 }
 
 // admitDataStream takes one data-stream slot without waiting. A full budget is

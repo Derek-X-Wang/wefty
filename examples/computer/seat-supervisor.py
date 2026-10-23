@@ -32,11 +32,14 @@ def validate(document):
         raise SeatFailure("invalid_directive")
     wanted, ports = {}, set()
     for seat in document["seats"]:
-        if not isinstance(seat, dict) or set(seat) != {"place", "user", "view_port", "control_port"}:
+        if not isinstance(seat, dict) or set(seat) != {"place", "user", "view_port", "control_port", "view_socket", "control_socket"}:
             raise SeatFailure("invalid_seat")
         place = seat["place"]
         if type(place) is not int or place not in range(1, 5) or place in wanted or seat["user"] != "seat%d" % place:
             raise SeatFailure("invalid_seat")
+        for kind in ("view", "control"):
+            if seat[kind + "_socket"] != "/wefty/service/seats/%d/run/%s.ws" % (place, kind):
+                raise SeatFailure("invalid_endpoint")
         for key in ("view_port", "control_port"):
             port = seat[key]
             if type(port) is not int or not 1024 <= port <= 65535 or port in ports:
@@ -422,11 +425,47 @@ def sweep_scratch(uid):
             os.close(descriptor)
 
 
-def rfb_ready(port):
-    """Check the negotiated binary WebSocket and the RFB greeting, not TCP."""
+def rfb_endpoint_matches(path, directory, expected, uid):
+    # Reopen the parent without following image links. Holding the old parent
+    # alone would miss a rename/replacement of the whole runtime folder.
+    current = open_directory(Path(path).parent)
     try:
+        parent = os.fstat(directory)
+        actual_parent = os.fstat(current)
+        actual = os.stat(Path(path).name, dir_fd=current, follow_symlinks=False)
+        return ((parent.st_dev, parent.st_ino) == (actual_parent.st_dev, actual_parent.st_ino)
+                and (expected.st_dev, expected.st_ino) == (actual.st_dev, actual.st_ino)
+                and stat.S_ISSOCK(actual.st_mode) and actual.st_uid == uid
+                and not actual.st_mode & 0o077)
+    finally:
+        os.close(current)
+
+
+def rfb_ready(path, uid=None):
+    """Check the negotiated binary WebSocket and the RFB greeting, over a private Unix socket."""
+    directory = None
+    try:
+        uid = os.getuid() if uid is None else uid
         deadline = time.monotonic() + 0.2
-        with socket.create_connection(("127.0.0.1", port), timeout=0.2) as connection:
+        directory = open_directory(Path(path).parent)
+        parent = os.fstat(directory)
+        expected = os.stat(Path(path).name, dir_fd=directory, follow_symlinks=False)
+        if (parent.st_uid != uid or parent.st_mode & 0o077
+                or not stat.S_ISSOCK(expected.st_mode) or expected.st_uid != uid
+                or expected.st_mode & 0o077):
+            return False
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(0.2)
+        with connection:
+            connection.connect(path)
+            if not rfb_endpoint_matches(path, directory, expected, uid):
+                return False
+            # On Linux a transient link-and-restore cannot borrow another
+            # Seat's listener either: its kernel peer uid would differ.
+            if hasattr(socket, 'SO_PEERCRED'):
+                _, peer_uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+                if peer_uid != uid:
+                    return False
             key = base64.b64encode(os.urandom(16)).decode()
             connection.sendall(("GET /websockify HTTP/1.1\r\nHost: localhost\r\n"
                                 "Upgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -462,9 +501,13 @@ def rfb_ready(port):
                 return False
             greeting = stream.read(12)
             return (len(greeting) == 12 and greeting[:4] == b"RFB " and greeting[7:8] == b"."
-                    and greeting[4:7].isdigit() and greeting[8:11].isdigit() and greeting[-1:] == b"\n")
+                    and greeting[4:7].isdigit() and greeting[8:11].isdigit() and greeting[-1:] == b"\n"
+                    and rfb_endpoint_matches(path, directory, expected, uid))
     except (OSError, ValueError, struct.error):
         return False
+    finally:
+        if directory is not None:
+            os.close(directory)
 
 
 class DesktopBackend:
@@ -534,7 +577,7 @@ class DesktopBackend:
                 ready = stat.S_ISREG(info.st_mode) and info.st_uid == 2000 + seat["place"]
             finally:
                 os.close(descriptor)
-            return ready and rfb_ready(seat["view_port"]) and rfb_ready(seat["control_port"])
+            return ready and rfb_ready(seat["view_socket"], 2000 + seat["place"]) and rfb_ready(seat["control_socket"], 2000 + seat["place"])
         except OSError:
             return False
 

@@ -18,6 +18,7 @@ type memoryFacts struct {
 }
 
 type capacityReservation struct {
+	tmpfsCeilingBytes           int64
 	memoryBytes                 int64
 	diskBytes                   int64
 	pendingDiskBytes            int64
@@ -244,10 +245,15 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 	}
 	if existing == nil {
 		existing = &capacityReservation{
-			memoryBytes: requestedMemory, diskBytes: requestedDisk,
+			memoryBytes: requestedMemory, diskBytes: requestedDisk, tmpfsCeilingBytes: tmpfsCeiling,
 			diskMaterialized: diskAlreadyMaterialized, attempts: make(map[string]struct{}),
 		}
 		engine.capacityReservations[jobKey] = existing
+	}
+	// Overlapping admitted attempts can have different creation-time scratch
+	// ceilings after a live grow. Retain the largest ceiling until absence.
+	if tmpfsCeiling > existing.tmpfsCeilingBytes {
+		existing.tmpfsCeilingBytes = tmpfsCeiling
 	}
 	existing.attempts[attemptKey] = struct{}{}
 	receipt.MemoryCommittedAfterBytes += additionalMemory
@@ -303,4 +309,24 @@ func (engine *ContainerdEngine) clearCapacityReservations() {
 	engine.capacityMu.Lock()
 	engine.capacityReservations = make(map[string]*capacityReservation)
 	engine.capacityMu.Unlock()
+}
+
+// Caller holds capacityMu. Admission and live grows use the same total, so a
+// failed newcomer cannot take memory already reserved by another Computer.
+func (engine *ContainerdEngine) availableComputerMemoryLocked() (int64, error) {
+	committed := int64(0)
+	for _, reservation := range engine.capacityReservations {
+		if reservation.memoryBytes < 0 || reservation.memoryBytes > int64(^uint64(0)>>1)-committed {
+			return 0, errors.New("Computer memory reservations overflowed")
+		}
+		committed += reservation.memoryBytes
+	}
+	if engine.config.MemoryCapacityBytes == 0 {
+		return int64(^uint64(0)>>1) - committed, nil
+	}
+	usable := engine.config.MemoryCapacityBytes - engine.config.MemoryReserveBytes
+	if usable <= committed {
+		return 0, nil
+	}
+	return usable - committed, nil
 }
