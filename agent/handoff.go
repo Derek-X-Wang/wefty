@@ -118,6 +118,7 @@ type handoffLease struct {
 	pathLock  *handoffPathLock
 	ownership *handoffOwnership
 	once      sync.Once
+	shared    nodeLock
 }
 
 func (lease *handoffLease) release() {
@@ -129,6 +130,9 @@ func (lease *handoffLease) release() {
 			lease.ownership.run.Close()
 		}
 		m.mu.Unlock()
+		if lease.shared != nil {
+			_ = lease.shared.Close()
+		}
 		lease.pathLock.token <- struct{}{}
 		m.releasePathReference(lease.path, lease.pathLock)
 	})
@@ -242,8 +246,33 @@ func (m *handoffManager) lockPath(ctx context.Context, path string) (*handoffLea
 		return nil, context.Cause(ctx)
 	case <-pathLock.token:
 	}
+	var shared nodeLock
+	if m.stateRoot != "" {
+		for {
+			var err error
+			shared, err = m.sharedLease(path)
+			if err == nil {
+				break
+			}
+			// All failures fail closed; a permanent I/O error is returned.
+			if !errors.Is(err, errSharedLeaseBusy) {
+				pathLock.token <- struct{}{}
+				m.releasePathReference(path, pathLock)
+				return nil, err
+			}
+			timer := time.NewTimer(25 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				pathLock.token <- struct{}{}
+				m.releasePathReference(path, pathLock)
+				return nil, context.Cause(ctx)
+			case <-timer.C:
+			}
+		}
+	}
 	m.mu.Lock()
-	lease := &handoffLease{manager: m, path: path, pathLock: pathLock}
+	lease := &handoffLease{manager: m, path: path, pathLock: pathLock, shared: shared}
 	pathLock.owner = lease
 	m.mu.Unlock()
 	return lease, nil
@@ -823,6 +852,16 @@ func (m *handoffManager) enforceRunBound(run *os.Root, runID string) error {
 // back there (liftQuarantine). Neither ever widens what the sweep is willing to
 // delete.
 func (m *handoffManager) collect() error {
+	if m.stateRoot != "" {
+		guard, err := m.sharedLease("node-results-collection")
+		if errors.Is(err, errSharedLeaseBusy) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer guard.Close()
+	}
 	m.collectMu.Lock()
 	defer m.collectMu.Unlock()
 	root, err := m.openHandoffRoot()
@@ -1095,10 +1134,18 @@ func (m *handoffManager) tryCollectLease(path string) *handoffLease {
 	if m.paths[path] != nil {
 		return nil
 	}
+	var shared nodeLock
+	if m.stateRoot != "" {
+		var err error
+		shared, err = m.sharedLease(path)
+		if err != nil {
+			return nil
+		}
+	}
 	pathLock := &handoffPathLock{token: make(chan struct{}, 1), refs: 1}
 	pathLock.token <- struct{}{}
 	<-pathLock.token
-	lease := &handoffLease{manager: m, path: path, pathLock: pathLock}
+	lease := &handoffLease{manager: m, path: path, pathLock: pathLock, shared: shared}
 	pathLock.owner = lease
 	m.paths[path] = pathLock
 	return lease
@@ -1333,4 +1380,9 @@ func writeHandoffMarker(run *os.Root, marker handoffMarker) error {
 		return fmt.Errorf("write handoff marker: %w", err)
 	}
 	return nil
+}
+
+// Stable names are never unlinked: unlinking a flock inode would split ownership.
+func (m *handoffManager) sharedLease(key string) (nodeLock, error) {
+	return acquireNodeLock(filepath.Join(m.stateRoot, "record-locks"), m.nodeID+":"+key)
 }

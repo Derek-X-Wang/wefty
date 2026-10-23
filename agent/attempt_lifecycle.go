@@ -2585,10 +2585,18 @@ func (lifecycle *attemptLifecycle) retirementEvidenceSettled(ctx context.Context
 	if outbox == nil {
 		return false, nil
 	}
-	delivered, err := outbox.attemptEvidenceDelivered(ctx, claim.Lease.AttemptID, lifecycle.completionAccepted.Load())
-	if err != nil || !delivered {
+	// Publication cannot transfer through historical log/completion custody.
+	published, err := lifecycle.retirementPublicationSettled(ctx, claim)
+	if err != nil || !published {
 		return false, err
 	}
+	if _, err := outbox.spool.db.ExecContext(ctx, `UPDATE spool_attempts SET publication_settled=1 WHERE attempt_id=? AND owner_generation=?`, claim.Lease.AttemptID, outbox.spool.generationID); err != nil {
+		return false, err
+	}
+	return outbox.attemptEvidenceDelivered(ctx, claim.Lease.AttemptID, lifecycle.completionAccepted.Load())
+}
+
+func (lifecycle *attemptLifecycle) retirementPublicationSettled(ctx context.Context, claim l1.Claim) (bool, error) {
 	owner := lifecycle.executionOwnerKey(claim.Job.Spec)
 	if owner == "" {
 		return lifecycle.mailboxDrained(), nil

@@ -797,6 +797,16 @@ func (m *handoffManager) measureNodeOnly(ctx context.Context) error {
 }
 
 func (m *handoffManager) accountNodeEnforcing(ctx context.Context, enforce bool) error {
+	if m.stateRoot != "" {
+		guard, err := m.sharedLease("node-results-collection")
+		if errors.Is(err, errSharedLeaseBusy) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer guard.Close()
+	}
 	root, err := m.openHandoffRoot()
 	if err != nil {
 		return err

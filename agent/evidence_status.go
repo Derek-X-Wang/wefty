@@ -32,7 +32,7 @@ func PendingEvidence(ctx context.Context, directory, nodeID string) (int, error)
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	attempts, err := (&logSpool{db: db}).pendingAttempts(ctx)
+	attempts, err := (&logSpool{db: db}).pendingAttemptsMatching(ctx, "1=1")
 	if err != nil {
 		return 0, err
 	}

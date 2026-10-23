@@ -69,6 +69,9 @@ type incompleteEvidenceTombstone struct {
 }
 
 type logSpool struct {
+	directory    string
+	nodeID       string
+	generationID string
 	// db is the synchronous=FULL handle: every write L1 or recovery relies
 	// on. appendDB is the synchronous=NORMAL handle for output-event appends
 	// only; see logSpoolDSN.
@@ -116,6 +119,14 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 	if err := durable.MkdirAll(directory, "", 0o700); err != nil {
 		return nil, fmt.Errorf("agent: create log spool directory: %w", err)
 	}
+	// Schema migrations and legacy backfills are serialized across startups.
+	startupContext, cancelStartup := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelStartup()
+	startup, err := waitNodeLock(startupContext, directory, nodeID+":spool-initialization")
+	if err != nil {
+		return nil, err
+	}
+	defer startup.Close()
 	path := filepath.Join(directory, spoolFileName(nodeID))
 	db, err := sql.Open("sqlite", logSpoolDSN(path, "FULL"))
 	if err != nil {
@@ -123,7 +134,7 @@ func openLogSpoolWithBudgets(directory, nodeID string, maxOneShotBytes, maxServi
 	}
 	db.SetMaxOpenConns(1)
 	spool := &logSpool{
-		db: db, maxOneShotBytes: maxOneShotBytes, maxServiceBytes: maxServiceBytes,
+		db: db, maxOneShotBytes: maxOneShotBytes, maxServiceBytes: maxServiceBytes, directory: directory, nodeID: nodeID,
 		dispositionNext: make(chan struct{}),
 	}
 	if err := spool.initialize(context.Background()); err != nil {
@@ -333,7 +344,13 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 	  cleanup_fence TEXT NOT NULL,
 	  acknowledged_ns INTEGER NOT NULL
 	);
-	CREATE TABLE IF NOT EXISTS spool_durability_barrier (
+	CREATE TABLE IF NOT EXISTS generation_evidence_custodians (generation_id TEXT PRIMARY KEY);
+ CREATE TABLE IF NOT EXISTS closed_agent_generations (generation_id TEXT PRIMARY KEY);
+ CREATE TABLE IF NOT EXISTS generation_evidence_custody (
+ attempt_id TEXT PRIMARY KEY REFERENCES spool_attempts(attempt_id) ON DELETE CASCADE,
+ owner_generation TEXT NOT NULL, custodian_generation TEXT NOT NULL, identity_json BLOB NOT NULL, digest TEXT NOT NULL,
+ acknowledged_ns INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS spool_durability_barrier (
 	  id INTEGER PRIMARY KEY CHECK(id = 1),
 	  commits INTEGER NOT NULL
 	);`
@@ -348,6 +365,8 @@ CREATE TABLE IF NOT EXISTS spool_completion_receipts (
 	}{
 		{table: "spool_removals", column: "runtime_kind", definition: "TEXT"},
 		{table: "spool_attempts", column: "kind", definition: "TEXT"},
+		{table: "spool_attempts", column: "owner_generation", definition: "TEXT NOT NULL DEFAULT ''"},
+		{table: "spool_attempts", column: "publication_settled", definition: "INTEGER NOT NULL DEFAULT 0"},
 		{table: "spool_attempts", column: "completion_disposition", definition: "TEXT"},
 		{table: "spool_attempts", column: "completion_reason", definition: "TEXT"},
 		{table: "spool_attempts", column: "intent_revision", definition: "INTEGER"},
@@ -792,22 +811,22 @@ func sameBackupCopyRemovalAuthority(left, right l1.ComputerBackupPruneDirective)
 }
 
 func (spool *logSpool) ensureAttempt(ctx context.Context, claim l1.Claim) error {
-	_, err := spool.db.ExecContext(ctx, `INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, class, kind, created_ns)
-VALUES(?, ?, ?, ?, ?, ?)
+	_, err := spool.db.ExecContext(ctx, `INSERT INTO spool_attempts(attempt_id, job_id, fencing_token, class, kind, created_ns, owner_generation)
+VALUES(?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(attempt_id) DO UPDATE SET job_id=excluded.job_id, fencing_token=excluded.fencing_token, class=excluded.class, kind=excluded.kind
 WHERE spool_attempts.job_id=excluded.job_id
   AND spool_attempts.fencing_token=excluded.fencing_token
 	AND spool_attempts.class=excluded.class
-	AND spool_attempts.kind=excluded.kind`,
-		claim.Lease.AttemptID, claim.Job.JobID, claim.Lease.FencingToken, claim.Job.Spec.Class, claim.Job.Spec.Kind, claim.Job.CreatedAt.UTC().Round(0).UnixNano())
+	AND spool_attempts.kind=excluded.kind AND spool_attempts.owner_generation=excluded.owner_generation`,
+		claim.Lease.AttemptID, claim.Job.JobID, claim.Lease.FencingToken, claim.Job.Spec.Class, claim.Job.Spec.Kind, claim.Job.CreatedAt.UTC().Round(0).UnixNano(), spool.generationID)
 	if err != nil {
 		return fmt.Errorf("agent: store log spool attempt: %w", err)
 	}
-	var jobID, fencingToken, class, kind string
-	if err := spool.db.QueryRowContext(ctx, "SELECT job_id, fencing_token, class, kind FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&jobID, &fencingToken, &class, &kind); err != nil {
+	var jobID, fencingToken, class, kind, owner string
+	if err := spool.db.QueryRowContext(ctx, "SELECT job_id, fencing_token, class, kind, owner_generation FROM spool_attempts WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&jobID, &fencingToken, &class, &kind, &owner); err != nil {
 		return fmt.Errorf("agent: verify log spool attempt: %w", err)
 	}
-	if jobID != claim.Job.JobID || fencingToken != claim.Lease.FencingToken || class != claim.Job.Spec.Class || kind != claim.Job.Spec.Kind {
+	if owner != spool.generationID || jobID != claim.Job.JobID || fencingToken != claim.Lease.FencingToken || class != claim.Job.Spec.Class || kind != claim.Job.Spec.Kind {
 		return fmt.Errorf("agent: log spool attempt %q conflicts with stored authority", claim.Lease.AttemptID)
 	}
 	return nil
@@ -1134,7 +1153,7 @@ WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
 		return fmt.Errorf("agent: clean drained delivered spool attempt: %w", err)
 	}
 	if jobID != "" {
-		if err := compactSuppressedCompletionPayloads(ctx, tx, jobID); err != nil {
+		if err := spool.compactSuppressedCompletionPayloads(ctx, tx, jobID); err != nil {
 			return err
 		}
 	}
@@ -1145,9 +1164,16 @@ WHERE attempt_id=? AND result_json IS NULL AND incomplete_json IS NULL
 }
 
 func (spool *logSpool) pendingAttempts(ctx context.Context) ([]logSpoolAttempt, error) {
+	return spool.pendingAttemptsMatching(ctx, spool.generationPredicate("a"))
+}
+
+// Read-only node-wide inspection uses the same evidence predicate without
+// treating an observation as execution/recovery ownership. This also reads
+// pre-generation schemas without migrating them.
+func (spool *logSpool) pendingAttemptsMatching(ctx context.Context, ownership string) ([]logSpoolAttempt, error) {
 	rows, err := spool.db.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.fencing_token, a.class, a.kind
 FROM spool_attempts a
-WHERE a.incomplete_json IS NULL
+WHERE a.incomplete_json IS NULL AND `+ownership+`
   AND (EXISTS (SELECT 1 FROM spool_events e WHERE e.attempt_id=a.attempt_id)
        OR (a.result_json IS NOT NULL AND COALESCE(a.completion_disposition, '') != 'suppressed'))
 ORDER BY a.created_ns, a.attempt_id`)
@@ -1530,7 +1556,7 @@ WHERE attempt_id=?`,
 		return fmt.Errorf("agent: join completion disposition to payload: %w", err)
 	}
 	if disposition == "suppressed" && jobID.Valid {
-		if err := compactSuppressedCompletionPayloads(ctx, tx, jobID.String); err != nil {
+		if err := spool.compactSuppressedCompletionPayloads(ctx, tx, jobID.String); err != nil {
 			return err
 		}
 	}
@@ -1545,11 +1571,13 @@ SELECT attempt_id FROM spool_completion_receipts ORDER BY observed_ns DESC LIMIT
 	return nil
 }
 
-func compactSuppressedCompletionPayloads(ctx context.Context, tx *sql.Tx, jobID string) error {
+func (spool *logSpool) compactSuppressedCompletionPayloads(ctx context.Context, tx *sql.Tx, jobID string) error {
 	rows, err := tx.QueryContext(ctx, `SELECT attempt_id FROM spool_attempts
-WHERE job_id=? AND completion_disposition='suppressed' AND result_json IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM spool_events WHERE spool_events.attempt_id=spool_attempts.attempt_id)
-ORDER BY finished_ns DESC, created_ns DESC, attempt_id DESC LIMIT -1 OFFSET ?`, jobID, maxSuppressedCompletionPayloadsPerJob)
+WHERE `+spool.generationPredicate("spool_attempts")+` AND attempt_id IN (
+ SELECT attempt_id FROM spool_attempts
+ WHERE job_id=? AND completion_disposition='suppressed' AND result_json IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM spool_events WHERE spool_events.attempt_id=spool_attempts.attempt_id)
+ ORDER BY finished_ns DESC, created_ns DESC, attempt_id DESC LIMIT -1 OFFSET ?)`, jobID, maxSuppressedCompletionPayloadsPerJob)
 	if err != nil {
 		return fmt.Errorf("agent: select suppressed payloads for compaction: %w", err)
 	}
@@ -1595,7 +1623,7 @@ func (spool *logSpool) compactExistingSuppressedCompletionPayloads(ctx context.C
 	rows, err := tx.QueryContext(ctx, `SELECT a.attempt_id, a.job_id, a.result_json, a.finished_ns,
 COALESCE(a.completion_reason, 'service_intent_stop'), a.intent_revision, COALESCE(r.observed_ns, a.finished_ns)
 FROM spool_attempts a LEFT JOIN spool_completion_receipts r ON r.attempt_id=a.attempt_id
-WHERE a.completion_disposition='suppressed' AND a.result_json IS NOT NULL`)
+WHERE a.completion_disposition='suppressed' AND a.result_json IS NOT NULL AND `+spool.generationPredicate("a"))
 	if err != nil {
 		return fmt.Errorf("agent: scan existing suppressed payloads: %w", err)
 	}
@@ -1633,7 +1661,7 @@ terminal_audit_json=excluded.terminal_audit_json`, suppression.attemptID, suppre
 		}
 	}
 	for jobID := range jobIDs {
-		if err := compactSuppressedCompletionPayloads(ctx, tx, jobID); err != nil {
+		if err := spool.compactSuppressedCompletionPayloads(ctx, tx, jobID); err != nil {
 			return err
 		}
 	}
