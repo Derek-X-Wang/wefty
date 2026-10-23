@@ -42,7 +42,7 @@ const (
 // Their counts grow with workload traffic, so they stay below the control
 // reserve even when many commands or endpoint clients run at once.
 func dataStreamMethod(method Method) bool {
-	return method == MethodDialAttemptPort || method == MethodDialHostBridge || method == MethodExecComputerSeat
+	return method == MethodDialAttemptPort || method == MethodDialHostBridge || method == MethodExecComputerSeat || method == MethodDialSeatEndpoint
 }
 
 // admitDataStream takes one data-stream slot without waiting. A full budget is

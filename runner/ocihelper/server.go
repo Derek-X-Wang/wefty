@@ -1389,7 +1389,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 		return false
 	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus,
 		MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodInventoryRemoval, MethodAttestRemoval,
-		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken, MethodApplyComputerSeats, MethodObserveComputerSeats, MethodExecComputerSeat, MethodSetComputerMemoryLimit,
+		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken, MethodApplyComputerSeats, MethodObserveComputerSeats, MethodExecComputerSeat, MethodSetComputerMemoryLimit, MethodDialSeatEndpoint,
 		MethodListRunMailbox, MethodReadRunMailbox, MethodRemoveRunMailbox, MethodInventoryHandoffs:
 		session.mu.Lock()
 		defer session.mu.Unlock()
@@ -2319,6 +2319,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if err != nil && !stream.ready {
 			_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
 		}
+	case MethodDialSeatEndpoint:
+		server.serveSeatEndpoint(session, operation, wire, request)
 	case MethodDialHostBridge:
 		var body DialHostBridgeRequest
 		if !decodeRequest(wire, request.Body, &body) {

@@ -808,7 +808,9 @@ func (engine *ContainerdEngine) detachComputerDisk(attachment *computerDiskAttac
 	if !present || manifest.Attached == nil || !sameComputerStorageIdentity(manifest.Storage, attachment.storage) || *manifest.Attached != attachment.authority {
 		return errors.New("Computer attachment manifest no longer matches exact attempt authority")
 	}
-	if err := engine.computerDiskSystem().detach(attachment.mountPath, attachment.loopDevice, attachment.imagePath); err != nil {
+	if err := engine.withSeatEndpointPinsClosed(attachment.authority, func() error {
+		return engine.computerDiskSystem().detach(attachment.mountPath, attachment.loopDevice, attachment.imagePath)
+	}); err != nil {
 		return err
 	}
 	if _, mounted, err := engine.computerDiskSystem().mountedSource(attachment.mountPath); err != nil {

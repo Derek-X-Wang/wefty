@@ -35,10 +35,16 @@ func (engine *ContainerdEngine) ApplyComputerSeats(ctx context.Context, request 
 		return ApplyComputerSeatsResponse{}, err
 	}
 	defer snapshot.namespace.close()
-	if attempt.seats == nil {
+	attempt.mu.Lock()
+	if attempt.seats == nil && !attempt.deleted && attempt.networkNamespace == snapshot.sourceNamespace {
 		attempt.seats = newComputerSeats(engine.config.Clock, snapshot.directory)
 	}
-	response, err := attempt.seats.apply(request.Seats)
+	seats := attempt.seats
+	attempt.mu.Unlock()
+	if seats == nil {
+		return ApplyComputerSeatsResponse{}, errors.New("Computer attempt lost its Seat authority")
+	}
+	response, err := seats.apply(request.Seats)
 	if err != nil {
 		return ApplyComputerSeatsResponse{}, err
 	}
@@ -139,9 +145,66 @@ func observeComputerSeatFiles(ctx context.Context, snapshot computerSeatAttemptS
 		return ObserveComputerSeatsResponse{}, err
 	}
 	defer directory.Close()
-	return snapshot.seats.observe(ctx, request.Generation, func(name string) ([]byte, error) { return ReadSeatStatusAnswer(directory, name) }, func(ctx context.Context, port uint16) error {
-		return probeComputerSeatGreeting(ctx, func(ctx context.Context) (net.Conn, error) { return dialTaskLoopback(ctx, snapshot.namespace, port) })
+	// Resolve the directive's internal port metadata to fixed Seat paths. These
+	// numbers remain for compatibility with ApplyComputerSeats; no TCP dial occurs.
+	pins := map[int]map[string]*os.File{}
+	defer func() {
+		for _, p := range pins {
+			for _, f := range p {
+				snapshot.seats.closeEndpointPin(f)
+			}
+		}
+	}()
+	result, err := snapshot.seats.observe(ctx, request.Generation, func(name string) ([]byte, error) { return ReadSeatStatusAnswer(directory, name) }, func(ctx context.Context, port uint16) error {
+		for place, entry := range snapshot.seats.entries {
+			for _, kind := range []string{"view", "control"} {
+				matches := kind == "view" && entry.config.ViewPort == port || kind == "control" && entry.config.ControlPort == port
+				if !entry.wanted || !matches {
+					continue
+				}
+				pin, err := snapshot.seats.openEndpointPin(func() (*os.File, error) { return openSeatEndpoint(proc+"/root", place, kind, uint32(2000+place)) })
+				if err != nil {
+					return err
+				}
+				err = probeComputerSeatGreeting(ctx, func(ctx context.Context) (net.Conn, error) {
+					return snapshot.seats.dialSeatSocket(ctx, proc+"/root", place, kind, uint32(2000+place), pin, connectSeatSocket)
+				})
+				if err != nil {
+					snapshot.seats.closeEndpointPin(pin)
+					return err
+				}
+				if pins[place] == nil {
+					pins[place] = map[string]*os.File{}
+				}
+				pins[place][kind] = pin
+				return nil
+			}
+		}
+		return errors.New("unknown Seat endpoint")
 	}, func(seat ComputerSeat) error { return confirmComputerSeatAbsent(proc, seat) })
+	if err != nil {
+		return result, err
+	}
+	for i := range result.Seats {
+		observation := &result.Seats[i]
+		entry := snapshot.seats.entries[observation.Place]
+		if observation.State != "ready" {
+			entry.closeEndpointPins()
+			continue
+		}
+		fresh := pins[observation.Place]
+		if len(fresh) != 2 {
+			return ObserveComputerSeatsResponse{}, errors.New("ready Seat lacks pinned endpoints")
+		}
+		if !sameSeatSocket(entry.endpointPins["view"], fresh["view"]) || !sameSeatSocket(entry.endpointPins["control"], fresh["control"]) {
+			entry.endpointRevision++
+		}
+		entry.closeEndpointPins()
+		entry.endpointPins = fresh
+		delete(pins, observation.Place)
+		observation.Endpoints = map[string]string{"view": entry.endpointName("view"), "control": entry.endpointName("control")}
+	}
+	return result, nil
 }
 func seatProcessMatchesNetwork(proc string, namespace *pinnedNetworkNamespace) error {
 	pinned, err := namespace.duplicate()

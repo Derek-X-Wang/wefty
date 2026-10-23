@@ -36,7 +36,7 @@ func CheckSeatUsers(passwd []byte) error {
 
 // SeatEvidence contains observations from the real-profile Linux lane. It is
 // separate from the single-desktop Docker approximation's v2 receipt.
-// Missing observations stay NOT-RUN; endpoint confinement belongs to P7.
+// Missing observations stay NOT-RUN, including endpoint crossover refusals.
 type SeatEvidence struct {
 	Version                  int             `json:"version"`
 	Image                    string          `json:"image"`
@@ -68,6 +68,7 @@ func CheckSeats(e SeatEvidence) SeatReport {
 	}{
 		{"IM-1", []string{"second_browser", "own_screen_input"}},
 		{"IM-2", []string{"view_ignores_input"}},
+		{"IM-4.endpoints", []string{"other_endpoints_refused", "cross_computer_endpoints_refused"}},
 		{"IM-4.display-files", []string{"own_display", "other_files_refused", "other_display_refused"}},
 		{"IM-5", []string{"removed_processes_absent", "removed_endpoints_absent", "removed_folder_absent", "shared_survives", "memory_returns"}},
 		{"IM-6", []string{"restart_processes_absent", "restart_folders_absent", "restart_answers_absent"}},
@@ -125,8 +126,6 @@ func CheckSeats(e SeatEvidence) SeatReport {
 	if e.Version != 1 || e.Image == "" {
 		r.Status = StatusFail
 	}
-	r.Checks = append(r.Checks, Check{ID: "IM-4.endpoints", Scope: ScopeImage, Status: StatusNotRun,
-		Summary: "per-Seat endpoint confinement", Detail: "P7 belongs to #1138; loopback is shared"})
 	return r
 }
 
