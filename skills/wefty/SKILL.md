@@ -171,6 +171,7 @@ Inside the run, `git` sees your checkout: HEAD is your base commit and your loca
 
 The run gets the node's login-shell `PATH`, not the caller's; project-local tools need `bun run`, `npx`, `pnpm exec` or `uv run`, or a path such as `./node_modules/.bin/turbo`.
 `wefty exec -- sh -c 'echo $PATH'` shows the run's `PATH`.
+A tool on both `PATH`s can be a different version in the run, for example an older `python3` from the login shell's version manager; when the version matters, check it with `wefty exec -- sh -c 'command -v python3; python3 --version'` and call a versioned name (`python3.14`) or an absolute path.
 Git-ignored files such as `.env.local` and ignored generated code (codegen output and framework caches) are not copied; pass non-secret values as environment variables in the command, and generate code inside the command.
 Ignored build outputs, such as binaries in `bin/` or `dist/`, are not copied either; build them inside the command, for example `wefty exec -- make build test`.
 Never copy secrets into a run.

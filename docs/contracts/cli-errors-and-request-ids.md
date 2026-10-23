@@ -359,6 +359,14 @@ Status reads this machine directly with the agent's platform reader. It uses
 the local profile and environment limit; keep installed settings there so both
 commands agree. Other nodes' load is not reported in phase 1.
 
+Approval windows add `approval_windows` to status JSON when open. Each entry
+contains `node_id`, `network` (wire values `internet` or `none`) and
+`expires_at`. Text displays the network as **with internet** or **without
+internet**, with the node and end time. A failed L1 window read adds
+`approval_windows_error` and prints `approval windows: cannot verify: ...`;
+it does not claim that no window is open or change the cluster readiness
+exit code. With a successful empty read, both optional fields are omitted.
+
 ## Client-service and participant ownership errors
 
 `participant_in_use` is an identity-ownership refusal (exit 3,

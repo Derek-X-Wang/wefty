@@ -58,6 +58,8 @@ func TestFleetPlainStatusBinaryCompatibility(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/v1/nodes" {
 			_ = json.NewEncoder(w).Encode(l1.NodeList{Nodes: []l1.Node{node}})
+		} else if r.Method == http.MethodGet && r.URL.Path == "/v1/seat-approval-windows" {
+			_ = json.NewEncoder(w).Encode([]l1.SeatApprovalWindow{})
 		} else {
 			_ = json.NewEncoder(w).Encode(map[string]any{"runs": []any{}})
 		}
@@ -82,6 +84,8 @@ func TestFleetPlainMultiNodeStatusBinaryCompatibility(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/v1/nodes" {
 			_ = json.NewEncoder(w).Encode(l1.NodeList{Nodes: []l1.Node{a, b}})
+		} else if r.Method == http.MethodGet && r.URL.Path == "/v1/seat-approval-windows" {
+			_ = json.NewEncoder(w).Encode([]l1.SeatApprovalWindow{})
 		} else {
 			_ = json.NewEncoder(w).Encode(map[string]any{"runs": []any{}})
 		}

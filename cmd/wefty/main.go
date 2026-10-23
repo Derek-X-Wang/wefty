@@ -438,6 +438,7 @@ Commands:
                              --node-id chooses a stable ID on first install
                              Plain Mac only: --remove keeps data and logs; --purge deletes them
                              Fleet removal is not supported yet
+  seat window close         Close this node's approval windows early
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
   whoami                    Observe the current Fabric-scoped person identity in L1
   admin bootstrap NONCE      Redeem a locally initiated administrator bootstrap challenge
