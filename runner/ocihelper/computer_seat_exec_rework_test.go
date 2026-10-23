@@ -172,3 +172,63 @@ func TestSeatExecRuntimeLimitDoesNotMaskMechanicsFailure(t *testing.T) {
 		}
 	})
 }
+
+// A bounded containerd IO wait may return while its copy goroutine is still
+// delivering an event. The final failure must serialize with that whole frame.
+func TestSeatExecCleanupTimeoutFinishesInFlightFrame(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	authority := testAuthority()
+	finishEngine := make(chan struct{})
+	emitDone := make(chan error, 1)
+	engine := &seatExecDeadlineEngine{fakeEngine: newFakeEngine(), run: func(_ context.Context, emit func(SeatCommandEvent) error) error {
+		go func() { emitDone <- emit(SeatCommandEvent{Stream: "stdout", Data: bytes.Repeat([]byte("x"), 4096)}) }()
+		<-finishEngine
+		return &seatCommandCleanupError{errors.New("fixture output drain expired")}
+	}}
+	helper := &Server{engine: engine, dataStreams: make(chan struct{}, 56)}
+	session := &serverSession{identity: SessionIdentity{authority.NodeID, authority.BootSessionID}, attempts: map[string]*serverAttempt{authority.key(): {authority: authority, state: attemptLive, computer: true}}}
+	serving, client := net.Pipe()
+	defer serving.Close()
+	defer client.Close()
+	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		helper.dispatchExecComputerSeat(&sessionOperation{ctx: ctx, cancel: cancel, session: session, conn: serving}, newFramedConn(serving), frame{Method: MethodExecComputerSeat, Body: body})
+	}()
+	var header [4]byte
+	if _, err := io.ReadFull(client, header[:]); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, binary.BigEndian.Uint32(header[:]))
+	if _, err := io.ReadFull(client, payload[:100]); err != nil {
+		t.Fatal(err)
+	}
+	close(finishEngine)
+	if _, err := io.ReadFull(client, payload[100:]); err != nil {
+		t.Fatalf("cleanup cut event frame: %v", err)
+	}
+	var eventFrame frame
+	if err := json.Unmarshal(payload, &eventFrame); err != nil {
+		t.Fatal(err)
+	}
+	var event SeatCommandEvent
+	if err := decodeBody(eventFrame.Body, &event); err != nil || len(event.Data) != 4096 {
+		t.Fatalf("lost in-flight output: %v %+v", err, event)
+	}
+	var final frame
+	if err := newFramedConn(client).read(&final); err != nil {
+		t.Fatal(err)
+	}
+	if final.Error == nil || final.Error.Code != CodeDiagnosticFailure || final.Error.Detail != "" {
+		t.Fatalf("cleanup failure lost: %+v", final)
+	}
+	if err := <-emitDone; err != nil {
+		t.Fatal(err)
+	}
+	<-done
+}

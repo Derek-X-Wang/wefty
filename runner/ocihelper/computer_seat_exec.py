@@ -16,6 +16,7 @@ child = None
 cancelled = False
 cancel_deadline = None
 kill_sent = False
+command_group_gone = False
 clock = time.monotonic
 CANCEL_GRACE = 5.0
 
@@ -23,10 +24,20 @@ CANCEL_GRACE = 5.0
 def signal_command_group(sig):
     # Policy seam: retain today's process-group scope pending the owner's
     # decision about plain '&' programs on cancel or runtime limit.
+    global command_group_gone
+    if command_group_gone:
+        return
     try:
         os.killpg(child.pid, sig)
     except ProcessLookupError:
-        pass
+        command_group_gone = True
+    except PermissionError:
+        # Darwin returns EPERM for a group containing only its zombie leader.
+        # A live leader's permission failure must still be reported. Poll may
+        # reap the leader, so never signal this potentially recycled ID again.
+        if poll_command() is None:
+            raise
+        command_group_gone = True
 
 
 def stop(signum, frame):
@@ -71,11 +82,11 @@ def output(stream, data):
         emit({'stream': stream, 'data': base64.b64encode(data).decode()})
 
 
-def pump(selector, discard=False):
+def pump(selector, discard=False, timeout=0.05):
     if not selector.get_map():
         time.sleep(0.05)
         return
-    for key, _ in selector.select(0.05):
+    for key, _ in selector.select(timeout):
         data = os.read(key.fd, 4096)
         if data:
             if not discard:
@@ -92,6 +103,13 @@ def retain_background_readers(selector):
     # containerd's stdio before the wrapper exits, so it cannot hold a Run open.
     if os.fork() == 0:
         try:
+            # Detach containerd stdio before any session/poller setup. A
+            # same-uid process may stop us at any instruction after fork.
+            null = os.open('/dev/null', os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            if null > 2:
+                os.close(null)
             os.setsid()
             # Recreate the poller after fork (kqueue is not inherited on Mac).
             readers = list(selector.get_map().values())
@@ -99,15 +117,10 @@ def retain_background_readers(selector):
             selector = selectors.DefaultSelector()
             for key in readers:
                 selector.register(key.fileobj, selectors.EVENT_READ, key.data)
-            null = os.open('/dev/null', os.O_RDWR)
-            for fd in (0, 1, 2):
-                os.dup2(null, fd)
-            if null > 2:
-                os.close(null)
             signal.signal(signal.SIGTERM, signal.SIG_DFL)
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             while selector.get_map():
-                pump(selector, discard=True)
+                pump(selector, discard=True, timeout=None)
         finally:
             os._exit(0)
     for key in list(selector.get_map().values()):

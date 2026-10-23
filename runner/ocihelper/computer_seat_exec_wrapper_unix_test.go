@@ -294,3 +294,158 @@ assert calls==[(1234,signal.SIGTERM),(1234,signal.SIGKILL)],calls`
 		t.Fatalf("grace policy: %v %s", err, out)
 	}
 }
+
+func TestSeatWrapperCancelReportsExitForZombieLeader(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	cmd := seatWrapperCommand(t, ctx, `import time
+open('ready','w').write('yes')
+while True: time.sleep(1)`)
+	cmd.Dir = root
+	var exit *SeatCommandExit
+	stream := newSeatCommandStream(ctx, func(e SeatCommandEvent) error {
+		if e.Exit != nil {
+			exit = e.Exit
+		}
+		return nil
+	})
+	cmd.Stdout = stream
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	waitSeatCommandFile(t, ctx, filepath.Join(root, "ready"))
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("zombie leader lost command exit: %v", err)
+	}
+	if err := stream.finish(); err != nil {
+		t.Fatal(err)
+	}
+	if exit == nil || exit.Signal != int(syscall.SIGTERM) {
+		t.Fatalf("cancel exit: %+v", exit)
+	}
+}
+
+func TestSeatWrapperPermissionDeniedRequiresExitedLeader(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness := `import errno,signal,sys,types
+source=sys.argv[1]
+for state in ('alive','zombie','reaped'):
+ ns={'__name__':'wrapper_test'}
+ exec(source,ns)
+ calls=[]
+ def denied(pid,sig):
+  calls.append((pid,sig))
+  raise PermissionError(errno.EPERM,'fixture group signal refused')
+ def poll():
+  if state=='alive': return None
+  child.returncode=23
+  return 23
+ child=types.SimpleNamespace(pid=1234,returncode=23 if state=='reaped' else None,poll=poll)
+ ns['child']=child
+ original=ns['os'].killpg
+ ns['os'].killpg=denied
+ try:
+  try: ns['signal_command_group'](signal.SIGTERM)
+  except PermissionError:
+   assert state=='alive',state
+  else:
+   assert state!='alive','live leader permission failure was hidden'
+   # Reaping a zombie permits PID reuse. Never signal that group again.
+   ns['signal_command_group'](signal.SIGKILL)
+   assert len(calls)==1,calls
+ finally: ns['os'].killpg=original`
+	if out, err := exec.CommandContext(t.Context(), python, "-I", "-S", "-c", harness, seatCommandWrapper).CombinedOutput(); err != nil {
+		t.Fatalf("permission policy: %v %s", err, out)
+	}
+}
+
+func TestSeatWrapperDiscardReaderClosesStdioBeforeSetup(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	harness := `import os,selectors,signal,sys
+ns={'__name__':'wrapper_test'}
+exec(sys.argv[1],ns)
+r,w=os.pipe();os.close(w)
+reader=os.fdopen(r,'rb')
+selector=selectors.DefaultSelector()
+selector.register(reader,selectors.EVENT_READ,'stdout')
+original=selectors.DefaultSelector
+# Stop the forked reader before it can rebuild its poller. The command's
+# output must already be detached, even if this process never resumes.
+def paused_selector():
+ open(sys.argv[2]+'/reader.pid','w').write(str(os.getpid()))
+ os.kill(os.getpid(),signal.SIGSTOP)
+ return original()
+selectors.DefaultSelector=paused_selector
+ns['retain_background_readers'](selector)
+ns['emit']({'exit':{'code':0}})`
+	cmd := exec.CommandContext(ctx, python, "-I", "-S", "-c", harness, seatCommandWrapper, root)
+	cmd.WaitDelay = time.Second
+	var exit *SeatCommandExit
+	cmd.Stdout = newSeatCommandStream(ctx, func(e SeatCommandEvent) error {
+		if e.Exit != nil {
+			exit = e.Exit
+		}
+		return nil
+	})
+	cmd.Stderr = os.Stderr
+	runErr := cmd.Run()
+	waitSeatCommandFile(t, ctx, filepath.Join(root, "reader.pid"))
+	b, err := os.ReadFile(filepath.Join(root, "reader.pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Kill(pid, syscall.SIGKILL)
+	if runErr != nil || exit == nil || exit.Code == nil || *exit.Code != 0 {
+		t.Fatalf("stopped discard reader retained command stdio: err=%v exit=%+v", runErr, exit)
+	}
+}
+
+func TestSeatWrapperDiscardReaderUsesBlockingSelect(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	harness := `import os,selectors,sys
+ns={'__name__':'wrapper_test'}
+exec(sys.argv[1],ns)
+r,w=os.pipe();os.close(w)
+reader=os.fdopen(r,'rb')
+selector=selectors.DefaultSelector()
+selector.register(reader,selectors.EVENT_READ,'stdout')
+original=selectors.DefaultSelector
+class RecordedSelector(original):
+ def select(self,timeout=None):
+  open(sys.argv[2]+'/timeout','w').write(repr(timeout))
+  return super().select(timeout)
+selectors.DefaultSelector=RecordedSelector
+ns['retain_background_readers'](selector)`
+	if out, err := exec.CommandContext(ctx, python, "-I", "-S", "-c", harness, seatCommandWrapper, root).CombinedOutput(); err != nil {
+		t.Fatalf("discard reader: %v %s", err, out)
+	}
+	waitSeatCommandFile(t, ctx, filepath.Join(root, "timeout"))
+	b, err := os.ReadFile(filepath.Join(root, "timeout"))
+	if err != nil || string(b) != "None" {
+		t.Fatalf("idle discard reader polls: timeout=%q err=%v", b, err)
+	}
+}

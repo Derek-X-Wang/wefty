@@ -2399,11 +2399,34 @@ or Run log is allocated by the helper. At command exit the wrapper snapshots
 the queued Run tail and drains exactly that tail. Later background writes are
 not part of the finished Run. If writers remain, it forks a small Seat-uid
 discard reader with the same bounded 4096-byte reads. The reader closes all
-containerd stdio descriptors, creates its own poller, and drains until both
-pipes reach EOF. Thus a plain `cmd &` that keeps logging gets neither SIGPIPE
-nor an extended Run lifetime. Its reader's memory stays bounded and Seat
-uid-wide cleanup stops both reader and writer. Exec streams remain subject to
+containerd stdio descriptors immediately after fork, before session or poller
+setup, then creates its own poller and drains until both pipes reach EOF. Its
+select blocks until data or EOF; an idle reader does not poll. Thus a plain
+`cmd &` that keeps logging gets neither SIGPIPE nor an extended Run lifetime.
+Its reader's memory stays bounded and Seat uid-wide cleanup stops both reader
+and writer. Exec streams remain subject to
 the data budget and the narrower command caps above.
+
+There is deliberately no separate per-Seat discard-reader count cap. There is
+at most one reader per completed command that still has pipe writers; it exits
+at EOF. Each reader has the Python interpreter's process memory cost, so total
+reader memory can grow with the number of background programs. A count cap
+that closes these pipes would break the promised background-writer survival,
+and the Seat uid can already fork processes itself. Readers remain inside the
+Computer's existing memory limit, hold no helper connection slots, and share
+the background programs' uid-wide Seat cleanup. This cleanup is the hard
+lifetime bound for both. It is not a per-Seat aggregate memory guarantee.
+
+After positive wrapper exit, containerd output draining has a separate
+five-second bound. If a same-uid program stops a reader before its first stdio
+redirect, retained writers cannot hold the helper operation indefinitely:
+expiry cancels the FIFO I/O and reports unconfirmed output cleanup. Containerd
+Delete has a separate five-second bound around the entire call, including its
+internal context-insensitive IO.Wait. A copy callback still in flight gets the
+same bounded whole-frame completion as at a runtime limit; final diagnostics
+serialize with it, and no callback can emit after the operation finishes.
+These failures remain operation-local `diagnostic_failure` results, without a
+runtime-limit detail.
 
 A runtime-limit stop is a typed final failure: `diagnostic_failure` with detail
 `runtime_limit` and message "Seat command reached its runtime limit". The CLI
@@ -2429,13 +2452,20 @@ Cancel is closing this operation's connection. Client context cancellation,
 callback error, EOF and `max_runtime` stop this command. The helper sends TERM
 to the exec wrapper, which sends SIGTERM to the command's process group, gives
 it a five-second grace for cleanup, then sends SIGKILL to remaining group
-members and waits for the leader. The leader PID stays unreaped during grace
-to pin the group identity. It never uses task-wide or uid-wide kill, or
+members and waits for the leader. The full grace is intentional even if the
+leader exits early: descendants retain their cleanup time, and the unreaped
+leader pins the group identity. On Darwin, a group containing only a zombie
+leader may refuse the signal with EPERM. The wrapper accepts that refusal only
+after confirming that the leader exited. If this check reaps it, the wrapper
+never signals that potentially recycled group ID again. Permission failures
+with a live leader remain errors. It never uses task-wide or uid-wide kill, or
 containerd `WithKillAll`. The helper gives the wrapper ten seconds to exit;
 if it must KILL the wrapper, it waits up to two more seconds for positive exit
 evidence before Delete. Unconfirmed running-exec exit never triggers Delete;
-a never-started `Created` exec can be deleted directly. Cleanup uses contexts
-independent of the vanished caller.
+an exec for which Start was never attempted is deleted directly, even if
+Status fails and no wait was registered. Containerd still checks its own
+deletion preconditions. A refused or timed-out Delete is reported as
+unconfirmed cleanup. Cleanup uses contexts independent of the vanished caller.
 
 **Held owner decision:** cancellation and the runtime limit still target the
 command's whole process group. A plain `&` program in that group receives TERM

@@ -3,6 +3,7 @@ package ocihelper
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 )
 
@@ -74,9 +75,16 @@ func (server *Server) dispatchExecComputerSeat(operation *sessionOperation, wire
 		close(deadlineApplied)
 	})
 	defer stop()
+	var emitMu sync.Mutex
+	emissionEnded := false
 	terminal := false
 	var frameWriteErr error
 	err := engine.ExecComputerSeat(ctx, body, func(event SeatCommandEvent) error {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		if emissionEnded {
+			return context.Canceled
+		}
 		if frameWriteErr != nil {
 			return frameWriteErr
 		}
@@ -96,6 +104,13 @@ func (server *Server) dispatchExecComputerSeat(operation *sessionOperation, wire
 	if !stop() {
 		<-deadlineApplied
 	}
+	// A bounded containerd IO wait can return while its copy goroutine is
+	// still emitting. Finish that whole frame under a deadline, then close
+	// emission before reading its state or writing the final response.
+	_ = wire.conn.SetWriteDeadline(time.Now().Add(seatCommandFrameFinishTimeout))
+	emitMu.Lock()
+	defer emitMu.Unlock()
+	emissionEnded = true
 	if frameWriteErr != nil {
 		return
 	}

@@ -608,7 +608,12 @@ for environment, stream and cancel semantics. A normal command end also
 preserves plain background writers that retain
 stdout/stderr. A bounded Seat-uid discard reader keeps those pipes readable
 without extending the Run or holding helper connection slots. The image's
-uid-wide cleanup ends both writer and reader. Process-group scope on cancel
+uid-wide cleanup ends both writer and reader. Idle readers use blocking
+select. Their count is not separately capped: closing a reader at a count limit
+would break background logging, and the Seat uid can already fork processes.
+Readers stay in the Computer's existing memory limit; aggregate per-Seat reader
+memory is not guaranteed. See the helper contract for the five-second output
+drain and deletion bounds. Process-group scope on cancel
 and runtime limit stays unchanged pending the owner decision documented at
 that helper seam.
 
