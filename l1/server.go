@@ -452,6 +452,12 @@ func (s *Server) routes() http.Handler {
 
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-list", s.computerSeatList)
+	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/read", s.readSeatRequest)
+	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/reserve-room", s.reserveSeatRoom)
+	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/start", s.startSeatRequest)
+	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/end", s.endSeatRequest)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-room-memory", s.reportComputerRoomMemory)
+
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-observations", s.computerSeatObservations)
 	agent.HandleFunc("POST /v1/agent/seat-approvals", s.beginSeatApproval)
 	agent.HandleFunc("POST /v1/agent/seat-approvals/{seat_id}/answer", s.answerSeatApproval)

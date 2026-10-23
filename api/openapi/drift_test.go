@@ -81,6 +81,16 @@ const (
 )
 
 var driftRows = []driftRow{
+	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/read"), typeOf[l1.SeatNodeRequest]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/read", "200"), typeOf[l1.SeatRequest]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/reserve-room"), typeOf[l1.SeatRoomReservationRequest]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/reserve-room", "200"), typeOf[l1.SeatRequest]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/start"), typeOf[l1.SeatStartRequest]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/start", "200"), typeOf[l1.SeatRequest]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/end"), typeOf[l1.SeatEndRequest]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/end", "200"), typeOf[l1.SeatRequest]()},
+	{requestBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-room-memory"), typeOf[l1.SeatRoomMemoryReport]()},
+	{responseBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-room-memory", "200"), typeOf[l1.SeatRoomMemoryReceipt]()},
 	{component(commonDoc, "ResidentAttempt"), typeOf[l1.ResidentAttempt]()},
 	{component(commonDoc, "NodeGeneration"), typeOf[l1.NodeGeneration]()},
 	{component(commonDoc, "NodeGenerationInventory"), typeOf[l1.NodeGenerationInventory]()},

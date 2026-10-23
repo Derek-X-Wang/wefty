@@ -19,9 +19,10 @@ import (
 // #1135's boot-scoped Seat approval records and windows, then #1174's
 // additive generation catalog, sessions, residents and promotion receipts,
 // then #1137's wanted Seat lists, retained identities and attempt-bound
-// observations, with restart exclusion and deletion cascades. A changed
-// golden means an upgrade across it
-// cannot restore the old binaries (ADR-0003).
+// observations, with restart exclusion and deletion cascades, then #1142
+// lifecycle columns on seat_approvals and retained room reservations/limits.
+// A changed golden means an upgrade across it cannot restore the old binaries
+// (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
 	store, err := OpenStore(path, StoreOptions{})
@@ -36,7 +37,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
-	const mainFingerprint = "eff174a657dc7b4a5a71dc462f9af807334c30512977c286139982cff1fd9d1d"
+	const mainFingerprint = "2feed80897b6d5418a067c849bd2cb3e0535027d3e8095d40c1e66e44c0fddf6"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}

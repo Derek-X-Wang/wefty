@@ -95,6 +95,13 @@ func (r *databaseReads) computerSeatListForAttempt(ctx context.Context, identity
 		return ComputerSeatList{}, err
 	}
 	for _, seat := range list.Seats {
+		value, lifecycleErr := readSeatRequest(ctx, r.q, seat.SeatID)
+		if lifecycleErr == nil && (value.State != SeatStarting && value.State != SeatLive || value.State == SeatStarting && !r.now().Before(value.Deadline)) {
+			return ComputerSeatList{}, errComputerSeatBindingNeeded
+		}
+		if lifecycleErr != nil && errorCodeForSeatLifecycle(lifecycleErr) != contract.ErrorNotFound {
+			return ComputerSeatList{}, lifecycleErr
+		}
 		var first sql.NullString
 		if err := r.q.QueryRowContext(ctx, `SELECT first_attempt_id FROM computer_seat_identities WHERE seat_id=?`, seat.SeatID).Scan(&first); err != nil {
 			return ComputerSeatList{}, err
@@ -130,7 +137,7 @@ func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, 
 	}
 	defer write.rollback()
 	tx := write.tx
-	if err := validateComputerSeatAttempt(ctx, tx, canonicalTime(s.clock.Now()), identity, computerID, jobID, attemptID, request); err != nil {
+	if err := validateComputerSeatAttempt(ctx, tx, write.at, identity, computerID, jobID, attemptID, request); err != nil {
 		return ComputerSeatList{}, err
 	}
 	list, err := readComputerSeatList(ctx, tx, computerID)
@@ -143,7 +150,30 @@ func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, 
 		if err := tx.QueryRowContext(ctx, `SELECT first_attempt_id FROM computer_seat_identities WHERE seat_id=?`, seat.SeatID).Scan(&first); err != nil {
 			return ComputerSeatList{}, err
 		}
+		value, lifecycleErr := readSeatRequest(ctx, tx, seat.SeatID)
+		if lifecycleErr != nil && errorCodeForSeatLifecycle(lifecycleErr) != contract.ErrorNotFound {
+			return ComputerSeatList{}, lifecycleErr
+		}
+		expired := lifecycleErr == nil && value.State == SeatStarting && !write.at.Before(value.Deadline)
+		final := lifecycleErr == nil && value.State != SeatStarting && value.State != SeatLive
+		if expired || final {
+			if expired {
+				if err := setSeatLifecycle(ctx, tx, seat.SeatID, SeatRefused, "Seat readiness deadline exceeded"); err != nil {
+					return ComputerSeatList{}, err
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM computer_wanted_seats WHERE seat_id=?`, seat.SeatID); err != nil {
+				return ComputerSeatList{}, err
+			}
+			removed = true
+			continue
+		}
 		if first.Valid && first.String != attemptID {
+			if lifecycleErr == nil {
+				if err := setSeatLifecycle(ctx, tx, seat.SeatID, SeatEnding, "the Computer restarted"); err != nil {
+					return ComputerSeatList{}, err
+				}
+			}
 			if _, err := tx.ExecContext(ctx, `DELETE FROM computer_wanted_seats WHERE computer_id=? AND seat_id=?`, computerID, seat.SeatID); err != nil {
 				return ComputerSeatList{}, err
 			}
@@ -310,6 +340,11 @@ func (s *Store) ReportComputerSeatObservations(ctx context.Context, identity, co
 			if err != nil {
 				return ComputerSeatObservationReceipt{}, internalError(err, "retain Seat observation")
 			}
+		}
+	}
+	for _, seat := range report.Seats {
+		if err := applySeatLifecycleObservation(ctx, tx, now, seat); err != nil {
+			return ComputerSeatObservationReceipt{}, err
 		}
 	}
 	if err := write.commit(); err != nil {

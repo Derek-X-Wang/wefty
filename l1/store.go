@@ -1273,8 +1273,11 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
 -- log_events at read time since #49, and nothing read the table (#52).
 DROP TABLE IF EXISTS job_log_jsonl;
 `
-	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema); err != nil {
+	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
+	}
+	if err := s.migrateSeatLifecycle(ctx); err != nil {
+		return err
 	}
 	if err := s.migrateAdminPersonDevice(ctx); err != nil {
 		return err
@@ -2949,6 +2952,11 @@ func (s *Store) registerNode(ctx context.Context, identity fabric.Identity, regi
 	}
 	if err != nil {
 		return Node{}, internalError(err, "store node registration")
+	}
+	if storedBoot != "" && storedBoot != registration.BootSessionID {
+		if err := refuseLostSeatDialogs(ctx, tx, registration.NodeID, registration.BootSessionID); err != nil {
+			return Node{}, err
+		}
 	}
 	if err := replaceNodeTags(ctx, tx, registration.NodeID, tags); err != nil {
 		return Node{}, internalError(err, "replace node tags")

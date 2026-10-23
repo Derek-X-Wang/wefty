@@ -390,3 +390,29 @@ func TestComputerSeatsUncertainApplyCannotRestoreAcknowledgedCleanup(t *testing.
 		t.Fatalf("uncertain directive was changed: %+v", runtime.applies)
 	}
 }
+
+func TestComputerSeatsRepeatedConflictHasRetryFloor(t *testing.T) {
+	c, api, runtime := newSeatTestController()
+	clock := newManualClock(time.Unix(100, 0))
+	c.clock = clock
+	reads := 0
+	api.onRead = func() { reads++ }
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	api.readError = &ProtocolError{StatusCode: 409, APIError: contract.APIError{Code: contract.ErrorConflict, Message: "attempt no longer owns the Seat list"}}
+	for range 15 {
+		_ = c.step(t.Context())
+	}
+	if reads != 3 {
+		t.Fatalf("persistent 409 made %d L1 reads, want initial + two conflicts", reads)
+	}
+	if len(runtime.observes) != 16 {
+		t.Fatalf("backoff stopped helper cleanup observation: %d", len(runtime.observes))
+	}
+	clock.Advance(2 * time.Second)
+	_ = c.step(t.Context())
+	if reads != 4 {
+		t.Fatalf("conflict was not retried after the floor: %d", reads)
+	}
+}

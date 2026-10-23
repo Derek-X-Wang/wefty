@@ -111,3 +111,11 @@ func TestComputerRoomRejectsTinySeatMemory(t *testing.T) {
 		t.Fatal("Seat memory below 256 MiB accepted")
 	}
 }
+
+func TestDedicatedComputerCapCountsStartingReservation(t *testing.T) {
+	room := DefaultComputerRoomConfig(3 << 30)
+	usage := []ComputerRoomUsage{{ComputerID: "starting", SeatRequestMade: true, SeatLimit: 1, Seats: 1}}
+	if _, err := room.Check(usage, true); !errors.Is(err, ErrDedicatedComputerCap) {
+		t.Fatalf("starting dedicated reservation escaped the cap: %v", err)
+	}
+}

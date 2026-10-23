@@ -53,6 +53,7 @@ type computerSeatController struct {
 	wanted         *l1.ComputerSeatList
 	nextL1         time.Time
 	l1Backoff      time.Duration
+	l1Conflicts    int
 	nextLog        time.Time
 	generation     uint64
 	revision       int64
@@ -196,7 +197,16 @@ func (c *computerSeatController) step(ctx context.Context) error {
 	}
 	if allowed {
 		l1Err := errors.Join(readErr, reportErr)
-		if l1Err != nil && computerSeatRetryableL1Error(l1Err) {
+		var protocol *ProtocolError
+		conflict := errors.As(l1Err, &protocol) && protocol.StatusCode == http.StatusConflict && !protocol.APIError.Retryable
+		if conflict {
+			c.l1Conflicts++
+		} else {
+			c.l1Conflicts = 0
+		}
+		// One conflict may be an ordinary revision race. A lasting 409 must
+		// have a floor too; helper cleanup continues during the L1 backoff.
+		if l1Err != nil && (computerSeatRetryableL1Error(l1Err) || c.l1Conflicts >= 2) {
 			if c.l1Backoff == 0 {
 				c.l1Backoff = 2 * time.Second
 			} else {
