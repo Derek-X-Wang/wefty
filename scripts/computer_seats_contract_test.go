@@ -110,3 +110,17 @@ func TestDefaultComputerSeatsRunBothNativeArchitecturesBeforePublication(t *test
 		}
 	}
 }
+
+func TestHelperSeatIM5UsesRootOnlySeatLane(t *testing.T) {
+	payload := mustReadFile(t, "../.github/workflows/computer-seats.yml")
+	text := string(payload)
+	for _, required := range []string{"TestHelperComputerSeatsIM5", "helper-seats.test", "WEFTY_HELPER_SEAT_EVIDENCE"} {
+		if !strings.Contains(text, required) {
+			t.Fatalf("helper IM-5 lane missing %s", required)
+		}
+	}
+	test := string(mustReadFile(t, "../runner/ocihelper/computer_seats_lane_linux_test.go"))
+	if !strings.HasPrefix(test, "//go:build linux && computer_seat_lane\n") {
+		t.Fatal("root-only helper test escaped its dedicated tag")
+	}
+}

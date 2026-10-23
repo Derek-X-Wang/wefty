@@ -1424,3 +1424,14 @@ func applyContextDeadline(ctx context.Context, connection net.Conn) error {
 	}
 	return connection.SetDeadline(time.Time{})
 }
+
+func (session *Session) ApplyComputerSeats(ctx context.Context, request ApplyComputerSeatsRequest) (ApplyComputerSeatsResponse, error) {
+	var response ApplyComputerSeatsResponse
+	err := session.call(ctx, MethodApplyComputerSeats, request, &response)
+	return response, err
+}
+func (session *Session) ObserveComputerSeats(ctx context.Context, request ObserveComputerSeatsRequest) (ObserveComputerSeatsResponse, error) {
+	var response ObserveComputerSeatsResponse
+	err := session.call(ctx, MethodObserveComputerSeats, request, &response)
+	return response, err
+}
