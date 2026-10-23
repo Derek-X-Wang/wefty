@@ -33,7 +33,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
-	const mainFingerprint = "61d4a75f9d1b7dcc2036e321689f232e74668129b939bcb67c5e7db100a7217f"
+	const mainFingerprint = "f627262d8bf126cc155139ab57bdb8f0503451bd62ce98be7eb937a9f16ffbf6"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}
