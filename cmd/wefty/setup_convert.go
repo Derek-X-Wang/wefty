@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/conversioninventory"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
@@ -195,6 +196,9 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 				return report, err
 			}
 			defer unlock()
+			if err := agentinstall.RefuseMaintenance(paths.data, "setup --convert-plain"); err != nil {
+				return report, err
+			}
 			request.lockHeld = true
 			current, err := readPlainConversion(paths)
 			if err != nil {
@@ -259,6 +263,9 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			return report, err
 		}
 		defer unlock()
+		if err := agentinstall.RefuseMaintenance(paths.data, "setup --convert-plain"); err != nil {
+			return report, err
+		}
 		request.lockHeld = true
 		current, err := readPlainConversion(paths)
 		if err != nil {

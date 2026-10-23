@@ -23,6 +23,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
@@ -247,6 +248,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if len(issues) > 0 {
 		return upgradeReport{}, issues[0].err
 	}
+	if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
+		return upgradeReport{}, err
+	}
 	role, err := selectUpgradeRole(paths)
 	if err != nil {
 		return upgradeReport{}, err
@@ -265,6 +269,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return result, err
 	}
 	defer unlock()
+	if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
+		return result, err
+	}
 	entries, err := os.ReadDir(paths.data)
 	if err != nil {
 		return result, err

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
+	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
@@ -71,6 +72,9 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 		}
 		report.Warnings = append(report.Warnings, "left "+filepath.Join(home, issue.folder)+": "+issue.err.Error())
 	}
+	if err := agentinstall.RefuseMaintenance(paths.data, "setup --remove"); err != nil {
+		return report, err
+	}
 	if purge && (paths.dataRel != setupFolders.data || paths.logsRel != setupFolders.logs) {
 		return report, errors.New("purge requires standard data and log folders without redirected paths; move their symbolic links aside first")
 	}
@@ -88,6 +92,9 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 		return report, err
 	}
 	defer unlock()
+	if err := agentinstall.RefuseMaintenance(paths.data, "setup --remove"); err != nil {
+		return report, err
+	}
 	root, err := os.OpenRoot(home)
 	if err != nil {
 		return report, err

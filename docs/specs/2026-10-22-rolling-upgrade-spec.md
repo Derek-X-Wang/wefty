@@ -135,7 +135,8 @@ JSON object `{"version":1,"retirement_protocol_versions":[1]}` and exits 0 witho
 opening stores, profiles, participants or listeners. A positively identified
 older binary without the entry point has no advertised support. Bad output or
 an inspection failure refuses; `--version` or profile preflight alone never
-substitutes. This entry point is planned, not added by #1173.
+substitutes. This read-only entry point is implemented by #1177; runtime capability
+advertisement remains gated on complete integration.
 
 Choose the highest protocol version common to the candidate **and every live
 generation**, even an idle generation whose retirement/evidence is unfinished.
@@ -277,6 +278,12 @@ Pending evidence otherwise keeps retirement pending. Collection cannot delete
 data still needed by another generation or custodian.
 
 ## 5. Installation and reboot (#1177, #1180)
+
+The opt-in local installation seams, startup fence, private records and cleanup
+are implemented by #1177; their current contract is
+[Retained node agent installation generations](../contracts/installation-service-plan.md#retained-node-agent-installation-generations-1177).
+The public upgrader does not call them yet. Interrupted-cutover reconciliation
+remains #1180, and real launchd acceptance remains #1182.
 
 Keep each activated generation's executable immutable under its own recorded
 owned location and use a unique launchd label. The catalog has a map of retained
