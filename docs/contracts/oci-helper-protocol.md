@@ -2175,3 +2175,87 @@ waits for, and verifies deletion of a real task inside the ten-second probe
 deadline. The same probe runs through the existing startup and heartbeat
 capability refresh loop. Successful L1 renewals are mapped to the exact helper
 attempt tuple and queued on that session's heartbeat pump.
+
+## Per-Seat directives and observations
+
+`ApplyComputerSeats` and `ObserveComputerSeats` are private, session-authorized
+Computer operations. Both require the complete `AttemptAuthority` of one live
+Computer attempt admitted by this helper session. Other workload classes,
+stale fences, stopped tasks and old helper sessions are refused. No host path
+or general endpoint dial capability crosses this seam.
+
+`ApplyComputerSeats` accepts `{authority,seats}`. Each Seat entry is exactly
+`{place,user,view_port,control_port}`: place 1–4, matching `seat1`–`seat4`, and
+unique ports in 1024–65535. Entries are canonicalized by place. The helper publishes
+`{version:1,generation,seats}` to `/wefty/control/seats.json` using a fresh
+mode-0444 file, sync and atomic rename. The profile binds the control **folder**
+read-only, so a replacement is visible. The response is `{generation}`. Each
+changed list advances the attempt-local generation; an identical list is an
+idempotent replay and does not restart deadlines or failed desktops. No
+counter survives the attempt. A helper restart loses observation authority;
+that loss never proves cleanup.
+
+The helper refuses an in-place config change. First omit the place, observe
+positive cleanup, then add its new config in a later generation. Neither its
+place nor its ports can be reused before confirmed cleanup. An accepted list
+contains only wanted Seats; omitted entries remain tracked for cleanup.
+
+`ObserveComputerSeats` accepts `{authority,generation}` for the exact current
+positive generation and returns `{generation,seats}`. Each observation is
+`{place,state,reason,cleanup_complete}`. States are `starting`, `ready`,
+`failed`, `removing` and `cleaned`; these are helper observations, **not** the
+durable L1 Seat state machine. An image failure keeps its reason. Failed
+cleanup remains unconfirmed and cannot free Room. Errors use
+`diagnostic_failure` and do not declare loss of the helper session or other
+attempts. Malformed requests and unauthorized attempts retain their existing
+protocol error codes.
+
+A new place gets its own monotonic 60-second readiness deadline starting
+before its add directive is published. An unchanged starting place retains its
+original deadline when other places change. A valid, generation-bound ready
+answer is necessary. The helper independently negotiates `rfb-websocket-v1`
+and reads the binary RFB greeting on **both** named ports inside the pinned
+attempt network namespace. Each probe has a two-second I/O bound within the
+remaining Seat budget. A probe which crosses the Seat deadline cannot publish
+ready; the observation is `failed/readiness_deadline_exceeded`, with no cleanup
+claim. A previously ready unchanged Seat must have a current-generation ready
+answer and fresh greeting checks before readiness carries into a later
+generation. Failed Seats never retry merely because another place changed.
+
+The helper and native image lane share `runner/ocihelper/seat_status_unix.go`.
+It implements the strict reader in [the image contract](computer-image.md):
+private bounded writable tmpfs mountinfo validation, no shadowing mounts,
+no-follow descriptor descent from the live kernel root, `st_dev` binding,
+nonblocking regular-file opens, and an 8192-byte bounded read. The helper pins
+the kernel process directory across the reads and checks that it still owns
+the attempt's pinned network namespace. Unreadable or invalid answers produce
+no readiness or cleanup evidence.
+
+Cleanup requires the current generation's complete `applied.json` proof with
+exactly the helper's wanted places and `cleanup_complete:true`. If a per-place
+answer exists, it must also say `removed` and claim successful cleanup in a
+positive generation no later than the current one. The current applied proof
+carries an earlier completed removal forward; the image does not rewrite
+answers for places already omitted. Future-generation and malformed answers
+are refused. An absent per-place answer alone proves nothing;
+the applied proof covers an add replaced before the image observed it. In
+addition the helper independently verifies no process of that Seat's uid in
+the Computer's PID namespace, no live uid-owned internet sockets or endpoint
+sockets, no Seat Unix sockets, and no Seat folder by no-follow descent from
+the kernel root. TCP TIME_WAIT entries with inode zero are not live sockets.
+Only this combined evidence produces `cleaned/cleanup_complete:true`.
+Timeouts, missing proof and cleanup failures never return Room.
+
+P9 folders remain on the Computer's Storage: `/wefty/service/seats/<place>`
+and `/wefty/service/shared`. The image creates and owns these directories per
+its contract. Seat removal deletes only its place; shared files survive.
+
+The root-only `TestHelperComputerSeatsIM5` uses the unmodified production
+profile and real helper Seat operations in `computer-seats.yml`, under
+`computer_seat_lane`, on `default-computer-seats / linux/amd64` and
+`default-computer-seats / linux/arm64`. It measures the attempt cgroup's
+`memory.current` around removal of a Seat with a double-forked 128 MiB
+allocation; at least 96 MiB must return, allowing 32 MiB for accounting and
+page-cache variation. It also verifies process/socket/folder absence and shared
+file survival. This is helper-operation evidence; fixture task creation does
+not claim helper Run admission or L1 lifecycle coverage.

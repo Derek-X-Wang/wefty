@@ -1388,7 +1388,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 		return false
 	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus,
 		MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodInventoryRemoval, MethodAttestRemoval,
-		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken,
+		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken, MethodApplyComputerSeats, MethodObserveComputerSeats,
 		MethodListRunMailbox, MethodReadRunMailbox, MethodRemoveRunMailbox, MethodInventoryHandoffs:
 		session.mu.Lock()
 		defer session.mu.Unlock()
@@ -1673,6 +1673,59 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			signalErr = nil
 		}
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, signalErr)
+	case MethodApplyComputerSeats, MethodObserveComputerSeats:
+		var authority AttemptAuthority
+		var apply ApplyComputerSeatsRequest
+		var observe ObserveComputerSeatsRequest
+		if request.Method == MethodApplyComputerSeats {
+			if !decodeRequest(wire, request.Body, &apply) {
+				return
+			}
+			authority = apply.Authority
+			if err := validateComputerSeats(apply.Seats); err != nil {
+				_ = writeFailure(wire, CodeInvalidRequest, "invalid Seat directive")
+				return
+			}
+		} else {
+			if !decodeRequest(wire, request.Body, &observe) {
+				return
+			}
+			authority = observe.Authority
+			if observe.Generation == 0 {
+				_ = writeFailure(wire, CodeInvalidRequest, "Seat generation must be positive")
+				return
+			}
+		}
+		attempt, rpcErr := session.authorizeAttempt(authority)
+		if rpcErr != nil {
+			_ = writeRPCError(wire, rpcErr)
+			return
+		}
+		if !attempt.computer {
+			_ = writeFailure(wire, CodeUnauthorizedAttempt, "Seat operations require a live Computer attempt")
+			return
+		}
+		engine, ok := server.engine.(ComputerSeatsEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "Computer Seat operations unavailable")
+			return
+		}
+		operation.monitorEOF()
+		if request.Method == MethodApplyComputerSeats {
+			response, err := engine.ApplyComputerSeats(operation.ctx, apply)
+			if err != nil {
+				_ = writeFailure(wire, CodeDiagnosticFailure, "Seat operation could not be confirmed")
+				return
+			}
+			_ = writeEngineResponseWithMethod(wire, request.Method, response, nil)
+		} else {
+			response, err := engine.ObserveComputerSeats(operation.ctx, observe)
+			if err != nil {
+				_ = writeFailure(wire, CodeDiagnosticFailure, "Seat operation could not be confirmed")
+				return
+			}
+			_ = writeEngineResponseWithMethod(wire, request.Method, response, nil)
+		}
 	case MethodSetComputerControl:
 		var body SetComputerControlStateRequest
 		if !decodeRequest(wire, request.Body, &body) {
