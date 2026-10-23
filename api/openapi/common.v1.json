@@ -1666,10 +1666,250 @@
           "uploaded_at": { "type": "string", "format": "date-time" }
         }
       },
+        "ResidentAttempt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "job_id",
+            "attempt_id",
+            "boot_session_id",
+            "authority_generation",
+            "fencing_token"
+          ],
+          "properties": {
+            "job_id": {
+              "type": "string"
+            },
+            "attempt_id": {
+              "type": "string"
+            },
+            "boot_session_id": {
+              "type": "string"
+            },
+            "authority_generation": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "fencing_token": {
+              "type": "string"
+            }
+          }
+        },
+        "NodeGeneration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "agent_generation_id",
+            "boot_session_id",
+            "authority_generation",
+            "role",
+            "registration",
+            "retirement_protocol_versions",
+            "selected_protocol",
+            "promotion_operation_id",
+            "created_at",
+            "last_heartbeat_at",
+            "resident_attempts"
+          ],
+          "properties": {
+            "agent_generation_id": {
+              "type": "string"
+            },
+            "boot_session_id": {
+              "type": "string"
+            },
+            "authority_generation": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "staged",
+                "primary",
+                "retiring",
+                "closed"
+              ]
+            },
+            "registration": {
+              "$ref": "#/components/schemas/NodeRegistration"
+            },
+            "retirement_protocol_versions": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "selected_protocol": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "promotion_operation_id": {
+              "type": "string"
+            },
+            "created_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "last_heartbeat_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "retiring_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "closed_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "resident_attempts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ResidentAttempt"
+              }
+            }
+          }
+        },
+        "NodeGenerationInventory": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "node_id",
+            "catalog_revision",
+            "generations"
+          ],
+          "properties": {
+            "node_id": {
+              "type": "string"
+            },
+            "catalog_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "generations": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/NodeGeneration"
+              }
+            }
+          }
+        },
+        "PromoteNodeGenerationRequest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operation_id",
+            "expected_primary_generation_id",
+            "expected_primary_boot_session_id",
+            "expected_authority_generation",
+            "candidate_generation_id",
+            "candidate_boot_session_id",
+            "expected_catalog_revision",
+            "catalog_revision",
+            "intent_revision",
+            "selected_protocol",
+            "retiring_generation_ids",
+            "resident_attempts"
+          ],
+          "properties": {
+            "operation_id": {
+              "type": "string"
+            },
+            "expected_primary_generation_id": {
+              "type": "string"
+            },
+            "expected_primary_boot_session_id": {
+              "type": "string"
+            },
+            "expected_authority_generation": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "candidate_generation_id": {
+              "type": "string"
+            },
+            "candidate_boot_session_id": {
+              "type": "string"
+            },
+            "expected_catalog_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "catalog_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "intent_revision": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "selected_protocol": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "retiring_generation_ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "resident_attempts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ResidentAttempt"
+              }
+            }
+          }
+        },
+        "NodeGenerationHeartbeatRequest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "boot_session_id"
+          ],
+          "properties": {
+            "boot_session_id": {
+              "type": "string"
+            }
+          }
+        },
+        "CloseNodeGenerationRequest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "boot_session_id",
+            "promotion_operation_id",
+            "resident_attempts",
+            "runtimes_reaped",
+            "evidence_settled"
+          ],
+          "properties": {
+            "boot_session_id": {
+              "type": "string"
+            },
+            "promotion_operation_id": {
+              "type": "string"
+            },
+            "resident_attempts": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/ResidentAttempt"
+              }
+            },
+            "runtimes_reaped": {
+              "type": "boolean"
+            },
+            "evidence_settled": {
+              "type": "boolean"
+            }
+          }
+        },
       "NodeRegistration": {
         "allOf": [{ "$ref": "#/components/schemas/NodeRegistrationFields" }],
         "unevaluatedProperties": false,
-        "description": "The registration request: exactly NodeRegistrationFields and nothing else."
+        "description": "Node registration fields plus optional generation identity. Omission retains legacy behavior until generation enrollment."
       },
       "NodeRegistrationFields": {
         "type": "object",
@@ -1678,6 +1918,7 @@
           "capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"
         ],
         "properties": {
+          "agent_generation_id": { "type": "string", "description": "Optional generation enrollment. The Node projection reports its primary generation after enrollment. Only the recorded primary can register; retiring identities cannot return to primary." },
           "node_id": { "type": "string" },
           "boot_session_id": { "type": "string" },
           "connect_host": {

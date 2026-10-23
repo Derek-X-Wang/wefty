@@ -81,6 +81,13 @@ const (
 )
 
 var driftRows = []driftRow{
+	{component(commonDoc, "ResidentAttempt"), typeOf[l1.ResidentAttempt]()},
+	{component(commonDoc, "NodeGeneration"), typeOf[l1.NodeGeneration]()},
+	{component(commonDoc, "NodeGenerationInventory"), typeOf[l1.NodeGenerationInventory]()},
+	{component(commonDoc, "PromoteNodeGenerationRequest"), typeOf[l1.PromoteNodeGenerationRequest]()},
+	{component(commonDoc, "NodeGenerationHeartbeatRequest"), typeOf[l1.NodeGenerationHeartbeatRequest]()},
+	{component(commonDoc, "CloseNodeGenerationRequest"), typeOf[l1.CloseNodeGenerationRequest]()},
+
 	// Shared components.
 	{component(commonDoc, "PeerHealth"), typeOf[contract.PeerHealth]()},
 	{component(commonDoc, "PeerPong"), typeOf[contract.PeerPong]()},

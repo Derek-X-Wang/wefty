@@ -2239,3 +2239,41 @@ A read failure is shown as unverified. `wefty seat window close` resolves this
 installation's stable node and calls
 `POST /v1/seat-approval-windows/close` to remove its windows early. This command
 can only remove approval; it cannot accept an answer or open a window.
+
+## Node agent generation sessions (#1174)
+
+Generation roles are durable L1 authority alongside the Node's existing
+liveness and claims intent; they are not new Node states. Node-agent process
+retirement and installed activation remain separate integrations.
+
+| From | To | Guard and effect |
+| --- | --- | --- |
+| No generation | `primary` | Generation-aware registration with no active legacy Attempts. Legacy callers keep their old registration behavior. |
+| No generation | `staged` | Verified-ready candidate assertion; no claims, execution authority or Node fact writes. |
+| `staged` | `primary` | One fenced, idempotent promotion transaction; expected current primary, Node intent and L1 catalog revision, complete retiree/resident sets and protocol compatibility. Admission is closed before promotion. |
+| `primary` | `retiring` | The same transaction freezes exact active process one-shot residents; all older retiring sessions remain unchanged. |
+| `retiring` | `closed` | Every resident's completion was accepted or its Lease ended; exact authenticated local reap/evidence attestations also match. Closure is monotonic. |
+
+There is one primary and any number of retiring generations. Retirees have no
+automatic deadline and no transition to primary. A further upgrade is another
+staged candidate and promotion; retrying a committed promotion returns the
+original receipt without demoting an additional session. A stale or conflicting
+operation refuses atomically.
+
+Only the primary's boot may claim, heartbeat Node facts or perform boot-scoped
+Node operations. A same-boot primary generation rejoin preserves its authority;
+a fresh primary boot invalidates old execution without process adoption.
+A retiring process cannot register a replacement boot. Ordinary Lease loss and
+Restartable recovery still govern its interrupted residents. Retiring heartbeat
+observes only its own session and does not refresh the primary Node or resident
+Leases. Closed sessions remain historical records and cannot reopen.
+
+E/CW recognize exact original retiring resident membership; O/R keep their
+existing evidence and accepted-replay predicates. All generations share Node
+Slot accounting. Unknown predecessor Attempts retain the claim embargo. For
+an enrolled Node, either a boot or authority-counter mismatch identifies a
+predecessor; legacy Nodes keep their existing boot-only rule.
+See [generation authority](lease-fencing-dispatch.md#node-agent-generation-authority-1174)
+for records, routes, fences, protocol observations and the shared per-Attempt
+closure prerequisite. A custody acknowledgment cannot replace first completion
+acceptance, Lease end, positive local reap or settled evidence.

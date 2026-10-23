@@ -28,7 +28,7 @@ func validateAttemptAuthority(identityNodeID, jobID, attemptID, fencingToken str
 	if a.fencingToken != fencingToken {
 		return protocolError(contract.ErrorStaleFence, "fencing token is stale")
 	}
-	if a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration {
+	if !a.retiringSessionAuthorized && (a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration) {
 		return protocolError(contract.ErrorNodeSessionReplaced, "attempt authority belongs to a replaced node registration")
 	}
 	return nil
@@ -140,8 +140,8 @@ const interruptNodeServiceStabilitySQL = `UPDATE service_jobs SET healthy_since_
 
 // nodeLivenessKey is what the health of an alive Node's services depends on:
 // health is set only while the Node is recorded alive with the Attempt's boot
-// session and registration generation. Every registration advances the
-// generation and nothing lowers it, so an alive Node whose key is unchanged
+// session and registration generation. Every authority replacement advances the
+// counter and nothing lowers it, so an alive Node whose key is unchanged
 // since the last committed pass can hold no health the rule must clear,
 // whatever happened between the passes. A Node not recorded alive is checked
 // on every pass instead, through the index of healthy services, so no

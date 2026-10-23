@@ -112,6 +112,282 @@
         }
       }
     },
+      "/v1/agent/nodes/{node_id}/generations": {
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "get": {
+          "operationId": "nodeGenerationInventory",
+          "summary": "Read exact generation and resident inventory",
+          "description": "Agent principal and the Node-bound Fabric identity are required. Closed request/response schemas. This endpoint does not advertise node-agent runtime retirement support.",
+          "responses": {
+            "200": {
+              "description": "Generation authority inventory. A promotion replay returns its original committed receipt.",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "./common.v1.json#/components/schemas/NodeGenerationInventory"
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          }
+        }
+      },
+      "/v1/agent/nodes/{node_id}/generations/stage": {
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "post": {
+          "operationId": "stageNodeGeneration",
+          "summary": "Assert candidate readiness without granting authority",
+          "description": "Agent principal and the Node-bound Fabric identity are required. Closed request/response schemas. This endpoint does not advertise node-agent runtime retirement support.",
+          "responses": {
+            "200": {
+              "description": "Generation authority inventory. A promotion replay returns its original committed receipt.",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "./common.v1.json#/components/schemas/NodeGenerationInventory"
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          },
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/NodeRegistration"
+                }
+              }
+            }
+          }
+        }
+      },
+      "/v1/agent/nodes/{node_id}/generations/promote": {
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "post": {
+          "operationId": "promoteNodeGeneration",
+          "summary": "Atomically promote a fenced candidate and preserve all retirees",
+          "description": "Agent principal and the Node-bound Fabric identity are required. Closed request/response schemas. This endpoint does not advertise node-agent runtime retirement support.",
+          "responses": {
+            "200": {
+              "description": "Generation authority inventory. A promotion replay returns its original committed receipt.",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "./common.v1.json#/components/schemas/NodeGenerationInventory"
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          },
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/PromoteNodeGenerationRequest"
+                }
+              }
+            }
+          }
+        }
+      },
+      "/v1/agent/nodes/{node_id}/generations/{generation_id}/heartbeat": {
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "generation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "post": {
+          "operationId": "heartbeatRetiringNodeGeneration",
+          "summary": "Observe retiring process liveness without changing Node facts",
+          "description": "Agent principal and the Node-bound Fabric identity are required. Closed request/response schemas. This endpoint does not advertise node-agent runtime retirement support.",
+          "responses": {
+            "200": {
+              "description": "Generation authority inventory. A promotion replay returns its original committed receipt.",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "./common.v1.json#/components/schemas/NodeGenerationInventory"
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          },
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/NodeGenerationHeartbeatRequest"
+                }
+              }
+            }
+          }
+        }
+      },
+      "/v1/agent/nodes/{node_id}/generations/{generation_id}/close": {
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "generation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "post": {
+          "operationId": "closeNodeGeneration",
+          "summary": "Close a fully settled retiring session monotonically",
+          "description": "Agent principal and the Node-bound Fabric identity are required. Closed request/response schemas. This endpoint does not advertise node-agent runtime retirement support.",
+          "responses": {
+            "200": {
+              "description": "Generation authority inventory. A promotion replay returns its original committed receipt.",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "./common.v1.json#/components/schemas/NodeGenerationInventory"
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          },
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/CloseNodeGenerationRequest"
+                }
+              }
+            }
+          }
+        }
+      },
     "/v1/agent/nodes/register": {
       "post": {
         "operationId": "registerNode",

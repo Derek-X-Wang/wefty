@@ -1119,8 +1119,11 @@ type CapabilityObservation struct {
 // runtime_handler:<name>, and cgroup_v2; they must not carry max_oneshot_slots
 // or max_service_slots.
 type NodeRegistration struct {
-	NodeID        string `json:"node_id"`
-	BootSessionID string `json:"boot_session_id"`
+	// AgentGenerationID opts into primary/retiring L1 sessions. Existing agents
+	// omit it; enrollment never adopts a legacy session's running Attempts.
+	AgentGenerationID string `json:"agent_generation_id,omitempty"`
+	NodeID            string `json:"node_id"`
+	BootSessionID     string `json:"boot_session_id"`
 	// ConnectHost is a raw Fabric-produced address. It remains usable as a
 	// secondary connection field, behind a wefty-owned friendly name, and never
 	// participates in identity, authorization, or scheduling.
