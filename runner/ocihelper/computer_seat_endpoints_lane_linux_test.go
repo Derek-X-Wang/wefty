@@ -33,6 +33,10 @@ import (
 // This fixture uses the production profile without adding mounts, privileges,
 // namespaces or processes to its OCI spec. Both Computers stay live during proof.
 func withSeatEndpointComputer(t *testing.T, imageRef, address string, prove func(context.Context, *ContainerdEngine, AttemptAuthority, containerd.Task, string)) {
+	withSeatEndpointComputerNetwork(t, imageRef, address, "", prove)
+}
+
+func withSeatEndpointComputerNetwork(t *testing.T, imageRef, address, network string, prove func(context.Context, *ContainerdEngine, AttemptAuthority, containerd.Task, string)) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(namespaces.WithNamespace(t.Context(), ContainerdNamespace), 5*time.Minute)
 	defer cancel()
@@ -59,6 +63,9 @@ func withSeatEndpointComputer(t *testing.T, imageRef, address string, prove func
 	resolver, hosts := filepath.Join(managed, "resolv.conf"), filepath.Join(managed, "hosts")
 	must(os.WriteFile(resolver, []byte("nameserver 127.0.0.53\n"), 0444))
 	must(os.WriteFile(hosts, []byte("127.0.0.1 localhost\n"), 0444))
+	if network == ComputerNetworkNone {
+		must(prepareComputerNoneNetworkFiles(managed))
+	}
 	id := "helper-seats-" + filepath.Base(root)
 	diffs, err := image.RootFS(ctx)
 	must(err)
@@ -87,7 +94,7 @@ func withSeatEndpointComputer(t *testing.T, imageRef, address string, prove func
 		var err error
 		document, err = BuildRuntimeSpec(ctx, RuntimeSpecInput{ContainerID: id, CgroupPath: "/" + id, RootfsPath: rootfs, ManagedRoot: managed,
 			Image:    ImageRuntimeConfig{User: config.Config.User, Environment: config.Config.Env, Entrypoint: config.Config.Entrypoint, Command: config.Config.Cmd, WorkingDirectory: config.Config.WorkingDir},
-			Workload: WorkloadInput{ImageReference: imageRef, ImageDigest: image.Target().Digest.String(), Computer: true, Limits: WorkloadLimits{MemoryBytes: 1 << 30}, ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{ComputerID: id, StorageID: id, StorageGeneration: 1, IntentRevision: 1, DiskBytes: 2 << 30}}}},
+			Workload: WorkloadInput{ImageReference: imageRef, ImageDigest: image.Target().Digest.String(), Computer: true, ComputerNetwork: network, Limits: WorkloadLimits{MemoryBytes: 1 << 30}, ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{ComputerID: id, StorageID: id, StorageGeneration: 1, IntentRevision: 1, DiskBytes: 2 << 30}}}},
 			Guest:    GuestKernelFacts{Architecture: runtime.GOARCH, KernelRelease: strings.TrimSpace(string(release))}, ResolverPath: resolver, HostsPath: hosts, ComputerControlSource: control, ManagedVolumeSources: map[ManagedVolumeKind]string{ManagedVolumeComputerDisk: service}})
 		return err
 	}))
@@ -139,9 +146,21 @@ func withSeatEndpointComputer(t *testing.T, imageRef, address string, prove func
 	namespace, err := pinTaskNetworkNamespace(task.Pid())
 	must(err)
 	defer namespace.close()
-	out, err := exec.CommandContext(ctx, "nsenter", "-t", fmt.Sprint(task.Pid()), "-n", "ip", "link", "set", "lo", "up").CombinedOutput()
-	if err != nil {
-		t.Fatalf("loopback: %v %s", err, out)
+	if network == ComputerNetworkNone {
+		// Use the production selection and setup path. There is deliberately no
+		// iptables executable or reachable upstream resolver in this fixture.
+		e := &ContainerdEngine{}
+		attachment, err := e.prepareComputerWorkloadNetwork(ctx, namespace, 7102, WorkloadInput{Computer: true, ComputerNetwork: network})
+		must(err)
+		defer attachment.close()
+		if attachment.hostLink != "" || attachment.dns != nil || attachment.probe != nil {
+			t.Fatal("none installed an egress attachment")
+		}
+	} else {
+		out, err := exec.CommandContext(ctx, "nsenter", "-t", fmt.Sprint(task.Pid()), "-n", "ip", "link", "set", "lo", "up").CombinedOutput()
+		if err != nil {
+			t.Fatalf("loopback: %v %s", err, out)
+		}
 	}
 	must(document.RevalidateMounts())
 	must(task.Start(ctx))

@@ -960,6 +960,17 @@ retries.
 image digest, optional full argv and working-directory replacements, separate
 public and sensitive operator environment, typed helper-minting inputs,
 enumerated managed volumes, operator mounts, and optional memory/CPU limits.
+For a Computer, the closed `computer_network` setting is `internet` or `none`;
+omission preserves `internet`. A nonempty setting on an ordinary workload or
+any other value is rejected before admission. `none` selects the loopback-only
+profile in `computer-image.md`, with fixed helper-owned localhost resolver and
+hosts files and no veth, outward route, NAT, egress listener or DNS proxy.
+`ProfileReceipt.computer_network` records the selected setting;
+`computer_loopback_only` is true only after actual namespace setup verifies
+the absence of outward networking. A profile document alone is not that proof.
+`DialSeatEndpoint`, `ExecComputerSeat`, command-mediated file copies and Seat
+readiness keep their existing authority and transport rules for both settings.
+Expected web/DNS refusal for `none` is not a readiness or liveness failure.
 The managed-volume list is closed to `handoff`, `service_data`,
 `computer_disk`, and `log_segments`; `kind=oci`, `class=one-shot` selects exactly one `handoff`
 descriptor carrying an opaque stable handoff-owner key, whose helper-owned
@@ -997,7 +1008,7 @@ and DNS proxy below run in the helper, outside the profile. The helper attaches
 a point-to-point veth, brings the Computer namespace's loopback and veth interfaces up, installs
 a default route, disables IPv6 through the namespace `all` and `default`
 sysctls, and masquerades the exact Computer IPv4 address through the Node/VM.
-Computer `/30`s use RFC 2544 benchmarking space `198.18.0.0/15`; endpoint port
+For `computer_network=internet`, Computer `/30`s use RFC 2544 benchmarking space `198.18.0.0/15`; endpoint port
 `p` selects byte offset `(p - AttemptPortMin) * 4`. The helper admits at most
 32,768 endpoint ports and refuses a conflicting non-Wefty Node
 route. A

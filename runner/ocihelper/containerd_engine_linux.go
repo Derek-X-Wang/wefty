@@ -1182,7 +1182,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if configErr != nil {
 			return &ImageUnavailableError{err: fmt.Errorf("read pinned image config: %w", configErr)}
 		}
-		if err := engine.refreshManagedNetworkFiles(); err != nil {
+		if err := engine.prepareComputerWorkloadNetworkFiles(request.Workload); err != nil {
 			return err
 		}
 		managedSources, freshServiceVolume, attachedDisk, managedErr := engine.managedVolumeSources(leaseContext, &request)
@@ -1303,7 +1303,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		if err != nil {
 			return RunResponse{}, fmt.Errorf("pin Computer network namespace: %w", err)
 		}
-		computerNetwork, err = engine.prepareComputerNetwork(leaseContext, networkNamespace, endpoints[contract.ComputerDisplayEndpointView])
+		computerNetwork, err = engine.prepareComputerWorkloadNetwork(leaseContext, networkNamespace, endpoints[contract.ComputerDisplayEndpointView], request.Workload)
 		if err != nil {
 			return RunResponse{}, fmt.Errorf("prepare Computer network namespace: %w", err)
 		}
@@ -1316,6 +1316,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 		profile.ComputerDNSUpstreamSource = computerNetwork.dnsUpstreamSource
 		profile.ComputerDNSUpstreamReachable = computerNetwork.dnsUpstreamReachable
 		profile.ComputerIPv6NATState = computerNetwork.ipv6NATState
+		profile.ComputerLoopbackOnly = request.Workload.ComputerNetwork == ComputerNetworkNone
 		for name, hold := range endpointHolds {
 			port := endpoints[name]
 			if err := hold.Close(); err != nil {

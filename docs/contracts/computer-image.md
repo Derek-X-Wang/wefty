@@ -304,6 +304,39 @@ identity and then rekey the copied identity before the destination can attach. A
 attach verifies the existing disk-root owner and does not recursively re-own
 the copied bytes.
 
+The Computer's fixed network setting selects `internet` or `none`. An omitted
+helper setting preserves `internet` for existing callers. Both settings create
+a fresh private network namespace. With `network=none`, that namespace has
+loopback only: the helper brings `lo` up and verifies that no other interface,
+default route or outward route exists, for either IP family. Kernel-local
+loopback routes remain. It creates no veth, NAT, egress proof listener or DNS
+proxy. The helper mounts fixed read-only files from its managed
+`network/none/` directory: `resolv.conf` names only `127.0.0.1`, with one
+one-second attempt, and `hosts` contains only IPv4/IPv6 localhost entries.
+No Node hosts snapshot, upstream resolver or search domain enters this profile.
+No guest proxy or DNS/IP filter implements this setting; the missing outward
+interface and routes are the boundary. The image receives no network
+administration capability with either setting.
+
+The helper reaches each Seat's Unix screen sockets through the exact live
+attempt's root from outside its network namespace. `ExecComputerSeat` uses
+containerd task exec as the Seat's user. Neither transport needs internet.
+The existing command stream can also carry command-mediated copies: bytes in
+command arguments enter a Seat file, and binary stdout returns a file's bytes.
+There is no dependency on a guest TCP file server or DNS. This helper-level
+proof does not claim the later `wefty cp` command or end-to-end AP-1 proof.
+Seat readiness and `rfb-websocket-v1` greetings check the private screen
+endpoints only. They do not probe an upstream network. Liveness remains the
+task's running state. The helper records `computer_network=none` and, after
+checking the actual namespace, `computer_loopback_only=true`; doctor accepts
+that proof without requiring an outward address or DNS/firewall attachment.
+A simultaneous `internet` Computer still requires its firewall evidence.
+The `computer-seats` CI jobs `default-computer-seats / linux/amd64` and
+`default-computer-seats / linux/arm64` prove AP-1 (helper screen, command and
+binary copy), AP-2 (web and DNS fail while loopback works), and AP-3 (fresh
+readiness probes and task liveness survive those refusals). The root-only test
+uses `computer_seat_lane`, never the general non-root realtiming lane.
+
 Computer disk publication is crash-resumable across its image/manifest pair.
 Grow writes exact durable operation intent before resizing in place; copy
 retains its staged identity and phase before the staged image can replace the
@@ -328,7 +361,7 @@ enters only the exact live Computer's network namespace and exposes the existing
 attempt-authority-bound stream; the Computer receives no new capability or
 privilege.
 
-The helper attaches one point-to-point `/30` veth to the private namespace,
+For `network=internet`, the helper attaches one point-to-point `/30` veth to the private namespace,
 installs a default route, retains the helper-managed resolver and hosts mounts,
 disables IPv6 through both the namespace `all` and `default` sysctls, and
 masquerades the exact Computer IPv4 address through the Node or Lima VM. The

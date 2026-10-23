@@ -460,6 +460,9 @@ type Request struct {
 	Limits           *contract.JobLimits
 	ManagedResources ManagedResources
 	ManagedVolumes   []ManagedVolume
+	// ComputerNetwork carries the Computer setting independently of its image.
+	// Empty preserves the helper's existing internet default.
+	ComputerNetwork string
 	// RunMailbox asks the runtime to seed this attempt's mailbox. It is set
 	// only for a runtime whose handoff storage the agent cannot reach.
 	RunMailbox       *RunMailboxSeed

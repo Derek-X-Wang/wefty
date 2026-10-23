@@ -40,6 +40,9 @@ func validateWorkloadWithSource(input WorkloadInput, allowedMountRoots []string,
 // authority is checked after the helper translates node paths into its guest
 // view; doing it here would reject every non-identity Lima translation.
 func validateWorkloadWire(input WorkloadInput) error {
+	if err := validateComputerNetwork(input); err != nil {
+		return err
+	}
 	if !digestPattern.MatchString(input.ImageDigest) {
 		return errors.New("workload image must be an immutable sha256 digest")
 	}

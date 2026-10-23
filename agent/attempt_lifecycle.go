@@ -1169,6 +1169,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		ManagedVolumes: runtimeManagedVolumes(claim, lifecycle.executionOwnerKey(claim.Job.Spec)),
 		IdlePolicy:     idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
+	if contract.IsComputerExecution(request.Execution) {
+		request.ComputerNetwork = ocihelper.ComputerNetworkInternet
+		if claim.ComputerStorage != nil && claim.ComputerStorage.ComputerSettings != nil && claim.ComputerStorage.Network != "" {
+			request.ComputerNetwork = string(claim.ComputerStorage.Network)
+		}
+	}
 	var ociRuntimeLoss ociRuntimeLossLatch
 	preRunObservationRefused := false
 	if claim.Job.Spec.Kind == contract.JobKindOCI {
