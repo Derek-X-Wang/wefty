@@ -249,8 +249,24 @@ command=(/bin/sh -c 'if [ ! -f "$1" ]; then touch "$1"; exit 7; fi; touch "$2"; 
 	if raw, err := os.ReadFile(predecessorResult); err != nil || !bytes.Contains(raw, []byte(`"exit_code":7`)) {
 		t.Fatalf("command did not exit 7 before cleanup: %s %v", raw, err)
 	}
+	// The start acknowledgement reaches L1 asynchronously; cleanup starting
+	// does not prove L1 recorded it, so wait before L3 observes the Job.
+	startDeadline := time.Now().Add(15 * time.Second)
+	for {
+		job, err := store.GetJob(t.Context(), first.Job.JobID)
+		if err == nil && job.State == contract.JobRunning {
+			break
+		}
+		if time.Now().After(startDeadline) {
+			t.Fatalf("predecessor never recorded running: state=%s err=%v", job.State, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err := reconciler.ReconcileOnce(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+	if run, err := runs.GetRun(t.Context(), accepted.RunID); err != nil || run.Status != contract.RunRunning {
+		t.Fatalf("started Run status=%s err=%v", run.Status, err)
 	}
 	interrupt(ErrAgentShutdown)
 	select {
