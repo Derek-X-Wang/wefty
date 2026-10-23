@@ -32,7 +32,7 @@ import (
 )
 
 // This lane uses BuildRuntimeSpec without modifying its returned OCI spec.
-// It proves image duties only: helper Seat operations and P7 are other tickets.
+// It proves image duties, including P7 confinement; helper operations have their own lane test.
 func TestDefaultComputerSeatsAtProductionTimings(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Fatal("real Computer profile requires root on the Linux CI runner")
@@ -121,6 +121,50 @@ func TestDefaultComputerSeatsAtProductionTimings(t *testing.T) {
 	evidence.Observations["own_screen_input"] = true
 	evidence.Observations["other_files_refused"] = h.exec("2002:2002", "sh", "-c", "if cat /wefty/service/seats/1/.Xauthority 2>/dev/null; then exit 1; fi; echo refused") == "refused"
 	evidence.Observations["other_display_refused"] = h.exec("2002:2002", "sh", "-c", seatEnv(2)+"if DISPLAY=:1 xdpyinfo >/dev/null 2>&1; then exit 1; fi; echo refused") == "refused"
+	for _, pair := range [][2]int{{1, 2}, {2, 1}} {
+		h.exec(fmt.Sprintf("%d:%d", 2000+pair[0], 2000+pair[0]), "python3", "-c", fmt.Sprintf(`import socket
+for name in ('view.ws','control.ws','view.sock','control.sock'):
+ s=socket.socket(socket.AF_UNIX);s.settimeout(.2)
+ try:s.connect('/wefty/service/seats/%d/run/'+name)
+ except PermissionError:pass
+ else:raise AssertionError('other Seat endpoint reachable: '+name)
+ finally:s.close()
+for port in (7102,7103,7104,7105):
+ s=socket.socket();s.settimeout(.2)
+ try:s.connect(('127.0.0.1',port))
+ except OSError:pass
+ else:raise AssertionError('legacy Seat TCP endpoint still reachable')
+ finally:s.close()
+`, pair[1]))
+	}
+	evidence.Observations["other_endpoints_refused"] = true
+	// Keep the target Computer live on a different display number. Its known
+	// filesystem endpoints and abstract X socket must be absent in this Computer.
+	peerRoot := t.TempDir()
+	peer := startSeatComputer(t, ctx, client, image, peerRoot, filepath.Join(peerRoot, "managed/service"), kit)
+	peer.directive(1, 3)
+	peer.ready(3)
+	peer.probe("frame", 3, "aa00aa")
+	peerLocal := func() {
+		peer.exec("2003:2003", "python3", "-c", `import socket
+for path in ('/wefty/service/seats/3/run/view.ws','/wefty/service/seats/3/run/control.ws','/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
+ with socket.socket(socket.AF_UNIX) as s:
+  s.settimeout(.2);s.connect(path)
+`)
+	}
+	peerLocal()
+	h.exec("2001:2001", "python3", "-c", `import socket
+for path in ('/wefty/service/seats/3/run/view.ws','/wefty/service/seats/3/run/control.ws','/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
+ s=socket.socket(socket.AF_UNIX);s.settimeout(.2)
+ try:s.connect(path)
+ except OSError:pass
+ else:raise AssertionError('neighbour Computer reachable: '+repr(path))
+ finally:s.close()
+`)
+	peer.probe("frame", 3, "aa00aa")
+	peerLocal()
+	peer.stop()
+	evidence.Observations["cross_computer_endpoints_refused"] = true
 	for _, place := range []int{1, 2} {
 		h.driver(place, false)
 	}
@@ -477,7 +521,7 @@ func (h *seatComputer) wait(description string, predicate func() bool, details .
 func (h *seatComputer) directive(generation int, places ...int) {
 	seats := []map[string]any{}
 	for _, place := range places {
-		seats = append(seats, map[string]any{"place": place, "user": fmt.Sprintf("seat%d", place), "view_port": 7100 + place*2, "control_port": 7101 + place*2})
+		seats = append(seats, map[string]any{"place": place, "user": fmt.Sprintf("seat%d", place), "view_port": 7100 + place*2, "control_port": 7101 + place*2, "view_socket": fmt.Sprintf("/wefty/service/seats/%d/run/view.ws", place), "control_socket": fmt.Sprintf("/wefty/service/seats/%d/run/control.ws", place)})
 	}
 	payload, err := json.Marshal(map[string]any{"version": 1, "generation": generation, "seats": seats})
 	seatMust(h.t, err)

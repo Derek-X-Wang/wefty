@@ -570,7 +570,7 @@ The DNS proxy discards upstream responses whose questions do not match the query
 including QDCOUNT-zero error replies. Such unauthenticated error shapes are not
 forwarded; a client may time out rather than receive the upstream error.
 
-## Default image and Seats (Computer request P5, P6, P8, P9)
+## Default image and Seats (Computer request P5, P6, P7, P8, P9)
 
 The final `seats` target in `examples/computer/Dockerfile` is the default
 Computer image. It holds Debian, XFCE, Xvfb, Chromium, `git`, `curl`, Python 3,
@@ -631,13 +631,13 @@ P5 binds the **directory** `/wefty/control` read-only. The helper atomically
 replaces `seats.json`; the supervisor reopens it on every poll:
 
 ```json
-{"version":1,"generation":1,"seats":[{"place":1,"user":"seat1","view_port":7102,"control_port":7103}]}
+{"version":1,"generation":1,"seats":[{"place":1,"user":"seat1","view_port":7102,"control_port":7103,"view_socket":"/wefty/service/seats/1/run/view.ws","control_socket":"/wefty/service/seats/1/run/control.ws"}]}
 ```
 
 `place` is 1–4. A public Seat ID remains `seat_<hex>` and is never the place.
 The positive attempt-local generation increases on each directive. Duplicate
-places or ports, incorrect users, unknown fields, malformed documents, missing
-directives and replayed generations fail closed. A refused document logs
+places or ports, incorrect users or socket paths, unknown fields, malformed
+documents, missing directives and replayed generations fail closed. A refused document logs
 once per replacement, not once per poll. Only a read error resets that
 observation. An unchanged starting Seat keeps its original 60-second deadline
 when another Seat is added. Failed Seats do not retry on an unrelated change;
@@ -745,8 +745,9 @@ probe waits for green. Both input probes first observe the page and click a
 matching pixel near the centre of its visible colour band, below browser
 chrome and clear of narrow overlays. Control input must change the colour;
 an already-green baseline cannot prove input delivery. The lane selects the
-Seat's control port for control input and its view port for view-input and
-screen observations. Probe output records the endpoint port, click position,
+Seat's control Unix socket for control input and its view Unix socket for
+view-input and screen observations. Probe output records the endpoint, click
+position,
 and colours before and after input on success or failure. Failures retain the
 last completed samples when a frame has been observed.
 
@@ -755,12 +756,43 @@ P8 reads the Seat's own read-only
 `{"version":1,"human_driving":true}` or `false`. Missing or invalid data
 produces local false state in that Seat's `run/driver-state.json`.
 
-`seat-endpoints.sh` remains the P7 replacement seam for #1138. Distinct IPv4
-loopback view/control ports use `/websockify` and the `binary` subprotocol.
-View discards pointer and key input server-side; control accepts it. The
-backend Unix sockets are private Seat files. **Other Seats can still reach
-these loopback ports.** This ticket claims only display-cookie and file
-separation for IM-4; endpoint confinement remains `NOT-RUN`.
+### Per-Seat endpoint transport (P7, IM-4)
+
+**Spike decision (#1138): use filesystem Unix sockets.** Linux can pin a socket
+with `O_PATH|O_NOFOLLOW` and connect through `/proc/self/fd/<fd>` from the helper,
+without entering or trusting an image pathname during connect. The existing
+websockify 0.10 `LibProxyServer` needs a small Unix-listener adapter and must
+ignore its TCP-only `TCP_NODELAY` option for Unix streams. A real binary
+WebSocket/RFB handshake covers that adapter. No per-Seat password is needed.
+
+The directive names exactly `/wefty/service/seats/<place>/run/view.ws` and
+`control.ws`, never caller-selected paths. The supervisor rejects any other
+spelling, including traversal or another place. The earlier `view_port` and
+`control_port` fields remain unique directive metadata for the helper API;
+**the Seat image binds no TCP listener at either number**. They cannot be
+used to reach a Seat. Older single-desktop images retain their port contract.
+
+`seat-endpoints.sh` binds both `rfb-websocket-v1` edges as mode-0600 filesystem
+Unix sockets in the Seat's mode-0700 runtime folder. Only that Seat's uid and
+root can open them. The underlying `view.sock` and `control.sock` RFB sockets
+are equally private. `/websockify` and the `binary` subprotocol stay unchanged.
+View still drops pointer and key input server-side; control accepts it.
+X TCP stays disabled and each display requires its own private X cookie.
+
+The helper returns opaque view/control endpoint names in each ready Seat
+observation, and accepts them only with that exact Computer attempt, current
+directive generation and place. See [the helper contract](oci-helper-protocol.md#per-seat-endpoint-streams-p7).
+It descends without following image links, pins socket identities and checks
+the listening peer's Seat uid. A replacement never redirects an old name;
+a later successful observation publishes fresh names after desktop recovery.
+
+Both `default-computer-seats / linux/amd64` and `/ linux/arm64` in
+`computer-seats.yml` attempt real connections from each Seat uid to the other
+Seat's view/control edges and RFB backends, and try the other display with the
+wrong cookie. The lane also keeps a neighbouring Computer live, brackets its
+refusal checks with real RFB liveness, and tries its known socket paths and
+abstract X token. Missing crossover observations keep `IM-4.endpoints`
+`NOT-RUN`; an observed successful crossover fails conformance.
 
 At startup the root supervisor refuses a non-root-owned or group/other-writable
 `/wefty/service`. It `lstat`-checks `seats` and `shared`, refuses links or wrong

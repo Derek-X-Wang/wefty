@@ -3428,6 +3428,14 @@ func (engine *ContainerdEngine) releaseAttemptRuntimeState(ctx context.Context, 
 	namespace := attempt.networkNamespace
 	attempt.networkNamespace = nil
 	attempt.mu.Unlock()
+	// Seat socket descriptors must not keep retired incarnations alive.
+	attempt.seatsMu.Lock()
+	if attempt.seats != nil {
+		for _, entry := range attempt.seats.entries {
+			entry.closeEndpointPins()
+		}
+	}
+	attempt.seatsMu.Unlock()
 	var errs []error
 	for _, hold := range holds {
 		errs = append(errs, hold.Close())

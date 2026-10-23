@@ -207,8 +207,8 @@ of JSON. Handshake and initial request reads have deadlines, the helper caps
 concurrent connections, and a decoder never reads beyond one frame.
 
 The connection cap is 64 slots, shared by the control connection and every
-request connection. Long-lived data streams -- `ExecComputerSeat`, `DialAttemptPort` and
-`DialHostBridge`, which hold their connection for the life of one proxied
+request connection. Long-lived data streams -- `ExecComputerSeat`, `DialAttemptPort`,
+`DialSeatEndpoint` and `DialHostBridge`, which hold their connection for the life of one proxied
 service client, one take-over view or control leg, or one Computer bridge
 pump -- may hold at most the cap minus a control reserve of 8, so 56. The
 control connection, each live attempt's `Watch`, and control RPCs such as
@@ -740,6 +740,7 @@ heartbeats.
 | `Verify` | Exact live attempt, or the authenticated session's whole `wefty` namespace. `namespace` is the mutating boot-barrier proof that may update pins, cache state, and sweep completion. `namespace_read_only` is an observation-only inventory route for acceptance baselines; it cannot satisfy the boot barrier or update helper policy state. |
 | `Sweep` | Authenticated session only. The boot barrier always sweeps the complete `wefty` namespace; there is no survivor selector. It inventories and removes every unowned `wftch*` link and `WEFTY-COMPUTER-*` per-attempt firewall rule with typed evidence; verified live attempts are the only exclusions. |
 | `DialAttemptPort` | Bidirectional host-to-guest stream for exactly one endpoint name returned by that live attempt's `Run`; the server resolves the authorized name to its private allocated port. For a Computer, the engine enters that exact task's network namespace only while creating the backend socket, restores the helper namespace, then relays the authority-bound stream. Success is withheld until the helper has connected that backend. A refused payload listener is a typed, attempt-scoped `engine_failure` and does not invalidate the healthy helper session, so readiness can observe withdrawal and retry republication. Only a successful attempt-endpoint stream detaches from its setup context. It is never a general guest dialer. |
+| `DialSeatEndpoint` | Exact live Computer attempt, current directive generation, Seat place and one opaque name returned by `ObserveComputerSeats`. Connects only the pinned private filesystem Unix socket for that Seat; no caller port or path. Success waits for backend connection and final attempt validation. See [Per-Seat endpoint streams](#per-seat-endpoint-streams-p7). |
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the bridge and the helper issued that attempt's separate capability. It is mandatory for Computers because their private network namespace cannot address the agent's Node-loopback listener directly; ordinary OCI uses it only for the Mac bind-failure fallback. It never accepts an arbitrary host address or port. |
 | `SetComputerControlState` | Exact live Computer-attempt authority and one boolean enter. The helper atomically replaces the attempt-local `/wefty/control/driver.json` body with the exact version-1 false or true document; ordinary, stale, old-boot, and reaped attempts are refused. |
 | `SetComputerToken` | Exact live Computer-attempt authority plus the opaque bearer and matching attempt bridge endpoint enter. A non-empty pair is atomically installed as attempt-local `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`, both mode 0400 and tenant-owned; an empty pair removes both. A partial pair, ordinary, stale, old-boot, or reaped attempt is refused. |
@@ -2194,8 +2195,11 @@ or general endpoint dial capability crosses this seam.
 
 `ApplyComputerSeats` accepts `{authority,seats}`. Each Seat entry is exactly
 `{place,user,view_port,control_port}`: place 1–4, matching `seat1`–`seat4`, and
-unique ports in 1024–65535. Entries are canonicalized by place. The helper publishes
-`{version:1,generation,seats}` to `/wefty/control/seats.json` using a fresh
+unique ports in 1024–65535. These numbers remain compatibility metadata;
+Seat endpoints use Unix sockets, not TCP listeners. Entries are canonicalized
+by place. The helper adds fixed `view_socket` and `control_socket` paths in
+that place's runtime folder, then publishes `{version:1,generation,seats}` to
+`/wefty/control/seats.json` using a fresh
 mode-0444 file, sync and atomic rename. The profile binds the control **folder**
 read-only, so a replacement is visible. The response is `{generation}`. Each
 changed list advances the attempt-local generation; an identical list is an
@@ -2215,7 +2219,9 @@ subsequent add of the same place creates a new incarnation with a new deadline.
 
 `ObserveComputerSeats` accepts `{authority,generation}` for the exact current
 positive generation and returns `{generation,seats}`. Each observation is
-`{place,state,reason,cleanup_complete}`. States are `starting`, `ready`,
+`{place,state,reason,cleanup_complete}`, plus `endpoints:{view,control}` only
+for a ready Seat with both socket identities pinned. Values are opaque names,
+not paths, ports or credentials. States are `starting`, `ready`,
 `failed`, `removing` and `cleaned`; these are helper observations, **not** the
 durable L1 Seat state machine. An image failure keeps its reason. Failed
 cleanup remains unconfirmed and cannot free Room. A host absence-check failure
@@ -2253,8 +2259,11 @@ before its add directive is published. An unchanged starting place retains its
 original deadline when other places change. Readiness is judged when the
 helper observes, so the node agent must observe within the readiness deadline.
 A valid, generation-bound ready answer is necessary. The helper independently negotiates `rfb-websocket-v1`
-and reads the binary RFB greeting on **both** named ports inside the pinned
-attempt network namespace. Each probe has a two-second I/O bound within the
+and reads the binary RFB greeting on **both** private filesystem Unix sockets
+under the pinned task root. It checks both greetings on every observation;
+failed rechecks withdraw readiness and the endpoint names. Socket identity
+changes advance the opaque endpoint names before they can be published again.
+Each probe has a two-second I/O bound within the
 remaining Seat budget. A probe which crosses the Seat deadline cannot publish
 ready; the observation is `failed/readiness_deadline_exceeded`, with no cleanup
 claim. A previously ready unchanged Seat must have a current-generation ready
@@ -2647,3 +2656,68 @@ write no freeze request, and a 960 MiB target reaches the used-cleanup refusal
 before the lower tmpfs floor. Its receipt includes these checks, grow, held,
 and shrink observations, and the tmpfs-floor refusal. Portable fake-runtime
 and session transport tests cover refusal and uncertain-readback paths with injected clocks.
+
+## Per-Seat endpoint streams (P7)
+
+The #1138 spike selected filesystem Unix sockets. See the
+[image decision and permissions](computer-image.md#per-seat-endpoint-transport-p7-im-4).
+`DialSeatEndpoint` is a session-authorized, post-sweep, long-lived data-stream
+operation. It counts against the same data-stream cap as `DialAttemptPort`;
+it cannot consume the control reserve. The closed request body is exactly
+`{authority,generation,place,name}`. `authority` is the full current
+`AttemptAuthority`; generation must equal the latest directive; place must
+name a currently wanted, ready, nonfailed Seat. The node agent resolves the
+public Seat identity to its place; this private helper operation accepts no
+Seat credential or general dial authority. Front-door tenure remains #1147.
+
+`ObserveComputerSeats` returns the two endpoint names by Seat after fresh
+binary RFB greetings. Names bind a random attempt-local scope, the place's
+add generation (its incarnation), endpoint kind and socket revision. Names
+are opaque: clients must not construct them. Another Computer's name is
+refused even when its place and generation happen to match. A removed or
+reused place, an old directive generation, a name from another Seat, and an
+old attempt/fence/session cannot reach a new endpoint.
+
+For observation and dial the helper pins `/proc/<task-pid>` and verifies its
+network namespace matches the attempt's duplicated namespace descriptor.
+It follows only the kernel task-root anchor. It opens every image directory
+component using descriptor-relative `O_PATH|O_DIRECTORY|O_NOFOLLOW`, then the
+socket with `O_PATH|O_NOFOLLOW`. The place, runtime folder and endpoint must
+belong to uid `2000+place` with no group/other permissions, and the endpoint
+must be a filesystem socket. The observation retains both socket descriptors.
+Every dial opens the current path again and compares its device/inode with
+the retained descriptor. A retained descriptor prevents inode reuse.
+
+Connection uses `/proc/self/fd/<pinned-socket-fd>`, so a concurrent path
+replacement cannot redirect it. Before returning success, the helper checks
+`SO_PEERCRED` against that Seat's uid, reopens and compares the endpoint
+again, and rechecks exact attempt identity, running task and namespace
+ownership. Symlinked components, wrong owners or permissions, a socket from
+another Computer, and replacements are refused. Path changes after the last
+check cannot redirect an already connected descriptor. Observation may mint
+fresh endpoint names after a legitimate edge restart; old names stay invalid.
+Pins close on withdrawal, removal, replacement and attempt runtime release.
+
+Dials and probes use only the Seat mutex during I/O, never the attempt
+lifecycle or owner-control mutex. The stream's success frame and backend-ready
+marker are withheld until connection and authority revalidation succeed.
+Only successful streams detach from their setup context; session/attempt loss
+still cancels them. No stream is reopened or redirected to a later Seat.
+
+Recoverable endpoint refusals use `seat_operation_refused` with detail tokens:
+`generation_mismatch` means refresh the directive generation;
+`endpoint_unavailable` means observe readiness and retry when published;
+`endpoint_mismatch` means the supplied name does not belong to that Seat;
+`endpoint_changed` means an identity, no-follow, owner or permission check
+failed. Do not treat the last two as evidence that waiting alone fixes a
+broken request or image. No refusal declares the helper session lost.
+There is no new CLI exit code.
+
+Rootless Linux unit tests attempt old-identity, symlink, replacement-during-
+connect and cross-root dials. `TestHelperSeatEndpointIM4`, tagged
+`linux && computer_seat_lane`, runs two live production-profile Computers,
+probes both named endpoint kinds, refuses old attempts and cross-Seat and
+cross-Computer names before stream readiness, then attempts real connections
+from a Seat uid to another Seat's endpoints/display and a neighbour's sockets
+and abstract display. It runs only as root in `computer-seats.yml`, in
+`default-computer-seats / linux/amd64` and `/ linux/arm64`.

@@ -32,11 +32,14 @@ def validate(document):
         raise SeatFailure("invalid_directive")
     wanted, ports = {}, set()
     for seat in document["seats"]:
-        if not isinstance(seat, dict) or set(seat) != {"place", "user", "view_port", "control_port"}:
+        if not isinstance(seat, dict) or set(seat) != {"place", "user", "view_port", "control_port", "view_socket", "control_socket"}:
             raise SeatFailure("invalid_seat")
         place = seat["place"]
         if type(place) is not int or place not in range(1, 5) or place in wanted or seat["user"] != "seat%d" % place:
             raise SeatFailure("invalid_seat")
+        for kind in ("view", "control"):
+            if seat[kind + "_socket"] != "/wefty/service/seats/%d/run/%s.ws" % (place, kind):
+                raise SeatFailure("invalid_endpoint")
         for key in ("view_port", "control_port"):
             port = seat[key]
             if type(port) is not int or not 1024 <= port <= 65535 or port in ports:
@@ -422,11 +425,14 @@ def sweep_scratch(uid):
             os.close(descriptor)
 
 
-def rfb_ready(port):
-    """Check the negotiated binary WebSocket and the RFB greeting, not TCP."""
+def rfb_ready(path):
+    """Check the negotiated binary WebSocket and the RFB greeting, over a private Unix socket."""
     try:
         deadline = time.monotonic() + 0.2
-        with socket.create_connection(("127.0.0.1", port), timeout=0.2) as connection:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(0.2)
+        with connection:
+            connection.connect(path)
             key = base64.b64encode(os.urandom(16)).decode()
             connection.sendall(("GET /websockify HTTP/1.1\r\nHost: localhost\r\n"
                                 "Upgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -534,7 +540,7 @@ class DesktopBackend:
                 ready = stat.S_ISREG(info.st_mode) and info.st_uid == 2000 + seat["place"]
             finally:
                 os.close(descriptor)
-            return ready and rfb_ready(seat["view_port"]) and rfb_ready(seat["control_port"])
+            return ready and rfb_ready(seat["view_socket"]) and rfb_ready(seat["control_socket"])
         except OSError:
             return False
 

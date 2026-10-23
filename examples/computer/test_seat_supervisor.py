@@ -41,7 +41,9 @@ class Backend:
 def directive(generation, *places):
     return {"version": 1, "generation": generation, "seats": [
         {"place": n, "user": "seat%d" % n, "view_port": 7100 + n * 2,
-         "control_port": 7101 + n * 2} for n in places]}
+         "control_port": 7101 + n * 2,
+         "view_socket": "/wefty/service/seats/%d/run/view.ws" % n,
+         "control_socket": "/wefty/service/seats/%d/run/control.ws" % n} for n in places]}
 
 
 class SupervisorTest(unittest.TestCase):
@@ -335,3 +337,25 @@ class StorageSafetyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class EndpointDirectiveTest(unittest.TestCase):
+    def test_directive_names_only_its_own_socket_paths(self):
+        doc = directive(1, 1)
+        seat = doc['seats'][0]
+        seat['view_socket'] = '/wefty/service/seats/1/run/view.ws'
+        seat['control_socket'] = '/wefty/service/seats/1/run/control.ws'
+        self.assertEqual(supervisor.validate(doc)[1]['view_socket'], seat['view_socket'])
+        for path in ('/wefty/service/seats/2/run/view.ws', '/tmp/view.ws',
+                     '/wefty/service/seats/1/run/../view.ws'):
+            seat['view_socket'] = path
+            with self.assertRaises(supervisor.SeatFailure):
+                supervisor.validate(doc)
+
+    def test_supervisor_probes_a_unix_endpoint(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = str(Path(root) / 'view.ws')
+            with mock.patch.object(supervisor.socket, 'socket') as make_socket:
+                make_socket.return_value.connect.side_effect = OSError('probe fixture')
+                supervisor.rfb_ready(path)
+                make_socket.assert_called_once_with(supervisor.socket.AF_UNIX, supervisor.socket.SOCK_STREAM)
+                make_socket.return_value.connect.assert_called_once_with(path)
