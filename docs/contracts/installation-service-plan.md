@@ -773,3 +773,46 @@ support is present. #1179 supplies activation sequencing and authority probes;
 #1180 supplies recovery; #1182 supplies real launchd acceptance. Temporary-dir
 fake-manager tests here do not establish installed-stack survival or reboot
 acceptance.
+
+### Shared runtime ownership during overlap (#1176)
+
+Installed `wefty-agent` supplies `Store.WithPrimary` as the agent's short local
+primary fence. It uses the catalog lock already used by promotion. A staged or
+retiring identity, a different primary, or an unresolved promotion cannot
+initialize the shared managed root or persist capability revisions. The callback
+runs only short local writes; it must never enclose an L1 RPC. L1 still fences
+Node observations and first completion authority independently.
+
+Installed `Store.StartupWithLifetime` holds the generation-directory lifetime
+lock before readiness. The runtime takes the stable-Node cohort lock shared and
+borrows that same lifetime lock through `Config.GenerationLifetimeLock`, using
+the handle's identity-checked, single-use `ClaimRuntime`. It never opens a
+second descriptor for that lock or takes a redundant spool-directory generation
+lock. Startup releases the handle only after runtime shutdown; runtime close
+releases its cohort lock without releasing the installed process binding.
+Readiness keeps its independent held-lock and kernel process-start checks.
+Standalone enrolled library configurations instead own a spool-directory
+generation lock. The executable rejects a generation ID without its catalog
+before opening profiles or runtime state. Legacy runtimes keep the exclusive
+cohort lock. Releasing a short
+primary/catalog lock never releases lifetime ownership. #1179 must keep its
+existing L1-promotion / local-commit / candidate-activation ordering; starting a candidate does not initialize shared
+runtime state before the committed primary fence opens.
+
+Shared spool rows carry immutable owning generations. The default retirement
+adapter acknowledges exact durable evidence custody only to a successor that
+has opened the same store and declared custody support. It preserves the bytes
+there, waits for existing mailbox/result publication rules, and gives no live
+completion authority to the custodian. Positive L1 closure is still required
+before foreign-generation recovery. Handoff leases and collection locks cover
+all processes using that shared root, and both spool and retained-result budgets
+count the complete cohort once. See
+[shared local evidence](agent-local-lifecycle.md#shared-local-evidence-across-node-agent-generations-1176).
+
+`RemoveFinished` may use the existing exact custody digest as evidence-storage
+proof only after its other positive completion checks. Its cleanup remains
+limited to generation installation files; it must never remove the shared spool,
+record-lock directory, result records or custody bytes. #1180 reconciliation
+must retain ambiguous and undeclared evidence. Custody alone proves neither an
+empty runtime nor an accepted first completion, and cannot authorize rollback
+or retirement restart.

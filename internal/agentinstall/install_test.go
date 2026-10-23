@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -678,5 +680,79 @@ func TestReadinessFailsClosedWhenProcessStartIsUnavailable(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestPrimaryFenceFollowsEveryPromotionAndRejectsPendingCutover(t *testing.T) {
+	f := newFixture(t)
+	first := f.prepare(t, true)
+	writes := 0
+	write := func() error { writes++; return nil }
+	must(t, f.s.WithPrimary(first.ID, write))
+	second := f.prepare(t, false)
+	if err := f.s.WithPrimary(second.ID, write); !errors.Is(err, ErrStartupSuppressed) {
+		t.Fatalf("candidate write: %v", err)
+	}
+	f.promote(t, second)
+	if err := f.s.WithPrimary(first.ID, write); !errors.Is(err, ErrStartupSuppressed) {
+		t.Fatalf("retiree write: %v", err)
+	}
+	must(t, f.s.WithPrimary(second.ID, write))
+	third := f.prepare(t, false)
+	c, err := f.s.Read()
+	must(t, err)
+	r, err := f.s.BeginPromotion(third.ID, testBoot, "third-cutover", c.Revision, 1, emptyResidents(c))
+	must(t, err)
+	for _, id := range []string{first.ID, second.ID, third.ID} {
+		if err := f.s.WithPrimary(id, write); !errors.Is(err, ErrStartupSuppressed) {
+			t.Fatalf("pending cutover write: %v", err)
+		}
+	}
+	must(t, f.s.CommitPromotion(t.Context(), r.ID, r.L1OperationID, testBoot, 1))
+	must(t, f.s.WithPrimary(third.ID, write))
+	if writes != 3 {
+		t.Fatalf("Node-wide writes=%d", writes)
+	}
+}
+
+func TestGenerationLifetimeAllowsOneRuntimeClaimAndPreservesReadinessLock(t *testing.T) {
+	f := newFixture(t)
+	g := f.prepare(t, true)
+	f.releaseLifetime(g.ID)
+	lifetime, err := f.s.StartupWithLifetime(g.ID, "node", g.Executable, testBoot)
+	must(t, err)
+	defer lifetime.Close()
+	must(t, requireLifetimeLock(filepath.Join(f.s.Root(), g.ID)))
+	if err := lifetime.ClaimRuntime("other-node", g.ID); err == nil {
+		t.Fatal("accepted another Node's lifetime proof")
+	}
+	if err := lifetime.ClaimRuntime("node", "other-generation"); err == nil {
+		t.Fatal("accepted another generation's lifetime proof")
+	}
+	var claims atomic.Int32
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if lifetime.ClaimRuntime("node", g.ID) == nil {
+				claims.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if claims.Load() != 1 {
+		t.Fatalf("runtime claims=%d", claims.Load())
+	}
+	// Borrowing never re-flocks or releases the descriptor that readiness probes.
+	_, err = f.s.BindReady(t.Context(), g.ID, *g.Process, g.CreatedAt)
+	must(t, err)
+	lifetime.Close()
+	lifetime.Close()
+	if err := lifetime.ClaimRuntime("node", g.ID); err == nil {
+		t.Fatal("released lifetime proof admitted runtime")
+	}
+	if _, err := f.s.BindReady(t.Context(), g.ID, *g.Process, g.CreatedAt); err == nil {
+		t.Fatal("readiness accepted released borrowed lifetime lock")
 	}
 }

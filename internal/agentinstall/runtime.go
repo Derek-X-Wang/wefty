@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/durable"
@@ -93,6 +94,52 @@ func (s Store) LoadCandidate(ctx context.Context, id string, base launchagent.Ag
 // Primary restarts are allowed, including after reboot, unless a promotion is
 // unresolved. A clean suppressed exit defeats stale loaded KeepAlive policy.
 func (s Store) Startup(id, nodeID, executable, boot string) (func(), error) {
+	lifetime, err := s.StartupWithLifetime(id, nodeID, executable, boot)
+	if err != nil {
+		return nil, err
+	}
+	return lifetime.Close, nil
+}
+
+// GenerationLifetime owns the one installed generation-directory lock. The
+// installed process keeps it until runtime shutdown; the runtime borrows it
+// once instead of acquiring a second per-generation lock.
+type GenerationLifetime struct {
+	mu                   sync.Mutex
+	nodeID, generationID string
+	release              func()
+	runtimeClaimed       bool
+}
+
+// ClaimRuntime validates and consumes the process-local ownership proof without
+// opening or flocking the directory again. It grants no primary authority.
+func (l *GenerationLifetime) ClaimRuntime(nodeID, generationID string) error {
+	if l == nil {
+		return errors.New("generation lifetime ownership is missing")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.release == nil || l.runtimeClaimed || l.nodeID != nodeID || l.generationID != generationID {
+		return errors.New("generation lifetime ownership is released, already claimed, or mismatched")
+	}
+	l.runtimeClaimed = true
+	return nil
+}
+
+// Close releases the lifetime lock after the borrowing runtime has stopped.
+func (l *GenerationLifetime) Close() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.release != nil {
+		l.release()
+		l.release = nil
+	}
+}
+
+// StartupWithLifetime is Startup with a borrowable process-local ownership
+// proof for the runtime. Readiness still independently verifies the same held
+// directory lock and the kernel process-start identity.
+func (s Store) StartupWithLifetime(id, nodeID, executable, boot string) (*GenerationLifetime, error) {
 	root, close, err := s.open(false)
 	if err != nil {
 		return nil, err
@@ -137,7 +184,7 @@ func (s Store) Startup(id, nodeID, executable, boot string) (func(), error) {
 			return nil, err
 		}
 	}
-	return release, nil
+	return &GenerationLifetime{nodeID: nodeID, generationID: id, release: release}, nil
 }
 
 // Ready is a process-owned private startup point. A candidate waits before
@@ -291,4 +338,22 @@ func (s Store) AwaitActivation(ctx context.Context, id string) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// WithPrimary holds the same catalog lock as promotion while a short Node-wide
+// local write runs. It grants no L1 authority and must never enclose an RPC.
+func (s Store) WithPrimary(id string, write func() error) error {
+	root, close, err := s.open(false)
+	if err != nil {
+		return err
+	}
+	defer close()
+	c, err := s.read(root)
+	if err != nil {
+		return err
+	}
+	if c.PendingReceipt != "" || c.Primary != id || c.Generations[id].Role != "primary" {
+		return ErrStartupSuppressed
+	}
+	return write()
 }

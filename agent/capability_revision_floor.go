@@ -38,6 +38,7 @@ type capabilityRevisionFloorState struct {
 //
 // A nil floor is that degraded, per-process mode.
 type capabilityRevisionFloor struct {
+	primary   func(func() error) error
 	mu        sync.Mutex
 	path      string
 	persisted int64
@@ -115,7 +116,14 @@ func (floor *capabilityRevisionFloor) record(revision int64) {
 	if revision <= floor.persisted {
 		return
 	}
-	if err := floor.writeLocked(revision); err != nil {
+	write := func() error { return floor.writeLocked(revision) }
+	var err error
+	if floor.primary != nil {
+		err = floor.primary(write)
+	} else {
+		err = write()
+	}
+	if err != nil {
 		if floor.logf != nil {
 			floor.logf("agent: persist capability revision floor: %v", err)
 		}

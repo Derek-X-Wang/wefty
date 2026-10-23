@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -146,5 +147,21 @@ func TestInstalledCandidateWaitsBeforeOpeningProfileOrRegistering(t *testing.T) 
 		if _, err := os.Stat(filepath.Join(home, folder)); !os.IsNotExist(err) {
 			t.Fatalf("candidate initialized user runtime state: %s %v", folder, err)
 		}
+	}
+}
+
+func TestInstalledGenerationIdentityRequiresCatalogBeforeProfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	oldArgs, oldFlags := os.Args, flag.CommandLine
+	defer func() { os.Args, flag.CommandLine = oldArgs, oldFlags }()
+	flag.CommandLine = flag.NewFlagSet("generation-without-catalog", flag.ContinueOnError)
+	os.Args = []string{"wefty-agent", "--agent-generation-id=installed-generation", "--profile=" + filepath.Join(home, "missing-profile.json")}
+	if err := run(); err == nil || !strings.Contains(err.Error(), "installed generation requires its identity and catalog directory") {
+		t.Fatalf("generation without its lifetime-lock catalog reached profile/runtime startup: %v", err)
+	}
+	entries, err := os.ReadDir(home)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("rejected startup initialized runtime state: %v %v", entries, err)
 	}
 }

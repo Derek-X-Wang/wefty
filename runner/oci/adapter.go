@@ -2814,8 +2814,8 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	managedVolumes := helperManagedVolumes(request)
 	input := ocihelper.WorkloadInput{
 		ImageReference: execution.Image.Reference, ImageDigest: digest,
-		Computer: contract.IsComputerExecution(request.Execution),
-		Argv:     append([]string(nil), execution.Argv...), WorkingDirectory: workingDirectory,
+		Computer: contract.IsComputerExecution(request.Execution), ComputerNetwork: request.ComputerNetwork,
+		Argv: append([]string(nil), execution.Argv...), WorkingDirectory: workingDirectory,
 		Environment: public, SensitiveEnvironment: sensitive,
 		ManagedVolumes: managedVolumes,
 	}
