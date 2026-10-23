@@ -238,6 +238,9 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 	if computer.DesiredState == contract.ServiceDesiredRemoved {
 		return Computer{}, false, false, protocolError(contract.ErrorConflict, "removed Computer cannot submit Runs")
 	}
+	if computer.Network == ComputerNetworkNone && request.SubmitEnabled != nil && *request.SubmitEnabled {
+		return Computer{}, false, false, protocolError(contract.ErrorConflict, "Computer without internet cannot enable submission")
+	}
 	var storedHash string
 	if err := tx.QueryRowContext(ctx, `SELECT request_hash FROM computer_submission_audit
 		WHERE computer_id=? AND idempotency_key=?`, computerID, request.IdempotencyKey).Scan(&storedHash); err == nil {

@@ -19,6 +19,7 @@ on:
       - docs/guides/computer-images.md
       - scripts/computer_seats_contract_test.go
       - scripts/computer_memory_limit_contract_test.go
+      - scripts/computer_network_contract_test.go
       - .github/workflows/computer-seats.yml
   push:
     branches: [main]
@@ -201,6 +202,20 @@ jobs:
             WEFTY_HELPER_MEMORY_EVIDENCE="$RUNNER_TEMP/default-computer/$ARCH-helper-memory.json" \
             "$RUNNER_TEMP/helper-memory.test" -test.v \
             -test.run '^TestHelperComputerMemoryRM5$' -test.timeout 5m
+      - name: Prove AP-1 AP-2 AP-3 through a helper Computer without internet
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          GOFLAGS=-p=1 GOMAXPROCS=2 go test -c -tags computer_seat_lane \
+            -o "$RUNNER_TEMP/helper-network.test" ./runner/ocihelper
+          sudo env PATH="/usr/local/bin:/usr/local/sbin:$PATH" \
+            WEFTY_SEAT_IMAGE="$WEFTY_SEAT_IMAGE" \
+            WEFTY_SEAT_CONTAINERD=/run/wefty-seat-containerd.sock \
+            WEFTY_HELPER_NETWORK_EVIDENCE="$RUNNER_TEMP/default-computer/$ARCH-helper-network.json" \
+            WEFTY_HELPER_SEAT_EVIDENCE="$RUNNER_TEMP/default-computer/$ARCH-network-computer" \
+            "$RUNNER_TEMP/helper-network.test" -test.v \
+            -test.run '^TestHelperComputerNetworkNoneAP1AP2AP3$' -test.timeout 5m
       - name: Make Seat evidence readable after every outcome
         if: always()
         run: |
