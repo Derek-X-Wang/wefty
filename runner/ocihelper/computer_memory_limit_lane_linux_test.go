@@ -176,6 +176,25 @@ func proveComputerMemoryRM5(t *testing.T, ctx context.Context, engine *Container
 		must(err)
 		return n
 	}
+	checkThawed := func() {
+		t.Helper()
+		requested, err := os.ReadFile(filepath.Join(cgroup, "cgroup.freeze"))
+		must(err)
+		events, err := os.ReadFile(filepath.Join(cgroup, "cgroup.events"))
+		must(err)
+		frozen, err := computerMemoryFrozen(events)
+		must(err)
+		if strings.TrimSpace(string(requested)) != "0" || frozen {
+			t.Fatalf("memory operation left Computer frozen: requested=%s events=%s", requested, events)
+		}
+	}
+	resize := func(target int64, generation uint64) (SetComputerMemoryLimitResponse, error) {
+		t.Helper()
+		request := SetComputerMemoryLimitRequest{authority, target, generation}
+		result, err := engine.SetComputerMemoryLimit(ctx, request)
+		checkThawed()
+		return result, err
+	}
 	check := func(r SetComputerMemoryLimitResponse, want int64) {
 		t.Helper()
 		_, _, _, err := verifyComputerCgroupMemoryPolicy("/sys/fs/cgroup", id, want)
@@ -218,9 +237,12 @@ func proveComputerMemoryRM5(t *testing.T, ctx context.Context, engine *Container
 	first, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{one}})
 	must(err)
 	wait(first.Generation, 1, "ready")
-	grown, err := engine.SetComputerMemoryLimit(ctx, SetComputerMemoryLimitRequest{authority, 2 << 30, first.Generation})
+	grown, err := resize(2<<30, first.Generation)
 	must(err)
 	check(grown, 2<<30)
+	if grown.FreezeRequests != 0 {
+		t.Fatalf("grow froze Computer: %+v", grown)
+	}
 	added, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{one, two}})
 	must(err)
 	wait(added.Generation, 2, "ready")
@@ -228,7 +250,7 @@ func proveComputerMemoryRM5(t *testing.T, ctx context.Context, engine *Container
 	must(err)
 	// An image answer alone is insufficient: no helper observation has yet made
 	// the positive absence decision for the omitted Seat.
-	_, err = engine.SetComputerMemoryLimit(ctx, SetComputerMemoryLimitRequest{authority, 1 << 30, removed.Generation})
+	_, err = resize(1<<30, removed.Generation)
 	var refusal *SeatOperationRefusalError
 	if !errors.As(err, &refusal) || refusal.Reason != SeatRefusalCleanupNotConfirmed {
 		t.Fatalf("shrank before cleanup evidence: %v", err)
@@ -260,9 +282,12 @@ while not os.path.exists('/wefty/service/seats/1/home/memory-release'): time.sle
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	held, err := engine.SetComputerMemoryLimit(ctx, SetComputerMemoryLimitRequest{authority, 1 << 30, removed.Generation})
+	held, err := resize(1<<30, removed.Generation)
 	must(err)
 	check(held, 2<<30)
+	if held.FreezeRequests != 0 {
+		t.Fatalf("held shrink froze Computer: %+v", held)
+	}
 	if held.Reason != "memory_in_use" || held.HeldMemoryBytes != 1<<30 || held.MemoryCurrentBytes <= 1<<30 {
 		t.Fatalf("usage failed to hold room: %+v", held)
 	}
@@ -277,7 +302,7 @@ while not os.path.exists('/wefty/service/seats/1/home/memory-release'): time.sle
 	run("sh", "-c", "touch /wefty/service/seats/1/home/memory-release")
 	var shrunk SetComputerMemoryLimitResponse
 	for i := 0; ; i++ {
-		shrunk, err = engine.SetComputerMemoryLimit(ctx, SetComputerMemoryLimitRequest{authority, 1 << 30, removed.Generation})
+		shrunk, err = resize(1<<30, removed.Generation)
 		must(err)
 		if shrunk.Reason == "" {
 			break
@@ -288,13 +313,19 @@ while not os.path.exists('/wefty/service/seats/1/home/memory-release'): time.sle
 		time.Sleep(200 * time.Millisecond)
 	}
 	check(shrunk, 1<<30)
+	// 960 MiB remains above the fixed tmpfs floor. This must reach cleanup
+	// proof validation, rather than being hidden by the lower floor refusal.
+	_, err = resize(960<<20, removed.Generation)
+	if !errors.As(err, &refusal) || refusal.Reason != SeatRefusalCleanupNotConfirmed {
+		t.Fatalf("used cleanup proof was reused: %v", err)
+	}
 	// At creation all six memory-backed mounts were bounded by half the cap.
 	// The live operation preserves these ceilings and refuses a lower floor.
-	_, err = engine.SetComputerMemoryLimit(ctx, SetComputerMemoryLimitRequest{authority, 512 << 20, removed.Generation})
+	_, err = resize(512<<20, removed.Generation)
 	if !errors.As(err, &refusal) || refusal.Reason != SeatRefusalTmpfsFloor {
 		t.Fatalf("tmpfs floor not enforced: %v", err)
 	}
-	payload, err := json.MarshalIndent(map[string]any{"version": 1, "acceptance": "RM-5", "platform": "linux/" + runtime.GOARCH, "grow": grown, "held": held, "shrink": shrunk, "cleanup_complete": true, "held_room_visible": true, "tmpfs_floor_refused": true, "image": os.Getenv("WEFTY_SEAT_IMAGE")}, "", "  ")
+	payload, err := json.MarshalIndent(map[string]any{"version": 1, "acceptance": "RM-5", "platform": "linux/" + runtime.GOARCH, "grow": grown, "held": held, "shrink": shrunk, "cleanup_complete": true, "held_room_visible": true, "tmpfs_floor_refused": true, "cleanup_reuse_refused": true, "freezer_checked": true, "image": os.Getenv("WEFTY_SEAT_IMAGE")}, "", "  ")
 	must(err)
 	if output := os.Getenv("WEFTY_HELPER_MEMORY_EVIDENCE"); output != "" {
 		must(os.WriteFile(output, payload, 0600))

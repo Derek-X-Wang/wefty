@@ -436,8 +436,14 @@ If remaining use exceeds the target, the old limit and its full reservation
 stay charged; `held_memory_bytes` reports the difference. Later retries may
 return that room once use falls. Creation-time tmpfs ceilings stay fixed: a
 target below twice their total is refused, with all that room still held.
-Failed grows proven unchanged keep the old reservation; uncertain readback
-keeps the larger reservation. These helper facts do not change L1 room policy
+Grows never freeze or write an old, smaller limit back; a target proved by
+readback is accepted even if its write reported an error. Failed grows proved
+unchanged keep the old reservation. Uncertain readback keeps the larger
+reservation until later exact readback reconciles the proved lower limit.
+Usage-held retries do not freeze. A shrink has one two-second freeze-to-thaw
+deadline and performs no containerd calls while frozen. An abandoned freeze
+is thawed, logged and reported; final `memory_thaw_failed` means the Computer
+may still be frozen. These helper facts do not change L1 room policy
 or implement restart recovery.
 
 The dedicated cap defaults to 1 and counts only currently running Computers

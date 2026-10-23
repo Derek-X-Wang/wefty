@@ -4,6 +4,7 @@ package ocihelper
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -58,4 +59,19 @@ func TestComputerMemoryRoomHeldThroughSessionAcceptance(t *testing.T) {
 	if err != nil || shrunk.ReservedMemoryBytes/(1<<30) != 1 || shrunk.HeldMemoryBytes != 0 || shrunk.MemoryLimitBytes != runtime.limit {
 		t.Fatalf("returned Room through wire: %+v %v", shrunk, err)
 	}
+	// A final thaw failure carries a distinct wire detail and does not lose the
+	// healthy helper session. A later call can recover the abandoned freeze.
+	runtime.frozen = true
+	runtime.thawFailure = errors.New("thaw refused")
+	_, err = session.SetComputerMemoryLimit(t.Context(), req)
+	var rpc *RPCError
+	if !errors.As(err, &rpc) || rpc.Code != CodeSeatOperationRefused || rpc.Detail != "memory_thaw_failed" {
+		t.Fatalf("possible frozen Computer was hidden: %v", err)
+	}
+	runtime.thawFailure = nil
+	recovered, err := session.SetComputerMemoryLimit(t.Context(), req)
+	if err != nil || !recovered.RecoveredFreeze || recovered.FreezeRequests != 0 || runtime.frozen {
+		t.Fatalf("session failed to recover abandoned freeze: %+v %v", recovered, err)
+	}
+
 }

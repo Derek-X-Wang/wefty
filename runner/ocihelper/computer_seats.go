@@ -32,6 +32,7 @@ const (
 	SeatRefusalMemoryCapacity      SeatOperationRefusalReason = "memory_capacity"
 	SeatRefusalMemoryGrowFailed    SeatOperationRefusalReason = "memory_grow_failed"
 	SeatRefusalMemoryBusy          SeatOperationRefusalReason = "memory_busy"
+	SeatRefusalMemoryThawFailed    SeatOperationRefusalReason = "memory_thaw_failed"
 )
 
 type SeatOperationRefusalError struct{ Reason SeatOperationRefusalReason }
@@ -100,11 +101,12 @@ type computerSeatEntry struct {
 // Serialized by the attempt's seatsMu. State belongs to one exact attempt;
 // losing it never creates cleanup evidence. Durable reconciliation is #1142.
 type computerSeats struct {
-	clock      Clock
-	directory  string
-	generation uint64
-	entries    map[int]*computerSeatEntry
-	wanted     []ComputerSeat
+	clock             Clock
+	directory         string
+	generation        uint64
+	entries           map[int]*computerSeatEntry
+	wanted            []ComputerSeat
+	pendingShrinkFrom int64 // old memory limit until an uncertain shrink is read back
 }
 
 func newComputerSeats(clock Clock, directory string) *computerSeats {

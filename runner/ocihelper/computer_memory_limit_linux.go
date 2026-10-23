@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -79,8 +80,10 @@ func (engine *ContainerdEngine) SetComputerMemoryLimit(ctx context.Context, requ
 }
 
 type computerCgroupMemory struct {
-	directory *os.File
-	clock     Clock
+	directory    *os.File
+	clock        Clock
+	freezeWrites int
+	cgroupID     string
 }
 
 func openComputerMemoryRuntime(root, id string, snapshot computerSeatAttemptSnapshot, clock Clock) (*computerCgroupMemory, error) {
@@ -124,10 +127,10 @@ func openComputerMemoryRuntime(root, id string, snapshot computerSeatAttemptSnap
 	if clock == nil {
 		clock = systemClock{}
 	}
-	return &computerCgroupMemory{directory: directory, clock: clock}, nil
+	return &computerCgroupMemory{directory: directory, clock: clock, cgroupID: id}, nil
 }
 func (m *computerCgroupMemory) read(name string) ([]byte, error) {
-	fd, err := unix.Openat(int(m.directory.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(m.directory.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -160,26 +163,34 @@ func (m *computerCgroupMemory) write(name, value string) error {
 func (m *computerCgroupMemory) writeLimit(n int64) error {
 	return m.write("memory.max", strconv.FormatInt(n, 10))
 }
-func (m *computerCgroupMemory) freeze(ctx context.Context) (func() error, error) {
-	prior, err := m.readInt("cgroup.freeze")
-	if err != nil {
-		return nil, err
+func (m *computerCgroupMemory) freezerIO() computerMemoryFreezerIO {
+	return computerMemoryFreezerIO{
+		readRequested: func() (bool, error) {
+			value, err := m.readInt("cgroup.freeze")
+			if err == nil && value > 1 {
+				return false, errors.New("invalid requested freezer state")
+			}
+			return value == 1, err
+		},
+		readEvents: func() ([]byte, error) { return m.read("cgroup.events") },
+		write: func(on bool) error {
+			value := "0"
+			if on {
+				value = "1"
+				m.freezeWrites++
+			}
+			return m.write("cgroup.freeze", value)
+		},
+		log: func(event string) { log.Printf("Computer memory freezer event=%s cgroup_id=%q", event, m.cgroupID) },
 	}
-	if prior != 0 {
-		return nil, &SeatOperationRefusalError{Reason: SeatRefusalMemoryBusy}
-	}
-	thaw := func() error { return m.write("cgroup.freeze", "0") }
-	if err = m.write("cgroup.freeze", "1"); err != nil {
-		return nil, errors.Join(err, thaw())
-	}
-	if err = waitComputerMemoryFrozen(ctx, m.clock, func() ([]byte, error) { return m.read("cgroup.events") }); err != nil {
-		if thawErr := thaw(); thawErr != nil {
-			return nil, fmt.Errorf("thaw Computer after freeze failure: %v; freeze result: %v", thawErr, err)
-		}
-		return nil, err
-	}
-	return thaw, nil
 }
+func (m *computerCgroupMemory) recoverFreeze(ctx context.Context) (bool, error) {
+	return recoverComputerMemoryFreeze(ctx, m.clock, m.freezerIO())
+}
+func (m *computerCgroupMemory) shrink(ctx context.Context, target int64) (computerMemoryShrinkResult, error) {
+	return shrinkComputerMemory(ctx, m.clock, m.freezerIO(), m.readUsage, m.readLimit, m.writeLimit, target)
+}
+func (m *computerCgroupMemory) freezerRequests() int { return m.freezeWrites }
 
 var _ ComputerMemoryLimitEngine = (*ContainerdEngine)(nil)
 

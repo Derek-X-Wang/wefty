@@ -3,8 +3,6 @@ package ocihelper
 import (
 	"context"
 	"errors"
-	"fmt"
-	"strings"
 	"time"
 )
 
@@ -25,6 +23,8 @@ type SetComputerMemoryLimitResponse struct {
 	MemoryCurrentBytes   int64     `json:"memory_current_bytes"`
 	HeldMemoryBytes      int64     `json:"held_memory_bytes"`
 	Reason               string    `json:"reason"`
+	RecoveredFreeze      bool      `json:"recovered_freeze"`
+	FreezeRequests       int       `json:"freeze_requests"`
 }
 type ComputerMemoryLimitEngine interface {
 	SetComputerMemoryLimit(context.Context, SetComputerMemoryLimitRequest) (SetComputerMemoryLimitResponse, error)
@@ -36,10 +36,18 @@ type computerMemoryRuntime interface {
 	readLimit() (int64, error)
 	readUsage() (int64, error)
 	writeLimit(int64) error
-	freeze(context.Context) (func() error, error)
+	recoverFreeze(context.Context) (bool, error)
+	shrink(context.Context, int64) (computerMemoryShrinkResult, error)
+	freezerRequests() int
 }
 
 func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLimitRequest, seats *computerSeats, tmpfsCeiling int64, reserved *int64, available int64, runtime computerMemoryRuntime, clock Clock, validate func() error) (response SetComputerMemoryLimitResponse, err error) {
+	recovered := false
+	initialFreezeRequests := runtime.freezerRequests()
+	defer func() {
+		response.RecoveredFreeze = recovered
+		response.FreezeRequests = runtime.freezerRequests() - initialFreezeRequests
+	}()
 	if request.MemoryBytes <= 0 || request.MemoryBytes%4096 != 0 {
 		return response, errors.New("memory limit must be a positive multiple of 4096 bytes")
 	}
@@ -53,15 +61,40 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 	if err = validate(); err != nil {
 		return response, err
 	}
+	recovered, err = runtime.recoverFreeze(ctx)
+	if err != nil {
+		return response, err
+	}
 	old, err := runtime.readLimit()
 	if err != nil {
 		return response, err
 	}
-	if old <= 0 || old != *reserved {
-		if old > *reserved {
-			*reserved = old
+	if old <= 0 {
+		return response, errors.New("live memory limit must be positive")
+	}
+	consumeCleanup := func() {
+		if seats != nil {
+			for _, entry := range seats.entries {
+				if !entry.wanted && entry.cleaned {
+					entry.memoryReturned = true
+				}
+			}
 		}
-		return response, errors.New("live memory limit differs from its reservation")
+	}
+	if old < *reserved {
+		// A later exact readback completes an earlier uncertain shrink. Release
+		// only the proved difference and include it in this call's grow budget.
+		available += *reserved - old
+		*reserved = old
+	} else if old > *reserved {
+		*reserved = old
+		return response, errors.New("live memory limit exceeds its reservation")
+	}
+	if seats != nil && seats.pendingShrinkFrom > 0 {
+		if old < seats.pendingShrinkFrom {
+			consumeCleanup()
+		}
+		seats.pendingShrinkFrom = 0
 	}
 	target := request.MemoryBytes
 	if target < old {
@@ -86,21 +119,6 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 	if target > old && target-old > available {
 		return response, &SeatOperationRefusalError{Reason: SeatRefusalMemoryCapacity}
 	}
-	if target != old {
-		// Freeze before sampling a shrink, and across a grow's rollback window.
-		// This avoids killing remaining Seats by writing below concurrent use.
-		thaw, freezeErr := runtime.freeze(ctx)
-		if freezeErr != nil {
-			return response, freezeErr
-		}
-		defer func() {
-			if thawErr := thaw(); thawErr != nil {
-				// Do not wrap a prior typed refusal: an unconfirmed thaw is broken,
-				// even when the memory write itself was a recoverable refusal.
-				err = fmt.Errorf("thaw Computer failed: %v; prior result: %v", thawErr, err)
-			}
-		}()
-	}
 	usage, err := runtime.readUsage()
 	if err != nil {
 		return response, err
@@ -114,94 +132,67 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 		response.Reason = "memory_in_use"
 	} else if target != old {
 		if err = ctx.Err(); err != nil {
-			return SetComputerMemoryLimitResponse{}, err
+			return response, err
 		}
+		// All containerd reads precede freeze. shrink performs only cgroup I/O and
+		// finishes thaw before returning, including on error or deadline expiry.
 		if err = validate(); err != nil {
-			return SetComputerMemoryLimitResponse{}, err
+			return response, err
 		}
-		// Reserve the grow first; release a shrink only after kernel readback.
-		if target > old {
+		actual := int64(0)
+		if target < old {
+			var result computerMemoryShrinkResult
+			if seats != nil {
+				seats.pendingShrinkFrom = old
+			}
+			result, err = runtime.shrink(ctx, target)
+			if err != nil {
+				return response, err
+			}
+			if seats != nil {
+				seats.pendingShrinkFrom = 0
+			}
+			actual = result.limit
+			response.MemoryCurrentBytes = result.usage
+			if result.usage > target {
+				response.HeldMemoryBytes = old - target
+				response.Reason = "memory_in_use"
+			} else {
+				consumeCleanup()
+			}
+		} else {
 			*reserved = target
-		}
-		writeErr := runtime.writeLimit(target)
-		actual, readErr := runtime.readLimit()
-		if writeErr != nil || readErr != nil || actual != target {
-			// A failed grow is unchanged only when readback proves it. Otherwise try
-			// to restore it, and retain the larger reservation on any uncertainty.
-			if target > old {
-				if readErr != nil || actual != old {
-					_ = runtime.writeLimit(old)
-					actual, readErr = runtime.readLimit()
-				}
-				if readErr == nil && actual == old {
+			writeErr := runtime.writeLimit(target)
+			var readErr error
+			actual, readErr = runtime.readLimit()
+			if readErr != nil {
+				return response, errors.New("memory grow readback failed; room remains held")
+			}
+			if actual != target {
+				if actual == old {
 					*reserved = old
-					return SetComputerMemoryLimitResponse{}, &SeatOperationRefusalError{Reason: SeatRefusalMemoryGrowFailed}
+					return response, &SeatOperationRefusalError{Reason: SeatRefusalMemoryGrowFailed}
 				}
+				if actual > *reserved {
+					*reserved = actual
+				}
+				return response, errors.New("memory grow could not be confirmed; room remains held")
 			}
-			if readErr == nil && actual > *reserved {
-				*reserved = actual
-			}
-			return SetComputerMemoryLimitResponse{}, errors.New("memory limit update could not be confirmed; room remains held")
+			// The larger limit is already in force. Never undo a grow by writing a
+			// smaller limit, even if the write returned an error.
+			_ = writeErr
 		}
-		if target < old && seats != nil {
-			// The caller requests the final per-Seat target, not a transient usage
-			// sample. Only successful readback consumes cleanup; a held shrink keeps
-			// its proof even if another Seat needs a grow in the meantime.
-			for _, entry := range seats.entries {
-				if !entry.wanted && entry.cleaned {
-					entry.memoryReturned = true
-				}
-			}
+		if actual <= 0 {
+			return response, errors.New("unbounded memory limit readback")
 		}
 		*reserved = actual
 		response.MemoryLimitBytes = actual
 		response.ReservedMemoryBytes = actual
 	}
+	// This can contact containerd only after shrink has completed thaw.
 	if err = validate(); err != nil {
-		return SetComputerMemoryLimitResponse{}, err
+		return response, err
 	}
 	response.ObservedAt = clock.Now().UTC().Round(0)
 	return response, nil
-}
-
-// A freeze can be delayed by an uninterruptible task. This bound belongs to
-// helper state logic and therefore uses the injected clock, including polling.
-func waitComputerMemoryFrozen(ctx context.Context, clock Clock, read func() ([]byte, error)) error {
-	deadline := clock.Now().Add(2 * time.Second)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		data, err := read()
-		if err != nil {
-			return err
-		}
-		frozen := ""
-		for _, line := range strings.Split(string(data), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) > 0 && fields[0] == "frozen" {
-				if len(fields) != 2 || frozen != "" || (fields[1] != "0" && fields[1] != "1") {
-					return errors.New("invalid cgroup freezer evidence")
-				}
-				frozen = fields[1]
-			}
-		}
-		if frozen == "" {
-			return errors.New("missing cgroup freezer evidence")
-		}
-		if !clock.Now().Before(deadline) {
-			return &SeatOperationRefusalError{Reason: SeatRefusalMemoryBusy}
-		}
-		if frozen == "1" {
-			return nil
-		}
-		timer := clock.NewTimerAt(clock.Now().Add(10 * time.Millisecond))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C():
-			timer.Stop()
-		}
-	}
 }

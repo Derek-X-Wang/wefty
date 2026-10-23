@@ -9,6 +9,10 @@ import (
 )
 
 type fakeComputerMemory struct {
+	clock                          Clock
+	freezeCalls                    int
+	applyWriteError                bool
+	readFailures                   int
 	thawFailure                    error
 	limit, usage                   int64
 	writes                         []int64
@@ -17,6 +21,10 @@ type fakeComputerMemory struct {
 }
 
 func (f *fakeComputerMemory) readLimit() (int64, error) {
+	if f.readFailures > 0 && len(f.writes) > 0 {
+		f.readFailures--
+		return 0, errors.New("one readback failed")
+	}
 	if f.badReadback && len(f.writes) > 0 {
 		return 0, errors.New("unreadable")
 	}
@@ -35,17 +43,49 @@ func (f *fakeComputerMemory) writeLimit(n int64) error {
 		return errors.New("shrink raced running allocations")
 	}
 	f.limit = n
+	if f.applyWriteError {
+		return errors.New("write applied then returned an error")
+	}
 	return nil
 }
-func (f *fakeComputerMemory) freeze(context.Context) (func() error, error) {
-	f.frozen = true
-	return func() error { f.frozen = false; return f.thawFailure }, nil
+func (f *fakeComputerMemory) freezerIO() computerMemoryFreezerIO {
+	return computerMemoryFreezerIO{
+		readRequested: func() (bool, error) { return f.frozen, nil },
+		readEvents: func() ([]byte, error) {
+			v := 0
+			if f.frozen {
+				v = 1
+			}
+			return []byte(fmt.Sprintf("frozen %d\n", v)), nil
+		},
+		write: func(on bool) error {
+			if on {
+				f.freezeCalls++
+				f.frozen = true
+				return nil
+			}
+			if f.thawFailure != nil {
+				return f.thawFailure
+			}
+			f.frozen = false
+			return nil
+		},
+	}
 }
+func (f *fakeComputerMemory) recoverFreeze(ctx context.Context) (bool, error) {
+	return recoverComputerMemoryFreeze(ctx, f.clock, f.freezerIO())
+}
+func (f *fakeComputerMemory) shrink(ctx context.Context, target int64) (computerMemoryShrinkResult, error) {
+	return shrinkComputerMemory(ctx, f.clock, f.freezerIO(), f.readUsage, f.readLimit, f.writeLimit, target)
+}
+func (f *fakeComputerMemory) freezerRequests() int { return f.freezeCalls }
+
 func memoryLimitFixture(t *testing.T) (*computerSeats, *fakeComputerMemory, *int64, Clock) {
 	t.Helper()
 	seats, _ := cleanedComputerSeatFixture(t)
 	reserved := int64(1 << 30)
-	return seats, &fakeComputerMemory{limit: reserved, usage: 128 << 20, reserved: &reserved}, &reserved, newManualClock(time.Unix(1234, 0))
+	clock := newManualClock(time.Unix(1234, 0))
+	return seats, &fakeComputerMemory{clock: clock, limit: reserved, usage: 128 << 20, reserved: &reserved}, &reserved, clock
 }
 func TestComputerMemoryLimitGrowShrinkAndHeldRoom(t *testing.T) {
 	s, f, reserved, clock := memoryLimitFixture(t)
@@ -183,6 +223,11 @@ func TestComputerMemoryLimitProtocolAuthorizationAndRefusals(t *testing.T) {
 	if !errors.As(err, &rpc) || rpc.Code != CodeSeatOperationRefused || rpc.Detail != "cleanup_not_confirmed" {
 		t.Fatalf("refusal: %v", err)
 	}
+	e.failure = &SeatOperationRefusalError{Reason: SeatRefusalMemoryThawFailed}
+	_, err = session.SetComputerMemoryLimit(t.Context(), req)
+	if !errors.As(err, &rpc) || rpc.Code != CodeSeatOperationRefused || rpc.Detail != "memory_thaw_failed" {
+		t.Fatalf("frozen-state wire detail: %v", err)
+	}
 	e.failure = errors.New("readback failed")
 	_, err = session.SetComputerMemoryLimit(t.Context(), req)
 	if !errors.As(err, &rpc) || rpc.Code != CodeDiagnosticFailure {
@@ -192,10 +237,10 @@ func TestComputerMemoryLimitProtocolAuthorizationAndRefusals(t *testing.T) {
 
 func TestComputerMemoryFreezeWaitUsesInjectedClock(t *testing.T) {
 	clock := newManualClock(time.Unix(1234, 0))
-	if err := waitComputerMemoryFrozen(t.Context(), clock, func() ([]byte, error) { return []byte("populated 1\nfrozen 1\n"), nil }); err != nil {
+	if err := waitComputerMemoryFrozen(t.Context(), clock, clock.Now().Add(2*time.Second), true, func() ([]byte, error) { return []byte("populated 1\nfrozen 1\n"), nil }); err != nil {
 		t.Fatal(err)
 	}
-	err := waitComputerMemoryFrozen(t.Context(), clock, func() ([]byte, error) { clock.Advance(3 * time.Second); return []byte("populated 1\nfrozen 0\n"), nil })
+	err := waitComputerMemoryFrozen(t.Context(), clock, clock.Now().Add(2*time.Second), true, func() ([]byte, error) { clock.Advance(3 * time.Second); return []byte("populated 1\nfrozen 0\n"), nil })
 	var refusal *SeatOperationRefusalError
 	if !errors.As(err, &refusal) || refusal.Reason != SeatRefusalMemoryBusy {
 		t.Fatalf("freeze deadline: %v", err)
@@ -224,21 +269,23 @@ func TestComputerMemoryLimitCannotReuseReturnedCleanupAfterLaterGrow(t *testing.
 
 func TestComputerMemoryFreezeMalformedEvidenceIsBroken(t *testing.T) {
 	clock := newManualClock(time.Unix(1234, 0))
-	err := waitComputerMemoryFrozen(t.Context(), clock, func() ([]byte, error) { clock.Advance(3 * time.Second); return []byte("populated 1\n"), nil })
+	err := waitComputerMemoryFrozen(t.Context(), clock, clock.Now().Add(2*time.Second), true, func() ([]byte, error) { clock.Advance(3 * time.Second); return []byte("populated 1\n"), nil })
 	var refusal *SeatOperationRefusalError
 	if err == nil || errors.As(err, &refusal) {
 		t.Fatalf("malformed freezer evidence became a retry: %v", err)
 	}
 }
 
-func TestComputerMemoryLimitThawFailureOverridesRecoverableRefusal(t *testing.T) {
+func TestComputerMemoryLimitThawFailureOverridesShrinkWriteFailure(t *testing.T) {
 	s, f, reserved, clock := memoryLimitFixture(t)
+	*reserved = 2 << 30
+	f.limit = 2 << 30
 	f.failWrite = true
 	f.thawFailure = errors.New("thaw failed")
-	_, err := changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: 2 << 30, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	_, err := changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: 1 << 30, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
 	var refusal *SeatOperationRefusalError
-	if err == nil || errors.As(err, &refusal) {
-		t.Fatalf("broken thaw became a recoverable refusal: %v", err)
+	if !errors.As(err, &refusal) || refusal.Reason != SeatRefusalMemoryThawFailed || *reserved != 2<<30 {
+		t.Fatalf("lost possible-frozen state: %v reserved=%d", err, *reserved)
 	}
 }
 
@@ -263,5 +310,104 @@ func TestComputerMemoryLimitHeldCleanupSurvivesInterleavedGrow(t *testing.T) {
 	r, err := call(2 << 30)
 	if err != nil || r.MemoryLimitBytes != 2<<30 || *reserved != 2<<30 {
 		t.Fatalf("grow erased unreturned cleanup proof: %+v %v", r, err)
+	}
+}
+
+func TestComputerMemoryReworkGrowAndHeldNeverFreeze(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	call := func(n int64) (SetComputerMemoryLimitResponse, error) {
+		return changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: n, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	}
+	if _, err := call(2 << 30); err != nil {
+		t.Fatal(err)
+	}
+	f.usage = 1500 << 20
+	for i := 0; i < 5; i++ {
+		r, err := call(1 << 30)
+		if err != nil || r.Reason != "memory_in_use" {
+			t.Fatalf("held: %+v %v", r, err)
+		}
+	}
+	if f.freezeCalls != 0 {
+		t.Fatalf("grow and held retries froze %d times", f.freezeCalls)
+	}
+}
+func TestComputerMemoryReworkAppliedGrowErrorKeepsLargerLimit(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	f.applyWriteError = true
+	r, err := changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: 2 << 30, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	if err != nil || r.MemoryLimitBytes != 2<<30 || *reserved != 2<<30 || len(f.writes) != 1 || f.freezeCalls != 0 {
+		t.Fatalf("applied grow was undone: %+v %v limit=%d writes=%v freezes=%d", r, err, f.limit, f.writes, f.freezeCalls)
+	}
+}
+func TestComputerMemoryReworkLowerReadbackReconcilesReservation(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	*reserved = 2 << 30
+	f.limit = 2 << 30
+	f.readFailures = 1
+	call := func(n int64) (SetComputerMemoryLimitResponse, error) {
+		return changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: n, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	}
+	if _, err := call(1 << 30); err == nil || *reserved != 2<<30 || f.limit != 1<<30 {
+		t.Fatalf("uncertainty did not hold reservation: %v reserved=%d limit=%d", err, *reserved, f.limit)
+	}
+	r, err := call(1 << 30)
+	if err != nil || r.MemoryLimitBytes != 1<<30 || *reserved != 1<<30 {
+		t.Fatalf("exact later readback cannot reconcile: %+v %v reserved=%d", r, err, *reserved)
+	}
+	if _, err = call(2 << 30); err != nil {
+		t.Fatalf("later resize blocked: %v", err)
+	}
+	_, err = call(1 << 30)
+	var refusal *SeatOperationRefusalError
+	if !errors.As(err, &refusal) || refusal.Reason != SeatRefusalCleanupNotConfirmed {
+		t.Fatalf("reconciled shrink left already-returned cleanup reusable: %v", err)
+	}
+}
+func TestComputerMemoryReworkNeverValidatesWhileFrozen(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	*reserved = 2 << 30
+	f.limit = 2 << 30
+	validations := 0
+	r, err := changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: 1 << 30, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error {
+		validations++
+		if f.frozen {
+			return errors.New("containerd call inside freeze")
+		}
+		return nil
+	})
+	if err != nil || r.MemoryLimitBytes != 1<<30 || validations < 2 {
+		t.Fatalf("validation span: %+v %v calls=%d", r, err, validations)
+	}
+}
+
+func TestComputerMemoryReworkAbandonedFreezeIsReported(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	f.frozen = true
+	r, err := changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: 2 << 30, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	if err != nil || !r.RecoveredFreeze || r.FreezeRequests != 0 || f.frozen {
+		t.Fatalf("abandoned freeze not recovered and reported: %+v %v", r, err)
+	}
+}
+
+func TestComputerMemoryReworkFailedGrowReconcileKeepsCleanup(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	*reserved = 2 << 30
+	f.limit = 2 << 30
+	f.failWrite = true
+	f.readFailures = 1
+	call := func(n int64) (SetComputerMemoryLimitResponse, error) {
+		return changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: n, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	}
+	if _, err := call(3 << 30); err == nil || *reserved != 3<<30 {
+		t.Fatalf("failed grow did not retain uncertainty: %v reserved=%d", err, *reserved)
+	}
+	f.failWrite = false
+	if _, err := call(2 << 30); err != nil || *reserved != 2<<30 {
+		t.Fatalf("failed grow did not reconcile: %v", err)
+	}
+	r, err := call(1 << 30)
+	if err != nil || r.MemoryLimitBytes != 1<<30 {
+		t.Fatalf("reconciling failed grow consumed unrelated cleanup: %+v %v", r, err)
 	}
 }
