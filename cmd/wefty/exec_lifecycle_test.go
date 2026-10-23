@@ -428,7 +428,7 @@ func (w *execReviewOutput) String() string {
 // the command. Concurrent runs with the production period make that likely.
 func TestExecWrapperEndsWellInsideAHeartbeatPeriod(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	old := execHeartbeatSeconds
 	execHeartbeatSeconds = "60"
 	t.Cleanup(func() { execHeartbeatSeconds = old })
@@ -470,7 +470,7 @@ func TestExecWrapperEndsWhenTheCommandLocksStorage(t *testing.T) {
 		t.Skip("root ignores the directory mode this test relies on")
 	}
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	old := execHeartbeatSeconds
 	execHeartbeatSeconds = "60"
 	t.Cleanup(func() { execHeartbeatSeconds = old })
@@ -512,7 +512,7 @@ func runExecWrapperPromptly(t *testing.T, wrapper string, want int) string {
 
 func TestExecHeartbeatStopsAtCommandEnd(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	shortenExecTimers(t)
 	execHeartbeatSeconds = "0.02"
 	repo := execTestRepo(t)

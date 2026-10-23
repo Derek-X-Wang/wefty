@@ -45,7 +45,7 @@ func newExecFleet(t *testing.T, capBytes int64, remoteSlots ...int) *execFleet {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("TMPDIR", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	network := plain.NewNetwork()
 	control := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	ledger := network.NewFabric(fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})

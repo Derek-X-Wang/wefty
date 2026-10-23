@@ -64,6 +64,44 @@ func waitExecPath(t *testing.T, path string, present bool) {
 	}
 }
 
+// execTestStorageRoot gives a test its own exec storage root. Retirement
+// returns before its detached delete step ends, so wait for every delete step
+// in the root before TempDir removes it (#1220). Cleanups run last in, first
+// out: this wait follows the test's own cleanups.
+func execTestStorageRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", root)
+	t.Cleanup(func() { waitExecDeleteSteps(t, root) })
+	return root
+}
+
+// waitExecDeleteSteps waits until root holds no renamed capture and no delete
+// marker. A symlink with a trash name is never deleted, so it is no sign of a
+// running step. The test context has ended by cleanup time, so poll the clock.
+func waitExecDeleteSteps(t *testing.T, root string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var busy []string
+		entries, _ := os.ReadDir(root)
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.Type()&os.ModeSymlink == 0 && (strings.HasPrefix(name, ".wefty-trash-") || strings.HasPrefix(name, ".wefty-delete-")) {
+				busy = append(busy, name)
+			}
+		}
+		if len(busy) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("exec delete steps still own %s: %v", root, busy)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // A missing capture path proves retirement only. Check the root too, so a
 // leaked temp file under renamed trash cannot masquerade as deletion.
 func waitExecStorageEmpty(t *testing.T, root string) {
@@ -257,7 +295,7 @@ func TestExecSweepOldCaptureRetiresBeforeDeletion(t *testing.T) {
 }
 
 func TestExecMissingCaptureWrapperReason(t *testing.T) {
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	capture, err := captureExec(t.Context(), execTestRepo(t))
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +437,7 @@ func TestExecRetirementTempLinkSafety(t *testing.T) {
 func TestExecTempSetupFailureIsInfrastructure(t *testing.T) {
 	for _, step := range []string{"folder", "link"} {
 		t.Run(step, func(t *testing.T) {
-			t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+			execTestStorageRoot(t)
 			capture, err := captureExec(t.Context(), execTestRepo(t))
 			if err != nil {
 				t.Fatal(err)
@@ -471,7 +509,7 @@ func TestExecTempLinkRemovalFailurePreservesVerdict(t *testing.T) {
 }
 
 func TestExecTempLinkRetriesCollision(t *testing.T) {
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	capture, err := captureExec(t.Context(), execTestRepo(t))
 	if err != nil {
 		t.Fatal(err)
