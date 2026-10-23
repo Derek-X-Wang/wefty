@@ -24,6 +24,38 @@ import (
 
 const controlChildEnvironment = "WEFTY_OCI_CONTROL_CHILD"
 
+func TestRecreateRefusalDetailsOmitEmptyFields(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		failure         *lima.RecreateBlockedError
+		present, absent string
+	}{
+		{"retained", &lima.RecreateBlockedError{Blockers: []string{"Computer computer_kept Storage storage_kept generation 2"}}, "blockers", "reason"},
+		{"unknown", &lima.RecreateBlockedError{Reason: "disk inventory unavailable"}, "reason", "blockers"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			writeControlResponse(recorder, nil, test.failure)
+			var response contract.ErrorResponse
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			if recorder.Code != 409 || response.Error.Code != ErrorHostVMRecreateBlocked || response.Error.Retryable {
+				t.Fatalf("bad refusal: %s", recorder.Body.String())
+			}
+			if _, ok := response.Error.Details[test.present]; !ok {
+				t.Fatalf("missing %s", test.present)
+			}
+			if _, ok := response.Error.Details[test.absent]; ok {
+				t.Fatalf("empty %s must be omitted: %s", test.absent, recorder.Body.String())
+			}
+			if test.name == "unknown" && !strings.Contains(response.Error.Message, "not retried automatically") {
+				t.Fatalf("unknown inventory lacks manual recovery guidance: %s", recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestControlResponsePreservesSanitizedHelperMechanics(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writeControlResponse(recorder, nil, &ocihelper.RPCError{

@@ -200,7 +200,7 @@ func classifyCommandReport(err error) commandReport {
 		contract.ErrorStorageReferenceConflict, contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict,
 		contract.ErrorInstanceKeyConflict, contract.ErrorInstanceKeyNotSupported, contract.ErrorFinalAdmin,
 		contract.ErrorCapacityExhausted, contract.ErrorComputerResourceRequired, contract.ErrorComputerTraitRequired,
-		contract.ErrorControllerBusy, contract.ErrorControllerAlreadyHeld:
+		contract.ErrorControllerBusy, contract.ErrorControllerAlreadyHeld, ocicontrol.ErrorHostVMRecreateBlocked:
 		report.exitCode = exitConflict
 	}
 	return report

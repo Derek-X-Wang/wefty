@@ -151,7 +151,7 @@ func executeLocalSetupOCI(ctx context.Context, client *ocicontrol.Client, jsonOu
 	}
 	sizing := lima.BindSizingFlags(flags, defaults)
 	applyRestart := flags.Bool("apply-restart", false, "apply restart-required Lima template changes")
-	recreate := flags.Bool("recreate", false, "apply recreate-required Lima template changes with zero live OCI attempts")
+	recreate := flags.Bool("recreate", false, "apply recreate-required Lima template changes only with zero live OCI attempts and proven absence of Computer Storage and Backup copies")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}

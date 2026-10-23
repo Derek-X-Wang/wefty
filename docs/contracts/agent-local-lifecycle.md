@@ -271,6 +271,71 @@ convergence, so doctor derives unchanged, live-safe, restart-required, or
 recreate-required by comparing current with desired rather than echoing the
 last probe reason.
 
+Every host VM recreate, including a per-user installation's recreate, passes
+the same guard immediately before Lima deletion, under the Lima lifecycle
+lock and after OCI admission and resident work have quiesced. Zero live
+attempts alone never authorize deletion. Any Computer Storage generation or
+Backup copy on that disk refuses the recreate, including stopped Computers,
+staging and retired generations, quarantined Storage, and unresolved reset
+records. There is no acknowledged-loss override.
+
+The guard reads the helper's durable guest files. The node agent's local spool
+records removal acknowledgements, not a complete inventory of physical copies;
+the helper's namespace Verify inventory also omits Backup copies. Neither an
+empty spool nor an empty runtime inventory proves an empty host VM disk. The
+shipped Lima helper uses `/var/lib/wefty/oci`; a different helper command or
+runtime-root override is unknown and refuses. With the host VM known running,
+the guard stops both the helper socket and service, joins their stop, and
+inspects `computer-disks`, `computer-backups`, `computer-disk-quarantine` and
+`computer-storage-resets`. Entries block except for
+`computer-backups/supersessions`, which contains removal and supersession
+records rather than Backup copies. That folder must be a real directory of
+regular files named `wefty-backup-copy-<32 lowercase hex>.json` or
+`.supersession.tmp-*` with a nonempty suffix, as written by the helper. Any other
+filename blocks as an unexpected Backup supersession entry; a symlink,
+subdirectory or other non-regular entry refuses.
+Losing these records during recreation is acceptable once the guard has proved
+that no source Storage or Backup copy remains on the disk. Copy folders still
+block when those records are present. A directory in `computer-disks` holding
+only a regular `attachment.lock` and `copy-refused.json` also blocks, but is
+reported as a refused Computer copy record rather than a Storage generation.
+
+A missing namespace directory is absence only after successful enumeration of
+its parent; an empty namespace needs a successful directory read. The runtime
+root is created lazily. Its absence counts as empty only after its real parent
+`/var/lib/wefty` enumerates successfully; an unavailable parent remains unknown.
+Symlinks, non-directories, failed reads, malformed or incomplete answers and
+unavailable inventory all refuse. The script restores socket activation on
+refusal and handles EXIT, HUP, INT and TERM while ignoring PIPE. Go also makes
+a bounded best-effort socket-start attempt after a non-nil guard result when
+the inventory command was attempted (including rejected output, cancellation
+and timeout), and after failed Lima deletion. Before inventory is attempted,
+refusal does not access the guest or attempt socket restoration. A restoration
+attempt uses a context independent of the canceled request and the ordinary
+command timeout. A failed restoration is logged without replacing
+the original refusal. A successful empty inspection leaves the helper stopped
+until host VM deletion, so no helper operation can create bytes between the
+check and deletion.
+
+A stopped, broken or unknown host VM never starts just to answer this guard.
+Without a complete durable host-side absence record its inventory is unknown,
+so recreation refuses and explains that the owner must start OCI before a new
+inspection. A proven empty disk still permits recreation through the ordinary
+template/start/recovery path. No Storage or Backup is moved or deleted to make
+recreation pass.
+
+The node-local refusal is HTTP 409 `host_vm_recreate_blocked`, CLI exit 5,
+`retryable=false`. Its message and `details.blockers` name the blocking
+Computer and Storage IDs and generation, or Backup and copy IDs, read from
+regular helper identity manifests. A missing or invalid manifest still blocks
+and is explicitly labeled identity unavailable; it never proves absence.
+The message tells the owner to remove or export the named Computer or Backup
+before manually rerunning setup. `details.reason` explains an unknown inventory
+and the error says no automatic retry occurs. Empty `blockers` and `reason`
+fields are omitted. Raw guest command output is never part of the refusal.
+The real CLI binary checks this typed exit. A source-guard test confines host
+VM delete calls to `runner/lima/supervisor.go`.
+
 Singular `wefty node` commands resolve the installed node configuration before
 Fabric initialization and use only the live agent's Unix control socket. The
 configuration has two valid shapes: an OCI installation names its absolute
