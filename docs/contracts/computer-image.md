@@ -777,6 +777,12 @@ Unix sockets in the Seat's mode-0700 runtime folder. Only that Seat's uid and
 root can open them. The underlying `view.sock` and `control.sock` RFB sockets
 are equally private. `/websockify` and the `binary` subprotocol stay unchanged.
 View still drops pointer and key input server-side; control accepts it.
+The root supervisor opens endpoint parents without following links, requires
+Seat-owned private socket files, and compares parent and socket device/inode
+identities before connection and after the greeting. Linux peer uid checks
+also reject a link-and-restore to another Seat during connect. Links or
+replacements cannot earn image readiness; the helper still makes its own
+independent descriptor-anchored probes.
 X TCP stays disabled and each display requires its own private X cookie.
 
 The helper returns opaque view/control endpoint names in each ready Seat
@@ -789,9 +795,12 @@ a later successful observation publishes fresh names after desktop recovery.
 Both `default-computer-seats / linux/amd64` and `/ linux/arm64` in
 `computer-seats.yml` attempt real connections from each Seat uid to the other
 Seat's view/control edges and RFB backends, and try the other display with the
-wrong cookie. The lane also keeps a neighbouring Computer live, brackets its
-refusal checks with real RFB liveness, and tries its known socket paths and
-abstract X token. Missing crossover observations keep `IM-4.endpoints`
+wrong cookie. Both live Computers also have Seat 1 with identical uid and
+socket paths but different frame colours. Probes from each Seat user must
+show only that Computer's colour. The helper lane checks those colours through
+its named streams too, bracketing cross-Computer name refusals. A distinct live
+abstract X token additionally tests network-namespace separation. Missing
+crossover observations keep `IM-4.endpoints`
 `NOT-RUN`; an observed successful crossover fails conformance.
 
 At startup the root supervisor refuses a non-root-owned or group/other-writable
@@ -810,6 +819,11 @@ On Linux this is `chown 0:0 <storage-root>` and `chmod 0755 <storage-root>`.
 Fix the root only; do not recursively change Seat or shared-file ownership.
 The root supervisor refuses unsafe ownership or write permission rather than
 silently trusting a tenant-writable parent.
+
+The removal lane checks all four `.ws`/`.sock` paths with `lstat` and scans
+that Computer's `/proc/net/unix` for the Seat prefix and both display tokens.
+A dangling endpoint path or an unlinked-but-live socket fails absence; closed
+legacy TCP ports do not prove Seat cleanup.
 
 Cleanup kills every process carrying the Seat uid, including detached and
 double-forked children. It removes that uid's SysV shared memory, semaphore

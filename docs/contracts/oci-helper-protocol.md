@@ -2270,7 +2270,9 @@ claim. A previously ready unchanged Seat must have a current-generation ready
 answer and fresh greeting checks before readiness carries into a later
 generation. A previously ready Seat reports `starting` after another place
 changes until the image rewrites its answer; that path has no readiness
-deadline. Failed Seats never retry merely because another place changed.
+deadline. A failed re-probe of an already ready Seat also returns `starting`
+without a new deadline; the image's restart limit eventually reports `failed`.
+Failed Seats never retry merely because another place changed.
 Seat work uses its own mutex. Probes and absence scans hold neither the
 attempt lifecycle mutex nor its owner-control mutex. The helper copies the
 task and duplicates the pinned network namespace, then rechecks exact attempt
@@ -2696,7 +2698,22 @@ ownership. Symlinked components, wrong owners or permissions, a socket from
 another Computer, and replacements are refused. Path changes after the last
 check cannot redirect an already connected descriptor. Observation may mint
 fresh endpoint names after a legitimate edge restart; old names stay invalid.
-Pins close on withdrawal, removal, replacement and attempt runtime release.
+Pins close on withdrawal, removal and replacement. Delete first retires attempt
+identity, then closes ready and provisional socket pins before container removal
+or Computer disk detachment. Sweep and direct recovery detach do the same.
+Runtime release repeats retirement idempotently before forgetting the attempt.
+Retirement uses a separate descriptor registry, never `seatsMu`, and cannot wait
+behind a greeting, task RPC, dial backlog or relay. Its short mutex covers only
+local no-follow descriptor walks, registration and close. It never covers network
+I/O. Retirement is permanent: late probes cannot open new pins, and final attempt
+validation prevents publishing stale observations or successful dials.
+Connection uses one `SOCK_NONBLOCK` Unix connect syscall; a full backlog returns
+endpoint unavailable for retry. `os.File` descriptor control guards the fd
+number for that syscall, so concurrent close cannot reuse it and redirect
+a connection. No blocking network wait retains a transient disk pin.
+Post-detach verification is never the first place these filesystem references
+are released. Attach rollback and offline copy mounts have no running Seats;
+reset/recreate requires the preceding attempt's detachment.
 
 Dials and probes use only the Seat mutex during I/O, never the attempt
 lifecycle or owner-control mutex. The stream's success frame and backend-ready
@@ -2717,7 +2734,10 @@ Rootless Linux unit tests attempt old-identity, symlink, replacement-during-
 connect and cross-root dials. `TestHelperSeatEndpointIM4`, tagged
 `linux && computer_seat_lane`, runs two live production-profile Computers,
 probes both named endpoint kinds, refuses old attempts and cross-Seat and
-cross-Computer names before stream readiness, then attempts real connections
-from a Seat uid to another Seat's endpoints/display and a neighbour's sockets
-and abstract display. It runs only as root in `computer-seats.yml`, in
+cross-Computer names before stream readiness, and gives both Computers Seat 1
+with identical uid and socket paths. One desktop stays red and the other is
+turned green. Frame probes run through each Computer's `DialSeatEndpoint`
+stream, so wrong-root observation or dial fails even if name checks agree.
+It also tries other-Seat endpoints/display and a neighbour's live abstract
+display. It runs only as root in `computer-seats.yml`, in
 `default-computer-seats / linux/amd64` and `/ linux/arm64`.

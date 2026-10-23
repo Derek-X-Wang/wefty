@@ -2,9 +2,11 @@ package ocihelper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 )
 
 const MethodDialSeatEndpoint Method = "DialSeatEndpoint"
@@ -47,7 +49,11 @@ func (s *computerSeats) endpoint(r DialSeatEndpointRequest) (string, error) {
 }
 func (e *computerSeatEntry) closeEndpointPins() {
 	for _, f := range e.endpointPins {
-		f.Close()
+		if e.pinOwner != nil {
+			e.pinOwner.closeEndpointPin(f)
+		} else {
+			f.Close()
+		}
 	}
 	e.endpointPins = nil
 }
@@ -61,4 +67,52 @@ func (e *computerSeatEntry) endpointName(kind string) string {
 		name = fmt.Sprintf("%s-%d", name, e.endpointRevision)
 	}
 	return name
+}
+
+// beforeDiskDetach runs after attempt authority is retired, without seatsMu.
+// Keeping the detach call here makes the descriptor-release order explicit.
+func (s *computerSeats) beforeDiskDetach(detach func() error) error {
+	s.closeEndpointPins()
+	return detach()
+}
+
+// Retirement is permanent and independent of entries, which may be changing
+// under seatsMu. It closes ready AND provisional pins before unmount begins.
+func (s *computerSeats) closeEndpointPins() {
+	if s == nil {
+		return
+	}
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	s.pinsRetired = true
+	for pin := range s.pins {
+		pin.Close()
+		delete(s.pins, pin)
+	}
+}
+
+// openEndpointPin keeps the short no-follow filesystem walk atomic with
+// retirement. The callback must only open/validate local descriptors; it must
+// never probe a listener, dial, call containerd or wait for another goroutine.
+func (s *computerSeats) openEndpointPin(open func() (*os.File, error)) (*os.File, error) {
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	if s.pinsRetired {
+		return nil, errors.New("Computer Seat endpoints retired")
+	}
+	pin, err := open()
+	if err != nil {
+		return nil, err
+	}
+	if s.pins == nil {
+		s.pins = map[*os.File]struct{}{}
+	}
+	s.pins[pin] = struct{}{}
+	return pin, nil
+}
+func (s *computerSeats) closeEndpointPin(pin *os.File) {
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	pin.Close()
+	delete(s.pins, pin)
 }

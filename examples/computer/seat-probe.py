@@ -12,7 +12,11 @@ import time
 class WS:
     def __init__(self, port, host="127.0.0.1"):
         self.deadline = time.monotonic() + 15
-        if isinstance(port, str) and port.startswith('/'):
+        if isinstance(port, str) and port.startswith('fd:'):
+            # The native helper lane passes its already-authorized stream.
+            self.s = socket.socket(fileno=int(port[3:]))
+            self.s.settimeout(10)
+        elif isinstance(port, str) and port.startswith('/'):
             self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.s.settimeout(10)
             self.s.connect(port)

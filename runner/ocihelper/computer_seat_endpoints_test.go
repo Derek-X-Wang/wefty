@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -171,4 +172,92 @@ func TestSeatEndpointFromNeighbourComputerIsRefused(t *testing.T) {
 	if _, err := second.endpoint(DialSeatEndpointRequest{Generation: 1, Place: 1, Name: name}); err == nil {
 		t.Fatal("neighbour Computer endpoint accepted")
 	}
+}
+
+func TestSeatEndpointPinsCloseBeforeDiskDetachEvenWhenDetachFails(t *testing.T) {
+	s := newComputerSeats(nil, t.TempDir())
+	var pins []*os.File
+	for _, place := range []int{1, 2} {
+		entry := &computerSeatEntry{endpointPins: map[string]*os.File{}, pinOwner: s}
+		s.entries[place] = entry
+		for _, kind := range []string{"view", "control"} {
+			pin, err := s.openEndpointPin(func() (*os.File, error) { return os.Open(t.TempDir()) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pin.Close()
+			pins = append(pins, pin)
+			entry.endpointPins[kind] = pin
+		}
+	}
+	detachFailure := errors.New("detach failed after descriptor release")
+	called := false
+	err := s.beforeDiskDetach(func() error {
+		called = true
+		for _, pin := range pins {
+			if _, err := pin.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Errorf("socket descriptor still open when detach begins: %v", err)
+			}
+		}
+		return detachFailure
+	})
+	if !called || !errors.Is(err, detachFailure) {
+		t.Fatalf("detach outcome lost: called=%v err=%v", called, err)
+	}
+	for _, entry := range s.entries {
+		for _, pin := range entry.endpointPins {
+			if _, err := pin.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Errorf("published pin remains usable: %v", err)
+			}
+		}
+	}
+	// A failed detach can be retried; no descriptors may be reopened by retry.
+	if err := s.beforeDiskDetach(func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A greeting can stall before an opened endpoint becomes a ready Seat pin.
+// Detach must release that filesystem reference too, and a late probe must
+// never reopen the retired Computer's filesystem.
+func TestSeatEndpointRetirementClosesProvisionalPinsAndRefusesLateOpen(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newComputerSeats(nil, t.TempDir())
+		open := func() (*os.File, error) { return os.Open(t.TempDir()) }
+		provisional, err := s.openEndpointPin(open)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer provisional.Close()
+		probeEntered, finishProbe := make(chan struct{}), make(chan struct{})
+		go func() { close(probeEntered); <-finishProbe; s.closeEndpointPin(provisional) }()
+		<-probeEntered
+		detached := make(chan error, 1)
+		go func() {
+			detached <- s.beforeDiskDetach(func() error {
+				if _, err := provisional.Stat(); !errors.Is(err, os.ErrClosed) {
+					t.Errorf("in-flight probe retained a filesystem reference at detach: %v", err)
+				}
+				return nil
+			})
+		}()
+		synctest.Wait()
+		select {
+		case err := <-detached:
+			if err != nil {
+				t.Error(err)
+			}
+		default:
+			t.Error("disk detach waited behind an in-flight probe")
+		}
+		opened := false
+		late, err := s.openEndpointPin(func() (*os.File, error) { opened = true; return open() })
+		if late != nil {
+			late.Close()
+		}
+		if err == nil || opened {
+			t.Errorf("retired attempt reopened an endpoint: opened=%v err=%v", opened, err)
+		}
+		close(finishProbe)
+	})
 }

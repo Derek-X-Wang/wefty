@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 )
 
@@ -93,6 +94,7 @@ type computerSeatAnswer struct {
 type computerSeatEntry struct {
 	incarnation      uint64
 	endpointPins     map[string]*os.File
+	pinOwner         *computerSeats
 	endpointRevision uint64
 	endpointScope    string
 	config           ComputerSeat
@@ -115,6 +117,12 @@ type computerSeats struct {
 	entries           map[int]*computerSeatEntry
 	wanted            []ComputerSeat
 	pendingShrinkFrom int64 // old memory limit until an uncertain shrink is read back
+
+	// pinMu never covers task RPCs, network waits, greetings or seatsMu.
+	// Only bounded local descriptor operations and the pin registry use it.
+	pinMu       sync.Mutex
+	pinsRetired bool
+	pins        map[*os.File]struct{}
 }
 
 func newComputerSeats(clock Clock, directory string) *computerSeats {
@@ -194,7 +202,7 @@ func (s *computerSeats) apply(wanted []ComputerSeat) (ApplyComputerSeatsResponse
 	for _, config := range wanted {
 		entry := s.entries[config.Place]
 		if entry == nil || !entry.wanted {
-			entry = &computerSeatEntry{endpointScope: s.endpointScope, incarnation: generation, config: config, deadline: started.Add(ComputerSeatReadinessTimeout)}
+			entry = &computerSeatEntry{pinOwner: s, endpointScope: s.endpointScope, incarnation: generation, config: config, deadline: started.Add(ComputerSeatReadinessTimeout)}
 			s.entries[config.Place] = entry
 		}
 		entry.wanted = true

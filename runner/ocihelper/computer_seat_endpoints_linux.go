@@ -62,22 +62,59 @@ func sameSeatSocket(a, b *os.File) bool {
 	bi, be := b.Stat()
 	return ae == nil && be == nil && os.SameFile(ai, bi)
 }
-func dialSeatSocket(ctx context.Context, root string, place int, kind string, uid uint32, expected *os.File) (net.Conn, error) {
-	return dialSeatSocketWith(ctx, root, place, kind, uid, expected, func(ctx context.Context, address string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", address)
-	})
-}
 
-func dialSeatSocketWith(ctx context.Context, root string, place int, kind string, uid uint32, expected *os.File, connect func(context.Context, string) (net.Conn, error)) (net.Conn, error) {
-	pin, err := openSeatEndpoint(root, place, kind, uid)
+// A Unix connect must not wait for a full listener backlog while retaining an
+// ext4 inode. SOCK_NONBLOCK refuses a busy endpoint immediately. Control keeps
+// the descriptor number from being reused until the one connect syscall ends;
+// retirement may close it concurrently without redirecting the connection.
+func connectSeatSocket(ctx context.Context, pin *os.File) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
 	}
-	defer pin.Close()
+	socket := os.NewFile(uintptr(fd), "Seat endpoint connection")
+	defer socket.Close()
+	raw, err := pin.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var connectErr error
+	if err := raw.Control(func(pinned uintptr) {
+		connectErr = unix.Connect(fd, &unix.SockaddrUnix{Name: fmt.Sprintf("/proc/self/fd/%d", pinned)})
+	}); err != nil {
+		return nil, err
+	}
+	if connectErr != nil {
+		return nil, connectErr
+	}
+	return net.FileConn(socket)
+}
+
+func dialSeatSocket(ctx context.Context, root string, place int, kind string, uid uint32, expected *os.File) (net.Conn, error) {
+	return dialSeatSocketWith(ctx, root, place, kind, uid, expected, connectSeatSocket)
+}
+
+// The standalone wrapper is used by socket unit tests. Real attempt operations
+// share the attempt's registry so retirement also closes their provisional pins.
+func dialSeatSocketWith(ctx context.Context, root string, place int, kind string, uid uint32, expected *os.File, connect func(context.Context, *os.File) (net.Conn, error)) (net.Conn, error) {
+	seats := newComputerSeats(nil, "")
+	defer seats.closeEndpointPins()
+	return seats.dialSeatSocket(ctx, root, place, kind, uid, expected, connect)
+}
+
+func (s *computerSeats) dialSeatSocket(ctx context.Context, root string, place int, kind string, uid uint32, expected *os.File, connect func(context.Context, *os.File) (net.Conn, error)) (net.Conn, error) {
+	pin, err := s.openEndpointPin(func() (*os.File, error) { return openSeatEndpoint(root, place, kind, uid) })
+	if err != nil {
+		return nil, err
+	}
+	defer s.closeEndpointPin(pin)
 	if !sameSeatSocket(pin, expected) {
 		return nil, errors.New("Seat endpoint was replaced")
 	}
-	c, err := connect(ctx, fmt.Sprintf("/proc/self/fd/%d", pin.Fd()))
+	c, err := connect(ctx, pin)
 	if err != nil {
 		return nil, err
 	}
@@ -96,11 +133,11 @@ func dialSeatSocketWith(ctx context.Context, root string, place int, kind string
 	}
 	// Refuse a rename/unlink during connect even though the descriptor kept the
 	// connection on the original inode. No replacement ever receives the dial.
-	after, err := openSeatEndpoint(root, place, kind, uid)
+	after, err := s.openEndpointPin(func() (*os.File, error) { return openSeatEndpoint(root, place, kind, uid) })
 	if err != nil {
 		return fail(err)
 	}
-	defer after.Close()
+	defer s.closeEndpointPin(after)
 	if !sameSeatSocket(pin, after) {
 		return fail(errors.New("Seat endpoint changed during connect"))
 	}
@@ -143,7 +180,7 @@ func (engine *ContainerdEngine) DialSeatEndpoint(ctx context.Context, r DialSeat
 		attempt.seatsMu.Unlock()
 		return err
 	}
-	backend, err := dialSeatSocket(ctx, proc+"/root", r.Place, kind, uint32(2000+r.Place), snapshot.seats.entries[r.Place].endpointPins[kind])
+	backend, err := snapshot.seats.dialSeatSocket(ctx, proc+"/root", r.Place, kind, uint32(2000+r.Place), snapshot.seats.entries[r.Place].endpointPins[kind], connectSeatSocket)
 	if err == nil {
 		err = engine.validateComputerSeatAttempt(ctx, r.Authority, attempt, snapshot)
 	}
@@ -153,7 +190,7 @@ func (engine *ContainerdEngine) DialSeatEndpoint(ctx context.Context, r DialSeat
 			backend.Close()
 		}
 		reason := SeatRefusalEndpointChanged
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, unix.EAGAIN) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			reason = SeatRefusalEndpointUnavailable
 		}
 		return &SeatOperationRefusalError{Reason: reason}

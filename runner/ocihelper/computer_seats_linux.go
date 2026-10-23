@@ -35,10 +35,16 @@ func (engine *ContainerdEngine) ApplyComputerSeats(ctx context.Context, request 
 		return ApplyComputerSeatsResponse{}, err
 	}
 	defer snapshot.namespace.close()
-	if attempt.seats == nil {
+	attempt.mu.Lock()
+	if attempt.seats == nil && !attempt.deleted && attempt.networkNamespace == snapshot.sourceNamespace {
 		attempt.seats = newComputerSeats(engine.config.Clock, snapshot.directory)
 	}
-	response, err := attempt.seats.apply(request.Seats)
+	seats := attempt.seats
+	attempt.mu.Unlock()
+	if seats == nil {
+		return ApplyComputerSeatsResponse{}, errors.New("Computer attempt lost its Seat authority")
+	}
+	response, err := seats.apply(request.Seats)
 	if err != nil {
 		return ApplyComputerSeatsResponse{}, err
 	}
@@ -145,7 +151,7 @@ func observeComputerSeatFiles(ctx context.Context, snapshot computerSeatAttemptS
 	defer func() {
 		for _, p := range pins {
 			for _, f := range p {
-				f.Close()
+				snapshot.seats.closeEndpointPin(f)
 			}
 		}
 	}()
@@ -156,15 +162,15 @@ func observeComputerSeatFiles(ctx context.Context, snapshot computerSeatAttemptS
 				if !entry.wanted || !matches {
 					continue
 				}
-				pin, err := openSeatEndpoint(proc+"/root", place, kind, uint32(2000+place))
+				pin, err := snapshot.seats.openEndpointPin(func() (*os.File, error) { return openSeatEndpoint(proc+"/root", place, kind, uint32(2000+place)) })
 				if err != nil {
 					return err
 				}
 				err = probeComputerSeatGreeting(ctx, func(ctx context.Context) (net.Conn, error) {
-					return dialSeatSocket(ctx, proc+"/root", place, kind, uint32(2000+place), pin)
+					return snapshot.seats.dialSeatSocket(ctx, proc+"/root", place, kind, uint32(2000+place), pin, connectSeatSocket)
 				})
 				if err != nil {
-					pin.Close()
+					snapshot.seats.closeEndpointPin(pin)
 					return err
 				}
 				if pins[place] == nil {

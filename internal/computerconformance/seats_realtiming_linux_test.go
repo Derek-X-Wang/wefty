@@ -138,30 +138,42 @@ for port in (7102,7103,7104,7105):
 `, pair[1]))
 	}
 	evidence.Observations["other_endpoints_refused"] = true
-	// Keep the target Computer live on a different display number. Its known
-	// filesystem endpoints and abstract X socket must be absent in this Computer.
+	// Both Computers use Seat 1 and its identical socket names. Different
+	// colours prove their roots stay separate; display 3 adds an abstract-socket refusal.
 	peerRoot := t.TempDir()
 	peer := startSeatComputer(t, ctx, client, image, peerRoot, filepath.Join(peerRoot, "managed/service"), kit)
-	peer.directive(1, 3)
+	peer.directive(1, 1, 3)
+	peer.ready(1)
 	peer.ready(3)
-	peer.probe("frame", 3, "aa00aa")
+	h.probe("frame", 1, "00ff00")
+	peer.probe("frame", 1, "ff0000")
+	script, err := os.ReadFile("../../examples/computer/seat-probe.py")
+	seatMust(t, err)
+	// Same uid and socket spelling in both Computers must show their own colour.
+	localFrames := func() {
+		t.Log(h.exec("2001:2001", "python3", "-c", string(script), "frame", "/wefty/service/seats/1/run/view.ws", "00ff00"))
+		t.Log(peer.exec("2001:2001", "python3", "-c", string(script), "frame", "/wefty/service/seats/1/run/view.ws", "ff0000"))
+	}
+	localFrames()
 	peerLocal := func() {
-		peer.exec("2003:2003", "python3", "-c", `import socket
-for path in ('/wefty/service/seats/3/run/view.ws','/wefty/service/seats/3/run/control.ws','/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
+		peer.exec("2001:2001", "python3", "-c", `import socket
+for path in ('/wefty/service/seats/1/run/view.ws','/wefty/service/seats/1/run/control.ws','/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
  with socket.socket(socket.AF_UNIX) as s:
   s.settimeout(.2);s.connect(path)
 `)
 	}
 	peerLocal()
 	h.exec("2001:2001", "python3", "-c", `import socket
-for path in ('/wefty/service/seats/3/run/view.ws','/wefty/service/seats/3/run/control.ws','/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
+for path in ('/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
  s=socket.socket(socket.AF_UNIX);s.settimeout(.2)
  try:s.connect(path)
  except OSError:pass
  else:raise AssertionError('neighbour Computer reachable: '+repr(path))
  finally:s.close()
 `)
-	peer.probe("frame", 3, "aa00aa")
+	peer.probe("frame", 1, "ff0000")
+	h.probe("frame", 1, "00ff00")
+	localFrames()
 	peerLocal()
 	peer.stop()
 	evidence.Observations["cross_computer_endpoints_refused"] = true
@@ -226,12 +238,14 @@ os.waitpid(p,0)`)
 	h.wait("Seat folder removed", func() bool { return h.tryExec("0:0", "test", "!", "-e", "/wefty/service/seats/2") == nil })
 	evidence.Observations["removed_folder_absent"] = true
 	evidence.Observations["removed_processes_absent"] = h.exec("0:0", "sh", "-c", `if ps -eo uid=,stat= | awk '$1==2002 && $2 !~ /^Z/ {found=1} END {exit !found}'; then exit 1; fi; echo absent`) == "absent"
-	evidence.Observations["removed_endpoints_absent"] = h.exec("0:0", "python3", "-c", `import socket
-for p in (7104,7105):
- s=socket.socket(); s.settimeout(.2)
- assert s.connect_ex(('127.0.0.1',p))!=0
- s.close()
-print('absent')`) == "absent"
+	command, err := seatEndpointAbsenceCommand(ctx, fmt.Sprintf("/proc/%d/root", h.pid), fmt.Sprintf("/proc/%d/net/unix", h.pid), 2)
+	seatMust(t, err)
+	absence, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("removed Seat endpoints: %v %s", err, absence)
+	}
+	evidence.Observations["removed_endpoints_absent"] = strings.TrimSpace(string(absence)) == "absent"
+
 	h.exec("0:0", "test", "!", "-e", "/tmp/.X11-unix/X2")
 	h.exec("0:0", "test", "!", "-e", "/tmp/.X2-lock")
 	h.exec("0:0", "test", "!", "-e", "/dev/mqueue/wefty-seat2-conformance")

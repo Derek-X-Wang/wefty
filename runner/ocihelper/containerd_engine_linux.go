@@ -2729,12 +2729,15 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 	if err := engine.sweepImageSpools(); err != nil {
 		return SweepResponse{}, err
 	}
+	var retiringSeats []*containerdAttempt
 	engine.mu.Lock()
 	for _, attempt := range engine.attempts {
 		if attempt.cancel != nil {
 			attempt.cancel()
 		}
 		attempt.mu.Lock()
+		attempt.deleted = true
+		retiringSeats = append(retiringSeats, attempt)
 		if attempt.oomCancel != nil {
 			attempt.oomCancel()
 		}
@@ -2745,6 +2748,12 @@ func (engine *ContainerdEngine) Sweep(ctx context.Context, request SweepRequest)
 		attempt.mu.Unlock()
 	}
 	engine.mu.Unlock()
+	// A whole-namespace sweep unmounts task roots before disk cleanup too.
+	// Retire pins outside engine.mu without waiting for Seat probes or dials.
+	for _, attempt := range retiringSeats {
+		attempt.closeSeatEndpointPins()
+	}
+
 	inventory, err := engine.inventory(ctx)
 	if err != nil {
 		return SweepResponse{}, err
@@ -3248,6 +3257,9 @@ func (engine *ContainerdEngine) deleteResources(ctx context.Context, authority A
 		attempt.mu.Lock()
 		attempt.deleted = true
 		attempt.mu.Unlock()
+		// Release filesystem references before container removal or disk detach.
+		// Concurrent observations can finish, but cannot reopen pins or publish.
+		attempt.closeSeatEndpointPins()
 		if attempt.cancel != nil {
 			attempt.cancel()
 		}
@@ -3405,19 +3417,12 @@ func (engine *ContainerdEngine) releaseAttemptImagePin(ctx context.Context, auth
 func (engine *ContainerdEngine) releaseAttemptRuntimeState(ctx context.Context, authorityKey string) error {
 	engine.mu.Lock()
 	attempt := engine.attempts[authorityKey]
-	delete(engine.attempts, authorityKey)
-	if attempt != nil {
-		for _, port := range attempt.endpoints {
-			if engine.ports[port] == authorityKey {
-				delete(engine.ports, port)
-			}
-		}
-	}
 	engine.mu.Unlock()
 	if attempt == nil {
 		return nil
 	}
 	attempt.mu.Lock()
+	attempt.deleted = true
 	holds := make([]net.Listener, 0, len(attempt.endpointHolds))
 	for name, hold := range attempt.endpointHolds {
 		holds = append(holds, hold)
@@ -3428,14 +3433,20 @@ func (engine *ContainerdEngine) releaseAttemptRuntimeState(ctx context.Context, 
 	namespace := attempt.networkNamespace
 	attempt.networkNamespace = nil
 	attempt.mu.Unlock()
-	// Seat socket descriptors must not keep retired incarnations alive.
-	attempt.seatsMu.Lock()
-	if attempt.seats != nil {
-		for _, entry := range attempt.seats.entries {
-			entry.closeEndpointPins()
+	// Idempotent fallback for runtime release without a disk attachment.
+	attempt.closeSeatEndpointPins()
+	// Keep the retired attempt discoverable by a concurrent disk detach until
+	// its descriptors are closed. No engine lock is held while closing pins.
+	engine.mu.Lock()
+	if engine.attempts[authorityKey] == attempt {
+		delete(engine.attempts, authorityKey)
+		for _, port := range attempt.endpoints {
+			if engine.ports[port] == authorityKey {
+				delete(engine.ports, port)
+			}
 		}
 	}
-	attempt.seatsMu.Unlock()
+	engine.mu.Unlock()
 	var errs []error
 	for _, hold := range holds {
 		errs = append(errs, hold.Close())

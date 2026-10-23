@@ -352,10 +352,13 @@ class EndpointDirectiveTest(unittest.TestCase):
                 supervisor.validate(doc)
 
     def test_supervisor_probes_a_unix_endpoint(self):
-        with tempfile.TemporaryDirectory() as root:
-            path = str(Path(root) / 'view.ws')
-            with mock.patch.object(supervisor.socket, 'socket') as make_socket:
-                make_socket.return_value.connect.side_effect = OSError('probe fixture')
-                supervisor.rfb_ready(path)
-                make_socket.assert_called_once_with(supervisor.socket.AF_UNIX, supervisor.socket.SOCK_STREAM)
-                make_socket.return_value.connect.assert_called_once_with(path)
+        with tempfile.TemporaryDirectory(dir='/tmp') as root:
+            path = str(Path(root).resolve() / 'view.ws')
+            with supervisor.socket.socket(supervisor.socket.AF_UNIX, supervisor.socket.SOCK_STREAM) as listener:
+                listener.bind(path)
+                os.chmod(path, 0o600)
+                with mock.patch.object(supervisor.socket, 'socket') as make_socket:
+                    make_socket.return_value.connect.side_effect = OSError('probe fixture')
+                    supervisor.rfb_ready(path)
+                    make_socket.assert_called_once_with(supervisor.socket.AF_UNIX, supervisor.socket.SOCK_STREAM)
+                    make_socket.return_value.connect.assert_called_once_with(path)

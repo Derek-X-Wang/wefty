@@ -3,6 +3,7 @@
 package ocihelper
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/opencontainers/image-spec/identity"
 	imagev1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
 )
 
 // This fixture uses the production profile without adding mounts, privileges,
@@ -260,11 +262,17 @@ for name in ('view.ws','control.ws','view.sock','control.sock'):
 			run(fmt.Sprintf("%d:%d", 2000+pair[0], 2000+pair[0]), "sh", "-c", fmt.Sprintf("if DISPLAY=:%d XAUTHORITY=/wefty/service/seats/%d/.Xauthority xdpyinfo >/dev/null 2>&1; then exit 1; fi", pair[1], pair[0]))
 		}
 		withSeatEndpointComputer(t, image, address, func(_ context.Context, second *ContainerdEngine, b AttemptAuthority, _ containerd.Task, peerID string) {
-			neighbour := ready(second, b, []ComputerSeat{{3, "seat3", 7106, 7107}})
+			neighbour := ready(second, b, []ComputerSeat{{1, "seat1", 7102, 7103}, {3, "seat3", 7106, 7107}})
 			name := neighbour.Seats[0].Endpoints["view"]
+			// Both roots have the same Seat, uid, path and directive generation.
+			// Turn only B green, so wrong-root observation or dial cannot pass.
+			probeHelperSeatFrame(t, ctx, first, DialSeatEndpointRequest{a, result.Generation, 1, view}, "frame", "ff0000")
+			probeHelperSeatFrame(t, ctx, second, DialSeatEndpointRequest{b, neighbour.Generation, 1, neighbour.Seats[0].Endpoints["control"]}, "input", "00ff00")
+			probeHelperSeatFrame(t, ctx, second, DialSeatEndpointRequest{b, neighbour.Generation, 1, name}, "frame", "00ff00")
+			probeHelperSeatFrame(t, ctx, first, DialSeatEndpointRequest{a, result.Generation, 1, view}, "frame", "ff0000")
 			peerLocal := func() {
-				argv := []string{"--address", address, "--namespace", ContainerdNamespace, "tasks", "exec", "--exec-id", fmt.Sprintf("peer-live-%d", time.Now().UnixNano()), "--user", "2003:2003", peerID, "python3", "-c", `import socket
-for path in ('/wefty/service/seats/3/run/view.ws','/wefty/service/seats/3/run/control.ws','/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
+				argv := []string{"--address", address, "--namespace", ContainerdNamespace, "tasks", "exec", "--exec-id", fmt.Sprintf("peer-live-%d", time.Now().UnixNano()), "--user", "2001:2001", peerID, "python3", "-c", `import socket
+for path in ('/wefty/service/seats/1/run/view.ws','/wefty/service/seats/1/run/control.ws','/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
  with socket.socket(socket.AF_UNIX) as s:
   s.settimeout(.2);s.connect(path)
 `}
@@ -273,25 +281,27 @@ for path in ('/wefty/service/seats/3/run/view.ws','/wefty/service/seats/3/run/co
 				}
 			}
 			peerLocal()
-			if err := dial(second, DialSeatEndpointRequest{b, neighbour.Generation, 3, name}); err != nil {
+			if err := dial(second, DialSeatEndpointRequest{b, neighbour.Generation, 1, name}); err != nil {
 				t.Fatalf("neighbour not live: %v", err)
 			}
 			refuse(first, DialSeatEndpointRequest{a, result.Generation, 1, name})
-			refuse(second, DialSeatEndpointRequest{b, neighbour.Generation, 3, view})
-			// The peer paths and abstract X token are known and live in the neighbour.
-			// A process in the first Computer must fail at those exact addresses.
+			refuse(second, DialSeatEndpointRequest{b, neighbour.Generation, 1, view})
+			// The same-Seat frames above prove root selection. A distinct
+			// live X display additionally tests namespace socket refusal.
 			run("2001:2001", "python3", "-c", `import socket
-for path in ('/wefty/service/seats/3/run/view.ws','/wefty/service/seats/3/run/control.ws','/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
+for path in ('/tmp/.X11-unix/X3','\0/tmp/.X11-unix/X3'):
  s=socket.socket(socket.AF_UNIX);s.settimeout(.2)
  try:s.connect(path)
  except OSError:pass
  else:raise AssertionError('neighbour endpoint reachable: '+repr(path))
  finally:s.close()
 `)
-			if err := dial(second, DialSeatEndpointRequest{b, neighbour.Generation, 3, name}); err != nil {
+			if err := dial(second, DialSeatEndpointRequest{b, neighbour.Generation, 1, name}); err != nil {
 				t.Fatalf("neighbour withdrew during crossover proof: %v", err)
 			}
 			peerLocal()
+			probeHelperSeatFrame(t, ctx, second, DialSeatEndpointRequest{b, neighbour.Generation, 1, name}, "frame", "00ff00")
+			probeHelperSeatFrame(t, ctx, first, DialSeatEndpointRequest{a, result.Generation, 1, view}, "frame", "ff0000")
 			if err := dial(first, DialSeatEndpointRequest{a, result.Generation, 1, view}); err != nil {
 				t.Fatalf("source Computer withdrew during crossover proof: %v", err)
 			}
@@ -304,3 +314,54 @@ type seatRefusalStream struct{ wrote bool }
 func (s *seatRefusalStream) Write(p []byte) (int, error) { s.wrote = true; return len(p), nil }
 func (s *seatRefusalStream) Read(p []byte) (int, error)  { return 0, io.EOF }
 func (s *seatRefusalStream) Close() error                { return nil }
+
+// Run the real RFB framebuffer probe through DialSeatEndpoint, not a direct
+// task-root connection. A wrong-root dial must show the other colour or fail.
+func probeHelperSeatFrame(t *testing.T, ctx context.Context, engine *ContainerdEngine, request DialSeatEndpointRequest, mode, colour string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientFile, helperFile := os.NewFile(uintptr(pair[0]), "Seat frame client"), os.NewFile(uintptr(pair[1]), "Seat frame helper")
+	defer clientFile.Close()
+	defer helperFile.Close()
+	helper, err := net.FileConn(helperFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperFile.Close()
+	go func() { defer helper.Close(); _ = engine.DialSeatEndpoint(ctx, request, helper) }()
+	setup, err := net.FileConn(clientFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = setup.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var marker [1]byte
+	_, err = io.ReadFull(setup, marker[:])
+	setup.Close()
+	if err != nil || marker[0] != attemptPortBackendReady {
+		t.Fatalf("Seat frame backend not ready: marker=%v err=%v", marker, err)
+	}
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("frame probe source unavailable")
+	}
+	script := filepath.Join(filepath.Dir(source), "../../examples/computer/seat-probe.py")
+	command := exec.CommandContext(ctx, "python3", script, mode, "fd:3", colour)
+	command.ExtraFiles = []*os.File{clientFile}
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	err = command.Start()
+	clientFile.Close()
+	if err == nil {
+		err = command.Wait()
+	}
+	t.Logf("Computer %s Seat %d %s expected %s: %s", request.Authority.AttemptID, request.Place, mode, colour, output.String())
+	if err != nil {
+		t.Fatalf("helper selected the wrong Computer screen or failed: %v %s", err, output.String())
+	}
+}

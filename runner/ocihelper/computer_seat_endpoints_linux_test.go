@@ -111,7 +111,7 @@ func TestSeatSocketReplacementDuringConnectNeverReachesNeighbour(t *testing.T) {
 	defer expected.Close()
 	path := filepath.Join(root, seatEndpointPath(1, "view"))
 	connected := false
-	c, err := dialSeatSocketWith(t.Context(), root, 1, "view", uint32(os.Getuid()), expected, func(ctx context.Context, address string) (net.Conn, error) {
+	c, err := dialSeatSocketWith(t.Context(), root, 1, "view", uint32(os.Getuid()), expected, func(ctx context.Context, pin *os.File) (net.Conn, error) {
 		connected = true
 		if err := os.Rename(path, path+".old"); err != nil {
 			t.Fatal(err)
@@ -119,7 +119,7 @@ func TestSeatSocketReplacementDuringConnectNeverReachesNeighbour(t *testing.T) {
 		if err := os.Symlink(filepath.Join(neighbour, seatEndpointPath(1, "view")), path); err != nil {
 			t.Fatal(err)
 		}
-		return (&net.Dialer{}).DialContext(ctx, "unix", address)
+		return connectSeatSocket(ctx, pin)
 	})
 	if c != nil {
 		c.Close()
