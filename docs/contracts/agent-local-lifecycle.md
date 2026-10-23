@@ -12,6 +12,7 @@ reachability, while this surface describes what the local process is doing.
 | `ready` | The registered session can claim work. An empty attempt map means healthy idle. | The session loses reachability or authority, or drain begins. |
 | `rejoining` | Registration or another session operation is retrying with capped exponential backoff and jitter. | Registration and a session operation succeed, or a semantic rejection quarantines or drains the agent. |
 | `quarantined` | A non-retryable node-session rejection stopped autonomous work. | Outer cancellation or an operator-requested drain; the daemon does not exit merely because it is quarantined. |
+| `retiring` | New claims are closed for this Node agent generation. Existing ordinary and Restartable process one-shots keep execution, renewal, output and publication without a retirement deadline. | Exact local reap and evidence proof plus L1 closure succeed, or an ordinary shutdown signal acts. |
 | `draining` | New claims are stopped while resident attempts are joined. | The drain completes and `Run` returns cleanly, or a second shutdown signal forces cancellation. |
 
 `session_backoff` is the current retry delay and is zero while ready. A
@@ -46,6 +47,81 @@ their sum. A service manager that
 kills after a fixed timeout must allow `D` plus that bound; `wefty setup`
 passes a budget to the installed node agent and derives launchd's `ExitTimeOut`
 from both, with slack.
+
+## Node agent generation retirement (#1175)
+
+`--agent-generation-id ID` supplies an installation-allocated identity to
+`agent.Config.AgentGenerationID`. An empty identity keeps the legacy session
+path. The flag alone does not advertise `upgrade:retirement:v1`, allocate an
+identity, change installation locks, or enable installed rolling upgrades.
+Activation and shared storage remain #1176–#1179 integrations.
+
+The dedicated trigger is L1's authenticated generation inventory after its
+fenced promotion transaction. The existing serialized heartbeat loop reads
+`GET /v1/agent/nodes/{node_id}/generations` for an enrolled session. An enrolled
+claim loop also reads it after a claim refusal, so a demotion racing the normal
+heartbeat cannot cancel sibling Attempts. Only an exact generation and original
+boot in role `retiring`, selected protocol 1, with a promotion operation and
+matching resident identities can latch local retirement. A committed claim with
+a lost response has no local runtime or credentials to adopt; it remains pending
+until L1 authoritatively ends its Lease. `Agent.Retire(ctx)`
+requests and acknowledges that same observation immediately; identical calls
+are safe. A local call while L1 still records `primary` refuses. No signal,
+Drain, context cancellation, or shutdown-budget timer triggers retirement.
+The upgrader drives L1's existing admission closure and promotion endpoints;
+it needs no second local authority source. This uses L1's private authenticated
+control response in place of a separate local control socket.
+
+The latch joins the mutex held through an in-flight claim RPC and its local
+admission record. A returned claim runs and completes normally. Claim workers
+exit after their resident Attempt finishes. They never start another claim
+once the latch closes. Ordinary and Restartable one-shots retain their parents,
+Guardians, Lease renewal, output readers, run mailbox publication, and real exit
+status. Each Job's own limits, explicit cancellation and Lease loss still apply.
+The retiree reports `retiring` through connectivity retries and uses only
+`POST /generations/{id}/heartbeat`; it never re-registers or publishes primary
+Node observations. Node-wide Computer policy watches stop at retirement.
+
+Generation-aware live finalization keeps normal renewal active while ordered
+pending logs and first completion delivery retry. Before inspecting or draining
+logs, delivery joins asynchronous durable redaction-tail appends, using the same
+ordering barrier as shutdown recovery with the live Attempt lifetime. An empty
+spool does not prove an outstanding append has committed. An ambiguous completion reply
+retries the same durable request. It does not release that first delivery to
+an outbox and deliberately age out the Lease. Ordinary shutdown still uses its
+existing bounded evidence recovery path.
+
+After every claim worker has returned, the retiree retains positive runtime
+reap records and evidence publication records; an empty running map is not
+proof. Every terminal path, including restart directives and Lease loss, retains
+a query over late appends, pending logs, durable completion disposition, and
+mailbox/result publication. Closure reconciles that query again after recovery;
+a missing Run mailbox does not prove delivery. Positive delivery proof survives
+bounded outbox receipt retention. Sealed incomplete or undelivered evidence
+keeps retirement pending unless permitted durable custody is acknowledged.
+Pending evidence keeps it alive. `Config.RetirementEvidenceSettled` is
+the #1176 integration seam, with exact pending Attempt identities, for an exact
+durable custody proof when local publication is incomplete. When configured, it
+always checks closure and may also veto it for other owned evidence. It cannot
+replace runtime reap or the L1 closure
+prerequisite. `POST /generations/{id}/close` carries the original boot, promotion
+operation, exact frozen residents and positive local attestations. L1 itself
+checks that every resident completion was accepted or its Lease authoritatively
+ended. Refused, missing or ambiguous close responses keep the retiree alive and
+retry identically. Successful closure lets `Run` return cleanly, independently
+of any other retiring generation.
+
+TERM during retirement starts today's drain and shutdown-budget path.
+Drain is local for a retiree and returns no L1 Node projection; it must not
+call the primary-only Node drain route or mutate the successor. If TERM races
+local observation after L1 demotion, a `node_session_replaced` Drain refusal
+triggers an authenticated generation read. A verified exact demotion makes it a
+local drain; missing, rejected or different authority keeps ordinary error
+handling. This race cannot start forced cancellation on a verified retiree.
+Restartable residents receive `agent_shutdown`; ordinary residents wait until
+they finish or existing forced cancellation acts. Retirement adds no alternate
+signal semantics. It does not close a generation after forced shutdown without
+its normal proof; later installation recovery owns that record.
 
 ## Immediate fleet heartbeat signal
 

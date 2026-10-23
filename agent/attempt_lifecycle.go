@@ -77,20 +77,22 @@ func (disabledAttemptWatch) Check() error           { return nil }
 func (disabledAttemptWatch) Stop()                  {}
 
 type attemptLifecycleDependencies struct {
-	client              *Client
-	runtimes            workloadRuntimeSet
-	outbox              *evidenceOutbox
-	logSinkFactory      attemptLogSinkFactory
-	watchdog            attemptWatchdog
-	clock               Clock
-	renewalInterval     time.Duration
-	completionRetry     time.Duration
-	finalizationTimeout time.Duration
-	outputSinkFactory   OutputSinkFactory
-	managedResource     managedResourceManager
-	handoffs            *handoffManager
-	runLedger           runLedgerAppender
-	mailboxPoll         time.Duration
+	keepCompletionAuthority bool
+	retirementEvidence      func(string, func(context.Context) (bool, error))
+	client                  *Client
+	runtimes                workloadRuntimeSet
+	outbox                  *evidenceOutbox
+	logSinkFactory          attemptLogSinkFactory
+	watchdog                attemptWatchdog
+	clock                   Clock
+	renewalInterval         time.Duration
+	completionRetry         time.Duration
+	finalizationTimeout     time.Duration
+	outputSinkFactory       OutputSinkFactory
+	managedResource         managedResourceManager
+	handoffs                *handoffManager
+	runLedger               runLedgerAppender
+	mailboxPoll             time.Duration
 	// mailboxStateRoot is the agent-owned directory under which a remote
 	// mailbox keeps its bookkeeping. A remote mailbox's directory is
 	// workload-writable and on the far side of a trust boundary, so its
@@ -152,6 +154,9 @@ type attemptLifecycle struct {
 	// (uploadRecord.publishes), separate from the latch saying an upload was
 	// attempted, so a second exit reads the first one's answer.
 	resultPublished atomic.Bool
+	// completionAccepted retains delivery acceptance for the retirement proof,
+	// including recovery after worker exit and bounded spool receipt pruning.
+	completionAccepted atomic.Bool
 	// capturedResult holds a result read before the runtime was reaped. An OCI
 	// attempt's handoff volume is only readable while its attempt is live, so
 	// the read happens at the same moment the mailbox drains and the bytes
@@ -468,6 +473,38 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
 	attemptID := claim.Lease.AttemptID
+	if lifecycle.dependencies.retirementEvidence != nil {
+		if lifecycle.dependencies.outbox != nil {
+			lifecycle.dependencies.outbox.trackRetirementCompletion(attemptID, &lifecycle.completionAccepted)
+		}
+		// Keep positive settlement proof once publication is also complete.
+		// The outbox transfers acceptance into this lifecycle at delivery;
+		// pending publication stays a live query until it too has settled.
+		var proofMu sync.Mutex
+		query := func(ctx context.Context) (bool, error) { return lifecycle.retirementEvidenceSettled(ctx, claim) }
+		check := func(ctx context.Context) (bool, error) {
+			proofMu.Lock()
+			defer proofMu.Unlock()
+			if query == nil {
+				return true, nil
+			}
+			settled, err := query(ctx)
+			if settled && err == nil {
+				// Release the retained lifecycle once delivery is proved.
+				query = nil
+			}
+			return settled, err
+		}
+		lifecycle.dependencies.retirementEvidence(attemptID, check)
+		defer func() {
+			proofContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+			defer cancel()
+			if _, err := check(proofContext); err != nil {
+				lifecycle.log("inspect terminal retirement evidence for attempt %s: %v", attemptID, err)
+			}
+		}()
+	}
+
 	reconcileCompletion := false
 	if lifecycle.dependencies.outbox != nil {
 		lifecycle.dependencies.outbox.ownAttempt(attemptID)
@@ -738,7 +775,7 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	if outcome.err != nil {
 		lifecycle.log("attempt %s execution: %v", claim.Lease.AttemptID, outcome.err)
 	}
-	switch completionRoute(outcome.logsPending && lifecycle.dependencies.outbox != nil,
+	switch completionRoute(outcome.logsPending && lifecycle.dependencies.outbox != nil && !lifecycle.dependencies.keepCompletionAuthority,
 		lifecycle.dependencies.outbox != nil && lifecycle.dependencies.outbox.recoveryStopped()) {
 	case completionRouteHandoff:
 		reconcileCompletion = true
@@ -767,7 +804,31 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		(errors.Is(cause, errOCIIntentDisabled) && claim.Job.Spec.Class != contract.JobClassService) {
 		completionContext = context.WithoutCancel(attemptContext)
 	}
-	go func() { completionDone <- lifecycle.completeWithRetry(completionContext, claim, request) }()
+	go func() {
+		if lifecycle.dependencies.keepCompletionAuthority && lifecycle.dependencies.outbox != nil {
+			for completionContext.Err() == nil {
+				attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID, fencingToken: claim.Lease.FencingToken, kind: claim.Job.Spec.Kind, class: claim.Job.Spec.Class}
+				err := lifecycle.dependencies.outbox.waitForLateAppends(completionContext, claim.Lease.AttemptID)
+				if err == nil {
+					err = lifecycle.dependencies.outbox.recoverLogs(completionContext, lifecycle.dependencies.client, attempt)
+				}
+				if err == nil {
+					break
+				}
+				if classifyAgentProtocolError(err).destination != errorDestinationTransient {
+					completionDone <- destinationFromError(err)
+					return
+				}
+				timer := lifecycle.dependencies.clock.NewTimer(lifecycle.dependencies.completionRetry)
+				select {
+				case <-completionContext.Done():
+					stopTimer(timer)
+				case <-timer.C():
+				}
+			}
+		}
+		completionDone <- lifecycle.completeWithRetry(completionContext, claim, request)
+	}()
 	// A heartbeat may cancel the resident directly after execution has already
 	// finished, without a renewal error. Join the abandoned delivery and retry
 	// the identical completion now, inside the original settlement window.
@@ -2517,4 +2578,30 @@ func toL1QuiescenceEvidence(evidence workloadrunner.ReapEvidence) l1.RuntimeQuie
 		return l1.RuntimeQuiescenceOCISweep
 	}
 	return l1.RuntimeQuiescenceEvidence(evidence)
+}
+
+func (lifecycle *attemptLifecycle) retirementEvidenceSettled(ctx context.Context, claim l1.Claim) (bool, error) {
+	outbox := lifecycle.dependencies.outbox
+	if outbox == nil {
+		return false, nil
+	}
+	delivered, err := outbox.attemptEvidenceDelivered(ctx, claim.Lease.AttemptID, lifecycle.completionAccepted.Load())
+	if err != nil || !delivered {
+		return false, err
+	}
+	owner := lifecycle.executionOwnerKey(claim.Job.Spec)
+	if owner == "" {
+		return lifecycle.mailboxDrained(), nil
+	}
+	if lifecycle.resultPublished.Load() {
+		return true, nil
+	}
+	if lifecycle.dependencies.handoffs == nil {
+		return false, nil
+	}
+	record, present, err := lifecycle.dependencies.handoffs.readUploadRecord(owner)
+	if err != nil {
+		return false, err
+	}
+	return present && record.NodeID == lifecycle.dependencies.nodeID && record.AttemptID == claim.Lease.AttemptID && record.publishes(), nil
 }
