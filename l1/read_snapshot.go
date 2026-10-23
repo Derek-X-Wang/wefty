@@ -17,6 +17,8 @@ import (
 // It grants neither SQL access nor mutation authority. Writes adapt their own
 // transaction, after replay checks, so decisions remain inside the write.
 type readModel interface {
+	computerSeatListForAttempt(context.Context, string, string, string, string, ComputerSeatAttemptRequest) (ComputerSeatList, error)
+	computerSeatObservations(context.Context, string) ([]ComputerSeatEvidence, error)
 	seatApprovalWindows(context.Context, string) ([]SeatApprovalWindow, error)
 	owedComputerRevocation(context.Context, int64) (owedRevocationRow, error)
 	computerReimageReplayHash(context.Context, string, string) (string, error)

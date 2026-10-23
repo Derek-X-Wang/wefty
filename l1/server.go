@@ -451,6 +451,8 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt", s.interruptRestartableAttempt)
 
 	agent := http.NewServeMux()
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-list", s.computerSeatList)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-observations", s.computerSeatObservations)
 	agent.HandleFunc("POST /v1/agent/seat-approvals", s.beginSeatApproval)
 	agent.HandleFunc("POST /v1/agent/seat-approvals/{seat_id}/answer", s.answerSeatApproval)
 	agent.HandleFunc("POST /v1/agent/nodes/register", s.registerNode)

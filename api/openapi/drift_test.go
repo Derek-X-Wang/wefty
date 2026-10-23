@@ -87,7 +87,10 @@ var driftRows = []driftRow{
 	{component(commonDoc, "PromoteNodeGenerationRequest"), typeOf[l1.PromoteNodeGenerationRequest]()},
 	{component(commonDoc, "NodeGenerationHeartbeatRequest"), typeOf[l1.NodeGenerationHeartbeatRequest]()},
 	{component(commonDoc, "CloseNodeGenerationRequest"), typeOf[l1.CloseNodeGenerationRequest]()},
-
+	{requestBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-list"), typeOf[l1.ComputerSeatAttemptRequest]()},
+	{responseBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-list", "200"), typeOf[l1.ComputerSeatList]()},
+	{requestBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-observations"), typeOf[l1.ComputerSeatObservationReport]()},
+	{responseBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-observations", "200"), typeOf[l1.ComputerSeatObservationReceipt]()},
 	// Shared components.
 	{component(commonDoc, "PeerHealth"), typeOf[contract.PeerHealth]()},
 	{component(commonDoc, "PeerPong"), typeOf[contract.PeerPong]()},

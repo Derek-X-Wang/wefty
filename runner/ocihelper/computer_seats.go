@@ -244,7 +244,7 @@ func (s *computerSeats) observe(ctx context.Context, generation uint64, read fun
 					entry.cleaned = true
 				} else {
 					entry.cleaned = false
-					observation.Reason = "cleanup_not_confirmed"
+					observation.Reason = "cleanup_unverified"
 				}
 			} else {
 				entry.cleaned = false

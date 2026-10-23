@@ -1865,7 +1865,20 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	request.Execution = executionSpec
 	var result contract.ProcessResult
 	var runErr error
-	if computerService {
+	if computerService && claim.ComputerStorage != nil && claim.ComputerStorage.SeatRequestMade {
+		seatRuntime, ok := runtimeAdapter.(computerSeatRuntime)
+		if !ok {
+			err := errors.New("Computer runtime does not support Seat observations")
+			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
+		}
+		authority := request.Authority
+		controller := newComputerSeatController(lifecycle.dependencies.client, seatRuntime, ocihelper.AttemptAuthority{
+			NodeID: authority.NodeID, BootSessionID: authority.BootSessionID,
+			JobID: authority.JobID, AttemptID: authority.AttemptID, FencingToken: authority.FencingToken,
+			Class: authority.WorkloadClass, RemovalGeneration: authority.RemovalGeneration,
+		}, claim.ComputerStorage.ComputerID, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
+		result, runErr = runComputerSeats(ctx, runtimeAdapter, request, sink, controller)
+	} else if computerService {
 		if ociEndpointLatch == nil || claim.ComputerStorage == nil {
 			err := errors.New("Computer attempt is missing runtime endpoints or Computer authority")
 			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)

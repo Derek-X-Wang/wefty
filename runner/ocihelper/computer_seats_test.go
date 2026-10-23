@@ -130,8 +130,8 @@ func TestComputerSeatRemovalRequiresProofAndIndependentAbsenceBeforeReuse(t *tes
 	}
 	answers["applied.json"] = []byte(`{"version":1,"generation":2,"wanted_places":[],"cleanup_complete":true}`)
 	absent = false
-	if r := observe(); r.CleanupComplete {
-		t.Fatal("image proof alone accepted")
+	if r := observe(); r.CleanupComplete || r.Reason != "cleanup_unverified" {
+		t.Fatalf("image proof alone accepted or cleanup observation reason is ambiguous: %+v", r)
 	}
 	absent = true
 	if r := observe(); !r.CleanupComplete || r.State != "cleaned" {
