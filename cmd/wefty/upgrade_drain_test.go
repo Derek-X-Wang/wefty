@@ -111,6 +111,14 @@ func TestUpgradeDrainTimeoutRetryabilityAfterRestore(t *testing.T) {
 					return node, err
 				}
 				before := installedUpgradeFiles(t, f)
+				reads := 0
+				f.operations.readJob = func(_ context.Context, _ connprofile.Profile, id string) (l1.Job, error) {
+					reads++
+					if !f.node.ClaimsEnabled || id != attempt.JobID {
+						t.Fatalf("Run lookup before restoration or for wrong Job: claims=%v job=%s", f.node.ClaimsEnabled, id)
+					}
+					return l1.Job{Spec: contract.JobSpec{Labels: map[string]string{contract.LabelRunID: "run_late"}}}, nil
+				}
 				_, err := runUpgrade(t.Context(), f.host, false, io.Discard, 12*time.Second)
 				var out bytes.Buffer
 				writeCommandError(&out, err, true)
@@ -124,8 +132,12 @@ func TestUpgradeDrainTimeoutRetryabilityAfterRestore(t *testing.T) {
 				if commandExitCode(err) != 5 || envelope.Error.Code != contract.ErrorConflict || envelope.Error.Retryable != wantRetryable || strings.Contains(envelope.Error.Message, "try again when") != wantRetryable || f.node.ClaimsEnabled != wantRetryable {
 					t.Fatalf("wrong timeout recovery advice: err=%v claims=%v JSON=%s", err, f.node.ClaimsEnabled, out.String())
 				}
-				if wantRetryable && !strings.Contains(envelope.Error.Message, attempt.JobID) {
-					t.Fatalf("missing blocking Job: %s", out.String())
+				if wantRetryable {
+					if reads != 1 || !strings.Contains(envelope.Error.Message, "(runs: run_late (late-job))") {
+						t.Fatalf("missing blocking Run: reads=%d JSON=%s", reads, out.String())
+					}
+				} else if reads != 0 {
+					t.Fatalf("nonretryable timeout read %d Jobs", reads)
 				}
 				if f.replaced || !reflect.DeepEqual(before, installedUpgradeFiles(t, f)) || len(f.launchd.mutating()) != 0 {
 					t.Fatal("timeout changed installation")
@@ -497,7 +509,29 @@ func TestUpgradeDrainTimeoutHintNamesOnlyBlockingJobs(t *testing.T) {
 		{JobID: "restartable", AttemptID: "attempt-2", Restartable: true},
 		{JobID: "service", AttemptID: "attempt-3", Class: contract.JobClassService},
 	})
-	if !err.APIError.Retryable || !strings.Contains(err.APIError.Message, "(jobs: ordinary)") {
+	if !err.APIError.Retryable || !strings.Contains(err.APIError.Message, "(runs: ordinary)") {
 		t.Fatalf("hint = %q retryable=%v, want only the ordinary Job", err.APIError.Message, err.APIError.Retryable)
+	}
+}
+
+func TestUpgradeDrainRunHintReadsAfterExpiredContext(t *testing.T) {
+	ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel()
+	timeout := upgradeDrainTimedOut(true, []l1.NodeActiveAttempt{{JobID: "job_blocking"}})
+	var probe context.Context
+	op := upgradeHost{readJob: func(ctx context.Context, _ connprofile.Profile, id string) (l1.Job, error) {
+		probe = ctx
+		deadline, ok := ctx.Deadline()
+		if remaining := time.Until(deadline); ctx.Err() != nil || !ok || remaining <= 0 || remaining > 2*time.Second {
+			t.Fatalf("lookup lacks independent two-second budget: err=%v remaining=%s", ctx.Err(), remaining)
+		}
+		return l1.Job{Spec: contract.JobSpec{Labels: map[string]string{contract.LabelRunID: "run_blocking"}}}, nil
+	}}
+	err := upgradeDrainRunHint(ctx, op, connprofile.Profile{}, timeout)
+	if err != timeout || commandExitCode(err) != exitConflict || !timeout.APIError.Retryable || !strings.HasSuffix(timeout.APIError.Message, "(runs: run_blocking (job_blocking))") {
+		t.Fatalf("lookup changed timeout semantics: %v", err)
+	}
+	if probe == nil || !errors.Is(probe.Err(), context.Canceled) {
+		t.Fatal("lookup context was not canceled after read")
 	}
 }

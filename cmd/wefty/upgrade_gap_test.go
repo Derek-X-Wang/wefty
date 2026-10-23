@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -26,11 +28,25 @@ func TestUpgradeGapTimeoutJSONIsRetryable(t *testing.T) {
 			}
 			f.node.ActiveAttempts = []l1.NodeActiveAttempt{
 				{JobID: "ordinary-1", AttemptID: "attempt-1"},
+				{JobID: "ordinary-1", AttemptID: "duplicate-attempt"},
+				{AttemptID: "empty-job-id"},
 				{JobID: "ordinary-2", AttemptID: "attempt-2"},
 				{JobID: "ordinary-3", AttemptID: "attempt-3"},
 				{JobID: "ordinary-4", AttemptID: "attempt-4"},
 				{JobID: "service", Class: contract.JobClassService},
 				{JobID: "restartable", Restartable: true},
+			}
+			var reads []string
+			f.operations.readJob = func(_ context.Context, _ connprofile.Profile, id string) (l1.Job, error) {
+				reads = append(reads, id)
+				switch id {
+				case "ordinary-1":
+					return l1.Job{Spec: contract.JobSpec{Labels: map[string]string{contract.LabelRunID: "run_blocking"}}}, nil
+				case "ordinary-2":
+					return l1.Job{}, nil // A Job without a Run keeps its Job ID.
+				default:
+					return l1.Job{}, errors.New("job read unavailable")
+				}
 			}
 			_, err := runUpgrade(t.Context(), f.host, false, io.Discard, 12*time.Second)
 			var out bytes.Buffer
@@ -43,6 +59,9 @@ func TestUpgradeGapTimeoutJSONIsRetryable(t *testing.T) {
 			}
 			if commandExitCode(err) != 5 || envelope.Error.Code != contract.ErrorConflict || !envelope.Error.Retryable || !strings.HasPrefix(envelope.Error.Message, "drain timed out; installed stack unchanged; try again when the running one-shots finish") {
 				t.Fatalf("wrong retry advice: err=%v JSON=%s", err, out.String())
+			}
+			if !strings.HasSuffix(envelope.Error.Message, "(runs: run_blocking (ordinary-1), ordinary-2, ordinary-3)") || !slices.Equal(reads, []string{"ordinary-1", "ordinary-2", "ordinary-3"}) {
+				t.Fatalf("wrong blocking Runs or read bound: reads=%v JSON=%s", reads, out.String())
 			}
 			for _, id := range []string{"ordinary-1", "ordinary-2", "ordinary-3"} {
 				if !strings.Contains(envelope.Error.Message, id) {

@@ -297,6 +297,9 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 	managerHost.unloadBound = time.Duration(setupNodeAgentExitTimeout+15) * time.Second
 	manager := fleetServiceManager{host: managerHost}
 	op := fleetUpgradeOperations(host, paths, profile, plan)
+	defer func() {
+		resultErr = upgradeDrainRunHint(ctx, op, profile, resultErr)
+	}()
 	if err := recoverUpgradeDrain(ctx, op, paths, profile, warnings); err != nil {
 		return report, err
 	}
