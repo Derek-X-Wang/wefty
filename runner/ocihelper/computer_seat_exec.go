@@ -94,3 +94,13 @@ func (e SeatCommandEvent) validate() error {
 	}
 	return nil
 }
+
+// containerdMaxExecIDLength is containerd's identifier limit for an exec
+// process; a longer ID fails Exec with "greater than maximum length".
+const containerdMaxExecIDLength = 76
+
+// seatCommandExecID keeps 128 random bits, which is ample for one task's
+// concurrent execs and stays under containerd's limit.
+func seatCommandExecID(capability string) string {
+	return "seat-command-" + capability[:32]
+}

@@ -63,3 +63,14 @@ func TestSeatCommandRequiresCurrentReadySeatAndOwnEnvironment(t *testing.T) {
 	request.Place = 2
 	checkRefused("seat_not_ready")
 }
+
+func TestSeatCommandExecIDFitsContainerdLimit(t *testing.T) {
+	capability, err := randomCapability()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := seatCommandExecID(capability)
+	if len(id) > containerdMaxExecIDLength || !strings.HasPrefix(id, "seat-command-") {
+		t.Fatalf("exec ID %q has %d characters; containerd allows %d", id, len(id), containerdMaxExecIDLength)
+	}
+}

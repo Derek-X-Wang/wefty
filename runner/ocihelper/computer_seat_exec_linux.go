@@ -137,7 +137,7 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 		_, err = stream.Write(data)
 		return err
 	})
-	process, err := snapshot.task.Exec(ctx, "seat-command-"+id, spec, cio.NewCreator(cio.WithStreams(nil, seatCommandDrain{gated, cancel}, io.Discard)))
+	process, err := snapshot.task.Exec(ctx, seatCommandExecID(id), spec, cio.NewCreator(cio.WithStreams(nil, seatCommandDrain{gated, cancel}, io.Discard)))
 	if err != nil {
 		close(gate)
 		return nil, nil, err
