@@ -1,4 +1,4 @@
-//go:build linux && service_acceptance_realtiming
+//go:build linux && computer_seat_lane
 
 package computerconformance_test
 

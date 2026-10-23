@@ -138,7 +138,7 @@ jobs:
           python3 -m unittest discover -s examples/computer -p 'test_*.py'
           GOFLAGS=-p=1 GOMAXPROCS=2 go test -count=1 ./runner/ocihelper \
             -run '^TestAdmissionReceiptUsesInjectedClockAndScaledTmpfsCeiling$'
-          GOFLAGS=-p=1 GOMAXPROCS=2 go test -c -tags service_acceptance_realtiming \
+          GOFLAGS=-p=1 GOMAXPROCS=2 go test -c -tags computer_seat_lane \
             -o "$RUNNER_TEMP/seat-conformance.test" ./internal/computerconformance
           (
             cd internal/computerconformance
