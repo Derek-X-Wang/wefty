@@ -2,6 +2,15 @@ package l1
 
 import "net/http"
 
+type CloseSeatApprovalWindowsRequest struct {
+	NodeID  string `json:"node_id"`
+	Network string `json:"network"`
+}
+
+type CloseSeatApprovalWindowsResponse struct {
+	Closed bool `json:"closed"`
+}
+
 func (s *Server) beginSeatApproval(w http.ResponseWriter, r *http.Request) {
 	var request SeatApprovalRequest
 	if err := decodeJSON(r, &request); err != nil {
@@ -37,10 +46,7 @@ func (s *Server) listSeatApprovalWindows(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, value)
 }
 func (s *Server) closeSeatApprovalWindows(w http.ResponseWriter, r *http.Request) {
-	var request struct {
-		NodeID  string `json:"node_id"`
-		Network string `json:"network"`
-	}
+	var request CloseSeatApprovalWindowsRequest
 	if err := decodeJSON(r, &request); err != nil {
 		writeError(w, err)
 		return
@@ -49,5 +55,5 @@ func (s *Server) closeSeatApprovalWindows(w http.ResponseWriter, r *http.Request
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"closed": true})
+	writeJSON(w, http.StatusOK, CloseSeatApprovalWindowsResponse{Closed: true})
 }

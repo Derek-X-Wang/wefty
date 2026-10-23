@@ -200,6 +200,9 @@ var driftRows = []driftRow{
 	{requestBody(l3Doc, "post", "/v1/runs"), typeOf[l3.CreateRunRequest]()},
 
 	// L1 client inline bodies.
+	{responseBody(clientDoc, "get", "/v1/seat-approval-windows", "200"), typeOf[[]l1.SeatApprovalWindow]()},
+	{requestBody(clientDoc, "post", "/v1/seat-approval-windows/close"), typeOf[l1.CloseSeatApprovalWindowsRequest]()},
+	{responseBody(clientDoc, "post", "/v1/seat-approval-windows/close", "200"), typeOf[l1.CloseSeatApprovalWindowsResponse]()},
 	{responseBody(clientDoc, "get", "/v1/computers/{computer_id}/submission", "200"), typeOf[l1.ComputerSubmissionState]()},
 	{requestBody(clientDoc, "put", "/v1/computers/{computer_id}/submission"), typeOf[l1.ComputerSubmissionRequest]()},
 	{responseBody(clientDoc, "put", "/v1/computers/{computer_id}/submission", "200"), typeOf[l1.ComputerSubmissionMutationResult]()},
@@ -243,6 +246,10 @@ var driftRows = []driftRow{
 	{requestBody(clientDoc, "post", "/v1/nodes/{node_id}/claims"), typeOf[l1.NodeIntentRequest]()},
 
 	// L1 agent inline bodies.
+	{requestBody(agentDoc, "post", "/v1/agent/seat-approvals"), typeOf[l1.SeatApprovalRequest]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seat-approvals", "200"), typeOf[l1.SeatApproval]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seat-approvals/{seat_id}/answer"), typeOf[l1.SeatApprovalAnswer]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seat-approvals/{seat_id}/answer", "200"), typeOf[l1.SeatApproval]()},
 	{requestBody(agentDoc, "post", "/v1/agent/nodes/{node_id}/heartbeat"), typeOf[l1.HeartbeatRequest]()},
 	{requestBody(agentDoc, "post", "/v1/agent/nodes/{node_id}/drain"), typeOf[l1.DrainRequest]()},
 	{requestBody(agentDoc, "post", "/v1/agent/jobs/claim"), typeOf[l1.ClaimRequest]()},

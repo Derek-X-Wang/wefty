@@ -79,6 +79,59 @@ func TestSeatWindowVisibleAndCloseOnly(t *testing.T) {
 	if !closed.Load() || !strings.Contains(out.String(), `"closed": true`) {
 		t.Fatalf("close: closed=%v output=%s", closed.Load(), out.String())
 	}
+	out.Reset()
+	if err := execute(t.Context(), clients, false, []string{"status"}, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "approval window") {
+		t.Fatalf("status must omit closed windows: %s", out.String())
+	}
+}
+
+func TestSeatApprovalStatusWindowLines(t *testing.T) {
+	expires := time.Date(2026, 10, 23, 9, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name    string
+		windows []l1.SeatApprovalWindow
+		failure string
+		want    string
+	}{
+		{name: "nil"},
+		{name: "empty", windows: []l1.SeatApprovalWindow{}},
+		{name: "open", windows: []l1.SeatApprovalWindow{{NodeID: "mac", Network: "internet", ExpiresAt: expires}}, want: "approval window: mac; every request form with internet, and requests without internet; until 2026-10-23T09:00:00Z\n"},
+		{name: "probe failure", failure: "not reachable", want: "approval windows: cannot verify: not reachable\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := clusterStatus{Ready: true, ApprovalWindows: test.windows, ApprovalWindowsError: test.failure}
+			var out bytes.Buffer
+			if err := writeSeatApprovalWindows(&out, status); err != nil {
+				t.Fatal(err)
+			}
+			if out.String() != test.want {
+				t.Fatalf("human window lines=%q, want %q", out.String(), test.want)
+			}
+			out.Reset()
+			if err := writeStatusResult(&out, status, true); err != nil {
+				t.Fatal(err)
+			}
+			var document map[string]json.RawMessage
+			if err := json.Unmarshal(out.Bytes(), &document); err != nil {
+				t.Fatal(err)
+			}
+			var failure string
+			if raw, exists := document["approval_windows_error"]; exists {
+				if err := json.Unmarshal(raw, &failure); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if failure != test.failure {
+				t.Fatalf("JSON window error=%q, want %q", failure, test.failure)
+			}
+			if _, exists := document["approval_windows"]; exists != (len(test.windows) > 0) {
+				t.Fatalf("JSON windows present=%t, windows=%v", exists, test.windows)
+			}
+		})
+	}
 }
 
 // AP-4 checks the compiler principal invariant and adds a source inventory
