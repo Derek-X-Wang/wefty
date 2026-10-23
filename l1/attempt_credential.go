@@ -144,7 +144,7 @@ func validateAttemptCredentialAuthority(identityNodeID string, scope AttemptCred
 	if !a.currentAttempt.Valid || a.currentAttempt.String != scope.AttemptID {
 		return protocolError(contract.ErrorUnauthorized, "attempt credential belongs to a superseded attempt")
 	}
-	if a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration {
+	if !a.retiringSessionAuthorized && (a.bootSessionID != a.currentBootSessionID || a.authorityGeneration != a.currentAuthorityGeneration) {
 		return protocolError(contract.ErrorUnauthorized, "attempt credential belongs to a replaced node registration")
 	}
 	if a.state != contract.AttemptClaimed && a.state != contract.AttemptRunning && a.state != contract.AttemptAwaitingInput {

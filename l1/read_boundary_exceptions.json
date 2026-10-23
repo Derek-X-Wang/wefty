@@ -24,16 +24,16 @@
     "slice": "agent-protocol"
   },
   {
-    "site": "computer_operator.go:*Store.withAgentReadSnapshot | s.db",
-    "count": 1,
-    "reason": "Agent and L3 protocol reads stay coherent on the main pool, independent of operator snapshot admission.",
-    "slice": "agent-protocol"
-  },
-  {
     "site": "computer_operator.go:*Store.withAgentReadSnapshot | conn",
     "count": 3,
     "reason": "Agent and L3 protocol snapshot constructor: main-pool checkout admission, read-only transaction hold and rollback failure discard.",
     "slice": "permanent"
+  },
+  {
+    "site": "computer_operator.go:*Store.withAgentReadSnapshot | s.db",
+    "count": 1,
+    "reason": "Agent and L3 protocol reads stay coherent on the main pool, independent of operator snapshot admission.",
+    "slice": "agent-protocol"
   },
   {
     "site": "custody.go:*Store.ListNodeComputerCustodyExportDirectives | s.db",
@@ -57,6 +57,24 @@
     "site": "log_retention.go:*Store.migrateServiceLogTruncations | s.db",
     "count": 2,
     "reason": "infrastructure: initialization and schema migration",
+    "slice": "permanent"
+  },
+  {
+    "site": "node_generation.go:*Store.NodeGenerationClosureReady | s.readDB",
+    "count": 1,
+    "reason": "Authenticated retirement prerequisite check uses an explicit read-only transaction.",
+    "slice": "agent-protocol"
+  },
+  {
+    "site": "node_generation.go:*Store.NodeGenerations | s.readDB",
+    "count": 1,
+    "reason": "Authenticated agent session inventory uses an explicit read-only transaction.",
+    "slice": "agent-protocol"
+  },
+  {
+    "site": "node_generation.go:*Store.initializeNodeGenerations | s.db",
+    "count": 1,
+    "reason": "Infrastructure: additive generation schema initialization before serving requests.",
     "slice": "permanent"
   },
   {
@@ -289,7 +307,7 @@
   },
   {
     "site": "store.go:OpenStore | db",
-    "count": 7,
+    "count": 8,
     "reason": "infrastructure: open and configure the four SQLite pools",
     "slice": "permanent"
   },

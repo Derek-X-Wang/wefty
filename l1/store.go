@@ -259,6 +259,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.initializeNodeGenerations(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Owed-revocation settlement writes run inside a node heartbeat's budget,
 	// so they get their own handle whose lock wait is short and fixed. The
 	// main pool's connections keep sqliteBusyTimeout; nothing ever changes a
@@ -2839,6 +2843,9 @@ func (s *Store) registerNode(ctx context.Context, identity fabric.Identity, regi
 	}
 	tx := write.tx
 	defer write.rollback()
+	if err := guardGenerationRegistration(ctx, tx, registration); err != nil {
+		return Node{}, err
+	}
 	var storedIdentity, storedBoot string
 	var storedState contract.NodeState
 	var storedCapabilitiesJSON, storedMissingJSON []byte
@@ -2974,6 +2981,27 @@ func (s *Store) registerNode(ctx context.Context, identity fabric.Identity, regi
 			return Node{}, internalError(err, "record node registration condition")
 		}
 	}
+	// Validate the effective stored observation; legacy same-boot registration
+	// may have ignored the incoming capability set.
+	var generationCapabilitiesJSON []byte
+	if registration.AgentGenerationID != "" {
+		if err := tx.QueryRowContext(ctx, `SELECT capabilities_json FROM nodes WHERE node_id=?`, registration.NodeID).Scan(&generationCapabilitiesJSON); err != nil {
+			return Node{}, err
+		}
+		var capabilities map[string]bool
+		if err := json.Unmarshal(generationCapabilitiesJSON, &capabilities); err != nil {
+			return Node{}, err
+		}
+		if err := validateGenerationProtocolObservation(ctx, tx, registration.NodeID, capabilities); err != nil {
+			return Node{}, err
+		}
+	}
+	if err := recordPrimaryGeneration(ctx, tx, registration, now); err != nil {
+		return Node{}, internalError(err, "record primary generation")
+	}
+	if err := refreshPrimaryGenerationObservation(ctx, tx, registration.NodeID, now); err != nil {
+		return Node{}, err
+	}
 	node, err := getNode(ctx, tx, registration.NodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read registered node")
@@ -3063,6 +3091,11 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 		replaceCapabilities = decision == capabilityObservationReplace
 		advanceCapabilityObservedAt = decision == capabilityObservationReplay && incoming.observation.ObservedAt.UnixNano() > storedObservedNS
 	}
+	if replaceCapabilities {
+		if err := validateGenerationProtocolObservation(ctx, tx, nodeID, incoming.observation.Capabilities); err != nil {
+			return Node{}, err
+		}
+	}
 	state := storedState
 	if storedState == contract.NodeAlive || storedState == contract.NodeStale {
 		state = contract.NodeAlive
@@ -3117,6 +3150,9 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 				return Node{}, internalError(err, "record heartbeat capability condition")
 			}
 		}
+	}
+	if err := refreshPrimaryGenerationObservation(ctx, tx, nodeID, now); err != nil {
+		return Node{}, err
 	}
 	node, err := getNode(ctx, tx, nodeID)
 	if err != nil {
@@ -3297,7 +3333,17 @@ WHERE job_id=(
 	    AND NOT EXISTS (
 	      SELECT 1 FROM attempts prior
 	      WHERE prior.node_id=@node_id
-	        AND prior.boot_session_id<>@boot_session_id
+	        AND (prior.boot_session_id<>@boot_session_id OR (
+	          prior.authority_generation<>@authority_generation
+	          AND EXISTS (SELECT 1 FROM node_generation_catalog enrolled WHERE enrolled.node_id=@node_id)
+	        ))
+	        AND NOT EXISTS (SELECT 1 FROM node_generation_residents resident
+	          JOIN node_generations session ON session.node_id=resident.node_id AND session.generation_id=resident.generation_id
+	          WHERE resident.attempt_id=prior.attempt_id AND resident.node_id=prior.node_id
+	            AND resident.job_id=prior.job_id AND resident.boot_session_id=prior.boot_session_id
+	            AND resident.authority_generation=prior.authority_generation AND resident.fencing_token=prior.fencing_token
+	            AND session.role='retiring' AND session.boot_session_id=prior.boot_session_id
+	            AND session.authority_generation=prior.authority_generation)
 	        AND prior.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
 	    )
 	    %s
@@ -3335,6 +3381,7 @@ AND state=@job_queued
 		sql.Named("class", class),
 		sql.Named("node_id", nodeID),
 		sql.Named("boot_session_id", bootSessionID),
+		sql.Named("authority_generation", authorityGeneration),
 		sql.Named("desired_running", contract.ServiceDesiredRunning),
 		sql.Named("attempt_claimed", contract.AttemptClaimed),
 		sql.Named("attempt_running", contract.AttemptRunning),
@@ -4829,6 +4876,7 @@ func recordPublishedPortOccupied(
 }
 
 type attemptAuthority struct {
+	retiringSessionAuthorized  bool
 	attemptID                  string
 	jobID                      string
 	nodeID                     string
@@ -4862,7 +4910,7 @@ func readAttemptAuthority(ctx context.Context, q queryer, attemptID string) (att
 	       a.lease_expires_ns, a.updated_ns, j.current_attempt_id, j.completion_replay_attempt_id,
 	       a.completion_key, a.completion_hash,
 	       j.spec_json, a.image_observation_json, a.image_observation_hash,
-	       j.image_resolution_hash, a.started_ns
+	       j.image_resolution_hash, a.started_ns, `+retiringAttemptAuthoritySQL+`
 FROM attempts a
 JOIN jobs j ON j.job_id=a.job_id
 JOIN nodes n ON n.node_id=a.node_id
@@ -4871,7 +4919,7 @@ JOIN nodes n ON n.node_id=a.node_id
 		&a.state, &a.fencingToken, &leaseNS, &updatedNS, &a.currentAttempt, &a.completionReplayAttempt,
 		&a.completionKey, &a.completionHash,
 		&specJSON, &a.imageObservationJSON, &a.imageObservationHash,
-		&a.jobImageResolutionHash, &a.startedNS)
+		&a.jobImageResolutionHash, &a.startedNS, &a.retiringSessionAuthorized)
 	if errors.Is(err, sql.ErrNoRows) {
 		return attemptAuthority{}, protocolError(contract.ErrorAttemptNotFound, "attempt %q was not found", attemptID)
 	}
@@ -5280,12 +5328,13 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	var intentUpdatedNS sql.NullInt64
 	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json,
 	capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code, state, max_oneshot_slots, max_service_slots,
-	authority_generation, claims_enabled, automatically_admitted, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns, last_condition_json
+	authority_generation, claims_enabled, automatically_admitted, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns, last_condition_json,
+    COALESCE((SELECT generation_id FROM node_generations WHERE node_generations.node_id=nodes.node_id AND role='primary'), '')
 	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.ConnectHost, &node.RootInstanceID, &node.OS, &node.Architecture,
 		&node.AgentVersion, &capabilitiesJSON, &node.CapabilityRevision, &capabilityObservedNS, &missingCapabilitiesJSON,
 		&node.CapabilityReasonCode, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
 		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.AutomaticallyAdmitted, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
-		&node.IntentActor, &heartbeatNS, &conditionData)
+		&node.IntentActor, &heartbeatNS, &conditionData, &node.AgentGenerationID)
 	if err != nil {
 		return Node{}, err
 	}

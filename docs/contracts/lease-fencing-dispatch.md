@@ -137,7 +137,8 @@ accepts it only when `kind:oci` is absent and missing with a member of the
 closed OCI-restriction reason set; for a stored
 same-text boot revision `N`, the registration transaction writes `N+1` and
 returns that authoritative observation. The agent adopts it, so startup uses
-one registration and increments `authority_generation` exactly once; a later
+one registration and, for legacy registration, increments `authority_generation`
+exactly once; generation-aware same-boot rejoin preserves its counter. A later
 positive probe is published by heartbeat at `N+2`.
 
 Capabilities express eligibility only. One-shot and service slots remain the
@@ -207,9 +208,11 @@ The first registration binds the stable operator-facing node ID to the
 authenticated Fabric identity. Later boot sessions may replace that node row
 only from the same Fabric identity, so a transport-internal ID need not leak
 into node configuration and another peer cannot take over the stable ID. Each
-successful registration increments `authority_generation`; a claim binds the
-current generation into its attempt. A replacement boot is embargoed from
-claiming while a non-terminal attempt from another boot session remains. Lease
+legacy registration increments `authority_generation`; generation-aware rejoin
+uses the rules below. A claim binds the
+current authority counter into its attempt. A replacement boot is embargoed
+from claiming while a nonterminal Attempt from another boot remains, except
+for exact authorized retiring residents described below. Lease
 expiry makes the old attempt terminal and clears that embargo without waiting
 for node death. The embargo check, like the one-shot slot count, reads only the
 claiming node's non-terminal attempts, never its whole attempt history (#948).
@@ -284,7 +287,8 @@ order is:
 1. authenticate Fabric identity and verify node ownership;
 2. match job and current attempt;
 3. match the current fencing token;
-4. match the current boot session and authority generation;
+4. match the current boot session and authority generation, or exact authorized
+   retiring resident membership under the generation authority rules below;
 5. verify lease against the control-plane clock;
 6. apply the idempotent mutation.
 
@@ -1540,3 +1544,117 @@ Attempt authority and never increments restart accounting. Other completion
 replay rules remain unchanged. Lost predecessor completion remains late evidence
 and cannot change the queued or successor Job. Prior-boot claim embargo, expiry
 boundaries, log provenance and latest-Attempt result fencing remain unchanged.
+
+## Node agent generation authority (#1174)
+
+L1 supports generation-aware sessions; node-agent retirement and installed
+rolling activation are separate integrations. No existing agent advertises
+`upgrade:retirement:v1` as a result of this L1 change.
+
+`NodeRegistration.agent_generation_id` is optional. Before enrollment, omission
+keeps the legacy registration rules, including advancing the authority counter
+on same-boot registration. Enrollment requires no active legacy Attempts and
+creates the first primary session. After enrollment only that recorded primary
+generation may register. A same-generation, same-boot rejoin preserves its
+counter and resident authority; a fresh boot advances the counter and leaves
+old-boot Attempts under the existing reconciliation and claim embargo rules.
+A retiring or closed identity can never register as primary, even with a new
+boot. Recovery after promotion must stage a fresh generation identity.
+
+The additive durable records are `node_generation_catalog` (L1 promotion
+revision, initially zero), `node_generations` (Node/generation, boot, authority
+counter, role, registration, supported and selected retirement protocols,
+operation ID and timestamps), `node_generation_residents` (exact original
+Job/Attempt/boot/counter/fence membership), and `node_generation_promotions`
+(immutable canonical request and committed result). The session role is
+`staged`, `primary`, `retiring`, or `closed`. One partial unique index permits
+one primary per Node; there is no limit or automatic deadline on retirees.
+
+All new routes are in the agent-principal group and require the Fabric identity
+already bound to the named Node. Inventory contains fences and is not a public
+Node status projection. Request and response schemas are closed in OpenAPI.
+
+| Method and suffix under `/v1/agent/nodes/{node_id}/generations` | Meaning |
+| --- | --- |
+| `GET` (no suffix) | Read all sessions, including closed history, and the current L1 catalog revision in one read-only transaction. |
+| `POST /stage` | Assert a verified ready candidate using a complete `NodeRegistration`, whose `node_id` matches the path. Store its immutable identity and normalized capabilities without granting authority or changing Node facts. Identical staging retries are no-ops. |
+| `POST /promote` | Atomically promote a candidate, freeze the old primary's exact active residents and demote it, retaining every older retiree. |
+| `POST /{generation_id}/heartbeat` | Record only that retiring session's liveness, requiring its original `boot_session_id`. Never change primary liveness, capacity, capabilities, tags, claims intent or Node facts. |
+| `POST /{generation_id}/close` | Close a settled retiring session monotonically under the closure rule below. |
+
+Promotion requires a nonempty `operation_id`, expected primary generation,
+boot and authority counter, candidate generation and boot, exact existing
+`retiring_generation_ids`, and the exact predecessor `resident_attempts`.
+Each resident carries `job_id`, `attempt_id`, `boot_session_id`,
+`authority_generation`, and `fencing_token`. The caller supplies
+`expected_catalog_revision` and its successor `catalog_revision` (exactly +1),
+and the current Node `intent_revision`; admission must already be disabled.
+The L1 catalog revision fences L1 promotions. Local catalog and intent custody,
+readiness verification and activation receipts remain the activation adapter's
+responsibility; this endpoint alone is not permission to activate a process.
+
+Claims and promotion serialize at the same SQLite writer boundary. Thus a
+claim committed before admission closed appears in the resident snapshot; an
+unaccounted or changed resident set refuses promotion. Promotion currently
+requires a plain Mac Node, `selected_protocol=1`, protocol compatibility across
+the candidate and every live primary/retiring generation, and only process
+one-shots among the predecessor's active residents. Services must quiesce first;
+OCI overlap is unsupported. It preserves Node capacity, tags and disabled claim
+intent while replacing the primary's registration facts and advancing the
+authority counter. An identical accepted operation returns its original
+committed inventory even after later promotions. Reusing its ID with changed
+canonical contents, or a fresh operation with stale fences, refuses without
+changing authority. Resident and retiree arrays are compared as identity sets
+with deterministic ordering; duplicate identities refuse.
+
+Supported versions come from normalized positive-decimal
+`upgrade:retirement:vN` capabilities. Malformed declarations refuse. Each session
+retains its own protocol set; primary observations update only that session and
+the Node. A primary cannot withdraw an existing protocol promise while active
+Attempts or another retiring session remain. A retiree heartbeat carries no
+replacement capability observation. A cohort protocol change is refused until
+an acknowledgment mechanism exists; no endpoint silently changes survivors'
+selected protocols.
+
+Execution authority **E** and workload credential authority **CW** recognize
+an authorized retiring session only through its exact resident membership,
+original boot and authority counter. E retains identity, path, current Job
+binding, fence and each endpoint's phase/Lease checks. First completion
+acceptance still requires E. CW retains bearer scope, authenticated Node,
+current Job binding, active phase and live Lease, without a fence check.
+Children retain their normal scope and route to primary/other eligible Nodes;
+retirees cannot claim them. No credential is rotated or injected on promotion.
+
+Historical evidence **O** and identical accepted-completion replay **R** retain
+their existing predicates and ordering. They do not require current session
+membership or a live Lease. Historical logs may still be retained after a
+successor becomes current, but only E-authorized effects may promote execution.
+An unaccepted buffered completion is not R. Mailbox, result publication and
+service health retain their own existing rules; resident service/OCI work must
+quiesce before promotion and acquires no new publication permission.
+
+Every generation shares the Node's existing Slot limits. Active one-shots
+count once, independent of boot or generation. Service occupancy keeps its
+existing class rules. Only exact authorized retiring residents are exempt from
+the predecessor claim embargo; unknown predecessors still block admission.
+For enrolled Nodes, a different authority counter also identifies a predecessor,
+even if a boot ID is reused. Unenrolled legacy Nodes keep their boot-only rule.
+Retiring liveness never makes an unreachable primary alive, or substitutes for
+resident Lease renewal.
+
+`Store.NodeGenerationClosureReady` is the shared L1/custody prerequisite: **each**
+frozen resident must have an authoritative accepted completion or an ended Lease
+under today's rules (absolute expiry or the cancellation settlement deadline at
+equality, or an Attempt already `lost`, including revocation/settlement). A
+missing Attempt or Job row fails closed. A late result on a
+lost Attempt is evidence; its ended Lease supplies the prerequisite. The query
+is read-only and does not settle, close, renew or transfer authority.
+
+Closure additionally requires the exact boot, retiring promotion operation ID
+and resident set, plus authenticated positive `runtimes_reaped=true` and
+`evidence_settled=true` attestations. These flags assert local prerequisites;
+L1 does not inspect processes or custody files. The local retirement and custody
+owners must establish those facts before calling. Custody alone cannot satisfy
+an unaccepted live completion. Closing removes E/CW session recognition and
+never restores primary authority; O/R predicates remain unchanged. Identical
+closure retries do not change the recorded closure timestamp.

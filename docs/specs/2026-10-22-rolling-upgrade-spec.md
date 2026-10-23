@@ -10,7 +10,8 @@ automatic retirement deadline or generation-count limit ends a Run.
 
 > **Status:** approved target for map [#1102](https://github.com/Derek-X-Wang/wefty/issues/1102),
 > specified by [#1173](https://github.com/Derek-X-Wang/wefty/issues/1173).
-> This PR adds vocabulary and an unwired pure compatibility decision only.
+> The initial spec added vocabulary and an unwired pure compatibility decision.
+> L1 session authority is now implemented by #1174; installed activation is unwired.
 > Runtime implementation belongs to #1174–#1181 and acceptance to #1182.
 > The documents in `docs/contracts/` continue to describe built behavior;
 > each implementation ticket moves its completed rules there with its code.
@@ -195,71 +196,24 @@ set order and non-mutation as well as this matrix.
 
 ## 3. L1 roles and transitions (#1174)
 
-Only one session is primary for a Node. Every other live authorized session is
-retiring and owns an exact resident Attempt set. A staged candidate has neither
-role nor claims. Promotion is an idempotent L1 transaction with expected-primary
-and catalog/intent fences. It resolves late claims against the old primary in
-the same authority boundary, binds each to its original resident session, demotes
-that primary to retiring, and grants the candidate primary authority atomically.
-All pre-existing retirees and their Attempts remain unchanged. There is no window
-with two primaries or a session that can claim without being primary.
+L1 generation sessions, fenced/idempotent promotion, exact retiring resident E/CW
+authority, shared Slots, unchanged O/R predicates and the L1 closure prerequisite
+are built in #1174. Their current contract is
+[Node agent generation authority](../contracts/lease-fencing-dispatch.md#node-agent-generation-authority-1174)
+and [generation state transitions](../contracts/state-machines.md#node-agent-generation-sessions-1174).
 
-| Transition | Preconditions and effects |
-| --- | --- |
-| Staged candidate → primary | Verified readiness, compatibility, admission fence and idempotent promotion; previous primary becomes retiring in the same transaction. |
-| Primary → retiring | Only the fenced promotion above; local claims close before publication, in-flight claims settle into the exact resident set. |
-| Retiring → retirement complete | Every resident runtime positively ended/reaped; L1 accepted each resident Attempt's completion or that Attempt's Lease ended under today's rules; pending evidence satisfies section 4. Session closes monotonically; custody alone cannot permit closure. |
-| Primary process restart | Only recorded primary may register a fresh boot; old boot loses authority under existing reconciliation/claim embargo rules. No process adoption. |
-| Retiring process loss/reboot | No replacement execution session. Apply existing Lease loss and Restartable policy; keep evidence for reconciliation. |
-| Staged candidate → discarded | Before promotion only, with positive proof it accepted no work; remove only candidate-owned files. |
+The node agent and installed upgrade path do not use these endpoints yet.
+#1175–#1181 must supply verified readiness, local admission closure/reap,
+activation receipts and evidence custody before claiming installed B1 behavior.
+L1's promotion revision is initially zero and advances exactly once per accepted
+promotion; it does not replace the local installation catalog revision. The
+activation adapter binds both in its receipt. Only protocol 1 is implemented;
+cohort protocol changes refuse until an acknowledgment mechanism exists.
 
-There is **no retiring → primary transition**. Pre-promotion rollback leaves the
-old primary in place. Post-promotion recovery uses a fresh candidate/session and
-the same promotion rules, even if its executable is an older version. It must
-account for work the current primary already accepted. Re-registration, replay,
-or a stale local catalog cannot regain primary authority.
-
-A primary may claim (subject to intent, capacity and capabilities), heartbeat
-Node facts and perform existing authorized Node operations. For a retiree's
-original resident Attempts, preserve L1's separate authority modes from the
-[lease/fencing contract](../contracts/lease-fencing-dispatch.md):
-
-- **Execution authority (E):** extend the registration check to recognize the
-  authorized retiring session. Keep authenticated identity, request path, current
-  Job binding, original fence and each endpoint's phase/Lease predicates. Renewal
-  and **first authoritative completion acceptance** require this authority.
-  Historical evidence or custody cannot substitute for it.
-- **Workload credential authority (CW):** recognize that same authorized retiring
-  session while retaining the existing bearer/scope, bound identity, current Job
-  binding, active phase and live Lease checks. CW still has no fencing-token
-  check. Child-operation scope does not expand; no extra credential is injected.
-- **Original-evidence provenance (O):** historical logs and late result evidence
-  keep their existing predicates, including endpoint-specific removal, continuity,
-  late-window and expiry handling. Do not add current binding, current session
-  or live Lease requirements. `AppendLogs` may retain historical evidence after a
-  Restartable successor becomes current; only its execution-authorized effects
-  may establish live health or promote execution.
-- **Identical accepted-completion replay (R):** keep the existing original
-  provenance, accepted key/canonical-body comparison, non-lost Attempt, replay
-  binding and other endpoint predicates unchanged. Do not require a current
-  session or unexpired Lease merely to replay a completion L1 already accepted.
-  A buffered completion that L1 has never accepted is not an R replay.
-
-Mailbox/result publication retains its existing authorization rules; O/R are
-not a general publication permission. Child submissions route normally to the
-primary/other eligible Nodes; the retiree cannot claim the children.
-
-Retirees cannot claim, change scheduling capabilities, capacity, tags, Node-wide
-intent or primary identity, sweep others' resources, or renew an unrelated
-Attempt. Only E/CW gain recognition of authorized retiring sessions; O/R retain
-their existing authority separation and predicates. Original-evidence provenance
-alone never grants live authority. Use the existing authority module rather than
-endpoint-specific bypasses.
-
-All sessions share one Node's Slot limits. Every live one-shot Attempt counts
-once regardless of generation. Service binding occupancy keeps its existing
-class rules. Unknown predecessors retain the existing claim embargo. Retiring
-session heartbeats never mask an unreachable primary or lost resident Lease.
+Staged candidate discard remains local installation work: before promotion,
+positive proof that it accepted no work permits removal of only candidate-owned
+files. This L1 slice retains staged identities and supplies no file-deletion
+authority. Post-promotion recovery always uses a fresh candidate identity.
 
 ## 4. Local retirement and shared evidence (#1175, #1176)
 
@@ -509,3 +463,22 @@ Deviations from the supplied draft plan/current code assumptions:
 No product-level owner question remains for this slice. The installation startup
 fence, session authority changes and concurrent evidence ownership are required
 implementation work, not capabilities established by this spec or pure gate.
+
+### #1174 implementation notes
+
+- L1 has a separate promotion catalog revision (initially zero, +1 per committed
+  promotion). The installation catalog is local and cannot be independently
+  verified by L1; #1179 must bind both revisions in the activation receipt.
+- Same-generation/same-boot registration is a rejoin and preserves that session's
+  authority counter. Legacy registration still increments the counter as before.
+  A new boot on the recorded primary retains existing fencing/claim-embargo rules.
+- Active services and OCI residents refuse L1 promotion. Service quiescence in
+  #1178 must finish before #1179 promotes; this enforces the existing B1 scope.
+- L1 closure checks accepted completion or ended Lease per resident. Positive
+  reap and settled evidence are authenticated attestations from #1175/#1176;
+  L1 cannot inspect their local runtime or custody files.
+
+- Enrolled Nodes identify unknown predecessors by boot or authority-counter
+  mismatch. Production-path regression testing showed that the legacy boot-only
+  embargo could be bypassed by reusing an older boot ID after a primary restart.
+  Legacy callers retain their existing boot-only behavior.
