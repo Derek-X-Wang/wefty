@@ -431,7 +431,8 @@ func TestExecTempSetupFailureIsInfrastructure(t *testing.T) {
 func TestExecTempLinkRemovalFailurePreservesVerdict(t *testing.T) {
 	for _, exitCode := range []int{0, 1} {
 		t.Run(fmt.Sprint(exitCode), func(t *testing.T) {
-			t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+			root := t.TempDir()
+			t.Setenv("WEFTY_EXEC_STORAGE_ROOT", root)
 			capture, err := captureExec(t.Context(), execTestRepo(t))
 			if err != nil {
 				t.Fatal(err)
@@ -462,6 +463,9 @@ func TestExecTempLinkRemovalFailurePreservesVerdict(t *testing.T) {
 			}
 			waitExecPath(t, capture.Storage, false)
 			waitExecPath(t, link, true)
+			// The delete helper outlives the rename and still owns its trash
+			// and lock folders in the root; TempDir cleanup must not race it (#1197).
+			waitExecStorageEmpty(t, root)
 		})
 	}
 }
