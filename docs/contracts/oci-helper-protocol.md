@@ -746,6 +746,7 @@ heartbeats.
 | `ApplyComputerSeats` | Exact live Computer-attempt authority and the complete wanted place list enter. The helper atomically publishes a rising directive generation and refuses in-place changes or reuse before positive cleanup. See [Per-Seat directives and observations](#per-seat-directives-and-observations). |
 | `ObserveComputerSeats` | Exact live Computer-attempt authority and current directive generation enter. Returns per-place readiness, failure reason, or final cleanup evidence. Probes do not hold owner-control or lifecycle locks. See [Per-Seat directives and observations](#per-seat-directives-and-observations). |
 | `ExecComputerSeat` | Exact live Computer-attempt authority, current directive generation, ready place, argv and positive runtime enter. Streams bounded stdout/stderr and exact exit code or signal; connection cancellation stops only this command. See [Commands inside a ready Seat](#commands-inside-a-ready-seat). |
+| `SetComputerMemoryLimit` | Exact live Computer-attempt authority, current helper Seat generation, and requested byte limit. Grow before adding a Seat; shrink only after positive helper cleanup observation. Reads back the kernel limit and returns the reservation and any room held by use. See [Live Computer memory limit](#live-computer-memory-limit). |
 | `ListRunMailbox` | Exact live attempt plus the exact handoff owner key and run ID that attempt's own `Run` declared; an attempt that declared no mailbox, or that names another run's volume or another run inside its own, is refused before any engine is reached. Returns at most 4096 entry names from the scope's directory and says when the listing reached that cap. It never enumerates anything else and never creates a missing directory. |
 | `ReadRunMailbox` | In the `events` scope, the same exact live-attempt, handoff-owner and declared mailbox run-ID authority as `ListRunMailbox`, plus one bounded entry name. In the `handoff_files` scope, only the exact live attempt and its admitted handoff owner are required: `run_id` may be omitted, and no run-mailbox seed, L3 configuration or run token is needed. A supplied run ID must still match the declared mailbox. A wrong owner, stale authority or a reaped attempt is refused before the engine is reached. Returns at most 64 KiB of one regular file in the `events` scope and at most 640 KiB in the `handoff_files` scope, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file, or that changed identity while being opened, comes back as a positive `unusable` classification in the response rather than as an error, because only that answer lets the caller delete an entry: a transport or authority failure is an error and must never read as junk. An entry that is not there at all comes back as `absent`, which is what an agent-opened directory reports for a missing name, so both implementations of the read answer alike. |
 | `InventoryHandoffVolumes` | Session-authorized, and deliberately not attempt-authorized: it spans every handoff volume this node still holds, and the attempts that produced them are long gone, so no attempt's fence could stand for them. The request carries a page cursor and nothing else, and cannot carry attempt authority -- a body that attaches one is refused as an unknown field; a cursor longer than one fixed scan identity, separator and volume name is refused as an invalid request. It returns, for each volume, the deterministic directory name, the terminal time and whether that came from a helper-owned receipt, logical, deduped and **charged** bytes, entry count, whether a live attempt is still writing there, whether the byte and entry figures are a floor rather than a measurement, and a bounded set of per-volume anomaly tokens from a closed vocabulary. Charged bytes are the node-budget unit and cross the wire rather than being derived on the agent's side: every entry contributes the larger of its deduplicated logical bytes and 4 KiB, which is the identical rule the agent applies to its own handoff root, and no function of a volume total and an entry count reproduces a per-entry floor. **It is a page of one scan, and the pages of one listing are one consistent view.** A request with no cursor runs the prologue, reads the generation, enumerates and measures the whole root once under the existing entry, open and row budgets, then validates that the generation did not move before caching and serving the first page. A changed root is rescanned internally up to the fixed bound; exhausting it returns an incomplete scan. Every later page is cut from that one validated measurement. That is what makes two things true at once. A volume created behind the cursor cannot be shown by no call at all, because pages are not independently measured; and one `(device, inode)` map spans the whole root, so a file two volumes hard-link is charged once however far apart those volumes sort. Per-page dedup would have charged it once per page, and a budget that overstates a node gives up results it did not have to -- which is destructive, not merely inaccurate.
@@ -2221,7 +2222,8 @@ cleanup remains unconfirmed and cannot free Room. A host absence-check failure
 uses observation reason `cleanup_unverified`, distinct from a refusal detail.
 
 The closed Seat refusal detail vocabulary is `in_place_change_requires_remove`,
-`cleanup_not_confirmed`, `generation_mismatch`.
+`cleanup_not_confirmed`, `generation_mismatch`, `attempt_not_live`, `tmpfs_floor`,
+`memory_capacity`, `memory_grow_failed`, `memory_busy`, `memory_thaw_failed`.
 
 Recoverable list conflicts use `seat_operation_refused` with a typed `detail`:
 `cleanup_not_confirmed`
@@ -2508,3 +2510,140 @@ writer that still prints ten seconds after command end. All surviving Seat
 processes must then disappear through positive Seat cleanup. Live-program
 checks reject zombie state `Z`, rather than accepting `kill(pid,0)` alone. Its JSON receipt records IM-3 and secondary CF-3 evidence. Local Mac
 unit tests and Linux cross-checks cannot establish these container outcomes.
+
+## Live Computer memory limit
+
+`SetComputerMemoryLimit` is private and session-authorized. Its closed request
+is `{authority,memory_bytes,generation}`. `memory_bytes` is positive and a
+multiple of 4096. `generation` is the current helper Seat directive generation,
+or zero before the first directive. The boot sweep must have completed.
+The server requires the exact live Computer attempt; foreign and stale
+session authority retain `attempt_outside_session` / `unauthorized_attempt`.
+An attempt that ceases to be live in the engine is refused with
+`seat_operation_refused`, detail `attempt_not_live`. This call grants no new
+Seat and does not change the wanted list.
+
+The response contains `observed_at`, `requested_memory_bytes`,
+`memory_limit_bytes`, `reserved_memory_bytes`, `memory_current_bytes`,
+`held_memory_bytes`, `reason`, `recovered_freeze`, and `freeze_requests`.
+`recovered_freeze` reports that this call found and cleared an abandoned helper
+freeze; `freeze_requests` counts this call's actual writes of `cgroup.freeze=1`.
+The limit is read from cgroup-v2 `memory.max`; usage is the inclusive
+`memory.current`. A successful grow or
+shrink has an empty reason and zero held bytes. If usage prevents a shrink,
+`reason` is `memory_in_use`, the old limit and reservation stay in force, and
+`held_memory_bytes` is their difference from the requested limit. The caller
+can retry the same target after use falls. Held bytes remain committed in
+helper admission, including admission of another Computer. They are not
+returned merely because a Seat ended or the wanted list became shorter.
+The node agent uses the effective reservation, not the requested target, for
+the Room count; durable reservation reconciliation and caller wiring are
+#1142 / #1143, not part of this helper operation.
+
+The node agent must complete a grow before `ApplyComputerSeats` publishes a
+list that adds the Seat. A grow checks the same configured memory capacity,
+infrastructure reserve, and current reservations as Computer admission; the
+newcomer pays. It reserves the larger amount before changing the kernel limit.
+A failed grow with proven unchanged readback returns `seat_operation_refused`
+with detail `memory_grow_failed`; insufficient room uses `memory_capacity`.
+Neither refusal changes the old limit or reservation, and the caller must
+refuse the Seat without publishing its directive. Grows never freeze the
+Computer. If a grow write reports an error but exact readback proves the target,
+the helper accepts that target: it never writes the old, smaller limit back.
+A failed readback is `diagnostic_failure`, never evidence that room is free.
+The larger reservation remains held until a later exact readback proves the
+lower limit, or Computer absence is confirmed. A later call reconciles a
+proved lower limit with the reservation before considering its next resize,
+releasing only that proved difference. An uncertain shrink therefore does not
+permanently block later resizes. Pending shrink provenance consumes cleanup
+only when the lower limit proves that shrink took effect; reconciling a failed
+grow does not consume unrelated Seat cleanup.
+
+A shrink requires at least one removed Seat with final positive cleanup from
+`ObserveComputerSeats` whose room has not yet been returned; every omitted
+Seat must be cleaned. Successful shrink readback consumes those cleanup proofs,
+so cleanup that already returned room cannot release a later grow. A shrink
+held by use preserves its proofs, including across an interleaved grow for a
+new Seat. The caller requests the final target for the remaining Seats, not a
+transient usage sample. Missing proof uses `cleanup_not_confirmed`; a stale
+directive generation uses `generation_mismatch`. Retrying a shrink after use
+falls can reuse its unconsumed confirmed cleanup. All these operations
+serialize with Seat directive and observation work under the Seat mutex.
+Runtime work holds neither `attempt.mu` nor `attempt.controlMu`; live attempt authority is checked again
+before changing the limit and before returning a result.
+
+The helper pins the exact task's host process directory and network namespace,
+checks its cgroup membership against the attempt's resource identity, and pins
+the cgroup-v2 directory for limit, use, and freezer I/O. It samples usage before
+freezing. If use already exceeds the target, it returns held with no freeze.
+Otherwise only a shrink enters the frozen span: confirm frozen state, resample
+use, write the limit only if use is at most the target minus 16 MiB, read back,
+and thaw. The fixed 16 MiB allowance is 1/64 of the default 1 GiB Seat: a modest
+buffer for asynchronous kernel/socket charges that can arrive while userspace
+is frozen, not a measured upper bound on those charges. A frozen sample within
+that margin returns `memory_in_use`, preserving the old limit, reservation,
+and cleanup proofs for a later retry. No containerd call,
+probe, or authority status read occurs inside that span. Live attempt status
+is checked before freezing and again after confirmed thaw, before publication.
+
+One injected-clock deadline bounds the whole freeze-to-thaw span to two seconds,
+including readiness, use resampling, the nonblocking limit write, readback, and
+thaw confirmation. A watchdog begins forced thaw at 1.5 seconds even if the
+shrink's usage or limit read is stalled. The remaining 500 ms is reserved for
+up to three thaw attempts, each requiring both `cgroup.freeze=0` and a current
+`cgroup.events` `frozen 0`. The deadline prevents a new limit write after forced
+thaw. All cgroup file I/O uses nonblocking descriptors; the write and thaw are
+serialized, so the watchdog cannot thaw between the deadline check and the
+single nonblocking limit write. A slow-to-freeze or expired shrink that thaws
+successfully is recoverable `memory_busy`. Expiry at the 1.5-second check may
+follow an applied limit write: the kernel limit may already be lower while
+the old reservation stays held. The next call reconciles it after exact
+readback. Thaw confirmation checks the observed state before the deadline;
+an already confirmed thaw succeeds even when observed after the deadline.
+Request cancellation also triggers
+thaw; cleanup does not inherit the cancelled request context.
+
+An existing freeze belongs to the helper. Every resize, including a grow or a
+held retry, first checks for an abandoned requested or effective freeze. It
+writes thaw, retries up to three times, logs `computer_memory_freeze_abandoned`
+and `computer_memory_freeze_recovered`, and returns `recovered_freeze=true` on
+recovery. It does not report an abandoned freeze as `memory_busy`. A final thaw
+failure logs `computer_memory_thaw_failed` and returns `seat_operation_refused`
+with distinct detail `memory_thaw_failed`: the caller must treat the Computer
+as possibly frozen. This detail takes precedence over any other operation
+failure and does not mark the helper session lost. The two-second successful
+pause bound excludes this explicitly reported failure to thaw.
+
+The helper does not write a shrink below observed use. It writes `memory.max`
+nonblocking and reads it back; `memory.oom.group=1` and `memory.swap.max=0`
+remain unchanged. The capacity mutex covers the transaction: grow reserves
+first, shrink releases only after exact readback and confirmed thaw. No
+successful shrink leaves an oversized reservation.
+
+Known caller obligations and fail-safe limits:
+
+- The reservation is per Job, while the limit is per Attempt cgroup; overlapping Attempts and replacement admission after a grow require #1142's fencing.
+- Cleanup proof is not tied to bytes; with `memory.oom.group=1`, #1143 must pass the true final target for the remaining Seats.
+- A partial shrink consumes every cleanup proof, and reusing a place erases an unreturned proof. Reconciling an earlier uncertain shrink can also consume a newer cleanup proof. All fail safe because room stays held.
+
+**Fixed tmpfs choice:** the helper preserves the creation-time ceilings of all
+six memory-backed mounts, including `/tmp`, `/var/tmp`, `/dev/shm`, and
+`/wefty/seat-status`. It refuses a shrink below twice the creation-time total
+with `seat_operation_refused`, detail `tmpfs_floor`, without changing either
+the limit or the reservation. It does not remount tmpfs. This maintains the
+half-of-limit rule even after a live shrink. The floor is retained in the
+Computer's helper reservation at admission, retaining the largest ceiling
+across overlapping admitted attempts; missing floor facts fail closed.
+
+`TestHelperComputerMemoryRM5` runs as root with `computer_seat_lane` in
+`default-computer-seats / linux/amd64` and
+`default-computer-seats / linux/arm64`. It grows the limit before starting the
+second Seat, removes that Seat, rejects an early shrink, waits for the helper's
+positive cleanup evidence, and verifies a shrink held by the remaining Seat's
+use. After that use ends it checks `memory.max` and the helper reservation
+against the returned limits. After every memory operation it proves requested
+and effective freezer state are both zero. It checks that grow and held shrink
+write no freeze request, and a 960 MiB target reaches the used-cleanup refusal
+before the lower tmpfs floor. Its receipt includes these checks, grow, held,
+and shrink observations, and the tmpfs-floor refusal. Portable fake-runtime
+and session transport tests cover refusal and uncertain-readback paths with injected clocks.

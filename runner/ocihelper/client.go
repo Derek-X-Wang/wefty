@@ -1441,3 +1441,9 @@ func (session *Session) ObserveComputerSeats(ctx context.Context, request Observ
 	err := session.call(ctx, MethodObserveComputerSeats, request, &response)
 	return response, err
 }
+
+func (session *Session) SetComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLimitRequest) (SetComputerMemoryLimitResponse, error) {
+	var response SetComputerMemoryLimitResponse
+	err := session.call(ctx, MethodSetComputerMemoryLimit, request, &response)
+	return response, err
+}
