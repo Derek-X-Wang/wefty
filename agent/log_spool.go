@@ -88,8 +88,10 @@ type logSpool struct {
 	// pendingCountCheckpoint is a test-only scheduling seam for contention at
 	// the pending-count query; production construction always leaves it nil.
 	pendingCountCheckpoint func(context.Context)
-	dispositionMu          sync.Mutex
-	dispositionNext        chan struct{}
+	// inspectCompletionCheckpoint orders lock-contention tests before SQL inspection.
+	inspectCompletionCheckpoint func()
+	dispositionMu               sync.Mutex
+	dispositionNext             chan struct{}
 	// dispositionWaitCheckpoint is a test-only scheduling seam that proves a
 	// waiter reached the pre-commit edge; production construction leaves it nil.
 	dispositionWaitCheckpoint func()
@@ -1249,6 +1251,9 @@ type completionInspectionReceipt struct {
 }
 
 func (spool *logSpool) inspectCompletion(ctx context.Context, attemptID string) completionInspectionReceipt {
+	if spool.inspectCompletionCheckpoint != nil {
+		spool.inspectCompletionCheckpoint()
+	}
 	var resultJSON, incompleteJSON, terminalAuditJSON []byte
 	var finishedNS, receiptFinishedNS sql.NullInt64
 	var disposition, dispositionReason sql.NullString

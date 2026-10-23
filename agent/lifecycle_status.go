@@ -19,6 +19,7 @@ const (
 	LifecycleRejoining   LifecycleState = "rejoining"
 	LifecycleQuarantined LifecycleState = "quarantined"
 	LifecycleDraining    LifecycleState = "draining"
+	LifecycleRetiring    LifecycleState = "retiring"
 )
 
 // AttemptLifecycleState is the local state of one attempt owned by the

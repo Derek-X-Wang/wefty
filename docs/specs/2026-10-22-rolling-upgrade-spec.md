@@ -202,7 +202,8 @@ are built in #1174. Their current contract is
 [Node agent generation authority](../contracts/lease-fencing-dispatch.md#node-agent-generation-authority-1174)
 and [generation state transitions](../contracts/state-machines.md#node-agent-generation-sessions-1174).
 
-The node agent and installed upgrade path do not use these endpoints yet.
+The node agent uses generation inventory, retiring heartbeat and closure in
+#1175. The installed upgrade path does not use these endpoints yet.
 #1175–#1181 must supply verified readiness, local admission closure/reap,
 activation receipts and evidence custody before claiming installed B1 behavior.
 L1's promotion revision is initially zero and advances exactly once per accepted
@@ -218,10 +219,15 @@ authority. Post-promotion recovery always uses a fresh candidate identity.
 ## 4. Local retirement and shared evidence (#1175, #1176)
 
 Retirement is a dedicated local operation, not `Drain`, SIGTERM, context cancel
-or shutdown-budget start. The private authenticated control request binds
-generation, boot session, promotion operation ID and exact resident set; replays
-must be idempotent. Close local claims, join in-flight claims and acknowledge the
-resident set. Preserve process parents, Guardians, output readers, renewal loops,
+or shutdown-budget start. #1175 uses the authenticated L1 generation inventory
+after fenced promotion as its control trigger, instead of adding a second local
+socket. The response binds generation, original boot session, promotion operation
+ID and exact resident set; local observation and `Agent.Retire` replays are
+idempotent. The upgrader closes L1 admission before promotion. The agent joins
+in-flight claim responses under its claim mutex, closes local claims and
+acknowledges the resident set. `--agent-generation-id` supplies the identity;
+installed allocation, activation and full protocol advertisement remain later
+integration work. Preserve process parents, Guardians, output readers, renewal loops,
 mailbox bridges and finalization until their work ends. Both ordinary and
 Restartable process one-shots retain Run/Job/Attempt IDs, fence, process identity
 and restart count. Existing runtime limits, explicit cancellation and Lease expiry
