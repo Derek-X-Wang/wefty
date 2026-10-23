@@ -19,7 +19,7 @@ import (
 // #1135's boot-scoped Seat approval records and windows, then #1174's
 // additive generation catalog, sessions, residents and promotion receipts,
 // then #1137's wanted Seat lists, retained identities and attempt-bound
-// observations. A changed
+// observations, with restart exclusion and deletion cascades. A changed
 // golden means an upgrade across it
 // cannot restore the old binaries (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -36,7 +36,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
-	const mainFingerprint = "61446c62ec0d996a5e9c9bcd92cff6a058824fbff8a47e1042832a2bc0759434"
+	const mainFingerprint = "eff174a657dc7b4a5a71dc462f9af807334c30512977c286139982cff1fd9d1d"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}
