@@ -8,6 +8,152 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-list": {
+      "post": {
+        "operationId": "computerSeatList",
+        "summary": "Read the wanted Seat list for an exact live Computer attempt",
+        "description": "Node agent principal only. Checks authenticated node identity, node ID, current registration and boot session, current Computer Job and Attempt, fence, live phase and lease. The list contains only wanted Seats; IDs are never reused. Reports carry the current wanted revision, a positive helper generation and a rising report sequence; exact retries are idempotent. Observations do not advance durable Seat states or return Room. A changed list returns 409 with details.reason=seat_list_revision_changed on reports. Ready may regress to starting after another place changes.",
+        "parameters": [
+          {
+            "name": "computer_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attempt_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/ComputerSeatAttemptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Current wanted list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/ComputerSeatList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          }
+        }
+      }
+    },
+    "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-observations": {
+      "post": {
+        "operationId": "computerSeatObservations",
+        "summary": "Retain per-Seat helper observations for an exact live Computer attempt",
+        "description": "Node agent principal only. Checks authenticated node identity, node ID, current registration and boot session, current Computer Job and Attempt, fence, live phase and lease. The list contains only wanted Seats; IDs are never reused. Reports carry the current wanted revision, a positive helper generation and a rising report sequence; exact retries are idempotent. Observations do not advance durable Seat states or return Room. A changed list returns 409 with details.reason=seat_list_revision_changed on reports. Ready may regress to starting after another place changes.",
+        "parameters": [
+          {
+            "name": "computer_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attempt_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/ComputerSeatObservationReport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Observations retained.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/ComputerSeatObservationReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          }
+        }
+      }
+    },
     "/v1/agent/seat-approvals": {
       "post": {
         "operationId": "beginSeatApproval",

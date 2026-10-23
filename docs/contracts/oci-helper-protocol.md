@@ -2195,7 +2195,9 @@ read-only, so a replacement is visible. The response is `{generation}`. Each
 changed list advances the attempt-local generation; an identical list is an
 idempotent replay and does not restart deadlines or failed desktops. No
 counter survives the attempt. A helper restart loses observation authority;
-that loss never proves cleanup.
+that loss never proves cleanup. An Apply `diagnostic_failure` may already have
+published the directive and advanced its generation. The node agent must
+re-apply the same list after that error; it must not assume nothing changed.
 
 The helper refuses an in-place config change. First omit the place, observe
 positive cleanup, then add its new config in a later generation. Neither its
@@ -2210,14 +2212,29 @@ positive generation and returns `{generation,seats}`. Each observation is
 `{place,state,reason,cleanup_complete}`. States are `starting`, `ready`,
 `failed`, `removing` and `cleaned`; these are helper observations, **not** the
 durable L1 Seat state machine. An image failure keeps its reason. Failed
-cleanup remains unconfirmed and cannot free Room. Recoverable list conflicts
-use `seat_operation_refused` with a typed `detail`: `cleanup_not_confirmed`
+cleanup remains unconfirmed and cannot free Room. A host absence-check failure
+uses observation reason `cleanup_unverified`, distinct from a refusal detail.
+
+The closed Seat refusal detail vocabulary is `in_place_change_requires_remove`,
+`cleanup_not_confirmed`, `generation_mismatch`.
+
+Recoverable list conflicts use `seat_operation_refused` with a typed `detail`:
+`cleanup_not_confirmed`
 means wait for cleanup and retry; `in_place_change_requires_remove` means omit
 the place, confirm cleanup, then add its new config; `generation_mismatch`
 means use the current directive generation. These refusals do not mutate the
 directive. Read and publication failures retain `diagnostic_failure`. Neither
 code declares loss of the helper session or other attempts. Malformed requests
 and unauthorized attempts retain their existing protocol error codes.
+
+The node agent observes immediately after Apply, then at a one-second interval.
+Each cycle bounds helper work to 20 seconds and each of the two L1 calls to two
+seconds. This leaves margin inside a starting Seat's 60-second deadline;
+readiness is judged when the helper observes, not from an earlier ready file.
+The node agent must keep observing even if an L1 read or report fails. A helper
+refusal means wait and retry; diagnostic failures remain errors and never
+become invented per-Seat failures. A ready-to-starting regression is reported
+as returned, without adding a node agent deadline.
 
 A new place gets its own monotonic 60-second readiness deadline starting
 before its add directive is published. An unchanged starting place retains its

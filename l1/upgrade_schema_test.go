@@ -17,7 +17,9 @@ import (
 // #1090's admin person-device binding and immutable rebind audit schema, then
 // #1134's Computer Seat settings and creation provenance columns, then
 // #1135's boot-scoped Seat approval records and windows, then #1174's
-// additive generation catalog, sessions, residents and promotion receipts. A changed
+// additive generation catalog, sessions, residents and promotion receipts,
+// then #1137's wanted Seat lists, retained identities and attempt-bound
+// observations. A changed
 // golden means an upgrade across it
 // cannot restore the old binaries (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {

@@ -2277,3 +2277,59 @@ See [generation authority](lease-fencing-dispatch.md#node-agent-generation-autho
 for records, routes, fences, protocol observations and the shared per-Attempt
 closure prerequisite. A custody acknowledgment cannot replace first completion
 acceptance, Lease end, positive local reap or settled evidence.
+
+## Computer Seat list and observations (#1137)
+
+This is an observation seam, not the durable Seat lifecycle (#1142). It does
+not approve requests, reserve or return Room, issue Seat credentials, or recover
+Seats after a restart. Requests and approval remain #1143's responsibility.
+
+L1's store-only `SetComputerWantedSeats` replaces a Computer's wanted list with
+an expected-revision check. A changed list advances its revision; an identical
+list is idempotent. A list contains at most the Computer's Seat limit, with
+unique places 1–4. Each `seat_<32 lowercase hex>` identity is permanently bound
+to its Computer and place. Removing a Seat removes only its wanted membership;
+its identity tombstone remains, and that Seat ID can never be reintroduced.
+There is no HTTP route for setting the list. Tests and future lifecycle code
+call the store seam. Stage A starts the Seat loop only for Seat-request-made
+Computers; owner-made Computers retain their existing readiness path. The loop
+starts after runtime Started and is stopped and joined before Attempt completion.
+
+The node agent uses two node-principal-only POST routes below
+`/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}`:
+
+- `/seat-list`: `{node_id,boot_session_id,fencing_token}` returns
+  `{revision,seats:[{seat_id,place}]}`, containing only wanted Seats.
+- `/seat-observations`: `{node_id,boot_session_id,fencing_token,list_revision,
+  generation,sequence,seats:[{seat_id,place,state,reason,cleanup_complete}]}`
+  returns `{accepted:true}` after commit.
+
+Both routes check the authenticated node identity, current node registration
+and boot session, current Computer Job and Attempt, fence, live Attempt phase
+and unexpired lease. The Computer must be running with Seats enabled. Reports
+require the current wanted revision and a positive helper generation. A changed
+revision returns conflict with `details.reason=seat_list_revision_changed`.
+Per-Attempt report sequences rise; helper generations never decrease. An exact
+batch retry at the same sequence is idempotent; a changed retry conflicts.
+Evidence is retained as the latest observation per Seat ID and Attempt, even
+when the Seat leaves the wanted list. It is never carried to another Attempt.
+
+Observation states are the helper's `starting`, `ready`, `failed`, `removing`
+and `cleaned`. Failure reasons pass through. A `ready` Seat may return to
+`starting` when the image must rewrite its answer after another place changes;
+this creates no new deadline. `cleaned` requires `cleanup_complete:true` and
+is final for that Seat and Attempt. Other states cannot claim cleanup. A
+wanted Seat cannot be reported cleaned, and an omitted Seat cannot be reported
+starting or ready. These reports alone do not advance durable Seat states or
+return Room. #1142 must bind any such effect to its own lifecycle authority.
+
+The node agent observes immediately after Apply and then polls every second.
+It bounds each helper cycle to 20 seconds and each L1 operation to two seconds,
+leaving margin within the helper's own 60-second readiness deadlines. It keeps
+observing through L1 read/report failures, retries uncertain Apply with the
+same list, and treats typed helper refusals as wait-and-retry. Its place-to-ID
+binding survives removal until L1 acknowledges cleaned evidence. A replacement
+Seat ID at that place is first omitted, then added in a later helper generation
+after that acknowledgement. Ports are `7100+2*place` (view) and `7101+2*place`
+(control), with image users `seat1`–`seat4`. See
+[the helper contract](oci-helper-protocol.md#per-seat-directives-and-observations).

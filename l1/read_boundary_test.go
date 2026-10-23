@@ -450,6 +450,8 @@ var agentProtocolReadSites = map[string]bool{
 	"server.go:*Server.acknowledgeComputerStorageRetirement": true,
 	"server.go:*Server.acknowledgeComputerStorageCopy":       true,
 	"server.go:*Server.acknowledgeComputerRestoreRetirement": true,
+
+	"computer_seat_observations.go:*Store.GetComputerSeatListForAttempt": true,
 }
 
 func TestReadSnapshotAgentGuardDetectsBypassShapes(t *testing.T) {

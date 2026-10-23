@@ -1273,7 +1273,7 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
 -- log_events at read time since #49, and nothing read the table (#52).
 DROP TABLE IF EXISTS job_log_jsonl;
 `
-	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema); err != nil {
+	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
 	if err := s.migrateAdminPersonDevice(ctx); err != nil {

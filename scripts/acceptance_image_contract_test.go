@@ -1568,3 +1568,31 @@ func TestGoVersionPinsMoveWithGoMod(t *testing.T) {
 		t.Fatal("found no setup-go step to check")
 	}
 }
+
+func TestOCIHelperSeatRefusalDetailsMatchContract(t *testing.T) {
+	source := string(mustReadFile(t, "../runner/ocihelper/computer_seats.go"))
+	pattern := regexp.MustCompile(`(?m)^\s+SeatRefusal\w+\s+SeatOperationRefusalReason = "([a-z_]+)"$`)
+	var implemented []string
+	for _, match := range pattern.FindAllStringSubmatch(source, -1) {
+		implemented = append(implemented, match[1])
+	}
+	if len(implemented) == 0 {
+		t.Fatal("missing implemented Seat refusal detail vocabulary")
+	}
+	document := string(mustReadFile(t, "../docs/contracts/oci-helper-protocol.md"))
+	start := strings.Index(document, "The closed Seat refusal detail vocabulary is ")
+	if start < 0 {
+		t.Fatal("missing closed Seat refusal detail vocabulary")
+	}
+	end := strings.Index(document[start:], ".\n")
+	if end < 0 {
+		t.Fatal("unterminated Seat refusal detail vocabulary")
+	}
+	var published []string
+	for _, match := range regexp.MustCompile("`([a-z_]+)`").FindAllStringSubmatch(document[start:start+end], -1) {
+		published = append(published, match[1])
+	}
+	if !slices.Equal(implemented, published) {
+		t.Fatalf("Seat refusal details: implementation=%v contract=%v", implemented, published)
+	}
+}
