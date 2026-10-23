@@ -89,7 +89,8 @@ type Server struct {
 	connections chan struct{}
 	// dataStreams bounds the connection slots long-lived data streams may hold
 	// to ConnectionLimit minus ControlConnectionReserve.
-	dataStreams chan struct{}
+	dataStreams  chan struct{}
+	seatCommands seatCommandBudget
 	// limitRefusals bounds the goroutines that answer a connection accepted
 	// over ConnectionLimit with a typed connection_limit frame.
 	limitRefusals   chan struct{}

@@ -32,7 +32,7 @@ func TestSeatExecDeadlineIsCommandScopedWithInjectedClock(t *testing.T) {
 					<-ctx.Done()
 					return ctx.Err()
 				}}
-				server := &Server{engine: engine}
+				server := &Server{engine: engine, dataStreams: make(chan struct{}, 56)}
 				session := &serverSession{identity: SessionIdentity{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID}, attempts: map[string]*serverAttempt{authority.key(): {authority: authority, state: attemptLive, computer: true}}}
 				serving, client := net.Pipe()
 				defer client.Close()
@@ -57,7 +57,12 @@ func TestSeatExecDeadlineIsCommandScopedWithInjectedClock(t *testing.T) {
 				if err := newFramedConn(client).read(&result); err != nil {
 					t.Fatal(err)
 				}
-				if result.Error == nil || result.Error.Code != CodeDiagnosticFailure {
+				if stalled && result.OK {
+					if err := newFramedConn(client).read(&result); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if result.Error == nil || result.Error.Code != CodeDiagnosticFailure || result.Error.Detail != DetailSeatCommandRuntimeLimit {
 					t.Fatalf("command deadline was not a scoped diagnostic: %+v", result)
 				}
 				<-done

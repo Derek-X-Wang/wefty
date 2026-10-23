@@ -3,6 +3,7 @@ package ocihelper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -25,9 +26,9 @@ func (e *seatExecProtocolEngine) ExecComputerSeat(ctx context.Context, request E
 	block := e.block
 	e.mu.Unlock()
 	if block {
-		close(e.started)
+		e.started <- struct{}{}
 		<-ctx.Done()
-		close(e.cancelled)
+		e.cancelled <- struct{}{}
 		return ctx.Err()
 	}
 	code := 23
@@ -40,7 +41,7 @@ func (e *seatExecProtocolEngine) ExecComputerSeat(ctx context.Context, request E
 }
 func seatExecSession(t *testing.T) (*Session, *seatExecProtocolEngine, AttemptAuthority) {
 	t.Helper()
-	e := &seatExecProtocolEngine{seatProtocolEngine: &seatProtocolEngine{newFakeEngine(), newComputerSeats(nil, t.TempDir())}, started: make(chan struct{}), cancelled: make(chan struct{})}
+	e := &seatExecProtocolEngine{seatProtocolEngine: &seatProtocolEngine{newFakeEngine(), newComputerSeats(nil, t.TempDir())}, started: make(chan struct{}, 8), cancelled: make(chan struct{}, 8)}
 	client, stop := startTestServer(t, e, ServerConfig{})
 	t.Cleanup(stop)
 	session, err := client.OpenSession(t.Context(), testSessionRequest())
@@ -160,5 +161,46 @@ func TestSeatExecClientDisconnectCancelsOnlyCommand(t *testing.T) {
 	}
 	if _, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{authority, 1}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSeatExecPerSeatLimitLeavesOtherSeatWorking(t *testing.T) {
+	session, e, authority := seatExecSession(t)
+	for place := 1; place <= 2; place++ {
+		e.seats.entries[place] = &computerSeatEntry{config: ComputerSeat{Place: place, User: fmt.Sprintf("seat%d", place)}, wanted: true, ready: true, readyGeneration: 1}
+	}
+	e.mu.Lock()
+	e.block = true
+	e.mu.Unlock()
+	ctx, stop := context.WithCancel(t.Context())
+	defer stop()
+	req := ExecComputerSeatRequest{authority, 1, 1, []string{"sleep", "60"}, time.Hour}
+	done := make(chan error, 3)
+	for i := 0; i < 2; i++ {
+		go func() { done <- session.ExecComputerSeat(ctx, req, nil) }()
+		select {
+		case <-e.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("command did not start")
+		}
+	}
+	refuseCtx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	err := session.ExecComputerSeat(refuseCtx, req, nil)
+	var rpc *RPCError
+	if !errors.As(err, &rpc) || rpc.Code != CodeConnectionLimit || rpc.Detail != "seat_command_limit" {
+		t.Fatalf("Seat consumed unlimited exec slots: %v", err)
+	}
+	other := req
+	other.Place = 2
+	go func() { done <- session.ExecComputerSeat(ctx, other, nil) }()
+	select {
+	case <-e.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("another Seat was starved")
+	}
+	stop()
+	for i := 0; i < 3; i++ {
+		<-done
 	}
 }

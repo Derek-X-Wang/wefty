@@ -24,8 +24,13 @@ func (engine *ContainerdEngine) execComputerSeat(ctx context.Context, request Ex
 	if err := request.validate(); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, request.MaxRuntime)
+	ctx, cancel := context.WithTimeoutCause(ctx, request.MaxRuntime, ErrSeatCommandRuntimeLimit)
 	defer cancel()
+	defer func() {
+		if resultErr != nil && errors.Is(context.Cause(ctx), ErrSeatCommandRuntimeLimit) && errors.Is(resultErr, ctx.Err()) && !seatCommandCleanupUnconfirmed(resultErr) {
+			resultErr = errors.Join(resultErr, ErrSeatCommandRuntimeLimit)
+		}
+	}()
 	stream := newSeatCommandStream(ctx, emit)
 	waitCtx, stopWait := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopWait()
@@ -33,41 +38,48 @@ func (engine *ContainerdEngine) execComputerSeat(ctx context.Context, request Ex
 	if err != nil {
 		return err
 	}
-	// Wait and cleanup retain the containerd namespace but outlive the caller.
+	// Delete only after positive wrapper exit evidence, including escalation.
+	terminal := false
 	defer func() {
-		cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer stop()
-		_, err := process.Delete(cleanup)
-		resultErr = errors.Join(resultErr, err)
+		if terminal {
+			cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer stop()
+			_, err := process.Delete(cleanup)
+			if err != nil {
+				resultErr = &seatCommandCleanupError{errors.Join(resultErr, err)}
+			}
+		}
 	}()
 	var result containerd.ExitStatus
 	select {
-	case result = <-wait:
-	case <-ctx.Done():
-		cleanup, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancelCleanup()
-		if err := process.Kill(cleanup, syscall.SIGTERM); err != nil {
-			// A terminal race is resolved by Wait, never by killing the Computer.
-			status, statusErr := process.Status(cleanup)
-			if statusErr != nil || status.Status != containerd.Stopped {
-				return errors.Join(ctx.Err(), err)
-			}
+	case status, ok := <-wait:
+		if !ok {
+			return errors.New("Seat command exit evidence missing")
 		}
-		select {
-		case result = <-wait:
-		case <-cleanup.Done():
-			// Only the wrapper is addressed. WithKillAll would kill the Computer.
-			last, lastCancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-			defer lastCancel()
-			_ = process.Kill(last, syscall.SIGKILL)
-			return errors.Join(ctx.Err(), errors.New("Seat command wrapper did not stop"))
+		result = status
+		terminal = result.Error() == nil
+	case <-ctx.Done():
+		var stopErr error
+		result, terminal, stopErr = stopSeatCommandProcess(ctx, process, wait)
+		if stopErr != nil {
+			return &seatCommandCleanupError{errors.Join(ctx.Err(), stopErr)}
 		}
 	}
 	if err := result.Error(); err != nil {
-		cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer stop()
-		_ = process.Kill(cleanup, syscall.SIGTERM)
-		return err
+		// A failed wait is not an exit. Recover its observation with a short
+		// registration bound, then stop/reap this exec before deleting it.
+		registerCtx, stopRegister := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		recovered, registerErr := registerSeatCommandWait(registerCtx, waitCtx, process)
+		stopRegister()
+		if registerErr != nil {
+			cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+			defer stop()
+			signalErr := process.Kill(cleanup, syscall.SIGTERM)
+			return &seatCommandCleanupError{errors.Join(err, registerErr, signalErr)}
+		}
+		_, confirmed, stopErr := stopSeatCommandProcess(ctx, process, recovered)
+		terminal = confirmed
+		return &seatCommandCleanupError{errors.Join(err, stopErr)}
 	}
 	if process.IO() != nil {
 		process.IO().Wait()
@@ -88,8 +100,23 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 	if err != nil {
 		return nil, nil, err
 	}
+	operationCtx := ctx
+	ctx, stopStart := context.WithTimeoutCause(ctx, seatCommandStartTimeout, errSeatCommandStartTimeout)
+	defer stopStart()
+	defer func() {
+		if resultErr != nil && errors.Is(context.Cause(ctx), errSeatCommandStartTimeout) {
+			resultErr = errors.Join(resultErr, errSeatCommandStartTimeout)
+		}
+	}()
 	attempt.seatsMu.Lock()
-	defer attempt.seatsMu.Unlock()
+	locked := true
+	unlock := func() {
+		if locked {
+			attempt.seatsMu.Unlock()
+			locked = false
+		}
+	}
+	defer unlock()
 	snapshot, err := snapshotComputerSeatAttempt(ctx, attempt)
 	if err != nil {
 		return nil, nil, err
@@ -121,11 +148,11 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 	// Do not publish command output before the post-start authority check.
 	gate := make(chan struct{})
 	authorized := false
-	gated := newSeatCommandStream(ctx, func(e SeatCommandEvent) error {
+	gated := newSeatCommandStream(operationCtx, func(e SeatCommandEvent) error {
 		select {
 		case <-gate:
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-operationCtx.Done():
+			return operationCtx.Err()
 		}
 		if !authorized {
 			return errors.New("Seat command lost start authority")
@@ -146,35 +173,29 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 	var wait <-chan containerd.ExitStatus
 	defer func() {
 		if !ok {
+			unlock()
 			cancel()
 			close(gate)
-			cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 			defer stop()
-			// A pre-start refusal has no command tree and cannot produce a
-			// Wait result. Delete that created exec directly.
 			status, statusErr := process.Status(cleanup)
-			if statusErr == nil && status.Status == containerd.Created {
-				_, deleteErr := process.Delete(cleanup)
-				resultErr = errors.Join(resultErr, deleteErr)
-				return
-			}
-			_ = process.Kill(cleanup, syscall.SIGTERM)
-			// Let the wrapper handle TERM before deleting it. Immediate KILL
-			// here could strand descendants after a lost post-start fence.
-			if wait != nil {
-				select {
-				case status := <-wait:
-					resultErr = errors.Join(resultErr, status.Error())
-				case <-cleanup.Done():
-					resultErr = errors.Join(resultErr, cleanup.Err())
-					return
+			terminal := statusErr == nil && (status.Status == containerd.Created || status.Status == containerd.Stopped)
+			if !terminal && wait != nil {
+				_, confirmed, stopErr := stopSeatCommandProcess(cleanup, process, wait)
+				terminal = confirmed
+				if stopErr != nil {
+					resultErr = &seatCommandCleanupError{errors.Join(resultErr, stopErr)}
 				}
 			}
-			_, deleteErr := process.Delete(cleanup)
-			resultErr = errors.Join(resultErr, deleteErr)
+			if terminal {
+				_, deleteErr := process.Delete(cleanup)
+				if deleteErr != nil {
+					resultErr = &seatCommandCleanupError{errors.Join(resultErr, deleteErr)}
+				}
+			}
 		}
 	}()
-	wait, err = process.Wait(waitCtx)
+	wait, err = registerSeatCommandWait(ctx, waitCtx, process)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -219,4 +240,59 @@ func confirmSeatCommandReady(snapshot computerSeatAttemptSnapshot, request ExecC
 		return &SeatOperationRefusalError{SeatRefusalCommandNotReady}
 	}
 	return nil
+}
+
+type seatCommandWaitRegistration struct {
+	wait <-chan containerd.ExitStatus
+	err  error
+}
+
+func registerSeatCommandWait(registrationCtx, lifetimeCtx context.Context, process containerd.Process) (<-chan containerd.ExitStatus, error) {
+	registration := make(chan seatCommandWaitRegistration, 1)
+	go func() { wait, err := process.Wait(lifetimeCtx); registration <- seatCommandWaitRegistration{wait, err} }()
+	select {
+	case result := <-registration:
+		return result.wait, result.err
+	case <-registrationCtx.Done():
+		return nil, registrationCtx.Err()
+	}
+}
+
+// The wrapper gives its process group five seconds after TERM. The helper
+// gives the wrapper ten seconds, then forces only that exec process down and
+// waits another two seconds. A stopped wrapper is required before Delete.
+func stopSeatCommandProcess(ctx context.Context, process containerd.Process, wait <-chan containerd.ExitStatus) (containerd.ExitStatus, bool, error) {
+	cleanup, stop := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer stop()
+	if err := process.Kill(cleanup, syscall.SIGTERM); err != nil {
+		status, statusErr := process.Status(cleanup)
+		if statusErr != nil || status.Status != containerd.Stopped {
+			return containerd.ExitStatus{}, false, err
+		}
+	}
+	select {
+	case status, ok := <-wait:
+		if !ok {
+			return containerd.ExitStatus{}, false, errors.New("Seat command exit evidence missing")
+		}
+		return status, status.Error() == nil, status.Error()
+	case <-cleanup.Done():
+	}
+	forced, stopForced := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer stopForced()
+	if err := process.Kill(forced, syscall.SIGKILL); err != nil {
+		status, statusErr := process.Status(forced)
+		if statusErr != nil || status.Status != containerd.Stopped {
+			return containerd.ExitStatus{}, false, err
+		}
+	}
+	select {
+	case status, ok := <-wait:
+		if !ok {
+			return containerd.ExitStatus{}, false, errors.New("Seat command forced-exit evidence missing")
+		}
+		return status, status.Error() == nil, errors.Join(status.Error(), errors.New("Seat command wrapper required KILL; process-tree cleanup unconfirmed"))
+	case <-forced.Done():
+		return containerd.ExitStatus{}, false, errors.New("Seat command wrapper did not exit after KILL")
+	}
 }

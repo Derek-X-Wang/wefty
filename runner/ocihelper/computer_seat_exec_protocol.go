@@ -57,15 +57,29 @@ func (server *Server) dispatchExecComputerSeat(operation *sessionOperation, wire
 		_ = writeFailure(wire, CodeUnsupportedOperation, "Seat commands unavailable")
 		return
 	}
+	release, refusal := server.admitSeatCommand(body)
+	if refusal != nil {
+		_ = writeRPCError(wire, refusal)
+		return
+	}
+	defer release()
 	operation.monitorEOF()
-	ctx, cancel := context.WithTimeout(operation.ctx, body.MaxRuntime)
+	ctx, cancel := context.WithTimeoutCause(operation.ctx, body.MaxRuntime, ErrSeatCommandRuntimeLimit)
 	defer cancel()
-	// This also releases a synchronous write to a connected non-reading client.
+	// A limit stops new events but gives the entire in-flight frame a bounded
+	// chance to finish. Never append a diagnostic behind a truncated frame.
 	deadlineApplied := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() { _ = wire.conn.SetWriteDeadline(time.Now()); close(deadlineApplied) })
+	stop := context.AfterFunc(ctx, func() {
+		_ = wire.conn.SetWriteDeadline(time.Now().Add(seatCommandFrameFinishTimeout))
+		close(deadlineApplied)
+	})
 	defer stop()
 	terminal := false
+	var frameWriteErr error
 	err := engine.ExecComputerSeat(ctx, body, func(event SeatCommandEvent) error {
+		if frameWriteErr != nil {
+			return frameWriteErr
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -76,10 +90,14 @@ func (server *Server) dispatchExecComputerSeat(operation *sessionOperation, wire
 			return errors.New("Seat command output after exit")
 		}
 		terminal = event.Exit != nil
-		return writeSuccess(wire, event)
+		frameWriteErr = writeSuccess(wire, event)
+		return frameWriteErr
 	})
 	if !stop() {
 		<-deadlineApplied
+	}
+	if frameWriteErr != nil {
+		return
 	}
 	// A command deadline is command-scoped. Keep the final diagnostic frame
 	// deliverable so it cannot look like loss of the helper session.
@@ -88,7 +106,13 @@ func (server *Server) dispatchExecComputerSeat(operation *sessionOperation, wire
 		err = errors.New("Seat command has no exit evidence")
 	}
 	if err != nil {
-		_ = writeSeatOperationFailure(wire, err)
+		if !seatCommandCleanupUnconfirmed(err) && (errors.Is(err, ErrSeatCommandRuntimeLimit) || (errors.Is(context.Cause(ctx), ErrSeatCommandRuntimeLimit) && errors.Is(err, context.DeadlineExceeded))) {
+			_ = writeRPCError(wire, &RPCError{Code: CodeDiagnosticFailure, Detail: DetailSeatCommandRuntimeLimit, Message: ErrSeatCommandRuntimeLimit.Error()})
+		} else if !seatCommandCleanupUnconfirmed(err) && errors.Is(err, errSeatCommandStartTimeout) {
+			_ = writeRPCError(wire, &RPCError{Code: CodeDiagnosticFailure, Detail: DetailSeatCommandStartTimeout, Message: errSeatCommandStartTimeout.Error()})
+		} else {
+			_ = writeSeatOperationFailure(wire, err)
+		}
 		return
 	}
 	_ = writeSuccess(wire, nil)

@@ -592,8 +592,9 @@ in the read-only image; password age uses fixed non-zero day 20000.
 
 Every multi-Seat image must provide executable `/usr/bin/python3`
 (Python 3.8 or newer), with the standard library modules `array`, `base64`,
-`fcntl`, `json`, `os`, `selectors`, `signal`, `subprocess`, `sys`, and `termios`,
-including `os.set_blocking` and `os.setsid`. It must run as each Seat uid with
+`errno`, `fcntl`, `json`, `os`, `selectors`, `signal`, `subprocess`, `sys`,
+`termios`, and `time`, including `os.set_blocking`, `os.setsid`, and
+`signal.pthread_sigmask`. It must run as each Seat uid with
 `-I -S`. This applies to custom multi-Seat images as well as the default image;
 it does not apply to generic OCI images or images without Seats.
 
@@ -603,8 +604,13 @@ output buffering, and keeps detached programs from holding a finished command's
 output open. Using the existing interpreter avoids mounting and managing a
 second helper-owned executable. No Seat-installed Python module is imported.
 See [the helper operation](oci-helper-protocol.md#commands-inside-a-ready-seat)
-for environment, stream and cancel semantics. New sessions/double-forked
-programs survive command end; the image's uid-wide Seat cleanup still ends them.
+for environment, stream and cancel semantics. A normal command end also
+preserves plain background writers that retain
+stdout/stderr. A bounded Seat-uid discard reader keeps those pipes readable
+without extending the Run or holding helper connection slots. The image's
+uid-wide cleanup ends both writer and reader. Process-group scope on cancel
+and runtime limit stays unchanged pending the owner decision documented at
+that helper seam.
 
 `CheckSeatCommandRuntime` in `internal/computerconformance` probes the exact
 absolute interpreter path and required imports with `-I -S` as a Seat user.

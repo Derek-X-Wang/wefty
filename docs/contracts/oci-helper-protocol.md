@@ -213,7 +213,11 @@ service client, one take-over view or control leg, or one Computer bridge
 pump -- may hold at most the cap minus a control reserve of 8, so 56. The
 control connection, each live attempt's `Watch`, and control RPCs such as
 `Signal`, `Delete`, and `Run` always keep the remaining 8 however busy a
-published service is. A data stream over its budget is refused after session
+published service is. Seat commands have additional caps: two streams per
+Seat place, four per exact attempt, and sixteen globally (or half the data
+budget when configured smaller). Thus exec can use at most sixteen of the
+default 56 data slots, leaving forty for screens and other endpoint traffic.
+A data stream over its budget is refused after session
 authorization with `connection_limit`. A connection accepted while all 64
 slots are taken has its peer credentials read on the accept loop, which is one
 non-blocking socket option. A peer outside the UID allowlist is closed at once
@@ -2354,7 +2358,18 @@ inheriting the root supervisor's environment or process privileges. Preparation
 and start serialize with Seat directives using `seatsMu`; running and streaming
 do not hold it. Probes, runtime calls and commands hold neither `attempt.mu`
 nor `attempt.controlMu`. Attempt authority is rechecked before publishing
-post-start output.
+post-start output. Exec preparation, wait registration and Start have a
+separate ten-second start deadline, even when `max_runtime` is an hour. The
+running wait retains its own operation lifetime. Failed-start cleanup releases
+`seatsMu` before waiting for runtime cleanup.
+
+Exec admission is non-queued and scoped by exact attempt plus place, across
+Seat directive generations. It allows two active streams per Seat, four per
+attempt, and sixteen helper-wide; for smaller configured data budgets the
+global cap is half that budget. Refusals use `connection_limit` with detail
+`seat_command_limit`, `attempt_command_limit`, or `command_stream_limit`.
+Counters are released when the operation ends, including disconnect and failed
+start. Background discard readers hold no helper stream or connection slot.
 
 ### Output, exit and cancellation
 
@@ -2368,7 +2383,7 @@ have exactly one of these shapes (`data` is JSON base64 for binary-safe bytes):
 {"exit":{"signal":15}}
 ```
 
-Exactly one exit event is required, followed by the empty success frame.
+Successful completion requires exactly one exit event, then the empty success frame.
 `code` includes zero and means a normal exit; `signal` is the positive Unix
 signal number and excludes `code`. Events after exit, contradictory exit fields,
 missing exit, unknown fields or malformed output are errors. A nonzero command
@@ -2381,30 +2396,62 @@ JSON record is at most 8192 bytes; the outer protocol frame bound also applies.
 Two bounded kernel pipes, fixed-sized reads, two bounded record decoders and
 synchronous writes provide backpressure. No output queue, full-output retention
 or Run log is allocated by the helper. At command exit the wrapper snapshots
-the bytes already queued in each pipe and drains exactly that tail, then closes
-them. Continued output from detached programs is not part of the finished
-command. This keeps such programs from holding its output open. Exec streams
-use the data-stream connection budget, preserving the control reserve.
+the queued Run tail and drains exactly that tail. Later background writes are
+not part of the finished Run. If writers remain, it forks a small Seat-uid
+discard reader with the same bounded 4096-byte reads. The reader closes all
+containerd stdio descriptors, creates its own poller, and drains until both
+pipes reach EOF. Thus a plain `cmd &` that keeps logging gets neither SIGPIPE
+nor an extended Run lifetime. Its reader's memory stays bounded and Seat
+uid-wide cleanup stops both reader and writer. Exec streams remain subject to
+the data budget and the narrower command caps above.
 
-Cancel is closing this operation's connection: client context cancellation,
-callback error, client EOF and `max_runtime` all stop only this command. The
-helper sends TERM to this exec wrapper, which sends KILL to the command's
-process group and waits for its leader. It never uses task-wide kill, uid-wide
-kill, or containerd `WithKillAll`. Cleanup has its own bounded context after
-the caller disappears. A deadline interrupts a stalled network write; the
-helper restores a bounded write deadline for the final command-scoped diagnostic
-so a connected client does not mistake a command timeout for session loss.
+A runtime-limit stop is a typed final failure: `diagnostic_failure` with detail
+`runtime_limit` and message "Seat command reached its runtime limit". The CLI
+can combine this fact with the configured `max_runtime` to say, for example,
+"stopped: reached its 1h limit". A ten-second start deadline instead has detail
+`start_timeout`. Other wrapper, containerd, missing-exit, and
+unconfirmed-cleanup failures
+retain `diagnostic_failure` without either limit detail; a coincident limit
+cannot mask an independent mechanics failure. A launch failure reports
+command exit 127 for a missing executable (ENOENT/ENOTDIR), and 126 for an
+executable that cannot run, including permission denied.
 
-The definition of a deliberately detached program is a process which leaves
-this command's process group, conventionally by creating a **new session**
-with `setsid` and double-forking. Ordinary descendants inherit the command's
-process group and are stopped on cancel. Explicit process-group/session changes
-opt out of command cancellation; they do not opt out of Seat cleanup. Programs
-that outlive a command should direct future output to their own files. The
-command itself may exit while such programs continue; a later command sees
-them. Removing the Seat invokes the image's existing uid-wide cleanup, which
-stops even double-forked programs and proves no remaining processes, sockets
-or folder. Cancel does not end the Seat or other commands on it.
+At a limit, no new output event starts. A frame already in flight has five
+seconds to finish, including its entire length-prefixed body, before the typed
+final frame is sent. If that bounded completion fails, the helper closes this
+operation and never appends another frame to its incomplete bytes. The thin
+client treats exec dial, request-write and response-transport errors as
+operation-local: they cannot call `markLost` or produce `RuntimeLossError`.
+Independent control/heartbeat authority continues to detect real session loss;
+a positive typed `session_stale` refusal still means the session is stale.
+
+Cancel is closing this operation's connection. Client context cancellation,
+callback error, EOF and `max_runtime` stop this command. The helper sends TERM
+to the exec wrapper, which sends SIGTERM to the command's process group, gives
+it a five-second grace for cleanup, then sends SIGKILL to remaining group
+members and waits for the leader. The leader PID stays unreaped during grace
+to pin the group identity. It never uses task-wide or uid-wide kill, or
+containerd `WithKillAll`. The helper gives the wrapper ten seconds to exit;
+if it must KILL the wrapper, it waits up to two more seconds for positive exit
+evidence before Delete. Unconfirmed running-exec exit never triggers Delete;
+a never-started `Created` exec can be deleted directly. Cleanup uses contexts
+independent of the vanished caller.
+
+**Held owner decision:** cancellation and the runtime limit still target the
+command's whole process group. A plain `&` program in that group receives TERM
+and KILL too. A program that creates a **new session**, conventionally with
+`setsid` and double-forking, or changes its process group, escapes command
+cancellation. The single `signal_command_group` function is the policy seam;
+this ticket does not settle which plain background programs a future cancel
+must preserve. A normal command end preserves logging background programs,
+whether or not they changed process group.
+
+The wrapper runs as the Seat uid. The command can SIGSTOP or SIGKILL it and
+thereby defeat cooperative process-tree cancellation. A forced wrapper kill is
+reported as unconfirmed tree cleanup. **Seat cleanup is the hard bound:** its
+uid-wide cleanup stops even detached programs and discard readers, and proves
+no remaining processes, sockets or folder. Cancel does not end the Seat or
+other commands on it.
 
 ### Wrapper and image requirement
 
@@ -2424,7 +2471,10 @@ and disabled site imports keep Seat-installed Python modules out of the wrapper.
 `default-computer-seats / linux/amd64` and `default-computer-seats / linux/arm64`.
 It uses the unchanged production profile and helper exec: uid/gid, no extra
 groups, cwd/home, `DISPLAY` and a working X cookie, the complete environment,
-stdout/stderr, exit code and signal, cancellation of a command tree while
-another command survives, and double-fork survival followed by positive Seat
-cleanup. Its JSON receipt records IM-3 and secondary CF-3 evidence. Local Mac
+stdout/stderr, exit code and signal, zero effective/bounding/ambient
+capabilities (ambient if present), `NoNewPrivs=1`, cancellation of a command
+tree while another command survives, double-fork survival, and a plain `&`
+writer that still prints ten seconds after command end. All surviving Seat
+processes must then disappear through positive Seat cleanup. Live-program
+checks reject zombie state `Z`, rather than accepting `kill(pid,0)` alone. Its JSON receipt records IM-3 and secondary CF-3 evidence. Local Mac
 unit tests and Linux cross-checks cannot establish these container outcomes.

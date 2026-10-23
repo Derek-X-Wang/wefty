@@ -1030,7 +1030,7 @@ func (session *Session) call(ctx context.Context, method Method, request, respon
 }
 
 func (session *Session) stream(ctx context.Context, method Method, request any, acknowledge bool, receive func(*framedConn, frame) error) error {
-	connection, wire, err := session.dialRequest(ctx, method, request)
+	connection, wire, err := session.dialRequestInternal(ctx, method, request, method != MethodExecComputerSeat)
 	if err != nil {
 		return err
 	}
@@ -1040,6 +1040,9 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 		if err := wire.read(&response); err != nil {
 			err = fmt.Errorf("receive OCI helper stream: %w", err)
 			err = classifyContextClosedOperation(connection, ctx, err)
+			if method == MethodExecComputerSeat {
+				return err
+			}
 			return session.markOperationFailure(ctx, err)
 		}
 		if response.Version != session.client.protocolVersion() {
@@ -1061,6 +1064,9 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 			if err := writeAll(connection, []byte{1}); err != nil {
 				err = fmt.Errorf("acknowledge OCI helper stream event: %w", err)
 				err = classifyContextClosedOperation(connection, ctx, err)
+				if method == MethodExecComputerSeat {
+					return err
+				}
 				return session.markOperationFailure(ctx, err)
 			}
 		}

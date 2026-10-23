@@ -104,3 +104,23 @@ const containerdMaxExecIDLength = 76
 func seatCommandExecID(capability string) string {
 	return "seat-command-" + capability[:32]
 }
+
+// These details distinguish a command's limits from failed runtime mechanics.
+const DetailSeatCommandRuntimeLimit ErrorDetail = "runtime_limit"
+const DetailSeatCommandStartTimeout ErrorDetail = "start_timeout"
+
+var ErrSeatCommandRuntimeLimit = errors.New("Seat command reached its runtime limit")
+var errSeatCommandStartTimeout = errors.New("Seat command start timed out")
+
+const seatCommandFrameFinishTimeout = 5 * time.Second
+const seatCommandStartTimeout = 10 * time.Second
+
+// Cleanup failure prevents a limit from claiming that the command stopped.
+type seatCommandCleanupError struct{ cause error }
+
+func (e *seatCommandCleanupError) Error() string { return e.cause.Error() }
+func (e *seatCommandCleanupError) Unwrap() error { return e.cause }
+func seatCommandCleanupUnconfirmed(err error) bool {
+	var failure *seatCommandCleanupError
+	return errors.As(err, &failure)
+}

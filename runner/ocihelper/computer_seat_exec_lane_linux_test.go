@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -209,7 +210,8 @@ func TestHelperComputerSeatExecIM3(t *testing.T) {
 	}
 	stdout, stderr, exit := run("python3", "-I", "-S", "-c", `import os,json,subprocess,sys
 subprocess.run(['xdpyinfo'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-print(json.dumps({'uid':os.getuid(),'gid':os.getgid(),'groups':os.getgroups(),'cwd':os.getcwd(),'home':os.environ['HOME'],'display':os.environ['DISPLAY'],'xauthority':os.environ['XAUTHORITY'],'env':dict(os.environ)}))
+security={k:v.strip() for k,v in (line.split(':',1) for line in open('/proc/self/status')) if k in ('CapEff','CapBnd','CapAmb','NoNewPrivs')}
+print(json.dumps({'security':security,'uid':os.getuid(),'gid':os.getgid(),'groups':os.getgroups(),'cwd':os.getcwd(),'home':os.environ['HOME'],'display':os.environ['DISPLAY'],'xauthority':os.environ['XAUTHORITY'],'env':dict(os.environ)}))
 sys.stderr.write('seat-stderr')
 sys.exit(23)`)
 	var identityProof struct {
@@ -217,10 +219,24 @@ sys.exit(23)`)
 		Groups                         []int
 		Cwd, Home, Display, Xauthority string
 		Env                            map[string]string
+		Security                       map[string]string
 	}
 	must(json.Unmarshal(stdout, &identityProof))
 	if identityProof.UID != 2001 || identityProof.GID != 2001 || len(identityProof.Groups) != 0 || identityProof.Cwd != "/wefty/service/seats/1" || identityProof.Home != "/wefty/service/seats/1/home" || identityProof.Display != ":1" || identityProof.Xauthority != "/wefty/service/seats/1/.Xauthority" || string(stderr) != "seat-stderr" || exit.Code == nil || *exit.Code != 23 {
 		t.Fatalf("IM-3: %+v stderr=%s exit=%+v", identityProof, stderr, exit)
+	}
+	for _, field := range []string{"CapEff", "CapBnd", "CapAmb"} {
+		value, present := identityProof.Security[field]
+		if field == "CapAmb" && !present {
+			continue
+		}
+		parsed, err := strconv.ParseUint(value, 16, 64)
+		if !present || err != nil || parsed != 0 {
+			t.Fatalf("Seat retained %s=%q: %v", field, value, err)
+		}
+	}
+	if identityProof.Security["NoNewPrivs"] != "1" {
+		t.Fatalf("Seat exec permits new privileges: %+v", identityProof.Security)
 	}
 	commandConfig, err := attempt.seats.command(request)
 	must(err)
@@ -292,7 +308,10 @@ for pid in sys.argv[1].split():
   state=open('/proc/'+pid+'/stat').read().rsplit(')',1)[1].split()[0]
   assert state=='Z', (pid,state)
  except FileNotFoundError: pass
-for pid in sys.argv[2].split()+[open('run/background.pid').read()]: os.kill(int(pid),0)`, string(cancelledPIDs), string(keeperPIDs))
+for pid in sys.argv[2].split()+[open('run/background.pid').read()]:
+ os.kill(int(pid),0)
+ state=open('/proc/'+pid+'/stat').read().rsplit(')',1)[1].split()[0]
+ assert state!='Z', (pid,state)`, string(cancelledPIDs), string(keeperPIDs))
 	if checkExit.Code == nil || *checkExit.Code != 0 {
 		t.Fatalf("cancel escaped its command: %+v", checkExit)
 	}
@@ -301,6 +320,32 @@ for pid in sys.argv[2].split()+[open('run/background.pid').read()]: os.kill(int(
 	if !errors.Is(mustCancel, context.Canceled) {
 		t.Fatalf("keeper cancel: %v", mustCancel)
 	}
+	// A plain '&' writer keeps its inherited stdout/stderr after its parent
+	// exits. It must survive ten seconds and remain live until Seat cleanup.
+	_, _, printingExit := run("/bin/sh", "-c", `python3 -u -c 'import os,time
+open("run/printing.pid","w").write(str(os.getpid()))
+started=None
+while True:
+ print("background output",flush=True)
+ if started is None and os.path.exists("run/printing-command-ended"):
+  started=time.monotonic()
+ if started is not None and time.monotonic()-started>=10:
+  open("run/printing-survived","w").write("yes")
+ time.sleep(.05)' &`)
+	if printingExit.Code == nil || *printingExit.Code != 0 {
+		t.Fatalf("plain background start: %+v", printingExit)
+	}
+	// Start the ten-second proof only after the command stream has ended.
+	must(os.WriteFile(filepath.Join(seatRoot, "run/printing-command-ended"), []byte("yes"), 0644))
+	printingCtx, stopPrintingWait := context.WithTimeout(ctx, 20*time.Second)
+	defer stopPrintingWait()
+	waitSeatCommandFile(t, printingCtx, filepath.Join(seatRoot, "run/printing-survived"))
+	_, _, printingCheck := run("python3", "-I", "-S", "-c", `pid=open('run/printing.pid').read()
+state=open('/proc/'+pid+'/stat').read().rsplit(')',1)[1].split()[0]
+assert state!='Z',state`)
+	if printingCheck.Code == nil || *printingCheck.Code != 0 {
+		t.Fatalf("printing background program stopped: %+v", printingCheck)
+	}
 	// The background program outlived both its command and another command's
 	// cancel. Part 1 cleanup must now prove there are no processes of this uid.
 	removed, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, nil})
@@ -308,7 +353,7 @@ for pid in sys.argv[2].split()+[open('run/background.pid').read()]: os.kill(int(
 	waitForSeat(removed.Generation, "cleaned")
 	must(confirmComputerSeatAbsent(fmt.Sprintf("/proc/%d", task.Pid()), ComputerSeat{1, "seat1", 7102, 7103}))
 	if output := os.Getenv("WEFTY_HELPER_SEAT_EXEC_EVIDENCE"); output != "" {
-		payload, err := json.MarshalIndent(map[string]any{"version": 1, "acceptance": "IM-3", "secondary": "CF-3", "platform": "linux/" + runtime.GOARCH, "image": imageRef, "uid": identityProof.UID, "gid": identityProof.GID, "supplementary_groups": identityProof.Groups, "cwd": identityProof.Cwd, "home": identityProof.Home, "display": identityProof.Display, "x_cookie_works": true, "environment_only_seat": true, "exit_code": 23, "signal": 15, "cancel_stopped_process_tree": true, "other_command_survived": true, "double_fork_survived_command": true, "double_fork_survived_other_cancel": true, "cleanup_complete": true}, "", "  ")
+		payload, err := json.MarshalIndent(map[string]any{"version": 1, "acceptance": "IM-3", "secondary": "CF-3", "platform": "linux/" + runtime.GOARCH, "image": imageRef, "uid": identityProof.UID, "gid": identityProof.GID, "supplementary_groups": identityProof.Groups, "cwd": identityProof.Cwd, "home": identityProof.Home, "display": identityProof.Display, "x_cookie_works": true, "environment_only_seat": true, "exit_code": 23, "signal": 15, "capabilities_absent": true, "no_new_privileges": true, "plain_background_prints_after_10s": true, "cancel_stopped_process_tree": true, "other_command_survived": true, "double_fork_survived_command": true, "double_fork_survived_other_cancel": true, "cleanup_complete": true}, "", "  ")
 		must(err)
 		must(os.WriteFile(output, payload, 0600))
 	}
