@@ -26,6 +26,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/local"
+	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
@@ -479,6 +480,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if len(issues) > 0 {
 		return setupReport{}, issues[0].err
 	}
+	if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+		return setupReport{}, err
+	}
 	if host.goos == "linux" && (request.convertPlain || request.abandonConversion) {
 		flag := "--convert-plain"
 		if request.abandonConversion {
@@ -538,6 +542,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			return setupReport{}, err
 		}
+	}
+	if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+		return setupReport{}, err
 	}
 	report := setupReport{
 		Profile: paths.profile, NodeConfig: paths.nodeConfig,

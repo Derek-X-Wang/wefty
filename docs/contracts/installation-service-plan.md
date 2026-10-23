@@ -651,3 +651,125 @@ records after the Linux boot time from `/proc/stat`; manager activation alone
 is not readiness. Setup and doctor both report read-only lingering advice,
 including the exact `loginctl enable-linger` command when logout survival is
 disabled or unverified. Neither changes lingering.
+
+
+## Retained node agent installation generations (#1177)
+
+The rolling installation API is opt-in and is not called by `wefty upgrade`
+yet (#1179). With no `agent-generations/` directory, legacy service arguments,
+labels, rendered plist bytes, removal and input digests keep their existing
+behavior. `internal/serviceplan.GenerationArguments` selects a generation's
+arguments without mutating the legacy arguments. Fleet and Linux rolling
+activation remain outside this API's supported installation scope.
+
+`internal/agentinstall.Store` takes the installation resolver's canonical data
+and LaunchAgents directories and an injected `launchagent.Manager`. The caller
+must hold the existing installation lock for installation mutations. Short
+catalog locks serialize private record publication; a separate lock on each
+generation directory stays held for that process's lifetime. Neither lock
+confers L1 authority. Generation startup checks occur before opening profiles,
+participants, managed roots or recovery stores.
+
+The private `DATA/agent-generations/catalog.json` is version 1. It contains the
+stable Node ID, monotonic local revision, exactly one primary ID, any number of
+retiring entries, staged candidates without a role, and an optional unresolved
+activation receipt ID. Random 128-bit lowercase hex generation IDs are allocated
+before activation. Each entry retains its version, SHA-256, creation/promotion/
+retirement times, supported/selected retirement protocol, exact executable,
+label/plist and plist digest, last process binding, and the resident Attempt
+identities supplied by the activation adapter. This is installation inventory,
+never L1 scheduling, renewal or completion authority.
+
+Each executable is copied once, exclusively, to
+`DATA/agent-generations/ID/wefty-agent` with mode `0500`. The private root and
+generation directories are owner-owned real directories with mode `0700`.
+Catalog, readiness, candidate-start, activation and finished receipts are
+owner-owned regular files with mode `0600`. Catalog and record publication is
+atomic and durable. Readers refuse symlinks, permissive modes, changed digests,
+foreign ownership, escaping paths and conflicting identities. Receipt paths
+never grant deletion authority: owned paths are derived from the validated ID.
+These records are private node-local state and are not CLI reports.
+
+Generation labels are `dev.wefty.node-agent.g-ID`. Each public plist carries
+that generation's immutable executable, `--agent-generation-id`,
+`--agent-generation-root`, `--agent-generation-launch-agents` and its own
+`--ready-file`. No credential enters the plist. `LoadCandidate` uses
+`Manager.LoadGeneration` to load a distinct absent label while every existing
+label/PID and executable stays intact. Generic `Converge` can observe an
+unchanged running generation but refuses reloads and stopped-generation starts;
+generic `Unload` refuses generation labels. Ordinary single-label behavior is
+unchanged. No `AbandonProcessGroup` key is added.
+
+A candidate publishes a `candidate_waiting` ready record after the private
+startup fence, before opening profiles, participants or shared runtime state.
+Its boot session is allocated with its preparation record. It waits without
+registration or claims until the catalog records it as primary and clears the
+pending receipt. The activation adapter stages that exact identity at L1 after
+verifying local readiness. An ordinary primary publishes a `registered` ready
+record after first registration.
+`BindReady` requires the expected Node, generation, version, executable digest,
+PID, node-agent boot session, system boot and a post-start timestamp. It also
+requires a fresh service-manager observation of the exact running PID, a held
+generation lifetime lock, and an independent kernel process-start identity
+matching the process's private ready record. A reused PID cannot substitute for
+that incarnation. Unavailable process-start or lock evidence refuses readiness.
+`CommitPromotion` repeats these checks before changing any labels or primary
+selection. The process-start reader uses Darwin's `kern.proc.pid` birth timestamp;
+other platforms refuse rolling activation. An expected candidate boot session comes from its preparation record; a primary's
+expected boot session comes from independently verified registration, not from
+trusting the ready file alone. Launch success or a version match does not
+prove readiness, admission, renewal or installed B1 acceptance.
+
+`BeginPromotion` requires the current local revision, selected protocol 1,
+ready candidate, exact complete cohort, observed resident arrays (an empty
+array means verified idle), intent revision and L1 catalog revision. Its private
+activation receipt binds the expected primary, candidate, every existing
+retiree, process bindings, binary digests, resident Attempt identities, service
+recovery keys, system boot and exact L1 promotion operation ID. The pending
+catalog marker blocks automatic startup until reconciliation.
+`CommitPromotion` requires the adapter's verified exact L1 result, checks the
+candidate's readiness again, persistently disables all predecessor labels,
+changes only their on-disk `RunAtLoad` and `KeepAlive` keys to false, and records
+the new primary and committed receipt before clearing the startup fence. It
+never boots out, reloads or kickstarts a predecessor. The macOS `launchctl(1)`
+manual specifies that a disabled override prevents loading and persists across
+boots; this API uses `disable`, not `bootout`, for live predecessors.
+
+`Startup` rejects a retiring entry before registration or payload execution,
+even when an old loaded definition still has its original KeepAlive policy.
+Suppression exits cleanly, so that policy does not restart a clean exit.
+Candidates receive only one start on their preparation system boot. A primary
+can restart or start after reboot; an unresolved promotion blocks it. Therefore
+only the recorded primary can start a new agent session after reboot. There is
+no process adoption, reboot survival or retirement deadline. #1180 owns
+reconciliation of interrupted promotion records; this slice leaves ambiguity
+closed rather than choosing a winner or rolling back.
+
+`RemoveFinished` requires a receipt-bound exact process identity, current local
+revision, authoritative L1 session closure, positive payload absence and safe
+evidence storage, with the exact evidence digest supplied by the retirement
+adapter. A missing reply, elapsed deadline, custody alone or an empty local
+runtime map is not that proof. The manager must confirm the process is not
+running and the generation process lock must be free. Only then may its label
+be booted out, confirmed absent, and its verified owned executable, ready/start
+records and plist be removed. Cleanup is idempotent across interrupted file
+deletions; private activation/finished receipts remain for audit. Unknown files
+or changed ownership/digests refuse cleanup. One finished retiree does not wait
+for any other retiree.
+
+Until role-aware maintenance is wired, setup (including conversion), remove,
+purge and legacy upgrade refuse the presence of the generation directory,
+even when idle or malformed, before service/file mutation. They recheck under
+the installation lock. This includes upgrade's recursive `.upgrade-*` stale
+staging cleanup. Removal clearly states that retirees may still hold work;
+there is no new force path. Refusal also preserves an unresolved cohort or an
+incomplete first-generation preparation instead of treating it as legacy.
+
+`wefty-agent --retirement-protocols` prints exactly one versioned JSON object
+with `retirement_protocol_versions: [1]` and exits before startup I/O. This is
+binary inspection, not the runtime `upgrade:retirement:v1` advertisement. That
+capability stays withheld until all required integration and shared-evidence
+support is present. #1179 supplies activation sequencing and authority probes;
+#1180 supplies recovery; #1182 supplies real launchd acceptance. Temporary-dir
+fake-manager tests here do not establish installed-stack survival or reboot
+acceptance.

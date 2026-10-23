@@ -69,11 +69,13 @@ func classifyLaunchctlFailure(err error, detail string) error {
 // Agent is one login service. It holds no secrets: every value is visible to
 // anyone who can read the owner's LaunchAgents folder.
 type Agent struct {
-	Label            string
-	Program          string
-	Arguments        []string
-	Environment      map[string]string
-	WorkingDirectory string
+	// SuppressAutostart is used only for recorded retiring generations.
+	SuppressAutostart bool
+	Label             string
+	Program           string
+	Arguments         []string
+	Environment       map[string]string
+	WorkingDirectory  string
 	// LogPath receives both standard output and standard error.
 	LogPath string
 	// ExitTimeOut is how long launchd waits after SIGTERM before SIGKILL; zero
@@ -156,10 +158,14 @@ func Render(agent Agent) ([]byte, error) {
 	}
 	writeString(&output, "StandardOutPath", agent.LogPath)
 	writeString(&output, "StandardErrorPath", agent.LogPath)
-	output.WriteString("  <key>RunAtLoad</key>\n  <true/>\n")
-	output.WriteString("  <key>KeepAlive</key>\n  <dict>\n")
-	output.WriteString("    <key>SuccessfulExit</key>\n    <false/>\n")
-	output.WriteString("  </dict>\n")
+	if agent.SuppressAutostart {
+		output.WriteString("  <key>RunAtLoad</key>\n  <false/>\n  <key>KeepAlive</key>\n  <false/>\n")
+	} else {
+		output.WriteString("  <key>RunAtLoad</key>\n  <true/>\n")
+		output.WriteString("  <key>KeepAlive</key>\n  <dict>\n")
+		output.WriteString("    <key>SuccessfulExit</key>\n    <false/>\n")
+		output.WriteString("  </dict>\n")
+	}
 	output.WriteString("  <key>ThrottleInterval</key>\n  <integer>10</integer>\n")
 	if agent.ExitTimeOut > 0 {
 		output.WriteString("  <key>ExitTimeOut</key>\n  <integer>" + strconv.Itoa(agent.ExitTimeOut) + "</integer>\n")
@@ -236,6 +242,9 @@ func (manager Manager) target(label string) string { return manager.domain() + "
 // returned, because acting on a guess could replace a definition under a
 // process that keeps running the old one.
 func (manager Manager) State(ctx context.Context, label string) (State, error) {
+	if manager.Run == nil {
+		return State{}, errors.New("LaunchAgent manager has no command runner")
+	}
 	output, err := manager.Run(ctx, Launchctl, "print", manager.target(label))
 	if errors.Is(err, ErrServiceNotFound) {
 		return State{}, nil
@@ -281,6 +290,18 @@ func stagingName(name string) string { return "." + name + ".staged" }
 // previous definition is put back and loaded again, so a failure never leaves
 // a service that was running unloaded.
 func (manager Manager) Converge(ctx context.Context, folder *os.Root, path, label string, payload []byte) (Action, error) {
+	return manager.converge(ctx, folder, path, label, payload, false)
+}
+
+// LoadGeneration allows a new generation label without replacing any loaded definition.
+func (manager Manager) LoadGeneration(ctx context.Context, folder *os.Root, path, label string, payload []byte) (Action, error) {
+	if !generationLabel(label) {
+		return "", errors.New("not a generation label")
+	}
+	return manager.converge(ctx, folder, path, label, payload, true)
+}
+func generationLabel(label string) bool { return strings.HasPrefix(label, "dev.wefty.node-agent.g-") }
+func (manager Manager) converge(ctx context.Context, folder *os.Root, path, label string, payload []byte, generationStart bool) (Action, error) {
 	if manager.Run == nil {
 		return "", errors.New("LaunchAgent manager has no command runner")
 	}
@@ -302,6 +323,9 @@ func (manager Manager) Converge(ctx context.Context, folder *os.Root, path, labe
 	}
 	if current && state.Running {
 		return Unchanged, nil
+	}
+	if generationLabel(label) && (state.Loaded || !generationStart) {
+		return "", errors.New("retained generation cannot be reloaded or restarted by Converge")
 	}
 	if current && state.Loaded {
 		if _, err := manager.Run(ctx, Launchctl, "kickstart", manager.target(label)); err != nil {
@@ -430,9 +454,38 @@ func (manager Manager) waitUnloaded(ctx context.Context, label string) error {
 // Unload waits for launchd to confirm absence before callers delete files.
 // A failed inspection or bootout leaves the install intact for a retry.
 func (manager Manager) Unload(ctx context.Context, label string) error {
+	if generationLabel(label) {
+		return errors.New("retained generation requires finished-generation cleanup")
+	}
+	return manager.unload(ctx, label, false)
+}
+
+// UnloadFinishedGeneration refuses a running generation even if a caller has a completion receipt.
+func (manager Manager) UnloadFinishedGeneration(ctx context.Context, label string) error {
+	if !generationLabel(label) {
+		return errors.New("not a generation label")
+	}
+	return manager.unload(ctx, label, true)
+}
+
+// SuppressGenerationStart persists a launchd disabled override without bootout.
+func (manager Manager) SuppressGenerationStart(ctx context.Context, label string) error {
+	if manager.Run == nil {
+		return errors.New("LaunchAgent manager has no command runner")
+	}
+	if !generationLabel(label) {
+		return errors.New("not a generation label")
+	}
+	_, err := manager.Run(ctx, Launchctl, "disable", manager.target(label))
+	return err
+}
+func (manager Manager) unload(ctx context.Context, label string, finished bool) error {
 	state, err := manager.State(ctx, label)
 	if err != nil || !state.Loaded {
 		return err
+	}
+	if finished && state.Running {
+		return errors.New("generation process still running")
 	}
 	if _, err := manager.Run(ctx, Launchctl, "bootout", manager.target(label)); err != nil {
 		return fmt.Errorf("unload LaunchAgent %s: %w", label, err)

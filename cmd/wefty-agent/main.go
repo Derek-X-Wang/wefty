@@ -22,8 +22,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/agent"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
@@ -41,6 +43,13 @@ import (
 const gracefulDrainTimeout = 30 * time.Second
 
 var version = "dev"
+
+// Installed startup fails closed when the kernel boot identity is unavailable.
+// Tests inject this reader without changing the production admission policy.
+var installedGenerationBootIdentity = hostboot.Identity
+
+// Nil selects the kernel process-start reader. Tests inject the OS boundary.
+var installedGenerationProcessStartIdentity func(int) (string, error)
 
 type repeatedStringFlag []string
 
@@ -424,6 +433,13 @@ func (remover macBootstrapRemover) removeBootstrap(instance, limactl, factsPath,
 }
 
 func run() error {
+	// Read-only binary inspection must precede profiles, default directories and stores.
+	if len(os.Args) == 2 && os.Args[1] == "--retirement-protocols" {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			Version  int   `json:"version"`
+			Versions []int `json:"retirement_protocol_versions"`
+		}{1, []int{1}})
+	}
 	if handled, err := serviceplan.ProfilePreflight(os.Args[1:], os.Stdout); handled {
 		return err
 	}
@@ -436,6 +452,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	generationRoot := flag.String("agent-generation-root", "", "private installed generation catalog directory")
+	generationLaunchAgents := flag.String("agent-generation-launch-agents", "", "recorded LaunchAgents directory")
 	var (
 		fabricMode            = flag.String("fabric", "plain", "fabric implementation: plain or tsnet")
 		plainFabricID         = flag.String("plain-fabric-id", os.Getenv("WEFTY_DEV_PLAIN_FABRIC_ID"), "DEVELOPMENT ONLY: shared plain Fabric ID (must start with plain-)")
@@ -488,6 +506,53 @@ func run() error {
 		fmt.Println(version)
 		return nil
 	}
+	var generationStore agentinstall.Store
+	var generationSystemBoot string
+	var generationBootSession string
+	if *generationRoot != "" || *generationLaunchAgents != "" {
+		if *agentGenerationID == "" || filepath.Base(*generationRoot) != agentinstall.Directory {
+			return errors.New("installed generation requires its identity and catalog directory")
+		}
+		generationStore = agentinstall.Store{Data: filepath.Dir(*generationRoot), LaunchAgents: *generationLaunchAgents, ProcessStartIdentity: installedGenerationProcessStartIdentity}
+		generationSystemBoot, err = installedGenerationBootIdentity()
+		if err != nil {
+			return err
+		}
+		// Read only the catalog Node ID here. The resolved profile is checked below
+		// before registration. No participant or managed state has opened yet.
+		catalog, err := generationStore.Read()
+		if err != nil {
+			return err
+		}
+		release, err := generationStore.Startup(*agentGenerationID, catalog.NodeID, agentExecutable, generationSystemBoot)
+		if errors.Is(err, agentinstall.ErrStartupSuppressed) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		defer release()
+		g := catalog.Generations[*agentGenerationID]
+		if g.Role == "" {
+			generationBootSession = g.CandidateBootSessionID
+			if *readyFile != generationStore.ReadyPath(g.ID) {
+				return errors.New("candidate ready path mismatch")
+			}
+			waiting, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			if err := generationStore.PublishReady(g.ID, catalog.NodeID, version, agentExecutable, generationBootSession, generationSystemBoot); err != nil {
+				stop()
+				return err
+			}
+			err := generationStore.AwaitActivation(waiting, g.ID)
+			stop()
+			if errors.Is(err, context.Canceled) || errors.Is(err, agentinstall.ErrStartupSuppressed) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+		}
+	}
 	if *seatApprovalAnswerWait > l1.MaxSeatApprovalWait {
 		return errors.New("Seat approval answer wait must not exceed 1h")
 	}
@@ -521,6 +586,15 @@ func run() error {
 	layer.Fill(nodeID, "node-id", "", settings.NodeID)
 	if *nodeID == "" {
 		return fmt.Errorf("--node-id is required")
+	}
+	if *generationRoot != "" {
+		catalog, err := generationStore.Read()
+		if err != nil {
+			return err
+		}
+		if catalog.NodeID != *nodeID {
+			return errors.New("installed generation Node ID differs from profile")
+		}
 	}
 	if *shutdownBudget < 0 {
 		return errors.New("--shutdown-budget must not be negative")
@@ -611,9 +685,12 @@ func run() error {
 		return err
 	}
 
-	bootSessionID, err := agent.NewBootSessionID()
-	if err != nil {
-		return err
+	bootSessionID := generationBootSession
+	if bootSessionID == "" {
+		bootSessionID, err = agent.NewBootSessionID()
+		if err != nil {
+			return err
+		}
 	}
 	capabilities := defaultAgentCapabilities()
 	runtimes := make(map[string]workloadrunner.WorkloadRuntime)
@@ -1026,7 +1103,16 @@ func run() error {
 		case <-ctx.Done():
 			readyDone <- nil
 		case <-nodeAgent.Registered():
-			publishErr := serviceready.Publish(*readyFile, serviceready.Metadata{NodeID: *nodeID, BootSessionID: bootSessionID, ImmediateHeartbeat: immediateHeartbeat})
+			var publishErr error
+			if *generationRoot != "" {
+				if *readyFile != generationStore.ReadyPath(*agentGenerationID) {
+					publishErr = errors.New("installed generation ready path mismatch")
+				} else {
+					publishErr = generationStore.PublishReady(*agentGenerationID, *nodeID, version, agentExecutable, bootSessionID, generationSystemBoot)
+				}
+			} else {
+				publishErr = serviceready.Publish(*readyFile, serviceready.Metadata{NodeID: *nodeID, BootSessionID: bootSessionID, ImmediateHeartbeat: immediateHeartbeat})
+			}
 			if publishErr != nil {
 				cancel()
 			}
