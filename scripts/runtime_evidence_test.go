@@ -14,6 +14,35 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
 )
 
+func TestShmMutationAcceptsScaledProfileFailureAndRejectsExtraFailures(t *testing.T) {
+	script, err := os.ReadFile("test-computer-image-runtime.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := regexp.MustCompile(`(?m)^run_mutation shm-too-small ([^ ]+) '([^']+)'$`).FindSubmatch(script)
+	if len(row) != 3 {
+		t.Fatal("missing shm-too-small mutation row")
+	}
+	for _, extraFailure := range []bool{false, true} {
+		// Replay the checker's observed 1 GiB-profile failure through the exact
+		// mutation arguments used by all four reference-image CI jobs.
+		checks := `{"id":"harness.shm-size","status":"FAIL","detail":"/dev/shm ceiling is not 256 MiB","failure_reason":"mutation_detected"}`
+		if extraFailure {
+			checks += `,{"id":"input.control-accepted","status":"FAIL","detail":"input lost","failure_reason":"assertion_failed"}`
+		}
+		receipt := filepath.Join(t.TempDir(), "shm.json")
+		payload := `{"version":2,"checks":[` + checks + `],"teardown":{"retries_used":0,"permission_repair_performed":false,"observations":[],"leftovers":[]}}`
+		if err := os.WriteFile(receipt, []byte(payload), 0600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("bash", "./check-computer-image-runtime-evidence.sh", "mutation", receipt, "shm-too-small", string(row[1]), string(row[2]), "1", "15")
+		output, err := command.CombinedOutput()
+		if (err == nil) == extraFailure {
+			t.Fatalf("extra failure=%t: err=%v output=%s", extraFailure, err, output)
+		}
+	}
+}
+
 func TestReadinessCheckEventPairingsMatchRecorderAndJQ(t *testing.T) {
 	_, source, _, ok := runtime.Caller(0)
 	if !ok {

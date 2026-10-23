@@ -72,7 +72,7 @@ func TestServiceAcceptancePinnedRuntimeProfiles(t *testing.T) {
 				}
 				assertMount(t, profile.Mounts, "/wefty/service", "/run/wefty/fixtures/computer-disk", false)
 				assertMount(t, profile.Mounts, "/wefty/control", "/run/wefty/fixtures/control", true)
-				assertExactMount(t, profile.Mounts, specs.Mount{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=1048576k"}})
+				assertExactMount(t, profile.Mounts, specs.Mount{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=131072k"}})
 				if environmentValue(profile.Process.Env, "WEFTY_COMPUTER_VIEW_PORT") != "42111" ||
 					environmentValue(profile.Process.Env, "WEFTY_COMPUTER_CONTROL_PORT") != "42112" ||
 					environmentValue(profile.Process.Env, "WEFTY_SERVICE_PORT") != "" ||

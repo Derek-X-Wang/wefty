@@ -363,6 +363,7 @@
   "desired_state": "running",
   "display_endpoint": null,
   "grants": [],
+  "idle_action": "nothing",
   "intent_revision": 1,
   "last_condition": {
     "code": "computer_intent_create",
@@ -376,8 +377,11 @@
     "since": "2026-08-09T10:00:00Z"
   },
   "name": "backup-computer",
+  "network": "internet",
   "placement_node_id": "computer-node",
   "reconfiguration_phase": "stable",
+  "seat_limit": 0,
+  "seat_request_made": false,
   "storage_generation": 1,
   "storage_id": "STORAGE",
   "submit_enabled": false,

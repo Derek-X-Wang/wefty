@@ -1,0 +1,5 @@
+# A real negative image: the uid exists in /etc/group but has no passwd entry.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN sed -i '/^seat4:/d' /etc/passwd

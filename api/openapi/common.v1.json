@@ -577,12 +577,17 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
+          "seat_limit", "idle_action", "network", "seat_request_made",
           "computer_id", "name", "placement_node_id", "grants", "storage_id", "storage_generation", "desired_disk_bytes",
           "desired_state", "intent_revision", "applied_revision", "current_job_id",
           "current_spec_revision", "backup_cap", "reconfiguration_phase", "submit_enabled", "submit_intent_revision",
           "submit_max_inflight", "submit_policy_revision", "display_endpoint", "controller_tenure", "allowed_actions", "last_condition", "current_job", "created_at", "updated_at"
         ],
         "properties": {
+          "seat_limit": { "type": "integer", "minimum": 0 },
+          "idle_action": { "type": "string", "enum": ["delete", "stop", "nothing"] },
+          "network": { "type": "string", "enum": ["internet", "none"] },
+          "seat_request_made": { "type": "boolean" },
           "computer_id": { "type": "string", "minLength": 1 },
           "name": { "type": "string", "minLength": 1, "maxLength": 255 },
           "placement_node_id": { "type": "string", "minLength": 1 },
@@ -1534,6 +1539,10 @@
     "additionalProperties": false,
     "required": ["computer_id", "storage_id", "storage_generation", "intent_revision", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "submit_policy_revision", "disk_bytes"],
     "properties": {
+      "seat_limit": { "type": "integer", "minimum": 0 },
+      "idle_action": { "type": "string", "enum": ["delete", "stop", "nothing"] },
+      "network": { "type": "string", "enum": ["internet", "none"] },
+      "seat_request_made": { "type": "boolean" },
       "computer_id": { "type": "string", "minLength": 1 },
       "storage_id": { "type": "string", "minLength": 1 },
       "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },

@@ -70,7 +70,14 @@ wefty node oci stop
 
 `oci start` restores transport, completes the boot sweep barrier and functional probe, then advertises capability. `oci stop` persists disabled first, withdraws local admission and publication, reaps OCI attempts, and then stops Lima on Mac; Linux containerd is left alone.
 
-An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, and zero live OCI attempts. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
+An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, zero live OCI attempts, and positive proof that no Computer Storage generation or Backup copy remains on the host VM disk. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
+
+Stopped Computers keep their Storage and therefore block recreation too. The
+shared guard stops helper writes while it inspects the durable guest files.
+A stopped or unavailable host VM refuses inspection; the guard never starts it.
+If necessary, explicitly start OCI before rerunning setup. Backup supersession
+records alone do not block; they may be lost once no Storage or copy remains.
+See `host_vm_recreate_blocked` below for owner actions and recovery limits.
 
 ## Connect to a Computer
 
@@ -559,7 +566,32 @@ Meaning: sizing differs and requires an authorized restart. Evidence: record old
 
 ## doctor-code-oci-convergence-recreate-required
 
-Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference and positive zero-live-attempt proof. First action: obtain explicit operator confirmation, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory.
+Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference, positive zero-live-attempt proof, and a current absence proof for Computer Storage and Backup copies. First action: obtain explicit operator confirmation, remove or export the named retained data through owner operations if needed, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory; `host_vm_recreate_blocked` is not an acknowledged-loss override.
+
+## host-vm-recreate-blocked
+
+`host_vm_recreate_blocked` is a node-local HTTP 409 refusal and CLI exit 5,
+with `retryable=false`. In JSON, nonempty `details.blockers` names Computer,
+Storage, Backup and copy IDs from helper manifests; `details.reason` explains
+an unavailable or invalid inventory. Human output carries the same explanation.
+Remove or export the named Computer or Backup, then manually rerun setup with
+`--recreate`. If an identity is unavailable, inspect its helper record before
+choosing an owner operation. A refused-copy record is not an allocated Storage
+generation, but still requires inspection and blocks deletion.
+
+If the host VM is stopped, start OCI explicitly before a new inspection. A
+missing lazy runtime root is empty only when its real parent enumerates
+successfully. Do not infer absence from a failed read or delete Storage files
+to silence the guard. Supersession records are ignored only when they are
+regular files named `wefty-backup-copy-<32 lowercase hex>.json` or
+`.supersession.tmp-*` with a nonempty suffix. Other names block as unexpected
+Backup supersession entries.
+
+The refusal is not retried automatically. After an attempted inventory command
+fails, or Lima deletion fails, Go attempts bounded helper socket restoration
+even after request cancellation. A refusal before inventory does not access the
+guest. Inspect the node agent log if that best-effort restoration fails. The
+original refusal remains the command's answer.
 
 ## doctor-code-oci-attempt-ownership-quarantine-not-run
 

@@ -1,0 +1,4 @@
+root:x:0:0:root:/root:/bin/sh
+seat1:x:2001:2001::/wefty/service/seats/1/home:/bin/sh
+seat2:x:2002:2002::/wefty/service/seats/2/home:/bin/sh
+seat3:x:2003:2003::/wefty/service/seats/3/home:/bin/sh

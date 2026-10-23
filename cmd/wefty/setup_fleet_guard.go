@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 )
 
 // refuseRecordedFleetRole fences legacy upgrade/removal before locks, recovery,
@@ -27,6 +29,9 @@ func refuseRecordedFleetRole(paths setupPaths, command string) error {
 		return nil
 	}
 	if err != nil {
+		if canRepairPlainSetupReceipt(paths) {
+			return nil
+		}
 		return fmt.Errorf("%s cannot verify the installation role: %w", command, err)
 	}
 	var metadata map[string]json.RawMessage
@@ -46,4 +51,25 @@ func refuseRecordedFleetRole(paths setupPaths, command string) error {
 		return fmt.Errorf("%s refuses recorded fleet role %q; use the recorded role’s supported maintenance path for %s", command, role, command)
 	}
 	return nil
+}
+
+// An unreadable receipt alone must not disable repair of a recorded plain
+// installation. Fleet stages and profiles still fence legacy maintenance.
+func canRepairPlainSetupReceipt(paths setupPaths) bool {
+	root, err := os.OpenRoot(paths.home)
+	if err != nil {
+		return false
+	}
+	defer root.Close()
+	for _, name := range []string{fleetSetupRecordName, fleetSetupProfileName} {
+		if _, err := root.Lstat(filepath.Join(paths.configRel, name)); !errors.Is(err, fs.ErrNotExist) {
+			return false
+		}
+	}
+	payload, err := root.ReadFile(filepath.Join(paths.configRel, connprofile.FileName))
+	if err != nil {
+		return false
+	}
+	var profile connprofile.Profile
+	return json.Unmarshal(payload, &profile) == nil && profile.Fabric == "plain" && profile.Validate() == nil
 }

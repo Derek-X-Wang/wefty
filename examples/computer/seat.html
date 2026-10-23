@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Wefty Seat</title>
+<style>
+  body {margin:0; font:24px sans-serif; color:white; background:#182030}
+  #strip {height:160px}
+  main {padding:40px}
+</style>
+<div id="strip"></div>
+<main><h1>Wefty Seat <span id="place"></span></h1>
+<p>Your desktop, browser and files are ready.</p>
+<p>Install test tools and browsers in your Seat folder.</p></main>
+<script>
+const place = new URLSearchParams(location.search).get('place');
+document.querySelector('#place').textContent = place;
+const strip = document.querySelector('#strip');
+strip.style.background = ['#ff0000', '#0000aa', '#aa00aa', '#aaaa00'][Number(place)-1];
+for (const event of ['pointerdown', 'keydown']) {
+  document.body.addEventListener(event, () => { strip.style.background = '#00ff00'; });
+}
+document.title = `wefty-seat-${place}-ready`;
+</script>
+</html>

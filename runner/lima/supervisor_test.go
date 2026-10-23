@@ -712,28 +712,16 @@ func TestSupervisedBarrierCycleAcquisitionHonorsContext(t *testing.T) {
 }
 
 func TestSupervisedBarrierRecreateDeletesAndStartsFromExplicitTemplate(t *testing.T) {
-	intent := newMutableIntent(true)
-	runner := &supervisorRunner{}
-	supervisor := newTestSupervisor(t, intent, runner)
-	client := &ocihelper.Client{
-		Version: ocihelper.ProtocolVersion, ExpectedChecksum: "sha256:" + strings.Repeat("a", 64),
-		Dial: func(context.Context) (net.Conn, error) { return nil, errors.New("not reached") },
+	f := newRecreateFixture(t)
+	if err := f.recreate(t); err != nil || !f.quiesced || !f.recovered {
+		t.Fatalf("recreate quiesced=%t recovered=%t err=%v", f.quiesced, f.recovered, err)
 	}
-	helperBarrier, err := ocihelper.NewBootBarrier(client, ocihelper.AcquireSessionRequest{NodeID: "node", BootSessionID: "boot"})
-	if err != nil {
-		t.Fatal(err)
+	if !f.helperStopped {
+		t.Fatal("empty-disk inspection did not fence helper writes before deletion")
 	}
-	barrier := &SupervisedBootBarrier{Supervisor: supervisor, Barrier: helperBarrier}
-	quiesced, recovered := false, false
-	err = barrier.Recreate(t.Context(), func(context.Context) error { quiesced = true; return nil }, func(context.Context) error { recovered = true; return nil }, TemplateConfig{
-		Sizing: Sizing{Memory: "4GiB", CPUs: 4, Disk: "32GiB"}, HostAllowedMountRoot: "/Users/operator/wefty",
-	})
-	if err != nil || !quiesced || !recovered {
-		t.Fatalf("recreate quiesced=%t recovered=%t err=%v", quiesced, recovered, err)
-	}
-	commands := runner.commandsSnapshot()
-	if len(commands) != 2 || !reflect.DeepEqual(commands[0], []string{"limactl", "delete", "--force", DefaultInstanceName}) ||
-		len(commands[1]) != 4 || commands[1][1] != "start" || commands[1][2] != "--name="+DefaultInstanceName || !filepath.IsAbs(commands[1][3]) {
+	commands := f.commands
+	if len(commands) != 4 || !reflect.DeepEqual(commands[2], []string{"delete", "--force", DefaultInstanceName}) ||
+		len(commands[3]) != 3 || commands[3][0] != "start" || commands[3][1] != "--name="+DefaultInstanceName || !filepath.IsAbs(commands[3][2]) {
 		t.Fatalf("recreate commands=%v", commands)
 	}
 }

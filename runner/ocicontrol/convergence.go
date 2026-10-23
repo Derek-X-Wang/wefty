@@ -50,6 +50,9 @@ func ClassifyConvergence(current, desired SetupState) ConvergenceClass {
 	return ConvergenceLiveSafe
 }
 
+// AuthorizeConvergence checks operator intent and live attempts. Host VM disk
+// absence is a separate mandatory guard at Lima's serialized delete boundary;
+// this authorization alone must never be used as permission to delete a disk.
 func AuthorizeConvergence(class ConvergenceClass, applyRestart, recreate bool, liveOCIAttempts int) error {
 	if !class.Valid() || liveOCIAttempts < 0 {
 		return errors.New("invalid OCI setup convergence state")

@@ -37,8 +37,8 @@ const (
 	containerRootfsPath          = "rootfs"
 	containerdRuntimeSpecTypeURL = "types.containerd.io/opencontainers/runtime-spec/1/Spec"
 	defaultCPUPeriodMicroseconds = uint64(100_000)
-	// OWNER-CALL: Computer desktops need a browser-sized /tmp; the combined
-	// cgroup-charged tmpfs ceilings must be reviewed against the 1 GiB default.
+	// Upper bounds for scratch scaling. Computer mounts scale
+	// with the actual cap; all six tmpfs ceilings stay within half of it.
 	computerTmpKilobytes    = 512 * 1024
 	computerVarTmpKilobytes = 64 * 1024
 	computerDevShmKilobytes = contract.ComputerDevShmBytes / 1024
@@ -289,13 +289,16 @@ func profileReceipt(workload WorkloadInput) ProfileReceipt {
 	if !workload.Computer {
 		return receipt
 	}
+	limits := computerScratchKilobytes(workload.Limits.MemoryBytes)
 	ceilings := []struct {
 		target string
 		bytes  int64
-	}{
-		{target: "/dev/shm", bytes: computerDevShmKilobytes * 1024},
-		{target: "/tmp", bytes: computerTmpKilobytes * 1024},
-		{target: "/var/tmp", bytes: computerVarTmpKilobytes * 1024},
+	}{}
+	for _, target := range []string{"/dev/shm", "/tmp", "/var/tmp", "/run", "/dev", "/wefty/seat-status"} {
+		ceilings = append(ceilings, struct {
+			target string
+			bytes  int64
+		}{target, limits[target] * 1024})
 	}
 	for _, ceiling := range ceilings {
 		receipt.ComputerTmpfsCeilingBytes += ceiling.bytes
@@ -501,6 +504,18 @@ func within(path, ancestor string) bool {
 }
 
 func validateRuntimeSpecInput(input RuntimeSpecInput, validateSource func(string, []string, bool) error) error {
+	if input.Workload.Computer {
+		if input.Workload.Limits.MemoryBytes > 0 && input.Workload.Limits.MemoryBytes < 48*1024 {
+			return errors.New("Computer memory limit is too small for bounded scratch")
+		}
+		for _, mount := range input.Workload.OperatorMounts {
+			target := path.Clean(mount.ContainerPath)
+			if target == "/wefty/seat-status" || within(target, "/wefty/seat-status") || within("/wefty/seat-status", target) {
+				return errors.New("operator mount conflicts with helper-owned Seat status")
+			}
+		}
+	}
+
 	if strings.TrimSpace(input.ContainerID) == "" || strings.IndexByte(input.ContainerID, 0) >= 0 {
 		return errors.New("container ID is required")
 	}
@@ -701,29 +716,67 @@ func isolationResources(limits WorkloadLimits, computer bool) (*specs.LinuxResou
 	return resources, nil
 }
 
+// computerScratchKilobytes reserves no RAM. It sets page-aligned ceilings.
+// A 1 GiB Computer gets shm=256, tmp=128, var/tmp=16, run=32, dev=32,
+// status=1 MiB (465 MiB total). Floors yield to the half-cap budget for tiny
+// Computers; the 1 GiB default keeps Chromium well above a 64 MiB shm mount.
+func computerScratchKilobytes(memory int64) map[string]int64 {
+	if memory <= 0 {
+		memory = 4 << 30
+	}
+	budget := memory / 2 / 4096
+	status := min(int64(256), max(int64(1), budget/16))
+	limits := map[string]int64{"/wefty/seat-status": status}
+	targets := []string{"/dev/shm", "/tmp", "/var/tmp", "/run", "/dev"}
+	divisors := []int64{4, 8, 64, 32, 32}
+	floors := []int64{64 << 20, 16 << 20, 4 << 20, 4 << 20, 4 << 20}
+	maxima := []int64{computerDevShmKilobytes * 1024, computerTmpKilobytes * 1024, computerVarTmpKilobytes * 1024, 64 << 20, 64 << 20}
+	var total int64
+	for i, target := range targets {
+		limits[target] = min(maxima[i], max(floors[i], memory/divisors[i])) / 4096
+		total += limits[target]
+	}
+	available := max(int64(0), budget-status)
+	if total > available {
+		// Leave one page per mount before proportionally distributing the rest.
+		remaining := max(int64(0), available-int64(len(targets)))
+		for _, target := range targets {
+			limits[target] = 1 + remaining*limits[target]/total
+		}
+	}
+	for target, pages := range limits {
+		limits[target] = pages * 4
+	}
+	return limits
+}
+
 func isolationMounts(input RuntimeSpecInput) ([]specs.Mount, error) {
 	devShmKilobytes := int64(64 * 1024)
+	devKilobytes, runKilobytes := int64(64*1024), int64(64*1024)
+	scratch := computerScratchKilobytes(input.Workload.Limits.MemoryBytes)
 	computer := input.Workload.Computer
 	if computer {
-		devShmKilobytes = computerDevShmKilobytes
+		devShmKilobytes = scratch["/dev/shm"]
+		devKilobytes, runKilobytes = scratch["/dev"], scratch["/run"]
 	}
 	mounts := []specs.Mount{
 		{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
-		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", fmt.Sprintf("size=%dk", devKilobytes)}},
 		{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620", "gid=5"}},
 		{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", fmt.Sprintf("size=%dk", devShmKilobytes)}},
 		{Destination: "/dev/mqueue", Type: "mqueue", Source: "mqueue", Options: []string{"nosuid", "noexec", "nodev"}},
 		{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
 		{Destination: "/sys/fs/cgroup", Type: "cgroup", Source: "cgroup", Options: []string{"nosuid", "noexec", "nodev", "relatime", "ro"}},
-		{Destination: "/run", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", "size=65536k"}},
+		{Destination: "/run", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "strictatime", "mode=755", fmt.Sprintf("size=%dk", runKilobytes)}},
 		readonlyBindMount(input.ResolverPath, "/etc/resolv.conf"),
 		readonlyBindMount(input.HostsPath, "/etc/hosts"),
 	}
 	if computer {
 		mounts = append(mounts,
 			readonlyBindMount(input.ComputerControlSource, contract.OCIContainerControlDirectory),
-			specs.Mount{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerTmpKilobytes)}},
-			specs.Mount{Destination: "/var/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", computerVarTmpKilobytes)}},
+			specs.Mount{Destination: "/wefty/seat-status", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "noexec", "mode=0700", fmt.Sprintf("size=%dk", scratch["/wefty/seat-status"])}},
+			specs.Mount{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", scratch["/tmp"])}},
+			specs.Mount{Destination: "/var/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "nodev", "mode=1777", fmt.Sprintf("size=%dk", scratch["/var/tmp"])}},
 		)
 	}
 	for _, volume := range input.Workload.ManagedVolumes {

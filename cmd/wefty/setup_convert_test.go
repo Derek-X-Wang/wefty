@@ -819,3 +819,66 @@ func TestSetupConvertPlainCrashAfterHistoryFolderRemovalResumes(t *testing.T) {
 		t.Fatalf("empty history container blocked recovery: %v", err)
 	}
 }
+
+func TestSetupConvertComputerSettingsRefuseBeforeHistory(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		settings setupComputerOptions
+		want     string
+	}{
+		{name: "cluster setting", settings: func() setupComputerOptions { n := 3; return setupComputerOptions{SharedSeatLimit: &n} }(), want: "cluster Computer settings require the control-plane installation"},
+		{name: "invalid node setting", settings: func() setupComputerOptions { n := int64(1); return setupComputerOptions{SeatMemoryBytes: &n} }(), want: "room per Seat must be at least 256 MiB"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newConversionFixture(t)
+			before := installedUpgradeFiles(t, &upgradeFixture{setupFixture: f.setupFixture})
+			request := f.request(t)
+			request.computer = tc.settings
+			_, err := runSetup(t.Context(), f.host, request)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("wrong conversion preflight error: %v", err)
+			}
+			paths, _ := resolveSetupPaths(f.home)
+			record, err := readPlainConversion(paths)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record != nil && conversionForward(record) {
+				t.Fatalf("invalid Computer flags crossed history boundary: phase=%q", record.Phase)
+			}
+			f.assertPlain(t, before)
+		})
+	}
+}
+func TestSetupConvertComputerNodeSettingsSurviveHistoryResume(t *testing.T) {
+	f := newConversionFixture(t)
+	seatMemory := int64(512 << 20)
+	cap := 0
+	image := "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)
+	f.setup(t, setupRequest{computer: setupComputerOptions{SeatMemoryBytes: &seatMemory, DedicatedCap: &cap, Image: &image}})
+	request := f.request(t)
+	request.afterFleetStep = func(step string) error {
+		if step == "convert:joining" {
+			return errors.New("injected after plain receipt removal")
+		}
+		return nil
+	}
+	if _, err := runSetup(t.Context(), f.host, request); err == nil || !strings.Contains(err.Error(), "injected after plain receipt removal") {
+		t.Fatalf("wrong injected failure: %v", err)
+	}
+	if _, err := runSetup(t.Context(), f.host, f.request(t)); err != nil {
+		t.Fatal(err)
+	}
+	receipt := readSetupReceipt(t, f.home)
+	if receipt.Computer == nil || receipt.Computer.SeatMemoryBytes == nil || *receipt.Computer.SeatMemoryBytes != seatMemory || receipt.Computer.DedicatedCap == nil || *receipt.Computer.DedicatedCap != cap {
+		t.Fatalf("conversion lost node settings: %+v", receipt.Computer)
+	}
+	if receipt.Computer.Image != nil || receipt.Computer.SharedSeatLimit != nil {
+		t.Fatal("conversion carried cluster settings into join receipt")
+	}
+	for _, want := range []string{"--computer-seat-memory-bytes=536870912", "--computer-dedicated-cap=0"} {
+		if !strings.Contains(f.plist(t, setupNodeAgentLabel), want) {
+			t.Fatalf("join node service lacks %s", want)
+		}
+	}
+}

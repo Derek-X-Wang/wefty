@@ -689,8 +689,12 @@ func (barrier *SupervisedBootBarrier) Recreate(ctx context.Context, quiesce, rec
 	intent, intentErr := barrier.Supervisor.readIntent(ctx)
 	if intentErr == nil && intent.Enabled {
 		barrier.Barrier.Invalidate()
-		if _, intentErr = barrier.Supervisor.runBounded(ctx, "delete", "--force", barrier.Supervisor.config.Instance); intentErr == nil {
-			_, intentErr = barrier.Supervisor.runBounded(ctx, "start", "--name="+barrier.Supervisor.config.Instance, temporaryPath)
+		if intentErr = barrier.Supervisor.guardRecreate(ctx); intentErr == nil {
+			if _, intentErr = barrier.Supervisor.runBounded(ctx, "delete", "--force", barrier.Supervisor.config.Instance); intentErr == nil {
+				_, intentErr = barrier.Supervisor.runBounded(ctx, "start", "--name="+barrier.Supervisor.config.Instance, temporaryPath)
+			} else {
+				barrier.Supervisor.restoreRecreateSocket(ctx)
+			}
 		}
 	}
 	barrier.Supervisor.ensureMu.Unlock()

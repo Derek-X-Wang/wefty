@@ -240,10 +240,12 @@ jobs:
         run: |
           set -euo pipefail
           registry_reference="localhost:5000/${LOCAL_NAME}:${CANDIDATE_SHA}-${ARCH}"
-          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+          target=()
+          case "$VARIANT" in xfce) target=(--target single-seat) ;; esac
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${target[@]}" \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
-          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false \
+          docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${target[@]}" \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
       - name: Execute the exact desktop digest and assert its ELF architecture

@@ -329,15 +329,21 @@ func (r *runtimeRunner) startContainer(ctx context.Context) error {
 	if r.config.MutationProfile == "forbidden-privilege" {
 		args = append(args, "--cap-add", "SYS_ADMIN")
 	}
-	shmSize := "1073741824"
+	// Match the shipped 1 GiB Computer profile, including disk-backed
+	// browser temp in the reference image. Leave Docker's /dev, devpts and
+	// mqueue setup intact; its /dev ceiling is outside this approximation.
+	args = append(args, "--memory", "1073741824", "--memory-swap", "1073741824")
+	shmSize := "268435456"
 	if r.config.MutationProfile == "shm-too-small" {
 		shmSize = "67108864"
 	}
 	args = append(args,
-		"--tmpfs", "/tmp:rw,nosuid,nodev,size=536870912,mode=1777",
-		"--tmpfs", "/var/tmp:rw,nosuid,nodev,size=67108864,mode=1777",
-		"--tmpfs", "/run:rw,nosuid,nodev,size=67108864,mode=0755",
+		"--shm-size", shmSize,
+		"--tmpfs", "/tmp:rw,nosuid,nodev,size=134217728,mode=1777",
+		"--tmpfs", "/var/tmp:rw,nosuid,nodev,size=16777216,mode=1777",
+		"--tmpfs", "/run:rw,nosuid,nodev,size=33554432,mode=0755",
 		"--tmpfs", "/dev/shm:rw,nosuid,nodev,noexec,size="+shmSize+",mode=1777",
+		"--tmpfs", "/wefty/seat-status:rw,nosuid,nodev,noexec,size=1048576,mode=0700",
 		"--mount", "type=bind,src="+r.serviceDir+",dst=/wefty/service",
 	)
 	controlMount := "type=bind,src=" + r.controlDir + ",dst=/wefty/control"
@@ -1279,9 +1285,9 @@ func (r *runtimeRunner) checkHarnessProfile(ctx context.Context) {
 	}
 	checks := []struct{ id, script, pass, fail string }{
 		{"harness.shm-private", `awk '$2 == "/dev/shm" && $3 == "tmpfs" { found=1 } END { exit !found }' /proc/mounts`, "private tmpfs observed in guest /proc/mounts", "/dev/shm is not tmpfs"},
-		{"harness.shm-size", `awk '$2 == "/dev/shm" && index($4,"size=1048576k") { found=1 } END { exit !found }' /proc/mounts`, "1 GiB ceiling observed in guest /proc/mounts", "/dev/shm ceiling is not 1 GiB"},
+		{"harness.shm-size", `awk '$2 == "/dev/shm" && index($4,"size=262144k") { found=1 } END { exit !found }' /proc/mounts`, "256 MiB ceiling observed in guest /proc/mounts", "/dev/shm ceiling is not 256 MiB"},
 		{"harness.shm-flags", `test "$(stat -c %a /dev/shm)" = 1777 && awk '$2 == "/dev/shm" && index(","$4",",",nosuid,") && index(","$4",",",nodev,") && index(","$4",",",noexec,") { found=1 } END { exit !found }' /proc/mounts`, "mode and mount flags are exact", "/dev/shm mode or flags differ"},
-		{"harness.tmp-ceilings", `awk '$2 == "/tmp" && index($4,"size=524288k") { tmp=1 } $2 == "/var/tmp" && index($4,"size=65536k") { vartmp=1 } END { exit !(tmp && vartmp) }' /proc/mounts`, "bounded /tmp and /var/tmp ceilings observed", "bounded /tmp or /var/tmp ceiling differs"},
+		{"harness.tmp-ceilings", `awk '$2 == "/tmp" && index($4,"size=131072k") { tmp=1 } $2 == "/var/tmp" && index($4,"size=16384k") { vartmp=1 } END { exit !(tmp && vartmp) }' /proc/mounts`, "bounded /tmp and /var/tmp ceilings observed", "bounded /tmp or /var/tmp ceiling differs"},
 	}
 	for _, check := range checks {
 		if r.execShell(ctx, check.script, "").exitCode == 0 {

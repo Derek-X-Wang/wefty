@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,8 +21,10 @@ func main() {
 
 func run(arguments []string) int {
 	var config computerconformance.RuntimeConfig
+	var seatEvidence string
 	flags := flag.NewFlagSet("wefty-computer-conformance", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
+	flags.StringVar(&seatEvidence, "seat-evidence", "", "evaluate observed Seat outcomes from the real-profile Linux lane")
 	flags.StringVar(&config.Image, "image", "", "OCI image reference or digest to check (required)")
 	flags.StringVar(&config.RepairImage, "repair-image", "", "known-good immutable image used only for detached-root permission repair (required)")
 	flags.StringVar(&config.Runtime, "runtime", "docker", "OCI command-line runtime: docker or nerdctl")
@@ -34,6 +39,9 @@ func run(arguments []string) int {
 			return 0
 		}
 		return 64
+	}
+	if seatEvidence != "" && flags.NArg() == 0 {
+		return runSeatEvidence(seatEvidence, config.ReceiptPath)
 	}
 	if flags.NArg() != 0 || config.Image == "" || !strings.Contains(config.RepairImage, "@sha256:") || (config.Runtime != "docker" && config.Runtime != "nerdctl") ||
 		(config.InputOraclePath != "" && !filepath.IsAbs(config.InputOraclePath)) ||
@@ -106,4 +114,44 @@ func writeSummary(receipt computerconformance.Receipt, receiptPath string) {
 		fmt.Fprintf(writer, "%-7s %-18s %-42s %s%s\n", check.Status, check.Scope, check.ID, check.Summary, detail)
 	}
 	fmt.Fprintf(writer, "image=%s harness=%s containerd-profile=%s — %d PASS, %d FAIL, %d NOT-RUN; receipt=%s\n", receipt.ImageStatus, receipt.HarnessStatus, receipt.ContainerdProfileStatus, passed, failed, notRun, receiptPath)
+}
+
+func runSeatEvidence(path, receiptPath string) int {
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	var evidence computerconformance.SeatEvidence
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&evidence); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		fmt.Fprintln(os.Stderr, "Seat evidence must contain one JSON object")
+		return 1
+	}
+	report := computerconformance.CheckSeats(evidence)
+	payload, err = json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := writeReceipt(receiptPath, payload); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	for _, check := range report.Checks {
+		fmt.Fprintf(os.Stderr, "%s %s %s\n", check.Status, check.ID, check.Detail)
+	}
+	switch report.Status {
+	case computerconformance.StatusPass:
+		return 0
+	case computerconformance.StatusNotRun:
+		return 2
+	default:
+		return 1
+	}
 }

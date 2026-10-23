@@ -176,6 +176,7 @@ const (
 	ErrorSetupRequired            contract.ErrorCode = "oci_setup_required"
 	ErrorTemplateRestartRequired  contract.ErrorCode = "template_restart_required"
 	ErrorTemplateRecreateRequired contract.ErrorCode = "template_recreate_required"
+	ErrorHostVMRecreateBlocked    contract.ErrorCode = "host_vm_recreate_blocked"
 	ErrorInternal                 contract.ErrorCode = contract.ErrorInternal
 )
 
