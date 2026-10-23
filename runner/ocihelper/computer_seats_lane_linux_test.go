@@ -20,6 +20,7 @@ import (
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/opencontainers/image-spec/identity"
@@ -65,13 +66,15 @@ func TestHelperComputerSeatsIM5(t *testing.T) {
 	id := "helper-seats-" + filepath.Base(root)
 	diffs, err := image.RootFS(ctx)
 	must(err)
-	snapshots := client.SnapshotService(DefaultSnapshotter)
-	mounts, err := snapshots.Prepare(ctx, id, identity.ChainID(diffs).String())
+	snapshotter := client.SnapshotService(DefaultSnapshotter)
+	// Without a GC root, containerd may collect the unreferenced active
+	// snapshot before NewContainer refers to it.
+	mounts, err := snapshotter.Prepare(ctx, id, identity.ChainID(diffs).String(), snapshots.WithLabels(map[string]string{"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339)}))
 	must(err)
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), ContainerdNamespace), 15*time.Second)
 		defer cancel()
-		if err := snapshots.Remove(cleanupCtx, id); err != nil && !strings.Contains(err.Error(), "not found") {
+		if err := snapshotter.Remove(cleanupCtx, id); err != nil && !strings.Contains(err.Error(), "not found") {
 			t.Error(err)
 		}
 	}()
