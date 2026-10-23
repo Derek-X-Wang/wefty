@@ -1556,8 +1556,9 @@
                   "idempotency_key": { "type": "string", "minLength": 1 },
                   "result": { "$ref": "./common.v1.json#/components/schemas/ProcessResult" },
                   "runtime_quiescence_evidence": {
+                    "description": "Computer Seat room release requires computer_attempt_absent from exact process/cgroup absence. Ordinary attempt, no-runtime and sweep evidence may settle completion while retaining Seat room.",
                     "type": "string",
-                    "enum": ["attempt", "no_runtime_resources", "oci_sweep", "prior_boot_guardian", "prior_boot_oci_sweep"]
+                    "enum": ["attempt", "no_runtime_resources", "oci_sweep", "prior_boot_guardian", "prior_boot_oci_sweep", "computer_attempt_absent"]
                   },
                   "protocol_output_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
                   "termination_initiator": {

@@ -75,6 +75,21 @@ type ObserveComputerSeatsResponse struct {
 	Generation uint64                    `json:"generation"`
 	Seats      []ComputerSeatObservation `json:"seats"`
 }
+
+// Discovery reads only the serialized directive. Starting denotes wanted
+// membership here, never readiness, a probe result or cleanup evidence.
+func (s *computerSeats) discover() ObserveComputerSeatsResponse {
+	r := ObserveComputerSeatsResponse{Seats: []ComputerSeatObservation{}}
+	if s == nil {
+		return r
+	}
+	r.Generation = s.generation
+	for _, wanted := range s.wanted {
+		r.Seats = append(r.Seats, ComputerSeatObservation{Place: wanted.Place, State: "starting"})
+	}
+	return r
+}
+
 type ComputerSeatsEngine interface {
 	ApplyComputerSeats(context.Context, ApplyComputerSeatsRequest) (ApplyComputerSeatsResponse, error)
 	ObserveComputerSeats(context.Context, ObserveComputerSeatsRequest) (ObserveComputerSeatsResponse, error)

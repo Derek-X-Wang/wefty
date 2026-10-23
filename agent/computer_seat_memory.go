@@ -71,9 +71,10 @@ func (c *computerSeatController) reconcileMemory(ctx context.Context, list l1.Co
 	if err != nil {
 		return err
 	}
-	if response.RequestedMemoryBytes != room.TargetMemoryBytes || response.MemoryLimitBytes <= 0 || response.ReservedMemoryBytes < response.MemoryLimitBytes {
+	if response.RequestedMemoryBytes != room.TargetMemoryBytes || response.MemoryLimitBytes < room.TargetMemoryBytes || response.ReservedMemoryBytes < response.MemoryLimitBytes {
 		return errors.New("helper returned inconsistent Computer memory evidence")
 	}
+	c.memoryReadbackRevision, c.memoryReadbackGeneration, c.memoryReadbackLimit = room.RoomRevision, c.generation, response.MemoryLimitBytes
 	// HeldMemoryBytes in the helper response is only excess above the target.
 	// L1 requires the entire effective charge, including an uncertain reservation.
 	held := max(response.ReservedMemoryBytes, response.MemoryLimitBytes)
@@ -93,4 +94,24 @@ func (c *computerSeatController) reconcileMemory(ctx context.Context, list l1.Co
 		c.memoryGeneration = c.generation
 	}
 	return nil
+}
+
+func (c *computerSeatController) memoryConfirmed(list l1.ComputerSeatList) bool {
+	if list.Recovery == nil || list.Recovery.Room == nil {
+		return true
+	}
+	room := list.Recovery.Room
+	return c.memoryReadbackRevision == room.RoomRevision && c.memoryReadbackGeneration == c.generation && c.memoryReadbackLimit >= room.TargetMemoryBytes
+}
+
+func (c *computerSeatController) restoreApplied(response ocihelper.ObserveComputerSeatsResponse) {
+	c.lastApplied = []ocihelper.ComputerSeat{}
+	c.appliedBindings = map[int]string{}
+	for _, observed := range response.Seats {
+		if binding, known := c.bindings[observed.Place]; known && observed.State == "starting" {
+			c.lastApplied = append(c.lastApplied, seatRuntimeConfig(binding))
+			c.appliedBindings[observed.Place] = binding.SeatID
+		}
+	}
+	slices.SortFunc(c.lastApplied, func(a, b ocihelper.ComputerSeat) int { return a.Place - b.Place })
 }

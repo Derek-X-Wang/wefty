@@ -463,6 +463,8 @@ type Request struct {
 	// ComputerNetwork carries the Computer setting independently of its image.
 	// Empty preserves the helper's existing internet default.
 	ComputerNetwork string
+	// MutableComputerMemory comes from L1's Seat-request creation provenance.
+	MutableComputerMemory bool
 	// RunMailbox asks the runtime to seed this attempt's mailbox. It is set
 	// only for a runtime whose handoff storage the agent cannot reach.
 	RunMailbox       *RunMailboxSeed
@@ -566,6 +568,9 @@ const (
 	ReapEvidencePriorBootGuardian ReapEvidence = "prior_boot_guardian"
 	ReapEvidencePriorBootOCISweep ReapEvidence = "prior_boot_oci_sweep"
 	ReapEvidenceOCIRuntimeSweep   ReapEvidence = "oci_runtime_sweep"
+
+	// Strict process/cgroup absence for this exact Computer Attempt.
+	ReapEvidenceComputerAttemptAbsent ReapEvidence = "computer_attempt_absent"
 )
 
 // ReapReceipt is positive evidence that runtime-owned workload state is gone.

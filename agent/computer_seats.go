@@ -34,44 +34,49 @@ type computerSeatControl interface {
 	ReportComputerSeats(context.Context, string, string, string, l1.ComputerSeatObservationReport) (l1.ComputerSeatObservationReceipt, error)
 }
 type seatApply struct {
-	revision int64
-	seats    []ocihelper.ComputerSeat
-	bindings map[int]l1.WantedComputerSeat
+	revision     int64
+	roomRevision int64
+	seats        []ocihelper.ComputerSeat
+	bindings     map[int]l1.WantedComputerSeat
 }
 
 // The controller lives only as long as this exact attempt. In particular it
 // reconstructs identities only from L1's exact Attempt recovery bindings.
 type computerSeatController struct {
-	recovered        bool
-	forceApply       bool
-	memoryRevision   int64
-	memoryGeneration uint64
-	control          computerSeatControl
-	runtime          computerSeatRuntime
-	authority        ocihelper.AttemptAuthority
-	computerID       string
-	clock            Clock
-	logf             func(string, ...any)
-	bindings         map[int]l1.WantedComputerSeat
-	cleaned          map[string]bool
-	pendingApply     *seatApply
-	pendingReport    *l1.ComputerSeatObservationReport
-	acceptedReport   *l1.ComputerSeatObservationReport
-	lastApplied      []ocihelper.ComputerSeat
-	wanted           *l1.ComputerSeatList
-	nextL1           time.Time
-	l1Backoff        time.Duration
-	l1Conflicts      int
-	cycleL1Error     error
-	nextLog          time.Time
-	generation       uint64
-	revision         int64
-	sequence         int64
-	afterStep        func()
+	memoryReadbackRevision   int64
+	memoryReadbackGeneration uint64
+	memoryReadbackLimit      int64
+	appliedBindings          map[int]string
+	recovered                bool
+	forceApply               bool
+	memoryRevision           int64
+	memoryGeneration         uint64
+	control                  computerSeatControl
+	runtime                  computerSeatRuntime
+	authority                ocihelper.AttemptAuthority
+	computerID               string
+	clock                    Clock
+	logf                     func(string, ...any)
+	bindings                 map[int]l1.WantedComputerSeat
+	cleaned                  map[string]bool
+	pendingApply             *seatApply
+	pendingReport            *l1.ComputerSeatObservationReport
+	acceptedReport           *l1.ComputerSeatObservationReport
+	lastApplied              []ocihelper.ComputerSeat
+	wanted                   *l1.ComputerSeatList
+	nextL1                   time.Time
+	l1Backoff                time.Duration
+	l1Conflicts              int
+	cycleL1Error             error
+	nextLog                  time.Time
+	generation               uint64
+	revision                 int64
+	sequence                 int64
+	afterStep                func()
 }
 
 func newComputerSeatController(control computerSeatControl, runtime computerSeatRuntime, authority ocihelper.AttemptAuthority, computerID string, clock Clock, logf func(string, ...any)) *computerSeatController {
-	return &computerSeatController{control: control, runtime: runtime, authority: authority, computerID: computerID, clock: clock, logf: logf, bindings: map[int]l1.WantedComputerSeat{}, cleaned: map[string]bool{}}
+	return &computerSeatController{control: control, runtime: runtime, authority: authority, computerID: computerID, clock: clock, logf: logf, bindings: map[int]l1.WantedComputerSeat{}, cleaned: map[string]bool{}, appliedBindings: map[int]string{}}
 }
 func (c *computerSeatController) run(ctx context.Context) {
 	timer := c.clock.NewTimer(computerSeatPollInterval)
@@ -99,6 +104,9 @@ func (c *computerSeatController) run(ctx context.Context) {
 }
 func (c *computerSeatController) plan(list l1.ComputerSeatList) *seatApply {
 	plan := &seatApply{revision: list.Revision, bindings: map[int]l1.WantedComputerSeat{}, seats: []ocihelper.ComputerSeat{}}
+	if list.Recovery != nil && list.Recovery.Room != nil {
+		plan.roomRevision = list.Recovery.Room.RoomRevision
+	}
 	for place, seat := range c.bindings {
 		plan.bindings[place] = seat
 	}
@@ -155,7 +163,8 @@ func (c *computerSeatController) step(ctx context.Context) error {
 		if refreshed {
 			return nil
 		}
-		if list.Recovery != nil && !c.recovered {
+		obsoleteApply := c.pendingApply != nil && list.Recovery != nil && list.Recovery.Room != nil && (c.pendingApply.revision != list.Revision || c.pendingApply.roomRevision != list.Recovery.Room.RoomRevision)
+		if list.Recovery != nil && (!c.recovered || obsoleteApply) {
 			recoverCtx, cancel := context.WithTimeout(helperCtx, computerSeatHelperBudget)
 			recovered, err := c.runtime.ObserveComputerSeats(recoverCtx, ocihelper.ObserveComputerSeatsRequest{Authority: c.authority, Discover: true})
 			cancel()
@@ -163,22 +172,29 @@ func (c *computerSeatController) step(ctx context.Context) error {
 				return err
 			}
 			c.generation = recovered.Generation
+			c.restoreApplied(recovered)
+			// Discovery serializes with Apply. It resolves an obsolete uncertain
+			// directive without replaying Seats against a newer, smaller limit.
+			c.pendingApply = nil
 			c.forceApply = true
 			c.recovered = true
 		}
 		if err := c.reconcileMemory(helperCtx, list); err != nil {
-			// A grow gates publication. Cleanup must still advance when a
-			// readback/report fails while already charged room covers the list.
-			room := list.Recovery.Room
-			if room.TargetMemoryBytes > room.HeldMemoryBytes {
-				return err
-			}
 			memoryErr = err
 		}
 	}
 	if fresh && c.pendingApply == nil {
 		plan := c.plan(list)
-		if !c.forceApply && c.generation != 0 && slices.Equal(plan.seats, c.lastApplied) {
+		if !c.memoryConfirmed(list) {
+			// Preserve positively discovered/applied Seats, but never add one
+			// using L1's charge as a substitute for an exact helper readback.
+			plan.seats = slices.DeleteFunc(plan.seats, func(seat ocihelper.ComputerSeat) bool {
+				return c.appliedBindings[seat.Place] != plan.bindings[seat.Place].SeatID
+			})
+		}
+		if !c.memoryConfirmed(list) && len(c.cleanupPlaces(list)) == 0 {
+			// No cleanup requires a directive. Leave existing desktops alone.
+		} else if !c.forceApply && c.generation != 0 && slices.Equal(plan.seats, c.lastApplied) {
 			c.revision, c.bindings = plan.revision, plan.bindings
 		} else {
 			c.pendingApply = plan
@@ -196,6 +212,10 @@ func (c *computerSeatController) step(ctx context.Context) error {
 		} else if response.Generation == 0 {
 			applyErr = errors.New("helper returned a zero Seat generation")
 		} else {
+			if c.memoryReadbackGeneration == c.generation {
+				// Apply changes membership, never the cgroup's limit.
+				c.memoryReadbackGeneration = response.Generation
+			}
 			// Cleanup acknowledged while this Apply was uncertain is final. Its old
 			// binding must not return with the Apply's earlier planning snapshot.
 			for place, seat := range pending.bindings {
@@ -205,6 +225,10 @@ func (c *computerSeatController) step(ctx context.Context) error {
 			}
 			c.generation, c.revision, c.bindings = response.Generation, pending.revision, pending.bindings
 			c.lastApplied = slices.Clone(pending.seats)
+			c.appliedBindings = map[int]string{}
+			for _, seat := range pending.seats {
+				c.appliedBindings[seat.Place] = pending.bindings[seat.Place].SeatID
+			}
 			c.forceApply = false
 			c.pendingApply = nil
 		}
@@ -236,6 +260,9 @@ func (c *computerSeatController) step(ctx context.Context) error {
 					wanted = wanted || seat.SeatID == binding.SeatID
 				}
 				if list.Recovery != nil && !wanted && (observation.State == "starting" || observation.State == "ready") {
+					continue
+				}
+				if !c.memoryConfirmed(list) && (observation.State == "starting" || observation.State == "ready") {
 					continue
 				}
 				seats = append(seats, l1.ComputerSeatObservation{SeatID: binding.SeatID, Place: binding.Place, State: l1.ComputerSeatObservedState(observation.State), Reason: observation.Reason, CleanupComplete: observation.CleanupComplete})

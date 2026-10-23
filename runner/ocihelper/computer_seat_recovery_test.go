@@ -42,3 +42,18 @@ func TestRecoveredSeatCleanupNeedsPositiveAbsence(t *testing.T) {
 		t.Fatal("cleanup registration resurrected a Seat")
 	}
 }
+
+func TestSeatDiscoveryReportsWantedPlacesWithoutReadiness(t *testing.T) {
+	s := newComputerSeats(newManualClock(time.Unix(100, 0)), t.TempDir())
+	wanted := []ComputerSeat{{Place: 1, User: "seat1", ViewPort: 7102, ControlPort: 7103}}
+	if _, err := s.apply(wanted); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recoverCleanup([]ComputerSeat{{Place: 2, User: "seat2", ViewPort: 7104, ControlPort: 7105}}); err != nil {
+		t.Fatal(err)
+	}
+	r := s.discover()
+	if r.Generation != s.generation || len(r.Seats) != 1 || r.Seats[0].Place != 1 || r.Seats[0].State != "starting" || r.Seats[0].CleanupComplete {
+		t.Fatalf("discovery claimed readiness or cleanup: %+v", r)
+	}
+}

@@ -123,7 +123,7 @@ func TestComputerRestartWaitsForPreviousAttemptReservationRelease(t *testing.T) 
 	request := func(attemptID string) RunRequest {
 		return RunRequest{
 			Authority: AttemptAuthority{NodeID: "node", JobID: "computer-job", AttemptID: attemptID, FencingToken: "fence-" + attemptID, BootSessionID: "boot", Class: "service", RemovalGeneration: "0"},
-			Workload:  WorkloadInput{Computer: true, Limits: WorkloadLimits{MemoryBytes: 1 << 30}},
+			Workload:  WorkloadInput{Computer: true, MutableComputerMemory: true, Limits: WorkloadLimits{MemoryBytes: 1 << 30}},
 		}
 	}
 	first := request("attempt-a")

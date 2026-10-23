@@ -4825,7 +4825,9 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		if err != nil {
 			return CompletionOutcome{}, err
 		}
-		if request.RuntimeQuiescenceEvidence != "" {
+		// Ordinary sweeps permit bounded cgroup retention. Only the exact
+		// strict Computer proof may release Seat memory at completion.
+		if request.RuntimeQuiescenceEvidence == RuntimeQuiescenceComputerAttemptAbsent {
 			if err := cleanComputerSeatAttempt(ctx, tx, computerID, attemptID); err != nil {
 				return CompletionOutcome{}, err
 			}

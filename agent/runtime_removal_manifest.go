@@ -845,7 +845,7 @@ func validateRuntimeReapReceipt(receipt workloadrunner.ReapReceipt) error {
 		return errors.New("agent: runtime removal requires positive boot-scoped quiescence evidence")
 	}
 	switch receipt.Evidence {
-	case workloadrunner.ReapEvidenceAttempt, workloadrunner.ReapEvidenceNoRuntime:
+	case workloadrunner.ReapEvidenceComputerAttemptAbsent, workloadrunner.ReapEvidenceAttempt, workloadrunner.ReapEvidenceNoRuntime:
 		if receipt.SweepEpoch != "" || receipt.HelperGeneration != 0 {
 			return fmt.Errorf("agent: runtime removal evidence %q carried unexpected sweep authority", receipt.Evidence)
 		}

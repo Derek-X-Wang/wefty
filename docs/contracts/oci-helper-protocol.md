@@ -2247,7 +2247,8 @@ uses observation reason `cleanup_unverified`, distinct from a refusal detail.
 For controller recovery, `ObserveComputerSeats` also accepts
 `{authority,generation:0,discover:true}` without cleanup entries. This reads only
 the exact live Attempt's current directive generation (zero if none) and returns
-an empty Seat list; it grants no cleanup proof and performs no probes. Ordinary
+its wanted places with state `starting`. This is directive membership metadata,
+never readiness or cleanup proof, and performs no probes. Ordinary
 observations retain their positive-generation requirement. They may include
 `cleanup:[{place,user,view_port,control_port}]` for omitted places retained by L1.
 The helper refuses a wanted or conflicting place. Recovery registration never
@@ -2579,8 +2580,9 @@ The node agent uses the effective reservation, not the requested target, for
 the Room count; durable reservation reconciliation and caller wiring are
 #1142 / #1143, not part of this helper operation.
 
-The node agent must complete a grow before `ApplyComputerSeats` publishes a
-list that adds the Seat. A grow checks the same configured memory capacity,
+The node agent must obtain an exact helper readback for this Attempt at the
+current L1 room revision, with a limit covering the whole target, before
+`ApplyComputerSeats` adds a Seat. Held L1 room alone is never grow evidence. A grow checks the same configured memory capacity,
 infrastructure reserve, and current reservations as Computer admission; the
 newcomer pays. It reserves the larger amount before changing the kernel limit.
 A failed grow with proven unchanged readback returns `seat_operation_refused`
@@ -2598,13 +2600,19 @@ permanently block later resizes. Pending shrink provenance consumes cleanup
 only when the lower limit proves that shrink took effect; reconciling a failed
 grow does not consume unrelated Seat cleanup.
 
-The per-Job capacity reservation belongs to one exact Attempt. Admission of
-another Attempt refuses `attempt_overlap`, including before the first resize,
+A Seat-request Computer carries `mutable_computer_memory:true` in its closed
+WorkloadInput, derived from L1's creation provenance. Its per-Job reservation
+belongs to one exact Attempt. Admission of another Attempt refuses
+`attempt_overlap`, including before the first resize,
 and before comparing the original declaration with a grown limit. A live-limit
 operation additionally refuses any recovered reservation shared by two Attempts. The losing Run retains its typed `seat_operation_refused` result
 and leaves the helper session usable. Neither refusal changes the reservation.
 Only verified Attempt cleanup (or rollback before runtime creation) releases it;
-replacement admission then reserves its original declaration afresh. A helper
+replacement admission then reserves its original declaration afresh. Owner-made
+Computers with the default false flag and no live resize retain fixed-size
+overlapping restart admission. A live resize claims exact ownership and makes
+that reservation exclusive too; resizing a reservation already shared by two
+Attempts is refused. A helper
 restart loses runtime authority and must complete the existing reap/sweep barrier
 before replacement admission; losing the in-memory reservation is not cleanup.
 
@@ -2671,7 +2679,7 @@ successful shrink leaves an oversized reservation.
 
 Known caller obligations and fail-safe limits:
 
-- A replacement waits for verified old-Attempt release, including after a grow; admission never shares the old cgroup's memory reservation. L1 Seat room return requires strict cgroup absence, even when ordinary helper reap permits a bounded retained cgroup. The node agent's OCI adapter applies that stronger proof to Computer Runs and after any Seat memory operation, including an uncertain operation, and retains it across failed reap retries.
+- A replacement of a mutable reservation waits for verified old-Attempt release, including after a grow; admission never shares that reservation with the old cgroup. L1 Seat room return requires strict cgroup absence, even when ordinary helper reap permits a bounded retained cgroup. The OCI adapter's exact check for a Computer Run or Seat memory operation yields `computer_attempt_absent`; only that completion evidence may release Seat room. A prior-boot sweep remains weaker evidence after a node-agent restart, keeps room held and requires the exact-absence reconciliation route. The adapter retains the strict requirement across failed reap retries.
 - Cleanup proof is not tied to bytes; with `memory.oom.group=1`, #1143 must pass the true final target for the remaining Seats.
 - A partial shrink consumes every cleanup proof, and reusing a place erases an unreturned proof. Reconciling an earlier uncertain shrink can also consume a newer cleanup proof. All fail safe because room stays held.
 

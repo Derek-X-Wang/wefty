@@ -243,6 +243,13 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 			others = append(others, computer)
 		}
 	}
+	// A pending Computer will start at its declaration, even with one Seat.
+	// Reserve that floor before admission can publish a starting Seat.
+	floor, err := computerCreationMemoryFloor(ctx, q, request.ComputerID)
+	if err != nil {
+		return value, err
+	}
+	currentCharge = max(currentCharge, floor)
 	var reserved int64
 	if err := q.QueryRowContext(ctx, `SELECT COALESCE(SUM(memory_bytes),0) FROM computer_seat_room_reservations WHERE computer_id=? AND cleanup_complete=0`, request.ComputerID).Scan(&reserved); err != nil {
 		return value, err

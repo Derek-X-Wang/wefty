@@ -65,3 +65,18 @@ func initialComputerRuntimeCharge(ctx context.Context, q queryer, computer strin
 	}
 	return 0, nil
 }
+
+func computerCreationMemoryFloor(ctx context.Context, q queryer, computer string) (int64, error) {
+	var raw []byte
+	if err := q.QueryRowContext(ctx, `SELECT j.spec_json FROM computers c JOIN jobs j ON j.job_id=c.current_job_id WHERE c.computer_id=?`, computer).Scan(&raw); err != nil {
+		return 0, err
+	}
+	var spec contract.JobSpec
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return 0, err
+	}
+	if spec.Execution.OCI != nil && spec.Execution.OCI.Limits != nil && spec.Execution.OCI.Limits.MemoryBytes != nil {
+		return *spec.Execution.OCI.Limits.MemoryBytes, nil
+	}
+	return 0, nil
+}

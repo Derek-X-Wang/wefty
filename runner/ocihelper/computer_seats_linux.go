@@ -72,11 +72,7 @@ func (engine *ContainerdEngine) observeComputerSeats(ctx context.Context, reques
 		if err := engine.validateComputerSeatAttempt(ctx, request.Authority, attempt, snapshot); err != nil {
 			return ObserveComputerSeatsResponse{}, err
 		}
-		var generation uint64
-		if snapshot.seats != nil {
-			generation = snapshot.seats.generation
-		}
-		return ObserveComputerSeatsResponse{Generation: generation, Seats: []ComputerSeatObservation{}}, nil
+		return snapshot.seats.discover(), nil
 	}
 	if snapshot.seats == nil {
 		return ObserveComputerSeatsResponse{}, errors.New("Computer has no Seat directive")

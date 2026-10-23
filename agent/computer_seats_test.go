@@ -64,7 +64,13 @@ func (f *seatTestRuntime) ApplyComputerSeats(_ context.Context, r ocihelper.Appl
 func (f *seatTestRuntime) ObserveComputerSeats(_ context.Context, r ocihelper.ObserveComputerSeatsRequest) (ocihelper.ObserveComputerSeatsResponse, error) {
 	f.observes = append(f.observes, r)
 	if r.Discover {
-		return ocihelper.ObserveComputerSeatsResponse{Generation: f.generation, Seats: []ocihelper.ComputerSeatObservation{}}, f.observeError
+		seats := []ocihelper.ComputerSeatObservation{}
+		if len(f.applies) > 0 {
+			for _, seat := range f.applies[len(f.applies)-1].Seats {
+				seats = append(seats, ocihelper.ComputerSeatObservation{Place: seat.Place, State: "starting"})
+			}
+		}
+		return ocihelper.ObserveComputerSeatsResponse{Generation: f.generation, Seats: seats}, f.observeError
 	}
 	if f.onObserve != nil {
 		f.onObserve()

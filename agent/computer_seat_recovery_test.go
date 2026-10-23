@@ -9,6 +9,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
@@ -125,10 +126,13 @@ func TestComputerSeatsFailedGrowCannotPublishEndedRecoveryPlan(t *testing.T) {
 	c, api, runtime := newSeatTestController()
 	c.clock = newManualClock(time.Unix(100, 0))
 	old := api.list.Seats[0]
-	api.list.Recovery = &l1.ComputerSeatRecovery{Bindings: []l1.WantedComputerSeat{old}, Room: &l1.SeatRoomMemoryReceipt{RoomRevision: 1, HeldMemoryBytes: 1 << 30, TargetMemoryBytes: 2 << 30}}
+	api.list.Recovery = &l1.ComputerSeatRecovery{Bindings: []l1.WantedComputerSeat{old}, Room: &l1.SeatRoomMemoryReceipt{RoomRevision: 1, HeldMemoryBytes: 2 << 30, TargetMemoryBytes: 2 << 30}}
 	runtime.memoryError = errors.New("grow response lost")
 	if err := c.step(t.Context()); err == nil {
 		t.Fatal("grow failure hidden")
+	}
+	if len(runtime.applies) != 0 {
+		t.Fatalf("failed grow published before cancellation: %+v", runtime.applies)
 	}
 	api.list.Revision++
 	api.list.Seats = nil
@@ -331,5 +335,75 @@ func TestComputerSeatsRecoveryMemoryConflictsHaveRetryFloor(t *testing.T) {
 	}
 	if len(runtime.observes) < 8 {
 		t.Fatal("memory report backoff stopped helper cleanup")
+	}
+}
+
+func TestComputerSeatsPublicationRequiresCurrentReadback(t *testing.T) {
+	for _, failure := range []string{"lost-grow", "short-readback"} {
+		t.Run(failure, func(t *testing.T) {
+			c, api, runtime := newSeatTestController()
+			c.clock = newManualClock(time.Unix(100, 0))
+			api.list.Recovery = &l1.ComputerSeatRecovery{Room: &l1.SeatRoomMemoryReceipt{RoomRevision: 1, HeldMemoryBytes: 1 << 30, TargetMemoryBytes: 1 << 30}}
+			if err := c.step(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			api.list.Revision++
+			api.list.Seats = append(api.list.Seats, l1.WantedComputerSeat{SeatID: "seat_00000000000000000000000000000002", Place: 2})
+			api.list.Recovery.Room = &l1.SeatRoomMemoryReceipt{RoomRevision: 2, HeldMemoryBytes: 2 << 30, TargetMemoryBytes: 2 << 30}
+			if failure == "lost-grow" {
+				runtime.memoryError = errors.New("grow reply lost")
+			} else {
+				runtime.memoryResponse = &ocihelper.SetComputerMemoryLimitResponse{RequestedMemoryBytes: 2 << 30, MemoryLimitBytes: 1 << 30, ReservedMemoryBytes: 2 << 30}
+			}
+			runtime.observations = []ocihelper.ComputerSeatObservation{{Place: 2, State: "ready"}}
+			for range 2 {
+				_ = c.step(t.Context())
+				// Restart also discards all last-readback knowledge.
+				c = newComputerSeatController(api, runtime, c.authority, c.computerID, c.clock, nil)
+			}
+			for _, apply := range runtime.applies {
+				if len(apply.Seats) > 1 {
+					t.Fatalf("new Seat published without current readback: %+v", apply)
+				}
+			}
+			for _, report := range api.reports {
+				for _, seat := range report.Seats {
+					if seat.Place == 2 && seat.State == l1.ComputerSeatReady {
+						t.Fatal("ready report bypassed the memory gate")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestComputerSeatsStrictAbsenceSupportsRemoval(t *testing.T) {
+	receipt := workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceComputerAttemptAbsent, BootSessionID: "boot"}
+	if err := validateRuntimeReapReceipt(receipt); err != nil {
+		t.Fatal(err)
+	}
+	if got := toL1QuiescenceEvidence(receipt.Evidence); got != l1.RuntimeQuiescenceComputerAttemptAbsent {
+		t.Fatalf("strict proof mapped to %q", got)
+	}
+}
+
+func TestComputerSeatsUncertainApplyCannotOutrunNewMemoryTarget(t *testing.T) {
+	c, api, runtime := newSeatTestController()
+	c.clock = newManualClock(time.Unix(100, 0))
+	api.list.Recovery = &l1.ComputerSeatRecovery{Room: &l1.SeatRoomMemoryReceipt{RoomRevision: 1, HeldMemoryBytes: 2 << 30, TargetMemoryBytes: 2 << 30}}
+	api.list.Seats = append(api.list.Seats, l1.WantedComputerSeat{SeatID: "seat_00000000000000000000000000000002", Place: 2})
+	runtime.applyError = errors.New("Apply response lost after publication")
+	_ = c.step(t.Context())
+	// L1 ends Seat 2 while its Apply response is uncertain. An exact lower
+	// readback must not authorize retrying the old two-Seat directive.
+	api.list.Revision++
+	api.list.Recovery.Bindings = append([]l1.WantedComputerSeat(nil), api.list.Seats...)
+	api.list.Seats = api.list.Seats[:1]
+	api.list.Recovery.Room = &l1.SeatRoomMemoryReceipt{RoomRevision: 2, HeldMemoryBytes: 2 << 30, TargetMemoryBytes: 1 << 30}
+	runtime.applyError = nil
+	runtime.memoryError = errors.New("cleanup not confirmed before shrink")
+	_ = c.step(t.Context())
+	if len(runtime.applies) < 2 || len(runtime.applies[len(runtime.applies)-1].Seats) != 1 {
+		t.Fatalf("obsolete Apply followed the lower readback: %+v", runtime.applies)
 	}
 }

@@ -8,6 +8,7 @@ type capacityReservation struct {
 	pendingDiskAdmissionCeiling int64
 	diskMaterialized            bool
 	memoryOwner                 string
+	mutableMemory               bool
 	attempts                    map[string]struct{}
 }
 
@@ -24,6 +25,9 @@ func (r *capacityReservation) claimMutableMemory(attempt string) error {
 	return nil
 }
 func (r *capacityReservation) checkReplacement(attempt string) error {
+	if !r.mutableMemory && r.memoryOwner == "" {
+		return nil // An unchanged owner-made declaration keeps its restart behavior.
+	}
 	if len(r.attempts) > 0 {
 		if _, same := r.attempts[attempt]; !same {
 			return &SeatOperationRefusalError{Reason: SeatRefusalAttemptOverlap}

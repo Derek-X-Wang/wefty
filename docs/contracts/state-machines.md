@@ -2493,7 +2493,9 @@ excluded from its own cap count and charged exactly once at the projected
 total; competing dedicated reservations still share the same write fence.
 An `any` request cannot reserve on a dedicated (Seat-limit-1) Computer.
 The initial limits row is at least the Computer's existing effective charge,
-including its creation-time runtime/tmpfs floor. Charge is the greater of
+including its creation-time runtime/tmpfs floor. A pending Computer also
+reserves its declared memory floor before it starts; a small first Seat cannot
+admit a larger future runtime against insufficient room. Charge is the greater of
 the retained effective limit and the still-uncleaned reservation bytes.
 Owner removal intent never discards that charge or the permanent Seat ID.
 Only verified removal clears the limits row and marks its Seat cleanup complete.
@@ -2507,8 +2509,8 @@ not reduce the effective charge. A Seat that never entered starting has no
 Seat runtime: ending marks its reservation cleaned immediately. Its synthetic
 room can return at once if no memory caller has bound an Attempt. A possibly
 changed runtime limit remains charged until readback or positive absence.
-The memory caller reads the new target and
-revision, calls the helper with its true final target (including a required
+The memory caller reads the new target and revision, calls the helper with
+its true final target (including a required
 runtime floor), and reports the requested target, actual limit and held
 memory. L1 rejects a stale room revision or evidence below still-uncleaned
 reservations. A failed shrink or uncertain larger readback keeps the extra
@@ -2521,15 +2523,24 @@ cleanup-only `bindings`, the last accepted report `sequence`, earlier Attempt
 identities awaiting absence proof, and the whole-Computer room target/revision.
 These bindings never add wanted membership. Even a Seat ended before its first
 list delivery retains cleanup authority. A restarted node agent restores the
-bindings and sequence from L1, discovers the helper's current generation, and
-reapplies the current wanted list. A failed grow cannot preserve an unattempted
-old plan for later publication. Delayed `starting` or `ready` answers for omitted
-Seats cannot be offered as live Seats.
+bindings and sequence from L1 and discovers the helper's current generation
+and existing wanted places. Discovery reports membership only, never readiness.
+Before adding a Seat, this exact Attempt must have a helper limit readback at
+the current room revision covering the whole target. L1's held charge is a
+reservation and cannot prove that a grow happened. A lost or short readback
+blocks additions and ready reports; removals can still preserve discovered
+wanted Seats and publish cleanup. Restart discards the readback proof and
+requires a fresh one. If an uncertain Apply belongs to an obsolete room/list
+revision, serialized discovery resolves it before planning the current list;
+it is never replayed against a newly lowered memory target. A failed grow
+cannot preserve an unattempted old plan for later publication. Delayed
+`starting` or `ready` answers for omitted Seats cannot be offered as live Seats.
 
 The immutable identity tombstone additionally retains
 `first_attempt_authority_json` and `first_attempt_absent`. The authority snapshot
-survives Attempt pruning, including the exact helper removal generation. The
-room record also keeps `memory_attempt_authority_json` and
+survives Attempt pruning. These live service snapshots use the initial helper
+removal generation `1`; they do not record a later removal-operation generation.
+The room record also keeps `memory_attempt_authority_json` and
 `memory_attempt_absent`. A cleanup-only Attempt can hold memory even when no
 Seat was ever first-bound to it; room return must prove that Attempt absent
 too. Only positive absence allows this memory ownership to move to the next
@@ -2542,8 +2553,9 @@ The node-only route
 accepts that exact retained identity under the current live Attempt's fence.
 It marks that exact old Attempt's Seats cleaned and settles ending to ended;
 starting requests are refused. Fresh helper folder cleanup still fences place
-reuse. It does not lower a replacement runtime's effective memory charge. An older record whose Attempt was pruned before its authority could be retained fails closed; an
-unknown identity is never guessed.
+reuse. It does not lower a replacement runtime's effective memory charge.
+An older record whose Attempt was pruned before its authority could be retained
+fails closed; an unknown identity is never guessed.
 
 After runtime absence, the helper may register omitted cleanup places without
 starting their desktops. Fresh host proof of process, folder and socket absence
@@ -2551,8 +2563,8 @@ is still required. Cleanup failure, including a full disk, keeps the reservation
 charged and is retried across controller restarts. Positive exact Attempt
 absence is separately sufficient runtime cleanup evidence; an intent, an
 Attempt-prune event or a process restart alone is never sufficient. A failed
-memory report must
-not prevent removal observations when already charged room covers the list.
+memory report must not prevent removal observations. Only a valid helper
+readback at the current room revision can authorize a newly added Seat.
 After positive cleanup, the node agent requests L1's true final memory target,
 including the immutable creation-time runtime floor, and reports the helper's
 actual limit and **absolute** reservation. The helper's `held_memory_bytes`
@@ -2560,10 +2572,14 @@ counts only excess above the target; it is not L1's absolute charge. Lost resize
 or report responses are reconciled by another exact readback after restart.
 Room held by memory use remains charged and is retried.
 
-A mutable helper memory reservation belongs to one exact Attempt. Overlap uses
+A Seat-request Computer carries L1's immutable creation provenance to helper
+admission as `mutable_computer_memory:true`. Its reservation belongs to one
+exact Attempt before the first resize. An owner-made Computer without live
+resizing keeps the existing fixed-declaration overlapping restart behavior.
+Once a live resize claims its reservation, it becomes exclusive too. Overlap uses
 `seat_operation_refused` with detail `attempt_overlap`, including the interval
 before the first live resize. Recovered overlapping reservations cannot become
-mutable while two Attempts hold them. A replacement
+mutable while two Attempts hold them. A replacement of a mutable reservation
 cannot share either the original or grown declaration. Verified old-Attempt
 cleanup releases that reservation before replacement admission reconstructs the
 original declaration and its creation-time scratch ceiling. Neither a refused
@@ -2572,11 +2588,19 @@ operation nor a declaration mismatch releases room.
 Owner stop, restart, reimage, storage reset, projection replacement and removal
 commit Seat authority loss in the same transaction as the Computer intent.
 Live Seats become ending; requests that never received a ready Seat become
-refused. Verified Attempt completion cleans only that Attempt's Seats, and
-verified Computer removal cleans all its Seats and clears its room row, even
-without a replacement running Attempt. A Computer Run or Seat memory caller binds the OCI
-adapter's reap proof to strict process/cgroup absence; bounded cgroup retention
-cannot become completion evidence that releases room. Failed proof is retried.
+refused. Completion cleans only that Attempt's Seats and releases their charge
+when it carries `computer_attempt_absent`. The OCI adapter issues this distinct
+evidence only after exact process/cgroup absence verification for a Computer
+Run or Seat memory caller. Generic `attempt`, `no_runtime_resources` and sweep
+completion evidence retain Seat cleanup obligations and memory ownership;
+`ReapPriorBoot` remains ordinary sweep evidence and can permit a bound populated
+`cgroup_reaping` retention. It cannot release Seat room. A replacement's
+exact-absence route must then settle the old Attempt, and a retained cgroup
+blocks it. Verified Computer removal cleans all its Seats and clears its room
+row, even without a replacement running Attempt. Failed proof is retried.
+A stopped Computer whose old Attempt was lost without strict absence evidence
+keeps its room charge until the owner restarts it for reconciliation or obtains
+verified removal. No running replacement controller exists to settle it sooner.
 Owner intent itself is never cleanup evidence.
 
 The current Computer API has no Seat-limit mutation operation. Network is

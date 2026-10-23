@@ -247,7 +247,7 @@ func (s *Store) classifyServiceCompletion(job Job, completion CompletionRequest,
 
 func validRuntimeQuiescenceEvidence(evidence RuntimeQuiescenceEvidence) bool {
 	switch evidence {
-	case RuntimeQuiescenceAttempt, RuntimeQuiescenceNoRuntime, RuntimeQuiescenceOCISweep,
+	case RuntimeQuiescenceComputerAttemptAbsent, RuntimeQuiescenceAttempt, RuntimeQuiescenceNoRuntime, RuntimeQuiescenceOCISweep,
 		RuntimeQuiescencePriorBootGuardian, RuntimeQuiescencePriorBootOCISweep:
 		return true
 	default:

@@ -1936,6 +1936,7 @@ func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunne
 			}
 			absent, err := adapter.VerifyComputerSeatAttemptAbsent(ctx, HelperAuthority(request.Authority))
 			if err == nil && absent {
+				result = workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceComputerAttemptAbsent, BootSessionID: request.Authority.BootSessionID}
 				return
 			}
 			// Generic reap permits bounded cgroup retention. Seat room cannot
@@ -2841,8 +2842,10 @@ func workloadInput(request workloadrunner.Request) ocihelper.WorkloadInput {
 	managedVolumes := helperManagedVolumes(request)
 	input := ocihelper.WorkloadInput{
 		ImageReference: execution.Image.Reference, ImageDigest: digest,
-		Computer: contract.IsComputerExecution(request.Execution), ComputerNetwork: request.ComputerNetwork,
-		Argv: append([]string(nil), execution.Argv...), WorkingDirectory: workingDirectory,
+		Computer:              contract.IsComputerExecution(request.Execution),
+		ComputerNetwork:       request.ComputerNetwork,
+		MutableComputerMemory: request.MutableComputerMemory,
+		Argv:                  append([]string(nil), execution.Argv...), WorkingDirectory: workingDirectory,
 		Environment: public, SensitiveEnvironment: sensitive,
 		ManagedVolumes: managedVolumes,
 	}

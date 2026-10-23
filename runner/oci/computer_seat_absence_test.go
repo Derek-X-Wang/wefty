@@ -95,9 +95,19 @@ func TestSeatMemoryReapRequiresCgroupAbsenceOnEveryRetry(t *testing.T) {
 				t.Fatal(err)
 			}
 			receipt, err := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{Authority: request.Authority})
-			if err != nil || !receipt.RuntimeQuiesced {
+			if err != nil || !receipt.RuntimeQuiesced || string(receipt.Evidence) != "computer_attempt_absent" {
 				t.Fatalf("absent cgroup did not complete cleanup: %+v %v", receipt, err)
 			}
 		})
+	}
+}
+
+func TestSeatRequestMemoryPolicyReachesHelperAdmission(t *testing.T) {
+	for _, mutable := range []bool{false, true} {
+		request := adapterTestRequest()
+		request.MutableComputerMemory = mutable
+		if got := workloadInput(request).MutableComputerMemory; got != mutable {
+			t.Fatalf("helper memory policy=%v want %v", got, mutable)
+		}
 	}
 }

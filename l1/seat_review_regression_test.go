@@ -285,7 +285,7 @@ func TestReviewOwnerStopEndsSeatsAfterVerifiedCompletion(t *testing.T) {
 		t.Fatalf("stop intent released room: %+v %v", before, err)
 	}
 	exit := 0
-	if _, err := f.store.CompleteAttempt(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "stopped-cleaned", RuntimeQuiescenceEvidence: RuntimeQuiescenceAttempt, Result: ProcessResult{ExitCode: &exit}}); err != nil {
+	if _, err := f.store.CompleteAttempt(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "stopped-cleaned", RuntimeQuiescenceEvidence: RuntimeQuiescenceComputerAttemptAbsent, Result: ProcessResult{ExitCode: &exit}}); err != nil {
 		t.Fatal(err)
 	}
 	v := f.state(t, id, SeatEnded)

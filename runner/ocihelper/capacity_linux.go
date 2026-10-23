@@ -197,6 +197,9 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 	additionalMemory, additionalDisk := requestedMemory, requestedDisk
 	diskAlreadyMaterialized := materializedComputerDisk(request.Workload, diskRoot)
 	if existing != nil {
+		if existing.mutableMemory != request.Workload.MutableComputerMemory {
+			return ResourceAdmissionReceipt{}, errors.New("bound Computer changed its memory policy")
+		}
 		if err := existing.checkReplacement(attemptKey); err != nil {
 			return ResourceAdmissionReceipt{}, err
 		}
@@ -238,7 +241,8 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 	}
 	if existing == nil {
 		existing = &capacityReservation{
-			memoryBytes: requestedMemory, diskBytes: requestedDisk, tmpfsCeilingBytes: tmpfsCeiling,
+			mutableMemory: request.Workload.MutableComputerMemory,
+			memoryBytes:   requestedMemory, diskBytes: requestedDisk, tmpfsCeilingBytes: tmpfsCeiling,
 			diskMaterialized: diskAlreadyMaterialized, attempts: make(map[string]struct{}),
 		}
 		engine.capacityReservations[jobKey] = existing
