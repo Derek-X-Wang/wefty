@@ -119,10 +119,14 @@ type Config struct {
 	// Logf need not be goroutine-safe. Agent serializes calls made through it.
 	Logf  func(string, ...any)
 	Clock Clock
+
+	SeatApprovalSettings SeatApprovalSettings
+	SeatApprovalDialog   SeatApprovalDialog
 }
 
 // Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
+	seatApprovals *SeatApprovalController
 	fabric        fabric.Fabric
 	runLedgerAddr string
 	// controlPlaneAddr is the same L1 address the agent's own client dials. The
@@ -219,6 +223,11 @@ func New(config Config) (*Agent, error) {
 	operationTimeout := durationOrDefault(config.OperationTimeout, DefaultOperationTimeout)
 	client, err := newClient(config.Fabric, config.ControlPlaneAddress, operationTimeout)
 	if err != nil {
+		return nil, err
+	}
+	seatApprovals, err := NewSeatApprovalController(client, config.NodeID, config.BootSessionID, config.SeatApprovalSettings, config.SeatApprovalDialog, clock)
+	if err != nil {
+		client.Close()
 		return nil, err
 	}
 	computerTokens := config.ComputerTokenMinter
@@ -485,6 +494,7 @@ func New(config Config) (*Agent, error) {
 	constructionSucceeded = true
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
+		seatApprovals:    seatApprovals,
 		controlPlaneAddr: config.ControlPlaneAddress,
 		registration:     registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),

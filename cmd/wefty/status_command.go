@@ -142,14 +142,16 @@ type localLoadStatus struct {
 
 // clusterStatus is the whole answer, and the shape `--json` publishes.
 type clusterStatus struct {
-	fleetView        bool
-	VersionWarnings  []statusReason   `json:"version_warnings,omitempty"`
-	UpgradeRecovery  string           `json:"upgrade_recovery,omitempty"`
-	Busy             string           `json:"busy,omitempty"`
-	WaitingRuns      *int             `json:"waiting_runs,omitempty"`
-	LocalLoad        *localLoadStatus `json:"local_load,omitempty"`
-	InstalledVersion string           `json:"installed_version,omitempty"`
-	Ready            bool             `json:"ready"`
+	ApprovalWindows      []l1.SeatApprovalWindow `json:"approval_windows,omitempty"`
+	ApprovalWindowsError string                  `json:"approval_windows_error,omitempty"`
+	fleetView            bool
+	VersionWarnings      []statusReason   `json:"version_warnings,omitempty"`
+	UpgradeRecovery      string           `json:"upgrade_recovery,omitempty"`
+	Busy                 string           `json:"busy,omitempty"`
+	WaitingRuns          *int             `json:"waiting_runs,omitempty"`
+	LocalLoad            *localLoadStatus `json:"local_load,omitempty"`
+	InstalledVersion     string           `json:"installed_version,omitempty"`
+	Ready                bool             `json:"ready"`
 	// Verdict is the one line a person reads: "ready", or "not ready: ..."
 	// naming what is missing rather than what was checked.
 	Verdict string `json:"verdict"`
@@ -260,7 +262,18 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 	var stuck []queuedRunNote
 	var waitingRuns *int
 	var group sync.WaitGroup
-	group.Add(4)
+	group.Add(5)
+	go func() {
+		defer group.Done()
+		probeCtx, done := context.WithTimeout(ctx, statusProbeBudget)
+		defer done()
+		windows, err := clients.listSeatApprovalWindows(probeCtx)
+		if err != nil {
+			status.ApprovalWindowsError = probeDetail(err)
+			return
+		}
+		status.ApprovalWindows = windows
+	}()
 	go func() {
 		defer group.Done()
 		probeCtx, done := context.WithTimeout(ctx, statusProbeBudget)
@@ -705,6 +718,9 @@ func endpointOrNone(endpoint string) string {
 // that one line, and a reader who trusts the line should not have to read on.
 func writeStatus(writer io.Writer, status clusterStatus) error {
 	if _, err := fmt.Fprintf(writer, "%s\n", status.Verdict); err != nil {
+		return err
+	}
+	if err := writeSeatApprovalWindows(writer, status); err != nil {
 		return err
 	}
 	if status.Busy != "" {

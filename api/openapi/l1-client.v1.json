@@ -8,6 +8,95 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/seat-approval-windows": {
+      "get": {
+        "operationId": "listSeatApprovalWindows",
+        "summary": "List currently open Seat approval windows",
+        "description": "Client principal only. Returns only unexpired windows for a live node and its current boot session. An internet window covers every request form with internet and requests without internet; a none window covers every request form without internet. This read cannot grant approval.",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "query",
+            "required": false,
+            "description": "Filter by stable node ID; omitted or empty lists all nodes.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Open approval windows; an empty list means none are open.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "./common.v1.json#/components/schemas/SeatApprovalWindow"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/seat-approval-windows/close": {
+      "post": {
+        "operationId": "closeSeatApprovalWindows",
+        "summary": "Close a node's approval windows early",
+        "description": "Client principal only. Removes approval authority without changing existing approved Seats. Omitting network or sending an empty network closes both network scopes. No client operation can open a window or answer a Seat approval request.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/CloseSeatApprovalWindowsRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Windows closed; closing an already empty scope also succeeds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/CloseSeatApprovalWindowsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
     "/v1/peer-health": {
       "get": {
         "operationId": "getL1PeerHealth",
