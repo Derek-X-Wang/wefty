@@ -414,7 +414,9 @@ and the guest socket back to `0660 root:wefty-oci`.
    For XFCE record the CPU-rendered Xvfb/XFCE/Chromium session. For the Wayland
    image record Sway's headless backend, pixman renderer, two native `wayvnc -w`
    processes, `--disable-input` on view, and the absence of `/dev/dri` and
-   websockify. For both record the 1 GiB private `/dev/shm`, profile/sign-in
+   websockify. For both record the scaled private `/dev/shm` (256 MiB at a 1 GiB
+   Computer cap, at most 1 GiB), all six tmpfs ceilings at or below half
+   the cap, disk-backed browser temp for the XFCE reference, profile/sign-in
    markers across a fresh attempt and stop→start, missing or malformed
    `driver.json` failing closed, and attempt-local scratch absence. All three
    image receipts must retain distinct repositories, digests, and tar names

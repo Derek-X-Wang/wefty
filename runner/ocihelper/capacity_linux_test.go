@@ -222,15 +222,18 @@ func TestDiskRefusalIsAtomicWithMemoryAndUsesDiskRootFilesystem(t *testing.T) {
 	}
 	receipt, err := engine.admitResources(request)
 	var insufficient *insufficientDiskError
-	if !errors.As(err, &insufficient) || receipt.FailureCode != CodeInsufficientDisk || receipt.MemoryCommittedAfterBytes != receipt.MemoryCommittedBeforeBytes || receipt.DiskCommittedAfterBytes != receipt.DiskCommittedBeforeBytes || len(receipt.Warnings) != 1 || len(engine.capacityReservations) != 0 {
+	if !errors.As(err, &insufficient) || receipt.FailureCode != CodeInsufficientDisk || receipt.MemoryCommittedAfterBytes != receipt.MemoryCommittedBeforeBytes || receipt.DiskCommittedAfterBytes != receipt.DiskCommittedBeforeBytes || len(engine.capacityReservations) != 0 {
 		t.Fatalf("atomic disk refusal = %+v reservations=%+v err=%v", receipt, engine.capacityReservations, err)
+	}
+	if receipt.ComputerTmpfsCeilingBytes != 465<<20 || len(receipt.Warnings) != 0 {
+		t.Fatalf("1 GiB Computer scaled scratch receipt = %+v", receipt)
 	}
 	if receipt.FilesystemAvailableBytes <= 0 {
 		t.Fatalf("disk-root filesystem advisory fact = %d", receipt.FilesystemAvailableBytes)
 	}
 }
 
-func TestAdmissionReceiptUsesInjectedClockAndCarriesTmpfsWarnings(t *testing.T) {
+func TestAdmissionReceiptUsesInjectedClockAndScaledTmpfsCeiling(t *testing.T) {
 	root := t.TempDir()
 	meminfo := filepath.Join(root, "meminfo")
 	if err := os.WriteFile(meminfo, []byte("MemTotal: 4194304 kB\nMemAvailable: 2097152 kB\n"), 0o600); err != nil {
@@ -245,8 +248,8 @@ func TestAdmissionReceiptUsesInjectedClockAndCarriesTmpfsWarnings(t *testing.T) 
 		Authority: AttemptAuthority{NodeID: "node", JobID: "computer", AttemptID: "attempt", FencingToken: "fence", BootSessionID: "boot", Class: "service", RemovalGeneration: "0"},
 		Workload:  WorkloadInput{Computer: true, Limits: WorkloadLimits{MemoryBytes: 512 << 20}},
 	})
-	if err != nil || !receipt.ObservedAt.Equal(clock.Now()) || len(receipt.Warnings) != 2 {
-		t.Fatalf("clocked warning receipt = %+v err=%v", receipt, err)
+	if err != nil || !receipt.ObservedAt.Equal(clock.Now()) || len(receipt.Warnings) != 0 || receipt.ComputerTmpfsCeilingBytes != 233<<20 {
+		t.Fatalf("clocked scaled receipt = %+v err=%v", receipt, err)
 	}
 }
 

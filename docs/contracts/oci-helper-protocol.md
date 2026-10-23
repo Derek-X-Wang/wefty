@@ -1074,9 +1074,15 @@ runtime document. `/etc/resolv.conf` and `/etc/hosts` are
 explicit read-only private bind mounts from helper-managed files. Their
 targets, the fixed `/proc`, `/dev`, `/sys`, and `/run` hierarchies, and
 `/wefty/handoff`, `/wefty/service`, and `/wefty/control` are helper-reserved
-mount targets. A Computer receives a private 1 GiB `/dev/shm` tmpfs with
+mount targets. A Computer receives a private `/dev/shm` tmpfs, scaled to 1/4 of its memory
+limit (256 MiB at the 1 GiB default, at most 1 GiB), with
 `mode=1777,nosuid,nodev,noexec`; the private mount/IPC namespaces make it
-attempt-local and the kernel charges its pages to the attempt cgroup. Ordinary
+attempt-local and the kernel charges its pages to the attempt cgroup.
+All six tmpfs ceilings, including `/tmp`, `/var/tmp`, `/run`, `/dev` and
+helper-owned `/wefty/seat-status`, total at most half the declared memory cap.
+At 1 GiB they total 465 MiB. Floors yield for tiny caps; see
+[Computer temp sizing](computer-image.md#oci-profile) for exact
+sizing. Both profile and admission receipts report the scaled combined sum. Ordinary
 workloads retain the shared profile's 64 MiB `/dev/shm` ceiling.
 
 Wire validation is lexical only. The engine translates every operator source
@@ -1107,7 +1113,7 @@ native Linux amd64, Lima Linux arm64, service mounts/environment, default-root,
 numeric-user, unlimited-resource, and the complete Computer profile. The
 Computer fixture proves image USER/ENTRYPOINT/CMD semantics, the unchanged
 capability/seccomp/namespace/pseudo-device walls, no new privilege or GPU, and
-the private 1 GiB shm mount. The Linux-only oracle also compares
+the private scaled shm mount and bounded helper-owned status tmpfs. The Linux-only oracle also compares
 each architecture's seccomp fixture with the real containerd generator after
 final capabilities are applied. Regenerate complete fixtures only in their
 matching Linux architecture with:

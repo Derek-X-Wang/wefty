@@ -156,7 +156,7 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 	}
 	requestedMemory := request.Workload.Limits.MemoryBytes
 	requestedDisk := requestedComputerDiskBytes(request.Workload)
-	tmpfsCeiling := int64(computerDevShmKilobytes+computerTmpKilobytes+computerVarTmpKilobytes) * 1024
+	tmpfsCeiling := profileReceipt(request.Workload).ComputerTmpfsCeilingBytes
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks")
 	if err := os.MkdirAll(diskRoot, 0o700); err != nil {
 		return ResourceAdmissionReceipt{}, fmt.Errorf("prepare Computer disk admission root: %w", err)

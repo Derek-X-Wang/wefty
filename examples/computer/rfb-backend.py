@@ -114,7 +114,7 @@ def main() -> None:
 
     command = [
         "x11vnc-view" if args.view_only else "x11vnc-control",
-        "-inetd", "-display", os.environ.get("DISPLAY", ":" + os.environ["WEFTY_COMPUTER_VIEW_PORT"]), "-nopw", "-shared", "-quiet",
+        "-inetd", "-display", (os.environ.get("DISPLAY") or ":" + os.environ["WEFTY_COMPUTER_VIEW_PORT"]), "-nopw", "-shared", "-quiet",
     ]
     if args.view_only:
         command.append("-viewonly")
