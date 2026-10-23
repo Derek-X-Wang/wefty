@@ -32,5 +32,6 @@ func computerFallbackTunnel(name, kind string) bool {
 		"tunl0": "ipip", "sit0": "sit", "ip6tnl0": "ip6tnl", "gre0": "gre",
 		"gretap0": "gretap", "erspan0": "erspan", "ip6gre0": "ip6gre",
 		"ip6gretap0": "ip6gretap", "ip6erspan0": "ip6erspan",
+		"ip_vti0": "vti", "ip6_vti0": "vti6",
 	}[name] == kind && kind != ""
 }

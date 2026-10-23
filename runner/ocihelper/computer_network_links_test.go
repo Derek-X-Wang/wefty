@@ -12,6 +12,8 @@ func TestComputerNoneNetworkAcceptsOnlyInactiveFallbackTunnels(t *testing.T) {
 		{name: "sit0", kind: "sit", index: 3},
 		{name: "ip6tnl0", kind: "ip6tnl", index: 4},
 		{name: "gre0", kind: "gre", index: 5},
+		{name: "ip_vti0", kind: "vti", index: 6},
+		{name: "ip6_vti0", kind: "vti6", index: 7},
 	}
 	for _, test := range []struct {
 		name    string

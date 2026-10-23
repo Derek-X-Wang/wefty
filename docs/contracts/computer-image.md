@@ -313,7 +313,8 @@ loopback only: the helper brings `lo` up and verifies that no outward interface,
 default route or outward route exists, for either IP family. Kernel-created
 fallback tunnels may remain only under their known fallback name and kind
 (`tunl0`/`ipip`, `sit0`/`sit`, `ip6tnl0`/`ip6tnl`, `gre0`/`gre`, and the
-corresponding GRE tap/ERSPAN and IPv6 fallback devices), down and with no IPv4
+corresponding GRE tap/ERSPAN, IPv6 and IPsec `ip_vti0`/`vti`, `ip6_vti0`/`vti6`
+fallback devices), down and with no IPv4
 or IPv6 address. Any other link, active fallback, or addressed fallback is a
 typed `oci_spec_rejected` refusal. Kernel-local
 loopback routes remain. It creates no veth, NAT, egress proof listener or DNS
