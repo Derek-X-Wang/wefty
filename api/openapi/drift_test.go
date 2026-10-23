@@ -89,6 +89,8 @@ var driftRows = []driftRow{
 	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/start", "200"), typeOf[l1.SeatRequest]()},
 	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/end"), typeOf[l1.SeatEndRequest]()},
 	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/end", "200"), typeOf[l1.SeatRequest]()},
+	{requestBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-attempt-absence"), typeOf[l1.ComputerSeatAttemptAbsenceReport]()},
+	{responseBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-attempt-absence", "200"), typeOf[l1.ComputerSeatObservationReceipt]()},
 	{requestBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-room-memory"), typeOf[l1.SeatRoomMemoryReport]()},
 	{responseBody(agentDoc, "post", "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-room-memory", "200"), typeOf[l1.SeatRoomMemoryReceipt]()},
 	{component(commonDoc, "ResidentAttempt"), typeOf[l1.ResidentAttempt]()},

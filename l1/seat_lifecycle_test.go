@@ -108,7 +108,7 @@ func TestSeatLifecycleDurableTransitionsAndFinalList(t *testing.T) {
 		t.Fatalf("target=%d", value.TargetMemoryBytes)
 	}
 	f.state(t, id, SeatApproved)
-	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Deadline: f.clock.Now().Add(time.Minute)}); err != nil {
+	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, ReadyWait: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	f.state(t, id, SeatStarting)
@@ -143,7 +143,7 @@ func TestSeatLifecycleDurableTransitionsAndFinalList(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.state(t, id, SeatEnded)
-	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Deadline: f.clock.Now().Add(time.Minute)}); errorCode(err) != contract.ErrorConflict {
+	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, ReadyWait: time.Minute}); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("ended Seat restarted: %v", err)
 	}
 	if _, err := f.store.SetComputerWantedSeats(t.Context(), f.computer.ComputerID, list.Revision, []WantedComputerSeat{{SeatID: id, Place: 1}}); errorCode(err) != contract.ErrorConflict {
@@ -209,7 +209,7 @@ func TestSeatLifecycleListCannotBypassApprovalOrReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.reserve(t, id, f.computer, 1, DefaultComputerRoomConfig(1<<30))
-	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Deadline: f.clock.Now().Add(time.Minute)}); err != nil {
+	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, ReadyWait: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.store.SetComputerWantedSeats(t.Context(), f.computer.ComputerID, 1, nil); errorCode(err) != contract.ErrorConflict {
@@ -225,11 +225,11 @@ func TestSeatLifecycleCleanupFailureKeepsRoomUntilCleanupAndShrink(t *testing.T)
 	f.reserve(t, id, f.computer, 1, room)
 	other := f.request(t, 2, true)
 	f.reserve(t, other, f.computer, 2, room)
-	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", other, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Deadline: f.clock.Now().Add(time.Minute)}); err != nil {
+	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", other, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, ReadyWait: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Deadline: f.clock.Now().Add(time.Minute)}); err != nil {
+	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, ReadyWait: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	claim, err := f.store.ClaimJob(t.Context(), "fabric-computer-node", f.node.NodeID, f.node.BootSessionID, contract.JobClassService)
@@ -243,7 +243,7 @@ func TestSeatLifecycleCleanupFailureKeepsRoomUntilCleanupAndShrink(t *testing.T)
 	if _, err := f.store.EndSeatRequest(t.Context(), "fabric-computer-node", id, SeatEndRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Reason: "released"}); err != nil {
 		t.Fatal(err)
 	}
-	f.state(t, id, SeatEnding)
+	f.state(t, id, SeatRefused)
 	list, err := f.store.GetComputerSeatListForAttempt(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, auth)
 	if err != nil {
 		t.Fatal(err)
@@ -252,7 +252,7 @@ func TestSeatLifecycleCleanupFailureKeepsRoomUntilCleanupAndShrink(t *testing.T)
 	if _, err := f.store.ReportComputerSeatObservations(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, report); err != nil {
 		t.Fatal(err)
 	}
-	f.state(t, id, SeatEnding)
+	f.state(t, id, SeatRefused)
 	snapshot, err := f.store.GetComputerRoomSnapshot(t.Context(), f.node.NodeID, room)
 	if err != nil || snapshot.HeldMemoryBytes != 2<<30 || snapshot.AvailableSeats != 0 {
 		t.Fatalf("failed cleanup freed room: %+v %v", snapshot, err)
@@ -266,12 +266,12 @@ func TestSeatLifecycleCleanupFailureKeepsRoomUntilCleanupAndShrink(t *testing.T)
 	if _, err := f.store.ReportComputerSeatObservations(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, report); err != nil {
 		t.Fatal(err)
 	}
-	f.state(t, id, SeatEnded)
+	f.state(t, id, SeatRefused)
 	snapshot, err = f.store.GetComputerRoomSnapshot(t.Context(), f.node.NodeID, room)
 	if err != nil || snapshot.HeldMemoryBytes != 2<<30 {
 		t.Fatalf("cleanup without shrink freed room: %+v %v", snapshot, err)
 	}
-	value := f.state(t, id, SeatEnded)
+	value := f.state(t, id, SeatRefused)
 	memory.RoomRevision = value.RoomRevision - 1
 	if _, err := f.store.ReportComputerRoomMemory(t.Context(), "fabric-computer-node", f.computer.ComputerID, claim.Job.JobID, claim.Lease.AttemptID, memory); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("stale memory reservation receipt accepted: %v", err)
@@ -290,7 +290,7 @@ func TestSeatLifecycleDeadlineRemovesWantedSeatBeforeLateReady(t *testing.T) {
 	f := newSeatLifecycleFixture(t)
 	id := f.request(t, 1, true)
 	f.reserve(t, id, f.computer, 1, DefaultComputerRoomConfig(1<<30))
-	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Deadline: f.clock.Now().Add(time.Minute)}); err != nil {
+	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, ReadyWait: time.Minute}); err != nil {
 		t.Fatal(err)
 	}
 	claim, err := f.store.ClaimJob(t.Context(), "fabric-computer-node", f.node.NodeID, f.node.BootSessionID, contract.JobClassService)
@@ -345,16 +345,16 @@ func TestSeatLifecycleStartRetriesDoNotExtendRequestDeadline(t *testing.T) {
 	f := newSeatLifecycleFixture(t)
 	id := f.request(t, 1, true)
 	f.reserve(t, id, f.computer, 1, DefaultComputerRoomConfig(1<<30))
-	request := SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, Deadline: f.clock.Now().Add(3 * time.Minute)}
+	request := SeatStartRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, ReadyWait: 3 * time.Minute}
 	v, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, request)
-	if err != nil || !v.Deadline.Equal(request.Deadline) {
+	if err != nil || !v.Deadline.Equal(f.clock.Now().Add(request.ReadyWait)) {
 		t.Fatalf("start=%+v %v", v, err)
 	}
 	f.reopen(t)
 	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, request); err != nil {
 		t.Fatal(err)
 	}
-	request.Deadline = request.Deadline.Add(time.Minute)
+	request.ReadyWait += time.Minute
 	if _, err := f.store.StartSeatRequest(t.Context(), "fabric-computer-node", id, request); errorCode(err) != contract.ErrorConflict {
 		t.Fatalf("request deadline extended by retry: %v", err)
 	}

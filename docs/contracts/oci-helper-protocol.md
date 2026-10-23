@@ -2244,8 +2244,19 @@ durable L1 Seat state machine. An image failure keeps its reason. Failed
 cleanup remains unconfirmed and cannot free Room. A host absence-check failure
 uses observation reason `cleanup_unverified`, distinct from a refusal detail.
 
+For controller recovery, `ObserveComputerSeats` also accepts
+`{authority,generation:0,discover:true}` without cleanup entries. This reads only
+the exact live Attempt's current directive generation (zero if none) and returns
+an empty Seat list; it grants no cleanup proof and performs no probes. Ordinary
+observations retain their positive-generation requirement. They may include
+`cleanup:[{place,user,view_port,control_port}]` for omitted places retained by L1.
+The helper refuses a wanted or conflicting place. Recovery registration never
+publishes wanted membership, starts a desktop or trusts an old image answer.
+It permits fresh host process, socket and folder absence checks; a failure
+remains unconfirmed and the next observation retries it.
+
 The closed Seat refusal detail vocabulary is `in_place_change_requires_remove`,
-`cleanup_not_confirmed`, `generation_mismatch`, `attempt_not_live`, `tmpfs_floor`,
+`cleanup_not_confirmed`, `generation_mismatch`, `attempt_not_live`, `attempt_overlap`, `tmpfs_floor`,
 `memory_capacity`, `memory_grow_failed`, `memory_busy`, `memory_thaw_failed`.
 
 Recoverable list conflicts use `seat_operation_refused` with a typed `detail`:
@@ -2587,6 +2598,16 @@ permanently block later resizes. Pending shrink provenance consumes cleanup
 only when the lower limit proves that shrink took effect; reconciling a failed
 grow does not consume unrelated Seat cleanup.
 
+The per-Job capacity reservation belongs to one exact Attempt. Admission of
+another Attempt refuses `attempt_overlap`, including before the first resize,
+and before comparing the original declaration with a grown limit. A live-limit
+operation additionally refuses any recovered reservation shared by two Attempts. The losing Run retains its typed `seat_operation_refused` result
+and leaves the helper session usable. Neither refusal changes the reservation.
+Only verified Attempt cleanup (or rollback before runtime creation) releases it;
+replacement admission then reserves its original declaration afresh. A helper
+restart loses runtime authority and must complete the existing reap/sweep barrier
+before replacement admission; losing the in-memory reservation is not cleanup.
+
 A shrink requires at least one removed Seat with final positive cleanup from
 `ObserveComputerSeats` whose room has not yet been returned; every omitted
 Seat must be cleaned. Successful shrink readback consumes those cleanup proofs,
@@ -2650,7 +2671,7 @@ successful shrink leaves an oversized reservation.
 
 Known caller obligations and fail-safe limits:
 
-- The reservation is per Job, while the limit is per Attempt cgroup; overlapping Attempts and replacement admission after a grow require #1142's fencing.
+- A replacement waits for verified old-Attempt release, including after a grow; admission never shares the old cgroup's memory reservation. L1 Seat room return requires strict cgroup absence, even when ordinary helper reap permits a bounded retained cgroup. The node agent's OCI adapter applies that stronger proof to Computer Runs and after any Seat memory operation, including an uncertain operation, and retains it across failed reap retries.
 - Cleanup proof is not tied to bytes; with `memory.oom.group=1`, #1143 must pass the true final target for the remaining Seats.
 - A partial shrink consumes every cleanup proof, and reusing a place erases an unreturned proof. Reconciling an earlier uncertain shrink can also consume a newer cleanup proof. All fail safe because room stays held.
 
@@ -2660,8 +2681,8 @@ six memory-backed mounts, including `/tmp`, `/var/tmp`, `/dev/shm`, and
 with `seat_operation_refused`, detail `tmpfs_floor`, without changing either
 the limit or the reservation. It does not remount tmpfs. This maintains the
 half-of-limit rule even after a live shrink. The floor is retained in the
-Computer's helper reservation at admission, retaining the largest ceiling
-across overlapping admitted attempts; missing floor facts fail closed.
+Computer's helper reservation at admission until verified Attempt absence;
+missing floor facts fail closed.
 
 `TestHelperComputerMemoryRM5` runs as root with `computer_seat_lane` in
 `default-computer-seats / linux/amd64` and

@@ -40,12 +40,12 @@ type SeatNodeRequest struct {
 	BootSessionID string `json:"boot_session_id"`
 }
 
-// SeatStartRequest carries the request flow's deadline. It does not replace
+// SeatStartRequest carries a remaining wait measured on L1's clock. It does not replace
 // the helper's independent 60-second deadline from directive publication.
 type SeatStartRequest struct {
-	NodeID        string    `json:"node_id"`
-	BootSessionID string    `json:"boot_session_id"`
-	Deadline      time.Time `json:"deadline"`
+	NodeID        string        `json:"node_id"`
+	BootSessionID string        `json:"boot_session_id"`
+	ReadyWait     time.Duration `json:"ready_wait"`
 }
 type SeatRoomReservationRequest struct {
 	NodeID        string             `json:"node_id"`
@@ -83,12 +83,31 @@ func (s *Store) migrateSeatLifecycle(ctx context.Context) error {
 		{"lifecycle_state", "TEXT NOT NULL DEFAULT '' CHECK(lifecycle_state IN ('','requested','approved','starting','live','ending','ended','refused'))"},
 		{"lifecycle_reason", "TEXT NOT NULL DEFAULT ''"},
 		{"seat_deadline_ns", "INTEGER NOT NULL DEFAULT 0"},
+		{"seat_ready_wait_ns", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.ensureColumn(ctx, "seat_approvals", col.name, col.definition); err != nil {
 			return err
 		}
 	}
-	return nil
+	for _, column := range []struct{ name, definition string }{{"first_attempt_authority_json", "BLOB"}, {"first_attempt_absent", "INTEGER NOT NULL DEFAULT 0 CHECK(first_attempt_absent IN (0,1))"}} {
+		if err := s.ensureColumn(ctx, "computer_seat_identities", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct{ name, definition string }{{"memory_attempt_authority_json", "BLOB"}, {"memory_attempt_absent", "INTEGER NOT NULL DEFAULT 0 CHECK(memory_attempt_absent IN (0,1))"}} {
+		if err := s.ensureColumn(ctx, "computer_room_limits", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	write, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer write.rollback()
+	if err := retainSeatAttemptAuthorities(ctx, write.tx, ""); err != nil {
+		return err
+	}
+	return write.commit()
 }
 
 func readSeatRequest(ctx context.Context, q queryer, id string) (SeatRequest, error) {
@@ -111,11 +130,18 @@ func readSeatRequest(ctx context.Context, q queryer, id string) (SeatRequest, er
 }
 func (s *Store) GetSeatRequest(ctx context.Context, id string) (SeatRequest, error) {
 	var value SeatRequest
+	var expired bool
 	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
 		var err error
 		value, err = readSeatRequest(ctx, reads.(*databaseReads).q, id)
+		if err == nil {
+			expired, err = seatApprovalNeedsExpiry(ctx, reads.(*databaseReads).q, value, reads.(*databaseReads).now())
+		}
 		return err
 	})
+	if err == nil && expired {
+		return s.expireSeatApprovalRead(ctx, id, "", nil)
+	}
 	return value, err
 }
 func authorizeSeatRequest(ctx context.Context, q queryer, identity, id, node, boot string) error {
@@ -155,6 +181,9 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 	if err := authorizeSeatRequest(ctx, q, identity, id, request.NodeID, request.BootSessionID); err != nil {
 		return SeatRequest{}, err
 	}
+	if err := expireSeatApproval(ctx, q, id, write.at); err != nil {
+		return SeatRequest{}, err
+	}
 	value, err := readSeatRequest(ctx, q, id)
 	if err != nil {
 		return value, err
@@ -191,7 +220,7 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 	if err != nil {
 		return value, err
 	}
-	if approval.Request.BootSessionID != request.BootSessionID || node != request.NodeID || network != approval.Request.Network || !made || desired != string(contract.ServiceDesiredRunning) || request.Place > limit || (approval.Request.Form == "dedicated" && limit != 1) {
+	if approval.Request.BootSessionID != request.BootSessionID || node != request.NodeID || network != approval.Request.Network || !made || desired != string(contract.ServiceDesiredRunning) || request.Place > limit || ((approval.Request.Form == "dedicated") != (limit == 1)) {
 		return value, protocolError(contract.ErrorConflict, "Computer does not match this approved Seat request")
 	}
 	var occupied int
@@ -205,7 +234,34 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 	if err != nil {
 		return value, err
 	}
-	_, roomErr := request.Room.Check(usage, approval.Request.Form == "dedicated")
+	var currentCharge int64
+	others := make([]ComputerRoomUsage, 0, len(usage))
+	for _, computer := range usage {
+		if computer.ComputerID == request.ComputerID {
+			currentCharge = computer.MemoryBytes
+		} else {
+			others = append(others, computer)
+		}
+	}
+	var reserved int64
+	if err := q.QueryRowContext(ctx, `SELECT COALESCE(SUM(memory_bytes),0) FROM computer_seat_room_reservations WHERE computer_id=? AND cleanup_complete=0`, request.ComputerID).Scan(&reserved); err != nil {
+		return value, err
+	}
+	if reserved > math.MaxInt64-request.Room.SeatMemoryBytes {
+		return value, protocolError(contract.ErrorConflict, "Computer room charge overflows")
+	}
+	required := max(currentCharge, reserved+request.Room.SeatMemoryBytes)
+	var roomErr error
+	if required > request.Room.MemoryBytes {
+		roomErr = ErrComputerRoomFull
+	} else {
+		// Check other Computers against the cap; charge this target exactly
+		// once, at its projected total, rather than treating it as a competitor.
+		budget := request.Room
+		budget.MemoryBytes -= required - request.Room.SeatMemoryBytes
+		_, roomErr = budget.Check(others, approval.Request.Form == "dedicated")
+	}
+
 	if roomErr != nil {
 		if !errors.Is(roomErr, ErrComputerRoomFull) && !errors.Is(roomErr, ErrDedicatedComputerCap) {
 			return value, roomErr
@@ -244,7 +300,7 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 		return value, err
 	}
 	// Charge before the grow. A lost grow response must never return room.
-	if _, err := q.ExecContext(ctx, `INSERT INTO computer_room_limits(computer_id,node_id,memory_bytes) VALUES(?,?,?) ON CONFLICT(computer_id) DO UPDATE SET memory_bytes=MAX(memory_bytes,excluded.memory_bytes),revision=revision+1`, request.ComputerID, request.NodeID, value.TargetMemoryBytes); err != nil {
+	if _, err := q.ExecContext(ctx, `INSERT INTO computer_room_limits(computer_id,node_id,memory_bytes) VALUES(?,?,?) ON CONFLICT(computer_id) DO UPDATE SET memory_bytes=MAX(memory_bytes,excluded.memory_bytes),revision=revision+1`, request.ComputerID, request.NodeID, max(currentCharge, value.TargetMemoryBytes)); err != nil {
 		return value, err
 	}
 	value, err = readSeatRequest(ctx, q, id)
@@ -279,7 +335,7 @@ func readSeatRoomUsage(ctx context.Context, q queryer, node string) ([]ComputerR
 		if reserved > 0 {
 			u.Seats = 1
 		} // Only occupancy matters here; bytes carry the charge.
-		if (!u.SeatRequestMade || u.Running) && !tracked {
+		if !u.SeatRequestMade || u.Running {
 			var spec contract.JobSpec
 			if err := json.Unmarshal(specBytes, &spec); err != nil {
 				rows.Close()
@@ -343,12 +399,19 @@ func (s *Store) StartSeatRequest(ctx context.Context, identity, id string, reque
 	if err := authorizeSeatRequest(ctx, q, identity, id, request.NodeID, request.BootSessionID); err != nil {
 		return SeatRequest{}, err
 	}
+	if err := expireSeatApproval(ctx, q, id, write.at); err != nil {
+		return SeatRequest{}, err
+	}
 	value, err := readSeatRequest(ctx, q, id)
 	if err != nil {
 		return value, err
 	}
 	if value.State == SeatStarting || value.State == SeatLive {
-		if !value.Deadline.Equal(request.Deadline) {
+		var wait int64
+		if err := q.QueryRowContext(ctx, `SELECT seat_ready_wait_ns FROM seat_approvals WHERE seat_id=?`, id).Scan(&wait); err != nil {
+			return value, err
+		}
+		if wait != int64(request.ReadyWait) {
 			return value, protocolError(contract.ErrorConflict, "Seat start retry changed its deadline")
 		}
 		return value, write.commit()
@@ -356,8 +419,19 @@ func (s *Store) StartSeatRequest(ctx context.Context, identity, id string, reque
 	if value.State != SeatApproved || value.ComputerID == "" {
 		return value, protocolError(contract.ErrorConflict, "Seat has no approved room reservation")
 	}
-	if request.Deadline.IsZero() || !write.at.Before(request.Deadline) {
-		return value, protocolError(contract.ErrorInvalidRequest, "Seat start requires a future request deadline")
+	deadline := write.at.Add(request.ReadyWait)
+	if request.ReadyWait <= 0 || deadline.UnixNano() <= write.at.UnixNano() {
+		if err := setSeatLifecycle(ctx, q, id, SeatRefused, "invalid Seat readiness wait"); err != nil {
+			return value, err
+		}
+		if err := cleanNeverStartedSeat(ctx, q, value); err != nil {
+			return value, err
+		}
+		if err := write.commit(); err != nil {
+			return value, err
+		}
+		value.State, value.Reason = SeatRefused, "invalid Seat readiness wait"
+		return value, protocolError(contract.ErrorInvalidRequest, "Seat start requires a positive readiness wait")
 	}
 	approval, err := readSeatApproval(ctx, q, id)
 	if err != nil {
@@ -369,7 +443,7 @@ func (s *Store) StartSeatRequest(ctx context.Context, identity, id string, reque
 	if err := setSeatLifecycle(ctx, q, id, SeatStarting, ""); err != nil {
 		return value, err
 	}
-	if _, err := q.ExecContext(ctx, `UPDATE seat_approvals SET seat_deadline_ns=? WHERE seat_id=?`, request.Deadline.UnixNano(), id); err != nil {
+	if _, err := q.ExecContext(ctx, `UPDATE seat_approvals SET seat_deadline_ns=?,seat_ready_wait_ns=? WHERE seat_id=?`, deadline.UnixNano(), int64(request.ReadyWait), id); err != nil {
 		return value, err
 	}
 	if _, err := q.ExecContext(ctx, `INSERT INTO computer_wanted_seats(computer_id,place,seat_id) VALUES(?,?,?)`, value.ComputerID, value.Place, id); err != nil {
@@ -397,13 +471,16 @@ func (s *Store) EndSeatRequest(ctx context.Context, identity, id string, request
 	if err := authorizeSeatRequest(ctx, q, identity, id, request.NodeID, request.BootSessionID); err != nil {
 		return SeatRequest{}, err
 	}
+	if err := expireSeatApproval(ctx, q, id, write.at); err != nil {
+		return SeatRequest{}, err
+	}
 	value, err := readSeatRequest(ctx, q, id)
 	if err != nil {
 		return value, err
 	}
 	if value.State != SeatEnded && value.State != SeatRefused && value.State != SeatEnding {
 		state := SeatEnding
-		if request.Refused || value.State == SeatRequested || value.State == SeatApproved {
+		if request.Refused || value.State == SeatRequested || value.State == SeatApproved || value.State == SeatStarting {
 			state = SeatRefused
 		}
 		if err := setSeatLifecycle(ctx, q, id, state, request.Reason); err != nil {
@@ -412,6 +489,9 @@ func (s *Store) EndSeatRequest(ctx context.Context, identity, id string, request
 		if err := removeLifecycleSeat(ctx, q, value); err != nil {
 			return value, err
 		}
+	}
+	if err := cleanNeverStartedSeat(ctx, q, value); err != nil {
+		return value, err
 	}
 	value, err = readSeatRequest(ctx, q, id)
 	if err != nil {
@@ -455,18 +535,8 @@ func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now
 		if value.State != SeatEnding && value.State != SeatRefused && value.State != SeatEnded {
 			return protocolError(contract.ErrorConflict, "active Seat has no cleanup authority")
 		}
-		result, err := q.ExecContext(ctx, `UPDATE computer_seat_room_reservations SET cleanup_complete=1 WHERE seat_id=? AND cleanup_complete=0`, seat.SeatID)
-		if err != nil {
+		if err := markSeatReservationClean(ctx, q, value); err != nil {
 			return err
-		}
-		changed, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if changed > 0 {
-			if _, err := q.ExecContext(ctx, `UPDATE computer_room_limits SET revision=revision+1 WHERE computer_id=?`, value.ComputerID); err != nil {
-				return err
-			}
 		}
 		if value.State == SeatEnding {
 			return setSeatLifecycle(ctx, q, seat.SeatID, SeatEnded, value.Reason)
@@ -529,8 +599,22 @@ func (s *Store) ReportComputerRoomMemory(ctx context.Context, identity, computer
 		return SeatRoomMemoryReceipt{}, err
 	}
 
+	if err := bindSeatRoomAttempt(ctx, q, computer, job, attempt, report.ComputerSeatAttemptRequest); err != nil {
+		return SeatRoomMemoryReceipt{}, err
+	}
+	pending, err := oldSeatRoomAttemptPending(ctx, q, computer, attempt)
+	if err != nil {
+		return SeatRoomMemoryReceipt{}, err
+	}
+	if pending {
+		return SeatRoomMemoryReceipt{}, protocolError(contract.ErrorConflict, "earlier Computer memory Attempt still needs absence evidence")
+	}
+
 	var revision int64
 	if err := q.QueryRowContext(ctx, `SELECT revision FROM computer_room_limits WHERE computer_id=?`, computer).Scan(&revision); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return SeatRoomMemoryReceipt{}, protocolError(contract.ErrorConflict, "Computer has no room reservation")
+		}
 		return SeatRoomMemoryReceipt{}, err
 	}
 	if revision != report.RoomRevision {
@@ -545,7 +629,7 @@ func (s *Store) ReportComputerRoomMemory(ctx context.Context, identity, computer
 	}
 	// An old attempt's pending cleanup cannot be discharged by a new cgroup.
 	var old int
-	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM computer_seat_room_reservations r JOIN computer_seat_identities i ON i.seat_id=r.seat_id WHERE r.computer_id=? AND i.first_attempt_id IS NOT NULL AND i.first_attempt_id!=? AND r.cleanup_complete=0`, computer, attempt).Scan(&old); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM computer_seat_room_reservations r JOIN computer_seat_identities i ON i.seat_id=r.seat_id WHERE r.computer_id=? AND i.first_attempt_id IS NOT NULL AND i.first_attempt_id!=? AND (i.first_attempt_absent=0 OR r.cleanup_complete=0)`, computer, attempt).Scan(&old); err != nil {
 		return SeatRoomMemoryReceipt{}, err
 	}
 	if old > 0 {
@@ -568,7 +652,37 @@ func (s *Store) ReportComputerRoomMemory(ctx context.Context, identity, computer
 // A new node agent boot cannot still own the preceding boot's native dialog.
 // Re-registering the same boot, or L1 alone restarting, does not lose a dialog.
 func refuseLostSeatDialogs(ctx context.Context, q seatApprovalQuery, node, boot string) error {
-	_, err := q.ExecContext(ctx, `UPDATE seat_approvals SET state='refused',reason='approval dialog lost',lifecycle_state='refused',lifecycle_reason='approval dialog lost'
- WHERE node_id=? AND boot_session_id!=? AND COALESCE(NULLIF(lifecycle_state,''),state)='requested'`, node, boot)
-	return err
+	rows, err := q.QueryContext(ctx, `SELECT seat_id FROM seat_approvals WHERE node_id=? AND boot_session_id!=? AND COALESCE(NULLIF(lifecycle_state,''),state) IN ('requested','approved')`, node, boot)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		v, err := readSeatRequest(ctx, q, id)
+		if err != nil {
+			return err
+		}
+		reason := "approval dialog lost"
+		if v.State == SeatApproved {
+			reason = "node agent restarted before Seat start"
+		}
+		if err := setSeatLifecycle(ctx, q, id, SeatRefused, reason); err != nil {
+			return err
+		}
+		if err := cleanNeverStartedSeat(ctx, q, v); err != nil {
+			return err
+		}
+	}
+	return nil
 }

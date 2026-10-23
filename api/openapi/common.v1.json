@@ -7,6 +7,97 @@
   "paths": {},
   "components": {
     "schemas": {
+      "ComputerSeatRecovery": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "retired_attempts": {
+            "type": "array",
+            "items": {
+              "$ref": "./common.v1.json#/components/schemas/ComputerSeatRetiredAttempt"
+            }
+          },
+          "bindings": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "$ref": "./common.v1.json#/components/schemas/WantedComputerSeat"
+            }
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "room": {
+            "$ref": "./common.v1.json#/components/schemas/SeatRoomMemoryReceipt"
+          }
+        },
+        "required": [
+          "retired_attempts",
+          "bindings",
+          "sequence"
+        ]
+      },
+      "ComputerSeatRetiredAttempt": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "removal_generation": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "boot_session_id": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "fencing_token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "boot_session_id",
+          "job_id",
+          "attempt_id",
+          "fencing_token",
+          "removal_generation"
+        ]
+      },
+      "ComputerSeatAttemptAbsenceReport": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "boot_session_id": {
+            "type": "string"
+          },
+          "fencing_token": {
+            "type": "string"
+          },
+          "retired": {
+            "$ref": "./common.v1.json#/components/schemas/ComputerSeatRetiredAttempt"
+          },
+          "absent": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "node_id",
+          "boot_session_id",
+          "fencing_token",
+          "retired",
+          "absent"
+        ]
+      },
       "SeatNodeRequest": {
         "type": "object",
         "additionalProperties": false,
@@ -222,7 +313,7 @@
         "required": [
           "node_id",
           "boot_session_id",
-          "deadline"
+          "ready_wait"
         ],
         "properties": {
           "node_id": {
@@ -231,9 +322,10 @@
           "boot_session_id": {
             "type": "string"
           },
-          "deadline": {
-            "type": "string",
-            "format": "date-time"
+          "ready_wait": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
           }
         }
       },
@@ -260,6 +352,9 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "recovery": {
+            "$ref": "./common.v1.json#/components/schemas/ComputerSeatRecovery"
+          },
           "revision": {
             "type": "integer",
             "minimum": 0

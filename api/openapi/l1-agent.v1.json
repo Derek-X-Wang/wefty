@@ -8,6 +8,82 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-attempt-absence": {
+      "parameters": [
+        {
+          "name": "computer_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "attempt_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "reportComputerSeatAttemptAbsence",
+        "summary": "Record exact retired Computer Attempt absence",
+        "description": "Current node authority reports positive absence of the immutable earlier Attempt identity retained by L1. This grants cleanup binding recovery only; fresh per-Seat cleanup and memory readback remain required before room returns.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/ComputerSeatAttemptAbsenceReport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable Seat lifecycle receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/ComputerSeatObservationReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
     "/v1/agent/seat-requests/{seat_id}/read": {
       "parameters": [
         {
@@ -142,7 +218,7 @@
       "post": {
         "operationId": "startSeatRequest",
         "summary": "startSeatRequest",
-        "description": "Publish a starting Seat after its grow. The request flow supplies its deadline once; retries cannot extend it. The helper separately enforces its per-Seat 60-second readiness deadline from directive publication.",
+        "description": "Publish a starting Seat after its grow. The request flow supplies a positive remaining duration in nanoseconds. L1 sets the deadline once on its own clock; retries must retain the duration and cannot extend the deadline. The helper separately enforces its per-Seat 60-second readiness deadline from directive publication.",
         "requestBody": {
           "required": true,
           "content": {

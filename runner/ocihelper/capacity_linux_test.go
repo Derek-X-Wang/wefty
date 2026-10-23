@@ -110,7 +110,7 @@ func TestOrdinaryOCIServiceDoesNotConsumeComputerCapacity(t *testing.T) {
 	}
 }
 
-func TestComputerRestartReusesJobReservationUntilLastAttemptDelete(t *testing.T) {
+func TestComputerRestartWaitsForPreviousAttemptReservationRelease(t *testing.T) {
 	root := t.TempDir()
 	meminfo := filepath.Join(root, "meminfo")
 	if err := os.WriteFile(meminfo, []byte("MemTotal: 4194304 kB\nMemAvailable: 2097152 kB\n"), 0o600); err != nil {
@@ -131,18 +131,28 @@ func TestComputerRestartReusesJobReservationUntilLastAttemptDelete(t *testing.T)
 		t.Fatal(err)
 	}
 	second := request("attempt-b")
+	_, err := engine.admitResources(second)
+	var refusal *SeatOperationRefusalError
+	if !errors.As(err, &refusal) || refusal.Reason != SeatRefusalAttemptOverlap {
+		t.Fatalf("overlapping restart admission: %v", err)
+	}
+	if len(engine.capacityReservations["computer-job"].attempts) != 1 {
+		t.Fatal("refusal changed reservation ownership")
+	}
+	engine.releaseCapacityReservation(first.Authority.key())
 	receipt, err := engine.admitResources(second)
-	if err != nil || receipt.MemoryCommittedBeforeBytes != 1<<30 || receipt.MemoryCommittedAfterBytes != 1<<30 || len(engine.capacityReservations) != 1 {
-		t.Fatalf("restart reservation = %+v reservations=%+v err=%v", receipt, engine.capacityReservations, err)
+	if err != nil || receipt.MemoryCommittedBeforeBytes != 0 || receipt.MemoryCommittedAfterBytes != 1<<30 {
+		t.Fatalf("replacement after verified release: %+v %v", receipt, err)
 	}
 	engine.releaseCapacityReservation(first.Authority.key())
 	if len(engine.capacityReservations) != 1 {
-		t.Fatalf("old-attempt delete released live restart reservation: %+v", engine.capacityReservations)
+		t.Fatal("old release removed replacement reservation")
 	}
 	engine.releaseCapacityReservation(second.Authority.key())
 	if len(engine.capacityReservations) != 0 {
-		t.Fatalf("last-attempt delete retained reservation: %+v", engine.capacityReservations)
+		t.Fatal("replacement release retained reservation")
 	}
+
 }
 
 func TestJobUnbindingAndVerifiedBootSweepReleaseReservations(t *testing.T) {

@@ -457,6 +457,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/start", s.startSeatRequest)
 	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/end", s.endSeatRequest)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-room-memory", s.reportComputerRoomMemory)
+	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-attempt-absence", s.reportComputerSeatAttemptAbsence)
 
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-observations", s.computerSeatObservations)
 	agent.HandleFunc("POST /v1/agent/seat-approvals", s.beginSeatApproval)

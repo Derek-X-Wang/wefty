@@ -164,7 +164,7 @@ func TestHelperComputerSeatExecIM3(t *testing.T) {
 		var last ObserveComputerSeatsResponse
 		var lastErr error
 		for {
-			last, lastErr = engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{authority, generation})
+			last, lastErr = engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{Authority: authority, Generation: generation})
 			if lastErr == nil && len(last.Seats) == 1 && last.Seats[0].State == state {
 				if state == "cleaned" && !last.Seats[0].CleanupComplete {
 					t.Fatal("cleaned without positive evidence")

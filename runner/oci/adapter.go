@@ -112,6 +112,7 @@ type memoryBindingPinLedger struct {
 type runEntry struct {
 	entered            bool
 	attemptPinAttached bool
+	seatMemory         bool
 	sweep              sweepBaseline
 	// volumes are the exact managed-volume descriptors this attempt's own Run
 	// request carried. Two of the attempt's deterministic resource names
@@ -1110,7 +1111,8 @@ func (adapter *Adapter) runObserved(ctx context.Context, request workloadrunner.
 	}
 	runtimeGeneration = helperSession(session)
 	entry := runEntry{
-		entered: true, sweep: sweepBaseline{epoch: sweepReceipt.SweepEpoch, helper: sweepReceipt.HelperSession},
+		entered: true, seatMemory: contract.IsComputerExecution(request.Execution),
+		sweep:   sweepBaseline{epoch: sweepReceipt.SweepEpoch, helper: sweepReceipt.HelperSession},
 		volumes: helperManagedVolumes(request),
 	}
 	if entry.sweep.epoch == "" || entry.sweep.helper.HelperInstanceID == "" || entry.sweep.helper.SessionGeneration == 0 {
@@ -1703,7 +1705,7 @@ func helperRunDefinitivelyRejected(err error) bool {
 	case ocihelper.CodeEngineFailure, ocihelper.CodeOCISpecRejected, ocihelper.CodeImageUnavailable,
 		ocihelper.CodeInsufficientMemory, ocihelper.CodeInsufficientDisk, ocihelper.CodeInvalidRequest,
 		ocihelper.CodeSweepRequired, ocihelper.CodeUnsupportedOperation, ocihelper.CodeComputerStorageBusy,
-		ocihelper.CodeComputerStorageRetired, ocihelper.CodeConnectionLimit:
+		ocihelper.CodeComputerStorageRetired, ocihelper.CodeConnectionLimit, ocihelper.CodeSeatOperationRefused:
 		return true
 	default:
 		return false
@@ -1923,10 +1925,34 @@ func waitBridgeRetryAfter(ctx context.Context, delay time.Duration) bool {
 	}
 }
 
-func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunner.ReapRequest) (workloadrunner.ReapReceipt, error) {
+func (adapter *Adapter) ReapAndVerify(ctx context.Context, request workloadrunner.ReapRequest) (result workloadrunner.ReapReceipt, finalErr error) {
 	adapter.mu.Lock()
 	entry, tracked := adapter.runEntered[request.Authority]
 	adapter.mu.Unlock()
+	if tracked && entry.seatMemory {
+		defer func() {
+			if finalErr != nil || !result.RuntimeQuiesced {
+				return
+			}
+			absent, err := adapter.VerifyComputerSeatAttemptAbsent(ctx, HelperAuthority(request.Authority))
+			if err == nil && absent {
+				return
+			}
+			// Generic reap permits bounded cgroup retention. Seat room cannot
+			// be released until the cgroup itself is gone. Retain the binding
+			// across retries, including successful Delete with a lost proof.
+			adapter.mu.Lock()
+			adapter.runEntered[request.Authority] = entry
+			adapter.mu.Unlock()
+			if err == nil {
+				err = errors.New("Computer Attempt absence was not verified")
+			}
+			if requiresOCIRuntimeRecovery(err) {
+				err = reapRuntimeLoss(entry.sweep.helper, err)
+			}
+			result, finalErr = workloadrunner.ReapReceipt{}, err
+		}()
+	}
 	if receipt, ok := adapter.reapFromMatchingSweep(request.Authority); ok {
 		adapter.consumeRunEntry(request.Authority)
 		return receipt, nil
@@ -2029,6 +2055,7 @@ func (adapter *Adapter) trackRun(authority workloadrunner.AttemptAuthority, entr
 		current.sweep = entry.sweep
 		current.volumes = entry.volumes
 	}
+	current.seatMemory = current.seatMemory || entry.seatMemory
 	adapter.runEntered[authority] = current
 	adapter.mu.Unlock()
 }

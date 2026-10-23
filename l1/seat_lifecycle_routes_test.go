@@ -51,8 +51,8 @@ func TestSeatLifecycleRoutesAreNodeFenced(t *testing.T) {
 		}
 	}
 	send(base+"/reserve-room", SeatRoomReservationRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, ComputerID: c.ComputerID, Place: 1, Room: DefaultComputerRoomConfig(1 << 30)}, SeatApproved)
-	send(base+"/start", SeatStartRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, Deadline: h.clock.Now().Add(time.Minute)}, SeatStarting)
-	send(base+"/end", SeatEndRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, Reason: "released"}, SeatEnding)
+	send(base+"/start", SeatStartRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, ReadyWait: time.Minute}, SeatStarting)
+	send(base+"/end", SeatEndRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, Reason: "released"}, SeatRefused)
 	auth.BootSessionID = "old-boot"
 	status, _, body := h.do(client, http.MethodPost, base+"/read", auth)
 	if status != 403 {

@@ -22,10 +22,14 @@ const computerSeatL1BackoffCap = 30 * time.Second
 const computerSeatLogInterval = 30 * time.Second
 
 type computerSeatRuntime interface {
+	VerifyComputerSeatAttemptAbsent(context.Context, ocihelper.AttemptAuthority) (bool, error)
+	SetComputerMemoryLimit(context.Context, ocihelper.SetComputerMemoryLimitRequest) (ocihelper.SetComputerMemoryLimitResponse, error)
 	ApplyComputerSeats(context.Context, ocihelper.ApplyComputerSeatsRequest) (ocihelper.ApplyComputerSeatsResponse, error)
 	ObserveComputerSeats(context.Context, ocihelper.ObserveComputerSeatsRequest) (ocihelper.ObserveComputerSeatsResponse, error)
 }
 type computerSeatControl interface {
+	ReportComputerSeatAttemptAbsence(context.Context, string, string, string, l1.ComputerSeatAttemptAbsenceReport) (l1.ComputerSeatObservationReceipt, error)
+	ReportComputerRoomMemory(context.Context, string, string, string, l1.SeatRoomMemoryReport) (l1.SeatRoomMemoryReceipt, error)
 	GetComputerSeatList(context.Context, string, string, string, l1.ComputerSeatAttemptRequest) (l1.ComputerSeatList, error)
 	ReportComputerSeats(context.Context, string, string, string, l1.ComputerSeatObservationReport) (l1.ComputerSeatObservationReceipt, error)
 }
@@ -36,29 +40,34 @@ type seatApply struct {
 }
 
 // The controller lives only as long as this exact attempt. In particular it
-// never reconstructs identity from a place after a node agent restart.
+// reconstructs identities only from L1's exact Attempt recovery bindings.
 type computerSeatController struct {
-	control        computerSeatControl
-	runtime        computerSeatRuntime
-	authority      ocihelper.AttemptAuthority
-	computerID     string
-	clock          Clock
-	logf           func(string, ...any)
-	bindings       map[int]l1.WantedComputerSeat
-	cleaned        map[string]bool
-	pendingApply   *seatApply
-	pendingReport  *l1.ComputerSeatObservationReport
-	acceptedReport *l1.ComputerSeatObservationReport
-	lastApplied    []ocihelper.ComputerSeat
-	wanted         *l1.ComputerSeatList
-	nextL1         time.Time
-	l1Backoff      time.Duration
-	l1Conflicts    int
-	nextLog        time.Time
-	generation     uint64
-	revision       int64
-	sequence       int64
-	afterStep      func()
+	recovered        bool
+	forceApply       bool
+	memoryRevision   int64
+	memoryGeneration uint64
+	control          computerSeatControl
+	runtime          computerSeatRuntime
+	authority        ocihelper.AttemptAuthority
+	computerID       string
+	clock            Clock
+	logf             func(string, ...any)
+	bindings         map[int]l1.WantedComputerSeat
+	cleaned          map[string]bool
+	pendingApply     *seatApply
+	pendingReport    *l1.ComputerSeatObservationReport
+	acceptedReport   *l1.ComputerSeatObservationReport
+	lastApplied      []ocihelper.ComputerSeat
+	wanted           *l1.ComputerSeatList
+	nextL1           time.Time
+	l1Backoff        time.Duration
+	l1Conflicts      int
+	cycleL1Error     error
+	nextLog          time.Time
+	generation       uint64
+	revision         int64
+	sequence         int64
+	afterStep        func()
 }
 
 func newComputerSeatController(control computerSeatControl, runtime computerSeatRuntime, authority ocihelper.AttemptAuthority, computerID string, clock Clock, logf func(string, ...any)) *computerSeatController {
@@ -109,16 +118,25 @@ func (c *computerSeatController) plan(list l1.ComputerSeatList) *seatApply {
 func (c *computerSeatController) step(ctx context.Context) error {
 	auth := l1.ComputerSeatAttemptRequest{NodeID: c.authority.NodeID, BootSessionID: c.authority.BootSessionID, FencingToken: c.authority.FencingToken}
 	allowed := !c.clock.Now().Before(c.nextL1)
+	c.cycleL1Error = nil
+	defer func() {
+		if allowed {
+			c.finishL1Cycle(c.cycleL1Error)
+		}
+	}()
 	var list l1.ComputerSeatList
 	var readErr error
+	var memoryErr error
 	fresh := false
 	if allowed {
 		readCtx, cancel := context.WithTimeout(ctx, computerSeatL1Budget)
 		list, readErr = c.control.GetComputerSeatList(readCtx, c.computerID, c.authority.JobID, c.authority.AttemptID, auth)
 		cancel()
+		c.cycleL1Error = readErr
 		if readErr == nil {
 			copy := list
 			copy.Seats = slices.Clone(list.Seats)
+			copy.Recovery = cloneSeatRecovery(list.Recovery)
 			c.wanted = &copy
 			fresh = true
 		}
@@ -126,16 +144,46 @@ func (c *computerSeatController) step(ctx context.Context) error {
 	if c.wanted != nil {
 		list = *c.wanted
 	}
+	helperCtx, helperCancel := context.WithTimeout(ctx, computerSeatHelperBudget)
+	defer helperCancel()
+	if fresh {
+		c.restoreBindings(list)
+		refreshed, err := c.reconcileRetired(helperCtx, list)
+		if err != nil {
+			return err
+		}
+		if refreshed {
+			return nil
+		}
+		if list.Recovery != nil && !c.recovered {
+			recoverCtx, cancel := context.WithTimeout(helperCtx, computerSeatHelperBudget)
+			recovered, err := c.runtime.ObserveComputerSeats(recoverCtx, ocihelper.ObserveComputerSeatsRequest{Authority: c.authority, Discover: true})
+			cancel()
+			if err != nil {
+				return err
+			}
+			c.generation = recovered.Generation
+			c.forceApply = true
+			c.recovered = true
+		}
+		if err := c.reconcileMemory(helperCtx, list); err != nil {
+			// A grow gates publication. Cleanup must still advance when a
+			// readback/report fails while already charged room covers the list.
+			room := list.Recovery.Room
+			if room.TargetMemoryBytes > room.HeldMemoryBytes {
+				return err
+			}
+			memoryErr = err
+		}
+	}
 	if fresh && c.pendingApply == nil {
 		plan := c.plan(list)
-		if c.generation != 0 && slices.Equal(plan.seats, c.lastApplied) {
+		if !c.forceApply && c.generation != 0 && slices.Equal(plan.seats, c.lastApplied) {
 			c.revision, c.bindings = plan.revision, plan.bindings
 		} else {
 			c.pendingApply = plan
 		}
 	}
-	helperCtx, helperCancel := context.WithTimeout(ctx, computerSeatHelperBudget)
-	defer helperCancel()
 	var applyErr error
 	if pending := c.pendingApply; pending != nil {
 		response, err := c.runtime.ApplyComputerSeats(helperCtx, ocihelper.ApplyComputerSeatsRequest{Authority: c.authority, Seats: pending.seats})
@@ -157,12 +205,13 @@ func (c *computerSeatController) step(ctx context.Context) error {
 			}
 			c.generation, c.revision, c.bindings = response.Generation, pending.revision, pending.bindings
 			c.lastApplied = slices.Clone(pending.seats)
+			c.forceApply = false
 			c.pendingApply = nil
 		}
 	}
 	var observeErr error
 	if c.generation != 0 {
-		response, err := c.runtime.ObserveComputerSeats(helperCtx, ocihelper.ObserveComputerSeatsRequest{Authority: c.authority, Generation: c.generation})
+		response, err := c.runtime.ObserveComputerSeats(helperCtx, ocihelper.ObserveComputerSeatsRequest{Authority: c.authority, Generation: c.generation, Cleanup: c.cleanupPlaces(list)})
 		var rpc *ocihelper.RPCError
 		if errors.As(err, &rpc) && rpc.Code == ocihelper.CodeSeatOperationRefused { // Wait for the next Apply/Observe pass.
 		} else if err != nil {
@@ -180,6 +229,15 @@ func (c *computerSeatController) step(ctx context.Context) error {
 					observeErr = errors.New("helper reported an unbound Seat place")
 					break
 				}
+				// A delayed ready answer for an omitted Seat has no request
+				// authority. Keep observing its removal, never offer it as live.
+				wanted := false
+				for _, seat := range list.Seats {
+					wanted = wanted || seat.SeatID == binding.SeatID
+				}
+				if list.Recovery != nil && !wanted && (observation.State == "starting" || observation.State == "ready") {
+					continue
+				}
 				seats = append(seats, l1.ComputerSeatObservation{SeatID: binding.SeatID, Place: binding.Place, State: l1.ComputerSeatObservedState(observation.State), Reason: observation.Reason, CleanupComplete: observation.CleanupComplete})
 			}
 			if observeErr == nil && len(seats) > 0 && c.observationsChanged(seats) {
@@ -194,31 +252,9 @@ func (c *computerSeatController) step(ctx context.Context) error {
 	var reportErr error
 	if allowed && readErr == nil {
 		reportErr = c.flush(ctx)
+		c.cycleL1Error = errors.Join(c.cycleL1Error, reportErr)
 	}
-	if allowed {
-		l1Err := errors.Join(readErr, reportErr)
-		var protocol *ProtocolError
-		conflict := errors.As(l1Err, &protocol) && protocol.StatusCode == http.StatusConflict && !protocol.APIError.Retryable
-		if conflict {
-			c.l1Conflicts++
-		} else {
-			c.l1Conflicts = 0
-		}
-		// One conflict may be an ordinary revision race. A lasting 409 must
-		// have a floor too; helper cleanup continues during the L1 backoff.
-		if l1Err != nil && (computerSeatRetryableL1Error(l1Err) || c.l1Conflicts >= 2) {
-			if c.l1Backoff == 0 {
-				c.l1Backoff = 2 * time.Second
-			} else {
-				c.l1Backoff = min(2*c.l1Backoff, computerSeatL1BackoffCap)
-			}
-			c.nextL1 = c.clock.Now().Add(c.l1Backoff)
-		} else {
-			c.l1Backoff = 0
-			c.nextL1 = time.Time{}
-		}
-	}
-	return errors.Join(readErr, applyErr, observeErr, reportErr)
+	return errors.Join(readErr, memoryErr, applyErr, observeErr, reportErr)
 }
 func (c *computerSeatController) flush(ctx context.Context) error {
 	report := c.pendingReport
@@ -280,7 +316,33 @@ func (c *computerSeatController) observationsChanged(seats []l1.ComputerSeatObse
 func computerSeatRetryableL1Error(err error) bool {
 	var protocol *ProtocolError
 	if errors.As(err, &protocol) {
+		if protocol.APIError.Details["reason"] == "seat_list_revision_changed" {
+			return false
+		}
 		return protocol.APIError.Retryable || protocol.StatusCode >= 500 || protocol.StatusCode == http.StatusRequestTimeout || protocol.StatusCode == http.StatusTooManyRequests
 	}
 	return true
+}
+
+func (c *computerSeatController) finishL1Cycle(l1Err error) {
+	var protocol *ProtocolError
+	conflict := errors.As(l1Err, &protocol) && protocol.StatusCode == http.StatusConflict && !protocol.APIError.Retryable && protocol.APIError.Details["reason"] != "seat_list_revision_changed"
+	if conflict {
+		c.l1Conflicts++
+	} else {
+		c.l1Conflicts = 0
+	}
+	// One conflict may be an ordinary revision race. A lasting 409 must
+	// have a floor too; helper cleanup continues during the L1 backoff.
+	if l1Err != nil && (computerSeatRetryableL1Error(l1Err) || c.l1Conflicts >= 2) {
+		if c.l1Backoff == 0 {
+			c.l1Backoff = 2 * time.Second
+		} else {
+			c.l1Backoff = min(2*c.l1Backoff, computerSeatL1BackoffCap)
+		}
+		c.nextL1 = c.clock.Now().Add(c.l1Backoff)
+	} else {
+		c.l1Backoff = 0
+		c.nextL1 = time.Time{}
+	}
 }

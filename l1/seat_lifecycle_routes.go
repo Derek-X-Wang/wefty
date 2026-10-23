@@ -7,6 +7,7 @@ import (
 
 func (s *Store) GetSeatRequestForNode(ctx context.Context, identity, id string, request SeatNodeRequest) (SeatRequest, error) {
 	var value SeatRequest
+	var expired bool
 	err := s.withAgentReadSnapshot(ctx, func(ctx context.Context, reads readModel) error {
 		q := reads.(*databaseReads).q
 		if err := authorizeSeatRequest(ctx, q, identity, id, request.NodeID, request.BootSessionID); err != nil {
@@ -14,8 +15,14 @@ func (s *Store) GetSeatRequestForNode(ctx context.Context, identity, id string, 
 		}
 		var err error
 		value, err = readSeatRequest(ctx, q, id)
+		if err == nil {
+			expired, err = seatApprovalNeedsExpiry(ctx, q, value, reads.(*databaseReads).now())
+		}
 		return err
 	})
+	if err == nil && expired {
+		return s.expireSeatApprovalRead(ctx, id, identity, &request)
+	}
 	return value, err
 }
 func (s *Server) readSeatRequest(w http.ResponseWriter, r *http.Request) {
@@ -77,6 +84,20 @@ func (s *Server) reportComputerRoomMemory(w http.ResponseWriter, r *http.Request
 		return
 	}
 	value, err := s.store.ReportComputerRoomMemory(r.Context(), identityFromRequest(r).NodeID, r.PathValue("computer_id"), r.PathValue("job_id"), r.PathValue("attempt_id"), request)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, value)
+}
+
+func (s *Server) reportComputerSeatAttemptAbsence(w http.ResponseWriter, r *http.Request) {
+	var request ComputerSeatAttemptAbsenceReport
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, err)
+		return
+	}
+	value, err := s.store.ReportComputerSeatAttemptAbsence(r.Context(), identityFromRequest(r).NodeID, r.PathValue("computer_id"), r.PathValue("job_id"), r.PathValue("attempt_id"), request)
 	if err != nil {
 		writeError(w, err)
 		return

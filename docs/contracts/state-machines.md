@@ -2429,28 +2429,37 @@ log/completion disposition, including after upgrade ownership is released.
 
 The approval's `seat_id` is the request ID and, once room is reserved, the
 permanent `computer_seat_identities.seat_id`. There is no third identity.
-`seat_approvals.lifecycle_state`, `lifecycle_reason` and `seat_deadline_ns`
-retain the lifecycle. An empty lifecycle state on an upgraded approval reads
+`seat_approvals.lifecycle_state`, `lifecycle_reason`, `seat_deadline_ns` and
+`seat_ready_wait_ns` retain the lifecycle and the immutable Start duration. An empty lifecycle state on an upgraded approval reads
 as that approval's existing state and reason.
 
 | From | Trigger | To | Durable effect |
 |---|---|---|---|
 | requested | Native dialog or existing approval window approves | approved | Existing approval authority; no runtime starts |
-| requested | Owner refuses, answer times out, or a new node agent boot loses the dialog | refused | Reason retained; no room allocated |
+| requested | Owner refuses or answer times out | refused | Reason retained; no room allocated |
+| requested or approved | Node session ends or a new boot loses the dialog/start | refused | Reason retained; never-started reservation cleaned and returned |
 | approved | Reservation wins | approved | One immutable request/Computer/place binding; room charged before a grow |
 | approved | Reservation loses the room or dedicated-cap race | refused | Refusal retained; no identity or room allocated |
-| approved | Start after reservation and memory grow | starting | Wanted membership and the request flow's deadline commit together |
+| approved | Start after reservation and memory grow | starting | Wanted membership, the supplied remaining duration and L1's deadline commit together |
+| approved | Invalid Start duration | refused | No wanted membership; never-started reservation cleaned |
 | starting | Fenced helper `ready` before the request deadline | live | Readiness becomes durable |
-| starting or live | Release/end | ending | Wanted membership removed immediately; room remains charged |
+| requested, approved or starting | Release/end or owner authority loss | refused | Request never received a Seat; reason retained and wanted membership removed |
+| live | Release/end or owner authority loss | ending | Wanted membership removed immediately; room remains charged |
 | starting or live | Helper failure, or an explicit request refusal | refused | Reason retained; wanted membership removed; cleanup still owed |
 | starting | Request deadline reached | refused | Removed on the next Seat-list reconciliation or ready report; never handed out |
-| starting or live | List binds to a replacement Computer Attempt | ending | Computer-restarted reason; prior identity excluded from the new list |
-| ending | Fenced `cleaned` and `cleanup_complete:true` | ended | Positive cleanup retained independently of prunable Attempt observations |
+| starting | List binds to a replacement Computer Attempt | refused | Computer-restarted reason; prior identity excluded from the new list |
+| live | List binds to a replacement Computer Attempt | ending | Computer-restarted reason; prior identity excluded from the new list |
+| ending | Fenced `cleaned` and `cleanup_complete:true`, exact Attempt absence, or verified Computer removal | ended | Positive cleanup retained independently of prunable Attempt observations |
 
 `ended` and `refused` are final. Repeated reservation, start and end calls use
 the same request ID. Reservation replays must keep the same Computer, place
 and Seat memory share. Start replays cannot extend their deadline. Neither a
 repeated approval answer nor the raw wanted-list seam revives a final Seat.
+Approval replays project ending/ended/refused lifecycle states as refused,
+so an old approval cannot be handed out again. A requested approval at its
+answer deadline becomes refused on its next read or write, with reason
+`no answer from the owner`. Normal read snapshots remain read-only; an expired
+read commits the refusal in a separate write transaction with fresh authority checks.
 The raw list seam cannot publish an unapproved lifecycle-managed Seat or
 remove one without its end transition. Observation-only legacy IDs retain
 their original behavior.
@@ -2468,24 +2477,37 @@ readback additionally validates the exact current Computer Job, Attempt,
 fence and live lease. Read routes use deferred read-only snapshots. Their
 closed schemas are in `api/openapi`; clients cannot submit an approval
 through these routes. The native dialog and window remain the only approval
-sources. Start receives the request flow's deadline, distinct from the
-helper's existing per-Seat 60-second deadline from directive publication.
+sources. Start receives `ready_wait`, a positive duration in nanoseconds, and
+sets its deadline once from L1's injected clock. Replays must carry the same
+duration and cannot extend that deadline. No node-agent wall clock enters
+the calculation. This is distinct from the helper's existing per-Seat
+60-second deadline from directive publication.
 
 `computer_seat_room_reservations` names the existing request/Seat ID, one
 Computer and one Node, and keeps the reserved bytes and positive cleanup bit.
 `computer_room_limits` retains the Computer's effective charge and room
 revision. Both the last memory share and the dedicated cap are decided under
 one SQLite immediate write transaction. Queued dedicated Computers with a
-reservation count against the cap before they run. Charge is the greater of
+reservation count against the cap before they run. The target Computer is
+excluded from its own cap count and charged exactly once at the projected
+total; competing dedicated reservations still share the same write fence.
+An `any` request cannot reserve on a dedicated (Seat-limit-1) Computer.
+The initial limits row is at least the Computer's existing effective charge,
+including its creation-time runtime/tmpfs floor. Charge is the greater of
 the retained effective limit and the still-uncleaned reservation bytes.
-Computer deletion never cascades away that charge or the permanent Seat ID.
+Owner removal intent never discards that charge or the permanent Seat ID.
+Only verified removal clears the limits row and marks its Seat cleanup complete.
 There is deliberately no Computer or Attempt foreign key on retained room
 records: deletion or pruning is not cleanup evidence.
 
 A reservation receipt exposes `target_memory_bytes` for the whole Computer
 and `room_revision`. The node agent must grow before publishing the added
 Seat. Cleanup increments that revision once and reduces the target; it does
-not reduce the effective charge. The memory caller reads the new target and
+not reduce the effective charge. A Seat that never entered starting has no
+Seat runtime: ending marks its reservation cleaned immediately. Its synthetic
+room can return at once if no memory caller has bound an Attempt. A possibly
+changed runtime limit remains charged until readback or positive absence.
+The memory caller reads the new target and
 revision, calls the helper with its true final target (including a required
 runtime floor), and reports the requested target, actual limit and held
 memory. L1 rejects a stale room revision or evidence below still-uncleaned
@@ -2494,10 +2516,74 @@ room charged. Cleanup failure, including a full disk, leaves the lifecycle
 ending/refused and the reservation charged; later positive cleanup and a
 matching memory readback can settle it. No restart grants cleanup authority.
 
-Implementation boundary: these L1 transitions, routes and retained proofs do
-not yet reattach a restarted node agent's cleanup bindings/report sequence,
-connect its memory caller, or prove old-Attempt runtime absence. Those recovery
-paths must keep room held until the helper supplies exact evidence. In
-particular, a new Attempt's memory report cannot settle uncleaned reservations
-bound to an older Attempt. The helper's per-Job reservation versus per-Attempt
-cgroup issue still needs an Attempt-level fence before that caller is safe.
+The exact-Attempt Seat-list response includes a separate `recovery` receipt:
+cleanup-only `bindings`, the last accepted report `sequence`, earlier Attempt
+identities awaiting absence proof, and the whole-Computer room target/revision.
+These bindings never add wanted membership. Even a Seat ended before its first
+list delivery retains cleanup authority. A restarted node agent restores the
+bindings and sequence from L1, discovers the helper's current generation, and
+reapplies the current wanted list. A failed grow cannot preserve an unattempted
+old plan for later publication. Delayed `starting` or `ready` answers for omitted
+Seats cannot be offered as live Seats.
+
+The immutable identity tombstone additionally retains
+`first_attempt_authority_json` and `first_attempt_absent`. The authority snapshot
+survives Attempt pruning, including the exact helper removal generation. The
+room record also keeps `memory_attempt_authority_json` and
+`memory_attempt_absent`. A cleanup-only Attempt can hold memory even when no
+Seat was ever first-bound to it; room return must prove that Attempt absent
+too. Only positive absence allows this memory ownership to move to the next
+Attempt. A replacement Attempt must first prove the earlier
+Attempt absent through the helper's read-only namespace inventory, narrowed to
+that exact service authority. Even a bounded retained cgroup blocks room
+return, including when the Seat cleanup bit was already committed before the old Attempt ended.
+The node-only route
+`POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-attempt-absence`
+accepts that exact retained identity under the current live Attempt's fence.
+It marks that exact old Attempt's Seats cleaned and settles ending to ended;
+starting requests are refused. Fresh helper folder cleanup still fences place
+reuse. It does not lower a replacement runtime's effective memory charge. An older record whose Attempt was pruned before its authority could be retained fails closed; an
+unknown identity is never guessed.
+
+After runtime absence, the helper may register omitted cleanup places without
+starting their desktops. Fresh host proof of process, folder and socket absence
+is still required. Cleanup failure, including a full disk, keeps the reservation
+charged and is retried across controller restarts. Positive exact Attempt
+absence is separately sufficient runtime cleanup evidence; an intent, an
+Attempt-prune event or a process restart alone is never sufficient. A failed
+memory report must
+not prevent removal observations when already charged room covers the list.
+After positive cleanup, the node agent requests L1's true final memory target,
+including the immutable creation-time runtime floor, and reports the helper's
+actual limit and **absolute** reservation. The helper's `held_memory_bytes`
+counts only excess above the target; it is not L1's absolute charge. Lost resize
+or report responses are reconciled by another exact readback after restart.
+Room held by memory use remains charged and is retried.
+
+A mutable helper memory reservation belongs to one exact Attempt. Overlap uses
+`seat_operation_refused` with detail `attempt_overlap`, including the interval
+before the first live resize. Recovered overlapping reservations cannot become
+mutable while two Attempts hold them. A replacement
+cannot share either the original or grown declaration. Verified old-Attempt
+cleanup releases that reservation before replacement admission reconstructs the
+original declaration and its creation-time scratch ceiling. Neither a refused
+operation nor a declaration mismatch releases room.
+
+Owner stop, restart, reimage, storage reset, projection replacement and removal
+commit Seat authority loss in the same transaction as the Computer intent.
+Live Seats become ending; requests that never received a ready Seat become
+refused. Verified Attempt completion cleans only that Attempt's Seats, and
+verified Computer removal cleans all its Seats and clears its room row, even
+without a replacement running Attempt. A Computer Run or Seat memory caller binds the OCI
+adapter's reap proof to strict process/cgroup absence; bounded cgroup retention
+cannot become completion evidence that releases room. Failed proof is retried.
+Owner intent itself is never cleanup evidence.
+
+The current Computer API has no Seat-limit mutation operation. Network is
+fixed at Computer creation by the ratified request spec. Any future settings
+mutation that loses Seat authority must use the same transactional ending hook;
+this change introduces no new settings mutation route.
+
+Repeated non-retryable L1 409s have a bounded exponential retry floor. The
+`seat_list_revision_changed` conflict is an ordinary concurrent-list race and
+does not contribute to that backoff.

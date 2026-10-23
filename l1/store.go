@@ -4825,6 +4825,14 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		if err != nil {
 			return CompletionOutcome{}, err
 		}
+		if request.RuntimeQuiescenceEvidence != "" {
+			if err := cleanComputerSeatAttempt(ctx, tx, computerID, attemptID); err != nil {
+				return CompletionOutcome{}, err
+			}
+			if err := releaseAbsentComputerAttemptRoom(ctx, tx, computerID, attemptID); err != nil {
+				return CompletionOutcome{}, err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return CompletionOutcome{}, internalError(err, "commit completion")

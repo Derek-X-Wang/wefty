@@ -110,7 +110,15 @@ func (r *databaseReads) computerSeatListForAttempt(ctx context.Context, identity
 			return ComputerSeatList{}, errComputerSeatBindingNeeded
 		}
 	}
-	return list, nil
+	needed, err := seatRoomAttemptBindingNeeded(ctx, r.q, computerID, attemptID)
+	if err != nil {
+		return ComputerSeatList{}, err
+	}
+	if needed {
+		return ComputerSeatList{}, errComputerSeatBindingNeeded
+	}
+	list.Recovery, err = readComputerSeatRecovery(ctx, r.q, computerID, attemptID)
+	return list, err
 }
 func (s *Store) GetComputerSeatListForAttempt(ctx context.Context, identity, computerID, jobID, attemptID string, request ComputerSeatAttemptRequest) (ComputerSeatList, error) {
 	var list ComputerSeatList
@@ -170,7 +178,11 @@ func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, 
 		}
 		if first.Valid && first.String != attemptID {
 			if lifecycleErr == nil {
-				if err := setSeatLifecycle(ctx, tx, seat.SeatID, SeatEnding, "the Computer restarted"); err != nil {
+				state := SeatEnding
+				if value.State == SeatStarting {
+					state = SeatRefused
+				}
+				if err := setSeatLifecycle(ctx, tx, seat.SeatID, state, "the Computer restarted"); err != nil {
 					return ComputerSeatList{}, err
 				}
 			}
@@ -184,6 +196,9 @@ func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, 
 			}
 		}
 	}
+	if err := retainSeatAttemptAuthorities(ctx, tx, computerID); err != nil {
+		return ComputerSeatList{}, err
+	}
 	if removed {
 		if list.Revision == math.MaxInt64 {
 			return ComputerSeatList{}, protocolError(contract.ErrorConflict, "wanted Seat revision exhausted")
@@ -193,6 +208,13 @@ func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, 
 		}
 	}
 	list, err = readComputerSeatList(ctx, tx, computerID)
+	if err != nil {
+		return ComputerSeatList{}, err
+	}
+	if err := bindSeatRoomAttempt(ctx, tx, computerID, jobID, attemptID, request); err != nil {
+		return ComputerSeatList{}, err
+	}
+	list.Recovery, err = readComputerSeatRecovery(ctx, tx, computerID, attemptID)
 	if err != nil {
 		return ComputerSeatList{}, err
 	}
@@ -305,7 +327,13 @@ func (s *Store) ReportComputerSeatObservations(ctx context.Context, identity, co
 			return ComputerSeatObservationReceipt{}, protocolError(contract.ErrorConflict, "Seat observation disagrees with wanted list")
 		}
 		if first.Valid && first.String != attemptID {
-			return ComputerSeatObservationReceipt{}, protocolError(contract.ErrorConflict, "Seat belongs to an earlier attempt")
+			var absent bool
+			if err := tx.QueryRowContext(ctx, `SELECT first_attempt_absent FROM computer_seat_identities WHERE seat_id=?`, seat.SeatID).Scan(&absent); err != nil {
+				return ComputerSeatObservationReceipt{}, err
+			}
+			if !absent || seat.State == ComputerSeatReady || seat.State == ComputerSeatStarting {
+				return ComputerSeatObservationReceipt{}, protocolError(contract.ErrorConflict, "earlier Seat Attempt has no absence proof")
+			}
 		}
 		if !first.Valid {
 			if _, err := tx.ExecContext(ctx, `UPDATE computer_seat_identities SET first_attempt_id=? WHERE seat_id=? AND first_attempt_id IS NULL`, attemptID, seat.SeatID); err != nil {
@@ -341,6 +369,9 @@ func (s *Store) ReportComputerSeatObservations(ctx context.Context, identity, co
 				return ComputerSeatObservationReceipt{}, internalError(err, "retain Seat observation")
 			}
 		}
+	}
+	if err := retainSeatAttemptAuthorities(ctx, tx, computerID); err != nil {
+		return ComputerSeatObservationReceipt{}, err
 	}
 	for _, seat := range report.Seats {
 		if err := applySeatLifecycleObservation(ctx, tx, now, seat); err != nil {

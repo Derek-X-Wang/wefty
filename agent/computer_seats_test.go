@@ -15,11 +15,16 @@ import (
 )
 
 type seatTestControl struct {
-	list        l1.ComputerSeatList
-	reports     []l1.ComputerSeatObservationReport
-	reportError error
-	readError   error
-	onRead      func()
+	absenceReports []l1.ComputerSeatAttemptAbsenceReport
+	onAbsence      func(l1.ComputerSeatAttemptAbsenceReport)
+	memoryReports  []l1.SeatRoomMemoryReport
+	memoryError    error
+	onReport       func(l1.ComputerSeatObservationReport)
+	list           l1.ComputerSeatList
+	reports        []l1.ComputerSeatObservationReport
+	reportError    error
+	readError      error
+	onRead         func()
 }
 
 func (f *seatTestControl) GetComputerSeatList(_ context.Context, _, _, _ string, _ l1.ComputerSeatAttemptRequest) (l1.ComputerSeatList, error) {
@@ -30,17 +35,26 @@ func (f *seatTestControl) GetComputerSeatList(_ context.Context, _, _, _ string,
 }
 func (f *seatTestControl) ReportComputerSeats(_ context.Context, _, _, _ string, r l1.ComputerSeatObservationReport) (l1.ComputerSeatObservationReceipt, error) {
 	f.reports = append(f.reports, r)
+	if f.reportError == nil && f.onReport != nil {
+		f.onReport(r)
+	}
 	return l1.ComputerSeatObservationReceipt{Accepted: f.reportError == nil}, f.reportError
 }
 
 type seatTestRuntime struct {
-	applies      []ocihelper.ApplyComputerSeatsRequest
-	applyError   error
-	observeError error
-	observations []ocihelper.ComputerSeatObservation
-	observes     []ocihelper.ObserveComputerSeatsRequest
-	generation   uint64
-	onObserve    func()
+	absent           bool
+	absenceError     error
+	verifiedAttempts []ocihelper.AttemptAuthority
+	memoryRequests   []ocihelper.SetComputerMemoryLimitRequest
+	memoryError      error
+	memoryResponse   *ocihelper.SetComputerMemoryLimitResponse
+	applies          []ocihelper.ApplyComputerSeatsRequest
+	applyError       error
+	observeError     error
+	observations     []ocihelper.ComputerSeatObservation
+	observes         []ocihelper.ObserveComputerSeatsRequest
+	generation       uint64
+	onObserve        func()
 }
 
 func (f *seatTestRuntime) ApplyComputerSeats(_ context.Context, r ocihelper.ApplyComputerSeatsRequest) (ocihelper.ApplyComputerSeatsResponse, error) {
@@ -49,6 +63,9 @@ func (f *seatTestRuntime) ApplyComputerSeats(_ context.Context, r ocihelper.Appl
 }
 func (f *seatTestRuntime) ObserveComputerSeats(_ context.Context, r ocihelper.ObserveComputerSeatsRequest) (ocihelper.ObserveComputerSeatsResponse, error) {
 	f.observes = append(f.observes, r)
+	if r.Discover {
+		return ocihelper.ObserveComputerSeatsResponse{Generation: f.generation, Seats: []ocihelper.ComputerSeatObservation{}}, f.observeError
+	}
 	if f.onObserve != nil {
 		f.onObserve()
 	}
@@ -414,5 +431,25 @@ func TestComputerSeatsRepeatedConflictHasRetryFloor(t *testing.T) {
 	_ = c.step(t.Context())
 	if reads != 4 {
 		t.Fatalf("conflict was not retried after the floor: %d", reads)
+	}
+}
+
+func TestComputerSeatsRevisionRaceDoesNotBackOff(t *testing.T) {
+	c, api, runtime := newSeatTestController()
+	c.clock = newManualClock(time.Unix(100, 0))
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	reads := 0
+	api.onRead = func() { reads++ }
+	api.readError = &ProtocolError{StatusCode: 409, APIError: contract.APIError{Code: contract.ErrorConflict, Details: map[string]any{"reason": "seat_list_revision_changed"}}}
+	for range 8 {
+		_ = c.step(t.Context())
+	}
+	if reads != 8 {
+		t.Fatalf("normal revision races backed off after %d reads", reads)
+	}
+	if len(runtime.observes) != 9 {
+		t.Fatal("revision race stopped cleanup observations")
 	}
 }

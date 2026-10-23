@@ -1027,6 +1027,9 @@ func finalizeComputerCustodyOutcome(ctx context.Context, tx *sql.Tx, computerID 
 			return internalError(err, "upgrade coordinated Computer custody removal outcomes")
 		}
 	}
+	if err := cleanRemovedComputerSeats(ctx, tx, computerID); err != nil {
+		return err
+	}
 	return nil
 }
 

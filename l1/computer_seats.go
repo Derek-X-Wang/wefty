@@ -16,8 +16,9 @@ type WantedComputerSeat struct {
 	Place  int    `json:"place"`
 }
 type ComputerSeatList struct {
-	Revision int64                `json:"revision"`
-	Seats    []WantedComputerSeat `json:"seats"`
+	Recovery *ComputerSeatRecovery `json:"recovery,omitempty"`
+	Revision int64                 `json:"revision"`
+	Seats    []WantedComputerSeat  `json:"seats"`
 }
 
 const computerSeatSchema = `

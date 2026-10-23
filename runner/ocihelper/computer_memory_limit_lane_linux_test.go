@@ -210,7 +210,7 @@ func proveComputerMemoryRM5(t *testing.T, ctx context.Context, engine *Container
 		tick := time.NewTicker(200 * time.Millisecond)
 		defer tick.Stop()
 		for {
-			r, err := engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{authority, g})
+			r, err := engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{Authority: authority, Generation: g})
 			must(err)
 			for _, s := range r.Seats {
 				if s.Place == place && s.State == state {

@@ -68,6 +68,16 @@ func (engine *ContainerdEngine) observeComputerSeats(ctx context.Context, reques
 		return ObserveComputerSeatsResponse{}, err
 	}
 	defer snapshot.namespace.close()
+	if request.Discover {
+		if err := engine.validateComputerSeatAttempt(ctx, request.Authority, attempt, snapshot); err != nil {
+			return ObserveComputerSeatsResponse{}, err
+		}
+		var generation uint64
+		if snapshot.seats != nil {
+			generation = snapshot.seats.generation
+		}
+		return ObserveComputerSeatsResponse{Generation: generation, Seats: []ComputerSeatObservation{}}, nil
+	}
 	if snapshot.seats == nil {
 		return ObserveComputerSeatsResponse{}, errors.New("Computer has no Seat directive")
 	}
@@ -145,6 +155,9 @@ func observeComputerSeatFiles(ctx context.Context, snapshot computerSeatAttemptS
 		return ObserveComputerSeatsResponse{}, err
 	}
 	defer directory.Close()
+	if err := snapshot.seats.recoverCleanup(request.Cleanup); err != nil {
+		return ObserveComputerSeatsResponse{}, err
+	}
 	// Resolve the directive's internal port metadata to fixed Seat paths. These
 	// numbers remain for compatibility with ApplyComputerSeats; no TCP dial occurs.
 	pins := map[int]map[string]*os.File{}
