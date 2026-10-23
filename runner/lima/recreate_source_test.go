@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -81,6 +82,12 @@ func TestHostVMDeleteSourceGuardRecognizesCommandForms(t *testing.T) {
 		{`run := supervisor.runBounded; args := []string{"delete", instance}; run(ctx, args...)`, 1},
 		{`shell := []string{"--tty=false", "shell", "--workdir=/", instance, "sudo"}; run(ctx, config.Limactl, append(shell, "rm", "-f", GuestHelperPath)...)`, 0},
 		{`flags := flag.NewFlagSet("bootstrap", flag.ContinueOnError); flags.Bool("remove", false, "remove bootstrap"); run(ctx, limactl, "list")`, 0},
+		{`exec.Command("sh", "-c", "limactl delete --force wefty-oci")`, 1},
+		{`command := fmt.Sprintf("limactl rm %s", instance)`, 1},
+		{`exec.Command("/bin/sh", "-c", "/opt/homebrew/bin/limactl --tty=false factory-reset "+instance)`, 1},
+		{`runCommand(ctx, limactl, "shell", instance, "sh", "-c", "limactl delete other")`, 1},
+		{`command := fmt.Sprintf("limactl list %s", instance)`, 0},
+		{`log.Print("limactl shell, then delete nothing")`, 0},
 	} {
 		positions, err := limaDeleteCalls("fixture.go", []byte("package fixture\nfunc check(){"+test.call+"}\n"))
 		if err != nil || len(positions) != test.want {
@@ -92,6 +99,8 @@ func TestHostVMDeleteSourceGuardRecognizesCommandForms(t *testing.T) {
 // A Lima-related file must not hide a destructive command in a literal, even
 // when its binary or arguments reach the runner indirectly. Deliberately scan
 // the whole file rather than trying to prove arbitrary Go data flow.
+var limaDeleteCommandString = regexp.MustCompile(`(?i)\blimactl(?:\s+-\S+)*\s+(?:delete|rm|remove|factory-reset)\b`)
+
 type limaDeleteLiteral struct {
 	token.Position
 	guarded bool
@@ -188,14 +197,21 @@ func limaDeleteCalls(path string, source []byte) ([]limaDeleteLiteral, error) {
 	var positions []limaDeleteLiteral
 	ast.Inspect(file, func(node ast.Node) bool {
 		literal, ok := node.(*ast.BasicLit)
-		if !ok || literal.Kind != token.STRING || ignored[literal.Pos()] {
+		if !ok || literal.Kind != token.STRING {
 			return true
 		}
 		value, _ := strconv.Unquote(literal.Value)
-		switch value {
-		case "delete", "rm", "remove", "factory-reset":
-		default:
-			return true
+		// A whole command in one string, such as an sh -c script, names
+		// limactl itself, so the guest-shell exemption never applies to it.
+		if !limaDeleteCommandString.MatchString(value) {
+			if ignored[literal.Pos()] {
+				return true
+			}
+			switch value {
+			case "delete", "rm", "remove", "factory-reset":
+			default:
+				return true
+			}
 		}
 		guarded := false
 		if path == "runner/lima/supervisor.go" {
