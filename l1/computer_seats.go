@@ -22,24 +22,25 @@ type ComputerSeatList struct {
 
 const computerSeatSchema = `
 CREATE TABLE IF NOT EXISTS computer_seat_lists (
- computer_id TEXT PRIMARY KEY REFERENCES computers(computer_id),
+ computer_id TEXT PRIMARY KEY REFERENCES computers(computer_id) ON DELETE CASCADE,
  revision INTEGER NOT NULL CHECK(revision>0)
 );
 CREATE TABLE IF NOT EXISTS computer_seat_identities (
  seat_id TEXT PRIMARY KEY,
- computer_id TEXT NOT NULL REFERENCES computers(computer_id),
+ computer_id TEXT NOT NULL,
  place INTEGER NOT NULL CHECK(place BETWEEN 1 AND 4),
- introduced_revision INTEGER NOT NULL CHECK(introduced_revision>0)
+ introduced_revision INTEGER NOT NULL CHECK(introduced_revision>0),
+ first_attempt_id TEXT
 );
 CREATE TABLE IF NOT EXISTS computer_wanted_seats (
- computer_id TEXT NOT NULL REFERENCES computers(computer_id),
+ computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,
  place INTEGER NOT NULL CHECK(place BETWEEN 1 AND 4),
  seat_id TEXT NOT NULL UNIQUE REFERENCES computer_seat_identities(seat_id),
  PRIMARY KEY(computer_id,place)
 );
 CREATE TABLE IF NOT EXISTS computer_seat_observations (
  seat_id TEXT NOT NULL REFERENCES computer_seat_identities(seat_id),
- attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+ attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
  list_revision INTEGER NOT NULL,
  helper_generation INTEGER NOT NULL CHECK(helper_generation>0),
  report_sequence INTEGER NOT NULL CHECK(report_sequence>0),

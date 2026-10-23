@@ -19,9 +19,13 @@ type seatTestControl struct {
 	reports     []l1.ComputerSeatObservationReport
 	reportError error
 	readError   error
+	onRead      func()
 }
 
 func (f *seatTestControl) GetComputerSeatList(_ context.Context, _, _, _ string, _ l1.ComputerSeatAttemptRequest) (l1.ComputerSeatList, error) {
+	if f.onRead != nil {
+		f.onRead()
+	}
 	return f.list, f.readError
 }
 func (f *seatTestControl) ReportComputerSeats(_ context.Context, _, _, _ string, r l1.ComputerSeatObservationReport) (l1.ComputerSeatObservationReceipt, error) {
@@ -36,6 +40,7 @@ type seatTestRuntime struct {
 	observations []ocihelper.ComputerSeatObservation
 	observes     []ocihelper.ObserveComputerSeatsRequest
 	generation   uint64
+	onObserve    func()
 }
 
 func (f *seatTestRuntime) ApplyComputerSeats(_ context.Context, r ocihelper.ApplyComputerSeatsRequest) (ocihelper.ApplyComputerSeatsResponse, error) {
@@ -44,6 +49,9 @@ func (f *seatTestRuntime) ApplyComputerSeats(_ context.Context, r ocihelper.Appl
 }
 func (f *seatTestRuntime) ObserveComputerSeats(_ context.Context, r ocihelper.ObserveComputerSeatsRequest) (ocihelper.ObserveComputerSeatsResponse, error) {
 	f.observes = append(f.observes, r)
+	if f.onObserve != nil {
+		f.onObserve()
+	}
 	return ocihelper.ObserveComputerSeatsResponse{Generation: r.Generation, Seats: f.observations}, f.observeError
 }
 func newSeatTestController() (*computerSeatController, *seatTestControl, *seatTestRuntime) {
@@ -116,6 +124,7 @@ func TestComputerSeatsRefusalWaitsAndReadyRegressionIsReported(t *testing.T) {
 }
 func TestComputerSeatsReplacementWaitsForAcknowledgedCleanup(t *testing.T) {
 	c, api, runtime := newSeatTestController()
+	c.clock = newManualClock(time.Unix(100, 0))
 	if err := c.step(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -135,10 +144,11 @@ func TestComputerSeatsReplacementWaitsForAcknowledgedCleanup(t *testing.T) {
 		t.Fatal("old cleanup relabeled as replacement")
 	}
 	api.reportError = nil
+	c.clock.(*manualClock).Advance(2 * time.Second)
 	if err := c.step(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if len(runtime.observes) != 3 || len(runtime.applies[2].Seats) != 0 || !reflect.DeepEqual(api.reports[1], api.reports[2]) {
+	if len(runtime.observes) != 3 || len(runtime.applies) != 2 || !reflect.DeepEqual(api.reports[1], api.reports[2]) {
 		t.Fatal("cleanup not retried exactly")
 	}
 	runtime.generation = 3
@@ -146,7 +156,7 @@ func TestComputerSeatsReplacementWaitsForAcknowledgedCleanup(t *testing.T) {
 	if err := c.step(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if len(runtime.applies[3].Seats) != 1 || api.reports[3].Seats[0].SeatID != replacement.SeatID || api.reports[3].Generation != 3 {
+	if len(runtime.applies) != 3 || len(runtime.applies[2].Seats) != 1 || api.reports[3].Seats[0].SeatID != replacement.SeatID || api.reports[3].Generation != 3 {
 		t.Fatalf("replacement %+v %+v", runtime.applies, api.reports)
 	}
 }
@@ -167,8 +177,8 @@ func TestComputerSeatsPollImmediatelyAndEverySecond(t *testing.T) {
 	}
 	clock.Advance(time.Second)
 	awaitSeatTestSignal(t, reports)
-	if len(api.reports) != 2 {
-		t.Fatal("one-second poll missing")
+	if len(api.reports) != 1 || len(c.runtime.(*seatTestRuntime).observes) != 2 {
+		t.Fatal("one-second observation missing or unchanged report repeated")
 	}
 	cancel()
 	awaitSeatTestSignal(t, done)
@@ -217,5 +227,166 @@ func awaitSeatTestSignal(t *testing.T, signal <-chan struct{}) {
 	case <-signal:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Seat test did not make progress")
+	}
+}
+
+func TestComputerSeatsUnchangedObservationsDoNotWriteOrApply(t *testing.T) {
+	c, api, runtime := newSeatTestController()
+	clock := newManualClock(time.Unix(100, 0))
+	c.clock = clock
+	for i := 0; i < 5; i++ {
+		if err := c.step(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(time.Second)
+	}
+	if len(api.reports) != 1 || len(runtime.applies) != 1 || len(runtime.observes) != 5 {
+		t.Fatalf("unchanged Seat repeated work: reports=%d applies=%d observes=%d", len(api.reports), len(runtime.applies), len(runtime.observes))
+	}
+	runtime.observations[0].State = "failed"
+	runtime.observations[0].Reason = "readiness_deadline_exceeded"
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	runtime.observations[0].Reason = "cleanup_failed"
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	api.list.Revision = 2 // A revision change still needs a report when the plan is identical.
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.reports) != 4 || api.reports[3].ListRevision != 2 || len(runtime.applies) != 1 {
+		t.Fatalf("changed observation/revision was suppressed: %+v applies=%d", api.reports, len(runtime.applies))
+	}
+}
+
+func TestComputerSeatsL1BackoffKeepsDeadlineObservationsAndBoundsLogs(t *testing.T) {
+	c, api, runtime := newSeatTestController()
+	start := time.Unix(100, 0)
+	clock := newManualClock(start)
+	c.clock = clock
+	var reads, observations, logs []time.Time
+	api.onRead = func() { reads = append(reads, clock.Now()) }
+	var readyObserved time.Time
+	runtime.observations[0].State = "starting"
+	runtime.onObserve = func() {
+		observations = append(observations, clock.Now())
+		if runtime.observations[0].State == "ready" && readyObserved.IsZero() {
+			readyObserved = clock.Now()
+		}
+	}
+	c.logf = func(string, ...any) { logs = append(logs, clock.Now()) }
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	api.readError = errors.New("L1 down")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	stepped := make(chan struct{}, 1)
+	c.afterStep = func() { stepped <- struct{}{} }
+	done := make(chan struct{})
+	go func() { defer close(done); c.run(ctx) }()
+	awaitSeatTestSignal(t, stepped)
+	for second := 1; second <= 120; second++ {
+		if second == 30 {
+			runtime.observations[0].State = "ready"
+		}
+		if second == 96 {
+			api.readError = nil
+		}
+		clock.Advance(time.Second)
+		awaitSeatTestSignal(t, stepped)
+	}
+	cancel()
+	awaitSeatTestSignal(t, done)
+	expected := []time.Duration{0, 0, 2 * time.Second, 6 * time.Second, 14 * time.Second, 30 * time.Second, 60 * time.Second, 90 * time.Second, 120 * time.Second}
+	if len(reads) != len(expected) {
+		t.Fatalf("L1 backoff calls=%d want %d", len(reads), len(expected))
+	}
+	for i, stamp := range reads {
+		if stamp.Sub(start) != expected[i] {
+			t.Fatalf("read %d at %s want %s", i, stamp.Sub(start), expected[i])
+		}
+	}
+	if len(observations) != 122 || readyObserved.Sub(start) != 30*time.Second || !readyObserved.Before(start.Add(60*time.Second)) {
+		t.Fatalf("readiness observation missed deadline: count=%d ready=%s", len(observations), readyObserved.Sub(start))
+	}
+	for i := 1; i < len(observations); i++ {
+		if observations[i].Sub(observations[i-1]) > time.Second {
+			t.Fatal("L1 backoff delayed helper observation")
+		}
+	}
+	if len(logs) != 4 {
+		t.Fatalf("outage logs=%d want 4", len(logs))
+	}
+	for i := 1; i < len(logs); i++ {
+		if logs[i].Sub(logs[i-1]) < 30*time.Second {
+			t.Fatal("outage log rate exceeded")
+		}
+	}
+	if len(api.reports) != 2 || api.reports[1].Seats[0].State != l1.ComputerSeatReady || len(runtime.applies) != 1 {
+		t.Fatalf("recovery reports=%+v applies=%d", api.reports, len(runtime.applies))
+	}
+}
+
+func TestComputerSeatsConflictRebuildsFromFreshObservation(t *testing.T) {
+	c, api, runtime := newSeatTestController()
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	} // Acknowledged ready.
+	runtime.observations[0].State = "starting"
+	api.reportError = &ProtocolError{StatusCode: 409, APIError: contract.APIError{Code: contract.ErrorConflict, Message: "sequence already used"}}
+	if err := c.step(t.Context()); err == nil {
+		t.Fatal("conflict hidden")
+	}
+	api.reportError = nil
+	runtime.observations[0].State = "ready" // Matches an old acknowledgement, not the conflicted report.
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.reports) != 3 || api.reports[2].Sequence <= api.reports[1].Sequence || api.reports[2].Seats[0].State != l1.ComputerSeatReady {
+		t.Fatalf("conflict suppressed or retried a stale report: %+v", api.reports)
+	}
+}
+
+func TestComputerSeatsUncertainApplyCannotRestoreAcknowledgedCleanup(t *testing.T) {
+	c, api, runtime := newSeatTestController()
+	old2 := l1.WantedComputerSeat{SeatID: "seat_" + strings.Repeat("b", 32), Place: 2}
+	api.list.Seats = append(api.list.Seats, old2)
+	runtime.observations = append(runtime.observations, ocihelper.ComputerSeatObservation{Place: 2, State: "ready"})
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	fresh1 := l1.WantedComputerSeat{SeatID: "seat_" + strings.Repeat("c", 32), Place: 1}
+	fresh2 := l1.WantedComputerSeat{SeatID: "seat_" + strings.Repeat("d", 32), Place: 2}
+	api.list = l1.ComputerSeatList{Revision: 2, Seats: []l1.WantedComputerSeat{fresh1, fresh2}}
+	runtime.generation = 2
+	runtime.observations = []ocihelper.ComputerSeatObservation{{Place: 1, State: "cleaned", CleanupComplete: true}, {Place: 2, State: "removing"}}
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	// Place 1's replacement changes the plan. Its Apply is uncertain while the
+	// old generation can now prove place 2's cleanup, which L1 acknowledges.
+	runtime.applyError = &ocihelper.RPCError{Code: ocihelper.CodeDiagnosticFailure, Message: "directive publication uncertain"}
+	runtime.observations[1] = ocihelper.ComputerSeatObservation{Place: 2, State: "cleaned", CleanupComplete: true}
+	if err := c.step(t.Context()); err == nil {
+		t.Fatal("uncertain Apply hidden")
+	}
+	if api.reports[len(api.reports)-1].Seats[0].SeatID != old2.SeatID {
+		t.Fatal("place 2 cleanup not reported")
+	}
+	runtime.applyError = nil
+	runtime.generation = 3
+	runtime.observations[0] = ocihelper.ComputerSeatObservation{Place: 1, State: "ready"}
+	if err := c.step(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	last := api.reports[len(api.reports)-1]
+	if len(last.Seats) != 1 || last.Seats[0].SeatID != fresh1.SeatID {
+		t.Fatalf("uncertain Apply restored cleaned binding: %+v", last)
+	}
+	if len(runtime.applies) != 4 || !reflect.DeepEqual(runtime.applies[2], runtime.applies[3]) {
+		t.Fatalf("uncertain directive was changed: %+v", runtime.applies)
 	}
 }

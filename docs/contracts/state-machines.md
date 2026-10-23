@@ -2290,6 +2290,15 @@ list is idempotent. A list contains at most the Computer's Seat limit, with
 unique places 1–4. Each `seat_<32 lowercase hex>` identity is permanently bound
 to its Computer and place. Removing a Seat removes only its wanted membership;
 its identity tombstone remains, and that Seat ID can never be reintroduced.
+The first list delivery or accepted report binds an identity to its first
+Attempt. That binding is retained even after the Attempt or Computer is
+deleted; neither `computer_id` nor `first_attempt_id` on the identity is a
+foreign key. On a later Attempt, the list transaction removes earlier-bound
+wanted memberships and advances the revision once. It never delivers those
+Seat IDs to the new Attempt. Unbound identities can bind to that Attempt,
+and fresh Seat IDs can still be added. This implements the restart exclusion
+from spec §2.6, §2.8.5 and IM-6; #1142 owns the full durable ending transition.
+Steady-state list reads use the node read snapshot without a write lock.
 There is no HTTP route for setting the list. Tests and future lifecycle code
 call the store seam. Stage A starts the Seat loop only for Seat-request-made
 Computers; owner-made Computers retain their existing readiness path. The loop
@@ -2313,6 +2322,9 @@ Per-Attempt report sequences rise; helper generations never decrease. An exact
 batch retry at the same sequence is idempotent; a changed retry conflicts.
 Evidence is retained as the latest observation per Seat ID and Attempt, even
 when the Seat leaves the wanted list. It is never carried to another Attempt.
+Deleting or pruning an Attempt cascades its observation rows. Deleting a
+Computer cascades its list and wanted memberships. Identity tombstones survive
+both deletions, so neither pruning nor Computer removal makes an ID reusable.
 
 Observation states are the helper's `starting`, `ready`, `failed`, `removing`
 and `cleaned`. Failure reasons pass through. A `ready` Seat may return to
@@ -2325,11 +2337,21 @@ return Room. #1142 must bind any such effect to its own lifecycle authority.
 
 The node agent observes immediately after Apply and then polls every second.
 It bounds each helper cycle to 20 seconds and each L1 operation to two seconds,
-leaving margin within the helper's own 60-second readiness deadlines. It keeps
-observing through L1 read/report failures, retries uncertain Apply with the
-same list, and treats typed helper refusals as wait-and-retry. Its place-to-ID
-binding survives removal until L1 acknowledges cleaned evidence. A replacement
+leaving margin within the helper's own 60-second readiness deadlines. Apply
+runs only when the plan differs from the last successfully applied plan; an
+uncertain Apply still retries the exact list. Reports are sent only when state,
+reason, helper generation, list revision or cleanup changes. There is no Seat
+report heartbeat: retained observations describe changes, and the existing
+Attempt lease owns node liveness. Transient L1 failures back off both L1 calls
+for 2, 4, 8, 16, then at most 30 seconds. Successful list/report delivery resets
+the backoff. Helper observations keep their one-second poll delay independently
+of that backoff. Outage/error logs are limited to one line per 30 seconds per
+Computer. A non-retryable report conflict drops the pending batch so the next
+report is rebuilt from a fresh observation. Typed helper refusals wait and
+retry. Its place-to-ID binding survives removal until L1 acknowledges cleaned
+evidence. A replacement
 Seat ID at that place is first omitted, then added in a later helper generation
-after that acknowledgement. Ports are `7100+2*place` (view) and `7101+2*place`
-(control), with image users `seat1`–`seat4`. See
+after that acknowledgement. A cleaned identity stays cleaned even if an
+uncertain Apply later resolves with an earlier binding snapshot. Ports are
+`7100+2*place` (view) and `7101+2*place` (control), with image users `seat1`–`seat4`. See
 [the helper contract](oci-helper-protocol.md#per-seat-directives-and-observations).

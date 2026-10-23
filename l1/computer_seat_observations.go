@@ -90,7 +90,20 @@ func (r *databaseReads) computerSeatListForAttempt(ctx context.Context, identity
 	if err := validateComputerSeatAttempt(ctx, r.q, r.now(), identity, computerID, jobID, attemptID, request); err != nil {
 		return ComputerSeatList{}, err
 	}
-	return readComputerSeatList(ctx, r.q, computerID)
+	list, err := readComputerSeatList(ctx, r.q, computerID)
+	if err != nil {
+		return ComputerSeatList{}, err
+	}
+	for _, seat := range list.Seats {
+		var first sql.NullString
+		if err := r.q.QueryRowContext(ctx, `SELECT first_attempt_id FROM computer_seat_identities WHERE seat_id=?`, seat.SeatID).Scan(&first); err != nil {
+			return ComputerSeatList{}, err
+		}
+		if !first.Valid || first.String != attemptID {
+			return ComputerSeatList{}, errComputerSeatBindingNeeded
+		}
+	}
+	return list, nil
 }
 func (s *Store) GetComputerSeatListForAttempt(ctx context.Context, identity, computerID, jobID, attemptID string, request ComputerSeatAttemptRequest) (ComputerSeatList, error) {
 	var list ComputerSeatList
@@ -99,7 +112,64 @@ func (s *Store) GetComputerSeatListForAttempt(ctx context.Context, identity, com
 		list, err = reads.computerSeatListForAttempt(ctx, identity, computerID, jobID, attemptID, request)
 		return err
 	})
+	if errors.Is(err, errComputerSeatBindingNeeded) {
+		return s.bindComputerSeatList(ctx, identity, computerID, jobID, attemptID, request)
+	}
 	return list, err
+}
+
+var errComputerSeatBindingNeeded = errors.New("Seat list needs attempt binding")
+
+// Binding happens once, before a list can be delivered. Steady-state reads
+// stay on the node read snapshot; they acquire no write lock. The immutable
+// first Attempt is a tombstone value, not a foreign key into prunable history.
+func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, jobID, attemptID string, request ComputerSeatAttemptRequest) (ComputerSeatList, error) {
+	write, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		return ComputerSeatList{}, err
+	}
+	defer write.rollback()
+	tx := write.tx
+	if err := validateComputerSeatAttempt(ctx, tx, canonicalTime(s.clock.Now()), identity, computerID, jobID, attemptID, request); err != nil {
+		return ComputerSeatList{}, err
+	}
+	list, err := readComputerSeatList(ctx, tx, computerID)
+	if err != nil {
+		return ComputerSeatList{}, err
+	}
+	removed := false
+	for _, seat := range list.Seats {
+		var first sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT first_attempt_id FROM computer_seat_identities WHERE seat_id=?`, seat.SeatID).Scan(&first); err != nil {
+			return ComputerSeatList{}, err
+		}
+		if first.Valid && first.String != attemptID {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM computer_wanted_seats WHERE computer_id=? AND seat_id=?`, computerID, seat.SeatID); err != nil {
+				return ComputerSeatList{}, err
+			}
+			removed = true
+		} else if !first.Valid {
+			if _, err := tx.ExecContext(ctx, `UPDATE computer_seat_identities SET first_attempt_id=? WHERE seat_id=? AND first_attempt_id IS NULL`, attemptID, seat.SeatID); err != nil {
+				return ComputerSeatList{}, err
+			}
+		}
+	}
+	if removed {
+		if list.Revision == math.MaxInt64 {
+			return ComputerSeatList{}, protocolError(contract.ErrorConflict, "wanted Seat revision exhausted")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE computer_seat_lists SET revision=revision+1 WHERE computer_id=?`, computerID); err != nil {
+			return ComputerSeatList{}, err
+		}
+	}
+	list, err = readComputerSeatList(ctx, tx, computerID)
+	if err != nil {
+		return ComputerSeatList{}, err
+	}
+	if err := write.commit(); err != nil {
+		return ComputerSeatList{}, err
+	}
+	return list, nil
 }
 func (r *databaseReads) computerSeatObservations(ctx context.Context, computerID string) ([]ComputerSeatEvidence, error) {
 	return readComputerSeatObservations(ctx, r.q, computerID, "")
@@ -193,7 +263,8 @@ func (s *Store) ReportComputerSeatObservations(ctx context.Context, identity, co
 	replayCount := 0
 	for _, seat := range report.Seats {
 		var place int
-		err := tx.QueryRowContext(ctx, `SELECT place FROM computer_seat_identities WHERE seat_id=? AND computer_id=?`, seat.SeatID, computerID).Scan(&place)
+		var first sql.NullString
+		err := tx.QueryRowContext(ctx, `SELECT place,first_attempt_id FROM computer_seat_identities WHERE seat_id=? AND computer_id=?`, seat.SeatID, computerID).Scan(&place, &first)
 		if errors.Is(err, sql.ErrNoRows) || err == nil && place != seat.Place {
 			return ComputerSeatObservationReceipt{}, protocolError(contract.ErrorConflict, "Seat identity does not match this Computer place")
 		}
@@ -202,6 +273,14 @@ func (s *Store) ReportComputerSeatObservations(ctx context.Context, identity, co
 		}
 		if ((seat.State == ComputerSeatReady || seat.State == ComputerSeatStarting) && !wanted[seat.SeatID]) || (seat.State == ComputerSeatCleaned && wanted[seat.SeatID]) {
 			return ComputerSeatObservationReceipt{}, protocolError(contract.ErrorConflict, "Seat observation disagrees with wanted list")
+		}
+		if first.Valid && first.String != attemptID {
+			return ComputerSeatObservationReceipt{}, protocolError(contract.ErrorConflict, "Seat belongs to an earlier attempt")
+		}
+		if !first.Valid {
+			if _, err := tx.ExecContext(ctx, `UPDATE computer_seat_identities SET first_attempt_id=? WHERE seat_id=? AND first_attempt_id IS NULL`, attemptID, seat.SeatID); err != nil {
+				return ComputerSeatObservationReceipt{}, err
+			}
 		}
 		old, known := byID[seat.SeatID]
 		if known && old.State == ComputerSeatCleaned && seat.State != ComputerSeatCleaned {

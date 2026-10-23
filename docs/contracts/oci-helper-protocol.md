@@ -2231,7 +2231,12 @@ The node agent observes immediately after Apply, then at a one-second interval.
 Each cycle bounds helper work to 20 seconds and each of the two L1 calls to two
 seconds. This leaves margin inside a starting Seat's 60-second deadline;
 readiness is judged when the helper observes, not from an earlier ready file.
-The node agent must keep observing even if an L1 read or report fails. A helper
+The node agent must keep observing even if an L1 read or report fails. It
+backs off L1 calls independently (2 seconds, doubling to a 30-second cap),
+while keeping the one-second helper poll delay. It skips unchanged Apply
+plans and reports only changed observations, without a Seat heartbeat; the
+Attempt lease owns liveness. It logs errors at most once per 30 seconds per
+Computer. Uncertain Apply errors still retry the exact list. A helper
 refusal means wait and retry; diagnostic failures remain errors and never
 become invented per-Seat failures. A ready-to-starting regression is reported
 as returned, without adding a node agent deadline.
