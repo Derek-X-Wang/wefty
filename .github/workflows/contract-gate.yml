@@ -42,7 +42,9 @@ jobs:
       - name: Vet Darwin production-timing acceptance build
         run: GOOS=darwin go vet -tags=service_acceptance_realtiming ./...
       - name: Test
-        run: go test ./...
+        # Go's default 10 min per package is too tight: cmd/wefty takes 7-9 min
+        # on a green hosted runner and l1 up to 7.5 min (#1208).
+        run: go test -timeout=30m ./...
       - name: Validate acceptance image workflow and artifact contract
         run: |
           go tool actionlint

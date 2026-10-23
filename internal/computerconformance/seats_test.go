@@ -42,6 +42,7 @@ func TestSeatEvidenceNeverPromotesMissingRuntimeProof(t *testing.T) {
 
 func TestSeatEvidenceDetectsViewInputAndStaleRestartSeats(t *testing.T) {
 	evidence := SeatEvidence{Version: 1, Image: "example.invalid/default@sha256:abc", Observations: map[string]bool{
+		"other_endpoints_refused": true, "cross_computer_endpoints_refused": true,
 		"second_browser": true, "own_screen_input": true, "view_ignores_input": true,
 		"own_display": true, "other_files_refused": true, "other_display_refused": true,
 		"removed_processes_absent": true, "removed_endpoints_absent": true,
@@ -49,7 +50,7 @@ func TestSeatEvidenceDetectsViewInputAndStaleRestartSeats(t *testing.T) {
 		"restart_processes_absent": true, "restart_folders_absent": true,
 		"restart_answers_absent": true, "passwd_entries": true, "missing_passwd_refused": true,
 		"driver_per_seat": true, "deadline_per_seat": true, "tools_present": true,
-		"readonly_root": true, "profile_unmodified": true,
+		"readonly_root": true, "profile_unmodified": true, "seat_command_python": true,
 	}, InstallBytes: 1, MemoryLimitBytes: 1 << 30, TmpfsCeilingBytes: 465 << 20, MemoryBeforeRemovalBytes: 512 << 20, MemoryAfterRemovalBytes: 256 << 20}
 	if r := CheckSeats(evidence); r.Status != StatusPass {
 		t.Fatalf("complete evidence: %+v", r)
@@ -96,5 +97,32 @@ func TestSeatMemoryReturnsRejectsNoise(t *testing.T) {
 	}
 	if MemoryReclaimed(100<<20, 200<<20) {
 		t.Fatal("memory growth claimed reclamation")
+	}
+}
+
+func TestSeatEndpointConfinementRequiresObservedCrossovers(t *testing.T) {
+	e := SeatEvidence{Version: 1, Image: "example.invalid/image", Observations: map[string]bool{"other_endpoints_refused": true, "cross_computer_endpoints_refused": true}}
+	find := func() Status {
+		for _, c := range CheckSeats(e).Checks {
+			if c.ID == "IM-4.endpoints" {
+				return c.Status
+			}
+		}
+		t.Fatal("missing endpoint evidence")
+		return StatusFail
+	}
+	if got := find(); got != StatusPass {
+		t.Fatalf("real crossover refusals not counted: %s", got)
+	}
+	for _, name := range []string{"other_endpoints_refused", "cross_computer_endpoints_refused"} {
+		e.Observations[name] = false
+		if got := find(); got != StatusFail {
+			t.Fatalf("%s successful crossover accepted: %s", name, got)
+		}
+		delete(e.Observations, name)
+		if got := find(); got != StatusNotRun {
+			t.Fatalf("%s missing proof promoted: %s", name, got)
+		}
+		e.Observations[name] = true
 	}
 }

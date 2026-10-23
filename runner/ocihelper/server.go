@@ -89,7 +89,8 @@ type Server struct {
 	connections chan struct{}
 	// dataStreams bounds the connection slots long-lived data streams may hold
 	// to ConnectionLimit minus ControlConnectionReserve.
-	dataStreams chan struct{}
+	dataStreams  chan struct{}
+	seatCommands seatCommandBudget
 	// limitRefusals bounds the goroutines that answer a connection accepted
 	// over ConnectionLimit with a typed connection_limit frame.
 	limitRefusals   chan struct{}
@@ -1388,7 +1389,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 		return false
 	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus,
 		MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodInventoryRemoval, MethodAttestRemoval,
-		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken, MethodApplyComputerSeats, MethodObserveComputerSeats,
+		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken, MethodApplyComputerSeats, MethodObserveComputerSeats, MethodExecComputerSeat, MethodSetComputerMemoryLimit, MethodDialSeatEndpoint,
 		MethodListRunMailbox, MethodReadRunMailbox, MethodRemoveRunMailbox, MethodInventoryHandoffs:
 		session.mu.Lock()
 		defer session.mu.Unlock()
@@ -1673,6 +1674,38 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			signalErr = nil
 		}
 		_ = writeEngineResponseWithMethod(wire, request.Method, response, signalErr)
+	case MethodExecComputerSeat:
+		server.dispatchExecComputerSeat(operation, wire, request)
+	case MethodSetComputerMemoryLimit:
+		var body SetComputerMemoryLimitRequest
+		if !decodeRequest(wire, request.Body, &body) {
+			return
+		}
+		if body.MemoryBytes <= 0 || body.MemoryBytes%4096 != 0 {
+			_ = writeFailure(wire, CodeInvalidRequest, "memory limit must be a positive multiple of 4096 bytes")
+			return
+		}
+		attempt, rpcErr := session.authorizeAttempt(body.Authority)
+		if rpcErr != nil {
+			_ = writeRPCError(wire, rpcErr)
+			return
+		}
+		if !attempt.computer {
+			_ = writeFailure(wire, CodeUnauthorizedAttempt, "memory operations require a live Computer attempt")
+			return
+		}
+		engine, ok := server.engine.(ComputerMemoryLimitEngine)
+		if !ok {
+			_ = writeFailure(wire, CodeUnsupportedOperation, "live Computer memory limits unavailable")
+			return
+		}
+		operation.monitorEOF()
+		response, err := engine.SetComputerMemoryLimit(operation.ctx, body)
+		if err != nil {
+			_ = writeSeatOperationFailure(wire, err)
+			return
+		}
+		_ = writeEngineResponseWithMethod(wire, request.Method, response, nil)
 	case MethodApplyComputerSeats, MethodObserveComputerSeats:
 		var authority AttemptAuthority
 		var apply ApplyComputerSeatsRequest
@@ -2286,6 +2319,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if err != nil && !stream.ready {
 			_ = writeEngineResponseWithMethod(wire, request.Method, struct{}{}, err)
 		}
+	case MethodDialSeatEndpoint:
+		server.serveSeatEndpoint(session, operation, wire, request)
 	case MethodDialHostBridge:
 		var body DialHostBridgeRequest
 		if !decodeRequest(wire, request.Body, &body) {

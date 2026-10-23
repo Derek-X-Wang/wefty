@@ -102,3 +102,21 @@ class ProbeTest(unittest.TestCase):
     def test_failure_keeps_last_observed_colour(self):
         with self.assertRaisesRegex(TimeoutError, '0000aa'):
             self.run_probe('frame', 'ff0000', [framebuffer('0000aa')])
+
+class UnixTransportTest(unittest.TestCase):
+    def test_probe_connects_only_the_selected_unix_socket(self):
+        path = '/wefty/service/seats/1/run/view.ws'
+        with mock.patch.object(probe.socket, 'socket') as factory:
+            factory.return_value.connect.side_effect = OSError('fixture')
+            with self.assertRaises(OSError):
+                probe.WS(path)
+            factory.assert_called_once_with(probe.socket.AF_UNIX, probe.socket.SOCK_STREAM)
+            factory.return_value.connect.assert_called_once_with(path)
+
+class HelperStreamTransportTest(unittest.TestCase):
+    def test_frame_probe_uses_the_helper_stream_descriptor(self):
+        with mock.patch.object(probe.socket, 'socket') as factory:
+            factory.return_value.recv.return_value = b'HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Protocol: binary\r\n\r\n'
+            connection = probe.WS('fd:7')
+            factory.assert_called_once_with(fileno=7)
+            connection.s.connect.assert_not_called()

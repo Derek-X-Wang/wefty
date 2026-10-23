@@ -3,6 +3,7 @@ package ocihelper
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 )
 
@@ -19,7 +21,7 @@ const (
 	ComputerSeatReadinessTimeout        = 60 * time.Second
 )
 
-// SeatOperationRefusalReason is a recoverable request/list conflict, distinct
+// SeatOperationRefusalReason is a typed request/runtime refusal, distinct
 // from a failure to read or publish runtime evidence.
 type SeatOperationRefusalReason string
 
@@ -27,6 +29,12 @@ const (
 	SeatRefusalInPlaceChange       SeatOperationRefusalReason = "in_place_change_requires_remove"
 	SeatRefusalCleanupNotConfirmed SeatOperationRefusalReason = "cleanup_not_confirmed"
 	SeatRefusalGenerationMismatch  SeatOperationRefusalReason = "generation_mismatch"
+	SeatRefusalAttemptNotLive      SeatOperationRefusalReason = "attempt_not_live"
+	SeatRefusalTmpfsFloor          SeatOperationRefusalReason = "tmpfs_floor"
+	SeatRefusalMemoryCapacity      SeatOperationRefusalReason = "memory_capacity"
+	SeatRefusalMemoryGrowFailed    SeatOperationRefusalReason = "memory_grow_failed"
+	SeatRefusalMemoryBusy          SeatOperationRefusalReason = "memory_busy"
+	SeatRefusalMemoryThawFailed    SeatOperationRefusalReason = "memory_thaw_failed"
 )
 
 type SeatOperationRefusalError struct{ Reason SeatOperationRefusalReason }
@@ -54,10 +62,11 @@ type ObserveComputerSeatsRequest struct {
 	Generation uint64           `json:"generation"`
 }
 type ComputerSeatObservation struct {
-	Place           int    `json:"place"`
-	State           string `json:"state"` // starting, ready, failed, removing, cleaned
-	Reason          string `json:"reason"`
-	CleanupComplete bool   `json:"cleanup_complete"`
+	Place           int               `json:"place"`
+	State           string            `json:"state"` // starting, ready, failed, removing, cleaned
+	Reason          string            `json:"reason"`
+	CleanupComplete bool              `json:"cleanup_complete"`
+	Endpoints       map[string]string `json:"endpoints,omitempty"`
 }
 type ObserveComputerSeatsResponse struct {
 	Generation uint64                    `json:"generation"`
@@ -68,11 +77,12 @@ type ComputerSeatsEngine interface {
 	ObserveComputerSeats(context.Context, ObserveComputerSeatsRequest) (ObserveComputerSeatsResponse, error)
 }
 
-type computerSeatDirective struct {
-	Version    int            `json:"version"`
-	Generation uint64         `json:"generation"`
-	Seats      []ComputerSeat `json:"seats"`
+type computerSeatImageConfig struct {
+	ComputerSeat
+	ViewSocket    string `json:"view_socket"`
+	ControlSocket string `json:"control_socket"`
 }
+
 type computerSeatAnswer struct {
 	Version         int    `json:"version"`
 	Generation      uint64 `json:"generation"`
@@ -82,30 +92,44 @@ type computerSeatAnswer struct {
 	CleanupComplete bool   `json:"cleanup_complete"`
 }
 type computerSeatEntry struct {
-	config          ComputerSeat
-	deadline        time.Time
-	wanted          bool
-	readyGeneration uint64
-	ready           bool
-	failure         string
-	cleaned         bool
+	incarnation      uint64
+	endpointPins     map[string]*os.File
+	pinOwner         *computerSeats
+	endpointRevision uint64
+	endpointScope    string
+	config           ComputerSeat
+	deadline         time.Time
+	wanted           bool
+	readyGeneration  uint64
+	ready            bool
+	failure          string
+	cleaned          bool
+	memoryReturned   bool
 }
 
 // Serialized by the attempt's seatsMu. State belongs to one exact attempt;
 // losing it never creates cleanup evidence. Durable reconciliation is #1142.
 type computerSeats struct {
-	clock      Clock
-	directory  string
-	generation uint64
-	entries    map[int]*computerSeatEntry
-	wanted     []ComputerSeat
+	clock             Clock
+	directory         string
+	generation        uint64
+	endpointScope     string
+	entries           map[int]*computerSeatEntry
+	wanted            []ComputerSeat
+	pendingShrinkFrom int64 // old memory limit until an uncertain shrink is read back
+
+	// pinMu never covers task RPCs, network waits, greetings or seatsMu.
+	// Only bounded local descriptor operations and the pin registry use it.
+	pinMu       sync.Mutex
+	pinsRetired bool
+	pins        map[*os.File]struct{}
 }
 
 func newComputerSeats(clock Clock, directory string) *computerSeats {
 	if clock == nil {
 		clock = systemClock{}
 	}
-	return &computerSeats{clock: clock, directory: directory, entries: map[int]*computerSeatEntry{}}
+	return &computerSeats{endpointScope: rand.Text(), clock: clock, directory: directory, entries: map[int]*computerSeatEntry{}}
 }
 func validateComputerSeats(seats []ComputerSeat) error {
 	if len(seats) > 4 {
@@ -148,9 +172,13 @@ func (s *computerSeats) apply(wanted []ComputerSeat) (ApplyComputerSeatsResponse
 	if generation == 0 {
 		return ApplyComputerSeatsResponse{}, errors.New("Seat generation exhausted")
 	}
-	directive := computerSeatDirective{1, generation, wanted}
-	if directive.Seats == nil {
-		directive.Seats = []ComputerSeat{}
+	directive := struct {
+		Version    int                       `json:"version"`
+		Generation uint64                    `json:"generation"`
+		Seats      []computerSeatImageConfig `json:"seats"`
+	}{Version: 1, Generation: generation, Seats: []computerSeatImageConfig{}}
+	for _, config := range wanted {
+		directive.Seats = append(directive.Seats, computerSeatImageConfig{config, seatEndpointPath(config.Place, "view"), seatEndpointPath(config.Place, "control")})
 	}
 	payload, err := json.Marshal(directive)
 	if err != nil {
@@ -168,12 +196,13 @@ func (s *computerSeats) apply(wanted []ComputerSeat) (ApplyComputerSeatsResponse
 	for place, entry := range s.entries {
 		if !wantedPlaces[place] {
 			entry.wanted = false
+			entry.closeEndpointPins()
 		}
 	}
 	for _, config := range wanted {
 		entry := s.entries[config.Place]
 		if entry == nil || !entry.wanted {
-			entry = &computerSeatEntry{config: config, deadline: started.Add(ComputerSeatReadinessTimeout)}
+			entry = &computerSeatEntry{pinOwner: s, endpointScope: s.endpointScope, incarnation: generation, config: config, deadline: started.Add(ComputerSeatReadinessTimeout)}
 			s.entries[config.Place] = entry
 		}
 		entry.wanted = true
@@ -265,7 +294,8 @@ func (s *computerSeats) observe(ctx context.Context, generation uint64, read fun
 		if valid && answer.State == "failed" && answer.Reason != "" {
 			entry.failure = answer.Reason
 		}
-		if valid && answer.State == "ready" && !answer.CleanupComplete && answer.Reason == "" && entry.failure == "" && entry.readyGeneration != generation {
+		if valid && answer.State == "ready" && !answer.CleanupComplete && answer.Reason == "" && entry.failure == "" {
+			entry.readyGeneration = 0
 			// Bound real I/O as well as checking the injected monotonic clock after
 			// both greetings. A ready file alone is never readiness evidence.
 			budget := entry.deadline.Sub(s.clock.Now())

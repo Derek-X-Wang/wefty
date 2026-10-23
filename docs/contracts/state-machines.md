@@ -427,7 +427,28 @@ memory limit once and do not acquire an additional per-Seat charge. Invalid,
 duplicate or overflowing local records fail the check, rather than appear as
 free room. The request is refused with `out of room, try again later` when one
 Seat does not fit. Reservation fencing and cleanup reconciliation are #1142;
-the live limit change is #1140, and request orchestration is #1143.
+the live limit change uses the helper's `SetComputerMemoryLimit` (#1140), and
+request orchestration is #1143. The node agent grows the limit before it
+publishes the added Seat. A shrink needs positive helper cleanup observation
+whose room has not been returned, and returns room only after exact kernel
+readback.
+If remaining use exceeds the target, the old limit and its full reservation
+stay charged; `held_memory_bytes` reports the difference. Later retries may
+return that room once use falls. A frozen resample must leave a 16 MiB margin
+below the target for asynchronous kernel/socket charges; otherwise the old
+limit, reservation, and cleanup proof remain held. Creation-time tmpfs ceilings stay fixed: a
+target below twice their total is refused, with all that room still held.
+Grows never freeze or write an old, smaller limit back; a target proved by
+readback is accepted even if its write reported an error. Failed grows proved
+unchanged keep the old reservation. Uncertain readback keeps the larger
+reservation until later exact readback reconciles the proved lower limit.
+Retries with initial use above the target do not freeze. A shrink has one two-second freeze-to-thaw
+deadline and performs no containerd calls while frozen. An abandoned freeze
+is thawed, logged and reported; final `memory_thaw_failed` means the Computer
+may still be frozen. `memory_busy` after the 1.5-second check may follow an
+applied shrink; the old reservation remains until the next call's exact
+readback reconciles the lower limit. These helper facts do not change L1 room policy
+or implement restart recovery.
 
 The dedicated cap defaults to 1 and counts only currently running Computers
 with `seat_request_made=true` and Seat limit 1. A full dedicated cap refuses

@@ -570,7 +570,7 @@ The DNS proxy discards upstream responses whose questions do not match the query
 including QDCOUNT-zero error replies. Such unauthenticated error shapes are not
 forwarded; a client may time out rather than receive the upstream error.
 
-## Default image and Seats (Computer request P5, P6, P8, P9)
+## Default image and Seats (Computer request P5, P6, P7, P8, P9)
 
 The final `seats` target in `examples/computer/Dockerfile` is the default
 Computer image. It holds Debian, XFCE, Xvfb, Chromium, `git`, `curl`, Python 3,
@@ -588,19 +588,56 @@ image's highest Seat limit. Their homes are
 refused as `passwd_entry_missing` before desktop startup. User creation stays
 in the read-only image; password age uses fixed non-zero day 20000.
 
+### Runtime required by every multi-Seat image
+
+Every multi-Seat image must provide executable `/usr/bin/python3`
+(Python 3.8 or newer), with the standard library modules `array`, `base64`,
+`errno`, `fcntl`, `json`, `os`, `selectors`, `signal`, `subprocess`, `sys`,
+`termios`, and `time`, including `os.set_blocking`, `os.setsid`, and
+`signal.pthread_sigmask`. It must run as each Seat uid with
+`-I -S`. This applies to custom multi-Seat images as well as the default image;
+it does not apply to generic OCI images or images without Seats.
+
+The helper uses an embedded, isolated Python wrapper for Seat commands. It
+runs inside the existing task, creates the command's process group, bounds
+output buffering, and keeps detached programs from holding a finished command's
+output open. Using the existing interpreter avoids mounting and managing a
+second helper-owned executable. No Seat-installed Python module is imported.
+See [the helper operation](oci-helper-protocol.md#commands-inside-a-ready-seat)
+for environment, stream and cancel semantics. A normal command end also
+preserves plain background writers that retain
+stdout/stderr. A bounded Seat-uid discard reader keeps those pipes readable
+without extending the Run or holding helper connection slots. The image's
+uid-wide cleanup ends both writer and reader. Idle readers use blocking
+select. Their count is not separately capped: closing a reader at a count limit
+would break background logging, and the Seat uid can already fork processes.
+Readers stay in the Computer's existing memory limit; aggregate per-Seat reader
+memory is not guaranteed. See the helper contract for the five-second output
+drain and deletion bounds. Process-group scope on cancel
+and runtime limit stays unchanged pending the owner decision documented at
+that helper seam.
+
+`CheckSeatCommandRuntime` in `internal/computerconformance` probes the exact
+absolute interpreter path and required imports with `-I -S` as a Seat user.
+A missing or incompatible interpreter is refused with the clear requirement
+message, before Seat exercises. The resulting `seat_command_python` observation
+is mandatory for a passing `seats.command-runtime` check: false is `FAIL`
+with the executable requirement in its detail, and missing evidence is
+`NOT-RUN`. The native two-architecture Seat lane records this probe.
+
 ### Directive, readiness and positive cleanup proof
 
 P5 binds the **directory** `/wefty/control` read-only. The helper atomically
 replaces `seats.json`; the supervisor reopens it on every poll:
 
 ```json
-{"version":1,"generation":1,"seats":[{"place":1,"user":"seat1","view_port":7102,"control_port":7103}]}
+{"version":1,"generation":1,"seats":[{"place":1,"user":"seat1","view_port":7102,"control_port":7103,"view_socket":"/wefty/service/seats/1/run/view.ws","control_socket":"/wefty/service/seats/1/run/control.ws"}]}
 ```
 
 `place` is 1–4. A public Seat ID remains `seat_<hex>` and is never the place.
 The positive attempt-local generation increases on each directive. Duplicate
-places or ports, incorrect users, unknown fields, malformed documents, missing
-directives and replayed generations fail closed. A refused document logs
+places or ports, incorrect users or socket paths, unknown fields, malformed
+documents, missing directives and replayed generations fail closed. A refused document logs
 once per replacement, not once per poll. Only a read error resets that
 observation. An unchanged starting Seat keeps its original 60-second deadline
 when another Seat is added. Failed Seats do not retry on an unrelated change;
@@ -708,8 +745,9 @@ probe waits for green. Both input probes first observe the page and click a
 matching pixel near the centre of its visible colour band, below browser
 chrome and clear of narrow overlays. Control input must change the colour;
 an already-green baseline cannot prove input delivery. The lane selects the
-Seat's control port for control input and its view port for view-input and
-screen observations. Probe output records the endpoint port, click position,
+Seat's control Unix socket for control input and its view Unix socket for
+view-input and screen observations. Probe output records the endpoint, click
+position,
 and colours before and after input on success or failure. Failures retain the
 last completed samples when a frame has been observed.
 
@@ -718,12 +756,52 @@ P8 reads the Seat's own read-only
 `{"version":1,"human_driving":true}` or `false`. Missing or invalid data
 produces local false state in that Seat's `run/driver-state.json`.
 
-`seat-endpoints.sh` remains the P7 replacement seam for #1138. Distinct IPv4
-loopback view/control ports use `/websockify` and the `binary` subprotocol.
-View discards pointer and key input server-side; control accepts it. The
-backend Unix sockets are private Seat files. **Other Seats can still reach
-these loopback ports.** This ticket claims only display-cookie and file
-separation for IM-4; endpoint confinement remains `NOT-RUN`.
+### Per-Seat endpoint transport (P7, IM-4)
+
+**Spike decision (#1138): use filesystem Unix sockets.** Linux can pin a socket
+with `O_PATH|O_NOFOLLOW` and connect through `/proc/self/fd/<fd>` from the helper,
+without entering or trusting an image pathname during connect. The existing
+websockify 0.10 `LibProxyServer` needs a small Unix-listener adapter and must
+ignore its TCP-only `TCP_NODELAY` option for Unix streams. A real binary
+WebSocket/RFB handshake covers that adapter. No per-Seat password is needed.
+
+The directive names exactly `/wefty/service/seats/<place>/run/view.ws` and
+`control.ws`, never caller-selected paths. The supervisor rejects any other
+spelling, including traversal or another place. The earlier `view_port` and
+`control_port` fields remain unique directive metadata for the helper API;
+**the Seat image binds no TCP listener at either number**. They cannot be
+used to reach a Seat. Older single-desktop images retain their port contract.
+
+`seat-endpoints.sh` binds both `rfb-websocket-v1` edges as mode-0600 filesystem
+Unix sockets in the Seat's mode-0700 runtime folder. Only that Seat's uid and
+root can open them. The underlying `view.sock` and `control.sock` RFB sockets
+are equally private. `/websockify` and the `binary` subprotocol stay unchanged.
+View still drops pointer and key input server-side; control accepts it.
+The root supervisor opens endpoint parents without following links, requires
+Seat-owned private socket files, and compares parent and socket device/inode
+identities before connection and after the greeting. Linux peer uid checks
+also reject a link-and-restore to another Seat during connect. Links or
+replacements cannot earn image readiness; the helper still makes its own
+independent descriptor-anchored probes.
+X TCP stays disabled and each display requires its own private X cookie.
+
+The helper returns opaque view/control endpoint names in each ready Seat
+observation, and accepts them only with that exact Computer attempt, current
+directive generation and place. See [the helper contract](oci-helper-protocol.md#per-seat-endpoint-streams-p7).
+It descends without following image links, pins socket identities and checks
+the listening peer's Seat uid. A replacement never redirects an old name;
+a later successful observation publishes fresh names after desktop recovery.
+
+Both `default-computer-seats / linux/amd64` and `/ linux/arm64` in
+`computer-seats.yml` attempt real connections from each Seat uid to the other
+Seat's view/control edges and RFB backends, and try the other display with the
+wrong cookie. Both live Computers also have Seat 1 with identical uid and
+socket paths but different frame colours. Probes from each Seat user must
+show only that Computer's colour. The helper lane checks those colours through
+its named streams too, bracketing cross-Computer name refusals. A distinct live
+abstract X token additionally tests network-namespace separation. Missing
+crossover observations keep `IM-4.endpoints`
+`NOT-RUN`; an observed successful crossover fails conformance.
 
 At startup the root supervisor refuses a non-root-owned or group/other-writable
 `/wefty/service`. It `lstat`-checks `seats` and `shared`, refuses links or wrong
@@ -741,6 +819,11 @@ On Linux this is `chown 0:0 <storage-root>` and `chmod 0755 <storage-root>`.
 Fix the root only; do not recursively change Seat or shared-file ownership.
 The root supervisor refuses unsafe ownership or write permission rather than
 silently trusting a tenant-writable parent.
+
+The removal lane checks all four `.ws`/`.sock` paths with `lstat` and scans
+that Computer's `/proc/net/unix` for the Seat prefix and both display tokens.
+A dangling endpoint path or an unlinked-but-live socket fails absence; closed
+legacy TCP ports do not prove Seat cleanup.
 
 Cleanup kills every process carrying the Seat uid, including detached and
 double-forked children. It removes that uid's SysV shared memory, semaphore

@@ -159,10 +159,38 @@ func TestRestartableDelayedCleanupCannotTouchSuccessor(t *testing.T) {
 			t.Fatalf("old cleanup did not retire %s: %v", path, err)
 		}
 	}
+	// The helper acknowledges the rename, not the deletion: its detached
+	// delete step still owns trash and lock folders beside the old storage.
+	// Wait for them, so TempDir cleanup does not race it (#1197).
+	waitRestartRecoveryNoExecTrash(t, filepath.Dir(previous))
 	for _, path := range []string{filepath.Join(storage, "work/keep"), filepath.Join(storage, "tmp/keep"), filepath.Join(tmp, "keep"), filepath.Join(next.directory, "params.json")} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("delayed predecessor cleanup touched successor: %s: %v", path, err)
 		}
+	}
+}
+
+func waitRestartRecoveryNoExecTrash(t *testing.T, directory string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		entries, err := os.ReadDir(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var left []string
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), ".wefty-") {
+				left = append(left, entry.Name())
+			}
+		}
+		if len(left) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("exec cleanup still owns %v in %s", left, directory)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

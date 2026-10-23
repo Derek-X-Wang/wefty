@@ -12,11 +12,20 @@ import time
 class WS:
     def __init__(self, port, host="127.0.0.1"):
         self.deadline = time.monotonic() + 15
-        self.s = socket.create_connection((host, port), timeout=10)
+        if isinstance(port, str) and port.startswith('fd:'):
+            # The native helper lane passes its already-authorized stream.
+            self.s = socket.socket(fileno=int(port[3:]))
+            self.s.settimeout(10)
+        elif isinstance(port, str) and port.startswith('/'):
+            self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.s.settimeout(10)
+            self.s.connect(port)
+        else:
+            self.s = socket.create_connection((host, port), timeout=10)
         key = base64.b64encode(os.urandom(16)).decode()
-        self.s.sendall(("GET /websockify HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        self.s.sendall(("GET /websockify HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                         "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n"
-                        "Sec-WebSocket-Protocol: binary\r\n\r\n" % (host, port, key)).encode())
+                        "Sec-WebSocket-Protocol: binary\r\n\r\n" % (host, key)).encode())
         buf = b""
         while b"\r\n\r\n" not in buf:
             c = self.read(4096)
@@ -195,7 +204,9 @@ class RFB:
 
 
 def main():
-    mode, port, expected = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    mode, port, expected = sys.argv[1], sys.argv[2], sys.argv[3]
+    if port.isdigit():
+        port = int(port)
     client = RFB(port)
     # One absolute deadline bounds every socket read as well as polling.
     deadline = client.ws.deadline
