@@ -81,12 +81,15 @@ checks all finish before admission changes. A preparation failure never drains.
 Before disabling claims, upgrade waits for a gap with no non-restartable
 one-shots. Claims stay open during this wait; restartable one-shots and services
 do not prevent a gap. It observes every five seconds within the configured
-drain timeout. If no gap appears, it exits 5 with
-`drain timed out; installed stack unchanged` without disabling claims or writing
-a drain receipt. Intent or boot changes refuse activation. The gap wait, durable receipt persistence, admission disable and post-disable
+drain timeout. If no gap appears, it exits 5 with `retryable=true` and
+`drain timed out; installed stack unchanged; try again when the running one-shots finish`
+without disabling claims or writing a drain receipt. The hint names up to three
+blocking Job IDs when available. Intent or boot changes refuse activation.
+The gap wait, durable receipt persistence, admission disable and post-disable
 wait share one absolute deadline. Upgrade checks it again before sending the
 disable; receipt latency consumes the remaining budget. If the budget expires
-before the disable is sent, it removes its receipt without changing admission. A late non-restartable claim committed
+before the disable is sent, it removes its receipt without changing admission.
+A late non-restartable claim committed
 before the disable is still waited for within the remaining time. `--yes`
 skips the gap wait; a pre-existing disable remains closed.
 
@@ -137,8 +140,13 @@ There is no interactive prompt.
 
 On timeout without `--yes`, upgrade restores only its own intent revision,
 leaves the old installation running, and exits **5** with
-`drain timed out; installed stack unchanged`. If the intent revision changes
-during the drain, activation refuses with conflict and preserves the newer
+the prefix `drain timed out; installed stack unchanged`. Once cleanup confirms
+claims are open again, the error has `retryable=true` and appends
+`; try again when the running one-shots finish`, naming up to three blocking
+Job IDs when available. Retryability does not change exit 5. A failed intent
+restore or claims left disabled retain `retryable=false` without that hint;
+restore failures keep the receipt and recovery advice. If the intent revision
+changes during the drain, activation refuses with conflict and preserves the newer
 operator decision. The CLI never clears a pre-existing disable or overwrites a
 newer intent, including a disable racing its restoration CAS.
 

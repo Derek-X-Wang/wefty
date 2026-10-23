@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -122,20 +123,24 @@ func beginUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, pr
 		return nil, ctx.Err()
 	}
 	if left <= 0 {
-		return nil, upgradeDrainTimedOut()
+		return nil, upgradeDrainTimedOut(node.ClaimsEnabled, node.ActiveAttempts)
 	}
 	bounded, cancel := context.WithTimeout(ctx, left)
 	defer cancel()
+	receipt := &upgradeDrainReceipt{
+		Home: paths.home, Version: 1, NodeID: node.NodeID, Revision: node.IntentRevision,
+		Reason: node.IntentReason, PreviousReason: node.IntentReason, RestoreClaims: node.ClaimsEnabled,
+		claimsDisabled: !node.ClaimsEnabled, deadline: deadline, disableNotSent: true,
+	}
 	budgetError := func() error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if !op.now().Before(deadline) || errors.Is(bounded.Err(), context.DeadlineExceeded) {
-			return upgradeDrainTimedOut()
+			return upgradeDrainTimedOut(node.ClaimsEnabled && receipt.disableNotSent, node.ActiveAttempts)
 		}
 		return bounded.Err()
 	}
-	receipt := &upgradeDrainReceipt{Home: paths.home, Version: 1, NodeID: node.NodeID, Revision: node.IntentRevision, Reason: node.IntentReason, PreviousReason: node.IntentReason, RestoreClaims: node.ClaimsEnabled, deadline: deadline, disableNotSent: true}
 	if node.ClaimsEnabled {
 		receipt.Revision++
 		receipt.Reason = upgradeIntentPrefix + rand.Text() + upgradeDeadlineField + deadline.UTC().Format(time.RFC3339Nano)
@@ -170,7 +175,7 @@ func beginUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, pr
 	}
 	mutationBudget := deadline.Sub(op.now())
 	if mutationBudget <= 0 {
-		return receipt, upgradeDrainTimedOut()
+		return receipt, upgradeDrainTimedOut(node.ClaimsEnabled, node.ActiveAttempts)
 	}
 	mutation, cancelMutation := context.WithTimeout(bounded, mutationBudget)
 	defer cancelMutation()
@@ -226,6 +231,7 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 	bounded, cancel := context.WithTimeout(ctx, deadline.Sub(op.now()))
 	defer cancel()
 	first := true
+	var active []l1.NodeActiveAttempt
 	interruptions := map[string]*upgradeInterruption{}
 	track := func(attempt l1.NodeActiveAttempt) {
 		if !yes && attempt.Restartable && attempt.Class != contract.JobClassService && interruptions[attempt.AttemptID] == nil {
@@ -243,7 +249,7 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 	}
 	for {
 		if !first && !yes && (!op.now().Before(deadline) || errors.Is(bounded.Err(), context.DeadlineExceeded)) && ctx.Err() == nil {
-			return l1.Node{}, upgradeDrainTimedOut()
+			return l1.Node{}, upgradeDrainTimedOut(false, active)
 		}
 		// Read after disabling, including claimed attempts committed just before CAS.
 		// The initial read has the observer's own budget, even on an idle node.
@@ -255,13 +261,14 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 		node, err := op.observe(probe, profile)
 		if err != nil {
 			if ctx.Err() == nil && errors.Is(bounded.Err(), context.DeadlineExceeded) {
-				return node, upgradeDrainTimedOut()
+				return node, upgradeDrainTimedOut(false, active)
 			}
 			return node, err
 		}
 		if node.IntentRevision != receipt.Revision || node.ClaimsEnabled || node.IntentReason != receipt.Reason {
 			return node, &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "node intent changed during upgrade drain; installed stack unchanged"}}
 		}
+		active = node.ActiveAttempts
 		receipt.counts = upgradeDrainCounts{}
 		for _, stop := range interruptions {
 			stop.active = false
@@ -322,7 +329,7 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 			if !stop.settled {
 				receipt.counts.StoppingRestartable++
 				if !op.now().Before(stop.deadline) {
-					return node, upgradeDrainTimedOut()
+					return node, upgradeDrainTimedOut(false, active)
 				}
 			}
 		}
@@ -336,7 +343,7 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 		}
 		left := deadline.Sub(op.now())
 		if left <= 0 || errors.Is(bounded.Err(), context.DeadlineExceeded) {
-			return node, upgradeDrainTimedOut()
+			return node, upgradeDrainTimedOut(false, active)
 		}
 		for _, stop := range interruptions {
 			if !stop.settled {
@@ -348,7 +355,7 @@ func waitUpgradeDrain(ctx context.Context, op upgradeHost, profile connprofile.P
 				return node, ctx.Err()
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
-				return node, upgradeDrainTimedOut()
+				return node, upgradeDrainTimedOut(false, active)
 			}
 			return node, err
 		}
@@ -409,8 +416,56 @@ func checkUpgradeReplacement(node l1.Node, receipt *upgradeDrainReceipt, yes boo
 	return nil
 }
 
-func upgradeDrainTimedOut() error {
-	return &apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict, Message: "drain timed out; installed stack unchanged"}}
+type upgradeDrainTimeoutError struct {
+	apiResponseError
+	hint string
+}
+
+func (e *upgradeDrainTimeoutError) Unwrap() error { return &e.apiResponseError }
+
+func (e *upgradeDrainTimeoutError) setRetryable(claimsOpen bool) {
+	e.APIError.Retryable = claimsOpen
+	e.APIError.Message = "drain timed out; installed stack unchanged"
+	if claimsOpen {
+		e.APIError.Message += e.hint
+	}
+}
+
+func upgradeDrainTimedOut(claimsOpen bool, attempts []l1.NodeActiveAttempt) *upgradeDrainTimeoutError {
+	var jobs []string
+	for _, attempt := range attempts {
+		if attempt.Class == contract.JobClassService || attempt.Restartable || attempt.JobID == "" {
+			continue
+		}
+		if !slices.Contains(jobs, attempt.JobID) {
+			jobs = append(jobs, attempt.JobID)
+		}
+		if len(jobs) == 3 {
+			break
+		}
+	}
+	err := &upgradeDrainTimeoutError{
+		apiResponseError: apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict}},
+		hint:             "; try again when the running one-shots finish",
+	}
+	if len(jobs) > 0 {
+		err.hint += " (jobs: " + strings.Join(jobs, ", ") + ")"
+	}
+	err.setRetryable(claimsOpen)
+	return err
+}
+
+// Post-disable timeouts become retryable only after cleanup confirms open claims.
+// A failed restore or a newer operator disable must retain the recovery outcome.
+func upgradeDrainResult(primary, restore error, claimsOpen bool) error {
+	var timeout *upgradeDrainTimeoutError
+	if errors.As(primary, &timeout) {
+		timeout.setRetryable(restore == nil && claimsOpen)
+	}
+	if restore != nil {
+		return &upgradeCleanupError{primary: primary, restore: restore}
+	}
+	return primary
 }
 
 func recoverUpgradeDrain(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, out io.Writer) error {

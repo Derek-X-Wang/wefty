@@ -28,15 +28,17 @@ func waitUpgradeGap(ctx context.Context, op upgradeHost, profile connprofile.Pro
 			return node, deadline, ctx.Err()
 		}
 		*counts = upgradeDrainCounts{}
+		var blocking []l1.NodeActiveAttempt
 		for _, attempt := range node.ActiveAttempts {
 			recordUpgradeWork(work, attempt)
 			if attempt.Class != contract.JobClassService && !attempt.Restartable {
 				counts.WaitingNonrestartable++
+				blocking = append(blocking, attempt)
 			}
 		}
 		left := deadline.Sub(op.now())
 		if left <= 0 || errors.Is(bounded.Err(), context.DeadlineExceeded) {
-			return node, deadline, upgradeDrainTimedOut()
+			return node, deadline, upgradeDrainTimedOut(true, blocking)
 		}
 		if counts.WaitingNonrestartable == 0 {
 			return node, deadline, nil
@@ -49,17 +51,17 @@ func waitUpgradeGap(ctx context.Context, op upgradeHost, profile connprofile.Pro
 				return node, deadline, ctx.Err()
 			}
 			if errors.Is(err, context.DeadlineExceeded) {
-				return node, deadline, upgradeDrainTimedOut()
+				return node, deadline, upgradeDrainTimedOut(true, blocking)
 			}
 			return node, deadline, err
 		}
 		if !op.now().Before(deadline) {
-			return node, deadline, upgradeDrainTimedOut()
+			return node, deadline, upgradeDrainTimedOut(true, blocking)
 		}
 		current, err := op.observe(bounded, profile)
 		if err != nil {
 			if ctx.Err() == nil && errors.Is(bounded.Err(), context.DeadlineExceeded) {
-				return current, deadline, upgradeDrainTimedOut()
+				return current, deadline, upgradeDrainTimedOut(true, blocking)
 			}
 			return current, deadline, err
 		}

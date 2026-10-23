@@ -302,9 +302,8 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	var drain *upgradeDrainReceipt
 	defer func() {
 		if drain != nil {
-			if err := finishUpgradeDrain(ctx, operations, paths, profile, drain, false, warnings); err != nil {
-				resultErr = &upgradeCleanupError{primary: resultErr, restore: err}
-			}
+			restoreErr := finishUpgradeDrain(ctx, operations, paths, profile, drain, false, warnings)
+			resultErr = upgradeDrainResult(resultErr, restoreErr, !drain.claimsDisabled)
 			result.RestartedServices = slices.Clone(drain.restarted)
 			result.ClaimsDisabled = drain.claimsDisabled
 			result.upgradeDrainCounts = drain.counts

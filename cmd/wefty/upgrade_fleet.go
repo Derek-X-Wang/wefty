@@ -470,9 +470,8 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 	drain, err := beginUpgradeDrain(ctx, op, paths, profile, baseline, bound, deadline)
 	if drain != nil {
 		defer func() {
-			if err := finishUpgradeDrain(ctx, op, paths, profile, drain, false, warnings); err != nil {
-				resultErr = &upgradeCleanupError{primary: resultErr, restore: err}
-			}
+			restoreErr := finishUpgradeDrain(ctx, op, paths, profile, drain, false, warnings)
+			resultErr = upgradeDrainResult(resultErr, restoreErr, !drain.claimsDisabled)
 			report.RestartedServices = slices.Clone(drain.restarted)
 			report.ClaimsDisabled = drain.claimsDisabled
 			report.upgradeDrainCounts = drain.counts
