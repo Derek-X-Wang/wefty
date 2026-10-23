@@ -86,6 +86,14 @@ for kind in computer-disks computer-backups computer-disk-quarantine computer-st
       [ ! -L "$records" ] && [ -d "$records" ] || exit 1
       invalid=$(find "$records" -mindepth 1 -maxdepth 1 ! -type f -print)
       [ -z "$invalid" ] || exit 1
+      # Match only durable copy-ID records and os.CreateTemp's staging files.
+      hex8='[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'
+      recordPattern=wefty-backup-copy-$hex8$hex8$hex8$hex8.json
+      unexpected=$(find "$records" -mindepth 1 -maxdepth 1 ! -name "$recordPattern" ! -name '.supersession.tmp-?*' -print)
+      if [ -n "$unexpected" ]; then blocked=1; fi
+      find "$records" -mindepth 1 -maxdepth 1 ! -name "$recordPattern" ! -name '.supersession.tmp-?*' -exec sh -c '
+        for entry do printf "computer-backup-unexpected-records/%s\000\000" "${entry##*/}"; done
+      ' sh {} +
     fi
   fi
   entries=$(find "$directory" -mindepth 1 -maxdepth 1 ! -name "$ignored" -print)
@@ -129,8 +137,9 @@ printf 'complete\000'
 `
 
 func (supervisor *Supervisor) guardRecreate(ctx context.Context) (guardErr error) {
+	inventoryAttempted := false
 	defer func() {
-		if guardErr != nil {
+		if inventoryAttempted && guardErr != nil {
 			supervisor.restoreRecreateSocket(ctx)
 		}
 	}()
@@ -138,6 +147,7 @@ func (supervisor *Supervisor) guardRecreate(ctx context.Context) (guardErr error
 	if err != nil || state != InstanceRunning {
 		return &RecreateBlockedError{Reason: "host VM is not known running; start OCI explicitly before inspecting its durable disk inventory"}
 	}
+	inventoryAttempted = true
 	output, err := supervisor.runBounded(ctx, "--tty=false", "shell", "--workdir=/", supervisor.config.Instance,
 		"sudo", "sh", "-c", recreateInventoryScript, "wefty-recreate-inventory", recreateRuntimeRoot)
 	if err != nil {
@@ -180,6 +190,9 @@ func authorizeRecreateInventory(output []byte) error {
 			label = "Computer Storage generation"
 		case "computer-backups":
 			label = "Backup copy"
+		case "computer-backup-unexpected-records":
+			blockers = append(blockers, "unexpected Backup supersession entry "+name)
+			continue
 		case "computer-refused-copies":
 			label = "refused Computer copy record"
 		case "computer-disk-quarantine":

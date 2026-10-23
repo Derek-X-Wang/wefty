@@ -282,7 +282,8 @@ func TestRecreateBackupSupersessionRecordsDoNotBlock(t *testing.T) {
 	for _, copyRemains := range []bool{false, true} {
 		t.Run(fmt.Sprintf("copy-remains=%t", copyRemains), func(t *testing.T) {
 			f := newRecreateFixture(t)
-			mustRecreateFile(t, f.root, "computer-backups/supersessions/pruned-copy.json")
+			mustRecreateFile(t, f.root, "computer-backups/supersessions/wefty-backup-copy-"+strings.Repeat("a", 32)+".json")
+			mustRecreateFile(t, f.root, "computer-backups/supersessions/.supersession.tmp-1234567890")
 			if copyRemains {
 				mustRecreateFile(t, f.root, "computer-backups/live-copy/backup.ext4")
 			}
@@ -396,5 +397,37 @@ func TestRecreateRejectsInvalidBackupRecordsFolder(t *testing.T) {
 				t.Fatalf("invalid records accepted or helper stopped: %v, %t", err, f.helperStopped)
 			}
 		})
+	}
+}
+
+func TestRecreateDoesNotRestoreSocketBeforeInventory(t *testing.T) {
+	for _, state := range []InstanceState{InstanceStopped, InstanceBroken, InstanceUnknown} {
+		t.Run(string(state), func(t *testing.T) {
+			f := newRecreateFixture(t)
+			f.state = state
+			if err := f.recreate(t); err == nil {
+				t.Fatal("recreate accepted unavailable inventory")
+			}
+			if f.restoreCalls != 0 || len(f.commands) != 1 || f.commands[0][0] != "list" {
+				t.Fatalf("guard attempted guest access before inventory: %v", f.commands)
+			}
+		})
+	}
+}
+
+func TestRecreateRejectsUnexpectedSupersessionFilename(t *testing.T) {
+	f := newRecreateFixture(t)
+	mustRecreateFile(t, f.root, "computer-backups/supersessions/backup.ext4")
+	err := f.recreate(t)
+	var blocked *RecreateBlockedError
+	if !errors.As(err, &blocked) || len(blocked.Blockers) != 1 ||
+		!strings.Contains(err.Error(), "unexpected Backup supersession entry backup.ext4") {
+		t.Fatalf("unexpected supersession file not identified as blocker: %v", err)
+	}
+	if f.helperStopped {
+		t.Fatal("refusal left helper socket activation stopped")
+	}
+	if _, err := os.Stat(filepath.Join(f.root, "computer-backups/supersessions/backup.ext4")); err != nil {
+		t.Fatalf("refusal lost unexpected file: %v", err)
 	}
 }

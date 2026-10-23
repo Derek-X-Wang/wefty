@@ -582,10 +582,16 @@ generation, but still requires inspection and blocks deletion.
 If the host VM is stopped, start OCI explicitly before a new inspection. A
 missing lazy runtime root is empty only when its real parent enumerates
 successfully. Do not infer absence from a failed read or delete Storage files
-to silence the guard. The refusal is not retried automatically. On guard
-refusal or failed Lima deletion, Go attempts bounded helper socket restoration
-even after request cancellation; inspect the node agent log if that best-effort
-restoration fails. The original refusal remains the command's answer.
+to silence the guard. Supersession records are ignored only when they are
+regular files named `wefty-backup-copy-<32 lowercase hex>.json` or
+`.supersession.tmp-*` with a nonempty suffix. Other names block as unexpected
+Backup supersession entries.
+
+The refusal is not retried automatically. After an attempted inventory command
+fails, or Lima deletion fails, Go attempts bounded helper socket restoration
+even after request cancellation. A refusal before inventory does not access the
+guest. Inspect the node agent log if that best-effort restoration fails. The
+original refusal remains the command's answer.
 
 ## doctor-code-oci-attempt-ownership-quarantine-not-run
 

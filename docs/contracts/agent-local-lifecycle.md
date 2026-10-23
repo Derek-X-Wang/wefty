@@ -290,7 +290,10 @@ inspects `computer-disks`, `computer-backups`, `computer-disk-quarantine` and
 `computer-storage-resets`. Entries block except for
 `computer-backups/supersessions`, which contains removal and supersession
 records rather than Backup copies. That folder must be a real directory of
-regular files; a symlink, subdirectory or other non-regular entry refuses.
+regular files named `wefty-backup-copy-<32 lowercase hex>.json` or
+`.supersession.tmp-*` with a nonempty suffix, as written by the helper. Any other
+filename blocks as an unexpected Backup supersession entry; a symlink,
+subdirectory or other non-regular entry refuses.
 Losing these records during recreation is acceptable once the guard has proved
 that no source Storage or Backup copy remains on the disk. Copy folders still
 block when those records are present. A directory in `computer-disks` holding
@@ -304,10 +307,12 @@ root is created lazily. Its absence counts as empty only after its real parent
 Symlinks, non-directories, failed reads, malformed or incomplete answers and
 unavailable inventory all refuse. The script restores socket activation on
 refusal and handles EXIT, HUP, INT and TERM while ignoring PIPE. Go also makes
-a bounded best-effort socket-start attempt after every non-nil guard result
-(including rejected output, cancellation and timeout), and after failed Lima
-deletion. That attempt uses a context independent of the canceled request and
-the ordinary command timeout. A failed restoration is logged without replacing
+a bounded best-effort socket-start attempt after a non-nil guard result when
+the inventory command was attempted (including rejected output, cancellation
+and timeout), and after failed Lima deletion. Before inventory is attempted,
+refusal does not access the guest or attempt socket restoration. A restoration
+attempt uses a context independent of the canceled request and the ordinary
+command timeout. A failed restoration is logged without replacing
 the original refusal. A successful empty inspection leaves the helper stopped
 until host VM deletion, so no helper operation can create bytes between the
 check and deletion.
