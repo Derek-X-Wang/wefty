@@ -436,7 +436,7 @@ func (e *upgradeDrainTimeoutError) setRetryable(claimsOpen bool) {
 func (e *upgradeDrainTimeoutError) setHint(blockers []string) {
 	e.hint = "; try again when the running one-shots finish"
 	if len(blockers) > 0 {
-		e.hint += " (runs: " + strings.Join(blockers, ", ") + ")"
+		e.hint += " (blocked by: " + strings.Join(blockers, ", ") + ")"
 	}
 }
 

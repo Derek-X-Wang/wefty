@@ -133,7 +133,7 @@ func TestUpgradeDrainTimeoutRetryabilityAfterRestore(t *testing.T) {
 					t.Fatalf("wrong timeout recovery advice: err=%v claims=%v JSON=%s", err, f.node.ClaimsEnabled, out.String())
 				}
 				if wantRetryable {
-					if reads != 1 || !strings.Contains(envelope.Error.Message, "(runs: run_late (late-job))") {
+					if reads != 1 || !strings.Contains(envelope.Error.Message, "(blocked by: run_late (late-job))") {
 						t.Fatalf("missing blocking Run: reads=%d JSON=%s", reads, out.String())
 					}
 				} else if reads != 0 {
@@ -509,7 +509,7 @@ func TestUpgradeDrainTimeoutHintNamesOnlyBlockingJobs(t *testing.T) {
 		{JobID: "restartable", AttemptID: "attempt-2", Restartable: true},
 		{JobID: "service", AttemptID: "attempt-3", Class: contract.JobClassService},
 	})
-	if !err.APIError.Retryable || !strings.Contains(err.APIError.Message, "(runs: ordinary)") {
+	if !err.APIError.Retryable || !strings.Contains(err.APIError.Message, "(blocked by: ordinary)") {
 		t.Fatalf("hint = %q retryable=%v, want only the ordinary Job", err.APIError.Message, err.APIError.Retryable)
 	}
 }
@@ -528,7 +528,7 @@ func TestUpgradeDrainRunHintReadsAfterExpiredContext(t *testing.T) {
 		return l1.Job{Spec: contract.JobSpec{Labels: map[string]string{contract.LabelRunID: "run_blocking"}}}, nil
 	}}
 	err := upgradeDrainRunHint(ctx, op, connprofile.Profile{}, timeout)
-	if err != timeout || commandExitCode(err) != exitConflict || !timeout.APIError.Retryable || !strings.HasSuffix(timeout.APIError.Message, "(runs: run_blocking (job_blocking))") {
+	if err != timeout || commandExitCode(err) != exitConflict || !timeout.APIError.Retryable || !strings.HasSuffix(timeout.APIError.Message, "(blocked by: run_blocking (job_blocking))") {
 		t.Fatalf("lookup changed timeout semantics: %v", err)
 	}
 	if probe == nil || !errors.Is(probe.Err(), context.Canceled) {

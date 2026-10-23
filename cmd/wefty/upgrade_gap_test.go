@@ -60,7 +60,7 @@ func TestUpgradeGapTimeoutJSONIsRetryable(t *testing.T) {
 			if commandExitCode(err) != 5 || envelope.Error.Code != contract.ErrorConflict || !envelope.Error.Retryable || !strings.HasPrefix(envelope.Error.Message, "drain timed out; installed stack unchanged; try again when the running one-shots finish") {
 				t.Fatalf("wrong retry advice: err=%v JSON=%s", err, out.String())
 			}
-			if !strings.HasSuffix(envelope.Error.Message, "(runs: run_blocking (ordinary-1), ordinary-2, ordinary-3)") || !slices.Equal(reads, []string{"ordinary-1", "ordinary-2", "ordinary-3"}) {
+			if !strings.HasSuffix(envelope.Error.Message, "(blocked by: run_blocking (ordinary-1), ordinary-2, ordinary-3)") || !slices.Equal(reads, []string{"ordinary-1", "ordinary-2", "ordinary-3"}) {
 				t.Fatalf("wrong blocking Runs or read bound: reads=%v JSON=%s", reads, out.String())
 			}
 			for _, id := range []string{"ordinary-1", "ordinary-2", "ordinary-3"} {

@@ -84,7 +84,7 @@ do not prevent a gap. It observes every five seconds within the configured
 drain timeout. If no gap appears, it exits 5 with `retryable=true` and
 `drain timed out; installed stack unchanged; try again when the running one-shots finish`
 without disabling claims or writing a drain receipt. The hint names up to three
-blocking Runs when available, as `(runs: run_X (job_A), job_B)`. It reads each
+blocking Runs when available, as `(blocked by: run_X (job_A), job_B)`. It reads each
 blocking Job's `run_id` label with an independent two-second timeout (at most
 three reads); a missing label or failed read leaves the Job ID alone.
 Intent or boot changes refuse activation.
@@ -146,7 +146,7 @@ leaves the old installation running, and exits **5** with
 the prefix `drain timed out; installed stack unchanged`. Once cleanup confirms
 claims are open again, the error has `retryable=true` and appends
 `; try again when the running one-shots finish`, naming up to three blocking
-Runs as `(runs: run_X (job_A), job_B)`, keeping each Job ID. Only a retryable
+Runs as `(blocked by: run_X (job_A), job_B)`, keeping each Job ID. Only a retryable
 timeout reads the Jobs' `run_id` labels, after cleanup, with an independent
 two-second timeout per Job (at most three reads). Missing labels and read errors
 leave the Job ID alone. Retryability does not change exit 5. A failed intent
