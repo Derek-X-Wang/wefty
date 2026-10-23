@@ -143,6 +143,15 @@ A machine running the wefty agent, joined through the fabric, with
 control-plane-assigned tags.
 _Avoid_: worker, host, machine (in scheduling contexts)
 
+**Node agent generation** _(B1 target; runtime support is planned)_:
+One installed incarnation of a Node's node agent, with a distinct identity
+and retained executable. Its **primary** role permits new claims; its
+**retiring** role permits only finishing work it already holds. One Node has
+one primary and may have any number of retiring generations. This term is
+separate from a Computer's **Storage generation**.
+_Avoid_: unqualified generation, Storage generation, authority generation,
+Run, boot session, version (several generations may use the same version)
+
 **Workload**:
 What a job asks a node to execute, described by two independent axes:
 **kind** — the isolation walls (`process`, `oci`, open for more) — and
