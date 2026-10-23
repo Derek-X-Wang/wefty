@@ -99,7 +99,8 @@ func (spool *logSpool) sweepDeadOneShotAttempts(ctx context.Context, limit int, 
 	}
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `SELECT attempt_id, l1_refused_ns IS NOT NULL FROM spool_attempts
-WHERE `+spoolSweepPredicate+`
+WHERE `+spoolSweepPredicate+` AND `+spool.generationPredicate("spool_attempts")+`
+ AND NOT EXISTS (SELECT 1 FROM generation_evidence_custody c WHERE c.attempt_id=spool_attempts.attempt_id)
 ORDER BY created_ns, attempt_id LIMIT ?`, contract.JobClassOneShot, limit)
 	if err != nil {
 		return spoolSweep{}, fmt.Errorf("agent: select dead one-shot spool rows: %w", err)

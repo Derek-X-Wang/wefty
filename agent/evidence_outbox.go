@@ -99,6 +99,7 @@ func doublingDelay(base, ceiling time.Duration, step int) time.Duration {
 // Sessions borrow it; ending or replacing a session must not discard evidence
 // that still needs delivery.
 type evidenceOutbox struct {
+	nodeID        string
 	spool         *logSpool
 	clock         Clock
 	batchSize     int
@@ -151,7 +152,7 @@ func newEvidenceOutbox(directory, nodeID string, maxBytes int64, clock Clock, ba
 	}
 	lateContext, lateCancel := context.WithCancel(context.Background())
 	return &evidenceOutbox{
-		spool: spool, clock: clock, batchSize: batchSize,
+		spool: spool, clock: clock, batchSize: batchSize, nodeID: nodeID,
 		flushInterval: flushInterval, retryInterval: retryInterval,
 		recoveryWake: make(chan struct{}, 1),
 		liveAttempts: make(map[string]struct{}),
@@ -326,8 +327,18 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 	outbox.recoveryContext = recoveryContext
 	outbox.recoveryCancel = cancel
 	outbox.recoveryWG.Add(1)
+	refreshInventory := outbox.spool.generationID != ""
+	if refreshInventory {
+		outbox.recoveryWG.Add(1)
+	}
 	outbox.recoveryMu.Unlock()
 
+	if refreshInventory {
+		go func() {
+			defer outbox.recoveryWG.Done()
+			outbox.runGenerationInventoryRefresh(recoveryContext, client)
+		}()
+	}
 	go func() {
 		defer outbox.recoveryWG.Done()
 		type recoveryResult struct {
@@ -348,6 +359,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 		// liveRecheckAt is when recovery looks again at a due retry it left
 		// because the attempt was live, in case the attempt is released
 		// without a wake; liveWaits counts the passes in a row that left one.
+		var cohortRecheckAt time.Time
 		var liveRecheckAt time.Time
 		var liveWaits int
 		var retryTimer Timer
@@ -372,6 +384,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 				consider(deadline)
 			}
 			consider(liveRecheckAt)
+			consider(cohortRecheckAt)
 			if retryTimer != nil {
 				stopTimer(retryTimer)
 				retryTimer = nil
@@ -390,6 +403,13 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 		var launchPending func()
 		launchPending = func() {
 			now := outbox.clock.Now()
+			if outbox.spool.generationID != "" {
+				// Another process's closure/custody does not wake this local
+				// channel. Even an idle primary must discover its backlog.
+				cohortRecheckAt = now.Add(generationInventoryRefreshInterval)
+			}
+			// Replay uses local ownership and the durable closure cache. The
+			// independent inventory loop must never hold up eligible evidence.
 			outbox.sweepDeadOneShotSpool(recoveryContext, now, report)
 			if !scanRetryAt.IsZero() && now.Before(scanRetryAt) {
 				armRetry(now)
@@ -444,7 +464,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 				outbox.recoveryWG.Add(1)
 				go func(attempt logSpoolAttempt) {
 					defer outbox.recoveryWG.Done()
-					result := recoveryResult{attemptID: attempt.attemptID, err: outbox.recoverAttempt(recoveryContext, client, attempt)}
+					result := recoveryResult{attemptID: attempt.attemptID, err: outbox.recoverOwnedAttempt(recoveryContext, client, attempt)}
 					if outbox.recoveryAttemptFinished != nil {
 						outbox.recoveryAttemptFinished(attempt.attemptID)
 					}

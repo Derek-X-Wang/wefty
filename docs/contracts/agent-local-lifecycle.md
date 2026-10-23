@@ -25,9 +25,9 @@ The first SIGINT or SIGTERM starts a graceful drain. The 30-second bound
 applies to the drain request to L1, which moves the node to `draining`; the
 agent stops claiming, interrupts Restartable process one-shots, and waits for
 the other resident attempts to finish. Waiting for those other attempts is
-bounded only by each attempt's own max runtime. Until the process exits its
-node lock is held, so a replacement agent for the same stable node ID is
-refused. A second signal is an explicit forced-shutdown transition: it cancels
+bounded only by each attempt's own max runtime. Until a legacy process exits its
+exclusive node lock is held, so another legacy agent for that stable Node is
+refused. Enrolled generations use the cohort ownership rules below. A second signal is an explicit forced-shutdown transition: it cancels
 resident attempts immediately. While Drain is joining residents it emits
 `forced_shutdown transition=draining_to_forced reason=second_signal`; after
 Drain returns it emits
@@ -54,7 +54,8 @@ from both, with slack.
 `agent.Config.AgentGenerationID`. An empty identity keeps the legacy session
 path. The flag alone does not advertise `upgrade:retirement:v1`, allocate an
 identity, change installation locks, or enable installed rolling upgrades.
-Activation and shared storage remain #1176–#1179 integrations.
+Shared storage ownership is built in #1176 below. Installed activation sequencing
+remains #1179 integration.
 
 The dedicated trigger is L1's authenticated generation inventory after its
 fenced promotion transaction. The existing serialized heartbeat loop reads
@@ -101,7 +102,8 @@ bounded outbox receipt retention. Sealed incomplete or undelivered evidence
 keeps retirement pending unless permitted durable custody is acknowledged.
 Pending evidence keeps it alive. `Config.RetirementEvidenceSettled` is
 the #1176 integration seam, with exact pending Attempt identities, for an exact
-durable custody proof when local publication is incomplete. When configured, it
+durable custody proof when log/completion delivery is incomplete. Mailbox and
+result publication must already have settled under their own rules. When configured, it
 always checks closure and may also veto it for other owned evidence. It cannot
 replace runtime reap or the L1 closure
 prerequisite. `POST /generations/{id}/close` carries the original boot, promotion
@@ -1520,3 +1522,108 @@ Cancellation wins.
 The interruption fields survive completion spool replay unchanged. After Lease
 loss L1 recovers through the persisted restart backoff rather than inventing
 shutdown evidence.
+
+## Shared local evidence across Node agent generations (#1176)
+
+The ownership rule is exclusion before inspection or mutation. A live producer
+owns its records before creating them, and collection cannot infer abandonment
+from absence in its own process map. There is one primary and any number of
+retiring generations; no age or generation-count limit permits collection.
+
+Legacy agents retain the exclusive stable-Node process lock. Enrolled agents
+hold that same cohort lock shared and one exclusive generation lifetime lock.
+Installed startup takes the generation-directory lock through
+`Store.StartupWithLifetime` before readiness or shared runtime initialization.
+It supplies `GenerationLifetime.ClaimRuntime` as `Config.GenerationLifetimeLock`:
+this validates the Node/generation and permits exactly one runtime to borrow the
+already-held lock, without opening another descriptor or taking another
+per-generation lock in the spool directory. Startup keeps the lock until the
+runtime stops. Readiness independently checks that same held directory lock
+and the kernel process-start identity. Standalone enrolled library
+configurations with no installed ownership proof take their generation lock in
+the spool directory.
+The executable requires an installation catalog whenever a generation ID is
+supplied, so installed processes cannot bypass the directory lifetime lock.
+This permits overlap, excludes duplicate generation processes, and prevents a
+legacy agent from opening an enrolled cohort's shared state. Ownership is taken
+before managed-root activation, not just before opening the spool. Installed
+startup additionally runs shared-root activation through
+`Config.PrimaryGeneration`, supplied by `agentinstall.Store.WithPrimary`. Its
+catalog lock excludes staged/retiring identities and unresolved promotions from
+Node-wide local writes. L1 remains the authority for Node registration and
+capability observations. Only the primary can publish them; the installed
+primary fence also encloses each durable capability-floor write, so a retiree's
+late probe or response cannot overwrite the successor's floor. These locks do
+not grant claims or execution authority.
+
+Each spool Attempt has an immutable `owner_generation`, established with its
+Job/Attempt/fence before the first output. Legacy rows carry the empty owner.
+Recovery and sweep select only the calling generation's rows or generations
+positively observed `closed` in authenticated L1 inventory. Missing entries,
+missing PIDs, local clocks and local ownership maps never establish closure.
+Read-only `PendingEvidence` inspection counts the whole cohort and reads old
+spool schemas without migration. It supplies no recovery ownership. Legacy
+recovery continues to read legacy rows. Enrolled processes leave legacy
+rows protected; conversion/reboot reconciliation must positively settle that
+legacy boot before changing ownership. Startup schema/backfill work is
+serialized, while SQLite transactions apply the existing one-shot byte budget
+once over all generations. They refuse excess output instead of evicting it.
+Recovery additionally holds a shared-store per-Attempt process lock, so two
+collectors cannot concurrently deliver the same closed-generation backlog. An
+enrolled recovery loop scans the local cohort every five seconds even when
+idle; another process's custody writes cannot wake its process-local channel.
+A separate inventory loop permits one request at a time, bounds it by the
+normal operation timeout, and waits five seconds after each completed or failed
+refresh before trying again. Recovery wakes and worker completions do not poll
+inventory. A successful refresh wakes local recovery; a pending or failed
+refresh never delays own-generation or durably known-closed evidence. Unknown
+owners remain protected until positive closure is cached. Shutdown cancels and
+joins both loops before closing the shared spool.
+
+Handoff admission holds an exclusive node-local record lock from before
+preparation through execution, mailbox publication, result upload, capture
+cleanup and finish. The existing process-local lease now also holds a stable
+cross-process lock under the agent-private state root. Startup adoption,
+expiry and budget eviction take that same lock without waiting; an owned
+record is left intact, including an admission with no terminal deadline.
+Lock files are never unlinked while the store is in use. No workload-writable
+marker grants this ownership. Result accounting still reads the complete shared
+record root and counts every generation's in-flight and retained bytes once.
+Node-wide expiry/budget passes share a collection lock, so two generations do
+not independently evict from the same old budget measurement. Attempt-scoped
+mailbox/capture cleanup stays under its handoff lease; it never scans another
+generation's open mailbox. Crash residue keeps today's recovery rules; this
+does not add process adoption, SIGKILL or reboot survival.
+
+An enrolled successor durably declares support for evidence custody when it
+opens this shared store. After every resident runtime is positively reaped,
+the default `RetirementEvidenceSettled` implementation can acknowledge pending
+logs/completion bytes to that declared primary custodian. Publication must
+already be settled under its existing rules: the lifecycle records this only
+after mailbox/result publication succeeds, independently of spool delivery.
+Late appends and live producers block custody. A FULL-synchronous transaction
+records the exact resident identity, source and custodian generations, a SHA-256
+digest of the stored completion/incomplete evidence and ordered log events, and
+the acknowledgment time. The bytes stay in the same durable SQLite store;
+receipt publication does not delete them or create a receipt without bytes.
+Custody rows are excluded from destructive spool sweep.
+`Agent.EvidenceCustodyReceipts` returns the exact stored identities and digests
+for installation proof; an empty receipt list does not prove reap or delivery.
+
+Custody supplies storage only. The target cannot recover a live source's rows,
+even after acknowledgment. L1 independently requires accepted completion or an
+authoritatively ended Lease before closing the source generation. Until then
+the retiree retains its normal E authority, renewal and first-delivery loop.
+Only after positive L1 closure can a successor deliver the stored bytes through
+existing historical O / accepted-identical-replay R predicates. No first
+completion authority, Lease renewal, mailbox entitlement or verdict transfers.
+No declared custodian, failed durable commit, pending publication or unknown
+closure keeps retirement pending. An explicit `RetirementEvidenceSettled`
+callback remains the integration seam for additional evidence and may veto
+closure; it cannot weaken runtime reap or L1's closure checks.
+
+The tests use temporary roots, real process one-shots and plain Fabric. They
+cover two and three concurrent stores, three running agent generations and two
+promotions, Node/floor publication fencing, aggregate budgets, historical custody
+replay and the legacy lock/spool path. Installed launchd survival remains #1182
+acceptance; services, activation sequencing and rollback remain #1178–#1180.
