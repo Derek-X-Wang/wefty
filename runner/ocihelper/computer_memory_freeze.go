@@ -12,6 +12,10 @@ const (
 	computerMemoryFreezeTimeout = 2 * time.Second
 	computerMemoryThawBudget    = 500 * time.Millisecond
 	computerMemoryThawAttempts  = 3
+	// Reserve 1/64 of a default 1 GiB Seat for kernel/socket charges that can
+	// arrive while userspace is frozen. This is a fixed engineering allowance,
+	// not a measured upper bound on those charges.
+	computerMemoryShrinkMarginBytes int64 = 16 << 20
 )
 
 type computerMemoryFreezerIO struct {
@@ -55,11 +59,11 @@ func waitComputerMemoryFrozen(ctx context.Context, clock Clock, deadline time.Ti
 		if err != nil {
 			return err
 		}
-		if !clock.Now().Before(deadline) {
-			return &SeatOperationRefusalError{Reason: SeatRefusalMemoryBusy}
-		}
 		if frozen == want {
 			return nil
+		}
+		if !clock.Now().Before(deadline) {
+			return &SeatOperationRefusalError{Reason: SeatRefusalMemoryBusy}
 		}
 		next := clock.Now().Add(10 * time.Millisecond)
 		if next.After(deadline) {
@@ -205,7 +209,10 @@ func (g *computerMemoryFreezeGuard) finish() error {
 	return g.thawErr
 }
 
-type computerMemoryShrinkResult struct{ limit, usage int64 }
+type computerMemoryShrinkResult struct {
+	limit, usage int64
+	held         bool
+}
 
 func shrinkComputerMemory(ctx context.Context, clock Clock, io computerMemoryFreezerIO, readUsage func() (int64, error), readLimit func() (int64, error), writeLimit func(int64) error, target int64) (result computerMemoryShrinkResult, err error) {
 	guard, err := startComputerMemoryFreeze(ctx, clock, io)
@@ -227,8 +234,9 @@ func shrinkComputerMemory(ctx context.Context, clock Clock, io computerMemoryFre
 	if result.usage < 0 {
 		return result, errors.New("negative memory usage")
 	}
+	result.held = target < computerMemoryShrinkMarginBytes || result.usage > target-computerMemoryShrinkMarginBytes
 	var writeErr error
-	if result.usage <= target {
+	if !result.held {
 		writeErr = guard.writeLimit(func() error { return writeLimit(target) })
 	}
 	if err = guard.check(); err != nil {
@@ -241,7 +249,7 @@ func shrinkComputerMemory(ctx context.Context, clock Clock, io computerMemoryFre
 	if err = guard.check(); err != nil {
 		return result, err
 	}
-	if result.usage <= target && result.limit != target {
+	if !result.held && result.limit != target {
 		return result, errors.New("memory shrink could not be confirmed; room remains held")
 	}
 	// Exact readback is authoritative even if the write reported an error.

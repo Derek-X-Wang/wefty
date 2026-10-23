@@ -154,7 +154,7 @@ func changeComputerMemoryLimit(ctx context.Context, request SetComputerMemoryLim
 			}
 			actual = result.limit
 			response.MemoryCurrentBytes = result.usage
-			if result.usage > target {
+			if result.held {
 				response.HeldMemoryBytes = old - target
 				response.Reason = "memory_in_use"
 			} else {

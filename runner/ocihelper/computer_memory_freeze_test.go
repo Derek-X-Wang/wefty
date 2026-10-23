@@ -66,6 +66,18 @@ func TestComputerMemoryReworkFinalThawFailureIsTyped(t *testing.T) {
 		t.Fatalf("lost possible-frozen evidence: %v writes=%d", err, f.thawWrites)
 	}
 }
+func TestComputerMemoryLateThawConfirmsObservedState(t *testing.T) {
+	clock := newManualClock(time.Unix(1234, 0))
+	deadline := clock.Now().Add(2 * time.Second)
+	clock.Advance(3 * time.Second)
+	f := &memoryFreezerFixture{frozen: true}
+	if err := thawComputerMemory(clock, deadline, f.io()); err != nil {
+		t.Fatalf("confirmed late thaw reported failure: %v", err)
+	}
+	if f.frozen || f.thawWrites != 1 || len(f.logs) != 0 {
+		t.Fatalf("late thaw: frozen=%t writes=%d logs=%v", f.frozen, f.thawWrites, f.logs)
+	}
+}
 func TestComputerMemoryReworkDeadlineThawsWhileShrinkReadIsBlocked(t *testing.T) {
 	clock := newManualClock(time.Unix(1234, 0))
 	started := clock.Now()

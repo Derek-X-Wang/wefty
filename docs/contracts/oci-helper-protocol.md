@@ -2577,7 +2577,12 @@ checks its cgroup membership against the attempt's resource identity, and pins
 the cgroup-v2 directory for limit, use, and freezer I/O. It samples usage before
 freezing. If use already exceeds the target, it returns held with no freeze.
 Otherwise only a shrink enters the frozen span: confirm frozen state, resample
-use, write the limit if it still fits, read back, and thaw. No containerd call,
+use, write the limit only if use is at most the target minus 16 MiB, read back,
+and thaw. The fixed 16 MiB allowance is 1/64 of the default 1 GiB Seat: a modest
+buffer for asynchronous kernel/socket charges that can arrive while userspace
+is frozen, not a measured upper bound on those charges. A frozen sample within
+that margin returns `memory_in_use`, preserving the old limit, reservation,
+and cleanup proofs for a later retry. No containerd call,
 probe, or authority status read occurs inside that span. Live attempt status
 is checked before freezing and again after confirmed thaw, before publication.
 
@@ -2590,7 +2595,12 @@ up to three thaw attempts, each requiring both `cgroup.freeze=0` and a current
 thaw. All cgroup file I/O uses nonblocking descriptors; the write and thaw are
 serialized, so the watchdog cannot thaw between the deadline check and the
 single nonblocking limit write. A slow-to-freeze or expired shrink that thaws
-successfully is recoverable `memory_busy`. Request cancellation also triggers
+successfully is recoverable `memory_busy`. Expiry at the 1.5-second check may
+follow an applied limit write: the kernel limit may already be lower while
+the old reservation stays held. The next call reconciles it after exact
+readback. Thaw confirmation checks the observed state before the deadline;
+an already confirmed thaw succeeds even when observed after the deadline.
+Request cancellation also triggers
 thaw; cleanup does not inherit the cancelled request context.
 
 An existing freeze belongs to the helper. Every resize, including a grow or a
@@ -2614,7 +2624,7 @@ Known caller obligations and fail-safe limits:
 
 - The reservation is per Job, while the limit is per Attempt cgroup; overlapping Attempts and replacement admission after a grow require #1142's fencing.
 - Cleanup proof is not tied to bytes; with `memory.oom.group=1`, #1143 must pass the true final target for the remaining Seats.
-- A partial shrink consumes every cleanup proof, and reusing a place erases an unreturned proof; both fail safe because room stays held.
+- A partial shrink consumes every cleanup proof, and reusing a place erases an unreturned proof. Reconciling an earlier uncertain shrink can also consume a newer cleanup proof. All fail safe because room stays held.
 
 **Fixed tmpfs choice:** the helper preserves the creation-time ceilings of all
 six memory-backed mounts, including `/tmp`, `/var/tmp`, `/dev/shm`, and

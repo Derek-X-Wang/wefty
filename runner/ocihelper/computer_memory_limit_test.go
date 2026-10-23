@@ -128,6 +128,29 @@ func TestComputerMemoryLimitGrowShrinkAndHeldRoom(t *testing.T) {
 		t.Fatalf("replay: %+v %v", r, err)
 	}
 }
+func TestComputerMemoryLimitShrinkRetainsKernelChargeMargin(t *testing.T) {
+	s, f, reserved, clock := memoryLimitFixture(t)
+	*reserved, f.limit = 2<<30, 2<<30
+	call := func() (SetComputerMemoryLimitResponse, error) {
+		return changeComputerMemoryLimit(t.Context(), SetComputerMemoryLimitRequest{MemoryBytes: 1 << 30, Generation: s.generation}, s, 233<<20, reserved, 2<<30, f, clock, func() error { return nil })
+	}
+	for _, usage := range []int64{1 << 30, (1 << 30) - (8 << 20), (1 << 30) - (16 << 20) + 1} {
+		f.usage = usage
+		r, err := call()
+		if err != nil || r.Reason != "memory_in_use" || r.HeldMemoryBytes != 1<<30 || r.MemoryCurrentBytes != usage || r.MemoryLimitBytes != 2<<30 || r.ReservedMemoryBytes != 2<<30 {
+			t.Fatalf("usage %d lost held-room evidence: %+v err=%v", usage, r, err)
+		}
+		if *reserved != 2<<30 || f.limit != 2<<30 || len(f.writes) != 0 || f.frozen || s.entries[1].memoryReturned {
+			t.Fatalf("usage %d consumed limit, room, or cleanup: reserved=%d limit=%d writes=%v frozen=%t returned=%t", usage, *reserved, f.limit, f.writes, f.frozen, s.entries[1].memoryReturned)
+		}
+	}
+	// The exact 16 MiB boundary fits and may reuse the held cleanup proof.
+	f.usage = (1 << 30) - (16 << 20)
+	r, err := call()
+	if err != nil || r.Reason != "" || r.HeldMemoryBytes != 0 || r.MemoryLimitBytes != 1<<30 || r.ReservedMemoryBytes != 1<<30 || *reserved != 1<<30 || f.limit != 1<<30 || len(f.writes) != 1 || f.frozen || !s.entries[1].memoryReturned {
+		t.Fatalf("safe retry: %+v err=%v reserved=%d limit=%d writes=%v frozen=%t returned=%t", r, err, *reserved, f.limit, f.writes, f.frozen, s.entries[1].memoryReturned)
+	}
+}
 func TestComputerMemoryLimitRefusalsPreserveLimitAndRoom(t *testing.T) {
 	for _, tc := range []struct {
 		name, reason string
