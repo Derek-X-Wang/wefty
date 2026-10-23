@@ -288,6 +288,9 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return upgradeReport{}, errors.New("upgrade requires setup's plain-process node and matching connection profile")
 	}
 	operations := upgradeOperations(host)
+	defer func() {
+		resultErr = upgradeDrainRunHint(ctx, operations, profile, resultErr)
+	}()
 	if err := recoverUpgradeDrain(ctx, operations, paths, profile, warnings); err != nil {
 		return result, err
 	}

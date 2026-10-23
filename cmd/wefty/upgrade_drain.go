@@ -26,6 +26,7 @@ const (
 	upgradeDrainTimeout        = 5 * time.Minute
 	upgradeDrainPoll           = 5 * time.Second
 	upgradeDrainRecoveryBudget = 10 * time.Second
+	upgradeDrainJobReadBudget  = 2 * time.Second
 	upgradeMutationBudget      = 5 * time.Second
 	upgradeDrainMinimum        = 10 * time.Second
 	upgradeIntentMargin        = 30 * time.Minute
@@ -418,7 +419,8 @@ func checkUpgradeReplacement(node l1.Node, receipt *upgradeDrainReceipt, yes boo
 
 type upgradeDrainTimeoutError struct {
 	apiResponseError
-	hint string
+	blockingJobs []string
+	hint         string
 }
 
 func (e *upgradeDrainTimeoutError) Unwrap() error { return &e.apiResponseError }
@@ -428,6 +430,13 @@ func (e *upgradeDrainTimeoutError) setRetryable(claimsOpen bool) {
 	e.APIError.Message = "drain timed out; installed stack unchanged"
 	if claimsOpen {
 		e.APIError.Message += e.hint
+	}
+}
+
+func (e *upgradeDrainTimeoutError) setHint(blockers []string) {
+	e.hint = "; try again when the running one-shots finish"
+	if len(blockers) > 0 {
+		e.hint += " (blocked by: " + strings.Join(blockers, ", ") + ")"
 	}
 }
 
@@ -446,13 +455,34 @@ func upgradeDrainTimedOut(claimsOpen bool, attempts []l1.NodeActiveAttempt) *upg
 	}
 	err := &upgradeDrainTimeoutError{
 		apiResponseError: apiResponseError{APIError: contract.APIError{Code: contract.ErrorConflict}},
-		hint:             "; try again when the running one-shots finish",
+		blockingJobs:     jobs,
 	}
-	if len(jobs) > 0 {
-		err.hint += " (jobs: " + strings.Join(jobs, ", ") + ")"
-	}
+	err.setHint(jobs)
 	err.setRetryable(claimsOpen)
 	return err
+}
+
+// Resolve only the final retryable error, after intent restoration. The drain
+// deadline has passed, so each best-effort read gets an independent budget.
+func upgradeDrainRunHint(ctx context.Context, op upgradeHost, profile connprofile.Profile, result error) error {
+	var timeout *upgradeDrainTimeoutError
+	if !errors.As(result, &timeout) || !timeout.APIError.Retryable {
+		return result
+	}
+	blockers := slices.Clone(timeout.blockingJobs)
+	for i, jobID := range timeout.blockingJobs {
+		probe, cancel := context.WithTimeout(context.WithoutCancel(ctx), upgradeDrainJobReadBudget)
+		job, err := op.readJob(probe, profile, jobID)
+		cancel()
+		if err == nil {
+			if runID := strings.TrimSpace(job.Spec.Labels[contract.LabelRunID]); runID != "" {
+				blockers[i] = runID + " (" + jobID + ")"
+			}
+		}
+	}
+	timeout.setHint(blockers)
+	timeout.setRetryable(true)
+	return result
 }
 
 // Post-disable timeouts become retryable only after cleanup confirms open claims.
