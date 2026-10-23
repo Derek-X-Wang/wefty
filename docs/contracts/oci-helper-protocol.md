@@ -207,13 +207,17 @@ of JSON. Handshake and initial request reads have deadlines, the helper caps
 concurrent connections, and a decoder never reads beyond one frame.
 
 The connection cap is 64 slots, shared by the control connection and every
-request connection. Long-lived data streams -- `DialAttemptPort` and
+request connection. Long-lived data streams -- `ExecComputerSeat`, `DialAttemptPort` and
 `DialHostBridge`, which hold their connection for the life of one proxied
 service client, one take-over view or control leg, or one Computer bridge
 pump -- may hold at most the cap minus a control reserve of 8, so 56. The
 control connection, each live attempt's `Watch`, and control RPCs such as
 `Signal`, `Delete`, and `Run` always keep the remaining 8 however busy a
-published service is. A data stream over its budget is refused after session
+published service is. Seat commands have additional caps: two streams per
+Seat place, four per exact attempt, and sixteen globally (or half the data
+budget when configured smaller). Thus exec can use at most sixteen of the
+default 56 data slots, leaving forty for screens and other endpoint traffic.
+A data stream over its budget is refused after session
 authorization with `connection_limit`. A connection accepted while all 64
 slots are taken has its peer credentials read on the accept loop, which is one
 non-blocking socket option. A peer outside the UID allowlist is closed at once
@@ -741,6 +745,7 @@ heartbeats.
 | `SetComputerToken` | Exact live Computer-attempt authority plus the opaque bearer and matching attempt bridge endpoint enter. A non-empty pair is atomically installed as attempt-local `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`, both mode 0400 and tenant-owned; an empty pair removes both. A partial pair, ordinary, stale, old-boot, or reaped attempt is refused. |
 | `ApplyComputerSeats` | Exact live Computer-attempt authority and the complete wanted place list enter. The helper atomically publishes a rising directive generation and refuses in-place changes or reuse before positive cleanup. See [Per-Seat directives and observations](#per-seat-directives-and-observations). |
 | `ObserveComputerSeats` | Exact live Computer-attempt authority and current directive generation enter. Returns per-place readiness, failure reason, or final cleanup evidence. Probes do not hold owner-control or lifecycle locks. See [Per-Seat directives and observations](#per-seat-directives-and-observations). |
+| `ExecComputerSeat` | Exact live Computer-attempt authority, current directive generation, ready place, argv and positive runtime enter. Streams bounded stdout/stderr and exact exit code or signal; connection cancellation stops only this command. See [Commands inside a ready Seat](#commands-inside-a-ready-seat). |
 | `ListRunMailbox` | Exact live attempt plus the exact handoff owner key and run ID that attempt's own `Run` declared; an attempt that declared no mailbox, or that names another run's volume or another run inside its own, is refused before any engine is reached. Returns at most 4096 entry names from the scope's directory and says when the listing reached that cap. It never enumerates anything else and never creates a missing directory. |
 | `ReadRunMailbox` | In the `events` scope, the same exact live-attempt, handoff-owner and declared mailbox run-ID authority as `ListRunMailbox`, plus one bounded entry name. In the `handoff_files` scope, only the exact live attempt and its admitted handoff owner are required: `run_id` may be omitted, and no run-mailbox seed, L3 configuration or run token is needed. A supplied run ID must still match the declared mailbox. A wrong owner, stale authority or a reaped attempt is refused before the engine is reached. Returns at most 64 KiB of one regular file in the `events` scope and at most 640 KiB in the `handoff_files` scope, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file, or that changed identity while being opened, comes back as a positive `unusable` classification in the response rather than as an error, because only that answer lets the caller delete an entry: a transport or authority failure is an error and must never read as junk. An entry that is not there at all comes back as `absent`, which is what an agent-opened directory reports for a missing name, so both implementations of the read answer alike. |
 | `InventoryHandoffVolumes` | Session-authorized, and deliberately not attempt-authorized: it spans every handoff volume this node still holds, and the attempts that produced them are long gone, so no attempt's fence could stand for them. The request carries a page cursor and nothing else, and cannot carry attempt authority -- a body that attaches one is refused as an unknown field; a cursor longer than one fixed scan identity, separator and volume name is refused as an invalid request. It returns, for each volume, the deterministic directory name, the terminal time and whether that came from a helper-owned receipt, logical, deduped and **charged** bytes, entry count, whether a live attempt is still writing there, whether the byte and entry figures are a floor rather than a measurement, and a bounded set of per-volume anomaly tokens from a closed vocabulary. Charged bytes are the node-budget unit and cross the wire rather than being derived on the agent's side: every entry contributes the larger of its deduplicated logical bytes and 4 KiB, which is the identical rule the agent applies to its own handoff root, and no function of a volume total and an entry count reproduces a per-entry floor. **It is a page of one scan, and the pages of one listing are one consistent view.** A request with no cursor runs the prologue, reads the generation, enumerates and measures the whole root once under the existing entry, open and row budgets, then validates that the generation did not move before caching and serving the first page. A changed root is rescanned internally up to the fixed bound; exhausting it returns an incomplete scan. Every later page is cut from that one validated measurement. That is what makes two things true at once. A volume created behind the cursor cannot be shown by no call at all, because pages are not independently measured; and one `(device, inode)` map spans the whole root, so a file two volumes hard-link is charged once however far apart those volumes sort. Per-page dedup would have charged it once per page, and a budget that overstates a node gives up results it did not have to -- which is destructive, not merely inaccurate.
@@ -2302,3 +2307,204 @@ the desktop disappears but the tmpfs fixture leaks. The lane also requires the
 absence check to reject the live ready Seat, then accept it after removal,
 and verifies shared-file survival. This is helper-operation evidence; fixture task creation does
 not claim helper Run admission or L1 lifecycle coverage.
+
+## Commands inside a ready Seat
+
+`ExecComputerSeat` is a private session-authorized operation. It requires the
+complete live Computer `authority`, a current directive `generation`, `place`
+1–4, `args` (an argv array), and positive `max_runtime` (nanoseconds, as for
+other Go duration fields). The caller supplies the configured time limit; its
+1-hour default and Run records belong to the node agent/CLI follow-up. Zero
+never disables the limit. There is no stdin or terminal in this operation.
+Unknown fields are rejected. In particular, the wire accepts no environment,
+user, supplementary groups, working directory, executable host path or general
+containerd operation. Argv is limited to 4096 entries and 128 KiB including
+terminators; NUL bytes and an empty executable are refused as `invalid_request`.
+
+The helper authorizes the exact attempt and checks that it is an admitted
+Computer, is running, and has a wanted, ready Seat in that directive generation.
+A starting, failed, removing, cleaned or unknown place is refused with
+`seat_operation_refused`, detail `seat_not_ready`. An old or unknown generation
+gets detail `generation_mismatch`. These are request refusals; retry after the
+Seat list/readiness has been reconciled. They do not mean the helper session
+broke. Existing session/fence refusals and `sweep_required` still apply.
+Unavailable exec engines return `unsupported_operation`; inability to confirm
+runtime mechanics returns `diagnostic_failure`, never node-wide runtime-loss
+proof. The current image ready answer is reread through the strict status
+reader before exec, so a missing, stale or failed answer cannot reuse an old
+ready observation.
+
+The operation uses `task.Exec` on the exact running task. It uses uid/gid
+`2000+place`, no supplementary groups, no Linux capabilities, and
+`no_new_privileges`. Its cwd is `/wefty/service/seats/<place>`. Environment is a
+fresh allowlist; no helper, node agent, caller-shell, image, or other-Seat
+variables are copied:
+
+| Variable | Value |
+|---|---|
+| `PATH`, `LANG` | `/usr/local/bin:/usr/bin:/bin`, `C.UTF-8` |
+| `USER`, `LOGNAME` | `seat<place>` |
+| `SEAT_ID`, `SEAT_DIR` | decimal place, `/wefty/service/seats/<place>` |
+| `HOME` | `$SEAT_DIR/home` |
+| `DISPLAY`, `XAUTHORITY` | `:<place>`, `$SEAT_DIR/.Xauthority` |
+| `XDG_RUNTIME_DIR`, `TMPDIR` | `$SEAT_DIR/run`, `$SEAT_DIR/tmp` |
+| `XDG_CACHE_HOME`, `XDG_CONFIG_HOME` | `$HOME/.cache`, `$HOME/.config` |
+| `PLAYWRIGHT_BROWSERS_PATH` | `$HOME/.cache/ms-playwright` |
+| `npm_config_cache`, `PIP_CACHE_DIR` | `$HOME/.cache/npm`, `$HOME/.cache/pip` |
+
+The X cookie stays in the Seat's file. It is neither copied into the protocol
+nor read from another Seat's environment. The OCI spec is fresh, rather than
+inheriting the root supervisor's environment or process privileges. Preparation
+and start serialize with Seat directives using `seatsMu`; running and streaming
+do not hold it. Probes, runtime calls and commands hold neither `attempt.mu`
+nor `attempt.controlMu`. Attempt authority is rechecked before publishing
+post-start output. Exec preparation, wait registration and Start have a
+separate ten-second start deadline, even when `max_runtime` is an hour. The
+running wait retains its own operation lifetime. Failed-start cleanup releases
+`seatsMu` before waiting for runtime cleanup.
+
+Exec admission is non-queued and scoped by exact attempt plus place, across
+Seat directive generations. It allows two active streams per Seat, four per
+attempt, and sixteen helper-wide; for smaller configured data budgets the
+global cap is half that budget. Refusals use `connection_limit` with detail
+`seat_command_limit`, `attempt_command_limit`, or `command_stream_limit`.
+Counters are released when the operation ends, including disconnect and failed
+start. Background discard readers hold no helper stream or connection slot.
+
+### Output, exit and cancellation
+
+After the usual request frame, zero or more successful framed response bodies
+have exactly one of these shapes (`data` is JSON base64 for binary-safe bytes):
+
+```json
+{"stream":"stdout","data":"b3V0Cg=="}
+{"stream":"stderr","data":"ZXJyCg=="}
+{"exit":{"code":23}}
+{"exit":{"signal":15}}
+```
+
+Successful completion requires exactly one exit event, then the empty success frame.
+`code` includes zero and means a normal exit; `signal` is the positive Unix
+signal number and excludes `code`. Events after exit, contradictory exit fields,
+missing exit, unknown fields or malformed output are errors. A nonzero command
+exit is a successful mechanics operation carrying that exit status. There are
+no event acknowledgements. The thin client delivers events synchronously and
+checks the terminal event; its callback must return promptly.
+
+Each output event contains at most 4096 decoded bytes. Each internal newline
+JSON record is at most 8192 bytes; the outer protocol frame bound also applies.
+Two bounded kernel pipes, fixed-sized reads, two bounded record decoders and
+synchronous writes provide backpressure. No output queue, full-output retention
+or Run log is allocated by the helper. At command exit the wrapper snapshots
+the queued Run tail and drains exactly that tail. Later background writes are
+not part of the finished Run. If writers remain, it forks a small Seat-uid
+discard reader with the same bounded 4096-byte reads. The reader closes all
+containerd stdio descriptors immediately after fork, before session or poller
+setup, then creates its own poller and drains until both pipes reach EOF. Its
+select blocks until data or EOF; an idle reader does not poll. Thus a plain
+`cmd &` that keeps logging gets neither SIGPIPE nor an extended Run lifetime.
+Its reader's memory stays bounded and Seat uid-wide cleanup stops both reader
+and writer. Exec streams remain subject to
+the data budget and the narrower command caps above.
+
+There is deliberately no separate per-Seat discard-reader count cap. There is
+at most one reader per completed command that still has pipe writers; it exits
+at EOF. Each reader has the Python interpreter's process memory cost, so total
+reader memory can grow with the number of background programs. A count cap
+that closes these pipes would break the promised background-writer survival,
+and the Seat uid can already fork processes itself. Readers remain inside the
+Computer's existing memory limit, hold no helper connection slots, and share
+the background programs' uid-wide Seat cleanup. This cleanup is the hard
+lifetime bound for both. It is not a per-Seat aggregate memory guarantee.
+
+After positive wrapper exit, containerd output draining has a separate
+five-second bound. If a same-uid program stops a reader before its first stdio
+redirect, retained writers cannot hold the helper operation indefinitely:
+expiry cancels the FIFO I/O and reports unconfirmed output cleanup. Containerd
+Delete has a separate five-second bound around the entire call, including its
+internal context-insensitive IO.Wait. A copy callback still in flight gets the
+same bounded whole-frame completion as at a runtime limit; final diagnostics
+serialize with it, and no callback can emit after the operation finishes.
+These failures remain operation-local `diagnostic_failure` results, without a
+runtime-limit detail.
+
+A runtime-limit stop is a typed final failure: `diagnostic_failure` with detail
+`runtime_limit` and message "Seat command reached its runtime limit". The CLI
+can combine this fact with the configured `max_runtime` to say, for example,
+"stopped: reached its 1h limit". A ten-second start deadline instead has detail
+`start_timeout`. Other wrapper, containerd, missing-exit, and
+unconfirmed-cleanup failures
+retain `diagnostic_failure` without either limit detail; a coincident limit
+cannot mask an independent mechanics failure. A launch failure reports
+command exit 127 for a missing executable (ENOENT/ENOTDIR), and 126 for an
+executable that cannot run, including permission denied.
+
+At a limit, no new output event starts. A frame already in flight has five
+seconds to finish, including its entire length-prefixed body, before the typed
+final frame is sent. If that bounded completion fails, the helper closes this
+operation and never appends another frame to its incomplete bytes. The thin
+client treats exec dial, request-write and response-transport errors as
+operation-local: they cannot call `markLost` or produce `RuntimeLossError`.
+Independent control/heartbeat authority continues to detect real session loss;
+a positive typed `session_stale` refusal still means the session is stale.
+
+Cancel is closing this operation's connection. Client context cancellation,
+callback error, EOF and `max_runtime` stop this command. The helper sends TERM
+to the exec wrapper, which sends SIGTERM to the command's process group, gives
+it a five-second grace for cleanup, then sends SIGKILL to remaining group
+members and waits for the leader. The full grace is intentional even if the
+leader exits early: descendants retain their cleanup time, and the unreaped
+leader pins the group identity. On Darwin, a group containing only a zombie
+leader may refuse the signal with EPERM. The wrapper accepts that refusal only
+after confirming that the leader exited. If this check reaps it, the wrapper
+never signals that potentially recycled group ID again. Permission failures
+with a live leader remain errors. It never uses task-wide or uid-wide kill, or
+containerd `WithKillAll`. The helper gives the wrapper ten seconds to exit;
+if it must KILL the wrapper, it waits up to two more seconds for positive exit
+evidence before Delete. Unconfirmed running-exec exit never triggers Delete;
+an exec for which Start was never attempted is deleted directly, even if
+Status fails and no wait was registered. Containerd still checks its own
+deletion preconditions. A refused or timed-out Delete is reported as
+unconfirmed cleanup. Cleanup uses contexts independent of the vanished caller.
+
+**Held owner decision:** cancellation and the runtime limit still target the
+command's whole process group. A plain `&` program in that group receives TERM
+and KILL too. A program that creates a **new session**, conventionally with
+`setsid` and double-forking, or changes its process group, escapes command
+cancellation. The single `signal_command_group` function is the policy seam;
+this ticket does not settle which plain background programs a future cancel
+must preserve. A normal command end preserves logging background programs,
+whether or not they changed process group.
+
+The wrapper runs as the Seat uid. The command can SIGSTOP or SIGKILL it and
+thereby defeat cooperative process-tree cancellation. A forced wrapper kill is
+reported as unconfirmed tree cleanup. **Seat cleanup is the hard bound:** its
+uid-wide cleanup stops even detached programs and discard readers, and proves
+no remaining processes, sockets or folder. Cancel does not end the Seat or
+other commands on it.
+
+### Wrapper and image requirement
+
+The helper embeds a small Python wrapper and invokes `/usr/bin/python3 -I -S`
+inside the task as the Seat user. Every multi-Seat image must provide this
+executable and the standard library described in `computer-image.md`.
+`internal/computerconformance.CheckSeatCommandRuntime` runs that exact absolute
+path with isolated flags as a Seat user and fails with an explicit requirement
+message if it is missing or incompatible; `seat_command_python` is required
+in a passing Seat report. This is an image-contract requirement, not an
+assumption about the default image. We choose the in-image wrapper because it
+needs no helper-binary mount or extra executable lifecycle, and the default
+image already uses the same isolated interpreter for cleanup. Isolated mode
+and disabled site imports keep Seat-installed Python modules out of the wrapper.
+
+`TestHelperComputerSeatExecIM3`, built only with `computer_seat_lane`, runs in
+`default-computer-seats / linux/amd64` and `default-computer-seats / linux/arm64`.
+It uses the unchanged production profile and helper exec: uid/gid, no extra
+groups, cwd/home, `DISPLAY` and a working X cookie, the complete environment,
+stdout/stderr, exit code and signal, zero effective/bounding/ambient
+capabilities (ambient if present), `NoNewPrivs=1`, cancellation of a command
+tree while another command survives, double-fork survival, and a plain `&`
+writer that still prints ten seconds after command end. All surviving Seat
+processes must then disappear through positive Seat cleanup. Live-program
+checks reject zombie state `Z`, rather than accepting `kill(pid,0)` alone. Its JSON receipt records IM-3 and secondary CF-3 evidence. Local Mac
+unit tests and Linux cross-checks cannot establish these container outcomes.

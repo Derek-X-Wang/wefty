@@ -169,6 +169,19 @@ jobs:
             WEFTY_HELPER_SEAT_EVIDENCE="$RUNNER_TEMP/default-computer/$ARCH-helper-seats.json" \
             "$RUNNER_TEMP/helper-seats.test" -test.v \
             -test.run '^TestHelperComputerSeatsIM5$' -test.timeout 5m
+      - name: Prove IM-3 and secondary CF-3 through helper Seat commands
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          GOFLAGS=-p=1 GOMAXPROCS=2 go test -c -tags computer_seat_lane \
+            -o "$RUNNER_TEMP/helper-seat-exec.test" ./runner/ocihelper
+          sudo env PATH="/usr/local/bin:/usr/local/sbin:$PATH" \
+            WEFTY_SEAT_IMAGE="$WEFTY_SEAT_IMAGE" \
+            WEFTY_SEAT_CONTAINERD=/run/wefty-seat-containerd.sock \
+            WEFTY_HELPER_SEAT_EXEC_EVIDENCE="$RUNNER_TEMP/default-computer/$ARCH-helper-seat-exec.json" \
+            "$RUNNER_TEMP/helper-seat-exec.test" -test.v \
+            -test.run '^TestHelperComputerSeatExecIM3$' -test.timeout 5m
       - name: Make Seat evidence readable after every outcome
         if: always()
         run: |

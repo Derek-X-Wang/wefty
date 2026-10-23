@@ -75,6 +75,7 @@ func CheckSeats(e SeatEvidence) SeatReport {
 		{"seats.driver", []string{"driver_per_seat"}},
 		{"seats.deadline", []string{"deadline_per_seat"}},
 		{"seats.tools", []string{"tools_present"}},
+		{"seats.command-runtime", []string{"seat_command_python"}},
 		{"seats.profile", []string{"readonly_root", "profile_unmodified"}},
 	}
 	for _, row := range rows {
@@ -87,6 +88,9 @@ func CheckSeats(e SeatEvidence) SeatReport {
 			if observed && !value {
 				check.Status = StatusFail
 				check.Detail += name + " failed; "
+				if name == "seat_command_python" {
+					check.Detail += seatCommandRuntimeRequirement + "; "
+				}
 			}
 		}
 		if row.id == "IM-5" && e.Observations["memory_returns"] {

@@ -588,6 +588,43 @@ image's highest Seat limit. Their homes are
 refused as `passwd_entry_missing` before desktop startup. User creation stays
 in the read-only image; password age uses fixed non-zero day 20000.
 
+### Runtime required by every multi-Seat image
+
+Every multi-Seat image must provide executable `/usr/bin/python3`
+(Python 3.8 or newer), with the standard library modules `array`, `base64`,
+`errno`, `fcntl`, `json`, `os`, `selectors`, `signal`, `subprocess`, `sys`,
+`termios`, and `time`, including `os.set_blocking`, `os.setsid`, and
+`signal.pthread_sigmask`. It must run as each Seat uid with
+`-I -S`. This applies to custom multi-Seat images as well as the default image;
+it does not apply to generic OCI images or images without Seats.
+
+The helper uses an embedded, isolated Python wrapper for Seat commands. It
+runs inside the existing task, creates the command's process group, bounds
+output buffering, and keeps detached programs from holding a finished command's
+output open. Using the existing interpreter avoids mounting and managing a
+second helper-owned executable. No Seat-installed Python module is imported.
+See [the helper operation](oci-helper-protocol.md#commands-inside-a-ready-seat)
+for environment, stream and cancel semantics. A normal command end also
+preserves plain background writers that retain
+stdout/stderr. A bounded Seat-uid discard reader keeps those pipes readable
+without extending the Run or holding helper connection slots. The image's
+uid-wide cleanup ends both writer and reader. Idle readers use blocking
+select. Their count is not separately capped: closing a reader at a count limit
+would break background logging, and the Seat uid can already fork processes.
+Readers stay in the Computer's existing memory limit; aggregate per-Seat reader
+memory is not guaranteed. See the helper contract for the five-second output
+drain and deletion bounds. Process-group scope on cancel
+and runtime limit stays unchanged pending the owner decision documented at
+that helper seam.
+
+`CheckSeatCommandRuntime` in `internal/computerconformance` probes the exact
+absolute interpreter path and required imports with `-I -S` as a Seat user.
+A missing or incompatible interpreter is refused with the clear requirement
+message, before Seat exercises. The resulting `seat_command_python` observation
+is mandatory for a passing `seats.command-runtime` check: false is `FAIL`
+with the executable requirement in its detail, and missing evidence is
+`NOT-RUN`. The native two-architecture Seat lane records this probe.
+
 ### Directive, readiness and positive cleanup proof
 
 P5 binds the **directory** `/wefty/control` read-only. The helper atomically
