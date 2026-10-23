@@ -60,6 +60,9 @@ func TestDefaultComputerSeatsAtProductionTimings(t *testing.T) {
 	root := t.TempDir()
 	service := filepath.Join(root, "managed", "service")
 	h := startSeatComputer(t, ctx, client, image, root, service, kit)
+	runtimeErr := computerconformance.CheckSeatCommandRuntime(func(args ...string) error { return h.tryExec("2001:2001", args...) })
+	evidence.Observations["seat_command_python"] = runtimeErr == nil
+	seatMust(t, runtimeErr)
 	passwd := h.exec("0:0", "cat", "/etc/passwd")
 	evidence.Observations["passwd_entries"] = computerconformance.CheckSeatUsers([]byte(passwd)) == nil
 	evidence.Observations["profile_unmodified"] = h.profileUnmodified

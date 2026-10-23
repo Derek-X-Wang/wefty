@@ -49,7 +49,7 @@ func TestSeatEvidenceDetectsViewInputAndStaleRestartSeats(t *testing.T) {
 		"restart_processes_absent": true, "restart_folders_absent": true,
 		"restart_answers_absent": true, "passwd_entries": true, "missing_passwd_refused": true,
 		"driver_per_seat": true, "deadline_per_seat": true, "tools_present": true,
-		"readonly_root": true, "profile_unmodified": true,
+		"readonly_root": true, "profile_unmodified": true, "seat_command_python": true,
 	}, InstallBytes: 1, MemoryLimitBytes: 1 << 30, TmpfsCeilingBytes: 465 << 20, MemoryBeforeRemovalBytes: 512 << 20, MemoryAfterRemovalBytes: 256 << 20}
 	if r := CheckSeats(evidence); r.Status != StatusPass {
 		t.Fatalf("complete evidence: %+v", r)
