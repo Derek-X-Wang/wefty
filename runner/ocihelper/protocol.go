@@ -108,6 +108,7 @@ const (
 	// CodeDiagnosticFailure is a read-only observation failure. It is never
 	// evidence that the helper session or runtime authority was lost.
 	CodeDiagnosticFailure    ErrorCode = "diagnostic_failure"
+	CodeSeatOperationRefused ErrorCode = "seat_operation_refused"
 	CodeUnsupportedOperation ErrorCode = "unsupported_operation"
 	CodeSweepRequired        ErrorCode = "sweep_required"
 	// CodeHandoffVolumeLive refuses a handoff-volume deletion because an

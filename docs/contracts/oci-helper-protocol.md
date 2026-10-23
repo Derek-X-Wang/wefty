@@ -246,7 +246,7 @@ The closed wire error-code vocabulary is `invalid_request`,
 `attempt_outside_session`, `unauthorized_port`, `unauthorized_bridge`,
 `oci_spec_rejected`, `image_unavailable`, `insufficient_memory`,
 `insufficient_disk`, `engine_failure`, `diagnostic_failure`,
-`unsupported_operation`, `sweep_required`, `handoff_volume_live`,
+`seat_operation_refused`, `unsupported_operation`, `sweep_required`, `handoff_volume_live`,
 `startup_bound_tripped`, and `connection_limit`.
 `attempt_expired` appears only in successful heartbeat bodies as an
 attempt-scoped refusal, not as a top-level RPC error. Adding a code requires changing
@@ -739,6 +739,8 @@ heartbeats.
 | `DialHostBridge` | Bidirectional guest-to-host reverse-tunnel stream only when `Run` explicitly requested the bridge and the helper issued that attempt's separate capability. It is mandatory for Computers because their private network namespace cannot address the agent's Node-loopback listener directly; ordinary OCI uses it only for the Mac bind-failure fallback. It never accepts an arbitrary host address or port. |
 | `SetComputerControlState` | Exact live Computer-attempt authority and one boolean enter. The helper atomically replaces the attempt-local `/wefty/control/driver.json` body with the exact version-1 false or true document; ordinary, stale, old-boot, and reaped attempts are refused. |
 | `SetComputerToken` | Exact live Computer-attempt authority plus the opaque bearer and matching attempt bridge endpoint enter. A non-empty pair is atomically installed as attempt-local `/wefty/control/computer-token` and `/wefty/control/l3-endpoint`, both mode 0400 and tenant-owned; an empty pair removes both. A partial pair, ordinary, stale, old-boot, or reaped attempt is refused. |
+| `ApplyComputerSeats` | Exact live Computer-attempt authority and the complete wanted place list enter. The helper atomically publishes a rising directive generation and refuses in-place changes or reuse before positive cleanup. See [Per-Seat directives and observations](#per-seat-directives-and-observations). |
+| `ObserveComputerSeats` | Exact live Computer-attempt authority and current directive generation enter. Returns per-place readiness, failure reason, or final cleanup evidence. Probes do not hold owner-control or lifecycle locks. See [Per-Seat directives and observations](#per-seat-directives-and-observations). |
 | `ListRunMailbox` | Exact live attempt plus the exact handoff owner key and run ID that attempt's own `Run` declared; an attempt that declared no mailbox, or that names another run's volume or another run inside its own, is refused before any engine is reached. Returns at most 4096 entry names from the scope's directory and says when the listing reached that cap. It never enumerates anything else and never creates a missing directory. |
 | `ReadRunMailbox` | In the `events` scope, the same exact live-attempt, handoff-owner and declared mailbox run-ID authority as `ListRunMailbox`, plus one bounded entry name. In the `handoff_files` scope, only the exact live attempt and its admitted handoff owner are required: `run_id` may be omitted, and no run-mailbox seed, L3 configuration or run token is needed. A supplied run ID must still match the declared mailbox. A wrong owner, stale authority or a reaped attempt is refused before the engine is reached. Returns at most 64 KiB of one regular file in the `events` scope and at most 640 KiB in the `handoff_files` scope, truncated rather than refused, so a verdict is never lost to a large payload. An entry that is not a readable regular file, or that changed identity while being opened, comes back as a positive `unusable` classification in the response rather than as an error, because only that answer lets the caller delete an entry: a transport or authority failure is an error and must never read as junk. An entry that is not there at all comes back as `absent`, which is what an agent-opened directory reports for a missing name, so both implementations of the read answer alike. |
 | `InventoryHandoffVolumes` | Session-authorized, and deliberately not attempt-authorized: it spans every handoff volume this node still holds, and the attempts that produced them are long gone, so no attempt's fence could stand for them. The request carries a page cursor and nothing else, and cannot carry attempt authority -- a body that attaches one is refused as an unknown field; a cursor longer than one fixed scan identity, separator and volume name is refused as an invalid request. It returns, for each volume, the deterministic directory name, the terminal time and whether that came from a helper-owned receipt, logical, deduped and **charged** bytes, entry count, whether a live attempt is still writing there, whether the byte and entry figures are a floor rather than a measurement, and a bounded set of per-volume anomaly tokens from a closed vocabulary. Charged bytes are the node-budget unit and cross the wire rather than being derived on the agent's side: every entry contributes the larger of its deduplicated logical bytes and 4 KiB, which is the identical rule the agent applies to its own handoff root, and no function of a volume total and an entry count reproduces a per-entry floor. **It is a page of one scan, and the pages of one listing are one consistent view.** A request with no cursor runs the prologue, reads the generation, enumerates and measures the whole root once under the existing entry, open and row budgets, then validates that the generation did not move before caching and serving the first page. A changed root is rescanned internally up to the fixed bound; exhausting it returns an incomplete scan. Every later page is cut from that one validated measurement. That is what makes two things true at once. A volume created behind the cursor cannot be shown by no call at all, because pages are not independently measured; and one `(device, inode)` map spans the whole root, so a file two volumes hard-link is charged once however far apart those volumes sort. Per-page dedup would have charged it once per page, and a budget that overstates a node gives up results it did not have to -- which is destructive, not merely inaccurate.
@@ -2175,3 +2177,106 @@ waits for, and verifies deletion of a real task inside the ten-second probe
 deadline. The same probe runs through the existing startup and heartbeat
 capability refresh loop. Successful L1 renewals are mapped to the exact helper
 attempt tuple and queued on that session's heartbeat pump.
+
+## Per-Seat directives and observations
+
+`ApplyComputerSeats` and `ObserveComputerSeats` are private, session-authorized
+Computer operations. Both require the complete `AttemptAuthority` of one live
+Computer attempt admitted by this helper session. Other workload classes,
+stale fences, stopped tasks and old helper sessions are refused. No host path
+or general endpoint dial capability crosses this seam.
+
+`ApplyComputerSeats` accepts `{authority,seats}`. Each Seat entry is exactly
+`{place,user,view_port,control_port}`: place 1–4, matching `seat1`–`seat4`, and
+unique ports in 1024–65535. Entries are canonicalized by place. The helper publishes
+`{version:1,generation,seats}` to `/wefty/control/seats.json` using a fresh
+mode-0444 file, sync and atomic rename. The profile binds the control **folder**
+read-only, so a replacement is visible. The response is `{generation}`. Each
+changed list advances the attempt-local generation; an identical list is an
+idempotent replay and does not restart deadlines or failed desktops. No
+counter survives the attempt. A helper restart loses observation authority;
+that loss never proves cleanup.
+
+The helper refuses an in-place config change. First omit the place, observe
+positive cleanup, then add its new config in a later generation. Neither its
+place nor its ports can be reused before confirmed cleanup. An accepted list
+contains only wanted Seats; omitted entries remain tracked for cleanup.
+Once `cleaned` is proved, it is final for that Seat incarnation. Later lists,
+missing answers and reuse of its ports cannot revoke that observation. A
+subsequent add of the same place creates a new incarnation with a new deadline.
+
+`ObserveComputerSeats` accepts `{authority,generation}` for the exact current
+positive generation and returns `{generation,seats}`. Each observation is
+`{place,state,reason,cleanup_complete}`. States are `starting`, `ready`,
+`failed`, `removing` and `cleaned`; these are helper observations, **not** the
+durable L1 Seat state machine. An image failure keeps its reason. Failed
+cleanup remains unconfirmed and cannot free Room. Recoverable list conflicts
+use `seat_operation_refused` with a typed `detail`: `cleanup_not_confirmed`
+means wait for cleanup and retry; `in_place_change_requires_remove` means omit
+the place, confirm cleanup, then add its new config; `generation_mismatch`
+means use the current directive generation. These refusals do not mutate the
+directive. Read and publication failures retain `diagnostic_failure`. Neither
+code declares loss of the helper session or other attempts. Malformed requests
+and unauthorized attempts retain their existing protocol error codes.
+
+A new place gets its own monotonic 60-second readiness deadline starting
+before its add directive is published. An unchanged starting place retains its
+original deadline when other places change. Readiness is judged when the
+helper observes, so the node agent must observe within the readiness deadline.
+A valid, generation-bound ready answer is necessary. The helper independently negotiates `rfb-websocket-v1`
+and reads the binary RFB greeting on **both** named ports inside the pinned
+attempt network namespace. Each probe has a two-second I/O bound within the
+remaining Seat budget. A probe which crosses the Seat deadline cannot publish
+ready; the observation is `failed/readiness_deadline_exceeded`, with no cleanup
+claim. A previously ready unchanged Seat must have a current-generation ready
+answer and fresh greeting checks before readiness carries into a later
+generation. A previously ready Seat reports `starting` after another place
+changes until the image rewrites its answer; that path has no readiness
+deadline. Failed Seats never retry merely because another place changed.
+Seat work uses its own mutex. Probes and absence scans hold neither the
+attempt lifecycle mutex nor its owner-control mutex. The helper copies the
+task and duplicates the pinned network namespace, then rechecks exact attempt
+identity and liveness before publishing any result.
+
+The helper and native image lane share `runner/ocihelper/seat_status_unix.go`.
+It implements the strict reader in [the image contract](computer-image.md):
+private bounded writable tmpfs mountinfo validation, no shadowing mounts,
+no-follow descriptor descent from the live kernel root, `st_dev` binding,
+nonblocking regular-file opens, and an 8192-byte bounded read. The helper pins
+the kernel process directory across the reads and checks that it still owns
+the attempt's pinned network namespace. Unreadable or invalid answers produce
+no readiness or cleanup evidence.
+
+Cleanup requires the current generation's complete `applied.json` proof with
+exactly the helper's wanted places and `cleanup_complete:true`. If a per-place
+answer exists, it must also say `removed` and claim successful cleanup in a
+positive generation no later than the current one. The current applied proof
+carries an earlier completed removal forward; the image does not rewrite
+answers for places already omitted. Future-generation and malformed answers
+are refused. An absent per-place answer alone proves nothing;
+the applied proof covers an add replaced before the image observed it. In
+addition the helper independently verifies no process of that Seat's uid in
+the Computer's PID namespace, no live uid-owned internet sockets or endpoint
+sockets, no Seat Unix sockets, and no Seat folder by no-follow descent from
+the kernel root. TCP TIME_WAIT entries with inode zero are not live sockets.
+Only this combined evidence produces `cleaned/cleanup_complete:true`.
+Timeouts, missing proof and cleanup failures never return Room.
+
+P9 folders remain on the Computer's Storage: `/wefty/service/seats/<place>`
+and `/wefty/service/shared`. The image creates and owns these directories per
+its contract. Seat removal deletes only its place; shared files survive.
+
+The root-only `TestHelperComputerSeatsIM5` uses the unmodified production
+profile and real helper Seat operations in `computer-seats.yml`, under
+`computer_seat_lane`, on `default-computer-seats / linux/amd64` and
+`default-computer-seats / linux/arm64`. It measures the attempt cgroup's
+`memory.current` for diagnosis and requires `memory.stat` `anon` + `shmem`
+to return within 32 MiB of the pre-Seat baseline for five consecutive 200 ms
+samples. A detached Seat process writes a 128 MiB Seat-owned `/dev/shm` file:
+that charge survives process death and requires image scratch cleanup. The
+32 MiB tolerance allows root-supervisor/accounting variation but cannot hide
+the fixture; ordinary file cache is excluded. Unit tests reject the case where
+the desktop disappears but the tmpfs fixture leaks. The lane also requires the
+absence check to reject the live ready Seat, then accept it after removal,
+and verifies shared-file survival. This is helper-operation evidence; fixture task creation does
+not claim helper Run admission or L1 lifecycle coverage.

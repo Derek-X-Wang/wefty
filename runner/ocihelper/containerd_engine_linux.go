@@ -83,6 +83,8 @@ type containerdAttempt struct {
 	endpoints        map[string]uint16
 	endpointHolds    map[string]net.Listener
 	controlDirectory string
+	seatsMu          sync.Mutex
+	seats            *computerSeats
 	computerUID      uint32
 	computerGID      uint32
 	networkNamespace *pinnedNetworkNamespace
