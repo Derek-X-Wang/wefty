@@ -19,7 +19,7 @@ const (
 	ComputerSeatReadinessTimeout        = 60 * time.Second
 )
 
-// SeatOperationRefusalReason is a recoverable request/list conflict, distinct
+// SeatOperationRefusalReason is a typed request/runtime refusal, distinct
 // from a failure to read or publish runtime evidence.
 type SeatOperationRefusalReason string
 
@@ -27,6 +27,11 @@ const (
 	SeatRefusalInPlaceChange       SeatOperationRefusalReason = "in_place_change_requires_remove"
 	SeatRefusalCleanupNotConfirmed SeatOperationRefusalReason = "cleanup_not_confirmed"
 	SeatRefusalGenerationMismatch  SeatOperationRefusalReason = "generation_mismatch"
+	SeatRefusalAttemptNotLive      SeatOperationRefusalReason = "attempt_not_live"
+	SeatRefusalTmpfsFloor          SeatOperationRefusalReason = "tmpfs_floor"
+	SeatRefusalMemoryCapacity      SeatOperationRefusalReason = "memory_capacity"
+	SeatRefusalMemoryGrowFailed    SeatOperationRefusalReason = "memory_grow_failed"
+	SeatRefusalMemoryBusy          SeatOperationRefusalReason = "memory_busy"
 )
 
 type SeatOperationRefusalError struct{ Reason SeatOperationRefusalReason }
@@ -89,6 +94,7 @@ type computerSeatEntry struct {
 	ready           bool
 	failure         string
 	cleaned         bool
+	memoryReturned  bool
 }
 
 // Serialized by the attempt's seatsMu. State belongs to one exact attempt;
