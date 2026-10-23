@@ -1714,14 +1714,14 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 		if request.Method == MethodApplyComputerSeats {
 			response, err := engine.ApplyComputerSeats(operation.ctx, apply)
 			if err != nil {
-				_ = writeFailure(wire, CodeDiagnosticFailure, "Seat operation could not be confirmed")
+				_ = writeSeatOperationFailure(wire, err)
 				return
 			}
 			_ = writeEngineResponseWithMethod(wire, request.Method, response, nil)
 		} else {
 			response, err := engine.ObserveComputerSeats(operation.ctx, observe)
 			if err != nil {
-				_ = writeFailure(wire, CodeDiagnosticFailure, "Seat operation could not be confirmed")
+				_ = writeSeatOperationFailure(wire, err)
 				return
 			}
 			_ = writeEngineResponseWithMethod(wire, request.Method, response, nil)
@@ -2686,4 +2686,12 @@ func writeFailure(connection *framedConn, code ErrorCode, message string) error 
 
 func writeRPCError(connection *framedConn, rpcErr *RPCError) error {
 	return connection.write(frame{Version: ProtocolVersion, Error: rpcErr})
+}
+
+func writeSeatOperationFailure(wire *framedConn, err error) error {
+	var refusal *SeatOperationRefusalError
+	if errors.As(err, &refusal) {
+		return writeRPCError(wire, &RPCError{Code: CodeSeatOperationRefused, Detail: ErrorDetail(refusal.Reason), Message: refusal.Error()})
+	}
+	return writeFailure(wire, CodeDiagnosticFailure, "Seat operation could not be confirmed")
 }

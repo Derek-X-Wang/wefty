@@ -19,6 +19,22 @@ const (
 	ComputerSeatReadinessTimeout        = 60 * time.Second
 )
 
+// SeatOperationRefusalReason is a recoverable request/list conflict, distinct
+// from a failure to read or publish runtime evidence.
+type SeatOperationRefusalReason string
+
+const (
+	SeatRefusalInPlaceChange       SeatOperationRefusalReason = "in_place_change_requires_remove"
+	SeatRefusalCleanupNotConfirmed SeatOperationRefusalReason = "cleanup_not_confirmed"
+	SeatRefusalGenerationMismatch  SeatOperationRefusalReason = "generation_mismatch"
+)
+
+type SeatOperationRefusalError struct{ Reason SeatOperationRefusalReason }
+
+func (e *SeatOperationRefusalError) Error() string {
+	return "Seat operation refused: " + string(e.Reason)
+}
+
 // ComputerSeat is the image's place configuration, not a public Seat identity.
 type ComputerSeat struct {
 	Place       int    `json:"place"`
@@ -75,7 +91,7 @@ type computerSeatEntry struct {
 	cleaned         bool
 }
 
-// Serialized by the attempt's controlMu. State belongs to one exact attempt;
+// Serialized by the attempt's seatsMu. State belongs to one exact attempt;
 // losing it never creates cleanup evidence. Durable reconciliation is #1142.
 type computerSeats struct {
 	clock      Clock
@@ -116,15 +132,15 @@ func (s *computerSeats) apply(wanted []ComputerSeat) (ApplyComputerSeatsResponse
 	for _, config := range wanted {
 		if entry := s.entries[config.Place]; entry != nil {
 			if entry.wanted && entry.config != config {
-				return ApplyComputerSeatsResponse{}, errors.New("in_place_change_requires_remove")
+				return ApplyComputerSeatsResponse{}, &SeatOperationRefusalError{Reason: SeatRefusalInPlaceChange}
 			}
 			if !entry.wanted && !entry.cleaned {
-				return ApplyComputerSeatsResponse{}, errors.New("Seat cleanup is not confirmed")
+				return ApplyComputerSeatsResponse{}, &SeatOperationRefusalError{Reason: SeatRefusalCleanupNotConfirmed}
 			}
 		}
 		for _, entry := range s.entries {
 			if !entry.cleaned && entry.config.Place != config.Place && (entry.config.ViewPort == config.ViewPort || entry.config.ControlPort == config.ViewPort || entry.config.ViewPort == config.ControlPort || entry.config.ControlPort == config.ControlPort) {
-				return ApplyComputerSeatsResponse{}, errors.New("Seat endpoint cleanup is not confirmed")
+				return ApplyComputerSeatsResponse{}, &SeatOperationRefusalError{Reason: SeatRefusalCleanupNotConfirmed}
 			}
 		}
 	}
@@ -198,7 +214,7 @@ func decodeSeatDocument(payload []byte, target any) error {
 }
 func (s *computerSeats) observe(ctx context.Context, generation uint64, read func(string) ([]byte, error), probe func(context.Context, uint16) error, cleanup func(ComputerSeat) error) (ObserveComputerSeatsResponse, error) {
 	if generation == 0 || generation != s.generation {
-		return ObserveComputerSeatsResponse{}, errors.New("Seat observation generation is stale")
+		return ObserveComputerSeatsResponse{}, &SeatOperationRefusalError{Reason: SeatRefusalGenerationMismatch}
 	}
 	result := ObserveComputerSeatsResponse{Generation: generation, Seats: []ComputerSeatObservation{}}
 	places := make([]int, 0, len(s.entries))
@@ -210,6 +226,13 @@ func (s *computerSeats) observe(ctx context.Context, generation uint64, read fun
 		entry := s.entries[place]
 		observation := ComputerSeatObservation{Place: place, State: "starting"}
 		if !entry.wanted {
+			// Cleanup is final for this incarnation. Its ports may already
+			// belong to a different Seat; a later directive cannot revoke it.
+			if entry.cleaned {
+				observation.State, observation.CleanupComplete = "cleaned", true
+				result.Seats = append(result.Seats, observation)
+				continue
+			}
 			observation.State = "removing"
 			payload, readErr := read(fmt.Sprintf("%d.json", place))
 			var failed computerSeatAnswer

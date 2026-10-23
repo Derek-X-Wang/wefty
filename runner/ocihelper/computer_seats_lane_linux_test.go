@@ -181,38 +181,6 @@ func TestHelperComputerSeatsIM5(t *testing.T) {
 			}
 		}
 	}
-	applied, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{{1, "seat1", 7102, 7103}}})
-	must(err)
-	waitForSeat(applied.Generation, "ready")
-	run := func(args ...string) {
-		t.Helper()
-		argv := []string{"--address", address, "--namespace", ContainerdNamespace, "tasks", "exec", "--exec-id", fmt.Sprintf("helper-proof-%d", time.Now().UnixNano()), "--user", "2001:2001", id}
-		out, err := exec.CommandContext(ctx, "ctr", append(argv, args...)...).CombinedOutput()
-		if err != nil {
-			t.Fatalf("fixture command: %v %s", err, out)
-		}
-	}
-	run("sh", "-c", "echo retained > /wefty/service/shared/keep")
-	// A double-forked 128 MiB allocation makes the memory oracle independent
-	// of desktop/browser variation and exercises cleanup beyond process groups.
-	run("python3", "-c", `import os,time
-if os.fork(): os._exit(0)
-os.setsid()
-if os.fork(): os._exit(0)
-b=bytearray(128*1024*1024)
-for offset in range(0,len(b),4096): b[offset]=1
-open('/wefty/service/seats/1/home/allocated','w').write('ready')
-time.sleep(180)`)
-	allocation := fmt.Sprintf("/proc/%d/root/wefty/service/seats/1/home/allocated", task.Pid())
-	for i := 0; i < 100; i++ {
-		if _, err := os.Stat(allocation); err == nil {
-			break
-		}
-		if i == 99 {
-			t.Fatal("memory fixture never allocated")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 	proc := fmt.Sprintf("/proc/%d", task.Pid())
 	data, err := os.ReadFile(filepath.Join(proc, "cgroup"))
 	must(err)
@@ -233,6 +201,81 @@ time.sleep(180)`)
 		must(err)
 		return v
 	}
+	charge := func() int64 {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(cgroup, "memory.stat"))
+		must(err)
+		v, err := seatMemoryCharge(b)
+		must(err)
+		return v
+	}
+	// Wait for root-supervisor startup before sampling the idle Computer. Use
+	// the minimum of five samples so a transient boot allocation cannot hide a leak.
+	boot := filepath.Join(proc, "root/run/wefty-seat-supervisor.json")
+	for i := 0; ; i++ {
+		if _, err := os.Stat(boot); err == nil {
+			break
+		}
+		if i == 649 {
+			t.Fatal("supervisor did not initialize")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	baseline := charge()
+	baselineCurrent := memory()
+	for i := 0; i < 4; i++ {
+		time.Sleep(200 * time.Millisecond)
+		if sample := charge(); sample < baseline {
+			baseline = sample
+		}
+	}
+	applied, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{{1, "seat1", 7102, 7103}}})
+	must(err)
+	waitForSeat(applied.Generation, "ready")
+	seat := ComputerSeat{1, "seat1", 7102, 7103}
+	if err := confirmComputerSeatAbsent(proc, seat); err == nil {
+		t.Fatal("absence check accepted a live ready Seat")
+	}
+	run := func(args ...string) {
+		t.Helper()
+		argv := []string{"--address", address, "--namespace", ContainerdNamespace, "tasks", "exec", "--exec-id", fmt.Sprintf("helper-proof-%d", time.Now().UnixNano()), "--user", "2001:2001", id}
+		out, err := exec.CommandContext(ctx, "ctr", append(argv, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("fixture command: %v %s", err, out)
+		}
+	}
+	run("sh", "-c", "echo retained > /wefty/service/shared/keep")
+	// This Seat-owned tmpfs file remains charged after its writer dies. Only
+	// the image's uid-based scratch cleanup can release its 128 MiB of shmem.
+	// The detached writer also exercises cleanup beyond the desktop process group.
+	run("python3", "-c", `import os,time
+if os.fork(): os._exit(0)
+os.setsid()
+if os.fork(): os._exit(0)
+with open('/dev/shm/wefty-seat-im5-1','wb') as f:
+    chunk=b'x'*(1024*1024)
+    for _ in range(128): f.write(chunk)
+    f.flush()
+    os.fsync(f.fileno())
+open('/wefty/service/seats/1/home/allocated','w').write('ready')
+time.sleep(180)`)
+	allocation := filepath.Join(proc, "root/wefty/service/seats/1/home/allocated")
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(allocation); err == nil {
+			break
+		}
+		if i == 99 {
+			t.Fatal("tmpfs fixture never allocated")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	scratch := filepath.Join(proc, "root/dev/shm/wefty-seat-im5-1")
+	info, err := os.Stat(scratch)
+	must(err)
+	if info.Size() != 128<<20 {
+		t.Fatal("tmpfs fixture size mismatch")
+	}
+	chargeBefore := charge()
 	before := memory()
 	removed, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, nil})
 	must(err)
@@ -240,15 +283,24 @@ time.sleep(180)`)
 		t.Fatal("directive generation did not advance")
 	}
 	waitForSeat(removed.Generation, "cleaned")
-	// Allow 32 MiB of accounting/page-cache noise on the 128 MiB allocation;
-	// demand a >=96 MiB drop in the exact attempt cgroup, never host free memory.
-	after := memory()
-	for i := 0; i < 100 && before-after < 96<<20; i++ {
-		time.Sleep(100 * time.Millisecond)
-		after = memory()
+	// Allow 32 MiB of anon/shmem accounting and root-supervisor variation.
+	// This is well below the 128 MiB tmpfs fixture, so deleting the desktop
+	// alone cannot pass. File cache is excluded. Five consecutive 200 ms
+	// samples must return to the pre-Seat baseline plus that tolerance.
+	recovery := seatMemoryRecovery{baseline: baseline, tolerance: 32 << 20, required: 5}
+	chargeAfter := charge()
+	recovered := recovery.observe(chargeAfter)
+	for i := 0; i < 100 && !recovered; i++ {
+		time.Sleep(200 * time.Millisecond)
+		chargeAfter = charge()
+		recovered = recovery.observe(chargeAfter)
 	}
-	if before-after < 96<<20 {
-		t.Fatalf("attempt memory did not return: before=%d after=%d drop=%d", before, after, before-after)
+	after := memory()
+	if !recovered {
+		t.Fatalf("Seat anon+shmem did not return: baseline=%d before=%d after=%d tolerance=%d consecutive=%d", baseline, chargeBefore, chargeAfter, recovery.tolerance, recovery.consecutive)
+	}
+	if _, err := os.Lstat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("Seat tmpfs fixture remains or cannot be inspected: %v", err)
 	}
 	b, err := os.ReadFile(filepath.Join(service, "shared/keep"))
 	must(err)
@@ -257,9 +309,9 @@ time.sleep(180)`)
 	}
 	must(confirmComputerSeatAbsent(proc, ComputerSeat{1, "seat1", 7102, 7103}))
 	if output := os.Getenv("WEFTY_HELPER_SEAT_EVIDENCE"); output != "" {
-		payload, err := json.MarshalIndent(map[string]any{"version": 1, "acceptance": "IM-5", "platform": "linux/" + runtime.GOARCH, "image": imageRef, "add_generation": applied.Generation, "remove_generation": removed.Generation, "memory_before_bytes": before, "memory_after_bytes": after, "minimum_reclaimed_bytes": 96 << 20, "shared_survives": true, "cleanup_complete": true}, "", "  ")
+		payload, err := json.MarshalIndent(map[string]any{"version": 1, "acceptance": "IM-5", "platform": "linux/" + runtime.GOARCH, "image": imageRef, "add_generation": applied.Generation, "remove_generation": removed.Generation, "memory_before_bytes": before, "memory_after_bytes": after, "memory_baseline_bytes": baselineCurrent, "anon_shmem_baseline_bytes": baseline, "anon_shmem_before_bytes": chargeBefore, "anon_shmem_after_bytes": chargeAfter, "anon_shmem_tolerance_bytes": recovery.tolerance, "consecutive_baseline_samples": recovery.consecutive, "shared_survives": true, "cleanup_complete": true}, "", "  ")
 		must(err)
 		must(os.WriteFile(output, payload, 0600))
 	}
-	t.Logf("IM-5 helper: generation=%d cleanup confirmed; memory.current before=%d after=%d; shared file retained", removed.Generation, before, after)
+	t.Logf("IM-5 helper: generation=%d cleanup confirmed; memory.current before=%d after=%d; anon+shmem baseline=%d after=%d consecutive=%d; tmpfs absent; shared retained", removed.Generation, before, after, baseline, chargeAfter, recovery.consecutive)
 }
