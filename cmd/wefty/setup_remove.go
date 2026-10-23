@@ -24,13 +24,14 @@ import (
 const setupManifestName = "setup-files.json"
 
 type setupManifest struct {
-	LinuxLogRoot     string            `json:"linux_log_root,omitempty"`
-	History          *plainHistory     `json:"history,omitempty"`
-	Role             serviceplan.Role  `json:"role,omitempty"`
-	InstalledVersion string            `json:"installed_version,omitempty"`
-	UpgradeSource    bool              `json:"upgrade_source,omitempty"`
-	Version          int               `json:"version"`
-	Files            map[string]string `json:"files"`
+	Computer         *setupComputerOptions `json:"computer,omitempty"`
+	LinuxLogRoot     string                `json:"linux_log_root,omitempty"`
+	History          *plainHistory         `json:"history,omitempty"`
+	Role             serviceplan.Role      `json:"role,omitempty"`
+	InstalledVersion string                `json:"installed_version,omitempty"`
+	UpgradeSource    bool                  `json:"upgrade_source,omitempty"`
+	Version          int                   `json:"version"`
+	Files            map[string]string     `json:"files"`
 }
 type setupRemoveReport struct {
 	Changes  []string `json:"changes"`

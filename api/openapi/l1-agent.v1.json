@@ -247,6 +247,10 @@
                       "additionalProperties": false,
                       "required": ["computer_id", "storage_id", "storage_generation", "intent_revision", "submit_enabled", "submit_intent_revision", "submit_max_inflight", "submit_policy_revision", "disk_bytes"],
                       "properties": {
+                        "seat_limit": { "type": "integer", "minimum": 0 },
+                        "idle_action": { "type": "string", "enum": ["delete", "stop", "nothing"] },
+                        "network": { "type": "string", "enum": ["internet", "none"] },
+                        "seat_request_made": { "type": "boolean" },
                         "computer_id": { "type": "string", "minLength": 1 },
                         "storage_id": { "type": "string", "minLength": 1 },
                         "storage_generation": { "type": "integer", "format": "int64", "minimum": 1 },

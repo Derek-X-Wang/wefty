@@ -16,16 +16,16 @@ import (
 )
 
 const (
-	DefaultInstanceName    = "wefty-oci"
-	GuestAllowedMountRoot  = "/mnt/wefty-host"
-	GuestHelperSocket      = "/run/wefty/oci-helper.sock"
-	HostHelperSocketName   = "wefty-oci-helper.sock"
-	DefaultDisk            = "32GiB"
-	VMMemoryFlagName       = "vm-memory"
-	VMCPUsFlagName         = "vm-cpus"
-	VMDiskFlagName         = "vm-disk"
-	maximumDefaultMemory   = int64(4 << 30)
-	defaultComputerCeiling = int64(4 << 30)
+	DefaultInstanceName           = "wefty-oci"
+	GuestAllowedMountRoot         = "/mnt/wefty-host"
+	GuestHelperSocket             = "/run/wefty/oci-helper.sock"
+	HostHelperSocketName          = "wefty-oci-helper.sock"
+	DefaultDisk                   = "32GiB"
+	VMMemoryFlagName              = "vm-memory"
+	VMCPUsFlagName                = "vm-cpus"
+	VMDiskFlagName                = "vm-disk"
+	maximumDefaultMemory          = int64(4 << 30)
+	computerInfrastructureReserve = int64(1 << 30)
 )
 
 var limaSizePattern = regexp.MustCompile(`^[1-9][0-9]*(?:[KMGT]iB|[kMGT]?B)$`)
@@ -145,7 +145,7 @@ func DefaultMacComputerCapacity(sizing Sizing) (capacityBytes, reserveBytes int6
 	if err != nil {
 		return 0, 0, err
 	}
-	return defaultComputerCeiling, vmMemoryBytes / 4, nil
+	return vmMemoryBytes, computerInfrastructureReserve, nil
 }
 
 // HostPhysicalMemoryBytes exposes the setup-time node sizing fact. Runtime

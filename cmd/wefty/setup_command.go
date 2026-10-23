@@ -127,6 +127,7 @@ type setupHost struct {
 }
 
 type setupRequest struct {
+	computer            setupComputerOptions
 	abandonConversion   bool
 	convertPlain        bool
 	joinCode            string
@@ -328,6 +329,7 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	var request setupRequest
+	bindSetupComputerFlags(flags, &request.computer)
 	var remove, purge bool
 	flags.StringVar(&request.role, "role", "", "fleet role on Mac or Linux: control-plane or join; omit for the daily plain Mac install")
 	flags.StringVar(&request.joinCode, "join-code", "", "non-secret join code from the control plane setup report")
@@ -596,7 +598,15 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		return report, err
 	}
 	files = append(files, skillFiles...)
-	services, err := setupServices(paths, profile, sourceDigests, nodeAgentPATH)
+	var computerNote string
+	request.computer, computerNote, err = resolveSetupComputerSettingsForRole(paths, serviceplan.Legacy, request.computer)
+	if computerNote != "" {
+		report.Notes = append(report.Notes, computerNote)
+	}
+	if err != nil {
+		return report, err
+	}
+	services, err := setupServices(paths, profile, sourceDigests, nodeAgentPATH, request.computer)
 	if err != nil {
 		return report, err
 	}
@@ -682,7 +692,7 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			change: "installed " + filepath.Join(paths.bin, name)}}, files...)
 	}
 	previous := setupManifest{Version: 1, Files: map[string]string{}}
-	manifest := setupManifest{Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
+	manifest := setupManifest{Computer: request.computer.recorded(), Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
 	if payload, err := homeRoot.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
 		if json.Unmarshal(payload, &previous) == nil && previous.Version == 1 {
 			manifest.Role = previous.Role
@@ -1101,12 +1111,12 @@ func desiredSetupProfile(host setupHost, existing connprofile.Profile, nodeID st
 
 // setupServices keeps the legacy plan until fleet setup explicitly publishes
 // role metadata. Participant presence never selects an installation role.
-func setupServices(paths setupPaths, profile connprofile.Profile, binaries map[string]string, nodeAgentPATH string) ([]launchagent.Agent, error) {
-	return setupRoleServices(paths, profile, binaries, nodeAgentPATH, serviceplan.Legacy)
+func setupServices(paths setupPaths, profile connprofile.Profile, binaries map[string]string, nodeAgentPATH string, computer ...setupComputerOptions) ([]launchagent.Agent, error) {
+	return setupRoleServices(paths, profile, binaries, nodeAgentPATH, serviceplan.Legacy, computer...)
 }
 
 // setupRoleServices is the Mac adapter for the platform-neutral named plan.
-func setupRoleServices(paths setupPaths, profile connprofile.Profile, binaries map[string]string, nodeAgentPATH string, role serviceplan.Role) ([]launchagent.Agent, error) {
+func setupRoleServices(paths setupPaths, profile connprofile.Profile, binaries map[string]string, nodeAgentPATH string, role serviceplan.Role, computer ...setupComputerOptions) ([]launchagent.Agent, error) {
 	plan, err := setupRolePlan(paths, role)
 	if err != nil {
 		return nil, err
@@ -1130,7 +1140,7 @@ func setupRoleServices(paths setupPaths, profile connprofile.Profile, binaries m
 		}
 		agents = append(agents, service)
 	}
-	return agents, nil
+	return applySetupComputerSettings(paths, profile, agents, role, computer...)
 }
 
 // captureLoginPATH asks the owner's login shell for its PATH. A LaunchAgent
