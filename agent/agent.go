@@ -52,9 +52,15 @@ type Config struct {
 	RunLedgerAddress    string
 	NodeID              string
 	BootSessionID       string
-	Version             string
-	OS                  string
-	Architecture        string
+	// AgentGenerationID opts into L1 generation authority; installed activation supplies it.
+	AgentGenerationID string
+	// RetirementEvidenceSettled always checks #1176 closure readiness when configured.
+	// It may veto closure for other owned evidence, or prove limited durable custody.
+	// It cannot replace positive runtime reap or L1 completion/Lease closure checks.
+	RetirementEvidenceSettled func(context.Context, l1.NodeGeneration, []l1.ResidentAttempt) (bool, error)
+	Version                   string
+	OS                        string
+	Architecture              string
 	// Capabilities is the complete advertised execution set; nil advertises none.
 	Capabilities map[string]bool
 	// CapabilityProbe earns and continuously revalidates OCI-related
@@ -264,13 +270,14 @@ func New(config Config) (*Agent, error) {
 		return nil, err
 	}
 	registration := contract.NodeRegistration{
-		NodeID:        config.NodeID,
-		BootSessionID: config.BootSessionID,
-		ConnectHost:   config.Fabric.ConnectHost(),
-		OS:            osName,
-		Architecture:  architecture,
-		AgentVersion:  config.Version,
-		Capabilities:  normalizeConfiguredCapabilities(config.Capabilities),
+		NodeID:            config.NodeID,
+		AgentGenerationID: config.AgentGenerationID,
+		BootSessionID:     config.BootSessionID,
+		ConnectHost:       config.Fabric.ConnectHost(),
+		OS:                osName,
+		Architecture:      architecture,
+		AgentVersion:      config.Version,
+		Capabilities:      normalizeConfiguredCapabilities(config.Capabilities),
 	}
 	processRuntime, _ := runtimes.selectKind(contract.JobKindProcess)
 	guardian, guardianOK := processRuntime.(interface{ GuardianAvailable() bool })
@@ -380,6 +387,7 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxOneshotSlots, l1.DefaultMaxOneshotSlots),
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
+	session.retirementEvidenceSettled = config.RetirementEvidenceSettled
 	if config.OneshotLoadLimit != nil {
 		session.oneshotLoadLimit = *config.OneshotLoadLimit
 	}
@@ -575,7 +583,9 @@ func (a *Agent) Registered() <-chan struct{} { return a.session.registrationSign
 
 // Drain stops new claims locally and marks the current boot session draining
 // at the control plane. Attempts already executing are not canceled; Run
-// returns after both class loops finish their resident attempt, if any.
+// returns after both class loops finish their resident attempt, if any. A
+// retiring generation drains locally and returns a zero Node: it cannot mutate
+// the successor's Node projection.
 func (a *Agent) Drain(ctx context.Context) (l1.Node, error) {
 	return a.session.drain(ctx)
 }
@@ -703,11 +713,15 @@ func (a *Agent) runWorkload(ctx context.Context, claim l1.Claim) (contract.Proce
 func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 	var allowsStart func(contract.JobSpec) bool
 	var computerPolicy *ComputerPolicyCache
+	var retirementEvidence func(string, func(context.Context) (bool, error))
 	if a.capabilities != nil {
 		allowsStart = a.capabilities.allows
 	}
 	if a.session != nil {
 		computerPolicy = a.session.computerPolicy
+		if a.registration.AgentGenerationID != "" {
+			retirementEvidence = a.session.trackRetirementEvidence
+		}
 	}
 	return newAttemptLifecycle(attemptLifecycleDependencies{
 		client: a.sessionClient(), runtimes: a.runtimes, outbox: a.outbox,
@@ -722,16 +736,18 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
 		fabric: a.fabric, computerPolicy: computerPolicy,
-		prepareServiceEndpoint: prepareProcessServiceEndpoint,
-		prepareAuthorityLoss:   a.prepareAuthorityLoss,
-		allowsStart:            allowsStart,
-		currentOCIGeneration:   a.currentOCIRuntimeGeneration,
-		embargoOCIRuntime:      a.embargoOCIRuntimeLoss,
-		recoverOCIRuntime:      a.recoverOCIRuntimeAfterLoss,
-		runtimeReaped:          a.recordRuntimeReap,
-		attemptDeadman:         a.attemptDeadman,
-		computerTokens:         a.computerTokens,
-		computerControlTokens:  a.computerControlTokens,
+		prepareServiceEndpoint:  prepareProcessServiceEndpoint,
+		prepareAuthorityLoss:    a.prepareAuthorityLoss,
+		allowsStart:             allowsStart,
+		currentOCIGeneration:    a.currentOCIRuntimeGeneration,
+		embargoOCIRuntime:       a.embargoOCIRuntimeLoss,
+		recoverOCIRuntime:       a.recoverOCIRuntimeAfterLoss,
+		runtimeReaped:           a.recordRuntimeReap,
+		keepCompletionAuthority: a.registration.AgentGenerationID != "",
+		retirementEvidence:      retirementEvidence,
+		attemptDeadman:          a.attemptDeadman,
+		computerTokens:          a.computerTokens,
+		computerControlTokens:   a.computerControlTokens,
 	})
 }
 

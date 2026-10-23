@@ -78,6 +78,11 @@ type agentSession struct {
 	loadReadErrorLogged bool
 	lastOneshotClaim    time.Time
 
+	retirementMu              sync.Mutex
+	retiringRequested         chan struct{}
+	retiringGeneration        *l1.NodeGeneration
+	retirementAttempts        map[string]*retirementAttempt
+	retirementEvidenceSettled func(context.Context, l1.NodeGeneration, []l1.ResidentAttempt) (bool, error)
 	claimMu                   sync.Mutex
 	residentJobID             map[string]struct{}
 	residentKind              map[string]string
@@ -185,6 +190,8 @@ func newAgentSession(
 		},
 		capacityChanged:           make(chan struct{}, 1),
 		claimsEnabled:             true,
+		retiringRequested:         make(chan struct{}),
+		retirementAttempts:        make(map[string]*retirementAttempt),
 		residentJobID:             make(map[string]struct{}),
 		residentKind:              make(map[string]string),
 		resident:                  make(map[string]*residentAttempt),
@@ -243,6 +250,9 @@ func (session *agentSession) suppressOCIBeforeBootSweep(ctx context.Context) {
 }
 
 func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
+	if session.isRetiring() {
+		return l1.Node{}, errors.New("retiring generation cannot register")
+	}
 	if session.computerPolicy != nil {
 		session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
 	}
@@ -762,9 +772,28 @@ func (session *agentSession) publishCapabilityHeartbeatResponse(ctx context.Cont
 }
 
 func (session *agentSession) drain(ctx context.Context) (l1.Node, error) {
-	session.observer.setSession(LifecycleDraining, 0, nil)
 	session.drainOnce.Do(func() { close(session.drainRequested) })
-	return session.client.Drain(ctx, session.registration.NodeID, session.registration.BootSessionID)
+	session.setSession(LifecycleDraining, 0, nil)
+	if session.isRetiring() {
+		// The successor owns the Node projection. TERM drains this process
+		// locally; calling the primary-only L1 Drain would reject the old boot
+		// and make the signal handler force-cancel ordinary residents.
+		return l1.Node{}, nil
+	}
+	node, err := session.client.Drain(ctx, session.registration.NodeID, session.registration.BootSessionID)
+	if session.registration.AgentGenerationID != "" && protocolErrorCode(err) == contract.ErrorNodeSessionReplaced {
+		// Promotion may have committed before the local retirement poll. Only an
+		// authenticated exact demotion makes this stale-primary refusal a local
+		// drain; other refusals keep normal shutdown error handling.
+		retiring, observationErr := session.observeGeneration(ctx)
+		if observationErr == nil && retiring {
+			return l1.Node{}, nil
+		}
+		if observationErr != nil {
+			return node, errors.Join(err, observationErr)
+		}
+	}
+	return node, err
 }
 
 // run is process-lifetime supervision. Protocol failures are acted on at the
@@ -805,10 +834,10 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 			return nil
 		}
 		if session.isDraining() {
-			session.observer.setSession(LifecycleDraining, 0, nil)
+			session.setSession(LifecycleDraining, 0, nil)
 			return nil
 		}
-		session.observer.setSession(state, 0, nil)
+		session.setSession(state, 0, nil)
 		if _, err := session.register(runContext); err != nil {
 			if runContext.Err() != nil {
 				return nil
@@ -816,7 +845,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 			classification := classifyAgentProtocolError(err)
 			switch classification.nodeSessionReaction {
 			case nodeSessionDrain:
-				session.observer.setSession(LifecycleDraining, 0, err)
+				session.setSession(LifecycleDraining, 0, err)
 				return nil
 			case nodeSessionStopRecordAndEscalate:
 				return session.quarantine(runContext, err)
@@ -825,7 +854,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 				return fmt.Errorf("agent: register node: %w", err)
 			}
 			delay := backoff.next()
-			session.observer.setSession(LifecycleRejoining, delay, err)
+			session.setSession(LifecycleRejoining, delay, err)
 			if err := session.waitWithoutHeartbeat(runContext, delay); err != nil {
 				return nil
 			}
@@ -854,7 +883,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 			state = LifecycleRejoining
 			continue
 		case nodeSessionDrain:
-			session.observer.setSession(LifecycleDraining, 0, failure.err)
+			session.setSession(LifecycleDraining, 0, failure.err)
 			return nil
 		case nodeSessionStopRecordAndEscalate:
 			return session.quarantine(runContext, failure.err)
@@ -875,15 +904,17 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 		defer close(heartbeatDone)
 		session.heartbeatLoop(sessionContext, heartbeatErrors)
 	}()
+	policyContext, stopPolicy := context.WithCancel(sessionContext)
+	defer stopPolicy()
 	policyWatchDone := make(chan struct{})
 	go func() {
 		defer close(policyWatchDone)
-		session.computerPolicyWatchLoop(sessionContext)
+		session.computerPolicyWatchLoop(policyContext)
 	}()
 	policyAckDone := make(chan struct{})
 	go func() {
 		defer close(policyAckDone)
-		session.computerAcks.run(sessionContext)
+		session.computerAcks.run(policyContext)
 	}()
 	type claimWorker struct {
 		id       int
@@ -953,14 +984,38 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 	}()
 
 	drainRequested := session.drainRequested
+	retiringRequested := session.retiringRequested
+	var retirementTick Timer
+	var retirementTickC <-chan time.Time
+	defer func() {
+		if retirementTick != nil {
+			stopTimer(retirementTick)
+		}
+	}()
 	draining := false
 	for {
 		select {
 		case <-sessionContext.Done():
 			return destinationError{}
+		case <-retiringRequested:
+			stopPolicy()
+			retiringRequested = nil
+			session.setSession(LifecycleRetiring, 0, nil)
+			retirementTick = session.clock.NewTimer(session.claimInterval)
+			retirementTickC = retirementTick.C()
+		case <-retirementTickC:
+			if session.isRetiring() && len(workers) == 0 && !session.isDraining() {
+				if closed, err := session.closeRetirement(sessionContext); closed {
+					return destinationError{}
+				} else if err != nil {
+					session.setSession(LifecycleRetiring, session.claimInterval, err)
+				}
+			}
+			retirementTick = session.clock.NewTimer(session.claimInterval)
+			retirementTickC = retirementTick.C()
 		case <-drainRequested:
 			draining = true
-			session.observer.setSession(LifecycleDraining, 0, nil)
+			session.setSession(LifecycleDraining, 0, nil)
 			if session.logf != nil {
 				session.logf("agent: draining; waiting for %d class claim loops and their resident attempts", len(workers))
 			}
@@ -976,9 +1031,15 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 			// workers instead of letting that expected refusal cancel siblings.
 			if session.isDraining() {
 				draining = true
-				session.observer.setSession(LifecycleDraining, 0, nil)
+				session.setSession(LifecycleDraining, 0, nil)
 				if len(workers) == 0 {
 					return destinationError{}
+				}
+				continue
+			}
+			if session.isRetiring() {
+				if result.failure.err != nil {
+					session.setSession(LifecycleRetiring, 0, result.failure.err)
 				}
 				continue
 			}
@@ -993,7 +1054,7 @@ func (session *agentSession) serveRegistered(ctx context.Context, execute sessio
 			}
 			reconcileWorkers()
 		case <-session.capacityChanged:
-			if !draining {
+			if !draining && !session.isRetiring() {
 				reconcileWorkers()
 			}
 		case failure := <-heartbeatErrors:
@@ -1052,8 +1113,10 @@ func (session *agentSession) claimClassLoop(
 			return destinationError{}
 		case <-retire:
 			return destinationError{}
+		case <-session.retiringRequested:
+			return destinationError{}
 		case <-session.drainRequested:
-			session.observer.setSession(LifecycleDraining, 0, nil)
+			session.setSession(LifecycleDraining, 0, nil)
 			return destinationError{}
 		default:
 		}
@@ -1073,6 +1136,18 @@ func (session *agentSession) claimClassLoop(
 			continue
 		}
 		if err != nil {
+			if session.registration.AgentGenerationID != "" {
+				_, observationErr := session.observeGeneration(ctx)
+				if session.isRetiring() {
+					return destinationError{}
+				}
+				if observationErr != nil || classifyAgentProtocolError(err).destination == errorDestinationNodeSession {
+					if waitErr := session.waitForClaimWork(ctx, retire, backoff.next()); waitErr != nil {
+						return destinationError{}
+					}
+					continue
+				}
+			}
 			classification := classifyAgentProtocolError(err)
 			failure := destinationError{
 				destination: classification.destination,
@@ -1082,7 +1157,7 @@ func (session *agentSession) claimClassLoop(
 				return failure
 			}
 			delay := backoff.next()
-			session.observer.setSession(LifecycleRejoining, delay, err)
+			session.setSession(LifecycleRejoining, delay, err)
 			if waitErr := session.waitForClaimWork(ctx, retire, delay); waitErr != nil {
 				return destinationFromError(waitErr)
 			}
@@ -1337,6 +1412,22 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 		case <-session.heartbeatWake:
 		}
 		stopTimer(timer)
+		if session.registration.AgentGenerationID != "" {
+			retiring, err := session.observeGeneration(ctx)
+			if err == nil && retiring {
+				err = session.client.HeartbeatRetiringGeneration(ctx, session.registration.NodeID, session.registration.AgentGenerationID, session.registration.BootSessionID)
+			}
+			if err != nil || retiring {
+				nextDelay = session.heartbeatInterval
+				if err != nil {
+					nextDelay = backoff.next()
+				} else {
+					backoff.reset()
+				}
+				session.setSession(LifecycleRejoining, nextDelay, err)
+				continue
+			}
+		}
 		var response l1.HeartbeatResponse
 		var err error
 		if session.ociBootBarrier == nil {
@@ -1349,9 +1440,9 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 		}
 		if err != nil {
 			classification := classifyAgentProtocolError(err)
-			if classification.destination == errorDestinationTransient {
+			if classification.destination == errorDestinationTransient || session.registration.AgentGenerationID != "" {
 				nextDelay = backoff.next()
-				session.observer.setSession(LifecycleRejoining, nextDelay, err)
+				session.setSession(LifecycleRejoining, nextDelay, err)
 				continue
 			}
 			select {
@@ -1431,6 +1522,9 @@ func (session *agentSession) claim(
 	// has requeued a job but before the first worker finishes local finalization.
 	session.claimMu.Lock()
 	defer session.claimMu.Unlock()
+	if session.isRetiring() || session.isDraining() {
+		return nil, false, nil
+	}
 	endCapabilityClaim := session.capabilities.beginClaim()
 	defer endCapabilityClaim()
 	if !session.capabilities.allowsClaim() {
@@ -1469,6 +1563,9 @@ func (session *agentSession) claim(
 	}
 	session.residentJobID[claim.Job.JobID] = struct{}{}
 	session.residentKind[claim.Job.JobID] = claim.Job.Spec.Kind
+	if session.registration.AgentGenerationID != "" {
+		session.retirementAttempts[claim.Lease.AttemptID] = &retirementAttempt{jobID: claim.Job.JobID, fencingToken: claim.Lease.FencingToken}
+	}
 	return claim, true, nil
 }
 
@@ -1632,6 +1729,11 @@ func (session *agentSession) recordRuntimeReap(jobID string, receipt workloadrun
 	session.claimMu.Lock()
 	defer session.claimMu.Unlock()
 	outcome := runtimeReapOutcome{receipt: receipt, err: err}
+	if resident := session.resident[jobID]; resident != nil {
+		if record := session.retirementAttempts[resident.attemptID]; record != nil {
+			record.reaped = err == nil && receipt.RuntimeQuiesced && receipt.Evidence != ""
+		}
+	}
 	resident, active := session.resident[jobID]
 	if active {
 		select {
@@ -1724,7 +1826,7 @@ func (session *agentSession) observeGrantedCapacity(node l1.Node) {
 func (session *agentSession) claimsAllowed() bool {
 	session.capacityMu.Lock()
 	defer session.capacityMu.Unlock()
-	return session.claimsEnabled && !session.isDraining()
+	return session.claimsEnabled && !session.isDraining() && !session.isRetiring()
 }
 
 func (session *agentSession) poolTarget(class workloadClass) int {
@@ -1740,6 +1842,8 @@ func (session *agentSession) waitForClaimWork(ctx context.Context, retire <-chan
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-retire:
+		return context.Canceled
+	case <-session.retiringRequested:
 		return context.Canceled
 	case <-session.drainRequested:
 		return context.Canceled
@@ -1762,12 +1866,12 @@ func (session *agentSession) waitWithoutHeartbeat(ctx context.Context, duration 
 }
 
 func (session *agentSession) quarantine(ctx context.Context, err error) error {
-	session.observer.setSession(LifecycleQuarantined, DefaultSessionBackoffMax, err)
+	session.setSession(LifecycleQuarantined, DefaultSessionBackoffMax, err)
 	select {
 	case <-ctx.Done():
 		return nil
 	case <-session.drainRequested:
-		session.observer.setSession(LifecycleDraining, 0, nil)
+		session.setSession(LifecycleDraining, 0, nil)
 		return nil
 	}
 }
@@ -1783,10 +1887,10 @@ func (session *agentSession) isDraining() bool {
 
 func (session *agentSession) markReady() {
 	if session.isDraining() {
-		session.observer.setSession(LifecycleDraining, 0, nil)
+		session.setSession(LifecycleDraining, 0, nil)
 		return
 	}
-	session.observer.setSession(LifecycleReady, 0, nil)
+	session.setSession(LifecycleReady, 0, nil)
 }
 
 func destinationFromError(err error) destinationError {

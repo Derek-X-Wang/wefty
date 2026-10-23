@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -125,11 +126,17 @@ type evidenceOutbox struct {
 	ownershipMu     sync.RWMutex
 	liveAttempts    map[string]struct{}
 	lateEvents      map[string]int
-	lateMu          sync.Mutex
-	lateContext     context.Context
-	lateCancel      context.CancelFunc
-	lateWG          sync.WaitGroup
-	lateClosed      bool
+	// lateRevision changes whenever a producer registers a late append. Evidence
+	// inspection snapshots it without holding ownershipMu across spool SQL.
+	lateRevision uint64
+	// retirementCompletions points to enrolled Attempts' proof flags until
+	// delivery transfers acceptance into them. Settled entries are removed.
+	retirementCompletions map[string]*atomic.Bool
+	lateMu                sync.Mutex
+	lateContext           context.Context
+	lateCancel            context.CancelFunc
+	lateWG                sync.WaitGroup
+	lateClosed            bool
 
 	// createdHere names the spool rows this process created and has not yet
 	// released, guarded by ownershipMu. The spool sweep takes an empty row
@@ -203,7 +210,19 @@ func (outbox *evidenceOutbox) completionDelivered(ctx context.Context, attemptID
 	if len(revision) > 0 {
 		observed = revision[0]
 	}
-	return outbox.spool.completionDelivered(ctx, attemptID, observed)
+	if err := outbox.spool.completionDelivered(ctx, attemptID, observed); err != nil {
+		return err
+	}
+	// Every delivery path, including background recovery after worker exit,
+	// records acceptance before returning from the durable acknowledgement.
+	// The DB transaction has ended before we take ownershipMu.
+	outbox.ownershipMu.Lock()
+	if accepted := outbox.retirementCompletions[attemptID]; accepted != nil {
+		accepted.Store(true)
+		delete(outbox.retirementCompletions, attemptID)
+	}
+	outbox.ownershipMu.Unlock()
+	return nil
 }
 
 func (outbox *evidenceOutbox) suppressCompletion(ctx context.Context, attemptID string, revision uint64) error {
@@ -573,6 +592,7 @@ func (outbox *evidenceOutbox) retainLateEvent(event contract.LogEvent) {
 	outbox.lateWG.Add(1)
 	outbox.ownershipMu.Lock()
 	outbox.lateEvents[event.AttemptID]++
+	outbox.lateRevision++
 	outbox.ownershipMu.Unlock()
 	lateContext := outbox.lateContext
 	outbox.lateMu.Unlock()
@@ -630,12 +650,22 @@ func (outbox *evidenceOutbox) recoveryStopped() bool {
 func (outbox *evidenceOutbox) recoverShutdownAttempt(ctx context.Context, client *Client, claim l1.Claim) error {
 	attempt := logSpoolAttempt{jobID: claim.Job.JobID, attemptID: claim.Lease.AttemptID,
 		fencingToken: claim.Lease.FencingToken, kind: claim.Job.Spec.Kind, class: claim.Job.Spec.Class}
+	if err := outbox.waitForLateAppends(ctx, attempt.attemptID); err != nil {
+		return err
+	}
+	return outbox.recoverAttempt(ctx, client, attempt)
+}
+
+// waitForLateAppends joins redaction tails transferred to process-lifetime
+// persistence. Both live and shutdown delivery must join before reading logs;
+// an empty spool alone does not prove an asynchronous append has committed.
+func (outbox *evidenceOutbox) waitForLateAppends(ctx context.Context, attemptID string) error {
 	for {
 		outbox.ownershipMu.RLock()
-		late := outbox.lateEvents[attempt.attemptID] > 0
+		late := outbox.lateEvents[attemptID] > 0
 		outbox.ownershipMu.RUnlock()
 		if !late {
-			return outbox.recoverAttempt(ctx, client, attempt)
+			return nil
 		}
 		timer := outbox.clock.NewTimer(outbox.retryInterval)
 		select {
@@ -645,6 +675,42 @@ func (outbox *evidenceOutbox) recoverShutdownAttempt(ctx context.Context, client
 		case <-timer.C():
 		}
 	}
+}
+
+// trackRetirementCompletion is called before an enrolled Attempt can produce
+// evidence. Legacy agents retain only the existing bounded inspection receipts.
+func (outbox *evidenceOutbox) trackRetirementCompletion(attemptID string, accepted *atomic.Bool) {
+	outbox.ownershipMu.Lock()
+	defer outbox.ownershipMu.Unlock()
+	if outbox.retirementCompletions == nil {
+		outbox.retirementCompletions = make(map[string]*atomic.Bool)
+	}
+	outbox.retirementCompletions[attemptID] = accepted
+}
+
+// attemptEvidenceDelivered reads the actual outbox state after all producers
+// have joined. An ended Lease, no mailbox, or an incomplete tombstone cannot
+// certify delivery of logs or a buffered completion. Never hold ownershipMu
+// across SQL: spool sweep owns the DB connection when it consults ownership.
+func (outbox *evidenceOutbox) attemptEvidenceDelivered(ctx context.Context, attemptID string, committed bool) (bool, error) {
+	outbox.ownershipMu.RLock()
+	late := outbox.lateEvents[attemptID] != 0
+	revision := outbox.lateRevision
+	outbox.ownershipMu.RUnlock()
+	if late {
+		return false, nil
+	}
+	receipt := outbox.spool.inspectCompletion(ctx, attemptID)
+	if receipt.InspectionError != "" {
+		return false, fmt.Errorf("inspect retirement evidence: %s", receipt.InspectionError)
+	}
+	outbox.ownershipMu.RLock()
+	unchanged := outbox.lateRevision == revision && outbox.lateEvents[attemptID] == 0
+	outbox.ownershipMu.RUnlock()
+	// Remember only completion acceptance. Logs must still be empty, and a
+	// newly buffered completion or sealed evidence must still block closure.
+	delivered := receipt.State == "delivered" || (committed && receipt.State == "never_persisted")
+	return unchanged && delivered && receipt.EventCount == 0, nil
 }
 
 func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, attempt logSpoolAttempt) error {

@@ -348,3 +348,16 @@ func decodeProtocolError(response *http.Response) error {
 	}
 	return &ProtocolError{StatusCode: response.StatusCode, APIError: protocolResponse.Error}
 }
+
+// NodeGenerations reads authenticated session authority, never the Node projection.
+func (c *Client) NodeGenerations(ctx context.Context, nodeID string) (l1.NodeGenerationInventory, error) {
+	var inventory l1.NodeGenerationInventory
+	err := c.request(ctx, http.MethodGet, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations", nil, &inventory)
+	return inventory, err
+}
+func (c *Client) HeartbeatRetiringGeneration(ctx context.Context, nodeID, generationID, bootID string) error {
+	return c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations/"+url.PathEscape(generationID)+"/heartbeat", l1.NodeGenerationHeartbeatRequest{BootSessionID: bootID}, nil)
+}
+func (c *Client) CloseRetiringGeneration(ctx context.Context, nodeID, generationID string, request l1.CloseNodeGenerationRequest) error {
+	return c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations/"+url.PathEscape(generationID)+"/close", request, nil)
+}
