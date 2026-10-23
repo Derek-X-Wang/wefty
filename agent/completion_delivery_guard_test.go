@@ -28,7 +28,7 @@ func TestCompletionDeliveryProtectedMutations(t *testing.T) {
 		{"evidence_outbox.go:evidenceOutbox.completionDelivered:completionDelivered", "Existing persistence forwarding method; no delivery policy.", 1},
 		{"evidence_outbox.go:evidenceOutbox.suppressCompletion:recordCompletionDisposition", "Existing bounded suppression persistence retry.", 1},
 		{"evidence_outbox.go:evidenceOutbox.withholdCompletion:recordCompletionDisposition", "Existing withheld persistence mutation.", 1},
-		{"evidence_outbox.go:evidenceOutbox.recoverLogs:sealIncomplete", "Replay log rejection seals evidence after gap replacement fails.", 3},
+		{"evidence_outbox.go:evidenceOutbox.recoverLogsRetaining:sealIncomplete", "Ordinary replay seals after gap replacement fails; upgrade replay retains bytes.", 3},
 		{"evidence_outbox.go:evidenceOutbox.sealIncomplete:sealAttemptEvidence", "Existing replay log seal and diagnostic; completion uses the mutation directly.", 1},
 		{"evidence_outbox.go:evidenceOutbox.sealAttemptEvidence:sealIncomplete", "Existing persistence forwarding method records the seal time.", 1},
 	}

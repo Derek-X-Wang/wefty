@@ -14,6 +14,9 @@ type completionDeliveryMode uint8
 const (
 	completionDeliveryLive completionDeliveryMode = iota
 	completionDeliveryReplay
+	// Upgrade proof requires accepted completion and retains every refusal for
+	// exact replay. Generic recovery's authority-loss disposal is insufficient.
+	completionDeliveryUpgrade
 )
 
 type completionVerdictKind uint8
@@ -51,6 +54,7 @@ func (outbox *evidenceOutbox) deliverCompletion(ctx context.Context, client *Cli
 	localFailure := func(err error) completionVerdict {
 		return completionVerdict{kind: completionLocalFailure, err: &completionPersistenceError{err: err}}
 	}
+	revision, _ := outbox.upgradeOwnership(attempt.attemptID)
 	persistenceContext := ctx
 	if mode == completionDeliveryLive {
 		persistenceContext = context.WithoutCancel(ctx)
@@ -108,7 +112,18 @@ func (outbox *evidenceOutbox) deliverCompletion(ctx context.Context, client *Cli
 	if err != nil && cause != nil && !(errors.As(err, &response) && !errors.Is(err, cause)) {
 		return completionVerdict{kind: completionAbandoned, err: &completionDeliveryAbandoned{cause: cause, err: err}}
 	}
+	// Join local dispositions, not the network request. A reply from an older
+	// owner stays fenced even if upgrade ownership has since been released.
+	outbox.dispositionMu.Lock()
+	defer outbox.dispositionMu.Unlock()
+	current, owned := outbox.upgradeOwnership(attempt.attemptID)
+	if attempt.class == contract.JobClassService && attempt.kind == contract.JobKindProcess && (owned || current != revision) {
+		mode = completionDeliveryUpgrade
+	}
 	code := protocolErrorCode(err)
+	if mode == completionDeliveryUpgrade && code == contract.ErrorLeaseExpired {
+		return completionVerdict{kind: completionRefused, destination: errorDestinationAttemptAuthority, err: err}
+	}
 	if err == nil || code == contract.ErrorLeaseExpired {
 		if outbox.spool != nil {
 			if receiptErr := outbox.completionDelivered(persistenceContext, attempt.attemptID, observation.Revision); receiptErr != nil {
@@ -127,7 +142,7 @@ func (outbox *evidenceOutbox) deliverCompletion(ctx context.Context, client *Cli
 	if permanentEvidenceRejection(code) {
 		verdict.kind = completionPermanentRefusal
 		verdict.destination = errorDestinationAttemptAuthority
-		if mode == completionDeliveryLive {
+		if mode == completionDeliveryLive || mode == completionDeliveryUpgrade {
 			return verdict
 		}
 		reason = "completion was permanently rejected"
@@ -138,6 +153,9 @@ func (outbox *evidenceOutbox) deliverCompletion(ctx context.Context, client *Cli
 				verdict.kind = completionLedgerBackoff
 			}
 		}
+		return verdict
+	}
+	if mode == completionDeliveryUpgrade {
 		return verdict
 	}
 	if outbox.spool != nil {

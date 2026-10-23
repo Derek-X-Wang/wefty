@@ -367,3 +367,56 @@ The attended owner-Mac upgrade and post-upgrade `wefty exec` proof require the
 orchestrator and owner approval. Unit tests use temporary homes, local source
 repositories, fake build steps, fake launchctl and clocks. They never invoke
 the real `wefty setup`, `wefty upgrade` or `launchctl`.
+
+## Rolling-generation service recovery (#1178)
+
+Generation activation reuses the upgrade drain receipt, its durable `services`
+queue, `resumeUpgradeServices`, and `POST /v1/jobs/{job_id}/restart`. It adds
+`service_quiescence`, the positive selective barrier result described in
+[agent local lifecycle](agent-local-lifecycle.md#selective-service-quiescence-for-rolling-upgrade-1178).
+The coordinator persists the service inventory before stopping anything and
+persists that result before promotion or recovery. Recovery checks that every
+remaining queue entry belongs to the exact proof's Node, predecessor boot and
+Job/Attempt inventory. A missing or mismatched proof cannot bypass the legacy
+changed-boot check. With positive proof, failed activation may recover services
+on the same original primary; a changed boot alone is no longer the proof.
+
+A selective barrier failure leaves claims closed and returns the exact blocked
+Job/Attempt, phase and cause. Retrying the same barrier operation re-verifies
+runtime absence and retained evidence before it can issue positive proof. The
+coordinator must not persist success, promote or queue service recovery from a
+pending or failed result. Service finalization failures do not stop the agent
+session or its resident one-shots. See the lifecycle contract for bounded
+no-runtime finalization and the exact-authority replay rules.
+The original session keeps the selected completion Leases alive through failed
+barrier calls and the interval before recovery, independently of stopped payloads.
+Ownership transfer fences earlier log/completion replies before they can dispose
+of retained evidence. Each service's own positive settlement joins its renewal
+owner without waiting for blocked siblings. Terminal renewal rejection or an
+authoritative operator stop also ends that owner; stop leaves an explicit
+`lease` recovery failure if evidence cannot settle. Completion replay remains
+separate, and pending evidence and resident one-shots remain intact.
+
+Keys are stable `operation_id:boot_session_id:attempt_id` strings, also suitable
+for the activation catalog's `service_recovery_keys`. Restart requests add an
+optional `upgrade` guard containing `node_id`, `attempt_id` and
+`boot_session_id`. In the existing restart transaction, L1 checks desired
+running, process service, unchanged binding/predecessor, no removal or policy
+stop, and accepted terminal predecessor completion. Stopped, removed,
+policy-stopped, live or already-replaced services are left alone. This second
+check covers operator changes after the upgrader's read. Accepted identical
+replays return the existing result without another request or directive;
+ordinary explicit restart requests with no guard keep their prior semantics.
+
+This includes `restart=never`: an agent-requested termination stays an
+infrastructure interruption, so it creates no payload policy stop. The explicit
+upgrade recovery queues its fresh Attempt. The Job, service data and reserved
+port retain their existing ownership. Claims remain closed through quiescence,
+promotion and recovery requests. Only the new primary starts successors after
+admission restoration. Retiring generations keep one-shots only, so services
+cannot keep their retirement open. Legacy receipts and agents without generation
+identity keep the previous changed-boot recovery behavior.
+
+#1179 supplies installed activation wiring and proof persistence; #1180 supplies
+interrupted installation reconciliation. These seams do not add OCI survival,
+Linux rolling activation, reboot survival or service process adoption.

@@ -64,6 +64,7 @@ type upgradeHost struct {
 	readNode         func(context.Context, connprofile.Profile) (l1.Node, error)
 	readJob          func(context.Context, connprofile.Profile, string) (l1.Job, error)
 	restartService   func(context.Context, connprofile.Profile, string, string) (l1.Job, error)
+	recoverService   func(context.Context, connprofile.Profile, string, l1.ServiceRestartRequest) (l1.Job, error)
 	interruptAttempt func(context.Context, connprofile.Profile, string, l1.InterruptRestartableAttemptRequest) (l1.Job, error)
 	now              func() time.Time
 	wait             func(context.Context, time.Duration) error
@@ -176,6 +177,9 @@ func upgradeOperations(host setupHost) upgradeHost {
 	}
 	if operations.restartService == nil {
 		operations.restartService = restartUpgradeService
+	}
+	if operations.recoverService == nil {
+		operations.recoverService = recoverUpgradeService
 	}
 	if operations.interruptAttempt == nil {
 		operations.interruptAttempt = interruptUpgradeAttempt
