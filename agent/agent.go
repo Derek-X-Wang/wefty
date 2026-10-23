@@ -47,6 +47,9 @@ type OutputSinkFactory func(l1.Claim) processrunner.OutputSink
 // Config contains the stable node identity, per-process boot identity, and
 // independent heartbeat, claim, and lease-renewal cadences.
 type Config struct {
+	// RetirementAcknowledged persists the exact dedicated retirement acknowledgment.
+	RetirementAcknowledged func(l1.NodeGeneration) error
+
 	Fabric              fabric.Fabric
 	ControlPlaneAddress string
 	RunLedgerAddress    string
@@ -424,6 +427,7 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxOneshotSlots, l1.DefaultMaxOneshotSlots),
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
+	session.retirementAcknowledged = config.RetirementAcknowledged
 	session.retirementEvidenceSettled = config.RetirementEvidenceSettled
 	if config.AgentGenerationID != "" && session.retirementEvidenceSettled == nil {
 		session.retirementEvidenceSettled = outbox.settleRetirementEvidence(client, config.NodeID)

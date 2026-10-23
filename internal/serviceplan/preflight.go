@@ -20,16 +20,24 @@ func ProfilePreflight(args []string, out io.Writer) (bool, error) {
 	flags := flag.NewFlagSet("profile-preflight", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	check := flags.Bool("profile-preflight", false, "validate the active profile and installation role, then exit")
+	plain := flags.Bool("plain", false, "validate a plain installation profile")
 	path := flags.String("profile", "", "active profile")
 	role := flags.String("role", "", "recorded installation role")
 	if err := flags.Parse(args); err != nil {
 		return true, err
 	}
-	if !*check || *path == "" || flags.NArg() != 0 || Role(*role) == Legacy {
+	if !*check || *path == "" || flags.NArg() != 0 || (!*plain && Role(*role) == Legacy) || (*plain && *role != "") {
 		return true, errors.New("profile preflight requires --profile and a fleet --role")
 	}
 	profile, err := connprofile.Read(*path)
 	if err != nil {
+		return true, err
+	}
+	if *plain {
+		if profile.Fabric != "plain" || len(profile.Participants) != 0 || profile.Identities.Node == "" {
+			return true, errors.New("plain preflight requires a plain profile and stable node identity")
+		}
+		_, err = fmt.Fprintln(out, "profile-readable plain")
 		return true, err
 	}
 	if err := ValidateProfile(Role(*role), profile); err != nil {

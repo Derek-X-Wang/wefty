@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -34,6 +35,24 @@ func TestUpgradePlainByteComparison(t *testing.T) {
 			t.Fatal(err)
 		}
 		captured[name+"-already"] = output{normalize(stdout.String()), normalize(stderr.String())}
+	}
+	// Captured by running this test in an isolated git archive of e3facc51.
+	// Only the temporary home prefix is normalized; report bytes stay exact.
+	fixture, err := os.ReadFile("testdata/upgrade_plain_e3facc51.golden.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var golden map[string]output
+	if err := json.Unmarshal(fixture, &golden); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(captured, golden) {
+		t.Error("default upgrade output differs from e3facc51")
+		for name, expected := range golden {
+			if got := captured[name]; got != expected {
+				t.Errorf("%s output changed\nstdout got=%q\nstdout want=%q\nstderr got=%q\nstderr want=%q", name, got.Stdout, expected.Stdout, got.Stderr, expected.Stderr)
+			}
+		}
 	}
 	if path := os.Getenv("WEFTY_UPGRADE_BYTE_CAPTURE"); path != "" {
 		payload, err := json.MarshalIndent(captured, "", "  ")

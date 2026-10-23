@@ -17,6 +17,8 @@ var errUpgradeServiceQuiescence = errors.New("agent: service stopped for rolling
 // QuiesceUpgradeServices; persist the returned proof before promotion/recovery.
 // This is local evidence, not L1 promotion or restart authority.
 type UpgradeServiceQuiescence struct {
+	IntentRevision    int64                  `json:"intent_revision"`
+	IntentReason      string                 `json:"intent_reason"`
 	OperationID       string                 `json:"operation_id"`
 	NodeID            string                 `json:"node_id"`
 	AgentGenerationID string                 `json:"agent_generation_id"`
@@ -36,22 +38,25 @@ func (a *Agent) QuiesceUpgradeServices(ctx context.Context, request UpgradeServi
 	}
 	defer s.upgradeServiceMu.Unlock()
 	if request.OperationID == "" || request.NodeID != s.registration.NodeID || request.AgentGenerationID == "" || request.AgentGenerationID != s.registration.AgentGenerationID || request.BootSessionID != s.registration.BootSessionID {
-		return UpgradeServiceQuiescence{}, errors.New("agent: upgrade service identity mismatch")
+		return UpgradeServiceQuiescence{}, upgradeControlConflict("agent: upgrade service identity mismatch")
+	}
+	if s.upgradeServiceResumed[request.OperationID] {
+		return UpgradeServiceQuiescence{}, upgradeControlConflict("agent: resumed upgrade operation cannot quiesce services again")
 	}
 	request.Services = slices.Clone(request.Services)
 	selected := make(map[string]l1.NodeActiveAttempt, len(request.Services))
 	s.claimMu.Lock()
 	replaying := s.upgradeServiceOperation != ""
-	if s.upgradeServiceOperation != "" && (s.upgradeServiceOperation != request.OperationID || !slices.Equal(s.upgradeServiceInventory, request.Services)) {
+	if s.upgradeServiceOperation != "" && (s.upgradeServiceOperation != request.OperationID || s.upgradeServiceIntent.IntentRevision != request.IntentRevision || s.upgradeServiceIntent.Reason != request.IntentReason || !slices.Equal(s.upgradeServiceInventory, request.Services)) {
 		s.claimMu.Unlock()
-		return UpgradeServiceQuiescence{}, errors.New("agent: another service quiescence operation is pending")
+		return UpgradeServiceQuiescence{}, upgradeControlConflict("agent: another service quiescence operation is pending")
 	}
 	for _, service := range request.Services {
 		record := s.retirementAttempts[service.AttemptID]
 		_, duplicate := selected[service.JobID]
 		if duplicate || service.Class != contract.JobClassService || service.Kind != contract.JobKindProcess || service.BootSessionID != request.BootSessionID || record == nil || record.jobID != service.JobID || record.class != service.Class || record.kind != service.Kind {
 			s.claimMu.Unlock()
-			return UpgradeServiceQuiescence{}, fmt.Errorf("agent: service %q lacks exact local upgrade ownership", service.JobID)
+			return UpgradeServiceQuiescence{}, upgradeControlConflict(fmt.Sprintf("agent: service %q lacks exact local upgrade ownership", service.JobID))
 		}
 		selected[service.JobID] = service
 	}
@@ -64,7 +69,7 @@ func (a *Agent) QuiesceUpgradeServices(ctx context.Context, request UpgradeServi
 			}
 			if service, found := selected[record.jobID]; !found || service.AttemptID != attemptID {
 				s.claimMu.Unlock()
-				return UpgradeServiceQuiescence{}, errors.New("agent: upgrade inventory omits a resident service")
+				return UpgradeServiceQuiescence{}, upgradeControlConflict("agent: upgrade inventory omits a resident service")
 			}
 		}
 	}
@@ -83,6 +88,7 @@ func (a *Agent) QuiesceUpgradeServices(ctx context.Context, request UpgradeServi
 		}
 	}
 	s.upgradeServiceOperation = request.OperationID
+	s.upgradeServiceIntent = l1.NodeIntentRequest{IntentRevision: request.IntentRevision, Reason: request.IntentReason}
 	s.upgradeServiceInventory = slices.Clone(request.Services)
 	for _, service := range selected {
 		s.keepUpgradeServiceLease(service.AttemptID, a.renewalInterval)
@@ -126,7 +132,7 @@ func (a *Agent) QuiesceUpgradeServices(ctx context.Context, request UpgradeServi
 					s.retainRemovalReap(jobID, receipt)
 				} else {
 					if reapErr == nil {
-						reapErr = errors.New("positive runtime reap is unavailable")
+						reapErr = upgradeControlConflict("positive runtime reap is unavailable")
 					}
 					return UpgradeServiceQuiescence{}, upgradeServiceFailure(jobID, attemptID, "reap", false, reapErr)
 				}
@@ -225,19 +231,26 @@ func (a *Agent) ResumeUpgradeServiceClaims(ctx context.Context, operationID stri
 	if err != nil {
 		return err
 	}
+	if inventory.NodeID == "" {
+		return errors.New("agent: malformed generation inventory reply")
+	}
 	primary := slices.ContainsFunc(inventory.Generations, func(g l1.NodeGeneration) bool {
 		return g.Role == l1.NodeGenerationPrimary && g.AgentGenerationID == s.registration.AgentGenerationID && g.BootSessionID == s.registration.BootSessionID
 	})
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
-	if primary && !s.isRetiring() && operationID != "" && s.upgradeServiceOperation == "" && s.upgradeServiceResumed == operationID {
+	if primary && !s.isRetiring() && operationID != "" && s.upgradeServiceOperation == "" && s.upgradeServiceResumed[operationID] {
 		return nil
 	}
 	if !primary || s.isRetiring() || !s.upgradeServicesSettled || operationID == "" || s.upgradeServiceOperation != operationID {
-		return errors.New("agent: service admission resume lacks primary operation authority")
+		return upgradeControlConflict("agent: service admission resume lacks primary operation authority")
 	}
-	s.upgradeServiceResumed = operationID
+	if s.upgradeServiceResumed == nil {
+		s.upgradeServiceResumed = map[string]bool{}
+	}
+	s.upgradeServiceResumed[operationID] = true
 	s.upgradeServiceOperation = ""
+	s.upgradeServiceIntent = l1.NodeIntentRequest{}
 	s.upgradeServiceInventory = nil
 	s.upgradeServicesSettled = false
 	return nil

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -26,7 +27,9 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/internal/upgradestate"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -55,6 +58,16 @@ const (
 // These machine operations extend setupHost, rather than adding public flags.
 // Tests use a local bare repository, a fake build, runner and clock.
 type upgradeHost struct {
+	rollingStep        func(string) error
+	requestRolling     bool
+	bootIdentity       func() (string, error)
+	generationStore    func(setupPaths) agentinstall.Store
+	generationRootStat func(string) (os.FileInfo, error)
+	generations        func(context.Context, connprofile.Profile) (l1.NodeGenerationInventory, error)
+	stageGeneration    func(context.Context, connprofile.Profile, contract.NodeRegistration) (l1.NodeGenerationInventory, error)
+	promoteGeneration  func(context.Context, connprofile.Profile, l1.PromoteNodeGenerationRequest) (l1.NodeGenerationInventory, error)
+	generationControl  func(context.Context, agentinstall.Store, agentinstall.ControlRequest) (json.RawMessage, error)
+
 	writeDrain       func(context.Context, string, *upgradeDrainReceipt) error
 	remote           string
 	build            func(context.Context, string, string, string, string) error
@@ -91,13 +104,14 @@ type upgradeReport struct {
 func executeUpgrade(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
+	rolling := flags.Bool("rolling", false, "opt in to plain Mac rolling activation (temporary until attended acceptance)")
 	yes := flags.Bool("yes", false, "replace the node agent even when work is running; one-shot attempts end")
 	drainTimeout := flags.Duration("drain-timeout", upgradeDrainTimeout, "wait at most this long for one-shot attempts to finish")
 	if err := parseCommandFlags(flags, args, false); err != nil {
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 0 {
-		return usageError("usage: wefty upgrade [--yes] [--drain-timeout DURATION]")
+		return usageError("usage: wefty upgrade [--rolling] [--yes] [--drain-timeout DURATION]")
 	}
 	if *drainTimeout < upgradeDrainMinimum {
 		return usageError("--drain-timeout must be at least 10s")
@@ -105,6 +119,11 @@ func executeUpgrade(ctx context.Context, options globalOptions, args []string, s
 	host, err := realSetupHost()
 	if err != nil {
 		return err
+	}
+	if *rolling {
+		op := upgradeOperations(host)
+		op.requestRolling = true
+		host.upgrade = &op
 	}
 	return executeUpgradeWithHost(ctx, host, options, *yes, stdout, stderr, *drainTimeout)
 }
@@ -146,6 +165,27 @@ func upgradeOperations(host setupHost) upgradeHost {
 	operations := upgradeHost{}
 	if host.upgrade != nil {
 		operations = *host.upgrade
+	}
+	if operations.bootIdentity == nil {
+		operations.bootIdentity = hostboot.Identity
+	}
+	if operations.generations == nil {
+		operations.generations = func(ctx context.Context, p connprofile.Profile) (l1.NodeGenerationInventory, error) {
+			return generationUpgradeControl(ctx, host, operations, p, "generation_inventory", nil)
+		}
+	}
+	if operations.stageGeneration == nil {
+		operations.stageGeneration = func(ctx context.Context, p connprofile.Profile, r contract.NodeRegistration) (l1.NodeGenerationInventory, error) {
+			return generationUpgradeControl(ctx, host, operations, p, "stage_generation", r)
+		}
+	}
+	if operations.promoteGeneration == nil {
+		operations.promoteGeneration = func(ctx context.Context, p connprofile.Profile, r l1.PromoteNodeGenerationRequest) (l1.NodeGenerationInventory, error) {
+			return generationUpgradeControl(ctx, host, operations, p, "promote_generation", r)
+		}
+	}
+	if operations.generationControl == nil {
+		operations.generationControl = requestGenerationControl
 	}
 	if operations.remote == "" {
 		operations.remote = upgradeRemote
@@ -252,12 +292,43 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if len(issues) > 0 {
 		return upgradeReport{}, issues[0].err
 	}
-	if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
-		return upgradeReport{}, err
+	operations := upgradeOperations(host)
+	if err := refuseInterruptedRolling(paths); err != nil {
+		return result, err
+	}
+	if !operations.requestRolling {
+		if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
+			return result, err
+		}
 	}
 	role, err := selectUpgradeRole(paths)
 	if err != nil {
 		return upgradeReport{}, err
+	}
+	if operations.requestRolling {
+		profile, err := connprofile.Read(paths.profile)
+		if err != nil {
+			return result, err
+		}
+		config, err := ocicontrol.ReadInstalledConfig(paths.nodeConfig)
+		if err != nil {
+			return result, err
+		}
+		installation := upgradecompat.PlainMac
+		switch {
+		case host.goos == "linux":
+			installation = upgradecompat.Linux
+		case role != "" || profile.Fabric != "plain":
+			installation = upgradecompat.FleetMac
+		case config.ControlSocket != "":
+			installation = upgradecompat.OCIMac
+		}
+		if installation != upgradecompat.PlainMac {
+			return result, refuseUnsupportedRolling(ctx, host, paths, operations, profile, installation)
+		}
+		if config.NodeID != profile.Identities.Node {
+			return result, rollingRefused(upgradecompat.InvalidInventory, "installed node and connection profile differ")
+		}
 	}
 	if role != "" {
 		return runFleetUpgrade(ctx, host, paths, role, yes, warnings, drainTimeout...)
@@ -273,7 +344,12 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return result, err
 	}
 	defer unlock()
-	if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
+	if !operations.requestRolling {
+		if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
+			return result, err
+		}
+	}
+	if err := refuseInterruptedRolling(paths); err != nil {
 		return result, err
 	}
 	entries, err := os.ReadDir(paths.data)
@@ -298,14 +374,25 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if profile.Fabric != "plain" || config.ControlSocket != "" || config.NodeID != profile.Identities.Node {
 		return upgradeReport{}, errors.New("upgrade requires setup's plain-process node and matching connection profile")
 	}
-	operations := upgradeOperations(host)
 	defer func() {
 		resultErr = upgradeDrainRunHint(ctx, operations, profile, resultErr)
 	}()
 	if err := recoverUpgradeDrain(ctx, operations, paths, profile, warnings); err != nil {
 		return result, err
 	}
-	plist, err := os.ReadFile(filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist"))
+	nodePlist := filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist")
+	if operations.requestRolling {
+		if _, statErr := os.Lstat(filepath.Join(paths.data, agentinstall.Directory)); statErr == nil {
+			catalog, readErr := upgradeGenerationStore(host, paths, operations).Read()
+			if readErr != nil {
+				return result, generationControlTransportError(readErr)
+			}
+			nodePlist = catalog.Generations[catalog.Primary].Plist
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return result, statErr
+		}
+	}
+	plist, err := os.ReadFile(nodePlist)
 	if err != nil {
 		return upgradeReport{}, err
 	}
@@ -314,13 +401,34 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return upgradeReport{}, err
 	}
 	var drain *upgradeDrainReceipt
+	var rolling *rollingUpgrade
+	var enrollGeneration bool
 	defer func() {
 		if drain != nil {
+			if (rolling != nil || enrollGeneration) && resultErr != nil {
+				probe, cancel := context.WithTimeout(context.WithoutCancel(ctx), upgradeMutationBudget)
+				node, err := operations.readNode(probe, profile)
+				cancel()
+				if err == nil {
+					result.ClaimsDisabled = !node.ClaimsEnabled
+				}
+				return
+			}
 			restoreErr := finishUpgradeDrain(ctx, operations, paths, profile, drain, false, warnings)
 			resultErr = upgradeDrainResult(resultErr, restoreErr, !drain.claimsDisabled)
 			result.RestartedServices = slices.Clone(drain.restarted)
 			result.ClaimsDisabled = drain.claimsDisabled
 			result.upgradeDrainCounts = drain.counts
+			if rolling != nil && restoreErr == nil {
+				resultErr = rolling.persist("complete")
+			} else if enrollGeneration && restoreErr == nil && resultErr == nil {
+				r, err := readUpgradeRolling(paths)
+				if err != nil {
+					resultErr = err
+				} else {
+					resultErr = writeUpgradeRolling(paths, r, "complete")
+				}
+			}
 		}
 	}()
 	// Refuse linked work folders, even links to another folder inside home.
@@ -389,6 +497,17 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return result, upgradeObservationError(ctx, host, err)
 	}
 	result = upgradeReport{Version: commit, RunningWork: slices.Clone(baseline.ActiveAttempts)}
+	if operations.requestRolling {
+		rolling, enrollGeneration, err = prepareRollingUpgrade(ctx, host, operations, paths, profile, baseline, destination, commit, loginPATH)
+		if err != nil {
+			return result, err
+		}
+		if enrollGeneration {
+			if _, err = fmt.Fprintln(warnings, "Rolling unavailable: legacy_primary; draining once to install the first generation. Later --rolling upgrades preserve compatible one-shots."); err != nil {
+				return result, err
+			}
+		}
+	}
 	var before []string
 	var saved []setupFile
 	activated := false
@@ -404,6 +523,14 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		}
 	}()
 	request := setupRequest{from: destination, installedVersion: commit, skillSource: skillRoot.FS(), deferNodeBinary: true, deferSkills: true, lockHeld: true}
+	if rolling != nil || enrollGeneration {
+		request.activateGeneration = func(serviceCtx context.Context, base launchagent.Agent) (launchagent.Action, error) {
+			if rolling != nil {
+				return rolling.activate(serviceCtx, base, filepath.Join(destination, "wefty-agent"), commit, drain)
+			}
+			return enrollUpgradeGeneration(serviceCtx, host, operations, paths, profile, base, filepath.Join(destination, "wefty-agent"), commit, drain)
+		}
+	}
 	request.wroteFile = func(name string, payload []byte) {
 		if name != filepath.Join(paths.configRel, setupManifestName) {
 			written[name] = payloadDigest(payload)
@@ -423,10 +550,37 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		if len(drainTimeout) > 0 {
 			bound = drainTimeout[0]
 		}
+		if rolling != nil {
+			if err := rolling.closeAdmission(ctx, current, bound, &drain, &report.RunningWork); err != nil {
+				return err
+			}
+			baseline, err = operations.observe(ctx, profile)
+			if err != nil {
+				return err
+			}
+			return nil
+		}
 		var deadline time.Time
 		current, deadline, err = waitUpgradeGap(ctx, operations, profile, current, yes, bound, warnings, &report.RunningWork, &report.upgradeDrainCounts)
 		if err != nil {
 			return err
+		}
+		if enrollGeneration {
+			boot, err := operations.bootIdentity()
+			if err != nil {
+				return err
+			}
+			receipt := upgradeRollingReceipt{Version: 1, Protocol: 1, OperationID: rand.Text(), NodeID: profile.Identities.Node, SystemBootID: boot, Preserved: slices.Clone(report.RunningWork), BinaryDigests: map[string]string{}}
+			for _, name := range setupBinaries {
+				digest, err := executableDigest(filepath.Join(destination, name))
+				if err != nil {
+					return err
+				}
+				receipt.BinaryDigests[name] = digest
+			}
+			if err = writeUpgradeRolling(paths, &receipt, "legacy_admission_closing"); err != nil {
+				return err
+			}
 		}
 		drain, err = beginUpgradeDrain(ctx, operations, paths, profile, current, bound, deadline)
 		if err != nil {
@@ -466,6 +620,13 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		if index != 2 {
 			return nil
 		}
+		if rolling != nil {
+			current, err := operations.observe(ctx, profile)
+			if err != nil {
+				return err
+			}
+			return checkRollingUpgradeReplacement(current, drain)
+		}
 		current, err := operations.observe(ctx, profile)
 		if err != nil {
 			return err
@@ -494,16 +655,30 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	request.afterService = func(index int, action launchagent.Action) error {
 		if index == 1 {
 			controlsRestarted = operations.now()
-			elapsed, err := waitUpgradeRenewal(controlCtx, operations, profile, baseline, started, controlsRestarted)
+			var elapsed time.Duration
+			var err error
+			if rolling != nil {
+				elapsed, err = rolling.waitControlRenewal(controlCtx, baseline, started, controlsRestarted)
+			} else {
+				elapsed, err = waitUpgradeRenewal(controlCtx, operations, profile, baseline, started, controlsRestarted)
+			}
 			report.LeaseRenewal = elapsed
 			if err != nil {
 				return err
+			}
+			if rolling != nil {
+				if err := rolling.persist("control_plane_renewed"); err != nil {
+					return err
+				}
 			}
 			if _, err := fmt.Fprintf(warnings, "Successful node lease renewal after control-plane restart: %s (window %s).\n", elapsed, upgradeRenewalWindow); err != nil {
 				return err
 			}
 		}
 		if index == 2 {
+			if rolling != nil {
+				return rolling.persist("installation_completing")
+			}
 			// Bootstrapping is not health. Require the replacement node agent to
 			// register a new boot and heartbeat; the CLI also probes the run ledger.
 			if err := waitUpgradeReplacement(ctx, operations, profile, baseline.BootSessionID, commit, action); err != nil {
@@ -514,13 +689,36 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return nil
 	}
 	report.Setup, err = runSetup(ctx, host, request)
+	if err == nil && (rolling != nil || enrollGeneration) {
+		catalog, readErr := upgradeGenerationStore(host, paths, operations).Read()
+		if readErr != nil {
+			err = generationControlTransportError(readErr)
+		} else {
+			primary := catalog.Generations[catalog.Primary]
+			for i := range report.Setup.Services {
+				if report.Setup.Services[i].Label == setupNodeAgentLabel {
+					report.Setup.Services[i].Label = primary.Label
+					report.Setup.Services[i].Plist = primary.Plist
+				}
+			}
+		}
+	}
 	for _, note := range report.Setup.Notes {
 		if _, writeErr := fmt.Fprintln(warnings, "Warning:", note); writeErr != nil {
 			err = errors.Join(err, writeErr)
 		}
 	}
 	if err == nil {
-		return report, nil
+		if rolling != nil {
+			err = rolling.persist("installation_complete")
+		}
+		return report, err
+	}
+	if rolling != nil {
+		return report, fmt.Errorf("rolling activation interrupted; receipts retained for generation-aware recovery: %w", err)
+	}
+	if enrollGeneration {
+		return report, fmt.Errorf("generation enrollment interrupted; retained generation catalog requires recovery: %w", err)
 	}
 	if !activated {
 		return report, err

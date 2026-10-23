@@ -698,6 +698,9 @@ func run() error {
 		}
 	}
 	capabilities := defaultAgentCapabilities()
+	if *agentGenerationID != "" && *generationRoot != "" && profile.Fabric == "plain" && runtime.GOOS == "darwin" {
+		capabilities["upgrade:retirement:v1"] = true
+	}
 	runtimes := make(map[string]workloadrunner.WorkloadRuntime)
 	var bootBarrier *ocihelper.BootBarrier
 	var agentBootBarrier agent.OCIBootBarrier
@@ -769,8 +772,14 @@ func run() error {
 		deadman = ociAttemptDeadman{barrier: bootBarrier, nodeID: *nodeID, bootSessionID: bootSessionID}
 	}
 	nodeAgent, err := agent.New(agent.Config{
-		SeatApprovalSettings:    agent.SeatApprovalSettings{AnswerWait: *seatApprovalAnswerWait, WindowHours: approvalWindowHours},
-		AgentGenerationID:       *agentGenerationID,
+		SeatApprovalSettings: agent.SeatApprovalSettings{AnswerWait: *seatApprovalAnswerWait, WindowHours: approvalWindowHours},
+		AgentGenerationID:    *agentGenerationID,
+		RetirementAcknowledged: func(g l1.NodeGeneration) error {
+			if *generationRoot == "" {
+				return nil
+			}
+			return generationStore.PublishRetirement(g)
+		},
 		PrimaryGeneration:       primaryGeneration,
 		GenerationLifetimeLock:  generationLifetimeLock,
 		Fabric:                  participant,
@@ -1068,6 +1077,13 @@ func run() error {
 			return errors.New("--oci-minimal-doctor-facts must be absolute")
 		}
 		go writeMinimalDoctorFactsLoop(ctx, *ociDoctorFacts, nodeAgent, limaSupervisor, bootBarrier, log.Printf)
+	}
+	if *generationRoot != "" {
+		go func() {
+			if controlErr := nodeAgent.ServeUpgradeControl(ctx, generationStore); controlErr != nil {
+				log.Printf("wefty-agent: generation control unavailable: %v", controlErr)
+			}
+		}()
 	}
 	// Only fleet agents advertise and accept this local maintenance trigger.
 	// Install the handler before publishing its capability in the ready record.

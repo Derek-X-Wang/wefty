@@ -355,6 +355,16 @@ func (c *Client) NodeGenerations(ctx context.Context, nodeID string) (l1.NodeGen
 	err := c.request(ctx, http.MethodGet, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations", nil, &inventory)
 	return inventory, err
 }
+func (c *Client) StageNodeGeneration(ctx context.Context, nodeID string, registration contract.NodeRegistration) (l1.NodeGenerationInventory, error) {
+	var inventory l1.NodeGenerationInventory
+	err := c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations/stage", registration, &inventory)
+	return inventory, err
+}
+func (c *Client) PromoteNodeGeneration(ctx context.Context, nodeID string, request l1.PromoteNodeGenerationRequest) (l1.NodeGenerationInventory, error) {
+	var inventory l1.NodeGenerationInventory
+	err := c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations/promote", request, &inventory)
+	return inventory, err
+}
 func (c *Client) HeartbeatRetiringGeneration(ctx context.Context, nodeID, generationID, bootID string) error {
 	return c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations/"+url.PathEscape(generationID)+"/heartbeat", l1.NodeGenerationHeartbeatRequest{BootSessionID: bootID}, nil)
 }
