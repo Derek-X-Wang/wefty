@@ -48,7 +48,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
 	// Seat identity recovery retains exact authority and positive Attempt absence.
-	const mainFingerprint = "92e77a3bdbafa0ac61ba93c7989763c0e45bf652669ccba959df5fec51a5e35d"
+	const mainFingerprint = "1acffe06f1d7ab9e2fd7bf7a0964624c0f2f623227de8249952104aac9d17705"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}
