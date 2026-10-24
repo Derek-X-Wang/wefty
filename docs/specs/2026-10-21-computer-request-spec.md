@@ -299,9 +299,9 @@ Spirit ([#1026](https://github.com/Derek-X-Wang/wefty/issues/1026)): a command o
 
 ### 5.3 Programs and time
 
-1. **A program that a command starts in the background**, such as a browser, keeps running until the Seat ends. The Run ends when the command ends. A background program does not keep the Seat alive, so a forgotten server cannot hold the Mac's memory ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)).
+1. **A program that a command starts in the background**, such as a browser, keeps running until the Seat ends when the command ends normally. The Run ends when the command ends. A background program does not keep the Seat alive, so a forgotten server cannot hold the Mac's memory ([#1025](https://github.com/Derek-X-Wang/wefty/issues/1025)).
 2. **Every Seat command has a time limit: 1 hour by default.** Without it, a forgotten command would keep the Seat, the Computer and the host VM alive forever. `--max-runtime` sets another limit; it cannot turn the limit off.
-3. **At the limit, only the command stops.** The Seat keeps its folder, dependencies and background programs. Wefty records `fail` with no exit code, as `wefty exec` does today. The CLI and the Seat's log say why and give the fix, for example "stopped: reached its 1h limit. Run it again with a longer `--max-runtime`."
+3. **At the limit, or on cancel, the command and every program it started stop** (owner, 2026-10-23). Wefty first asks them to stop, so that tools such as browser drivers can close their browsers, and stops them a few seconds later. A program that must outlive a cancel or the limit starts in its own session, for example with `setsid`. The Seat keeps its folder, its dependencies and such programs. Why: a cancel that leaves work running is not a cancel, and left-over browsers use the Seat's small memory room. Wefty records `fail` with no exit code, as `wefty exec` does today. The CLI and the Seat's log say why and give the fix, for example "stopped: reached its 1h limit. Run it again with a longer `--max-runtime`."
 4. **No warning before the limit and no command to extend it.** The owner: rely on the maximum runtime as the maximum; the AI agent starts the command again.
 
 ### 5.4 `wefty cp`

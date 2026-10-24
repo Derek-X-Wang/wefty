@@ -66,6 +66,42 @@ type readObservedConnection struct {
 	observeBytes func()
 }
 
+// bodyReadObservedListener reports the read after the complete request headers.
+// The guest sends no body bytes, so this read holds net/http's request-body lock
+// until the guest closes. Cancellation alone cannot finish the proxy handler.
+type bodyReadObservedListener struct {
+	net.Listener
+	bodyReadStarted chan struct{}
+}
+
+func (listener *bodyReadObservedListener) Accept() (net.Conn, error) {
+	connection, err := listener.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &bodyReadObservedConnection{Conn: connection, bodyReadStarted: listener.bodyReadStarted}, nil
+}
+
+type bodyReadObservedConnection struct {
+	net.Conn
+	bodyReadStarted chan struct{}
+	headers         string
+	headersRead     bool
+	once            sync.Once
+}
+
+func (connection *bodyReadObservedConnection) Read(buffer []byte) (int, error) {
+	if connection.headersRead {
+		connection.once.Do(func() { close(connection.bodyReadStarted) })
+	}
+	count, err := connection.Conn.Read(buffer)
+	if !connection.headersRead {
+		connection.headers += string(buffer[:count])
+		connection.headersRead = strings.Contains(connection.headers, "\r\n\r\n")
+	}
+	return count, err
+}
+
 type closeErrorListener struct {
 	net.Listener
 	err           error
@@ -1293,14 +1329,23 @@ func TestComputerSubmissionPolicyRemintReportsUndrainedActiveRequest(t *testing.
 	})}
 	go func() { _ = l3Server.Serve(l3Listener) }()
 	defer l3Server.Close()
-	bridge, err := newComputerAttemptBridge(t.Context(), agentFabric, "wefty://run-ledger", true)
+	tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	listener := &bodyReadObservedListener{Listener: tcpListener, bodyReadStarted: make(chan struct{})}
+	bridge, err := newWorkflowBridgeWithBindingAndSurface(t.Context(), agentFabric, "wefty://run-ledger", workloadrunner.WorkflowBridgeBinding{
+		Listener: listener, AdvertiseHost: "127.0.0.1",
+	}, workflowBridgeSurfaceComputer, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bridge.server.Close()
 	guest, err := bridge.dial(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer guest.Close()
 	request, err := http.NewRequest(http.MethodPost, bridge.l3Endpoint+"/v1/runs", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1320,6 +1365,14 @@ func TestComputerSubmissionPolicyRemintReportsUndrainedActiveRequest(t *testing.
 	interim.Body.Close()
 	if interim.StatusCode != http.StatusContinue {
 		t.Fatalf("paused request acknowledgement status=%d, want 100", interim.StatusCode)
+	}
+	// Relaying 100 Continue does not mean the proxy's body-copy goroutine has
+	// begun reading. If cancellation wins that race, shutdown can drain normally.
+	// Wait for the body read itself so this request must outlive the drain limit.
+	select {
+	case <-listener.bodyReadStarted:
+	case <-t.Context().Done():
+		t.Fatal("bridge did not begin reading the paused guest body")
 	}
 	drainErr := bridge.closeWithCause(errComputerSubmissionPolicyReminted)
 	if err := guest.Close(); err != nil && !errors.Is(err, net.ErrClosed) {

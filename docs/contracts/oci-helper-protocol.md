@@ -2509,14 +2509,14 @@ Status fails and no wait was registered. Containerd still checks its own
 deletion preconditions. A refused or timed-out Delete is reported as
 unconfirmed cleanup. Cleanup uses contexts independent of the vanished caller.
 
-**Held owner decision:** cancellation and the runtime limit still target the
-command's whole process group. A plain `&` program in that group receives TERM
-and KILL too. A program that creates a **new session**, conventionally with
-`setsid` and double-forking, or changes its process group, escapes command
-cancellation. The single `signal_command_group` function is the policy seam;
-this ticket does not settle which plain background programs a future cancel
-must preserve. A normal command end preserves logging background programs,
-whether or not they changed process group.
+**Owner decision (2026-10-23, spec section 5.3):** cancellation and the
+runtime limit target the command's whole process group. A plain `&` program in
+that group receives TERM and KILL too. A program that creates a **new
+session**, conventionally with `setsid` and double-forking, or changes its
+process group, outlives command cancellation; that is the documented way for an
+AI agent to keep a program past a cancel or the limit. The single
+`signal_command_group` function holds this rule. A normal command end preserves
+logging background programs, whether or not they changed process group.
 
 The wrapper runs as the Seat uid. The command can SIGSTOP or SIGKILL it and
 thereby defeat cooperative process-tree cancellation. A forced wrapper kill is
