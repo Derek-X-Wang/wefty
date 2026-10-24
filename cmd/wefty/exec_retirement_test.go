@@ -476,8 +476,11 @@ func TestExecTempLinkRemovalFailurePreservesVerdict(t *testing.T) {
 				t.Fatal(err)
 			}
 			probe := filepath.Join(t.TempDir(), "bash-env")
+			// Fail only the short link itself. Inside a wefty run TMPDIR is
+			// such a link too, so the storage root lies beneath one and the
+			// delete step's rm must still work (#1220).
 			writeExecFile(t, probe, `function /bin/rm() {
-  case "${*: -1}" in /tmp/wefty-run.*) return 1 ;; esac
+  case "${*: -1}" in /tmp/wefty-run.*/*) ;; /tmp/wefty-run.*) return 1 ;; esac
   command /bin/rm "$@"
 }
 `)
