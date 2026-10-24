@@ -588,3 +588,40 @@ func (manager Manager) unload(ctx context.Context, label string, finished bool) 
 	}
 	return manager.waitUnloaded(ctx, label)
 }
+
+// UnloadMaintenancePrimary is used only after generation-aware maintenance has
+// recorded the exact quiet primary. Graceful bootout retains legacy semantics.
+func (manager Manager) UnloadMaintenancePrimary(ctx context.Context, label string) error {
+	if !generationLabel(label) {
+		return errors.New("not a generation primary label")
+	}
+	if err := manager.SuppressGenerationStart(ctx, label); err != nil {
+		return err
+	}
+	return manager.unload(ctx, label, false)
+}
+
+// RestoreMaintenancePrimary reloads the exact retained definition. No new
+// generation is allocated and no different binary or catalog is published.
+func (manager Manager) RestoreMaintenancePrimary(ctx context.Context, folder *os.Root, path, label string, payload []byte) error {
+	if !generationLabel(label) {
+		return errors.New("not a generation primary label")
+	}
+	state, err := manager.State(ctx, label)
+	if err != nil {
+		return err
+	}
+	if _, err = manager.Run(ctx, Launchctl, "enable", manager.target(label)); err != nil {
+		return err
+	}
+	if state.Running {
+		return nil
+	}
+	if state.Loaded {
+		if err = manager.unload(ctx, label, true); err != nil {
+			return err
+		}
+	}
+	_, err = manager.LoadGeneration(ctx, folder, path, label, payload)
+	return err
+}

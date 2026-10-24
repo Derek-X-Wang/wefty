@@ -116,7 +116,7 @@ func (s Store) ReadRetirement(id string) (g l1.NodeGeneration, err error) {
 // This is a closed protocol, never an arbitrary node-authenticated HTTP proxy.
 func validControlAction(action string) bool {
 	switch action {
-	case "quiesce_services", "resume_services", "generation_inventory", "stage_generation", "promote_generation", "abort_staged_generation":
+	case "quiesce_services", "resume_services", "generation_inventory", "stage_generation", "promote_generation", "abort_staged_generation", "de_enroll_generation":
 		return true
 	default:
 		return false

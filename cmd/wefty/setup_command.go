@@ -89,6 +89,7 @@ var setupBinaries = []string{"wefty", "wefty-l1", "wefty-l3", "wefty-agent"}
 // setupHost is everything setup reads from or does to the machine, so a test
 // can run it against a temporary home with fake launchctl and a fake shell.
 type setupHost struct {
+	maintenanceStep       func(string) error
 	proof                 bool
 	proofRemoveOutput     io.Writer
 	stopHostVM            func(context.Context, string, string) error
@@ -417,6 +418,11 @@ func executeSetupUsingHost(ctx context.Context, options globalOptions, args []st
 					return err
 				}
 			}
+			for _, retained := range report.Retained {
+				if _, err := fmt.Fprintln(stdout, "Retained:", retained); err != nil {
+					return err
+				}
+			}
 			for _, warning := range report.Warnings {
 				if _, err := fmt.Fprintln(stdout, "Warning:", warning); err != nil {
 					return err
@@ -514,11 +520,6 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			return setupReport{}, issues[0].err
 		}
 	}
-	if request.activateGeneration == nil || !request.lockHeld {
-		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
-			return setupReport{}, err
-		}
-	}
 	if host.goos == "linux" && (request.convertPlain || request.abandonConversion) {
 		flag := "--convert-plain"
 		if request.abandonConversion {
@@ -536,12 +537,40 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return setupReport{}, err
 	}
+	if request.convertPlain || conversion != nil {
+		if _, _, err := checkGenerationMaintenance(host, paths, "convert"); err != nil {
+			return setupReport{}, err
+		}
+	} else if request.activateGeneration == nil || !request.lockHeld {
+		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+			return setupReport{}, err
+		}
+	}
 	if request.convertPlain && !request.abandonConversion && conversion == nil {
 		stage, err := readFleetSetupRecord(paths)
 		if err != nil {
 			return setupReport{}, err
 		}
 		if stage != nil && stage.Role == serviceplan.Join && stage.Committed && stage.ProfilePublished && stage.ConversionHistoryDigest != "" {
+			store := upgradeGenerationStore(host, paths, upgradeOperations(host))
+			m, e := store.ReadMaintenance()
+			if e != nil {
+				return setupReport{}, e
+			}
+			if m != nil && m.Kind == "convert" && m.Retired {
+				if !request.lockHeld {
+					unlock, e := lockSetup(paths, false)
+					if e != nil {
+						return setupReport{}, e
+					}
+					defer unlock()
+					request.lockHeld = true
+					return runSetup(ctx, host, request)
+				}
+				if e = store.FinishMaintenance(); e != nil {
+					return setupReport{}, e
+				}
+			}
 			request.convertPlain = false
 		}
 	}

@@ -31,6 +31,10 @@ func decideCommandReport(err error) commandReport {
 }
 
 func classifyCommandReport(err error) commandReport {
+	var maintenanceFault *maintenanceFault
+	if errors.As(err, &maintenanceFault) {
+		return commandReport{exitCode: exitFailure, err: err, errorDocument: contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Message: err.Error(), Retryable: false}}}
+	}
 	var doctor *doctorResultError
 	if errors.As(err, &doctor) {
 		report := classifyCommandReport(doctor.cause)
@@ -196,7 +200,7 @@ func classifyCommandReport(err error) commandReport {
 		report.exitCode = exitUnauthorized
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
 		report.exitCode = exitNotFound
-	case seatErrorRoomUnconfigured, seatErrorNodeUnavailable, seatErrorWindowNotAllowed, seatErrorEnded, seatErrorRoomFull, seatErrorNoAnswer, seatErrorDenied, seatErrorDedicatedCap, seatErrorHostOff, seatErrorStartFailed, contract.ErrorCancelService, contract.ErrorCancelNotQueued, contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
+	case seatErrorRoomUnconfigured, seatErrorNodeUnavailable, seatErrorWindowNotAllowed, seatErrorEnded, seatErrorRoomFull, seatErrorNoAnswer, seatErrorDenied, seatErrorDedicatedCap, seatErrorHostOff, seatErrorStartFailed, contract.ErrorCancelService, contract.ErrorCancelNotQueued, contract.ErrorConflict, contract.ErrorDeEnrollmentNotCommitted, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
 		contract.ErrorStorageReferenceConflict, contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict,
 		contract.ErrorInstanceKeyConflict, contract.ErrorInstanceKeyNotSupported, contract.ErrorFinalAdmin,
 		contract.ErrorCapacityExhausted, contract.ErrorComputerResourceRequired, contract.ErrorComputerTraitRequired,

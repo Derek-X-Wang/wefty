@@ -275,8 +275,10 @@ infer conversion. `--role join` without the flag and `--role control-plane`
 continue to refuse an existing plain installation. The new control plane starts
 empty. Conversion keeps the scheduling Node ID from `node.json`; it refuses a
 conflicting `--node-id`, OCI configuration, or a non-plain source profile.
-The three existing plain LaunchAgents must be running for the initial verified
-drain. If they are not, repair the plain installation with plain setup first.
+The existing plain L1, L3 and primary agent LaunchAgents must be running for the
+initial verified drain. A generation installation uses its recorded primary,
+not the legacy agent label. Repair a legacy installation with plain setup;
+repair a generation installation with rolling recovery before conversion.
 
 For the attended cutover (#903), run the **new** CLI by its full path for both
 conversion and recovery, for example `/absolute/path/to/new/wefty setup ...`.
@@ -794,13 +796,117 @@ under the same UID can forge these files. Private ownership, regular-file
 checks and modes protect the existing account boundary; they do not authenticate
 processes within the account. These local records grant no L1 authority.
 
-Until role-aware maintenance is wired, setup (including conversion), remove,
-purge and legacy upgrade refuse the presence of the generation directory,
-even when idle or malformed, before service/file mutation. They recheck under
-the installation lock. This includes upgrade's recursive `.upgrade-*` stale
-staging cleanup. Removal clearly states that retirees may still hold work;
-there is no new force path. Refusal also preserves an unresolved cohort or an
-incomplete first-generation preparation instead of treating it as legacy.
+Quiet generation maintenance (#1229) is limited to plain-to-join conversion and
+removal, including the proof removal path. A quiet catalog has exactly one
+primary, no retiring or staged entries, no pending activation, and no unresolved
+rolling operation. The rolling receipt must be absent or terminal `complete` or
+`rolled_back`; a reboot-reconciled receipt still requires rolling recovery.
+Every finished-generation audit must contain its exact positive L1 closure and
+reap/evidence proof. Its digest binds the canonical decoded L1 closure, matching
+the existing retirement writer; retained file bytes remain unchanged. Catalog and rolling-receipt observation share the catalog
+lock and use the validated descriptor readers. Read/decode failures remain
+operational faults. Non-quiet state is a typed conflict (exit 5), with the
+retiree count or `wefty upgrade --rolling` recovery instruction, before mutation.
+
+All other setup and upgrade callers retain their conservative generation
+refusal. An unfinished generation-maintenance intent also fences unrelated
+maintenance, including the window after the active catalog has been retired.
+The installation lock serializes the whole maintenance operation; catalog locks
+remain short and do not span RPCs.
+
+Removal first records `agent-maintenance.json` in the installation data directory.
+It records the exact closed-admission intent before CAS, uses the existing
+service reap/evidence barrier, waits for non-restartable residents and applies
+the existing shutdown cancellation to restartable residents, then asks only the primary's named
+`de_enroll_generation` private operation to return L1 to legacy registration
+authority. The CLI never opens a node principal. L1 checks the operation, exact
+primary/boot/authority/catalog/intent, absence of staged or retiring generations,
+settled Attempts and positive local reap/evidence in one transaction. It closes
+the primary and revokes its boot before another legacy boot may register. The
+existing registration guard is unchanged. The existing operation-result ledger
+stores the exact request and result under a separate de-enrollment namespace;
+identical replay returns that result, and changed replay cannot replace it.
+
+The primary refuses every current-generation spool row without a positively
+reaped, finalized local runtime record, including rows with no events. Missing
+in-memory work after a restart does not prove closure. It durably attests local
+evidence before sending the L1 request and
+persists its result before replying. Installed startup can resolve that exact
+attested request before registration, managed-root initialization or payloads.
+An ambiguous reply retains closed admission and the exact request. Only HTTP 409
+`de_enrollment_not_committed`, non-retryable and bound by `details.node_id`,
+`operation_id` and `request_sha256`, is definitive. The hash binds canonical
+`DeEnrollNodeGenerationRequest` JSON, including both evidence flags. L1 first
+consults the operation ledger for that exact payload. A prior success returns its
+original inventory; changed-payload replay returns generic conflict and remains
+uncertain. With no prior outcome, a fence refusal durably records a terminal
+negative outcome in the existing ledger before emitting the typed proof. An
+identical delayed replay can never commit after this rejection, even if its
+failed fence later clears; a new attempt needs a new operation ID.
+
+Only verified proof permits the agent to publish its immutable local rejection
+receipt and remove the matching attestation. Startup and the live adapter use
+the same exact-request classification. Authentication/authorization (401/403),
+routing (404), malformed envelopes/requests, generic conflicts, unknown codes,
+5xx, transport/decode failures, rate limits and retryable replies all remain
+uncertain: none proves that the operation ledger was checked. Admission stays
+closed and the attestation remains for replay after the fault clears. A
+recorded rejection lets startup register normally; CLI recovery restores the
+owned precommit operation without waiting forever for a success result. Before
+de-enrollment commits, recovery restores the recorded primary and owned admission
+and service intent. After success, recovery only moves forward.
+
+Before attestation, a same-primary restart may refresh only the process binding
+and monotone catalog revision. Recovery verifies the exact ready record, manager
+PID, process birth identity and held lifetime lock; every other catalog field
+must match. It records restoration before changing services or admission. A
+replacement boot has no dead session's local service gate; the retained service
+queue still uses the existing fenced L1 recovery. After attestation the binding
+stays strict until an exact durable result or rejection resolves the request.
+
+The request candidate in CLI memory is not publication evidence. On a write
+failure, the CLI rereads the validated journal: an old document permits precommit
+restoration, a published request remains fenced, and an unreadable or conflicting
+document is an operational fault. A retry republishes intent before any RPC, so
+an earlier uncertain directory sync cannot weaken durability ordering.
+
+Only after durable de-enrollment does removal gracefully stop and confirm unload
+of the recorded primary, using the legacy bootout/drain behavior. Cleanup holds
+its directory and lifetime lock, reads each owned file through one no-follow,
+non-blocking descriptor, binds its bytes (the executable by its catalog digest),
+and unlinks relative to that held directory. A durable cleanup receipt precedes
+all deletions. Unknown files are never deleted. The active catalog directory is
+retired with an exclusive, descriptor-relative rename to the derived
+`agent-generation-history-PRIMARY` directory. Empty generation directories,
+catalog snapshots, control replies and audit receipts remain there as evidence.
+The original initialization intent moves there too. This is not an autostart
+location. No recursive catalog or generation deletion is used. Live SQLite
+files, shared node evidence/custody storage and audit history remain even for
+purge of a generation installation. A private
+`agent-generation-preservation.json` policy record outlives the maintenance
+journal and any incomplete setup removal. Later ordinary and proof purges honor
+that record even when no active catalog remains. For an earlier incomplete
+removal without a policy marker, its private archived catalog is read under its
+lock and verified against its archive identity; that snapshot also preserves the
+data. Malformed or unreadable policy or archive records are operational faults. It grants no execution or registration authority.
+Reports name the retained storage and reason;
+intentional retention is not an incomplete-removal warning. A later same-ID plain
+setup registers against the retained, de-enrolled L1 successfully. Admission
+stays closed in that retained database; the owner explicitly enables claims
+after reinstall when ready. Removal never treats de-enrollment as permission
+to reopen admission.
+
+Conversion verifies the primary plist against its catalog digest through one
+no-follow descriptor before recording intent or changing admission. It keeps the
+catalog, executable and primary plist through every reversible phase. Pre-history failure or retry reloads the exact recorded
+generation, never a legacy node against the enrolled local L1. Only after the
+read-only `history` phase is durable does receipt-bound cleanup retire generation
+installation files and the active catalog. Conversion then publishes the normal
+join layout, with no generation arguments. It does not de-enroll the historical
+local L1: the joined agent registers with the fleet authority selected by its
+join profile. Local L1 generation records remain read-only history and grant no
+authority in that separate fleet.
+
 
 `wefty-agent --retirement-protocols` prints exactly one versioned JSON object
 with `retirement_protocol_versions: [1]` and exits before startup I/O. This is

@@ -924,7 +924,7 @@ func requestGenerationControl(ctx context.Context, store agentinstall.Store, req
 					}
 					return nil, &apiResponseError{Service: "L1", StatusCode: result.StatusCode, APIError: apiError}
 				}
-				return nil, errors.New(result.Error)
+				return nil, &generationOperationFault{Message: result.Error}
 			}
 			return result.Payload, nil
 		}
@@ -1352,3 +1352,9 @@ func writeLegacyRolling(paths setupPaths, op upgradeHost, r *upgradeRollingRecei
 	}
 	return nil
 }
+
+// A correlated reply proves the adapter finished this request. Transport
+// timeout remains distinct because its L1 outcome may still be ambiguous.
+type generationOperationFault struct{ Message string }
+
+func (e *generationOperationFault) Error() string { return e.Message }

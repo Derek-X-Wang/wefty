@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/agent"
@@ -91,4 +92,58 @@ func reconcileInstalledActivation(ctx context.Context, store agentinstall.Store,
 		return store.AbortPromotion(inventory)
 	}
 	return nil // uncommitted intent remains fenced; it grants no startup authority
+}
+
+// Reconcile only an already-attested de-enrollment intent before registration.
+// L1's exact-request ledger resolves death after commit but before local result
+// publication. No new boot, managed root or payload is opened on this path.
+func reconcileInstalledDeEnrollment(ctx context.Context, store agentinstall.Store, profilePath string) (bool, error) {
+	record, err := store.ReadDeEnrollment()
+	if err != nil || record == nil {
+		return false, err
+	}
+	if record.Result != nil {
+		return true, nil
+	}
+	if rejected, e := store.DeEnrollmentRejected(record.Request); e != nil {
+		return true, e
+	} else if rejected {
+		return false, store.AbortDeEnrollment(record.Request)
+	}
+	profile, _, err := connprofile.Resolve(profilePath, "")
+	if err != nil {
+		return true, err
+	}
+	if profile.Fabric != "plain" || profile.Identities.Node != record.NodeID {
+		return true, &agentinstall.VerificationRefusal{Message: "de-enrollment recovery requires matching plain profile"}
+	}
+	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	config, err := fabricconfig.SavedService(profile, connprofile.ParticipantNodeAgent, fabricconfig.Config{Mode: "plain", PlainFabricID: profile.PlainFabricID, Identity: fabric.Identity{NodeID: record.NodeID, Tags: []string{l1.DefaultAgentPrincipalTag}}}, nil)
+	if err != nil {
+		return true, err
+	}
+	participant, closeFabric, err := fabricconfig.Open(bounded, config)
+	if closeFabric != nil {
+		defer closeFabric()
+	}
+	if err != nil {
+		return true, err
+	}
+	client, err := agent.NewClient(participant, profile.L1Address)
+	if err != nil {
+		return true, err
+	}
+	defer client.Close()
+	result, err := client.DeEnrollNodeGeneration(bounded, record.NodeID, record.Request)
+	if err != nil {
+		if agent.DefinitiveDeEnrollmentRefusal(err, record.NodeID, record.Request) {
+			if abortErr := store.AbortDeEnrollment(record.Request); abortErr != nil {
+				return true, errors.Join(err, abortErr)
+			}
+			return false, nil
+		}
+		return true, err
+	}
+	return true, store.CompleteDeEnrollment(result)
 }

@@ -79,6 +79,7 @@ type Catalog struct {
 // Store paths must be supplied by the installation's home-confined resolver.
 // Files are derived from random IDs, never from receipt paths.
 type Store struct {
+	MaintenanceStep           func(string) error
 	InitializationStep        func(string) error
 	initializationSyncDir     func(string, *os.Root) error
 	afterPromotionWrite       func(string) error
@@ -272,6 +273,11 @@ func (s Store) Read() (Catalog, error) {
 // is wired: even an idle recorded cohort must not fall into legacy unload or
 // recursive purge/stale-stage deletion. Missing catalog storage means legacy.
 func RefuseMaintenance(data, command string) error {
+	if _, err := os.Lstat(filepath.Join(data, MaintenanceFile)); err == nil {
+		return fmt.Errorf("%s refuses incomplete generation maintenance; resume setup --remove or setup --role join --convert-plain", command)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	_, err := os.Lstat(filepath.Join(data, Directory))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil

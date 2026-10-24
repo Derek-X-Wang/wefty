@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
@@ -37,6 +38,7 @@ type setupManifest struct {
 	Files            map[string]string     `json:"files"`
 }
 type setupRemoveReport struct {
+	Retained []string `json:"retained,omitempty"`
 	Changes  []string `json:"changes"`
 	Warnings []string `json:"warnings"`
 }
@@ -89,7 +91,8 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 			return report, errors.New("OCI host VM disk contains retained Storage and Backups; --purge is refused; remove the install without --purge")
 		}
 	}
-	if err := agentinstall.RefuseMaintenance(paths.data, "setup --remove"); err != nil {
+	catalog, maintenance, err := checkGenerationMaintenance(host, paths, generationMaintenanceRemove)
+	if err != nil {
 		return report, err
 	}
 	if purge && (paths.dataRel != setupFolders.data || paths.logsRel != setupFolders.logs) {
@@ -109,9 +112,16 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 		return report, err
 	}
 	defer unlock()
-	if err := agentinstall.RefuseMaintenance(paths.data, "setup --remove"); err != nil {
+	catalog, maintenance, err = checkGenerationMaintenance(host, paths, generationMaintenanceRemove)
+	if err != nil {
 		return report, err
 	}
+	store := upgradeGenerationStore(host, paths, upgradeOperations(host))
+	preservedGenerations, err := store.HasPreservedGenerationData()
+	if err != nil {
+		return report, &maintenanceFault{Cause: err}
+	}
+	preservedGenerations = preservedGenerations || catalog != nil
 	root, err := os.OpenRoot(home)
 	if err != nil {
 		return report, err
@@ -236,6 +246,25 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 			report.Warnings = append(report.Warnings, "left "+filepath.Join(home, name)+": content is not the file setup installed; inspect it and remove it yourself if appropriate")
 		}
 	}
+	// Validate unverifiable loaded definitions before the irreversible L1 step.
+	if catalog != nil {
+		for _, label := range labels {
+			name := filepath.Join(paths.launchAgentsRel, label+".plist")
+			if owned[name] {
+				continue
+			}
+			state, e := (launchagent.Manager{UID: host.uid, Run: host.launchctl}).State(ctx, label)
+			if e != nil {
+				return report, e
+			}
+			if state.Loaded {
+				return report, fmt.Errorf("LaunchAgent %s is loaded but its setup-owned definition cannot be verified; restore its definition before removal", label)
+			}
+		}
+	}
+	if err := removeMaintenanceGeneration(ctx, host, paths, catalog, maintenance, &report); err != nil {
+		return report, err
+	}
 	// Unload everything before deleting anything. A failed unload leaves the
 	// files (and ownership evidence) available for another attempt.
 	for _, label := range labels {
@@ -300,7 +329,7 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 	if purge {
 		if !setupEvidence {
 			report.Warnings = append(report.Warnings, "left data and logs: no setup receipt or LaunchAgent plist proves setup installed this home; inspect them before removing them yourself")
-		} else if err := purgeSetupEntries(root, paths, &report); err != nil {
+		} else if err := purgeSetupEntries(root, paths, &report, preservedGenerations); err != nil {
 			return report, err
 		}
 	}
@@ -323,13 +352,19 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 			report.Changes = append(report.Changes, paths.data)
 		}
 	}
+	if catalog != nil {
+		store := upgradeGenerationStore(host, paths, upgradeOperations(host))
+		if err := store.FinishMaintenance(); err != nil {
+			return report, err
+		}
+	}
 	return report, nil
 }
 func setupMetadataPath(paths setupPaths, name string) bool {
 	return name == filepath.Join(paths.configRel, connprofile.FileName) || name == filepath.Join(paths.configRel, "node.json")
 }
 
-func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveReport) error {
+func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveReport, preserveGenerations ...bool) error {
 	var manifest setupManifest
 	if payload, err := root.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
 		_ = json.Unmarshal(payload, &manifest)
@@ -344,6 +379,12 @@ func purgeSetupEntries(root *os.Root, paths setupPaths, report *setupRemoveRepor
 		}
 		for _, entry := range entries {
 			name := entry.Name()
+			if len(preserveGenerations) > 0 && preserveGenerations[0] && folder == paths.dataRel && (strings.HasPrefix(name, "l1.sqlite") || strings.HasPrefix(name, "l3.sqlite") || name == "node-agent" || strings.HasPrefix(name, "agent-generation-") || name == agentinstall.MaintenanceFile) {
+				if name != agentinstall.MaintenanceFile {
+					report.Retained = append(report.Retained, "left "+filepath.Join(paths.data, name)+": live database, shared evidence/custody or generation audit storage is preserved")
+				}
+				continue
+			}
 			// Retained authority is never a purge target, including future entries.
 			if folder == paths.dataRel && name == plainHistoryFolder {
 				continue
