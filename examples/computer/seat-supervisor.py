@@ -197,11 +197,13 @@ def open_directory(path):
         raise
 
 
-def remove_at(parent, name):
+def remove_at(parent, name, uid=None):
     """Iterative no-follow deletion with at most three extra descriptors.
 
     Parent identities are checked on ascent, so a renamed directory cannot
     redirect cleanup. Depth consumes metadata, never Python stack or fds.
+    With uid set, visit other users' directories but remove only uid-owned
+    entries; retain directories that still hold another user's entries.
     """
     current = os.dup(parent)
     frames = []
@@ -221,7 +223,10 @@ def remove_at(parent, name):
                     if ((observed.st_dev, observed.st_ino) != expected_parent
                             or (child.st_dev, child.st_ino) != expected_child):
                         raise SeatFailure("cleanup_path_replaced")
-                    os.rmdir(name, dir_fd=upper)
+                    if uid is None or (child.st_uid == uid and not os.listdir(current)):
+                        os.rmdir(name, dir_fd=upper)
+                except FileNotFoundError:
+                    pass
                 except BaseException:
                     os.close(upper)
                     raise
@@ -232,10 +237,19 @@ def remove_at(parent, name):
                 info = os.stat(name, dir_fd=current, follow_symlinks=False)
             except FileNotFoundError:
                 continue
+            if uid is not None and info.st_dev != os.fstat(current).st_dev:
+                continue  # A nested mount is outside this scratch filesystem.
             if not stat.S_ISDIR(info.st_mode):
-                os.unlink(name, dir_fd=current)
+                if uid is None or info.st_uid == uid:
+                    try:
+                        os.unlink(name, dir_fd=current)
+                    except FileNotFoundError:
+                        pass
                 continue
-            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+            except FileNotFoundError:
+                continue
             try:
                 observed, upper = os.fstat(child), os.fstat(current)
                 if ((info.st_dev, info.st_ino) != (observed.st_dev, observed.st_ino)
@@ -417,8 +431,7 @@ def sweep_scratch(uid):
         try:
             for name in os.listdir(descriptor):
                 try:
-                    if os.stat(name, dir_fd=descriptor, follow_symlinks=False).st_uid == uid:
-                        remove_at(descriptor, name)
+                    remove_at(descriptor, name, uid=uid)
                 except FileNotFoundError:
                     pass
         finally:

@@ -884,7 +884,15 @@ root intentionally has no `CAP_IPC_OWNER`. The cleaner runs as
 `/usr/bin/python3 -I -S`, with cwd `/` and a clean environment, so Seat Python
 user-site hooks cannot run during cleanup. It then proves process absence
 again, removes uid-owned scratch (including X sockets/locks and POSIX shared
-memory), and deletes the Seat folder. `/wefty/service/shared` is mode `1777`
+memory), and deletes the Seat folder. The scratch sweep walks `/tmp`,
+`/var/tmp`, `/dev/shm`, `/run` and `/tmp/.X11-unix` at every depth, bottom-up,
+without following symlinks or crossing nested mounts (`st_dev`). It descends
+through folders owned by other uids, removes only entries owned by the ending
+Seat uid, and retains other uids' files and folders. An owned folder that still
+contains another uid's entries also stays. Owned symlinks are unlinked without
+touching their targets. Entries that disappear during cleanup are harmless;
+other cleanup errors produce `cleanup_failed` without positive
+`cleanup_complete` evidence. `/wefty/service/shared` is mode `1777`
 and survives. A new attempt has a fresh status tmpfs and control directory;
 startup clears stale Seat folders and starts no Seat without a fresh directive.
 
@@ -919,7 +927,11 @@ Failures repair root-owned evidence permissions before artifact upload.
 them with containerd's stored spec. The **1 GiB** live cgroup must report the
 same `memory.max`, `memory.swap.max=0` and `memory.oom.group=1`. The lane owns
 IM-1, IM-2 and IM-6, plus secondary IM-4 display/file and IM-5 cleanup/memory
-proof. It also checks IPC removal, X socket/lock absence, component recovery,
+proof. The helper IM-5 fixture splits 128 MiB of shared-memory charge between
+a top-level file and a nested file inside a root-owned sticky scratch folder.
+Both files must disappear, the other uid's folder and file must survive, and
+the charge must return below the existing recovery tolerance. It also checks
+IPC removal, X socket/lock absence, component recovery,
 and the missing-passwd negative image under that same profile.
 
 This is image evidence, not helper/L1/CLI integration. Storage is a directory

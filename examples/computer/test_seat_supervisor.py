@@ -248,6 +248,174 @@ class SupervisorTest(unittest.TestCase):
         self.assertIn(2, self.backend.live)
 
 
+class ScratchCleanupTest(unittest.TestCase):
+    def test_nested_scratch_removes_only_ending_uid_without_following_links(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            scratch = root / 'scratch'
+            scratch.mkdir()
+            foreign = scratch / 'other-seat'
+            foreign.mkdir()
+            nested = foreign / 'nested'
+            nested.mkdir()
+            ending_file = nested / 'big'
+            ending_file.write_text('charged memory')
+            foreign_file = nested / 'keep'
+            foreign_file.write_text('other Seat')
+            empty = foreign / 'ending-empty'
+            empty.mkdir()
+            outside = root / 'outside'
+            outside.mkdir()
+            target = outside / 'keep'
+            target.write_text('link target')
+            link = foreign / 'ending-link'
+            link.symlink_to(outside, target_is_directory=True)
+            foreign_link = scratch / 'foreign-link'
+            foreign_link.symlink_to(outside, target_is_directory=True)
+            dangling = foreign / 'ending-dangling'
+            dangling.symlink_to(root / 'missing')
+            owned = {p.lstat().st_ino for p in (nested, ending_file, empty, link, dangling, target)}
+            uid = os.getuid() + 10000
+            real_stat = os.stat
+            real_open_directory = supervisor.open_directory
+
+            def seat_stat(*args, **kwargs):
+                info = real_stat(*args, **kwargs)
+                values = list(info)
+                values[4] = uid if info.st_ino in owned else uid + 1
+                return os.stat_result(values)
+
+            # Only ownership is simulated; traversal, unlink and rmdir use real files.
+            def open_scratch(folder):
+                if folder == '/dev/shm':
+                    return real_open_directory(scratch)
+                raise FileNotFoundError(folder)
+
+            with mock.patch.object(supervisor, 'open_directory', side_effect=open_scratch), \
+                    mock.patch.object(supervisor.os, 'stat', side_effect=seat_stat):
+                supervisor.sweep_scratch(uid)
+            self.assertFalse(ending_file.exists())
+            self.assertFalse(empty.exists())
+            self.assertFalse(link.is_symlink())
+            self.assertFalse(dangling.is_symlink())
+            self.assertEqual(foreign_file.read_text(), 'other Seat')
+            self.assertTrue(foreign.is_dir())
+            self.assertTrue(nested.is_dir())  # Still contains another uid's file.
+            self.assertTrue(foreign_link.is_symlink())
+            self.assertEqual(target.read_text(), 'link target')
+
+    def test_scratch_does_not_cross_a_nested_mount(self):
+        with tempfile.TemporaryDirectory() as d:
+            scratch = Path(d).resolve()
+            mount = scratch / 'mount'
+            mount.mkdir()
+            (mount / 'keep').write_text('different filesystem')
+            real_stat = os.stat
+            mount_inode = mount.stat().st_ino
+
+            def mounted_stat(*args, **kwargs):
+                info = real_stat(*args, **kwargs)
+                if info.st_ino == mount_inode:
+                    values = list(info)
+                    values[2] = info.st_dev + 1
+                    return os.stat_result(values)
+                return info
+
+            descriptor = supervisor.open_directory(scratch)
+            with mock.patch.object(supervisor, 'open_directory', side_effect=lambda _: os.dup(descriptor)), \
+                    mock.patch.object(supervisor.os, 'stat', side_effect=mounted_stat):
+                try:
+                    supervisor.sweep_scratch(os.getuid())
+                finally:
+                    os.close(descriptor)
+            self.assertEqual((mount / 'keep').read_text(), 'different filesystem')
+
+    def test_nested_cleanup_failure_withholds_positive_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            scratch = root / 'scratch'
+            scratch.mkdir()
+            foreign = scratch / 'other-seat'
+            foreign.mkdir()
+            target = foreign / 'blocked'
+            target.write_text('charged memory')
+            inode = target.stat().st_ino
+            uid = 2001
+            real_stat = os.stat
+            real_unlink = os.unlink
+
+            def seat_stat(*args, **kwargs):
+                info = real_stat(*args, **kwargs)
+                values = list(info)
+                values[4] = uid if info.st_ino == inode else uid + 1
+                return os.stat_result(values)
+
+            def denied_unlink(name, **kwargs):
+                if name == 'blocked':
+                    raise PermissionError('scratch cleanup denied')
+                return real_unlink(name, **kwargs)
+
+            descriptor = supervisor.open_directory(scratch)
+            backend = supervisor.DesktopBackend(mock.Mock())
+            engine = supervisor.Supervisor(root, backend, clock=lambda: 0)
+            real_open_directory = supervisor.open_directory
+
+            def open_scratch(folder):
+                if folder in ('/tmp', '/var/tmp', '/dev/shm', '/run', '/tmp/.X11-unix'):
+                    return os.dup(descriptor)
+                return real_open_directory(folder)
+
+            with mock.patch.object(supervisor, 'open_directory', side_effect=open_scratch), \
+                    mock.patch.object(supervisor.os, 'stat', side_effect=seat_stat), \
+                    mock.patch.object(supervisor.os, 'unlink', side_effect=denied_unlink), \
+                    mock.patch.object(supervisor, 'kill_uid'), \
+                    mock.patch.object(supervisor.subprocess, 'run'):
+                try:
+                    stopped = engine.stop(1)
+                finally:
+                    os.close(descriptor)
+            answer = json.loads((root / '1.json').read_text())
+            self.assertFalse(stopped)
+            self.assertEqual(answer['reason'], 'cleanup_failed')
+            self.assertFalse(answer['cleanup_complete'])
+            self.assertTrue(target.exists())
+            backend.storage.remove_seat.assert_not_called()
+
+    def test_nested_scratch_disappearing_during_unlink_is_quiet(self):
+        with tempfile.TemporaryDirectory() as d:
+            scratch = Path(d).resolve()
+            foreign = scratch / 'other-seat'
+            foreign.mkdir()
+            target = foreign / 'gone'
+            target.write_text('charged memory')
+            inode = target.stat().st_ino
+            uid = os.getuid() + 10000
+            real_stat = os.stat
+            real_unlink = os.unlink
+
+            def seat_stat(*args, **kwargs):
+                info = real_stat(*args, **kwargs)
+                values = list(info)
+                values[4] = uid if info.st_ino == inode else uid + 1
+                return os.stat_result(values)
+
+            def racing_unlink(name, **kwargs):
+                real_unlink(name, **kwargs)
+                if name == 'gone':
+                    raise FileNotFoundError(name)
+
+            descriptor = supervisor.open_directory(scratch)
+            with mock.patch.object(supervisor, 'open_directory', side_effect=lambda _: os.dup(descriptor)), \
+                    mock.patch.object(supervisor.os, 'stat', side_effect=seat_stat), \
+                    mock.patch.object(supervisor.os, 'unlink', side_effect=racing_unlink):
+                try:
+                    supervisor.sweep_scratch(uid)
+                finally:
+                    os.close(descriptor)
+            self.assertFalse(target.exists())
+            self.assertTrue(foreign.is_dir())
+
+
 class StorageSafetyTest(unittest.TestCase):
     def test_writable_service_is_refused(self):
         with tempfile.TemporaryDirectory() as d:
