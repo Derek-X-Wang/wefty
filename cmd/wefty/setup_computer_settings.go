@@ -36,23 +36,9 @@ type setupComputerOptions struct {
 }
 
 func bindSetupComputerFlags(flags *flag.FlagSet, values *setupComputerOptions) {
-	for _, setting := range []struct {
-		name, help string
-		target     **time.Duration
-	}{
-		{"seat-idle-wait", "Seat idle wait (default 30m)", &values.SeatIdleWait},
-		{"seat-warning-wait", "warning interval before Seat expiry (default 5m)", &values.SeatWarningWait},
-		{"computer-idle-wait", "Computer idle wait (default 10m)", &values.ComputerIdleWait},
-	} {
-		flags.Func(setting.name, setting.help, func(raw string) error {
-			value, err := time.ParseDuration(raw)
-			if err != nil || value <= 0 {
-				return fmt.Errorf("--%s requires a positive duration", setting.name)
-			}
-			*setting.target = &value
-			return nil
-		})
-	}
+	flags.Func("seat-idle-wait", "Seat idle wait (default 30m)", setupPositiveDuration("seat-idle-wait", &values.SeatIdleWait))
+	flags.Func("seat-warning-wait", "warning interval before Seat expiry (default 5m)", setupPositiveDuration("seat-warning-wait", &values.SeatWarningWait))
+	flags.Func("computer-idle-wait", "Computer idle wait (default 10m)", setupPositiveDuration("computer-idle-wait", &values.ComputerIdleWait))
 
 	flags.Func("computer-default-image", "digest-pinned cluster default Computer image reference", func(value string) error {
 		if err := l1.ValidateComputerDefaultImage(value); err != nil {
@@ -85,6 +71,19 @@ func bindSetupComputerFlags(flags *flag.FlagSet, values *setupComputerOptions) {
 		values.DedicatedCap = &n
 		return nil
 	})
+}
+
+// setupPositiveDuration parses one timer setting. Flag names stay literal at
+// the registration site for TestJSONValueFlagVocabulary.
+func setupPositiveDuration(name string, target **time.Duration) func(string) error {
+	return func(raw string) error {
+		value, err := time.ParseDuration(raw)
+		if err != nil || value <= 0 {
+			return fmt.Errorf("--%s requires a positive duration", name)
+		}
+		*target = &value
+		return nil
+	}
 }
 
 func (values *setupComputerOptions) merge(next setupComputerOptions) {
