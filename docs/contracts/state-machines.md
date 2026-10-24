@@ -2735,3 +2735,33 @@ same transaction. #1142 currently retains final Seat records indefinitely; no
 new time-based retention period is introduced here. Permanent Seat identities
 retain `ever_live`, backfilled from the original `start_finished` receipts, so
 pruning call records cannot turn an existing Computer into a failed new start.
+
+### Rolling status projection (#1181)
+
+The CLI projects coordinator state separately from generation retirement:
+`cutover` requires a nonterminal receipt (or pending activation) plus the live
+installation lock; `interrupted` requires a positively free kernel lock and
+receipt identity/phase revalidation after the probe;
+`complete` includes healthy pending retirement; `unverified` preserves unavailable
+authority or unreadable evidence. These projections write no state. Terminal
+receipt phases include `reboot_reconciled`, which preserves interrupted Attempt
+observations rather than asserting survival. Each retiree's frozen residents are
+read even after loss or interruption. Lease deadlines and accepted renewal times
+belong to the resident, never to the primary heartbeat. Terminal Attempt problems
+remain visible in retained closed session history. Optional public Node
+`generations` fields are read in the same `ReadOnly:true` snapshot as Node
+capacity. See [rolling diagnosis](plain-node-upgrade.md#read-only-rolling-status-and-doctor-1181).
+
+An enrolled Node without generation observations is unverified. Diagnostic
+catalog and retirement-ack reads never wait for the catalog lock; contention and
+unknown setup-lock evidence retain their causes. Per-record public observation
+errors preserve readable Nodes and residents; snapshot failures still fail the
+request. Null current Attempt state does not erase recorded reboot interruption.
+
+Installation diagnostics also report pending maintenance intent independently of
+rolling state. A completed upgrade and healthy primary cannot hide a retained
+removal/conversion journal. Active-Attempt observation errors are unverified
+regardless of generation enrollment; record-specific conversion errors preserve
+the affected identity and readable Nodes. Neither error infers Attempt failure.
+Database/snapshot failures remain request failures; private authority reads stay
+strict and all L1 diagnostic reads retain `TxOptions{ReadOnly:true}`.

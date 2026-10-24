@@ -183,11 +183,21 @@ func (s Store) ReadPromotionResult(id string) (result ControlResult, err error) 
 	return
 }
 
+// ReadRetirementDiagnostic refuses contention instead of waiting for cleanup.
+func (s Store) ReadRetirementDiagnostic(id string) (g l1.NodeGeneration, err error) {
+	err = s.readRetainedEvidenceWithOpen(id, "retirement-ack.json", &g, s.openDiagnostic)
+	return
+}
+
 func (s Store) readRetainedEvidence(id, name string, target any) error {
+	return s.readRetainedEvidenceWithOpen(id, name, target, func() (*os.Root, func(), error) { return s.open(false) })
+}
+
+func (s Store) readRetainedEvidenceWithOpen(id, name string, target any, open func() (*os.Root, func(), error)) error {
 	if !validID(id) {
 		return &ControlRequestRefusal{Message: "invalid evidence generation"}
 	}
-	root, close, err := s.open(false)
+	root, close, err := open()
 	if err != nil {
 		return err
 	}

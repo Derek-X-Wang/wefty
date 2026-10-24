@@ -94,20 +94,21 @@ type readModel interface {
 // databaseReads is private SQL plumbing; callers see only readModel.
 // A write gets a fresh memo at each decision, never across writes.
 type databaseReads struct {
-	personDeviceBinding *personDeviceBinding
-	pageDeadline        time.Time
-	q                   queryer
-	at                  time.Time
-	actor               *serviceActionActor
-	reads               *serviceOperatorReads
-	nodeIDs             []string
-	placements          map[string]placementRead
-	requirements        map[string]placementRequirements
-	occupancy           map[string]int
-	occupancyLoaded     bool
-	occupancyErr        error
-	nodesLoaded         bool
-	nodesErr            error
+	diagnosticObservations bool
+	personDeviceBinding    *personDeviceBinding
+	pageDeadline           time.Time
+	q                      queryer
+	at                     time.Time
+	actor                  *serviceActionActor
+	reads                  *serviceOperatorReads
+	nodeIDs                []string
+	placements             map[string]placementRead
+	requirements           map[string]placementRequirements
+	occupancy              map[string]int
+	occupancyLoaded        bool
+	occupancyErr           error
+	nodesLoaded            bool
+	nodesErr               error
 }
 type nodeRead struct {
 	value Node
@@ -150,7 +151,10 @@ func (r *databaseReads) attempts(ctx context.Context, id string) ([]Attempt, err
 func (r *databaseReads) node(ctx context.Context, id string) (Node, error) {
 	value, ok := r.reads.nodes[id]
 	if !ok {
-		value.value, value.err = getNode(ctx, r.q, id)
+		value.value, value.err = getNodeProjection(ctx, r.q, id, r.diagnosticObservations)
+		if value.err == nil && value.value.AgentGenerationID != "" {
+			value.value.Generations, value.err = readNodeGenerationObservations(ctx, r.q, id)
+		}
 		r.reads.nodes[id] = value
 	}
 	return value.value, value.err
@@ -537,6 +541,7 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 		return err
 	}
 	reads := newDatabaseReads(tx, canonicalTime(s.clock.Now()), caller)
+	reads.diagnosticObservations = true
 	reads.personDeviceBinding = &s.personDeviceBinding
 	cutoff := readSnapshotPageCutoff
 	if override, ok := ctx.Value(readPageCutoffContextKey{}).(time.Duration); ok {

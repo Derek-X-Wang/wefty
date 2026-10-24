@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "install": "plain-process",
+  "healthy": true,
+  "findings": [
+    {
+      "check": "local-node",
+      "severity": "ok",
+      "detail": "verified",
+      "fix": ""
+    }
+  ]
+}

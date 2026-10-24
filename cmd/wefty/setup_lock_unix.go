@@ -90,26 +90,40 @@ func lockSetup(paths setupPaths, create bool) (func(), error) {
 	}, nil
 }
 
-func setupLockHeld(paths setupPaths) bool {
+func setupLockHeld(paths setupPaths) bool { return observeSetupLock(paths).state == setupLockHeldState }
+
+func observeSetupLock(paths setupPaths) setupLockObservation {
 	setupLockOwners.Lock()
 	defer setupLockOwners.Unlock()
 	if setupLockOwners.held[filepath.Join(paths.data, setupLockProbeFile)] {
-		return true
+		return setupLockObservation{state: setupLockHeldState}
+	}
+	unknown := func(err error) setupLockObservation {
+		return setupLockObservation{cause: fmt.Errorf("setup lock observation: %w", err)}
 	}
 	root, err := os.OpenRoot(paths.home)
 	if err != nil {
-		return false
+		return unknown(err)
 	}
 	defer root.Close()
 	probe, err := root.OpenFile(filepath.Join(paths.dataRel, setupLockProbeFile), os.O_RDONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return false
+		return unknown(err)
 	}
 	defer probe.Close()
 	info, err := probe.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return false
+	if err != nil {
+		return unknown(err)
+	}
+	if !info.Mode().IsRegular() {
+		return unknown(errors.New("companion must be a regular file"))
 	}
 	lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0}
-	return unix.FcntlFlock(probe.Fd(), unix.F_GETLK, &lock) == nil && lock.Type != unix.F_UNLCK
+	if err := unix.FcntlFlock(probe.Fd(), unix.F_GETLK, &lock); err != nil {
+		return unknown(err)
+	}
+	if lock.Type != unix.F_UNLCK {
+		return setupLockObservation{state: setupLockHeldState}
+	}
+	return setupLockObservation{state: setupLockFree}
 }

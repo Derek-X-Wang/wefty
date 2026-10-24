@@ -87,6 +87,9 @@ func writeDoctorReport(out io.Writer, report plainDoctorReport, jsonOutput bool)
 	if jsonOutput {
 		return writeJSON(out, report)
 	}
+	if err := writeRollingStatus(out, report.rollingStatusFields); err != nil {
+		return err
+	}
 	for _, f := range report.Findings {
 		if _, err := fmt.Fprintf(out, "%s\t%s\t%s\n", f.Check, f.Severity, f.Detail); err != nil {
 			return err
@@ -105,8 +108,14 @@ func writeDoctorReport(out io.Writer, report plainDoctorReport, jsonOutput bool)
 	return nil
 }
 
-func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, paths setupPaths, role serviceplan.Role) (plainDoctorReport, error) {
-	report := plainDoctorReport{Version: 1, Install: "fleet-process", Role: role, Healthy: true, Findings: []plainDoctorFinding{}}
+func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, paths setupPaths, role serviceplan.Role) (report plainDoctorReport, diagnosis error) {
+	defer func() {
+		appendDoctorRolling(ctx, host, options, &report)
+		if !report.Healthy && diagnosis == nil {
+			diagnosis = &notReadyError{verdict: "doctor found issues; follow the fix hints"}
+		}
+	}()
+	report = plainDoctorReport{Version: 1, Install: "fleet-process", Role: role, Healthy: true, Findings: []plainDoctorFinding{}}
 	add := func(check, severity, detail, fix string) {
 		if severity == "ok" {
 			fix = ""

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"reflect"
 	"slices"
@@ -332,6 +333,12 @@ func (s *Store) NodeGenerations(ctx context.Context, identity, nodeID string) (N
 }
 
 func readNodeGenerations(ctx context.Context, q queryer, nodeID string) (NodeGenerationInventory, error) {
+	return readNodeGenerationInventory(ctx, q, nodeID, nil)
+}
+
+// Diagnostic projections retain malformed record identity and continue. Private
+// authority reads keep their fail-closed validation through the nil error map.
+func readNodeGenerationInventory(ctx context.Context, q queryer, nodeID string, recordErrors map[string]string) (NodeGenerationInventory, error) {
 	inventory := NodeGenerationInventory{NodeID: nodeID, Generations: []NodeGeneration{}}
 	err := q.QueryRowContext(ctx, `SELECT catalog_revision FROM node_generation_catalog WHERE node_id=?`, nodeID).Scan(&inventory.CatalogRevision)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -350,16 +357,33 @@ func readNodeGenerations(ctx context.Context, q queryer, nodeID string) (NodeGen
 		var created, heartbeat int64
 		var retiring, closed sql.NullInt64
 		if err = rows.Scan(&g.AgentGenerationID, &g.BootSessionID, &g.AuthorityGeneration, &g.Role, &payload, &versions, &g.SelectedProtocol, &g.PromotionOperationID, &created, &heartbeat, &retiring, &closed); err != nil {
-			rows.Close()
-			return inventory, err
+			if recordErrors == nil {
+				rows.Close()
+				return inventory, err
+			}
+			recordErrors[g.AgentGenerationID] = fmt.Sprintf("generation %s: unreadable retained generation: %v", g.AgentGenerationID, err)
+			inventory.Generations = append(inventory.Generations, g)
+			continue
 		}
 		if err = json.Unmarshal(payload, &g.Registration); err != nil {
-			rows.Close()
-			return inventory, err
+			if recordErrors == nil {
+				rows.Close()
+				return inventory, err
+			}
+			recordErrors[g.AgentGenerationID] = fmt.Sprintf("generation %s: unreadable registration: %v", g.AgentGenerationID, err)
+			g.Registration = contract.NodeRegistration{}
 		}
 		if err = json.Unmarshal(versions, &g.RetirementProtocolVersions); err != nil {
-			rows.Close()
-			return inventory, err
+			if recordErrors == nil {
+				rows.Close()
+				return inventory, err
+			}
+			cause := fmt.Sprintf("generation %s: unreadable retirement protocols: %v", g.AgentGenerationID, err)
+			if recordErrors[g.AgentGenerationID] != "" {
+				cause = recordErrors[g.AgentGenerationID] + "; " + cause
+			}
+			recordErrors[g.AgentGenerationID] = cause
+			g.RetirementProtocolVersions = nil
 		}
 		g.CreatedAt = time.Unix(0, created).UTC()
 		g.LastHeartbeatAt = time.Unix(0, heartbeat).UTC()

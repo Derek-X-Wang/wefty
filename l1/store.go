@@ -1367,6 +1367,11 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.ensureColumn(ctx, "service_jobs", "lease_loss_count", "INTEGER NOT NULL DEFAULT 0 CHECK(lease_loss_count >= 0)"); err != nil {
 		return err
 	}
+	// Keep historical rows unknown. Only an accepted renewal sets this time;
+	// generic Attempt updates and primary heartbeats cannot stand in for it.
+	if err := s.ensureColumn(ctx, "attempts", "last_renewal_ns", "INTEGER"); err != nil {
+		return err
+	}
 	// A completion records who asked its exit-code payload to end, '' for no
 	// one. An attempt completed before L1 kept that fact reads NULL: unknown,
 	// not a payload's own exit.
@@ -3668,7 +3673,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	if attempt.state == contract.AttemptClaimed && attempt.spec.Kind != contract.JobKindOCI && !canceled {
 		nextState = contract.AttemptRunning
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE attempts SET state=?, lease_expires_ns=?, updated_ns=? WHERE attempt_id=?", nextState, expires.UnixNano(), now.UnixNano(), attemptID)
+	_, err = tx.ExecContext(ctx, "UPDATE attempts SET state=?, lease_expires_ns=?, updated_ns=?, last_renewal_ns=? WHERE attempt_id=?", nextState, expires.UnixNano(), now.UnixNano(), now.UnixNano(), attemptID)
 	if err != nil {
 		return AttemptLease{}, internalError(err, "renew attempt lease")
 	}
@@ -5350,6 +5355,10 @@ type nodeQueryer interface {
 }
 
 func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
+	return getNodeProjection(ctx, q, nodeID, false)
+}
+
+func getNodeProjection(ctx context.Context, q nodeQueryer, nodeID string, diagnostic bool) (Node, error) {
 	var node Node
 	var capabilitiesJSON, missingCapabilitiesJSON, conditionData []byte
 	var heartbeatNS, capabilityObservedNS int64
@@ -5421,8 +5430,7 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 		}
 	}
 	node.ActiveAttempts = make([]NodeActiveAttempt, 0)
-	attempts, err := q.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.boot_session_id, json_extract(CAST(j.spec_json AS TEXT),'$.kind'),
-		json_extract(CAST(j.spec_json AS TEXT),'$.class'), a.state, a.lease_expires_ns, COALESCE(json_extract(CAST(j.spec_json AS TEXT),'$.restartable'), 0)
+	attempts, err := q.QueryContext(ctx, `SELECT a.job_id, a.attempt_id, a.boot_session_id, j.spec_json, a.state, a.lease_expires_ns
 		FROM attempts a JOIN jobs j ON j.job_id=a.job_id
 		WHERE a.node_id=? AND a.state IN (?, ?, ?) ORDER BY a.created_ns, a.attempt_id`, nodeID,
 		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput)
@@ -5433,8 +5441,30 @@ func getNode(ctx context.Context, q nodeQueryer, nodeID string) (Node, error) {
 	for attempts.Next() {
 		var attempt NodeActiveAttempt
 		var leaseNS int64
-		if err := attempts.Scan(&attempt.JobID, &attempt.AttemptID, &attempt.BootSessionID, &attempt.Kind, &attempt.Class, &attempt.State, &leaseNS, &attempt.Restartable); err != nil {
-			return Node{}, err
+		var specJSON []byte
+		if err := attempts.Scan(&attempt.JobID, &attempt.AttemptID, &attempt.BootSessionID, &specJSON, &attempt.State, &leaseNS); err != nil {
+			if !diagnostic {
+				return Node{}, err
+			}
+			if iterationErr := attempts.Err(); iterationErr != nil {
+				return Node{}, iterationErr
+			}
+			attempt.ObservationError = fmt.Sprintf("Job %s (Attempt %s): unreadable retained Attempt: %v", attempt.JobID, attempt.AttemptID, err)
+			node.ActiveAttempts = append(node.ActiveAttempts, attempt)
+			continue
+		}
+		var spec struct {
+			Kind        string `json:"kind"`
+			Class       string `json:"class"`
+			Restartable bool   `json:"restartable"`
+		}
+		if err := json.Unmarshal(specJSON, &spec); err != nil {
+			if !diagnostic {
+				return Node{}, err
+			}
+			attempt.ObservationError = fmt.Sprintf("Job %s (Attempt %s): unreadable retained Job spec: %v", attempt.JobID, attempt.AttemptID, err)
+		} else {
+			attempt.Kind, attempt.Class, attempt.Restartable = spec.Kind, spec.Class, spec.Restartable
 		}
 		attempt.LeaseExpiresAt = time.Unix(0, leaseNS).UTC()
 		node.ActiveAttempts = append(node.ActiveAttempts, attempt)

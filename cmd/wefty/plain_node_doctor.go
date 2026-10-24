@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
@@ -30,6 +30,7 @@ type plainDoctorFinding struct {
 	Fix      string `json:"fix"`
 }
 type plainDoctorReport struct {
+	rollingStatusFields
 	Role           serviceplan.Role      `json:"role,omitempty"`
 	PolicyEvidence []setupReadinessCheck `json:"policy_evidence,omitempty"`
 	Version        int                   `json:"version"`
@@ -52,6 +53,9 @@ func executePlainDoctor(ctx context.Context, options globalOptions, args []strin
 			return err
 		}
 	} else {
+		if err := writeRollingStatus(stdout, report.rollingStatusFields); err != nil {
+			return err
+		}
 		for _, finding := range report.Findings {
 			if _, err := fmt.Fprintf(stdout, "%s\t%s\t%s\n", finding.Check, finding.Severity, finding.Detail); err != nil {
 				return err
@@ -71,8 +75,10 @@ func executePlainDoctor(ctx context.Context, options globalOptions, args []strin
 
 // This diagnosis reads local files even if every service is down. Only node
 // registration needs L1, and an unavailable L1 is explicitly unverified.
-func runPlainDoctor(ctx context.Context, host setupHost, options globalOptions) plainDoctorReport {
-	report := plainDoctorReport{Version: 1, Install: "plain-process", Healthy: true, Findings: []plainDoctorFinding{}}
+func runPlainDoctor(ctx context.Context, host setupHost, options globalOptions) (report plainDoctorReport) {
+	var observed l1.NodeList
+	defer func() { appendDoctorRolling(ctx, host, options, &report, observed) }()
+	report = plainDoctorReport{Version: 1, Install: "plain-process", Healthy: true, Findings: []plainDoctorFinding{}}
 	add := func(check, severity, detail, fix string) {
 		if severity == "ok" {
 			fix = ""
@@ -84,7 +90,15 @@ func runPlainDoctor(ctx context.Context, host setupHost, options globalOptions) 
 	}
 	budget, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	for _, label := range []string{setupL1Label, setupL3Label, setupNodeAgentLabel} {
+	agentLabel, generationInstall, labelErr := plainDoctorAgentLabel(host)
+	if labelErr != nil {
+		add("primary-generation", "warning", "recorded primary generation unverified: "+labelErr.Error(), "restore catalog access and rerun doctor")
+	}
+	labels := []string{setupL1Label, setupL3Label}
+	if agentLabel != "" {
+		labels = append(labels, agentLabel)
+	}
+	for _, label := range labels {
 		detail, severity := "loaded and running", "ok"
 		if host.goos != "darwin" {
 			detail, severity = "LaunchAgents require macOS", "error"
@@ -132,7 +146,7 @@ func runPlainDoctor(ctx context.Context, host setupHost, options globalOptions) 
 	} else {
 		add("connection-profile", "ok", "valid profile at "+profilePath, "run `wefty setup` to repair missing settings")
 	}
-	// A confined write probe checks actual access as well as permission bits.
+	// Doctor is read-only. Inspect directory access bits without creating a probe.
 	root, err := os.OpenRoot(home)
 	if err != nil {
 		add("paths", "error", err.Error(), "restore access to your home folder")
@@ -179,7 +193,11 @@ func runPlainDoctor(ctx context.Context, host setupHost, options globalOptions) 
 		options.nodeConfigPath = configPath
 		if err := applyConnectionProfile(&options); err == nil {
 			checkCtx, cancel := context.WithTimeout(budget, statusProbeBudget)
-			err = verifyDoctorLocalNode(checkCtx, options)
+			var node l1.Node
+			node, err = verifyDoctorLocalNode(checkCtx, options)
+			if err == nil {
+				observed.Nodes = []l1.Node{node}
+			}
 			cancel()
 			if err == nil {
 				add("local-node", "ok", "L1 confirms this machine's installed node and reserved routing tag", "keep this node's admission policy")
@@ -203,14 +221,24 @@ func runPlainDoctor(ctx context.Context, host setupHost, options globalOptions) 
 	var plist []byte
 	err = blocked[setupFolders.launchAgents]
 	if err == nil {
-		plist, err = root.ReadFile(filepath.Join(paths.launchAgentsRel, setupNodeAgentLabel+".plist"))
+		if agentLabel == "" {
+			err = errors.New("recorded primary generation is unverified")
+		} else {
+			plist, err = root.ReadFile(filepath.Join(paths.launchAgentsRel, agentLabel+".plist"))
+		}
 	}
 	var loginPATH string
 	if err == nil {
 		loginPATH, err = recordedNodePATH(plist)
 	}
 	if err != nil {
-		add("node-agent-PATH", "error", "cannot read the node agent's recorded login-shell PATH: "+err.Error(), "run `wefty setup` to capture your login-shell PATH")
+		severity := "error"
+		fix := "run `wefty setup` to capture your login-shell PATH"
+		if generationInstall {
+			severity = "warning"
+			fix = "restore the recorded primary generation plist and rerun doctor"
+		}
+		add("node-agent-PATH", severity, "cannot read the node agent's recorded login-shell PATH: "+err.Error(), fix)
 	} else {
 		for _, tool := range []string{"go", "git", "node", "gh", "claude", "codex"} {
 			severity, detail := "ok", "found on the node agent's recorded login-shell PATH"
@@ -248,22 +276,7 @@ func doctorWritableFolder(root *os.Root, folder string) error {
 	if !info.IsDir() || info.Mode().Perm()&0o300 != 0o300 {
 		return errors.New("folder needs owner write and search access")
 	}
-	dir, err := root.OpenRoot(folder)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	name, err := randomHex(rand.Reader, 8)
-	if err != nil {
-		return err
-	}
-	name = ".wefty-doctor-" + name
-	f, err := dir.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return err
-	}
-	closeErr := f.Close()
-	return errors.Join(closeErr, dir.Remove(name))
+	return nil
 }
 func doctorFindTool(path, workingDirectory, tool string) bool {
 	for _, folder := range filepath.SplitList(path) {
@@ -277,27 +290,26 @@ func doctorFindTool(path, workingDirectory, tool string) bool {
 	}
 	return false
 }
-func verifyDoctorLocalNode(ctx context.Context, options globalOptions) error {
+func verifyDoctorLocalNode(ctx context.Context, options globalOptions) (l1.Node, error) {
 	// Daily setup uses plain Fabric. Opening a tsnet node can require enrollment
 	// and write state; doctor must not do that while diagnosing a local install.
 	if options.fabricMode != "plain" {
-		return &localNodeError{Code: localNodeConfigInvalid, Detail: "plain-process doctor needs the plain Fabric profile"}
+		return l1.Node{}, &localNodeError{Code: localNodeConfigInvalid, Detail: "plain-process doctor needs the plain Fabric profile"}
 	}
 	participant, closeFabric, err := fabricconfig.Open(ctx, fabricconfig.Config{Mode: "plain", Identity: fabric.Identity{NodeID: options.plainIdentity, Tags: []string{l1.DefaultClientPrincipalTag}}, PlainFabricID: options.plainFabricID})
 	if closeFabric != nil {
 		defer closeFabric()
 	}
 	if err != nil {
-		return &localNodeError{Code: localNodeConfigInvalid, Detail: err.Error(), Cause: err}
+		return l1.Node{}, &localNodeError{Code: localNodeConfigInvalid, Detail: err.Error(), Cause: err}
 	}
 	clients, err := newAPIClients(participant, options.l1Address, "")
 	if err != nil {
-		return &localNodeError{Code: localNodeConfigInvalid, Detail: err.Error(), Cause: err}
+		return l1.Node{}, &localNodeError{Code: localNodeConfigInvalid, Detail: err.Error(), Cause: err}
 	}
 	defer clients.close()
 	clients.nodeConfigPath = options.nodeConfigPath
-	_, err = resolveLocalNode(ctx, clients)
-	return err
+	return resolveLocalNodeRecord(ctx, clients)
 }
 
 // Read only the EnvironmentVariables dict, never a PATH key elsewhere in
@@ -349,4 +361,29 @@ func recordedNodePATH(payload []byte) (string, error) {
 		}
 		return "", errors.New("node agent environment has no PATH")
 	}
+}
+
+// Generation enrollment removes the legacy node-agent label and plist. Diagnose
+// the recorded primary instead; stopped closed retirees are retained history,
+// and their Attempt/renewal evidence is assessed by the cohort projection.
+func plainDoctorAgentLabel(host setupHost) (string, bool, error) {
+	home, err := filepath.EvalSymlinks(host.home)
+	if err != nil {
+		return setupNodeAgentLabel, false, nil
+	}
+	paths, issues := resolveMaintenancePaths(home)
+	for _, issue := range issues {
+		if issue.folder == setupFolders.data || issue.folder == setupFolders.launchAgents {
+			return setupNodeAgentLabel, false, nil
+		}
+	}
+	store := agentinstall.Store{Data: paths.data, LaunchAgents: paths.launchAgents}
+	if _, err := os.Lstat(store.Root()); errors.Is(err, os.ErrNotExist) {
+		return setupNodeAgentLabel, false, nil
+	}
+	catalog, err := store.ReadDiagnostic()
+	if err != nil {
+		return "", true, err
+	}
+	return catalog.Generations[catalog.Primary].Label, true, nil
 }

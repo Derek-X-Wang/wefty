@@ -167,6 +167,12 @@ type plainBinaryFixture struct {
 func newPlainBinaryFixture(t *testing.T, binary string) *plainBinaryFixture {
 	t.Helper()
 	f := newSetupFixture(t)
+	// Every binary fixture starts with explicit ephemeral endpoints, including
+	// L3 when a test replaces only L1. No profile fallback can reach an install.
+	unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	t.Cleanup(unavailable.Close)
+	f.host.l1Address = strings.TrimPrefix(unavailable.URL, "http://")
+	f.host.l3Address = f.host.l1Address
 	tools := t.TempDir()
 	for _, name := range []string{"go", "git", "node", "gh", "claude", "codex"} {
 		if err := os.WriteFile(filepath.Join(tools, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -206,6 +212,9 @@ esac
 }
 func (f *plainBinaryFixture) run(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
+	if err := f.diagnosticEndpointError(args); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, f.binary, args...)
@@ -298,7 +307,7 @@ func TestPlainDoctorRealBinary(t *testing.T) {
 			mustRemove(t, launchagent.Path(f.setup.home, setupNodeAgentLabel))
 		}},
 		{name: "L1 unreachable", check: "local-node", severity: "warning", detail: "NOT-RUN: L1 is unavailable", damage: func(t *testing.T, f *plainBinaryFixture) {
-			f.environment = append(f.environment, "WEFTY_L1_ADDR=127.0.0.1:1")
+			f.stopL1()
 		}},
 		{name: "L1 unauthorized", check: "local-node", severity: "error", detail: "L1 refused this identity: HTTP 401 (unauthorized)"},
 		{name: "L1 forbidden", check: "local-node", severity: "error", detail: "L1 refused this identity: HTTP 403 (forbidden)"},
@@ -721,4 +730,27 @@ func TestSetupRemovalFlagsRealBinary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Run the shared resolver in an isolated process with exactly the command's
+// environment. TestMain handles this preflight before its normal isolation;
+// no tests, machine adapters, Fabric or HTTP clients run in that process.
+func (f *plainBinaryFixture) diagnosticEndpointError(args []string) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(args)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, executable)
+	command.Env = append(append([]string{}, f.environment...), diagnosticGuardArguments+"="+string(payload))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("diagnostic endpoint preflight: %w: %s", err, output)
+	}
+	return nil
 }

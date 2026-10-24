@@ -1,0 +1,16 @@
+{
+  "ready": true,
+  "verdict": "ready",
+  "identity": {
+    "kind": "machine",
+    "detail": "machine principal"
+  },
+  "services": [],
+  "nodes": [],
+  "local_node": null,
+  "capacity_by_kind": {
+    "oci": 0,
+    "process": 4
+  },
+  "checked_at": "2026-10-24T12:00:00Z"
+}

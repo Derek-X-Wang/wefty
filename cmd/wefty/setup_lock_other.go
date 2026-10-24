@@ -9,3 +9,7 @@ func lockSetup(setupPaths, bool) (func(), error) {
 }
 
 func setupLockHeld(setupPaths) bool { return false }
+
+func observeSetupLock(setupPaths) setupLockObservation {
+	return setupLockObservation{cause: errors.New("setup lock observation unsupported on this platform")}
+}

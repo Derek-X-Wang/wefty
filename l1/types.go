@@ -447,20 +447,22 @@ type HostBootSessionProof struct {
 
 // NodeActiveAttempt contains execution facts without an attempt credential or fence.
 type NodeActiveAttempt struct {
-	JobID          string                `json:"job_id"`
-	AttemptID      string                `json:"attempt_id"`
-	BootSessionID  string                `json:"boot_session_id"`
-	Kind           string                `json:"kind"`
-	Class          string                `json:"class"`
-	Restartable    bool                  `json:"restartable,omitempty"`
-	State          contract.AttemptState `json:"state"`
-	LeaseExpiresAt time.Time             `json:"lease_expires_at"`
+	ObservationError string                `json:"observation_error,omitempty"`
+	JobID            string                `json:"job_id"`
+	AttemptID        string                `json:"attempt_id"`
+	BootSessionID    string                `json:"boot_session_id"`
+	Kind             string                `json:"kind"`
+	Class            string                `json:"class"`
+	Restartable      bool                  `json:"restartable,omitempty"`
+	State            contract.AttemptState `json:"state"`
+	LeaseExpiresAt   time.Time             `json:"lease_expires_at"`
 }
 
 // Node is the node projection shared by the operator list and agent protocol.
 // Node carries observed facts. AllowedActions is filled only by the HTTP route
 // for its authenticated caller, never by a store read.
 type Node struct {
+	Generations []NodeGenerationObservation `json:"generations,omitempty"`
 	contract.NodeRegistration
 	State                 contract.NodeState       `json:"state"`
 	AuthoritativeTags     []string                 `json:"authoritative_tags"`
