@@ -23,6 +23,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
@@ -146,7 +147,7 @@ func runOCIIntentStopFixture(t *testing.T, controlledRenewal bool) {
 	if _, err := store.Reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	queued, err := waitForFailureJobState(store, job.JobID, contract.JobQueued, hostedFixtureTimeout)
+	queued, err := waitForFailureJobStateUntil(t, store, job.JobID, contract.JobQueued)
 	if err != nil {
 		cancelRun()
 		t.Fatal(err)
@@ -476,7 +477,7 @@ func runOCIOutcomeStopFixture(t *testing.T, controlledRenewal bool) {
 	var attemptID string
 	select {
 	case attemptID = <-runtime.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("outcome-first OCI service did not start")
 	}
 	stopDone := make(chan error, 1)
@@ -619,7 +620,7 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 		t.Fatalf("intent-marker OCI service start failed: %v", startErr)
 	case runErr := <-runDone:
 		t.Fatalf("intent-marker agent exited before OCI service start: %v", runErr)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		queued, jobErr := store.GetJob(t.Context(), job.JobID)
 		attempts, attemptsErr := store.ListJobAttempts(t.Context(), job.JobID)
 		t.Fatalf("intent-marker OCI service did not start: job=%+v job_err=%v attempts=%+v attempts_err=%v status=%+v capability=%+v",
@@ -632,7 +633,7 @@ func TestDurableOCIIntentStopFencesFinishedServiceAttempt(t *testing.T) {
 	runtime.finishFirst()
 	select {
 	case <-intentObserved:
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("completion did not pause after its final enabled intent read")
 	}
 	stopDone := make(chan error, 1)
@@ -1110,7 +1111,7 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 	var attemptID string
 	select {
 	case attemptID = <-runtime.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("OCI service did not start")
 	}
 	// Before the first advance, only renewal uses a 50 ms deadline; the
@@ -1249,11 +1250,12 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 	var completionStoredOnce sync.Once
 	nodeAgent.outbox.completionStored = func() { completionStoredOnce.Do(func() { close(completionStored) }) }
 	runContext, cancelRun := context.WithCancel(t.Context())
+	defer cancelRun()
 	runDone := make(chan error, 1)
 	go func() { runDone <- nodeAgent.Run(runContext) }()
 	select {
 	case <-runtime.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("intent-stop OCI one-shot did not start")
 	}
 	deadman.waitForRenewal(t)
@@ -1264,7 +1266,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 	}
 	select {
 	case <-completionStored:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("intent-stop one-shot never persisted its genuine completion")
 	}
 	select {
@@ -1274,7 +1276,7 @@ func TestOCIIntentStopLetsFinishedOneShotCompleteAndFinalizeHandoff(t *testing.T
 	}
 	// finalized stays 0: a successful one-shot keeps its handoff volume now,
 	// because that is where its results are.
-	completed, err := waitForFailureJobState(store, job.JobID, contract.JobSucceeded, 5*time.Second)
+	completed, err := waitForFailureJobStateUntil(t, store, job.JobID, contract.JobSucceeded)
 	if err != nil || completed.State != contract.JobSucceeded || runtime.finalized.Load() != 0 {
 		cancelRun()
 		attempts, attemptsErr := store.ListJobAttempts(t.Context(), job.JobID)
@@ -1318,9 +1320,10 @@ func TestReapRefusalCannotCompleteExitZeroAttemptSuccessfully(t *testing.T) {
 	}
 	defer nodeAgent.Close()
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
-	completed, err := waitForFailureJobState(store, job.JobID, contract.JobFailed, 5*time.Second)
+	completed, err := waitForFailureJobStateUntil(t, store, job.JobID, contract.JobFailed)
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -1680,7 +1683,7 @@ func runPartitionedAgentRejoinFixture(t *testing.T, transientFailure, firstClaim
 	if freshAttemptID == expiredAttemptID {
 		t.Fatalf("fresh job reused expired attempt %q", freshAttemptID)
 	}
-	completed, err := waitForFailureJobState(store, freshJob.JobID, contract.JobSucceeded, resilienceTestWatchdog)
+	completed, err := waitForFailureJobStateUntil(t, store, freshJob.JobID, contract.JobSucceeded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1793,15 +1796,18 @@ func assertAgentFillsGrantedClassSlotsConcurrently(t *testing.T) {
 	go func() { done <- nodeAgent.Run(ctx) }()
 
 	wantStarts := int32(l1.DefaultMaxOneshotSlots + l1.DefaultMaxServiceSlots)
-	deadline := time.Now().Add(5 * time.Second)
 	observedStarts := int32(0)
-	for runner.starts.Load() != wantStarts && time.Now().Before(deadline) {
-		if starts := runner.starts.Load(); starts > observedStarts {
+	testwait.Until(t, "all granted class slots to start", func() (bool, error) {
+		starts := runner.starts.Load()
+		if starts > observedStarts {
 			observedStarts = starts
 			admissionClock.Advance(30 * time.Second)
 		}
-		time.Sleep(time.Millisecond)
-	}
+		if starts == wantStarts {
+			return true, nil
+		}
+		return false, fmt.Errorf("concurrent runner starts = %d, want %d class-scoped slots filled", starts, wantStarts)
+	})
 	if runner.starts.Load() != wantStarts {
 		cancel()
 		t.Fatalf("concurrent runner starts = %d, want %d class-scoped slots filled", runner.starts.Load(), wantStarts)
@@ -1839,7 +1845,7 @@ func assertAgentFillsGrantedClassSlotsConcurrently(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent Run() after cancellation = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not join both class loops after cancellation")
 	}
 }
@@ -1987,7 +1993,7 @@ func assertAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t *testing.T) 
 	}()
 	select {
 	case <-completionAccepted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("first service completion was not accepted")
 	}
 	time.Sleep(1500 * time.Millisecond)
@@ -2001,7 +2007,7 @@ func assertAgentExcludesARequeuedJobUntilLocalFinalizationReturns(t *testing.T) 
 	close(releaseFinalization)
 	select {
 	case <-secondAttempt:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("service was not reclaimable after local finalization returned")
 	}
 	cancel()
@@ -2072,13 +2078,13 @@ func assertFailedCompletionLeavesSiblingAndSessionRunning(t *testing.T) {
 	}()
 	select {
 	case <-firstFailed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		cancel()
 		t.Fatal("attempt completion did not fail")
 	}
 	select {
 	case <-siblingStarted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		cancel()
 		t.Fatal("sibling attempt did not remain independently runnable")
 	}
@@ -2153,7 +2159,7 @@ func assertDrainJoinsEveryResidentOneShotAttempt(t *testing.T) {
 		if err != nil {
 			t.Fatalf("plural drain returned error: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("plural drain did not join every resident attempt")
 	}
 }
@@ -2233,7 +2239,7 @@ func assertSilentRenewalHangCannotOutliveLocalAuthority(t *testing.T) {
 	}
 	select {
 	case <-renewalAccepted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		cancel()
 		t.Fatal("renewal RPC was not accepted")
 	}
@@ -2386,6 +2392,26 @@ func assertUnreapedPayloadStaysVisibleWithoutKillingDaemon(t *testing.T) {
 	}
 }
 
+// waitForFailureJobStateUntil observes a state held until this fixture acts again.
+// Keep the explicit-timeout helper below for callers outside this slice, including
+// service_acceptance_realtiming callers whose observation budget must not change.
+func waitForFailureJobStateUntil(t *testing.T, store *l1.Store, jobID string, want contract.JobState) (l1.Job, error) {
+	t.Helper()
+	var job l1.Job
+	testwait.Until(t, fmt.Sprintf("job %s state %q", jobID, want), func() (bool, error) {
+		var err error
+		job, err = store.GetJob(context.Background(), jobID)
+		if err != nil {
+			return false, err
+		}
+		if job.State != want {
+			return false, fmt.Errorf("job %s state = %q, want %q", jobID, job.State, want)
+		}
+		return true, nil
+	})
+	return job, nil
+}
+
 func waitForFailureJobState(store *l1.Store, jobID string, want contract.JobState, timeout time.Duration) (l1.Job, error) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -2454,7 +2480,7 @@ func TestAgentDrainFinishesRunningAttemptAndStopsClaiming(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent Run() after drain = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not finish graceful drain")
 	}
 	if runner.starts.Load() != 1 {
@@ -2512,13 +2538,7 @@ func TestAgentShutdownFencesAttemptForImmediateSuccessor(t *testing.T) {
 	defer stopSecond()
 	secondDone := make(chan error, 1)
 	go func() { secondDone <- secondAgent.Run(secondCtx) }()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if got, err := store.GetJob(context.Background(), second.JobID); err == nil && got.State == contract.JobSucceeded {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitForFailureJobStateUntil(t, store, second.JobID, contract.JobSucceeded)
 	stopSecond()
 	if err := <-secondDone; err != nil {
 		t.Fatalf("successor shutdown = %v", err)
@@ -2581,7 +2601,7 @@ func TestUnstampedLogEventSurvivesTheRetentionSweep(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
-	if _, err := waitForFailureJobState(store, job.JobID, contract.JobSucceeded, 5*time.Second); err != nil {
+	if _, err := waitForFailureJobStateUntil(t, store, job.JobID, contract.JobSucceeded); err != nil {
 		t.Fatal(err)
 	}
 	cancel()
@@ -3121,7 +3141,7 @@ func assertFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.kill()
-	requeued, err := waitForFailureJobState(store, service.JobID, contract.JobQueued, 5*time.Second)
+	requeued, err := waitForFailureJobStateUntil(t, store, service.JobID, contract.JobQueued)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3147,7 +3167,7 @@ func assertFinalizationTimeoutStartsAfterServicePayloadStops(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent shutdown = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not stop after finalization-anchor assertion")
 	}
 }
@@ -3222,6 +3242,7 @@ func TestAgentConsumesRenewalDirectivesWithoutDaemonExit(t *testing.T) {
 	}
 	defer nodeAgent.Close()
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- nodeAgent.Run(ctx) }()
 	runner.waitStarted(t)
@@ -3231,7 +3252,8 @@ func TestAgentConsumesRenewalDirectivesWithoutDaemonExit(t *testing.T) {
 	runner.waitCanceled(t)
 	// The restart directive must be consumed by this fresh attempt; its
 	// completion returns the service to queued/restart-pending without
-	// terminating the daemon.
+	// terminating the daemon. Queued is transient here: keep the original
+	// observation cadence rather than using Until for a held state.
 	if _, err := waitForFailureJobState(store, service.JobID, contract.JobQueued, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
@@ -3366,7 +3388,7 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaimsWithFreeSlot(t *testing.T) {
 	clock.Advance(DefaultClaimInterval)
 	waitForClaimTick(t, clock, done, start.Add(16*DefaultClaimInterval))
 	runner.release(residentAttemptID)
-	if _, err := waitForFailureJobState(store, resident.JobID, contract.JobSucceeded, 5*time.Second); err != nil {
+	if _, err := waitForFailureJobStateUntil(t, store, resident.JobID, contract.JobSucceeded); err != nil {
 		t.Fatalf("resident attempt under disabled claims: %v", err)
 	}
 	for second := 16; second < 18; second++ {
@@ -3396,7 +3418,7 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaimsWithFreeSlot(t *testing.T) {
 		t.Fatal("re-enabled claims did not resume claiming")
 	}
 	runner.release(resumedAttemptID)
-	if _, err := waitForFailureJobState(store, queued.JobID, contract.JobSucceeded, 5*time.Second); err != nil {
+	if _, err := waitForFailureJobStateUntil(t, store, queued.JobID, contract.JobSucceeded); err != nil {
 		t.Fatalf("resumed job: %v", err)
 	}
 	cancel()
@@ -3405,7 +3427,7 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaimsWithFreeSlot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("claims-disabled free-slot daemon exit = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not return after outer cancellation")
 	}
 }
@@ -3540,13 +3562,7 @@ func (runner *slotRefillRunner) Run(ctx context.Context, request processrunner.R
 
 func (runner *slotRefillRunner) waitStarted(t *testing.T) string {
 	t.Helper()
-	select {
-	case attemptID := <-runner.started:
-		return attemptID
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for slot-refill attempt")
-		return ""
-	}
+	return testwait.Receive(t, "slot-refill attempt", runner.started)
 }
 
 func (runner *slotRefillRunner) release(attemptID string) {
@@ -3832,7 +3848,7 @@ func (runtime *intentStopRuntime) waitCanceled(t *testing.T) {
 	t.Helper()
 	select {
 	case <-runtime.canceled:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("intent-stop OCI service was not canceled")
 	}
 }
@@ -3865,13 +3881,7 @@ func (runner *finalizationAnchorRunner) Run(ctx context.Context, request process
 
 func (runner *finalizationAnchorRunner) waitStarted(t *testing.T) string {
 	t.Helper()
-	select {
-	case attemptID := <-runner.started:
-		return attemptID
-	case <-time.After(5 * time.Second):
-		t.Fatal("finalization-anchor service did not start")
-		return ""
-	}
+	return testwait.Receive(t, "finalization-anchor service start", runner.started)
 }
 
 func (runner *finalizationAnchorRunner) kill() {
@@ -3906,13 +3916,7 @@ func (runner *loggingBlockingRunner) Run(ctx context.Context, request processrun
 
 func (runner *loggingBlockingRunner) waitStarted(t *testing.T) string {
 	t.Helper()
-	select {
-	case attemptID := <-runner.started:
-		return attemptID
-	case <-time.After(5 * time.Second):
-		t.Fatal("logging runner did not start")
-		return ""
-	}
+	return testwait.Receive(t, "logging runner start", runner.started)
 }
 
 type directiveRunner struct {
@@ -3936,11 +3940,7 @@ func (runner *directiveRunner) Run(ctx context.Context, request processrunner.Re
 
 func (runner *directiveRunner) waitStarted(t *testing.T) {
 	t.Helper()
-	select {
-	case <-runner.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("directive runner did not start")
-	}
+	testwait.Receive(t, "directive runner start", runner.started)
 }
 
 func (runner *directiveRunner) waitCanceled(t *testing.T) {
@@ -3975,18 +3975,14 @@ func (runner *stubbornRunner) Run(ctx context.Context, request processrunner.Req
 
 func (runner *stubbornRunner) waitStarted(t *testing.T) {
 	t.Helper()
-	select {
-	case <-runner.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("stubborn runner did not start")
-	}
+	testwait.Receive(t, "stubborn runner start", runner.started)
 }
 
 func (runner *stubbornRunner) waitCanceled(t *testing.T) {
 	t.Helper()
 	select {
 	case <-runner.canceled:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("stubborn runner did not observe cancellation")
 	}
 }
@@ -3995,7 +3991,7 @@ func (runner *stubbornRunner) release() { close(runner.releaseC) }
 
 // Runtime-start and reap channels order this test. This watchdog only catches
 // deadlocks; hosted runner scheduling is not an execution-start contract.
-const resilienceTestWatchdog = 30 * time.Second
+const resilienceTestWatchdog = testwait.Bound
 
 func newResilienceRunner() *resilienceRunner {
 	return &resilienceRunner{
@@ -4097,11 +4093,7 @@ func (runner *blockingRunner) Run(ctx context.Context, request processrunner.Req
 
 func (runner *blockingRunner) waitStarted(t *testing.T) {
 	t.Helper()
-	select {
-	case <-runner.started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("process runner did not start")
-	}
+	testwait.Receive(t, "process runner start", runner.started)
 }
 
 func (runner *blockingRunner) release() {
