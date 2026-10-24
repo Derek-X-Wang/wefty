@@ -133,6 +133,10 @@ says this is a proof fixture rather than a Seat request. Inspect only the proof
 node-agent log and, if created, `data/lima/wefty-proof/ha.stderr.log` inside the
 proof root if startup fails; save them privately. Undo: step 10. A denied,
 missing or failed dialog is a PR-1 failure, not a reason to invoke another dialog.
+Deny, timeout and unavailable choices persist as `approved:false` with the choice
+in `data/proof-dialog.json`. The node agent stays alive without OCI, and later
+starts skip bootstrap and the dialog. Stop and undo the already started proof
+host VM; do not delete the refusal receipt to retry.
 
 ### 4. ORCHESTRATOR — prove one process starts the host VM, shows the dialog and receives a Seat
 
@@ -149,7 +153,8 @@ internet and waits for the current attempt's Seat **and** Computer readiness.
 It saves the Seat observation and then waits for `removed_verified` cleanup.
 A process-only start or VM-only start cannot pass this step. Run it **before**
 measurements restart the node-agent process. Undo: the fixture's cleanup is
-automatic on success. For an interrupted create, find its ID in
+attempted in `finally` on success or failure. If cleanup itself fails, stop
+and undo. For a killed process or an interrupted create, find its ID in
 `evidence/wefty-proof-*.json`; the owner may instead purge the disposable proof
 in step 10 without resuming it after a memory trip.
 
@@ -197,7 +202,9 @@ Expected: one cumulative table after each command. PR-2/M1 has **five** stopped
 host VM starts, each with host-start end, helper-install end, helper handshake, verified sweep,
 functional probe, acknowledged positive publication, claim, Computer-ready
 observation and Seat-ready times. Claim comes from L1 attempt creation;
-Computer-ready polling is explicitly an upper bound. The table reports
+Computer-ready polling is explicitly an upper bound. The `proof-seat` fixture
+writes the proof L1 SQLite database directly while L1 runs; these PR-2 numbers
+include the normal node-agent and snapshot polling delay. The table reports
 microseconds; original source receipts retain their timestamps. Helper durations are
 also recorded from the existing boot-barrier receipt. Missing timestamps say
 NOT-RUN. This is a cold **host VM** start with an already imported image, not
@@ -223,11 +230,15 @@ python3 scripts/measure-per-user-proof.py disk --image "$DEFAULT_IMAGE"
 
 Expected: PR-4/M3 rows for an empty host VM, after its Computer stops, after
 60 seconds idle without a balloon intervention, and with the host VM stopped.
-The receipt includes host free memory, swap and the VZ host-agent's same-user
-`vmmap -summary` physical footprint. If vmmap cannot read it without privilege,
-that field is NOT-RUN; never add Mac sudo. The stopped state records Lima state and checks that the previously recorded
-VZ process PID no longer exists. Without that evidence, process absence is
-NOT-RUN and the row is PARTIAL. This is one Computer with one Seat, not a load test.
+The receipt includes system-wide host free memory and swap. A same-user
+`vmmap -summary` figure is labeled **host-agent footprint** only after the PID's
+command ties it to the proof instance. It is Lima's host agent, not the
+Virtualization.framework VM service where guest RAM is charged. The VM-service
+footprint and its process absence after stop are explicitly **NOT-RUN**: this
+script cannot identify that service for the proof instance with certainty.
+Rows remain PARTIAL; use system-wide figures for the four-state comparison.
+An unverified or unrelated PID is never measured. Never add Mac sudo. The stopped
+state confirms Lima state only. This is one Computer with one Seat, not a load test.
 
 PR-5/M4 records `diffdisk` apparent bytes **and allocated bytes** at baseline,
 after creation and after verified deletion for **ten** Computer cycles. Compare
@@ -273,13 +284,20 @@ LIMA_HOME="$PROOF_ROOT/data/lima" limactl stop wefty-proof
 
 After the stop succeeds, Ctrl-C terminal A's watcher. This prevents a late
 receipt write from recreating an already purged proof root. The host VM stays
-stopped throughout the remaining undo. The **owner then types**:
+stopped throughout the remaining undo.
+
+**`--proof` is required. Omitting it from `setup --remove --purge` selects the
+daily installation and can purge its files. Copy the exact command below.**
+
+The **owner then types**:
 
 ```sh
 "$PROOF_BIN/wefty" setup --proof --remove --purge --json
 ```
 
-Expected: removal JSON names only `dev.wefty-proof.*`. It unloads all proof
+Expected: before removal, stderr prints `Proof removal root: <login home>/.local/share/wefty-proof (purge=true)`.
+Check that exact root against the setup receipt
+`config/setup-files.json` (`proof_root`). Removal JSON names only `dev.wefty-proof.*`. It unloads all proof
 services, gracefully stops only `wefty-proof`, then removes the whole disposable
 proof root (including source binaries, tools, downloaded image, state, logs and
 its host VM disk). A proof setup receipt is required. A failed unload/stop

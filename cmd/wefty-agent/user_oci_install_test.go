@@ -42,8 +42,8 @@ func TestPerUserBootstrapUsesSameProcessAndNativeDialogOnce(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, dialog); err != nil {
-			t.Fatal(err)
+		if allowed, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, dialog); err != nil || !allowed {
+			t.Fatalf("allowed=%t err=%v", allowed, err)
 		}
 	}
 	saved, err := ocicontrol.ReadSetupState(c.SetupState)
@@ -69,5 +69,48 @@ func TestPerUserBootstrapUsesSameProcessAndNativeDialogOnce(t *testing.T) {
 	}
 	if !receipt.Approved || receipt.PID != os.Getpid() {
 		t.Fatalf("receipt=%+v", receipt)
+	}
+}
+
+func TestPerUserProofRefusalIsDurableWithoutRestartDialog(t *testing.T) {
+	for _, choice := range []agent.SeatApprovalChoice{agent.SeatApprovalDeny, agent.SeatApprovalNoAnswer} {
+		t.Run(string(choice), func(t *testing.T) {
+			root := t.TempDir()
+			c := limarunner.UserInstallConfig{Instance: "wefty-proof", LimaHome: filepath.Join(root, "lima"), MountRoot: filepath.Join(root, "mount"), IntentFile: filepath.Join(root, "intent.json"), SetupState: filepath.Join(root, "setup.json"), Sizing: limarunner.Sizing{Memory: "4GiB", CPUs: 4, Disk: "32GiB"}, Assets: limarunner.UserInstallAssets{HelperVersion: "test", ProbeDigest: "sha256:test"}, ProofDialog: true}
+			if _, err := limarunner.InitializeOCIIntent(c.IntentFile, time.Unix(1, 0)); err != nil {
+				t.Fatal(err)
+			}
+			payload, _ := json.Marshal(c)
+			path := filepath.Join(root, "config.json")
+			if err := os.WriteFile(path, payload, 0600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("LIMA_HOME", c.LimaHome)
+			dialogs, prepares := 0, 0
+			prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error { prepares++; return nil }
+			dialog := agent.SeatApprovalDialogFunc(func(context.Context, agent.SeatApprovalPrompt) (agent.SeatApprovalChoice, error) {
+				dialogs++
+				return choice, nil
+			})
+			for range 2 {
+				if allowed, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, dialog); err != nil || allowed {
+					t.Fatalf("refusal must keep the process-only node agent alive: %v", err)
+				}
+			}
+			var receipt struct {
+				Approved bool                     `json:"approved"`
+				Choice   agent.SeatApprovalChoice `json:"choice"`
+			}
+			payload, err := os.ReadFile(filepath.Join(root, "proof-dialog.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(payload, &receipt); err != nil {
+				t.Fatal(err)
+			}
+			if receipt.Approved || receipt.Choice != choice || dialogs != 1 || prepares != 1 {
+				t.Fatalf("receipt=%+v dialogs=%d prepares=%d", receipt, dialogs, prepares)
+			}
+		})
 	}
 }

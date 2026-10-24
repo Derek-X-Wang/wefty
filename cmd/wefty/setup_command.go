@@ -90,6 +90,7 @@ var setupBinaries = []string{"wefty", "wefty-l1", "wefty-l3", "wefty-agent"}
 // can run it against a temporary home with fake launchctl and a fake shell.
 type setupHost struct {
 	proof                 bool
+	proofRemoveOutput     io.Writer
 	stopHostVM            func(context.Context, string, string) error
 	doctorCommand         func(context.Context, string, ...string) ([]byte, error)
 	conversionClients     func(context.Context, connprofile.Profile) (*apiClients, error)
@@ -399,6 +400,7 @@ func executeSetupUsingHost(ctx context.Context, options globalOptions, args []st
 		removeInstall := runSetupRemove
 		if proof {
 			removeInstall = removeProofSetup
+			host.proofRemoveOutput = stderr
 		}
 		report, err := removeInstall(ctx, host, purge)
 		if err != nil {
@@ -752,6 +754,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	previous := setupManifest{Version: 1, Files: map[string]string{}}
 	manifest := setupManifest{Computer: request.computer.recorded(), Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
+	if host.proof {
+		manifest.ProofRoot = filepath.Join(paths.home, proofInstallRelative)
+	}
 	if payload, err := homeRoot.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
 		if json.Unmarshal(payload, &previous) == nil && previous.Version == 1 {
 			manifest.Role = previous.Role

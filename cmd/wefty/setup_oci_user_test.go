@@ -14,24 +14,7 @@ import (
 
 func TestSetupOCIUserServiceOwnsHostVMAndRetainsSettings(t *testing.T) {
 	f := newSetupFixture(t)
-	helper := filepath.Join(f.source, "linux-helper")
-	archive := filepath.Join(f.source, "probe.tar")
-	if err := os.WriteFile(helper, []byte("linux helper"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(archive, []byte("probe archive"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	checksum, err := fileDigest(helper)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assets := limarunner.UserInstallAssets{LinuxHelper: helper, HelperVersion: "v1", HelperChecksum: checksum, ProbeArchive: archive, ProbeReference: "example/probe:v1", ProbeDigest: "sha256:" + strings.Repeat("a", 64)}
-	payload, _ := json.Marshal(assets)
-	config := filepath.Join(f.source, "assets.json")
-	if err := os.WriteFile(config, payload, 0600); err != nil {
-		t.Fatal(err)
-	}
+	config := setupOCIAssetsFixture(t, f)
 	f.setup(t, setupRequest{ociConfig: config})
 	before := f.plist(t, setupNodeAgentLabel)
 	for _, want := range []string{"--oci-user-install=", "--oci-helper-socket=", "--oci-intent-file=", "LIMA_HOME", "Interactive"} {
@@ -71,4 +54,27 @@ func TestSetupOCIUserServiceOwnsHostVMAndRetainsSettings(t *testing.T) {
 		t.Fatal("removal did not gracefully stop the per-user host VM")
 	}
 
+}
+
+func setupOCIAssetsFixture(t *testing.T, f *setupFixture) string {
+	t.Helper()
+	helper := filepath.Join(f.source, "linux-helper")
+	archive := filepath.Join(f.source, "probe.tar")
+	if err := os.WriteFile(helper, []byte("linux helper"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archive, []byte("probe archive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	checksum, err := fileDigest(helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assets := limarunner.UserInstallAssets{LinuxHelper: helper, HelperVersion: "v1", HelperChecksum: checksum, ProbeArchive: archive, ProbeReference: "example/probe:v1", ProbeDigest: "sha256:" + strings.Repeat("a", 64)}
+	payload, _ := json.Marshal(assets)
+	config := filepath.Join(f.source, "assets.json")
+	if err := os.WriteFile(config, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	return config
 }

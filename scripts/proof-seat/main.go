@@ -50,6 +50,7 @@ func proofRoot(home string) (string, error) {
 	}
 	var receipt struct {
 		Approved bool      `json:"approved"`
+		Choice   string    `json:"choice,omitempty"`
 		PID      int       `json:"pid"`
 		At       time.Time `json:"at"`
 	}

@@ -703,10 +703,15 @@ func run() error {
 			return errors.New("--oci-user-install requires macOS")
 		}
 		installContext, stop := context.WithTimeout(context.Background(), 15*time.Minute)
-		installErr := prepareInstalledUserOCI(installContext, *ociUserInstall, *nodeID, bootSessionID, version, limarunner.PrepareUserInstall, agent.NativeSeatApprovalDialog{})
+		ociAllowed, installErr := prepareInstalledUserOCI(installContext, *ociUserInstall, *nodeID, bootSessionID, version, limarunner.PrepareUserInstall, agent.NativeSeatApprovalDialog{})
 		stop()
 		if installErr != nil {
 			return installErr
+		}
+		if !ociAllowed {
+			// A refused proof stays registered for process work. Do not construct
+			// OCI recovery, control or doctor loops that could reopen the host VM.
+			*ociHelperSocket, *ociControlSocket, *ociDoctorFacts = "", "", ""
 		}
 	}
 	capabilities := defaultAgentCapabilities()

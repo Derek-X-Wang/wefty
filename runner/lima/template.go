@@ -105,13 +105,22 @@ func (values *SizingFlags) Sizing() (Sizing, error) {
 	return sizing, nil
 }
 
-// DefaultSizing applies the phase 3 defaults: one quarter of host RAM,
-// four CPUs, and a 32 GiB disk. Setup persists these fixed values.
+// DefaultSizing retains the existing node setup-oci and Linux defaults: a
+// quarter of RAM capped at 4 GiB, and half the logical CPUs capped at four.
 func DefaultSizing(hostMemoryBytes int64, logicalCPUs int) (Sizing, error) {
-	if hostMemoryBytes < 4<<20 || logicalCPUs <= 0 {
+	if hostMemoryBytes <= 0 || logicalCPUs <= 0 {
 		return Sizing{}, errors.New("host memory and logical CPU count must be positive")
 	}
-	return Sizing{Memory: fmt.Sprintf("%dMiB", (hostMemoryBytes/4)>>20), CPUs: 4, Disk: DefaultDisk}, nil
+	return Sizing{Memory: fmt.Sprintf("%dMiB", min(hostMemoryBytes/4, int64(4<<30))>>20), CPUs: max(1, min(4, logicalCPUs/2)), Disk: DefaultDisk}, nil
+}
+
+// PerUserDefaultSizing applies spec section 3 only to the new per-user host VM
+// install. A 4 GiB host gives the host VM its minimum 1 GiB infrastructure room.
+func PerUserDefaultSizing(hostMemoryBytes int64, logicalCPUs int) (Sizing, error) {
+	if hostMemoryBytes < 4<<30 || logicalCPUs <= 0 {
+		return Sizing{}, errors.New("per-user host VM needs at least 4 GiB host memory and a positive logical CPU count")
+	}
+	return Sizing{Memory: fmt.Sprintf("%dMiB", (hostMemoryBytes/4)>>20), CPUs: min(4, logicalCPUs), Disk: DefaultDisk}, nil
 }
 
 func HostDefaultSizing() (Sizing, error) {
@@ -120,6 +129,14 @@ func HostDefaultSizing() (Sizing, error) {
 		return Sizing{}, err
 	}
 	return DefaultSizing(memory, runtime.NumCPU())
+}
+
+func HostPerUserDefaultSizing() (Sizing, error) {
+	memory, err := hostPhysicalMemoryBytes()
+	if err != nil {
+		return Sizing{}, err
+	}
+	return PerUserDefaultSizing(memory, runtime.NumCPU())
 }
 
 // DefaultMacComputerCapacity materializes the shipped Computer admission

@@ -1,0 +1,12 @@
+{
+  "capability": {
+    "capability_revision": 1, "capabilities": {"kind:oci": true},
+    "capability_observed_at": "1970-01-01T00:00:01Z", "missing_capabilities": null,
+    "last_probe": {"capability_revision": 1, "capabilities": {"kind:oci": true}, "capability_observed_at": "1970-01-01T00:00:01Z", "missing_capabilities": null},
+    "pending_publication_revision": 0
+  },
+  "seats": [
+    {"seat_id":"seat-current","place":1,"state":"ready","reason":"","cleanup_complete":false,"AttemptID":"attempt-current","ListRevision":1,"Generation":1,"Sequence":1,"ObservedAt":"1970-01-01T00:00:02Z"},
+    {"seat_id":"seat-old","place":2,"state":"ready","reason":"","cleanup_complete":false,"AttemptID":"attempt-old","ListRevision":1,"Generation":1,"Sequence":1,"ObservedAt":"2099-01-01T00:00:00Z"}
+  ]
+}

@@ -1150,9 +1150,11 @@ latch. `disk_exhausted` requires a positively observed attempt-local ENOSPC
 event; a post-hoc free-byte sample is advisory only and cannot create the
 latch. Neither resource fact is inferred from stderr or a numeric exit status.
 
-Mac setup uses one quarter of physical Mac memory and four CPUs for the fixed
-host VM sizing. Its Computer memory capacity equals that configured memory,
-with a fixed 1 GiB infrastructure reserve (phase 3 spec section 3). Linux setup defaults the configured
+The new per-user Mac install uses one quarter of physical Mac memory and
+`min(4, logical CPUs)` for the fixed host VM sizing. Existing `node setup-oci`
+and Linux sizing defaults retain their 4 GiB and half-core caps. Mac Computer
+memory capacity equals the configured host VM memory, with a fixed 1 GiB
+infrastructure reserve (phase 3 spec section 3). Linux setup defaults the configured
 usable arithmetic to `MemTotal - min(1 GiB, 25%)`. The helper consumes those
 facts as configuration and never refuses to start because of their values.
 

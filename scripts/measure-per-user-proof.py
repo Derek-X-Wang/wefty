@@ -62,7 +62,6 @@ class Proof:
         self.env = dict(os.environ, LIMA_HOME=str(self.lima_home), WEFTY_ATTENDED_PROOF="1")
         self.rows = []
         self.last_guard = 0
-        self.vz_pid = None
 
     def raw(self, argv, timeout=15, check=True):
         result = subprocess.run(argv, env=self.env, text=True, capture_output=True, timeout=timeout)
@@ -229,9 +228,15 @@ class Proof:
     def create_ready(self, name):
         created = self.fixture_call("create", name=name)
         computer = created["computer_id"]
-        (self.evidence / f"{name}.json").write_text(json.dumps(created) + "\n")
-        snapshot = self.wait(lambda: (value if (value := self.fixture_call("snapshot", computer))["ready"] else None), timeout=600)
-        return computer, snapshot
+        ready = False
+        try:
+            (self.evidence / f"{name}.json").write_text(json.dumps(created) + "\n")
+            snapshot = self.wait(lambda: (value if (value := self.fixture_call("snapshot", computer))["ready"] else None), timeout=600)
+            ready = True
+            return computer, snapshot
+        finally:
+            if not ready:
+                self.remove(computer)
 
     def remove(self, computer):
         self.fixture_call("cleanup", computer)
@@ -256,42 +261,46 @@ class Proof:
         if helper.stdout.strip() != "root":
             raise RuntimeError("guest helper does not run as guest root")
         computer, snapshot = self.create_ready("wefty-proof-one")
-        node = snapshot["node"]
-        attempts = snapshot["computer"]["current_job"].get("attempts", [])
-        current = snapshot["computer"]["current_job"]["current_attempt_id"]
-        active = [value for value in attempts if value["attempt_id"] == current]
-        if node["boot_session_id"] != startup["boot_session_id"] or node["node_id"] != startup["node_id"] or len(active) != 1 or active[0]["node_id"] != startup["node_id"]:
-            raise RuntimeError("Seat attempt does not belong to the recorded node-agent boot")
-        (self.evidence / "pr1-seat-ready.json").write_text(json.dumps(snapshot) + "\n")
-        self.row("PR-1", "one-login-node-agent", "VERIFIED", f"pid={pid}; host VM Running; owner dialog approved; guest helper root; one Seat ready through #1137; #1143 NOT-RUN")
-        self.remove(computer)
+        try:
+            node = snapshot["node"]
+            attempts = snapshot["computer"]["current_job"].get("attempts", [])
+            current = snapshot["computer"]["current_job"]["current_attempt_id"]
+            active = [value for value in attempts if value["attempt_id"] == current]
+            if node["boot_session_id"] != startup["boot_session_id"] or node["node_id"] != startup["node_id"] or len(active) != 1 or active[0]["node_id"] != startup["node_id"]:
+                raise RuntimeError("Seat attempt does not belong to the recorded node-agent boot")
+            (self.evidence / "pr1-seat-ready.json").write_text(json.dumps(snapshot) + "\n")
+            self.row("PR-1", "one-login-node-agent", "VERIFIED", f"pid={pid}; host VM Running; owner dialog approved; guest helper root; one Seat ready through #1137; #1143 NOT-RUN")
+        finally:
+            self.remove(computer)
 
     def cold(self):
         for number in range(1, 6):
             self.halt()
             begin, startup = self.boot()
             computer, snapshot = self.create_ready(f"wefty-proof-cold-{number}")
-            host = json.loads((self.data / "user-install-timing.json").read_text())
-            for suffix, receipt in [("startup", startup), ("host", host), ("ready", snapshot)]:
-                (self.evidence / f"cold-{number}-{suffix}.json").write_text(json.dumps(receipt) + "\n")
-            barrier = startup["barrier"]
-            attempts = snapshot["computer"]["current_job"].get("attempts", [])
-            milestones = {
-                "host_start_end": host["host_started"],
-                "helper_install_end": host["helper_installed"],
-                "helper_preface": barrier["preface_completed_at"],
-                "helper_handshake": barrier["session_admitted_at"],
-                "sweep_verified": barrier["verified_ready_at"],
-                "probe": startup["capability"]["last_probe"]["observed_at"],
-                "positive_publication": startup["published_at"],
-                "claim": attempts[-1]["created_at"] if attempts else None,
-                "computer_ready_observed": snapshot["observed_at"],
-                "seat_ready": max((s["observed_at"] for s in snapshot["seats"] if s["state"] == "ready"), default=None),
-            }
-            for step, at in milestones.items():
-                self.row("PR-2/M1", f"{number}/{step}", "VERIFIED" if at else "NOT-RUN", f"{seconds(at)-begin:.6f}s since login bootstrap" if at else "source timestamp absent")
-            self.row("PR-2/M1", f"{number}/helper_durations", "VERIFIED", f'handshake_ns={barrier["handshake_elapsed"]} admission_ns={barrier["session_admission_elapsed"]} sweep_ns={barrier["sweep_elapsed"]} verify_ns={barrier["verify_elapsed"]}; Computer readiness is a polling upper bound')
-            self.remove(computer)
+            try:
+                host = json.loads((self.data / "user-install-timing.json").read_text())
+                for suffix, receipt in [("startup", startup), ("host", host), ("ready", snapshot)]:
+                    (self.evidence / f"cold-{number}-{suffix}.json").write_text(json.dumps(receipt) + "\n")
+                barrier = startup["barrier"]
+                attempts = snapshot["computer"]["current_job"].get("attempts", [])
+                milestones = {
+                    "host_start_end": host["host_started"],
+                    "helper_install_end": host["helper_installed"],
+                    "helper_preface": barrier["preface_completed_at"],
+                    "helper_handshake": barrier["session_admitted_at"],
+                    "sweep_verified": barrier["verified_ready_at"],
+                    "probe": startup["capability"]["last_probe"]["capability_observed_at"],
+                    "positive_publication": startup["published_at"],
+                    "claim": attempts[-1]["created_at"] if attempts else None,
+                    "computer_ready_observed": snapshot["observed_at"],
+                    "seat_ready": max((s["ObservedAt"] for s in snapshot["seats"] if s["state"] == "ready" and s["AttemptID"] == snapshot["computer"]["current_job"]["current_attempt_id"]), default=None),
+                }
+                for step, at in milestones.items():
+                    self.row("PR-2/M1", f"{number}/{step}", "VERIFIED" if at else "NOT-RUN", f"{seconds(at)-begin:.6f}s since login bootstrap" if at else "source timestamp absent")
+                self.row("PR-2/M1", f"{number}/helper_durations", "VERIFIED", f'handshake_ns={barrier["handshake_elapsed"]} admission_ns={barrier["session_admission_elapsed"]} sweep_ns={barrier["sweep_elapsed"]} verify_ns={barrier["verify_elapsed"]}; Computer readiness is a polling upper bound')
+            finally:
+                self.remove(computer)
 
     def stops(self):
         for force in [False, True]:
@@ -309,41 +318,41 @@ class Proof:
 
     def memory(self, label):
         sample = self.memory_sample()
-        detail = json.dumps(sample)
+        detail = json.dumps(sample) + "; VM-service footprint NOT-RUN (no certain proof-instance identity)"
         pid_file = self.instance_dir / "ha.pid"
         if self.state() == "Stopped":
-            absent = False
-            if self.vz_pid is not None:
-                try:
-                    os.kill(self.vz_pid, 0)
-                except ProcessLookupError:
-                    absent = True
-                except PermissionError:
-                    pass
-            self.row("PR-4/M3", label, "VERIFIED" if absent else "PARTIAL", detail + ("; recorded VZ PID no longer exists" if absent else "; host state=Stopped; VZ process absence NOT-RUN"))
+            self.row("PR-4/M3", label, "PARTIAL", detail + "; host state=Stopped; VM-service process absence NOT-RUN")
             return
-        if not pid_file.exists():
-            self.row("PR-4/M3", label, "NOT-RUN", detail + "; no Lima host-agent PID")
+        if pid_file.is_symlink() or not pid_file.is_file():
+            self.row("PR-4/M3", label, "PARTIAL", detail + "; host-agent footprint NOT-RUN (no regular proof PID file)")
             return
         pid = int(pid_file.read_text().strip())
-        self.vz_pid = pid
+        # ha.pid belongs to Lima's host agent, not the Virtualization.framework
+        # VM service. Check its argv before vmmap, including against PID reuse.
+        identity = self.raw(["/bin/ps", "-p", str(pid), "-o", "command="], check=False)
+        if pid <= 0 or identity.returncode or "hostagent" not in identity.stdout or str(self.instance_dir) + "/" not in identity.stdout or "wefty-oci" in identity.stdout:
+            self.row("PR-4/M3", label, "PARTIAL", detail + "; host-agent footprint NOT-RUN (PID not tied to proof instance)")
+            return
         footprint, _ = self.run(["/usr/bin/vmmap", "-summary", str(pid)], check=False)
         (self.evidence / f"memory-{label}.txt").write_text(footprint.stdout + footprint.stderr)
         match = re.search(r"Physical footprint:\s*([^\n]+)", footprint.stdout)
-        self.row("PR-4/M3", label, "VERIFIED" if footprint.returncode == 0 and match else "NOT-RUN", detail + (f"; VZ footprint={match[1]}" if match else "; same-user vmmap could not read VZ footprint"))
+        measured = footprint.returncode == 0 and match
+        self.row("PR-4/M3", label, "PARTIAL", detail + (f"; host-agent footprint={match[1]}" if measured else "; host-agent footprint NOT-RUN (same-user vmmap unavailable)"))
 
     def memory_states(self):
         self.memory("empty-host")
         computer, _ = self.create_ready("wefty-proof-memory")
-        self.fixture_call("stop", computer)
-        self.wait(lambda: self.fixture_call("snapshot", computer)["computer"]["current_job"].get("state") == "stopped", timeout=600)
-        self.memory("computers-stopped")
-        deadline = time.monotonic() + self.args.idle_seconds
-        while time.monotonic() < deadline:
-            self.guard()
-            time.sleep(1)
-        self.memory("balloon-free-idle")
-        self.remove(computer)
+        try:
+            self.fixture_call("stop", computer)
+            self.wait(lambda: self.fixture_call("snapshot", computer)["computer"]["current_job"].get("state") == "stopped", timeout=600)
+            self.memory("computers-stopped")
+            deadline = time.monotonic() + self.args.idle_seconds
+            while time.monotonic() < deadline:
+                self.guard()
+                time.sleep(1)
+            self.memory("balloon-free-idle")
+        finally:
+            self.remove(computer)
         self.halt()
         self.memory("host-stopped")
         self.boot()
@@ -359,8 +368,10 @@ class Proof:
         self.disk_sample("baseline")
         for number in range(1, 11):
             computer, _ = self.create_ready(f"wefty-proof-disk-{number}")
-            self.disk_sample(f"{number}/created")
-            self.remove(computer)
+            try:
+                self.disk_sample(f"{number}/created")
+            finally:
+                self.remove(computer)
             self.disk_sample(f"{number}/removed_verified")
 
     def quoting(self):

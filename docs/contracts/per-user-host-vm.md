@@ -6,9 +6,10 @@ keeps its process-only behavior. Fleet installation roles do not accept this
 option. It needs no admin password and never installs a system LaunchDaemon.
 Lima 2.2 must already be on the owner's login PATH; Homebrew installation is
 an owner step. A `vz` host VM uses one quarter of the Mac's physical memory,
-four CPUs, and a 32 GiB disk by default. The memory value is resolved once at
-setup and persisted. The phase 3 spec supersedes the earlier 4 GiB cap and
-half-core CPU cap.
+up to four CPUs (bounded by logical CPUs), and a 32 GiB disk by default. The memory value is resolved once at
+setup and persisted. These defaults apply only to this new per-user installation, on hosts with
+at least 4 GiB RAM. Existing `node setup-oci` and Linux callers retain their
+4 GiB RAM cap and half-core CPU cap; saved per-user settings survive reruns.
 
 The input JSON is closed and names local immutable assets:
 
@@ -71,22 +72,28 @@ Proof services receive their own per-process `HOME` and `TMPDIR`. This keeps
 node-agent defaults and Lima's download cache inside the disposable root;
 [Lima 2.2's downloader](https://github.com/lima-vm/lima/blob/v2.2.0/pkg/downloader/downloader.go)
 uses `os.UserCacheDir()` for its cache. The owner's shell environment stays
-unchanged. Redirected proof paths are refused. No proof step selects `dev.wefty.*`,
+unchanged. Symlinked proof path components, including the Lima home and instance, are
+refused during setup and removal. No proof step selects `dev.wefty.*`,
 the daily profile, or the daily `wefty-oci` instance. `--proof --remove`
 unloads only the three proof labels, gracefully stops only that host VM,
 and removes proof binaries/configuration, keeping data/logs. Explicit
 `--proof --remove --purge` instead removes the **entire disposable proof root**,
 including its host VM disk, tools and evidence. This is an owner-authorized
 undo for disposable proof data, not a host VM recreate. Copy the evidence out
-first. Purge needs the proof setup receipt, and all services and the host VM
+first. The setup receipt records the absolute `proof_root`; proof removal prints
+the exact root to stderr before changing services or deleting files, including
+with `--json`. Purge needs the proof setup receipt, and all services and the host VM
 must stop before any data is removed. An unsuccessful stop retains the files.
 
 On its first proof startup the node-agent process calls #1135's existing
 `NativeSeatApprovalDialog` after the host VM and helper are ready. No second
-native-dialog implementation exists. Approval writes a private PID-bearing
-`proof-dialog.json` receipt. It is a **proof fixture**, not an L1 Seat approval
-or the #1143 request flow. Denial/unavailability fails the proof. Subsequent
-starts retain that receipt and do not ask again.
+native-dialog implementation exists. Every choice writes a private PID-bearing
+`proof-dialog.json` receipt with `approved` and `choice` fields. It is a **proof fixture**, not an L1 Seat approval
+or the #1143 request flow. Denial, timeout or unavailability fails the proof. The node agent remains
+alive for process work without OCI recovery, control or doctor loops. Later
+starts read the refusal before bootstrap and do not ask again or start the host
+VM. The first refused startup has already started the host VM; the attended
+undo stops it. Approval receipts also suppress subsequent dialogs.
 
 The attended `scripts/proof-seat` tool confines itself to this proof's existing
 L1 database. It uses `CreateComputer` with the trusted Seat settings and
@@ -100,6 +107,7 @@ before cold-start measurements replace the node-agent process.
 completion. `proof-startup.json` records the existing helper barrier timeline,
 functional probe and acknowledged positive capability publication. Recording
 starts only after registration, with positive `kind:oci`, a probe receipt and
-no pending publication. Computer-ready polling gives an upper bound; a missing
+no pending publication. The fixture writes the isolated L1 SQLite database while L1 runs. Its existing
+polling contributes delay to the PR-2 times; Computer-ready polling gives an upper bound; a missing
 source timestamp is `NOT-RUN`, never zero. These files and scripts do not prove
 anything until the owner-attended run completes.

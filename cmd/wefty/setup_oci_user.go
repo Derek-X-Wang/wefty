@@ -32,7 +32,7 @@ func setupUserOCIFiles(host setupHost, paths setupPaths, request setupRequest, n
 		}
 	}
 	if c.Instance == "" {
-		sizing, err := limarunner.HostDefaultSizing()
+		sizing, err := limarunner.HostPerUserDefaultSizing()
 		if err != nil {
 			return nil, err
 		}

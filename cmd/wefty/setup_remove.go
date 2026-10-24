@@ -26,6 +26,7 @@ import (
 const setupManifestName = "setup-files.json"
 
 type setupManifest struct {
+	ProofRoot        string                `json:"proof_root,omitempty"`
 	Computer         *setupComputerOptions `json:"computer,omitempty"`
 	LinuxLogRoot     string                `json:"linux_log_root,omitempty"`
 	History          *plainHistory         `json:"history,omitempty"`

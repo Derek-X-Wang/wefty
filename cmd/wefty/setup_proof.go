@@ -24,6 +24,19 @@ const proofLabelPrefix = "dev.wefty-proof."
 // Proof paths never reuse the daily profile, binaries, skills or Lima home.
 func resolveProofSetupPaths(home string) (setupPaths, error) {
 	p := setupPaths{home: home}
+	// Check every component, including absent final paths, before any setup
+	// writes. Canonicalizing only data/ misses an existing redirected Lima home.
+	for _, suffix := range []string{"bin", "config/oci-user.json", "data/lima/wefty-proof/sock", "data/oci-intent.json", "data/oci-setup.json", "data/node-agent/log-spool", "data/node-agent/managed", "data/home", "data/tmp", "logs"} {
+		for path := filepath.Join(home, proofInstallRelative, suffix); path != home; path = filepath.Dir(path) {
+			info, err := os.Lstat(path)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return p, err
+			}
+			if err == nil && info.Mode()&os.ModeSymlink != 0 {
+				return p, errors.New("proof install refuses symlinked paths")
+			}
+		}
+	}
 	var err error
 	for _, f := range []struct {
 		target *string
@@ -79,7 +92,7 @@ func removeProofSetup(ctx context.Context, host setupHost, purge bool) (setupRem
 	if err := limarunner.ReadUserInstallJSON(filepath.Join(paths.config, setupManifestName), &manifest); err != nil {
 		return report, fmt.Errorf("proof removal needs its setup receipt: %w", err)
 	}
-	if manifest.Version != 1 {
+	if manifest.Version != 1 || manifest.ProofRoot != "" && manifest.ProofRoot != filepath.Join(home, proofInstallRelative) {
 		return report, errors.New("invalid proof setup receipt")
 	}
 	root, err := os.OpenRoot(home)
@@ -87,6 +100,11 @@ func removeProofSetup(ctx context.Context, host setupHost, purge bool) (setupRem
 		return report, err
 	}
 	defer root.Close()
+	if host.proofRemoveOutput != nil {
+		if _, err := fmt.Fprintf(host.proofRemoveOutput, "Proof removal root: %s (purge=%t)\n", filepath.Join(home, proofInstallRelative), purge); err != nil {
+			return report, err
+		}
+	}
 	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid, UnloadBound: host.unloadBound}
 	// Unload all three proof services before changing files or stopping the host VM.
 	for _, name := range []string{"node-agent", "l3", "l1"} {

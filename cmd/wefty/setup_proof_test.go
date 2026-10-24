@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"howett.net/plist"
 	"os"
 	"path/filepath"
@@ -64,5 +66,99 @@ func TestProofSetupRendersIsolatedLoginServicesAndConverges(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(fixture.home, ".config", "wefty")); !os.IsNotExist(err) {
 		t.Fatalf("touched daily config: %v", err)
+	}
+}
+
+func TestProofOCISetupCommandReceiptAndPurgeStopBoundary(t *testing.T) {
+	f := newSetupFixture(t)
+	config := setupOCIAssetsFixture(t, f)
+	var stdout, stderr bytes.Buffer
+	run := func(args ...string) error {
+		return executeSetupUsingHost(t.Context(), globalOptions{jsonOutput: true}, args, &stdout, &stderr, func() (setupHost, error) { return f.host, nil })
+	}
+	if err := run("--proof", "--oci-config", config); err != nil {
+		t.Fatal(err)
+	}
+	proofRoot := filepath.Join(f.home, proofInstallRelative)
+	payload, err := os.ReadFile(filepath.Join(f.home, "Library", "LaunchAgents", "dev.wefty-proof.node-agent.plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var definition struct {
+		EnvironmentVariables map[string]string
+		ProgramArguments     []string
+	}
+	if _, err := plist.Unmarshal(payload, &definition); err != nil {
+		t.Fatal(err)
+	}
+	if definition.EnvironmentVariables["LIMA_HOME"] != filepath.Join(proofRoot, "data", "lima") || !strings.Contains(strings.Join(definition.ProgramArguments, " "), "--oci-lima-instance=wefty-proof") {
+		t.Fatalf("not proof OCI: %+v", definition)
+	}
+	var receipt map[string]any
+	payload, err = os.ReadFile(filepath.Join(proofRoot, "config", setupManifestName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(payload, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt["proof_root"] != proofRoot {
+		t.Fatalf("proof receipt lacks exact removal root: %s", payload)
+	}
+	stopFailure := errors.New("injected stop failed")
+	calls := 0
+	f.host.stopHostVM = func(_ context.Context, limaHome, instance string) error {
+		calls++
+		if limaHome != filepath.Join(proofRoot, "data", "lima") || instance != "wefty-proof" {
+			t.Fatalf("wrong stop target %s %s", limaHome, instance)
+		}
+		if !strings.Contains(stderr.String(), proofRoot) {
+			t.Fatal("removal did not print exact root before stop/deletion")
+		}
+		if calls == 1 {
+			return stopFailure
+		}
+		return nil
+	}
+	if err := run("--proof", "--remove", "--purge"); !errors.Is(err, stopFailure) {
+		t.Fatalf("stop error=%v", err)
+	}
+	for _, file := range []string{filepath.Join(proofRoot, "config", setupManifestName), filepath.Join(f.home, "Library", "LaunchAgents", "dev.wefty-proof.node-agent.plist")} {
+		if _, err := os.Stat(file); err != nil {
+			t.Fatalf("failed stop removed %s: %v", file, err)
+		}
+	}
+	if err := run("--proof", "--remove", "--purge"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("stop calls=%d", calls)
+	}
+	if _, err := os.Stat(proofRoot); !os.IsNotExist(err) {
+		t.Fatalf("purge root still exists: %v", err)
+	}
+}
+
+func TestProofSetupRefusesSymlinkedLimaPaths(t *testing.T) {
+	for _, suffix := range []string{"data/lima", "data/lima/wefty-proof"} {
+		t.Run(suffix, func(t *testing.T) {
+			f := newSetupFixture(t)
+			config := setupOCIAssetsFixture(t, f)
+			link := filepath.Join(f.home, proofInstallRelative, suffix)
+			if err := os.MkdirAll(filepath.Dir(link), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(t.TempDir(), link); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			err := executeSetupUsingHost(t.Context(), globalOptions{}, []string{"--proof", "--oci-config", config}, &stdout, &stderr, func() (setupHost, error) { return f.host, nil })
+			if err == nil {
+				t.Fatal("setup accepted symlinked proof Lima state")
+			}
+			if len(f.launchd.mutating()) != 0 {
+				t.Fatal("symlink refusal changed services")
+			}
+		})
 	}
 }
