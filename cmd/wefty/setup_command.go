@@ -131,7 +131,7 @@ type setupHost struct {
 }
 
 type setupRequest struct {
-	ociConfig           string
+	ociConfig string
 	// Only upgrade under its held installation lock may replace node activation.
 	activateGeneration  func(context.Context, launchagent.Agent) (launchagent.Action, error)
 	computer            setupComputerOptions

@@ -22,6 +22,24 @@ This run needs Lima 2.2 already installed by Homebrew without sudo, Go, Python 3
 If any prerequisite is missing, stop before setup and record NOT-RUN. A missing
 image artifact is an image-publication gap; do not build a replacement image.
 
+A symlinked `~/.local` or `~/.local/share` makes **both setup and removal
+refuse**, as a fail-safe rule. Before creating the proof root, the
+**ORCHESTRATOR** checks these path components:
+
+```sh
+for proof_ancestor in "$HOME/.local" "$HOME/.local/share"; do
+  if [ -L "$proof_ancestor" ]; then
+    printf 'REFUSED: symlinked proof ancestor: %s\n' "$proof_ancestor"
+    exit 1
+  fi
+done
+```
+
+Expected: exit 0 and no output; missing directories are allowed. On refusal,
+stop and report NOT-RUN. Do not unlink or redirect the daily directories as a
+proof workaround. If the layout changes after installation, removal also fails
+safe; the owner must restore the original directory layout before undo.
+
 The installed node-agent process starts the host VM, installs the guest helper
 as guest root and calls #1135's existing `NativeSeatApprovalDialog` in its login
 session. After the owner approves, the orchestrator's confined `proof-seat`
@@ -128,15 +146,20 @@ Then the **owner types**:
 Expected: setup JSON naming exactly three `dev.wefty-proof.*` services, private
 paths and ports 48111/48112. The node-agent LaunchAgent starts the `vz` host VM;
 its guest installer may take several minutes. The owner sees the native proof
-dialog and clicks **Approve**. No Mac admin password is requested. The dialog
+dialog and clicks **Approve**. The dialog has its own full five-minute
+deadline, starting when shown, independent of the bootstrap deadline. No Mac
+admin password is requested. The dialog
 says this is a proof fixture rather than a Seat request. Inspect only the proof
 node-agent log and, if created, `data/lima/wefty-proof/ha.stderr.log` inside the
 proof root if startup fails; save them privately. Undo: step 10. A denied,
 missing or failed dialog is a PR-1 failure, not a reason to invoke another dialog.
 Deny, timeout and unavailable choices persist as `approved:false` with the choice
 in `data/proof-dialog.json`. The node agent stays alive without OCI, and later
-starts skip bootstrap and the dialog. Stop and undo the already started proof
-host VM; do not delete the refusal receipt to retry.
+starts skip bootstrap and the dialog. After recording refusal, the node agent
+requests a graceful stop of only `wefty-proof`, with a separate four-minute
+bound. A failed stop is logged and the node agent stays up without OCI. The
+runbook undo still applies, whether the automatic stop succeeds or fails; do
+not delete the refusal receipt to retry.
 
 ### 4. ORCHESTRATOR — prove one process starts the host VM, shows the dialog and receives a Seat
 

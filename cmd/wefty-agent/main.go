@@ -703,7 +703,7 @@ func run() error {
 			return errors.New("--oci-user-install requires macOS")
 		}
 		installContext, stop := context.WithTimeout(context.Background(), 15*time.Minute)
-		ociAllowed, installErr := prepareInstalledUserOCI(installContext, *ociUserInstall, *nodeID, bootSessionID, version, limarunner.PrepareUserInstall, agent.NativeSeatApprovalDialog{})
+		ociAllowed, installErr := prepareInstalledUserOCI(installContext, *ociUserInstall, *nodeID, bootSessionID, version, limarunner.PrepareUserInstall, agent.NativeSeatApprovalDialog{}, limarunner.StopProofUserInstall)
 		stop()
 		if installErr != nil {
 			return installErr

@@ -25,7 +25,7 @@ type proofDialogReceipt struct {
 
 // The boolean grants OCI startup for this process. A recorded refusal keeps the
 // process-only node agent alive and cannot cause a launchd dialog restart loop.
-func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expectedVersion string, prepare func(context.Context, limarunner.UserInstallConfig, string, string) error, dialog agent.SeatApprovalDialog) (bool, error) {
+func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expectedVersion string, prepare func(context.Context, limarunner.UserInstallConfig, string, string) error, dialog agent.SeatApprovalDialog, stopProof func(context.Context, limarunner.UserInstallConfig) error) (bool, error) {
 	var c limarunner.UserInstallConfig
 	if err := limarunner.ReadUserInstallJSON(path, &c); err != nil {
 		return false, err
@@ -84,7 +84,11 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
-	choice, dialogErr := dialog.Show(ctx, agent.SeatApprovalPrompt{Message: "Wefty attended proof: the per-user node agent started the isolated host VM. Approve one proof Seat without internet. This is a proof fixture, not a Seat request.", Wait: 5 * time.Minute})
+	// Bootstrap has finished. Its remaining install budget must not shorten
+	// the owner's dialog; bound this new phase independently.
+	dialogContext, cancelDialog := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	defer cancelDialog()
+	choice, dialogErr := dialog.Show(dialogContext, agent.SeatApprovalPrompt{Message: "Wefty attended proof: the per-user node agent started the isolated host VM. Approve one proof Seat without internet. This is a proof fixture, not a Seat request.", Wait: 5 * time.Minute})
 	if dialogErr != nil {
 		choice = agent.SeatApprovalUnavailable
 		if errors.Is(dialogErr, context.DeadlineExceeded) {
@@ -106,6 +110,13 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 		return false, err
 	}
 	log.Printf("per-user host VM proof dialog choice=%s pid=%d", choice, os.Getpid())
+	if !approved && c.Instance == "wefty-proof" {
+		// The dialog may have outlived bootstrap's deadline. Cleanup gets its
+		// own bounded Lima command, without reopening OCI or losing the refusal.
+		if err := stopProof(context.WithoutCancel(ctx), c); err != nil {
+			log.Printf("proof host VM graceful stop failed: %v; use the attended undo", err)
+		}
+	}
 	return approved, nil
 }
 

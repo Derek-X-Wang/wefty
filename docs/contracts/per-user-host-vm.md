@@ -87,13 +87,18 @@ must stop before any data is removed. An unsuccessful stop retains the files.
 
 On its first proof startup the node-agent process calls #1135's existing
 `NativeSeatApprovalDialog` after the host VM and helper are ready. No second
-native-dialog implementation exists. Every choice writes a private PID-bearing
+native-dialog implementation exists. Bootstrap retains its 15-minute budget;
+the dialog receives a separate five-minute context starting when shown. Every
+choice writes a private PID-bearing
 `proof-dialog.json` receipt with `approved` and `choice` fields. It is a **proof fixture**, not an L1 Seat approval
 or the #1143 request flow. Denial, timeout or unavailability fails the proof. The node agent remains
 alive for process work without OCI recovery, control or doctor loops. Later
 starts read the refusal before bootstrap and do not ask again or start the host
-VM. The first refused startup has already started the host VM; the attended
-undo stops it. Approval receipts also suppress subsequent dialogs.
+VM. After persisting the first refusal, the node agent attempts a graceful
+`limactl stop wefty-proof` using the configured proof Lima home and an
+independent four-minute bound. It never force-stops or targets the daily host
+VM. A failed stop is logged without exiting the node agent; the attended undo
+still applies. Approval receipts also suppress subsequent dialogs.
 
 The attended `scripts/proof-seat` tool confines itself to this proof's existing
 L1 database. It uses `CreateComputer` with the trusted Seat settings and
