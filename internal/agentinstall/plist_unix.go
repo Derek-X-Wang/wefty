@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -15,6 +16,18 @@ import (
 // openat directly. Nonblocking open prevents a replaced FIFO from hanging the
 // catalog lock. Validate and read the same descriptor, never reopen its name.
 func readRetainedPlist(parent *os.Root, name string) ([]byte, error) {
+	return readOwnedFile(parent, name, 0644)
+}
+
+// ReadPrivateFile reads and validates one descriptor relative to a held parent.
+func ReadPrivateFile(parent *os.Root, name string) ([]byte, error) {
+	return readOwnedFile(parent, name, 0600)
+}
+
+func readOwnedFile(parent *os.Root, name string, mode os.FileMode) ([]byte, error) {
+	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") {
+		return nil, &VerificationRefusal{Message: "owned record requires a single component"}
+	}
 	directory, err := parent.Open(".")
 	if err != nil {
 		return nil, err
@@ -43,8 +56,14 @@ func readRetainedPlist(parent *os.Root, name string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !privateInfo(info, 0644) {
+	if !owned(info) || !info.Mode().IsRegular() || info.Mode().Perm() != mode {
 		return nil, &VerificationRefusal{Message: "retained generation plist ownership, type or mode changed"}
 	}
 	return io.ReadAll(file)
+}
+
+// ReadOwnedRegularFile supplies the same no-follow descriptor check for an
+// installation completion file whose setup mode is already known.
+func ReadOwnedRegularFile(parent *os.Root, name string, mode os.FileMode) ([]byte, error) {
+	return readOwnedFile(parent, name, mode)
 }

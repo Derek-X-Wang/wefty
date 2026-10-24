@@ -761,9 +761,18 @@ records and plist be removed. The same rules cover `control-request.json`,
 checks their private regular-file ownership and mode, retains their exact bytes in the completion
 receipt before deletion, and refuses changed evidence on replay. Cleanup is
 idempotent across interrupted file deletions; private activation/finished
-receipts remain for audit. Unknown files
-or changed ownership/digests refuse cleanup. One finished retiree does not wait
+receipts remain for audit. The emptied generation directory remains without
+catalog ownership: retaining it avoids resolving a swapped parent entry for
+`rmdir` after verification. Unknown files or changed ownership/digests refuse cleanup. One finished retiree does not wait
 for any other retiree.
+
+First-generation initialization extends its existing intent with opaque staging
+custody records under the data directory. Ambiguous scratch is quarantined, never
+unlinked or adopted. The executable directory is synced after creation or reuse
+before the catalog can own it. Legacy conversion disables restart before its last
+process check, confirms unload and plist absence before generation activation,
+and retains that legacy-label override through completion. These diagnostic
+quarantines do not grant runtime or L1 authority.
 
 Generation inventory, stage and promotion requests are executed by the installed
 primary agent with its existing node participant. The upgrade CLI holds only its
@@ -845,6 +854,30 @@ record-lock directory, result records or custody bytes. #1180 reconciliation
 must retain ambiguous and undeclared evidence. Custody alone proves neither an
 empty runtime nor an accepted first completion, and cannot authorize rollback
 or retirement restart.
+
+### Interrupted generation installation (#1180)
+
+`upgrade-rolling.json` and the existing drain/service queue remain the only
+coordinator state. Recovery runs before legacy cleanup. Candidate abort intent
+fences restart and permits only exact owned-file removal after process absence;
+all older generations remain loaded. Promotion suppression records original and
+target plist bytes before writes. Catalog, committed receipt and pending intent
+can each be retried after interruption. Successful operation evidence is retained
+in completion audit receipts after generation cleanup.
+
+Before installed startup or while a candidate waits, the narrow node adapter can
+reconcile a positively committed L1 operation. On reboot it can close an empty
+uncommitted staged session under the original operation, primary, catalog and
+admission fences. No participant, registration or managed root opens for a stale
+retiree. Only a fresh registered primary publishes a new process binding. Previous
+readiness and completion receipts never prove survival across reboot.
+
+The registered primary checks L1 closure and exact local closure evidence before
+`RemoveFinished`. It also verifies process absence and lifetime-lock release.
+The retiree persists its positive closure result before exit; a failed write
+fences exit and retries publication without another close mutation. After reboot,
+unaccounted shared evidence keeps cleanup pending without an age limit. Live
+SQLite files, shared evidence/custody storage and unknown files are never removed.
 
 ## Per-user host VM and attended proof
 

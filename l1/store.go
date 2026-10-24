@@ -3357,7 +3357,8 @@ WHERE job_id=(
 	            AND resident.job_id=prior.job_id AND resident.boot_session_id=prior.boot_session_id
 	            AND resident.authority_generation=prior.authority_generation AND resident.fencing_token=prior.fencing_token
 	            AND session.role='retiring' AND session.boot_session_id=prior.boot_session_id
-	            AND session.authority_generation=prior.authority_generation)
+	            AND session.authority_generation=prior.authority_generation
+ AND COALESCE(json_extract(session.registration_json,'$.system_boot_id'),'')=COALESCE((SELECT json_extract(p.registration_json,'$.system_boot_id') FROM node_generations p WHERE p.node_id=session.node_id AND p.role='primary'),'') )
 	        AND prior.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
 	    )
 	    %s

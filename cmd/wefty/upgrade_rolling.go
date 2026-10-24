@@ -41,15 +41,26 @@ func rollingRefused(reason upgradecompat.Reason, detail string) error {
 func (e *upgradeRollingRefusedError) Unwrap() error { return &e.apiResponseError }
 
 // Rolling receipts deliberately survive failures. #1180 reconciles external
-// effects by these exact requests/operation IDs; this coordinator never rolls
-// back or invokes legacy drain recovery for an interrupted rolling operation.
+// effects by these exact requests/operation IDs before another activation or
+// legacy drain recovery can change ownership.
 type upgradeRollingReceipt struct {
-	Protocol             uint32                        `json:"retirement_protocol"`
-	LocalCatalogRevision uint64                        `json:"local_catalog_revision"`
-	TrackedResidents     map[string]l1.ResidentAttempt `json:"tracked_residents,omitempty"`
-	ControlRenewalProof  map[string]l1.Attempt         `json:"control_plane_renewal_proof,omitempty"`
-	ControlsRestartedAt  time.Time                     `json:"controls_restarted_at,omitempty"`
-	BinaryDigests        map[string]string             `json:"binary_sha256,omitempty"`
+	ForwardFromOperation string                           `json:"forward_from_operation,omitempty"`
+	ForwardAdmission     *upgradeDrainReceipt             `json:"forward_admission,omitempty"`
+	LegacyPlistDigest    string                           `json:"legacy_plist_sha256,omitempty"`
+	LegacyBase           *launchagent.Agent               `json:"legacy_generation_agent,omitempty"`
+	StagedAbort          *agentinstall.StagedAbortControl `json:"staged_abort,omitempty"`
+	StageRegistration    *contract.NodeRegistration       `json:"stage_registration,omitempty"`
+	CompletionFiles      []rollingCompletionFile          `json:"completion_files,omitempty"`
+	RebootAttempts       map[string]l1.Attempt            `json:"reboot_attempts,omitempty"`
+	DrainIntentSequenced bool                             `json:"drain_intent_sequenced,omitempty"`
+	RecoveryDrain        *upgradeDrainReceipt             `json:"recovery_drain,omitempty"`
+	RecoveryState        string                           `json:"recovery_state,omitempty"`
+	Protocol             uint32                           `json:"retirement_protocol"`
+	LocalCatalogRevision uint64                           `json:"local_catalog_revision"`
+	TrackedResidents     map[string]l1.ResidentAttempt    `json:"tracked_residents,omitempty"`
+	ControlRenewalProof  map[string]l1.Attempt            `json:"control_plane_renewal_proof,omitempty"`
+	ControlsRestartedAt  time.Time                        `json:"controls_restarted_at,omitempty"`
+	BinaryDigests        map[string]string                `json:"binary_sha256,omitempty"`
 
 	Version             int                              `json:"version"`
 	OperationID         string                           `json:"operation_id"`
@@ -86,16 +97,9 @@ func readUpgradeRolling(paths setupPaths) (*upgradeRollingReceipt, error) {
 		return nil, err
 	}
 	defer root.Close()
-	info, err := root.Lstat(upgradeRollingFile)
+	payload, err := agentinstall.ReadPrivateFile(root, upgradeRollingFile)
 	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm() != 0600 || !setupFolderOwnedBy(info, os.Geteuid()) {
-		return nil, generationControlConflict("rolling receipt must be a private regular file")
-	}
-	payload, err := root.ReadFile(upgradeRollingFile)
-	if err != nil {
-		return nil, err
+		return nil, generationControlTransportError(err)
 	}
 	var r upgradeRollingReceipt
 	if err = json.Unmarshal(payload, &r); err != nil {
@@ -114,20 +118,21 @@ func refuseInterruptedRolling(paths setupPaths) error {
 	if err != nil {
 		return err
 	}
-	if r.Phase != "complete" {
+	if r.Phase != "complete" && r.Phase != "rolled_back" && r.Phase != "reboot_reconciled" {
 		return rollingRefused(upgradecompat.InvalidInventory, "interrupted activation "+r.OperationID+" at "+r.Phase+" requires generation-aware recovery; receipts retained")
 	}
 	return nil
 }
 
 type rollingUpgrade struct {
-	op        upgradeHost
-	paths     setupPaths
-	profile   connprofile.Profile
-	store     agentinstall.Store
-	receipt   upgradeRollingReceipt
-	protocols []uint32
-	primary   l1.NodeGeneration
+	verifiedPrimaryBoot string
+	op                  upgradeHost
+	paths               setupPaths
+	profile             connprofile.Profile
+	store               agentinstall.Store
+	receipt             upgradeRollingReceipt
+	protocols           []uint32
+	primary             l1.NodeGeneration
 }
 
 // Tests can exercise stat failures without changing any installed directories.
@@ -271,7 +276,7 @@ func prepareRollingUpgrade(ctx context.Context, host setupHost, op upgradeHost, 
 	if err != nil {
 		return nil, false, err
 	}
-	r := &rollingUpgrade{op: op, paths: paths, profile: profile, store: upgradeGenerationStore(host, paths, op), protocols: protocols, receipt: upgradeRollingReceipt{Version: 1, Protocol: decision.Protocol, OperationID: rand.Text(), NodeID: node.NodeID, SystemBootID: boot, Inventory: inventory, Preserved: slices.Clone(node.ActiveAttempts)}}
+	r := &rollingUpgrade{op: op, paths: paths, profile: profile, store: upgradeGenerationStore(host, paths, op), protocols: protocols, receipt: upgradeRollingReceipt{DrainIntentSequenced: true, Version: 1, Protocol: decision.Protocol, OperationID: rand.Text(), NodeID: node.NodeID, SystemBootID: boot, Inventory: inventory, Preserved: slices.Clone(node.ActiveAttempts)}}
 	r.receipt.BinaryDigests = map[string]string{}
 	for _, name := range setupBinaries {
 		digest, err := executableDigest(filepath.Join(destination, name))
@@ -321,8 +326,17 @@ func (r *rollingUpgrade) validateInventory(ctx context.Context, in l1.NodeGenera
 		return err
 	}
 	r.receipt.LocalCatalogRevision = c.Revision
-	if in.NodeID != r.profile.Identities.Node || c.NodeID != in.NodeID || c.PendingReceipt != "" {
+	if in.NodeID != r.profile.Identities.Node || c.NodeID != in.NodeID {
 		return rollingRefused(upgradecompat.InvalidInventory, "generation catalog identity or pending promotion differs")
+	}
+	if c.PendingReceipt != "" {
+		pending, err := r.store.ReadActivationReceipt(c.PendingReceipt)
+		if err != nil {
+			return generationControlTransportError(err)
+		}
+		if pending.L1OperationID != r.receipt.OperationID || pending.Candidate != r.receipt.Candidate.ID {
+			return generationControlConflict("inventory pending activation differs")
+		}
 	}
 	seen := map[string]bool{}
 	for _, g := range in.Generations {
@@ -395,10 +409,11 @@ func (r *rollingUpgrade) closeAdmission(ctx context.Context, node l1.Node, bound
 		return err
 	}
 	var err error
-	*drain, err = beginUpgradeDrain(ctx, r.op, r.paths, r.profile, node, bound)
+	*drain, err = beginUpgradeDrain(ctx, r.drainSnapshotHost(), r.paths, r.profile, node, bound)
 	if err != nil {
 		return err
 	}
+	r.inheritForwardAdmission(*drain)
 	if err = r.persist("admission_closed"); err != nil {
 		return err
 	}
@@ -501,7 +516,7 @@ func (r *rollingUpgrade) activate(ctx context.Context, base launchagent.Agent, s
 	for i, v := range r.protocols {
 		protocols[i] = int(v)
 	}
-	candidate, err := r.store.PrepareCandidate(source, version, r.receipt.SystemBootID, protocols)
+	candidate, err := r.store.PrepareCandidate(source, version, r.receipt.SystemBootID, protocols, r.receipt.OperationID)
 	err = generationControlTransportError(err)
 	if err != nil {
 		return "", err
@@ -531,6 +546,12 @@ func (r *rollingUpgrade) activate(ctx context.Context, base launchagent.Agent, s
 	if err = r.persist("candidate_ready"); err != nil {
 		return action, err
 	}
+	return r.promoteReady(ctx, drain, action)
+}
+
+func (r *rollingUpgrade) promoteReady(ctx context.Context, drain *upgradeDrainReceipt, action launchagent.Action) (launchagent.Action, error) {
+	candidate := r.receipt.Candidate
+	version := candidate.Version
 	node, err := r.op.observe(ctx, r.profile)
 	if err != nil {
 		return action, err
@@ -542,7 +563,38 @@ func (r *rollingUpgrade) activate(ctx context.Context, base launchagent.Agent, s
 	if err != nil {
 		return action, err
 	}
-	if !sameRollingCohort(r.receipt.Inventory, in) {
+	var staged *l1.NodeGeneration
+	cohort := in
+	cohort.Generations = slices.Clone(in.Generations)
+	cohort.Generations = slices.DeleteFunc(cohort.Generations, func(g l1.NodeGeneration) bool {
+		if g.AgentGenerationID == candidate.ID && g.Role == l1.NodeGenerationStaged {
+			copy := g
+			staged = &copy
+			return true
+		}
+		return false
+	})
+	if staged != nil {
+		if staged.BootSessionID != candidate.CandidateBootSessionID || staged.Registration.AgentVersion != candidate.Version || staged.Registration.NodeID != r.receipt.NodeID || staged.AuthorityGeneration != 0 || len(staged.ResidentAttempts) != 0 {
+			return action, generationControlConflict("staged recovery candidate identity differs")
+		}
+		if r.receipt.StageRegistration != nil {
+			expected := *r.receipt.StageRegistration
+			if expected.SystemBootID != "" && hostboot.SameBoot(expected.SystemBootID, staged.Registration.SystemBootID) {
+				expected.SystemBootID = staged.Registration.SystemBootID
+			}
+			expected.MissingCapabilities = append([]string{}, expected.MissingCapabilities...)
+			actual := staged.Registration
+			actual.MissingCapabilities = append([]string{}, actual.MissingCapabilities...)
+			if !reflect.DeepEqual(expected, actual) {
+				return action, generationControlConflict("staged recovery payload differs from the original request")
+			}
+		}
+	}
+	if err = r.store.VerifyRunning(ctx, candidate.ID, r.receipt.SystemBootID); err != nil {
+		return action, generationControlTransportError(err)
+	}
+	if !sameRollingCohort(r.receipt.Inventory, cohort) {
 		return action, rollingRefused(upgradecompat.InvalidInventory, "cohort changed before staging")
 	}
 	if err = r.validateInventory(ctx, in, node); err != nil {
@@ -554,22 +606,33 @@ func (r *rollingUpgrade) activate(ctx context.Context, base launchagent.Agent, s
 	// Stage only a ready candidate. Use current normalized Node facts; candidate
 	// startup publishes its own observations after local activation is committed.
 	registration := node.NodeRegistration
+	registration.SystemBootID = r.receipt.SystemBootID
 	registration.AgentGenerationID = candidate.ID
 	registration.BootSessionID = candidate.CandidateBootSessionID
 	registration.AgentVersion = version
 	registration.CapabilityRevision++
 	registration.CapabilityObservedAt = r.op.now()
+	if staged != nil {
+		registration = staged.Registration
+		r.receipt.StageRegistration = &registration
+	} else if r.receipt.StageRegistration != nil {
+		registration = *r.receipt.StageRegistration
+	} else {
+		r.receipt.StageRegistration = &registration
+	}
 	if err = r.persist("candidate_staging"); err != nil {
 		return action, err
 	}
-	in, err = r.op.stageGeneration(ctx, r.profile, registration)
-	if err != nil {
-		return action, err
+	if staged == nil {
+		in, err = r.op.stageGeneration(ctx, r.profile, registration)
+		if err != nil {
+			return action, err
+		}
 	}
 	if err = r.captureInventory(ctx, in); err != nil {
 		return action, err
 	}
-	evidence := agentinstall.PromotionEvidence{IntentRevision: drain.Revision, L1CatalogRevision: in.CatalogRevision, Residents: map[string][]agentinstall.ResidentAttempt{candidate.ID: {}}, ClosedGenerations: map[string]agentinstall.Binding{}, ServiceRecoveryKeys: map[string]string{}}
+	evidence := agentinstall.PromotionEvidence{ExpectedAuthorityGeneration: r.primary.AuthorityGeneration, IntentReason: drain.Reason, IntentRevision: drain.Revision, L1CatalogRevision: in.CatalogRevision, Residents: map[string][]agentinstall.ResidentAttempt{candidate.ID: {}}, ClosedGenerations: map[string]agentinstall.Binding{}, ServiceRecoveryKeys: map[string]string{}}
 	c, err := r.store.Read()
 	err = generationControlTransportError(err)
 	if err != nil {
@@ -603,51 +666,92 @@ func (r *rollingUpgrade) activate(ctx context.Context, base launchagent.Agent, s
 	for _, a := range drain.Services {
 		evidence.ServiceRecoveryKeys[a.AttemptID] = upgradeServiceRecoveryKey(drain, a)
 	}
-	receipt, err := r.store.BeginPromotion(candidate.ID, r.receipt.SystemBootID, r.receipt.OperationID, c.Revision, 1, evidence)
+	var receipt agentinstall.ActivationReceipt
+	if c.PendingReceipt != "" {
+		receipt, err = r.store.ReadActivationReceipt(c.PendingReceipt)
+		if err == nil && (receipt.L1OperationID != r.receipt.OperationID || receipt.Candidate != candidate.ID || receipt.IntentRevision != drain.Revision) {
+			err = generationControlConflict("pending activation belongs to another operation")
+		}
+	} else {
+		receipt, err = r.store.BeginPromotion(candidate.ID, r.receipt.SystemBootID, r.receipt.OperationID, c.Revision, 1, evidence)
+	}
 	err = generationControlTransportError(err)
 	if err != nil {
 		return action, err
 	}
 	r.receipt.ActivationReceiptID = receipt.ID
+	slices.Sort(retirees)
 	request := l1.PromoteNodeGenerationRequest{OperationID: r.receipt.OperationID, ExpectedPrimaryGenerationID: r.primary.AgentGenerationID, ExpectedPrimaryBootSessionID: r.primary.BootSessionID, ExpectedAuthorityGeneration: r.primary.AuthorityGeneration, CandidateGenerationID: candidate.ID, CandidateBootSessionID: candidate.CandidateBootSessionID, ExpectedCatalogRevision: in.CatalogRevision, CatalogRevision: in.CatalogRevision + 1, IntentRevision: drain.Revision, SelectedProtocol: 1, RetiringGenerationIDs: retirees, ResidentAttempts: residents}
+	if err = r.store.BindPromotionRequest(receipt.ID, request); err != nil {
+		return action, generationControlTransportError(err)
+	}
 	r.receipt.Promotion = &request
 	if err = r.persist("promotion_requested"); err != nil {
 		return action, err
 	}
-	// Conservative observation boundary: even a slow RPC must be followed by a
-	// renewal accepted after its reply. Ambiguity leaves the exact request intact.
-	promoted, err := r.op.promoteGeneration(ctx, r.profile, request)
-	if err != nil {
+	return r.finishPromotion(ctx, action)
+}
+
+func (r *rollingUpgrade) finishPromotion(ctx context.Context, action launchagent.Action) (launchagent.Action, error) {
+	originalPhase := r.receipt.Phase
+	acknowledged := slices.Contains([]string{"retirement_acknowledged", "survivor_renewal_proved", "installation_completing", "installation_complete", "admission_settling"}, originalPhase)
+	proved := slices.Contains([]string{"survivor_renewal_proved", "installation_completing", "installation_complete", "admission_settling"}, originalPhase)
+	request := *r.receipt.Promotion
+	var promoted l1.NodeGenerationInventory
+	var err error
+	if r.receipt.PromotionResult != nil {
+		promoted = *r.receipt.PromotionResult
+	} else {
+		// Conservative observation boundary: even a slow RPC must be followed by a
+		// renewal accepted after its reply. Ambiguity leaves the exact request intact.
+		promoted, err = r.op.promoteGeneration(ctx, r.profile, request)
+		if err != nil {
+			return action, err
+		}
+		if err = validateRollingPromotion(promoted, request, r.receipt.NodeID); err != nil {
+			return action, err
+		}
+		r.receipt.PromotionResult = &promoted
+		r.receipt.CutoverAt = r.op.now()
+		if err = r.persist("promotion_committed"); err != nil {
+			return action, err
+		}
+	}
+	if err = validateRollingPromotion(promoted, request, r.receipt.NodeID); err != nil {
 		return action, err
 	}
-	if err = validateRollingPromotion(promoted, request); err != nil {
-		return action, err
-	}
-	r.receipt.PromotionResult = &promoted
-	r.receipt.CutoverAt = r.op.now()
-	if err = r.persist("promotion_committed"); err != nil {
-		return action, err
-	}
-	if err = r.store.CommitPromotion(ctx, receipt.ID, request.OperationID, r.receipt.SystemBootID, promoted.CatalogRevision); err != nil {
+	if err = r.store.CommitPromotion(ctx, r.receipt.ActivationReceiptID, request.OperationID, r.receipt.SystemBootID, promoted.CatalogRevision); err != nil {
 		return action, generationControlTransportError(err)
 	}
-	if err = r.persist("catalog_reconciled"); err != nil {
-		return action, err
+	if r.receipt.RecoveryState != "" {
+		if err = r.waitRecoveryPrimary(ctx); err != nil {
+			return action, err
+		}
 	}
-	if err = r.waitRetirement(ctx, promoted); err != nil {
-		return action, err
+	if !acknowledged {
+		if err = r.persist("catalog_reconciled"); err != nil {
+			return action, err
+		}
+		if err = r.waitRetirement(ctx, promoted); err != nil {
+			return action, err
+		}
+		if err = r.persist("retirement_acknowledged"); err != nil {
+			return action, err
+		}
 	}
-	if err = r.persist("retirement_acknowledged"); err != nil {
-		return action, err
-	}
-	if err = r.waitSurvivors(ctx, promoted, r.receipt.CutoverAt); err != nil {
-		return action, err
+	if !proved || r.receipt.RecoveryState != "" {
+		if err = r.waitSurvivors(ctx, promoted, r.receipt.CutoverAt); err != nil {
+			return action, err
+		}
 	}
 	return action, r.persist("survivor_renewal_proved")
 }
-func validateRollingPromotion(in l1.NodeGenerationInventory, request l1.PromoteNodeGenerationRequest) error {
+func validateRollingPromotion(in l1.NodeGenerationInventory, request l1.PromoteNodeGenerationRequest, expectedNode ...string) error {
 	if in.NodeID == "" || in.CatalogRevision <= 0 || len(in.Generations) == 0 {
 		return errors.New("malformed promotion result")
+	}
+	if len(expectedNode) > 0 && in.NodeID != expectedNode[0] {
+		return generationControlConflict("promotion result node identity differs")
 	}
 	if in.CatalogRevision != request.CatalogRevision {
 		return generationControlConflict("promotion result revision differs")
@@ -742,6 +846,14 @@ func (r *rollingUpgrade) waitSurvivors(ctx context.Context, in l1.NodeGeneration
 			if err != nil {
 				return fmt.Errorf("observe surviving job %s attempt %s: %w", old.JobID, old.AttemptID, err)
 			}
+			if r.receipt.RecoveryState != "" {
+				if job.JobID == "" {
+					return errors.New("malformed surviving Job observation")
+				}
+				if job.JobID != old.JobID {
+					return generationControlConflict("surviving Job identity differs")
+				}
+			}
 			found := false
 			for _, a := range job.Attempts {
 				if a.AttemptID != old.AttemptID {
@@ -751,6 +863,11 @@ func (r *rollingUpgrade) waitSurvivors(ctx context.Context, in l1.NodeGeneration
 				terminal := (a.State == contract.AttemptSucceeded || a.State == contract.AttemptFailed) && a.Result != nil
 				renewed := (a.State == contract.AttemptClaimed || a.State == contract.AttemptRunning || a.State == contract.AttemptAwaitingInput) && a.UpdatedAt.After(after) && a.LeaseExpiresAt.Add(-l1.DefaultLeaseDuration).After(after) && a.LeaseExpiresAt.After(r.op.now())
 				if terminal || renewed {
+					if renewed && r.receipt.RecoveryState != "" {
+						if err := r.verifyRetiringProcess(ctx, old); err != nil {
+							return err
+						}
+					}
 					r.receipt.RenewalProof[a.AttemptID] = a
 				} else {
 					complete = false
@@ -764,7 +881,11 @@ func (r *rollingUpgrade) waitSurvivors(ctx context.Context, in l1.NodeGeneration
 		if err != nil {
 			return err
 		}
-		primaryHealthy := node.BootSessionID == r.receipt.Candidate.CandidateBootSessionID && node.AgentVersion == r.receipt.Candidate.Version && node.State == contract.NodeAlive && node.LastHeartbeatAt.After(after)
+		expectedBoot := r.receipt.Candidate.CandidateBootSessionID
+		if r.verifiedPrimaryBoot != "" {
+			expectedBoot = r.verifiedPrimaryBoot
+		}
+		primaryHealthy := node.BootSessionID == expectedBoot && node.AgentVersion == r.receipt.Candidate.Version && node.State == contract.NodeAlive && node.LastHeartbeatAt.After(after)
 		if complete && primaryHealthy {
 			return nil
 		}
@@ -788,7 +909,7 @@ func requestGenerationControl(ctx context.Context, store agentinstall.Store, req
 	defer ticker.Stop()
 	for {
 		result, err := store.ReadControlReply(request)
-		if err == nil && reflect.DeepEqual(result.Request, request) {
+		if err == nil && (reflect.DeepEqual(result.Request, request) || (result.SuccessfulPromotion() && agentinstall.SamePromotionControl(result.Request, request))) {
 			if result.Error != "" {
 				if result.APIError != nil {
 					apiError := *result.APIError
@@ -901,6 +1022,29 @@ func generationUpgradeControl(ctx context.Context, host setupHost, op upgradeHos
 		}
 		operation = receipt.OperationID
 	}
+	if action == "promote_generation" {
+		request, ok := payload.(l1.PromoteNodeGenerationRequest)
+		if !ok {
+			return in, generationControlConflict("promotion control requires the typed request")
+		}
+		previous, readErr := store.ReadPromotionResult(request.ExpectedPrimaryGenerationID)
+		var pending *agentinstall.RecordPendingError
+		if readErr == nil && previous.SuccessfulPromotion() {
+			body, encodeErr := json.Marshal(payload)
+			if encodeErr != nil {
+				return in, encodeErr
+			}
+			expected := agentinstall.ControlRequest{ID: operation, NodeID: catalog.NodeID, GenerationID: request.ExpectedPrimaryGenerationID, BootSessionID: request.ExpectedPrimaryBootSessionID, Action: action, Payload: body}
+			if !agentinstall.SamePromotionControl(previous.Request, expected) {
+				return in, generationControlConflict("promotion replay payload differs")
+			}
+			err = json.Unmarshal(previous.Payload, &in)
+			return in, err
+		}
+		if readErr != nil && !errors.As(readErr, &pending) {
+			return in, readErr
+		}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return in, err
@@ -1001,7 +1145,9 @@ func enrollUpgradeGeneration(ctx context.Context, host setupHost, op upgradeHost
 	if r.NodeID != p.Identities.Node || !hostboot.SameBoot(r.SystemBootID, boot) || r.Phase != "legacy_admission_closing" {
 		return "", generationControlConflict("legacy enrollment intent changed")
 	}
-	if err = writeUpgradeRolling(paths, r, "legacy_draining"); err != nil {
+	r.LegacyBase = &base
+	r.RecoveryDrain = drain
+	if err = writeLegacyRolling(paths, op, r, "legacy_draining"); err != nil {
 		return "", err
 	}
 	legacyPlist := filepath.Join(paths.launchAgentsRel, setupNodeAgentLabel+".plist")
@@ -1010,17 +1156,27 @@ func enrollUpgradeGeneration(ctx context.Context, host setupHost, op upgradeHost
 		return "", err
 	}
 	defer root.Close()
-	manifestPayload, err := root.ReadFile(filepath.Join(paths.configRel, setupManifestName))
+	configRoot, err := root.OpenRoot(paths.configRel)
 	if err != nil {
 		return "", err
+	}
+	manifestPayload, err := agentinstall.ReadPrivateFile(configRoot, setupManifestName)
+	configRoot.Close()
+	if err != nil {
+		return "", generationControlTransportError(err)
 	}
 	var manifest setupManifest
 	if err = json.Unmarshal(manifestPayload, &manifest); err != nil {
 		return "", err
 	}
-	plistPayload, err := root.ReadFile(legacyPlist)
+	plistRoot, err := root.OpenRoot(paths.launchAgentsRel)
 	if err != nil {
 		return "", err
+	}
+	plistPayload, err := agentinstall.ReadOwnedRegularFile(plistRoot, setupNodeAgentLabel+".plist", 0644)
+	plistRoot.Close()
+	if err != nil {
+		return "", generationControlTransportError(err)
 	}
 	if manifest.Version != 1 || manifest.Files[legacyPlist] != payloadDigest(plistPayload) {
 		return "", generationControlConflict("legacy generation enrollment lacks exact plist ownership")
@@ -1034,11 +1190,17 @@ func enrollUpgradeGeneration(ctx context.Context, host setupHost, op upgradeHost
 		recordUpgradeWork(&oldAttempts, service)
 	}
 	r.Preserved = oldAttempts
-	if err = writeUpgradeRolling(paths, r, "legacy_stopping"); err != nil {
+	r.LegacyPlistDigest = payloadDigest(plistPayload)
+	if err = writeLegacyRolling(paths, op, r, "legacy_stopping"); err != nil {
 		return "", err
 	}
 	if err = store.Manager.Unload(ctx, setupNodeAgentLabel); err != nil {
 		return "", err
+	}
+	if op.rollingStep != nil {
+		if err = op.rollingStep("legacy_unloaded_before_plist_removal"); err != nil {
+			return "", err
+		}
 	}
 	started := op.now()
 	for {
@@ -1062,19 +1224,11 @@ func enrollUpgradeGeneration(ctx context.Context, host setupHost, op upgradeHost
 			return "", err
 		}
 	}
-	if err = root.Remove(legacyPlist); err != nil {
+	cleanup := rollingUpgrade{paths: paths, store: store, receipt: *r}
+	if err = cleanup.removeLegacyAutostart(ctx); err != nil {
 		return "", err
 	}
-	folder, err := root.OpenRoot(paths.launchAgentsRel)
-	if err != nil {
-		return "", err
-	}
-	err = durable.SyncDir(folder)
-	folder.Close()
-	if err != nil {
-		return "", err
-	}
-	g, err := store.Initialize(p.Identities.Node, source, version, boot, []int{1})
+	g, err := store.Initialize(p.Identities.Node, source, version, boot, []int{1}, r.OperationID)
 	err = generationControlTransportError(err)
 	if err != nil {
 		return "", err
@@ -1083,7 +1237,7 @@ func enrollUpgradeGeneration(ctx context.Context, host setupHost, op upgradeHost
 	if g.Digest != strings.TrimPrefix(r.BinaryDigests["wefty-agent"], "sha256:") {
 		return "", rollingRefused(upgradecompat.InvalidInventory, "candidate changed after protocol inspection")
 	}
-	if err = writeUpgradeRolling(paths, r, "legacy_generation_loading"); err != nil {
+	if err = writeLegacyRolling(paths, op, r, "legacy_generation_loading"); err != nil {
 		return "", err
 	}
 	action, err := store.LoadCandidate(ctx, g.ID, base)
@@ -1107,7 +1261,7 @@ func enrollUpgradeGeneration(ctx context.Context, host setupHost, op upgradeHost
 			err = bindErr
 			if err == nil {
 				r.Candidate.Process = &ready.Binding
-				return action, writeUpgradeRolling(paths, r, "legacy_generation_ready")
+				return action, writeLegacyRolling(paths, op, r, "legacy_generation_ready")
 			}
 			var pending *agentinstall.RecordPendingError
 			if !errors.As(err, &pending) {
@@ -1187,4 +1341,14 @@ func refuseUnsupportedRolling(ctx context.Context, host setupHost, paths setupPa
 	}
 	decision := upgradecompat.Decide(input)
 	return rollingRefused(decision.Reason, "this installation cannot use rolling activation; the default upgrade path is unchanged")
+}
+
+func writeLegacyRolling(paths setupPaths, op upgradeHost, r *upgradeRollingReceipt, phase string) error {
+	if err := writeUpgradeRolling(paths, r, phase); err != nil {
+		return err
+	}
+	if op.rollingStep != nil {
+		return op.rollingStep(phase)
+	}
+	return nil
 }

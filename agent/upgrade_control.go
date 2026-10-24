@@ -12,6 +12,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
+	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
@@ -21,6 +22,7 @@ import (
 func (a *Agent) ServeUpgradeControl(ctx context.Context, store agentinstall.Store) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	var nextCleanup time.Time
 	var handled *agentinstall.ControlRequest
 	var pending *agentinstall.ControlResult
 	replyFenced := false
@@ -53,6 +55,24 @@ func (a *Agent) ServeUpgradeControl(ctx context.Context, store agentinstall.Stor
 			// No mutex is held across a failed write or between retries.
 			_ = publish()
 			continue
+		}
+		// Only the installed primary performs independent retiree cleanup. A
+		// failed observation never supplies closure, and live processes are kept.
+		if a.session.client != nil && !a.session.isRetiring() && !a.session.clock.Now().Before(nextCleanup) {
+			nextCleanup = a.session.clock.Now().Add(generationInventoryRefreshInterval)
+			inventory, observeErr := a.session.client.NodeGenerations(ctx, a.session.registration.NodeID)
+			primary := observeErr == nil && inventory.NodeID == a.session.registration.NodeID && slices.ContainsFunc(inventory.Generations, func(g l1.NodeGeneration) bool {
+				return g.Role == l1.NodeGenerationPrimary && g.AgentGenerationID == a.session.registration.AgentGenerationID && g.BootSessionID == a.session.registration.BootSessionID
+			})
+			if observeErr == nil && primary {
+				observeErr = a.reconcileRebootRetirees(ctx, store, inventory)
+			}
+			if observeErr == nil && primary {
+				observeErr = store.CleanupClosed(ctx, inventory)
+			}
+			if observeErr != nil && a.session.logf != nil {
+				a.session.logf("generation retirement cleanup remains pending: %v", observeErr)
+			}
 		}
 		r, err := store.ReadControl(a.session.registration.AgentGenerationID)
 		var notPublished *agentinstall.RecordPendingError
@@ -94,9 +114,7 @@ func (a *Agent) ServeUpgradeControl(ctx context.Context, store agentinstall.Stor
 			switch r.Action {
 			case "quiesce_services":
 				var request UpgradeServiceQuiescence
-				if err = json.Unmarshal(r.Payload, &request); err != nil {
-					err = upgradeControlConflict(fmt.Sprintf("agent: invalid quiescence payload: %v", err))
-				} else if request.OperationID != r.ID {
+				if err = decodeUpgradeControlPayload(r.Payload, &request, "quiescence"); err == nil && request.OperationID != r.ID {
 					err = upgradeControlConflict("agent: installed control operation mismatch")
 				}
 				if err == nil {
@@ -121,6 +139,12 @@ func (a *Agent) ServeUpgradeControl(ctx context.Context, store agentinstall.Stor
 			case "generation_inventory", "stage_generation", "promote_generation":
 				var inventory l1.NodeGenerationInventory
 				inventory, err = a.controlUpgradeGenerations(bounded, store, r)
+				if err == nil {
+					result.Payload, err = json.Marshal(inventory)
+				}
+			case "abort_staged_generation":
+				var inventory l1.NodeGenerationInventory
+				inventory, err = a.abortStaged(bounded, store, r)
 				if err == nil {
 					result.Payload, err = json.Marshal(inventory)
 				}
@@ -213,11 +237,14 @@ func (a *Agent) controlUpgradeGenerations(ctx context.Context, store agentinstal
 	switch r.Action {
 	case "stage_generation":
 		var registration contract.NodeRegistration
-		if err := json.Unmarshal(r.Payload, &registration); err != nil {
-			return inventory, upgradeControlConflict(fmt.Sprintf("agent: invalid stage payload: %v", err))
+		if err := decodeUpgradeControlPayload(r.Payload, &registration, "stage"); err != nil {
+			return inventory, err
 		}
 		candidate, owned := catalog.Generations[registration.AgentGenerationID]
-		if registration.NodeID != s.registration.NodeID || !owned || candidate.Role != "" || candidate.Process == nil || candidate.Process.BootSessionID != registration.BootSessionID || candidate.Version != registration.AgentVersion || catalog.PendingReceipt != "" {
+		if registration.SystemBootID == "" && candidate.Process != nil {
+			registration.SystemBootID = candidate.Process.SystemBootID
+		}
+		if registration.NodeID != s.registration.NodeID || !owned || candidate.Role != "" || candidate.Process == nil || candidate.Process.BootSessionID != registration.BootSessionID || candidate.Version != registration.AgentVersion || !hostboot.SameBoot(registration.SystemBootID, candidate.Process.SystemBootID) || catalog.PendingReceipt != "" {
 			return inventory, upgradeControlConflict("agent: stage requires the exact ready local candidate")
 		}
 		if err := store.VerifyRunning(ctx, candidate.ID, candidate.Process.SystemBootID); err != nil {
@@ -226,8 +253,8 @@ func (a *Agent) controlUpgradeGenerations(ctx context.Context, store agentinstal
 		return s.client.StageNodeGeneration(ctx, s.registration.NodeID, registration)
 	case "promote_generation":
 		var request l1.PromoteNodeGenerationRequest
-		if err := json.Unmarshal(r.Payload, &request); err != nil {
-			return inventory, upgradeControlConflict(fmt.Sprintf("agent: invalid promotion payload: %v", err))
+		if err := decodeUpgradeControlPayload(r.Payload, &request, "promotion"); err != nil {
+			return inventory, err
 		}
 		if catalog.PendingReceipt == "" {
 			return inventory, upgradeControlConflict("agent: promotion requires an active installation receipt")
@@ -299,4 +326,18 @@ func NewUpgradeControlResult(request agentinstall.ControlRequest, payload json.R
 	result := agentinstall.ControlResult{Request: request, Payload: payload}
 	setUpgradeControlError(&result, err)
 	return result
+}
+
+// A valid JSON value with the wrong action shape is an explicit payload
+// refusal. Syntax/encoding failures retain their operational decode cause.
+func decodeUpgradeControlPayload(payload json.RawMessage, target any, action string) error {
+	err := json.Unmarshal(payload, target)
+	if err == nil {
+		return nil
+	}
+	var mismatch *json.UnmarshalTypeError
+	if errors.As(err, &mismatch) {
+		return upgradeControlConflict(fmt.Sprintf("agent: invalid %s payload: %v", action, err))
+	}
+	return fmt.Errorf("agent: decode %s payload: %w", action, err)
 }

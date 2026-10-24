@@ -144,6 +144,15 @@ func (session *agentSession) closeRetirement(ctx context.Context) (bool, error) 
 	if err := session.lockRetirementAfterReply(ctx); err != nil {
 		return false, err
 	}
+	if session.retirementClosedResult != nil {
+		closed := *session.retirementClosedResult
+		session.retirementMu.Unlock()
+		if session.retirementClosed != nil {
+			err := session.retirementClosed(closed)
+			return err == nil, err
+		}
+		return true, nil
+	}
 	generation := *session.retiringGeneration
 	generation.ResidentAttempts = slices.Clone(generation.ResidentAttempts)
 	session.retirementMu.Unlock()
@@ -196,7 +205,32 @@ func (session *agentSession) closeRetirement(ctx context.Context) (bool, error) 
 		BootSessionID: generation.BootSessionID, PromotionOperationID: generation.PromotionOperationID,
 		ResidentAttempts: generation.ResidentAttempts, RuntimesReaped: true, EvidenceSettled: true,
 	})
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	if session.retirementClosed != nil {
+		inventory, err := session.client.NodeGenerations(ctx, session.registration.NodeID)
+		if err != nil {
+			return false, err
+		}
+		if inventory.NodeID == "" {
+			return false, errors.New("agent: malformed closure inventory")
+		}
+		if inventory.NodeID != session.registration.NodeID {
+			return false, upgradeControlConflict("agent: closure inventory node differs")
+		}
+		for _, g := range inventory.Generations {
+			if g.AgentGenerationID == generation.AgentGenerationID && g.BootSessionID == generation.BootSessionID && g.Role == l1.NodeGenerationClosed {
+				session.retirementMu.Lock()
+				session.retirementClosedResult = &g
+				session.retirementMu.Unlock()
+				err = session.retirementClosed(g)
+				return err == nil, err
+			}
+		}
+		return false, errors.New("agent: positive retirement closure unverified")
+	}
+	return true, nil
 }
 
 // lockRetirementAfterReply returns with retirementMu held, but waits for durable

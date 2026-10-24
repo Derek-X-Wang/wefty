@@ -585,11 +585,202 @@ same-account process to another.
 `ResumeUpgradeServiceClaims` is exposed by the same adapter for #1180's
 pre-promotion recovery, which must first prove that generation is still primary.
 
-An incomplete rolling receipt blocks subsequent upgrade before stale staging
-cleanup, legacy drain recovery or registration. Returned failures retain
-admission and all receipts for #1180; this slice performs no rolling rollback.
-`readUpgradeRolling`, agentinstall activation receipts, control result and
-retirement acknowledgment readers are the #1180 reconciliation seams. #1181
-can use the completed receipt and L1 inventory for status/doctor; this change
-does not implement their overlap text. Native launchd/reboot behavior remains
-subject to #1182's attended acceptance.
+### Interrupted rolling activation, rollback and retirement (#1180)
+
+An incomplete rolling receipt is reconciled under the installation lock before
+stale-stage deletion, legacy drain recovery, or a further activation. The next
+`upgrade` invocation does this even without `--rolling`. It settles one existing
+operation and returns; it does not begin a second upgrade in that invocation.
+The ordinary no-receipt path keeps its existing drain behavior and output.
+
+| Durable boundary | Retry behavior |
+| --- | --- |
+| `prepared`, `admission_closing`, `admission_closed` | Reconcile owned admission; primary and all retirees stay intact. |
+| `services_quiescing` | Replay the exact service barrier and persist its positive result before recovery or resume. |
+| `services_quiesced`, `installation_writing`, `control_plane_renewed`, `candidate_preparing`, `candidate_loading` | Abort only the operation-bound unpromoted candidate; wait for its process lock and process to end before exact-file cleanup; recover services through the existing queue. |
+| `candidate_ready`, `candidate_staging` | Reuse exact staged registration and pending activation evidence; continue forward without restarting controls or services. A positively stopped staged candidate can instead close under exact admission fences and roll back. |
+| `promotion_requested` | Resolve the exact stored request/result. An installed candidate can resolve an already committed operation before runtime initialization. |
+| `promotion_committed`, catalog/retirement publication | Finish suppression, catalog publication, committed receipt and pending-intent clearance idempotently. |
+| `retirement_acknowledged`, `survivor_renewal_proved` | Re-read exact Attempt evidence and verify each active retiree's current process incarnation. Saved renewal proof is history, never current survival proof. |
+| `installation_completing`, `installation_complete`, `admission_settling` | Publish the prepared skills/manifest bytes, replay the existing service queue and settle only owned admission with CAS. |
+| `rolling_back`, `rolled_back` | Continue or retain candidate-only rollback; never unload a primary or retiree. |
+| `reboot_reconciled` | Keep the interrupted original Attempt observations; only the recorded primary starts and existing restartable-Job recovery creates successors. |
+
+Legacy enrollment remains a drain. Its `legacy_admission_closing`,
+`legacy_draining` and `legacy_stopping` phases can leave a still-running legacy
+primary intact. Once that process has stopped and exact Attempts have settled,
+recovery finishes only the single recorded first generation. Its original launch
+plan and completion files are stored before use; a loaded generation is not
+bootstrapped again. Missing or contradictory ownership stays fenced.
+
+The installation receipt carries completion-file bytes only for setup's skill
+paths and installed manifest. It contains no database snapshot. Early rollback
+can retain new compatible control binaries; its manifest records actual binary
+hashes and clears the installed version rather than claiming a complete install.
+Format preflight and live databases are retained. No recovery restores a database
+or downgrades writers over an observed format change.
+
+Preparation binds each candidate to its operation. Abort intent is durable before
+its waiting process exits or a stale launchd definition can start it. An abort
+cannot remove a staged or promoted candidate without positive L1 resolution.
+The optional `abort` on generation close is restricted to an empty staged session,
+exact primary/boot/authority, catalog revision, admission revision/reason and
+operation. It reuses L1's operation-result ledger. Changed replay payloads refuse
+without replacing recorded success. No primary or retiring session can use it.
+
+After promotion, recovery prefers forward completion. If the replacement process
+is unhealthy and compatible replacement plus complete work accounting cannot be
+proved, rollback returns a typed `destructive_rollback` conflict (exit 5), including
+accepted new-primary Attempts. It retains every generation, live database and
+receipt. It does not stop the replacement or repeat an ordinary Job. Transport,
+syntax/reply decode, persistence, manager and filesystem faults retain exit 1
+and their cause. A valid JSON value with the wrong action payload shape is an
+explicit validation refusal (exit 5).
+
+Activation records exact target suppression bytes before changing any plist.
+Retry accepts only the original or recorded target bytes. It can finish after
+any suppression write, catalog publication, receipt publication or pending-intent
+clearance. Committed replay validates operation and L1 revision before returning.
+A newly registered primary publishes its fresh process binding; candidate readiness
+is not retained as proof of the registered or rebooted process.
+
+An installed agent can reconcile an exact L1-committed promotion before opening
+managed state, registering, or running payloads. On reboot it can abort a positively
+uncommitted staged operation under its original admission fences. Unavailable
+authority keeps startup fenced. The CLI never opens a node principal. The named `abort_staged_generation` action also lets a fresh primary close a
+never-authorized candidate staged before promotion, including a prior-boot
+candidate. It verifies local operation ownership, an empty staged resident set
+and the original closed admission. Positive L1 closure is durable before local
+pending activation is marked aborted and candidate removal can proceed.
+The adapter has no arbitrary HTTP proxy and no Seat approval operation.
+
+`system_boot_id` is an optional generation-registration field. Installed agents
+supply the host identity. A verified activation binds legacy cohort metadata on
+that same boot; an unchanged primary boot can record the first such observation.
+An ordinary primary process restart on the same host boot preserves retirees.
+A host reboot invalidates prior-boot retiree heartbeat and live Attempt renewal
+and keeps the unknown-predecessor claim embargo until reconciliation. Evidence
+replay predicates remain unchanged. Expiry is reported as lost, with no invented
+exit result; only restartable Jobs receive fresh Attempts under #1085.
+
+Retirement closes at L1 only after positive reap and settled evidence. Its exact
+closure result is persisted before exit. The primary independently checks fresh
+L1 closure and the local closure record, process absence and lock release before
+receipt-bound cleanup. A local receipt alone never authorizes removal. Audit
+receipts retain promotion replies and retirement acknowledgments after exact-file
+cleanup. Unaccounted evidence after reboot stays pending without a deadline.
+
+#1181 should read `phase`, `recovery_state`, original and reboot Attempt evidence,
+renewal proofs, admission ownership and activation/catalog IDs together with
+fresh L1 inventory. `reboot_interrupted` must not be displayed as survival or a
+successful uninterrupted cutover. Missing completion plans or old receipts that
+lack enough exact recovery evidence remain unverified; no values are invented.
+Native launchd/reboot acceptance remains #1182's attended gate.
+
+Admission recovery records the exact drain intent in the existing rolling receipt
+before writing the drain file or sending its compare-and-set request. Missing
+drain files use that exact snapshot. Missing both copies after admission starts
+is a filesystem fault, never evidence that admission was restored.
+
+### Review repair boundaries (#1180)
+
+Candidate and retired-generation cleanup hold the validated directory descriptor
+and acquire its lifetime lock on that same inode. Every unlink is relative to
+that descriptor. The parent entry must still identify that inode before each
+file removal. Cleanup verifies emptiness and syncs those unlinks through that
+descriptor before removing catalog ownership; it retains the empty directory. It never resolves the parent
+entry again for `rmdir`, so a swap after its final identity check cannot remove
+a replacement directory. A renamed directory or relative symlink substitution
+observed during verification is an ownership refusal; sibling files remain.
+The candidate plist digest records publication intent. An absent plist is safe
+only for the exact stopped, operation-bound candidate with no execution authority;
+it does not prove publication or process survival.
+
+First-generation initialization persists an exclusive operation-bound intent in
+the existing installation data directory before creating the generation root.
+Its exact generation ID, binary digest, version, protocol and original boot remain
+fixed across retry. Root creation, generation-directory creation, executable
+publication and catalog publication can each resume. Their derived staging names
+(`wefty-agent.init-ID.tmp` and `catalog.json.init-ID.tmp`) confer no file ownership.
+An ambiguous entry at either name is never deleted or adopted. The existing
+initialization intent records a unique `agent-initialization-quarantine-ID`
+location under the installation data directory before descriptor-relative
+`renameat` moves the entry there. Source, destination and parent directory syncs
+precede recorded custody. Retry completes either side of that move; a replacement
+between observation and rename is preserved as well. Unknown names outside these
+scratch locations still refuse.
+
+Fresh stages are O_EXCL-created and held open through payload/inode verification
+in their private custody directory and publication. Custody records alone never
+authorize publication; a retry creates a fresh stage. These opaque quarantine
+files, including successful publication scratch, and leftover uniquely named
+intent-publication files remain for the owner. They are not autostart definitions,
+process-survival evidence, or inputs for Job recovery. Initialization never
+unlinks a staging entry or treats its name as creation evidence.
+After either creating or accepting the executable, recovery syncs the held
+generation directory before catalog publication, including death after the stage
+name disappeared. A failed sync leaves catalog publication fenced.
+
+Recovery completes removal of the exact legacy plist recorded before unloading
+the legacy agent, before loading the first generation. `launchctl disable` fences
+legacy restart before the final stopped-process observation. Recovery always
+checks under that fence, even after an earlier unloaded observation or an absent
+plist, confirms unload, removes the owned plist and positively verifies absence
+before generation activation. The legacy label's disabled override deliberately
+persists through forward conversion, including errors, retries and completion:
+generation labels are distinct, and this retired legacy label must never autostart
+alongside the primary. If recovery instead verifies that legacy still owns the
+primary, it durably enables the legacy target before recording rollback or
+restoring admission. An enable fault leaves rollback incomplete; a retry repeats
+that step safely. Setup reads the disabled override for an already-loaded legacy
+definition and enables it when needed before returning unchanged or kickstarting
+it. An enabled definition requires no mutation; an unreadable or malformed
+override reply leaves setup incomplete. A future legacy reinstall enables its own
+definition through the normal installation protocol.
+
+After reboot, the primary reconciles retained outbox identities against the
+retiree's authoritative frozen Attempt roster. Known job, Attempt, boot,
+authority and fencing identities use the existing durable custody barrier before
+L1 closure; only positively closed owners become eligible for historical replay.
+Missing roster membership, mismatched identity or unproved publication stays
+fenced. Neither a new process map nor expired Leases can account for unknown
+shared evidence. L1 still independently checks completion/Lease settlement.
+
+### Manual repair after destructive rollback refusal
+
+The refusal does not authorize stopping a generation or restoring a database.
+If the recorded primary's private control adapter answers, use a further
+`wefty upgrade --rolling` after the source contains the fixed build. A fresh
+adapter reply must confirm the recorded primary and boot. Recovery first settles
+the original service queue without reopening admission. The new operation records
+its predecessor and inherits only admission that the interrupted operation still
+owns. Its prepared receipt retains the predecessor's exact settled service proof
+and empty recovery queue until the successor drain is durable. Recovery at
+`prepared` or `admission_closing` accepts that predecessor file only under both
+recorded operation identities and the same Node, boot, admission revision/reason
+and proof; it consumes no predecessor restart or resume a second time. A changed
+handoff refuses. A changed operator intent is never restored. Build or preflight failure
+retains the original receipt. The usual cohort, format and survival gates still
+apply; this path cannot override a different refusal.
+
+If that adapter cannot answer, the installation needs operator repair:
+
+1. Keep new admission closed. Retain the rolling, activation, control and catalog
+   records, shared outbox, handoffs and live databases. Record the exact primary
+   ID, label, executable digest and boot from authoritative/local evidence.
+2. Diagnose and repair connectivity, disk availability, ownership and the exact
+   recorded primary launch definition. Do not unload retirees, erase receipts,
+   replace the immutable executable, rewrite catalog authority, or use legacy
+   `setup`, `remove` or database restoration as a shortcut.
+3. If the recorded primary process has ended, first establish that its old
+   payloads have ended; do not adopt surviving processes. Under operator control,
+   load only its recorded, verified primary launch definition. Leave retiring
+   definitions suppressed. A fresh primary boot must register normally; original
+   Attempts remain interrupted and only restartable Jobs can recover.
+4. Once the primary adapter answers, run the forward rolling upgrade to the fixed
+   build. Verify the new primary, exact Attempt outcomes, service queue settlement
+   and owned admission before reopening work.
+5. If the matching primary still cannot start, stop with the retained evidence.
+   Replacement of an inaccessible generation requires a separately reviewed,
+   generation-aware offline repair. This bounded protocol provides no authority
+   to fabricate a promotion or force a database downgrade.

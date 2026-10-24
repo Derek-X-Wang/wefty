@@ -397,6 +397,33 @@ deadlines locally. Unknown work is not silently declared complete. Reboot uses
 the primary-only startup and #1085 rules above. Crash tests must cover every
 durable phase, including reply loss across L1 promotion and catalog publication.
 
+### #1180 implementation notes
+
+Active retiree survival is re-observed on retry, including its current process
+incarnation; saved renewal receipts supply history rather than survival proof.
+Legacy enrollment drain phases preserve a running legacy primary or finish the
+exact recorded first generation after old Attempt settlement.
+
+Recovery settles an interrupted operation before the next upgrade can remove
+staging or enter the legacy drain path, including an invocation without
+`--rolling`. Before staging it uses candidate-only rollback; a ready/staged
+candidate continues forward. It records prepared completion-file bytes in the
+existing rolling receipt. A rolled-back partial installation clears the version
+claim and keeps actual binary hashes; live databases are never restored.
+
+Suppression intent records exact original/target plist bytes. Local catalog,
+committed receipt and pending-intent publication are independently replayable.
+An installed candidate can reconcile a positively committed L1 result before
+runtime initialization; reboot can abort an empty uncommitted staged session
+with an optional strictly fenced close request. No CLI node principal is added.
+
+Installed generation registration includes `system_boot_id`. Same-host-boot
+primary restarts preserve retirees. Different-host-boot sessions cannot renew
+retiring Attempts or bypass the predecessor embargo. Reboot recovery records
+original Attempt outcomes and uses existing restartable-only recovery; its
+`reboot_reconciled` phase is explicitly interrupted rather than survival proof.
+Unaccounted retained evidence remains pending without a retirement deadline.
+
 ## 8. Status and doctor (#1181)
 
 Use distinct upgrade progress and per-generation retirement progress. Healthy

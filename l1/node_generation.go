@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 )
 
@@ -76,11 +77,12 @@ type NodeGenerationHeartbeatRequest struct {
 }
 
 type CloseNodeGenerationRequest struct {
-	BootSessionID        string            `json:"boot_session_id"`
-	PromotionOperationID string            `json:"promotion_operation_id"`
-	ResidentAttempts     []ResidentAttempt `json:"resident_attempts"`
-	RuntimesReaped       bool              `json:"runtimes_reaped"`
-	EvidenceSettled      bool              `json:"evidence_settled"`
+	Abort                *StagedGenerationAbort `json:"abort,omitempty"`
+	BootSessionID        string                 `json:"boot_session_id"`
+	PromotionOperationID string                 `json:"promotion_operation_id"`
+	ResidentAttempts     []ResidentAttempt      `json:"resident_attempts"`
+	RuntimesReaped       bool                   `json:"runtimes_reaped"`
+	EvidenceSettled      bool                   `json:"evidence_settled"`
 }
 
 func (s *Store) initializeNodeGenerations(ctx context.Context) error {
@@ -130,6 +132,9 @@ func retirementProtocols(capabilities map[string]bool) ([]uint32, error) {
 // guardGenerationRegistration runs before any Node fact is changed. Legacy
 // registrations remain unchanged until this Node opts into generation identity.
 func guardGenerationRegistration(ctx context.Context, tx *sql.Tx, registration contract.NodeRegistration) error {
+	if registration.SystemBootID != "" && !hostboot.ValidIdentity(registration.SystemBootID) {
+		return stagedAbortConflict("invalid generation system boot identity")
+	}
 	var generation string
 	err := tx.QueryRowContext(ctx, `SELECT generation_id FROM node_generations WHERE node_id=? AND role='primary'`, registration.NodeID).Scan(&generation)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -142,7 +147,17 @@ func guardGenerationRegistration(ctx context.Context, tx *sql.Tx, registration c
 		return nil
 	}
 	var role NodeGenerationRole
-	e := tx.QueryRowContext(ctx, `SELECT role FROM node_generations WHERE node_id=? AND generation_id=?`, registration.NodeID, registration.AgentGenerationID).Scan(&role)
+	var priorJSON []byte
+	e := tx.QueryRowContext(ctx, `SELECT role,registration_json FROM node_generations WHERE node_id=? AND generation_id=?`, registration.NodeID, registration.AgentGenerationID).Scan(&role, &priorJSON)
+	if e == nil {
+		var prior contract.NodeRegistration
+		if err := json.Unmarshal(priorJSON, &prior); err != nil {
+			return err
+		}
+		if prior.SystemBootID != "" && (registration.SystemBootID == "" || (registration.BootSessionID == prior.BootSessionID && !hostboot.SameBoot(registration.SystemBootID, prior.SystemBootID))) {
+			return stagedAbortConflict("generation system boot binding changed or was withdrawn")
+		}
+	}
 	if e == nil && role != NodeGenerationPrimary {
 		return protocolError(contract.ErrorNodeSessionReplaced, "generation cannot register as primary")
 	}
@@ -169,6 +184,7 @@ func recordPrimaryGeneration(ctx context.Context, tx *sql.Tx, registration contr
 	if registration.AgentGenerationID == "" {
 		return nil
 	}
+	registration.SystemBootID = canonicalGenerationSystemBoot(registration.SystemBootID)
 	protocols, err := retirementProtocols(registration.Capabilities)
 	if err != nil {
 		return err
@@ -181,6 +197,13 @@ func recordPrimaryGeneration(ctx context.Context, tx *sql.Tx, registration contr
 	}
 	// Rejoining the same generation/boot must not revoke its resident Attempts.
 	if err == nil && oldBoot == registration.BootSessionID {
+		// First observation from an already-promoted primary can bind legacy
+		// cohort metadata on this unchanged boot. A new boot never adopts it.
+		if registration.SystemBootID != "" {
+			if _, err = tx.ExecContext(ctx, `UPDATE node_generations SET registration_json=json_set(CAST(registration_json AS TEXT),'$.system_boot_id',?) WHERE node_id=? AND role IN ('primary','retiring') AND COALESCE(json_extract(registration_json,'$.system_boot_id'),'')=''`, registration.SystemBootID, registration.NodeID); err != nil {
+				return err
+			}
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE nodes SET authority_generation=? WHERE node_id=?`, oldAuthority, registration.NodeID); err != nil {
 			return err
 		}
@@ -229,6 +252,10 @@ func (s *Store) StageNodeGeneration(ctx context.Context, identity string, regist
 	if registration.AgentGenerationID == "" || registration.BootSessionID == "" || registration.AgentVersion == "" || registration.OS != "darwin" || registration.Architecture == "" {
 		return NodeGenerationInventory{}, protocolError(contract.ErrorInvalidRequest, "a complete plain Mac generation registration is required")
 	}
+	if registration.SystemBootID != "" && !hostboot.ValidIdentity(registration.SystemBootID) {
+		return NodeGenerationInventory{}, stagedAbortConflict("invalid candidate system boot identity")
+	}
+	registration.SystemBootID = canonicalGenerationSystemBoot(registration.SystemBootID)
 	incoming, err := canonicalCapabilityObservation(registrationCapabilityObservation(registration))
 	if err != nil {
 		return NodeGenerationInventory{}, err
@@ -395,7 +422,8 @@ const retiringAttemptAuthoritySQL = `EXISTS(SELECT 1 FROM node_generation_reside
  WHERE resident.attempt_id=a.attempt_id AND resident.node_id=a.node_id
  AND resident.job_id=a.job_id AND resident.boot_session_id=a.boot_session_id
  AND resident.authority_generation=a.authority_generation AND resident.fencing_token=a.fencing_token
- AND session.role='retiring' AND session.boot_session_id=a.boot_session_id AND session.authority_generation=a.authority_generation)`
+ AND session.role='retiring' AND session.boot_session_id=a.boot_session_id AND session.authority_generation=a.authority_generation
+ AND COALESCE(json_extract(session.registration_json,'$.system_boot_id'),'')=COALESCE((SELECT json_extract(primary_session.registration_json,'$.system_boot_id') FROM node_generations primary_session WHERE primary_session.node_id=session.node_id AND primary_session.role='primary'),'') )`
 
 func (s *Store) PromoteNodeGeneration(ctx context.Context, identity, nodeID string, request PromoteNodeGenerationRequest) (NodeGenerationInventory, error) {
 	if request.OperationID == "" || request.ExpectedPrimaryGenerationID == "" || request.CandidateGenerationID == "" || request.ExpectedPrimaryGenerationID == request.CandidateGenerationID || request.ExpectedCatalogRevision < 0 || request.CatalogRevision <= request.ExpectedCatalogRevision || request.CatalogRevision != request.ExpectedCatalogRevision+1 || request.SelectedProtocol != upgradecompat.ProtocolV1 {
@@ -499,6 +527,23 @@ func (s *Store) PromoteNodeGeneration(ctx context.Context, identity, nodeID stri
 	if _, err = tx.ExecContext(ctx, `UPDATE node_generations SET role='retiring',retiring_ns=?,selected_protocol=?,promotion_operation_id=? WHERE node_id=? AND generation_id=?`, write.at.UnixNano(), request.SelectedProtocol, request.OperationID, nodeID, primary.AgentGenerationID); err != nil {
 		return inventory, err
 	}
+	if candidate.Registration.SystemBootID != "" {
+		for _, g := range inventory.Generations {
+			if g.Role != NodeGenerationPrimary && g.Role != NodeGenerationRetiring {
+				continue
+			}
+			if g.Registration.SystemBootID != "" && g.Registration.SystemBootID != candidate.Registration.SystemBootID {
+				return inventory, stagedAbortConflict("candidate and surviving cohort system boots differ")
+			}
+			if g.Registration.SystemBootID == "" {
+				g.Registration.SystemBootID = candidate.Registration.SystemBootID
+				body, _ := json.Marshal(g.Registration)
+				if _, err = tx.ExecContext(ctx, `UPDATE node_generations SET registration_json=? WHERE node_id=? AND generation_id=?`, body, nodeID, g.AgentGenerationID); err != nil {
+					return inventory, err
+				}
+			}
+		}
+	}
 	registration := candidate.Registration
 	incoming, err := canonicalCapabilityObservation(registrationCapabilityObservation(registration))
 	if err != nil {
@@ -536,7 +581,7 @@ func (s *Store) HeartbeatRetiringNodeGeneration(ctx context.Context, identity, n
 	if err = requireGenerationIdentity(ctx, tx, nodeID, identity); err != nil {
 		return NodeGenerationInventory{}, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE node_generations SET heartbeat_ns=? WHERE node_id=? AND generation_id=? AND boot_session_id=? AND role='retiring'`, write.at.UnixNano(), nodeID, generation, boot)
+	result, err := tx.ExecContext(ctx, `UPDATE node_generations SET heartbeat_ns=? WHERE node_id=? AND generation_id=? AND boot_session_id=? AND role='retiring' AND COALESCE(json_extract(registration_json,'$.system_boot_id'),'')=COALESCE((SELECT json_extract(p.registration_json,'$.system_boot_id') FROM node_generations p WHERE p.node_id=node_generations.node_id AND p.role='primary'),'')`, write.at.UnixNano(), nodeID, generation, boot)
 	if err != nil {
 		return NodeGenerationInventory{}, err
 	}
@@ -572,6 +617,9 @@ func nodeGenerationClosureReady(ctx context.Context, q queryer, nodeID, generati
 }
 
 func (s *Store) CloseNodeGeneration(ctx context.Context, identity, nodeID, generation string, request CloseNodeGenerationRequest) (NodeGenerationInventory, error) {
+	if request.Abort != nil {
+		return s.abortStagedGeneration(ctx, identity, nodeID, generation, request)
+	}
 	write, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return NodeGenerationInventory{}, err
@@ -763,4 +811,12 @@ func (s *Store) NodeGenerationClosureReady(ctx context.Context, identity, nodeID
 		return false, err
 	}
 	return ready, tx.Commit()
+}
+
+func canonicalGenerationSystemBoot(value string) string {
+	if value == "" {
+		return ""
+	}
+	parts := strings.Split(value, ":")
+	return parts[0] + ":" + parts[len(parts)-1]
 }

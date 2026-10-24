@@ -148,9 +148,11 @@ func newUpgradeFailureFixtureWithServices(t *testing.T, hook func(*Agent), lease
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.SetNodeClaimsByOperator(t.Context(), "node", "operator", l1.NodeIntentRequest{ClaimsEnabled: false, IntentRevision: node.IntentRevision, Reason: "upgrade"}); err != nil {
+	if node, err = store.SetNodeClaimsByOperator(t.Context(), "node", "operator", l1.NodeIntentRequest{ClaimsEnabled: false, IntentRevision: node.IntentRevision, Reason: "upgrade"}); err != nil {
 		t.Fatal(err)
 	}
+	f.request.IntentRevision = node.IntentRevision
+	f.request.IntentReason = node.IntentReason
 	f.marker = filepath.Join(root, "agent", "nodes", managedroot.EncodeID("node"), "services", managedroot.EncodeID(f.service.JobID), "data", "keep")
 	if err := os.WriteFile(f.marker, []byte("service data"), 0600); err != nil {
 		t.Fatal(err)

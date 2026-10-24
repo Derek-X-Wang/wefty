@@ -82,6 +82,8 @@ func setupCommandHost() (setupHost, error) {
 				return nil, launchagent.ErrServiceNotFound
 			}
 			return []byte("service = {\n state = running\n pid = 4242\n}\n"), nil
+		case "print-disabled":
+			return []byte("disabled services = {\n}\n"), nil
 		case "enable":
 			return nil, nil
 		case "bootstrap":

@@ -92,6 +92,8 @@ type agentSession struct {
 	upgradeLeaseContext       context.Context
 	upgradeLeasesClosed       bool
 	retirementAcknowledged    func(l1.NodeGeneration) error
+	retirementClosed          func(l1.NodeGeneration) error
+	retirementClosedResult    *l1.NodeGeneration
 	retirementEvidenceSettled func(context.Context, l1.NodeGeneration, []l1.ResidentAttempt) (bool, error)
 	claimMu                   sync.Mutex
 	residentJobID             map[string]struct{}

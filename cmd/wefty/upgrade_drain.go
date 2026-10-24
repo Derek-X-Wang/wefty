@@ -705,12 +705,12 @@ func validateUpgradeServiceQuiescence(receipt *upgradeDrainReceipt) error {
 	if proof == nil {
 		return nil
 	}
-	if proof.OperationID == "" || proof.AgentGenerationID == "" || proof.NodeID != receipt.NodeID || proof.BootSessionID == "" || proof.BootSessionID != receipt.OldBoot {
-		return errors.New("invalid upgrade service quiescence identity")
+	if proof.OperationID == "" || proof.AgentGenerationID == "" || proof.NodeID != receipt.NodeID || proof.BootSessionID == "" || proof.BootSessionID != receipt.OldBoot || proof.IntentRevision != receipt.Revision || proof.IntentReason != receipt.Reason {
+		return generationControlConflict("invalid upgrade service quiescence identity")
 	}
 	for _, service := range receipt.Services {
 		if service.Class != contract.JobClassService || service.Kind != contract.JobKindProcess || service.BootSessionID != proof.BootSessionID || !slices.Contains(proof.Services, service) {
-			return errors.New("upgrade service recovery lacks exact quiescence proof")
+			return generationControlConflict("upgrade service recovery lacks exact quiescence proof")
 		}
 	}
 	return nil

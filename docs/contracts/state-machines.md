@@ -2425,6 +2425,28 @@ Other services and one-shots keep their own renewal owners. Barrier retries add
 no deadline. Ownership revisions fence older recovery replies against destructive
 log/completion disposition, including after upgrade ownership is released.
 
+### Interrupted rolling cutover (#1180)
+
+Installation phases are not Run, Job or Attempt states. `prepared`, `admission_closing` through
+`candidate_loading` can settle by candidate-only rollback; `candidate_ready` and
+`candidate_staging` resume from exact staged/pending evidence. A stopped staged
+candidate can close its empty L1 session, abort the pending activation and roll
+back without changing retirees. `promotion_requested`
+resolves its operation before any ownership change. Committed promotion resumes
+forward through catalog/suppression, dedicated retirement acknowledgment, survivor
+renewal, installation publication and owned-admission settlement. `complete` and
+`rolled_back` settle the operation. An unhealthy committed primary with unproved
+safe replacement yields a typed destructive-rollback refusal, never a blind stop.
+
+Reboot records original Attempts as interrupted/lost according to authoritative
+L1 observations, without inventing results or adopting processes. `reboot_reconciled`
+with recovery state `reboot_interrupted` settles installation recovery without a
+survival claim. Prior-system-boot retirees lose live renewal/heartbeat authority;
+a same-system-boot primary process restart does not revoke them. The existing
+unknown-predecessor embargo and restartable-Job policy remain in force. Retirement
+cleanup needs positive current L1 closure, exact closure evidence and process/lock
+absence. Neither elapsed time nor an installation receipt is a closure transition.
+
 ## Durable Seat lifecycle and room fence (#1142, P18)
 
 The approval's `seat_id` is the request ID and, once room is reserved, the

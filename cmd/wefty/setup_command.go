@@ -131,7 +131,8 @@ type setupHost struct {
 }
 
 type setupRequest struct {
-	ociConfig string
+	ociConfig         string
+	rollingCompletion func([]setupFile) error
 	// Only upgrade under its held installation lock may replace node activation.
 	activateGeneration  func(context.Context, launchagent.Agent) (launchagent.Action, error)
 	computer            setupComputerOptions
@@ -833,6 +834,20 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		file := files[len(files)-1]
 		completedReceipt = &file
 		files = files[:len(files)-1]
+	}
+	if request.rollingCompletion != nil {
+		var completion []setupFile
+		for _, file := range files {
+			if setupSkillPath(paths, filepath.Join(file.folder, file.name)) {
+				completion = append(completion, file)
+			}
+		}
+		if completedReceipt != nil {
+			completion = append(completion, *completedReceipt)
+		}
+		if err := request.rollingCompletion(completion); err != nil {
+			return report, err
+		}
 	}
 	var deferredNodeFile *setupFile
 	var deferredSkills []setupFile
