@@ -77,6 +77,8 @@ type Catalog struct {
 // Store paths must be supplied by the installation's home-confined resolver.
 // Files are derived from random IDs, never from receipt paths.
 type Store struct {
+	// beforePlistOpen is a test seam after validation and before the retained plist open.
+	beforePlistOpen func() error
 	// ProcessStartIdentity observes kernel process birth identity; nil uses the platform reader.
 	ProcessStartIdentity func(pid int) (string, error)
 	Data                 string
@@ -100,21 +102,21 @@ func (s Store) ReadyPath(id string) string  { return filepath.Join(s.Root(), id,
 func (s Store) validate() error {
 	for _, p := range []string{s.Data, s.LaunchAgents} {
 		if !filepath.IsAbs(p) || filepath.Clean(p) != p || strings.ContainsAny(p, "\x00\r\n") {
-			return errors.New("generation installation paths must be absolute and clean")
+			return &VerificationRefusal{Message: "generation installation paths must be absolute and clean"}
 		}
 		resolved, err := filepath.EvalSymlinks(p)
 		if err != nil {
 			return err
 		}
 		if resolved != p {
-			return errors.New("generation installation paths must not traverse symbolic links")
+			return &VerificationRefusal{Message: "generation installation paths must not traverse symbolic links"}
 		}
 		info, err := os.Lstat(p)
 		if err != nil {
 			return err
 		}
 		if !info.IsDir() || !owned(info) || info.Mode().Perm()&0022 != 0 {
-			return errors.New("generation installation directories must be owner-controlled")
+			return &VerificationRefusal{Message: "generation installation directories must be owner-controlled"}
 		}
 	}
 	return nil
@@ -128,7 +130,7 @@ func privateDirectory(path string) error {
 		return err
 	}
 	if !privateInfo(info, 0700) {
-		return fmt.Errorf("generation directory must be owner-only and unlinked: %s", path)
+		return &VerificationRefusal{Message: fmt.Sprintf("generation directory must be owner-only and unlinked: %s", path)}
 	}
 	return nil
 }
@@ -161,7 +163,7 @@ func readPrivate(root *os.Root, name string, target any) error {
 		return err
 	}
 	if !privateInfo(info, 0600) {
-		return fmt.Errorf("generation record %s must be an owner-only regular file", name)
+		return &VerificationRefusal{Message: fmt.Sprintf("generation record %s must be an owner-only regular file", name)}
 	}
 	payload, err := root.ReadFile(name)
 	if err != nil {
@@ -185,47 +187,47 @@ func (s Store) read(root *os.Root) (Catalog, error) {
 		return c, err
 	}
 	if c.Version != 1 || c.NodeID == "" || c.Revision == 0 || !validID(c.Primary) || len(c.Generations) == 0 {
-		return c, errors.New("invalid generation catalog")
+		return c, &VerificationRefusal{Message: "invalid generation catalog"}
 	}
 	if c.PendingReceipt != "" && !validID(c.PendingReceipt) {
-		return c, errors.New("invalid pending generation receipt")
+		return c, &VerificationRefusal{Message: "invalid pending generation receipt"}
 	}
 	primary := 0
 	for id, g := range c.Generations {
 		digest, err := hex.DecodeString(g.Digest)
 		if !validID(id) || !validID(g.CandidateBootSessionID) || g.ID != id || g.Label != s.label(id) || g.Executable != s.executable(id) || g.Plist != filepath.Join(s.LaunchAgents, g.Label+".plist") || g.Version == "" || err != nil || len(digest) != 32 || g.CreatedAt.IsZero() || !hostboot.ValidIdentity(g.StartBootID) {
-			return c, errors.New("invalid generation ownership record")
+			return c, &VerificationRefusal{Message: "invalid generation ownership record"}
 		}
 		if g.Process != nil && (g.Process.PID <= 0 || g.Process.ProcessStartID == "" || g.Process.BootSessionID == "" || !hostboot.ValidIdentity(g.Process.SystemBootID) || g.Process.ReadyAt.IsZero()) {
-			return c, errors.New("invalid generation process binding")
+			return c, &VerificationRefusal{Message: "invalid generation process binding"}
 		}
 		if g.PlistDigest != "" {
 			digest, err := hex.DecodeString(g.PlistDigest)
 			if err != nil || len(digest) != 32 {
-				return c, errors.New("invalid generation plist digest")
+				return c, &VerificationRefusal{Message: "invalid generation plist digest"}
 			}
 		}
 		switch g.Role {
 		case "primary":
 			primary++
 			if c.Primary != id {
-				return c, errors.New("conflicting generation primary")
+				return c, &VerificationRefusal{Message: "conflicting generation primary"}
 			}
 		case "retiring", "":
 		default:
-			return c, errors.New("invalid generation role")
+			return c, &VerificationRefusal{Message: "invalid generation role"}
 		}
 		if len(g.ProtocolVersions) == 0 {
-			return c, errors.New("missing generation protocols")
+			return c, &VerificationRefusal{Message: "missing generation protocols"}
 		}
 		for _, v := range g.ProtocolVersions {
 			if v <= 0 {
-				return c, errors.New("invalid generation protocol")
+				return c, &VerificationRefusal{Message: "invalid generation protocol"}
 			}
 		}
 	}
 	if primary != 1 {
-		return c, errors.New("generation catalog requires exactly one primary")
+		return c, &VerificationRefusal{Message: "generation catalog requires exactly one primary"}
 	}
 	return c, nil
 }
@@ -260,11 +262,13 @@ func (s Store) Initialize(nodeID, source, version, boot string, protocols []int)
 		return Generation{}, err
 	}
 	defer close()
-	if _, err := root.Lstat(catalogName); !errors.Is(err, os.ErrNotExist) {
-		return Generation{}, errors.New("generation catalog already exists or is unreadable")
+	if _, err := root.Lstat(catalogName); err == nil {
+		return Generation{}, &VerificationRefusal{Message: "generation catalog already exists"}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Generation{}, err
 	}
 	if nodeID == "" {
-		return Generation{}, errors.New("generation Node ID required")
+		return Generation{}, &VerificationRefusal{Message: "generation Node ID required"}
 	}
 	g, err := s.prepare(root, source, version, boot, protocols)
 	if err != nil {
@@ -277,11 +281,11 @@ func (s Store) Initialize(nodeID, source, version, boot string, protocols []int)
 }
 func (s Store) prepare(root *os.Root, source, version, boot string, protocols []int) (Generation, error) {
 	if version == "" || !hostboot.ValidIdentity(boot) || len(protocols) == 0 {
-		return Generation{}, errors.New("generation requires version, system boot and protocols")
+		return Generation{}, &VerificationRefusal{Message: "generation requires version, system boot and protocols"}
 	}
 	for _, v := range protocols {
 		if v <= 0 {
-			return Generation{}, errors.New("invalid retirement protocol")
+			return Generation{}, &VerificationRefusal{Message: "invalid retirement protocol"}
 		}
 	}
 	info, err := os.Lstat(source)
@@ -289,7 +293,7 @@ func (s Store) prepare(root *os.Root, source, version, boot string, protocols []
 		return Generation{}, err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
-		return Generation{}, errors.New("candidate executable must be a regular executable")
+		return Generation{}, &VerificationRefusal{Message: "candidate executable must be a regular executable"}
 	}
 	binary, err := os.ReadFile(source)
 	if err != nil {
@@ -333,7 +337,7 @@ func (s Store) PrepareCandidate(source, version, boot string, protocols []int) (
 		return Generation{}, err
 	}
 	if c.PendingReceipt != "" {
-		return Generation{}, errors.New("unresolved generation promotion")
+		return Generation{}, &VerificationRefusal{Message: "unresolved generation promotion"}
 	}
 	g, err := s.prepare(root, source, version, boot, protocols)
 	if err != nil {
@@ -352,7 +356,7 @@ func (s Store) verifyExecutable(root *os.Root, g Generation) error {
 		return err
 	}
 	if !privateInfo(info, 0500) {
-		return errors.New("retained executable ownership or mode changed")
+		return &VerificationRefusal{Message: "retained executable ownership or mode changed"}
 	}
 	binary, err := root.ReadFile(filepath.Join(g.ID, "wefty-agent"))
 	if err != nil {
@@ -360,7 +364,7 @@ func (s Store) verifyExecutable(root *os.Root, g Generation) error {
 	}
 	digest := sha256.Sum256(binary)
 	if hex.EncodeToString(digest[:]) != g.Digest {
-		return errors.New("retained executable digest changed")
+		return &VerificationRefusal{Message: "retained executable digest changed"}
 	}
 	return nil
 }

@@ -22,8 +22,8 @@ CANCEL_GRACE = 5.0
 
 
 def signal_command_group(sig):
-    # Policy seam: retain today's process-group scope pending the owner's
-    # decision about plain '&' programs on cancel or runtime limit.
+    # Owner decision (spec section 5.3): cancel and the runtime limit stop
+    # the command's whole process group; only a new session (setsid) survives.
     global command_group_gone
     if command_group_gone:
         return

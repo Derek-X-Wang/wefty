@@ -427,7 +427,7 @@ conflict 5, unavailable 13, accepted-mutation wait timeout 14, other failure 1. 
 
 Commands:
   upgrade [--yes] [--drain-timeout DURATION]  Build latest main and upgrade this Mac's installed stack
-  setup [--from DIR] [--node-id ID]
+  setup [--proof] [--oci-config FILE] [--from DIR] [--node-id ID]
                              Install the daily plain Mac stack and connection profile
     --role control-plane|join
                              Install a fleet role on Mac or Linux

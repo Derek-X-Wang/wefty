@@ -64,6 +64,14 @@ func TestUpgradeRealBinariesReportCommitAndPreflightCopies(t *testing.T) {
 			t.Fatalf("setup notes = %v", report.Notes)
 		}
 		assertStatusShowsVersion(t, f.home, report.NodeID, commit)
+		for _, name := range setupBinaries {
+			command := exec.CommandContext(t.Context(), filepath.Join(destination, name), "--profile-preflight", "--plain", "--profile="+report.Profile)
+			command.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin", "WEFTY_PROFILE=/missing-profile"}
+			output, err := command.CombinedOutput()
+			if err != nil || strings.TrimSpace(string(output)) != "profile-readable plain" {
+				t.Fatalf("%s plain profile preflight: %s %v", name, output, err)
+			}
+		}
 	})
 	for _, name := range []string{"wefty-l1", "wefty-l3"} {
 		t.Run(name+"-preflight", func(t *testing.T) {

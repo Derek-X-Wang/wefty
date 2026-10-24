@@ -89,6 +89,9 @@ var setupBinaries = []string{"wefty", "wefty-l1", "wefty-l3", "wefty-agent"}
 // setupHost is everything setup reads from or does to the machine, so a test
 // can run it against a temporary home with fake launchctl and a fake shell.
 type setupHost struct {
+	proof                 bool
+	proofRemoveOutput     io.Writer
+	stopHostVM            func(context.Context, string, string) error
 	doctorCommand         func(context.Context, string, ...string) ([]byte, error)
 	conversionClients     func(context.Context, connprofile.Profile) (*apiClients, error)
 	conversionFilesClosed func(context.Context, []string) error
@@ -128,6 +131,9 @@ type setupHost struct {
 }
 
 type setupRequest struct {
+	ociConfig string
+	// Only upgrade under its held installation lock may replace node activation.
+	activateGeneration  func(context.Context, launchagent.Agent) (launchagent.Action, error)
 	computer            setupComputerOptions
 	abandonConversion   bool
 	convertPlain        bool
@@ -327,11 +333,17 @@ type setupReport struct {
 }
 
 func executeSetup(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
+	return executeSetupUsingHost(ctx, options, args, stdout, stderr, setupCommandHost)
+}
+
+func executeSetupUsingHost(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer, commandHost func() (setupHost, error)) error {
 	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
 	flags.SetOutput(flagErrorOutput(stderr, options.jsonOutput))
 	var request setupRequest
 	bindSetupComputerFlags(flags, &request.computer)
-	var remove, purge bool
+	flags.StringVar(&request.ociConfig, "oci-config", "", "add the host VM using immutable local Linux helper and probe assets from JSON")
+	var remove, purge, proof bool
+	flags.BoolVar(&proof, "proof", false, "isolated attended Mac proof install (dev.wefty-proof labels, separate state and host VM home)")
 	flags.StringVar(&request.role, "role", "", "fleet role on Mac or Linux: control-plane or join; omit for the daily plain Mac install")
 	flags.StringVar(&request.joinCode, "join-code", "", "non-secret join code from the control plane setup report")
 	flags.BoolVar(&request.convertPlain, "convert-plain", false, "explicitly convert an existing plain Mac into a joining machine, retaining read-only history")
@@ -370,15 +382,27 @@ func executeSetup(ctx context.Context, options globalOptions, args []string, std
 	if request.abandonConversion && (!request.convertPlain || request.role != "join") {
 		return usageError("--abandon-conversion requires --role join --convert-plain")
 	}
-	if purge && !remove || remove && (request.from != "" || request.nodeID != "") {
-		return usageError("--purge requires --remove; --remove cannot use --from or --node-id")
+	if purge && !remove || remove && (request.from != "" || request.nodeID != "" || request.ociConfig != "") {
+		return usageError("--purge requires --remove; --remove cannot use --from, --node-id or --oci-config")
 	}
-	host, err := setupCommandHost()
+	host, err := commandHost()
 	if err != nil {
 		return err
 	}
+	host.proof = proof
+	if proof {
+		if fleetFlag || joinFlag || host.goos != "darwin" {
+			return usageError("--proof is a plain Mac install only")
+		}
+		host.l1Address, host.l3Address = "127.0.0.1:48111", "127.0.0.1:48112"
+	}
 	if remove {
-		report, err := runSetupRemove(ctx, host, purge)
+		removeInstall := runSetupRemove
+		if proof {
+			removeInstall = removeProofSetup
+			host.proofRemoveOutput = stderr
+		}
+		report, err := removeInstall(ctx, host, purge)
 		if err != nil {
 			return err
 		}
@@ -476,12 +500,23 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return setupReport{}, fmt.Errorf("resolve home folder: %w", err)
 	}
-	paths, issues := resolveFleetMaintenancePaths(home, host)
-	if len(issues) > 0 {
-		return setupReport{}, issues[0].err
+	var paths setupPaths
+	if host.proof {
+		paths, err = resolveProofSetupPaths(home)
+		if err != nil {
+			return setupReport{}, err
+		}
+	} else {
+		var issues []setupPathIssue
+		paths, issues = resolveFleetMaintenancePaths(home, host)
+		if len(issues) > 0 {
+			return setupReport{}, issues[0].err
+		}
 	}
-	if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
-		return setupReport{}, err
+	if request.activateGeneration == nil || !request.lockHeld {
+		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+			return setupReport{}, err
+		}
 	}
 	if host.goos == "linux" && (request.convertPlain || request.abandonConversion) {
 		flag := "--convert-plain"
@@ -519,6 +554,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return setupReport{}, err
 	}
+	if role != serviceplan.Legacy && request.ociConfig != "" {
+		return setupReport{}, usageError("--oci-config currently requires the plain Mac install")
+	}
 	if role != serviceplan.Legacy {
 		return runFleetSetup(ctx, host, request, paths, role)
 	}
@@ -543,8 +581,10 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			return setupReport{}, err
 		}
 	}
-	if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
-		return setupReport{}, err
+	if request.activateGeneration == nil || !request.lockHeld {
+		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+			return setupReport{}, err
+		}
 	}
 	report := setupReport{
 		Profile: paths.profile, NodeConfig: paths.nodeConfig,
@@ -617,6 +657,17 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if err != nil {
 		return report, err
 	}
+	ociFiles, err := setupUserOCIFiles(host, paths, request, nodeID, services)
+	if err != nil {
+		return report, err
+	}
+	if len(ociFiles) > 0 {
+		files = slices.DeleteFunc(files, func(f setupFile) bool { return f.folder == paths.configRel && f.name == "node.json" })
+	}
+	files = append(files, ociFiles...)
+	if host.proof {
+		isolateProofServices(services)
+	}
 	plists := make([][]byte, len(services))
 	for index, service := range services {
 		if plists[index], err = launchagent.Render(service); err != nil {
@@ -629,6 +680,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	defer homeRoot.Close()
 	folders := append([]string{paths.binRel, paths.configRel, paths.dataRel, paths.logsRel, paths.launchAgentsRel}, paths.nodeDataFolders...)
+	if host.proof {
+		folders = append(folders, filepath.Join(paths.dataRel, "home"), filepath.Join(paths.dataRel, "tmp"))
+	}
 	for _, file := range files {
 		folders = append(folders, file.folder)
 	}
@@ -700,6 +754,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	previous := setupManifest{Version: 1, Files: map[string]string{}}
 	manifest := setupManifest{Computer: request.computer.recorded(), Version: 1, InstalledVersion: request.installedVersion, UpgradeSource: request.installedVersion != "", Files: map[string]string{}}
+	if host.proof {
+		manifest.ProofRoot = filepath.Join(paths.home, proofInstallRelative)
+	}
 	if payload, err := homeRoot.ReadFile(filepath.Join(paths.configRel, setupManifestName)); err == nil {
 		if json.Unmarshal(payload, &previous) == nil && previous.Version == 1 {
 			manifest.Role = previous.Role
@@ -759,6 +816,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		manifest.Files[filepath.Join(file.folder, file.name)] = payloadDigest(file.payload)
 	}
 	for index, service := range services {
+		if index == 2 && request.activateGeneration != nil {
+			continue
+		}
 		manifest.Files[filepath.Join(paths.launchAgentsRel, service.Label+".plist")] = payloadDigest(plists[index])
 	}
 	manifestPayload, err := json.MarshalIndent(manifest, "", "  ")
@@ -776,6 +836,15 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	}
 	var deferredNodeFile *setupFile
 	var deferredSkills []setupFile
+	if len(ociFiles) > 0 {
+		initialized, err := initializeSetupOCIIntent(paths)
+		if err != nil {
+			return report, err
+		}
+		if initialized {
+			report.Changes = append(report.Changes, "recorded OCI intent")
+		}
+	}
 	for _, file := range files {
 		if request.deferSkills {
 			skill := false
@@ -835,7 +904,13 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			manager.UnloadBound = time.Duration(service.ExitTimeOut+15) * time.Second
 		}
 		plist := filepath.Join(paths.launchAgents, service.Label+".plist")
-		action, err := manager.Converge(serviceCtx, launchAgents, plist, service.Label, plists[index])
+		var action launchagent.Action
+		var err error
+		if index == 2 && request.activateGeneration != nil {
+			action, err = request.activateGeneration(serviceCtx, service)
+		} else {
+			action, err = manager.Converge(serviceCtx, launchAgents, plist, service.Label, plists[index])
+		}
 		if request.wroteFile != nil && action != launchagent.Unchanged {
 			// Converge can publish its plist before bootstrap fails. Record only bytes
 			// that are actually present, never an unrelated owner modification.
@@ -995,7 +1070,7 @@ func chooseSetupNodeID(host setupHost, request setupRequest, paths setupPaths, p
 	config, err := ocicontrol.ReadInstalledConfig(paths.nodeConfig)
 	switch {
 	case err == nil:
-		if config.ControlSocket != "" {
+		if config.ControlSocket != "" && !setupHasUserOCI(paths) {
 			return "", fmt.Errorf("%s belongs to an OCI node installation (control socket %s); wefty setup installs a plain-process node and does not replace it",
 				paths.nodeConfig, config.ControlSocket)
 		}

@@ -27,6 +27,8 @@ func TestDecide(t *testing.T) {
 		{"legacy candidate and primary", func(in *Input) { in.CandidateProtocols = nil; in.Live = []Generation{{ID: "legacy", Role: Primary}} }, Decision{Drain, LegacyPrimary, 0}},
 		{"OCI work", func(in *Input) { in.Live = []Generation{primary}; in.Work = []WorkKind{ProcessOneshot, OCIWork} }, Decision{Drain, UnsupportedWork, 0}},
 		{"Mac fleet", func(in *Input) { in.Live = []Generation{primary}; in.Installation = FleetMac }, Decision{Drain, UnsupportedInstallation, 0}},
+		{"OCI installation", func(in *Input) { in.Live = []Generation{primary}; in.Installation = OCIMac }, Decision{Drain, UnsupportedInstallation, 0}},
+		{"OCI installation during overlap", func(in *Input) { in.Installation = OCIMac }, Decision{Refuse, UnsafeDrainDuringOverlap, 0}},
 		{"Linux", func(in *Input) { in.Live = []Generation{primary}; in.Installation = Linux }, Decision{Drain, UnsupportedInstallation, 0}},
 		{"OCI during overlap", func(in *Input) { in.Work = []WorkKind{OCIWork} }, Decision{Refuse, UnsafeDrainDuringOverlap, 0}},
 		{"fleet during overlap", func(in *Input) { in.Installation = FleetMac }, Decision{Refuse, UnsafeDrainDuringOverlap, 0}},

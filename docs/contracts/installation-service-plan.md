@@ -655,8 +655,8 @@ disabled or unverified. Neither changes lingering.
 
 ## Retained node agent installation generations (#1177)
 
-The rolling installation API is opt-in and is not called by `wefty upgrade`
-yet (#1179). With no `agent-generations/` directory, legacy service arguments,
+The rolling installation API is called only by `wefty upgrade --rolling`
+(#1179), pending #1182 attended acceptance. With no `agent-generations/` directory, legacy service arguments,
 labels, rendered plist bytes, removal and input digests keep their existing
 behavior. `internal/serviceplan.GenerationArguments` selects a generation's
 arguments without mutating the legacy arguments. Fleet and Linux rolling
@@ -724,9 +724,13 @@ prove readiness, admission, renewal or installed B1 acceptance.
 ready candidate, exact complete cohort, observed resident arrays (an empty
 array means verified idle), intent revision and L1 catalog revision. Its private
 activation receipt binds the expected primary, candidate, every existing
-retiree, process bindings, binary digests, resident Attempt identities, service
+live retiree, process bindings, binary digests, resident Attempt identities, service
 recovery keys, system boot and exact L1 promotion operation ID. The pending
-catalog marker blocks automatic startup until reconciliation.
+catalog marker blocks automatic startup until reconciliation. Authoritatively
+closed L1 sessions are historical ownership, excluded from the live cohort.
+`closed_generations` in the activation receipt binds their retained local process
+records separately; promotion leaves their files untouched for #1180 cleanup.
+Closed history never requires a running PID or delays another activation.
 `CommitPromotion` requires the adapter's verified exact L1 result, checks the
 candidate's readiness again, persistently disables all predecessor labels,
 changes only their on-disk `RunAtLoad` and `KeepAlive` keys to false, and records
@@ -752,10 +756,34 @@ adapter. A missing reply, elapsed deadline, custody alone or an empty local
 runtime map is not that proof. The manager must confirm the process is not
 running and the generation process lock must be free. Only then may its label
 be booted out, confirmed absent, and its verified owned executable, ready/start
-records and plist be removed. Cleanup is idempotent across interrupted file
-deletions; private activation/finished receipts remain for audit. Unknown files
+records and plist be removed. The same rules cover `control-request.json`,
+`control-result.json`, `control-refusal.json` and `retirement-ack.json`: cleanup
+checks their private regular-file ownership and mode, retains their exact bytes in the completion
+receipt before deletion, and refuses changed evidence on replay. Cleanup is
+idempotent across interrupted file deletions; private activation/finished
+receipts remain for audit. Unknown files
 or changed ownership/digests refuse cleanup. One finished retiree does not wait
 for any other retiree.
+
+Generation inventory, stage and promotion requests are executed by the installed
+primary agent with its existing node participant. The upgrade CLI holds only its
+client principal and sends named private control requests. Stage requires a ready owned
+candidate; promotion requires the pending activation receipt and L1 fences.
+The adapter has no arbitrary node-route proxy or Seat approval operation. Its
+promotion reply is durable before retirement observation can acknowledge or
+finish the predecessor. A pending-reply fence survives publication failure and
+retries the write without retaining a mutex or repeating promotion. Successful
+replies remain bound to their operation and canonical request after demotion;
+changed requests receive a separate refusal without replacing that evidence.
+Stage and promotion require the admission revision and reason originally
+accepted by the settled service barrier. Adapter fence refusals preserve typed
+conflict status and the compatibility gate reason.
+
+The OS account is the local trust boundary for catalog, readiness, control
+request/result and retirement acknowledgment files. Another process running
+under the same UID can forge these files. Private ownership, regular-file
+checks and modes protect the existing account boundary; they do not authenticate
+processes within the account. These local records grant no L1 authority.
 
 Until role-aware maintenance is wired, setup (including conversion), remove,
 purge and legacy upgrade refuse the presence of the generation directory,
@@ -767,9 +795,10 @@ incomplete first-generation preparation instead of treating it as legacy.
 
 `wefty-agent --retirement-protocols` prints exactly one versioned JSON object
 with `retirement_protocol_versions: [1]` and exits before startup I/O. This is
-binary inspection, not the runtime `upgrade:retirement:v1` advertisement. That
-capability stays withheld until all required integration and shared-evidence
-support is present. #1179 supplies activation sequencing and authority probes;
+binary inspection, not the runtime `upgrade:retirement:v1` advertisement.
+Installed plain Mac generations advertise that capability through #1179 after
+the generation startup fence and shared-evidence integration are present. Legacy
+and non-plain agents do not advertise it. #1179 supplies activation sequencing and authority probes;
 #1180 supplies recovery; #1182 supplies real launchd acceptance. Temporary-dir
 fake-manager tests here do not establish installed-stack survival or reboot
 acceptance.
@@ -816,3 +845,14 @@ record-lock directory, result records or custody bytes. #1180 reconciliation
 must retain ambiguous and undeclared evidence. Custody alone proves neither an
 empty runtime nor an accepted first completion, and cannot authorize rollback
 or retirement restart.
+
+## Per-user host VM and attended proof
+
+The plain Mac plan can add the host VM with `wefty setup --oci-config FILE`.
+It adds OCI settings to the existing interactive node-agent LaunchAgent; it
+adds no service or system daemon. The isolated `--proof` variant gives this
+same three-process plan its own labels, ports, binaries, configuration and
+state. Normal OCI removal preserves the host VM disk; explicit disposable
+proof purge removes only proof-owned state after a graceful stop.
+See [the per-user host VM contract](per-user-host-vm.md) for inputs, paths,
+intent preservation and the attended-only fixture boundary.

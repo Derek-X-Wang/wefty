@@ -977,6 +977,9 @@ type WorkloadInput struct {
 	OperatorMounts       []OperatorMount           `json:"operator_mounts,omitempty"`
 	Limits               WorkloadLimits            `json:"limits,omitempty"`
 	helperMintedReserved bool                      `json:"-"`
+
+	// L1's Seat-request provenance fences memory before the first live resize.
+	MutableComputerMemory bool `json:"mutable_computer_memory,omitempty"`
 }
 
 // WorkloadLimits are cgroup-v2 hard limits. Zero means the corresponding

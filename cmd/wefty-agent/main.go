@@ -444,6 +444,7 @@ func run() error {
 		return err
 	}
 	printVersion := flag.Bool("version", false, "print the build commit and exit")
+	mirrorRunOutput := registerMirrorRunOutputFlag(flag.CommandLine)
 	agentExecutable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate wefty-agent executable: %w", err)
@@ -492,6 +493,7 @@ func run() error {
 		ociIntentFile         = flag.String("oci-intent-file", "", "absolute read-only durable OCI intent file; missing disables OCI")
 		ociControlSocket      = flag.String("oci-control-socket", "", "operator-only node-local OCI control socket")
 		ociProbeArchive       = flag.String("oci-probe-archive", "", "absolute immutable OCI archive used by setup-oci")
+		ociUserInstall        = flag.String("oci-user-install", "", "setup-owned per-user host VM bootstrap configuration")
 		ociSetupState         = flag.String("oci-setup-state", "", "absolute durable OCI setup convergence state")
 		ociMemoryCapacity     = flag.Int64("oci-memory-capacity-bytes", 0, "setup-configured Computer memory ceiling used by the private helper")
 		ociMemoryReserve      = flag.Int64("oci-memory-reserve-bytes", 0, "setup-configured infrastructure memory reserve used by the private helper")
@@ -696,7 +698,26 @@ func run() error {
 			return err
 		}
 	}
+	if *ociUserInstall != "" {
+		if runtime.GOOS != "darwin" {
+			return errors.New("--oci-user-install requires macOS")
+		}
+		installContext, stop := context.WithTimeout(context.Background(), 15*time.Minute)
+		ociAllowed, installErr := prepareInstalledUserOCI(installContext, *ociUserInstall, *nodeID, bootSessionID, version, limarunner.PrepareUserInstall, agent.NativeSeatApprovalDialog{}, limarunner.StopProofUserInstall)
+		stop()
+		if installErr != nil {
+			return installErr
+		}
+		if !ociAllowed {
+			// A refused proof stays registered for process work. Do not construct
+			// OCI recovery, control or doctor loops that could reopen the host VM.
+			*ociHelperSocket, *ociControlSocket, *ociDoctorFacts = "", "", ""
+		}
+	}
 	capabilities := defaultAgentCapabilities()
+	if *agentGenerationID != "" && *generationRoot != "" && profile.Fabric == "plain" && runtime.GOOS == "darwin" {
+		capabilities["upgrade:retirement:v1"] = true
+	}
 	runtimes := make(map[string]workloadrunner.WorkloadRuntime)
 	var bootBarrier *ocihelper.BootBarrier
 	var agentBootBarrier agent.OCIBootBarrier
@@ -768,8 +789,14 @@ func run() error {
 		deadman = ociAttemptDeadman{barrier: bootBarrier, nodeID: *nodeID, bootSessionID: bootSessionID}
 	}
 	nodeAgent, err := agent.New(agent.Config{
-		SeatApprovalSettings:    agent.SeatApprovalSettings{AnswerWait: *seatApprovalAnswerWait, WindowHours: approvalWindowHours},
-		AgentGenerationID:       *agentGenerationID,
+		SeatApprovalSettings: agent.SeatApprovalSettings{AnswerWait: *seatApprovalAnswerWait, WindowHours: approvalWindowHours},
+		AgentGenerationID:    *agentGenerationID,
+		RetirementAcknowledged: func(g l1.NodeGeneration) error {
+			if *generationRoot == "" {
+				return nil
+			}
+			return generationStore.PublishRetirement(g)
+		},
 		PrimaryGeneration:       primaryGeneration,
 		GenerationLifetimeLock:  generationLifetimeLock,
 		Fabric:                  participant,
@@ -797,10 +824,8 @@ func run() error {
 		ManagedRootDirectory:    *managedRoot,
 		GuardianExecutable:      agentExecutable,
 		HandoffRoot:             *handoffRoot,
-		OutputSinkFactory: func(claim l1.Claim) processrunner.OutputSink {
-			return newConsoleOutputSink(os.Stdout, os.Stderr, claim)
-		},
-		Logf: log.Printf,
+		OutputSinkFactory:       consoleOutputSinkFactory(*mirrorRunOutput, os.Stdout, os.Stderr),
+		Logf:                    log.Printf,
 	})
 	if err != nil {
 		return err
@@ -1058,6 +1083,9 @@ func run() error {
 			}
 		}()
 	}
+	if *ociUserInstall != "" && *ociLimaInstance == "wefty-proof" && bootBarrier != nil {
+		go writeProofStartupReceipt(ctx, filepath.Dir(*ociSetupState), nodeAgent, bootBarrier, *nodeID, bootSessionID)
+	}
 	if supervisedBootBarrier != nil {
 		go supervisedBootBarrier.Run(ctx, nodeAgent.RecoverOCIRuntimeCapabilities)
 	}
@@ -1069,6 +1097,13 @@ func run() error {
 			return errors.New("--oci-minimal-doctor-facts must be absolute")
 		}
 		go writeMinimalDoctorFactsLoop(ctx, *ociDoctorFacts, nodeAgent, limaSupervisor, bootBarrier, log.Printf)
+	}
+	if *generationRoot != "" {
+		go func() {
+			if controlErr := nodeAgent.ServeUpgradeControl(ctx, generationStore); controlErr != nil {
+				log.Printf("wefty-agent: generation control unavailable: %v", controlErr)
+			}
+		}()
 	}
 	// Only fleet agents advertise and accept this local maintenance trigger.
 	// Install the handler before publishing its capability in the ready record.
@@ -1258,6 +1293,19 @@ func (dispatcher *consoleOutputDispatcher) write(ctx context.Context, writer io.
 	}
 }
 
+func registerMirrorRunOutputFlag(flags *flag.FlagSet) *bool {
+	return flags.Bool("mirror-run-output", false, "mirror run output to stdout/stderr for running the agent in the foreground during development; otherwise read run output with wefty logs")
+}
+
+func consoleOutputSinkFactory(mirrorRunOutput bool, stdout, stderr io.Writer) agent.OutputSinkFactory {
+	if !mirrorRunOutput {
+		return nil
+	}
+	return func(claim l1.Claim) processrunner.OutputSink {
+		return newConsoleOutputSink(stdout, stderr, claim)
+	}
+}
+
 func newConsoleOutputSink(stdout, stderr io.Writer, claim l1.Claim) processrunner.OutputSink {
 	return processrunner.OutputSinkFunc(func(ctx context.Context, event contract.LogEvent) error {
 		writer := stdout
@@ -1360,13 +1408,16 @@ func writeMinimalDoctorFactsLoop(
 		}
 		snapshot := nodeAgent.CapabilitySnapshot()
 		unitState := limarunner.UnitStateUnmanaged
-		if os.Getenv("WEFTY_LAUNCH_UNIT") == limarunner.LaunchDaemonLabel {
+		if os.Getenv("WEFTY_LAUNCH_UNIT") == limarunner.LaunchDaemonLabel || os.Getenv("WEFTY_LAUNCH_UNIT") == "dev.wefty.node-agent" || os.Getenv("WEFTY_LAUNCH_UNIT") == "dev.wefty-proof.node-agent" {
 			unitState = limarunner.UnitStateLaunchedByUnit
 		}
 		facts := limarunner.BuildMinimalDoctorFacts(
 			unitState, supervisor.Facts(), handshake, snapshot.CapabilityObservation,
 			snapshot.LastProbe, time.Now(),
 		)
+		if unitState == limarunner.UnitStateLaunchedByUnit {
+			facts.Unit.Label = os.Getenv("WEFTY_LAUNCH_UNIT")
+		}
 		if err := limarunner.WriteMinimalDoctorFacts(path, facts); err != nil && logf != nil {
 			logf("wefty-agent: write minimal doctor facts: %v", err)
 		}

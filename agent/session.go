@@ -79,16 +79,19 @@ type agentSession struct {
 	lastOneshotClaim    time.Time
 
 	retirementMu              sync.Mutex
+	upgradePromotionReply     chan struct{}
 	retiringRequested         chan struct{}
 	retiringGeneration        *l1.NodeGeneration
 	retirementAttempts        map[string]*retirementAttempt
 	upgradeServiceMu          sync.Mutex
 	upgradeServiceOperation   string
-	upgradeServiceResumed     string
+	upgradeServiceIntent      l1.NodeIntentRequest
+	upgradeServiceResumed     map[string]bool
 	upgradeServiceInventory   []l1.NodeActiveAttempt
 	upgradeServicesSettled    bool
 	upgradeLeaseContext       context.Context
 	upgradeLeasesClosed       bool
+	retirementAcknowledged    func(l1.NodeGeneration) error
 	retirementEvidenceSettled func(context.Context, l1.NodeGeneration, []l1.ResidentAttempt) (bool, error)
 	claimMu                   sync.Mutex
 	residentJobID             map[string]struct{}

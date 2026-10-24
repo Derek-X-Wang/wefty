@@ -16,8 +16,9 @@ type WantedComputerSeat struct {
 	Place  int    `json:"place"`
 }
 type ComputerSeatList struct {
-	Revision int64                `json:"revision"`
-	Seats    []WantedComputerSeat `json:"seats"`
+	Recovery *ComputerSeatRecovery `json:"recovery,omitempty"`
+	Revision int64                 `json:"revision"`
+	Seats    []WantedComputerSeat  `json:"seats"`
 }
 
 const computerSeatSchema = `
@@ -55,6 +56,7 @@ CREATE INDEX IF NOT EXISTS computer_seat_observations_attempt ON computer_seat_o
 
 // SetComputerWantedSeats is the store-only list seam for #1142/#1143. It does
 // not approve requests, advance durable Seat states, or reserve/return Room.
+// Lifecycle-managed Seats can only be added/removed through their transitions.
 func (s *Store) SetComputerWantedSeats(ctx context.Context, computerID string, expectedRevision int64, wanted []WantedComputerSeat) (ComputerSeatList, error) {
 	wanted = slices.Clone(wanted)
 	slices.SortFunc(wanted, func(a, b WantedComputerSeat) int { return a.Place - b.Place })
@@ -83,12 +85,34 @@ func (s *Store) SetComputerWantedSeats(ctx context.Context, computerID string, e
 	if desired != string(contract.ServiceDesiredRunning) || limit < 1 || len(wanted) > limit {
 		return ComputerSeatList{}, protocolError(contract.ErrorConflict, "Computer cannot accept this wanted Seat list")
 	}
+	for _, seat := range wanted {
+		value, err := readSeatRequest(ctx, tx, seat.SeatID)
+		if err == nil {
+			if (value.State != SeatStarting && value.State != SeatLive) || value.ComputerID != computerID || value.Place != seat.Place {
+				return ComputerSeatList{}, protocolError(contract.ErrorConflict, "Seat lifecycle does not permit this wanted list")
+			}
+		} else if errorCodeForSeatLifecycle(err) != contract.ErrorNotFound {
+			return ComputerSeatList{}, err
+		}
+	}
 	current, err := readComputerSeatList(ctx, tx, computerID)
 	if err != nil {
 		return ComputerSeatList{}, err
 	}
 	if expectedRevision != current.Revision {
 		return ComputerSeatList{}, protocolError(contract.ErrorConflict, "wanted Seat list revision changed")
+	}
+	for _, seat := range current.Seats {
+		if slices.Contains(wanted, seat) {
+			continue
+		}
+		_, err := readSeatRequest(ctx, tx, seat.SeatID)
+		if err == nil {
+			return ComputerSeatList{}, protocolError(contract.ErrorConflict, "end the Seat request before removing its wanted membership")
+		}
+		if errorCodeForSeatLifecycle(err) != contract.ErrorNotFound {
+			return ComputerSeatList{}, err
+		}
 	}
 	if slices.Equal(current.Seats, wanted) {
 		return current, write.commit()

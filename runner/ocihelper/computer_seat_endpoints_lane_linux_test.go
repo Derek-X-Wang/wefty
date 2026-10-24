@@ -203,7 +203,7 @@ func TestHelperSeatEndpointIM4(t *testing.T) {
 			ticker := time.NewTicker(200 * time.Millisecond)
 			defer ticker.Stop()
 			for {
-				result, err := e.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{a, applied.Generation})
+				result, err := e.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{Authority: a, Generation: applied.Generation})
 				all := err == nil && len(result.Seats) == len(seats)
 				for _, seat := range result.Seats {
 					all = all && seat.State == "ready" && len(seat.Endpoints) == 2

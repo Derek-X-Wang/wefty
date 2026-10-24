@@ -10,7 +10,8 @@ import (
 
 // AP-4 follows the production call graph from every registered HTTP handler
 // to SQL that touches approval tables, including helpers and read callbacks.
-// Only the read and close routes may reach those tables without the node mux.
+// Read/close and exact owner revocation routes may reach these tables.
+// Approval grants, room reservation and starts remain node-only.
 func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	_, files, info := readBoundaryTypes(t)
 	calls := newBoundaryCalls(files, info)
@@ -73,6 +74,68 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	if len(tainted) < 6 {
 		t.Fatalf("incomplete approval SQL call graph: %d functions", len(tainted))
 	}
+	reviewedHandler := func(expr ast.Expr, name string) bool {
+		fn := calls.function(expr)
+		if fn == nil || fn.Name() != name {
+			return false
+		}
+		sig, ok := fn.Type().(*types.Signature)
+		if !ok || sig.Recv() == nil {
+			return false
+		}
+		ptr, ok := sig.Recv().Type().(*types.Pointer)
+		if !ok {
+			return false
+		}
+		named, ok := ptr.Elem().(*types.Named)
+		return ok && named.Obj().Name() == "Server" && named.Obj().Pkg() == fn.Pkg()
+	}
+	granting := map[*types.Func]bool{}
+	for fn := range calls.bodies {
+		switch fn.Name() {
+		case "BeginSeatApproval", "AnswerSeatApproval", "saveSeatApproval", "ReserveSeatRoom", "StartSeatRequest":
+			granting[fn] = true
+		}
+	}
+	reachesGrant := func(node ast.Node) bool {
+		found := false
+		ast.Inspect(node, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			expr, ok := n.(ast.Expr)
+			if !ok {
+				return true
+			}
+			fn := calls.function(expr)
+			if fn == nil {
+				return true
+			}
+			if granting[fn] {
+				found = true
+				return false
+			}
+			if calls.bodies[fn] == nil {
+				for _, candidate := range byName[fn.Name()] {
+					if granting[candidate] {
+						found = true
+						return false
+					}
+				}
+			}
+			return true
+		})
+		return found
+	}
+	for changed := true; changed; {
+		changed = false
+		for fn, body := range calls.bodies {
+			if !granting[fn] && reachesGrant(body) {
+				granting[fn] = true
+				changed = true
+			}
+		}
+	}
 	agentMux := ""
 	agentMounts := 0
 	for _, file := range files {
@@ -116,6 +179,17 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	allowed := map[string]string{
 		"GET /v1/seat-approval-windows":        "listSeatApprovalWindows",
 		"POST /v1/seat-approval-windows/close": "closeSeatApprovalWindows",
+	}
+	revocations := map[string]string{
+		"PUT /v1/computers/{computer_id}/desired-state":  "setComputerDesiredState",
+		"POST /v1/computers/{computer_id}/restart":       "restartComputer",
+		"POST /v1/computers/{computer_id}/reimage":       "reimageComputer",
+		"POST /v1/computers/{computer_id}/storage-reset": "resetComputerStorage",
+		"POST /v1/computers/{computer_id}/projections":   "installComputerProjection",
+		"POST /v1/computers/{computer_id}/remove":        "removeComputer",
+	}
+	for route, handler := range revocations {
+		allowed[route] = handler
 	}
 	seen := map[string]bool{}
 	for _, file := range files {
@@ -165,8 +239,10 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 			expected, allowedRoute := allowed[route]
 			if !allowedRoute {
 				t.Errorf("non-node route reaches approval SQL: %s", route)
-			} else if handlers := byName[expected]; len(handlers) != 1 || calls.function(call.Args[1]) != handlers[0] {
+			} else if !reviewedHandler(call.Args[1], expected) {
 				t.Errorf("approval route %s must use its exact reviewed handler %s", route, expected)
+			} else if _, revoking := revocations[route]; revoking && reachesGrant(calls.resolve(call.Args[1])) {
+				t.Errorf("owner revocation route can grant Seat authority: %s", route)
 			} else {
 				seen[route] = true
 			}

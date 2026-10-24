@@ -27,10 +27,11 @@ type CompletionProof struct {
 	EvidenceDigest  string `json:"evidence_sha256"`
 }
 type completionReceipt struct {
-	Version     int             `json:"version"`
-	Generation  Generation      `json:"generation"`
-	Proof       CompletionProof `json:"proof"`
-	PlistDigest string          `json:"plist_sha256"`
+	Version      int               `json:"version"`
+	Generation   Generation        `json:"generation"`
+	Proof        CompletionProof   `json:"proof"`
+	PlistDigest  string            `json:"plist_sha256"`
+	ControlFiles map[string][]byte `json:"control_files,omitempty"`
 }
 
 func digestBytes(b []byte) string { d := sha256.Sum256(b); return hex.EncodeToString(d[:]) }
@@ -132,7 +133,7 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 		}
 		for _, entry := range entries {
 			switch entry.Name() {
-			case "wefty-agent", "ready.json", "candidate-start.json":
+			case "wefty-agent", "ready.json", "candidate-start.json", "control-request.json", "control-result.json", "control-refusal.json", "retirement-ack.json":
 			default:
 				return errors.New("generation directory contains unrecognized retained evidence")
 			}
@@ -148,6 +149,22 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 			}
 			if !privateInfo(info, mode) {
 				return errors.New("generation file ownership changed")
+			}
+			if entry.Name() == "control-request.json" || entry.Name() == "control-result.json" || entry.Name() == "control-refusal.json" || entry.Name() == "retirement-ack.json" {
+				b, err := dir.ReadFile(entry.Name())
+				if err != nil {
+					return err
+				}
+				if receiptErr == nil {
+					if retained, ok := receipt.ControlFiles[entry.Name()]; !ok || !bytes.Equal(retained, b) {
+						return errors.New("generation control evidence changed after completion receipt")
+					}
+				} else {
+					if receipt.ControlFiles == nil {
+						receipt.ControlFiles = map[string][]byte{}
+					}
+					receipt.ControlFiles[entry.Name()] = b
+				}
 			}
 			if entry.Name() == "wefty-agent" {
 				b, err := dir.ReadFile(entry.Name())
@@ -190,7 +207,7 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 	if err := durable.SyncDir(folder); err != nil {
 		return err
 	}
-	for _, file := range []string{"ready.json", "candidate-start.json", "wefty-agent"} {
+	for _, file := range []string{"ready.json", "candidate-start.json", "control-request.json", "control-result.json", "control-refusal.json", "retirement-ack.json", "wefty-agent"} {
 		if err := root.Remove(filepath.Join(id, file)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

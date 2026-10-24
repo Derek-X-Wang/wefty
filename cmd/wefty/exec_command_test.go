@@ -49,7 +49,7 @@ func newExecStack(t *testing.T, idle time.Duration) *execStack {
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("TMPDIR", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	network := plain.NewNetwork()
 	control := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
 	ledger := network.NewFabric(fabric.Identity{NodeID: "run-ledger", Tags: []string{l1.DefaultClientPrincipalTag}})

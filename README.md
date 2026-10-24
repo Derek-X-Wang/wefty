@@ -214,6 +214,8 @@ mkdir -p "$WEFTY_STATE_ROOT/agent-logs"
   --log-spool-dir="$WEFTY_STATE_ROOT/agent-logs"
 ```
 
+Read run output with `wefty logs`; add `-mirror-run-output` to a foreground development agent to also mirror it to stdout/stderr (off by default).
+
 Relative `--db`, `--log-spool-dir`, `--managed-root` and `--handoff-root`
 paths resolve against the directory each process was started in.
 

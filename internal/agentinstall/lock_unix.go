@@ -45,7 +45,7 @@ func requireLifetimeLock(path string) error {
 	release, err := lockDirectory(path)
 	if err == nil {
 		release()
-		return errors.New("generation lifetime lock is free")
+		return &VerificationRefusal{Message: "generation lifetime lock is free"}
 	}
 	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 		return nil

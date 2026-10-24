@@ -26,6 +26,7 @@ func TestDefaultSizingIsResolvedOnceFromOwnerDefaults(t *testing.T) {
 		cores  int
 		want   Sizing
 	}{
+		{memory: 32 << 30, cores: 4, want: Sizing{Memory: "4096MiB", CPUs: 2, Disk: "32GiB"}},
 		{memory: 16 << 30, cores: 12, want: Sizing{Memory: "4096MiB", CPUs: 4, Disk: "32GiB"}},
 		{memory: 8 << 30, cores: 6, want: Sizing{Memory: "2048MiB", CPUs: 3, Disk: "32GiB"}},
 		{memory: 4 << 30, cores: 1, want: Sizing{Memory: "1024MiB", CPUs: 1, Disk: "32GiB"}},
@@ -128,5 +129,25 @@ func TestHelperSocketPathStaysInsideInstanceSocketDirectory(t *testing.T) {
 		if _, err := HelperSocketPath(t.TempDir(), unsafe); err == nil {
 			t.Fatalf("accepted unsafe Lima instance name %q", unsafe)
 		}
+	}
+}
+
+func TestComputerRequestSizingUsesQuarterOfLargeMacAndFourCPUs(t *testing.T) {
+	sizing, err := PerUserDefaultSizing(32<<30, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizing.Memory != "8192MiB" || sizing.CPUs != 4 {
+		t.Fatalf("phase 3 host VM must use quarter RAM and 4 CPUs: %+v", sizing)
+	}
+}
+
+func TestPerUserSizingCapsCPUsAndRejectsSubFourGiBHosts(t *testing.T) {
+	sizing, err := PerUserDefaultSizing(32<<30, 2)
+	if err != nil || sizing.Memory != "8192MiB" || sizing.CPUs != 2 {
+		t.Fatalf("per-user sizing=%+v err=%v", sizing, err)
+	}
+	if _, err := PerUserDefaultSizing((4<<30)-1, 4); err == nil {
+		t.Fatal("accepted less than 4 GiB host memory")
 	}
 }

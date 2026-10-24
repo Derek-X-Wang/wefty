@@ -20,3 +20,15 @@ func (c *Client) ReportComputerSeats(ctx context.Context, computerID, jobID, att
 	err := c.post(ctx, computerSeatPath(computerID, jobID, attemptID)+"/seat-observations", request, &receipt)
 	return receipt, err
 }
+
+func (c *Client) ReportComputerRoomMemory(ctx context.Context, computerID, jobID, attemptID string, request l1.SeatRoomMemoryReport) (l1.SeatRoomMemoryReceipt, error) {
+	var receipt l1.SeatRoomMemoryReceipt
+	err := c.post(ctx, computerSeatPath(computerID, jobID, attemptID)+"/seat-room-memory", request, &receipt)
+	return receipt, err
+}
+
+func (c *Client) ReportComputerSeatAttemptAbsence(ctx context.Context, computer, job, attempt string, request l1.ComputerSeatAttemptAbsenceReport) (l1.ComputerSeatObservationReceipt, error) {
+	var receipt l1.ComputerSeatObservationReceipt
+	err := c.post(ctx, computerSeatPath(computer, job, attempt)+"/seat-attempt-absence", request, &receipt)
+	return receipt, err
+}

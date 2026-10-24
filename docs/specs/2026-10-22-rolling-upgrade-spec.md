@@ -11,7 +11,7 @@ automatic retirement deadline or generation-count limit ends a Run.
 > **Status:** approved target for map [#1102](https://github.com/Derek-X-Wang/wefty/issues/1102),
 > specified by [#1173](https://github.com/Derek-X-Wang/wefty/issues/1173).
 > The initial spec added vocabulary and an unwired pure compatibility decision.
-> L1 session authority is now implemented by #1174; installed activation is unwired.
+> L1 session authority is implemented by #1174; #1179 wires opt-in plain Mac activation.
 > Runtime implementation belongs to #1174–#1181 and acceptance to #1182.
 > The documents in `docs/contracts/` continue to describe built behavior;
 > each implementation ticket moves its completed rules there with its code.
@@ -150,12 +150,12 @@ semantic-version range inference and no hard-coded maximum generation count.
 ### 2.2 Pure gate (#1173)
 
 `internal/upgradecompat.Decide(Input) Decision` has no I/O, clock, process
-control, store, schema migration or runtime caller in this PR. It lives in a
+control, store or schema migration; #1179 supplies the runtime adapter. It lives in a
 small internal package so L1 and the CLI need not import each other's runtime
 machinery. It decides policy from normalized, verified inputs; it is not an
 activation permit. #1179 collects inputs and enforces the result.
 
-`Input` contains installation (`plain_mac`, `fleet_mac`, `linux`), candidate
+`Input` contains installation (`plain_mac`, `oci_mac`, `fleet_mac`, `linux`), candidate
 supported versions, **all** live generations with unique ID/role/version set,
 and all resident work kinds (`process_oneshot`, `restartable_process_oneshot`,
 `process_service`, `oci`). Nil work means verified idle. There must be exactly
@@ -173,7 +173,7 @@ The following ordered table defines `Mode` and typed `Reason`. The selected
 | Condition (first match) | Mode | Reason |
 | --- | --- | --- |
 | Invalid identities, roles, installation/work kinds or protocol zero | `refuse` | `invalid_inventory` |
-| Fleet Mac or Linux, no retirees | `drain` | `unsupported_installation` |
+| OCI installation, Fleet Mac or Linux, no retirees | `drain` | `unsupported_installation` |
 | OCI work present, no retirees | `drain` | `unsupported_work` |
 | Positively identified legacy primary, no retirees | `drain` | `legacy_primary` |
 | Any of those drain fallbacks, with existing retirees | `refuse` | `unsafe_drain_during_overlap` |
@@ -204,7 +204,7 @@ are built in #1174. Their current contract is
 and [generation state transitions](../contracts/state-machines.md#node-agent-generation-sessions-1174).
 
 The node agent uses generation inventory, retiring heartbeat and closure in
-#1175. The installed upgrade path does not use these endpoints yet.
+#1175. The opt-in installed upgrade path stages and promotes through #1179.
 #1175–#1181 must supply verified readiness, local admission closure/reap,
 activation receipts and evidence custody before claiming installed B1 behavior.
 L1's promotion revision is initially zero and advances exactly once per accepted
@@ -282,7 +282,7 @@ data still needed by another generation or custodian.
 The opt-in local installation seams, startup fence, private records and cleanup
 are implemented by #1177; their current contract is
 [Retained node agent installation generations](../contracts/installation-service-plan.md#retained-node-agent-installation-generations-1177).
-The public upgrader does not call them yet. Interrupted-cutover reconciliation
+The public upgrader calls them only with `--rolling` (#1179). The default remains the drain path until #1182 attended acceptance. Interrupted-cutover reconciliation
 remains #1180, and real launchd acceptance remains #1182.
 
 Keep each activated generation's executable immutable under its own recorded
@@ -413,8 +413,11 @@ last accepted renewal time/deadline and pending evidence count. Unknown fields
 are null/unknown, never inferred zero/healthy. Include selected protocol,
 primary identity, admission and shared class capacity. Each generation's
 retirement progress is `finishing`, `evidence_pending`, `complete` or `unverified`.
-Completed entries may be retained as history; live inventory excludes them only
-after positive session closure and ownership reconciliation.
+Completed entries may be retained as history. Positive L1 session closure
+excludes them from the live activation cohort; retained local ownership is bound
+separately in activation receipts until receipt-bound cleanup. Cleanup must not
+block a further upgrade. Status distinguishes that retained history from live
+retirees.
 
 A healthy new primary cannot hide expired or unverified retirees. Active cutover,
 interrupted receipt without a live upgrader, and unreachable authority have

@@ -244,7 +244,13 @@ atomic registration supersede, and the same claim barrier applies.
 
 ## Mac boot supervision
 
-The macOS agent process is the only Lima supervisor. Its system LaunchDaemon
+The macOS node-agent process is the only Lima supervisor. The plain daily
+install can now add the host VM to its interactive `dev.wefty.node-agent`
+LaunchAgent in the owner's GUI domain, without Mac privilege. The isolated
+attended proof uses `dev.wefty-proof.node-agent`. Both use the same supervisor
+and preserve the recreate guard. Their paths, guest-root bootstrap, intent and
+removal rules are in [per-user host VM installation](per-user-host-vm.md).
+The older interim system bootstrap remains available; its system LaunchDaemon
 label is `dev.wefty.agent`; launchd runs it as the operator user with absolute
 program, working, and log paths plus explicit `HOME`, `LIMA_HOME`, `USER`,
 `LOGNAME`, and `PATH`. The plist contains no Fabric credential, and a competing
@@ -1003,11 +1009,16 @@ spontaneous exit all require both the payload leader's `Wait` and group
 `ProcessReapTimeout` (five seconds by default). Failed proof ends the control
 stream and makes the agent report `ErrGuardianLost`.
 
+Run output is uploaded to L1 and read with `wefty logs`; `wefty-agent` mirrors
+it to stdout/stderr only with `-mirror-run-output` for foreground development
+(default false), while lifecycle and error lines remain in the agent service log.
+
 The agent's Guardian `WaitDelay` is termination grace plus that reap bound
 plus a one-second scheduling margin (eleven seconds by default). Its independent
 output context is cancelled on Guardian loss or one second before that output
-wait bound, releasing production SQLite append waits and console-sink callers. One bounded console queue and one
-process-wide worker keep a stuck console fd out of attempt pipe copying;
+wait bound, releasing production SQLite append waits and console-sink callers.
+When mirroring is enabled, one bounded console queue and one process-wide worker
+keep a stuck console fd out of attempt pipe copying;
 closing an owned test pipe also releases the worker. A permanently blocked
 console fd can hold that single mirror worker until the daemon exits.
 After a proven `exited`, `exec.ErrWaitDelay` means output was cut off after a
@@ -1139,8 +1150,11 @@ latch. `disk_exhausted` requires a positively observed attempt-local ENOSPC
 event; a post-hoc free-byte sample is advisory only and cannot create the
 latch. Neither resource fact is inferred from stderr or a numeric exit status.
 
-Mac setup ships a 4 GiB Computer ceiling with an infrastructure reserve
-proportional to the fixed Lima VM sizing. Linux setup defaults the configured
+The new per-user Mac install uses one quarter of physical Mac memory and
+`min(4, logical CPUs)` for the fixed host VM sizing. Existing `node setup-oci`
+and Linux sizing defaults retain their 4 GiB and half-core caps. Mac Computer
+memory capacity equals the configured host VM memory, with a fixed 1 GiB
+infrastructure reserve (phase 3 spec section 3). Linux setup defaults the configured
 usable arithmetic to `MemTotal - min(1 GiB, 25%)`. The helper consumes those
 facts as configuration and never refuses to start because of their values.
 

@@ -142,7 +142,7 @@ func WriteMinimalDoctorFacts(path string, facts MinimalDoctorFacts) error {
 	if !filepath.IsAbs(path) {
 		return errors.New("minimal doctor facts path must be absolute")
 	}
-	if facts.Version != MinimalDoctorFactsVersion || facts.Unit.Label != LaunchDaemonLabel || !facts.Unit.State.Valid() ||
+	if facts.Version != MinimalDoctorFactsVersion || !validMacLaunchUnitLabel(facts.Unit.Label) || !facts.Unit.State.Valid() ||
 		!facts.Lima.State.Valid() || !facts.Helper.State.Valid() || !facts.Probe.State.Valid() ||
 		!facts.ReasonCode.Valid() && facts.ReasonCode != "" {
 		return errors.New("minimal doctor facts are invalid")
@@ -197,4 +197,10 @@ func WriteMinimalDoctorFacts(path string, facts MinimalDoctorFacts) error {
 	}
 	cleanup = false
 	return nil
+}
+
+// The interim system unit and the two per-user installations share the same
+// closed facts surface; arbitrary labels remain invalid.
+func validMacLaunchUnitLabel(label string) bool {
+	return label == LaunchDaemonLabel || label == "dev.wefty.node-agent" || label == "dev.wefty-proof.node-agent"
 }

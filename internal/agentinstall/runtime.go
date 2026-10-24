@@ -1,6 +1,7 @@
 package agentinstall
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +16,12 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 )
+
+// VerificationRefusal reports an observed identity, ownership, inventory or process-state
+// mismatch. Reads, service-manager calls and OS failures keep their own errors.
+type VerificationRefusal struct{ Message string }
+
+func (e *VerificationRefusal) Error() string { return e.Message }
 
 // Agent preserves today's service arguments and keys, replacing only identity,
 // executable and the private ready path. Nothing secret is put in the plist.
@@ -51,7 +58,7 @@ func (s Store) LoadCandidate(ctx context.Context, id string, base launchagent.Ag
 	}
 	g, ok := c.Generations[id]
 	if !ok || g.Role == "retiring" || c.PendingReceipt != "" {
-		return "", errors.New("generation is not eligible to start")
+		return "", &VerificationRefusal{Message: "generation is not eligible to start"}
 	}
 	if err := s.verifyExecutable(root, g); err != nil {
 		return "", err
@@ -74,10 +81,21 @@ func (s Store) LoadCandidate(ctx context.Context, id string, base launchagent.Ag
 		return "", err
 	}
 	if state.Loaded {
-		if state.Running && durable.Holds(folder, filepath.Base(g.Plist), payload, 0644) && g.PlistDigest == digestBytes(payload) {
-			return launchagent.Unchanged, nil
+		if state.Running {
+			if s.beforePlistOpen != nil {
+				if err := s.beforePlistOpen(); err != nil {
+					return "", err
+				}
+			}
+			old, err := readRetainedPlist(folder, filepath.Base(g.Plist))
+			if err != nil {
+				return "", err
+			}
+			if bytes.Equal(old, payload) && g.PlistDigest == digestBytes(payload) {
+				return launchagent.Unchanged, nil
+			}
 		}
-		return "", errors.New("retained generation definition cannot be replaced or restarted")
+		return "", &VerificationRefusal{Message: "retained generation definition cannot be replaced or restarted"}
 	}
 	g.PlistDigest = digestBytes(payload)
 	c.Generations[id] = g
@@ -115,12 +133,12 @@ type GenerationLifetime struct {
 // opening or flocking the directory again. It grants no primary authority.
 func (l *GenerationLifetime) ClaimRuntime(nodeID, generationID string) error {
 	if l == nil {
-		return errors.New("generation lifetime ownership is missing")
+		return &VerificationRefusal{Message: "generation lifetime ownership is missing"}
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.release == nil || l.runtimeClaimed || l.nodeID != nodeID || l.generationID != generationID {
-		return errors.New("generation lifetime ownership is released, already claimed, or mismatched")
+		return &VerificationRefusal{Message: "generation lifetime ownership is released, already claimed, or mismatched"}
 	}
 	l.runtimeClaimed = true
 	return nil
@@ -151,16 +169,16 @@ func (s Store) StartupWithLifetime(id, nodeID, executable, boot string) (*Genera
 	}
 	g, ok := c.Generations[id]
 	if !ok || c.NodeID != nodeID || executable != g.Executable {
-		return nil, errors.New("generation startup identity mismatch")
+		return nil, &VerificationRefusal{Message: "generation startup identity mismatch"}
 	}
 	if c.PendingReceipt != "" {
-		return nil, errors.New("generation promotion unresolved; startup requires reconciliation")
+		return nil, &VerificationRefusal{Message: "generation promotion unresolved; startup requires reconciliation"}
 	}
 	if g.Role == "retiring" || (g.Role == "" && !hostboot.SameBoot(g.StartBootID, boot)) {
 		return nil, ErrStartupSuppressed
 	}
 	if !hostboot.ValidIdentity(boot) {
-		return nil, errors.New("unverified system boot identity")
+		return nil, &VerificationRefusal{Message: "unverified system boot identity"}
 	}
 	if err := s.verifyExecutable(root, g); err != nil {
 		return nil, err
@@ -211,7 +229,7 @@ func (s Store) PublishReady(id, nodeID, version, executable, bootSession, system
 	}
 	g, ok := c.Generations[id]
 	if !ok || g.Role == "retiring" || c.NodeID != nodeID || version != g.Version || executable != g.Executable || bootSession == "" || !hostboot.ValidIdentity(systemBoot) {
-		return errors.New("generation readiness identity mismatch")
+		return &VerificationRefusal{Message: "generation readiness identity mismatch"}
 	}
 	if err := s.verifyExecutable(root, g); err != nil {
 		return err
@@ -220,7 +238,7 @@ func (s Store) PublishReady(id, nodeID, version, executable, bootSession, system
 	if g.Role == "" {
 		phase = "candidate_waiting"
 		if bootSession != g.CandidateBootSessionID {
-			return errors.New("candidate ready boot session differs from prepared identity")
+			return &VerificationRefusal{Message: "candidate ready boot session differs from prepared identity"}
 		}
 	}
 	startID, err := s.processStart(os.Getpid())
@@ -244,7 +262,7 @@ func (s Store) BindReady(ctx context.Context, id string, expected Binding, start
 	}
 	g, ok := c.Generations[id]
 	if !ok || g.Role == "retiring" {
-		return Ready{}, errors.New("generation cannot become ready")
+		return Ready{}, &VerificationRefusal{Message: "generation cannot become ready"}
 	}
 	r, err := s.ready(ctx, root, c, g, expected, startedAfter)
 	if err != nil {
@@ -260,7 +278,7 @@ func (s Store) ready(ctx context.Context, root *os.Root, c Catalog, g Generation
 	if err := s.verifyExecutable(root, g); err != nil {
 		return r, err
 	}
-	if err := readPrivate(root, filepath.Join(g.ID, "ready.json"), &r); err != nil {
+	if err := readPendingRecord(root, filepath.Join(g.ID, "ready.json"), &r); err != nil {
 		return r, err
 	}
 	state, err := s.Manager.State(ctx, g.Label)
@@ -271,14 +289,14 @@ func (s Store) ready(ctx context.Context, root *os.Root, c Catalog, g Generation
 	if g.Role == "" {
 		phase = "candidate_waiting"
 		if expected.BootSessionID != g.CandidateBootSessionID {
-			return r, errors.New("candidate expected process differs from prepared identity")
+			return r, &VerificationRefusal{Message: "candidate expected process differs from prepared identity"}
 		}
 	}
 	if r.Phase != phase || r.GenerationID != g.ID || r.NodeID != c.NodeID || r.Digest != g.Digest || r.Version != g.Version || !state.Running || state.PID <= 0 || r.PID != state.PID || r.PID != expected.PID || expected.BootSessionID == "" || r.BootSessionID != expected.BootSessionID || !hostboot.SameBoot(r.SystemBootID, expected.SystemBootID) || startedAfter.IsZero() || r.ReadyAt.Before(startedAfter) || r.ReadyAt.After(time.Now().UTC()) || (!expected.ReadyAt.IsZero() && !r.ReadyAt.Equal(expected.ReadyAt)) {
-		return r, errors.New("stale or mismatched generation readiness")
+		return r, &VerificationRefusal{Message: "stale or mismatched generation readiness"}
 	}
 	if r.ProcessStartID == "" || (expected.ProcessStartID != "" && r.ProcessStartID != expected.ProcessStartID) {
-		return r, errors.New("missing or mismatched process start identity")
+		return r, &VerificationRefusal{Message: "missing or mismatched process start identity"}
 	}
 	if err := requireLifetimeLock(filepath.Join(s.Root(), g.ID)); err != nil {
 		return r, err
@@ -288,7 +306,7 @@ func (s Store) ready(ctx context.Context, root *os.Root, c Catalog, g Generation
 		return r, err
 	}
 	if observed != r.ProcessStartID {
-		return r, errors.New("generation readiness belongs to a different process incarnation")
+		return r, &VerificationRefusal{Message: "generation readiness belongs to a different process incarnation"}
 	}
 	return r, nil
 }
@@ -303,7 +321,7 @@ func (s Store) processStart(pid int) (string, error) {
 		return "", err
 	}
 	if identity == "" {
-		return "", errors.New("unverified process start identity")
+		return "", &VerificationRefusal{Message: "unverified process start identity"}
 	}
 	return identity, nil
 }
@@ -324,7 +342,7 @@ func (s Store) AwaitActivation(ctx context.Context, id string) error {
 		}
 		g, ok := c.Generations[id]
 		if !ok {
-			return errors.New("candidate removed during activation")
+			return &VerificationRefusal{Message: "candidate removed during activation"}
 		}
 		if g.Role == "retiring" {
 			return ErrStartupSuppressed
@@ -356,4 +374,43 @@ func (s Store) WithPrimary(id string, write func() error) error {
 		return ErrStartupSuppressed
 	}
 	return write()
+}
+
+// VerifyRunning verifies an existing live generation without rebinding it or
+// changing its role. A PID alone is not process-incarnation or survival proof.
+func (s Store) VerifyRunning(ctx context.Context, id, boot string) error {
+	root, close, err := s.open(false)
+	if err != nil {
+		return err
+	}
+	defer close()
+	c, err := s.read(root)
+	if err != nil {
+		return err
+	}
+	g, ok := c.Generations[id]
+	if !ok || g.Process == nil || !hostboot.SameBoot(g.Process.SystemBootID, boot) {
+		return &VerificationRefusal{Message: "live generation binding unavailable"}
+	}
+	if err = s.verifyExecutable(root, g); err != nil {
+		return err
+	}
+	state, err := s.Manager.State(ctx, g.Label)
+	if err != nil {
+		return err
+	}
+	if !state.Running || state.PID != g.Process.PID {
+		return &VerificationRefusal{Message: "live generation process missing"}
+	}
+	if err = requireLifetimeLock(filepath.Join(s.Root(), id)); err != nil {
+		return err
+	}
+	start, err := s.processStart(state.PID)
+	if err != nil {
+		return err
+	}
+	if start != g.Process.ProcessStartID {
+		return &VerificationRefusal{Message: "live generation process incarnation changed"}
+	}
+	return nil
 }
