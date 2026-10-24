@@ -27,6 +27,7 @@ type SeatCallInput struct {
 	WindowHours int    `json:"window_hours"`
 }
 type SeatCallResult struct {
+	UnreadEvents int `json:"unread_events"`
 	SeatRequest
 	Credential     string `json:"credential,omitempty"`
 	CleanupPending bool   `json:"cleanup_pending"`
@@ -143,6 +144,12 @@ func (s *Store) CreateSeatCall(ctx context.Context, caller string, input SeatCal
 		if _, err := write.tx.ExecContext(ctx, `INSERT INTO seat_request_calls(seat_id,node_id,boot_session_id,caller_identity,input_json,credential,created_ns) VALUES(?,?,?,?,?,?,?)`, input.SeatID, input.NodeID, boot, caller, data, hex.EncodeToString(secret), write.at.UnixNano()); err != nil {
 			return SeatCallResult{}, err
 		}
+		if err := appendSeatEvent(ctx, write.tx, write.at, SeatLogEvent{SeatID: input.SeatID, EventID: "requested", Kind: SeatEventRequested}); err != nil {
+			return SeatCallResult{}, err
+		}
+		if _, err := write.tx.ExecContext(ctx, `UPDATE seat_logs SET caller_identity=?,credential_hash=? WHERE seat_id=?`, caller, seatCredentialHash(hex.EncodeToString(secret)), input.SeatID); err != nil {
+			return SeatCallResult{}, err
+		}
 		var caps map[string]bool
 		if err := json.Unmarshal(capabilities, &caps); err != nil {
 			return SeatCallResult{}, err
@@ -178,10 +185,14 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 		if owner != caller {
 			return protocolError(contract.ErrorForbidden, "Seat request belongs to another caller")
 		}
+		var unread int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM seat_log_events e JOIN seat_logs l ON l.seat_id=e.seat_id WHERE e.seat_id=? AND e.ordinal>l.read_ordinal`, id).Scan(&unread); err != nil {
+			return err
+		}
 		value, err := readSeatRequest(ctx, q, id)
 		if errorCodeForSeatLifecycle(err) == contract.ErrorNotFound {
 			unpickedExpired = !r.now().Before(time.Unix(0, created).Add(MaxSeatApprovalWait))
-			result = SeatCallResult{SeatRequest: SeatRequest{SeatID: id, State: SeatRequested}}
+			result = SeatCallResult{SeatRequest: SeatRequest{SeatID: id, State: SeatRequested}, UnreadEvents: unread}
 			return nil
 		}
 		if err != nil {
@@ -191,7 +202,7 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 		if err != nil {
 			return err
 		}
-		result = SeatCallResult{SeatRequest: value}
+		result = SeatCallResult{SeatRequest: value, UnreadEvents: unread}
 		if value.State == SeatLive {
 			result.Credential = secret
 		}
@@ -547,7 +558,10 @@ func refuseUnpickedSeatCall(ctx context.Context, q seatApprovalQuery, input Seat
 	// This public-call path can only insert a refusal. It cannot grant or
 	// overwrite approval, even if another writer picked up the request.
 	_, err = q.ExecContext(ctx, `INSERT INTO seat_approvals(seat_id,node_id,boot_session_id,request_json,state,reason,deadline_ns) VALUES(?,?,?,?,'refused',?,?)`, input.SeatID, input.NodeID, boot, data, reason, at.UnixNano())
-	return err
+	if err != nil {
+		return err
+	}
+	return appendSeatEvent(ctx, q, at, SeatLogEvent{SeatID: input.SeatID, EventID: "refused", Kind: SeatEventRefused, Reason: reason})
 }
 func (s *Store) expireUnpickedSeatCall(ctx context.Context, caller, id string) error {
 	write, err := s.beginWriteTransaction(ctx, nil)

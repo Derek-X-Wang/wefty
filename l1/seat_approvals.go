@@ -113,7 +113,7 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 		if existing.State == "requested" && !write.at.Before(existing.Deadline) {
 			existing.State = "refused"
 			existing.Reason = "no answer from the owner"
-			if err := saveSeatApproval(ctx, q, existing); err != nil {
+			if err := saveSeatApproval(ctx, q, existing, write.at); err != nil {
 				return SeatApproval{}, err
 			}
 		}
@@ -138,7 +138,7 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 			}
 		}
 	}
-	if err := saveSeatApproval(ctx, q, value); err != nil {
+	if err := saveSeatApproval(ctx, q, value, write.at); err != nil {
 		return SeatApproval{}, err
 	}
 	return value, write.commit()
@@ -193,7 +193,7 @@ func (s *Store) AnswerSeatApproval(ctx context.Context, identityNodeID, seatID s
 			value.Reason = answer.Reason
 		}
 	}
-	if err := saveSeatApproval(ctx, q, value); err != nil {
+	if err := saveSeatApproval(ctx, q, value, write.at); err != nil {
 		return SeatApproval{}, err
 	}
 	return value, write.commit()
@@ -220,14 +220,23 @@ func readSeatApproval(ctx context.Context, q queryer, id string) (SeatApproval, 
 	value.Deadline = time.Unix(0, deadline).UTC()
 	return value, err
 }
-func saveSeatApproval(ctx context.Context, q seatApprovalQuery, value SeatApproval) error {
+func saveSeatApproval(ctx context.Context, q seatApprovalQuery, value SeatApproval, at time.Time) error {
 	request, err := json.Marshal(value.Request)
 	if err != nil {
 		return err
 	}
 	_, err = q.ExecContext(ctx, `INSERT INTO seat_approvals(seat_id,node_id,boot_session_id,request_json,state,reason,source,deadline_ns) VALUES(?,?,?,?,?,?,?,?)
  ON CONFLICT(seat_id) DO UPDATE SET state=excluded.state,reason=excluded.reason,source=excluded.source`, value.Request.SeatID, value.Request.NodeID, value.Request.BootSessionID, request, value.State, value.Reason, value.Source, value.Deadline.UnixNano())
-	return err
+	if err != nil {
+		return err
+	}
+	if err := appendSeatEvent(ctx, q, at, SeatLogEvent{SeatID: value.Request.SeatID, EventID: "requested", Kind: SeatEventRequested}); err != nil {
+		return err
+	}
+	if value.State == "requested" {
+		return nil
+	}
+	return appendSeatEvent(ctx, q, at, SeatLogEvent{SeatID: value.Request.SeatID, EventID: value.State, Kind: SeatEventKind(value.State), Reason: value.Reason})
 }
 func readSeatApprovalWindows(ctx context.Context, q queryer, nodeID string, now time.Time) ([]SeatApprovalWindow, error) {
 	rows, err := q.QueryContext(ctx, `SELECT w.node_id,w.network,w.expires_ns FROM seat_approval_windows w JOIN nodes n ON n.node_id=w.node_id AND n.boot_session_id=w.boot_session_id

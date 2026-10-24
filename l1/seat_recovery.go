@@ -155,7 +155,7 @@ func (s *Store) ReportComputerSeatAttemptAbsence(ctx context.Context, identity, 
 	if json.Unmarshal(raw, &retained) != nil || retained != report.Retired || retained.NodeID != report.NodeID {
 		return ComputerSeatObservationReceipt{}, protocolError(contract.ErrorConflict, "earlier Attempt identity changed")
 	}
-	if err := cleanComputerSeatAttempt(ctx, q, computer, retained.AttemptID); err != nil {
+	if err := cleanComputerSeatAttempt(ctx, q, computer, retained.AttemptID, write.at); err != nil {
 		return ComputerSeatObservationReceipt{}, err
 	}
 

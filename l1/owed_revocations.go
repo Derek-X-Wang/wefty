@@ -178,7 +178,7 @@ func recordOwedComputerRevocation(ctx context.Context, tx *sql.Tx, record owedRe
 	if record.verb == ComputerRevocationVerbAttemptCompletion {
 		reason = "the Computer restarted"
 	}
-	if err := endComputerSeats(ctx, tx, record.computerID, record.attemptID, reason); err != nil {
+	if err := endComputerSeats(ctx, tx, record.computerID, record.attemptID, reason, now); err != nil {
 		return 0, err
 	}
 	scope := ComputerRevocationScopeRevokeAll
