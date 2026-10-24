@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -107,7 +108,23 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 		}
 		return nil
 	}
+	retriedAsCaller := false
 	pages, retries := 0, 0
+	pendingAck := ""
+	acknowledge := func() error {
+		if pendingAck == "" {
+			return nil
+		}
+		err := clients.l1.do(ctx, http.MethodPost, path+"/read", l1.SeatLogRead{Cursor: pendingAck}, headers, nil, http.StatusOK)
+		if err == nil {
+			pendingAck = ""
+			return nil
+		}
+		if follow && isRetryableObservation(err) {
+			return nil
+		}
+		return err
+	}
 	for {
 		query := url.Values{"limit": {strconv.Itoa(limit)}}
 		if cursor != "" {
@@ -116,6 +133,14 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 		var page l1.SeatLogPage
 		err := clients.l1.do(ctx, http.MethodGet, path+"?"+query.Encode(), nil, headers, &page, http.StatusOK)
 		if err != nil {
+			var response *apiResponseError
+			if !retriedAsCaller && headers.Get(l1.SeatCredentialHeader) != "" && errors.As(err, &response) && response.StatusCode == http.StatusForbidden && response.APIError.Code == contract.ErrorForbidden && response.APIError.Message == "invalid Seat credential" {
+				// Older binaries scrubbed ended secrets before retaining digests.
+				// The retry has only the original Fabric caller's existing rights.
+				retriedAsCaller = true
+				headers.Del(l1.SeatCredentialHeader)
+				continue
+			}
 			if (follow && isRetryableObservation(err)) || (walking && isRetryableL1Answer(err)) {
 				retries++
 				if !follow && retries > logWalkRetryLimit {
@@ -150,16 +175,14 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 		} else if err := writeEvents(page.Events); err != nil {
 			return err
 		}
+		moved := len(page.Events) > 0 && page.NextCursor != cursor
 		cursor = page.NextCursor
-		// Acknowledge only delivered pages. Tail acknowledges the walked history
-		// once its selected suffix has been printed successfully.
-		acknowledge := func() error {
-			if cursor == "" {
-				return nil
-			}
-			return clients.l1.do(ctx, http.MethodPost, path+"/read", l1.SeatLogRead{Cursor: cursor}, headers, nil, http.StatusOK)
-		}
+		// Keep a retryable acknowledgement pending; an empty poll alone never
+		// creates one. Only successfully printed history may advance it.
 		if !tailSet || !walking {
+			if moved {
+				pendingAck = cursor
+			}
 			if err := acknowledge(); err != nil {
 				return err
 			}
@@ -179,6 +202,9 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 				if err := writeEvents(buffered[:next]); err != nil {
 					return err
 				}
+				if len(buffered) > 0 {
+					pendingAck = cursor
+				}
 				if err := acknowledge(); err != nil {
 					return err
 				}
@@ -195,13 +221,13 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 			}
 			return nil
 		}
-		if page.Ended && len(page.Events) == 0 {
+		if page.Ended && len(page.Events) == 0 && pendingAck == "" {
 			// The final line always explains the end, including a follow resumed at
 			// the terminal cursor or with a tail that omitted the original end event.
 			if jsonOutput {
 				return writeJSONLine(stdout, map[string]any{"seat_id": id, "kind": "ended", "reason": page.Reason})
 			}
-			_, err := fmt.Fprintf(stdout, "Seat %s ended: %s\n", id, page.Reason)
+			_, err := fmt.Fprintf(stdout, "Seat %s ended: %s\n", id, readableSeatEndReason(page.Reason))
 			return err
 		}
 		wait := clients.wait
@@ -215,7 +241,7 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 }
 
 // withSeatReply is the one reply path shared by Seat commands. Callers pass
-// the count from their L1 read snapshot; formatting never changes read state.
+// the count L1 computed after outcome acknowledgement; formatting changes no state.
 func withSeatReply(stdout io.Writer, jsonOutput bool, id string, unread int, reply func(io.Writer) error) error {
 	var staged bytes.Buffer
 	output := stdout
@@ -253,4 +279,19 @@ func withSeatReply(stdout io.Writer, jsonOutput bool, id string, unread int, rep
 	}
 	_, err = fmt.Fprintln(stdout, line)
 	return err
+}
+
+func readableSeatEndReason(reason string) string {
+	switch reason {
+	case "computer_stopped":
+		return "the owner stopped the Computer"
+	case "computer_restarted":
+		return "the owner restarted the Computer"
+	case "computer_reimaged":
+		return "the owner reimaged the Computer"
+	case "computer_removed":
+		return "the owner removed the Computer"
+	default:
+		return reason
+	}
 }

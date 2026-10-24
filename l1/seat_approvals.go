@@ -230,6 +230,9 @@ func saveSeatApproval(ctx context.Context, q seatApprovalQuery, value SeatApprov
 	if err != nil {
 		return err
 	}
+	if err := createSeatLog(ctx, q, value.Request.SeatID, at); err != nil {
+		return err
+	}
 	if err := appendSeatEvent(ctx, q, at, SeatLogEvent{SeatID: value.Request.SeatID, EventID: "requested", Kind: SeatEventRequested}); err != nil {
 		return err
 	}

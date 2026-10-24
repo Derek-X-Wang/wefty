@@ -484,6 +484,8 @@ its read cursor. Every other operation returns `seat_ended`, HTTP 409 and
 CLI exit 5, with the end reason. This uses the existing typed-exit whitelist.
 An invalid credential returns `forbidden`; a credential cannot read another
 Seat's log. Before pruning, an expired log returns `not_found`; pruning
-removes the credential digest too, so that credential then returns
-`forbidden`. See [Seat logs](seat-logs.md) for cursor, unread-event,
+removes the credential digest too, so a direct credential request returns
+`forbidden`. On exactly 403 `invalid Seat credential`, the CLI retries once
+as the original Fabric caller; a pruned log then returns `not_found`, and
+another caller remains forbidden while a log exists. See [Seat logs](seat-logs.md) for cursor, unread-event,
 credential-scope and retention rules.

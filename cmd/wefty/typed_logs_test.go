@@ -23,10 +23,14 @@ func TestTypedLogTargetsRealBinary(t *testing.T) {
 			t.Fatalf("%s: exit=%d %s", cmd, code, out)
 		}
 	}
+	jobID := "job_" + strings.Repeat("a", 32)
+	noRunID := "job_" + strings.Repeat("b", 32)
 	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/jobs/job-log":
-			json.NewEncoder(w).Encode(map[string]any{"job_id": "job-log", "spec": map[string]any{"labels": map[string]string{"run_id": "run_log"}}})
+		case "/v1/jobs/" + jobID:
+			json.NewEncoder(w).Encode(map[string]any{"job_id": jobID, "spec": map[string]any{"labels": map[string]string{"run_id": "run_log"}}})
+		case "/v1/jobs/" + noRunID:
+			json.NewEncoder(w).Encode(map[string]any{"job_id": noRunID, "spec": map[string]any{}})
 		case "/v1/runs/run_log/logs":
 			json.NewEncoder(w).Encode(l1.LogPage{Events: nil})
 		default:
@@ -34,9 +38,17 @@ func TestTypedLogTargetsRealBinary(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	})
-	code, out := runWefty(t, binary, 30*time.Second, "--l1="+address, "--l3="+address, "logs", "job-log", "--json")
+	code, out := runWefty(t, binary, 30*time.Second, "--l1="+address, "--l3="+address, "logs", jobID, "--json")
 	if code != 0 {
 		t.Fatalf("Job log: exit=%d %s", code, out)
+	}
+	code, out = runWefty(t, binary, 30*time.Second, "--l1="+address, "--l3="+address, "logs", noRunID)
+	if code != exitUsage || !strings.Contains(out, noRunID+" is a Job ID") || !strings.Contains(out, "no run_id label") {
+		t.Fatalf("missing Run label: exit=%d %s", code, out)
+	}
+	code, out = runWefty(t, binary, 30*time.Second, "--l1="+address, "--l3=", "logs", jobID)
+	if code != exitUsage || !strings.Contains(out, jobID+" is a Job ID for Run run_log") || !strings.Contains(out, "--l3") {
+		t.Fatalf("missing L3: exit=%d %s", code, out)
 	}
 }
 

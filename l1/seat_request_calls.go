@@ -123,7 +123,7 @@ func (s *Store) CreateSeatCall(ctx context.Context, caller string, input SeatCal
 		}
 	} else if errors.Is(err, sql.ErrNoRows) {
 		var used int
-		if err := write.tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_approvals WHERE seat_id=? UNION ALL SELECT 1 FROM computer_seat_identities WHERE seat_id=?)`, input.SeatID, input.SeatID).Scan(&used); err != nil {
+		if err := write.tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_approvals WHERE seat_id=? UNION ALL SELECT 1 FROM computer_seat_identities WHERE seat_id=? UNION ALL SELECT 1 FROM seat_logs WHERE seat_id=?)`, input.SeatID, input.SeatID, input.SeatID).Scan(&used); err != nil {
 			return SeatCallResult{}, err
 		}
 		if used != 0 {
@@ -142,6 +142,9 @@ func (s *Store) CreateSeatCall(ctx context.Context, caller string, input SeatCal
 			return SeatCallResult{}, err
 		}
 		if _, err := write.tx.ExecContext(ctx, `INSERT INTO seat_request_calls(seat_id,node_id,boot_session_id,caller_identity,input_json,credential,created_ns) VALUES(?,?,?,?,?,?,?)`, input.SeatID, input.NodeID, boot, caller, data, hex.EncodeToString(secret), write.at.UnixNano()); err != nil {
+			return SeatCallResult{}, err
+		}
+		if err := createSeatLog(ctx, write.tx, input.SeatID, write.at); err != nil {
 			return SeatCallResult{}, err
 		}
 		if err := appendSeatEvent(ctx, write.tx, write.at, SeatLogEvent{SeatID: input.SeatID, EventID: "requested", Kind: SeatEventRequested}); err != nil {
@@ -170,9 +173,9 @@ func (s *Store) CreateSeatCall(ctx context.Context, caller string, input SeatCal
 func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallResult, error) {
 	var result SeatCallResult
 	var expired, unpickedExpired bool
-	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
-		r := reads.(*databaseReads)
-		q := r.q
+	var readOrdinal, outcomeOrdinal int64
+	readCall := func(ctx context.Context, q queryer, at time.Time) error {
+		expired, unpickedExpired = false, false
 		var owner, secret string
 		var startFinished bool
 		var created int64
@@ -191,14 +194,14 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 		}
 		value, err := readSeatRequest(ctx, q, id)
 		if errorCodeForSeatLifecycle(err) == contract.ErrorNotFound {
-			unpickedExpired = !r.now().Before(time.Unix(0, created).Add(MaxSeatApprovalWait))
+			unpickedExpired = !at.Before(time.Unix(0, created).Add(MaxSeatApprovalWait))
 			result = SeatCallResult{SeatRequest: SeatRequest{SeatID: id, State: SeatRequested}, UnreadEvents: unread}
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		expired, err = seatApprovalNeedsExpiry(ctx, q, value, r.now())
+		expired, err = seatApprovalNeedsExpiry(ctx, q, value, at)
 		if err != nil {
 			return err
 		}
@@ -224,7 +227,52 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 			}
 		}
 		return nil
+	}
+	read := func(ctx context.Context, q queryer, at time.Time) error {
+		readOrdinal, outcomeOrdinal = 0, 0
+		if err := readCall(ctx, q, at); err != nil {
+			return err
+		}
+		kind := SeatEventKind(result.State)
+		switch result.State {
+		case SeatLive:
+			kind = SeatEventStarted
+		case SeatEnding, SeatEnded:
+			kind = SeatEventEnded
+		}
+		err := q.QueryRowContext(ctx, `SELECT read_ordinal,COALESCE((SELECT MAX(ordinal) FROM seat_log_events WHERE seat_id=? AND event_id IN (?,'upgrade-state') AND json_extract(event_json,'$.kind')=?),0) FROM seat_logs WHERE seat_id=?`, id, string(kind), kind, id).Scan(&readOrdinal, &outcomeOrdinal)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
+		r := reads.(*databaseReads)
+		return read(ctx, r.q, r.now())
 	})
+	if err == nil && !expired && !unpickedExpired && outcomeOrdinal > readOrdinal {
+		// Only an outcome not already reported needs a write. Re-read caller,
+		// state and event boundary under the same fence that acknowledges it.
+		write, e := s.beginWriteTransaction(ctx, nil)
+		if e != nil {
+			return SeatCallResult{}, e
+		}
+		defer write.rollback()
+		if e = read(ctx, write.tx, write.at); e != nil {
+			return SeatCallResult{}, e
+		}
+		if !expired && !unpickedExpired {
+			if _, e = write.tx.ExecContext(ctx, `UPDATE seat_logs SET read_ordinal=MAX(read_ordinal,?) WHERE seat_id=?`, outcomeOrdinal, id); e != nil {
+				return SeatCallResult{}, e
+			}
+			if e = write.tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM seat_log_events e JOIN seat_logs l ON l.seat_id=e.seat_id WHERE e.seat_id=? AND e.ordinal>l.read_ordinal`, id).Scan(&result.UnreadEvents); e != nil {
+				return SeatCallResult{}, e
+			}
+		}
+		if e = write.commit(); e != nil {
+			return SeatCallResult{}, e
+		}
+	}
 	if err == nil && unpickedExpired {
 		if err := s.expireUnpickedSeatCall(ctx, caller, id); err != nil {
 			return SeatCallResult{}, err

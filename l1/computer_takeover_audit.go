@@ -484,9 +484,6 @@ func (r *databaseReads) computerViewListComputerTakeoverSessions(ctx context.Con
 // It is deliberately independent from attempt/log-summary retention: deleting
 // an attempt never deletes take-over evidence as a foreign-key side effect.
 func (s *Store) pruneComputerTakeoverAudit(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
-	if _, err := tx.ExecContext(ctx, `DELETE FROM seat_logs WHERE ended_ns<=?`, now.Add(-DefaultComputerTakeoverAuditRetentionAge).UnixNano()); err != nil {
-		return 0, internalError(err, "prune Seat log retention")
-	}
 	cutoff := now.Add(-s.computerTakeoverAuditRetentionAge).UnixNano()
 	result, err := tx.ExecContext(ctx, "DELETE FROM computer_takeover_audit WHERE stored_ns<?", cutoff)
 	if err != nil {

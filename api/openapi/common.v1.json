@@ -192,7 +192,7 @@
           "cleanup_pending"
         ],
         "properties": {
-          "unread_events": { "type": "integer", "minimum": 0 },
+          "unread_events": { "type": "integer", "minimum": 0, "description": "Events after the credential read cursor, after acknowledging the outcome reported by this reply. Later events remain unread." },
           "seat_id": {
             "type": "string"
           },
