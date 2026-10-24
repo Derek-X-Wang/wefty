@@ -221,7 +221,7 @@
         "get": {
           "operationId": "getSeatCall",
           "summary": "getSeatCall",
-          "description": "Reports the current outcome and acknowledges its lifecycle-event prefix in the same fenced read/write view. Later events remain unread; repeated waits for the same acknowledged outcome stay read-only.",
+          "description": "Reports the current outcome and acknowledges its contiguous lifecycle-event prefix in the same fenced read/write view, stopping before the first unread non-lifecycle event even if it precedes the outcome. That event and subsequent events remain unread; repeated waits for the same acknowledged outcome stay read-only.",
           "responses": {
             "200": {
               "description": "Durable Seat request receipt.",

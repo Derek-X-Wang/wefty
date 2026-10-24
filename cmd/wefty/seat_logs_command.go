@@ -111,6 +111,7 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 	retriedAsCaller := false
 	pages, retries := 0, 0
 	pendingAck := ""
+	warnedAck := false
 	acknowledge := func() error {
 		if pendingAck == "" {
 			return nil
@@ -120,7 +121,17 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 			pendingAck = ""
 			return nil
 		}
-		if follow && isRetryableObservation(err) {
+		if !follow {
+			// Delivered log data remains successful even if its read receipt
+			// cannot be stored. A repeated read safely acknowledges via MAX.
+			if !warnedAck {
+				warnedAck = true
+				_, warningErr := fmt.Fprintf(stderr, "wefty: warning: could not acknowledge Seat log: %v; read cursor was not confirmed\n", err)
+				return warningErr
+			}
+			return nil
+		}
+		if isRetryableObservation(err) {
 			return nil
 		}
 		return err
