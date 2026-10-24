@@ -99,6 +99,7 @@ func doublingDelay(base, ceiling time.Duration, step int) time.Duration {
 // Sessions borrow it; ending or replacing a session must not discard evidence
 // that still needs delivery.
 type evidenceOutbox struct {
+	nodeID        string
 	spool         *logSpool
 	clock         Clock
 	batchSize     int
@@ -123,9 +124,15 @@ type evidenceOutbox struct {
 	recoveryCancel  context.CancelFunc
 	recoveryWG      sync.WaitGroup
 	recoveryWake    chan struct{}
+	// dispositionMu orders ownership transfer against local destructive effects.
+	// Never hold ownershipMu across spool SQL: sweep consults live ownership.
+	dispositionMu   sync.Mutex
 	ownershipMu     sync.RWMutex
 	liveAttempts    map[string]struct{}
-	lateEvents      map[string]int
+	upgradeAttempts map[string]struct{}
+	// Retain revisions after release to fence replies from an earlier owner.
+	upgradeRevisions map[string]uint64
+	lateEvents       map[string]int
 	// lateRevision changes whenever a producer registers a late append. Evidence
 	// inspection snapshots it without holding ownershipMu across spool SQL.
 	lateRevision uint64
@@ -151,7 +158,7 @@ func newEvidenceOutbox(directory, nodeID string, maxBytes int64, clock Clock, ba
 	}
 	lateContext, lateCancel := context.WithCancel(context.Background())
 	return &evidenceOutbox{
-		spool: spool, clock: clock, batchSize: batchSize,
+		spool: spool, clock: clock, batchSize: batchSize, nodeID: nodeID,
 		flushInterval: flushInterval, retryInterval: retryInterval,
 		recoveryWake: make(chan struct{}, 1),
 		liveAttempts: make(map[string]struct{}),
@@ -326,8 +333,18 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 	outbox.recoveryContext = recoveryContext
 	outbox.recoveryCancel = cancel
 	outbox.recoveryWG.Add(1)
+	refreshInventory := outbox.spool.generationID != ""
+	if refreshInventory {
+		outbox.recoveryWG.Add(1)
+	}
 	outbox.recoveryMu.Unlock()
 
+	if refreshInventory {
+		go func() {
+			defer outbox.recoveryWG.Done()
+			outbox.runGenerationInventoryRefresh(recoveryContext, client)
+		}()
+	}
 	go func() {
 		defer outbox.recoveryWG.Done()
 		type recoveryResult struct {
@@ -348,6 +365,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 		// liveRecheckAt is when recovery looks again at a due retry it left
 		// because the attempt was live, in case the attempt is released
 		// without a wake; liveWaits counts the passes in a row that left one.
+		var cohortRecheckAt time.Time
 		var liveRecheckAt time.Time
 		var liveWaits int
 		var retryTimer Timer
@@ -372,6 +390,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 				consider(deadline)
 			}
 			consider(liveRecheckAt)
+			consider(cohortRecheckAt)
 			if retryTimer != nil {
 				stopTimer(retryTimer)
 				retryTimer = nil
@@ -390,6 +409,13 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 		var launchPending func()
 		launchPending = func() {
 			now := outbox.clock.Now()
+			if outbox.spool.generationID != "" {
+				// Another process's closure/custody does not wake this local
+				// channel. Even an idle primary must discover its backlog.
+				cohortRecheckAt = now.Add(generationInventoryRefreshInterval)
+			}
+			// Replay uses local ownership and the durable closure cache. The
+			// independent inventory loop must never hold up eligible evidence.
 			outbox.sweepDeadOneShotSpool(recoveryContext, now, report)
 			if !scanRetryAt.IsZero() && now.Before(scanRetryAt) {
 				armRetry(now)
@@ -444,7 +470,7 @@ func (outbox *evidenceOutbox) startRecovery(ctx context.Context, client *Client,
 				outbox.recoveryWG.Add(1)
 				go func(attempt logSpoolAttempt) {
 					defer outbox.recoveryWG.Done()
-					result := recoveryResult{attemptID: attempt.attemptID, err: outbox.recoverAttempt(recoveryContext, client, attempt)}
+					result := recoveryResult{attemptID: attempt.attemptID, err: outbox.recoverOwnedAttempt(recoveryContext, client, attempt)}
 					if outbox.recoveryAttemptFinished != nil {
 						outbox.recoveryAttemptFinished(attempt.attemptID)
 					}
@@ -558,7 +584,8 @@ func (outbox *evidenceOutbox) releaseAttempt(attemptID string, reconcile bool) {
 func (outbox *evidenceOutbox) attemptIsLive(attemptID string) bool {
 	outbox.ownershipMu.RLock()
 	_, live := outbox.liveAttempts[attemptID]
-	live = live || outbox.lateEvents[attemptID] > 0
+	_, upgradeOwned := outbox.upgradeAttempts[attemptID]
+	live = live || upgradeOwned || outbox.lateEvents[attemptID] > 0
 	outbox.ownershipMu.RUnlock()
 	return live
 }
@@ -714,6 +741,11 @@ func (outbox *evidenceOutbox) attemptEvidenceDelivered(ctx context.Context, atte
 }
 
 func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, attempt logSpoolAttempt) error {
+	return outbox.recoverLogsRetaining(ctx, client, attempt, false)
+}
+
+func (outbox *evidenceOutbox) recoverLogsRetaining(ctx context.Context, client *Client, attempt logSpoolAttempt, preserve bool) error {
+	revision, _ := outbox.upgradeOwnership(attempt.attemptID)
 	lostBatches := 0
 	for {
 		if lostBatches >= maxEvidenceLogReplayBatchesPerPass {
@@ -750,27 +782,37 @@ func (outbox *evidenceOutbox) recoverLogs(ctx context.Context, client *Client, a
 			continue
 		}
 
-		code := protocolErrorCode(err)
-		if permanentEvidenceRejection(code) {
-			if eventsContainGap(events) {
-				return outbox.sealIncomplete(ctx, attempt.attemptID, "replacement gap was rejected", code)
+		// The request ran without the disposition lock. Fence its response
+		// against any ownership transfer, including a transfer already released.
+		retry, refusal := func() (bool, error) {
+			outbox.dispositionMu.Lock()
+			defer outbox.dispositionMu.Unlock()
+			current, owned := outbox.upgradeOwnership(attempt.attemptID)
+			if preserve || owned || current != revision {
+				return false, err
 			}
-			if err := outbox.spool.replaceBatchWithReplayGaps(ctx, attempt.attemptID, batch); err != nil {
-				return outbox.sealIncomplete(ctx, attempt.attemptID, "rejected replay could not be replaced with a gap", code)
+			code := protocolErrorCode(err)
+			if permanentEvidenceRejection(code) {
+				if eventsContainGap(events) {
+					return false, outbox.sealIncomplete(ctx, attempt.attemptID, "replacement gap was rejected", code)
+				}
+				if err := outbox.spool.replaceBatchWithReplayGaps(ctx, attempt.attemptID, batch); err != nil {
+					return false, outbox.sealIncomplete(ctx, attempt.attemptID, "rejected replay could not be replaced with a gap", code)
+				}
+				return true, nil
 			}
-			continue
-		}
-
-		classification := classifyAgentProtocolError(err)
-		switch classification.destination {
-		case errorDestinationTransient:
-			return err
-		case errorDestinationAttemptAuthority:
-			return outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts evidence", code)
-		case errorDestinationNodeSession:
-			return recoveryRefusal(err, code, classification)
-		default:
-			return err
+			classification := classifyAgentProtocolError(err)
+			switch classification.destination {
+			case errorDestinationAttemptAuthority:
+				return false, outbox.sealIncomplete(ctx, attempt.attemptID, "attempt authority no longer accepts evidence", code)
+			case errorDestinationNodeSession:
+				return false, recoveryRefusal(err, code, classification)
+			default:
+				return false, err
+			}
+		}()
+		if !retry {
+			return refusal
 		}
 	}
 }
@@ -855,4 +897,42 @@ func (outbox *evidenceOutbox) Close() error {
 	outbox.recoveryMu.Unlock()
 	outbox.recoveryWG.Wait()
 	return outbox.spool.Close()
+}
+
+func (outbox *evidenceOutbox) upgradeOwnership(attemptID string) (uint64, bool) {
+	outbox.ownershipMu.RLock()
+	defer outbox.ownershipMu.RUnlock()
+	_, held := outbox.upgradeAttempts[attemptID]
+	return outbox.upgradeRevisions[attemptID], held
+}
+
+// Upgrade barriers retain exclusive local evidence ownership across worker exit.
+// Only exact barrier replay may retry it; generic recovery must not seal or
+// discard a rejected completion while the coordinator still needs its proof.
+func (outbox *evidenceOutbox) holdUpgradeAttempt(attemptID string) {
+	outbox.dispositionMu.Lock()
+	defer outbox.dispositionMu.Unlock()
+	outbox.ownershipMu.Lock()
+	defer outbox.ownershipMu.Unlock()
+	if outbox.upgradeAttempts == nil {
+		outbox.upgradeAttempts = make(map[string]struct{})
+	}
+	if outbox.upgradeRevisions == nil {
+		outbox.upgradeRevisions = make(map[string]uint64)
+	}
+	if _, held := outbox.upgradeAttempts[attemptID]; !held {
+		outbox.upgradeRevisions[attemptID]++
+	}
+	outbox.upgradeAttempts[attemptID] = struct{}{}
+}
+func (outbox *evidenceOutbox) releaseUpgradeAttempt(attemptID string) {
+	outbox.dispositionMu.Lock()
+	defer outbox.dispositionMu.Unlock()
+	outbox.ownershipMu.Lock()
+	if _, held := outbox.upgradeAttempts[attemptID]; held {
+		outbox.upgradeRevisions[attemptID]++
+	}
+	delete(outbox.upgradeAttempts, attemptID)
+	outbox.ownershipMu.Unlock()
+	outbox.scheduleRecovery()
 }

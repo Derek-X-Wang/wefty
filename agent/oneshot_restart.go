@@ -97,7 +97,12 @@ func prepareRestartableResults(spec contract.JobSpec, attemptID string) error {
 // in L1, but cannot change an already durable idempotent completion body.
 func (lifecycle *attemptLifecycle) deliveryCompletionRequest(claim l1.Claim, result contract.ProcessResult, evidence wr.ReapEvidence) l1.CompletionRequest {
 	if !claim.Job.Spec.Restartable {
-		return completionRequest(claim, result, evidence)
+		request := completionRequest(claim, result, evidence)
+		if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess {
+			lifecycle.completion.CompareAndSwap(nil, &request)
+			return *lifecycle.completion.Load()
+		}
+		return request
 	}
 	if request := lifecycle.completion.Load(); request != nil {
 		return *request

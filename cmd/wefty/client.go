@@ -470,9 +470,13 @@ func (c *apiClients) setServiceDesiredState(
 }
 
 func (c *apiClients) restartService(ctx context.Context, jobID, idempotencyKey string) (l1.Job, error) {
+	return c.restartServiceRequest(ctx, jobID, l1.ServiceRestartRequest{IdempotencyKey: idempotencyKey})
+}
+
+func (c *apiClients) restartServiceRequest(ctx context.Context, jobID string, request l1.ServiceRestartRequest) (l1.Job, error) {
 	var job l1.Job
 	path := "/v1/jobs/" + url.PathEscape(jobID) + "/restart?class=" + contract.JobClassService
-	err := c.l1.do(ctx, http.MethodPost, path, l1.ServiceRestartRequest{IdempotencyKey: idempotencyKey}, nil,
+	err := c.l1.do(ctx, http.MethodPost, path, request, nil,
 		&job, http.StatusAccepted, http.StatusOK)
 	return job, err
 }

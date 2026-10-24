@@ -38,20 +38,21 @@ const (
 )
 
 type upgradeDrainReceipt struct {
-	Home           string                 `json:"home"`
-	Version        int                    `json:"version"`
-	NodeID         string                 `json:"node_id"`
-	Revision       int64                  `json:"intent_revision"`
-	Reason         string                 `json:"intent_reason"`
-	PreviousReason string                 `json:"previous_reason"`
-	RestoreClaims  bool                   `json:"restore_claims"`
-	OldBoot        string                 `json:"old_boot,omitempty"`
-	Services       []l1.NodeActiveAttempt `json:"services,omitempty"`
-	restarted      []string
-	claimsDisabled bool
-	counts         upgradeDrainCounts
-	deadline       time.Time
-	disableNotSent bool
+	Home              string                          `json:"home"`
+	Version           int                             `json:"version"`
+	NodeID            string                          `json:"node_id"`
+	Revision          int64                           `json:"intent_revision"`
+	Reason            string                          `json:"intent_reason"`
+	PreviousReason    string                          `json:"previous_reason"`
+	RestoreClaims     bool                            `json:"restore_claims"`
+	OldBoot           string                          `json:"old_boot,omitempty"`
+	Services          []l1.NodeActiveAttempt          `json:"services,omitempty"`
+	ServiceQuiescence *agent.UpgradeServiceQuiescence `json:"service_quiescence,omitempty"`
+	restarted         []string
+	claimsDisabled    bool
+	counts            upgradeDrainCounts
+	deadline          time.Time
+	disableNotSent    bool
 }
 
 func (receipt *upgradeDrainReceipt) ownsClaims(node l1.Node) bool {
@@ -624,15 +625,28 @@ func restartUpgradeService(ctx context.Context, profile connprofile.Profile, job
 // existing explicit-restart API, whose durable key also covers lost replies.
 // Keep the binding, data directory, spec and published-port reservation intact.
 func resumeUpgradeServices(ctx context.Context, op upgradeHost, paths setupPaths, profile connprofile.Profile, receipt *upgradeDrainReceipt, node l1.Node, finalFailures bool, out io.Writer) error {
-	if receipt.OldBoot == "" || (node.BootSessionID == receipt.OldBoot && node.State == contract.NodeAlive) {
+	if err := validateUpgradeServiceQuiescence(receipt); err != nil {
+		return err
+	}
+	if receipt.ServiceQuiescence == nil && (receipt.OldBoot == "" || (node.BootSessionID == receipt.OldBoot && node.State == contract.NodeAlive)) {
 		return nil
 	}
 	for len(receipt.Services) > 0 {
 		old := receipt.Services[0]
 		job, err := op.readJob(ctx, profile, old.JobID)
 		if err == nil && job.ServiceJob != nil && job.ComputerID == "" && job.BoundNodeID == receipt.NodeID && job.DesiredState == contract.ServiceDesiredRunning && job.Removal == nil && job.PolicyStop == nil && (job.CurrentAttemptID == "" || job.CurrentAttemptID == old.AttemptID) {
-			_, err = op.restartService(ctx, profile, old.JobID, receipt.Reason+":"+old.AttemptID)
-			if err == nil {
+			if proof := receipt.ServiceQuiescence; proof != nil {
+				if op.recoverService == nil {
+					return errors.New("upgrade service recovery adapter is unavailable")
+				}
+				job, err = op.recoverService(ctx, profile, old.JobID, l1.ServiceRestartRequest{
+					IdempotencyKey: upgradeServiceRecoveryKey(receipt, old),
+					Upgrade:        &l1.ServiceUpgradeRecovery{NodeID: receipt.NodeID, AttemptID: old.AttemptID, BootSessionID: proof.BootSessionID},
+				})
+			} else {
+				_, err = op.restartService(ctx, profile, old.JobID, upgradeServiceRecoveryKey(receipt, old))
+			}
+			if err == nil && (receipt.ServiceQuiescence == nil || (job.DesiredState == contract.ServiceDesiredRunning && job.Removal == nil && job.PolicyStop == nil && job.State == contract.JobQueued)) {
 				receipt.restarted = append(receipt.restarted, old.JobID)
 			}
 		} else if err == nil && job.ServiceJob != nil && job.DesiredState == contract.ServiceDesiredRunning && (job.State == contract.JobClaimed || job.State == contract.JobRunning) && job.CurrentAttemptID != "" && job.CurrentAttemptID != old.AttemptID {
@@ -678,6 +692,41 @@ func readUpgradeIntent(ctx context.Context, profile connprofile.Profile) (node l
 	err = withUpgradeClients(ctx, profile, func(ctx context.Context, clients *apiClients) error {
 		var err error
 		node, err = clients.getNode(ctx, profile.Identities.Node)
+		return err
+	})
+	return
+}
+
+// Generation activation and interrupted recovery use the same durable service
+// queue and restart endpoint as plain upgrade. Positive local evidence replaces
+// the legacy changed-boot heuristic; a same-primary failed activation can recover.
+func validateUpgradeServiceQuiescence(receipt *upgradeDrainReceipt) error {
+	proof := receipt.ServiceQuiescence
+	if proof == nil {
+		return nil
+	}
+	if proof.OperationID == "" || proof.AgentGenerationID == "" || proof.NodeID != receipt.NodeID || proof.BootSessionID == "" || proof.BootSessionID != receipt.OldBoot {
+		return errors.New("invalid upgrade service quiescence identity")
+	}
+	for _, service := range receipt.Services {
+		if service.Class != contract.JobClassService || service.Kind != contract.JobKindProcess || service.BootSessionID != proof.BootSessionID || !slices.Contains(proof.Services, service) {
+			return errors.New("upgrade service recovery lacks exact quiescence proof")
+		}
+	}
+	return nil
+}
+
+func upgradeServiceRecoveryKey(receipt *upgradeDrainReceipt, service l1.NodeActiveAttempt) string {
+	if proof := receipt.ServiceQuiescence; proof != nil {
+		return proof.OperationID + ":" + proof.BootSessionID + ":" + service.AttemptID
+	}
+	return receipt.Reason + ":" + service.AttemptID
+}
+
+func recoverUpgradeService(ctx context.Context, profile connprofile.Profile, jobID string, request l1.ServiceRestartRequest) (job l1.Job, err error) {
+	err = withUpgradeClients(ctx, profile, func(ctx context.Context, clients *apiClients) error {
+		var err error
+		job, err = clients.restartServiceRequest(ctx, jobID, request)
 		return err
 	})
 	return

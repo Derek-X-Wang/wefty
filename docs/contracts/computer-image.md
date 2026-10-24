@@ -137,7 +137,9 @@ The other reserved OCI names remain governed by the run-execution-context
 contract. In particular, a Computer never receives `WEFTY_RUN_TOKEN` merely
 because it is a Computer.
 
-Submission is disabled by default. When an administrator enables the
+Submission is disabled by default and cannot be enabled for `network=none`:
+L1 returns HTTP 409 `conflict`, and neither the node agent nor the helper opens
+a submission bridge or delivers a pass for that network. When an administrator enables the
 revisioned submission intent, the agent must obtain an L3-verified pass bound
 to the exact Computer, attempt, Storage generation, submit-intent revision,
 host Node, and L3 authority generation before helper preflight. Mint failure
@@ -304,6 +306,45 @@ identity and then rekey the copied identity before the destination can attach. A
 attach verifies the existing disk-root owner and does not recursively re-own
 the copied bytes.
 
+The Computer's fixed network setting selects `internet` or `none`. An omitted
+helper setting preserves `internet` for existing callers. Both settings create
+a fresh private network namespace. With `network=none`, that namespace has
+loopback only: the helper brings `lo` up and verifies that no outward interface,
+default route or outward route exists, for either IP family. Kernel-created
+fallback tunnels may remain only under their known fallback name and kind
+(`tunl0`/`ipip`, `sit0`/`sit`, `ip6tnl0`/`ip6tnl`, `gre0`/`gre`, and the
+corresponding GRE tap/ERSPAN, IPv6 and IPsec `ip_vti0`/`vti`, `ip6_vti0`/`vti6`
+fallback devices), down and with no IPv4
+or IPv6 address. Any other link, active fallback, or addressed fallback is a
+typed `oci_spec_rejected` refusal. Kernel-local
+loopback routes remain. It creates no veth, NAT, egress proof listener or DNS
+proxy. The helper mounts fixed read-only files from its managed
+`network/none/` directory: `resolv.conf` names only `127.0.0.1`, with one
+one-second attempt, and `hosts` contains only IPv4/IPv6 localhost entries.
+No Node hosts snapshot, upstream resolver or search domain enters this profile.
+No guest proxy or DNS/IP filter implements this setting; the missing outward
+interface and routes are the boundary. The image receives no network
+administration capability with either setting.
+
+The helper reaches each Seat's Unix screen sockets through the exact live
+attempt's root from outside its network namespace. `ExecComputerSeat` uses
+containerd task exec as the Seat's user. Neither transport needs internet.
+The existing command stream can also carry command-mediated copies: bytes in
+command arguments enter a Seat file, and binary stdout returns a file's bytes.
+There is no dependency on a guest TCP file server or DNS. This helper-level
+proof does not claim the later `wefty cp` command or end-to-end AP-1 proof.
+Seat readiness and `rfb-websocket-v1` greetings check the private screen
+endpoints only. They do not probe an upstream network. Liveness remains the
+task's running state. The helper records `computer_network=none` and, after
+checking the actual namespace, `computer_loopback_only=true`; doctor accepts
+that proof without requiring an outward address or DNS/firewall attachment.
+A simultaneous `internet` Computer still requires its firewall evidence.
+The `computer-seats` CI jobs `default-computer-seats / linux/amd64` and
+`default-computer-seats / linux/arm64` prove AP-1 (helper screen, command and
+binary copy), AP-2 (web and DNS fail while loopback works), and AP-3 (fresh
+readiness probes and task liveness survive those refusals). The root-only test
+uses `computer_seat_lane`, never the general non-root realtiming lane.
+
 Computer disk publication is crash-resumable across its image/manifest pair.
 Grow writes exact durable operation intent before resizing in place; copy
 retains its staged identity and phase before the staged image can replace the
@@ -328,7 +369,7 @@ enters only the exact live Computer's network namespace and exposes the existing
 attempt-authority-bound stream; the Computer receives no new capability or
 privilege.
 
-The helper attaches one point-to-point `/30` veth to the private namespace,
+For `network=internet`, the helper attaches one point-to-point `/30` veth to the private namespace,
 installs a default route, retains the helper-managed resolver and hosts mounts,
 disables IPv6 through both the namespace `all` and `default` sysctls, and
 masquerades the exact Computer IPv4 address through the Node or Lima VM. The
@@ -368,8 +409,19 @@ observed as disabled. The authority-bound
 view, control, and directive paths remain private loopback bridges. Ordinary OCI
 jobs keep shared networking unchanged.
 
-Computer submission uses the helper reverse bridge as its only transport on
-every platform. Exactly four bridge pumps may be active per Computer attempt;
+Computer submission is available only with `network=internet`. L1 refuses an
+admin's enable request for `network=none` with HTTP 409 `conflict`, without
+changing submission intent, policy revision, or audit. Disabling remains
+available. The node agent does not mint or synchronize a pass, create a
+submission bridge, or request a helper bridge for `none`, even if a stale
+claim says submission is enabled. The helper independently refuses bridge
+preparation and nonempty submission authority for `none`, including later
+`SetComputerToken` calls. It exposes no bridge capability or endpoint. Screen,
+command, and copy transports continue to work from outside the Computer.
+There is no submission exception to the loopback-only rule.
+
+For `internet`, Computer submission uses the helper reverse bridge as its only
+transport on every platform. Exactly four bridge pumps may be active per Computer attempt;
 additional guest connections wait behind that fixed concurrency bound.
 
 This screen mechanism does not by itself prove the complete isolation boundary.

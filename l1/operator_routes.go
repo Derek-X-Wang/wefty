@@ -235,6 +235,9 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	if strings.TrimSpace(jobID) == "" || strings.TrimSpace(request.IdempotencyKey) == "" {
 		return Job{}, false, protocolError(contract.ErrorInvalidRequest, "job_id and idempotency_key are required")
 	}
+	if request.Upgrade != nil && (request.Upgrade.NodeID == "" || request.Upgrade.AttemptID == "" || request.Upgrade.BootSessionID == "") {
+		return Job{}, false, protocolError(contract.ErrorInvalidRequest, "upgrade recovery requires node, attempt and boot identities")
+	}
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return Job{}, false, internalError(err, "encode service restart request")
@@ -269,6 +272,21 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, internalError(err, "read service restart replay")
+	}
+	if old := request.Upgrade; old != nil {
+		// Recheck operator intent and predecessor identity in the restart write,
+		// not just in the upgrader's earlier read. A stale recovery cannot clear
+		// a newer stop/policy latch or restart an already replaced Attempt.
+		if job.Spec.Kind != contract.JobKindProcess || job.ComputerID != "" || job.BoundNodeID != old.NodeID || job.DesiredState != contract.ServiceDesiredRunning || job.Removal != nil || job.PolicyStop != nil || job.CurrentAttemptID != old.AttemptID || (job.State != contract.JobQueued && job.State != contract.JobFailed) {
+			return job, false, nil
+		}
+		var matches bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM attempts WHERE attempt_id=? AND job_id=? AND node_id=? AND boot_session_id=? AND completion_key IS NOT NULL AND state IN ('succeeded','failed'))`, old.AttemptID, jobID, old.NodeID, old.BootSessionID).Scan(&matches); err != nil {
+			return Job{}, false, internalError(err, "check upgrade service predecessor")
+		}
+		if !matches {
+			return Job{}, false, protocolError(contract.ErrorConflict, "upgrade service predecessor has no accepted completion")
+		}
 	}
 	if err := serviceActionDecision(ctx, transactionReads(tx, now), job, "restart", actor); err != nil {
 		return Job{}, false, err

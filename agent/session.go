@@ -82,6 +82,13 @@ type agentSession struct {
 	retiringRequested         chan struct{}
 	retiringGeneration        *l1.NodeGeneration
 	retirementAttempts        map[string]*retirementAttempt
+	upgradeServiceMu          sync.Mutex
+	upgradeServiceOperation   string
+	upgradeServiceResumed     string
+	upgradeServiceInventory   []l1.NodeActiveAttempt
+	upgradeServicesSettled    bool
+	upgradeLeaseContext       context.Context
+	upgradeLeasesClosed       bool
 	retirementEvidenceSettled func(context.Context, l1.NodeGeneration, []l1.ResidentAttempt) (bool, error)
 	claimMu                   sync.Mutex
 	residentJobID             map[string]struct{}
@@ -207,6 +214,9 @@ func newAgentSession(
 }
 
 func (session *agentSession) close() {
+	if session != nil {
+		session.stopUpgradeServiceLeases(true)
+	}
 	if session != nil && session.computerPolicy != nil {
 		session.computerPolicy.Close()
 	}
@@ -801,8 +811,12 @@ func (session *agentSession) drain(ctx context.Context) (l1.Node, error) {
 // resident attempt has returned.
 func (session *agentSession) run(ctx context.Context, execute sessionAttemptExecution) error {
 	runContext, stop := context.WithCancel(ctx)
+	session.claimMu.Lock()
+	session.upgradeLeaseContext = runContext
+	session.claimMu.Unlock()
 	defer func() {
 		stop()
+		session.stopUpgradeServiceLeases(false)
 		session.attempts.Wait()
 		if session.removals != nil {
 			session.removals.wait()
@@ -1203,6 +1217,9 @@ func (session *agentSession) executeResident(
 		session.serviceBoots[claim.Job.JobID] = session.registration.BootSessionID
 	}
 	session.resident[claim.Job.JobID] = resident
+	if resident.class == contract.JobClassService && session.upgradeServiceOperation != "" {
+		resident.cancel(errUpgradeServiceQuiescence)
+	}
 	if session.shutdownRestartable && resident.restartable {
 		resident.cancel(ErrAgentShutdown)
 	}
@@ -1220,6 +1237,14 @@ func (session *agentSession) executeResident(
 		if errors.As(executeErr, &persistenceErr) && persistenceErr.IntentRevision >= session.residentSuppressionReopenRevision {
 			resident.completionErr = executeErr
 			session.residentSuppressionErrors[claim.Job.JobID] = executeErr
+		}
+		if record := session.retirementAttempts[claim.Lease.AttemptID]; record != nil {
+			record.finished = true
+			if resident.class == contract.JobClassService && session.upgradeServiceOperation != "" {
+				record.finalizationErr = executeErr
+				executeErr = nil
+				destination = errorDestinationUnclassified
+			}
 		}
 		delete(session.resident, claim.Job.JobID)
 		delete(session.residentJobID, claim.Job.JobID)
@@ -1522,7 +1547,7 @@ func (session *agentSession) claim(
 	// has requeued a job but before the first worker finishes local finalization.
 	session.claimMu.Lock()
 	defer session.claimMu.Unlock()
-	if session.isRetiring() || session.isDraining() {
+	if session.isRetiring() || session.isDraining() || (selector == contract.JobClassService && session.upgradeServiceOperation != "") {
 		return nil, false, nil
 	}
 	endCapabilityClaim := session.capabilities.beginClaim()
@@ -1564,7 +1589,7 @@ func (session *agentSession) claim(
 	session.residentJobID[claim.Job.JobID] = struct{}{}
 	session.residentKind[claim.Job.JobID] = claim.Job.Spec.Kind
 	if session.registration.AgentGenerationID != "" {
-		session.retirementAttempts[claim.Lease.AttemptID] = &retirementAttempt{jobID: claim.Job.JobID, fencingToken: claim.Lease.FencingToken}
+		session.retirementAttempts[claim.Lease.AttemptID] = &retirementAttempt{jobID: claim.Job.JobID, fencingToken: claim.Lease.FencingToken, class: claim.Job.Spec.Class, kind: claim.Job.Spec.Kind}
 	}
 	return claim, true, nil
 }
@@ -1732,6 +1757,7 @@ func (session *agentSession) recordRuntimeReap(jobID string, receipt workloadrun
 	if resident := session.resident[jobID]; resident != nil {
 		if record := session.retirementAttempts[resident.attemptID]; record != nil {
 			record.reaped = err == nil && receipt.RuntimeQuiesced && receipt.Evidence != ""
+			record.reapErr = err
 		}
 	}
 	resident, active := session.resident[jobID]
@@ -1770,10 +1796,20 @@ func (session *agentSession) retainRemovalReap(jobID string, receipt workloadrun
 	session.serviceReaps[jobID] = runtimeReapOutcome{receipt: receipt}
 }
 
-func (session *agentSession) clearRuntimeReap(jobID string) {
+// completeServiceRemoval runs only after positive job-wide reap, spool purge,
+// managed-root cleanup, accepted removal acknowledgement and durable completion.
+// Removed service evidence is intentionally gone, so its old delivery query can
+// no longer prove settlement. Retain this positive removal proof instead.
+func (session *agentSession) completeServiceRemoval(jobID string) {
 	session.claimMu.Lock()
 	delete(session.serviceReaps, jobID)
 	delete(session.serviceBoots, jobID)
+	for _, record := range session.retirementAttempts {
+		if record.jobID == jobID && record.class == contract.JobClassService && record.kind == contract.JobKindProcess && record.finished {
+			record.reaped, record.evidenceSettled = true, true
+			record.checkEvidence = nil
+		}
+	}
 	session.claimMu.Unlock()
 }
 

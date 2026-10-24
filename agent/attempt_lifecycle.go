@@ -79,6 +79,9 @@ func (disabledAttemptWatch) Stop()                  {}
 type attemptLifecycleDependencies struct {
 	keepCompletionAuthority bool
 	retirementEvidence      func(string, func(context.Context) (bool, error))
+	upgradeEvidence         func(string, func(context.Context) error)
+	upgradeRuntime          func(string, func(context.Context) (workloadrunner.ReapReceipt, error))
+	verifyStoppedService    func(context.Context, l1.Claim) (workloadrunner.ReapReceipt, error)
 	client                  *Client
 	runtimes                workloadRuntimeSet
 	outbox                  *evidenceOutbox
@@ -473,6 +476,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
 	attemptID := claim.Lease.AttemptID
+	if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess {
+		lifecycle.dependencies.upgradeEvidence(attemptID, func(ctx context.Context) error { return lifecycle.recoverUpgradeServiceEvidence(ctx, claim) })
+	}
 	if lifecycle.dependencies.retirementEvidence != nil {
 		if lifecycle.dependencies.outbox != nil {
 			lifecycle.dependencies.outbox.trackRetirementCompletion(attemptID, &lifecycle.completionAccepted)
@@ -481,6 +487,10 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		// The outbox transfers acceptance into this lifecycle at delivery;
 		// pending publication stays a live query until it too has settled.
 		var proofMu sync.Mutex
+		upgradeEvidence, upgradeRuntime := lifecycle.dependencies.upgradeEvidence, lifecycle.dependencies.upgradeRuntime
+		if claim.Job.Spec.Class != contract.JobClassService || claim.Job.Spec.Kind != contract.JobKindProcess {
+			upgradeEvidence, upgradeRuntime = nil, nil
+		}
 		query := func(ctx context.Context) (bool, error) { return lifecycle.retirementEvidenceSettled(ctx, claim) }
 		check := func(ctx context.Context) (bool, error) {
 			proofMu.Lock()
@@ -492,6 +502,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			if settled && err == nil {
 				// Release the retained lifecycle once delivery is proved.
 				query = nil
+				// Recovery callbacks also retain the lifecycle. Drop them only
+				// when the session has positive reap as well as this delivery proof.
+				if upgradeEvidence != nil {
+					upgradeEvidence(attemptID, nil)
+				}
+				if upgradeRuntime != nil {
+					upgradeRuntime(attemptID, nil)
+				}
 			}
 			return settled, err
 		}
@@ -525,10 +543,26 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	}
 	lifecycle.dependencies.observer.beginAttempt(attemptID, claim.Job.JobID, claim.Job.Spec.Class)
 	defer lifecycle.dependencies.observer.finishAttempt(attemptID)
+	if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess && errors.Is(context.Cause(ctx), errUpgradeServiceQuiescence) {
+		return lifecycle.finalizeUnstartedUpgradeService(ctx, claim)
+	}
 	if lifecycle.dependencies.outbox != nil {
-		if err := lifecycle.dependencies.outbox.ensureAttempt(attemptContext, claim); err != nil {
+		initializationContext := attemptContext
+		cancelInitialization := func() {}
+		if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess {
+			initializationContext, cancelInitialization = context.WithTimeout(context.WithoutCancel(attemptContext), lifecycle.dependencies.client.operationTimeout)
+		}
+		err := lifecycle.dependencies.outbox.ensureAttempt(initializationContext, claim)
+		cancelInitialization()
+		if err != nil {
+			if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess && errors.Is(context.Cause(ctx), errUpgradeServiceQuiescence) {
+				return lifecycle.finalizeUnstartedUpgradeService(ctx, claim)
+			}
 			return errorDestinationUnclassified, fmt.Errorf("agent: persist attempt evidence identity: %w", err)
 		}
+	}
+	if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess && errors.Is(context.Cause(ctx), errUpgradeServiceQuiescence) {
+		return lifecycle.finalizeUnstartedUpgradeService(ctx, claim)
 	}
 
 	// Start the local monotonic lease window when the claim response is actually
@@ -627,6 +661,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		outcome.result = result
 		if err := persistCompletion(&outcome, true); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
+		}
+		if errors.Is(cause, errUpgradeServiceQuiescence) && claim.Job.Spec.Class == contract.JobClassService {
+			if outcome.reapEvidence == "" {
+				return errorDestinationUnclassified, errors.New("upgrade service runtime reap did not verify quiescence")
+			}
+			finalizationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+			defer cancel()
+			return errorDestinationUnclassified, lifecycle.recoverUpgradeServiceEvidence(finalizationContext, claim)
 		}
 		if errors.Is(cause, errServiceRemovalRequested) {
 			// The removal controller persists its local removing record before
@@ -974,6 +1016,10 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 }
 
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
+	return lifecycle.completeWithRetryMode(ctx, claim, request, completionDeliveryLive)
+}
+
+func (lifecycle *attemptLifecycle) completeWithRetryMode(ctx context.Context, claim l1.Claim, request l1.CompletionRequest, mode completionDeliveryMode) destinationError {
 	// Tests may use a lifecycle without durable storage; production borrows the
 	// process-lifetime outbox, which also owns its intent gate.
 	outbox := lifecycle.dependencies.outbox
@@ -986,7 +1032,7 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 	// another ledger call, so back off while preserving the identical body.
 	ledgerRefusals := 0
 	for {
-		verdict := outbox.deliverCompletion(ctx, lifecycle.dependencies.client, attempt, request, completionDeliveryLive)
+		verdict := outbox.deliverCompletion(ctx, lifecycle.dependencies.client, attempt, request, mode)
 		switch verdict.kind {
 		case completionSuppressed:
 			return destinationError{err: errOCIIntentDisabled}
@@ -1168,6 +1214,16 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits,
 		ManagedVolumes: runtimeManagedVolumes(claim, lifecycle.executionOwnerKey(claim.Job.Spec)),
 		IdlePolicy:     idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
+	}
+	if contract.IsComputerExecution(request.Execution) {
+		request.ComputerNetwork = ocihelper.ComputerNetworkInternet
+		if claim.ComputerStorage != nil && claim.ComputerStorage.ComputerSettings != nil && claim.ComputerStorage.Network != "" {
+			request.ComputerNetwork = string(claim.ComputerStorage.Network)
+		}
+	}
+	computerTokens := lifecycle.dependencies.computerTokens
+	if request.ComputerNetwork == ocihelper.ComputerNetworkNone {
+		computerTokens = nil
 	}
 	var ociRuntimeLoss ociRuntimeLossLatch
 	preRunObservationRefused := false
@@ -1377,12 +1433,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	if computerService {
 		request.Execution = withoutComputerReservedOperatorEnvironment(request.Execution)
-		if claim.ComputerStorage.SubmitEnabled {
-			if lifecycle.dependencies.computerTokens == nil {
+		if claim.ComputerStorage.SubmitEnabled && request.ComputerNetwork != ocihelper.ComputerNetworkNone {
+			if computerTokens == nil {
 				err := errors.New("Computer submission is enabled but the L3 token minter is unavailable")
 				return spawnFailure(contract.SpawnFailurePassUnavailable, err), err
 			}
-			grant, err := lifecycle.dependencies.computerTokens.MintComputerToken(ctx, l3.ComputerTokenMintRequest{
+			grant, err := computerTokens.MintComputerToken(ctx, l3.ComputerTokenMintRequest{
 				ComputerID: claim.ComputerStorage.ComputerID, ComputerAttemptID: claim.Lease.AttemptID,
 			})
 			if err != nil {
@@ -1471,9 +1527,20 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if handoffReader != nil {
 			lifecycle.captureRemoteResult(finalizationContext, handoffReader)
 		}
-		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, workloadrunner.ReapRequest{
-			Authority: authority, ManagedResources: managedResources,
-		})
+		reapRequest := workloadrunner.ReapRequest{Authority: authority, ManagedResources: managedResources}
+		if lifecycle.dependencies.upgradeRuntime != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess {
+			lifecycle.dependencies.upgradeRuntime(claim.Lease.AttemptID, func(ctx context.Context) (workloadrunner.ReapReceipt, error) {
+				receipt, err := runtimeAdapter.ReapAndVerify(ctx, reapRequest)
+				if err != nil && lifecycle.dependencies.verifyStoppedService != nil {
+					// The first runtime verification may have consumed a negative
+					// receipt. Recheck the exact durable process-group identity;
+					// no missing map entry or elapsed time supplies positive proof.
+					return lifecycle.dependencies.verifyStoppedService(ctx, claim)
+				}
+				return receipt, err
+			})
+		}
+		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, reapRequest)
 		var reapLoss *workloadrunner.RuntimeLossError
 		if errors.As(reapErr, &reapLoss) {
 			cancelFinalization()
@@ -1808,7 +1875,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	}
 	var err error
 	var computerBridge *computerAttemptBridgeController
-	if computerService {
+	if computerService && request.ComputerNetwork != ocihelper.ComputerNetworkNone {
 		computerBridge = newComputerAttemptBridgeController(ctx, lifecycle.dependencies.workflowBridge, claim.Job.Spec.Kind, executionSpec)
 		defer computerBridge.disable(errComputerAttemptClosed)
 		if claim.ComputerStorage.SubmitEnabled {
@@ -1948,10 +2015,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			clock: lifecycle.dependencies.clock, fabric: lifecycle.dependencies.fabric,
 			publicationOperation: lifecycle.dependencies.client.boundedContext,
 			authorizer:           lifecycle.dependencies.computerPolicy, auditor: lifecycle.dependencies.client,
-			computerTokens: lifecycle.dependencies.computerTokens, computerBridge: computerBridge,
+			computerTokens: computerTokens, computerBridge: computerBridge,
 			controlTokens: lifecycle.dependencies.computerControlTokens,
 			submission: ComputerSubmissionAuthority{ComputerID: claim.ComputerStorage.ComputerID,
-				Enabled: claim.ComputerStorage.SubmitEnabled, SubmitIntentRevision: claim.ComputerStorage.SubmitIntentRevision,
+				Enabled: claim.ComputerStorage.SubmitEnabled && request.ComputerNetwork != ocihelper.ComputerNetworkNone, SubmitIntentRevision: claim.ComputerStorage.SubmitIntentRevision,
 				SubmitMaxInflight: claim.ComputerStorage.SubmitMaxInflight, SubmitPolicyRevision: claim.ComputerStorage.SubmitPolicyRevision},
 			computerID: claim.ComputerStorage.ComputerID, jobID: claim.Job.JobID,
 			storageID: claim.ComputerStorage.StorageID, storageGeneration: claim.ComputerStorage.StorageGeneration,
@@ -2585,10 +2652,18 @@ func (lifecycle *attemptLifecycle) retirementEvidenceSettled(ctx context.Context
 	if outbox == nil {
 		return false, nil
 	}
-	delivered, err := outbox.attemptEvidenceDelivered(ctx, claim.Lease.AttemptID, lifecycle.completionAccepted.Load())
-	if err != nil || !delivered {
+	// Publication cannot transfer through historical log/completion custody.
+	published, err := lifecycle.retirementPublicationSettled(ctx, claim)
+	if err != nil || !published {
 		return false, err
 	}
+	if _, err := outbox.spool.db.ExecContext(ctx, `UPDATE spool_attempts SET publication_settled=1 WHERE attempt_id=? AND owner_generation=?`, claim.Lease.AttemptID, outbox.spool.generationID); err != nil {
+		return false, err
+	}
+	return outbox.attemptEvidenceDelivered(ctx, claim.Lease.AttemptID, lifecycle.completionAccepted.Load())
+}
+
+func (lifecycle *attemptLifecycle) retirementPublicationSettled(ctx context.Context, claim l1.Claim) (bool, error) {
 	owner := lifecycle.executionOwnerKey(claim.Job.Spec)
 	if owner == "" {
 		return lifecycle.mailboxDrained(), nil

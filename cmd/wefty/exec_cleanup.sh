@@ -12,6 +12,10 @@ retire_exec_storage() {
   # The process runner reaps the wrapper's process group at attempt end.
   # Job control gives this helper a separate group, also on macOS Bash 3.2
   # where setsid is unavailable. No inherited output pipe may keep a run open.
+  # When the kernel refuses the new group, Bash reports it from the child
+  # before the redirections below apply. Keep that line out of the run's
+  # stderr (#1204); fd 9 holds the caller's stderr until the fork is done.
+  exec 9>&2 2>/dev/null
   set -m
   (
     trap - EXIT INT TERM
@@ -98,9 +102,10 @@ retire_exec_storage() {
       /bin/rmdir -- "$marker/$$" && /bin/rmdir -- "$marker"
     ' wefty-exec-delete "$trash" &
     exit "$link_failure"
-  ) </dev/null >/dev/null 2>&1 &
+  ) </dev/null >/dev/null 2>&1 9>&- &
   operation=$!
   set +m
+  exec 2>&9 9>&-
   [ "$kind" != trash ] || return 0
   # A stalled rename must not keep a run open. Do not kill the helper when
   # this budget expires: it may still retire and delete the capture later.

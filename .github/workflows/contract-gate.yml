@@ -122,9 +122,9 @@ jobs:
         # packages concurrently starves them on the slowest runner in the
         # matrix — observed as TestTimeoutTerminatesThenKillsEntireProcessGroup
         # timing out on macos-latest while passing in every other job.
-        # -timeout=20m matches mac-linux-runner: cmd/wefty takes 365-600 s
-        # here on hosted macOS and hit the 10-minute default on PR #872 (#163).
-        run: go test -p 1 -timeout=20m -tags=service_acceptance ./...
+        # -timeout=30m matches mac-linux-runner: cmd/wefty takes 690-1010 s
+        # here on hosted macOS and hit 20m on PR #1213 (#163, #1035).
+        run: go test -p 1 -timeout=30m -tags=service_acceptance ./...
 
   dogfood-workflow:
     name: dogfood-workflow

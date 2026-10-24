@@ -506,10 +506,12 @@ func run() error {
 		fmt.Println(version)
 		return nil
 	}
+	var primaryGeneration func(func() error) error
+	var generationLifetimeLock func(string, string) error
 	var generationStore agentinstall.Store
 	var generationSystemBoot string
 	var generationBootSession string
-	if *generationRoot != "" || *generationLaunchAgents != "" {
+	if *agentGenerationID != "" || *generationRoot != "" || *generationLaunchAgents != "" {
 		if *agentGenerationID == "" || filepath.Base(*generationRoot) != agentinstall.Directory {
 			return errors.New("installed generation requires its identity and catalog directory")
 		}
@@ -524,14 +526,16 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		release, err := generationStore.Startup(*agentGenerationID, catalog.NodeID, agentExecutable, generationSystemBoot)
+		lifetime, err := generationStore.StartupWithLifetime(*agentGenerationID, catalog.NodeID, agentExecutable, generationSystemBoot)
 		if errors.Is(err, agentinstall.ErrStartupSuppressed) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		defer release()
+		defer lifetime.Close()
+		generationLifetimeLock = lifetime.ClaimRuntime
+		primaryGeneration = func(write func() error) error { return generationStore.WithPrimary(*agentGenerationID, write) }
 		g := catalog.Generations[*agentGenerationID]
 		if g.Role == "" {
 			generationBootSession = g.CandidateBootSessionID
@@ -766,6 +770,8 @@ func run() error {
 	nodeAgent, err := agent.New(agent.Config{
 		SeatApprovalSettings:    agent.SeatApprovalSettings{AnswerWait: *seatApprovalAnswerWait, WindowHours: approvalWindowHours},
 		AgentGenerationID:       *agentGenerationID,
+		PrimaryGeneration:       primaryGeneration,
+		GenerationLifetimeLock:  generationLifetimeLock,
 		Fabric:                  participant,
 		ControlPlaneAddress:     *controlPlane,
 		RunLedgerAddress:        *runLedger,
