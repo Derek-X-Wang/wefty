@@ -134,12 +134,34 @@ func TestExecSweepsAbandonedCaptures(t *testing.T) {
 	if e := execute(t.Context(), stack.clients, false, []string{"cancel", id}, io.Discard, io.Discard); e != nil {
 		t.Fatal(e)
 	}
+	// Cancel returns before the run ends, and a sweep keeps a live run's
+	// capture. Sweep only once the cancelled run is terminal (#1220).
+	waitExecRunTerminal(t, stack.clients, id)
 	if e := execute(t.Context(), stack.clients, false, []string{"exec", "--", "true"}, io.Discard, io.Discard); e != nil {
 		t.Fatal(e)
 	}
 	for _, path := range []string{params.Storage, residue} {
 		if _, e := os.Stat(path); !os.IsNotExist(e) {
 			t.Errorf("terminal capture leaked at %s: %v", path, e)
+		}
+	}
+}
+
+func waitExecRunTerminal(t *testing.T, clients *apiClients, id string) {
+	t.Helper()
+	ctx, stop := context.WithTimeout(t.Context(), 20*time.Second)
+	defer stop()
+	for {
+		runs, err := clients.listRuns(ctx, "", 20)
+		if err == nil {
+			for _, run := range runs.Runs {
+				if run.RunID == id && (run.Status == contract.RunSucceeded || run.Status == contract.RunFailed) {
+					return
+				}
+			}
+		}
+		if err := waitForContext(ctx, 20*time.Millisecond); err != nil {
+			t.Fatalf("run %s did not end: %v", id, err)
 		}
 	}
 }

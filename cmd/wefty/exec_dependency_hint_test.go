@@ -42,7 +42,7 @@ func TestExecIgnoredDependencyHint(t *testing.T) {
 	} {
 		for _, jsonOutput := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/json=%v", tc.name, jsonOutput), func(t *testing.T) {
-				t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+				execTestStorageRoot(t)
 				repo := execTestRepo(t)
 				writeExecFile(t, filepath.Join(repo, ".gitignore"), tc.ignore)
 				writeExecFile(t, filepath.Join(repo, "sub/nested/tracked"), "base")

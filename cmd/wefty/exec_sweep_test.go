@@ -149,7 +149,7 @@ func TestExecSweepMarkerlessLookup(t *testing.T) {
 }
 
 func TestExecWrapperRecordsRunBeforeClone(t *testing.T) {
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	capture, err := captureExec(t.Context(), execTestRepo(t))
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +195,7 @@ func TestExecWrapperRecordsRunBeforeClone(t *testing.T) {
 }
 
 func TestExecWrapperCleanupAlreadyRemoved(t *testing.T) {
-	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", t.TempDir())
+	execTestStorageRoot(t)
 	capture, err := captureExec(t.Context(), execTestRepo(t))
 	if err != nil {
 		t.Fatal(err)
