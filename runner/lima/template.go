@@ -24,7 +24,6 @@ const (
 	VMMemoryFlagName              = "vm-memory"
 	VMCPUsFlagName                = "vm-cpus"
 	VMDiskFlagName                = "vm-disk"
-	maximumDefaultMemory          = int64(4 << 30)
 	computerInfrastructureReserve = int64(1 << 30)
 )
 
@@ -106,25 +105,13 @@ func (values *SizingFlags) Sizing() (Sizing, error) {
 	return sizing, nil
 }
 
-// DefaultSizing applies the owner-ratified setup defaults: one quarter of
-// host RAM capped at 4 GiB, four CPUs capped at half the logical cores, and a
-// 32 GiB disk. Callers persist the returned values as explicit setup flags.
+// DefaultSizing applies the phase 3 defaults: one quarter of host RAM,
+// four CPUs, and a 32 GiB disk. Setup persists these fixed values.
 func DefaultSizing(hostMemoryBytes int64, logicalCPUs int) (Sizing, error) {
-	if hostMemoryBytes <= 0 || logicalCPUs <= 0 {
+	if hostMemoryBytes < 4<<20 || logicalCPUs <= 0 {
 		return Sizing{}, errors.New("host memory and logical CPU count must be positive")
 	}
-	memory := hostMemoryBytes / 4
-	if memory > maximumDefaultMemory {
-		memory = maximumDefaultMemory
-	}
-	cpus := logicalCPUs / 2
-	if cpus < 1 {
-		cpus = 1
-	}
-	if cpus > 4 {
-		cpus = 4
-	}
-	return Sizing{Memory: fmt.Sprintf("%dMiB", memory>>20), CPUs: cpus, Disk: DefaultDisk}, nil
+	return Sizing{Memory: fmt.Sprintf("%dMiB", (hostMemoryBytes/4)>>20), CPUs: 4, Disk: DefaultDisk}, nil
 }
 
 func HostDefaultSizing() (Sizing, error) {

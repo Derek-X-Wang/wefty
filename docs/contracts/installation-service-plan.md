@@ -845,3 +845,14 @@ record-lock directory, result records or custody bytes. #1180 reconciliation
 must retain ambiguous and undeclared evidence. Custody alone proves neither an
 empty runtime nor an accepted first completion, and cannot authorize rollback
 or retirement restart.
+
+## Per-user host VM and attended proof
+
+The plain Mac plan can add the host VM with `wefty setup --oci-config FILE`.
+It adds OCI settings to the existing interactive node-agent LaunchAgent; it
+adds no service or system daemon. The isolated `--proof` variant gives this
+same three-process plan its own labels, ports, binaries, configuration and
+state. Normal OCI removal preserves the host VM disk; explicit disposable
+proof purge removes only proof-owned state after a graceful stop.
+See [the per-user host VM contract](per-user-host-vm.md) for inputs, paths,
+intent preservation and the attended-only fixture boundary.

@@ -19,6 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
+	limarunner "github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
 
@@ -72,6 +73,21 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 		}
 		report.Warnings = append(report.Warnings, "left "+filepath.Join(home, issue.folder)+": "+issue.err.Error())
 	}
+	var userOCI limarunner.UserInstallConfig
+	hasUserOCI := false
+	if err := limarunner.ReadUserInstallJSON(filepath.Join(paths.config, "oci-user.json"), &userOCI); err == nil {
+		hasUserOCI = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return report, err
+	}
+	if hasUserOCI {
+		if userOCI.Instance != limarunner.DefaultInstanceName || userOCI.LimaHome != filepath.Join(paths.data, "lima") {
+			return report, errors.New("OCI removal paths do not match this installation")
+		}
+		if purge {
+			return report, errors.New("OCI host VM disk contains retained Storage and Backups; --purge is refused; remove the install without --purge")
+		}
+	}
 	if err := agentinstall.RefuseMaintenance(paths.data, "setup --remove"); err != nil {
 		return report, err
 	}
@@ -121,6 +137,9 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 		return report, err
 	}
 	allowed := []string{filepath.Join(paths.configRel, connprofile.FileName), filepath.Join(paths.configRel, "node.json")}
+	if hasUserOCI {
+		allowed = append(allowed, filepath.Join(paths.configRel, "oci-user.json"), filepath.Join(paths.configRel, "host-vm.yaml"))
+	}
 	for _, name := range setupBinaries {
 		allowed = append(allowed, filepath.Join(paths.binRel, name))
 	}
@@ -235,6 +254,15 @@ func runSetupRemove(ctx context.Context, host setupHost, purge bool) (setupRemov
 			bound = time.Duration(setupNodeAgentExitTimeout+15) * time.Second
 		}
 		if err := (launchagent.Manager{UID: host.uid, Run: host.launchctl, UnloadBound: bound}).Unload(ctx, label); err != nil {
+			return report, err
+		}
+	}
+	if hasUserOCI {
+		stop := host.stopHostVM
+		if stop == nil {
+			stop = stopInstalledHost
+		}
+		if err := stop(ctx, userOCI.LimaHome, userOCI.Instance); err != nil {
 			return report, err
 		}
 	}
