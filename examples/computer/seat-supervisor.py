@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Root Seat supervisor. Control is read-only; answers are attempt-local."""
 import base64
+import errno
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,9 @@ STATUS = Path("/wefty/seat-status")
 SEATS = Path("/wefty/service/seats")
 SHARED = Path("/wefty/service/shared")
 READINESS_SECONDS = 60
+SCRATCH_SWEEP_SECONDS = 30
+SCRATCH_SWEEP_ENTRIES = 200000
+SCRATCH_SWEEP_PASSES = 3
 
 
 class SeatFailure(Exception):
@@ -197,7 +201,36 @@ def open_directory(path):
         raise
 
 
-def remove_at(parent, name, uid=None):
+class ScratchChanged(Exception):
+    """A foreign folder changed; retry from the scratch roots."""
+
+
+class ScratchBudget:
+    def __init__(self, clock):
+        self.clock = clock
+        self.deadline = clock() + SCRATCH_SWEEP_SECONDS
+        self.remaining = SCRATCH_SWEEP_ENTRIES
+
+    def check(self):
+        if self.clock() >= self.deadline:
+            raise SeatFailure("cleanup_scratch_budget")
+
+    def names(self, descriptor):
+        # Bound enumeration itself, before a wide directory allocates a list.
+        names = []
+        self.check()
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                self.check()
+                if self.remaining <= 0:
+                    raise SeatFailure("cleanup_scratch_budget")
+                self.remaining -= 1
+                names.append(entry.name)
+        self.check()
+        return names
+
+
+def remove_at(parent, name, uid=None, budget=None):
     """Iterative no-follow deletion with at most three extra descriptors.
 
     Parent identities are checked on ascent, so a renamed directory cannot
@@ -205,66 +238,108 @@ def remove_at(parent, name, uid=None):
     With uid set, visit other users' directories but remove only uid-owned
     entries; retain directories that still hold another user's entries.
     """
+    def replaced(owner):
+        if uid is not None and owner != uid:
+            raise ScratchChanged()
+        raise SeatFailure("cleanup_path_replaced")
+
     current = os.dup(parent)
     frames = []
     entries = iter([name])
     try:
+        current_info = os.fstat(current)
         while True:
+            if budget is not None:
+                budget.check()
             try:
                 name = next(entries)
             except StopIteration:
                 if not frames:
                     return
-                name, expected_parent, expected_child, entries = frames.pop()
-                upper = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                name, expected_parent, expected_child, owner, entries = frames.pop()
+                try:
+                    upper = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
+                except FileNotFoundError:
+                    if uid is not None and owner != uid:
+                        raise ScratchChanged() from None
+                    raise
                 try:
                     observed = os.fstat(upper)
-                    child = os.stat(name, dir_fd=upper, follow_symlinks=False)
-                    if ((observed.st_dev, observed.st_ino) != expected_parent
-                            or (child.st_dev, child.st_ino) != expected_child):
-                        raise SeatFailure("cleanup_path_replaced")
-                    if uid is None or (child.st_uid == uid and not os.listdir(current)):
-                        os.rmdir(name, dir_fd=upper)
-                except FileNotFoundError:
-                    pass
+                    if (observed.st_dev, observed.st_ino) != expected_parent:
+                        replaced(owner)
+                    try:
+                        child = os.stat(name, dir_fd=upper, follow_symlinks=False)
+                    except FileNotFoundError:
+                        if uid is None:
+                            raise
+                        if owner != uid:
+                            raise ScratchChanged() from None
+                        child = None
+                    if child is not None:
+                        if (child.st_dev, child.st_ino) != expected_child:
+                            replaced(owner)
+                        if uid is None:
+                            os.rmdir(name, dir_fd=upper)
+                        elif child.st_uid == uid:
+                            try:
+                                os.rmdir(name, dir_fd=upper)
+                            except FileNotFoundError:
+                                pass
+                            except OSError as error:
+                                if error.errno != errno.ENOTEMPTY:
+                                    raise
+                                # Do not leave this folder owned by a uid that
+                                # the next Seat at this place will reuse.
+                                mode = stat.S_IMODE(os.fstat(current).st_mode)
+                                os.fchown(current, 0, 0)
+                                os.fchmod(current, mode)  # chown can clear setid.
                 except BaseException:
                     os.close(upper)
                     raise
                 os.close(current)
-                current = upper
+                current, current_info = upper, observed
                 continue
             try:
                 info = os.stat(name, dir_fd=current, follow_symlinks=False)
             except FileNotFoundError:
                 continue
-            if uid is not None and info.st_dev != os.fstat(current).st_dev:
+            if uid is not None and info.st_dev != current_info.st_dev:
                 continue  # A nested mount is outside this scratch filesystem.
             if not stat.S_ISDIR(info.st_mode):
                 if uid is None or info.st_uid == uid:
                     try:
                         os.unlink(name, dir_fd=current)
                     except FileNotFoundError:
-                        pass
+                        if uid is None:
+                            raise
                 continue
             try:
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
-            except FileNotFoundError:
-                continue
+            except OSError as error:
+                if uid is None:
+                    raise
+                if isinstance(error, FileNotFoundError):
+                    if info.st_uid != uid:
+                        raise ScratchChanged() from None
+                    continue
+                if error.errno in (errno.ENOTDIR, errno.ELOOP):
+                    replaced(info.st_uid)
+                raise
             try:
-                observed, upper = os.fstat(child), os.fstat(current)
+                observed, upper = os.fstat(child), current_info
                 if ((info.st_dev, info.st_ino) != (observed.st_dev, observed.st_ino)
                         or observed.st_dev != upper.st_dev):
-                    raise SeatFailure("cleanup_path_replaced")
-                # Enumerate each directory once. Retain names, never an open
-                # directory iterator/fd at every level or repeated wide scans.
-                children = iter(os.listdir(child))
+                    replaced(info.st_uid)
+                # Retain bounded name lists, never a directory iterator/fd at
+                # every level. uid=None keeps the Storage deletion behavior.
+                children = iter(budget.names(child) if budget is not None else os.listdir(child))
                 frames.append((name, (upper.st_dev, upper.st_ino),
-                               (observed.st_dev, observed.st_ino), entries))
+                               (observed.st_dev, observed.st_ino), info.st_uid, entries))
             except BaseException:
                 os.close(child)
                 raise
             os.close(current)
-            current, entries = child, children
+            current, current_info, entries = child, observed, children
     finally:
         os.close(current)
 
@@ -422,20 +497,33 @@ def kill_uid(uid):
         time.sleep(0.05)
 
 
-def sweep_scratch(uid):
-    for folder in ("/tmp", "/var/tmp", "/dev/shm", "/run", "/tmp/.X11-unix"):
-        try:
-            descriptor = open_directory(folder)
-        except FileNotFoundError:
-            continue
-        try:
-            for name in os.listdir(descriptor):
-                try:
-                    remove_at(descriptor, name, uid=uid)
-                except FileNotFoundError:
-                    pass
-        finally:
-            os.close(descriptor)
+def sweep_scratch(uid, clock=time.monotonic):
+    # All roots and retries share one deadline and enumeration budget.
+    budget = ScratchBudget(clock)
+    for _ in range(SCRATCH_SWEEP_PASSES):
+        changed = False
+        for folder in ("/tmp", "/var/tmp", "/dev/shm", "/run", "/tmp/.X11-unix"):
+            budget.check()
+            try:
+                descriptor = open_directory(folder)
+            except FileNotFoundError:
+                continue
+            try:
+                for name in budget.names(descriptor):
+                    try:
+                        remove_at(descriptor, name, uid=uid, budget=budget)
+                    except ScratchChanged:
+                        # Drop this top-level subtree's pinned descriptors;
+                        # finish other entries before retrying from the roots.
+                        changed = True
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(descriptor)
+        budget.check()
+        if not changed:
+            return
+    raise SeatFailure("cleanup_path_replaced")
 
 
 def rfb_endpoint_matches(path, directory, expected, uid):

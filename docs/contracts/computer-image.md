@@ -729,7 +729,9 @@ Removal keeps a generation-bound `removed` answer instead of deleting proof.
 If the image stops a Seat itself, it writes `failed` and its reason, with
 `cleanup_complete:true` only after cleanup succeeds. If cleanup fails, it
 writes `failed/cleanup_failed`, keeps that place blocked and retries cleanup
-after 30 seconds, doubling each failed retry up to 300 seconds. An
+after 30 seconds, doubling each failed retry up to 300 seconds. Scratch-walk
+exhaustion (`cleanup_scratch_budget`) and persistent foreign-folder changes
+(`cleanup_path_replaced`) use this same failure and retry path. An
 unexpected cleanup exception has the same per-place result, including during
 startup; it does not end other Seats. No new desktop starts in a blocked
 place. **Room returns only after positive cleanup evidence** for that
@@ -889,11 +891,33 @@ memory), and deletes the Seat folder. The scratch sweep walks `/tmp`,
 without following symlinks or crossing nested mounts (`st_dev`). It descends
 through folders owned by other uids, removes only entries owned by the ending
 Seat uid, and retains other uids' files and folders. An owned folder that still
-contains another uid's entries also stays. Owned symlinks are unlinked without
-touching their targets. Entries that disappear during cleanup are harmless;
-other cleanup errors produce `cleanup_failed` without positive
-`cleanup_complete` evidence. `/wefty/service/shared` is mode `1777`
-and survives. A new attempt has a fresh status tmpfs and control directory;
+contains another uid's entries also stays, but the supervisor transfers it
+to `0:0` through its no-follow directory descriptor before that place's uid
+can be reused. It explicitly restores all mode bits with `fchmod` after
+`fchown`, including sticky and setid bits that a chown can clear. The sweep
+tries `rmdir` once; `ENOTEMPTY` means retain, without rescanning the folder.
+Owned symlinks are unlinked without touching their targets. Owned entries
+that disappear during cleanup are harmless; other cleanup errors produce
+`cleanup_failed` without positive `cleanup_complete` evidence. One sweep has a
+**30-second monotonic deadline**
+and a **200,000-entry enumeration budget**, shared across all scratch roots
+and retries. Bounded enumeration also limits wide and deep foreign trees;
+exhaustion raises `cleanup_scratch_budget` and follows that same
+`failed/cleanup_failed` path without positive evidence. Checks surround
+bounded filesystem operations; they cannot preempt a blocked kernel call.
+
+If a folder owned by another uid changes type or identity during traversal,
+the supervisor drops that top-level subtree for the pass, finishes other
+entries and retries from all scratch roots, for at most **three passes**.
+Persistent changes raise `cleanup_path_replaced`. Changes to uid-owned paths
+still fail immediately with that token. Storage deletion (`uid=None`) keeps
+its original fail-closed handling of vanished entries during unlink, directory
+open and ascent. A live foreign Seat can move a file into an already-visited
+folder without changing that folder's identity; the sweep can miss that file.
+This live-writer race cannot be eliminated by a filesystem walk.
+
+`/wefty/service/shared` is mode `1777` and survives. A new attempt has a fresh
+status tmpfs and control directory;
 startup clears stale Seat folders and starts no Seat without a fresh directive.
 
 ### Temp space, install measurement and acceptance
