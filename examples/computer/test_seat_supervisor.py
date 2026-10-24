@@ -710,7 +710,7 @@ class ScratchWalkLimitsTest(unittest.TestCase):
         self.assertEqual(keep.read_text(), 'other Seat')
 
     def test_owned_vanish_retries_before_positive_evidence(self):
-        for phase in ('unlink', 'open', 'ascent', 'rmdir', 'parent', 'stat'):
+        for phase in ('unlink', 'open', 'ascent', 'rmdir', 'parent'):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory(dir=self.root) as d:
                 self.scratch = Path(d)
                 self.uid = 2001
@@ -769,6 +769,23 @@ class ScratchWalkLimitsTest(unittest.TestCase):
                 self.assertTrue(answer['cleanup_complete'])
                 self.assertEqual(len(passes), 2)
                 self.assertFalse(moved.exists())
+
+    def test_foreign_churn_before_stat_does_not_retry(self):
+        # Another busy Seat deletes short-lived files between listing and stat
+        # on every pass; that must not hold this Seat's cleanup.
+        (self.scratch / 'sem.churn').write_text('foreign')
+        real_stat = os.stat
+        hits = []
+
+        def churn(name, *args, **kwargs):
+            if name == 'sem.churn':
+                hits.append(1)
+                raise FileNotFoundError('deleted by another Seat')
+            return real_stat(name, *args, **kwargs)
+
+        with self.filesystem(), mock.patch.object(supervisor.os, 'stat', side_effect=churn):
+            supervisor.sweep_scratch(self.uid)
+        self.assertEqual(len(hits), 1)
 
     def test_owned_vanish_stops_after_three_passes(self):
         target = self.scratch / 'owned'

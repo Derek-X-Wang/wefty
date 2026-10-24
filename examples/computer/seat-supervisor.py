@@ -299,10 +299,8 @@ def remove_at(parent, name, uid=None, budget=None):
             try:
                 info = os.stat(name, dir_fd=current, follow_symlinks=False)
             except FileNotFoundError:
-                if uid is not None:
-                    # Ownership is unknown once it has vanished. It may have
-                    # moved into a folder this pass already visited.
-                    raise ScratchChanged() from None
+                # Owner unknown: other Seats' short-lived files vanish here all
+                # the time, and retrying on them would hold this Seat's room.
                 continue
             if uid is not None and info.st_dev != current_info.st_dev:
                 continue  # A nested mount is outside this scratch filesystem.

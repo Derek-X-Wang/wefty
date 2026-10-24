@@ -897,12 +897,12 @@ can be reused. After `fchown`, it uses `fchmod` to restore ordinary permission
 bits and sticky, with `S_ISUID|S_ISGID` masked out. The sweep tries `rmdir`
 once; `ENOTEMPTY` or `EEXIST` means retain, without rescanning the folder.
 Owned symlinks are unlinked without touching their targets. In uid mode,
-every observed disappearance triggers a new full pass: initial entry stat,
+every disappearance of an entry whose owner is known triggers a new full pass:
 directory open, unlink, ascent stat, opening `..`, or `rmdir`. An entry that
-vanishes before its owner can be read also triggers a retry, because it could
-belong to the ending uid. No such pass publishes positive cleanup evidence;
-other cleanup errors produce
-`cleanup_failed` without positive `cleanup_complete` evidence. One sweep has a
+vanishes before its owner can be read is skipped: other Seats' short-lived
+files vanish there constantly, and retrying on them would hold this Seat's
+room while another Seat stays busy. No pass that triggers a retry publishes
+positive cleanup evidence; other cleanup errors produce `cleanup_failed` without positive `cleanup_complete` evidence. One sweep has a
 **30-second monotonic deadline**
 and a **200,000-entry enumeration budget**, shared across all scratch roots
 and retries. Bounded enumeration also limits wide and deep foreign trees;
