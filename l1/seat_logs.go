@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS seat_logs (
  caller_identity TEXT NOT NULL DEFAULT '',
  credential_hash TEXT NOT NULL DEFAULT '',
  created_ns INTEGER NOT NULL,
+ ever_live INTEGER NOT NULL DEFAULT 0 CHECK(ever_live IN (0,1)),
  ended_ns INTEGER,
  reason TEXT NOT NULL DEFAULT '',
  read_ordinal INTEGER NOT NULL DEFAULT 0
@@ -145,11 +146,20 @@ func appendSeatEvent(ctx context.Context, q seatApprovalQuery, at time.Time, eve
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	if _, err = q.ExecContext(ctx, `INSERT INTO seat_logs(seat_id,created_ns) VALUES(?,?) ON CONFLICT DO NOTHING`, event.SeatID, at.UnixNano()); err != nil {
+	var exists bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_logs WHERE seat_id=?)`, event.SeatID).Scan(&exists); err != nil {
 		return err
+	}
+	if !exists {
+		return protocolError(contract.ErrorNotFound, "Seat log not found; a Seat request must create it first")
 	}
 	if _, err = q.ExecContext(ctx, `INSERT INTO seat_log_events(seat_id,event_id,event_json) VALUES(?,?,?)`, event.SeatID, event.EventID, data); err != nil {
 		return err
+	}
+	if event.Kind == SeatEventStarted {
+		if _, err := q.ExecContext(ctx, `UPDATE seat_logs SET ever_live=1 WHERE seat_id=?`, event.SeatID); err != nil {
+			return err
+		}
 	}
 	if event.Kind == SeatEventEnded || event.Kind == SeatEventRefused {
 		_, err = q.ExecContext(ctx, `UPDATE seat_logs SET ended_ns=COALESCE(ended_ns,?),reason=? WHERE seat_id=?`, at.UnixNano(), event.Reason, event.SeatID)
@@ -193,8 +203,8 @@ func authorizeSeatLog(ctx context.Context, q queryer, id, caller, secret string)
 	return protocolError(contract.ErrorForbidden, "Seat log belongs to another caller or credential")
 }
 
-// GetSeatLogs uses only a read snapshot. In particular, it never renews Seat
-// activity and never acknowledges data the caller has not printed yet.
+// GetSeatLogs uses only a read snapshot and never acknowledges unprinted data.
+// Follow polling does not renew Seat activity. #1146 owns one-time call activity.
 func (s *Store) GetSeatLogs(ctx context.Context, caller, id, secret, cursor string, limit int) (SeatLogPage, error) {
 	page := SeatLogPage{SeatID: id, Events: []SeatLogEvent{}}
 	n, err := parseSeatLogCursor(id, cursor)
@@ -211,10 +221,12 @@ func (s *Store) GetSeatLogs(ctx context.Context, caller, id, secret, cursor stri
 			return err
 		}
 		var ended sql.NullInt64
-		if err := q.QueryRowContext(ctx, `SELECT ended_ns,reason FROM seat_logs WHERE seat_id=?`, id).Scan(&ended, &page.Reason); err != nil {
+		var created int64
+		var everLive bool
+		if err := q.QueryRowContext(ctx, `SELECT created_ns,ended_ns,ever_live,reason FROM seat_logs WHERE seat_id=?`, id).Scan(&created, &ended, &everLive, &page.Reason); err != nil {
 			return err
 		}
-		if ended.Valid && !r.now().Before(time.Unix(0, ended.Int64).Add(DefaultComputerTakeoverAuditRetentionAge)) {
+		if seatLogRetentionExpired(r.now(), created, ended, everLive, s.computerTakeoverAuditRetentionAge) {
 			return protocolError(contract.ErrorNotFound, "Seat log retention ended")
 		}
 		page.Ended = ended.Valid
@@ -254,10 +266,12 @@ func (s *Store) MarkSeatLogRead(ctx context.Context, caller, id, secret, cursor 
 		return err
 	}
 	var ended sql.NullInt64
-	if err := w.tx.QueryRowContext(ctx, `SELECT ended_ns FROM seat_logs WHERE seat_id=?`, id).Scan(&ended); err != nil {
+	var created int64
+	var everLive bool
+	if err := w.tx.QueryRowContext(ctx, `SELECT created_ns,ended_ns,ever_live FROM seat_logs WHERE seat_id=?`, id).Scan(&created, &ended, &everLive); err != nil {
 		return err
 	}
-	if ended.Valid && !w.at.Before(time.Unix(0, ended.Int64).Add(DefaultComputerTakeoverAuditRetentionAge)) {
+	if seatLogRetentionExpired(w.at, created, ended, everLive, s.computerTakeoverAuditRetentionAge) {
 		return protocolError(contract.ErrorNotFound, "Seat log retention ended")
 	}
 	var maximum int64
@@ -271,4 +285,34 @@ func (s *Store) MarkSeatLogRead(ctx context.Context, caller, id, secret, cursor 
 		return err
 	}
 	return w.commit()
+}
+
+// Only request admission creates a log. Generic event writers cannot invent or
+// revive one after retention. The caller's request transaction owns this insert.
+func createSeatLog(ctx context.Context, q seatApprovalQuery, id string, at time.Time) error {
+	_, err := q.ExecContext(ctx, `INSERT INTO seat_logs(seat_id,created_ns) VALUES(?,?) ON CONFLICT DO NOTHING`, id, at.UnixNano())
+	return err
+}
+
+func seatLogRetentionExpired(at time.Time, created int64, ended sql.NullInt64, everLive bool, age time.Duration) bool {
+	if !everLive {
+		return !at.Before(time.Unix(0, created).Add(age))
+	}
+	return ended.Valid && !at.Before(time.Unix(0, ended.Int64).Add(age))
+}
+
+func (s *Store) pruneSeatLogs(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
+	cutoff := now.Add(-s.computerTakeoverAuditRetentionAge).UnixNano()
+	result, err := tx.ExecContext(ctx, `DELETE FROM seat_logs WHERE seat_id IN (
+ SELECT seat_id FROM seat_logs WHERE ever_live=1 AND ended_ns<=?
+ UNION ALL SELECT seat_id FROM seat_logs WHERE ever_live=0 AND created_ns<=?
+ )`, cutoff, cutoff)
+	if err != nil {
+		return 0, internalError(err, "prune Seat log retention")
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, internalError(err, "count pruned Seat logs")
+	}
+	return count, nil
 }

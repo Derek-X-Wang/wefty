@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -71,6 +72,10 @@ func (s *Server) seatCredentialProtocol(next, logs http.Handler) http.Handler {
 		path := "/v1/seats/" + id
 		if (r.Method == http.MethodGet && r.URL.Path == path+"/logs") || (r.Method == http.MethodPost && r.URL.Path == path+"/logs/read") {
 			logs.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/seats/") && (strings.HasSuffix(r.URL.Path, "/logs") || strings.HasSuffix(r.URL.Path, "/logs/read")) {
+			writeError(w, protocolError(contract.ErrorForbidden, "Seat credential belongs to another Seat log"))
 			return
 		}
 		if ended.Valid {

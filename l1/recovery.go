@@ -160,6 +160,10 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	// Take-over audit has its own age bound. This sweep is intentionally not
 	// nested in service attempt-summary retention, and the audit table has no
 	// cascading foreign key to attempts.
+	result.PrunedSeatLogs, err = s.pruneSeatLogs(ctx, tx, now)
+	if err != nil {
+		return ReconcileResult{}, err
+	}
 	result.PrunedComputerTakeoverAuditEvents, err = s.pruneComputerTakeoverAudit(ctx, tx, now)
 	if err != nil {
 		return ReconcileResult{}, err

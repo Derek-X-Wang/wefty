@@ -23,7 +23,7 @@
       "get": {
         "operationId": "getSeatLogs",
         "summary": "getSeatLogs",
-        "description": "The original caller or this Seat credential may read retained Seat events. A log read never keeps a Seat alive. After its end, the credential authorizes only its own retained log and read cursor.",
+        "description": "The original caller or this Seat credential may read retained Seat events. Follow polls never renew Seat activity; #1146 defines one-time log-call activity. After its end, the credential authorizes only its own retained log and read cursor.",
         "security": [
           {
             "fabricIdentity": []
@@ -102,7 +102,7 @@
       "post": {
         "operationId": "markSeatLogRead",
         "summary": "markSeatLogRead",
-        "description": "The original caller or this Seat credential may read retained Seat events. A log read never keeps a Seat alive. After its end, the credential authorizes only its own retained log and read cursor.",
+        "description": "The original caller or this Seat credential may read retained Seat events. Follow polls never renew Seat activity; #1146 defines one-time log-call activity. After its end, the credential authorizes only its own retained log and read cursor.",
         "security": [
           {
             "fabricIdentity": []
@@ -221,6 +221,7 @@
         "get": {
           "operationId": "getSeatCall",
           "summary": "getSeatCall",
+          "description": "Reports the current outcome and acknowledges its lifecycle-event prefix in the same fenced read/write view. Later events remain unread; repeated waits for the same acknowledged outcome stay read-only.",
           "responses": {
             "200": {
               "description": "Durable Seat request receipt.",

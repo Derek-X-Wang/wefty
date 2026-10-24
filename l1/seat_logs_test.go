@@ -73,8 +73,8 @@ func TestSeatLogLifecycleAndReadCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err = f.store.GetSeatCall(t.Context(), "cli", id)
-	if err != nil || result.UnreadEvents != 1 {
-		t.Fatalf("unread: %+v %v", result, err)
+	if err != nil || result.UnreadEvents != 0 {
+		t.Fatalf("reported refusal must acknowledge its outcome: %+v %v", result, err)
 	}
 	page, err = f.store.GetSeatLogs(t.Context(), "cli", id, "", page.NextCursor, 100)
 	if err != nil || !page.Ended || len(page.Events) != 1 || page.Reason != "denied by the owner" {
@@ -140,6 +140,19 @@ func TestSeatLogEndedCredentialScopeAndRetention(t *testing.T) {
 	status, body := send(http.MethodGet, "/v1/seats/"+id+"/logs")
 	if status != 200 || !strings.Contains(string(body), `"reason":"released"`) {
 		t.Fatalf("ended log: %d %s", status, body)
+	}
+	originalCaller := caller
+	caller = h.client(fabric.Identity{NodeID: "different-fabric-reader"})
+	if status, body := send(http.MethodGet, "/v1/seats/"+id+"/logs"); status != 200 {
+		t.Fatalf("authenticated bearer holder cannot read: %d %s", status, body)
+	}
+	caller = originalCaller
+	otherID := "seat_00000000000000000000000000000002"
+	if _, err := h.store.CreateSeatCall(t.Context(), "cli", SeatCallInput{SeatID: otherID, NodeID: node.NodeID, Harness: "test", Folder: "/workspace", Form: "any", Network: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	if status, body := send(http.MethodGet, "/v1/seats/"+otherID+"/logs"); status != 403 {
+		t.Fatalf("cross-Seat log request must be forbidden: %d %s", status, body)
 	}
 	for _, op := range []string{"command", "input", "copy", "screen"} {
 		status, body = send(http.MethodPost, "/v1/seats/"+id+"/"+op)
