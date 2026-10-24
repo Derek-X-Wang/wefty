@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 
 func TestTypedLogTargetsRealBinary(t *testing.T) {
 	binary := buildWefty(t)
-	for _, cmd := range []string{"logs", "cancel"} {
+	for _, cmd := range []string{"logs", "cancel", "inspect"} {
 		code, out := runWefty(t, binary, 30*time.Second, "--l1="+unusedAddress(t), "--l3=", cmd, "unknown_123")
 		if code != exitUsage || !strings.Contains(out, "unknown ID kind") {
 			t.Fatalf("%s: exit=%d %s", cmd, code, out)
@@ -49,6 +50,59 @@ func TestTypedLogTargetsRealBinary(t *testing.T) {
 	code, out = runWefty(t, binary, 30*time.Second, "--l1="+address, "--l3=", "logs", jobID)
 	if code != exitUsage || !strings.Contains(out, jobID+" is a Job ID for Run run_log") || !strings.Contains(out, "--l3") {
 		t.Fatalf("missing L3: exit=%d %s", code, out)
+	}
+}
+
+// A drain or status message names Job IDs; inspect reads the Job's Run, never
+// sending the Job ID to L3 as a Run ID (#1200).
+func TestTypedInspectTargetsRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	jobID := "job_" + strings.Repeat("c", 32)
+	noRunID := "job_" + strings.Repeat("d", 32)
+	var mu sync.Mutex
+	var runPaths []string
+	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/v1/jobs/"+jobID:
+			json.NewEncoder(w).Encode(map[string]any{"job_id": jobID, "spec": map[string]any{"labels": map[string]string{"run_id": "run_inspect"}}})
+		case r.URL.Path == "/v1/jobs/"+noRunID:
+			json.NewEncoder(w).Encode(map[string]any{"job_id": noRunID, "spec": map[string]any{}})
+		case strings.HasPrefix(r.URL.Path, "/v1/runs/"):
+			mu.Lock()
+			runPaths = append(runPaths, r.URL.Path)
+			mu.Unlock()
+			http.NotFound(w, r)
+		default:
+			t.Errorf("unexpected request %s", r.URL)
+			http.NotFound(w, r)
+		}
+	})
+	code, out := runWefty(t, binary, 30*time.Second, "--l1="+address, "--l3="+address, "inspect", jobID)
+	if code == 0 || strings.Contains(out, "is a Job ID") {
+		t.Fatalf("resolved Job: exit=%d %s", code, out)
+	}
+	mu.Lock()
+	paths := append([]string(nil), runPaths...)
+	mu.Unlock()
+	if len(paths) == 0 || paths[0] != "/v1/runs/run_inspect" {
+		t.Fatalf("inspect %s read runs %v, want /v1/runs/run_inspect first", jobID, paths)
+	}
+	for _, path := range paths {
+		if strings.Contains(path, "job_") {
+			t.Fatalf("Job ID sent to L3 as a Run ID: %v", paths)
+		}
+	}
+	code, out = runWefty(t, binary, 30*time.Second, "--l1="+address, "--l3="+address, "inspect", noRunID)
+	if code != exitUsage || !strings.Contains(out, noRunID+" is a Job ID") || !strings.Contains(out, "no run_id label") {
+		t.Fatalf("missing Run label: exit=%d %s", code, out)
+	}
+	code, out = runWefty(t, binary, 30*time.Second, "--l1="+address, "--l3=", "inspect", jobID)
+	if code != exitUsage || !strings.Contains(out, jobID+" is a Job ID for Run run_inspect") || !strings.Contains(out, "--l3") {
+		t.Fatalf("missing L3: exit=%d %s", code, out)
+	}
+	code, out = runWefty(t, binary, 30*time.Second, "--l1="+unusedAddress(t), "--l3=", "inspect", "seat_"+strings.Repeat("e", 32))
+	if code != exitUsage || !strings.Contains(out, "inspect received a Seat ID") {
+		t.Fatalf("Seat ID: exit=%d %s", code, out)
 	}
 }
 

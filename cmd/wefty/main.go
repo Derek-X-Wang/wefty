@@ -533,7 +533,7 @@ Commands:
                              Block until a run is terminal; exit 10 if it failed, 11 on timeout
   results RUN_ID [--out FILE]
                              Read the result document the run uploaded
-  inspect RUN_ID [--execution] [--include-script]
+  inspect RUN_ID|JOB_ID [--execution] [--include-script]
                              Show run lineage, with optional L1 execution diagnostics
   JSON run records omit inline script content, keeping sha256, size_bytes, and
   content_omitted=true. --include-script restores content on wait, inspect,

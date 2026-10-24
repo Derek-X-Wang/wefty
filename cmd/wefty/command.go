@@ -10,8 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -301,9 +299,25 @@ func executeInspect(ctx context.Context, clients *apiClients, jsonOutput bool, a
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty inspect RUN_ID [--execution] [--include-script]")
+		return usageError("usage: wefty inspect RUN_ID|JOB_ID [--execution] [--include-script]")
 	}
 	runID := flags.Arg(0)
+	kind, err := parseTargetID(runID, targetRun)
+	if err != nil {
+		return err
+	}
+	switch kind {
+	case targetSeat:
+		return usageError("inspect received a Seat ID; inspect accepts Run IDs and Job IDs; read a Seat's log with wefty logs SEAT_ID")
+	case targetJob:
+		jobID := runID
+		if runID, err = resolveJobRun(ctx, clients, jobID); err != nil {
+			return err
+		}
+		if clients.l3 == nil || clients.l3.client == nil {
+			return usageError(fmt.Sprintf("%s is a Job ID for Run %s; configure --l3 to inspect it", jobID, runID))
+		}
+	}
 	root, err := clients.getRun(ctx, runID)
 	if err != nil {
 		return err
@@ -623,14 +637,9 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return executeSeatLogs(ctx, clients, jsonOutput, runID, requestedCursor, limit, tail, tailSet, follow, all, pollInterval, stdout, stderr)
 	}
 	if kind == targetJob {
-		var job l1.Job
-		if err := clients.l1.do(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(runID), nil, nil, &job, http.StatusOK); err != nil {
-			return err
-		}
 		jobID := runID
-		runID = strings.TrimSpace(job.Spec.Labels["run_id"])
-		if runID == "" {
-			return usageError(fmt.Sprintf("%s is a Job ID; its Run cannot be resolved because the Job has no run_id label", jobID))
+		if runID, err = resolveJobRun(ctx, clients, jobID); err != nil {
+			return err
 		}
 		if clients.l3 == nil || clients.l3.client == nil {
 			return usageError(fmt.Sprintf("%s is a Job ID for Run %s; configure --l3 to read its log", jobID, runID))
