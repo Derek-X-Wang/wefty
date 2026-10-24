@@ -783,12 +783,12 @@ func writeRunLogPageNotice(ctx context.Context, clients *apiClients, stderr io.W
 	if page.NextCursor == "" {
 		return nil
 	}
-	notice := fmt.Sprintf("wefty: log read may be partial; resume with --cursor %s or use --all for every retained event", page.NextCursor)
+	notice := fmt.Sprintf("wefty: log read may be partial; resume with --cursor %s, use --tail 50 for the end, or use --all for every retained event", page.NextCursor)
 	ctx = withoutClientRetry(ctx)
 	probe, err := clients.getRunLogs(ctx, runID, page.NextCursor, 1)
 	if err == nil {
 		if len(probe.Events) > 0 {
-			notice = fmt.Sprintf("wefty: more log events exist; resume with --cursor %s or use --all", page.NextCursor)
+			notice = fmt.Sprintf("wefty: more log events exist; resume with --cursor %s, use --tail 50 for the end, or use --all", page.NextCursor)
 		} else if run, err := clients.getRun(ctx, runID); err == nil {
 			if isTerminalRun(run.Status) {
 				return nil

@@ -72,7 +72,7 @@ func TestRunLogsPaging(t *testing.T) {
 		t.Fatalf("cursor did not continue: %s error=%v", secondJSON, err)
 	}
 	out, notice := read(false)
-	if out != "first event\n" || notice != "wefty: more log events exist; resume with --cursor 1 or use --all\n" {
+	if out != "first event\n" || notice != "wefty: more log events exist; resume with --cursor 1, use --tail 50 for the end, or use --all\n" {
 		t.Fatalf("plain page/notice: stdout=%q stderr=%q", out, notice)
 	}
 	out, notice = read(false, "--cursor", "2")
@@ -118,7 +118,7 @@ func TestRunLogsPagingStderrNotice(t *testing.T) {
 }
 
 func TestRunLogsPlainPageNotice(t *testing.T) {
-	fallback := "wefty: log read may be partial; resume with --cursor next-page or use --all for every retained event\n"
+	fallback := "wefty: log read may be partial; resume with --cursor next-page, use --tail 50 for the end, or use --all for every retained event\n"
 	for _, test := range []struct {
 		name        string
 		status      contract.RunState
@@ -129,7 +129,7 @@ func TestRunLogsPlainPageNotice(t *testing.T) {
 	}{
 		{name: "whole log terminal succeeded", status: contract.RunSucceeded},
 		{name: "whole log terminal failed", status: contract.RunFailed},
-		{name: "more events", more: true, wantNotice: "wefty: more log events exist; resume with --cursor next-page or use --all\n"},
+		{name: "more events", more: true, wantNotice: "wefty: more log events exist; resume with --cursor next-page, use --tail 50 for the end, or use --all\n"},
 		{name: "still running", status: contract.RunRunning, wantNotice: "wefty: run is still running; more log events may follow; use --follow --cursor next-page\n"},
 		{name: "still queued", status: contract.RunQueued, wantNotice: "wefty: run is still queued; more log events may follow; use --follow --cursor next-page\n"},
 		{name: "probe error", probeError: true, wantNotice: fallback},

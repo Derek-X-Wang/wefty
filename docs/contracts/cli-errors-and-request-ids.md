@@ -120,11 +120,11 @@ consecutive retries before returning the last answer.
 page (default 200); the read cutoff may return fewer. `--cursor CURSOR`
 continues after a previous page's `next_cursor`, including with `--follow`.
 A nonempty plain page probes the next cursor with limit 1. If more events
-exist, stderr says `wefty: more log events exist; resume with --cursor CURSOR or use --all`.
+exist, stderr says `wefty: more log events exist; resume with --cursor CURSOR, use --tail 50 for the end, or use --all`.
 If the probe is empty, the CLI reads the run status. A non-terminal run says
 `wefty: run is still STATUS; more log events may follow; use --follow --cursor CURSOR`.
 A terminal run has no paging notice. If either read fails, stderr says
-`wefty: log read may be partial; resume with --cursor CURSOR or use --all for every retained event`.
+`wefty: log read may be partial; resume with --cursor CURSOR, use --tail 50 for the end, or use --all for every retained event`.
 These extra reads cannot fail the command. Stdout stays as log bytes.
 An empty initial page has no paging notice.
 One-page `--json` keeps the existing page object, including `next_cursor`.
