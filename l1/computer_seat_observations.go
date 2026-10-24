@@ -166,7 +166,7 @@ func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, 
 		final := lifecycleErr == nil && value.State != SeatStarting && value.State != SeatLive
 		if expired || final {
 			if expired {
-				if err := setSeatLifecycle(ctx, tx, seat.SeatID, SeatRefused, "Seat readiness deadline exceeded"); err != nil {
+				if err := setSeatLifecycle(ctx, tx, seat.SeatID, SeatRefused, "Seat readiness deadline exceeded", write.at); err != nil {
 					return ComputerSeatList{}, err
 				}
 			}
@@ -182,7 +182,7 @@ func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, 
 				if value.State == SeatStarting {
 					state = SeatRefused
 				}
-				if err := setSeatLifecycle(ctx, tx, seat.SeatID, state, "the Computer restarted"); err != nil {
+				if err := setSeatLifecycle(ctx, tx, seat.SeatID, state, "the Computer restarted", write.at); err != nil {
 					return ComputerSeatList{}, err
 				}
 			}

@@ -468,3 +468,22 @@ independently of pruned call receipts.
 The final JSON result names `credential_file`; text output names the same file.
 This storage does not grant socket access or any approval. A sandbox that
 blocks the wefty socket stays refused under the client-service contract.
+
+## Seat logs and typed IDs (#1145)
+
+`wefty logs ID` and `wefty cancel ID` share prefix parsing. An unknown
+underscore ID kind returns `invalid_request`, exit 2, before a network call.
+Cancel accepts Job and Run IDs; a Seat ID receives a typed usage refusal.
+Legacy opaque and hyphenated handles retain their existing command meaning.
+A Job log target resolves `spec.labels.run_id`; an unresolvable Job gives a
+typed usage answer naming the Job, and a missing L3 configuration names its
+Run. It is never sent to L3 as though the Job ID were a Run ID.
+
+An ended Seat credential may read only its own retained log and acknowledge
+its read cursor. Every other operation returns `seat_ended`, HTTP 409 and
+CLI exit 5, with the end reason. This uses the existing typed-exit whitelist.
+An invalid credential returns `forbidden`; a credential cannot read another
+Seat's log. Before pruning, an expired log returns `not_found`; pruning
+removes the credential digest too, so that credential then returns
+`forbidden`. See [Seat logs](seat-logs.md) for cursor, unread-event,
+credential-scope and retention rules.

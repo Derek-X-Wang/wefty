@@ -27,7 +27,14 @@ func executeCancel(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	}
 	args = flags.Args()
 
-	if strings.HasPrefix(args[0], "run_") || strings.HasPrefix(args[0], "run-") {
+	kind, err := parseTargetID(args[0], targetJob)
+	if err != nil {
+		return err
+	}
+	if kind == targetSeat {
+		return usageError("cancel received a Seat ID; cancel accepts Job IDs and Run IDs")
+	}
+	if kind == targetRun {
 		if clients.l3.address == "" {
 			return usageError("this command requires --l3, which is not configured")
 		}
@@ -48,7 +55,7 @@ func executeCancel(ctx context.Context, clients *apiClients, jsonOutput bool, ar
 	if jsonOutput {
 		return writeJSON(stdout, job)
 	}
-	_, err := fmt.Fprintf(stdout, "JOB ID\tSTATE\tOUTCOME\n%s\t%s\t%s\n", job.JobID, job.State, job.Outcome)
+	_, err = fmt.Fprintf(stdout, "JOB ID\tSTATE\tOUTCOME\n%s\t%s\t%s\n", job.JobID, job.State, job.Outcome)
 	return err
 }
 

@@ -529,7 +529,11 @@ func (s *Server) routes() http.Handler {
 	credential.HandleFunc("POST /v1/jobs/{job_id}/cancel", s.cancelJob)
 	credential.HandleFunc("/", s.attemptCredentialOutOfScope)
 
+	seatLogs := http.NewServeMux()
+	seatLogs.HandleFunc("GET /v1/seats/{seat_id}/logs", s.getSeatLogs)
+	seatLogs.HandleFunc("POST /v1/seats/{seat_id}/logs/read", s.markSeatLogRead)
 	root := http.NewServeMux()
+	root.Handle("/v1/seats/", s.authorize(clientPrincipal, seatLogs))
 	root.Handle("/v1/seat-requests", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/seat-requests/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/seat-approval-windows", s.authorize(clientPrincipal, client))
@@ -559,7 +563,7 @@ func (s *Server) routes() http.Handler {
 	root.Handle("/v1/admin-policy", s.authorize(personPrincipal, person))
 	root.Handle("/v1/admin-policy/", s.authorize(personPrincipal, person))
 	root.Handle("/v1/whoami", s.authorize(personPrincipal, person))
-	return s.observeInternalErrors(root)
+	return s.observeInternalErrors(s.seatCredentialProtocol(root, seatLogs))
 }
 
 func (s *Server) proveServiceBinding(w http.ResponseWriter, r *http.Request) {

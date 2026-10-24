@@ -10,6 +10,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -593,7 +595,7 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return flagUsageError(err)
 	}
 	if flags.NArg() != 1 {
-		return usageError("usage: wefty logs RUN_ID [--all | [--tail N] [--follow]] [--cursor CURSOR]")
+		return usageError("usage: wefty logs RUN_ID|SEAT_ID|JOB_ID [--all | [--tail N] [--follow]] [--cursor CURSOR]")
 	}
 	if limit < 1 || limit > l1.MaxLogPageLimit {
 		return usageError(fmt.Sprintf("--limit must be between 1 and %d", l1.MaxLogPageLimit))
@@ -613,6 +615,27 @@ func executeLogs(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		return usageError("--all prints every retained event once; it cannot follow")
 	}
 	runID := flags.Arg(0)
+	kind, err := parseTargetID(runID, targetRun)
+	if err != nil {
+		return err
+	}
+	if kind == targetSeat {
+		return executeSeatLogs(ctx, clients, jsonOutput, runID, requestedCursor, limit, tail, tailSet, follow, all, pollInterval, stdout, stderr)
+	}
+	if kind == targetJob {
+		var job l1.Job
+		if err := clients.l1.do(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(runID), nil, nil, &job, http.StatusOK); err != nil {
+			return err
+		}
+		jobID := runID
+		runID = strings.TrimSpace(job.Spec.Labels["run_id"])
+		if runID == "" {
+			return usageError(fmt.Sprintf("%s is a Job ID; its Run cannot be resolved because the Job has no run_id label", jobID))
+		}
+		if clients.l3 == nil || clients.l3.client == nil {
+			return usageError(fmt.Sprintf("%s is a Job ID for Run %s; configure --l3 to read its log", jobID, runID))
+		}
+	}
 	walking := all || tailSet
 	if follow || walking {
 		// Like service logs, these loops own their retry interval and bound;

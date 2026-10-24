@@ -8,6 +8,155 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/seats/{seat_id}/logs": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getSeatLogs",
+        "summary": "getSeatLogs",
+        "description": "The original caller or this Seat credential may read retained Seat events. A log read never keeps a Seat alive. After its end, the credential authorizes only its own retained log and read cursor.",
+        "security": [
+          {
+            "fabricIdentity": []
+          },
+          {
+            "fabricIdentity": [],
+            "seatCredential": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Seat log read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatLogPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        },
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 200
+            }
+          }
+        ]
+      }
+    },
+    "/v1/seats/{seat_id}/logs/read": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "markSeatLogRead",
+        "summary": "markSeatLogRead",
+        "description": "The original caller or this Seat credential may read retained Seat events. A log read never keeps a Seat alive. After its end, the credential authorizes only its own retained log and read cursor.",
+        "security": [
+          {
+            "fabricIdentity": []
+          },
+          {
+            "fabricIdentity": [],
+            "seatCredential": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Seat log read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatLogRead"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatLogRead"
+              }
+            }
+          }
+        }
+      }
+    },
       "/v1/seat-requests": {
         "post": {
           "operationId": "createSeatCall",
@@ -2254,6 +2403,7 @@
   },
   "components": {
     "securitySchemes": {
+      "seatCredential": { "type": "apiKey", "in": "header", "name": "X-Wefty-Seat-Credential" },
       "fabricIdentity": { "$ref": "./common.v1.json#/components/securitySchemes/fabricIdentity" },
       "attemptCredential": { "$ref": "./common.v1.json#/components/securitySchemes/attemptCredential" }
     }

@@ -1275,10 +1275,13 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
 -- log_events at read time since #49, and nothing read the table (#52).
 DROP TABLE IF EXISTS job_log_jsonl;
 `
-	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema+seatCallSchema); err != nil {
+	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema+seatCallSchema+seatLogSchema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
 	if err := s.migrateSeatLifecycle(ctx); err != nil {
+		return err
+	}
+	if err := s.migrateSeatLogs(ctx); err != nil {
 		return err
 	}
 	if err := s.migrateSeatCalls(ctx); err != nil {
@@ -2960,7 +2963,7 @@ func (s *Store) registerNode(ctx context.Context, identity fabric.Identity, regi
 		return Node{}, internalError(err, "store node registration")
 	}
 	if storedBoot != "" && storedBoot != registration.BootSessionID {
-		if err := refuseLostSeatDialogs(ctx, tx, registration.NodeID, registration.BootSessionID); err != nil {
+		if err := refuseLostSeatDialogs(ctx, tx, registration.NodeID, registration.BootSessionID, now); err != nil {
 			return Node{}, err
 		}
 	}
@@ -4835,7 +4838,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 		// Ordinary sweeps permit bounded cgroup retention. Only the exact
 		// strict Computer proof may release Seat memory at completion.
 		if request.RuntimeQuiescenceEvidence == RuntimeQuiescenceComputerAttemptAbsent {
-			if err := cleanComputerSeatAttempt(ctx, tx, computerID, attemptID); err != nil {
+			if err := cleanComputerSeatAttempt(ctx, tx, computerID, attemptID, now); err != nil {
 				return CompletionOutcome{}, err
 			}
 			if err := releaseAbsentComputerAttemptRoom(ctx, tx, computerID, attemptID); err != nil {

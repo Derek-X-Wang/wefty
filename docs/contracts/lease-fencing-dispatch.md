@@ -533,6 +533,11 @@ Each change is still applied on the pass that observes it.
 
 ## Log retention
 
+Seat event logs have a separate 90-day lifetime and never contain program
+output. See [Seat logs](seat-logs.md) for the shared take-over record, ended
+credential scope and read cursors.
+
+
 L1 bounds the log bytes it keeps; the job record (spec, status, attempts,
 result) is not a log and is not trimmed by these bounds. Every bound is an L1
 flag, measured in raw payload bytes (`LENGTH(bytes)`, not the stored JSON):

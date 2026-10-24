@@ -155,6 +155,17 @@ the macOS temp folder.
 If the sandbox blocks the wefty socket, stop and ask the owner; Seats add no
 socket allowance.
 
+Read a Seat's own events with `wefty logs SEAT_ID`, or follow with
+`wefty logs SEAT_ID --follow`. `--cursor` and `--tail N` work as for Runs.
+A follow stops when the Seat ends and finishes with the reason; it does not
+keep the Seat alive. The credential can still read that Seat's log for 90
+days after its end, while commands, input, copies and screen calls are refused.
+A Seat reply adds `N new Seat event(s): wefty logs SEAT_ID` only when unread
+events exist. Reading the log advances the credential's read cursor; an
+older cursor does not move it backward. Successful JSON replies carry
+`unread_events` and a nonempty `unread_events_line` when there are new events;
+typed refusals include the hint in their message.
+
 ## One command with local changes: `wefty exec`
 
 Use `exec` for one build, test, or other command in your current Git checkout.

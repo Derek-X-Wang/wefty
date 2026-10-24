@@ -170,14 +170,16 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 				return err
 			}
 			result.Credential = ""
-			if jsonOutput {
-				return writeJSON(stdout, struct {
-					l1.SeatCallResult
-					CredentialFile string `json:"credential_file"`
-				}{result, path})
-			}
-			_, err = fmt.Fprintf(stdout, "Seat %s ready on %s; credential stored in %s\n", id, result.ComputerID, path)
-			return err
+			return withSeatReply(stdout, jsonOutput, id, result.UnreadEvents, func(output io.Writer) error {
+				if jsonOutput {
+					return writeJSON(output, struct {
+						l1.SeatCallResult
+						CredentialFile string `json:"credential_file"`
+					}{result, path})
+				}
+				_, err = fmt.Fprintf(output, "Seat %s ready on %s; credential stored in %s\n", id, result.ComputerID, path)
+				return err
+			})
 		case l1.SeatRefused, l1.SeatEnded, l1.SeatEnding:
 			if result.CleanupPending {
 				if cleanupDeadline.IsZero() {
@@ -195,10 +197,12 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 				outcome.APIError.Message += "; cleanup still pending; L1 continues cleanup; check again with wefty seat wait " + id
 				outcome.APIError.Details["cleanup_pending"] = true
 			}
-			return outcome
+			return withSeatReply(stdout, jsonOutput, id, result.UnreadEvents, func(output io.Writer) error { return outcome })
 		}
 		if err := wait(ctx, 250*time.Millisecond); err != nil {
-			return fmt.Errorf("Seat request %s still recorded; wait again with wefty seat wait %s: %w", id, id, err)
+			return withSeatReply(stdout, jsonOutput, id, result.UnreadEvents, func(io.Writer) error {
+				return fmt.Errorf("Seat request %s still recorded; wait again with wefty seat wait %s: %w", id, id, err)
+			})
 		}
 	}
 }
