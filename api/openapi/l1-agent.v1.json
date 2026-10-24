@@ -117,6 +117,67 @@
           }
         }
       },
+    "/v1/agent/nodes/{node_id}/generations/de-enroll": {
+      "parameters": [
+        {
+          "name": "node_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "deEnrollNodeGeneration",
+        "summary": "Return a quiet, drained generation node to legacy registration authority",
+        "description": "Node-bound agent principal only. Admission must be closed for this exact operation. The transaction verifies primary, boot, authority, catalog, intent, closed older generations and settled Attempts. Positive local reap and evidence are attested by the primary private adapter. Success revokes the old boot and preserves closed history. The unchanged legacy-registration guard still fences every enrolled primary. Identical replay returns its original result, including after legacy registration; changed payload refuses. Only HTTP 409 de_enrollment_not_committed with matching details.node_id, operation_id and request_sha256 proves a terminal rejection: L1 consults the exact operation ledger, finds no committed result, and durably records the rejection before replying. request_sha256 is sha256: followed by the lowercase hex digest of the canonical decoded DeEnrollNodeGenerationRequest JSON (Go field order, no whitespace or trailing newline, including both evidence flags). Identical rejected replay remains rejected even if its fences later clear; changed payload gets generic conflict, which proves no outcome. Authentication/authorization, malformed request, routing and generic errors may occur before the ledger and must retain the attestation for exact replay.",
+        "responses": {
+          "200": {
+            "description": "Durable de-enrollment inventory; every generation is closed. The old primary boot has been revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/NodeGenerationInventory"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "de_enrollment_not_committed is a terminal post-ledger rejection only when non-retryable and details bind the exact node, operation ID and canonical request SHA-256. L1 commits this negative outcome in the existing de-enrollment operation ledger without changing generation authority. A generic conflict (including changed-payload replay) provides no such proof and remains uncertain.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/DeEnrollNodeGenerationRequest"
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-attempt-absence": {
       "parameters": [
         {

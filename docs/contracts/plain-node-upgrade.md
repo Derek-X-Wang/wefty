@@ -429,8 +429,9 @@ Without it, upgrade keeps the existing drain, interruption, output and recovery
 path above. Enabling rolling by default later requires removing the
 `requestRolling` opt-in branch, retaining the gate and every activation check.
 `--yes` does not override compatibility or interrupt preserved one-shots on
-this path. Setup, remove and default upgrade still refuse retained catalogs
-until generation-aware maintenance is available.
+this path. Ordinary setup and default upgrade still refuse retained catalogs.
+Conversion and removal accept only the validated quiet catalog described below;
+active retirement and unresolved rolling recovery still refuse maintenance.
 
 All four candidate binaries must accept the active plain profile through the
 read-only `--profile-preflight --plain` entry point before admission changes.
@@ -784,3 +785,49 @@ If that adapter cannot answer, the installation needs operator repair:
    Replacement of an inaccessible generation requires a separately reviewed,
    generation-aware offline repair. This bounded protocol provides no authority
    to fabricate a promotion or force a database downgrade.
+
+
+### Quiet-catalog conversion and removal (#1229)
+
+Only conversion and removal accept a quiet generation catalog; ordinary setup,
+default upgrade and fleet upgrade retain their existing generation guards.
+See [installation maintenance](installation-service-plan.md) for the exact quiet
+predicate, descriptor-relative cleanup and preservation rules. `--rolling`
+remains opt-in. No retiree has a deadline.
+
+| Durable maintenance boundary | Retry behavior |
+| --- | --- |
+| Maintenance intent, before admission CAS | Keep the recorded primary; replay only the saved admission intent. |
+| Admission closed, service barrier started | Complete the exact barrier; a recoverable refusal restores owned service/admission intent without stopping the primary. |
+| Restoration intent, service barrier settled/resumed | Replay only unfinished restoration actions; saved resume success precedes admission restoration, so a CAS fault cannot strand the old service operation. |
+| De-enrollment request recorded | Resolve only that operation. Ambiguity retains closed admission; no guessed rollback. |
+| Agent attestation saved, L1 result lost | Installed pre-start recovery replays the same authenticated request and persists the original L1 result; no registration or payload starts. |
+| De-enrollment result durable | Forward only; never reload a legacy boot as rollback. |
+| Primary unloaded, cleanup not started | Reconfirm unload; acquire the same generation directory's lifetime lock before deleting installation files. |
+| Cleanup receipt saved, any owned file removed | Verify every remaining file against the receipt and continue exact unlinks. Unknown files and shared data remain. |
+| Catalog directory renamed, CLI result not saved | Find the derived archive, verify its recorded device/inode, and finish forward. |
+| Catalog retired, legacy removal incomplete | Resume legacy removal from retained maintenance intent even if profile or manifest removal already occurred. |
+| Before attestation, same primary registers a replacement boot | Verify unchanged generation, exact readiness/process/lifetime binding; persist precommit restoration, recover the old service queue and owned admission, then begin a fresh operation. |
+| After attestation, replacement binding differs without an outcome | Strict conflict; resolve the exact attested request first. |
+| Startup gets exact-request `de_enrollment_not_committed` proof from the post-ledger handler | Publish exact-request rejection before removing attestation; register the primary normally; CLI restores precommit state and preserves newer operator intent. |
+| Startup gets authentication, routing, malformed/generic error, mismatched proof, transport or retryable failure | Keep attestation and admission fenced; retry the same payload. |
+| Request publication fails before replacement | Read back the old journal; restore services and owned admission. |
+| Request publication may have succeeded | Read back and retain the exact request; unreadable state stays fenced; re-publish durably before the next RPC. |
+| Incomplete purge, then another purge after journal completion | Durable preservation policy still protects SQLite, node-agent evidence/custody and generation history. |
+| Conversion stopped before `history` | Restore the recorded generation and the existing reversible dataset/service/admission protocol. |
+| Conversion `history` durable, catalog still active | Never restore local authority; retire only the stopped recorded generation, then continue fleet join. |
+| Conversion catalog retired, join incomplete | Resume the existing join record. The local authority remains read-only history. |
+
+| Condition | Classification |
+| --- | --- |
+| Retiring, pending, staged, unresolved rolling operation, missing positive closure | Typed maintenance refusal; exit 5; no file or launchd mutation. |
+| De-enrollment identity/admission/catalog/reap/evidence fence fails | Typed L1 conflict; exit 5; transaction changes nothing. |
+| Catalog/receipt stat, open, permission, I/O or JSON decode failure | Operational failure; exit 1; cause retained. |
+| Manager, transport or persistence failure | Operational failure; exit 1; exact durable intent retained for retry. |
+
+Same-ID plain reinstall is supported after generation-aware removal because L1
+has positively de-enrolled the old generation and revoked its boot. Conversion
+needs no de-enrollment: join registration targets the fleet control plane, not
+the old local L1. Catalog snapshots and audit receipts in generation history are
+installation evidence only; they never authorize process adoption, first
+completion or legacy registration by themselves.

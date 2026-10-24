@@ -371,3 +371,9 @@ func (c *Client) HeartbeatRetiringGeneration(ctx context.Context, nodeID, genera
 func (c *Client) CloseRetiringGeneration(ctx context.Context, nodeID, generationID string, request l1.CloseNodeGenerationRequest) error {
 	return c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations/"+url.PathEscape(generationID)+"/close", request, nil)
 }
+
+func (c *Client) DeEnrollNodeGeneration(ctx context.Context, nodeID string, request l1.DeEnrollNodeGenerationRequest) (l1.NodeGenerationInventory, error) {
+	var inventory l1.NodeGenerationInventory
+	err := c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations/de-enroll", request, &inventory)
+	return inventory, err
+}

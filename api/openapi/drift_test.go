@@ -91,6 +91,8 @@ var driftRows = []driftRow{
 	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/poll", "200"), typeOf[l1.SeatCallList]()},
 	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/advance"), typeOf[l1.SeatCallPoll]()},
 	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/advance", "200"), typeOf[l1.SeatRequest]()},
+	{requestBody(agentDoc, "post", "/v1/agent/nodes/{node_id}/generations/de-enroll"), typeOf[l1.DeEnrollNodeGenerationRequest]()},
+	{responseBody(agentDoc, "post", "/v1/agent/nodes/{node_id}/generations/de-enroll", "200"), typeOf[l1.NodeGenerationInventory]()},
 	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/read"), typeOf[l1.SeatNodeRequest]()},
 	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/read", "200"), typeOf[l1.SeatRequest]()},
 	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/reserve-room"), typeOf[l1.SeatRoomReservationRequest]()},
