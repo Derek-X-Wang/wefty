@@ -124,7 +124,7 @@ func newRemovalController(
 	controller.stallBound = l1.DefaultRemovalStallBound
 	if session != nil {
 		controller.reapService = session.reapServiceForRemoval
-		controller.clearReap = session.clearRuntimeReap
+		controller.clearReap = session.completeServiceRemoval
 	}
 	if managed != nil {
 		controller.removeResource = managed.remove

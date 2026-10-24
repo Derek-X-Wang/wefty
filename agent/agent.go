@@ -754,6 +754,8 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 	var allowsStart func(contract.JobSpec) bool
 	var computerPolicy *ComputerPolicyCache
 	var retirementEvidence func(string, func(context.Context) (bool, error))
+	var upgradeEvidence func(string, func(context.Context) error)
+	var upgradeRuntime func(string, func(context.Context) (workloadrunner.ReapReceipt, error))
 	if a.capabilities != nil {
 		allowsStart = a.capabilities.allows
 	}
@@ -761,6 +763,8 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		computerPolicy = a.session.computerPolicy
 		if a.registration.AgentGenerationID != "" {
 			retirementEvidence = a.session.trackRetirementEvidence
+			upgradeEvidence = a.session.trackUpgradeServiceEvidence
+			upgradeRuntime = a.session.trackUpgradeServiceRuntime
 		}
 	}
 	return newAttemptLifecycle(attemptLifecycleDependencies{
@@ -785,6 +789,9 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		runtimeReaped:           a.recordRuntimeReap,
 		keepCompletionAuthority: a.registration.AgentGenerationID != "",
 		retirementEvidence:      retirementEvidence,
+		upgradeEvidence:         upgradeEvidence,
+		upgradeRuntime:          upgradeRuntime,
+		verifyStoppedService:    a.verifyStoppedUpgradeService,
 		attemptDeadman:          a.attemptDeadman,
 		computerTokens:          a.computerTokens,
 		computerControlTokens:   a.computerControlTokens,

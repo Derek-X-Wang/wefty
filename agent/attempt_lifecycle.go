@@ -79,6 +79,9 @@ func (disabledAttemptWatch) Stop()                  {}
 type attemptLifecycleDependencies struct {
 	keepCompletionAuthority bool
 	retirementEvidence      func(string, func(context.Context) (bool, error))
+	upgradeEvidence         func(string, func(context.Context) error)
+	upgradeRuntime          func(string, func(context.Context) (workloadrunner.ReapReceipt, error))
+	verifyStoppedService    func(context.Context, l1.Claim) (workloadrunner.ReapReceipt, error)
 	client                  *Client
 	runtimes                workloadRuntimeSet
 	outbox                  *evidenceOutbox
@@ -473,6 +476,9 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	executionContext, cancelExecution := context.WithCancel(attemptContext)
 	defer cancelExecution()
 	attemptID := claim.Lease.AttemptID
+	if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess {
+		lifecycle.dependencies.upgradeEvidence(attemptID, func(ctx context.Context) error { return lifecycle.recoverUpgradeServiceEvidence(ctx, claim) })
+	}
 	if lifecycle.dependencies.retirementEvidence != nil {
 		if lifecycle.dependencies.outbox != nil {
 			lifecycle.dependencies.outbox.trackRetirementCompletion(attemptID, &lifecycle.completionAccepted)
@@ -481,6 +487,10 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		// The outbox transfers acceptance into this lifecycle at delivery;
 		// pending publication stays a live query until it too has settled.
 		var proofMu sync.Mutex
+		upgradeEvidence, upgradeRuntime := lifecycle.dependencies.upgradeEvidence, lifecycle.dependencies.upgradeRuntime
+		if claim.Job.Spec.Class != contract.JobClassService || claim.Job.Spec.Kind != contract.JobKindProcess {
+			upgradeEvidence, upgradeRuntime = nil, nil
+		}
 		query := func(ctx context.Context) (bool, error) { return lifecycle.retirementEvidenceSettled(ctx, claim) }
 		check := func(ctx context.Context) (bool, error) {
 			proofMu.Lock()
@@ -492,6 +502,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 			if settled && err == nil {
 				// Release the retained lifecycle once delivery is proved.
 				query = nil
+				// Recovery callbacks also retain the lifecycle. Drop them only
+				// when the session has positive reap as well as this delivery proof.
+				if upgradeEvidence != nil {
+					upgradeEvidence(attemptID, nil)
+				}
+				if upgradeRuntime != nil {
+					upgradeRuntime(attemptID, nil)
+				}
 			}
 			return settled, err
 		}
@@ -525,10 +543,26 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 	}
 	lifecycle.dependencies.observer.beginAttempt(attemptID, claim.Job.JobID, claim.Job.Spec.Class)
 	defer lifecycle.dependencies.observer.finishAttempt(attemptID)
+	if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess && errors.Is(context.Cause(ctx), errUpgradeServiceQuiescence) {
+		return lifecycle.finalizeUnstartedUpgradeService(ctx, claim)
+	}
 	if lifecycle.dependencies.outbox != nil {
-		if err := lifecycle.dependencies.outbox.ensureAttempt(attemptContext, claim); err != nil {
+		initializationContext := attemptContext
+		cancelInitialization := func() {}
+		if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess {
+			initializationContext, cancelInitialization = context.WithTimeout(context.WithoutCancel(attemptContext), lifecycle.dependencies.client.operationTimeout)
+		}
+		err := lifecycle.dependencies.outbox.ensureAttempt(initializationContext, claim)
+		cancelInitialization()
+		if err != nil {
+			if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess && errors.Is(context.Cause(ctx), errUpgradeServiceQuiescence) {
+				return lifecycle.finalizeUnstartedUpgradeService(ctx, claim)
+			}
 			return errorDestinationUnclassified, fmt.Errorf("agent: persist attempt evidence identity: %w", err)
 		}
+	}
+	if lifecycle.dependencies.upgradeEvidence != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess && errors.Is(context.Cause(ctx), errUpgradeServiceQuiescence) {
+		return lifecycle.finalizeUnstartedUpgradeService(ctx, claim)
 	}
 
 	// Start the local monotonic lease window when the claim response is actually
@@ -627,6 +661,14 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		outcome.result = result
 		if err := persistCompletion(&outcome, true); err != nil {
 			return errorDestinationUnclassified, fmt.Errorf("agent: persist durable completion: %w", err)
+		}
+		if errors.Is(cause, errUpgradeServiceQuiescence) && claim.Job.Spec.Class == contract.JobClassService {
+			if outcome.reapEvidence == "" {
+				return errorDestinationUnclassified, errors.New("upgrade service runtime reap did not verify quiescence")
+			}
+			finalizationContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), lifecycle.dependencies.client.operationTimeout)
+			defer cancel()
+			return errorDestinationUnclassified, lifecycle.recoverUpgradeServiceEvidence(finalizationContext, claim)
 		}
 		if errors.Is(cause, errServiceRemovalRequested) {
 			// The removal controller persists its local removing record before
@@ -974,6 +1016,10 @@ func (lifecycle *attemptLifecycle) finishCompletedAttempt(ctx context.Context, c
 }
 
 func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim l1.Claim, request l1.CompletionRequest) destinationError {
+	return lifecycle.completeWithRetryMode(ctx, claim, request, completionDeliveryLive)
+}
+
+func (lifecycle *attemptLifecycle) completeWithRetryMode(ctx context.Context, claim l1.Claim, request l1.CompletionRequest, mode completionDeliveryMode) destinationError {
 	// Tests may use a lifecycle without durable storage; production borrows the
 	// process-lifetime outbox, which also owns its intent gate.
 	outbox := lifecycle.dependencies.outbox
@@ -986,7 +1032,7 @@ func (lifecycle *attemptLifecycle) completeWithRetry(ctx context.Context, claim 
 	// another ledger call, so back off while preserving the identical body.
 	ledgerRefusals := 0
 	for {
-		verdict := outbox.deliverCompletion(ctx, lifecycle.dependencies.client, attempt, request, completionDeliveryLive)
+		verdict := outbox.deliverCompletion(ctx, lifecycle.dependencies.client, attempt, request, mode)
 		switch verdict.kind {
 		case completionSuppressed:
 			return destinationError{err: errOCIIntentDisabled}
@@ -1481,9 +1527,20 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if handoffReader != nil {
 			lifecycle.captureRemoteResult(finalizationContext, handoffReader)
 		}
-		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, workloadrunner.ReapRequest{
-			Authority: authority, ManagedResources: managedResources,
-		})
+		reapRequest := workloadrunner.ReapRequest{Authority: authority, ManagedResources: managedResources}
+		if lifecycle.dependencies.upgradeRuntime != nil && claim.Job.Spec.Class == contract.JobClassService && claim.Job.Spec.Kind == contract.JobKindProcess {
+			lifecycle.dependencies.upgradeRuntime(claim.Lease.AttemptID, func(ctx context.Context) (workloadrunner.ReapReceipt, error) {
+				receipt, err := runtimeAdapter.ReapAndVerify(ctx, reapRequest)
+				if err != nil && lifecycle.dependencies.verifyStoppedService != nil {
+					// The first runtime verification may have consumed a negative
+					// receipt. Recheck the exact durable process-group identity;
+					// no missing map entry or elapsed time supplies positive proof.
+					return lifecycle.dependencies.verifyStoppedService(ctx, claim)
+				}
+				return receipt, err
+			})
+		}
+		reapReceipt, reapErr := runtimeAdapter.ReapAndVerify(finalizationContext, reapRequest)
 		var reapLoss *workloadrunner.RuntimeLossError
 		if errors.As(reapErr, &reapLoss) {
 			cancelFinalization()

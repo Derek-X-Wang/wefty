@@ -2376,3 +2376,42 @@ after that acknowledgement. A cleaned identity stays cleaned even if an
 uncertain Apply later resolves with an earlier binding snapshot. Ports are
 `7100+2*place` (view) and `7101+2*place` (control), with image users `seat1`–`seat4`. See
 [the helper contract](oci-helper-protocol.md#per-seat-directives-and-observations).
+### Rolling-generation service recovery (#1178)
+
+Rolling upgrade adds no Job or Attempt states. Before promotion, the old primary
+selectively stops process services, joins their workers and proves runtime reap,
+publication, accepted completion and drained logs. Service completion keeps the
+existing infrastructure-interruption policy, including a post-start `never`
+service ending `failed` without a payload policy stop. The existing explicit
+restart transaction then queues each still-desired service with one stable
+upgrade key, regardless of `restart=never`. A guarded request compares the exact
+predecessor Job/Attempt/boot and bound Node inside the write transaction, requires
+accepted terminal completion, and leaves stopped, removed, policy-stopped, live
+and already-replaced services unchanged. An identical accepted key remains a
+replay after a successor starts; it never adds another restart directive.
+
+Only normal claim creates the replacement Attempt, fence and Lease under the
+new primary. L1 promotion continues to refuse active services; its frozen retiree
+membership contains process one-shots only. Already-ended local services carry
+positive reap and settled evidence and do not keep retirement alive. Legacy
+registration and unguarded explicit service restarts are unchanged. See
+[selective service lifecycle](agent-local-lifecycle.md#selective-service-quiescence-for-rolling-upgrade-1178)
+and [upgrade recovery](plain-node-upgrade.md#rolling-generation-service-recovery-1178)
+for the local gate and durable receipt ordering.
+
+A service-local upgrade failure does not transition the agent session or any
+sibling one-shot. The closed service gate remains until positive proof permits
+promotion/recovery or primary-authorized resume. Failed reap and rejected or
+sealed evidence return an identified phase/cause instead of an unbounded silent
+wait. Same-operation replay re-verifies the exact predecessor; it cannot turn
+expired authority or lost evidence into accepted completion. An admitted service
+canceled before runtime preparation completes with positive `no_runtime`
+evidence on its own bounded finalization context.
+The session retains the selected Attempt's completion Lease renewal after its
+payload and worker end, until that service's own settlement or session closure.
+Terminal renewal rejection and authoritative operator stop also end its renewal
+owner. Unsettled evidence after operator stop returns an explicit `lease` phase;
+ending renewal neither discards evidence nor preempts accepted completion replay.
+Other services and one-shots keep their own renewal owners. Barrier retries add
+no deadline. Ownership revisions fence older recovery replies against destructive
+log/completion disposition, including after upgrade ownership is released.

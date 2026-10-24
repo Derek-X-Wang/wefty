@@ -4,11 +4,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/Derek-X-Wang/wefty/agent/managedroot"
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -106,4 +109,42 @@ func (resource *processManagedResource) processGroups(jobID string) ([]workloadr
 		groups = append(groups, workloadrunner.ProcessGroupRecord{NotSpawned: record.NotSpawned, AttemptID: record.AttemptID, BootSessionID: record.BootSessionID, HostBootID: record.HostBootID, ProcessGroupID: record.ProcessGroupID})
 	}
 	return groups, nil
+}
+
+// verifyStoppedAttempt is read-only recovery for this exact agent boot and
+// Attempt. Only a durable not-spawned record or ESRCH for its recorded process
+// group proves absence. EPERM, reused IDs, unknown groups and missing records
+// refuse; no signal, directory deletion or process adoption occurs here.
+func (resource *processManagedResource) verifyStoppedAttempt(ctx context.Context, authority workloadrunner.AttemptAuthority) (workloadrunner.ReapReceipt, error) {
+	if err := ctx.Err(); err != nil {
+		return workloadrunner.ReapReceipt{}, err
+	}
+	if authority.NodeID != resource.root.Manifest().NodeID || authority.BootSessionID != resource.bootSessionID || authority.WorkloadClass != contract.JobClassService || authority.JobID == "" || authority.AttemptID == "" || authority.FencingToken == "" {
+		return workloadrunner.ReapReceipt{}, errors.New("process verification requires exact current service authority")
+	}
+	records, err := resource.root.ProcessAttempts(authority.JobID)
+	if err != nil {
+		return workloadrunner.ReapReceipt{}, err
+	}
+	for _, record := range records {
+		if record.AttemptID != authority.AttemptID || record.BootSessionID != authority.BootSessionID {
+			continue
+		}
+		receipt := workloadrunner.ReapReceipt{RuntimeQuiesced: true, Evidence: workloadrunner.ReapEvidenceAttempt, BootSessionID: authority.BootSessionID}
+		if record.NotSpawned && record.ProcessGroupID == 0 {
+			receipt.Evidence = workloadrunner.ReapEvidenceNoRuntime
+			return receipt, nil
+		}
+		if record.ProcessGroupID <= 0 {
+			return workloadrunner.ReapReceipt{}, errors.New("process group identity is unavailable")
+		}
+		if err := syscall.Kill(-record.ProcessGroupID, 0); !errors.Is(err, syscall.ESRCH) {
+			if err == nil {
+				return workloadrunner.ReapReceipt{}, fmt.Errorf("process group %d still exists", record.ProcessGroupID)
+			}
+			return workloadrunner.ReapReceipt{}, fmt.Errorf("process group %d absence is unverified: %w", record.ProcessGroupID, err)
+		}
+		return receipt, nil
+	}
+	return workloadrunner.ReapReceipt{}, errors.New("exact process attempt inventory is unavailable")
 }

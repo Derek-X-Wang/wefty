@@ -8,13 +8,21 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/l1"
+	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
 // retirementAttempt retains local proof after a claim worker releases residency.
 // Absence from the running map never proves reap or evidence delivery.
 type retirementAttempt struct {
 	jobID, fencingToken     string
+	class, kind             string
 	reaped, evidenceSettled bool
+	finished                bool
+	completionLease         *upgradeServiceLease
+	finalizationErr         error
+	reapErr                 error
+	recheckRuntime          func(context.Context) (workloadrunner.ReapReceipt, error)
+	recoverEvidence         func(context.Context) error
 	checkEvidence           func(context.Context) (bool, error)
 }
 
