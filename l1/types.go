@@ -777,6 +777,7 @@ type NodeIntentRequest struct {
 // ReconcileResult reports the durable transitions won by one reconciliation
 // pass. Counts are useful for observability and deterministic tests.
 type ReconcileResult struct {
+	PrunedSeatLogs                    int64 `json:"pruned_seat_logs"`
 	ExpiredAttempts                   int64 `json:"expired_attempts"`
 	StaleNodes                        int64 `json:"stale_nodes"`
 	DeadNodes                         int64 `json:"dead_nodes"`

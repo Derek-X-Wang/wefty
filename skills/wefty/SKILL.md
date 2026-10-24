@@ -155,6 +155,30 @@ the macOS temp folder.
 If the sandbox blocks the wefty socket, stop and ask the owner; Seats add no
 socket allowance.
 
+Read a Seat's own events with `wefty logs SEAT_ID`, or follow with
+`wefty logs SEAT_ID --follow`. `--cursor` and `--tail N` work as for Runs.
+A follow stops with a readable end reason and never renews Seat activity;
+#1146 defines activity for a one-time log read. The credential is a bearer
+secret: any authenticated Fabric identity holding it can read its own Seat's
+log, including after the Seat ends. It cannot read another Seat's log or
+perform actions after the end. Audit retention defaults to 90 days; a
+never-live request's log ages from creation once it ends or loses all Seat
+references; unresolved referenced requests retain their history. A stored
+secret scrubbed by an older binary gets one retry as the original caller; after pruning, the
+CLI reports that the log was not found.
+
+The reply reporting a Seat outcome acknowledges its contiguous lifecycle
+history, stopping before the first unread non-lifecycle event. An earlier
+owner note, control, command or copy event still produces the unread hint.
+A reply with no such barrier does not repeat its own lifecycle history.
+Later events produce `N new Seat event(s): wefty logs SEAT_ID`; repeated waits
+for the same outcome leave those later events unread. Reading the log
+acknowledges printed history. If a one-shot acknowledgement fails, the command
+still succeeds and warns on stderr that its read cursor was not confirmed.
+Empty follow polls do not acknowledge; a retryable acknowledgement failure is retried without ending the follow.
+Successful JSON replies carry `unread_events` and, only when nonzero,
+`unread_events_line`; typed refusals include the hint in their message.
+
 ## One command with local changes: `wefty exec`
 
 Use `exec` for one build, test, or other command in your current Git checkout.
