@@ -24,6 +24,9 @@ Request one Seat, or wait again by its ID after an interrupted call.
 The network must be named. Only the owner's native dialog can approve.
 `
 
+// seatCleanupWaitLimit bounds one CLI observation, not L1 cleanup authority.
+const seatCleanupWaitLimit = time.Minute
+
 var seatCLIIdentifier = regexp.MustCompile(`^seat_[0-9a-f]{32}$`)
 
 type seatRequestFlags struct {
@@ -131,6 +134,15 @@ func seatHarnessLabel() string {
 	return strings.Join(labels, ", ")
 }
 func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id string, stdout io.Writer) error {
+	now := clients.seatWaitNow
+	if now == nil {
+		now = time.Now
+	}
+	wait := clients.wait
+	if wait == nil {
+		wait = waitForContext
+	}
+	var cleanupDeadline time.Time
 	for {
 		var result l1.SeatCallResult
 		err := clients.l1.do(ctx, http.MethodGet, "/v1/seat-requests/"+id, nil, nil, &result, http.StatusOK)
@@ -166,25 +178,32 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 			}
 			_, err = fmt.Fprintf(stdout, "Seat %s ready on %s; credential stored in %s\n", id, result.ComputerID, path)
 			return err
-		case l1.SeatEnded, l1.SeatEnding:
-			if !result.CleanupPending {
-				return &apiResponseError{APIError: contract.APIError{Code: seatErrorEnded, Message: "Seat ended: " + result.Reason, Details: map[string]any{"seat_id": id}}}
+		case l1.SeatRefused, l1.SeatEnded, l1.SeatEnding:
+			if result.CleanupPending {
+				if cleanupDeadline.IsZero() {
+					cleanupDeadline = now().Add(seatCleanupWaitLimit)
+				}
+				if now().Before(cleanupDeadline) {
+					break
+				}
 			}
-		case l1.SeatRefused:
-			if !result.CleanupPending {
-				return seatCallRefusal(id, result.Reason)
+			outcome := seatCallRefusal(id, result.Reason)
+			if result.State != l1.SeatRefused {
+				outcome = &apiResponseError{APIError: contract.APIError{Code: seatErrorEnded, Message: "Seat ended: " + result.Reason, Details: map[string]any{"seat_id": id}}}
 			}
+			if result.CleanupPending {
+				outcome.APIError.Message += "; cleanup still pending; L1 continues cleanup; check again with wefty seat wait " + id
+				outcome.APIError.Details["cleanup_pending"] = true
+			}
+			return outcome
 		}
-		timer := time.NewTimer(250 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return fmt.Errorf("Seat request %s still recorded; wait again with wefty seat wait %s: %w", id, id, ctx.Err())
-		case <-timer.C:
+		if err := wait(ctx, 250*time.Millisecond); err != nil {
+			return fmt.Errorf("Seat request %s still recorded; wait again with wefty seat wait %s: %w", id, id, err)
 		}
 	}
 }
-func seatCallRefusal(id, reason string) error {
+
+func seatCallRefusal(id, reason string) *apiResponseError {
 	code := seatErrorStartFailed
 	switch {
 	case reason == "Computer room is not configured on this node":

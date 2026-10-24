@@ -2647,9 +2647,11 @@ count only while the call is Requested. The refusing write rechecks that state
 and an empty Computer binding; Approved calls use ReserveSeatRoom's fence.
 Errors for one candidate are logged and skipped so other requests can proceed.
 The answer deadline includes dispatch delay from request creation; the
-approval controller receives the remaining time. It retains the owner's answer
-per Seat ID for its process lifetime and retries a failed answer post with
-exponential backoff from one to thirty seconds, bounded by that same deadline.
+approval controller receives the remaining time. It retains an unconfirmed
+owner answer per Seat ID and retries a failed answer post with exponential
+backoff from one to thirty seconds, bounded by that same deadline. The in-memory
+entry is dropped when L1 returns a state past Requested, or after the deadline
+once the answer has been posted. Subsequent calls read L1's durable result.
 It never shows a second dialog for that ID. A new boot still refuses a lost
 dialog under #1142. A request that lost its node
 boot is refused. The node-owned poller survives CLI cancellation, re-reads
@@ -2683,8 +2685,11 @@ decision likewise cannot end a Seat that already became Live. Existing failure
 latches stay.
 The public receipt reports `cleanup_pending` while its Seat cleanup remains
 unconfirmed, and also until verified removal of a failed new Computer. The CLI
-cannot complete a refusal with runtime resources left behind. An approval
-refusal allocates no Computer or room. Poll retries
+waits up to `seatCleanupWaitLimit` (one minute) after first seeing pending
+cleanup, then returns the typed outcome with an explicit `cleanup still pending`
+note and `details.cleanup_pending: true`. L1 continues reconciliation and keeps
+room held until positive cleanup/removal evidence; CLI completion is not cleanup
+evidence. An approval refusal allocates no Computer or room. Poll retries
 unfinished removal and never revives a final Seat. This ticket serves a running
 host VM; the stopped-host-VM demand/wait path is owned by #1144.
 

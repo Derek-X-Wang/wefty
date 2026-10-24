@@ -435,9 +435,15 @@ JSON error document on stderr, with `details.seat_id` and these codes:
 No new process exit number is added. The whitelist in `main.go`, the shared
 command reporter and real-binary tests pin these typed conflict outcomes.
 A new Computer whose Seats never became Live settles a failed start through the
-existing verified removal protocol. `cleanup_pending` prevents CLI completion
-until its Seat cleanup is confirmed and, for a failed new start, its Computer
-and Storage are gone. Once a Seat became Live, its Computer stays existing
+existing verified removal protocol. After first observing a terminal outcome
+with `cleanup_pending`, each CLI wait gives cleanup up to one minute
+(`seatCleanupWaitLimit`). If cleanup remains pending, the CLI returns the
+original typed outcome and exit code, appends `cleanup still pending` and the
+same-ID wait command, and includes `details.cleanup_pending: true`. Cleanup
+finishing within that minute returns the ordinary outcome. This limit bounds
+only the CLI wait: L1 keeps its cleanup state, room fence and verified-removal
+requirements until the Seat, Computer and Storage cleanup is confirmed. Once a
+Seat became Live, its Computer stays existing
 even after a later Seat failure; its other Seats, failure latch and cleanup
 fence are preserved.
 A room-race loser does not create a Computer or Storage generation at all.

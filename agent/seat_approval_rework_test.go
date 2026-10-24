@@ -81,3 +81,70 @@ func TestSeatApprovalAnswerBlipRetriesWithoutSecondDialog(t *testing.T) {
 		}
 	}
 }
+
+// Once L1 has settled an answer, subsequent calls must consult its durable
+// state rather than retain the controller's old Approved response forever.
+func TestSeatApprovalAnsweredCallRechecksL1(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 10, 24, 0, 0, 0, 0, time.UTC))
+	client, store := approvalTestClient(t, clock)
+	var dialogs atomic.Int32
+	controller, err := NewSeatApprovalController(client, "mac", "boot", SeatApprovalSettings{}, SeatApprovalDialogFunc(func(context.Context, SeatApprovalPrompt) (SeatApprovalChoice, error) {
+		dialogs.Add(1)
+		return SeatApprovalApprove, nil
+	}), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := l1.SeatApprovalRequest{SeatID: "seat_" + strings.Repeat("f", 32), Folder: "/workspace", Form: "any", Network: "none"}
+	first, err := controller.RequestApproval(t.Context(), input)
+	if err != nil || first.State != "approved" {
+		t.Fatalf("first answer: %+v %v", first, err)
+	}
+	if _, err := store.EndSeatRequest(t.Context(), "dialog-node", input.SeatID, l1.SeatEndRequest{NodeID: "mac", BootSessionID: "boot", Refused: true, Reason: "start failed"}); err != nil {
+		t.Fatal(err)
+	}
+	next, err := controller.RequestApproval(t.Context(), input)
+	if err != nil || next.State != "refused" || next.Reason != "start failed" || dialogs.Load() != 1 {
+		t.Fatalf("settled answer must read L1 without another dialog: %+v %v dialogs=%d", next, err, dialogs.Load())
+	}
+}
+
+type seatAnswerOutage struct {
+	SeatApprovalClient
+	posts  atomic.Int32
+	posted chan struct{}
+}
+
+func (c *seatAnswerOutage) AnswerSeatApproval(context.Context, string, l1.SeatApprovalAnswer) (l1.SeatApproval, error) {
+	if c.posts.Add(1) == 1 {
+		close(c.posted)
+	}
+	return l1.SeatApproval{}, fmt.Errorf("answer transport unavailable")
+}
+
+func TestSeatApprovalPostedAnswerExpiresFromController(t *testing.T) {
+	clock := newManualClock(time.Date(2026, 10, 24, 0, 0, 0, 0, time.UTC))
+	client, _ := approvalTestClient(t, clock)
+	outage := &seatAnswerOutage{SeatApprovalClient: client, posted: make(chan struct{})}
+	var dialogs atomic.Int32
+	controller, err := NewSeatApprovalController(outage, "mac", "boot", SeatApprovalSettings{}, SeatApprovalDialogFunc(func(context.Context, SeatApprovalPrompt) (SeatApprovalChoice, error) {
+		dialogs.Add(1)
+		return SeatApprovalApprove, nil
+	}), clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := l1.SeatApprovalRequest{SeatID: "seat_" + strings.Repeat("9", 32), Folder: "/workspace", Form: "any", Network: "none"}
+	done := make(chan error, 1)
+	go func() { _, err := controller.RequestApproval(t.Context(), input); done <- err }()
+	awaitSeatApprovalTest(t, outage.posted)
+	clock.waitForDeadline(t, clock.Now().Add(time.Second))
+	clock.Advance(DefaultSeatApprovalWait)
+	if err := awaitSeatApprovalTest(t, done); err == nil {
+		t.Fatal("outage was hidden")
+	}
+	next, err := controller.RequestApproval(t.Context(), input)
+	if err != nil || next.State != "refused" || next.Reason != "no answer from the owner" || dialogs.Load() != 1 || outage.posts.Load() != 2 {
+		t.Fatalf("deadline result must read L1 without another dialog or post: %+v %v dialogs=%d posts=%d", next, err, dialogs.Load(), outage.posts.Load())
+	}
+}

@@ -40,6 +40,7 @@ type apiClients struct {
 	// client participant. Never substitute the client when this is absent.
 	servicePerson fabric.Fabric
 	wait          func(context.Context, time.Duration) error
+	seatWaitNow   func() time.Time
 }
 
 type apiClient struct {

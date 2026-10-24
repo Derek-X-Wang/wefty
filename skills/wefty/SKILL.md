@@ -149,13 +149,11 @@ A full node refuses before showing a dialog: `out of room, try again later`
 host VM also have distinct typed refusal codes. There is no wait queue for
 room. A wait observes its original request and never opens a second dialog.
 
-The CLI stores the Seat credential and replay receipt in private files under
-`$XDG_STATE_HOME/wefty/seats` when XDG_STATE_HOME is absolute, otherwise
-`~/.local/state/wefty/seats`. On macOS, a permission or read-only refusal uses
-`os.TempDir()/wefty-seats`. `WEFTY_SEAT_STATE_ROOT` overrides the root and never
-falls back. Later waits search the default root and macOS fallback in that order.
-Keep the credential private. If the sandbox blocks the wefty socket, stop and
-ask the owner. Seats add no socket allowance or alternate connection path.
+The CLI prints the credential path. Later calls search the state folder, then
+the macOS temp folder.
+
+If the sandbox blocks the wefty socket, stop and ask the owner; Seats add no
+socket allowance.
 
 ## One command with local changes: `wefty exec`
 
