@@ -294,6 +294,60 @@
           }
         }
       },
+      "DeEnrollNodeGenerationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "operation_id",
+          "primary_generation_id",
+          "primary_boot_session_id",
+          "authority_generation",
+          "catalog_revision",
+          "intent_revision",
+          "intent_reason",
+          "runtimes_reaped",
+          "evidence_settled"
+        ],
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "primary_generation_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "primary_boot_session_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "authority_generation": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "catalog_revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "intent_revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "intent_reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "runtimes_reaped": {
+            "type": "boolean",
+            "const": true
+          },
+          "evidence_settled": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "description": "Exact inverse-enrollment operation, authenticated by the primary agent. Requires closed admission under wefty maintenance OPERATION, exact primary/boot/authority/catalog/intent, no staged or retiring generation, settled Attempts and positive local reap/evidence. Identical replay returns the durable original result; changed replay refuses."
+      },
       "ComputerSeatRecovery": {
         "type": "object",
         "additionalProperties": false,
@@ -1031,7 +1085,7 @@
           "details": {
             "type": "object",
             "additionalProperties": true,
-            "description": "For stale_intent_revision (HTTP 409, retryable=false), expected_revision is the current stored intent revision and observed_revision is the revision supplied by the caller. Details also carry the resource identifier (node_id or computer_id). L1 operational identity lookup failures carry reason=identity_unverifiable (503 unavailable, retryable=true). On dispatch-key lookup, Computer token-scope proof, and host boot-session proof, refusal of a client that is not the configured run ledger carries reason=run_ledger_not_admitted (403 forbidden, retryable=false); per-Computer and per-host authority refusals retain their existing details without that reason. Mux 404/405 errors carry reason=no_route to distinguish missing routes or methods from resource refusals."
+            "description": "For stale_intent_revision (HTTP 409, retryable=false), expected_revision is the current stored intent revision and observed_revision is the revision supplied by the caller. Details also carry the resource identifier (node_id or computer_id). L1 operational identity lookup failures carry reason=identity_unverifiable (503 unavailable, retryable=true). On dispatch-key lookup, Computer token-scope proof, and host boot-session proof, refusal of a client that is not the configured run ledger carries reason=run_ledger_not_admitted (403 forbidden, retryable=false); per-Computer and per-host authority refusals retain their existing details without that reason. Mux 404/405 errors carry reason=no_route to distinguish missing routes or methods from resource refusals. De-enrollment alone may return de_enrollment_not_committed (HTTP 409, retryable=false) with node_id, operation_id and request_sha256 binding the exact canonical decoded request. This code is emitted only after committing a terminal post-ledger rejection. Every other code or mismatched/missing proof remains uncertain for de-enrollment recovery."
           },
           "request_id": { "type": "string", "description": "Server-generated HTTP request correlation ID, echoed in X-Request-Id and the server log. L3 preserves a relayed L1 error ID and adds its own ID in details.l3_request_id and X-L3-Request-Id. Omitted for CLI-local and stored decision errors that have no HTTP request." }
         }

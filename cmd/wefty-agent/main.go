@@ -529,6 +529,9 @@ func run() error {
 		if err != nil {
 			return err
 		}
+		if resolving, resolveErr := reconcileInstalledDeEnrollment(context.Background(), generationStore, *profilePath); resolving || resolveErr != nil {
+			return resolveErr
+		}
 		if catalog.PendingReceipt != "" {
 			if err := reconcileInstalledActivation(context.Background(), generationStore, *profilePath, generationSystemBoot); err != nil {
 				return err

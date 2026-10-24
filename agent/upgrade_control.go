@@ -53,7 +53,10 @@ func (a *Agent) ServeUpgradeControl(ctx context.Context, store agentinstall.Stor
 		if pending != nil {
 			// Retry only publication, never a possibly committed L1 mutation.
 			// No mutex is held across a failed write or between retries.
-			_ = publish()
+			deEnrolled := pending.Request.Action == "de_enroll_generation" && pending.Error == ""
+			if publish() == nil && deEnrolled {
+				return nil
+			}
 			continue
 		}
 		// Only the installed primary performs independent retiree cleanup. A
@@ -142,6 +145,12 @@ func (a *Agent) ServeUpgradeControl(ctx context.Context, store agentinstall.Stor
 				if err == nil {
 					result.Payload, err = json.Marshal(inventory)
 				}
+			case "de_enroll_generation":
+				var inventory l1.NodeGenerationInventory
+				inventory, err = a.deEnrollGeneration(bounded, store, r)
+				if err == nil {
+					result.Payload, err = json.Marshal(inventory)
+				}
 			case "abort_staged_generation":
 				var inventory l1.NodeGenerationInventory
 				inventory, err = a.abortStaged(bounded, store, r)
@@ -157,8 +166,11 @@ func (a *Agent) ServeUpgradeControl(ctx context.Context, store agentinstall.Stor
 		cancel()
 		result = NewUpgradeControlResult(r, result.Payload, err)
 		pending = &result
-		if err := publish(); err != nil && r.Action != "promote_generation" {
+		if err := publish(); err != nil && r.Action != "promote_generation" && r.Action != "de_enroll_generation" {
 			return err
+		}
+		if pending == nil && r.Action == "de_enroll_generation" && result.Error == "" {
+			return nil
 		}
 	}
 }
@@ -299,6 +311,8 @@ func upgradeControlProtocolCause(err error) *ProtocolError {
 	switch e := err.(type) {
 	case *ProtocolError:
 		return e
+	case *agentinstall.MaintenanceRefusal:
+		return upgradeControlConflict(e.Error())
 	case *agentinstall.VerificationRefusal:
 		return upgradeControlConflict(e.Error())
 	case *agentinstall.ControlRequestRefusal:

@@ -34,17 +34,18 @@ const rollingTestBoot = "darwin:11111111-1111-1111-1111-111111111111"
 
 type rollingFixture struct {
 	*upgradeFixture
-	h             *nodeCLIHarness
-	paths         setupPaths
-	install       agentinstall.Store
-	primary       agentinstall.Generation
-	claims        []*l1.Claim
-	lifetimes     map[string]*agentinstall.GenerationLifetime
-	promoted      bool
-	heartbeatOnly bool
-	late          bool
-	beforeRecover func(string)
-	failPhase     string
+	h                  *nodeCLIHarness
+	paths              setupPaths
+	install            agentinstall.Store
+	primary            agentinstall.Generation
+	claims             []*l1.Claim
+	lifetimes          map[string]*agentinstall.GenerationLifetime
+	promoted           bool
+	heartbeatOnly      bool
+	late               bool
+	stopPrimaryControl func()
+	beforeRecover      func(string)
+	failPhase          string
 }
 
 func newRollingFixture(t *testing.T) *rollingFixture { return newRollingFixtureWithLegacy(t, false) }
@@ -869,14 +870,20 @@ func exposeRollingL1WithPromotionReply(t *testing.T, f *rollingFixture, beforeRe
 	mustRolling(t, err)
 	controlCtx, stopControl := context.WithCancel(t.Context())
 	controlDone := make(chan error, 1)
-	go func() { controlDone <- runtime.ServeUpgradeControl(controlCtx, f.install) }()
-	t.Cleanup(func() {
-		stopControl()
-		if err := <-controlDone; err != nil {
-			t.Error(err)
-		}
-		runtime.Close()
-	})
+	controlStore := f.install
+	go func() { controlDone <- runtime.ServeUpgradeControl(controlCtx, controlStore) }()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			stopControl()
+			if err := <-controlDone; err != nil {
+				t.Error(err)
+			}
+			runtime.Close()
+		})
+	}
+	f.stopPrimaryControl = stop
+	t.Cleanup(stop)
 	return runtime
 }
 func TestUpgradeRollingRealBinaryOCIAndOverlapRefusals(t *testing.T) {
