@@ -420,3 +420,176 @@ identity keep the previous changed-boot recovery behavior.
 #1179 supplies installed activation wiring and proof persistence; #1180 supplies
 interrupted installation reconciliation. These seams do not add OCI survival,
 Linux rolling activation, reboot survival or service process adoption.
+
+## Opt-in rolling activation (#1179)
+
+`wefty upgrade --rolling` opts in to the plain Mac generation coordinator.
+The flag is temporary until #1182 passes attended installed-stack acceptance.
+Without it, upgrade keeps the existing drain, interruption, output and recovery
+path above. Enabling rolling by default later requires removing the
+`requestRolling` opt-in branch, retaining the gate and every activation check.
+`--yes` does not override compatibility or interrupt preserved one-shots on
+this path. Setup, remove and default upgrade still refuse retained catalogs
+until generation-aware maintenance is available.
+
+All four candidate binaries must accept the active plain profile through the
+read-only `--profile-preflight --plain` entry point before admission changes.
+The candidate is inspected with `--retirement-protocols`, bound to its exact
+executable digest. L1's complete generation inventory and the local catalog
+must agree on primary, boots, processes and every surviving generation. Each
+live process is checked against its kernel process-start identity and held
+lifetime lock. Protocol 1 must be common to the entire cohort. A staged,
+missing, changed or unreconciled generation refuses activation. There is no
+retiree count limit and no retirement deadline. A compatible further upgrade
+can leave one primary and any number of retirees. Positively closed L1
+sessions are history, outside the live compatibility and promotion cohort.
+Their local files and process bindings remain recorded for #1180's
+`RemoveFinished` cleanup; neither that cleanup nor another retiree's completion
+is a prerequisite for activation. The activation receipt separately binds any
+retained closed ownership without treating it as a running retiree.
+
+The compatibility gate's `refuse` result is a typed conflict (exit **5**) with
+its reason; it never falls back to destructive drain. A positively observed
+legacy primary with no catalog or retirees uses an **announced one-time drain**
+when `--rolling` is requested, then enrolls the replacement through
+`agentinstall.Initialize`. It does not adopt legacy work. The exact owned old
+bootstrap plist is removed after unload so it cannot start beside the primary
+at login. The default command does not perform this enrollment. An unreadable
+inventory never counts as a legacy observation.
+
+Linux and fleet activation remain outside rolling scope: their default command
+uses the existing fleet drain path. Explicit `--rolling` runs the shared gate:
+a single-primary installation reports `unsupported_installation`, while live
+retirees select `unsafe_drain_during_overlap`. Both are typed exit 5 refusals.
+Linux plain installs remain unsupported. OCI installations keep the default
+installation refusal; their opt-in uses the same scope and overlap gate reasons. Resident OCI selects
+`unsupported_work` (drain without retirees, refusal during overlap); the opt-in
+reports that default drain is required rather than overlapping OCI. The pure
+gate's `unsafe_drain_during_overlap` guard remains mandatory. These rules grant
+no Linux, fleet or OCI survival promise.
+
+After preparation, activation persists `upgrade-rolling.json`, closes admission
+with the existing intent CAS and captures late claims. It persists the exact
+service inventory in `upgrade-drain.json` before the private generation-control
+request. The old agent joins in-flight claims, stops only process services and
+returns positive reap/evidence proof. That proof is persisted before promotion
+or service recovery. Stopped, removed, policy-stopped and already-replaced
+services retain their operator state; recovery uses the transactional
+predecessor guard and operation/boot/Attempt restart key, including
+`restart=never`. Recovery does not start a successor before quiescence.
+
+L1 and L3 restart in their existing order. The old primary heartbeat and every
+preserved Attempt must prove renewal after both restarts. Every retiree's
+frozen membership is included even when absent from Node `active_attempts`.
+An exact accepted terminal result can settle an Attempt; expiry, disappearance
+or a queued successor cannot. The existing cancellation exception applies only
+to the control-plane proof. Both services must be reachable.
+
+The coordinator then prepares an immutable candidate executable and unique
+launchd label through `PrepareCandidate` and `LoadCandidate`. `BindReady`
+checks exact generation, digest/version, PID, kernel process-start identity,
+boot, held process lock and fresh readiness time. A candidate waits without
+opening shared runtime state or registering until promotion commits. The ready
+candidate is staged at L1, the final resident set is frozen in
+`BeginPromotion`, and the exact fenced promotion request is persisted before
+sending it. L1 atomically promotes; `CommitPromotion` records the result and
+durably suppresses every retiree's restart/autostart without stopping it.
+The old agent's dedicated retirement acknowledgment is persisted separately.
+
+Completion requires a healthy replacement primary and an accepted **post-cutover
+Lease renewal for every surviving retiring Attempt**. `UpdatedAt` and the
+extended Lease deadline prove renewal; a new heartbeat alone cannot pass.
+The observation boundary is after the promotion reply, which is conservative.
+An exact terminal Attempt with an accepted result also passes. Lost, interrupted,
+expired, missing or successor-only evidence fails. Retirees keep their original
+Attempts, fences, runtimes, output readers and renewal/finalization loops.
+Services recover, setup publishes skills and the installed-version receipt,
+and cleanup restores only admission owned by the upgrade's revision and reason.
+A newer operator disable is preserved.
+
+The private rolling receipt records the operation ID, phase, system boot,
+candidate, full L1 inventory, preserved Attempts, exact promotion request and
+result, agentinstall activation receipt ID, cutover boundary, retirement
+acknowledgments and per-Attempt renewal proof. Phases record intent before each
+external effect and its result afterwards. The drain receipt retains service
+recovery proof/keys and admission ownership. `agentinstall` retains immutable
+binary/process/catalog evidence and its own activation receipt.
+The upgrade CLI never creates or holds a node principal. Admission, interruption
+and service recovery keep their existing client-principal routes. Generation
+inventory, stage and promotion use the installed primary agent's existing node
+participant through the private control adapter. Its only generation actions
+are `generation_inventory`, `stage_generation` and `promote_generation`; it
+accepts no arbitrary HTTP method/path or Seat approval answer. Retirement close
+remains the retiring agent's own protocol. Legacy enrollment identifies an
+empty cohort only from absent local ownership plus a successful client Node
+observation with no generation identity.
+
+The agent checks its current L1 primary/boot before generation operations.
+Mutations also require that operation's settled service barrier and closed L1
+admission at the exact revision and reason accepted by that barrier. A changed
+intent cannot rebind an old operation, including through edited local receipts. Stage binds the exact ready local candidate; promotion binds the
+pending activation receipt and exact L1 intent/authority fences. The promotion
+reply is persisted before successful local retirement can acknowledge demotion
+or exit, including an idle predecessor. An explicit pending-reply fence remains
+until the write succeeds. The adapter retries publication without repeating the
+L1 mutation or holding the retirement mutex between attempts. Successful
+promotion evidence is bound to its operation and canonical semantic request;
+identical retries return that result even after demotion. Changed requests use
+`control-refusal.json` and cannot replace `control-result.json` success evidence.
+Only explicit identity, ownership, intent, inventory, resume-authority,
+action-payload and request-envelope refusals become conflict status, gate reason
+`invalid_inventory` and exit 5. Installer catalog contradictions, private-file
+ownership, activation-receipt identity and process-state mismatches use typed
+refusals at the validation site. Callers translate those types selectively;
+a generic verification error is not a refusal. The compatibility gate retains
+its own reason for installation, protocol and overlap refusals.
+Filesystem/stat/permission/I/O errors, service-manager and command failures,
+persistence and transport failures, and malformed or undecodable successful
+replies remain operational failures (exit 1), including during inventory
+preflight and readiness polling. An existing generation directory with missing
+catalog storage retains the catalog read error. Only a positively absent
+generation directory plus the client Node observation can identify legacy.
+A decoded catalog that contradicts its primary or ownership is a validation
+refusal; failed reads and JSON decoding are operational failures.
+Wrapping a cause in a service barrier error does not change its classification.
+The private reply and the CLI's text and JSON reports retain the full barrier
+text and exact Job, Attempt, phase and pending diagnostics independently of
+status and API code. An unambiguous typed L1 cause keeps its original status,
+code and details; barrier context augments its message and details. A joined
+operational fault remains operational and retains both causes. Cancellation,
+timeout, reply encoding and control-file I/O also remain operational failures.
+Missing readiness, retirement and control replies can still arrive and are
+polled within their existing budgets. Only the absent record after verified
+installation/catalog/generation ownership counts as pending publication;
+missing catalog or directory storage remains an operational read failure.
+Other read/decode/manager failures retain their causes; readable identity
+contradictions refuse. Failed observations
+never supply renewal or cutover proof.
+An unsafe forged transport envelope cannot be answered in another generation's
+directory and is rejected without publication. Lost replies and persistence failures retain
+interrupted-operation
+evidence for #1180. The CLI then reconciles local installation intent
+from that exact reply; it never gains general node-protocol access. L1 failures
+retain their typed protocol code and HTTP status across the private hop.
+
+Generation control uses private regular request/result files under the owned
+generation directory, bound to operation, generation and boot; a fresh request
+ID permits retries with the same service operation. The adapter verifies the
+current primary boot and exact closed L1 admission revision/reason before a
+quiescence request. A successful resume makes that operation terminal for
+quiescence replay, including a replay with a different transport request ID.
+No file grants L1 authority. The OS account is the local trust boundary: another
+process under the same UID can forge these files, as with the existing local
+installation records. Private ownership and modes do not authenticate one
+same-account process to another.
+`ResumeUpgradeServiceClaims` is exposed by the same adapter for #1180's
+pre-promotion recovery, which must first prove that generation is still primary.
+
+An incomplete rolling receipt blocks subsequent upgrade before stale staging
+cleanup, legacy drain recovery or registration. Returned failures retain
+admission and all receipts for #1180; this slice performs no rolling rollback.
+`readUpgradeRolling`, agentinstall activation receipts, control result and
+retirement acknowledgment readers are the #1180 reconciliation seams. #1181
+can use the completed receipt and L1 inventory for status/doctor; this change
+does not implement their overlap text. Native launchd/reboot behavior remains
+subject to #1182's attended acceptance.

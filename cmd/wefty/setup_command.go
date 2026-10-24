@@ -128,6 +128,8 @@ type setupHost struct {
 }
 
 type setupRequest struct {
+	// Only upgrade under its held installation lock may replace node activation.
+	activateGeneration  func(context.Context, launchagent.Agent) (launchagent.Action, error)
 	computer            setupComputerOptions
 	abandonConversion   bool
 	convertPlain        bool
@@ -480,8 +482,10 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 	if len(issues) > 0 {
 		return setupReport{}, issues[0].err
 	}
-	if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
-		return setupReport{}, err
+	if request.activateGeneration == nil || !request.lockHeld {
+		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+			return setupReport{}, err
+		}
 	}
 	if host.goos == "linux" && (request.convertPlain || request.abandonConversion) {
 		flag := "--convert-plain"
@@ -543,8 +547,10 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			return setupReport{}, err
 		}
 	}
-	if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
-		return setupReport{}, err
+	if request.activateGeneration == nil || !request.lockHeld {
+		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+			return setupReport{}, err
+		}
 	}
 	report := setupReport{
 		Profile: paths.profile, NodeConfig: paths.nodeConfig,
@@ -759,6 +765,9 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		manifest.Files[filepath.Join(file.folder, file.name)] = payloadDigest(file.payload)
 	}
 	for index, service := range services {
+		if index == 2 && request.activateGeneration != nil {
+			continue
+		}
 		manifest.Files[filepath.Join(paths.launchAgentsRel, service.Label+".plist")] = payloadDigest(plists[index])
 	}
 	manifestPayload, err := json.MarshalIndent(manifest, "", "  ")
@@ -835,7 +844,13 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			manager.UnloadBound = time.Duration(service.ExitTimeOut+15) * time.Second
 		}
 		plist := filepath.Join(paths.launchAgents, service.Label+".plist")
-		action, err := manager.Converge(serviceCtx, launchAgents, plist, service.Label, plists[index])
+		var action launchagent.Action
+		var err error
+		if index == 2 && request.activateGeneration != nil {
+			action, err = request.activateGeneration(serviceCtx, service)
+		} else {
+			action, err = manager.Converge(serviceCtx, launchAgents, plist, service.Label, plists[index])
+		}
 		if request.wroteFile != nil && action != launchagent.Unchanged {
 			// Converge can publish its plist before bootstrap fails. Record only bytes
 			// that are actually present, never an unrelated owner modification.

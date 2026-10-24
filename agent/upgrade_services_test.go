@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -209,5 +210,36 @@ func TestUpgradeServicesRemovalSettlesOnlyAfterCleanupAcknowledged(t *testing.T)
 				t.Fatal("removed service kept quiescence pending", err)
 			}
 		})
+	}
+}
+
+func TestUpgradeServicesBarrierRejectsChangedAdmissionIntent(t *testing.T) {
+	clock := systemClock{}
+	s := newAgentSession(nil, contract.NodeRegistration{NodeID: "node", AgentGenerationID: "generation", BootSessionID: "boot"}, nil, time.Second, time.Millisecond, clock, newLifecycleObserver(clock), nil, 1, 1)
+	a := &Agent{session: s}
+	request := UpgradeServiceQuiescence{OperationID: "activation", NodeID: "node", AgentGenerationID: "generation", BootSessionID: "boot", IntentRevision: 1, IntentReason: "upgrade", Services: []l1.NodeActiveAttempt{}}
+	if _, err := a.QuiesceUpgradeServices(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"revision", "reason"} {
+		changed := request
+		if field == "revision" {
+			changed.IntentRevision++
+		} else {
+			changed.IntentReason = "operator maintenance"
+		}
+		_, err := a.QuiesceUpgradeServices(t.Context(), changed)
+		assertUpgradeServiceConflict(t, err)
+	}
+	if _, err := a.QuiesceUpgradeServices(t.Context(), request); err != nil {
+		t.Fatal("exact replay rejected", err)
+	}
+}
+
+func assertUpgradeServiceConflict(t *testing.T, err error) {
+	t.Helper()
+	var protocol *ProtocolError
+	if !errors.As(err, &protocol) || protocol.StatusCode != http.StatusConflict || protocol.APIError.Code != contract.ErrorConflict || protocol.APIError.Details["reason"] != string(upgradecompat.InvalidInventory) {
+		t.Fatalf("untyped service fence refusal: %#v", err)
 	}
 }

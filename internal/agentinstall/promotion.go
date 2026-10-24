@@ -3,7 +3,6 @@ package agentinstall
 import (
 	"bytes"
 	"context"
-	"errors"
 	"maps"
 	"os"
 	"path/filepath"
@@ -17,6 +16,9 @@ import (
 
 // PromotionEvidence comes from verified L1 inventory under closed admission.
 type PromotionEvidence struct {
+	// ClosedGenerations binds retained local ownership to authoritative L1 closed
+	// history. These files remain for receipt-bound cleanup, outside the live cohort.
+	ClosedGenerations   map[string]Binding           `json:"closed_generations,omitempty"`
 	IntentRevision      int64                        `json:"intent_revision"`
 	L1CatalogRevision   int64                        `json:"l1_catalog_revision"`
 	Residents           map[string][]ResidentAttempt `json:"resident_attempts"`
@@ -55,46 +57,56 @@ func (s Store) BeginPromotion(candidate, boot, operation string, expectedRevisio
 	}
 	g, ok := c.Generations[candidate]
 	if !ok || g.Role != "" || g.Process == nil || c.PendingReceipt != "" || c.Revision != expectedRevision || operation == "" || !hostboot.SameBoot(g.Process.SystemBootID, boot) || protocol != 1 {
-		return ActivationReceipt{}, errors.New("promotion requires a ready candidate, current catalog and protocol 1")
+		return ActivationReceipt{}, &VerificationRefusal{Message: "promotion requires a ready candidate, current catalog and protocol 1"}
 	}
-	if evidence.IntentRevision <= 0 || evidence.L1CatalogRevision < 0 || len(evidence.Residents) != len(c.Generations) {
-		return ActivationReceipt{}, errors.New("promotion requires complete verified resident inventory and intent revision")
+	if evidence.IntentRevision <= 0 || evidence.L1CatalogRevision < 0 || len(evidence.Residents)+len(evidence.ClosedGenerations) != len(c.Generations) {
+		return ActivationReceipt{}, &VerificationRefusal{Message: "promotion requires complete verified resident inventory and intent revision"}
 	}
 	id, err := newID()
 	if err != nil {
 		return ActivationReceipt{}, err
 	}
 	r := ActivationReceipt{PromotionEvidence: evidence, Processes: map[string]Binding{}, Version: 1, ID: id, ExpectedPrimary: c.Primary, Candidate: candidate, CatalogRevision: c.Revision, SystemBootID: boot, Protocol: protocol, Digests: map[string]string{}, L1OperationID: operation}
+	r.ClosedGenerations = maps.Clone(evidence.ClosedGenerations)
 	r.Residents = map[string][]ResidentAttempt{}
 	r.ServiceRecoveryKeys = maps.Clone(evidence.ServiceRecoveryKeys)
 	seenAttempts := map[string]bool{}
 	for id, g := range c.Generations {
+		if binding, closed := evidence.ClosedGenerations[id]; closed {
+			if g.Role != "retiring" || id == c.Primary || g.Process == nil || *g.Process != binding {
+				return r, &VerificationRefusal{Message: "closed generation history differs from retained ownership"}
+			}
+			if _, live := evidence.Residents[id]; live {
+				return r, &VerificationRefusal{Message: "closed generation also included in live cohort"}
+			}
+			continue
+		}
 		if g.Role == "" && id != candidate {
-			return r, errors.New("another staged candidate requires reconciliation")
+			return r, &VerificationRefusal{Message: "another staged candidate requires reconciliation"}
 		}
 		if !slices.Contains(g.ProtocolVersions, protocol) {
-			return r, errors.New("protocol is not supported by the entire generation cohort")
+			return r, &VerificationRefusal{Message: "protocol is not supported by the entire generation cohort"}
 		}
 		if g.Process == nil || !hostboot.SameBoot(g.Process.SystemBootID, boot) {
-			return r, errors.New("generation process binding missing")
+			return r, &VerificationRefusal{Message: "generation process binding missing"}
 		}
 		residents, observed := evidence.Residents[id]
 		if !observed || residents == nil {
-			return r, errors.New("missing resident inventory; verified idle must be an empty array")
+			return r, &VerificationRefusal{Message: "missing resident inventory; verified idle must be an empty array"}
 		}
 		residents = append([]ResidentAttempt{}, residents...)
 		slices.SortFunc(residents, func(a, b ResidentAttempt) int { return strings.Compare(a.AttemptID, b.AttemptID) })
 		if g.Role == "retiring" && !slices.Equal(g.ResidentAttempts, residents) {
-			return r, errors.New("retiring resident membership changed")
+			return r, &VerificationRefusal{Message: "retiring resident membership changed"}
 		}
 		for _, a := range residents {
 			if a.JobID == "" || a.AttemptID == "" || a.FencingToken == "" || a.AuthorityGeneration <= 0 || a.BootSessionID != g.Process.BootSessionID || seenAttempts[a.AttemptID] {
-				return r, errors.New("invalid resident attempt identity")
+				return r, &VerificationRefusal{Message: "invalid resident attempt identity"}
 			}
 			seenAttempts[a.AttemptID] = true
 		}
 		if id == candidate && len(residents) != 0 {
-			return r, errors.New("staged candidate has resident work")
+			return r, &VerificationRefusal{Message: "staged candidate has resident work"}
 		}
 		g.ResidentAttempts = append([]ResidentAttempt{}, residents...)
 		r.Residents[id] = append([]ResidentAttempt{}, residents...)
@@ -119,7 +131,7 @@ func (s Store) BeginPromotion(candidate, boot, operation string, expectedRevisio
 // in place and startup closed. Retiring labels stay loaded and keep their PIDs.
 func (s Store) CommitPromotion(ctx context.Context, receiptID, operation, boot string, l1Revision int64) error {
 	if !validID(receiptID) {
-		return errors.New("invalid activation receipt ID")
+		return &VerificationRefusal{Message: "invalid activation receipt ID"}
 	}
 	root, close, err := s.open(false)
 	if err != nil {
@@ -134,13 +146,19 @@ func (s Store) CommitPromotion(ctx context.Context, receiptID, operation, boot s
 	if err := readPrivate(root, activationName(receiptID), &r); err != nil {
 		return err
 	}
-	if c.PendingReceipt != receiptID || r.ID != receiptID || r.Version != 1 || r.Committed || c.Primary != r.ExpectedPrimary || c.Revision != r.CatalogRevision+1 || r.L1OperationID != operation || l1Revision <= 0 || l1Revision != r.L1CatalogRevision+1 || r.Protocol != 1 || !hostboot.SameBoot(r.SystemBootID, boot) || len(r.Digests) != len(c.Generations) {
-		return errors.New("activation receipt or promotion result mismatch")
+	if c.PendingReceipt != receiptID || r.ID != receiptID || r.Version != 1 || r.Committed || c.Primary != r.ExpectedPrimary || c.Revision != r.CatalogRevision+1 || r.L1OperationID != operation || l1Revision <= 0 || l1Revision != r.L1CatalogRevision+1 || r.Protocol != 1 || !hostboot.SameBoot(r.SystemBootID, boot) || len(r.Digests)+len(r.ClosedGenerations) != len(c.Generations) {
+		return &VerificationRefusal{Message: "activation receipt or promotion result mismatch"}
 	}
 	retirees := []string{}
 	for id, g := range c.Generations {
+		if binding, closed := r.ClosedGenerations[id]; closed {
+			if g.Role != "retiring" || id == c.Primary || g.Process == nil || *g.Process != binding {
+				return &VerificationRefusal{Message: "closed generation ownership changed"}
+			}
+			continue
+		}
 		if r.Digests[id] != g.Digest || g.Process == nil || r.Processes[id] != *g.Process || !slices.Equal(r.Residents[id], g.ResidentAttempts) {
-			return errors.New("activation cohort changed")
+			return &VerificationRefusal{Message: "activation cohort changed"}
 		}
 		if g.Role == "retiring" {
 			retirees = append(retirees, id)
@@ -148,11 +166,11 @@ func (s Store) CommitPromotion(ctx context.Context, receiptID, operation, boot s
 	}
 	slices.Sort(retirees)
 	if !slices.Equal(retirees, r.Retiring) {
-		return errors.New("activation retiree set changed")
+		return &VerificationRefusal{Message: "activation retiree set changed"}
 	}
 	candidate, ok := c.Generations[r.Candidate]
 	if !ok || candidate.Process == nil || candidate.Role != "" || r.Candidate == r.ExpectedPrimary {
-		return errors.New("candidate process binding missing")
+		return &VerificationRefusal{Message: "candidate process binding missing"}
 	}
 	if _, err := s.ready(ctx, root, c, candidate, *candidate.Process, candidate.Process.ReadyAt); err != nil {
 		return err
@@ -164,7 +182,7 @@ func (s Store) CommitPromotion(ctx context.Context, receiptID, operation, boot s
 	defer folder.Close()
 	now := time.Now().UTC()
 	for id, g := range c.Generations {
-		if id == r.Candidate {
+		if _, closed := r.ClosedGenerations[id]; id == r.Candidate || closed {
 			continue
 		}
 		// No bootstrap, kickstart, reload or bootout here. The launchd override is
@@ -181,7 +199,7 @@ func (s Store) CommitPromotion(ctx context.Context, receiptID, operation, boot s
 			return err
 		}
 		if !privateInfo(info, 0644) || g.PlistDigest == "" || digestBytes(old) != g.PlistDigest {
-			return errors.New("retained generation plist changed")
+			return &VerificationRefusal{Message: "retained generation plist changed"}
 		}
 		g.Role = "retiring"
 		if g.RetiringAt.IsZero() {
@@ -219,7 +237,7 @@ func (s Store) CommitPromotion(ctx context.Context, receiptID, operation, boot s
 // to public reports. It also reads committed audit receipts after cleanup.
 func (s Store) ReadActivationReceipt(id string) (ActivationReceipt, error) {
 	if !validID(id) {
-		return ActivationReceipt{}, errors.New("invalid activation receipt ID")
+		return ActivationReceipt{}, &VerificationRefusal{Message: "invalid activation receipt ID"}
 	}
 	root, close, err := s.open(false)
 	if err != nil {
@@ -231,7 +249,7 @@ func (s Store) ReadActivationReceipt(id string) (ActivationReceipt, error) {
 		return r, err
 	}
 	if r.ID != id || r.Version != 1 || !validID(r.Candidate) || !validID(r.ExpectedPrimary) || r.Protocol != 1 || r.L1OperationID == "" || !hostboot.ValidIdentity(r.SystemBootID) {
-		return r, errors.New("invalid activation receipt")
+		return r, &VerificationRefusal{Message: "invalid activation receipt"}
 	}
 	return r, nil
 }

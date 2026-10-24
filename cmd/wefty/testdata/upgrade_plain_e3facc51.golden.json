@@ -1,0 +1,18 @@
+{
+  "human": {
+    "Stdout": "Installed version: d61c5ae70f7e0cc77c229ca6e89670d9d1c321e4\nNode agent replaced; services come back.\nwaiting_nonrestartable=0 stopping_restartable=0 restart_pending=0\n",
+    "Stderr": "Draining: 0 one-shot attempts remain; waiting_nonrestartable=0 stopping_restartable=0 restart_pending=0; deadline 2026-09-07T00:05:00Z.\nSuccessful node lease renewal after control-plane restart: 200ms (window 23s).\nWarning: \u003cHOME\u003e/.local/bin is not on your login-shell PATH; add it so a new shell finds `wefty` (the node agent already gets it)\n"
+  },
+  "human-already": {
+    "Stdout": "",
+    "Stderr": "already at d61c5ae70f7e0cc77c229ca6e89670d9d1c321e4\n"
+  },
+  "json": {
+    "Stdout": "{\n  \"waiting_nonrestartable\": 0,\n  \"stopping_restartable\": 0,\n  \"restart_pending\": 0,\n  \"version\": \"d61c5ae70f7e0cc77c229ca6e89670d9d1c321e4\",\n  \"lease_renewal_ns\": 200000000,\n  \"setup\": {\n    \"node_id\": \"owners-macbook-pro-5a5a5a5a\",\n    \"profile\": \"\u003cHOME\u003e/.config/wefty/profile.json\",\n    \"node_config\": \"\u003cHOME\u003e/.config/wefty/node.json\",\n    \"l1_address\": \"127.0.0.1:47101\",\n    \"l3_address\": \"127.0.0.1:47102\",\n    \"bin_dir\": \"\u003cHOME\u003e/.local/bin\",\n    \"data_dir\": \"\u003cHOME\u003e/Library/Application Support/wefty\",\n    \"log_dir\": \"\u003cHOME\u003e/Library/Logs/wefty\",\n    \"changes\": [\n      \"installed \u003cHOME\u003e/.local/bin/wefty-l3\",\n      \"installed \u003cHOME\u003e/.local/bin/wefty-l1\",\n      \"installed \u003cHOME\u003e/.local/bin/wefty\",\n      \"installed the wefty skill in \u003cHOME\u003e/.claude/skills/wefty\",\n      \"installed the wefty skill in \u003cHOME\u003e/.agents/skills/wefty\"\n    ],\n    \"services\": [\n      {\n        \"label\": \"dev.wefty.l1\",\n        \"plist\": \"\u003cHOME\u003e/Library/LaunchAgents/dev.wefty.l1.plist\",\n        \"log\": \"\u003cHOME\u003e/Library/Logs/wefty/l1.log\",\n        \"action\": \"reloaded\"\n      },\n      {\n        \"label\": \"dev.wefty.l3\",\n        \"plist\": \"\u003cHOME\u003e/Library/LaunchAgents/dev.wefty.l3.plist\",\n        \"log\": \"\u003cHOME\u003e/Library/Logs/wefty/l3.log\",\n        \"action\": \"reloaded\"\n      },\n      {\n        \"label\": \"dev.wefty.node-agent\",\n        \"plist\": \"\u003cHOME\u003e/Library/LaunchAgents/dev.wefty.node-agent.plist\",\n        \"log\": \"\u003cHOME\u003e/Library/Logs/wefty/node-agent.log\",\n        \"action\": \"reloaded\"\n      }\n    ],\n    \"notes\": [\n      \"\u003cHOME\u003e/.local/bin is not on your login-shell PATH; add it so a new shell finds `wefty` (the node agent already gets it)\"\n    ]\n  },\n  \"running_work\": null,\n  \"already_at\": false\n}\n",
+    "Stderr": ""
+  },
+  "json-already": {
+    "Stdout": "{\n  \"waiting_nonrestartable\": 0,\n  \"stopping_restartable\": 0,\n  \"restart_pending\": 0,\n  \"version\": \"d61c5ae70f7e0cc77c229ca6e89670d9d1c321e4\",\n  \"lease_renewal_ns\": 0,\n  \"setup\": {\n    \"node_id\": \"\",\n    \"profile\": \"\",\n    \"node_config\": \"\",\n    \"l1_address\": \"\",\n    \"l3_address\": \"\",\n    \"bin_dir\": \"\",\n    \"data_dir\": \"\",\n    \"log_dir\": \"\",\n    \"changes\": null,\n    \"services\": null\n  },\n  \"running_work\": null,\n  \"already_at\": true\n}\n",
+    "Stderr": ""
+  }
+}

@@ -66,7 +66,9 @@ func (a *Agent) Retire(ctx context.Context) (l1.NodeGeneration, error) {
 }
 
 func (session *agentSession) observeGeneration(ctx context.Context) (bool, error) {
-	session.retirementMu.Lock()
+	if err := session.lockRetirementAfterReply(ctx); err != nil {
+		return false, err
+	}
 	defer session.retirementMu.Unlock()
 	if session.isRetiring() {
 		return true, nil
@@ -108,6 +110,12 @@ func (session *agentSession) observeGeneration(ctx context.Context) (bool, error
 				session.retirementAttempts[resident.AttemptID] = &retirementAttempt{jobID: resident.JobID, fencingToken: resident.FencingToken, reaped: true, evidenceSettled: true}
 			}
 		}
+		if session.retirementAcknowledged != nil {
+			if err := session.retirementAcknowledged(generation); err != nil {
+				session.claimMu.Unlock()
+				return false, err
+			}
+		}
 		session.retiringGeneration = &generation
 		close(session.retiringRequested)
 		session.claimMu.Unlock()
@@ -133,7 +141,9 @@ func (session *agentSession) trackRetirementEvidence(attemptID string, check fun
 // transaction independently enforces accepted completion or an ended Lease;
 // no local clock or evidence acknowledgment substitutes for that L1 check.
 func (session *agentSession) closeRetirement(ctx context.Context) (bool, error) {
-	session.retirementMu.Lock()
+	if err := session.lockRetirementAfterReply(ctx); err != nil {
+		return false, err
+	}
 	generation := *session.retiringGeneration
 	generation.ResidentAttempts = slices.Clone(generation.ResidentAttempts)
 	session.retirementMu.Unlock()
@@ -187,4 +197,25 @@ func (session *agentSession) closeRetirement(ctx context.Context) (bool, error) 
 		ResidentAttempts: generation.ResidentAttempts, RuntimesReaped: true, EvidenceSettled: true,
 	})
 	return err == nil, err
+}
+
+// lockRetirementAfterReply returns with retirementMu held, but waits for durable
+// publication without holding it. Failed publication leaves this explicit fence
+// in place; heartbeat/close can retry and context cancellation cannot clear it.
+func (session *agentSession) lockRetirementAfterReply(ctx context.Context) error {
+	for {
+		if err := lockMutexContext(ctx, &session.retirementMu); err != nil {
+			return err
+		}
+		pending := session.upgradePromotionReply
+		if pending == nil {
+			return nil
+		}
+		session.retirementMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-pending:
+		}
+	}
 }

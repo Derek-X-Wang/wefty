@@ -14,6 +14,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 const testBoot = "darwin:11111111-1111-1111-1111-111111111111"
@@ -754,5 +755,125 @@ func TestGenerationLifetimeAllowsOneRuntimeClaimAndPreservesReadinessLock(t *tes
 	}
 	if _, err := f.s.BindReady(t.Context(), g.ID, *g.Process, g.CreatedAt); err == nil {
 		t.Fatal("readiness accepted released borrowed lifetime lock")
+	}
+}
+
+func TestFinishedGenerationCleanupAfterControlExchangeAndRetirementAck(t *testing.T) {
+	f := newFixture(t)
+	old := f.prepare(t, true)
+	request := ControlRequest{ID: "operation", RequestID: "request", NodeID: "node", GenerationID: old.ID, BootSessionID: old.Process.BootSessionID, Action: "quiesce_services"}
+	must(t, f.s.RequestControl(request))
+	observed, err := f.s.ReadControl(old.ID)
+	must(t, err)
+	must(t, f.s.PublishControl(ControlResult{Request: observed, Payload: []byte(`{"settled":true}`)}))
+	_, err = f.s.ReadControlResult(old.ID)
+	must(t, err)
+	// Persist successful promotion, then a changed-payload refusal. Cleanup
+	// must retain both evidence slots under the completion receipt.
+	promotion := request
+	promotion.Action = "promote_generation"
+	promotion.Payload = []byte(`{"operation_id":"operation"}`)
+	must(t, f.s.PublishControl(ControlResult{Request: promotion, Payload: []byte(`{"generations":[]}`)}))
+	changed := promotion
+	changed.RequestID = "changed-promotion"
+	changed.Payload = []byte(`{"operation_id":"operation","catalog_revision":99}`)
+	must(t, f.s.PublishControl(ControlResult{Request: changed, Error: "changed promotion"}))
+	refusal, err := f.s.ReadControlReply(changed)
+	must(t, err)
+	if refusal.Error != "changed promotion" {
+		t.Fatal("lost refusal", refusal)
+	}
+	preserved, err := f.s.ReadControlResult(old.ID)
+	must(t, err)
+	if preserved.Error != "" || !SamePromotionControl(preserved.Request, promotion) {
+		t.Fatal("lost successful promotion", preserved)
+	}
+	primary := f.prepare(t, false)
+	f.promote(t, primary)
+	must(t, f.s.PublishRetirement(l1.NodeGeneration{AgentGenerationID: old.ID, BootSessionID: old.Process.BootSessionID, Role: l1.NodeGenerationRetiring}))
+	_, err = f.s.ReadRetirement(old.ID)
+	must(t, err)
+	c, err := f.s.Read()
+	must(t, err)
+	proof := CompletionProof{GenerationID: old.ID, CatalogRevision: c.Revision, Binding: *old.Process, PayloadsAbsent: true, L1SessionClosed: true, EvidenceSafe: true, EvidenceDigest: strings.Repeat("a", 64)}
+	f.releaseLifetime(old.ID)
+	f.f.states[old.Label] = launchagent.State{Loaded: true}
+	must(t, f.s.RemoveFinished(t.Context(), proof))
+	must(t, f.s.RemoveFinished(t.Context(), proof))
+	if _, err := os.Stat(filepath.Dir(old.Executable)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("retained generation directory", err)
+	}
+	var receipt completionReceipt
+	root, close, err := f.s.open(false)
+	must(t, err)
+	defer close()
+	must(t, readPrivate(root, "finished-"+old.ID+".json", &receipt))
+	if len(receipt.ControlFiles) != 4 {
+		t.Fatalf("control evidence not retained: %+v", receipt.ControlFiles)
+	}
+}
+
+func TestFinishedGenerationControlEvidenceIsReceiptBound(t *testing.T) {
+	f := newFixture(t)
+	old := f.prepare(t, true)
+	request := ControlRequest{ID: "operation", RequestID: "request", NodeID: "node", GenerationID: old.ID, BootSessionID: old.Process.BootSessionID, Action: "quiesce_services"}
+	must(t, f.s.RequestControl(request))
+	f.promote(t, f.prepare(t, false))
+	c, err := f.s.Read()
+	must(t, err)
+	proof := CompletionProof{GenerationID: old.ID, CatalogRevision: c.Revision, Binding: *old.Process, PayloadsAbsent: true, L1SessionClosed: true, EvidenceSafe: true, EvidenceDigest: strings.Repeat("a", 64)}
+	f.releaseLifetime(old.ID)
+	f.f.states[old.Label] = launchagent.State{Loaded: true}
+	run := f.s.Manager.Run
+	f.s.Manager.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if args[0] == "bootout" {
+			return nil, errors.New("injected cleanup interruption")
+		}
+		return run(ctx, name, args...)
+	}
+	if err := f.s.RemoveFinished(t.Context(), proof); err == nil {
+		t.Fatal("cleanup interruption missing")
+	}
+	f.s.Manager.Run = run
+	request.RequestID = "changed-after-receipt"
+	must(t, f.s.RequestControl(request))
+	if err := f.s.RemoveFinished(t.Context(), proof); err == nil || !strings.Contains(err.Error(), "control evidence changed") {
+		t.Fatal("changed control evidence removed", err)
+	}
+	request.RequestID = "request"
+	must(t, f.s.RequestControl(request))
+	must(t, f.s.RemoveFinished(t.Context(), proof))
+}
+
+func TestPromotionClosedHistoryRequiresExactRetiringOwnership(t *testing.T) {
+	for _, scenario := range []string{"primary", "candidate", "binding"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newFixture(t)
+			old := f.prepare(t, true)
+			f.promote(t, f.prepare(t, false))
+			candidate := f.prepare(t, false)
+			c, err := f.s.Read()
+			must(t, err)
+			evidence := emptyResidents(c)
+			target := old.ID
+			if scenario == "primary" {
+				target = c.Primary
+			} else if scenario == "candidate" {
+				target = candidate.ID
+			}
+			binding := *c.Generations[target].Process
+			if scenario == "binding" {
+				binding.BootSessionID = "another-boot"
+			}
+			evidence.ClosedGenerations = map[string]Binding{target: binding}
+			delete(evidence.Residents, target)
+			before := len(f.f.mutations)
+			if _, err := f.s.BeginPromotion(candidate.ID, testBoot, "wrong-history", c.Revision, 1, evidence); err == nil {
+				t.Fatal("unverified closed ownership accepted")
+			}
+			if len(f.f.mutations) != before {
+				t.Fatal("refused history changed a generation")
+			}
+		})
 	}
 }

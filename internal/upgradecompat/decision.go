@@ -32,6 +32,7 @@ type Installation string
 
 const (
 	PlainMac Installation = "plain_mac"
+	OCIMac   Installation = "oci_mac"
 	FleetMac Installation = "fleet_mac"
 	Linux    Installation = "linux"
 )
@@ -109,7 +110,7 @@ func Decide(in Input) Decision {
 	if primary == -1 {
 		return Decision{Mode: Refuse, Reason: InvalidInventory}
 	}
-	if in.Installation != PlainMac && in.Installation != FleetMac && in.Installation != Linux {
+	if in.Installation != PlainMac && in.Installation != FleetMac && in.Installation != Linux && in.Installation != OCIMac {
 		return Decision{Mode: Refuse, Reason: InvalidInventory}
 	}
 	oci := false
