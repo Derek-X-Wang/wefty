@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS computer_seat_identities (
  computer_id TEXT NOT NULL,
  place INTEGER NOT NULL CHECK(place BETWEEN 1 AND 4),
  introduced_revision INTEGER NOT NULL CHECK(introduced_revision>0),
- first_attempt_id TEXT
+ first_attempt_id TEXT,
+ ever_live INTEGER NOT NULL DEFAULT 0 CHECK(ever_live IN (0,1))
 );
 CREATE TABLE IF NOT EXISTS computer_wanted_seats (
  computer_id TEXT NOT NULL REFERENCES computers(computer_id) ON DELETE CASCADE,

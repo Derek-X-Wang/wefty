@@ -17,14 +17,14 @@ envelope-schema envelope-schema-file evidence-file fabric fabric-id fabric-name
 file follow-for from oci-config helper-checksum idempotency-key image install-manifest instance-key
 intent-file intent-revision interpreter join-code key kind l1 l3 lang limit local-port manifest
 manifest-digest max-cost max-inflight max-runtime memory-bytes memory-capacity-bytes
-memory-reserve-bytes mode mount name node node-config node-id operator-user origin
+memory-reserve-bytes mode mount name network node node-config node-id operator-user origin
 out outcome params params-file path payload-file payload-json-file permission
 plain-device-id plain-fabric-id plain-identity plain-user-id policy-revision
 poll-interval probe-archive probe-digest probe-reference profile published-port ready-file reason
 reference restart revision role runtime-handler script session-token-file setup-state
 socket state state-dir status step storage-generation storage-id submit-intent-revision
 submitter summary tag tail timeout unit-directory wait wait-timeout workflow-ref
-vm-memory vm-cpus vm-disk working-directory`
+vm-memory vm-cpus vm-disk window working-directory`
 
 func removeBoolFlag(args []string, name string) ([]string, bool, error) {
 	valueFlags := make(map[string]bool)

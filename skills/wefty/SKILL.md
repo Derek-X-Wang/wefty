@@ -1,6 +1,6 @@
 ---
 name: wefty
-description: Submit and track work on a wefty cluster — check the cluster is ready, offload a command and local changes with wefty exec, schedule AI agent workflows and one-shot jobs onto machines you own, wait for an outcome, follow logs, inspect run lineage and results, and rerun from snapshots. Use when the user wants to run something "on wefty", "on the cluster/fabric", schedule AI agent work onto their machines, or check on a wefty run.
+description: Request and wait for Computer Seats, or submit and track work on a wefty cluster — check the cluster is ready, offload a command and local changes with wefty exec, schedule AI agent workflows and one-shot jobs onto machines you own, wait for an outcome, follow logs, inspect run lineage and results, and rerun from snapshots. Use when the user wants to run something "on wefty", "on the cluster/fabric", schedule AI agent work onto their machines, or check on a wefty run.
 ---
 
 # Driving a wefty cluster
@@ -8,7 +8,8 @@ description: Submit and track work on a wefty cluster — check the cluster is r
 Wefty is a personal compute fabric: the user's machines form one tag-routed
 cluster; every execution is permanently recorded. Read `CONTEXT.md` at the
 repo root for the vocabulary — the short version: a **workflow** is a stored
-program; running anything creates a **run** in the ledger (L3); the run
+program; executing workflow or one-shot work creates a **run** in the ledger
+(L3); the run
 becomes a **job** in the cluster queue (L1); a node agent claims it as an
 **attempt**.
 
@@ -118,6 +119,41 @@ WEFTY_L3_ADDR=<host:port>` makes them the defaults, and a flag still wins.
 right. `wefty run ...` and `wefty workflow init` are
 the exceptions: they only write files, so they need no endpoint, no identity and
 no credential — see "Reporting from a workflow".
+
+## Request a Computer Seat
+
+For screen work, request one Seat on a Computer. Name the network explicitly:
+
+```sh
+wefty seat request --network internet
+wefty seat request --network none
+wefty seat request --network internet --dedicated
+wefty seat request --network internet --window 8h
+wefty seat wait SEAT_ID
+wefty seat --help
+```
+
+The request prints one `seat_<32 hex>` ID immediately, then waits for a ready
+Seat or a typed refusal. After a cut-off call, use `seat wait` with that ID;
+requesting again makes a different request. The request waits during the
+owner's dialog; run it in the background or rely on `wefty seat wait`.
+The network is required. `internet`
+asks for internet; `none` asks for no internet. `--dedicated` asks for a new
+Computer with a Seat limit of 1. Without it, wefty uses a shared Computer with
+room or creates another. `--window` asks the owner for 1, 8 or 24 hours of
+approval; only the native dialog can open it. `wefty seat window close` takes
+window approval away early. Harness names are labels, marked not verified.
+
+A full node refuses before showing a dialog: `out of room, try again later`
+(`seat_room_full`, exit 5). Denial, no answer, the dedicated cap, and an off
+host VM also have distinct typed refusal codes. There is no wait queue for
+room. A wait observes its original request and never opens a second dialog.
+
+The CLI prints the credential path. Later calls search the state folder, then
+the macOS temp folder.
+
+If the sandbox blocks the wefty socket, stop and ask the owner; Seats add no
+socket allowance.
 
 ## One command with local changes: `wefty exec`
 
@@ -287,6 +323,8 @@ settings, for example:
 ```json
 {"sandbox":{"filesystem":{"allowWrite":["~/.local/state/wefty/exec"]}}}
 ```
+
+For Seat credentials, add `~/.local/state/wefty/seats` beside the exec folder in Claude Code `allowWrite` or its absolute path in Codex `writable_roots`.
 
 See Claude Code's [sandbox configuration](https://code.claude.com/docs/en/sandboxing#configure-sandboxing).
 After the allowance is active, check it with `wefty exec -- go version`.

@@ -2611,3 +2611,95 @@ this change introduces no new settings mutation route.
 Repeated non-retryable L1 409s have a bounded exponential retry floor. The
 `seat_list_revision_changed` conflict is an ordinary concurrent-list race and
 does not contribute to that backoff.
+
+## Reconnectable Seat request flow (#1143)
+
+The CLI generates its ID with L1's `newID("seat")` format and writes a private
+input receipt before `POST /v1/seat-requests`. L1's `seat_request_calls` stores
+that same ID, immutable input, original Fabric caller identity, serving Node,
+boot session, creation time, one L1-minted credential and `start_finished`.
+The latter commits as true with the fenced Starting-to-Live observation, so
+a cut-off CLI cannot lose the fact that the Computer started. Any Seat's Live
+receipt makes the Computer existing, even when a later request becomes ready
+first. No Computer/Attempt
+foreign key is added. The existing `seat_approvals` lifecycle remains the only
+Seat lifecycle. Before the node has done preflight, a call reads as requested.
+The retained call is not a wait queue for room: the first node preflight refuses
+lack of room at once. The existing single-dialog queue retains its deadlines.
+
+`GET /v1/seat-requests/{seat_id}` is bound to the original caller. The same POST
+replays identical input; another caller is forbidden, and changed input is a
+`dispatch_key_conflict`. Only the existing native dialog/window can approve.
+The public routes cannot reach approval-grant, room-reservation or Start paths.
+The credential is returned only while the existing lifecycle says live.
+
+The current node and boot use `POST /v1/agent/seat-requests/poll` to receive
+pending input. Registration advertises `computer:seat-requests` only when
+Computer room is configured, independently of runtime readiness. Create refuses
+immediately when that capability is absent. An unpicked call expires at
+creation plus `MaxSeatApprovalWait`, with `the node did not pick up the request`.
+The read path commits that refusal with fresh caller and unpicked-state checks.
+The node supplies its configured room, intent, answer wait and allowed window
+hours (`null` defaults to 1, 8 and 24; an empty list allows no windows). An
+unsupported window is refused before a dialog, naming the allowed lengths.
+Before any dialog, L1 checks those values against its durable room and dedicated
+count only while the call is Requested. The refusing write rechecks that state
+and an empty Computer binding; Approved calls use ReserveSeatRoom's fence.
+Errors for one candidate are logged and skipped so other requests can proceed.
+The answer deadline includes dispatch delay from request creation; the
+approval controller receives the remaining time. It retains an unconfirmed
+owner answer per Seat ID and retries a failed answer post with exponential
+backoff from one to thirty seconds, bounded by that same deadline. The in-memory
+entry is dropped when L1 returns a state past Requested, or after the deadline
+once the answer has been posted. Subsequent calls read L1's durable result.
+It never shows a second dialog for that ID. A new boot still refuses a lost
+dialog under #1142. A request that lost its node
+boot is refused. The node-owned poller survives CLI cancellation, re-reads
+intent after the dialog, and uses
+`POST /v1/agent/seat-requests/{seat_id}/advance` only after approval.
+
+Advance first uses the permanent reservation on replay. An any request takes
+a free place on a shared, on-demand Computer with its network and desired state
+running; failed Computers are excluded. If all such Computers are full, it
+creates a shared Computer. Dedicated creates a Computer with Seat limit 1.
+Creation uses the newest pinned default image and 8 GiB Storage. The deterministic
+Computer name/dispatch key is derived from the Seat ID. Creation and its first
+room reservation share one SQLite write transaction: a losing request rolls
+back the Computer, Job, Storage generation and room writes, then keeps only
+its refused request record. No claim can start the losing Computer.
+The existing #1142 controller grows memory before publishing a Seat directive.
+Its fenced helper observation is the only way Starting becomes Live. The
+request's immutable Start wait is L1's prestart infrastructure budget (ten
+minutes by default) plus the helper's sixty-second readiness interval. The
+image pull/unpack occurs before task start; it must fit that prestart budget.
+Polling or replay cannot restart this deadline. Selection is serialized per
+node, with the SQLite room fence still authoritative across nodes.
+
+Poll also reconciles a starting request's readiness deadline and Computer
+failure. A refused request that created a new Computer whose Seats never
+became Live requests removal through the existing Computer removal protocol. Finished starts
+leave the request controller permanently; later Seat failures cannot delete an
+existing Computer or disturb its other Seats. Removal rechecks those positive
+receipts and the refused request in its write transaction; a stale start-refusal
+decision likewise cannot end a Seat that already became Live. Existing failure
+latches stay.
+The public receipt reports `cleanup_pending` while its Seat cleanup remains
+unconfirmed, and also until verified removal of a failed new Computer. The CLI
+waits up to `seatCleanupWaitLimit` (one minute) after first seeing pending
+cleanup, then returns the typed outcome with an explicit `cleanup still pending`
+note and `details.cleanup_pending: true`. L1 continues reconciliation and keeps
+room held until positive cleanup/removal evidence; CLI completion is not cleanup
+evidence. An approval refusal allocates no Computer or room. Poll retries
+unfinished removal and never revives a final Seat. This ticket serves a running
+host VM; the stopped-host-VM demand/wait path is owned by #1144.
+
+The four new routes and their closed request/response schemas are published in
+`api/openapi` and pinned to the Go types by drift tests.
+
+Call credentials are scrubbed transactionally on refusal and on entry to Ending
+or Ended, including upgraded final records. The call's node foreign key cascades
+on node deletion. A final approval's deletion prunes its call receipt in the
+same transaction. #1142 currently retains final Seat records indefinitely; no
+new time-based retention period is introduced here. Permanent Seat identities
+retain `ever_live`, backfilled from the original `start_finished` receipts, so
+pruning call records cannot turn an existing Computer into a failed new start.

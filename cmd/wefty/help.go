@@ -123,7 +123,9 @@ func wantsCommandHelp(args []string) bool {
 var positionalCommandUsage = map[string]string{
 	"seat window close":               seatWindowUsage,
 	"seat window":                     seatWindowUsage,
-	"seat":                            seatWindowUsage,
+	"seat":                            seatUsage,
+	"seat request":                    seatUsage,
+	"seat wait":                       seatUsage,
 	"whoami":                          "usage: wefty whoami",
 	"admin bootstrap":                 "usage: wefty admin bootstrap NONCE",
 	"admin policy get":                "usage: wefty admin policy get",

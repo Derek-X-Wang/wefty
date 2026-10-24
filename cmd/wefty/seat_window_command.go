@@ -13,8 +13,11 @@ import (
 const seatWindowUsage = "usage: wefty seat window close\nClose this node's approval windows early. Only the native dialog can open one.\n"
 
 func executeSeat(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
-	if len(args) != 2 || args[0] != "window" || args[1] != "close" {
-		return usageError(seatWindowUsage)
+	if len(args) == 0 || args[0] != "window" {
+		return executeSeatRequest(ctx, clients, jsonOutput, args, stdout)
+	}
+	if len(args) != 2 || args[1] != "close" {
+		return usageError(seatUsage)
 	}
 	local, err := resolveLocalNode(ctx, clients)
 	if err != nil {

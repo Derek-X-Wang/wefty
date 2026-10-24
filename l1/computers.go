@@ -168,6 +168,8 @@ type ComputerBackupCapRequest struct {
 
 type ComputerRemoveRequest struct {
 	ComputerMutationPrecondition
+	// Node-owned failed-start cleanup only; never accepted from JSON.
+	failedSeatRequestID string
 }
 
 type ComputerProjectionRequest struct {
@@ -335,6 +337,28 @@ func requireComputerCAS(result sql.Result, computerID string, observedRevision i
 // one transaction. Bare Computer-trait Job creation is rejected by CreateJob
 // so no runtime projection can exist without this authority row.
 func (s *Store) CreateComputer(ctx context.Context, request CreateComputerRequest) (Computer, bool, error) {
+	now := canonicalTime(s.clock.Now())
+	write, err := s.beginWriteTransaction(ctx, nil, now)
+	if err != nil {
+		return Computer{}, false, internalError(err, "begin Computer creation")
+	}
+	defer write.rollback()
+	computer, replay, err := s.createComputerTx(ctx, write.tx, now, request)
+	if err != nil {
+		return Computer{}, false, err
+	}
+	if err := write.commit(); err != nil {
+		return Computer{}, false, internalError(err, "commit Computer creation")
+	}
+	if !replay {
+		s.notifyComputerPolicyChanged()
+	}
+	return computer, replay, nil
+}
+
+// createComputerTx only creates the Computer. Seat approval and room are
+// exclusively reachable from the node-only request controller.
+func (s *Store) createComputerTx(ctx context.Context, tx *sql.Tx, now time.Time, request CreateComputerRequest) (Computer, bool, error) {
 	request.Name = strings.TrimSpace(request.Name)
 	request.Actor = strings.TrimSpace(request.Actor)
 	if err := validateComputerNameAndActor(request.Name, request.Actor); err != nil {
@@ -371,13 +395,6 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	if err != nil {
 		return Computer{}, false, err
 	}
-	now := canonicalTime(s.clock.Now())
-	write, err := s.beginWriteTransaction(ctx, nil, now)
-	if err != nil {
-		return Computer{}, false, internalError(err, "begin Computer creation")
-	}
-	tx := write.tx
-	defer write.rollback()
 
 	if existing, storedHash, readErr := getJobByDispatchKey(ctx, tx, request.Spec.DispatchKey, now); readErr == nil {
 		if storedHash != requestHash {
@@ -472,10 +489,6 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 	if err != nil {
 		return Computer{}, false, internalError(err, "read created Computer")
 	}
-	if err := tx.Commit(); err != nil {
-		return Computer{}, false, internalError(err, "commit Computer creation")
-	}
-	s.notifyComputerPolicyChanged()
 	return computer, false, nil
 }
 
@@ -1375,6 +1388,24 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	}
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer removal target")
+	}
+	if id := request.failedSeatRequestID; id != "" {
+		if computer.Name != seatCallComputerName(id) || !computer.SeatRequestMade {
+			return Computer{}, protocolError(contract.ErrorConflict, "Computer does not belong to this Seat request")
+		}
+		finished, err := computerHasFinishedSeatCall(ctx, tx, computerID)
+		if err != nil {
+			return Computer{}, err
+		}
+		seat, err := readSeatRequest(ctx, tx, id)
+		if err != nil {
+			return Computer{}, err
+		}
+		// The readiness receipt and refusal are checked in this write, not
+		// merely when cleanup was planned from an older Read snapshot.
+		if finished || seat.State != SeatRefused || seat.ComputerID != computerID {
+			return computer, nil
+		}
 	}
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, err

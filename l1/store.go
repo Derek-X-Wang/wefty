@@ -106,6 +106,8 @@ type Store struct {
 	computerSharedSeatLimit           int
 	reconfigurationHook               func(string) error
 	deploymentID                      string
+	seatCallSelectionMu               sync.Mutex
+	seatCallSelections                map[string]*seatCallNodeSelection
 	policyChangeMu                    sync.Mutex
 	policyChanged                     chan struct{}
 	// secretWALMu serializes SweepScrubbedSecrets. secretWALGeneration is the
@@ -1273,12 +1275,16 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
 -- log_events at read time since #49, and nothing read the table (#52).
 DROP TABLE IF EXISTS job_log_jsonl;
 `
-	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema); err != nil {
+	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema+seatCallSchema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
 	if err := s.migrateSeatLifecycle(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateSeatCalls(ctx); err != nil {
+		return err
+	}
+
 	if err := s.migrateAdminPersonDevice(ctx); err != nil {
 		return err
 	}

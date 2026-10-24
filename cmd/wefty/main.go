@@ -79,6 +79,21 @@ const (
 
 const errorWaitTimeout contract.ErrorCode = "wait_timeout"
 
+// Seat refusal codes share the conflict exit. This is the explicit whitelist
+// consumed by command_reporting.go and exercised through the real binary.
+const (
+	seatErrorRoomFull         contract.ErrorCode = "seat_room_full"
+	seatErrorNoAnswer         contract.ErrorCode = "seat_no_answer"
+	seatErrorDenied           contract.ErrorCode = "seat_denied"
+	seatErrorDedicatedCap     contract.ErrorCode = "seat_dedicated_cap"
+	seatErrorHostOff          contract.ErrorCode = "seat_host_off"
+	seatErrorStartFailed      contract.ErrorCode = "seat_start_failed"
+	seatErrorRoomUnconfigured contract.ErrorCode = "seat_room_unconfigured"
+	seatErrorNodeUnavailable  contract.ErrorCode = "seat_node_unavailable"
+	seatErrorWindowNotAllowed contract.ErrorCode = "seat_window_not_allowed"
+	seatErrorEnded            contract.ErrorCode = "seat_ended"
+)
+
 func commandExitCode(err error) int {
 	return decideCommandReport(err).exitCode
 }
@@ -182,6 +197,11 @@ func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.W
 	// with, so requiring one here would defeat the mailbox entirely.
 	if handled, err := executeAuthoringCommand(options, commandArgs, stdout, stderr); handled {
 		return err
+	}
+	if commandArgs[0] == "seat" {
+		if err := validateSeatArgs(commandArgs[1:]); err != nil {
+			return err
+		}
 	}
 	if err := applyConnectionProfile(&options); err != nil {
 		return err
@@ -438,6 +458,9 @@ Commands:
                              --node-id chooses a stable ID on first install
                              Plain Mac only: --remove keeps data and logs; --purge deletes them
                              Fleet removal is not supported yet
+  seat request --network internet|none [--dedicated] [--window 1h|8h|24h]
+                             Request one approved Computer Seat
+  seat wait SEAT_ID          Wait again by the original request ID
   seat window close         Close this node's approval windows early
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
   whoami                    Observe the current Fabric-scoped person identity in L1

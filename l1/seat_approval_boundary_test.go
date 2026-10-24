@@ -10,7 +10,7 @@ import (
 
 // AP-4 follows the production call graph from every registered HTTP handler
 // to SQL that touches approval tables, including helpers and read callbacks.
-// Read/close and exact owner revocation routes may reach these tables.
+// Request receipts, read/close and exact owner revocation routes may reach these tables.
 // Approval grants, room reservation and starts remain node-only.
 func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	_, files, info := readBoundaryTypes(t)
@@ -93,7 +93,7 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	granting := map[*types.Func]bool{}
 	for fn := range calls.bodies {
 		switch fn.Name() {
-		case "BeginSeatApproval", "AnswerSeatApproval", "saveSeatApproval", "ReserveSeatRoom", "StartSeatRequest":
+		case "BeginSeatApproval", "AnswerSeatApproval", "saveSeatApproval", "ReserveSeatRoom", "reserveSeatRoomTx", "StartSeatRequest":
 			granting[fn] = true
 		}
 	}
@@ -177,6 +177,8 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 		t.Fatalf("node-principal mux mounts=%d", agentMounts)
 	}
 	allowed := map[string]string{
+		"POST /v1/seat-requests":               "createSeatCall",
+		"GET /v1/seat-requests/{seat_id}":      "getSeatCall",
 		"GET /v1/seat-approval-windows":        "listSeatApprovalWindows",
 		"POST /v1/seat-approval-windows/close": "closeSeatApprovalWindows",
 	}
@@ -241,8 +243,8 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 				t.Errorf("non-node route reaches approval SQL: %s", route)
 			} else if !reviewedHandler(call.Args[1], expected) {
 				t.Errorf("approval route %s must use its exact reviewed handler %s", route, expected)
-			} else if _, revoking := revocations[route]; revoking && reachesGrant(calls.resolve(call.Args[1])) {
-				t.Errorf("owner revocation route can grant Seat authority: %s", route)
+			} else if reachesGrant(calls.resolve(call.Args[1])) {
+				t.Errorf("non-node route can grant Seat authority: %s", route)
 			} else {
 				seen[route] = true
 			}

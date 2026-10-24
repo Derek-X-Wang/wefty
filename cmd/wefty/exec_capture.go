@@ -486,17 +486,7 @@ func errorsWithCleanup(err error, storage string) error {
 }
 
 func execStorageRoot() (string, error) {
-	if root := os.Getenv("WEFTY_EXEC_STORAGE_ROOT"); root != "" {
-		return filepath.Abs(root)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	if root := os.Getenv("XDG_STATE_HOME"); filepath.IsAbs(root) {
-		return filepath.Join(root, "wefty", "exec"), nil
-	}
-	return filepath.Join(home, ".local", "state", "wefty", "exec"), nil
+	return userStateStorageRoot("WEFTY_EXEC_STORAGE_ROOT", "exec")
 }
 
 // Git's --stdin-paths parser uses C quoting, with octal escapes for bytes.

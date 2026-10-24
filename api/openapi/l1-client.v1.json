@@ -8,6 +8,105 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+      "/v1/seat-requests": {
+        "post": {
+          "operationId": "createSeatCall",
+          "summary": "createSeatCall",
+          "responses": {
+            "200": {
+              "description": "Durable Seat request receipt.",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "./common.v1.json#/components/schemas/SeatCallResult"
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "404": {
+              "$ref": "./common.v1.json#/components/responses/NotFound"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "500": {
+              "$ref": "./common.v1.json#/components/responses/Internal"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          },
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatCallInput"
+                }
+              }
+            }
+          }
+        }
+      },
+      "/v1/seat-requests/{seat_id}": {
+        "parameters": [
+          {
+            "name": "seat_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^seat_[0-9a-f]{32}$"
+            }
+          }
+        ],
+        "get": {
+          "operationId": "getSeatCall",
+          "summary": "getSeatCall",
+          "responses": {
+            "200": {
+              "description": "Durable Seat request receipt.",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "./common.v1.json#/components/schemas/SeatCallResult"
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "404": {
+              "$ref": "./common.v1.json#/components/responses/NotFound"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "500": {
+              "$ref": "./common.v1.json#/components/responses/Internal"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          }
+        }
+      },
     "/v1/seat-approval-windows": {
       "get": {
         "operationId": "listSeatApprovalWindows",

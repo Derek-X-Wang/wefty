@@ -13,7 +13,7 @@ var helpCommands = []string{
 	"open",
 	"", "help", "exec", "setup", "submit", "status", "whoami", "cancel", "rerun", "logs", "wait", "results", "inspect", "drain",
 	"nodes", "nodes list", "nodes inspect", "nodes set-claims", "jobs", "jobs list", "computers", "computers list", "runs", "runs list",
-	"seat", "seat window", "seat window close",
+	"seat", "seat request", "seat wait", "seat window", "seat window close",
 	"admin", "admin bootstrap", "admin policy", "admin policy get", "admin policy add", "admin policy remove",
 	"admins", "admins list", "admins get", "admins add", "admins remove",
 	"node", "node doctor", "node setup-oci", "node load-image", "node oci", "node oci start", "node oci stop", "node oci removals",
@@ -109,7 +109,10 @@ func expectedHelpFirstLine(command string) string {
 	if command == "" || command == "help" || commandHelpGroups[command] {
 		return helpFirstLine([]byte(rootUsage))
 	}
-	if command == "seat" || command == "seat window" || command == "seat window close" {
+	if command == "seat" || command == "seat request" || command == "seat wait" {
+		return "usage: wefty seat request"
+	}
+	if command == "seat window" || command == "seat window close" {
 		return "usage: wefty seat window close"
 	}
 	if _, ok := positionalCommandUsage[command]; ok {

@@ -324,3 +324,46 @@ func releasedAddress(t *testing.T) string {
 	}
 	return address
 }
+
+func TestSkillSeatDialogAndStateFolder(t *testing.T) {
+	skill := readSkill(t)
+	if strings.Contains(skill, "setsid") {
+		t.Fatal("Seat command process semantics belong to #1151")
+	}
+	for _, text := range []string{"owner's dialog", "background", "wefty/seats"} {
+		if !strings.Contains(skill, text) {
+			t.Errorf("Seat guidance missing %q", text)
+		}
+	}
+}
+
+func TestSkillSeatCredentialGuidanceIsBrief(t *testing.T) {
+	skill := readSkill(t)
+	_, section, ok := strings.Cut(skill, "## Request a Computer Seat\n")
+	if !ok {
+		t.Fatal("Seat guidance missing")
+	}
+	section, _, _ = strings.Cut(section, "\n## ")
+	var credential string
+	for _, paragraph := range strings.Split(section, "\n\n") {
+		if strings.Contains(paragraph, "credential") {
+			credential = paragraph
+			break
+		}
+	}
+	text := strings.Join(strings.Fields(credential), " ")
+	if len(strings.Fields(text)) > 45 {
+		t.Errorf("credential guidance should only teach the printed path and search order: %d words", len(strings.Fields(text)))
+	}
+	for _, want := range []string{"prints the credential path", "state folder, then the macOS temp folder"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("credential guidance missing %q", want)
+		}
+	}
+	if strings.Contains(section, "WEFTY_SEAT_STATE_ROOT") || strings.Contains(section, "XDG_STATE_HOME") {
+		t.Error("storage configuration detail belongs in the contract")
+	}
+	if !strings.Contains(skill, "For Seat credentials, add `~/.local/state/wefty/seats` beside the exec folder in Claude Code `allowWrite` or its absolute path in Codex `writable_roots`.") {
+		t.Error("Seat sandbox allowance must stay beside exec's folder guidance")
+	}
+}

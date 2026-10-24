@@ -400,3 +400,71 @@ When participant ownership refusal joins an enrolment failure, classification
 still selects `participant_in_use` and exit 3, but the JSON message retains both
 the original enrolment cause and the ownership refusal. Response extensions on
 the local protocol are tolerated by older clients; server requests stay strict.
+
+## Seat requests (#1143)
+
+`wefty seat request --network internet|none [--dedicated] [--window 1h|8h|24h]`
+prints `seat_<32 hex>` before submitting and waits for that request. The network
+has no default. Missing/unknown flags, a missing network, unsupported window
+lengths, and stage-B `--computer`/`--node` flags are usage errors (exit 2).
+`wefty seat wait SEAT_ID` observes the same request. Neither command can approve.
+`wefty seat --help` lists the available Seat commands without opening Fabric.
+
+The CLI writes the immutable request to a private receipt before its first POST.
+A wait that finds no server record can replay that receipt under the same ID;
+it cannot change the input, caller, deadline, dialog or Seat membership. Without
+a receipt, an unknown ID remains not found (exit 4). Interrupting a wait leaves
+the node-owned request running and retains the ID. It does not deny approval.
+With `--json`, request emits an initial ID document followed by its terminal
+result document; wait emits only its terminal result. Refusals use the common
+JSON error document on stderr, with `details.seat_id` and these codes:
+
+| Code | Message | Exit | Retryable |
+| --- | --- | --- | --- |
+| `seat_room_full` | out of room, try again later | 5 | true |
+| `seat_no_answer` | no answer from the owner (also a lost/unavailable dialog) | 5 | true |
+| `seat_denied` | denied by the owner | 5 | false |
+| `seat_dedicated_cap` | dedicated Computer cap reached | 5 | false |
+| `seat_host_off` | the host VM is off | 5 | false |
+| `seat_start_failed` | the recorded start/readiness failure reason | 5 | false |
+| `seat_room_unconfigured` | Computer room is not configured on this node | 5 | false |
+| `seat_node_unavailable` | the node did not pick up the request | 5 | true |
+| `seat_window_not_allowed` | requested window is not enabled; names the allowed windows | 5 | false |
+| `seat_ended` | Seat ended: the recorded end reason | 5 | false |
+
+No new process exit number is added. The whitelist in `main.go`, the shared
+command reporter and real-binary tests pin these typed conflict outcomes.
+A new Computer whose Seats never became Live settles a failed start through the
+existing verified removal protocol. After first observing a terminal outcome
+with `cleanup_pending`, each CLI wait gives cleanup up to one minute
+(`seatCleanupWaitLimit`). If cleanup remains pending, the CLI returns the
+original typed outcome and exit code, appends `cleanup still pending` and the
+same-ID wait command, and includes `details.cleanup_pending: true`. Cleanup
+finishing within that minute returns the ordinary outcome. This limit bounds
+only the CLI wait: L1 keeps its cleanup state, room fence and verified-removal
+requirements until the Seat, Computer and Storage cleanup is confirmed. Once a
+Seat became Live, its Computer stays existing
+even after a later Seat failure; its other Seats, failure latch and cleanup
+fence are preserved.
+A room-race loser does not create a Computer or Storage generation at all.
+
+L1 mints one random Seat credential and stores it with the caller-bound request.
+Only a live request returns it to its original Fabric caller. Repeated waits
+receive the same credential. The CLI never prints the credential. It writes
+`<seat_id>.json` under `$XDG_STATE_HOME/wefty/seats` when XDG_STATE_HOME is
+absolute, otherwise `~/.local/state/wefty/seats`. Only on macOS, permission or
+read-only failures fall back to `os.TempDir()/wefty-seats`. The
+`WEFTY_SEAT_STATE_ROOT` override never falls back. Readers search the same
+ordered roots, even when the default root has become writable since an earlier
+fallback. The root must be a 0700 directory owned by the current uid; files
+are 0600. The credential file is a JSON object with `seat_id` and `credential`
+string fields. The immutable replay receipt is the sibling
+`<seat_id>.request.json`. A directory-root handle and atomic relative rename
+keep interrupted writes and replaced symlinks from redirecting credential writes.
+Removing CLI files when a Seat ends belongs to #1146. L1 erases its stored
+credential when the Seat ends or is refused; call-row pruning follows the final
+Seat record's retention. The permanent Seat identity keeps the once-Live guard
+independently of pruned call receipts.
+The final JSON result names `credential_file`; text output names the same file.
+This storage does not grant socket access or any approval. A sandbox that
+blocks the wefty socket stays refused under the client-service contract.

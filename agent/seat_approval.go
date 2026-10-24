@@ -97,10 +97,12 @@ type SeatApprover interface {
 }
 
 type seatApprovalCall struct {
-	done    chan struct{}
-	request l1.SeatApprovalRequest
-	result  l1.SeatApproval
-	err     error
+	done     chan struct{}
+	request  l1.SeatApprovalRequest
+	result   l1.SeatApproval
+	err      error
+	answer   *l1.SeatApprovalAnswer
+	deadline time.Time
 }
 type SeatApprovalController struct {
 	client                SeatApprovalClient
@@ -156,14 +158,18 @@ func (c *SeatApprovalController) RequestApproval(ctx context.Context, request l1
 	call := &seatApprovalCall{done: make(chan struct{}), request: request}
 	c.calls[request.SeatID] = call
 	c.mu.Unlock()
-	call.result, call.err = c.requestApproval(ctx, request)
+	call.result, call.err = c.requestApproval(ctx, request, call)
 	c.mu.Lock()
-	delete(c.calls, request.SeatID)
+	settled := call.err == nil && call.result.State != "" && call.result.State != "requested"
+	expired := call.answer != nil && !c.clock.Now().Before(call.deadline)
+	if call.answer == nil || settled || expired {
+		delete(c.calls, request.SeatID)
+	}
 	close(call.done)
 	c.mu.Unlock()
 	return call.result, call.err
 }
-func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1.SeatApprovalRequest) (l1.SeatApproval, error) {
+func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1.SeatApprovalRequest, call *seatApprovalCall) (l1.SeatApproval, error) {
 	started := c.clock.Now()
 	pending, err := c.client.BeginSeatApproval(ctx, request)
 	if err != nil || pending.State != "requested" {
@@ -176,6 +182,7 @@ func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1
 	if serverDeadline.Before(deadline) {
 		deadline = serverDeadline
 	}
+	call.deadline = deadline
 	remaining := deadline.Sub(c.clock.Now())
 	answer := l1.SeatApprovalAnswer{NodeID: c.nodeID, BootSessionID: c.bootSessionID, Reason: "no answer from the owner"}
 	if remaining > 0 {
@@ -191,7 +198,27 @@ func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1
 		case <-timer.C():
 		}
 	}
-	return c.client.AnswerSeatApproval(context.WithoutCancel(ctx), request.SeatID, answer)
+	// Keep an unconfirmed answer until L1 settles it or its deadline passes.
+	// A lost post must never turn it back into a new dialog on the next poll.
+	call.answer = &answer
+	backoff := time.Second
+	for {
+		postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		value, err := c.client.AnswerSeatApproval(postCtx, request.SeatID, *call.answer)
+		cancel()
+		if err == nil || ctx.Err() != nil || !c.clock.Now().Before(deadline) {
+			return value, err
+		}
+		retry := c.clock.NewTimer(min(backoff, deadline.Sub(c.clock.Now())))
+		select {
+		case <-ctx.Done():
+			stopTimer(retry)
+			return value, ctx.Err()
+		case <-retry.C():
+			stopTimer(retry)
+		}
+		backoff = min(30*time.Second, backoff*2)
+	}
 }
 
 // The node owns the slot until Show has returned, including after cancellation.

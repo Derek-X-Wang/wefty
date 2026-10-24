@@ -789,6 +789,7 @@ func run() error {
 		deadman = ociAttemptDeadman{barrier: bootBarrier, nodeID: *nodeID, bootSessionID: bootSessionID}
 	}
 	nodeAgent, err := agent.New(agent.Config{
+		ComputerRoom:         computerRoom,
 		SeatApprovalSettings: agent.SeatApprovalSettings{AnswerWait: *seatApprovalAnswerWait, WindowHours: approvalWindowHours},
 		AgentGenerationID:    *agentGenerationID,
 		RetirementAcknowledged: func(g l1.NodeGeneration) error {
