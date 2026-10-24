@@ -245,18 +245,26 @@ func TestHelperComputerSeatsIM5(t *testing.T) {
 		}
 	}
 	run("sh", "-c", "echo retained > /wefty/service/shared/keep")
-	// This Seat-owned tmpfs file remains charged after its writer dies. Only
-	// the image's uid-based scratch cleanup can release its 128 MiB of shmem.
+	// The root-owned sticky folder survives Seat cleanup, but its Seat-owned
+	// contents must not. Split the 128 MiB charge between top-level and nested
+	// files so either leak exceeds the recovery tolerance below.
+	scratchDir := filepath.Join(proc, "root/dev/shm/wefty-seat-im5-shared")
+	must(os.Mkdir(scratchDir, 0777))
+	must(os.Chmod(scratchDir, os.ModeSticky|0777))
+	must(os.WriteFile(filepath.Join(scratchDir, "keep"), []byte("other uid\n"), 0600))
+	// These Seat-owned tmpfs files remain charged after their writer dies. Only
+	// the image's uid-based scratch cleanup can release their 128 MiB of shmem.
 	// The detached writer also exercises cleanup beyond the desktop process group.
 	run("python3", "-c", `import os,time
 if os.fork(): os._exit(0)
 os.setsid()
 if os.fork(): os._exit(0)
-with open('/dev/shm/wefty-seat-im5-1','wb') as f:
-    chunk=b'x'*(1024*1024)
-    for _ in range(128): f.write(chunk)
-    f.flush()
-    os.fsync(f.fileno())
+for path in ('/dev/shm/wefty-seat-im5-1', '/dev/shm/wefty-seat-im5-shared/nested'):
+    with open(path,'wb') as f:
+        chunk=b'x'*(1024*1024)
+        for _ in range(64): f.write(chunk)
+        f.flush()
+        os.fsync(f.fileno())
 open('/wefty/service/seats/1/home/allocated','w').write('ready')
 time.sleep(180)`)
 	allocation := filepath.Join(proc, "root/wefty/service/seats/1/home/allocated")
@@ -270,10 +278,13 @@ time.sleep(180)`)
 		time.Sleep(100 * time.Millisecond)
 	}
 	scratch := filepath.Join(proc, "root/dev/shm/wefty-seat-im5-1")
-	info, err := os.Stat(scratch)
-	must(err)
-	if info.Size() != 128<<20 {
-		t.Fatal("tmpfs fixture size mismatch")
+	nestedScratch := filepath.Join(scratchDir, "nested")
+	for _, path := range []string{scratch, nestedScratch} {
+		info, err := os.Stat(path)
+		must(err)
+		if info.Size() != 64<<20 {
+			t.Fatalf("tmpfs fixture size mismatch: %s", filepath.Base(path))
+		}
 	}
 	chargeBefore := charge()
 	before := memory()
@@ -299,8 +310,15 @@ time.sleep(180)`)
 	if !recovered {
 		t.Fatalf("Seat anon+shmem did not return: baseline=%d before=%d after=%d tolerance=%d consecutive=%d", baseline, chargeBefore, chargeAfter, recovery.tolerance, recovery.consecutive)
 	}
-	if _, err := os.Lstat(scratch); !os.IsNotExist(err) {
-		t.Fatalf("Seat tmpfs fixture remains or cannot be inspected: %v", err)
+	for _, path := range []string{scratch, nestedScratch} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("Seat tmpfs fixture %s remains or cannot be inspected: %v", filepath.Base(path), err)
+		}
+	}
+	foreign, err := os.ReadFile(filepath.Join(scratchDir, "keep"))
+	must(err)
+	if string(foreign) != "other uid\n" {
+		t.Fatal("another uid's scratch file lost")
 	}
 	b, err := os.ReadFile(filepath.Join(service, "shared/keep"))
 	must(err)
@@ -313,5 +331,5 @@ time.sleep(180)`)
 		must(err)
 		must(os.WriteFile(output, payload, 0600))
 	}
-	t.Logf("IM-5 helper: generation=%d cleanup confirmed; memory.current before=%d after=%d; anon+shmem baseline=%d after=%d consecutive=%d; tmpfs absent; shared retained", removed.Generation, before, after, baseline, chargeAfter, recovery.consecutive)
+	t.Logf("IM-5 helper: generation=%d cleanup confirmed; memory.current before=%d after=%d; anon+shmem baseline=%d after=%d consecutive=%d; top-level and nested tmpfs absent; other uid scratch and shared retained", removed.Generation, before, after, baseline, chargeAfter, recovery.consecutive)
 }

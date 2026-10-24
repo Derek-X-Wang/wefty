@@ -729,7 +729,9 @@ Removal keeps a generation-bound `removed` answer instead of deleting proof.
 If the image stops a Seat itself, it writes `failed` and its reason, with
 `cleanup_complete:true` only after cleanup succeeds. If cleanup fails, it
 writes `failed/cleanup_failed`, keeps that place blocked and retries cleanup
-after 30 seconds, doubling each failed retry up to 300 seconds. An
+after 30 seconds, doubling each failed retry up to 300 seconds. Scratch-walk
+exhaustion (`cleanup_scratch_budget`) and persistent foreign-folder changes
+(`cleanup_path_replaced`) use this same failure and retry path. An
 unexpected cleanup exception has the same per-place result, including during
 startup; it does not end other Seats. No new desktop starts in a blocked
 place. **Room returns only after positive cleanup evidence** for that
@@ -884,8 +886,44 @@ root intentionally has no `CAP_IPC_OWNER`. The cleaner runs as
 `/usr/bin/python3 -I -S`, with cwd `/` and a clean environment, so Seat Python
 user-site hooks cannot run during cleanup. It then proves process absence
 again, removes uid-owned scratch (including X sockets/locks and POSIX shared
-memory), and deletes the Seat folder. `/wefty/service/shared` is mode `1777`
-and survives. A new attempt has a fresh status tmpfs and control directory;
+memory), and deletes the Seat folder. The scratch sweep walks `/tmp`,
+`/var/tmp`, `/dev/shm`, `/run` and `/tmp/.X11-unix` at every depth, bottom-up,
+without following symlinks or crossing nested mounts (`st_dev`). It descends
+through folders owned by other uids, removes only entries owned by the ending
+Seat uid, and retains other uids' files and folders. An owned folder that still
+contains another uid's entries also stays, but the supervisor transfers it
+to `0:0` through its no-follow directory descriptor before that place's uid
+can be reused. After `fchown`, it uses `fchmod` to restore ordinary permission
+bits and sticky, with `S_ISUID|S_ISGID` masked out. The sweep tries `rmdir`
+once; `ENOTEMPTY` or `EEXIST` means retain, without rescanning the folder.
+Owned symlinks are unlinked without touching their targets. In uid mode,
+every disappearance of an entry whose owner is known triggers a new full pass:
+directory open, unlink, ascent stat, opening `..`, or `rmdir`. An entry that
+vanishes before its owner can be read is skipped: other Seats' short-lived
+files vanish there constantly, and retrying on them would hold this Seat's
+room while another Seat stays busy. No pass that triggers a retry publishes
+positive cleanup evidence; other cleanup errors produce `cleanup_failed` without positive `cleanup_complete` evidence. One sweep has a
+**30-second monotonic deadline**
+and a **200,000-entry enumeration budget**, shared across all scratch roots
+and retries. Bounded enumeration also limits wide and deep foreign trees;
+exhaustion raises `cleanup_scratch_budget` and follows that same
+`failed/cleanup_failed` path without positive evidence. Checks surround
+bounded filesystem operations; they cannot preempt a blocked kernel call.
+
+If a folder owned by another uid changes type or identity during traversal,
+the supervisor drops that top-level subtree for the pass, finishes other
+entries and retries from all scratch roots, for at most **three passes**.
+Persistent changes or disappearances raise `cleanup_path_replaced`. Observed
+identity or type replacements of uid-owned paths still fail immediately with
+that token. Storage deletion (`uid=None`) keeps
+its original fail-closed handling of vanished entries during unlink, directory
+open and ascent. A live foreign Seat can still move a file before its source
+subtree is enumerated into an already-visited folder. Without an observed
+disappearance or identity change, the sweep can miss that file. This
+live-writer race cannot be eliminated by a filesystem walk.
+
+`/wefty/service/shared` is mode `1777` and survives. A new attempt has a fresh
+status tmpfs and control directory;
 startup clears stale Seat folders and starts no Seat without a fresh directive.
 
 ### Temp space, install measurement and acceptance
@@ -919,7 +957,11 @@ Failures repair root-owned evidence permissions before artifact upload.
 them with containerd's stored spec. The **1 GiB** live cgroup must report the
 same `memory.max`, `memory.swap.max=0` and `memory.oom.group=1`. The lane owns
 IM-1, IM-2 and IM-6, plus secondary IM-4 display/file and IM-5 cleanup/memory
-proof. It also checks IPC removal, X socket/lock absence, component recovery,
+proof. The helper IM-5 fixture splits 128 MiB of shared-memory charge between
+a top-level file and a nested file inside a root-owned sticky scratch folder.
+Both files must disappear, the other uid's folder and file must survive, and
+the charge must return below the existing recovery tolerance. It also checks
+IPC removal, X socket/lock absence, component recovery,
 and the missing-passwd negative image under that same profile.
 
 This is image evidence, not helper/L1/CLI integration. Storage is a directory
