@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,11 @@ func TestDeEnrollmentStartupResolvesLostCommittedReply(t *testing.T) {
 	testStartupDeEnrollment(t, true, false)
 }
 func TestDeEnrollmentStartupDefinitiveRefusalRestoresRegistration(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		// Restored registration publishes readiness with a process start
+		// identity, which only plain Mac generations record.
+		t.Skip("generation process start identity requires Darwin")
+	}
 	testStartupDeEnrollment(t, false, false)
 }
 func TestDeEnrollmentStartupUncertainOutcomeRemainsFenced(t *testing.T) {
