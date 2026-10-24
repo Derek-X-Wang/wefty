@@ -65,6 +65,116 @@
           }
         }
       },
+      "SeatLogEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "seat_id",
+          "kind",
+          "occurred_at"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "seat_id": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "requested",
+              "approved",
+              "refused",
+              "starting",
+              "started",
+              "released",
+              "ended",
+              "owner_stop",
+              "owner_restart",
+              "command_started",
+              "command_finished",
+              "copy_in",
+              "copy_out",
+              "control_taken",
+              "control_released"
+            ]
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "note": { "type": "string", "maxLength": 8192 },
+          "reason": {
+            "type": "string",
+            "maxLength": 8192
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "audit": {
+            "$ref": "#/components/schemas/ComputerTakeoverAuditEvent"
+          }
+        }
+      },
+      "SeatLogPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "seat_id",
+          "events",
+          "next_cursor",
+          "ended",
+          "reason"
+        ],
+        "properties": {
+          "seat_id": {
+            "type": "string"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SeatLogEvent"
+            }
+          },
+          "next_cursor": {
+            "type": "string"
+          },
+          "ended": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "SeatLogRead": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cursor"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "string"
+          }
+        }
+      },
       "SeatCallResult": {
         "type": "object",
         "additionalProperties": false,
@@ -78,9 +188,11 @@
           "cleanup_complete",
           "target_memory_bytes",
           "room_revision",
+          "unread_events",
           "cleanup_pending"
         ],
         "properties": {
+          "unread_events": { "type": "integer", "minimum": 0, "description": "Events after the credential read cursor, after acknowledging the contiguous lifecycle prefix for this outcome. A non-lifecycle event stops acknowledgement even before the outcome; it and subsequent events remain unread." },
           "seat_id": {
             "type": "string"
           },

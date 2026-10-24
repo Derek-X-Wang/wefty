@@ -10,7 +10,8 @@ import (
 
 // AP-4 follows the production call graph from every registered HTTP handler
 // to SQL that touches approval tables, including helpers and read callbacks.
-// Request receipts, read/close and exact owner revocation routes may reach these tables.
+// Request receipts, read/close, log retention reads and exact owner revocation
+// routes may reach these tables. Log routes only inspect authority references.
 // Approval grants, room reservation and starts remain node-only.
 func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	_, files, info := readBoundaryTypes(t)
@@ -177,6 +178,8 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 		t.Fatalf("node-principal mux mounts=%d", agentMounts)
 	}
 	allowed := map[string]string{
+		"GET /v1/seats/{seat_id}/logs":         "getSeatLogs",
+		"POST /v1/seats/{seat_id}/logs/read":   "markSeatLogRead",
 		"POST /v1/seat-requests":               "createSeatCall",
 		"GET /v1/seat-requests/{seat_id}":      "getSeatCall",
 		"GET /v1/seat-approval-windows":        "listSeatApprovalWindows",

@@ -14,8 +14,15 @@ func seatApprovalNeedsExpiry(ctx context.Context, q queryer, v SeatRequest, now 
 	return now.UnixNano() >= deadline, err
 }
 func expireSeatApproval(ctx context.Context, q seatApprovalQuery, id string, now time.Time) error {
-	_, err := q.ExecContext(ctx, `UPDATE seat_approvals SET state='refused',reason='no answer from the owner',lifecycle_state='refused',lifecycle_reason='no answer from the owner' WHERE seat_id=? AND COALESCE(NULLIF(lifecycle_state,''),state)='requested' AND deadline_ns<=?`, id, now.UnixNano())
-	return err
+	result, err := q.ExecContext(ctx, `UPDATE seat_approvals SET state='refused',reason='no answer from the owner',lifecycle_state='refused',lifecycle_reason='no answer from the owner' WHERE seat_id=? AND COALESCE(NULLIF(lifecycle_state,''),state)='requested' AND deadline_ns<=?`, id, now.UnixNano())
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n == 0 {
+		return err
+	}
+	return appendSeatEvent(ctx, q, now, SeatLogEvent{SeatID: id, EventID: "refused", Kind: SeatEventRefused, Reason: "no answer from the owner"})
 }
 
 // Normal reads remain read-only. An expired pending read enters a separate

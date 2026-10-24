@@ -285,7 +285,7 @@ func (s *Store) reserveSeatRoomTx(ctx context.Context, q *sql.Tx, at time.Time, 
 		if !errors.Is(roomErr, ErrComputerRoomFull) && !errors.Is(roomErr, ErrDedicatedComputerCap) {
 			return value, roomErr
 		}
-		if err := setSeatLifecycle(ctx, q, id, SeatRefused, roomErr.Error()); err != nil {
+		if err := setSeatLifecycle(ctx, q, id, SeatRefused, roomErr.Error(), at); err != nil {
 			return value, err
 		}
 		value, err = readSeatRequest(ctx, q, id)
@@ -386,9 +386,40 @@ func readSeatRoomUsage(ctx context.Context, q queryer, node string) ([]ComputerR
 	return result, rows.Err()
 }
 
-func setSeatLifecycle(ctx context.Context, q seatApprovalQuery, id string, state SeatRequestState, reason string) error {
+func setSeatLifecycle(ctx context.Context, q seatApprovalQuery, id string, state SeatRequestState, reason string, at time.Time) error {
+	old, readErr := readSeatRequest(ctx, q, id)
+	if readErr != nil {
+		return readErr
+	}
 	_, err := q.ExecContext(ctx, `UPDATE seat_approvals SET lifecycle_state=?,lifecycle_reason=?,state=CASE WHEN ?='refused' THEN 'refused' ELSE state END,reason=CASE WHEN ?='refused' THEN ? ELSE reason END WHERE seat_id=?`, state, reason, state, state, reason, id)
-	return err
+	if err != nil {
+		return err
+	}
+	if old.State == state && old.Reason == reason {
+		return nil
+	}
+	kind := SeatEventKind("")
+	switch state {
+	case SeatApproved:
+		kind = SeatEventApproved
+	case SeatStarting:
+		kind = SeatEventStarting
+	case SeatLive:
+		kind = SeatEventStarted
+	case SeatRefused:
+		kind = SeatEventRefused
+	case SeatEnding:
+		kind = SeatEventEnded
+	}
+	if kind == "" {
+		return nil
+	}
+	if state == SeatEnding && reason == "released" {
+		if err := appendSeatEvent(ctx, q, at, SeatLogEvent{SeatID: id, EventID: "released", Kind: SeatEventReleased}); err != nil {
+			return err
+		}
+	}
+	return appendSeatEvent(ctx, q, at, SeatLogEvent{SeatID: id, EventID: string(kind), Kind: kind, Reason: reason})
 }
 func bumpSeatList(ctx context.Context, q seatApprovalQuery, computer string) error {
 	_, err := q.ExecContext(ctx, `INSERT INTO computer_seat_lists(computer_id,revision) VALUES(?,1) ON CONFLICT(computer_id) DO UPDATE SET revision=revision+1`, computer)
@@ -440,7 +471,7 @@ func (s *Store) StartSeatRequest(ctx context.Context, identity, id string, reque
 	}
 	deadline := write.at.Add(request.ReadyWait)
 	if request.ReadyWait <= 0 || deadline.UnixNano() <= write.at.UnixNano() {
-		if err := setSeatLifecycle(ctx, q, id, SeatRefused, "invalid Seat readiness wait"); err != nil {
+		if err := setSeatLifecycle(ctx, q, id, SeatRefused, "invalid Seat readiness wait", write.at); err != nil {
 			return value, err
 		}
 		if err := cleanNeverStartedSeat(ctx, q, value); err != nil {
@@ -459,7 +490,7 @@ func (s *Store) StartSeatRequest(ctx context.Context, identity, id string, reque
 	if approval.Request.BootSessionID != request.BootSessionID {
 		return value, protocolError(contract.ErrorConflict, "Seat approval belongs to an earlier node session")
 	}
-	if err := setSeatLifecycle(ctx, q, id, SeatStarting, ""); err != nil {
+	if err := setSeatLifecycle(ctx, q, id, SeatStarting, "", write.at); err != nil {
 		return value, err
 	}
 	if _, err := q.ExecContext(ctx, `UPDATE seat_approvals SET seat_deadline_ns=?,seat_ready_wait_ns=? WHERE seat_id=?`, deadline.UnixNano(), int64(request.ReadyWait), id); err != nil {
@@ -508,7 +539,7 @@ func (s *Store) EndSeatRequest(ctx context.Context, identity, id string, request
 		if request.Refused || value.State == SeatRequested || value.State == SeatApproved || value.State == SeatStarting {
 			state = SeatRefused
 		}
-		if err := setSeatLifecycle(ctx, q, id, state, request.Reason); err != nil {
+		if err := setSeatLifecycle(ctx, q, id, state, request.Reason, write.at); err != nil {
 			return value, err
 		}
 		if err := removeLifecycleSeat(ctx, q, value); err != nil {
@@ -539,7 +570,7 @@ func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now
 	case ComputerSeatReady:
 		if value.State == SeatStarting {
 			if !now.Before(value.Deadline) {
-				if err := setSeatLifecycle(ctx, q, seat.SeatID, SeatRefused, "Seat readiness deadline exceeded"); err != nil {
+				if err := setSeatLifecycle(ctx, q, seat.SeatID, SeatRefused, "Seat readiness deadline exceeded", now); err != nil {
 					return err
 				}
 				return removeLifecycleSeat(ctx, q, value)
@@ -553,11 +584,11 @@ func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now
 			if _, err := q.ExecContext(ctx, `UPDATE computer_seat_identities SET ever_live=1 WHERE seat_id=?`, seat.SeatID); err != nil {
 				return err
 			}
-			return setSeatLifecycle(ctx, q, seat.SeatID, SeatLive, "")
+			return setSeatLifecycle(ctx, q, seat.SeatID, SeatLive, "", now)
 		}
 	case ComputerSeatFailed:
 		if value.State == SeatStarting || value.State == SeatLive {
-			if err := setSeatLifecycle(ctx, q, seat.SeatID, SeatRefused, seat.Reason); err != nil {
+			if err := setSeatLifecycle(ctx, q, seat.SeatID, SeatRefused, seat.Reason, now); err != nil {
 				return err
 			}
 			return removeLifecycleSeat(ctx, q, value)
@@ -573,7 +604,7 @@ func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now
 			return err
 		}
 		if value.State == SeatEnding {
-			return setSeatLifecycle(ctx, q, seat.SeatID, SeatEnded, value.Reason)
+			return setSeatLifecycle(ctx, q, seat.SeatID, SeatEnded, value.Reason, now)
 		}
 	}
 	return nil
@@ -685,7 +716,7 @@ func (s *Store) ReportComputerRoomMemory(ctx context.Context, identity, computer
 
 // A new node agent boot cannot still own the preceding boot's native dialog.
 // Re-registering the same boot, or L1 alone restarting, does not lose a dialog.
-func refuseLostSeatDialogs(ctx context.Context, q seatApprovalQuery, node, boot string) error {
+func refuseLostSeatDialogs(ctx context.Context, q seatApprovalQuery, node, boot string, now time.Time) error {
 	rows, err := q.QueryContext(ctx, `SELECT seat_id FROM seat_approvals WHERE node_id=? AND boot_session_id!=? AND COALESCE(NULLIF(lifecycle_state,''),state) IN ('requested','approved')`, node, boot)
 	if err != nil {
 		return err
@@ -711,7 +742,7 @@ func refuseLostSeatDialogs(ctx context.Context, q seatApprovalQuery, node, boot 
 		if v.State == SeatApproved {
 			reason = "node agent restarted before Seat start"
 		}
-		if err := setSeatLifecycle(ctx, q, id, SeatRefused, reason); err != nil {
+		if err := setSeatLifecycle(ctx, q, id, SeatRefused, reason, now); err != nil {
 			return err
 		}
 		if err := cleanNeverStartedSeat(ctx, q, v); err != nil {

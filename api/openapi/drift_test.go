@@ -81,6 +81,9 @@ const (
 )
 
 var driftRows = []driftRow{
+	{responseBody(clientDoc, "get", "/v1/seats/{seat_id}/logs", "200"), typeOf[l1.SeatLogPage]()},
+	{requestBody(clientDoc, "post", "/v1/seats/{seat_id}/logs/read"), typeOf[l1.SeatLogRead]()},
+	{responseBody(clientDoc, "post", "/v1/seats/{seat_id}/logs/read", "200"), typeOf[l1.SeatLogRead]()},
 	{requestBody(clientDoc, "post", "/v1/seat-requests"), typeOf[l1.SeatCallInput]()},
 	{responseBody(clientDoc, "post", "/v1/seat-requests", "200"), typeOf[l1.SeatCallResult]()},
 	{responseBody(clientDoc, "get", "/v1/seat-requests/{seat_id}", "200"), typeOf[l1.SeatCallResult]()},
