@@ -570,3 +570,58 @@ func TestFleetDoctorHostAdviceKeepsOtherFindings(t *testing.T) {
 		}
 	}
 }
+
+func TestFleetDoctorMissingOptionalToolsStayHealthy(t *testing.T) {
+	optional := []string{"go", "node", "gh", "claude", "codex"}
+	for _, role := range []serviceplan.Role{serviceplan.ControlPlane, serviceplan.Join} {
+		t.Run(string(role), func(t *testing.T) {
+			f := healthyDoctorFixture(t, role)
+			for _, tool := range optional {
+				if err := os.Remove(filepath.Join(f.home, "tools", tool)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			paths, _ := resolveSetupPaths(f.home)
+			report, err := runFleetDoctor(t.Context(), f.host, globalOptions{}, paths, role)
+			if err != nil || !report.Healthy {
+				t.Fatalf("optional tools failed the verdict: healthy=%v err=%v", report.Healthy, err)
+			}
+			warned := map[string]bool{}
+			for _, finding := range report.Findings {
+				if finding.Severity == "warning" && strings.HasPrefix(finding.Check, "tool:") && finding.Fix != "" {
+					warned[strings.TrimPrefix(finding.Check, "tool:")] = true
+				} else if finding.Severity != "ok" {
+					t.Errorf("unexpected finding: %+v", finding)
+				}
+			}
+			for _, tool := range optional {
+				if !warned[tool] {
+					t.Errorf("tool:%s warning with advice is missing", tool)
+				}
+			}
+			var out bytes.Buffer
+			if err := writeDoctorReport(&out, report, false); err != nil || !strings.Contains(out.String(), "tool:codex\twarning\t") || !strings.Contains(out.String(), "  Fix: install codex") {
+				t.Fatalf("warnings were not printed: %v %s", err, &out)
+			}
+		})
+	}
+}
+
+func TestFleetDoctorMissingGitStillFails(t *testing.T) {
+	f := healthyDoctorFixture(t, serviceplan.Join)
+	for _, tool := range []string{"git", "codex"} {
+		if err := os.Remove(filepath.Join(f.home, "tools", tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths, _ := resolveSetupPaths(f.home)
+	report, err := runFleetDoctor(t.Context(), f.host, globalOptions{}, paths, serviceplan.Join)
+	if report.Healthy || classifyCommandReport(err).exitCode != 12 {
+		t.Fatalf("missing git did not fail the verdict: healthy=%v err=%v", report.Healthy, err)
+	}
+	for _, finding := range report.Findings {
+		if finding.Check == "tool:git" && finding.Severity != "error" {
+			t.Fatalf("git severity changed: %+v", finding)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,7 +41,11 @@ func TestGenerationMaintenanceRefusesBeforeFilesOrServicesChange(t *testing.T) {
 			case "upgrade":
 				_, err = runUpgrade(t.Context(), f.host, false, nil)
 			}
-			if err == nil || !strings.Contains(err.Error(), "retiring generations may still hold work") {
+			if command == "conversion" || command == "remove" || command == "purge" {
+				if err == nil || commandExitCode(err) != 1 || !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("missing catalog must be an operational fault: %v", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "retiring generations may still hold work") {
 				t.Fatalf("expected clear refusal: %v", err)
 			}
 			if called {

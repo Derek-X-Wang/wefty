@@ -680,6 +680,11 @@ func (s *Server) nodeGenerations(w http.ResponseWriter, r *http.Request) {
 				inventory, err = s.store.StageNodeGeneration(r.Context(), identity, request)
 			}
 		}
+	case strings.HasSuffix(r.URL.Path, "/de-enroll"):
+		var request DeEnrollNodeGenerationRequest
+		if err = decodeJSON(r, &request); err == nil {
+			inventory, err = s.store.DeEnrollNodeGeneration(r.Context(), identity, nodeID, request)
+		}
 	case strings.HasSuffix(r.URL.Path, "/promote"):
 		var request PromoteNodeGenerationRequest
 		if err = decodeJSON(r, &request); err == nil {

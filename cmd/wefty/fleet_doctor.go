@@ -262,7 +262,13 @@ func runFleetDoctor(ctx context.Context, host setupHost, options globalOptions, 
 					severity = "error"
 				}
 			}
+			healthy := report.Healthy
 			add("tool:"+tool, severity, detail, "install "+tool+" or add it to the login-shell PATH, then rerun setup")
+			// A missing optional tool is advisory: a script- or OCI-only
+			// machine is still healthy. Missing git stays an error.
+			if severity == "warning" {
+				report.Healthy = healthy
+			}
 		}
 	}
 	skills, err := setupSkillFiles(paths)

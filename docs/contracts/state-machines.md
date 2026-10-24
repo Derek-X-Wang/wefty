@@ -2277,10 +2277,20 @@ retirement and installed activation remain separate integrations.
 | `staged` | `primary` | One fenced, idempotent promotion transaction; expected current primary, Node intent and L1 catalog revision, complete retiree/resident sets and protocol compatibility. Admission is closed before promotion. |
 | `primary` | `retiring` | The same transaction freezes exact active process one-shot residents; all older retiring sessions remain unchanged. |
 | `retiring` | `closed` | Every resident's completion was accepted or its Lease ended; exact authenticated local reap/evidence attestations also match. Closure is monotonic. |
+| `primary` | `closed` | Explicit inverse enrollment (#1229); exact operation/admission/primary/catalog fences, no staged or retiring sessions, no live or unsettled Attempts, positive reap/evidence; revoke the old boot and permit fresh legacy registration atomically. |
 
-There is one primary and any number of retiring generations. Retirees have no
-automatic deadline and no transition to primary. A further upgrade is another
-staged candidate and promotion; retrying a committed promotion returns the
+A quiet, drained primary can also enter `closed` through the explicit inverse
+installation-enrollment operation (#1229). Its exact closed-admission operation,
+primary, boot, authority and catalog fences, no staged/retiring generations,
+settled Attempts and authenticated local reap/evidence attestation are checked
+in one L1 transaction. The same transaction revokes its boot and records the
+idempotent result. Only then may a fresh legacy registration use that Node ID.
+Changed replay refuses without replacing success. This is not ordinary retiree
+closure or a general registration bypass; the existing guard remains unchanged.
+
+A Node under generation authority has one primary and any number of retiring
+generations. Retirees have no automatic deadline and no transition to primary.
+A further upgrade is another staged candidate and promotion; retrying a committed promotion returns the
 original receipt without demoting an additional session. A stale or conflicting
 operation refuses atomically.
 

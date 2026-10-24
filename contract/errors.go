@@ -77,6 +77,10 @@ const (
 	ErrorFabricUnreachable ErrorCode = "fabric_unreachable"
 	ErrorClientServiceBusy ErrorCode = "client_service_busy"
 	ErrorInternal          ErrorCode = "internal"
+
+	// ErrorDeEnrollmentNotCommitted is an exact-request terminal rejection
+	// recorded by de-enrollment after consulting its operation ledger.
+	ErrorDeEnrollmentNotCommitted ErrorCode = "de_enrollment_not_committed"
 )
 
 // APIError is the single error shape shared by every HTTP protocol. Retryable

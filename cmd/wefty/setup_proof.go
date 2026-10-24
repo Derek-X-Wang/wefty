@@ -83,11 +83,25 @@ func removeProofSetup(ctx context.Context, host setupHost, purge bool) (setupRem
 	if err != nil {
 		return report, err
 	}
+	catalog, maintenance, err := checkGenerationMaintenance(host, paths, generationMaintenanceRemove)
+	if err != nil {
+		return report, err
+	}
 	unlock, err := lockSetup(paths, false)
 	if err != nil {
 		return report, err
 	}
 	defer unlock()
+	catalog, maintenance, err = checkGenerationMaintenance(host, paths, generationMaintenanceRemove)
+	if err != nil {
+		return report, err
+	}
+	store := upgradeGenerationStore(host, paths, upgradeOperations(host))
+	preservedGenerations, err := store.HasPreservedGenerationData()
+	if err != nil {
+		return report, &maintenanceFault{Cause: err}
+	}
+	preservedGenerations = preservedGenerations || catalog != nil
 	var manifest setupManifest
 	if err := limarunner.ReadUserInstallJSON(filepath.Join(paths.config, setupManifestName), &manifest); err != nil {
 		return report, fmt.Errorf("proof removal needs its setup receipt: %w", err)
@@ -104,6 +118,9 @@ func removeProofSetup(ctx context.Context, host setupHost, purge bool) (setupRem
 		if _, err := fmt.Fprintf(host.proofRemoveOutput, "Proof removal root: %s (purge=%t)\n", filepath.Join(home, proofInstallRelative), purge); err != nil {
 			return report, err
 		}
+	}
+	if err = removeMaintenanceGeneration(ctx, host, paths, catalog, maintenance, &report); err != nil {
+		return report, err
 	}
 	manager := launchagent.Manager{Run: host.launchctl, UID: host.uid, UnloadBound: host.unloadBound}
 	// Unload all three proof services before changing files or stopping the host VM.
@@ -144,7 +161,7 @@ func removeProofSetup(ctx context.Context, host setupHost, purge bool) (setupRem
 	// This explicitly disposable proof has its own private root. Purge removes
 	// only this root after its processes and host VM have stopped. Daily OCI
 	// removal never authorizes deletion of a host VM disk.
-	if purge {
+	if purge && !preservedGenerations {
 		if err := root.RemoveAll(proofInstallRelative); err != nil {
 			return report, err
 		}
@@ -153,6 +170,11 @@ func removeProofSetup(ctx context.Context, host setupHost, purge bool) (setupRem
 			if err := root.RemoveAll(folder); err != nil {
 				return report, err
 			}
+		}
+	}
+	if catalog != nil {
+		if err = upgradeGenerationStore(host, paths, upgradeOperations(host)).FinishMaintenance(); err != nil {
+			return report, err
 		}
 	}
 	return report, nil

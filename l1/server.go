@@ -470,6 +470,7 @@ func (s *Server) routes() http.Handler {
 	agent.HandleFunc("GET /v1/agent/nodes/{node_id}/generations", s.nodeGenerations)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/generations/stage", s.nodeGenerations)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/generations/promote", s.nodeGenerations)
+	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/generations/de-enroll", s.nodeGenerations)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/generations/{generation_id}/heartbeat", s.nodeGenerations)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/generations/{generation_id}/close", s.nodeGenerations)
 	agent.HandleFunc("POST /v1/agent/nodes/{node_id}/heartbeat", s.heartbeatNode)

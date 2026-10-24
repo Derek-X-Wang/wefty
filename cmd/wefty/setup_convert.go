@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -67,6 +68,7 @@ type plainConversionService struct {
 }
 
 type plainConversion struct {
+	GenerationID       string                   `json:"generation_id,omitempty"`
 	Computer           *setupComputerOptions    `json:"computer,omitempty"`
 	Version            int                      `json:"version"`
 	NodeID             string                   `json:"node_id"`
@@ -118,7 +120,15 @@ func readPlainConversion(paths setupPaths) (*plainConversion, error) {
 	if r.InventoryDirectory != "" && (!validPlainConversionInventoryDirectory(paths, r.InventoryDirectory) || (r.Phase != "stop" && r.Phase != "restoring")) {
 		return nil, errors.New("invalid plain conversion inventory directory")
 	}
-	for i, label := range []string{setupL1Label, setupL3Label, setupNodeAgentLabel} {
+	labels := []string{setupL1Label, setupL3Label, setupNodeAgentLabel}
+	if r.GenerationID != "" {
+		id, e := hex.DecodeString(r.GenerationID)
+		if e != nil || len(id) != 16 || hex.EncodeToString(id) != r.GenerationID {
+			return nil, errors.New("invalid conversion generation identity")
+		}
+		labels[2] = "dev.wefty.node-agent.g-" + r.GenerationID
+	}
+	for i, label := range labels {
 		if r.Services[i].Label != label || len(r.Services[i].Plist) == 0 {
 			return nil, errors.New("invalid plain conversion service record")
 		}
@@ -196,7 +206,7 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 				return report, err
 			}
 			defer unlock()
-			if err := agentinstall.RefuseMaintenance(paths.data, "setup --convert-plain"); err != nil {
+			if _, _, err := checkGenerationMaintenance(host, paths, "convert"); err != nil {
 				return report, err
 			}
 			request.lockHeld = true
@@ -263,7 +273,7 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			return report, err
 		}
 		defer unlock()
-		if err := agentinstall.RefuseMaintenance(paths.data, "setup --convert-plain"); err != nil {
+		if _, _, err := checkGenerationMaintenance(host, paths, "convert"); err != nil {
 			return report, err
 		}
 		request.lockHeld = true
@@ -272,6 +282,10 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			return report, err
 		}
 		return runPlainConversion(ctx, host, request, paths, current)
+	}
+	catalog, generationMaintenance, err := checkGenerationMaintenance(host, paths, "convert")
+	if err != nil {
+		return report, err
 	}
 	root, err := os.OpenRoot(paths.home)
 	if err != nil {
@@ -347,7 +361,12 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 		record = &plainConversion{Version: 1, NodeID: node.NodeID, Phase: "prepared", Profile: profile, History: history, JoinCode: request.joinCode, WithPerson: request.withPerson}
 		record.Computer = nodeSettings.recorded()
 		manager := launchagent.Manager{Run: host.launchctl, UID: host.uid}
-		for _, label := range []string{setupL1Label, setupL3Label, setupNodeAgentLabel} {
+		labels := []string{setupL1Label, setupL3Label, setupNodeAgentLabel}
+		if catalog != nil {
+			record.GenerationID = catalog.Primary
+			labels[2] = catalog.Generations[catalog.Primary].Label
+		}
+		for _, label := range labels {
 			state, err := manager.State(ctx, label)
 			if err != nil {
 				return report, err
@@ -355,19 +374,44 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			if !state.Running {
 				return report, fmt.Errorf("plain LaunchAgent %s must be running for a verified drain; run plain setup first", label)
 			}
-			name := filepath.Join(paths.launchAgentsRel, label+".plist")
-			info, err := root.Lstat(name)
-			if err != nil {
-				return report, err
-			}
-			if !info.Mode().IsRegular() || info.Mode().Perm() != 0644 {
-				return report, errors.New("plain conversion requires regular setup LaunchAgents with mode 0644")
-			}
-			payload, err := root.ReadFile(name)
-			if err != nil {
-				return report, err
+			var payload []byte
+			if catalog != nil && label == catalog.Generations[catalog.Primary].Label {
+				// Bind rollback bytes before admission or history changes. Open the
+				// primary once relative to its held parent without following links.
+				parent, err := os.OpenRoot(paths.launchAgents)
+				if err != nil {
+					return report, err
+				}
+				payload, err = agentinstall.ReadOwnedRegularFile(parent, label+".plist", 0644)
+				parent.Close()
+				if err != nil {
+					return report, generationControlTransportError(err)
+				}
+				if payloadDigest(payload) != "sha256:"+catalog.Generations[catalog.Primary].PlistDigest {
+					return report, maintenanceError(&agentinstall.MaintenanceRefusal{Message: "recorded primary plist changed; retain the generation and repair its definition before conversion"})
+				}
+			} else {
+				name := filepath.Join(paths.launchAgentsRel, label+".plist")
+				info, err := root.Lstat(name)
+				if err != nil {
+					return report, err
+				}
+				if !info.Mode().IsRegular() || info.Mode().Perm() != 0644 {
+					return report, errors.New("plain conversion requires regular setup LaunchAgents with mode 0644")
+				}
+				payload, err = root.ReadFile(name)
+				if err != nil {
+					return report, err
+				}
 			}
 			record.Services = append(record.Services, plainConversionService{Label: label, Plist: payload})
+		}
+		if catalog != nil && generationMaintenance == nil {
+			store := upgradeGenerationStore(host, paths, op)
+			generationMaintenance, err = store.BeginMaintenance("convert", rand.Text(), *catalog)
+			if err != nil {
+				return report, maintenanceError(err)
+			}
 		}
 		if err := savePlainConversion(paths, record); err != nil {
 			return report, err
@@ -512,6 +556,9 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 		}
 		// Remove restart definitions while all old processes are confirmed absent.
 		for _, service := range record.Services {
+			if record.GenerationID != "" && service.Label == "dev.wefty.node-agent.g-"+record.GenerationID {
+				continue
+			}
 			if err := root.Remove(filepath.Join(paths.launchAgentsRel, service.Label+".plist")); err != nil {
 				return report, err
 			}
@@ -624,6 +671,13 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 			return report, err
 		}
 	}
+	if record.GenerationID != "" {
+		retained, err := retireConversionGeneration(ctx, host, paths, record)
+		if err != nil {
+			return report, err
+		}
+		defer func() { report.Notes = append(report.Notes, retained...) }()
+	}
 	// From here history is evidence only. No restart or store-open is permitted.
 	// Reconfirm old authority absence on every resume, even after a reboot.
 	if err := stopPlainConversion(ctx, host, record); err != nil {
@@ -660,6 +714,9 @@ func runPlainConversion(ctx context.Context, host setupHost, request setupReques
 	request.nodeID = record.NodeID
 	request.convertPlain = false
 	report, resultErr = runFleetSetup(ctx, host, request, paths, serviceplan.Join)
+	if resultErr == nil && record.GenerationID != "" {
+		resultErr = upgradeGenerationStore(host, paths, op).FinishMaintenance()
+	}
 	return report, resultErr
 }
 
@@ -673,7 +730,20 @@ func stopPlainConversion(ctx context.Context, host setupHost, r *plainConversion
 		labels = []string{setupL3Label, setupL1Label}
 	}
 	for _, label := range labels {
-		if err := manager.Unload(ctx, label); err != nil {
+		if label == setupNodeAgentLabel && r.GenerationID != "" {
+			paths, err := resolveSetupPaths(host.home)
+			if err != nil {
+				return err
+			}
+			store := upgradeGenerationStore(host, paths, upgradeOperations(host))
+			m, err := conversionGenerationIntent(host, paths, r)
+			if err != nil {
+				return err
+			}
+			if err = store.StopMaintenancePrimary(ctx, m); err != nil {
+				return maintenanceError(err)
+			}
+		} else if err := manager.Unload(ctx, label); err != nil {
 			return err
 		}
 		if len(steps) > 0 {
@@ -828,7 +898,16 @@ func restorePlainConversion(ctx context.Context, host setupHost, paths setupPath
 		defer folder.Close()
 		manager := launchagent.Manager{Run: host.launchctl, UID: host.uid, UnloadBound: host.unloadBound}
 		for _, s := range r.Services {
-			if _, err := manager.Converge(recovery, folder, filepath.Join(paths.launchAgents, s.Label+".plist"), s.Label, s.Plist); err != nil {
+			if r.GenerationID != "" && s.Label == "dev.wefty.node-agent.g-"+r.GenerationID {
+				store := upgradeGenerationStore(host, paths, op)
+				m, err := conversionGenerationIntent(host, paths, r)
+				if err != nil {
+					return err
+				}
+				if err = store.RestoreMaintenancePrimary(recovery, m); err != nil {
+					return err
+				}
+			} else if _, err := manager.Converge(recovery, folder, filepath.Join(paths.launchAgents, s.Label+".plist"), s.Label, s.Plist); err != nil {
 				return fmt.Errorf("restore plain LaunchAgent: %w", err)
 			}
 			deadline := op.now().Add(upgradeMutationBudget)
@@ -869,6 +948,11 @@ func restorePlainConversion(ctx context.Context, host setupHost, paths setupPath
 	r.Phase, r.History.Files, r.History.Size, r.History.ReadOnly = "prepared", nil, 0, false
 	if err := root.Remove(filepath.Join(paths.configRel, plainConversionName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
+	}
+	if r.GenerationID != "" {
+		if err := upgradeGenerationStore(host, paths, op).FinishMaintenance(); err != nil {
+			return err
+		}
 	}
 	return syncConversionFolder(root, paths.configRel)
 }
