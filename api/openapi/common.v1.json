@@ -3056,6 +3056,10 @@
           "lease_expires_at"
         ],
         "properties": {
+          "observation_error": {
+            "type": "string",
+            "description": "Record-specific observation failure with identity and cause, including retained Job JSON or SQL conversion errors. Other fields may have zero values and are not verified observations when this is present, including lease_expires_at. Readable records and Nodes remain available."
+          },
           "job_id": {
             "type": "string"
           },
@@ -3093,6 +3097,107 @@
         },
         "description": "Nonterminal persisted attempt on this Node, including prior boots until reconciled. Read routes preserve attempts whose leases have expired until background reconciliation records their expiry. Reports execution state and lease, never a credential, fence or proof that a payload is physically running."
       },
+      "NodeGenerationAttempt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "job_id",
+          "attempt_id",
+          "state",
+          "last_renewed_at",
+          "lease_expires_at"
+        ],
+        "properties": {
+          "observation_error": {
+            "type": "string",
+            "description": "Record-specific unavailable observation with identity and cause. Other readable records remain present; this record cannot establish healthy generation evidence."
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "state": {
+            "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost", "interrupted", null],
+            "description": "Retained Attempt state; null means the frozen resident observation is unavailable."
+          },
+          "last_renewed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "lease_expires_at": {
+            "type": ["string", "null"],
+            "format": "date-time"
+          },
+          "interruption_reason": {
+            "enum": ["upgrade", "agent_shutdown", "lease_expired"]
+          }
+        },
+        "description": "Public resident observation without fencing tokens or boot authority. last_renewed_at is the last accepted Lease renewal, never a heartbeat or generic update timestamp. Legacy observations remain null."
+      },
+      "NodeGenerationObservation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agent_generation_id",
+          "role",
+          "version",
+          "created_at",
+          "retirement_started_at",
+          "selected_protocol",
+          "attempts"
+        ],
+        "properties": {
+          "observation_error": {
+            "type": "string",
+            "description": "Record-specific unavailable observation with identity and cause. Other readable records remain present; this record cannot establish healthy generation evidence."
+          },
+          "previous_system_boot": { "type": "boolean", "description": "The recorded session belongs to a different verified host boot from the primary. Its old Leases do not prove survival." },
+          "agent_generation_id": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "staged",
+              "primary",
+              "retiring",
+              "closed"
+            ]
+          },
+          "version": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "retirement_started_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "selected_protocol": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "attempts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NodeGenerationAttempt"
+            }
+          }
+        },
+        "description": "One session from the same read-only snapshot as Node capacity. Includes every retiring generation and retained closed sessions, with terminal residents so primary health cannot mask interrupted or lost Attempts."
+      },
       "Node": {
         "allOf": [{ "$ref": "#/components/schemas/NodeFields" }],
         "unevaluatedProperties": false,
@@ -3112,6 +3217,7 @@
               "active_attempts", "last_condition", "allowed_actions"
             ],
             "properties": {
+              "generations": { "type": "array", "items": { "$ref": "#/components/schemas/NodeGenerationObservation" }, "readOnly": true, "description": "Optional for generation-enrolled Nodes. Authority-free observations from the Node read snapshot; omitted for legacy installations." },
               "state": { "enum": ["alive", "stale", "draining", "dead"], "description": "Node list and detail GETs show effective liveness computed from the snapshot clock without writes; recorded state follows through background reconciliation. Agent and mutation responses report recorded state. Durable decisions use recorded state. Effective dead/stale is provisional, and a heartbeat accepted before reconciliation returns the node to alive." },
               "authoritative_tags": {
                 "type": "array",

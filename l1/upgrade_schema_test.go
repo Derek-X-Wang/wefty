@@ -27,7 +27,8 @@ import (
 // retention triggers and permanent once-Live Seat history; then #1145
 // retained Seat logs, credential digests and per-credential read cursors; then
 // bounded never-live Seat log retention and retained once-live history; then
-// approval-only and permanent-identity Seat log source migration.
+// approval-only and permanent-identity Seat log source migration, then #1181
+// accepted Lease renewal timestamps (attempts.last_renewal_ns).
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -44,8 +45,8 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
-	// Seat identity recovery retains exact authority and positive Attempt absence.
-	const mainFingerprint = "a0f43260670f070b941d5d23d896d61e8cbef198e0611c3cf75df0e7781c6cc6"
+	// Accepted renewal time is separate from generic Attempt updates.
+	const mainFingerprint = "ad50babb08e04df18b991c2245a75f8e647612ddff4a00387104cc4b6e3b55dd"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}

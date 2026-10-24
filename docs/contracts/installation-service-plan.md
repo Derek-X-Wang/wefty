@@ -995,3 +995,32 @@ state. Normal OCI removal preserves the host VM disk; explicit disposable
 proof purge removes only proof-owned state after a graceful stop.
 See [the per-user host VM contract](per-user-host-vm.md) for inputs, paths,
 intent preservation and the attended-only fixture boundary.
+
+### Read-only cohort diagnosis (#1181)
+
+Status and doctor read the catalog, rolling receipt and retained retirement
+acknowledgments independently. An unreadable record includes its cause and does
+not suppress the other generations. Public L1 Node reads supply fresh session
+and Attempt observations with shared class capacity, without a CLI node
+principal. Saved process readiness, retirement acknowledgments and renewal
+proofs do not establish current reachability. Local catalog creation time keeps
+age stable across primary restarts. Positive L1 closure marks a session as
+history; local retained files alone never make it a live retiree. Diagnosis
+creates no local writable-folder probes and does not mutate installation state.
+See [rolling status and doctor](plain-node-upgrade.md#read-only-rolling-status-and-doctor-1181).
+
+Diagnostic catalog reads, retirement acknowledgments and primary-label discovery
+use nonblocking reads of the existing catalog lock. Contention is unverified,
+with its cause, while readable evidence still renders. An enrolled Node without
+public generation observations is unverified even without local catalog files.
+A free setup lock establishes interruption only after the receipt identity and
+phase are revalidated. Missing current Attempt rows retain any recorded reboot
+interruption as history while current reachability remains unknown.
+
+Pending `DATA/agent-maintenance.json` intent is a diagnostic problem independently
+of catalog presence, primary health, admission or the last rolling receipt.
+Status and doctor read it through a descriptor-safe, lock-free diagnostic path
+and name its removal/conversion operation. Recovery advice is to re-run the same
+`wefty setup` command to finish or restore; this preserves #1229's existing
+precommit restoration and forward-only boundaries. An unreadable journal is
+unverified with its cause. Rich maintenance progress is not implied by this read.

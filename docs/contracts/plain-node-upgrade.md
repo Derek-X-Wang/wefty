@@ -831,3 +831,110 @@ needs no de-enrollment: join registration targets the fleet control plane, not
 the old local L1. Catalog snapshots and audit receipts in generation history are
 installation evidence only; they never authorize process adoption, first
 completion or legacy registration by themselves.
+
+### Read-only rolling status and doctor (#1181)
+
+`status` and plain Mac `doctor` retain the legacy output when there is no
+rolling receipt, generation catalog, enrolled L1 session, pending maintenance
+intent or known active-Attempt observation error. Their JSON adds
+optional `upgrade_state` (`cutover`, `complete`, `interrupted`, `unverified`),
+`upgrade_detail`, `upgrade_operation_id`, `upgrade_phase`,
+`upgrade_recovery_state`, `primary_generation_id`, `generations`,
+`generation_evidence_errors`, `active_attempt_evidence_errors` and `maintenance`.
+These are observations, never a second coordinator. `maintenance` contains
+`kind` (`remove` or `convert`), `operation_id` and `detail`. It reports the
+outside `DATA/agent-maintenance.json` journal independently of an active or
+archived catalog, even before admission or primary state changes. Its text is
+`maintenance in progress: <removal|conversion> <operation>; re-run the same wefty setup command to finish or restore`.
+A pending journal always prevents ready/healthy; its unreadable state remains
+unverified with its cause. This descriptor-safe diagnostic read acquires no
+catalog lock and grants no maintenance or restoration authority. The existing
+strict maintenance retry reader and its authority checks remain unchanged.
+
+`active_attempt_evidence_errors` contains ordinary reason objects (`code`,
+`detail`) naming the Node, Job, Attempt and observation cause. These findings
+apply equally to legacy and enrolled Nodes, remain unverified, and prevent
+ready/healthy without suppressing other readable Nodes or shared capacity.
+No rolling enrollment or upgrade state is invented for a legacy Attempt error.
+
+A nonterminal receipt with the existing installation lock held means active
+cutover. A positively free kernel lock and an unchanged receipt identity and
+phase, re-read after the probe, mean interrupted upgrade. An unreadable or
+unsupported lock probe is unknown with its cause. A receipt that changes during
+collection is unverified; completion races do not establish interruption. Recovery advice names
+`wefty upgrade --rolling` to resume or roll back. Terminal phases are `complete`,
+`rolled_back` and `reboot_reconciled`; the recovery state remains visible. A
+pending catalog activation also requires a live coordinator. Unreachable L1,
+unreadable records or unmatched primary ownership are unverified. An enrolled
+Node (`agent_generation_id` present) without generation observations is also
+unverified, even when ordinary Node capacity looks healthy. Legacy compatibility
+requires absent enrollment, not merely absent observations. An incomplete
+receipt is not converted to success using an old activation or renewal reply.
+
+Each generation contains its Node and generation identity, role, version,
+`age_ns`, `retirement_started_at`, `selected_protocol`, `remaining_run_ids`,
+`remaining_attempt_ids`, `unledgered_attempt_ids`, `renewal_health`,
+`last_renewed_at`, `lease_expires_at`, `pending_evidence_count`,
+`retirement_progress`, `shared_capacity`, retained `attempts`, and any `problems`.
+Unknown counts, times and capacity are null. Public generation and resident
+Attempt observations (including `active_attempts`) may add `observation_error`, preserving record identity and
+the read/parse cause while other readable records and Nodes remain available.
+Malformed retained Job/generation JSON and record-specific active-Attempt SQL
+conversion failures do not fail the whole Node listing;
+database or snapshot failures still fail the request. On a failed active-Attempt
+scan, `observation_error` retains identity and cause; other fields may have zero
+values and must not be treated as verified observations (including Lease expiry).
+Private authority reads
+remain fail-closed. If a current Attempt row is missing, its state remains null;
+a retained reboot interruption is still shown as recorded history with any known
+Run ID. Current uncertainty cannot erase known interruption. Renewal health is `healthy`,
+`degraded` (expired Lease or failed/lost/interrupted Attempt), or `unverified`
+(missing observation). The text names stale renewal explicitly. Last renewal
+and deadline describe the least recently renewed active resident and earliest
+current Lease deadline, respectively. Completed residents cannot make a live
+resident’s current deadline appear expired. With no active residents these
+fields may retain historical observations. An absent renewal timestamp is not inferred from
+claim time, a generic update time, primary heartbeat, or a saved upgrade proof.
+
+There is no retirement deadline and no limit of two generations. Completed
+healthy overlap says `upgrade complete; older generations finishing N Runs`.
+N counts distinct Runs among active retiring Attempts. Attempts without an L3
+Run are listed separately. Zero Runs does not imply evidence settlement:
+`evidence_pending` and an unknown evidence count remain visible until positive
+closure. Closed sessions remain separate history. Failed/lost/interrupted
+resident Attempts remain problems after closure or reboot reconciliation.
+A healthy primary and a cutover busy message cannot hide those problems.
+
+Status preserves ordinary shared capacity/admission readiness. Healthy overlap
+adds no failure. Unknown renewal, interrupted upgrades and retiring Attempt
+problems produce the existing not-ready exit 12. Doctor keeps its existing
+convention: any error or warning makes `healthy:false` and returns exit 12;
+unknown evidence uses warning, known Attempt loss uses error. Diagnosis reads
+local files without creating writable-folder probe files, control request files,
+or lock files, and performs no launchd mutations. Catalog and retirement-ack
+reads use a nonblocking diagnostic acquisition of the existing catalog lock;
+contention is unverified with its OS cause and does not delay the remaining
+evidence. Primary-label discovery uses the same bounded read path. Existing launchd state reads remain.
+
+L1 Node list/detail reads add optional `generations` observations. They use the
+existing client read path and the existing `ReadOnly:true` snapshot transaction.
+No node principal or new private-control operation is added to the CLI. A
+`previous_system_boot` observation identifies a retiring session from a different
+verified host boot even before background Lease reconciliation. Its active
+Attempts are reported interrupted rather than surviving on their old deadlines.
+Public
+observations omit fences and promotion requests. `attempts.last_renewal_ns` is
+nullable and advances only on an accepted Lease renewal. Migration leaves older
+rows null. OpenAPI documents the additive Node observation fields.
+
+The healthy finishing count also verifies each distinct mapped Run through the
+existing public L3 Run GET. Terminal ledger Runs are excluded even while their
+Attempts still finish teardown; those Attempts and their shared capacity remain
+visible. Unreachable or missing Run records make the remaining Run count null
+and the diagnosis unverified, rather than counting a label as a live Run.
+
+After generation enrollment removes the legacy node-agent label and plist,
+plain doctor checks the catalog primary's label and recorded PATH. It does not
+require the removed legacy label, or require stopped closed retirees to run.
+An unreadable catalog leaves the primary label/PATH unverified and keeps the
+record cause visible in the cohort report.

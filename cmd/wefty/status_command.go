@@ -142,6 +142,7 @@ type localLoadStatus struct {
 
 // clusterStatus is the whole answer, and the shape `--json` publishes.
 type clusterStatus struct {
+	rollingStatusFields
 	ApprovalWindows      []l1.SeatApprovalWindow `json:"approval_windows,omitempty"`
 	ApprovalWindowsError string                  `json:"approval_windows_error,omitempty"`
 	fleetView            bool
@@ -419,6 +420,30 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 	if note, ok := unschedulableRunsNote(stuck); ok {
 		status.Limitations = append(status.Limitations, note)
 	}
+	status.rollingStatusFields = collectRollingStatus(clients.nodeConfigPath, nodes, l1Status.Reachable, status.CheckedAt)
+	verifyRollingRuns(ctx, clients, &status.rollingStatusFields)
+	if status.UpgradeState != "" {
+		status.UpgradeRecovery = ""
+		// Rolling receipts explain a coordinator, not ownership of every
+		// admission change. Restore ordinary reasons before considering the
+		// exact existing drain receipt, so a newer owner disable stays visible.
+		status.Reasons, _ = reasonsFor(l1Status, l3Status, status.Nodes, status.Capacity)
+		if status.UpgradeState == "cutover" {
+			ownedAdmission := false
+			if receipt != nil && upgradeActive {
+				for _, node := range nodes.Nodes {
+					ownedAdmission = ownedAdmission || receipt.ownsClaims(node)
+				}
+			}
+			if ownedAdmission {
+				status.Reasons = nil
+			}
+			status.Busy = "busy: rolling cutover; retry in a few seconds"
+		}
+	}
+	// Add diagnostics after any upgrade/busy suppression, including evidence
+	// errors on legacy Nodes and unfinished installation maintenance.
+	status.Reasons = append(status.Reasons, status.rollingStatusFields.findings()...)
 	status.Ready = len(status.Reasons) == 0
 	status.Verdict = verdictOf(status.Reasons)
 	if status.Busy != "" {
@@ -732,6 +757,9 @@ func writeStatus(writer io.Writer, status clusterStatus) error {
 		if _, err := fmt.Fprintln(writer, status.UpgradeRecovery); err != nil {
 			return err
 		}
+	}
+	if err := writeRollingStatus(writer, status.rollingStatusFields); err != nil {
+		return err
 	}
 	if status.InstalledVersion != "" {
 		if _, err := fmt.Fprintln(writer, "installed version:", status.InstalledVersion); err != nil {

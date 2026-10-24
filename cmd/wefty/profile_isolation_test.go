@@ -26,6 +26,13 @@ var (
 // and into every real binary they start. An empty profile means "built-in
 // defaults"; a test about the profile names its own.
 func TestMain(main *testing.M) {
+	if arguments, present := os.LookupEnv(diagnosticGuardArguments); present {
+		if err := resolveDiagnosticFixtureEndpoints(arguments); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	packageTestEnvironment = os.Environ()
 	directory, err := os.MkdirTemp("", "wefty-cli-profile-")
 	if err != nil {

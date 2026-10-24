@@ -110,26 +110,33 @@ func (s Store) executable(id string) string { return filepath.Join(s.Root(), id,
 func (s Store) ReadyPath(id string) string  { return filepath.Join(s.Root(), id, "ready.json") }
 func (s Store) validate() error {
 	for _, p := range []string{s.Data, s.LaunchAgents} {
-		if !filepath.IsAbs(p) || filepath.Clean(p) != p || strings.ContainsAny(p, "\x00\r\n") {
-			return &VerificationRefusal{Message: "generation installation paths must be absolute and clean"}
-		}
-		resolved, err := filepath.EvalSymlinks(p)
-		if err != nil {
+		if err := validateInstallationDirectory(p); err != nil {
 			return err
-		}
-		if resolved != p {
-			return &VerificationRefusal{Message: "generation installation paths must not traverse symbolic links"}
-		}
-		info, err := os.Lstat(p)
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() || !owned(info) || info.Mode().Perm()&0022 != 0 {
-			return &VerificationRefusal{Message: "generation installation directories must be owner-controlled"}
 		}
 	}
 	return nil
 }
+func validateInstallationDirectory(p string) error {
+	if !filepath.IsAbs(p) || filepath.Clean(p) != p || strings.ContainsAny(p, "\x00\r\n") {
+		return &VerificationRefusal{Message: "generation installation paths must be absolute and clean"}
+	}
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return err
+	}
+	if resolved != p {
+		return &VerificationRefusal{Message: "generation installation paths must not traverse symbolic links"}
+	}
+	info, err := os.Lstat(p)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() || !owned(info) || info.Mode().Perm()&0022 != 0 {
+		return &VerificationRefusal{Message: "generation installation directories must be owner-controlled"}
+	}
+	return nil
+}
+
 func privateInfo(info os.FileInfo, mode os.FileMode) bool {
 	return owned(info) && info.Mode().Perm() == mode && ((mode == 0700 && info.IsDir()) || (mode != 0700 && info.Mode().IsRegular()))
 }
@@ -144,6 +151,14 @@ func privateDirectory(path string) error {
 	return nil
 }
 func (s Store) open(create bool) (*os.Root, func(), error) {
+	return s.openWithLock(create, lockCatalog)
+}
+
+func (s Store) openDiagnostic() (*os.Root, func(), error) {
+	return s.openWithLock(false, lockDirectory)
+}
+
+func (s Store) openWithLock(create bool, acquire func(string) (func(), error)) (*os.Root, func(), error) {
 	if err := s.validate(); err != nil {
 		return nil, nil, err
 	}
@@ -155,7 +170,7 @@ func (s Store) open(create bool) (*os.Root, func(), error) {
 	if err := privateDirectory(s.Root()); err != nil {
 		return nil, nil, err
 	}
-	unlock, err := lockCatalog(s.Root())
+	unlock, err := acquire(s.Root())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -260,6 +275,18 @@ func (s Store) read(root *os.Root) (Catalog, error) {
 	}
 	return c, nil
 }
+
+// ReadDiagnostic uses the same descriptor-safe validation as Read, but never
+// waits for a writer. Contention is unavailable evidence, with its OS cause.
+func (s Store) ReadDiagnostic() (Catalog, error) {
+	root, close, err := s.openDiagnostic()
+	if err != nil {
+		return Catalog{}, fmt.Errorf("diagnostic catalog read: %w", err)
+	}
+	defer close()
+	return s.read(root)
+}
+
 func (s Store) Read() (Catalog, error) {
 	root, close, err := s.open(false)
 	if err != nil {

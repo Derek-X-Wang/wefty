@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -149,6 +151,10 @@ func TestReviewMaintenanceSkipsBrokenSkillPath(t *testing.T) {
 	for _, outside := range []bool{false, true} {
 		t.Run(fmt.Sprint(outside), func(t *testing.T) {
 			f := newSetupFixture(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+			defer server.Close()
+			f.host.l1Address = strings.TrimPrefix(server.URL, "http://")
+			f.host.l3Address = f.host.l1Address
 			f.setup(t, setupRequest{})
 			paths, _ := resolveSetupPaths(f.home)
 			target := filepath.Join(f.home, "checkout")
@@ -166,7 +172,7 @@ func TestReviewMaintenanceSkipsBrokenSkillPath(t *testing.T) {
 			if err := os.Symlink(target, skill); err != nil {
 				t.Fatal(err)
 			}
-			report := runPlainDoctor(t.Context(), f.host, globalOptions{profilePath: paths.profile, nodeConfigPath: paths.nodeConfig})
+			report := runFixturePlainDoctor(t, f.host, globalOptions{profilePath: paths.profile, nodeConfigPath: paths.nodeConfig})
 			for _, check := range []string{setupL1Label, "connection-profile", "node-config", "path:" + setupFolders.bin, "skill:" + filepath.Join(setupFolders.skills[1], "SKILL.md")} {
 				found := false
 				for _, finding := range report.Findings {
