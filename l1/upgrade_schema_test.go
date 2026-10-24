@@ -28,9 +28,9 @@ import (
 // retained Seat logs, credential digests and per-credential read cursors; then
 // bounded never-live Seat log retention and retained once-live history; then
 // approval-only and permanent-identity Seat log source migration, then #1181
-// accepted Lease renewal timestamps (attempts.last_renewal_ns);
-// then #1146
-// durable boot-relative Seat/approval/idle clocks, activity holds and owner summaries.
+// accepted Lease renewal timestamps (attempts.last_renewal_ns); then #1146
+// durable boot-relative Seat/approval/idle clocks, activity holds and owner summaries;
+// then remove the global calendar anchor so general L1 timestamps remain wall time.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -48,7 +48,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
 	// Seat identity recovery retains exact authority and positive Attempt absence.
-	const mainFingerprint = "50d69b41d765236b98892b9743e2e8ebea7e5138e34b6b4fde4ed1b1d207e0bf"
+	const mainFingerprint = "92e77a3bdbafa0ac61ba93c7989763c0e45bf652669ccba959df5fec51a5e35d"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}

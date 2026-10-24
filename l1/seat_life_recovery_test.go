@@ -128,16 +128,17 @@ func TestSeatIdleChangedWaitAppliesAtNextCheck(t *testing.T) {
 }
 
 func TestSeatLifeClockRecoveryAcrossL1RestartAndNewBoot(t *testing.T) {
-	for _, newBoot := range []bool{false, true} {
-		t.Run(fmt.Sprint("new_boot=", newBoot), func(t *testing.T) {
+	for _, scenario := range []struct{ newBoot, held bool }{{false, false}, {true, false}, {true, true}} {
+		newBoot := scenario.newBoot
+		t.Run(fmt.Sprint("new_boot=", newBoot, "_held=", scenario.held), func(t *testing.T) {
 			f := newSeatLifecycleFixture(t)
 			clock := &seatBootTestClock{fakeClock: f.clock, boot: "boot-a", elapsed: time.Hour}
 			f.store.clock = clock
-			id, secret := liveSeatWithCredential(t, f)
+			id, _ := liveSeatWithCredential(t, f)
 			if err := f.store.SeatCommandRunning(t.Context(), id, "long-command", true); err != nil {
 				t.Fatal(err)
 			}
-			if !newBoot {
+			if !scenario.held {
 				if err := f.store.SeatCommandRunning(t.Context(), id, "long-command", false); err != nil {
 					t.Fatal(err)
 				}
@@ -157,14 +158,31 @@ func TestSeatLifeClockRecoveryAcrossL1RestartAndNewBoot(t *testing.T) {
 				t.Fatal(err)
 			}
 			if newBoot {
-				if value.State != SeatEnding || value.Reason != "the Computer restarted" || value.CleanupComplete || value.TargetMemoryBytes != 1<<30 {
-					t.Fatalf("new boot restored Seat authority/room: %+v", value)
+				if value.State != SeatLive || value.Reason != "" || value.CleanupComplete {
+					t.Fatalf("L1 reboot falsely ended remote Computer Seat: %+v", value)
 				}
-				if err := f.store.SeatCallHappened(t.Context(), id, secret); errorCode(err) != "seat_ended" {
-					t.Fatalf("old credential regained authority: %v", err)
+				if scenario.held {
+					if err := f.store.SeatCommandRunning(t.Context(), id, "long-command", false); err != nil {
+						t.Fatal(err)
+					}
+				}
+				clock.elapsed += 29 * time.Minute
+				if err := f.store.CheckSeatLife(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if value, err = f.store.GetSeatRequest(t.Context(), id); err != nil || value.State != SeatLive {
+					t.Fatalf("reboot shortened fresh wait: %+v %v", value, err)
+				}
+				clock.elapsed += time.Minute
+				if err := f.store.CheckSeatLife(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if value, err = f.store.GetSeatRequest(t.Context(), id); err != nil || value.Reason != "expired" {
+					t.Fatalf("reboot wait is unbounded: %+v %v", value, err)
 				}
 				return
 			}
+
 			if value.State != SeatLive {
 				t.Fatalf("L1 restart/calendar change ended Seat: %+v", value)
 			}
@@ -227,11 +245,22 @@ func TestSeatApprovalClockRecoveryAcrossL1RestartAndNewBoot(t *testing.T) {
 				t.Fatal(err)
 			}
 			if newBoot {
-				if len(windows) != 0 || pending.State != "refused" {
-					t.Fatalf("new boot inherited authority: windows=%+v pending=%+v", windows, pending)
+				if len(windows) != 1 || pending.State != "requested" || pending.RemainingWait != 5*time.Minute {
+					t.Fatalf("L1 reboot dropped bounded approval: windows=%+v pending=%+v", windows, pending)
+				}
+				clock.elapsed += 5 * time.Minute
+				pending, err = f.store.BeginSeatApproval(t.Context(), "fabric-computer-node", base)
+				if err != nil || pending.State != "refused" {
+					t.Fatalf("reboot pending wait unbounded: %+v %v", pending, err)
+				}
+				clock.elapsed += 55 * time.Minute
+				windows, err = f.store.ListSeatApprovalWindows(t.Context(), f.node.NodeID)
+				if err != nil || len(windows) != 0 {
+					t.Fatalf("reboot window unbounded: %+v %v", windows, err)
 				}
 				return
 			}
+
 			if len(windows) != 1 || pending.State != "requested" || pending.RemainingWait != 3*time.Minute {
 				t.Fatalf("L1 restart reset approval clocks: windows=%+v pending=%+v", windows, pending)
 			}

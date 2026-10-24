@@ -100,7 +100,7 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 	}
 	defer write.rollback()
 	q := seatApprovalQuery(write.tx)
-	if err := persistSeatClockAnchor(ctx, q, s.clock); err != nil {
+	if err := recoverSeatApprovalClocks(ctx, q, s.clock); err != nil {
 		return SeatApproval{}, err
 	}
 	if err := requireSeatApprovalNode(ctx, q, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
@@ -272,7 +272,7 @@ func readSeatApprovalWindows(ctx context.Context, q queryer, nodeID string, now 
 		if err != nil {
 			return nil, err
 		}
-		if boot == "" || boot != current || ns < started || time.Duration(ns-started) >= time.Duration(duration) {
+		if boot == "" || boot != current || time.Duration(max(0, ns-started)) >= time.Duration(duration) {
 			continue
 		}
 		value.ExpiresAt = time.Unix(0, expires).UTC()

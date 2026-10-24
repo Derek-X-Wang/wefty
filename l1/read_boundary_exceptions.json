@@ -126,14 +126,8 @@
     "slice": "agent-protocol"
   },
   {
-    "site": "seat_time.go:*Store.loadSeatClockAnchor | s.db",
-    "count": 1,
-    "reason": "Infrastructure: restore the durable boot clock anchor during schema initialization, before read pools and request serving exist.",
-    "slice": "permanent"
-  },
-  {
     "site": "seat_time.go:*Store.migrateSeatLife | s.db",
-    "count": 1,
+    "count": 2,
     "reason": "Infrastructure: additive Seat timer schema initialization before serving requests.",
     "slice": "permanent"
   },

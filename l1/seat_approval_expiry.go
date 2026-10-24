@@ -26,9 +26,12 @@ func seatApprovalNeedsExpiry(ctx context.Context, q queryer, v SeatRequest, now 
 	if err != nil {
 		return false, err
 	}
-	return current != boot || ns < started || time.Duration(ns-started) >= a.Request.AnswerWait, nil
+	return current != boot || time.Duration(max(0, ns-started)) >= a.Request.AnswerWait, nil
 }
 func expireSeatApproval(ctx context.Context, q seatApprovalQuery, id string, now time.Time, clock Clock) error {
+	if err := recoverSeatApprovalClocks(ctx, q, clock); err != nil {
+		return err
+	}
 	v, err := readSeatRequest(ctx, q, id)
 	if errorCodeForSeatLifecycle(err) == "not_found" {
 		return nil

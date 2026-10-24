@@ -9,7 +9,23 @@ import (
 
 // Only the approval controller uses this elapsed timeline. Its wall labels
 // remain separate. Existing injected clocks retain their controlled timers.
-type seatWaitClock struct{ read func() (time.Duration, error) }
+type seatWaitClock struct {
+	read    func() (time.Duration, error)
+	failure *seatClockFailure
+}
+type seatClockFailure struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (c seatWaitClock) Err() error {
+	if c.failure == nil {
+		return nil
+	}
+	c.failure.mu.Lock()
+	defer c.failure.mu.Unlock()
+	return c.failure.err
+}
 
 func (c seatWaitClock) elapsed() (time.Duration, error) {
 	if c.read != nil {
@@ -20,7 +36,12 @@ func (c seatWaitClock) elapsed() (time.Duration, error) {
 func (c seatWaitClock) Now() time.Time {
 	ns, err := c.elapsed()
 	if err != nil {
-		panic(err)
+		if c.failure != nil {
+			c.failure.mu.Lock()
+			c.failure.err = err
+			c.failure.mu.Unlock()
+		}
+		return time.Time{}
 	}
 	return time.Unix(0, int64(ns))
 }
@@ -69,7 +90,7 @@ func (t *seatWaitTimer) Reset(d time.Duration) bool {
 		for {
 			now := t.clock.Now()
 			remaining := deadline.Sub(now)
-			if remaining <= 0 {
+			if t.clock.Err() != nil || remaining <= 0 {
 				t.mu.Lock()
 				defer t.mu.Unlock()
 				if t.cancel == cancel && t.active {

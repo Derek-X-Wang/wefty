@@ -23,57 +23,109 @@ const (
 // CheckSeatLife uses the same fence as Seat admission and owner mutations.
 // Helper cleanup and memory readback remain the only way room can return.
 func (s *Store) CheckSeatLife(ctx context.Context) error {
-	w, err := s.beginWriteTransaction(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer w.rollback()
-	ids, err := seatIDs(ctx, w.tx, `SELECT seat_id FROM seat_approvals WHERE lifecycle_state='live'`)
-	if err != nil {
-		return err
-	}
-	for _, id := range ids {
-		if err := s.checkSeatLifeTx(ctx, w.tx, id, w.at); err != nil {
-			return err
-		}
-	}
-	computers, err := seatIDs(ctx, w.tx, `SELECT computer_id FROM computers WHERE seat_request_made=1 AND desired_state='running' AND idle_action='delete' AND EXISTS(SELECT 1 FROM computer_seat_identities i WHERE i.computer_id=computers.computer_id)`)
-	if err != nil {
-		return err
-	}
-	due := []Computer{}
-	for _, id := range computers {
-		expired, err := s.computerIdleDue(ctx, w.tx, id, true)
+	if err := func() error {
+		w, err := s.beginWriteTransaction(ctx, nil)
 		if err != nil {
 			return err
 		}
-		if expired {
-			c, err := readComputerAuthority(ctx, w.tx, id, w.at)
+		defer w.rollback()
+		if err = recoverSeatApprovalClocks(ctx, w.tx, s.clock); err != nil {
+			return err
+		}
+		return w.commit()
+	}(); err != nil {
+		s.logSeatLifeError("approval_clock_recovery", err)
+	}
+	var seats, computers []string
+	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, r readModel) error {
+		q := r.(*databaseReads).q
+		var err error
+		seats, err = seatIDs(ctx, q, `SELECT seat_id FROM seat_approvals WHERE lifecycle_state='live'`)
+		if err != nil {
+			return err
+		}
+		computers, err = seatIDs(ctx, q, `SELECT computer_id FROM computers WHERE seat_request_made=1 AND desired_state='running' AND idle_action='delete' AND EXISTS(SELECT 1 FROM computer_seat_identities i WHERE i.computer_id=computers.computer_id) ORDER BY computer_id`)
+		return err
+	})
+	if err != nil {
+		s.logSeatLifeError("inventory", err)
+		return nil
+	}
+	for _, id := range seats {
+		err := func() error {
+			w, err := s.beginWriteTransaction(ctx, nil)
 			if err != nil {
 				return err
 			}
-			due = append(due, c)
-		}
-	}
-	if err := w.commit(); err != nil {
-		return err
-	}
-	for _, c := range due {
-		if err := s.reconfigurationCheckpoint("computer_idle_selected"); err != nil {
-			return err
-		}
-		_, err := s.RemoveComputer(ctx, c.ComputerID, ComputerRemoveRequest{ComputerMutationPrecondition: ComputerMutationPrecondition{IntentRevision: c.IntentRevision, StorageID: c.StorageID, StorageGeneration: c.StorageGeneration, Actor: "idle action"}, idleOnly: true})
-		// A concurrent Seat or owner mutation wins before removal starts.
-		if err != nil && errorCode(err) != contract.ErrorConflict {
-			return err
-		}
-		if err == nil {
-			if err := s.reconfigurationCheckpoint("computer_idle_started"); err != nil {
+			defer w.rollback()
+			if err = s.checkSeatLifeTxIfLive(ctx, w.tx, id, w.at); err != nil {
 				return err
 			}
+			return w.commit()
+		}()
+		if err != nil {
+			s.logSeatLifeError(id, err)
+			continue
+		}
+	}
+	for _, id := range computers {
+		err := s.checkComputerIdle(ctx, id)
+		if err != nil {
+			s.logSeatLifeError(id, err)
+			continue
 		}
 	}
 	return nil
+}
+
+func (s *Store) logSeatLifeError(target string, err error) {
+	if s.logf == nil {
+		return
+	}
+	code := errorCode(err)
+	if code == "" {
+		code = contract.ErrorInternal
+	}
+	s.logf("event=seat_life_retry target=%q code=%s action=retry_next_tick error=%q", target, code, err.Error())
+}
+
+func (s *Store) checkComputerIdle(ctx context.Context, id string) error {
+	var computer Computer
+	due, err := func() (bool, error) {
+		w, err := s.beginWriteTransaction(ctx, nil)
+		if err != nil {
+			return false, err
+		}
+		defer w.rollback()
+		due, err := s.computerIdleDue(ctx, w.tx, id, true)
+		if err != nil {
+			return false, err
+		}
+		if due {
+			computer, err = readComputerAuthority(ctx, w.tx, id, w.at)
+			if err != nil {
+				return false, err
+			}
+		}
+		return due, w.commit()
+	}()
+	if err != nil || !due {
+		return err
+	}
+	if err = s.reconfigurationCheckpoint("computer_idle_selected"); err != nil {
+		return err
+	}
+	_, err = s.RemoveComputer(ctx, id, ComputerRemoveRequest{ComputerMutationPrecondition: ComputerMutationPrecondition{IntentRevision: computer.IntentRevision, StorageID: computer.StorageID, StorageGeneration: computer.StorageGeneration, Actor: "idle action"}, idleOnly: true})
+	// An owner mutation, another Seat, or another removal may win the fence.
+	switch errorCode(err) {
+	case contract.ErrorConflict, "stale_intent_revision", "storage_reference_conflict", contract.ErrorNotFound:
+		s.logSeatLifeError(id, err)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return s.reconfigurationCheckpoint("computer_idle_started")
 }
 
 // A read-only decision is shared by follow authority checks and fenced writes.
@@ -96,16 +148,13 @@ func (s *Store) planSeatLife(ctx context.Context, q queryer, id string) (seatLif
 	if err != nil {
 		return seatLifeChange{}, err
 	}
-	if boot == "" {
+	if boot == "" || boot != current {
 		return seatLifeChange{initialize: true}, nil
-	}
-	if boot != current || ns < last {
-		return seatLifeChange{endReason: "the Computer restarted"}, nil
 	}
 	if held {
 		return seatLifeChange{}, nil
 	}
-	elapsed := time.Duration(ns - last)
+	elapsed := time.Duration(max(0, ns-last))
 	change := seatLifeChange{revision: revision, warn: !warned && elapsed >= s.seatIdleWait-s.seatWarningWait}
 	if elapsed >= s.seatIdleWait {
 		change.endReason = "expired"
@@ -121,9 +170,6 @@ func (s *Store) checkSeatLifeTx(ctx context.Context, q seatApprovalQuery, id str
 		return err
 	}
 	if change.initialize {
-		if err := persistSeatClockAnchor(ctx, q, s.clock); err != nil {
-			return err
-		}
 		return touchSeatActivity(ctx, q, s.clock, id)
 	}
 	if change.warn {
@@ -158,20 +204,20 @@ func (s *Store) computerIdleDue(ctx context.Context, q seatApprovalQuery, id str
 		return false, err
 	}
 	if busy || desired != "running" || action != "delete" {
-		_, err = q.ExecContext(ctx, `UPDATE computers SET wait_boot_id='',wait_started_ns=0 WHERE computer_id=?`, id)
+		_, err = q.ExecContext(ctx, `UPDATE computers SET wait_boot_id='',wait_started_ns=0 WHERE computer_id=? AND (wait_boot_id!='' OR wait_started_ns!=0)`, id)
 		return false, err
 	}
 	current, ns, err := seatTime(s.clock)
 	if err != nil {
 		return false, err
 	}
-	if boot == "" || boot != current || ns < started {
+	if boot == "" || boot != current {
 		if initialize {
 			_, err = q.ExecContext(ctx, `UPDATE computers SET wait_boot_id=?,wait_started_ns=? WHERE computer_id=?`, current, ns, id)
 		}
 		return false, err
 	}
-	return time.Duration(ns-started) >= s.computerIdleWait, nil
+	return time.Duration(max(0, ns-started)) >= s.computerIdleWait, nil
 }
 
 // SeatCallHappened is the shared one-time credential call seam. A log follow

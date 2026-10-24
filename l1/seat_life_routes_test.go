@@ -110,3 +110,43 @@ func TestSeatExpiredCredentialRefusesImmediatelyAndRetainsLog(t *testing.T) {
 		t.Fatalf("sleep-skipped warning must precede expiry: %+v", page.Events)
 	}
 }
+
+func TestSeatReleaseRetryHTTPRetainsSuccessfulOutcome(t *testing.T) {
+	policies := map[string]NodePolicy{"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxServiceSlots: 4}}
+	h := newIntegrationHarnessWithReconcileInterval(t, StoreOptions{LeaseDuration: time.Hour}, policies, true, 24*time.Hour)
+	node := registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{CapabilitySeatRequests: true, "kind:oci": true, "computer": true, "cgroup_v2": true}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	f := &seatLifecycleFixture{store: h.store, clock: h.clock, node: node}
+	f.computer = f.createComputer(t, "release", 2)
+	id, secret := liveSeatWithCredential(t, f)
+	client := h.client(fabric.Identity{NodeID: "cli", Tags: []string{DefaultClientPrincipalTag}})
+	for range 2 {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "http://control-plane.invalid/v1/seats/"+id+"/release", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set(SeatCredentialHeader, secret)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reply SeatCallResult
+		err = json.NewDecoder(response.Body).Decode(&reply)
+		response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusOK || reply.Reason != "released" {
+			t.Fatalf("release retry status=%d reply=%+v err=%v", response.StatusCode, reply, err)
+		}
+	}
+	page, err := h.store.GetSeatLogs(t.Context(), "cli", id, secret, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ends := 0
+	for _, event := range page.Events {
+		if event.Kind == SeatEventEnded {
+			ends++
+		}
+	}
+	if ends != 1 {
+		t.Fatalf("release replay duplicated end: %d", ends)
+	}
+}

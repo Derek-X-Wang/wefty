@@ -2255,7 +2255,9 @@ requests with internet. New requests check L1 inside the approval write, with no
 boundary the next request needs a dialog. Window expiry does not stop running
 Seats. Windows are boot-scoped, so replacing a node boot cannot inherit one.
 L1 records expiry from its injected sleep-counting clock; durable boot-relative
-stamps survive an L1 restart and invalidate authority on a new host boot.
+stamps survive an L1 restart. A new L1 host boot restarts each pending answer
+and retained approval window for its original bounded duration; a different
+node boot still invalidates its windows.
 
 `GET /v1/seat-approval-windows` supplies the coherent L1 read used by
 `wefty status`, including each open window's node, network and end time.
@@ -2786,11 +2788,19 @@ programs and log-follow polls do not. Trusted backend seams are
 backend must cancel every outstanding command when its Seat loses authority.
 
 Durable waits pair a boot identity with a sleep-counting elapsed clock, behind
-the injected clock seam: Darwin `CLOCK_MONOTONIC`, Linux `CLOCK_BOOTTIME`.
+the injected clock seam: Darwin `CLOCK_MONOTONIC_RAW`, Linux `CLOCK_BOOTTIME`.
 Calendar timestamps label logs and replies; they do not decide Seat expiry or
 approval-window authority. L1 restarts on the same boot retain the wait.
-A different boot ends old live Seats with `the Computer restarted`, retains
-room until positive cleanup, and invalidates old pending approvals and windows.
+A new L1 host boot gives each live Seat a full idle wait and restarts pending
+answers and retained approval windows for their original bounded durations,
+once per boot. Command and screen holds remain durable. An L1 reboot is not a
+Computer restart: only the existing Attempt lifecycle supplies that end reason.
+A backward elapsed-clock step within the same boot means zero elapsed and
+never a reboot. Boot identity alone identifies a new boot.
+L1's general timestamps use real wall time, without a global clock anchor.
+Existing Attempt lease comparisons still use wall time; a calendar step can
+therefore independently remove Attempt authority. Hardening those lease paths
+is separate from the Seat timers described here.
 Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
 pending approvals and windows without a stamp do not retain authority.
 
@@ -2801,8 +2811,19 @@ stops the Seat's processes and removes its folder. Only positive cleanup
 enters `ended`; existing `computer_room_limits` readback fences memory release.
 A Computer restart and owner stop, restart, reimage, reset or remove use this
 same lifecycle. Owner replies list Seats ended by that intent revision.
+The same credential can repeat a release whose reason is `released` and get
+the retained successful outcome, including after cleanup. Other ended reasons
+retain the typed refusal.
 
-The idle wait starts when the last active Seat leaves. New admission clears
+Seat life and idle maintenance failures never stop L1 startup or its HTTP
+server. Each Seat and Computer has an independent transaction. A failure is
+logged as one typed `seat_life_retry` line and retried next tick. Expected
+removal conflicts (changed intent, changed Storage reference, missing Computer,
+or ordinary conflict) yield to the concurrent action.
+
+The idle wait starts when the last active Seat leaves. Every owner intent
+change restarts it at that intent's commit, including backup-cap changes,
+reimage, reset, start, restart and stop. New admission clears
 it under the reservation fence. At deletion, L1 rechecks the current Desired
 state, idle action, elapsed wait and absence of active Seats inside the same
 write transaction that publishes removal. A Seat or owner stop that wins that

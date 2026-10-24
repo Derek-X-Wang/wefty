@@ -13,7 +13,11 @@ func (s *Store) ReleaseSeat(ctx context.Context, id, secret string) (SeatCallRes
 		return SeatCallResult{}, err
 	}
 	defer w.rollback()
-	if err := s.authorizeLiveSeat(ctx, w.tx, id, secret, w.at); err != nil {
+	authErr := s.authorizeLiveSeat(ctx, w.tx, id, secret, w.at)
+	value, readErr := readSeatRequest(ctx, w.tx, id)
+	replay := readErr == nil && value.Reason == "released" && (value.State == SeatEnding || value.State == SeatEnded) && errorCode(authErr) == "seat_ended"
+	if authErr != nil && !replay {
+		err := authErr
 		if errorCode(err) == "seat_ended" {
 			if e := w.commit(); e != nil {
 				return SeatCallResult{}, e
@@ -21,19 +25,19 @@ func (s *Store) ReleaseSeat(ctx context.Context, id, secret string) (SeatCallRes
 		}
 		return SeatCallResult{}, err
 	}
-	value, err := readSeatRequest(ctx, w.tx, id)
-	if err != nil {
-		return SeatCallResult{}, err
+	if readErr != nil {
+		return SeatCallResult{}, readErr
 	}
-	if err := setSeatLifecycle(ctx, w.tx, id, SeatEnding, "released", w.at); err != nil {
-		return SeatCallResult{}, err
-	}
-	if err := removeLifecycleSeat(ctx, w.tx, value); err != nil {
-		return SeatCallResult{}, err
-	}
-	// Start the idle wait at the last Seat's departure, not at a later poll.
-	if _, err := s.computerIdleDue(ctx, w.tx, value.ComputerID, true); err != nil {
-		return SeatCallResult{}, err
+	if !replay {
+		if err := setSeatLifecycle(ctx, w.tx, id, SeatEnding, "released", w.at); err != nil {
+			return SeatCallResult{}, err
+		}
+		if err := removeLifecycleSeat(ctx, w.tx, value); err != nil {
+			return SeatCallResult{}, err
+		}
+		if _, err := s.computerIdleDue(ctx, w.tx, value.ComputerID, true); err != nil {
+			return SeatCallResult{}, err
+		}
 	}
 	var caller string
 	if err := w.tx.QueryRowContext(ctx, `SELECT caller_identity FROM seat_request_calls WHERE seat_id=?`, id).Scan(&caller); err != nil {

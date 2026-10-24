@@ -93,7 +93,7 @@ func (s *Server) seatCredentialProtocol(next, logs http.Handler) http.Handler {
 			writeError(w, protocolError(contract.ErrorForbidden, "Seat credential belongs to another Seat log"))
 			return
 		}
-		if !ended.Valid && r.Method == http.MethodPost && r.URL.Path == path+"/release" {
+		if (!ended.Valid || reason == "released") && r.Method == http.MethodPost && r.URL.Path == path+"/release" {
 			logs.ServeHTTP(w, r)
 			return
 		}

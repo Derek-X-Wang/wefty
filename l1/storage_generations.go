@@ -257,7 +257,7 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 		computer.DesiredState == contract.ServiceDesiredRunning, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "persist Computer Storage reset intent")
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentReset,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentReset,
 		computer.DesiredState, computer.StorageID, nextGeneration, computer.CurrentJobID,
 		computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, false, err

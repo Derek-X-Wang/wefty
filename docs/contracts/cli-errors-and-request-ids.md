@@ -481,7 +481,8 @@ the Job, and a missing L3 configuration names its Run. It is never sent to L3
 as though the Job ID were a Run ID (#1200).
 
 An ended Seat credential may read only its own retained log and acknowledge
-its read cursor. Every other operation returns `seat_ended`, HTTP 409 and
+its read cursor. A repeated release with reason `released` also returns its
+retained successful outcome to the same credential. Other operations return `seat_ended`, HTTP 409 and
 CLI exit 5, with the end reason. This uses the existing typed-exit whitelist.
 An invalid credential returns `forbidden`; a credential cannot read another
 Seat's log. Before pruning, an expired log returns `not_found`; pruning
@@ -496,5 +497,7 @@ credential-scope and retention rules.
 command, screen, input and copy authority at once and reports `released`.
 Cleanup remains pending until helper evidence; release success is not cleanup
 proof. An expired credential returns `seat_ended` with `Seat ended: expired`
-(exit 5). A released credential returns `Seat ended: released`. The retained
+(exit 5). Repeating a successful release with the same credential returns success,
+including after cleanup; it does not restart the idle wait. Other operations
+with a released credential return `Seat ended: released`. The retained
 log and its read cursor remain readable under either credential.

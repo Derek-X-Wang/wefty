@@ -173,4 +173,6 @@ and end, reconciliation writes the warning before the end in the same check.
 A credential log request with `X-Wefty-Seat-Call: start` counts as one Seat
 call. The CLI sets it for the first log GET only, including a follow. Cursor
 acknowledgements, pagination and follow polls do not renew the Seat. An ended
-credential continues to read its log and cannot renew or release the Seat.
+credential continues to read its log and cannot renew the Seat. If its reason
+is `released`, the same credential may replay release to read the retained
+successful outcome; this grants no new authority and appends no duplicate end.

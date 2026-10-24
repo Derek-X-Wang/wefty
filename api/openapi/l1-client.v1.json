@@ -35,7 +35,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Seat log read.",
+            "description": "Seat released; a repeated release by the same credential returns the retained outcome.",
             "content": {
               "application/json": {
                 "schema": {

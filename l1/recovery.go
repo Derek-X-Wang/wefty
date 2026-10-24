@@ -228,7 +228,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		s.reconcileHoldForTest(time.Since(locked))
 	}
 	if err := s.CheckSeatLife(ctx); err != nil {
-		return result, err
+		s.logSeatLifeError("pass", err)
 	}
 	return result, nil
 }

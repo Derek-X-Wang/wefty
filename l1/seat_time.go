@@ -2,8 +2,6 @@ package l1
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/bootclock"
@@ -21,7 +19,7 @@ func (systemClock) BootTime() (string, time.Duration, error) {
 	return id, ns, err
 }
 
-func seatTime(clock Clock) (string, int64, error) {
+func seatTime(clock Clock, snapshot ...time.Time) (string, int64, error) {
 	if c, ok := clock.(interface {
 		BootTime() (string, time.Duration, error)
 	}); ok {
@@ -30,6 +28,9 @@ func seatTime(clock Clock) (string, int64, error) {
 	}
 	// Existing injected clocks have one controlled timeline. Tests that model
 	// independent calendar changes supply BootTime as well.
+	if len(snapshot) > 0 {
+		return "injected-clock", snapshot[0].UnixNano(), nil
+	}
 	return "injected-clock", clock.Now().UnixNano(), nil
 }
 
@@ -48,7 +49,7 @@ func (s *Store) migrateSeatLife(ctx context.Context) error {
 			}
 		}
 	}
-	_, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS seat_clock_anchor (singleton INTEGER PRIMARY KEY CHECK(singleton=1),boot_id TEXT NOT NULL,wall_offset_ns INTEGER NOT NULL);
+	_, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS seat_clock_anchor;
  CREATE TABLE IF NOT EXISTS seat_activity_holds (
  seat_id TEXT NOT NULL REFERENCES seat_approvals(seat_id) ON DELETE CASCADE,
  kind TEXT NOT NULL CHECK(kind IN ('command','person')),
@@ -59,7 +60,10 @@ func (s *Store) migrateSeatLife(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return s.loadSeatClockAnchor(ctx)
+	if err := recoverSeatApprovalClocks(ctx, s.db, s.clock); err != nil {
+		s.logSeatLifeError("approval_clock_recovery", err)
+	}
+	return nil
 }
 
 func touchSeatActivity(ctx context.Context, q seatApprovalQuery, clock Clock, id string) error {
@@ -81,44 +85,30 @@ func seatApprovalRemaining(ctx context.Context, q queryer, clock Clock, a SeatAp
 	if err != nil {
 		return 0, err
 	}
-	if current != boot || ns < started {
-		return 0, nil
+	if current != boot {
+		return a.Request.AnswerWait, nil
 	}
-	return max(0, a.Request.AnswerWait-time.Duration(ns-started)), nil
+	return max(0, a.Request.AnswerWait-time.Duration(max(0, ns-started))), nil
 }
 
-// The calendar-label anchor is durable too: an L1 restart cannot reinterpret
-// existing lease timestamps after the owner changes the calendar clock.
-func (s *Store) loadSeatClockAnchor(ctx context.Context) error {
-	if _, ok := s.clock.(systemClock); !ok {
-		return nil
-	}
-	var boot string
-	var offset int64
-	err := s.db.QueryRowContext(ctx, `SELECT boot_id,wall_offset_ns FROM seat_clock_anchor WHERE singleton=1`).Scan(&boot, &offset)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
+// A new L1 boot restarts existing pending answers and approval windows for
+// their original bounded duration. A node boot change still invalidates them.
+func recoverSeatApprovalClocks(ctx context.Context, q seatApprovalQuery, clock Clock) error {
+	var any bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_approvals WHERE state='requested' AND wait_boot_id!='' UNION ALL SELECT 1 FROM seat_approval_windows WHERE wait_boot_id!='')`).Scan(&any); err != nil {
 		return err
 	}
-	current, _, err := seatTime(s.clock)
-	if err != nil {
-		return err
-	}
-	if boot == current {
-		s.clock = systemClock{offset: &offset}
-	}
-	return nil
-}
-func persistSeatClockAnchor(ctx context.Context, q seatApprovalQuery, clock Clock) error {
-	if _, ok := clock.(systemClock); !ok {
+	if !any {
 		return nil
 	}
 	boot, ns, err := seatTime(clock)
 	if err != nil {
 		return err
 	}
-	_, err = q.ExecContext(ctx, `INSERT INTO seat_clock_anchor(singleton,boot_id,wall_offset_ns) VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET boot_id=excluded.boot_id,wall_offset_ns=excluded.wall_offset_ns WHERE boot_id!=excluded.boot_id`, boot, clock.Now().UnixNano()-ns)
+	now := clock.Now().UnixNano()
+	if _, err = q.ExecContext(ctx, `UPDATE seat_approvals SET wait_boot_id=?,wait_started_ns=?,deadline_ns=?+json_extract(CAST(request_json AS TEXT),'$.answer_wait') WHERE state='requested' AND wait_boot_id!='' AND wait_boot_id!=?`, boot, ns, now, boot); err != nil {
+		return err
+	}
+	_, err = q.ExecContext(ctx, `UPDATE seat_approval_windows SET wait_boot_id=?,wait_started_ns=?,expires_ns=?+wait_duration_ns WHERE wait_boot_id!='' AND wait_boot_id!=?`, boot, ns, now, boot)
 	return err
 }

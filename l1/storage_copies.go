@@ -348,7 +348,7 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 		request.IdempotencyKey, requestHash, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "persist Computer restore operation")
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, revision, ComputerIntentRestore,
+	if err := s.insertComputerIntent(ctx, tx, computerID, revision, ComputerIntentRestore,
 		contract.ServiceDesiredStopped, computer.StorageID, generation, computer.CurrentJobID,
 		computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, false, err
@@ -613,7 +613,7 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 		computerID, storageID, request.DiskBytes, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "stage cloned Computer Storage")
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, 1, ComputerIntentClone, contract.ServiceDesiredStopped,
+	if err := s.insertComputerIntent(ctx, tx, computerID, 1, ComputerIntentClone, contract.ServiceDesiredStopped,
 		storageID, 1, job.JobID, 1, request.Actor, now); err != nil {
 		return Computer{}, false, err
 	}
