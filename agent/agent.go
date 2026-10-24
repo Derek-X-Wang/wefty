@@ -295,6 +295,10 @@ func New(config Config) (*Agent, error) {
 		AgentVersion:      config.Version,
 		Capabilities:      normalizeConfiguredCapabilities(config.Capabilities),
 	}
+	delete(registration.Capabilities, l1.CapabilitySeatRequests)
+	if config.ComputerRoom != nil {
+		registration.Capabilities[l1.CapabilitySeatRequests] = true
+	}
 	processRuntime, _ := runtimes.selectKind(contract.JobKindProcess)
 	guardian, guardianOK := processRuntime.(interface{ GuardianAvailable() bool })
 	delete(registration.Capabilities, l1.CapabilityOneshotRestartable)

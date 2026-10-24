@@ -15,7 +15,7 @@ import (
 // SL-1: the public request is durable before a node agent opens a dialog.
 func TestSeatRequestCallReplayAndCallerFence(t *testing.T) {
 	h := newIntegrationHarnessWithPolicies(t, map[string]NodePolicy{"computer-node": {Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxServiceSlots: 4}})
-	registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{"kind:oci": true, "computer": true, "cgroup_v2": true}, []string{contract.StableNodeTagPrefix + "computer-node"})
+	registerCapabilityNodeWithTags(t, h, "computer-node", map[string]bool{"computer:seat-requests": true, "kind:oci": true, "computer": true, "cgroup_v2": true}, []string{contract.StableNodeTagPrefix + "computer-node"})
 	caller := h.client(fabric.Identity{NodeID: "cli", Tags: []string{DefaultClientPrincipalTag}})
 	other := h.client(fabric.Identity{NodeID: "other-cli", Tags: []string{DefaultClientPrincipalTag}})
 	id := fmt.Sprintf("seat_%032x", 1)
@@ -321,7 +321,7 @@ func TestSeatRequestFailedNewComputerUsesVerifiedRemoval(t *testing.T) {
 		t.Fatalf("dedicated settings: %+v", computer.ComputerSettings)
 	}
 	// Injected time expires a not-yet-ready new Computer. No Lima/runtime runs.
-	f.clock.now = f.clock.now.Add(time.Minute)
+	f.clock.Advance(value.Deadline.Sub(f.clock.Now()))
 	if _, err := f.store.PollSeatCalls(t.Context(), "fabric-computer-node", poll); err != nil {
 		t.Fatal(err)
 	}
@@ -492,6 +492,12 @@ func TestSeatRequestRefusalWaitsForExistingSeatCleanup(t *testing.T) {
 }
 
 func TestSeatRequestOnceLiveComputerSurvivesLaterSeatFailure(t *testing.T) {
+	testSeatOnceLiveHistory(t, false)
+}
+
+func TestSeatCallOnceLiveSurvivesReceiptPrune(t *testing.T) { testSeatOnceLiveHistory(t, true) }
+
+func testSeatOnceLiveHistory(t *testing.T, prune bool) {
 	for _, firstReady := range []bool{true, false} {
 		t.Run(fmt.Sprintf("first_ready=%v", firstReady), func(t *testing.T) {
 
@@ -539,6 +545,11 @@ func TestSeatRequestOnceLiveComputerSurvivesLaterSeatFailure(t *testing.T) {
 			}
 			observe(2, 2, []ComputerSeatObservation{{SeatID: id, Place: first.Place, State: firstState}, {SeatID: secondID, Place: second.Place, State: ComputerSeatReady}})
 			observe(3, 2, []ComputerSeatObservation{{SeatID: id, Place: first.Place, State: ComputerSeatFailed, Reason: "desktop failed later"}, {SeatID: secondID, Place: second.Place, State: ComputerSeatReady}})
+			if prune {
+				if _, err := f.store.db.Exec(`DELETE FROM seat_request_calls`); err != nil {
+					t.Fatal(err)
+				}
+			}
 			// A cleanup queued from an older read must recheck the positive start
 			// receipt in the removal write, even though the poll now excludes it.
 			if err := f.store.cleanupSeatCallComputer(t.Context(), id); err != nil {
@@ -550,6 +561,9 @@ func TestSeatRequestOnceLiveComputerSurvivesLaterSeatFailure(t *testing.T) {
 			computer, err := f.store.GetComputer(t.Context(), first.ComputerID)
 			if err != nil || computer.DesiredState != contract.ServiceDesiredRunning {
 				t.Fatalf("once-live Computer treated as failed new start: desired=%s err=%v", computer.DesiredState, err)
+			}
+			if prune {
+				return
 			}
 			other, err := f.store.GetSeatCall(t.Context(), "cli", secondID)
 			if err != nil || other.State != SeatLive {

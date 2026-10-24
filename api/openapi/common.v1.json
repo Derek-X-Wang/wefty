@@ -138,7 +138,8 @@
           "boot_session_id",
           "room",
           "host_enabled",
-          "answer_wait"
+          "answer_wait",
+          "window_hours"
         ],
         "properties": {
           "node_id": {
@@ -152,6 +153,11 @@
           },
           "host_enabled": {
             "type": "boolean"
+          },
+          "window_hours": {
+            "type": ["array", "null"],
+            "items": {"type": "integer", "enum": [1, 8, 24]},
+            "description": "Allowed node window lengths; null defaults to all lengths, empty disables windows."
           },
           "answer_wait": {
             "type": "integer",

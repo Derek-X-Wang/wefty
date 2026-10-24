@@ -427,6 +427,10 @@ JSON error document on stderr, with `details.seat_id` and these codes:
 | `seat_dedicated_cap` | dedicated Computer cap reached | 5 | false |
 | `seat_host_off` | the host VM is off | 5 | false |
 | `seat_start_failed` | the recorded start/readiness failure reason | 5 | false |
+| `seat_room_unconfigured` | Computer room is not configured on this node | 5 | false |
+| `seat_node_unavailable` | the node did not pick up the request | 5 | true |
+| `seat_window_not_allowed` | requested window is not enabled; names the allowed windows | 5 | false |
+| `seat_ended` | Seat ended: the recorded end reason | 5 | false |
 
 No new process exit number is added. The whitelist in `main.go`, the shared
 command reporter and real-binary tests pin these typed conflict outcomes.
@@ -441,11 +445,20 @@ A room-race loser does not create a Computer or Storage generation at all.
 L1 mints one random Seat credential and stores it with the caller-bound request.
 Only a live request returns it to its original Fabric caller. Repeated waits
 receive the same credential. The CLI never prints the credential. It writes
-`wefty-seats-<uid>/<seat_id>.json` inside Go's system temp folder (`os.TempDir()`),
-in a 0700 directory with 0600 files. The credential file is a JSON object with
-`seat_id` and `credential` string fields. The immutable replay receipt is the sibling
+`<seat_id>.json` under `$XDG_STATE_HOME/wefty/seats` when XDG_STATE_HOME is
+absolute, otherwise `~/.local/state/wefty/seats`. Only on macOS, permission or
+read-only failures fall back to `os.TempDir()/wefty-seats`. The
+`WEFTY_SEAT_STATE_ROOT` override never falls back. Readers search the same
+ordered roots, even when the default root has become writable since an earlier
+fallback. The root must be a 0700 directory owned by the current uid; files
+are 0600. The credential file is a JSON object with `seat_id` and `credential`
+string fields. The immutable replay receipt is the sibling
 `<seat_id>.request.json`. A directory-root handle and atomic relative rename
 keep interrupted writes and replaced symlinks from redirecting credential writes.
+Removing CLI files when a Seat ends belongs to #1146. L1 erases its stored
+credential when the Seat ends or is refused; call-row pruning follows the final
+Seat record's retention. The permanent Seat identity keeps the once-Live guard
+independently of pruned call receipts.
 The final JSON result names `credential_file`; text output names the same file.
 This storage does not grant socket access or any approval. A sandbox that
 blocks the wefty socket stays refused under the client-service contract.

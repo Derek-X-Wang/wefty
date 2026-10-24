@@ -33,7 +33,7 @@ func newSeatLifecycleFixture(t *testing.T) *seatLifecycleFixture {
 	})
 	f.node, err = f.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-computer-node"}, contract.NodeRegistration{
 		NodeID: "computer-node", BootSessionID: "boot", RootInstanceID: "root", OS: "linux", Architecture: "amd64", AgentVersion: "test",
-		Capabilities: map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true}, CapabilityRevision: 1, CapabilityObservedAt: f.clock.Now(), MissingCapabilities: []string{},
+		Capabilities: map[string]bool{"computer:seat-requests": true, "kind:oci": true, "cgroup_v2": true, "computer": true}, CapabilityRevision: 1, CapabilityObservedAt: f.clock.Now(), MissingCapabilities: []string{},
 	}, NodePolicy{Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxServiceSlots: 4}, true)
 	if err != nil {
 		t.Fatal(err)
@@ -331,7 +331,7 @@ func TestSeatLifecycleNewNodeBootRefusesLostDialog(t *testing.T) {
 	f := newSeatLifecycleFixture(t)
 	id := f.request(t, 1, false)
 	f.reopen(t)
-	_, err := f.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-computer-node"}, contract.NodeRegistration{NodeID: f.node.NodeID, BootSessionID: "next-boot", RootInstanceID: "root", OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true}, CapabilityRevision: 2, CapabilityObservedAt: f.clock.Now(), MissingCapabilities: []string{}}, NodePolicy{Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxServiceSlots: 4}, true)
+	_, err := f.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-computer-node"}, contract.NodeRegistration{NodeID: f.node.NodeID, BootSessionID: "next-boot", RootInstanceID: "root", OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"computer:seat-requests": true, "kind:oci": true, "cgroup_v2": true, "computer": true}, CapabilityRevision: 2, CapabilityObservedAt: f.clock.Now(), MissingCapabilities: []string{}}, NodePolicy{Tags: []string{contract.StableNodeTagPrefix + "computer-node"}, MaxServiceSlots: 4}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

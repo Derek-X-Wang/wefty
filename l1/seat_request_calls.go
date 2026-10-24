@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,15 +36,19 @@ type SeatCallPoll struct {
 	Room        ComputerRoomConfig `json:"room"`
 	HostEnabled bool               `json:"host_enabled"`
 	AnswerWait  time.Duration      `json:"answer_wait"`
+	WindowHours []int              `json:"window_hours"`
 }
 type SeatCallList struct {
 	Requests []SeatCallInput `json:"requests"`
 }
 
+// CapabilitySeatRequests advertises configured room, independently of runtime readiness.
+const CapabilitySeatRequests = "computer:seat-requests"
+
 const seatCallSchema = `
 CREATE TABLE IF NOT EXISTS seat_request_calls (
  seat_id TEXT PRIMARY KEY,
- node_id TEXT NOT NULL REFERENCES nodes(node_id),
+ node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
  boot_session_id TEXT NOT NULL,
  caller_identity TEXT NOT NULL,
  input_json BLOB NOT NULL,
@@ -53,12 +59,39 @@ CREATE TABLE IF NOT EXISTS seat_request_calls (
 CREATE INDEX IF NOT EXISTS seat_request_calls_node ON seat_request_calls(node_id,created_ns,seat_id);
 `
 
-// Selection is node-local and short. Room admission itself still uses #1142's
-// SQLite write fence. No probe, dialog or runtime command holds this mutex.
 // NewSeatRequestID shares the store ID format with every durable L1 identity.
 func NewSeatRequestID() string { return newID("seat") }
 
-var seatCallSelection sync.Mutex
+// Selection is node-local and short. Room admission still uses SQLite's
+// write fence; no probe, dialog or runtime command holds this mutex.
+type seatCallNodeSelection struct {
+	sync.Mutex
+	users int
+}
+
+func (s *Store) lockSeatCallSelection(node string) func() {
+	s.seatCallSelectionMu.Lock()
+	if s.seatCallSelections == nil {
+		s.seatCallSelections = map[string]*seatCallNodeSelection{}
+	}
+	entry := s.seatCallSelections[node]
+	if entry == nil {
+		entry = &seatCallNodeSelection{}
+		s.seatCallSelections[node] = entry
+	}
+	entry.users++
+	s.seatCallSelectionMu.Unlock()
+	entry.Lock()
+	return func() {
+		entry.Unlock()
+		s.seatCallSelectionMu.Lock()
+		entry.users--
+		if entry.users == 0 {
+			delete(s.seatCallSelections, node)
+		}
+		s.seatCallSelectionMu.Unlock()
+	}
+}
 
 func (s *Store) CreateSeatCall(ctx context.Context, caller string, input SeatCallInput) (SeatCallResult, error) {
 	request := SeatApprovalRequest{SeatID: input.SeatID, NodeID: input.NodeID, BootSessionID: "validate", Harness: input.Harness, Folder: input.Folder, Form: input.Form, Network: input.Network, WindowHours: input.WindowHours, AnswerWait: time.Minute}
@@ -89,14 +122,15 @@ func (s *Store) CreateSeatCall(ctx context.Context, caller string, input SeatCal
 		}
 	} else if errors.Is(err, sql.ErrNoRows) {
 		var used int
-		if err := write.tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM seat_approvals WHERE seat_id=?`, input.SeatID).Scan(&used); err != nil {
+		if err := write.tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_approvals WHERE seat_id=? UNION ALL SELECT 1 FROM computer_seat_identities WHERE seat_id=?)`, input.SeatID, input.SeatID).Scan(&used); err != nil {
 			return SeatCallResult{}, err
 		}
 		if used != 0 {
 			return SeatCallResult{}, protocolError(contract.ErrorDispatchKeyConflict, "Seat ID was already used")
 		}
 		var boot, state string
-		if err := write.tx.QueryRowContext(ctx, `SELECT boot_session_id,state FROM nodes WHERE node_id=?`, input.NodeID).Scan(&boot, &state); err != nil {
+		var capabilities []byte
+		if err := write.tx.QueryRowContext(ctx, `SELECT boot_session_id,state,capabilities_json FROM nodes WHERE node_id=?`, input.NodeID).Scan(&boot, &state, &capabilities); err != nil {
 			return SeatCallResult{}, protocolError(contract.ErrorNotFound, "Seat request node not found")
 		}
 		if state != string(contract.NodeAlive) {
@@ -109,6 +143,15 @@ func (s *Store) CreateSeatCall(ctx context.Context, caller string, input SeatCal
 		if _, err := write.tx.ExecContext(ctx, `INSERT INTO seat_request_calls(seat_id,node_id,boot_session_id,caller_identity,input_json,credential,created_ns) VALUES(?,?,?,?,?,?,?)`, input.SeatID, input.NodeID, boot, caller, data, hex.EncodeToString(secret), write.at.UnixNano()); err != nil {
 			return SeatCallResult{}, err
 		}
+		var caps map[string]bool
+		if err := json.Unmarshal(capabilities, &caps); err != nil {
+			return SeatCallResult{}, err
+		}
+		if !caps[CapabilitySeatRequests] {
+			if err := refuseUnpickedSeatCall(ctx, write.tx, input, boot, write.at, "Computer room is not configured on this node"); err != nil {
+				return SeatCallResult{}, err
+			}
+		}
 	} else {
 		return SeatCallResult{}, err
 	}
@@ -119,13 +162,14 @@ func (s *Store) CreateSeatCall(ctx context.Context, caller string, input SeatCal
 }
 func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallResult, error) {
 	var result SeatCallResult
-	var expired bool
+	var expired, unpickedExpired bool
 	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
 		r := reads.(*databaseReads)
 		q := r.q
 		var owner, secret string
 		var startFinished bool
-		if err := q.QueryRowContext(ctx, `SELECT caller_identity,credential,start_finished FROM seat_request_calls WHERE seat_id=?`, id).Scan(&owner, &secret, &startFinished); err != nil {
+		var created int64
+		if err := q.QueryRowContext(ctx, `SELECT caller_identity,credential,start_finished,created_ns FROM seat_request_calls WHERE seat_id=?`, id).Scan(&owner, &secret, &startFinished, &created); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return protocolError(contract.ErrorNotFound, "Seat request not found")
 			}
@@ -136,6 +180,7 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 		}
 		value, err := readSeatRequest(ctx, q, id)
 		if errorCodeForSeatLifecycle(err) == contract.ErrorNotFound {
+			unpickedExpired = !r.now().Before(time.Unix(0, created).Add(MaxSeatApprovalWait))
 			result = SeatCallResult{SeatRequest: SeatRequest{SeatID: id, State: SeatRequested}}
 			return nil
 		}
@@ -169,6 +214,12 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 		}
 		return nil
 	})
+	if err == nil && unpickedExpired {
+		if err := s.expireUnpickedSeatCall(ctx, caller, id); err != nil {
+			return SeatCallResult{}, err
+		}
+		return s.GetSeatCall(ctx, caller, id)
+	}
 	if err == nil && expired {
 		if _, err := s.expireSeatApprovalRead(ctx, id, "", nil); err != nil {
 			return SeatCallResult{}, err
@@ -189,6 +240,15 @@ func (s *Store) PollSeatCalls(ctx context.Context, identity string, poll SeatCal
 	if poll.AnswerWait <= 0 || poll.AnswerWait > MaxSeatApprovalWait {
 		return SeatCallList{}, protocolError(contract.ErrorInvalidRequest, "invalid Seat answer wait")
 	}
+	windows := poll.WindowHours
+	if windows == nil {
+		windows = []int{1, 8, 24}
+	}
+	for _, hours := range windows {
+		if hours != 1 && hours != 8 && hours != 24 {
+			return SeatCallList{}, protocolError(contract.ErrorInvalidRequest, "invalid Seat approval window hours")
+		}
+	}
 	type candidate struct {
 		input   SeatCallInput
 		boot    string
@@ -200,7 +260,7 @@ func (s *Store) PollSeatCalls(ctx context.Context, identity string, poll SeatCal
 		if err := requireSeatApprovalNode(ctx, q, identity, poll.NodeID, poll.BootSessionID); err != nil {
 			return err
 		}
-		rows, err := q.QueryContext(ctx, `SELECT c.input_json,c.boot_session_id,c.created_ns FROM seat_request_calls c LEFT JOIN seat_approvals a ON a.seat_id=c.seat_id WHERE c.node_id=? AND c.start_finished=0 AND (a.seat_id IS NULL OR COALESCE(NULLIF(a.lifecycle_state,''),a.state) IN ('requested','approved','starting') OR (COALESCE(NULLIF(a.lifecycle_state,''),a.state)='refused' AND EXISTS(SELECT 1 FROM computers failed WHERE failed.name='seat-' || substr(c.seat_id,6) AND failed.seat_request_made=1 AND failed.removal_outcome!='removed_verified' AND NOT EXISTS(SELECT 1 FROM seat_request_calls finished JOIN computer_seat_identities used ON used.seat_id=finished.seat_id WHERE used.computer_id=failed.computer_id AND finished.start_finished=1)))) ORDER BY c.created_ns,c.seat_id`, poll.NodeID)
+		rows, err := q.QueryContext(ctx, `SELECT c.input_json,c.boot_session_id,c.created_ns FROM seat_request_calls c LEFT JOIN seat_approvals a ON a.seat_id=c.seat_id WHERE c.node_id=? AND c.start_finished=0 AND (a.seat_id IS NULL OR COALESCE(NULLIF(a.lifecycle_state,''),a.state) IN ('requested','approved','starting') OR (COALESCE(NULLIF(a.lifecycle_state,''),a.state)='refused' AND EXISTS(SELECT 1 FROM computers failed WHERE failed.name='seat-' || substr(c.seat_id,6) AND failed.seat_request_made=1 AND failed.removal_outcome!='removed_verified' AND NOT EXISTS(SELECT 1 FROM computer_seat_identities used WHERE used.computer_id=failed.computer_id AND used.ever_live=1)))) ORDER BY c.created_ns,c.seat_id`, poll.NodeID)
 		if err != nil {
 			return err
 		}
@@ -222,32 +282,44 @@ func (s *Store) PollSeatCalls(ctx context.Context, identity string, poll SeatCal
 		return SeatCallList{}, err
 	}
 
-	result := SeatCallList{Requests: []SeatCallInput{}}
-	for _, c := range candidates {
+	process := func(c candidate) (bool, error) {
 		v, err := s.GetSeatRequest(ctx, c.input.SeatID)
 		if errorCodeForSeatLifecycle(err) == contract.ErrorNotFound {
 			_, err = s.BeginSeatApproval(ctx, identity, SeatApprovalRequest{SeatID: c.input.SeatID, NodeID: poll.NodeID, BootSessionID: poll.BootSessionID, Harness: c.input.Harness, Folder: c.input.Folder, Form: c.input.Form, Network: c.input.Network, WindowHours: c.input.WindowHours, AnswerWait: poll.AnswerWait})
 		}
 		if err != nil {
-			return result, err
+			return false, err
 		}
 		// Include dispatch delay in the original deadline. Begin's immutable
 		// AnswerWait remains the node setting for approval replay.
 		if err := s.limitSeatCallDeadline(ctx, identity, c.input.SeatID, poll, time.Unix(0, c.created).Add(poll.AnswerWait)); err != nil {
-			return result, err
+			return false, err
 		}
 
 		reason := ""
+		preflightOnly := false
 		if c.boot != poll.BootSessionID {
 			reason = "approval dialog lost"
 		} else if (v.State == "" || v.State == SeatRequested) && !s.clock.Now().Before(time.Unix(0, c.created).Add(poll.AnswerWait)) {
 			reason = "no answer from the owner"
+		} else if c.input.WindowHours != 0 && !slices.Contains(windows, c.input.WindowHours) && (v.State == "" || v.State == SeatRequested) {
+			allowed := []string{}
+			for _, h := range windows {
+				allowed = append(allowed, fmt.Sprintf("%dh", h))
+			}
+			label := strings.Join(allowed, ", ")
+			if label == "" {
+				label = "none"
+			}
+			reason = fmt.Sprintf("Seat approval window %dh is not enabled; allowed windows: %s", c.input.WindowHours, label)
+			preflightOnly = true
 		} else if !poll.HostEnabled {
 			reason = "the host VM is off"
-		} else if v.State == "" || v.State == SeatRequested || v.State == SeatApproved && v.ComputerID == "" {
+		} else if v.State == "" || v.State == SeatRequested {
+			preflightOnly = true
 			snap, e := s.GetComputerRoomSnapshot(ctx, poll.NodeID, poll.Room)
 			if e != nil {
-				return result, e
+				return false, e
 			}
 			if snap.AvailableSeats == 0 {
 				reason = ErrComputerRoomFull.Error()
@@ -262,7 +334,7 @@ func (s *Store) PollSeatCalls(ctx context.Context, identity string, poll SeatCal
 			if v.ComputerID != "" {
 				computer, e := s.GetComputer(ctx, v.ComputerID)
 				if e != nil {
-					return result, e
+					return false, e
 				}
 				if computer.CurrentJob.State == contract.JobFailed {
 					reason = "Computer failed to start"
@@ -270,21 +342,35 @@ func (s *Store) PollSeatCalls(ctx context.Context, identity string, poll SeatCal
 			}
 		}
 		if reason != "" && v.State != SeatRefused {
-			if _, err := s.EndSeatRequest(ctx, identity, c.input.SeatID, SeatEndRequest{NodeID: poll.NodeID, BootSessionID: poll.BootSessionID, Reason: reason, Refused: true, pendingOnly: true}); err != nil {
-				return result, err
+			if _, err := s.EndSeatRequest(ctx, identity, c.input.SeatID, SeatEndRequest{NodeID: poll.NodeID, BootSessionID: poll.BootSessionID, Reason: reason, Refused: true, pendingOnly: true, preflightOnly: preflightOnly}); err != nil {
+				return false, err
 			}
 		}
 		v, err = s.GetSeatRequest(ctx, c.input.SeatID)
 		if err != nil {
-			return result, err
+			return false, err
 		}
 		if v.State == SeatRefused {
 			if err := s.cleanupSeatCallComputer(ctx, c.input.SeatID); err != nil {
-				return result, err
+				return false, err
+			}
+			return false, nil
+		}
+		return true, nil
+	}
+	result := SeatCallList{Requests: []SeatCallInput{}}
+	for _, c := range candidates {
+		include, err := process(c)
+		if err != nil {
+			s.logf("l1: Seat request %s on node %s: %v", c.input.SeatID, poll.NodeID, err)
+			if ctx.Err() != nil {
+				return result, ctx.Err()
 			}
 			continue
 		}
-		result.Requests = append(result.Requests, c.input)
+		if include {
+			result.Requests = append(result.Requests, c.input)
+		}
 	}
 	return result, nil
 }
@@ -292,8 +378,8 @@ func (s *Store) PollSeatCalls(ctx context.Context, identity string, poll SeatCal
 // AdvanceSeatCall runs only after the dialog, under the node identity. Retries
 // reuse both the permanent reservation and a deterministic creation key.
 func (s *Store) AdvanceSeatCall(ctx context.Context, identity, id string, poll SeatCallPoll) (SeatRequest, error) {
-	seatCallSelection.Lock()
-	defer seatCallSelection.Unlock()
+	unlock := s.lockSeatCallSelection(poll.NodeID)
+	defer unlock()
 	if err := poll.Room.Validate(); err != nil {
 		return SeatRequest{}, err
 	}
@@ -337,7 +423,7 @@ func (s *Store) AdvanceSeatCall(ctx context.Context, identity, id string, poll S
 		return value, nil
 	}
 	if value.ComputerID != "" {
-		return s.StartSeatRequest(ctx, identity, id, SeatStartRequest{NodeID: poll.NodeID, BootSessionID: poll.BootSessionID, ReadyWait: time.Minute})
+		return s.StartSeatRequest(ctx, identity, id, SeatStartRequest{NodeID: poll.NodeID, BootSessionID: poll.BootSessionID, ReadyWait: s.seatCallReadyWait()})
 	}
 	if computerID == "" {
 		image, e := s.ComputerDefaultImage()
@@ -365,7 +451,7 @@ func (s *Store) AdvanceSeatCall(ctx context.Context, identity, id string, poll S
 	if value.State == SeatRefused {
 		return value, s.cleanupSeatCallComputer(ctx, id)
 	}
-	return s.StartSeatRequest(ctx, identity, id, SeatStartRequest{NodeID: poll.NodeID, BootSessionID: poll.BootSessionID, ReadyWait: time.Minute})
+	return s.StartSeatRequest(ctx, identity, id, SeatStartRequest{NodeID: poll.NodeID, BootSessionID: poll.BootSessionID, ReadyWait: s.seatCallReadyWait()})
 }
 func (s *Store) refuseSeatCall(ctx context.Context, identity, id string, poll SeatCallPoll, reason string) (SeatRequest, error) {
 	v, err := s.EndSeatRequest(ctx, identity, id, SeatEndRequest{NodeID: poll.NodeID, BootSessionID: poll.BootSessionID, Reason: reason, Refused: true, pendingOnly: true})
@@ -447,6 +533,56 @@ func (s *Store) createSeatCallComputer(ctx context.Context, identity, id string,
 // later request becomes ready before the request that created the Computer.
 func computerHasFinishedSeatCall(ctx context.Context, q queryer, computer string) (bool, error) {
 	var finished bool
-	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_request_calls c JOIN computer_seat_identities i ON i.seat_id=c.seat_id WHERE i.computer_id=? AND c.start_finished=1)`, computer).Scan(&finished)
+	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM computer_seat_identities WHERE computer_id=? AND ever_live=1)`, computer).Scan(&finished)
 	return finished, err
+}
+
+// Refusal is the only authority available before a node picks up the request.
+func refuseUnpickedSeatCall(ctx context.Context, q seatApprovalQuery, input SeatCallInput, boot string, at time.Time, reason string) error {
+	request := SeatApprovalRequest{SeatID: input.SeatID, NodeID: input.NodeID, BootSessionID: boot, Harness: input.Harness, Folder: input.Folder, Form: input.Form, Network: input.Network, WindowHours: input.WindowHours, AnswerWait: MaxSeatApprovalWait}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	// This public-call path can only insert a refusal. It cannot grant or
+	// overwrite approval, even if another writer picked up the request.
+	_, err = q.ExecContext(ctx, `INSERT INTO seat_approvals(seat_id,node_id,boot_session_id,request_json,state,reason,deadline_ns) VALUES(?,?,?,?,'refused',?,?)`, input.SeatID, input.NodeID, boot, data, reason, at.UnixNano())
+	return err
+}
+func (s *Store) expireUnpickedSeatCall(ctx context.Context, caller, id string) error {
+	write, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer write.rollback()
+	var owner, boot string
+	var data []byte
+	var created int64
+	var picked bool
+	if err := write.tx.QueryRowContext(ctx, `SELECT caller_identity,boot_session_id,input_json,created_ns,EXISTS(SELECT 1 FROM seat_approvals WHERE seat_id=c.seat_id) FROM seat_request_calls c WHERE seat_id=?`, id).Scan(&owner, &boot, &data, &created, &picked); err != nil {
+		return err
+	}
+	if owner != caller {
+		return protocolError(contract.ErrorForbidden, "Seat request belongs to another caller")
+	}
+	if !picked && !write.at.Before(time.Unix(0, created).Add(MaxSeatApprovalWait)) {
+		var input SeatCallInput
+		if err := json.Unmarshal(data, &input); err != nil {
+			return err
+		}
+		if err := refuseUnpickedSeatCall(ctx, write.tx, input, boot, write.at, "the node did not pick up the request"); err != nil {
+			return err
+		}
+	}
+	return write.commit()
+}
+
+// EnsureImage may pull and unpack the pinned default image before task start.
+// Reuse L1's bounded prestart infrastructure budget, plus the helper's own
+// 60-second endpoint-readiness interval. Start persists this duration once;
+// polling and replay never reset it, including while a Computer is queued.
+const seatCallEndpointReadinessWait = time.Minute
+
+func (s *Store) seatCallReadyWait() time.Duration {
+	return s.prestartInfrastructureBudget + seatCallEndpointReadinessWait
 }

@@ -18,9 +18,15 @@ import (
 // SL-1 crosses the production node-owned poller, native-dialog seam and L1.
 // The disconnected CLI observer has no cancellation authority over the dialog.
 func TestSeatRequestCutOffWaitKeepsOneDialogAndSeat(t *testing.T) {
+	testSeatRequestDialog(t, false)
+}
+
+func TestSeatRequestNilIntentAfterDialog(t *testing.T) { testSeatRequestDialog(t, true) }
+
+func testSeatRequestDialog(t *testing.T, nilIntent bool) {
 	clock := newManualClock(time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC))
 	client, store := approvalTestClient(t, clock)
-	_, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "dialog-node"}, contract.NodeRegistration{NodeID: "mac", BootSessionID: "boot", RootInstanceID: "root", OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"kind:oci": true, "computer": true, "cgroup_v2": true}, CapabilityRevision: 2, CapabilityObservedAt: clock.Now(), MissingCapabilities: []string{}}, l1.DefaultNodePolicy(contract.StableNodeTagPrefix+"mac"), true)
+	_, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "dialog-node"}, contract.NodeRegistration{NodeID: "mac", BootSessionID: "boot", RootInstanceID: "root", OS: "linux", Architecture: "amd64", AgentVersion: "test", Capabilities: map[string]bool{"computer:seat-requests": true, "kind:oci": true, "computer": true, "cgroup_v2": true}, CapabilityRevision: 2, CapabilityObservedAt: clock.Now(), MissingCapabilities: []string{}}, l1.DefaultNodePolicy(contract.StableNodeTagPrefix+"mac"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,16 +82,25 @@ func TestSeatRequestCutOffWaitKeepsOneDialogAndSeat(t *testing.T) {
 	if _, err := store.CreateSeatCall(t.Context(), "cli", input); err != nil {
 		t.Fatal(err)
 	}
+	if nilIntent {
+		node.session.ociIntent = nil
+	}
 	close(approve)
 	// Real time bounds test execution only; all lifecycle time uses clock.
 	deadline := time.Now().Add(5 * time.Second)
 	var value l1.SeatCallResult
 	for time.Now().Before(deadline) {
 		value, err = store.GetSeatCall(t.Context(), "cli", input.SeatID)
-		if err == nil && value.State == l1.SeatStarting {
+		if err == nil && (value.State == l1.SeatStarting || nilIntent && value.State == l1.SeatRefused) {
 			break
 		}
 		time.Sleep(time.Millisecond)
+	}
+	if nilIntent {
+		if err != nil || value.State != l1.SeatRefused || value.Reason != "the host VM is off" || dialogs.Load() != 1 {
+			t.Fatalf("nil intent: %+v %v dialogs=%d", value, err, dialogs.Load())
+		}
+		return
 	}
 	if err != nil || value.State != l1.SeatStarting || value.ComputerID != computer.ComputerID || dialogs.Load() != 1 {
 		t.Fatalf("replayed request state=%s computer=%s dialogs=%d err=%v", value.State, value.ComputerID, dialogs.Load(), err)

@@ -135,3 +135,29 @@ func TestSeatRequestLostPostReplyReplaysPrivateReceipt(t *testing.T) {
 		t.Fatalf("replay posts=%d output=%s", posts, output.String())
 	}
 }
+
+func TestSeatRequestAdditionalRefusalsRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	id := "seat_00000000000000000000000000000903"
+	for _, c := range []struct {
+		reason, code string
+		state        l1.SeatRequestState
+		retry        bool
+	}{
+		{"Computer room is not configured on this node", "seat_room_unconfigured", l1.SeatRefused, false},
+		{"the node did not pick up the request", "seat_node_unavailable", l1.SeatRefused, true},
+		{"Seat approval window 8h is not enabled; allowed windows: 1h", "seat_window_not_allowed", l1.SeatRefused, false},
+		{"released", "seat_ended", l1.SeatEnded, false},
+	} {
+		t.Run(c.code, func(t *testing.T) {
+			address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(l1.SeatCallResult{SeatRequest: l1.SeatRequest{SeatID: id, State: c.state, Reason: c.reason}})
+			})
+			code, out := runWefty(t, binary, 30*time.Second, "--l1", address, "seat", "wait", id, "--json")
+			var response contract.ErrorResponse
+			if err := json.Unmarshal([]byte(out), &response); err != nil || code != 5 || string(response.Error.Code) != c.code || response.Error.Retryable != c.retry {
+				t.Fatalf("exit=%d response=%s err=%v", code, out, err)
+			}
+		})
+	}
+}

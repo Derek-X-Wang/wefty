@@ -23,7 +23,8 @@ import (
 // lifecycle columns on seat_approvals and retained room reservations/limits,
 // then exact Seat and memory Attempt authority/absence recovery columns,
 // then #1143 caller-bound Seat input receipts, credentials and the fenced
-// start-finished receipt.
+// start-finished receipt; then request-node deletion, final credential scrub/
+// retention triggers and permanent once-Live Seat history.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -41,7 +42,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
 	// Seat identity recovery retains exact authority and positive Attempt absence.
-	const mainFingerprint = "a4f0b75cd65eb61e78682dca72cee87219067aadd90fe71982496d90462a7254"
+	const mainFingerprint = "190f38fe2fa2f6111d7bdfc97d1bfecba92259024fc657a8a23e863112f8fd7d"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}

@@ -166,7 +166,11 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 			}
 			_, err = fmt.Fprintf(stdout, "Seat %s ready on %s; credential stored in %s\n", id, result.ComputerID, path)
 			return err
-		case l1.SeatRefused, l1.SeatEnded, l1.SeatEnding:
+		case l1.SeatEnded, l1.SeatEnding:
+			if !result.CleanupPending {
+				return &apiResponseError{APIError: contract.APIError{Code: seatErrorEnded, Message: "Seat ended: " + result.Reason, Details: map[string]any{"seat_id": id}}}
+			}
+		case l1.SeatRefused:
 			if !result.CleanupPending {
 				return seatCallRefusal(id, result.Reason)
 			}
@@ -183,6 +187,12 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 func seatCallRefusal(id, reason string) error {
 	code := seatErrorStartFailed
 	switch {
+	case reason == "Computer room is not configured on this node":
+		code = seatErrorRoomUnconfigured
+	case reason == "the node did not pick up the request":
+		code = seatErrorNodeUnavailable
+	case strings.HasPrefix(reason, "Seat approval window ") && strings.Contains(reason, "allowed windows:"):
+		code = seatErrorWindowNotAllowed
 	case reason == "out of room, try again later":
 		code = seatErrorRoomFull
 	case strings.HasPrefix(reason, "dedicated Computer cap reached"):
@@ -194,5 +204,5 @@ func seatCallRefusal(id, reason string) error {
 	case reason == "the host VM is off":
 		code = seatErrorHostOff
 	}
-	return &apiResponseError{APIError: contract.APIError{Code: code, Message: reason, Retryable: code == seatErrorRoomFull || code == seatErrorNoAnswer, Details: map[string]any{"seat_id": id}}}
+	return &apiResponseError{APIError: contract.APIError{Code: code, Message: reason, Retryable: code == seatErrorRoomFull || code == seatErrorNoAnswer || code == seatErrorNodeUnavailable, Details: map[string]any{"seat_id": id}}}
 }

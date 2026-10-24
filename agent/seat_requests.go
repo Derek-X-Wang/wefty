@@ -55,7 +55,7 @@ func (a *Agent) runSeatRequests(ctx context.Context) {
 		}
 		// Keep reconciling failed starts even if runtime capability is lost.
 		// This loop never starts a host VM; cold-start demand is #1144.
-		poll := l1.SeatCallPoll{SeatNodeRequest: l1.SeatNodeRequest{NodeID: a.registration.NodeID, BootSessionID: a.registration.BootSessionID}, Room: *a.seatRoom, HostEnabled: enabled, AnswerWait: a.seatApprovals.settings.AnswerWait}
+		poll := l1.SeatCallPoll{SeatNodeRequest: l1.SeatNodeRequest{NodeID: a.registration.NodeID, BootSessionID: a.registration.BootSessionID}, Room: *a.seatRoom, HostEnabled: enabled, AnswerWait: a.seatApprovals.settings.AnswerWait, WindowHours: a.seatApprovals.settings.WindowHours}
 		list, err := a.sessionClient().PollSeatCalls(ctx, poll)
 		if err != nil {
 			a.log("node agent: Seat request poll: %v", err)
@@ -80,7 +80,11 @@ func (a *Agent) runSeatRequests(ctx context.Context) {
 				approval, err := a.RequestSeatApproval(ctx, request)
 				if err == nil && approval.State == "approved" {
 					// Re-read intent after an arbitrarily long owner dialog.
-					observation, e := a.session.ociIntent(ctx)
+					var observation OCIIntentObservation
+					var e error
+					if a.session.ociIntent != nil {
+						observation, e = a.session.ociIntent(ctx)
+					}
 					if e != nil {
 						err = e
 					} else {

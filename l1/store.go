@@ -106,6 +106,8 @@ type Store struct {
 	computerSharedSeatLimit           int
 	reconfigurationHook               func(string) error
 	deploymentID                      string
+	seatCallSelectionMu               sync.Mutex
+	seatCallSelections                map[string]*seatCallNodeSelection
 	policyChangeMu                    sync.Mutex
 	policyChanged                     chan struct{}
 	// secretWALMu serializes SweepScrubbedSecrets. secretWALGeneration is the
@@ -1279,6 +1281,10 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.migrateSeatLifecycle(ctx); err != nil {
 		return err
 	}
+	if err := s.migrateSeatCalls(ctx); err != nil {
+		return err
+	}
+
 	if err := s.migrateAdminPersonDevice(ctx); err != nil {
 		return err
 	}

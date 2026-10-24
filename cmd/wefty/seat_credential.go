@@ -7,18 +7,36 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
+	"runtime"
+	"syscall"
 
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-// P3 stores credentials in the system temp folder. A refused write stays refused.
-// OpenRoot pins the directory; atomic relative rename cannot follow a replaced
-// credential-file symlink. Neither this file nor the receipt bypasses Fabric.
-func openSeatCredentialRoot() (*os.Root, error) {
-	directory := filepath.Join(os.TempDir(), "wefty-seats-"+strconv.Itoa(os.Getuid()))
-	if err := os.Mkdir(directory, 0700); err != nil && !os.IsExist(err) {
+// Roots follow exec's state-folder convention. A denied write never changes
+// Fabric access; the macOS fallback is only a private local storage location.
+var seatStorageGOOS = runtime.GOOS
+var seatCredentialUID = os.Getuid
+
+func seatCredentialRoots() ([]string, error) {
+	root, err := userStateStorageRoot("WEFTY_SEAT_STATE_ROOT", "seats")
+	if err != nil {
 		return nil, err
+	}
+	roots := []string{root}
+	if seatStorageGOOS == "darwin" && os.Getenv("WEFTY_SEAT_STATE_ROOT") == "" {
+		fallback := filepath.Join(os.TempDir(), "wefty-seats")
+		if fallback != root {
+			roots = append(roots, fallback)
+		}
+	}
+	return roots, nil
+}
+func openSeatCredentialDirectory(directory string, create bool) (*os.Root, error) {
+	if create {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			return nil, err
+		}
 	}
 	info, err := os.Lstat(directory)
 	if err != nil {
@@ -26,6 +44,10 @@ func openSeatCredentialRoot() (*os.Root, error) {
 	}
 	if !info.IsDir() || info.Mode().Perm() != 0700 {
 		return nil, fmt.Errorf("Seat credential directory must be a private directory")
+	}
+	owner, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || owner.Uid != uint32(seatCredentialUID()) {
+		return nil, fmt.Errorf("Seat credential directory must be owned by the current uid")
 	}
 	root, err := os.OpenRoot(directory)
 	if err != nil {
@@ -38,37 +60,54 @@ func openSeatCredentialRoot() (*os.Root, error) {
 	}
 	return root, nil
 }
+func seatStorageDenied(err error) bool {
+	return errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.EROFS)
+}
 func storeSeatPrivateFile(id, suffix string, value any) (string, error) {
 	if !seatCLIIdentifier.MatchString(id) {
 		return "", fmt.Errorf("invalid Seat ID")
 	}
-	root, err := openSeatCredentialRoot()
+	roots, err := seatCredentialRoots()
 	if err != nil {
 		return "", err
 	}
-	defer root.Close()
 	data, err := json.Marshal(value)
 	if err != nil {
 		return "", err
 	}
-	// An exclusive staging file prevents another writer from replacing bytes
-	// before they are complete. The final file is always a 0600 regular file.
-	stage := id + suffix + "." + rand.Text() + ".writing"
-	file, err := root.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return "", err
+	attempt := func(directory string) (string, error) {
+		root, err := openSeatCredentialDirectory(directory, true)
+		if err != nil {
+			return "", err
+		}
+		defer root.Close()
+		stage := id + suffix + "." + rand.Text() + ".writing"
+		file, err := root.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return "", err
+		}
+		defer root.Remove(stage)
+		_, writeErr := file.Write(data)
+		err = errors.Join(writeErr, file.Sync(), file.Close())
+		if err != nil {
+			return "", err
+		}
+		name := id + suffix
+		if err := root.Rename(stage, name); err != nil {
+			return "", err
+		}
+		return filepath.Join(root.Name(), name), nil
 	}
-	defer root.Remove(stage)
-	_, writeErr := file.Write(data)
-	err = errors.Join(writeErr, file.Sync(), file.Close())
-	if err != nil {
-		return "", err
+	path, first := attempt(roots[0])
+	if first == nil {
+		return path, nil
 	}
-	name := id + suffix
-	if err := root.Rename(stage, name); err != nil {
-		return "", err
+	if seatStorageDenied(first) && len(roots) > 1 {
+		if path, err := attempt(roots[1]); err == nil {
+			return path, nil
+		}
 	}
-	return filepath.Join(root.Name(), name), nil
+	return "", first
 }
 func storeSeatCredential(id, secret string) (string, error) {
 	return storeSeatPrivateFile(id, ".json", struct {
@@ -85,12 +124,28 @@ func loadSeatCallInput(id string) (l1.SeatCallInput, error) {
 	if !seatCLIIdentifier.MatchString(id) {
 		return result, fmt.Errorf("invalid Seat ID")
 	}
-	root, err := openSeatCredentialRoot()
+	roots, err := seatCredentialRoots()
 	if err != nil {
 		return result, err
 	}
-	defer root.Close()
-	data, err := root.ReadFile(id + ".request.json")
+	var data []byte
+	for i, directory := range roots {
+		root, e := openSeatCredentialDirectory(directory, false)
+		if e == nil {
+			data, e = root.ReadFile(id + ".request.json")
+			root.Close()
+		}
+		if e == nil {
+			err = nil
+			break
+		}
+		if i == 0 {
+			err = e
+		}
+		if !os.IsNotExist(e) && !seatStorageDenied(e) {
+			return result, e
+		}
+	}
 	if err != nil {
 		return result, err
 	}

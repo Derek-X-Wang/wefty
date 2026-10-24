@@ -2634,10 +2634,24 @@ The public routes cannot reach approval-grant, room-reservation or Start paths.
 The credential is returned only while the existing lifecycle says live.
 
 The current node and boot use `POST /v1/agent/seat-requests/poll` to receive
-pending input. The node supplies its configured room, intent and answer wait.
+pending input. Registration advertises `computer:seat-requests` only when
+Computer room is configured, independently of runtime readiness. Create refuses
+immediately when that capability is absent. An unpicked call expires at
+creation plus `MaxSeatApprovalWait`, with `the node did not pick up the request`.
+The read path commits that refusal with fresh caller and unpicked-state checks.
+The node supplies its configured room, intent, answer wait and allowed window
+hours (`null` defaults to 1, 8 and 24; an empty list allows no windows). An
+unsupported window is refused before a dialog, naming the allowed lengths.
 Before any dialog, L1 checks those values against its durable room and dedicated
-count. The answer deadline includes dispatch delay from request creation; the
-approval controller receives the remaining time. A request that lost its node
+count only while the call is Requested. The refusing write rechecks that state
+and an empty Computer binding; Approved calls use ReserveSeatRoom's fence.
+Errors for one candidate are logged and skipped so other requests can proceed.
+The answer deadline includes dispatch delay from request creation; the
+approval controller receives the remaining time. It retains the owner's answer
+per Seat ID for its process lifetime and retries a failed answer post with
+exponential backoff from one to thirty seconds, bounded by that same deadline.
+It never shows a second dialog for that ID. A new boot still refuses a lost
+dialog under #1142. A request that lost its node
 boot is refused. The node-owned poller survives CLI cancellation, re-reads
 intent after the dialog, and uses
 `POST /v1/agent/seat-requests/{seat_id}/advance` only after approval.
@@ -2652,7 +2666,12 @@ room reservation share one SQLite write transaction: a losing request rolls
 back the Computer, Job, Storage generation and room writes, then keeps only
 its refused request record. No claim can start the losing Computer.
 The existing #1142 controller grows memory before publishing a Seat directive.
-Its fenced helper observation is the only way Starting becomes Live.
+Its fenced helper observation is the only way Starting becomes Live. The
+request's immutable Start wait is L1's prestart infrastructure budget (ten
+minutes by default) plus the helper's sixty-second readiness interval. The
+image pull/unpack occurs before task start; it must fit that prestart budget.
+Polling or replay cannot restart this deadline. Selection is serialized per
+node, with the SQLite room fence still authoritative across nodes.
 
 Poll also reconciles a starting request's readiness deadline and Computer
 failure. A refused request that created a new Computer whose Seats never
@@ -2671,3 +2690,11 @@ host VM; the stopped-host-VM demand/wait path is owned by #1144.
 
 The four new routes and their closed request/response schemas are published in
 `api/openapi` and pinned to the Go types by drift tests.
+
+Call credentials are scrubbed transactionally on refusal and on entry to Ending
+or Ended, including upgraded final records. The call's node foreign key cascades
+on node deletion. A final approval's deletion prunes its call receipt in the
+same transaction. #1142 currently retains final Seat records indefinitely; no
+new time-based retention period is introduced here. Permanent Seat identities
+retain `ever_live`, backfilled from the original `start_finished` receipts, so
+pruning call records cannot turn an existing Computer into a failed new start.

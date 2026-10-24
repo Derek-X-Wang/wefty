@@ -101,6 +101,7 @@ type seatApprovalCall struct {
 	request l1.SeatApprovalRequest
 	result  l1.SeatApproval
 	err     error
+	answer  *l1.SeatApprovalAnswer
 }
 type SeatApprovalController struct {
 	client                SeatApprovalClient
@@ -156,14 +157,16 @@ func (c *SeatApprovalController) RequestApproval(ctx context.Context, request l1
 	call := &seatApprovalCall{done: make(chan struct{}), request: request}
 	c.calls[request.SeatID] = call
 	c.mu.Unlock()
-	call.result, call.err = c.requestApproval(ctx, request)
+	call.result, call.err = c.requestApproval(ctx, request, call)
 	c.mu.Lock()
-	delete(c.calls, request.SeatID)
+	if call.answer == nil {
+		delete(c.calls, request.SeatID)
+	}
 	close(call.done)
 	c.mu.Unlock()
 	return call.result, call.err
 }
-func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1.SeatApprovalRequest) (l1.SeatApproval, error) {
+func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1.SeatApprovalRequest, call *seatApprovalCall) (l1.SeatApproval, error) {
 	started := c.clock.Now()
 	pending, err := c.client.BeginSeatApproval(ctx, request)
 	if err != nil || pending.State != "requested" {
@@ -191,7 +194,27 @@ func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1
 		case <-timer.C():
 		}
 	}
-	return c.client.AnswerSeatApproval(context.WithoutCancel(ctx), request.SeatID, answer)
+	// Retain this result for the process lifetime. A lost post must never
+	// turn an owner answer back into a new dialog on the next poll.
+	call.answer = &answer
+	backoff := time.Second
+	for {
+		postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		value, err := c.client.AnswerSeatApproval(postCtx, request.SeatID, *call.answer)
+		cancel()
+		if err == nil || ctx.Err() != nil || !c.clock.Now().Before(deadline) {
+			return value, err
+		}
+		retry := c.clock.NewTimer(min(backoff, deadline.Sub(c.clock.Now())))
+		select {
+		case <-ctx.Done():
+			stopTimer(retry)
+			return value, ctx.Err()
+		case <-retry.C():
+			stopTimer(retry)
+		}
+		backoff = min(30*time.Second, backoff*2)
+	}
 }
 
 // The node owns the slot until Show has returned, including after cancellation.

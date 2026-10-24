@@ -135,7 +135,9 @@ wefty seat --help
 
 The request prints one `seat_<32 hex>` ID immediately, then waits for a ready
 Seat or a typed refusal. After a cut-off call, use `seat wait` with that ID;
-requesting again makes a different request. The network is required. `internet`
+requesting again makes a different request. The request waits during the
+owner's dialog; run it in the background or rely on `wefty seat wait`.
+The network is required. `internet`
 asks for internet; `none` asks for no internet. `--dedicated` asks for a new
 Computer with a Seat limit of 1. Without it, wefty uses a shared Computer with
 room or creates another. `--window` asks the owner for 1, 8 or 24 hours of
@@ -147,12 +149,13 @@ A full node refuses before showing a dialog: `out of room, try again later`
 host VM also have distinct typed refusal codes. There is no wait queue for
 room. A wait observes its original request and never opens a second dialog.
 
-The CLI stores the Seat credential in a private file keyed by Seat ID under
-the system temp folder and reports its path. Keep the credential private;
-use the same user and system temp folder when waiting again. If the sandbox
-blocks the wefty socket, stop and ask the owner. Seats add no socket allowance
-or alternate connection path. Seat command cancellation and time limits stop
-the command's whole process group; only programs that use `setsid` survive.
+The CLI stores the Seat credential and replay receipt in private files under
+`$XDG_STATE_HOME/wefty/seats` when XDG_STATE_HOME is absolute, otherwise
+`~/.local/state/wefty/seats`. On macOS, a permission or read-only refusal uses
+`os.TempDir()/wefty-seats`. `WEFTY_SEAT_STATE_ROOT` overrides the root and never
+falls back. Later waits search the default root and macOS fallback in that order.
+Keep the credential private. If the sandbox blocks the wefty socket, stop and
+ask the owner. Seats add no socket allowance or alternate connection path.
 
 ## One command with local changes: `wefty exec`
 
@@ -322,6 +325,8 @@ settings, for example:
 ```json
 {"sandbox":{"filesystem":{"allowWrite":["~/.local/state/wefty/exec"]}}}
 ```
+
+For Seat credentials, add `~/.local/state/wefty/seats` beside the exec folder in Claude Code `allowWrite` or its absolute path in Codex `writable_roots`.
 
 See Claude Code's [sandbox configuration](https://code.claude.com/docs/en/sandboxing#configure-sandboxing).
 After the allowance is active, check it with `wefty exec -- go version`.

@@ -324,3 +324,15 @@ func releasedAddress(t *testing.T) string {
 	}
 	return address
 }
+
+func TestSkillSeatDialogAndStateFolder(t *testing.T) {
+	skill := readSkill(t)
+	if strings.Contains(skill, "setsid") {
+		t.Fatal("Seat command process semantics belong to #1151")
+	}
+	for _, text := range []string{"owner's dialog", "background", "WEFTY_SEAT_STATE_ROOT", "wefty/seats"} {
+		if !strings.Contains(skill, text) {
+			t.Errorf("Seat guidance missing %q", text)
+		}
+	}
+}

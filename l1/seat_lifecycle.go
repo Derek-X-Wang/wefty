@@ -60,7 +60,8 @@ type SeatEndRequest struct {
 	Reason        string `json:"reason"`
 	Refused       bool   `json:"refused"`
 	// The request controller cannot end a Seat that already reached Live.
-	pendingOnly bool
+	pendingOnly   bool
+	preflightOnly bool
 }
 
 const seatRoomSchema = `
@@ -496,6 +497,9 @@ func (s *Store) EndSeatRequest(ctx context.Context, identity, id string, request
 	if err != nil {
 		return value, err
 	}
+	if request.preflightOnly && (value.State != SeatRequested || value.ComputerID != "") {
+		return value, write.commit()
+	}
 	if request.pendingOnly && (value.State == SeatLive || value.State == SeatEnding || value.State == SeatEnded) {
 		return value, write.commit()
 	}
@@ -544,6 +548,9 @@ func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now
 			// never receives its answer. Later Seat failure cannot turn an
 			// existing Computer back into a failed new start.
 			if _, err := q.ExecContext(ctx, `UPDATE seat_request_calls SET start_finished=1 WHERE seat_id=?`, seat.SeatID); err != nil {
+				return err
+			}
+			if _, err := q.ExecContext(ctx, `UPDATE computer_seat_identities SET ever_live=1 WHERE seat_id=?`, seat.SeatID); err != nil {
 				return err
 			}
 			return setSeatLifecycle(ctx, q, seat.SeatID, SeatLive, "")

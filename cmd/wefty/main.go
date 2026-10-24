@@ -82,12 +82,16 @@ const errorWaitTimeout contract.ErrorCode = "wait_timeout"
 // Seat refusal codes share the conflict exit. This is the explicit whitelist
 // consumed by command_reporting.go and exercised through the real binary.
 const (
-	seatErrorRoomFull     contract.ErrorCode = "seat_room_full"
-	seatErrorNoAnswer     contract.ErrorCode = "seat_no_answer"
-	seatErrorDenied       contract.ErrorCode = "seat_denied"
-	seatErrorDedicatedCap contract.ErrorCode = "seat_dedicated_cap"
-	seatErrorHostOff      contract.ErrorCode = "seat_host_off"
-	seatErrorStartFailed  contract.ErrorCode = "seat_start_failed"
+	seatErrorRoomFull         contract.ErrorCode = "seat_room_full"
+	seatErrorNoAnswer         contract.ErrorCode = "seat_no_answer"
+	seatErrorDenied           contract.ErrorCode = "seat_denied"
+	seatErrorDedicatedCap     contract.ErrorCode = "seat_dedicated_cap"
+	seatErrorHostOff          contract.ErrorCode = "seat_host_off"
+	seatErrorStartFailed      contract.ErrorCode = "seat_start_failed"
+	seatErrorRoomUnconfigured contract.ErrorCode = "seat_room_unconfigured"
+	seatErrorNodeUnavailable  contract.ErrorCode = "seat_node_unavailable"
+	seatErrorWindowNotAllowed contract.ErrorCode = "seat_window_not_allowed"
+	seatErrorEnded            contract.ErrorCode = "seat_ended"
 )
 
 func commandExitCode(err error) int {
