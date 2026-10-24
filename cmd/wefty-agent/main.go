@@ -493,6 +493,7 @@ func run() error {
 		ociIntentFile         = flag.String("oci-intent-file", "", "absolute read-only durable OCI intent file; missing disables OCI")
 		ociControlSocket      = flag.String("oci-control-socket", "", "operator-only node-local OCI control socket")
 		ociProbeArchive       = flag.String("oci-probe-archive", "", "absolute immutable OCI archive used by setup-oci")
+		ociUserInstall        = flag.String("oci-user-install", "", "setup-owned per-user host VM bootstrap configuration")
 		ociSetupState         = flag.String("oci-setup-state", "", "absolute durable OCI setup convergence state")
 		ociMemoryCapacity     = flag.Int64("oci-memory-capacity-bytes", 0, "setup-configured Computer memory ceiling used by the private helper")
 		ociMemoryReserve      = flag.Int64("oci-memory-reserve-bytes", 0, "setup-configured infrastructure memory reserve used by the private helper")
@@ -695,6 +696,22 @@ func run() error {
 		bootSessionID, err = agent.NewBootSessionID()
 		if err != nil {
 			return err
+		}
+	}
+	if *ociUserInstall != "" {
+		if runtime.GOOS != "darwin" {
+			return errors.New("--oci-user-install requires macOS")
+		}
+		installContext, stop := context.WithTimeout(context.Background(), 15*time.Minute)
+		ociAllowed, installErr := prepareInstalledUserOCI(installContext, *ociUserInstall, *nodeID, bootSessionID, version, limarunner.PrepareUserInstall, agent.NativeSeatApprovalDialog{}, limarunner.StopProofUserInstall)
+		stop()
+		if installErr != nil {
+			return installErr
+		}
+		if !ociAllowed {
+			// A refused proof stays registered for process work. Do not construct
+			// OCI recovery, control or doctor loops that could reopen the host VM.
+			*ociHelperSocket, *ociControlSocket, *ociDoctorFacts = "", "", ""
 		}
 	}
 	capabilities := defaultAgentCapabilities()
@@ -1066,6 +1083,9 @@ func run() error {
 			}
 		}()
 	}
+	if *ociUserInstall != "" && *ociLimaInstance == "wefty-proof" && bootBarrier != nil {
+		go writeProofStartupReceipt(ctx, filepath.Dir(*ociSetupState), nodeAgent, bootBarrier, *nodeID, bootSessionID)
+	}
 	if supervisedBootBarrier != nil {
 		go supervisedBootBarrier.Run(ctx, nodeAgent.RecoverOCIRuntimeCapabilities)
 	}
@@ -1388,13 +1408,16 @@ func writeMinimalDoctorFactsLoop(
 		}
 		snapshot := nodeAgent.CapabilitySnapshot()
 		unitState := limarunner.UnitStateUnmanaged
-		if os.Getenv("WEFTY_LAUNCH_UNIT") == limarunner.LaunchDaemonLabel {
+		if os.Getenv("WEFTY_LAUNCH_UNIT") == limarunner.LaunchDaemonLabel || os.Getenv("WEFTY_LAUNCH_UNIT") == "dev.wefty.node-agent" || os.Getenv("WEFTY_LAUNCH_UNIT") == "dev.wefty-proof.node-agent" {
 			unitState = limarunner.UnitStateLaunchedByUnit
 		}
 		facts := limarunner.BuildMinimalDoctorFacts(
 			unitState, supervisor.Facts(), handshake, snapshot.CapabilityObservation,
 			snapshot.LastProbe, time.Now(),
 		)
+		if unitState == limarunner.UnitStateLaunchedByUnit {
+			facts.Unit.Label = os.Getenv("WEFTY_LAUNCH_UNIT")
+		}
 		if err := limarunner.WriteMinimalDoctorFacts(path, facts); err != nil && logf != nil {
 			logf("wefty-agent: write minimal doctor facts: %v", err)
 		}
