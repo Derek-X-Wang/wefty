@@ -224,6 +224,8 @@ func runWorkloadE2E(t *testing.T, leaseDuration, renewalInterval time.Duration, 
 		"--heartbeat-interval=5s",
 		"--claim-interval=10ms",
 		"--renewal-interval="+renewalInterval.String(),
+		// The run's output reaches agentLogs only through the console mirror (#1169).
+		"--mirror-run-output=true",
 	)
 	node.command.Stdout = agentLogs
 	node.command.Stderr = agentLogs

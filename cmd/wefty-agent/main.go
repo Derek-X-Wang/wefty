@@ -444,6 +444,7 @@ func run() error {
 		return err
 	}
 	printVersion := flag.Bool("version", false, "print the build commit and exit")
+	mirrorRunOutput := registerMirrorRunOutputFlag(flag.CommandLine)
 	agentExecutable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate wefty-agent executable: %w", err)
@@ -797,10 +798,8 @@ func run() error {
 		ManagedRootDirectory:    *managedRoot,
 		GuardianExecutable:      agentExecutable,
 		HandoffRoot:             *handoffRoot,
-		OutputSinkFactory: func(claim l1.Claim) processrunner.OutputSink {
-			return newConsoleOutputSink(os.Stdout, os.Stderr, claim)
-		},
-		Logf: log.Printf,
+		OutputSinkFactory:       consoleOutputSinkFactory(*mirrorRunOutput, os.Stdout, os.Stderr),
+		Logf:                    log.Printf,
 	})
 	if err != nil {
 		return err
@@ -1255,6 +1254,19 @@ func (dispatcher *consoleOutputDispatcher) write(ctx context.Context, writer io.
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func registerMirrorRunOutputFlag(flags *flag.FlagSet) *bool {
+	return flags.Bool("mirror-run-output", false, "mirror run output to stdout/stderr for running the agent in the foreground during development; otherwise read run output with wefty logs")
+}
+
+func consoleOutputSinkFactory(mirrorRunOutput bool, stdout, stderr io.Writer) agent.OutputSinkFactory {
+	if !mirrorRunOutput {
+		return nil
+	}
+	return func(claim l1.Claim) processrunner.OutputSink {
+		return newConsoleOutputSink(stdout, stderr, claim)
 	}
 }
 

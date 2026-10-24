@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -598,6 +599,47 @@ func waitForMainTestNode(t *testing.T, store *l1.Store, nodeID string, predicate
 		return false, fmt.Errorf("nodes = %+v", nodes)
 	})
 	return matched
+}
+
+func TestMirrorRunOutputFlagWiresOptionalConsoleSink(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		arguments []string
+		wantSink  bool
+	}{
+		{name: "default"},
+		{name: "enabled", arguments: []string{"-mirror-run-output"}, wantSink: true},
+		{name: "explicitly disabled", arguments: []string{"-mirror-run-output=false"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			flags := flag.NewFlagSet("wefty-agent", flag.ContinueOnError)
+			mirrorRunOutput := registerMirrorRunOutputFlag(flags)
+			if err := flags.Parse(test.arguments); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+			config := agent.Config{OutputSinkFactory: consoleOutputSinkFactory(*mirrorRunOutput, &stdout, &stderr)}
+			if got := config.OutputSinkFactory != nil; got != test.wantSink {
+				t.Fatalf("OutputSinkFactory present = %t, want %t", got, test.wantSink)
+			}
+			if !test.wantSink {
+				return
+			}
+			claim := l1.Claim{Job: l1.Job{JobID: "job"}, Lease: l1.AttemptLease{AttemptID: "attempt"}}
+			sink := config.OutputSinkFactory(claim)
+			for _, stream := range []contract.LogStream{contract.LogStdout, contract.LogStderr} {
+				if err := sink.WriteOutput(t.Context(), contract.LogEvent{Stream: stream, Bytes: []byte("payload\n")}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got, want := stdout.String(), "[job=job attempt=attempt stream=stdout] payload\n"; got != want {
+				t.Fatalf("stdout = %q, want %q", got, want)
+			}
+			if got, want := stderr.String(), "[job=job attempt=attempt stream=stderr] payload\n"; got != want {
+				t.Fatalf("stderr = %q, want %q", got, want)
+			}
+		})
+	}
 }
 
 func TestConsoleOutputIsAttributedAndSerialized(t *testing.T) {

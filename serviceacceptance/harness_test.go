@@ -251,6 +251,9 @@ func newAcceptanceAgentProcess(
 		// Capacity and isolation lanes fill every slot at once; the
 		// line-keeper hold and its spacing are covered by agent unit tests.
 		"--oneshot-load-limit=0",
+		// A test agent runs in the foreground: keep run output in its
+		// captured output for attribution checks and failure messages.
+		"--mirror-run-output=true",
 	}
 	if !productionTimings {
 		arguments = append(arguments,

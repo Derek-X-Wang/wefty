@@ -1003,11 +1003,16 @@ spontaneous exit all require both the payload leader's `Wait` and group
 `ProcessReapTimeout` (five seconds by default). Failed proof ends the control
 stream and makes the agent report `ErrGuardianLost`.
 
+Run output is uploaded to L1 and read with `wefty logs`; `wefty-agent` mirrors
+it to stdout/stderr only with `-mirror-run-output` for foreground development
+(default false), while lifecycle and error lines remain in the agent service log.
+
 The agent's Guardian `WaitDelay` is termination grace plus that reap bound
 plus a one-second scheduling margin (eleven seconds by default). Its independent
 output context is cancelled on Guardian loss or one second before that output
-wait bound, releasing production SQLite append waits and console-sink callers. One bounded console queue and one
-process-wide worker keep a stuck console fd out of attempt pipe copying;
+wait bound, releasing production SQLite append waits and console-sink callers.
+When mirroring is enabled, one bounded console queue and one process-wide worker
+keep a stuck console fd out of attempt pipe copying;
 closing an owned test pipe also releases the worker. A permanently blocked
 console fd can hold that single mirror worker until the daemon exits.
 After a proven `exited`, `exec.ErrWaitDelay` means output was cut off after a
