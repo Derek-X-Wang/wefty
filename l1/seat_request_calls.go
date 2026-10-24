@@ -201,7 +201,7 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 		if err != nil {
 			return err
 		}
-		expired, err = seatApprovalNeedsExpiry(ctx, q, value, at)
+		expired, err = seatApprovalNeedsExpiry(ctx, q, value, at, s.clock)
 		if err != nil {
 			return err
 		}

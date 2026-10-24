@@ -169,3 +169,77 @@ func TestSeatLogFollowEndReasonReadableTextAndJSONToken(t *testing.T) {
 		server.Close()
 	}
 }
+
+func TestSeatLogFollowCountsCredentialCallOnlyAtStart(t *testing.T) {
+	t.Setenv("WEFTY_SEAT_STATE_ROOT", t.TempDir()+"/seats")
+	id := "seat_" + strings.Repeat("a", 32)
+	if _, err := storeSeatCredential(id, "seat-follow-secret"); err != nil {
+		t.Fatal(err)
+	}
+	gets, starts := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(l1.SeatCredentialHeader) != "seat-follow-secret" {
+			t.Error("log command lost its credential")
+		}
+		if r.Header.Get("X-Wefty-Seat-Call") == "start" {
+			starts++
+			if r.Method != http.MethodGet || gets != 0 {
+				t.Error("pagination, acknowledgement or follow renewed activity")
+			}
+		}
+		if r.Method == http.MethodPost {
+			io.WriteString(w, `{}`)
+			return
+		}
+		gets++
+		page := l1.SeatLogPage{SeatID: id, Events: []l1.SeatLogEvent{}, NextCursor: "one"}
+		if gets == 1 {
+			page.Events = []l1.SeatLogEvent{{SeatID: id, EventID: "started", Kind: l1.SeatEventStarted}}
+		}
+		if gets == 4 {
+			page.Ended = true
+			page.Reason = "expired"
+		}
+		json.NewEncoder(w).Encode(page)
+	}))
+	defer server.Close()
+	clients := &apiClients{l1: statusClient(t, "L1", "l1", server), wait: func(context.Context, time.Duration) error { return nil }}
+	var out bytes.Buffer
+	if err := executeSeatLogs(t.Context(), clients, false, id, "", 200, 0, false, true, true, time.Second, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 || gets != 4 {
+		t.Fatalf("credential call starts=%d GETs=%d", starts, gets)
+	}
+}
+
+func TestSeatLogFollowRetryDoesNotRenewCredentialCall(t *testing.T) {
+	t.Setenv("WEFTY_SEAT_STATE_ROOT", t.TempDir()+"/seats")
+	id := "seat_" + strings.Repeat("b", 32)
+	if _, err := storeSeatCredential(id, "seat-retry-secret"); err != nil {
+		t.Fatal(err)
+	}
+	gets, starts := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets++
+		if r.Header.Get("X-Wefty-Seat-Call") == "start" {
+			starts++
+		}
+		if gets == 1 {
+			// L1 accepted the activity call, but its response was unavailable.
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"error":{"code":"unavailable","retryable":true,"message":"try later"}}`)
+			return
+		}
+		json.NewEncoder(w).Encode(l1.SeatLogPage{SeatID: id, Events: []l1.SeatLogEvent{}, Ended: true, Reason: "expired"})
+	}))
+	defer server.Close()
+	clients := &apiClients{l1: statusClient(t, "L1", "l1", server), wait: func(context.Context, time.Duration) error { return nil }}
+	var out bytes.Buffer
+	if err := executeSeatLogs(t.Context(), clients, false, id, "", 200, 0, false, true, false, time.Millisecond, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if gets != 2 || starts != 1 {
+		t.Fatalf("follow retry renewed Seat: GETs=%d activity calls=%d", gets, starts)
+	}
+}

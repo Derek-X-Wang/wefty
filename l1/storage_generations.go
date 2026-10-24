@@ -273,6 +273,11 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	if err != nil {
 		return Computer{}, false, err
 	}
+	updated.EndedSeats, err = readComputerEndedSeats(ctx, tx, computerID, updated.IntentRevision)
+	if err != nil {
+		return Computer{}, false, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer Storage reset reservation")
 	}

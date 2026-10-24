@@ -28,11 +28,12 @@ type SeatApprovalRequest struct {
 }
 
 type SeatApproval struct {
-	Request  SeatApprovalRequest `json:"request"`
-	State    string              `json:"state"` // requested, approved, refused
-	Reason   string              `json:"reason,omitempty"`
-	Source   string              `json:"source,omitempty"` // dialog or window
-	Deadline time.Time           `json:"deadline"`
+	Request       SeatApprovalRequest `json:"request"`
+	State         string              `json:"state"` // requested, approved, refused
+	Reason        string              `json:"reason,omitempty"`
+	Source        string              `json:"source,omitempty"` // dialog or window
+	Deadline      time.Time           `json:"deadline"`
+	RemainingWait time.Duration       `json:"remaining_wait"`
 }
 
 type SeatApprovalAnswer struct {
@@ -99,10 +100,13 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 	}
 	defer write.rollback()
 	q := seatApprovalQuery(write.tx)
+	if err := persistSeatClockAnchor(ctx, q, s.clock); err != nil {
+		return SeatApproval{}, err
+	}
 	if err := requireSeatApprovalNode(ctx, q, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return SeatApproval{}, err
 	}
-	if err := expireSeatApproval(ctx, q, request.SeatID, write.at); err != nil {
+	if err := expireSeatApproval(ctx, q, request.SeatID, write.at, s.clock); err != nil {
 		return SeatApproval{}, err
 	}
 	existing, err := readSeatApproval(ctx, q, request.SeatID)
@@ -110,10 +114,9 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 		if existing.Request != request {
 			return SeatApproval{}, protocolError(contract.ErrorConflict, "Seat approval ID has different input")
 		}
-		if existing.State == "requested" && !write.at.Before(existing.Deadline) {
-			existing.State = "refused"
-			existing.Reason = "no answer from the owner"
-			if err := saveSeatApproval(ctx, q, existing, write.at); err != nil {
+		if existing.State == "requested" {
+			existing.RemainingWait, err = seatApprovalRemaining(ctx, q, s.clock, existing)
+			if err != nil {
 				return SeatApproval{}, err
 			}
 		}
@@ -122,8 +125,8 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 	if !errors.Is(err, sql.ErrNoRows) {
 		return SeatApproval{}, err
 	}
-	value := SeatApproval{Request: request, State: "requested", Deadline: write.at.Add(request.AnswerWait)}
-	windows, err := readSeatApprovalWindows(ctx, q, request.NodeID, write.at)
+	value := SeatApproval{Request: request, State: "requested", Deadline: write.at.Add(request.AnswerWait), RemainingWait: request.AnswerWait}
+	windows, err := readSeatApprovalWindows(ctx, q, request.NodeID, write.at, s.clock)
 	if err != nil {
 		return SeatApproval{}, err
 	}
@@ -141,6 +144,13 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 	if err := saveSeatApproval(ctx, q, value, write.at); err != nil {
 		return SeatApproval{}, err
 	}
+	boot, ns, err := seatTime(s.clock)
+	if err != nil {
+		return SeatApproval{}, err
+	}
+	if _, err := q.ExecContext(ctx, `UPDATE seat_approvals SET wait_boot_id=?,wait_started_ns=? WHERE seat_id=?`, boot, ns, request.SeatID); err != nil {
+		return SeatApproval{}, err
+	}
 	return value, write.commit()
 }
 
@@ -154,7 +164,7 @@ func (s *Store) AnswerSeatApproval(ctx context.Context, identityNodeID, seatID s
 	if err := requireSeatApprovalNode(ctx, q, identityNodeID, answer.NodeID, answer.BootSessionID); err != nil {
 		return SeatApproval{}, err
 	}
-	if err := expireSeatApproval(ctx, q, seatID, write.at); err != nil {
+	if err := expireSeatApproval(ctx, q, seatID, write.at, s.clock); err != nil {
 		return SeatApproval{}, err
 	}
 	value, err := readSeatApproval(ctx, q, seatID)
@@ -168,19 +178,21 @@ func (s *Store) AnswerSeatApproval(ctx context.Context, identityNodeID, seatID s
 		return SeatApproval{}, protocolError(contract.ErrorForbidden, "Seat approval belongs to another node session")
 	}
 	if value.State != "requested" {
-		return value, nil
+		return value, write.commit()
 	} // a repeated answer cannot extend a window
 	value.Source = "dialog"
 	value.State = "refused"
 	switch {
-	case !write.at.Before(value.Deadline):
-		value.Reason = "no answer from the owner"
 	case answer.Approved:
 		value.State = "approved"
 		if value.Request.WindowHours != 0 {
-			_, err = q.ExecContext(ctx, `INSERT INTO seat_approval_windows(node_id,boot_session_id,network,expires_ns) VALUES(?,?,?,?)
-    ON CONFLICT(node_id,network) DO UPDATE SET boot_session_id=excluded.boot_session_id,expires_ns=excluded.expires_ns`,
-				answer.NodeID, answer.BootSessionID, value.Request.Network, write.at.Add(time.Duration(value.Request.WindowHours)*time.Hour).UnixNano())
+			boot, ns, clockErr := seatTime(s.clock)
+			if clockErr != nil {
+				return SeatApproval{}, clockErr
+			}
+			_, err = q.ExecContext(ctx, `INSERT INTO seat_approval_windows(node_id,boot_session_id,network,expires_ns,wait_boot_id,wait_started_ns,wait_duration_ns) VALUES(?,?,?,?,?,?,?)
+    ON CONFLICT(node_id,network) DO UPDATE SET boot_session_id=excluded.boot_session_id,expires_ns=excluded.expires_ns,wait_boot_id=excluded.wait_boot_id,wait_started_ns=excluded.wait_started_ns,wait_duration_ns=excluded.wait_duration_ns`,
+				answer.NodeID, answer.BootSessionID, value.Request.Network, write.at.Add(time.Duration(value.Request.WindowHours)*time.Hour).UnixNano(), boot, ns, int64(time.Duration(value.Request.WindowHours)*time.Hour))
 			if err != nil {
 				return SeatApproval{}, err
 			}
@@ -241,9 +253,9 @@ func saveSeatApproval(ctx context.Context, q seatApprovalQuery, value SeatApprov
 	}
 	return appendSeatEvent(ctx, q, at, SeatLogEvent{SeatID: value.Request.SeatID, EventID: value.State, Kind: SeatEventKind(value.State), Reason: value.Reason})
 }
-func readSeatApprovalWindows(ctx context.Context, q queryer, nodeID string, now time.Time) ([]SeatApprovalWindow, error) {
-	rows, err := q.QueryContext(ctx, `SELECT w.node_id,w.network,w.expires_ns FROM seat_approval_windows w JOIN nodes n ON n.node_id=w.node_id AND n.boot_session_id=w.boot_session_id
- WHERE (?='' OR w.node_id=?) AND w.expires_ns>? AND n.state!='dead' ORDER BY w.node_id,w.network`, nodeID, nodeID, now.UnixNano())
+func readSeatApprovalWindows(ctx context.Context, q queryer, nodeID string, now time.Time, clock Clock) ([]SeatApprovalWindow, error) {
+	rows, err := q.QueryContext(ctx, `SELECT w.node_id,w.network,w.expires_ns,w.wait_boot_id,w.wait_started_ns,w.wait_duration_ns FROM seat_approval_windows w JOIN nodes n ON n.node_id=w.node_id AND n.boot_session_id=w.boot_session_id
+ WHERE (?='' OR w.node_id=?) AND n.state!='dead' ORDER BY w.node_id,w.network`, nodeID, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -251,9 +263,17 @@ func readSeatApprovalWindows(ctx context.Context, q queryer, nodeID string, now 
 	result := []SeatApprovalWindow{}
 	for rows.Next() {
 		var value SeatApprovalWindow
-		var expires int64
-		if err := rows.Scan(&value.NodeID, &value.Network, &expires); err != nil {
+		var expires, started, duration int64
+		var boot string
+		if err := rows.Scan(&value.NodeID, &value.Network, &expires, &boot, &started, &duration); err != nil {
 			return nil, err
+		}
+		current, ns, err := seatTime(clock)
+		if err != nil {
+			return nil, err
+		}
+		if boot == "" || boot != current || ns < started || time.Duration(ns-started) >= time.Duration(duration) {
+			continue
 		}
 		value.ExpiresAt = time.Unix(0, expires).UTC()
 		result = append(result, value)
@@ -261,7 +281,11 @@ func readSeatApprovalWindows(ctx context.Context, q queryer, nodeID string, now 
 	return result, rows.Err()
 }
 func (r *databaseReads) seatApprovalWindows(ctx context.Context, nodeID string) ([]SeatApprovalWindow, error) {
-	return readSeatApprovalWindows(ctx, r.q, nodeID, r.at)
+	clock := r.seatClock
+	if clock == nil {
+		clock = ClockFunc(func() time.Time { return r.at })
+	}
+	return readSeatApprovalWindows(ctx, r.q, nodeID, r.at, clock)
 }
 func (s *Store) ListSeatApprovalWindows(ctx context.Context, nodeID string) ([]SeatApprovalWindow, error) {
 	var result []SeatApprovalWindow

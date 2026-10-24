@@ -8,6 +8,66 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/seats/{seat_id}/release": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "releaseSeat",
+        "summary": "Release one live Seat",
+        "description": "Requires this Seat credential. Revokes live authority immediately with reason released; helper cleanup and memory readback finish asynchronously.",
+        "security": [
+          {
+            "fabricIdentity": []
+          },
+          {
+            "fabricIdentity": [],
+            "seatCredential": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Seat log read.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatCallResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
     "/v1/seats/{seat_id}/logs": {
       "parameters": [
         {
@@ -23,7 +83,7 @@
       "get": {
         "operationId": "getSeatLogs",
         "summary": "getSeatLogs",
-        "description": "The original caller or this Seat credential may read retained Seat events. Follow polls never renew Seat activity; #1146 defines one-time log-call activity. After its end, the credential authorizes only its own retained log and read cursor.",
+        "description": "The original caller or this Seat credential may read retained Seat events. The first credential GET with X-Wefty-Seat-Call: start renews activity once. Pagination, read receipts and follow polls never renew it. After its end, the credential authorizes only its own retained log and read cursor.",
         "security": [
           {
             "fabricIdentity": []
@@ -68,6 +128,12 @@
         },
         "parameters": [
           {
+            "name": "X-Wefty-Seat-Call",
+            "in": "header",
+            "description": "Set to start only on the first credential GET of one log command; omitted on pagination and follow polls.",
+            "schema": {"type": "string", "enum": ["start"]}
+          },
+          {
             "name": "cursor",
             "in": "query",
             "schema": {
@@ -102,7 +168,7 @@
       "post": {
         "operationId": "markSeatLogRead",
         "summary": "markSeatLogRead",
-        "description": "The original caller or this Seat credential may read retained Seat events. Follow polls never renew Seat activity; #1146 defines one-time log-call activity. After its end, the credential authorizes only its own retained log and read cursor.",
+        "description": "The original caller or this Seat credential may read retained Seat events. The first credential GET with X-Wefty-Seat-Call: start renews activity once. Pagination, read receipts and follow polls never renew it. After its end, the credential authorizes only its own retained log and read cursor.",
         "security": [
           {
             "fabricIdentity": []

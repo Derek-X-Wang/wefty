@@ -54,17 +54,21 @@ func computerRestartDecision(ctx context.Context, tx readModel, computer Compute
 	activeResourceRestart := (computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning) &&
 		json.Unmarshal(computer.CurrentJob.LastFailure, &latchedFailure) == nil &&
 		(latchedFailure.Code == contract.SpawnFailureInsufficientDisk || latchedFailure.Code == contract.SpawnFailureInsufficientMemory)
-	if computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed && !activeResourceRestart {
+	// Seat-request Computers obey the owner's restart immediately, including a
+	// healthy running Computer. Legacy owner-made Computers keep their policy.
+	activeSeatRestart := computer.SeatRequestMade && (computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning)
+	activeRestart := activeResourceRestart || activeSeatRestart
+	if computer.CurrentJob.State != contract.JobStopped && computer.CurrentJob.State != contract.JobFailed && !activeRestart {
 		return false, protocolError(contract.ErrorConflict,
 			"Computer %q can restart only from stopped, failed, or an active insufficient-resource latch, not %q",
 			computerID, computer.CurrentJob.State)
 	}
-	if !activeResourceRestart && !computer.CurrentJob.HoldsSlot(computer.CurrentJob.State) {
+	if !activeRestart && !computer.CurrentJob.HoldsSlot(computer.CurrentJob.State) {
 		if err := tx.ensureServiceCapacity(ctx, computer.CurrentJob); err != nil {
 			return false, err
 		}
 	}
-	return activeResourceRestart, nil
+	return activeRestart, nil
 }
 
 func computerBackupCapDecision(ctx context.Context, tx readModel, computer Computer, request ComputerBackupCapRequest) error {
@@ -266,7 +270,7 @@ func computerResetDecision(ctx context.Context, tx readModel, computer Computer,
 	}
 	active := computer.CurrentJob.State == contract.JobClaimed || computer.CurrentJob.State == contract.JobRunning ||
 		computer.CurrentJob.State == contract.JobStopping
-	if active && !request.TerminateSessions {
+	if active && !request.TerminateSessions && !computer.SeatRequestMade {
 		return protocolError(contract.ErrorConflict,
 			"running Computer reset requires explicit take-over session termination")
 	}
@@ -412,7 +416,7 @@ func computerPruneDecision(ctx context.Context, tx readModel, computer Computer,
 }
 
 func computerReimageSessionsDecision(computer Computer, terminateSessions bool) error {
-	if computerRuntimeActive(computer) && !terminateSessions {
+	if computerRuntimeActive(computer) && !terminateSessions && !computer.SeatRequestMade {
 		return protocolError(contract.ErrorConflict, "running Computer reimage requires explicit take-over session termination")
 	}
 	return nil

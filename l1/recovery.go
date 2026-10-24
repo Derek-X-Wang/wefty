@@ -13,7 +13,8 @@ import (
 
 // Reconcile applies lease and node-liveness transitions using one snapshot of
 // the injected clock. SQLite's immediate transaction lock serializes this pass
-// with renewal, heartbeat, completion, and claim transactions, so the winner
+// with renewal, heartbeat, completion, and claim transactions. Seat life then
+// runs its own fenced pass. For each class, the winner
 // of an expiry-boundary race fully determines the durable result.
 func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	now := canonicalTime(s.clock.Now())
@@ -225,6 +226,9 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	s.serviceHealthNodes.save(seenNodes)
 	if s.reconcileHoldForTest != nil {
 		s.reconcileHoldForTest(time.Since(locked))
+	}
+	if err := s.CheckSeatLife(ctx); err != nil {
+		return result, err
 	}
 	return result, nil
 }

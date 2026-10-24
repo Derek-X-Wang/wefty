@@ -138,7 +138,7 @@ func (s *Store) GetSeatRequest(ctx context.Context, id string) (SeatRequest, err
 		var err error
 		value, err = readSeatRequest(ctx, reads.(*databaseReads).q, id)
 		if err == nil {
-			expired, err = seatApprovalNeedsExpiry(ctx, reads.(*databaseReads).q, value, reads.(*databaseReads).now())
+			expired, err = seatApprovalNeedsExpiry(ctx, reads.(*databaseReads).q, value, reads.(*databaseReads).now(), s.clock)
 		}
 		return err
 	})
@@ -193,7 +193,7 @@ func (s *Store) reserveSeatRoomTx(ctx context.Context, q *sql.Tx, at time.Time, 
 	if err := authorizeSeatRequest(ctx, q, identity, id, request.NodeID, request.BootSessionID); err != nil {
 		return SeatRequest{}, err
 	}
-	if err := expireSeatApproval(ctx, q, id, at); err != nil {
+	if err := expireSeatApproval(ctx, q, id, at, s.clock); err != nil {
 		return SeatRequest{}, err
 	}
 	value, err := readSeatRequest(ctx, q, id)
@@ -234,6 +234,9 @@ func (s *Store) reserveSeatRoomTx(ctx context.Context, q *sql.Tx, at time.Time, 
 	}
 	if approval.Request.BootSessionID != request.BootSessionID || node != request.NodeID || network != approval.Request.Network || !made || desired != string(contract.ServiceDesiredRunning) || request.Place > limit || ((approval.Request.Form == "dedicated") != (limit == 1)) {
 		return value, protocolError(contract.ErrorConflict, "Computer does not match this approved Seat request")
+	}
+	if _, err := q.ExecContext(ctx, `UPDATE computers SET wait_boot_id='',wait_started_ns=0 WHERE computer_id=?`, request.ComputerID); err != nil {
+		return value, err
 	}
 	var occupied int
 	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM computer_seat_identities i JOIN computer_seat_room_reservations r ON r.seat_id=i.seat_id WHERE i.computer_id=? AND i.place=? AND r.cleanup_complete=0`, request.ComputerID, request.Place).Scan(&occupied); err != nil {
@@ -449,7 +452,7 @@ func (s *Store) StartSeatRequest(ctx context.Context, identity, id string, reque
 	if err := authorizeSeatRequest(ctx, q, identity, id, request.NodeID, request.BootSessionID); err != nil {
 		return SeatRequest{}, err
 	}
-	if err := expireSeatApproval(ctx, q, id, write.at); err != nil {
+	if err := expireSeatApproval(ctx, q, id, write.at, s.clock); err != nil {
 		return SeatRequest{}, err
 	}
 	value, err := readSeatRequest(ctx, q, id)
@@ -521,7 +524,7 @@ func (s *Store) EndSeatRequest(ctx context.Context, identity, id string, request
 	if err := authorizeSeatRequest(ctx, q, identity, id, request.NodeID, request.BootSessionID); err != nil {
 		return SeatRequest{}, err
 	}
-	if err := expireSeatApproval(ctx, q, id, write.at); err != nil {
+	if err := expireSeatApproval(ctx, q, id, write.at, s.clock); err != nil {
 		return SeatRequest{}, err
 	}
 	value, err := readSeatRequest(ctx, q, id)
@@ -549,6 +552,11 @@ func (s *Store) EndSeatRequest(ctx context.Context, identity, id string, request
 	if err := cleanNeverStartedSeat(ctx, q, value); err != nil {
 		return value, err
 	}
+	if value.ComputerID != "" {
+		if _, err := s.computerIdleDue(ctx, q, value.ComputerID, true); err != nil {
+			return value, err
+		}
+	}
 	value, err = readSeatRequest(ctx, q, id)
 	if err != nil {
 		return value, err
@@ -557,7 +565,7 @@ func (s *Store) EndSeatRequest(ctx context.Context, identity, id string, request
 }
 
 // Observation and lifecycle publication share the same fenced transaction.
-func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now time.Time, seat ComputerSeatObservation) error {
+func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now time.Time, seat ComputerSeatObservation, clock Clock) error {
 	value, err := readSeatRequest(ctx, q, seat.SeatID)
 	var typed *Error
 	if errors.As(err, &typed) && typed.Code == contract.ErrorNotFound {
@@ -584,7 +592,10 @@ func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now
 			if _, err := q.ExecContext(ctx, `UPDATE computer_seat_identities SET ever_live=1 WHERE seat_id=?`, seat.SeatID); err != nil {
 				return err
 			}
-			return setSeatLifecycle(ctx, q, seat.SeatID, SeatLive, "", now)
+			if err := setSeatLifecycle(ctx, q, seat.SeatID, SeatLive, "", now); err != nil {
+				return err
+			}
+			return touchSeatActivity(ctx, q, clock, seat.SeatID)
 		}
 	case ComputerSeatFailed:
 		if value.State == SeatStarting || value.State == SeatLive {

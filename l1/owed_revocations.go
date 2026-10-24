@@ -175,6 +175,9 @@ func computerAttemptsHoldingAuthority(ctx context.Context, q queryer, jobID stri
 // cannot commit without it.
 func recordOwedComputerRevocation(ctx context.Context, tx *sql.Tx, record owedRevocationRecord, now time.Time) (int64, error) {
 	reason := record.reason
+	if record.verb == ComputerRevocationVerbReset {
+		reason = "computer_reset"
+	}
 	if record.verb == ComputerRevocationVerbAttemptCompletion {
 		reason = "the Computer restarted"
 	}

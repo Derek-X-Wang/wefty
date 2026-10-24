@@ -64,6 +64,7 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 	headers := http.Header{}
 	if secret != "" {
 		headers.Set(l1.SeatCredentialHeader, secret)
+		headers.Set("X-Wefty-Seat-Call", "start")
 	}
 	path := "/v1/seats/" + id + "/logs"
 	walking := all || tailSet
@@ -143,6 +144,7 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 		}
 		var page l1.SeatLogPage
 		err := clients.l1.do(ctx, http.MethodGet, path+"?"+query.Encode(), nil, headers, &page, http.StatusOK)
+		headers.Del("X-Wefty-Seat-Call")
 		if err != nil {
 			var response *apiResponseError
 			if !retriedAsCaller && headers.Get(l1.SeatCredentialHeader) != "" && errors.As(err, &response) && response.StatusCode == http.StatusForbidden && response.APIError.Code == contract.ErrorForbidden && response.APIError.Message == "invalid Seat credential" {
@@ -300,6 +302,8 @@ func readableSeatEndReason(reason string) string {
 		return "the owner restarted the Computer"
 	case "computer_reimaged":
 		return "the owner reimaged the Computer"
+	case "computer_reset":
+		return "the owner reset the Computer"
 	case "computer_removed":
 		return "the owner removed the Computer"
 	default:

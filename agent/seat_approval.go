@@ -127,7 +127,9 @@ func NewSeatApprovalController(client SeatApprovalClient, nodeID, boot string, s
 		dialog = NativeSeatApprovalDialog{}
 	}
 	if clock == nil {
-		clock = systemClock{}
+		clock = seatWaitClock{}
+	} else if _, production := clock.(systemClock); production {
+		clock = seatWaitClock{}
 	}
 	return &SeatApprovalController{client: client, nodeID: nodeID, bootSessionID: boot, settings: settings, dialog: dialog, clock: clock, calls: make(map[string]*seatApprovalCall), dialogSlot: make(chan struct{}, 1)}, nil
 }
@@ -178,7 +180,11 @@ func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1
 	// A queued request keeps its deadline from request start. The L1 deadline
 	// independently limits it, including time spent in the initial exchange.
 	deadline := started.Add(request.AnswerWait)
-	serverDeadline := c.clock.Now().Add(pending.Deadline.Sub(wallNow(c.clock)))
+	remainingWait := pending.RemainingWait
+	if remainingWait == 0 {
+		remainingWait = pending.Deadline.Sub(wallNow(c.clock))
+	}
+	serverDeadline := c.clock.Now().Add(remainingWait)
 	if serverDeadline.Before(deadline) {
 		deadline = serverDeadline
 	}

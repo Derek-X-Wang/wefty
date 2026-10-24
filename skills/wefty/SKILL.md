@@ -130,6 +130,7 @@ wefty seat request --network none
 wefty seat request --network internet --dedicated
 wefty seat request --network internet --window 8h
 wefty seat wait SEAT_ID
+wefty seat release SEAT_ID
 wefty seat --help
 ```
 
@@ -137,6 +138,11 @@ The request prints one `seat_<32 hex>` ID immediately, then waits for a ready
 Seat or a typed refusal. After a cut-off call, use `seat wait` with that ID;
 requesting again makes a different request. The request waits during the
 owner's dialog; run it in the background or rely on `wefty seat wait`.
+
+Release when done: `wefty seat release SEAT_ID`. Copy results out first.
+Release stops commands and programs, then deletes the Seat folder after cleanup.
+An idle Seat expires after 30 minutes; log following counts only at start.
+
 The network is required. `internet`
 asks for internet; `none` asks for no internet. `--dedicated` asks for a new
 Computer with a Seat limit of 1. Without it, wefty uses a shared Computer with

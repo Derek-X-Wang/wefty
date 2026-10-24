@@ -490,3 +490,11 @@ removes the credential digest too, so a direct credential request returns
 as the original Fabric caller; a pruned log then returns `not_found`, and
 another caller remains forbidden while a log exists. See [Seat logs](seat-logs.md) for cursor, unread-event,
 credential-scope and retention rules.
+
+
+`wefty seat release SEAT_ID` requires that Seat's private credential. It ends
+command, screen, input and copy authority at once and reports `released`.
+Cleanup remains pending until helper evidence; release success is not cleanup
+proof. An expired credential returns `seat_ended` with `Seat ended: expired`
+(exit 5). A released credential returns `Seat ended: released`. The retained
+log and its read cursor remain readable under either credential.

@@ -374,7 +374,7 @@ func (s *Store) ReportComputerSeatObservations(ctx context.Context, identity, co
 		return ComputerSeatObservationReceipt{}, err
 	}
 	for _, seat := range report.Seats {
-		if err := applySeatLifecycleObservation(ctx, tx, now, seat); err != nil {
+		if err := applySeatLifecycleObservation(ctx, tx, now, seat, s.clock); err != nil {
 			return ComputerSeatObservationReceipt{}, err
 		}
 	}

@@ -95,7 +95,7 @@
               "released",
               "ended",
               "owner_stop",
-              "owner_restart",
+              "owner_restart", "ends_soon", "owner_reimage", "owner_reset", "owner_remove",
               "command_started",
               "command_finished",
               "copy_in",
@@ -906,9 +906,10 @@
         "required": [
           "request",
           "state",
-          "deadline"
+          "deadline", "remaining_wait"
         ],
         "properties": {
+          "remaining_wait": {"type":"integer","minimum":0,"description":"Remaining answer wait in nanoseconds on the sleep-counting clock."},
           "request": {
             "$ref": "#/components/schemas/SeatApprovalRequest"
           },
@@ -1601,6 +1602,7 @@
           "submit_max_inflight", "submit_policy_revision", "display_endpoint", "controller_tenure", "allowed_actions", "last_condition", "current_job", "created_at", "updated_at"
         ],
         "properties": {
+          "ended_seats": {"type":"array","items":{"type":"object","additionalProperties":false,"required":["seat_id","reason"],"properties":{"seat_id":{"type":"string"},"reason":{"type":"string"}}}},
           "seat_limit": { "type": "integer", "minimum": 0 },
           "idle_action": { "type": "string", "enum": ["delete", "stop", "nothing"] },
           "network": { "type": "string", "enum": ["internet", "none"] },

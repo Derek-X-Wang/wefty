@@ -21,9 +21,63 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	for fn := range calls.bodies {
 		byName[fn.Name()] = append(byName[fn.Name()], fn)
 	}
+	// Computer projections may expose the ended-Seat summary. Review that
+	// exact leaf as SELECT-only rather than allowing every Computer route to
+	// write approval state. Any new local call or SQL write fails this audit.
+	readOnlyLeaf := map[*types.Func]bool{}
+	for fn, body := range calls.bodies {
+		if fn.Name() != "readComputerEndedSeats" {
+			continue
+		}
+		queries := 0
+		ast.Inspect(body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			target := calls.function(call.Fun)
+			if target != nil && target.Pkg() == fn.Pkg() && calls.bodies[target] != nil {
+				t.Errorf("reviewed approval reader calls local function %s", target.Name())
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch selector.Sel.Name {
+			case "ExecContext", "Exec", "BeginTx":
+				t.Error("reviewed approval reader gained a write door")
+			case "QueryContext", "QueryRowContext":
+				queries++
+				if len(call.Args) < 2 {
+					t.Error("approval reader query lacks constant SQL")
+					return true
+				}
+				sql := info.Types[call.Args[1]].Value
+				if sql == nil || sql.Kind() != constant.String {
+					t.Error("approval reader query must be constant")
+					return true
+				}
+				statement := strings.ToUpper(strings.TrimSpace(constant.StringVal(sql)))
+				if !strings.HasPrefix(statement, "SELECT ") || strings.Contains(statement, ";") {
+					t.Error("approval reader must contain only one SELECT")
+				}
+			}
+			return true
+		})
+		if queries != 1 {
+			t.Errorf("reviewed approval reader queries=%d, want one", queries)
+		}
+		readOnlyLeaf[fn] = true
+	}
+	if len(readOnlyLeaf) != 1 {
+		t.Fatal("ended-Seat summary reader was not audited")
+	}
 	referencesTainted := func(expr ast.Expr) bool {
 		fn := calls.function(expr)
 		if fn == nil {
+			return false
+		}
+		if readOnlyLeaf[fn] {
 			return false
 		}
 		if tainted[fn] {
@@ -137,6 +191,11 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 			}
 		}
 	}
+	for fn := range readOnlyLeaf {
+		if granting[fn] {
+			t.Error("approval reader can grant Seat authority")
+		}
+	}
 	agentMux := ""
 	agentMounts := 0
 	for _, file := range files {
@@ -178,6 +237,7 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 		t.Fatalf("node-principal mux mounts=%d", agentMounts)
 	}
 	allowed := map[string]string{
+		"POST /v1/seats/{seat_id}/release":     "releaseSeat",
 		"GET /v1/seats/{seat_id}/logs":         "getSeatLogs",
 		"POST /v1/seats/{seat_id}/logs/read":   "markSeatLogRead",
 		"POST /v1/seat-requests":               "createSeatCall",

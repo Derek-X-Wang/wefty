@@ -16,7 +16,7 @@ func (s *Store) GetSeatRequestForNode(ctx context.Context, identity, id string, 
 		var err error
 		value, err = readSeatRequest(ctx, q, id)
 		if err == nil {
-			expired, err = seatApprovalNeedsExpiry(ctx, q, value, reads.(*databaseReads).now())
+			expired, err = seatApprovalNeedsExpiry(ctx, q, value, reads.(*databaseReads).now(), s.clock)
 		}
 		return err
 	})

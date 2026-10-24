@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/bootclock"
 )
 
 const (
@@ -69,9 +70,18 @@ type ClockFunc func() time.Time
 
 func (f ClockFunc) Now() time.Time { return f() }
 
-type systemClock struct{}
+type systemClock struct{ offset *int64 }
 
-func (systemClock) Now() time.Time { return time.Now() }
+func (c systemClock) Now() time.Time {
+	if c.offset == nil {
+		return bootclock.StableNow()
+	}
+	ns, err := bootclock.Now()
+	if err != nil {
+		panic(err)
+	}
+	return time.Unix(0, *c.offset+int64(ns))
+}
 
 // Job is the L1 HTTP representation of a job.
 type Job struct {

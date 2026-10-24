@@ -2254,8 +2254,8 @@ also covers requests without internet. A window without internet never covers
 requests with internet. New requests check L1 inside the approval write, with no cached allow. At the exact expiry
 boundary the next request needs a dialog. Window expiry does not stop running
 Seats. Windows are boot-scoped, so replacing a node boot cannot inherit one.
-L1 records expiry from its injected clock; the cross-sleep monotonic time
-source is the separate #1146 integration.
+L1 records expiry from its injected sleep-counting clock; durable boot-relative
+stamps survive an L1 restart and invalidate authority on a new host boot.
 
 `GET /v1/seat-approval-windows` supplies the coherent L1 read used by
 `wefty status`, including each open window's node, network and end time.
@@ -2765,3 +2765,48 @@ regardless of generation enrollment; record-specific conversion errors preserve
 the affected identity and readable Nodes. Neither error infers Attempt failure.
 Database/snapshot failures remain request failures; private authority reads stay
 strict and all L1 diagnostic reads retain `TxOptions{ReadOnly:true}`.
+
+
+### Seat expiry and Computer idle actions (#1146)
+
+L1 owns the Seat idle wait (30 minutes), warning interval (5 minutes), and
+Computer idle wait (10 minutes). These are startup settings, alongside the
+existing Computer defaults: `--seat-idle-wait`, `--seat-warning-wait`, and
+`--computer-idle-wait`. `wefty setup` persists explicit values in its existing
+Computer settings receipt and installs them on L1 only. A setup rerun retains
+unspecified values; changing one restarts L1 without restarting the node service. A changed setting applies at the next check.
+`idle_action` remains on the Computer; no second settings store is introduced.
+This stage implements `delete` and `nothing`; `stop` remains stage B.
+
+A Seat's idle origin is the latest credential call, command end, or person's
+screen release. Running commands and a person driving hold expiry. Background
+programs and log-follow polls do not. Trusted backend seams are
+`SeatCallHappened`, `SeatCommandRunning`, `SeatPersonDriving`, and
+`SeatCommandsToCancel`. Stable command IDs make repeats harmless. A command
+backend must cancel every outstanding command when its Seat loses authority.
+
+Durable waits pair a boot identity with a sleep-counting elapsed clock, behind
+the injected clock seam: Darwin `CLOCK_MONOTONIC`, Linux `CLOCK_BOOTTIME`.
+Calendar timestamps label logs and replies; they do not decide Seat expiry or
+approval-window authority. L1 restarts on the same boot retain the wait.
+A different boot ends old live Seats with `the Computer restarted`, retains
+room until positive cleanup, and invalidates old pending approvals and windows.
+Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
+pending approvals and windows without a stamp do not retain authority.
+
+Release and expiry remove wanted Seat membership, enter `ending`, append the
+end reason, and stop the credential immediately except for its retained log.
+The node agent applies the reduced list with `ApplyComputerSeats`; the helper
+stops the Seat's processes and removes its folder. Only positive cleanup
+enters `ended`; existing `computer_room_limits` readback fences memory release.
+A Computer restart and owner stop, restart, reimage, reset or remove use this
+same lifecycle. Owner replies list Seats ended by that intent revision.
+
+The idle wait starts when the last active Seat leaves. New admission clears
+it under the reservation fence. At deletion, L1 rechecks the current Desired
+state, idle action, elapsed wait and absence of active Seats inside the same
+write transaction that publishes removal. A Seat or owner stop that wins that
+fence cancels deletion. Once removal wins, admission cannot select that
+Computer. An owner-stopped Computer is never deleted by this timer. Automatic
+deletion uses the existing `RemoveComputer` path and its cleanup proof, without
+claiming `removed_verified` before the node agent and helper prove removal.
