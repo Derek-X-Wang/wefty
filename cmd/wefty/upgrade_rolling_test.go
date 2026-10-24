@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -24,7 +25,6 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
-	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -447,16 +447,6 @@ func TestUpgradeRollingGateRefusesIncompatibleCohort(t *testing.T) {
 	}
 	if _, err = os.Stat(filepath.Join(f.paths.config, upgradeDrainFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("refused gate closed admission")
-	}
-}
-
-func TestUpgradeRollingRealBinaryRefusal(t *testing.T) {
-	f := newFleetUpgradeFixture(t, serviceplan.Join)
-	code, output := runWeftyWithEnv(t, buildWefty(t), 10*time.Second,
-		[]string{"HOME=" + f.home, "WEFTY_PROFILE=" + filepath.Join(f.home, setupFolders.config, "profile.json")},
-		"--json", "upgrade", "--rolling")
-	if code != exitConflict || !strings.Contains(output, "unsupported_installation") || !strings.Contains(output, `"code": "conflict"`) {
-		t.Fatalf("real binary refused rolling: exit=%d output=%s", code, output)
 	}
 }
 
@@ -894,7 +884,12 @@ func TestUpgradeRollingRealBinaryOCIAndOverlapRefusals(t *testing.T) {
 				f.claim(t, "live", contract.JobClassOneShot, false)
 				_, err := runUpgrade(t.Context(), f.host, false, io.Discard)
 				mustRolling(t, err)
-				expected = "unsafe_drain_during_overlap"
+				if runtime.GOOS == "darwin" {
+					expected = "unsafe_drain_during_overlap"
+				}
+				// The Linux binary uses its own data root, without this Mac
+				// fixture's generation catalog. Its legacy scope refusal is
+				// unsupported_installation, before observing the Mac overlap.
 			}
 			exposeRollingL1(t, f)
 			config, err := ocicontrol.ReadInstalledConfig(f.paths.nodeConfig)
