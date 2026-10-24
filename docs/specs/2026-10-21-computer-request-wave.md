@@ -751,7 +751,7 @@ How does a Run execute inside an existing Seat, with its logs, results and deadl
 ### Deliverable
 
 - **A Seat Run:** an ordinary Run that records its Seat and executes through Ticket 9's operation, as the Seat's user, with the Seat's environment only ([#1026](https://github.com/Derek-X-Wang/wefty/issues/1026)). Run logs and results work as for `wefty exec`.
-- **The deadline:** 1 hour by default (a setting), never none. At the deadline only the command stops, recorded as `fail` with no exit code, and the Seat's log gives the reason and the fix. No warning and no extend.
+- **The deadline:** 1 hour by default (a setting), never none. At the deadline the command and every program it started stop (a new session, for example `setsid`, survives; spec section 5.3), recorded as `fail` with no exit code, and the Seat's log gives the reason and the fix. No warning and no extend.
 - **Cancellation of the command only**, fenced against Seat reuse: a cancel bound to one Seat and attempt never reaches a command of a later Seat or attempt.
 - **`wefty rerun` refuses a Seat Run.**
 - **A running command keeps the Seat alive, and its end starts the 30 minutes** (feeds Ticket 16).
