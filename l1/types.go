@@ -341,6 +341,15 @@ type ServiceDesiredStateRequest struct {
 // ServiceRestartRequest gives an explicit restart its own durable replay key.
 type ServiceRestartRequest struct {
 	IdempotencyKey string `json:"idempotency_key"`
+	// Upgrade is an optional compare guard for planned recovery. Ordinary
+	// explicit restarts keep their existing semantics when it is absent.
+	Upgrade *ServiceUpgradeRecovery `json:"upgrade,omitempty"`
+}
+
+type ServiceUpgradeRecovery struct {
+	NodeID        string `json:"node_id"`
+	AttemptID     string `json:"attempt_id"`
+	BootSessionID string `json:"boot_session_id"`
 }
 
 // JobList is one stable creation/job-ID ordered page of readable jobs.

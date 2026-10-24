@@ -25,9 +25,9 @@ The first SIGINT or SIGTERM starts a graceful drain. The 30-second bound
 applies to the drain request to L1, which moves the node to `draining`; the
 agent stops claiming, interrupts Restartable process one-shots, and waits for
 the other resident attempts to finish. Waiting for those other attempts is
-bounded only by each attempt's own max runtime. Until the process exits its
-node lock is held, so a replacement agent for the same stable node ID is
-refused. A second signal is an explicit forced-shutdown transition: it cancels
+bounded only by each attempt's own max runtime. Until a legacy process exits its
+exclusive node lock is held, so another legacy agent for that stable Node is
+refused. Enrolled generations use the cohort ownership rules below. A second signal is an explicit forced-shutdown transition: it cancels
 resident attempts immediately. While Drain is joining residents it emits
 `forced_shutdown transition=draining_to_forced reason=second_signal`; after
 Drain returns it emits
@@ -54,7 +54,8 @@ from both, with slack.
 `agent.Config.AgentGenerationID`. An empty identity keeps the legacy session
 path. The flag alone does not advertise `upgrade:retirement:v1`, allocate an
 identity, change installation locks, or enable installed rolling upgrades.
-Activation and shared storage remain #1176–#1179 integrations.
+Shared storage ownership is built in #1176 below. Installed activation sequencing
+remains #1179 integration.
 
 The dedicated trigger is L1's authenticated generation inventory after its
 fenced promotion transaction. The existing serialized heartbeat loop reads
@@ -101,7 +102,8 @@ bounded outbox receipt retention. Sealed incomplete or undelivered evidence
 keeps retirement pending unless permitted durable custody is acknowledged.
 Pending evidence keeps it alive. `Config.RetirementEvidenceSettled` is
 the #1176 integration seam, with exact pending Attempt identities, for an exact
-durable custody proof when local publication is incomplete. When configured, it
+durable custody proof when log/completion delivery is incomplete. Mailbox and
+result publication must already have settled under their own rules. When configured, it
 always checks closure and may also veto it for other owned evidence. It cannot
 replace runtime reap or the L1 closure
 prerequisite. `POST /generations/{id}/close` carries the original boot, promotion
@@ -1520,3 +1522,225 @@ Cancellation wins.
 The interruption fields survive completion spool replay unchanged. After Lease
 loss L1 recovers through the persisted restart backoff rather than inventing
 shutdown evidence.
+
+## Shared local evidence across Node agent generations (#1176)
+
+The ownership rule is exclusion before inspection or mutation. A live producer
+owns its records before creating them, and collection cannot infer abandonment
+from absence in its own process map. There is one primary and any number of
+retiring generations; no age or generation-count limit permits collection.
+
+Legacy agents retain the exclusive stable-Node process lock. Enrolled agents
+hold that same cohort lock shared and one exclusive generation lifetime lock.
+Installed startup takes the generation-directory lock through
+`Store.StartupWithLifetime` before readiness or shared runtime initialization.
+It supplies `GenerationLifetime.ClaimRuntime` as `Config.GenerationLifetimeLock`:
+this validates the Node/generation and permits exactly one runtime to borrow the
+already-held lock, without opening another descriptor or taking another
+per-generation lock in the spool directory. Startup keeps the lock until the
+runtime stops. Readiness independently checks that same held directory lock
+and the kernel process-start identity. Standalone enrolled library
+configurations with no installed ownership proof take their generation lock in
+the spool directory.
+The executable requires an installation catalog whenever a generation ID is
+supplied, so installed processes cannot bypass the directory lifetime lock.
+This permits overlap, excludes duplicate generation processes, and prevents a
+legacy agent from opening an enrolled cohort's shared state. Ownership is taken
+before managed-root activation, not just before opening the spool. Installed
+startup additionally runs shared-root activation through
+`Config.PrimaryGeneration`, supplied by `agentinstall.Store.WithPrimary`. Its
+catalog lock excludes staged/retiring identities and unresolved promotions from
+Node-wide local writes. L1 remains the authority for Node registration and
+capability observations. Only the primary can publish them; the installed
+primary fence also encloses each durable capability-floor write, so a retiree's
+late probe or response cannot overwrite the successor's floor. These locks do
+not grant claims or execution authority.
+
+Each spool Attempt has an immutable `owner_generation`, established with its
+Job/Attempt/fence before the first output. Legacy rows carry the empty owner.
+Recovery and sweep select only the calling generation's rows or generations
+positively observed `closed` in authenticated L1 inventory. Missing entries,
+missing PIDs, local clocks and local ownership maps never establish closure.
+Read-only `PendingEvidence` inspection counts the whole cohort and reads old
+spool schemas without migration. It supplies no recovery ownership. Legacy
+recovery continues to read legacy rows. Enrolled processes leave legacy
+rows protected; conversion/reboot reconciliation must positively settle that
+legacy boot before changing ownership. Startup schema/backfill work is
+serialized, while SQLite transactions apply the existing one-shot byte budget
+once over all generations. They refuse excess output instead of evicting it.
+Recovery additionally holds a shared-store per-Attempt process lock, so two
+collectors cannot concurrently deliver the same closed-generation backlog. An
+enrolled recovery loop scans the local cohort every five seconds even when
+idle; another process's custody writes cannot wake its process-local channel.
+A separate inventory loop permits one request at a time, bounds it by the
+normal operation timeout, and waits five seconds after each completed or failed
+refresh before trying again. Recovery wakes and worker completions do not poll
+inventory. A successful refresh wakes local recovery; a pending or failed
+refresh never delays own-generation or durably known-closed evidence. Unknown
+owners remain protected until positive closure is cached. Shutdown cancels and
+joins both loops before closing the shared spool.
+
+Handoff admission holds an exclusive node-local record lock from before
+preparation through execution, mailbox publication, result upload, capture
+cleanup and finish. The existing process-local lease now also holds a stable
+cross-process lock under the agent-private state root. Startup adoption,
+expiry and budget eviction take that same lock without waiting; an owned
+record is left intact, including an admission with no terminal deadline.
+Lock files are never unlinked while the store is in use. No workload-writable
+marker grants this ownership. Result accounting still reads the complete shared
+record root and counts every generation's in-flight and retained bytes once.
+Node-wide expiry/budget passes share a collection lock, so two generations do
+not independently evict from the same old budget measurement. Attempt-scoped
+mailbox/capture cleanup stays under its handoff lease; it never scans another
+generation's open mailbox. Crash residue keeps today's recovery rules; this
+does not add process adoption, SIGKILL or reboot survival.
+
+An enrolled successor durably declares support for evidence custody when it
+opens this shared store. After every resident runtime is positively reaped,
+the default `RetirementEvidenceSettled` implementation can acknowledge pending
+logs/completion bytes to that declared primary custodian. Publication must
+already be settled under its existing rules: the lifecycle records this only
+after mailbox/result publication succeeds, independently of spool delivery.
+Late appends and live producers block custody. A FULL-synchronous transaction
+records the exact resident identity, source and custodian generations, a SHA-256
+digest of the stored completion/incomplete evidence and ordered log events, and
+the acknowledgment time. The bytes stay in the same durable SQLite store;
+receipt publication does not delete them or create a receipt without bytes.
+Custody rows are excluded from destructive spool sweep.
+`Agent.EvidenceCustodyReceipts` returns the exact stored identities and digests
+for installation proof; an empty receipt list does not prove reap or delivery.
+
+Custody supplies storage only. The target cannot recover a live source's rows,
+even after acknowledgment. L1 independently requires accepted completion or an
+authoritatively ended Lease before closing the source generation. Until then
+the retiree retains its normal E authority, renewal and first-delivery loop.
+Only after positive L1 closure can a successor deliver the stored bytes through
+existing historical O / accepted-identical-replay R predicates. No first
+completion authority, Lease renewal, mailbox entitlement or verdict transfers.
+No declared custodian, failed durable commit, pending publication or unknown
+closure keeps retirement pending. An explicit `RetirementEvidenceSettled`
+callback remains the integration seam for additional evidence and may veto
+closure; it cannot weaken runtime reap or L1's closure checks.
+
+The tests use temporary roots, real process one-shots and plain Fabric. They
+cover two and three concurrent stores, three running agent generations and two
+promotions, Node/floor publication fencing, aggregate budgets, historical custody
+replay and the legacy lock/spool path. Installed launchd survival remains #1182
+acceptance; services, activation sequencing and rollback remain #1178–#1180.
+
+## Selective service quiescence for rolling upgrade (#1178)
+
+Before L1 promotion, the installation coordinator closes L1 admission, joins
+its inventory read, and durably records the old primary's process service
+Job/Attempt/boot identities in the existing upgrade drain receipt. It then
+calls `Agent.QuiesceUpgradeServices` with that inventory, the exact Node,
+generation, boot and activation operation ID. This is a pre-promotion barrier:
+L1 already refuses promotion with active service Attempts. It does not stop
+a retiring process or use Drain, shutdown, removal, or one-shot interruption.
+
+The barrier joins the claim mutex before selecting work. Missing local
+ownership, an incomplete service inventory, OCI, one-shots and changed replay
+inputs refuse before cancellation. Local service claims close for the operation;
+a service already admitted but not yet installed as a resident receives the
+same selective cancellation when its worker enters. All selected services stop
+before the barrier waits. Ordinary and Restartable process one-shots keep their
+original contexts, Guardians, runtime limits, Lease renewal and finalization.
+
+Success requires each selected service worker to join, a positive runtime reap,
+and settled publication plus accepted completion and drained log evidence.
+The barrier also joins earlier terminal process-service evidence, including
+services no longer in active L1 inventory. The retained #1176 evidence query
+supplies this proof. Neither absence from the
+resident map nor an ended Lease certifies quiescence. This path requires actual
+evidence delivery before promotion; it does not use custody to let a replacement
+start while its predecessor still needs first completion. A bounded caller
+context may return pending/error, with the service gate still closed for replay.
+
+Upgrade finalization is local to each service. A stalled or refused completion
+never exits the session or cancels sibling one-shots. The barrier retains the
+immutable completion and ordered spool after the worker joins; generic recovery
+cannot discard or seal that evidence. A service admitted before the gate closed
+whose lifecycle has not begun runtime preparation records positive `no_runtime`
+evidence and delivers its completion on a separate bounded context. Cancellation
+of its execution context cannot cancel that finalization.
+
+Before canceling selected payloads, the session takes over renewal of their exact
+completion Leases. These service-only renewal owners survive worker exit and
+bounded barrier returns, including the idle time before replay. Each stops and
+joins on its own positive settlement, independently of other blocked services,
+or when the session/agent closes. A terminal renewal rejection also ends that
+Attempt's renewal owner. Payload stop, reap failure and completion delivery delay
+therefore do not create a lease-length recovery deadline. Successful L1 renewal
+remains necessary; the agent cannot undo L1 fencing or an operator's revocation.
+An authoritative stop directive ends renewal immediately. If evidence remains
+unsettled, the barrier reports phase `lease` with that directive and the evidence
+failure, while retaining the immutable spool and keeping service admission
+closed. Renewal ending does not preempt exact-authority completion replay,
+including a completion that L1 accepted but whose response was lost. Replay
+alone decides settlement; an expired, unaccepted completion stays an explicit
+failure rather than fabricated proof.
+
+Upgrade evidence ownership transfers share a local disposition lock with replay
+refusal mutations. The lock never spans an HTTP request or holds the ownership
+mutex across spool SQL. Each request records its Attempt's ownership revision;
+a reply from an older revision cannot replace bytes with gaps or seal evidence,
+even after upgrade ownership has been released. Transfer joins any local
+disposition already in progress and fences the remaining in-flight replies.
+
+`UpgradeServiceQuiescenceError` identifies the blocked Job, Attempt, phase and
+cause. `Pending` means the service worker has not joined when the caller's bound
+expires. A joined worker with failed reap or undelivered evidence returns a
+failure immediately. There is no retirement deadline and no timeout that stops
+kept one-shots. A sealed, missing or undecodable evidence record is an explicit
+failure, never positive proof or a silent wait.
+
+Replay requires the same operation, Node, generation, boot and original inventory,
+while service admission stays closed. It retries the original runtime authority.
+If the runtime has consumed its failed receipt, read-only verification checks the
+exact Attempt's durable process-group record in the same agent boot. Only a
+positive runtime receipt, a durable not-spawned record, or absence of that recorded
+group supplies proof; live, unknown or inaccessible groups refuse. Replay then
+retries the same retained completion and ordered logs. A refused completion,
+including expired authority, cannot certify accepted upgrade evidence. Lost or
+sealed evidence cannot be reconstructed into success. These failures retain
+service data and leave resident one-shots untouched; the coordinator must resolve
+the reported cause and replay before promotion or service recovery.
+
+The returned `UpgradeServiceQuiescence` is local evidence for the existing
+upgrade receipt's `service_quiescence` field. Persist it before promotion or
+service recovery. Its full original inventory remains in the receipt while the
+existing `services` retry queue shrinks durably. No managed service root, data,
+binding or port reservation is removed. Cleanup stays in each Attempt's normal
+runtime/finalization path; it never traverses one-shot resources.
+
+After this barrier, L1 freezes only active process one-shots in the retiring
+generation. Already-finished service records have positive reap and settled
+evidence, so they cannot hold retirement open. A service removed by the ordinary removal controller instead retains positive
+settlement only after job-wide runtime reap, spool purge, managed-root cleanup,
+accepted removal acknowledgement and durable removal completion. Its obsolete
+delivery query cannot wait forever on intentionally deleted evidence; failed
+cleanup or acknowledgement does not grant this proof. This settles only process
+service records, never one-shot records. The remaining one-shots and their
+evidence are the closure barrier, with no automatic retirement deadline and no
+limit on older retirees.
+
+The activation coordinator (#1179) and interrupted-cutover recovery (#1180)
+reuse `resumeUpgradeServices` and the ordinary durable restart endpoint described
+in [plain upgrade](plain-node-upgrade.md). They retain one stable recovery key
+per activation operation, predecessor boot and Attempt. Each still-desired
+service, including `restart=never`, receives one accepted restart request; only
+ordinary L1 claim creates a fresh Attempt and fence under the new primary.
+There is no process adoption or uninterrupted-service guarantee.
+
+If activation fails before promotion, the same positive proof permits recovery
+under the original primary. After service recovery, call
+`Agent.ResumeUpgradeServiceClaims` with the same operation ID. It requires a
+completed local barrier and authenticated inventory naming that exact primary
+and boot. A retiree cannot reopen service claims. The caller separately restores
+only its owned L1 admission revision. The installation lock serializes these
+operations with promotion. Agents without generation identity cannot enter this
+path and keep their existing claim, shutdown and plain-upgrade behavior.
+
+These are library integration seams. Installed activation transport, the ordered
+upgrade sequence and interrupted installation reconciliation remain #1179 and
+#1180; the existing installed upgrade does not select this path yet.

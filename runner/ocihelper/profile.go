@@ -289,6 +289,10 @@ func profileReceipt(workload WorkloadInput) ProfileReceipt {
 	if !workload.Computer {
 		return receipt
 	}
+	receipt.ComputerNetwork = workload.ComputerNetwork
+	if receipt.ComputerNetwork == "" {
+		receipt.ComputerNetwork = ComputerNetworkInternet
+	}
 	limits := computerScratchKilobytes(workload.Limits.MemoryBytes)
 	ceilings := []struct {
 		target string
@@ -362,6 +366,7 @@ func marshalRuntimeSpec(spec *specs.Spec) ([]byte, error) {
 }
 
 func buildRuntimeSpec(ctx context.Context, input RuntimeSpecInput, dependencies runtimeSpecDependencies) (*specs.Spec, error) {
+	input = computerNetworkProfileInput(input)
 	if dependencies.generateBase == nil || dependencies.generateSeccomp == nil || dependencies.validateSource == nil || dependencies.verifyVersion == nil {
 		return nil, errors.New("OCI profile dependencies are incomplete")
 	}

@@ -54,6 +54,14 @@ type Config struct {
 	BootSessionID       string
 	// AgentGenerationID opts into L1 generation authority; installed activation supplies it.
 	AgentGenerationID string
+	// GenerationLifetimeLock claims the installed process's already-held lifetime
+	// lock once, after checking the Node and generation identity. Startup owns
+	// its release and must keep it held until this runtime stops. Nil uses the
+	// standalone generation lock; legacy agents retain their exclusive Node lock.
+	GenerationLifetimeLock func(nodeID, generationID string) error
+	// PrimaryGeneration serializes Node-wide local writes with installed promotion.
+	// It must reject staged/retiring identities and unresolved catalog transitions.
+	PrimaryGeneration func(func() error) error
 	// RetirementEvidenceSettled always checks #1176 closure readiness when configured.
 	// It may veto closure for other owned evidence, or prove limited durable custody.
 	// It cannot replace positive runtime reap or L1 completion/Lease closure checks.
@@ -264,11 +272,6 @@ func New(config Config) (*Agent, error) {
 			Clock: processClockAdapter{clock: clock}, GuardianExecutable: config.GuardianExecutable,
 		}), config.BootSessionID)
 	}
-	managedResource, err := initializeManagedResource(config.ManagedRootDirectory, config.NodeID, config.BootSessionID, config.Logf)
-	if err != nil {
-		client.Close()
-		return nil, err
-	}
 	registration := contract.NodeRegistration{
 		NodeID:            config.NodeID,
 		AgentGenerationID: config.AgentGenerationID,
@@ -285,9 +288,6 @@ func New(config Config) (*Agent, error) {
 	if guardianOK && guardian.GuardianAvailable() && registration.Capabilities["kind:process"] && registration.Capabilities[contract.CapabilityExecCaptureBundle] {
 		registration.Capabilities[l1.CapabilityOneshotRestartable] = true
 	}
-	if managedResource != nil {
-		registration.RootInstanceID = managedResource.rootInstanceID()
-	}
 	heartbeatInterval := durationOrDefault(config.HeartbeatInterval, DefaultHeartbeatInterval)
 	claimInterval := durationOrDefault(config.ClaimInterval, DefaultClaimInterval)
 	logBatchSize := intOrDefault(config.LogBatchSize, DefaultLogBatchSize)
@@ -298,10 +298,30 @@ func New(config Config) (*Agent, error) {
 		client.Close()
 		return nil, err
 	}
-	stableNodeLock, err := acquireNodeLock(logSpoolDirectory, config.NodeID)
+	stableNodeLock, err := acquireConfiguredAgentNodeLock(logSpoolDirectory, config.NodeID, config.AgentGenerationID, config.GenerationLifetimeLock)
 	if err != nil {
 		client.Close()
 		return nil, err
+	}
+	// Ownership precedes managed-root activation, including rejected starts.
+	var managedResource managedResourceManager
+	initializeRoot := func() error {
+		var err error
+		managedResource, err = initializeManagedResource(config.ManagedRootDirectory, config.NodeID, config.BootSessionID, config.Logf)
+		return err
+	}
+	if config.PrimaryGeneration != nil {
+		err = config.PrimaryGeneration(initializeRoot)
+	} else {
+		err = initializeRoot()
+	}
+	if err != nil {
+		_ = stableNodeLock.Close()
+		client.Close()
+		return nil, err
+	}
+	if managedResource != nil {
+		registration.RootInstanceID = managedResource.rootInstanceID()
 	}
 	outbox, err := newEvidenceOutbox(
 		logSpoolDirectory,
@@ -316,6 +336,15 @@ func New(config Config) (*Agent, error) {
 		_ = stableNodeLock.Close()
 		client.Close()
 		return nil, err
+	}
+	outbox.spool.generationID = config.AgentGenerationID
+	if config.AgentGenerationID != "" {
+		if _, err := outbox.spool.db.Exec(`INSERT OR IGNORE INTO generation_evidence_custodians VALUES(?)`, config.AgentGenerationID); err != nil {
+			_ = outbox.Close()
+			_ = stableNodeLock.Close()
+			client.Close()
+			return nil, err
+		}
 	}
 	var intentGate *ociIntentCompletionGate
 	if config.OCIIntent != nil {
@@ -380,6 +409,14 @@ func New(config Config) (*Agent, error) {
 		client.Close()
 		return nil, err
 	}
+	if revisionFloor != nil {
+		revisionFloor.primary = config.PrimaryGeneration
+		if config.AgentGenerationID != "" && config.PrimaryGeneration == nil {
+			revisionFloor.primary = func(func() error) error {
+				return errors.New("agent: generation capability floor requires primary ownership")
+			}
+		}
+	}
 	capabilities := newCapabilityState(registration.Capabilities, config.CapabilityProbe, clock, config.CapabilityProbeTimeout, revisionFloor)
 	registration = applyCapabilityObservation(registration, capabilities.snapshot())
 	session := newAgentSession(
@@ -388,6 +425,9 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
 	session.retirementEvidenceSettled = config.RetirementEvidenceSettled
+	if config.AgentGenerationID != "" && session.retirementEvidenceSettled == nil {
+		session.retirementEvidenceSettled = outbox.settleRetirementEvidence(client, config.NodeID)
+	}
 	if config.OneshotLoadLimit != nil {
 		session.oneshotLoadLimit = *config.OneshotLoadLimit
 	}
@@ -714,6 +754,8 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 	var allowsStart func(contract.JobSpec) bool
 	var computerPolicy *ComputerPolicyCache
 	var retirementEvidence func(string, func(context.Context) (bool, error))
+	var upgradeEvidence func(string, func(context.Context) error)
+	var upgradeRuntime func(string, func(context.Context) (workloadrunner.ReapReceipt, error))
 	if a.capabilities != nil {
 		allowsStart = a.capabilities.allows
 	}
@@ -721,6 +763,8 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		computerPolicy = a.session.computerPolicy
 		if a.registration.AgentGenerationID != "" {
 			retirementEvidence = a.session.trackRetirementEvidence
+			upgradeEvidence = a.session.trackUpgradeServiceEvidence
+			upgradeRuntime = a.session.trackUpgradeServiceRuntime
 		}
 	}
 	return newAttemptLifecycle(attemptLifecycleDependencies{
@@ -745,6 +789,9 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		runtimeReaped:           a.recordRuntimeReap,
 		keepCompletionAuthority: a.registration.AgentGenerationID != "",
 		retirementEvidence:      retirementEvidence,
+		upgradeEvidence:         upgradeEvidence,
+		upgradeRuntime:          upgradeRuntime,
+		verifyStoppedService:    a.verifyStoppedUpgradeService,
 		attemptDeadman:          a.attemptDeadman,
 		computerTokens:          a.computerTokens,
 		computerControlTokens:   a.computerControlTokens,

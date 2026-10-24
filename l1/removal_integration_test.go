@@ -34,6 +34,9 @@ func TestLegacyFinalizedRemovalAcceptsBareAcknowledgementAfterMigration(t *testi
 	finalizeOrObserveRemoval(t, harness.h.store, harness.job.JobID, func(job Job) bool {
 		return job.State == contract.JobRemovedVerified
 	})
+	// Join the server's reconcile loop first: a pass that begins after the
+	// Store closes fails the server, and with it this test.
+	harness.h.stopServer()
 	var sequence int
 	var name, databasePath string
 	if err := harness.h.store.db.QueryRow(`PRAGMA database_list`).Scan(&sequence, &name, &databasePath); err != nil {

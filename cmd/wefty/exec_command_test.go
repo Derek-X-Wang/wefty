@@ -454,7 +454,7 @@ func TestExecCancellation(t *testing.T) {
 
 func TestExecRefusalsSubmitNothing(t *testing.T) {
 	stack := newExecStack(t, execTestIdleLimit)
-	for _, name := range []string{"not a git repo", "no commits yet", "current folder is outside", "unresolved merge", "sparse checkout", "partial clone", "ignored start folder", "empty start folder", "Git LFS", "Git LFS config", "submodules with changes", "submodules with changed HEAD", "submodules with missing checkout", "unsupported file", "no installed node", "requires --l3", "64 KiB", "cancelled before capture"} {
+	for _, name := range []string{"not a git repo", "no commits yet", "current folder is outside", "unresolved merge", "sparse checkout", "partial clone", "partial clone promisor remote", "ignored start folder", "empty start folder", "Git LFS", "Git LFS config", "submodules with changes", "submodules with changed HEAD", "submodules with missing checkout", "unsupported file", "no installed node", "requires --l3", "64 KiB", "cancelled before capture"} {
 		t.Run(name, func(t *testing.T) {
 			repo := execTestRepo(t)
 			wantMessage := name
@@ -502,6 +502,9 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 			case "partial clone":
 				wantMessage = "partial clone is not supported by exec (extensions.partialClone is set); use a full clone"
 				execTestGit(t, repo, "config", "extensions.partialClone", "origin")
+			case "partial clone promisor remote":
+				wantMessage = "partial clone is not supported by exec (remote.origin.promisor is set); use a full clone"
+				execTestGit(t, repo, "config", "remote.origin.promisor", "true")
 			case "ignored start folder":
 				wantMessage = "ignored start folder is not in the snapshot: ignored; run from a tracked folder"
 				writeExecFile(t, filepath.Join(repo, "ignored", "file"), "excluded")
@@ -585,6 +588,16 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 				t.Fatalf("refusal submitted %d requests", len(stack.requests))
 			}
 		})
+	}
+}
+
+// A remote that is explicitly not a promisor is an ordinary full clone (#1212).
+func TestExecPromisorRemoteOffIsNotPartialClone(t *testing.T) {
+	repo := execTestRepo(t)
+	execTestGit(t, repo, "config", "remote.origin.promisor", "false")
+	execTestGit(t, repo, "config", "remote.backup.url", repo)
+	if err := validateExecRepo(t.Context(), repo); err != nil {
+		t.Fatalf("promisor=false refused: %v", err)
 	}
 }
 

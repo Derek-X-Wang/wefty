@@ -954,6 +954,7 @@ type WorkloadInput struct {
 	ImageReference       string                `json:"image_reference"`
 	ImageDigest          string                `json:"image_digest"`
 	Computer             bool                  `json:"computer,omitempty"`
+	ComputerNetwork      string                `json:"computer_network,omitempty"`
 	Argv                 []string              `json:"argv,omitempty"`
 	WorkingDirectory     string                `json:"working_directory,omitempty"`
 	Environment          []EnvironmentVariable `json:"environment,omitempty"`
@@ -1064,6 +1065,8 @@ const (
 // /var/tmp; ordinary baseline tmpfs mounts remain outside that product delta.
 type ProfileReceipt struct {
 	Computer                                     bool                 `json:"computer"`
+	ComputerNetwork                              string               `json:"computer_network,omitempty"`
+	ComputerLoopbackOnly                         bool                 `json:"computer_loopback_only,omitempty"`
 	NetworkNamespacePresent                      bool                 `json:"network_namespace_present"`
 	HelperNetworkNamespaceInode                  string               `json:"helper_network_namespace_inode,omitempty"`
 	TaskNetworkNamespaceInode                    string               `json:"task_network_namespace_inode,omitempty"`

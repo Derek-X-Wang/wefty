@@ -669,7 +669,17 @@
                 "additionalProperties": false,
                 "required": ["idempotency_key"],
                 "properties": {
-                  "idempotency_key": { "type": "string", "minLength": 1 }
+                  "idempotency_key": { "type": "string", "minLength": 1 },
+                  "upgrade": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["node_id", "attempt_id", "boot_session_id"],
+                    "description": "Optional planned-upgrade compare guard. Requires accepted predecessor completion. Atomically skips changed operator intent, policy stops, removals, and replaced or still-live Attempts. Uses the ordinary durable restart key; absent for explicit operator restarts.",
+                    "properties": {
+                      "node_id": { "type": "string", "minLength": 1 },
+                      "attempt_id": { "type": "string", "minLength": 1 },
+                      "boot_session_id": { "type": "string", "minLength": 1 }
+                    }
+                  }
                 }
               }
             }

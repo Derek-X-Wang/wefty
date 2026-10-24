@@ -278,6 +278,15 @@ func validateExecRepo(ctx context.Context, root string) error {
 	if _, err := execGit(ctx, root, "", nil, "config", "--get", "extensions.partialClone"); err == nil {
 		return usageError("partial clone is not supported by exec (extensions.partialClone is set); use a full clone")
 	}
+	// A blobless clone can mark only its remote as a promisor (Git 2.39 does).
+	// Capturing it would fetch missing objects into the caller's checkout (#1212).
+	if promisors, err := execGit(ctx, root, "", nil, "config", "--type=bool", "--get-regexp", `^remote\..*\.promisor$`); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(promisors), "\n") {
+			if key, value, _ := strings.Cut(line, " "); value == "true" {
+				return usageError(fmt.Sprintf("partial clone is not supported by exec (%s is set); use a full clone", key))
+			}
+		}
+	}
 	unmerged, err := execGit(ctx, root, "", nil, "ls-files", "-u")
 	if err != nil {
 		return err

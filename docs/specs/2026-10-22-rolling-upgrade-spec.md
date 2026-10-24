@@ -324,6 +324,12 @@ Services keep their current product behavior: stop/reap the old service Attempt
 positively, then request one idempotent recovery for each still-desired service,
 including `restart=never`. Use exact Job/Attempt/boot identities and stable restart
 keys. Respect stopped, removed, policy-stopped and already-replaced services.
+The selective service barrier runs before promotion: L1 refuses active service
+residents, so services finish while the old generation is still primary. The
+returned positive reap/evidence proof is persisted in the existing upgrade drain
+receipt before promotion or recovery; #1179 wires the installed coordinator and
+#1180 reconciles interrupted activation. The restart endpoint uses an optional
+transactional predecessor/intent guard and the existing durable restart key.
 No service successor starts before predecessor quiescence. Selective service
 teardown cannot cancel preserved one-shots or start their shutdown timer.
 An OCI service still selects the non-rolling fallback.

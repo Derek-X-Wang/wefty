@@ -164,6 +164,8 @@ type ProfileDoctorFacts struct {
 
 type ComputerScreenIsolationDoctorFacts struct {
 	Outcome                                      DiagnosticOutcome              `json:"outcome"`
+	ComputerNetwork                              string                         `json:"computer_network,omitempty"`
+	ComputerLoopbackOnly                         bool                           `json:"computer_loopback_only,omitempty"`
 	NetworkNamespacePresent                      bool                           `json:"network_namespace_present"`
 	HelperNetworkNamespaceInode                  string                         `json:"helper_network_namespace_inode,omitempty"`
 	TaskNetworkNamespaceInode                    string                         `json:"task_network_namespace_inode,omitempty"`
@@ -1026,12 +1028,23 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 		report.Findings = append(report.Findings, finding("profile-ceilings", diagnosticReceipt{ran: true, passed: true, code: code, severity: severity, detail: detail}))
 		if profile.Computer {
 			firewallObserved := runtimeStatus.ComputerFirewallRead.Outcome == ocihelper.DiagnosticReadOK
-			firewallEnforced := firewallObserved && (!runtimeStatus.ComputerAttemptsLive || runtimeStatus.ComputerFirewallPresent)
+			withoutInternet := profile.ComputerNetwork == ocihelper.ComputerNetworkNone
+			// ComputerAttemptsLive counts veth attachments. A none Computer
+			// needs no firewall, but other live internet Computers still do.
+			firewallRequired := !withoutInternet || runtimeStatus.ComputerAttemptsLive
+			firewallEnforced := !firewallRequired || firewallObserved && (!runtimeStatus.ComputerAttemptsLive || runtimeStatus.ComputerFirewallPresent)
+			networkEnforced := profile.ComputerNetworkAddress != "" && profile.ComputerNetworkGateway != "" && profile.ComputerNetworkAddress != profile.ComputerNetworkGateway
+			if withoutInternet {
+				networkEnforced = profile.ComputerLoopbackOnly && profile.ComputerNetworkAddress == "" && profile.ComputerNetworkGateway == "" &&
+					profile.ComputerResolverAddress == "" && !profile.ComputerDNSProxyUDP && !profile.ComputerDNSProxyTCP && !profile.ComputerDNSUpstreamReachable && profile.ComputerDNSUpstreamAddress == ""
+			}
 			enforced := profile.NetworkNamespacePresent && profile.HelperNetworkNamespaceInode != "" && profile.TaskNetworkNamespaceInode != "" &&
 				profile.HelperNetworkNamespaceInode != profile.TaskNetworkNamespaceInode && !profile.HostAbstractSocketVisible && profile.HostAbstractSocketObservedAfterEndpointReady && profile.TargetAbstractSocketLive &&
-				profile.ComputerNetworkAddress != "" && profile.ComputerNetworkGateway != "" && profile.ComputerNetworkAddress != profile.ComputerNetworkGateway && firewallEnforced
+				networkEnforced && firewallEnforced
 			report.ComputerScreenIsolation = ComputerScreenIsolationDoctorFacts{
 				Outcome:                                      outcomeFor(true, enforced),
+				ComputerNetwork:                              profile.ComputerNetwork,
+				ComputerLoopbackOnly:                         profile.ComputerLoopbackOnly,
 				NetworkNamespacePresent:                      profile.NetworkNamespacePresent,
 				HelperNetworkNamespaceInode:                  profile.HelperNetworkNamespaceInode,
 				TaskNetworkNamespaceInode:                    profile.TaskNetworkNamespaceInode,
@@ -1064,10 +1077,13 @@ func buildHelper(ctx context.Context, config DoctorConfig, report *DoctorRespons
 			} else if !firewallObserved && runtimeStatus.ComputerAttemptsLive {
 				diagnostic = diagnosticReceipt{ran: true, code: "oci_computer_screen_isolation_not_enforced", detail: "current firewall read is unavailable while Computers are live; active isolation cannot be verified (this does not prove the chains are absent)"}
 				report.ComputerScreenIsolation.Outcome = DiagnosticFailed
-			} else if !firewallObserved {
+			} else if !firewallObserved && firewallRequired {
 				diagnostic = diagnosticReceipt{code: "oci_computer_screen_isolation_not_recorded", notRunCause: NotRunSourceUnavailable, detail: "current firewall read is unavailable and no Computers are live; recorded namespace and X facts remain visible but current enforcement is not verified"}
 			} else if enforced {
 				diagnostic = diagnosticReceipt{ran: true, passed: true, code: "oci_computer_screen_isolation_enforced", detail: "the target X token was live after endpoint readiness, absent in the helper namespace, with distinct namespace inodes and a current firewall observation"}
+				if withoutInternet {
+					diagnostic.detail = "the target X token was live after endpoint readiness, absent in the helper namespace, with distinct namespace inodes and verified loopback-only networking"
+				}
 				report.ComputerScreenIsolation.Outcome = DiagnosticOK
 			}
 			report.Findings = append(report.Findings, finding("computer-screen-isolation", diagnostic))
@@ -1528,7 +1544,7 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("RUNTIMES\t%s containerd=%s runc=%s runc_source=%s outside_tested_range=%t", report.Versions.Outcome, report.Versions.Containerd, report.Versions.Runc, report.Versions.RuncSource, report.Versions.OutsideTestedRange),
 		fmt.Sprintf("CACHE\t%s bytes=%d cap=%d within_bound=%t last_eviction=%s", report.Cache.Outcome, report.Cache.Bytes, report.Cache.CapBytes, report.Cache.WithinBound, lastEviction),
 		fmt.Sprintf("PROFILE\t%s memory_limit=%d memory_max=%d memory_oom_group=%t memory_swap_max=%d computer_tmpfs_ceiling=%d largest_tmpfs_ceiling=%d warnings=%d", report.Profile.Outcome, report.Profile.MemoryLimitBytes, report.Profile.MemoryMaxBytes, report.Profile.MemoryOOMGroup, report.Profile.MemorySwapMaxBytes, report.Profile.ComputerTmpfsCeilingBytes, report.Profile.LargestTmpfsCeilingBytes, len(report.Profile.Warnings)),
-		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t after_endpoint_ready=%t target_x_live=%t address=%s gateway=%s resolver=%s dns_proxy_udp=%t dns_proxy_tcp=%t dns_upstream=%s dns_source=%s dns_reachable=%t ipv6_nat=%s computer_firewall_present=%t computer_attempts_live=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.HostAbstractSocketObservedAfterEndpointReady, report.ComputerScreenIsolation.TargetAbstractSocketLive, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway, report.ComputerScreenIsolation.ComputerResolverAddress, report.ComputerScreenIsolation.ComputerDNSProxyUDP, report.ComputerScreenIsolation.ComputerDNSProxyTCP, report.ComputerScreenIsolation.ComputerDNSUpstreamAddress, report.ComputerScreenIsolation.ComputerDNSUpstreamSource, report.ComputerScreenIsolation.ComputerDNSUpstreamReachable, report.ComputerScreenIsolation.ComputerIPv6NATState, report.ComputerScreenIsolation.ComputerFirewallPresent, report.ComputerScreenIsolation.ComputerAttemptsLive),
+		fmt.Sprintf("SCREEN ISOLATION\t%s network_namespace_present=%t helper_inode=%s task_inode=%s host_abstract_socket_visible=%t after_endpoint_ready=%t target_x_live=%t address=%s gateway=%s resolver=%s dns_proxy_udp=%t dns_proxy_tcp=%t dns_upstream=%s dns_source=%s dns_reachable=%t ipv6_nat=%s computer_firewall_present=%t computer_attempts_live=%t computer_network=%s loopback_only=%t", report.ComputerScreenIsolation.Outcome, report.ComputerScreenIsolation.NetworkNamespacePresent, report.ComputerScreenIsolation.HelperNetworkNamespaceInode, report.ComputerScreenIsolation.TaskNetworkNamespaceInode, report.ComputerScreenIsolation.HostAbstractSocketVisible, report.ComputerScreenIsolation.HostAbstractSocketObservedAfterEndpointReady, report.ComputerScreenIsolation.TargetAbstractSocketLive, report.ComputerScreenIsolation.ComputerNetworkAddress, report.ComputerScreenIsolation.ComputerNetworkGateway, report.ComputerScreenIsolation.ComputerResolverAddress, report.ComputerScreenIsolation.ComputerDNSProxyUDP, report.ComputerScreenIsolation.ComputerDNSProxyTCP, report.ComputerScreenIsolation.ComputerDNSUpstreamAddress, report.ComputerScreenIsolation.ComputerDNSUpstreamSource, report.ComputerScreenIsolation.ComputerDNSUpstreamReachable, report.ComputerScreenIsolation.ComputerIPv6NATState, report.ComputerScreenIsolation.ComputerFirewallPresent, report.ComputerScreenIsolation.ComputerAttemptsLive, report.ComputerScreenIsolation.ComputerNetwork, report.ComputerScreenIsolation.ComputerLoopbackOnly),
 		fmt.Sprintf("MOUNTS\t%s roots=%s", report.Mounts.Outcome, strings.Join(report.Mounts.AllowedRoots, ",")),
 		fmt.Sprintf("CONVERGENCE\t%s class=%s current={%s} desired={%s}", report.Convergence.Outcome, report.Convergence.Class, convergenceState, desiredConvergenceState),
 		retainedResultsLine(report.RetainedResults),
