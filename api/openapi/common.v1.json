@@ -192,7 +192,7 @@
           "cleanup_pending"
         ],
         "properties": {
-          "unread_events": { "type": "integer", "minimum": 0, "description": "Events after the credential read cursor, after acknowledging the outcome reported by this reply. Later events remain unread." },
+          "unread_events": { "type": "integer", "minimum": 0, "description": "Events after the credential read cursor, after acknowledging the contiguous lifecycle prefix for this outcome. A non-lifecycle event stops acknowledgement even before the outcome; it and subsequent events remain unread." },
           "seat_id": {
             "type": "string"
           },

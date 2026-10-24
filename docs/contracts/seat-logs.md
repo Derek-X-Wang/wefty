@@ -8,18 +8,24 @@ Computer audit remains the record for take-over without a Seat.
 
 ## Writer and lifecycle
 
-Only request admission (`CreateSeatCall`, `saveSeatApproval`) and upgrade
-seeding create a log. A retained log also reserves its Seat ID: pruning the
-request receipt cannot hand that log to a new caller.
+Request admission (`CreateSeatCall`, `saveSeatApproval`), upgrade seeding,
+and trusted lifecycle recovery create logs from retained Seat authority.
+A retained log also reserves its Seat ID: pruning the request receipt cannot
+hand that log to a new caller.
 
 `Store.AppendSeatEvent` is the shared internal writer for later command,
 copy and control operations. It is not an unauthenticated HTTP mutation.
 The calling feature must prove its operation authority. Every event kind,
 including `requested`, returns `not_found` when its log does not exist;
 a generic event cannot invent an orphan or revive a pruned log.
-Lifecycle writers use `appendSeatEvent` in their existing fenced transaction,
-so state and evidence commit together. Each event has a stable ID scoped to
-its Seat. Identical retries succeed once; changed evidence returns
+Lifecycle writers use `appendSeatEvent` in their existing fenced transaction.
+If a log is missing, they recover metadata from the call, approval or permanent
+Seat identity, preserving the caller and credential digest when available.
+Without retained Seat authority they skip the event. Missing evidence alone
+never rolls back node registration or a lifecycle transition. The exported
+`AppendSeatEvent` remains strict and cannot perform this recovery.
+Each event has a stable ID scoped to its Seat. Identical retries succeed once;
+changed evidence returns
 `idempotency_conflict`. L1 supplies time when none is supplied, including on
 replay. A supplied timestamp is immutable evidence.
 
@@ -62,19 +68,28 @@ moved cursor. Empty polls do not create acknowledgements. A retryable
 acknowledgement failure remains pending and is retried on a later poll;
 `MAX` makes that retry idempotent. The follow does not duplicate printed
 events and drains a pending acknowledgement before its terminal line.
+A one-shot read that printed its events remains successful if acknowledgement
+fails: it writes a warning to stderr because the read cursor was not confirmed.
+A later successful acknowledgement can advance it. Repeating the read is safe
+via `MAX`.
 Follow polls never renew Seat activity. Whether a one-time
 `wefty logs SEAT_ID` counts as a Seat call belongs to #1146.
 
-A reply reporting a Seat outcome acknowledges the prefix through that
-outcome's lifecycle event: requested, approved, starting, started, refused,
-or ended (including a migrated current-state event). L1 reads the caller,
-state and outcome boundary, advances the cursor, and computes the reply's
+A reply reporting a Seat outcome acknowledges only the contiguous lifecycle
+prefix through that outcome: requested, approved, starting, started, released,
+refused or ended (including a migrated current-state event). It stops before
+the first unread event of any other kind, even when that event precedes the
+outcome. An owner note, control, copy or command event therefore remains unread;
+any later lifecycle events also stay unread until that barrier is read.
+L1 reads the caller, state and outcome boundary, advances the cursor, and
+computes the reply's
 unread count in the same fenced transaction. A repeated wait for an already
 acknowledged outcome stays read-only. It does not advance through later
 control, copy, command or other events merely because the Seat state is
-unchanged. A first ready or refusal reply therefore does not announce its
-own lifecycle history as new. This acknowledgement records the outcome
-reply L1 produced; it does not prove the client received it.
+unchanged. With no earlier non-lifecycle barrier, a first ready or refusal
+reply therefore does not announce its own lifecycle history as new. This
+acknowledgement records the outcome reply L1 produced; it does not prove the
+client received it.
 
 `SeatCallResult.unread_events` counts events strictly after that cursor.
 The CLI's one shared Seat reply path adds
@@ -94,10 +109,13 @@ returns `seat_ended` with the end reason.
 Seat logs use the same store retention setting as the take-over audit:
 `computerTakeoverAuditRetentionAge`, 90 days by default. After action
 authority ends, the stream and digest last for that retention. A request
-that never went live instead expires from its creation time, even if it
-never resolves or its refusal arrives much later. A retained once-live flag
-keeps creation time from pruning a live Seat's log. Events or reads never
-extend this retention.
+that never went live uses creation time, but its log stays available while
+it is unresolved and a call, approval or permanent Seat identity still refers
+to it. Once it ends, or all those references disappear, that log expires at
+creation plus the retention age. Thus a very late refusal may make an old
+log immediately eligible for pruning without blocking the refusal itself.
+A retained once-live flag keeps creation time from pruning a live Seat's log.
+Events and reads do not extend these age bounds.
 
 The existing L1 retention sweep deletes expired streams and digests and
 reports their number as `ReconcileResult.pruned_seat_logs`. No new janitor
@@ -106,9 +124,12 @@ Logs have no foreign key to a Computer, Attempt, node or prunable request
 receipt, so pruning those cannot erase evidence. Reads and acknowledgements
 refuse at the configured retention boundary even before a sweep.
 
-On upgrade, existing request receipts seed a current-state event and retain
-any still-available credential digest. Missing history and secrets already
-scrubbed by the earlier binary cannot be reconstructed. The original caller
+On upgrade, existing call receipts, approval-only Seats and permanent Seat
+identities seed a current-state event and retain any still-available credential
+digest. The permanent identity's `ever_live` history survives missing call
+receipts. Source migrations run once, including a repair for databases that
+already ran the earlier call-only migration. Missing history and secrets
+already scrubbed by the earlier binary cannot be reconstructed. The original caller
 can still read a seeded log. If the CLI's stored credential gets exactly
 403 `invalid Seat credential`, it retries the log GET once without that
 header. L1 then checks the original caller; a different caller remains
@@ -121,7 +142,8 @@ expires. After pruning, the digest is gone: a direct credential request gets
 original caller. Other forbidden answers do not trigger fallback.
 A migrated once-live terminal log starts retention at upgrade because older
 receipts have no end timestamp; a never-live log uses its known creation
-time. A retained log is never reseeded after expiry.
+time when available, otherwise upgrade time. Restarting L1 after the source
+migrations complete does not reseed a pruned log.
 
 ## CLI
 

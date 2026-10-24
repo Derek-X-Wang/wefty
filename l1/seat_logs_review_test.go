@@ -140,6 +140,17 @@ func TestSeatLogUnresolvedRequestExpiresAndReportsPruning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if result.PrunedSeatLogs != 0 {
+		t.Fatalf("unresolved request lost its log before refusal: %+v", result)
+	}
+	outcome, err := f.store.GetSeatCall(t.Context(), "cli", id)
+	if err != nil || outcome.State != SeatRefused {
+		t.Fatalf("old pending request cannot refuse: %+v %v", outcome, err)
+	}
+	result, err = f.store.Reconcile(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	data, err := json.Marshal(result)
 	if err != nil {
 		t.Fatal(err)

@@ -151,6 +151,9 @@ func TestSeatLogEndedCredentialScopeAndRetention(t *testing.T) {
 	if _, err := h.store.CreateSeatCall(t.Context(), "cli", SeatCallInput{SeatID: otherID, NodeID: node.NodeID, Harness: "test", Folder: "/workspace", Form: "any", Network: "none"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := h.store.GetSeatLogs(t.Context(), "cli", otherID, value.Credential, "", 100); errorCode(err) != contract.ErrorForbidden {
+		t.Fatalf("Seat credential borrowed caller authority to read another Seat: %v", err)
+	}
 	if status, body := send(http.MethodGet, "/v1/seats/"+otherID+"/logs"); status != 403 {
 		t.Fatalf("cross-Seat log request must be forbidden: %d %s", status, body)
 	}

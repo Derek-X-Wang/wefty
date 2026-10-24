@@ -244,6 +244,18 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
+		if err != nil || outcomeOrdinal <= readOrdinal {
+			return err
+		}
+		// A cursor can acknowledge only a contiguous prefix. An owner note or
+		// any other non-lifecycle event is still unread even if a later outcome
+		// is reported, so stop immediately before that event.
+		var barrier int64
+		err = q.QueryRowContext(ctx, `SELECT COALESCE(MIN(ordinal),0) FROM seat_log_events WHERE seat_id=? AND ordinal>? AND ordinal<=? AND json_extract(event_json,'$.kind') NOT IN ('requested','approved','refused','starting','started','released','ended')`, id, readOrdinal, outcomeOrdinal).Scan(&barrier)
+		if barrier > 0 {
+			outcomeOrdinal = barrier - 1
+		}
+
 		return err
 	}
 	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {

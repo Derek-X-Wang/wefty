@@ -12,6 +12,9 @@ func (s *Store) migrateSeatLogs(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "seat_logs", "ever_live", "INTEGER NOT NULL DEFAULT 0 CHECK(ever_live IN (0,1))"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "computer_seat_identities", "ever_live", "INTEGER NOT NULL DEFAULT 0 CHECK(ever_live IN (0,1))"); err != nil {
+		return err
+	}
 	w, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
 		return err
@@ -37,10 +40,17 @@ func (s *Store) migrateSeatLogs(ctx context.Context) error {
 	if err := w.tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM l1_data_migrations WHERE name='seat_log_seed')`).Scan(&applied); err != nil {
 		return err
 	}
-	if applied {
+	var authorityApplied bool
+	if err := w.tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM l1_data_migrations WHERE name='seat_log_authority_seed')`).Scan(&authorityApplied); err != nil {
+		return err
+	}
+	if applied && authorityApplied {
 		return w.commit()
 	}
-	rows, err := w.tx.QueryContext(ctx, `SELECT c.seat_id,c.caller_identity,c.credential,c.created_ns,COALESCE(NULLIF(a.lifecycle_state,''),a.state,'requested'),COALESCE(NULLIF(a.lifecycle_reason,''),a.reason,''),c.start_finished FROM seat_request_calls c LEFT JOIN seat_approvals a ON a.seat_id=c.seat_id WHERE NOT EXISTS(SELECT 1 FROM seat_logs l WHERE l.seat_id=c.seat_id)`)
+	rows, err := w.tx.QueryContext(ctx, `SELECT ids.seat_id,COALESCE(c.caller_identity,''),COALESCE(c.credential,''),COALESCE(c.created_ns,?),COALESCE(NULLIF(a.lifecycle_state,''),a.state,CASE WHEN i.ever_live=1 THEN 'live' ELSE 'requested' END),COALESCE(NULLIF(a.lifecycle_reason,''),a.reason,''),COALESCE(i.ever_live,0) OR COALESCE(c.start_finished,0)
+ FROM (SELECT seat_id FROM seat_request_calls WHERE ?=0 UNION SELECT seat_id FROM seat_approvals WHERE ?=0 UNION SELECT seat_id FROM computer_seat_identities WHERE ?=0) ids
+ LEFT JOIN seat_request_calls c USING(seat_id) LEFT JOIN seat_approvals a USING(seat_id) LEFT JOIN computer_seat_identities i USING(seat_id)
+ WHERE NOT EXISTS(SELECT 1 FROM seat_logs l WHERE l.seat_id=ids.seat_id)`, w.at.UnixNano(), applied, authorityApplied, authorityApplied)
 	if err != nil {
 		return err
 	}
@@ -74,7 +84,7 @@ func (s *Store) migrateSeatLogs(ctx context.Context) error {
 		if e.state == "ending" || e.state == "ended" || e.state == "refused" {
 			ended = sql.NullInt64{Int64: w.at.UnixNano(), Valid: true}
 		}
-		if _, err := w.tx.ExecContext(ctx, `INSERT INTO seat_logs(seat_id,caller_identity,credential_hash,created_ns,ended_ns,reason,ever_live) VALUES(?,?,?,?,?,?,?)`, e.id, e.caller, digest, e.created, ended, e.reason, e.everLive || e.state == "live" || e.state == "ending" || e.state == "ended"); err != nil {
+		if _, err := w.tx.ExecContext(ctx, `INSERT INTO seat_logs(seat_id,caller_identity,credential_hash,created_ns,ended_ns,reason,ever_live) VALUES(?,?,?,?,?,?,?)`, e.id, e.caller, digest, e.created, ended, e.reason, e.everLive || e.state == "live"); err != nil {
 			return err
 		}
 		// This is a current-state receipt, not a reconstruction of missing history.
@@ -89,7 +99,7 @@ func (s *Store) migrateSeatLogs(ctx context.Context) error {
 			return err
 		}
 	}
-	if _, err := w.tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name,applied_ns) VALUES('seat_log_seed',?)`, w.at.UnixNano()); err != nil {
+	if _, err := w.tx.ExecContext(ctx, `INSERT INTO l1_data_migrations(name,applied_ns) VALUES('seat_log_seed',?),('seat_log_authority_seed',?) ON CONFLICT DO NOTHING`, w.at.UnixNano(), w.at.UnixNano()); err != nil {
 		return err
 	}
 	return w.commit()

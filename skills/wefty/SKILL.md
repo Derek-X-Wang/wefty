@@ -162,16 +162,20 @@ A follow stops with a readable end reason and never renews Seat activity;
 secret: any authenticated Fabric identity holding it can read its own Seat's
 log, including after the Seat ends. It cannot read another Seat's log or
 perform actions after the end. Audit retention defaults to 90 days; a
-never-live request's log expires from creation. A stored secret scrubbed by
-an older binary gets one retry as the original caller; after pruning, the
+never-live request's log ages from creation once it ends or loses all Seat
+references; unresolved referenced requests retain their history. A stored
+secret scrubbed by an older binary gets one retry as the original caller; after pruning, the
 CLI reports that the log was not found.
 
-The reply reporting a Seat outcome acknowledges events through that outcome.
-It does not announce its own request/start/refusal history as unread.
+The reply reporting a Seat outcome acknowledges its contiguous lifecycle
+history, stopping before the first unread non-lifecycle event. An earlier
+owner note, control, command or copy event still produces the unread hint.
+A reply with no such barrier does not repeat its own lifecycle history.
 Later events produce `N new Seat event(s): wefty logs SEAT_ID`; repeated waits
 for the same outcome leave those later events unread. Reading the log
-acknowledges printed history. Empty follow polls do not acknowledge; a
-retryable acknowledgement failure is retried without ending the follow.
+acknowledges printed history. If a one-shot acknowledgement fails, the command
+still succeeds and warns on stderr that its read cursor was not confirmed.
+Empty follow polls do not acknowledge; a retryable acknowledgement failure is retried without ending the follow.
 Successful JSON replies carry `unread_events` and, only when nonzero,
 `unread_events_line`; typed refusals include the hint in their message.
 

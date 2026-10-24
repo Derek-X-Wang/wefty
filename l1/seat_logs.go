@@ -100,12 +100,33 @@ func (s *Store) AppendSeatEvent(ctx context.Context, event SeatLogEvent) error {
 		return err
 	}
 	defer w.rollback()
-	if err := appendSeatEvent(ctx, w.tx, w.at, event); err != nil {
+	if err := writeSeatEvent(ctx, w.tx, w.at, event); err != nil {
 		return err
 	}
 	return w.commit()
 }
+
+// Internal lifecycle evidence must not strand authoritative state when an older
+// database or retention has no log. Recover from retained Seat authority, or
+// omit the event when that authority is gone. The exported writer stays strict.
 func appendSeatEvent(ctx context.Context, q seatApprovalQuery, at time.Time, event SeatLogEvent) error {
+	var exists bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_logs WHERE seat_id=?)`, event.SeatID).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		recovered, err := recoverSeatLog(ctx, q, event.SeatID, at)
+		if err != nil {
+			return err
+		}
+		if !recovered {
+			return nil
+		}
+	}
+	return writeSeatEvent(ctx, q, at, event)
+}
+
+func writeSeatEvent(ctx context.Context, q seatApprovalQuery, at time.Time, event SeatLogEvent) error {
 	if !seatApprovalID.MatchString(event.SeatID) || event.EventID == "" || len(event.EventID) > 255 || len(event.Reason) > 8192 || len(event.Note) > 8192 || len(event.Path) > 4096 || (event.SizeBytes != nil && *event.SizeBytes < 0) {
 		return protocolError(contract.ErrorInvalidRequest, "invalid Seat log event")
 	}
@@ -222,11 +243,11 @@ func (s *Store) GetSeatLogs(ctx context.Context, caller, id, secret, cursor stri
 		}
 		var ended sql.NullInt64
 		var created int64
-		var everLive bool
-		if err := q.QueryRowContext(ctx, `SELECT created_ns,ended_ns,ever_live,reason FROM seat_logs WHERE seat_id=?`, id).Scan(&created, &ended, &everLive, &page.Reason); err != nil {
+		var everLive, referred bool
+		if err := q.QueryRowContext(ctx, `SELECT created_ns,ended_ns,ever_live,reason,EXISTS(SELECT 1 FROM seat_request_calls WHERE seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM seat_approvals WHERE seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM computer_seat_identities WHERE seat_id=seat_logs.seat_id) FROM seat_logs WHERE seat_id=?`, id).Scan(&created, &ended, &everLive, &page.Reason, &referred); err != nil {
 			return err
 		}
-		if seatLogRetentionExpired(r.now(), created, ended, everLive, s.computerTakeoverAuditRetentionAge) {
+		if seatLogRetentionExpired(r.now(), created, ended, everLive, referred, s.computerTakeoverAuditRetentionAge) {
 			return protocolError(contract.ErrorNotFound, "Seat log retention ended")
 		}
 		page.Ended = ended.Valid
@@ -267,11 +288,11 @@ func (s *Store) MarkSeatLogRead(ctx context.Context, caller, id, secret, cursor 
 	}
 	var ended sql.NullInt64
 	var created int64
-	var everLive bool
-	if err := w.tx.QueryRowContext(ctx, `SELECT created_ns,ended_ns,ever_live FROM seat_logs WHERE seat_id=?`, id).Scan(&created, &ended, &everLive); err != nil {
+	var everLive, referred bool
+	if err := w.tx.QueryRowContext(ctx, `SELECT created_ns,ended_ns,ever_live,EXISTS(SELECT 1 FROM seat_request_calls WHERE seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM seat_approvals WHERE seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM computer_seat_identities WHERE seat_id=seat_logs.seat_id) FROM seat_logs WHERE seat_id=?`, id).Scan(&created, &ended, &everLive, &referred); err != nil {
 		return err
 	}
-	if seatLogRetentionExpired(w.at, created, ended, everLive, s.computerTakeoverAuditRetentionAge) {
+	if seatLogRetentionExpired(w.at, created, ended, everLive, referred, s.computerTakeoverAuditRetentionAge) {
 		return protocolError(contract.ErrorNotFound, "Seat log retention ended")
 	}
 	var maximum int64
@@ -287,15 +308,43 @@ func (s *Store) MarkSeatLogRead(ctx context.Context, caller, id, secret, cursor 
 	return w.commit()
 }
 
-// Only request admission creates a log. Generic event writers cannot invent or
-// revive one after retention. The caller's request transaction owns this insert.
+// Admission and lifecycle recovery derive ownership and history from retained
+// Seat authority. An event payload can never supply those rights.
 func createSeatLog(ctx context.Context, q seatApprovalQuery, id string, at time.Time) error {
-	_, err := q.ExecContext(ctx, `INSERT INTO seat_logs(seat_id,created_ns) VALUES(?,?) ON CONFLICT DO NOTHING`, id, at.UnixNano())
+	_, err := recoverSeatLog(ctx, q, id, at)
 	return err
 }
 
-func seatLogRetentionExpired(at time.Time, created int64, ended sql.NullInt64, everLive bool, age time.Duration) bool {
+func recoverSeatLog(ctx context.Context, q seatApprovalQuery, id string, at time.Time) (bool, error) {
+	var caller, secret, state, reason string
+	var created int64
+	var everLive bool
+	err := q.QueryRowContext(ctx, `SELECT COALESCE(c.caller_identity,''),COALESCE(c.credential,''),COALESCE(c.created_ns,?),COALESCE(i.ever_live,0) OR COALESCE(c.start_finished,0),COALESCE(NULLIF(a.lifecycle_state,''),a.state,CASE WHEN i.ever_live=1 THEN 'live' ELSE 'requested' END),COALESCE(NULLIF(a.lifecycle_reason,''),a.reason,'')
+ FROM (SELECT ? AS seat_id) source LEFT JOIN seat_request_calls c USING(seat_id) LEFT JOIN seat_approvals a USING(seat_id) LEFT JOIN computer_seat_identities i USING(seat_id)
+ WHERE c.seat_id IS NOT NULL OR a.seat_id IS NOT NULL OR i.seat_id IS NOT NULL`, at.UnixNano(), id).Scan(&caller, &secret, &created, &everLive, &state, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	digest := ""
+	if secret != "" {
+		digest = seatCredentialHash(secret)
+	}
+	var ended sql.NullInt64
+	if state == "ending" || state == "ended" || state == "refused" {
+		ended = sql.NullInt64{Int64: at.UnixNano(), Valid: true}
+	}
+	_, err = q.ExecContext(ctx, `INSERT INTO seat_logs(seat_id,caller_identity,credential_hash,created_ns,ever_live,ended_ns,reason) VALUES(?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, id, caller, digest, created, everLive, ended, reason)
+	return err == nil, err
+}
+
+func seatLogRetentionExpired(at time.Time, created int64, ended sql.NullInt64, everLive, referred bool, age time.Duration) bool {
 	if !everLive {
+		if !ended.Valid && referred {
+			return false
+		}
 		return !at.Before(time.Unix(0, created).Add(age))
 	}
 	return ended.Valid && !at.Before(time.Unix(0, ended.Int64).Add(age))
@@ -305,7 +354,7 @@ func (s *Store) pruneSeatLogs(ctx context.Context, tx *sql.Tx, now time.Time) (i
 	cutoff := now.Add(-s.computerTakeoverAuditRetentionAge).UnixNano()
 	result, err := tx.ExecContext(ctx, `DELETE FROM seat_logs WHERE seat_id IN (
  SELECT seat_id FROM seat_logs WHERE ever_live=1 AND ended_ns<=?
- UNION ALL SELECT seat_id FROM seat_logs WHERE ever_live=0 AND created_ns<=?
+ UNION ALL SELECT seat_id FROM seat_logs WHERE ever_live=0 AND created_ns<=? AND (ended_ns IS NOT NULL OR NOT EXISTS(SELECT 1 FROM seat_request_calls c WHERE c.seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM seat_approvals a WHERE a.seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM computer_seat_identities i WHERE i.seat_id=seat_logs.seat_id))
  )`, cutoff, cutoff)
 	if err != nil {
 		return 0, internalError(err, "prune Seat log retention")
