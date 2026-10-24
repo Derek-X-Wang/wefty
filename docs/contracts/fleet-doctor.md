@@ -51,8 +51,10 @@ attended unlock after a cold boot, before per-user services start. Unknown or fa
 output never means FileVault is off. These checks do not prove remote login or
 reboot recovery; that remains attended acceptance. Sleep, FileVault and unverified
 host warnings are advisory: they retain their warning severity and fix advice,
-but do not change `healthy` or the exit code. Other findings retain their
-existing severity and effect.
+but do not change `healthy` or the exit code. A missing optional tool (`go`,
+`node`, `gh`, `claude` or `codex`) on the recorded PATH is advisory in the same
+way, so a machine that runs only scripts or OCI work can be healthy. Missing
+`git` stays an error. Other findings retain their existing severity and effect.
 
 ## Report and exits
 
