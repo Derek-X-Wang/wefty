@@ -137,6 +137,7 @@ type Config struct {
 	Logf  func(string, ...any)
 	Clock Clock
 
+	ComputerRoom         *l1.ComputerRoomConfig
 	SeatApprovalSettings SeatApprovalSettings
 	SeatApprovalDialog   SeatApprovalDialog
 }
@@ -144,6 +145,7 @@ type Config struct {
 // Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
 	seatApprovals *SeatApprovalController
+	seatRoom      *l1.ComputerRoomConfig
 	fabric        fabric.Fabric
 	runLedgerAddr string
 	// controlPlaneAddr is the same L1 address the agent's own client dials. The
@@ -241,6 +243,14 @@ func New(config Config) (*Agent, error) {
 	client, err := newClient(config.Fabric, config.ControlPlaneAddress, operationTimeout)
 	if err != nil {
 		return nil, err
+	}
+	if config.ComputerRoom != nil {
+		if err := config.ComputerRoom.Validate(); err != nil {
+			client.Close()
+			return nil, err
+		}
+		room := *config.ComputerRoom
+		config.ComputerRoom = &room
 	}
 	seatApprovals, err := NewSeatApprovalController(client, config.NodeID, config.BootSessionID, config.SeatApprovalSettings, config.SeatApprovalDialog, clock)
 	if err != nil {
@@ -547,6 +557,7 @@ func New(config Config) (*Agent, error) {
 	return &Agent{
 		fabric: config.Fabric, runLedgerAddr: stringOrDefault(config.RunLedgerAddress, "wefty://run-ledger"),
 		seatApprovals:    seatApprovals,
+		seatRoom:         config.ComputerRoom,
 		controlPlaneAddr: config.ControlPlaneAddress,
 		registration:     registration, renewalInterval: durationOrDefault(config.RenewalInterval, DefaultRenewalInterval),
 		finalizationTimeout: durationOrDefault(config.FinalizationTimeout, DefaultFinalizationTimeout),
@@ -646,6 +657,10 @@ func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
+	seatCtx, seatCancel := context.WithCancel(ctx)
+	seatDone := make(chan struct{})
+	go func() { defer close(seatDone); a.runSeatRequests(seatCtx) }()
+	defer func() { seatCancel(); <-seatDone }()
 	a.startHostTokenRevocation(ctx)
 	defer a.stopHostTokenRevocation()
 	if a.handoffs != nil {

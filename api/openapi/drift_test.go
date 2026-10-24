@@ -81,6 +81,13 @@ const (
 )
 
 var driftRows = []driftRow{
+	{requestBody(clientDoc, "post", "/v1/seat-requests"), typeOf[l1.SeatCallInput]()},
+	{responseBody(clientDoc, "post", "/v1/seat-requests", "200"), typeOf[l1.SeatCallResult]()},
+	{responseBody(clientDoc, "get", "/v1/seat-requests/{seat_id}", "200"), typeOf[l1.SeatCallResult]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/poll"), typeOf[l1.SeatCallPoll]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/poll", "200"), typeOf[l1.SeatCallList]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/advance"), typeOf[l1.SeatCallPoll]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/advance", "200"), typeOf[l1.SeatRequest]()},
 	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/read"), typeOf[l1.SeatNodeRequest]()},
 	{responseBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/read", "200"), typeOf[l1.SeatRequest]()},
 	{requestBody(agentDoc, "post", "/v1/agent/seat-requests/{seat_id}/reserve-room"), typeOf[l1.SeatRoomReservationRequest]()},

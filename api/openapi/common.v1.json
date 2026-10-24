@@ -7,6 +7,175 @@
   "paths": {},
   "components": {
     "schemas": {
+      "SeatCallInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "seat_id",
+          "node_id",
+          "harness",
+          "folder",
+          "form",
+          "network",
+          "window_hours"
+        ],
+        "properties": {
+          "seat_id": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          },
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "harness": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Self-reported harness label, not verified."
+          },
+          "folder": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "form": {
+            "type": "string",
+            "enum": [
+              "any",
+              "dedicated"
+            ]
+          },
+          "network": {
+            "type": "string",
+            "enum": [
+              "internet",
+              "none"
+            ],
+            "description": "internet means with internet; none means without internet."
+          },
+          "window_hours": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              8,
+              24
+            ],
+            "description": "Zero asks for one Seat; a nonzero value explicitly requests a new approval window."
+          }
+        }
+      },
+      "SeatCallResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "seat_id",
+          "state",
+          "reason",
+          "computer_id",
+          "place",
+          "deadline",
+          "cleanup_complete",
+          "target_memory_bytes",
+          "room_revision",
+          "cleanup_pending"
+        ],
+        "properties": {
+          "seat_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "requested",
+              "approved",
+              "starting",
+              "live",
+              "ending",
+              "ended",
+              "refused"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "computer_id": {
+            "type": "string"
+          },
+          "place": {
+            "type": "integer"
+          },
+          "deadline": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "cleanup_complete": {
+            "type": "boolean"
+          },
+          "target_memory_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "room_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "cleanup_pending": {
+            "type": "boolean",
+            "description": "Seat cleanup is unconfirmed, or a failed new Computer with no accepted ready Seat still awaits verified removal."
+          },
+          "credential": {
+            "type": "string",
+            "description": "L1-minted Seat credential, returned only to the original caller while live. Store privately; never print."
+          }
+        }
+      },
+      "SeatCallPoll": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "boot_session_id",
+          "room",
+          "host_enabled",
+          "answer_wait"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "boot_session_id": {
+            "type": "string"
+          },
+          "room": {
+            "$ref": "#/components/schemas/ComputerRoomConfig"
+          },
+          "host_enabled": {
+            "type": "boolean"
+          },
+          "answer_wait": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "maximum": 3600000000000
+          }
+        }
+      },
+      "SeatCallList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "requests"
+        ],
+        "properties": {
+          "requests": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SeatCallInput"
+            }
+          }
+        }
+      },
       "ComputerSeatRecovery": {
         "type": "object",
         "additionalProperties": false,

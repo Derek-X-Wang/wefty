@@ -400,6 +400,8 @@ type attemptCredentialContextKey struct{}
 
 func (s *Server) routes() http.Handler {
 	client := http.NewServeMux()
+	client.HandleFunc("POST /v1/seat-requests", s.createSeatCall)
+	client.HandleFunc("GET /v1/seat-requests/{seat_id}", s.getSeatCall)
 	client.HandleFunc("GET /v1/seat-approval-windows", s.listSeatApprovalWindows)
 	client.HandleFunc("POST /v1/seat-approval-windows/close", s.closeSeatApprovalWindows)
 	client.HandleFunc("POST /v1/jobs", s.createJob)
@@ -451,6 +453,8 @@ func (s *Server) routes() http.Handler {
 	client.HandleFunc("POST /v1/nodes/{node_id}/restartable-attempts/{attempt_id}/interrupt", s.interruptRestartableAttempt)
 
 	agent := http.NewServeMux()
+	agent.HandleFunc("POST /v1/agent/seat-requests/poll", s.pollSeatCalls)
+	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/advance", s.advanceSeatCall)
 	agent.HandleFunc("POST /v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-list", s.computerSeatList)
 	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/read", s.readSeatRequest)
 	agent.HandleFunc("POST /v1/agent/seat-requests/{seat_id}/reserve-room", s.reserveSeatRoom)
@@ -526,6 +530,8 @@ func (s *Server) routes() http.Handler {
 	credential.HandleFunc("/", s.attemptCredentialOutOfScope)
 
 	root := http.NewServeMux()
+	root.Handle("/v1/seat-requests", s.authorize(clientPrincipal, client))
+	root.Handle("/v1/seat-requests/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/seat-approval-windows", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/seat-approval-windows/", s.authorize(clientPrincipal, client))
 	root.Handle("GET /v1/peer-health", s.authorize(clientPrincipal, http.HandlerFunc(s.getPeerHealth)))

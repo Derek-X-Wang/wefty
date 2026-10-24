@@ -196,7 +196,7 @@ func classifyCommandReport(err error) commandReport {
 		report.exitCode = exitUnauthorized
 	case contract.ErrorNotFound, contract.ErrorAttemptNotFound, contract.ErrorTakeoverSessionEnded:
 		report.exitCode = exitNotFound
-	case contract.ErrorCancelService, contract.ErrorCancelNotQueued, contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
+	case seatErrorRoomFull, seatErrorNoAnswer, seatErrorDenied, seatErrorDedicatedCap, seatErrorHostOff, seatErrorStartFailed, contract.ErrorCancelService, contract.ErrorCancelNotQueued, contract.ErrorConflict, contract.ErrorStalePolicyRevision, contract.ErrorStaleIntentRevision,
 		contract.ErrorStorageReferenceConflict, contract.ErrorIdempotencyConflict, contract.ErrorDispatchKeyConflict,
 		contract.ErrorInstanceKeyConflict, contract.ErrorInstanceKeyNotSupported, contract.ErrorFinalAdmin,
 		contract.ErrorCapacityExhausted, contract.ErrorComputerResourceRequired, contract.ErrorComputerTraitRequired,

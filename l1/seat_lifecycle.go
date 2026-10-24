@@ -59,6 +59,8 @@ type SeatEndRequest struct {
 	BootSessionID string `json:"boot_session_id"`
 	Reason        string `json:"reason"`
 	Refused       bool   `json:"refused"`
+	// The request controller cannot end a Seat that already reached Live.
+	pendingOnly bool
 }
 
 const seatRoomSchema = `
@@ -177,11 +179,20 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 		return SeatRequest{}, err
 	}
 	defer write.rollback()
-	q := write.tx
+	value, err := s.reserveSeatRoomTx(ctx, write.tx, write.at, identity, id, request)
+	if err != nil {
+		return value, err
+	}
+	return value, write.commit()
+}
+
+// Creation and first room admission share one transaction: a losing request
+// never publishes a runnable Computer, a Storage generation, or a new charge.
+func (s *Store) reserveSeatRoomTx(ctx context.Context, q *sql.Tx, at time.Time, identity, id string, request SeatRoomReservationRequest) (SeatRequest, error) {
 	if err := authorizeSeatRequest(ctx, q, identity, id, request.NodeID, request.BootSessionID); err != nil {
 		return SeatRequest{}, err
 	}
-	if err := expireSeatApproval(ctx, q, id, write.at); err != nil {
+	if err := expireSeatApproval(ctx, q, id, at); err != nil {
 		return SeatRequest{}, err
 	}
 	value, err := readSeatRequest(ctx, q, id)
@@ -195,13 +206,13 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 		if reservedComputer != request.ComputerID || value.Place != request.Place || reservedMemory != request.Room.SeatMemoryBytes {
 			return value, protocolError(contract.ErrorConflict, "Seat reservation ID has different input")
 		}
-		return value, write.commit()
+		return value, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return value, err
 	}
 	if value.State == SeatRefused {
-		return value, write.commit()
+		return value, nil
 	}
 	if value.State != SeatApproved {
 		return value, protocolError(contract.ErrorConflict, "Seat request is not approved")
@@ -280,7 +291,7 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 		if err != nil {
 			return value, err
 		}
-		return value, write.commit()
+		return value, nil
 	}
 	list, err := readComputerSeatList(ctx, q, request.ComputerID)
 	if err != nil {
@@ -314,7 +325,7 @@ func (s *Store) ReserveSeatRoom(ctx context.Context, identity, id string, reques
 	if err != nil {
 		return value, err
 	}
-	return value, write.commit()
+	return value, nil
 }
 
 func readSeatRoomUsage(ctx context.Context, q queryer, node string) ([]ComputerRoomUsage, error) {
@@ -485,6 +496,9 @@ func (s *Store) EndSeatRequest(ctx context.Context, identity, id string, request
 	if err != nil {
 		return value, err
 	}
+	if request.pendingOnly && (value.State == SeatLive || value.State == SeatEnding || value.State == SeatEnded) {
+		return value, write.commit()
+	}
 	if value.State != SeatEnded && value.State != SeatRefused && value.State != SeatEnding {
 		state := SeatEnding
 		if request.Refused || value.State == SeatRequested || value.State == SeatApproved || value.State == SeatStarting {
@@ -525,6 +539,12 @@ func applySeatLifecycleObservation(ctx context.Context, q seatApprovalQuery, now
 					return err
 				}
 				return removeLifecycleSeat(ctx, q, value)
+			}
+			// This positive receipt commits with Live, including when the CLI
+			// never receives its answer. Later Seat failure cannot turn an
+			// existing Computer back into a failed new start.
+			if _, err := q.ExecContext(ctx, `UPDATE seat_request_calls SET start_finished=1 WHERE seat_id=?`, seat.SeatID); err != nil {
+				return err
 			}
 			return setSeatLifecycle(ctx, q, seat.SeatID, SeatLive, "")
 		}
