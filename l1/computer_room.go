@@ -83,7 +83,7 @@ func (config ComputerRoomConfig) Check(usage []ComputerRoomUsage, dedicated bool
 				return ComputerRoomSnapshot{}, errors.New("Computer Seat memory charge overflows")
 			}
 			charge = max(charge, int64(computer.Seats)*config.SeatMemoryBytes)
-			if computer.SeatLimit == 1 && computer.Running {
+			if computer.SeatLimit == 1 && (computer.Running || computer.Seats > 0) {
 				snapshot.RunningDedicated++
 			}
 		}
@@ -98,7 +98,7 @@ func (config ComputerRoomConfig) Check(usage []ComputerRoomUsage, dedicated bool
 		return snapshot, ErrComputerRoomFull
 	}
 	if dedicated && snapshot.RunningDedicated >= config.DedicatedCap {
-		return snapshot, fmt.Errorf("%w: %d running, limit %d", ErrDedicatedComputerCap,
+		return snapshot, fmt.Errorf("%w: %d running or reserved, limit %d", ErrDedicatedComputerCap,
 			snapshot.RunningDedicated, config.DedicatedCap)
 	}
 	return snapshot, nil

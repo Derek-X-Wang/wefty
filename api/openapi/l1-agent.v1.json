@@ -8,11 +8,403 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-attempt-absence": {
+      "parameters": [
+        {
+          "name": "computer_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "attempt_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "reportComputerSeatAttemptAbsence",
+        "summary": "Record exact retired Computer Attempt absence",
+        "description": "Current node authority reports positive absence of the immutable earlier Attempt identity retained by L1. This grants cleanup binding recovery only; fresh per-Seat cleanup and memory readback remain required before room returns.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/ComputerSeatAttemptAbsenceReport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable Seat lifecycle receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/ComputerSeatObservationReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/agent/seat-requests/{seat_id}/read": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "readSeatRequest",
+        "summary": "readSeatRequest",
+        "description": "Read one durable Seat request under the current node identity and boot session.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatNodeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable Seat lifecycle receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatRequest"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/agent/seat-requests/{seat_id}/reserve-room": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "reserveSeatRoom",
+        "summary": "reserveSeatRoom",
+        "description": "Atomically reserve room after approval. A losing request is durably refused. The reservation uses the request ID as its Seat ID and binds one Computer and place. target_memory_bytes is the true total target for the Computer before publishing the Seat.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatRoomReservationRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable Seat lifecycle receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatRequest"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/agent/seat-requests/{seat_id}/start": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "startSeatRequest",
+        "summary": "startSeatRequest",
+        "description": "Publish a starting Seat after its grow. The request flow supplies a positive remaining duration in nanoseconds. L1 sets the deadline once on its own clock; retries must retain the duration and cannot extend the deadline. The helper separately enforces its per-Seat 60-second readiness deadline from directive publication.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatStartRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable Seat lifecycle receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatRequest"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/agent/seat-requests/{seat_id}/end": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "endSeatRequest",
+        "summary": "endSeatRequest",
+        "description": "Revoke wanted membership immediately and retain room until positive cleanup and effective memory readback. Ended and refused requests are final.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatEndRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable Seat lifecycle receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatRequest"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-room-memory": {
+      "parameters": [
+        {
+          "name": "computer_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "attempt_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "reportComputerRoomMemory",
+        "summary": "reportComputerRoomMemory",
+        "description": "Record the helper effective memory readback under exact live Attempt authority. A stale room_revision or a target below uncleaned reservations is refused; cleanup alone does not return room. The caller must report the true final target, actual memory limit and held memory from the helper.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatRoomMemoryReport"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Durable Seat lifecycle receipt.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatRoomMemoryReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
     "/v1/agent/computers/{computer_id}/jobs/{job_id}/attempts/{attempt_id}/seat-list": {
       "post": {
         "operationId": "computerSeatList",
         "summary": "Read the wanted Seat list for an exact live Computer attempt",
-        "description": "Node agent principal only. Checks authenticated node identity, node ID, current registration and boot session, current Computer Job and Attempt, fence, live phase and lease. The list contains only wanted Seats; IDs are never reused. The first list delivery or accepted report binds an ID to its first Attempt. A later Attempt removes earlier-bound wanted memberships and advances the list revision once; it never receives those IDs. Unchanged list reads do not write. Reports carry the current wanted revision, a positive helper generation and a rising report sequence; exact retries are idempotent. Observations do not advance durable Seat states or return Room. A changed list returns 409 with details.reason=seat_list_revision_changed on reports. Ready may regress to starting after another place changes.",
+        "description": "Read the wanted Seat list under exact live Attempt authority. Lifecycle-managed lists carry only starting and live Seats. A read reconciles expired readiness deadlines and excludes Seats bound to an earlier Attempt. Seat IDs are permanent tombstones.",
         "parameters": [
           {
             "name": "computer_id",
@@ -85,7 +477,7 @@
       "post": {
         "operationId": "computerSeatObservations",
         "summary": "Retain per-Seat helper observations for an exact live Computer attempt",
-        "description": "Node agent principal only. Checks authenticated node identity, node ID, current registration and boot session, current Computer Job and Attempt, fence, live phase and lease. The list contains only wanted Seats; IDs are never reused. The first list delivery or accepted report binds an ID to its first Attempt. A later Attempt removes earlier-bound wanted memberships and advances the list revision once; it never receives those IDs. Unchanged list reads do not write. Reports carry the current wanted revision, a positive helper generation and a rising report sequence; exact retries are idempotent. Observations do not advance durable Seat states or return Room. A changed list returns 409 with details.reason=seat_list_revision_changed on reports. Ready may regress to starting after another place changes.",
+        "description": "Retain helper observations under exact live Attempt authority and the current wanted revision. For lifecycle-managed Seats, ready advances starting to live only before the deadline; failed refuses and removes the Seat; cleaned with cleanup_complete:true records cleanup and ends an ending Seat. Effective memory readback is separately required before room returns.",
         "parameters": [
           {
             "name": "computer_id",
@@ -1164,8 +1556,9 @@
                   "idempotency_key": { "type": "string", "minLength": 1 },
                   "result": { "$ref": "./common.v1.json#/components/schemas/ProcessResult" },
                   "runtime_quiescence_evidence": {
+                    "description": "Computer Seat room release requires computer_attempt_absent from exact process/cgroup absence. Ordinary attempt, no-runtime and sweep evidence may settle completion while retaining Seat room.",
                     "type": "string",
-                    "enum": ["attempt", "no_runtime_resources", "oci_sweep", "prior_boot_guardian", "prior_boot_oci_sweep"]
+                    "enum": ["attempt", "no_runtime_resources", "oci_sweep", "prior_boot_guardian", "prior_boot_oci_sweep", "computer_attempt_absent"]
                   },
                   "protocol_output_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
                   "termination_initiator": {

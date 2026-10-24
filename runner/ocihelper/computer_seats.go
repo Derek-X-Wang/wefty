@@ -30,6 +30,7 @@ const (
 	SeatRefusalCleanupNotConfirmed SeatOperationRefusalReason = "cleanup_not_confirmed"
 	SeatRefusalGenerationMismatch  SeatOperationRefusalReason = "generation_mismatch"
 	SeatRefusalAttemptNotLive      SeatOperationRefusalReason = "attempt_not_live"
+	SeatRefusalAttemptOverlap      SeatOperationRefusalReason = "attempt_overlap"
 	SeatRefusalTmpfsFloor          SeatOperationRefusalReason = "tmpfs_floor"
 	SeatRefusalMemoryCapacity      SeatOperationRefusalReason = "memory_capacity"
 	SeatRefusalMemoryGrowFailed    SeatOperationRefusalReason = "memory_grow_failed"
@@ -58,6 +59,8 @@ type ApplyComputerSeatsResponse struct {
 	Generation uint64 `json:"generation"`
 }
 type ObserveComputerSeatsRequest struct {
+	Discover   bool             `json:"discover,omitempty"`
+	Cleanup    []ComputerSeat   `json:"cleanup,omitempty"`
 	Authority  AttemptAuthority `json:"authority"`
 	Generation uint64           `json:"generation"`
 }
@@ -72,6 +75,21 @@ type ObserveComputerSeatsResponse struct {
 	Generation uint64                    `json:"generation"`
 	Seats      []ComputerSeatObservation `json:"seats"`
 }
+
+// Discovery reads only the serialized directive. Starting denotes wanted
+// membership here, never readiness, a probe result or cleanup evidence.
+func (s *computerSeats) discover() ObserveComputerSeatsResponse {
+	r := ObserveComputerSeatsResponse{Seats: []ComputerSeatObservation{}}
+	if s == nil {
+		return r
+	}
+	r.Generation = s.generation
+	for _, wanted := range s.wanted {
+		r.Seats = append(r.Seats, ComputerSeatObservation{Place: wanted.Place, State: "starting"})
+	}
+	return r
+}
+
 type ComputerSeatsEngine interface {
 	ApplyComputerSeats(context.Context, ApplyComputerSeatsRequest) (ApplyComputerSeatsResponse, error)
 	ObserveComputerSeats(context.Context, ObserveComputerSeatsRequest) (ObserveComputerSeatsResponse, error)
@@ -92,6 +110,7 @@ type computerSeatAnswer struct {
 	CleanupComplete bool   `json:"cleanup_complete"`
 }
 type computerSeatEntry struct {
+	recoveryCleanup  bool
 	incarnation      uint64
 	endpointPins     map[string]*os.File
 	pinOwner         *computerSeats
@@ -268,7 +287,7 @@ func (s *computerSeats) observe(ctx context.Context, generation uint64, read fun
 			if readErr == nil && decodeSeatDocument(payload, &failed) == nil && failed.Version == 1 && failed.Generation == generation && failed.Place == place && failed.State == "failed" && failed.Reason != "" {
 				observation.State, observation.Reason = "failed", failed.Reason
 			}
-			if s.removalProven(place, generation, read) {
+			if entry.recoveryCleanup || s.removalProven(place, generation, read) {
 				if err := cleanup(entry.config); err == nil {
 					entry.cleaned = true
 				} else {
@@ -357,4 +376,23 @@ func (s *computerSeats) removalProven(place int, generation uint64, read func(st
 	}
 	var answer computerSeatAnswer
 	return err == nil && decodeSeatDocument(payload, &answer) == nil && answer.Version == 1 && answer.Generation > 0 && answer.Generation <= generation && answer.Place == place && answer.State == "removed" && answer.Reason == "" && answer.CleanupComplete
+}
+
+// recoverCleanup registers only an omitted place for host-verified absence.
+// It publishes no wanted directive and never starts image code for that place.
+func (s *computerSeats) recoverCleanup(cleanup []ComputerSeat) error {
+	if err := validateComputerSeats(cleanup); err != nil {
+		return err
+	}
+	for _, seat := range cleanup {
+		if old := s.entries[seat.Place]; old != nil && (old.wanted || old.config != seat) {
+			return &SeatOperationRefusalError{Reason: SeatRefusalCleanupNotConfirmed}
+		}
+	}
+	for _, seat := range cleanup {
+		if s.entries[seat.Place] == nil {
+			s.entries[seat.Place] = &computerSeatEntry{config: seat, recoveryCleanup: true}
+		}
+	}
+	return nil
 }

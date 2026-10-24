@@ -54,7 +54,7 @@ func TestHelperComputerNetworkNoneAP1AP2AP3(t *testing.T) {
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			observed, err = engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{authority, applied.Generation})
+			observed, err = engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{Authority: authority, Generation: applied.Generation})
 			if err == nil && len(observed.Seats) == 1 && observed.Seats[0].State == "ready" && len(observed.Seats[0].Endpoints) == 2 {
 				break
 			}
@@ -203,7 +203,7 @@ print(json.dumps({'loopback':True,'outbound_tcp_refused':True,'outbound_udp_dns_
 `)
 		// Repeat real endpoint probes after the network refusals. Missing internet
 		// must neither revoke readiness nor kill the Computer's task.
-		health, err := engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{authority, applied.Generation})
+		health, err := engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{Authority: authority, Generation: applied.Generation})
 		must(err)
 		if len(health.Seats) != 1 || health.Seats[0].State != "ready" || health.Seats[0].Reason != "" {
 			t.Fatalf("missing internet reported as a fault: %+v", health)

@@ -39,7 +39,7 @@ func TestComputerSeatSlowProbeDoesNotBlockOwnerControlOrRuntimeRelease(t *testin
 			}
 			observed := make(chan outcome, 1)
 			go func() {
-				r, err := engine.observeComputerSeats(t.Context(), ObserveComputerSeatsRequest{authority, 1}, func(ctx context.Context, snapshot computerSeatAttemptSnapshot, request ObserveComputerSeatsRequest) (ObserveComputerSeatsResponse, error) {
+				r, err := engine.observeComputerSeats(t.Context(), ObserveComputerSeatsRequest{Authority: authority, Generation: 1}, func(ctx context.Context, snapshot computerSeatAttemptSnapshot, request ObserveComputerSeatsRequest) (ObserveComputerSeatsResponse, error) {
 					first := true
 					return snapshot.seats.observe(ctx, request.Generation, func(string) ([]byte, error) {
 						return []byte(`{"version":1,"generation":1,"place":1,"state":"ready","reason":"","cleanup_complete":false}`), nil

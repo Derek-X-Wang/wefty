@@ -1588,6 +1588,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			var storageRetired *computerStorageRetiredError
 			var storageDeferred *ComputerStorageResumeDeferredError
 			var storageQuarantined *ComputerStorageQuarantinedError
+			var seatRefusal *SeatOperationRefusalError
 			// A failed Run whose attempt the helper positively reaped while its
 			// session stayed live is bounded by that attempt. Saying so on the
 			// wire is what keeps a table of negative Run probes from reading as
@@ -1598,6 +1599,12 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			attemptScoped := session.attemptPositivelyReaped(attempt)
 			if errors.As(err, &rpcErr) {
 				_ = writeRPCError(wire, withAttemptScopedRunFailure(rpcErr, attemptScoped))
+			} else if errors.As(err, &seatRefusal) {
+				if reapErr == nil {
+					_ = writeSeatOperationFailure(wire, err)
+				} else {
+					_ = writeFailure(wire, CodeSessionStale, "Computer memory admission refusal could not verify runtime absence")
+				}
 			} else if errors.Is(err, errComputerStorageAttachmentOwned) {
 				if reapErr == nil {
 					// A live owner refusing a second Computer attachment is an
@@ -1729,8 +1736,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				return
 			}
 			authority = observe.Authority
-			if observe.Generation == 0 {
-				_ = writeFailure(wire, CodeInvalidRequest, "Seat generation must be positive")
+			if observe.Discover && (observe.Generation != 0 || len(observe.Cleanup) != 0) || !observe.Discover && observe.Generation == 0 || validateComputerSeats(observe.Cleanup) != nil {
+				_ = writeFailure(wire, CodeInvalidRequest, "Seat observation requires a positive generation or an empty discovery request")
 				return
 			}
 		}

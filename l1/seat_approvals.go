@@ -102,6 +102,9 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 	if err := requireSeatApprovalNode(ctx, q, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return SeatApproval{}, err
 	}
+	if err := expireSeatApproval(ctx, q, request.SeatID, write.at); err != nil {
+		return SeatApproval{}, err
+	}
 	existing, err := readSeatApproval(ctx, q, request.SeatID)
 	if err == nil {
 		if existing.Request != request {
@@ -149,6 +152,9 @@ func (s *Store) AnswerSeatApproval(ctx context.Context, identityNodeID, seatID s
 	defer write.rollback()
 	q := seatApprovalQuery(write.tx)
 	if err := requireSeatApprovalNode(ctx, q, identityNodeID, answer.NodeID, answer.BootSessionID); err != nil {
+		return SeatApproval{}, err
+	}
+	if err := expireSeatApproval(ctx, q, seatID, write.at); err != nil {
 		return SeatApproval{}, err
 	}
 	value, err := readSeatApproval(ctx, q, seatID)
@@ -206,7 +212,7 @@ func readSeatApproval(ctx context.Context, q queryer, id string) (SeatApproval, 
 	var value SeatApproval
 	var request []byte
 	var deadline int64
-	err := q.QueryRowContext(ctx, `SELECT request_json,state,reason,source,deadline_ns FROM seat_approvals WHERE seat_id=?`, id).Scan(&request, &value.State, &value.Reason, &value.Source, &deadline)
+	err := q.QueryRowContext(ctx, `SELECT request_json,CASE WHEN lifecycle_state IN ('ending','ended','refused') THEN 'refused' ELSE state END,CASE WHEN lifecycle_state IN ('ending','ended','refused') THEN lifecycle_reason ELSE reason END,source,deadline_ns FROM seat_approvals WHERE seat_id=?`, id).Scan(&request, &value.State, &value.Reason, &value.Source, &deadline)
 	if err != nil {
 		return value, err
 	}

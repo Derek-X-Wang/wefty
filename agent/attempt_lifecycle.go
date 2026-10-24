@@ -1212,8 +1212,9 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 	request := workloadrunner.Request{
 		Authority: authority, RuntimeHandler: claim.Job.Spec.RuntimeHandler,
 		Execution: claim.Job.Spec.Execution, Limits: claim.Job.Spec.Limits,
-		ManagedVolumes: runtimeManagedVolumes(claim, lifecycle.executionOwnerKey(claim.Job.Spec)),
-		IdlePolicy:     idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
+		ManagedVolumes:        runtimeManagedVolumes(claim, lifecycle.executionOwnerKey(claim.Job.Spec)),
+		MutableComputerMemory: claim.ComputerStorage != nil && claim.ComputerStorage.SeatRequestMade,
+		IdlePolicy:            idlePolicy, InitialDeadman: claim.Lease.LeaseTTL,
 	}
 	if contract.IsComputerExecution(request.Execution) {
 		request.ComputerNetwork = ocihelper.ComputerNetworkInternet

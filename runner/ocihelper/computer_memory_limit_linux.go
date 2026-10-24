@@ -65,8 +65,8 @@ func (engine *ContainerdEngine) SetComputerMemoryLimit(ctx context.Context, requ
 	if reservation == nil {
 		return SetComputerMemoryLimitResponse{}, errors.New("Computer memory reservation is unavailable")
 	}
-	if _, ok := reservation.attempts[request.Authority.key()]; !ok {
-		return SetComputerMemoryLimitResponse{}, &SeatOperationRefusalError{Reason: SeatRefusalAttemptNotLive}
+	if err := reservation.claimMutableMemory(request.Authority.key()); err != nil {
+		return SetComputerMemoryLimitResponse{}, err
 	}
 	available, err := engine.availableComputerMemoryLocked()
 	if err != nil {

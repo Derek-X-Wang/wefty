@@ -129,7 +129,7 @@ func TestSeatExecProtocolAuthorityReadinessAndOutput(t *testing.T) {
 	if err := session.ExecComputerSeat(t.Context(), req, func(SeatCommandEvent) error { return sentinel }); !errors.Is(err, sentinel) {
 		t.Fatal(err)
 	}
-	if _, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{authority, 1}); err != nil {
+	if _, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{Authority: authority, Generation: 1}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -159,7 +159,7 @@ func TestSeatExecClientDisconnectCancelsOnlyCommand(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("disconnected command was not cancelled")
 	}
-	if _, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{authority, 1}); err != nil {
+	if _, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{Authority: authority, Generation: 1}); err != nil {
 		t.Fatal(err)
 	}
 }

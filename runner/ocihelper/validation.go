@@ -43,6 +43,9 @@ func validateWorkloadWire(input WorkloadInput) error {
 	if err := validateComputerNetwork(input); err != nil {
 		return err
 	}
+	if input.MutableComputerMemory && !input.Computer {
+		return errors.New("mutable Computer memory requires a Computer workload")
+	}
 	if !digestPattern.MatchString(input.ImageDigest) {
 		return errors.New("workload image must be an immutable sha256 digest")
 	}

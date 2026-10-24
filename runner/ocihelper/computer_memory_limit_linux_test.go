@@ -74,6 +74,9 @@ func TestComputerMemoryLimitChangesRealAdmissionReservation(t *testing.T) {
 	if reservation.tmpfsCeilingBytes != profileReceipt(request("resident").Workload).ComputerTmpfsCeilingBytes {
 		t.Fatal("creation-time tmpfs floor was not retained")
 	}
+	if err := reservation.claimMutableMemory(request("resident").Authority.key()); err != nil {
+		t.Fatal(err)
+	}
 	seats, runtime, _, clock := memoryLimitFixture(t)
 	runtime.reserved = &reservation.memoryBytes
 	available, err := engine.availableComputerMemoryLocked()
@@ -86,16 +89,29 @@ func TestComputerMemoryLimitChangesRealAdmissionReservation(t *testing.T) {
 	}
 	restart := request("resident")
 	restart.Authority.AttemptID = "next-attempt"
-	restart.Workload.Limits.MemoryBytes = 2 << 30
-	if _, err := engine.admitResources(restart); err != nil {
-		t.Fatal(err)
-	}
-	if reservation.tmpfsCeilingBytes != profileReceipt(restart.Workload).ComputerTmpfsCeilingBytes {
-		t.Fatal("new attempt's creation-time scratch ceiling was lost")
+	// Neither the original nor the grown declaration may overlap the exact
+	// cgroup that owns the mutable reservation.
+	for _, size := range []int64{1 << 30, 2 << 30} {
+		restart.Workload.Limits.MemoryBytes = size
+		var refusal *SeatOperationRefusalError
+		if _, err := engine.admitResources(restart); !errors.As(err, &refusal) || refusal.Reason != SeatRefusalAttemptOverlap {
+			t.Fatalf("overlap size=%d: %v", size, err)
+		}
 	}
 	receipt, err := engine.admitResources(request("newcomer"))
 	var insufficient *insufficientMemoryError
 	if !errors.As(err, &insufficient) || receipt.MemoryCommittedBeforeBytes != 3<<30 || insufficient.ObservedAvailableBytes != 0 {
 		t.Fatalf("newcomer did not see the live reservation: %+v %v", receipt, err)
+	}
+	// Production calls this only after verified Attempt cleanup (or rollback
+	// before runtime creation). The replacement gets its original declaration.
+	engine.releaseCapacityReservation(request("resident").Authority.key())
+	restart.Workload.Limits.MemoryBytes = 1 << 30
+	if _, err := engine.admitResources(restart); err != nil {
+		t.Fatal(err)
+	}
+	replacement := engine.capacityReservations["resident"]
+	if replacement.memoryBytes != 1<<30 || replacement.memoryOwner != "" || replacement.tmpfsCeilingBytes != profileReceipt(restart.Workload).ComputerTmpfsCeilingBytes {
+		t.Fatalf("replacement inherited grown reservation: %+v", replacement)
 	}
 }

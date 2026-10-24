@@ -174,6 +174,13 @@ func computerAttemptsHoldingAuthority(ctx context.Context, q queryer, jobID stri
 // mutation owes inside that mutation's own transaction, so the mutation
 // cannot commit without it.
 func recordOwedComputerRevocation(ctx context.Context, tx *sql.Tx, record owedRevocationRecord, now time.Time) (int64, error) {
+	reason := record.reason
+	if record.verb == ComputerRevocationVerbAttemptCompletion {
+		reason = "the Computer restarted"
+	}
+	if err := endComputerSeats(ctx, tx, record.computerID, record.attemptID, reason); err != nil {
+		return 0, err
+	}
 	scope := ComputerRevocationScopeRevokeAll
 	recorded := record.holdingAttempts
 	if record.attemptID != "" {

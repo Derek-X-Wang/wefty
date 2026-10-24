@@ -434,6 +434,8 @@ func boundarySelectors(fset *token.FileSet, node ast.Node, site string, info *ty
 // reads, including acknowledgement reloads and live authority proofs. Set
 // equality refuses both new owners and vanished type-check results.
 var agentProtocolReadSites = map[string]bool{
+	// Node-only lifecycle read; identity and current boot are checked in the snapshot.
+	"seat_lifecycle_routes.go:*Store.GetSeatRequestForNode":  true,
 	"server.go:*Server.revokeAfterAuthorityLoss":             true,
 	"owed_revocations.go:*Store.owedComputerRevocation":      true,
 	"server.go:*Server.proveServiceBinding":                  true,

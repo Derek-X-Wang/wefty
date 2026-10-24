@@ -17,16 +17,6 @@ type memoryFacts struct {
 	available int64
 }
 
-type capacityReservation struct {
-	tmpfsCeilingBytes           int64
-	memoryBytes                 int64
-	diskBytes                   int64
-	pendingDiskBytes            int64
-	pendingDiskAdmissionCeiling int64
-	diskMaterialized            bool
-	attempts                    map[string]struct{}
-}
-
 func readMemoryFacts(path string) (memoryFacts, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -207,6 +197,12 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 	additionalMemory, additionalDisk := requestedMemory, requestedDisk
 	diskAlreadyMaterialized := materializedComputerDisk(request.Workload, diskRoot)
 	if existing != nil {
+		if existing.mutableMemory != request.Workload.MutableComputerMemory {
+			return ResourceAdmissionReceipt{}, errors.New("bound Computer changed its memory policy")
+		}
+		if err := existing.checkReplacement(attemptKey); err != nil {
+			return ResourceAdmissionReceipt{}, err
+		}
 		if existing.memoryBytes != requestedMemory || existing.diskBytes != requestedDisk {
 			return ResourceAdmissionReceipt{}, errors.New("bound Computer changed its reserved resource declaration")
 		}
@@ -245,13 +241,14 @@ func (engine *ContainerdEngine) admitResources(request RunRequest) (ResourceAdmi
 	}
 	if existing == nil {
 		existing = &capacityReservation{
-			memoryBytes: requestedMemory, diskBytes: requestedDisk, tmpfsCeilingBytes: tmpfsCeiling,
+			mutableMemory: request.Workload.MutableComputerMemory,
+			memoryBytes:   requestedMemory, diskBytes: requestedDisk, tmpfsCeilingBytes: tmpfsCeiling,
 			diskMaterialized: diskAlreadyMaterialized, attempts: make(map[string]struct{}),
 		}
 		engine.capacityReservations[jobKey] = existing
 	}
-	// Overlapping admitted attempts can have different creation-time scratch
-	// ceilings after a live grow. Retain the largest ceiling until absence.
+	// Keep the creation-time scratch ceiling until verified Attempt absence.
+	// A live grow never raises the scratch mounts of this incarnation.
 	if tmpfsCeiling > existing.tmpfsCeilingBytes {
 		existing.tmpfsCeilingBytes = tmpfsCeiling
 	}

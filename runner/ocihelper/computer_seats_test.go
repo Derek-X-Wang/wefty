@@ -199,10 +199,10 @@ func TestComputerSeatProtocolRequiresExactLiveComputerAndGeneration(t *testing.T
 	if _, err := session.ApplyComputerSeats(t.Context(), apply); err == nil {
 		t.Fatal("wrong attempt accepted")
 	}
-	if _, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{authority, 99}); err == nil {
+	if _, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{Authority: authority, Generation: 99}); err == nil {
 		t.Fatal("stale generation accepted")
 	}
-	r, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{authority, 1})
+	r, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{Authority: authority, Generation: 1})
 	if err != nil || len(r.Seats) != 1 || r.Seats[0].State != "starting" {
 		t.Fatalf("observe = %+v %v", r, err)
 	}
@@ -432,12 +432,12 @@ func TestComputerSeatProtocolDistinguishesRefusalsFromReadFailure(t *testing.T) 
 	}
 	check(apply([]ComputerSeat{{1, "seat1", 7202, 7203}}), "seat_operation_refused", "cleanup_not_confirmed")
 	check(apply([]ComputerSeat{{2, "seat2", 7102, 7103}}), "seat_operation_refused", "cleanup_not_confirmed")
-	_, err = session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{authority, 1})
+	_, err = session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{Authority: authority, Generation: 1})
 	check(err, "seat_operation_refused", "generation_mismatch")
 	e.readFailureMu.Lock()
 	e.readFailure = errors.New("status read failed")
 	e.readFailureMu.Unlock()
-	_, err = session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{authority, 2})
+	_, err = session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{Authority: authority, Generation: 2})
 	check(err, CodeDiagnosticFailure, "")
 	if err := session.HealthError(); err != nil {
 		t.Fatalf("Seat refusal invalidated session: %v", err)

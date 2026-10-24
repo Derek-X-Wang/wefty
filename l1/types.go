@@ -604,7 +604,9 @@ type CompletionRequest struct {
 }
 
 // RuntimeQuiescenceEvidence names the positive runtime authority that proved
-// attempt resources absent before completion. An omitted value is not proof.
+// attempt quiescence before completion. Ordinary runtime classifications may
+// permit bounded retention; ComputerAttemptAbsent alone proves strict Computer
+// process/cgroup absence for Seat room release. An omitted value is not proof.
 type RuntimeQuiescenceEvidence string
 
 const (
@@ -613,6 +615,9 @@ const (
 	RuntimeQuiescenceOCISweep          RuntimeQuiescenceEvidence = "oci_sweep"
 	RuntimeQuiescencePriorBootGuardian RuntimeQuiescenceEvidence = "prior_boot_guardian"
 	RuntimeQuiescencePriorBootOCISweep RuntimeQuiescenceEvidence = "prior_boot_oci_sweep"
+
+	// Strict process/cgroup absence for this exact Computer Attempt.
+	RuntimeQuiescenceComputerAttemptAbsent RuntimeQuiescenceEvidence = "computer_attempt_absent"
 )
 
 // LateResultEvidence is the non-authoritative completion fact retained after
