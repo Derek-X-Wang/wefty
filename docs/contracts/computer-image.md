@@ -893,11 +893,15 @@ through folders owned by other uids, removes only entries owned by the ending
 Seat uid, and retains other uids' files and folders. An owned folder that still
 contains another uid's entries also stays, but the supervisor transfers it
 to `0:0` through its no-follow directory descriptor before that place's uid
-can be reused. It explicitly restores all mode bits with `fchmod` after
-`fchown`, including sticky and setid bits that a chown can clear. The sweep
-tries `rmdir` once; `ENOTEMPTY` means retain, without rescanning the folder.
-Owned symlinks are unlinked without touching their targets. Owned entries
-that disappear during cleanup are harmless; other cleanup errors produce
+can be reused. After `fchown`, it uses `fchmod` to restore ordinary permission
+bits and sticky, with `S_ISUID|S_ISGID` masked out. The sweep tries `rmdir`
+once; `ENOTEMPTY` or `EEXIST` means retain, without rescanning the folder.
+Owned symlinks are unlinked without touching their targets. In uid mode,
+every observed disappearance triggers a new full pass: initial entry stat,
+directory open, unlink, ascent stat, opening `..`, or `rmdir`. An entry that
+vanishes before its owner can be read also triggers a retry, because it could
+belong to the ending uid. No such pass publishes positive cleanup evidence;
+other cleanup errors produce
 `cleanup_failed` without positive `cleanup_complete` evidence. One sweep has a
 **30-second monotonic deadline**
 and a **200,000-entry enumeration budget**, shared across all scratch roots
@@ -909,12 +913,14 @@ bounded filesystem operations; they cannot preempt a blocked kernel call.
 If a folder owned by another uid changes type or identity during traversal,
 the supervisor drops that top-level subtree for the pass, finishes other
 entries and retries from all scratch roots, for at most **three passes**.
-Persistent changes raise `cleanup_path_replaced`. Changes to uid-owned paths
-still fail immediately with that token. Storage deletion (`uid=None`) keeps
+Persistent changes or disappearances raise `cleanup_path_replaced`. Observed
+identity or type replacements of uid-owned paths still fail immediately with
+that token. Storage deletion (`uid=None`) keeps
 its original fail-closed handling of vanished entries during unlink, directory
-open and ascent. A live foreign Seat can move a file into an already-visited
-folder without changing that folder's identity; the sweep can miss that file.
-This live-writer race cannot be eliminated by a filesystem walk.
+open and ascent. A live foreign Seat can still move a file before its source
+subtree is enumerated into an already-visited folder. Without an observed
+disappearance or identity change, the sweep can miss that file. This
+live-writer race cannot be eliminated by a filesystem walk.
 
 `/wefty/service/shared` is mode `1777` and survives. A new attempt has a fresh
 status tmpfs and control directory;

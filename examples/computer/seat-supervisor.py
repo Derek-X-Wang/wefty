@@ -202,7 +202,7 @@ def open_directory(path):
 
 
 class ScratchChanged(Exception):
-    """A foreign folder changed; retry from the scratch roots."""
+    """Scratch changed during traversal; retry from the scratch roots."""
 
 
 class ScratchBudget:
@@ -260,7 +260,7 @@ def remove_at(parent, name, uid=None, budget=None):
                 try:
                     upper = os.open("..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
                 except FileNotFoundError:
-                    if uid is not None and owner != uid:
+                    if uid is not None:
                         raise ScratchChanged() from None
                     raise
                 try:
@@ -272,27 +272,24 @@ def remove_at(parent, name, uid=None, budget=None):
                     except FileNotFoundError:
                         if uid is None:
                             raise
-                        if owner != uid:
-                            raise ScratchChanged() from None
-                        child = None
-                    if child is not None:
-                        if (child.st_dev, child.st_ino) != expected_child:
-                            replaced(owner)
-                        if uid is None:
+                        raise ScratchChanged() from None
+                    if (child.st_dev, child.st_ino) != expected_child:
+                        replaced(owner)
+                    if uid is None:
+                        os.rmdir(name, dir_fd=upper)
+                    elif child.st_uid == uid:
+                        try:
                             os.rmdir(name, dir_fd=upper)
-                        elif child.st_uid == uid:
-                            try:
-                                os.rmdir(name, dir_fd=upper)
-                            except FileNotFoundError:
-                                pass
-                            except OSError as error:
-                                if error.errno != errno.ENOTEMPTY:
-                                    raise
-                                # Do not leave this folder owned by a uid that
-                                # the next Seat at this place will reuse.
-                                mode = stat.S_IMODE(os.fstat(current).st_mode)
-                                os.fchown(current, 0, 0)
-                                os.fchmod(current, mode)  # chown can clear setid.
+                        except FileNotFoundError:
+                            raise ScratchChanged() from None
+                        except OSError as error:
+                            if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                                raise
+                            # The next Seat reuses this uid. Retain ordinary
+                            # permissions and sticky, never root-owned setid.
+                            mode = stat.S_IMODE(os.fstat(current).st_mode) & ~(stat.S_ISUID | stat.S_ISGID)
+                            os.fchown(current, 0, 0)
+                            os.fchmod(current, mode)
                 except BaseException:
                     os.close(upper)
                     raise
@@ -302,6 +299,10 @@ def remove_at(parent, name, uid=None, budget=None):
             try:
                 info = os.stat(name, dir_fd=current, follow_symlinks=False)
             except FileNotFoundError:
+                if uid is not None:
+                    # Ownership is unknown once it has vanished. It may have
+                    # moved into a folder this pass already visited.
+                    raise ScratchChanged() from None
                 continue
             if uid is not None and info.st_dev != current_info.st_dev:
                 continue  # A nested mount is outside this scratch filesystem.
@@ -312,6 +313,7 @@ def remove_at(parent, name, uid=None, budget=None):
                     except FileNotFoundError:
                         if uid is None:
                             raise
+                        raise ScratchChanged() from None
                 continue
             try:
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current)
@@ -319,9 +321,7 @@ def remove_at(parent, name, uid=None, budget=None):
                 if uid is None:
                     raise
                 if isinstance(error, FileNotFoundError):
-                    if info.st_uid != uid:
-                        raise ScratchChanged() from None
-                    continue
+                    raise ScratchChanged() from None
                 if error.errno in (errno.ENOTDIR, errno.ELOOP):
                     replaced(info.st_uid)
                 raise
@@ -340,6 +340,10 @@ def remove_at(parent, name, uid=None, budget=None):
                 raise
             os.close(current)
             current, current_info, entries = child, observed, children
+    except FileNotFoundError:
+        if uid is not None:
+            raise ScratchChanged() from None
+        raise
     finally:
         os.close(current)
 
@@ -516,8 +520,10 @@ def sweep_scratch(uid, clock=time.monotonic):
                         # Drop this top-level subtree's pinned descriptors;
                         # finish other entries before retrying from the roots.
                         changed = True
-                    except FileNotFoundError:
-                        pass
+            except FileNotFoundError:
+                # Even root enumeration may lose a folder. Never turn a
+                # disappearance into successful cleanup from this pass.
+                changed = True
             finally:
                 os.close(descriptor)
         budget.check()
