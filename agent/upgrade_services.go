@@ -238,12 +238,30 @@ func (a *Agent) ResumeUpgradeServiceClaims(ctx context.Context, operationID stri
 		return g.Role == l1.NodeGenerationPrimary && g.AgentGenerationID == s.registration.AgentGenerationID && g.BootSessionID == s.registration.BootSessionID
 	})
 	s.claimMu.Lock()
-	defer s.claimMu.Unlock()
 	if primary && !s.isRetiring() && operationID != "" && s.upgradeServiceOperation == "" && s.upgradeServiceResumed[operationID] {
+		s.claimMu.Unlock()
 		return nil
 	}
 	if !primary || s.isRetiring() || !s.upgradeServicesSettled || operationID == "" || s.upgradeServiceOperation != operationID {
+		s.claimMu.Unlock()
 		return upgradeControlConflict("agent: service admission resume lacks primary operation authority")
+	}
+	intent := s.upgradeServiceIntent
+	s.claimMu.Unlock()
+	node, err := s.heartbeat(ctx)
+	if err != nil {
+		return err
+	}
+	if node.NodeID == "" || node.AgentGenerationID == "" || node.BootSessionID == "" {
+		return errors.New("agent: malformed resume heartbeat reply")
+	}
+	if node.NodeID != s.registration.NodeID || node.AgentGenerationID != s.registration.AgentGenerationID || node.BootSessionID != s.registration.BootSessionID || node.ClaimsEnabled || node.IntentRevision != intent.IntentRevision || node.IntentReason != intent.Reason {
+		return upgradeControlConflict("agent: service admission resume intent fence changed")
+	}
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+	if s.isRetiring() {
+		return upgradeControlConflict("agent: generation retired during service resume")
 	}
 	if s.upgradeServiceResumed == nil {
 		s.upgradeServiceResumed = map[string]bool{}

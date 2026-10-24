@@ -109,14 +109,14 @@ func (s Store) PublishRetirement(g l1.NodeGeneration) error {
 	return s.control(g.AgentGenerationID, "retirement-ack.json", g, true)
 }
 func (s Store) ReadRetirement(id string) (g l1.NodeGeneration, err error) {
-	err = s.control(id, "retirement-ack.json", &g, false)
+	err = s.readRetainedEvidence(id, "retirement-ack.json", &g)
 	return
 }
 
 // This is a closed protocol, never an arbitrary node-authenticated HTTP proxy.
 func validControlAction(action string) bool {
 	switch action {
-	case "quiesce_services", "resume_services", "generation_inventory", "stage_generation", "promote_generation":
+	case "quiesce_services", "resume_services", "generation_inventory", "stage_generation", "promote_generation", "abort_staged_generation":
 		return true
 	default:
 		return false
@@ -174,4 +174,106 @@ func (s Store) ReadControlReply(request ControlRequest) (ControlResult, error) {
 		return refusal, err
 	}
 	return s.ReadControlResult(request.GenerationID)
+}
+
+// ReadPromotionResult keeps reply-loss resolution available after receipt-bound
+// retirement cleanup. The audit copy is not evidence of a surviving process.
+func (s Store) ReadPromotionResult(id string) (result ControlResult, err error) {
+	err = s.readRetainedEvidence(id, "control-result.json", &result)
+	return
+}
+
+func (s Store) readRetainedEvidence(id, name string, target any) error {
+	if !validID(id) {
+		return &ControlRequestRefusal{Message: "invalid evidence generation"}
+	}
+	root, close, err := s.open(false)
+	if err != nil {
+		return err
+	}
+	defer close()
+	c, err := s.read(root)
+	if err != nil {
+		return err
+	}
+	local, present := c.Generations[id]
+	var missing error
+	if present {
+		dirErr := privateDirectory(filepath.Join(s.Root(), id))
+		if dirErr == nil {
+			err = readPrivate(root, filepath.Join(id, name), target)
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			missing = &RecordPendingError{Cause: err}
+		} else if !errors.Is(dirErr, os.ErrNotExist) {
+			return dirErr
+		} else {
+			missing = dirErr
+		}
+	}
+	var receipt completionReceipt
+	if err = readPrivate(root, "finished-"+id+".json", &receipt); err != nil {
+		if errors.Is(err, os.ErrNotExist) && missing != nil {
+			return missing
+		}
+		return err
+	}
+	if receipt.Version != 1 || receipt.Generation.ID != id || (present && !sameGeneration(local, receipt.Generation)) {
+		return &VerificationRefusal{Message: "retained evidence receipt ownership differs"}
+	}
+	payload, ok := receipt.ControlFiles[name]
+	if !ok {
+		if missing != nil {
+			return missing
+		}
+		return &VerificationRefusal{Message: "completed generation lacks required retained evidence"}
+	}
+	return json.Unmarshal(payload, target)
+}
+
+// RetainPromotionResult records startup reconciliation without replacing an
+// already-published transport-correlated success from the predecessor.
+func (s Store) RetainPromotionResult(result ControlResult) error {
+	request := result.Request
+	if !result.SuccessfulPromotion() || !validID(request.GenerationID) {
+		return &VerificationRefusal{Message: "invalid retained promotion result"}
+	}
+	root, close, err := s.open(false)
+	if err != nil {
+		return err
+	}
+	defer close()
+	c, err := s.read(root)
+	if err != nil {
+		return err
+	}
+	if c.NodeID != request.NodeID {
+		return &VerificationRefusal{Message: "retained promotion node differs"}
+	}
+	if _, ok := c.Generations[request.GenerationID]; !ok {
+		return &VerificationRefusal{Message: "retained promotion predecessor missing"}
+	}
+	if err := privateDirectory(filepath.Join(s.Root(), request.GenerationID)); err != nil {
+		return err
+	}
+	var previous ControlResult
+	name := filepath.Join(request.GenerationID, "control-result.json")
+	if err = readPrivate(root, name, &previous); err == nil && previous.SuccessfulPromotion() {
+		if !SamePromotionControl(previous.Request, request) {
+			return &VerificationRefusal{Message: "retained promotion payload changed"}
+		}
+		return nil
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return writePrivate(root, name, result)
+}
+
+type StagedAbortControl struct {
+	CandidateGenerationID string                        `json:"candidate_generation_id"`
+	Request               l1.CloseNodeGenerationRequest `json:"request"`
 }

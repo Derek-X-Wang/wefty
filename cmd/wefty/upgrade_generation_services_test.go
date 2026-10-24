@@ -22,7 +22,7 @@ func TestUpgradeGenerationServiceRecoveryUsesQuiescence(t *testing.T) {
 			old := l1.NodeActiveAttempt{JobID: "never-service", AttemptID: "old", BootSessionID: f.node.BootSessionID, Kind: contract.JobKindProcess, Class: contract.JobClassService}
 			receipt := &upgradeDrainReceipt{Home: f.home, Version: 1, NodeID: f.node.NodeID, OldBoot: f.node.BootSessionID, Reason: "wefty upgrade operation", Services: []l1.NodeActiveAttempt{old}}
 			if mode != "legacy" && mode != "missing-proof" {
-				receipt.ServiceQuiescence = &agent.UpgradeServiceQuiescence{OperationID: "activation", NodeID: f.node.NodeID, AgentGenerationID: "old-generation", BootSessionID: f.node.BootSessionID, Services: []l1.NodeActiveAttempt{old}}
+				receipt.ServiceQuiescence = &agent.UpgradeServiceQuiescence{IntentRevision: receipt.Revision, IntentReason: receipt.Reason, OperationID: "activation", NodeID: f.node.NodeID, AgentGenerationID: "old-generation", BootSessionID: f.node.BootSessionID, Services: []l1.NodeActiveAttempt{old}}
 				if mode == "changed-proof" {
 					receipt.ServiceQuiescence.Services[0].AttemptID = "different"
 				}

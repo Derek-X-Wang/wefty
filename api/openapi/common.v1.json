@@ -2542,6 +2542,42 @@
             "evidence_settled"
           ],
           "properties": {
+            "abort": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "operation_id",
+                "primary_generation_id",
+                "primary_boot_session_id",
+                "authority_generation",
+                "catalog_revision",
+                "intent_revision",
+                "intent_reason"
+              ],
+              "properties": {
+                "operation_id": {
+                  "type": "string"
+                },
+                "primary_generation_id": {
+                  "type": "string"
+                },
+                "primary_boot_session_id": {
+                  "type": "string"
+                },
+                "authority_generation": {
+                  "type": "integer"
+                },
+                "catalog_revision": {
+                  "type": "integer"
+                },
+                "intent_revision": {
+                  "type": "integer"
+                },
+                "intent_reason": {
+                  "type": "string"
+                }
+              }
+            },
             "boot_session_id": {
               "type": "string"
             },
@@ -2574,6 +2610,7 @@
           "capabilities", "capability_revision", "capability_observed_at", "missing_capabilities"
         ],
         "properties": {
+          "system_boot_id": { "type": "string", "description": "Installed generation host boot identity; retained sessions from a different system boot have no live renewal authority." },
           "agent_generation_id": { "type": "string", "description": "Optional generation enrollment. The Node projection reports its primary generation after enrollment. Only the recorded primary can register; retiring identities cannot return to primary." },
           "node_id": { "type": "string" },
           "boot_session_id": { "type": "string" },

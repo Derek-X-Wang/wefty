@@ -326,7 +326,7 @@ func TestFinishedGenerationCleanupNeedsProofProcessAbsenceAndKeepsOtherGeneratio
 	release()
 	must(t, f.s.RemoveFinished(t.Context(), proof))
 	must(t, f.s.RemoveFinished(t.Context(), proof))
-	for _, p := range []string{old.Plist, old.Executable, filepath.Dir(old.Executable)} {
+	for _, p := range []string{old.Plist, old.Executable} {
 		if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("left retired file %s: %v", p, err)
 		}
@@ -800,8 +800,8 @@ func TestFinishedGenerationCleanupAfterControlExchangeAndRetirementAck(t *testin
 	f.f.states[old.Label] = launchagent.State{Loaded: true}
 	must(t, f.s.RemoveFinished(t.Context(), proof))
 	must(t, f.s.RemoveFinished(t.Context(), proof))
-	if _, err := os.Stat(filepath.Dir(old.Executable)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("retained generation directory", err)
+	if entries, err := os.ReadDir(filepath.Dir(old.Executable)); err != nil || len(entries) != 0 {
+		t.Fatal("retired directory must be empty", entries, err)
 	}
 	var receipt completionReceipt
 	root, close, err := f.s.open(false)

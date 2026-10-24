@@ -155,6 +155,7 @@ func newRollingFixtureWithLegacy(t *testing.T, legacy bool) *rollingFixture {
 		}
 		return in, nil
 	}
+	registeredReady := map[string]bool{f.primary.ID: true}
 	f.operations.observe = func(ctx context.Context, _ connprofile.Profile) (l1.Node, error) {
 		c, err := f.install.Read()
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -212,6 +213,11 @@ func newRollingFixtureWithLegacy(t *testing.T, legacy bool) *rollingFixture {
 					}
 				}
 			}
+		}
+		if c.PendingReceipt == "" && c.Primary != "" && current.AgentGenerationID == c.Primary && f.launchd.loaded[c.Generations[c.Primary].Label] && f.lifetimes[c.Primary] != nil && !registeredReady[c.Primary] {
+			g := c.Generations[c.Primary]
+			mustRolling(t, f.install.PublishReady(g.ID, c.NodeID, g.Version, g.Executable, current.BootSessionID, rollingTestBoot))
+			registeredReady[g.ID] = true
 		}
 		return f.h.store.GetNode(ctx, f.node.NodeID)
 	}
@@ -383,9 +389,8 @@ func TestUpgradeRollingHeartbeatOnlyAndInterruptedReceipts(t *testing.T) {
 				t.Fatalf("missing resumable exact promotion receipt: %+v", receipt)
 			}
 			_, err = runUpgrade(t.Context(), f.host, false, io.Discard)
-			var refused *upgradeRollingRefusedError
-			if !errors.As(err, &refused) || commandExitCode(err) != exitConflict {
-				t.Fatal("interruption not fenced", err)
+			if err == nil || commandExitCode(err) != 1 {
+				t.Fatal("unverified recovery did not keep its operational cause", err)
 			}
 			node, err := f.h.store.GetNode(t.Context(), f.node.NodeID)
 			mustRolling(t, err)

@@ -42,6 +42,7 @@ const setupTestUID = 501
 type fakeLaunchd struct {
 	loaded   map[string]bool
 	stopped  map[string]bool
+	disabled map[string]bool
 	failOnce map[string]error
 	commands [][]string
 }
@@ -66,6 +67,8 @@ func (launchd *fakeLaunchd) run(_ context.Context, name string, args ...string) 
 			return []byte(args[1] + " = {\n\tstate = not running\n\tlast exit code = 0\n}\n"), nil
 		}
 		return []byte(args[1] + " = {\n\tstate = running\n\tpid = 4242\n}\n"), nil
+	case "print-disabled":
+		return []byte(fmt.Sprintf("disabled services = {\n\t\"dev.wefty.node-agent\" => %t\n}\n", launchd.disabled[setupNodeAgentLabel])), nil
 	case "bootout":
 		delete(launchd.loaded, label(args[1]))
 		delete(launchd.stopped, label(args[1]))
@@ -75,17 +78,18 @@ func (launchd *fakeLaunchd) run(_ context.Context, name string, args ...string) 
 	case "kickstart":
 		delete(launchd.stopped, label(args[1]))
 	case "enable":
+		delete(launchd.disabled, label(args[1]))
 	default:
 		return nil, errors.New("unexpected launchctl verb")
 	}
 	return nil, nil
 }
 
-// mutating returns every command other than the read-only print.
+// mutating returns every command other than read-only service and override queries.
 func (launchd *fakeLaunchd) mutating() [][]string {
 	var mutating [][]string
 	for _, command := range launchd.commands {
-		if command[1] != "print" {
+		if command[1] != "print" && command[1] != "print-disabled" {
 			mutating = append(mutating, command)
 		}
 	}
@@ -108,7 +112,7 @@ func newSetupFixture(t *testing.T) *setupFixture {
 	}
 	fixture := &setupFixture{
 		home: home, source: t.TempDir(),
-		launchd:   &fakeLaunchd{loaded: make(map[string]bool), stopped: make(map[string]bool), failOnce: make(map[string]error)},
+		launchd:   &fakeLaunchd{loaded: make(map[string]bool), stopped: make(map[string]bool), disabled: make(map[string]bool), failOnce: make(map[string]error)},
 		loginPATH: "/opt/homebrew/bin:/usr/bin:/bin",
 	}
 	for _, name := range setupBinaries {
@@ -781,5 +785,27 @@ func TestSetupStopsWhenLaunchdCannotBeAsked(t *testing.T) {
 	report := fixture.setup(t, setupRequest{})
 	if serviceActions(report)[setupL3Label] != launchagent.Reloaded {
 		t.Fatalf("the next run did not reload: %v %v", serviceActions(report), fixture.launchd.mutating())
+	}
+}
+
+func TestSetupLoadedLegacyClearsDisabledOverride(t *testing.T) {
+	for _, stopped := range []bool{false, true} {
+		t.Run(fmt.Sprint(stopped), func(t *testing.T) {
+			f := newSetupFixture(t)
+			f.setup(t, setupRequest{})
+			f.launchd.disabled[setupNodeAgentLabel] = true
+			f.launchd.stopped[setupNodeAgentLabel] = stopped
+			f.setup(t, setupRequest{})
+			if f.launchd.disabled[setupNodeAgentLabel] || f.launchd.stopped[setupNodeAgentLabel] {
+				t.Fatal("legacy primary retained without autostart or running process")
+			}
+			want := [][]string{{launchagent.Launchctl, "enable", "gui/501/" + setupNodeAgentLabel}}
+			if stopped {
+				want = append(want, []string{launchagent.Launchctl, "kickstart", "gui/501/" + setupNodeAgentLabel})
+			}
+			if !reflect.DeepEqual(f.launchd.mutating(), want) {
+				t.Fatalf("loaded legacy repair commands: got %v want %v", f.launchd.mutating(), want)
+			}
+		})
 	}
 }

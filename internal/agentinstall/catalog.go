@@ -46,6 +46,8 @@ type ResidentAttempt struct {
 }
 
 type Generation struct {
+	PreparationOperation   string            `json:"preparation_operation,omitempty"`
+	AbortOperation         string            `json:"abort_operation,omitempty"`
 	CandidateBootSessionID string            `json:"candidate_boot_session_id"`
 	ResidentAttempts       []ResidentAttempt `json:"resident_attempts"`
 	ID                     string            `json:"agent_generation_id"`
@@ -77,6 +79,12 @@ type Catalog struct {
 // Store paths must be supplied by the installation's home-confined resolver.
 // Files are derived from random IDs, never from receipt paths.
 type Store struct {
+	InitializationStep        func(string) error
+	initializationSyncDir     func(string, *os.Root) error
+	afterPromotionWrite       func(string) error
+	beforeGenerationRemoval   func(string) error
+	afterRemovalIdentityCheck func(string) error
+	afterCandidateWrite       func(string) error
 	// beforePlistOpen is a test seam after validation and before the retained plist open.
 	beforePlistOpen func() error
 	// ProcessStartIdentity observes kernel process birth identity; nil uses the platform reader.
@@ -158,14 +166,34 @@ func (s Store) open(create bool) (*os.Root, func(), error) {
 	return root, func() { root.Close(); unlock() }, nil
 }
 func readPrivate(root *os.Root, name string, target any) error {
-	info, err := root.Lstat(name)
-	if err != nil {
-		return err
+	parent := root
+	if folder := filepath.Dir(name); folder != "." {
+		before, err := root.Lstat(folder)
+		if err != nil {
+			return err
+		}
+		if !privateInfo(before, 0700) {
+			return &VerificationRefusal{Message: "generation record parent must be a private unlinked directory"}
+		}
+		parent, err = root.OpenRoot(folder)
+		if err != nil {
+			return err
+		}
+		defer parent.Close()
+		directory, err := parent.Open(".")
+		if err != nil {
+			return err
+		}
+		held, statErr := directory.Stat()
+		directory.Close()
+		if statErr != nil {
+			return statErr
+		}
+		if !privateInfo(held, 0700) || !os.SameFile(before, held) {
+			return &VerificationRefusal{Message: "generation record parent changed during open"}
+		}
 	}
-	if !privateInfo(info, 0600) {
-		return &VerificationRefusal{Message: fmt.Sprintf("generation record %s must be an owner-only regular file", name)}
-	}
-	payload, err := root.ReadFile(name)
+	payload, err := ReadPrivateFile(parent, filepath.Base(name))
 	if err != nil {
 		return err
 	}
@@ -256,12 +284,20 @@ func RefuseMaintenance(data, command string) error {
 
 // Initialize records the first generation after the caller has drained the
 // legacy install. It never adopts a legacy process or its work.
-func (s Store) Initialize(nodeID, source, version, boot string, protocols []int) (Generation, error) {
+func (s Store) Initialize(nodeID, source, version, boot string, protocols []int, operation ...string) (Generation, error) {
+	if len(operation) > 0 && operation[0] != "" {
+		return s.initializeOperation(nodeID, source, version, boot, protocols, operation[0])
+	}
 	root, close, err := s.open(true)
 	if err != nil {
 		return Generation{}, err
 	}
 	defer close()
+	if s.InitializationStep != nil {
+		if err := s.InitializationStep("root_created"); err != nil {
+			return Generation{}, err
+		}
+	}
 	if _, err := root.Lstat(catalogName); err == nil {
 		return Generation{}, &VerificationRefusal{Message: "generation catalog already exists"}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -273,6 +309,14 @@ func (s Store) Initialize(nodeID, source, version, boot string, protocols []int)
 	g, err := s.prepare(root, source, version, boot, protocols)
 	if err != nil {
 		return g, err
+	}
+	if s.InitializationStep != nil {
+		if err := s.InitializationStep("executable_created"); err != nil {
+			return g, err
+		}
+	}
+	if len(operation) > 0 {
+		g.PreparationOperation = operation[0]
 	}
 	g.Role = "primary"
 	g.PromotedAt = time.Now().UTC()
@@ -295,7 +339,12 @@ func (s Store) prepare(root *os.Root, source, version, boot string, protocols []
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 		return Generation{}, &VerificationRefusal{Message: "candidate executable must be a regular executable"}
 	}
-	binary, err := os.ReadFile(source)
+	sourceParent, err := os.OpenRoot(filepath.Dir(source))
+	if err != nil {
+		return Generation{}, err
+	}
+	defer sourceParent.Close()
+	binary, err := readOwnedFile(sourceParent, filepath.Base(source), info.Mode().Perm())
 	if err != nil {
 		return Generation{}, err
 	}
@@ -326,7 +375,7 @@ func (s Store) prepare(root *os.Root, source, version, boot string, protocols []
 	g.Plist = filepath.Join(s.LaunchAgents, g.Label+".plist")
 	return g, nil
 }
-func (s Store) PrepareCandidate(source, version, boot string, protocols []int) (Generation, error) {
+func (s Store) PrepareCandidate(source, version, boot string, protocols []int, operation ...string) (Generation, error) {
 	root, close, err := s.open(false)
 	if err != nil {
 		return Generation{}, err
@@ -339,9 +388,41 @@ func (s Store) PrepareCandidate(source, version, boot string, protocols []int) (
 	if c.PendingReceipt != "" {
 		return Generation{}, &VerificationRefusal{Message: "unresolved generation promotion"}
 	}
+	if len(operation) > 0 && operation[0] != "" {
+		for _, g := range c.Generations {
+			if g.PreparationOperation == operation[0] {
+				if g.Version != version || !hostboot.SameBoot(g.StartBootID, boot) || !slices.Equal(g.ProtocolVersions, protocols) || g.AbortOperation != "" {
+					return Generation{}, &VerificationRefusal{Message: "candidate preparation operation changed"}
+				}
+				if err := s.verifyExecutable(root, g); err != nil {
+					return Generation{}, err
+				}
+				info, err := os.Lstat(source)
+				if err != nil {
+					return Generation{}, err
+				}
+				sourceParent, err := os.OpenRoot(filepath.Dir(source))
+				if err != nil {
+					return Generation{}, err
+				}
+				binary, err := readOwnedFile(sourceParent, filepath.Base(source), info.Mode().Perm())
+				sourceParent.Close()
+				if err != nil {
+					return Generation{}, err
+				}
+				if digestBytes(binary) != g.Digest {
+					return Generation{}, &VerificationRefusal{Message: "candidate preparation payload changed"}
+				}
+				return g, nil
+			}
+		}
+	}
 	g, err := s.prepare(root, source, version, boot, protocols)
 	if err != nil {
 		return g, err
+	}
+	if len(operation) > 0 {
+		g.PreparationOperation = operation[0]
 	}
 	c.Generations[g.ID] = g
 	c.Revision++
@@ -351,14 +432,12 @@ func (s Store) verifyExecutable(root *os.Root, g Generation) error {
 	if err := privateDirectory(filepath.Join(s.Root(), g.ID)); err != nil {
 		return err
 	}
-	info, err := root.Lstat(filepath.Join(g.ID, "wefty-agent"))
+	dir, err := root.OpenRoot(g.ID)
 	if err != nil {
 		return err
 	}
-	if !privateInfo(info, 0500) {
-		return &VerificationRefusal{Message: "retained executable ownership or mode changed"}
-	}
-	binary, err := root.ReadFile(filepath.Join(g.ID, "wefty-agent"))
+	defer dir.Close()
+	binary, err := readOwnedFile(dir, "wefty-agent", 0500)
 	if err != nil {
 		return err
 	}

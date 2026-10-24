@@ -49,12 +49,15 @@ type OutputSinkFactory func(l1.Claim) processrunner.OutputSink
 type Config struct {
 	// RetirementAcknowledged persists the exact dedicated retirement acknowledgment.
 	RetirementAcknowledged func(l1.NodeGeneration) error
+	RetirementClosed       func(l1.NodeGeneration) error
 
 	Fabric              fabric.Fabric
 	ControlPlaneAddress string
 	RunLedgerAddress    string
 	NodeID              string
 	BootSessionID       string
+	// SystemBootID binds installed generation authority to the observed host boot.
+	SystemBootID string
 	// AgentGenerationID opts into L1 generation authority; installed activation supplies it.
 	AgentGenerationID string
 	// GenerationLifetimeLock claims the installed process's already-held lifetime
@@ -287,6 +290,7 @@ func New(config Config) (*Agent, error) {
 	}
 	registration := contract.NodeRegistration{
 		NodeID:            config.NodeID,
+		SystemBootID:      config.SystemBootID,
 		AgentGenerationID: config.AgentGenerationID,
 		BootSessionID:     config.BootSessionID,
 		ConnectHost:       config.Fabric.ConnectHost(),
@@ -442,6 +446,7 @@ func New(config Config) (*Agent, error) {
 		intOrDefault(config.MaxServiceSlots, l1.DefaultMaxServiceSlots),
 	)
 	session.retirementAcknowledged = config.RetirementAcknowledged
+	session.retirementClosed = config.RetirementClosed
 	session.retirementEvidenceSettled = config.RetirementEvidenceSettled
 	if config.AgentGenerationID != "" && session.retirementEvidenceSettled == nil {
 		session.retirementEvidenceSettled = outbox.settleRetirementEvidence(client, config.NodeID)

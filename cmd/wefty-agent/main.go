@@ -26,6 +26,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/hostboot"
+	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/internal/pathflags"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
@@ -517,7 +518,7 @@ func run() error {
 		if *agentGenerationID == "" || filepath.Base(*generationRoot) != agentinstall.Directory {
 			return errors.New("installed generation requires its identity and catalog directory")
 		}
-		generationStore = agentinstall.Store{Data: filepath.Dir(*generationRoot), LaunchAgents: *generationLaunchAgents, ProcessStartIdentity: installedGenerationProcessStartIdentity}
+		generationStore = agentinstall.Store{Manager: launchagent.Manager{Run: launchagent.ExecRunner, UID: os.Getuid()}, Data: filepath.Dir(*generationRoot), LaunchAgents: *generationLaunchAgents, ProcessStartIdentity: installedGenerationProcessStartIdentity}
 		generationSystemBoot, err = installedGenerationBootIdentity()
 		if err != nil {
 			return err
@@ -527,6 +528,15 @@ func run() error {
 		catalog, err := generationStore.Read()
 		if err != nil {
 			return err
+		}
+		if catalog.PendingReceipt != "" {
+			if err := reconcileInstalledActivation(context.Background(), generationStore, *profilePath, generationSystemBoot); err != nil {
+				return err
+			}
+			catalog, err = generationStore.Read()
+			if err != nil {
+				return err
+			}
 		}
 		lifetime, err := generationStore.StartupWithLifetime(*agentGenerationID, catalog.NodeID, agentExecutable, generationSystemBoot)
 		if errors.Is(err, agentinstall.ErrStartupSuppressed) {
@@ -549,7 +559,12 @@ func run() error {
 				stop()
 				return err
 			}
-			err := generationStore.AwaitActivation(waiting, g.ID)
+			err := generationStore.AwaitActivation(waiting, g.ID, func(ctx context.Context) error {
+				if err := reconcileInstalledActivation(ctx, generationStore, *profilePath, generationSystemBoot); err != nil {
+					log.Printf("activation reconciliation remains pending: %v", err)
+				}
+				return nil
+			})
 			stop()
 			if errors.Is(err, context.Canceled) || errors.Is(err, agentinstall.ErrStartupSuppressed) {
 				return nil
@@ -792,6 +807,13 @@ func run() error {
 		ComputerRoom:         computerRoom,
 		SeatApprovalSettings: agent.SeatApprovalSettings{AnswerWait: *seatApprovalAnswerWait, WindowHours: approvalWindowHours},
 		AgentGenerationID:    *agentGenerationID,
+		SystemBootID:         generationSystemBoot,
+		RetirementClosed: func(g l1.NodeGeneration) error {
+			if *generationRoot == "" {
+				return nil
+			}
+			return generationStore.PublishClosedGeneration(g)
+		},
 		RetirementAcknowledged: func(g l1.NodeGeneration) error {
 			if *generationRoot == "" {
 				return nil

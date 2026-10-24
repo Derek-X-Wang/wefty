@@ -67,6 +67,7 @@ func (plist testPlist) assertOnly(t *testing.T, want string) {
 // or launchd's confirmed "no such service".
 type fakeLaunchd struct {
 	loaded, running bool
+	disabled        bool
 	// printErr, when set, is how print fails while it is set.
 	printErr    error
 	bootoutErr  error
@@ -88,6 +89,12 @@ func (launchd *fakeLaunchd) run(_ context.Context, _ string, args ...string) ([]
 			return []byte("gui/501/dev.wefty.test = {\n\tstate = not running\n}\n"), nil
 		}
 		return []byte("gui/501/dev.wefty.test = {\n\tstate = running\n\tpid = 42\n}\n"), nil
+	case "print-disabled":
+		return []byte(fmt.Sprintf("disabled services = {\n\t\"dev.wefty.node-agent\" => %t\n}\n", launchd.disabled)), nil
+	case "disable":
+		launchd.disabled = true
+	case "enable":
+		launchd.disabled = false
 	case "bootout":
 		if launchd.bootoutErr != nil {
 			return nil, launchd.bootoutErr
@@ -427,6 +434,193 @@ func TestConvergeKeepsALoadedServiceWhoseDefinitionCannotBeRead(t *testing.T) {
 			}
 			if entries, _ := os.ReadDir(filepath.Dir(plist.path)); len(entries) > 1 {
 				t.Fatalf("a refused converge left %v", entries)
+			}
+		})
+	}
+}
+
+func TestUnloadStoppedLegacyConfirmsAbsenceAndKeepsRunningProcess(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		t.Run(fmt.Sprint(running), func(t *testing.T) {
+			launchd := &fakeLaunchd{loaded: true, running: running}
+			manager := launchd.manager()
+			err := manager.UnloadStoppedLegacy(t.Context(), "dev.wefty.node-agent")
+			if running {
+				if err == nil || !launchd.loaded {
+					t.Fatal("running legacy definition unloaded", err)
+				}
+				for _, verb := range launchd.verbs {
+					if verb == "bootout" {
+						t.Fatal("running process booted out")
+					}
+				}
+			} else if err != nil || launchd.loaded {
+				t.Fatal("legacy definition not confirmed absent", err)
+			}
+		})
+	}
+	launchd := &fakeLaunchd{loaded: true, staysLoaded: true}
+	if err := launchd.manager().UnloadStoppedLegacy(t.Context(), "dev.wefty.node-agent"); err == nil {
+		t.Fatal("unconfirmed bootout accepted")
+	}
+}
+
+func TestUnloadStoppedLegacyFencesRelaunchAfterFinalCheck(t *testing.T) {
+	launchd := &fakeLaunchd{loaded: true}
+	manager := launchd.manager()
+	checks := 0
+	attempted := false
+	manager.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if args[0] == "print" {
+			checks++
+			output, err := launchd.run(ctx, name, args...)
+			if checks == 1 {
+				attempted = true
+				if !launchd.disabled {
+					launchd.running = true
+				}
+			}
+			return output, err
+		}
+		if args[0] == "bootout" && launchd.running {
+			t.Fatal("bootout targeted running legacy process after final check")
+		}
+		return launchd.run(ctx, name, args...)
+	}
+	if err := manager.UnloadStoppedLegacy(t.Context(), "dev.wefty.node-agent"); err != nil {
+		t.Fatal(err)
+	}
+	if !attempted || !launchd.disabled || launchd.loaded {
+		t.Fatal("restart fence not retained through unload")
+	}
+}
+
+func TestUnloadStoppedLegacyFenceFaultKeepsDefinition(t *testing.T) {
+	fault := errors.New("disable transport fault")
+	launchd := &fakeLaunchd{loaded: true}
+	manager := launchd.manager()
+	manager.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if args[0] == "disable" {
+			return nil, fault
+		}
+		if args[0] == "bootout" {
+			t.Fatal("bootout after failed restart fence")
+		}
+		return launchd.run(ctx, name, args...)
+	}
+	if err := manager.UnloadStoppedLegacy(t.Context(), "dev.wefty.node-agent"); !errors.Is(err, fault) {
+		t.Fatal("fence fault cause lost", err)
+	}
+	if !launchd.loaded {
+		t.Fatal("failed restart fence removed definition")
+	}
+}
+
+func TestConvergeEnablesLoadedLegacyAutostart(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		t.Run(fmt.Sprint(running), func(t *testing.T) {
+			plist := newTestPlist(t)
+			plist.agent.Label = "dev.wefty.node-agent"
+			plist.path = filepath.Join(filepath.Dir(plist.path), plist.agent.Label+".plist")
+			var err error
+			plist.payload, err = Render(plist.agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(plist.path, plist.payload, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			launchd := &fakeLaunchd{loaded: true, running: running, disabled: true}
+			manager := launchd.manager()
+			manager.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if args[0] == "kickstart" && launchd.disabled {
+					t.Fatal("kickstart before enabling legacy autostart")
+				}
+				return launchd.run(ctx, name, args...)
+			}
+			want := Started
+			if running {
+				want = Unchanged
+			}
+			if action, err := plist.converge(t, manager); err != nil || action != want {
+				t.Fatalf("converge = %s, %v", action, err)
+			}
+			if launchd.disabled {
+				t.Fatal("loaded legacy autostart remains disabled")
+			}
+			plist.assertOnly(t, string(plist.payload))
+		})
+	}
+}
+
+func TestConvergeLegacyEnableFaultKeepsLoadedDefinition(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		t.Run(fmt.Sprint(running), func(t *testing.T) {
+			plist := newTestPlist(t)
+			plist.agent.Label = "dev.wefty.node-agent"
+			plist.path = filepath.Join(filepath.Dir(plist.path), plist.agent.Label+".plist")
+			var err error
+			plist.payload, err = Render(plist.agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(plist.path, plist.payload, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			launchd := &fakeLaunchd{loaded: true, running: running, disabled: true}
+			fault := errors.New("enable transport failed")
+			manager := launchd.manager()
+			manager.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if args[0] == "enable" {
+					return nil, fault
+				}
+				if args[0] != "print" && args[0] != "print-disabled" {
+					t.Fatalf("mutation after enable fault: %v", args)
+				}
+				return launchd.run(ctx, name, args...)
+			}
+			if _, err = plist.converge(t, manager); !errors.Is(err, fault) {
+				t.Fatalf("enable cause lost: %v", err)
+			}
+			if !launchd.disabled || !launchd.loaded || launchd.running != running {
+				t.Fatal("enable failure changed retained definition")
+			}
+			plist.assertOnly(t, string(plist.payload))
+		})
+	}
+}
+
+func TestLegacyStartOverrideObservation(t *testing.T) {
+	fault := errors.New("disabled override transport unavailable")
+	for _, tc := range []struct {
+		name, reply         string
+		disabled, wantError bool
+		fault               error
+	}{
+		{name: "absent", reply: "disabled services = {\n}\n"},
+		{name: "enabled", reply: "disabled services = {\n \"dev.wefty.node-agent\" => false\n}\n"},
+		{name: "disabled", reply: "disabled services = {\n \"dev.wefty.node-agent\" => true\n}\n", disabled: true},
+		{name: "disabled word", reply: "disabled services = {\n \"dev.wefty.node-agent\" => disabled\n}\n", disabled: true},
+		{name: "enabled word", reply: "disabled services = {\n \"dev.wefty.node-agent\" => enabled\n}\n"},
+		{name: "unrelated", reply: "disabled services = {\n \"other.label\" => true\n}\n"},
+		{name: "empty", wantError: true},
+		{name: "unknown", reply: "disabled services = {\n \"dev.wefty.node-agent\" => unknown\n}\n", wantError: true},
+		{name: "duplicate", reply: "disabled services = {\n \"dev.wefty.node-agent\" => true\n \"dev.wefty.node-agent\" => false\n}\n", wantError: true},
+		{name: "transport", fault: fault, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := Manager{UID: 501, Run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				if strings.Join(args, ",") != "print-disabled,gui/501" {
+					t.Fatalf("unexpected override mutation: %v", args)
+				}
+				return []byte(tc.reply), tc.fault
+			}}
+			disabled, err := manager.legacyStartDisabled(t.Context())
+			if (err != nil) != tc.wantError || disabled != tc.disabled {
+				t.Fatalf("override observation: disabled=%t err=%v", disabled, err)
+			}
+			if tc.fault != nil && !errors.Is(err, tc.fault) {
+				t.Fatal("transport cause lost", err)
 			}
 		})
 	}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -138,6 +139,10 @@ func TestUpgradeServicesResumeRequiresSettledPrimary(t *testing.T) {
 	var primary atomic.Bool
 	primary.Store(true)
 	client, stop := startEvidenceReplayServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/heartbeat") {
+			_ = json.NewEncoder(w).Encode(l1.HeartbeatResponse{Node: l1.Node{NodeRegistration: contract.NodeRegistration{NodeID: "node", AgentGenerationID: "generation", BootSessionID: "boot"}, IntentRevision: 1, IntentReason: "upgrade"}})
+			return
+		}
 		role := l1.NodeGenerationRetiring
 		if primary.Load() {
 			role = l1.NodeGenerationPrimary
@@ -149,6 +154,7 @@ func TestUpgradeServicesResumeRequiresSettledPrimary(t *testing.T) {
 	clock := systemClock{}
 	s := newAgentSession(client, contract.NodeRegistration{NodeID: "node", AgentGenerationID: "generation", BootSessionID: "boot"}, nil, time.Second, time.Millisecond, clock, newLifecycleObserver(clock), nil, 1, 1)
 	a := &Agent{session: s}
+	s.upgradeServiceIntent = l1.NodeIntentRequest{IntentRevision: 1, Reason: "upgrade"}
 	s.upgradeServiceOperation = "activation"
 	if err := a.ResumeUpgradeServiceClaims(t.Context(), "activation"); err == nil || s.upgradeServiceOperation == "" {
 		t.Fatal("unsettled services resumed")

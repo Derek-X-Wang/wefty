@@ -1119,6 +1119,7 @@ type CapabilityObservation struct {
 // runtime_handler:<name>, and cgroup_v2; they must not carry max_oneshot_slots
 // or max_service_slots.
 type NodeRegistration struct {
+	SystemBootID string `json:"system_boot_id,omitempty"`
 	// AgentGenerationID opts into primary/retiring L1 sessions. Existing agents
 	// omit it; enrollment never adopts a legacy session's running Attempts.
 	AgentGenerationID string `json:"agent_generation_id,omitempty"`

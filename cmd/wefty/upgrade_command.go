@@ -90,6 +90,8 @@ type upgradeDrainCounts struct {
 }
 
 type upgradeReport struct {
+	RecoveryState      string `json:"recovery_state,omitempty"`
+	RecoveredOperation string `json:"recovered_operation_id,omitempty"`
 	upgradeDrainCounts
 	VersionWarnings   []statusReason         `json:"version_warnings,omitempty"`
 	Version           string                 `json:"version"`
@@ -141,6 +143,10 @@ func executeUpgradeWithHost(ctx context.Context, host setupHost, options globalO
 		return err
 	}
 	if err != nil {
+		return err
+	}
+	if report.RecoveredOperation != "" {
+		_, err := fmt.Fprintf(stdout, "Rolling upgrade recovery: %s; operation %s.\n", report.RecoveryState, report.RecoveredOperation)
 		return err
 	}
 	if report.AlreadyAt {
@@ -293,10 +299,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return upgradeReport{}, issues[0].err
 	}
 	operations := upgradeOperations(host)
-	if err := refuseInterruptedRolling(paths); err != nil {
-		return result, err
-	}
-	if !operations.requestRolling {
+	if !operations.requestRolling && !hasInterruptedRolling(paths) {
 		if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
 			return result, err
 		}
@@ -305,7 +308,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	if err != nil {
 		return upgradeReport{}, err
 	}
-	if operations.requestRolling {
+	if operations.requestRolling || hasInterruptedRolling(paths) {
 		profile, err := connprofile.Read(paths.profile)
 		if err != nil {
 			return result, err
@@ -344,13 +347,39 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return result, err
 	}
 	defer unlock()
-	if !operations.requestRolling {
+	if !operations.requestRolling && !hasInterruptedRolling(paths) {
 		if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
 			return result, err
 		}
 	}
-	if err := refuseInterruptedRolling(paths); err != nil {
-		return result, err
+	var forwardAdmission *upgradeDrainReceipt
+	var forwardFrom string
+	if hasInterruptedRolling(paths) {
+		prior, err := readUpgradeRolling(paths)
+		if err != nil {
+			return result, err
+		}
+		if operations.requestRolling && prior.RecoveryState == "rollback_refused" {
+			boot, err := operations.bootIdentity()
+			if err != nil {
+				return result, err
+			}
+			if !hostboot.SameBoot(boot, prior.SystemBootID) {
+				return recoverRollingUpgrade(ctx, host, operations, paths, warnings)
+			}
+			forwardAdmission, err = prepareFurtherRolling(ctx, host, operations, paths, prior, warnings)
+			if err != nil {
+				return result, err
+			}
+			forwardFrom = prior.OperationID
+		} else {
+			return recoverRollingUpgrade(ctx, host, operations, paths, warnings)
+		}
+	}
+	if forwardFrom == "" {
+		if err := refuseInterruptedRolling(paths); err != nil {
+			return result, err
+		}
 	}
 	entries, err := os.ReadDir(paths.data)
 	if err != nil {
@@ -377,8 +406,10 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	defer func() {
 		resultErr = upgradeDrainRunHint(ctx, operations, profile, resultErr)
 	}()
-	if err := recoverUpgradeDrain(ctx, operations, paths, profile, warnings); err != nil {
-		return result, err
+	if forwardFrom == "" {
+		if err := recoverUpgradeDrain(ctx, operations, paths, profile, warnings); err != nil {
+			return result, err
+		}
 	}
 	nodePlist := filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist")
 	if operations.requestRolling {
@@ -413,6 +444,13 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 					result.ClaimsDisabled = !node.ClaimsEnabled
 				}
 				return
+			}
+			if rolling != nil {
+				rolling.receipt.RecoveryDrain = drain
+				if err := rolling.persist("admission_settling"); err != nil {
+					resultErr = err
+					return
+				}
 			}
 			restoreErr := finishUpgradeDrain(ctx, operations, paths, profile, drain, false, warnings)
 			resultErr = upgradeDrainResult(resultErr, restoreErr, !drain.claimsDisabled)
@@ -502,6 +540,10 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		if err != nil {
 			return result, err
 		}
+		if rolling != nil {
+			rolling.receipt.ForwardFromOperation = forwardFrom
+			rolling.receipt.ForwardAdmission = forwardAdmission
+		}
 		if enrollGeneration {
 			if _, err = fmt.Fprintln(warnings, "Rolling unavailable: legacy_primary; draining once to install the first generation. Later --rolling upgrades preserve compatible one-shots."); err != nil {
 				return result, err
@@ -523,6 +565,41 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		}
 	}()
 	request := setupRequest{from: destination, installedVersion: commit, skillSource: skillRoot.FS(), deferNodeBinary: true, deferSkills: true, lockHeld: true}
+	if rolling != nil || enrollGeneration {
+		request.rollingCompletion = func(files []setupFile) error {
+			var target *upgradeRollingReceipt
+			if rolling != nil {
+				target = &rolling.receipt
+			} else {
+				var err error
+				target, err = readUpgradeRolling(paths)
+				if err != nil {
+					return err
+				}
+			}
+			root, err := os.OpenRoot(paths.home)
+			if err != nil {
+				return err
+			}
+			defer root.Close()
+			for _, f := range files {
+				completion := rollingCompletionFile{Path: filepath.Join(f.folder, f.name), Payload: f.payload, Mode: uint32(f.mode)}
+				previous, readErr := readRollingCompletionFile(root, completion)
+				if errors.Is(readErr, os.ErrNotExist) {
+					completion.PreviouslyMissing = true
+				} else if readErr != nil {
+					return generationControlTransportError(readErr)
+				} else {
+					completion.PreviousDigest = payloadDigest(previous)
+				}
+				target.CompletionFiles = append(target.CompletionFiles, completion)
+			}
+			if rolling != nil {
+				return rolling.persist("installation_writing")
+			}
+			return writeLegacyRolling(paths, operations, target, target.Phase)
+		}
+	}
 	if rolling != nil || enrollGeneration {
 		request.activateGeneration = func(serviceCtx context.Context, base launchagent.Agent) (launchagent.Action, error) {
 			if rolling != nil {
@@ -570,7 +647,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 			if err != nil {
 				return err
 			}
-			receipt := upgradeRollingReceipt{Version: 1, Protocol: 1, OperationID: rand.Text(), NodeID: profile.Identities.Node, SystemBootID: boot, Preserved: slices.Clone(report.RunningWork), BinaryDigests: map[string]string{}}
+			receipt := upgradeRollingReceipt{DrainIntentSequenced: true, Version: 1, Protocol: 1, OperationID: rand.Text(), NodeID: profile.Identities.Node, SystemBootID: boot, Preserved: slices.Clone(report.RunningWork), BinaryDigests: map[string]string{}}
 			for _, name := range setupBinaries {
 				digest, err := executableDigest(filepath.Join(destination, name))
 				if err != nil {
@@ -578,11 +655,31 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 				}
 				receipt.BinaryDigests[name] = digest
 			}
-			if err = writeUpgradeRolling(paths, &receipt, "legacy_admission_closing"); err != nil {
+			receipt.Candidate.Version = commit
+			receipt.Candidate.Digest = strings.TrimPrefix(receipt.BinaryDigests["wefty-agent"], "sha256:")
+			if err = writeLegacyRolling(paths, operations, &receipt, "legacy_admission_closing"); err != nil {
 				return err
 			}
 		}
-		drain, err = beginUpgradeDrain(ctx, operations, paths, profile, current, bound, deadline)
+		drainHost := operations
+		if enrollGeneration {
+			write := drainHost.writeDrain
+			drainHost.writeDrain = func(ctx context.Context, config string, drain *upgradeDrainReceipt) error {
+				receipt, err := readUpgradeRolling(paths)
+				if err != nil {
+					return err
+				}
+				receipt.RecoveryDrain = drain
+				if err = writeLegacyRolling(paths, operations, receipt, receipt.Phase); err != nil {
+					return err
+				}
+				if write != nil {
+					return write(ctx, config, drain)
+				}
+				return writeUpgradeDrain(config, drain)
+			}
+		}
+		drain, err = beginUpgradeDrain(ctx, drainHost, paths, profile, current, bound, deadline)
 		if err != nil {
 			return err
 		}

@@ -321,6 +321,19 @@ func (manager Manager) converge(ctx context.Context, folder *os.Root, path, labe
 	if err != nil {
 		return "", err
 	}
+	// Setup must restore autostart even when an existing legacy definition needs
+	// no bootstrap. Migration rollback can leave a persistent disabled override.
+	if current && state.Loaded && label == "dev.wefty.node-agent" {
+		disabled, err := manager.legacyStartDisabled(ctx)
+		if err != nil {
+			return "", err
+		}
+		if disabled {
+			if err := manager.RestoreLegacyStart(ctx, label); err != nil {
+				return "", err
+			}
+		}
+	}
 	if current && state.Running {
 		return Unchanged, nil
 	}
@@ -460,6 +473,89 @@ func (manager Manager) Unload(ctx context.Context, label string) error {
 	return manager.unload(ctx, label, false)
 }
 
+// RunningProcessError is a positive stopped-process validation refusal.
+// Service-manager observations and I/O failures retain their original errors.
+type RunningProcessError struct{ Label string }
+
+func (e *RunningProcessError) Error() string {
+	return fmt.Sprintf("LaunchAgent %s process still running", e.Label)
+}
+
+// UnloadStoppedLegacy disables legacy restart before its final stopped-process
+// check, then waits for launchd to confirm unload. The override stays disabled
+// through forward conversion and completion, including an absent plist. A caller
+// that instead retains legacy ownership must restore its start override.
+func (manager Manager) UnloadStoppedLegacy(ctx context.Context, label string) error {
+	if generationLabel(label) {
+		return errors.New("retained generation requires finished-generation cleanup")
+	}
+	if manager.Run == nil {
+		return errors.New("LaunchAgent manager has no command runner")
+	}
+	// This override is retained through plist removal and across crashes. The
+	// retired legacy label must never autostart beside a generation primary.
+	if _, err := manager.Run(ctx, Launchctl, "disable", manager.target(label)); err != nil {
+		return fmt.Errorf("fence legacy LaunchAgent %s restart: %w", label, err)
+	}
+	return manager.unload(ctx, label, true)
+}
+
+// legacyStartDisabled reads the persisted override without changing an already
+// enabled service. Unknown output is an operational decode fault, never proof
+// that autostart is enabled.
+func (manager Manager) legacyStartDisabled(ctx context.Context) (bool, error) {
+	payload, err := manager.Run(ctx, Launchctl, "print-disabled", manager.domain())
+	if err != nil {
+		return false, fmt.Errorf("inspect legacy LaunchAgent autostart: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(payload)), "\n")
+	if len(lines) < 2 || strings.TrimSpace(lines[0]) != "disabled services = {" || strings.TrimSpace(lines[len(lines)-1]) != "}" {
+		return false, errors.New("decode launchctl disabled services: malformed domain record")
+	}
+	seen := make(map[string]bool)
+	disabled := false
+	for _, line := range lines[1 : len(lines)-1] {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=>")
+		label, err := strconv.Unquote(strings.TrimSpace(key))
+		if !ok || err != nil || label == "" || seen[label] {
+			return false, errors.New("decode launchctl disabled services: malformed or duplicate entry")
+		}
+		seen[label] = true
+		var flag bool
+		switch strings.TrimSpace(value) {
+		case "true", "disabled":
+			flag = true
+		case "false", "enabled":
+			flag = false
+		default:
+			return false, errors.New("decode launchctl disabled services: unknown override")
+		}
+		if label == "dev.wefty.node-agent" {
+			disabled = flag
+		}
+	}
+	return disabled, nil
+}
+
+// RestoreLegacyStart clears the durable migration restart fence only after the
+// caller establishes that legacy ownership is retained. Repeating it is safe
+// after a crash before the caller records rollback completion.
+func (manager Manager) RestoreLegacyStart(ctx context.Context, label string) error {
+	if label != "dev.wefty.node-agent" {
+		return errors.New("not the legacy node-agent label")
+	}
+	if manager.Run == nil {
+		return errors.New("LaunchAgent manager has no command runner")
+	}
+	if _, err := manager.Run(ctx, Launchctl, "enable", manager.target(label)); err != nil {
+		return fmt.Errorf("restore legacy LaunchAgent %s autostart: %w", label, err)
+	}
+	return nil
+}
+
 // UnloadFinishedGeneration refuses a running generation even if a caller has a completion receipt.
 func (manager Manager) UnloadFinishedGeneration(ctx context.Context, label string) error {
 	if !generationLabel(label) {
@@ -485,7 +581,7 @@ func (manager Manager) unload(ctx context.Context, label string, finished bool) 
 		return err
 	}
 	if finished && state.Running {
-		return errors.New("generation process still running")
+		return &RunningProcessError{Label: label}
 	}
 	if _, err := manager.Run(ctx, Launchctl, "bootout", manager.target(label)); err != nil {
 		return fmt.Errorf("unload LaunchAgent %s: %w", label, err)

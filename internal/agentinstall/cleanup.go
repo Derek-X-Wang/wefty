@@ -12,6 +12,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/internal/durable"
 	"github.com/Derek-X-Wang/wefty/internal/hostboot"
+	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 )
 
 // CompletionProof is supplied by authoritative retirement observation, not
@@ -41,11 +42,11 @@ func digestBytes(b []byte) string { d := sha256.Sum256(b); return hex.EncodeToSt
 // It can resume after any file deletion without recursive removal.
 func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error {
 	if !validID(proof.GenerationID) {
-		return errors.New("invalid completion generation")
+		return &VerificationRefusal{Message: "invalid completion generation"}
 	}
 	evidence, decodeErr := hex.DecodeString(proof.EvidenceDigest)
 	if !proof.PayloadsAbsent || !proof.L1SessionClosed || !proof.EvidenceSafe || decodeErr != nil || len(evidence) != 32 || proof.PID <= 0 || proof.BootSessionID == "" || !hostboot.ValidIdentity(proof.SystemBootID) || proof.ReadyAt.IsZero() {
-		return errors.New("retiring generation still holds work or lacks exact completion evidence")
+		return &VerificationRefusal{Message: "retiring generation still holds work or lacks exact completion evidence"}
 	}
 	root, close, err := s.open(false)
 	if err != nil {
@@ -57,7 +58,7 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 		return err
 	}
 	if c.PendingReceipt != "" {
-		return errors.New("cannot clean up an unresolved promotion")
+		return &VerificationRefusal{Message: "cannot clean up an unresolved promotion"}
 	}
 	id := proof.GenerationID
 	name := "finished-" + id + ".json"
@@ -65,42 +66,40 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 	receiptErr := readPrivate(root, name, &receipt)
 	g, present := c.Generations[id]
 	if present && (g.Role != "retiring" || c.Primary == id || g.Process == nil || proof.PID != g.Process.PID || proof.BootSessionID != g.Process.BootSessionID || !hostboot.SameBoot(proof.SystemBootID, g.Process.SystemBootID) || !proof.ReadyAt.Equal(g.Process.ReadyAt)) {
-		return errors.New("completion proof does not match a retiring process")
+		return &VerificationRefusal{Message: "completion proof does not match a retiring process"}
 	}
 
 	if receiptErr == nil {
 		if receipt.Generation.Role != "retiring" || receipt.Version != 1 || receipt.Generation.ID != id || receipt.Generation.Executable != s.executable(id) || receipt.Generation.Label != s.label(id) || receipt.Generation.Plist != filepath.Join(s.LaunchAgents, s.label(id)+".plist") || receipt.Proof != proof {
-			return errors.New("completion receipt mismatch")
+			return &VerificationRefusal{Message: "completion receipt mismatch"}
 		}
 		if !present {
 			return nil
 		}
 		if !sameGeneration(g, receipt.Generation) {
-			return errors.New("generation changed after completion receipt")
+			return &VerificationRefusal{Message: "generation changed after completion receipt"}
 		}
 	} else {
 		if !errors.Is(receiptErr, os.ErrNotExist) {
 			return receiptErr
 		}
 		if !present || proof.CatalogRevision != c.Revision {
-			return errors.New("retiring generation still holds work or lacks exact completion evidence")
+			return &VerificationRefusal{Message: "retiring generation still holds work or lacks exact completion evidence"}
 		}
 		if err := s.verifyExecutable(root, g); err != nil {
 			return err
 		}
-		info, err := os.Lstat(g.Plist)
+		folder, err := os.OpenRoot(s.LaunchAgents)
 		if err != nil {
 			return err
 		}
-		if !privateInfo(info, 0644) {
-			return errors.New("generation plist ownership changed")
-		}
-		b, err := os.ReadFile(g.Plist)
+		b, err := readRetainedPlist(folder, filepath.Base(g.Plist))
+		folder.Close()
 		if err != nil {
 			return err
 		}
 		if g.PlistDigest == "" || digestBytes(b) != g.PlistDigest {
-			return errors.New("generation plist differs from installation record")
+			return &VerificationRefusal{Message: "generation plist differs from installation record"}
 		}
 		receipt = completionReceipt{Version: 1, Generation: g, Proof: proof, PlistDigest: g.PlistDigest}
 	}
@@ -109,33 +108,30 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 		return err
 	}
 	if state.Running {
-		return errors.New("generation process still running")
+		return &VerificationRefusal{Message: "generation process still running"}
 	}
-	if err := privateDirectory(filepath.Join(s.Root(), id)); err != nil {
+	held, err := holdGenerationDirectory(root, id)
+	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) || receiptErr != nil {
 			return err
 		}
 	} else {
-		release, err := lockDirectory(filepath.Join(s.Root(), id))
-		if err != nil {
-			return errors.New("generation process lock still held")
-		}
-		defer release()
-		// Unknown files are never recursively removed, even with a valid receipt.
-		dir, err := root.OpenRoot(id)
+		defer held.Close()
+		dir := held.root
+		directory, err := dir.Open(".")
 		if err != nil {
 			return err
 		}
-		defer dir.Close()
-		entries, err := os.ReadDir(filepath.Join(s.Root(), id))
+		defer directory.Close()
+		entries, err := directory.ReadDir(-1)
 		if err != nil {
 			return err
 		}
 		for _, entry := range entries {
 			switch entry.Name() {
-			case "wefty-agent", "ready.json", "candidate-start.json", "control-request.json", "control-result.json", "control-refusal.json", "retirement-ack.json":
+			case "wefty-agent", "ready.json", "candidate-start.json", "control-request.json", "control-result.json", "control-refusal.json", "retirement-ack.json", "retirement-closed.json":
 			default:
-				return errors.New("generation directory contains unrecognized retained evidence")
+				return &VerificationRefusal{Message: "generation directory contains unrecognized retained evidence"}
 			}
 		}
 		for _, entry := range entries {
@@ -148,16 +144,16 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 				mode = 0500
 			}
 			if !privateInfo(info, mode) {
-				return errors.New("generation file ownership changed")
+				return &VerificationRefusal{Message: "generation file ownership changed"}
 			}
-			if entry.Name() == "control-request.json" || entry.Name() == "control-result.json" || entry.Name() == "control-refusal.json" || entry.Name() == "retirement-ack.json" {
-				b, err := dir.ReadFile(entry.Name())
+			if entry.Name() == "control-request.json" || entry.Name() == "control-result.json" || entry.Name() == "control-refusal.json" || entry.Name() == "retirement-ack.json" || entry.Name() == "retirement-closed.json" {
+				b, err := readOwnedFile(dir, entry.Name(), mode)
 				if err != nil {
 					return err
 				}
 				if receiptErr == nil {
 					if retained, ok := receipt.ControlFiles[entry.Name()]; !ok || !bytes.Equal(retained, b) {
-						return errors.New("generation control evidence changed after completion receipt")
+						return &VerificationRefusal{Message: "generation control evidence changed after completion receipt"}
 					}
 				} else {
 					if receipt.ControlFiles == nil {
@@ -167,23 +163,24 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 				}
 			}
 			if entry.Name() == "wefty-agent" {
-				b, err := dir.ReadFile(entry.Name())
+				b, err := readOwnedFile(dir, entry.Name(), mode)
 				if err != nil {
 					return err
 				}
 				if digestBytes(b) != g.Digest {
-					return errors.New("retained executable changed")
+					return &VerificationRefusal{Message: "retained executable changed"}
 				}
 			}
 		}
 	}
-	if b, err := os.ReadFile(g.Plist); err == nil {
-		info, err := os.Lstat(g.Plist)
-		if err != nil {
-			return err
-		}
-		if !privateInfo(info, 0644) || digestBytes(b) != receipt.PlistDigest {
-			return errors.New("generation plist changed after completion")
+	folder, err := os.OpenRoot(s.LaunchAgents)
+	if err != nil {
+		return err
+	}
+	defer folder.Close()
+	if b, err := readRetainedPlist(folder, filepath.Base(g.Plist)); err == nil {
+		if digestBytes(b) != receipt.PlistDigest {
+			return &VerificationRefusal{Message: "generation plist changed after completion"}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) || receiptErr != nil {
 		return err
@@ -194,26 +191,35 @@ func (s Store) RemoveFinished(ctx context.Context, proof CompletionProof) error 
 		}
 	}
 	if err := s.Manager.UnloadFinishedGeneration(ctx, g.Label); err != nil {
+		var running *launchagent.RunningProcessError
+		if errors.As(err, &running) {
+			return &VerificationRefusal{Message: running.Error()}
+		}
 		return err
 	}
-	folder, err := os.OpenRoot(s.LaunchAgents)
-	if err != nil {
-		return err
-	}
-	defer folder.Close()
 	if err := folder.Remove(filepath.Base(g.Plist)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if err := durable.SyncDir(folder); err != nil {
 		return err
 	}
-	for _, file := range []string{"ready.json", "candidate-start.json", "control-request.json", "control-result.json", "control-refusal.json", "retirement-ack.json", "wefty-agent"} {
-		if err := root.Remove(filepath.Join(id, file)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if s.beforeGenerationRemoval != nil {
+		if err := s.beforeGenerationRemoval(id); err != nil {
 			return err
 		}
 	}
-	if err := root.Remove(id); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	for _, file := range []string{"ready.json", "candidate-start.json", "control-request.json", "control-result.json", "control-refusal.json", "retirement-ack.json", "retirement-closed.json", "wefty-agent"} {
+		if held == nil {
+			break
+		}
+		if err := held.remove(root, id, file); err != nil {
+			return err
+		}
+	}
+	if held != nil {
+		if err := held.retainEmpty(root, id, s.afterRemovalIdentityCheck); err != nil {
+			return err
+		}
 	}
 	if err := durable.SyncDir(root); err != nil {
 		return err

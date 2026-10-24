@@ -493,3 +493,81 @@ func TestUpgradeControlServiceBarrierResultsRetainErrorType(t *testing.T) {
 		})
 	}
 }
+
+func TestUpgradeControlStagedAbortUsesCurrentPrimaryAndExactOperation(t *testing.T) {
+	store, primary := newUpgradeControlStore(t)
+	boot := "darwin:11111111-1111-1111-1111-111111111111"
+	candidate, err := store.PrepareCandidate(primary.Executable, "next", boot, []int{1}, "operation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var closes atomic.Int32
+	client := newRoundTripClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
+			_ = json.NewEncoder(w).Encode(l1.HeartbeatResponse{Node: l1.Node{NodeRegistration: contract.NodeRegistration{NodeID: "node", AgentGenerationID: primary.ID, BootSessionID: "primary-boot"}, AuthorityGeneration: 1, IntentRevision: 2, IntentReason: "closed"}})
+		case strings.HasSuffix(r.URL.Path, "/close"):
+			var request l1.CloseNodeGenerationRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+			}
+			if request.Abort == nil || request.Abort.OperationID != "operation" || request.BootSessionID != candidate.CandidateBootSessionID {
+				t.Error("changed abort request")
+			}
+			closes.Add(1)
+			_ = json.NewEncoder(w).Encode(l1.NodeGenerationInventory{NodeID: "node"})
+		case strings.HasSuffix(r.URL.Path, "/generations"):
+			_ = json.NewEncoder(w).Encode(l1.NodeGenerationInventory{NodeID: "node", Generations: []l1.NodeGeneration{{AgentGenerationID: primary.ID, BootSessionID: "primary-boot", Role: l1.NodeGenerationPrimary}, {AgentGenerationID: candidate.ID, BootSessionID: candidate.CandidateBootSessionID, Role: l1.NodeGenerationClosed, PromotionOperationID: "operation"}}})
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	clock := systemClock{}
+	session := newAgentSession(client, contract.NodeRegistration{NodeID: "node", AgentGenerationID: primary.ID, BootSessionID: "primary-boot", SystemBootID: boot}, nil, time.Second, time.Second, clock, newLifecycleObserver(clock), nil, 1, 1)
+	a := &Agent{session: session}
+	payload := agentinstall.StagedAbortControl{CandidateGenerationID: candidate.ID, Request: l1.CloseNodeGenerationRequest{BootSessionID: candidate.CandidateBootSessionID, PromotionOperationID: "operation", ResidentAttempts: []l1.ResidentAttempt{}, RuntimesReaped: true, EvidenceSettled: true, Abort: &l1.StagedGenerationAbort{OperationID: "operation", PrimaryGenerationID: primary.ID, PrimaryBootSessionID: "primary-boot", AuthorityGeneration: 1, IntentRevision: 2, IntentReason: "closed"}}}
+	raw, _ := json.Marshal(payload)
+	control := agentinstall.ControlRequest{ID: "different", Payload: raw}
+	if _, err = a.abortStaged(t.Context(), store, control); err == nil || closes.Load() != 0 {
+		t.Fatal("changed operation reached L1", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- a.ServeUpgradeControl(ctx, store) }()
+	defer func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	send := func(action string, payload json.RawMessage) {
+		t.Helper()
+		request := agentinstall.ControlRequest{ID: "operation", RequestID: action, NodeID: "node", GenerationID: primary.ID, BootSessionID: "primary-boot", Action: action, Payload: payload}
+		if err := store.RequestControl(request); err != nil {
+			t.Fatal(err)
+		}
+		retirementWait(t, "recovery adapter reply", func() bool {
+			reply, err := store.ReadControlReply(request)
+			return err == nil && reply.Request.RequestID == request.RequestID
+		})
+		reply, err := store.ReadControlReply(request)
+		if err != nil || reply.Error != "" {
+			t.Fatalf("%s: %+v %v", action, reply, err)
+		}
+	}
+	proof := UpgradeServiceQuiescence{OperationID: "operation", NodeID: "node", AgentGenerationID: primary.ID, BootSessionID: "primary-boot", IntentRevision: 2, IntentReason: "closed", Services: []l1.NodeActiveAttempt{}}
+	proofRaw, _ := json.Marshal(proof)
+	send("quiesce_services", proofRaw)
+	send("abort_staged_generation", raw)
+	send("resume_services", nil)
+	if closes.Load() != 1 {
+		t.Fatal("staged close repeated or bypassed")
+	}
+	session.claimMu.Lock()
+	resumed := session.upgradeServiceResumed["operation"] && session.upgradeServiceOperation == ""
+	session.claimMu.Unlock()
+	if !resumed {
+		t.Fatal("real resume adapter did not release the recovery gate")
+	}
+}

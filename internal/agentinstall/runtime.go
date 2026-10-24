@@ -103,6 +103,11 @@ func (s Store) LoadCandidate(ctx context.Context, id string, base launchagent.Ag
 	if err := writePrivate(root, catalogName, c); err != nil {
 		return "", err
 	}
+	if s.afterCandidateWrite != nil {
+		if err := s.afterCandidateWrite("plist_intent_recorded"); err != nil {
+			return "", err
+		}
+	}
 	return s.Manager.LoadGeneration(ctx, folder, g.Plist, g.Label, payload)
 }
 
@@ -174,7 +179,7 @@ func (s Store) StartupWithLifetime(id, nodeID, executable, boot string) (*Genera
 	if c.PendingReceipt != "" {
 		return nil, &VerificationRefusal{Message: "generation promotion unresolved; startup requires reconciliation"}
 	}
-	if g.Role == "retiring" || (g.Role == "" && !hostboot.SameBoot(g.StartBootID, boot)) {
+	if g.Role == "retiring" || g.AbortOperation != "" || (g.Role == "" && !hostboot.SameBoot(g.StartBootID, boot)) {
 		return nil, ErrStartupSuppressed
 	}
 	if !hostboot.ValidIdentity(boot) {
@@ -183,17 +188,17 @@ func (s Store) StartupWithLifetime(id, nodeID, executable, boot string) (*Genera
 	if err := s.verifyExecutable(root, g); err != nil {
 		return nil, err
 	}
-	release, err := lockDirectory(filepath.Join(s.Root(), id))
+	held, err := holdGenerationDirectory(root, id)
 	if err != nil {
 		return nil, fmt.Errorf("generation already running or process lock unavailable: %w", err)
 	}
+	release := held.Close
 	if g.Role == "" {
-		dir, err := root.OpenRoot(id)
-		if err != nil {
+		if err := held.verify(root, id); err != nil {
 			release()
 			return nil, err
 		}
-		defer dir.Close()
+		dir := held.root
 		if err := durable.CreateFile(dir, "candidate-start.json", []byte("{}\n"), 0600); err != nil {
 			release()
 			if errors.Is(err, os.ErrExist) {
@@ -245,7 +250,19 @@ func (s Store) PublishReady(id, nodeID, version, executable, bootSession, system
 	if err != nil {
 		return err
 	}
-	return writePrivate(root, filepath.Join(id, "ready.json"), Ready{Phase: phase, GenerationID: id, NodeID: nodeID, Version: version, Digest: g.Digest, Binding: Binding{ProcessStartID: startID, PID: os.Getpid(), BootSessionID: bootSession, SystemBootID: systemBoot, ReadyAt: time.Now().UTC()}})
+	ready := Ready{Phase: phase, GenerationID: id, NodeID: nodeID, Version: version, Digest: g.Digest, Binding: Binding{ProcessStartID: startID, PID: os.Getpid(), BootSessionID: bootSession, SystemBootID: systemBoot, ReadyAt: time.Now().UTC()}}
+	if err := writePrivate(root, filepath.Join(id, "ready.json"), ready); err != nil {
+		return err
+	}
+	// Primary restarts publish a fresh incarnation. Keep the catalog bound to
+	// that exact registered process, rather than retaining candidate readiness.
+	if g.Role == "primary" && c.PendingReceipt == "" {
+		g.Process = &ready.Binding
+		c.Generations[id] = g
+		c.Revision++
+		return writePrivate(root, catalogName, c)
+	}
+	return nil
 }
 
 // BindReady requires an exact externally expected process binding and a fresh
@@ -329,12 +346,21 @@ func (s Store) processStart(pid int) (string, error) {
 // AwaitActivation keeps a staged candidate alive without opening participants,
 // stores or running payloads. Only a committed local primary transition opens
 // startup. The caller holds its generation process lock throughout this wait.
-func (s Store) AwaitActivation(ctx context.Context, id string) error {
+func (s Store) AwaitActivation(ctx context.Context, id string, reconcile ...func(context.Context) error) error {
+	var nextReconcile time.Time
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if !time.Now().Before(nextReconcile) {
+			nextReconcile = time.Now().Add(time.Second)
+			for _, resolve := range reconcile {
+				if err := resolve(ctx); err != nil {
+					return err
+				}
+			}
 		}
 		c, err := s.Read()
 		if err != nil {
@@ -344,7 +370,7 @@ func (s Store) AwaitActivation(ctx context.Context, id string) error {
 		if !ok {
 			return &VerificationRefusal{Message: "candidate removed during activation"}
 		}
-		if g.Role == "retiring" {
+		if g.Role == "retiring" || g.AbortOperation != "" {
 			return ErrStartupSuppressed
 		}
 		if c.PendingReceipt == "" && c.Primary == id && g.Role == "primary" {
