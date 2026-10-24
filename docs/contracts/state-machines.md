@@ -2255,9 +2255,10 @@ requests with internet. New requests check L1 inside the approval write, with no
 boundary the next request needs a dialog. Window expiry does not stop running
 Seats. Windows are boot-scoped, so replacing a node boot cannot inherit one.
 L1 records expiry from its injected sleep-counting clock; durable boot-relative
-stamps survive an L1 restart. A new L1 host boot restarts each pending answer
-and retained approval window for its original bounded duration; a different
-node boot still invalidates its windows.
+stamps survive an L1 restart in the same boot. A new L1 host boot closes its
+approval windows with the logged reason `l1_host_restarted`; the next request
+needs the owner dialog again. Pending answer waits may restart for their
+original bounded duration. A different node boot still invalidates its windows.
 
 `GET /v1/seat-approval-windows` supplies the coherent L1 read used by
 `wefty status`, including each open window's node, network and end time.
@@ -2780,6 +2781,10 @@ unspecified values; changing one restarts L1 without restarting the node service
 `idle_action` remains on the Computer; no second settings store is introduced.
 This stage implements `delete` and `nothing`; `stop` remains stage B.
 
+A Seat request's answer wait includes dispatch delay: capping the request
+deadline shortens the boot-clock wait by that delay without changing the
+immutable node AnswerWait setting or shortening it again on repeated polls.
+
 A Seat's idle origin is the latest credential call, command end, or person's
 screen release. Running commands and a person driving hold expiry. Background
 programs and log-follow polls do not. Trusted backend seams are
@@ -2791,16 +2796,22 @@ Durable waits pair a boot identity with a sleep-counting elapsed clock, behind
 the injected clock seam: Darwin `CLOCK_MONOTONIC_RAW`, Linux `CLOCK_BOOTTIME`.
 Calendar timestamps label logs and replies; they do not decide Seat expiry or
 approval-window authority. L1 restarts on the same boot retain the wait.
-A new L1 host boot gives each live Seat a full idle wait and restarts pending
-answers and retained approval windows for their original bounded durations,
-once per boot. Command and screen holds remain durable. An L1 reboot is not a
+A new L1 host boot gives each live Seat a full idle wait and may restart pending
+answers for their original bounded duration, once per boot. Approval windows
+are dropped with reason `l1_host_restarted`, so reboot cannot extend their
+maximum 24-hour cap. Command and screen holds remain durable. An L1 reboot is not a
 Computer restart: only the existing Attempt lifecycle supplies that end reason.
+Command and screen holds survive an L1 reboot by design; #1150 and #1147 must
+clear their holds on a Computer restart.
 A backward elapsed-clock step within the same boot means zero elapsed and
 never a reboot. Boot identity alone identifies a new boot.
 L1's general timestamps use real wall time, without a global clock anchor.
 Existing Attempt lease comparisons still use wall time; a calendar step can
 therefore independently remove Attempt authority. Hardening those lease paths
 is separate from the Seat timers described here.
+SL-7 is not met end to end until #1247 lands: a wall-clock step larger than the
+lease time on L1's host can remove Attempt authority and end Seats as
+`the Computer restarted`.
 Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
 pending approvals and windows without a stamp do not retain authority.
 

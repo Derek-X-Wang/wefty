@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/bootclock"
@@ -60,7 +61,7 @@ func (s *Store) migrateSeatLife(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := recoverSeatApprovalClocks(ctx, s.db, s.clock); err != nil {
+	if err := recoverSeatApprovalClocks(ctx, s.db, s.clock, s.logf); err != nil {
 		s.logSeatLifeError("approval_clock_recovery", err)
 	}
 	return nil
@@ -91,9 +92,9 @@ func seatApprovalRemaining(ctx context.Context, q queryer, clock Clock, a SeatAp
 	return max(0, a.Request.AnswerWait-time.Duration(max(0, ns-started))), nil
 }
 
-// A new L1 boot restarts existing pending answers and approval windows for
-// their original bounded duration. A node boot change still invalidates them.
-func recoverSeatApprovalClocks(ctx context.Context, q seatApprovalQuery, clock Clock) error {
+// A new L1 boot may restart bounded pending answers. Existing approval
+// windows are closed so a reboot cannot extend an owner grant past its cap.
+func recoverSeatApprovalClocks(ctx context.Context, q seatApprovalQuery, clock Clock, loggers ...func(string, ...any)) error {
 	var any bool
 	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_approvals WHERE state='requested' AND wait_boot_id!='' UNION ALL SELECT 1 FROM seat_approval_windows WHERE wait_boot_id!='')`).Scan(&any); err != nil {
 		return err
@@ -109,6 +110,20 @@ func recoverSeatApprovalClocks(ctx context.Context, q seatApprovalQuery, clock C
 	if _, err = q.ExecContext(ctx, `UPDATE seat_approvals SET wait_boot_id=?,wait_started_ns=?,deadline_ns=?+json_extract(CAST(request_json AS TEXT),'$.answer_wait') WHERE state='requested' AND wait_boot_id!='' AND wait_boot_id!=?`, boot, ns, now, boot); err != nil {
 		return err
 	}
-	_, err = q.ExecContext(ctx, `UPDATE seat_approval_windows SET wait_boot_id=?,wait_started_ns=?,expires_ns=?+wait_duration_ns WHERE wait_boot_id!='' AND wait_boot_id!=?`, boot, ns, now, boot)
-	return err
+	result, err := q.ExecContext(ctx, `DELETE FROM seat_approval_windows WHERE wait_boot_id!='' AND wait_boot_id!=?`, boot)
+	if err != nil {
+		return err
+	}
+	closed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	logger := log.Printf
+	if len(loggers) > 0 {
+		logger = loggers[0]
+	}
+	if closed > 0 && logger != nil {
+		logger("event=seat_approval_windows_closed reason=l1_host_restarted count=%d", closed)
+	}
+	return nil
 }

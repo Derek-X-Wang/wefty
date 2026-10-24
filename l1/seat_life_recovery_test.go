@@ -245,8 +245,8 @@ func TestSeatApprovalClockRecoveryAcrossL1RestartAndNewBoot(t *testing.T) {
 				t.Fatal(err)
 			}
 			if newBoot {
-				if len(windows) != 1 || pending.State != "requested" || pending.RemainingWait != 5*time.Minute {
-					t.Fatalf("L1 reboot dropped bounded approval: windows=%+v pending=%+v", windows, pending)
+				if len(windows) != 0 || pending.State != "requested" || pending.RemainingWait != 5*time.Minute {
+					t.Fatalf("L1 reboot retained a window or lost its bounded pending answer: windows=%+v pending=%+v", windows, pending)
 				}
 				clock.elapsed += 5 * time.Minute
 				pending, err = f.store.BeginSeatApproval(t.Context(), "fabric-computer-node", base)

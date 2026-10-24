@@ -100,7 +100,7 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 	}
 	defer write.rollback()
 	q := seatApprovalQuery(write.tx)
-	if err := recoverSeatApprovalClocks(ctx, q, s.clock); err != nil {
+	if err := recoverSeatApprovalClocks(ctx, q, s.clock, s.logf); err != nil {
 		return SeatApproval{}, err
 	}
 	if err := requireSeatApprovalNode(ctx, q, identityNodeID, request.NodeID, request.BootSessionID); err != nil {

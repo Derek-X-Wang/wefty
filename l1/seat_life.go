@@ -29,7 +29,7 @@ func (s *Store) CheckSeatLife(ctx context.Context) error {
 			return err
 		}
 		defer w.rollback()
-		if err = recoverSeatApprovalClocks(ctx, w.tx, s.clock); err != nil {
+		if err = recoverSeatApprovalClocks(ctx, w.tx, s.clock, s.logf); err != nil {
 			return err
 		}
 		return w.commit()
