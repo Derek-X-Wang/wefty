@@ -7,6 +7,10 @@ bind. It provides four named Seat users, 1280×800 desktops, test tools and
 disk-backed Seat temp folders. See the [Seat contract](../../docs/contracts/computer-image.md#default-image-and-seats-computer-request-p5-p6-p8-p9)
 for directive fields, answers, deadlines and current P7 limits.
 
+Each screen role starts one warm x11vnc on first use and supervises it across
+client connections. Clients relay through private Unix sockets; x11vnc opens
+no TCP listener. See the [screen backend contract](../../docs/contracts/computer-image.md#warm-screen-backends).
+
 ## Single-desktop reference target
 
 Build the earlier single-desktop reference with `--target single-seat`.

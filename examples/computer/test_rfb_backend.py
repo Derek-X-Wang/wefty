@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
-"""Regression tests for bounded x11vnc session diagnostics (#569)."""
+"""Warm Unix screen roles and bounded x11vnc diagnostics (#569, #1148)."""
 
 import importlib.util
 import io
+import os
+import queue
 import re
+import socket
+import stat
+import sys
+import tempfile
 from pathlib import Path
 import subprocess
 import threading
 import time
 import unittest
+from unittest import mock
 
 
 def load_backend():
@@ -47,6 +54,125 @@ class StalledLog:
         pass
 
 
+FAKE_BACKEND = r'''
+import os, socket, sys, threading
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[sys.argv.index('-unixsock') + 1])
+listener.listen(16)
+print('warm backend ready', file=sys.stderr, flush=True)
+def serve(connection):
+    with connection:
+        connection.sendall((str(os.getpid()) + '\n').encode())
+        while True:
+            data = connection.recv(65536)
+            if not data: return
+            connection.sendall(data)
+while True:
+    connection, _ = listener.accept()
+    threading.Thread(target=serve, args=(connection,), daemon=True).start()
+'''
+
+
+class WarmBackendTest(unittest.TestCase):
+    def setUp(self):
+        display = mock.patch.dict(os.environ, {'DISPLAY': ':1'})
+        display.start()
+        self.addCleanup(display.stop)
+        self.root = tempfile.TemporaryDirectory(dir='/tmp')
+        self.addCleanup(self.root.cleanup)
+        self.commands, self.processes = [], []
+        self.started = queue.Queue()
+        class LiveLog(io.BytesIO):
+            ready = threading.Event()
+            def write(self, data):
+                size = super().write(data)
+                if b'warm backend ready' in data:
+                    self.ready.set()
+                return size
+        self.stream = LiveLog()
+        self.sink = BACKEND.DiagnosticsSink(self.stream)
+
+    def launch(self, command, **kwargs):
+        self.commands.append(command)
+        kwargs.pop('executable')
+        process = subprocess.Popen([sys.executable, '-u', '-c', FAKE_BACKEND, *command[1:]], **kwargs)
+        self.processes.append(process)
+        self.started.put(process)
+        return process
+
+    def role(self, view_only=False):
+        path = str(Path(self.root.name) / ('view.sock' if view_only else 'control.sock'))
+        backend = BACKEND.RoleBackend(path, view_only, self.sink, popen=self.launch)
+        self.addCleanup(backend.close)
+        return backend
+
+    def client(self, backend):
+        client, relay = socket.socketpair()
+        client.settimeout(5)
+        self.addCleanup(client.close)
+        threading.Thread(target=BACKEND.relay_connection, args=(relay, backend), daemon=True).start()
+        banner = b''
+        while not banner.endswith(b'\n'):
+            data = client.recv(64)
+            self.assertTrue(data, 'relay closed before the backend banner')
+            banner += data
+        return client, banner
+
+    def test_role_reuses_one_process_for_overlapping_and_later_connections(self):
+        for view_only in (False, True):
+            with self.subTest(view_only=view_only):
+                before = len(self.commands)
+                backend = self.role(view_only)
+                self.assertEqual(len(self.commands), before, 'backend must start lazily')
+                first, pid = self.client(backend)
+                second, same_pid = self.client(backend)
+                self.assertEqual(same_pid, pid)
+                first.close()
+                second.sendall(b'still connected')
+                self.assertEqual(second.recv(64), b'still connected')
+                third, later_pid = self.client(backend)
+                self.assertEqual(later_pid, pid)
+                self.assertEqual(len(self.commands), before + 1)
+                command = self.commands[-1]
+                for flag in ('-forever', '-shared', '-nopw', '-norc', '-no6'):
+                    self.assertIn(flag, command)
+                self.assertNotIn('-inetd', command)
+                self.assertEqual(command[command.index('-rfbport') + 1], '0')
+                self.assertEqual('-viewonly' in command, view_only)
+                private = Path(command[command.index('-unixsock') + 1])
+                self.assertEqual(private.parent, Path(self.root.name))
+                self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+                second.close()
+                third.close()
+                backend.close()
+
+    def test_dead_backend_is_restarted_without_losing_diagnostics(self):
+        backend = self.role()
+        first, old_pid = self.client(backend)
+        old = self.started.get(timeout=5)
+        old.terminate()
+        old.wait(timeout=5)
+        first.close()
+        self.started.get(timeout=2)  # restart happens without another client
+        second, new_pid = self.client(backend)
+        self.assertNotEqual(new_pid, old_pid)
+        second.sendall(b'restarted')
+        self.assertEqual(second.recv(64), b'restarted')
+        second.close()
+        backend.close()
+        self.sink.wait_idle()
+        diagnostics = self.stream.getvalue().decode()
+        self.assertIn('warm backend ready', diagnostics)
+        self.assertIn('session exited by signal 15', diagnostics)
+
+    def test_live_backend_forwards_diagnostics_before_disconnect(self):
+        backend = self.role()
+        client, _ = self.client(backend)
+        self.assertTrue(self.stream.ready.wait(timeout=2), 'live diagnostics waited for process exit')
+        self.assertIsNone(self.processes[0].poll())
+        client.close()
+
+
 class SessionDiagnosticsTest(unittest.TestCase):
     def test_signal_exit_is_named(self):
         status, output, pid = run_session("echo 'XIO: fatal IO error' >&2; kill -SEGV $$")
@@ -71,6 +197,11 @@ class SessionDiagnosticsTest(unittest.TestCase):
         self.assertEqual(forwarded, "x" * 64)
         self.assertIn("stderr truncated after 64 bytes", output)
         self.assertLess(len(output), 512)
+
+    def test_final_partial_chunk_reports_truncation(self):
+        status, output, _ = run_session("printf '%080d' 0 >&2", limit=64)
+        self.assertEqual(status, 0)
+        self.assertIn('stderr truncated after 64 bytes', output)
 
     def test_stalled_log_never_stalls_the_session_or_its_reaping(self):
         log = StalledLog()

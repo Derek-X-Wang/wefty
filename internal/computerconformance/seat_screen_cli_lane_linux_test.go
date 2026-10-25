@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 
 	"testing"
@@ -156,11 +157,13 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	seatMust(t, os.Chmod(state, 0700))
 	credential, _ := json.Marshal(map[string]string{"seat_id": id, "credential": ready.Credential})
 	seatMust(t, os.WriteFile(filepath.Join(state, id+".json"), credential, 0600))
+	var processStart time.Time
 	call := func(args ...string) (int, []byte, time.Duration) {
 		t.Helper()
 		command := exec.CommandContext(ctx, binaryPath, append([]string{"--l1", listener.Addr().String(), "--plain-identity", "screen-cli", "--plain-fabric-id", "plain-seat-screen-lane", "--json", "seat"}, args...)...)
-		command.Env = append(os.Environ(), "WEFTY_SEAT_STATE_ROOT="+state)
+		command.Env = append(os.Environ(), "WEFTY_SEAT_STATE_ROOT="+state, "WEFTY_SEAT_SCREEN_TIMING=1")
 		start := time.Now()
+		processStart = start
 		out, e := command.CombinedOutput()
 		elapsed := time.Since(start)
 		code := 0
@@ -173,6 +176,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		}
 		return code, out, elapsed
 	}
+	var breakdowns []map[string]float64
 	click := func() time.Duration {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "click.png")
@@ -180,6 +184,28 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("SC-1 CLI exit %d: %s", code, out)
 		}
+		var reply struct {
+			Debug struct {
+				Start  int64              `json:"screen_timing_start_unix_ns"`
+				Phases map[string]float64 `json:"screen_timing_ms"`
+			} `json:"debug"`
+		}
+		seatMust(t, json.Unmarshal(out, &reply))
+		if reply.Debug.Start == 0 {
+			t.Fatal("SC-1 CLI omitted phase timing")
+		}
+		offset := float64(reply.Debug.Start-processStart.UnixNano()) / 1e6
+		points := map[string]float64{"cli_process_start": 0}
+		for _, name := range []string{"cli_dispatch", "l1_discovery", "door_dial", "rfb_banner", "input_written", "sync_done", "screenshot_connection_open", "frame_read", "png_written"} {
+			value, ok := reply.Debug.Phases[name]
+			if !ok {
+				t.Fatalf("SC-1 CLI omitted phase %s", name)
+			}
+			points[name] = offset + value
+		}
+		breakdowns = append(breakdowns, points)
+		encoded, _ := json.Marshal(points)
+		t.Logf("SC-1 call %d phase timestamps from CLI process start (ms): %s", len(breakdowns), encoded)
 		f, err := os.Open(path)
 		seatMust(t, err)
 		im, err := png.Decode(f)
@@ -235,8 +261,19 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		t.Fatalf("SC-4 CLI exit=%d: %s", code, out)
 	}
 	t.Logf("SC-1 warm median click + PNG: %.3f ms; SC-4 Take control to first person_driving: %.3f ms; default image=%s; Linux/%s; process launch included", float64(sc1.Microseconds())/1000, float64(sc4.Microseconds())/1000, imageRef, runtime.GOARCH)
+	rss := screenLaneX11RSS(t, ctx, store, ready)
 	// Both observations are logged even when one exceeds its limit.
-	evidence, _ := json.MarshalIndent(map[string]any{"sc1_ms": float64(sc1.Microseconds()) / 1000, "sc1_cold_ms": float64(cold.Microseconds()) / 1000, "sc1_warm_ms": []float64{float64(warm[0].Microseconds()) / 1000, float64(warm[1].Microseconds()) / 1000, float64(warm[2].Microseconds()) / 1000}, "sc1_warm_median_ms": float64(sc1.Microseconds()) / 1000, "sc4_ms": float64(sc4.Microseconds()) / 1000, "image": imageRef, "platform": "linux/" + runtime.GOARCH, "process_launch_included": true, "helper_ipc_included": true}, "", "  ")
+	evidence, _ := json.MarshalIndent(map[string]any{
+		"sc1_phase_ms":       map[string]any{"cold": breakdowns[0], "warmup": breakdowns[1], "warm": breakdowns[2:]},
+		"x11vnc_rss_kib":     rss,
+		"sc1_ms":             float64(sc1.Microseconds()) / 1000,
+		"sc1_cold_ms":        float64(cold.Microseconds()) / 1000,
+		"sc1_warm_ms":        []float64{float64(warm[0].Microseconds()) / 1000, float64(warm[1].Microseconds()) / 1000, float64(warm[2].Microseconds()) / 1000},
+		"sc1_warm_median_ms": float64(sc1.Microseconds()) / 1000,
+		"sc4_ms":             float64(sc4.Microseconds()) / 1000,
+		"image":              imageRef, "platform": "linux/" + runtime.GOARCH,
+		"process_launch_included": true, "helper_ipc_included": true,
+	}, "", "  ")
 	seatMust(t, os.WriteFile(filepath.Join(filepath.Dir(requiredSeatEnv(t, "WEFTY_SEAT_EVIDENCE")), runtime.GOARCH+"-screen-cli.json"), evidence, 0600))
 	if sc1 > time.Second {
 		t.Errorf("SC-1 warm median %s exceeds 1s", sc1)
@@ -244,6 +281,95 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	if sc4 > time.Second {
 		t.Errorf("SC-4 %s exceeds 1s", sc4)
 	}
+}
+
+// Read only this Computer task's processes, then select this Seat's UID and
+// the two role names. RSS is evidence outside both timed intervals, not a gate.
+func screenLaneX11RSS(t *testing.T, ctx context.Context, store *l1.Store, seat l1.SeatCallResult) map[string]uint64 {
+	t.Helper()
+	rss := map[string]uint64{}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	computer, err := store.GetComputer(ctx, seat.ComputerID)
+	if err != nil {
+		t.Logf("x11vnc RSS unavailable: Computer lookup: %v", err)
+		return rss
+	}
+	job, err := store.GetJob(ctx, computer.CurrentJobID)
+	if err != nil {
+		t.Logf("x11vnc RSS unavailable: job lookup: %v", err)
+		return rss
+	}
+	client, err := containerd.New(requiredSeatEnv(t, "WEFTY_SEAT_CONTAINERD"), containerd.WithDefaultNamespace(ocihelper.ContainerdNamespace))
+	if err != nil {
+		t.Logf("x11vnc RSS unavailable: containerd: %v", err)
+		return rss
+	}
+	defer client.Close()
+	containers, err := client.Containers(ctx)
+	if err != nil {
+		t.Logf("x11vnc RSS unavailable: containers: %v", err)
+		return rss
+	}
+	for _, container := range containers {
+		info, err := container.Info(ctx)
+		if err != nil || job.CurrentAttemptID == "" || info.Labels["io.wefty/attempt_id"] != job.CurrentAttemptID || info.Labels["io.wefty/job_id"] != job.JobID || info.Labels["io.wefty/node_id"] != "screen-node" {
+			continue
+		}
+		task, err := container.Task(ctx, nil)
+		if err != nil {
+			continue
+		}
+		processes, err := task.Pids(ctx)
+		if err != nil {
+			continue
+		}
+		for _, process := range processes {
+			root := fmt.Sprintf("/proc/%d/", process.Pid)
+			command, err := os.ReadFile(root + "cmdline")
+			if err != nil {
+				continue
+			}
+			role := strings.SplitN(string(command), "\x00", 2)[0]
+			if role != "x11vnc-view" && role != "x11vnc-control" {
+				continue
+			}
+			status, err := os.ReadFile(root + "status")
+			if err != nil {
+				continue
+			}
+			uid, memory := "", uint64(0)
+			for _, line := range strings.Split(string(status), "\n") {
+				fields := strings.Fields(line)
+				if len(fields) < 2 {
+					continue
+				}
+				if fields[0] == "Uid:" {
+					uid = fields[1]
+				}
+				if fields[0] == "VmRSS:" {
+					memory, _ = strconv.ParseUint(fields[1], 10, 64)
+				}
+			}
+			if uid == strconv.Itoa(2000+seat.Place) && memory > 0 {
+				rss[role] += memory
+				t.Logf("Seat place %d %s pid=%d RSS=%d KiB", seat.Place, role, process.Pid, memory)
+			}
+		}
+	}
+	if len(rss) == 0 {
+		t.Log("x11vnc RSS unavailable: no matching live role processes")
+		return rss
+	}
+	if len(rss) != 2 {
+		t.Logf("x11vnc RSS partial: observed %d of 2 roles", len(rss))
+	}
+	total := uint64(0)
+	for _, memory := range rss {
+		total += memory
+	}
+	t.Logf("Seat place %d observed warm x11vnc RSS sum=%d KiB (%d roles)", seat.Place, total, len(rss))
+	return rss
 }
 
 func screenLaneJSON(ctx context.Context, f fabric.Fabric, host, method, path, credential string, body any, result any) error {

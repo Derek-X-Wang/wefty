@@ -640,6 +640,24 @@ image's highest Seat limit. Their homes are
 refused as `passwd_entry_missing` before desktop startup. User creation stays
 in the read-only image; password age uses fixed non-zero day 20000.
 
+### Warm screen backends
+
+The default image and the optional single-desktop reference start one x11vnc
+per role on first connection. Each remains warm with `-forever -shared`;
+`view` also uses `-viewonly`. Each backend relays concurrent clients through
+a private x11vnc Unix socket in the external socket's existing private
+directory. Both sockets use mode 0600. External paths and roles stay unchanged.
+`-rfbport 0 -no6 -norc` disables TCP listeners and local configuration overrides.
+
+After first use, a supervisor replaces an exited x11vnc without waiting for a
+new client. A disconnect closes that client's relay, preserving other clients
+and the role process. Backend shutdown terminates and reaps its x11vnc child.
+Diagnostics are drained continuously, forwarded through the existing bounded
+queue, and limited to 4096 bytes per process lifetime plus truncation and exit
+status lines. Neither the relay nor diagnostics records screen or input data.
+At most two warm x11vnc processes remain per Seat; the screen CLI lane records
+their observed RSS outside its timing intervals when available.
+
 ### Runtime required by every multi-Seat image
 
 Every multi-Seat image must provide executable `/usr/bin/python3`

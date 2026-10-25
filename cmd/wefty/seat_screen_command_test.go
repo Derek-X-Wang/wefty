@@ -96,9 +96,6 @@ func TestSeatScreenCommandsRealBinary(t *testing.T) {
 				t.Fatalf("exit=%d %s", code, out)
 			}
 			wantNotes := 1
-			if args[0] == "click" {
-				wantNotes = 2
-			}
 			if strings.Contains(out, "Please continue.") || strings.Count(diagnostic, "Please continue.") != wantNotes || !strings.Contains(out, "3 new Seat events") || !strings.Contains(out, "elapsed_ms") {
 				t.Fatalf("missing reply metadata: %s", out)
 			}
@@ -136,9 +133,13 @@ func TestSeatScreenCommandsRealBinary(t *testing.T) {
 	mu.Lock()
 	person = true
 	mu.Unlock()
-	code, out := runWefty(t, binaryPath, 30*time.Second, "--l1", address, "--json", "seat", "click", id, "1", "2")
+	refusedPath := filepath.Join(t.TempDir(), "refused.png")
+	code, out := runWefty(t, binaryPath, 30*time.Second, "--l1", address, "--json", "seat", "click", id, "1", "2", "--screenshot", refusedPath)
 	if code != 5 || !strings.Contains(out, "person_driving") || !strings.Contains(out, "a person is driving") || !strings.Contains(out, "elapsed_ms") {
 		t.Fatalf("refusal exit=%d %s", code, out)
+	}
+	if _, err := os.Stat(refusedPath); !os.IsNotExist(err) {
+		t.Fatalf("refused input left a PNG: %v", err)
 	}
 	path := filepath.Join(t.TempDir(), "person.png")
 	code, out = runWefty(t, binaryPath, 30*time.Second, "--l1", address, "seat", "screenshot", id, "-o", path)

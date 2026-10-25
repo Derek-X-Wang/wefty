@@ -561,8 +561,9 @@ that neither matches the published door hostname nor names an IP literal
 `wefty seat screenshot|click|move|drag|scroll|type|key SEAT_ID …` requires that
 Seat's saved credential. Missing credentials fail locally; an invalid or
 cross-Seat credential retains the L1/node `forbidden` refusal (exit 3). Input
-uses `/screen/input`; screenshots always use `/screen/view`, including an
-input call's optional screenshot. Input is never retried automatically.
+uses `/screen/input`; an input call's optional screenshot is a full
+non-incremental frame on that same connection. Screenshot-only calls use
+`/screen/view`. Input is never retried automatically.
 
 `person_driving` remains the existing typed HTTP 409 / CLI exit 5 refusal,
 with message `a person is driving`. A refused input sends no RFB input and
@@ -580,9 +581,9 @@ The PNG destination is created exclusively before input is sent. An existing
 or unwritable destination refuses the call before it can act. Once input bytes
 are written, every later failure starts with `<action> done; …` and JSON
 `details.action_done` is `true`. A failed synchronization says `input
-synchronization failed: …`; view, decode and PNG failures say `screenshot
-failed: …`. The completed action must not be retried; these errors are
-non-retryable even if the view refusal was retryable. Failed captures are removed.
+synchronization failed: …`; frame decode and PNG failures say `screenshot
+failed: …`. The completed action must not be retried; every post-input error
+is non-retryable. Failed captures are removed.
 
 A screenshot writes one valid PNG to a fresh private temp file and prints its
 absolute path. `-o FILE` selects an explicit new destination, including inside
@@ -598,5 +599,10 @@ Screen TEXT must be nonempty. It is literal even when it starts with `-`.
 Options may precede the Seat ID and TEXT; `--` before them makes all remaining
 arguments literal. Existing options after the required arguments still work.
 Every successful screen reply prints its release note to the caller's stderr,
-including repeated copies within a click-plus-screenshot call and across calls.
+including repeated copies across calls. A combined call has one screen reply.
 The latest note repeats until the next release; AI agents act on it once.
+
+The test-only `WEFTY_SEAT_SCREEN_TIMING=1` hook adds JSON `debug` with a
+`screen_timing_start_unix_ns` origin and `screen_timing_ms` phase timestamps.
+It records discovery, dial, banner, input, synchronization, capture connection,
+frame and PNG completion times. It records no input or framebuffer payloads.

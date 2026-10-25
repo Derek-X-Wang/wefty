@@ -39,7 +39,7 @@ End, PageUp, PageDown, Left, Right, Up, Down, space, plus, F1-F12, or one
 Unicode character. Join ctrl/control, shift, alt, super, meta with +:
 ctrl+l, Return, shift+Tab. Text is UTF-8, without a clipboard or shell.
 TEXT is literal even when it starts with -. Put flags before SEAT_ID and TEXT, or use --.
-Screenshots use the view path, including while a person drives.
+Screenshots alone use the view path, including while a person drives.
 Input then returns person_driving (exit 5): a person is driving.
 Default PNG files go to the system temp folder. --json includes elapsed_ms.
 `
@@ -242,6 +242,7 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		start = time.Now()
 	}
 	elapsed := func() float64 { return float64(time.Since(start).Microseconds()) / 1000 }
+	timing := newSeatScreenTiming(start)
 	a, err := parseSeatScreenArgs(args)
 	if err != nil {
 		return err
@@ -286,6 +287,7 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	if err = clients.l1.do(ctx, http.MethodGet, "/v1/seats/"+a.id+"/screen-target", nil, http.Header{l1.SeatCredentialHeader: []string{secret}}, &target, http.StatusOK); err != nil {
 		return err
 	}
+	timing.mark("l1_discovery")
 	unread := target.Unread
 	actionDone, replied := false, false
 	phase := "input synchronization"
@@ -310,6 +312,9 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 					copy.APIError.Details[k] = v
 				}
 				copy.APIError.Details["elapsed_ms"] = elapsed()
+				if timing != nil {
+					copy.APIError.Details["debug"] = timing.debug()
+				}
 				if actionDone {
 					copy.APIError.Details["action_done"] = true
 					copy.APIError.Retryable = false
@@ -340,6 +345,7 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		}
 		node.client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		c, response, e := websocket.Dial(ctx, u.String(), &websocket.DialOptions{HTTPClient: node.client, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{secret}}, Subprotocols: []string{"binary"}})
+		timing.mark("door_dial")
 		if e != nil {
 			if response != nil {
 				defer response.Body.Close()
@@ -351,6 +357,9 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 			return nil, nil, e
 		}
 		close := func() { _ = c.CloseNow() }
+		if mode == "view" || capture != nil {
+			timing.mark("screenshot_connection_open")
+		}
 		if c.Subprotocol() != "binary" {
 			close()
 			return nil, nil, fmt.Errorf("Seat screen did not negotiate binary WebSocket")
@@ -370,40 +379,46 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				return nil, nil, e
 			}
 		}
-		client, e := rfbclient.Open(websocket.NetConn(ctx, c, websocket.MessageBinary))
+		wire := &seatScreenBannerWire{ReadWriter: websocket.NetConn(ctx, c, websocket.MessageBinary), remaining: 12, received: func() { timing.mark("rfb_banner") }}
+		client, e := rfbclient.Open(wire)
 		if e != nil {
 			close()
 			return nil, nil, e
 		}
 		return client, close, nil
 	}
+	mode := "view"
 	if a.command != "screenshot" {
-		client, close, e := open("input")
-		if e != nil {
-			return e
+		mode = "input"
+	}
+	client, close, err := open(mode)
+	if err != nil {
+		return err
+	}
+	defer close()
+	if mode == "input" {
+		if err := performSeatScreenInput(client, a); err != nil {
+			return err
 		}
-		e = performSeatScreenInput(client, a)
-		// A one-pixel round trip orders the final input release before close.
-		if e == nil {
-			// Input has already been sent, even if this round trip fails.
-			actionDone = true
-			e = client.Sync()
-		}
-		close()
-		if e != nil {
-			return e
+		// All input bytes are written; subsequent failures must not repeat it.
+		actionDone = true
+		timing.mark("input_written")
+		if capture == nil {
+			if err := client.Sync(); err != nil {
+				return err
+			}
+			timing.mark("sync_done")
 		}
 	}
 	if capture != nil {
 		phase = "screenshot"
-		client, close, e := open("view")
+		frame, e := client.Frame()
 		if e != nil {
 			return e
 		}
-		frame, e := client.Frame()
-		close()
-		if e != nil {
-			return e
+		timing.mark("frame_read")
+		if actionDone {
+			timing.mark("sync_done") // the full frame also orders the final input
 		}
 		e = png.Encode(capture, frame)
 		e = errors.Join(e, capture.Close())
@@ -411,12 +426,18 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 			return e
 		}
 		captured = true
+		timing.mark("png_written")
 	}
+	close()
 	phase = "reply"
 	replied = true
 	return withSeatReply(stdout, jsonOutput, a.id, unread, func(w io.Writer) error {
 		if jsonOutput {
-			return writeJSON(w, map[string]any{"seat_id": a.id, "action": a.command, "path": path, "elapsed_ms": elapsed(), "unread_events": unread})
+			value := map[string]any{"seat_id": a.id, "action": a.command, "path": path, "elapsed_ms": elapsed(), "unread_events": unread}
+			if timing != nil {
+				value["debug"] = timing.debug()
+			}
+			return writeJSON(w, value)
 		}
 		if path != "" {
 			_, e := fmt.Fprintln(w, path)

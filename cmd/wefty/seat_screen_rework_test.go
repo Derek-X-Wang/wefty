@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image/png"
 	"io"
 	"net/http"
 	"os"
@@ -62,14 +63,19 @@ func seatScreenReworkFixture(t *testing.T, failure string) (*apiClients, string,
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		events := 0
+		requests := 0
 		_ = screenFakeRFBRequests(websocket.NetConn(ctx, ws, websocket.MessageBinary), func([]byte) { events++ }, func(width, height int) {
-			if isInput && (width != 1 || height != 1) {
-				t.Errorf("input synchronization requested %dx%d instead of 1x1", width, height)
+			requests++
+			if failure == "view" && isInput && requests > 1 {
+				t.Error("combined call requested more than one framebuffer")
+			}
+			if isInput && !(width == 1 && height == 1 || width == 1280 && height == 800) {
+				t.Errorf("unexpected input framebuffer request %dx%d", width, height)
 			}
 			if !isInput && (width != 1280 || height != 800) {
 				t.Errorf("screenshot requested %dx%d instead of full screen", width, height)
 			}
-			if isInput && failure == "sync" {
+			if isInput && (failure == "sync" || failure == "frame" || failure == "view" && width != 1280) {
 				if events != 2 {
 					t.Errorf("sync failure before click press and release: events=%d", events)
 				}
@@ -103,7 +109,7 @@ func TestSeatScreenDestinationCheckedBeforeInput(t *testing.T) {
 	}
 }
 func TestSeatScreenScreenshotFailureReportsActionDone(t *testing.T) {
-	clients, id, input := seatScreenReworkFixture(t, "view")
+	clients, id, input := seatScreenReworkFixture(t, "frame")
 	path := filepath.Join(t.TempDir(), "failed.png")
 	err := execute(t.Context(), clients, true, []string{"seat", "click", id, "1", "2", "--screenshot", path}, io.Discard, io.Discard)
 	var api *apiResponseError
@@ -132,7 +138,7 @@ func TestSeatScreenReleaseNotesUseCallerStderrAndRepeat(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if strings.Contains(stdout.String(), "Same release note.") || strings.Count(stderr.String(), "Same release note.") != 4 {
+	if strings.Contains(stdout.String(), "Same release note.") || strings.Count(stderr.String(), "Same release note.") != 2 {
 		t.Fatalf("repeated note went to wrong writer: stdout=%s stderr=%s", stdout.String(), stderr.String())
 	}
 }
@@ -155,7 +161,11 @@ func TestSeatScreenSyncFailureReportsActionDone(t *testing.T) {
 			}
 			err := execute(t.Context(), clients, true, args, io.Discard, io.Discard)
 			var api *apiResponseError
-			if err == nil || !strings.Contains(err.Error(), "click done; input synchronization failed:") || !errors.As(err, &api) || api.APIError.Details["action_done"] != true || api.APIError.Retryable {
+			phase := "input synchronization"
+			if screenshot {
+				phase = "screenshot"
+			}
+			if err == nil || !strings.Contains(err.Error(), "click done; "+phase+" failed:") || !errors.As(err, &api) || api.APIError.Details["action_done"] != true || api.APIError.Retryable {
 				t.Fatalf("missing completed action after sync failure: %v", err)
 			}
 			if input.Load() != 1 {
@@ -171,5 +181,62 @@ func TestSeatScreenSyncFailureReportsActionDone(t *testing.T) {
 				t.Fatalf("JSON lost completed action: %s", rendered.String())
 			}
 		})
+	}
+}
+
+func TestSeatScreenTimingBreakdown(t *testing.T) {
+	clients, id, _ := seatScreenReworkFixture(t, "")
+	t.Setenv("WEFTY_SEAT_SCREEN_TIMING", "1")
+	var stdout bytes.Buffer
+	if err := execute(t.Context(), clients, true, []string{"seat", "click", id, "1", "2", "--screenshot"}, &stdout, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	var reply struct {
+		Path  string `json:"path"`
+		Debug struct {
+			Start  int64              `json:"screen_timing_start_unix_ns"`
+			Phases map[string]float64 `json:"screen_timing_ms"`
+		} `json:"debug"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &reply); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(reply.Path)
+	if reply.Debug.Start == 0 {
+		t.Fatal("missing CLI timing origin")
+	}
+	for _, name := range []string{"l1_discovery", "door_dial", "rfb_banner", "input_written", "sync_done", "screenshot_connection_open", "frame_read", "png_written"} {
+		if elapsed, ok := reply.Debug.Phases[name]; !ok || elapsed < 0 {
+			t.Errorf("missing or negative phase %s: %v", name, reply.Debug.Phases)
+		}
+	}
+	if reply.Debug.Phases["rfb_banner"] > reply.Debug.Phases["input_written"] || reply.Debug.Phases["input_written"] > reply.Debug.Phases["frame_read"] || reply.Debug.Phases["frame_read"] > reply.Debug.Phases["png_written"] {
+		t.Fatalf("timing phases out of order: %v", reply.Debug.Phases)
+	}
+}
+
+func TestSeatScreenCombinedCaptureUsesInputConnection(t *testing.T) {
+	t.Setenv("WEFTY_SEAT_SCREEN_TIMING", "")
+	// A view dial would fail: this call must capture on its sole input stream.
+	clients, id, input := seatScreenReworkFixture(t, "view")
+	path := filepath.Join(t.TempDir(), "capture.png")
+	var stdout, stderr bytes.Buffer
+	if err := execute(t.Context(), clients, true, []string{"seat", "click", id, "1", "2", "--screenshot", path}, &stdout, &stderr); err != nil {
+		t.Fatalf("combined call opened view instead of reusing input: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	frame, err := png.Decode(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if input.Load() != 1 || frame.Bounds().Dx() != 1280 || frame.Bounds().Dy() != 800 || strings.Count(stderr.String(), "Same release note.") != 1 {
+		t.Fatal("combined call did not use one input reply and one full PNG")
+	}
+	if bytes.Contains(stdout.Bytes(), []byte(`"debug"`)) {
+		t.Fatal("test-only timing appeared without the hook")
 	}
 }

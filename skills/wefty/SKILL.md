@@ -745,8 +745,8 @@ code — see the recipe above.
 
 ## Drive a Seat's screen
 
-Use only your own Seat ID and its saved credential. Each call opens and closes
-its own connection; there is no screen daemon.
+Use only your own Seat ID and its saved credential. Each CLI call opens and
+closes one connection, including when an action also captures a screenshot.
 
 ```sh
 wefty seat screenshot SEAT_ID                  # prints a new PNG path

@@ -3077,15 +3077,17 @@ Unsupported security, messages, encodings, dimensions or rectangles fail
 closed. Complete non-incremental framebuffer updates become local PNG files.
 
 Input calls send pointer or X11 keysym events through the input endpoint.
-Modifiers and buttons are released before a one-pixel framebuffer round trip,
-which orders the end of input before the short connection closes. The server
-may return larger Raw rectangles within its ServerInit framebuffer bounds.
+Modifiers and buttons are released before a framebuffer round trip, which
+orders the end of input before the short connection closes. With a screenshot,
+this is one full non-incremental frame on the same input connection; without
+one, it requests one pixel. Screenshot-only calls use the view endpoint and
+continue working while a person drives. The server may return larger Raw
+rectangles within its ServerInit framebuffer bounds.
 The client drains the entire update, decodes only the requested intersection,
-and completes synchronization once the requested pixel is covered. Zero-size,
+and completes synchronization once the requested area is covered. Zero-size,
 out-of-screen and non-Raw rectangles still fail closed. Input is done when its
 bytes are written: a later synchronization or capture failure reports
-`action_done: true` and must not repeat the action. An optional screenshot
-opens the view endpoint after this round trip. No daemon or
+`action_done: true` and must not repeat the action. No CLI daemon or
 background screen connection survives the command. No click, key, text or
 framebuffer content is written to Wefty's logs. The CLI's screenshot file is
 an explicit local artifact, not a Seat-log entry.
@@ -3093,7 +3095,10 @@ an explicit local artifact, not a Seat-log entry.
 SC-1 measures CLI process start through the completed click and PNG on disk.
 The lane records the cold first call, performs one separate warm-up, records
 three warm calls and gates the one-second threshold on their median. The cold
-number and all warm numbers remain in the log and JSON evidence.
+number and all warm numbers remain in the log and JSON evidence. The lane also
+records phase timestamps relative to CLI process start, and warm x11vnc RSS
+for this Seat when `/proc` exposes it. A combined call's full frame is its
+synchronization, and its capture connection is already open before input.
 SC-4 performs an input warm-up outside the measurement, then measures Take
 control through the first typed `person_driving` CLI refusal. Both have a one-second limit. The root-only `computer_seat_lane`
 records CI measurements against the real default image. CI measurements do
