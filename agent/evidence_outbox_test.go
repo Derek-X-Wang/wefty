@@ -4001,7 +4001,7 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 			var allowReplayOnce sync.Once
 			releaseReplay := func() { allowReplayOnce.Do(func() { close(allowReplay) }) }
 			defer releaseReplay()
-			var completionCalls, logCalls atomic.Int32
+			var completionCalls, logCalls, inlineLogCalls atomic.Int32
 			var claimSent atomic.Bool
 			var resumed atomic.Bool
 			assertLiveAndEmpty := func() {
@@ -4049,8 +4049,20 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 					return
 				}
 				if strings.HasSuffix(r.URL.Path, "/logs") {
-					call := logCalls.Add(1)
-					if shutdown && !resumed.Load() && (call == 1 || test.boundRunsOut) {
+					logCalls.Add(1)
+					// A finalization upload is one sent before the lifecycle
+					// stores its durable completion; inline recovery comes after.
+					// On a busy machine the live uploader can miss the
+					// finalization bound and send nothing, so the first call can
+					// be inline recovery itself: count, not call order (#1262).
+					finalizing := false
+					if shutdown && !resumed.Load() {
+						finalizing = outbox.spool.inspectCompletion(r.Context(), claim.Lease.AttemptID).State != "durable_completion"
+						if !finalizing {
+							inlineLogCalls.Add(1)
+						}
+					}
+					if shutdown && !resumed.Load() && (finalizing || test.boundRunsOut) {
 						// Hold finalization, then (in the bound case) inline recovery.
 						// Only cancellation of the request releases either call.
 						<-r.Context().Done()
@@ -4197,8 +4209,8 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 				}
 				assertLiveAndEmpty()
 				if test.boundRunsOut {
-					if logCalls.Load() < 2 {
-						t.Fatalf("shutdown did not try inline recovery before its bound: log_calls=%d", logCalls.Load())
+					if inlineLogCalls.Load() < 1 {
+						t.Fatalf("shutdown did not try inline recovery before its bound: log_calls=%d inline_log_calls=%d", logCalls.Load(), inlineLogCalls.Load())
 					}
 					receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 					if receipt.State != "durable_completion" || receipt.Result.Signal != "terminated" || !receipt.Result.LogEvidenceIncomplete {
