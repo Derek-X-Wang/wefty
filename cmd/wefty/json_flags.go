@@ -23,7 +23,7 @@ out outcome params params-file path payload-file payload-json-file permission
 plain-device-id plain-fabric-id plain-identity plain-user-id policy-revision
 poll-interval probe-archive probe-digest probe-reference profile published-port ready-file reason
 reference restart revision role runtime-handler script session-token-file setup-state
-socket state state-dir status step storage-generation storage-id submit-intent-revision
+seat socket state state-dir status step storage-generation storage-id submit-intent-revision
 submitter summary tag tail timeout unit-directory wait wait-timeout workflow-ref
 vm-memory vm-cpus vm-disk window working-directory`
 

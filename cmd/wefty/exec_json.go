@@ -18,21 +18,27 @@ import (
 // All accepted watching modes use the same final event, including cases where
 // observation ended without a command verdict. A null exit code is deliberate.
 type execFinished struct {
-	Type     string            `json:"type"`
-	Outcome  string            `json:"outcome"`
-	ExitCode *int              `json:"exit_code"`
-	RunID    string            `json:"run_id"`
-	Base     string            `json:"base_commit"`
-	Dirty    bool              `json:"dirty"`
-	Status   contract.RunState `json:"status"`
-	Reason   string            `json:"reason,omitempty"`
+	Type              string            `json:"type"`
+	Outcome           string            `json:"outcome"`
+	ExitCode          *int              `json:"exit_code"`
+	RunID             string            `json:"run_id"`
+	Base              string            `json:"base_commit"`
+	Dirty             bool              `json:"dirty"`
+	Status            contract.RunState `json:"status"`
+	Reason            string            `json:"reason,omitempty"`
+	SeatID            string            `json:"seat_id,omitempty"`
+	MaxRuntimeSeconds int               `json:"max_runtime_seconds,omitempty"`
 
 	// Keep plain diagnostics specific to a published wrapper failure.
 	infrastructureFailure bool
 }
 
 func execFinishedEvent(capture execCapture, record contract.RunRecord, outcome string) execFinished {
-	return execFinished{Type: "finished", Outcome: outcome, RunID: record.RunID, Base: capture.Base, Dirty: capture.Dirty, Status: record.Status}
+	event := execFinished{Type: "finished", Outcome: outcome, RunID: record.RunID, Base: capture.Base, Dirty: capture.Dirty, Status: record.Status, SeatID: record.SeatID}
+	if record.SeatID != "" && record.Limits != nil {
+		event.MaxRuntimeSeconds = record.Limits.MaxRuntimeSeconds
+	}
+	return event
 }
 
 var execHeartbeatLine = regexp.MustCompile(`^still (running|preparing the snapshot) \([0-9]+m\)\n$`)
@@ -197,6 +203,10 @@ func reportExecFinished(ctx context.Context, clients *apiClients, record contrac
 
 func writeExecPathHint(stderr io.Writer, event execFinished) {
 	if event.Outcome == "fail" && event.ExitCode != nil && *event.ExitCode == 127 {
+		if event.SeatID != "" {
+			fmt.Fprintln(stderr, "wefty: exit 127 usually means a command was not found in the Seat's environment; install tools in the Seat or use an executable path.")
+			return
+		}
 		fmt.Fprintln(stderr, "wefty: exit 127 usually means a command was not found on the run's PATH; runs get the node's login-shell PATH, not yours. Use `bun run`, `npx`, `pnpm exec`, `uv run` or a path such as ./node_modules/.bin/<tool>; `wefty exec -- sh -c 'echo $PATH'` shows it.")
 	}
 }
