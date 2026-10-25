@@ -575,6 +575,9 @@ func executeRerun(ctx context.Context, clients *apiClients, jsonOutput bool, arg
 	if err != nil {
 		return err
 	}
+	if _, seatRun, _ := contract.ParseSeatRunParams(source.Params); source.SeatID != "" || seatRun {
+		return &apiResponseError{Service: "L3", StatusCode: 409, APIError: contract.APIError{Code: seatErrorRunRerun, Message: "Seat Runs depend on current Seat state and cannot be replayed; start a new Seat Run"}}
+	}
 	if err := checkExecRerunCapture(source); err != nil {
 		return err
 	}

@@ -26,16 +26,28 @@ import (
 // Only explicit settings are retained in the setup receipt, outside the
 // installed service environment inherited by process jobs.
 type setupComputerOptions struct {
-	SeatIdleWait     *time.Duration `json:"seat_idle_wait,omitempty"`
-	SeatWarningWait  *time.Duration `json:"seat_warning_wait,omitempty"`
-	ComputerIdleWait *time.Duration `json:"computer_idle_wait,omitempty"`
-	Image            *string        `json:"image,omitempty"`
-	SharedSeatLimit  *int           `json:"shared_seat_limit,omitempty"`
-	SeatMemoryBytes  *int64         `json:"seat_memory_bytes,omitempty"`
-	DedicatedCap     *int           `json:"dedicated_cap,omitempty"`
+	SeatCommandMaxRuntime *time.Duration `json:"seat_command_max_runtime,omitempty"`
+	SeatIdleWait          *time.Duration `json:"seat_idle_wait,omitempty"`
+	SeatWarningWait       *time.Duration `json:"seat_warning_wait,omitempty"`
+	ComputerIdleWait      *time.Duration `json:"computer_idle_wait,omitempty"`
+	Image                 *string        `json:"image,omitempty"`
+	SharedSeatLimit       *int           `json:"shared_seat_limit,omitempty"`
+	SeatMemoryBytes       *int64         `json:"seat_memory_bytes,omitempty"`
+	DedicatedCap          *int           `json:"dedicated_cap,omitempty"`
 }
 
 func bindSetupComputerFlags(flags *flag.FlagSet, values *setupComputerOptions) {
+	flags.Func("seat-command-max-runtime", fmt.Sprintf("default Seat command runtime (default %s)", contract.DefaultSeatCommandRuntime), func(raw string) error {
+		value, err := time.ParseDuration(raw)
+		if err != nil {
+			return err
+		}
+		if err = l1.ValidateSeatCommandMaxRuntime(value); err != nil {
+			return err
+		}
+		values.SeatCommandMaxRuntime = &value
+		return nil
+	})
 	flags.Func("seat-idle-wait", "Seat idle wait (default 30m)", setupPositiveDuration("seat-idle-wait", &values.SeatIdleWait))
 	flags.Func("seat-warning-wait", "warning interval before Seat expiry (default 5m)", setupPositiveDuration("seat-warning-wait", &values.SeatWarningWait))
 	flags.Func("computer-idle-wait", "Computer idle wait (default 10m)", setupPositiveDuration("computer-idle-wait", &values.ComputerIdleWait))
@@ -87,6 +99,9 @@ func setupPositiveDuration(name string, target **time.Duration) func(string) err
 }
 
 func (values *setupComputerOptions) merge(next setupComputerOptions) {
+	if next.SeatCommandMaxRuntime != nil {
+		values.SeatCommandMaxRuntime = next.SeatCommandMaxRuntime
+	}
 	if next.SeatIdleWait != nil {
 		values.SeatIdleWait = next.SeatIdleWait
 	}
@@ -111,7 +126,7 @@ func (values *setupComputerOptions) merge(next setupComputerOptions) {
 }
 
 func (values setupComputerOptions) hasClusterSettings() bool {
-	return values.Image != nil || values.SharedSeatLimit != nil || values.SeatIdleWait != nil || values.SeatWarningWait != nil || values.ComputerIdleWait != nil
+	return values.SeatCommandMaxRuntime != nil || values.Image != nil || values.SharedSeatLimit != nil || values.SeatIdleWait != nil || values.SeatWarningWait != nil || values.ComputerIdleWait != nil
 }
 
 func (values setupComputerOptions) empty() bool {
@@ -145,7 +160,7 @@ func (values setupComputerOptions) arguments(cluster, node bool) []string {
 		for _, setting := range []struct {
 			name  string
 			value *time.Duration
-		}{{"seat-idle-wait", values.SeatIdleWait}, {"seat-warning-wait", values.SeatWarningWait}, {"computer-idle-wait", values.ComputerIdleWait}} {
+		}{{"seat-command-max-runtime", values.SeatCommandMaxRuntime}, {"seat-idle-wait", values.SeatIdleWait}, {"seat-warning-wait", values.SeatWarningWait}, {"computer-idle-wait", values.ComputerIdleWait}} {
 			if setting.value != nil {
 				args = append(args, "--"+setting.name+"="+setting.value.String())
 			}
@@ -191,6 +206,7 @@ func applySetupComputerSettings(paths setupPaths, profile connprofile.Profile, s
 		var scoped setupComputerOptions
 		switch service.Label {
 		case setupL1Label:
+			scoped.SeatCommandMaxRuntime = values.SeatCommandMaxRuntime
 			scoped.Image, scoped.SharedSeatLimit = values.Image, values.SharedSeatLimit
 			scoped.SeatIdleWait, scoped.SeatWarningWait, scoped.ComputerIdleWait = values.SeatIdleWait, values.SeatWarningWait, values.ComputerIdleWait
 			service.Arguments = append(service.Arguments, scoped.arguments(true, false)...)

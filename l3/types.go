@@ -101,6 +101,7 @@ func (v WorkflowVersion) MarshalJSON() ([]byte, error) {
 }
 
 type CreateRunRequest struct {
+	SeatRun          *contract.SeatRunInput `json:"seat_run,omitempty"`
 	WorkflowRef      string                 `json:"workflow_ref,omitempty"`
 	InlineScript     *InlineScriptInput     `json:"inline_script,omitempty"`
 	Image            *contract.ImageProgram `json:"image,omitempty"`
@@ -122,7 +123,8 @@ type CreateRunRequest struct {
 }
 
 type CreateRunInput struct {
-	FabricClient   bool // Set only after authenticating the Fabric client caller.
+	SeatRunBinding *contract.SeatRunBinding // Proven with the caller's Seat credential, never supplied by JSON.
+	FabricClient   bool                     // Set only after authenticating the Fabric client caller.
 	IdempotencyKey string
 	Actor          string
 	Request        CreateRunRequest

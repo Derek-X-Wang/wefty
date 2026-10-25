@@ -16,6 +16,7 @@
     "updated_at"
   ],
   "properties": {
+    "seat_id": { "type": "string", "pattern": "^seat_[0-9a-f]{32}$" },
     "dispatch_hold": {
         "description": "Ledger-wide admission condition, projected only onto Runs waiting to submit. Never a Run outcome.",
         "type": "object", "additionalProperties": false,

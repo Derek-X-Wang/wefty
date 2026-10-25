@@ -5,19 +5,22 @@ import (
 	"flag"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 type computerStartupFlags struct {
-	seatIdleWait     time.Duration
-	seatWarningWait  time.Duration
-	computerIdleWait time.Duration
-	image            string
-	sharedSeatLimit  int
+	seatCommandMaxRuntime time.Duration
+	seatIdleWait          time.Duration
+	seatWarningWait       time.Duration
+	computerIdleWait      time.Duration
+	image                 string
+	sharedSeatLimit       int
 }
 
 func bindComputerStartupFlags(flags *flag.FlagSet) *computerStartupFlags {
 	values := &computerStartupFlags{}
+	flags.DurationVar(&values.seatCommandMaxRuntime, "seat-command-max-runtime", contract.DefaultSeatCommandRuntime, "default maximum runtime of a Seat command")
 	flags.DurationVar(&values.seatIdleWait, "seat-idle-wait", l1.DefaultSeatIdleWait, "Seat idle wait after its latest activity")
 	flags.DurationVar(&values.seatWarningWait, "seat-warning-wait", l1.DefaultSeatWarningWait, "warning interval before Seat expiry")
 	flags.DurationVar(&values.computerIdleWait, "computer-idle-wait", l1.DefaultComputerIdleWait, "Computer idle wait before its idle action")
@@ -36,6 +39,10 @@ func (values *computerStartupFlags) apply(options *l1.StoreOptions) error {
 	if values.seatIdleWait <= 0 || values.seatWarningWait <= 0 || values.seatWarningWait >= values.seatIdleWait || values.computerIdleWait <= 0 {
 		return errors.New("invalid Seat or Computer idle waits")
 	}
+	if err := l1.ValidateSeatCommandMaxRuntime(values.seatCommandMaxRuntime); err != nil {
+		return err
+	}
+	options.SeatCommandMaxRuntime = values.seatCommandMaxRuntime
 	options.SeatIdleWait = values.seatIdleWait
 	options.SeatWarningWait = values.seatWarningWait
 	options.ComputerIdleWait = values.computerIdleWait

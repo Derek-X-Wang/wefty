@@ -596,3 +596,114 @@ A selected-file copy is **not a Custody export**. It creates no Storage
 provenance, export receipt, custody manifest or custody taint. A Computer's
 removal proof and removal outcome are the same before and after copy-out.
 Whole-Storage Custody exports retain their existing contract.
+
+## Seat Runs
+
+A Seat Run is an ordinary Run bound to one Seat and the Computer Attempt that
+first hosted it. `POST /v1/runs` accepts `seat_run` as a fourth program source:
+`{"seat_id":"seat_<32 hex>","argv":["command","arg"],"max_runtime_seconds":3600}`.
+The request carries the Seat credential in `X-Wefty-Seat-Credential`, never in
+params, command text or environment. It requires a Fabric client. It cannot
+have another program source, parent, dispatch authority, restartability,
+required envelope, envelope schema or other params. L3 proves the credential
+through L1's `GET /v1/seats/{seat_id}/run-target`, which counts once as a Seat
+call for a new submission, then records the public Seat,
+Computer, Node and Computer Attempt identities in immutable Run params,
+tagged with `seat_run_version=1` beside `seat_run` and `seat_binding`. The
+ordinary Run projection also returns `seat_id`. It Pins the Job to that Node.
+The fallback inline script refuses execution on an older node. Before resolving
+a new submission, L3 looks up the submitting actor and idempotency key. An
+identical replay returns the original Run ID without another Seat call, even
+if that Seat has ended, its Computer Attempt changed, or the configured default
+changed. The request hash describes the caller's source, argv, explicit deadline
+and tags; it excludes resolved authority and the resolved default. A different
+request under the same actor and key is still an `idempotency_conflict`.
+
+L1 commits the Job's `seat_runs` binding and public params with admission.
+The params remain after terminal Job label scrubbing so a lost finish receipt
+can still release its hold. It rechecks the live
+Seat and exact Computer Attempt both then and at command start. Its node-only
+`POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/seat-run` accepts `start`,
+`poll` and `finish`, fenced by the command Attempt's Node, boot session and
+fencing token. Only the start/poll replies expose the current Computer Attempt
+fence to its node agent. Attempt foreign keys use `ON DELETE SET NULL`, and the
+Job foreign key uses `ON DELETE CASCADE`. Resolution first writes the credential
+call's Seat activity, then reads its
+binding through the shared L1 read snapshot (`TxOptions{ReadOnly:true}`). Command
+`poll` and cancellation-list reads use that same read-only snapshot boundary;
+`start` and `finish` write their transitions. A running command does not require
+a `ready` observation: a live Seat may report `starting` during a probe or
+helper generation change. Poll cancels on an ended Seat, a different Computer,
+or an ended or changed Computer Attempt or authority fence. It also checks the
+command Attempt's node against the immutable Seat binding. Start retains the
+Computer fence privately in L1; it never enters public Run params.
+
+The node agent runs argv through `ExecComputerSeat`, the existing helper
+operation. It passes the current helper generation, Seat place and Computer
+Attempt authority. It passes no caller environment, executable, user, path,
+Run token or Attempt credential. The Seat's Linux user, folder, screen and
+complete environment come from that operation. It creates no host command and
+never reaps or stops the Computer as part of a Run. Run output, log upload,
+ordinary completion, cancellation and retained results use the existing Run
+paths. File synchronization and background-program rules belong to #1152;
+the `wefty exec --seat` CLI belongs to #1151.
+
+`contract.DefaultSeatCommandRuntime` is the single shipped default: one hour.
+L1's `--seat-command-max-runtime` startup flag sets the cluster default;
+`wefty setup --seat-command-max-runtime=2h` retains the owner's setting and
+writes it only into L1's installed service arguments. It requires positive
+whole seconds. L1 publishes the current default with Seat Run resolution.
+L3 resolves it once for a new Run; changing the default cannot extend an
+already admitted Run. An explicit command deadline overrides that default. Each
+command has a positive finite deadline; omission uses that default and a
+zero, null or a negative explicit value is refused. Another positive `max_runtime_seconds` selects a
+different deadline. There is no warning or extension. The helper enforces the
+same deadline independently of the node agent's injected clock. At the limit
+only the command stops. The Run fails with `limit_reached=max_runtime` and no
+exit code. Its Run log and Seat log say it reached the limit and to start it
+again with a longer `--max-runtime`. The Seat and its folder remain available.
+
+Starting a command acquires the shared Seat command hold, and finishing it
+releases that hold and starts the thirty-minute idle wait. Both transitions
+are atomic with `command_started` / `command_finished` Seat events. Each event
+contains the Run ID; finished events contain the exit code when one exists,
+or a reason for an interrupted command. Program output stays in the Run log.
+If the finish receipt is lost, the Seat-life check recovers a terminal command
+Attempt's recorded result and releases its hold. An unusable result becomes a
+fixed valid `terminated` result without an exit code; a retained deadline reason
+is preserved when valid. Recovery logs and skips each failed row independently
+and advances through keyset pages, so one failure cannot block later Runs.
+
+L1 also bounds a running hold by its boot-relative start plus the immutable
+command deadline and `seatRunBackstopGrace` (five minutes). Once that bound is
+reached without terminal evidence, L1 force-finishes the ordinary command Job
+as failed without an exit code, finishes the Seat Run, releases the hold, and
+writes a `max_runtime_backstop` Seat event with the reason and fix. The helper
+still owns stopping the command at its deadline; L1 does not claim runtime
+quiescence from missing evidence. Calendar changes cannot extend this bound.
+Command holds survive an L1 reboot. A different L1 host boot, or an older
+active command with no start stamp, gets a current boot-relative start stamp
+on the next Seat-life check; neither case fails the Run or releases its hold.
+The receipt backstop then waits one fresh command deadline plus five-minute
+grace from that re-stamp. Repeated checks within the same host boot preserve
+that origin. The node agent and helper retain the command's original deadline;
+only L1's silent-node recovery window restarts, adding at most one deadline
+plus grace for a Run crossing an L1 reboot. Failed recovery writes retry on
+later checks. A repeated finish with identical evidence is harmless. A second start is
+refused, including after the command ends. Internal event writes recover or
+skip a missing older Seat log rather than blocking the state transition.
+
+Cancellation closes only that command's helper stream. The node agent also
+polls L1 while it runs, stopping on an ended Seat or a permanent authority
+refusal. A temporary readiness change preserves the running command. Transient
+poll failures use the ordinary Attempt lease and never
+extend it or the command deadline.
+Cancellation belongs to the Run's command Attempt and its immutable Seat and
+Computer Attempt binding. It never looks up a new occupant by place and never
+uses a Computer-wide stop. A late cancel or finish cannot affect a command of
+a later Seat or Attempt. A cancel or deadline produces a failure without an
+exit code even if a tool reports an exit code while stopping.
+
+`wefty rerun` and L3 refuse Seat Runs with `seat_run_not_replayable`
+(HTTP 409, CLI exit 5, not retryable): Seat state cannot be replayed. Start a
+new Seat Run instead.

@@ -7,6 +7,169 @@
   "paths": {},
   "components": {
     "schemas": {
+      "SeatRunInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "seat_id",
+          "argv"
+        ],
+        "properties": {
+          "seat_id": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          },
+          "argv": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4096,
+            "items": {
+              "type": "string"
+            }
+          },
+          "max_runtime_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036,
+            "default": 3600
+          }
+        }
+      },
+      "SeatRunBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "seat_id",
+          "node_id",
+          "computer_id",
+          "computer_job_id",
+          "computer_attempt_id"
+        ],
+        "properties": {
+          "default_max_runtime_seconds": { "type": "integer", "minimum": 1, "maximum": 9223372036, "description": "L1 startup default for a newly submitted Seat Run; not Attempt authority." },
+          "seat_id": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          },
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "computer_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "computer_job_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "computer_attempt_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "SeatRunControlRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "boot_session_id",
+          "fencing_token",
+          "phase"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "boot_session_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "fencing_token": {
+            "type": "string",
+            "minLength": 1
+          },
+          "phase": {
+            "enum": [
+              "start",
+              "poll",
+              "finish"
+            ]
+          },
+          "result": {
+            "$ref": "./common.v1.json#/components/schemas/ProcessResult"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "phase": {
+                  "const": "finish"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "result"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "result"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "SeatRunCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "run_id",
+          "binding",
+          "node_id",
+          "boot_session_id",
+          "fencing_token",
+          "generation",
+          "place",
+          "cancel"
+        ],
+        "properties": {
+          "run_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "binding": {
+            "$ref": "./common.v1.json#/components/schemas/SeatRunBinding"
+          },
+          "node_id": {
+            "type": "string"
+          },
+          "boot_session_id": {
+            "type": "string"
+          },
+          "fencing_token": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "place": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4
+          },
+          "cancel": {
+            "type": "boolean"
+          }
+        }
+      },
       "SeatCopyOutcomeReceipt": {
         "type": "object",
         "description": "Local publication result for an existing node-created copy-out event. Echo the node CopyID, path and size exactly. Requires a live Seat; never creates events.",
