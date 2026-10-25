@@ -99,7 +99,7 @@ func TestSeatCopyProgramParentLinkCancellationAndDeepPack(t *testing.T) {
 		t.Fatalf("linked parent: %v %s", err, out)
 	}
 	// The real child blocks on input after opening a staged file. No sleeps.
-	prefix := "import os\nreal_open=os.open\ndef observed(path,*args,**kwargs):\n fd=real_open(path,*args,**kwargs)\n if path=='item': os.write(1,b'STAGED\\n')\n return fd\nos.open=observed\n"
+	prefix := seatCopyStackDump + "import os\nreal_open=os.open\ndef observed(path,*args,**kwargs):\n fd=real_open(path,*args,**kwargs)\n if path=='item': os.write(1,b'STAGED\\n')\n return fd\nos.open=observed\n"
 	child := exec.Command(python, "-I", "-S", "-c", prefix+seatCopyProgram, "in", filepath.Join(parent, "cancelled"))
 	input, err := child.StdinPipe()
 	if err != nil {
@@ -109,6 +109,9 @@ func TestSeatCopyProgramParentLinkCancellationAndDeepPack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var stderr bytes.Buffer
+	child.Stderr = &stderr
+	deadline := time.Now().Add(seatCopyHandshakeBound)
 	if err = child.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -123,10 +126,8 @@ func TestSeatCopyProgramParentLinkCancellationAndDeepPack(t *testing.T) {
 	if _, err = input.Write(partial.Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	if line, err := bufio.NewReader(output).ReadString('\n'); err != nil || line != "STAGED\n" {
-		t.Fatalf("stage handshake=%q %v", line, err)
-	}
-	terminateSeatCopyChild(t, child)
+	readSeatCopyHandshake(t, child, output, "STAGED\n", deadline, &stderr)
+	terminateSeatCopyChild(t, child, &stderr)
 	requireNoSeatCopyStaging(t, parent)
 	deep := filepath.Join(base, "deep")
 	if err = os.Mkdir(deep, 0700); err != nil {
@@ -159,7 +160,7 @@ func TestSeatCopyProgramSignalWhileMainThreadBlocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent := t.TempDir()
-	prefix := `import os, signal, sys, threading, time
+	prefix := seatCopyStackDump + `import os, signal, sys, threading, time
 main, staged = threading.get_ident(), threading.Event()
 real_open = os.open
 def observed(path, *args, **kwargs):
@@ -168,14 +169,20 @@ def observed(path, *args, **kwargs):
         staged.set()
     return fd
 os.open = observed
+def at_stdin_read(frame):
+    # The fixed program waits in its Input.read, called by tarfile's stream
+    # reader; the old program waits in that tarfile frame itself.
+    if frame.f_code.co_name == 'read' and frame.f_code.co_filename == '<string>':
+        frame = frame.f_back
+    return frame.f_code.co_name == '__read' and frame.f_code.co_filename.endswith('tarfile.py')
 def watch():
     staged.wait()
     last, still = None, 0
     while still < 5:
         time.sleep(0.02)
         frame = sys._current_frames()[main]
-        where = (id(frame), frame.f_lasti)
-        still, last = (still + 1 if where == last else 0), where
+        where = (id(frame), frame.f_lasti) if at_stdin_read(frame) else None
+        still, last = (still + 1 if where is not None and where == last else 0), where
     os.write(1, b'PARKED\n')
     threading.Event().wait()
 threading.Thread(target=watch, daemon=True).start()
@@ -192,6 +199,7 @@ signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 	}
 	var stderr bytes.Buffer
 	child.Stderr = &stderr
+	deadline := time.Now().Add(seatCopyHandshakeBound)
 	if err = child.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -204,10 +212,8 @@ signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 	if _, err = input.Write(partial.Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	if line, err := bufio.NewReader(output).ReadString('\n'); err != nil || line != "PARKED\n" {
-		t.Fatalf("park handshake=%q %v %s", line, err, stderr.String())
-	}
-	terminateSeatCopyChild(t, child)
+	readSeatCopyHandshake(t, child, output, "PARKED\n", deadline, &stderr)
+	terminateSeatCopyChild(t, child, &stderr)
 	if code := child.ProcessState.ExitCode(); code != 1 {
 		t.Fatalf("cancelled copy exit=%d %s", code, stderr.String())
 	}
@@ -217,10 +223,48 @@ signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 	requireNoSeatCopyStaging(t, parent)
 }
 
+// seatCopyHandshakeBound covers child startup and its handshake line.
+const seatCopyHandshakeBound = 30 * time.Second
+
+// readSeatCopyHandshake requires the child's handshake line before deadline.
+// A child that never reaches that point is killed and fails the test instead
+// of hanging the package until its timeout (#1283).
+func readSeatCopyHandshake(t *testing.T, child *exec.Cmd, output io.Reader, want string, deadline time.Time, stderr *bytes.Buffer) {
+	t.Helper()
+	type handshake struct {
+		line string
+		err  error
+	}
+	got := make(chan handshake, 1)
+	go func() {
+		line, err := bufio.NewReader(output).ReadString('\n')
+		got <- handshake{line, err}
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case h := <-got:
+		if h.err == nil && h.line == want {
+			return
+		}
+		_ = child.Process.Kill()
+		_ = child.Wait()
+		t.Fatalf("copy child handshake=%q %v, want %q (#1283); stderr=%s", h.line, h.err, want, stderr.String())
+	case <-timer.C:
+		_ = child.Process.Kill()
+		_ = child.Wait()
+		t.Fatalf("copy child did not print %q within %s of start (#1283); stderr=%s", strings.TrimSpace(want), seatCopyHandshakeBound, stderr.String())
+	}
+}
+
+// seatCopyStackDump lets a stuck test child print every Python thread's stack
+// on SIGUSR1, so a bound failure shows where the child waited.
+const seatCopyStackDump = "import faulthandler, signal\nfaulthandler.register(signal.SIGUSR1, all_threads=True)\n"
+
 // terminateSeatCopyChild sends SIGTERM and requires a failed exit within a
 // short bound, so a missed signal fails in seconds instead of hanging the
-// package until its timeout.
-func terminateSeatCopyChild(t *testing.T, child *exec.Cmd) {
+// package until its timeout. On timeout it asks the child for its stacks.
+func terminateSeatCopyChild(t *testing.T, child *exec.Cmd, stderr *bytes.Buffer) {
 	t.Helper()
 	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
@@ -233,9 +277,14 @@ func terminateSeatCopyChild(t *testing.T, child *exec.Cmd) {
 			t.Fatal("cancelled copy succeeded")
 		}
 	case <-time.After(10 * time.Second):
-		_ = child.Process.Kill()
-		<-done
-		t.Fatal("copy child did not exit within 10s of SIGTERM (#1283)")
+		_ = child.Process.Signal(syscall.SIGUSR1)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = child.Process.Kill()
+			<-done
+		}
+		t.Fatalf("copy child did not exit within 10s of SIGTERM (#1283); stderr=%s", stderr.String())
 	}
 }
 
