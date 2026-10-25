@@ -17,7 +17,7 @@ class SeatRFB extends RFB {
 
 const el = id => document.getElementById(id);
 const base = location.pathname.replace(/\/viewer$/, '');
-let bearer = '', rfb, stopped = false, pollTimer, clockTimer, deadline = 0, busy = false, screenReady = false, lastDriver = null, actionEpoch = 0;
+let bearer = '', rfb, stopped = false, pollTimer, clockTimer, deadline = 0, busy = false, screenReady = false, lastDriver = null, actionEpoch = 0, reconnectSince = null;
 const wsURL = new URL(base + '/viewer-session', location.href);
 wsURL.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const socket = new WebSocket(wsURL, ['binary']);
@@ -51,9 +51,10 @@ function tick() {
     const seconds = Math.max(0, Math.ceil((deadline - performance.now()) / 1000));
     el('remaining').textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} remaining`;
     if (!seconds) stop('The one-hour viewing limit has ended. Reconnect to continue.');
+    reconnectTimedOut();
 }
 function terminal(response, body) {
-    if (response.status === 404 || body.error?.code === 'seat_ended') {
+    if (body.error?.code === 'seat_ended') {
         stop('This Seat has ended'); return true;
     }
     if (body.error?.code === 'takeover_session_ended') {
@@ -67,6 +68,20 @@ function terminal(response, body) {
     }
     return false;
 }
+function reconnectTimedOut() {
+    if (reconnectSince === null || performance.now() - reconnectSince < 30000) return false;
+    stop('Cannot reconnect to the Seat. Reopen the viewer to try again.');
+    return true;
+}
+function cannotCheck() {
+    driving('Cannot check');
+    if (reconnectTimedOut()) return;
+    if (reconnectSince !== null) {
+        el('message').textContent = 'Cannot check the Seat. Reconnecting…';
+    } else {
+        el('message').textContent = 'Cannot check the Seat. Retrying…';
+    }
+}
 async function poll() {
     if (stopped || !bearer) return;
     const epoch = actionEpoch;
@@ -75,16 +90,16 @@ async function poll() {
         const body = await response.json().catch(() => ({}));
         if (stopped || epoch !== actionEpoch || busy) return;
         if (terminal(response, body)) return;
+        if (response.status === 404 && reconnectSince === null) reconnectSince = performance.now();
         if (!response.ok) throw new Error('Cannot check the Seat. Retrying…');
+        reconnectSince = null;
         driving(body.driver); remaining(body.remaining_seconds);
         el('message').textContent = socket.readyState === WebSocket.OPEN ? 'Watching the Seat live.' : 'Screen disconnected. Reconnect to continue.';
     } catch (error) {
         if (stopped || epoch !== actionEpoch || busy) return;
-        driving('Cannot check');
-        el('take').disabled = el('release').disabled = true;
-        el('message').textContent = 'Cannot check the Seat. Retrying…';
+        cannotCheck();
     } finally {
-        if (!stopped) pollTimer = setTimeout(poll, 1000);
+        if (!stopped) pollTimer = setTimeout(poll, 3000);
     }
 }
 async function action(name) {
@@ -100,7 +115,7 @@ async function action(name) {
             method: 'POST', headers: {'X-Wefty-Control-Token': bearer, 'Content-Type': 'application/json'},
             body: JSON.stringify(name === 'release' ? {note} : {})
         });
-        const body = await response.json();
+        const body = await response.json().catch(() => ({}));
         if (stopped) return;
         if (terminal(response, body)) return;
         if (!response.ok) throw new Error(body.error?.message || 'Control action was refused.');

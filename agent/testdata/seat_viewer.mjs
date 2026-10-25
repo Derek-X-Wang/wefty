@@ -15,6 +15,8 @@ function browser() {
     };
     const requests = [], timeouts = new Map(), intervals = new Map();
     let timerID = 0, now = 0, screen, socket, hold = false, resume;
+    let actionStatus = 200, actionPlain = false;
+    let nextDelay;
     let state = {driver: 'AI agent', remaining_seconds: 3600}, status = 200;
     class WS {
         static OPEN = 1;
@@ -30,16 +32,16 @@ function browser() {
     const context = {RFB, WebSocket: WS, URL, TextEncoder, performance: {now: () => now},
         location: {pathname: '/v1/seats/seat_test/person/viewer', href: 'http://seat-node/v1/seats/seat_test/person/viewer', protocol: 'http:'},
         document: {getElementById: element}, window: {addEventListener(name, callback) { if (name === 'connect') callback(); }},
-        setTimeout(callback) {timeouts.set(++timerID, callback); return timerID;}, clearTimeout(id) {timeouts.delete(id);},
+        setTimeout(callback, delay) {nextDelay = delay; timeouts.set(++timerID, callback); return timerID;}, clearTimeout(id) {timeouts.delete(id);},
         setInterval(callback) {intervals.set(++timerID, callback); return timerID;}, clearInterval(id) {intervals.delete(id);},
         async fetch(url, options) {
             requests.push({url, options});
             if (url.endsWith('/viewer-status') && hold) await new Promise(resolve => { resume = resolve; });
             if (url.endsWith('/viewer-status')) return {status, ok: status === 200, async json() { return state; }};
-            return {status: 200, ok: true, async json() {return {};}};
+            return {status: actionStatus, ok: actionStatus === 200, async json() {if (actionPlain) throw new SyntaxError('Unexpected private transport text'); return {};}};
         }};
     vm.runInNewContext(source, context);
-    return {element, requests, timeouts, intervals, get screen() {return screen;}, get socket() {return socket;},
+    return {element, requests, timeouts, intervals, get pollDelay() {return nextDelay;}, actionReply(code, plain = false) {actionStatus = code; actionPlain = plain;}, get screen() {return screen;}, get socket() {return socket;},
         holdNextPoll() {hold = true;}, releasePoll() {hold = false; resume();},
         async connect() {socket.onmessage({data: JSON.stringify({bearer: 'private-control-bearer', remaining_seconds: 3600})}); await flush();},
         async poll(body, code = 200) {state = body; status = code; const [id, callback] = [...timeouts][0]; timeouts.delete(id); await callback(); await flush();},
@@ -51,6 +53,7 @@ function browser() {
     assert.equal(b.screen.viewOnly, true);
     assert.equal(b.element('driver').textContent, 'AI agent');
     assert.equal(b.element('take').disabled, false);
+    assert.equal(b.pollDelay, 3000);
     assert.ok(!b.socket.url.includes('private-control-bearer'));
     assert.equal(b.requests[0].options.headers['X-Wefty-Control-Token'], 'private-control-bearer');
     await b.element('take').handlers.click(); await flush();
@@ -72,7 +75,27 @@ function browser() {
 {
     const b = browser(); await b.connect();
     await b.poll({}, 404);
-    assert.equal(b.element('message').textContent, 'This Seat has ended');
+    assert.equal(b.element('message').textContent, 'Cannot check the Seat. Reconnecting…');
+    assert.equal(b.element('take').disabled, true);
+    assert.equal(b.socket.readyState, 1);
+    assert.equal(b.timeouts.size, 1);
+    b.tick(3000);
+    await b.poll({driver: 'AI agent', remaining_seconds: 3597});
+    assert.equal(b.element('message').textContent, 'Watching the Seat live.');
+    assert.equal(b.element('take').disabled, false);
+}
+{
+    const b = browser(); await b.connect();
+    await b.poll({}, 404);
+    for (let i = 0; i < 9; i++) {b.tick(3000); await b.poll({}, 404);}
+    assert.equal(b.socket.readyState, 1);
+    b.holdNextPoll();
+    const pending = b.poll({}, 404);
+    b.tick(3000); // The deadline also fires while a status fetch is still pending.
+    b.releasePoll(); await pending;
+    assert.equal(b.element('message').textContent, 'Cannot reconnect to the Seat. Reopen the viewer to try again.');
+    assert.notEqual(b.element('message').textContent, 'This Seat has ended');
+    assert.equal(b.socket.readyState, 3);
     assert.equal(b.timeouts.size, 0);
 }
 {
@@ -112,5 +135,13 @@ function browser() {
     b.releasePoll(); await pending;
     assert.equal(b.element('driver').textContent, 'you');
     assert.equal(b.screen.viewOnly, false);
+}
+{
+    const b = browser(); await b.connect();
+    b.actionReply(503, true);
+    await b.element('take').handlers.click(); await flush();
+    assert.equal(b.element('message').textContent, 'Control action was refused.');
+    assert.equal(b.element('driver').textContent, 'AI agent');
+    assert.equal(b.screen.viewOnly, true);
 }
 console.log('viewer page: view, take, note release, Seat end, cap and unavailable passed');

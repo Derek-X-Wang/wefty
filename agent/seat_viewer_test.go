@@ -281,3 +281,72 @@ func TestSeatViewerPageController(t *testing.T) {
 		t.Fatalf("shipped page controller: %v\n%s", err, output)
 	}
 }
+
+func TestSeatViewerRefusesReboundHostOnEveryPersonRoute(t *testing.T) {
+	door := newSeatFrontDoor(nil)
+	door.endpoint = "ws://seat-node:80/websockify"
+	calls := 0
+	reg, err := door.register(t.Context(), "computer", "attempt", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(http.StatusNoContent) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.close()
+	if err = reg.bind([]string{viewerSeatID}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/viewer", "/viewer/", "/viewer/index.html", "/viewer/viewer.js", "/viewer/novnc/core/rfb.js", "/viewer-session", "/viewer-status", computerControlTakePath, computerControlReleasePath, "/websockify"} {
+		for _, tc := range []struct {
+			host  string
+			allow bool
+		}{
+			{"rebound.invalid", false}, {"seat-node.attacker.invalid:80", false}, {"seat-node", true}, {"SEAT-NODE:80", true}, {"seat-node.:80", true}, {"127.0.0.1:80", true}, {"[::1]:80", true},
+		} {
+			t.Run(path+"/"+tc.host, func(t *testing.T) {
+				method := "GET"
+				if strings.Contains(path, "/control/") {
+					method = "POST"
+				}
+				request := httptest.NewRequest(method, "/v1/seats/"+viewerSeatID+"/person"+path, nil)
+				request.Host = tc.host
+				before := calls
+				response := httptest.NewRecorder()
+				door.ServeHTTP(response, request)
+				want := http.StatusForbidden
+				if tc.allow {
+					want = http.StatusNoContent
+				}
+				if response.Code != want {
+					t.Fatalf("Host %q path %q: status=%d body=%s", tc.host, path, response.Code, response.Body)
+				}
+				if !tc.allow && calls != before {
+					t.Fatal("rebound request reached the person handler")
+				}
+			})
+		}
+	}
+}
+
+func TestSeatViewerCanonicalPageAliases(t *testing.T) {
+	server, _, _, _ := viewerFixture(t, true)
+	client := *http.DefaultClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	for _, suffix := range []string{"/viewer/", "/viewer/index.html"} {
+		response, err := client.Get(server.URL + "/v1/seats/" + viewerSeatID + "/person" + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusTemporaryRedirect || response.Header.Get("Location") != "/v1/seats/"+viewerSeatID+"/person/viewer" {
+			t.Fatalf("alias %q: %d location=%q", suffix, response.StatusCode, response.Header.Get("Location"))
+		}
+	}
+	response, err := http.Get(server.URL + "/v1/seats/" + viewerSeatID + "/person/viewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	csp := response.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "connect-src 'self';") || strings.Contains(csp, "ws: wss:") {
+		t.Fatalf("viewer CSP=%q", csp)
+	}
+}

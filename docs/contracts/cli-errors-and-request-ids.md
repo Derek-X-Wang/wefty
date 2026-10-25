@@ -548,5 +548,10 @@ refuse non-admins with `control_not_authorized` (HTTP 403). An ended Seat return
 `seat_ended` (CLI exit 5); a screen that is not published returns `unavailable`.
 The browser status poll returns `takeover_session_ended` (HTTP 410) and the typed
 `session_end_reason`, including `session_cap_expired`; the owner reconnects. A
-`seat_ended` poll reply, or a 404 after the Seat is unbound, ends the viewer.
-No new CLI exit code is introduced. `--no-open` and `--json` print only the URL.
+typed `seat_ended` poll reply ends the viewer. A 404 instead starts a bounded
+30-second reconnect wait with input disabled, then asks the owner to reopen the
+viewer without claiming the Seat ended. Status polls run every three seconds.
+The person viewer, assets, session, status and sideband reject an HTTP Host
+that neither matches the published door hostname nor names an IP literal
+(HTTP 403 `forbidden`). No new CLI exit code is introduced. `--no-open` and
+`--json` print only the URL.

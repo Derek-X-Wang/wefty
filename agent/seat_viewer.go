@@ -4,6 +4,8 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"strings"
 	"time"
 
@@ -35,6 +37,24 @@ func isSeatViewerResource(path string) bool {
 	return path == "/viewer" || path == "/viewer-status" || strings.HasPrefix(path, "/viewer/")
 }
 
+// Compare against the door's published address, never forwarded headers or DNS.
+// An IP literal cannot be rebound to the node through an attacker-owned name.
+func seatViewerHostAllowed(authority, endpoint string) bool {
+	requested, err := url.Parse("//" + authority)
+	if err != nil || requested.Host != authority || requested.User != nil || requested.Path != "" || requested.RawQuery != "" || requested.ForceQuery || requested.Fragment != "" || requested.Hostname() == "" {
+		return false
+	}
+	host := requested.Hostname()
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	published, err := url.Parse(endpoint)
+	if err != nil || published.Hostname() == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSuffix(host, "."), strings.TrimSuffix(published.Hostname(), "."))
+}
+
 // Called only after Fabric authentication and the installed administrator policy.
 // No cookie, query parameter, HTML substitution or persistent browser storage
 // carries a capability. The status poll cannot extend the live session's cap.
@@ -42,7 +62,15 @@ func (f *computerFrontDoor) serveSeatViewerResource(w http.ResponseWriter, r *ht
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+	if r.URL.Path == "/viewer/" || r.URL.Path == "/viewer/index.html" {
+		if f.config.seatViewerPath == "" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, f.config.seatViewerPath, http.StatusTemporaryRedirect)
+		return
+	}
 	if r.URL.Path == "/viewer-status" {
 		if f.config.seatViewerStatus != nil {
 			if err := f.config.seatViewerStatus(r.Context()); err != nil {

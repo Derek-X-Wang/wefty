@@ -2946,7 +2946,15 @@ The person path does not require a Seat credential.
 The owner browser viewer (#1149) is `GET /v1/seats/{seat_id}/person/viewer`
 on that same front door. The page and every embedded asset under
 `/person/viewer/` require the same Fabric identity and installed administrator
-policy; a non-admin gets no HTML or session. The page has no CDN or build step;
+policy; a non-admin gets no HTML or session. All `/person/` routes, including
+page assets, browser session, status and take/release, also validate HTTP `Host`
+against the hostname of the published Seat door endpoint or an IP literal.
+Other hosts receive HTTP 403 `forbidden` before any capability is issued or
+used. Hostname comparison ignores DNS case and a final dot; forwarded headers
+and DNS resolution do not supply authority. The page CSP uses
+`connect-src 'self'`. `/person/viewer/` and `/person/viewer/index.html` redirect
+to the authenticated canonical `/person/viewer` URL, so relative assets and
+session paths use the same base. The page has no CDN or build step;
 its embedded noVNC core is pinned to v1.6.0 with its MPL-2.0 and dependency
 licenses. The page requests stateless Raw rectangles (plus DesktopSize and
 LastRect), and reasserts its pixel format, encodings and a full update request
@@ -2966,15 +2974,21 @@ noVNC to the same socket. The bearer stays only in JS memory and travels in
 poll. It is never put in a URL, HTML, cookie, browser storage or log. Session
 closure revokes it; closing the page closes the socket and releases tenure.
 
-Every second the page reads `/person/viewer-status`, authenticated through the
-Fabric, the installed administrator policy and the same session bearer. A live
+Every three seconds the page reads `/person/viewer-status`. It authenticates
+through the Fabric, the installed administrator policy and the same session bearer. A live
 reply has `driver` (`AI agent`, `you`, or `a person` for another person's session)
 and `remaining_seconds`. This poll checks fresh fenced Seat authority, but does
-not renew Seat life or reset the viewing deadline. `seat_ended` from L1, or HTTP
-404 after the front door unbinds the Seat, makes the page show **This Seat has
-ended** and stop the connection and polling. Transport or server failure is
-shown as an inability to check, never as proof of an ended Seat. A closed
-session returns `takeover_session_ended`, with its typed session end reason in
+not renew Seat life or reset the viewing deadline. Only typed `seat_ended`
+makes the page show **This Seat has ended** and stop the connection and polling.
+HTTP 404 can mean a temporary unbind while a node agent restarts. The page
+disables input, shows that it cannot check and is reconnecting, and retries.
+A successful live reply resets that wait. If no live reply follows within
+30 seconds of the first 404, the page stops and asks the owner to reopen the
+viewer; it does not claim that the Seat ended. The browser's elapsed clock also
+enforces that wait when a subsequent fetch is still pending. Other transport
+or server failure is an inability to check, never proof of an ended Seat.
+Control actions tolerate non-JSON error replies and show a plain refusal.
+A closed session returns `takeover_session_ended`, with its typed session end reason in
 the receipt; `session_cap_expired` tells the owner to reconnect. The browser
 also shows a countdown, but the node's injected-clock deadline enforces the cap.
 

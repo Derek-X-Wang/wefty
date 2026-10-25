@@ -241,6 +241,9 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	// The query-only read snapshot cannot approve, reserve, start or expire a
 	// Seat. These reads reject ended Seats and stale Attempt/ready bindings.
 	allowed := map[string]string{
+		// Administrator authority precedes Seat discovery in one read-only
+		// snapshot. This handler cannot approve, reserve or grant a Seat.
+		"GET /v1/seats/{seat_id}/viewer-target": "getSeatViewerTarget",
 		"GET /v1/seats/{seat_id}/run-target":    "resolveSeatRun",
 		"GET /v1/seats/{seat_id}/screen-target": "getSeatCopyTarget",
 		"GET /v1/seats/{seat_id}/copy-target":   "getSeatCopyTarget",

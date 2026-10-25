@@ -135,6 +135,7 @@ type computerFrontDoorConfig struct {
 	seatCopy             http.Handler
 	administratorsOnly   bool
 	seatViewerStatus     func(context.Context) error
+	seatViewerPath       string
 	authorityContext     context.Context
 	fabric               fabric.Fabric
 	authorizer           computerGrantAuthorizer

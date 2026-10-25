@@ -146,6 +146,13 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Person viewing and its sideband share the published door. Check
+	// the HTTP host before any page or browser-readable capability can escape.
+	suffix := strings.TrimPrefix(r.URL.Path, "/v1/seats/"+match[1])
+	if strings.HasPrefix(suffix, "/person/") && !seatViewerHostAllowed(r.Host, d.endpoint) {
+		writeComputerControlError(w, http.StatusForbidden, contract.APIError{Code: contract.ErrorForbidden, Message: "Seat viewer host is not allowed"}, nil)
+		return
+	}
 	d.mu.RLock()
 	registration := d.seats[match[1]]
 	var seatCtx context.Context
