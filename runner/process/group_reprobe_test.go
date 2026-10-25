@@ -14,10 +14,13 @@ import (
 // ID may belong to an unrelated process by then (#1258).
 func TestReapedLeaderGroupEscalatesOnlyWhileStillPresent(t *testing.T) {
 	// reaped starts a payload whose leader exits zero at once and is reaped,
-	// leaving one child that ignores TERM and lives for childLife.
+	// leaving one child that ignores TERM and lives for childLife. The leader
+	// ignores TERM before it forks, so the child cannot catch an early TERM.
+	// Like the other reaped-leader tests here, the group empties only after the
+	// orphaned child's new parent (launchd or init) reaps it.
 	reaped := func(t *testing.T, childLife string) (int, chan waitResult) {
 		t.Helper()
-		command := exec.Command("/bin/sh", "-c", `(trap "" TERM; exec sleep `+childLife+`) & exit 0`)
+		command := exec.Command("/bin/sh", "-c", `trap "" TERM; sleep `+childLife+` & exit 0`)
 		if err := configureProcessGroup(command); err != nil {
 			t.Fatal(err)
 		}
@@ -42,7 +45,7 @@ func TestReapedLeaderGroupEscalatesOnlyWhileStillPresent(t *testing.T) {
 		}
 		return runner, &kills
 	}
-	const grace = 5 * time.Second
+	const grace = 20 * time.Second
 	stops := []struct {
 		name string
 		stop func(*Runner, int, chan waitResult)
@@ -52,7 +55,7 @@ func TestReapedLeaderGroupEscalatesOnlyWhileStillPresent(t *testing.T) {
 	}
 	for _, stop := range stops {
 		t.Run(stop.name+": group empties within grace", func(t *testing.T) {
-			group, wait := reaped(t, "0.3")
+			group, wait := reaped(t, "1")
 			runner, kills := countingRunner(grace)
 			started := time.Now()
 			stop.stop(runner, group, wait)
