@@ -1067,65 +1067,81 @@ func generationUpgradeControl(ctx context.Context, host setupHost, op upgradeHos
 
 func (r *rollingUpgrade) waitControlRenewal(ctx context.Context, baseline l1.Node, start, after time.Time) (time.Duration, error) {
 	var diagnostic string
+	var lastErr error
 	r.receipt.ControlsRestartedAt = after
 	r.receipt.ControlRenewalProof = map[string]l1.Attempt{}
 	for r.op.now().Sub(start) < upgradeRenewalWindow && ctx.Err() == nil {
 		node, err := r.op.observe(ctx, r.profile)
-		if err != nil {
-			return r.op.now().Sub(start), err
-		}
-		diagnostic = fmt.Sprintf("observe=%v boot=%s/%s authority=%d/%d heartbeat=%s after=%s", err, node.BootSessionID, baseline.BootSessionID, node.AuthorityGeneration, baseline.AuthorityGeneration, node.LastHeartbeatAt, after)
-		complete := node.BootSessionID == baseline.BootSessionID && node.AuthorityGeneration == baseline.AuthorityGeneration && node.LastHeartbeatAt.After(after)
-		// Baseline is captured after service quiescence. Include every retiree's
-		// frozen members as well, including Attempts absent from Node's active list.
-		attempts := []l1.NodeActiveAttempt{}
-		for _, old := range r.receipt.Preserved {
-			if old.Class != contract.JobClassService {
+		if err == nil {
+			diagnostic = fmt.Sprintf("observe=%v boot=%s/%s authority=%d/%d heartbeat=%s after=%s", err, node.BootSessionID, baseline.BootSessionID, node.AuthorityGeneration, baseline.AuthorityGeneration, node.LastHeartbeatAt, after)
+			complete := node.BootSessionID == baseline.BootSessionID && node.AuthorityGeneration == baseline.AuthorityGeneration && node.LastHeartbeatAt.After(after)
+			// Baseline is captured after service quiescence. Include every retiree's
+			// frozen members as well, including Attempts absent from Node's active list.
+			attempts := []l1.NodeActiveAttempt{}
+			for _, old := range r.receipt.Preserved {
+				if old.Class != contract.JobClassService {
+					recordUpgradeWork(&attempts, old)
+				}
+			}
+			for _, old := range baseline.ActiveAttempts {
 				recordUpgradeWork(&attempts, old)
 			}
-		}
-		for _, old := range baseline.ActiveAttempts {
-			recordUpgradeWork(&attempts, old)
-		}
-		for _, g := range r.receipt.Inventory.Generations {
-			if g.Role == l1.NodeGenerationRetiring {
-				for _, a := range g.ResidentAttempts {
-					recordUpgradeWork(&attempts, l1.NodeActiveAttempt{JobID: a.JobID, AttemptID: a.AttemptID})
+			for _, g := range r.receipt.Inventory.Generations {
+				if g.Role == l1.NodeGenerationRetiring {
+					for _, a := range g.ResidentAttempts {
+						recordUpgradeWork(&attempts, l1.NodeActiveAttempt{JobID: a.JobID, AttemptID: a.AttemptID})
+					}
 				}
 			}
-		}
-		for _, old := range attempts {
-			job, err := r.op.readJob(ctx, r.profile, old.JobID)
-			if err != nil {
-				return r.op.now().Sub(start), fmt.Errorf("observe surviving job %s attempt %s: %w", old.JobID, old.AttemptID, err)
-			}
-			found := false
-			for _, a := range job.Attempts {
-				if a.AttemptID != old.AttemptID {
-					continue
+			for _, old := range attempts {
+				var job l1.Job
+				job, err = r.op.readJob(ctx, r.profile, old.JobID)
+				if err != nil {
+					err = fmt.Errorf("observe surviving job %s attempt %s: %w", old.JobID, old.AttemptID, err)
+					break
 				}
-				found = true
-				terminal := (a.State == contract.AttemptSucceeded || a.State == contract.AttemptFailed) && a.Result != nil
-				renewed := a.UpdatedAt.After(after) && a.LeaseExpiresAt.After(old.LeaseExpiresAt) && a.LeaseExpiresAt.Add(-l1.DefaultLeaseDuration).After(after)
-				if !terminal && !renewed && job.Outcome != contract.JobOutcomeCanceled {
-					diagnostic += fmt.Sprintf(" attempt=%s state=%s updated=%s expires=%s old=%s", a.AttemptID, a.State, a.UpdatedAt, a.LeaseExpiresAt, old.LeaseExpiresAt)
+				found := false
+				for _, a := range job.Attempts {
+					if a.AttemptID != old.AttemptID {
+						continue
+					}
+					found = true
+					terminal := (a.State == contract.AttemptSucceeded || a.State == contract.AttemptFailed) && a.Result != nil
+					renewed := a.UpdatedAt.After(after) && a.LeaseExpiresAt.After(old.LeaseExpiresAt) && a.LeaseExpiresAt.Add(-l1.DefaultLeaseDuration).After(after)
+					if !terminal && !renewed && job.Outcome != contract.JobOutcomeCanceled {
+						diagnostic += fmt.Sprintf(" attempt=%s state=%s updated=%s expires=%s old=%s", a.AttemptID, a.State, a.UpdatedAt, a.LeaseExpiresAt, old.LeaseExpiresAt)
+						complete = false
+					} else {
+						r.receipt.ControlRenewalProof[a.AttemptID] = a
+					}
+				}
+				if !found {
 					complete = false
-				} else {
-					r.receipt.ControlRenewalProof[a.AttemptID] = a
 				}
 			}
-			if !found {
-				complete = false
+			if complete && err == nil && r.op.now().Sub(start) < upgradeRenewalWindow && ctx.Err() == nil {
+				return r.op.now().Sub(start), nil
 			}
 		}
-		if complete {
-			return r.op.now().Sub(start), nil
+		if err != nil {
+			var transient *transientExchangeError
+			var refusal *apiResponseError
+			// An explicit response wins even when another failed exchange is
+			// joined into its cause chain. Only transport uncertainty retries.
+			if errors.As(err, &refusal) || !errors.As(err, &transient) {
+				return r.op.now().Sub(start), err
+			}
+			lastErr = err
+		}
+		if r.op.now().Sub(start) >= upgradeRenewalWindow || ctx.Err() != nil {
+			break
 		}
 		if err = r.op.wait(ctx, 100*time.Millisecond); err != nil {
-			return r.op.now().Sub(start), err
+			lastErr = errors.Join(lastErr, err)
+			break
 		}
 	}
-	return r.op.now().Sub(start), errors.Join(fmt.Errorf("control-plane renewal of every surviving generation Attempt unverified (elapsed %s, %s)", r.op.now().Sub(start), diagnostic), ctx.Err())
+	return r.op.now().Sub(start), errors.Join(fmt.Errorf("control-plane renewal of every surviving generation Attempt unverified (elapsed %s, %s)", r.op.now().Sub(start), diagnostic), lastErr, ctx.Err())
 }
 
 // Only an explicitly requested legacy drain enrolls the first immutable

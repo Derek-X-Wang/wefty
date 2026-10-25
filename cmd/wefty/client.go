@@ -931,12 +931,12 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 			return nil, classifyFailedExchange(ctx, httpexchange.Request, sandbox)
 		}
 		return nil, classifyFailedExchange(ctx, httpexchange.Request,
-			fmt.Errorf("call %s at %s: %w (%s)", c.name, c.address, err, c.addressHint()))
+			markTransientTransport(ctx, fmt.Errorf("call %s at %s: %w (%s)", c.name, c.address, err, c.addressHint())))
 	}
 	defer response.Body.Close()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 16<<20))
 	if err != nil {
-		return nil, classifyFailedExchange(ctx, httpexchange.Body, fmt.Errorf("read %s response: %w", c.name, err))
+		return nil, classifyFailedExchange(ctx, httpexchange.Body, markTransientTransport(ctx, fmt.Errorf("read %s response: %w", c.name, err)))
 	}
 	for _, status := range success {
 		if response.StatusCode == status {
@@ -955,7 +955,11 @@ func (c *apiClient) doWithResponse(ctx context.Context, method, path string, bod
 	}
 	failure := fmt.Errorf("%s returned HTTP %d", c.name, response.StatusCode)
 	if response.StatusCode >= 500 && response.StatusCode < 600 {
-		return response.Header.Clone(), classifyFailedExchange(ctx, httpexchange.BareStatus, errors.New(httpexchange.ResponseMessage(c.name, response.StatusCode, responseBody)))
+		var failure error = errors.New(httpexchange.ResponseMessage(c.name, response.StatusCode, responseBody))
+		if response.StatusCode == http.StatusBadGateway || response.StatusCode == http.StatusServiceUnavailable {
+			failure = &transientExchangeError{cause: failure}
+		}
+		return response.Header.Clone(), classifyFailedExchange(ctx, httpexchange.BareStatus, failure)
 	}
 	return response.Header.Clone(), failure
 }
