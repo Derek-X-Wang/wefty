@@ -3,6 +3,7 @@ package l1
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/upgradestate"
 )
@@ -36,7 +37,9 @@ import (
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := OpenStore(path, StoreOptions{Clock: ClockFunc(func() time.Time {
+		return time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	})})
 	if err != nil {
 		t.Fatal(err)
 	}

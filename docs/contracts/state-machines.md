@@ -2815,12 +2815,18 @@ After a new host boot, or for pre-upgrade Attempts without a boot deadline,
 comparisons fall back to the recorded wall deadline; they do not grant a fresh
 lease. A successful renewal then records the current boot and both deadlines.
 Recorded timestamps and returned lease expiry timestamps remain wall time.
-If boot-clock sampling fails, L1 keeps serving and runs unrelated maintenance,
+OpenStore reads the host boot identity once and refuses to open if that read
+fails. Seat and Attempt timers share that cached identity; transactions sample
+only boot-elapsed time. Every read and write door pins the Attempt clock, and
+a missing clock refuses lease authority instead of falling back to wall time.
+If elapsed-clock sampling fails, L1 keeps serving and runs unrelated maintenance,
 retries lease-dependent reconciliation on the next pass, and refuses lease
 authority until the clock is available. It does not silently switch a stamped
 live lease to wall time after a clock-read failure. Owner revocation still loses
 the Attempt; without a usable boot clock it clears the boot stamp and caps the
 wall deadline.
+Cancellation settlement uses its wall deadline even when elapsed-clock sampling
+fails; it does not depend on the Attempt lease clock.
 Node-side lease timers are unchanged.
 Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
 pending approvals and windows without a stamp do not retain authority.

@@ -96,6 +96,8 @@ type seatBootTestClock struct {
 }
 
 func (c *seatBootTestClock) BootTime() (string, time.Duration, error) { return c.boot, c.elapsed, nil }
+func (c *seatBootTestClock) BootIdentity() (string, error)            { return c.boot, nil }
+func (c *seatBootTestClock) BootElapsed() (time.Duration, error)      { return c.elapsed, nil }
 
 func TestSeatLifeIgnoresCalendarChangesAndCountsSleep(t *testing.T) {
 	f := newSeatLifecycleFixture(t)

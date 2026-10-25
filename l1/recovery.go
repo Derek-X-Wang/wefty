@@ -269,8 +269,7 @@ var expiredAttemptsSQL = `SELECT attempts.attempt_id
 	UNION
 	SELECT attempts.attempt_id
 	FROM jobs JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
-	WHERE @lease_boot_id IS NOT NULL
-		AND jobs.outcome='canceled'
+	WHERE jobs.outcome='canceled'
 		AND jobs.state IN (@job_claimed, @job_running, @job_awaiting_input, @job_stopping)
 		AND jobs.cancel_settle_by_ns<=@now_ns
 		AND attempts.job_id=jobs.job_id

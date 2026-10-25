@@ -237,6 +237,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if sharedSeatLimit < 2 {
 		return nil, fmt.Errorf("l1: shared Computer Seat limit must be at least 2")
 	}
+	clock, err = cacheStoreBootIdentity(clock)
+	if err != nil {
+		return nil, err
+	}
 	deploymentID, err := loadOrCreateDeploymentID(path)
 	if err != nil {
 		return nil, err

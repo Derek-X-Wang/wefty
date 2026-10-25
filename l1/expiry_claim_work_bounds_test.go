@@ -159,7 +159,8 @@ func formerAndCurrentExpiredAttempts(t *testing.T, store *Store, now time.Time) 
 	former = selectedAttempts(t, tx, formerExpiredAttemptsSQL,
 		contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput, now.UnixNano(), now.UnixNano(),
 		contract.JobClaimed, contract.JobRunning, contract.JobAwaitingInput, contract.JobStopping)
-	current = selectedAttempts(t, tx, expiredAttemptsSQL, expiredAttemptsArguments(now)...)
+	ctx := withAttemptClock(t.Context(), store.clock, now)
+	current = selectedAttempts(t, tx, expiredAttemptsSQL, expiredAttemptsArguments(now, ctx)...)
 	return former, current
 }
 
@@ -485,7 +486,8 @@ func queryPlan(t *testing.T, store *Store, query string, args ...any) []string {
 // of the embargo test really reads attempts with main's scan.
 func TestExpiredAttemptSelectionUsesItsIndexes(t *testing.T) {
 	store, clock := openRetentionSweepStore(t, StoreOptions{})
-	plan := queryPlan(t, store, expiredAttemptsSQL, expiredAttemptsArguments(clock.Now())...)
+	ctx := withAttemptClock(t.Context(), store.clock, clock.Now())
+	plan := queryPlan(t, store, expiredAttemptsSQL, expiredAttemptsArguments(clock.Now(), ctx)...)
 	for _, want := range []string{
 		"SEARCH attempts USING INDEX attempts_lease_expiry (state=? AND lease_expires_ns<?)",
 		"SEARCH attempts USING INDEX attempts_boot_lease_expiry (state=? AND lease_boot_id=? AND lease_deadline_ns>? AND lease_deadline_ns<?)",

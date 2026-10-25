@@ -3,6 +3,7 @@ package l1
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -18,20 +19,25 @@ type attemptClock struct {
 }
 type attemptClockKey struct{}
 
+var errAttemptClockMissing = errors.New("l1: missing transaction Attempt clock")
+
 func withAttemptClock(ctx context.Context, clock Clock, now time.Time) context.Context {
 	boot, ns, err := seatTime(clock, now)
 	if err != nil {
 		err = fmt.Errorf("read Attempt lease clock: %w", err)
 	}
-	// Sampling failures must not disable unrelated L1 work or startup. Lease
-	// operations refuse authority; reconciliation retries without settling leases.
+	// Elapsed sampling failures must not disable unrelated L1 work. Lease
+	// operations refuse authority; reconciliation retries lease expiry later.
 	return context.WithValue(ctx, attemptClockKey{}, attemptClock{boot, ns, err})
 }
 
-// Low-level readers used without a Store transaction retain wall-time behavior.
-// Store read snapshots and lease-writing transactions always supply this value.
+// Every Store read or write door must pin this clock. A missing sample is a
+// programming error, never permission to grant authority using wall time.
 func currentAttemptClock(ctx context.Context) attemptClock {
-	value, _ := ctx.Value(attemptClockKey{}).(attemptClock)
+	value, ok := ctx.Value(attemptClockKey{}).(attemptClock)
+	if !ok || value.boot == "" && value.err == nil {
+		return attemptClock{err: errAttemptClockMissing}
+	}
 	return value
 }
 
@@ -47,6 +53,9 @@ func (clock attemptClock) sqlBoot() any {
 func attemptLeaseExpired(ctx context.Context, now time.Time, a attemptAuthority) (bool, error) {
 	clock := currentAttemptClock(ctx)
 	if clock.err != nil {
+		if errors.Is(clock.err, errAttemptClockMissing) {
+			return false, internalError(clock.err, "read Attempt lease clock")
+		}
 		// A terminal Attempt cannot regain execution authority. Preserve historical
 		// evidence and accepted-completion replay without needing a live clock.
 		switch a.state {
@@ -75,7 +84,7 @@ func attemptLeaseArguments(ctx context.Context, now time.Time) []any {
 
 func attemptLeaseDeadline(ctx context.Context, now, expires time.Time) (string, int64) {
 	clock := currentAttemptClock(ctx)
-	if clock.boot == "" {
+	if clock.err != nil || clock.boot == "" {
 		return "", 0
 	}
 	return clock.boot, clock.ns + int64(expires.Sub(now))
