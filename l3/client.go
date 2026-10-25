@@ -256,6 +256,9 @@ func (c *L1Client) do(ctx context.Context, method, path string, body any, target
 	if err != nil {
 		return internalError(err, "create L1 request")
 	}
+	if credential, ok := ctx.Value(seatCredentialContextKey{}).(string); ok {
+		request.Header.Set(contract.SeatCredentialHeader, credential)
+	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}

@@ -370,7 +370,7 @@
       "post": {
         "operationId": "createRun",
         "summary": "Create a manual or child run",
-        "description": "Exactly one of workflow_ref, inline_script, or image is required. workflow://<id> resolves the latest version and workflow://<id>/vN resolves an explicit version; every source is snapshotted onto the run before the run row and dispatch intent commit atomically. Image reruns reuse either the submitted digest or the write-once digest ingested from accepted L1 attempt evidence; they never resolve a tag again. L1 creation uses a stable dispatch key. Idempotency keys are scoped per authenticated actor: uniqueness and replay lookup use (actor, key), including explicit keys. Each actor independently binds a key to the complete normalized request permanently, with no replay time window. Mutable references are hashed by name, not resolved contents: submitting reg/app:latest after moving the tag still replays the old run with the same key. CLI callers should pin images by digest and Workflow refs by version, or use --again for a deliberate repeat. A matching key returns the original run (HTTP 200, Idempotent-Replay: true); changed inputs under the same actor and key return idempotency_conflict; a different actor using that key creates its own run. max_cost is stored but not enforced in v0.1.",
+        "description": "Exactly one of workflow_ref, inline_script, image, or seat_run is required. Seat Runs carry X-Wefty-Seat-Credential, are Pinned to the Seat Node, use only its environment, and have a one-hour default deadline. They cannot be replayed with rerun. workflow://<id> resolves the latest version and workflow://<id>/vN resolves an explicit version; every source is snapshotted onto the run before the run row and dispatch intent commit atomically. Image reruns reuse either the submitted digest or the write-once digest ingested from accepted L1 attempt evidence; they never resolve a tag again. L1 creation uses a stable dispatch key. Idempotency keys are scoped per authenticated actor: uniqueness and replay lookup use (actor, key), including explicit keys. Each actor independently binds a key to the complete normalized request permanently, with no replay time window. Mutable references are hashed by name, not resolved contents: submitting reg/app:latest after moving the tag still replays the old run with the same key. CLI callers should pin images by digest and Workflow refs by version, or use --again for a deliberate repeat. A matching key returns the original run (HTTP 200, Idempotent-Replay: true); changed inputs under the same actor and key return idempotency_conflict; a different actor using that key creates its own run. max_cost is stored but not enforced in v0.1.",
         "security": [{ "fabricIdentity": [] }, { "fabricIdentity": [], "runToken": [] }, { "fabricIdentity": [], "computerToken": [] }],
         "parameters": [
           {
@@ -387,7 +387,6 @@
               "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["params"],
                 "properties": {
                   "workflow_ref": {
                     "type": "string",
@@ -409,6 +408,7 @@
                     }
                   },
                   "image": { "$ref": "#/components/schemas/ImageProgram" },
+                  "seat_run": { "$ref": "./common.v1.json#/components/schemas/SeatRunInput" },
                   "params": { "type": "object" },
                   "tags": {
                     "type": "array",
@@ -438,30 +438,93 @@
                 },
                 "oneOf": [
                   {
-                    "required": ["workflow_ref"],
+                    "required": ["workflow_ref", "params"],
                     "not": {
                       "anyOf": [
                         { "required": ["inline_script"] },
-                        { "required": ["image"] }
+                        { "required": ["image"] },
+                        { "required": ["seat_run"] }
                       ]
                     }
                   },
                   {
-                    "required": ["inline_script"],
+                    "required": ["inline_script", "params"],
                     "not": {
                       "anyOf": [
                         { "required": ["workflow_ref"] },
-                        { "required": ["image"] }
+                        { "required": ["image"] },
+                        { "required": ["seat_run"] }
                       ]
                     }
                   },
                   {
-                    "required": ["image"],
+                    "required": ["image", "params"],
                     "not": {
                       "anyOf": [
                         { "required": ["workflow_ref"] },
-                        { "required": ["inline_script"] }
+                        { "required": ["inline_script"] },
+                        { "required": ["seat_run"] }
                       ]
+                    }
+                  },
+                  {
+                    "required": [
+                      "seat_run"
+                    ],
+                    "not": {
+                      "anyOf": [
+                        {
+                          "required": [
+                            "workflow_ref"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "inline_script"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "image"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "parent_run_id"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "envelope_schema"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "allOf": [
+                  {
+                    "if": {
+                      "required": [
+                        "seat_run"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "params": {
+                          "type": "object",
+                          "maxProperties": 0
+                        },
+                        "dispatch_authority": {
+                          "const": false
+                        },
+                        "restartable": {
+                          "const": false
+                        },
+                        "required_envelope": {
+                          "const": false
+                        }
+                      }
                     }
                   }
                 ]

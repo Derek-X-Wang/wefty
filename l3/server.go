@@ -616,6 +616,34 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, err)
 		return
 	}
+	var seatBinding *contract.SeatRunBinding
+	if request.SeatRun != nil {
+		if r.Header.Get("Authorization") != "" {
+			writeError(w, protocolError(contract.ErrorForbidden, "Seat Runs require a Fabric client"))
+			return
+		}
+		input := CreateRunInput{IdempotencyKey: r.Header.Get("Idempotency-Key"), Actor: actorFromIdentity(identityFromRequest(r)), FabricClient: true, Request: request}
+		record, replayed, err := s.store.ReplaySeatRun(r.Context(), input)
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		if replayed {
+			s.runAccepted(w, record, true)
+			return
+		}
+		resolver, ok := s.jobs.(seatRunResolver)
+		if !ok {
+			writeError(w, protocolError(contract.ErrorForbidden, "Seat Runs require L1 Seat authority"))
+			return
+		}
+		binding, err := resolver.ResolveSeatRun(r.Context(), request.SeatRun.SeatID, r.Header.Get(contract.SeatCredentialHeader))
+		if err != nil {
+			s.writeError(w, r, err)
+			return
+		}
+		seatBinding = &binding
+	}
 	identity := identityFromRequest(r)
 	actor := actorFromIdentity(identity)
 	if scope, ok := runTokenFromRequest(r); ok {
@@ -647,6 +675,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 		Actor:          actor,
 		FabricClient:   r.Header.Get("Authorization") == "",
+		SeatRunBinding: seatBinding,
 		Request:        request,
 	})
 	if err != nil {

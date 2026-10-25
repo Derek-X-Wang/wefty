@@ -8,6 +8,72 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/seat-run": {
+      "parameters": [
+        {
+          "name": "job_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        {
+          "name": "attempt_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      ],
+      "post": {
+        "operationId": "controlSeatRun",
+        "summary": "Control a command on one fenced Seat Run Attempt",
+        "responses": {
+          "200": {
+            "description": "Seat Run reply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatRunCommand"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatRunControlRequest"
+              }
+            }
+          }
+        }
+      }
+    },
       "/v1/agent/seats/{seat_id}/copy-authority": {
         "parameters": [
           {

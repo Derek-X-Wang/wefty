@@ -1196,6 +1196,21 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		err := &contract.ExecutionError{Kind: claim.Job.Spec.Kind}
 		return spawnFailure(contract.SpawnFailureUnsupportedKind, err), err
 	}
+	if params, seatRun, err := contract.ParseSeatRunParams([]byte(claim.Job.Spec.Labels[contract.LabelRunParams])); err != nil {
+		return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+	} else if seatRun {
+		if !submittedByRunLedger(claim) || claim.Job.Spec.Kind != contract.JobKindProcess || claim.Job.Spec.Class != contract.JobClassOneShot || claim.Job.Spec.Restartable {
+			err := errors.New("Seat Run requires an ordinary non-restartable Run")
+			return spawnFailure(contract.SpawnFailureProcessRequest, err), err
+		}
+		ociRuntime, _ := lifecycle.dependencies.runtimes.selectKind(contract.JobKindOCI)
+		helper, _ := ociRuntime.(seatRunHelper)
+		var control seatRunControl
+		if lifecycle.dependencies.client != nil {
+			control = lifecycle.dependencies.client
+		}
+		runtimeAdapter = &seatRunRuntime{control: control, helper: helper, clock: lifecycle.dependencies.clock, params: params}
+	}
 	if claim.Job.Spec.Kind == contract.JobKindOCI && contract.IsComputerExecution(claim.Job.Spec.Execution) && claim.ComputerStorage == nil {
 		err := errors.New("Computer claim is missing its durable Storage identity")
 		return spawnFailure(contract.SpawnFailureManagedResourcePreparation, err), err

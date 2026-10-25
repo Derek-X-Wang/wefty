@@ -979,6 +979,9 @@ func (s *Store) CreateRerun(ctx context.Context, input CreateRerunInput) (record
 	if e := s.db.QueryRowContext(ctx, "SELECT params_json FROM runs WHERE run_id=?", input.SourceRunID).Scan(&sourceParams); e != nil && !errors.Is(e, sql.ErrNoRows) {
 		return record, false, internalError(e, "read rerun capture source")
 	}
+	if _, present, _ := contract.ParseSeatRunParams(sourceParams); present {
+		return record, false, protocolError(contract.ErrorSeatRunRerun, "Seat Runs depend on current Seat state and cannot be replayed; start a new Seat Run")
+	}
 	if _, present, e := parseExecCaptureReference(sourceParams); e != nil {
 		return record, false, e
 	} else if present {
@@ -1209,6 +1212,23 @@ func (s *Store) recordRunImageResolution(ctx context.Context, runID string, evid
 }
 
 func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, error) {
+	// Idempotency describes the caller's command, before resolving mutable
+	// Seat authority or a configured default deadline.
+	var seatRequest *CreateRunRequest
+	if input.Request.SeatRun != nil {
+		original := input.Request
+		value := *original.SeatRun
+		if original.Limits != nil {
+			value.MaxRuntimeSeconds = int64(original.Limits.MaxRuntimeSeconds)
+		}
+		original.SeatRun = &value
+		original.Limits = nil
+		original.Params = nil // An omitted or empty params object is equivalent.
+		seatRequest = &original
+	}
+	if err := normalizeSeatRun(&input); err != nil {
+		return input, "", 0, err
+	}
 	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
 	input.Actor = strings.TrimSpace(input.Actor)
 	if input.IdempotencyKey == "" || len(input.IdempotencyKey) > 255 {
@@ -1297,6 +1317,13 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 		Request CreateRunRequest `json:"request"`
 		Mode    uint32           `json:"resolved_mode"`
 	}{input.Actor, input.Request, mode}
+	if seatRequest != nil {
+		seatRequest.Tags, err = normalizeTags(seatRequest.Tags)
+		if err != nil {
+			return input, "", 0, err
+		}
+		normalizedForHash.Request = *seatRequest
+	}
 	encoded, err := json.Marshal(normalizedForHash)
 	if err != nil {
 		return input, "", 0, internalError(err, "encode normalized run request")
@@ -1444,6 +1471,9 @@ WHERE r.run_id=?`, runID).Scan(&record.RunID, &parent, &nodeID, &failureReason, 
 	record.NodeID = nodeID.String
 	record.FailureReason = failureReason.String
 	record.Params = append(json.RawMessage(nil), paramsJSON...)
+	if params, present, err := contract.ParseSeatRunParams(paramsJSON); present && err == nil {
+		record.SeatID = params.SeatRun.SeatID
+	}
 	if err := json.Unmarshal(tagsJSON, &record.Tags); err != nil {
 		return contract.RunRecord{}, internalError(err, "decode run tags")
 	}

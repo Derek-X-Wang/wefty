@@ -2812,7 +2812,9 @@ are dropped with reason `l1_host_restarted`, so reboot cannot extend their
 maximum 24-hour cap. Command and screen holds remain durable. An L1 reboot is not a
 Computer restart: only the existing Attempt lifecycle supplies that end reason.
 Command and screen holds survive an L1 reboot by design; #1150 and #1147 must
-clear their holds on a Computer restart.
+clear their holds on a Computer restart. #1150's silent-node backstop restarts
+its bounded window when L1's host boot changes; L1's reboot is not evidence
+that a remote command ended or reached its deadline.
 A backward elapsed-clock step within the same boot means zero elapsed and
 never a reboot. Boot identity alone identifies a new boot.
 L1's general timestamps use real wall time, without a global clock anchor.
@@ -2868,3 +2870,51 @@ fence cancels deletion. Once removal wins, admission cannot select that
 Computer. An owner-stopped Computer is never deleted by this timer. Automatic
 deletion uses the existing `RemoveComputer` path and its cleanup proof, without
 claiming `removed_verified` before the node agent and helper prove removal.
+
+
+### Seat Runs (#1150)
+
+The ordinary Run, Job and command Attempt keep their existing state machines.
+L1's retained `seat_runs` row binds that Run to its Seat, Computer Attempt and
+command Attempt. It has three states:
+
+| State | Entry and retained evidence | Transition |
+|---|---|---|
+| `queued` | Trusted Run Job admission records immutable public params and the original Computer Attempt. There is no command hold. | A fenced `start` rechecks the ready, live Seat and matching node and Computer Attempt, then enters `running`. |
+| `running` | Start atomically records the command Attempt, private Computer fence, boot-relative start, command hold and `command_started` event. | Fenced `finish`, lost-receipt recovery, or the deadline backstop enters `finished`. A second start is refused. |
+| `finished` | Result, released hold and `command_finished` event are committed together. A live Seat's thirty-minute idle wait starts at release. | An identical finish is harmless; conflicting evidence and new starts are refused. The Seat never becomes live again through a command finish. |
+
+`poll` is a read snapshot, not a transition or a hold renewal. A live Seat's
+observation may return to `starting` without cancelling its command. An ended
+Seat or Computer Attempt, a different Computer, or a changed fence cancels only
+the old command. The command Attempt must also belong to the
+binding's node. A Seat ID or place cannot redirect a late cancel to a later
+occupant.
+
+If an ordinary command Attempt ends before its Seat finish receipt arrives,
+Seat-life maintenance recovers the retained result. Invalid or incompatible
+result arms become a valid `terminated` result with no exit code. A valid
+retained deadline reason survives that replacement. Each failed recovery is
+logged and skipped; keyset pages continue past that Run and retry it on a later
+check.
+
+A `running` row cannot retain its hold forever when the node is silent. L1 uses
+Seat boot-relative time and the start's immutable `max_runtime_seconds`, plus
+one five-minute `seatRunBackstopGrace`. At that bound, maintenance fails the
+ordinary command Job without an exit code, then finishes the Seat Run and
+releases its hold with `max_runtime_backstop` and a reason and fix in the Seat
+log. The two steps are recoverable: if the receipt write fails after ordinary
+completion, the next check uses terminal Attempt recovery. Neither step stops
+the Computer or asserts runtime quiescence. The helper independently stops the
+command at its original deadline. Wall-clock changes cannot extend the bound.
+A changed L1 host boot or an unstamped pre-upgrade active command restarts only
+the backstop window: maintenance writes the current `start_boot_id` and
+boot-relative `start_ns` without failing the Run or releasing its hold. The
+fresh window is one command deadline plus grace from that re-stamp. Repeated
+checks and L1 restarts within the same host boot retain the stamp. The node
+agent and helper still enforce the command's original deadline independently.
+A Run crossing an L1 reboot can therefore receive at most one extra deadline
+plus grace for receipt recovery. Completed Attempt receipts still recover
+normally. Conditional re-stamp writes cannot overwrite a newer origin or a
+finished command. Start, finish and clock re-stamps use write transactions;
+polls and recovery inventories use `TxOptions{ReadOnly:true}` snapshots.
