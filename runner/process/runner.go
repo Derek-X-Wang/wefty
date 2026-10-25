@@ -104,7 +104,15 @@ type Runner struct {
 	startupReadinessDeadline time.Duration
 	readinessProbeInterval   time.Duration
 	readinessConnectTimeout  time.Duration
+	// killGroup sends the final SIGKILL to a payload group. Tests replace it to
+	// observe whether an escalation happened.
+	killGroup func(int) error
 }
+
+// groupGonePollInterval is how often a stop re-probes a group whose leader was
+// already reaped. Once the leader is reaped the group ID is no longer reserved,
+// so the final SIGKILL goes only to a group that a fresh probe still finds.
+const groupGonePollInterval = 10 * time.Millisecond
 
 // New creates a process runner with defaults for every zero-valued duration.
 func New(config Config) *Runner {
@@ -129,6 +137,7 @@ func New(config Config) *Runner {
 		startupReadinessDeadline: durationOrDefault(config.StartupReadinessDeadline, DefaultStartupReadinessDeadline),
 		readinessProbeInterval:   durationOrDefault(config.ReadinessProbeInterval, DefaultReadinessProbeInterval),
 		readinessConnectTimeout:  durationOrDefault(config.ReadinessConnectTimeout, DefaultReadinessConnectTimeout),
+		killGroup:                killProcessGroup,
 	}
 }
 
@@ -378,20 +387,35 @@ func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResul
 	completed, delivered := requestTermination(processGroupID, wait)
 	graceTimer := runner.clock.NewTimer(runner.terminationGraceTime)
 	defer stopTimer(graceTimer)
+	// The poll is a real ticker: it bounds how stale the last absence probe
+	// is, which is OS timing, not domain timing.
+	poll := time.NewTicker(groupGonePollInterval)
+	defer poll.Stop()
 
 	for {
 		if completed != nil && !processGroupAlive(processGroupID) {
 			return *completed, delivered
 		}
+		var pollChannel <-chan time.Time
+		if completed != nil {
+			pollChannel = poll.C
+		}
 
 		select {
 		case outcome := <-wait:
 			completed = &outcome
+		case <-pollChannel:
 		case <-graceTimer.C():
-			_ = killProcessGroup(processGroupID)
 			if completed != nil {
+				// The leader was reaped, so its group ID may already belong to
+				// someone else: escalate only to a group that is still there.
+				if processGroupAlive(processGroupID) {
+					_ = runner.killGroup(processGroupID)
+				}
 				return *completed, delivered
 			}
+			// The unreaped leader still holds the group ID, so it cannot be reused.
+			_ = runner.killGroup(processGroupID)
 			// Deliberately a REAL timer, not the injected clock. This bounds
 			// an OS-level reap, not domain timing: the injected clock only
 			// advances when a test tells it to, so bounding this wait with it
@@ -416,8 +440,23 @@ func (runner *Runner) cleanupRemainingGroup(processGroupID int) {
 	_ = terminateProcessGroup(processGroupID)
 	graceTimer := runner.clock.NewTimer(runner.terminationGraceTime)
 	defer stopTimer(graceTimer)
-	<-graceTimer.C()
-	_ = killProcessGroup(processGroupID)
+	poll := time.NewTicker(groupGonePollInterval)
+	defer poll.Stop()
+	// The leader is already reaped here, so the group ID is not reserved: stop
+	// as soon as the group is gone, and escalate only to a group still found.
+	for {
+		select {
+		case <-poll.C:
+			if !processGroupAlive(processGroupID) {
+				return
+			}
+		case <-graceTimer.C():
+			if processGroupAlive(processGroupID) {
+				_ = runner.killGroup(processGroupID)
+			}
+			return
+		}
+	}
 }
 
 func validateRequest(ctx context.Context, request Request) error {
