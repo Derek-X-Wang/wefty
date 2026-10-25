@@ -8,6 +8,126 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/agent/seats/{seat_id}/screen-authority": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "authorizeSeatScreen",
+        "summary": "authorizeSeatScreen",
+        "responses": {
+          "200": {
+            "description": "Fenced Seat screen reply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatScreenAuthority"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatScreenAuthorityInput"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agent/seats/{seat_id}/screen-event": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "recordSeatScreenEvent",
+        "summary": "recordSeatScreenEvent",
+        "responses": {
+          "200": {
+            "description": "Fenced Seat screen reply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatScreenEventReceipt"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatScreenEventRequest"
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/seat-run": {
       "parameters": [
         {

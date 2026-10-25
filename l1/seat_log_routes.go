@@ -101,7 +101,7 @@ func (s *Server) seatCredentialProtocol(next, logs http.Handler) http.Handler {
 			logs.ServeHTTP(w, r)
 			return
 		}
-		if !ended.Valid && r.Method == http.MethodGet && r.URL.Path == path+"/copy-target" {
+		if !ended.Valid && r.Method == http.MethodGet && (r.URL.Path == path+"/copy-target" || r.URL.Path == path+"/screen-target") {
 			logs.ServeHTTP(w, r)
 			return
 		}

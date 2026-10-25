@@ -10,6 +10,13 @@ import (
 
 const computerAuditAttempts = 3
 
+// computerAuditFailure marks an audit write only after asserted retries are
+// exhausted. It preserves the underlying typed refusal and its error text.
+type computerAuditFailure struct{ err error }
+
+func (e *computerAuditFailure) Error() string { return e.err.Error() }
+func (e *computerAuditFailure) Unwrap() error { return e.err }
+
 type computerAuditAppend func(context.Context, l1.ComputerTakeoverAuditEvent) (l1.ComputerTakeoverAuditReceipt, error)
 
 func canonicalComputerAuditEvent(event l1.ComputerTakeoverAuditEvent) l1.ComputerTakeoverAuditEvent {
@@ -34,7 +41,7 @@ func appendAssertedComputerAudit(ctx context.Context, appendEvent computerAuditA
 			break
 		}
 	}
-	return lastErr
+	return &computerAuditFailure{err: lastErr}
 }
 
 func computerAuditReceiptAsserts(receipt l1.ComputerTakeoverAuditReceipt, requested l1.ComputerTakeoverAuditEvent) bool {

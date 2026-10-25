@@ -36,6 +36,8 @@ import (
 // Then #1153 adds Attempt-bound, boot-relative copy leases in seat_copy_holds.
 // Then #1150 adds Seat Run identity, exact command Attempt bindings,
 // boot-relative start stamps and the private admitted Computer fence.
+// #1147 adds screen routes using the existing Seat logs and activity holds;
+// it adds no persisted schema, so this fingerprint remains unchanged.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {

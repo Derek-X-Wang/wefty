@@ -244,3 +244,18 @@ L1 restarts preserve leases. A different boot drops old lease authority and
 starts the ordinary new-boot idle wait. Seat or Attempt ending clears copy
 holds and the node cancels transfers when a Seat is unbound or renewal is
 refused. A delayed sending receipt cannot resurrect a terminal operation.
+
+## Seat screen evidence (#1147)
+
+The closed kinds also include `screen_input` and `takeover`. A `screen_input`
+event names `ai_agent` in `reason`, once per admitted AI agent input stream.
+The person's input path is identified by its `control_taken` event and bounded
+Controller tenure. `takeover` carries session open/close, denial and override
+evidence in `audit`. Control acquisition and release use `control_taken` and
+`control_released`; release may carry a `note`. These records contain no
+clicks, keys or screen contents. They are the take-over audit for that Seat.
+The node-only screen-event writer requires exact retained Seat/Attempt
+binding, returns L1-derived audit authority generation, and uses the same
+strict writer as `AppendSeatEvent`. Its tenure events change the Seat-life
+person hold in that same transaction. Immutable retries do not repeat hold
+transitions.

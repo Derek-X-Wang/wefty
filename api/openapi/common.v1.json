@@ -7,6 +7,132 @@
   "paths": {},
   "components": {
     "schemas": {
+      "SeatScreenEventReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event",
+          "replayed"
+        ],
+        "properties": {
+          "event": {
+            "$ref": "#/components/schemas/SeatLogEvent"
+          },
+          "replayed": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SeatScreenAuthorityInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "boot_session_id",
+          "fencing_token",
+          "computer_id",
+          "job_id",
+          "attempt_id",
+          "credential",
+          "input",
+          "person"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "boot_session_id": {
+            "type": "string"
+          },
+          "fencing_token": {
+            "type": "string"
+          },
+          "computer_id": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "input": {
+            "type": "boolean"
+          },
+          "person": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SeatScreenAuthority": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "generation",
+          "place",
+          "release_note",
+          "unread_events"
+        ],
+        "properties": {
+          "generation": {
+            "type": "integer"
+          },
+          "place": {
+            "type": "integer"
+          },
+          "release_note": {
+            "type": "string"
+          },
+          "unread_events": {
+            "type": "integer"
+          }
+        }
+      },
+      "SeatScreenEventRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "node_id",
+          "boot_session_id",
+          "fencing_token",
+          "computer_id",
+          "job_id",
+          "attempt_id",
+          "credential",
+          "event"
+        ],
+        "properties": {
+          "node_id": {
+            "type": "string"
+          },
+          "boot_session_id": {
+            "type": "string"
+          },
+          "fencing_token": {
+            "type": "string"
+          },
+          "computer_id": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "credential": {
+            "type": "string",
+            "writeOnly": true
+          },
+          "event": {
+            "$ref": "#/components/schemas/SeatLogEvent"
+          }
+        }
+      },
       "SeatRunInput": {
         "type": "object",
         "additionalProperties": false,
@@ -470,6 +596,8 @@
               "command_finished",
               "copy_in",
               "copy_out",
+              "screen_input",
+              "takeover",
               "control_taken",
               "control_released"
             ]

@@ -1394,7 +1394,7 @@ func (session *serverSession) sweepRequired(method Method) bool {
 		return false
 	case MethodEnsureImage, MethodReconcileImagePins, MethodReleaseImagePin, MethodReleaseAttemptPin, MethodImageCacheStatus,
 		MethodRun, MethodSignal, MethodWatch, MethodDelete, MethodDeleteVolume, MethodInventoryRemoval, MethodAttestRemoval,
-		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken, MethodApplyComputerSeats, MethodObserveComputerSeats, MethodExecComputerSeat, MethodSetComputerMemoryLimit, MethodDialSeatEndpoint,
+		MethodDialAttemptPort, MethodDialHostBridge, MethodSetComputerControl, MethodSetComputerToken, MethodApplyComputerSeats, MethodObserveComputerSeats, MethodExecComputerSeat, MethodSetComputerMemoryLimit, MethodDialSeatEndpoint, MethodSetSeatDriver,
 		MethodListRunMailbox, MethodReadRunMailbox, MethodRemoveRunMailbox, MethodInventoryHandoffs, MethodCopyComputerSeat:
 		session.mu.Lock()
 		defer session.mu.Unlock()
@@ -1773,6 +1773,8 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 			}
 			_ = writeEngineResponseWithMethod(wire, request.Method, response, nil)
 		}
+	case MethodSetSeatDriver:
+		server.serveSeatDriver(session, operation, wire, request)
 	case MethodSetComputerControl:
 		var body SetComputerControlStateRequest
 		if !decodeRequest(wire, request.Body, &body) {

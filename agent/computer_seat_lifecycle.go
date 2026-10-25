@@ -14,6 +14,7 @@ import (
 
 type seatComputerServiceConfig struct {
 	router      *seatFrontDoor
+	screen      *seatScreenConfig
 	copyRuntime seatCopyRuntime
 	copyControl seatCopyControl
 	publish     func(context.Context, bool, string) error
@@ -30,16 +31,40 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 		config.clock = systemClock{}
 	}
 	var nextFailureLog time.Time
+	var failureLogMu sync.Mutex
 	logFailure := func(err error) {
 		now := config.clock.Now()
-		if controller.logf != nil && (nextFailureLog.IsZero() || !now.Before(nextFailureLog)) {
-			controller.logf("Seat front-door publication failed computer=%q error=%v", controller.computerID, err)
+		failureLogMu.Lock()
+		due := controller.logf != nil && (nextFailureLog.IsZero() || !now.Before(nextFailureLog))
+		if due {
 			nextFailureLog = now.Add(time.Minute)
+		}
+		failureLogMu.Unlock()
+		if due {
+			controller.logf("Seat front-door publication failed computer=%q error=%v", controller.computerID, err)
 		}
 	}
 	seatCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	mux := http.NewServeMux()
+	if config.screen != nil {
+		screenConfig := *config.screen
+		screenConfig.ctx = seatCtx
+		screenConfig.fatal = func(err error) { cancel(); logFailure(err) }
+		// Every screen report must remain visible, including local refusals.
+		// Publication retries keep their separate rate-limited logger above.
+		screenConfig.logFailure = func(err error) {
+			if controller.logf != nil {
+				controller.logf("Seat screen failed: %v", err)
+			}
+		}
+		screens, err := newSeatScreenHandler(screenConfig)
+		if err != nil {
+			return contract.ProcessResult{}, err
+		}
+		mux.Handle("GET /v1/seats/{seat_id}/screen/{mode}", screens)
+		mux.Handle("/v1/seats/{seat_id}/person/", screens)
+	}
 	mux.Handle("POST /v1/seats/{seat_id}/copy", newSeatCopyHandlerWithClock(config.copyRuntime, config.copyControl, request.Authority, controller.computerID, config.clock))
 	registration, err := config.router.register(seatCtx, controller.computerID, controller.authority.AttemptID, mux)
 	if err != nil {

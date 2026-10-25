@@ -33,6 +33,8 @@ const (
 	SeatEventCommandFinished SeatEventKind = "command_finished"
 	SeatEventCopyIn          SeatEventKind = "copy_in"
 	SeatEventCopyOut         SeatEventKind = "copy_out"
+	SeatEventScreenInput     SeatEventKind = "screen_input"
+	SeatEventTakeover        SeatEventKind = "takeover"
 	SeatEventControlTaken    SeatEventKind = "control_taken"
 	SeatEventControlReleased SeatEventKind = "control_released"
 )
@@ -134,7 +136,7 @@ func writeSeatEvent(ctx context.Context, q seatApprovalQuery, at time.Time, even
 		return protocolError(contract.ErrorInvalidRequest, "invalid Seat log event")
 	}
 	switch event.Kind {
-	case SeatEventEndsSoon, SeatEventOwnerReimage, SeatEventOwnerReset, SeatEventOwnerRemove, SeatEventRequested, SeatEventApproved, SeatEventRefused, SeatEventStarting, SeatEventStarted, SeatEventReleased, SeatEventEnded, SeatEventOwnerStop, SeatEventOwnerRestart, SeatEventCommandStarted, SeatEventCommandFinished, SeatEventCopyIn, SeatEventCopyOut, SeatEventControlTaken, SeatEventControlReleased:
+	case SeatEventScreenInput, SeatEventTakeover, SeatEventEndsSoon, SeatEventOwnerReimage, SeatEventOwnerReset, SeatEventOwnerRemove, SeatEventRequested, SeatEventApproved, SeatEventRefused, SeatEventStarting, SeatEventStarted, SeatEventReleased, SeatEventEnded, SeatEventOwnerStop, SeatEventOwnerRestart, SeatEventCommandStarted, SeatEventCommandFinished, SeatEventCopyIn, SeatEventCopyOut, SeatEventControlTaken, SeatEventControlReleased:
 	default:
 		return protocolError(contract.ErrorInvalidRequest, "unknown Seat log event kind")
 	}

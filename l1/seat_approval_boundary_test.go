@@ -236,8 +236,13 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 	if agentMounts != 1 {
 		t.Fatalf("node-principal mux mounts=%d", agentMounts)
 	}
+	// Both discovery URLs use the same reviewed handler: GetSeatCopyTarget
+	// checks the exact Seat credential before SELECTing its lifecycle state.
+	// The query-only read snapshot cannot approve, reserve, start or expire a
+	// Seat. These reads reject ended Seats and stale Attempt/ready bindings.
 	allowed := map[string]string{
 		"GET /v1/seats/{seat_id}/run-target":    "resolveSeatRun",
+		"GET /v1/seats/{seat_id}/screen-target": "getSeatCopyTarget",
 		"GET /v1/seats/{seat_id}/copy-target":   "getSeatCopyTarget",
 		"POST /v1/seats/{seat_id}/copy-outcome": "reportSeatCopyOutcome",
 		"POST /v1/seats/{seat_id}/release":      "releaseSeat",
