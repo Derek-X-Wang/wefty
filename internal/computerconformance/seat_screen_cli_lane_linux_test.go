@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image/png"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"testing"
 	"time"
@@ -42,6 +44,11 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Fatal("computer_seat_lane requires root")
 	}
+	t.Setenv("WEFTY_SEAT_SCREEN_TIMING", "1")
+	previousLog := log.Writer()
+	traceLog := &screenLaneTimingLog{t: t, fallback: previousLog}
+	log.SetOutput(traceLog)
+	t.Cleanup(func() { log.SetOutput(previousLog) })
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	t.Cleanup(cancel)
 	imageRef := requiredSeatEnv(t, "WEFTY_SEAT_IMAGE")
@@ -153,6 +160,19 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		ready, err = store.GetSeatCall(ctx, "screen-cli", id)
 		return err == nil && ready.State == l1.SeatLive && ready.Credential != ""
 	})
+	// Read these tables in the actual Computer namespace, never the host's.
+	task := screenLaneTask(t, ctx, store, ready)
+	procRoot := fmt.Sprintf("/proc/%d", task.Pid())
+	for _, table := range []string{"tcp", "tcp6"} {
+		payload, readErr := os.ReadFile(filepath.Join(procRoot, "net", table))
+		seatMust(t, readErr)
+		seatMust(t, checkSeatScreenTCPListeners(payload, uint32(2000+ready.Place)))
+	}
+	t.Logf("Seat uid %d owns no TCP or TCP6 listeners", 2000+ready.Place)
+	backendTiming := filepath.Join(procRoot, "root/wefty/service/seats", strconv.Itoa(ready.Place), "run/.screen-timing")
+	seatMust(t, os.WriteFile(backendTiming, nil, 0600))
+	seatMust(t, os.Chown(backendTiming, 2000+ready.Place, 2000+ready.Place))
+	t.Cleanup(func() { _ = os.Remove(backendTiming) })
 	state := t.TempDir()
 	seatMust(t, os.Chmod(state, 0700))
 	credential, _ := json.Marshal(map[string]string{"seat_id": id, "credential": ready.Credential})
@@ -224,7 +244,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	ordered := slices.Clone(warm)
 	slices.Sort(ordered)
 	sc1 := ordered[1]
-	t.Logf("SC-1 warm click + PNG: %v; warm median: %.3f ms", warm, float64(sc1.Microseconds())/1000)
+	t.Logf("SC-1 warm click + PNG: %v; warm median: %.3f ms; warm max: %.3f ms", warm, float64(sc1.Microseconds())/1000, float64(ordered[2].Microseconds())/1000)
 	var target l1.SeatCopyTarget
 	seatMust(t, screenLaneJSON(ctx, ownerFabric, listener.Addr().String(), http.MethodGet, "/v1/seats/"+id+"/screen-target", ready.Credential, nil, &target))
 	host := strings.TrimPrefix(strings.Split(strings.TrimPrefix(target.Endpoint, "ws://"), "/")[0], "http://")
@@ -261,17 +281,33 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		t.Fatalf("SC-4 CLI exit=%d: %s", code, out)
 	}
 	t.Logf("SC-1 warm median click + PNG: %.3f ms; SC-4 Take control to first person_driving: %.3f ms; default image=%s; Linux/%s; process launch included", float64(sc1.Microseconds())/1000, float64(sc4.Microseconds())/1000, imageRef, runtime.GOARCH)
+	for _, table := range []string{"tcp", "tcp6"} {
+		payload, readErr := os.ReadFile(filepath.Join(procRoot, "net", table))
+		seatMust(t, readErr)
+		seatMust(t, checkSeatScreenTCPListeners(payload, uint32(2000+ready.Place)))
+	}
+	timingBytes, readErr := os.ReadFile(backendTiming)
+	seatMust(t, readErr)
+	if len(timingBytes) == 0 {
+		t.Error("backend omitted opt-in accept-to-first-byte timings")
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(timingBytes)), "\n") {
+		t.Logf("Seat backend timing: %s", line)
+	}
 	rss := screenLaneX11RSS(t, ctx, store, ready)
 	// Both observations are logged even when one exceeds its limit.
 	evidence, _ := json.MarshalIndent(map[string]any{
-		"sc1_phase_ms":       map[string]any{"cold": breakdowns[0], "warmup": breakdowns[1], "warm": breakdowns[2:]},
-		"x11vnc_rss_kib":     rss,
-		"sc1_ms":             float64(sc1.Microseconds()) / 1000,
-		"sc1_cold_ms":        float64(cold.Microseconds()) / 1000,
-		"sc1_warm_ms":        []float64{float64(warm[0].Microseconds()) / 1000, float64(warm[1].Microseconds()) / 1000, float64(warm[2].Microseconds()) / 1000},
-		"sc1_warm_median_ms": float64(sc1.Microseconds()) / 1000,
-		"sc4_ms":             float64(sc4.Microseconds()) / 1000,
-		"image":              imageRef, "platform": "linux/" + runtime.GOARCH,
+		"sc1_phase_ms":         map[string]any{"cold": breakdowns[0], "warmup": breakdowns[1], "warm": breakdowns[2:]},
+		"x11vnc_rss_kib":       rss,
+		"sc1_ms":               float64(sc1.Microseconds()) / 1000,
+		"sc1_cold_ms":          float64(cold.Microseconds()) / 1000,
+		"sc1_warm_ms":          []float64{float64(warm[0].Microseconds()) / 1000, float64(warm[1].Microseconds()) / 1000, float64(warm[2].Microseconds()) / 1000},
+		"sc1_warm_median_ms":   float64(sc1.Microseconds()) / 1000,
+		"sc1_warm_max_ms":      float64(ordered[2].Microseconds()) / 1000,
+		"backend_timing_jsonl": string(timingBytes),
+		"node_helper_timing":   traceLog.snapshot(),
+		"sc4_ms":               float64(sc4.Microseconds()) / 1000,
+		"image":                imageRef, "platform": "linux/" + runtime.GOARCH,
 		"process_launch_included": true, "helper_ipc_included": true,
 	}, "", "  ")
 	seatMust(t, os.WriteFile(filepath.Join(filepath.Dir(requiredSeatEnv(t, "WEFTY_SEAT_EVIDENCE")), runtime.GOARCH+"-screen-cli.json"), evidence, 0600))
@@ -455,4 +491,52 @@ func (d screenLaneDeadman) QueueSuccessfulRenewal(claim l1.Claim, expires time.T
 		removal = fmt.Sprint(l1.InitialServiceRemovalGeneration)
 	}
 	return session.QueueAttemptRenewalUntil(ocihelper.AttemptAuthority{NodeID: "screen-node", BootSessionID: "screen-boot", JobID: claim.Job.JobID, AttemptID: claim.Lease.AttemptID, FencingToken: claim.Lease.FencingToken, Class: claim.Job.Spec.Class, RemovalGeneration: removal}, expires)
+}
+
+// Keep ordinary logs on their previous sink; publish only opt-in transport
+// phase records. The collector is shared by concurrent node/helper goroutines.
+type screenLaneTimingLog struct {
+	t        *testing.T
+	fallback io.Writer
+	mu       sync.Mutex
+	records  []string
+}
+
+func (w *screenLaneTimingLog) Write(p []byte) (int, error) {
+	if !bytes.Contains(p, []byte("Seat screen timing component=")) {
+		return w.fallback.Write(p)
+	}
+	w.mu.Lock()
+	w.records = append(w.records, strings.TrimSpace(string(p)))
+	w.mu.Unlock()
+	w.t.Logf("%s", bytes.TrimSpace(p))
+	return len(p), nil
+}
+func (w *screenLaneTimingLog) snapshot() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.records)
+}
+func screenLaneTask(t *testing.T, ctx context.Context, store *l1.Store, seat l1.SeatCallResult) containerd.Task {
+	t.Helper()
+	computer, err := store.GetComputer(ctx, seat.ComputerID)
+	seatMust(t, err)
+	job, err := store.GetJob(ctx, computer.CurrentJobID)
+	seatMust(t, err)
+	client, err := containerd.New(requiredSeatEnv(t, "WEFTY_SEAT_CONTAINERD"), containerd.WithDefaultNamespace(ocihelper.ContainerdNamespace))
+	seatMust(t, err)
+	t.Cleanup(func() { client.Close() })
+	containers, err := client.Containers(ctx)
+	seatMust(t, err)
+	for _, c := range containers {
+		info, err := c.Info(ctx)
+		seatMust(t, err)
+		if job.CurrentAttemptID != "" && info.Labels["io.wefty/attempt_id"] == job.CurrentAttemptID && info.Labels["io.wefty/job_id"] == job.JobID && info.Labels["io.wefty/node_id"] == "screen-node" {
+			task, err := c.Task(ctx, nil)
+			seatMust(t, err)
+			return task
+		}
+	}
+	t.Fatal("live screen Seat has no matching containerd task")
+	return nil
 }

@@ -2244,6 +2244,21 @@ durable L1 Seat state machine. An image failure keeps its reason. Failed
 cleanup remains unconfirmed and cannot free Room. A host absence-check failure
 uses observation reason `cleanup_unverified`, distinct from a refusal detail.
 
+For screen opens, `{authority,generation,endpoint_lookup:true}` selects only
+previously published endpoint names for that exact positive generation. It is
+mutually exclusive with `discover` and `cleanup`. This is a lookup, not a fresh
+readiness observation: it cannot make a starting Seat ready, create pins, mint
+names, acknowledge cleanup or change the directive. Only wanted, nonfailed,
+ready entries with both retained pins and current ready-generation expose names.
+It runs under the Seat mutex and validates the live Attempt/task before returning.
+The subsequent `DialSeatEndpoint` still checks the exact generation, current
+path/inode, private ownership, peer UID, namespace and live Attempt. The node
+then reads the actual connection's binary RFB banner before accepting the client.
+L1 screen authority, tenure admission and input audit remain fresh per operation;
+no L1 authority is cached. Ordinary reconciliation still probes both roles.
+This avoids reopening both roles just to find an already published name on
+every short screen call, including probes of unrelated Seats.
+
 For controller recovery, `ObserveComputerSeats` also accepts
 `{authority,generation:0,discover:true}` without cleanup entries. This reads only
 the exact live Attempt's current directive generation (zero if none) and returns
@@ -2730,8 +2745,9 @@ name a currently wanted, ready, nonfailed Seat. The node agent resolves the
 public Seat identity to its place; this private helper operation accepts no
 Seat credential or general dial authority. Front-door tenure remains #1147.
 
-`ObserveComputerSeats` returns the two endpoint names by Seat after fresh
-binary RFB greetings. Names bind a random attempt-local scope, the place's
+`ObserveComputerSeats` ordinary observations return the two endpoint names by
+Seat after fresh binary RFB greetings; `endpoint_lookup:true` retrieves those
+already published names without repeating readiness probes. Names bind a random attempt-local scope, the place's
 add generation (its incarnation), endpoint kind and socket revision. Names
 are opaque: clients must not construct them. Another Computer's name is
 refused even when its place and generation happen to match. A removed or

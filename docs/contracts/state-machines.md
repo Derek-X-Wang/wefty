@@ -3096,10 +3096,20 @@ SC-1 measures CLI process start through the completed click and PNG on disk.
 The lane records the cold first call, performs one separate warm-up, records
 three warm calls and gates the one-second threshold on their median. The cold
 number and all warm numbers remain in the log and JSON evidence. The lane also
-records phase timestamps relative to CLI process start, and warm x11vnc RSS
+records phase timestamps relative to CLI process start, the warm maximum,
+node/helper Fabric accept, L1 authorization, endpoint lookup, socket connect
+and RFB banner timings, backend accept-to-first-byte timings, and warm x11vnc RSS
 for this Seat when `/proc` exposes it. A combined call's full frame is its
 synchronization, and its capture connection is already open before input.
 SC-4 performs an input warm-up outside the measurement, then measures Take
 control through the first typed `person_driving` CLI refusal. Both have a one-second limit. The root-only `computer_seat_lane`
 records CI measurements against the real default image. CI measurements do
 not replace the later attended measurement on the owner's Mac.
+
+Screen-call endpoint selection uses `ObserveComputerSeats` with
+`endpoint_lookup:true` to retrieve already published names in the current
+helper generation. It does not repeat both readiness probes per screen open.
+The exact live Attempt is revalidated, and the actual stream still checks its
+pinned socket, ownership and peer before the node reads its RFB banner.
+L1 fenced screen authority, the Seat tenure gate and input audit remain fresh
+for every operation. This lookup caches no authority across screen operations.

@@ -650,13 +650,28 @@ directory. Both sockets use mode 0600. External paths and roles stay unchanged.
 `-rfbport 0 -no6 -norc` disables TCP listeners and local configuration overrides.
 
 After first use, a supervisor replaces an exited x11vnc without waiting for a
-new client. A disconnect closes that client's relay, preserving other clients
+new client. Repeated exits and spawn `OSError`s back off from 0.1 seconds,
+doubling up to 30 seconds. Ten seconds of child uptime resets the delay to
+0.1 seconds. Incoming clients cannot bypass this supervisor backoff.
+A disconnect closes that client's relay, preserving other clients
 and the role process. Backend shutdown terminates and reaps its x11vnc child.
 Diagnostics are drained continuously, forwarded through the existing bounded
 queue, and limited to 4096 bytes per process lifetime plus truncation and exit
-status lines. Neither the relay nor diagnostics records screen or input data.
+status lines. All child, restart and refused-connection diagnostics additionally
+share an 8192-byte budget per role per 30-second monotonic window; the next
+window reports suppressed lines. Neither the relay nor diagnostics records
+screen or input data.
 At most two warm x11vnc processes remain per Seat; the screen CLI lane records
-their observed RSS outside its timing intervals when available.
+their observed RSS outside its timing intervals when available. The lane also
+checks `/proc/<task>/net/tcp` and `tcp6` before and after screen use: the Seat uid
+must own no listening TCP socket.
+
+For test-only transport timing, the lane creates a private, Seat-owned
+`run/.screen-timing` file. The relay appends role, wall start timestamp and
+monotonic elapsed times for backend connect and first byte from x11vnc. It
+records no bytes or input, creates no file in normal use, and caps this file at
+32 KiB plus one record. The lane prints these records and retains them in its
+timing artifact.
 
 ### Runtime required by every multi-Seat image
 

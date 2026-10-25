@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Derek-X-Wang/wefty/internal/screentiming"
 	"net"
 	"os"
 	"path/filepath"
@@ -57,6 +58,8 @@ func (engine *ContainerdEngine) ObserveComputerSeats(ctx context.Context, reques
 	return engine.observeComputerSeats(ctx, request, observeComputerSeatFiles)
 }
 func (engine *ContainerdEngine) observeComputerSeats(ctx context.Context, request ObserveComputerSeatsRequest, observe func(context.Context, computerSeatAttemptSnapshot, ObserveComputerSeatsRequest) (ObserveComputerSeatsResponse, error)) (ObserveComputerSeatsResponse, error) {
+	timing := screentiming.Start("helper_observe")
+	defer timing("lookup_complete")
 	attempt, err := engine.attempt(request.Authority)
 	if err != nil {
 		return ObserveComputerSeatsResponse{}, err
@@ -68,6 +71,19 @@ func (engine *ContainerdEngine) observeComputerSeats(ctx context.Context, reques
 		return ObserveComputerSeatsResponse{}, err
 	}
 	defer snapshot.namespace.close()
+	if request.EndpointLookup {
+		if request.Discover || len(request.Cleanup) != 0 {
+			return ObserveComputerSeatsResponse{}, errors.New("endpoint lookup cannot discover or clean up")
+		}
+		result, err := snapshot.seats.lookupEndpoints(request.Generation)
+		if err != nil {
+			return ObserveComputerSeatsResponse{}, err
+		}
+		if err := engine.validateComputerSeatAttempt(ctx, request.Authority, attempt, snapshot); err != nil {
+			return ObserveComputerSeatsResponse{}, err
+		}
+		return result, nil
+	}
 	if request.Discover {
 		if err := engine.validateComputerSeatAttempt(ctx, request.Authority, attempt, snapshot); err != nil {
 			return ObserveComputerSeatsResponse{}, err

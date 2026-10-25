@@ -3,6 +3,8 @@
 
 import argparse
 import errno
+import fcntl
+import json
 import os
 import queue
 import socket
@@ -102,6 +104,28 @@ def forward_session_diagnostics(process, role, sink, limit=SESSION_STDERR_LIMIT)
     return status
 
 
+class RoleDiagnostics:
+    """Bound all child, restart and connection diagnostics to 8 KiB / 30 s."""
+    def __init__(self, sink, clock=time.monotonic):
+        self.sink, self.clock = sink, clock
+        self.window, self.used, self.dropped = clock(), 0, 0
+        self.lock = threading.Lock()
+
+    def emit(self, line):
+        with self.lock:
+            now = self.clock()
+            if now - self.window >= 30:
+                self.window, self.used = now, 0
+                if self.dropped:
+                    line = f'wefty-rfb-backend: {self.dropped} diagnostic lines suppressed\n'.encode() + line
+                    self.dropped = 0
+            if self.used + len(line) > 8192:
+                self.dropped += 1
+                return
+            self.used += len(line)
+            self.sink.emit(line)
+
+
 class RoleBackend:
     """Start on first use, then keep one supervised process warm for this role.
 
@@ -109,9 +133,11 @@ class RoleBackend:
     to x11vnc's shared listener; disconnecting one never terminates the child.
     """
 
-    def __init__(self, path, view_only, sink, popen=subprocess.Popen):
+    def __init__(self, path, view_only, sink, popen=subprocess.Popen, clock=time.monotonic):
         self.path = os.path.join(os.path.dirname(path), '.' + os.path.basename(path) + '.x11vnc')
-        self.view_only, self.sink, self.popen = view_only, sink, popen
+        self.view_only, self.popen, self.clock = view_only, popen, clock
+        self.sink = RoleDiagnostics(sink, clock)
+        self.started_at = clock()
         self.role = 'view' if view_only else 'control'
         self.process = None
         self.diagnostics = None
@@ -139,6 +165,7 @@ class RoleBackend:
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             close_fds=True, umask=0o077,
         )
+        self.started_at = self.clock()
         self.diagnostics = threading.Thread(
             target=forward_session_diagnostics,
             args=(self.process, self.role, self.sink), daemon=True,
@@ -146,30 +173,40 @@ class RoleBackend:
         self.diagnostics.start()
 
     def _supervise(self):
+        delay = 0.1
         while not self.stopping.is_set():
             with self.lock:
-                process = self.process
-            process.wait()
-            if self.stopping.wait(0.1):
+                process, started_at = self.process, self.started_at
+            if process is not None:
+                process.wait()
+                if self.clock() - started_at >= 10:
+                    delay = 0.1
+            if self.stopping.wait(delay):
                 return
             with self.lock:
                 if self.closed:
                     return
-                if self.process is process:
-                    try:
-                        self._start()
-                    except OSError:
-                        self.sink.emit(f'wefty-rfb-backend[{self.role}]: restart failed\n'.encode())
+                self.process = None
+                try:
+                    self._start()
+                except OSError:
+                    self.sink.emit(f'wefty-rfb-backend[{self.role}]: restart failed\n'.encode())
+            delay = min(delay * 2, 30.0)
 
     def connect(self):
         with self.lock:
             if self.closed:
                 raise OSError('screen backend is closed')
-            if self.process is None or self.process.poll() is not None:
-                self._start()
             if self.supervisor is None:
-                self.supervisor = threading.Thread(target=self._supervise, daemon=True)
-                self.supervisor.start()
+                # Only the supervisor retries. Callers cannot bypass the delay,
+                # including when the very first spawn raises OSError.
+                try:
+                    self._start()
+                finally:
+                    self.supervisor = threading.Thread(target=self._supervise, daemon=True)
+                    self.supervisor.start()
+            if self.process is None:
+                raise OSError('screen backend restart is pending')
             deadline = time.monotonic() + 5
             while self.process.poll() is None:
                 connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -185,6 +222,20 @@ class RoleBackend:
                     raise TimeoutError('x11vnc Unix listener did not become ready')
                 time.sleep(0.01)
             raise OSError('x11vnc exited before its Unix listener became ready')
+
+    def timing(self, started_ns, phase):
+        # Test-only opt-in: the lane creates this file in the private Seat run
+        # directory. Never create it in normal use or record relayed bytes.
+        path = os.path.join(os.path.dirname(self.path), '.screen-timing')
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'ab', buffering=0) as stream:
+                fcntl.flock(stream, fcntl.LOCK_EX)
+                if os.fstat(stream.fileno()).st_size < 32768:
+                    stream.write((json.dumps({'role': self.role, 'start_unix_ns': started_ns[1],
+                        'phase': phase, 'elapsed_ms': (time.monotonic_ns()-started_ns[0])/1e6})+'\n').encode())
+        except OSError:
+            pass  # Diagnostics must never fail a screen connection.
 
     def close(self):
         with self.lock:
@@ -207,17 +258,22 @@ class RoleBackend:
             self.supervisor.join(timeout=2)
 
 
-def relay_connection(connection, backend):
+def relay_connection(connection, backend, started_ns=None):
     """Relay bytes with bounded buffers and propagate disconnects both ways."""
+    started_ns = started_ns or (time.monotonic_ns(), time.time_ns())
     upstream = None
     sender = None
 
     def pump(source, destination):
+        first_byte = True
         try:
             while True:
                 data = source.recv(65536)
                 if not data:
                     break
+                if first_byte and source is upstream:
+                    backend.timing(started_ns, "backend_first_byte")
+                    first_byte = False
                 destination.sendall(data)
         except OSError:
             pass
@@ -229,6 +285,7 @@ def relay_connection(connection, backend):
 
     try:
         upstream = backend.connect()
+        backend.timing(started_ns, "backend_connected")
         sender = threading.Thread(target=pump, args=(connection, upstream), daemon=True)
         sender.start()
         pump(upstream, connection)
@@ -270,7 +327,7 @@ def main() -> None:
     try:
         while True:
             connection, _ = listener.accept()
-            threading.Thread(target=relay_connection, args=(connection, backend), daemon=True).start()
+            threading.Thread(target=relay_connection, args=(connection, backend, (time.monotonic_ns(), time.time_ns())), daemon=True).start()
     finally:
         listener.close()
         backend.close()

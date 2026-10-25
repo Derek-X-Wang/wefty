@@ -3,6 +3,7 @@
 
 import importlib.util
 import io
+import json
 import os
 import queue
 import re
@@ -73,6 +74,48 @@ while True:
 '''
 
 
+class RestartBackoffTest(unittest.TestCase):
+    def test_supervisor_bounds_crashes_and_start_failures_and_resets(self):
+        for fail_start in (False, True):
+            with self.subTest(fail_start=fail_start), tempfile.TemporaryDirectory(dir='/tmp') as root:
+                now, delays, starts = [0.0], [], []
+                class Stop:
+                    done = False
+                    def is_set(self): return self.done
+                    def wait(self, delay):
+                        delays.append(delay)
+                        now[0] += delay
+                        if len(delays) >= 13: self.done = True
+                        return self.done
+                class Process:
+                    def wait(self): now[0] += 10 if len(starts) == 10 else 0
+                backend = BACKEND.RoleBackend(root+'/control.sock', False, mock.Mock(), clock=lambda: now[0])
+                backend.stopping = Stop()
+                def start():
+                    starts.append(now[0])
+                    if fail_start and len(starts) != 10:
+                        raise OSError('cannot start')
+                    backend.process = Process()
+                    backend.started_at = now[0]
+                backend._start = start
+                backend.process = Process()
+                backend.started_at = now[0]
+                backend._supervise()
+                self.assertEqual(delays[:10], [0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8, 25.6, 30.0])
+                self.assertEqual(delays[10:12], [0.1, 0.2])
+
+    def test_failed_first_start_is_supervised_and_clients_cannot_bypass_backoff(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as root, mock.patch.dict(os.environ, {'DISPLAY': ':1'}):
+            factory = mock.Mock(side_effect=OSError('cannot start'))
+            backend = BACKEND.RoleBackend(root+'/control.sock', False, mock.Mock(), popen=factory)
+            with mock.patch.object(threading.Thread, 'start'):
+                for _ in range(20):
+                    with self.assertRaises(OSError): backend.connect()
+            self.assertEqual(factory.call_count, 1)
+            self.assertIsNotNone(backend.supervisor)
+            backend.stopping.set()
+
+
 class WarmBackendTest(unittest.TestCase):
     def setUp(self):
         display = mock.patch.dict(os.environ, {'DISPLAY': ':1'})
@@ -91,6 +134,17 @@ class WarmBackendTest(unittest.TestCase):
                 return size
         self.stream = LiveLog()
         self.sink = BACKEND.DiagnosticsSink(self.stream)
+
+    def test_opt_in_timing_records_accept_to_first_byte_without_payload(self):
+        backend = self.role()
+        trace = Path(self.root.name) / '.screen-timing'
+        trace.touch(mode=0o600)
+        _, banner = self.client(backend)
+        # The relay records before it forwards the first byte to the caller.
+        records = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertEqual([r['phase'] for r in records], ['backend_connected', 'backend_first_byte'])
+        self.assertTrue(all(r['elapsed_ms'] >= 0 and r['role'] == 'control' for r in records))
+        self.assertTrue(all(set(r) == {"role", "phase", "start_unix_ns", "elapsed_ms"} for r in records))
 
     def launch(self, command, **kwargs):
         self.commands.append(command)
@@ -229,6 +283,18 @@ class SessionDiagnosticsTest(unittest.TestCase):
         self.assertTrue(dropped, written)
         self.assertEqual(sum(dropped) + len(forwarded), 401, written)
         self.assertTrue(written.endswith("after\n"), written)
+
+class RoleDiagnosticsTest(unittest.TestCase):
+    def test_restarts_and_refused_clients_share_a_time_bounded_log_budget(self):
+        now = [0.0]
+        sink = mock.Mock()
+        diagnostics = BACKEND.RoleDiagnostics(sink, clock=lambda: now[0])
+        for _ in range(100): diagnostics.emit(b'x' * 4096)
+        self.assertLessEqual(sum(len(c.args[0]) for c in sink.emit.call_args_list), 8192)
+        now[0] = 30.0
+        diagnostics.emit(b'recovered\n')
+        self.assertIn(b'diagnostic lines suppressed', sink.emit.call_args.args[0])
+        self.assertIn(b'recovered', sink.emit.call_args.args[0])
 
 
 if __name__ == "__main__":
