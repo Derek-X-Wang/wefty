@@ -62,10 +62,16 @@ func TestSeatRunNormalizesToOrdinaryPinnedRunWithoutCredentials(t *testing.T) {
 
 type seatRunHTTPJobs struct {
 	JobClient
-	binding contract.SeatRunBinding
+	binding     contract.SeatRunBinding
+	calls       int
+	unavailable bool
 }
 
 func (c *seatRunHTTPJobs) ResolveSeatRun(_ context.Context, id, credential string) (contract.SeatRunBinding, error) {
+	c.calls++
+	if c.unavailable {
+		return contract.SeatRunBinding{}, protocolError(contract.ErrorCode("seat_ended"), "Seat ended")
+	}
 	if id != c.binding.SeatID || credential != "seat-test-secret" {
 		return contract.SeatRunBinding{}, protocolError(contract.ErrorForbidden, "invalid Seat credential")
 	}
@@ -132,5 +138,49 @@ func TestSeatRunUsesClusterDefaultWithoutChangingExplicitDeadlines(t *testing.T)
 		if normalized.Request.Limits.MaxRuntimeSeconds != expected {
 			t.Fatalf("deadline=%d want %d", normalized.Request.Limits.MaxRuntimeSeconds, expected)
 		}
+	}
+}
+
+func TestSeatRunHTTPIdempotentReplayIgnoresLaterSeatState(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "ledger.sqlite"), StoreOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	jobs := &seatRunHTTPJobs{binding: contract.SeatRunBinding{SeatID: "seat_00000000000000000000000000000001", NodeID: "node", ComputerID: "computer", ComputerJobID: "job", ComputerAttemptID: "attempt", DefaultMaxRuntimeSeconds: 7200}}
+	server := &Server{store: store, jobs: jobs, logf: func(string, ...any) {}}
+	request := func(key, argv, actor string) *httptest.ResponseRecorder {
+		body := `{"seat_run":{"seat_id":"seat_00000000000000000000000000000001","argv":["` + argv + `"]}}`
+		r := httptest.NewRequest(http.MethodPost, "/v1/runs", strings.NewReader(body))
+		r.Header.Set("Idempotency-Key", key)
+		r.Header.Set(contract.SeatCredentialHeader, "seat-test-secret")
+		r = r.WithContext(context.WithValue(r.Context(), identityContextKey{}, fabric.Identity{NodeID: actor}))
+		w := httptest.NewRecorder()
+		server.createRun(w, r)
+		return w
+	}
+	first := request("replay-seat", "env", "caller")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first=%d %s", first.Code, first.Body.String())
+	}
+	jobs.binding.ComputerAttemptID = "later-attempt"
+	jobs.binding.DefaultMaxRuntimeSeconds = 900
+	for _, ended := range []bool{false, true} {
+		jobs.unavailable = ended
+		retry := request("replay-seat", "env", "caller")
+		if retry.Code != http.StatusOK || retry.Header().Get("Idempotent-Replay") != "true" || retry.Body.String() != first.Body.String() {
+			t.Fatalf("replay=%d %s", retry.Code, retry.Body.String())
+		}
+	}
+	if jobs.calls != 1 {
+		t.Fatalf("replay counted %d Seat calls, want one", jobs.calls)
+	}
+	changed := request("replay-seat", "false", "caller")
+	if changed.Code != http.StatusConflict || !strings.Contains(changed.Body.String(), string(contract.ErrorIdempotencyConflict)) {
+		t.Fatalf("changed replay=%d %s", changed.Code, changed.Body.String())
+	}
+	other := request("replay-seat", "env", "other-caller")
+	if other.Code == http.StatusOK {
+		t.Fatal("another actor replayed the original Run")
 	}
 }

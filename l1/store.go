@@ -1309,6 +1309,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema+seatCallSchema+seatLogSchema+seatRunSchema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
+	if err := s.migrateSeatRuns(ctx); err != nil {
+		return err
+	}
 	if err := s.migrateSeatLife(ctx); err != nil {
 		return err
 	}

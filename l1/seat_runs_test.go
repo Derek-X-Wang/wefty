@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/upgradestate"
 )
 
 func TestSeatRunBindingRefusesEndedSeatAndAttemptReuse(t *testing.T) {
@@ -296,5 +298,315 @@ func TestSeatRunClusterDeadlineSettingReachesResolution(t *testing.T) {
 	binding, err := f.store.ResolveSeatRun(t.Context(), id, secret)
 	if err != nil || binding.DefaultMaxRuntimeSeconds != 7200 {
 		t.Fatalf("configured deadline=%+v %v", binding, err)
+	}
+}
+
+func TestSeatRunPollKeepsLiveStartingSeatRunning(t *testing.T) {
+	f, id, _, claim, input := startSeatRunFixture(t)
+	input.Phase = "poll"
+	command, err := f.store.ControlSeatRun(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := command.Binding
+	auth := command.ComputerSeatAttemptRequest
+	list, err := f.store.GetComputerSeatListForAttempt(t.Context(), "fabric-computer-node", b.ComputerID, b.ComputerJobID, b.ComputerAttemptID, auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.store.ReportComputerSeatObservations(t.Context(), "fabric-computer-node", b.ComputerID, b.ComputerJobID, b.ComputerAttemptID, ComputerSeatObservationReport{NodeID: auth.NodeID, BootSessionID: auth.BootSessionID, FencingToken: auth.FencingToken, ListRevision: list.Revision, Generation: 2, Sequence: 2, Seats: []ComputerSeatObservation{{SeatID: id, Place: 1, State: ComputerSeatStarting}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, err = f.store.ControlSeatRun(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input)
+	if err != nil || command.Cancel {
+		t.Fatalf("live Seat starting cancelled command: %+v %v", command, err)
+	}
+	if _, err = f.store.EndSeatRequest(t.Context(), "fabric-computer-node", id, SeatEndRequest{NodeID: auth.NodeID, BootSessionID: auth.BootSessionID, Reason: "released"}); err != nil {
+		t.Fatal(err)
+	}
+	command, err = f.store.ControlSeatRun(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input)
+	if err != nil || !command.Cancel {
+		t.Fatalf("ended Seat did not cancel command: %+v %v", command, err)
+	}
+}
+
+func TestSeatRunControlRefusesAnotherNodeBinding(t *testing.T) {
+	f, _, _, claim, input := startSeatRunFixture(t)
+	// Model a misrouted Job despite its pin tag: authenticated Attempt evidence
+	// alone must not authorize a command bound to a different node.
+	var raw []byte
+	if err := f.store.db.QueryRow(`SELECT params_json FROM seat_runs WHERE job_id=?`, claim.Job.JobID).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var params contract.SeatRunParams
+	if err := json.Unmarshal(raw, &params); err != nil {
+		t.Fatal(err)
+	}
+	params.Binding.NodeID = "another-node"
+	raw, _ = json.Marshal(params)
+	if _, err := f.store.db.Exec(`UPDATE seat_runs SET params_json=? WHERE job_id=?`, raw, claim.Job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"start", "poll", "finish"} {
+		input.Phase = phase
+		input.Result = nil
+		if phase == "finish" {
+			code := 0
+			input.Result = &ProcessResult{ExitCode: &code}
+		}
+		_, err := f.store.ControlSeatRun(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input)
+		if errorCode(err) != contract.ErrorForbidden {
+			t.Fatalf("%s node binding refusal=%v", phase, err)
+		}
+	}
+}
+
+func anotherSeatRun(t *testing.T, f *seatLifecycleFixture, first Claim) Claim {
+	t.Helper()
+	spec := first.Job.Spec
+	spec.DispatchKey = "second-seat-run-command"
+	spec.Labels = map[string]string{"run_id": "run_00000000000000000000000000000002", contract.LabelRunParams: first.Job.Spec.Labels[contract.LabelRunParams]}
+	job, _, err := f.store.CreateJobAs(t.Context(), spec, JobOrigin{OriginatingSubmitter: "cli", SubmittedByRunLedger: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := f.store.ClaimJob(t.Context(), "fabric-computer-node", f.node.NodeID, f.node.BootSessionID, contract.JobClassOneShot)
+	if err != nil || claim == nil {
+		t.Fatalf("second claim=%+v %v", claim, err)
+	}
+	_, err = f.store.ControlSeatRun(t.Context(), "fabric-computer-node", job.JobID, claim.Lease.AttemptID, SeatRunControlRequest{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, FencingToken: claim.Lease.FencingToken, Phase: "start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return *claim
+}
+func TestSeatRunRecoveryInvalidReceiptDoesNotBlockLaterRun(t *testing.T) {
+	f, id, secret, first, _ := startSeatRunFixture(t)
+	second := anotherSeatRun(t, f, first)
+	zero := 0
+	for i, claim := range []Claim{first, second} {
+		result := ProcessResult{ExitCode: &zero}
+		if i == 0 {
+			result = ProcessResult{OutputError: "cannot write result file", LimitReached: contract.LimitReachedMaxRuntime}
+		}
+		if _, err := f.store.CompleteAttempt(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "lost-receipt", Result: result}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	page, err := f.store.GetSeatLogs(t.Context(), "cli", id, secret, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := 0
+	for _, event := range page.Events {
+		if event.Kind == SeatEventCommandFinished {
+			finished++
+			if event.RunID == first.Job.Spec.Labels["run_id"] && (event.ExitCode != nil || event.Reason != "max_runtime") {
+				t.Fatalf("recovered event=%+v", event)
+			}
+		}
+	}
+	if finished != 2 {
+		t.Fatalf("recovered %d commands, want both", finished)
+	}
+	f.clock.Advance(30 * time.Minute)
+	if err = f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	value, err := f.store.GetSeatRequest(t.Context(), id)
+	if err != nil || value.State != SeatEnding {
+		t.Fatalf("recovered holds retained Seat: %+v %v", value, err)
+	}
+}
+
+func TestSeatRunRecoverySkipsFailedRow(t *testing.T) {
+	f, id, secret, first, _ := startSeatRunFixture(t)
+	second := anotherSeatRun(t, f, first)
+	zero := 0
+	for _, claim := range []Claim{first, second} {
+		if _, err := f.store.CompleteAttempt(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, CompletionRequest{FencingToken: claim.Lease.FencingToken, IdempotencyKey: "lost-receipt", Result: ProcessResult{ExitCode: &zero}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.store.db.Exec(`CREATE TRIGGER fail_one_seat_run BEFORE UPDATE ON seat_runs WHEN OLD.run_id='run_00000000000000000000000000000001' BEGIN SELECT RAISE(ABORT,'injected finish failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	page, err := f.store.GetSeatLogs(t.Context(), "cli", id, secret, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range page.Events {
+		if event.Kind == SeatEventCommandFinished && event.RunID == second.Job.Spec.Labels["run_id"] {
+			return
+		}
+	}
+	t.Fatal("one failed recovery row blocked the later command")
+}
+
+func TestSeatRunBackstopFinishesSilentNodeAndReleasesHold(t *testing.T) {
+	f, id, secret, claim, input := startSeatRunFixture(t)
+	// Keep the boot-relative start timeline while moving the wall clock
+	// backwards. Only elapsed Seat time may decide the backstop.
+	clock := &seatBootTestClock{fakeClock: f.clock, boot: "injected-clock", elapsed: time.Duration(f.clock.Now().UnixNano())}
+	f.store.clock = clock
+	clock.elapsed += 65*time.Minute - time.Nanosecond
+	f.clock.Advance(-24 * time.Hour)
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	page, err := f.store.GetSeatLogs(t.Context(), "cli", id, secret, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range page.Events {
+		if event.Kind == SeatEventCommandFinished {
+			t.Fatalf("early backstop: %+v", event)
+		}
+	}
+	clock.elapsed++
+	if err = f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	page, err = f.store.GetSeatLogs(t.Context(), "cli", id, secret, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range page.Events {
+		if event.Kind == SeatEventCommandFinished {
+			found = true
+			if event.ExitCode != nil || event.Reason != "max_runtime_backstop" || !strings.Contains(event.Note, "longer --max-runtime") {
+				t.Fatalf("backstop event=%+v", event)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("silent node command never force-finished")
+	}
+	job, err := f.store.GetJob(t.Context(), claim.Job.JobID)
+	if err != nil || job.State != contract.JobFailed {
+		t.Fatalf("backstop Job=%+v %v", job, err)
+	}
+	attempts, err := f.store.ListJobAttempts(t.Context(), claim.Job.JobID)
+	if err != nil || len(attempts) != 1 || (attempts[0].Result != nil && attempts[0].Result.ExitCode != nil) {
+		t.Fatalf("backstop Attempts=%+v %v", attempts, err)
+	}
+	input.Phase = "poll"
+	if _, err = f.store.ControlSeatRun(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input); err == nil {
+		t.Fatal("backstop left command authority active")
+	}
+	clock.elapsed += 30 * time.Minute
+	if err = f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	value, err := f.store.GetSeatRequest(t.Context(), id)
+	if err != nil || value.State != SeatEnding {
+		t.Fatalf("backstop hold retained Seat: %+v %v", value, err)
+	}
+}
+
+func TestSeatRunPollDoesNotWaitForWriter(t *testing.T) {
+	f, _, _, claim, input := startSeatRunFixture(t)
+	input.Phase = "poll"
+	write, err := f.store.beginWriteTransaction(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer write.rollback()
+	// This timeout only bounds a deadlock in the test; it does not advance a
+	// business timer. A WAL read snapshot must succeed beside a held writer.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	command, err := f.store.ControlSeatRun(ctx, "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input)
+	if err != nil || command.Cancel {
+		t.Fatalf("poll waited for unrelated writer: %+v %v", command, err)
+	}
+}
+
+func TestSeatRunLegacyRunningHoldGetsBoundOnUpgrade(t *testing.T) {
+	f, id, _, claim, _ := startSeatRunFixture(t)
+	columns, err := sqliteTableColumns(t.Context(), f.store.db, "seat_runs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, col := range columns {
+		if col != "start_boot_id" && col != "start_ns" && col != "computer_fencing_token" {
+			continue
+		}
+		if _, err := f.store.db.Exec("ALTER TABLE seat_runs DROP COLUMN " + col); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.reopen(t)
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	job, err := f.store.GetJob(t.Context(), claim.Job.JobID)
+	if err != nil || job.State != contract.JobFailed {
+		t.Fatalf("unstamped legacy Run=%+v %v", job, err)
+	}
+	f.clock.Advance(30 * time.Minute)
+	if err = f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	value, err := f.store.GetSeatRequest(t.Context(), id)
+	if err != nil || value.State != SeatEnding {
+		t.Fatalf("legacy hold retained Seat: %+v %v", value, err)
+	}
+}
+
+func TestSeatRunPollCancelsReplacedComputerFence(t *testing.T) {
+	f, _, _, claim, input := startSeatRunFixture(t)
+	input.Phase = "poll"
+	first, err := f.store.ControlSeatRun(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.store.db.Exec(`UPDATE attempts SET fencing_token='replacement-fence' WHERE attempt_id=?`, first.Binding.ComputerAttemptID); err != nil {
+		t.Fatal(err)
+	}
+	next, err := f.store.ControlSeatRun(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input)
+	if err != nil || !next.Cancel {
+		t.Fatalf("changed Computer fence preserved command: %+v %v", next, err)
+	}
+}
+
+func TestSeatRunSchemaUpgradeMatchesFreshFingerprint(t *testing.T) {
+	fresh := newSeatLifecycleFixture(t)
+	upgraded := newSeatLifecycleFixture(t)
+	const legacy = `CREATE TABLE IF NOT EXISTS seat_runs (
+ run_id TEXT PRIMARY KEY,
+ job_id TEXT NOT NULL UNIQUE REFERENCES jobs(job_id) ON DELETE CASCADE,
+ seat_id TEXT NOT NULL,
+ params_json BLOB NOT NULL,
+ computer_attempt_id TEXT REFERENCES attempts(attempt_id) ON DELETE SET NULL,
+ command_attempt_id TEXT REFERENCES attempts(attempt_id) ON DELETE SET NULL,
+ state TEXT NOT NULL CHECK(state IN ('queued','running','finished')),
+ result_json BLOB
+);`
+	if _, err := upgraded.store.db.Exec(`DROP TABLE seat_runs;` + legacy); err != nil {
+		t.Fatal(err)
+	}
+	upgraded.reopen(t)
+	if err := fresh.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := upgraded.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want, err := upgradestate.Fingerprint(t.Context(), fresh.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := upgradestate.Fingerprint(t.Context(), upgraded.path)
+	if err != nil || got != want {
+		t.Fatalf("upgrade fingerprint=%s fresh=%s error=%v", got, want, err)
 	}
 }

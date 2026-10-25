@@ -3,8 +3,10 @@ package l3
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 
@@ -87,4 +89,31 @@ func normalizeSeatRun(input *CreateRunInput) error {
 	r.Limits = &contract.RunLimits{MaxRuntimeSeconds: int(value.MaxRuntimeSeconds)}
 	r.SeatRun = nil
 	return nil
+}
+
+// ReplaySeatRun reads the actor-scoped receipt before consulting a live Seat.
+// The synthetic binding is used only for validating/hash-normalizing the
+// caller's source; it cannot authorize or create a Run.
+func (s *Store) ReplaySeatRun(ctx context.Context, input CreateRunInput) (contract.RunRecord, bool, error) {
+	if input.Request.SeatRun == nil {
+		return contract.RunRecord{}, false, protocolError(contract.ErrorInvalidRequest, "Seat Run source is required")
+	}
+	input.SeatRunBinding = &contract.SeatRunBinding{SeatID: input.Request.SeatRun.SeatID, NodeID: "idempotency", ComputerID: "idempotency", ComputerJobID: "idempotency", ComputerAttemptID: "idempotency"}
+	normalized, hash, _, err := normalizeCreateRun(input)
+	if err != nil {
+		return contract.RunRecord{}, false, err
+	}
+	var id, existing string
+	err = s.db.QueryRowContext(ctx, `SELECT run_id,request_hash FROM runs WHERE actor=? AND idempotency_key=?`, normalized.Actor, normalized.IdempotencyKey).Scan(&id, &existing)
+	if errors.Is(err, sql.ErrNoRows) {
+		return contract.RunRecord{}, false, nil
+	}
+	if err != nil {
+		return contract.RunRecord{}, false, internalError(err, "read Seat Run idempotency key")
+	}
+	if hash != existing {
+		return contract.RunRecord{}, false, protocolError(contract.ErrorIdempotencyConflict, "idempotency key %q was already used by this actor with a different request", normalized.IdempotencyKey)
+	}
+	record, err := s.GetRun(ctx, id)
+	return record, true, err
 }

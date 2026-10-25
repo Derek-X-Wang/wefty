@@ -1212,6 +1212,20 @@ func (s *Store) recordRunImageResolution(ctx context.Context, runID string, evid
 }
 
 func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, error) {
+	// Idempotency describes the caller's command, before resolving mutable
+	// Seat authority or a configured default deadline.
+	var seatRequest *CreateRunRequest
+	if input.Request.SeatRun != nil {
+		original := input.Request
+		value := *original.SeatRun
+		if original.Limits != nil {
+			value.MaxRuntimeSeconds = int64(original.Limits.MaxRuntimeSeconds)
+		}
+		original.SeatRun = &value
+		original.Limits = nil
+		original.Params = nil // An omitted or empty params object is equivalent.
+		seatRequest = &original
+	}
 	if err := normalizeSeatRun(&input); err != nil {
 		return input, "", 0, err
 	}
@@ -1303,6 +1317,13 @@ func normalizeCreateRun(input CreateRunInput) (CreateRunInput, string, uint32, e
 		Request CreateRunRequest `json:"request"`
 		Mode    uint32           `json:"resolved_mode"`
 	}{input.Actor, input.Request, mode}
+	if seatRequest != nil {
+		seatRequest.Tags, err = normalizeTags(seatRequest.Tags)
+		if err != nil {
+			return input, "", 0, err
+		}
+		normalizedForHash.Request = *seatRequest
+	}
 	encoded, err := json.Marshal(normalizedForHash)
 	if err != nil {
 		return input, "", 0, internalError(err, "encode normalized run request")

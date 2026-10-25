@@ -607,11 +607,17 @@ params, command text or environment. It requires a Fabric client. It cannot
 have another program source, parent, dispatch authority, restartability,
 required envelope, envelope schema or other params. L3 proves the credential
 through L1's `GET /v1/seats/{seat_id}/run-target`, which counts once as a Seat
-call, then records the public Seat,
+call for a new submission, then records the public Seat,
 Computer, Node and Computer Attempt identities in immutable Run params,
 tagged with `seat_run_version=1` beside `seat_run` and `seat_binding`. The
 ordinary Run projection also returns `seat_id`. It Pins the Job to that Node.
-The fallback inline script refuses execution on an older node.
+The fallback inline script refuses execution on an older node. Before resolving
+a new submission, L3 looks up the submitting actor and idempotency key. An
+identical replay returns the original Run ID without another Seat call, even
+if that Seat has ended, its Computer Attempt changed, or the configured default
+changed. The request hash describes the caller's source, argv, explicit deadline
+and tags; it excludes resolved authority and the resolved default. A different
+request under the same actor and key is still an `idempotency_conflict`.
 
 L1 commits the Job's `seat_runs` binding and public params with admission.
 The params remain after terminal Job label scrubbing so a lost finish receipt
@@ -621,8 +627,16 @@ Seat and exact Computer Attempt both then and at command start. Its node-only
 `poll` and `finish`, fenced by the command Attempt's Node, boot session and
 fencing token. Only the start/poll replies expose the current Computer Attempt
 fence to its node agent. Attempt foreign keys use `ON DELETE SET NULL`, and the
-Job foreign key uses `ON DELETE CASCADE`. Read-only resolution uses the shared
-L1 read snapshot (`TxOptions{ReadOnly:true}`); command transitions use writes.
+Job foreign key uses `ON DELETE CASCADE`. Resolution first writes the credential
+call's Seat activity, then reads its
+binding through the shared L1 read snapshot (`TxOptions{ReadOnly:true}`). Command
+`poll` and cancellation-list reads use that same read-only snapshot boundary;
+`start` and `finish` write their transitions. A running command does not require
+a `ready` observation: a live Seat may report `starting` during a probe or
+helper generation change. Poll cancels on an ended Seat, a different Computer,
+or an ended or changed Computer Attempt or authority fence. It also checks the
+command Attempt's node against the immutable Seat binding. Start retains the
+Computer fence privately in L1; it never enters public Run params.
 
 The node agent runs argv through `ExecComputerSeat`, the existing helper
 operation. It passes the current helper generation, Seat place and Computer
@@ -655,14 +669,28 @@ are atomic with `command_started` / `command_finished` Seat events. Each event
 contains the Run ID; finished events contain the exit code when one exists,
 or a reason for an interrupted command. Program output stays in the Run log.
 If the finish receipt is lost, the Seat-life check recovers a terminal command
-Attempt's recorded result and releases its hold. A repeated finish with
-identical evidence is harmless. A second start is
+Attempt's recorded result and releases its hold. An unusable result becomes a
+fixed valid `terminated` result without an exit code; a retained deadline reason
+is preserved when valid. Recovery logs and skips each failed row independently
+and advances through keyset pages, so one failure cannot block later Runs.
+
+L1 also bounds a running hold by its boot-relative start plus the immutable
+command deadline and `seatRunBackstopGrace` (five minutes). Once that bound is
+reached without terminal evidence, L1 force-finishes the ordinary command Job
+as failed without an exit code, finishes the Seat Run, releases the hold, and
+writes a `max_runtime_backstop` Seat event with the reason and fix. The helper
+still owns stopping the command at its deadline; L1 does not claim runtime
+quiescence from missing evidence. Calendar changes cannot extend this bound.
+A different L1 host boot, or an older running row with no start stamp, invokes
+the backstop on the next Seat-life check. Failed recovery writes retry on later
+checks. A repeated finish with identical evidence is harmless. A second start is
 refused, including after the command ends. Internal event writes recover or
 skip a missing older Seat log rather than blocking the state transition.
 
 Cancellation closes only that command's helper stream. The node agent also
 polls L1 while it runs, stopping on an ended Seat or a permanent authority
-refusal. Transient poll failures use the ordinary Attempt lease and never
+refusal. A temporary readiness change preserves the running command. Transient
+poll failures use the ordinary Attempt lease and never
 extend it or the command deadline.
 Cancellation belongs to the Run's command Attempt and its immutable Seat and
 Computer Attempt binding. It never looks up a new occupant by place and never

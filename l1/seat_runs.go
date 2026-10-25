@@ -22,6 +22,23 @@ const seatRunSchema = `CREATE TABLE IF NOT EXISTS seat_runs (
  result_json BLOB
 );`
 
+const seatRunBackstopGrace = 5 * time.Minute
+
+// Keep additive columns on one DDL path for fresh and upgraded stores so
+// rollback fingerprints agree as well as column shapes.
+func (s *Store) migrateSeatRuns(ctx context.Context) error {
+	for _, col := range []struct{ name, definition string }{
+		{"start_boot_id", "TEXT NOT NULL DEFAULT ''"},
+		{"start_ns", "INTEGER NOT NULL DEFAULT 0"},
+		{"computer_fencing_token", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(ctx, "seat_runs", col.name, col.definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ResolveSeatRun proves the Seat credential. The resulting public binding may
 // be kept in immutable Run params; credentials and helper fences may not.
 func (s *Store) ResolveSeatRun(ctx context.Context, id, credential string) (binding contract.SeatRunBinding, err error) {
@@ -142,7 +159,7 @@ type SeatRunCommand struct {
 }
 
 func (s *Store) ControlSeatRun(ctx context.Context, identity, jobID, attemptID string, input SeatRunControlRequest) (command SeatRunCommand, err error) {
-	command, err = s.controlSeatRun(ctx, identity, jobID, attemptID, input)
+	command, err = s.controlSeatRun(ctx, identity, jobID, attemptID, input, "")
 	if err != nil || input.Phase != "poll" {
 		return
 	}
@@ -157,12 +174,15 @@ func (s *Store) ControlSeatRun(ctx context.Context, identity, jobID, attemptID s
 	}
 	return
 }
-func (s *Store) controlSeatRun(ctx context.Context, identity, jobID, attemptID string, input SeatRunControlRequest) (command SeatRunCommand, err error) {
+func (s *Store) controlSeatRun(ctx context.Context, identity, jobID, attemptID string, input SeatRunControlRequest, recoveryReason string) (command SeatRunCommand, err error) {
 	if input.Phase != "start" && input.Phase != "poll" && input.Phase != "finish" {
 		return command, protocolError(contract.ErrorInvalidRequest, "invalid Seat Run phase")
 	}
 	if (input.Phase == "finish") != (input.Result != nil) {
 		return command, protocolError(contract.ErrorInvalidRequest, "only finish requires a result")
+	}
+	if input.Phase == "poll" {
+		return s.pollSeatRun(ctx, identity, jobID, attemptID, input)
 	}
 	w, err := s.beginWriteTransaction(ctx, nil)
 	if err != nil {
@@ -191,6 +211,9 @@ func (s *Store) controlSeatRun(ctx context.Context, identity, jobID, attemptID s
 		return command, protocolError(contract.ErrorInvalidRequest, "Attempt is not a Seat Run")
 	}
 	command.Binding = p.Binding
+	if a.nodeID != p.Binding.NodeID {
+		return command, protocolError(contract.ErrorForbidden, "Seat Run belongs to another node")
+	}
 	command.RunID = runID
 	if commandAttempt.Valid && commandAttempt.String != attemptID {
 		return command, protocolError(contract.ErrorAttemptMismatch, "Seat Run command belongs to another Attempt")
@@ -233,6 +256,10 @@ func (s *Store) controlSeatRun(ctx context.Context, identity, jobID, attemptID s
 			reason = "cancelled_or_failed"
 			note = "command has no exit code; inspect its Run for cancellation or failure details"
 		}
+		if recoveryReason == "max_runtime_backstop" {
+			reason = recoveryReason
+			note = "L1 finished the command after its deadline and five-minute receipt grace; the node did not confirm its end. Run it again with a longer --max-runtime if needed."
+		}
 		if err = appendSeatEvent(ctx, w.tx, w.at, SeatLogEvent{EventID: runID + "-finished", SeatID: p.SeatRun.SeatID, Kind: SeatEventCommandFinished, RunID: runID, ExitCode: input.Result.ExitCode, Reason: reason, Note: note}); err != nil {
 			return command, err
 		}
@@ -248,17 +275,7 @@ func (s *Store) controlSeatRun(ctx context.Context, identity, jobID, attemptID s
 		return command, protocolError(contract.ErrorConflict, "Seat Run already ended")
 	}
 	seat, computer, e := currentSeatRunBinding(ctx, w.tx, w.at, p)
-	if e != nil && input.Phase == "poll" {
-		var protocol *Error
-		if !errors.As(e, &protocol) {
-			return command, internalError(e, "verify Seat Run binding")
-		}
-		if apiErrorFromDecision(e).Retryable {
-			return command, e
-		}
-		command.Cancel = true
-		return command, w.commit()
-	}
+
 	if e != nil {
 		return command, e
 	}
@@ -271,7 +288,11 @@ func (s *Store) controlSeatRun(ctx context.Context, identity, jobID, attemptID s
 		if err = s.seatActivityHoldTx(ctx, w.tx, w.at, p.SeatRun.SeatID, "command", runID, true); err != nil {
 			return command, err
 		}
-		if _, err = w.tx.ExecContext(ctx, `UPDATE seat_runs SET state='running',command_attempt_id=? WHERE run_id=?`, attemptID, runID); err != nil {
+		boot, ns, e := seatTime(s.clock, w.at)
+		if e != nil {
+			return command, e
+		}
+		if _, err = w.tx.ExecContext(ctx, `UPDATE seat_runs SET state='running',command_attempt_id=?,start_boot_id=?,start_ns=?,computer_fencing_token=? WHERE run_id=?`, attemptID, boot, ns, computer.fencingToken, runID); err != nil {
 			return command, err
 		}
 		if err = appendSeatEvent(ctx, w.tx, w.at, SeatLogEvent{EventID: runID + "-started", SeatID: p.SeatRun.SeatID, Kind: SeatEventCommandStarted, RunID: runID}); err != nil {
@@ -281,6 +302,85 @@ func (s *Store) controlSeatRun(ctx context.Context, identity, jobID, attemptID s
 		return command, protocolError(contract.ErrorConflict, "Seat Run is not running")
 	}
 	return command, w.commit()
+}
+
+// Polling an admitted command tests retained authority, not display readiness.
+// A live Seat may temporarily report starting while its command keeps running.
+func (s *Store) pollSeatRun(ctx context.Context, identity, jobID, attemptID string, input SeatRunControlRequest) (command SeatRunCommand, err error) {
+	err = s.withReadSnapshot(ctx, nil, func(ctx context.Context, r readModel) error {
+		rd := r.(*databaseReads)
+		a, e := readAttemptAuthority(ctx, rd.q, attemptID)
+		if e != nil {
+			return e
+		}
+		if e = validateAttemptAuthority(identity, jobID, attemptID, input.FencingToken, a); e != nil {
+			return e
+		}
+		if a.nodeID != input.NodeID || a.bootSessionID != input.BootSessionID {
+			return protocolError(contract.ErrorForbidden, "Seat Run node mismatch")
+		}
+		if _, e = validateComputerSeatAttemptForRun(ctx, rd.q, rd.now(), a); e != nil {
+			return e
+		}
+		var state, commandAttempt, computerFence string
+		var params []byte
+		if e = rd.q.QueryRowContext(ctx, `SELECT run_id,state,COALESCE(command_attempt_id,''),params_json,computer_fencing_token FROM seat_runs WHERE job_id=?`, jobID).Scan(&command.RunID, &state, &commandAttempt, &params, &computerFence); e != nil {
+			return e
+		}
+		p, present, e := contract.ParseSeatRunParams(params)
+		if e != nil || !present {
+			return protocolError(contract.ErrorInvalidRequest, "Attempt is not a Seat Run")
+		}
+		command.Binding = p.Binding
+		if a.nodeID != p.Binding.NodeID {
+			return protocolError(contract.ErrorForbidden, "Seat Run belongs to another node")
+		}
+		if commandAttempt != attemptID {
+			return protocolError(contract.ErrorAttemptMismatch, "Seat Run command belongs to another Attempt")
+		}
+		if state != "running" {
+			return protocolError(contract.ErrorConflict, "Seat Run is not running")
+		}
+		value, e := readSeatRequest(ctx, rd.q, p.Binding.SeatID)
+		if e != nil {
+			return e
+		}
+		if value.State != SeatLive || value.ComputerID != p.Binding.ComputerID {
+			command.Cancel = true
+			return nil
+		}
+		computer, e := readAttemptAuthority(ctx, rd.q, p.Binding.ComputerAttemptID)
+		if e != nil {
+			if errorCode(e) == contract.ErrorAttemptNotFound {
+				command.Cancel = true
+				return nil
+			}
+			return e
+		}
+		if computer.nodeID != p.Binding.NodeID || computer.jobID != p.Binding.ComputerJobID || (computerFence != "" && computerFence != computer.fencingToken) {
+			command.Cancel = true
+			return nil
+		}
+		auth := ComputerSeatAttemptRequest{NodeID: computer.nodeID, BootSessionID: computer.bootSessionID, FencingToken: computer.fencingToken}
+		e = validateComputerSeatAttempt(ctx, rd.q, rd.now(), computer.identityNodeID, p.Binding.ComputerID, computer.jobID, computer.attemptID, auth)
+		if e != nil {
+			switch errorCode(e) {
+			case contract.ErrorAttemptNotOwned, contract.ErrorAttemptMismatch, contract.ErrorStaleFence, contract.ErrorNodeSessionReplaced, contract.ErrorConflict, contract.ErrorNotFound:
+			default:
+				return e
+			}
+			command.Cancel = true
+			return nil
+		}
+		command.ComputerSeatAttemptRequest = auth
+		command.Place = value.Place
+		e = rd.q.QueryRowContext(ctx, `SELECT helper_generation FROM computer_seat_observations WHERE seat_id=? AND attempt_id=?`, p.Binding.SeatID, computer.attemptID).Scan(&command.Generation)
+		if errors.Is(e, sql.ErrNoRows) {
+			return nil
+		}
+		return e
+	})
+	return
 }
 
 // This uses the ordinary Attempt lease fence, including boot-relative expiry.
@@ -298,69 +398,111 @@ func validateComputerSeatAttemptForRun(ctx context.Context, q queryer, now time.
 	return true, nil
 }
 
-// A command's final receipt can be lost while ordinary Attempt completion is
-// durable. Recover that evidence so its old hold cannot retain a Seat forever.
+// Recover each receipt independently. Keyset pages move past failed rows so
+// a broken early Run cannot starve later Runs or keep their Seats alive.
 func (s *Store) recoverSeatRunEnds(ctx context.Context) error {
 	type ended struct {
-		identity, job, attempt string
-		input                  SeatRunControlRequest
+		authority attemptAuthority
+		result    ProcessResult
+		backstop  bool
 	}
-	var endedRuns []ended
-	err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, r readModel) error {
-		q := r.(*databaseReads).q
-		rows, err := q.QueryContext(ctx, `SELECT sr.command_attempt_id,a.result_json FROM seat_runs sr JOIN attempts a ON a.attempt_id=sr.command_attempt_id WHERE sr.state='running' AND a.state NOT IN ('claimed','running','awaiting-input') ORDER BY sr.run_id LIMIT 100`)
-		if err != nil {
-			return err
-		}
-		type evidence struct {
-			attempt string
-			result  []byte
-		}
-		var evidenceRows []evidence
-		for rows.Next() {
-			var value evidence
-			if err = rows.Scan(&value.attempt, &value.result); err != nil {
-				rows.Close()
+	cursor := ""
+	for {
+		var endedRuns []ended
+		count := 0
+		err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, r readModel) error {
+			rd := r.(*databaseReads)
+			boot, ns, err := seatTime(s.clock, rd.now())
+			if err != nil {
 				return err
 			}
-			evidenceRows = append(evidenceRows, value)
-		}
-		err = rows.Err()
-		rows.Close()
+			rows, err := rd.q.QueryContext(ctx, `SELECT sr.run_id,sr.command_attempt_id,sr.params_json,sr.start_boot_id,sr.start_ns,a.state,a.result_json FROM seat_runs sr JOIN attempts a ON a.attempt_id=sr.command_attempt_id WHERE sr.state='running' AND sr.run_id>? ORDER BY sr.run_id LIMIT 100`, cursor)
+			if err != nil {
+				return err
+			}
+			type evidence struct {
+				run, attempt, boot, state string
+				start                     int64
+				params, result            []byte
+			}
+			var values []evidence
+			for rows.Next() {
+				var v evidence
+				if err = rows.Scan(&v.run, &v.attempt, &v.params, &v.boot, &v.start, &v.state, &v.result); err != nil {
+					rows.Close()
+					return err
+				}
+				values = append(values, v)
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return err
+			}
+			count = len(values)
+			for _, v := range values {
+				cursor = v.run
+				p, present, e := contract.ParseSeatRunParams(v.params)
+				if e != nil || !present {
+					s.logSeatLifeError(v.run, fmt.Errorf("invalid retained Seat Run params"))
+					continue
+				}
+				// Boot replacement or a legacy unstamped command cannot retain an
+				// unbounded hold. No wall-clock adjustment extends the original bound.
+				due := v.boot == "" || v.boot != boot || (ns >= v.start && (ns-v.start)/int64(time.Second)-int64(seatRunBackstopGrace/time.Second) >= p.SeatRun.MaxRuntimeSeconds)
+				active := v.state == string(contract.AttemptClaimed) || v.state == string(contract.AttemptRunning) || v.state == string(contract.AttemptAwaitingInput)
+				if active && !due {
+					continue
+				}
+				a, e := readAttemptAuthority(ctx, rd.q, v.attempt)
+				if e != nil {
+					s.logSeatLifeError(v.run, e)
+					continue
+				}
+				result := ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+				if len(v.result) > 0 {
+					if e = json.Unmarshal(v.result, &result); e != nil {
+						result = ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+					}
+				}
+				if result.LimitReached != "" {
+					result = ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent, LimitReached: result.LimitReached}
+				}
+				if validateProcessResult(result) != nil {
+					result = ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
+				}
+				if due && active {
+					result = ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent, LimitReached: contract.LimitReachedMaxRuntime}
+				}
+				endedRuns = append(endedRuns, ended{a, result, due && active})
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		for _, value := range evidenceRows {
-			a, e := readAttemptAuthority(ctx, q, value.attempt)
-			if e != nil {
-				return e
-			}
-			result := ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}
-			if len(value.result) > 0 {
-				result = ProcessResult{}
-				if e = json.Unmarshal(value.result, &result); e != nil {
-					return e
+		for _, v := range endedRuns {
+			a := v.authority
+			reason := ""
+			if v.backstop {
+				reason = "max_runtime_backstop"
+				if a.state == contract.AttemptClaimed || a.state == contract.AttemptRunning || a.state == contract.AttemptAwaitingInput {
+					_, e := s.CompleteAttempt(ctx, a.identityNodeID, a.jobID, a.attemptID, CompletionRequest{FencingToken: a.fencingToken, IdempotencyKey: "seat-run-backstop:" + a.attemptID, Result: v.result})
+					if e != nil && errorCode(e) != contract.ErrorLeaseExpired {
+						s.logSeatLifeError(a.attemptID, e)
+						continue
+					}
 				}
 			}
-			// A legacy process completion may contain an exit alongside a limit.
-			if result.LimitReached != "" {
-				result.ExitCode = nil
-				result.Signal = "terminated"
-				result.TerminationCause = contract.TerminationCauseAgent
+			input := SeatRunControlRequest{NodeID: a.nodeID, BootSessionID: a.bootSessionID, FencingToken: a.fencingToken, Phase: "finish", Result: &v.result}
+			if _, e := s.controlSeatRun(ctx, a.identityNodeID, a.jobID, a.attemptID, input, reason); e != nil {
+				s.logSeatLifeError(a.attemptID, e)
 			}
-			endedRuns = append(endedRuns, ended{identity: a.identityNodeID, job: a.jobID, attempt: a.attemptID, input: SeatRunControlRequest{NodeID: a.nodeID, BootSessionID: a.bootSessionID, FencingToken: a.fencingToken, Phase: "finish", Result: &result}})
 		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	for _, value := range endedRuns {
-		if _, err = s.ControlSeatRun(ctx, value.identity, value.job, value.attempt, value.input); err != nil {
-			return err
+		if count < 100 {
+			return nil
 		}
 	}
-	return nil
 }
 
 // Seat deadlines use the ordinary Run protocol's whole-second runtime limit.
