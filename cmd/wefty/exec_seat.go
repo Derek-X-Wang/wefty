@@ -40,10 +40,10 @@ func executeSeatExec(ctx context.Context, clients *apiClients, id string, argv [
 	request := l3.CreateRunRequest{SeatRun: &source}
 	accepted, uncertain, err := submitExecRun(submitCtx, clients, request, key, stderr, secret)
 	stop()
-	if err != nil && uncertain && ctx.Err() != nil {
-		// A signal can hide a committed submission. Replay exactly once with
-		// the same key: L3 returns its receipt without another Seat call.
-		// Then the shared observer applies the ordinary cancellation policy.
+	if err != nil && uncertain && ctx.Err() != nil && !keepRunning && !detach {
+		// Recovery after a signal is normally read-only. This default-mode
+		// exception is safe: the shared observer immediately cancels any Run
+		// the replay finds or creates. Keep-running and detach must not replay.
 		recoveryCtx, stopRecovery := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		recovered, recoveryErr := clients.submitRun(recoveryCtx, request, key, secret)
 		stopRecovery()

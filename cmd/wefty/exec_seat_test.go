@@ -472,6 +472,12 @@ func TestExecSeatInterruptedSubmissionRecoversOnce(t *testing.T) {
 			args = append(args, "--", "true")
 			var out, stderr bytes.Buffer
 			err := execute(ctx, clients, false, args, &out, &stderr)
+			if mode == "keep-running" || mode == "detach" {
+				if posts != 1 || cancels != 0 || out.Len() != 0 || execModeCode(err) != 13 || err == nil || key == "" || !strings.Contains(err.Error(), "could not be confirmed (key "+key+")") {
+					t.Fatalf("signalled %s must not replay: POSTs=%d cancels=%d err=%v stdout=%q", mode, posts, cancels, err, &out)
+				}
+				return
+			}
 			if posts != 2 {
 				t.Fatalf("submission POSTs=%d want original plus one recovery; err=%v", posts, err)
 			}
@@ -481,21 +487,8 @@ func TestExecSeatInterruptedSubmissionRecoversOnce(t *testing.T) {
 				}
 				return
 			}
-			if mode == "detach" {
-				if err != nil || cancels != 0 || out.String() != "{\"run_id\":\"run-seat\"}\n" {
-					t.Fatalf("detach err=%v cancels=%d stdout=%q", err, cancels, &out)
-				}
-				return
-			}
-			wantCancels, wantOutcome := 1, "cancelled"
-			if mode == "keep-running" {
-				wantCancels, wantOutcome = 0, "queued"
-				if execModeCode(err) != 13 {
-					t.Errorf("keep-running exit=%d", execModeCode(err))
-				}
-			}
 			events := execModeEvents(t, out.String())
-			if err == nil || cancels != wantCancels || len(events) == 0 || events[len(events)-1]["outcome"] != wantOutcome {
+			if err == nil || cancels != 1 || len(events) == 0 || events[len(events)-1]["outcome"] != "cancelled" {
 				t.Fatalf("recovery err=%v cancels=%d stdout=%q stderr=%q", err, cancels, &out, &stderr)
 			}
 		})
@@ -531,5 +524,52 @@ func TestExecSeatLimitMessageDoesNotDescribePlainExec(t *testing.T) {
 	err := reportExecFinished(t.Context(), ledgerStub(t, nil), record, execCapture{}, false, &out, &stderr)
 	if execModeCode(err) != 10 || strings.Contains(stderr.String(), "stopped:") {
 		t.Fatalf("plain exec err=%v stderr=%q", err, &stderr)
+	}
+}
+
+func TestExecSeatInterruptedBeforeCommitDoesNotReplay(t *testing.T) {
+	for _, mode := range []string{"keep-running", "detach"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
+			if _, err := storeSeatCredential(execSeatTestID, "secret"); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			created, attempts := 0, 0
+			var key string
+			clients := execSeatLedger(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/runs":
+					created++
+					w.WriteHeader(201)
+					io.WriteString(w, `{"run_id":"run-seat"}`)
+				case "/v1/runs/run-seat":
+					json.NewEncoder(w).Encode(contract.RunRecord{RunID: "run-seat", SeatID: execSeatTestID, Status: contract.RunQueued})
+				case "/v1/seat-requests/" + execSeatTestID:
+					json.NewEncoder(w).Encode(l1.SeatCallResult{SeatRequest: l1.SeatRequest{SeatID: execSeatTestID, State: l1.SeatLive}})
+				default:
+					t.Errorf("unexpected request %s", r.URL.Path)
+					w.WriteHeader(500)
+				}
+			})
+			base := clients.l3.client.Transport
+			clients.l3.client.Transport = storageRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.Method == http.MethodPost && r.URL.Path == "/v1/runs" {
+					attempts++
+					if attempts == 1 {
+						key = r.Header.Get("Idempotency-Key")
+						cancel()
+						return nil, context.Canceled // The original request never reached L3.
+					}
+				}
+				return base.RoundTrip(r)
+			})
+			var out, stderr bytes.Buffer
+			err := execute(ctx, clients, false, []string{"exec", "--seat", execSeatTestID, "--" + mode, "--json", "--", "true"}, &out, &stderr)
+			if attempts != 1 || created != 0 || out.Len() != 0 || execModeCode(err) != 13 || err == nil || key == "" || !strings.Contains(err.Error(), "could not be confirmed (key "+key+")") {
+				t.Fatalf("signal created work: attempts=%d created=%d err=%v stdout=%q stderr=%q", attempts, created, err, &out, &stderr)
+			}
+		})
 	}
 }

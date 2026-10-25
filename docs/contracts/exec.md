@@ -629,11 +629,14 @@ the Run's `seat_id` and admitted `max_runtime_seconds`.
 In a Seat Run's JSON `finished` event, `base_commit` is empty and `dirty` is
 false because nothing was captured; they are not facts about the checkout.
 
-If a signal hides a submission reply, the CLI replays the identical request
-once with the same idempotency key on a cancellation-independent context
-bounded to five seconds. A recovered Run follows ordinary exec policy:
-cancel by default, stop only watching with `--keep-running`, or print its ID
-with `--detach`. Failed recovery remains unavailable (exit 13).
+If a signal hides a submission reply, only default mode replays the identical
+request once with the same idempotency key on a cancellation-independent
+context bounded to five seconds. It immediately uses the ordinary cancellation
+path for any Run the replay finds or creates. This is the one safe exception
+to read-only recovery after a signal. With `--keep-running` or `--detach`,
+the CLI never replays: it could create work after the caller tried to stop.
+Those modes, and failed default-mode recovery, report unavailable (exit 13)
+with the unconfirmed submission key.
 
 After an accepted command, the CLI reads the original caller's Seat outcome
 once to obtain its unread count and uses the shared Seat reply path. The hint
