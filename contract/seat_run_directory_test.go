@@ -29,3 +29,22 @@ func TestSeatRunWorkingDirectoryContract(t *testing.T) {
 		})
 	}
 }
+
+func TestSeatRunDirectoryRequiresVersionTwo(t *testing.T) {
+	id := "seat_00000000000000000000000000000001"
+	for _, tc := range []struct {
+		version   int
+		directory string
+		valid     bool
+	}{{1, "", true}, {1, "work/pkg", false}, {2, "work/pkg", true}, {3, "work/pkg", false}} {
+		params := SeatRunParams{Version: tc.version, SeatRun: SeatRunInput{SeatID: id, Argv: []string{"pwd"}, WorkingDirectory: tc.directory}, Binding: SeatRunBinding{SeatID: id, NodeID: "node", ComputerID: "computer", ComputerJobID: "job", ComputerAttemptID: "attempt"}}
+		raw, _ := json.Marshal(params)
+		got, present, err := ParseSeatRunParams(raw)
+		if !present || (err == nil) != tc.valid {
+			t.Fatalf("version=%d directory=%q: %v", tc.version, tc.directory, err)
+		}
+		if tc.valid && got.SeatRun.WorkingDirectory != tc.directory {
+			t.Fatal("directory lost")
+		}
+	}
+}

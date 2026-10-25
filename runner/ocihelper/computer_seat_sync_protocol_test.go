@@ -46,7 +46,7 @@ func TestSeatCommandWorkingDirectoryProtocol(t *testing.T) {
 				t.Fatal(err)
 			}
 			config, err := engine.seats.command(request)
-			if err != nil || config.Directory != "/wefty/service/seats/1/work/pkg" {
+			if err != nil || config.Directory != "/wefty/service/seats/1" {
 				t.Fatalf("folder=%s err=%v", config.Directory, err)
 			}
 		} else if err == nil {

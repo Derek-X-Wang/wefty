@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -154,6 +155,7 @@ func TestHelperComputerSeatWorkingCopyCF(t *testing.T) {
 	authority.Class = "service"
 	attempt := &containerdAttempt{authority: authority, task: task, networkNamespace: namespace, controlDirectory: control}
 	engine := &ContainerdEngine{config: NativeEngineConfig{Clock: systemClock{}}, attempts: map[string]*containerdAttempt{authority.key(): attempt}}
+	expectedSeats := 1
 	waitForSeat := func(generation uint64, state string) {
 		t.Helper()
 		deadline := time.NewTimer(65 * time.Second)
@@ -164,7 +166,11 @@ func TestHelperComputerSeatWorkingCopyCF(t *testing.T) {
 		var lastErr error
 		for {
 			last, lastErr = engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{Authority: authority, Generation: generation})
-			if lastErr == nil && len(last.Seats) == 1 && last.Seats[0].State == state {
+			all := lastErr == nil && len(last.Seats) == expectedSeats
+			for _, seat := range last.Seats {
+				all = all && seat.State == state && (state != "cleaned" || seat.CleanupComplete)
+			}
+			if all {
 				if state == "cleaned" && !last.Seats[0].CleanupComplete {
 					t.Fatal("cleaned without positive evidence")
 				}
@@ -235,9 +241,40 @@ func TestHelperComputerSeatWorkingCopyCF(t *testing.T) {
 pid=int(open(os.environ["SEAT_DIR"]+"/run/background-cf.pid").read())
 os.kill(pid,0)
 assert open("/proc/"+str(pid)+"/stat").read().rsplit(")",1)[1].split()[0] != "Z"' `)
+	// H1: direct Seat Run directory input must be resolved as the Seat uid,
+	// never by runc while it still has root authority.
+	expectedSeats = 2
+	applied, err = engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{{1, "seat1", 7102, 7103}, {2, "seat2", 7104, 7105}}})
+	must(err)
+	waitForSeat(applied.Generation, "ready")
+	request.Generation = applied.Generation
+	second := request
+	second.Place = 2
+	second.WorkingDirectory = ""
+	second.Args = []string{"python3", "-I", "-S", "-c", "import os;os.mkdir('home/private',0o700)"}
+	must(engine.ExecComputerSeat(ctx, second, func(event SeatCommandEvent) error {
+		if event.Exit != nil && (event.Exit.Code == nil || *event.Exit.Code != 0) {
+			return fmt.Errorf("Seat 2 setup failed: %+v", event.Exit)
+		}
+		return nil
+	}))
+	run(`ln -s /wefty/service/seats/2/home/private "$SEAT_DIR/work/x"`)
+	attack := request
+	attack.WorkingDirectory = "work/x"
+	attack.Args = []string{"/bin/sh", "-c", `touch /wefty/service/seats/1/run/cross-seat-command-started`}
+	err = engine.ExecComputerSeat(ctx, attack, func(SeatCommandEvent) error { return errors.New("refused command produced payload output") })
+	var refusal *SeatOperationRefusalError
+	if !errors.As(err, &refusal) || refusal.Reason != "working_directory_unavailable" {
+		t.Fatalf("cross-Seat directory did not produce a typed refusal: %v", err)
+	}
+	marker := fmt.Sprintf("/proc/%d/root/wefty/service/seats/1/run/cross-seat-command-started", task.Pid())
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("cross-Seat command started: %v", err)
+	}
 	removed, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, nil})
 	must(err)
 	waitForSeat(removed.Generation, "cleaned")
 	must(confirmComputerSeatAbsent(fmt.Sprintf("/proc/%d", task.Pid()), ComputerSeat{1, "seat1", 7102, 7103}))
-	t.Log("CF-1 dependencies persist; CF-2 caller deletion applied; Seat edits put back; CF-3 background sleep outlives command and stops with Seat")
+	must(confirmComputerSeatAbsent(fmt.Sprintf("/proc/%d", task.Pid()), ComputerSeat{2, "seat2", 7104, 7105}))
+	t.Log("H1 symlink directory refused; CF-1 dependencies persist; CF-2 caller deletion applied; Seat edits put back; CF-3 background sleep outlives command and stops with Seat")
 }

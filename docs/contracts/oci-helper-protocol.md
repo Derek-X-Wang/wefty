@@ -2382,8 +2382,15 @@ ready observation.
 
 The operation uses `task.Exec` on the exact running task. It uses uid/gid
 `2000+place`, no supplementary groups, no Linux capabilities, and
-`no_new_privileges`. Its cwd is `/wefty/service/seats/<place>`, with the optional
-`working_directory` appended. Environment is a
+`no_new_privileges`. The OCI process cwd stays `/wefty/service/seats/<place>`.
+After privilege drop, the wrapper walks the optional `working_directory` as
+the Seat uid, opening each component from that folder with
+`O_DIRECTORY|O_NOFOLLOW`, then using `fchdir`. A missing or symlinked component
+emits one terminal internal-wrapper `refusal` frame (`reason: "working_directory_unavailable"`,
+`message`: a path and repair hint). The helper returns the existing typed
+`seat_operation_refused` code with that detail; no command runs or emits output.
+The internal `WEFTY_SEAT_WORKING_DIRECTORY` variable carries the directory to
+the wrapper and is removed before argv starts. Workload environment is a
 fresh allowlist; no helper, node agent, caller-shell, image, or other-Seat
 variables are copied:
 
@@ -2837,10 +2844,15 @@ and symlinks; hard links, special files and unsafe paths are refused. The
 program pins `work` and `.wefty`, uses `O_NOFOLLOW` for directory traversal,
 serializes sync with `.wefty/work.lock`, atomically renames changed files,
 and publishes `.wefty/work-manifest.json` only after a successful apply.
+Lock acquisition waits at most 30 seconds, then refuses with “another
+working-copy update of this Seat is running; try again”. Under the lock it
+removes stale `sync-*` staging entries without following links.
 A pending journal permits repair after partial apply; incomplete input never
-publishes. Only manifest-owned paths are replaced or deleted, preserving
-unmanaged dependencies and outputs. An unchanged content hash and mode keep
-mtime. This operation never stages a `.git` folder.
+publishes. Only manifest-owned paths are deleted. A newly captured file is
+adopted without a write if content and mode match, or replaced with the
+caller's version if they differ. Unmanaged paths outside the capture stay.
+An unchanged content hash and mode keep mtime. Other apply refusals name the
+path and a repair hint. This operation never stages a `.git` folder.
 
 Sync stdout carries one bounded JSON summary (`files_written`, `files_removed`,
 `size_bytes`), delivered through normal data frames to the node agent. The

@@ -192,69 +192,6 @@ func TestSeatSyncProgramSymlinksAndPartialInput(t *testing.T) {
 		t.Fatal("unowned link followed")
 	}
 }
-func TestSeatSyncProgramLock(t *testing.T) {
-	base := t.TempDir()
-	if err := os.Mkdir(filepath.Join(base, ".wefty"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out, err := runSyncFixture(t, base, syncFixtureArchive(t, syncFixtureFile{"setup", "ready", "", 0644})); err != nil {
-		t.Fatalf("before lock: %v %s", err, out)
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 6*time.Second)
-	defer cancel()
-	child := exec.CommandContext(ctx, python, "-I", "-S", "-c", `import fcntl,sys; f=open('.wefty/work.lock','w'); fcntl.flock(f,fcntl.LOCK_EX); print('locked',flush=True); sys.stdin.read()`)
-	child.Dir = base
-	child.WaitDelay = time.Second
-	input, err := child.StdinPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	output, err := child.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = child.Start(); err != nil {
-		t.Fatal(err)
-	}
-	waited := false
-	defer func() {
-		input.Close()
-		if !waited {
-			child.Process.Kill()
-			child.Wait()
-		}
-	}()
-	ready := make(chan error, 1)
-	go func() { var b [7]byte; _, e := output.Read(b[:]); ready <- e }()
-	select {
-	case err = <-ready:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-ctx.Done():
-		t.Fatal("lock handshake hung")
-	}
-	if out, err := runSyncFixture(t, base, syncFixtureArchive(t, syncFixtureFile{"x", "x", "", 0644})); err == nil {
-		t.Fatalf("concurrent sync accepted: %s", out)
-	}
-	if _, err := os.Stat(filepath.Join(base, "work/x")); !os.IsNotExist(err) {
-		t.Fatal("locked sync wrote file")
-	}
-	input.Close()
-	err = child.Wait()
-	waited = true
-	if err != nil {
-		t.Fatalf("lock holder: %v", err)
-	}
-	if out, err := runSyncFixture(t, base, syncFixtureArchive(t, syncFixtureFile{"x", "x", "", 0644})); err != nil {
-		t.Fatalf("after unlock: %v %s", err, out)
-	}
-}
-
 func TestSeatSyncProgramChangedFileEmptyDirectoriesAndRecovery(t *testing.T) {
 	base := t.TempDir()
 	first := syncFixtureArchive(t, syncFixtureFile{"empty-after-delete/file", "old", "", 0644}, syncFixtureFile{"tracked", "old", "", 0644})
@@ -323,7 +260,7 @@ os.rename=fail_manifest
 	}
 }
 
-func TestSeatSyncProgramRefusesUnsafeInputAndUnownedCollisions(t *testing.T) {
+func TestSeatSyncProgramRefusesUnsafeInputAndAdoptsCallerFile(t *testing.T) {
 	for _, name := range []string{"../escape", "/escape", "a/../escape", "a//escape", ".git/config", "pkg/.git/config"} {
 		t.Run(name, func(t *testing.T) {
 			base := t.TempDir()
@@ -344,13 +281,13 @@ func TestSeatSyncProgramRefusesUnsafeInputAndUnownedCollisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 2 {
-		if out, err := runSyncFixture(t, base, syncFixtureArchive(t, syncFixtureFile{"unowned", "caller", "", 0644})); err == nil {
-			t.Fatalf("unowned path adopted after failed sync: %s", out)
+		if out, err := runSyncFixture(t, base, syncFixtureArchive(t, syncFixtureFile{"unowned", "caller", "", 0644})); err != nil {
+			t.Fatalf("caller path refused: %v %s", err, out)
 		}
 	}
 	got, _ := os.ReadFile(dest)
-	if string(got) != "installed" {
-		t.Fatal("unowned file changed")
+	if string(got) != "caller" {
+		t.Fatal("caller file did not win")
 	}
 }
 

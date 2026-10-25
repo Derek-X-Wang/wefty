@@ -30,6 +30,9 @@ func TestSeatRunWorkingDirectoryParamsAndIdempotency(t *testing.T) {
 	}
 	var params map[string]any
 	_ = json.Unmarshal(record.Params, &params)
+	if params["seat_run_version"] != float64(2) {
+		t.Fatalf("directory Run did not fence older nodes: %s", record.Params)
+	}
 	if params["seat_run"].(map[string]any)["working_directory"] != "work/pkg" {
 		t.Fatalf("folder lost: %s", record.Params)
 	}

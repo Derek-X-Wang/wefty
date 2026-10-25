@@ -94,7 +94,7 @@ func ParseSeatRunParams(raw []byte) (SeatRunParams, bool, error) {
 	}
 	var p SeatRunParams
 	var version int
-	if json.Unmarshal(fields["seat_run_version"], &version) != nil || version != 1 {
+	if json.Unmarshal(fields["seat_run_version"], &version) != nil || (version != 1 && version != 2) {
 		return p, true, errors.New("unsupported Seat Run metadata version")
 	}
 	if err := decodeJSONStrict(raw, &p); err != nil {
@@ -102,6 +102,9 @@ func ParseSeatRunParams(raw []byte) (SeatRunParams, bool, error) {
 	}
 	if err := p.SeatRun.Normalize(); err != nil {
 		return p, true, err
+	}
+	if p.SeatRun.WorkingDirectory != "" && version < 2 {
+		return p, true, errors.New("working_directory requires Seat Run metadata version 2")
 	}
 	b := p.Binding
 	if b.SeatID != p.SeatRun.SeatID || b.NodeID == "" || b.ComputerID == "" || b.ComputerJobID == "" || b.ComputerAttemptID == "" {

@@ -272,3 +272,7 @@ excluding tar framing. Sending and failed rows may omit the apply counts.
 Counts on completed evidence are immutable on retry. Existing copy holds,
 lease renewal, credential fencing, retained logging and unread rules apply.
 No new event kind or database table is introduced.
+
+Text `wefty logs SEAT_ID` renders a sync as a “working-copy update”, with
+files written, files removed and bytes sent. JSON retains the `copy_in` kind
+and the existing `direction` and `sync` fields.

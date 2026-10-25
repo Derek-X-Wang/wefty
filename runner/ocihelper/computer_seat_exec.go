@@ -30,10 +30,19 @@ type SeatCommandExit struct {
 	Code   *int `json:"code,omitempty"`
 	Signal int  `json:"signal,omitempty"`
 }
+
+const SeatRefusalWorkingDirectory SeatOperationRefusalReason = "working_directory_unavailable"
+
+type SeatCommandRefusal struct {
+	Reason  SeatOperationRefusalReason `json:"reason"`
+	Message string                     `json:"message"`
+}
+
 type SeatCommandEvent struct {
-	Stream string           `json:"stream,omitempty"`
-	Data   []byte           `json:"data,omitempty"`
-	Exit   *SeatCommandExit `json:"exit,omitempty"`
+	Stream  string              `json:"stream,omitempty"`
+	Data    []byte              `json:"data,omitempty"`
+	Exit    *SeatCommandExit    `json:"exit,omitempty"`
+	Refusal *SeatCommandRefusal `json:"refusal,omitempty"`
 }
 type ComputerSeatExecEngine interface {
 	ExecComputerSeat(context.Context, ExecComputerSeatRequest, func(SeatCommandEvent) error) error
@@ -81,9 +90,6 @@ func (s *computerSeats) command(r ExecComputerSeatRequest) (seatCommandConfig, e
 	folder := fmt.Sprintf("/wefty/service/seats/%d", r.Place)
 	home := folder + "/home"
 	directory := folder
-	if r.WorkingDirectory != "" {
-		directory += "/" + r.WorkingDirectory
-	}
 	return seatCommandConfig{UID: uint32(2000 + r.Place), GID: uint32(2000 + r.Place), Directory: directory, Environment: []string{
 		"PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8", "USER=" + e.config.User, "LOGNAME=" + e.config.User,
 		"HOME=" + home, "SEAT_ID=" + fmt.Sprint(r.Place), "SEAT_DIR=" + folder, "DISPLAY=:" + fmt.Sprint(r.Place), "XAUTHORITY=" + folder + "/.Xauthority",
@@ -92,6 +98,12 @@ func (s *computerSeats) command(r ExecComputerSeatRequest) (seatCommandConfig, e
 	}}, nil
 }
 func (e SeatCommandEvent) validate() error {
+	if e.Refusal != nil {
+		if e.Exit != nil || e.Stream != "" || len(e.Data) != 0 || e.Refusal.Reason != SeatRefusalWorkingDirectory || e.Refusal.Message == "" || len(e.Refusal.Message) > 4096 {
+			return errors.New("invalid command refusal")
+		}
+		return nil
+	}
 	if e.Exit != nil {
 		if e.Stream != "" || len(e.Data) != 0 || (e.Exit.Code == nil) == (e.Exit.Signal == 0) || e.Exit.Signal < 0 || e.Exit.Signal > 64 || (e.Exit.Code != nil && (*e.Exit.Code < 0 || *e.Exit.Code > 255)) {
 			return errors.New("invalid command exit")

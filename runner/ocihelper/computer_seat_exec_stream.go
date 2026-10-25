@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 )
 
@@ -15,6 +16,7 @@ type seatCommandStream struct {
 	mu       sync.Mutex
 	pending  []byte
 	terminal bool
+	refusal  error
 	err      error
 }
 
@@ -59,8 +61,11 @@ func (w *seatCommandStream) Write(data []byte) (int, error) {
 			if w.emit != nil {
 				err = w.emit(event)
 			}
-			if event.Exit != nil {
+			if event.Exit != nil || event.Refusal != nil {
 				w.terminal = true
+			}
+			if event.Refusal != nil {
+				w.refusal = fmt.Errorf("%s: %w", event.Refusal.Message, &SeatOperationRefusalError{Reason: event.Refusal.Reason})
 			}
 		}
 		w.pending = w.pending[:0]
@@ -83,7 +88,7 @@ func (w *seatCommandStream) finish() error {
 	if len(w.pending) != 0 || !w.terminal {
 		return errors.New("Seat command has no complete exit evidence")
 	}
-	return nil
+	return w.refusal
 }
 
 // Containerd must keep draining after a failed consumer so a wrapper blocked

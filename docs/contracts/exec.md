@@ -630,7 +630,8 @@ on stderr, using the Run's actual admitted deadline. The Run failure remains
 exit 10 with no command exit code. JSON keeps the `finished` event and adds
 the Run's `seat_id` and admitted `max_runtime_seconds`.
 In a Seat Run's JSON `finished` event, `base_commit` is empty and `dirty` is
-false because nothing was captured; they are not facts about the checkout.
+false because Seat Runs do not publish capture metadata; these fields do not
+describe the caller's checkout.
 
 If a signal hides a submission reply, only default mode replays the identical
 request once with the same idempotency key on a cancellation-independent
@@ -663,7 +664,10 @@ required envelope, envelope schema or other params. L3 proves the credential
 through L1's `GET /v1/seats/{seat_id}/run-target`, which counts once as a Seat
 call for a new submission, then records the public Seat,
 Computer, Node and Computer Attempt identities in immutable Run params,
-tagged with `seat_run_version=1` beside `seat_run` and `seat_binding`. The
+tagged with `seat_run_version` beside `seat_run` and `seat_binding`. Version 2
+is required whenever `working_directory` is nonempty; version 1 remains valid
+without it. An older node agent refuses the unsupported version before starting
+a command, rather than silently running in the Seat folder. The
 ordinary Run projection also returns `seat_id`. It Pins the Job to that Node.
 The fallback inline script refuses execution on an older node. Before resolving
 a new submission, L3 looks up the submitting actor and idempotency key. An
@@ -697,7 +701,12 @@ operation. It passes the current helper generation, Seat place and Computer
 Attempt authority and the immutable `working_directory` from L1's start reply.
 The optional directory must be relative and clean: no leading `/`, `..`
 component, NUL, repeated or trailing slash, or `.` component; at most
-4096 bytes. Omission means the Seat folder. It passes no caller environment, executable, user,
+4096 bytes. Omission means the Seat folder. The runtime starts the wrapper in
+the Seat folder. As the Seat uid, the wrapper opens each directory component
+with `O_DIRECTORY|O_NOFOLLOW`, then uses `fchdir` before starting argv. A missing
+or symlinked component refuses with `seat_operation_refused`, detail
+`working_directory_unavailable`, and a path and repair hint; no command starts.
+It passes no caller environment, executable, user,
 Run token or Attempt credential. The Seat's Linux user, folder, screen and
 complete environment come from that operation. It creates no host command and
 never reaps or stops the Computer as part of a Run. Run output, log upload,
@@ -776,6 +785,12 @@ Git attributes such as `export-ignore` or `export-subst` do not alter this
 capture. The caller's checkout wins over edits made to captured files on the
 Seat, even when size and mtime match.
 
+Checkout Seat commands now have the same capture restrictions as plain
+`wefty exec`: a checkout without a commit, a checkout using Git LFS, or a
+Git-ignored or empty start folder is refused with the plain-exec usage error before
+sync or Run submission. These checkouts previously ran in the Seat folder
+without capture. Outside a checkout, execution still uses the Seat folder.
+
 Stage A sends the full frozen snapshot in one `direction=sync&path=work`
 request over the existing Seat copy route and Seat credential. There is no
 manifest round trip or changed-files transfer. The unprivileged sync program
@@ -786,18 +801,24 @@ Unchanged files keep their mtime. Changed files are staged, fsynced and renamed
 into place; a real name never contains half a file. The manifest is atomically
 published only after the apply succeeds.
 
-Only paths owned by previous manifests may be removed or replaced. Paths
-removed from the caller's capture, including paths that became ignored, go
-away; directories created by sync are removed when empty. Paths never managed
-by sync, such as `node_modules`, build outputs and copied secrets, stay.
-A newly captured file that collides with an unowned Seat path is refused
-instead of deleting that path. Existing directories can hold both kinds of
-files. Pinned directory descriptors and `O_NOFOLLOW` keep every write within
-`work`; a working-copy symlink cannot redirect a later write outside it.
+Paths removed from the caller's capture, including paths that became ignored,
+go away only if a previous manifest owned them; directories created by sync
+are removed when empty. Files outside the capture and never managed by sync,
+such as `node_modules`, build outputs and copied secrets, stay. When a newly
+captured path already exists on the Seat (for example `package-lock.json`
+created by `npm install`), matching content and mode are adopted without a
+write or mtime change. If they differ, the caller's version replaces the file:
+the path is now in the copy set, and the caller's checkout wins. Existing
+directories can hold both kinds of files. A blocking unowned directory component
+or nonempty directory refuses with its path and a repair hint. Pinned directory
+descriptors and `O_NOFOLLOW` keep every write within `work`; a working-copy
+symlink cannot redirect a later write outside it.
 
-`.wefty/work.lock` admits one sync at a time per Seat; a concurrent sync is
-refused and may be retried. Sync is not a command lock: a sync while another
-command runs updates the same working copy under that command. Commands do
+`.wefty/work.lock` admits one sync at a time per Seat. A concurrent sync waits
+up to 30 seconds, then refuses with “another working-copy update of this Seat
+is running; try again”. Under the lock, each sync removes stale `.wefty/sync-*`
+staging folders left by a killed update, without following symlinks. Sync is
+not a command lock: a sync while another command runs updates the same working copy under that command. Commands do
 not receive private copies. A failed or partial sync retains the old manifest.
 A pending-apply journal outside `work` lets the next sync repair complete
 files already published by a failed apply, including newly added paths.

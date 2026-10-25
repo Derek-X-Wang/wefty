@@ -8,13 +8,17 @@ import signal
 import stat
 import sys
 import tarfile
+import time
 
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 COMMIT = b'\nWEFTY_COPY_COMMIT_V1\n'
+active_path = 'work'
 
 
 def parts(name):
+    global active_path
+    active_path = name
     result = name.split('/')
     if (not name or len(name) > 4096 or '\x00' in name
             or any(p in ('', '.', '..') for p in result) or '.git' in result):
@@ -23,6 +27,8 @@ def parts(name):
 
 
 def directory(parent, name):
+    global active_path
+    active_path = name
     try:
         os.mkdir(name, 0o700, dir_fd=parent)
     except FileExistsError:
@@ -38,6 +44,8 @@ def metadata(fd, name):
 
 
 def load(fd, name):
+    global active_path
+    active_path = ".wefty/" + name
     try:
         handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
     except FileNotFoundError:
@@ -54,6 +62,8 @@ def load(fd, name):
 
 
 def atomic_json(fd, name, value):
+    global active_path
+    active_path = ".wefty/" + name
     temporary = '.sync-' + os.urandom(16).hex()
     try:
         out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
@@ -177,12 +187,10 @@ def apply(root, state, stage, incoming, size):
         owns = name in owned and owned[name].get('owned', True)
         if record['kind'] == 'directory':
             if info is not None and not stat.S_ISDIR(info.st_mode) and not owns:
-                raise ValueError('sync collides with an unowned directory path')
+                raise ValueError('directory component is a symlink or file; save or remove the blocking path before retrying')
             record['owned'] = owns or info is None
             if info is None or not stat.S_ISDIR(info.st_mode):
                 missing_directories.add(name)
-        elif info is not None and not owns:
-            raise ValueError('sync collides with an unowned file path')
     atomic_json(state, 'work-pending.json', {**owned, **incoming})
     removed = written = 0
     for name in sorted(owned, key=lambda n: (n.count('/'), n), reverse=True):
@@ -230,8 +238,6 @@ def apply(root, state, stage, incoming, size):
                 continue
             if same(fd, leaf, record):
                 continue
-            if info is not None and name not in owned:
-                raise ValueError('sync collides with an unowned path')
             if info is not None and stat.S_ISDIR(info.st_mode):
                 # A Seat may have changed a managed file into a directory.
                 # Restore an empty one, but never delete unmanaged contents.
@@ -262,12 +268,61 @@ def apply(root, state, stage, incoming, size):
     return {'files_written': written, 'files_removed': removed, 'size_bytes': size}
 
 
+class SyncBusyError(Exception):
+    pass
+
+
+def acquire_lock(fd, wait=30.0, clock=time.monotonic, sleep=time.sleep):
+    # Stay below the copy stream's 60-second stall budget so its watchdog
+    # cannot mask this actionable refusal. Tests inject both clock and sleep.
+    deadline = clock() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            remaining = deadline - clock()
+            if remaining <= 0:
+                raise SyncBusyError('another working-copy update of this Seat is running; try again') from None
+            sleep(min(0.05, remaining))
+
+
+def remove_stale_directory(parent_fd, name):
+    fd = os.open(name, DIRECTORY, dir_fd=parent_fd)
+    try:
+        for child in os.listdir(fd):
+            info = metadata(fd, child)
+            if info is not None and stat.S_ISDIR(info.st_mode):
+                remove_stale_directory(fd, child)
+            elif info is not None:
+                os.unlink(child, dir_fd=fd)
+    finally:
+        os.close(fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def clear_stale_stages(state):
+    global active_path
+    # The lock excludes a live sync. Never follow a link, including one at
+    # the stage's root; these reserved names can only hold abandoned staging.
+    for name in os.listdir(state):
+        if not name.startswith('sync-'):
+            continue
+        active_path = '.wefty/' + name
+        info = metadata(state, name)
+        if info is not None and stat.S_ISDIR(info.st_mode):
+            remove_stale_directory(state, name)
+        elif info is not None:
+            os.unlink(name, dir_fd=state)
+
+
 def main():
     seat = os.open('.', DIRECTORY)
     state = directory(seat, '.wefty')
     lock = os.open('work.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=state)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquire_lock(lock)
+        clear_stale_stages(state)
         work = directory(seat, 'work')
         temporary = 'sync-' + os.urandom(16).hex()
         stage = directory(state, temporary)
@@ -293,6 +348,9 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+    except SyncBusyError as error:
+        sys.stderr.write(str(error) + "\n")
+        sys.exit(1)
     except Exception as error:
-        sys.stderr.write(str(error) + '\n')
+        sys.stderr.write('cannot update working-copy path %r: %s; fix the path or permissions, or free space, then retry (save files with wefty cp before removing a blocker)\n' % (active_path, error))
         sys.exit(1)

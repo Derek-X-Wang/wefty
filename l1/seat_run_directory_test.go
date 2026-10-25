@@ -18,7 +18,7 @@ func TestSeatRunWorkingDirectoryStartAndIdleAfterCommand(t *testing.T) {
 	if err = json.Unmarshal(raw, &source); err != nil {
 		t.Fatal(err)
 	}
-	params, _ := json.Marshal(contract.SeatRunParams{Version: 1, SeatRun: source, Binding: binding})
+	params, _ := json.Marshal(contract.SeatRunParams{Version: 2, SeatRun: source, Binding: binding})
 	spec := contract.JobSpec{SchemaVersion: 1, DispatchKey: "directory-command", Kind: contract.JobKindProcess, Class: contract.JobClassOneShot, RoutingTags: []string{contract.StableNodeTagPrefix + f.node.NodeID}, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/false"}, Argv: []string{"false"}, WorkingDirectory: "/tmp"}, Labels: map[string]string{"run_id": "run_00000000000000000000000000000002", contract.LabelRunParams: string(params)}}
 	original := spec.Labels[contract.LabelRunParams]
 	for _, directory := range []string{"/outside", "work/../outside", "work//pkg"} {

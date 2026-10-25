@@ -447,81 +447,81 @@
           }
         },
         "SeatCopyReceipt": {
-        "description": "Node-owned copy evidence. The pre-stream sending receipt counts as a Seat call and acquires a separate 60-second boot-relative copy lease. Repeating sending every 20 seconds renews that lease without another event or call. Terminal evidence releases it. Seat or Attempt ending clears copy holds.",
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "node_id",
-          "boot_session_id",
-          "fencing_token",
-          "computer_id",
-          "job_id",
-          "attempt_id",
-          "credential",
-          "copy_id",
-          "direction",
-          "path",
-          "size_bytes"
-        ],
-        "properties": {
-          "node_id": {
-            "type": "string"
-          },
-          "boot_session_id": {
-            "type": "string"
-          },
-          "fencing_token": {
-            "type": "string"
-          },
-          "computer_id": {
-            "type": "string"
-          },
-          "job_id": {
-            "type": "string"
-          },
-          "attempt_id": {
-            "type": "string"
-          },
-          "credential": {
-            "type": "string",
-            "writeOnly": true
-          },
-          "copy_id": {
-            "type": "string"
-          },
-          "direction": {
-            "type": "string",
-            "enum": [
-              "in",
-              "out",
-              "sync"
-            ]
-          },
-          "path": {
-            "type": "string"
-          },
-          "size_bytes": {
-            "type": "integer"
-          },
-          "outcome": {
-            "type": "string",
-            "enum": [
-              "completed",
-              "failed",
-              "sent",
-              "sending"
-            ],
-            "description": "Older node receipts omit this: completed for in, sent for out."
-          },
-          "reason": {
-            "type": "string",
-            "pattern": "^[a-z][a-z0-9_]{0,63}$"
-          },
-          "sync": {
-            "$ref": "#/components/schemas/SeatSyncCounts"
+          "description": "Node-owned copy evidence. The pre-stream sending receipt counts as a Seat call and acquires a separate 60-second boot-relative copy lease. Repeating sending every 20 seconds renews that lease without another event or call. Terminal evidence releases it. Seat or Attempt ending clears copy holds.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "node_id",
+            "boot_session_id",
+            "fencing_token",
+            "computer_id",
+            "job_id",
+            "attempt_id",
+            "credential",
+            "copy_id",
+            "direction",
+            "path",
+            "size_bytes"
+          ],
+          "properties": {
+            "node_id": {
+              "type": "string"
+            },
+            "boot_session_id": {
+              "type": "string"
+            },
+            "fencing_token": {
+              "type": "string"
+            },
+            "computer_id": {
+              "type": "string"
+            },
+            "job_id": {
+              "type": "string"
+            },
+            "attempt_id": {
+              "type": "string"
+            },
+            "credential": {
+              "type": "string",
+              "writeOnly": true
+            },
+            "copy_id": {
+              "type": "string"
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "in",
+                "out",
+                "sync"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "size_bytes": {
+              "type": "integer"
+            },
+            "outcome": {
+              "type": "string",
+              "enum": [
+                "completed",
+                "failed",
+                "sent",
+                "sending"
+              ],
+              "description": "Older node receipts omit this: completed for in, sent for out."
+            },
+            "reason": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{0,63}$"
+            },
+            "sync": {
+              "$ref": "#/components/schemas/SeatSyncCounts"
+            }
           }
-        }
-      },
+        },
         "SeatCopyStreamEvent": {
           "type": "object",
           "additionalProperties": false,
@@ -631,11 +631,7 @@
               "released",
               "ended",
               "owner_stop",
-              "owner_restart",
-              "ends_soon",
-              "owner_reimage",
-              "owner_reset",
-              "owner_remove",
+              "owner_restart", "ends_soon", "owner_reimage", "owner_reset", "owner_remove",
               "command_started",
               "command_finished",
               "copy_in",

@@ -127,10 +127,37 @@ def retain_background_readers(selector):
         key.fileobj.close()
 
 
+def enter_working_directory(directory):
+    if not directory:
+        return
+    parts = directory.split('/')
+    if any(part in ('', '.', '..') for part in parts) or '\x00' in directory:
+        raise ValueError('expected a clean relative directory')
+    fd = os.open('.', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in parts:
+            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        os.fchdir(fd)
+    finally:
+        os.close(fd)
+
+
 def main():
     global child
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    directory = os.environ.pop('WEFTY_SEAT_WORKING_DIRECTORY', '')
+    try:
+        # runc starts only in the trusted Seat folder. This walk runs after
+        # uid/gid were dropped, and never follows even an in-Seat symlink.
+        enter_working_directory(directory)
+    except (OSError, ValueError) as error:
+        message = ("cannot open working_directory %r: %s" % (directory, error))[:700]
+        emit({'refusal': {'reason': 'working_directory_unavailable',
+                          'message': message + '; choose an existing directory without symlinks'}})
+        return
     try:
         child = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
