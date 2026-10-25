@@ -6,6 +6,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
 	"io"
+	"path/filepath"
 	"slices"
 	"testing"
 )
@@ -24,7 +25,13 @@ func TestSeatRunSetupDeadlineIsClusterOnlyAndRetained(t *testing.T) {
 	if len(value.arguments(false, true)) != 0 {
 		t.Fatalf("cluster deadline reached node arguments: %v", value.arguments(false, true))
 	}
-	paths, err := resolveSetupPaths(t.TempDir())
+	// t.TempDir can sit under a symlinked temp root (macOS /var, a wefty run's
+	// $TMPDIR); setup refuses writes that leave the home through a link.
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := resolveSetupPaths(home)
 	if err != nil {
 		t.Fatal(err)
 	}
