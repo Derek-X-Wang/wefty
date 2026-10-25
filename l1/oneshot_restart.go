@@ -87,6 +87,7 @@ func (s *Store) InterruptRestartableAttempt(ctx context.Context, nodeID, attempt
 		return Job{}, false, internalError(err, "begin interruption request")
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	tx, now := write.tx, write.at
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
@@ -133,7 +134,11 @@ func (s *Store) InterruptRestartableAttempt(ctx context.Context, nodeID, attempt
 	if canceled {
 		return Job{}, false, protocolError(contract.ErrorConflict, "Job cancellation takes precedence")
 	}
-	if !now.Before(attempt.leaseExpires) {
+	leaseExpired, err := attemptLeaseExpired(ctx, now, attempt)
+	if err != nil {
+		return Job{}, false, err
+	}
+	if leaseExpired {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, false, err
 		}

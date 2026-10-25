@@ -2806,12 +2806,22 @@ clear their holds on a Computer restart.
 A backward elapsed-clock step within the same boot means zero elapsed and
 never a reboot. Boot identity alone identifies a new boot.
 L1's general timestamps use real wall time, without a global clock anchor.
-Existing Attempt lease comparisons still use wall time; a calendar step can
-therefore independently remove Attempt authority. Hardening those lease paths
-is separate from the Seat timers described here.
-SL-7 is not met end to end until #1247 lands: a wall-clock step larger than the
-lease time on L1's host can remove Attempt authority and end Seats as
-`the Computer restarted`.
+Attempt leases also store L1's host boot identity and a boot-elapsed deadline
+beside their wall deadline (#1247). Within that host boot, every L1 lease
+comparison uses the boot deadline, so calendar steps neither expire nor extend
+Attempt authority (SL-7). Claim, renewal and authority revocation write both
+deadlines. An L1 process restart on the same host boot retains the boot deadline.
+After a new host boot, or for pre-upgrade Attempts without a boot deadline,
+comparisons fall back to the recorded wall deadline; they do not grant a fresh
+lease. A successful renewal then records the current boot and both deadlines.
+Recorded timestamps and returned lease expiry timestamps remain wall time.
+If boot-clock sampling fails, L1 keeps serving and runs unrelated maintenance,
+retries lease-dependent reconciliation on the next pass, and refuses lease
+authority until the clock is available. It does not silently switch a stamped
+live lease to wall time after a clock-read failure. Owner revocation still loses
+the Attempt; without a usable boot clock it clears the boot stamp and caps the
+wall deadline.
+Node-side lease timers are unchanged.
 Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
 pending approvals and windows without a stamp do not retain authority.
 

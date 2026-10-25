@@ -152,6 +152,7 @@ func (s *Store) setServiceDesiredState(ctx context.Context, jobID string, desire
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	job, err := getJobByID(ctx, tx, jobID, now)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && job.ServiceJob == nil) {
 		return Job{}, protocolError(contract.ErrorNotFound, "service job %q was not found", jobID)
@@ -251,6 +252,7 @@ func (s *Store) restartService(ctx context.Context, jobID string, request Servic
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	job, err := getJobByID(ctx, tx, jobID, now)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && job.ServiceJob == nil) {
 		return Job{}, false, protocolError(contract.ErrorNotFound, "service job %q was not found", jobID)

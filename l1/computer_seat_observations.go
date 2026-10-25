@@ -69,7 +69,11 @@ func validateComputerSeatAttempt(ctx context.Context, q queryer, now time.Time, 
 	if request.NodeID != a.nodeID || request.BootSessionID != a.bootSessionID {
 		return protocolError(contract.ErrorNodeSessionReplaced, "Seat observation node registration does not match")
 	}
-	if (a.state != contract.AttemptClaimed && a.state != contract.AttemptRunning && a.state != contract.AttemptAwaitingInput) || !now.Before(a.leaseExpires) {
+	leaseExpired, err := attemptLeaseExpired(ctx, now, a)
+	if err != nil {
+		return err
+	}
+	if (a.state != contract.AttemptClaimed && a.state != contract.AttemptRunning && a.state != contract.AttemptAwaitingInput) || leaseExpired {
 		return protocolError(contract.ErrorConflict, "Seat observation requires a live attempt")
 	}
 	var currentJob, desired string
@@ -144,6 +148,7 @@ func (s *Store) bindComputerSeatList(ctx context.Context, identity, computerID, 
 		return ComputerSeatList{}, err
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	tx := write.tx
 	if err := validateComputerSeatAttempt(ctx, tx, write.at, identity, computerID, jobID, attemptID, request); err != nil {
 		return ComputerSeatList{}, err
@@ -280,6 +285,7 @@ func (s *Store) ReportComputerSeatObservations(ctx context.Context, identity, co
 		return ComputerSeatObservationReceipt{}, err
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	tx := write.tx
 	now := canonicalTime(s.clock.Now())
 	auth := ComputerSeatAttemptRequest{NodeID: report.NodeID, BootSessionID: report.BootSessionID, FencingToken: report.FencingToken}

@@ -292,7 +292,7 @@ func TestJobReadSnapshotCredentialRevalidation(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := h.store.db.Exec("UPDATE attempts SET lease_expires_ns=0 WHERE attempt_id=?", claim.Lease.AttemptID); err != nil {
+			if _, err := h.store.db.Exec("UPDATE attempts SET lease_expires_ns=0, lease_deadline_ns=1 WHERE attempt_id=?", claim.Lease.AttemptID); err != nil {
 				t.Fatal(err)
 			}
 			ctx := context.WithValue(t.Context(), attemptCredentialContextKey{}, scope)

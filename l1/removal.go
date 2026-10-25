@@ -75,6 +75,7 @@ func (s *Store) removeService(ctx context.Context, jobID string, actor *serviceA
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 
 	var dispatchKey, requestHash string
 	var specJSON []byte
@@ -215,6 +216,7 @@ func (s *Store) forceForgetService(ctx context.Context, jobID string, actor *ser
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	removal, err := readServiceRemoval(ctx, tx, jobID)
 	if err != nil {
 		return Job{}, internalError(err, "read forced service forget")
@@ -442,6 +444,7 @@ func (s *Store) AcknowledgeServiceRemoval(ctx context.Context, identityNodeID, j
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 
 	removal, err := readServiceRemoval(ctx, tx, jobID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -837,6 +840,7 @@ func (s *Store) FinalizeServiceRemoval(ctx context.Context, jobID string) (Job, 
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	job, finalized, err := finalizeServiceRemovalTx(ctx, tx, jobID, now)
 	if err != nil {
 		return Job{}, false, err

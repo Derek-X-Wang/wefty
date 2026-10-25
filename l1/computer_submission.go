@@ -221,6 +221,7 @@ func (s *Store) MutateComputerSubmission(ctx context.Context, identity fabric.Id
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	if err := s.personDeviceBinding.requireCurrentAdmin(ctx, tx, identity); err != nil {
 		return Computer{}, false, false, err
 	}
@@ -357,8 +358,10 @@ func (r *databaseReads) proveComputerTokenScope(ctx context.Context, computerID,
 	var proof ComputerTokenScopeProof
 	var submitEnabled bool
 	var leaseExpiresNS int64
+	var leaseBootID string
+	var leaseDeadlineNS int64
 	err := r.q.QueryRowContext(ctx, `SELECT c.computer_id, a.attempt_id, c.storage_generation,
-		c.submit_intent_revision, host.identity_node_id, host.node_id, host.boot_session_id, c.submit_max_inflight, c.submit_enabled, a.lease_expires_ns
+		c.submit_intent_revision, host.identity_node_id, host.node_id, host.boot_session_id, c.submit_max_inflight, c.submit_enabled, a.lease_expires_ns, a.lease_boot_id, a.lease_deadline_ns
 		FROM computers c JOIN attempts a ON a.job_id=c.current_job_id
 		JOIN jobs j ON j.job_id=c.current_job_id
 		JOIN nodes host ON host.node_id=a.node_id
@@ -378,14 +381,18 @@ func (r *databaseReads) proveComputerTokenScope(ctx context.Context, computerID,
 		)`, computerID, attemptID, hostIdentityNodeID, hostIdentityNodeID, hostNodeID, hostNodeID,
 		contract.NodeDead).Scan(&proof.ComputerID,
 		&proof.ComputerAttemptID, &proof.ComputerStorageGeneration, &proof.SubmitIntentRevision,
-		&proof.HostNodeID, &proof.HostStableNodeID, &proof.HostBootSessionID, &proof.SubmitMaxInflight, &submitEnabled, &leaseExpiresNS)
+		&proof.HostNodeID, &proof.HostStableNodeID, &proof.HostBootSessionID, &proof.SubmitMaxInflight, &submitEnabled, &leaseExpiresNS, &leaseBootID, &leaseDeadlineNS)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ComputerTokenScopeProof{}, protocolError(contract.ErrorForbidden, "Computer submission authority is not current")
 	}
 	if err != nil {
 		return ComputerTokenScopeProof{}, internalError(err, "prove Computer token scope")
 	}
-	if !submitEnabled || leaseExpiresNS <= r.now().UnixNano() {
+	leaseExpired, err := attemptLeaseExpired(ctx, r.now(), attemptAuthority{leaseExpires: time.Unix(0, leaseExpiresNS), leaseBootID: leaseBootID, leaseDeadlineNS: leaseDeadlineNS, state: contract.AttemptRunning})
+	if err != nil {
+		return ComputerTokenScopeProof{}, err
+	}
+	if !submitEnabled || leaseExpired {
 		return ComputerTokenScopeProof{}, protocolError(contract.ErrorForbidden, "Computer submission authority is not current")
 	}
 	return proof, nil

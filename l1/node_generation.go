@@ -626,6 +626,9 @@ func (s *Store) HeartbeatRetiringNodeGeneration(ctx context.Context, identity, n
 // nodeGenerationClosureReady is L1's part of the shared #1176 boundary. An
 // unaccepted buffered completion and a custody receipt never satisfy it.
 func nodeGenerationClosureReady(ctx context.Context, q queryer, nodeID, generation string, now time.Time) (bool, error) {
+	if err := attemptClockError(ctx); err != nil {
+		return false, internalError(err, "read generation lease clock")
+	}
 	var pending bool
 	err := q.QueryRowContext(ctx, `SELECT EXISTS(
         SELECT 1 FROM node_generation_residents resident
@@ -634,9 +637,9 @@ func nodeGenerationClosureReady(ctx context.Context, q queryer, nodeID, generati
         WHERE resident.node_id=? AND resident.generation_id=?
         AND (a.attempt_id IS NULL OR j.job_id IS NULL OR (
             (a.completion_key IS NULL OR a.state NOT IN ('succeeded','failed','interrupted'))
-            AND a.state<>'lost' AND a.lease_expires_ns>?
+            AND a.state<>'lost' AND `+attemptLeaseLiveSQL("a", "?", "?", "?")+`
             AND NOT (j.outcome='canceled' AND j.cancel_settle_by_ns<=?)
-        )))`, nodeID, generation, now.UnixNano(), now.UnixNano()).Scan(&pending)
+        )))`, nodeID, generation, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, now.UnixNano(), now.UnixNano()).Scan(&pending)
 	return !pending, err
 }
 
@@ -649,6 +652,7 @@ func (s *Store) CloseNodeGeneration(ctx context.Context, identity, nodeID, gener
 		return NodeGenerationInventory{}, err
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	tx := write.tx
 	if err = requireGenerationIdentity(ctx, tx, nodeID, identity); err != nil {
 		return NodeGenerationInventory{}, err
@@ -835,7 +839,9 @@ func (s *Store) NodeGenerationClosureReady(ctx context.Context, identity, nodeID
 	if role != NodeGenerationRetiring && role != NodeGenerationClosed {
 		return false, protocolError(contract.ErrorConflict, "only retiring sessions can close")
 	}
-	ready, err := nodeGenerationClosureReady(ctx, tx, nodeID, generation, canonicalTime(s.clock.Now()))
+	now := canonicalTime(s.clock.Now())
+	ctx = withAttemptClock(ctx, s.clock, now)
+	ready, err := nodeGenerationClosureReady(ctx, tx, nodeID, generation, now)
 	if err != nil {
 		return false, err
 	}

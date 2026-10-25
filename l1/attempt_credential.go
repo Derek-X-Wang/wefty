@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 )
@@ -110,7 +111,7 @@ func (r *databaseReads) resolveCredential(ctx context.Context, token, identityNo
 		return AttemptCredentialScope{}, protocolError(contract.ErrorUnauthorized, "attempt credential is no longer live")
 	}
 	if err := validateAttemptCredentialAuthority(identityNodeID, scope, authority,
-		r.now().UnixNano()); err != nil {
+		r.now().UnixNano(), ctx); err != nil {
 		return AttemptCredentialScope{}, err
 	}
 	scope.IdentityNodeID = identityNodeID
@@ -127,14 +128,18 @@ func revalidateAttemptCredential(ctx context.Context, q queryer, scope AttemptCr
 	if err != nil {
 		return protocolError(contract.ErrorUnauthorized, "attempt credential is no longer live")
 	}
-	return validateAttemptCredentialAuthority(scope.IdentityNodeID, scope, authority, nowNS)
+	return validateAttemptCredentialAuthority(scope.IdentityNodeID, scope, authority, nowNS, ctx)
 }
 
 // validateAttemptCredentialAuthority is validateAttemptAuthority's predicate
 // set minus the fencing token, which the workload never holds. Keeping the
 // same predicates in the same order is deliberate: the credential must die
 // exactly when the attempt's write authority does, never one condition later.
-func validateAttemptCredentialAuthority(identityNodeID string, scope AttemptCredentialScope, a attemptAuthority, nowNS int64) error {
+func validateAttemptCredentialAuthority(identityNodeID string, scope AttemptCredentialScope, a attemptAuthority, nowNS int64, contexts ...context.Context) error {
+	ctx := context.Background()
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
 	if a.identityNodeID != identityNodeID {
 		return protocolError(contract.ErrorForbidden, "attempt credential was presented from another node")
 	}
@@ -150,7 +155,11 @@ func validateAttemptCredentialAuthority(identityNodeID string, scope AttemptCred
 	if a.state != contract.AttemptClaimed && a.state != contract.AttemptRunning && a.state != contract.AttemptAwaitingInput {
 		return protocolError(contract.ErrorUnauthorized, "attempt credential belongs to a terminal attempt")
 	}
-	if a.leaseExpires.UnixNano() <= nowNS {
+	leaseExpired, err := attemptLeaseExpired(ctx, time.Unix(0, nowNS), a)
+	if err != nil {
+		return err
+	}
+	if leaseExpired {
 		return protocolError(contract.ErrorUnauthorized, "attempt credential lease has expired")
 	}
 	return nil

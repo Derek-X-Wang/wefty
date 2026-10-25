@@ -488,6 +488,7 @@ func TestExpiredAttemptSelectionUsesItsIndexes(t *testing.T) {
 	plan := queryPlan(t, store, expiredAttemptsSQL, expiredAttemptsArguments(clock.Now())...)
 	for _, want := range []string{
 		"SEARCH attempts USING INDEX attempts_lease_expiry (state=? AND lease_expires_ns<?)",
+		"SEARCH attempts USING INDEX attempts_boot_lease_expiry (state=? AND lease_boot_id=? AND lease_deadline_ns>? AND lease_deadline_ns<?)",
 		"SEARCH jobs USING INDEX sqlite_autoindex_jobs_1 (job_id=?)",
 		"SEARCH jobs USING INDEX jobs_cancel_settlement (state=? AND cancel_settle_by_ns<?)",
 		"SEARCH attempts USING INDEX sqlite_autoindex_attempts_1 (attempt_id=?)",
@@ -501,7 +502,7 @@ func TestExpiredAttemptSelectionUsesItsIndexes(t *testing.T) {
 			t.Fatalf("plan = %q scans", plan)
 		}
 	}
-	for _, index := range attemptIndexes948 {
+	for _, index := range append(attemptIndexes948, "attempts_boot_lease_expiry") {
 		retentionSweepExec(t, store, "DROP INDEX "+index)
 	}
 	priorBoot := `SELECT EXISTS (SELECT 1 FROM attempts prior WHERE prior.node_id=? AND prior.boot_session_id<>? AND prior.state IN (?, ?, ?))`

@@ -186,6 +186,7 @@ func (s *Store) BeginComputerStorageReset(ctx context.Context, computerID string
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -535,6 +536,7 @@ func (s *Store) publishVerifiedComputerStorageReset(ctx context.Context, compute
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer Storage reset publication authority")
@@ -655,6 +657,7 @@ func (s *Store) AcknowledgeComputerStorageRetirement(ctx context.Context, identi
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	if err := validateStorageResetNode(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}

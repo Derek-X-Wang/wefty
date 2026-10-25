@@ -16,7 +16,7 @@ import (
 )
 
 func TestServiceBindingProofReadsSnapshotWhileWriterHoldsLock(t *testing.T) {
-	store, err := OpenStore(filepath.Join(t.TempDir(), "binding.sqlite"), StoreOptions{})
+	store, err := OpenStore(filepath.Join(t.TempDir(), "binding.sqlite"), StoreOptions{Clock: &fakeClock{now: time.Date(2026, 10, 24, 0, 0, 0, 0, time.UTC)}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +96,7 @@ func (c bindingSnapshotConn) QueryContext(ctx context.Context, query string, arg
 
 func TestServiceBindingProofKeepsOneSnapshotAcrossConcurrentCommit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "binding.sqlite")
-	store, err := OpenStore(path, StoreOptions{})
+	store, err := OpenStore(path, StoreOptions{Clock: &fakeClock{now: time.Date(2026, 10, 24, 0, 0, 0, 0, time.UTC)}})
 	if err != nil {
 		t.Fatal(err)
 	}

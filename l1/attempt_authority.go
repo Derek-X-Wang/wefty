@@ -87,7 +87,7 @@ func establishHealth(ctx context.Context, tx *sql.Tx, attemptID string, cause he
 				WHERE jobs.job_id=service_jobs.job_id
 					AND jobs.current_attempt_id=?
 					AND attempts.state IN (?, ?, ?)
-					AND attempts.lease_expires_ns>?
+					AND `+attemptLeaseLiveSQL("attempts", "?", "?", "?")+`
 					AND jobs.outcome<>'canceled'
 					AND ((service_jobs.published_port IS NULL AND NOT EXISTS (
 						SELECT 1 FROM computer_job_projections
@@ -98,7 +98,7 @@ func establishHealth(ctx context.Context, tx *sql.Tx, attemptID string, cause he
 					AND attempts.boot_session_id=nodes.boot_session_id
 					AND attempts.authority_generation=nodes.authority_generation
 			)`, now.UnixNano(), jobID, attemptID, contract.AttemptClaimed, contract.AttemptRunning,
-		contract.AttemptAwaitingInput, now.UnixNano(), contract.NodeAlive); err != nil {
+		contract.AttemptAwaitingInput, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, now.UnixNano(), contract.NodeAlive); err != nil {
 		return internalError(err, "record service stability")
 	}
 	return nil
@@ -243,7 +243,7 @@ func readNodeLivenessKeys(ctx context.Context, tx *sql.Tx) (map[string]nodeLiven
 // serviceStabilityResetSQL is the reconcile stability rule. Its first terms
 // match the service_jobs_stability_due index, so it reads only the services
 // due for a reset.
-const serviceStabilityResetSQL = `UPDATE service_jobs SET restart_streak=0
+var serviceStabilityResetSQL = `UPDATE service_jobs SET restart_streak=0
 	WHERE restart_streak>0
 		AND desired_state=?
 		AND healthy_since_ns IS NOT NULL
@@ -255,7 +255,7 @@ const serviceStabilityResetSQL = `UPDATE service_jobs SET restart_streak=0
 			WHERE jobs.job_id=service_jobs.job_id
 				AND jobs.state=?
 				AND attempts.state=?
-				AND attempts.lease_expires_ns>?
+				AND ` + attemptLeaseLiveSQL("attempts", "?", "?", "?") + `
 				AND nodes.state=?
 				AND attempts.boot_session_id=nodes.boot_session_id
 				AND attempts.authority_generation=nodes.authority_generation
@@ -272,7 +272,7 @@ func reconcileServiceStability(ctx context.Context, tx *sql.Tx, now time.Time, w
 	// particular, a node that reaches the equal two-minute dead/stability
 	// boundary is dead and cannot reset a service's failure streak.
 	resets, err := tx.ExecContext(ctx, serviceStabilityResetSQL, contract.ServiceDesiredRunning, now.Add(-window).UnixNano(),
-		contract.JobRunning, contract.AttemptRunning, now.UnixNano(), contract.NodeAlive)
+		contract.JobRunning, contract.AttemptRunning, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, now.UnixNano(), contract.NodeAlive)
 	if err != nil {
 		return 0, internalError(err, "reset stable service restart streaks")
 	}
@@ -337,8 +337,16 @@ func invalidateAttempts(ctx context.Context, tx *sql.Tx, targetID string, cause 
 	query := "UPDATE attempts SET state=?, updated_ns=?"
 	args := []any{contract.AttemptLost, now.UnixNano()}
 	if cause != invalidateLeaseSettlement {
-		query += ", lease_expires_ns=MIN(lease_expires_ns, ?)"
-		args = append(args, now.UnixNano())
+		clock := currentAttemptClock(ctx)
+		if clock.err != nil {
+			// Revocation loses the Attempt even without a usable clock. Clear the
+			// unverifiable boot stamp; the terminal state fences all execution.
+			query += ", lease_expires_ns=MIN(lease_expires_ns, ?), lease_boot_id='', lease_deadline_ns=0"
+			args = append(args, now.UnixNano())
+		} else {
+			query += ", lease_expires_ns=MIN(lease_expires_ns, ?), lease_deadline_ns=CASE WHEN lease_boot_id=? AND lease_deadline_ns>0 THEN MIN(lease_deadline_ns, ?) ELSE ? END, lease_boot_id=?"
+			args = append(args, now.UnixNano(), clock.boot, clock.ns, clock.ns, clock.boot)
+		}
 	}
 	switch cause {
 	case invalidateComputerAbort, invalidateServiceRemoval:

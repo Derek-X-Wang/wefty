@@ -670,6 +670,7 @@ func (s *Store) ReportComputerRoomMemory(ctx context.Context, identity, computer
 		return SeatRoomMemoryReceipt{}, err
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	q := write.tx
 	if err := validateComputerSeatAttempt(ctx, q, write.at, identity, computer, job, attempt, report.ComputerSeatAttemptRequest); err != nil {
 		return SeatRoomMemoryReceipt{}, err
