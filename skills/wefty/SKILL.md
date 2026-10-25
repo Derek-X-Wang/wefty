@@ -212,8 +212,8 @@ keeps its folder. The CLI says which limit it reached and the fix: run it
 again with a longer `--max-runtime`. There is no warning or extension.
 `--detach`, `--keep-running`, streaming JSON and Run commands work as for exec.
 `--detach --json` prints exactly `{"run_id":"..."}` on stdout.
-Seat command replies show unread Seat event hints on stderr, keeping command
-output and JSON intact.
+Seat command replies print unread Seat hints only on stderr, also in JSON
+mode, because stdout belongs to the command.
 
 Never put secrets in command text: wefty stores the command as typed.
 Copy them in as files, for example `wefty cp .env SEAT_ID:.env`.

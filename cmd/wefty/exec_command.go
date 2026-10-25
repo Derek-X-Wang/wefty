@@ -85,7 +85,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	separator := len(args) - flags.NArg() - 1
 	if separator < 0 || flags.NArg() == 0 || args[separator] != "--" {
-		return usageError("usage: wefty exec [--node NODE] [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>")
+		return usageError("usage: wefty exec [--node NODE] [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>; or wefty exec --seat SEAT_ID -- <command...>")
 	}
 	if keepRunning && detach {
 		return usageError("--keep-running and --detach are alternatives")

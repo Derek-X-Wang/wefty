@@ -26,7 +26,9 @@ func executeSeatExec(ctx context.Context, clients *apiClients, id string, argv [
 		return err
 	}
 	if secret == "" {
-		return fmt.Errorf("Seat credential is unavailable; wait again with wefty seat wait %s", id)
+		return &apiResponseError{StatusCode: http.StatusForbidden, APIError: contract.APIError{
+			Code: contract.ErrorForbidden, Message: fmt.Sprintf("Seat credential is unavailable; wait again with wefty seat wait %s", id), Details: map[string]any{"seat_id": id},
+		}}
 	}
 	ctx, stopSignalContext := execSignalContext(ctx)
 	defer stopSignalContext()
@@ -35,8 +37,20 @@ func executeSeatExec(ctx context.Context, clients *apiClients, id string, argv [
 		return err
 	}
 	submitCtx, stop := context.WithTimeout(ctx, 30*time.Second)
-	accepted, uncertain, err := submitExecRun(submitCtx, clients, l3.CreateRunRequest{SeatRun: &source}, key, stderr, secret)
+	request := l3.CreateRunRequest{SeatRun: &source}
+	accepted, uncertain, err := submitExecRun(submitCtx, clients, request, key, stderr, secret)
 	stop()
+	if err != nil && uncertain && ctx.Err() != nil {
+		// A signal can hide a committed submission. Replay exactly once with
+		// the same key: L3 returns its receipt without another Seat call.
+		// Then the shared observer applies the ordinary cancellation policy.
+		recoveryCtx, stopRecovery := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		recovered, recoveryErr := clients.submitRun(recoveryCtx, request, key, secret)
+		stopRecovery()
+		if recoveryErr == nil && recovered.RunID != "" {
+			accepted, err = recovered, nil
+		}
+	}
 	if err != nil {
 		if uncertain {
 			return &unavailableError{cause: fmt.Errorf("Seat command submission could not be confirmed (key %s); inspect `wefty runs list` before starting another command: %w", key, err)}

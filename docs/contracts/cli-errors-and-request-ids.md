@@ -534,3 +534,8 @@ commands keep running. A caller may retry after the person releases control.
 Seat command always has a limit and to use a positive `--max-runtime` for a
 longer limit. Placement refusals explain that the Seat decides the node and
 placement; restartability is refused because Seat state cannot be replayed.
+
+A missing local credential for `wefty exec --seat` returns the existing
+`forbidden` code (non-retryable, CLI exit 3), as for an unknown Seat
+credential. It includes `seat_id` in details and directs the caller to
+`wefty seat wait SEAT_ID`, before making any network call.

@@ -191,6 +191,9 @@ func TestExecSeatAttachedOutcomesAndDeadlineFix(t *testing.T) {
 				if !strings.Contains(stderr.String(), "2 new Seat events: wefty logs "+execSeatTestID) {
 					t.Errorf("missing shared Seat reply hint: %q", &stderr)
 				}
+				if outcome == "fail" && strings.Contains(stderr.String(), "stopped:") {
+					t.Errorf("ordinary command failure got a Seat limit line: %q", &stderr)
+				}
 				if outcome == "limit" && !jsonOutput && !strings.Contains(stderr.String(), "stopped: reached its 2h limit. Run it again with a longer --max-runtime.") {
 					t.Errorf("missing actual deadline and fix: %q", &stderr)
 				}
@@ -391,5 +394,142 @@ func TestExecSeatCommandNotFoundUsesSeatEnvironment(t *testing.T) {
 	err := reportExecFinished(t.Context(), clients, record, execCapture{}, false, &out, &stderr)
 	if execModeCode(err) != 10 || !strings.Contains(stderr.String(), "Seat's environment") || strings.Contains(stderr.String(), "node's login-shell PATH") {
 		t.Fatalf("err=%v stderr=%q", err, &stderr)
+	}
+}
+
+func TestExecSeatInterruptedSubmissionRecoversOnce(t *testing.T) {
+	for _, mode := range []string{"cancel", "keep-running", "detach", "recovery-fails"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
+			if _, err := storeSeatCredential(execSeatTestID, "secret"); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			posts, cancels := 0, 0
+			var key string
+			var body []byte
+			record := contract.RunRecord{RunID: "run-seat", SeatID: execSeatTestID, Status: contract.RunQueued}
+			clients := execSeatLedger(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/runs":
+					posts++
+					raw, _ := io.ReadAll(r.Body)
+					if posts == 1 {
+						key = r.Header.Get("Idempotency-Key")
+						body = raw
+					} else if key == "" || key != r.Header.Get("Idempotency-Key") || !bytes.Equal(body, raw) || r.Header.Get(contract.SeatCredentialHeader) != "secret" {
+						t.Error("recovery changed submission or lost credential")
+					}
+					if posts > 2 {
+						t.Error("recovery submitted more than once")
+					}
+					if posts == 2 && mode == "recovery-fails" {
+						w.WriteHeader(503)
+						io.WriteString(w, `{"error":{"code":"unavailable","retryable":true}}`)
+						return
+					}
+					w.WriteHeader(201)
+					io.WriteString(w, `{"run_id":"run-seat"}`)
+				case "/v1/runs/run-seat":
+					json.NewEncoder(w).Encode(record)
+				case "/v1/runs/run-seat/cancel":
+					cancels++
+					record.Status = contract.RunFailed
+					record.CancelStatus = "settled"
+					json.NewEncoder(w).Encode(record)
+				case "/v1/seat-requests/" + execSeatTestID:
+					json.NewEncoder(w).Encode(l1.SeatCallResult{SeatRequest: l1.SeatRequest{SeatID: execSeatTestID, State: l1.SeatLive}})
+				default:
+					t.Errorf("unexpected request %s", r.URL.Path)
+					w.WriteHeader(500)
+				}
+			})
+			base := clients.l3.client.Transport
+			clients.l3.client.Transport = storageRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/v1/runs" && posts == 1 {
+					if r.Context().Err() != nil {
+						t.Error("recovery inherited caller cancellation")
+					}
+					deadline, ok := r.Context().Deadline()
+					if !ok || time.Until(deadline) > 5*time.Second {
+						t.Error("recovery needs a short deadline")
+					}
+				}
+				response, err := base.RoundTrip(r)
+				if err == nil && r.URL.Path == "/v1/runs" && posts == 1 {
+					io.Copy(io.Discard, response.Body)
+					response.Body.Close()
+					cancel()
+					return nil, context.Canceled // L3 committed, but the reply was lost on Ctrl-C.
+				}
+				return response, err
+			})
+			args := []string{"exec", "--seat", execSeatTestID, "--json"}
+			if mode == "keep-running" || mode == "detach" {
+				args = append(args, "--"+mode)
+			}
+			args = append(args, "--", "true")
+			var out, stderr bytes.Buffer
+			err := execute(ctx, clients, false, args, &out, &stderr)
+			if posts != 2 {
+				t.Fatalf("submission POSTs=%d want original plus one recovery; err=%v", posts, err)
+			}
+			if mode == "recovery-fails" {
+				if execModeCode(err) != 13 || cancels != 0 || out.Len() != 0 {
+					t.Fatalf("failed recovery err=%v cancels=%d stdout=%q", err, cancels, &out)
+				}
+				return
+			}
+			if mode == "detach" {
+				if err != nil || cancels != 0 || out.String() != "{\"run_id\":\"run-seat\"}\n" {
+					t.Fatalf("detach err=%v cancels=%d stdout=%q", err, cancels, &out)
+				}
+				return
+			}
+			wantCancels, wantOutcome := 1, "cancelled"
+			if mode == "keep-running" {
+				wantCancels, wantOutcome = 0, "queued"
+				if execModeCode(err) != 13 {
+					t.Errorf("keep-running exit=%d", execModeCode(err))
+				}
+			}
+			events := execModeEvents(t, out.String())
+			if err == nil || cancels != wantCancels || len(events) == 0 || events[len(events)-1]["outcome"] != wantOutcome {
+				t.Fatalf("recovery err=%v cancels=%d stdout=%q stderr=%q", err, cancels, &out, &stderr)
+			}
+		})
+	}
+}
+
+func TestExecSeatMissingCredentialTypedFromRealBinary(t *testing.T) {
+	t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
+	calls := 0
+	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(500) })
+	code, out, stderr := runPolishBinary(t, buildWefty(t), "--l1", address, "--l3", address, "exec", "--seat", execSeatTestID, "--json", "--", "true")
+	var envelope contract.ErrorResponse
+	if code != 3 || len(out) != 0 || calls != 0 || json.Unmarshal(stderr, &envelope) != nil || envelope.Error.Code != contract.ErrorForbidden || envelope.Error.Retryable || !strings.Contains(envelope.Error.Message, "wefty seat wait "+execSeatTestID) {
+		t.Fatalf("exit=%d calls=%d stdout=%s stderr=%s", code, calls, out, stderr)
+	}
+}
+
+func TestExecSeatUsageFormsFromRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	code, out, stderr := runPolishBinary(t, binary, "--help")
+	if code != 0 || len(stderr) != 0 || !strings.Contains(string(out), "exec --seat SEAT_ID") {
+		t.Errorf("root help exit=%d stdout=%s stderr=%s", code, out, stderr)
+	}
+	code, out, stderr = runPolishBinary(t, binary, "exec", "--seat", execSeatTestID, "true")
+	if code != 2 || len(out) != 0 || !strings.Contains(string(stderr), "wefty exec --seat SEAT_ID -- <command") {
+		t.Errorf("missing separator exit=%d stdout=%s stderr=%s", code, out, stderr)
+	}
+}
+
+func TestExecSeatLimitMessageDoesNotDescribePlainExec(t *testing.T) {
+	record := contract.RunRecord{RunID: "run-plain", Status: contract.RunFailed, FailureReason: "maximum runtime reached", Limits: &contract.RunLimits{MaxRuntimeSeconds: 3600}}
+	var out, stderr bytes.Buffer
+	err := reportExecFinished(t.Context(), ledgerStub(t, nil), record, execCapture{}, false, &out, &stderr)
+	if execModeCode(err) != 10 || strings.Contains(stderr.String(), "stopped:") {
+		t.Fatalf("plain exec err=%v stderr=%q", err, &stderr)
 	}
 }

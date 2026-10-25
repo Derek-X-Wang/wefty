@@ -522,6 +522,8 @@ Commands:
     --origin computer:ID     List Runs by immutable Computer origin instead
   exec [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>
                              Run this checkout on this machine's node; exit 0 or 10
+  exec --seat SEAT_ID [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>
+                             Run in the Seat's folder without capturing or copying a checkout
   submit [--again] [--idempotency-key KEY]
                              Submit a saved Workflow or an inline-script/image run
   rerun RUN_ID [--again] [--idempotency-key KEY]

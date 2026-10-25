@@ -626,6 +626,14 @@ prints `stopped: reached its 1h limit. Run it again with a longer --max-runtime.
 on stderr, using the Run's actual admitted deadline. The Run failure remains
 exit 10 with no command exit code. JSON keeps the `finished` event and adds
 the Run's `seat_id` and admitted `max_runtime_seconds`.
+In a Seat Run's JSON `finished` event, `base_commit` is empty and `dirty` is
+false because nothing was captured; they are not facts about the checkout.
+
+If a signal hides a submission reply, the CLI replays the identical request
+once with the same idempotency key on a cancellation-independent context
+bounded to five seconds. A recovered Run follows ordinary exec policy:
+cancel by default, stop only watching with `--keep-running`, or print its ID
+with `--detach`. Failed recovery remains unavailable (exit 13).
 
 After an accepted command, the CLI reads the original caller's Seat outcome
 once to obtain its unread count and uses the shared Seat reply path. The hint
