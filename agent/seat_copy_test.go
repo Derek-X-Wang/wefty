@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/seatcopy"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -117,7 +118,7 @@ func TestSeatCopyRouteCarriesCredentialAndRecordsOneEvent(t *testing.T) {
 			t.Fatal("copy completion missing")
 		}
 	}
-	if len(control.receipts) != 2 || control.receipts[0].Direction != "in" || control.receipts[1].Direction != "out" || control.receipts[1].Path != ".env" || control.receipts[1].SizeBytes != 7 {
+	if len(control.receipts) != 4 || control.receipts[0].Outcome != "sending" || control.receipts[1].Direction != "in" || control.receipts[2].Outcome != "sending" || control.receipts[3].Direction != "out" || control.receipts[3].Path != ".env" || control.receipts[3].SizeBytes != 7 {
 		t.Fatalf("receipts: %+v", control.receipts)
 	}
 }
@@ -169,10 +170,9 @@ func TestSeatCopyReceiptRetriesAfterCancellationAndLogsFailures(t *testing.T) {
 			handler := newSeatCopyHandler(runtime, control, workloadrunner.AttemptAuthority{}, "computer")
 			request := httptest.NewRequest(http.MethodPost, "/v1/seats/seat_00000000000000000000000000000001/copy?direction=in&path=file", nil).WithContext(ctx)
 			request.Header.Set(l1.SeatCredentialHeader, "secret")
-			request.Header.Set("X-Wefty-Copy-Id", "retry-copy")
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
-			if len(control.calls) != 2 || len(control.receipts) != 1 {
+			if len(control.calls) != 3 || len(control.receipts) != 2 {
 				t.Fatalf("calls=%+v receipts=%+v response=%s", control.calls, control.receipts, response.Body.String())
 			}
 			if !failed {
@@ -180,8 +180,8 @@ func TestSeatCopyReceiptRetriesAfterCancellationAndLogsFailures(t *testing.T) {
 					t.Fatalf("landed copy lost: %q %v", data, err)
 				}
 			}
-			first, last := control.calls[0], control.calls[1]
-			if first.CopyID == "" || first.CopyID == "retry-copy" || last.CopyID != first.CopyID {
+			first, last := control.calls[0], control.calls[2]
+			if first.CopyID == "" || last.CopyID != first.CopyID {
 				t.Fatalf("retry changed CopyID: %+v", control.calls)
 			}
 			expected := "completed"
@@ -203,7 +203,6 @@ func TestSeatCopyNodeOwnsID(t *testing.T) {
 	for range 2 {
 		req := httptest.NewRequest(http.MethodPost, "/v1/seats/seat_00000000000000000000000000000001/copy?direction=out&path=secrets.tar", nil)
 		req.Header.Set(l1.SeatCredentialHeader, "secret")
-		req.Header.Set("X-Wefty-Copy-Id", "preclaimed")
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, req)
 		var event l1.SeatCopyStreamEvent
@@ -215,7 +214,7 @@ func TestSeatCopyNodeOwnsID(t *testing.T) {
 			t.Fatalf("node accepted caller ID or lost its ID: event=%+v receipt=%+v", event, receipt)
 		}
 	}
-	if control.receipts[0].CopyID == control.receipts[1].CopyID {
+	if control.receipts[0].CopyID == control.receipts[2].CopyID {
 		t.Fatal("two transfers reused one ID")
 	}
 }
@@ -230,5 +229,45 @@ func TestSeatCopyReceiptRetryBackoff(t *testing.T) {
 	}
 	if delays := clock.recorded(); len(delays) != 1 || delays[0] != 100*time.Millisecond {
 		t.Fatalf("retry backoff=%v", delays)
+	}
+}
+
+func TestSeatCopySendingExistsBeforePayload(t *testing.T) {
+	control := &copyControlFixture{}
+	runtime := copyRuntimeFunc(func(_ context.Context, _ ocihelper.CopyComputerSeatRequest, _ io.Reader, emit func([]byte) error) (int64, error) {
+		if len(control.receipts) != 1 || control.receipts[0].Outcome != "sending" || control.receipts[0].SizeBytes != 0 {
+			t.Errorf("bytes flowed before sending receipt: %+v", control.receipts)
+		}
+		return 1, emit([]byte("x"))
+	})
+	handler := newSeatCopyHandler(runtime, control, workloadrunner.AttemptAuthority{}, "computer")
+	r := httptest.NewRequest(http.MethodPost, "/v1/seats/seat_00000000000000000000000000000001/copy?direction=out&path=file", nil)
+	r.Header.Set(l1.SeatCredentialHeader, "secret")
+	handler.ServeHTTP(httptest.NewRecorder(), r)
+}
+
+type refusedCopyStart struct{ copyControlFixture }
+
+func (f *refusedCopyStart) RecordSeatCopy(_ context.Context, _ string, r l1.SeatCopyReceipt) error {
+	f.receipts = append(f.receipts, r)
+	if r.Outcome == "sending" {
+		return &ProtocolError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: "seat_ended", Message: "Seat ended: released"}}
+	}
+	return nil
+}
+
+func TestSeatCopyRefusedStartRecordsFailureWithoutPayload(t *testing.T) {
+	control := &refusedCopyStart{}
+	runtime := copyRuntimeFunc(func(context.Context, ocihelper.CopyComputerSeatRequest, io.Reader, func([]byte) error) (int64, error) {
+		t.Error("refused copy moved bytes")
+		return 0, nil
+	})
+	handler := newSeatCopyHandler(runtime, control, workloadrunner.AttemptAuthority{}, "computer")
+	r := httptest.NewRequest("POST", "/v1/seats/seat_00000000000000000000000000000001/copy?direction=in&path=file", nil)
+	r.Header.Set(l1.SeatCredentialHeader, "secret")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+	if len(control.receipts) != 2 || control.receipts[1].Outcome != "failed" || control.receipts[1].SizeBytes != 0 || control.receipts[1].CopyID != control.receipts[0].CopyID {
+		t.Fatalf("refused copy left a pending start: %+v", control.receipts)
 	}
 }

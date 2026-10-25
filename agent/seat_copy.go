@@ -63,6 +63,15 @@ func newSeatCopyHandler(runtime seatCopyRuntime, control seatCopyControl, author
 			sendError(err)
 			return
 		}
+		start := l1.SeatCopyReceipt{SeatCopyAuthorityInput: input, CopyID: copyID, Direction: direction, Path: path, Outcome: "sending"}
+		if err := recordSeatCopyReceipt(r.Context(), control, match[1], start); err != nil {
+			// The start may have committed before its acknowledgement failed.
+			// Close that operation and release any hold without moving payload.
+			start.Outcome, start.Reason = "failed", "start_failed"
+			finishErr := recordSeatCopyReceipt(r.Context(), control, match[1], start)
+			sendError(fmt.Errorf("copy start unconfirmed: %w", errors.Join(err, finishErr)))
+			return
+		}
 		// HTTP/1 must permit response chunks while upload still streams. HTTP/2
 		// already has this behavior. There is no application-wide body limit.
 		_ = http.NewResponseController(w).EnableFullDuplex()

@@ -147,6 +147,7 @@ type Config struct {
 
 // Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
+	seatDoor      *seatFrontDoor
 	seatApprovals *SeatApprovalController
 	seatRoom      *l1.ComputerRoomConfig
 	fabric        fabric.Fabric
@@ -666,6 +667,21 @@ func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
+	ctx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	door, closeDoor, err := startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID)
+	if err != nil {
+		return err
+	}
+	a.seatDoor = door
+	defer closeDoor()
+	go func() {
+		select {
+		case <-door.done:
+			cancelRun()
+		case <-ctx.Done():
+		}
+	}()
 	seatCtx, seatCancel := context.WithCancel(ctx)
 	seatDone := make(chan struct{})
 	go func() { defer close(seatDone); a.runSeatRequests(seatCtx) }()
@@ -728,9 +744,15 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.log("recover durable evidence: %v", err)
 		})
 	}
-	return a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
+	runErr := a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 		return a.executeClaim(attemptContext, claim, claimStarted)
 	})
+	select {
+	case <-door.done:
+		return errors.Join(runErr, door.serveErr)
+	default:
+		return runErr
+	}
 }
 
 func (a *Agent) startHostTokenRevocation(parent context.Context) {
@@ -807,7 +829,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		nodeID:           a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
 		workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
-		fabric: a.fabric, computerPolicy: computerPolicy,
+		fabric: a.fabric, computerPolicy: computerPolicy, seatDoor: a.seatDoor,
 		prepareServiceEndpoint:  prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:    a.prepareAuthorityLoss,
 		allowsStart:             allowsStart,

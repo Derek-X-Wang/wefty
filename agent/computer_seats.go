@@ -72,6 +72,7 @@ type computerSeatController struct {
 	generation               uint64
 	revision                 int64
 	sequence                 int64
+	onWanted                 func(l1.ComputerSeatList) error
 	afterStep                func()
 }
 
@@ -155,6 +156,11 @@ func (c *computerSeatController) step(ctx context.Context) error {
 	helperCtx, helperCancel := context.WithTimeout(ctx, computerSeatHelperBudget)
 	defer helperCancel()
 	if fresh {
+		if c.onWanted != nil {
+			if err := c.onWanted(list); err != nil {
+				return err
+			}
+		}
 		c.restoreBindings(list)
 		refreshed, err := c.reconcileRetired(helperCtx, list)
 		if err != nil {

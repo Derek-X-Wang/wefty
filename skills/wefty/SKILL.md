@@ -714,6 +714,8 @@ resolves parent symlinks once and refuses a symlink at DEST's final name.
 Copied folders have mode 0700. A failed copy leaves no partial destination.
 Every authorized copy that reaches the node records path, byte count and
 node outcome in `wefty logs SEAT_ID`; earlier failures create no event.
+A copy starts as `sending`; a node crash can leave that pending result.
+Copies reset Seat activity and hold the Seat against idle expiry while running.
 Copy-out is `sent` until the CLI reports local `completed` or `failed` while
 the Seat is live. Logs preserve the node result alongside the local result.
 An outcome-unconfirmed error means receipt delivery failed; inspect the log

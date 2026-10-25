@@ -181,7 +181,8 @@
               "enum": [
                 "completed",
                 "failed",
-                "sent"
+                "sent",
+                "sending"
               ],
               "description": "Older node receipts omit this: completed for in, sent for out."
             },
@@ -346,7 +347,8 @@
             "enum": [
               "sent",
               "completed",
-              "failed"
+              "failed",
+              "sending"
             ]
           },
           "node_outcome": {
@@ -354,7 +356,8 @@
             "enum": [
               "sent",
               "completed",
-              "failed"
+              "failed",
+              "sending"
             ]
           }
         }

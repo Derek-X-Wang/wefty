@@ -180,19 +180,22 @@ successful outcome; this grants no new authority and appends no duplicate end.
 
 ## Copy outcomes
 
-Every copy that reaches the node and passes Seat authorization is logged.
-Only the node creates an event, through `AppendSeatEvent`, with an unguessable
+Every copy that reaches the node and passes Seat authorization is logged. Only
+the node creates an event, through `AppendSeatEvent`, with an unguessable
 random CopyID and event ID `copy:COPY_ID`. Caller-supplied transfer IDs are
-ignored. The node returns its ID after recording its evidence. A failure
-before reaching the node creates no event, because no file entered or left
-the Seat. Runtime failures are logged, including zero-byte failures.
+ignored. The node records `sending` before any payload bytes, then updates
+that same event with its terminal evidence. A crash mid-copy leaves `sending`
+visible. The node returns its ID after recording its terminal evidence. A
+failure before reaching the node creates no event, because no file entered or
+left the Seat. Runtime failures are logged, including zero-byte failures.
 
 A copy event has kind `copy_in` or `copy_out`, `copy_id`, Seat path,
 file-content byte count, `outcome` and a short `reason` token for failure.
-`node_outcome` is immutable: copy-in `completed`/`failed`, copy-out
-`sent`/`failed`. Direction, path, size and node result cannot be changed by
-the caller. Node retries deduplicate by the node's own ID and immutable
-evidence, even after a local outcome arrives.
+`node_outcome` starts as `sending` with zero bytes. Its terminal value is
+immutable: copy-in `completed`/`failed`, copy-out `sent`/`failed`. Direction,
+path, size and node result cannot be changed by the caller. Node retries
+deduplicate by the node's own ID and immutable evidence, even after a local
+outcome arrives.
 
 Copy-out `sent` means the node finished; local publication is still pending.
 The CLI uses its Seat credential to POST `/v1/seats/{seat_id}/copy-outcome`
@@ -200,27 +203,34 @@ with the node's CopyID, exact direction/path/size, final outcome and failure
 reason. Only an existing node-created copy-out event with `node_outcome=sent`
 accepts `completed` or `failed`. An unknown ID returns typed 404 `not_found`
 and writes nothing. There are no caller-only events. Copy-in events and failed
-node results cannot be updated by the caller. A local result cannot replace
-an earlier, different local result.
+node results cannot be updated by the caller. A local result cannot replace an
+earlier, different local result.
 
 Local outcome updates require a live Seat, verified inside the update
 transaction. Ending or ended Seats refuse them with `seat_ended`; retained
-credentials still read their logs. A copy that finishes beside the Seat's
-end can therefore retain `sent` with local outcome unconfirmed. The node's
-own receipt can still record its already admitted transfer at the end.
+credentials still read their logs. A copy that finishes beside the Seat's end
+can therefore retain `sent` with local outcome unconfirmed. The node's own
+receipt can still record its already admitted transfer at the end.
 
-Adding a local result is the copy-specific exception to immutable generic
-event payloads. L1 updates `outcome` and `reason` in that same row and moves
-its ordinal to a fresh cursor position, with an updated occurrence time.
-A follow that printed `sent` receives the local result with the same CopyID;
-a full log still has one row per copy. Identical retries do not move the
-cursor. Each node event accepts at most one local result, so caller receipts
-cannot grow or repeatedly reorder the log. Copy updates change no Seat
-lifecycle or Custody facts.
+Recording the node terminal result and adding a local result are the
+copy-specific exceptions to immutable generic event payloads. L1 updates
+`outcome` and `reason` in that same row and moves its ordinal to a fresh
+cursor position, with an updated occurrence time. A follow that printed `sent`
+receives the local result with the same CopyID; a full log still has one row
+per copy. Identical retries do not move the cursor. Each node event accepts at
+most one local result, so caller receipts cannot grow or repeatedly reorder
+the log. Copy updates change no Seat lifecycle or Custody facts.
 
-Human logs preserve both facts, for example `sent 999 B; local publish failed`.
-JSON exposes immutable `node_outcome` alongside `outcome` and `reason` for
-the local result. Node and CLI receipts use three cancellation-independent
-attempts within five seconds, with 100 ms then 200 ms backoff and the same
-node-owned CopyID. Exhausted receipt retries fail loudly; `sent` remains
-pending instead of becoming a false local completion.
+Human logs preserve both facts, for example `sent 999 B; local publish
+failed`. JSON exposes immutable `node_outcome` alongside `outcome` and
+`reason` for the local result. Node and CLI receipts use three
+cancellation-independent attempts within five seconds, with 100 ms then 200 ms
+backoff and the same node-owned CopyID. Exhausted receipt retries fail loudly;
+`sent` remains pending instead of becoming a false local completion.
+
+The pre-stream sending receipt counts as a Seat call through
+`SeatCallHappened` and acquires the trusted running-command hold with ID
+`copy:COPY_ID`. The terminal receipt releases it through `SeatCommandRunning`,
+so the idle wait starts again after the transfer ends. Holds survive L1
+restart like command holds; Seat/Attempt termination still ends authority. A
+delayed sending retry cannot resurrect a terminal operation's hold.

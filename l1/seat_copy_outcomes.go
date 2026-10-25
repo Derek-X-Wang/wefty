@@ -36,6 +36,9 @@ func validCopyReceipt(r SeatCopyOutcomeReceipt, node bool) bool {
 		return false
 	}
 	if node {
+		if r.Outcome == "sending" {
+			return r.SizeBytes == 0
+		}
 		return r.Direction == "in" && r.Outcome == "completed" || r.Direction == "out" && r.Outcome == "sent"
 	}
 	return r.Direction == "out" && r.Outcome == "completed"
@@ -101,7 +104,7 @@ func (s *Store) ReportSeatCopyOutcome(ctx context.Context, id, credential string
 
 // Only the node creates copy events. Local publication receipts never append
 // and never change the immutable node direction, path, size or result.
-func (s *Store) appendSeatCopyOutcome(ctx context.Context, id string, r SeatCopyOutcomeReceipt) error {
+func (s *Store) appendSeatCopyOutcome(ctx context.Context, id string, r SeatCopyOutcomeReceipt) (bool, error) {
 	kind := SeatEventCopyIn
 	if r.Direction == "out" {
 		kind = SeatEventCopyOut
@@ -109,22 +112,42 @@ func (s *Store) appendSeatCopyOutcome(ctx context.Context, id string, r SeatCopy
 	incoming := SeatLogEvent{SeatID: id, EventID: "copy:" + r.CopyID, Kind: kind, CopyID: r.CopyID, Path: r.Path, SizeBytes: &r.SizeBytes, Outcome: r.Outcome, NodeOutcome: r.Outcome, Reason: r.Reason}
 	err := s.AppendSeatEvent(ctx, incoming)
 	if errorCodeForSeatLifecycle(err) != contract.ErrorIdempotencyConflict {
-		return err
+		return r.Outcome == "sending", err
 	}
-	// A local result may have arrived since the first node receipt. Deduplicate
-	// using only immutable node evidence, not the caller's publication outcome.
-	return s.withReadSnapshot(ctx, nil, func(ctx context.Context, reads readModel) error {
-		var raw []byte
-		if err := reads.(*databaseReads).q.QueryRowContext(ctx, `SELECT event_json FROM seat_log_events WHERE seat_id=? AND event_id=?`, id, incoming.EventID).Scan(&raw); err != nil {
-			return err
+	w, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer w.rollback()
+	var raw []byte
+	if err := w.tx.QueryRowContext(ctx, `SELECT event_json FROM seat_log_events WHERE seat_id=? AND event_id=?`, id, incoming.EventID).Scan(&raw); err != nil {
+		return false, err
+	}
+	var old SeatLogEvent
+	if err := json.Unmarshal(raw, &old); err != nil {
+		return false, err
+	}
+	if old.Kind != incoming.Kind || old.CopyID != r.CopyID || old.Path != r.Path || old.SizeBytes == nil || old.NodeOutcome == "" {
+		return false, protocolError(contract.ErrorIdempotencyConflict, "copy ID has different node evidence")
+	}
+	if r.Outcome == "sending" {
+		// A delayed start retry never resurrects a finished operation's hold.
+		return old.NodeOutcome == "sending", nil
+	}
+	if old.NodeOutcome != "sending" {
+		if *old.SizeBytes != r.SizeBytes || old.NodeOutcome != r.Outcome || (r.Outcome == "failed" && old.Reason != r.Reason) {
+			return false, protocolError(contract.ErrorIdempotencyConflict, "copy ID has different node evidence")
 		}
-		var old SeatLogEvent
-		if err := json.Unmarshal(raw, &old); err != nil {
-			return err
-		}
-		if old.Kind != incoming.Kind || old.CopyID != r.CopyID || old.Path != r.Path || old.SizeBytes == nil || *old.SizeBytes != r.SizeBytes || old.NodeOutcome != r.Outcome || (r.Outcome == "failed" && old.Reason != r.Reason) {
-			return protocolError(contract.ErrorIdempotencyConflict, "copy ID has different node evidence")
-		}
-		return nil
-	})
+		return false, nil
+	}
+	old.NodeOutcome, old.Outcome, old.Reason = r.Outcome, r.Outcome, r.Reason
+	old.SizeBytes, old.OccurredAt = &r.SizeBytes, w.at
+	payload, err := json.Marshal(old)
+	if err != nil {
+		return false, err
+	}
+	if _, err = w.tx.ExecContext(ctx, `UPDATE seat_log_events SET ordinal=(SELECT COALESCE(MAX(ordinal),0)+1 FROM seat_log_events),event_json=? WHERE seat_id=? AND event_id=?`, payload, id, old.EventID); err != nil {
+		return false, err
+	}
+	return false, w.commit()
 }

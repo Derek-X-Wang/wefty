@@ -106,6 +106,7 @@ type attemptLifecycleDependencies struct {
 	workflowBridge         func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error)
 	logf                   func(string, ...any)
 	observer               *lifecycleObserver
+	seatDoor               *seatFrontDoor
 	fabric                 fabric.Fabric
 	computerPolicy         *ComputerPolicyCache
 	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
@@ -2006,7 +2007,25 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			JobID: authority.JobID, AttemptID: authority.AttemptID, FencingToken: authority.FencingToken,
 			Class: authority.WorkloadClass, RemovalGeneration: authority.RemovalGeneration,
 		}, claim.ComputerStorage.ComputerID, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
-		result, runErr = runComputerSeats(ctx, runtimeAdapter, request, sink, controller)
+		copyRuntime, ok := runtimeAdapter.(seatCopyRuntime)
+		if !ok {
+			err := errors.New("Computer runtime does not support Seat copies")
+			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
+		}
+		result, runErr = runComputerSeats(ctx, runtimeAdapter, request, sink, controller, seatComputerServiceConfig{
+			router: lifecycle.dependencies.seatDoor, copyRuntime: copyRuntime, copyControl: lifecycle.dependencies.client,
+			publish: func(publishContext context.Context, ready bool, endpoint string) error {
+				if ready && ctx.Err() != nil {
+					return ctx.Err()
+				}
+				publication := l1.PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready}
+				if ready {
+					publication.DisplayEndpoint = &endpoint
+				}
+				_, err := lifecycle.dependencies.client.SetAttemptPublication(publishContext, claim.Job.JobID, claim.Lease.AttemptID, publication)
+				return err
+			},
+		})
 	} else if computerService {
 		if ociEndpointLatch == nil || claim.ComputerStorage == nil {
 			err := errors.New("Computer attempt is missing runtime endpoints or Computer authority")
