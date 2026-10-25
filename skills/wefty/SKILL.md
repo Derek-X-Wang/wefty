@@ -145,6 +145,9 @@ An AI agent must not open the viewer itself: the viewer counts as a person.
 While a person drives, use screenshots to watch; leave screen input to the
 person, including input made by commands such as Playwright or `xdotool`.
 
+When the Seat is ready, use [Drive a Seat's screen](#drive-a-seats-screen)
+for screenshots and input.
+
 Release when done: `wefty seat release SEAT_ID`. Copy results out first.
 Release stops commands and programs, then deletes the Seat folder after cleanup.
 An idle Seat expires after 30 minutes; log following counts only at start.
@@ -739,6 +742,52 @@ the document the run itself concluded with. The reference workflow is
 `workflows/branch-gates/` is the smaller one to copy: it gates a branch and
 hands back a pass/fail verdict. `workflows/issue-to-pr/` is the one that writes
 code — see the recipe above.
+
+## Drive a Seat's screen
+
+Use only your own Seat ID and its saved credential. Each call opens and closes
+its own connection; there is no screen daemon.
+
+```sh
+wefty seat screenshot SEAT_ID                  # prints a new PNG path
+wefty seat screenshot SEAT_ID -o /tmp/seat.png
+wefty seat click SEAT_ID 640 400 --button left --screenshot
+wefty seat move SEAT_ID 100 200
+wefty seat drag SEAT_ID 100 200 500 200 --screenshot /tmp/drag.png
+wefty seat scroll SEAT_ID 640 400 --dy 3 --dx 0
+wefty seat type SEAT_ID 'Hello, world'
+wefty seat key SEAT_ID ctrl+l --screenshot
+wefty seat key SEAT_ID Return
+```
+
+Coordinates use pixels, with `(0,0)` at the top left of the 1280×800 screen.
+Click buttons are `left` (default), `right`, and `double`. Positive `dy` scrolls
+down; positive `dx` scrolls right, in wheel ticks. Every input command accepts
+`--screenshot [FILE]`; omit FILE for a fresh PNG in the system temp folder.
+Use `--screenshot=FILE` if the filename starts with `-`. Explicit destinations
+must be new files. Wefty never puts a default screenshot in the Git checkout.
+
+Read the PNG with your harness's own image tool: **Read** in Claude Code or
+**view_image** in Codex. Wefty does not interpret the image for you.
+
+Key names: `Return` (`Enter`), `Tab`, `Escape` (`Esc`), `BackSpace`, `Delete`,
+`Insert`, `Home`, `End`, `PageUp`, `PageDown`, `Left`, `Right`, `Up`, `Down`,
+`space`, `plus`, `F1`–`F12`, or one Unicode character. Names ignore case.
+Combine one key with `ctrl` (`control`), `shift`, `alt`, `super`, or `meta`,
+joined by `+`, such as `ctrl+l` or `shift+Tab`. `type` accepts UTF-8 text and
+sends key events, including Return for newlines and Tab for tabs.
+
+On `person_driving` (exit 5, “a person is driving”), stop screen input until
+the person releases control. Screenshots still work. While a person drives,
+**do not drive the screen through commands such as `xdotool` or Playwright
+either**. Read any release note printed on stderr before continuing. Every
+reply carries the shared unread Seat-event hint; read it with `wefty logs`.
+
+Use `--json` for `elapsed_ms`, `path`, `unread_events`, and, when nonzero,
+`unread_events_line`. Refusals carry `details.elapsed_ms`. Input calls are
+never retried automatically: an interrupted call may already have acted.
+Wefty records no clicks, keys, or screen contents. PNG files are your local
+artifacts; keep or remove them as needed.
 
 ## Copy files to or from a Seat
 

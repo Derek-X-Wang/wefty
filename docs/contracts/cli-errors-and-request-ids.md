@@ -555,3 +555,33 @@ The person viewer, assets, session, status and sideband reject an HTTP Host
 that neither matches the published door hostname nor names an IP literal
 (HTTP 403 `forbidden`). No new CLI exit code is introduced. `--no-open` and
 `--json` print only the URL.
+
+### Seat screen CLI (#1148)
+
+`wefty seat screenshot|click|move|drag|scroll|type|key SEAT_ID …` requires that
+Seat's saved credential. Missing credentials fail locally; an invalid or
+cross-Seat credential retains the L1/node `forbidden` refusal (exit 3). Input
+uses `/screen/input`; screenshots always use `/screen/view`, including an
+input call's optional screenshot. Input is never retried automatically.
+
+`person_driving` remains the existing typed HTTP 409 / CLI exit 5 refusal,
+with message `a person is driving`. A refused input sends no RFB input and
+writes no PNG. Screenshots remain available during a person's tenure.
+Release notes from successful screen handshake headers are printed on stderr.
+The shared Seat reply path prints the unread-events line on text stdout, or
+adds `unread_events_line` to a JSON reply when the count is nonzero. The JSON
+success also includes `unread_events` (including zero), `seat_id`, `action`,
+`path` (empty without a screenshot), and `elapsed_ms`. Structured refusals
+include `details.elapsed_ms`. Measurement starts at CLI dispatch entry before
+configuration and Fabric setup; process launch overhead is measured externally
+by the lane. Reading a note or screenshot does not acknowledge Seat events.
+
+A screenshot writes one valid PNG to a fresh private temp file and prints its
+absolute path. `-o FILE` selects an explicit new destination, including inside
+a checkout. Every input accepts `--screenshot [FILE]`; `--screenshot=FILE`
+accepts a filename starting with `-`. An existing destination is refused and
+left intact. Partial PNG files are removed on an encoding/write failure.
+Coordinates must be in `[0,1279] × [0,799]`; malformed arguments fail before
+opening Fabric. `scroll` requires `--dy N`, accepts `--dx N`, and limits each
+axis to 10000 wheel ticks in either direction. See `wefty seat --help` for
+key names and command arguments. Input payloads never enter a log or reply.

@@ -22,6 +22,8 @@ const seatUsage = `usage: wefty seat request --network internet|none [--dedicate
        wefty seat view SEAT_ID [--no-open]
        wefty seat window close
 
+` + seatScreenUsage + `
+
 Request one Seat, or wait again by its ID after an interrupted call.
 The network must be named. Only the owner's native dialog can approve.
 `
@@ -60,6 +62,9 @@ func validateSeatArgs(args []string) error {
 	case "view":
 		_, err := parseSeatViewFlags(args[1:])
 		return err
+	case "screenshot", "click", "move", "drag", "scroll", "type", "key":
+		_, err := parseSeatScreenArgs(args)
+		return err
 	case "request":
 		_, err := parseSeatRequestFlags(args[1:])
 		return err
@@ -80,6 +85,9 @@ func executeSeatRequest(ctx context.Context, clients *apiClients, jsonOutput boo
 	}
 	if args[0] == "view" {
 		return executeSeatView(ctx, clients, jsonOutput, args[1:], stdout)
+	}
+	if isSeatScreenCommand(args[0]) {
+		return executeSeatScreen(ctx, clients, jsonOutput, args, stdout, os.Stderr)
 	}
 	if args[0] == "release" {
 		return executeSeatRelease(ctx, clients, jsonOutput, args[1], stdout)

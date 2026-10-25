@@ -116,7 +116,7 @@ func flagErrorOutput(stderr io.Writer, jsonOutput bool) io.Writer {
 }
 
 func hasJSONFlag(args []string) bool {
-	_, enabled, err := removeBoolFlag(args, "--json")
+	_, enabled, err := removeBoolFlag(normalizeSeatScreenArgs(args), "--json")
 	return enabled || err != nil
 }
 
@@ -150,6 +150,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.Writer, openFabric func(context.Context, fabricconfig.Config) (fabric.Fabric, fabricconfig.CloseFunc, error)) (result error) {
+	ctx = context.WithValue(ctx, seatScreenStartKey{}, time.Now())
+	args = normalizeSeatScreenArgs(args)
 	if handled, err := serviceplan.ProfilePreflight(args, stdout); handled {
 		return err
 	}
@@ -186,7 +188,12 @@ func runWithFabricOpener(ctx context.Context, args []string, stdout, stderr io.W
 	if commandArgs[0] == "client-service" {
 		return executeClientService(ctx, options, commandArgs[1:], stdout, stderr)
 	}
-	if wantsCommandHelp(commandArgs) {
+	screenHelp, screenCommand := seatScreenWantsHelp(commandArgs)
+	if screenHelp {
+		_, err := io.WriteString(stdout, seatScreenUsage)
+		return err
+	}
+	if !screenCommand && wantsCommandHelp(commandArgs) {
 		return executeCommandHelp(ctx, options, commandArgs, stdout, stderr)
 	}
 	if commandArgs[0] == "doctor" {
@@ -465,6 +472,7 @@ Commands:
                              --node-id chooses a stable ID on first install
                              Plain Mac only: --remove keeps data and logs; --purge deletes them
                              Fleet removal is not supported yet
+  seat screenshot|click|move|drag|scroll|type|key SEAT_ID ...
   seat request --network internet|none [--dedicated] [--window 1h|8h|24h]
                              Request one approved Computer Seat
   cp SRC SEAT_ID:PATH | cp SEAT_ID:PATH DEST
