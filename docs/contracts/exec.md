@@ -491,10 +491,12 @@ Each Computer Attempt registers a feature mux and binds only Seat IDs from its
 fenced L1 wanted list. Copies, Seat Runs and per-Seat screens share this same
 listener; unknown paths and unbound Seats are refused. The generated
 private-network policy permits client participants to reach only node port 80
-for this door; other node ports remain owner-only. Port 80 is reserved by the
-node listener, so a hosted application cannot bind it. This is policy
+for this door; other node ports remain owner-only. Port 80 is reserved on every Fabric. Submit validation refuses
+`published_port: 80` with `invalid_request`; node reservation repeats the
+check, so a hosted application cannot bind it. This is policy
 guidance; existing owner-installed network policies must allow that narrow
-path. Each feature checks its own Seat credential and Attempt authority. The
+path. The door rejects a missing Seat credential with typed HTTP 401 before
+invoking a feature. Each feature checks the credential and Attempt authority. The
 router holds no lock across I/O. The published `/websockify` URL retains the
 existing Computer endpoint envelope; copy requests use the Seat path below,
 not that legacy screen path.
@@ -553,12 +555,20 @@ five-second `context.WithoutCancel` bound, with 100 ms then 200 ms backoff and
 the same node-owned CopyID. They never repeat the transfer. If delivery cannot
 be confirmed, the command fails loudly; no completed local outcome is
 inferred. See `seat-logs.md` for cursor and authority rules. The sending
-receipt invokes `SeatCallHappened`, then the trusted `SeatCommandRunning` hold
-seam with ID `copy:COPY_ID`. Completion or failure releases that hold and
-resets the idle origin through the same seam. A long copy therefore cannot
-expire from Seat idleness while it runs; an explicit Seat release or owner
-action still ends it. Delayed start retries never resurrect a terminal copy
-hold.
+receipt counts as `SeatCallHappened` and creates a separate copy hold, never
+an entry in the command cancellation seam. The node renews it every 20 seconds
+with the same sending receipt, independently of blocked payload I/O. Its lease
+is 60 seconds on L1's boot-relative Seat clock. L1 restart in the same boot
+preserves the deadline. A missing final receipt releases the hold at that
+deadline; the idle wait starts there. Successful terminal delivery releases it
+and starts the idle wait at completion. Seat or Attempt termination clears
+copy holds. Removing a Seat from the wanted list cancels its in-flight copies;
+a rejected renewal also cancels the transfer. A renewal failure stops the copy
+rather than continuing under an unconfirmed lease. Delayed sending receipts
+cannot resurrect a terminal copy. Publication retries transient errors with
+backoff until the Attempt ends; fencing stops startup. Cleanup retries
+withdrawal within ten seconds, and stale registrations cannot withdraw their
+replacement.
 
 The node response streams bounded NDJSON `SeatCopyStreamEvent` objects: `data`
 contains archive bytes; a final `size_bytes` means node completion (copy-out

@@ -68,10 +68,9 @@
       }
     },
     "published_port": {
-      "description": "Immutable Fabric-namespace port for a service, or null/absent for a portless service.",
+      "description": "Immutable Fabric-namespace port for a service; 80 is reserved for the Seat front door on every Fabric. Null/absent means portless.",
       "type": ["integer", "null"],
-      "minimum": 1,
-      "maximum": 65535
+      "anyOf": [{"type":"null"},{"minimum":1,"maximum":79},{"minimum":81,"maximum":65535}]
     },
     "restart": {
       "description": "Service restart mode: always, on-failure, or never. Omission defaults to always. Computers must explicitly declare always.",

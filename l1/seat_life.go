@@ -154,9 +154,14 @@ func (s *Store) planSeatLife(ctx context.Context, q queryer, id string) (seatLif
 	if boot == "" || boot != current {
 		return seatLifeChange{initialize: true}, nil
 	}
-	if held {
+	var copyUntil int64
+	if err := q.QueryRowContext(ctx, `SELECT COALESCE(MAX(lease_until_ns),0) FROM seat_copy_holds WHERE seat_id=? AND boot_id=?`, id, current).Scan(&copyUntil); err != nil {
+		return seatLifeChange{}, err
+	}
+	if held || copyUntil > ns {
 		return seatLifeChange{}, nil
 	}
+	last = max(last, copyUntil)
 	elapsed := time.Duration(max(0, ns-last))
 	change := seatLifeChange{revision: revision, warn: !warned && elapsed >= s.seatIdleWait-s.seatWarningWait}
 	if elapsed >= s.seatIdleWait {
@@ -240,10 +245,13 @@ func (s *Store) SeatCallHappened(ctx context.Context, id, secret string) error {
 		}
 		return err
 	}
-	if err := touchSeatActivity(ctx, w.tx, s.clock, id); err != nil {
+	if err := s.seatCallHappenedTx(ctx, w.tx, id); err != nil {
 		return err
 	}
 	return w.commit()
+}
+func (s *Store) seatCallHappenedTx(ctx context.Context, q seatApprovalQuery, id string) error {
+	return touchSeatActivity(ctx, q, s.clock, id)
 }
 func (s *Store) authorizeLiveSeat(ctx context.Context, q seatApprovalQuery, id, secret string, at time.Time) error {
 	var digest string

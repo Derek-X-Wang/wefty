@@ -398,6 +398,11 @@ func setSeatLifecycle(ctx context.Context, q seatApprovalQuery, id string, state
 	if err != nil {
 		return err
 	}
+	if state == SeatEnding || state == SeatEnded || state == SeatRefused {
+		if _, err := q.ExecContext(ctx, `DELETE FROM seat_copy_holds WHERE seat_id=?`, id); err != nil {
+			return err
+		}
+	}
 	if old.State == state && old.Reason == reason {
 		return nil
 	}

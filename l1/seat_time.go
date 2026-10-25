@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/bootclock"
 	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 )
@@ -89,9 +90,35 @@ func (s *Store) migrateSeatLife(ctx context.Context) error {
  hold_id TEXT NOT NULL,
  active INTEGER NOT NULL CHECK(active IN (0,1)),
  PRIMARY KEY(seat_id,kind,hold_id)
+ );
+ CREATE TABLE IF NOT EXISTS seat_copy_holds (
+ seat_id TEXT NOT NULL REFERENCES seat_approvals(seat_id) ON DELETE CASCADE,
+ copy_id TEXT NOT NULL,
+ attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+ boot_id TEXT NOT NULL,
+ lease_until_ns INTEGER NOT NULL,
+ PRIMARY KEY(seat_id,copy_id)
  );`)
 	if err != nil {
 		return err
+	}
+	// Upgrade the earlier unbounded copy command holds exactly once. They
+	// receive one bounded lease; command consumers must never see copy IDs.
+	var legacy bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_activity_holds WHERE kind='command' AND substr(hold_id,1,5)='copy:')`).Scan(&legacy); err != nil {
+		return err
+	}
+	if legacy {
+		boot, ns, err := seatTime(s.clock)
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO seat_copy_holds(seat_id,copy_id,attempt_id,boot_id,lease_until_ns) SELECT h.seat_id,substr(h.hold_id,6),i.first_attempt_id,?,? FROM seat_activity_holds h JOIN computer_seat_identities i ON i.seat_id=h.seat_id JOIN seat_approvals a ON a.seat_id=h.seat_id WHERE h.kind='command' AND substr(h.hold_id,1,5)='copy:' AND h.active=1 AND i.first_attempt_id IS NOT NULL AND a.lifecycle_state='live'`, boot, ns+int64(contract.SeatCopyHoldLease)); err != nil {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM seat_activity_holds WHERE kind='command' AND substr(hold_id,1,5)='copy:'`); err != nil {
+			return err
+		}
 	}
 	if err := recoverSeatApprovalClocks(ctx, s.db, s.clock, s.logf); err != nil {
 		s.logSeatLifeError("approval_clock_recovery", err)

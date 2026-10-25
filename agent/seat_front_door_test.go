@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -10,10 +11,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -34,14 +37,18 @@ func TestSeatFrontDoorRoutesRegisteredFeaturesAndClosesExactAttempt(t *testing.T
 		want int
 	}{{"/v1/seats/" + id + "/future-feature", 204}, {"/unknown", 404}, {"/v1/seats/seat_" + strings.Repeat("b", 32) + "/copy", 404}} {
 		w := httptest.NewRecorder()
-		door.ServeHTTP(w, httptest.NewRequest("POST", tc.path, nil))
+		req := httptest.NewRequest("POST", tc.path, nil)
+		req.Header.Set(l1.SeatCredentialHeader, "secret")
+		door.ServeHTTP(w, req)
 		if w.Code != tc.want {
 			t.Fatalf("%s: %d", tc.path, w.Code)
 		}
 	}
 	cancel()
 	w := httptest.NewRecorder()
-	door.ServeHTTP(w, httptest.NewRequest("POST", "/v1/seats/"+id+"/copy", nil))
+	req := httptest.NewRequest("POST", "/v1/seats/"+id+"/copy", nil)
+	req.Header.Set(l1.SeatCredentialHeader, "secret")
+	door.ServeHTTP(w, req)
 	if w.Code != 404 {
 		t.Fatal("cancelled Attempt still served")
 	}
@@ -55,7 +62,9 @@ func TestSeatFrontDoorRoutesRegisteredFeaturesAndClosesExactAttempt(t *testing.T
 	}
 	registration.close()
 	w = httptest.NewRecorder()
-	door.ServeHTTP(w, httptest.NewRequest("POST", "/v1/seats/"+id+"/copy", nil))
+	req = httptest.NewRequest("POST", "/v1/seats/"+id+"/copy", nil)
+	req.Header.Set(l1.SeatCredentialHeader, "secret")
+	door.ServeHTTP(w, req)
 	if w.Code != 202 {
 		t.Fatal("old cleanup removed replacement")
 	}
@@ -63,7 +72,7 @@ func TestSeatFrontDoorRoutesRegisteredFeaturesAndClosesExactAttempt(t *testing.T
 
 func TestSeatFrontDoorPublicationPrecedesReadinessAndWithdraws(t *testing.T) {
 	for _, stale := range []bool{false, true} {
-		t.Run(map[bool]string{false: "live", true: "stale"}[stale], func(t *testing.T) {
+		t.Run(map[bool]string{false: "live", true: "fencing-refusal"}[stale], func(t *testing.T) {
 			c, api, helper := newSeatTestController()
 			published, withdrawn := false, false
 			observed := make(chan struct{}, 1)
@@ -96,7 +105,7 @@ func TestSeatFrontDoorPublicationPrecedesReadinessAndWithdraws(t *testing.T) {
 			_, err := runComputerSeats(t.Context(), runtime, workloadrunner.Request{}, nil, c, seatComputerServiceConfig{router: door, copyRuntime: copyRuntime, copyControl: control, publish: func(ctx context.Context, ready bool, endpoint string) error {
 				if ready {
 					if stale {
-						return errors.New("stale Attempt")
+						return &ProtocolError{StatusCode: 409, APIError: contract.APIError{Code: contract.ErrorStaleFence}}
 					}
 					published = true
 				} else {
@@ -162,7 +171,9 @@ func TestSeatFrontDoorOneFabricListenerForMultipleComputers(t *testing.T) {
 			suffix string
 			status int
 		}{{"future-feature", 204}, {"unknown", 404}} {
-			response, err := client.Get("http://node/v1/seats/" + id + "/" + tc.suffix)
+			req, _ := http.NewRequest("GET", "http://node/v1/seats/"+id+"/"+tc.suffix, nil)
+			req.Header.Set(l1.SeatCredentialHeader, "secret")
+			response, err := client.Do(req)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -206,4 +217,154 @@ func TestSeatFrontDoorDoesNotPublishBeforeRuntimeStarts(t *testing.T) {
 	if err != nil || calls != 0 {
 		t.Fatalf("publication before runtime start: calls=%d err=%v", calls, err)
 	}
+}
+
+func TestSeatFrontDoorRequiresCredentialBeforeHandler(t *testing.T) {
+	door := newSeatFrontDoor(nil)
+	id := "seat_" + strings.Repeat("a", 32)
+	called := false
+	reg, err := door.register(t.Context(), "computer", "attempt", http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.close()
+	if err := reg.bind([]string{id}); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	door.ServeHTTP(w, httptest.NewRequest("POST", "/v1/seats/"+id+"/copy", nil))
+	var failure contract.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &failure); err != nil {
+		t.Fatal(err)
+	}
+	if w.Code != 401 || called || failure.Error.Code != contract.ErrorUnauthorized {
+		t.Fatalf("unguarded door: %d %s called=%v", w.Code, w.Body.String(), called)
+	}
+}
+func TestSeatFrontDoorNodeRefusesPublishedPort80(t *testing.T) {
+	port := 80
+	a := &Agent{fabric: plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "node"})}
+	listener, failure := a.reservePublishedPort(l1.Claim{Job: l1.Job{Spec: contract.JobSpec{Class: contract.JobClassService, PublishedPort: &port}}})
+	if listener != nil {
+		listener.Close()
+	}
+	if failure == nil || !strings.Contains(failure.Message, "reserved for wefty's Seat front door") {
+		t.Fatalf("node accepted reserved port: %+v", failure)
+	}
+}
+
+func TestAgentRunWithoutFabricLeavesSeatDoorUnavailable(t *testing.T) {
+	clock := systemClock{}
+	client, err := newClient(plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "node"}), "wefty://control-plane", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	registration := contract.NodeRegistration{NodeID: "node", BootSessionID: "boot"}
+	observer := newLifecycleObserver(clock)
+	capabilities := newCapabilityState(nil, nil, clock, 0, nil)
+	session := newAgentSession(client, registration, capabilities, time.Second, time.Second, clock, observer, nil, 1, 0)
+	defer session.close()
+	a := &Agent{session: session, registration: registration, clock: clock, observer: observer, capabilities: capabilities}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_ = a.Run(ctx)
+	if a.seatDoor != nil {
+		t.Fatal("node without Fabric acquired a Seat door")
+	}
+	if _, err := a.seatDoor.register(t.Context(), "computer", "attempt", http.NotFoundHandler()); err == nil {
+		t.Fatal("missing door accepted registration")
+	}
+}
+
+func TestSeatFrontDoorStaleRegistrationCannotPublishOrWithdrawReplacement(t *testing.T) {
+	door := newSeatFrontDoor(nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	old, err := door.register(ctx, "computer", "old", http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	next, err := door.register(t.Context(), "computer", "next", http.NotFoundHandler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.close()
+	calls := 0
+	ready := false
+	publish := func(context.Context, bool, string) error { calls++; ready = true; return nil }
+	if err := next.publish(t.Context(), true, "endpoint", publish); err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []bool{true, false} {
+		if err := old.publish(t.Context(), value, "endpoint", publish); !errors.Is(err, errStaleSeatPublication) {
+			t.Fatalf("stale mutation: %v", err)
+		}
+	}
+	old.close()
+	if calls != 1 || !ready || door.computers["computer"] != next {
+		t.Fatal("stale registration changed replacement")
+	}
+}
+
+func TestSeatFrontDoorRetriesPublicationAndWithdrawal(t *testing.T) {
+	c, _, helper := newSeatTestController()
+	observed := make(chan struct{}, 1)
+	c.afterStep = func() { observed <- struct{}{} }
+	runtime := &seatLifecycleRuntime{seatTestRuntime: helper, run: func(ctx context.Context, r workloadrunner.Request) (workloadrunner.Result, error) {
+		r.Started()
+		awaitSeatTestSignal(t, observed)
+		return workloadrunner.Result{}, nil
+	}}
+	calls := map[bool]int{}
+	clock := &delayRecordingClock{}
+	_, err := runComputerSeats(t.Context(), runtime, workloadrunner.Request{}, nil, c, seatComputerServiceConfig{
+		router: newSeatFrontDoor(nil), copyRuntime: copyRuntimeFixture{}, copyControl: &copyControlFixture{}, clock: clock,
+		publish: func(ctx context.Context, ready bool, endpoint string) error {
+			calls[ready]++
+			if calls[ready] == 1 {
+				return &ProtocolError{StatusCode: 503, APIError: contract.APIError{Code: contract.ErrorUnavailable}}
+			}
+			return nil
+		}})
+	if err != nil || calls[true] != 2 || calls[false] != 2 {
+		t.Fatalf("publication not recovered: %v calls=%v", err, calls)
+	}
+	delays := clock.recorded()
+	if len(delays) != 2 || delays[0] != DefaultPublicationRetryInterval || delays[1] != DefaultPublicationRetryInterval {
+		t.Fatalf("retry schedule=%v", delays)
+	}
+}
+
+func TestSeatFrontDoorSeatRemovalCancelsInFlightCopy(t *testing.T) {
+	door := newSeatFrontDoor(nil)
+	id := "seat_" + strings.Repeat("a", 32)
+	started, done := make(chan struct{}), make(chan struct{})
+	reg, err := door.register(t.Context(), "computer", "attempt", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { close(started); <-r.Context().Done(); close(done) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.close()
+	if err := reg.bind([]string{id}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/v1/seats/"+id+"/copy", nil)
+	req.Header.Set(l1.SeatCredentialHeader, "secret")
+	returned := make(chan struct{})
+	go func() { defer close(returned); door.ServeHTTP(httptest.NewRecorder(), req) }()
+	awaitSeatTestSignal(t, started)
+	// A repeat wanted list must preserve a running operation.
+	if err := reg.bind([]string{id}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+		t.Fatal("unchanged list cancelled copy")
+	default:
+	}
+	if err := reg.bind(nil); err != nil {
+		t.Fatal(err)
+	}
+	awaitSeatTestSignal(t, done)
+	awaitSeatTestSignal(t, returned)
 }

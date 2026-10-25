@@ -186,15 +186,12 @@ func (s *Store) RecordSeatCopy(ctx context.Context, identity, id string, input S
 		return err
 	}
 	if pending {
-		if err := s.SeatCallHappened(ctx, id, input.Credential); err != nil {
-			return err
-		}
-		return s.SeatCommandRunning(ctx, id, "copy:"+input.CopyID, true)
+		return s.renewSeatCopyHold(ctx, id, input)
 	}
 	if input.Outcome == "sending" {
 		return nil
 	}
-	return s.SeatCommandRunning(ctx, id, "copy:"+input.CopyID, false)
+	return s.releaseSeatCopyHold(ctx, id, input.CopyID)
 }
 
 // SeatCopyStreamEvent is one bounded NDJSON line from the hosting node.

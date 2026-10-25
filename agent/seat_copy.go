@@ -30,6 +30,9 @@ type seatCopyRuntime interface {
 var seatCopyRoute = regexp.MustCompile(`^/v1/seats/(seat_[0-9a-f]{32})/copy$`)
 
 func newSeatCopyHandler(runtime seatCopyRuntime, control seatCopyControl, authority workloadrunner.AttemptAuthority, computer string) http.Handler {
+	return newSeatCopyHandlerWithClock(runtime, control, authority, computer, systemClock{})
+}
+func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyControl, authority workloadrunner.AttemptAuthority, computer string, clock Clock) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		match := seatCopyRoute.FindStringSubmatch(r.URL.Path)
 		if len(match) != 2 || r.Method != http.MethodPost {
@@ -72,6 +75,22 @@ func newSeatCopyHandler(runtime seatCopyRuntime, control seatCopyControl, author
 			sendError(fmt.Errorf("copy start unconfirmed: %w", errors.Join(err, finishErr)))
 			return
 		}
+		copyCtx, cancelCopy := context.WithCancel(r.Context())
+		defer cancelCopy()
+		// Closing the helper connection cancels its process. Also interrupt
+		// blocked HTTP upload/download I/O when Seat authority is withdrawn.
+		stopIO := context.AfterFunc(copyCtx, func() {
+			response := http.NewResponseController(w)
+			_ = response.SetReadDeadline(time.Now())
+			_ = response.SetWriteDeadline(time.Now())
+			_ = r.Body.Close()
+		})
+		defer stopIO()
+		renewalDone := make(chan struct{})
+		go func() {
+			defer close(renewalDone)
+			renewSeatCopyLease(copyCtx, control, match[1], start, clock, cancelCopy)
+		}()
 		// HTTP/1 must permit response chunks while upload still streams. HTTP/2
 		// already has this behavior. There is no application-wide body limit.
 		_ = http.NewResponseController(w).EnableFullDuplex()
@@ -81,7 +100,7 @@ func newSeatCopyHandler(runtime seatCopyRuntime, control seatCopyControl, author
 		if direction == "in" {
 			inputStream = io.TeeReader(r.Body, meter)
 		}
-		size, err := runtime.CopyComputerSeat(r.Context(), ocihelper.CopyComputerSeatRequest{Authority: ocihelper.AttemptAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, AttemptID: authority.AttemptID, FencingToken: authority.FencingToken, Class: authority.WorkloadClass, RemovalGeneration: authority.RemovalGeneration}, Generation: binding.Generation, Place: binding.Place, Direction: direction, Path: path}, inputStream, func(data []byte) error {
+		size, err := runtime.CopyComputerSeat(copyCtx, ocihelper.CopyComputerSeatRequest{Authority: ocihelper.AttemptAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, AttemptID: authority.AttemptID, FencingToken: authority.FencingToken, Class: authority.WorkloadClass, RemovalGeneration: authority.RemovalGeneration}, Generation: binding.Generation, Place: binding.Place, Direction: direction, Path: path}, inputStream, func(data []byte) error {
 			if err := encode.Encode(l1.SeatCopyStreamEvent{Data: data}); err != nil {
 				return err
 			}
@@ -91,6 +110,9 @@ func newSeatCopyHandler(runtime seatCopyRuntime, control seatCopyControl, author
 			_, _ = meter.Write(data)
 			return nil
 		})
+		stopIO()
+		cancelCopy()
+		<-renewalDone
 		size = max(size, meter.Close())
 		outcome, reason := "completed", ""
 		if direction == "out" {
@@ -157,4 +179,26 @@ func recordSeatCopyReceiptWithClock(ctx context.Context, control seatCopyControl
 		}
 	}
 	return err
+}
+
+// A Seat end rejects renewal and cancels even a blocked transfer. Losing L1
+// also stops the transfer rather than continuing beyond an unconfirmed lease.
+func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string, start l1.SeatCopyReceipt, clock Clock, cancel context.CancelFunc) {
+	timer := clock.NewTimer(contract.SeatCopyHoldRenewal)
+	defer stopTimer(timer)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C():
+		}
+		renewCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+		err := control.RecordSeatCopy(renewCtx, id, start)
+		stop()
+		if err != nil {
+			cancel()
+			return
+		}
+		timer.Reset(contract.SeatCopyHoldRenewal)
+	}
 }

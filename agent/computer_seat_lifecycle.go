@@ -17,6 +17,7 @@ type seatComputerServiceConfig struct {
 	copyRuntime seatCopyRuntime
 	copyControl seatCopyControl
 	publish     func(context.Context, bool, string) error
+	clock       Clock
 }
 
 // Publication precedes the controller's first live observation. The shared
@@ -25,10 +26,13 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 	if config.router == nil || config.publish == nil || config.copyRuntime == nil || config.copyControl == nil {
 		return contract.ProcessResult{}, errors.New("Seat front-door dependencies are incomplete")
 	}
+	if config.clock == nil {
+		config.clock = systemClock{}
+	}
 	seatCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/seats/{seat_id}/copy", newSeatCopyHandler(config.copyRuntime, config.copyControl, request.Authority, controller.computerID))
+	mux.Handle("POST /v1/seats/{seat_id}/copy", newSeatCopyHandlerWithClock(config.copyRuntime, config.copyControl, request.Authority, controller.computerID, config.clock))
 	registration, err := config.router.register(seatCtx, controller.computerID, controller.authority.AttemptID, mux)
 	if err != nil {
 		return contract.ProcessResult{}, err
@@ -58,9 +62,9 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 					return
 				}
 				publicationAttempted = true
-				publishCtx, stop := context.WithTimeout(seatCtx, 5*time.Second)
-				startupErr = config.publish(publishCtx, true, config.router.endpoint)
-				stop()
+				startupErr = retrySeatPublication(seatCtx, config.clock, func(callCtx context.Context) error {
+					return registration.publish(callCtx, true, config.router.endpoint, config.publish)
+				})
 				if startupErr != nil {
 					cancel()
 					return
@@ -74,12 +78,42 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 	result, runErr := runtime.Run(seatCtx, request, sink)
 	cancel()
 	workers.Wait()
-	registration.close()
 	if !publicationAttempted {
 		return result.Outcome, errors.Join(runErr, startupErr)
 	}
-	withdrawCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	withdrawErr := config.publish(withdrawCtx, false, "")
+	withdrawCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), DefaultPublicationRecoveryWindow)
+	withdrawErr := retrySeatPublication(withdrawCtx, config.clock, func(callCtx context.Context) error { return registration.publish(callCtx, false, "", config.publish) })
+	if errors.Is(withdrawErr, errStaleSeatPublication) {
+		withdrawErr = nil
+	}
 	stop()
 	return result.Outcome, errors.Join(runErr, startupErr, withdrawErr)
+}
+
+func retrySeatPublication(ctx context.Context, clock Clock, send func(context.Context) error) error {
+	delay := DefaultPublicationRetryInterval
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		callCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+		err := send(callCtx)
+		stop()
+		if err == nil {
+			return nil
+		}
+		var protocol *ProtocolError
+		if errors.Is(err, errStaleSeatPublication) || classifyAgentProtocolError(err).destination == errorDestinationAttemptAuthority || errors.As(err, &protocol) && protocol.StatusCode >= 400 && protocol.StatusCode < 500 && !protocol.APIError.Retryable {
+			return err
+		}
+		timer := clock.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return ctx.Err()
+		case <-timer.C():
+		}
+		stopTimer(timer)
+		delay = min(delay*2, time.Second)
+	}
 }

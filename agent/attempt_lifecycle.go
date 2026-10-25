@@ -2013,7 +2013,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
 		result, runErr = runComputerSeats(ctx, runtimeAdapter, request, sink, controller, seatComputerServiceConfig{
-			router: lifecycle.dependencies.seatDoor, copyRuntime: copyRuntime, copyControl: lifecycle.dependencies.client,
+			clock: lifecycle.dependencies.clock, router: lifecycle.dependencies.seatDoor, copyRuntime: copyRuntime, copyControl: lifecycle.dependencies.client,
 			publish: func(publishContext context.Context, ready bool, endpoint string) error {
 				if ready && ctx.Err() != nil {
 					return ctx.Err()

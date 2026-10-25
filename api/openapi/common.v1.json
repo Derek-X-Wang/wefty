@@ -122,6 +122,7 @@
           }
         },
         "SeatCopyReceipt": {
+          "description": "Node-owned copy evidence. The pre-stream sending receipt counts as a Seat call and acquires a separate 60-second boot-relative copy lease. Repeating sending every 20 seconds renews that lease without another event or call. Terminal evidence releases it. Seat or Attempt ending clears copy holds.",
           "type": "object",
           "additionalProperties": false,
           "required": [

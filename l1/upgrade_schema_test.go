@@ -33,6 +33,7 @@ import (
 // durable boot-relative Seat/approval/idle clocks, activity holds and owner summaries;
 // then remove the global calendar anchor so general L1 timestamps remain wall time;
 // then #1247 boot-scoped Attempt lease deadlines and their expiry index.
+// Then #1153 adds Attempt-bound, boot-relative copy leases in seat_copy_holds.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {

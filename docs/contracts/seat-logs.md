@@ -229,8 +229,15 @@ backoff and the same node-owned CopyID. Exhausted receipt retries fail loudly;
 `sent` remains pending instead of becoming a false local completion.
 
 The pre-stream sending receipt counts as a Seat call through
-`SeatCallHappened` and acquires the trusted running-command hold with ID
-`copy:COPY_ID`. The terminal receipt releases it through `SeatCommandRunning`,
-so the idle wait starts again after the transfer ends. Holds survive L1
-restart like command holds; Seat/Attempt termination still ends authority. A
-delayed sending retry cannot resurrect a terminal operation's hold.
+`SeatCallHappened` and creates a separate copy hold in `seat_copy_holds`, keyed
+by Seat and node-owned CopyID and bound to its Attempt (cascade deletion).
+It is not a command and never appears in `SeatCommandsToCancel`. Repeated
+sending receipts renew a 60-second boot-relative lease every 20 seconds,
+without adding events or resetting the call's idle origin. The node stops a
+copy when renewal fails. A terminal receipt releases the hold and resets the
+idle origin. Without a terminal receipt, L1 treats the lease deadline as the
+release time; the Seat can then expire after its normal idle wait. Same-boot
+L1 restarts preserve leases. A different boot drops old lease authority and
+starts the ordinary new-boot idle wait. Seat or Attempt ending clears copy
+holds and the node cancels transfers when a Seat is unbound or renewal is
+refused. A delayed sending receipt cannot resurrect a terminal operation.

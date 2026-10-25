@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/tailscale/hujson"
 )
 
@@ -74,6 +75,10 @@ func TestPrivateNetworkPolicy(t *testing.T) {
 		}
 		for _, source := range []string{"tag:wefty-control", "tag:wefty-client", "tag:wefty-agent"} {
 			if source == "tag:wefty-client" && port == 80 {
+				spec := contract.JobSpec{SchemaVersion: 1, DispatchKey: "reserved-seat-door", Kind: contract.JobKindProcess, Class: contract.JobClassService, PublishedPort: &port, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: "/tmp"}}
+				if err := contract.ValidateJobSpec(&spec); err == nil || !strings.Contains(err.Error(), contract.SeatFrontDoorPortReserved) {
+					t.Fatalf("policy permits an application at the Seat door: %v", err)
+				}
 				continue
 			}
 			if allows(source, target) {

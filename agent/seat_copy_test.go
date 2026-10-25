@@ -271,3 +271,51 @@ func TestSeatCopyRefusedStartRecordsFailureWithoutPayload(t *testing.T) {
 		t.Fatalf("refused copy left a pending start: %+v", control.receipts)
 	}
 }
+
+type renewingCopyControl struct {
+	copyControlFixture
+	renewed chan struct{}
+	ended   bool
+}
+
+func (f *renewingCopyControl) RecordSeatCopy(ctx context.Context, id string, r l1.SeatCopyReceipt) error {
+	if r.Outcome == "sending" {
+		if f.ended {
+			return &ProtocolError{StatusCode: 409, APIError: contract.APIError{Code: "seat_ended"}}
+		}
+		select {
+		case f.renewed <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func TestSeatCopyRenewsLeaseAndCancelsWhenSeatEnds(t *testing.T) {
+	clock := newManualClock(time.Unix(0, 0))
+	control := &renewingCopyControl{renewed: make(chan struct{}, 1)}
+	started, done := make(chan struct{}), make(chan struct{})
+	runtime := copyRuntimeFunc(func(ctx context.Context, _ ocihelper.CopyComputerSeatRequest, _ io.Reader, _ func([]byte) error) (int64, error) {
+		close(started)
+		<-ctx.Done()
+		return 0, ctx.Err()
+	})
+	handler := newSeatCopyHandlerWithClock(runtime, control, workloadrunner.AttemptAuthority{}, "computer", clock)
+	req := httptest.NewRequest("POST", "/v1/seats/seat_00000000000000000000000000000001/copy?direction=out&path=file", nil)
+	req = req.WithContext(t.Context())
+	req.Header.Set(l1.SeatCredentialHeader, "secret")
+	response := httptest.NewRecorder()
+	go func() { defer close(done); handler.ServeHTTP(response, req) }()
+	awaitSeatTestSignal(t, started)
+	awaitSeatTestSignal(t, control.renewed) // pre-stream receipt
+	clock.waitForDeadline(t, clock.Now().Add(contract.SeatCopyHoldRenewal))
+	clock.Advance(contract.SeatCopyHoldRenewal)
+	awaitSeatTestSignal(t, control.renewed)
+	clock.waitForDeadline(t, clock.Now().Add(contract.SeatCopyHoldRenewal))
+	control.ended = true
+	clock.Advance(contract.SeatCopyHoldRenewal)
+	awaitSeatTestSignal(t, done)
+	if !bytes.Contains(response.Body.Bytes(), []byte("context canceled")) {
+		t.Fatalf("ended Seat left transfer running: %s", response.Body.String())
+	}
+}

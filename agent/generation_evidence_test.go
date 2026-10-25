@@ -298,7 +298,19 @@ func TestGenerationCustodyRetainsExactEvidenceAndRequiresPublication(t *testing.
 	}
 }
 
-// Exercise real agent Run loops, live shell processes and two successive L1
+// Separate processes have separate plain listener namespaces. This fixture
+// shares one in-process network, so give each generation its own service name
+// while preserving its common authenticated node identity.
+type generationSeatServiceFabric struct {
+	fabric.Fabric
+	generation string
+}
+
+func (f generationSeatServiceFabric) LocalServiceAddress() string {
+	return "wefty://node/cohort-" + f.generation
+}
+
+// Exercise real node agent Run loops, live shell processes and two successive L1
 // promotions against one spool, managed root, result root and capability floor.
 func TestGenerationThreeRunningAgentsShareNodeLocalState(t *testing.T) {
 	network := plain.NewNetwork()
@@ -352,7 +364,7 @@ func TestGenerationThreeRunningAgentsShareNodeLocalState(t *testing.T) {
 			}
 		}
 		zero := 0.0
-		a, err := New(Config{Fabric: network.NewFabric(fabric.Identity{NodeID: "cohort-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane", NodeID: "node", BootSessionID: boot, AgentGenerationID: id, OS: "darwin", Version: id, Capabilities: map[string]bool{"kind:process": true, "upgrade:retirement:v1": true, contract.CapabilityExecCaptureBundle: true}, GuardianExecutable: agentBinaryPath, LogSpoolDirectory: spoolRoot, HandoffRoot: handoffRoot, ManagedRootDirectory: managedRoot, CapabilityRevisionPath: floorPath, MaxOneshotSlots: 3, OneshotLoadLimit: &zero, HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond, RenewalInterval: 100 * time.Millisecond,
+		a, err := New(Config{Fabric: generationSeatServiceFabric{Fabric: network.NewFabric(fabric.Identity{NodeID: "cohort-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), generation: id}, ControlPlaneAddress: "wefty://control-plane", NodeID: "node", BootSessionID: boot, AgentGenerationID: id, OS: "darwin", Version: id, Capabilities: map[string]bool{"kind:process": true, "upgrade:retirement:v1": true, contract.CapabilityExecCaptureBundle: true}, GuardianExecutable: agentBinaryPath, LogSpoolDirectory: spoolRoot, HandoffRoot: handoffRoot, ManagedRootDirectory: managedRoot, CapabilityRevisionPath: floorPath, MaxOneshotSlots: 3, OneshotLoadLimit: &zero, HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond, RenewalInterval: 100 * time.Millisecond,
 			PrimaryGeneration: func(write func() error) error {
 				primaryMu.Lock()
 				defer primaryMu.Unlock()
@@ -381,6 +393,8 @@ func TestGenerationThreeRunningAgentsShareNodeLocalState(t *testing.T) {
 		})
 		select {
 		case <-a.Registered():
+		case err := <-finished:
+			t.Fatalf("node generation stopped before registration: %v", err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("registration timed out")
 		}

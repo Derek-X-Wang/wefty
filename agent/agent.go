@@ -669,19 +669,24 @@ func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
 func (a *Agent) Run(ctx context.Context) error {
 	ctx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
-	door, closeDoor, err := startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID)
-	if err != nil {
-		return err
-	}
-	a.seatDoor = door
-	defer closeDoor()
-	go func() {
-		select {
-		case <-door.done:
-			cancelRun()
-		case <-ctx.Done():
+	var doorDone <-chan struct{}
+	a.seatDoor = nil
+	if a.fabric != nil {
+		door, closeDoor, err := startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID)
+		if err != nil {
+			return err
 		}
-	}()
+		a.seatDoor = door
+		doorDone = door.done
+		defer closeDoor()
+		go func() {
+			select {
+			case <-doorDone:
+				cancelRun()
+			case <-ctx.Done():
+			}
+		}()
+	}
 	seatCtx, seatCancel := context.WithCancel(ctx)
 	seatDone := make(chan struct{})
 	go func() { defer close(seatDone); a.runSeatRequests(seatCtx) }()
@@ -748,8 +753,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		return a.executeClaim(attemptContext, claim, claimStarted)
 	})
 	select {
-	case <-door.done:
-		return errors.Join(runErr, door.serveErr)
+	case <-doorDone:
+		return errors.Join(runErr, a.seatDoor.serveErr)
 	default:
 		return runErr
 	}
@@ -954,6 +959,9 @@ func (a *Agent) reservePublishedPort(claim l1.Claim) (net.Listener, *contract.Sp
 	port := claim.Job.Spec.PublishedPort
 	if claim.Job.Spec.Class != contract.JobClassService || port == nil {
 		return nil, nil
+	}
+	if *port == contract.SeatFrontDoorPort {
+		return nil, &contract.SpawnFailure{Code: contract.SpawnFailureProcessRequest, Message: contract.SeatFrontDoorPortReserved}
 	}
 	if a.fabric == nil {
 		return nil, &contract.SpawnFailure{

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/l1"
 )
 
 // One node listener carries all Seat features. Attempts register a feature mux
@@ -31,6 +33,9 @@ type seatFrontDoorRegistration struct {
 	ctx               context.Context
 	computer, attempt string
 	handler           http.Handler
+	publicationMu     *sync.Mutex
+	seatContexts      map[string]context.Context
+	seatCancels       map[string]context.CancelFunc
 }
 
 var seatFrontDoorPath = regexp.MustCompile(`^/v1/seats/(seat_[0-9a-f]{32})(?:/|$)`)
@@ -73,7 +78,11 @@ func (d *seatFrontDoor) register(ctx context.Context, computer, attempt string, 
 	if old := d.computers[computer]; old != nil && old.ctx.Err() == nil {
 		return nil, errors.New("Computer already has a Seat front-door Attempt")
 	}
-	r := &seatFrontDoorRegistration{door: d, ctx: ctx, computer: computer, attempt: attempt, handler: h}
+	publicationMu := &sync.Mutex{}
+	if old := d.computers[computer]; old != nil {
+		publicationMu = old.publicationMu
+	}
+	r := &seatFrontDoorRegistration{door: d, ctx: ctx, computer: computer, attempt: attempt, handler: h, publicationMu: publicationMu, seatContexts: map[string]context.Context{}, seatCancels: map[string]context.CancelFunc{}}
 	d.computers[computer] = r
 	return r, nil
 }
@@ -89,17 +98,29 @@ func (r *seatFrontDoorRegistration) bind(ids []string) error {
 			return errors.New("Seat already belongs to another front-door Attempt")
 		}
 	}
+	wanted := map[string]bool{}
+	for _, id := range ids {
+		wanted[id] = true
+	}
 	for id, old := range d.seats {
-		if old == r {
+		if old == r && !wanted[id] {
+			r.seatCancels[id]()
+			delete(r.seatContexts, id)
+			delete(r.seatCancels, id)
 			delete(d.seats, id)
 		}
 	}
 	for _, id := range ids {
+		if d.seats[id] != r {
+			r.seatContexts[id], r.seatCancels[id] = context.WithCancel(r.ctx)
+		}
 		d.seats[id] = r
 	}
 	return nil
 }
 func (r *seatFrontDoorRegistration) close() {
+	r.publicationMu.Lock()
+	defer r.publicationMu.Unlock()
 	d := r.door
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -108,6 +129,7 @@ func (r *seatFrontDoorRegistration) close() {
 	}
 	for id, old := range d.seats {
 		if old == r {
+			r.seatCancels[id]()
 			delete(d.seats, id)
 		}
 	}
@@ -120,9 +142,19 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.RLock()
 	registration := d.seats[match[1]]
+	var seatCtx context.Context
+	if registration != nil {
+		seatCtx = registration.seatContexts[match[1]]
+	}
 	d.mu.RUnlock()
 	if registration == nil || registration.ctx.Err() != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if r.Header.Get(l1.SeatCredentialHeader) == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorUnauthorized, Message: "Seat credential is required"}})
 		return
 	}
 	if d.fabric != nil {
@@ -133,7 +165,23 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	stop := context.AfterFunc(registration.ctx, cancel)
+	stop := context.AfterFunc(seatCtx, cancel)
 	defer stop()
 	registration.handler.ServeHTTP(w, r.WithContext(ctx))
 }
+
+// Serialize only publication I/O, never registry or Attempt locks. Replacements
+// share this gate and recheck registration authority before each remote call.
+func (r *seatFrontDoorRegistration) publish(ctx context.Context, ready bool, endpoint string, send func(context.Context, bool, string) error) error {
+	r.publicationMu.Lock()
+	defer r.publicationMu.Unlock()
+	r.door.mu.RLock()
+	current := r.door.computers[r.computer] == r
+	r.door.mu.RUnlock()
+	if !current || ready && r.ctx.Err() != nil {
+		return errStaleSeatPublication
+	}
+	return send(ctx, ready, endpoint)
+}
+
+var errStaleSeatPublication = errors.New("stale Seat front-door Attempt")
