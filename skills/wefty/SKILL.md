@@ -696,3 +696,25 @@ the document the run itself concluded with. The reference workflow is
 `workflows/branch-gates/` is the smaller one to copy: it gates a branch and
 hands back a pass/fail verdict. `workflows/issue-to-pr/` is the one that writes
 code — see the recipe above.
+
+## Copy files to or from a Seat
+
+```sh
+wefty cp ./.env SEAT_ID:.env
+wefty cp ./fixtures SEAT_ID:fixtures
+wefty cp SEAT_ID:out/report.html ./report.html
+```
+
+Use the actual `seat_<32 hex>` ID. Relative Seat paths start in its folder;
+absolute paths use the Seat user's permissions. Files and recursive
+directories stream without a size limit; Git-ignored files are included.
+DEST names the exact result, with an existing parent. Existing nonempty
+directories are not merged. The CLI writes copy-out within your sandbox and
+resolves parent symlinks once and refuses a symlink at DEST's final name.
+Copied folders have mode 0700. A failed copy leaves no partial destination.
+Every authorized copy that reaches the node records path, byte count and
+node outcome in `wefty logs SEAT_ID`; earlier failures create no event.
+Copy-out is `sent` until the CLI reports local `completed` or `failed` while
+the Seat is live. Logs preserve the node result alongside the local result.
+An outcome-unconfirmed error means receipt delivery failed; inspect the log
+before repeating work. Copy-out is not a Custody export and does not change removal proof.

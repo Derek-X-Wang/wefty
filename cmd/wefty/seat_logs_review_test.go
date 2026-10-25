@@ -46,6 +46,28 @@ func TestSeatLogFollowAcknowledgesOnlyDeliveredEvents(t *testing.T) {
 	}
 }
 
+func TestSeatLogCopyShowsNodeAndLocalResults(t *testing.T) {
+	t.Setenv("WEFTY_SEAT_STATE_ROOT", t.TempDir()+"/seats")
+	id := "seat_" + strings.Repeat("c", 32)
+	size := int64(999)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			io.WriteString(w, `{}`)
+			return
+		}
+		json.NewEncoder(w).Encode(l1.SeatLogPage{SeatID: id, NextCursor: "copy", Events: []l1.SeatLogEvent{{SeatID: id, EventID: "copy:node-owned", Kind: l1.SeatEventCopyOut, CopyID: "node-owned", Path: "secrets.tar", SizeBytes: &size, NodeOutcome: "sent", Outcome: "failed", Reason: "destination_write_denied"}}})
+	}))
+	defer server.Close()
+	clients := &apiClients{l1: statusClient(t, "L1", "l1", server)}
+	var out bytes.Buffer
+	if err := executeSeatLogs(t.Context(), clients, false, id, "", 200, 0, false, false, false, time.Second, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "secrets.tar") || !strings.Contains(out.String(), "sent 999 B; local publish failed") {
+		t.Fatalf("human log hid node result: %s", out.String())
+	}
+}
+
 func TestSeatLogFollowRetriesPendingAcknowledgement(t *testing.T) {
 	t.Setenv("WEFTY_SEAT_STATE_ROOT", t.TempDir()+"/seats")
 	id := "seat_" + strings.Repeat("e", 32)

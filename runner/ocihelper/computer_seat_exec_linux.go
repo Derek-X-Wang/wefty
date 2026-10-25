@@ -20,7 +20,7 @@ import (
 func (engine *ContainerdEngine) ExecComputerSeat(ctx context.Context, request ExecComputerSeatRequest, emit func(SeatCommandEvent) error) error {
 	return engine.execComputerSeat(ctx, request, emit, confirmSeatCommandReady)
 }
-func (engine *ContainerdEngine) execComputerSeat(ctx context.Context, request ExecComputerSeatRequest, emit func(SeatCommandEvent) error, confirm func(computerSeatAttemptSnapshot, ExecComputerSeatRequest) error) (resultErr error) {
+func (engine *ContainerdEngine) execComputerSeat(ctx context.Context, request ExecComputerSeatRequest, emit func(SeatCommandEvent) error, confirm func(computerSeatAttemptSnapshot, ExecComputerSeatRequest) error, input ...io.Reader) (resultErr error) {
 	if err := request.validate(); err != nil {
 		return err
 	}
@@ -34,7 +34,7 @@ func (engine *ContainerdEngine) execComputerSeat(ctx context.Context, request Ex
 	stream := newSeatCommandStream(ctx, emit)
 	waitCtx, stopWait := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopWait()
-	process, wait, err := engine.startSeatCommand(ctx, waitCtx, request, stream, cancel, confirm)
+	process, wait, err := engine.startSeatCommand(ctx, waitCtx, request, stream, cancel, confirm, input...)
 	if err != nil {
 		return err
 	}
@@ -93,7 +93,7 @@ func (engine *ContainerdEngine) execComputerSeat(ctx context.Context, request Ex
 
 // Only preparation and start hold seatsMu, so removal can end a running
 // command. No containerd call holds the attempt's lifecycle/control mutex.
-func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, request ExecComputerSeatRequest, stream *seatCommandStream, cancel context.CancelFunc, confirm func(computerSeatAttemptSnapshot, ExecComputerSeatRequest) error) (resultProcess containerd.Process, resultWait <-chan containerd.ExitStatus, resultErr error) {
+func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, request ExecComputerSeatRequest, stream *seatCommandStream, cancel context.CancelFunc, confirm func(computerSeatAttemptSnapshot, ExecComputerSeatRequest) error, input ...io.Reader) (resultProcess containerd.Process, resultWait <-chan containerd.ExitStatus, resultErr error) {
 	attempt, err := engine.attempt(request.Authority)
 	if err != nil {
 		return nil, nil, err
@@ -136,10 +136,19 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 	}
 	// All fields are fresh. In particular, no image/root supplementary groups,
 	// capabilities, environment or working directory can enter this process.
+	wrapper := seatCommandWrapper
+	var stdin io.Reader
+	if len(input) > 0 {
+		stdin = input[0]
+		wrapper, err = seatCommandWithInput(wrapper)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	spec := &specs.Process{
 		User: specs.User{UID: config.UID, GID: config.GID, AdditionalGids: []uint32{}},
 		Cwd:  config.Directory, Env: config.Environment,
-		Args:            append([]string{"/usr/bin/python3", "-I", "-S", "-c", seatCommandWrapper}, request.Args...),
+		Args:            append([]string{"/usr/bin/python3", "-I", "-S", "-c", wrapper}, request.Args...),
 		NoNewPrivileges: true, Capabilities: &specs.LinuxCapabilities{},
 		Rlimits: []specs.POSIXRlimit{{Type: "RLIMIT_NOFILE", Hard: 1024, Soft: 1024}},
 	}
@@ -162,7 +171,7 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 		_, err = stream.Write(data)
 		return err
 	})
-	process, err := snapshot.task.Exec(ctx, seatCommandExecID(id), spec, cio.NewCreator(cio.WithStreams(nil, seatCommandDrain{gated, cancel}, io.Discard)))
+	process, err := snapshot.task.Exec(ctx, seatCommandExecID(id), spec, cio.NewCreator(cio.WithStreams(stdin, seatCommandDrain{gated, cancel}, io.Discard)))
 	if err != nil {
 		close(gate)
 		return nil, nil, err

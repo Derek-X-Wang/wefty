@@ -8,6 +8,129 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+      "/v1/agent/seats/{seat_id}/copy-authority": {
+        "parameters": [
+          {
+            "name": "seat_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^seat_[0-9a-f]{32}$"
+            }
+          }
+        ],
+        "post": {
+          "operationId": "authorizeSeatCopy",
+          "summary": "authorizeSeatCopy",
+          "responses": {
+            "200": {
+              "description": "Seat copy reply",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "./common.v1.json#/components/schemas/SeatCopyAuthority"
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "404": {
+              "$ref": "./common.v1.json#/components/responses/NotFound"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "500": {
+              "$ref": "./common.v1.json#/components/responses/Internal"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          },
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatCopyAuthorityInput"
+                }
+              }
+            }
+          }
+        }
+      },
+      "/v1/agent/seats/{seat_id}/copy-receipt": {
+        "parameters": [
+          {
+            "name": "seat_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^seat_[0-9a-f]{32}$"
+            }
+          }
+        ],
+        "post": {
+          "operationId": "recordSeatCopy",
+          "summary": "recordSeatCopy",
+          "responses": {
+            "200": {
+              "description": "Seat copy reply",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [],
+                    "properties": {}
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "./common.v1.json#/components/responses/BadRequest"
+            },
+            "401": {
+              "$ref": "./common.v1.json#/components/responses/Unauthorized"
+            },
+            "403": {
+              "$ref": "./common.v1.json#/components/responses/Forbidden"
+            },
+            "404": {
+              "$ref": "./common.v1.json#/components/responses/NotFound"
+            },
+            "409": {
+              "$ref": "./common.v1.json#/components/responses/Conflict"
+            },
+            "500": {
+              "$ref": "./common.v1.json#/components/responses/Internal"
+            },
+            "503": {
+              "$ref": "./common.v1.json#/components/responses/Unavailable"
+            }
+          },
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatCopyReceipt"
+                }
+              }
+            }
+          }
+        }
+      },
       "/v1/agent/seat-requests/poll": {
         "post": {
           "operationId": "pollSeatCalls",

@@ -132,6 +132,7 @@ type computerGrantAuthorizer interface {
 }
 
 type computerFrontDoorConfig struct {
+	seatCopy             http.Handler
 	authorityContext     context.Context
 	fabric               fabric.Fabric
 	authorizer           computerGrantAuthorizer
@@ -394,6 +395,18 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 		} else {
 			http.Error(writer, "Fabric identity could not be verified", http.StatusServiceUnavailable)
 		}
+		return
+	}
+	if seatCopyRoute.MatchString(request.URL.Path) {
+		if frontDoor.config.seatCopy == nil {
+			http.Error(writer, "Seat copy unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		copyContext, cancel := context.WithCancel(request.Context())
+		defer cancel()
+		stop := context.AfterFunc(frontDoor.config.authorityContext, cancel)
+		defer stop()
+		frontDoor.config.seatCopy.ServeHTTP(writer, request.WithContext(copyContext))
 		return
 	}
 	if request.URL.Path == computerControlTakePath || request.URL.Path == computerControlReleasePath {

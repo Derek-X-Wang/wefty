@@ -189,6 +189,11 @@ jobs:
             WEFTY_HELPER_SEAT_EXEC_EVIDENCE="$RUNNER_TEMP/default-computer/$ARCH-helper-seat-exec.json" \
             "$RUNNER_TEMP/helper-seat-exec.test" -test.v \
             -test.run '^TestHelperComputerSeatExecIM3$' -test.timeout 5m
+          sudo env PATH="/usr/local/bin:/usr/local/sbin:$PATH" \
+            WEFTY_SEAT_IMAGE="$WEFTY_SEAT_IMAGE" \
+            WEFTY_SEAT_CONTAINERD=/run/wefty-seat-containerd.sock \
+            "$RUNNER_TEMP/helper-seat-exec.test" -test.v \
+            -test.run '^TestHelperComputerSeatCopy$' -test.timeout 5m
       - name: Prove RM-5 through live helper memory limits
         env:
           ARCH: ${{ matrix.arch }}

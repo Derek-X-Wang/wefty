@@ -501,3 +501,20 @@ proof. An expired credential returns `seat_ended` with `Seat ended: expired`
 including after cleanup; it does not restart the idle wait. Other operations
 with a released credential return `Seat ended: released`. The retained
 log and its read cursor remain readable under either credential.
+
+### Seat file copies
+
+`seat_copy_failed` and `seat_copy_write_denied` are non-retryable typed CLI
+errors with exit 1. The former includes source, transport and disk-full
+failures. The latter identifies a local sandbox/permission, read-only
+filesystem or final-name destination-symlink refusal. Parent symlinks are
+resolved once, then the parent is pinned; `/tmp` and `/var` work on macOS.
+An existing-folder failure explains that DEST names the exact result path.
+The CLI does not retry a transfer or
+ask a privileged process to bypass its sandbox. `seat_ended` remains exit 5
+and includes the reason from the retained Seat log.
+
+Copy outcome metadata uses up to three retries within five seconds, with one
+CopyID, even after caller cancellation. A failed metadata delivery is reported
+as outcome unconfirmed. Copy-out remains `sent` until its local publication
+receipt records `completed` or `failed`; it is never assumed completed.
