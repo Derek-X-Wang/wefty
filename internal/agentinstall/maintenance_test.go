@@ -160,3 +160,67 @@ func TestMaintenancePreservationRejectsUnsafeRecords(t *testing.T) {
 		})
 	}
 }
+
+func TestRefuseMaintenanceNamesRecordedBlockers(t *testing.T) {
+	for _, scenario := range []string{"quiet", "retiring", "staged", "unfinished", "maintenance"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newFixture(t)
+			f.prepare(t, true)
+			expected := "enrolled"
+			switch scenario {
+			case "retiring":
+				f.promote(t, f.prepare(t, false))
+				f.promote(t, f.prepare(t, false))
+				expected = "2 retiring generations"
+			case "staged":
+				f.prepare(t, false)
+				expected = "1 staged candidate"
+			case "unfinished":
+				c, err := f.s.Read()
+				must(t, err)
+				root, close, err := f.s.open(false)
+				must(t, err)
+				c.PendingReceipt = strings.Repeat("a", 32)
+				must(t, writePrivate(root, catalogName, c))
+				close()
+				expected = "unfinished operation"
+			case "maintenance":
+				must(t, os.WriteFile(filepath.Join(f.s.Data, MaintenanceFile), []byte("retained pending maintenance"), 0600))
+				expected = "pending generation maintenance"
+			}
+			// The public gate is exercised with real catalog files and fake launchd.
+			err := RefuseMaintenance(f.s, "setup")
+			var refusal *MaintenanceRefusal
+			if !errors.As(err, &refusal) || !strings.Contains(err.Error(), expected) {
+				t.Fatalf("want typed %s refusal, got %v", expected, err)
+			}
+		})
+	}
+}
+
+func TestQuietMaintenanceNamesExactBlocker(t *testing.T) {
+	for _, scenario := range []string{"candidate", "operation"} {
+		t.Run(scenario, func(t *testing.T) {
+			f := newFixture(t)
+			f.prepare(t, true)
+			expected := "1 staged candidate"
+			if scenario == "candidate" {
+				f.prepare(t, false)
+			} else {
+				c, err := f.s.Read()
+				must(t, err)
+				c.PendingReceipt = strings.Repeat("b", 32)
+				root, close, err := f.s.open(false)
+				must(t, err)
+				must(t, writePrivate(root, catalogName, c))
+				close()
+				expected = "activation receipt " + c.PendingReceipt
+			}
+			_, err := f.s.CheckMaintenance(nil)
+			var refusal *MaintenanceRefusal
+			if !errors.As(err, &refusal) || !strings.Contains(err.Error(), expected) {
+				t.Fatalf("want %s, got %v", expected, err)
+			}
+		})
+	}
+}

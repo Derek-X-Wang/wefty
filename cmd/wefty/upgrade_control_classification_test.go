@@ -54,7 +54,7 @@ func TestUpgradeRollingInventoryStorageFailureKeepsCause(t *testing.T) {
 	}
 }
 
-func TestUpgradeRollingCatalogContradictionKeepsConflictExit(t *testing.T) {
+func TestUpgradeRollingCatalogContradictionIsOperational(t *testing.T) {
 	f := newRollingFixture(t)
 	op, p := classificationOperations(t, f)
 	c, err := f.install.Read()
@@ -64,7 +64,7 @@ func TestUpgradeRollingCatalogContradictionKeepsConflictExit(t *testing.T) {
 	mustRolling(t, err)
 	mustRolling(t, os.WriteFile(filepath.Join(f.install.Root(), "catalog.json"), body, 0600))
 	_, err = op.generations(t.Context(), p)
-	assertUpgradeControlCLIConflict(t, err)
+	assertUpgradeControlOperational(t, err)
 	if !strings.Contains(err.Error(), "conflicting generation primary") {
 		t.Fatal("catalog contradiction lost", err)
 	}

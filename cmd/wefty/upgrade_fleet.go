@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
-	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
@@ -276,7 +275,7 @@ func runFleetUpgrade(ctx context.Context, host setupHost, paths setupPaths, role
 		return report, err
 	}
 	defer unlock()
-	if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
+	if err := refuseGenerationMaintenance(host, paths, "upgrade"); err != nil {
 		return report, err
 	}
 	// Recheck under the same installation lock used by setup.

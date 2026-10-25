@@ -27,7 +27,7 @@ func (r *rollingUpgrade) recoverLegacyEnrollment(ctx context.Context, boot strin
 	if drain != nil && (drain.NodeID != r.receipt.NodeID || drain.Home != r.paths.home) {
 		return report, generationControlConflict("legacy recovery admission identity differs")
 	}
-	c, readErr := r.store.Read()
+	c, readErr := readUpgradeCatalog(r.store)
 	if readErr != nil {
 		if _, statErr := os.Lstat(r.store.Root()); !errors.Is(statErr, os.ErrNotExist) {
 			if statErr != nil {
@@ -119,7 +119,7 @@ func (r *rollingUpgrade) recoverLegacyEnrollment(ctx context.Context, boot strin
 		if err = r.persist("legacy_generation_loading"); err != nil {
 			return report, err
 		}
-		c, err = r.store.Read()
+		c, err = readUpgradeCatalog(r.store)
 		if err != nil {
 			return report, err
 		}
@@ -155,7 +155,7 @@ func (r *rollingUpgrade) recoverLegacyEnrollment(ctx context.Context, boot strin
 		if err != nil {
 			return report, err
 		}
-		c, err = r.store.Read()
+		c, err = readUpgradeCatalog(r.store)
 		if err != nil {
 			return report, generationControlTransportError(err)
 		}

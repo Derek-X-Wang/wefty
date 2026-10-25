@@ -320,7 +320,7 @@ func rollingWorkKind(a l1.NodeActiveAttempt) (upgradecompat.WorkKind, error) {
 }
 
 func (r *rollingUpgrade) validateInventory(ctx context.Context, in l1.NodeGenerationInventory, node l1.Node) error {
-	c, err := r.store.Read()
+	c, err := readUpgradeCatalog(r.store)
 	err = generationControlTransportError(err)
 	if err != nil {
 		return err
@@ -537,7 +537,7 @@ func (r *rollingUpgrade) activate(ctx context.Context, base launchagent.Agent, s
 	if err = r.waitReady(ctx, candidate, started); err != nil {
 		return action, err
 	}
-	boundCatalog, err := r.store.Read()
+	boundCatalog, err := readUpgradeCatalog(r.store)
 	err = generationControlTransportError(err)
 	if err != nil {
 		return action, err
@@ -633,7 +633,7 @@ func (r *rollingUpgrade) promoteReady(ctx context.Context, drain *upgradeDrainRe
 		return action, err
 	}
 	evidence := agentinstall.PromotionEvidence{ExpectedAuthorityGeneration: r.primary.AuthorityGeneration, IntentReason: drain.Reason, IntentRevision: drain.Revision, L1CatalogRevision: in.CatalogRevision, Residents: map[string][]agentinstall.ResidentAttempt{candidate.ID: {}}, ClosedGenerations: map[string]agentinstall.Binding{}, ServiceRecoveryKeys: map[string]string{}}
-	c, err := r.store.Read()
+	c, err := readUpgradeCatalog(r.store)
 	err = generationControlTransportError(err)
 	if err != nil {
 		return action, err
@@ -943,6 +943,10 @@ func requestGenerationControl(ctx context.Context, store agentinstall.Store, req
 // Envelope validation is a local fence refusal; transport/storage failures
 // keep their original errors and cannot be mistaken for an L1 gate decision.
 func generationControlTransportError(err error) error {
+	var catalogFault *upgradeCatalogFault
+	if errors.As(err, &catalogFault) {
+		return err
+	}
 	var refusal *agentinstall.ControlRequestRefusal
 	var verification *agentinstall.VerificationRefusal
 	if explicitGenerationControlRefusal(err) && (errors.As(err, &refusal) || errors.As(err, &verification)) {
@@ -985,7 +989,7 @@ func generationUpgradeControl(ctx context.Context, host setupHost, op upgradeHos
 		return in, issues[0].err
 	}
 	store := upgradeGenerationStore(host, paths, op)
-	catalog, err := store.Read()
+	catalog, err := readUpgradeCatalog(store)
 	err = generationControlTransportError(err)
 	if errors.Is(err, os.ErrNotExist) && action == "generation_inventory" {
 		if _, statErr := op.statGenerationRoot(store.Root()); statErr == nil {
@@ -1336,7 +1340,7 @@ func refuseUnsupportedRolling(ctx context.Context, host setupHost, paths setupPa
 		if err != nil {
 			return generationControlTransportError(err)
 		}
-		if _, err := upgradeGenerationStore(host, paths, op).Read(); err != nil {
+		if _, err := readUpgradeCatalog(upgradeGenerationStore(host, paths, op)); err != nil {
 			return generationControlTransportError(err)
 		}
 		bounded, cancel := context.WithTimeout(ctx, upgradeMutationBudget)

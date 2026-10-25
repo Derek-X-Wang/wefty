@@ -11,7 +11,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
-func TestUpgradeRollingRunUpgradeCatalogRefusalsKeepConflictExit(t *testing.T) {
+func TestUpgradeRollingRunUpgradeCatalogFailuresRemainOperational(t *testing.T) {
 	for _, stage := range []string{"before-plist", "after-installation"} {
 		for _, kind := range []string{"primary", "ownership"} {
 			t.Run(stage+"/"+kind, func(t *testing.T) {
@@ -46,7 +46,7 @@ func TestUpgradeRollingRunUpgradeCatalogRefusalsKeepConflictExit(t *testing.T) {
 				if !corrupted {
 					t.Fatal("did not reach the catalog-read boundary")
 				}
-				assertUpgradeControlCLIConflict(t, err)
+				assertUpgradeControlOperational(t, err)
 			})
 		}
 	}

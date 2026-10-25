@@ -296,23 +296,52 @@ func (s Store) Read() (Catalog, error) {
 	return s.read(root)
 }
 
-// RefuseMaintenance is intentionally conservative until role-aware maintenance
-// is wired: even an idle recorded cohort must not fall into legacy unload or
-// recursive purge/stale-stage deletion. Missing catalog storage means legacy.
-func RefuseMaintenance(data, command string) error {
-	if _, err := os.Lstat(filepath.Join(data, MaintenanceFile)); err == nil {
-		return fmt.Errorf("%s refuses incomplete generation maintenance; resume setup --remove or setup --role join --convert-plain", command)
+// RefusePendingMaintenance fences every upgrade route, including recovery.
+// Presence is sufficient to refuse; an unreadable intent never authorizes work.
+func (s Store) RefusePendingMaintenance(command string) error {
+	if _, err := os.Lstat(filepath.Join(s.Data, MaintenanceFile)); err == nil {
+		return &MaintenanceRefusal{Message: command + " refuses pending generation maintenance; resume `wefty setup --remove` or `wefty setup --role join --convert-plain`"}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	_, err := os.Lstat(filepath.Join(data, Directory))
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	return nil
+}
+
+// RefuseMaintenance prevents legacy setup or drain against enrolled authority.
+// Read the real catalog so the refusal names recorded blockers accurately.
+func RefuseMaintenance(s Store, command string) error {
+	if err := s.RefusePendingMaintenance(command); err != nil {
+		return err
 	}
+	if _, err := os.Lstat(s.Root()); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	c, err := s.Read()
 	if err != nil {
 		return err
 	}
-	return fmt.Errorf("%s refuses retained node agent generations: retiring generations may still hold work; finish retirement and use generation-aware maintenance", command)
+	blockers := []string{"installation is enrolled in node agent generations"}
+	retiring, staged := 0, 0
+	for _, g := range c.Generations {
+		switch g.Role {
+		case "retiring":
+			retiring++
+		case "":
+			staged++
+		}
+	}
+	if retiring > 0 {
+		blockers = append(blockers, fmt.Sprintf("%d retiring generations", retiring))
+	}
+	if staged > 0 {
+		blockers = append(blockers, fmt.Sprintf("%d staged candidates", staged))
+	}
+	if c.PendingReceipt != "" {
+		blockers = append(blockers, "unfinished operation (activation receipt "+c.PendingReceipt+")")
+	}
+	return &MaintenanceRefusal{Message: command + " refuses: " + strings.Join(blockers, "; ") + "; use `wefty upgrade` for updates, `wefty setup --remove` for removal, or `wefty setup --role join --convert-plain` for conversion"}
 }
 
 // Initialize records the first generation after the caller has drained the
