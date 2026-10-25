@@ -237,6 +237,7 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 		t.Fatalf("node-principal mux mounts=%d", agentMounts)
 	}
 	allowed := map[string]string{
+		"GET /v1/seats/{seat_id}/run-target":    "resolveSeatRun",
 		"GET /v1/seats/{seat_id}/copy-target":   "getSeatCopyTarget",
 		"POST /v1/seats/{seat_id}/copy-outcome": "reportSeatCopyOutcome",
 		"POST /v1/seats/{seat_id}/release":      "releaseSeat",

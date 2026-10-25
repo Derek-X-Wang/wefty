@@ -46,6 +46,7 @@ const (
 )
 
 type StoreOptions struct {
+	SeatCommandMaxRuntime             time.Duration
 	SeatIdleWait                      time.Duration
 	SeatWarningWait                   time.Duration
 	ComputerIdleWait                  time.Duration
@@ -79,6 +80,7 @@ type StoreOptions struct {
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
+	seatCommandMaxRuntime             time.Duration
 	seatIdleWait                      time.Duration
 	seatWarningWait                   time.Duration
 	computerIdleWait                  time.Duration
@@ -246,6 +248,12 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, err
 	}
 
+	if options.SeatCommandMaxRuntime == 0 {
+		options.SeatCommandMaxRuntime = contract.DefaultSeatCommandRuntime
+	}
+	if err := ValidateSeatCommandMaxRuntime(options.SeatCommandMaxRuntime); err != nil {
+		return nil, err
+	}
 	if options.SeatIdleWait == 0 {
 		options.SeatIdleWait = DefaultSeatIdleWait
 	}
@@ -264,7 +272,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	db.SetMaxOpenConns(16)
 	store := &Store{
-		seatIdleWait: options.SeatIdleWait, seatWarningWait: options.SeatWarningWait, computerIdleWait: options.ComputerIdleWait,
+		seatCommandMaxRuntime: options.SeatCommandMaxRuntime, seatIdleWait: options.SeatIdleWait, seatWarningWait: options.SeatWarningWait, computerIdleWait: options.ComputerIdleWait,
 		db: db, logf: log.Printf, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
@@ -1298,7 +1306,7 @@ CREATE TABLE IF NOT EXISTS service_tombstones (
 -- log_events at read time since #49, and nothing read the table (#52).
 DROP TABLE IF EXISTS job_log_jsonl;
 `
-	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema+seatCallSchema+seatLogSchema); err != nil {
+	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema+seatCallSchema+seatLogSchema+seatRunSchema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
 	}
 	if err := s.migrateSeatLife(ctx); err != nil {
@@ -2545,6 +2553,9 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, job.JobID, spec.DispatchKe
 		// it after rolling this transaction back and preserve replay semantics.
 		_ = tx.Rollback()
 		return s.readConcurrentSubmit(ctx, spec, requestHash, origin, err)
+	}
+	if err := admitSeatRun(ctx, tx, now, job, submittedByRunLedger); err != nil {
+		return Job{}, false, err
 	}
 	for _, capability := range requiredCapabilities {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO job_required_capabilities(job_id, capability) VALUES(?, ?)", job.JobID, capability); err != nil {

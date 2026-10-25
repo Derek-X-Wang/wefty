@@ -23,6 +23,9 @@ const (
 // CheckSeatLife uses the same fence as Seat admission and owner mutations.
 // Helper cleanup and memory readback remain the only way room can return.
 func (s *Store) CheckSeatLife(ctx context.Context) error {
+	if err := s.recoverSeatRunEnds(ctx); err != nil {
+		s.logSeatLifeError("command_end_recovery", err)
+	}
 	if err := func() error {
 		w, err := s.beginWriteTransaction(ctx, nil)
 		if err != nil {
@@ -309,38 +312,48 @@ func (s *Store) seatActivityHold(ctx context.Context, id, kind, key string, acti
 	}
 	defer w.rollback()
 	ctx = w.ctx
-	value, err := readSeatRequest(ctx, w.tx, id)
+	if err := s.seatActivityHoldTx(ctx, w.tx, w.at, id, kind, key, active); err != nil {
+		if errorCodeForSeatLifecycle(err) == contract.ErrorCode("seat_ended") {
+			if commitErr := w.commit(); commitErr != nil {
+				return commitErr
+			}
+		}
+		return err
+	}
+	return w.commit()
+}
+
+// All command backends share the same hold transition, also within admission.
+func (s *Store) seatActivityHoldTx(ctx context.Context, tx *sql.Tx, at time.Time, id, kind, key string, active bool) error {
+	value, err := readSeatRequest(ctx, tx, id)
 	if err != nil {
 		return err
 	}
 	if value.State != SeatLive {
 		if !active {
-			if _, err := w.tx.ExecContext(ctx, `UPDATE seat_activity_holds SET active=0 WHERE seat_id=? AND kind=? AND hold_id=?`, id, kind, key); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE seat_activity_holds SET active=0 WHERE seat_id=? AND kind=? AND hold_id=?`, id, kind, key); err != nil {
 				return err
 			}
-			return w.commit()
+			return nil
 		}
 		return protocolError(contract.ErrorCode("seat_ended"), "Seat ended: %s", value.Reason)
 	}
 	// Check expiry before a new hold can acquire authority. Release is always
 	// accepted while the old hold still protects the Seat.
 	if active {
-		if err := s.checkSeatLifeTx(ctx, w.tx, id, w.at); err != nil {
+		if err := s.checkSeatLifeTx(ctx, tx, id, at); err != nil {
 			return err
 		}
-		value, err = readSeatRequest(ctx, w.tx, id)
+		value, err = readSeatRequest(ctx, tx, id)
 		if err != nil {
 			return err
 		}
 		if value.State != SeatLive {
-			if err := w.commit(); err != nil {
-				return err
-			}
 			return protocolError(contract.ErrorCode("seat_ended"), "Seat ended: %s", value.Reason)
 		}
 	}
 	var old bool
-	err = w.tx.QueryRowContext(ctx, `SELECT active FROM seat_activity_holds WHERE seat_id=? AND kind=? AND hold_id=?`, id, kind, key).Scan(&old)
+	err = tx.QueryRowContext(ctx, `SELECT active FROM seat_activity_holds WHERE seat_id=? AND kind=? AND hold_id=?`, id, kind, key).Scan(&old)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -348,20 +361,20 @@ func (s *Store) seatActivityHold(ctx context.Context, id, kind, key string, acti
 		return protocolError(contract.ErrorConflict, "command already ended")
 	}
 	if err == nil && old == active {
-		return w.commit()
+		return nil
 	}
 	if errors.Is(err, sql.ErrNoRows) && !active && kind == "person" {
-		return w.commit()
+		return nil
 	}
-	if _, err = w.tx.ExecContext(ctx, `INSERT INTO seat_activity_holds(seat_id,kind,hold_id,active) VALUES(?,?,?,?) ON CONFLICT(seat_id,kind,hold_id) DO UPDATE SET active=excluded.active`, id, kind, key, active); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO seat_activity_holds(seat_id,kind,hold_id,active) VALUES(?,?,?,?) ON CONFLICT(seat_id,kind,hold_id) DO UPDATE SET active=excluded.active`, id, kind, key, active); err != nil {
 		return err
 	}
 	if !active {
-		if err := touchSeatActivity(ctx, w.tx, s.clock, id); err != nil {
+		if err := touchSeatActivity(ctx, tx, s.clock, id); err != nil {
 			return err
 		}
 	}
-	return w.commit()
+	return nil
 }
 
 // SeatCommandsToCancel is a durable cancellation seam for #1150. Consumers

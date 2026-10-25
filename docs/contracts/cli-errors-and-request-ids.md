@@ -518,3 +518,7 @@ Copy outcome metadata uses up to three retries within five seconds, with one
 CopyID, even after caller cancellation. A failed metadata delivery is reported
 as outcome unconfirmed. Copy-out remains `sent` until its local publication
 receipt records `completed` or `failed`; it is never assumed completed.
+
+A Seat Run cannot be replayed. `seat_run_not_replayable` is a non-retryable
+HTTP 409 / CLI exit 5 refusal from both `wefty rerun` and L3. Start a new Seat
+Run because the old Seat state is not a replayable input.

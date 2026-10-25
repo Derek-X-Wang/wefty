@@ -714,6 +714,7 @@ type DispatchHold struct {
 }
 
 type RunRecord struct {
+	SeatID        string        `json:"seat_id,omitempty"`
 	DispatchHold  *DispatchHold `json:"dispatch_hold,omitempty"`
 	SchemaVersion int           `json:"schema_version"`
 	RunID         string        `json:"run_id"`

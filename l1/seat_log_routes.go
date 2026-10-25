@@ -11,7 +11,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 )
 
-const SeatCredentialHeader = "X-Wefty-Seat-Credential"
+const SeatCredentialHeader = contract.SeatCredentialHeader
 
 func (s *Server) getSeatLogs(w http.ResponseWriter, r *http.Request) {
 	limit := DefaultLogPageLimit
