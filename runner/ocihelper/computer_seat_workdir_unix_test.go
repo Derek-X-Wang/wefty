@@ -17,7 +17,12 @@ import (
 func TestSeatCommandWorkingDirectoryWalkAsSeatUser(t *testing.T) {
 	for _, directory := range []string{"work/nested", "work/link", "work/missing", "work/nested/link"} {
 		t.Run(directory, func(t *testing.T) {
-			base, outside := t.TempDir(), t.TempDir()
+			// The wrapper's getcwd resolves macOS's /var symlink.
+			base, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			outside := t.TempDir()
 			if err := os.MkdirAll(filepath.Join(base, "work/nested"), 0700); err != nil {
 				t.Fatal(err)
 			}
@@ -39,7 +44,7 @@ func TestSeatCommandWorkingDirectoryWalkAsSeatUser(t *testing.T) {
 			if err := cmd.Run(); err != nil {
 				t.Fatalf("wrapper: %v", err)
 			}
-			err := stream.finish()
+			err = stream.finish()
 			if directory == "work/nested" {
 				if err != nil {
 					t.Fatal(err)
