@@ -527,3 +527,10 @@ Seat screen input while a person holds that Seat's Controller tenure returns
 `person_driving` with `a person is driving` (HTTP 409, CLI conflict exit 5).
 Screenshots still work. This refusal concerns only the wefty screen path;
 commands keep running. A caller may retry after the person releases control.
+
+`wefty exec --seat` refuses an invalid Seat ID, an explicit non-positive
+`--max-runtime`, or any `--node`, `--tag` or `--restartable` flag as
+`invalid_request`, exit 2, before a network call. The deadline refusal says a
+Seat command always has a limit and to use a positive `--max-runtime` for a
+longer limit. Placement refusals explain that the Seat decides the node and
+placement; restartability is refused because Seat state cannot be replayed.

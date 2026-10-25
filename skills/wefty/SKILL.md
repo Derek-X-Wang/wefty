@@ -185,6 +185,39 @@ Empty follow polls do not acknowledge; a retryable acknowledgement failure is re
 Successful JSON replies carry `unread_events` and, only when nonzero,
 `unread_events_line`; typed refusals include the hint in their message.
 
+## Run a command on a Seat
+
+```sh
+wefty exec --seat SEAT_ID -- python3 check.py
+wefty exec --seat SEAT_ID --max-runtime 2h --keep-running -- make test
+wefty exec --seat SEAT_ID --detach --json -- make test
+wefty logs RUN_ID --follow
+wefty cancel RUN_ID
+wefty results RUN_ID
+wefty inspect RUN_ID
+```
+
+Use the actual `seat_<32 hex>` ID. The command runs as the Seat's Linux user,
+in its folder, with its screen and environment. It works outside a Git
+checkout too. This path does not capture or copy your checkout; copy the files
+you need with `wefty cp`. Working-copy synchronization comes in #1152.
+The Seat decides placement, so `--node` and `--tag` are refused.
+`--restartable` is refused because Seat state cannot be replayed.
+
+Every Seat command has a deadline: one hour by default, unless the owner sets
+another cluster default. `--max-runtime D` selects a positive duration, rounded
+up to whole seconds; `--max-runtime 0` cannot turn the limit off.
+At the limit the Run fails (exit 10, no command exit code), while the Seat
+keeps its folder. The CLI says which limit it reached and the fix: run it
+again with a longer `--max-runtime`. There is no warning or extension.
+`--detach`, `--keep-running`, streaming JSON and Run commands work as for exec.
+`--detach --json` prints exactly `{"run_id":"..."}` on stdout.
+Seat command replies show unread Seat event hints on stderr, keeping command
+output and JSON intact.
+
+Never put secrets in command text: wefty stores the command as typed.
+Copy them in as files, for example `wefty cp .env SEAT_ID:.env`.
+
 ## One command with local changes: `wefty exec`
 
 Use `exec` for one build, test, or other command in your current Git checkout.

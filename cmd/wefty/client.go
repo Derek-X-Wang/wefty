@@ -534,9 +534,12 @@ func (c *apiClients) drainNode(ctx context.Context, nodeID string, observedRevis
 	return node, err
 }
 
-func (c *apiClients) submitRun(ctx context.Context, request l3.CreateRunRequest, idempotencyKey string) (acceptedOutput, error) {
+func (c *apiClients) submitRun(ctx context.Context, request l3.CreateRunRequest, idempotencyKey string, seatCredential ...string) (acceptedOutput, error) {
 	var accepted acceptedOutput
 	headers := http.Header{"Idempotency-Key": []string{idempotencyKey}}
+	if request.SeatRun != nil && len(seatCredential) > 0 {
+		headers.Set(contract.SeatCredentialHeader, seatCredential[0])
+	}
 	response, err := c.l3.doWithResponse(ctx, http.MethodPost, "/v1/runs", request, headers, &accepted.RunAccepted, http.StatusCreated, http.StatusOK)
 	accepted.IdempotentReplay = response.Get("Idempotent-Replay") == "true"
 	return accepted, err

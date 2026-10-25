@@ -98,7 +98,10 @@ func observeExecRunOutput(ctx context.Context, clients *apiClients, runID, nodeI
 }
 
 func lostExecObservation(stderr io.Writer, runID, storage string, cause error) error {
-	fmt.Fprintf(stderr, "wefty: lost observation of run %s; the run continues\nwefty: follow with `wefty logs %s --follow`; cancel with `wefty cancel %s`\nwefty: snapshot retained at %s\n", runID, runID, runID, storage)
+	fmt.Fprintf(stderr, "wefty: lost observation of run %s; the run continues\nwefty: follow with `wefty logs %s --follow`; cancel with `wefty cancel %s`\n", runID, runID, runID)
+	if storage != "" {
+		fmt.Fprintf(stderr, "wefty: snapshot retained at %s\n", storage)
+	}
 	return &unavailableError{cause: fmt.Errorf("could not observe run %s: %w", runID, cause)}
 }
 
@@ -120,6 +123,12 @@ func reportExecRun(ctx context.Context, clients *apiClients, record contract.Run
 	if errors.As(result, &unavailable) {
 		if event.infrastructureFailure {
 			fmt.Fprintf(stderr, "wefty: infrastructure failure: %s\n", event.Reason)
+		}
+		return result
+	}
+	if message := seatExecLimitMessage(record, event.Reason); message != "" {
+		if _, err := fmt.Fprintln(stderr, message); err != nil {
+			return err
 		}
 		return result
 	}
