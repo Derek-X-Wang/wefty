@@ -4,16 +4,54 @@ import fcntl
 import hashlib
 import json
 import os
+import select
 import signal
 import stat
 import sys
 import tarfile
 import time
 
+# Python runs this handler only between bytecodes in the main thread. A
+# SIGTERM caught just before a blocking read would leave that read waiting
+# (#1283). The wakeup pipe makes such a signal visible to the input select.
+WAKE, wake_write = os.pipe()
+os.set_blocking(WAKE, False)
+os.set_blocking(wake_write, False)
+signal.set_wakeup_fd(wake_write)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 COMMIT = b'\nWEFTY_COPY_COMMIT_V1\n'
 active_path = 'work'
+
+
+class Input:
+    # Reads stdin, but waits for it together with the signal wakeup pipe.
+    def __init__(self, fd):
+        self.fd = fd
+        self.data = b''
+        self.offset = 0
+
+    def read(self, size):
+        while self.offset == len(self.data):
+            ready = select.select([self.fd, WAKE], [], [])[0]
+            if WAKE in ready:
+                try:
+                    while os.read(WAKE, 512):
+                        pass
+                except BlockingIOError:
+                    pass
+                # Back in bytecode, the pending handler runs before the next wait.
+                continue
+            data = os.read(self.fd, 65536)
+            if not data:
+                return b''
+            self.data, self.offset = data, 0
+        data = self.data[self.offset:self.offset + size]
+        self.offset += len(data)
+        return data
+
+
+source_input = Input(sys.stdin.fileno())
 
 
 def parts(name):
@@ -103,7 +141,7 @@ def digest(source):
 def extract(stage):
     incoming = {}
     size = 0
-    with tarfile.open(fileobj=sys.stdin.buffer, mode='r|', bufsize=512) as archive:
+    with tarfile.open(fileobj=source_input, mode='r|', bufsize=512) as archive:
         for member in archive:
             name = member.name.rstrip('/') if member.isdir() else member.name
             components = parts(name)
@@ -142,7 +180,7 @@ def extract(stage):
             incoming[name] = record
     tail = b''
     while True:
-        data = sys.stdin.buffer.read(32768)
+        data = source_input.read(32768)
         if not data:
             break
         tail = (tail + data)[-len(COMMIT):]
