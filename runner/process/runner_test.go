@@ -290,9 +290,9 @@ func TestCancelledRunKeepsTrailingOutput(t *testing.T) {
 }
 
 // Kept trailing output must not unbound a cancelled stop. A sink write still
-// waiting when the TERM grace ends is cut off there, so Wait returns inside
-// the reap bound with the payload's real exit, and the lost write is reported
-// as incomplete log evidence rather than a reap timeout.
+// waiting when the TERM grace ends is cut off right before SIGKILL, so Wait
+// returns inside the reap bound instead of reporting a reap timeout, and the
+// lost write is reported as incomplete log evidence.
 func TestCancelledRunCutsOffAStuckSinkAtEscalation(t *testing.T) {
 	directory := t.TempDir()
 	ready, release := filepath.Join(directory, "ready"), filepath.Join(directory, "release")
@@ -300,34 +300,50 @@ func TestCancelledRunCutsOffAStuckSinkAtEscalation(t *testing.T) {
 	script := "trap 'printf \"handled\\n\"; exit 0' TERM\n: > \"$1\"\nwhile [ ! -e \"$2\" ]; do sleep 0.05; done\nexit 0\n"
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	go func() {
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			if _, err := os.Stat(ready); err == nil {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		cancel()
-	}()
+	// The handler's write arrives under a cancelled stop and waits for its
+	// context: only the escalation cut-off can release it.
+	admitted := make(chan struct{})
+	var admitOnce sync.Once
 	sink := OutputSinkFunc(func(ctx context.Context, event contract.LogEvent) error {
+		admitOnce.Do(func() { close(admitted) })
 		<-ctx.Done()
 		return ctx.Err()
 	})
-	const grace, reap = 200 * time.Millisecond, 5 * time.Second
-	started := time.Now()
-	result, err := New(Config{TerminationGraceTime: grace, ProcessReapTimeout: reap}).Run(ctx, Request{
-		AttemptID: "attempt-stuck-sink", IdlePolicy: IgnoreIdle,
-		Execution: contract.ExecutionSpec{
-			Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", script, "sh", ready, release},
-			WorkingDirectory: directory,
-		},
-	}, sink)
-	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrProcessReapTimeout) || result.ExitCode == nil || *result.ExitCode != 0 || !result.LogEvidenceIncomplete {
-		t.Fatalf("stuck-sink cancel = (%#v, %v), want exit 0 with incomplete log evidence and no reap timeout", result, err)
+	clock := newFakeClock(time.Unix(5_000, 0))
+	const grace, reap = 2 * time.Second, 5 * time.Second
+	finished := make(chan runOutcome, 1)
+	go func() {
+		result, err := New(Config{Clock: clock, TerminationGraceTime: grace, ProcessReapTimeout: reap}).Run(ctx, Request{
+			AttemptID: "attempt-stuck-sink", IdlePolicy: IgnoreIdle,
+			Execution: contract.ExecutionSpec{
+				Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", script, "sh", ready, release},
+				WorkingDirectory: directory,
+			},
+		}, sink)
+		finished <- runOutcome{result: result, err: err}
+	}()
+	waitForCondition(t, func() bool { _, err := os.Stat(ready); return err == nil }, "TERM handler installed")
+	cancel()
+	select {
+	case <-admitted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the TERM handler's write never reached the sink")
 	}
-	if elapsed := time.Since(started); elapsed >= 10*time.Second {
-		t.Fatalf("stuck-sink cancel took %s", elapsed)
+	// The grace timer is the only runner timer; escalate only once it exists.
+	clock.WaitForTimerCount(t, 1)
+	escalated := time.Now()
+	clock.Advance(grace)
+	var outcome runOutcome
+	select {
+	case outcome = <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("cancelled run did not return after escalation")
+	}
+	if elapsed := time.Since(escalated); elapsed >= reap {
+		t.Fatalf("Run returned %s after escalation, want inside the %s reap bound", elapsed, reap)
+	}
+	if !errors.Is(outcome.err, context.Canceled) || errors.Is(outcome.err, ErrProcessReapTimeout) || outcome.result.SpawnError != nil || !outcome.result.LogEvidenceIncomplete {
+		t.Fatalf("stuck-sink cancel = (%#v, %v), want a reaped payload with incomplete log evidence and no reap timeout", outcome.result, outcome.err)
 	}
 }
 
