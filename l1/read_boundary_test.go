@@ -434,6 +434,10 @@ func boundarySelectors(fset *token.FileSet, node ast.Node, site string, info *ty
 // reads, including acknowledgement reloads and live authority proofs. Set
 // equality refuses both new owners and vanished type-check results.
 var agentProtocolReadSites = map[string]bool{
+	// #1153 node-only Seat copy authority and receipts; the Seat credential,
+	// Computer and exact Attempt are checked in the snapshot.
+	"seat_copy.go:*Store.AuthorizeSeatCopy": true,
+	"seat_copy.go:*Store.RecordSeatCopy":    true,
 	// #1143 node-only preflight, selection and cleanup authority reads.
 	"seat_request_calls.go:*Store.PollSeatCalls":           true,
 	"seat_request_calls.go:*Store.AdvanceSeatCall":         true,
