@@ -2027,7 +2027,18 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			err := errors.New("Computer runtime does not support Seat copies")
 			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
+		screenRuntime, ok := runtimeAdapter.(seatScreenRuntime)
+		if !ok {
+			err := errors.New("Computer runtime does not support Seat screens")
+			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
+		}
 		result, runErr = runComputerSeats(ctx, runtimeAdapter, request, sink, controller, seatComputerServiceConfig{
+			screen: &seatScreenConfig{
+				fabric: lifecycle.dependencies.fabric, authorizer: lifecycle.dependencies.computerPolicy,
+				clock: lifecycle.dependencies.clock, runtime: screenRuntime, control: lifecycle.dependencies.client,
+				computer: claim.ComputerStorage.ComputerID, storage: claim.ComputerStorage.StorageID,
+				storageGeneration: claim.ComputerStorage.StorageGeneration, authority: controller.authority,
+			},
 			clock: lifecycle.dependencies.clock, router: lifecycle.dependencies.seatDoor, copyRuntime: copyRuntime, copyControl: lifecycle.dependencies.client,
 			publish: func(publishContext context.Context, ready bool, endpoint string) error {
 				if ready && ctx.Err() != nil {

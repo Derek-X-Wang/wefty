@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -156,7 +157,7 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if r.Header.Get(l1.SeatCredentialHeader) == "" {
+	if r.Header.Get(l1.SeatCredentialHeader) == "" && !strings.HasPrefix(strings.TrimPrefix(r.URL.Path, "/v1/seats/"+match[1]), "/person/") {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorUnauthorized, Message: "Seat credential is required"}})
@@ -164,7 +165,13 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if d.fabric != nil {
 		if _, err := d.fabric.WhoIs(r.Context(), r.RemoteAddr); err != nil {
-			http.Error(w, "Fabric identity unavailable", http.StatusUnauthorized)
+			status := http.StatusServiceUnavailable
+			message := "Fabric identity could not be verified"
+			if errors.Is(err, fabric.ErrIdentityNotFound) {
+				status = http.StatusUnauthorized
+				message = "Fabric identity could not be authenticated"
+			}
+			http.Error(w, message, status)
 			return
 		}
 	}
@@ -172,6 +179,7 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	stop := context.AfterFunc(seatCtx, cancel)
 	defer stop()
+	ctx = context.WithValue(ctx, seatAuthorityContextKey{}, seatCtx)
 	registration.handler.ServeHTTP(w, r.WithContext(ctx))
 }
 

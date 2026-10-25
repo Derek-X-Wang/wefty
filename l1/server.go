@@ -454,6 +454,8 @@ func (s *Server) routes() http.Handler {
 
 	agent := http.NewServeMux()
 	agent.HandleFunc("POST /v1/agent/jobs/{job_id}/attempts/{attempt_id}/seat-run", s.controlSeatRun)
+	agent.HandleFunc("POST /v1/agent/seats/{seat_id}/screen-authority", s.authorizeSeatScreen)
+	agent.HandleFunc("POST /v1/agent/seats/{seat_id}/screen-event", s.recordSeatScreenEvent)
 	agent.HandleFunc("POST /v1/agent/seats/{seat_id}/copy-authority", s.authorizeSeatCopy)
 	agent.HandleFunc("POST /v1/agent/seats/{seat_id}/copy-receipt", s.recordSeatCopy)
 	agent.HandleFunc("POST /v1/agent/seat-requests/poll", s.pollSeatCalls)
@@ -537,6 +539,7 @@ func (s *Server) routes() http.Handler {
 	seatLogs.HandleFunc("POST /v1/seats/{seat_id}/copy-outcome", s.reportSeatCopyOutcome)
 	seatLogs.HandleFunc("GET /v1/seats/{seat_id}/run-target", s.resolveSeatRun)
 	seatLogs.HandleFunc("GET /v1/seats/{seat_id}/copy-target", s.getSeatCopyTarget)
+	seatLogs.HandleFunc("GET /v1/seats/{seat_id}/screen-target", s.getSeatCopyTarget)
 	seatLogs.HandleFunc("GET /v1/seats/{seat_id}/logs", s.getSeatLogs)
 	seatLogs.HandleFunc("POST /v1/seats/{seat_id}/logs/read", s.markSeatLogRead)
 	seatLogs.HandleFunc("POST /v1/seats/{seat_id}/release", s.releaseSeat)

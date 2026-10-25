@@ -8,6 +8,63 @@
   "servers": [{ "url": "wefty://control-plane" }],
   "security": [{ "fabricIdentity": [] }],
   "paths": {
+    "/v1/seats/{seat_id}/screen-target": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getSeatScreenTarget",
+        "summary": "Discover the shared Seat screen front door",
+        "responses": {
+          "200": {
+            "description": "Seat copy reply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatCopyTarget"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "fabricIdentity": [],
+            "seatCredential": []
+          }
+        ],
+        "description": "Requires the live Seat credential. Returns the private Computer endpoint used for streaming POST /v1/seats/{seat_id}/copy?direction=in|out&path=PATH at the node agent. Ended credentials receive seat_ended with the reason; this read does not renew Seat activity."
+      }
+    },
     "/v1/seats/{seat_id}/run-target": {
       "parameters": [
         {
