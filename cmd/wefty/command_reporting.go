@@ -32,7 +32,8 @@ func decideCommandReport(err error) commandReport {
 
 func classifyCommandReport(err error) commandReport {
 	var maintenanceFault *maintenanceFault
-	if errors.As(err, &maintenanceFault) {
+	var catalogFault *upgradeCatalogFault
+	if errors.As(err, &maintenanceFault) || errors.As(err, &catalogFault) {
 		return commandReport{exitCode: exitFailure, err: err, errorDocument: contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Message: err.Error(), Retryable: false}}}
 	}
 	var doctor *doctorResultError

@@ -231,7 +231,7 @@ func TestQuietCatalogMaintenanceRefusesWithoutMutation(t *testing.T) {
 					c.Generations[g.ID] = g
 				case "pending":
 					c.PendingReceipt = strings.Repeat("b", 32)
-					reason = "pending"
+					reason = "activation receipt " + c.PendingReceipt
 				case "interrupted", "reboot_reconciled":
 					phase := "promotion_requested"
 					if state == "reboot_reconciled" {
@@ -626,7 +626,7 @@ func TestQuietCatalogProofRemovalRefusesBeforeMutation(t *testing.T) {
 	f.launchd.commands = nil
 	_, err = removeProofSetup(t.Context(), f.host, true)
 	var refusal *apiResponseError
-	if commandExitCode(err) != 5 || !errors.As(err, &refusal) || !strings.Contains(err.Error(), "pending") {
+	if commandExitCode(err) != 5 || !errors.As(err, &refusal) || !strings.Contains(err.Error(), "activation receipt") {
 		t.Fatalf("proof gate did not preserve typed generation refusal: %v", err)
 	}
 	if !reflect.DeepEqual(before, quietMaintenanceFiles(t, f.home)) || len(f.launchd.commands) != 0 {

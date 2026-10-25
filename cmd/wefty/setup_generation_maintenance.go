@@ -60,6 +60,29 @@ func checkGenerationMaintenance(host setupHost, paths setupPaths, kind string) (
 	}
 	return c, nil, maintenanceError(err)
 }
+
+// Catalog state is diagnostic here; it never authorizes legacy activation.
+func refuseGenerationMaintenance(host setupHost, paths setupPaths, command string) error {
+	store := upgradeGenerationStore(host, paths, upgradeOperations(host))
+	err := agentinstall.RefuseMaintenance(store, command)
+	var refusal *agentinstall.MaintenanceRefusal
+	if !errors.As(err, &refusal) {
+		return err
+	}
+	// Pending maintenance owns recovery even if a rolling receipt also remains.
+	if pending := store.RefusePendingMaintenance(command); pending != nil {
+		return maintenanceError(pending)
+	}
+	r, readErr := readUpgradeRolling(paths)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	if readErr == nil && r.Phase != "complete" && r.Phase != "rolled_back" && r.Phase != "reboot_reconciled" {
+		return maintenanceError(&agentinstall.MaintenanceRefusal{Message: refusal.Message + "; unfinished operation " + r.OperationID + " at " + r.Phase})
+	}
+	return maintenanceError(err)
+}
+
 func maintenanceError(err error) error {
 	var refusal *agentinstall.MaintenanceRefusal
 	if errors.As(err, &refusal) {

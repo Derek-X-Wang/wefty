@@ -17,7 +17,6 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
-	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
 	"github.com/Derek-X-Wang/wefty/internal/fleetjoin"
@@ -357,7 +356,7 @@ func runFleetSetup(ctx context.Context, host setupHost, request setupRequest, pa
 			return report, err
 		}
 		defer unlock()
-		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+		if err := refuseGenerationMaintenance(host, paths, "setup"); err != nil {
 			return report, err
 		}
 		request.lockHeld = true

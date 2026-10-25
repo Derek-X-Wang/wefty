@@ -26,7 +26,7 @@ func prepareFurtherRolling(ctx context.Context, host setupHost, op upgradeHost, 
 		return nil, err
 	}
 	store := upgradeGenerationStore(host, paths, op)
-	c, err := store.Read()
+	c, err := readUpgradeCatalog(store)
 	if err != nil {
 		return nil, generationControlTransportError(err)
 	}
