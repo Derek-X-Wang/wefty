@@ -31,6 +31,7 @@ type NodeGenerationAttempt struct {
 	JobID              string                 `json:"job_id"`
 	AttemptID          string                 `json:"attempt_id"`
 	RunID              string                 `json:"run_id,omitempty"`
+	JobOutcome         contract.JobOutcome    `json:"job_outcome,omitempty"`
 	State              *contract.AttemptState `json:"state"`
 	LastRenewedAt      *time.Time             `json:"last_renewed_at"`
 	LeaseExpiresAt     *time.Time             `json:"lease_expires_at"`
@@ -72,7 +73,7 @@ func readNodeGenerationObservations(ctx context.Context, q queryer, nodeID strin
 
 func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID string, resident ResidentAttempt) (NodeGenerationAttempt, error) {
 	a := NodeGenerationAttempt{JobID: resident.JobID, AttemptID: resident.AttemptID}
-	rows, err := q.QueryContext(ctx, `SELECT a.state,a.last_renewal_ns,a.lease_expires_ns,COALESCE(a.interruption_reason,''),j.spec_json FROM attempts a JOIN jobs j ON j.job_id=a.job_id WHERE a.attempt_id=? AND a.job_id=? AND a.node_id=?`, resident.AttemptID, resident.JobID, nodeID)
+	rows, err := q.QueryContext(ctx, `SELECT a.state,a.last_renewal_ns,a.lease_expires_ns,COALESCE(a.interruption_reason,''),j.spec_json,j.outcome FROM attempts a JOIN jobs j ON j.job_id=a.job_id WHERE a.attempt_id=? AND a.job_id=? AND a.node_id=?`, resident.AttemptID, resident.JobID, nodeID)
 	if err != nil {
 		return a, err
 	}
@@ -88,7 +89,7 @@ func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID str
 	var renewal sql.NullInt64
 	var expiry int64
 	var specJSON []byte
-	scanErr := rows.Scan(&state, &renewal, &expiry, &a.InterruptionReason, &specJSON)
+	scanErr := rows.Scan(&state, &renewal, &expiry, &a.InterruptionReason, &specJSON, &a.JobOutcome)
 	// Database iteration failures invalidate the snapshot; conversion failures
 	// describe this one retained record and preserve its frozen identity.
 	if err := rows.Err(); err != nil {
