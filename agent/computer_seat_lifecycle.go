@@ -29,6 +29,14 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 	if config.clock == nil {
 		config.clock = systemClock{}
 	}
+	var nextFailureLog time.Time
+	logFailure := func(err error) {
+		now := config.clock.Now()
+		if controller.logf != nil && (nextFailureLog.IsZero() || !now.Before(nextFailureLog)) {
+			controller.logf("Seat front-door publication failed computer=%q error=%v", controller.computerID, err)
+			nextFailureLog = now.Add(time.Minute)
+		}
+	}
 	seatCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	mux := http.NewServeMux()
@@ -64,7 +72,7 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 				publicationAttempted = true
 				startupErr = retrySeatPublication(seatCtx, config.clock, func(callCtx context.Context) error {
 					return registration.publish(callCtx, true, config.router.endpoint, config.publish)
-				})
+				}, logFailure)
 				if startupErr != nil {
 					cancel()
 					return
@@ -82,7 +90,7 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 		return result.Outcome, errors.Join(runErr, startupErr)
 	}
 	withdrawCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), DefaultPublicationRecoveryWindow)
-	withdrawErr := retrySeatPublication(withdrawCtx, config.clock, func(callCtx context.Context) error { return registration.publish(callCtx, false, "", config.publish) })
+	withdrawErr := retrySeatPublication(withdrawCtx, config.clock, func(callCtx context.Context) error { return registration.publish(callCtx, false, "", config.publish) }, logFailure)
 	if errors.Is(withdrawErr, errStaleSeatPublication) {
 		withdrawErr = nil
 	}
@@ -90,7 +98,7 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 	return result.Outcome, errors.Join(runErr, startupErr, withdrawErr)
 }
 
-func retrySeatPublication(ctx context.Context, clock Clock, send func(context.Context) error) error {
+func retrySeatPublication(ctx context.Context, clock Clock, send func(context.Context) error, logFailure func(error)) error {
 	delay := DefaultPublicationRetryInterval
 	for {
 		if err := ctx.Err(); err != nil {
@@ -102,6 +110,7 @@ func retrySeatPublication(ctx context.Context, clock Clock, send func(context.Co
 		if err == nil {
 			return nil
 		}
+		logFailure(err)
 		var protocol *ProtocolError
 		if errors.Is(err, errStaleSeatPublication) || classifyAgentProtocolError(err).destination == errorDestinationAttemptAuthority || errors.As(err, &protocol) && protocol.StatusCode >= 400 && protocol.StatusCode < 500 && !protocol.APIError.Retryable {
 			return err

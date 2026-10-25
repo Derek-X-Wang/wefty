@@ -67,6 +67,8 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 			return
 		}
 		start := l1.SeatCopyReceipt{SeatCopyAuthorityInput: input, CopyID: copyID, Direction: direction, Path: path, Outcome: "sending"}
+		// Bound the local lease from request issuance, never a late reply.
+		leaseIssuedAt := clock.Now()
 		if err := recordSeatCopyReceipt(r.Context(), control, match[1], start); err != nil {
 			// The start may have committed before its acknowledgement failed.
 			// Close that operation and release any hold without moving payload.
@@ -89,7 +91,7 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 		renewalDone := make(chan struct{})
 		go func() {
 			defer close(renewalDone)
-			renewSeatCopyLease(copyCtx, control, match[1], start, clock, cancelCopy)
+			renewSeatCopyLease(copyCtx, control, match[1], start, clock, cancelCopy, leaseIssuedAt)
 		}()
 		// HTTP/1 must permit response chunks while upload still streams. HTTP/2
 		// already has this behavior. There is no application-wide body limit.
@@ -181,10 +183,17 @@ func recordSeatCopyReceiptWithClock(ctx context.Context, control seatCopyControl
 	return err
 }
 
-// A Seat end rejects renewal and cancels even a blocked transfer. Losing L1
-// also stops the transfer rather than continuing beyond an unconfirmed lease.
-func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string, start l1.SeatCopyReceipt, clock Clock, cancel context.CancelFunc) {
-	timer := clock.NewTimer(contract.SeatCopyHoldRenewal)
+const seatCopyLeaseSafetyMargin = 5 * time.Second
+const seatCopyRenewalRequestBudget = 5 * time.Second
+
+// Transient outages consume the last acknowledged lease's remaining budget.
+// Terminal authority refusals stop immediately. A failed/ambiguous receipt
+// never extends the local deadline, even if L1 might have committed it.
+func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string, start l1.SeatCopyReceipt, clock Clock, cancel context.CancelFunc, issuedAt time.Time) {
+	safeUntil := issuedAt.Add(contract.SeatCopyHoldLease - seatCopyLeaseSafetyMargin)
+	next := issuedAt.Add(contract.SeatCopyHoldRenewal)
+	delay := 100 * time.Millisecond
+	timer := clock.NewTimer(max(0, next.Sub(clock.Now())))
 	defer stopTimer(timer)
 	for {
 		select {
@@ -192,13 +201,36 @@ func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string,
 			return
 		case <-timer.C():
 		}
-		renewCtx, stop := context.WithTimeout(ctx, 5*time.Second)
-		err := control.RecordSeatCopy(renewCtx, id, start)
-		stop()
-		if err != nil {
+		remaining := safeUntil.Sub(clock.Now())
+		if remaining <= 0 {
 			cancel()
 			return
 		}
-		timer.Reset(contract.SeatCopyHoldRenewal)
+		issuedAt = clock.Now()
+		renewCtx, stop := context.WithTimeout(ctx, min(seatCopyRenewalRequestBudget, remaining))
+		err := control.RecordSeatCopy(renewCtx, id, start)
+		stop()
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			safeUntil = issuedAt.Add(contract.SeatCopyHoldLease - seatCopyLeaseSafetyMargin)
+			next = issuedAt.Add(contract.SeatCopyHoldRenewal)
+			delay = 100 * time.Millisecond
+		} else {
+			var protocol *ProtocolError
+			if classifyAgentProtocolError(err).destination == errorDestinationAttemptAuthority || errors.As(err, &protocol) && (protocol.APIError.Code == "seat_ended" || protocol.StatusCode >= 400 && protocol.StatusCode < 500 && !protocol.APIError.Retryable) {
+				cancel()
+				return
+			}
+			next = clock.Now().Add(delay)
+			delay = min(delay*2, time.Second)
+		}
+		remaining = safeUntil.Sub(clock.Now())
+		if remaining <= 0 {
+			cancel()
+			return
+		}
+		timer.Reset(min(max(0, next.Sub(clock.Now())), remaining))
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/bootclock"
 	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 )
@@ -101,24 +100,6 @@ func (s *Store) migrateSeatLife(ctx context.Context) error {
  );`)
 	if err != nil {
 		return err
-	}
-	// Upgrade the earlier unbounded copy command holds exactly once. They
-	// receive one bounded lease; command consumers must never see copy IDs.
-	var legacy bool
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM seat_activity_holds WHERE kind='command' AND substr(hold_id,1,5)='copy:')`).Scan(&legacy); err != nil {
-		return err
-	}
-	if legacy {
-		boot, ns, err := seatTime(s.clock)
-		if err != nil {
-			return err
-		}
-		if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO seat_copy_holds(seat_id,copy_id,attempt_id,boot_id,lease_until_ns) SELECT h.seat_id,substr(h.hold_id,6),i.first_attempt_id,?,? FROM seat_activity_holds h JOIN computer_seat_identities i ON i.seat_id=h.seat_id JOIN seat_approvals a ON a.seat_id=h.seat_id WHERE h.kind='command' AND substr(h.hold_id,1,5)='copy:' AND h.active=1 AND i.first_attempt_id IS NOT NULL AND a.lifecycle_state='live'`, boot, ns+int64(contract.SeatCopyHoldLease)); err != nil {
-			return err
-		}
-		if _, err := s.db.ExecContext(ctx, `DELETE FROM seat_activity_holds WHERE kind='command' AND substr(hold_id,1,5)='copy:'`); err != nil {
-			return err
-		}
 	}
 	if err := recoverSeatApprovalClocks(ctx, s.db, s.clock, s.logf); err != nil {
 		s.logSeatLifeError("approval_clock_recovery", err)

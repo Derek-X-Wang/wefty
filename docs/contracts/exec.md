@@ -569,12 +569,17 @@ preserves the deadline. A missing final receipt releases the hold at that
 deadline; the idle wait starts there. Successful terminal delivery releases it
 and starts the idle wait at completion. Seat or Attempt termination clears
 copy holds. Removing a Seat from the wanted list cancels its in-flight copies;
-a rejected renewal also cancels the transfer. A renewal failure stops the copy
-rather than continuing under an unconfirmed lease. Delayed sending receipts
-cannot resurrect a terminal copy. Publication retries transient errors with
+a terminal renewal refusal also cancels the transfer. Other renewal errors
+retry with backoff (100 ms, doubling to a one-second cap) within the last
+confirmed lease. The local deadline starts when that receipt was issued,
+not when its reply arrived. Each request is bounded by five seconds and the
+remaining budget. Without a successful renewal the node cancels five seconds
+before that lease expires. Ambiguous failures never extend the local budget.
+Delayed sending receipts cannot resurrect a terminal copy. Publication retries transient errors with
 backoff until the Attempt ends; fencing stops startup. Cleanup retries
 withdrawal within ten seconds, and stale registrations cannot withdraw their
-replacement.
+replacement. Publication failures log the Computer and error on the first
+failure, then at most once per minute across startup and withdrawal.
 
 The node response streams bounded NDJSON `SeatCopyStreamEvent` objects: `data`
 contains archive bytes; a final `size_bytes` means node completion (copy-out

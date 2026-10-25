@@ -234,8 +234,11 @@ by Seat and node-owned CopyID and bound to its Attempt (cascade deletion).
 It is not a command and never appears in `SeatCommandsToCancel`. Repeated
 sending receipts renew a 60-second boot-relative lease every 20 seconds,
 without adding events or resetting the call's idle origin. The node stops a
-copy when renewal fails. A terminal receipt releases the hold and resets the
-idle origin. Without a terminal receipt, L1 treats the lease deadline as the
+copy immediately on a terminal authority refusal. Transient renewal errors
+retry with backoff within the last confirmed lease, with a five-second
+safety margin. The deadline is measured from request issuance; ambiguous
+failures do not extend it. If retries exhaust that budget the copy stops.
+A terminal receipt releases the hold and resets the idle origin. Without a terminal receipt, L1 treats the lease deadline as the
 release time; the Seat can then expire after its normal idle wait. Same-boot
 L1 restarts preserve leases. A different boot drops old lease authority and
 starts the ordinary new-boot idle wait. Seat or Attempt ending clears copy

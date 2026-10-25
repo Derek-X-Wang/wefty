@@ -179,29 +179,3 @@ func TestSeatCopyAttemptEndClearsCopyHolds(t *testing.T) {
 		t.Fatalf("ended Attempt retained copy holds: %d %v", n, err)
 	}
 }
-
-func TestSeatCopyUpgradeBoundsLegacyCommandHold(t *testing.T) {
-	f, id, _, auth := liveSeatForCopy(t)
-	if _, err := f.store.db.Exec(`INSERT INTO seat_activity_holds(seat_id,kind,hold_id,active) VALUES(?,'command','copy:legacy',1)`, id); err != nil {
-		t.Fatal(err)
-	}
-	f.reopen(t)
-	var n int
-	if err := f.store.db.QueryRow(`SELECT COUNT(*) FROM seat_copy_holds WHERE seat_id=? AND attempt_id=?`, id, auth.AttemptID).Scan(&n); err != nil || n != 1 {
-		t.Fatalf("legacy hold was not leased: %d %v", n, err)
-	}
-	if err := f.store.db.QueryRow(`SELECT COUNT(*) FROM seat_activity_holds WHERE seat_id=? AND kind='command'`, id).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("legacy copy still a command: %d %v", n, err)
-	}
-	// Opening again must not extend the recovered lease.
-	f.clock.Advance(30 * time.Second)
-	f.reopen(t)
-	f.clock.Advance(30*time.Minute + 30*time.Second)
-	if err := f.store.CheckSeatLife(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	v, err := f.store.GetSeatRequest(t.Context(), id)
-	if err != nil || v.State != SeatEnding {
-		t.Fatalf("restart extended migrated hold: %+v %v", v, err)
-	}
-}

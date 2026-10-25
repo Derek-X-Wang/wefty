@@ -319,3 +319,163 @@ func TestSeatCopyRenewsLeaseAndCancelsWhenSeatEnds(t *testing.T) {
 		t.Fatalf("ended Seat left transfer running: %s", response.Body.String())
 	}
 }
+
+// Observe scheduling without sleeping through lease or retry intervals.
+type seatLeaseTestClock struct {
+	*manualClock
+	scheduled chan time.Duration
+}
+type seatLeaseTestTimer struct {
+	Timer
+	scheduled chan time.Duration
+}
+
+func (c *seatLeaseTestClock) NewTimer(d time.Duration) Timer {
+	timer := &seatLeaseTestTimer{Timer: c.manualClock.NewTimer(d), scheduled: c.scheduled}
+	c.scheduled <- d
+	return timer
+}
+func (t *seatLeaseTestTimer) Reset(d time.Duration) bool {
+	active := t.Timer.Reset(d)
+	t.scheduled <- d
+	return active
+}
+func awaitSeatLeaseSchedule(t *testing.T, c *seatLeaseTestClock, done <-chan struct{}) time.Duration {
+	t.Helper()
+	select {
+	case d := <-c.scheduled:
+		return d
+	case <-done:
+		t.Fatal("copy stopped before lease retry")
+	case <-time.After(5 * time.Second):
+		t.Fatal("lease scheduling did not progress")
+	}
+	return 0
+}
+
+type retryLeaseCopyControl struct {
+	copyControlFixture
+	failures []error
+	always   error
+	calls    int
+	attempts chan error
+}
+
+func (c *retryLeaseCopyControl) RecordSeatCopy(ctx context.Context, id string, r l1.SeatCopyReceipt) error {
+	c.receipts = append(c.receipts, r)
+	if r.Outcome != "sending" {
+		return nil
+	}
+	c.calls++
+	if c.calls == 1 {
+		return nil
+	} // pre-stream receipt
+	err := c.always
+	if c.calls-2 < len(c.failures) {
+		err = c.failures[c.calls-2]
+	}
+	c.attempts <- err
+	return err
+}
+func startSeatLeaseTestCopy(t *testing.T, control *retryLeaseCopyControl) (*seatLeaseTestClock, chan struct{}, <-chan struct{}, *httptest.ResponseRecorder) {
+	t.Helper()
+	clock := &seatLeaseTestClock{manualClock: newManualClock(time.Unix(0, 0)), scheduled: make(chan time.Duration, 100)}
+	finish, done := make(chan struct{}), make(chan struct{})
+	runtime := copyRuntimeFunc(func(ctx context.Context, _ ocihelper.CopyComputerSeatRequest, _ io.Reader, _ func([]byte) error) (int64, error) {
+		select {
+		case <-finish:
+			return 7, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	})
+	handler := newSeatCopyHandlerWithClock(runtime, control, workloadrunner.AttemptAuthority{}, "computer", clock)
+	req := httptest.NewRequest("POST", "/v1/seats/seat_00000000000000000000000000000001/copy?direction=out&path=file", nil).WithContext(t.Context())
+	req.Header.Set(l1.SeatCredentialHeader, "secret")
+	response := httptest.NewRecorder()
+	go func() { defer close(done); handler.ServeHTTP(response, req) }()
+	if d := awaitSeatLeaseSchedule(t, clock, done); d != contract.SeatCopyHoldRenewal {
+		t.Fatalf("first renewal=%v", d)
+	}
+	clock.Advance(contract.SeatCopyHoldRenewal)
+	return clock, finish, done, response
+}
+func awaitSeatLeaseAttempt(t *testing.T, c *retryLeaseCopyControl) error {
+	t.Helper()
+	select {
+	case err := <-c.attempts:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("no renewal attempt")
+	}
+	return nil
+}
+func TestSeatCopyLeaseRetriesBriefL1Outage(t *testing.T) {
+	unavailable := &ProtocolError{StatusCode: 503, APIError: contract.APIError{Code: contract.ErrorUnavailable, Message: "L1 restarting"}}
+	control := &retryLeaseCopyControl{failures: []error{unavailable, unavailable}, attempts: make(chan error, 100)}
+	clock, finish, done, response := startSeatLeaseTestCopy(t, control)
+	for _, delay := range []time.Duration{100 * time.Millisecond, 200 * time.Millisecond} {
+		if err := awaitSeatLeaseAttempt(t, control); err == nil {
+			t.Fatal("outage did not reach renewal")
+		}
+		if d := awaitSeatLeaseSchedule(t, clock, done); d != delay {
+			t.Fatalf("retry delay=%v want %v", d, delay)
+		}
+		clock.Advance(delay)
+	}
+	if err := awaitSeatLeaseAttempt(t, control); err != nil {
+		t.Fatal(err)
+	}
+	if d := awaitSeatLeaseSchedule(t, clock, done); d != contract.SeatCopyHoldRenewal {
+		t.Fatalf("renewal cadence=%v", d)
+	}
+	close(finish)
+	awaitSeatTestSignal(t, done)
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"size_bytes":7`)) || bytes.Contains(response.Body.Bytes(), []byte(`"error"`)) {
+		t.Fatalf("restart aborted copy: %s", response.Body.String())
+	}
+	for _, r := range control.receipts {
+		if r.CopyID != control.receipts[0].CopyID {
+			t.Fatal("retry changed copy ID")
+		}
+	}
+}
+func TestSeatCopyLeaseTerminalRefusalCancelsImmediately(t *testing.T) {
+	for _, api := range []struct {
+		status    int
+		code      contract.ErrorCode
+		retryable bool
+	}{
+		{409, "seat_ended", true}, {409, contract.ErrorConflict, false}, {403, contract.ErrorForbidden, false}, {409, contract.ErrorLeaseExpired, true},
+	} {
+		t.Run(string(api.code), func(t *testing.T) {
+			control := &retryLeaseCopyControl{always: &ProtocolError{StatusCode: api.status, APIError: contract.APIError{Code: api.code, Retryable: api.retryable}}, attempts: make(chan error, 100)}
+			clock, _, done, response := startSeatLeaseTestCopy(t, control)
+			_ = awaitSeatLeaseAttempt(t, control)
+			awaitSeatTestSignal(t, done)
+			if !clock.Now().Equal(time.Unix(0, 0).Add(contract.SeatCopyHoldRenewal)) || control.calls != 2 {
+				t.Fatalf("terminal refusal retried: calls=%d at=%v", control.calls, clock.Now())
+			}
+			if !bytes.Contains(response.Body.Bytes(), []byte(`"error"`)) {
+				t.Fatalf("copy succeeded after refusal: %s", response.Body.String())
+			}
+		})
+	}
+}
+func TestSeatCopyLeaseOutageCancelsBeforeDeadline(t *testing.T) {
+	control := &retryLeaseCopyControl{always: &ProtocolError{StatusCode: 503, APIError: contract.APIError{Code: contract.ErrorUnavailable}}, attempts: make(chan error, 100)}
+	clock, _, done, response := startSeatLeaseTestCopy(t, control)
+	safeUntil := time.Unix(0, 0).Add(contract.SeatCopyHoldLease - 5*time.Second)
+	for {
+		_ = awaitSeatLeaseAttempt(t, control)
+		d := awaitSeatLeaseSchedule(t, clock, done)
+		clock.Advance(d)
+		if !clock.Now().Before(safeUntil) {
+			break
+		}
+	}
+	awaitSeatTestSignal(t, done)
+	if !clock.Now().Equal(safeUntil) || !bytes.Contains(response.Body.Bytes(), []byte(`"error"`)) {
+		t.Fatalf("copy exceeded safe lease budget at %v: %s", clock.Now(), response.Body.String())
+	}
+}

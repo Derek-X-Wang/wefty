@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -468,5 +469,88 @@ func TestSeatFrontDoorListenFailureKeepsNodeSessionRunning(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("listener failure not logged")
+	}
+}
+
+func TestSeatFrontDoorPublicationFailuresAreLoggedWithRateLimit(t *testing.T) {
+	c, _, helper := newSeatTestController()
+	clock := &seatLeaseTestClock{manualClock: newManualClock(time.Unix(0, 0)), scheduled: make(chan time.Duration, 100)}
+	logs := make(chan string, 10)
+	c.logf = func(format string, args ...any) { logs <- fmt.Sprintf(format, args...) }
+	observed := make(chan struct{}, 1)
+	c.afterStep = func() {
+		select {
+		case observed <- struct{}{}:
+		default:
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan struct{})
+	var recovered atomic.Bool
+	runtime := &seatLifecycleRuntime{seatTestRuntime: helper, run: func(ctx context.Context, r workloadrunner.Request) (workloadrunner.Result, error) {
+		r.Started()
+		select {
+		case <-observed:
+		case <-ctx.Done():
+		}
+		return workloadrunner.Result{}, nil
+	}}
+	result := make(chan error, 1)
+	go func() {
+		defer close(done)
+		_, err := runComputerSeats(ctx, runtime, workloadrunner.Request{}, nil, c, seatComputerServiceConfig{
+			router: newSeatFrontDoor(nil), copyRuntime: copyRuntimeFixture{}, copyControl: &copyControlFixture{}, clock: clock,
+			publish: func(_ context.Context, ready bool, _ string) error {
+				if !ready || recovered.Load() {
+					return nil
+				}
+				return &ProtocolError{StatusCode: 503, APIError: contract.APIError{Code: contract.ErrorUnavailable, Message: "injected publication outage"}}
+			},
+		})
+		result <- err
+	}()
+	defer func() { cancel(); awaitSeatTestSignal(t, done) }()
+	for {
+		d := awaitSeatLeaseSchedule(t, clock, done)
+		// Scheduling happens after failure handling, so the log must already exist.
+		if clock.Now().Equal(time.Unix(0, 0)) {
+			select {
+			case line := <-logs:
+				if !strings.Contains(line, c.computerID) || !strings.Contains(line, "injected publication outage") {
+					t.Fatalf("publication log=%q", line)
+				}
+			default:
+				t.Fatal("first publication failure was silent")
+			}
+		} else if clock.Now().Sub(time.Unix(0, 0)) >= time.Minute {
+			select {
+			case line := <-logs:
+				if !strings.Contains(line, c.computerID) {
+					t.Fatalf("publication log=%q", line)
+				}
+			default:
+				t.Fatal("ongoing publication outage was silent")
+			}
+			recovered.Store(true)
+			clock.Advance(d)
+			break
+		} else {
+			select {
+			case line := <-logs:
+				t.Fatalf("publication retry flooded logs: %s", line)
+			default:
+			}
+		}
+		clock.Advance(d)
+	}
+	awaitSeatTestSignal(t, done)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case line := <-logs:
+		t.Fatalf("unexpected extra log: %s", line)
+	default:
 	}
 }
