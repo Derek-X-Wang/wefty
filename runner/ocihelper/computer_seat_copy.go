@@ -13,6 +13,10 @@ import (
 const MethodCopyComputerSeat Method = "CopyComputerSeat"
 const SeatCopyChunkBytes = 32 << 10
 
+// seatCopyReplyGrace bounds the wait for the helper's reply after an upload
+// frame write fails. A reply that is already buffered is read at once.
+var seatCopyReplyGrace = defaultRequestTimeout
+
 type CopyComputerSeatRequest struct {
 	Authority  AttemptAuthority `json:"authority"`
 	Generation uint64           `json:"generation"`
@@ -93,8 +97,13 @@ func (s *Session) CopyComputerSeat(ctx context.Context, r CopyComputerSeatReques
 			// A failed frame write usually means the helper already answered
 			// and closed, for example with a stale-generation refusal. A full
 			// close here would discard that typed reply before the read loop
-			// sees it (#1279). Half-close so the helper still sees EOF.
+			// sees it (#1279). Half-close so a live helper sees EOF. Do not
+			// fall back to a full close when the half-close fails: darwin
+			// refuses shutdown once the peer has closed, yet the reply is
+			// still buffered. Bound the read loop instead, so it never waits
+			// on a helper that cannot see the end of input.
 			_ = closeWrite(conn)
+			_ = conn.SetReadDeadline(time.Now().Add(seatCopyReplyGrace))
 		}
 		done <- sendErr
 	}()

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,10 +70,12 @@ func TestSeatCopyStdinWrapperRejectsChangedTemplate(t *testing.T) {
 	}
 }
 
-// gatedCopyConn holds every read after the first reply frame until a frame
-// write fails or the connection closes. That forces the losing order from
-// #1279: the helper refuses and closes, the client's upload write fails, and
-// only then does the read loop look for the typed refusal.
+// gatedCopyConn holds every read after the first reply frame until the
+// client has finished a half-close or a full close. That forces the losing
+// order from #1279: the helper refuses and closes, the client's upload write
+// fails, the client reacts, and only then does the read loop look for the
+// typed refusal. The gate opens only after the inner close returns, so a full
+// close always wins against the read.
 type gatedCopyConn struct {
 	net.Conn
 	read        []byte
@@ -82,13 +85,17 @@ type gatedCopyConn struct {
 	writeFailed atomic.Bool
 }
 
+// seatCopyGateHangGuard only stops a broken test from hanging the package. The
+// gate normally opens within milliseconds, so CI load cannot reach it.
+const seatCopyGateHangGuard = 2 * time.Minute
+
 func (c *gatedCopyConn) open() { c.once.Do(func() { close(c.release) }) }
 func (c *gatedCopyConn) Read(p []byte) (int, error) {
 	if c.armed {
 		select {
 		case <-c.release:
-		case <-time.After(10 * time.Second):
-			return 0, errors.New("test gate: no write failure or close")
+		case <-time.After(seatCopyGateHangGuard):
+			return 0, errors.New("test gate: the client never closed or half-closed")
 		}
 		return c.Conn.Read(p)
 	}
@@ -103,12 +110,15 @@ func (c *gatedCopyConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	if err != nil {
 		c.writeFailed.Store(true)
-		c.open()
 	}
 	return n, err
 }
-func (c *gatedCopyConn) Close() error { c.open(); return c.Conn.Close() }
+func (c *gatedCopyConn) Close() error {
+	defer c.open()
+	return c.Conn.Close()
+}
 func (c *gatedCopyConn) CloseWrite() error {
+	defer c.open()
 	return c.Conn.(interface{ CloseWrite() error }).CloseWrite()
 }
 
@@ -143,5 +153,56 @@ func TestSeatCopyRefusalSurvivesFailedUploadWrite(t *testing.T) {
 	var rpc *RPCError
 	if !errors.As(err, &rpc) || rpc.Code != CodeSeatOperationRefused || rpc.Detail != "generation_mismatch" {
 		t.Fatalf("stale generation after failed upload write: %v", err)
+	}
+}
+
+// brokenUploadConn fails every write after the first reply frame and cannot
+// half-close, while the helper stays alive waiting for upload input.
+type brokenUploadConn struct {
+	net.Conn
+	read  []byte
+	armed bool
+}
+
+func (c *brokenUploadConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if !c.armed {
+		c.read = append(c.read, p[:n]...)
+		c.armed = len(c.read) >= 4 && len(c.read) >= 4+int(binary.BigEndian.Uint32(c.read[:4]))
+	}
+	return n, err
+}
+func (c *brokenUploadConn) Write(p []byte) (int, error) {
+	if c.armed {
+		return 0, errors.New("injected upload write failure")
+	}
+	return c.Conn.Write(p)
+}
+func (c *brokenUploadConn) CloseWrite() error { return errors.New("injected: no half-close") }
+
+func TestSeatCopyFailedUploadWriteWithoutHalfCloseDoesNotHang(t *testing.T) {
+	grace := seatCopyReplyGrace
+	seatCopyReplyGrace = 100 * time.Millisecond
+	t.Cleanup(func() { seatCopyReplyGrace = grace })
+	session, e, authority := seatExecSession(t)
+	e.seats.entries[1].ready = true
+	e.seats.entries[1].readyGeneration = 1
+	dial := session.client.Dial
+	session.client.Dial = func(ctx context.Context) (net.Conn, error) {
+		conn, err := dial(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &brokenUploadConn{Conn: conn}, nil
+	}
+	// The context is only a hang guard. The helper never sees the end of
+	// input, so only the client's reply grace may end this copy. Without the
+	// grace, the copy ends later through a helper-side bound (EOF) instead.
+	ctx, cancel := context.WithTimeout(t.Context(), seatCopyGateHangGuard)
+	defer cancel()
+	request := CopyComputerSeatRequest{Authority: authority, Generation: 1, Place: 1, Direction: "in", Path: "report"}
+	_, err := session.CopyComputerSeat(ctx, request, endlessCopyInput{}, nil)
+	if !errors.Is(err, os.ErrDeadlineExceeded) || ctx.Err() != nil {
+		t.Fatalf("copy with a broken upload: err=%v ctx=%v", err, ctx.Err())
 	}
 }
