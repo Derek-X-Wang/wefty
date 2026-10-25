@@ -178,3 +178,42 @@ func TestSyncRequestsOnlyOnePixel(t *testing.T) {
 		t.Fatalf("sync requested more than one pixel: %x", w.written.Bytes())
 	}
 }
+
+func TestSyncLargerUpdatesPreserveFrameAndScreenBounds(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		width, height uint16
+	}{{"tile", 64, 64}, {"full screen", 1280, 800}} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := handshake("008", 1280, 800, 1)
+			// The first rectangle does not cover the requested pixel. The next
+			// covers it and extends beyond the request; all rectangles must drain.
+			b = append(b, update(
+				rectangle(64, 64, 1, 1, 0, 0, 0, 255, 0),
+				rectangle(0, 0, tc.width, tc.height, 0, bytes.Repeat([]byte{0, 255, 0, 0}, int(tc.width)*int(tc.height))...),
+				rectangle(100, 100, 1, 1, 0, 0, 0, 255, 0),
+			)...)
+			b = append(b, update(rectangle(0, 0, 1280, 800, 0, bytes.Repeat([]byte{255, 0, 0, 0}, 1280*800)...))...)
+			// Enlarged replies are permitted only within ServerInit's dimensions.
+			b = append(b, update(rectangle(0, 0, 1, 1, 0, 0, 0, 255, 0), rectangle(1280, 0, 1, 1, 0))...)
+			w := &wire{Reader: bytes.NewReader(b)}
+			c, err := rfbclient.Open(w)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Sync(); err != nil {
+				t.Fatalf("legal enlarged sync reply: %v", err)
+			}
+			im, err := c.Frame()
+			if err != nil {
+				t.Fatalf("frame after enlarged sync reply: %v", err)
+			}
+			if im.Bounds().Dx() != 1280 || im.Bounds().Dy() != 800 || im.RGBAAt(0, 0) != (color.RGBA{0, 0, 255, 255}) || im.RGBAAt(1279, 799) != (color.RGBA{0, 0, 255, 255}) {
+				t.Fatal("full screenshot pixels changed after enlarged sync reply")
+			}
+			if err := c.Sync(); err == nil || !strings.Contains(err.Error(), "outside screen") {
+				t.Fatalf("rectangle outside real screen accepted: %v", err)
+			}
+		})
+	}
+}

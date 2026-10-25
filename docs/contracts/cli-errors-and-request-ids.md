@@ -577,11 +577,12 @@ configuration and Fabric setup; process launch overhead is measured externally
 by the lane. Reading a note or screenshot does not acknowledge Seat events.
 
 The PNG destination is created exclusively before input is sent. An existing
-or unwritable destination refuses the call before it can act. If a screenshot
-fails after confirmed input, the error starts with `<action> done; screenshot
-failed: …` and JSON `details.action_done` is `true`. The completed action must
-not be retried; this error is non-retryable even if the view refusal was
-retryable. Failed captures are removed.
+or unwritable destination refuses the call before it can act. Once input bytes
+are written, every later failure starts with `<action> done; …` and JSON
+`details.action_done` is `true`. A failed synchronization says `input
+synchronization failed: …`; view, decode and PNG failures say `screenshot
+failed: …`. The completed action must not be retried; these errors are
+non-retryable even if the view refusal was retryable. Failed captures are removed.
 
 A screenshot writes one valid PNG to a fresh private temp file and prints its
 absolute path. `-o FILE` selects an explicit new destination, including inside

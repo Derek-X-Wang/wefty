@@ -3078,8 +3078,14 @@ closed. Complete non-incremental framebuffer updates become local PNG files.
 
 Input calls send pointer or X11 keysym events through the input endpoint.
 Modifiers and buttons are released before a one-pixel framebuffer round trip,
-which orders the end of input before the short connection closes. An optional
-screenshot opens the view endpoint after this round trip. No daemon or
+which orders the end of input before the short connection closes. The server
+may return larger Raw rectangles within its ServerInit framebuffer bounds.
+The client drains the entire update, decodes only the requested intersection,
+and completes synchronization once the requested pixel is covered. Zero-size,
+out-of-screen and non-Raw rectangles still fail closed. Input is done when its
+bytes are written: a later synchronization or capture failure reports
+`action_done: true` and must not repeat the action. An optional screenshot
+opens the view endpoint after this round trip. No daemon or
 background screen connection survives the command. No click, key, text or
 framebuffer content is written to Wefty's logs. The CLI's screenshot file is
 an explicit local artifact, not a Seat-log entry.

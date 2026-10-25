@@ -135,6 +135,8 @@ func (c *Client) Frame() (*image.RGBA, error) { return c.frame(c.Width, c.Height
 
 // Sync orders prior input before close using the smallest non-incremental
 // framebuffer request. The separate view call still captures the full screen.
+// Servers may enlarge replies within the real screen. Drain each update and
+// return once the requested pixel is covered.
 func (c *Client) Sync() error { _, err := c.frame(1, 1); return err }
 
 func (c *Client) frame(width, height int) (*image.RGBA, error) {
@@ -185,7 +187,7 @@ func (c *Client) frame(width, height int) (*image.RGBA, error) {
 			if binary.BigEndian.Uint32(rect[8:]) != 0 {
 				return nil, fmt.Errorf("RFB server ignored Raw encoding negotiation")
 			}
-			if w == 0 || h == 0 || x+w > width || y+h > height {
+			if w == 0 || h == 0 || x+w > c.Width || y+h > c.Height {
 				return nil, fmt.Errorf("RFB rectangle outside screen")
 			}
 			row := make([]byte, w*4)
@@ -193,10 +195,15 @@ func (c *Client) frame(width, height int) (*image.RGBA, error) {
 				if _, err := io.ReadFull(c.wire, row); err != nil {
 					return nil, err
 				}
-				for xx := 0; xx < w; xx++ {
-					offset := xx * 4
-					frame.SetRGBA(x+xx, yy, color.RGBA{R: row[offset+2], G: row[offset+1], B: row[offset], A: 255})
-					i := yy*width + x + xx
+				// Raw bytes outside the request are still consumed and checked,
+				// but only the intersection belongs in the result and coverage map.
+				if yy >= height {
+					continue
+				}
+				for xx := x; xx < min(x+w, width); xx++ {
+					offset := (xx - x) * 4
+					frame.SetRGBA(xx, yy, color.RGBA{R: row[offset+2], G: row[offset+1], B: row[offset], A: 255})
+					i := yy*width + xx
 					if !seen[i] {
 						seen[i] = true
 						remaining--

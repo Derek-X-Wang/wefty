@@ -789,9 +789,9 @@ Seat-event hint; read it with `wefty logs`.
 Use `--json` for `elapsed_ms`, `path`, `unread_events`, and, when nonzero,
 `unread_events_line`. Refusals carry `details.elapsed_ms`. Input calls are
 never retried automatically: an interrupted call may already have acted.
-Wefty checks the PNG destination before sending input. If input completes but
-the screenshot fails, the error says `<action> done; screenshot failed: …` and
-JSON details include `action_done: true`. Do not repeat that completed action.
+Wefty checks the PNG destination before sending input. Once input bytes are
+written, a later synchronization or screenshot failure says `<action> done; …`
+and JSON details include `action_done: true`. Do not repeat that completed action.
 Wefty records no clicks, keys, or screen contents. PNG files are your local
 artifacts; keep or remove them as needed.
 

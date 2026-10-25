@@ -287,17 +287,19 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		return err
 	}
 	unread := target.Unread
-	actionDone, takingScreenshot, replied := false, false, false
+	actionDone, replied := false, false
+	phase := "input synchronization"
 	defer func() {
 		if resultErr != nil {
-			if actionDone && takingScreenshot {
+			if actionDone {
+				prefix := a.command + " done; " + phase + " failed: "
 				var api *apiResponseError
 				if errors.As(resultErr, &api) {
 					copy := *api
-					copy.APIError.Message = a.command + " done; screenshot failed: " + api.APIError.Message
+					copy.APIError.Message = prefix + api.APIError.Message
 					resultErr = &copy
 				} else {
-					resultErr = &apiResponseError{APIError: contract.APIError{Code: contract.ErrorInternal, Message: a.command + " done; screenshot failed: " + resultErr.Error()}}
+					resultErr = &apiResponseError{APIError: contract.APIError{Code: contract.ErrorInternal, Message: prefix + resultErr.Error()}}
 				}
 			}
 			var api *apiResponseError
@@ -308,7 +310,7 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 					copy.APIError.Details[k] = v
 				}
 				copy.APIError.Details["elapsed_ms"] = elapsed()
-				if actionDone && takingScreenshot {
+				if actionDone {
 					copy.APIError.Details["action_done"] = true
 					copy.APIError.Retryable = false
 				}
@@ -383,16 +385,17 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		e = performSeatScreenInput(client, a)
 		// A one-pixel round trip orders the final input release before close.
 		if e == nil {
+			// Input has already been sent, even if this round trip fails.
+			actionDone = true
 			e = client.Sync()
 		}
 		close()
 		if e != nil {
 			return e
 		}
-		actionDone = true
 	}
 	if capture != nil {
-		takingScreenshot = true
+		phase = "screenshot"
 		client, close, e := open("view")
 		if e != nil {
 			return e
@@ -408,8 +411,8 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 			return e
 		}
 		captured = true
-		takingScreenshot = false
 	}
+	phase = "reply"
 	replied = true
 	return withSeatReply(stdout, jsonOutput, a.id, unread, func(w io.Writer) error {
 		if jsonOutput {
