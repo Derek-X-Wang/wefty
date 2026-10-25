@@ -19,7 +19,7 @@ func (e *seatExecProtocolEngine) CopyComputerSeat(ctx context.Context, r CopyCom
 	if _, err := e.seats.command(r.command()); err != nil {
 		return 0, err
 	}
-	if r.Direction == "in" {
+	if r.Direction == "in" || r.Direction == "sync" {
 		return io.Copy(io.Discard, input)
 	}
 	if err := emit([]byte("streamed copy")); err != nil {

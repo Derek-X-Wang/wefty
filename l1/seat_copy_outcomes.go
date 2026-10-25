@@ -26,7 +26,7 @@ type SeatCopyOutcomeReceipt struct {
 }
 
 func validCopyReceipt(r SeatCopyOutcomeReceipt, node bool) bool {
-	if !ValidSeatCopyID(r.CopyID) || r.Path == "" || len(r.Path) > 4096 || strings.ContainsRune(r.Path, 0) || r.SizeBytes < 0 || (r.Direction != "in" && r.Direction != "out") {
+	if !ValidSeatCopyID(r.CopyID) || r.Path == "" || len(r.Path) > 4096 || strings.ContainsRune(r.Path, 0) || r.SizeBytes < 0 || (r.Direction != "in" && r.Direction != "out" && r.Direction != "sync") {
 		return false
 	}
 	if r.Outcome == "failed" {
@@ -39,7 +39,7 @@ func validCopyReceipt(r SeatCopyOutcomeReceipt, node bool) bool {
 		if r.Outcome == "sending" {
 			return r.SizeBytes == 0
 		}
-		return r.Direction == "in" && r.Outcome == "completed" || r.Direction == "out" && r.Outcome == "sent"
+		return (r.Direction == "in" || r.Direction == "sync") && r.Outcome == "completed" || r.Direction == "out" && r.Outcome == "sent"
 	}
 	return r.Direction == "out" && r.Outcome == "completed"
 }
@@ -104,12 +104,18 @@ func (s *Store) ReportSeatCopyOutcome(ctx context.Context, id, credential string
 
 // Only the node creates copy events. Local publication receipts never append
 // and never change the immutable node direction, path, size or result.
-func (s *Store) appendSeatCopyOutcome(ctx context.Context, id string, r SeatCopyOutcomeReceipt) (bool, error) {
+func (s *Store) appendSeatCopyOutcome(ctx context.Context, id string, r SeatCopyOutcomeReceipt, syncCounts ...*SeatSyncCounts) (bool, error) {
 	kind := SeatEventCopyIn
 	if r.Direction == "out" {
 		kind = SeatEventCopyOut
 	}
 	incoming := SeatLogEvent{SeatID: id, EventID: "copy:" + r.CopyID, Kind: kind, CopyID: r.CopyID, Path: r.Path, SizeBytes: &r.SizeBytes, Outcome: r.Outcome, NodeOutcome: r.Outcome, Reason: r.Reason}
+	if r.Direction == "sync" {
+		incoming.Direction = "sync"
+		if len(syncCounts) > 0 {
+			incoming.Sync = syncCounts[0]
+		}
+	}
 	err := s.AppendSeatEvent(ctx, incoming)
 	if errorCodeForSeatLifecycle(err) != contract.ErrorIdempotencyConflict {
 		return r.Outcome == "sending", err
@@ -127,7 +133,7 @@ func (s *Store) appendSeatCopyOutcome(ctx context.Context, id string, r SeatCopy
 	if err := json.Unmarshal(raw, &old); err != nil {
 		return false, err
 	}
-	if old.Kind != incoming.Kind || old.CopyID != r.CopyID || old.Path != r.Path || old.SizeBytes == nil || old.NodeOutcome == "" {
+	if old.Direction != incoming.Direction || old.Kind != incoming.Kind || old.CopyID != r.CopyID || old.Path != r.Path || old.SizeBytes == nil || old.NodeOutcome == "" {
 		return false, protocolError(contract.ErrorIdempotencyConflict, "copy ID has different node evidence")
 	}
 	if r.Outcome == "sending" {
@@ -135,13 +141,14 @@ func (s *Store) appendSeatCopyOutcome(ctx context.Context, id string, r SeatCopy
 		return old.NodeOutcome == "sending", nil
 	}
 	if old.NodeOutcome != "sending" {
-		if *old.SizeBytes != r.SizeBytes || old.NodeOutcome != r.Outcome || (r.Outcome == "failed" && old.Reason != r.Reason) {
+		if !equalSeatSyncCounts(old.Sync, incoming.Sync) || *old.SizeBytes != r.SizeBytes || old.NodeOutcome != r.Outcome || (r.Outcome == "failed" && old.Reason != r.Reason) {
 			return false, protocolError(contract.ErrorIdempotencyConflict, "copy ID has different node evidence")
 		}
 		return false, nil
 	}
 	old.NodeOutcome, old.Outcome, old.Reason = r.Outcome, r.Outcome, r.Reason
 	old.SizeBytes, old.OccurredAt = &r.SizeBytes, w.at
+	old.Sync = incoming.Sync
 	payload, err := json.Marshal(old)
 	if err != nil {
 		return false, err

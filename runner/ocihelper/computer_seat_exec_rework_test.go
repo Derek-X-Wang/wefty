@@ -29,7 +29,7 @@ func TestSeatExecLimitFinishesPartlyConsumedFrame(t *testing.T) {
 		defer client.Close()
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		body, _ := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour})
+		body, _ := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour, ""})
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -132,7 +132,7 @@ func TestSeatExecStalledPartialFrameEndsLocallyAfterGrace(t *testing.T) {
 			defer cancel()
 			helper.dispatchExecComputerSeat(&sessionOperation{ctx: ctx, cancel: cancel, session: authoritySession, conn: server}, wire, request)
 		}()
-		err := session.ExecComputerSeat(t.Context(), ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour}, nil)
+		err := session.ExecComputerSeat(t.Context(), ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour, ""}, nil)
 		var loss *RuntimeLossError
 		if err == nil || errors.As(err, &loss) || session.HealthError() != nil {
 			t.Fatalf("stalled frame escaped command scope: %v health=%v", err, session.HealthError())
@@ -158,7 +158,7 @@ func TestSeatExecRuntimeLimitDoesNotMaskMechanicsFailure(t *testing.T) {
 		defer client.Close()
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
-		body, _ := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour})
+		body, _ := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour, ""})
 		go func() {
 			defer serving.Close()
 			helper.dispatchExecComputerSeat(&sessionOperation{ctx: ctx, cancel: cancel, session: session, conn: serving}, newFramedConn(serving), frame{Method: MethodExecComputerSeat, Body: body})
@@ -194,7 +194,7 @@ func TestSeatExecCleanupTimeoutFinishesInFlightFrame(t *testing.T) {
 	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	body, _ := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour})
+	body, _ := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour, ""})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

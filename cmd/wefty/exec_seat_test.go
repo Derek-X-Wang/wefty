@@ -54,85 +54,78 @@ func TestExecSeatUsageRefusesBeforeNetwork(t *testing.T) {
 	}
 }
 
-func TestExecSeatSubmitsWithoutCaptureAndPlainStillRequiresCheckout(t *testing.T) {
-	for _, inside := range []bool{false, true} {
-		for _, deadline := range []string{"", "1001ms", "1ns"} {
-			t.Run(fmt.Sprintf("checkout=%t/deadline=%s", inside, deadline), func(t *testing.T) {
-				directory := t.TempDir()
-				if inside {
-					directory = execTestRepo(t)
-				}
-				t.Chdir(directory)
-				root := t.TempDir()
-				t.Setenv("WEFTY_EXEC_STORAGE_ROOT", root)
-				t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
-				const secret = "private-seat-command-secret"
-				if _, err := storeSeatCredential(execSeatTestID, secret); err != nil {
-					t.Fatal(err)
-				}
-				argv := []string{"printf", "%s", "--json", "--seat", "--detach"}
-				posts := 0
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					switch r.URL.Path {
-					case "/v1/runs":
-						posts++
-						raw, _ := io.ReadAll(r.Body)
-						if r.Method != "POST" || r.Header.Get(contract.SeatCredentialHeader) != secret || r.Header.Get("Idempotency-Key") == "" || bytes.Contains(raw, []byte(secret)) {
-							t.Errorf("invalid submission metadata or credential leakage")
-						}
-						var request l3.CreateRunRequest
-						if err := json.Unmarshal(raw, &request); err != nil {
-							t.Error(err)
-						}
-						wantSeconds := int64(0)
-						if deadline == "1001ms" {
-							wantSeconds = 2
-						}
-						if deadline == "1ns" {
-							wantSeconds = 1
-						}
-						if request.SeatRun == nil || request.SeatRun.SeatID != execSeatTestID || !reflect.DeepEqual(request.SeatRun.Argv, argv) || request.SeatRun.MaxRuntimeSeconds != wantSeconds {
-							t.Errorf("wrong Seat source: %s", raw)
-						}
-						if string(request.Params) != "null" || request.InlineScript != nil || request.Image != nil || request.WorkflowRef != "" || len(request.Tags) != 0 || request.Limits != nil || request.Restartable || request.DispatchAuthority || request.ParentRunID != "" {
-							t.Errorf("Seat command carried another source or params: %s", raw)
-						}
-						w.WriteHeader(http.StatusCreated)
-						io.WriteString(w, `{"run_id":"run-seat"}`)
-					case "/v1/seat-requests/" + execSeatTestID:
-						json.NewEncoder(w).Encode(l1.SeatCallResult{SeatRequest: l1.SeatRequest{SeatID: execSeatTestID, State: l1.SeatLive}})
-					case "/v1/nodes/node-cli":
-						json.NewEncoder(w).Encode(l1.Node{NodeID: "node-cli", AuthoritativeTags: []string{contract.StableNodeTagPrefix + "node-cli"}})
-					default:
-						t.Errorf("unexpected request (capture/upload/selection): %s %s", r.Method, r.URL.Path)
-						w.WriteHeader(500)
+func TestExecSeatOutsideCheckoutAndPlainStillRequiresCheckout(t *testing.T) {
+	for _, deadline := range []string{"", "1001ms", "1ns"} {
+		t.Run("deadline="+deadline, func(t *testing.T) {
+			directory := t.TempDir()
+			t.Chdir(directory)
+			root := t.TempDir()
+			t.Setenv("WEFTY_EXEC_STORAGE_ROOT", root)
+			t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
+			const secret = "private-seat-command-secret"
+			if _, err := storeSeatCredential(execSeatTestID, secret); err != nil {
+				t.Fatal(err)
+			}
+			argv := []string{"printf", "%s", "--json", "--seat", "--detach"}
+			posts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/runs":
+					posts++
+					raw, _ := io.ReadAll(r.Body)
+					if r.Method != "POST" || r.Header.Get(contract.SeatCredentialHeader) != secret || r.Header.Get("Idempotency-Key") == "" || bytes.Contains(raw, []byte(secret)) {
+						t.Errorf("invalid submission metadata or credential leakage")
 					}
-				}))
-				defer server.Close()
-				clients := &apiClients{l1: statusClient(t, "L1", "l1", server), l3: statusClient(t, "L3", "l3", server), wait: func(context.Context, time.Duration) error { return nil }}
-				clients.nodeConfigPath = filepath.Join(t.TempDir(), "node.json")
-				writeExecFile(t, clients.nodeConfigPath, `{"version":1,"node_id":"node-cli","control_socket":"/tmp/unused.sock"}`)
-				args := []string{"exec", "--seat", execSeatTestID, "--detach", "--json"}
-				if deadline != "" {
-					args = append(args, "--max-runtime", deadline)
-				}
-				args = append(append(args, "--"), argv...)
-				var out, stderr bytes.Buffer
-				err := execute(t.Context(), clients, false, args, &out, &stderr)
-				entries, e := os.ReadDir(root)
-				if err != nil || e != nil || len(entries) != 0 || posts != 1 || out.String() != "{\"run_id\":\"run-seat\"}\n" || strings.Contains(out.String()+stderr.String(), secret) {
-					t.Fatalf("exit=%d err=%v posts=%d capture=%v stdout=%q stderr=%q", execModeCode(err), err, posts, entries, &out, &stderr)
-				}
-				if !inside {
-					out.Reset()
-					stderr.Reset()
-					err = execute(t.Context(), clients, false, []string{"exec", "--", "true"}, &out, &stderr)
-					if execModeCode(err) != 2 || !strings.Contains(err.Error(), "wefty exec runs from inside a Git checkout") || posts != 1 {
-						t.Fatalf("plain exec outside checkout: %v posts=%d", err, posts)
+					var request l3.CreateRunRequest
+					if err := json.Unmarshal(raw, &request); err != nil {
+						t.Error(err)
 					}
+					wantSeconds := int64(0)
+					if deadline == "1001ms" {
+						wantSeconds = 2
+					}
+					if deadline == "1ns" {
+						wantSeconds = 1
+					}
+					if request.SeatRun == nil || request.SeatRun.SeatID != execSeatTestID || !reflect.DeepEqual(request.SeatRun.Argv, argv) || request.SeatRun.MaxRuntimeSeconds != wantSeconds {
+						t.Errorf("wrong Seat source: %s", raw)
+					}
+					if string(request.Params) != "null" || request.InlineScript != nil || request.Image != nil || request.WorkflowRef != "" || len(request.Tags) != 0 || request.Limits != nil || request.Restartable || request.DispatchAuthority || request.ParentRunID != "" {
+						t.Errorf("Seat command carried another source or params: %s", raw)
+					}
+					w.WriteHeader(http.StatusCreated)
+					io.WriteString(w, `{"run_id":"run-seat"}`)
+				case "/v1/seat-requests/" + execSeatTestID:
+					json.NewEncoder(w).Encode(l1.SeatCallResult{SeatRequest: l1.SeatRequest{SeatID: execSeatTestID, State: l1.SeatLive}})
+				case "/v1/nodes/node-cli":
+					json.NewEncoder(w).Encode(l1.Node{NodeID: "node-cli", AuthoritativeTags: []string{contract.StableNodeTagPrefix + "node-cli"}})
+				default:
+					t.Errorf("unexpected request (capture/upload/selection): %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(500)
 				}
-			})
-		}
+			}))
+			defer server.Close()
+			clients := &apiClients{l1: statusClient(t, "L1", "l1", server), l3: statusClient(t, "L3", "l3", server), wait: func(context.Context, time.Duration) error { return nil }}
+			clients.nodeConfigPath = filepath.Join(t.TempDir(), "node.json")
+			writeExecFile(t, clients.nodeConfigPath, `{"version":1,"node_id":"node-cli","control_socket":"/tmp/unused.sock"}`)
+			args := []string{"exec", "--seat", execSeatTestID, "--detach", "--json"}
+			if deadline != "" {
+				args = append(args, "--max-runtime", deadline)
+			}
+			args = append(append(args, "--"), argv...)
+			var out, stderr bytes.Buffer
+			err := execute(t.Context(), clients, false, args, &out, &stderr)
+			entries, e := os.ReadDir(root)
+			if err != nil || e != nil || len(entries) != 0 || posts != 1 || out.String() != "{\"run_id\":\"run-seat\"}\n" || strings.Contains(out.String()+stderr.String(), secret) {
+				t.Fatalf("exit=%d err=%v posts=%d capture=%v stdout=%q stderr=%q", execModeCode(err), err, posts, entries, &out, &stderr)
+			}
+			out.Reset()
+			stderr.Reset()
+			err = execute(t.Context(), clients, false, []string{"exec", "--", "true"}, &out, &stderr)
+			if execModeCode(err) != 2 || !strings.Contains(err.Error(), "wefty exec runs from inside a Git checkout") || posts != 1 {
+				t.Fatalf("plain exec outside checkout: %v posts=%d", err, posts)
+			}
+		})
 	}
 }
 
@@ -310,7 +303,7 @@ func TestExecSeatStoppingWatchCancelsUnlessKeepRunning(t *testing.T) {
 func TestExecSeatHelpAndBinaryContract(t *testing.T) {
 	binary := buildWefty(t)
 	code, stdout, stderr := runPolishBinary(t, binary, "exec", "--help")
-	if code != 0 || len(stderr) != 0 || !strings.Contains(string(stdout), "wefty exec --seat SEAT_ID") || !strings.Contains(string(stdout), "No checkout capture or file copy") {
+	if code != 0 || len(stderr) != 0 || !strings.Contains(string(stdout), "wefty exec --seat SEAT_ID") || !strings.Contains(string(stdout), "Inside a checkout, syncs work before the command") {
 		t.Errorf("Seat help exit=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 	t.Chdir(t.TempDir())
@@ -398,6 +391,7 @@ func TestExecSeatCommandNotFoundUsesSeatEnvironment(t *testing.T) {
 }
 
 func TestExecSeatInterruptedSubmissionRecoversOnce(t *testing.T) {
+	t.Chdir(t.TempDir())
 	for _, mode := range []string{"cancel", "keep-running", "detach", "recovery-fails"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
@@ -528,6 +522,7 @@ func TestExecSeatLimitMessageDoesNotDescribePlainExec(t *testing.T) {
 }
 
 func TestExecSeatInterruptedBeforeCommitDoesNotReplay(t *testing.T) {
+	t.Chdir(t.TempDir())
 	for _, mode := range []string{"keep-running", "detach"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))

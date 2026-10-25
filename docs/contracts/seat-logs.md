@@ -259,3 +259,16 @@ binding, returns L1-derived audit authority generation, and uses the same
 strict writer as `AppendSeatEvent`. Its tenure events change the Seat-life
 person hold in that same transaction. Immutable retries do not repeat hold
 transitions.
+
+
+### Working-copy sync
+
+A checkout command first sends `direction=sync`, `path=work` over the Seat
+copy route. It reuses `copy_in` and one node-owned `copy:COPY_ID` row. The row
+adds `direction: "sync"`; on successful apply, `sync` is the closed object
+`{"files_written":N,"files_removed":N}` with nonnegative counts of files and
+symlinks (directories excluded). `size_bytes` is file-content bytes sent,
+excluding tar framing. Sending and failed rows may omit the apply counts.
+Counts on completed evidence are immutable on retry. Existing copy holds,
+lease renewal, credential fencing, retained logging and unread rules apply.
+No new event kind or database table is introduced.

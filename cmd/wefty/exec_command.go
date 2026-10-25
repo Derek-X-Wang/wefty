@@ -77,7 +77,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags.DurationVar(&maxRuntime, "max-runtime", 0, "runtime cap; Seat commands require a positive limit (default: cluster setting, shipped as 1h); plain exec has no cap by default")
 	flags.Usage = func() {
 		fmt.Fprintln(flags.Output(), "Usage: wefty exec [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>\nFreeze the checkout and local changes; run on this machine's node by default. Use --node NODE for another owned node.\nStream output; exit 0 on pass, 10 on command failure, or 13 for unavailable evidence/restart limit. Stopping cancels the run unless --keep-running is set.")
-		fmt.Fprintln(flags.Output(), "Usage: wefty exec --seat SEAT_ID [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>\nRun in the Seat's folder and environment. No checkout capture or file copy, inside or outside a Git checkout.\nEvery Seat command has a limit (cluster default, shipped as 1h); use a positive --max-runtime for a longer limit. --node, --tag and --restartable do not fit a Seat Run.")
+		fmt.Fprintln(flags.Output(), "Usage: wefty exec --seat SEAT_ID [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>\nInside a checkout, syncs work before the command and starts in the same relative folder. Outside a checkout, runs in the Seat's folder. Dependencies stay; the caller's checkout wins.\nEvery Seat command has a limit (cluster default, shipped as 1h); use a positive --max-runtime for a longer limit. --node, --tag and --restartable do not fit a Seat Run.")
 		flags.PrintDefaults()
 	}
 	if err := parseCommandFlags(flags, args, false); err != nil {

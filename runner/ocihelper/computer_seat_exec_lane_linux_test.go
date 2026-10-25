@@ -186,7 +186,7 @@ func TestHelperComputerSeatExecIM3(t *testing.T) {
 	applied, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{{1, "seat1", 7102, 7103}}})
 	must(err)
 	waitForSeat(applied.Generation, "ready")
-	request := ExecComputerSeatRequest{authority, applied.Generation, 1, nil, time.Minute}
+	request := ExecComputerSeatRequest{authority, applied.Generation, 1, nil, time.Minute, ""}
 	run := func(args ...string) ([]byte, []byte, *SeatCommandExit) {
 		t.Helper()
 		req := request

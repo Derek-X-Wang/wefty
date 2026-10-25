@@ -39,7 +39,7 @@ func TestSeatExecDeadlineIsCommandScopedWithInjectedClock(t *testing.T) {
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				operation := &sessionOperation{ctx: ctx, cancel: cancel, session: session, conn: serving}
-				body, err := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour})
+				body, err := json.Marshal(ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour, ""})
 				if err != nil {
 					t.Fatal(err)
 				}

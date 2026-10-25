@@ -70,7 +70,7 @@ func (s *Server) dispatchCopyComputerSeat(op *sessionOperation, wire *framedConn
 					op.monitorEOF()
 					return
 				}
-				if r.Direction != "in" || len(part.Data) == 0 || len(part.Data) > SeatCopyChunkBytes {
+				if (r.Direction != "in" && r.Direction != "sync") || len(part.Data) == 0 || len(part.Data) > SeatCopyChunkBytes {
 					writer.CloseWithError(errors.New("invalid copy input frame"))
 					op.cancel()
 					return

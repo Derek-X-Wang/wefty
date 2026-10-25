@@ -43,13 +43,13 @@ func (e *ContainerdEngine) CopyComputerSeat(ctx context.Context, r CopyComputerS
 			_, err := diagnostic.Write(event.Data)
 			return err
 		}
-		if r.Direction != "out" {
+		if r.Direction != "out" && r.Direction != "sync" {
 			return errors.New("unexpected copy-in output")
 		}
 		return emit(event.Data)
 	}
 	var inputs []io.Reader
-	if r.Direction == "in" {
+	if r.Direction == "in" || r.Direction == "sync" {
 		if input == nil {
 			return 0, errors.New("copy-in input missing")
 		}

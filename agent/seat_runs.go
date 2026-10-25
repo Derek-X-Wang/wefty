@@ -150,7 +150,7 @@ func (r *seatRunRuntime) Run(ctx context.Context, request workloadrunner.Request
 	}
 	var exit *ocihelper.SeatCommandExit
 	err = r.helper.ExecComputerSeat(commandCtx, ocihelper.ExecComputerSeatRequest{
-		Authority: ocihelper.AttemptAuthority{NodeID: command.NodeID, BootSessionID: command.BootSessionID, JobID: command.Binding.ComputerJobID, AttemptID: command.Binding.ComputerAttemptID, FencingToken: command.FencingToken, Class: contract.JobClassService}, Generation: command.Generation, Place: command.Place, Args: append([]string(nil), r.params.SeatRun.Argv...), MaxRuntime: duration,
+		Authority: ocihelper.AttemptAuthority{NodeID: command.NodeID, BootSessionID: command.BootSessionID, JobID: command.Binding.ComputerJobID, AttemptID: command.Binding.ComputerAttemptID, FencingToken: command.FencingToken, Class: contract.JobClassService}, Generation: command.Generation, Place: command.Place, Args: append([]string(nil), r.params.SeatRun.Argv...), MaxRuntime: duration, WorkingDirectory: command.WorkingDirectory,
 	}, func(event ocihelper.SeatCommandEvent) error {
 		// A helper refusal is not evidence that a payload exists. The helper
 		// stream's first output or exit supplies that evidence.

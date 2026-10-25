@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"github.com/Derek-X-Wang/wefty/contract"
 	"strings"
 	"time"
 )
@@ -14,14 +15,15 @@ const SeatCommandChunkBytes = 4096
 const seatCommandFrameBytes = 8192
 const SeatRefusalCommandNotReady SeatOperationRefusalReason = "seat_not_ready"
 
-// ExecComputerSeatRequest deliberately accepts no environment, user or path.
+// ExecComputerSeatRequest accepts no caller environment or user.
 // Generation fences place reuse and every change of the Seat directive.
 type ExecComputerSeatRequest struct {
-	Authority  AttemptAuthority `json:"authority"`
-	Generation uint64           `json:"generation"`
-	Place      int              `json:"place"`
-	Args       []string         `json:"args"`
-	MaxRuntime time.Duration    `json:"max_runtime"`
+	Authority        AttemptAuthority `json:"authority"`
+	Generation       uint64           `json:"generation"`
+	Place            int              `json:"place"`
+	Args             []string         `json:"args"`
+	MaxRuntime       time.Duration    `json:"max_runtime"`
+	WorkingDirectory string           `json:"working_directory,omitempty"`
 }
 
 type SeatCommandExit struct {
@@ -53,6 +55,9 @@ func (r ExecComputerSeatRequest) validate() error {
 	if r.Generation == 0 || r.Place < 1 || r.Place > 4 || len(r.Args) == 0 || r.Args[0] == "" || r.MaxRuntime <= 0 {
 		return errors.New("command requires a Seat generation, place, argv and positive runtime")
 	}
+	if err := contract.ValidateSeatWorkingDirectory(r.WorkingDirectory); err != nil {
+		return err
+	}
 	size := 0
 	for _, arg := range r.Args {
 		if strings.ContainsRune(arg, 0) {
@@ -75,7 +80,11 @@ func (s *computerSeats) command(r ExecComputerSeatRequest) (seatCommandConfig, e
 	}
 	folder := fmt.Sprintf("/wefty/service/seats/%d", r.Place)
 	home := folder + "/home"
-	return seatCommandConfig{UID: uint32(2000 + r.Place), GID: uint32(2000 + r.Place), Directory: folder, Environment: []string{
+	directory := folder
+	if r.WorkingDirectory != "" {
+		directory += "/" + r.WorkingDirectory
+	}
+	return seatCommandConfig{UID: uint32(2000 + r.Place), GID: uint32(2000 + r.Place), Directory: directory, Environment: []string{
 		"PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8", "USER=" + e.config.User, "LOGNAME=" + e.config.User,
 		"HOME=" + home, "SEAT_ID=" + fmt.Sprint(r.Place), "SEAT_DIR=" + folder, "DISPLAY=:" + fmt.Sprint(r.Place), "XAUTHORITY=" + folder + "/.Xauthority",
 		"XDG_RUNTIME_DIR=" + folder + "/run", "TMPDIR=" + folder + "/tmp", "XDG_CACHE_HOME=" + home + "/.cache", "XDG_CONFIG_HOME=" + home + "/.config",

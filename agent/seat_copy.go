@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -56,8 +57,12 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 			sendError(errors.New("Seat copy path unavailable"))
 			return
 		}
-		if (direction != "in" && direction != "out") || path == "" || len(path) > 4096 || strings.ContainsRune(path, 0) {
-			sendError(errors.New("copy needs direction in or out and a path"))
+		if (direction != "in" && direction != "out" && direction != "sync") || path == "" || len(path) > 4096 || strings.ContainsRune(path, 0) {
+			sendError(errors.New("copy needs direction in, out or sync and a path"))
+			return
+		}
+		if direction == "sync" && path != "work" {
+			sendError(errors.New("sync path must be work"))
 			return
 		}
 		input := l1.SeatCopyAuthorityInput{ComputerSeatAttemptRequest: l1.ComputerSeatAttemptRequest{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, FencingToken: authority.FencingToken}, ComputerID: computer, JobID: authority.JobID, AttemptID: authority.AttemptID, Credential: r.Header.Get(l1.SeatCredentialHeader)}
@@ -99,10 +104,18 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 		encode := json.NewEncoder(w)
 		meter := seatcopy.NewMeter()
 		var inputStream io.Reader = r.Body
-		if direction == "in" {
+		if direction == "in" || direction == "sync" {
 			inputStream = io.TeeReader(r.Body, meter)
 		}
+		var syncOutput bytes.Buffer
 		size, err := runtime.CopyComputerSeat(copyCtx, ocihelper.CopyComputerSeatRequest{Authority: ocihelper.AttemptAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, JobID: authority.JobID, AttemptID: authority.AttemptID, FencingToken: authority.FencingToken, Class: authority.WorkloadClass, RemovalGeneration: authority.RemovalGeneration}, Generation: binding.Generation, Place: binding.Place, Direction: direction, Path: path}, inputStream, func(data []byte) error {
+			if direction == "sync" {
+				if syncOutput.Len()+len(data) > 4096 {
+					return errors.New("sync counts exceed limit")
+				}
+				_, err := syncOutput.Write(data)
+				return err
+			}
 			if err := encode.Encode(l1.SeatCopyStreamEvent{Data: data}); err != nil {
 				return err
 			}
@@ -116,6 +129,19 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 		cancelCopy()
 		<-renewalDone
 		size = max(size, meter.Close())
+		var counts *l1.SeatSyncCounts
+		if direction == "sync" && err == nil {
+			var result struct {
+				FilesWritten *int64 `json:"files_written"`
+				FilesRemoved *int64 `json:"files_removed"`
+				SizeBytes    *int64 `json:"size_bytes"`
+			}
+			if decodeErr := json.Unmarshal(syncOutput.Bytes(), &result); decodeErr != nil || result.SizeBytes == nil || *result.SizeBytes != size || result.FilesWritten == nil || result.FilesRemoved == nil || *result.FilesWritten < 0 || *result.FilesRemoved < 0 {
+				err = errors.New("sync has no valid apply counts")
+			} else {
+				counts = &l1.SeatSyncCounts{FilesWritten: *result.FilesWritten, FilesRemoved: *result.FilesRemoved}
+			}
+		}
 		outcome, reason := "completed", ""
 		if direction == "out" {
 			outcome = "sent"
@@ -127,7 +153,7 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 				reason = "cancelled"
 			}
 		}
-		receipt := l1.SeatCopyReceipt{SeatCopyAuthorityInput: input, CopyID: copyID, Direction: direction, Path: path, SizeBytes: size, Outcome: outcome, Reason: reason}
+		receipt := l1.SeatCopyReceipt{SeatCopyAuthorityInput: input, CopyID: copyID, Direction: direction, Path: path, SizeBytes: size, Outcome: outcome, Reason: reason, Sync: counts}
 		recordErr := recordSeatCopyReceipt(r.Context(), control, match[1], receipt)
 		if recordErr != nil {
 			sendError(fmt.Errorf("copy outcome unconfirmed: %w", recordErr))

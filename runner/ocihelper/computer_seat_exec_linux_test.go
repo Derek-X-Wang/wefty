@@ -74,7 +74,7 @@ func TestSeatExecBuildsUnprivilegedProcessAndKeepsOwnerLocksFree(t *testing.T) {
 				}}
 				attempt := &containerdAttempt{authority: authority, task: task, networkNamespace: namespace, controlDirectory: directory, seats: seats}
 				engine := &ContainerdEngine{attempts: map[string]*containerdAttempt{authority.key(): attempt}}
-				request := ExecComputerSeatRequest{authority, 1, 1, slices.Clone(tc.args), time.Second}
+				request := ExecComputerSeatRequest{authority, 1, 1, slices.Clone(tc.args), time.Second, ""}
 				wrong := request
 				wrong.Authority.FencingToken = "stale"
 				if err := engine.ExecComputerSeat(t.Context(), wrong, nil); err == nil {
@@ -159,7 +159,7 @@ func TestSeatExecRuntimeLimitCancelsOnlyExecWithInjectedClock(t *testing.T) {
 		}}
 		attempt := &containerdAttempt{authority: authority, task: task, networkNamespace: namespace, controlDirectory: directory, seats: seats}
 		engine := &ContainerdEngine{attempts: map[string]*containerdAttempt{authority.key(): attempt}}
-		err = engine.execComputerSeat(t.Context(), ExecComputerSeatRequest{authority, 1, 1, []string{"sleep", "7200"}, time.Hour}, nil, func(computerSeatAttemptSnapshot, ExecComputerSeatRequest) error { return nil })
+		err = engine.execComputerSeat(t.Context(), ExecComputerSeatRequest{authority, 1, 1, []string{"sleep", "7200"}, time.Hour, ""}, nil, func(computerSeatAttemptSnapshot, ExecComputerSeatRequest) error { return nil })
 		if !errors.Is(err, context.DeadlineExceeded) || !slices.Equal(process.killed, []syscall.Signal{syscall.SIGTERM}) || !process.deleted {
 			t.Fatalf("deadline cleanup: err=%v kills=%v deleted=%v", err, process.killed, process.deleted)
 		}
@@ -229,7 +229,7 @@ func TestSeatExecHungStartReleasesSeatMutexAtShortDeadline(t *testing.T) {
 		attempt := &containerdAttempt{authority: authority, task: task, networkNamespace: namespace, controlDirectory: directory, seats: seats}
 		engine := &ContainerdEngine{attempts: map[string]*containerdAttempt{authority.key(): attempt}}
 		started := time.Now()
-		err = engine.execComputerSeat(t.Context(), ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour}, nil, func(computerSeatAttemptSnapshot, ExecComputerSeatRequest) error { return nil })
+		err = engine.execComputerSeat(t.Context(), ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour, ""}, nil, func(computerSeatAttemptSnapshot, ExecComputerSeatRequest) error { return nil })
 		if !errors.Is(err, errSeatCommandStartTimeout) || time.Since(started) > 10*time.Second {
 			t.Fatalf("start held Seat work for %s: %v", time.Since(started), err)
 		}

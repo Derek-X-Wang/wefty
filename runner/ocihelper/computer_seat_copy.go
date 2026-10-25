@@ -40,11 +40,17 @@ type ComputerSeatCopyEngine interface {
 var seatCopyProgram string
 
 func (r CopyComputerSeatRequest) command() ExecComputerSeatRequest {
-	return ExecComputerSeatRequest{r.Authority, r.Generation, r.Place, []string{"/usr/bin/python3", "-I", "-S", "-c", seatCopyProgram, r.Direction, r.Path}, time.Duration(1<<63 - 1)}
+	if r.Direction == "sync" {
+		return ExecComputerSeatRequest{Authority: r.Authority, Generation: r.Generation, Place: r.Place, Args: []string{"/usr/bin/python3", "-I", "-S", "-c", seatSyncProgram}, MaxRuntime: time.Duration(1<<63 - 1)}
+	}
+	return ExecComputerSeatRequest{r.Authority, r.Generation, r.Place, []string{"/usr/bin/python3", "-I", "-S", "-c", seatCopyProgram, r.Direction, r.Path}, time.Duration(1<<63 - 1), ""}
 }
 func (r CopyComputerSeatRequest) validate() error {
-	if r.Direction != "in" && r.Direction != "out" {
-		return errors.New("copy direction must be in or out")
+	if r.Direction != "in" && r.Direction != "out" && r.Direction != "sync" {
+		return errors.New("copy direction must be in, out or sync")
+	}
+	if r.Direction == "sync" && r.Path != "work" {
+		return errors.New("sync path must be work")
 	}
 	if r.Path == "" || len(r.Path) > 4096 || strings.ContainsRune(r.Path, 0) {
 		return errors.New("copy needs a path without NUL, at most 4096 bytes")
@@ -68,7 +74,7 @@ func (s *Session) CopyComputerSeat(ctx context.Context, r CopyComputerSeatReques
 	go func() {
 		var sendErr error
 		inputFailed := false
-		if input != nil && r.Direction == "in" {
+		if input != nil && (r.Direction == "in" || r.Direction == "sync") {
 			buf := make([]byte, SeatCopyChunkBytes)
 			for {
 				n, e := input.Read(buf)

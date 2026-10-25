@@ -153,9 +153,10 @@ type SeatRunCommand struct {
 	RunID   string                  `json:"run_id"`
 	Binding contract.SeatRunBinding `json:"binding"`
 	ComputerSeatAttemptRequest
-	Generation uint64 `json:"generation"`
-	Place      int    `json:"place"`
-	Cancel     bool   `json:"cancel"`
+	Generation       uint64 `json:"generation"`
+	Place            int    `json:"place"`
+	Cancel           bool   `json:"cancel"`
+	WorkingDirectory string `json:"working_directory,omitempty"`
 }
 
 func (s *Store) ControlSeatRun(ctx context.Context, identity, jobID, attemptID string, input SeatRunControlRequest) (command SeatRunCommand, err error) {
@@ -211,6 +212,7 @@ func (s *Store) controlSeatRun(ctx context.Context, identity, jobID, attemptID s
 		return command, protocolError(contract.ErrorInvalidRequest, "Attempt is not a Seat Run")
 	}
 	command.Binding = p.Binding
+	command.WorkingDirectory = p.SeatRun.WorkingDirectory
 	if a.nodeID != p.Binding.NodeID {
 		return command, protocolError(contract.ErrorForbidden, "Seat Run belongs to another node")
 	}
@@ -332,6 +334,7 @@ func (s *Store) pollSeatRun(ctx context.Context, identity, jobID, attemptID stri
 			return protocolError(contract.ErrorInvalidRequest, "Attempt is not a Seat Run")
 		}
 		command.Binding = p.Binding
+		command.WorkingDirectory = p.SeatRun.WorkingDirectory
 		if a.nodeID != p.Binding.NodeID {
 			return protocolError(contract.ErrorForbidden, "Seat Run belongs to another node")
 		}

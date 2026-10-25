@@ -606,9 +606,12 @@ Whole-Storage Custody exports retain their existing contract.
 its environment and screen. The typed ID is `seat_<32 lowercase hex>`.
 The CLI loads the credential through the same private state-folder and macOS
 temp-folder lookup as `wefty cp`, and sends it only in the credential header.
-No caller environment, checkout capture, file copy or bundle upload occurs,
-inside or outside a Git checkout. Plain exec still requires a Git checkout.
-Working-copy synchronization belongs to #1152.
+Inside a Git checkout, the CLI captures the caller's checkout, synchronizes
+its one working copy at `$SEAT_DIR/work`, then submits the Run. It starts in
+`work/<caller relative folder>` (or `work` at the checkout root). Outside a
+checkout it does no capture or sync and starts in the Seat folder. Plain exec
+still requires a Git checkout. No caller environment or Git history goes in.
+A sync refusal uses the existing copy errors and creates no Run.
 
 An omitted `--max-runtime` leaves the deadline to L1's configured default
 (shipped as one hour). A positive duration rounds up to whole seconds.
@@ -652,7 +655,7 @@ in as files, such as `.env`, with `wefty cp`.
 
 A Seat Run is an ordinary Run bound to one Seat and the Computer Attempt that
 first hosted it. `POST /v1/runs` accepts `seat_run` as a fourth program source:
-`{"seat_id":"seat_<32 hex>","argv":["command","arg"],"max_runtime_seconds":3600}`.
+`{"seat_id":"seat_<32 hex>","argv":["command","arg"],"max_runtime_seconds":3600,"working_directory":"work"}`.
 The request carries the Seat credential in `X-Wefty-Seat-Credential`, never in
 params, command text or environment. It requires a Fabric client. It cannot
 have another program source, parent, dispatch authority, restartability,
@@ -666,7 +669,7 @@ The fallback inline script refuses execution on an older node. Before resolving
 a new submission, L3 looks up the submitting actor and idempotency key. An
 identical replay returns the original Run ID without another Seat call, even
 if that Seat has ended, its Computer Attempt changed, or the configured default
-changed. The request hash describes the caller's source, argv, explicit deadline
+changed. The request hash describes the caller's source, argv, working directory, explicit deadline
 and tags; it excludes resolved authority and the resolved default. A different
 request under the same actor and key is still an `idempotency_conflict`.
 
@@ -691,13 +694,15 @@ Computer fence privately in L1; it never enters public Run params.
 
 The node agent runs argv through `ExecComputerSeat`, the existing helper
 operation. It passes the current helper generation, Seat place and Computer
-Attempt authority. It passes no caller environment, executable, user, path,
+Attempt authority and the immutable `working_directory` from L1's start reply.
+The optional directory must be relative and clean: no leading `/`, `..`
+component, NUL, repeated or trailing slash, or `.` component; at most
+4096 bytes. Omission means the Seat folder. It passes no caller environment, executable, user,
 Run token or Attempt credential. The Seat's Linux user, folder, screen and
 complete environment come from that operation. It creates no host command and
 never reaps or stops the Computer as part of a Run. Run output, log upload,
 ordinary completion, cancellation and retained results use the existing Run
-paths. File synchronization and background-program rules belong to #1152;
-the `wefty exec --seat` CLI belongs to #1151.
+paths. Working-copy and program lifetime rules follow below.
 
 `contract.DefaultSeatCommandRuntime` is the single shipped default: one hour.
 L1's `--seat-command-max-runtime` startup flag sets the cluster default;
@@ -758,3 +763,62 @@ exit code even if a tool reports an exit code while stopping.
 `wefty rerun` and L3 refuse Seat Runs with `seat_run_not_replayable`
 (HTTP 409, CLI exit 5, not retryable): Seat state cannot be replayed. Start a
 new Seat Run instead.
+
+
+### One working copy per Seat
+
+The working copy is `work` in the Seat folder. For example,
+`wefty cp SEAT_ID:work/out/report.html ./report.html` retrieves a build result.
+Every checkout command reuses `captureExec`: tracked and untracked files that
+Git does not ignore, executable bits and symlinks as captured. Stage A sends
+no `.git` folder; commands that need Git history require a later feature.
+Git attributes such as `export-ignore` or `export-subst` do not alter this
+capture. The caller's checkout wins over edits made to captured files on the
+Seat, even when size and mtime match.
+
+Stage A sends the full frozen snapshot in one `direction=sync&path=work`
+request over the existing Seat copy route and Seat credential. There is no
+manifest round trip or changed-files transfer. The unprivileged sync program
+keeps its last manifest outside `work`, at `.wefty/work-manifest.json`. Each
+entry records path, kind, mode, size and SHA-256 content hash. It hashes the
+Seat's current bytes and compares mode before deciding to replace a file.
+Unchanged files keep their mtime. Changed files are staged, fsynced and renamed
+into place; a real name never contains half a file. The manifest is atomically
+published only after the apply succeeds.
+
+Only paths owned by previous manifests may be removed or replaced. Paths
+removed from the caller's capture, including paths that became ignored, go
+away; directories created by sync are removed when empty. Paths never managed
+by sync, such as `node_modules`, build outputs and copied secrets, stay.
+A newly captured file that collides with an unowned Seat path is refused
+instead of deleting that path. Existing directories can hold both kinds of
+files. Pinned directory descriptors and `O_NOFOLLOW` keep every write within
+`work`; a working-copy symlink cannot redirect a later write outside it.
+
+`.wefty/work.lock` admits one sync at a time per Seat; a concurrent sync is
+refused and may be retried. Sync is not a command lock: a sync while another
+command runs updates the same working copy under that command. Commands do
+not receive private copies. A failed or partial sync retains the old manifest.
+A pending-apply journal outside `work` lets the next sync repair complete
+files already published by a failed apply, including newly added paths.
+
+Each admitted sync has one `copy_in` Seat log event with `direction=sync`,
+`path=work`, file-content bytes sent, and successful apply counts
+`sync.files_written` and `sync.files_removed`. The existing sending/completed/
+failed receipt and Seat hold rules apply. Counts include files and symlinks,
+not directory scaffolding. Failure may report no counts; it never claims a
+successful apply. The CLI waits for completion evidence before it submits.
+
+### Background programs
+
+The command's leader exit ends its Run, even when a background program keeps
+stdout or stderr open. Background programs (for example `sleep 600 &` or a
+browser) survive that exit, until the Seat ends. They do not hold Seat activity
+or delay its idle expiry: only the command hold does so, and it ends with the
+Run. Seat expiry or release stops all processes of the Seat's uid, including
+programs in a separate session, then deletes its folder.
+
+Cancellation and the command limit stop only that command's process group:
+TERM, then KILL after five seconds. A program that made its own session can
+survive command cancellation; it still stops when the Seat ends. No Computer
+stop is used to cancel one command.

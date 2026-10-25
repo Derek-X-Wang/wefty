@@ -2359,9 +2359,13 @@ other Go duration fields). The caller supplies the configured time limit; its
 1-hour default and Run records belong to the node agent/CLI follow-up. Zero
 never disables the limit. There is no stdin or terminal in this operation.
 Unknown fields are rejected. In particular, the wire accepts no environment,
-user, supplementary groups, working directory, executable host path or general
+user, supplementary groups, executable host path or general
 containerd operation. Argv is limited to 4096 entries and 128 KiB including
 terminators; NUL bytes and an empty executable are refused as `invalid_request`.
+An optional `working_directory` is a clean relative path within the Seat
+folder (at most 4096 bytes): no leading `/`, `..` or `.` component, repeated
+or trailing slash or NUL. Omission or empty means the Seat folder.
+L1 carries it from immutable Run params through the Seat Run start reply.
 
 The helper authorizes the exact attempt and checks that it is an admitted
 Computer, is running, and has a wanted, ready Seat in that directive generation.
@@ -2378,7 +2382,8 @@ ready observation.
 
 The operation uses `task.Exec` on the exact running task. It uses uid/gid
 `2000+place`, no supplementary groups, no Linux capabilities, and
-`no_new_privileges`. Its cwd is `/wefty/service/seats/<place>`. Environment is a
+`no_new_privileges`. Its cwd is `/wefty/service/seats/<place>`, with the optional
+`working_directory` appended. Environment is a
 fresh allowlist; no helper, node agent, caller-shell, image, or other-Seat
 variables are copied:
 
@@ -2792,7 +2797,7 @@ display. It runs only as root in `computer-seats.yml`, in
 
 An additive data-stream operation, subject to the same per-Seat, per-Attempt
 and global admission budgets as `ExecComputerSeat`. The request carries exact
-`authority`, `generation`, `place`, `direction` (`in` or `out`) and `path`.
+`authority`, `generation`, `place`, `direction` (`in`, `out` or `sync`) and `path`.
 The helper derives UID/GID, working folder and environment through the Seat
 command path. It uses that path's readiness checks and post-start authority
 check. Refusals retain `seat_operation_refused` with detail `seat_not_ready`
@@ -2823,6 +2828,26 @@ failed input, without a commit marker. Failed input removes staging and
 preserves an old destination. Diagnostics preserve disk-full/read/write
 failure text; the CLI surfaces `seat_copy_failed` or local
 `seat_copy_write_denied`. No copy operation enters the Custody export path.
+
+For `sync`, `path` must be `work`. The helper runs the embedded
+`computer_seat_sync.py` as the Seat uid in the Seat folder, with the same
+stdin completion marker and explicit `CloseIO` as copy-in. The payload is a
+full tar of the CLI's frozen captured tree, with regular files, directories
+and symlinks; hard links, special files and unsafe paths are refused. The
+program pins `work` and `.wefty`, uses `O_NOFOLLOW` for directory traversal,
+serializes sync with `.wefty/work.lock`, atomically renames changed files,
+and publishes `.wefty/work-manifest.json` only after a successful apply.
+A pending journal permits repair after partial apply; incomplete input never
+publishes. Only manifest-owned paths are replaced or deleted, preserving
+unmanaged dependencies and outputs. An unchanged content hash and mode keep
+mtime. This operation never stages a `.git` folder.
+
+Sync stdout carries one bounded JSON summary (`files_written`, `files_removed`,
+`size_bytes`), delivered through normal data frames to the node agent. The
+node consumes it for the existing `copy_in` log event with `direction=sync`;
+it does not relay it as command output. Stderr carries the normal copy
+`size_bytes` completion evidence. File-content bytes exclude tar framing.
+The CLI receives the usual final copy completion only after log receipt.
 
 ### `SetSeatDriver` (#1147)
 
