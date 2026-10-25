@@ -259,6 +259,10 @@ func readSeatCopyHandshake(t *testing.T, child *exec.Cmd, output io.Reader, want
 
 // seatCopyStackDump lets a stuck test child print every Python thread's stack
 // on SIGUSR1, so a bound failure shows where the child waited.
+// seatCopyTerminateBound is generous because a heavily swapping host can
+// stall a healthy child for seconds; it still fails far below the package timeout.
+const seatCopyTerminateBound = 30 * time.Second
+
 const seatCopyStackDump = "import faulthandler, signal\nfaulthandler.register(signal.SIGUSR1, all_threads=True)\n"
 
 // terminateSeatCopyChild sends SIGTERM and requires a failed exit within a
@@ -276,7 +280,7 @@ func terminateSeatCopyChild(t *testing.T, child *exec.Cmd, stderr *bytes.Buffer)
 		if err == nil {
 			t.Fatal("cancelled copy succeeded")
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(seatCopyTerminateBound):
 		_ = child.Process.Signal(syscall.SIGUSR1)
 		select {
 		case <-done:
@@ -284,7 +288,7 @@ func terminateSeatCopyChild(t *testing.T, child *exec.Cmd, stderr *bytes.Buffer)
 			_ = child.Process.Kill()
 			<-done
 		}
-		t.Fatalf("copy child did not exit within 10s of SIGTERM (#1283); stderr=%s", stderr.String())
+		t.Fatalf("copy child did not exit within %s of SIGTERM (#1283); stderr=%s", seatCopyTerminateBound, stderr.String())
 	}
 }
 
