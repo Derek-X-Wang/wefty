@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -93,6 +94,11 @@ func TestRollingUpgradeRound3SafetyRegressions(t *testing.T) {
 
 // Explicit GUI-domain observations and source checks use fake launchd only.
 func TestRollingUpgradeRound4SafetyRegressions(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		// These fixtures use macOS process birth identities and session
+		// semantics; the runner itself only runs on macOS.
+		t.Skip("round-4 runner safety fixtures need macOS process identity")
+	}
 	command := exec.Command("python3", "test-rolling-upgrade-round4.py")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("B1 GUI/source compatibility: %v\n%s", err, output)
