@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -427,7 +428,12 @@ func TestSeatFrontDoorListenFailureKeepsNodeSessionRunning(t *testing.T) {
 	store, stop := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{"door-unavailable": {Tags: []string{"linux"}, MaxOneshotSlots: 1}}, l1.DefaultLeaseDuration)
 	defer stop()
 	logs := make(chan string, 20)
-	node, err := New(Config{Fabric: seatDoorRefusingFabric{network.NewFabric(fabric.Identity{NodeID: "node-fabric", Tags: []string{l1.DefaultAgentPrincipalTag}})}, ControlPlaneAddress: "wefty://control-plane", NodeID: "door-unavailable", BootSessionID: "boot", Version: "test", Capabilities: map[string]bool{"kind:process": true}, ManagedRootDirectory: t.TempDir(), LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), Logf: func(format string, args ...any) {
+	// macOS reaches t.TempDir through the /var symlink; New refuses it.
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := New(Config{Fabric: seatDoorRefusingFabric{network.NewFabric(fabric.Identity{NodeID: "node-fabric", Tags: []string{l1.DefaultAgentPrincipalTag}})}, ControlPlaneAddress: "wefty://control-plane", NodeID: "door-unavailable", BootSessionID: "boot", Version: "test", Capabilities: map[string]bool{"kind:process": true}, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), Logf: func(format string, args ...any) {
 		select {
 		case logs <- fmt.Sprintf(format, args...):
 		default:
