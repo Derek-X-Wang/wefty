@@ -173,7 +173,7 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	if err := requireComputerCAS(result, computerID, abortedRevision); err != nil {
 		return Computer{}, false, err
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentAbort,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentAbort,
 		computer.DesiredState, computer.StorageID, computer.StorageGeneration, computer.CurrentJobID,
 		computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, false, err

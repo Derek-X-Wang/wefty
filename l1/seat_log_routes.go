@@ -23,6 +23,12 @@ func (s *Server) getSeatLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if r.Header.Get("X-Wefty-Seat-Call") == "start" && r.Header.Get(SeatCredentialHeader) != "" {
+		if err := s.store.seatLogCallHappened(r.Context(), r.PathValue("seat_id"), r.Header.Get(SeatCredentialHeader)); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
 	page, err := s.store.GetSeatLogs(r.Context(), identityFromRequest(r).NodeID, r.PathValue("seat_id"), r.Header.Get(SeatCredentialHeader), r.URL.Query().Get("cursor"), limit)
 	if err != nil {
 		writeError(w, err)
@@ -69,6 +75,15 @@ func (s *Server) seatCredentialProtocol(next, logs http.Handler) http.Handler {
 			writeError(w, err)
 			return
 		}
+		if !ended.Valid {
+			value, err := s.store.checkSeatCredentialEnd(r.Context(), id)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			ended.Valid = value.State == SeatEnding || value.State == SeatEnded || value.State == SeatRefused
+			reason = value.Reason
+		}
 		path := "/v1/seats/" + id
 		if (r.Method == http.MethodGet && r.URL.Path == path+"/logs") || (r.Method == http.MethodPost && r.URL.Path == path+"/logs/read") {
 			logs.ServeHTTP(w, r)
@@ -76,6 +91,10 @@ func (s *Server) seatCredentialProtocol(next, logs http.Handler) http.Handler {
 		}
 		if strings.HasPrefix(r.URL.Path, "/v1/seats/") && (strings.HasSuffix(r.URL.Path, "/logs") || strings.HasSuffix(r.URL.Path, "/logs/read")) {
 			writeError(w, protocolError(contract.ErrorForbidden, "Seat credential belongs to another Seat log"))
+			return
+		}
+		if (!ended.Valid || reason == "released") && r.Method == http.MethodPost && r.URL.Path == path+"/release" {
+			logs.ServeHTTP(w, r)
 			return
 		}
 		if ended.Valid {

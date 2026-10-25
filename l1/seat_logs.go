@@ -131,7 +131,7 @@ func writeSeatEvent(ctx context.Context, q seatApprovalQuery, at time.Time, even
 		return protocolError(contract.ErrorInvalidRequest, "invalid Seat log event")
 	}
 	switch event.Kind {
-	case SeatEventRequested, SeatEventApproved, SeatEventRefused, SeatEventStarting, SeatEventStarted, SeatEventReleased, SeatEventEnded, SeatEventOwnerStop, SeatEventOwnerRestart, SeatEventCommandStarted, SeatEventCommandFinished, SeatEventCopyIn, SeatEventCopyOut, SeatEventControlTaken, SeatEventControlReleased:
+	case SeatEventEndsSoon, SeatEventOwnerReimage, SeatEventOwnerReset, SeatEventOwnerRemove, SeatEventRequested, SeatEventApproved, SeatEventRefused, SeatEventStarting, SeatEventStarted, SeatEventReleased, SeatEventEnded, SeatEventOwnerStop, SeatEventOwnerRestart, SeatEventCommandStarted, SeatEventCommandFinished, SeatEventCopyIn, SeatEventCopyOut, SeatEventControlTaken, SeatEventControlReleased:
 	default:
 		return protocolError(contract.ErrorInvalidRequest, "unknown Seat log event kind")
 	}

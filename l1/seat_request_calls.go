@@ -201,7 +201,7 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 		if err != nil {
 			return err
 		}
-		expired, err = seatApprovalNeedsExpiry(ctx, q, value, at)
+		expired, err = seatApprovalNeedsExpiry(ctx, q, value, at, s.clock)
 		if err != nil {
 			return err
 		}
@@ -568,7 +568,9 @@ func (s *Store) limitSeatCallDeadline(ctx context.Context, identity, id string, 
 	if err := authorizeSeatRequest(ctx, write.tx, identity, id, poll.NodeID, poll.BootSessionID); err != nil {
 		return err
 	}
-	if _, err := write.tx.ExecContext(ctx, `UPDATE seat_approvals SET deadline_ns=MIN(deadline_ns,?) WHERE seat_id=? AND state='requested'`, deadline.UnixNano(), id); err != nil {
+	// Shorten the elapsed wait by the same dispatch delay, once. The immutable
+	// AnswerWait remains the node setting; repeated polls cannot shift it again.
+	if _, err := write.tx.ExecContext(ctx, `UPDATE seat_approvals SET wait_started_ns=wait_started_ns-MAX(0,deadline_ns-?),deadline_ns=MIN(deadline_ns,?) WHERE seat_id=? AND state='requested'`, deadline.UnixNano(), deadline.UnixNano(), id); err != nil {
 		return err
 	}
 	return write.commit()

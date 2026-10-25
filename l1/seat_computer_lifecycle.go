@@ -32,6 +32,17 @@ func endComputerSeats(ctx context.Context, q seatApprovalQuery, computer, attemp
 			kind = SeatEventOwnerStop
 		} else if reason == "computer_restarted" {
 			kind = SeatEventOwnerRestart
+		} else if reason == "computer_reimaged" {
+			kind = SeatEventOwnerReimage
+		} else if reason == "computer_reset" {
+			kind = SeatEventOwnerReset
+		} else if reason == "computer_removed" {
+			kind = SeatEventOwnerRemove
+		}
+		if kind != "" {
+			if _, err := q.ExecContext(ctx, `UPDATE seat_approvals SET ended_computer_revision=(SELECT intent_revision FROM computers WHERE computer_id=?) WHERE seat_id=?`, computer, id); err != nil {
+				return err
+			}
 		}
 		if kind != "" {
 			if err := appendSeatEvent(ctx, q, now, SeatLogEvent{SeatID: id, EventID: string(kind), Kind: kind, Reason: reason}); err != nil {

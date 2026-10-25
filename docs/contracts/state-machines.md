@@ -2254,8 +2254,11 @@ also covers requests without internet. A window without internet never covers
 requests with internet. New requests check L1 inside the approval write, with no cached allow. At the exact expiry
 boundary the next request needs a dialog. Window expiry does not stop running
 Seats. Windows are boot-scoped, so replacing a node boot cannot inherit one.
-L1 records expiry from its injected clock; the cross-sleep monotonic time
-source is the separate #1146 integration.
+L1 records expiry from its injected sleep-counting clock; durable boot-relative
+stamps survive an L1 restart in the same boot. A new L1 host boot closes its
+approval windows with the logged reason `l1_host_restarted`; the next request
+needs the owner dialog again. Pending answer waits may restart for their
+original bounded duration. A different node boot still invalidates its windows.
 
 `GET /v1/seat-approval-windows` supplies the coherent L1 read used by
 `wefty status`, including each open window's node, network and end time.
@@ -2765,3 +2768,77 @@ regardless of generation enrollment; record-specific conversion errors preserve
 the affected identity and readable Nodes. Neither error infers Attempt failure.
 Database/snapshot failures remain request failures; private authority reads stay
 strict and all L1 diagnostic reads retain `TxOptions{ReadOnly:true}`.
+
+
+### Seat expiry and Computer idle actions (#1146)
+
+L1 owns the Seat idle wait (30 minutes), warning interval (5 minutes), and
+Computer idle wait (10 minutes). These are startup settings, alongside the
+existing Computer defaults: `--seat-idle-wait`, `--seat-warning-wait`, and
+`--computer-idle-wait`. `wefty setup` persists explicit values in its existing
+Computer settings receipt and installs them on L1 only. A setup rerun retains
+unspecified values; changing one restarts L1 without restarting the node service. A changed setting applies at the next check.
+`idle_action` remains on the Computer; no second settings store is introduced.
+This stage implements `delete` and `nothing`; `stop` remains stage B.
+
+A Seat request's answer wait includes dispatch delay: capping the request
+deadline shortens the boot-clock wait by that delay without changing the
+immutable node AnswerWait setting or shortening it again on repeated polls.
+
+A Seat's idle origin is the latest credential call, command end, or person's
+screen release. Running commands and a person driving hold expiry. Background
+programs and log-follow polls do not. Trusted backend seams are
+`SeatCallHappened`, `SeatCommandRunning`, `SeatPersonDriving`, and
+`SeatCommandsToCancel`. Stable command IDs make repeats harmless. A command
+backend must cancel every outstanding command when its Seat loses authority.
+
+Durable waits pair a boot identity with a sleep-counting elapsed clock, behind
+the injected clock seam: Darwin `CLOCK_MONOTONIC_RAW`, Linux `CLOCK_BOOTTIME`.
+Calendar timestamps label logs and replies; they do not decide Seat expiry or
+approval-window authority. L1 restarts on the same boot retain the wait.
+A new L1 host boot gives each live Seat a full idle wait and may restart pending
+answers for their original bounded duration, once per boot. Approval windows
+are dropped with reason `l1_host_restarted`, so reboot cannot extend their
+maximum 24-hour cap. Command and screen holds remain durable. An L1 reboot is not a
+Computer restart: only the existing Attempt lifecycle supplies that end reason.
+Command and screen holds survive an L1 reboot by design; #1150 and #1147 must
+clear their holds on a Computer restart.
+A backward elapsed-clock step within the same boot means zero elapsed and
+never a reboot. Boot identity alone identifies a new boot.
+L1's general timestamps use real wall time, without a global clock anchor.
+Existing Attempt lease comparisons still use wall time; a calendar step can
+therefore independently remove Attempt authority. Hardening those lease paths
+is separate from the Seat timers described here.
+SL-7 is not met end to end until #1247 lands: a wall-clock step larger than the
+lease time on L1's host can remove Attempt authority and end Seats as
+`the Computer restarted`.
+Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
+pending approvals and windows without a stamp do not retain authority.
+
+Release and expiry remove wanted Seat membership, enter `ending`, append the
+end reason, and stop the credential immediately except for its retained log.
+The node agent applies the reduced list with `ApplyComputerSeats`; the helper
+stops the Seat's processes and removes its folder. Only positive cleanup
+enters `ended`; existing `computer_room_limits` readback fences memory release.
+A Computer restart and owner stop, restart, reimage, reset or remove use this
+same lifecycle. Owner replies list Seats ended by that intent revision.
+The same credential can repeat a release whose reason is `released` and get
+the retained successful outcome, including after cleanup. Other ended reasons
+retain the typed refusal.
+
+Seat life and idle maintenance failures never stop L1 startup or its HTTP
+server. Each Seat and Computer has an independent transaction. A failure is
+logged as one typed `seat_life_retry` line and retried next tick. Expected
+removal conflicts (changed intent, changed Storage reference, missing Computer,
+or ordinary conflict) yield to the concurrent action.
+
+The idle wait starts when the last active Seat leaves. Every owner intent
+change restarts it at that intent's commit, including backup-cap changes,
+reimage, reset, start, restart and stop. New admission clears
+it under the reservation fence. At deletion, L1 rechecks the current Desired
+state, idle action, elapsed wait and absence of active Seats inside the same
+write transaction that publishes removal. A Seat or owner stop that wins that
+fence cancels deletion. Once removal wins, admission cannot select that
+Computer. An owner-stopped Computer is never deleted by this timer. Automatic
+deletion uses the existing `RemoveComputer` path and its cleanup proof, without
+claiming `removed_verified` before the node agent and helper prove removal.

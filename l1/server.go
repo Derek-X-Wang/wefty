@@ -533,6 +533,7 @@ func (s *Server) routes() http.Handler {
 	seatLogs := http.NewServeMux()
 	seatLogs.HandleFunc("GET /v1/seats/{seat_id}/logs", s.getSeatLogs)
 	seatLogs.HandleFunc("POST /v1/seats/{seat_id}/logs/read", s.markSeatLogRead)
+	seatLogs.HandleFunc("POST /v1/seats/{seat_id}/release", s.releaseSeat)
 	root := http.NewServeMux()
 	root.Handle("/v1/seats/", s.authorize(clientPrincipal, seatLogs))
 	root.Handle("/v1/seat-requests", s.authorize(clientPrincipal, client))

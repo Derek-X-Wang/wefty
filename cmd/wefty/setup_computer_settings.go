@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
@@ -25,13 +26,20 @@ import (
 // Only explicit settings are retained in the setup receipt, outside the
 // installed service environment inherited by process jobs.
 type setupComputerOptions struct {
-	Image           *string `json:"image,omitempty"`
-	SharedSeatLimit *int    `json:"shared_seat_limit,omitempty"`
-	SeatMemoryBytes *int64  `json:"seat_memory_bytes,omitempty"`
-	DedicatedCap    *int    `json:"dedicated_cap,omitempty"`
+	SeatIdleWait     *time.Duration `json:"seat_idle_wait,omitempty"`
+	SeatWarningWait  *time.Duration `json:"seat_warning_wait,omitempty"`
+	ComputerIdleWait *time.Duration `json:"computer_idle_wait,omitempty"`
+	Image            *string        `json:"image,omitempty"`
+	SharedSeatLimit  *int           `json:"shared_seat_limit,omitempty"`
+	SeatMemoryBytes  *int64         `json:"seat_memory_bytes,omitempty"`
+	DedicatedCap     *int           `json:"dedicated_cap,omitempty"`
 }
 
 func bindSetupComputerFlags(flags *flag.FlagSet, values *setupComputerOptions) {
+	flags.Func("seat-idle-wait", "Seat idle wait (default 30m)", setupPositiveDuration("seat-idle-wait", &values.SeatIdleWait))
+	flags.Func("seat-warning-wait", "warning interval before Seat expiry (default 5m)", setupPositiveDuration("seat-warning-wait", &values.SeatWarningWait))
+	flags.Func("computer-idle-wait", "Computer idle wait (default 10m)", setupPositiveDuration("computer-idle-wait", &values.ComputerIdleWait))
+
 	flags.Func("computer-default-image", "digest-pinned cluster default Computer image reference", func(value string) error {
 		if err := l1.ValidateComputerDefaultImage(value); err != nil {
 			return err
@@ -65,7 +73,29 @@ func bindSetupComputerFlags(flags *flag.FlagSet, values *setupComputerOptions) {
 	})
 }
 
+// setupPositiveDuration parses one timer setting. Flag names stay literal at
+// the registration site for TestJSONValueFlagVocabulary.
+func setupPositiveDuration(name string, target **time.Duration) func(string) error {
+	return func(raw string) error {
+		value, err := time.ParseDuration(raw)
+		if err != nil || value <= 0 {
+			return fmt.Errorf("--%s requires a positive duration", name)
+		}
+		*target = &value
+		return nil
+	}
+}
+
 func (values *setupComputerOptions) merge(next setupComputerOptions) {
+	if next.SeatIdleWait != nil {
+		values.SeatIdleWait = next.SeatIdleWait
+	}
+	if next.SeatWarningWait != nil {
+		values.SeatWarningWait = next.SeatWarningWait
+	}
+	if next.ComputerIdleWait != nil {
+		values.ComputerIdleWait = next.ComputerIdleWait
+	}
 	if next.Image != nil {
 		values.Image = next.Image
 	}
@@ -80,8 +110,12 @@ func (values *setupComputerOptions) merge(next setupComputerOptions) {
 	}
 }
 
+func (values setupComputerOptions) hasClusterSettings() bool {
+	return values.Image != nil || values.SharedSeatLimit != nil || values.SeatIdleWait != nil || values.SeatWarningWait != nil || values.ComputerIdleWait != nil
+}
+
 func (values setupComputerOptions) empty() bool {
-	return values.Image == nil && values.SharedSeatLimit == nil && values.SeatMemoryBytes == nil && values.DedicatedCap == nil
+	return !values.hasClusterSettings() && values.SeatMemoryBytes == nil && values.DedicatedCap == nil
 }
 
 func (values setupComputerOptions) validate() error {
@@ -89,12 +123,33 @@ func (values setupComputerOptions) validate() error {
 	flags.SetOutput(io.Discard)
 	var checked setupComputerOptions
 	bindSetupComputerFlags(flags, &checked)
-	return flags.Parse(values.arguments(true, true))
+	if err := flags.Parse(values.arguments(true, true)); err != nil {
+		return err
+	}
+	idle, warning := l1.DefaultSeatIdleWait, l1.DefaultSeatWarningWait
+	if checked.SeatIdleWait != nil {
+		idle = *checked.SeatIdleWait
+	}
+	if checked.SeatWarningWait != nil {
+		warning = *checked.SeatWarningWait
+	}
+	if warning >= idle {
+		return errors.New("Seat warning wait must be less than the Seat idle wait")
+	}
+	return nil
 }
 
 func (values setupComputerOptions) arguments(cluster, node bool) []string {
 	var args []string
 	if cluster {
+		for _, setting := range []struct {
+			name  string
+			value *time.Duration
+		}{{"seat-idle-wait", values.SeatIdleWait}, {"seat-warning-wait", values.SeatWarningWait}, {"computer-idle-wait", values.ComputerIdleWait}} {
+			if setting.value != nil {
+				args = append(args, "--"+setting.name+"="+setting.value.String())
+			}
+		}
 		if values.Image != nil {
 			args = append(args, "--computer-default-image="+*values.Image)
 		}
@@ -119,7 +174,7 @@ func applySetupComputerSettings(paths setupPaths, profile connprofile.Profile, s
 		return nil, err
 	}
 	hasL1 := slices.ContainsFunc(services, func(s launchagent.Agent) bool { return s.Label == setupL1Label })
-	if (values.Image != nil || values.SharedSeatLimit != nil) && !hasL1 {
+	if values.hasClusterSettings() && !hasL1 {
 		return nil, errors.New("cluster Computer settings require the control-plane installation")
 	}
 	var room *l1.ComputerRoomConfig
@@ -137,6 +192,7 @@ func applySetupComputerSettings(paths setupPaths, profile connprofile.Profile, s
 		switch service.Label {
 		case setupL1Label:
 			scoped.Image, scoped.SharedSeatLimit = values.Image, values.SharedSeatLimit
+			scoped.SeatIdleWait, scoped.SeatWarningWait, scoped.ComputerIdleWait = values.SeatIdleWait, values.SeatWarningWait, values.ComputerIdleWait
 			service.Arguments = append(service.Arguments, scoped.arguments(true, false)...)
 			if room != nil && profile.Identities.Node != "" {
 				policies := profile.L1().NodePolicies()
@@ -257,7 +313,7 @@ func validateSetupComputerPlan(paths setupPaths, plan serviceplan.Plan, changes 
 	if err != nil {
 		return values, err
 	}
-	if plan.Role == serviceplan.Join && (values.Image != nil || values.SharedSeatLimit != nil) {
+	if plan.Role == serviceplan.Join && values.hasClusterSettings() {
 		return values, errors.New("cluster Computer settings require the control-plane installation")
 	}
 	for _, service := range plan.Services {

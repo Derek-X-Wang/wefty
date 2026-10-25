@@ -228,7 +228,7 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 		newID("custody-fence"), specJSON, specHash, request.IdempotencyKey, requestHash, now.UnixNano()); err != nil {
 		return ComputerCustodyExport{}, false, internalError(err, "record Custody export before external bytes")
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, revision, ComputerIntentCustodyExport,
+	if err := s.insertComputerIntent(ctx, tx, computerID, revision, ComputerIntentCustodyExport,
 		computer.DesiredState, computer.StorageID, computer.StorageGeneration, computer.CurrentJobID,
 		computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return ComputerCustodyExport{}, false, err
@@ -731,7 +731,7 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		specHash, request.Actor); err != nil {
 		return ComputerCustodyImport{}, false, internalError(err, "reserve Custody import in Storage copy ledger")
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, 1, ComputerIntentCustodyImport,
+	if err := s.insertComputerIntent(ctx, tx, computerID, 1, ComputerIntentCustodyImport,
 		contract.ServiceDesiredStopped, storageID, 1, jobID, 1, request.Actor, now); err != nil {
 		return ComputerCustodyImport{}, false, err
 	}

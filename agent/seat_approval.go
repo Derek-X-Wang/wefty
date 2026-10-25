@@ -127,7 +127,19 @@ func NewSeatApprovalController(client SeatApprovalClient, nodeID, boot string, s
 		dialog = NativeSeatApprovalDialog{}
 	}
 	if clock == nil {
-		clock = systemClock{}
+		clock = seatWaitClock{}
+	} else if _, production := clock.(systemClock); production {
+		clock = seatWaitClock{}
+	}
+	if c, ok := clock.(seatWaitClock); ok {
+		if c.failure == nil {
+			c.failure = &seatClockFailure{}
+		}
+		c.Now()
+		if err := c.Err(); err != nil {
+			return nil, err
+		}
+		clock = c
 	}
 	return &SeatApprovalController{client: client, nodeID: nodeID, bootSessionID: boot, settings: settings, dialog: dialog, clock: clock, calls: make(map[string]*seatApprovalCall), dialogSlot: make(chan struct{}, 1)}, nil
 }
@@ -170,6 +182,9 @@ func (c *SeatApprovalController) RequestApproval(ctx context.Context, request l1
 	return call.result, call.err
 }
 func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1.SeatApprovalRequest, call *seatApprovalCall) (l1.SeatApproval, error) {
+	if err := seatApprovalClockError(c.clock); err != nil {
+		return l1.SeatApproval{}, err
+	}
 	started := c.clock.Now()
 	pending, err := c.client.BeginSeatApproval(ctx, request)
 	if err != nil || pending.State != "requested" {
@@ -178,7 +193,8 @@ func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1
 	// A queued request keeps its deadline from request start. The L1 deadline
 	// independently limits it, including time spent in the initial exchange.
 	deadline := started.Add(request.AnswerWait)
-	serverDeadline := c.clock.Now().Add(pending.Deadline.Sub(wallNow(c.clock)))
+	remainingWait := pending.RemainingWait
+	serverDeadline := c.clock.Now().Add(remainingWait)
 	if serverDeadline.Before(deadline) {
 		deadline = serverDeadline
 	}
@@ -200,9 +216,15 @@ func (c *SeatApprovalController) requestApproval(ctx context.Context, request l1
 	}
 	// Keep an unconfirmed answer until L1 settles it or its deadline passes.
 	// A lost post must never turn it back into a new dialog on the next poll.
+	if err := seatApprovalClockError(c.clock); err != nil {
+		return pending, err
+	}
 	call.answer = &answer
 	backoff := time.Second
 	for {
+		if err := seatApprovalClockError(c.clock); err != nil {
+			return pending, err
+		}
 		postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		value, err := c.client.AnswerSeatApproval(postCtx, request.SeatID, *call.answer)
 		cancel()
@@ -335,4 +357,11 @@ func (c *Client) AnswerSeatApproval(ctx context.Context, seatID string, answer l
 // Its context belongs to the node-owned request, not a reconnectable CLI wait.
 func (a *Agent) RequestSeatApproval(ctx context.Context, request l1.SeatApprovalRequest) (l1.SeatApproval, error) {
 	return a.seatApprovals.RequestApproval(ctx, request)
+}
+
+func seatApprovalClockError(clock Clock) error {
+	if c, ok := clock.(interface{ Err() error }); ok {
+		return c.Err()
+	}
+	return nil
 }

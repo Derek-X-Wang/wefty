@@ -46,6 +46,9 @@ const (
 )
 
 type StoreOptions struct {
+	SeatIdleWait                      time.Duration
+	SeatWarningWait                   time.Duration
+	ComputerIdleWait                  time.Duration
 	Clock                             Clock
 	Jitter                            func(time.Duration) time.Duration
 	LeaseDuration                     time.Duration
@@ -76,6 +79,9 @@ type StoreOptions struct {
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
+	seatIdleWait                      time.Duration
+	seatWarningWait                   time.Duration
+	computerIdleWait                  time.Duration
 	personDeviceBinding               personDeviceBinding
 	readSnapshotHardLimitForTest      time.Duration
 	readDB                            *sql.DB
@@ -236,12 +242,25 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, err
 	}
 
+	if options.SeatIdleWait == 0 {
+		options.SeatIdleWait = DefaultSeatIdleWait
+	}
+	if options.SeatWarningWait == 0 {
+		options.SeatWarningWait = DefaultSeatWarningWait
+	}
+	if options.ComputerIdleWait == 0 {
+		options.ComputerIdleWait = DefaultComputerIdleWait
+	}
+	if options.SeatIdleWait <= 0 || options.SeatWarningWait < 0 || options.SeatWarningWait >= options.SeatIdleWait || options.ComputerIdleWait <= 0 {
+		return nil, fmt.Errorf("invalid Seat or Computer idle waits")
+	}
 	db, err := sql.Open("sqlite", sqliteDSN(path, sqliteBusyTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("l1: open SQLite: %w", err)
 	}
 	db.SetMaxOpenConns(16)
 	store := &Store{
+		seatIdleWait: options.SeatIdleWait, seatWarningWait: options.SeatWarningWait, computerIdleWait: options.ComputerIdleWait,
 		db: db, logf: log.Printf, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
@@ -1277,6 +1296,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 `
 	if _, err := s.db.ExecContext(ctx, schema+seatApprovalSchema+computerSeatSchema+seatRoomSchema+seatCallSchema+seatLogSchema); err != nil {
 		return fmt.Errorf("l1: apply SQLite schema: %w", err)
+	}
+	if err := s.migrateSeatLife(ctx); err != nil {
+		return err
 	}
 	if err := s.migrateSeatLifecycle(ctx); err != nil {
 		return err

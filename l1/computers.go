@@ -91,6 +91,7 @@ type ComputerIntent struct {
 // replacement.
 type Computer struct {
 	ComputerSettings
+	EndedSeats                []ComputerEndedSeat                `json:"ended_seats,omitempty"`
 	SeatRequestMade           bool                               `json:"seat_request_made"`
 	ComputerID                string                             `json:"computer_id"`
 	Name                      string                             `json:"name"`
@@ -170,6 +171,7 @@ type ComputerRemoveRequest struct {
 	ComputerMutationPrecondition
 	// Node-owned failed-start cleanup only; never accepted from JSON.
 	failedSeatRequestID string
+	idleOnly            bool
 }
 
 type ComputerProjectionRequest struct {
@@ -481,7 +483,7 @@ func (s *Store) createComputerTx(ctx context.Context, tx *sql.Tx, now time.Time,
 		request.Spec.Execution.OCI.Computer.DiskBytes, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "store initial Computer Storage generation")
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, initialComputerRevision, ComputerIntentCreate,
+	if err := s.insertComputerIntent(ctx, tx, computerID, initialComputerRevision, ComputerIntentCreate,
 		contract.ServiceDesiredRunning, storageID, 1, job.JobID, 1, request.Actor, now); err != nil {
 		return Computer{}, false, err
 	}
@@ -578,7 +580,7 @@ func insertComputerJobWithID(
 	return job, nil
 }
 
-func insertComputerIntent(
+func (s *Store) insertComputerIntent(
 	ctx context.Context,
 	tx *sql.Tx,
 	computerID string,
@@ -598,6 +600,24 @@ func insertComputerIntent(
 	) VALUES(?, ?, ?, ?, ?, ?, (SELECT backup_cap FROM computers WHERE computer_id=?), ?, ?, ?, ?)`, computerID, revision, operation, desired,
 		storageID, storageGeneration, computerID, jobID, specRevision, actor, now.UnixNano()); err != nil {
 		return internalError(err, "append immutable Computer intent")
+	}
+	if revision > initialComputerRevision {
+		var made bool
+		if err := tx.QueryRowContext(ctx, `SELECT seat_request_made FROM computers WHERE computer_id=?`, computerID).Scan(&made); err != nil {
+			return internalError(err, "read Computer idle timer ownership")
+		}
+		if !made {
+			return nil
+		}
+		boot, ns, err := seatTime(s.clock, now)
+		if err != nil {
+			s.logSeatLifeError(computerID, err)
+			boot = ""
+			ns = 0
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE computers SET wait_boot_id=?,wait_started_ns=? WHERE computer_id=? AND seat_request_made=1`, boot, ns, computerID); err != nil {
+			return internalError(err, "restart Computer idle wait")
+		}
 	}
 	return nil
 }
@@ -830,6 +850,10 @@ func readComputerAuthority(ctx context.Context, q queryer, computerID string, no
 	if err != nil {
 		return Computer{}, fmt.Errorf("read Computer Storage cleanup quarantines: %w", err)
 	}
+	computer.EndedSeats, err = readComputerEndedSeats(ctx, q, computerID, computer.IntentRevision)
+	if err != nil {
+		return Computer{}, err
+	}
 	computer.OwedRevocations, err = readOwedComputerRevocations(ctx, q, computerID)
 	if err != nil {
 		return Computer{}, fmt.Errorf("read owed Computer revocations: %w", err)
@@ -970,7 +994,7 @@ func (s *Store) SetComputerBackupCap(ctx context.Context, computerID string, req
 	if err := requireComputerCAS(result, computerID, computer.IntentRevision); err != nil {
 		return Computer{}, err
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentBackupCap,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentBackupCap,
 		computer.DesiredState, computer.StorageID, computer.StorageGeneration, computer.CurrentJobID,
 		computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, err
@@ -1158,7 +1182,7 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	if request.DesiredState == contract.ServiceDesiredStopped {
 		operation = ComputerIntentStop
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, operation,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, operation,
 		request.DesiredState, computer.StorageID, computer.StorageGeneration,
 		computer.CurrentJobID, computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, err
@@ -1184,6 +1208,11 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 			return Computer{}, err
 		}
 	}
+	updated.EndedSeats, err = readComputerEndedSeats(ctx, tx, computerID, updated.IntentRevision)
+	if err != nil {
+		return Computer{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer desired state")
 	}
@@ -1258,7 +1287,8 @@ func computerRestartRequestHash(request ComputerRestartRequest) (string, error) 
 	return hex.EncodeToString(hash[:]), nil
 }
 
-// RestartComputer clears a stopped or latched-failed current projection under
+// RestartComputer also accepts an active Seat-request Computer, ending its
+// Seats immediately. Legacy Computers clear a stopped or latched-failed projection under
 // Computer CAS. Direct Job restart remains forbidden so the durable resource,
 // not an immutable observation, owns the fresh-attempt decision.
 func (s *Store) RestartComputer(ctx context.Context, computerID string, request ComputerRestartRequest) (Computer, bool, error) {
@@ -1300,7 +1330,7 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if err := computerWritePreconditionDecision(ctx, computer, request.ComputerMutationPrecondition); err != nil {
 		return Computer{}, false, err
 	}
-	activeResourceRestart, err := computerRestartDecision(ctx, transactionReads(tx, now), computer, request)
+	activeRestart, err := computerRestartDecision(ctx, transactionReads(tx, now), computer, request)
 	if err != nil {
 		return Computer{}, false, err
 	}
@@ -1318,15 +1348,15 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if err := requireComputerCAS(result, computerID, computer.IntentRevision); err != nil {
 		return Computer{}, false, err
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentRestart,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentRestart,
 		contract.ServiceDesiredRunning, computer.StorageID, computer.StorageGeneration,
 		computer.CurrentJobID, computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, false, err
 	}
-	if activeResourceRestart {
+	if activeRestart {
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs SET state=?, updated_ns=? WHERE job_id=?`,
 			contract.JobStopping, now.UnixNano(), computer.CurrentJobID); err != nil {
-			return Computer{}, false, internalError(err, "quiesce active Computer resource latch")
+			return Computer{}, false, internalError(err, "quiesce active Computer for restart")
 		}
 	} else if err := transitionServiceJob(ctx, tx, computer.CurrentJobID, contract.ServiceDesiredRunning, contract.JobQueued, now); err != nil {
 		return Computer{}, false, err
@@ -1365,6 +1395,11 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	if err != nil {
 		return Computer{}, false, err
 	}
+	updated.EndedSeats, err = readComputerEndedSeats(ctx, tx, computerID, updated.IntentRevision)
+	if err != nil {
+		return Computer{}, false, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return Computer{}, false, internalError(err, "commit Computer restart")
 	}
@@ -1388,6 +1423,15 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	}
 	if err != nil {
 		return Computer{}, internalError(err, "read Computer removal target")
+	}
+	if request.idleOnly {
+		due, err := s.computerIdleDue(ctx, tx, computerID, false)
+		if err != nil {
+			return Computer{}, err
+		}
+		if !due {
+			return computer, protocolError(contract.ErrorConflict, "Computer is no longer idle")
+		}
 	}
 	if id := request.failedSeatRequestID; id != "" {
 		if computer.Name != seatCallComputerName(id) || !computer.SeatRequestMade {
@@ -1480,7 +1524,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	if err := requireComputerCAS(result, computerID, computer.IntentRevision); err != nil {
 		return Computer{}, err
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentRemove,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentRemove,
 		contract.ServiceDesiredRemoved, computer.StorageID, computer.StorageGeneration,
 		computer.CurrentJobID, computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, err
@@ -1561,6 +1605,10 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 		computerID: computerID, hostNodeID: computerHostNodeID(computer),
 		verb: ComputerRevocationVerbRemove, reason: "computer_removed", holdingAttempts: holding,
 	}, now)
+	if err != nil {
+		return Computer{}, err
+	}
+	removed.EndedSeats, err = readComputerEndedSeats(ctx, tx, computerID, removed.IntentRevision)
 	if err != nil {
 		return Computer{}, err
 	}
@@ -1838,7 +1886,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	if err := requireComputerCAS(result, computerID, computer.IntentRevision); err != nil {
 		return Computer{}, err
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, operation,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, operation,
 		computer.DesiredState, computer.StorageID, computer.StorageGeneration,
 		job.JobID, nextSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, err
@@ -1897,6 +1945,11 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	if err != nil {
 		return Computer{}, err
 	}
+	updated.EndedSeats, err = readComputerEndedSeats(ctx, tx, computerID, updated.IntentRevision)
+	if err != nil {
+		return Computer{}, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return Computer{}, internalError(err, "commit Computer projection install")
 	}

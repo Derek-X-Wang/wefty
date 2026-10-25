@@ -130,7 +130,7 @@ func computerAllowedActions(ctx context.Context, tx readModel, computer Computer
 			input("spec", "object", true)
 		case "reimage", "reset":
 			key()
-			if computerRuntimeActive(computer) {
+			if computerRuntimeActive(computer) && !computer.SeatRequestMade {
 				action.Requires["terminate_sessions"] = true
 			} else {
 				input("terminate_sessions", "boolean", false)

@@ -212,7 +212,7 @@ func (s *Store) BeginComputerGrow(ctx context.Context, computerID string, reques
 		requestHash, now.UnixNano()); err != nil {
 		return Computer{}, false, internalError(err, "persist Computer grow intent")
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentGrow, computer.DesiredState,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentGrow, computer.DesiredState,
 		computer.StorageID, computer.StorageGeneration, computer.CurrentJobID, computer.CurrentSpecRevision,
 		request.Actor, now); err != nil {
 		return Computer{}, false, err

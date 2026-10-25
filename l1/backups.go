@@ -264,7 +264,7 @@ func (s *Store) BeginComputerBackup(ctx context.Context, computerID string, requ
 	if err := requireComputerCAS(result, computerID, computer.IntentRevision); err != nil {
 		return Computer{}, false, err
 	}
-	if err := insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentBackupCreate,
+	if err := s.insertComputerIntent(ctx, tx, computerID, nextRevision, ComputerIntentBackupCreate,
 		computer.DesiredState, computer.StorageID, computer.StorageGeneration, computer.CurrentJobID,
 		computer.CurrentSpecRevision, request.Actor, now); err != nil {
 		return Computer{}, false, err

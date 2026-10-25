@@ -30,13 +30,11 @@ changed evidence returns
 replay. A supplied timestamp is immutable evidence.
 
 The closed kinds are `requested`, `approved`, `refused`, `starting`, `started`,
-`released`, `ended`, `owner_stop`, `owner_restart`, `command_started`,
-`command_finished`, `copy_in`, `copy_out`, `control_taken`, and
-`control_released`. This ticket produces request, approval/refusal, start and
-end events, and owner stop/restart events in existing Computer lifecycle
-operations. Future release, command, copy and control tickets use this same
-writer and vocabulary. They are not implemented by this contract. There is
-no ends-soon event here; the expiry ticket owns that behavior.
+`released`, `ended`, `ends_soon`, `owner_stop`, `owner_restart`, `owner_reimage`,
+`owner_reset`, `owner_remove`, `command_started`, `command_finished`, `copy_in`,
+`copy_out`, `control_taken`, and `control_released`. Lifecycle writers produce
+request, approval/refusal, start, release, warning, end, and owner-action events.
+Command, copy and control backends use the same writer and vocabulary.
 
 A Seat loses action authority at `ending` (or `refused`), before cleanup.
 The terminal event and its reason are recorded then; later cleanup does not
@@ -72,8 +70,7 @@ A one-shot read that printed its events remains successful if acknowledgement
 fails: it writes a warning to stderr because the read cursor was not confirmed.
 A later successful acknowledgement can advance it. Repeating the read is safe
 via `MAX`.
-Follow polls never renew Seat activity. Whether a one-time
-`wefty logs SEAT_ID` counts as a Seat call belongs to #1146.
+Follow polls never renew Seat activity. A one-time `wefty logs SEAT_ID` counts once, at its start.
 
 A reply reporting a Seat outcome acknowledges only the contiguous lifecycle
 prefix through that outcome: requested, approved, starting, started, released,
@@ -163,3 +160,19 @@ A follow drains the terminal log and stops by itself. Its final text line
 uses a readable reason, such as "the owner stopped the Computer"; JSON keeps
 the reason token, such as `computer_stopped`. JSON follows use one event
 object per line and finish with an `ended` object and its reason.
+
+## Seat life events (#1146)
+
+`ends_soon` is emitted once per idle period, at the first check within the
+warning interval (five minutes by default). A one-time Seat call resets the
+idle period and permits a new warning. If the host sleeps across the warning
+and end, reconciliation writes the warning before the end in the same check.
+`owner_reimage`, `owner_reset` and `owner_remove` join `owner_stop` and
+`owner_restart`; each precedes the Seat's end and records the action reason.
+
+A credential log request with `X-Wefty-Seat-Call: start` counts as one Seat
+call. The CLI sets it for the first log GET only, including a follow. Cursor
+acknowledgements, pagination and follow polls do not renew the Seat. An ended
+credential continues to read its log and cannot renew the Seat. If its reason
+is `released`, the same credential may replay release to read the retained
+successful outcome; this grants no new authority and appends no duplicate end.

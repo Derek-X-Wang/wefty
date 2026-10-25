@@ -697,7 +697,15 @@ func writeComputerProjection(writer io.Writer, computer computerOperatorProjecti
 	if jsonOutput {
 		return writeJSON(writer, computer)
 	}
-	return writeComputersTable(writer, []computerOperatorProjection{computer})
+	if err := writeComputersTable(writer, []computerOperatorProjection{computer}); err != nil {
+		return err
+	}
+	for _, seat := range computer.EndedSeats {
+		if _, err := fmt.Fprintf(writer, "Seat %s ended: %s\n", seat.SeatID, readableSeatEndReason(seat.Reason)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writeComputersTable(writer io.Writer, computers []computerOperatorProjection) error {

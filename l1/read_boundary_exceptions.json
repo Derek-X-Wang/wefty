@@ -126,6 +126,12 @@
     "slice": "agent-protocol"
   },
   {
+    "site": "seat_time.go:*Store.migrateSeatLife | s.db",
+    "count": 2,
+    "reason": "Infrastructure: additive Seat timer schema initialization before serving requests.",
+    "slice": "permanent"
+  },
+  {
     "site": "secret_scrub.go:*Store.SweepScrubbedSecrets | s.db",
     "count": 1,
     "reason": "infrastructure: secret scrubbing and WAL checkpoint; ADR-0002",

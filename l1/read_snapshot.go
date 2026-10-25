@@ -95,6 +95,7 @@ type readModel interface {
 // A write gets a fresh memo at each decision, never across writes.
 type databaseReads struct {
 	diagnosticObservations bool
+	seatClock              Clock
 	personDeviceBinding    *personDeviceBinding
 	pageDeadline           time.Time
 	q                      queryer
@@ -542,6 +543,7 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 	}
 	reads := newDatabaseReads(tx, canonicalTime(s.clock.Now()), caller)
 	reads.diagnosticObservations = true
+	reads.seatClock = s.clock
 	reads.personDeviceBinding = &s.personDeviceBinding
 	cutoff := readSnapshotPageCutoff
 	if override, ok := ctx.Value(readPageCutoffContextKey{}).(time.Duration); ok {
