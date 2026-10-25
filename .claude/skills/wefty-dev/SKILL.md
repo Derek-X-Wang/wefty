@@ -22,7 +22,7 @@ description: Development conventions for working on the wefty codebase itself â€
 ## Gates â€” run ALL before claiming anything works
 
 ```sh
-gofmt -l . | (! grep .)               # formatting
+test -z "$(gofmt -l . | tee /dev/stderr)" # formatting; lists unformatted files
 bash scripts/check-fabric-boundary.sh # tailscale imports only in fabric/tsnet
 go vet ./...
 go test -timeout 45m ./...            # cmd/wefty alone takes up to ~30m on a busy Mac; 60m+ when CPUs are capped
