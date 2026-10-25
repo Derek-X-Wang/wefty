@@ -32,6 +32,7 @@ type controllerTenureConfig struct {
 	record             func(context.Context, l1.ComputerTakeoverAuditEvent) (l1.ComputerTakeoverAuditReceipt, error)
 	report             func(error)
 	onUnconfirmedClear func(error)
+	onAuditFailure     func(error)
 }
 
 // controllerTenure is process-local and attempt-scoped. Its mutex protects
@@ -408,7 +409,11 @@ func (tenure *controllerTenure) Release(ctx context.Context, sessionID string, r
 		tenure.mu.Unlock()
 
 		tenure.detachControl(holder)
-		auditErr := tenure.record(holder.session, holder.serial, l1.ComputerTakeoverControlReleased, reason)
+		releasedSession := holder.session
+		if note, ok := ctx.Value(seatReleaseNoteKey{}).(string); ok {
+			releasedSession.context = context.WithValue(releasedSession.context, seatReleaseNoteKey{}, note)
+		}
+		auditErr := tenure.record(releasedSession, holder.serial, l1.ComputerTakeoverControlReleased, reason)
 		clearErr := tenure.clear(operationContext)
 		tenure.finishOperation(operation, nil)
 		cancel()
@@ -543,6 +548,9 @@ func (tenure *controllerTenure) record(
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(session.context), controllerTenureFinalizationLimit)
 	defer cancel()
 	if err := appendAssertedComputerAudit(ctx, tenure.config.record, event); err != nil {
+		if tenure.config.onAuditFailure != nil {
+			tenure.config.onAuditFailure(err)
+		}
 		return fmt.Errorf("record %s: %w", kind, err)
 	}
 	return nil

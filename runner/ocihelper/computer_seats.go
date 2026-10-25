@@ -203,6 +203,26 @@ func (s *computerSeats) apply(wanted []ComputerSeat) (ApplyComputerSeatsResponse
 	if err != nil {
 		return ApplyComputerSeatsResponse{}, err
 	}
+	// A new incarnation starts false before the image sees its directive.
+	for _, config := range wanted {
+		entry := s.entries[config.Place]
+		if entry == nil || !entry.wanted {
+			if err := s.writeDriver(config.Place, false); err != nil {
+				return ApplyComputerSeatsResponse{}, err
+			}
+		}
+	}
+	wantedDriverPlaces := map[int]bool{}
+	for _, config := range wanted {
+		wantedDriverPlaces[config.Place] = true
+	}
+	for place, entry := range s.entries {
+		if entry.wanted && !wantedDriverPlaces[place] {
+			if err := s.writeDriver(place, false); err != nil {
+				return ApplyComputerSeatsResponse{}, err
+			}
+		}
+	}
 	// The budget starts before publication. A slow fsync cannot extend it.
 	started := s.clock.Now()
 	if err := publishComputerSeatDirective(s.directory, payload); err != nil {

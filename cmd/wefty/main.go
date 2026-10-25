@@ -94,6 +94,7 @@ const (
 	seatErrorWindowNotAllowed contract.ErrorCode = "seat_window_not_allowed"
 	seatErrorEnded            contract.ErrorCode = "seat_ended"
 	seatErrorCopyFailed       contract.ErrorCode = "seat_copy_failed"
+	seatErrorPersonDriving    contract.ErrorCode = "person_driving"
 	seatErrorCopyWriteDenied  contract.ErrorCode = "seat_copy_write_denied"
 )
 

@@ -81,6 +81,11 @@ const (
 )
 
 var driftRows = []driftRow{
+	{responseBody(clientDoc, "get", "/v1/seats/{seat_id}/screen-target", "200"), typeOf[l1.SeatCopyTarget]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/screen-authority"), typeOf[l1.SeatScreenAuthorityInput]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/screen-authority", "200"), typeOf[l1.SeatScreenAuthority]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/screen-event"), typeOf[l1.SeatScreenEventRequest]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/screen-event", "200"), typeOf[l1.SeatScreenEventReceipt]()},
 	{requestBody(clientDoc, "post", "/v1/seats/{seat_id}/copy-outcome"), typeOf[l1.SeatCopyOutcomeReceipt]()},
 	{responseBody(clientDoc, "post", "/v1/seats/{seat_id}/copy-outcome", "200"), typeOf[struct{}]()},
 	{responseBody(clientDoc, "get", "/v1/seats/{seat_id}/copy-target", "200"), typeOf[l1.SeatCopyTarget]()},

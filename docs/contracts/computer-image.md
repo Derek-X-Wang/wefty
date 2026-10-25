@@ -981,3 +981,18 @@ image. Missing proof stays `NOT-RUN`, false proof fails, and P7 always stays
 `wefty-computer-default-<commit>` with the digest-pinned index reference,
 verified multi-platform OCI archive and both Seat reports. Anonymous manifest
 retrieval must succeed. Local checks do not imply image or publication PASS.
+
+### Per-Seat driver publication (#1147, P8)
+
+The helper initializes `/wefty/control/seats/<place>/driver.json` to exactly
+`{"version":1,"human_driving":false}` before publishing a new Seat directive.
+`SetSeatDriver` binds the full Attempt authority, current helper generation
+and place. It writes the same version-1 true/false body by atomic rename with
+mode 0444 in the image's read-only control mount. One Seat's tenure never
+changes another Seat's driver file. The node sets true before dialing a human
+control endpoint, and clears it after closing that tenure's input leg. A
+successful person-to-person override keeps true throughout. The old image's
+single `/wefty/control/driver.json` contract remains unchanged.
+Removing a Seat also clears its own driver file before the removal directive
+is published. This covers release after the Seat no longer has live L1
+authority, and preserves every other Seat's signal.

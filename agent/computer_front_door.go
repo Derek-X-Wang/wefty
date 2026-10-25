@@ -133,6 +133,7 @@ type computerGrantAuthorizer interface {
 
 type computerFrontDoorConfig struct {
 	seatCopy             http.Handler
+	administratorsOnly   bool
 	authorityContext     context.Context
 	fabric               fabric.Fabric
 	authorizer           computerGrantAuthorizer
@@ -154,6 +155,8 @@ type computerFrontDoorConfig struct {
 	controlTokens        *computerControlTokenCodec
 	// Tests use this hook to prove the client banner cannot overtake registration.
 	beforeControlSessionRegistration func()
+	// onReport observes each failure even when session teardown outlives the queue consumer.
+	onReport func(error)
 }
 
 // computerSessionHandle is the private sideband capability for one live
@@ -443,7 +446,8 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 		}, nil)
 		return
 	}
-	if err != nil || authorization == nil {
+	if err != nil || authorization == nil || frontDoor.config.administratorsOnly && !authorization.IsAdministrator() {
+		authorization.Release()
 		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
 		writeComputerControlError(writer, http.StatusForbidden, contract.APIError{Code: contract.ErrorControlNotAuthorized,
 			Message: "Computer access is not authorized", Retryable: false}, nil)
@@ -529,12 +533,34 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 		action = "take"
 		receipt, err = session.handle.Take(request.Context())
 	} else {
-		receipt, err = session.handle.Release(request.Context())
+		releaseContext := request.Context()
+		if frontDoor.config.administratorsOnly && request.ContentLength != 0 {
+			var body struct {
+				Note string `json:"note"`
+			}
+			decoder := json.NewDecoder(http.MaxBytesReader(writer, request.Body, 64<<10))
+			decoder.DisallowUnknownFields()
+			if decodeErr := decoder.Decode(&body); decodeErr != nil || len(body.Note) > 8192 {
+				writeComputerControlError(writer, http.StatusBadRequest, contract.APIError{Code: contract.ErrorInvalidRequest, Message: "release note must be at most 8192 bytes"}, nil)
+				return
+			}
+			if decodeErr := decoder.Decode(new(any)); decodeErr != io.EOF {
+				writeComputerControlError(writer, http.StatusBadRequest, contract.APIError{Code: contract.ErrorInvalidRequest, Message: "release needs one JSON object"}, nil)
+				return
+			}
+			releaseContext = context.WithValue(releaseContext, seatReleaseNoteKey{}, body.Note)
+		}
+		receipt, err = session.handle.Release(releaseContext)
 	}
 	receipt.ComputerID = frontDoor.config.computerID
 	receipt.Action = action
 	if err == nil {
 		writeComputerControlJSON(writer, http.StatusOK, receipt)
+		return
+	}
+	var protocol *ProtocolError
+	if frontDoor.config.administratorsOnly && errors.As(err, &protocol) {
+		writeComputerControlError(writer, protocol.StatusCode, protocol.APIError, &receipt)
 		return
 	}
 	var tenureErr *ComputerTenureError
@@ -550,7 +576,7 @@ func (frontDoor *computerFrontDoor) serveControlAction(writer http.ResponseWrite
 		}
 		writeComputerControlError(writer, status, contract.APIError{Code: tenureErr.Code,
 			Message:   "Computer " + action + " was refused by Controller tenure",
-			Retryable: tenureErr.Code == contract.ErrorControllerBusy}, &receipt)
+			Retryable: tenureErr.Code == contract.ErrorControllerBusy || frontDoor.config.administratorsOnly && isSeatScreenRefusal(err)}, &receipt)
 		if tenureErr.HelperConnectionLimit {
 			if report, suppressed := frontDoor.limitRefusals.Note(time.Now()); report {
 				log.Printf("Computer front door refused a take-over control take: the OCI helper's connection budget is full (%d more refusals since the last report); the Computer is unaffected", suppressed)
@@ -646,6 +672,10 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 			}
 		} else {
 			frontDoor.report(fmt.Errorf("dial Computer view backend: %w", err))
+		}
+		if frontDoor.config.administratorsOnly {
+			writeSeatScreenError(writer, err)
+			return
 		}
 		http.Error(writer, "Computer display unavailable", http.StatusServiceUnavailable)
 		return
@@ -973,6 +1003,9 @@ func (frontDoor *computerFrontDoor) record(ctx context.Context, event l1.Compute
 func (frontDoor *computerFrontDoor) report(err error) {
 	if err == nil {
 		return
+	}
+	if frontDoor.config.onReport != nil {
+		frontDoor.config.onReport(err)
 	}
 	frontDoor.errorMu.Lock()
 	frontDoor.pendingErrors = append(frontDoor.pendingErrors, err)
