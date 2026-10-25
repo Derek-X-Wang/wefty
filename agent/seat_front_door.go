@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,9 +45,13 @@ func newSeatFrontDoor(f fabric.Fabric) *seatFrontDoor {
 	return &seatFrontDoor{fabric: f, computers: map[string]*seatFrontDoorRegistration{}, seats: map[string]*seatFrontDoorRegistration{}}
 }
 func startSeatFrontDoor(ctx context.Context, f fabric.Fabric, node string) (*seatFrontDoor, func(), error) {
-	address := "wefty://node/" + node
+	var address string
 	if local, ok := f.(fabric.LocalServiceAddressProvider); ok {
 		address = local.LocalServiceAddress()
+	} else {
+		// Clients dial the published endpoint, not this private registration name.
+		// Retiring and replacement node agent instances may share one plain network.
+		address = "wefty://node/" + node + "-seat-" + rand.Text()
 	}
 	listener, err := f.Listen("tcp", address)
 	if err != nil {

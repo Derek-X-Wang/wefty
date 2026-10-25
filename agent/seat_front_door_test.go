@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -150,8 +152,12 @@ func TestSeatFrontDoorOneFabricListenerForMultipleComputers(t *testing.T) {
 	}
 	defer closeDoor()
 	clientFabric := network.NewFabric(fabric.Identity{NodeID: "client"})
+	endpoint, err := url.Parse(door.endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
 	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return clientFabric.Dial(ctx, network, "wefty://node/node")
+		return clientFabric.Dial(ctx, network, endpoint.Host)
 	}}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
@@ -183,7 +189,7 @@ func TestSeatFrontDoorOneFabricListenerForMultipleComputers(t *testing.T) {
 			}
 		}
 	}
-	if len(serverFabric.addresses) != 1 || serverFabric.addresses[0] != "wefty://node/node" {
+	if len(serverFabric.addresses) != 1 || !strings.HasPrefix(serverFabric.addresses[0], "wefty://node/node-seat-") {
 		t.Fatalf("listeners=%v", serverFabric.addresses)
 	}
 }
@@ -367,4 +373,100 @@ func TestSeatFrontDoorSeatRemovalCancelsInFlightCopy(t *testing.T) {
 	}
 	awaitSeatTestSignal(t, done)
 	awaitSeatTestSignal(t, returned)
+}
+
+func TestSeatFrontDoorPlainGenerationsUsePublishedEndpoints(t *testing.T) {
+	network := plain.NewNetwork()
+	serverFabric := &seatListenerRecorder{Fabric: network.NewFabric(fabric.Identity{NodeID: "node"})}
+	clientFabric := network.NewFabric(fabric.Identity{NodeID: "client"})
+	for range 3 {
+		door, closeDoor, err := startSeatFrontDoor(t.Context(), serverFabric, "same-node")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closeDoor()
+		endpoint, err := url.Parse(door.endpoint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return clientFabric.Dial(ctx, network, endpoint.Host)
+		}}
+		defer transport.CloseIdleConnections()
+		req, _ := http.NewRequestWithContext(t.Context(), "GET", "http://node/unknown", nil)
+		response, err := (&http.Client{Transport: transport}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("published endpoint status %d", response.StatusCode)
+		}
+	}
+	if len(serverFabric.addresses) != 3 {
+		t.Fatalf("listeners=%v", serverFabric.addresses)
+	}
+	for i, address := range serverFabric.addresses {
+		for _, old := range serverFabric.addresses[:i] {
+			if old == address {
+				t.Fatalf("generations share %q", address)
+			}
+		}
+	}
+}
+
+type seatDoorRefusingFabric struct{ fabric.Fabric }
+
+func (f seatDoorRefusingFabric) Listen(string, string) (net.Listener, error) {
+	return nil, errors.New("injected Seat listener failure")
+}
+
+func TestSeatFrontDoorListenFailureKeepsNodeSessionRunning(t *testing.T) {
+	network := plain.NewNetwork()
+	store, stop := startFailureServerWithPoliciesAndLease(t, network, nil, map[string]l1.NodePolicy{"door-unavailable": {Tags: []string{"linux"}, MaxOneshotSlots: 1}}, l1.DefaultLeaseDuration)
+	defer stop()
+	logs := make(chan string, 20)
+	node, err := New(Config{Fabric: seatDoorRefusingFabric{network.NewFabric(fabric.Identity{NodeID: "node-fabric", Tags: []string{l1.DefaultAgentPrincipalTag}})}, ControlPlaneAddress: "wefty://control-plane", NodeID: "door-unavailable", BootSessionID: "boot", Version: "test", Capabilities: map[string]bool{"kind:process": true}, ManagedRootDirectory: t.TempDir(), LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), Logf: func(format string, args ...any) {
+		select {
+		case logs <- fmt.Sprintf(format, args...):
+		default:
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { defer close(done); done <- node.Run(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("node did not stop")
+		}
+	}()
+	select {
+	case <-node.Registered():
+	case err := <-done:
+		t.Fatalf("Seat door stopped non-Seat registration: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("node did not register")
+	}
+	if node.seatDoor != nil {
+		t.Fatal("failed listener left a Seat door")
+	}
+	if _, err := store.GetNode(t.Context(), "door-unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for len(logs) > 0 {
+		line := <-logs
+		found = found || strings.Contains(line, "injected Seat listener failure")
+	}
+	if !found {
+		t.Fatal("listener failure not logged")
+	}
 }

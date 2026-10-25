@@ -667,31 +667,34 @@ func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
-	ctx, cancelRun := context.WithCancel(ctx)
+	// Session and door shutdown must not cancel process-lifetime replay or
+	// result collection. Those retain the caller context and are joined by Close.
+	runContext, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	var doorDone <-chan struct{}
 	a.seatDoor = nil
 	if a.fabric != nil {
-		door, closeDoor, err := startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID)
+		door, closeDoor, err := startSeatFrontDoor(runContext, a.fabric, a.registration.NodeID)
 		if err != nil {
-			return err
+			a.log("Seat front door unavailable; Seat-request Computers cannot become ready: %v", err)
+		} else {
+			a.seatDoor = door
+			doorDone = door.done
+			defer closeDoor()
+			go func() {
+				select {
+				case <-doorDone:
+					cancelRun()
+				case <-runContext.Done():
+				}
+			}()
 		}
-		a.seatDoor = door
-		doorDone = door.done
-		defer closeDoor()
-		go func() {
-			select {
-			case <-doorDone:
-				cancelRun()
-			case <-ctx.Done():
-			}
-		}()
 	}
-	seatCtx, seatCancel := context.WithCancel(ctx)
+	seatCtx, seatCancel := context.WithCancel(runContext)
 	seatDone := make(chan struct{})
 	go func() { defer close(seatDone); a.runSeatRequests(seatCtx) }()
 	defer func() { seatCancel(); <-seatDone }()
-	a.startHostTokenRevocation(ctx)
+	a.startHostTokenRevocation(runContext)
 	defer a.stopHostTokenRevocation()
 	if a.handoffs != nil {
 		// One clock: the ticker above and the retention timestamps below have
@@ -749,7 +752,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.log("recover durable evidence: %v", err)
 		})
 	}
-	runErr := a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
+	runErr := a.session.run(runContext, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 		return a.executeClaim(attemptContext, claim, claimStarted)
 	})
 	select {

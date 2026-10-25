@@ -485,8 +485,14 @@ that DEST names the exact result path. Seat-to-Seat copies are refused.
 
 `Agent.Run` owns one shared Seat front-door listener on the node's logical
 Fabric service address (the enrolled participant name supplied by the Fabric,
-fixed port 80 in the private Fabric; the plain test Fabric maps it to
-loopback). The participant name need not equal the registered Wefty node ID.
+fixed port 80 in the private Fabric). Without a Fabric-supplied service
+address, each listener gets a unique logical name, so overlapping node agent
+generations cannot collide. The plain Fabric maps that name to an ephemeral
+loopback endpoint. Clients dial the endpoint published by L1's copy-target
+route, not the private logical registration name. The participant name need
+not equal the registered Wefty node ID. A listener startup failure is logged
+and leaves the Seat door unavailable: Seat-request Computers refuse readiness,
+while node registration and non-Seat work continue.
 Each Computer Attempt registers a feature mux and binds only Seat IDs from its
 fenced L1 wanted list. Copies, Seat Runs and per-Seat screens share this same
 listener; unknown paths and unbound Seats are refused. The generated
