@@ -1114,11 +1114,10 @@ func TestOCIServiceAuthorityRecoveryPublishesLostAttemptLateEvidence(t *testing.
 	case <-time.After(testwait.Bound):
 		t.Fatal("OCI service did not start")
 	}
-	// Before the first advance, only renewal uses a 50 ms deadline; the
-	// shorter heartbeat interval cannot satisfy this readiness barrier.
-	// Drive a renewal after startup without spending the lease on fixture work.
-	clock.waitForDeadline(t, clock.Now().Add(50*time.Millisecond))
-	clock.Advance(50 * time.Millisecond)
+	// Drive a renewal after startup without spending the lease on fixture
+	// work: advance only the renewal loop's own waits, including a retry after
+	// a renewal request that timed out on a busy machine.
+	clock.driveRenewalUntil(t, deadman.renewed, "OCI helper admission did not produce a deadman renewal")
 	deadman.waitForRenewal(t)
 	if calls, _, generation := deadman.snapshot(); calls < 1 || generation != readyOCIHelperGeneration() {
 		t.Fatalf("authority-recovery deadman renewals=%d generation=%+v, want at least one renewal for %+v", calls, generation, readyOCIHelperGeneration())
@@ -4124,8 +4123,9 @@ func (clock *manualClock) WallNow() time.Time {
 func (clock *manualClock) NewTimer(duration time.Duration) Timer {
 	clock.mu.Lock()
 	defer clock.mu.Unlock()
+	caller := newTimerCaller()
 	timer := &manualTimer{clock: clock, channel: make(chan time.Time, 1), deadline: clock.now.Add(duration), active: true,
-		claimWait: armedByClaimWait()}
+		claimWait: caller == claimWaitFunction, renewalWait: caller == renewalWaitFunction}
 	clock.timers = append(clock.timers, timer)
 	return timer
 }
@@ -4156,6 +4156,40 @@ func (clock *manualClock) claimWaitArmed(deadline time.Time) bool {
 
 func (clock *manualClock) Advance(duration time.Duration) {
 	clock.advance(duration, nil)
+}
+
+// driveRenewalUntil advances the clock to each wait the attempt renewal loop
+// arms until done closes. A renewal request runs under a wall-clock timeout,
+// so on a loaded machine one can fail as transient; the loop then arms a short
+// retry wait that nothing else advances, and a single Advance left the test
+// waiting for a renewal that could never come (#1262).
+func (clock *manualClock) driveRenewalUntil(t *testing.T, done <-chan struct{}, what string) {
+	t.Helper()
+	waitUntil := time.Now().Add(resilienceTestWatchdog)
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+		if time.Now().After(waitUntil) {
+			t.Fatalf("timed out driving attempt renewal: %s", what)
+		}
+		clock.mu.Lock()
+		var wait time.Duration
+		armed := false
+		for _, timer := range clock.timers {
+			if timer.active && timer.renewalWait {
+				wait, armed = timer.deadline.Sub(clock.now), true
+				break
+			}
+		}
+		clock.mu.Unlock()
+		if armed {
+			clock.advance(wait, func(timer *manualTimer) bool { return timer.renewalWait })
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // advance moves the clock by duration. A non-nil armed requires an active
@@ -4225,22 +4259,27 @@ type manualTimer struct {
 	active   bool
 	// claimWait marks the claim worker's wait between claim polls.
 	claimWait bool
+	// renewalWait marks an attempt renewal loop's wait before its next renewal.
+	renewalWait bool
 }
 
 // claimWaitFunction names the only place a claim worker waits between claim
 // polls. The method expression turns a rename into a compile error here.
 var claimWaitFunction = runtime.FuncForPC(reflect.ValueOf((*agentSession).waitForClaimWork).Pointer()).Name()
 
-// armedByClaimWait reports whether manualClock.NewTimer was called directly
-// from the claim worker's wait.
-func armedByClaimWait() bool {
+// renewalWaitFunction names the only place an attempt waits between lease
+// renewals.
+var renewalWaitFunction = runtime.FuncForPC(reflect.ValueOf((*attemptLifecycle).renewalLoop).Pointer()).Name()
+
+// newTimerCaller names the function that called manualClock.NewTimer.
+func newTimerCaller() string {
 	var callers [1]uintptr
 	// Skip runtime.Callers, this function and manualClock.NewTimer.
 	if runtime.Callers(3, callers[:]) == 0 {
-		return false
+		return ""
 	}
 	frame, _ := runtime.CallersFrames(callers[:]).Next()
-	return frame.Function == claimWaitFunction
+	return frame.Function
 }
 
 func (timer *manualTimer) C() <-chan time.Time { return timer.channel }
