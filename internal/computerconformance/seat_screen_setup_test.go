@@ -20,7 +20,18 @@ import (
 func screenLaneNodeConfig(t *testing.T, f fabric.Fabric, address string) agent.Config {
 	t.Helper()
 	room := l1.DefaultComputerRoomConfig(2 << 30)
-	return agent.Config{Version: "screen-lane", Fabric: f, ControlPlaneAddress: address, NodeID: "screen-node", BootSessionID: "screen-boot", ManagedRootDirectory: filepath.Join(t.TempDir(), "managed"), HandoffRoot: t.TempDir(), LogSpoolDirectory: t.TempDir(), MaxServiceSlots: 2, MaxOneshotSlots: 1, ComputerRoom: &room, Logf: t.Logf}
+	return agent.Config{Version: "screen-lane", Fabric: f, ControlPlaneAddress: address, NodeID: "screen-node", BootSessionID: "screen-boot", ManagedRootDirectory: filepath.Join(resolvedTempDir(t), "managed"), HandoffRoot: resolvedTempDir(t), LogSpoolDirectory: resolvedTempDir(t), MaxServiceSlots: 2, MaxOneshotSlots: 1, ComputerRoom: &room, Logf: t.Logf}
+}
+
+// t.TempDir can sit under a symlinked temp root (macOS /var, a wefty run's
+// $TMPDIR); the managed root refuses paths that leave through a link.
+func resolvedTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 func screenLaneServerConfig() l1.ServerConfig {
 	return l1.ServerConfig{AllowSelfAssertedPersonIdentities: true, RunLedgerNodeID: "screen-ledger", NodePolicies: map[string]l1.NodePolicy{"screen-node": {Tags: []string{contract.StableNodeTagPrefix + "screen-node"}, MaxServiceSlots: 2, MaxOneshotSlots: 1}}}
