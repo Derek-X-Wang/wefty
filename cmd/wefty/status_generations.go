@@ -69,6 +69,15 @@ type rollingStatusFields struct {
 func liveGenerationAttempt(s contract.AttemptState) bool {
 	return s == contract.AttemptClaimed || s == contract.AttemptRunning || s == contract.AttemptAwaitingInput
 }
+
+// Cancellation reserves a Job outcome before its Attempt finishes. Only a
+// completed Attempt is settled; lost/interrupted residents and live Lease
+// problems retain their own evidence even when cancellation was requested.
+func settledGenerationCancellation(a l1.NodeGenerationAttempt) bool {
+	return a.JobOutcome == contract.JobOutcomeCanceled && a.State != nil &&
+		(*a.State == contract.AttemptFailed || *a.State == contract.AttemptSucceeded)
+}
+
 func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Time) generationStatus {
 	ns := nodeStatuses(l1.NodeList{Nodes: []l1.Node{node}})[0]
 	result := generationStatus{NodeID: node.NodeID, ID: g.AgentGenerationID, Role: string(g.Role), Version: g.Version, RetirementStartedAt: g.RetirementStartedAt, SelectedProtocol: g.SelectedProtocol, RemainingRunIDs: []string{}, RemainingAttemptIDs: []string{}, UnledgeredAttemptIDs: []string{}, RenewalHealth: "healthy", Progress: "evidence_pending", Attempts: g.Attempts, Capacity: &generationCapacity{node.ClaimsEnabled, ns.FreeOneshot, ns.TotalOneshot, ns.FreeService, ns.TotalService}}
@@ -128,6 +137,7 @@ func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Ti
 					result.RenewalHealth = "unverified"
 				}
 			}
+		case settledGenerationCancellation(a):
 		case state == contract.AttemptLost || state == contract.AttemptInterrupted || state == contract.AttemptFailed:
 			result.Problems = append(result.Problems, statusReason{"retiring_attempt_problem", interruptionDetail(label, state, a.InterruptionReason)})
 			result.RenewalHealth = "degraded"
@@ -585,6 +595,17 @@ func writeRollingStatus(out io.Writer, r rollingStatusFields) error {
 		}
 		if _, err := fmt.Fprintf(out, "generation %s %s: version %s; age %s; remaining Runs %s; renewal %s; last renewal %s; deadline %s; capacity %s; %s; pending evidence %s; protocol %d; retirement started %s\n", g.ID, g.Role, unknownGenerationVersion(g.Version), age, runs, g.RenewalHealth, renewal, expiry, capacity, g.Progress, evidence, g.SelectedProtocol, retirement); err != nil {
 			return err
+		}
+		for _, a := range g.Attempts {
+			if settledGenerationCancellation(a) {
+				label := "Attempt " + a.AttemptID
+				if a.RunID != "" {
+					label = "Run " + a.RunID + " (Attempt " + a.AttemptID + ")"
+				}
+				if _, err := fmt.Fprintf(out, "  %s: canceled\n", label); err != nil {
+					return err
+				}
+			}
 		}
 		if len(g.UnledgeredAttemptIDs) > 0 {
 			if _, err := fmt.Fprintln(out, "  Attempts without an L3 Run:", strings.Join(g.UnledgeredAttemptIDs, ", ")); err != nil {

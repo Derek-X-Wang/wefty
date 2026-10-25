@@ -3354,6 +3354,10 @@
           "run_id": {
             "type": "string"
           },
+          "job_outcome": {
+            "enum": ["canceled"],
+            "description": "Authoritative Job outcome, independent of process exit evidence. Absent without a reserved outcome. A failed or succeeded Attempt with canceled outcome is settled cancellation; live, lost and interrupted Attempts retain their own Lease or interruption diagnosis."
+          },
           "state": {
             "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost", "interrupted", null],
             "description": "Retained Attempt state; null means the frozen resident observation is unavailable."
