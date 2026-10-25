@@ -37,6 +37,13 @@ type Fabric interface {
 	ConnectHost() string
 }
 
+// LocalServiceAddressProvider supplies the enrolled participant's logical
+// service address. Its name need not equal the registered Wefty node ID.
+// Adapters without this extension retain the node-ID logical-name convention.
+type LocalServiceAddressProvider interface {
+	LocalServiceAddress() string
+}
+
 // PublishedPortListener is implemented by a Fabric whose ordinary listeners
 // expect a wefty-only connection preface. A published port carries the
 // application's own protocol from ordinary clients, so such a Fabric opens it

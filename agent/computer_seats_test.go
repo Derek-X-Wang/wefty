@@ -233,7 +233,7 @@ func TestComputerSeatsLifecycleStartsAfterRuntimeAndStopsWithAttempt(t *testing.
 		}
 		return workloadrunner.Result{}, nil
 	}
-	_, err := runComputerSeats(t.Context(), runtime, workloadrunner.Request{Started: func() { started = true }}, nil, c)
+	_, err := runComputerSeats(t.Context(), runtime, workloadrunner.Request{Started: func() { started = true }}, nil, c, seatComputerServiceConfig{router: newSeatFrontDoor(nil), copyRuntime: copyRuntimeFixture{t.TempDir()}, copyControl: &copyControlFixture{}, publish: func(context.Context, bool, string) error { return nil }})
 	if err != nil {
 		t.Fatal(err)
 	}

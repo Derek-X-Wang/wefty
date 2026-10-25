@@ -298,7 +298,7 @@ func TestGenerationCustodyRetainsExactEvidenceAndRequiresPublication(t *testing.
 	}
 }
 
-// Exercise real agent Run loops, live shell processes and two successive L1
+// Exercise real node agent Run loops, live shell processes and two successive L1
 // promotions against one spool, managed root, result root and capability floor.
 func TestGenerationThreeRunningAgentsShareNodeLocalState(t *testing.T) {
 	network := plain.NewNetwork()
@@ -381,6 +381,8 @@ func TestGenerationThreeRunningAgentsShareNodeLocalState(t *testing.T) {
 		})
 		select {
 		case <-a.Registered():
+		case err := <-finished:
+			t.Fatalf("node generation stopped before registration: %v", err)
 		case <-time.After(10 * time.Second):
 			t.Fatal("registration timed out")
 		}

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/tailscale/hujson"
 )
 
@@ -62,14 +63,24 @@ func TestPrivateNetworkPolicy(t *testing.T) {
 	if !allows("autogroup:owner", "tag:wefty-control:80") {
 		t.Error("owner cannot reach L1 for person commands")
 	}
-	// #1049: publication may use any TCP port, including the control port.
-	// Prove the complete port range, while retaining the control paths above.
+	// The fixed Seat front door is the one client exception. Hosted application
+	// ports remain owner-only across the rest of the complete TCP range.
+	if !allows("tag:wefty-client", "tag:wefty-agent:80") {
+		t.Error("client cannot reach the fixed Seat front door")
+	}
 	for port := 1; port <= 65535; port++ {
 		target := "tag:wefty-agent:" + strconv.Itoa(port)
 		if !allows("autogroup:owner", target) {
 			t.Errorf("owner cannot reach %s", target)
 		}
 		for _, source := range []string{"tag:wefty-control", "tag:wefty-client", "tag:wefty-agent"} {
+			if source == "tag:wefty-client" && port == 80 {
+				spec := contract.JobSpec{SchemaVersion: 1, DispatchKey: "reserved-seat-door", Kind: contract.JobKindProcess, Class: contract.JobClassService, PublishedPort: &port, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/true"}, Argv: []string{"true"}, WorkingDirectory: "/tmp"}}
+				if err := contract.ValidateJobSpec(&spec); err == nil || !strings.Contains(err.Error(), contract.SeatFrontDoorPortReserved) {
+					t.Fatalf("policy permits an application at the Seat door: %v", err)
+				}
+				continue
+			}
 			if allows(source, target) {
 				t.Errorf("machine may reach another agent's published port: %s → %s", source, target)
 			}

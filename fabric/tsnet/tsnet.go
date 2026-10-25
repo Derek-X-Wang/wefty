@@ -437,6 +437,8 @@ func (f *Fabric) PersonIdentityTrust() fabric.PersonIdentityTrust {
 // or the legacy mapping when no name was recorded. It performs no network IO.
 func (f *Fabric) ConnectHost() string { return f.server.Hostname }
 
+func (f *Fabric) LocalServiceAddress() string { return f.localName.String() }
+
 func (f *Fabric) localClient() (*local.Client, error) {
 	f.clientMu.Lock()
 	defer f.clientMu.Unlock()

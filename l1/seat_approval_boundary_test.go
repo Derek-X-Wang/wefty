@@ -237,13 +237,15 @@ func TestSeatApprovalRoutesRemainNodeOnly(t *testing.T) {
 		t.Fatalf("node-principal mux mounts=%d", agentMounts)
 	}
 	allowed := map[string]string{
-		"POST /v1/seats/{seat_id}/release":     "releaseSeat",
-		"GET /v1/seats/{seat_id}/logs":         "getSeatLogs",
-		"POST /v1/seats/{seat_id}/logs/read":   "markSeatLogRead",
-		"POST /v1/seat-requests":               "createSeatCall",
-		"GET /v1/seat-requests/{seat_id}":      "getSeatCall",
-		"GET /v1/seat-approval-windows":        "listSeatApprovalWindows",
-		"POST /v1/seat-approval-windows/close": "closeSeatApprovalWindows",
+		"GET /v1/seats/{seat_id}/copy-target":   "getSeatCopyTarget",
+		"POST /v1/seats/{seat_id}/copy-outcome": "reportSeatCopyOutcome",
+		"POST /v1/seats/{seat_id}/release":      "releaseSeat",
+		"GET /v1/seats/{seat_id}/logs":          "getSeatLogs",
+		"POST /v1/seats/{seat_id}/logs/read":    "markSeatLogRead",
+		"POST /v1/seat-requests":                "createSeatCall",
+		"GET /v1/seat-requests/{seat_id}":       "getSeatCall",
+		"GET /v1/seat-approval-windows":         "listSeatApprovalWindows",
+		"POST /v1/seat-approval-windows/close":  "closeSeatApprovalWindows",
 	}
 	revocations := map[string]string{
 		"PUT /v1/computers/{computer_id}/desired-state":  "setComputerDesiredState",

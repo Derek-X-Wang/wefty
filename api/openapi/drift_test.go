@@ -81,6 +81,14 @@ const (
 )
 
 var driftRows = []driftRow{
+	{requestBody(clientDoc, "post", "/v1/seats/{seat_id}/copy-outcome"), typeOf[l1.SeatCopyOutcomeReceipt]()},
+	{responseBody(clientDoc, "post", "/v1/seats/{seat_id}/copy-outcome", "200"), typeOf[struct{}]()},
+	{responseBody(clientDoc, "get", "/v1/seats/{seat_id}/copy-target", "200"), typeOf[l1.SeatCopyTarget]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/copy-authority"), typeOf[l1.SeatCopyAuthorityInput]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/copy-authority", "200"), typeOf[l1.SeatCopyAuthority]()},
+	{requestBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/copy-receipt"), typeOf[l1.SeatCopyReceipt]()},
+	{responseBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/copy-receipt", "200"), typeOf[struct{}]()},
+	{component(commonDoc, "SeatCopyStreamEvent"), typeOf[l1.SeatCopyStreamEvent]()},
 	{responseBody(clientDoc, "get", "/v1/seats/{seat_id}/logs", "200"), typeOf[l1.SeatLogPage]()},
 	{responseBody(clientDoc, "post", "/v1/seats/{seat_id}/release", "200"), typeOf[l1.SeatCallResult]()},
 	{requestBody(clientDoc, "post", "/v1/seats/{seat_id}/logs/read"), typeOf[l1.SeatLogRead]()},

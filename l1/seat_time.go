@@ -89,6 +89,14 @@ func (s *Store) migrateSeatLife(ctx context.Context) error {
  hold_id TEXT NOT NULL,
  active INTEGER NOT NULL CHECK(active IN (0,1)),
  PRIMARY KEY(seat_id,kind,hold_id)
+ );
+ CREATE TABLE IF NOT EXISTS seat_copy_holds (
+ seat_id TEXT NOT NULL REFERENCES seat_approvals(seat_id) ON DELETE CASCADE,
+ copy_id TEXT NOT NULL,
+ attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id) ON DELETE CASCADE,
+ boot_id TEXT NOT NULL,
+ lease_until_ns INTEGER NOT NULL,
+ PRIMARY KEY(seat_id,copy_id)
  );`)
 	if err != nil {
 		return err

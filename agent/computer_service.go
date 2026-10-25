@@ -202,7 +202,10 @@ func runComputerService(
 
 	runContext, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelRun()
+	copyRuntime, _ := runtimeAdapter.(seatCopyRuntime)
+	copyControl, _ := config.auditor.(seatCopyControl)
 	frontDoor, err := newComputerFrontDoor(computerFrontDoorConfig{
+		seatCopy:         newSeatCopyHandler(copyRuntime, copyControl, request.Authority, config.computerID),
 		authorityContext: runContext, fabric: config.fabric, authorizer: config.authorizer, auditor: config.auditor,
 		clock: clock, computerID: config.computerID, jobID: config.jobID, attemptID: config.attemptID,
 		storageID: config.storageID, storageGeneration: config.storageGeneration,

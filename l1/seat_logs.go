@@ -38,16 +38,19 @@ const (
 )
 
 type SeatLogEvent struct {
-	EventID    string        `json:"event_id"`
-	SeatID     string        `json:"seat_id"`
-	Kind       SeatEventKind `json:"kind"`
-	OccurredAt time.Time     `json:"occurred_at"`
-	Reason     string        `json:"reason,omitempty"`
-	Note       string        `json:"note,omitempty"`
-	RunID      string        `json:"run_id,omitempty"`
-	ExitCode   *int          `json:"exit_code,omitempty"`
-	Path       string        `json:"path,omitempty"`
-	SizeBytes  *int64        `json:"size_bytes,omitempty"`
+	EventID     string        `json:"event_id"`
+	SeatID      string        `json:"seat_id"`
+	Kind        SeatEventKind `json:"kind"`
+	OccurredAt  time.Time     `json:"occurred_at"`
+	Reason      string        `json:"reason,omitempty"`
+	Note        string        `json:"note,omitempty"`
+	RunID       string        `json:"run_id,omitempty"`
+	ExitCode    *int          `json:"exit_code,omitempty"`
+	Path        string        `json:"path,omitempty"`
+	SizeBytes   *int64        `json:"size_bytes,omitempty"`
+	CopyID      string        `json:"copy_id,omitempty"`
+	Outcome     string        `json:"outcome,omitempty"`
+	NodeOutcome string        `json:"node_outcome,omitempty"`
 	// Take-over evidence and the optional release note live in this same record.
 	Audit *ComputerTakeoverAuditEvent `json:"audit,omitempty"`
 }

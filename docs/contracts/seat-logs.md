@@ -35,6 +35,7 @@ The closed kinds are `requested`, `approved`, `refused`, `starting`, `started`,
 `copy_out`, `control_taken`, and `control_released`. Lifecycle writers produce
 request, approval/refusal, start, release, warning, end, and owner-action events.
 Command, copy and control backends use the same writer and vocabulary.
+Copy outcome handling is specified below.
 
 A Seat loses action authority at `ending` (or `refused`), before cleanup.
 The terminal event and its reason are recorded then; later cleanup does not
@@ -98,9 +99,9 @@ Successful JSON replies include the count and, when nonzero, an
 
 A separate SHA-256 credential digest survives the active secret's terminal
 scrub. Presenting a Seat credential selects a closed protocol: its own log
-and read cursor only. It never falls through to the caller's broader Fabric
-principal. Another Seat's log returns `forbidden`. Every other operation
-after the Seat ends, including command, input, copy and screen routes,
+and read cursor after its end. Live Seats also accept copy-outcome receipts.
+It never falls through to the caller's broader Fabric principal. Another Seat's log returns `forbidden`. Every other operation
+after the Seat ends, including command, input, copy-transfer and screen routes,
 returns `seat_ended` with the end reason.
 
 Seat logs use the same store retention setting as the take-over audit:
@@ -176,3 +177,70 @@ acknowledgements, pagination and follow polls do not renew the Seat. An ended
 credential continues to read its log and cannot renew the Seat. If its reason
 is `released`, the same credential may replay release to read the retained
 successful outcome; this grants no new authority and appends no duplicate end.
+
+## Copy outcomes
+
+Every copy that reaches the node and passes Seat authorization is logged. Only
+the node creates an event, through `AppendSeatEvent`, with an unguessable
+random CopyID and event ID `copy:COPY_ID`. Caller-supplied transfer IDs are
+ignored. The node records `sending` before any payload bytes, then updates
+that same event with its terminal evidence. A crash mid-copy leaves `sending`
+visible. The node returns its ID after recording its terminal evidence. A
+failure before reaching the node creates no event, because no file entered or
+left the Seat. Runtime failures are logged, including zero-byte failures.
+
+A copy event has kind `copy_in` or `copy_out`, `copy_id`, Seat path,
+file-content byte count, `outcome` and a short `reason` token for failure.
+`node_outcome` starts as `sending` with zero bytes. Its terminal value is
+immutable: copy-in `completed`/`failed`, copy-out `sent`/`failed`. Direction,
+path, size and node result cannot be changed by the caller. Node retries
+deduplicate by the node's own ID and immutable evidence, even after a local
+outcome arrives.
+
+Copy-out `sent` means the node finished; local publication is still pending.
+The CLI uses its Seat credential to POST `/v1/seats/{seat_id}/copy-outcome`
+with the node's CopyID, exact direction/path/size, final outcome and failure
+reason. Only an existing node-created copy-out event with `node_outcome=sent`
+accepts `completed` or `failed`. An unknown ID returns typed 404 `not_found`
+and writes nothing. There are no caller-only events. Copy-in events and failed
+node results cannot be updated by the caller. A local result cannot replace an
+earlier, different local result.
+
+Local outcome updates require a live Seat, verified inside the update
+transaction. Ending or ended Seats refuse them with `seat_ended`; retained
+credentials still read their logs. A copy that finishes beside the Seat's end
+can therefore retain `sent` with local outcome unconfirmed. The node's own
+receipt can still record its already admitted transfer at the end.
+
+Recording the node terminal result and adding a local result are the
+copy-specific exceptions to immutable generic event payloads. L1 updates
+`outcome` and `reason` in that same row and moves its ordinal to a fresh
+cursor position, with an updated occurrence time. A follow that printed `sent`
+receives the local result with the same CopyID; a full log still has one row
+per copy. Identical retries do not move the cursor. Each node event accepts at
+most one local result, so caller receipts cannot grow or repeatedly reorder
+the log. Copy updates change no Seat lifecycle or Custody facts.
+
+Human logs preserve both facts, for example `sent 999 B; local publish
+failed`. JSON exposes immutable `node_outcome` alongside `outcome` and
+`reason` for the local result. Node and CLI receipts use three
+cancellation-independent attempts within five seconds, with 100 ms then 200 ms
+backoff and the same node-owned CopyID. Exhausted receipt retries fail loudly;
+`sent` remains pending instead of becoming a false local completion.
+
+The pre-stream sending receipt counts as a Seat call through
+`SeatCallHappened` and creates a separate copy hold in `seat_copy_holds`, keyed
+by Seat and node-owned CopyID and bound to its Attempt (cascade deletion).
+It is not a command and never appears in `SeatCommandsToCancel`. Repeated
+sending receipts renew a 60-second boot-relative lease every 20 seconds,
+without adding events or resetting the call's idle origin. The node stops a
+copy immediately on a terminal authority refusal. Transient renewal errors
+retry with backoff within the last confirmed lease, with a five-second
+safety margin. The deadline is measured from request issuance; ambiguous
+failures do not extend it. If retries exhaust that budget the copy stops.
+A terminal receipt releases the hold and resets the idle origin. Without a terminal receipt, L1 treats the lease deadline as the
+release time; the Seat can then expire after its normal idle wait. Same-boot
+L1 restarts preserve leases. A different boot drops old lease authority and
+starts the ordinary new-boot idle wait. Seat or Attempt ending clears copy
+holds and the node cancels transfers when a Seat is unbound or renewal is
+refused. A delayed sending receipt cannot resurrect a terminal operation.

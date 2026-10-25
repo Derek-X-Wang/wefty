@@ -68,6 +68,132 @@
         }
       }
     },
+    "/v1/seats/{seat_id}/copy-outcome": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "reportSeatCopyOutcome",
+        "summary": "Report local copy publication outcome",
+        "description": "Requires a live Seat and its credential. Updates only an existing node-created copy-out event with node_outcome=sent. An unknown node CopyID returns typed 404 not_found and writes nothing. Direction, path, size and node result are immutable; a local result cannot be replaced. Ending or ended Seats return seat_ended. This operation grants no payload action or Seat activity.",
+        "security": [
+          {
+            "fabricIdentity": [],
+            "seatCredential": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./common.v1.json#/components/schemas/SeatCopyOutcomeReceipt"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Copy outcome recorded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {}
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/seats/{seat_id}/copy-target": {
+      "parameters": [
+        {
+          "name": "seat_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^seat_[0-9a-f]{32}$"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getSeatCopyTarget",
+        "summary": "getSeatCopyTarget",
+        "responses": {
+          "200": {
+            "description": "Seat copy reply",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "./common.v1.json#/components/schemas/SeatCopyTarget"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "./common.v1.json#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "./common.v1.json#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "./common.v1.json#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "./common.v1.json#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "./common.v1.json#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "./common.v1.json#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "./common.v1.json#/components/responses/Unavailable"
+          }
+        },
+        "security": [
+          {
+            "fabricIdentity": [],
+            "seatCredential": []
+          }
+        ],
+        "description": "Requires the live Seat credential. Returns the private Computer endpoint used for streaming POST /v1/seats/{seat_id}/copy?direction=in|out&path=PATH at the node agent. Ended credentials receive seat_ended with the reason; this read does not renew Seat activity."
+      }
+    },
     "/v1/seats/{seat_id}/logs": {
       "parameters": [
         {
@@ -83,7 +209,7 @@
       "get": {
         "operationId": "getSeatLogs",
         "summary": "getSeatLogs",
-        "description": "The original caller or this Seat credential may read retained Seat events. The first credential GET with X-Wefty-Seat-Call: start renews activity once. Pagination, read receipts and follow polls never renew it. After its end, the credential authorizes only its own retained log and read cursor.",
+        "description": "The original caller or this Seat credential may read retained Seat events. The first credential GET with X-Wefty-Seat-Call: start renews activity once. Pagination, read receipts and follow polls never renew it. After its end, the credential authorizes only its own retained log and read cursor. Copy-outcome updates require a live Seat.",
         "security": [
           {
             "fabricIdentity": []
@@ -168,7 +294,7 @@
       "post": {
         "operationId": "markSeatLogRead",
         "summary": "markSeatLogRead",
-        "description": "The original caller or this Seat credential may read retained Seat events. The first credential GET with X-Wefty-Seat-Call: start renews activity once. Pagination, read receipts and follow polls never renew it. After its end, the credential authorizes only its own retained log and read cursor.",
+        "description": "The original caller or this Seat credential may read retained Seat events. The first credential GET with X-Wefty-Seat-Call: start renews activity once. Pagination, read receipts and follow polls never renew it. After its end, the credential authorizes only its own retained log and read cursor. Copy-outcome updates require a live Seat.",
         "security": [
           {
             "fabricIdentity": []

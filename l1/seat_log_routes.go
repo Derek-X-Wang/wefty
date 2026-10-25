@@ -97,6 +97,14 @@ func (s *Server) seatCredentialProtocol(next, logs http.Handler) http.Handler {
 			logs.ServeHTTP(w, r)
 			return
 		}
+		if !ended.Valid && r.Method == http.MethodPost && r.URL.Path == path+"/copy-outcome" {
+			logs.ServeHTTP(w, r)
+			return
+		}
+		if !ended.Valid && r.Method == http.MethodGet && r.URL.Path == path+"/copy-target" {
+			logs.ServeHTTP(w, r)
+			return
+		}
 		if ended.Valid {
 			writeError(w, protocolError(contract.ErrorCode("seat_ended"), "Seat ended: %s", reason))
 			return

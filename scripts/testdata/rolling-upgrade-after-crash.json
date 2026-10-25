@@ -1,0 +1,226 @@
+{
+  "note": "Reduced Run-4 JSON shapes; all generation, Run, Job and Attempt identities redacted. No native service is exercised.",
+  "status": {
+    "upgrade_state": "complete",
+    "ready": false,
+    "reasons": [
+      {
+        "code": "retiring_attempt_problem",
+        "detail": "generation g-cancelled: Run run-cancelled (Attempt attempt-cancelled): failed"
+      },
+      {
+        "code": "retiring_attempt_problem",
+        "detail": "generation g-crashed: Run run-crashed (Attempt attempt-crashed): lost"
+      }
+    ],
+    "generations": [
+      {
+        "agent_generation_id": "g-primary",
+        "role": "primary",
+        "remaining_run_ids": [],
+        "remaining_attempt_ids": [],
+        "renewal_health": "healthy",
+        "retirement_progress": "complete",
+        "attempts": []
+      },
+      {
+        "agent_generation_id": "g-cancelled",
+        "role": "closed",
+        "remaining_run_ids": [],
+        "remaining_attempt_ids": [],
+        "renewal_health": "degraded",
+        "retirement_progress": "complete",
+        "attempts": [
+          {
+            "job_id": "job-cancelled",
+            "attempt_id": "attempt-cancelled",
+            "run_id": "run-cancelled",
+            "state": "failed",
+            "last_renewed_at": "2026-10-25T04:18:04.800458Z",
+            "lease_expires_at": "2026-10-25T04:18:24.92986Z"
+          }
+        ]
+      },
+      {
+        "agent_generation_id": "g-crashed",
+        "role": "retiring",
+        "remaining_run_ids": [],
+        "remaining_attempt_ids": [],
+        "renewal_health": "degraded",
+        "retirement_progress": "evidence_pending",
+        "attempts": [
+          {
+            "job_id": "job-crashed",
+            "attempt_id": "attempt-crashed",
+            "run_id": "run-crashed",
+            "state": "lost",
+            "last_renewed_at": "2026-10-25T04:18:03.741623Z",
+            "lease_expires_at": "2026-10-25T04:18:33.741623Z"
+          }
+        ]
+      },
+      {
+        "agent_generation_id": "g-survivors",
+        "role": "retiring",
+        "remaining_run_ids": [
+          "run-success",
+          "run-nonzero"
+        ],
+        "remaining_attempt_ids": [
+          "attempt-success",
+          "attempt-nonzero"
+        ],
+        "renewal_health": "healthy",
+        "retirement_progress": "finishing",
+        "attempts": [
+          {
+            "job_id": "job-success",
+            "attempt_id": "attempt-success",
+            "run_id": "run-success",
+            "state": "running",
+            "last_renewed_at": "2026-10-25T04:18:27.580566Z",
+            "lease_expires_at": "2026-10-25T04:18:57.580566Z"
+          },
+          {
+            "job_id": "job-nonzero",
+            "attempt_id": "attempt-nonzero",
+            "run_id": "run-nonzero",
+            "state": "running",
+            "last_renewed_at": "2026-10-25T04:18:27.586619Z",
+            "lease_expires_at": "2026-10-25T04:18:57.586619Z"
+          }
+        ]
+      }
+    ]
+  },
+  "doctor": {
+    "upgrade_state": "complete",
+    "healthy": false,
+    "generations": [
+      {
+        "agent_generation_id": "g-primary",
+        "role": "primary",
+        "remaining_run_ids": [],
+        "remaining_attempt_ids": [],
+        "renewal_health": "healthy",
+        "retirement_progress": "complete",
+        "attempts": []
+      },
+      {
+        "agent_generation_id": "g-cancelled",
+        "role": "closed",
+        "remaining_run_ids": [],
+        "remaining_attempt_ids": [],
+        "renewal_health": "degraded",
+        "retirement_progress": "complete",
+        "attempts": [
+          {
+            "job_id": "job-cancelled",
+            "attempt_id": "attempt-cancelled",
+            "run_id": "run-cancelled",
+            "state": "failed",
+            "last_renewed_at": "2026-10-25T04:18:04.800458Z",
+            "lease_expires_at": "2026-10-25T04:18:24.92986Z"
+          }
+        ]
+      },
+      {
+        "agent_generation_id": "g-crashed",
+        "role": "retiring",
+        "remaining_run_ids": [],
+        "remaining_attempt_ids": [],
+        "renewal_health": "degraded",
+        "retirement_progress": "evidence_pending",
+        "attempts": [
+          {
+            "job_id": "job-crashed",
+            "attempt_id": "attempt-crashed",
+            "run_id": "run-crashed",
+            "state": "lost",
+            "last_renewed_at": "2026-10-25T04:18:03.741623Z",
+            "lease_expires_at": "2026-10-25T04:18:33.741623Z"
+          }
+        ]
+      },
+      {
+        "agent_generation_id": "g-survivors",
+        "role": "retiring",
+        "remaining_run_ids": [
+          "run-success",
+          "run-nonzero"
+        ],
+        "remaining_attempt_ids": [
+          "attempt-success",
+          "attempt-nonzero"
+        ],
+        "renewal_health": "healthy",
+        "retirement_progress": "finishing",
+        "attempts": [
+          {
+            "job_id": "job-success",
+            "attempt_id": "attempt-success",
+            "run_id": "run-success",
+            "state": "running",
+            "last_renewed_at": "2026-10-25T04:18:27.580566Z",
+            "lease_expires_at": "2026-10-25T04:18:57.580566Z"
+          },
+          {
+            "job_id": "job-nonzero",
+            "attempt_id": "attempt-nonzero",
+            "run_id": "run-nonzero",
+            "state": "running",
+            "last_renewed_at": "2026-10-25T04:18:27.586619Z",
+            "lease_expires_at": "2026-10-25T04:18:57.586619Z"
+          }
+        ]
+      }
+    ],
+    "findings": [
+      {
+        "check": "proof-l1",
+        "severity": "ok",
+        "detail": "loaded and running",
+        "fix": ""
+      },
+      {
+        "check": "retiring_attempt_problem",
+        "severity": "error",
+        "detail": "generation g-cancelled: Run run-cancelled (Attempt attempt-cancelled): failed",
+        "fix": "run wefty upgrade --rolling to resume or roll back an interrupted upgrade; restore missing evidence and rerun doctor"
+      },
+      {
+        "check": "retiring_attempt_problem",
+        "severity": "error",
+        "detail": "generation g-crashed: Run run-crashed (Attempt attempt-crashed): lost",
+        "fix": "run wefty upgrade --rolling to resume or roll back an interrupted upgrade; restore missing evidence and rerun doctor"
+      }
+    ]
+  },
+  "probes": {
+    "run-cancelled": {
+      "job": "job-cancelled",
+      "attempt": "attempt-cancelled"
+    },
+    "run-crashed": {
+      "job": "job-crashed",
+      "attempt": "attempt-crashed"
+    },
+    "run-success": {
+      "job": "job-success",
+      "attempt": "attempt-success"
+    },
+    "run-nonzero": {
+      "job": "job-nonzero",
+      "attempt": "attempt-nonzero"
+    }
+  },
+  "expectation": {
+    "generation": "g-crashed",
+    "run": "run-crashed",
+    "survivors": [
+      "run-success",
+      "run-nonzero"
+    ],
+    "cancelled": "run-cancelled"
+  }
+}

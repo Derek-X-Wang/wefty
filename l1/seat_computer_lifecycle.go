@@ -8,6 +8,11 @@ import (
 // Authority loss and Seat ending commit with the Computer intent. Attempt
 // completion is scoped to its old Seats, never to a replacement's new Seats.
 func endComputerSeats(ctx context.Context, q seatApprovalQuery, computer, attempt, reason string, now time.Time) error {
+	if attempt != "" {
+		if _, err := q.ExecContext(ctx, `DELETE FROM seat_copy_holds WHERE attempt_id=?`, attempt); err != nil {
+			return err
+		}
+	}
 	query := `SELECT i.seat_id FROM computer_seat_identities i JOIN seat_approvals a ON a.seat_id=i.seat_id WHERE i.computer_id=? AND COALESCE(NULLIF(a.lifecycle_state,''),a.state) IN ('requested','approved','starting','live')`
 	args := []any{computer}
 	if attempt != "" {

@@ -451,3 +451,148 @@ reasons, IDs and timestamps are null. Human output includes
 `restartable: yes; restarts: N/10; restart pending: yes|no` and the last reason.
 Required execution observation failure is an error, never cached counters.
 `inspect --execution` also shows Attempt `state` and `interruption_reason`.
+
+## Seat file copies
+
+`wefty cp SRC SEAT_ID:PATH` copies in; `wefty cp SEAT_ID:PATH DEST` copies
+out. Exactly one side names a Seat. Both single regular files and recursive
+directories are supported, through a streaming tar archive. Git is not
+consulted: ignored files, including secret files, can be copied in. Wefty
+downloads nothing. Symlinks to regular source files are read as files;
+directory symlinks and special files are refused.
+
+A relative Seat path starts in its folder. An absolute Seat path may name any
+file accessible to its Linux user, including the Computer's shared folder. The
+helper uses the existing Seat command preparation, readiness check, generation
+fence, UID/GID and environment. Copies never run as root.
+
+DEST names the exact result path, not a directory to merge into. Its parent
+must exist. Resolve parent symlinks once (including macOS `/tmp` and `/var`),
+then pin that resolved directory with `os.OpenRoot`; reject only a symlink at
+DEST's final name. Python uses the same resolved-parent/descriptor rule as the
+Seat user. Staging and rename stay relative to that pinned directory even if a
+parent link changes later. Incoming archive links and special files remain
+refused. Copied folders have mode 0700; regular file modes retain permission
+bits subject to the user's umask. A failed copy removes staging and preserves
+the existing destination. SIGTERM exits Python through cleanup.
+
+The CLI performs local writes itself, within its own sandbox; no helper writes
+to the Mac on its behalf. File contents stream without a total byte limit.
+A copy with no input or output stream progress for 60 seconds fails with
+`seat_copy_failed` and a `Seat copy stalled` diagnostic; progress refreshes
+that bound, so a progressing copy has no total runtime limit.
+Disk-full and transport failures return `seat_copy_failed`; local permission,
+read-only filesystem and final-name symlink refusals return
+`seat_copy_write_denied`. Both use exit 1. An existing-folder failure says
+that DEST names the exact result path. Seat-to-Seat copies are refused.
+
+`Agent.Run` owns one shared Seat front-door listener on the node's logical
+Fabric service address (the enrolled participant name supplied by the Fabric,
+fixed port 80 in the private Fabric). Without a Fabric-supplied service
+address, each listener gets a unique logical name, so overlapping node agent
+generations cannot collide. The plain Fabric maps that name to an ephemeral
+loopback endpoint. Clients dial the endpoint published by L1's copy-target
+route, not the private logical registration name. The participant name need
+not equal the registered Wefty node ID. A listener startup failure is logged
+and leaves the Seat door unavailable: Seat-request Computers refuse readiness,
+while node registration and non-Seat work continue.
+Each Computer Attempt registers a feature mux and binds only Seat IDs from its
+fenced L1 wanted list. Copies, Seat Runs and per-Seat screens share this same
+listener; unknown paths and unbound Seats are refused. The generated
+private-network policy permits client participants to reach only node port 80
+for this door; other node ports remain owner-only. Port 80 is reserved on every Fabric. Submit validation refuses
+`published_port: 80` with `invalid_request`; node reservation repeats the
+check, so a hosted application cannot bind it. This is policy
+guidance; existing owner-installed network policies must allow that narrow
+path. The door rejects a missing Seat credential with typed HTTP 401 before
+invoking a feature. Each feature checks the credential and Attempt authority. The
+router holds no lock across I/O. The published `/websockify` URL retains the
+existing Computer endpoint envelope; copy requests use the Seat path below,
+not that legacy screen path.
+
+A Seat-request Computer publishes through `SetAttemptPublication` with its
+exact Attempt ID and fencing token after runtime start, before its controller
+can report a live Seat. Publication failure prevents live readiness. Cleanup
+cancels the registration, removes only that exact Attempt's routes, and
+withdraws its publication. L1 rejects stale Attempt publication. Registration
+locks are never held during publication, runtime commands or network calls.
+
+`GET /v1/seats/{seat_id}/copy-target` requires that Seat's credential and
+returns its current private Computer endpoint plus the unread-event count. The
+CLI sends the same credential to `POST
+/v1/seats/{seat_id}/copy?direction=in|out&path=PATH` at that endpoint. The
+node agent obtains current authority through `POST
+/v1/agent/seats/{seat_id}/copy-authority`, bound to its Computer, Attempt,
+node boot and fence. Its receipt goes to `POST
+/v1/agent/seats/{seat_id}/copy-receipt`. Before any payload bytes, the node
+records a `sending` event and acquires the Seat hold. Every copy that reaches
+the node and passes Seat authorization is logged, including runtime failure,
+with one `copy_in` or `copy_out` event containing its path, file-content bytes
+moved (excluding tar framing), outcome and short failure reason. Failures
+before reaching the node create no Seat log event: nothing entered or left the
+Seat. The node creates a random, unguessable CopyID, ignores any
+caller-supplied ID, and returns its ID in the terminal stream reply after
+recording its own evidence. The CLI never supplies a CopyID for a transfer.
+
+Copy-in records `completed` only after rename, or `failed` with bytes
+consumed. Copy-out records `sent` after the node finishes sending; this is
+pending local publication. The node replaces `sending` with its terminal
+outcome and bytes moved; a crash mid-transfer leaves `sending` visible.
+Terminal node direction, path, size and `node_outcome` are immutable. The CLI
+reports `completed` after local rename, or `failed` (for example
+`destination_write_denied`) through `POST /v1/seats/{seat_id}/copy-outcome`,
+using the node's CopyID and exact metadata. A failed local stage drains and
+discards the remaining stream to obtain that terminal receipt. L1 only updates
+an existing node-created copy-out event with `node_outcome=sent`; an unknown
+ID gets typed 404 `not_found` and writes nothing. A caller cannot create an
+event, update a copy-in, alter node evidence or replace a previously recorded
+local result. A node receipt retry remains valid after a local result has been
+added.
+
+Local outcome updates require a live Seat, checked in the same transaction as
+the update. An ending or ended Seat refuses them with `seat_ended`. The
+retained credential can still read its log. If the Seat ends between transfer
+and local reporting, the CLI reports outcome unconfirmed and the node's `sent`
+remains visible. L1 moves the same event to a fresh cursor position when the
+local result first arrives; identical retries do not move it again. Human logs
+show both results when they differ, for example `sent 999 B; local publish
+failed`. JSON retains `node_outcome` alongside `outcome` and the local failure
+reason.
+
+Node and CLI metadata receipts each use up to three attempts within one
+five-second `context.WithoutCancel` bound, with 100 ms then 200 ms backoff and
+the same node-owned CopyID. They never repeat the transfer. If delivery cannot
+be confirmed, the command fails loudly; no completed local outcome is
+inferred. See `seat-logs.md` for cursor and authority rules. The sending
+receipt counts as `SeatCallHappened` and creates a separate copy hold, never
+an entry in the command cancellation seam. The node renews it every 20 seconds
+with the same sending receipt, independently of blocked payload I/O. Its lease
+is 60 seconds on L1's boot-relative Seat clock. L1 restart in the same boot
+preserves the deadline. A missing final receipt releases the hold at that
+deadline; the idle wait starts there. Successful terminal delivery releases it
+and starts the idle wait at completion. Seat or Attempt termination clears
+copy holds. Removing a Seat from the wanted list cancels its in-flight copies;
+a terminal renewal refusal also cancels the transfer. Other renewal errors
+retry with backoff (100 ms, doubling to a one-second cap) within the last
+confirmed lease. The local deadline starts when that receipt was issued,
+not when its reply arrived. Each request is bounded by five seconds and the
+remaining budget. Without a successful renewal the node cancels five seconds
+before that lease expires. Ambiguous failures never extend the local budget.
+Delayed sending receipts cannot resurrect a terminal copy. Publication retries transient errors with
+backoff until the Attempt ends; fencing stops startup. Cleanup retries
+withdrawal within ten seconds, and stale registrations cannot withdraw their
+replacement. Publication failures log the Computer and error on the first
+failure, then at most once per minute across startup and withdrawal.
+
+The node response streams bounded NDJSON `SeatCopyStreamEvent` objects: `data`
+contains archive bytes; a final `size_bytes` means node completion (copy-out
+is still `sent`); terminal replies include `copy_id`; `error` is a typed
+failure. EOF without completion is failure. Copy-out publishes locally only
+after that terminal evidence and archive validation. Copy-in uses a
+helper-to-child completion marker so a truncated input cannot be mistaken for
+a complete archive by containerd's stdin pipe.
+
+A selected-file copy is **not a Custody export**. It creates no Storage
+provenance, export receipt, custody manifest or custody taint. A Computer's
+removal proof and removal outcome are the same before and after copy-out.
+Whole-Storage Custody exports retain their existing contract.

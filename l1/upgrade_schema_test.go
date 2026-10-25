@@ -33,6 +33,7 @@ import (
 // durable boot-relative Seat/approval/idle clocks, activity holds and owner summaries;
 // then remove the global calendar anchor so general L1 timestamps remain wall time;
 // then #1247 boot-scoped Attempt lease deadlines and their expiry index.
+// Then #1153 adds Attempt-bound, boot-relative copy leases in seat_copy_holds.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -52,7 +53,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
 	// Seat identity recovery retains exact authority and positive Attempt absence.
-	const mainFingerprint = "cae3f9daf881c295b2e0c847bc4ab48d7110085c1484f74242c0cd8d470bb406"
+	const mainFingerprint = "bdcc9243e4fb7f15d399e8539ed6a61951f0e86e9549701616e364990828f1d7"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}
