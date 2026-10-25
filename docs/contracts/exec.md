@@ -681,9 +681,15 @@ as failed without an exit code, finishes the Seat Run, releases the hold, and
 writes a `max_runtime_backstop` Seat event with the reason and fix. The helper
 still owns stopping the command at its deadline; L1 does not claim runtime
 quiescence from missing evidence. Calendar changes cannot extend this bound.
-A different L1 host boot, or an older running row with no start stamp, invokes
-the backstop on the next Seat-life check. Failed recovery writes retry on later
-checks. A repeated finish with identical evidence is harmless. A second start is
+Command holds survive an L1 reboot. A different L1 host boot, or an older
+active command with no start stamp, gets a current boot-relative start stamp
+on the next Seat-life check; neither case fails the Run or releases its hold.
+The receipt backstop then waits one fresh command deadline plus five-minute
+grace from that re-stamp. Repeated checks within the same host boot preserve
+that origin. The node agent and helper retain the command's original deadline;
+only L1's silent-node recovery window restarts, adding at most one deadline
+plus grace for a Run crossing an L1 reboot. Failed recovery writes retry on
+later checks. A repeated finish with identical evidence is harmless. A second start is
 refused, including after the command ends. Internal event writes recover or
 skip a missing older Seat log rather than blocking the state transition.
 

@@ -530,8 +530,8 @@ func TestSeatRunPollDoesNotWaitForWriter(t *testing.T) {
 	}
 }
 
-func TestSeatRunLegacyRunningHoldGetsBoundOnUpgrade(t *testing.T) {
-	f, id, _, claim, _ := startSeatRunFixture(t)
+func TestSeatRunLegacyRunningHoldRestampsOnUpgrade(t *testing.T) {
+	f, id, _, claim, input := startSeatRunFixture(t)
 	columns, err := sqliteTableColumns(t.Context(), f.store.db, "seat_runs")
 	if err != nil {
 		t.Fatal(err)
@@ -540,25 +540,143 @@ func TestSeatRunLegacyRunningHoldGetsBoundOnUpgrade(t *testing.T) {
 		if col != "start_boot_id" && col != "start_ns" && col != "computer_fencing_token" {
 			continue
 		}
-		if _, err := f.store.db.Exec("ALTER TABLE seat_runs DROP COLUMN " + col); err != nil {
+		if _, err = f.store.db.Exec("ALTER TABLE seat_runs DROP COLUMN " + col); err != nil {
 			t.Fatal(err)
 		}
 	}
 	f.reopen(t)
-	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+	if err = f.store.CheckSeatLife(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	job, err := f.store.GetJob(t.Context(), claim.Job.JobID)
-	if err != nil || job.State != contract.JobFailed {
-		t.Fatalf("unstamped legacy Run=%+v %v", job, err)
-	}
+	assertSeatRunContinues(t, f, claim, input)
+	assertSeatRunStartStamp(t, f, claim, "injected-clock", f.clock.Now().UnixNano())
 	f.clock.Advance(30 * time.Minute)
 	if err = f.store.CheckSeatLife(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	value, err := f.store.GetSeatRequest(t.Context(), id)
+	if err != nil || value.State != SeatLive {
+		t.Fatalf("legacy command lost its hold: %+v %v", value, err)
+	}
+	f.clock.Advance(35 * time.Minute)
+	if err = f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	job, err := f.store.GetJob(t.Context(), claim.Job.JobID)
+	if err != nil || job.State != contract.JobFailed {
+		t.Fatalf("legacy fresh window never ended: %+v %v", job, err)
+	}
+	f.clock.Advance(30 * time.Minute)
+	if err = f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	value, err = f.store.GetSeatRequest(t.Context(), id)
 	if err != nil || value.State != SeatEnding {
-		t.Fatalf("legacy hold retained Seat: %+v %v", value, err)
+		t.Fatalf("legacy backstop retained hold: %+v %v", value, err)
+	}
+}
+
+func reopenSeatRunOnNewL1Boot(t *testing.T, f *seatLifecycleFixture) *seatBootTestClock {
+	t.Helper()
+	if err := f.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	clock := &seatBootTestClock{fakeClock: f.clock, boot: "new-l1-host-boot", elapsed: 10 * time.Minute}
+	var err error
+	f.store, err = OpenStore(f.path, StoreOptions{Clock: clock, LeaseDuration: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return clock
+}
+func assertSeatRunContinues(t *testing.T, f *seatLifecycleFixture, claim Claim, input SeatRunControlRequest) {
+	t.Helper()
+	job, err := f.store.GetJob(t.Context(), claim.Job.JobID)
+	if err != nil || (job.State != contract.JobClaimed && job.State != contract.JobRunning) {
+		t.Fatalf("L1 reboot or missing stamp ended command: %+v %v", job, err)
+	}
+	input.Phase = "poll"
+	reply, err := f.store.ControlSeatRun(t.Context(), "fabric-computer-node", claim.Job.JobID, claim.Lease.AttemptID, input)
+	if err != nil || reply.Cancel {
+		t.Fatalf("live command refused after clock recovery: %+v %v", reply, err)
+	}
+	var held bool
+	if err = f.store.db.QueryRow(`SELECT active FROM seat_activity_holds WHERE seat_id=? AND kind='command' AND hold_id=?`, reply.Binding.SeatID, reply.RunID).Scan(&held); err != nil || !held {
+		t.Fatalf("command hold=%t %v", held, err)
+	}
+}
+func assertSeatRunStartStamp(t *testing.T, f *seatLifecycleFixture, claim Claim, wantBoot string, wantNS int64) {
+	t.Helper()
+	var boot string
+	var ns int64
+	err := f.store.db.QueryRow(`SELECT start_boot_id,start_ns FROM seat_runs WHERE job_id=?`, claim.Job.JobID).Scan(&boot, &ns)
+	if err != nil || boot != wantBoot || ns != wantNS {
+		t.Fatalf("stamp=(%q,%d), want (%q,%d): %v", boot, ns, wantBoot, wantNS, err)
+	}
+}
+func TestSeatRunL1HostRebootRestampsWithoutEndingCommand(t *testing.T) {
+	f, id, _, claim, input := startSeatRunFixture(t)
+	clock := reopenSeatRunOnNewL1Boot(t, f)
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertSeatRunContinues(t, f, claim, input)
+	assertSeatRunStartStamp(t, f, claim, clock.boot, int64(10*time.Minute))
+	clock.elapsed += 31 * time.Minute
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	value, err := f.store.GetSeatRequest(t.Context(), id)
+	if err != nil || value.State != SeatLive {
+		t.Fatalf("reboot released running command hold: %+v %v", value, err)
+	}
+	assertSeatRunContinues(t, f, claim, input)
+}
+func TestSeatRunL1HostRebootBackstopWaitsForFreshWindow(t *testing.T) {
+	f, id, secret, claim, input := startSeatRunFixture(t)
+	clock := reopenSeatRunOnNewL1Boot(t, f)
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	// Repeated maintenance must retain the re-stamp, rather than continually
+	// renewing the window. The old boot's elapsed value is unrelated.
+	clock.elapsed += 65*time.Minute - time.Nanosecond
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertSeatRunContinues(t, f, claim, input)
+	assertSeatRunStartStamp(t, f, claim, clock.boot, int64(10*time.Minute))
+	clock.elapsed++
+	if err := f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	job, err := f.store.GetJob(t.Context(), claim.Job.JobID)
+	if err != nil || job.State != contract.JobFailed {
+		t.Fatalf("fresh backstop did not finish: %+v %v", job, err)
+	}
+	page, err := f.store.GetSeatLogs(t.Context(), "cli", id, secret, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range page.Events {
+		if event.Kind == SeatEventCommandFinished {
+			found = true
+			if event.Reason != "max_runtime_backstop" || event.ExitCode != nil {
+				t.Fatalf("backstop event=%+v", event)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("fresh backstop omitted finished event")
+	}
+	clock.elapsed += 30 * time.Minute
+	if err = f.store.CheckSeatLife(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	value, err := f.store.GetSeatRequest(t.Context(), id)
+	if err != nil || value.State != SeatEnding {
+		t.Fatalf("fresh backstop did not release hold: %+v %v", value, err)
 	}
 }
 

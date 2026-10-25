@@ -2811,10 +2811,10 @@ answers for their original bounded duration, once per boot. Approval windows
 are dropped with reason `l1_host_restarted`, so reboot cannot extend their
 maximum 24-hour cap. Command and screen holds remain durable. An L1 reboot is not a
 Computer restart: only the existing Attempt lifecycle supplies that end reason.
-Command and screen holds survive an L1 process restart on the same host boot;
-#1150 and #1147 clear their holds on a Computer restart. #1150 additionally
-bounds command holds by their deadline and receipt grace; a changed host boot
-cannot grant an unstamped command a fresh deadline.
+Command and screen holds survive an L1 reboot by design; #1150 and #1147 must
+clear their holds on a Computer restart. #1150's silent-node backstop restarts
+its bounded window when L1's host boot changes; L1's reboot is not evidence
+that a remote command ended or reached its deadline.
 A backward elapsed-clock step within the same boot means zero elapsed and
 never a reboot. Boot identity alone identifies a new boot.
 L1's general timestamps use real wall time, without a global clock anchor.
@@ -2907,6 +2907,14 @@ log. The two steps are recoverable: if the receipt write fails after ordinary
 completion, the next check uses terminal Attempt recovery. Neither step stops
 the Computer or asserts runtime quiescence. The helper independently stops the
 command at its original deadline. Wall-clock changes cannot extend the bound.
-A changed L1 host boot or an unstamped pre-upgrade running row takes this same
-backstop on the next check. Start and finish use write transactions; polls and
-recovery inventories use `TxOptions{ReadOnly:true}` snapshots.
+A changed L1 host boot or an unstamped pre-upgrade active command restarts only
+the backstop window: maintenance writes the current `start_boot_id` and
+boot-relative `start_ns` without failing the Run or releasing its hold. The
+fresh window is one command deadline plus grace from that re-stamp. Repeated
+checks and L1 restarts within the same host boot retain the stamp. The node
+agent and helper still enforce the command's original deadline independently.
+A Run crossing an L1 reboot can therefore receive at most one extra deadline
+plus grace for receipt recovery. Completed Attempt receipts still recover
+normally. Conditional re-stamp writes cannot overwrite a newer origin or a
+finished command. Start, finish and clock re-stamps use write transactions;
+polls and recovery inventories use `TxOptions{ReadOnly:true}` snapshots.

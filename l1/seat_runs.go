@@ -406,9 +406,14 @@ func (s *Store) recoverSeatRunEnds(ctx context.Context) error {
 		result    ProcessResult
 		backstop  bool
 	}
+	type restart struct {
+		run, attempt, boot string
+		start              int64
+	}
 	cursor := ""
 	for {
 		var endedRuns []ended
+		var restarts []restart
 		count := 0
 		err := s.withReadSnapshot(ctx, nil, func(ctx context.Context, r readModel) error {
 			rd := r.(*databaseReads)
@@ -447,10 +452,14 @@ func (s *Store) recoverSeatRunEnds(ctx context.Context) error {
 					s.logSeatLifeError(v.run, fmt.Errorf("invalid retained Seat Run params"))
 					continue
 				}
-				// Boot replacement or a legacy unstamped command cannot retain an
-				// unbounded hold. No wall-clock adjustment extends the original bound.
-				due := v.boot == "" || v.boot != boot || (ns >= v.start && (ns-v.start)/int64(time.Second)-int64(seatRunBackstopGrace/time.Second) >= p.SeatRun.MaxRuntimeSeconds)
 				active := v.state == string(contract.AttemptClaimed) || v.state == string(contract.AttemptRunning) || v.state == string(contract.AttemptAwaitingInput)
+				// A new L1 host boot has no comparable elapsed origin. Preserve
+				// remote commands and restart only this receipt backstop window.
+				if active && (v.boot == "" || v.boot != boot) {
+					restarts = append(restarts, restart{v.run, v.attempt, v.boot, v.start})
+					continue
+				}
+				due := ns >= v.start && (ns-v.start)/int64(time.Second)-int64(seatRunBackstopGrace/time.Second) >= p.SeatRun.MaxRuntimeSeconds
 				if active && !due {
 					continue
 				}
@@ -481,6 +490,11 @@ func (s *Store) recoverSeatRunEnds(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		for _, v := range restarts {
+			if e := s.restartSeatRunBackstop(ctx, v.run, v.attempt, v.boot, v.start); e != nil {
+				s.logSeatLifeError(v.run, e)
+			}
+		}
 		for _, v := range endedRuns {
 			a := v.authority
 			reason := ""
@@ -503,6 +517,28 @@ func (s *Store) recoverSeatRunEnds(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// Re-stamp only the active command and origin observed by recovery. A second
+// recovery pass with the old snapshot must not reset a window already started.
+func (s *Store) restartSeatRunBackstop(ctx context.Context, runID, attemptID, oldBoot string, oldStart int64) error {
+	w, err := s.beginWriteTransaction(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer w.rollback()
+	boot, ns, err := seatTime(s.clock, w.at)
+	if err != nil {
+		return err
+	}
+	_, err = w.tx.ExecContext(w.ctx, `UPDATE seat_runs SET start_boot_id=?,start_ns=?
+ WHERE run_id=? AND command_attempt_id=? AND state='running'
+ AND start_boot_id=? AND start_ns=? AND (start_boot_id='' OR start_boot_id!=?)
+ AND EXISTS(SELECT 1 FROM attempts a WHERE a.attempt_id=seat_runs.command_attempt_id AND a.state IN ('claimed','running','awaiting-input'))`, boot, ns, runID, attemptID, oldBoot, oldStart, boot)
+	if err != nil {
+		return err
+	}
+	return w.commit()
 }
 
 // Seat deadlines use the ordinary Run protocol's whole-second runtime limit.
