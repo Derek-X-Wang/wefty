@@ -2823,3 +2823,15 @@ failed input, without a commit marker. Failed input removes staging and
 preserves an old destination. Diagnostics preserve disk-full/read/write
 failure text; the CLI surfaces `seat_copy_failed` or local
 `seat_copy_write_denied`. No copy operation enters the Custody export path.
+
+### `SetSeatDriver` (#1147)
+
+`SetSeatDriver` takes `authority` (the full Attempt authority), `generation`
+(nonzero), `place` (1–4), and `human_driving` (boolean). Only a live Computer
+Attempt may use it. It is a short control RPC, not a data stream. Success has
+an empty object body. A stale generation returns `seat_operation_refused`
+with detail `generation_mismatch`; an absent or removed place returns that
+same typed code with detail `endpoint_unavailable`. Publication failures stay
+diagnostic failures. The Linux implementation uses the Seat mutex, never
+holds the Attempt lifecycle or owner-control mutex across a task query, and
+rechecks Attempt authority before the atomic driver-file publication.

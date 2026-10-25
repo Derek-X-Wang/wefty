@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -55,9 +57,14 @@ func TestComputerNoneClaimKeepsSubmissionBridgeClosed(t *testing.T) {
 		Token: "unexpected-pass", ComputerID: "network-computer", ComputerAttemptID: "network-attempt", ComputerStorageGeneration: 1,
 	}}
 	bridges := 0
+	// Agent.Run only creates the Seat door when the node has a Fabric.
+	// Computer network=none does not remove the node's private Fabric.
+	nodeFabric := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "network-node"})
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		seatDoor: newSeatFrontDoor(nil),
-		nodeID:   "network-node", bootSessionID: "network-boot", clock: systemClock{}, managedResource: managed,
+		fabric:         nodeFabric,
+		computerPolicy: NewComputerPolicyCache(systemClock{}, "network-node", "network-boot"),
+		seatDoor:       newSeatFrontDoor(nodeFabric),
+		nodeID:         "network-node", bootSessionID: "network-boot", clock: systemClock{}, managedResource: managed,
 		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, computerTokens: minter,
 		workflowBridge: func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error) {
 			bridges++

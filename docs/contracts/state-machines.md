@@ -2871,7 +2871,6 @@ Computer. An owner-stopped Computer is never deleted by this timer. Automatic
 deletion uses the existing `RemoveComputer` path and its cleanup proof, without
 claiming `removed_verified` before the node agent and helper prove removal.
 
-
 ### Seat Runs (#1150)
 
 The ordinary Run, Job and command Attempt keep their existing state machines.
@@ -2918,3 +2917,92 @@ plus grace for receipt recovery. Completed Attempt receipts still recover
 normally. Conditional re-stamp writes cannot overwrite a newer origin or a
 finished command. Start, finish and clock re-stamps use write transactions;
 polls and recovery inventories use `TxOptions{ReadOnly:true}` snapshots.
+
+### Seat screen tenure (#1147)
+
+Seat-enabled Computers use the node's shared Seat front door. Each Seat has a
+separate attempt-scoped Controller tenure and driver signal. Older images keep
+the per-Computer path above. The shared listener opens no additional port.
+
+`GET /v1/seats/{seat_id}/screen/view` and `/screen/input` carry the `binary`
+WebSocket/RFB protocol. They require that exact Seat's `X-Wefty-Seat-Credential`.
+The node obtains fresh, fenced L1 authority before dialing the helper-returned
+endpoint for that Seat's place and generation. Neither a URL nor a credential
+can select a different Seat's helper endpoint. The view endpoint ignores input
+and remains available during a person's tenure, so an AI agent can still take
+screenshots. The input endpoint returns HTTP 409, code `person_driving`, message
+`a person is driving`, while the person holds that Seat's tenure. Taking control
+also closes existing AI agent input streams before the human control dial.
+Other Seats and commands keep running.
+
+The person path is `/v1/seats/{seat_id}/person/websockify`, with sideband
+`/person/wefty/control/take` and `/person/wefty/control/release`. It authenticates the
+person through the Fabric and the installed administrator policy. It starts
+in view mode, requires an explicit take, and keeps the same session-bound
+control bearer, policy revalidation, revocation and one-hour cap. A request
+with a Seat credential always selects the AI agent path, even on a person URL.
+The person path does not require a Seat credential.
+
+The node-only L1 routes `POST /v1/agent/seats/{seat_id}/screen-authority` and
+`/screen-event` bind the Computer, Job, Attempt, node boot session and fence.
+Control acquisition and release use the Seat-life person-hold seam and the
+strict Seat event writer in one transaction. Acquisition keeps the Seat alive;
+release starts its idle wait. Replaying evidence does not reacquire a released
+hold or move its idle origin. L1 derives audit authority generation and returns
+an asserted receipt. Seat-enabled take-over evidence lives in the Seat log;
+it is not duplicated into the legacy Computer audit.
+
+Release accepts an optional JSON object `{"note":"..."}` (at most 8192 UTF-8
+bytes). The Seat log keeps that note. The next successful AI agent screen reply
+carries the latest release note as unpadded base64url UTF-8 in
+`Wefty-Seat-Release-Note`, and the unread count in `Wefty-Seat-Unread-Events`.
+Reading the note does not acknowledge unrelated events. The latest note stays
+available on every subsequent screen reply until the next release, so a lost
+response cannot lose it. Other actions deliver the Seat log's unread-event hint
+through the shared Seat reply path; reading the screen note does not consume
+that hint.
+
+`screen_input` evidence records the AI agent path for an input stream;
+`control_taken` identifies the person path for all input under that tenure.
+Session open, close, override and denial evidence uses `takeover` events with
+the existing privacy-safe audit fields. Wefty stores no clicks, keys, RFB
+payloads or screen contents.
+
+AI agent discovery uses `GET /v1/seats/{seat_id}/screen-target` with that Seat's
+credential. The reply contains `endpoint` (the shared front door URL) and
+`unread_events`. A credential cannot discover another Seat's endpoint. Clients
+replace the endpoint path with the Seat screen path above; raw helper addresses
+never enter discovery. Screen and copy discovery share the same reviewed
+handler and query-only read snapshot. It validates the exact Seat credential
+before reading that Seat's lifecycle state, then requires its current live
+Attempt and ready helper binding. The approval-state read refuses ended Seats;
+it cannot approve, reserve room, start work or expire a Seat. Actual screen
+operations still require fresh, fenced authority through the node-only route.
+A lost driver-write acknowledgement is treated as uncertain publication. The
+node confirms false before allowing AI agent input again. If it cannot confirm
+false, it withdraws the Attempt. A typed helper refusal proves the write did
+not happen and refuses only that take.
+L1 screen-authority and screen-event refusals (including `seat_ended`, not-ready
+conflicts and Attempt mismatches), view-open transport or server failures,
+and helper not-ready or generation changes refuse only that action. The reply
+carries a typed error; other Seats keep working. A helper
+`seat_operation_refused` during a Seat view or take also refuses only that
+action. A take reply marks a helper refusal retryable. Every front-door report
+is logged with the Computer, Seat and error, including local 4xx audit refusals
+and reports during session teardown. Exhausted take-over audit writes,
+including session-open, session-close, denial and control evidence, withdraw
+the Attempt unless L1 gave a definitive 4xx refusal. A view or dial failure
+alone does not. An uncertain driver signal also
+withdraws the Attempt. A refused expired take commits the Seat's expiry
+without recording a successful acquisition. Release rediscovers the helper
+generation and rechecks the same live Seat before
+clearing, so another Seat's membership change cannot strand the driver signal.
+A live clear retries temporary authority or helper failures for at most ten
+seconds, starting at 100 ms and backing off to at most one second. The same
+injected clock bounds the backoff and cancels in-flight calls. AI agent input
+stays blocked until false is confirmed. Exhausting the bound leaves the clear
+unconfirmed and withdraws the Attempt. A `seat_ended` answer skips the backoff.
+The generation pin still refuses a reused place. If L1 reports `seat_ended`
+before unbinding, release clears using the last signal's generation and place.
+A helper refusal of that old pin confirms the ended Seat is gone; it cannot
+clear a replacement Seat's driver signal.

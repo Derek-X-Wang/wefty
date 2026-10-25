@@ -163,7 +163,7 @@ jobs:
           docker run --rm --entrypoint /bin/sh \
             --mount "type=bind,src=$PWD/examples/computer,dst=/tests,readonly" \
             "$WEFTY_SEAT_IMAGE" -ec 'python3 -c "import websockify"; exec python3 -m unittest discover -s /tests -p test_rfb_websocket.py'
-      - name: Prove IM-4 and IM-5 through helper Seat operations
+      - name: Prove P8, IM-4 and IM-5 through helper Seat operations
         env:
           ARCH: ${{ matrix.arch }}
         run: |
@@ -175,7 +175,7 @@ jobs:
             WEFTY_SEAT_CONTAINERD=/run/wefty-seat-containerd.sock \
             WEFTY_HELPER_SEAT_EVIDENCE="$RUNNER_TEMP/default-computer/$ARCH-helper-seats.json" \
             "$RUNNER_TEMP/helper-seats.test" -test.v \
-            -test.run '^(TestHelperComputerSeatsIM5|TestHelperSeatEndpointIM4)$' -test.timeout 10m
+            -test.run '^(TestHelperComputerSeatsIM5|TestHelperSeatEndpointIM4|TestHelperSeatDriverP8)$' -test.timeout 10m
       - name: Prove IM-3 and secondary CF-3 through helper Seat commands
         env:
           ARCH: ${{ matrix.arch }}
