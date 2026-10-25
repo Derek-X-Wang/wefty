@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -184,10 +185,27 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 		return spawnFailure(contract.SpawnFailureProcessGroupSetup, err), err
 	}
 
+	// Cancellation stops the payload; it does not cut off what the payload
+	// still writes. Output read after ctx ends -- a TERM handler's lines, or
+	// bytes still unread in the pipe when the stop arrived -- keeps flowing
+	// to the sink (#1277), as on the guarded path. A separate cancel cuts it
+	// off where a cancelled stop escalates to SIGKILL, so a sink write still
+	// waiting then cannot hold Wait past the reap bound, and when Run returns.
+	outputContext, cancelOutput := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelOutput()
+	var outputCutOff atomic.Bool
+	inner := sink
+	sink = OutputSinkFunc(func(writeContext context.Context, event contract.LogEvent) error {
+		err := inner.WriteOutput(writeContext, event)
+		if err != nil && outputContext.Err() != nil {
+			outputCutOff.Store(true)
+		}
+		return err
+	})
 	activity := newActivityTracker(runner.clock.Now())
 	failure := newSinkFailure()
 	command.Stdout = &eventWriter{
-		ctx:       ctx,
+		ctx:       outputContext,
 		clock:     runner.clock,
 		attemptID: request.AttemptID,
 		stream:    contract.LogStdout,
@@ -196,7 +214,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 		failure:   failure,
 	}
 	command.Stderr = &eventWriter{
-		ctx:       ctx,
+		ctx:       outputContext,
 		clock:     runner.clock,
 		attemptID: request.AttemptID,
 		stream:    contract.LogStderr,
@@ -291,7 +309,23 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			return terminate(fmt.Errorf("output sink: %w", failure.Err()))
 
 		case <-ctx.Done():
-			return terminate(ctx.Err())
+			// Keep output through the TERM grace; cut it off where terminate
+			// escalates, as the guarded path does before its output bound.
+			cutOff := runner.clock.NewTimer(runner.terminationGraceTime)
+			defer stopTimer(cutOff)
+			stopped := make(chan struct{})
+			defer close(stopped)
+			go func() {
+				select {
+				case <-cutOff.C():
+					cancelOutput()
+				case <-stopped:
+				}
+			}()
+			result, err := terminate(ctx.Err())
+			// Only a write refused after the cut-off lost output.
+			result.LogEvidenceIncomplete = result.LogEvidenceIncomplete || outputCutOff.Load()
+			return result, err
 		}
 	}
 }
