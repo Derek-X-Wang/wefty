@@ -31,6 +31,15 @@ const (
 	// together, with room for a slow runner. Removals that each make their own
 	// attempt take about 1.5 s for concurrentRemovals.
 	removalWALPromptBound = 1250 * time.Millisecond
+	// removalWALLoadTolerantBound is the bound for concurrent removals on a
+	// shared runner. Behind the one checkpoint wait, queued removals take the
+	// write lock in turn through SQLite's busy handler, which polls in sleeps
+	// of up to 100 ms; under load those sleeps overshoot, and the last of five
+	// removals took 1.83 s on CI with only one checkpoint wait (#1262). The
+	// bound stays below the pool's 5 s lock wait and the reader watchdog, so
+	// a removal or a writer that waits for the reader (#598) still fails. The
+	// one-wait bound for concurrent removals runs in the realtiming lane.
+	removalWALLoadTolerantBound = 4 * time.Second
 	// removalWALReaderWatchdog releases the held reader only if the test
 	// hangs, so a removal that waits for the reader fails on time rather
 	// than blocking forever. The reader is otherwise released by the test.
@@ -46,17 +55,17 @@ const (
 func TestServiceRemovalDefersWALTruncationPastAHeldReader(t *testing.T) {
 	store, path := openRemovalWALStore(t)
 	removals := createRemovalServices(t, store, 1)
-	assertRemovalsDeferWALTruncation(t, store, path, removals)
+	assertRemovalsDeferWALTruncation(t, store, path, removals, removalWALPromptBound)
 }
 
-// Removals under one held reader coalesce: a removal does not queue for the
-// checkpoint handle behind another removal, and does not retry a checkpoint
-// that has just been deferred, so none of them takes more than about one
-// checkpoint wait.
-func TestConcurrentServiceRemovalsUnderAHeldReaderEachReturnWithinOneWait(t *testing.T) {
+// Concurrent removals under one held reader each return, and a writer behind
+// them is not starved, without waiting for the reader. The one-wait bound that
+// proves they coalesce is wall-clock sensitive to the write-lock queue, so it
+// runs in the realtiming lane (removal_wal_realtiming_test.go).
+func TestConcurrentServiceRemovalsUnderAHeldReaderReturnWithoutWaitingForIt(t *testing.T) {
 	store, path := openRemovalWALStore(t)
 	removals := createRemovalServices(t, store, concurrentRemovals)
-	assertRemovalsDeferWALTruncation(t, store, path, removals)
+	assertRemovalsDeferWALTruncation(t, store, path, removals, removalWALLoadTolerantBound)
 }
 
 func TestComputerRemovalDefersWALTruncationPastAHeldReader(t *testing.T) {
@@ -74,7 +83,7 @@ func TestComputerRemovalDefersWALTruncationPastAHeldReader(t *testing.T) {
 			ComputerMutationPrecondition: computerPrecondition(computer, "operator"),
 		})
 		return err
-	}})
+	}}, removalWALPromptBound)
 }
 
 func openRemovalWALStore(t *testing.T) (*Store, string) {
@@ -108,9 +117,9 @@ func createRemovalServices(t *testing.T, store *Store, count int) []func() error
 
 // assertRemovalsDeferWALTruncation runs removals concurrently while a reader
 // holds a WAL snapshot. Every removal and an unrelated writer finish within
-// about one checkpoint wait, and once the reader leaves the sweep truncates
-// the WAL because the removals marked the truncation due.
-func assertRemovalsDeferWALTruncation(t *testing.T, store *Store, path string, removals []func() error) {
+// bound, and once the reader leaves the sweep truncates the WAL because the
+// removals marked the truncation due.
+func assertRemovalsDeferWALTruncation(t *testing.T, store *Store, path string, removals []func() error, bound time.Duration) {
 	t.Helper()
 	ctx := context.Background()
 	// The first sweep in a process always truncates. After it the sweep owes
@@ -179,14 +188,14 @@ func assertRemovalsDeferWALTruncation(t *testing.T, store *Store, path string, r
 		if errs[i] != nil {
 			t.Fatalf("removal %d under a held reader: %v", i, errs[i])
 		}
-		if elapsed[i] > removalWALPromptBound {
-			t.Fatalf("removal %d of %d under a held reader took %v (all: %v), want at most about one %v checkpoint wait",
-				i, len(removals), elapsed[i], elapsed, secretWALCheckpointWait)
+		if elapsed[i] > bound {
+			t.Fatalf("removal %d of %d under a held reader took %v (all: %v), want at most %v (one checkpoint wait is %v)",
+				i, len(removals), elapsed[i], elapsed, bound, secretWALCheckpointWait)
 		}
 	}
-	if waited > removalWALPromptBound {
-		t.Fatalf("a writer behind the removals waited %v, want at most about one %v checkpoint wait",
-			waited, secretWALCheckpointWait)
+	if waited > bound {
+		t.Fatalf("a writer behind the removals waited %v, want at most %v (one checkpoint wait is %v)",
+			waited, bound, secretWALCheckpointWait)
 	}
 	if info, err := os.Stat(path + "-wal"); err != nil || info.Size() == 0 {
 		t.Fatalf("WAL under a held reader = %v err %v, want its frames still there", info, err)
