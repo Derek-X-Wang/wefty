@@ -223,8 +223,11 @@ func quietCatalog(c Catalog) error {
 	if retiring > 0 {
 		return &MaintenanceRefusal{Message: fmt.Sprintf("wait for %d retiring generations to finish; then retry maintenance", retiring)}
 	}
-	if c.PendingReceipt != "" || staged > 0 {
-		return &MaintenanceRefusal{Message: "pending or staged generation remains; let the rolling recovery complete with `wefty upgrade --rolling`"}
+	if c.PendingReceipt != "" {
+		return &MaintenanceRefusal{Message: "unfinished operation (activation receipt " + c.PendingReceipt + "); let rolling recovery complete with `wefty upgrade`"}
+	}
+	if staged > 0 {
+		return &MaintenanceRefusal{Message: fmt.Sprintf("%d staged candidates remain; let rolling recovery complete with `wefty upgrade`", staged)}
 	}
 	if len(c.Generations) != 1 {
 		return &MaintenanceRefusal{Message: "maintenance requires exactly one primary; let the rolling recovery complete with `wefty upgrade --rolling`"}

@@ -26,7 +26,6 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/local"
-	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
@@ -542,7 +541,7 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 			return setupReport{}, err
 		}
 	} else if request.activateGeneration == nil || !request.lockHeld {
-		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+		if err := refuseGenerationMaintenance(host, paths, "setup"); err != nil {
 			return setupReport{}, err
 		}
 	}
@@ -612,7 +611,7 @@ func runSetup(ctx context.Context, host setupHost, request setupRequest) (setupR
 		}
 	}
 	if request.activateGeneration == nil || !request.lockHeld {
-		if err := agentinstall.RefuseMaintenance(paths.data, "setup"); err != nil {
+		if err := refuseGenerationMaintenance(host, paths, "setup"); err != nil {
 			return setupReport{}, err
 		}
 	}

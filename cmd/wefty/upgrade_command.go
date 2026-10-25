@@ -299,14 +299,44 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return upgradeReport{}, issues[0].err
 	}
 	operations := upgradeOperations(host)
-	if !operations.requestRolling && !hasInterruptedRolling(paths) {
-		if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
-			return result, err
-		}
+	store := upgradeGenerationStore(host, paths, operations)
+	if err := store.RefusePendingMaintenance("upgrade"); err != nil {
+		return result, maintenanceError(err)
 	}
 	role, err := selectUpgradeRole(paths)
 	if err != nil {
 		return upgradeReport{}, err
+	}
+	automaticRolling := false
+	if !operations.requestRolling && host.goos == "darwin" && role == "" {
+		if _, statErr := operations.statGenerationRoot(store.Root()); statErr == nil {
+			profile, err := connprofile.Read(paths.profile)
+			if err != nil {
+				return result, err
+			}
+			config, err := ocicontrol.ReadInstalledConfig(paths.nodeConfig)
+			if err != nil {
+				return result, err
+			}
+			if profile.Fabric == "plain" && config.ControlSocket == "" {
+				// Interrupted rolling receipts own recovery, including incomplete first
+				// enrollment. Fresh automatic activation requires a validated catalog.
+				if !hasInterruptedRolling(paths) {
+					if _, err := readUpgradeCatalog(store); err != nil {
+						return result, err
+					}
+				}
+				operations.requestRolling = true
+				automaticRolling = true
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return result, statErr
+		}
+	}
+	if !operations.requestRolling && !hasInterruptedRolling(paths) {
+		if err := refuseGenerationMaintenance(host, paths, "upgrade"); err != nil {
+			return result, err
+		}
 	}
 	if operations.requestRolling || hasInterruptedRolling(paths) {
 		profile, err := connprofile.Read(paths.profile)
@@ -347,8 +377,24 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 		return result, err
 	}
 	defer unlock()
+	if err := store.RefusePendingMaintenance("upgrade"); err != nil {
+		return result, maintenanceError(err)
+	}
+	// Revalidate fresh rolling activation under the installation lock before
+	// stale staging cleanup or legacy drain/service/admission recovery. An
+	// interrupted rolling receipt retains its own reconstruction protocol.
+	if operations.requestRolling && !hasInterruptedRolling(paths) {
+		store = upgradeGenerationStore(host, paths, operations)
+		if _, err := operations.statGenerationRoot(store.Root()); err == nil {
+			if _, err := readUpgradeCatalog(store); err != nil {
+				return result, err
+			}
+		} else if automaticRolling || !errors.Is(err, os.ErrNotExist) {
+			return result, &upgradeCatalogFault{Cause: err}
+		}
+	}
 	if !operations.requestRolling && !hasInterruptedRolling(paths) {
-		if err := agentinstall.RefuseMaintenance(paths.data, "upgrade"); err != nil {
+		if err := refuseGenerationMaintenance(host, paths, "upgrade"); err != nil {
 			return result, err
 		}
 	}
@@ -414,7 +460,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	nodePlist := filepath.Join(paths.launchAgents, setupNodeAgentLabel+".plist")
 	if operations.requestRolling {
 		if _, statErr := os.Lstat(filepath.Join(paths.data, agentinstall.Directory)); statErr == nil {
-			catalog, readErr := upgradeGenerationStore(host, paths, operations).Read()
+			catalog, readErr := readUpgradeCatalog(upgradeGenerationStore(host, paths, operations))
 			if readErr != nil {
 				return result, generationControlTransportError(readErr)
 			}
@@ -787,7 +833,7 @@ func runUpgrade(ctx context.Context, host setupHost, yes bool, warnings io.Write
 	}
 	report.Setup, err = runSetup(ctx, host, request)
 	if err == nil && (rolling != nil || enrollGeneration) {
-		catalog, readErr := upgradeGenerationStore(host, paths, operations).Read()
+		catalog, readErr := readUpgradeCatalog(upgradeGenerationStore(host, paths, operations))
 		if readErr != nil {
 			err = generationControlTransportError(readErr)
 		} else {

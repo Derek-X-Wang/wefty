@@ -91,7 +91,7 @@ func recoverRollingUpgrade(ctx context.Context, host setupHost, op upgradeHost, 
 		return report, generationControlConflict("rolling recovery admission identity differs")
 	}
 	if slices.Contains([]string{"candidate_ready", "candidate_staging", "promotion_requested"}, receipt.Phase) {
-		catalog, err := r.store.Read()
+		catalog, err := readUpgradeCatalog(r.store)
 		if err != nil {
 			return report, generationControlTransportError(err)
 		}
@@ -127,7 +127,7 @@ func recoverRollingUpgrade(ctx context.Context, host setupHost, op upgradeHost, 
 		report.ClaimsDisabled = drain != nil && drain.claimsDisabled
 		report.RecoveryState = r.receipt.RecoveryState
 		if err == nil {
-			catalog, readErr := r.store.Read()
+			catalog, readErr := readUpgradeCatalog(r.store)
 			if readErr != nil {
 				return report, readErr
 			}
@@ -200,7 +200,7 @@ func (r *rollingUpgrade) rollbackCandidate(ctx context.Context, drain *upgradeDr
 	if !primary {
 		return generationControlConflict("rollback would destroy a replacement primary; forward reconciliation required")
 	}
-	c, err := r.store.Read()
+	c, err := readUpgradeCatalog(r.store)
 	if err != nil {
 		return generationControlTransportError(err)
 	}
@@ -327,7 +327,7 @@ func (r *rollingUpgrade) refuseDestructiveRollback(ctx context.Context) error {
 }
 
 func (r *rollingUpgrade) resumeReadyPromotion(ctx context.Context, drain *upgradeDrainReceipt) error {
-	c, err := r.store.Read()
+	c, err := readUpgradeCatalog(r.store)
 	if err != nil {
 		return generationControlTransportError(err)
 	}
@@ -367,7 +367,7 @@ func (r *rollingUpgrade) recoverReboot(ctx context.Context, boot string, out io.
 	if err := r.persist(r.receipt.Phase); err != nil {
 		return report, err
 	}
-	c, err := r.store.Read()
+	c, err := readUpgradeCatalog(r.store)
 	if err != nil {
 		return report, generationControlTransportError(err)
 	}
@@ -610,7 +610,7 @@ func (r *rollingUpgrade) bindLegacyCandidate() error {
 	if !slices.Contains([]string{"candidate_preparing", "candidate_loading", "candidate_ready", "candidate_staging", "rolling_back"}, r.receipt.Phase) {
 		return nil
 	}
-	c, err := r.store.Read()
+	c, err := readUpgradeCatalog(r.store)
 	if err != nil {
 		return generationControlTransportError(err)
 	}
@@ -657,7 +657,7 @@ func (r *rollingUpgrade) waitRecoveryPrimary(ctx context.Context) error {
 		if node.NodeID != r.receipt.NodeID || node.AgentGenerationID != r.receipt.Candidate.ID {
 			return generationControlConflict("registered recovery primary identity differs")
 		}
-		c, err := r.store.Read()
+		c, err := readUpgradeCatalog(r.store)
 		if err != nil {
 			return generationControlTransportError(err)
 		}

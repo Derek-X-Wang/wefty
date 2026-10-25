@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -41,12 +40,8 @@ func TestGenerationMaintenanceRefusesBeforeFilesOrServicesChange(t *testing.T) {
 			case "upgrade":
 				_, err = runUpgrade(t.Context(), f.host, false, nil)
 			}
-			if command == "conversion" || command == "remove" || command == "purge" {
-				if err == nil || commandExitCode(err) != 1 || !errors.Is(err, os.ErrNotExist) {
-					t.Fatalf("missing catalog must be an operational fault: %v", err)
-				}
-			} else if err == nil || !strings.Contains(err.Error(), "retiring generations may still hold work") {
-				t.Fatalf("expected clear refusal: %v", err)
+			if err == nil || commandExitCode(err) != 1 || !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("missing catalog must be an operational fault: %v", err)
 			}
 			if called {
 				t.Fatal("maintenance reached launchctl")

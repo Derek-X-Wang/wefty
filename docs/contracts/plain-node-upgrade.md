@@ -425,11 +425,18 @@ Linux rolling activation, reboot survival or service process adoption.
 
 `wefty upgrade --rolling` opts in to the plain Mac generation coordinator.
 The flag is temporary until #1182 passes attended installed-stack acceptance.
-Without it, upgrade keeps the existing drain, interruption, output and recovery
-path above. Enabling rolling by default later requires removing the
-`requestRolling` opt-in branch, retaining the gate and every activation check.
+On a legacy installation without a generation catalog, omitting the flag keeps
+the existing drain, interruption, output and recovery path above. Once a plain
+Mac has a generation catalog, plain `wefty upgrade` selects the same rolling
+coordinator as `wefty upgrade --rolling`, including interrupted-operation
+recovery, compatibility checks and typed refusals. The flag opts a legacy
+installation into enrollment; plain upgrade never enrolls a legacy installation.
 `--yes` does not override compatibility or interrupt preserved one-shots on
-this path. Ordinary setup and default upgrade still refuse retained catalogs.
+this path. Ordinary setup refuses retained catalogs with a typed conflict (exit
+5). It names `wefty upgrade` for updates, `wefty setup --remove` for removal and
+`wefty setup --role join --convert-plain` for conversion. Repeat setup has no
+general primary-definition repair path; maintenance restoration requires its
+recorded journal. It never loads a legacy agent against an enrolled L1.
 Conversion and removal accept only the validated quiet catalog described below;
 active retirement and unresolved rolling recovery still refuse maintenance.
 
@@ -592,7 +599,8 @@ An incomplete rolling receipt is reconciled under the installation lock before
 stale-stage deletion, legacy drain recovery, or a further activation. The next
 `upgrade` invocation does this even without `--rolling`. It settles one existing
 operation and returns; it does not begin a second upgrade in that invocation.
-The ordinary no-receipt path keeps its existing drain behavior and output.
+The ordinary no-receipt path keeps its existing drain behavior and output on
+a legacy installation. An enrolled plain Mac selects rolling activation.
 
 | Durable boundary | Retry behavior |
 | --- | --- |
@@ -789,11 +797,12 @@ If that adapter cannot answer, the installation needs operator repair:
 
 ### Quiet-catalog conversion and removal (#1229)
 
-Only conversion and removal accept a quiet generation catalog; ordinary setup,
-default upgrade and fleet upgrade retain their existing generation guards.
+Only conversion and removal accept a quiet generation catalog for maintenance.
+Ordinary setup and fleet upgrade retain their generation guards. Plain upgrade
+on an enrolled plain Mac uses rolling activation, including with live retirees.
 See [installation maintenance](installation-service-plan.md) for the exact quiet
 predicate, descriptor-relative cleanup and preservation rules. `--rolling`
-remains opt-in. No retiree has a deadline.
+remains opt-in for initial enrollment. No retiree has a deadline.
 
 | Durable maintenance boundary | Retry behavior |
 | --- | --- |
@@ -947,3 +956,42 @@ plain doctor checks the catalog primary's label and recorded PATH. It does not
 require the removed legacy label, or require stopped closed retirees to run.
 An unreadable catalog leaves the primary label/PATH unverified and keeps the
 record cause visible in the cohort report.
+
+
+### Plain upgrade after enrollment (#1233)
+
+A validated catalog selects fresh rolling activation only for the plain-process
+Mac installation.
+Fleet, Linux and OCI keep their existing default routes and refusals. With a
+catalog directory present, read errors never permit legacy drain or first
+enrollment. The installation
+lock reads and validates the catalog again before stale `.upgrade-*` cleanup,
+legacy drain recovery, admission restoration, service recovery or installed
+writes. With a catalog directory present, missing, unreadable, malformed or
+structurally invalid catalog evidence is an operational failure (exit 1), with
+its cause retained. Catalog faults do not become compatibility conflicts (exit
+5), including through explicit `--rolling` and later control/recovery adapters.
+An interrupted rolling receipt retains its existing recovery protocol, including
+reconstruction of incomplete first enrollment; fresh-activation preflight does
+not replace that receipt-based authority.
+Pending `agent-maintenance.json` refuses both plain and explicit rolling
+upgrade with exit 5 and names the setup commands that resume maintenance.
+
+Both enrolled invocations use the same report writer. Human output retains
+rolling progress, then `Installed version: <commit>`, the node-agent summary,
+and `waiting_nonrestartable=N stopping_restartable=N restart_pending=N`.
+An already-current activation retains the existing `already at <commit>`
+message. Recovery reports `Rolling upgrade recovery: <state>; operation <id>.`.
+JSON uses the same upgrade report: `version`, `lease_renewal_ns`, `setup`,
+`running_work`, `already_at`, the three drain counts, and the existing optional
+`recovery_state`, `recovered_operation_id`, `version_warnings`,
+`restarted_services` and `claims_remain_disabled`. JSON suppresses human
+progress on stderr. On refusal, stdout contains the upgrade report and stderr
+contains the standard JSON error. Typed refusals retain the existing conflict
+error shape and exit 5. Status and doctor do not change.
+
+Maintenance refusals name the recorded blockers: the number of retiring
+generations, staged candidates, an unfinished activation operation, or pending
+maintenance. A quiet catalog is described as enrolled, without suggesting that
+retiring work exists. An unfinished rolling receipt names its operation and
+phase. Unreadable evidence remains a failure with its cause.
