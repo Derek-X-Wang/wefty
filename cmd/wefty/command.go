@@ -25,7 +25,7 @@ func execute(ctx context.Context, clients *apiClients, jsonOutput bool, args []s
 	case "open":
 		return executeOpen(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "seat":
-		return executeSeat(ctx, clients, jsonOutput, args[1:], stdout)
+		return executeSeat(ctx, clients, jsonOutput, args[1:], stdout, stderr)
 	case "cp":
 		return executeCP(ctx, clients, jsonOutput, args[1:], stdout)
 	case "exec":

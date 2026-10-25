@@ -57,3 +57,37 @@ func TestSeatScreenFlagsDoNotRewriteOtherCommands(t *testing.T) {
 		}
 	}
 }
+
+func TestSeatScreenFlagsBeforeLiteralTextAndSeparator(t *testing.T) {
+	id := "seat_0123456789abcdef0123456789abcdef"
+	for _, args := range [][]string{
+		{"type", "--screenshot", id, "--help"},
+		{"type", "--screenshot", "--", id, "--json"},
+		{"type", "--screenshot=capture.png", "--", id, "--screenshot"},
+		{"click", "--button", "right", "--screenshot", id, "12", "34"},
+		{"screenshot", "-o", "--json", id},
+	} {
+		parsed, err := parseSeatScreenArgs(args)
+		if err != nil {
+			t.Errorf("flags before literal arguments %q: %v", args, err)
+			continue
+		}
+		if parsed.id != id {
+			t.Fatalf("Seat ID changed: %+v", parsed)
+		}
+		if args[0] == "type" {
+			want := args[len(args)-1]
+			if parsed.text != want {
+				t.Errorf("TEXT changed: %q want %q", parsed.text, want)
+			}
+		}
+		normalized := normalizeSeatScreenArgs(append([]string{"seat"}, args...))
+		if help, _ := seatScreenWantsHelp(normalized); help {
+			t.Errorf("literal TEXT became help: %q", normalized)
+		}
+		filtered, jsonFlag, err := removeBoolFlag(normalized, "--json")
+		if err != nil || jsonFlag || len(filtered) == 0 {
+			t.Errorf("literal TEXT became JSON: %q json=%v err=%v", filtered, jsonFlag, err)
+		}
+	}
+}

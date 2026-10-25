@@ -576,6 +576,13 @@ include `details.elapsed_ms`. Measurement starts at CLI dispatch entry before
 configuration and Fabric setup; process launch overhead is measured externally
 by the lane. Reading a note or screenshot does not acknowledge Seat events.
 
+The PNG destination is created exclusively before input is sent. An existing
+or unwritable destination refuses the call before it can act. If a screenshot
+fails after confirmed input, the error starts with `<action> done; screenshot
+failed: …` and JSON `details.action_done` is `true`. The completed action must
+not be retried; this error is non-retryable even if the view refusal was
+retryable. Failed captures are removed.
+
 A screenshot writes one valid PNG to a fresh private temp file and prints its
 absolute path. `-o FILE` selects an explicit new destination, including inside
 a checkout. Every input accepts `--screenshot [FILE]`; `--screenshot=FILE`
@@ -585,3 +592,10 @@ Coordinates must be in `[0,1279] × [0,799]`; malformed arguments fail before
 opening Fabric. `scroll` requires `--dy N`, accepts `--dx N`, and limits each
 axis to 10000 wheel ticks in either direction. See `wefty seat --help` for
 key names and command arguments. Input payloads never enter a log or reply.
+
+Screen TEXT must be nonempty. It is literal even when it starts with `-`.
+Options may precede the Seat ID and TEXT; `--` before them makes all remaining
+arguments literal. Existing options after the required arguments still work.
+Every successful screen reply prints its release note to the caller's stderr,
+including repeated copies within a click-plus-screenshot call and across calls.
+The latest note repeats until the next release; AI agents act on it once.

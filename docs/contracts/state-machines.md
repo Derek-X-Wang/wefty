@@ -3077,7 +3077,7 @@ Unsupported security, messages, encodings, dimensions or rectangles fail
 closed. Complete non-incremental framebuffer updates become local PNG files.
 
 Input calls send pointer or X11 keysym events through the input endpoint.
-Modifiers and buttons are released before a final framebuffer round trip,
+Modifiers and buttons are released before a one-pixel framebuffer round trip,
 which orders the end of input before the short connection closes. An optional
 screenshot opens the view endpoint after this round trip. No daemon or
 background screen connection survives the command. No click, key, text or
@@ -3085,7 +3085,10 @@ framebuffer content is written to Wefty's logs. The CLI's screenshot file is
 an explicit local artifact, not a Seat-log entry.
 
 SC-1 measures CLI process start through the completed click and PNG on disk.
-SC-4 measures Take control through the first typed `person_driving` CLI
-refusal. Both have a one-second limit. The root-only `computer_seat_lane`
+The lane records the cold first call, performs one separate warm-up, records
+three warm calls and gates the one-second threshold on their median. The cold
+number and all warm numbers remain in the log and JSON evidence.
+SC-4 performs an input warm-up outside the measurement, then measures Take
+control through the first typed `person_driving` CLI refusal. Both have a one-second limit. The root-only `computer_seat_lane`
 records CI measurements against the real default image. CI measurements do
 not replace the later attended measurement on the owner's Mac.

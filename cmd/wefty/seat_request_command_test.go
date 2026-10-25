@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -121,14 +122,14 @@ func TestSeatRequestLostPostReplyReplaysPrivateReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var output bytes.Buffer
-	if err := executeSeatRequest(t.Context(), clients, true, []string{"request", "--network", "none"}, &output); err == nil {
+	if err := executeSeatRequest(t.Context(), clients, true, []string{"request", "--network", "none"}, &output, io.Discard); err == nil {
 		t.Fatal("lost observation was hidden")
 	}
 	if !seatCLIIdentifier.MatchString(first.SeatID) || !strings.Contains(output.String(), first.SeatID) {
 		t.Fatalf("ID was not printed before lost reply: %s", output.String())
 	}
 	output.Reset()
-	if err := executeSeatRequest(t.Context(), clients, true, []string{"wait", first.SeatID}, &output); err != nil {
+	if err := executeSeatRequest(t.Context(), clients, true, []string{"wait", first.SeatID}, &output, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if posts != 2 || !strings.Contains(output.String(), `"state": "live"`) || strings.Contains(output.String(), strings.Repeat("a", 64)) {

@@ -150,11 +150,15 @@ jobs:
           python3 -m unittest discover -s examples/computer -p 'test_*.py'
           GOFLAGS=-p=1 GOMAXPROCS=2 go test -count=1 ./runner/ocihelper \
             -run '^TestAdmissionReceiptUsesInjectedClockAndScaledTmpfsCeiling$'
+          GOFLAGS=-p=1 GOMAXPROCS=2 go build -o "$RUNNER_TEMP/seat-wefty" ./cmd/wefty
+          GOFLAGS=-p=1 GOMAXPROCS=2 go build -o "$RUNNER_TEMP/seat-wefty-node" ./cmd/wefty-agent
           GOFLAGS=-p=1 GOMAXPROCS=2 go test -c -tags computer_seat_lane \
             -o "$RUNNER_TEMP/seat-conformance.test" ./internal/computerconformance
           (
             cd internal/computerconformance
             sudo env PATH="/usr/local/bin:/usr/local/sbin:$PATH" \
+              WEFTY_SEAT_CLI_BINARY="$RUNNER_TEMP/seat-wefty" \
+              WEFTY_SEAT_NODE_BINARY="$RUNNER_TEMP/seat-wefty-node" \
               WEFTY_SEAT_IMAGE="$WEFTY_SEAT_IMAGE" \
               WEFTY_SEAT_NEGATIVE_IMAGE=docker.io/library/wefty-seat-negative:ci \
               WEFTY_SEAT_CONTAINERD=/run/wefty-seat-containerd.sock \

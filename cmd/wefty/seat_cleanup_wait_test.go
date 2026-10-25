@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -42,7 +43,7 @@ func TestSeatWaitCleanupHasBoundedTypedOutcome(t *testing.T) {
 				defer server.Close()
 				clients := &apiClients{l1: statusClient(t, "L1", "test", server), seatWaitNow: clock.Now, wait: func(ctx context.Context, _ time.Duration) error { return ctx.Err() }}
 				var out bytes.Buffer
-				err := executeSeatRequest(ctx, clients, true, []string{"wait", id}, &out)
+				err := executeSeatRequest(ctx, clients, true, []string{"wait", id}, &out, io.Discard)
 				var apiErr *apiResponseError
 				want := seatErrorStartFailed
 				if state == l1.SeatEnded {

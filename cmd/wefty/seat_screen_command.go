@@ -38,6 +38,7 @@ Keys: Return (Enter), Tab, Escape (Esc), BackSpace, Delete, Insert, Home,
 End, PageUp, PageDown, Left, Right, Up, Down, space, plus, F1-F12, or one
 Unicode character. Join ctrl/control, shift, alt, super, meta with +:
 ctrl+l, Return, shift+Tab. Text is UTF-8, without a clipboard or shell.
+TEXT is literal even when it starts with -. Put flags before SEAT_ID and TEXT, or use --.
 Screenshots use the view path, including while a person drives.
 Input then returns person_driving (exit 5): a person is driving.
 Default PNG files go to the system temp folder. --json includes elapsed_ms.
@@ -83,20 +84,8 @@ func normalizeSeatScreenArgs(args []string) []string {
 		if arg != "seat" || i+1 >= len(result) || !isSeatScreenCommand(result[i+1]) {
 			return result
 		}
-		for j := i + 2 + seatScreenPositionals(result[i+1]); j < len(result); j++ {
-			if result[j] == "--" {
-				break
-			}
-			if result[j] == "--screenshot" {
-				result[j] = "--screenshot="
-				if j+1 < len(result) && !strings.HasPrefix(result[j+1], "-") {
-					result[j] += result[j+1]
-					result = append(result[:j+1], result[j+2:]...)
-				}
-			} else if flagArgumentTakesValue(result[j], nil, values) {
-				j++
-			}
-		}
+		positionals, flags := seatScreenParts(result[i+1], result[i+2:])
+		result = append(result[:i+2], append(positionals, flags...)...)
 		return result
 	}
 	return result
@@ -115,22 +104,57 @@ func seatScreenPositionals(command string) int {
 	return 1
 }
 
+// Required arguments become literal once the Seat ID begins. Options can
+// precede them, or follow all required arguments. -- starts literal arguments.
+func seatScreenParts(command string, args []string) (positionals, flags []string) {
+	required := seatScreenPositionals(command)
+	values := map[string]bool{}
+	for _, name := range strings.Fields(jsonValueFlags) {
+		values[name] = true
+	}
+	literal := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if literal || len(positionals) > 0 && len(positionals) < required {
+			positionals = append(positionals, arg)
+			continue
+		}
+		if arg == "--" {
+			literal = true
+			continue
+		}
+		if !strings.HasPrefix(arg, "-") {
+			positionals = append(positionals, arg)
+			continue
+		}
+		if arg == "--screenshot" {
+			value := ""
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && (len(positionals) > 0 || !seatCLIIdentifier.MatchString(args[i+1])) {
+				i++
+				value = args[i]
+			}
+			flags = append(flags, "--screenshot="+value)
+		} else {
+			flags = append(flags, arg)
+			if flagArgumentTakesValue(arg, nil, values) && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		}
+	}
+	return
+}
+
 func seatScreenWantsHelp(args []string) (bool, bool) {
 	if len(args) < 2 || args[0] != "seat" || !isSeatScreenCommand(args[1]) {
 		return false, false
 	}
-	if len(args) > 2 && isHelpFlag(args[2]) {
-		return true, true
-	}
-	start := 2 + seatScreenPositionals(args[1])
-	for i := start; i < len(args); i++ {
-		if args[i] == "--" {
-			break
-		}
-		if isHelpFlag(args[i]) {
+	_, flags := seatScreenParts(args[1], args[2:])
+	for i := 0; i < len(flags); i++ {
+		if isHelpFlag(flags[i]) {
 			return true, true
 		}
-		if args[i] == "-o" || args[i] == "--button" || args[i] == "--dy" || args[i] == "--dx" {
+		if flags[i] == "-o" || flags[i] == "--o" || flags[i] == "--button" || flags[i] == "-button" || flags[i] == "--dy" || flags[i] == "-dy" || flags[i] == "--dx" || flags[i] == "-dx" {
 			i++
 		}
 	}
@@ -140,25 +164,16 @@ func seatScreenWantsHelp(args []string) (bool, bool) {
 func parseSeatScreenArgs(args []string) (seatScreenArgs, error) {
 	var a seatScreenArgs
 	fail := func() (seatScreenArgs, error) { return a, usageError(seatScreenUsage) }
-	if len(args) < 2 || !isSeatScreenCommand(args[0]) || !seatCLIIdentifier.MatchString(args[1]) {
+	if len(args) < 2 || !isSeatScreenCommand(args[0]) {
 		return fail()
 	}
-	a.command, a.id = args[0], args[1]
-	// Flags follow the required positionals, so negative coordinates and text
-	// starting with '-' stay data and are validated by their own rules.
-	n := 0
-	switch a.command {
-	case "click", "move", "scroll":
-		n = 2
-	case "drag":
-		n = 4
-	case "type", "key":
-		n = 1
-	}
-	if len(args) < 2+n {
+	a.command = args[0]
+	positionals, flagArgs := seatScreenParts(a.command, args[1:])
+	if len(positionals) != seatScreenPositionals(a.command) || !seatCLIIdentifier.MatchString(positionals[0]) {
 		return fail()
 	}
-	pos := args[2 : 2+n]
+	a.id = positionals[0]
+	pos := positionals[1:]
 	flags := flag.NewFlagSet("seat "+a.command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	if a.command == "screenshot" {
@@ -173,8 +188,7 @@ func parseSeatScreenArgs(args []string) (seatScreenArgs, error) {
 		flags.IntVar(&a.dy, "dy", 0, "vertical wheel ticks (required)")
 		flags.IntVar(&a.dx, "dx", 0, "horizontal wheel ticks")
 	}
-	normalized := normalizeSeatScreenArgs(append([]string{"seat"}, args...))[3+n:]
-	if err := flags.Parse(normalized); err != nil || flags.NArg() != 0 {
+	if err := flags.Parse(flagArgs); err != nil || flags.NArg() != 0 {
 		return fail()
 	}
 	if a.command == "click" && a.button != "left" && a.button != "right" && a.button != "double" {
@@ -194,7 +208,7 @@ func parseSeatScreenArgs(args []string) (seatScreenArgs, error) {
 	if a.command == "type" || a.command == "key" {
 		a.text = pos[0]
 		var err error
-		if len(a.text) > 1<<20 || !utf8.ValidString(a.text) {
+		if len(a.text) == 0 || len(a.text) > 1<<20 || !utf8.ValidString(a.text) {
 			return fail()
 		}
 		if a.command == "type" {
@@ -232,6 +246,30 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	if err != nil {
 		return err
 	}
+	// Reserve the destination before input: a local refusal must never repeat an action.
+	var capture *os.File
+	path := ""
+	captured := false
+	if a.command == "screenshot" || a.screenshot {
+		if a.output == "" {
+			capture, err = os.CreateTemp("", "wefty-"+a.id+"-*.png")
+		} else {
+			path, err = filepath.Abs(a.output)
+			if err == nil {
+				capture, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		path = capture.Name()
+		defer func() {
+			if !captured {
+				_ = capture.Close()
+				_ = os.Remove(path)
+			}
+		}()
+	}
 	secret, err := loadSeatCredential(a.id)
 	if err != nil {
 		return err
@@ -249,8 +287,19 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		return err
 	}
 	unread := target.Unread
+	actionDone, takingScreenshot, replied := false, false, false
 	defer func() {
 		if resultErr != nil {
+			if actionDone && takingScreenshot {
+				var api *apiResponseError
+				if errors.As(resultErr, &api) {
+					copy := *api
+					copy.APIError.Message = a.command + " done; screenshot failed: " + api.APIError.Message
+					resultErr = &copy
+				} else {
+					resultErr = &apiResponseError{APIError: contract.APIError{Code: contract.ErrorInternal, Message: a.command + " done; screenshot failed: " + resultErr.Error()}}
+				}
+			}
 			var api *apiResponseError
 			if errors.As(resultErr, &api) {
 				copy := *api
@@ -259,9 +308,15 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 					copy.APIError.Details[k] = v
 				}
 				copy.APIError.Details["elapsed_ms"] = elapsed()
+				if actionDone && takingScreenshot {
+					copy.APIError.Details["action_done"] = true
+					copy.APIError.Retryable = false
+				}
 				resultErr = &copy
 			}
-			resultErr = withSeatReply(stdout, jsonOutput, a.id, unread, func(io.Writer) error { return resultErr })
+			if !replied {
+				resultErr = withSeatReply(stdout, jsonOutput, a.id, unread, func(io.Writer) error { return resultErr })
+			}
 		}
 	}()
 	endpoint, err := url.Parse(target.Endpoint)
@@ -270,7 +325,6 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	note := ""
 	open := func(mode string) (*rfbclient.Client, func(), error) {
 		u := *endpoint
 		u.Path = "/v1/seats/" + a.id + "/screen/" + mode
@@ -309,12 +363,9 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				close()
 				return nil, nil, fmt.Errorf("invalid Seat release note")
 			}
-			if string(decoded) != note {
-				note = string(decoded)
-				if _, e = fmt.Fprintln(stderr, note); e != nil {
-					close()
-					return nil, nil, e
-				}
+			if _, e = fmt.Fprintln(stderr, string(decoded)); e != nil {
+				close()
+				return nil, nil, e
 			}
 		}
 		client, e := rfbclient.Open(websocket.NetConn(ctx, c, websocket.MessageBinary))
@@ -330,18 +381,18 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 			return e
 		}
 		e = performSeatScreenInput(client, a)
-		// A full update is an RFB round trip after the input. This keeps a short
-		// call from closing before the server processes its final key/button release.
+		// A one-pixel round trip orders the final input release before close.
 		if e == nil {
-			_, e = client.Frame()
+			e = client.Sync()
 		}
 		close()
 		if e != nil {
 			return e
 		}
+		actionDone = true
 	}
-	path := ""
-	if a.command == "screenshot" || a.screenshot {
+	if capture != nil {
+		takingScreenshot = true
 		client, close, e := open("view")
 		if e != nil {
 			return e
@@ -351,26 +402,15 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		if e != nil {
 			return e
 		}
-		var f *os.File
-		if a.output == "" {
-			f, e = os.CreateTemp("", "wefty-"+a.id+"-*.png")
-		} else {
-			path, e = filepath.Abs(a.output)
-			if e == nil {
-				f, e = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-			}
-		}
+		e = png.Encode(capture, frame)
+		e = errors.Join(e, capture.Close())
 		if e != nil {
 			return e
 		}
-		path = f.Name()
-		e = png.Encode(f, frame)
-		e = errors.Join(e, f.Close())
-		if e != nil {
-			_ = os.Remove(path)
-			return e
-		}
+		captured = true
+		takingScreenshot = false
 	}
+	replied = true
 	return withSeatReply(stdout, jsonOutput, a.id, unread, func(w io.Writer) error {
 		if jsonOutput {
 			return writeJSON(w, map[string]any{"seat_id": a.id, "action": a.command, "path": path, "elapsed_ms": elapsed(), "unread_events": unread})

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,28 +31,33 @@ func TestSeatScreenCommandsRealBinary(t *testing.T) {
 	id := "seat_" + strings.Repeat("a", 32)
 	other := "seat_" + strings.Repeat("b", 32)
 	t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
-	for _, seat := range []string{id, other} {
-		if _, err := storeSeatCredential(seat, "secret-a"); err != nil {
+	credentials := map[string]string{id: "secret-a", other: "secret-b"}
+	for seat, secret := range credentials {
+		if _, err := storeSeatCredential(seat, secret); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var mu sync.Mutex
 	var events []byte
 	person := false
+	var refusedCredential atomic.Int32
 	address := ""
 	address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(l1.SeatCredentialHeader) != "secret-a" {
-			t.Error("missing Seat credential")
+		parts := strings.Split(r.URL.Path, "/")
+		if len(parts) < 5 || parts[1] != "v1" || parts[2] != "seats" || credentials[parts[3]] == "" {
+			t.Error("unexpected Seat path")
+			w.WriteHeader(404)
+			return
+		}
+		expected := credentials[parts[3]]
+		if r.Header.Get(l1.SeatCredentialHeader) != expected {
+			refusedCredential.Add(1)
 			w.WriteHeader(403)
+			json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorForbidden, Message: "invalid Seat credential"}})
 			return
 		}
 		if strings.HasSuffix(r.URL.Path, "/screen-target") {
 			json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + address, "unread_events": 2})
-			return
-		}
-		if strings.Contains(r.URL.Path, other) {
-			w.WriteHeader(403)
-			json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorForbidden, Message: "invalid Seat credential"}})
 			return
 		}
 
@@ -89,7 +95,11 @@ func TestSeatScreenCommandsRealBinary(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("exit=%d %s", code, out)
 			}
-			if strings.Contains(out, "Please continue.") || !strings.Contains(diagnostic, "Please continue.") || !strings.Contains(out, "3 new Seat events") || !strings.Contains(out, "elapsed_ms") {
+			wantNotes := 1
+			if args[0] == "click" {
+				wantNotes = 2
+			}
+			if strings.Contains(out, "Please continue.") || strings.Count(diagnostic, "Please continue.") != wantNotes || !strings.Contains(out, "3 new Seat events") || !strings.Contains(out, "elapsed_ms") {
 				t.Fatalf("missing reply metadata: %s", out)
 			}
 			// The result is one stdout JSON document; the release note is on stderr.
@@ -135,9 +145,23 @@ func TestSeatScreenCommandsRealBinary(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("screenshot while person drives: %d %s", code, out)
 	}
+	// Seat B works with its own distinct credential. Every accepted request above
+	// checks that the path and header name the same Seat.
+	otherPath := filepath.Join(t.TempDir(), "other.png")
+	code, out = runWefty(t, binaryPath, 30*time.Second, "--l1", address, "seat", "screenshot", other, "-o", otherPath)
+	if code != 0 {
+		t.Fatalf("Seat B credential failed: %d %s", code, out)
+	}
+	// Deliberately put A's secret under B's ID; the door must refuse the crossover.
+	if _, err := storeSeatCredential(other, credentials[id]); err != nil {
+		t.Fatal(err)
+	}
 	code, out = runWefty(t, binaryPath, 30*time.Second, "--l1", address, "seat", "click", other, "1", "2")
 	if code != 3 || !strings.Contains(out, "invalid Seat credential") {
 		t.Fatalf("cross-Seat refusal: %d %s", code, out)
+	}
+	if refusedCredential.Load() != 1 {
+		t.Fatalf("cross-Seat requests refused=%d", refusedCredential.Load())
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -157,6 +181,9 @@ func TestSeatScreenCommandsRealBinary(t *testing.T) {
 }
 
 func screenFakeRFB(conn io.ReadWriter, event func([]byte)) error {
+	return screenFakeRFBRequests(conn, event, func(int, int) {})
+}
+func screenFakeRFBRequests(conn io.ReadWriter, event func([]byte), request func(int, int)) error {
 	conn.Write([]byte("RFB 003.008\n"))
 	b := make([]byte, 12)
 	if _, err := io.ReadFull(conn, b); err != nil {
@@ -209,14 +236,16 @@ func screenFakeRFB(conn io.ReadWriter, event func([]byte)) error {
 			event(append([]byte{kind}, payload...))
 		}
 		if kind == 3 {
+			width, height := int(binary.BigEndian.Uint16(payload[5:])), int(binary.BigEndian.Uint16(payload[7:]))
+			request(width, height)
 			header := make([]byte, 16)
 			header[3] = 1
-			binary.BigEndian.PutUint16(header[8:], 1280)
-			binary.BigEndian.PutUint16(header[10:], 800)
+			binary.BigEndian.PutUint16(header[8:], uint16(width))
+			binary.BigEndian.PutUint16(header[10:], uint16(height))
 			if _, err := conn.Write(header); err != nil {
 				return err
 			}
-			pixels := make([]byte, 1280*800*4)
+			pixels := make([]byte, width*height*4)
 			for i := 0; i < len(pixels); i += 4 {
 				pixels[i+2] = 255
 			}

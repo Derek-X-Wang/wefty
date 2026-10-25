@@ -79,7 +79,7 @@ func validateSeatArgs(args []string) error {
 	}
 	return usageError(seatUsage)
 }
-func executeSeatRequest(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
+func executeSeatRequest(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout, stderr io.Writer) error {
 	if err := validateSeatArgs(args); err != nil {
 		return err
 	}
@@ -87,7 +87,7 @@ func executeSeatRequest(ctx context.Context, clients *apiClients, jsonOutput boo
 		return executeSeatView(ctx, clients, jsonOutput, args[1:], stdout)
 	}
 	if isSeatScreenCommand(args[0]) {
-		return executeSeatScreen(ctx, clients, jsonOutput, args, stdout, os.Stderr)
+		return executeSeatScreen(ctx, clients, jsonOutput, args, stdout, stderr)
 	}
 	if args[0] == "release" {
 		return executeSeatRelease(ctx, clients, jsonOutput, args[1], stdout)

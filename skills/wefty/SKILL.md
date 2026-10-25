@@ -750,10 +750,9 @@ its own connection; there is no screen daemon.
 
 ```sh
 wefty seat screenshot SEAT_ID                  # prints a new PNG path
-wefty seat screenshot SEAT_ID -o /tmp/seat.png
 wefty seat click SEAT_ID 640 400 --button left --screenshot
 wefty seat move SEAT_ID 100 200
-wefty seat drag SEAT_ID 100 200 500 200 --screenshot /tmp/drag.png
+wefty seat drag SEAT_ID 100 200 500 200 --screenshot
 wefty seat scroll SEAT_ID 640 400 --dy 3 --dx 0
 wefty seat type SEAT_ID 'Hello, world'
 wefty seat key SEAT_ID ctrl+l --screenshot
@@ -775,17 +774,24 @@ Key names: `Return` (`Enter`), `Tab`, `Escape` (`Esc`), `BackSpace`, `Delete`,
 `space`, `plus`, `F1`–`F12`, or one Unicode character. Names ignore case.
 Combine one key with `ctrl` (`control`), `shift`, `alt`, `super`, or `meta`,
 joined by `+`, such as `ctrl+l` or `shift+Tab`. `type` accepts UTF-8 text and
-sends key events, including Return for newlines and Tab for tabs.
+sends key events, including Return for newlines and Tab for tabs. TEXT must be
+nonempty and is literal even when it starts with `-`. Put flags before SEAT_ID
+and TEXT, or use `--`, for example `wefty seat type --screenshot -- SEAT_ID --help`.
 
 On `person_driving` (exit 5, “a person is driving”), stop screen input until
 the person releases control. Screenshots still work. While a person drives,
 **do not drive the screen through commands such as `xdotool` or Playwright
-either**. Read any release note printed on stderr before continuing. Every
-reply carries the shared unread Seat-event hint; read it with `wefty logs`.
+either**. The latest release note repeats on stderr on every successful screen
+reply until the next release. Read it and act on it once; repeated delivery
+does not mean a new instruction. Every reply carries the shared unread
+Seat-event hint; read it with `wefty logs`.
 
 Use `--json` for `elapsed_ms`, `path`, `unread_events`, and, when nonzero,
 `unread_events_line`. Refusals carry `details.elapsed_ms`. Input calls are
 never retried automatically: an interrupted call may already have acted.
+Wefty checks the PNG destination before sending input. If input completes but
+the screenshot fails, the error says `<action> done; screenshot failed: …` and
+JSON details include `action_done: true`. Do not repeat that completed action.
 Wefty records no clicks, keys, or screen contents. PNG files are your local
 artifacts; keep or remove them as needed.
 

@@ -131,15 +131,21 @@ func (c *Client) Key(keysym uint32, down bool) error {
 
 // Frame requests a full update and assembles all its Raw rectangles. It never
 // returns an incomplete framebuffer, including when a server splits updates.
-func (c *Client) Frame() (*image.RGBA, error) {
+func (c *Client) Frame() (*image.RGBA, error) { return c.frame(c.Width, c.Height) }
+
+// Sync orders prior input before close using the smallest non-incremental
+// framebuffer request. The separate view call still captures the full screen.
+func (c *Client) Sync() error { _, err := c.frame(1, 1); return err }
+
+func (c *Client) frame(width, height int) (*image.RGBA, error) {
 	request := []byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0}
-	binary.BigEndian.PutUint16(request[6:], uint16(c.Width))
-	binary.BigEndian.PutUint16(request[8:], uint16(c.Height))
+	binary.BigEndian.PutUint16(request[6:], uint16(width))
+	binary.BigEndian.PutUint16(request[8:], uint16(height))
 	if err := c.write(request); err != nil {
 		return nil, err
 	}
-	frame := image.NewRGBA(image.Rect(0, 0, c.Width, c.Height))
-	seen := make([]bool, c.Width*c.Height)
+	frame := image.NewRGBA(image.Rect(0, 0, width, height))
+	seen := make([]bool, width*height)
 	remaining := len(seen)
 	for remaining > 0 {
 		var kind [1]byte
@@ -179,7 +185,7 @@ func (c *Client) Frame() (*image.RGBA, error) {
 			if binary.BigEndian.Uint32(rect[8:]) != 0 {
 				return nil, fmt.Errorf("RFB server ignored Raw encoding negotiation")
 			}
-			if w == 0 || h == 0 || x+w > c.Width || y+h > c.Height {
+			if w == 0 || h == 0 || x+w > width || y+h > height {
 				return nil, fmt.Errorf("RFB rectangle outside screen")
 			}
 			row := make([]byte, w*4)
@@ -190,7 +196,7 @@ func (c *Client) Frame() (*image.RGBA, error) {
 				for xx := 0; xx < w; xx++ {
 					offset := xx * 4
 					frame.SetRGBA(x+xx, yy, color.RGBA{R: row[offset+2], G: row[offset+1], B: row[offset], A: 255})
-					i := yy*c.Width + x + xx
+					i := yy*width + x + xx
 					if !seen[i] {
 						seen[i] = true
 						remaining--
