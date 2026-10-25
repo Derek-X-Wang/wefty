@@ -3,10 +3,15 @@ package ocihelper
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
+	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func (e *seatExecProtocolEngine) CopyComputerSeat(ctx context.Context, r CopyComputerSeatRequest, input io.Reader, emit func([]byte) error) (int64, error) {
@@ -61,5 +66,82 @@ func TestSeatCopyStdinWrapperRejectsChangedTemplate(t *testing.T) {
 		if _, err = seatCommandWithInput(broken); err == nil {
 			t.Fatal("unguarded wrapper replacement")
 		}
+	}
+}
+
+// gatedCopyConn holds every read after the first reply frame until a frame
+// write fails or the connection closes. That forces the losing order from
+// #1279: the helper refuses and closes, the client's upload write fails, and
+// only then does the read loop look for the typed refusal.
+type gatedCopyConn struct {
+	net.Conn
+	read        []byte
+	armed       bool
+	release     chan struct{}
+	once        sync.Once
+	writeFailed atomic.Bool
+}
+
+func (c *gatedCopyConn) open() { c.once.Do(func() { close(c.release) }) }
+func (c *gatedCopyConn) Read(p []byte) (int, error) {
+	if c.armed {
+		select {
+		case <-c.release:
+		case <-time.After(10 * time.Second):
+			return 0, errors.New("test gate: no write failure or close")
+		}
+		return c.Conn.Read(p)
+	}
+	n, err := c.Conn.Read(p)
+	c.read = append(c.read, p[:n]...)
+	if len(c.read) >= 4 && len(c.read) >= 4+int(binary.BigEndian.Uint32(c.read[:4])) {
+		c.armed = true
+	}
+	return n, err
+}
+func (c *gatedCopyConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if err != nil {
+		c.writeFailed.Store(true)
+		c.open()
+	}
+	return n, err
+}
+func (c *gatedCopyConn) Close() error { c.open(); return c.Conn.Close() }
+func (c *gatedCopyConn) CloseWrite() error {
+	return c.Conn.(interface{ CloseWrite() error }).CloseWrite()
+}
+
+type endlessCopyInput struct{}
+
+func (endlessCopyInput) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+func TestSeatCopyRefusalSurvivesFailedUploadWrite(t *testing.T) {
+	session, e, authority := seatExecSession(t)
+	e.seats.entries[1].ready = true
+	e.seats.entries[1].readyGeneration = 1
+	var gate *gatedCopyConn
+	dial := session.client.Dial
+	session.client.Dial = func(ctx context.Context) (net.Conn, error) {
+		conn, err := dial(ctx)
+		if err != nil {
+			return nil, err
+		}
+		gate = &gatedCopyConn{Conn: conn, release: make(chan struct{})}
+		return gate, nil
+	}
+	request := CopyComputerSeatRequest{Authority: authority, Generation: 2, Place: 1, Direction: "in", Path: "report"}
+	_, err := session.CopyComputerSeat(t.Context(), request, endlessCopyInput{}, nil)
+	if gate == nil || !gate.writeFailed.Load() {
+		t.Fatalf("losing order not reached: err=%v", err)
+	}
+	var rpc *RPCError
+	if !errors.As(err, &rpc) || rpc.Code != CodeSeatOperationRefused || rpc.Detail != "generation_mismatch" {
+		t.Fatalf("stale generation after failed upload write: %v", err)
 	}
 }

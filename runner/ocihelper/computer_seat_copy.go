@@ -63,6 +63,7 @@ func (s *Session) CopyComputerSeat(ctx context.Context, r CopyComputerSeatReques
 	done := make(chan error, 1)
 	go func() {
 		var sendErr error
+		inputFailed := false
 		if input != nil && r.Direction == "in" {
 			buf := make([]byte, SeatCopyChunkBytes)
 			for {
@@ -75,7 +76,7 @@ func (s *Session) CopyComputerSeat(ctx context.Context, r CopyComputerSeatReques
 				}
 				if e != nil {
 					if e != io.EOF {
-						sendErr = e
+						sendErr, inputFailed = e, true
 					}
 					break
 				}
@@ -84,8 +85,16 @@ func (s *Session) CopyComputerSeat(ctx context.Context, r CopyComputerSeatReques
 		if sendErr == nil {
 			sendErr = wire.write(seatCopyInput{End: true})
 		}
-		if sendErr != nil {
+		switch {
+		case inputFailed:
+			// Local input broke: abort the copy and the helper's process.
 			conn.Close()
+		case sendErr != nil:
+			// A failed frame write usually means the helper already answered
+			// and closed, for example with a stale-generation refusal. A full
+			// close here would discard that typed reply before the read loop
+			// sees it (#1279). Half-close so the helper still sees EOF.
+			_ = closeWrite(conn)
 		}
 		done <- sendErr
 	}()
