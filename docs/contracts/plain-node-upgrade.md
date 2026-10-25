@@ -927,6 +927,15 @@ observations omit fences and promotion requests. `attempts.last_renewal_ns` is
 nullable and advances only on an accepted Lease renewal. Migration leaves older
 rows null. OpenAPI documents the additive Node observation fields.
 
+Each resident also includes optional `job_outcome` from the authoritative Job
+row in that same snapshot. `canceled` is owner cancellation intent, independent
+of process exit evidence. A failed or succeeded Attempt with that outcome is
+settled: text shows `canceled`, JSON retains the Attempt state and
+`job_outcome: canceled`, and neither readiness nor doctor's exit is degraded.
+Cancellation intent alone does not settle live Attempts or hide lost,
+interrupted, or expired-Lease problems. Absent outcome preserves the existing
+failure diagnosis; exit code 143 and message text never establish cancellation.
+
 The healthy finishing count also verifies each distinct mapped Run through the
 existing public L3 Run GET. Terminal ledger Runs are excluded even while their
 Attempts still finish teardown; those Attempts and their shared capacity remain

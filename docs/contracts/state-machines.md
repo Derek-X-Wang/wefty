@@ -2759,7 +2759,11 @@ read even after loss or interruption. Lease deadlines and accepted renewal times
 belong to the resident, never to the primary heartbeat. Terminal Attempt problems
 remain visible in retained closed session history. Optional public Node
 `generations` fields are read in the same `ReadOnly:true` snapshot as Node
-capacity. See [rolling diagnosis](plain-node-upgrade.md#read-only-rolling-status-and-doctor-1181).
+capacity. Optional resident `job_outcome` exposes the authoritative Job outcome
+in the same snapshot. Failed or succeeded Attempts with `canceled` outcome are
+settled cancellation for status and doctor; live, lost, interrupted, and
+expired-Lease Attempts retain their existing diagnosis. Process results never
+infer cancellation. See [rolling diagnosis](plain-node-upgrade.md#read-only-rolling-status-and-doctor-1181).
 
 An enrolled Node without generation observations is unverified. Diagnostic
 catalog and retirement-ack reads never wait for the catalog lock; contention and

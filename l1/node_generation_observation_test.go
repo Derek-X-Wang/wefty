@@ -257,3 +257,66 @@ func TestRound2ActiveAttemptConversionPreservesOtherNodes(t *testing.T) {
 		t.Fatal("private projection accepted invalid lease expiry")
 	}
 }
+
+func TestNodeGenerationObservationJobOutcome(t *testing.T) {
+	for _, canceled := range []bool{false, true} {
+		name := "failed-by-itself"
+		if canceled {
+			name = "owner-canceled"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newGenerationFixture(t)
+			a := f.claim(t, name)
+			f.promote(t, "g2")
+			if canceled {
+				if _, err := f.h.store.CancelJob(t.Context(), a.Job.JobID, JobCancelCaller{Submitter: "operator"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exit := 143 // Deliberately identical: process evidence is not cancellation intent.
+			if _, err := f.h.store.CompleteAttempt(t.Context(), "agent", a.Job.JobID, a.Lease.AttemptID, CompletionRequest{FencingToken: a.Lease.FencingToken, IdempotencyKey: name, Result: ProcessResult{ExitCode: &exit}}); err != nil {
+				t.Fatal(err)
+			}
+			nodes, err := f.h.store.ListNodes(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, err := f.h.store.GetNode(t.Context(), "node")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, n := range []Node{nodes[0], node} {
+				found := false
+				for _, g := range n.Generations {
+					for _, observed := range g.Attempts {
+						if observed.AttemptID != a.Lease.AttemptID {
+							continue
+						}
+						found = true
+						if observed.State == nil || *observed.State != contract.AttemptFailed {
+							t.Fatalf("Attempt state lost: %+v", observed)
+						}
+						payload, err := json.Marshal(observed)
+						if err != nil {
+							t.Fatal(err)
+						}
+						var fields map[string]any
+						if err := json.Unmarshal(payload, &fields); err != nil {
+							t.Fatal(err)
+						}
+						if canceled {
+							if fields["job_outcome"] != "canceled" {
+								t.Errorf("missing cancellation intent: %s", payload)
+							}
+						} else if _, present := fields["job_outcome"]; present {
+							t.Errorf("invented outcome from exit 143: %s", payload)
+						}
+					}
+				}
+				if !found {
+					t.Fatal("retiring resident disappeared")
+				}
+			}
+		})
+	}
+}
