@@ -658,6 +658,14 @@ would reject the AF_UNIX peer's hostname; the private Unix socket retains
 its existing filesystem access controls. Loopback binding is an extra guard,
 never permission to open a TCP listener.
 
+Both roles additionally use `-noremote -novncconnect -nocmds -safer` (all
+supported by the pinned 0.9.16-9). X clients on the Seat's display must not
+reconfigure either backend through `X11VNC_REMOTE` commands or queries, request
+reverse connections through `VNC_CONNECT`, or make the server run external
+commands. This prevents display-property commands from reopening IP listeners
+or changing the view role after admission. Keep the three explicit disable
+flags even with `-safer`; normal RFB input and view access retain their roles.
+
 Before returning each backend connection, and again at its first byte, the
 Linux relay matches the child PID's `/proc/<pid>/fd` socket inodes against
 `/proc/<pid>/net/tcp` and `tcp6`. It refuses the relay, logs the reason through
@@ -669,6 +677,10 @@ initializing the library's IP listeners. No bytes flow in either direction
 until that check succeeds. These checks guard connection admission; they are
 not continuous process monitoring. The strict lane checks below also catch
 listeners introduced later.
+The namespace-wide TCP tables are streamed without a total byte/row limit;
+browser connections and TIME_WAIT entries must not cause a false refusal.
+Each header and row is bounded to 4096 bytes, and oversized or malformed lines
+fail closed. Listener ownership still matches only the child's socket inodes.
 
 After first use, a supervisor replaces an exited x11vnc without waiting for a
 new client. Repeated exits and spawn `OSError`s back off from 0.1 seconds,

@@ -149,6 +149,41 @@ class TCPListenerGuardTest(unittest.TestCase):
                 (proc/'net/tcp').unlink()
                 with self.assertRaises(OSError): BACKEND.check_no_tcp_listeners(process, proc_root=root)
 
+    def tcp_fixture(self, root):
+        proc = Path(root) / '4321'
+        (proc/'fd').mkdir(parents=True)
+        (proc/'net').mkdir()
+        (proc/'fd/3').symlink_to('socket:[42]')
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = None
+        header = 'sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n'
+        return process, proc/'net/tcp', header
+
+    def test_guard_accepts_large_tables_and_finds_a_listener_at_the_end(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as root:
+            process, table, header = self.tcp_fixture(root)
+            # Browser connections and TIME_WAIT sockets share this namespace.
+            unrelated = '0: 0100007F:170C 0100007F:170D 06 00000000:00000000 00:00000000 00000000 2001 0 0\n'
+            table.write_text(header + unrelated * 20000)
+            self.assertGreater(table.stat().st_size, 1048576)
+            BACKEND.check_no_tcp_listeners(process, proc_root=root)
+            with table.open('a') as stream:
+                stream.write('0: 00000000:170C 00000000:0000 0A 00000000:00000000 00:00000000 00000000 2001 0 42\n')
+            with self.assertRaisesRegex(OSError, 'TCP listener on port 5900'):
+                BACKEND.check_no_tcp_listeners(process, proc_root=root)
+
+    def test_guard_refuses_overlong_headers_and_rows(self):
+        for location in ('header', 'row'):
+            with self.subTest(location=location), tempfile.TemporaryDirectory(dir='/tmp') as root:
+                process, table, header = self.tcp_fixture(root)
+                unrelated = '0: 00000000:170C 00000000:0000 0A 00000000:00000000 00:00000000 00000000 2001 0 99'
+                if location == 'header':
+                    table.write_text(header.rstrip() + ' '*8192 + '\n')
+                else:
+                    table.write_text(header + unrelated + ' '*8192 + '\n')
+                with self.assertRaises(OSError):
+                    BACKEND.check_no_tcp_listeners(process, proc_root=root)
+
 
 class WarmBackendTest(unittest.TestCase):
     def setUp(self):
@@ -180,7 +215,8 @@ class WarmBackendTest(unittest.TestCase):
                 self.assertEqual(command[command.index('-unixsock')+1], backend.path)
                 self.assertEqual(command[command.index('-rfbport')+1], '0')
                 self.assertEqual(command[command.index('-rfbportv6')+1], '0')
-                for flag in ('-nolookup', '-no6', '-noipv6', '-noipv4', '-norc'):
+                for flag in ('-nolookup', '-no6', '-noipv6', '-noipv4', '-norc',
+                             '-noremote', '-novncconnect', '-nocmds', '-safer'):
                     self.assertIn(flag, command)
                 self.assertEqual(command[command.index('-listen')+1], '127.0.0.1')
                 self.assertEqual(command[command.index('-listenv6')+1], '::1')

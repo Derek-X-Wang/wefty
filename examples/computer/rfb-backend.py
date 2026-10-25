@@ -22,6 +22,8 @@ SESSION_STDERR_LIMIT = 4096
 # Lines queued for the container log while it is slow. Each process forwards
 # at most SESSION_STDERR_LIMIT bytes, so the queue's memory is bounded too.
 SINK_QUEUE_LINES = 256
+# /proc TCP tables span the namespace; bound each kernel row, not total rows.
+TCP_TABLE_LINE_LIMIT = 4096
 
 
 class DiagnosticsSink:
@@ -145,7 +147,7 @@ def check_no_tcp_listeners(process, proc_root='/proc'):
                 except FileNotFoundError:
                     continue  # A descriptor closed during enumeration.
                 if target.startswith('socket:['):
-                    sockets.add(target)
+                    sockets.add(os.fsencode(target))
         finally:
             os.close(fd_dir)
         for name in ('tcp', 'tcp6'):
@@ -155,23 +157,25 @@ def check_no_tcp_listeners(process, proc_root='/proc'):
                 if name == 'tcp6':
                     continue
                 raise
-            with os.fdopen(table_fd) as table:
-                payload = table.read(1048577)
-            rows = payload.splitlines()
-            if len(payload) > 1048576 or not rows or 'local_address' not in rows[0]:
-                raise OSError('cannot verify x11vnc: invalid '+name+' table')
-            for row in rows[1:]:
-                fields = row.split()
-                if not fields:
-                    continue
-                if len(fields) < 10:
-                    raise OSError('cannot verify x11vnc: invalid '+name+' row')
-                if fields[3] == '0A' and 'socket:['+fields[9]+']' in sockets:
-                    try:
-                        port = int(fields[1].rsplit(':', 1)[1], 16)
-                    except (ValueError, IndexError):
-                        raise OSError('cannot verify x11vnc: invalid '+name+' address') from None
-                    raise OSError(f'x11vnc owns {name.upper()} listener on port {port}')
+            with os.fdopen(table_fd, 'rb') as table:
+                header = table.readline(TCP_TABLE_LINE_LIMIT + 1)
+                if len(header) > TCP_TABLE_LINE_LIMIT or b'local_address' not in header:
+                    raise OSError('cannot verify x11vnc: invalid '+name+' table')
+                for row in iter(lambda: table.readline(TCP_TABLE_LINE_LIMIT + 1), b''):
+                    if len(row) > TCP_TABLE_LINE_LIMIT:
+                        raise OSError('cannot verify x11vnc: oversized '+name+' row')
+                    fields = row.split()
+                    if not fields:
+                        continue
+                    if len(fields) < 10:
+                        raise OSError('cannot verify x11vnc: invalid '+name+' row')
+                    if fields[3] == b'0A' and b'socket:['+fields[9]+b']' in sockets:
+                        try:
+                            port = int(fields[1].rsplit(b':', 1)[1], 16)
+                        except (ValueError, IndexError):
+                            raise OSError('cannot verify x11vnc: invalid '+name+' address') from None
+                        raise OSError(f'x11vnc owns {name.upper()} listener on port {port}')
+
     finally:
         os.close(proc)
     if process.poll() is not None:
@@ -214,6 +218,9 @@ class RoleBackend:
             # Bind-only guards preserve Unix peers; -localhost also installs
             # an IP allow-list that rejects the AF_UNIX peer's hostname.
             '-listen', '127.0.0.1', '-listenv6', '::1',
+            # X clients must not reopen IP listeners or change the view role
+            # through X11VNC_REMOTE or VNC_CONNECT display properties.
+            '-noremote', '-novncconnect', '-nocmds', '-safer',
             '-norc', '-forever', '-shared',
             '-display', os.environ.get('DISPLAY') or ':' + os.environ["WEFTY_COMPUTER_VIEW_PORT"],
             '-nopw', '-quiet',
