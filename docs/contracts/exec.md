@@ -599,6 +599,57 @@ Whole-Storage Custody exports retain their existing contract.
 
 ## Seat Runs
 
+### CLI
+
+`wefty exec --seat SEAT_ID [--max-runtime D] [--keep-running | --detach]
+[--json] -- <command...>` runs in the Seat's folder, as its Linux user, with
+its environment and screen. The typed ID is `seat_<32 lowercase hex>`.
+The CLI loads the credential through the same private state-folder and macOS
+temp-folder lookup as `wefty cp`, and sends it only in the credential header.
+No caller environment, checkout capture, file copy or bundle upload occurs,
+inside or outside a Git checkout. Plain exec still requires a Git checkout.
+Working-copy synchronization belongs to #1152.
+
+An omitted `--max-runtime` leaves the deadline to L1's configured default
+(shipped as one hour). A positive duration rounds up to whole seconds.
+An explicit non-positive duration is `invalid_request`, exit 2, before any
+network call: a Seat command always has a limit; use a positive
+`--max-runtime` for a longer limit. `--node`, `--tag` and `--restartable` are
+also usage errors with `--seat`: the Seat decides placement, and its state
+cannot be replayed.
+
+Streaming, detach, keep-running, JSON and exit codes use the ordinary exec
+policy. `--detach --json` writes exactly one `{"run_id":"..."}` line.
+`wefty logs RUN_ID`, `wefty cancel RUN_ID`, `wefty results RUN_ID` and
+`wefty inspect RUN_ID` use the ordinary Run paths. At a deadline, text mode
+prints `stopped: reached its 1h limit. Run it again with a longer --max-runtime.`
+on stderr, using the Run's actual admitted deadline. The Run failure remains
+exit 10 with no command exit code. JSON keeps the `finished` event and adds
+the Run's `seat_id` and admitted `max_runtime_seconds`.
+In a Seat Run's JSON `finished` event, `base_commit` is empty and `dirty` is
+false because nothing was captured; they are not facts about the checkout.
+
+If a signal hides a submission reply, only default mode replays the identical
+request once with the same idempotency key on a cancellation-independent
+context bounded to five seconds. It immediately uses the ordinary cancellation
+path for any Run the replay finds or creates. This is the one safe exception
+to read-only recovery after a signal. With `--keep-running` or `--detach`,
+the CLI never replays: it could create work after the caller tried to stop.
+Those modes, and failed default-mode recovery, report unavailable (exit 13)
+with the unconfirmed submission key.
+
+After an accepted command, the CLI reads the original caller's Seat outcome
+once to obtain its unread count and uses the shared Seat reply path. The hint
+goes to stderr in text and JSON modes, preserving command stdout and the
+detach JSON object. It acknowledges only contiguous lifecycle history and
+does not renew Seat activity. A failed hint read warns without changing the
+Run outcome.
+
+Never put secrets in command text: wefty stores argv as typed. Copy secrets
+in as files, such as `.env`, with `wefty cp`.
+
+### Backend
+
 A Seat Run is an ordinary Run bound to one Seat and the Computer Attempt that
 first hosted it. `POST /v1/runs` accepts `seat_run` as a fourth program source:
 `{"seat_id":"seat_<32 hex>","argv":["command","arg"],"max_runtime_seconds":3600}`.

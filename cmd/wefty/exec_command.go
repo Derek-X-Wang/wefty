@@ -65,17 +65,19 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	flags.SetOutput(flagErrorOutput(stderr, jsonOutput))
 	var tags stringListFlag
 	var maxRuntime time.Duration
-	var targetNode string
+	var targetNode, targetSeat string
 	var keepRunning, detach, restartable bool
 	flags.BoolVar(&keepRunning, "keep-running", false, "stopping ends only watching; the run continues")
 	flags.BoolVar(&restartable, "restartable", false, "restart interrupted commands from the same frozen inputs (up to ten restarts)")
 	flags.BoolVar(&detach, "detach", false, "return the run ID after acceptance without watching")
 	flags.BoolVar(&jsonOutput, "json", jsonOutput, "stream one JSON event per line")
 	flags.StringVar(&targetNode, "node", "", "run on this owned Node ID (default: this machine)")
+	flags.StringVar(&targetSeat, "seat", "", "run in this Seat's folder and environment, without capturing or copying a checkout")
 	flags.Var(&tags, "tag", "additional tag that narrows the selected node's Pinned run (repeatable)")
-	flags.DurationVar(&maxRuntime, "max-runtime", 0, "optional per-Attempt runtime cap (no cap by default)")
+	flags.DurationVar(&maxRuntime, "max-runtime", 0, "runtime cap; Seat commands require a positive limit (default: cluster setting, shipped as 1h); plain exec has no cap by default")
 	flags.Usage = func() {
 		fmt.Fprintln(flags.Output(), "Usage: wefty exec [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>\nFreeze the checkout and local changes; run on this machine's node by default. Use --node NODE for another owned node.\nStream output; exit 0 on pass, 10 on command failure, or 13 for unavailable evidence/restart limit. Stopping cancels the run unless --keep-running is set.")
+		fmt.Fprintln(flags.Output(), "Usage: wefty exec --seat SEAT_ID [--max-runtime D] [--keep-running | --detach] [--json] -- <command...>\nRun in the Seat's folder and environment. No checkout capture or file copy, inside or outside a Git checkout.\nEvery Seat command has a limit (cluster default, shipped as 1h); use a positive --max-runtime for a longer limit. --node, --tag and --restartable do not fit a Seat Run.")
 		flags.PrintDefaults()
 	}
 	if err := parseCommandFlags(flags, args, false); err != nil {
@@ -83,7 +85,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	separator := len(args) - flags.NArg() - 1
 	if separator < 0 || flags.NArg() == 0 || args[separator] != "--" {
-		return usageError("usage: wefty exec [--node NODE] [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>")
+		return usageError("usage: wefty exec [--node NODE] [--tag TAG] [--max-runtime D] [--restartable] [--keep-running | --detach] [--json] -- <command...>; or wefty exec --seat SEAT_ID -- <command...>")
 	}
 	if keepRunning && detach {
 		return usageError("--keep-running and --detach are alternatives")
@@ -92,6 +94,25 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	for _, arg := range argv {
 		if strings.ContainsRune(arg, 0) {
 			return usageError("command arguments cannot contain NUL")
+		}
+	}
+	set := make(map[string]bool)
+	flags.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if set["seat"] {
+		if !seatCLIIdentifier.MatchString(targetSeat) {
+			return usageError("--seat requires a valid Seat ID (seat_<32 lowercase hex>)")
+		}
+		for _, refusal := range []struct{ flag, reason string }{
+			{"node", "the Seat decides the node"},
+			{"tag", "the Seat decides placement"},
+			{"restartable", "Seat state cannot be replayed"},
+		} {
+			if set[refusal.flag] {
+				return usageError(fmt.Sprintf("--%s cannot be used with --seat: %s", refusal.flag, refusal.reason))
+			}
+		}
+		if set["max-runtime"] && maxRuntime <= 0 {
+			return usageError("a Seat command always has a limit; use a positive --max-runtime for a longer limit")
 		}
 	}
 	seconds := int(maxRuntime / time.Second)
@@ -111,6 +132,9 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	if clients.l3.address == "" {
 		return usageError("this command requires --l3, which is not configured")
+	}
+	if set["seat"] {
+		return executeSeatExec(ctx, clients, targetSeat, argv, seconds, keepRunning, detach, jsonOutput, stdout, stderr)
 	}
 	// Only exec restores default signal handling after the first signal.
 	// A second Ctrl-C exits immediately; a later exec sweeps abandoned captures.
@@ -221,6 +245,17 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	}
 	runID := accepted.RunID
 	retireSubmittedExecCapture(capture, runID, stderr)
+	observeNodeID := node.NodeID
+	if crossNode {
+		// Caller load cannot describe the other Node.
+		observeNodeID = ""
+	}
+	return observeSubmittedExecRun(ctx, clients, runID, observeNodeID, capture, keepRunning, detach, jsonOutput, stdout, stderr)
+}
+
+// Captured commands and Seat commands share watching, signal and exit policy.
+func observeSubmittedExecRun(ctx context.Context, clients *apiClients, runID, observeNodeID string, capture execCapture, keepRunning, detach, jsonOutput bool, stdout, stderr io.Writer) error {
+	var err error
 	if detach {
 		return printExecDetached(stdout, jsonOutput, runID)
 	}
@@ -232,11 +267,6 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 			return endExecObservation(clients, capture, contract.RunRecord{RunID: runID}, jsonOutput, stdout, stderr, ctx.Err())
 		}
 		return cancelExecObservation(clients, capture, runID, jsonOutput, stdout, stderr, ctx.Err())
-	}
-	observeNodeID := node.NodeID
-	if crossNode {
-		// Caller load cannot describe the other Node.
-		observeNodeID = ""
 	}
 	record, err := observeExecRunOutput(ctx, clients, runID, observeNodeID, jsonOutput, stdout, stderr)
 	if err != nil && !runIsTerminal(record.Status) {
@@ -252,8 +282,10 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 		fmt.Fprintf(stderr, "wefty: warning: could not drain logs for terminal run %s: %v\n", runID, err)
 	}
 	result := reportExecFinished(ctx, clients, record, capture, jsonOutput, stdout, stderr)
-	if err = cleanupExecStorage(capture.Storage); err != nil {
-		fmt.Fprintf(stderr, "wefty: warning: %v\n", err)
+	if capture.Storage != "" {
+		if err = cleanupExecStorage(capture.Storage); err != nil {
+			fmt.Fprintf(stderr, "wefty: warning: %v\n", err)
+		}
 	}
 	return result
 }
@@ -276,7 +308,7 @@ func buildExecWrapperFromTemplate(template string, capture execCapture, argv []s
 	return strings.Replace(script, "__WEFTY_EXEC_INPUT__", input.String(), 1)
 }
 
-func submitExecRun(ctx context.Context, clients *apiClients, request l3.CreateRunRequest, key string, stderr io.Writer) (acceptedOutput, bool, error) {
+func submitExecRun(ctx context.Context, clients *apiClients, request l3.CreateRunRequest, key string, stderr io.Writer, seatCredential ...string) (acceptedOutput, bool, error) {
 	var accepted acceptedOutput
 	var err error
 	uncertain := false
@@ -285,7 +317,7 @@ func submitExecRun(ctx context.Context, clients *apiClients, request l3.CreateRu
 		if ctx.Err() != nil {
 			return accepted, uncertain, ctx.Err()
 		}
-		accepted, err = clients.submitRun(ctx, request, key)
+		accepted, err = clients.submitRun(ctx, request, key, seatCredential...)
 		if err == nil && accepted.RunID != "" {
 			return accepted, false, nil
 		}
@@ -399,8 +431,10 @@ func cancelExecRun(clients *apiClients, runID, storage string, cause error, stde
 	var record contract.RunRecord
 	err := clients.l3.do(ctx, http.MethodPost, "/v1/runs/"+url.PathEscape(runID)+"/cancel", nil, nil, &record, http.StatusOK)
 	if err != nil {
-		fmt.Fprintf(stderr, "wefty: snapshot retained at %s\n", retained)
-		return fmt.Errorf("could not confirm cancellation of run %s; snapshot retained at %s: %w", runID, retained, err)
+		if retained != "" {
+			fmt.Fprintf(stderr, "wefty: snapshot retained at %s\n", retained)
+		}
+		return fmt.Errorf("could not confirm cancellation of run %s%s: %w", runID, execRetainedSuffix(retained), err)
 	}
 	// L1 reserves cancellation independently of the eventual process result.
 	// Terminal observation below serves only storage cleanup, not the verdict.
@@ -417,11 +451,20 @@ func cancelExecRun(clients *apiClients, runID, storage string, cause error, stde
 		}
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "wefty: warning: could not confirm run %s ended; snapshot retained at %s: %v\n", runID, retained, err)
-	} else if err = cleanupExecStorage(storage); err != nil {
-		fmt.Fprintf(stderr, "wefty: warning: %v\n", err)
+		fmt.Fprintf(stderr, "wefty: warning: could not confirm run %s ended%s: %v\n", runID, execRetainedSuffix(retained), err)
+	} else if storage != "" {
+		if err = cleanupExecStorage(storage); err != nil {
+			fmt.Fprintf(stderr, "wefty: warning: %v\n", err)
+		}
 	}
 	return fmt.Errorf("cancelled run %s: %w", runID, cause)
+}
+
+func execRetainedSuffix(storage string) string {
+	if storage == "" {
+		return ""
+	}
+	return "; snapshot retained at " + storage
 }
 
 func printExecDetached(stdout io.Writer, jsonOutput bool, runID string) error {
