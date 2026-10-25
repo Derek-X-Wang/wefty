@@ -142,6 +142,7 @@ func (s *Store) ReportComputerSeatAttemptAbsence(ctx context.Context, identity, 
 		return ComputerSeatObservationReceipt{}, err
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	q := write.tx
 	if err := validateComputerSeatAttempt(ctx, q, write.at, identity, computer, job, current, report.ComputerSeatAttemptRequest); err != nil {
 		return ComputerSeatObservationReceipt{}, err

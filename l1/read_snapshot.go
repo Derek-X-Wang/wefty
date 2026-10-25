@@ -541,7 +541,9 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&anchor); err != nil {
 		return err
 	}
-	reads := newDatabaseReads(tx, canonicalTime(s.clock.Now()), caller)
+	at := canonicalTime(s.clock.Now())
+	ctx = withAttemptClock(ctx, s.clock, at)
+	reads := newDatabaseReads(tx, at, caller)
 	reads.diagnosticObservations = true
 	reads.seatClock = s.clock
 	reads.personDeviceBinding = &s.personDeviceBinding
@@ -608,6 +610,7 @@ func projectJobWithReads(ctx context.Context, reads readModel, job Job, parts jo
 // writeTransaction keeps mutation authority and one pinned clock. Each
 // decision gets a new read set, so earlier decisions cannot hide later writes.
 type writeTransaction struct {
+	ctx                 context.Context
 	personDeviceBinding *personDeviceBinding
 	tx                  *sql.Tx
 	at                  time.Time
@@ -630,7 +633,8 @@ func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceAction
 	} else {
 		at = canonicalTime(s.clock.Now())
 	}
-	return &writeTransaction{tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
+	ctx = withAttemptClock(ctx, s.clock, at)
+	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
 }
 
 // beginSettlementWriteTransaction is the write door for heartbeat revocation
@@ -650,7 +654,8 @@ func (s *Store) beginSettlementWriteTransaction(ctx context.Context, caller *ser
 	} else {
 		at = canonicalTime(s.clock.Now())
 	}
-	return &writeTransaction{tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
+	ctx = withAttemptClock(ctx, s.clock, at)
+	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
 }
 
 func (w *writeTransaction) decisionReads() readModel {

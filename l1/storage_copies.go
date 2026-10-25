@@ -281,6 +281,7 @@ func (s *Store) BeginComputerRestore(ctx context.Context, computerID string, req
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -547,6 +548,7 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	if replay, replayErr := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
 		FROM computer_storage_copy_operations WHERE backup_id=? AND idempotency_key=?`, request.BackupID, request.IdempotencyKey)); replayErr == nil {
 		if replay.Operation != "clone" {
@@ -1146,6 +1148,7 @@ func (s *Store) AcknowledgeComputerStorageCopy(ctx context.Context, identityNode
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	var storedOperation string
 	if err := tx.QueryRowContext(ctx, `SELECT operation FROM computer_storage_copy_operations
 		WHERE destination_computer_id=? ORDER BY operation_revision DESC LIMIT 1`, destinationComputerID).
@@ -1349,6 +1352,7 @@ func (s *Store) publishVerifiedComputerStorageCopy(ctx context.Context, destinat
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	row, err := scanComputerStorageCopy(tx.QueryRowContext(ctx, `SELECT `+storageCopyColumns+`
 		FROM computer_storage_copy_operations WHERE destination_computer_id=? AND operation_revision=?`,
 		destinationComputerID, operationRevision))
@@ -1519,6 +1523,7 @@ func (s *Store) AcknowledgeComputerRestoreRetirement(ctx context.Context, identi
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	if err := validateStorageResetNode(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Computer{}, err
 	}

@@ -52,6 +52,7 @@ func (s *Store) AbortComputerReconfiguration(ctx context.Context, computerID str
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)

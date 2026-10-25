@@ -6,6 +6,12 @@
     "slice": "permanent"
   },
   {
+    "site": "attempt_time.go:*Store.migrateAttemptLeaseClock | s.db",
+    "count": 1,
+    "reason": "Startup migration adds the Attempt lease expiry index before request serving.",
+    "slice": "permanent"
+  },
+  {
     "site": "backups.go:*Store.ListNodeComputerBackupDirectives | s.db",
     "count": 2,
     "reason": "Agent heartbeat write-path directive read stays independent of operator snapshot admission; not a Computer client view.",

@@ -26,6 +26,12 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	locked := time.Now()
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
+	if err := attemptClockError(ctx); err != nil {
+		if s.logf != nil {
+			s.logf("event=attempt_lease_clock_retry action=retry_next_tick error=%q", err)
+		}
+	}
 
 	result := ReconcileResult{}
 	dead, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_condition_json=?
@@ -75,7 +81,7 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 		return ReconcileResult{}, err
 	}
 
-	rows, err := tx.QueryContext(ctx, expiredAttemptsSQL, expiredAttemptsArguments(now)...)
+	rows, err := tx.QueryContext(ctx, expiredAttemptsSQL, expiredAttemptsArguments(now, ctx)...)
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "select expired attempts")
 	}
@@ -238,13 +244,26 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 // and is past its settlement deadline: the statement every pass ran before
 // #948, split at its OR. Each branch walks its own index up to now, so a pass
 // reads only active Attempts and canceled active Jobs whose deadline has
-// passed, never every active Job: attempts_lease_expiry for leases, and
-// jobs_cancel_settlement, which holds only canceled Jobs, for cancellations.
-// UNION drops an Attempt both branches find.
-const expiredAttemptsSQL = `SELECT attempts.attempt_id
+// passed, never every active Job: attempts_lease_expiry for wall candidates,
+// attempts_boot_lease_expiry for same-boot candidates, and jobs_cancel_settlement
+// for cancellations. The shared predicate checks each candidate against the
+// correct clock. UNION removes duplicate Attempts.
+var expiredAttemptsSQL = `SELECT attempts.attempt_id
 	FROM attempts JOIN jobs ON jobs.job_id=attempts.job_id
-	WHERE attempts.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
+	WHERE @lease_boot_id IS NOT NULL
+		AND attempts.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
 		AND attempts.lease_expires_ns<=@now_ns
+		AND NOT ` + attemptLeaseLiveSQL("attempts", "@lease_boot_id", "@lease_boot_ns", "@now_ns") + `
+		AND jobs.current_attempt_id=attempts.attempt_id
+		AND jobs.state IN (@job_claimed, @job_running, @job_awaiting_input, @job_stopping)
+	UNION
+	SELECT attempts.attempt_id
+	FROM attempts JOIN jobs ON jobs.job_id=attempts.job_id
+	WHERE @lease_boot_id IS NOT NULL
+		AND attempts.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)
+		AND attempts.lease_boot_id=@lease_boot_id
+		AND attempts.lease_deadline_ns>0 AND attempts.lease_deadline_ns<=@lease_boot_ns
+		AND NOT ` + attemptLeaseLiveSQL("attempts", "@lease_boot_id", "@lease_boot_ns", "@now_ns") + `
 		AND jobs.current_attempt_id=attempts.attempt_id
 		AND jobs.state IN (@job_claimed, @job_running, @job_awaiting_input, @job_stopping)
 	UNION
@@ -256,8 +275,12 @@ const expiredAttemptsSQL = `SELECT attempts.attempt_id
 		AND attempts.job_id=jobs.job_id
 		AND attempts.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)`
 
-func expiredAttemptsArguments(now time.Time) []any {
-	return []any{
+func expiredAttemptsArguments(now time.Time, contexts ...context.Context) []any {
+	ctx := context.Background()
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
+	return append(attemptLeaseArguments(ctx, now), []any{
 		sql.Named("attempt_claimed", contract.AttemptClaimed),
 		sql.Named("attempt_running", contract.AttemptRunning),
 		sql.Named("attempt_awaiting_input", contract.AttemptAwaitingInput),
@@ -265,8 +288,7 @@ func expiredAttemptsArguments(now time.Time) []any {
 		sql.Named("job_running", contract.JobRunning),
 		sql.Named("job_awaiting_input", contract.JobAwaitingInput),
 		sql.Named("job_stopping", contract.JobStopping),
-		sql.Named("now_ns", now.UnixNano()),
-	}
+	}...)
 }
 
 func (s *Store) reconcileClaimingNode(ctx context.Context, tx *sql.Tx, nodeID string, state contract.NodeState, heartbeat, now time.Time) (contract.NodeState, error) {

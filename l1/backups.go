@@ -232,6 +232,7 @@ func (s *Store) BeginComputerBackup(ctx context.Context, computerID string, requ
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -404,6 +405,7 @@ func (s *Store) AcknowledgeComputerBackup(ctx context.Context, identityNodeID, c
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	if err := validateBackupNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Backup{}, Computer{}, err
 	}
@@ -798,6 +800,7 @@ func (s *Store) BeginComputerBackupPrune(ctx context.Context, computerID string,
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Backup{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)

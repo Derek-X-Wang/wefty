@@ -196,6 +196,7 @@ func (s *Store) LatchServiceImageReconciliationFailure(ctx context.Context, iden
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	if err := validateImagePinNodeSession(ctx, tx, identityNodeID, request.NodeID, request.BootSessionID); err != nil {
 		return Job{}, err
 	}

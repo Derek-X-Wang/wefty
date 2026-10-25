@@ -724,7 +724,7 @@ func TestServiceLivenessStatementsUseTheirIndexes(t *testing.T) {
 		args  []any
 		want  string
 	}{
-		{serviceStabilityResetSQL, []any{"running", 0, "running", "running", 0, "alive"},
+		{serviceStabilityResetSQL, []any{"running", 0, "running", "running", "", "", 0, 0, "alive"},
 			"SEARCH service_jobs USING INDEX service_jobs_stability_due (healthy_since_ns>? AND healthy_since_ns<?)"},
 		{interruptNodeServiceStabilitySQL, []any{"node", "alive"},
 			"SEARCH service_jobs USING INDEX service_jobs_healthy_node (bound_node_id=?)"},

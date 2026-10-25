@@ -267,6 +267,7 @@ func TestAttemptCredentialIsRefusedAfterAuthorityLossWithALiveLease(t *testing.T
 // one and still look correct through the routes above.
 func TestAttemptCredentialAuthorityPredicates(t *testing.T) {
 	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	ctx := withAttemptClock(t.Context(), ClockFunc(func() time.Time { return now }), now)
 	scope := AttemptCredentialScope{AttemptID: "attempt-1", JobID: "job-1", NodeID: "node-1"}
 	live := func() attemptAuthority {
 		return attemptAuthority{
@@ -278,7 +279,7 @@ func TestAttemptCredentialAuthorityPredicates(t *testing.T) {
 			leaseExpires:   now.Add(30 * time.Second),
 		}
 	}
-	if err := validateAttemptCredentialAuthority("node-1", scope, live(), now.UnixNano()); err != nil {
+	if err := validateAttemptCredentialAuthority("node-1", scope, live(), now.UnixNano(), ctx); err != nil {
 		t.Fatalf("live attempt = %v, want authorized", err)
 	}
 
@@ -308,7 +309,7 @@ func TestAttemptCredentialAuthorityPredicates(t *testing.T) {
 	} {
 		authority := live()
 		probe.mutate(&authority)
-		err := validateAttemptCredentialAuthority(probe.node, scope, authority, now.UnixNano())
+		err := validateAttemptCredentialAuthority(probe.node, scope, authority, now.UnixNano(), ctx)
 		if errorCode(err) != probe.wantErr {
 			t.Errorf("%s = %v (code %s), want %s", probe.name, err, errorCode(err), probe.wantErr)
 		}

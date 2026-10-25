@@ -345,6 +345,7 @@ func (s *Store) CreateComputer(ctx context.Context, request CreateComputerReques
 		return Computer{}, false, internalError(err, "begin Computer creation")
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	computer, replay, err := s.createComputerTx(ctx, write.tx, now, request)
 	if err != nil {
 		return Computer{}, false, err
@@ -969,6 +970,7 @@ func (s *Store) SetComputerBackupCap(ctx context.Context, computerID string, req
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1143,6 +1145,7 @@ func (s *Store) SetComputerDesiredState(ctx context.Context, computerID string, 
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1307,6 +1310,7 @@ func (s *Store) RestartComputer(ctx context.Context, computerID string, request 
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1417,6 +1421,7 @@ func (s *Store) RemoveComputer(ctx context.Context, computerID string, request C
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -1793,6 +1798,7 @@ func (s *Store) installComputerProjection(ctx context.Context, computerID string
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Computer{}, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)

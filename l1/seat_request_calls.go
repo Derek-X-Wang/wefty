@@ -584,6 +584,7 @@ func (s *Store) createSeatCallComputer(ctx context.Context, identity, id string,
 		return Computer{}, false, err
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	computer, replay, err := s.createComputerTx(ctx, write.tx, write.at, request)
 	if err != nil {
 		return Computer{}, false, err

@@ -409,7 +409,7 @@ func assertOperatorReadyRequiresCurrentActiveAuthority(t *testing.T) {
 			}
 		}},
 		{name: "unexpired lease", mutate: func(t *testing.T, fixture publicationFixture) {
-			_, err := fixture.h.store.db.Exec("UPDATE attempts SET lease_expires_ns=? WHERE attempt_id=?", fixture.h.clock.Now().UnixNano(), fixture.claim.Lease.AttemptID)
+			_, err := fixture.h.store.db.Exec("UPDATE attempts SET lease_expires_ns=?, lease_deadline_ns=1 WHERE attempt_id=?", fixture.h.clock.Now().UnixNano(), fixture.claim.Lease.AttemptID)
 			if err != nil {
 				t.Fatal(err)
 			}

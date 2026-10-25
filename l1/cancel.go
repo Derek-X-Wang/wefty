@@ -44,6 +44,7 @@ func (s *Store) CancelJob(ctx context.Context, jobID string, caller JobCancelCal
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	now := write.at
 	if caller.Parent != nil {
 		if err := revalidateAttemptCredential(ctx, tx, *caller.Parent, now.UnixNano()); err != nil {

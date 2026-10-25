@@ -2,6 +2,7 @@ package l1
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -9,15 +10,46 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 )
 
-// BootTime is an optional extension of the existing injected Clock. Durable
-// Seat waits store both values; a different boot cannot reuse an old deadline.
-func (systemClock) BootTime() (string, time.Duration, error) {
-	id, err := hostboot.Identity()
-	if err != nil {
-		return "", 0, err
+// Identity cannot change while L1 lives. Keep its fallible read at OpenStore;
+// only the independent elapsed source is sampled during transactions. Seats
+// and Attempts both receive this same cached Store clock.
+type bootClockSource interface {
+	BootIdentity() (string, error)
+	BootElapsed() (time.Duration, error)
+}
+
+func (systemClock) BootIdentity() (string, error)       { return hostboot.Identity() }
+func (systemClock) BootElapsed() (time.Duration, error) { return bootclock.Now() }
+
+type cachedBootClock struct {
+	Clock
+	boot   string
+	source bootClockSource
+}
+
+func (c cachedBootClock) BootTime() (string, time.Duration, error) {
+	elapsed, err := c.source.BootElapsed()
+	return c.boot, elapsed, err
+}
+
+func (c cachedBootClock) NewTimer(duration time.Duration) clockTimer {
+	return newClockTimer(c.Clock, duration)
+}
+
+func cacheStoreBootIdentity(clock Clock) (Clock, error) {
+	source, ok := clock.(bootClockSource)
+	if !ok {
+		// Simple injected clocks retain their one controlled timeline.
+		return clock, nil
 	}
-	ns, err := bootclock.Now()
-	return id, ns, err
+	boot, err := source.BootIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("l1: read host boot identity at OpenStore: %w", err)
+	}
+	if boot == "" {
+		return nil, fmt.Errorf("l1: empty host boot identity at OpenStore")
+	}
+	return cachedBootClock{Clock: clock, boot: boot, source: source}, nil
 }
 
 func seatTime(clock Clock, snapshot ...time.Time) (string, int64, error) {

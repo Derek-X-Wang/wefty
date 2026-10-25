@@ -29,6 +29,7 @@ func (s *Store) CheckSeatLife(ctx context.Context) error {
 			return err
 		}
 		defer w.rollback()
+		ctx = w.ctx
 		if err = recoverSeatApprovalClocks(ctx, w.tx, s.clock, s.logf); err != nil {
 			return err
 		}
@@ -58,6 +59,7 @@ func (s *Store) CheckSeatLife(ctx context.Context) error {
 				return err
 			}
 			defer w.rollback()
+			ctx = w.ctx
 			if err = s.checkSeatLifeTxIfLive(ctx, w.tx, id, w.at); err != nil {
 				return err
 			}
@@ -97,6 +99,7 @@ func (s *Store) checkComputerIdle(ctx context.Context, id string) error {
 			return false, err
 		}
 		defer w.rollback()
+		ctx = w.ctx
 		due, err := s.computerIdleDue(ctx, w.tx, id, true)
 		if err != nil {
 			return false, err
@@ -228,6 +231,7 @@ func (s *Store) SeatCallHappened(ctx context.Context, id, secret string) error {
 		return err
 	}
 	defer w.rollback()
+	ctx = w.ctx
 	if err := s.authorizeLiveSeat(ctx, w.tx, id, secret, w.at); err != nil {
 		if errorCode(err) == "seat_ended" {
 			if e := w.commit(); e != nil {
@@ -296,6 +300,7 @@ func (s *Store) seatActivityHold(ctx context.Context, id, kind, key string, acti
 		return err
 	}
 	defer w.rollback()
+	ctx = w.ctx
 	value, err := readSeatRequest(ctx, w.tx, id)
 	if err != nil {
 		return err

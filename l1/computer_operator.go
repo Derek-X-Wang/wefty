@@ -450,7 +450,10 @@ func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Cont
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_schema").Scan(&anchor); err != nil {
 		return err
 	}
-	reads := newDatabaseReads(tx, canonicalTime(s.clock.Now()), nil)
+	at := canonicalTime(s.clock.Now())
+	ctx = withAttemptClock(ctx, s.clock, at)
+	reads := newDatabaseReads(tx, at, nil)
+	reads.seatClock = s.clock
 	reads.personDeviceBinding = &s.personDeviceBinding
 	return use(ctx, reads)
 }

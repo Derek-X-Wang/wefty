@@ -174,6 +174,7 @@ func (s *Store) BeginComputerCustodyExport(ctx context.Context, computerID strin
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	computer, err := readComputerAuthority(ctx, tx, computerID, now)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ComputerCustodyExport{}, false, protocolError(contract.ErrorNotFound, "Computer %q was not found", computerID)
@@ -800,6 +801,7 @@ func (s *Store) AcknowledgeComputerCustodyImport(ctx context.Context, identityNo
 		return Computer{}, internalError(err, "begin Custody import acknowledgement")
 	}
 	defer write.rollback()
+	ctx = write.ctx
 	return s.acknowledgeComputerCustodyImport(ctx, write, identityNodeID, destinationComputerID, request, bodyHash)
 }
 

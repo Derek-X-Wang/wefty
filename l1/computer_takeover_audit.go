@@ -67,6 +67,7 @@ func (s *Store) AppendComputerTakeoverAudit(
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return ComputerTakeoverAuditReceipt{}, err

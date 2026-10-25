@@ -237,6 +237,10 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	if sharedSeatLimit < 2 {
 		return nil, fmt.Errorf("l1: shared Computer Seat limit must be at least 2")
 	}
+	clock, err = cacheStoreBootIdentity(clock)
+	if err != nil {
+		return nil, err
+	}
 	deploymentID, err := loadOrCreateDeploymentID(path)
 	if err != nil {
 		return nil, err
@@ -1400,6 +1404,11 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.ensureColumn(ctx, "attempts", "termination_initiator", "TEXT CHECK(termination_initiator IN ('', 'agent', 'guardian'))"); err != nil {
 		return err
 	}
+	// Append after all older Attempt migrations so fresh and upgraded tables
+	// have the same column order and rollback schema fingerprint.
+	if err := s.migrateAttemptLeaseClock(ctx); err != nil {
+		return err
+	}
 	if err := s.ensureColumn(ctx, "computer_takeover_audit", "stored_ns", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
@@ -2443,6 +2452,7 @@ func (s *Store) CreateJobAs(ctx context.Context, spec contract.JobSpec, origin J
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	// Beginning an immediate transaction can wait behind another writer. Read
 	// time after acquiring it so a lease that expired while waiting is refused.
 	now := write.at
@@ -3225,6 +3235,10 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
+	if err := attemptClockError(ctx); err != nil {
+		return nil, internalError(err, "claim Attempt lease clock")
+	}
 
 	var nodeState contract.NodeState
 	var storedIdentity, storedBoot string
@@ -3285,6 +3299,7 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	}
 
 	leaseExpires := canonicalTime(now.Add(s.leaseDuration))
+	leaseBoot, leaseDeadline := attemptLeaseDeadline(ctx, now, leaseExpires)
 	attemptID := newID("attempt")
 	var jobID string
 	var specJSON []byte
@@ -3499,10 +3514,10 @@ AND state=@job_queued
 		attemptCreatedNS = latestRestartNS.Int64 + 1
 	}
 	_, err = tx.ExecContext(ctx, `
-	INSERT INTO attempts(attempt_id, job_id, node_id, boot_session_id, state, fencing_token, lease_expires_ns, authority_generation,
+	INSERT INTO attempts(attempt_id, job_id, node_id, boot_session_id, state, fencing_token, lease_expires_ns, lease_boot_id, lease_deadline_ns, authority_generation,
 	                     image_observation_json, image_observation_hash, created_ns, updated_ns)
-	VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, contract.AttemptClaimed,
-		fencingToken, leaseExpires.UnixNano(), authorityGeneration, attemptCreatedNS, now.UnixNano())
+	VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`, attemptID, jobID, nodeID, bootSessionID, contract.AttemptClaimed,
+		fencingToken, leaseExpires.UnixNano(), leaseBoot, leaseDeadline, authorityGeneration, attemptCreatedNS, now.UnixNano())
 	if err != nil {
 		return nil, internalError(err, "create claimed attempt")
 	}
@@ -3644,6 +3659,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return AttemptLease{}, err
@@ -3665,7 +3681,11 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	if attempt.state != contract.AttemptClaimed && attempt.state != contract.AttemptRunning && attempt.state != contract.AttemptAwaitingInput {
 		return AttemptLease{}, protocolError(contract.ErrorConflict, "attempt is terminal")
 	}
-	if !now.Before(attempt.leaseExpires) || (canceled && !now.Before(settleBy)) {
+	leaseExpired, err := attemptLeaseExpired(ctx, now, attempt)
+	if err != nil {
+		return AttemptLease{}, err
+	}
+	if leaseExpired || (canceled && !now.Before(settleBy)) {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return AttemptLease{}, err
 		}
@@ -3695,7 +3715,8 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	if attempt.state == contract.AttemptClaimed && attempt.spec.Kind != contract.JobKindOCI && !canceled {
 		nextState = contract.AttemptRunning
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE attempts SET state=?, lease_expires_ns=?, updated_ns=?, last_renewal_ns=? WHERE attempt_id=?", nextState, expires.UnixNano(), now.UnixNano(), now.UnixNano(), attemptID)
+	leaseBoot, leaseDeadline := attemptLeaseDeadline(ctx, now, expires)
+	_, err = tx.ExecContext(ctx, "UPDATE attempts SET state=?, lease_expires_ns=?, lease_boot_id=?, lease_deadline_ns=?, updated_ns=?, last_renewal_ns=? WHERE attempt_id=?", nextState, expires.UnixNano(), leaseBoot, leaseDeadline, now.UnixNano(), now.UnixNano(), attemptID)
 	if err != nil {
 		return AttemptLease{}, internalError(err, "renew attempt lease")
 	}
@@ -3742,6 +3763,7 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return Job{}, err
@@ -3775,7 +3797,11 @@ func (s *Store) ObserveAttemptImage(ctx context.Context, identityNodeID, jobID, 
 		return Job{}, err
 	}
 	now := write.at
-	if !now.Before(attempt.leaseExpires) {
+	leaseExpired, err := attemptLeaseExpired(ctx, now, attempt)
+	if err != nil {
+		return Job{}, err
+	}
+	if leaseExpired {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
 		}
@@ -3899,6 +3925,7 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return Job{}, err
@@ -3910,7 +3937,11 @@ func (s *Store) StartAttempt(ctx context.Context, identityNodeID, jobID, attempt
 		return Job{}, protocolError(contract.ErrorConflict, "Started is only valid for OCI or process attempts")
 	}
 	now := write.at
-	if !now.Before(attempt.leaseExpires) {
+	leaseExpired, err := attemptLeaseExpired(ctx, now, attempt)
+	if err != nil {
+		return Job{}, err
+	}
+	if leaseExpired {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
 		}
@@ -4016,6 +4047,7 @@ func (s *Store) SetAttemptPublication(
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
@@ -4029,7 +4061,11 @@ func (s *Store) SetAttemptPublication(
 	}
 
 	now := write.at
-	if !now.Before(attempt.leaseExpires) {
+	leaseExpired, err := attemptLeaseExpired(ctx, now, attempt)
+	if err != nil {
+		return Job{}, err
+	}
+	if leaseExpired {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return Job{}, err
 		}
@@ -4194,6 +4230,7 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return AppendLogsResponse{}, err
@@ -4214,7 +4251,11 @@ func (s *Store) AppendLogs(ctx context.Context, identityNodeID, jobID, attemptID
 	}
 	hasAuthority := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt) == nil
 	now := write.at
-	if !now.Before(attempt.leaseExpires) {
+	leaseExpired, err := attemptLeaseExpired(ctx, now, attempt)
+	if err != nil {
+		return AppendLogsResponse{}, err
+	}
+	if leaseExpired {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return AppendLogsResponse{}, err
 		}
@@ -4614,6 +4655,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return CompletionOutcome{}, err
@@ -4636,7 +4678,11 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err != nil {
 		return CompletionOutcome{}, err
 	}
-	if (!now.Before(attempt.leaseExpires) || (canceled && !now.Before(settleBy))) && attempt.state != contract.AttemptLost {
+	leaseExpired, err := attemptLeaseExpired(ctx, now, attempt)
+	if err != nil {
+		return CompletionOutcome{}, err
+	}
+	if (leaseExpired || (canceled && !now.Before(settleBy))) && attempt.state != contract.AttemptLost {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return CompletionOutcome{}, err
 		}
@@ -4702,7 +4748,7 @@ func (s *Store) CompleteAttemptOutcome(ctx context.Context, identityNodeID, jobI
 	if err := validateAttemptAuthority(identityNodeID, jobID, attemptID, request.FencingToken, attempt); err != nil {
 		return CompletionOutcome{}, err
 	}
-	if !now.Before(attempt.leaseExpires) {
+	if leaseExpired {
 		if err := expireAttempt(ctx, tx, attempt, now, s.restartJitter); err != nil {
 			return CompletionOutcome{}, err
 		}
@@ -4943,6 +4989,8 @@ type attemptAuthority struct {
 	state                      contract.AttemptState
 	fencingToken               string
 	leaseExpires               time.Time
+	leaseBootID                string
+	leaseDeadlineNS            int64
 	updatedAt                  time.Time
 	currentAttempt             sql.NullString
 	completionReplayAttempt    sql.NullString
@@ -4962,7 +5010,7 @@ func readAttemptAuthority(ctx context.Context, q queryer, attemptID string) (att
 	err := q.QueryRowContext(ctx, `
 	SELECT a.attempt_id, a.job_id, a.node_id, n.identity_node_id, a.boot_session_id, n.boot_session_id,
 	       a.authority_generation, n.authority_generation, a.state, a.fencing_token,
-	       a.lease_expires_ns, a.updated_ns, j.current_attempt_id, j.completion_replay_attempt_id,
+	       a.lease_expires_ns, a.lease_boot_id, a.lease_deadline_ns, a.updated_ns, j.current_attempt_id, j.completion_replay_attempt_id,
 	       a.completion_key, a.completion_hash,
 	       j.spec_json, a.image_observation_json, a.image_observation_hash,
 	       j.image_resolution_hash, a.started_ns, `+retiringAttemptAuthoritySQL+`
@@ -4971,7 +5019,7 @@ JOIN jobs j ON j.job_id=a.job_id
 JOIN nodes n ON n.node_id=a.node_id
 	WHERE a.attempt_id=?`, attemptID).Scan(&a.attemptID, &a.jobID, &a.nodeID, &a.identityNodeID,
 		&a.bootSessionID, &a.currentBootSessionID, &a.authorityGeneration, &a.currentAuthorityGeneration,
-		&a.state, &a.fencingToken, &leaseNS, &updatedNS, &a.currentAttempt, &a.completionReplayAttempt,
+		&a.state, &a.fencingToken, &leaseNS, &a.leaseBootID, &a.leaseDeadlineNS, &updatedNS, &a.currentAttempt, &a.completionReplayAttempt,
 		&a.completionKey, &a.completionHash,
 		&specJSON, &a.imageObservationJSON, &a.imageObservationHash,
 		&a.jobImageResolutionHash, &a.startedNS, &a.retiringSessionAuthorized)
@@ -5250,7 +5298,7 @@ CASE
 				AND publication_attempt.job_id=jobs.job_id
 				AND publication_attempt.node_id=service_jobs.bound_node_id
 				AND publication_attempt.state IN ('claimed', 'running', 'awaiting-input')
-				AND publication_attempt.lease_expires_ns>@now_ns
+				AND `+attemptLeaseLiveSQL("publication_attempt", "@lease_boot_id", "@lease_boot_ns", "@now_ns")+`
 				AND publication_attempt.boot_session_id=publication_node.boot_session_id
 				AND publication_attempt.authority_generation=publication_node.authority_generation
 		)
@@ -5259,7 +5307,7 @@ END,
 service_jobs.policy_stop_json,
 jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-WHERE jobs.dispatch_key=@dispatch_key`, sql.Named("now_ns", now.UnixNano()), sql.Named("dispatch_key", dispatchKey)).Scan(append(append([]any{
+WHERE jobs.dispatch_key=@dispatch_key`, append(attemptLeaseArguments(ctx, now), sql.Named("dispatch_key", dispatchKey))...).Scan(append(append([]any{
 		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &job.Outcome, &specJSON, &currentAttempt, &createdNS, &updatedNS, &requestHash, &failureReason,
 		&secretsScrubbedNS,
 	}, serviceColumns.scanDestinations()...), spawnColumns.scanDestinations()...)...)
@@ -5314,7 +5362,7 @@ CASE
 				AND publication_attempt.job_id=jobs.job_id
 				AND publication_attempt.node_id=service_jobs.bound_node_id
 				AND publication_attempt.state IN ('claimed', 'running', 'awaiting-input')
-				AND publication_attempt.lease_expires_ns>@now_ns
+				AND `+attemptLeaseLiveSQL("publication_attempt", "@lease_boot_id", "@lease_boot_ns", "@now_ns")+`
 				AND publication_attempt.boot_session_id=publication_node.boot_session_id
 				AND publication_attempt.authority_generation=publication_node.authority_generation
 		)
@@ -5323,7 +5371,7 @@ END,
 service_jobs.policy_stop_json,
 jobs.parent_job_id, jobs.parent_attempt_id, jobs.originating_submitter, jobs.spawn_depth
 FROM jobs LEFT JOIN service_jobs ON service_jobs.job_id=jobs.job_id
-WHERE jobs.job_id=@job_id`, sql.Named("now_ns", now.UnixNano()), sql.Named("job_id", jobID)).Scan(append(append([]any{
+WHERE jobs.job_id=@job_id`, append(attemptLeaseArguments(ctx, now), sql.Named("job_id", jobID))...).Scan(append(append([]any{
 		&job.JobID, &job.ComputerID, &job.NodeID, &job.State, &job.Outcome, &specJSON, &currentAttempt, &createdNS, &updatedNS, &failureReason,
 		&secretsScrubbedNS,
 	}, serviceColumns.scanDestinations()...), spawnColumns.scanDestinations()...)...)
@@ -5583,6 +5631,7 @@ func (s *Store) SetAttemptResult(ctx context.Context, identityNodeID, jobID, att
 	}
 	tx := write.tx
 	defer write.rollback()
+	ctx = write.ctx
 	attempt, err := readAttemptAuthority(ctx, tx, attemptID)
 	if err != nil {
 		return AttemptResultResponse{}, err
