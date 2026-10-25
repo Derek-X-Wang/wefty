@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -184,10 +185,28 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 		return spawnFailure(contract.SpawnFailureProcessGroupSetup, err), err
 	}
 
+	// Cancellation stops the payload; it does not cut off what the payload
+	// still writes. Output read after ctx ends -- a TERM handler's lines, or
+	// bytes still unread in the pipe when the stop arrived -- keeps flowing
+	// to the sink (#1277), as on the guarded path. A separate cancel cuts it
+	// off right before a cancelled stop escalates to SIGKILL, so a sink write
+	// still waiting then cannot hold Wait past the reap bound, and when Run
+	// returns.
+	outputContext, cancelOutput := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelOutput()
+	var outputCutOff atomic.Bool
+	inner := sink
+	sink = OutputSinkFunc(func(writeContext context.Context, event contract.LogEvent) error {
+		err := inner.WriteOutput(writeContext, event)
+		if err != nil && outputContext.Err() != nil {
+			outputCutOff.Store(true)
+		}
+		return err
+	})
 	activity := newActivityTracker(runner.clock.Now())
 	failure := newSinkFailure()
 	command.Stdout = &eventWriter{
-		ctx:       ctx,
+		ctx:       outputContext,
 		clock:     runner.clock,
 		attemptID: request.AttemptID,
 		stream:    contract.LogStdout,
@@ -196,7 +215,7 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 		failure:   failure,
 	}
 	command.Stderr = &eventWriter{
-		ctx:       ctx,
+		ctx:       outputContext,
 		clock:     runner.clock,
 		attemptID: request.AttemptID,
 		stream:    contract.LogStderr,
@@ -238,12 +257,13 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 	var completionTimerChannel <-chan time.Time
 	completionSignal := request.CompletionSignal
 
-	terminate := func(cause error) (contract.ProcessResult, error) {
+	terminateCutting := func(cause error, cutOutput func()) (contract.ProcessResult, error) {
 		if request.StopInitiated != nil {
 			request.StopInitiated(cause)
 		}
-		return runner.terminate(command.Process.Pid, wait, cause)
+		return runner.terminateCutting(command.Process.Pid, wait, cause, cutOutput)
 	}
+	terminate := func(cause error) (contract.ProcessResult, error) { return terminateCutting(cause, nil) }
 
 	for {
 		select {
@@ -291,7 +311,15 @@ func (runner *Runner) Run(ctx context.Context, request Request, sink OutputSink)
 			return terminate(fmt.Errorf("output sink: %w", failure.Err()))
 
 		case <-ctx.Done():
-			return terminate(ctx.Err())
+			// Keep output through the TERM grace; cut it off at the SIGKILL
+			// escalation, as the guarded path does before its output bound.
+			// Timeout stops never cancelled ctx, so they keep their output.
+			result, err := terminateCutting(ctx.Err(), cancelOutput)
+			// Only a write refused after the cut-off lost output. A false flag
+			// is not proof of complete logs: a reap timeout or an earlier sink
+			// failure can lose output without setting it.
+			result.LogEvidenceIncomplete = result.LogEvidenceIncomplete || outputCutOff.Load()
+			return result, err
 		}
 	}
 }
@@ -349,7 +377,13 @@ func (runner *Runner) timeouts(limits *contract.JobLimits) (time.Duration, time.
 // payload's own. A reap timeout is joined to the stop error so callers retain
 // both the supervision reason and the lack of confirmed quiescence.
 func (runner *Runner) terminate(processGroupID int, wait <-chan waitResult, stopErr error) (contract.ProcessResult, error) {
-	outcome, delivered := runner.terminateAndWait(processGroupID, wait)
+	return runner.terminateCutting(processGroupID, wait, stopErr, nil)
+}
+
+// terminateCutting is terminate with an optional cutOutput, called right
+// before SIGKILL reaches a payload whose Wait has not returned.
+func (runner *Runner) terminateCutting(processGroupID int, wait <-chan waitResult, stopErr error, cutOutput func()) (contract.ProcessResult, error) {
+	outcome, delivered := runner.terminateAndWaitCutting(processGroupID, wait, cutOutput)
 	result := resultFromWait(outcome.err, outcome.state, terminationCause(delivered, contract.TerminationCauseAgent))
 	if errors.Is(outcome.err, ErrProcessReapTimeout) {
 		return result, errors.Join(stopErr, outcome.err)
@@ -384,6 +418,10 @@ func terminationCause(delivered bool, requester contract.TerminationCause) contr
 }
 
 func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResult) (waitResult, bool) {
+	return runner.terminateAndWaitCutting(processGroupID, wait, nil)
+}
+
+func (runner *Runner) terminateAndWaitCutting(processGroupID int, wait <-chan waitResult, cutOutput func()) (waitResult, bool) {
 	completed, delivered := requestTermination(processGroupID, wait)
 	graceTimer := runner.clock.NewTimer(runner.terminationGraceTime)
 	defer stopTimer(graceTimer)
@@ -413,6 +451,11 @@ func (runner *Runner) terminateAndWait(processGroupID int, wait <-chan waitResul
 					_ = runner.killGroup(processGroupID)
 				}
 				return *completed, delivered
+			}
+			// Wait has not returned, so output may still be copying: cut it off
+			// before the kill so a waiting sink write cannot outlast the reap.
+			if cutOutput != nil {
+				cutOutput()
 			}
 			// The unreaped leader still holds the group ID, so it cannot be reused.
 			_ = runner.killGroup(processGroupID)
