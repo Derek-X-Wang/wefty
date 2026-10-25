@@ -198,8 +198,12 @@ func TestExecCleanupFailurePreservesVerdict(t *testing.T) {
 					injected = true
 					var params execParams
 					_ = json.Unmarshal(stack.requests[0].Params, &params)
-					// The wrapper is done. Recreate owned residue, then make its
-					// parent unwritable: real rm fails even after chmod of storage.
+					// The wrapper is done, but its detached delete step may still
+					// need the root to remove its marker. Let it finish first, so
+					// the fault below hits only this CLI's cleanup (#1262).
+					waitExecDeleteSteps(t, root)
+					// Recreate owned residue, then make its parent unwritable:
+					// real rm fails even after chmod of storage.
 					writeExecFile(t, filepath.Join(params.Storage, "residue"), "test")
 					if err := os.Chmod(root, 0500); err != nil {
 						t.Fatal(err)
