@@ -19,6 +19,7 @@ import (
 const seatUsage = `usage: wefty seat request --network internet|none [--dedicated] [--window 1h|8h|24h]
        wefty seat wait SEAT_ID
        wefty seat release SEAT_ID
+       wefty seat view SEAT_ID [--no-open]
        wefty seat window close
 
 Request one Seat, or wait again by its ID after an interrupted call.
@@ -56,6 +57,9 @@ func validateSeatArgs(args []string) error {
 		return usageError(seatUsage)
 	}
 	switch args[0] {
+	case "view":
+		_, err := parseSeatViewFlags(args[1:])
+		return err
 	case "request":
 		_, err := parseSeatRequestFlags(args[1:])
 		return err
@@ -73,6 +77,9 @@ func validateSeatArgs(args []string) error {
 func executeSeatRequest(ctx context.Context, clients *apiClients, jsonOutput bool, args []string, stdout io.Writer) error {
 	if err := validateSeatArgs(args); err != nil {
 		return err
+	}
+	if args[0] == "view" {
+		return executeSeatView(ctx, clients, jsonOutput, args[1:], stdout)
 	}
 	if args[0] == "release" {
 		return executeSeatRelease(ctx, clients, jsonOutput, args[1], stdout)

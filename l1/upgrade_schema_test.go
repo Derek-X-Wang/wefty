@@ -38,6 +38,7 @@ import (
 // boot-relative start stamps and the private admitted Computer fence.
 // #1147 adds screen routes using the existing Seat logs and activity holds;
 // it adds no persisted schema, so this fingerprint remains unchanged.
+// #1149 adds an administrator-only viewer discovery route with no schema change.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {

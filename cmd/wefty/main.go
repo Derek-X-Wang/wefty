@@ -323,6 +323,9 @@ func requiresPersonCommand(args []string) bool {
 	if len(args) == 0 {
 		return false
 	}
+	if len(args) > 1 && args[0] == "seat" && args[1] == "view" {
+		return true
+	}
 	if args[0] == "admin" || args[0] == "admins" {
 		return true
 	}
@@ -467,6 +470,7 @@ Commands:
   cp SRC SEAT_ID:PATH | cp SEAT_ID:PATH DEST
                              Copy files or directories into or out of a Seat
   seat wait SEAT_ID          Wait again by the original request ID
+  seat view SEAT_ID          Open the owner browser viewer (--no-open prints its URL)
   seat window close         Close this node's approval windows early
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
   whoami                    Observe the current Fabric-scoped person identity in L1

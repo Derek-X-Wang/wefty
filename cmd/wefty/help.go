@@ -127,6 +127,7 @@ var positionalCommandUsage = map[string]string{
 	"seat":                            seatUsage,
 	"seat request":                    seatUsage,
 	"seat wait":                       seatUsage,
+	"seat view":                       seatViewUsage,
 	"whoami":                          "usage: wefty whoami",
 	"admin bootstrap":                 "usage: wefty admin bootstrap NONCE",
 	"admin policy get":                "usage: wefty admin policy get",
