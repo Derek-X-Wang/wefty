@@ -1,0 +1,37 @@
+// Generated only in disposable, fingerprint-verified B1 source copies.
+package main
+
+import (
+ "context"
+ "encoding/json"
+ "fmt"
+ "os"
+
+ "github.com/Derek-X-Wang/wefty/internal/connprofile"
+ "github.com/Derek-X-Wang/wefty/internal/launchagent"
+)
+
+var b1Environment = map[string]string@@ENV@@
+const b1LoginPATH = @@PATH@@
+func b1LoginShell(context.Context, string, ...string) ([]byte,error) {
+ return []byte(setupPATHBegin+"\n"+b1LoginPATH+"\n"+setupPATHEnd+"\n"),nil
+}
+func b1Resources(service *launchagent.Agent) {
+ for key,value := range b1Environment { service.Environment[key] = value }
+}
+func init() {
+ if len(os.Args)!=2 || os.Args[1]!="--b1-print-plan" {return}
+ fail:=func(err error) { if err!=nil {fmt.Fprintln(os.Stderr,err);os.Exit(1)} }
+ host,err:=realSetupHost();fail(err)
+ paths,err:=resolveSetupPaths(host.home);fail(err)
+ profile,err:=desiredSetupProfile(host,connprofile.Profile{},"b1-proof-node");fail(err)
+ services,err:=setupServices(paths,profile,map[string]string{},b1LoginPATH);fail(err)
+ var plists [][]byte
+ for _,s:=range services {p,err:=launchagent.Render(s);fail(err);plists=append(plists,p)}
+ fail(json.NewEncoder(os.Stdout).Encode(map[string]any{
+  "services":plists,"source_remote":upgradeRemote,"broker":launchagent.Launchctl,
+  "ports":[]string{profile.L1Address,profile.L3Address},
+  "paths":[]string{paths.bin,paths.config,paths.data,paths.logs,paths.launchAgents,paths.profile,paths.nodeConfig},
+ }))
+ os.Exit(0)
+}

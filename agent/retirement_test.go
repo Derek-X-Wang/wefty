@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/agent/managedroot"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
@@ -80,15 +81,23 @@ func newRetirementFixtureWithStoreClock(t *testing.T, clock l1.Clock, hook func(
 	store, stop := startFailureServerWithPoliciesAndLease(t, network, clock, map[string]l1.NodePolicy{"node": {Tags: []string{"linux"}, MaxOneshotSlots: 3}}, lease)
 	t.Cleanup(stop)
 	zero := 0.0
+	managed := temporaryManagedRoot(t)
 	a, err := New(Config{Fabric: network.NewFabric(fabric.Identity{NodeID: "retirement-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node", BootSessionID: "boot", AgentGenerationID: "generation", OS: "darwin", Version: "test", Capabilities: map[string]bool{"kind:process": true, "upgrade:retirement:v1": true, contract.CapabilityExecCaptureBundle: true},
-		HandoffRoot: t.TempDir(), GuardianExecutable: agentBinaryPath, LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: temporaryManagedRoot(t), MaxOneshotSlots: 3, OneshotLoadLimit: &zero,
+		HandoffRoot: t.TempDir(), GuardianExecutable: agentBinaryPath, LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: managed, MaxOneshotSlots: 3, OneshotLoadLimit: &zero,
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond, RenewalInterval: 100 * time.Millisecond, Logf: t.Logf,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(a.Close)
+	// Match the upgrade-service fixture: keep real process inventory but use
+	// the host-boot seam before agent goroutines start (sandbox-safe on Mac).
+	resource := a.managedResource.(*processManagedResource)
+	resource.root, err = managedroot.Open(managedroot.Config{Root: managed, NodeID: "node", BootSessionID: "boot", HostBootIdentity: rootHostIdentity})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if hook != nil {
 		hook(a, store)
 	}
