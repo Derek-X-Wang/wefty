@@ -170,6 +170,11 @@ func TestAgentCancelProcessEndToEnd(t *testing.T) {
 			if !bytes.Contains(output, []byte("started")) {
 				t.Fatalf("final output lost=%s", output)
 			}
+			// Cancellation must not cut off what the payload's TERM handler
+			// writes while it stops (#1277).
+			if !test.forced && !bytes.Contains(output, []byte("handled\n")) {
+				t.Fatalf("TERM handler output lost=%s", output)
+			}
 			// The node remains available after cancel, and ordinary work still runs.
 			follow := submitE2EJob(t, client, contract.JobSpec{SchemaVersion: 1, DispatchKey: "after-cancel", Kind: "process", Class: "one-shot", RoutingTags: []string{"linux"}, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: agentHelperPath}, Argv: []string{"processhelper", "stdout", "after cancel"}, WorkingDirectory: directory, HandoffDirectory: directory}})
 			waitForE2EJobState(t, client, follow.JobID, contract.JobSucceeded, 10*time.Second)

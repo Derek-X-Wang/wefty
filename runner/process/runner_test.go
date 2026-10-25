@@ -218,6 +218,135 @@ func TestRunKeepsTheInitiatorOfARequestedExit(t *testing.T) {
 	}
 }
 
+// contextSink refuses writes whose context is done, as the agent's spool
+// sink does. The test sinks above ignore their context and cannot show
+// output the runner hands over under a cancelled one.
+type contextSink struct {
+	mu     sync.Mutex
+	events []contract.LogEvent
+}
+
+func (sink *contextSink) WriteOutput(ctx context.Context, event contract.LogEvent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	sink.events = append(sink.events, event)
+	return nil
+}
+
+func (sink *contextSink) Events() []contract.LogEvent {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	return append([]contract.LogEvent(nil), sink.events...)
+}
+
+// Cancellation asks the payload to stop; it does not cut off what the payload
+// still writes. A TERM handler's output, and output still unread in the pipe
+// when cancellation arrives, reach the sink on both paths (#1277).
+func TestCancelledRunKeepsTrailingOutput(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		guarded bool
+	}{
+		{name: "plain"},
+		{name: "guarded", guarded: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			ready, release := filepath.Join(directory, "ready"), filepath.Join(directory, "release")
+			t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+			script := "trap 'printf \"handled\\n\"; exit 0' TERM\nprintf 'before\\n'\n: > \"$1\"\nwhile [ ! -e \"$2\" ]; do sleep 0.05; done\nexit 0\n"
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			go func() {
+				// Cancel only once the TERM handler is installed.
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, err := os.Stat(ready); err == nil {
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				cancel()
+			}()
+			sink := &contextSink{}
+			result, err := New(Config{GuardianExecutable: guardianAgentPath}).Run(ctx, Request{
+				AttemptID: "attempt-trailing-output-" + test.name, Guarded: test.guarded, IdlePolicy: IgnoreIdle,
+				Execution: contract.ExecutionSpec{
+					Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", script, "sh", ready, release},
+					WorkingDirectory: directory,
+				},
+			}, sink)
+			if !errors.Is(err, context.Canceled) || result.ExitCode == nil || *result.ExitCode != 0 || result.LogEvidenceIncomplete {
+				t.Fatalf("cancelled run = (%#v, %v), want TERM-handled exit 0 with complete output", result, err)
+			}
+			if got := string(joinStream(sink.Events(), contract.LogStdout)); got != "before\nhandled\n" {
+				t.Fatalf("stdout = %q, want the pre-cancel line and the TERM handler's line", got)
+			}
+		})
+	}
+}
+
+// Kept trailing output must not unbound a cancelled stop. A sink write still
+// waiting when the TERM grace ends is cut off right before SIGKILL, so Wait
+// returns inside the reap bound instead of reporting a reap timeout, and the
+// lost write is reported as incomplete log evidence.
+func TestCancelledRunCutsOffAStuckSinkAtEscalation(t *testing.T) {
+	directory := t.TempDir()
+	ready, release := filepath.Join(directory, "ready"), filepath.Join(directory, "release")
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+	script := "trap 'printf \"handled\\n\"; exit 0' TERM\n: > \"$1\"\nwhile [ ! -e \"$2\" ]; do sleep 0.05; done\nexit 0\n"
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	// The handler's write arrives under a cancelled stop and waits for its
+	// context: only the escalation cut-off can release it.
+	admitted := make(chan struct{})
+	var admitOnce sync.Once
+	sink := OutputSinkFunc(func(ctx context.Context, event contract.LogEvent) error {
+		admitOnce.Do(func() { close(admitted) })
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	clock := newFakeClock(time.Unix(5_000, 0))
+	const grace, reap = 2 * time.Second, 5 * time.Second
+	finished := make(chan runOutcome, 1)
+	go func() {
+		result, err := New(Config{Clock: clock, TerminationGraceTime: grace, ProcessReapTimeout: reap}).Run(ctx, Request{
+			AttemptID: "attempt-stuck-sink", IdlePolicy: IgnoreIdle,
+			Execution: contract.ExecutionSpec{
+				Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", script, "sh", ready, release},
+				WorkingDirectory: directory,
+			},
+		}, sink)
+		finished <- runOutcome{result: result, err: err}
+	}()
+	waitForCondition(t, func() bool { _, err := os.Stat(ready); return err == nil }, "TERM handler installed")
+	cancel()
+	select {
+	case <-admitted:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the TERM handler's write never reached the sink")
+	}
+	// The grace timer is the only runner timer; escalate only once it exists.
+	clock.WaitForTimerCount(t, 1)
+	escalated := time.Now()
+	clock.Advance(grace)
+	var outcome runOutcome
+	select {
+	case outcome = <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatal("cancelled run did not return after escalation")
+	}
+	if elapsed := time.Since(escalated); elapsed >= reap {
+		t.Fatalf("Run returned %s after escalation, want inside the %s reap bound", elapsed, reap)
+	}
+	if !errors.Is(outcome.err, context.Canceled) || errors.Is(outcome.err, ErrProcessReapTimeout) || outcome.result.SpawnError != nil || !outcome.result.LogEvidenceIncomplete {
+		t.Fatalf("stuck-sink cancel = (%#v, %v), want a reaped payload with incomplete log evidence and no reap timeout", outcome.result, outcome.err)
+	}
+}
+
 // A stop names an initiator only when it reached a payload that was still
 // running. A payload Wait had already reaped exited on its own, even while a
 // child keeps its group alive and the stop still lands on the group; a group
