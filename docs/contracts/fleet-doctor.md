@@ -87,9 +87,11 @@ public contract describes only required private-network access:
 
 - Clients and node agents may reach L1 and L3.
 - L1 and L3 may reach each other.
-- The owner's own untagged identity may reach L1 for person commands. Only
-  that identity may reach Computer front doors and published ports on node agents.
-- Machine participants cannot reach other machines' published ports.
+- The owner's own untagged identity may reach L1 for person commands,
+  Computer front doors and published application ports on node agents.
+- Client participants may reach the fixed Seat front door on node port 80.
+  Other machines' published application ports remain forbidden to machine
+  participants.
 - Agent-tag ownership must remain restricted to trusted administrative roles.
 
 The owner must review the complete policy before applying the snippet. An
@@ -106,7 +108,10 @@ control-plane machine's network app, or any machine where AI agents run as you,
 into the Owner account. L1 binds each administrator to one enrolled person
 device; nonadministrator grants remain person based.
 
-The snippet allows only TCP port 80 for control traffic. It stores no keys or
+The snippet allows TCP port 80 for control traffic and the node Seat front
+door. Port 80 is reserved on node agents on every Fabric; submit and node
+validation refuse applications that request it. Other published service ports
+remain owner-only. It stores no keys or
 admin credentials and changes no network settings.
 
 Each policy evidence entry carries `check`, `status` and `detail`. A successful

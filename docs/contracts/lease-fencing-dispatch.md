@@ -1154,7 +1154,10 @@ agent that cannot execute one reports `unsupported_class`. The known values are
 A service declares `restart: always`, `restart: on-failure`, or `restart: never` (omission is
 normalized to `always` before hashing), may declare a positive
 `max_restart_streak`, and may carry a `published_port` in the inclusive range
-1–65535. A missing or null port means the service is portless. A Computer is a
+1–65535 except 80, which is reserved for the node Seat front door on every
+Fabric. `published_port: 80` is refused with `invalid_request` and the message
+`published port 80 is reserved for wefty's Seat front door; choose another port`.
+A missing or null port means the service is portless. A Computer is a
 digest-pinned OCI service Job that must explicitly declare `restart: always`,
 with `display.protocol=rfb-websocket-v1`, positive
 `disk_bytes`, and positive explicit OCI `memory_bytes`; it forbids the

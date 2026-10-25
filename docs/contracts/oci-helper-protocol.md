@@ -2787,3 +2787,39 @@ stream, so wrong-root observation or dial fails even if name checks agree.
 It also tries other-Seat endpoints/display and a neighbour's live abstract
 display. It runs only as root in `computer-seats.yml`, in
 `default-computer-seats / linux/amd64` and `/ linux/arm64`.
+
+### `CopyComputerSeat`
+
+An additive data-stream operation, subject to the same per-Seat, per-Attempt
+and global admission budgets as `ExecComputerSeat`. The request carries exact
+`authority`, `generation`, `place`, `direction` (`in` or `out`) and `path`.
+The helper derives UID/GID, working folder and environment through the Seat
+command path. It uses that path's readiness checks and post-start authority
+check. Refusals retain `seat_operation_refused` with detail `seat_not_ready`
+or `generation_mismatch`; capacity refusals retain `connection_limit` and
+its command-budget detail. Copy errors do not invalidate the helper session.
+
+After an initial success frame, the client sends bounded input frames with
+`data` (at most 32768 bytes), ending in `{"end":true}`. Copy-out sends only
+the end frame. Responses carry `SeatCopyEvent`: `data` is at most 4096 bytes;
+a final `size_bytes` gives file-content size, followed by the normal empty
+success frame. A diagnostic error or EOF before terminal evidence fails the
+copy. Streams have no total byte limit and cancellation closes only this
+operation. Sixty seconds without input or output stream progress cancels the
+copy with a diagnostic failure (`Seat copy stalled`), followed by the command
+path's bounded process cleanup. Progress refreshes this bound; it imposes no
+total runtime limit. Copies never inherit a root stdin or root environment.
+
+The unprivileged Python copy program accepts single files and directories.
+It stages input beside the exact destination, fsyncs regular files and renames
+only at completion. It rejects incoming links and special files. The helper
+appends `WEFTY_COPY_COMMIT_V1` only after clean input EOF; the program requires
+that marker before publishing, because containerd otherwise turns a failed
+stdin copy into indistinguishable EOF. After the final input bytes have been
+written to the FIFO, the helper explicitly closes runtime stdin with
+`CloseIO(WithStdinCloser)`: the shim retains its own writer, so closing the
+client FIFO writer alone cannot deliver EOF. This close also happens on a
+failed input, without a commit marker. Failed input removes staging and
+preserves an old destination. Diagnostics preserve disk-full/read/write
+failure text; the CLI surfaces `seat_copy_failed` or local
+`seat_copy_write_denied`. No copy operation enters the Custody export path.

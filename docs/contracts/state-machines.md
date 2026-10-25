@@ -815,6 +815,12 @@ Computer outcome is `removed_reduced`; after coordinated positive removal of
 every managed branch, retained Computer outcomes may advance to
 `removed_verified` only when no Custody export taints the provenance graph.
 
+Copying selected files with `wefty cp` is not a Custody export. It creates no
+Storage provenance or custody taint and does not change a Computer's removal
+proof or removal outcome. This rule applies to directories copied through a
+Seat as well as single files. Whole-Storage exports with `custody.json` keep
+the following contract.
+
 A Custody export first CAS-records immutable source Backup, Storage, Node,
 managed-root, path, and fence evidence and moves the Computer through
 `exporting`. The event is permanent, and every outcome taints the branch

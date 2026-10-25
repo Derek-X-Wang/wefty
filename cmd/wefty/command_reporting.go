@@ -189,6 +189,8 @@ func classifyCommandReport(err error) commandReport {
 	}
 
 	switch apiError.Code {
+	case seatErrorCopyFailed, seatErrorCopyWriteDenied:
+		report.exitCode = exitFailure
 	case contract.ErrorRevocationWaitTimeout:
 		report.exitCode = exitMutationWaitTimeout
 	case contract.ErrorUnavailable, contract.ErrorFabricUnreachable, contract.ErrorClientServiceBusy:

@@ -14,7 +14,7 @@ func PrivateNetworkPolicy() fabric.PrivateNetworkPolicy {
 			"Review the complete private network policy before applying this snippet. Existing overlapping allow rules, including a default allow-all rule, can defeat published-port isolation; this snippet cannot revoke another allow rule.",
 			"The owner selector means the network's Owner role on untagged devices. Tagged machine participants do not acquire that identity. Owners, Admins and Network admins implicitly own all tags; tagOwners alone does not limit tagging to admins. Keep all of these privileged roles restricted to trusted administrators.",
 			"Keep the Owner person identity on the owner's laptop. Do not sign the control-plane machine's network app, or any machine where AI agents run as you, into the Owner account.",
-			"The snippet permits only TCP port 80 for control traffic. Computer front doors and published ports on node agents are reachable only by the owner's untagged identity. Attended peer tests must confirm both allowed and refused connections.",
+			"The snippet permits TCP port 80 for control traffic and the shared Seat front door. Client participants may reach only that fixed node port, whose handlers require a Seat credential. Other Computer front doors and published application ports remain reachable only by the owner's untagged identity. Attended peer tests must confirm both allowed and refused connections.",
 			"Doctor prints guidance and observed evidence; it never reads or stores an admin credential and never changes the network policy.",
 		},
 		Snippet: `{
@@ -25,6 +25,7 @@ func PrivateNetworkPolicy() fabric.PrivateNetworkPolicy {
   },
   "acls": [
     {"action": "accept", "proto": "tcp", "src": ["tag:wefty-client", "tag:wefty-agent"], "dst": ["tag:wefty-control:80", "tag:wefty-client:80"]},
+    {"action": "accept", "proto": "tcp", "src": ["tag:wefty-client"], "dst": ["tag:wefty-agent:80"]},
     {"action": "accept", "proto": "tcp", "src": ["tag:wefty-control"], "dst": ["tag:wefty-client:80"]},
     {"action": "accept", "proto": "tcp", "src": ["autogroup:owner"], "dst": ["tag:wefty-control:80", "tag:wefty-agent:*"]}
   ]

@@ -82,7 +82,7 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 				continue
 			}
 			suffix := ""
-			if event.Reason != "" {
+			if event.Reason != "" && event.NodeOutcome == "" {
 				suffix = ": " + event.Reason
 			}
 			if event.Note != "" {
@@ -94,10 +94,27 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 			if event.ExitCode != nil {
 				suffix += fmt.Sprintf(" exit %d", *event.ExitCode)
 			}
+			if event.CopyID != "" {
+				suffix += " copy " + event.CopyID
+			}
+			if event.Outcome != "" && event.NodeOutcome == "" {
+				suffix += " " + event.Outcome
+			}
 			if event.Path != "" {
 				suffix += " " + event.Path
 			}
-			if event.SizeBytes != nil {
+			if event.NodeOutcome != "" {
+				suffix += " " + event.NodeOutcome
+				if event.SizeBytes != nil {
+					suffix += fmt.Sprintf(" %d B", *event.SizeBytes)
+				}
+				if event.Outcome != "" && event.Outcome != event.NodeOutcome {
+					suffix += "; local publish " + event.Outcome
+				}
+				if event.Reason != "" {
+					suffix += ": " + event.Reason
+				}
+			} else if event.SizeBytes != nil {
 				suffix += fmt.Sprintf(" (%d bytes)", *event.SizeBytes)
 			}
 			if event.Audit != nil && event.Audit.Reason != "" {

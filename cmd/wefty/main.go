@@ -92,6 +92,8 @@ const (
 	seatErrorNodeUnavailable  contract.ErrorCode = "seat_node_unavailable"
 	seatErrorWindowNotAllowed contract.ErrorCode = "seat_window_not_allowed"
 	seatErrorEnded            contract.ErrorCode = "seat_ended"
+	seatErrorCopyFailed       contract.ErrorCode = "seat_copy_failed"
+	seatErrorCopyWriteDenied  contract.ErrorCode = "seat_copy_write_denied"
 )
 
 func commandExitCode(err error) int {
@@ -460,6 +462,8 @@ Commands:
                              Fleet removal is not supported yet
   seat request --network internet|none [--dedicated] [--window 1h|8h|24h]
                              Request one approved Computer Seat
+  cp SRC SEAT_ID:PATH | cp SEAT_ID:PATH DEST
+                             Copy files or directories into or out of a Seat
   seat wait SEAT_ID          Wait again by the original request ID
   seat window close         Close this node's approval windows early
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot

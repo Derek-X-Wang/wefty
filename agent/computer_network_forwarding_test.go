@@ -56,7 +56,8 @@ func TestComputerNoneClaimKeepsSubmissionBridgeClosed(t *testing.T) {
 	}}
 	bridges := 0
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
-		nodeID: "network-node", bootSessionID: "network-boot", clock: systemClock{}, managedResource: managed,
+		seatDoor: newSeatFrontDoor(nil),
+		nodeID:   "network-node", bootSessionID: "network-boot", clock: systemClock{}, managedResource: managed,
 		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, computerTokens: minter,
 		workflowBridge: func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error) {
 			bridges++

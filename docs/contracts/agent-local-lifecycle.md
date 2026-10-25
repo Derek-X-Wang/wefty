@@ -1205,7 +1205,11 @@ when to upload cannot turn a healthy payload result into `output_error`. If the
 append itself instead returns the caller's expired finalization cause, the
 preceding incomplete-evidence rule applies rather than reclassifying the payload;
 the process-lifetime outbox retries the retained redacted event and orders its
-late-evidence upload before completion.
+late-evidence upload before completion. Seat front-door and claim-session
+cancellation use a child scope; they do not cancel this outbox or retained
+result collection. Those keep the caller's process-lifetime context until it
+is canceled or `Agent.Close` cancels and joins them. Returning from `Run` on
+a session authority error therefore does not strand withheld completions.
 
 `one_shot` and `services` report independent occupied/limit pairs. They are
 local admission counts, not slot identities and not L1 state.

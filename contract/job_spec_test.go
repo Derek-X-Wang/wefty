@@ -199,3 +199,13 @@ func TestProcessOneShotMayOmitHandoffDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPublishedPort80ReservedForSeatFrontDoor(t *testing.T) {
+	spec := validProcessJobSpecForValidation()
+	spec.Class = JobClassService
+	port := 80
+	spec.PublishedPort = &port
+	if err := ValidateJobSpec(&spec); err == nil || !strings.Contains(err.Error(), "reserved for wefty's Seat front door") {
+		t.Fatalf("reserved port accepted: %v", err)
+	}
+}

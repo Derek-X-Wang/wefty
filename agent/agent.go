@@ -147,6 +147,7 @@ type Config struct {
 
 // Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
+	seatDoor      *seatFrontDoor
 	seatApprovals *SeatApprovalController
 	seatRoom      *l1.ComputerRoomConfig
 	fabric        fabric.Fabric
@@ -666,11 +667,34 @@ func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
 func (a *Agent) Run(ctx context.Context) error {
-	seatCtx, seatCancel := context.WithCancel(ctx)
+	// Session and door shutdown must not cancel process-lifetime replay or
+	// result collection. Those retain the caller context and are joined by Close.
+	runContext, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	var doorDone <-chan struct{}
+	a.seatDoor = nil
+	if a.fabric != nil {
+		door, closeDoor, err := startSeatFrontDoor(runContext, a.fabric, a.registration.NodeID)
+		if err != nil {
+			a.log("Seat front door unavailable; Seat-request Computers cannot become ready: %v", err)
+		} else {
+			a.seatDoor = door
+			doorDone = door.done
+			defer closeDoor()
+			go func() {
+				select {
+				case <-doorDone:
+					cancelRun()
+				case <-runContext.Done():
+				}
+			}()
+		}
+	}
+	seatCtx, seatCancel := context.WithCancel(runContext)
 	seatDone := make(chan struct{})
 	go func() { defer close(seatDone); a.runSeatRequests(seatCtx) }()
 	defer func() { seatCancel(); <-seatDone }()
-	a.startHostTokenRevocation(ctx)
+	a.startHostTokenRevocation(runContext)
 	defer a.stopHostTokenRevocation()
 	if a.handoffs != nil {
 		// One clock: the ticker above and the retention timestamps below have
@@ -728,9 +752,15 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.log("recover durable evidence: %v", err)
 		})
 	}
-	return a.session.run(ctx, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
+	runErr := a.session.run(runContext, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 		return a.executeClaim(attemptContext, claim, claimStarted)
 	})
+	select {
+	case <-doorDone:
+		return errors.Join(runErr, a.seatDoor.serveErr)
+	default:
+		return runErr
+	}
 }
 
 func (a *Agent) startHostTokenRevocation(parent context.Context) {
@@ -807,7 +837,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		nodeID:           a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
 		workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
-		fabric: a.fabric, computerPolicy: computerPolicy,
+		fabric: a.fabric, computerPolicy: computerPolicy, seatDoor: a.seatDoor,
 		prepareServiceEndpoint:  prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:    a.prepareAuthorityLoss,
 		allowsStart:             allowsStart,
@@ -932,6 +962,9 @@ func (a *Agent) reservePublishedPort(claim l1.Claim) (net.Listener, *contract.Sp
 	port := claim.Job.Spec.PublishedPort
 	if claim.Job.Spec.Class != contract.JobClassService || port == nil {
 		return nil, nil
+	}
+	if *port == contract.SeatFrontDoorPort {
+		return nil, &contract.SpawnFailure{Code: contract.SpawnFailureProcessRequest, Message: contract.SeatFrontDoorPortReserved}
 	}
 	if a.fabric == nil {
 		return nil, &contract.SpawnFailure{
