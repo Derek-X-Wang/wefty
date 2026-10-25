@@ -15,9 +15,16 @@ func (e *ContainerdEngine) CopyComputerSeat(ctx context.Context, r CopyComputerS
 	if err := r.validate(); err != nil {
 		return 0, err
 	}
+	clock := e.config.Clock
+	if clock == nil {
+		clock = systemClock{}
+	}
+	ctx, progress, stop := watchSeatCopy(ctx, clock)
+	defer stop()
 	var diagnostic bytes.Buffer
 	var exited bool
 	receive := func(event SeatCommandEvent) error {
+		progress()
 		if event.Exit != nil {
 			if event.Exit.Code == nil || *event.Exit.Code != 0 {
 				message := strings.TrimSpace(diagnostic.String())
@@ -46,10 +53,10 @@ func (e *ContainerdEngine) CopyComputerSeat(ctx context.Context, r CopyComputerS
 		if input == nil {
 			return 0, errors.New("copy-in input missing")
 		}
-		inputs = []io.Reader{io.MultiReader(input, strings.NewReader("\nWEFTY_COPY_COMMIT_V1\n"))}
+		inputs = []io.Reader{seatCopyReader{io.MultiReader(input, strings.NewReader("\nWEFTY_COPY_COMMIT_V1\n")), progress}}
 	}
 	if err := e.execComputerSeat(ctx, r.command(), receive, confirmSeatCommandReady, inputs...); err != nil {
-		return 0, err
+		return 0, errors.Join(err, context.Cause(ctx))
 	}
 	var result struct {
 		SizeBytes *int64 `json:"size_bytes"`

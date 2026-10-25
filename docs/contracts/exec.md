@@ -478,6 +478,9 @@ the existing destination. SIGTERM exits Python through cleanup.
 
 The CLI performs local writes itself, within its own sandbox; no helper writes
 to the Mac on its behalf. File contents stream without a total byte limit.
+A copy with no input or output stream progress for 60 seconds fails with
+`seat_copy_failed` and a `Seat copy stalled` diagnostic; progress refreshes
+that bound, so a progressing copy has no total runtime limit.
 Disk-full and transport failures return `seat_copy_failed`; local permission,
 read-only filesystem and final-name symlink refusals return
 `seat_copy_write_denied`. Both use exit 1. An existing-folder failure says

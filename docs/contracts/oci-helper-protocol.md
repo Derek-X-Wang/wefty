@@ -2805,14 +2805,21 @@ the end frame. Responses carry `SeatCopyEvent`: `data` is at most 4096 bytes;
 a final `size_bytes` gives file-content size, followed by the normal empty
 success frame. A diagnostic error or EOF before terminal evidence fails the
 copy. Streams have no total byte limit and cancellation closes only this
-operation. Copies never inherit a root stdin or root environment.
+operation. Sixty seconds without input or output stream progress cancels the
+copy with a diagnostic failure (`Seat copy stalled`), followed by the command
+path's bounded process cleanup. Progress refreshes this bound; it imposes no
+total runtime limit. Copies never inherit a root stdin or root environment.
 
 The unprivileged Python copy program accepts single files and directories.
 It stages input beside the exact destination, fsyncs regular files and renames
 only at completion. It rejects incoming links and special files. The helper
 appends `WEFTY_COPY_COMMIT_V1` only after clean input EOF; the program requires
 that marker before publishing, because containerd otherwise turns a failed
-stdin copy into indistinguishable EOF. Failed input removes staging and
+stdin copy into indistinguishable EOF. After the final input bytes have been
+written to the FIFO, the helper explicitly closes runtime stdin with
+`CloseIO(WithStdinCloser)`: the shim retains its own writer, so closing the
+client FIFO writer alone cannot deliver EOF. This close also happens on a
+failed input, without a commit marker. Failed input removes staging and
 preserves an old destination. Diagnostics preserve disk-full/read/write
 failure text; the CLI surfaces `seat_copy_failed` or local
 `seat_copy_write_denied`. No copy operation enters the Custody export path.

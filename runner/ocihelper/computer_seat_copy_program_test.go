@@ -6,6 +6,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/internal/seatcopy"
 )
@@ -157,5 +159,58 @@ func TestSeatCopyProgramParentLinkCancellationAndDeepPack(t *testing.T) {
 	pack.Stdout = io.Discard
 	if err := pack.Run(); err != nil {
 		t.Fatalf("deep pack failed: %v", err)
+	}
+}
+
+// The shim retains a stdin writer after cio finishes copying. Model that
+// handle with a pipe which only the explicit CloseIO callback can close.
+func TestSeatCopyProgramClosesRetainedStdin(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	source := filepath.Join(base, ".env")
+	if err := os.WriteFile(source, []byte("ignored secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	child := exec.CommandContext(ctx, python, "-I", "-S", "-c", seatCopyProgram, "in", filepath.Join(base, "result"))
+	child.WaitDelay = time.Second
+	retained, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retained.Close()
+	var output bytes.Buffer
+	child.Stdout = &output
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	input, writer := io.Pipe()
+	defer input.Close()
+	packed := make(chan error, 1)
+	go func() { _, err := seatcopy.Pack(writer, source); writer.CloseWithError(err); packed <- err }()
+	copied := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(retained, &seatCommandInput{
+			reader:     io.MultiReader(input, strings.NewReader("\nWEFTY_COPY_COMMIT_V1\n")),
+			closeStdin: retained.Close,
+		})
+		copied <- err
+	}()
+	if err := child.Wait(); err != nil {
+		t.Fatalf("copy with retained runtime stdin: %v; context=%v; output=%s", err, ctx.Err(), output.String())
+	}
+	if err := <-copied; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-packed; err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(base, "result"))
+	if err != nil || string(got) != "ignored secret" {
+		t.Fatalf("copy=%q err=%v", got, err)
 	}
 }

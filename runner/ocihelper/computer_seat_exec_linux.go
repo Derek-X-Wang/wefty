@@ -138,8 +138,24 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 	// capabilities, environment or working directory can enter this process.
 	wrapper := seatCommandWrapper
 	var stdin io.Reader
+	started := make(chan struct{})
+	var inputProcess containerd.Process
 	if len(input) > 0 {
-		stdin = input[0]
+		stdin = &seatCommandInput{reader: input[0], closeStdin: func() error {
+			select {
+			case <-started:
+			case <-operationCtx.Done():
+				return operationCtx.Err()
+			}
+			closeCtx, stop := context.WithTimeout(operationCtx, 5*time.Second)
+			defer stop()
+			// The shim retains a FIFO writer until CloseIO, independently of cio.
+			if err := inputProcess.CloseIO(closeCtx, containerd.WithStdinCloser); err != nil {
+				cancel()
+				return fmt.Errorf("close Seat copy stdin: %w", err)
+			}
+			return nil
+		}}
 		wrapper, err = seatCommandWithInput(wrapper)
 		if err != nil {
 			return nil, nil, err
@@ -204,6 +220,8 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 		return nil, nil, err
 	}
 	authorized, ok = true, true
+	inputProcess = process
+	close(started)
 	close(gate)
 	return process, wait, nil
 }
