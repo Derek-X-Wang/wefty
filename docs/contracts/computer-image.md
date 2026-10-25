@@ -647,7 +647,28 @@ per role on first connection. Each remains warm with `-forever -shared`;
 `view` also uses `-viewonly`. Each backend relays concurrent clients through
 a private x11vnc Unix socket in the external socket's existing private
 directory. Both sockets use mode 0600. External paths and roles stay unchanged.
-`-rfbport 0 -no6 -norc` disables TCP listeners and local configuration overrides.
+The pinned Debian x11vnc 0.9.16-9 provides `-unixsock PATH`, not
+`-unixsockonly`. Unix-only operation requires **both** LibVNCServer listener
+ports disabled: `-rfbport 0 -rfbportv6 0`. Its separate IPv6 port defaults to
+5900; x11vnc's `-no6` disables only its own additional IPv6 listener, leaving
+that library listener enabled. The backend also supplies `-no6 -noipv6
+-noipv4 -nolookup -norc` and binds any fallback IP listener to loopback with
+`-listen 127.0.0.1 -listenv6 ::1`. It omits `-localhost`, whose IP allow-list
+would reject the AF_UNIX peer's hostname; the private Unix socket retains
+its existing filesystem access controls. Loopback binding is an extra guard,
+never permission to open a TCP listener.
+
+Before returning each backend connection, and again at its first byte, the
+Linux relay matches the child PID's `/proc/<pid>/fd` socket inodes against
+`/proc/<pid>/net/tcp` and `tcp6`. It refuses the relay, logs the reason through
+the bounded diagnostic sink, and kills/reaps the child if any inode is a TCP
+listener or inspection fails. A missing `tcp6` table is allowed only as the
+kernel's absent-IPv6 case; the child must still be live and `tcp` readable.
+The greeting check is required because x11vnc binds its Unix socket before
+initializing the library's IP listeners. No bytes flow in either direction
+until that check succeeds. These checks guard connection admission; they are
+not continuous process monitoring. The strict lane checks below also catch
+listeners introduced later.
 
 After first use, a supervisor replaces an exited x11vnc without waiting for a
 new client. Repeated exits and spawn `OSError`s back off from 0.1 seconds,

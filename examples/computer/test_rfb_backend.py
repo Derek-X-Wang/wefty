@@ -116,6 +116,40 @@ class RestartBackoffTest(unittest.TestCase):
             backend.stopping.set()
 
 
+class TCPListenerGuardTest(unittest.TestCase):
+    def test_guard_matches_child_socket_inodes_and_fails_closed(self):
+        for name, table, inode, state, refused in (
+            ('IPv4 listener', 'tcp', '42', '0A', True),
+            ('IPv6 listener', 'tcp6', '42', '0A', True),
+            ('another process same uid', 'tcp6', '99', '0A', False),
+            ('connected socket', 'tcp', '42', '01', False),
+            ('malformed table', 'tcp', None, None, True),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory(dir='/tmp') as root:
+                proc = Path(root) / '4321'
+                (proc/'fd').mkdir(parents=True)
+                (proc/'net').mkdir()
+                (proc/'fd/3').symlink_to('socket:[42]')
+                header = 'sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n'
+                for entry in ('tcp', 'tcp6'): (proc/'net'/entry).write_text(header)
+                address = '00000000' if table == 'tcp' else '0'*32
+                row = f'0: {address}:170C {address}:0000 {state} 00000000:00000000 00:00000000 00000000 2001 0 {inode}\n'
+                (proc/'net'/table).write_text(header+(row if inode is not None else 'bad row\n'))
+                process = mock.Mock(pid=4321)
+                process.poll.return_value = None
+                if refused:
+                    with self.assertRaises(OSError): BACKEND.check_no_tcp_listeners(process, proc_root=root)
+                else:
+                    BACKEND.check_no_tcp_listeners(process, proc_root=root)
+                # No IPv6 kernel table is valid; unreadable/missing PID evidence
+                # must still fail closed, never silently disable the guard.
+                (proc/'net/tcp6').unlink()
+                (proc/'net/tcp').write_text(header)
+                BACKEND.check_no_tcp_listeners(process, proc_root=root)
+                (proc/'net/tcp').unlink()
+                with self.assertRaises(OSError): BACKEND.check_no_tcp_listeners(process, proc_root=root)
+
+
 class WarmBackendTest(unittest.TestCase):
     def setUp(self):
         display = mock.patch.dict(os.environ, {'DISPLAY': ':1'})
@@ -134,6 +168,45 @@ class WarmBackendTest(unittest.TestCase):
                 return size
         self.stream = LiveLog()
         self.sink = BACKEND.DiagnosticsSink(self.stream)
+
+    def test_command_uses_unix_only_mode_with_both_ip_ports_disabled(self):
+        for view_only in (False, True):
+            with self.subTest(view_only=view_only):
+                backend = self.role(view_only)
+                self.client(backend)
+                command = self.commands[-1]
+                # 0.9.16 has -unixsock, not -unixsockonly. LibVNCServer's
+                # IPv6 port is separate from x11vnc's -6 / -no6 listener.
+                self.assertEqual(command[command.index('-unixsock')+1], backend.path)
+                self.assertEqual(command[command.index('-rfbport')+1], '0')
+                self.assertEqual(command[command.index('-rfbportv6')+1], '0')
+                for flag in ('-nolookup', '-no6', '-noipv6', '-noipv4', '-norc'):
+                    self.assertIn(flag, command)
+                self.assertEqual(command[command.index('-listen')+1], '127.0.0.1')
+                self.assertEqual(command[command.index('-listenv6')+1], '::1')
+                self.assertNotIn('-localhost', command)  # Its IP ACL rejects AF_UNIX peers.
+                self.assertNotIn('-6', command)
+                self.assertNotIn('-inetd', command)
+                backend.close()
+
+    def test_listener_refusal_closes_relay_before_any_bytes_and_logs_reason(self):
+        for successful_checks in (0, 1):
+            with self.subTest(successful_checks=successful_checks):
+                checker = mock.Mock(side_effect=[None]*successful_checks + [OSError('x11vnc owns TCP6 listener on port 5900')])
+                backend = self.role(tcp_check=checker)
+                client, relay = socket.socketpair()
+                client.settimeout(5)
+                with client:
+                    worker = threading.Thread(target=BACKEND.relay_connection, args=(relay,backend), daemon=True)
+                    worker.start()
+                    self.assertEqual(client.recv(64), b'', 'unsafe backend sent screen bytes')
+                    worker.join(timeout=5)
+                    self.assertFalse(worker.is_alive())
+                backend.close()
+                self.sink.wait_idle()
+                self.assertEqual(checker.call_count, successful_checks+1)
+                self.assertIsNotNone(self.processes[-1].poll(), 'unsafe child was not stopped')
+                self.assertIn(b'x11vnc owns TCP6 listener on port 5900', self.stream.getvalue())
 
     def test_opt_in_timing_records_accept_to_first_byte_without_payload(self):
         backend = self.role()
@@ -154,9 +227,9 @@ class WarmBackendTest(unittest.TestCase):
         self.started.put(process)
         return process
 
-    def role(self, view_only=False):
+    def role(self, view_only=False, tcp_check=lambda process: None):
         path = str(Path(self.root.name) / ('view.sock' if view_only else 'control.sock'))
-        backend = BACKEND.RoleBackend(path, view_only, self.sink, popen=self.launch)
+        backend = BACKEND.RoleBackend(path, view_only, self.sink, popen=self.launch, tcp_check=tcp_check)
         self.addCleanup(backend.close)
         return backend
 

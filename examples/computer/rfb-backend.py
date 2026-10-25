@@ -126,6 +126,58 @@ class RoleDiagnostics:
             self.sink.emit(line)
 
 
+def check_no_tcp_listeners(process, proc_root='/proc'):
+    """Match this child's socket inodes, not every socket sharing its uid.
+
+    Pin its proc directory across fd and network reads. Failure to inspect a
+    live child is a refusal. tcp6 may be absent when IPv6 is disabled in Linux.
+    """
+    if process.poll() is not None:
+        raise OSError('x11vnc exited during TCP listener verification')
+    proc = os.open(os.path.join(proc_root, str(process.pid)), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fd_dir = os.open('fd', os.O_RDONLY | os.O_DIRECTORY, dir_fd=proc)
+        try:
+            sockets = set()
+            for entry in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(entry, dir_fd=fd_dir)
+                except FileNotFoundError:
+                    continue  # A descriptor closed during enumeration.
+                if target.startswith('socket:['):
+                    sockets.add(target)
+        finally:
+            os.close(fd_dir)
+        for name in ('tcp', 'tcp6'):
+            try:
+                table_fd = os.open('net/'+name, os.O_RDONLY, dir_fd=proc)
+            except FileNotFoundError:
+                if name == 'tcp6':
+                    continue
+                raise
+            with os.fdopen(table_fd) as table:
+                payload = table.read(1048577)
+            rows = payload.splitlines()
+            if len(payload) > 1048576 or not rows or 'local_address' not in rows[0]:
+                raise OSError('cannot verify x11vnc: invalid '+name+' table')
+            for row in rows[1:]:
+                fields = row.split()
+                if not fields:
+                    continue
+                if len(fields) < 10:
+                    raise OSError('cannot verify x11vnc: invalid '+name+' row')
+                if fields[3] == '0A' and 'socket:['+fields[9]+']' in sockets:
+                    try:
+                        port = int(fields[1].rsplit(':', 1)[1], 16)
+                    except (ValueError, IndexError):
+                        raise OSError('cannot verify x11vnc: invalid '+name+' address') from None
+                    raise OSError(f'x11vnc owns {name.upper()} listener on port {port}')
+    finally:
+        os.close(proc)
+    if process.poll() is not None:
+        raise OSError('x11vnc exited during TCP listener verification')
+
+
 class RoleBackend:
     """Start on first use, then keep one supervised process warm for this role.
 
@@ -133,9 +185,10 @@ class RoleBackend:
     to x11vnc's shared listener; disconnecting one never terminates the child.
     """
 
-    def __init__(self, path, view_only, sink, popen=subprocess.Popen, clock=time.monotonic):
+    def __init__(self, path, view_only, sink, popen=subprocess.Popen, clock=time.monotonic, tcp_check=check_no_tcp_listeners):
         self.path = os.path.join(os.path.dirname(path), '.' + os.path.basename(path) + '.x11vnc')
         self.view_only, self.popen, self.clock = view_only, popen, clock
+        self.tcp_check = tcp_check
         self.sink = RoleDiagnostics(sink, clock)
         self.started_at = clock()
         self.role = 'view' if view_only else 'control'
@@ -154,7 +207,14 @@ class RoleBackend:
             pass
         command = [
             'x11vnc-' + self.role, '-unixsock', self.path,
-            '-rfbport', '0', '-no6', '-norc', '-forever', '-shared',
+            # LibVNCServer has a separate IPv6 port (default 5900):
+            # x11vnc's -no6 only controls its additional IPv6 listener.
+            '-rfbport', '0', '-rfbportv6', '0',
+            '-no6', '-noipv6', '-noipv4', '-nolookup',
+            # Bind-only guards preserve Unix peers; -localhost also installs
+            # an IP allow-list that rejects the AF_UNIX peer's hostname.
+            '-listen', '127.0.0.1', '-listenv6', '::1',
+            '-norc', '-forever', '-shared',
             '-display', os.environ.get('DISPLAY') or ':' + os.environ["WEFTY_COMPUTER_VIEW_PORT"],
             '-nopw', '-quiet',
         ]
@@ -212,6 +272,7 @@ class RoleBackend:
                 connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
                     connection.connect(self.path)
+                    self._verify_transport(self.process)
                     os.chmod(self.path, 0o600)
                     return connection
                 except OSError as error:
@@ -222,6 +283,27 @@ class RoleBackend:
                     raise TimeoutError('x11vnc Unix listener did not become ready')
                 time.sleep(0.01)
             raise OSError('x11vnc exited before its Unix listener became ready')
+
+    def _verify_transport(self, process):
+        try:
+            self.tcp_check(process)
+        except OSError as error:
+            self.sink.emit(f'wefty-rfb-backend[{self.role} x11vnc {process.pid}]: screen relay refused: {str(error)[:256]}\n'.encode())
+            # Do not leave an unsafe listener running while refusing its relay.
+            # The existing supervisor owns subsequent restart/backoff attempts.
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            raise
+
+    def verify_transport(self):
+        with self.lock:
+            if self.process is None:
+                raise OSError('screen backend restart is pending')
+            self._verify_transport(self.process)
 
     def timing(self, started_ns, phase):
         # Test-only opt-in: the lane creates this file in the private Seat run
@@ -263,8 +345,11 @@ def relay_connection(connection, backend, started_ns=None):
     started_ns = started_ns or (time.monotonic_ns(), time.time_ns())
     upstream = None
     sender = None
+    admission = threading.Event()
+    admitted = False
 
     def pump(source, destination):
+        nonlocal admitted
         first_byte = True
         try:
             while True:
@@ -272,8 +357,17 @@ def relay_connection(connection, backend, started_ns=None):
                 if not data:
                     break
                 if first_byte and source is upstream:
+                    # x11vnc binds its Unix socket before initializing TCP.
+                    # Recheck at its greeting, before forwarding either direction.
+                    backend.verify_transport()
+                    admitted = True
+                    admission.set()
                     backend.timing(started_ns, "backend_first_byte")
                     first_byte = False
+                if source is connection:
+                    admission.wait()
+                    if not admitted:
+                        return
                 destination.sendall(data)
         except OSError:
             pass
@@ -292,6 +386,7 @@ def relay_connection(connection, backend, started_ns=None):
     except OSError:
         backend.sink.emit(f'wefty-rfb-backend[{backend.role}]: Unix backend unavailable\n'.encode())
     finally:
+        admission.set()  # Release an input writer on failed/empty greetings.
         for stream in (connection, upstream):
             if stream is not None:
                 try:
