@@ -1,14 +1,50 @@
 # Runs under the Seat UID, never in the privileged helper process.
 import json
 import os
+import select
 import shutil
 import stat
 import sys
 import tarfile
 import signal
+# Python runs this handler only between bytecodes in the main thread. A
+# SIGTERM caught just before a blocking read, or by another thread, would
+# leave that read waiting with the staging folder in place (#1283). The
+# wakeup pipe makes such a signal visible to the input select below.
+WAKE, wake_write = os.pipe()
+os.set_blocking(WAKE, False)
+os.set_blocking(wake_write, False)
+signal.set_wakeup_fd(wake_write)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 
 COMMIT = b'\nWEFTY_COPY_COMMIT_V1\n'
+
+
+class Input:
+    # Reads stdin, but waits for it together with the signal wakeup pipe.
+    def __init__(self, fd):
+        self.fd = fd
+        self.data = b''
+        self.offset = 0
+
+    def read(self, size):
+        while self.offset == len(self.data):
+            ready = select.select([self.fd, WAKE], [], [])[0]
+            if WAKE in ready:
+                try:
+                    while os.read(WAKE, 512):
+                        pass
+                except BlockingIOError:
+                    pass
+                # Back in bytecode, the pending handler runs before the next wait.
+                continue
+            data = os.read(self.fd, 65536)
+            if not data:
+                return b''
+            self.data, self.offset = data, 0
+        data = self.data[self.offset:self.offset + size]
+        self.offset += len(data)
+        return data
 
 
 def remove_tree(name, parent):
@@ -45,8 +81,9 @@ def extract(destination):
         stage = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
         size = 0
         seen = set()
+        source_input = Input(sys.stdin.fileno())
         try:
-            with tarfile.open(fileobj=sys.stdin.buffer, mode='r|', bufsize=512) as archive:
+            with tarfile.open(fileobj=source_input, mode='r|', bufsize=512) as archive:
                 for member in archive:
                     parts = member.name.split('/')
                     if (not parts or parts[0] != 'item' or any(p in ('', '.', '..') for p in parts)
@@ -78,7 +115,7 @@ def extract(destination):
             # Only the helper appends this marker after a complete input stream.
             tail = b''
             while True:
-                data = sys.stdin.buffer.read(32768)
+                data = source_input.read(32768)
                 if not data:
                     break
                 tail = (tail + data)[-len(COMMIT):]

@@ -126,21 +126,8 @@ func TestSeatCopyProgramParentLinkCancellationAndDeepPack(t *testing.T) {
 	if line, err := bufio.NewReader(output).ReadString('\n'); err != nil || line != "STAGED\n" {
 		t.Fatalf("stage handshake=%q %v", line, err)
 	}
-	if err = child.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Fatal(err)
-	}
-	if err = child.Wait(); err == nil {
-		t.Fatal("cancelled copy succeeded")
-	}
-	entries, err := os.ReadDir(parent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".wefty-copy-") {
-			t.Fatalf("cancel left %s", entry.Name())
-		}
-	}
+	terminateSeatCopyChild(t, child)
+	requireNoSeatCopyStaging(t, parent)
 	deep := filepath.Join(base, "deep")
 	if err = os.Mkdir(deep, 0700); err != nil {
 		t.Fatal(err)
@@ -159,6 +146,109 @@ func TestSeatCopyProgramParentLinkCancellationAndDeepPack(t *testing.T) {
 	pack.Stdout = io.Discard
 	if err := pack.Run(); err != nil {
 		t.Fatalf("deep pack failed: %v", err)
+	}
+}
+
+// A SIGTERM that Python's main thread does not take inside its blocking read
+// must still end the copy and remove the staging folder (#1283). Blocking
+// SIGTERM in the main thread sends it to a helper thread, so the main thread
+// gets no EINTR. The test signals only after the main thread is parked.
+func TestSeatCopyProgramSignalWhileMainThreadBlocked(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := t.TempDir()
+	prefix := `import os, signal, sys, threading, time
+main, staged = threading.get_ident(), threading.Event()
+real_open = os.open
+def observed(path, *args, **kwargs):
+    fd = real_open(path, *args, **kwargs)
+    if path == 'item':
+        staged.set()
+    return fd
+os.open = observed
+def watch():
+    staged.wait()
+    last, still = None, 0
+    while still < 5:
+        time.sleep(0.02)
+        frame = sys._current_frames()[main]
+        where = (id(frame), frame.f_lasti)
+        still, last = (still + 1 if where == last else 0), where
+    os.write(1, b'PARKED\n')
+    threading.Event().wait()
+threading.Thread(target=watch, daemon=True).start()
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+`
+	child := exec.Command(python, "-I", "-S", "-c", prefix+seatCopyProgram, "in", filepath.Join(parent, "cancelled"))
+	input, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	child.Stderr = &stderr
+	if err = child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer child.Process.Kill()
+	defer input.Close()
+	var partial bytes.Buffer
+	if err = tar.NewWriter(&partial).WriteHeader(&tar.Header{Name: "item", Mode: 0600, Size: 1 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = input.Write(partial.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := bufio.NewReader(output).ReadString('\n'); err != nil || line != "PARKED\n" {
+		t.Fatalf("park handshake=%q %v %s", line, err, stderr.String())
+	}
+	terminateSeatCopyChild(t, child)
+	if code := child.ProcessState.ExitCode(); code != 1 {
+		t.Fatalf("cancelled copy exit=%d %s", code, stderr.String())
+	}
+	if _, err = os.Lstat(filepath.Join(parent, "cancelled")); !os.IsNotExist(err) {
+		t.Fatalf("cancelled destination: %v", err)
+	}
+	requireNoSeatCopyStaging(t, parent)
+}
+
+// terminateSeatCopyChild sends SIGTERM and requires a failed exit within a
+// short bound, so a missed signal fails in seconds instead of hanging the
+// package until its timeout.
+func terminateSeatCopyChild(t *testing.T, child *exec.Cmd) {
+	t.Helper()
+	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled copy succeeded")
+		}
+	case <-time.After(10 * time.Second):
+		_ = child.Process.Kill()
+		<-done
+		t.Fatal("copy child did not exit within 10s of SIGTERM (#1283)")
+	}
+}
+
+func requireNoSeatCopyStaging(t *testing.T, parent string) {
+	t.Helper()
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".wefty-copy-") {
+			t.Fatalf("cancel left %s", entry.Name())
+		}
 	}
 }
 
