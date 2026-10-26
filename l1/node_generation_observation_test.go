@@ -2,6 +2,7 @@ package l1
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -71,7 +72,7 @@ func TestNodeGenerationObservationsRetainLossAndAcceptedRenewal(t *testing.T) {
 }
 
 func TestNodeGenerationObservationReadsDoNotTakeWriterLock(t *testing.T) {
-	f := newGenerationFixture(t)
+	f := generationObservationStoreFixture(t)
 	f.claim(t, "resident")
 	tx, err := f.h.store.db.BeginTx(t.Context(), nil)
 	if err != nil {
@@ -327,8 +328,13 @@ func TestNodeGenerationObservationPayloadExit(t *testing.T) {
 		name, result, lateResult string
 		wantExit                 any
 		wantError                bool
+		initiator                contract.TerminationCause
+		canceled                 bool
 	}{
 		{name: "payload-exit-17", result: `{"exit_code":17}`, wantExit: float64(17)},
+		{name: "agent-initiated-exit-17", result: `{"exit_code":17}`, wantExit: float64(17), initiator: contract.TerminationCauseAgent},
+		{name: "guardian-initiated-exit-17", result: `{"exit_code":17}`, wantExit: float64(17), initiator: contract.TerminationCauseGuardian},
+		{name: "owner-canceled-exit-17", result: `{"exit_code":17}`, wantExit: float64(17), initiator: contract.TerminationCauseAgent, canceled: true},
 		{name: "payload-exit-zero", result: `{"exit_code":0}`, wantExit: float64(0)},
 		{name: "no-result"},
 		{name: "infrastructure-failure", result: `{"output_error":"cannot retain output"}`},
@@ -336,9 +342,14 @@ func TestNodeGenerationObservationPayloadExit(t *testing.T) {
 		{name: "unreadable-result", result: `{`, wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newGenerationFixture(t)
+			f := generationObservationStoreFixture(t)
 			a := f.claim(t, tc.name)
 			f.promote(t, "g2")
+			if tc.canceled {
+				if _, err := f.h.store.CancelJob(t.Context(), a.Job.JobID, JobCancelCaller{Submitter: "operator"}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			// Ordinary exits enter through the accepted completion API. Corrupt,
 			// absent and late evidence fixtures exercise conservative snapshot reads.
 			if tc.wantExit != nil {
@@ -346,7 +357,7 @@ func TestNodeGenerationObservationPayloadExit(t *testing.T) {
 				if err := json.Unmarshal([]byte(tc.result), &result); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := f.h.store.CompleteAttempt(t.Context(), "agent", a.Job.JobID, a.Lease.AttemptID, CompletionRequest{FencingToken: a.Lease.FencingToken, IdempotencyKey: tc.name, Result: result}); err != nil {
+				if _, err := f.h.store.CompleteAttempt(t.Context(), "agent", a.Job.JobID, a.Lease.AttemptID, CompletionRequest{FencingToken: a.Lease.FencingToken, IdempotencyKey: tc.name, Result: result, TerminationInitiator: tc.initiator}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -386,6 +397,15 @@ func TestNodeGenerationObservationPayloadExit(t *testing.T) {
 						if err := json.Unmarshal(payload, &fields); err != nil {
 							t.Fatal(err)
 						}
+						if tc.initiator != "" && (observed.State == nil || *observed.State != contract.AttemptFailed) {
+							t.Errorf("agent/guardian completion is not failed: %s", payload)
+						}
+						if tc.canceled && fields["job_outcome"] != "canceled" {
+							t.Errorf("owner cancellation intent missing: %s", payload)
+						}
+						if tc.initiator != "" && fields["termination_initiator"] != string(tc.initiator) {
+							t.Errorf("accepted termination provenance missing: %s", payload)
+						}
 						if fields["exit_code"] != tc.wantExit || (observed.ObservationError != "") != tc.wantError {
 							t.Errorf("observation=%s want exit=%v error=%t", payload, tc.wantExit, tc.wantError)
 						}
@@ -402,4 +422,27 @@ func TestNodeGenerationObservationPayloadExit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Snapshot/completion tests need a Store, not an HTTP server or background reconciler.
+func generationObservationStoreFixture(t *testing.T) *generationFixture {
+	t.Helper()
+	clock := &fakeClock{now: time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)}
+	store, err := OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), StoreOptions{Clock: clock, LeaseDuration: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	h := &integrationHarness{t: t, store: store, clock: clock}
+	node, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "agent"}, generationRegistration(h, "g1"), NodePolicy{MaxOneshotSlots: 3, MaxServiceSlots: 2}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &generationFixture{h: h, node: node}
+	f.refresh(t)
+	return f
 }

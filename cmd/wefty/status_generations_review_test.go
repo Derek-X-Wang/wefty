@@ -238,3 +238,84 @@ func TestReviewDoctorLabelAndRetirementReadsRefuseContention(t *testing.T) {
 		t.Fatal("doctor label or retirement acknowledgment waited on catalog lock")
 	}
 }
+
+func TestReviewPayloadExitRequiresSnapshotAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name, initiator, current string
+		recorded, problem        bool
+		canceled                 bool
+		recordedState            contract.AttemptState
+	}{
+		{name: "payload-own"},
+		{name: "agent-initiated", initiator: "agent", problem: true},
+		{name: "guardian-initiated", initiator: "guardian", problem: true},
+		{name: "owner-canceled", initiator: "agent", canceled: true},
+		{name: "receipt-only", recorded: true, current: "absent", problem: true},
+		{name: "receipt-current-payload-own", recorded: true},
+		{name: "receipt-current-owner-canceled", recorded: true, initiator: "agent", canceled: true},
+		{name: "receipt-loss-stays-visible", recorded: true, recordedState: contract.AttemptLost, problem: true},
+		{name: "receipt-current-agent", recorded: true, initiator: "agent", problem: true},
+		{name: "receipt-current-unknown", recorded: true, current: "unknown", problem: true},
+		{name: "receipt-current-live", recorded: true, current: "live", problem: true},
+		{name: "receipt-other-node", recorded: true, current: "other-node", problem: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			nodes := generationStatusFixture(now, 1)
+			a := &nodes.Nodes[0].Generations[1].Attempts[0]
+			exit := 17
+			a.State = generationAttemptState(contract.AttemptFailed)
+			a.ExitCode = &exit
+			if tc.canceled {
+				a.JobOutcome = contract.JobOutcomeCanceled
+			}
+			payload, err := json.Marshal(nodes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.initiator != "" {
+				payload = []byte(strings.Replace(string(payload), `"exit_code":17`, `"exit_code":17,"termination_initiator":"`+tc.initiator+`"`, 1))
+			}
+			if err := json.Unmarshal(payload, &nodes); err != nil {
+				t.Fatal(err)
+			}
+			config := ""
+			if tc.recorded {
+				paths, r := reviewReceipt(t, "reboot_reconciled")
+				config = paths.nodeConfig
+				state := contract.AttemptFailed
+				if tc.recordedState != "" {
+					state = tc.recordedState
+				}
+				r.RebootAttempts = map[string]l1.Attempt{"attempt-0": {State: state, Result: &l1.ProcessResult{ExitCode: &exit}}}
+				r.Inventory.Generations = []l1.NodeGeneration{{AgentGenerationID: "old-0", ResidentAttempts: []l1.ResidentAttempt{{JobID: "job-0", AttemptID: "attempt-0"}}}}
+				if err := writeUpgradeRolling(paths, r, "reboot_reconciled"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch tc.current {
+			case "absent":
+				nodes.Nodes[0].Generations = nodes.Nodes[0].Generations[:1]
+			case "unknown":
+				nodes.Nodes[0].Generations[1].Attempts[0].State = nil
+			case "live":
+				nodes.Nodes[0].Generations[1].Attempts[0].State = generationAttemptState(contract.AttemptRunning)
+			case "other-node":
+				other := nodes.Nodes[0]
+				other.NodeID = "other-node"
+				nodes.Nodes = append(nodes.Nodes, other)
+				nodes.Nodes[0].Generations = nodes.Nodes[0].Generations[:1]
+			}
+			got := collectRollingStatus(config, nodes, true, now)
+			foundProblem := false
+			for _, g := range got.Generations {
+				for _, p := range g.Problems {
+					foundProblem = foundProblem || p.Code == "retiring_attempt_problem"
+				}
+			}
+			if foundProblem != tc.problem {
+				t.Fatalf("retiring_attempt_problem=%t want=%t projection=%s", foundProblem, tc.problem, mustReviewJSON(t, got))
+			}
+		})
+	}
+}

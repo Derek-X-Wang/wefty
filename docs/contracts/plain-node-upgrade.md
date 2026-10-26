@@ -947,10 +947,21 @@ establish cancellation.
 
 Optional resident `exit_code` comes only from the accepted Attempt completion
 result in that same read snapshot, never from a late result or message text. A
-failed Attempt with a recorded nonzero payload exit is also settled, like a
-succeeded Attempt, including retained closed generations and recorded reboot
-observations. Status remains ready, retirement renewal stays healthy, and doctor
-does not raise an operator problem for that user outcome. Failures without
+failed Attempt with a recorded nonzero payload-owned exit is also settled, like a
+succeeded Attempt, including retained closed generations. Optional resident
+`termination_initiator` comes from the accepted Attempt row in that same
+`ReadOnly:true` snapshot. An `agent` or `guardian` initiator means the stop was
+not payload-owned and the failed Attempt remains a `retiring_attempt_problem`,
+even if the payload's stop handler exited 17. Owner cancellation continues to
+settle only through the existing `job_outcome: canceled` rule.
+
+A saved reboot receipt cannot establish a payload-owned completion by itself.
+A recorded failed Attempt settles only when the current L1 snapshot contains
+matching accepted payload-owned completion evidence for that Attempt on the same
+Node (or the existing authoritative Job cancellation outcome). With only a
+receipt, or an unknown or live current observation, the problem or unverified
+diagnosis remains. For a settled payload-owned exit, status remains ready,
+retirement renewal stays healthy, and doctor raises no operator problem. Failures without
 accepted payload exit evidence, lost and interrupted Attempts, live stale Leases,
 and reboot-interrupted Attempts retain their diagnosis. Missing or unreadable
 completion evidence never establishes settlement.

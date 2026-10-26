@@ -65,17 +65,27 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 		closed        bool
 		recorded      bool
 		priorBoot     bool
+		initiator     string
+		current       string
 	}{
 		{name: "cancelled-and-lost", outcome: "canceled", extra: contract.AttemptLost, problems: 1},
 		{name: "cancelled-alone", outcome: "canceled"},
 		{name: "failed-without-payload-evidence", problems: 1},
 		{name: "payload-exit-17", exitCode: &exit17},
+		{name: "agent-initiated-exit-17", exitCode: &exit17, initiator: "agent", problems: 1},
+		{name: "guardian-initiated-exit-17", exitCode: &exit17, initiator: "guardian", problems: 1},
+		{name: "owner-cancel-initiated-exit-17", exitCode: &exit17, initiator: "agent", outcome: "canceled"},
 		{name: "closed-payload-exit-17", exitCode: &exit17, closed: true},
 		{name: "payload-exit-143", exitCode: &exit143},
 		{name: "failed-with-exit-zero", exitCode: &exit0, problems: 1},
 		{name: "stale-live-with-payload-evidence", exitCode: &exit17, state: contract.AttemptRunning, problems: 1},
 		{name: "prior-boot-live-with-payload-evidence", exitCode: &exit17, state: contract.AttemptRunning, priorBoot: true, problems: 1},
-		{name: "recorded-payload-exit-17", exitCode: &exit17, recorded: true},
+		{name: "recorded-payload-exit-17", exitCode: &exit17, recorded: true, problems: 1},
+		{name: "recorded-payload-exit-17-current", exitCode: &exit17, recorded: true, current: "matching"},
+		{name: "recorded-payload-exit-17-current-agent", exitCode: &exit17, recorded: true, current: "matching", initiator: "agent", problems: 1},
+		{name: "recorded-payload-exit-17-current-unknown", exitCode: &exit17, recorded: true, current: "unknown", problems: 1},
+		{name: "recorded-payload-exit-17-current-live", exitCode: &exit17, recorded: true, current: "live", problems: 1},
+		{name: "recorded-payload-exit-17-other-node", exitCode: &exit17, recorded: true, current: "other-node", problems: 1},
 		{name: "recorded-failed-without-evidence", recorded: true, problems: 1},
 		{name: "recorded-lost-with-payload-evidence", recorded: true, exitCode: &exit17, state: contract.AttemptLost, problems: 1},
 		{name: "recorded-interrupted-with-payload-evidence", recorded: true, exitCode: &exit17, state: contract.AttemptInterrupted, problems: 1},
@@ -105,6 +115,9 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 			attempt := wire["nodes"].([]any)[0].(map[string]any)["generations"].([]any)[1].(map[string]any)["attempts"].([]any)[0].(map[string]any)
 			if tc.exitCode != nil {
 				attempt["exit_code"] = *tc.exitCode
+			}
+			if tc.initiator != "" {
+				attempt["termination_initiator"] = tc.initiator
 			}
 			payload, err = json.Marshal(wire)
 			if err != nil {
@@ -168,7 +181,22 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 					t.Fatal(err)
 				}
 				// The retained receipt is the only evidence for this old generation.
-				nodes.Nodes[0].Generations = nodes.Nodes[0].Generations[:1]
+				switch tc.current {
+				case "matching":
+				case "unknown":
+					nodes.Nodes[0].Generations[1].Attempts[0].State = nil
+				case "live":
+					a := &nodes.Nodes[0].Generations[1].Attempts[0]
+					a.State = generationAttemptState(contract.AttemptRunning)
+					a.LeaseExpiresAt = generationDeadline(time.Now().Add(time.Hour))
+				case "other-node":
+					other := nodes.Nodes[0]
+					other.NodeID = "other-node"
+					nodes.Nodes = append(nodes.Nodes, other)
+					nodes.Nodes[0].Generations = nodes.Nodes[0].Generations[:1]
+				default:
+					nodes.Nodes[0].Generations = nodes.Nodes[0].Generations[:1]
+				}
 			}
 			before := diagnosticTree(t, f.setup.home)
 			for _, command := range []string{"status", "doctor"} {
@@ -199,7 +227,7 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 							if err := json.Unmarshal([]byte(out), &report); err != nil {
 								t.Fatal(err)
 							}
-							if strings.Contains(report.UpgradeDetail, "problems need attention") != (tc.problems > 0) {
+							if tc.current != "unknown" && strings.Contains(report.UpgradeDetail, "problems need attention") != (tc.problems > 0) {
 								t.Errorf("incorrect upgrade detail: %s", report.UpgradeDetail)
 							}
 							healthy := report.Ready

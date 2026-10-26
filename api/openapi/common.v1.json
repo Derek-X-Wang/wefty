@@ -3700,7 +3700,12 @@
           },
           "exit_code": {
             "type": "integer",
-            "description": "Payload exit code from the accepted Attempt completion result, read in the same snapshot. Absent without accepted payload exit evidence; late results never supply it. A failed Attempt with a nonzero exit code is settled for status and doctor. Lost and interrupted Attempts retain their diagnosis."
+            "description": "Payload exit code from the accepted Attempt completion result, read in the same snapshot. Absent without accepted payload exit evidence; late results never supply it. A failed Attempt with a nonzero exit code and no termination_initiator is a payload-owned exit, settled for status and doctor. Owner cancellation uses job_outcome. Lost and interrupted Attempts retain their diagnosis."
+          },
+          "termination_initiator": {
+            "type": "string",
+            "enum": ["agent", "guardian"],
+            "description": "Accepted exit-code completion provenance from the Attempt row in the same ReadOnly snapshot. Agent or guardian termination remains an operator problem for a failed Attempt even when the payload handles the stop by exiting nonzero. Absent for a payload-owned exit. Owner cancellation is settled only through job_outcome. Local reboot receipts alone cannot establish settlement."
           },
           "state": {
             "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost", "interrupted", null],

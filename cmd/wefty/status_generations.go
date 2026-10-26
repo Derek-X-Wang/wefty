@@ -78,10 +78,12 @@ func settledGenerationCancellation(a l1.NodeGenerationAttempt) bool {
 		(*a.State == contract.AttemptFailed || *a.State == contract.AttemptSucceeded)
 }
 
-// Only an accepted payload exit settles a failed Attempt. Lost/interrupted
-// Attempts retain their diagnosis even if other exit evidence is present.
+// Only an accepted payload-owned exit settles a failed Attempt. Agent/guardian
+// stops and lost/interrupted Attempts retain their diagnosis. Owner cancellation
+// is settled separately through the authoritative Job outcome.
 func settledGenerationPayloadExit(a l1.NodeGenerationAttempt) bool {
-	return a.State != nil && *a.State == contract.AttemptFailed && a.ExitCode != nil && *a.ExitCode != 0
+	return a.ObservationError == "" && a.JobOutcome == "" && a.TerminationInitiator == "" &&
+		a.State != nil && *a.State == contract.AttemptFailed && a.ExitCode != nil && *a.ExitCode != 0
 }
 
 func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Time) generationStatus {
@@ -372,29 +374,38 @@ func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, 
 		// Reboot interruptions remain problems after recovery completes, even when
 		// an old generation's local files have already been cleaned up.
 		for id, a := range receipt.RebootAttempts {
-			var exitCode *int
-			if a.Result != nil {
-				exitCode = a.Result.ExitCode
-			}
-			if settledGenerationPayloadExit(l1.NodeGenerationAttempt{State: &a.State, ExitCode: exitCode}) {
-				continue
-			}
 			if a.State != contract.AttemptLost && a.State != contract.AttemptInterrupted && a.State != contract.AttemptFailed {
 				continue
 			}
 			found := false
 			for i := range result.Generations {
 				g := &result.Generations[i]
+				if g.NodeID != receipt.NodeID {
+					continue
+				}
 				for _, observed := range g.Attempts {
 					if observed.AttemptID == id {
 						found = true
-						if observed.State == nil {
-							label := "Attempt " + id
-							if observed.RunID != "" {
-								label = fmt.Sprintf("Run %s (Attempt %s)", observed.RunID, id)
-							}
-							g.Problems = append(g.Problems, statusReason{"retiring_attempt_problem", "recorded reboot observation: " + interruptionDetail(label, a.State, a.InterruptionReason) + "; current Attempt state unknown"})
+						settled := settledGenerationPayloadExit(observed) || settledGenerationCancellation(observed)
+						if a.State == contract.AttemptFailed && settled {
+							// Settlement must come from this Node's current L1 snapshot,
+							// never the saved reboot receipt's local completion copy.
+							continue
 						}
+						if observed.State != nil && !settled && (*observed.State == contract.AttemptFailed || *observed.State == contract.AttemptLost || *observed.State == contract.AttemptInterrupted) {
+							continue // Current snapshot already projects the Attempt problem.
+						}
+						label := "Attempt " + id
+						if observed.RunID != "" {
+							label = fmt.Sprintf("Run %s (Attempt %s)", observed.RunID, id)
+						}
+						qualification := "; current Attempt does not establish settled payload completion"
+						if observed.State == nil {
+							qualification = "; current Attempt state unknown"
+						} else {
+							g.RenewalHealth = "degraded"
+						}
+						g.Problems = append(g.Problems, statusReason{"retiring_attempt_problem", "recorded reboot observation: " + interruptionDetail(label, a.State, a.InterruptionReason) + qualification})
 					}
 				}
 			}
@@ -420,7 +431,7 @@ func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, 
 				result.EvidenceErrors = append(result.EvidenceErrors, detail+"; generation membership unknown")
 				continue
 			}
-			result.Generations = append(result.Generations, generationStatus{NodeID: receipt.NodeID, ID: generationID, Version: version, Role: "history", RenewalHealth: "degraded", Progress: "unverified", Attempts: []l1.NodeGenerationAttempt{{JobID: resident.JobID, AttemptID: id, State: &a.State, ExitCode: exitCode, InterruptionReason: a.InterruptionReason}}, Problems: []statusReason{{"retiring_attempt_problem", detail}}})
+			result.Generations = append(result.Generations, generationStatus{NodeID: receipt.NodeID, ID: generationID, Version: version, Role: "history", RenewalHealth: "degraded", Progress: "unverified", Attempts: []l1.NodeGenerationAttempt{{JobID: resident.JobID, AttemptID: id, State: &a.State, InterruptionReason: a.InterruptionReason}}, Problems: []statusReason{{"retiring_attempt_problem", detail}}})
 		}
 	}
 	if result.UpgradeState == "complete" && catalogPresent && catalog.PendingReceipt != "" {

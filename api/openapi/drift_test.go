@@ -425,6 +425,9 @@ var driftEnumExceptions = map[string]driftEnumException{
 		subset: []string{"current", "staging", "retired"},
 		reason: "absent names a missing generation row in a refusal's error details; it is never a stored phase",
 	},
+	"contract.TerminationCause@" + component(commonDoc, "NodeGenerationAttempt") + "/properties/termination_initiator": {
+		subset: []string{"agent", "guardian"}, reason: "accepted Attempt initiators contain only agent or guardian; a spontaneous exit stores no initiator",
+	},
 	"contract.TerminationCause@" + requestBody(agentDoc, "post", "/v1/agent/jobs/{job_id}/attempts/{attempt_id}/complete") + "/properties/termination_initiator": {
 		subset: []string{"agent", "guardian"}, reason: "a spontaneous exit names no initiator, so L1 refuses spontaneous here",
 	},
