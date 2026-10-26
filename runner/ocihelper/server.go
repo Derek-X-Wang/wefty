@@ -1738,7 +1738,7 @@ func (server *Server) dispatch(operation *sessionOperation, wire *framedConn, re
 				return
 			}
 			authority = observe.Authority
-			if observe.Discover && (observe.Generation != 0 || len(observe.Cleanup) != 0) || !observe.Discover && observe.Generation == 0 || validateComputerSeats(observe.Cleanup) != nil {
+			if observe.EndpointLookup && (observe.Discover || len(observe.Cleanup) != 0) || observe.Discover && (observe.Generation != 0 || len(observe.Cleanup) != 0) || !observe.Discover && observe.Generation == 0 || validateComputerSeats(observe.Cleanup) != nil {
 				_ = writeFailure(wire, CodeInvalidRequest, "Seat observation requires a positive generation or an empty discovery request")
 				return
 			}

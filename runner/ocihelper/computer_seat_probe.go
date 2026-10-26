@@ -9,10 +9,13 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/screentiming"
 	"github.com/coder/websocket"
 )
 
 func probeComputerSeatGreeting(ctx context.Context, dial func(context.Context) (net.Conn, error)) error {
+	timing := screentiming.Start("helper_probe")
+	defer timing("greeting_complete")
 	// A failed endpoint does not consume the other Seats' entire readiness
 	// budget. The injected Seat clock still decides the final publication.
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)

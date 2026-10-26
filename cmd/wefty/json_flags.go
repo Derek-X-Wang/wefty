@@ -10,7 +10,7 @@ import (
 // and help routing. Linux privilege bypass uses the actual command parse.
 // Keep this vocabulary in sync with command registrations (including authoring
 // and platform-specific commands); TestJSONValueFlagVocabulary checks it.
-const jsonValueFlags = `agent-path allowed-mount-root argv auth-key backup-cap cap
+const jsonValueFlags = `o button dy dx screenshot agent-path allowed-mount-root argv auth-key backup-cap cap
 computer-default-image computer-shared-seat-limit computer-seat-memory-bytes computer-dedicated-cap
 computer-idle-wait seat-idle-wait seat-warning-wait seat-command-max-runtime
 capability claims-enabled class control-url coordinator-url cpu-millicores cursor device-id dir disk-bytes drain-timeout
@@ -61,6 +61,14 @@ func removeBoolFlag(args []string, name string) ([]string, bool, error) {
 			filtered = append(filtered, args[i])
 		} else if !strings.HasPrefix(arg, "-") && len(command) < 2 {
 			command = append(command, arg)
+			if len(command) == 2 && command[0] == "seat" && isSeatScreenCommand(command[1]) {
+				count := seatScreenPositionals(command[1])
+				for count > 0 && i+1 < len(args) {
+					i++
+					filtered = append(filtered, args[i])
+					count--
+				}
+			}
 		}
 	}
 	return filtered, enabled, nil

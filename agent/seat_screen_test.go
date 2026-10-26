@@ -121,10 +121,12 @@ type screenRuntimeFixture struct {
 	generation         uint64
 	hidePlaceOne       bool
 	changedObservation bool
+	endpointLookup     bool
 }
 
 func (f *screenRuntimeFixture) ObserveComputerSeats(_ context.Context, r ocihelper.ObserveComputerSeatsRequest) (ocihelper.ObserveComputerSeatsResponse, error) {
 	f.mu.Lock()
+	f.endpointLookup = r.EndpointLookup
 	generation := f.generation
 	if generation == 0 {
 		generation = 1
@@ -838,5 +840,22 @@ func TestSeatScreenReleaseRetriesLiveClearBeforeWithdrawing(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSeatScreenOpenUsesFencedEndpointLookup(t *testing.T) {
+	runtime := &screenRuntimeFixture{view: newComputerBackend(t, computerBackendOptions{}), control: newComputerBackend(t, computerBackendOptions{})}
+	defer runtime.view.Close()
+	defer runtime.control.Close()
+	h := &seatScreenHandler{config: seatScreenConfig{runtime: runtime}}
+	conn, err := h.dial(t.Context(), l1.SeatScreenAuthority{SeatCopyAuthority: l1.SeatCopyAuthority{Place: 1, Generation: 1}}, "view")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if !runtime.endpointLookup {
+		t.Fatal("screen open repeated all Seats' readiness probes instead of looking up the fenced endpoint")
 	}
 }

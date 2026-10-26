@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 
+	"github.com/Derek-X-Wang/wefty/internal/screentiming"
 	"golang.org/x/sys/unix"
 )
 
@@ -145,6 +146,7 @@ func (s *computerSeats) dialSeatSocket(ctx context.Context, root string, place i
 }
 
 func (engine *ContainerdEngine) DialSeatEndpoint(ctx context.Context, r DialSeatEndpointRequest, stream io.ReadWriteCloser) error {
+	timing := screentiming.Start("helper_endpoint")
 	attempt, err := engine.attempt(r.Authority)
 	if err != nil {
 		return err
@@ -160,6 +162,7 @@ func (engine *ContainerdEngine) DialSeatEndpoint(ctx context.Context, r DialSeat
 		attempt.seatsMu.Unlock()
 		return &SeatOperationRefusalError{Reason: SeatRefusalEndpointUnavailable}
 	}
+	timing("attempt_snapshot")
 	kind, err := snapshot.seats.endpoint(r)
 	if err != nil {
 		attempt.seatsMu.Unlock()
@@ -169,6 +172,7 @@ func (engine *ContainerdEngine) DialSeatEndpoint(ctx context.Context, r DialSeat
 		attempt.seatsMu.Unlock()
 		return &SeatOperationRefusalError{Reason: SeatRefusalEndpointUnavailable}
 	}
+	timing("generation_lookup")
 	process, err := os.Open(fmt.Sprintf("/proc/%d", snapshot.task.Pid()))
 	if err != nil {
 		attempt.seatsMu.Unlock()
@@ -181,10 +185,12 @@ func (engine *ContainerdEngine) DialSeatEndpoint(ctx context.Context, r DialSeat
 		return err
 	}
 	backend, err := snapshot.seats.dialSeatSocket(ctx, proc+"/root", r.Place, kind, uint32(2000+r.Place), snapshot.seats.entries[r.Place].endpointPins[kind], connectSeatSocket)
+	timing("backend_socket_dial")
 	if err == nil {
 		err = engine.validateComputerSeatAttempt(ctx, r.Authority, attempt, snapshot)
 	}
 	attempt.seatsMu.Unlock()
+	timing("authority_rechecked")
 	if err != nil {
 		if backend != nil {
 			backend.Close()

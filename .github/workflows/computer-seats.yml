@@ -7,6 +7,11 @@ on:
     paths:
       - examples/computer/**
       - internal/computerconformance/**
+      - internal/rfbclient/**
+      - cmd/wefty/seat_screen*.go
+      - cmd/wefty/seat_request_command.go
+      - cmd/wefty/json_flags.go
+      - cmd/wefty/main.go
       - cmd/wefty-computer-conformance/**
       - runner/ocihelper/**
       - contract/**
@@ -122,6 +127,10 @@ jobs:
           curl -fLsS --retry 5 -o runc.sha256 "https://github.com/opencontainers/runc/releases/download/v$runc_version/runc.sha256sum"
           grep " runc.$ARCH$" runc.sha256 | sha256sum --check
           sudo install -m0755 "runc.$ARCH" /usr/local/sbin/runc
+          sudo apt-get update
+          sudo apt-get install --yes e2fsprogs util-linux
+          sudo modprobe loop
+          test -e /dev/loop-control
           sudo modprobe overlay
           sudo systemd-run --unit=wefty-seat-containerd --property=KillMode=control-group \
             /usr/local/bin/containerd --address /run/wefty-seat-containerd.sock \
@@ -141,11 +150,15 @@ jobs:
           python3 -m unittest discover -s examples/computer -p 'test_*.py'
           GOFLAGS=-p=1 GOMAXPROCS=2 go test -count=1 ./runner/ocihelper \
             -run '^TestAdmissionReceiptUsesInjectedClockAndScaledTmpfsCeiling$'
+          GOFLAGS=-p=1 GOMAXPROCS=2 go build -o "$RUNNER_TEMP/seat-wefty" ./cmd/wefty
+          GOFLAGS=-p=1 GOMAXPROCS=2 go build -o "$RUNNER_TEMP/seat-wefty-node" ./cmd/wefty-agent
           GOFLAGS=-p=1 GOMAXPROCS=2 go test -c -tags computer_seat_lane \
             -o "$RUNNER_TEMP/seat-conformance.test" ./internal/computerconformance
           (
             cd internal/computerconformance
             sudo env PATH="/usr/local/bin:/usr/local/sbin:$PATH" \
+              WEFTY_SEAT_CLI_BINARY="$RUNNER_TEMP/seat-wefty" \
+              WEFTY_SEAT_NODE_BINARY="$RUNNER_TEMP/seat-wefty-node" \
               WEFTY_SEAT_IMAGE="$WEFTY_SEAT_IMAGE" \
               WEFTY_SEAT_NEGATIVE_IMAGE=docker.io/library/wefty-seat-negative:ci \
               WEFTY_SEAT_CONTAINERD=/run/wefty-seat-containerd.sock \
@@ -153,7 +166,7 @@ jobs:
               WEFTY_SEAT_EVIDENCE="$evidence/$ARCH-seats-observed.json" \
               WEFTY_SEAT_PROFILE_RECEIPT="$evidence/$ARCH-profile.json" \
               "$RUNNER_TEMP/seat-conformance.test" -test.v \
-              -test.run '^(TestDefaultComputerSeatsAtProductionTimings|TestSeatLaneSetupPassesRealProfileValidationForFreshAndRestartedStorage|TestSeatStatus.*)$' -test.timeout 10m
+              -test.run '^(TestSeatScreenCLISC1SC4|TestDefaultComputerSeatsAtProductionTimings|TestSeatLaneSetupPassesRealProfileValidationForFreshAndRestartedStorage|TestSeatStatus.*)$' -test.timeout 10m
           )
           sudo chown -R "$(id -u):$(id -g)" "$evidence"
           go run ./cmd/wefty-computer-conformance --seat-evidence "$evidence/$ARCH-seats-observed.json" \

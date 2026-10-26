@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 )
 
 const MethodDialSeatEndpoint Method = "DialSeatEndpoint"
@@ -115,4 +116,27 @@ func (s *computerSeats) closeEndpointPin(pin *os.File) {
 	defer s.pinMu.Unlock()
 	pin.Close()
 	delete(s.pins, pin)
+}
+
+// lookupEndpoints selects previously published names, never establishes readiness.
+// The actual dial still validates the pinned inode, peer UID, network namespace
+// and live attempt before publishing its stream. L1 authority is never cached.
+func (s *computerSeats) lookupEndpoints(generation uint64) (ObserveComputerSeatsResponse, error) {
+	if s == nil || generation == 0 || generation != s.generation {
+		return ObserveComputerSeatsResponse{}, &SeatOperationRefusalError{Reason: SeatRefusalGenerationMismatch}
+	}
+	result := ObserveComputerSeatsResponse{Generation: generation, Seats: []ComputerSeatObservation{}}
+	for place, entry := range s.entries {
+		if !entry.wanted {
+			continue
+		}
+		observation := ComputerSeatObservation{Place: place, State: "starting"}
+		if entry.ready && entry.readyGeneration == generation && entry.failure == "" && entry.endpointPins["view"] != nil && entry.endpointPins["control"] != nil {
+			observation.State = "ready"
+			observation.Endpoints = map[string]string{"view": entry.endpointName("view"), "control": entry.endpointName("control")}
+		}
+		result.Seats = append(result.Seats, observation)
+	}
+	slices.SortFunc(result.Seats, func(a, b ComputerSeatObservation) int { return a.Place - b.Place })
+	return result, nil
 }

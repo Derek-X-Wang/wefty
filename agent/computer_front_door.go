@@ -18,6 +18,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/screentiming"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -1071,6 +1072,7 @@ func dialComputerBackend(ctx context.Context, dial computerEndpointDial, endpoin
 }
 
 func dialComputerBackendWithLifetime(dialContext, lifetimeContext context.Context, dial computerEndpointDial, endpointName string) (net.Conn, *websocket.Conn, []byte, error) {
+	timing := screentiming.Start("node_backend")
 	var mu sync.Mutex
 	used := false
 	transport := &http.Transport{DialContext: func(dialContext context.Context, _, _ string) (net.Conn, error) {
@@ -1089,6 +1091,7 @@ func dialComputerBackendWithLifetime(dialContext, lifetimeContext context.Contex
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	timing("backend_websocket_accepted")
 	if connection.Subprotocol() != computerWebSocketSubprotocol {
 		_ = connection.CloseNow()
 		return nil, nil, nil, errors.New("Computer backend did not negotiate the binary subprotocol")
@@ -1111,6 +1114,7 @@ func dialComputerBackendWithLifetime(dialContext, lifetimeContext context.Contex
 		_ = connection.CloseNow()
 		return nil, nil, nil, fmt.Errorf("read Computer RFB version banner: %w", err)
 	}
+	timing("backend_first_banner")
 	if !validRFBVersionBanner(banner) {
 		_ = connection.CloseNow()
 		return nil, nil, nil, fmt.Errorf("invalid Computer RFB version banner %q", banner)

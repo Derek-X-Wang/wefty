@@ -1,0 +1,21 @@
+--- a/src/inet.c
++++ b/src/inet.c
+@@ -698,17 +698,17 @@
+ int accept_unix(int s) {
+ #if !defined(AF_UNIX) || !defined(LIBVNCSERVER_HAVE_SYS_SOCKET_H)
+ 	if (s) {}
+ 	return -1;
+ #else
+ 	int fd;
+-	socklen_t fromlen;
+ 	struct sockaddr_un fsaun;
++	socklen_t fromlen = sizeof(fsaun);
+ 
+ 	fd = accept(s, (struct sockaddr *)&fsaun, &fromlen);
+ 	if (fd < 0) {
+ 		rfbLogPerror("accept_unix: accept");
+ 		return -1;
+ 	}
+ 	return fd;
+ #endif
+ }

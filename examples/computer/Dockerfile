@@ -5,6 +5,32 @@
 ARG DEBIAN_IMAGE=docker.io/library/debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 ARG SOURCE_DATE_EPOCH=0
 
+# The packaged -unixsock accept path passes an uninitialized sockaddr length
+# to accept(2). Keep Debian's source, patches and build flags; fix only that
+# length, without adding build tools to either runtime image.
+FROM ${DEBIAN_IMAGE} AS x11vnc-build
+ARG SOURCE_DATE_EPOCH
+ENV DEBIAN_FRONTEND=noninteractive
+RUN printf '%s\n' \
+      'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260827T000000Z bookworm main' \
+      'deb-src [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260827T000000Z bookworm main' \
+      > /etc/apt/sources.list \
+    && rm -f /etc/apt/sources.list.d/* \
+    && apt-get -o Acquire::Check-Valid-Until=false update \
+    && apt-get install --yes --no-install-recommends build-essential=12.9 dpkg-dev=1.21.23 patch=2.7.6-7 \
+    && apt-get build-dep --yes --no-install-recommends x11vnc=0.9.16-9
+WORKDIR /tmp
+RUN apt-get source x11vnc=0.9.16-9 \
+    && printf '%s\n' \
+      'ce203e7d4cfaba859502b958824511f328f6f142945277251d3c452406374377  x11vnc_0.9.16.orig.tar.gz' \
+      '02e5e18ecb8ae3576e24b2e8ac3cf7ce946e439be8422eaf81bd34c2490a84d2  x11vnc_0.9.16-9.debian.tar.xz' \
+      | sha256sum --check -
+COPY examples/computer/patches/x11vnc-unix-accept.patch /tmp/x11vnc-unix-accept.patch
+RUN patch --directory /tmp/x11vnc-0.9.16 --strip=1 < /tmp/x11vnc-unix-accept.patch \
+    && cd /tmp/x11vnc-0.9.16 \
+    && dpkg-buildpackage --build=binary --no-sign --jobs=2 \
+    && dpkg-deb --extract /tmp/x11vnc_0.9.16-9_*.deb /opt/x11vnc
+
 FROM ${DEBIAN_IMAGE} AS desktop
 
 ARG SOURCE_DATE_EPOCH
@@ -34,6 +60,9 @@ RUN printf '%s\n' \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/cache/fontconfig/* /var/cache/ldconfig/aux-cache \
     && printf '%032d\n' 0 > /etc/machine-id \
     && ln -sf /etc/machine-id /var/lib/dbus/machine-id
+
+COPY --from=x11vnc-build /opt/x11vnc/usr/bin/x11vnc /usr/bin/x11vnc
+COPY --chmod=0644 examples/computer/patches/x11vnc-unix-accept.patch /usr/share/doc/x11vnc/wefty-unix-accept.patch
 
 FROM desktop AS single-seat
 

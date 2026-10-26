@@ -555,3 +555,54 @@ The person viewer, assets, session, status and sideband reject an HTTP Host
 that neither matches the published door hostname nor names an IP literal
 (HTTP 403 `forbidden`). No new CLI exit code is introduced. `--no-open` and
 `--json` print only the URL.
+
+### Seat screen CLI (#1148)
+
+`wefty seat screenshot|click|move|drag|scroll|type|key SEAT_ID …` requires that
+Seat's saved credential. Missing credentials fail locally; an invalid or
+cross-Seat credential retains the L1/node `forbidden` refusal (exit 3). Input
+uses `/screen/input`; an input call's optional screenshot is a full
+non-incremental frame on that same connection. Screenshot-only calls use
+`/screen/view`. Input is never retried automatically.
+
+`person_driving` remains the existing typed HTTP 409 / CLI exit 5 refusal,
+with message `a person is driving`. A refused input sends no RFB input and
+writes no PNG. Screenshots remain available during a person's tenure.
+Release notes from successful screen handshake headers are printed on stderr.
+The shared Seat reply path prints the unread-events line on text stdout, or
+adds `unread_events_line` to a JSON reply when the count is nonzero. The JSON
+success also includes `unread_events` (including zero), `seat_id`, `action`,
+`path` (empty without a screenshot), and `elapsed_ms`. Structured refusals
+include `details.elapsed_ms`. Measurement starts at CLI dispatch entry before
+configuration and Fabric setup; process launch overhead is measured externally
+by the lane. Reading a note or screenshot does not acknowledge Seat events.
+
+The PNG destination is created exclusively before input is sent. An existing
+or unwritable destination refuses the call before it can act. Once input bytes
+are written, every later failure starts with `<action> done; …` and JSON
+`details.action_done` is `true`. A failed synchronization says `input
+synchronization failed: …`; frame decode and PNG failures say `screenshot
+failed: …`. The completed action must not be retried; every post-input error
+is non-retryable. Failed captures are removed.
+
+A screenshot writes one valid PNG to a fresh private temp file and prints its
+absolute path. `-o FILE` selects an explicit new destination, including inside
+a checkout. Every input accepts `--screenshot [FILE]`; `--screenshot=FILE`
+accepts a filename starting with `-`. An existing destination is refused and
+left intact. Partial PNG files are removed on an encoding/write failure.
+Coordinates must be in `[0,1279] × [0,799]`; malformed arguments fail before
+opening Fabric. `scroll` requires `--dy N`, accepts `--dx N`, and limits each
+axis to 10000 wheel ticks in either direction. See `wefty seat --help` for
+key names and command arguments. Input payloads never enter a log or reply.
+
+Screen TEXT must be nonempty. It is literal even when it starts with `-`.
+Options may precede the Seat ID and TEXT; `--` before them makes all remaining
+arguments literal. Existing options after the required arguments still work.
+Every successful screen reply prints its release note to the caller's stderr,
+including repeated copies across calls. A combined call has one screen reply.
+The latest note repeats until the next release; AI agents act on it once.
+
+The test-only `WEFTY_SEAT_SCREEN_TIMING=1` hook adds JSON `debug` with a
+`screen_timing_start_unix_ns` origin and `screen_timing_ms` phase timestamps.
+It records discovery, dial, banner, input, synchronization, capture connection,
+frame and PNG completion times. It records no input or framebuffer payloads.

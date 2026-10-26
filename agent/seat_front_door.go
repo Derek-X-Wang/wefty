@@ -16,6 +16,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/screentiming"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -141,6 +142,8 @@ func (r *seatFrontDoorRegistration) close() {
 	}
 }
 func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	timing := screentiming.Start("node_fabric")
+	timing("http_received")
 	match := seatFrontDoorPath.FindStringSubmatch(r.URL.Path)
 	if len(match) != 2 {
 		http.NotFound(w, r)
@@ -182,6 +185,7 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	timing("fabric_accepted")
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	stop := context.AfterFunc(seatCtx, cancel)

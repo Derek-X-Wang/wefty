@@ -261,3 +261,48 @@ func TestSeatEndpointRetirementClosesProvisionalPinsAndRefusesLateOpen(t *testin
 		close(finishProbe)
 	})
 }
+
+func TestSeatEndpointLookupRequiresPublishedCurrentGeneration(t *testing.T) {
+	s := newComputerSeats(nil, "")
+	s.generation = 2
+	view, err := os.CreateTemp(t.TempDir(), "view")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+	control, err := os.CreateTemp(t.TempDir(), "control")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	s.entries[1] = &computerSeatEntry{wanted: true, ready: true, readyGeneration: 2, config: ComputerSeat{Place: 1}, endpointScope: "scope", incarnation: 1, endpointPins: map[string]*os.File{"view": view, "control": control}}
+	for _, tc := range []struct {
+		name       string
+		generation uint64
+		ready      bool
+		wantReady  bool
+		wantError  bool
+	}{
+		{"published", 2, true, true, false}, {"unpublished", 2, false, false, false}, {"stale", 1, true, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s.entries[1].ready = tc.ready
+			got, err := s.lookupEndpoints(tc.generation)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("lookup error = %v", err)
+			}
+			if tc.wantError {
+				return
+			}
+			if len(got.Seats) != 1 || (got.Seats[0].State == "ready") != tc.wantReady {
+				t.Fatalf("lookup = %+v", got)
+			}
+			if tc.wantReady && got.Seats[0].Endpoints["control"] != s.entries[1].endpointName("control") {
+				t.Fatalf("missing fenced endpoint: %+v", got)
+			}
+			if !tc.wantReady && len(got.Seats[0].Endpoints) != 0 {
+				t.Fatal("unready endpoint published")
+			}
+		})
+	}
+}

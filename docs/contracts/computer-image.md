@@ -640,6 +640,84 @@ image's highest Seat limit. Their homes are
 refused as `passwd_entry_missing` before desktop startup. User creation stays
 in the read-only image; password age uses fixed non-zero day 20000.
 
+### Warm screen backends
+
+The default image and the optional single-desktop reference start one x11vnc
+per role on first connection. Each remains warm with `-forever -shared`;
+`view` also uses `-viewonly`. Each backend relays concurrent clients through
+a private x11vnc Unix socket in the external socket's existing private
+directory. Both sockets use mode 0600. External paths and roles stay unchanged.
+The image rebuilds the pinned Debian 0.9.16-9 source with
+`examples/computer/patches/x11vnc-unix-accept.patch`. Its `accept_unix` must
+initialize the peer-address length to `sizeof(struct sockaddr_un)` before
+`accept(2)`. The packaged code leaves that input uninitialized. A native
+Linux kernel can then drop the connection; QEMU's user-mode emulation
+refuses before it accepts, so the connection stays queued and no RFB
+greeting arrives. The former per-connection `-inetd` path did not use this function.
+Both image targets copy the patched binary from a separate build stage;
+runtime images retain the package's dependencies and license files, plus the
+applied patch in `/usr/share/doc/x11vnc/wefty-unix-accept.patch`. Source archives
+are checked against pinned SHA-256 digests. Readiness still has the existing
+60-second deadline; a listening socket alone never proves readiness.
+The pinned Debian x11vnc 0.9.16-9 provides `-unixsock PATH`, not
+`-unixsockonly`. Unix-only operation requires **both** LibVNCServer listener
+ports disabled: `-rfbport 0 -rfbportv6 0`. Its separate IPv6 port defaults to
+5900; x11vnc's `-no6` disables only its own additional IPv6 listener, leaving
+that library listener enabled. The backend also supplies `-no6 -noipv6
+-noipv4 -nolookup -norc` and binds any fallback IP listener to loopback with
+`-listen 127.0.0.1 -listenv6 ::1`. It omits `-localhost`, whose IP allow-list
+would reject the AF_UNIX peer's hostname; the private Unix socket retains
+its existing filesystem access controls. Loopback binding is an extra guard,
+never permission to open a TCP listener.
+
+Both roles additionally use `-noremote -novncconnect -nocmds -safer` (all
+supported by the pinned 0.9.16-9). X clients on the Seat's display must not
+reconfigure either backend through `X11VNC_REMOTE` commands or queries, request
+reverse connections through `VNC_CONNECT`, or make the server run external
+commands. This prevents display-property commands from reopening IP listeners
+or changing the view role after admission. Keep the three explicit disable
+flags even with `-safer`; normal RFB input and view access retain their roles.
+
+Before returning each backend connection, and again at its first byte, the
+Linux relay matches the child PID's `/proc/<pid>/fd` socket inodes against
+`/proc/<pid>/net/tcp` and `tcp6`. It refuses the relay, logs the reason through
+the bounded diagnostic sink, and kills/reaps the child if any inode is a TCP
+listener or inspection fails. A missing `tcp6` table is allowed only as the
+kernel's absent-IPv6 case; the child must still be live and `tcp` readable.
+The greeting check is required because x11vnc binds its Unix socket before
+initializing the library's IP listeners. No bytes flow in either direction
+until that check succeeds. These checks guard connection admission; they are
+not continuous process monitoring. The strict lane checks below also catch
+listeners introduced later.
+The namespace-wide TCP tables are streamed without a total byte/row limit;
+browser connections and TIME_WAIT entries must not cause a false refusal.
+Each header and row is bounded to 4096 bytes, and oversized or malformed lines
+fail closed. Listener ownership still matches only the child's socket inodes.
+
+After first use, a supervisor replaces an exited x11vnc without waiting for a
+new client. Repeated exits and spawn `OSError`s back off from 0.1 seconds,
+doubling up to 30 seconds. Ten seconds of child uptime resets the delay to
+0.1 seconds. Incoming clients cannot bypass this supervisor backoff.
+A disconnect closes that client's relay, preserving other clients
+and the role process. Backend shutdown terminates and reaps its x11vnc child.
+Diagnostics are drained continuously, forwarded through the existing bounded
+queue, and limited to 4096 bytes per process lifetime plus truncation and exit
+status lines. All child, restart and refused-connection diagnostics additionally
+share an 8192-byte budget per role per 30-second monotonic window; the next
+window reports suppressed lines. Neither the relay nor diagnostics records
+screen or input data.
+At most two warm x11vnc processes remain per Seat; the screen CLI lane records
+their observed RSS outside its timing intervals when available. The lane also
+checks `/proc/<task>/net/tcp` and `tcp6` before and after screen use: the Seat uid
+must own no listening TCP socket.
+
+For test-only transport timing, the lane creates a private, Seat-owned
+`run/.screen-timing` file. The relay appends role, wall start timestamp and
+monotonic elapsed times for backend connect and first byte from x11vnc. It
+records no bytes or input, creates no file in normal use, and caps this file at
+32 KiB plus one record. The lane prints these records and retains them in its
+timing artifact.
+
 ### Runtime required by every multi-Seat image
 
 Every multi-Seat image must provide executable `/usr/bin/python3`

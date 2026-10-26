@@ -59,10 +59,11 @@ type ApplyComputerSeatsResponse struct {
 	Generation uint64 `json:"generation"`
 }
 type ObserveComputerSeatsRequest struct {
-	Discover   bool             `json:"discover,omitempty"`
-	Cleanup    []ComputerSeat   `json:"cleanup,omitempty"`
-	Authority  AttemptAuthority `json:"authority"`
-	Generation uint64           `json:"generation"`
+	Discover       bool             `json:"discover,omitempty"`
+	Cleanup        []ComputerSeat   `json:"cleanup,omitempty"`
+	Authority      AttemptAuthority `json:"authority"`
+	Generation     uint64           `json:"generation"`
+	EndpointLookup bool             `json:"endpoint_lookup,omitempty"`
 }
 type ComputerSeatObservation struct {
 	Place           int               `json:"place"`

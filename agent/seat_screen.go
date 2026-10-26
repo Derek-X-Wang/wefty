@@ -16,6 +16,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/screentiming"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -133,18 +134,22 @@ func (h *seatScreenHandler) record(ctx context.Context, id string, e l1.SeatLogE
 	return h.config.control.RecordSeatScreenEvent(ctx, id, l1.SeatScreenEventRequest{SeatCopyAuthorityInput: h.input(""), Event: e})
 }
 
-// All helper names come from this generation's own observation, never a URL.
+// All helper names come from this generation's published endpoints, never a URL.
 func (h *seatScreenHandler) dial(ctx context.Context, binding l1.SeatScreenAuthority, kind string) (net.Conn, error) {
-	observed, err := h.config.runtime.ObserveComputerSeats(ctx, ocihelper.ObserveComputerSeatsRequest{Authority: h.config.authority, Generation: binding.Generation})
+	timing := screentiming.Start("node_endpoint")
+	observed, err := h.config.runtime.ObserveComputerSeats(ctx, ocihelper.ObserveComputerSeatsRequest{Authority: h.config.authority, Generation: binding.Generation, EndpointLookup: true})
 	if err != nil {
 		return nil, err
 	}
+	timing("helper_endpoint_lookup")
 	if observed.Generation != binding.Generation {
 		return nil, &ProtocolError{StatusCode: http.StatusServiceUnavailable, APIError: contract.APIError{Code: contract.ErrorUnavailable, Message: "Seat screen generation changed", Retryable: true}}
 	}
 	for _, seat := range observed.Seats {
 		if seat.Place == binding.Place && seat.State == "ready" && seat.Endpoints[kind] != "" {
-			return h.config.runtime.DialSeatEndpoint(ctx, ocihelper.DialSeatEndpointRequest{Authority: h.config.authority, Generation: binding.Generation, Place: binding.Place, Name: seat.Endpoints[kind]})
+			conn, err := h.config.runtime.DialSeatEndpoint(ctx, ocihelper.DialSeatEndpointRequest{Authority: h.config.authority, Generation: binding.Generation, Place: binding.Place, Name: seat.Endpoints[kind]})
+			timing("helper_dial")
+			return conn, err
 		}
 	}
 	return nil, &ProtocolError{StatusCode: http.StatusServiceUnavailable, APIError: contract.APIError{Code: contract.ErrorUnavailable, Message: "Seat screen is not ready", Retryable: true}}
@@ -467,8 +472,11 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Seat screen requires the binary WebSocket subprotocol", http.StatusBadRequest)
 		return
 	}
+	timing := screentiming.Start("node_screen")
+	timing("request_received")
 	input := suffix == "/screen/input"
 	binding, err := h.config.control.AuthorizeSeatScreen(r.Context(), id, l1.SeatScreenAuthorityInput{SeatCopyAuthorityInput: h.input(r.Header.Get(l1.SeatCredentialHeader)), Input: input})
+	timing("l1_authorize_returned")
 	if err != nil {
 		writeSeatScreenError(w, err)
 		return
@@ -501,6 +509,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeSeatScreenError(w, err)
 		return
 	}
+	timing("backend_banner_received")
 	defer backendWS.CloseNow()
 	defer backend.Close()
 	stopBackend := context.AfterFunc(ctx, func() { _ = backendWS.CloseNow() })
@@ -522,6 +531,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer clientWS.CloseNow()
 	stopClient := context.AfterFunc(ctx, func() { _ = clientWS.CloseNow() })
 	defer stopClient()
+	timing("websocket_accepted")
 	client := websocket.NetConn(ctx, clientWS, websocket.MessageBinary)
 	if _, err = client.Write(banner); err != nil {
 		return
