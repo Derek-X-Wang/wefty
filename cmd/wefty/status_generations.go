@@ -78,6 +78,14 @@ func settledGenerationCancellation(a l1.NodeGenerationAttempt) bool {
 		(*a.State == contract.AttemptFailed || *a.State == contract.AttemptSucceeded)
 }
 
+// Only an accepted payload-owned exit settles a failed Attempt. Agent/guardian
+// stops and lost/interrupted Attempts retain their diagnosis. Owner cancellation
+// is settled separately through the authoritative Job outcome.
+func settledGenerationPayloadExit(a l1.NodeGenerationAttempt) bool {
+	return a.ObservationError == "" && a.JobOutcome == "" && a.TerminationInitiator == "" &&
+		a.State != nil && *a.State == contract.AttemptFailed && a.ExitCode != nil && *a.ExitCode != 0
+}
+
 func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Time) generationStatus {
 	ns := nodeStatuses(l1.NodeList{Nodes: []l1.Node{node}})[0]
 	result := generationStatus{NodeID: node.NodeID, ID: g.AgentGenerationID, Role: string(g.Role), Version: g.Version, RetirementStartedAt: g.RetirementStartedAt, SelectedProtocol: g.SelectedProtocol, RemainingRunIDs: []string{}, RemainingAttemptIDs: []string{}, UnledgeredAttemptIDs: []string{}, RenewalHealth: "healthy", Progress: "evidence_pending", Attempts: g.Attempts, Capacity: &generationCapacity{node.ClaimsEnabled, ns.FreeOneshot, ns.TotalOneshot, ns.FreeService, ns.TotalService}}
@@ -137,7 +145,7 @@ func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Ti
 					result.RenewalHealth = "unverified"
 				}
 			}
-		case settledGenerationCancellation(a):
+		case settledGenerationCancellation(a) || settledGenerationPayloadExit(a):
 		case state == contract.AttemptLost || state == contract.AttemptInterrupted || state == contract.AttemptFailed:
 			result.Problems = append(result.Problems, statusReason{"retiring_attempt_problem", interruptionDetail(label, state, a.InterruptionReason)})
 			result.RenewalHealth = "degraded"
@@ -363,8 +371,8 @@ func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, 
 				result.UpgradeState = "interrupted"
 			}
 		}
-		// Reboot observations remain problems even after recovery completed and
-		// even when an old generation's local files have already been cleaned up.
+		// Reboot interruptions remain problems after recovery completes, even when
+		// an old generation's local files have already been cleaned up.
 		for id, a := range receipt.RebootAttempts {
 			if a.State != contract.AttemptLost && a.State != contract.AttemptInterrupted && a.State != contract.AttemptFailed {
 				continue
@@ -372,16 +380,32 @@ func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, 
 			found := false
 			for i := range result.Generations {
 				g := &result.Generations[i]
+				if g.NodeID != receipt.NodeID {
+					continue
+				}
 				for _, observed := range g.Attempts {
 					if observed.AttemptID == id {
 						found = true
-						if observed.State == nil {
-							label := "Attempt " + id
-							if observed.RunID != "" {
-								label = fmt.Sprintf("Run %s (Attempt %s)", observed.RunID, id)
-							}
-							g.Problems = append(g.Problems, statusReason{"retiring_attempt_problem", "recorded reboot observation: " + interruptionDetail(label, a.State, a.InterruptionReason) + "; current Attempt state unknown"})
+						settled := settledGenerationPayloadExit(observed) || settledGenerationCancellation(observed)
+						if a.State == contract.AttemptFailed && settled {
+							// Settlement must come from this Node's current L1 snapshot,
+							// never the saved reboot receipt's local completion copy.
+							continue
 						}
+						if observed.State != nil && !settled && (*observed.State == contract.AttemptFailed || *observed.State == contract.AttemptLost || *observed.State == contract.AttemptInterrupted) {
+							continue // Current snapshot already projects the Attempt problem.
+						}
+						label := "Attempt " + id
+						if observed.RunID != "" {
+							label = fmt.Sprintf("Run %s (Attempt %s)", observed.RunID, id)
+						}
+						qualification := "; current Attempt does not establish settled payload completion"
+						if observed.State == nil {
+							qualification = "; current Attempt state unknown"
+						} else {
+							g.RenewalHealth = "degraded"
+						}
+						g.Problems = append(g.Problems, statusReason{"retiring_attempt_problem", "recorded reboot observation: " + interruptionDetail(label, a.State, a.InterruptionReason) + qualification})
 					}
 				}
 			}

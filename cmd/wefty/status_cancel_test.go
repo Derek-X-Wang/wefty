@@ -55,17 +55,77 @@ func cancellationStatusNodes(t *testing.T, outcome string, extra contract.Attemp
 
 func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 	binary := buildPlainInstallCLI(t)
+	exit17, exit143, exit0 := 17, 143, 0
 	for _, tc := range []struct {
 		name, outcome string
 		extra         contract.AttemptState
 		problems      int
+		exitCode      *int
+		state         contract.AttemptState
+		closed        bool
+		recorded      bool
+		priorBoot     bool
+		initiator     string
+		current       string
 	}{
-		{"cancelled-and-lost", "canceled", contract.AttemptLost, 1},
-		{"cancelled-alone", "canceled", "", 0},
-		{"failed-by-itself", "", "", 1},
+		{name: "cancelled-and-lost", outcome: "canceled", extra: contract.AttemptLost, problems: 1},
+		{name: "cancelled-alone", outcome: "canceled"},
+		{name: "failed-without-payload-evidence", problems: 1},
+		{name: "payload-exit-17", exitCode: &exit17},
+		{name: "agent-initiated-exit-17", exitCode: &exit17, initiator: "agent", problems: 1},
+		{name: "guardian-initiated-exit-17", exitCode: &exit17, initiator: "guardian", problems: 1},
+		{name: "owner-cancel-initiated-exit-17", exitCode: &exit17, initiator: "agent", outcome: "canceled"},
+		{name: "closed-payload-exit-17", exitCode: &exit17, closed: true},
+		{name: "payload-exit-143", exitCode: &exit143},
+		{name: "failed-with-exit-zero", exitCode: &exit0, problems: 1},
+		{name: "stale-live-with-payload-evidence", exitCode: &exit17, state: contract.AttemptRunning, problems: 1},
+		{name: "prior-boot-live-with-payload-evidence", exitCode: &exit17, state: contract.AttemptRunning, priorBoot: true, problems: 1},
+		{name: "recorded-payload-exit-17", exitCode: &exit17, recorded: true, problems: 1},
+		{name: "recorded-payload-exit-17-current", exitCode: &exit17, recorded: true, current: "matching"},
+		{name: "recorded-payload-exit-17-current-agent", exitCode: &exit17, recorded: true, current: "matching", initiator: "agent", problems: 1},
+		{name: "recorded-payload-exit-17-current-unknown", exitCode: &exit17, recorded: true, current: "unknown", problems: 1},
+		{name: "recorded-payload-exit-17-current-live", exitCode: &exit17, recorded: true, current: "live", problems: 1},
+		{name: "recorded-payload-exit-17-other-node", exitCode: &exit17, recorded: true, current: "other-node", problems: 1},
+		{name: "recorded-failed-without-evidence", recorded: true, problems: 1},
+		{name: "recorded-lost-with-payload-evidence", recorded: true, exitCode: &exit17, state: contract.AttemptLost, problems: 1},
+		{name: "recorded-interrupted-with-payload-evidence", recorded: true, exitCode: &exit17, state: contract.AttemptInterrupted, problems: 1},
+		{name: "lost-with-payload-evidence", exitCode: &exit17, state: contract.AttemptLost, problems: 1},
+		{name: "interrupted-with-payload-evidence", exitCode: &exit17, state: contract.AttemptInterrupted, problems: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			nodes := cancellationStatusNodes(t, tc.outcome, tc.extra)
+			if tc.state != "" {
+				nodes.Nodes[0].Generations[1].Attempts[0].State = generationAttemptState(tc.state)
+			}
+			if tc.priorBoot {
+				nodes.Nodes[0].Generations[1].PreviousSystemBoot = true
+			}
+			if tc.closed {
+				nodes.Nodes[0].Generations[1].Role = l1.NodeGenerationClosed
+			}
+			// Wire input exercises the production decoder even before the field exists.
+			payload, err := json.Marshal(nodes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var wire map[string]any
+			if err := json.Unmarshal(payload, &wire); err != nil {
+				t.Fatal(err)
+			}
+			attempt := wire["nodes"].([]any)[0].(map[string]any)["generations"].([]any)[1].(map[string]any)["attempts"].([]any)[0].(map[string]any)
+			if tc.exitCode != nil {
+				attempt["exit_code"] = *tc.exitCode
+			}
+			if tc.initiator != "" {
+				attempt["termination_initiator"] = tc.initiator
+			}
+			payload, err = json.Marshal(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(payload, &nodes); err != nil {
+				t.Fatal(err)
+			}
 			f := newPlainBinaryFixture(t, binary)
 			network := plain.NewNetwork()
 			participant := network.NewFabric(fabric.Identity{NodeID: "cancel-test-control"})
@@ -87,6 +147,8 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorPersonIdentityRequired, Message: "machine principal"}})
 				case "/v1/seat-approval-windows":
 					_ = json.NewEncoder(w).Encode([]l1.SeatApprovalWindow{})
+				case "/v1/runs/run-0":
+					_ = json.NewEncoder(w).Encode(contract.RunRecord{RunID: "run-0", Status: contract.RunRunning})
 				case "/v1/runs":
 					_ = json.NewEncoder(w).Encode(map[string]any{"runs": []any{}})
 				default:
@@ -101,6 +163,41 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 			f.setup.host.l1Address = strings.TrimPrefix(server.URL, "http://")
 			f.setup.host.l3Address = f.setup.host.l1Address
 			f.setup.setup(t, setupRequest{nodeID: "test-mac"})
+			if tc.recorded {
+				paths, _ := resolveSetupPaths(f.setup.home)
+				state := contract.AttemptFailed
+				if tc.state != "" {
+					state = tc.state
+				}
+				var result *l1.ProcessResult
+				if tc.exitCode != nil {
+					result = &l1.ProcessResult{ExitCode: tc.exitCode}
+				}
+				receipt := upgradeRollingReceipt{Version: 1, OperationID: "recorded-reboot", NodeID: "test-mac",
+					RebootAttempts: map[string]l1.Attempt{"attempt-0": {State: state, Result: result}},
+					Inventory:      l1.NodeGenerationInventory{Generations: []l1.NodeGeneration{{AgentGenerationID: "old-0", ResidentAttempts: []l1.ResidentAttempt{{JobID: "job-0", AttemptID: "attempt-0"}}}}},
+				}
+				if err := writeUpgradeRolling(paths, &receipt, "reboot_reconciled"); err != nil {
+					t.Fatal(err)
+				}
+				// The retained receipt is the only evidence for this old generation.
+				switch tc.current {
+				case "matching":
+				case "unknown":
+					nodes.Nodes[0].Generations[1].Attempts[0].State = nil
+				case "live":
+					a := &nodes.Nodes[0].Generations[1].Attempts[0]
+					a.State = generationAttemptState(contract.AttemptRunning)
+					a.LeaseExpiresAt = generationDeadline(time.Now().Add(time.Hour))
+				case "other-node":
+					other := nodes.Nodes[0]
+					other.NodeID = "other-node"
+					nodes.Nodes = append(nodes.Nodes, other)
+					nodes.Nodes[0].Generations = nodes.Nodes[0].Generations[:1]
+				default:
+					nodes.Nodes[0].Generations = nodes.Nodes[0].Generations[:1]
+				}
+			}
 			before := diagnosticTree(t, f.setup.home)
 			for _, command := range []string{"status", "doctor"} {
 				for _, asJSON := range []bool{true, false} {
@@ -120,14 +217,18 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 						}
 						if asJSON {
 							var report struct {
-								Ready       bool                 `json:"ready"`
-								Healthy     bool                 `json:"healthy"`
-								Generations []generationStatus   `json:"generations"`
-								Reasons     []statusReason       `json:"reasons"`
-								Findings    []plainDoctorFinding `json:"findings"`
+								Ready         bool                 `json:"ready"`
+								Healthy       bool                 `json:"healthy"`
+								Generations   []generationStatus   `json:"generations"`
+								Reasons       []statusReason       `json:"reasons"`
+								Findings      []plainDoctorFinding `json:"findings"`
+								UpgradeDetail string               `json:"upgrade_detail"`
 							}
 							if err := json.Unmarshal([]byte(out), &report); err != nil {
 								t.Fatal(err)
+							}
+							if tc.current != "unknown" && strings.Contains(report.UpgradeDetail, "problems need attention") != (tc.problems > 0) {
+								t.Errorf("incorrect upgrade detail: %s", report.UpgradeDetail)
 							}
 							healthy := report.Ready
 							if command == "doctor" {
@@ -155,12 +256,12 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 							}
 							findings := 0
 							for _, r := range report.Reasons {
-								if r.Code == "retiring_attempt_problem" {
+								if strings.HasPrefix(r.Code, "retiring_") {
 									findings++
 								}
 							}
 							for _, f := range report.Findings {
-								if f.Check == "retiring_attempt_problem" {
+								if strings.HasPrefix(f.Check, "retiring_") {
 									findings++
 								}
 							}
@@ -175,7 +276,7 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 								if !strings.Contains(out, "Run run-0 (Attempt attempt-0): canceled") || strings.Contains(out, "Run run-0 (Attempt attempt-0): failed") {
 									t.Errorf("cancellation not settled: %s", out)
 								}
-							} else if !strings.Contains(out, "Run run-0 (Attempt attempt-0): failed") {
+							} else if !tc.recorded && tc.state == "" && tc.problems > 0 && !strings.Contains(out, "Run run-0 (Attempt attempt-0): failed") {
 								t.Errorf("failure disappeared: %s", out)
 							}
 							if tc.extra == contract.AttemptLost && !strings.Contains(out, "Run run-extra (Attempt attempt-extra): lost") {

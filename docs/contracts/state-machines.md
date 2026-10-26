@@ -2763,7 +2763,19 @@ capacity. Optional resident `job_outcome` exposes the authoritative Job outcome
 in the same snapshot. Failed or succeeded Attempts with `canceled` outcome are
 settled cancellation for status and doctor; live, lost, interrupted, and
 expired-Lease Attempts retain their existing diagnosis. Process results never
-infer cancellation. See [rolling diagnosis](plain-node-upgrade.md#read-only-rolling-status-and-doctor-1181).
+infer cancellation. Optional resident `exit_code` comes from the accepted
+completion result in the same snapshot, never late evidence. A failed Attempt
+with a recorded nonzero payload-owned exit is settled for status and doctor,
+including closed generation history. Optional resident `termination_initiator`
+is read from the accepted Attempt row in that same `ReadOnly:true` snapshot.
+Agent/guardian-initiated exits remain operator problems; owner cancellation
+continues to use the authoritative Job outcome. Saved reboot receipts cannot
+establish settlement alone: a recorded failure requires matching current L1
+completion evidence for that Attempt on the same Node. Receipt-only, unknown or
+live current observations retain the problem or unverified diagnosis. Failure
+without payload-owned completion evidence, loss, interruption and stale live
+Leases remain operator problems.
+See [rolling diagnosis](plain-node-upgrade.md#read-only-rolling-status-and-doctor-1181).
 
 An enrolled Node without generation observations is unverified. Diagnostic
 catalog and retirement-ack reads never wait for the catalog lock; contention and

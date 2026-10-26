@@ -27,15 +27,17 @@ type NodeGenerationObservation struct {
 }
 
 type NodeGenerationAttempt struct {
-	ObservationError   string                 `json:"observation_error,omitempty"`
-	JobID              string                 `json:"job_id"`
-	AttemptID          string                 `json:"attempt_id"`
-	RunID              string                 `json:"run_id,omitempty"`
-	JobOutcome         contract.JobOutcome    `json:"job_outcome,omitempty"`
-	State              *contract.AttemptState `json:"state"`
-	LastRenewedAt      *time.Time             `json:"last_renewed_at"`
-	LeaseExpiresAt     *time.Time             `json:"lease_expires_at"`
-	InterruptionReason InterruptionReason     `json:"interruption_reason,omitempty"`
+	ObservationError     string                    `json:"observation_error,omitempty"`
+	JobID                string                    `json:"job_id"`
+	AttemptID            string                    `json:"attempt_id"`
+	RunID                string                    `json:"run_id,omitempty"`
+	JobOutcome           contract.JobOutcome       `json:"job_outcome,omitempty"`
+	State                *contract.AttemptState    `json:"state"`
+	ExitCode             *int                      `json:"exit_code,omitempty"`
+	TerminationInitiator contract.TerminationCause `json:"termination_initiator,omitempty"`
+	LastRenewedAt        *time.Time                `json:"last_renewed_at"`
+	LeaseExpiresAt       *time.Time                `json:"lease_expires_at"`
+	InterruptionReason   InterruptionReason        `json:"interruption_reason,omitempty"`
 }
 
 // Called only inside the existing read snapshot, with its ReadOnly transaction.
@@ -73,7 +75,7 @@ func readNodeGenerationObservations(ctx context.Context, q queryer, nodeID strin
 
 func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID string, resident ResidentAttempt) (NodeGenerationAttempt, error) {
 	a := NodeGenerationAttempt{JobID: resident.JobID, AttemptID: resident.AttemptID}
-	rows, err := q.QueryContext(ctx, `SELECT a.state,a.last_renewal_ns,a.lease_expires_ns,COALESCE(a.interruption_reason,''),j.spec_json,j.outcome FROM attempts a JOIN jobs j ON j.job_id=a.job_id WHERE a.attempt_id=? AND a.job_id=? AND a.node_id=?`, resident.AttemptID, resident.JobID, nodeID)
+	rows, err := q.QueryContext(ctx, `SELECT a.state,a.last_renewal_ns,a.lease_expires_ns,COALESCE(a.interruption_reason,''),j.spec_json,j.outcome,a.result_json,COALESCE(a.termination_initiator,'') FROM attempts a JOIN jobs j ON j.job_id=a.job_id WHERE a.attempt_id=? AND a.job_id=? AND a.node_id=?`, resident.AttemptID, resident.JobID, nodeID)
 	if err != nil {
 		return a, err
 	}
@@ -88,8 +90,8 @@ func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID str
 	var state contract.AttemptState
 	var renewal sql.NullInt64
 	var expiry int64
-	var specJSON []byte
-	scanErr := rows.Scan(&state, &renewal, &expiry, &a.InterruptionReason, &specJSON, &a.JobOutcome)
+	var specJSON, resultJSON []byte
+	scanErr := rows.Scan(&state, &renewal, &expiry, &a.InterruptionReason, &specJSON, &a.JobOutcome, &resultJSON, &a.TerminationInitiator)
 	// Database iteration failures invalidate the snapshot; conversion failures
 	// describe this one retained record and preserve its frozen identity.
 	if err := rows.Err(); err != nil {
@@ -98,6 +100,13 @@ func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID str
 	if scanErr != nil {
 		a.ObservationError = fmt.Sprintf("Job %s (Attempt %s): unreadable retained Attempt: %v", a.JobID, a.AttemptID, scanErr)
 		return a, nil
+	}
+	var result ProcessResult
+	if len(resultJSON) > 0 {
+		if err := json.Unmarshal(resultJSON, &result); err != nil {
+			a.ObservationError = fmt.Sprintf("Job %s (Attempt %s): unreadable retained Attempt result: %v", a.JobID, a.AttemptID, err)
+			return a, nil
+		}
 	}
 	var spec struct {
 		Labels map[string]string `json:"labels"`
@@ -108,6 +117,7 @@ func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID str
 	}
 	a.RunID = spec.Labels[contract.LabelRunID]
 	a.State = &state
+	a.ExitCode = result.ExitCode
 	deadline := time.Unix(0, expiry).UTC()
 	a.LeaseExpiresAt = &deadline
 	if renewal.Valid {

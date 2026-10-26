@@ -942,8 +942,29 @@ of process exit evidence. A failed or succeeded Attempt with that outcome is
 settled: text shows `canceled`, JSON retains the Attempt state and
 `job_outcome: canceled`, and neither readiness nor doctor's exit is degraded.
 Cancellation intent alone does not settle live Attempts or hide lost,
-interrupted, or expired-Lease problems. Absent outcome preserves the existing
-failure diagnosis; exit code 143 and message text never establish cancellation.
+interrupted, or expired-Lease problems. Exit code 143 and message text never
+establish cancellation.
+
+Optional resident `exit_code` comes only from the accepted Attempt completion
+result in that same read snapshot, never from a late result or message text. A
+failed Attempt with a recorded nonzero payload-owned exit is also settled, like a
+succeeded Attempt, including retained closed generations. Optional resident
+`termination_initiator` comes from the accepted Attempt row in that same
+`ReadOnly:true` snapshot. An `agent` or `guardian` initiator means the stop was
+not payload-owned and the failed Attempt remains a `retiring_attempt_problem`,
+even if the payload's stop handler exited 17. Owner cancellation continues to
+settle only through the existing `job_outcome: canceled` rule.
+
+A saved reboot receipt cannot establish a payload-owned completion by itself.
+A recorded failed Attempt settles only when the current L1 snapshot contains
+matching accepted payload-owned completion evidence for that Attempt on the same
+Node (or the existing authoritative Job cancellation outcome). With only a
+receipt, or an unknown or live current observation, the problem or unverified
+diagnosis remains. For a settled payload-owned exit, status remains ready,
+retirement renewal stays healthy, and doctor raises no operator problem. Failures without
+accepted payload exit evidence, lost and interrupted Attempts, live stale Leases,
+and reboot-interrupted Attempts retain their diagnosis. Missing or unreadable
+completion evidence never establishes settlement.
 
 The healthy finishing count also verifies each distinct mapped Run through the
 existing public L3 Run GET. Terminal ledger Runs are excluded even while their
