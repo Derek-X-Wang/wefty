@@ -539,3 +539,19 @@ A missing local credential for `wefty exec --seat` returns the existing
 `forbidden` code (non-retryable, CLI exit 3), as for an unknown Seat
 credential. It includes `seat_id` in details and directs the caller to
 `wefty seat wait SEAT_ID`, before making any network call.
+
+`wefty seat view SEAT_ID` requires administrator person authority, without a
+Seat credential. Its read-only `viewer-target` discovery returns `admin_required`
+(HTTP 403, CLI exit 5) to non-admin people; machine principals receive the
+existing `principal_forbidden`. The front-door page, assets and browser session
+refuse non-admins with `control_not_authorized` (HTTP 403). An ended Seat returns
+`seat_ended` (CLI exit 5); a screen that is not published returns `unavailable`.
+The browser status poll returns `takeover_session_ended` (HTTP 410) and the typed
+`session_end_reason`, including `session_cap_expired`; the owner reconnects. A
+typed `seat_ended` poll reply ends the viewer. A 404 instead starts a bounded
+30-second reconnect wait with input disabled, then asks the owner to reopen the
+viewer without claiming the Seat ended. Status polls run every three seconds.
+The person viewer, assets, session, status and sideband reject an HTTP Host
+that neither matches the published door hostname nor names an IP literal
+(HTTP 403 `forbidden`). No new CLI exit code is introduced. `--no-open` and
+`--json` print only the URL.

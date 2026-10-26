@@ -13,7 +13,7 @@ var helpCommands = []string{
 	"open",
 	"", "help", "cp", "exec", "setup", "submit", "status", "whoami", "cancel", "rerun", "logs", "wait", "results", "inspect", "drain",
 	"nodes", "nodes list", "nodes inspect", "nodes set-claims", "jobs", "jobs list", "computers", "computers list", "runs", "runs list",
-	"seat", "seat request", "seat wait", "seat window", "seat window close",
+	"seat", "seat request", "seat wait", "seat view", "seat window", "seat window close",
 	"admin", "admin bootstrap", "admin policy", "admin policy get", "admin policy add", "admin policy remove",
 	"admins", "admins list", "admins get", "admins add", "admins remove",
 	"node", "node doctor", "node setup-oci", "node load-image", "node oci", "node oci start", "node oci stop", "node oci removals",

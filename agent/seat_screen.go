@@ -180,6 +180,8 @@ func (h *seatScreenHandler) seat(ctx context.Context, id string) (*seatScreen, e
 		jobID: h.config.authority.JobID, attemptID: h.config.authority.AttemptID,
 		storageID: h.config.storage, storageGeneration: h.config.storageGeneration,
 		fencingToken: h.config.authority.FencingToken, dial: dial, administratorsOnly: true,
+		seatViewerPath:   "/v1/seats/" + id + "/person/viewer",
+		seatViewerStatus: func(ctx context.Context) error { _, err := auth(ctx); return err },
 		onReport: func(err error) {
 			failure := fmt.Errorf("computer=%q seat=%q: %w", h.config.computer, id, err)
 			var audit *computerAuditFailure

@@ -139,6 +139,12 @@ Seat or a typed refusal. After a cut-off call, use `seat wait` with that ID;
 requesting again makes a different request. The request waits during the
 owner's dialog; run it in the background or rely on `wefty seat wait`.
 
+The owner can watch with `wefty seat view SEAT_ID`, take control, and release
+with an optional note. `--no-open` prints the URL; `--json` prints it as JSON.
+An AI agent must not open the viewer itself: the viewer counts as a person.
+While a person drives, use screenshots to watch; leave screen input to the
+person, including input made by commands such as Playwright or `xdotool`.
+
 Release when done: `wefty seat release SEAT_ID`. Copy results out first.
 Release stops commands and programs, then deletes the Seat folder after cleanup.
 An idle Seat expires after 30 minutes; log following counts only at start.

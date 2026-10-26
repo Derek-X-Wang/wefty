@@ -134,6 +134,8 @@ type computerGrantAuthorizer interface {
 type computerFrontDoorConfig struct {
 	seatCopy             http.Handler
 	administratorsOnly   bool
+	seatViewerStatus     func(context.Context) error
+	seatViewerPath       string
 	authorityContext     context.Context
 	fabric               fabric.Fabric
 	authorizer           computerGrantAuthorizer
@@ -177,9 +179,10 @@ type computerSessionHandle struct {
 }
 
 type activeComputerSession struct {
-	handle   *computerSessionHandle
-	identity fabric.Identity
-	cancel   context.CancelCauseFunc
+	handle    *computerSessionHandle
+	identity  fabric.Identity
+	cancel    context.CancelCauseFunc
+	expiresAt time.Time
 }
 
 func (session *activeComputerSession) end(reason l1.ComputerTakeoverReason, policyRevision int64) {
@@ -416,12 +419,14 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 		frontDoor.serveControlAction(writer, request, identity)
 		return
 	}
-	if request.URL.Path != computerWebSocketPath || request.URL.RawQuery != "" || request.Method != http.MethodGet {
+	viewerResource := frontDoor.config.administratorsOnly && isSeatViewerResource(request.URL.Path)
+	viewerSession := frontDoor.config.administratorsOnly && request.URL.Path == seatViewerSessionPath
+	if (request.URL.Path != computerWebSocketPath && !viewerResource && !viewerSession) || request.URL.RawQuery != "" || request.Method != http.MethodGet {
 		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverInvalidRequestPath)
 		http.Error(writer, "Computer display path is fixed", http.StatusNotFound)
 		return
 	}
-	if !exactComputerSubprotocol(request.Header.Values("Sec-WebSocket-Protocol")) {
+	if !viewerResource && !exactComputerSubprotocol(request.Header.Values("Sec-WebSocket-Protocol")) {
 		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverInvalidSubprotocol)
 		http.Error(writer, "Computer display requires the binary WebSocket subprotocol", http.StatusBadRequest)
 		return
@@ -451,6 +456,11 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
 		writeComputerControlError(writer, http.StatusForbidden, contract.APIError{Code: contract.ErrorControlNotAuthorized,
 			Message: "Computer access is not authorized", Retryable: false}, nil)
+		return
+	}
+	if viewerResource {
+		defer authorization.Release()
+		frontDoor.serveSeatViewerResource(writer, request, identity)
 		return
 	}
 	frontDoor.serveAuthorized(writer, request, identity, authorization, admittedAt)
@@ -718,7 +728,7 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		return
 	}
 	defer handle.tenure.Unregister(sessionID)
-	active := &activeComputerSession{handle: handle, identity: identity, cancel: cancelSession}
+	active := &activeComputerSession{handle: handle, identity: identity, cancel: cancelSession, expiresAt: admittedAt.Add(frontDoor.config.sessionCap)}
 	frontDoor.mu.Lock()
 	if !frontDoor.ready {
 		frontDoor.mu.Unlock()
@@ -744,6 +754,17 @@ func (frontDoor *computerFrontDoor) serveAuthorized(
 		frontDoor.sessionCond.Broadcast()
 		frontDoor.mu.Unlock()
 	}()
+	if request.URL.Path == seatViewerSessionPath {
+		// The browser can read frames, but cannot read upgrade response headers.
+		// Issue only after this exact session is registered, before any RFB bytes.
+		metadata, _ := json.Marshal(seatViewerSession{Bearer: controlToken, RemainingSeconds: remainingSeatViewerSeconds(frontDoor.config.clock.Now(), active.expiresAt)})
+		if err := clientWebSocket.Write(sessionContext, websocket.MessageText, metadata); err != nil {
+			relay.Close()
+			release()
+			frontDoor.finishSession(request.Context(), baseEvent, l1.ComputerTakeoverClientClosed)
+			return
+		}
+	}
 	if _, err := client.Write(banner); err != nil {
 		_ = backend.Close()
 		release()

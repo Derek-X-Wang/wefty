@@ -81,6 +81,7 @@ const (
 )
 
 var driftRows = []driftRow{
+	{responseBody(clientDoc, "get", "/v1/seats/{seat_id}/viewer-target", "200"), typeOf[l1.SeatViewerTarget]()},
 	{responseBody(clientDoc, "get", "/v1/seats/{seat_id}/screen-target", "200"), typeOf[l1.SeatCopyTarget]()},
 	{requestBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/screen-authority"), typeOf[l1.SeatScreenAuthorityInput]()},
 	{responseBody(agentDoc, "post", "/v1/agent/seats/{seat_id}/screen-authority", "200"), typeOf[l1.SeatScreenAuthority]()},

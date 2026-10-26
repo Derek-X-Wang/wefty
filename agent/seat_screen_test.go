@@ -307,6 +307,7 @@ func TestSeatScreenDoorPreservesIdentityLookupFailure(t *testing.T) {
 	}{{errors.New("private identity lookup cause"), 503}, {fabric.ErrIdentityNotFound, 401}} {
 		identity.set(fabric.Identity{}, tc.failure)
 		request := httptest.NewRequest(http.MethodGet, "/v1/seats/"+id+"/person/websockify", nil)
+		request.Host = "127.0.0.1" // A valid door host keeps this test at the identity boundary.
 		reply := httptest.NewRecorder()
 		door.ServeHTTP(reply, request)
 		if reply.Code != tc.status || strings.Contains(reply.Body.String(), "private identity lookup cause") {

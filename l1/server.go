@@ -521,6 +521,7 @@ func (s *Server) routes() http.Handler {
 	person.HandleFunc("GET /v1/computers/{computer_id}/takeover/sessions", s.listComputerTakeoverSessions)
 	person.HandleFunc("GET /v1/computers/{computer_id}/takeover/audit", s.listComputerTakeoverAudit)
 	person.HandleFunc("GET /v1/computers/{computer_id}/takeover", s.getComputerTakeoverAccess)
+	person.HandleFunc("GET /v1/seats/{seat_id}/viewer-target", s.getSeatViewerTarget)
 	person.HandleFunc("PUT /v1/computers/{computer_id}/submission", s.mutateComputerSubmission)
 
 	// The attempt credential reaches a separate credential protocol rather
@@ -545,6 +546,7 @@ func (s *Server) routes() http.Handler {
 	seatLogs.HandleFunc("POST /v1/seats/{seat_id}/release", s.releaseSeat)
 	root := http.NewServeMux()
 	root.Handle("/v1/seats/", s.authorize(clientPrincipal, seatLogs))
+	root.Handle("GET /v1/seats/{seat_id}/viewer-target", s.authorize(personPrincipal, person))
 	root.Handle("/v1/seat-requests", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/seat-requests/", s.authorize(clientPrincipal, client))
 	root.Handle("/v1/seat-approval-windows", s.authorize(clientPrincipal, client))
