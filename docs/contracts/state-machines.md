@@ -2763,7 +2763,12 @@ capacity. Optional resident `job_outcome` exposes the authoritative Job outcome
 in the same snapshot. Failed or succeeded Attempts with `canceled` outcome are
 settled cancellation for status and doctor; live, lost, interrupted, and
 expired-Lease Attempts retain their existing diagnosis. Process results never
-infer cancellation. See [rolling diagnosis](plain-node-upgrade.md#read-only-rolling-status-and-doctor-1181).
+infer cancellation. Optional resident `exit_code` comes from the accepted
+completion result in the same snapshot, never late evidence. A failed Attempt
+with a recorded nonzero payload exit is settled for status and doctor, including
+closed generation history and recorded reboot observations. Failure without that
+evidence, loss, interruption and stale live Leases remain operator problems.
+See [rolling diagnosis](plain-node-upgrade.md#read-only-rolling-status-and-doctor-1181).
 
 An enrolled Node without generation observations is unverified. Diagnostic
 catalog and retirement-ack reads never wait for the catalog lock; contention and

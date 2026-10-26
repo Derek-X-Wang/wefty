@@ -3698,6 +3698,10 @@
             "enum": ["canceled"],
             "description": "Authoritative Job outcome, independent of process exit evidence. Absent without a reserved outcome. A failed or succeeded Attempt with canceled outcome is settled cancellation; live, lost and interrupted Attempts retain their own Lease or interruption diagnosis."
           },
+          "exit_code": {
+            "type": "integer",
+            "description": "Payload exit code from the accepted Attempt completion result, read in the same snapshot. Absent without accepted payload exit evidence; late results never supply it. A failed Attempt with a nonzero exit code is settled for status and doctor. Lost and interrupted Attempts retain their diagnosis."
+          },
           "state": {
             "enum": ["claimed", "running", "awaiting-input", "succeeded", "failed", "lost", "interrupted", null],
             "description": "Retained Attempt state; null means the frozen resident observation is unavailable."

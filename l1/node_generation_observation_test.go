@@ -72,6 +72,7 @@ func TestNodeGenerationObservationsRetainLossAndAcceptedRenewal(t *testing.T) {
 
 func TestNodeGenerationObservationReadsDoNotTakeWriterLock(t *testing.T) {
 	f := newGenerationFixture(t)
+	f.claim(t, "resident")
 	tx, err := f.h.store.db.BeginTx(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -310,6 +311,88 @@ func TestNodeGenerationObservationJobOutcome(t *testing.T) {
 							}
 						} else if _, present := fields["job_outcome"]; present {
 							t.Errorf("invented outcome from exit 143: %s", payload)
+						}
+					}
+				}
+				if !found {
+					t.Fatal("retiring resident disappeared")
+				}
+			}
+		})
+	}
+}
+
+func TestNodeGenerationObservationPayloadExit(t *testing.T) {
+	for _, tc := range []struct {
+		name, result, lateResult string
+		wantExit                 any
+		wantError                bool
+	}{
+		{name: "payload-exit-17", result: `{"exit_code":17}`, wantExit: float64(17)},
+		{name: "payload-exit-zero", result: `{"exit_code":0}`, wantExit: float64(0)},
+		{name: "no-result"},
+		{name: "infrastructure-failure", result: `{"output_error":"cannot retain output"}`},
+		{name: "late-exit-is-not-accepted", lateResult: `{"result":{"exit_code":17}}`},
+		{name: "unreadable-result", result: `{`, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newGenerationFixture(t)
+			a := f.claim(t, tc.name)
+			f.promote(t, "g2")
+			// Ordinary exits enter through the accepted completion API. Corrupt,
+			// absent and late evidence fixtures exercise conservative snapshot reads.
+			if tc.wantExit != nil {
+				var result ProcessResult
+				if err := json.Unmarshal([]byte(tc.result), &result); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.h.store.CompleteAttempt(t.Context(), "agent", a.Job.JobID, a.Lease.AttemptID, CompletionRequest{FencingToken: a.Lease.FencingToken, IdempotencyKey: tc.name, Result: result}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var result, lateResult any
+			if tc.result != "" {
+				result = []byte(tc.result)
+			}
+			if tc.lateResult != "" {
+				lateResult = []byte(tc.lateResult)
+			}
+			if tc.wantExit == nil {
+				if _, err := f.h.store.db.Exec(`UPDATE attempts SET state='failed',result_json=?,late_result_json=? WHERE attempt_id=?`, result, lateResult, a.Lease.AttemptID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			nodes, err := f.h.store.ListNodes(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			node, err := f.h.store.GetNode(t.Context(), "node")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, n := range []Node{nodes[0], node} {
+				found := false
+				for _, g := range n.Generations {
+					for _, observed := range g.Attempts {
+						if observed.AttemptID != a.Lease.AttemptID {
+							continue
+						}
+						found = true
+						payload, err := json.Marshal(observed)
+						if err != nil {
+							t.Fatal(err)
+						}
+						var fields map[string]any
+						if err := json.Unmarshal(payload, &fields); err != nil {
+							t.Fatal(err)
+						}
+						if fields["exit_code"] != tc.wantExit || (observed.ObservationError != "") != tc.wantError {
+							t.Errorf("observation=%s want exit=%v error=%t", payload, tc.wantExit, tc.wantError)
+						}
+						if tc.wantExit == nil {
+							if _, present := fields["exit_code"]; present {
+								t.Errorf("invented exit evidence: %s", payload)
+							}
 						}
 					}
 				}

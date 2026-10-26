@@ -78,6 +78,12 @@ func settledGenerationCancellation(a l1.NodeGenerationAttempt) bool {
 		(*a.State == contract.AttemptFailed || *a.State == contract.AttemptSucceeded)
 }
 
+// Only an accepted payload exit settles a failed Attempt. Lost/interrupted
+// Attempts retain their diagnosis even if other exit evidence is present.
+func settledGenerationPayloadExit(a l1.NodeGenerationAttempt) bool {
+	return a.State != nil && *a.State == contract.AttemptFailed && a.ExitCode != nil && *a.ExitCode != 0
+}
+
 func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Time) generationStatus {
 	ns := nodeStatuses(l1.NodeList{Nodes: []l1.Node{node}})[0]
 	result := generationStatus{NodeID: node.NodeID, ID: g.AgentGenerationID, Role: string(g.Role), Version: g.Version, RetirementStartedAt: g.RetirementStartedAt, SelectedProtocol: g.SelectedProtocol, RemainingRunIDs: []string{}, RemainingAttemptIDs: []string{}, UnledgeredAttemptIDs: []string{}, RenewalHealth: "healthy", Progress: "evidence_pending", Attempts: g.Attempts, Capacity: &generationCapacity{node.ClaimsEnabled, ns.FreeOneshot, ns.TotalOneshot, ns.FreeService, ns.TotalService}}
@@ -137,7 +143,7 @@ func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Ti
 					result.RenewalHealth = "unverified"
 				}
 			}
-		case settledGenerationCancellation(a):
+		case settledGenerationCancellation(a) || settledGenerationPayloadExit(a):
 		case state == contract.AttemptLost || state == contract.AttemptInterrupted || state == contract.AttemptFailed:
 			result.Problems = append(result.Problems, statusReason{"retiring_attempt_problem", interruptionDetail(label, state, a.InterruptionReason)})
 			result.RenewalHealth = "degraded"
@@ -363,9 +369,16 @@ func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, 
 				result.UpgradeState = "interrupted"
 			}
 		}
-		// Reboot observations remain problems even after recovery completed and
-		// even when an old generation's local files have already been cleaned up.
+		// Reboot interruptions remain problems after recovery completes, even when
+		// an old generation's local files have already been cleaned up.
 		for id, a := range receipt.RebootAttempts {
+			var exitCode *int
+			if a.Result != nil {
+				exitCode = a.Result.ExitCode
+			}
+			if settledGenerationPayloadExit(l1.NodeGenerationAttempt{State: &a.State, ExitCode: exitCode}) {
+				continue
+			}
 			if a.State != contract.AttemptLost && a.State != contract.AttemptInterrupted && a.State != contract.AttemptFailed {
 				continue
 			}
@@ -407,7 +420,7 @@ func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, 
 				result.EvidenceErrors = append(result.EvidenceErrors, detail+"; generation membership unknown")
 				continue
 			}
-			result.Generations = append(result.Generations, generationStatus{NodeID: receipt.NodeID, ID: generationID, Version: version, Role: "history", RenewalHealth: "degraded", Progress: "unverified", Attempts: []l1.NodeGenerationAttempt{{JobID: resident.JobID, AttemptID: id, State: &a.State, InterruptionReason: a.InterruptionReason}}, Problems: []statusReason{{"retiring_attempt_problem", detail}}})
+			result.Generations = append(result.Generations, generationStatus{NodeID: receipt.NodeID, ID: generationID, Version: version, Role: "history", RenewalHealth: "degraded", Progress: "unverified", Attempts: []l1.NodeGenerationAttempt{{JobID: resident.JobID, AttemptID: id, State: &a.State, ExitCode: exitCode, InterruptionReason: a.InterruptionReason}}, Problems: []statusReason{{"retiring_attempt_problem", detail}}})
 		}
 	}
 	if result.UpgradeState == "complete" && catalogPresent && catalog.PendingReceipt != "" {

@@ -942,8 +942,18 @@ of process exit evidence. A failed or succeeded Attempt with that outcome is
 settled: text shows `canceled`, JSON retains the Attempt state and
 `job_outcome: canceled`, and neither readiness nor doctor's exit is degraded.
 Cancellation intent alone does not settle live Attempts or hide lost,
-interrupted, or expired-Lease problems. Absent outcome preserves the existing
-failure diagnosis; exit code 143 and message text never establish cancellation.
+interrupted, or expired-Lease problems. Exit code 143 and message text never
+establish cancellation.
+
+Optional resident `exit_code` comes only from the accepted Attempt completion
+result in that same read snapshot, never from a late result or message text. A
+failed Attempt with a recorded nonzero payload exit is also settled, like a
+succeeded Attempt, including retained closed generations and recorded reboot
+observations. Status remains ready, retirement renewal stays healthy, and doctor
+does not raise an operator problem for that user outcome. Failures without
+accepted payload exit evidence, lost and interrupted Attempts, live stale Leases,
+and reboot-interrupted Attempts retain their diagnosis. Missing or unreadable
+completion evidence never establishes settlement.
 
 The healthy finishing count also verifies each distinct mapped Run through the
 existing public L3 Run GET. Terminal ledger Runs are excluded even while their
