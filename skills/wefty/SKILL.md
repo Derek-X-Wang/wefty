@@ -41,6 +41,10 @@ exit code is the answer:
 | 12 | `not ready: <what is missing>` — read the line; it names the thing to fix |
 | 2 | you passed something wrong |
 
+If the shell or a script says `wefty` is not found, use the CLI that `wefty setup`
+installs: `~/.local/bin/wefty`. Call it by that path, or add `~/.local/bin` to `PATH`.
+A script's subprocess or a shell started outside your login profile often lacks it.
+
 `status` prints the endpoints it was configured with and whatever the servers
 said, verbatim. Those are the person's own addresses on the person's own
 terminal, which is exactly what makes the output useful — and exactly why you
