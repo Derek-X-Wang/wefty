@@ -387,7 +387,10 @@ The owner separately approves the exact Mac, stock starting/target commits,
 profile/Node and selected test Runs. Allow 35–50 minutes plus preparation for
 one upgrade. Check `wefty --version`, `wefty --json status` and text/JSON doctor.
 If legacy enrollment is needed, authorize it separately and perform it while
-idle **before** starting the arrival payloads.
+idle **before** starting the arrival payloads. Enrollment is itself a rolling
+upgrade: it reports `already_at` and enrolls nothing when public main equals the
+installed commit. The daily scenario therefore needs two distinct newer mains,
+one for enrollment and a later one for the measured upgrade.
 
 Save the numbered payload below in a clean small Git checkout and commit it.
 Use explicit unique probe names. This stock example prints its PID to output;
