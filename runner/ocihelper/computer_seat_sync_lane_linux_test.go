@@ -1,0 +1,280 @@
+//go:build linux && computer_seat_lane
+
+package ocihelper
+
+import (
+	"archive/tar"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/opencontainers/image-spec/identity"
+	imagev1 "github.com/opencontainers/image-spec/specs-go/v1"
+)
+
+// The task fixture uses the unmodified production profile. All Seat directives,
+// ready decisions and cleanup decisions go through the real helper engine;
+// task creation/termination is fixture plumbing, not a claim about Run admission.
+func TestHelperComputerSeatWorkingCopyCF(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Fatal("computer_seat_lane requires root")
+	}
+	imageRef, address := os.Getenv("WEFTY_SEAT_IMAGE"), os.Getenv("WEFTY_SEAT_CONTAINERD")
+	if imageRef == "" || address == "" {
+		t.Fatal("Seat lane provisioning missing")
+	}
+	ctx, cancel := context.WithTimeout(namespaces.WithNamespace(t.Context(), ContainerdNamespace), 4*time.Minute)
+	defer cancel()
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, err := containerd.New(address, containerd.WithDefaultNamespace(ContainerdNamespace))
+	must(err)
+	defer client.Close()
+	image, err := client.GetImage(ctx, imageRef)
+	must(err)
+	must(image.Unpack(ctx, DefaultSnapshotter))
+	root := t.TempDir()
+	managed := filepath.Join(root, "managed")
+	service := filepath.Join(managed, "service")
+	control := filepath.Join(managed, "control")
+	for _, p := range []string{filepath.Join(service, "etc"), control} {
+		must(os.MkdirAll(p, 0755))
+	}
+	must(os.WriteFile(filepath.Join(service, "etc/machine-id"), []byte("0123456789abcdef0123456789abcdef\n"), 0444))
+	resolver, hosts := filepath.Join(managed, "resolv.conf"), filepath.Join(managed, "hosts")
+	must(os.WriteFile(resolver, []byte("nameserver 127.0.0.53\n"), 0444))
+	must(os.WriteFile(hosts, []byte("127.0.0.1 localhost\n"), 0444))
+	id := "helper-seat-working-copy-" + filepath.Base(root)
+	diffs, err := image.RootFS(ctx)
+	must(err)
+	snapshotter := client.SnapshotService(DefaultSnapshotter)
+	// Without a GC root, containerd may collect the unreferenced active
+	// snapshot before NewContainer refers to it.
+	mounts, err := snapshotter.Prepare(ctx, id, identity.ChainID(diffs).String(), snapshots.WithLabels(map[string]string{"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339)}))
+	must(err)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), ContainerdNamespace), 15*time.Second)
+		defer cancel()
+		if err := snapshotter.Remove(cleanupCtx, id); err != nil && !strings.Contains(err.Error(), "not found") {
+			t.Error(err)
+		}
+	}()
+	desc, err := image.Config(ctx)
+	must(err)
+	blob, err := content.ReadBlob(ctx, client.ContentStore(), desc)
+	must(err)
+	var config imagev1.Image
+	must(json.Unmarshal(blob, &config))
+	release, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	must(err)
+	var document *RuntimeSpecDocument
+	must(mount.WithTempMount(ctx, mounts, func(rootfs string) error {
+		var err error
+		document, err = BuildRuntimeSpec(ctx, RuntimeSpecInput{ContainerID: id, CgroupPath: "/" + id, RootfsPath: rootfs, ManagedRoot: managed,
+			Image:    ImageRuntimeConfig{User: config.Config.User, Environment: config.Config.Env, Entrypoint: config.Config.Entrypoint, Command: config.Config.Cmd, WorkingDirectory: config.Config.WorkingDir},
+			Workload: WorkloadInput{ImageReference: imageRef, ImageDigest: image.Target().Digest.String(), Computer: true, Limits: WorkloadLimits{MemoryBytes: 1 << 30}, ManagedVolumes: []ManagedVolumeDescriptor{{Kind: ManagedVolumeComputerDisk, ComputerStorage: &ComputerStorageReference{ComputerID: "helper-seats", StorageID: "helper-seats", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 2 << 30}}}},
+			Guest:    GuestKernelFacts{Architecture: runtime.GOARCH, KernelRelease: strings.TrimSpace(string(release))}, ResolverPath: resolver, HostsPath: hosts, ComputerControlSource: control, ManagedVolumeSources: map[ManagedVolumeKind]string{ManagedVolumeComputerDisk: service}})
+		return err
+	}))
+	defer document.Close()
+	spec, err := document.ContainerdSpec()
+	must(err)
+	container, err := client.NewContainer(ctx, id, containerd.WithImage(image), containerd.WithRuntime(DefaultRuntimeHandler, nil), containerd.WithSnapshotter(DefaultSnapshotter), containerd.WithSnapshot(id), func(_ context.Context, _ *containerd.Client, record *containers.Container) error {
+		record.Spec = spec
+		return nil
+	})
+	must(err)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), ContainerdNamespace), 15*time.Second)
+		defer cancel()
+		if err := container.Delete(cleanupCtx); err != nil {
+			t.Error(err)
+		}
+	}()
+	task, err := container.NewTask(ctx, cio.LogFile(filepath.Join(root, "computer.log")))
+	must(err)
+	t.Cleanup(func() {
+		if output := os.Getenv("WEFTY_HELPER_SEAT_EXEC_EVIDENCE"); output != "" {
+			b, err := os.ReadFile(filepath.Join(root, "computer.log"))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if err := os.WriteFile(output+".computer.log", b, 0600); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(namespaces.WithNamespace(context.Background(), ContainerdNamespace), 15*time.Second)
+		defer cancel()
+		wait, err := task.Wait(cleanupCtx)
+		if err == nil {
+			_ = task.Kill(cleanupCtx, syscall.SIGKILL, containerd.WithKillAll)
+			select {
+			case <-wait:
+			case <-cleanupCtx.Done():
+				t.Error(cleanupCtx.Err())
+			}
+		}
+		if _, err := task.Delete(cleanupCtx); err != nil {
+			t.Error(err)
+		}
+	}()
+	namespace, err := pinTaskNetworkNamespace(task.Pid())
+	must(err)
+	defer namespace.close()
+	out, err := exec.CommandContext(ctx, "nsenter", "-t", fmt.Sprint(task.Pid()), "-n", "ip", "link", "set", "lo", "up").CombinedOutput()
+	if err != nil {
+		t.Fatalf("loopback: %v %s", err, out)
+	}
+	must(document.RevalidateMounts())
+	must(task.Start(ctx))
+	authority := testAuthority()
+	authority.Class = "service"
+	attempt := &containerdAttempt{authority: authority, task: task, networkNamespace: namespace, controlDirectory: control}
+	engine := &ContainerdEngine{config: NativeEngineConfig{Clock: systemClock{}}, attempts: map[string]*containerdAttempt{authority.key(): attempt}}
+	expectedSeats := 1
+	waitForSeat := func(generation uint64, state string) {
+		t.Helper()
+		deadline := time.NewTimer(65 * time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		var last ObserveComputerSeatsResponse
+		var lastErr error
+		for {
+			last, lastErr = engine.ObserveComputerSeats(ctx, ObserveComputerSeatsRequest{Authority: authority, Generation: generation})
+			all := lastErr == nil && len(last.Seats) == expectedSeats
+			for _, seat := range last.Seats {
+				all = all && seat.State == state && (state != "cleaned" || seat.CleanupComplete)
+			}
+			if all {
+				if state == "cleaned" && !last.Seats[0].CleanupComplete {
+					t.Fatal("cleaned without positive evidence")
+				}
+				return
+			}
+			if lastErr == nil && len(last.Seats) == 1 && last.Seats[0].State == "failed" {
+				t.Fatalf("Seat failed: %+v", last)
+			}
+			select {
+			case <-deadline.C:
+				t.Fatalf("Seat never %s: %+v %v", state, last, lastErr)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			case <-ticker.C:
+			}
+		}
+	}
+	applied, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{{1, "seat1", 7102, 7103}}})
+	must(err)
+	waitForSeat(applied.Generation, "ready")
+
+	request := ExecComputerSeatRequest{Authority: authority, Generation: applied.Generation, Place: 1, WorkingDirectory: "work/pkg", MaxRuntime: 20 * time.Second}
+	sync := func(files map[string]string) {
+		t.Helper()
+		var archive bytes.Buffer
+		tw := tar.NewWriter(&archive)
+		for name, data := range files {
+			must(tw.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(data))}))
+			_, err := tw.Write([]byte(data))
+			must(err)
+		}
+		must(tw.Close())
+		_, err := engine.CopyComputerSeat(ctx, CopyComputerSeatRequest{Authority: authority, Generation: applied.Generation, Place: 1, Direction: "sync", Path: "work"}, &archive, func([]byte) error { return nil })
+		must(err)
+	}
+	run := func(script string) {
+		t.Helper()
+		req := request
+		req.Args = []string{"/bin/sh", "-ec", script}
+		var diagnostics bytes.Buffer
+		var exit *SeatCommandExit
+		must(engine.ExecComputerSeat(ctx, req, func(event SeatCommandEvent) error {
+			if event.Exit != nil {
+				exit = event.Exit
+			} else {
+				diagnostics.Write(event.Data)
+			}
+			return nil
+		}))
+		if exit == nil || exit.Code == nil || *exit.Code != 0 {
+			t.Fatalf("command: %+v %s", exit, diagnostics.String())
+		}
+	}
+	sync(map[string]string{"pkg/tracked": "caller", "pkg/deleted": "delete", ".gitignore": "pkg/node_modules/\n"})
+	run(`test "$PWD" = "$SEAT_DIR/work/pkg"
+ mkdir node_modules
+ printf installed > node_modules/dependency
+ printf changed > tracked
+ sleep 600 &
+ echo $! > "$SEAT_DIR/run/background-cf.pid"`)
+	// Run ended despite inherited stdout, and a second sync updates the same
+	// folder while retaining the dependency installed by the first command.
+	sync(map[string]string{"pkg/tracked": "caller", ".gitignore": "pkg/node_modules/\n"})
+	run(`test "$(cat node_modules/dependency)" = installed
+ test ! -e deleted
+ test "$(cat tracked)" = caller
+ python3 -I -S -c 'import os
+pid=int(open(os.environ["SEAT_DIR"]+"/run/background-cf.pid").read())
+os.kill(pid,0)
+assert open("/proc/"+str(pid)+"/stat").read().rsplit(")",1)[1].split()[0] != "Z"' `)
+	// H1: direct Seat Run directory input must be resolved as the Seat uid,
+	// never by runc while it still has root authority.
+	expectedSeats = 2
+	applied, err = engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, []ComputerSeat{{1, "seat1", 7102, 7103}, {2, "seat2", 7104, 7105}}})
+	must(err)
+	waitForSeat(applied.Generation, "ready")
+	request.Generation = applied.Generation
+	second := request
+	second.Place = 2
+	second.WorkingDirectory = ""
+	second.Args = []string{"python3", "-I", "-S", "-c", "import os;os.mkdir('home/private',0o700)"}
+	must(engine.ExecComputerSeat(ctx, second, func(event SeatCommandEvent) error {
+		if event.Exit != nil && (event.Exit.Code == nil || *event.Exit.Code != 0) {
+			return fmt.Errorf("Seat 2 setup failed: %+v", event.Exit)
+		}
+		return nil
+	}))
+	run(`ln -s /wefty/service/seats/2/home/private "$SEAT_DIR/work/x"`)
+	attack := request
+	attack.WorkingDirectory = "work/x"
+	attack.Args = []string{"/bin/sh", "-c", `touch /wefty/service/seats/1/run/cross-seat-command-started`}
+	err = engine.ExecComputerSeat(ctx, attack, func(SeatCommandEvent) error { return errors.New("refused command produced payload output") })
+	var refusal *SeatOperationRefusalError
+	if !errors.As(err, &refusal) || refusal.Reason != "working_directory_unavailable" {
+		t.Fatalf("cross-Seat directory did not produce a typed refusal: %v", err)
+	}
+	marker := fmt.Sprintf("/proc/%d/root/wefty/service/seats/1/run/cross-seat-command-started", task.Pid())
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("cross-Seat command started: %v", err)
+	}
+	removed, err := engine.ApplyComputerSeats(ctx, ApplyComputerSeatsRequest{authority, nil})
+	must(err)
+	waitForSeat(removed.Generation, "cleaned")
+	must(confirmComputerSeatAbsent(fmt.Sprintf("/proc/%d", task.Pid()), ComputerSeat{1, "seat1", 7102, 7103}))
+	must(confirmComputerSeatAbsent(fmt.Sprintf("/proc/%d", task.Pid()), ComputerSeat{2, "seat2", 7104, 7105}))
+	t.Log("H1 symlink directory refused; CF-1 dependencies persist; CF-2 caller deletion applied; Seat edits put back; CF-3 background sleep outlives command and stops with Seat")
+}

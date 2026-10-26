@@ -70,7 +70,7 @@ func seatExecSession(t *testing.T) (*Session, *seatExecProtocolEngine, AttemptAu
 }
 func TestSeatExecProtocolAuthorityReadinessAndOutput(t *testing.T) {
 	session, e, authority := seatExecSession(t)
-	req := ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour}
+	req := ExecComputerSeatRequest{authority, 1, 1, []string{"true"}, time.Hour, ""}
 	check := func(code ErrorCode, detail string) {
 		t.Helper()
 		err := session.ExecComputerSeat(t.Context(), req, nil)
@@ -100,11 +100,11 @@ func TestSeatExecProtocolAuthorityReadinessAndOutput(t *testing.T) {
 	req.MaxRuntime = time.Hour
 	valid := req
 	for _, invalid := range []ExecComputerSeatRequest{
-		{authority, 1, 1, nil, time.Hour},
-		{authority, 1, 1, []string{"bad\x00command"}, time.Hour},
-		{authority, 1, 0, []string{"true"}, time.Hour},
-		{authority, 0, 1, []string{"true"}, time.Hour},
-		{authority, 1, 1, []string{strings.Repeat("a", 128<<10)}, time.Hour},
+		{authority, 1, 1, nil, time.Hour, ""},
+		{authority, 1, 1, []string{"bad\x00command"}, time.Hour, ""},
+		{authority, 1, 0, []string{"true"}, time.Hour, ""},
+		{authority, 0, 1, []string{"true"}, time.Hour, ""},
+		{authority, 1, 1, []string{strings.Repeat("a", 128<<10)}, time.Hour, ""},
 	} {
 		req = invalid
 		check(CodeInvalidRequest, "")
@@ -143,7 +143,7 @@ func TestSeatExecClientDisconnectCancelsOnlyCommand(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
-		done <- session.ExecComputerSeat(ctx, ExecComputerSeatRequest{authority, 1, 1, []string{"sleep", "60"}, time.Hour}, nil)
+		done <- session.ExecComputerSeat(ctx, ExecComputerSeatRequest{authority, 1, 1, []string{"sleep", "60"}, time.Hour, ""}, nil)
 	}()
 	select {
 	case <-e.started:
@@ -174,7 +174,7 @@ func TestSeatExecPerSeatLimitLeavesOtherSeatWorking(t *testing.T) {
 	e.mu.Unlock()
 	ctx, stop := context.WithCancel(t.Context())
 	defer stop()
-	req := ExecComputerSeatRequest{authority, 1, 1, []string{"sleep", "60"}, time.Hour}
+	req := ExecComputerSeatRequest{authority, 1, 1, []string{"sleep", "60"}, time.Hour, ""}
 	done := make(chan error, 3)
 	for i := 0; i < 2; i++ {
 		go func() { done <- session.ExecComputerSeat(ctx, req, nil) }()

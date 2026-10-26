@@ -2746,7 +2746,7 @@ func writeRPCError(connection *framedConn, rpcErr *RPCError) error {
 func writeSeatOperationFailure(wire *framedConn, err error) error {
 	var refusal *SeatOperationRefusalError
 	if errors.As(err, &refusal) {
-		return writeRPCError(wire, &RPCError{Code: CodeSeatOperationRefused, Detail: ErrorDetail(refusal.Reason), Message: refusal.Error()})
+		return writeRPCError(wire, &RPCError{Code: CodeSeatOperationRefused, Detail: ErrorDetail(refusal.Reason), Message: err.Error()})
 	}
 	return writeFailure(wire, CodeDiagnosticFailure, "Seat operation could not be confirmed")
 }

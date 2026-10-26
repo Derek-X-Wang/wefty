@@ -31,7 +31,15 @@ func (engine *ContainerdEngine) execComputerSeat(ctx context.Context, request Ex
 			resultErr = errors.Join(resultErr, ErrSeatCommandRuntimeLimit)
 		}
 	}()
-	stream := newSeatCommandStream(ctx, emit)
+	stream := newSeatCommandStream(ctx, func(event SeatCommandEvent) error {
+		if event.Refusal != nil {
+			return nil
+		} // A pre-exec refusal is not payload output.
+		if emit != nil {
+			return emit(event)
+		}
+		return nil
+	})
 	waitCtx, stopWait := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopWait()
 	process, wait, err := engine.startSeatCommand(ctx, waitCtx, request, stream, cancel, confirm, input...)
@@ -161,9 +169,13 @@ func (engine *ContainerdEngine) startSeatCommand(ctx, waitCtx context.Context, r
 			return nil, nil, err
 		}
 	}
+	environment := append([]string(nil), config.Environment...)
+	if request.WorkingDirectory != "" {
+		environment = append(environment, "WEFTY_SEAT_WORKING_DIRECTORY="+request.WorkingDirectory)
+	}
 	spec := &specs.Process{
 		User: specs.User{UID: config.UID, GID: config.GID, AdditionalGids: []uint32{}},
-		Cwd:  config.Directory, Env: config.Environment,
+		Cwd:  config.Directory, Env: environment,
 		Args:            append([]string{"/usr/bin/python3", "-I", "-S", "-c", wrapper}, request.Args...),
 		NoNewPrivileges: true, Capabilities: &specs.LinuxCapabilities{},
 		Rlimits: []specs.POSIXRlimit{{Type: "RLIMIT_NOFILE", Hard: 1024, Soft: 1024}},

@@ -25,14 +25,27 @@ type SeatCopyAuthority struct {
 	Generation uint64 `json:"generation"`
 	Place      int    `json:"place"`
 }
+type SeatSyncCounts struct {
+	FilesWritten int64 `json:"files_written"`
+	FilesRemoved int64 `json:"files_removed"`
+}
+
+func equalSeatSyncCounts(a, b *SeatSyncCounts) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 type SeatCopyReceipt struct {
 	SeatCopyAuthorityInput
-	CopyID    string `json:"copy_id"`
-	Direction string `json:"direction"`
-	Path      string `json:"path"`
-	SizeBytes int64  `json:"size_bytes"`
-	Outcome   string `json:"outcome,omitempty"`
-	Reason    string `json:"reason,omitempty"`
+	CopyID    string          `json:"copy_id"`
+	Direction string          `json:"direction"`
+	Path      string          `json:"path"`
+	SizeBytes int64           `json:"size_bytes"`
+	Outcome   string          `json:"outcome,omitempty"`
+	Reason    string          `json:"reason,omitempty"`
+	Sync      *SeatSyncCounts `json:"sync,omitempty"`
 }
 
 func checkSeatCopyCredential(ctx context.Context, q queryer, id, credential string, requireLive bool) (SeatRequest, error) {
@@ -145,6 +158,9 @@ func (s *Store) RecordSeatCopy(ctx context.Context, identity, id string, input S
 			input.Outcome = "sent"
 		}
 	}
+	if input.Sync != nil && (input.Direction != "sync" || input.Sync.FilesWritten < 0 || input.Sync.FilesRemoved < 0) || input.Direction == "sync" && (input.Path != "work" || input.Outcome == "completed" && input.Sync == nil || input.Outcome == "sending" && input.Sync != nil) {
+		return protocolError(contract.ErrorInvalidRequest, "invalid Seat sync counts")
+	}
 	if !validCopyReceipt(SeatCopyOutcomeReceipt{input.CopyID, input.Direction, input.Path, input.SizeBytes, input.Outcome, input.Reason}, true) {
 		return protocolError(contract.ErrorInvalidRequest, "invalid Seat copy receipt")
 	}
@@ -181,7 +197,7 @@ func (s *Store) RecordSeatCopy(ctx context.Context, identity, id string, input S
 	if err != nil {
 		return err
 	}
-	pending, err := s.appendSeatCopyOutcome(ctx, id, SeatCopyOutcomeReceipt{input.CopyID, input.Direction, input.Path, input.SizeBytes, input.Outcome, input.Reason})
+	pending, err := s.appendSeatCopyOutcome(ctx, id, SeatCopyOutcomeReceipt{input.CopyID, input.Direction, input.Path, input.SizeBytes, input.Outcome, input.Reason}, input.Sync)
 	if err != nil {
 		return err
 	}

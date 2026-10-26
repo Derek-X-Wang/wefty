@@ -93,7 +93,7 @@ func TestHelperComputerNetworkNoneAP1AP2AP3(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			var exit *SeatCommandExit
 			argv := append([]string{"python3", "-I", "-S", "-c", script}, args...)
-			must(engine.ExecComputerSeat(ctx, ExecComputerSeatRequest{authority, applied.Generation, 1, argv, time.Minute}, func(e SeatCommandEvent) error {
+			must(engine.ExecComputerSeat(ctx, ExecComputerSeatRequest{authority, applied.Generation, 1, argv, time.Minute, ""}, func(e SeatCommandEvent) error {
 				if e.Exit != nil {
 					exit = e.Exit
 				} else if e.Stream == "stdout" {

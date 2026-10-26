@@ -74,7 +74,11 @@ func normalizeSeatRun(input *CreateRunInput) error {
 	if input.SeatRunBinding.SeatID != value.SeatID {
 		return protocolError(contract.ErrorForbidden, "Seat binding mismatch")
 	}
-	params := contract.SeatRunParams{Version: 1, SeatRun: value, Binding: *input.SeatRunBinding}
+	version := 1
+	if value.WorkingDirectory != "" {
+		version = 2 // Older node agents must refuse rather than ignore the directory.
+	}
+	params := contract.SeatRunParams{Version: version, SeatRun: value, Binding: *input.SeatRunBinding}
 	raw, err := json.Marshal(params)
 	if err != nil {
 		return err

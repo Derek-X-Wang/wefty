@@ -32,6 +32,10 @@ func executeSeatExec(ctx context.Context, clients *apiClients, id string, argv [
 	}
 	ctx, stopSignalContext := execSignalContext(ctx)
 	defer stopSignalContext()
+	source.WorkingDirectory, err = prepareSeatWorkingCopy(ctx, clients, id, secret)
+	if err != nil {
+		return err
+	}
 	key, err := ensureIdempotencyKey("")
 	if err != nil {
 		return err

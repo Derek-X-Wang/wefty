@@ -3,6 +3,7 @@ package contract
 import (
 	"encoding/json"
 	"errors"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -15,12 +16,13 @@ const SeatCredentialHeader = "X-Wefty-Seat-Credential"
 const DefaultSeatCommandRuntime = time.Hour
 const ErrorSeatRunRerun ErrorCode = "seat_run_not_replayable"
 
-// SeatRunInput carries only argv and a deadline. No caller environment, user,
-// directory, executable bytes or workload credentials cross into the Seat.
+// SeatRunInput carries argv, a deadline and an optional Seat-relative folder.
+// No caller environment, user, executable bytes or workload credentials cross.
 type SeatRunInput struct {
 	SeatID            string   `json:"seat_id"`
 	Argv              []string `json:"argv"`
 	MaxRuntimeSeconds int64    `json:"max_runtime_seconds,omitempty"`
+	WorkingDirectory  string   `json:"working_directory,omitempty"`
 }
 
 func (r *SeatRunInput) UnmarshalJSON(data []byte) error {
@@ -45,6 +47,9 @@ var seatRunIDPattern = regexp.MustCompile(`^seat_[0-9a-f]{32}$`)
 func (r *SeatRunInput) Normalize() error {
 	if !seatRunIDPattern.MatchString(r.SeatID) || len(r.Argv) == 0 || r.Argv[0] == "" || len(r.Argv) > 4096 {
 		return errors.New("Seat Run requires a Seat ID and argv")
+	}
+	if err := ValidateSeatWorkingDirectory(r.WorkingDirectory); err != nil {
+		return err
 	}
 	size := 0
 	for _, arg := range r.Argv {
@@ -89,7 +94,7 @@ func ParseSeatRunParams(raw []byte) (SeatRunParams, bool, error) {
 	}
 	var p SeatRunParams
 	var version int
-	if json.Unmarshal(fields["seat_run_version"], &version) != nil || version != 1 {
+	if json.Unmarshal(fields["seat_run_version"], &version) != nil || (version != 1 && version != 2) {
 		return p, true, errors.New("unsupported Seat Run metadata version")
 	}
 	if err := decodeJSONStrict(raw, &p); err != nil {
@@ -98,9 +103,29 @@ func ParseSeatRunParams(raw []byte) (SeatRunParams, bool, error) {
 	if err := p.SeatRun.Normalize(); err != nil {
 		return p, true, err
 	}
+	if p.SeatRun.WorkingDirectory != "" && version < 2 {
+		return p, true, errors.New("working_directory requires Seat Run metadata version 2")
+	}
 	b := p.Binding
 	if b.SeatID != p.SeatRun.SeatID || b.NodeID == "" || b.ComputerID == "" || b.ComputerJobID == "" || b.ComputerAttemptID == "" {
 		return p, true, errors.New("Seat Run binding is incomplete")
 	}
 	return p, true, nil
+}
+
+// ValidateSeatWorkingDirectory accepts a clean relative path, or omission for
+// the Seat folder. A component can never climb out of that folder.
+func ValidateSeatWorkingDirectory(value string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > 4096 || path.IsAbs(value) || path.Clean(value) != value || value == "." || strings.ContainsRune(value, 0) {
+		return errors.New("working_directory must be a clean relative path without ..")
+	}
+	for _, part := range strings.Split(value, "/") {
+		if part == ".." {
+			return errors.New("working_directory must not contain ..")
+		}
+	}
+	return nil
 }

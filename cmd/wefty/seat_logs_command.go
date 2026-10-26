@@ -81,7 +81,11 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 				}
 				continue
 			}
+			displayKind := string(event.Kind)
 			suffix := ""
+			if event.Kind == l1.SeatEventCopyIn && event.Direction == "sync" {
+				displayKind = "working-copy update"
+			}
 			if event.Reason != "" && event.NodeOutcome == "" {
 				suffix = ": " + event.Reason
 			}
@@ -120,7 +124,10 @@ func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, 
 			if event.Audit != nil && event.Audit.Reason != "" {
 				suffix += ": " + string(event.Audit.Reason)
 			}
-			if _, err := fmt.Fprintf(stdout, "%s %s%s\n", event.OccurredAt.Format(time.RFC3339), event.Kind, suffix); err != nil {
+			if event.Direction == "sync" && event.Sync != nil {
+				suffix += fmt.Sprintf(" (%d written, %d removed)", event.Sync.FilesWritten, event.Sync.FilesRemoved)
+			}
+			if _, err := fmt.Fprintf(stdout, "%s %s%s\n", event.OccurredAt.Format(time.RFC3339), displayKind, suffix); err != nil {
 				return err
 			}
 		}

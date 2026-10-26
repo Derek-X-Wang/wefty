@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"github.com/Derek-X-Wang/wefty/contract"
 	"strings"
 	"time"
 )
@@ -14,24 +15,34 @@ const SeatCommandChunkBytes = 4096
 const seatCommandFrameBytes = 8192
 const SeatRefusalCommandNotReady SeatOperationRefusalReason = "seat_not_ready"
 
-// ExecComputerSeatRequest deliberately accepts no environment, user or path.
+// ExecComputerSeatRequest accepts no caller environment or user.
 // Generation fences place reuse and every change of the Seat directive.
 type ExecComputerSeatRequest struct {
-	Authority  AttemptAuthority `json:"authority"`
-	Generation uint64           `json:"generation"`
-	Place      int              `json:"place"`
-	Args       []string         `json:"args"`
-	MaxRuntime time.Duration    `json:"max_runtime"`
+	Authority        AttemptAuthority `json:"authority"`
+	Generation       uint64           `json:"generation"`
+	Place            int              `json:"place"`
+	Args             []string         `json:"args"`
+	MaxRuntime       time.Duration    `json:"max_runtime"`
+	WorkingDirectory string           `json:"working_directory,omitempty"`
 }
 
 type SeatCommandExit struct {
 	Code   *int `json:"code,omitempty"`
 	Signal int  `json:"signal,omitempty"`
 }
+
+const SeatRefusalWorkingDirectory SeatOperationRefusalReason = "working_directory_unavailable"
+
+type SeatCommandRefusal struct {
+	Reason  SeatOperationRefusalReason `json:"reason"`
+	Message string                     `json:"message"`
+}
+
 type SeatCommandEvent struct {
-	Stream string           `json:"stream,omitempty"`
-	Data   []byte           `json:"data,omitempty"`
-	Exit   *SeatCommandExit `json:"exit,omitempty"`
+	Stream  string              `json:"stream,omitempty"`
+	Data    []byte              `json:"data,omitempty"`
+	Exit    *SeatCommandExit    `json:"exit,omitempty"`
+	Refusal *SeatCommandRefusal `json:"refusal,omitempty"`
 }
 type ComputerSeatExecEngine interface {
 	ExecComputerSeat(context.Context, ExecComputerSeatRequest, func(SeatCommandEvent) error) error
@@ -52,6 +63,9 @@ func (r ExecComputerSeatRequest) validate() error {
 	}
 	if r.Generation == 0 || r.Place < 1 || r.Place > 4 || len(r.Args) == 0 || r.Args[0] == "" || r.MaxRuntime <= 0 {
 		return errors.New("command requires a Seat generation, place, argv and positive runtime")
+	}
+	if err := contract.ValidateSeatWorkingDirectory(r.WorkingDirectory); err != nil {
+		return err
 	}
 	size := 0
 	for _, arg := range r.Args {
@@ -75,7 +89,8 @@ func (s *computerSeats) command(r ExecComputerSeatRequest) (seatCommandConfig, e
 	}
 	folder := fmt.Sprintf("/wefty/service/seats/%d", r.Place)
 	home := folder + "/home"
-	return seatCommandConfig{UID: uint32(2000 + r.Place), GID: uint32(2000 + r.Place), Directory: folder, Environment: []string{
+	directory := folder
+	return seatCommandConfig{UID: uint32(2000 + r.Place), GID: uint32(2000 + r.Place), Directory: directory, Environment: []string{
 		"PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8", "USER=" + e.config.User, "LOGNAME=" + e.config.User,
 		"HOME=" + home, "SEAT_ID=" + fmt.Sprint(r.Place), "SEAT_DIR=" + folder, "DISPLAY=:" + fmt.Sprint(r.Place), "XAUTHORITY=" + folder + "/.Xauthority",
 		"XDG_RUNTIME_DIR=" + folder + "/run", "TMPDIR=" + folder + "/tmp", "XDG_CACHE_HOME=" + home + "/.cache", "XDG_CONFIG_HOME=" + home + "/.config",
@@ -83,6 +98,12 @@ func (s *computerSeats) command(r ExecComputerSeatRequest) (seatCommandConfig, e
 	}}, nil
 }
 func (e SeatCommandEvent) validate() error {
+	if e.Refusal != nil {
+		if e.Exit != nil || e.Stream != "" || len(e.Data) != 0 || e.Refusal.Reason != SeatRefusalWorkingDirectory || e.Refusal.Message == "" || len(e.Refusal.Message) > 4096 {
+			return errors.New("invalid command refusal")
+		}
+		return nil
+	}
 	if e.Exit != nil {
 		if e.Stream != "" || len(e.Data) != 0 || (e.Exit.Code == nil) == (e.Exit.Signal == 0) || e.Exit.Signal < 0 || e.Exit.Signal > 64 || (e.Exit.Code != nil && (*e.Exit.Code < 0 || *e.Exit.Code > 255)) {
 			return errors.New("invalid command exit")

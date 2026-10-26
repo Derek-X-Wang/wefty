@@ -205,8 +205,12 @@ wefty inspect RUN_ID
 
 Use the actual `seat_<32 hex>` ID. The command runs as the Seat's Linux user,
 in its folder, with its screen and environment. It works outside a Git
-checkout too. This path does not capture or copy your checkout; copy the files
-you need with `wefty cp`. Working-copy synchronization comes in #1152.
+checkout too. Inside a checkout, each command syncs the Seat's one working
+copy at `work` and starts in the caller's relative folder. Dependencies and
+other Git-ignored files on the Seat stay; the caller's checkout wins over
+captured-file edits and deletions. Background programs live until the Seat
+ends and do not keep it alive. Use `wefty cp SEAT_ID:work/out/report.html ./report.html`
+to retrieve output. Outside a checkout, commands start in the Seat folder.
 The Seat decides placement, so `--node` and `--tag` are refused.
 `--restartable` is refused because Seat state cannot be replayed.
 

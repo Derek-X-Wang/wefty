@@ -158,6 +158,15 @@
             "minimum": 1,
             "maximum": 9223372036,
             "default": 3600
+          },
+          "working_directory": {
+            "type": "string",
+            "maxLength": 4096,
+            "pattern": "^$|^[^/\u0000]+(/[^/\u0000]+)*$",
+            "not": {
+              "pattern": "(^|/)\\.{1,2}(/|$)"
+            },
+            "description": "Clean Seat-relative directory. Omitted or empty means the Seat folder; checkout commands use work or work/<caller relative folder>."
           }
         }
       },
@@ -293,6 +302,33 @@
           },
           "cancel": {
             "type": "boolean"
+          },
+          "working_directory": {
+            "type": "string",
+            "maxLength": 4096,
+            "pattern": "^$|^[^/\u0000]+(/[^/\u0000]+)*$",
+            "not": {
+              "pattern": "(^|/)\\.{1,2}(/|$)"
+            },
+            "description": "Clean Seat-relative directory. Omitted or empty means the Seat folder; checkout commands use work or work/<caller relative folder>."
+          }
+        }
+      },
+      "SeatSyncCounts": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "files_written",
+          "files_removed"
+        ],
+        "properties": {
+          "files_written": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "files_removed": {
+            "type": "integer",
+            "minimum": 0
           }
         }
       },
@@ -457,7 +493,8 @@
               "type": "string",
               "enum": [
                 "in",
-                "out"
+                "out",
+                "sync"
               ]
             },
             "path": {
@@ -479,6 +516,9 @@
             "reason": {
               "type": "string",
               "pattern": "^[a-z][a-z0-9_]{0,63}$"
+            },
+            "sync": {
+              "$ref": "#/components/schemas/SeatSyncCounts"
             }
           }
         },
@@ -651,6 +691,15 @@
               "failed",
               "sending"
             ]
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "sync"
+            ]
+          },
+          "sync": {
+            "$ref": "#/components/schemas/SeatSyncCounts"
           }
         }
       },
