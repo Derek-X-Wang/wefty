@@ -588,7 +588,12 @@ func writeRollingStatus(out io.Writer, r rollingStatusFields) error {
 			return err
 		}
 	}
+	closed := 0
 	for _, g := range r.Generations {
+		if g.Role == "closed" && len(g.Problems) == 0 && g.RenewalHealth == "healthy" {
+			closed++
+			continue
+		}
 		age := "unknown"
 		if g.Age != nil {
 			age = time.Duration(*g.Age).String()
@@ -635,6 +640,11 @@ func writeRollingStatus(out io.Writer, r rollingStatusFields) error {
 			if _, err := fmt.Fprintln(out, "  Attempts without an L3 Run:", strings.Join(g.UnledgeredAttemptIDs, ", ")); err != nil {
 				return err
 			}
+		}
+	}
+	if closed > 0 {
+		if _, err := fmt.Fprintf(out, "closed generations: %d (healthy)\n", closed); err != nil {
+			return err
 		}
 	}
 	for _, f := range r.findings() {
