@@ -46,6 +46,11 @@ func TestReadSnapshotTargetOverrunReturnsAnswer(t *testing.T) {
 	})
 }
 
+// Tests that force a hold expiry sleep this long inside the snapshot. The door reads ctx.Err(), which turns on only when the context timer's
+// goroutine runs; a loaded CI runner can run it tens of milliseconds late, so
+// a thin margin past the limit flakes (#1288).
+const forcedSnapshotExpirySleep = 2 * readSnapshotHardLimit
+
 func assertSnapshotUnavailable(t *testing.T, err error, reason string) {
 	t.Helper()
 	api := apiErrorFromDecision(err)
