@@ -7,6 +7,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import socket
 import stat
 import sys
@@ -72,6 +73,73 @@ while True:
     connection, _ = listener.accept()
     threading.Thread(target=serve, args=(connection,), daemon=True).start()
 '''
+
+
+class UnixAcceptTest(unittest.TestCase):
+    def test_image_initializes_the_unix_peer_address_length(self):
+        # Compile the exact patched upstream function. Pattern-initialized
+        # locals model a bad stack value without architecture-specific luck.
+        patch = Path(__file__).with_name('patches') / 'x11vnc-unix-accept.patch'
+        before, after = [], []
+        for line in patch.read_text().splitlines():
+            if line.startswith(('---', '+++', '@@')):
+                continue
+            if line.startswith((' ', '-')):
+                before.append(line[1:])
+            if line.startswith((' ', '+')):
+                after.append(line[1:])
+        compiler = shutil.which('cc')
+        if not compiler:
+            self.skipTest('the Unix accept regression requires a C compiler')
+        harness = r'''
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#define LIBVNCSERVER_HAVE_SYS_SOCKET_H 1
+#define rfbLogPerror(message) ((void) 0)
+/* Linux/QEMU reject a negative addrlen; Darwin accepts it. Keep the same
+ * regression runnable on the Mac, then use a real Unix accept and greeting. */
+#ifdef __APPLE__
+static int linux_accept(int fd, struct sockaddr *addr, socklen_t *length) {
+    if ((int)*length < 0) { errno = EINVAL; return -1; }
+    return accept(fd, addr, length);
+}
+#define accept linux_accept
+#endif
+FUNCTION
+int main(int argc, char **argv) {
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    if (argc != 2 || strlen(argv[1]) >= sizeof(addr.sun_path)) return 2;
+    strcpy(addr.sun_path, argv[1]);
+    int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) || listen(listener, 1)) return 3;
+    int client = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (connect(client, (struct sockaddr *)&addr, sizeof(addr))) return 4;
+    int peer = accept_unix(listener);
+    if (peer < 0) return 1;
+    if (write(peer, "RFB 003.008\n", 12) != 12) return 5;
+    char banner[12];
+    if (read(client, banner, 12) != 12 || memcmp(banner, "RFB 003.008\n", 12)) return 6;
+    close(peer); close(client); close(listener); unlink(argv[1]);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory(dir='/tmp') as root:
+            for name, source, expected in (('before', before, 1), ('after', after, 0)):
+                with self.subTest(name=name):
+                    code = Path(root) / (name+'.c')
+                    binary = Path(root) / name
+                    code.write_text(harness.replace('FUNCTION', '\n'.join(source)))
+                    built = subprocess.run([compiler, '-ftrivial-auto-var-init=pattern', str(code), '-o', str(binary)], capture_output=True, text=True)
+                    self.assertEqual(built.returncode, 0, built.stderr)
+                    ran = subprocess.run([str(binary), root+'/'+name+'.sock'], capture_output=True, timeout=5)
+                    self.assertEqual(ran.returncode, expected, ran.stderr)
+        dockerfile = Path(__file__).with_name('Dockerfile').read_text()
+        self.assertIn('patch --directory /tmp/x11vnc-0.9.16 --strip=1', dockerfile)
+        self.assertIn('COPY --from=x11vnc-build /opt/x11vnc/usr/bin/x11vnc /usr/bin/x11vnc', dockerfile)
 
 
 class RestartBackoffTest(unittest.TestCase):

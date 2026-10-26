@@ -647,6 +647,18 @@ per role on first connection. Each remains warm with `-forever -shared`;
 `view` also uses `-viewonly`. Each backend relays concurrent clients through
 a private x11vnc Unix socket in the external socket's existing private
 directory. Both sockets use mode 0600. External paths and roles stay unchanged.
+The image rebuilds the pinned Debian 0.9.16-9 source with
+`examples/computer/patches/x11vnc-unix-accept.patch`. Its `accept_unix` must
+initialize the peer-address length to `sizeof(struct sockaddr_un)` before
+`accept(2)`. The packaged code leaves that input uninitialized. A native
+Linux kernel can then drop the connection; QEMU's user-mode emulation
+refuses before it accepts, so the connection stays queued and no RFB
+greeting arrives. The former per-connection `-inetd` path did not use this function.
+Both image targets copy the patched binary from a separate build stage;
+runtime images retain the package's dependencies and license files, plus the
+applied patch in `/usr/share/doc/x11vnc/wefty-unix-accept.patch`. Source archives
+are checked against pinned SHA-256 digests. Readiness still has the existing
+60-second deadline; a listening socket alone never proves readiness.
 The pinned Debian x11vnc 0.9.16-9 provides `-unixsock PATH`, not
 `-unixsockonly`. Unix-only operation requires **both** LibVNCServer listener
 ports disabled: `-rfbport 0 -rfbportv6 0`. Its separate IPv6 port defaults to

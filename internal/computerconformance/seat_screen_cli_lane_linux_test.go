@@ -408,41 +408,6 @@ func screenLaneX11RSS(t *testing.T, ctx context.Context, store *l1.Store, seat l
 	return rss
 }
 
-func screenLaneJSON(ctx context.Context, f fabric.Fabric, host, method, path, credential string, body any, result any) error {
-	var reader io.Reader
-	if body != nil {
-		data, e := json.Marshal(body)
-		if e != nil {
-			return e
-		}
-		reader = bytes.NewReader(data)
-	}
-	transport := &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { return f.Dial(ctx, network, host) }}
-	defer transport.CloseIdleConnections()
-	request, e := http.NewRequestWithContext(ctx, method, "http://wefty.invalid"+path, reader)
-	if e != nil {
-		return e
-	}
-	if strings.Contains(path, "/person/") {
-		request.Header.Set(contract.ComputerControlTokenHeader, credential)
-	} else {
-		request.Header.Set(l1.SeatCredentialHeader, credential)
-	}
-	response, e := (&http.Client{Transport: transport}).Do(request)
-	if e != nil {
-		return e
-	}
-	defer response.Body.Close()
-	if response.StatusCode != 200 {
-		data, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("%s %s: HTTP %d %s", method, path, response.StatusCode, data)
-	}
-	if result != nil {
-		return json.NewDecoder(response.Body).Decode(result)
-	}
-	return nil
-}
-
 // Real process readiness is observed outside the measured interval.
 func screenLaneWait(t *testing.T, ctx context.Context, description string, ready func() bool) {
 	t.Helper()
