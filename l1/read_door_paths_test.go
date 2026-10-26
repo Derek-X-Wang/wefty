@@ -132,7 +132,7 @@ func TestReimageReplaySnapshotExpiryRemainsRetryable(t *testing.T) {
 	// The real driver blocks precisely at replay lookup until the read door expires.
 	reader := sql.OpenDB(bindingSnapshotConnector{driver: original.Driver(), dsn: sqliteDSN(path, sqliteBusyTimeout), beforeQuery: func(query string) error {
 		if strings.Contains(query, "computer_reimage_operations") {
-			time.Sleep(250 * time.Millisecond)
+			time.Sleep(forcedSnapshotExpirySleep)
 		}
 		return nil
 	}})

@@ -162,7 +162,7 @@ func TestJobReadReviewPostChangeFailureReason(t *testing.T) {
 			case "snapshot":
 				// Force a genuine expiry inside the production snapshot door.
 				at := h.clock.Now()
-				h.store.clock = ClockFunc(func() time.Time { time.Sleep(readSnapshotHardLimit + 20*time.Millisecond); return at })
+				h.store.clock = ClockFunc(func() time.Time { time.Sleep(forcedSnapshotExpirySleep); return at })
 				wantReason = "read_snapshot_expired"
 			}
 			w := httptest.NewRecorder()

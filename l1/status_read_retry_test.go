@@ -164,7 +164,7 @@ func TestTestReadHandlerRecoversFromRealSnapshotExpiry(t *testing.T) {
 	h.store.clock = ClockFunc(func() time.Time {
 		calls++
 		if calls == 1 {
-			time.Sleep(readSnapshotHardLimit + 50*time.Millisecond)
+			time.Sleep(forcedSnapshotExpirySleep)
 		}
 		return original.Now()
 	})
@@ -186,7 +186,7 @@ func TestTestHTTPReadRecoversFromRealSnapshotExpiry(t *testing.T) {
 	h.store.clock = ClockFunc(func() time.Time {
 		calls++
 		if calls == 1 {
-			time.Sleep(readSnapshotHardLimit + 50*time.Millisecond)
+			time.Sleep(forcedSnapshotExpirySleep)
 		}
 		return original.Now()
 	})
