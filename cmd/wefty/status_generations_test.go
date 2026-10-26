@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +32,102 @@ func generationStatusFixture(now time.Time, retiring int) l1.NodeList {
 	}
 	return l1.NodeList{Nodes: []l1.Node{node}}
 }
+
+func TestRollingStatusClosedGenerationSummary(t *testing.T) {
+	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*rollingStatusFields)
+		summary   int
+		detailIDs []string
+	}{
+		{name: "healthy", summary: 3, detailIDs: []string{"primary"}},
+		{name: "problem-with-healthy-renewal", summary: 2, detailIDs: []string{"primary", "old-0"}, mutate: func(r *rollingStatusFields) {
+			r.Generations[1].Problems = []statusReason{{Code: "retiring_attempt_problem", Detail: "Run run-0: interrupted"}}
+		}},
+		{name: "degraded-renewal", summary: 2, detailIDs: []string{"primary", "old-0"}, mutate: func(r *rollingStatusFields) {
+			r.Generations[1].RenewalHealth = "degraded"
+		}},
+		{name: "unverified-renewal", summary: 2, detailIDs: []string{"primary", "old-0"}, mutate: func(r *rollingStatusFields) {
+			r.Generations[1].RenewalHealth = "unverified"
+		}},
+		{name: "staged", summary: 2, detailIDs: []string{"primary", "old-0"}, mutate: func(r *rollingStatusFields) {
+			r.Generations[1].Role = "staged"
+		}},
+		{name: "retiring", summary: 2, detailIDs: []string{"primary", "old-0"}, mutate: func(r *rollingStatusFields) {
+			r.Generations[1].Role = "retiring"
+		}},
+		{name: "history", summary: 2, detailIDs: []string{"primary", "old-0"}, mutate: func(r *rollingStatusFields) {
+			r.Generations[1].Role = "history"
+		}},
+		{name: "no-closed-generations", detailIDs: []string{"primary"}, mutate: func(r *rollingStatusFields) {
+			r.Generations = r.Generations[:1]
+		}},
+		{name: "no-healthy-closed-generations", detailIDs: []string{"primary", "old-0", "old-1", "old-2"}, mutate: func(r *rollingStatusFields) {
+			for i := 1; i < len(r.Generations); i++ {
+				r.Generations[i].RenewalHealth = "unverified"
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nodes := generationStatusFixture(now, 3)
+			for i := 1; i < len(nodes.Nodes[0].Generations); i++ {
+				nodes.Nodes[0].Generations[i].Role = l1.NodeGenerationClosed
+				nodes.Nodes[0].Generations[i].Attempts[0].State = generationAttemptState(contract.AttemptSucceeded)
+			}
+			r := collectRollingStatus("", nodes, true, now)
+			if tc.mutate != nil {
+				tc.mutate(&r)
+			}
+			for _, command := range []string{"status", "doctor"} {
+				for _, asJSON := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/json=%t", command, asJSON), func(t *testing.T) {
+						var out bytes.Buffer
+						var err error
+						if command == "status" {
+							err = writeStatusResult(&out, clusterStatus{rollingStatusFields: r, Ready: true, Verdict: "ready"}, asJSON)
+						} else {
+							err = writeDoctorReport(&out, plainDoctorReport{rollingStatusFields: r, Healthy: true}, asJSON)
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						if asJSON {
+							var decoded rollingStatusFields
+							if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+								t.Fatal(err)
+							}
+							if !reflect.DeepEqual(decoded.Generations, r.Generations) {
+								t.Fatalf("JSON lost generation detail: %s", out.String())
+							}
+							return
+						}
+						for _, g := range r.Generations {
+							line := "generation " + g.ID + " " + g.Role + ": version "
+							if strings.Contains(out.String(), line) != slices.Contains(tc.detailIDs, g.ID) {
+								t.Fatalf("wrong generation detail for %s: %s", g.ID, out.String())
+							}
+							for _, problem := range g.Problems {
+								if !strings.Contains(out.String(), problem.Detail) {
+									t.Fatalf("hidden problem: %s", out.String())
+								}
+							}
+						}
+						if tc.summary == 0 {
+							if strings.Contains(out.String(), "closed generations:") {
+								t.Fatalf("unexpected summary: %s", out.String())
+							}
+						} else if strings.Count(out.String(), "closed generations:") != 1 ||
+							!strings.Contains(out.String(), fmt.Sprintf("\nclosed generations: %d (healthy)\n", tc.summary)) {
+							t.Fatalf("wrong healthy closed-generation summary: %s", out.String())
+						}
+					})
+				}
+			}
+		})
+	}
+}
+
 func TestRollingStatusTextAndJSONFixtures(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
