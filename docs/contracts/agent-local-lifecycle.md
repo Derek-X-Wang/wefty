@@ -57,6 +57,23 @@ identity, change installation locks, or enable installed rolling upgrades.
 Shared storage ownership is built in #1176 below. Installed activation sequencing
 remains #1179 integration.
 
+An enrolled primary can recover a `node_dead` heartbeat or claim RPC refusal
+when an authenticated generation observation still confirms it as primary.
+Re-registration keeps the same generation and boot, and runs inside the serving
+session. Resident contexts, Guardians, output and Attempt renewal keep running;
+actual Attempt Lease loss and explicit cancellation retain their existing rules.
+If promotion races registration, another authenticated observation latches the
+normal retirement path instead of quarantining or retrying registration as a
+retiree. Legacy agents keep their existing session recovery behavior.
+
+Other heartbeat or claim RPC refusals reach their classifier only after the
+required generation observations succeed. Generation-observation errors,
+including semantic refusals such as `node_not_registered`, `identity_bound`,
+and `principal_forbidden`, retain the existing retry behavior; they can prevent
+registration or quarantine. The heartbeat loop logs the first node-session
+failure until a heartbeat succeeds, and successful re-registration logs the
+rejoin.
+
 The dedicated trigger is L1's authenticated generation inventory after its
 fenced promotion transaction. The existing serialized heartbeat loop reads
 `GET /v1/agent/nodes/{node_id}/generations` for an enrolled session. An enrolled
