@@ -78,6 +78,7 @@ type agentSession struct {
 	loadReadErrorLogged bool
 	lastOneshotClaim    time.Time
 
+	rejoinMu                  sync.Mutex
 	retirementMu              sync.Mutex
 	upgradePromotionReply     chan struct{}
 	retiringRequested         chan struct{}
@@ -330,6 +331,57 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 		return node, nil
 	}
 	return session.publishRegistrationCapabilityPinned(ctx)
+}
+
+// Rejoin an enrolled primary in place. Node liveness is independent of Attempt
+// Leases; replacing the serving context would cancel still-authorized residents.
+func (session *agentSession) rejoinGeneration(ctx context.Context, cause error) error {
+	session.rejoinMu.Lock()
+	defer session.rejoinMu.Unlock()
+	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
+	session.setSession(LifecycleRejoining, 0, cause)
+	for ctx.Err() == nil {
+		retiring, err := session.observeGeneration(ctx)
+		if retiring {
+			return nil
+		}
+		if err == nil {
+			_, err = session.register(ctx)
+			if err == nil {
+				session.markReady()
+				if session.logf != nil {
+					session.logf("agent: rejoined node %s", session.registration.NodeID)
+				}
+				if session.removals != nil && session.ociBootBarrier == nil {
+					if err := session.removals.resume(ctx); err != nil && ctx.Err() == nil && session.logf != nil {
+						session.logf("agent: resume service removals: %v", err)
+					}
+				}
+				return nil
+			}
+			// Promotion can commit after the final primary observation, or
+			// retirement can latch before register's local guard. Both cases
+			// must enter normal retirement without cancelling residents.
+			retiring, observationErr := session.observeGeneration(ctx)
+			if retiring {
+				return nil
+			}
+			if observationErr == nil {
+				classification := classifyAgentProtocolError(err)
+				if classification.destination != errorDestinationTransient && classification.nodeSessionReaction != nodeSessionReregister {
+					return err
+				}
+			} else {
+				err = observationErr
+			}
+		}
+		delay := backoff.next()
+		session.setSession(LifecycleRejoining, delay, err)
+		if err := session.waitWithoutHeartbeat(ctx, delay); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
 }
 
 func (session *agentSession) notifyOCIBootReady() {
@@ -1171,6 +1223,16 @@ func (session *agentSession) claimClassLoop(
 				}
 			}
 			classification := classifyAgentProtocolError(err)
+			if session.registration.AgentGenerationID != "" && classification.nodeSessionReaction == nodeSessionReregister {
+				if err = session.rejoinGeneration(ctx, err); err == nil {
+					backoff.reset()
+					continue
+				}
+				if ctx.Err() != nil {
+					return destinationError{}
+				}
+				classification = classifyAgentProtocolError(err)
+			}
 			failure := destinationError{
 				destination: classification.destination,
 				err:         fmt.Errorf("agent: claim %s job: %w", selector, err),
@@ -1493,6 +1555,17 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 					session.setSession(LifecycleRejoining, nextDelay, err)
 					continue
 				}
+			}
+			if session.registration.AgentGenerationID != "" && classification.nodeSessionReaction == nodeSessionReregister {
+				if err = session.rejoinGeneration(ctx, err); err == nil {
+					backoff.reset()
+					nextDelay = session.heartbeatInterval
+					continue
+				}
+				if ctx.Err() != nil {
+					return
+				}
+				classification = classifyAgentProtocolError(err)
 			}
 			if classification.destination == errorDestinationTransient {
 				nextDelay = backoff.next()
