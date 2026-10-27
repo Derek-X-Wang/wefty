@@ -33,6 +33,54 @@ func generationStatusFixture(now time.Time, retiring int) l1.NodeList {
 	return l1.NodeList{Nodes: []l1.Node{node}}
 }
 
+func TestPrimaryGenerationReregistrationRecoversStatus(t *testing.T) {
+	clock := &nodeCLIClock{now: time.Now().UTC()}
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "rejoin.sqlite"), l1.StoreOptions{Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	registration := contract.NodeRegistration{NodeID: "node", BootSessionID: "boot", AgentGenerationID: "generation", OS: "darwin", Architecture: "arm64", AgentVersion: "test",
+		Capabilities: map[string]bool{"kind:process": true, "upgrade:retirement:v1": true}}
+	register := func() {
+		t.Helper()
+		if _, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "agent"}, registration, l1.NodePolicy{MaxOneshotSlots: 1}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	register()
+	clock.Advance(l1.DefaultNodeDeadAfter)
+	if _, err := store.Reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, rejoin := range []bool{false, true} {
+		if rejoin {
+			register()
+		}
+		nodes, err := store.ListNodes(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := newStatusHarness(t)
+		h.nodes = l1.NodeList{Nodes: nodes}
+		var out, stderr bytes.Buffer
+		err = executeStatus(t.Context(), h.clients(), true, nil, &out, &stderr)
+		if rejoin && err != nil {
+			t.Fatal(err)
+		}
+		var status clusterStatus
+		if err := json.Unmarshal(out.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		if status.Ready != rejoin || len(status.Nodes) != 1 || status.Nodes[0].AcceptsOneshot != rejoin {
+			t.Fatalf("rejoin=%t status=%s", rejoin, out.String())
+		}
+		if rejoin && (len(status.Generations) != 1 || status.Generations[0].ID != "generation" || status.Generations[0].RenewalHealth != "healthy" || len(status.Generations[0].Problems) != 0) {
+			t.Fatalf("generation health after rejoin=%s", out.String())
+		}
+	}
+}
+
 func TestRollingStatusClosedGenerationSummary(t *testing.T) {
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {

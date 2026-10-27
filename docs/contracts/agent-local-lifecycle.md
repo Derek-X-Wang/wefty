@@ -57,6 +57,15 @@ identity, change installation locks, or enable installed rolling upgrades.
 Shared storage ownership is built in #1176 below. Installed activation sequencing
 remains #1179 integration.
 
+A primary generation uses the same node-session error reactions as a legacy
+agent. A `node_dead` or `node_not_registered` heartbeat or claim refusal returns
+to registration; other node-session errors keep their classifier's drain or
+quarantine reaction. A refusal triggers another authenticated generation read
+before routing, so promotion racing a primary heartbeat can latch retirement.
+An unavailable generation observation keeps the existing retry behavior.
+The heartbeat loop logs the first node-session failure until a heartbeat
+succeeds, and successful re-registration logs the rejoin.
+
 The dedicated trigger is L1's authenticated generation inventory after its
 fenced promotion transaction. The existing serialized heartbeat loop reads
 `GET /v1/agent/nodes/{node_id}/generations` for an enrolled session. An enrolled
