@@ -137,6 +137,9 @@ type agentSession struct {
 	registeredMu   sync.Mutex
 	registered     chan struct{}
 	registeredOnce sync.Once
+
+	heartbeatErrorMu     sync.Mutex
+	heartbeatErrorLogged bool
 }
 
 type residentAttempt struct {
@@ -349,7 +352,14 @@ func (session *agentSession) rejoinGeneration(ctx context.Context, cause error) 
 		if retiring {
 			return nil
 		}
-		if err == nil {
+		classification := classifyAgentProtocolError(err)
+		if err != nil {
+			session.logHeartbeatError(err)
+			if classification.nodeSessionReaction != nodeSessionNoReaction && classification.nodeSessionReaction != nodeSessionReregister {
+				return err
+			}
+		}
+		if err == nil || classification.nodeSessionReaction == nodeSessionReregister {
 			_, err = session.register(ctx)
 			if err == nil {
 				session.markReady()
@@ -370,13 +380,15 @@ func (session *agentSession) rejoinGeneration(ctx context.Context, cause error) 
 			if retiring {
 				return nil
 			}
-			if observationErr == nil {
-				classification := classifyAgentProtocolError(err)
+			if observationErr != nil {
+				err = observationErr
+				session.logHeartbeatError(err)
+			}
+			classification := classifyAgentProtocolError(err)
+			if observationErr == nil || classification.nodeSessionReaction != nodeSessionNoReaction {
 				if classification.destination != errorDestinationTransient && classification.nodeSessionReaction != nodeSessionReregister {
 					return err
 				}
-			} else {
-				err = observationErr
 			}
 		}
 		delay := backoff.next()
@@ -1232,10 +1244,14 @@ func (session *agentSession) claimClassLoop(
 					return destinationError{}
 				}
 				if observationErr != nil {
-					if waitErr := session.waitForClaimWork(ctx, retire, backoff.next()); waitErr != nil {
-						return destinationError{}
+					session.logHeartbeatError(observationErr)
+					if classifyAgentProtocolError(observationErr).nodeSessionReaction == nodeSessionNoReaction {
+						if waitErr := session.waitForClaimWork(ctx, retire, backoff.next()); waitErr != nil {
+							return destinationError{}
+						}
+						continue
 					}
-					continue
+					err = observationErr
 				}
 			}
 			classification := classifyAgentProtocolError(err)
@@ -1522,18 +1538,22 @@ func (session *agentSession) heartbeatOCIPinned(ctx context.Context) (l1.Heartbe
 	return response, err
 }
 
+// Inventory reads can fail in the heartbeat, claim and rejoin loops. Share the
+// heartbeat's first-refusal latch until a primary or retiring heartbeat succeeds.
+func (session *agentSession) logHeartbeatError(err error) {
+	session.heartbeatErrorMu.Lock()
+	defer session.heartbeatErrorMu.Unlock()
+	if err == nil {
+		session.heartbeatErrorLogged = false
+	} else if !session.heartbeatErrorLogged && classifyAgentProtocolError(err).destination == errorDestinationNodeSession && session.logf != nil {
+		session.logf("agent: heartbeat failed: %v", err)
+		session.heartbeatErrorLogged = true
+	}
+}
+
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
 	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
 	nextDelay := session.heartbeatInterval
-	nodeSessionErrorLogged := false
-	logHeartbeatError := func(err error) {
-		if err == nil {
-			nodeSessionErrorLogged = false
-		} else if !nodeSessionErrorLogged && classifyAgentProtocolError(err).destination == errorDestinationNodeSession && session.logf != nil {
-			session.logf("agent: heartbeat failed: %v", err)
-			nodeSessionErrorLogged = true
-		}
-	}
 	for {
 		timer := session.clock.NewTimer(nextDelay)
 		select {
@@ -1544,13 +1564,16 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 		case <-session.heartbeatWake:
 		}
 		stopTimer(timer)
+		var response l1.HeartbeatResponse
+		var err error
 		if session.registration.AgentGenerationID != "" {
-			retiring, err := session.observeGeneration(ctx)
+			var retiring bool
+			retiring, err = session.observeGeneration(ctx)
 			if err == nil && retiring {
 				err = session.client.HeartbeatRetiringGeneration(ctx, session.registration.NodeID, session.registration.AgentGenerationID, session.registration.BootSessionID)
 			}
-			if err != nil || retiring {
-				logHeartbeatError(err)
+			if retiring || (err != nil && classifyAgentProtocolError(err).nodeSessionReaction == nodeSessionNoReaction) {
+				session.logHeartbeatError(err)
 				nextDelay = session.heartbeatInterval
 				if err != nil {
 					nextDelay = backoff.next()
@@ -1561,27 +1584,30 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				continue
 			}
 		}
-		var response l1.HeartbeatResponse
-		var err error
-		if session.ociBootBarrier == nil {
+		if err == nil && session.ociBootBarrier == nil {
 			if refreshErr := session.capabilities.refresh(ctx); refreshErr != nil && !capabilityProbeWasSkipped(refreshErr) && session.logf != nil {
 				session.logf("agent: capability probe before heartbeat: %v", refreshErr)
 			}
 			response, err = session.publishCapabilityHeartbeatResponse(ctx, nil)
-		} else {
+		} else if err == nil {
 			response, err = session.heartbeatOCIPinned(ctx)
 		}
 		if err != nil {
-			logHeartbeatError(err)
+			session.logHeartbeatError(err)
 			classification := classifyAgentProtocolError(err)
 			if session.registration.AgentGenerationID != "" && classification.destination != errorDestinationTransient {
 				// Promotion can race the heartbeat after the primary observation
 				// above. Confirm demotion before routing a stale-primary refusal.
 				retiring, observationErr := session.observeGeneration(ctx)
-				if retiring || observationErr != nil {
+				if retiring || (observationErr != nil && classifyAgentProtocolError(observationErr).nodeSessionReaction == nodeSessionNoReaction) {
 					nextDelay = backoff.next()
 					session.setSession(LifecycleRejoining, nextDelay, err)
 					continue
+				}
+				if observationErr != nil {
+					err = observationErr
+					session.logHeartbeatError(err)
+					classification = classifyAgentProtocolError(err)
 				}
 			}
 			if session.registration.AgentGenerationID != "" && classification.nodeSessionReaction == nodeSessionReregister {
@@ -1606,7 +1632,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			}
 			return
 		}
-		logHeartbeatError(nil)
+		session.logHeartbeatError(nil)
 		if session.computerPolicy != nil && !session.computerPolicy.Valid() && response.ComputerPolicy != nil {
 			if policyErr := session.installComputerPolicy(ctx, response.ComputerPolicy); policyErr != nil {
 				session.computerPolicy.Invalidate(ComputerPolicyWatchLost)
