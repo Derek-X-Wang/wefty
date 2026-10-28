@@ -359,9 +359,12 @@ class Proof:
         self.boot()
 
     def disk_sample(self, name):
-        disk = self.instance_dir / "diffdisk"
+        # Lima 2.x keeps the instance disk as "disk"; older Lima used "diffdisk".
+        disk = self.instance_dir / "disk"
+        if not disk.exists() and not disk.is_symlink():
+            disk = self.instance_dir / "diffdisk"
         if disk.is_symlink() or not disk.is_file():
-            raise RuntimeError("proof diffdisk is absent or redirected")
+            raise RuntimeError("proof instance disk is absent or redirected")
         info = disk.stat()
         self.row("PR-5/M4", name, "VERIFIED", f"apparent_bytes={info.st_size} allocated_bytes={info.st_blocks*512}")
 

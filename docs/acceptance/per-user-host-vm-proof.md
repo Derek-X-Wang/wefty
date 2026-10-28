@@ -1,9 +1,10 @@
 # Attended per-user host VM proof (#1132)
 
-**Status: NOT-RUN.** This runbook and its scripts prepare PR-1 to PR-5 of
+**Status: attended run passed on 2026-10-27.** PR-1, PR-2, PR-3 and PR-5 are
+VERIFIED; PR-4 is PARTIAL by design. The sanitized results are on #1132.
+This runbook and its scripts prepare PR-1 to PR-5 of
 [the phase 3 spec](../specs/2026-10-21-computer-request-spec.md#1112-the-proof-on-the-owners-mac-1027-1010).
-They do not claim that a LaunchAgent can start `vz` on the owner's Mac.
-Only the attended run can establish that. Use a quiet login session with the
+Injected tests do not establish these results; only an attended run can. Use a quiet login session with the
 owner present. The owner types **every** `wefty setup` / `--remove` command
 and clicks the native dialog. The orchestrator runs preparation, observations,
 measurements and proof-service lifecycle commands. The orchestrator never runs
@@ -263,7 +264,7 @@ Rows remain PARTIAL; use system-wide figures for the four-state comparison.
 An unverified or unrelated PID is never measured. Never add Mac sudo. The stopped
 state confirms Lima state only. This is one Computer with one Seat, not a load test.
 
-PR-5/M4 records `diffdisk` apparent bytes **and allocated bytes** at baseline,
+PR-5/M4 records the instance disk file (`disk` in Lima 2.x, `diffdisk` in older Lima) apparent bytes **and allocated bytes** at baseline,
 after creation and after verified deletion for **ten** Computer cycles. Compare
 the allocated sizes to answer whether the host file shrinks; constant apparent
 size alone cannot answer it. No trim/compact operation is added. Stop on any
