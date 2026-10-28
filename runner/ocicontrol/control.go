@@ -69,13 +69,15 @@ type SetupResponse struct {
 }
 
 type IntentMutationRequest struct {
-	ExpectedRevision uint64 `json:"expected_revision"`
+	ExpectedRevision uint64           `json:"expected_revision"`
+	Position         lima.OCIPosition `json:"position,omitempty"`
 }
 
 type IntentResponse struct {
-	Intent              lima.OCIIntent `json:"intent"`
-	CapabilityPublished bool           `json:"capability_published"`
-	RuntimeQuiesced     bool           `json:"runtime_quiesced,omitempty"`
+	Intent              lima.OCIIntent    `json:"intent"`
+	CapabilityPublished bool              `json:"capability_published"`
+	RuntimeQuiesced     bool              `json:"runtime_quiesced,omitempty"`
+	EndedWork           []lima.DemandItem `json:"ended_work,omitempty"`
 }
 
 // LoadImageRequest carries the operator's explicit import name. An OCI

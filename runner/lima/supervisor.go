@@ -84,6 +84,8 @@ type SupervisorFacts struct {
 	Instance   string                        `json:"instance"`
 	State      InstanceState                 `json:"state"`
 	Enabled    bool                          `json:"enabled"`
+	Position   OCIPosition                   `json:"position,omitempty"`
+	Demand     []DemandItem                  `json:"demand,omitempty"`
 	Recovering bool                          `json:"recovering"`
 	ReasonCode contract.CapabilityReasonCode `json:"reason_code,omitempty"`
 	ObservedAt time.Time                     `json:"observed_at"`
@@ -113,6 +115,10 @@ type SupervisorConfig struct {
 	wait            func(context.Context, time.Duration) error
 	withTimeout     timeoutContext
 	Logf            func(string, ...any)
+	Demand          DemandSource
+	IdleWait        time.Duration
+	IdleStopTimeout time.Duration
+	CheckFreeSpace  func() error
 }
 
 // Supervisor is the sole Lima lifecycle mutator in the macOS agent process.
@@ -127,6 +133,7 @@ type Supervisor struct {
 	// helperLossAt stamps the last helper-loss signal. It is taken once, so a
 	// fault buys exactly one extra inspection however many cycles observe it.
 	helperLossAt time.Time
+	idleSince    time.Time
 }
 
 // noteHelperLoss records that the helper connection was lost, which on this
@@ -162,6 +169,15 @@ func NewSupervisor(config SupervisorConfig) (*Supervisor, error) {
 	}
 	if config.Intent == nil {
 		return nil, errors.New("Lima supervisor requires a read-only OCI intent source")
+	}
+	if config.IdleWait < 0 || config.IdleStopTimeout < 0 {
+		return nil, errors.New("host VM idle waits must be positive")
+	}
+	if config.IdleWait <= 0 {
+		config.IdleWait = DefaultHostVMIdleWait
+	}
+	if config.IdleStopTimeout <= 0 {
+		config.IdleStopTimeout = DefaultHostVMIdleStopTimeout
 	}
 	if config.PollInterval <= 0 {
 		config.PollInterval = defaultSupervisorPollInterval
@@ -206,6 +222,7 @@ func (supervisor *Supervisor) Facts() SupervisorFacts {
 	defer supervisor.mu.RUnlock()
 	facts := supervisor.facts
 	facts.Transitions = append([]StateTransition(nil), supervisor.facts.Transitions...)
+	facts.Demand = append([]DemandItem(nil), supervisor.facts.Demand...)
 	return facts
 }
 
@@ -273,6 +290,18 @@ func (supervisor *Supervisor) ensureWithin(ctx context.Context) error {
 	if err := supervisor.recheckEnabled(ctx, intent); err != nil {
 		return supervisor.cancelToStopped(ctx, state, err)
 	}
+	if intent.PositionValue() == OCIPositionOnDemand && state != InstanceRunning {
+		items, demandErr := supervisor.demand(ctx)
+		if demandErr != nil {
+			return demandErr
+		}
+		if len(items) == 0 {
+			if !supervisor.idleStopped(ctx, intent, state) {
+				supervisor.record(state, true, false, reasonForInstanceState(state), false)
+			}
+			return errors.New("host VM has no demand")
+		}
+	}
 	// A Stopped reading just after a helper loss may be Lima's status file
 	// mid-settle rather than a settled instance. Re-inspect once so an instance
 	// that settles to a durable Broken takes the Broken branch -- the bounded
@@ -324,6 +353,19 @@ func (supervisor *Supervisor) recoveryNeeded(ctx context.Context, helperReady bo
 		supervisor.record(InstanceUnknown, true, false, contract.CapabilityReasonProbeFailed, false)
 		return true
 	}
+	if intent.PositionValue() == OCIPositionOnDemand {
+		items, demandErr := supervisor.demand(ctx)
+		if demandErr != nil {
+			supervisor.record(state, true, false, contract.CapabilityReasonProbeFailed, false)
+			return false
+		}
+		if len(items) == 0 {
+			if !supervisor.idleStopped(ctx, intent, state) {
+				supervisor.record(state, true, false, reasonForInstanceState(state), false)
+			}
+			return false
+		}
+	}
 	reason := reasonForInstanceState(state)
 	recovering := state != InstanceRunning || !helperReady
 	if state == InstanceRunning && !helperReady {
@@ -350,6 +392,12 @@ func (supervisor *Supervisor) enforceDisabled(ctx context.Context, intentErr err
 func (supervisor *Supervisor) startAndVerify(ctx context.Context, expected OCIIntent, repaired bool) error {
 	if err := supervisor.recheckEnabled(ctx, expected); err != nil {
 		return supervisor.cancelToStopped(ctx, InstanceStopped, err)
+	}
+	if supervisor.config.CheckFreeSpace != nil {
+		if err := supervisor.config.CheckFreeSpace(); err != nil {
+			supervisor.record(InstanceStopped, true, false, contract.CapabilityReasonPrerequisiteMissing, false)
+			return err
+		}
 	}
 	_, startErr := supervisor.runWithinRecoveryBudget(ctx, "start", supervisor.config.Instance)
 	if intentErr := supervisor.recheckEnabled(ctx, expected); intentErr != nil {
@@ -689,7 +737,13 @@ func (barrier *SupervisedBootBarrier) Recreate(ctx context.Context, quiesce, rec
 	intent, intentErr := barrier.Supervisor.readIntent(ctx)
 	if intentErr == nil && intent.Enabled {
 		barrier.Barrier.Invalidate()
-		if intentErr = barrier.Supervisor.guardRecreate(ctx); intentErr == nil {
+		if check := barrier.Supervisor.config.CheckFreeSpace; check != nil {
+			intentErr = check()
+		}
+		if intentErr == nil {
+			intentErr = barrier.Supervisor.guardRecreate(ctx)
+		}
+		if intentErr == nil {
 			if _, intentErr = barrier.Supervisor.runBounded(ctx, "delete", "--force", barrier.Supervisor.config.Instance); intentErr == nil {
 				_, intentErr = barrier.Supervisor.runBounded(ctx, "start", "--name="+barrier.Supervisor.config.Instance, temporaryPath)
 			} else {
@@ -865,13 +919,18 @@ func (barrier *SupervisedBootBarrier) Invalidate() {
 	barrier.cycleMu.Unlock()
 }
 
-func (barrier *SupervisedBootBarrier) Run(ctx context.Context, recover func(context.Context) error) {
+func (barrier *SupervisedBootBarrier) Run(ctx context.Context, recover func(context.Context) error, idle ...func(context.Context) error) {
 	if barrier == nil || barrier.Supervisor == nil || recover == nil {
 		return
 	}
 	for {
 		if err := barrier.Supervisor.config.wait(ctx, barrier.Supervisor.config.PollInterval); err != nil {
 			return
+		}
+		if len(idle) > 0 {
+			if err := idle[0](ctx); err != nil && barrier.Supervisor.config.Logf != nil {
+				barrier.Supervisor.config.Logf("host VM idle convergence: %v", err)
+			}
 		}
 		barrier.cycleMu.Lock()
 		needed := barrier.Supervisor.recoveryNeeded(ctx, barrier.Barrier.Ready())

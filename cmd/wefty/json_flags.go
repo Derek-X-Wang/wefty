@@ -12,6 +12,7 @@ import (
 // and platform-specific commands); TestJSONValueFlagVocabulary checks it.
 const jsonValueFlags = `o button dy dx screenshot agent-path allowed-mount-root argv auth-key backup-cap cap
 computer-default-image computer-shared-seat-limit computer-seat-memory-bytes computer-dedicated-cap
+host-vm-idle-wait host-vm-minimum-free-bytes
 computer-idle-wait seat-idle-wait seat-warning-wait seat-command-max-runtime
 capability claims-enabled class control-url coordinator-url cpu-millicores cursor device-id dir disk-bytes drain-timeout
 envelope-schema envelope-schema-file evidence-file fabric fabric-id fabric-name

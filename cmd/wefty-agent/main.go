@@ -322,6 +322,12 @@ func runMacBootstrap(arguments []string) error {
 	}
 	supervisor, err := limarunner.NewSupervisor(limarunner.SupervisorConfig{
 		Instance: *instance, Limactl: *limactl, Intent: limarunner.FileIntentSource{Path: *intentPath},
+		Demand: limarunner.DemandSourceFunc(func(context.Context) ([]limarunner.DemandItem, error) {
+			return []limarunner.DemandItem{{Kind: "load-image", ID: "bootstrap"}}, nil
+		}),
+		CheckFreeSpace: func() error {
+			return limarunner.CheckHostVMFreeSpace(*limaHome, limarunner.DefaultHostVMMinimumFreeBytes)
+		},
 	})
 	if err != nil {
 		return err
@@ -501,6 +507,8 @@ func run() error {
 		shutdownBudget        = flag.Duration("shutdown-budget", 0, "after the first SIGINT or SIGTERM, cancel resident attempts in order once this long has passed; 0 waits for them (a second signal still cancels at once)")
 		profilePath           = flag.String("profile", os.Getenv(connprofile.EnvironmentVariable), "connection profile that supplies the Fabric, control-plane and run-ledger addresses and the node ID not set by flags (default $"+connprofile.EnvironmentVariable+")")
 	)
+	hostVMIdleWait := flag.Duration("host-vm-idle-wait", limarunner.DefaultHostVMIdleWait, "idle wait before the on-demand host VM stops")
+	hostVMMinimumFreeBytes := flag.Uint64("host-vm-minimum-free-bytes", limarunner.DefaultHostVMMinimumFreeBytes, "free bytes required on the Mac before the host VM starts")
 	computerRoomFlags := bindComputerRoomFlags(flag.CommandLine)
 	seatApprovalAnswerWait := flag.Duration("seat-approval-answer-wait", agent.DefaultSeatApprovalWait, "wait for the owner to answer a native Seat approval dialog (maximum 1h)")
 	seatApprovalWindowHours := flag.String("seat-approval-window-hours", "1,8,24", "allowed Seat approval window lengths in hours (subset of 1,8,24)")
@@ -744,6 +752,7 @@ func run() error {
 	var deadman agent.AttemptDeadmanRenewer
 	var ociBridgeBinder workloadrunner.WorkflowBridgeBinder
 	var limaSupervisor *limarunner.Supervisor
+	hostVMDemand := &limarunner.DemandState{}
 	var supervisedBootBarrier *limarunner.SupervisedBootBarrier
 	var ociAdapter *ocirunner.Adapter
 	if *ociHelperSocket != "" {
@@ -771,8 +780,10 @@ func run() error {
 		if runtime.GOOS == "darwin" {
 			limaSupervisor, err = limarunner.NewSupervisor(limarunner.SupervisorConfig{
 				Instance: *ociLimaInstance,
-				Intent:   limarunner.FileIntentSource{Path: *ociIntentFile},
-				Logf:     log.Printf,
+				Demand:   hostVMDemand, IdleWait: *hostVMIdleWait,
+				CheckFreeSpace: func() error { return limarunner.CheckHostVMFreeSpace(limarunner.HostVMHome(), *hostVMMinimumFreeBytes) },
+				Intent:         limarunner.FileIntentSource{Path: *ociIntentFile},
+				Logf:           log.Printf,
 			})
 			if err != nil {
 				return err
@@ -906,7 +917,13 @@ func run() error {
 				}
 				var limaFacts func() limarunner.SupervisorFacts
 				if limaSupervisor != nil {
-					limaFacts = limaSupervisor.Facts
+					limaFacts = func() limarunner.SupervisorFacts {
+						facts := limaSupervisor.Facts()
+						if items, err := nodeAgent.HostVMDemand(doctorContext); err == nil {
+							facts.Demand = items
+						}
+						return facts
+					}
 				}
 				var stalledWindows func() uint64
 				var startupBound func() ocihelper.StartupBoundObservation
@@ -1098,7 +1115,7 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		controlServer, err := ocicontrol.NewServer(*ociControlSocket, controller)
+		controlServer, err := ocicontrol.NewNodeServer(*ociControlSocket, controller)
 		if err != nil {
 			return err
 		}
@@ -1113,7 +1130,8 @@ func run() error {
 		go writeProofStartupReceipt(ctx, filepath.Dir(*ociSetupState), nodeAgent, bootBarrier, *nodeID, bootSessionID)
 	}
 	if supervisedBootBarrier != nil {
-		go supervisedBootBarrier.Run(ctx, nodeAgent.RecoverOCIRuntimeCapabilities)
+		nodeAgent.ConfigureHostVMDemand(hostVMDemand, agent.NoQueuedOCIDemand{})
+		go supervisedBootBarrier.Run(ctx, nodeAgent.RecoverOCIRuntimeCapabilities, func(ctx context.Context) error { return nodeAgent.PollHostVM(ctx, supervisedBootBarrier) })
 	}
 	if *ociDoctorFacts != "" {
 		if runtime.GOOS != "darwin" || limaSupervisor == nil || bootBarrier == nil {
@@ -1402,7 +1420,7 @@ func (probe ociCapabilityProbe) intentEnabled(ctx context.Context) (bool, error)
 		return true, nil
 	}
 	intent, err := probe.intent.ReadIntent(ctx)
-	return err == nil && intent.Version == limarunner.OCIIntentVersion && intent.Revision > 0 && intent.Enabled, err
+	return err == nil && (intent.Version == 1 || intent.Version == limarunner.OCIIntentVersion) && intent.Revision > 0 && intent.Enabled, err
 }
 
 func (probe ociCapabilityProbe) intentObservation(ctx context.Context) (agent.OCIIntentObservation, error) {

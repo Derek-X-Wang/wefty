@@ -51,6 +51,7 @@ type Server struct {
 	server               *http.Server
 	allowedUIDs          map[uint32]struct{}
 	shutdownDrainTimeout time.Duration
+	refuseDescendants    bool
 	logf                 func(string, ...any)
 }
 
@@ -94,7 +95,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	authenticated := &peerAuthenticatedListener{Listener: listener, allowedUIDs: server.allowedUIDs}
+	authenticated := &peerAuthenticatedListener{Listener: listener, allowedUIDs: server.allowedUIDs, refuseDescendants: server.refuseDescendants}
 	server.listener = authenticated
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/doctor", server.handleDoctor)
@@ -253,7 +254,8 @@ func sweepControlSocketStagingDirectories(directory string, prefixes ...string) 
 
 type peerAuthenticatedListener struct {
 	net.Listener
-	allowedUIDs map[uint32]struct{}
+	allowedUIDs       map[uint32]struct{}
+	refuseDescendants bool
 }
 
 func (listener *peerAuthenticatedListener) Accept() (net.Conn, error) {
@@ -264,7 +266,13 @@ func (listener *peerAuthenticatedListener) Accept() (net.Conn, error) {
 		}
 		uid, err := unixPeerUID(connection)
 		if _, allowed := listener.allowedUIDs[uid]; err == nil && allowed {
-			return connection, nil
+			if !listener.refuseDescendants {
+				return connection, nil
+			}
+			pid, pidErr := unixPeerPID(connection)
+			if pidErr == nil && operatorPeer(pid) {
+				return connection, nil
+			}
 		}
 		_ = connection.Close()
 	}
@@ -404,4 +412,16 @@ func helperMechanicsDetails(err error) map[string]any {
 		details["disk_failure"] = failure.DiskFailure
 	}
 	return details
+}
+
+// NewNodeServer adds the node agent descendant refusal to the UID-authenticated
+// transport. Generic service fixtures can use NewServer when their child
+// processes represent operator clients rather than node workloads.
+func NewNodeServer(path string, service Service, allowedUIDs ...uint32) (*Server, error) {
+	server, err := NewServer(path, service, allowedUIDs...)
+	if err != nil {
+		return nil, err
+	}
+	server.refuseDescendants = true
+	return server, nil
 }

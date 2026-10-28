@@ -1030,6 +1030,7 @@ const (
 	CapabilityReasonTemplateRecreateRequired         CapabilityReasonCode = "template_recreate_required"
 	CapabilityReasonMountRootUnavailable             CapabilityReasonCode = "mount_root_unavailable"
 	CapabilityReasonLocalPermissionDenied            CapabilityReasonCode = "local_permission_denied"
+	CapabilityReasonHostVMIdle                       CapabilityReasonCode = "host_vm_idle"
 )
 
 var capabilityReasonCodes = []CapabilityReasonCode{
@@ -1051,6 +1052,7 @@ var capabilityReasonCodes = []CapabilityReasonCode{
 	CapabilityReasonTemplateRecreateRequired,
 	CapabilityReasonMountRootUnavailable,
 	CapabilityReasonLocalPermissionDenied,
+	CapabilityReasonHostVMIdle,
 }
 
 // ociRestrictionCapabilityReasonCodes is intentionally separate from the wire
@@ -1075,6 +1077,7 @@ var ociRestrictionCapabilityReasonCodes = []CapabilityReasonCode{
 	CapabilityReasonTemplateRecreateRequired,
 	CapabilityReasonMountRootUnavailable,
 	CapabilityReasonLocalPermissionDenied,
+	CapabilityReasonHostVMIdle,
 }
 
 // CapabilityReasonCodes returns the complete wire vocabulary accepted by

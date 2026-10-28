@@ -47,9 +47,26 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 			return false, err
 		}
 	}
-	log.Printf("per-user host VM bootstrap begin pid=%d at=%s", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
-	if err := prepare(ctx, c, nodeID, bootID); err != nil {
-		return false, err
+	preparedPath := filepath.Join(filepath.Dir(c.SetupState), "host-vm-prepared.json")
+	wanted := preparedUserOCI{Assets: c.Assets, Instance: c.Instance, LimaHome: c.LimaHome, MountRoot: c.MountRoot, Sizing: c.Sizing}
+	var prepared preparedUserOCI
+	preparedErr := limarunner.ReadUserInstallJSON(preparedPath, &prepared)
+	currentIntent, intentErr := (limarunner.FileIntentSource{Path: c.IntentFile}).ReadIntent(ctx)
+	if intentErr != nil {
+		return false, intentErr
+	}
+	if !currentIntent.Enabled {
+		return true, nil
+	}
+	if preparedErr != nil && !errors.Is(preparedErr, os.ErrNotExist) {
+		return false, preparedErr
+	}
+	skipPrepare := !c.ProofDialog && currentIntent.PositionValue() == limarunner.OCIPositionOnDemand && preparedErr == nil && prepared == wanted
+	if !skipPrepare {
+		log.Printf("per-user host VM bootstrap begin pid=%d at=%s", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+		if err := prepare(ctx, c, nodeID, bootID); err != nil {
+			return false, err
+		}
 	}
 	intent, err := (limarunner.FileIntentSource{Path: c.IntentFile}).ReadIntent(ctx)
 	if err != nil {
@@ -57,6 +74,24 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 	}
 	if !intent.Enabled {
 		return true, nil
+	}
+	if !skipPrepare && !c.ProofDialog {
+		payload, err := json.Marshal(wanted)
+		if err != nil {
+			return false, err
+		}
+		root, err := os.OpenRoot(filepath.Dir(preparedPath))
+		if err != nil {
+			return false, err
+		}
+		err = durable.WriteFile(root, filepath.Base(preparedPath), append(payload, '\n'), 0600)
+		closeErr := root.Close()
+		if err != nil {
+			return false, err
+		}
+		if closeErr != nil {
+			return false, closeErr
+		}
 	}
 	capacity, reserve, err := limarunner.DefaultMacComputerCapacity(c.Sizing)
 	if err != nil {
@@ -167,4 +202,14 @@ func writeProofStartupReceipt(ctx context.Context, dir string, node *agent.Agent
 	if err := durable.WriteFile(root, "proof-startup.json", append(payload, '\n'), 0600); err != nil {
 		log.Printf("proof startup receipt: %v", err)
 	}
+}
+
+// The receipt identifies prepared helper/probe assets, not host VM liveness.
+// Timing settings are excluded so changing them cannot start an idle host VM.
+type preparedUserOCI struct {
+	Assets    limarunner.UserInstallAssets `json:"assets"`
+	Instance  string                       `json:"instance"`
+	LimaHome  string                       `json:"lima_home"`
+	MountRoot string                       `json:"mount_root"`
+	Sizing    limarunner.Sizing            `json:"sizing"`
 }

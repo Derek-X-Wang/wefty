@@ -192,3 +192,27 @@ func TestPerUserProofRefusalStopFailureKeepsNodeProcessUp(t *testing.T) {
 		t.Fatalf("stop calls=%d logs=%s", stops, &logs)
 	}
 }
+
+func TestOnDemandNodeRestartDoesNotBootstrapHostVM(t *testing.T) {
+	path := perUserProofTestConfig(t)
+	var config limarunner.UserInstallConfig
+	if err := limarunner.ReadUserInstallJSON(path, &config); err != nil {
+		t.Fatal(err)
+	}
+	config.ProofDialog = false
+	payload, _ := json.Marshal(config)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepares := 0
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error { prepares++; return nil }
+	for range 2 {
+		allowed, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil)
+		if err != nil || !allowed {
+			t.Fatalf("allowed=%t err=%v", allowed, err)
+		}
+	}
+	if prepares != 1 {
+		t.Fatalf("on-demand node restart bootstrapped host VM %d times", prepares)
+	}
+}

@@ -61,14 +61,15 @@ On macOS, `dev.wefty.agent` is the sole Lima supervisor. Lima autostart units mu
 
 ## Intent, convergence, and truthful availability
 
-OCI intent is a durable revisioned node-local bit. Setup initializes it only when absent and never overwrites an existing disabled value. These are the only intent mutations:
+OCI intent is a durable revisioned node-local switch: off, on demand or always on. A new per-user setup initializes on demand only when the marker is absent and preserves an existing off value. These are the only intent mutations:
 
 ```sh
-wefty node oci start
-wefty node oci stop
+wefty node oci always-on
+wefty node oci on-demand
+wefty node oci off
 ```
 
-`oci start` restores transport, completes the boot sweep barrier and functional probe, then advertises capability. `oci stop` persists disabled first, withdraws local admission and publication, reaps OCI attempts, and then stops Lima on Mac; Linux containerd is left alone.
+`oci always-on` restores transport, completes the boot sweep barrier and functional probe, then advertises capability. `oci off` persists disabled first, withdraws local admission and publication, reaps OCI attempts, and then stops Lima on Mac; Linux containerd is left alone.
 
 An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, zero live OCI attempts, and positive proof that no Computer Storage generation or Backup copy remains on the host VM disk. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
 
@@ -294,7 +295,7 @@ Meaning: durable OCI intent is enabled. Evidence: record its revision and update
 
 ## doctor-code-oci-intent-disabled
 
-Meaning: the operator's durable intent withholds OCI. Evidence: record the disabled revision and update time. First action: run `wefty node oci start` only when OCI should be enabled. Escalation: do not treat an intentional disabled bit as a runtime incident.
+Meaning: the operator's durable intent withholds OCI. Evidence: record the disabled revision and update time. First action: run `wefty node oci always-on` only when OCI should be enabled. Escalation: do not treat an intentional disabled bit as a runtime incident.
 
 ## doctor-code-oci-capability-revision-not-read
 
@@ -330,7 +331,7 @@ Meaning: the last recorded probe earned OCI capability. Evidence: check its age,
 
 ## doctor-code-oci-probe-failed
 
-Meaning: the last completed probe did not earn OCI capability. Evidence: use its typed reason and sanitized detail. First action: repair the named dependency, then use `oci start` or the normal agent recovery path. Escalation: attach the probe receipt and helper generation, never raw secrets.
+Meaning: the last completed probe did not earn OCI capability. Evidence: use its typed reason and sanitized detail. First action: repair the named dependency, then use `oci always-on` or the normal agent recovery path. Escalation: attach the probe receipt and helper generation, never raw secrets.
 
 ## doctor-code-oci-lima-not-applicable
 
@@ -386,7 +387,7 @@ Meaning: the connected helper reported no tripped startup-failure bound. First a
 
 ## doctor-code-oci-helper-startup-bound-tripped
 
-Meaning: the helper's boot Sweep+Verify barrier failed its bounded number of consecutive times, so this helper generation admits no session and re-attempts the barrier at most once per startup-failure window; every helper-dependent finding below is NOT-RUN for that reason. The finding names the handshake it was read at and the next attempt time — a bound read minutes ago may already be cleared. Evidence: preserve the reported phase, count, and elapsed streak, and the helper journal for the failing barrier. First action: fix the denial named in the journal — the whole-namespace startup sweep is denied by anything pinned inside the OCI runtime root, including a test fixture's mount. The helper then recovers on its own at the next attempt time, with no restart at all; re-run doctor after it. Escalation: restarting the helper unit (`systemctl restart dev.wefty.oci-helper.service` inside the guest or on a native Linux node, `wefty node oci start` on a Lima node) does **not** shorten the wait — the new generation inherits the same schedule, which is exactly what bounds the relaunch loop. To force an immediate attempt, delete the helper's failure ledger (`/var/lib/wefty/oci/startup-barrier-failures.json`, under the configured OCI runtime root) and then restart the unit; do that only after the denial itself is fixed, or the loop starts over.
+Meaning: the helper's boot Sweep+Verify barrier failed its bounded number of consecutive times, so this helper generation admits no session and re-attempts the barrier at most once per startup-failure window; every helper-dependent finding below is NOT-RUN for that reason. The finding names the handshake it was read at and the next attempt time — a bound read minutes ago may already be cleared. Evidence: preserve the reported phase, count, and elapsed streak, and the helper journal for the failing barrier. First action: fix the denial named in the journal — the whole-namespace startup sweep is denied by anything pinned inside the OCI runtime root, including a test fixture's mount. The helper then recovers on its own at the next attempt time, with no restart at all; re-run doctor after it. Escalation: restarting the helper unit (`systemctl restart dev.wefty.oci-helper.service` inside the guest or on a native Linux node, `wefty node oci always-on` on a Lima node) does **not** shorten the wait — the new generation inherits the same schedule, which is exactly what bounds the relaunch loop. To force an immediate attempt, delete the helper's failure ledger (`/var/lib/wefty/oci/startup-barrier-failures.json`, under the configured OCI runtime root) and then restart the unit; do that only after the denial itself is fixed, or the loop starts over.
 
 ## doctor-code-oci-computer-storage-recovery-clear
 
@@ -652,3 +653,13 @@ Meaning: the node's retained results were measured, and some entries under the h
 ## retained-results-record-names
 
 Meaning: this agent version files a run's retention record under a name that cannot collide with another run's. Older versions folded every character outside `[A-Za-z0-9_-]` to `_` and cut the name at 96 bytes, so `run.live` and `run_live` shared one file, as did any two runs agreeing on their first 96 characters. Records written under the old names are still read, so upgrading needs no migration. **Downgrading does:** an agent older than this one cannot find a record written under the new name, so a run whose ID contains a `.` or is longer than 96 characters keeps its retained results on the node, unexpired, until the agent is upgraded again. Nothing is deleted and nothing is lost; the node holds more than it should until then. Evidence: the agent log's per-pass `agent: retained results on this node:` line, whose unrecorded count rises as those directories stop being named by any record the older agent can read. First action: upgrade the agent back. Escalation: attach the handoff root listing and the agent's state directory listing.
+
+## On-demand host VM idle state
+
+`host_vm_idle` is healthy when the owner switch is `on-demand` and the host VM
+is stopped with no demand. Doctor reads facts and never starts it. When the
+host VM runs, doctor lists the OCI work and helper directives keeping it on.
+The idle wait defaults to ten minutes. The graceful stop gets four minutes;
+force is allowed only after that timeout. Before startup, free space must meet
+the node's `--host-vm-minimum-free-bytes` setting (5 GiB by default). Free space
+on the host VM disk volume and retry if startup refuses for insufficient space.

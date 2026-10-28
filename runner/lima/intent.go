@@ -12,15 +12,38 @@ import (
 	"time"
 )
 
-const OCIIntentVersion = 1
+const OCIIntentVersion = 2
 
-// OCIIntent is the read-only supervisor projection of Ticket #153's durable
-// store. This ticket creates only the initial marker during explicit setup.
+type OCIPosition string
+
+const (
+	OCIPositionOff      OCIPosition = "off"
+	OCIPositionOnDemand OCIPosition = "on-demand"
+	OCIPositionAlwaysOn OCIPosition = "always-on"
+)
+
+func (position OCIPosition) Valid() bool {
+	return position == OCIPositionOff || position == OCIPositionOnDemand || position == OCIPositionAlwaysOn
+}
+
+// PositionValue maps the previous boolean marker without changing its revision.
+func (intent OCIIntent) PositionValue() OCIPosition {
+	if intent.Position != "" {
+		return intent.Position
+	}
+	if intent.Enabled {
+		return OCIPositionAlwaysOn
+	}
+	return OCIPositionOff
+}
+
+// OCIIntent is the durable owner switch. Computed demand is held only by the node agent.
 type OCIIntent struct {
-	Version   int       `json:"version"`
-	Revision  uint64    `json:"revision"`
-	Enabled   bool      `json:"enabled"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Version   int         `json:"version"`
+	Revision  uint64      `json:"revision"`
+	Enabled   bool        `json:"enabled"`
+	Position  OCIPosition `json:"position,omitempty"`
+	UpdatedAt time.Time   `json:"updated_at"`
 }
 
 // IntentStateError identifies an absent or malformed durable intent marker.
@@ -37,10 +60,11 @@ func (err *IntentConflictError) Error() string {
 }
 
 func (intent OCIIntent) valid() bool {
-	return intent.Version == OCIIntentVersion && intent.Revision > 0 && !intent.UpdatedAt.IsZero()
+	versionOK := intent.Version == 1 && intent.Position == "" || intent.Version == OCIIntentVersion && (intent.Position == "" || intent.Position.Valid() && intent.Enabled == (intent.Position != OCIPositionOff))
+	return versionOK && intent.Revision > 0 && !intent.UpdatedAt.IsZero()
 }
 
-// IntentSource is deliberately read-only. Ticket #153 owns mutation and CAS.
+// IntentSource is read-only; the operator controller owns mutation and CAS.
 type IntentSource interface {
 	ReadIntent(context.Context) (OCIIntent, error)
 }
@@ -77,6 +101,8 @@ func (source FileIntentSource) ReadIntent(ctx context.Context) (OCIIntent, error
 	if err := decoder.Decode(&intent); err != nil || decoder.Decode(&struct{}{}) != io.EOF || !intent.valid() {
 		return OCIIntent{}, &IntentStateError{Message: "read OCI intent: invalid marker"}
 	}
+	intent.Position = intent.PositionValue()
+	intent.Version = OCIIntentVersion
 	intent.UpdatedAt = intent.UpdatedAt.UTC().Round(0)
 	return intent, nil
 }
@@ -87,6 +113,19 @@ func (source FileIntentSource) ReadIntent(ctx context.Context) (OCIIntent, error
 // before returning it. Replaying an already-achieved state is idempotent and
 // does not manufacture another revision.
 func SetOCIIntent(ctx context.Context, path string, expectedRevision uint64, enabled bool, now time.Time) (OCIIntent, error) {
+	position := OCIPositionOff
+	if enabled {
+		position = OCIPositionAlwaysOn
+	}
+	return SetOCIPosition(ctx, path, expectedRevision, position, now)
+}
+
+// SetOCIPosition persists only the owner's switch, never computed demand.
+func SetOCIPosition(ctx context.Context, path string, expectedRevision uint64, position OCIPosition, now time.Time) (OCIIntent, error) {
+	if !position.Valid() {
+		return OCIIntent{}, errors.New("invalid host VM position")
+	}
+
 	source := FileIntentSource{Path: path}
 	current, err := source.ReadIntent(ctx)
 	if err != nil {
@@ -98,12 +137,12 @@ func SetOCIIntent(ctx context.Context, path string, expectedRevision uint64, ena
 	if current.Revision != expectedRevision {
 		return OCIIntent{}, &IntentConflictError{CurrentRevision: current.Revision}
 	}
-	if current.Enabled == enabled {
+	if current.PositionValue() == position {
 		return current, nil
 	}
 	next := OCIIntent{
 		Version: OCIIntentVersion, Revision: current.Revision + 1,
-		Enabled: enabled, UpdatedAt: now.UTC().Round(0),
+		Enabled: position != OCIPositionOff, Position: position, UpdatedAt: now.UTC().Round(0),
 	}
 	if next.UpdatedAt.IsZero() {
 		return OCIIntent{}, errors.New("OCI intent update time is required")
@@ -114,7 +153,7 @@ func SetOCIIntent(ctx context.Context, path string, expectedRevision uint64, ena
 	return next, nil
 }
 
-// InitializeOCIIntent writes the first enabled marker only when no intent has
+// InitializeOCIIntent writes the first on-demand marker only when no intent has
 // ever been recorded. An existing disabled marker is preserved exactly.
 func InitializeOCIIntent(path string, now time.Time) (bool, error) {
 	if !filepath.IsAbs(path) {
@@ -128,7 +167,7 @@ func InitializeOCIIntent(path string, now time.Time) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return false, fmt.Errorf("create OCI intent directory: %w", err)
 	}
-	intent := OCIIntent{Version: OCIIntentVersion, Revision: 1, Enabled: true, UpdatedAt: now.UTC().Round(0)}
+	intent := OCIIntent{Version: OCIIntentVersion, Revision: 1, Enabled: true, Position: OCIPositionOnDemand, UpdatedAt: now.UTC().Round(0)}
 	if err := writeOCIIntent(path, intent, true); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return false, nil

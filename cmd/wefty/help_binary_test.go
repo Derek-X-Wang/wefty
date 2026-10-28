@@ -16,7 +16,7 @@ var helpCommands = []string{
 	"seat", "seat request", "seat wait", "seat view", "seat window", "seat window close",
 	"admin", "admin bootstrap", "admin policy", "admin policy get", "admin policy add", "admin policy remove",
 	"admins", "admins list", "admins get", "admins add", "admins remove",
-	"node", "node doctor", "node setup-oci", "node load-image", "node oci", "node oci start", "node oci stop", "node oci removals",
+	"node", "node doctor", "node setup-oci", "node load-image", "node oci", "node oci always-on", "node oci on-demand", "node oci off", "node oci removals",
 	"services", "services create", "services list", "services status", "services start", "services stop", "services restart", "services logs", "services remove", "services forget",
 	"services reimage", "services reset", "services resize", "services abort", "services grants", "services grant", "services revoke",
 	"services submission", "services submission enable", "services submission disable", "services submission set-inflight",

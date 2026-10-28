@@ -289,8 +289,12 @@ func TestRepeatedStartKeepsHealthyRuntimeLive(t *testing.T) {
 	}
 	runtime := &controlTestRuntime{intentPath: path, live: true}
 	controller, _ := NewController(ControllerConfig{IntentPath: path, Runtime: runtime, Clock: clock})
-	response, err := controller.Start(t.Context(), IntentMutationRequest{ExpectedRevision: 1})
-	if err != nil || response.Intent.Revision != 1 || !response.CapabilityPublished || runtime.recovered != 0 {
+	first, err := controller.Start(t.Context(), IntentMutationRequest{ExpectedRevision: 1})
+	if err != nil || first.Intent.PositionValue() != lima.OCIPositionAlwaysOn {
+		t.Fatalf("first always-on switch=%+v %v", first, err)
+	}
+	response, err := controller.Start(t.Context(), IntentMutationRequest{ExpectedRevision: first.Intent.Revision})
+	if err != nil || response.Intent.Revision != first.Intent.Revision || !response.CapabilityPublished || runtime.recovered != 0 {
 		t.Fatalf("idempotent start response=%+v recovered=%d err=%v", response, runtime.recovered, err)
 	}
 }

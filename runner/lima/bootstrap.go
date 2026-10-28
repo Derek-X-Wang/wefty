@@ -163,6 +163,7 @@ func ValidateLaunchDaemonInstall(config LaunchDaemonConfig) error {
 }
 
 type GuestHelperInstallConfig struct {
+	MinimumFreeBytes    uint64
 	Instance            string
 	Limactl             string
 	GuestUser           string

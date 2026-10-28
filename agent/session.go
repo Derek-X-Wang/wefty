@@ -63,6 +63,7 @@ type agentSession struct {
 	ociIntent     func(context.Context) (OCIIntentObservation, error)
 	ociImagePins  workloadrunner.OCIImagePinRuntime
 	ociRecoveryMu sync.Mutex
+	hostVM        hostVMState
 
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
@@ -470,6 +471,8 @@ func (session *agentSession) processCancelDirectives(directives []l1.OneShotCanc
 // through its own operation outcome. Nothing about the helper's namespace
 // sweep and verification changes either.
 func (session *agentSession) processStandingDirectives(ctx context.Context, response l1.HeartbeatResponse) error {
+	finishHostVMDirectives := session.beginHostVMDirectivePass(response)
+	defer finishHostVMDirectives()
 	session.processCancelDirectives(response.OneShotCancelDirectives)
 	retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
 	return errors.Join(session.resumePendingRemovals(ctx),
@@ -1588,6 +1591,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			}
 		}
 		session.observeGrantedCapacity(response.Node)
+		finishHostVMDirectives := session.beginHostVMDirectivePass(response)
 		session.processCancelDirectives(response.OneShotCancelDirectives)
 		// The same exclusion the boot sequence makes: a stalled removal's
 		// retained resources belong to its own durable backoff, and the
@@ -1633,6 +1637,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				session.custody.enqueue(ctx, directive, failures)
 			}
 		}
+		finishHostVMDirectives()
 		backoff.reset()
 		nextDelay = session.heartbeatInterval
 		session.markReady()

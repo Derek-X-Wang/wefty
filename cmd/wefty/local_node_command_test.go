@@ -211,7 +211,11 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 			return ocicontrol.SetupResponse{Configured: true, Intent: intent, Convergence: ocicontrol.ConvergenceUnchanged, ProbePreloaded: true}, err
 		},
 		StartFunc: func(_ context.Context, request ocicontrol.IntentMutationRequest) (ocicontrol.IntentResponse, error) {
-			intent, err := lima.SetOCIIntent(context.Background(), intentPath, request.ExpectedRevision, true, time.Now())
+			position := request.Position
+			if position == "" {
+				position = lima.OCIPositionAlwaysOn
+			}
+			intent, err := lima.SetOCIPosition(context.Background(), intentPath, request.ExpectedRevision, position, time.Now())
 			return ocicontrol.IntentResponse{Intent: intent, CapabilityPublished: err == nil}, err
 		},
 		StopFunc: func(_ context.Context, request ocicontrol.IntentMutationRequest) (ocicontrol.IntentResponse, error) {
@@ -339,7 +343,7 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	stderr.Reset()
 	if err := run(t.Context(), []string{
 		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json",
-		"node", "oci", "stop",
+		"node", "oci", "off",
 	}, &stdout, &stderr); err != nil {
 		t.Fatalf("oci stop: %v stderr=%s", err, stderr.String())
 	}
@@ -351,13 +355,29 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 	stderr.Reset()
 	if err := run(t.Context(), []string{
 		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json",
-		"node", "oci", "start",
+		"node", "oci", "always-on",
 	}, &stdout, &stderr); err != nil {
 		t.Fatalf("oci start: %v stderr=%s", err, stderr.String())
 	}
 	var started ocicontrol.IntentResponse
 	if err := json.Unmarshal(stdout.Bytes(), &started); err != nil || !started.Intent.Enabled || !started.CapabilityPublished {
 		t.Fatalf("start output=%q decoded=%+v err=%v", stdout.String(), started, err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if err := run(t.Context(), []string{"--node-config=" + configPath, "--json", "node", "oci", "on-demand"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	var onDemand ocicontrol.IntentResponse
+	if err := json.Unmarshal(stdout.Bytes(), &onDemand); err != nil || onDemand.Intent.PositionValue() != lima.OCIPositionOnDemand {
+		t.Fatalf("on-demand output=%s err=%v", stdout.String(), err)
+	}
+	for _, removed := range []string{"start", "stop"} {
+		err := executeLocalOCIIntent(t.Context(), nil, false, []string{removed}, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "off|on-demand|always-on") {
+			t.Fatalf("removed command %s=%v", removed, err)
+		}
 	}
 
 	stdout.Reset()
@@ -425,8 +445,9 @@ func TestOCINodeRunbookCommandsUseExercisedSurfaces(t *testing.T) {
 		"sudo wefty node setup-oci":                        false,
 		"wefty node setup-oci":                             false,
 		"wefty node doctor":                                false,
-		"wefty node oci start":                             false,
-		"wefty node oci stop":                              false,
+		"wefty node oci always-on":                         false,
+		"wefty node oci on-demand":                         false,
+		"wefty node oci off":                               false,
 		"wefty --json node oci removals":                   false,
 		"wefty node load-image FILE":                       false,
 		"wefty node load-image FILE --reference REFERENCE": false,
@@ -475,7 +496,7 @@ func TestSingularNodeCommandsExplainAPlainProcessNode(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	err := run(context.Background(), []string{"--node-config", path, "node", "oci", "start"}, io.Discard, io.Discard)
+	err := run(context.Background(), []string{"--node-config", path, "node", "oci", "always-on"}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "plain-process node") || !strings.Contains(err.Error(), path) {
 		t.Fatalf("node oci start on a plain-process node = %v", err)
 	}

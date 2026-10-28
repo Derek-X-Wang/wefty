@@ -278,11 +278,12 @@ domain, so OCI failure cannot turn into a process-killing launchd loop.
 
 Lima supervision reads an injected, read-only revisioned OCI-intent source.
 Missing, unreadable, or malformed state is disabled. Explicit bootstrap creates
-the initial enabled marker only when no marker exists and preserves an existing
-disabled marker; Ticket #153 owns all later writes and CAS. The supervisor
+the initial on-demand marker only when no marker exists and preserves an
+existing off marker. The operator controller owns later writes and CAS. The supervisor
 rechecks intent after every inspection and lifecycle command. Disable wins an
 intervening start or repair, leaves Lima stopped and OCI restrictive, and a
-revision change fails closed for the next cycle. While enabled, `Stopped`
+revision change fails closed for the next cycle. When the switch is always-on,
+or on-demand has known demand, `Stopped`
 permits one bounded `limactl start`; `Broken` permits one bounded `stop --force`
 followed by capped-backoff starts within an overall deadline. Failure leaves the same
 agent process and `kind:process` capability available while OCI stays
@@ -355,17 +356,66 @@ it does not manufacture a convergence class.
 
 ## Durable OCI intent and node-local control
 
-The versioned OCI intent marker is the node-local operator decision, separate
-from L1 `claims_enabled` and Capability revision. Missing, unreadable, malformed,
-or zero-revision state is disabled. `setup-oci` creates revision 1 enabled only
-when the marker has never existed; every rerun preserves an existing disabled
-marker exactly. `oci start` and `oci stop` compare-and-swap the revision and
-fsync the replacement and its parent directory before any runtime effect.
-`setup-oci` is configure-only: it checks every prerequisite before mutation,
-writes the requested configuration/template or Linux units, and reports the
-resulting convergence class without recovering or starting OCI. The sole
-runtime exception is an explicit restart/recreate flag with zero live OCI
-attempts; `wefty node oci start` remains the ordinary start operation.
+The versioned OCI intent marker records the owner's host VM switch, separate
+from L1 `claims_enabled`, Capability revision and node-computed demand:
+
+| Position | Runtime authority |
+| --- | --- |
+| `off` | No OCI work runs. The command immediately ends resident OCI work and lists its Job IDs. Process work continues. |
+| `on-demand` | Start when node-owned demand exists; stop after the idle wait, default `10m`. |
+| `always-on` | Keep the host VM running and repair it through the watchdog. |
+
+`wefty node oci off|on-demand|always-on` replaces `start|stop`. Each command
+compares and swaps the marker revision and fsyncs the replacement and parent
+before runtime effects. Repeating a position does not create a revision.
+Version 1 `enabled: true` maps to `always-on`; `enabled: false` and a missing
+marker map to `off`. Missing or malformed state cannot grant recovery authority.
+A new install writes version 2 with `position: "on-demand"`. Version 2 also
+retains `enabled` as the projection `position != "off"`; a version 1 reader
+refuses the new marker rather than interpreting on-demand as always-on. Reads
+normalize valid legacy state in memory without changing its durable revision.
+Demand is never written into the marker.
+
+The node computes demand from running Computers and other resident OCI work,
+queued OCI work waiting for this Node, unfinished helper directives (removal,
+Backup, prune, restore, clone, reset and grow), and an owner `load-image`.
+Reimage and Custody export helper work also retain runtime authority. Cleanup
+counts until it finishes, including asynchronous calls that are still unwinding
+and durable removals recovered after a node-agent restart. An unreadable demand
+source prevents idle stop. `QueuedOCIDemand` is the #1144 hint seam; the current
+`NoQueuedOCIDemand` supplies none. It will read node-owned cached claim-poll
+facts, not perform a network request while holding the claim lock. No control
+socket request accepts a demand value.
+
+The idle wait starts at the first empty demand observation, using the node's
+clock. The watchdog polls every five seconds. `--host-vm-idle-wait` changes the
+node setting; per-user `wefty setup` persists it and preserves it when omitted.
+After the idle wait, the node serializes with OCI recovery, publishes reduced
+capability with `host_vm_idle`, and waits for L1's acknowledgement. It then
+checks demand under the claim lock, takes the Lima cycle lock, and checks demand
+and the switch again before shutdown. New demand before shutdown cancels the
+stop and restores capability. The cycle runs graceful `limactl stop` with a
+separate four-minute timeout. Only a timeout permits `--force`; other failures
+remain failures. This does not raise the ordinary thirty-second command budget.
+The #1144 start-race seam handles a request arriving after shutdown has begun.
+
+A stopped host VM with no demand under `on-demand` has the closed capability
+reason `host_vm_idle`. Doctor treats that state and its reduced capability as
+healthy, reads no guest diagnostics for that state, never starts the host VM,
+and displays the demand items when it runs. The watchdog repairs stopped or
+broken state only for `always-on`, or `on-demand` with known demand; it never
+restarts an idle-stopped host VM. Before a host VM starts, the node checks free
+space on its Mac disk volume. The default minimum is **5 GiB**; the node setting
+`--host-vm-minimum-free-bytes` and per-user setup can change it. An unverified or
+insufficient measurement refuses startup with a reason and a fix.
+
+`setup-oci` remains configure-only: it checks prerequisites, writes configuration
+and reports convergence without starting OCI. An explicit restart/recreate with
+zero live OCI attempts retains its existing guards. A per-user node startup
+prepares helper and probe assets once; an unchanged prepared on-demand install
+stays stopped across daemon restarts. The proof install keeps its attended
+bootstrap and dialog behavior.
+
 Configure-only setup writes a separate desired-state receipt before returning
 a restart/recreate refusal. The applied receipt advances only after authorized
 convergence, so doctor derives unchanged, live-safe, restart-required, or
@@ -448,8 +498,13 @@ an error naming the file, because they need an OCI installation. Its
 private runtime directory is `0700`, its socket is `0600`, an active socket is never replaced,
 and a symlink or non-socket path fails closed. The server authenticates every
 accepted peer with `SO_PEERCRED` on Linux or `LOCAL_PEERCRED` on macOS and
-allows only the installed operator UID. Process-kind payloads share that UID
-with the agent. That is accepted behavior (#220): choosing the non-sandboxed
+allows only the installed operator UID. It also reads the kernel peer PID and
+refuses callers descended from the node agent, including process jobs, before
+a request reaches the controller. Unavailable process identity fails closed.
+This check applies to the whole socket, including switch and image-import
+operations. The refusal is a control-path guard, not same-user
+isolation: detached or proxied code that escapes its process ancestry remains
+within the trusted-process limitation of #220. Process-kind payloads still share that UID with the node agent. That is accepted behavior (#220): choosing the non-sandboxed
 process kind is choosing that trust level, container kinds are the isolation
 story, and the limitation grants no additional control authority. The agent is the sole writer of
 intent and runtime state. `load-image` streams an OCI archive through this
