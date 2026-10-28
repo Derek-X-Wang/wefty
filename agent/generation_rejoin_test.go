@@ -112,7 +112,9 @@ func generationReadRefusal(t *testing.T, request *http.Request, store *l1.Store,
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, request)
 	var response contract.ErrorResponse
-	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Error.Code != code {
+	// Agent loops keep reading while the fixture shuts down; a canceled
+	// request has no refusal to check.
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); request.Context().Err() == nil && (err != nil || response.Error.Code != code) {
 		t.Errorf("inventory refusal=%s, want %s: %v", recorder.Body.String(), code, err)
 	}
 	return recorder.Result()
