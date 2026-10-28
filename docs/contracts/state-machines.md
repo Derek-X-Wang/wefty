@@ -2779,7 +2779,10 @@ See [rolling diagnosis](plain-node-upgrade.md#read-only-rolling-status-and-docto
 
 An enrolled Node without generation observations is unverified. Diagnostic
 catalog and retirement-ack reads never wait for the catalog lock; contention and
-unknown setup-lock evidence retain their causes. Per-record public observation
+unknown setup-lock evidence retain their causes. CLI catalog callers may retry
+contention for up to 2.5 seconds per read within the caller's context. Doctor
+retains its existing budget and deferred rolling-diagnosis context. A still-busy
+catalog remains unverified and asks for a rerun in a moment. Per-record public observation
 errors preserve readable Nodes and residents; snapshot failures still fail the
 request. Null current Attempt state does not erase recorded reboot interruption.
 

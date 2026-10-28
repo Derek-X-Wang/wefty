@@ -213,7 +213,7 @@ func rollingDiagnosticPaths(nodeConfig string) (setupPaths, bool) {
 	return paths, true
 }
 
-func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, now time.Time) rollingStatusFields {
+func collectRollingStatus(ctx context.Context, nodeConfig string, nodes l1.NodeList, reachable bool, now time.Time) rollingStatusFields {
 	var result rollingStatusFields
 	for _, node := range nodes.Nodes {
 		for _, a := range node.ActiveAttempts {
@@ -273,7 +273,7 @@ func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, 
 			store := agentinstall.Store{Data: paths.data, LaunchAgents: paths.launchAgents}
 			var err error
 			_, rootErr := os.Lstat(store.Root())
-			catalog, err = store.ReadDiagnostic()
+			catalog, err = readDiagnosticCatalog(ctx, store)
 			if err == nil {
 				catalogPresent = true
 			} else if rootErr == nil || !errors.Is(err, os.ErrNotExist) {
@@ -337,7 +337,7 @@ func collectRollingStatus(nodeConfig string, nodes l1.NodeList, reachable bool, 
 				result.EvidenceErrors = append(result.EvidenceErrors, err.Error())
 			}
 			if catalogPresent && catalog.PendingReceipt != "" && err == nil && !active {
-				fresh, readErr := (agentinstall.Store{Data: paths.data, LaunchAgents: paths.launchAgents}).ReadDiagnostic()
+				fresh, readErr := readDiagnosticCatalog(ctx, agentinstall.Store{Data: paths.data, LaunchAgents: paths.launchAgents})
 				if readErr != nil {
 					result.EvidenceErrors = append(result.EvidenceErrors, "catalog revalidation: "+readErr.Error())
 				} else if fresh.Revision != catalog.Revision || fresh.PendingReceipt != catalog.PendingReceipt {
@@ -673,7 +673,7 @@ func appendDoctorRolling(ctx context.Context, host setupHost, options globalOpti
 	if len(observed) > 0 {
 		initialNodes = observed[0]
 	}
-	initial := collectRollingStatus(config, initialNodes, len(initialNodes.Nodes) > 0, time.Now().UTC())
+	initial := collectRollingStatus(ctx, config, initialNodes, len(initialNodes.Nodes) > 0, time.Now().UTC())
 	if initial.UpgradeState == "" && len(initial.findings()) == 0 {
 		return
 	}
@@ -710,7 +710,7 @@ func appendDoctorRolling(ctx context.Context, host setupHost, options globalOpti
 	} else if cause == nil {
 		cause = errors.New("rolling doctor requires a verified client read path")
 	}
-	report.rollingStatusFields = collectRollingStatus(config, nodes, reachable, time.Now().UTC())
+	report.rollingStatusFields = collectRollingStatus(ctx, config, nodes, reachable, time.Now().UTC())
 	verifyRollingRuns(ctx, runClients, &report.rollingStatusFields)
 	if cause != nil {
 		report.EvidenceErrors = append(report.EvidenceErrors, "L1 read: "+cause.Error())
@@ -726,6 +726,9 @@ func appendDoctorRolling(ctx context.Context, host setupHost, options globalOpti
 				severity = "warning"
 			}
 			fix := "run wefty upgrade --rolling to resume or roll back an interrupted upgrade; restore missing evidence and rerun doctor"
+			if f.Code == "rolling_evidence_unverified" && strings.Contains(f.Detail, diagnosticCatalogBusyDetail) {
+				fix = "rerun doctor in a moment"
+			}
 			if f.Code == "maintenance_in_progress" {
 				fix = "re-run the same wefty setup command to finish or restore"
 			}

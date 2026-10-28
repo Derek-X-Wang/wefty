@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -66,7 +67,9 @@ func TestReviewDiagnosticCatalogContention(t *testing.T) {
 	}
 	done := make(chan rollingStatusFields, 1)
 	go func() {
-		done <- collectRollingStatus(paths.nodeConfig, generationStatusFixture(time.Now(), 1), true, time.Now())
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		defer cancel()
+		done <- collectRollingStatus(ctx, paths.nodeConfig, generationStatusFixture(time.Now(), 1), true, time.Now())
 	}()
 	select {
 	case got := <-done:
@@ -78,7 +81,7 @@ func TestReviewDiagnosticCatalogContention(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 		_ = unix.Flock(int(directory.Fd()), unix.LOCK_UN)
 		<-done // Release the baseline's blocking reader before reporting failure.
-		t.Fatal("status waited on a catalog lock instead of reporting unknown contention")
+		t.Fatal("status exceeded the caller's catalog retry budget")
 	}
 }
 func TestReviewUnknownUpgradeLock(t *testing.T) {
@@ -100,7 +103,7 @@ func TestReviewUnknownUpgradeLock(t *testing.T) {
 					}
 				}
 			}
-			got := collectRollingStatus(paths.nodeConfig, generationStatusFixture(time.Now(), 0), true, time.Now())
+			got := collectRollingStatus(t.Context(), paths.nodeConfig, generationStatusFixture(time.Now(), 0), true, time.Now())
 			if got.UpgradeState != "unverified" || !strings.Contains(strings.Join(got.EvidenceErrors, " "), "lock") {
 				t.Fatalf("unknown lock became interruption without cause: %+v", got)
 			}
@@ -117,7 +120,7 @@ func TestReviewMissingAttemptRetainsRebootInterruption(t *testing.T) {
 	}
 	nodes := generationStatusFixture(time.Now(), 1)
 	nodes.Nodes[0].Generations[1].Attempts[0].State = nil
-	got := collectRollingStatus(paths.nodeConfig, nodes, true, time.Now())
+	got := collectRollingStatus(t.Context(), paths.nodeConfig, nodes, true, time.Now())
 	if len(got.Generations) != 2 || got.Generations[1].RenewalHealth != "unverified" {
 		t.Fatalf("current uncertainty lost: %+v", got)
 	}
@@ -145,7 +148,7 @@ func TestReviewInterruptionWithoutEmptyReason(t *testing.T) {
 			} else {
 				nodes.Nodes[0].Generations[1].Attempts[0].State = generationAttemptState(contract.AttemptInterrupted)
 			}
-			got := collectRollingStatus(config, nodes, true, time.Now())
+			got := collectRollingStatus(t.Context(), config, nodes, true, time.Now())
 			reviewDiagnosticOutputs(t, got, "interrupted", "interrupted ()")
 		})
 	}
@@ -196,7 +199,7 @@ func TestReviewObservationCauseRendersUnknown(t *testing.T) {
 	a := &nodes.Nodes[0].Generations[1].Attempts[0]
 	a.State = nil
 	a.ObservationError = "Job job-0 (Attempt attempt-0): unreadable retained Job spec: unexpected end of JSON input"
-	got := collectRollingStatus("", nodes, true, time.Now())
+	got := collectRollingStatus(t.Context(), "", nodes, true, time.Now())
 	reviewDiagnosticOutputs(t, got, "unreadable retained Job spec", "")
 }
 
@@ -219,7 +222,9 @@ func TestReviewDoctorLabelAndRetirementReadsRefuseContention(t *testing.T) {
 	defer unix.Flock(int(directory.Fd()), unix.LOCK_UN)
 	done := make(chan error, 1)
 	go func() {
-		label, enrolled, labelErr := plainDoctorAgentLabel(setupHost{home: paths.home})
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		defer cancel()
+		label, enrolled, labelErr := plainDoctorAgentLabel(ctx, setupHost{home: paths.home})
 		if label != "" || !enrolled || labelErr == nil || !strings.Contains(labelErr.Error(), unix.EWOULDBLOCK.Error()) {
 			done <- fmt.Errorf("unknown primary label called legacy: %q %t", label, enrolled)
 			return
@@ -235,7 +240,7 @@ func TestReviewDoctorLabelAndRetirementReadsRefuseContention(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 		_ = unix.Flock(int(directory.Fd()), unix.LOCK_UN)
 		<-done
-		t.Fatal("doctor label or retirement acknowledgment waited on catalog lock")
+		t.Fatal("doctor label or retirement acknowledgment exceeded the caller's retry budget")
 	}
 }
 
@@ -306,7 +311,7 @@ func TestReviewPayloadExitRequiresSnapshotAuthority(t *testing.T) {
 				nodes.Nodes = append(nodes.Nodes, other)
 				nodes.Nodes[0].Generations = nodes.Nodes[0].Generations[:1]
 			}
-			got := collectRollingStatus(config, nodes, true, now)
+			got := collectRollingStatus(t.Context(), config, nodes, true, now)
 			foundProblem := false
 			for _, g := range got.Generations {
 				for _, p := range g.Problems {
