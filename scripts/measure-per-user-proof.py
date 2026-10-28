@@ -314,8 +314,18 @@ class Proof:
                 journal, _ = self.run(["limactl", "--tty=false", "shell", "--workdir=/", INSTANCE, "sudo", "-n", "journalctl", "-b", "-1", "--no-pager"], check=False)
                 receipt = self.evidence / f'journal-{"force" if force else "graceful"}-{number}.txt'
                 receipt.write_text(journal.stdout + journal.stderr)
-                clean = bool(re.search(r"Unmounted|unmounting|Syncing filesystems|Reached target.*Power-Off", journal.stdout, re.I))
-                self.row("PR-3/M2", f"journal-{force}-{number}", "VERIFIED" if journal.returncode == 0 and clean else "NOT-RUN", "clean-unmount journal lines found" if journal.returncode == 0 and clean else "no retained clean-unmount evidence; inspect private journal receipt")
+                # A clean shutdown is the last thing journald writes. Matching
+                # "unmounted" anywhere also matched fsck's "not properly
+                # unmounted" warning after a forced stop.
+                lines = journal.stdout.strip().splitlines()
+                clean = bool(lines) and "Journal stopped" in lines[-1]
+                if journal.returncode or not lines:
+                    verdict, detail = "NOT-RUN", "no retained previous-boot journal; inspect private journal receipt"
+                elif clean:
+                    verdict, detail = "VERIFIED", "previous boot ended with a clean journald stop"
+                else:
+                    verdict, detail = ("VERIFIED", "previous boot ended abruptly, as expected for --force") if force else ("PARTIAL", "previous boot ended without a clean journald stop")
+                self.row("PR-3/M2", f"journal-{force}-{number}", verdict, detail)
 
     def memory(self, label):
         sample = self.memory_sample()
