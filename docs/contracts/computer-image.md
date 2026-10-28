@@ -802,6 +802,11 @@ Readiness requires the browser, a 1280×800 desktop and both endpoints' binary
 which crosses the deadline cannot publish ready. The helper independently
 checks the endpoints and its own deadline, bound to the exact attempt,
 generation and place. A ready file alone never publishes a Seat.
+Each image endpoint probe has a 2-second budget, matching the node agent's
+greeting probe. An idle x11vnc checks its Unix listener on an approximately
+200 ms cycle; that wake-up plus the WebSocket and relay checks cannot fit
+reliably into a 200 ms probe. This endpoint budget does not extend the
+Seat's 60-second readiness deadline or allow a late probe to publish ready.
 
 The default image logs each Seat start and each published Seat answer as JSON
 lines in the Computer log, with directive generation and place. While waiting,
@@ -816,9 +821,17 @@ when the ready title is found; it never logs window titles or page content. At
 `readiness_deadline`, it logs the last completed probe, its age and probe count
 **before cleanup deletes the Seat folder**. Diagnostics do not extend the
 60-second budget, redial after expiry, or add fields to the status answers.
+Both the ready answer's log record and the deadline record include cumulative
+`condition_failures` (for example `view:rfb_frame:TimeoutError`) and
+`max_probe_elapsed_ms` across every attempted endpoint, including successful
+view probes before a failed control probe. These fields exist only in logs.
+An `OSError` writing supervisor or browser diagnostics is ignored and cannot
+end a Seat.
 The root-only Seat lane names the Computer and wanted places for each
 directive. A readiness failure includes the last status read and a bounded
 Computer log tail in the job output; complete logs remain in CI evidence.
+The inline tail retries for up to two seconds for the matching answer's log
+record, because the containerd shim copies Computer logs asynchronously.
 The supervisor and browser diagnostics carry monotonic milliseconds so their
 events can be ordered across the Seat processes.
 

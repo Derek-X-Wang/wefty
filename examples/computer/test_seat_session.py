@@ -20,6 +20,25 @@ class Process:
 
 
 class SessionTest(unittest.TestCase):
+    def test_browser_log_oserror_does_not_end_session(self):
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': root, 'HOME': root, 'SEAT_ID': '1'}), \
+                mock.patch.object(session.sys, 'argv', ['wefty-seat-session', '--display-pid', '42']), \
+                mock.patch.object(session, 'display_alive', side_effect=[True, False]), \
+                mock.patch.object(session.time, 'sleep'), \
+                mock.patch.object(session.os, 'killpg'), \
+                mock.patch.object(session.subprocess, 'Popen') as spawn, \
+                mock.patch.object(session.subprocess, 'run') as run, \
+                mock.patch('builtins.print', side_effect=OSError('container log unavailable')):
+            spawn.return_value.pid = 42
+            spawn.return_value.poll.return_value = None
+            run.side_effect = [mock.Mock(stdout='window id # 0x123\n'),
+                               mock.Mock(stdout='wefty-seat-1-ready\n')]
+            self.assertEqual(session.main(), 1)
+            # The second tick observes real lifecycle failure. A log error on
+            # the first tick must not interrupt the controller before then.
+            self.assertEqual((Path(root) / 'launcher-failure').read_text(), 'display_exited')
+
     def setUp(self):
         self.now = 0
         self.display = True

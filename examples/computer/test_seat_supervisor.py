@@ -61,6 +61,57 @@ class SupervisorTest(unittest.TestCase):
     def answer(self, place):
         return json.loads((Path(self.tmp.name).resolve() / (str(place) + ".json")).read_text())
 
+    def test_ready_and_deadline_logs_retain_failure_counts_and_max_probe_time(self):
+        for terminal in ('ready', 'readiness_deadline'):
+            with self.subTest(terminal=terminal):
+                status = Path(self.tmp.name).resolve() / terminal
+                status.mkdir()
+                clock, lines = [0], []
+                backend = Backend()
+                backend.readiness_details = {}
+                attempts = iter([(False, 'view', 'rfb_frame', 2000),
+                                 (False, 'view', 'rfb_frame', 2000),
+                                 (False, 'control', 'rfb_greeting', 1500),
+                                 (True, 'ready', 'ready', 250)])
+
+                def probe(seat):
+                    ready, waiting, phase, elapsed = next(attempts)
+                    detail = {'waiting_for': waiting, 'probe': {'phase': phase, 'elapsed_ms': elapsed}}
+                    if not ready:
+                        detail['probe']['error'] = 'TimeoutError'
+                    backend.readiness_details[seat['place']] = detail
+                    clock[0] += elapsed / 1000
+                    return ready
+
+                backend.is_ready = probe
+                engine = supervisor.Supervisor(status, backend, clock=lambda: clock[0], log=lines.append)
+                engine.apply(directive(1, 1))
+                for _ in range(3):
+                    engine.tick()
+                if terminal == 'readiness_deadline':
+                    clock[0] = 60
+                engine.tick()
+                events = [json.loads(line) for line in lines]
+                report = next(event for event in events if
+                              event['event'] == 'readiness_deadline' or event.get('answer', {}).get('state') == 'ready')
+                self.assertEqual(report['condition_failures'], {
+                    'view:rfb_frame:TimeoutError': 2, 'control:rfb_greeting:TimeoutError': 1})
+                self.assertEqual(report['max_probe_elapsed_ms'], 2000)
+                # Aggregate diagnostics belong only to log records. The wire
+                # answer, including key order and whitespace, stays identical.
+                expected = ('{"version":1,"generation":1,"place":1,"state":"ready","reason":"","cleanup_complete":false}'
+                            if terminal == 'ready' else
+                            '{"version":1,"generation":1,"place":1,"state":"failed","reason":"readiness_deadline","cleanup_complete":true}')
+                self.assertEqual((status / '1.json').read_text(), expected + '\n')
+
+    def test_unwritable_diagnostic_log_cannot_end_seat(self):
+        with mock.patch('builtins.print', side_effect=OSError('container log unavailable')):
+            self.engine.apply(directive(1, 1))
+            self.backend.ready.add(1)
+            self.engine.tick()
+        self.assertIn(1, self.backend.live)
+        self.assertEqual(self.answer(1)['state'], 'ready')
+
     def test_deadline_logs_last_readiness_condition_before_cleanup(self):
         lines = []
         self.engine.log = lines.append
@@ -127,12 +178,14 @@ class SupervisorTest(unittest.TestCase):
                 marker = mock.Mock(st_mode=info.st_mode, st_uid=2001)
                 stat_call.return_value = marker
                 def probe(_path, _uid, detail):
-                    detail.update(phase='rfb_greeting', error='TimeoutError')
+                    detail.update(phase='rfb_greeting', error='TimeoutError',
+                                  elapsed_ms=1500 if _path == seat['view_socket'] else 250)
                     return _path == seat['view_socket']
                 with mock.patch.object(supervisor, 'rfb_ready', side_effect=probe):
                     self.assertFalse(backend.is_ready(seat))
             self.assertEqual(backend.readiness_details[1]['waiting_for'], 'control')
             self.assertEqual(backend.readiness_details[1]['probe']['error'], 'TimeoutError')
+            self.assertEqual(backend.readiness_details[1]['max_probe_elapsed_ms'], 1500)
 
     def test_new_seat_has_its_own_deadline_and_late_ready_is_cleaned(self):
         self.engine.apply(directive(1, 1))

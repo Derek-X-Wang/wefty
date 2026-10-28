@@ -548,7 +548,7 @@ func (h *seatComputer) directive(generation int, places ...int) {
 func (h *seatComputer) ready(place int) {
 	h.t.Helper()
 	lastStatus := "not yet read"
-	diagnostics := func() string { return seatReadinessDiagnostics(h.logPath, lastStatus) }
+	diagnostics := func() string { return waitSeatReadinessDiagnostics(h.logPath, lastStatus, time.Now, time.Sleep) }
 	h.wait(fmt.Sprintf("Computer %s Seat %d ready", h.id, place), func() bool {
 		h.t.Helper()
 		b, err := readSeatStatusAnswer(h.status, fmt.Sprintf("%d.json", place))

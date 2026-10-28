@@ -28,6 +28,13 @@ class SeatFailure(Exception):
     pass
 
 
+def log_line(line):
+    try:
+        print(line, file=sys.stderr, flush=True)
+    except OSError:
+        pass  # Losing diagnostics must not change the Seat's lifecycle.
+
+
 def validate(document):
     if (not isinstance(document, dict) or set(document) != {"version", "generation", "seats"}
             or type(document["version"]) is not int or document["version"] != 1
@@ -54,8 +61,7 @@ def validate(document):
 
 
 class Supervisor:
-    def __init__(self, status, backend, clock=time.monotonic,
-                 log=lambda line: print(line, file=sys.stderr, flush=True)):
+    def __init__(self, status, backend, clock=time.monotonic, log=log_line):
         self.status, self.backend, self.clock = status, backend, clock
         self.log = log
         self.running, self.wanted, self.blocked = {}, {}, {}
@@ -72,6 +78,9 @@ class Supervisor:
                  'monotonic_ms': round(now * 1000, 3)}
         if state is not None:
             value['elapsed_ms'] = round((now - state['started']) * 1000, 3)
+            if event in ('seat_answer', 'readiness_deadline'):
+                value['condition_failures'] = state['condition_failures']
+                value['max_probe_elapsed_ms'] = state['max_probe_elapsed_ms']
         value.update(details)
         self.log(json.dumps(value, separators=(',', ':')))
 
@@ -149,6 +158,7 @@ class Supervisor:
                 self.running[place] = {"seat": seat, "started": started,
                                        "deadline": started + READINESS_SECONDS, "ready": False,
                                        "probe_count": 0, "last_probe_at": None,
+                                       "condition_failures": {}, "max_probe_elapsed_ms": 0,
                                        "readiness": {'waiting_for': 'first_probe'}, "last_wait_log": None}
                 self.record(place, 'seat_start', readiness_seconds=READINESS_SECONDS)
             except (SeatFailure, OSError, subprocess.SubprocessError) as error:
@@ -193,6 +203,15 @@ class Supervisor:
                     state['probe_count'] += 1
                     state['last_probe_at'] = self.clock()
                     state['readiness'] = getattr(self.backend, 'readiness_details', {}).get(place, {})
+                    detail = state['readiness']
+                    probe = detail.get('probe', {})
+                    state['max_probe_elapsed_ms'] = max(state['max_probe_elapsed_ms'],
+                        detail.get('max_probe_elapsed_ms', probe.get('elapsed_ms', 0)))
+                    if not ready:
+                        condition = ':'.join(part for part in (detail.get('waiting_for', 'unknown'),
+                            probe.get('phase'), probe.get('error', detail.get('error'))) if part)
+                        failures = state['condition_failures']
+                        failures[condition] = failures.get(condition, 0) + 1
                     if ready:
                         if self.clock() >= state["deadline"]:
                             reason = "readiness_deadline"
@@ -587,7 +606,10 @@ def rfb_ready(path, uid=None, detail=None):
     detail['phase'] = 'endpoint_directory'
     try:
         uid = os.getuid() if uid is None else uid
-        deadline = started + 0.2
+        # An idle x11vnc checks its Unix listener only once per ~200 ms
+        # cycle. Leave time for that wake-up, WebSocket and relay checks,
+        # matching the node agent's per-endpoint greeting probe.
+        deadline = started + 2
         directory = open_directory(Path(path).parent)
         parent = os.fstat(directory)
         detail['phase'] = 'endpoint_stat'
@@ -598,7 +620,7 @@ def rfb_ready(path, uid=None, detail=None):
             detail['phase'] = 'endpoint_permissions'
             return False
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        connection.settimeout(0.2)
+        connection.settimeout(2)
         with connection:
             detail['phase'] = 'connect'
             connection.connect(path)
@@ -731,7 +753,7 @@ class DesktopBackend:
         return "desktop_exited"
 
     def is_ready(self, seat):
-        detail = {'waiting_for': 'desktop_ready'}
+        detail = {'waiting_for': 'desktop_ready', 'max_probe_elapsed_ms': 0}
         self.readiness_details[seat['place']] = detail
         try:
             descriptor = open_directory(SEATS / str(seat["place"]) / "run")
@@ -745,7 +767,9 @@ class DesktopBackend:
                 return False
             for role in ('view', 'control'):
                 detail.update(waiting_for=role, probe={})
-                if not rfb_ready(seat[role + '_socket'], 2000 + seat['place'], detail['probe']):
+                ready = rfb_ready(seat[role + '_socket'], 2000 + seat['place'], detail['probe'])
+                detail['max_probe_elapsed_ms'] = max(detail['max_probe_elapsed_ms'], detail['probe']['elapsed_ms'])
+                if not ready:
                     return False
             detail['waiting_for'] = 'ready'
             return True
@@ -754,7 +778,7 @@ class DesktopBackend:
             return False
 
 
-def run_loop(engine, control, should_stop, sleep=time.sleep, log=lambda line: print(line, file=sys.stderr, flush=True)):
+def run_loop(engine, control, should_stop, sleep=time.sleep, log=log_line):
     previous = None
     read_failed = False
     while not should_stop():

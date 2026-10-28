@@ -159,9 +159,12 @@ def main():
         if result or last_browser_log is None or now - last_browser_log >= 5:
             # Never log window titles or page content, only the condition
             # which prevents the desktop-ready marker from being written.
-            print(json.dumps({'event': 'browser_readiness', 'place': int(os.environ['SEAT_ID']),
-                              'monotonic_ms': round(now * 1000, 3),
-                              'readiness': detail}, separators=(',', ':')), file=sys.stderr, flush=True)
+            try:
+                print(json.dumps({'event': 'browser_readiness', 'place': int(os.environ['SEAT_ID']),
+                                  'monotonic_ms': round(now * 1000, 3),
+                                  'readiness': detail}, separators=(',', ':')), file=sys.stderr, flush=True)
+            except OSError:
+                pass  # A failed Computer log must not end the desktop.
             last_browser_log = now
         return result
 
