@@ -489,7 +489,7 @@ Commands:
   node setup-oci             Configure the installed node's OCI runtime
   doctor [--print-policy]    Check the installation or print private network policy
   node doctor                Check the installed role, plain process or OCI node
-  node oci start|stop        Set durable node-local OCI intent
+  node oci off|on-demand|always-on  Set the host VM switch
   node oci removals          Read durable runtime removal manifests, phases, and attestations
   node load-image FILE       Import an OCI archive through the live agent
     [--reference REFERENCE]  Name an archive whose export named no artifact

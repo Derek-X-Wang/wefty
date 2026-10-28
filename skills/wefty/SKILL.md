@@ -124,6 +124,22 @@ right. `wefty run ...` and `wefty workflow init` are
 the exceptions: they only write files, so they need no endpoint, no identity and
 no credential — see "Reporting from a workflow".
 
+## The owner's host VM switch
+
+On a Mac, `wefty node oci off|on-demand|always-on` sets the host VM switch.
+`start|stop` are removed. On demand is the default for a new per-user install;
+it keeps the host VM on for running Computers, OCI one-shots, queued OCI work,
+unfinished helper cleanup and owner image imports. It stops ten minutes after
+those finish. Always on keeps it running. Off ends OCI work immediately and
+lists the ended Job IDs. Change the owner's switch only within authorized work.
+
+`wefty node doctor` reads facts without starting the host VM. `host_vm_idle`
+is healthy under on-demand, and doctor lists what keeps a running host VM on.
+An owner can rerun setup with `--host-vm-idle-wait 10m` or
+`--host-vm-minimum-free-bytes 5368709120` to change node settings. The default
+startup disk-space minimum is 5 GiB. Queued-demand startup and the Seat cold-start
+reply are supplied by #1144; this switch does not itself create demand.
+
 ## Request a Computer Seat
 
 For screen work, request one Seat on a Computer. Name the network explicitly:

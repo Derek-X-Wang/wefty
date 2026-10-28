@@ -29,15 +29,17 @@ type UserInstallAssets struct {
 }
 
 type UserInstallConfig struct {
-	Assets       UserInstallAssets `json:"assets"`
-	Instance     string            `json:"instance"`
-	LimaHome     string            `json:"lima_home"`
-	MountRoot    string            `json:"mount_root"`
-	IntentFile   string            `json:"intent_file"`
-	SetupState   string            `json:"setup_state"`
-	TemplatePath string            `json:"template_path"`
-	Sizing       Sizing            `json:"sizing"`
-	ProofDialog  bool              `json:"proof_dialog,omitempty"`
+	Assets                 UserInstallAssets `json:"assets"`
+	Instance               string            `json:"instance"`
+	LimaHome               string            `json:"lima_home"`
+	MountRoot              string            `json:"mount_root"`
+	IntentFile             string            `json:"intent_file"`
+	SetupState             string            `json:"setup_state"`
+	TemplatePath           string            `json:"template_path"`
+	Sizing                 Sizing            `json:"sizing"`
+	HostVMIdleWait         time.Duration     `json:"host_vm_idle_wait,omitempty"`
+	HostVMMinimumFreeBytes uint64            `json:"host_vm_minimum_free_bytes,omitempty"`
+	ProofDialog            bool              `json:"proof_dialog,omitempty"`
 }
 
 func ReadUserInstallJSON(path string, value any) error {
@@ -57,6 +59,9 @@ func ReadUserInstallJSON(path string, value any) error {
 }
 
 func (c UserInstallConfig) Validate() error {
+	if c.HostVMIdleWait < 0 {
+		return errors.New("host VM idle wait must be positive")
+	}
 	if !instanceNamePattern.MatchString(c.Instance) {
 		return errors.New("invalid per-user host VM instance")
 	}
@@ -104,7 +109,12 @@ func PrepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID
 		}
 		return output, err
 	}
-	supervisor, err := NewSupervisor(SupervisorConfig{Instance: c.Instance, Intent: FileIntentSource{Path: c.IntentFile}, run: run})
+	supervisor, err := NewSupervisor(SupervisorConfig{Instance: c.Instance, Intent: FileIntentSource{Path: c.IntentFile}, run: run,
+		Demand: DemandSourceFunc(func(context.Context) ([]DemandItem, error) {
+			return []DemandItem{{Kind: "load-image", ID: "bootstrap"}}, nil
+		}),
+		CheckFreeSpace: func() error { return CheckHostVMFreeSpace(c.LimaHome, c.HostVMMinimumFreeBytes) },
+	})
 	if err != nil {
 		return err
 	}
@@ -167,7 +177,7 @@ func prepareUserInstall(ctx context.Context, c UserInstallConfig, nodeID, bootID
 	}
 	capacity, reserve, _ := DefaultMacComputerCapacity(c.Sizing)
 	socket, _ := HelperSocketPath(c.LimaHome, c.Instance)
-	helper := GuestHelperInstallConfig{Instance: c.Instance, GuestUser: strings.TrimSpace(string(name)), GuestUID: uint32(uid),
+	helper := GuestHelperInstallConfig{MinimumFreeBytes: c.HostVMMinimumFreeBytes, Instance: c.Instance, GuestUser: strings.TrimSpace(string(name)), GuestUID: uint32(uid),
 		HelperBinary: c.Assets.LinuxHelper, ExpectedVersion: c.Assets.HelperVersion, ExpectedChecksum: c.Assets.HelperChecksum,
 		HostMountRoot: c.MountRoot, HelperSocket: socket, ProbeArchive: c.Assets.ProbeArchive, ProbeReference: c.Assets.ProbeReference, ProbeDigest: c.Assets.ProbeDigest,
 		NodeID: nodeID, BootSessionID: bootID, MemoryCapacityBytes: capacity, MemoryReserveBytes: reserve}

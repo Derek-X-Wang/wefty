@@ -114,18 +114,41 @@ func (controller *Controller) Start(ctx context.Context, request IntentMutationR
 	if readErr != nil {
 		return IntentResponse{}, controlError(ErrorSetupRequired, http.StatusPreconditionFailed, "valid OCI intent is required", readErr)
 	}
-	intent, err := lima.SetOCIIntent(ctx, controller.config.IntentPath, request.ExpectedRevision, true, controller.config.Clock.Now())
+	position := request.Position
+	if position == "" {
+		position = lima.OCIPositionAlwaysOn
+	}
+	if position != lima.OCIPositionAlwaysOn && position != lima.OCIPositionOnDemand {
+		return IntentResponse{}, invalidRequest("use off, on-demand or always-on", nil)
+	}
+	intent, err := lima.SetOCIPosition(ctx, controller.config.IntentPath, request.ExpectedRevision, position, controller.config.Clock.Now())
 	if err != nil {
 		return IntentResponse{}, classifyIntentError(err)
 	}
 	if controller.config.Runtime == nil {
 		return IntentResponse{Intent: intent}, runtimeUnavailable("OCI runtime is unavailable", nil)
 	}
+	if position == lima.OCIPositionOnDemand {
+		runtime, ok := controller.config.Runtime.(interface {
+			EnableOnDemand(context.Context, uint64) error
+		})
+		if !ok {
+			return IntentResponse{Intent: intent}, runtimeUnavailable("on-demand intent publication is unavailable", nil)
+		}
+		if err := runtime.EnableOnDemand(ctx, intent.Revision); err != nil {
+			return IntentResponse{Intent: intent}, runtimeUnavailable("on-demand intent publication failed", err)
+		}
+		return IntentResponse{Intent: intent, CapabilityPublished: true}, nil
+	}
 	if current.Enabled && controller.config.Runtime.OCIRuntimeLive() {
 		return IntentResponse{Intent: intent, CapabilityPublished: true}, nil
 	}
 	if err := controller.config.Runtime.RecoverOCIRuntimeCapabilities(ctx); err != nil {
-		return IntentResponse{Intent: intent}, runtimeUnavailable("OCI runtime recovery failed", err)
+		var refusal interface{ HostVMStartRefusal() string }
+		if errors.As(err, &refusal) {
+			return IntentResponse{Intent: intent}, runtimeUnavailable(refusal.HostVMStartRefusal(), err)
+		}
+		return IntentResponse{Intent: intent}, runtimeUnavailable("OCI runtime recovery failed; run wefty node doctor", err)
 	}
 	return IntentResponse{Intent: intent, CapabilityPublished: true}, nil
 }
@@ -147,6 +170,10 @@ func (controller *Controller) Stop(ctx context.Context, request IntentMutationRe
 	// The exclusive acquisition is a drain barrier, not a lock around runtime
 	// teardown. Publishing is already fenced by the durable disabled revision.
 	releaseFence()
+	var ended []lima.DemandItem
+	if reporter, ok := controller.config.Runtime.(interface{ OCIWork() []lima.DemandItem }); ok {
+		ended = reporter.OCIWork()
+	}
 	quiesce := controller.config.Runtime.StopOCIRuntime
 	if controller.config.StopCycle != nil {
 		err = controller.config.StopCycle.Stop(ctx, quiesce)
@@ -156,7 +183,7 @@ func (controller *Controller) Stop(ctx context.Context, request IntentMutationRe
 	if err != nil {
 		return IntentResponse{Intent: intent, RuntimeQuiesced: false}, controlError(ErrorRuntimeQuiescenceFailed, http.StatusConflict, "OCI runtime quiescence was not proven", err)
 	}
-	return IntentResponse{Intent: intent, RuntimeQuiesced: true}, nil
+	return IntentResponse{Intent: intent, RuntimeQuiesced: true, EndedWork: ended}, nil
 }
 
 func (controller *Controller) LoadImage(ctx context.Context, request LoadImageRequest, archive io.Reader) (LoadImageResponse, error) {
@@ -174,6 +201,19 @@ func (controller *Controller) LoadImage(ctx context.Context, request LoadImageRe
 	controller.mu.Unlock()
 	if images == nil {
 		return LoadImageResponse{}, runtimeUnavailable("OCI image loading is unavailable", nil)
+	}
+	if demand, ok := controller.config.Runtime.(interface{ BeginHostVMLoadImage() func() }); ok {
+		release := demand.BeginHostVMLoadImage()
+		defer release()
+		if !controller.config.Runtime.OCIRuntimeLive() {
+			if err := controller.config.Runtime.RecoverOCIRuntimeCapabilities(ctx); err != nil {
+				var refusal interface{ HostVMStartRefusal() string }
+				if errors.As(err, &refusal) {
+					return LoadImageResponse{}, runtimeUnavailable(refusal.HostVMStartRefusal(), err)
+				}
+				return LoadImageResponse{}, runtimeUnavailable("host VM start failed; run wefty node doctor", err)
+			}
+		}
 	}
 	response, err := images.LoadImage(ctx, request.Reference, archive)
 	if err != nil {

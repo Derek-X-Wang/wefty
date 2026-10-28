@@ -285,7 +285,7 @@ How does the node keep the host VM on only while work needs it, without overridi
 - **The idle stop**, 10 minutes after the last demand ends (a setting): publish the reduced capability and wait for L1's acknowledgement; check demand again under the claim lock; take the cycle lock; run a graceful `limactl stop`, with `--force` only after a timeout. Raise today's 30 s Lima command timeout for this step.
 - **The reason `host_vm_idle`**: `wefty node doctor` treats it as healthy, never starts the host VM, and shows what keeps it on. The watchdog still repairs a broken host VM.
 - **A free-space check** on the Mac before the host VM starts.
-- ***off*** ends running work at once, as `oci stop` does today, and lists what it ended.
+- ***off*** ends running work at once, as `oci off` does today, and lists what it ended.
 - The rules land in `docs/contracts/agent-local-lifecycle.md`.
 
 ### Acceptance

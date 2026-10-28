@@ -30,3 +30,21 @@ func unixPeerUID(connection net.Conn) (uint32, error) {
 	}
 	return credential.Uid, nil
 }
+
+func unixPeerPID(connection net.Conn) (int, error) {
+	c, ok := connection.(*net.UnixConn)
+	if !ok {
+		return 0, errPeerPIDUnavailable
+	}
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var pid int
+	var readErr error
+	err = raw.Control(func(fd uintptr) { pid, readErr = unix.GetsockoptInt(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERPID) })
+	if err != nil {
+		return 0, err
+	}
+	return pid, readErr
+}

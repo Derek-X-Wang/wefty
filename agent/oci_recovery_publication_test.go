@@ -92,7 +92,7 @@ func (barrier *contendedRecoveryBarrier) SetLossHandler(func(ocihelper.HelperSes
 func (barrier *contendedRecoveryBarrier) Close() error { return nil }
 
 // TestOperatorRecoveryPublishesInsideTheRecoveryTransaction is the #409 gap-1
-// regression. `wefty node oci start` printed "OCI runtime recovery failed" and
+// regression. `wefty node oci always-on` printed "OCI runtime recovery failed" and
 // exited 1 on a recovery that had succeeded, because the pinned positive
 // publication ran after the recovery mutex was released and a queued competing
 // recovery invalidated the helper generation underneath it.

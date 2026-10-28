@@ -135,6 +135,7 @@ type IntentDoctorFacts struct {
 	Version   int               `json:"version"`
 	Revision  uint64            `json:"revision"`
 	Enabled   bool              `json:"enabled"`
+	Position  lima.OCIPosition  `json:"position,omitempty"`
 	UpdatedAt *time.Time        `json:"updated_at,omitempty"`
 }
 
@@ -492,7 +493,11 @@ func BuildDoctor(ctx context.Context, config DoctorConfig) DoctorResponse {
 	buildConvergence(ctx, config, &report)
 	buildHelperHandshakeStalls(config, &report)
 	buildHelperStartupBound(config, &report)
-	buildHelper(ctx, config, &report)
+	if report.Lima.Applicable && report.Lima.Facts.ReasonCode == contract.CapabilityReasonHostVMIdle {
+		appendHelperNotRun(&report, "host_vm_idle: the host VM is intentionally stopped")
+	} else {
+		buildHelper(ctx, config, &report)
+	}
 	buildRemovalRecords(ctx, config, now, &report)
 	buildRetainedResults(config, &report)
 	return report
@@ -766,13 +771,13 @@ func buildIntent(ctx context.Context, config DoctorConfig, report *DoctorRespons
 		report.Findings = append(report.Findings, finding("intent", diagnosticReceipt{code: "oci_intent_not_read", notRunCause: NotRunSourceUnavailable, detail: "durable OCI intent could not be read"}))
 		return
 	}
-	if intent.Version != lima.OCIIntentVersion || intent.Revision == 0 {
+	if (intent.Version != 1 && intent.Version != lima.OCIIntentVersion) || intent.Revision == 0 {
 		report.Intent.Outcome = DiagnosticFailed
 		report.Findings = append(report.Findings, finding("intent", diagnosticReceipt{ran: true, code: "oci_intent_unavailable", reasonCode: contract.CapabilityReasonPrerequisiteMissing, detail: "durable OCI intent was read but is malformed"}))
 		return
 	}
 	updatedAt := intent.UpdatedAt.UTC().Round(0)
-	report.Intent = IntentDoctorFacts{Outcome: DiagnosticOK, Version: intent.Version, Revision: intent.Revision, Enabled: intent.Enabled, UpdatedAt: &updatedAt}
+	report.Intent = IntentDoctorFacts{Outcome: DiagnosticOK, Version: intent.Version, Revision: intent.Revision, Enabled: intent.Enabled, Position: intent.PositionValue(), UpdatedAt: &updatedAt}
 	reason := contract.CapabilityReasonCode("")
 	code := "oci_intent_enabled"
 	passed := intent.Enabled
@@ -812,7 +817,7 @@ func buildCapability(config DoctorConfig, now time.Time, report *DoctorResponse)
 		}
 	}
 	report.Findings = append(report.Findings, finding("capability-revision", diagnosticReceipt{ran: true, passed: revisionCurrent, code: code, reasonCode: reason, detail: "the complete L1 capability metadata tuple was read from shared agent state"}))
-	observationPassed := validTuple && observation.Capabilities["kind:oci"] && observation.ReasonCode == ""
+	observationPassed := validTuple && (observation.Capabilities["kind:oci"] && observation.ReasonCode == "" || observation.ReasonCode == contract.CapabilityReasonHostVMIdle)
 	observationReason := observation.ReasonCode
 	if !observationPassed && !observationReason.Valid() {
 		observationReason = contract.CapabilityReasonProbeFailed
@@ -862,7 +867,7 @@ func buildLima(config DoctorConfig, report *DoctorResponse) {
 	}
 	facts := config.LimaFacts()
 	report.Lima.Facts = facts
-	passed := facts.State == lima.InstanceRunning && facts.Enabled && !facts.Recovering
+	passed := facts.State == lima.InstanceRunning && facts.Enabled && !facts.Recovering || facts.State == lima.InstanceStopped && facts.Position == lima.OCIPositionOnDemand && facts.ReasonCode == contract.CapabilityReasonHostVMIdle
 	reason := facts.ReasonCode
 	if !passed && !reason.Valid() {
 		switch facts.State {
@@ -1411,6 +1416,7 @@ func StableDoctorReasonCodes() []contract.CapabilityReasonCode {
 		contract.CapabilityReasonLimaStartTimeout, contract.CapabilityReasonTemplateRestartRequired,
 		contract.CapabilityReasonTemplateRecreateRequired, contract.CapabilityReasonMountRootUnavailable,
 		contract.CapabilityReasonLocalPermissionDenied,
+		contract.CapabilityReasonHostVMIdle,
 	}
 }
 
@@ -1538,7 +1544,7 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		fmt.Sprintf("HOST PLATFORM\t%s/%s", report.HostPlatform.OS, report.HostPlatform.Architecture),
 		fmt.Sprintf("RUNTIME PLATFORM\t%s", platform),
 		fmt.Sprintf("AGENT\tuser=%s unit=%s", report.Agent.User, report.Agent.LaunchUnit),
-		fmt.Sprintf("INTENT\t%s enabled=%t revision=%d updated_at=%s", report.Intent.Outcome, report.Intent.Enabled, report.Intent.Revision, intentUpdated),
+		fmt.Sprintf("INTENT\t%s enabled=%t revision=%d updated_at=%s position=%s", report.Intent.Outcome, report.Intent.Enabled, report.Intent.Revision, intentUpdated, report.Intent.Position),
 		fmt.Sprintf("PROBE\t%s verdict=%s age=%s observed_at=%s probe_revision=%d reason=%s capability_observed_at=%s capability_revision=%d pending=%d capability_reason=%s", report.Probe.Outcome, report.Probe.Verdict, probeAge, formatOptionalTime(report.Probe.ObservedAt), report.Probe.ProbeRevision, report.Probe.ReasonCode, report.Probe.CapabilityObservedAt.Format(time.RFC3339Nano), report.Probe.CapabilityRevision, report.Probe.PendingPublicationRevision, report.Probe.CapabilityReasonCode),
 		fmt.Sprintf("HELPER\t%s protocol=%d version=%s checksum=%s instance=%s generation=%d", report.Helper.Outcome, report.Helper.ProtocolVersion, report.Helper.Version, report.Helper.Checksum, report.Helper.InstanceID, report.Helper.SessionGeneration),
 		fmt.Sprintf("RUNTIMES\t%s containerd=%s runc=%s runc_source=%s outside_tested_range=%t", report.Versions.Outcome, report.Versions.Containerd, report.Versions.Runc, report.Versions.RuncSource, report.Versions.OutsideTestedRange),
@@ -1561,6 +1567,11 @@ func WriteDoctorHuman(writer io.Writer, report DoctorResponse) error {
 		lines = append(lines, "SESSION INVALIDATION\tNOT-RUN no receipt")
 	}
 	if report.Lima.Applicable {
+		var demand []string
+		for _, item := range report.Lima.Facts.Demand {
+			demand = append(demand, item.Kind+":"+item.ID)
+		}
+		lines = append(lines, "HOST VM DEMAND\t"+strings.Join(demand, " "))
 		lines = append(lines, fmt.Sprintf("LIMA\t%s instance=%s state=%s enabled=%t recovering=%t observed_at=%s repair_count=%d reason=%s", report.Lima.Outcome, report.Lima.Facts.Instance, report.Lima.Facts.State, report.Lima.Facts.Enabled, report.Lima.Facts.Recovering, report.Lima.Facts.ObservedAt.Format(time.RFC3339Nano), report.Lima.Facts.RepairCount, report.Lima.Facts.ReasonCode))
 	} else {
 		lines = append(lines, "LIMA\tNOT-RUN not applicable")

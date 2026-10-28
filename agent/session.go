@@ -63,6 +63,7 @@ type agentSession struct {
 	ociIntent     func(context.Context) (OCIIntentObservation, error)
 	ociImagePins  workloadrunner.OCIImagePinRuntime
 	ociRecoveryMu sync.Mutex
+	hostVM        hostVMState
 
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
@@ -248,7 +249,7 @@ func (session *agentSession) markRegistered() {
 // suppressOCIBeforeBootSweep publishes the restrictive observation that must
 // precede a boot sweep. A durable disabled marker is intent authority, not a
 // runtime fact, and reading it here is what arms the process latch on a cold
-// start that follows `wefty node oci stop`: the barrier may no longer speak for
+// start that follows `wefty node oci off`: the barrier may no longer speak for
 // intent, and a Lima instance left stopped never asks for background recovery.
 // An inconclusive read falls back to the barrier's own health, which withdraws
 // kind:oci without claiming an intent verdict it could not prove.
@@ -404,6 +405,10 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 		return l1.Node{}, err
 	}
 	defer session.ociRecoveryMu.Unlock()
+	return session.publishRegistrationCapabilityPinnedLocked(ctx)
+}
+
+func (session *agentSession) publishRegistrationCapabilityPinnedLocked(ctx context.Context) (l1.Node, error) {
 	generation, ok := session.ociBootBarrier.Generation()
 	if !ok {
 		session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("OCI helper session lost after removal recovery"))
@@ -470,6 +475,8 @@ func (session *agentSession) processCancelDirectives(directives []l1.OneShotCanc
 // through its own operation outcome. Nothing about the helper's namespace
 // sweep and verification changes either.
 func (session *agentSession) processStandingDirectives(ctx context.Context, response l1.HeartbeatResponse) error {
+	finishHostVMDirectives := session.beginHostVMDirectivePass(response)
+	defer finishHostVMDirectives()
 	session.processCancelDirectives(response.OneShotCancelDirectives)
 	retention := session.removals.declaredStalledRetention(ctx, response.RemovalDirectives)
 	return errors.Join(session.resumePendingRemovals(ctx),
@@ -708,6 +715,9 @@ func lockMutexContext(ctx context.Context, mutex *sync.Mutex) error {
 }
 
 func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihelper.HelperSession, error) {
+	if err := session.skipHostVMRecovery(ctx); err != nil {
+		return ocihelper.HelperSession{}, err
+	}
 	if session.ociBootBarrier == nil {
 		return ocihelper.HelperSession{}, session.capabilities.refresh(ctx)
 	}
@@ -1463,10 +1473,22 @@ func (session *agentSession) allowOCIIntentIfUnchanged(suppressionSequence, inte
 // never failed; it is the same root cause as the operator-visible #409 defect
 // on a different path.
 func (session *agentSession) heartbeatOCIPinned(ctx context.Context) (l1.HeartbeatResponse, error) {
+	if err := session.skipHostVMRecovery(ctx); err != nil {
+		if capabilityProbeWasSkipped(err) {
+			return session.publishCapabilityHeartbeatResponse(ctx, nil)
+		}
+		return l1.HeartbeatResponse{}, err
+	}
 	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
 		return l1.HeartbeatResponse{}, err
 	}
 	defer session.ociRecoveryMu.Unlock()
+	if err := session.skipHostVMRecovery(ctx); err != nil {
+		if capabilityProbeWasSkipped(err) {
+			return session.publishCapabilityHeartbeatResponse(ctx, nil)
+		}
+		return l1.HeartbeatResponse{}, err
+	}
 	var pinned *ocihelper.HelperSession
 	if generation, ready := session.ociBootBarrier.Generation(); ready {
 		refreshErr := session.capabilities.refreshValidated(ctx, func() error {
@@ -1588,6 +1610,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			}
 		}
 		session.observeGrantedCapacity(response.Node)
+		finishHostVMDirectives := session.beginHostVMDirectivePass(response)
 		session.processCancelDirectives(response.OneShotCancelDirectives)
 		// The same exclusion the boot sequence makes: a stalled removal's
 		// retained resources belong to its own durable backoff, and the
@@ -1633,6 +1656,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				session.custody.enqueue(ctx, directive, failures)
 			}
 		}
+		finishHostVMDirectives()
 		backoff.reset()
 		nextDelay = session.heartbeatInterval
 		session.markReady()

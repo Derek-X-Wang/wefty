@@ -131,8 +131,10 @@ type setupHost struct {
 }
 
 type setupRequest struct {
-	ociConfig         string
-	rollingCompletion func([]setupFile) error
+	ociConfig              string
+	hostVMIdleWait         time.Duration
+	hostVMMinimumFreeBytes uint64
+	rollingCompletion      func([]setupFile) error
 	// Only upgrade under its held installation lock may replace node activation.
 	activateGeneration  func(context.Context, launchagent.Agent) (launchagent.Action, error)
 	computer            setupComputerOptions
@@ -343,6 +345,8 @@ func executeSetupUsingHost(ctx context.Context, options globalOptions, args []st
 	var request setupRequest
 	bindSetupComputerFlags(flags, &request.computer)
 	flags.StringVar(&request.ociConfig, "oci-config", "", "add the host VM using immutable local Linux helper and probe assets from JSON")
+	flags.DurationVar(&request.hostVMIdleWait, "host-vm-idle-wait", 0, "on-demand host VM idle wait (default 10m; preserve an installed value when omitted)")
+	flags.Uint64Var(&request.hostVMMinimumFreeBytes, "host-vm-minimum-free-bytes", 0, "Mac free bytes required before host VM start (default 5368709120; preserve an installed value when omitted)")
 	var remove, purge, proof bool
 	flags.BoolVar(&proof, "proof", false, "isolated attended Mac proof install (dev.wefty-proof labels, separate state and host VM home)")
 	flags.StringVar(&request.role, "role", "", "fleet role on Mac or Linux: control-plane or join; omit for the daily plain Mac install")

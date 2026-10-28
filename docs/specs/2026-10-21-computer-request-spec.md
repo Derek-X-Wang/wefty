@@ -434,7 +434,7 @@ The host VM runs while any of these exists (#1027):
 |---|---|
 | *on demand* | The host VM starts when demand appears and stops after the idle wait. |
 | *always on* | Today's *enabled*. |
-| *off* | No OCI work runs. A Seat request is refused at once with "the host VM is off". Turning the switch *off* while work runs ends that work at once, as `oci stop` does today, and the command lists what it ended. |
+| *off* | No OCI work runs. A Seat request is refused at once with "the host VM is off". Turning the switch *off* while work runs ends that work at once, as `oci off` does today, and the command lists what it ended. |
 
 How today's intent marker maps to the three positions is proposed (P14).
 

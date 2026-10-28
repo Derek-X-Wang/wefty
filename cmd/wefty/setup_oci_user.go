@@ -48,6 +48,21 @@ func setupUserOCIFiles(host setupHost, paths setupPaths, request setupRequest, n
 		c.TemplatePath = filepath.Join(paths.config, "host-vm.yaml")
 		c.Sizing = sizing
 	}
+	if request.hostVMIdleWait < 0 {
+		return nil, errors.New("host VM idle wait must be positive")
+	}
+	if request.hostVMIdleWait > 0 {
+		c.HostVMIdleWait = request.hostVMIdleWait
+	}
+	if request.hostVMMinimumFreeBytes > 0 {
+		c.HostVMMinimumFreeBytes = request.hostVMMinimumFreeBytes
+	}
+	if c.HostVMIdleWait == 0 {
+		c.HostVMIdleWait = limarunner.DefaultHostVMIdleWait
+	}
+	if c.HostVMMinimumFreeBytes == 0 {
+		c.HostVMMinimumFreeBytes = limarunner.DefaultHostVMMinimumFreeBytes
+	}
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("per-user OCI install: %w", err)
 	}
@@ -97,6 +112,7 @@ func setupUserOCIFiles(host setupHost, paths setupPaths, request setupRequest, n
 			"--oci-probe-image="+c.Assets.ProbeReference, "--oci-probe-digest="+c.Assets.ProbeDigest, "--oci-probe-archive="+c.Assets.ProbeArchive,
 			"--oci-lima-instance="+c.Instance, "--oci-lima-host-mount-root="+c.MountRoot, "--oci-intent-file="+c.IntentFile,
 			"--oci-control-socket="+controlSocket, "--oci-setup-state="+c.SetupState, "--oci-minimal-doctor-facts="+filepath.Join(paths.data, "oci-facts.json"),
+			"--host-vm-idle-wait="+c.HostVMIdleWait.String(), "--host-vm-minimum-free-bytes="+strconv.FormatUint(c.HostVMMinimumFreeBytes, 10),
 			"--oci-memory-capacity-bytes="+strconv.FormatInt(capacity, 10), "--oci-memory-reserve-bytes="+strconv.FormatInt(reserve, 10))
 		digest, err := connprofile.Digest(struct {
 			Previous string

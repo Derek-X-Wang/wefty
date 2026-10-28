@@ -51,6 +51,9 @@ type Server struct {
 	server               *http.Server
 	allowedUIDs          map[uint32]struct{}
 	shutdownDrainTimeout time.Duration
+	refuseDescendants    bool
+	parentPID            func(int) (int, error)
+	peerPID              func(net.Conn) (int, error)
 	logf                 func(string, ...any)
 }
 
@@ -104,7 +107,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/oci/start", server.handleStart)
 	mux.HandleFunc("POST /v1/oci/stop", server.handleStop)
 	mux.HandleFunc("POST /v1/images/load", server.handleLoadImage)
-	server.server = &http.Server{Handler: mux, ReadHeaderTimeout: controlReadHeaderTimeout, ReadTimeout: controlRequestReadTimeout}
+	server.server = &http.Server{Handler: server.authorizePeer(mux), ConnContext: server.peerContext, ReadHeaderTimeout: controlReadHeaderTimeout, ReadTimeout: controlRequestReadTimeout}
 	shutdownComplete := make(chan struct{})
 	shutdown := context.AfterFunc(ctx, func() {
 		defer close(shutdownComplete)
@@ -404,4 +407,18 @@ func helperMechanicsDetails(err error) map[string]any {
 		details["disk_failure"] = failure.DiskFailure
 	}
 	return details
+}
+
+// NewNodeServer adds the node agent descendant refusal to the UID-authenticated
+// transport. Generic service fixtures can use NewServer when their child
+// processes represent operator clients rather than node workloads.
+func NewNodeServer(path string, service Service, allowedUIDs ...uint32) (*Server, error) {
+	server, err := NewServer(path, service, allowedUIDs...)
+	if err != nil {
+		return nil, err
+	}
+	server.refuseDescendants = true
+	server.parentPID = readParentPID
+	server.peerPID = unixPeerPID
+	return server, nil
 }

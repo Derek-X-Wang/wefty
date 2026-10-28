@@ -144,3 +144,10 @@ func (client *Client) call(ctx context.Context, method, path string, body io.Rea
 	}
 	return nil
 }
+
+// OnDemand changes the owner switch without inventing node demand.
+func (client *Client) OnDemand(ctx context.Context, expected uint64) (IntentResponse, error) {
+	var response IntentResponse
+	err := client.callJSON(ctx, "/v1/oci/start", IntentMutationRequest{ExpectedRevision: expected, Position: lima.OCIPositionOnDemand}, &response)
+	return response, err
+}

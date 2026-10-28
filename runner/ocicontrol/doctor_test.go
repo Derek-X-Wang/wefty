@@ -512,6 +512,7 @@ func TestDoctorGoldenParityCoversEveryReasonAndL1MetadataTuple(t *testing.T) {
 			mutateHelper(config, func(snapshot *HelperDoctorSnapshot) { snapshot.Runtime.AllowedMountRoots = []string{"/different"} })
 		}},
 		{contract.CapabilityReasonLocalPermissionDenied, passThrough, func(config *DoctorConfig) { setProbeReason(config, contract.CapabilityReasonLocalPermissionDenied) }},
+		{contract.CapabilityReasonHostVMIdle, passThrough, func(config *DoctorConfig) { setProbeReason(config, contract.CapabilityReasonHostVMIdle) }},
 	}
 	seen := make(map[contract.CapabilityReasonCode]string)
 	for _, row := range rows {

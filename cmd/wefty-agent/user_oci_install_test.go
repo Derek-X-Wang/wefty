@@ -192,3 +192,68 @@ func TestPerUserProofRefusalStopFailureKeepsNodeProcessUp(t *testing.T) {
 		t.Fatalf("stop calls=%d logs=%s", stops, &logs)
 	}
 }
+
+func TestOnDemandNodeRestartDoesNotBootstrapHostVM(t *testing.T) {
+	path := perUserProofTestConfig(t)
+	var config limarunner.UserInstallConfig
+	if err := limarunner.ReadUserInstallJSON(path, &config); err != nil {
+		t.Fatal(err)
+	}
+	config.ProofDialog = false
+	payload, _ := json.Marshal(config)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepares := 0
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error {
+		prepares++
+		folder := filepath.Join(config.LimaHome, config.Instance)
+		if err := os.MkdirAll(folder, 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
+	}
+	for range 2 {
+		allowed, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil)
+		if err != nil || !allowed {
+			t.Fatalf("allowed=%t err=%v", allowed, err)
+		}
+	}
+	if prepares != 1 {
+		t.Fatalf("on-demand node restart bootstrapped host VM %d times", prepares)
+	}
+}
+
+func TestPreparedReceiptDoesNotHideRemovedLimaInstance(t *testing.T) {
+	path := perUserProofTestConfig(t)
+	var config limarunner.UserInstallConfig
+	if err := limarunner.ReadUserInstallJSON(path, &config); err != nil {
+		t.Fatal(err)
+	}
+	config.ProofDialog = false
+	payload, _ := json.Marshal(config)
+	if err := os.WriteFile(path, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	prepares := 0
+	prepare := func(context.Context, limarunner.UserInstallConfig, string, string) error {
+		prepares++
+		folder := filepath.Join(config.LimaHome, config.Instance)
+		if err := os.MkdirAll(folder, 0700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(folder, "lima.yaml"), []byte("fixture"), 0600)
+	}
+	if _, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(config.LimaHome, config.Instance)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prepareInstalledUserOCI(t.Context(), path, "node", "boot", "test", prepare, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if prepares != 2 {
+		t.Fatalf("missing instance was skipped: preparations=%d", prepares)
+	}
+}

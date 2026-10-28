@@ -18,7 +18,7 @@ import (
 
 func executeLocalNode(ctx context.Context, options globalOptions, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return usageError("usage: wefty node doctor | wefty node setup-oci | wefty node oci start|stop|removals | wefty node load-image FILE [--reference REFERENCE]")
+		return usageError("usage: wefty node doctor | wefty node setup-oci | wefty node oci off|on-demand|always-on|removals | wefty node load-image FILE [--reference REFERENCE]")
 	}
 	if handled, err := maybeExecutePrivilegedLinuxSetup(ctx, options, args, stdout, stderr); handled {
 		return err
@@ -186,16 +186,18 @@ func executeLocalOCIIntent(ctx context.Context, client *ocicontrol.Client, jsonO
 	if len(args) == 1 && args[0] == "removals" {
 		return executeLocalOCIRemovals(ctx, client, jsonOutput, stdout)
 	}
-	if len(args) != 1 || args[0] != "start" && args[0] != "stop" {
-		return usageError("usage: wefty node oci start | wefty node oci stop | wefty node oci removals")
+	if len(args) != 1 || args[0] != "always-on" && args[0] != "on-demand" && args[0] != "off" {
+		return usageError("usage: wefty node oci off|on-demand|always-on|removals")
 	}
 	current, err := client.Intent(ctx)
 	if err != nil {
 		return classifyRecordedExchangeError(ctx, err)
 	}
 	var response ocicontrol.IntentResponse
-	if args[0] == "start" {
+	if args[0] == "always-on" {
 		response, err = client.Start(ctx, current.Revision)
+	} else if args[0] == "on-demand" {
+		response, err = client.OnDemand(ctx, current.Revision)
 	} else {
 		response, err = client.Stop(ctx, current.Revision)
 	}
@@ -205,9 +207,17 @@ func executeLocalOCIIntent(ctx context.Context, client *ocicontrol.Client, jsonO
 	if jsonOutput {
 		return writeJSON(stdout, response)
 	}
-	_, err = fmt.Fprintf(stdout, "OCI intent enabled=%t revision=%d capability_published=%t runtime_quiesced=%t\n",
-		response.Intent.Enabled, response.Intent.Revision, response.CapabilityPublished, response.RuntimeQuiesced)
-	return err
+	_, err = fmt.Fprintf(stdout, "host VM %s; enabled=%t revision=%d capability_published=%t runtime_quiesced=%t\n",
+		response.Intent.PositionValue(), response.Intent.Enabled, response.Intent.Revision, response.CapabilityPublished, response.RuntimeQuiesced)
+	if err != nil {
+		return err
+	}
+	for _, work := range response.EndedWork {
+		if _, err = fmt.Fprintf(stdout, "ended %s %s\n", work.Kind, work.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // executeLocalOCIRemovals reads the durable removal proof the node-local agent

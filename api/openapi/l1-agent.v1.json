@@ -1478,7 +1478,7 @@
                       "helper_version_mismatch", "helper_handshake_failed",
                       "boot_sweep_failed", "probe_failed", "lima_stopped", "lima_broken",
                       "lima_start_timeout", "template_restart_required", "template_recreate_required",
-                      "mount_root_unavailable", "local_permission_denied"
+                      "mount_root_unavailable", "local_permission_denied", "host_vm_idle"
                     ]
                   }
                 }
