@@ -43,6 +43,22 @@ class SessionTest(unittest.TestCase):
             self.assertEqual(self.session.failure, None)
         self.assertEqual(len(self.starts), 4)
 
+    def test_browser_readiness_diagnostics_name_missing_window_without_titles(self):
+        detail = {}
+        answers = [mock.Mock(stdout='_NET_CLIENT_LIST(WINDOW): window id # 0x123\n'),
+                   mock.Mock(stdout='_NET_WM_NAME(UTF8_STRING) = "private page title"\n')]
+        with mock.patch.dict(os.environ, {'SEAT_ID': '1'}), \
+                mock.patch.object(session.subprocess, 'run', side_effect=answers):
+            self.assertFalse(session.browser_ready(detail))
+        self.assertEqual(detail, {'phase': 'window_titles', 'window_count': 1, 'titles_checked': 1})
+        self.assertNotIn('private page title', json.dumps(detail))
+
+    def test_browser_readiness_diagnostics_name_xprop_timeout(self):
+        detail = {}
+        with mock.patch.object(session.subprocess, 'run', side_effect=session.subprocess.TimeoutExpired('xprop', 1)):
+            self.assertFalse(session.browser_ready(detail))
+        self.assertEqual(detail, {'phase': 'client_list', 'error': 'TimeoutExpired'})
+
     def test_repeated_restarts_fail_but_window_expiry_resets_budget(self):
         self.session.tick()
         for _ in range(3):

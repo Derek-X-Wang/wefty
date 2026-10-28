@@ -803,6 +803,25 @@ which crosses the deadline cannot publish ready. The helper independently
 checks the endpoints and its own deadline, bound to the exact attempt,
 generation and place. A ready file alone never publishes a Seat.
 
+The default image logs each Seat start and each published Seat answer as JSON
+lines in the Computer log, with directive generation and place. While waiting,
+it logs the last readiness condition at most once per five seconds: the
+`desktop-ready` marker, view endpoint or control endpoint. Endpoint diagnostics
+name the probe phase (socket checks, connect, WebSocket upgrade, headers,
+subprotocol, RFB frame or greeting), elapsed milliseconds, and exception class
+and errno when a probe raises. They do not include peer bytes. While the
+desktop marker is missing, the session controller logs the browser probe's
+phase, window count and exception class at most once per five seconds and
+when the ready title is found; it never logs window titles or page content. At
+`readiness_deadline`, it logs the last completed probe, its age and probe count
+**before cleanup deletes the Seat folder**. Diagnostics do not extend the
+60-second budget, redial after expiry, or add fields to the status answers.
+The root-only Seat lane names the Computer and wanted places for each
+directive. A readiness failure includes the last status read and a bounded
+Computer log tail in the job output; complete logs remain in CI evidence.
+The supervisor and browser diagnostics carry monotonic milliseconds so their
+events can be ordered across the Seat processes.
+
 Removal keeps a generation-bound `removed` answer instead of deleting proof.
 If the image stops a Seat itself, it writes `failed` and its reason, with
 `cleanup_complete:true` only after cleanup succeeds. If cleanup fails, it

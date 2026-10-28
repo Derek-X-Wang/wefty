@@ -61,6 +61,79 @@ class SupervisorTest(unittest.TestCase):
     def answer(self, place):
         return json.loads((Path(self.tmp.name).resolve() / (str(place) + ".json")).read_text())
 
+    def test_deadline_logs_last_readiness_condition_before_cleanup(self):
+        lines = []
+        self.engine.log = lines.append
+        self.backend.readiness_details = {}
+        def waiting(seat):
+            self.backend.readiness_details[seat['place']] = {
+                'waiting_for': 'control', 'probe': {'phase': 'rfb_greeting', 'error': 'TimeoutError'}}
+            return False
+        self.backend.is_ready = waiting
+        self.engine.apply(directive(1, 1))
+        self.clock = 59
+        self.engine.tick()
+        # Cleanup destroys the run folder. Diagnostics must use the saved
+        # probe, not try another dial after the deadline or after cleanup.
+        def stop(place):
+            self.backend.readiness_details.clear()
+            self.backend.live.discard(place)
+        self.backend.stop = stop
+        self.clock = 60
+        self.engine.tick()
+        events = [json.loads(line) for line in lines]
+        expired = next(event for event in events if event['event'] == 'readiness_deadline')
+        self.assertEqual(expired['generation'], 1)
+        self.assertEqual(expired['place'], 1)
+        self.assertEqual(expired['elapsed_ms'], 60000)
+        self.assertEqual(expired['monotonic_ms'], 60000)
+        self.assertEqual(expired['last_probe_age_ms'], 1000)
+        self.assertEqual(expired['probe_count'], 1)
+        self.assertEqual(expired['readiness']['waiting_for'], 'control')
+        self.assertEqual(expired['readiness']['probe']['phase'], 'rfb_greeting')
+        self.assertEqual(events[-1]['answer'], self.answer(1))
+        self.assertEqual(self.answer(1)['reason'], 'readiness_deadline')
+
+    def test_readiness_logs_are_bounded_and_unchanged_generation_keeps_start(self):
+        lines = []
+        self.engine.log = lines.append
+        self.backend.readiness_details = {1: {'waiting_for': 'desktop_ready'}}
+        self.engine.apply(directive(1, 1))
+        for index in range(50):
+            self.clock = index / 10
+            self.engine.tick()
+        self.assertEqual(sum(json.loads(line)['event'] == 'readiness_wait' for line in lines), 1)
+        self.clock = 5
+        self.engine.apply(directive(2, 1, 2))
+        self.backend.ready.add(1)
+        self.engine.tick()
+        ready = next(json.loads(line) for line in lines if json.loads(line).get('answer', {}).get('state') == 'ready')
+        self.assertEqual(ready['generation'], 2)
+        self.assertEqual(ready['elapsed_ms'], 5000)
+
+    def test_desktop_backend_reports_missing_marker_and_exact_endpoint(self):
+        with tempfile.TemporaryDirectory() as root, mock.patch.object(supervisor, 'SEATS', Path(root).resolve()):
+            runtime = Path(root) / '1/run'
+            runtime.mkdir(parents=True)
+            backend = supervisor.DesktopBackend(mock.Mock())
+            seat = directive(1, 1)['seats'][0]
+            self.assertFalse(backend.is_ready(seat))
+            self.assertEqual(backend.readiness_details[1]['waiting_for'], 'desktop_ready')
+            (runtime / 'desktop-ready').touch()
+            with mock.patch.object(supervisor.os, 'stat', wraps=os.stat) as stat_call:
+                # The fixture uses the current uid; only the marker ownership
+                # expectation differs from the production Seat uid.
+                info = os.stat(runtime / 'desktop-ready')
+                marker = mock.Mock(st_mode=info.st_mode, st_uid=2001)
+                stat_call.return_value = marker
+                def probe(_path, _uid, detail):
+                    detail.update(phase='rfb_greeting', error='TimeoutError')
+                    return _path == seat['view_socket']
+                with mock.patch.object(supervisor, 'rfb_ready', side_effect=probe):
+                    self.assertFalse(backend.is_ready(seat))
+            self.assertEqual(backend.readiness_details[1]['waiting_for'], 'control')
+            self.assertEqual(backend.readiness_details[1]['probe']['error'], 'TimeoutError')
+
     def test_new_seat_has_its_own_deadline_and_late_ready_is_cleaned(self):
         self.engine.apply(directive(1, 1))
         self.backend.ready.add(1)
