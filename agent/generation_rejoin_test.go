@@ -88,6 +88,152 @@ func TestPrimaryGenerationRejoinsAfterNodeDeadHeartbeat(t *testing.T) {
 	assertPrimaryGenerationRejoinsAfterNodeDead(t, true)
 }
 
+// Produce refusals through L1's real authorization and inventory handlers.
+// Other RPCs keep their original identity and store, including Attempt renewals.
+func generationReadRefusal(t *testing.T, request *http.Request, store *l1.Store, code contract.ErrorCode) *http.Response {
+	t.Helper()
+	identity := fabric.Identity{NodeID: "agent", Tags: []string{l1.DefaultAgentPrincipalTag}}
+	request = request.Clone(request.Context())
+	request.Method = http.MethodGet
+	switch code {
+	case contract.ErrorNodeNotRegistered:
+		request.URL.Path = "/v1/agent/nodes/missing/generations"
+	case contract.ErrorIdentityBound:
+		identity.NodeID = "other-agent"
+	case contract.ErrorPrincipalForbidden:
+		identity.Tags = nil
+	default:
+		t.Fatalf("unsupported real inventory refusal: %s", code)
+	}
+	server, err := l1.NewServer(&mutableWhoIsFabric{identity: identity}, store, l1.ServerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	var response contract.ErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Error.Code != code {
+		t.Errorf("inventory refusal=%s, want %s: %v", recorder.Body.String(), code, err)
+	}
+	return recorder.Result()
+}
+
+func TestPrimaryGenerationReadRefusalQuarantines(t *testing.T) {
+	for _, code := range []contract.ErrorCode{contract.ErrorIdentityBound, contract.ErrorPrincipalForbidden} {
+		for _, path := range []string{"heartbeat", "heartbeat_reobservation", "claim", "rejoin", "rejoin_after_register"} {
+			t.Run(string(code)+"/"+path, func(t *testing.T) {
+				var refuse atomic.Bool
+				var reads, logged atomic.Int32
+				heartbeatInterval, claimInterval := time.Hour, 10*time.Millisecond
+				if strings.HasPrefix(path, "heartbeat") {
+					heartbeatInterval, claimInterval = 10*time.Millisecond, time.Hour
+				}
+				session, _, registrations := newGenerationRejoinFixture(t, heartbeatInterval, claimInterval, func(format string, args ...any) {
+					line := fmt.Sprintf(format, args...)
+					if strings.HasPrefix(line, "agent: heartbeat failed:") {
+						logged.Add(1)
+					}
+				}, func(r *http.Request, store *l1.Store, clock *manualClock) *http.Response {
+					if !refuse.Load() {
+						return nil
+					}
+					if r.URL.Path == "/v1/agent/jobs/claim" || (r.URL.Path == "/v1/agent/nodes/node/heartbeat" && path == "heartbeat_reobservation") {
+						if path == "claim" {
+							recorder := httptest.NewRecorder()
+							recorder.WriteHeader(http.StatusServiceUnavailable)
+							return recorder.Result()
+						}
+						// Expire through L1 to reach the inventory read after a
+						// refused claim or heartbeat.
+						clock.Advance(l1.DefaultNodeDeadAfter)
+						if _, err := store.Reconcile(r.Context()); err != nil {
+							t.Error(err)
+						}
+					}
+					if r.URL.Path == "/v1/agent/nodes/register" && path == "rejoin_after_register" {
+						recorder := httptest.NewRecorder()
+						recorder.WriteHeader(http.StatusServiceUnavailable)
+						return recorder.Result()
+					}
+					if r.URL.Path == "/v1/agent/nodes/node/generations" {
+						read := reads.Add(1)
+						if (path == "rejoin" || path == "heartbeat_reobservation") && read == 1 || path == "rejoin_after_register" && read <= 2 {
+							return nil
+						}
+						return generationReadRefusal(t, r, store, code)
+					}
+					return nil
+				})
+				refuse.Store(true)
+				retirementWait(t, "inventory refusal quarantines the session", func() bool {
+					return session.observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).State == LifecycleQuarantined
+				})
+				status := session.observer.snapshot(ClassOccupancy{}, ClassOccupancy{})
+				if status.LastSemanticError == nil || status.LastSemanticError.Code != code {
+					t.Fatalf("quarantine reason=%+v, want %s", status.LastSemanticError, code)
+				}
+				if registrations.Load() != 1 || logged.Load() != 1 {
+					t.Fatalf("registrations=%d refusal logs=%d, want one each", registrations.Load(), logged.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestPrimaryGenerationReadTransientFailureRetries(t *testing.T) {
+	var fail atomic.Bool
+	var failures, recoveredHeartbeats atomic.Int32
+	session, _, registrations := newGenerationRejoinFixture(t, 10*time.Millisecond, time.Hour, nil, func(r *http.Request, _ *l1.Store, _ *manualClock) *http.Response {
+		if r.URL.Path == "/v1/agent/nodes/node/generations" && fail.Load() {
+			failures.Add(1)
+			recorder := httptest.NewRecorder()
+			recorder.WriteHeader(http.StatusServiceUnavailable)
+			return recorder.Result()
+		}
+		if r.URL.Path == "/v1/agent/nodes/node/heartbeat" && failures.Load() >= 2 {
+			recoveredHeartbeats.Add(1)
+		}
+		return nil
+	})
+	fail.Store(true)
+	retirementWait(t, "transient inventory failure retries", func() bool { return failures.Load() >= 2 })
+	if registrations.Load() != 1 {
+		t.Fatal("transient inventory failure re-registered the generation")
+	}
+	fail.Store(false)
+	retirementWait(t, "heartbeat recovers after inventory becomes available", func() bool {
+		return recoveredHeartbeats.Load() > 0 && session.observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).State == LifecycleReady
+	})
+	if registrations.Load() != 1 {
+		t.Fatal("inventory recovery re-registered the generation")
+	}
+}
+
+func TestGenerationReadRefusalReobservesRetirementBeforeRejoin(t *testing.T) {
+	var promote atomic.Bool
+	var retiringHeartbeats atomic.Int32
+	session, store, registrations := newGenerationRejoinFixture(t, 10*time.Millisecond, time.Hour, nil, func(r *http.Request, store *l1.Store, _ *manualClock) *http.Response {
+		if r.URL.Path == "/v1/agent/nodes/node/generations" && promote.CompareAndSwap(true, false) {
+			promoteRetirementFixture(t, store, "node", "agent")
+			return generationReadRefusal(t, r, store, contract.ErrorNodeNotRegistered)
+		}
+		if strings.HasSuffix(r.URL.Path, "/generations/generation/heartbeat") {
+			retiringHeartbeats.Add(1)
+			return generationReadRefusal(t, r, store, contract.ErrorNodeNotRegistered)
+		}
+		return nil
+	})
+	promote.Store(true)
+	retirementWait(t, "retiring heartbeat retries", func() bool { return retiringHeartbeats.Load() >= 2 })
+	if registrations.Load() != 1 || !session.isRetiring() {
+		t.Fatalf("retirement fence lost: registrations=%d retiring=%t", registrations.Load(), session.isRetiring())
+	}
+	node, err := store.GetNode(t.Context(), "node")
+	if err != nil || node.BootSessionID != "next-boot" || node.AgentGenerationID != "next-generation" {
+		t.Fatalf("successor projection changed: %+v %v", node, err)
+	}
+}
+
 func TestPrimaryGenerationRejoinsAfterNodeDeadClaim(t *testing.T) {
 	assertPrimaryGenerationRejoinsAfterNodeDead(t, false)
 }

@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -75,6 +76,53 @@ func TestPrimaryGenerationRejoinKeepsLeasedResident(t *testing.T) {
 				finishRejoinResident(t, store, job, release)
 			})
 		}
+	}
+}
+
+func TestPrimaryGenerationReadRefusalRejoinKeepsLeasedResident(t *testing.T) {
+	for _, restartable := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restartable=%t", restartable), func(t *testing.T) {
+			clock := newManualClock(time.Now().UTC())
+			var refuse atomic.Bool
+			var registrations, refusals, logged atomic.Int32
+			a, store, _, _ := newResidentRejoinFixture(t, clock, func(a *Agent, store *l1.Store) {
+				a.session.logf = func(format string, args ...any) {
+					line := fmt.Sprintf(format, args...)
+					if strings.HasPrefix(line, "agent: heartbeat failed:") && strings.Contains(line, string(contract.ErrorNodeNotRegistered)) {
+						logged.Add(1)
+					}
+					t.Log(line)
+				}
+				base := a.session.client.httpClient.Transport
+				a.session.client.httpClient.Transport = captureRoundTrip(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Path == "/v1/agent/nodes/node/generations" && refuse.Load() {
+						refusals.Add(1)
+						return generationReadRefusal(t, r, store, contract.ErrorNodeNotRegistered), nil
+					}
+					response, err := base.RoundTrip(r)
+					if err == nil && r.URL.Path == "/v1/agent/nodes/register" && response.StatusCode == http.StatusOK {
+						if registrations.Add(1) == 2 {
+							refuse.Store(false)
+						}
+					}
+					return response, err
+				})
+			})
+			job, ready, release := retirementReviewJob(t, store, "inventory-rejoin", restartable, nil)
+			retirementWait(t, "resident payload ready", func() bool { _, err := os.Stat(ready); return err == nil })
+			refuse.Store(true)
+			retirementWait(t, "primary re-registered after inventory refusal", func() bool { return registrations.Load() == 2 })
+			if refusals.Load() < 2 {
+				t.Fatal("rejoin did not re-observe the generation before registration")
+			}
+			if logged.Load() != 1 {
+				t.Fatalf("inventory refusal logs=%d, want one across rejoin observations", logged.Load())
+			}
+			if status := a.Status(); status.State == LifecycleQuarantined {
+				t.Fatal("primary quarantined during inventory rejoin")
+			}
+			finishRejoinResident(t, store, job, release)
+		})
 	}
 }
 
