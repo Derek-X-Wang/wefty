@@ -64,10 +64,13 @@ type Client struct {
 	operationTimeout time.Duration
 }
 
+const claimHintRetryInterval = 10 * time.Minute
+
 // Shared by transport-only client copies within a node-agent session.
 type claimHintState struct {
-	enabled     atomic.Bool
-	unsupported atomic.Bool
+	enabled    atomic.Bool
+	retryAfter atomic.Pointer[time.Time]
+	clock      Clock
 }
 
 // NewClient creates a client whose HTTP connections are obtained exclusively
@@ -93,7 +96,7 @@ func newClient(f fabric.Fabric, controlPlaneAddress string, operationTimeout tim
 		},
 	}
 	return &Client{
-		claimHints: &claimHintState{},
+		claimHints: &claimHintState{clock: systemClock{}},
 		baseURL:    "http://control-plane.invalid",
 		httpClient: &http.Client{
 			Transport: transport,
@@ -146,12 +149,18 @@ func (c *Client) Claim(ctx context.Context, nodeID, bootSessionID, class string,
 
 func (c *Client) ClaimPoll(ctx context.Context, nodeID, bootSessionID, class string, excludedJobIDs ...string) (l1.ClaimPollResponse, error) {
 	var reply l1.ClaimPollResponse
+	acceptHint := c.claimHints != nil && c.claimHints.enabled.Load()
+	if acceptHint {
+		retryAfter := c.claimHints.retryAfter.Load()
+		acceptHint = retryAfter == nil || !c.claimHints.clock.Now().Before(*retryAfter)
+	}
 	request := l1.ClaimRequest{NodeID: nodeID, BootSessionID: bootSessionID, Class: class, ExcludedJobIDs: excludedJobIDs,
-		AcceptQueuedOCIHint: c.claimHints != nil && c.claimHints.enabled.Load() && !c.claimHints.unsupported.Load()}
+		AcceptQueuedOCIHint: acceptHint}
 	_, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", request, &reply)
 	var refused *ProtocolError
 	if request.AcceptQueuedOCIHint && errors.As(err, &refused) && refused.StatusCode == http.StatusBadRequest && refused.APIError.Code == contract.ErrorInvalidRequest && strings.Contains(refused.APIError.Message, "accept_queued_oci_hint") {
-		c.claimHints.unsupported.Store(true)
+		retryAfter := c.claimHints.clock.Now().Add(claimHintRetryInterval)
+		c.claimHints.retryAfter.Store(&retryAfter)
 		request.AcceptQueuedOCIHint = false
 		_, err = c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", request, &reply)
 	}

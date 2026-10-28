@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
@@ -119,5 +120,63 @@ func TestColdStartOldL1FallbackUntilReconnect(t *testing.T) {
 	poll()
 	if len(requests) != 5 || !strings.Contains(requests[3], `"accept_queued_oci_hint":true`) {
 		t.Fatalf("reconnect did not renegotiate: %v", requests)
+	}
+}
+
+func TestColdStartClaimHintRetryAfterLegacyInterval(t *testing.T) {
+	for _, upgraded := range []bool{false, true} {
+		t.Run(map[bool]string{false: "still-old", true: "upgraded"}[upgraded], func(t *testing.T) {
+			a := newHostVMControlTestAgent(t)
+			a.session.registration.OS = "darwin"
+			a.ConfigureHostVMDemand(&lima.DemandState{}, nil)
+			clock := a.capabilities.clock.(*manualClock)
+			old := true
+			var opts []bool
+			a.session.client.httpClient.Transport = captureRoundTrip(func(r *http.Request) (*http.Response, error) {
+				var fields map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&fields); err != nil {
+					t.Fatal(err)
+				}
+				opted := fields["accept_queued_oci_hint"] == true
+				opts = append(opts, opted)
+				if old && opted {
+					return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"invalid_request","message":"unknown field accept_queued_oci_hint"}}`)), Header: make(http.Header)}, nil
+				}
+				if opted {
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"queued_oci_work":true}`)), Header: make(http.Header)}, nil
+				}
+				return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+			})
+			poll := func() bool {
+				t.Helper()
+				reply, err := a.session.client.ClaimPoll(t.Context(), "node", "boot", contract.JobClassOneShot)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return reply.QueuedOCIWork
+			}
+			poll()
+			clock.Advance(10*time.Minute - time.Nanosecond)
+			poll()
+			if !reflect.DeepEqual(opts, []bool{true, false, false}) {
+				t.Fatalf("early renegotiation=%v", opts)
+			}
+			old = !upgraded
+			clock.Advance(time.Nanosecond)
+			if got := poll(); got != upgraded {
+				t.Errorf("hint after retry=%v want=%v", got, upgraded)
+			}
+			want := []bool{true, false, false, true}
+			if !upgraded {
+				want = append(want, false)
+			}
+			if !reflect.DeepEqual(opts, want) {
+				t.Fatalf("bounded retry=%v want=%v", opts, want)
+			}
+			poll()
+			if opts[len(opts)-1] != upgraded {
+				t.Fatalf("new interval not remembered: %v", opts)
+			}
+		})
 	}
 }

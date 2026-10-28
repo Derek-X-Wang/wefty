@@ -441,7 +441,15 @@ state probe fails; normal recovery reports `probe_failed`. Recovery reads the
 owner's switch before trusting a stopping mark; *off* always wins.
 
 A stopped host VM with no demand under `on-demand` has the closed capability
-reason `host_vm_idle`. Doctor treats that state and its reduced capability as
+reason `host_vm_idle`. Every idle suppression reports the configured helper's
+restorable set in `missing_capabilities`: `kind:oci`, `cgroup_v2`, configured
+runtime handlers, and the helper's Linux runtime platform for this node's
+configured architecture. It includes `computer` only when Computer room is
+configured. The set also retains the last positive OCI probe facts in memory,
+subject to that Computer-room rule. This works before any successful probe,
+after node-agent restart, and after off → on-demand with the host VM stopped.
+These missing capabilities are demand hints only; they do not advertise earned
+execution capability or bypass the normal functional probe. Doctor treats that state and its reduced capability as
 healthy, reads no guest diagnostics for that state, never starts the host VM,
 and displays the demand items when it runs. The watchdog repairs stopped or
 broken state only for `always-on`, or `on-demand` with known demand; it never

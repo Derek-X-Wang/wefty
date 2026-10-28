@@ -99,7 +99,8 @@ The flag only negotiates the reply format; it grants no runtime authority.
 Control plane first remains the supported upgrade order.
 An old L1's HTTP 400 `invalid_request` naming `accept_queued_oci_hint` causes
 one retry of the same poll without the field. The node agent remembers that
-fallback for the session and tries the opt-in again after reconnecting.
+fallback and tries the opt-in again after reconnecting or ten minutes,
+whichever comes first. Each poll makes at most one legacy fallback retry.
 Linux and unconfigured Mac node agents send the original request shape.
 
 For an opted-in reader, the reply can carry `queued_oci_work: true` when this
@@ -107,8 +108,10 @@ node does not advertise `kind:oci` and has
 queued OCI work whose routing tags match, or a Computer pinned here with
 Desired state `running`. Work bound to another node and services whose Desired
 state is stopped do not contribute. Required capabilities must be satisfiable
-by the node after restoring `kind:oci` and the OCI probe capabilities listed
-in its withdrawal observation (the capabilities advertised before going idle).
+by the node after restoring `kind:oci` and the OCI capabilities listed in its
+idle observation. The node agent derives that restoration set from helper and
+Computer-room configuration, unioned with its last positive probe in memory;
+it does not require a probe in this process before it can report idle demand.
 A missing runtime handler or host feature that it never advertised cannot
 produce a hint. Both workload-class polls observe all
 queued OCI demand, so one empty class does not erase the other class's hint.

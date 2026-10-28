@@ -226,6 +226,7 @@ func (a *Agent) ConfigureHostVMDemand(snapshot *lima.DemandState, queued QueuedO
 		if a.session.client.claimHints == nil {
 			a.session.client.claimHints = &claimHintState{}
 		}
+		a.session.client.claimHints.clock = a.capabilities.clock
 		a.session.client.claimHints.enabled.Store(a.session.registration.OS == "darwin" && snapshot != nil)
 	}
 	a.session.hostVM.mu.Lock()

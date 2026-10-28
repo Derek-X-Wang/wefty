@@ -439,6 +439,11 @@ func New(config Config) (*Agent, error) {
 			}
 		}
 	}
+	// The helper runs Linux on the configured node architecture. This fact is
+	// retained only as idle restoration demand until its probe earns admission.
+	if registration.Capabilities["kind:oci"] {
+		registration.Capabilities[l1.RuntimePlatformCapability("linux", architecture)] = true
+	}
 	capabilities := newCapabilityState(registration.Capabilities, config.CapabilityProbe, clock, config.CapabilityProbeTimeout, revisionFloor)
 	registration = applyCapabilityObservation(registration, capabilities.snapshot())
 	session := newAgentSession(

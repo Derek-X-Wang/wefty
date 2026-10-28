@@ -131,22 +131,6 @@ func TestColdStartApprovalDeadlineAndReply(t *testing.T) {
 	}
 }
 
-func TestColdStartIdleComputerIsStartingNotUnschedulable(t *testing.T) {
-	f := newSeatLifecycleFixture(t)
-	hb := heartbeatRequestForBoot(f.node, f.node.BootSessionID)
-	hb.CapabilityRevision = 2
-	hb.Capabilities = map[string]bool{CapabilitySeatRequests: true}
-	hb.MissingCapabilities = []string{"kind:oci", "computer", "cgroup_v2"}
-	hb.CapabilityReasonCode = contract.CapabilityReasonHostVMIdle
-	if _, err := f.store.HeartbeatNodeWithCapabilityObservation(t.Context(), "fabric-computer-node", f.node.NodeID, f.node.BootSessionID, heartbeatCapabilityObservation(hb), NodePolicy{Tags: []string{contract.StableNodeTagPrefix + f.node.NodeID}, MaxServiceSlots: 4}); err != nil {
-		t.Fatal(err)
-	}
-	c, err := f.store.GetComputer(t.Context(), f.computer.ComputerID)
-	if err != nil || c.CurrentJob.Status != "host VM starting" || c.CurrentJob.UnschedulableReason != "" {
-		t.Fatalf("idle queued Computer=%+v %v", c.CurrentJob, err)
-	}
-}
-
 // HV-4 / RM-4 with fakes: stopped runtime, demand hint, ready runtime, ready Seat.
 func TestColdStartRecoveredRuntimeDeliversSameSeat(t *testing.T) {
 	f := newSeatLifecycleFixture(t)

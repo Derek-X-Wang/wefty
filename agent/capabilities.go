@@ -113,6 +113,8 @@ type capabilityState struct {
 	probe                      CapabilityProbe
 	timeout                    time.Duration
 	base                       map[string]bool
+	configuredOCI              map[string]bool
+	lastPositiveOCI            map[string]bool
 	current                    contract.CapabilityObservation
 	lastProbe                  *contract.CapabilityObservation
 	pendingPublicationRevision int64
@@ -132,10 +134,20 @@ func newCapabilityState(
 		timeout = DefaultCapabilityProbeTimeout
 	}
 	base := normalizeConfiguredCapabilities(configured)
-	for capability := range base {
+	restorable := map[string]bool{}
+	for capability, enabled := range base {
 		if isOCIProbeCapability(capability) {
+			if enabled {
+				restorable[capability] = true
+			}
 			delete(base, capability)
 		}
+	}
+	// A configured helper provides cgroup support after start. Computer room
+	// is separate owner configuration, not inferred from a past probe.
+	if restorable["kind:oci"] {
+		restorable["cgroup_v2"] = true
+		restorable["computer"] = base[l1.CapabilitySeatRequests]
 	}
 	now := wallNow(clock).UTC().Round(0)
 	// Start above every revision a previous process on this node published, so
@@ -144,7 +156,7 @@ func newCapabilityState(
 	revision := revisionFloor.start()
 	revisionFloor.record(revision)
 	return &capabilityState{
-		clock: clock, probe: probe, timeout: timeout, base: base, revisionFloor: revisionFloor,
+		clock: clock, probe: probe, timeout: timeout, base: base, configuredOCI: restorable, revisionFloor: revisionFloor,
 		current: contract.CapabilityObservation{
 			Revision: revision, Capabilities: cloneCapabilities(base), ObservedAt: now, MissingCapabilities: []string{},
 		},
@@ -352,6 +364,20 @@ func (state *capabilityState) applyObservationLocked(result CapabilityProbeResul
 		}
 		missing["kind:oci"] = struct{}{}
 	}
+	// Idle describes a stopped, configured runtime. This is only restoration
+	// demand; execution still requires the normal positive functional probe.
+	if result.ReasonCode == contract.CapabilityReasonHostVMIdle {
+		for _, source := range []map[string]bool{state.configuredOCI, state.lastPositiveOCI} {
+			for capability, enabled := range source {
+				if enabled && isOCIProbeCapability(capability) {
+					missing[capability] = struct{}{}
+				}
+			}
+		}
+		if !state.base[l1.CapabilitySeatRequests] {
+			delete(missing, "computer")
+		}
+	}
 	for capability := range missing {
 		delete(capabilities, capability)
 	}
@@ -380,6 +406,9 @@ func (state *capabilityState) applyObservationLocked(result CapabilityProbeResul
 		ObservedAt: now, MissingCapabilities: missingCapabilities, ReasonCode: reason,
 	}
 	if probeCompleted {
+		if probeErr == nil {
+			state.lastPositiveOCI = cloneCapabilities(capabilities)
+		}
 		receipt := cloneCapabilityObservation(state.current)
 		state.lastProbe = &receipt
 	}

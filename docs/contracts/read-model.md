@@ -239,7 +239,8 @@ cannot turn that snapshot's retained intents into an empty page. Computer
 `unschedulable`; the persisted `state` remains unchanged. Queued OCI work
 matching an alive, claims-enabled node whose required capabilities can be
 satisfied by its current capabilities plus `kind:oci` and the OCI probe
-capabilities it withdrew before idle, and whose capability reason is
+capabilities reported as restorable from configuration or the last positive
+probe in its idle observation, and whose capability reason is
 `host_vm_idle` shows `status: "host VM starting"` and no
 `unschedulable_reason`. A bound service uses only its bound node for this
 projection. This is a computed status, not a new lifecycle state or closed
