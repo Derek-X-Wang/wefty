@@ -46,6 +46,7 @@ const (
 )
 
 type StoreOptions struct {
+	SeatStartWait                     time.Duration
 	SeatCommandMaxRuntime             time.Duration
 	SeatIdleWait                      time.Duration
 	SeatWarningWait                   time.Duration
@@ -80,6 +81,7 @@ type StoreOptions struct {
 
 // Store is the durable SQLite substrate for L1 queue operations.
 type Store struct {
+	seatStartWait                     time.Duration
 	seatCommandMaxRuntime             time.Duration
 	seatIdleWait                      time.Duration
 	seatWarningWait                   time.Duration
@@ -248,6 +250,12 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 		return nil, err
 	}
 
+	if options.SeatStartWait == 0 {
+		options.SeatStartWait = DefaultSeatStartWait
+	}
+	if options.SeatStartWait < 0 {
+		return nil, fmt.Errorf("l1: Seat start wait must be positive")
+	}
 	if options.SeatCommandMaxRuntime == 0 {
 		options.SeatCommandMaxRuntime = contract.DefaultSeatCommandRuntime
 	}
@@ -272,7 +280,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	db.SetMaxOpenConns(16)
 	store := &Store{
-		seatCommandMaxRuntime: options.SeatCommandMaxRuntime, seatIdleWait: options.SeatIdleWait, seatWarningWait: options.SeatWarningWait, computerIdleWait: options.ComputerIdleWait,
+		seatStartWait: options.SeatStartWait, seatCommandMaxRuntime: options.SeatCommandMaxRuntime, seatIdleWait: options.SeatIdleWait, seatWarningWait: options.SeatWarningWait, computerIdleWait: options.ComputerIdleWait,
 		db: db, logf: log.Printf, clock: clock, restartJitter: restartJitter, leaseDuration: leaseDuration, lateEvidenceWindow: lateEvidenceWindow,
 		nodeStaleAfter: nodeStaleAfter, nodeDeadAfter: nodeDeadAfter, serviceStabilityWindow: serviceStabilityWindow,
 		serviceLogRetentionBytes: serviceLogRetentionBytes, serviceLogRetentionAge: serviceLogRetentionAge,
@@ -3070,6 +3078,9 @@ func (s *Store) registerNode(ctx context.Context, identity fabric.Identity, regi
 	if err := refreshPrimaryGenerationObservation(ctx, tx, registration.NodeID, now); err != nil {
 		return Node{}, err
 	}
+	if err := armIdleNodeSeatDeadlines(ctx, tx, registration.NodeID); err != nil {
+		return Node{}, internalError(err, "arm idle host VM Seat deadlines")
+	}
 	node, err := getNode(ctx, tx, registration.NodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read registered node")
@@ -3222,6 +3233,9 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	if err := refreshPrimaryGenerationObservation(ctx, tx, nodeID, now); err != nil {
 		return Node{}, err
 	}
+	if err := armIdleNodeSeatDeadlines(ctx, tx, nodeID); err != nil {
+		return Node{}, internalError(err, "arm idle host VM Seat deadlines")
+	}
 	node, err := getNode(ctx, tx, nodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read heartbeating node")
@@ -3236,6 +3250,10 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 // admission, fencing, attempt creation, and lease establishment. Every
 // eligibility predicate is part of the UPDATE that wins the queued row.
 func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessionID, class string, excludedJobIDs ...string) (*Claim, error) {
+	return s.claimJob(ctx, identityNodeID, nodeID, bootSessionID, class, nil, excludedJobIDs...)
+}
+
+func (s *Store) claimJob(ctx context.Context, identityNodeID, nodeID, bootSessionID, class string, queued *bool, excludedJobIDs ...string) (*Claim, error) {
 	if class != contract.JobClassOneShot && class != contract.JobClassService {
 		return nil, protocolError(contract.ErrorInvalidRequest, "claim class must be %q or %q", contract.JobClassOneShot, contract.JobClassService)
 	}
@@ -3298,6 +3316,12 @@ func (s *Store) ClaimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	// finish. Only the node's real draining state above earns that code.
 	if !claimsEnabled {
 		return nil, nil
+	}
+	if queued != nil {
+		*queued, err = queuedOCIWork(ctx, tx, nodeID)
+		if err != nil {
+			return nil, internalError(err, "read queued OCI demand")
+		}
 	}
 	if class == contract.JobClassOneShot {
 		if _, err := tx.ExecContext(ctx, `UPDATE jobs

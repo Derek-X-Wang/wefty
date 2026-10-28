@@ -87,6 +87,44 @@ contract or history giving that lost Attempt a continuing lease. Inline
 lease/cancellation-deadline settlement preserves its existing lease value and
 row-count-driven accounting. Removal authority remains separate from leases.
 
+## Queued OCI demand hint (#1144)
+
+Only a darwin node agent with host VM demand configured sends
+`accept_queued_oci_hint: true` in the
+existing `POST /v1/agent/jobs/claim` request. This optional boolean defaults to
+false. An omitted or false value retains exactly the prior claim or empty
+HTTP 204 reply, with no hint fields, even when matching OCI work is queued.
+This keeps a new L1 safe for old node agents during the L1-first rolling upgrade.
+The flag only negotiates the reply format; it grants no runtime authority.
+Control plane first remains the supported upgrade order.
+An old L1's HTTP 400 `invalid_request` naming `accept_queued_oci_hint` causes
+one retry of the same poll without the field. The node agent remembers that
+fallback and tries the opt-in again after reconnecting or ten minutes,
+whichever comes first. Each poll makes at most one legacy fallback retry.
+Linux and unconfigured Mac node agents send the original request shape.
+
+For an opted-in reader, the reply can carry `queued_oci_work: true` when this
+node does not advertise `kind:oci` and has
+queued OCI work whose routing tags match, or a Computer pinned here with
+Desired state `running`. Work bound to another node and services whose Desired
+state is stopped do not contribute. Required capabilities must be satisfiable
+by the node after restoring `kind:oci` and the OCI capabilities listed in its
+idle observation. The node agent derives that restoration set from helper and
+Computer-room configuration, unioned with its last positive probe in memory;
+it does not require a probe in this process before it can report idle demand.
+A missing runtime handler or host feature that it never advertised cannot
+produce a hint. Both workload-class polls observe all
+queued OCI demand, so one empty class does not erase the other class's hint.
+A node with claims disabled receives no hint. A Linux node agent ignores it.
+
+A hint-only reply is HTTP 200 with only `queued_oci_work`; it grants no claim,
+Attempt, fence, credential or lease. A won process claim can carry the hint
+alongside its normal fields. HTTP 204 remains an empty poll without a hint.
+The hint is an observation, not a reservation; the ordinary atomic claim
+predicates still decide all execution authority. Nothing starts before owner
+approval: a pending Seat call alone is not queued OCI work. Approval publishes
+its Computer and thereby makes the node's next claim poll observe demand.
+
 ## Atomic claim and eligibility
 
 A claim is one SQLite transaction that verifies durable operator intent permits

@@ -162,6 +162,8 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 		wait = waitForContext
 	}
 	var cleanupDeadline time.Time
+	coldStartObserved := false
+	const coldStartMessage = "starting the host VM, about 1 minute"
 	for {
 		var result l1.SeatCallResult
 		err := clients.l1.do(ctx, http.MethodGet, "/v1/seat-requests/"+id, nil, nil, &result, http.StatusOK)
@@ -179,6 +181,14 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 		if result.SeatID != id {
 			return fmt.Errorf("Seat request response changed its ID")
 		}
+		if result.HostVMStarting && !coldStartObserved {
+			if !jsonOutput {
+				if _, err := fmt.Fprintln(stdout, coldStartMessage); err != nil {
+					return err
+				}
+			}
+			coldStartObserved = true
+		}
 		switch result.State {
 		case l1.SeatLive:
 			if result.Credential == "" {
@@ -189,18 +199,24 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 				return err
 			}
 			result.Credential = ""
+			result.HostVMStarting = coldStartObserved
+			message := ""
+			if coldStartObserved {
+				message = coldStartMessage
+			}
 			return withSeatReply(stdout, jsonOutput, id, result.UnreadEvents, func(output io.Writer) error {
 				if jsonOutput {
 					return writeJSON(output, struct {
 						l1.SeatCallResult
 						CredentialFile string `json:"credential_file"`
-					}{result, path})
+						Message        string `json:"message,omitempty"`
+					}{result, path, message})
 				}
 				_, err = fmt.Fprintf(output, "Seat %s ready on %s; credential stored in %s\n", id, result.ComputerID, path)
 				return err
 			})
 		case l1.SeatRefused, l1.SeatEnded, l1.SeatEnding:
-			if result.CleanupPending {
+			if result.CleanupPending && !strings.HasPrefix(result.Reason, "Seat start deadline exceeded") {
 				if cleanupDeadline.IsZero() {
 					cleanupDeadline = now().Add(seatCleanupWaitLimit)
 				}
@@ -211,6 +227,10 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 			outcome := seatCallRefusal(id, result.Reason)
 			if result.State != l1.SeatRefused {
 				outcome = &apiResponseError{APIError: contract.APIError{Code: seatErrorEnded, Message: "Seat ended: " + result.Reason, Details: map[string]any{"seat_id": id}}}
+			}
+			if coldStartObserved {
+				outcome.APIError.Details["host_vm_starting"] = true
+				outcome.APIError.Details["message"] = coldStartMessage
 			}
 			if result.CleanupPending {
 				outcome.APIError.Message += "; cleanup still pending; L1 continues cleanup; check again with wefty seat wait " + id

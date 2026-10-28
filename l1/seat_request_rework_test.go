@@ -168,6 +168,11 @@ func TestSeatRequestBadCleanupDoesNotBlockOtherCalls(t *testing.T) {
 
 func TestSeatRequestSlowFirstImagePullKeepsOriginalDeadline(t *testing.T) {
 	f := newSeatLifecycleFixture(t)
+	// A ready Mac already has a running host VM; image delivery is a warm start.
+	if _, err := f.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-computer-node"}, contract.NodeRegistration{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, RootInstanceID: "root", OS: "darwin", Architecture: "arm64", AgentVersion: "test", Capabilities: f.node.Capabilities, CapabilityRevision: 2, CapabilityObservedAt: f.clock.Now(), MissingCapabilities: []string{}}, NodePolicy{Tags: []string{contract.StableNodeTagPrefix + f.node.NodeID}, MaxServiceSlots: 4}, true); err != nil {
+		t.Fatal(err)
+	}
+
 	f.store.computerDefaultImage = "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)
 	poll := SeatCallPoll{SeatNodeRequest: SeatNodeRequest{NodeID: f.node.NodeID, BootSessionID: "boot"}, Room: DefaultComputerRoomConfig(6 << 30), HostEnabled: true, AnswerWait: time.Minute}
 	input := SeatCallInput{SeatID: fmt.Sprintf("seat_%032x", 906), NodeID: f.node.NodeID, Folder: "/workspace", Form: "dedicated", Network: "none"}
@@ -185,9 +190,13 @@ func TestSeatRequestSlowFirstImagePullKeepsOriginalDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	// EnsureImage pulls the pinned public image before the task and the helper's
-	// independent 60-second Seat timer can start. Two minutes is still in L1's
-	// existing ten-minute prestart infrastructure budget.
-	f.clock.Advance(2 * time.Minute)
+	// independent 60-second Seat timer can start. A running host VM keeps
+	// the prestart infrastructure budget plus one minute from start.
+	if !first.Deadline.Equal(f.clock.Now().Add(11 * time.Minute)) {
+		t.Fatalf("warm start deadline=%s, want eleven minutes from start", first.Deadline)
+	}
+	f.reopen(t)
+	f.clock.Advance(3*time.Minute + time.Second)
 	if _, err := f.store.PollSeatCalls(t.Context(), "fabric-computer-node", poll); err != nil {
 		t.Fatal(err)
 	}

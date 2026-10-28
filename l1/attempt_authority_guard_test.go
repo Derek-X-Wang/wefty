@@ -22,8 +22,8 @@ func TestAttemptAuthorityProtectedWritesRatchet(t *testing.T) {
 		site, reason string
 		count        int
 	}{
-		{"store.go:ClaimJob:detach", "Exhausted queued one-shot pre-start budget clears current binding and leaves replay untouched.", 1},
-		{"store.go:ClaimJob:replay | NULL", "Atomic claim installs the successor and clears predecessor replay; claim stays at its endpoint.", 1},
+		{"store.go:claimJob:detach", "Exhausted queued one-shot pre-start budget clears current binding and leaves replay untouched.", 1},
+		{"store.go:claimJob:replay | NULL", "Atomic claim installs the successor and clears predecessor replay; claim stays at its endpoint.", 1},
 		{"cancel.go:CancelJob:detach", "Queued one-shot cancellation clears current binding and leaves replay untouched.", 1},
 		{"store.go:SetAttemptPublication:health | CASE WHEN ? THEN healthy_since_ns ELSE NULL END", "CASE only retains existing health or clears it; it cannot establish health.", 1},
 		{"service_jobs.go:transitionServiceJob:health | CASE WHEN ? THEN NULL ELSE healthy_since_ns END", "CASE only clears or retains existing health; it cannot establish health.", 1},

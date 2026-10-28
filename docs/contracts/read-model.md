@@ -236,7 +236,17 @@ answer. Existence checks share the same moment as rows: a deleted Computer's
 intents return `not_found`, while a failure committed during an older snapshot
 cannot turn that snapshot's retained intents into an empty page. Computer
 `current_job.status` uses the job projector, including `restart-pending` and
-`unschedulable`; the persisted `state` remains unchanged. The CLI Computer table
+`unschedulable`; the persisted `state` remains unchanged. Queued OCI work
+matching an alive, claims-enabled node whose required capabilities can be
+satisfied by its current capabilities plus `kind:oci` and the OCI probe
+capabilities reported as restorable from configuration or the last positive
+probe in its idle observation, and whose capability reason is
+`host_vm_idle` shows `status: "host VM starting"` and no
+`unschedulable_reason`. A bound service uses only its bound node for this
+projection. This is a computed status, not a new lifecycle state or closed
+reason. While the runtime actually starts, `lima_stopped` or
+`helper_unreachable` may briefly project unschedulable until the ready
+capabilities return. The CLI Computer table
 shows computed status. Node facts and the clock are shared across a Computer page.
 Computer listings accept limits up to 1000, but project at most 250 rows per
 page, stop at the adaptive cutoff, and resume through `next_cursor`.

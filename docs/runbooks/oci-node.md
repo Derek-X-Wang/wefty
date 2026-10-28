@@ -659,14 +659,25 @@ Meaning: this agent version files a run's retention record under a name that can
 `host_vm_idle` is healthy when the owner switch is `on-demand` and the host VM
 is stopped with no demand. Doctor reads facts and never starts it. When the
 host VM runs, doctor lists the OCI work and helper directives keeping it on.
-The idle wait defaults to ten minutes. The graceful stop gets four minutes;
-force is allowed only after that timeout. Before startup, free space must meet
+The idle wait defaults to ten minutes. The graceful idle stop gets 90 seconds;
+force is allowed only after that timeout and keeps its own short bound (default
+30 seconds). This leaves time for the cold start inside the three-minute Seat
+approval deadline for requests that encounter `host_vm_idle`. Other starts
+keep the prestart budget plus one minute (11 minutes by default). During the
+roughly 25-second cold start, `lima_stopped` / `helper_unreachable` can briefly
+show unschedulable; the Seat wait continues within its persisted cold-start
+limit. Before startup, free space must meet
 the node's `--host-vm-minimum-free-bytes` setting (5 GiB by default). Free space
 on the host VM disk volume and retry if startup refuses for insufficient space.
 
-Until the L1 queued-work hint (#1144) lands, a queued Seat alone does not start
-an on-demand host VM; it starts only when other demand exists. Use `always-on`
-meanwhile when queued Seats must start without other demand.
+After owner approval, a Seat's queued Computer supplies demand through the
+claim-poll hint. An on-demand host VM starts automatically. The Seat reply says
+"starting the host VM, about 1 minute" and waits up to the L1
+`--seat-start-wait` setting (default three minutes from approval). A request
+during idle shutdown cancels it before shutdown starts, or waits for shutdown
+to finish and the host VM to start again. An owner command during shutdown
+says "the host VM is stopping; retry in a moment". The switch at `off` refuses
+the Seat immediately.
 
 A stalled or quarantined removal keeps the host VM on until cleanup ends, by
 design: cleanup counts as demand even after it releases its service Slot.

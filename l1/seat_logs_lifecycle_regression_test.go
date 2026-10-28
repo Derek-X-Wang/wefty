@@ -53,6 +53,9 @@ func TestSeatLogActiveNeverLiveSurvivesRetentionSweep(t *testing.T) {
 				t.Fatal(err)
 			}
 			if action != "wait" {
+				// Keep the approved, never-live Seat active across the retention
+				// sweep; this fixture tests log retention, not the start timeout.
+				reopenSeatLife(t, f, StoreOptions{SeatStartWait: 92 * 24 * time.Hour})
 				f.request(t, 1, true)
 				f.reserve(t, id, f.computer, 1, DefaultComputerRoomConfig(1<<30))
 			}

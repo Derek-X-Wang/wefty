@@ -2773,18 +2773,23 @@ func (s *Server) claimJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	identity := identityFromRequest(r)
-	claim, err := s.store.ClaimJob(
-		r.Context(), identity.NodeID, request.NodeID, request.BootSessionID, request.Class, request.ExcludedJobIDs...,
-	)
+	var reply ClaimPollResponse
+	var err error
+	if request.AcceptQueuedOCIHint {
+		reply, err = s.store.ClaimJobPoll(r.Context(), identity.NodeID, request.NodeID, request.BootSessionID, request.Class, request.ExcludedJobIDs...)
+	} else {
+		// Old readers can decode only an actual claim or the existing empty 204.
+		reply.Claim, err = s.store.ClaimJob(r.Context(), identity.NodeID, request.NodeID, request.BootSessionID, request.Class, request.ExcludedJobIDs...)
+	}
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if claim == nil {
+	if reply.Claim == nil && !reply.QueuedOCIWork {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	writeJSON(w, http.StatusOK, claim)
+	writeJSON(w, http.StatusOK, reply)
 }
 
 func (s *Server) renewLease(w http.ResponseWriter, r *http.Request) {

@@ -305,7 +305,7 @@ var driftRows = []driftRow{
 	{requestBody(agentDoc, "post", "/v1/agent/nodes/{node_id}/heartbeat"), typeOf[l1.HeartbeatRequest]()},
 	{requestBody(agentDoc, "post", "/v1/agent/nodes/{node_id}/drain"), typeOf[l1.DrainRequest]()},
 	{requestBody(agentDoc, "post", "/v1/agent/jobs/claim"), typeOf[l1.ClaimRequest]()},
-	{responseBody(agentDoc, "post", "/v1/agent/jobs/claim", "200"), typeOf[l1.Claim]()},
+	{responseBody(agentDoc, "post", "/v1/agent/jobs/claim", "200"), typeOf[l1.ClaimPollResponse]()},
 	{requestBody(agentDoc, "post", "/v1/agent/jobs/{job_id}/service-binding-proof"), typeOf[l1.ServiceBindingProofRequest]()},
 	{responseBody(agentDoc, "post", "/v1/agent/jobs/{job_id}/service-binding-proof", "200"), typeOf[l1.ServiceBindingProofResponse]()},
 	{requestBody(agentDoc, "post", "/v1/agent/jobs/{job_id}/image-reconciliation-failure"), typeOf[l1.ServiceImageReconciliationFailureRequest]()},

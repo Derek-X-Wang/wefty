@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -56,10 +57,20 @@ func (e *responseBodyError) Unwrap() error { return e.err }
 
 // Client calls the Fabric-authenticated L1 agent protocol.
 type Client struct {
+	claimHints       *claimHintState
 	baseURL          string
 	httpClient       *http.Client
 	transport        *http.Transport
 	operationTimeout time.Duration
+}
+
+const claimHintRetryInterval = 10 * time.Minute
+
+// Shared by transport-only client copies within a node-agent session.
+type claimHintState struct {
+	enabled    atomic.Bool
+	retryAfter atomic.Pointer[time.Time]
+	clock      Clock
 }
 
 // NewClient creates a client whose HTTP connections are obtained exclusively
@@ -85,7 +96,8 @@ func newClient(f fabric.Fabric, controlPlaneAddress string, operationTimeout tim
 		},
 	}
 	return &Client{
-		baseURL: "http://control-plane.invalid",
+		claimHints: &claimHintState{clock: systemClock{}},
+		baseURL:    "http://control-plane.invalid",
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   operationTimeout,
@@ -131,14 +143,28 @@ func (c *Client) Drain(ctx context.Context, nodeID, bootSessionID string) (l1.No
 }
 
 func (c *Client) Claim(ctx context.Context, nodeID, bootSessionID, class string, excludedJobIDs ...string) (*l1.Claim, error) {
-	var claim l1.Claim
-	noContent, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", l1.ClaimRequest{
-		NodeID: nodeID, BootSessionID: bootSessionID, Class: class, ExcludedJobIDs: excludedJobIDs,
-	}, &claim)
-	if err != nil || noContent {
-		return nil, err
+	reply, err := c.ClaimPoll(ctx, nodeID, bootSessionID, class, excludedJobIDs...)
+	return reply.Claim, err
+}
+
+func (c *Client) ClaimPoll(ctx context.Context, nodeID, bootSessionID, class string, excludedJobIDs ...string) (l1.ClaimPollResponse, error) {
+	var reply l1.ClaimPollResponse
+	acceptHint := c.claimHints != nil && c.claimHints.enabled.Load()
+	if acceptHint {
+		retryAfter := c.claimHints.retryAfter.Load()
+		acceptHint = retryAfter == nil || !c.claimHints.clock.Now().Before(*retryAfter)
 	}
-	return &claim, nil
+	request := l1.ClaimRequest{NodeID: nodeID, BootSessionID: bootSessionID, Class: class, ExcludedJobIDs: excludedJobIDs,
+		AcceptQueuedOCIHint: acceptHint}
+	_, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", request, &reply)
+	var refused *ProtocolError
+	if request.AcceptQueuedOCIHint && errors.As(err, &refused) && refused.StatusCode == http.StatusBadRequest && refused.APIError.Code == contract.ErrorInvalidRequest && strings.Contains(refused.APIError.Message, "accept_queued_oci_hint") {
+		retryAfter := c.claimHints.clock.Now().Add(claimHintRetryInterval)
+		c.claimHints.retryAfter.Store(&retryAfter)
+		request.AcceptQueuedOCIHint = false
+		_, err = c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", request, &reply)
+	}
+	return reply, err
 }
 
 func (c *Client) ProveServiceBinding(ctx context.Context, nodeID, bootSessionID, jobID string) (bool, error) {

@@ -26,6 +26,7 @@ import (
 // Only explicit settings are retained in the setup receipt, outside the
 // installed service environment inherited by process jobs.
 type setupComputerOptions struct {
+	SeatStartWait         *time.Duration `json:"seat_start_wait,omitempty"`
 	SeatCommandMaxRuntime *time.Duration `json:"seat_command_max_runtime,omitempty"`
 	SeatIdleWait          *time.Duration `json:"seat_idle_wait,omitempty"`
 	SeatWarningWait       *time.Duration `json:"seat_warning_wait,omitempty"`
@@ -37,6 +38,7 @@ type setupComputerOptions struct {
 }
 
 func bindSetupComputerFlags(flags *flag.FlagSet, values *setupComputerOptions) {
+	flags.Func("seat-start-wait", "Stopped host VM wait from owner approval (default 3m)", setupPositiveDuration("seat-start-wait", &values.SeatStartWait))
 	flags.Func("seat-command-max-runtime", fmt.Sprintf("default Seat command runtime (default %s)", contract.DefaultSeatCommandRuntime), func(raw string) error {
 		value, err := time.ParseDuration(raw)
 		if err != nil {
@@ -99,6 +101,9 @@ func setupPositiveDuration(name string, target **time.Duration) func(string) err
 }
 
 func (values *setupComputerOptions) merge(next setupComputerOptions) {
+	if next.SeatStartWait != nil {
+		values.SeatStartWait = next.SeatStartWait
+	}
 	if next.SeatCommandMaxRuntime != nil {
 		values.SeatCommandMaxRuntime = next.SeatCommandMaxRuntime
 	}
@@ -126,7 +131,7 @@ func (values *setupComputerOptions) merge(next setupComputerOptions) {
 }
 
 func (values setupComputerOptions) hasClusterSettings() bool {
-	return values.SeatCommandMaxRuntime != nil || values.Image != nil || values.SharedSeatLimit != nil || values.SeatIdleWait != nil || values.SeatWarningWait != nil || values.ComputerIdleWait != nil
+	return values.SeatStartWait != nil || values.SeatCommandMaxRuntime != nil || values.Image != nil || values.SharedSeatLimit != nil || values.SeatIdleWait != nil || values.SeatWarningWait != nil || values.ComputerIdleWait != nil
 }
 
 func (values setupComputerOptions) empty() bool {
@@ -160,7 +165,7 @@ func (values setupComputerOptions) arguments(cluster, node bool) []string {
 		for _, setting := range []struct {
 			name  string
 			value *time.Duration
-		}{{"seat-command-max-runtime", values.SeatCommandMaxRuntime}, {"seat-idle-wait", values.SeatIdleWait}, {"seat-warning-wait", values.SeatWarningWait}, {"computer-idle-wait", values.ComputerIdleWait}} {
+		}{{"seat-start-wait", values.SeatStartWait}, {"seat-command-max-runtime", values.SeatCommandMaxRuntime}, {"seat-idle-wait", values.SeatIdleWait}, {"seat-warning-wait", values.SeatWarningWait}, {"computer-idle-wait", values.ComputerIdleWait}} {
 			if setting.value != nil {
 				args = append(args, "--"+setting.name+"="+setting.value.String())
 			}
@@ -206,6 +211,7 @@ func applySetupComputerSettings(paths setupPaths, profile connprofile.Profile, s
 		var scoped setupComputerOptions
 		switch service.Label {
 		case setupL1Label:
+			scoped.SeatStartWait = values.SeatStartWait
 			scoped.SeatCommandMaxRuntime = values.SeatCommandMaxRuntime
 			scoped.Image, scoped.SharedSeatLimit = values.Image, values.SharedSeatLimit
 			scoped.SeatIdleWait, scoped.SeatWarningWait, scoped.ComputerIdleWait = values.SeatIdleWait, values.SeatWarningWait, values.ComputerIdleWait

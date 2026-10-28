@@ -144,6 +144,9 @@ func (s *Store) BeginSeatApproval(ctx context.Context, identityNodeID string, re
 	if err := saveSeatApproval(ctx, q, value, write.at); err != nil {
 		return SeatApproval{}, err
 	}
+	if err := s.armSeatCallDeadline(ctx, q, value, write.at); err != nil {
+		return SeatApproval{}, err
+	}
 	boot, ns, err := seatTime(s.clock)
 	if err != nil {
 		return SeatApproval{}, err
@@ -206,6 +209,9 @@ func (s *Store) AnswerSeatApproval(ctx context.Context, identityNodeID, seatID s
 		}
 	}
 	if err := saveSeatApproval(ctx, q, value, write.at); err != nil {
+		return SeatApproval{}, err
+	}
+	if err := s.armSeatCallDeadline(ctx, q, value, write.at); err != nil {
 		return SeatApproval{}, err
 	}
 	return value, write.commit()

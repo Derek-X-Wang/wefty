@@ -655,6 +655,9 @@ type ClaimRequest struct {
 	BootSessionID  string   `json:"boot_session_id"`
 	Class          string   `json:"class"`
 	ExcludedJobIDs []string `json:"excluded_job_ids,omitempty"`
+
+	// AcceptQueuedOCIHint permits the hint-only reply arm; omitted by old readers.
+	AcceptQueuedOCIHint bool `json:"accept_queued_oci_hint,omitempty"`
 }
 
 type RenewalRequest struct {

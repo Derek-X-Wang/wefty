@@ -31,6 +31,7 @@ type SeatCallResult struct {
 	SeatRequest
 	Credential     string `json:"credential,omitempty"`
 	CleanupPending bool   `json:"cleanup_pending"`
+	HostVMStarting bool   `json:"host_vm_starting,omitempty"`
 }
 type SeatCallPoll struct {
 	SeatNodeRequest
@@ -206,6 +207,10 @@ func (s *Store) GetSeatCall(ctx context.Context, caller, id string) (SeatCallRes
 			return err
 		}
 		result = SeatCallResult{SeatRequest: value, UnreadEvents: unread}
+		result.HostVMStarting, err = seatHostVMStarting(ctx, q, id)
+		if err != nil {
+			return err
+		}
 		if value.State == SeatLive {
 			result.Credential = secret
 		}
@@ -654,12 +659,9 @@ func (s *Store) expireUnpickedSeatCall(ctx context.Context, caller, id string) e
 	return write.commit()
 }
 
-// EnsureImage may pull and unpack the pinned default image before task start.
-// Reuse L1's bounded prestart infrastructure budget, plus the helper's own
-// 60-second endpoint-readiness interval. Start persists this duration once;
-// polling and replay never reset it, including while a Computer is queued.
-const seatCallEndpointReadinessWait = time.Minute
-
+// Warm starts retain the prestart infrastructure budget from start.
+// An armed cold-start deadline can only shorten this interval.
+// The helper separately keeps its own 60-second endpoint-readiness interval.
 func (s *Store) seatCallReadyWait() time.Duration {
-	return s.prestartInfrastructureBudget + seatCallEndpointReadinessWait
+	return s.prestartInfrastructureBudget + time.Minute
 }

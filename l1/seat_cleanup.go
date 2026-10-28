@@ -27,7 +27,11 @@ func markSeatReservationClean(ctx context.Context, q seatApprovalQuery, value Se
 // No wanted directive can exist before starting. Cancel that reservation, but
 // retain any possibly changed runtime charge once a helper caller has bound it.
 func cleanNeverStartedSeat(ctx context.Context, q seatApprovalQuery, value SeatRequest) error {
-	if !value.Deadline.IsZero() {
+	var published bool
+	if err := q.QueryRowContext(ctx, `SELECT seat_ready_wait_ns>0 FROM seat_approvals WHERE seat_id=?`, value.SeatID).Scan(&published); err != nil {
+		return err
+	}
+	if published {
 		return nil
 	}
 	if err := markSeatReservationClean(ctx, q, value); err != nil {

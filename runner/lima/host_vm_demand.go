@@ -10,7 +10,9 @@ import (
 )
 
 const DefaultHostVMIdleWait = 10 * time.Minute
-const DefaultHostVMIdleStopTimeout = 4 * time.Minute
+
+// Leave time for force-stop and cold start within the Seat approval deadline.
+const DefaultHostVMIdleStopTimeout = 90 * time.Second
 const DefaultHostVMMinimumFreeBytes uint64 = 5 << 30
 
 // DemandItem explains node-owned work that keeps the host VM running.
@@ -215,12 +217,15 @@ func (*HostVMIdleSkipError) CapabilityReasonCode() contract.CapabilityReasonCode
 func (barrier *SupervisedBootBarrier) OCIRecoverySkip(ctx context.Context) error {
 	s := barrier.Supervisor
 	facts := s.Facts()
-	if facts.Stopping {
-		return &HostVMIdleSkipError{}
-	}
 	intent, err := s.readIntent(ctx)
 	if err != nil {
 		return nil // Ordinary recovery owns intent errors; only known idle skips it.
+	}
+	if intent.PositionValue() == OCIPositionOff {
+		return nil
+	}
+	if facts.Stopping {
+		return &HostVMStoppingError{}
 	}
 	if intent.PositionValue() != OCIPositionOnDemand || facts.State != InstanceStopped {
 		return nil
@@ -234,4 +239,14 @@ func (barrier *SupervisedBootBarrier) OCIRecoverySkip(ctx context.Context) error
 		return &HostVMIdleSkipError{}
 	}
 	return nil
+}
+
+// HostVMStoppingError is a temporary refusal for owner operations. Recovery
+// resumes after the serialized shutdown finishes; it is not a broken runtime.
+type HostVMStoppingError struct{}
+
+func (*HostVMStoppingError) Error() string                { return "the host VM is stopping; retry in a moment" }
+func (e *HostVMStoppingError) HostVMStartRefusal() string { return e.Error() }
+func (*HostVMStoppingError) CapabilityReasonCode() contract.CapabilityReasonCode {
+	return contract.CapabilityReasonHostVMIdle
 }

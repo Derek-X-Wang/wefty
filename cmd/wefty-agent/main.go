@@ -1130,7 +1130,7 @@ func run() error {
 		go writeProofStartupReceipt(ctx, filepath.Dir(*ociSetupState), nodeAgent, bootBarrier, *nodeID, bootSessionID)
 	}
 	if supervisedBootBarrier != nil {
-		nodeAgent.ConfigureHostVMDemand(hostVMDemand, agent.NoQueuedOCIDemand{})
+		nodeAgent.ConfigureHostVMDemand(hostVMDemand, nil)
 		go supervisedBootBarrier.Run(ctx, nodeAgent.RecoverOCIRuntimeCapabilities, func(ctx context.Context) error { return nodeAgent.PollHostVM(ctx, supervisedBootBarrier) })
 	}
 	if *ociDoctorFacts != "" {

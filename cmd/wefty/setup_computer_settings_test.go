@@ -364,14 +364,14 @@ func TestSetupTimerSettingsPersistAndInstall(t *testing.T) {
 	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
 	var settings setupComputerOptions
 	bindSetupComputerFlags(flags, &settings)
-	if err := flags.Parse([]string{"--seat-idle-wait=40m", "--seat-warning-wait=6m", "--computer-idle-wait=12m"}); err != nil {
+	if err := flags.Parse([]string{"--seat-start-wait=90s", "--seat-idle-wait=40m", "--seat-warning-wait=6m", "--computer-idle-wait=12m"}); err != nil {
 		t.Fatal(err)
 	}
 	f.setup(t, setupRequest{computer: settings})
 	node := f.plist(t, setupNodeAgentLabel)
 	assertTimers := func(text string) {
 		t.Helper()
-		for _, want := range []string{"--seat-idle-wait=40m0s", "--seat-warning-wait=6m0s", "--computer-idle-wait=12m0s"} {
+		for _, want := range []string{"--seat-start-wait=1m30s", "--seat-idle-wait=40m0s", "--seat-warning-wait=6m0s", "--computer-idle-wait=12m0s"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("installed L1 lacks %s", want)
 			}
@@ -386,7 +386,7 @@ func TestSetupTimerSettingsPersistAndInstall(t *testing.T) {
 	}
 	f.setup(t, setupRequest{computer: settings})
 	changed := f.plist(t, setupL1Label)
-	for _, want := range []string{"--seat-idle-wait=40m0s", "--seat-warning-wait=6m0s", "--computer-idle-wait=15m0s"} {
+	for _, want := range []string{"--seat-start-wait=1m30s", "--seat-idle-wait=40m0s", "--seat-warning-wait=6m0s", "--computer-idle-wait=15m0s"} {
 		if !strings.Contains(changed, want) {
 			t.Errorf("changed settings lost %s", want)
 		}
@@ -396,7 +396,7 @@ func TestSetupTimerSettingsPersistAndInstall(t *testing.T) {
 		t.Fatal("timer settings were not retained, or a cluster setting changed the node service")
 	}
 	receipt, _ := json.Marshal(readSetupReceipt(t, f.home))
-	for _, key := range []string{"seat_idle_wait", "seat_warning_wait", "computer_idle_wait"} {
+	for _, key := range []string{"seat_start_wait", "seat_idle_wait", "seat_warning_wait", "computer_idle_wait"} {
 		if !strings.Contains(string(receipt), key) {
 			t.Errorf("receipt lacks %s", key)
 		}
@@ -419,7 +419,7 @@ func TestSetupTimerSettingsPersistAndInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"--seat-idle-wait=40m0s", "--seat-warning-wait=6m0s", "--computer-idle-wait=15m0s"} {
+	for _, want := range []string{"--seat-start-wait=1m30s", "--seat-idle-wait=40m0s", "--seat-warning-wait=6m0s", "--computer-idle-wait=15m0s"} {
 		if !strings.Contains(string(unit), want) {
 			t.Errorf("systemd unit lacks %s", want)
 		}
