@@ -420,7 +420,7 @@ func collectStatus(ctx context.Context, clients *apiClients) clusterStatus {
 	if note, ok := unschedulableRunsNote(stuck); ok {
 		status.Limitations = append(status.Limitations, note)
 	}
-	status.rollingStatusFields = collectRollingStatus(clients.nodeConfigPath, nodes, l1Status.Reachable, status.CheckedAt)
+	status.rollingStatusFields = collectRollingStatus(ctx, clients.nodeConfigPath, nodes, l1Status.Reachable, status.CheckedAt)
 	verifyRollingRuns(ctx, clients, &status.rollingStatusFields)
 	if status.UpgradeState != "" {
 		status.UpgradeRecovery = ""

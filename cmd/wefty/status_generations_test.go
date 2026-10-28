@@ -187,7 +187,7 @@ func TestRollingStatusClosedGenerationSummary(t *testing.T) {
 				nodes.Nodes[0].Generations[i].Role = l1.NodeGenerationClosed
 				nodes.Nodes[0].Generations[i].Attempts[0].State = generationAttemptState(contract.AttemptSucceeded)
 			}
-			r := collectRollingStatus("", nodes, true, now)
+			r := collectRollingStatus(t.Context(), "", nodes, true, now)
 			if tc.mutate != nil {
 				tc.mutate(&r)
 			}
@@ -292,7 +292,7 @@ func TestRollingStatusTextAndJSONFixtures(t *testing.T) {
 			if tc.mutate != nil {
 				tc.mutate(&nodes)
 			}
-			r := collectRollingStatus("", nodes, tc.reachable, now)
+			r := collectRollingStatus(t.Context(), "", nodes, tc.reachable, now)
 			if r.UpgradeState != tc.state || (len(r.findings()) > 0) != tc.problem {
 				t.Fatalf("projection=%+v findings=%+v", r, r.findings())
 			}
@@ -367,7 +367,7 @@ func TestRollingStatusReceiptPhasesAndReadOnly(t *testing.T) {
 					defer unlock()
 				}
 				before := diagnosticTree(t, home)
-				status := collectRollingStatus(paths.nodeConfig, generationStatusFixture(time.Now(), 1), true, time.Now())
+				status := collectRollingStatus(t.Context(), paths.nodeConfig, generationStatusFixture(time.Now(), 1), true, time.Now())
 				after := diagnosticTree(t, home)
 				if before != after {
 					t.Fatal("diagnostic wrote local files")
@@ -454,7 +454,7 @@ func TestRollingStatusUnreadableEvidenceContinues(t *testing.T) {
 			if err := os.WriteFile(name, []byte(payload), mode); err != nil {
 				t.Fatal(err)
 			}
-			got := collectRollingStatus(paths.nodeConfig, generationStatusFixture(time.Now(), 3), true, time.Now())
+			got := collectRollingStatus(t.Context(), paths.nodeConfig, generationStatusFixture(time.Now(), 3), true, time.Now())
 			if got.UpgradeState != "unverified" || len(got.EvidenceErrors) != 1 || len(got.Generations) != 4 {
 				t.Fatalf("%+v", got)
 			}
@@ -599,12 +599,12 @@ func TestRollingStatusCatalogAndUnreadableRetirement(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "catalog.json"), payload, 0600); err != nil {
 		t.Fatal(err)
 	}
-	got := collectRollingStatus(paths.nodeConfig, nodes, true, now)
+	got := collectRollingStatus(t.Context(), paths.nodeConfig, nodes, true, now)
 	if got.UpgradeState != "complete" || len(got.findings()) != 0 || len(got.Generations) != 2 {
 		t.Fatalf("healthy catalog: %+v", got)
 	}
 	// Missing authoritative reads must retain both local generations as unknown.
-	unknown := collectRollingStatus(paths.nodeConfig, l1.NodeList{}, false, now)
+	unknown := collectRollingStatus(t.Context(), paths.nodeConfig, l1.NodeList{}, false, now)
 	if unknown.UpgradeState != "unverified" || len(unknown.Generations) != 2 {
 		t.Fatalf("%+v", unknown)
 	}
@@ -618,7 +618,7 @@ func TestRollingStatusCatalogAndUnreadableRetirement(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := diagnosticTree(t, home)
-	got = collectRollingStatus(paths.nodeConfig, nodes, true, now)
+	got = collectRollingStatus(t.Context(), paths.nodeConfig, nodes, true, now)
 	if got.UpgradeState != "unverified" || len(got.Generations) != 2 || len(got.EvidenceErrors) != 1 || !strings.Contains(got.EvidenceErrors[0], "retirement acknowledgment") {
 		t.Fatalf("%+v", got)
 	}
@@ -658,7 +658,7 @@ func TestRollingStatusCountsOnlyVerifiedNonterminalRuns(t *testing.T) {
 			clients := &apiClients{l3: statusClient(t, "L3", "wefty://run-ledger", server)}
 			nodes := generationStatusFixture(time.Now(), 2)
 			nodes.Nodes[0].Generations[2].Attempts[0].RunID = "run-0"
-			got := collectRollingStatus("", nodes, true, time.Now())
+			got := collectRollingStatus(t.Context(), "", nodes, true, time.Now())
 			verifyRollingRuns(t.Context(), clients, &got)
 			if calls != 1 {
 				t.Fatalf("duplicate Run read %d", calls)
@@ -743,7 +743,7 @@ func TestRollingStatusCompletedReceiptRequiresWinnerEvidence(t *testing.T) {
 			if err := writeUpgradeRolling(paths, &receipt, "complete"); err != nil {
 				t.Fatal(err)
 			}
-			got := collectRollingStatus(paths.nodeConfig, generationStatusFixture(time.Now(), 3), true, time.Now())
+			got := collectRollingStatus(t.Context(), paths.nodeConfig, generationStatusFixture(time.Now(), 3), true, time.Now())
 			if got.UpgradeState != "unverified" || len(got.EvidenceErrors) == 0 || len(got.Generations) != 4 {
 				t.Fatalf("%+v", got)
 			}

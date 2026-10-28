@@ -217,7 +217,7 @@ func TestRound2UnreadableMaintenanceWithoutCatalog(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(paths.data, agentinstall.MaintenanceFile), []byte("{"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	got := collectRollingStatus(paths.nodeConfig, l1.NodeList{}, true, time.Now())
+	got := collectRollingStatus(t.Context(), paths.nodeConfig, l1.NodeList{}, true, time.Now())
 	if len(got.findings()) == 0 || !strings.Contains(strings.Join(got.EvidenceErrors, " "), "maintenance") {
 		t.Fatalf("unreadable maintenance disappeared: %+v", got)
 	}

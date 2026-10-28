@@ -922,8 +922,15 @@ unknown evidence uses warning, known Attempt loss uses error. Diagnosis reads
 local files without creating writable-folder probe files, control request files,
 or lock files, and performs no launchd mutations. Catalog and retirement-ack
 reads use a nonblocking diagnostic acquisition of the existing catalog lock;
-contention is unverified with its OS cause and does not delay the remaining
-evidence. Primary-label discovery uses the same bounded read path. Existing launchd state reads remain.
+the store never waits for a writer. CLI catalog readers, including primary-label
+discovery, retry only lock contention at short intervals for up to 2.5 seconds
+per read, within the context passed by the caller. Doctor's primary-label read
+uses its existing 15-second budget; deferred rolling diagnosis retains the outer
+command context. Persistent contention remains
+unverified with its OS cause: the catalog was busy, an upgrade or agent may be
+writing it, and the operator should rerun in a moment. Other access errors keep
+their existing repair advice and are reported without retries. Retirement-ack
+reads remain nonblocking. Existing launchd state reads remain.
 
 L1 Node list/detail reads add optional `generations` observations. They use the
 existing client read path and the existing `ReadOnly:true` snapshot transaction.

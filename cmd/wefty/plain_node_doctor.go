@@ -90,9 +90,13 @@ func runPlainDoctor(ctx context.Context, host setupHost, options globalOptions) 
 	}
 	budget, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	agentLabel, generationInstall, labelErr := plainDoctorAgentLabel(host)
+	agentLabel, generationInstall, labelErr := plainDoctorAgentLabel(budget, host)
 	if labelErr != nil {
-		add("primary-generation", "warning", "recorded primary generation unverified: "+labelErr.Error(), "restore catalog access and rerun doctor")
+		fix := "restore catalog access and rerun doctor"
+		if diagnosticCatalogBusy(labelErr) {
+			fix = "rerun doctor in a moment"
+		}
+		add("primary-generation", "warning", "recorded primary generation unverified: "+labelErr.Error(), fix)
 	}
 	labels := []string{setupL1Label, setupL3Label}
 	if agentLabel != "" {
@@ -366,7 +370,7 @@ func recordedNodePATH(payload []byte) (string, error) {
 // Generation enrollment removes the legacy node-agent label and plist. Diagnose
 // the recorded primary instead; stopped closed retirees are retained history,
 // and their Attempt/renewal evidence is assessed by the cohort projection.
-func plainDoctorAgentLabel(host setupHost) (string, bool, error) {
+func plainDoctorAgentLabel(ctx context.Context, host setupHost) (string, bool, error) {
 	home, err := filepath.EvalSymlinks(host.home)
 	if err != nil {
 		return setupNodeAgentLabel, false, nil
@@ -381,7 +385,7 @@ func plainDoctorAgentLabel(host setupHost) (string, bool, error) {
 	if _, err := os.Lstat(store.Root()); errors.Is(err, os.ErrNotExist) {
 		return setupNodeAgentLabel, false, nil
 	}
-	catalog, err := store.ReadDiagnostic()
+	catalog, err := readDiagnosticCatalog(ctx, store)
 	if err != nil {
 		return "", true, err
 	}
