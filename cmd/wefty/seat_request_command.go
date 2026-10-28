@@ -162,6 +162,7 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 		wait = waitForContext
 	}
 	var cleanupDeadline time.Time
+	coldStartPrinted := false
 	for {
 		var result l1.SeatCallResult
 		err := clients.l1.do(ctx, http.MethodGet, "/v1/seat-requests/"+id, nil, nil, &result, http.StatusOK)
@@ -178,6 +179,18 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 		}
 		if result.SeatID != id {
 			return fmt.Errorf("Seat request response changed its ID")
+		}
+		if result.HostVMStarting && !coldStartPrinted {
+			const message = "starting the host VM, about 1 minute"
+			if jsonOutput {
+				err = writeJSON(stdout, map[string]any{"seat_id": id, "host_vm_starting": true, "message": message})
+			} else {
+				_, err = fmt.Fprintln(stdout, message)
+			}
+			if err != nil {
+				return err
+			}
+			coldStartPrinted = true
 		}
 		switch result.State {
 		case l1.SeatLive:
@@ -200,7 +213,7 @@ func waitSeatCall(ctx context.Context, clients *apiClients, jsonOutput bool, id 
 				return err
 			})
 		case l1.SeatRefused, l1.SeatEnded, l1.SeatEnding:
-			if result.CleanupPending {
+			if result.CleanupPending && !strings.HasPrefix(result.Reason, "Seat start deadline exceeded") {
 				if cleanupDeadline.IsZero() {
 					cleanupDeadline = now().Add(seatCleanupWaitLimit)
 				}

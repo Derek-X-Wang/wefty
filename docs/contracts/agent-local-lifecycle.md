@@ -382,9 +382,13 @@ Backup, prune, restore, clone, reset and grow), and an owner `load-image`.
 Reimage and Custody export helper work also retain runtime authority. Cleanup
 counts until it finishes, including asynchronous calls that are still unwinding
 and durable removals recovered after a node-agent restart. An unreadable demand
-source prevents idle stop. `QueuedOCIDemand` is the #1144 hint seam; the current
-`NoQueuedOCIDemand` supplies none. It will read node-owned cached claim-poll
-facts, not perform a network request while holding the claim lock. No control
+source prevents idle stop. `QueuedOCIDemand` reads node-owned cached claim-poll
+facts. The new reader explicitly sends `accept_queued_oci_hint: true`; old
+readers receive only their existing claim/204 reply shapes and no hint fields.
+The Mac node agent replaces that cache on each successful poll, including
+an empty reply, and immediately republishes its demand snapshot. A Linux node
+agent ignores the hint. The demand read performs no network request under the
+claim lock. No control
 socket request accepts a demand value. The node control socket checks peer
 ancestry through native parent-PID reads in each connection handler, outside
 the accept loop. A descendant of the node agent or an unreadable ancestry
@@ -408,10 +412,22 @@ the command. Heartbeats skip OCI recovery while stopping; process claims,
 completion bookkeeping and doctor remain available. A node-agent restart
 reconciles the stopping mark with Lima state before watchdog recovery. The cycle
 runs graceful `limactl stop` with a
-separate four-minute timeout. Only a timeout permits `--force`; other failures
-remain failures and re-arm the idle wait before another attempt. This does not
-raise the ordinary thirty-second command budget.
-The #1144 start-race seam handles a request arriving after shutdown has begun.
+separate 90-second timeout (`DefaultHostVMIdleStopTimeout`). Only a timeout
+permits `--force`, with its independent short command bound (default 30 s). Other
+failures remain failures and re-arm the idle wait before another attempt. This does not
+raise the ordinary thirty-second command budget. A stalled shutdown consumes
+at most the graceful budget before force-stop; the fixed three-minute Seat
+approval deadline also covers force-stop and the subsequent cold start.
+A request received before shutdown cancels the idle stop at the claim or final
+cycle recheck and retains the pinned helper generation. Once shutdown starts,
+it finishes under the cycle lock. The claim-poll hint remains demand through
+that shutdown, so the watchdog then starts the host VM and earns a fresh ready
+generation. The Seat caller sees only the cold-start reply and its fixed
+approval deadline. An owner `oci always-on` or `load-image` during shutdown
+gets "the host VM is stopping; retry in a moment", rather than doctor advice.
+On node-agent restart, the stale stopping mark is cleared even if the Lima
+state probe fails; normal recovery reports `probe_failed`. Recovery reads the
+owner's switch before trusting a stopping mark; *off* always wins.
 
 A stopped host VM with no demand under `on-demand` has the closed capability
 reason `host_vm_idle`. Doctor treats that state and its reduced capability as

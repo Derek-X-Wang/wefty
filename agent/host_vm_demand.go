@@ -12,15 +12,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 )
 
-// QueuedOCIDemand is the #1144 claim-poll hint seam. Until it is supplied,
-// the node uses NoQueuedOCIDemand; the operator socket cannot supply a hint.
+// QueuedOCIDemand reads cached claim-poll facts, never operator input.
 type QueuedOCIDemand interface {
 	QueuedOCIWork(context.Context) ([]lima.DemandItem, error)
 }
-type NoQueuedOCIDemand struct{}
-
-func (NoQueuedOCIDemand) QueuedOCIWork(context.Context) ([]lima.DemandItem, error) { return nil, nil }
-
 type hostVMState struct {
 	stopping        atomic.Bool
 	idleLogged      atomic.Bool
@@ -30,6 +25,17 @@ type hostVMState struct {
 	directivePasses int
 	snapshot        *lima.DemandState
 	queued          QueuedOCIDemand
+	claimPoll       claimPollDemand
+	refresh         func(context.Context)
+}
+
+type claimPollDemand struct{ waiting bool }
+
+func (d claimPollDemand) QueuedOCIWork(context.Context) ([]lima.DemandItem, error) {
+	if d.waiting {
+		return []lima.DemandItem{{Kind: "queued-oci"}}, nil
+	}
+	return nil, nil
 }
 
 func (session *agentSession) observeHostVMDirectives(response l1.HeartbeatResponse) {
@@ -102,10 +108,10 @@ func (a *Agent) hostVMDemandLocked(ctx context.Context) ([]lima.DemandItem, erro
 		items = append(items, lima.DemandItem{Kind: "load-image"})
 	}
 	queued := state.queued
-	state.mu.Unlock()
 	if queued == nil {
-		queued = NoQueuedOCIDemand{}
+		queued = state.claimPoll
 	}
+	state.mu.Unlock()
 	waiting, err := queued.QueuedOCIWork(ctx)
 	if err != nil {
 		return nil, err
@@ -218,6 +224,7 @@ func (a *Agent) ConfigureHostVMDemand(snapshot *lima.DemandState, queued QueuedO
 	defer a.session.hostVM.mu.Unlock()
 	a.session.hostVM.snapshot = snapshot
 	a.session.hostVM.queued = queued
+	a.session.hostVM.refresh = a.refreshHostVMDemandLocked
 }
 func (a *Agent) refreshHostVMDemandLocked(ctx context.Context) {
 	items, err := a.hostVMDemandLocked(ctx)
@@ -414,4 +421,27 @@ func (a *Agent) EnableOnDemand(ctx context.Context, revision uint64) error {
 	a.capabilities.suppressOCI(contract.CapabilityReasonHostVMIdle, errors.New("host VM on demand; no runtime started"))
 	_, err = s.publishCapabilityHeartbeat(ctx, nil)
 	return err
+}
+
+// Owner recovery must distinguish an in-progress idle shutdown from failure.
+func (session *agentSession) hostVMOwnerRecoveryRefusal() error {
+	if session.hostVM.stopping.Load() {
+		return &lima.HostVMStoppingError{}
+	}
+	return nil
+}
+
+// The claim caller holds claimMu. Keep all demand sources, including durable
+// cleanup, when a successful poll refreshes the watchdog's snapshot.
+func (session *agentSession) observeClaimPollDemandLocked(ctx context.Context, waiting bool) {
+	if session.registration.OS != "darwin" {
+		return
+	}
+	session.hostVM.mu.Lock()
+	session.hostVM.claimPoll.waiting = waiting
+	refresh := session.hostVM.refresh
+	session.hostVM.mu.Unlock()
+	if refresh != nil {
+		refresh(ctx)
+	}
 }

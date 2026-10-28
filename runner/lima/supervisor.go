@@ -360,9 +360,6 @@ func (supervisor *Supervisor) recoveryNeeded(ctx context.Context, helperReady bo
 	resume := supervisor.resumeIdleStop
 	supervisor.mu.RUnlock()
 	if resume {
-		if inspectErr != nil {
-			return false
-		}
 		if err := supervisor.finishStopping(); err != nil {
 			return false
 		}

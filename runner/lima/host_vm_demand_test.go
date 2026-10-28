@@ -71,8 +71,8 @@ func TestIdleStopCancelsOnDemandAndForcesOnlyOnTimeout(t *testing.T) {
 			}, run: func(ctx context.Context, _ string, args ...string) ([]byte, error) {
 				calls = append(calls, args)
 				if len(args) == 2 {
-					if commandBudget != 4*time.Minute {
-						t.Fatal("idle stop retained 30-second command budget")
+					if commandBudget != 90*time.Second {
+						t.Fatal("idle stop must have its independent 90-second command budget")
 					}
 					return nil, failure
 				}

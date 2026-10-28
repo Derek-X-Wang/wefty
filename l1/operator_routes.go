@@ -480,6 +480,12 @@ func (r *databaseReads) serviceStatus(ctx context.Context, job Job) (Job, error)
 			return Job{}, err
 		}
 	}
+	if job.Status == "host VM starting" {
+		if service.BoundNodeID != "" {
+			service.NodeState = contract.NodeAlive
+		}
+		return job, nil
+	}
 	if service.BoundNodeID != "" {
 		var node placementFacts
 		var err error

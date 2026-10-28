@@ -6,6 +6,9 @@ import (
 )
 
 func seatApprovalNeedsExpiry(ctx context.Context, q queryer, v SeatRequest, now time.Time, clock Clock) (bool, error) {
+	if (v.State == SeatApproved || v.State == SeatStarting) && !v.Deadline.IsZero() {
+		return !now.Before(v.Deadline), nil
+	}
 	if v.State != SeatRequested {
 		return false, nil
 	}
@@ -43,7 +46,20 @@ func expireSeatApproval(ctx context.Context, q seatApprovalQuery, id string, now
 	if err != nil || !expired {
 		return err
 	}
-	return setSeatLifecycle(ctx, q, id, SeatRefused, "no answer from the owner", now)
+	reason := "no answer from the owner"
+	if v.State != SeatRequested {
+		reason, err = seatStartFailureReason(ctx, q, id)
+		if err != nil {
+			return err
+		}
+	}
+	if err := setSeatLifecycle(ctx, q, id, SeatRefused, reason, now); err != nil {
+		return err
+	}
+	if err := removeLifecycleSeat(ctx, q, v); err != nil {
+		return err
+	}
+	return cleanNeverStartedSeat(ctx, q, v)
 }
 
 // Normal reads remain read-only. An expired pending read enters a separate

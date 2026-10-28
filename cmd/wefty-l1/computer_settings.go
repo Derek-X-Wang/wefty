@@ -10,6 +10,7 @@ import (
 )
 
 type computerStartupFlags struct {
+	seatStartWait         time.Duration
 	seatCommandMaxRuntime time.Duration
 	seatIdleWait          time.Duration
 	seatWarningWait       time.Duration
@@ -20,6 +21,7 @@ type computerStartupFlags struct {
 
 func bindComputerStartupFlags(flags *flag.FlagSet) *computerStartupFlags {
 	values := &computerStartupFlags{}
+	flags.DurationVar(&values.seatStartWait, "seat-start-wait", l1.DefaultSeatStartWait, "Seat start limit from owner approval")
 	flags.DurationVar(&values.seatCommandMaxRuntime, "seat-command-max-runtime", contract.DefaultSeatCommandRuntime, "default maximum runtime of a Seat command")
 	flags.DurationVar(&values.seatIdleWait, "seat-idle-wait", l1.DefaultSeatIdleWait, "Seat idle wait after its latest activity")
 	flags.DurationVar(&values.seatWarningWait, "seat-warning-wait", l1.DefaultSeatWarningWait, "warning interval before Seat expiry")
@@ -36,12 +38,16 @@ func (values *computerStartupFlags) apply(options *l1.StoreOptions) error {
 	if values.sharedSeatLimit < 2 {
 		return errors.New("--computer-shared-seat-limit must be at least 2")
 	}
+	if values.seatStartWait <= 0 {
+		return errors.New("--seat-start-wait must be positive")
+	}
 	if values.seatIdleWait <= 0 || values.seatWarningWait <= 0 || values.seatWarningWait >= values.seatIdleWait || values.computerIdleWait <= 0 {
 		return errors.New("invalid Seat or Computer idle waits")
 	}
 	if err := l1.ValidateSeatCommandMaxRuntime(values.seatCommandMaxRuntime); err != nil {
 		return err
 	}
+	options.SeatStartWait = values.seatStartWait
 	options.SeatCommandMaxRuntime = values.seatCommandMaxRuntime
 	options.SeatIdleWait = values.seatIdleWait
 	options.SeatWarningWait = values.seatWarningWait

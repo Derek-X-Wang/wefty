@@ -416,7 +416,32 @@ it cannot change the input, caller, deadline, dialog or Seat membership. Without
 a receipt, an unknown ID remains not found (exit 4). Interrupting a wait leaves
 the node-owned request running and retains the ID. It does not deny approval.
 With `--json`, request emits an initial ID document followed by its terminal
-result document; wait emits only its terminal result. Refusals use the common
+result document; wait emits its terminal result. While an approved Seat waits
+for a Mac's OCI runtime, either command prints
+`starting the host VM, about 1 minute` once on stdout per invocation. In JSON
+mode it emits a progress document with `seat_id`, `host_vm_starting: true` and
+`message` containing that text. L1 exposes `host_vm_starting` on the pending
+Seat call result; a progress reply neither acknowledges an outcome nor grants
+a Seat credential.
+
+`wefty-l1 --seat-start-wait` sets the start limit (default `3m`), alongside the
+existing Seat and Computer startup waits. The owner can persist it with
+`wefty setup --seat-start-wait DURATION`; setup retains an omitted value and
+passes it only to L1, on both launchd and systemd. L1 fixes the deadline at owner
+approval, including approval through a window. Dispatch, waiting again, a
+restart of L1, or an idle-stop race cannot extend it. The existing readiness
+deadline column retains it; a delayed start uses the earlier deadline. On
+expiry, L1 refuses with `seat_start_failed`, the node's recorded capability
+reason and `run wefty node doctor`. The CLI returns that refusal immediately,
+even if cleanup remains pending. This deadline bounds the complete Seat start,
+including an image pull and endpoint readiness. The helper's separate
+60-second endpoint deadline still applies.
+
+The switch at *off* refuses before any dialog or start with `seat_host_off` and
+`the host VM is off`; *on demand* permits the cold start and *always on* keeps
+its running behavior. Idle shutdown itself is never a start-failure verdict;
+its pending request retains the same Seat ID and waits through recovery.
+Refusals use the common
 JSON error document on stderr, with `details.seat_id` and these codes:
 
 | Code | Message | Exit | Retryable |
@@ -436,7 +461,7 @@ No new process exit number is added. The whitelist in `main.go`, the shared
 command reporter and real-binary tests pin these typed conflict outcomes.
 A new Computer whose Seats never became Live settles a failed start through the
 existing verified removal protocol. After first observing a terminal outcome
-with `cleanup_pending`, each CLI wait gives cleanup up to one minute
+with `cleanup_pending`, each CLI wait (except an expired start deadline) gives cleanup up to one minute
 (`seatCleanupWaitLimit`). If cleanup remains pending, the CLI returns the
 original typed outcome and exit code, appends `cleanup still pending` and the
 same-ID wait command, and includes `details.cleanup_pending: true`. Cleanup

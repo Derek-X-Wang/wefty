@@ -165,12 +165,13 @@ func (r *databaseReads) node(ctx context.Context, id string) (Node, error) {
 // per-job projection costs one node query; a snapshot shares the same facts
 // across bound jobs and candidate scans.
 type placementFacts struct {
-	id              string
-	state           contract.NodeState
-	claimsEnabled   bool
-	capabilities    map[string]bool
-	tags            []string
-	maxServiceSlots int
+	capabilityReason contract.CapabilityReasonCode
+	id               string
+	state            contract.NodeState
+	claimsEnabled    bool
+	capabilities     map[string]bool
+	tags             []string
+	maxServiceSlots  int
 }
 type placementRead struct {
 	value placementFacts
@@ -212,7 +213,7 @@ func (r *databaseReads) placementRequirements(ctx context.Context, jobID string)
 
 func (r *databaseReads) loadPlacements(ctx context.Context, id string) error {
 	query := `SELECT nodes.node_id, nodes.state, nodes.claims_enabled, nodes.capabilities_json,
- nodes.max_service_slots, node_tags.tag FROM nodes LEFT JOIN node_tags ON node_tags.node_id=nodes.node_id`
+ nodes.max_service_slots, nodes.capability_reason_code, node_tags.tag FROM nodes LEFT JOIN node_tags ON node_tags.node_id=nodes.node_id`
 	var args []any
 	if id != "" {
 		query += " WHERE nodes.node_id=?"
@@ -229,7 +230,7 @@ func (r *databaseReads) loadPlacements(ctx context.Context, id string) error {
 		var value placementFacts
 		var caps []byte
 		var tag sql.NullString
-		if err = rows.Scan(&value.id, &value.state, &value.claimsEnabled, &caps, &value.maxServiceSlots, &tag); err != nil {
+		if err = rows.Scan(&value.id, &value.state, &value.claimsEnabled, &caps, &value.maxServiceSlots, &value.capabilityReason, &tag); err != nil {
 			break
 		}
 		prior, ok := loaded[value.id]

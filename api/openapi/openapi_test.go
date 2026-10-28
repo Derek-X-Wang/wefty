@@ -923,7 +923,7 @@ func TestL1PublishesAttemptCredentialSurface(t *testing.T) {
 	claim := object(t, object(t, agent["paths"], "paths")["/v1/agent/jobs/claim"], "claim path")
 	response := object(t, object(t, object(t, claim["post"], "claim post")["responses"], "responses")["200"], "claim 200")
 	schema := object(t, object(t, object(t, response["content"], "content")["application/json"], "media")["schema"], "claim schema")
-	if !stringSet(t, schema["required"])["attempt_token"] {
+	if !stringSet(t, object(t, schema["anyOf"].([]any)[0], "claimed reply")["required"])["attempt_token"] {
 		t.Fatal("claim response does not require attempt_token")
 	}
 }
@@ -1114,6 +1114,7 @@ func compileProtocolSchema(t *testing.T, location string) *jsonschema.Schema {
 	compiler := jsonschema.NewCompiler()
 	resources := map[string]string{
 		"file:///api/openapi/l3.v1.json":        "l3.v1.json",
+		"file:///api/openapi/l1-agent.v1.json":  "l1-agent.v1.json",
 		"file:///api/openapi/common.v1.json":    "common.v1.json",
 		"file:///api/openapi/l1-client.v1.json": "l1-client.v1.json",
 	}

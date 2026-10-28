@@ -478,6 +478,9 @@ func (s *Store) StartSeatRequest(ctx context.Context, identity, id string, reque
 		return value, protocolError(contract.ErrorConflict, "Seat has no approved room reservation")
 	}
 	deadline := write.at.Add(request.ReadyWait)
+	if !value.Deadline.IsZero() && value.Deadline.Before(deadline) {
+		deadline = value.Deadline
+	}
 	if request.ReadyWait <= 0 || deadline.UnixNano() <= write.at.UnixNano() {
 		if err := setSeatLifecycle(ctx, q, id, SeatRefused, "invalid Seat readiness wait", write.at); err != nil {
 			return value, err

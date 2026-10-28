@@ -237,10 +237,17 @@ func (r *databaseReads) queuedStatus(ctx context.Context, job Job) (Job, error) 
 	}
 	missingSet := make(map[string]struct{}, len(required))
 	candidates := len(nodes)
+	starting := false
 	for _, id := range nodes {
 		node, err := r.placement(ctx, id)
 		if err != nil {
 			return Job{}, internalError(err, "read capability placement candidate")
+		}
+		if job.ServiceJob != nil && job.ServiceJob.BoundNodeID != "" && job.ServiceJob.BoundNodeID != id {
+			continue
+		}
+		if job.Spec.Kind == contract.JobKindOCI && node.state == contract.NodeAlive && node.claimsEnabled && node.capabilityReason == contract.CapabilityReasonHostVMIdle {
+			starting = true
 		}
 		missing := MissingCapabilities(required, node.capabilities)
 		if len(missing) == 0 {
@@ -249,6 +256,11 @@ func (r *databaseReads) queuedStatus(ctx context.Context, job Job) (Job, error) 
 		for _, capability := range missing {
 			missingSet[capability] = struct{}{}
 		}
+	}
+	if starting {
+		job.Status = "host VM starting"
+		job.UnschedulableReason = ""
+		return job, nil
 	}
 	if candidates == 0 {
 		for _, capability := range required {

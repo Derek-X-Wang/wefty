@@ -665,6 +665,9 @@ func (session *agentSession) recoverOCIRuntimePublished(ctx context.Context, val
 		return err
 	}
 	defer session.ociRecoveryMu.Unlock()
+	if err := session.hostVMOwnerRecoveryRefusal(); err != nil {
+		return err
+	}
 	if validateIntent != nil {
 		if err := validateIntent(); err != nil {
 			return err
@@ -1692,9 +1695,13 @@ func (session *agentSession) claim(
 	for jobID := range session.residentJobID {
 		excluded = append(excluded, jobID)
 	}
-	claim, err := session.client.Claim(
+	reply, err := session.client.ClaimPoll(
 		ctx, session.registration.NodeID, session.registration.BootSessionID, selector, excluded...,
 	)
+	claim := reply.Claim
+	if err == nil {
+		session.observeClaimPollDemandLocked(ctx, reply.QueuedOCIWork)
+	}
 	if err != nil || claim == nil {
 		return claim, true, err
 	}

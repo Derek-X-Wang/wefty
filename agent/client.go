@@ -131,14 +131,16 @@ func (c *Client) Drain(ctx context.Context, nodeID, bootSessionID string) (l1.No
 }
 
 func (c *Client) Claim(ctx context.Context, nodeID, bootSessionID, class string, excludedJobIDs ...string) (*l1.Claim, error) {
-	var claim l1.Claim
-	noContent, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", l1.ClaimRequest{
-		NodeID: nodeID, BootSessionID: bootSessionID, Class: class, ExcludedJobIDs: excludedJobIDs,
-	}, &claim)
-	if err != nil || noContent {
-		return nil, err
-	}
-	return &claim, nil
+	reply, err := c.ClaimPoll(ctx, nodeID, bootSessionID, class, excludedJobIDs...)
+	return reply.Claim, err
+}
+
+func (c *Client) ClaimPoll(ctx context.Context, nodeID, bootSessionID, class string, excludedJobIDs ...string) (l1.ClaimPollResponse, error) {
+	var reply l1.ClaimPollResponse
+	_, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", l1.ClaimRequest{
+		NodeID: nodeID, BootSessionID: bootSessionID, Class: class, ExcludedJobIDs: excludedJobIDs, AcceptQueuedOCIHint: true,
+	}, &reply)
+	return reply, err
 }
 
 func (c *Client) ProveServiceBinding(ctx context.Context, nodeID, bootSessionID, jobID string) (bool, error) {

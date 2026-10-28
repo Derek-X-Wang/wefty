@@ -87,6 +87,31 @@ contract or history giving that lost Attempt a continuing lease. Inline
 lease/cancellation-deadline settlement preserves its existing lease value and
 row-count-driven accounting. Removal authority remains separate from leases.
 
+## Queued OCI demand hint (#1144)
+
+Only a new node agent reader sends `accept_queued_oci_hint: true` in the
+existing `POST /v1/agent/jobs/claim` request. This optional boolean defaults to
+false. An omitted or false value retains exactly the prior claim or empty
+HTTP 204 reply, with no hint fields, even when matching OCI work is queued.
+This keeps a new L1 safe for old node agents during the L1-first rolling upgrade.
+The flag only negotiates the reply format; it grants no runtime authority.
+
+For an opted-in reader, the reply can carry `queued_oci_work: true` when this
+node does not advertise `kind:oci` and has
+queued OCI work whose routing tags match, or a Computer pinned here with
+Desired state `running`. Work bound to another node and services whose Desired
+state is stopped do not contribute. Both workload-class polls observe all
+queued OCI demand, so one empty class does not erase the other class's hint.
+A node with claims disabled receives no hint. A Linux node agent ignores it.
+
+A hint-only reply is HTTP 200 with only `queued_oci_work`; it grants no claim,
+Attempt, fence, credential or lease. A won process claim can carry the hint
+alongside its normal fields. HTTP 204 remains an empty poll without a hint.
+The hint is an observation, not a reservation; the ordinary atomic claim
+predicates still decide all execution authority. Nothing starts before owner
+approval: a pending Seat call alone is not queued OCI work. Approval publishes
+its Computer and thereby makes the node's next claim poll observe demand.
+
 ## Atomic claim and eligibility
 
 A claim is one SQLite transaction that verifies durable operator intent permits
