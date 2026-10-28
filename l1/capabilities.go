@@ -246,7 +246,7 @@ func (r *databaseReads) queuedStatus(ctx context.Context, job Job) (Job, error) 
 		if job.ServiceJob != nil && job.ServiceJob.BoundNodeID != "" && job.ServiceJob.BoundNodeID != id {
 			continue
 		}
-		if job.Spec.Kind == contract.JobKindOCI && node.state == contract.NodeAlive && node.claimsEnabled && node.capabilityReason == contract.CapabilityReasonHostVMIdle {
+		if job.Spec.Kind == contract.JobKindOCI && node.state == contract.NodeAlive && node.claimsEnabled && node.capabilityReason == contract.CapabilityReasonHostVMIdle && len(MissingCapabilities(required, hostVMRestorableCapabilities(node.capabilities, node.missingCapabilities))) == 0 {
 			starting = true
 		}
 		missing := MissingCapabilities(required, node.capabilities)

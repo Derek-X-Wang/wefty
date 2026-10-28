@@ -87,6 +87,7 @@ func (s *Store) migrateSeatLifecycle(ctx context.Context) error {
 		{"lifecycle_reason", "TEXT NOT NULL DEFAULT ''"},
 		{"seat_deadline_ns", "INTEGER NOT NULL DEFAULT 0"},
 		{"seat_ready_wait_ns", "INTEGER NOT NULL DEFAULT 0"},
+		{"host_vm_wait_deadline_ns", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if err := s.ensureColumn(ctx, "seat_approvals", col.name, col.definition); err != nil {
 			return err

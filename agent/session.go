@@ -267,6 +267,9 @@ func (session *agentSession) suppressOCIBeforeBootSweep(ctx context.Context) {
 }
 
 func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
+	if session.client.claimHints != nil {
+		session.client.claimHints.unsupported.Store(false)
+	}
 	if session.isRetiring() {
 		return l1.Node{}, errors.New("retiring generation cannot register")
 	}

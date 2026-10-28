@@ -3078,6 +3078,9 @@ func (s *Store) registerNode(ctx context.Context, identity fabric.Identity, regi
 	if err := refreshPrimaryGenerationObservation(ctx, tx, registration.NodeID, now); err != nil {
 		return Node{}, err
 	}
+	if err := armIdleNodeSeatDeadlines(ctx, tx, registration.NodeID); err != nil {
+		return Node{}, internalError(err, "arm idle host VM Seat deadlines")
+	}
 	node, err := getNode(ctx, tx, registration.NodeID)
 	if err != nil {
 		return Node{}, internalError(err, "read registered node")
@@ -3229,6 +3232,9 @@ func (s *Store) heartbeatNode(ctx context.Context, identityNodeID, nodeID, bootS
 	}
 	if err := refreshPrimaryGenerationObservation(ctx, tx, nodeID, now); err != nil {
 		return Node{}, err
+	}
+	if err := armIdleNodeSeatDeadlines(ctx, tx, nodeID); err != nil {
+		return Node{}, internalError(err, "arm idle host VM Seat deadlines")
 	}
 	node, err := getNode(ctx, tx, nodeID)
 	if err != nil {

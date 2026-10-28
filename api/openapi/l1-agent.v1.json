@@ -1587,7 +1587,7 @@
       "post": {
         "operationId": "claimJob",
         "summary": "Atomically claim one eligible queued job in one workload class",
-        "description": "Eligibility, class capacity, service binding, and agent-local job exclusions are evaluated inside the claim transaction using authenticated authoritative node policy. Exclusions prevent this boot session from re-claiming a job whose prior attempt is still being finalized locally. The request intentionally contains no tags or capacity. Only a reader that explicitly sends accept_queued_oci_hint:true can receive queued_oci_work when kind:oci is absent; a hint-only 200 creates no Attempt or lease. Omitted or false preserves the existing claim or empty 204 reply, with no hint fields. Linux node agents ignore the hint.",
+        "description": "Eligibility, class capacity, service binding, and agent-local job exclusions are evaluated inside the claim transaction using authenticated authoritative node policy. Exclusions prevent this boot session from re-claiming a job whose prior attempt is still being finalized locally. The request intentionally contains no tags or capacity. Only a reader that explicitly sends accept_queued_oci_hint:true can receive queued_oci_work when kind:oci is absent; a hint-only 200 creates no Attempt or lease. Omitted or false preserves the existing claim or empty 204 reply, with no hint fields. Only darwin node agents with host VM demand configured opt in; old-L1 invalid_request naming the field triggers one legacy retry and session fallback until reconnect.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1626,7 +1626,7 @@
                     { "required": ["queued_oci_work"], "not": { "anyOf": [{"required":["job"]}, {"required":["lease"]}, {"required":["attempt_token"]}] } }
                   ],
                   "properties": {
-                    "queued_oci_work": { "type": "boolean", "const": true, "description": "Queued OCI work matches this node, or a Computer pinned here desires running, while kind:oci is absent. No reservation, claim or lease. Linux node agents ignore it." },
+                    "queued_oci_work": { "type": "boolean", "const": true, "description": "Queued OCI work matches this node, or a Computer pinned here desires running, while kind:oci is absent. Required capabilities must be satisfiable after restoring kind:oci and the OCI probe capabilities withdrawn before idle. No reservation, claim or lease." },
                     "job": { "$ref": "./common.v1.json#/components/schemas/Job" },
                     "lease": { "$ref": "./common.v1.json#/components/schemas/AttemptLease" },
                     "attempt_token": {

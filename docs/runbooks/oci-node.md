@@ -662,7 +662,11 @@ host VM runs, doctor lists the OCI work and helper directives keeping it on.
 The idle wait defaults to ten minutes. The graceful idle stop gets 90 seconds;
 force is allowed only after that timeout and keeps its own short bound (default
 30 seconds). This leaves time for the cold start inside the three-minute Seat
-approval deadline. Before startup, free space must meet
+approval deadline for requests that encounter `host_vm_idle`. Other starts
+keep the prestart budget plus one minute (11 minutes by default). During the
+roughly 25-second cold start, `lima_stopped` / `helper_unreachable` can briefly
+show unschedulable; the Seat wait continues within its persisted cold-start
+limit. Before startup, free space must meet
 the node's `--host-vm-minimum-free-bytes` setting (5 GiB by default). Free space
 on the host VM disk volume and retry if startup refuses for insufficient space.
 

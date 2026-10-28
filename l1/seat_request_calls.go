@@ -659,8 +659,9 @@ func (s *Store) expireUnpickedSeatCall(ctx context.Context, caller, id string) e
 	return write.commit()
 }
 
-// The caller's fixed approval deadline covers image delivery and readiness.
+// Warm starts retain the prestart infrastructure budget from start.
+// An armed cold-start deadline can only shorten this interval.
 // The helper separately keeps its own 60-second endpoint-readiness interval.
 func (s *Store) seatCallReadyWait() time.Duration {
-	return s.seatStartWait
+	return s.prestartInfrastructureBudget + time.Minute
 }

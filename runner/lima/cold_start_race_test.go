@@ -112,7 +112,7 @@ func TestColdStartIdleStopStalledShutdownThenReadySeat(t *testing.T) {
 	}
 	defer store.Close()
 	caps := map[string]bool{l1.CapabilitySeatRequests: true}
-	node, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-cold"}, contract.NodeRegistration{NodeID: "cold", BootSessionID: "boot", RootInstanceID: "root", OS: "darwin", Architecture: "arm64", AgentVersion: "test", Capabilities: caps, CapabilityRevision: 1, CapabilityObservedAt: now, MissingCapabilities: []string{"kind:oci"}, CapabilityReasonCode: contract.CapabilityReasonHostVMIdle}, l1.NodePolicy{Tags: []string{contract.StableNodeTagPrefix + "cold"}, MaxServiceSlots: 4}, true)
+	node, err := store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-cold"}, contract.NodeRegistration{NodeID: "cold", BootSessionID: "boot", RootInstanceID: "root", OS: "darwin", Architecture: "arm64", AgentVersion: "test", Capabilities: caps, CapabilityRevision: 1, CapabilityObservedAt: now, MissingCapabilities: []string{"kind:oci", "computer", "cgroup_v2"}, CapabilityReasonCode: contract.CapabilityReasonHostVMIdle}, l1.NodePolicy{Tags: []string{contract.StableNodeTagPrefix + "cold"}, MaxServiceSlots: 4}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

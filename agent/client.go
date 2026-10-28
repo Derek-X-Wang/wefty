@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -56,10 +57,17 @@ func (e *responseBodyError) Unwrap() error { return e.err }
 
 // Client calls the Fabric-authenticated L1 agent protocol.
 type Client struct {
+	claimHints       *claimHintState
 	baseURL          string
 	httpClient       *http.Client
 	transport        *http.Transport
 	operationTimeout time.Duration
+}
+
+// Shared by transport-only client copies within a node-agent session.
+type claimHintState struct {
+	enabled     atomic.Bool
+	unsupported atomic.Bool
 }
 
 // NewClient creates a client whose HTTP connections are obtained exclusively
@@ -85,7 +93,8 @@ func newClient(f fabric.Fabric, controlPlaneAddress string, operationTimeout tim
 		},
 	}
 	return &Client{
-		baseURL: "http://control-plane.invalid",
+		claimHints: &claimHintState{},
+		baseURL:    "http://control-plane.invalid",
 		httpClient: &http.Client{
 			Transport: transport,
 			Timeout:   operationTimeout,
@@ -137,9 +146,15 @@ func (c *Client) Claim(ctx context.Context, nodeID, bootSessionID, class string,
 
 func (c *Client) ClaimPoll(ctx context.Context, nodeID, bootSessionID, class string, excludedJobIDs ...string) (l1.ClaimPollResponse, error) {
 	var reply l1.ClaimPollResponse
-	_, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", l1.ClaimRequest{
-		NodeID: nodeID, BootSessionID: bootSessionID, Class: class, ExcludedJobIDs: excludedJobIDs, AcceptQueuedOCIHint: true,
-	}, &reply)
+	request := l1.ClaimRequest{NodeID: nodeID, BootSessionID: bootSessionID, Class: class, ExcludedJobIDs: excludedJobIDs,
+		AcceptQueuedOCIHint: c.claimHints != nil && c.claimHints.enabled.Load() && !c.claimHints.unsupported.Load()}
+	_, err := c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", request, &reply)
+	var refused *ProtocolError
+	if request.AcceptQueuedOCIHint && errors.As(err, &refused) && refused.StatusCode == http.StatusBadRequest && refused.APIError.Code == contract.ErrorInvalidRequest && strings.Contains(refused.APIError.Message, "accept_queued_oci_hint") {
+		c.claimHints.unsupported.Store(true)
+		request.AcceptQueuedOCIHint = false
+		_, err = c.postAllowNoContent(ctx, "/v1/agent/jobs/claim", request, &reply)
+	}
 	return reply, err
 }
 

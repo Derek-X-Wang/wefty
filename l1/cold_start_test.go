@@ -111,6 +111,24 @@ func TestColdStartApprovalDeadlineAndReply(t *testing.T) {
 	if err != nil || result.State != SeatRefused || !strings.Contains(result.Reason, "prerequisite_missing") || !strings.Contains(result.Reason, "wefty node doctor") {
 		t.Fatalf("deadline refusal=%+v %v", result, err)
 	}
+	page, err := f.store.GetSeatLogs(t.Context(), "cli", input.SeatID, "", "", 100)
+	if err != nil || len(page.Events) == 0 || page.Events[len(page.Events)-1].Kind != SeatEventRefused {
+		t.Fatalf("expiry log=%+v err=%v", page, err)
+	}
+	// Never-live refused history ages from the original request, not refusal.
+	f.clock.Advance(DefaultComputerTakeoverAuditRetentionAge - 3*time.Minute - time.Nanosecond)
+	swept, err := f.store.Reconcile(t.Context())
+	if err != nil || swept.PrunedSeatLogs != 0 {
+		t.Fatalf("early log sweep=%+v err=%v", swept, err)
+	}
+	f.clock.Advance(time.Nanosecond)
+	swept, err = f.store.Reconcile(t.Context())
+	if err != nil || swept.PrunedSeatLogs != 1 {
+		t.Fatalf("refused log sweep=%+v err=%v", swept, err)
+	}
+	if _, err := f.store.GetSeatLogs(t.Context(), "cli", input.SeatID, "", "", 100); errorCode(err) != contract.ErrorNotFound {
+		t.Fatalf("expired history survived: %v", err)
+	}
 }
 
 func TestColdStartIdleComputerIsStartingNotUnschedulable(t *testing.T) {
@@ -160,9 +178,10 @@ func TestColdStartRecoveredRuntimeDeliversSameSeat(t *testing.T) {
 		t.Fatal(err)
 	}
 	value, err := f.store.AdvanceSeatCall(t.Context(), "fabric-computer-node", id, poll)
-	if err != nil || value.State != SeatStarting {
-		t.Fatalf("start=%+v %v", value, err)
+	if err != nil || value.State != SeatStarting || !value.Deadline.Equal(approvedAt.Add(3*time.Minute)) {
+		t.Fatalf("start after idle withdrawal=%+v %v", value, err)
 	}
+	f.reopen(t)
 	hint, err := f.store.ClaimJobPoll(t.Context(), "fabric-computer-node", f.node.NodeID, f.node.BootSessionID, contract.JobClassService)
 	if err != nil || !hint.QueuedOCIWork || hint.Claim != nil {
 		t.Fatalf("stopped runtime hint=%+v %v", hint, err)
@@ -278,6 +297,64 @@ func TestColdStartClaimPollNegotiatesHintReader(t *testing.T) {
 			}
 			if !tc.process && (fields["job"] != nil || fields["lease"] != nil || fields["attempt_token"] != nil) {
 				t.Fatalf("hint minted authority: %s", body)
+			}
+		})
+	}
+}
+
+func TestColdStartReplyRequiresIdleNode(t *testing.T) {
+	for _, reason := range []contract.CapabilityReasonCode{contract.CapabilityReasonHostVMIdle, contract.CapabilityReasonPrerequisiteMissing, contract.CapabilityReasonLimaStopped, contract.CapabilityReasonHelperUnreachable} {
+		t.Run(string(reason), func(t *testing.T) {
+			f := newSeatLifecycleFixture(t)
+			id := "seat_00000000000000000000000000001244"
+			if _, err := f.store.CreateSeatCall(t.Context(), "cli", SeatCallInput{SeatID: id, NodeID: f.node.NodeID, Folder: "/workspace", Form: "any", Network: "none"}); err != nil {
+				t.Fatal(err)
+			}
+			reg := contract.NodeRegistration{NodeID: f.node.NodeID, BootSessionID: f.node.BootSessionID, RootInstanceID: "root", OS: "darwin", Architecture: "arm64", AgentVersion: "test", Capabilities: map[string]bool{CapabilitySeatRequests: true}, CapabilityRevision: 2, CapabilityObservedAt: f.clock.Now(), MissingCapabilities: []string{"kind:oci"}, CapabilityReasonCode: reason}
+			if _, err := f.store.RegisterNode(t.Context(), fabric.Identity{NodeID: "fabric-computer-node"}, reg, NodePolicy{Tags: []string{contract.StableNodeTagPrefix + f.node.NodeID}, MaxServiceSlots: 4}, true); err != nil {
+				t.Fatal(err)
+			}
+			f.request(t, 0x1244, true)
+			result, err := f.store.GetSeatCall(t.Context(), "cli", id)
+			if err != nil || result.HostVMStarting != (reason == contract.CapabilityReasonHostVMIdle) {
+				t.Fatalf("reply=%+v err=%v", result, err)
+			}
+			if reason != contract.CapabilityReasonHostVMIdle && !result.Deadline.IsZero() {
+				t.Fatalf("broken warm runtime acquired cold deadline: %+v", result)
+			}
+		})
+	}
+}
+
+func TestColdStartHintRequiresRestorableCapabilities(t *testing.T) {
+	for _, handler := range []string{"runc", "cannot-run"} {
+		t.Run(handler, func(t *testing.T) {
+			h := newIntegrationHarness(t, nil)
+			node := registerCapabilityNode(t, h, "cold", map[string]bool{"kind:process": true, "kind:oci": true, "runtime_handler:runc": true})
+			hb := heartbeatRequestForBoot(node, node.BootSessionID)
+			hb.CapabilityRevision = node.CapabilityRevision + 1
+			hb.Capabilities = map[string]bool{"kind:process": true}
+			hb.MissingCapabilities = []string{"kind:oci", "runtime_handler:runc"}
+			hb.CapabilityReasonCode = contract.CapabilityReasonHostVMIdle
+			if _, err := h.store.HeartbeatNodeWithCapabilityObservation(t.Context(), "fabric-cold", node.NodeID, node.BootSessionID, heartbeatCapabilityObservation(hb), NodePolicy{MaxOneshotSlots: 1}); err != nil {
+				t.Fatal(err)
+			}
+			spec := capabilityJobSpec("cold-capability", contract.JobKindOCI, contract.JobClassOneShot, handler, nil)
+			job, _, err := h.store.CreateJobAs(t.Context(), spec, runLedgerOrigin)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hint, err := h.store.ClaimJobPoll(t.Context(), "fabric-cold", node.NodeID, node.BootSessionID, contract.JobClassOneShot)
+			want := handler == "runc"
+			if err != nil || hint.QueuedOCIWork != want {
+				t.Errorf("hint=%+v err=%v want=%v", hint, err, want)
+			}
+			caller := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
+			status, _, body := h.do(caller, http.MethodGet, "/v1/jobs/"+job.JobID, nil)
+			var got Job
+			err = json.Unmarshal(body, &got)
+			if err != nil || status != 200 || (got.Status == "host VM starting") != want {
+				t.Fatalf("status=%s reason=%s HTTP=%d err=%v", got.Status, got.UnschedulableReason, status, err)
 			}
 		})
 	}

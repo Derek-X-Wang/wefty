@@ -38,7 +38,7 @@ type setupComputerOptions struct {
 }
 
 func bindSetupComputerFlags(flags *flag.FlagSet, values *setupComputerOptions) {
-	flags.Func("seat-start-wait", "Seat start limit from owner approval (default 3m)", setupPositiveDuration("seat-start-wait", &values.SeatStartWait))
+	flags.Func("seat-start-wait", "Stopped host VM wait from owner approval (default 3m)", setupPositiveDuration("seat-start-wait", &values.SeatStartWait))
 	flags.Func("seat-command-max-runtime", fmt.Sprintf("default Seat command runtime (default %s)", contract.DefaultSeatCommandRuntime), func(raw string) error {
 		value, err := time.ParseDuration(raw)
 		if err != nil {

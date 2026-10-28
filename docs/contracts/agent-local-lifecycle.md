@@ -418,12 +418,23 @@ failures remain failures and re-arm the idle wait before another attempt. This d
 raise the ordinary thirty-second command budget. A stalled shutdown consumes
 at most the graceful budget before force-stop; the fixed three-minute Seat
 approval deadline also covers force-stop and the subsequent cold start.
-A request received before shutdown cancels the idle stop at the claim or final
-cycle recheck and retains the pinned helper generation. Once shutdown starts,
+Demand observed before shutdown cancels the idle stop at the claim or final
+cycle recheck and retains the pinned helper generation. A request approved
+just before withdrawal cannot produce a hint while L1 still sees `kind:oci`.
+There is no extra claim poll between withdrawal acknowledgement and the final
+demand recheck. If no ordinary poll delivers its hint before that recheck, the
+request follows finish-then-restart, still within its three-minute approval
+limit. Once shutdown starts,
 it finishes under the cycle lock. The claim-poll hint remains demand through
 that shutdown, so the watchdog then starts the host VM and earns a fresh ready
 generation. The Seat caller sees only the cold-start reply and its fixed
-approval deadline. An owner `oci always-on` or `load-image` during shutdown
+approval deadline. The limit applies only when the request encounters
+`host_vm_idle`; other Seat starts retain their prestart budget plus one minute.
+During the real cold start (about 25 seconds), capability probes can report
+`lima_stopped` or `helper_unreachable`. Queued status may briefly read
+unschedulable until ready capability is published; the cold Seat deadline
+remains armed, and a CLI wait that saw the cold-start reply keeps waiting.
+An owner `oci always-on` or `load-image` during shutdown
 gets "the host VM is stopping; retry in a moment", rather than doctor advice.
 On node-agent restart, the stale stopping mark is cleared even if the Lima
 state probe fails; normal recovery reports `probe_failed`. Recovery reads the

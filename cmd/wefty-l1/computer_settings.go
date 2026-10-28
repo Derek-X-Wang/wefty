@@ -21,7 +21,7 @@ type computerStartupFlags struct {
 
 func bindComputerStartupFlags(flags *flag.FlagSet) *computerStartupFlags {
 	values := &computerStartupFlags{}
-	flags.DurationVar(&values.seatStartWait, "seat-start-wait", l1.DefaultSeatStartWait, "Seat start limit from owner approval")
+	flags.DurationVar(&values.seatStartWait, "seat-start-wait", l1.DefaultSeatStartWait, "Stopped host VM wait from owner approval")
 	flags.DurationVar(&values.seatCommandMaxRuntime, "seat-command-max-runtime", contract.DefaultSeatCommandRuntime, "default maximum runtime of a Seat command")
 	flags.DurationVar(&values.seatIdleWait, "seat-idle-wait", l1.DefaultSeatIdleWait, "Seat idle wait after its latest activity")
 	flags.DurationVar(&values.seatWarningWait, "seat-warning-wait", l1.DefaultSeatWarningWait, "warning interval before Seat expiry")

@@ -220,6 +220,14 @@ func (a *Agent) BeginHostVMLoadImage() func() {
 }
 
 func (a *Agent) ConfigureHostVMDemand(snapshot *lima.DemandState, queued QueuedOCIDemand) {
+	if a.session.client != nil {
+		// Configuration precedes serving claims; literal test clients may have
+		// no negotiation state until host VM demand is configured.
+		if a.session.client.claimHints == nil {
+			a.session.client.claimHints = &claimHintState{}
+		}
+		a.session.client.claimHints.enabled.Store(a.session.registration.OS == "darwin" && snapshot != nil)
+	}
 	a.session.hostVM.mu.Lock()
 	defer a.session.hostVM.mu.Unlock()
 	a.session.hostVM.snapshot = snapshot

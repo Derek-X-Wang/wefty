@@ -89,18 +89,28 @@ row-count-driven accounting. Removal authority remains separate from leases.
 
 ## Queued OCI demand hint (#1144)
 
-Only a new node agent reader sends `accept_queued_oci_hint: true` in the
+Only a darwin node agent with host VM demand configured sends
+`accept_queued_oci_hint: true` in the
 existing `POST /v1/agent/jobs/claim` request. This optional boolean defaults to
 false. An omitted or false value retains exactly the prior claim or empty
 HTTP 204 reply, with no hint fields, even when matching OCI work is queued.
 This keeps a new L1 safe for old node agents during the L1-first rolling upgrade.
 The flag only negotiates the reply format; it grants no runtime authority.
+Control plane first remains the supported upgrade order.
+An old L1's HTTP 400 `invalid_request` naming `accept_queued_oci_hint` causes
+one retry of the same poll without the field. The node agent remembers that
+fallback for the session and tries the opt-in again after reconnecting.
+Linux and unconfigured Mac node agents send the original request shape.
 
 For an opted-in reader, the reply can carry `queued_oci_work: true` when this
 node does not advertise `kind:oci` and has
 queued OCI work whose routing tags match, or a Computer pinned here with
 Desired state `running`. Work bound to another node and services whose Desired
-state is stopped do not contribute. Both workload-class polls observe all
+state is stopped do not contribute. Required capabilities must be satisfiable
+by the node after restoring `kind:oci` and the OCI probe capabilities listed
+in its withdrawal observation (the capabilities advertised before going idle).
+A missing runtime handler or host feature that it never advertised cannot
+produce a hint. Both workload-class polls observe all
 queued OCI demand, so one empty class does not erase the other class's hint.
 A node with claims disabled receives no hint. A Linux node agent ignores it.
 

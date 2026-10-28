@@ -20,6 +20,7 @@ func TestColdStartHintIdleStopRaceMatrix(t *testing.T) {
 		t.Run(arrival, func(t *testing.T) {
 			a := newHostVMControlTestAgent(t)
 			a.session.registration.OS = "darwin"
+			a.capabilities.record(CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true, "computer": true, "cgroup_v2": true}}, nil)
 			if _, err := a.session.publishCapabilityHeartbeat(t.Context(), nil); err != nil {
 				t.Fatal(err)
 			}
@@ -41,6 +42,9 @@ func TestColdStartHintIdleStopRaceMatrix(t *testing.T) {
 			delivered := false
 			a.session.client.httpClient.Transport = captureRoundTrip(func(r *http.Request) (*http.Response, error) {
 				if strings.HasSuffix(r.URL.Path, "/claim") {
+					if a.CapabilitySnapshot().Capabilities["kind:oci"] {
+						return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+					}
 					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"queued_oci_work":true}`)), Header: make(http.Header)}, nil
 				}
 				deliver := func() {
@@ -66,6 +70,8 @@ func TestColdStartHintIdleStopRaceMatrix(t *testing.T) {
 				}
 				return response, err
 			})
+			// Before withdrawal L1 still sees kind:oci, so it cannot send a hint.
+			// This request is first visible as queued demand on the poll after stop.
 			if arrival == "before-withdrawal" {
 				if err := pollHint(); err != nil {
 					t.Fatal(err)
@@ -109,7 +115,7 @@ func TestColdStartHintIdleStopRaceMatrix(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if arrival == "after-shutdown" {
+			if arrival == "after-shutdown" || arrival == "before-withdrawal" {
 				if err := pollHint(); err != nil {
 					t.Fatal(err)
 				}
@@ -118,7 +124,7 @@ func TestColdStartHintIdleStopRaceMatrix(t *testing.T) {
 			if demandErr != nil || len(items) == 0 {
 				t.Fatalf("queued hint was lost: %v %v", items, demandErr)
 			}
-			early := arrival != "during-shutdown" && arrival != "after-shutdown"
+			early := arrival != "during-shutdown" && arrival != "after-shutdown" && arrival != "before-withdrawal"
 			if early && (shutdowns != 0 || ensures != 0 || !a.CapabilitySnapshot().Capabilities["kind:oci"]) {
 				t.Fatalf("early hint did not preserve ready generation: shutdowns=%d ensures=%d snapshot=%+v", shutdowns, ensures, a.CapabilitySnapshot())
 			}

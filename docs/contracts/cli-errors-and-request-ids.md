@@ -417,25 +417,32 @@ a receipt, an unknown ID remains not found (exit 4). Interrupting a wait leaves
 the node-owned request running and retains the ID. It does not deny approval.
 With `--json`, request emits an initial ID document followed by its terminal
 result document; wait emits its terminal result. While an approved Seat waits
-for a Mac's OCI runtime, either command prints
-`starting the host VM, about 1 minute` once on stdout per invocation. In JSON
-mode it emits a progress document with `seat_id`, `host_vm_starting: true` and
-`message` containing that text. L1 exposes `host_vm_starting` on the pending
-Seat call result; a progress reply neither acknowledges an outcome nor grants
-a Seat credential.
+for an idle Mac host VM, either command prints
+`starting the host VM, about 1 minute` once on stdout per invocation in text mode.
+JSON mode prints no progress document: the terminal success document includes
+`host_vm_starting: true` and `message` containing that text if this wait observed
+the cold start. A typed refusal includes those fields in `error.details` in the
+common error document on stderr. Thus `seat wait --json` has one success document
+on stdout, or no stdout document on refusal; `seat request --json` retains its
+initial ID document. L1 exposes `host_vm_starting` only for a pending approved
+Seat whose node reports `host_vm_idle`, not for a broken always-on host VM or
+`prerequisite_missing`. A progress observation grants no Seat credential.
 
-`wefty-l1 --seat-start-wait` sets the start limit (default `3m`), alongside the
-existing Seat and Computer startup waits. The owner can persist it with
-`wefty setup --seat-start-wait DURATION`; setup retains an omitted value and
-passes it only to L1, on both launchd and systemd. L1 fixes the deadline at owner
-approval, including approval through a window. Dispatch, waiting again, a
-restart of L1, or an idle-stop race cannot extend it. The existing readiness
-deadline column retains it; a delayed start uses the earlier deadline. On
-expiry, L1 refuses with `seat_start_failed`, the node's recorded capability
-reason and `run wefty node doctor`. The CLI returns that refusal immediately,
-even if cleanup remains pending. This deadline bounds the complete Seat start,
-including an image pull and endpoint readiness. The helper's separate
-60-second endpoint deadline still applies.
+`wefty-l1 --seat-start-wait` sets the stopped host VM wait (default `3m`),
+alongside the existing Seat and Computer startup waits. The owner can persist
+it with `wefty setup --seat-start-wait DURATION`; setup retains an omitted
+value and passes it only to L1, on both launchd and systemd. Approval, including
+approval through a window, records the potential cold-start limit. L1 activates
+it only if the request encounters `host_vm_idle`, including a withdrawal after
+approval. The persisted `host_vm_wait_deadline_ns` holds that approval-based
+limit; `seat_deadline_ns` retains the active deadline. Dispatch, waiting again,
+L1 restart, recovery, and an idle-stop race cannot extend it. On expiry, L1
+refuses with `seat_start_failed`, the node's recorded capability reason and
+`run wefty node doctor`. The CLI returns that refusal immediately, even if
+cleanup remains pending. Every other Seat start keeps the prestart infrastructure
+budget plus one minute from start (11 minutes with default settings), including
+first image delivery. Both active deadlines persist across L1 restart. The
+helper's separate 60-second endpoint deadline still applies.
 
 The switch at *off* refuses before any dialog or start with `seat_host_off` and
 `the host VM is off`; *on demand* permits the cold start and *always on* keeps
