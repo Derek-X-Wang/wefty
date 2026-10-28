@@ -864,6 +864,10 @@ network from the manifest. An old manifest without the field has an unknown
 source network: a new import uses `none` and reports
 `Source network is unknown; using none.` No copy or import silently adds
 internet access. Changing an existing Computer's network is outside this rule.
+A manifest that records `network` needs a destination node agent, helper and
+L1 at this version or newer: older ones refuse the field (`manifest_invalid`,
+a digest conflict, or a closed-schema refusal) instead of importing it. Clones
+and imports made by older builds are not changed.
 
 Clone and import CLI text and JSON name the new Computer's `network`. Import
 JSON also carries `network_note` when the source network is unknown, and text
