@@ -139,7 +139,10 @@ func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Ti
 				result.Problems = append(result.Problems, statusReason{"retiring_lease_stale", label + ": stale renewal; Lease expired at " + a.LeaseExpiresAt.Format(time.RFC3339Nano)})
 				result.RenewalHealth = "degraded"
 				result.Progress = "unverified"
-			} else if a.LastRenewedAt == nil || a.LeaseExpiresAt == nil {
+			} else if a.LeaseExpiresAt == nil || (a.LastRenewedAt == nil && state != contract.AttemptRunning) {
+				// A running Attempt can still be inside its first, unexpired
+				// Lease before recording a renewal. Missing Lease data cannot
+				// establish that evidence; expired Leases are diagnosed above.
 				missingRenewal = true
 				if result.RenewalHealth != "degraded" {
 					result.RenewalHealth = "unverified"

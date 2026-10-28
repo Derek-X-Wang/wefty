@@ -33,6 +33,70 @@ func generationStatusFixture(now time.Time, retiring int) l1.NodeList {
 	return l1.NodeList{Nodes: []l1.Node{node}}
 }
 
+func TestFreshAttemptRenewalStatusAndDoctor(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		state  contract.AttemptState
+		lease  *time.Time
+		health string
+		code   string
+	}{
+		{name: "inside-first-lease", state: contract.AttemptRunning, lease: generationDeadline(time.Now().Add(time.Hour)), health: "healthy"},
+		{name: "expired-first-lease", state: contract.AttemptRunning, lease: generationDeadline(time.Now().Add(-time.Hour)), health: "degraded", code: "retiring_lease_stale"},
+		{name: "missing-lease", state: contract.AttemptRunning, health: "unverified", code: "generation_renewal_unverified"},
+		{name: "claimed-without-renewal", state: contract.AttemptClaimed, lease: generationDeadline(time.Now().Add(time.Hour)), health: "unverified", code: "generation_renewal_unverified"},
+		{name: "awaiting-input-without-renewal", state: contract.AttemptAwaitingInput, lease: generationDeadline(time.Now().Add(time.Hour)), health: "unverified", code: "generation_renewal_unverified"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, entry := range []string{"status", "doctor"} {
+				t.Run(entry, func(t *testing.T) {
+					nodes := round2Nodes(t, true)
+					nodes.Nodes[0].Generations[0].Attempts = []l1.NodeGenerationAttempt{{
+						JobID: "fresh-job", AttemptID: "fresh-attempt",
+						State: generationAttemptState(tc.state), LeaseExpiresAt: tc.lease,
+					}}
+					wantHealthy := tc.health == "healthy"
+					if entry == "status" {
+						h := newStatusHarness(t)
+						h.nodes = nodes
+						var out, stderr bytes.Buffer
+						err := executeStatus(t.Context(), h.clients(), true, nil, &out, &stderr)
+						var status clusterStatus
+						if decodeErr := json.Unmarshal(out.Bytes(), &status); decodeErr != nil {
+							t.Fatal(decodeErr)
+						}
+						if (err == nil) != wantHealthy || status.Ready != wantHealthy || len(status.Generations) != 1 || status.Generations[0].RenewalHealth != tc.health {
+							t.Fatalf("first lease status: err=%v status=%s", err, out.String())
+						}
+						if wantHealthy {
+							if status.Verdict != "ready" || len(status.Reasons) != 0 {
+								t.Fatalf("healthy first lease verdict: %s", out.String())
+							}
+						} else if !slices.ContainsFunc(status.Reasons, func(r statusReason) bool { return r.Code == tc.code }) {
+							t.Fatalf("missing %s: %s", tc.code, out.String())
+						}
+						return
+					}
+					f, paths := round2DoctorFixture(t, &nodes)
+					report := runFixturePlainDoctor(t, f.host, globalOptions{nodeConfigPath: paths.nodeConfig, profilePath: paths.profile})
+					if report.Healthy != wantHealthy || len(report.Generations) != 1 || report.Generations[0].RenewalHealth != tc.health {
+						t.Fatalf("first lease doctor: %+v", report)
+					}
+					check, severity := tc.code, "warning"
+					if wantHealthy {
+						check, severity = "rolling-upgrade", "ok"
+					} else if tc.health == "degraded" {
+						severity = "error"
+					}
+					if !slices.ContainsFunc(report.Findings, func(f plainDoctorFinding) bool { return f.Check == check && f.Severity == severity }) {
+						t.Fatalf("doctor omitted %s %s: %+v", check, severity, report.Findings)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestPrimaryGenerationReregistrationRecoversStatus(t *testing.T) {
 	clock := &nodeCLIClock{now: time.Now().UTC()}
 	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "rejoin.sqlite"), l1.StoreOptions{Clock: clock})
@@ -214,7 +278,7 @@ func TestRollingStatusTextAndJSONFixtures(t *testing.T) {
 		{name: "failed-retiree", retiring: 1, reachable: true, state: "complete", problem: true, contains: "Run run-0 (Attempt attempt-0): failed", mutate: func(n *l1.NodeList) {
 			n.Nodes[0].Generations[1].Attempts[0].State = generationAttemptState(contract.AttemptFailed)
 		}},
-		{name: "renewal-unknown", retiring: 1, reachable: true, state: "complete", problem: true, contains: "renewal evidence unknown", mutate: func(n *l1.NodeList) { n.Nodes[0].Generations[1].Attempts[0].LastRenewedAt = nil }},
+		{name: "lease-unknown", retiring: 1, reachable: true, state: "complete", problem: true, contains: "renewal evidence unknown", mutate: func(n *l1.NodeList) { n.Nodes[0].Generations[1].Attempts[0].LeaseExpiresAt = nil }},
 		{name: "attempt-unknown", retiring: 1, reachable: true, state: "complete", problem: true, contains: "renewal evidence unknown", mutate: func(n *l1.NodeList) { n.Nodes[0].Generations[1].Attempts[0].State = nil }},
 		{name: "no-run", retiring: 1, reachable: true, state: "complete", contains: "Attempts without an L3 Run: attempt-0", mutate: func(n *l1.NodeList) { n.Nodes[0].Generations[1].Attempts[0].RunID = "" }},
 		{name: "unreachable", retiring: 1, reachable: false, state: "unverified", problem: true, contains: "unverified"},
