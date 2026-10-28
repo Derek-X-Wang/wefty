@@ -972,6 +972,7 @@ type ComputerCustodyExportRequest struct {
 	CustodyFence      string
 	JobSpec           contract.JobSpec
 	JobSpecHash       string
+	Network           string
 }
 
 type ComputerCustodyExportReceipt = contract.ComputerCustodyExportReceipt

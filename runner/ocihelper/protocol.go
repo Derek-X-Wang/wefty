@@ -1679,6 +1679,7 @@ type ExportComputerCustodyRequest struct {
 	JobSpec      contract.JobSpec               `json:"job_spec"`
 	JobSpecHash  string                         `json:"job_spec_hash"`
 	Authority    ComputerCustodyExportAuthority `json:"authority"`
+	Network      string                         `json:"network,omitempty"`
 }
 
 type ComputerCustodyExportReceipt = contract.ComputerCustodyExportReceipt

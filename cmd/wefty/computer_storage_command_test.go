@@ -763,7 +763,7 @@ func TestStorageMutationRenderingKeepsEveryResourceAndAppliedFactsOnReadFailure(
 	}
 }
 
-func newStorageCLIHarness(t *testing.T) *storageCLIHarness {
+func newStorageCLIHarness(t *testing.T, settings ...*l1.ComputerSettings) *storageCLIHarness {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	network := plain.NewNetwork()
@@ -816,8 +816,13 @@ func newStorageCLIHarness(t *testing.T) *storageCLIHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var seatSettings *l1.ComputerSettings
+	if len(settings) != 0 {
+		seatSettings = settings[0]
+	}
 	computer, _, err := store.CreateComputer(ctx, l1.CreateComputerRequest{
-		Name: "storage-cli-source", Spec: storageCLIComputerSpec("computer:storage-cli"), Actor: "operator",
+		SeatRequestSettings: seatSettings,
+		Name:                "storage-cli-source", Spec: storageCLIComputerSpec("computer:storage-cli"), Actor: "operator",
 	})
 	if err != nil {
 		t.Fatal(err)

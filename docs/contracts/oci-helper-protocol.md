@@ -19,6 +19,14 @@ optional `identity_rekeyed`, optional `expanded`, `manifest_written`, and
 `published`; restart resumes from the first incomplete boundary without
 accepting a changed authority tuple.
 
+`ExportComputerCustody` carries an optional `network` (`internet` or `none`)
+and writes it to the portable `custody.json` manifest. Omission means unknown;
+`omitempty` keeps old manifests' serialized bytes and digests unchanged.
+Import accepts those old manifests; L1 gives a new Computer `none` and reports
+the unknown source network. Export resume accepts a missing network, but
+refuses conflicting recorded networks. The node agent and its installed helper
+remain checksum-bound; this additive field does not change the protocol major.
+
 On Mac, the Lima 2.2 `vz` template enables only rootful containerd with the
 `overlayfs` snapshotter, maps one explicit operator-owned host root to
 `/mnt/wefty-host`, and forwards only `/run/wefty/oci-helper.sock` into the

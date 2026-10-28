@@ -63,7 +63,8 @@ func sameCustodyManifest(manifest computerCustodyManifest, request ExportCompute
 		manifest.Encryption == "none" && manifest.NodeID == request.Authority.NodeID &&
 		manifest.RootInstanceID == request.Authority.RootInstanceID &&
 		manifest.OperationRevision == request.Authority.OperationRevision && manifest.JobSpecHash == request.JobSpecHash &&
-		manifest.CustodyFence == request.Authority.CustodyFence && manifest.DiskFile == "storage.ext4"
+		manifest.CustodyFence == request.Authority.CustodyFence && manifest.DiskFile == "storage.ext4" &&
+		(manifest.Network == request.Network || manifest.Network == "" || request.Network == "")
 }
 
 // custodyExternalDestination is one Custody destination the helper has proven
@@ -1275,7 +1276,7 @@ func (engine *ContainerdEngine) ExportComputerCustody(ctx context.Context, reque
 			ContentDigest: request.SourceDigest, Encryption: "none", NodeID: request.Authority.NodeID,
 			RootInstanceID: request.Authority.RootInstanceID, OperationRevision: request.Authority.OperationRevision,
 			CustodyFence: request.Authority.CustodyFence, JobSpec: request.JobSpec, JobSpecHash: request.JobSpecHash,
-			DiskFile: "storage.ext4", Phase: "writing"}
+			DiskFile: "storage.ext4", Phase: "writing", Network: request.Network}
 		if _, err := writeCustodyManifest(externalDirectory, externalOwner, chown, manifest); err != nil {
 			return ExportComputerCustodyResponse{}, err
 		}

@@ -855,6 +855,21 @@ closes `exporting`, and a dead bound Node permits an explicit abort.
 failures are retryable. Retry a read to observe the export; a mutation retry keeps
 its original idempotency key.
 
+A clone keeps its source Computer's fixed `network` (`internet` or `none`);
+it never uses the Computer column default. A Custody export records that same
+setting in the portable manifest's optional `network` field. The setting is
+immutable for the source Computer, so its Backups share that setting.
+Import sets the new Computer's
+network from the manifest. An old manifest without the field has an unknown
+source network: a new import uses `none` and reports
+`Source network is unknown; using none.` No copy or import silently adds
+internet access. Changing an existing Computer's network is outside this rule.
+
+Clone and import CLI text and JSON name the new Computer's `network`. Import
+JSON also carries `network_note` when the source network is unknown, and text
+prints the same note. An idempotent replay reports the existing Computer's
+fixed network; it does not change a Computer created by an older build.
+
 `custody.json` is the portable import authority: it contains the sanitized Job
 specification, manifest digest inputs, immutable source digest, and Storage
 provenance needed after the exporting L1 database is gone. The operator chooses
