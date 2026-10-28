@@ -99,9 +99,9 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Run cross-platform runner and contract tests
-        # cmd/wefty takes 950-1125 s on hosted macOS runners and hit 20m
-        # (#163, #1034; growth tracked in #1035); a hang still fails here.
-        run: go test -timeout=30m ./...
+        # cmd/wefty takes 1107-1552 s on hosted macOS runners and hit 30m
+        # (#163, #1034, #1326; growth tracked in #1035); a hang still fails here.
+        run: go test -timeout=45m ./...
 
   service-acceptance:
     name: service-acceptance / ${{ matrix.os }}
@@ -122,9 +122,9 @@ jobs:
         # packages concurrently starves them on the slowest runner in the
         # matrix — observed as TestTimeoutTerminatesThenKillsEntireProcessGroup
         # timing out on macos-latest while passing in every other job.
-        # -timeout=30m matches mac-linux-runner: cmd/wefty takes 690-1010 s
-        # here on hosted macOS and hit 20m on PR #1213 (#163, #1035).
-        run: go test -p 1 -timeout=30m -tags=service_acceptance ./...
+        # -timeout=45m matches mac-linux-runner: cmd/wefty takes 1107-1243 s
+        # here on hosted macOS and hit 30m on PR #1319 (#163, #1035, #1326).
+        run: go test -p 1 -timeout=45m -tags=service_acceptance ./...
 
   dogfood-workflow:
     name: dogfood-workflow
