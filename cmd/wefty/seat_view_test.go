@@ -57,8 +57,9 @@ func TestSeatViewRealBinary(t *testing.T) {
 	var data []byte
 	var err error
 	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		// The shell creates the record before printf writes it; wait for the URL.
 		data, err = os.ReadFile(record)
-		if err == nil {
+		if err == nil && string(data) == want {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
