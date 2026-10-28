@@ -260,7 +260,8 @@ class Proof:
         helper, _ = self.run(["limactl", "--tty=false", "shell", "--workdir=/", INSTANCE, "systemctl", "show", "--property=User", "--value", "dev.wefty.oci-helper.service"])
         if helper.stdout.strip() != "root":
             raise RuntimeError("guest helper does not run as guest root")
-        computer, snapshot = self.create_ready("wefty-proof-one")
+        # A removed Computer keeps its name, so a repeated step 4 needs a new one.
+        computer, snapshot = self.create_ready(f"wefty-proof-one-{int(time.time())}")
         try:
             node = snapshot["node"]
             attempts = snapshot["computer"]["current_job"].get("attempts", [])

@@ -166,6 +166,11 @@ func run() error {
 			if e != nil {
 				return e
 			}
+			// GetJob leaves Attempts empty; the proof matches the current attempt
+			// to the recorded node-agent boot.
+			if job.Attempts, e = store.ListJobAttempts(ctx, job.JobID); e != nil {
+				return e
+			}
 			c.CurrentJob = job
 		}
 		seats, err := store.GetComputerSeatObservations(ctx, c.ComputerID)
@@ -178,7 +183,9 @@ func run() error {
 				ready = true
 			}
 		}
-		computerReady := c.CurrentJob.ServiceJob != nil && c.CurrentJob.Ready != nil && *c.CurrentJob.Ready
+		// A Computer has no published port, so ServiceJob.Ready stays nil. L1
+		// exposes DisplayEndpoint only while the current attempt is published ready.
+		computerReady := c.DisplayEndpoint != nil
 		node, err := store.GetNode(ctx, profile.Identities.Node)
 		if err != nil {
 			return err
