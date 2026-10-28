@@ -183,12 +183,22 @@ func run() error {
 				ready = true
 			}
 		}
-		// A Computer has no published port, so ServiceJob.Ready stays nil. L1
-		// exposes DisplayEndpoint only while the current attempt is published ready.
-		computerReady := c.DisplayEndpoint != nil
 		node, err := store.GetNode(ctx, profile.Identities.Node)
 		if err != nil {
 			return err
+		}
+		// A Computer has no published port, so ServiceJob.Ready stays nil. L1
+		// exposes DisplayEndpoint only while the current attempt is published
+		// ready. Publication can outlive a lost lease until reconciliation, so
+		// the current attempt must also be active, leased and on this live node.
+		computerReady := false
+		if c.DisplayEndpoint != nil && node.State == contract.NodeAlive {
+			for _, a := range c.CurrentJob.Attempts {
+				if a.AttemptID == c.CurrentJob.CurrentAttemptID && a.NodeID == node.NodeID &&
+					(a.State == contract.AttemptClaimed || a.State == contract.AttemptRunning) && a.LeaseExpiresAt.After(time.Now()) {
+					computerReady = true
+				}
+			}
 		}
 		result = map[string]any{"computer": c, "seats": seats, "node": node, "ready": ready && computerReady, "observed_at": time.Now().UTC()}
 	default:

@@ -1,7 +1,10 @@
 # Attended per-user host VM proof (#1132)
 
 **Status: attended run passed on 2026-10-27.** PR-1, PR-2, PR-3 and PR-5 are
-VERIFIED; PR-4 is PARTIAL by design. The sanitized results are on #1132.
+VERIFIED; PR-4 is PARTIAL by design. The run used observer-tool fixes made
+during it (#1306). PR-3's clean-shutdown verdicts come from replaying the
+corrected journal rule on the saved receipts; a clean verdict means a clean
+journald stop, not a full filesystem proof. The sanitized results are on #1132.
 This runbook and its scripts prepare PR-1 to PR-5 of
 [the phase 3 spec](../specs/2026-10-21-computer-request-spec.md#1112-the-proof-on-the-owners-mac-1027-1010).
 Injected tests do not establish these results; only an attended run can. Use a quiet login session with the
@@ -360,5 +363,5 @@ starts/stops the host VM on that node agent's request. That needs a separate
 small design for identity, allowed instance, intent, lifetime and failure
 handling; moving just the existing LaunchDaemon is insufficient because it
 currently launches and supervises the node-agent process itself. **Do not build
-or enable this fallback in this ticket.** No such failure has been observed in
-this sandbox; the attended proof is NOT-RUN.
+or enable this fallback in this ticket.** The 2026-10-27 attended run did not
+need it: the per-user GUI LaunchAgent started `vz` without Mac privilege.
