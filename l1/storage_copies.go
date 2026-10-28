@@ -600,10 +600,10 @@ func (s *Store) BeginComputerClone(ctx context.Context, request ComputerCloneReq
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computers(computer_id, name, placement_node_id,
 		bound_node_id, grants_json, storage_id, storage_generation, backup_cap, desired_state,
 		desired_disk_bytes, intent_revision, applied_revision, current_job_id, current_spec_revision,
-		reconfiguration_phase, reconfiguration_revision, created_ns, updated_ns)
-		VALUES(?, ?, ?, ?, '[]', ?, 1, ?, 'stopped', ?, 1, 0, ?, 1, 'cloning', 1, ?, ?)`,
+		reconfiguration_phase, reconfiguration_revision, created_ns, updated_ns, network)
+		VALUES(?, ?, ?, ?, '[]', ?, 1, ?, 'stopped', ?, 1, 0, ?, 1, 'cloning', 1, ?, ?, ?)`,
 		computerID, request.Name, copy.NodeID, copy.NodeID, storageID, source.BackupCap,
-		request.DiskBytes, job.JobID, now.UnixNano(), now.UnixNano()); err != nil {
+		request.DiskBytes, job.JobID, now.UnixNano(), now.UnixNano(), source.Network); err != nil {
 		return Computer{}, false, internalError(err, "store cloned Computer authority")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computer_job_projections(computer_id, job_id,

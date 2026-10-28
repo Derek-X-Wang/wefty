@@ -10,3 +10,7 @@ func TestServiceAcceptanceComputerStorageCLIRealRoutesAndProvenance(t *testing.T
 	assertComputerStorageCLIAdversarialRows(t)
 	assertComputerCLIUsageForeignIDAndRoutePaginationErrors(t)
 }
+
+func TestServiceAcceptanceStorageCopyNetwork(t *testing.T) {
+	TestStorageCopyNetworkCLIOutputs(t)
+}

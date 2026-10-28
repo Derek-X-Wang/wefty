@@ -57,6 +57,7 @@ type ComputerCustodyExportDirective struct {
 	CustodyFence      string           `json:"custody_fence"`
 	SourceSpec        contract.JobSpec `json:"source_spec"`
 	SourceSpecHash    string           `json:"source_spec_hash"`
+	Network           ComputerNetwork  `json:"network,omitempty"`
 }
 
 type ComputerCustodyExportReceipt = contract.ComputerCustodyExportReceipt
@@ -97,6 +98,8 @@ type ComputerCustodyImport struct {
 	PreparationOutcome    *ComputerStoragePreparationOutcome `json:"preparation_outcome,omitempty"`
 	RequestedAt           time.Time                          `json:"requested_at"`
 	CompletedAt           *time.Time                         `json:"completed_at,omitempty"`
+	Network               ComputerNetwork                    `json:"network"`
+	NetworkNote           string                             `json:"network_note,omitempty"`
 }
 
 type ComputerCustodyImportObservation struct {
@@ -251,7 +254,7 @@ func (s *Store) ListNodeComputerCustodyExportDirectives(ctx context.Context, ide
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT e.export_id, e.computer_id, e.operation_revision, e.backup_id,
 		e.copy_id, e.source_storage_id, e.source_generation, e.allocated_size, e.content_digest, e.bound_node_id,
-		e.root_instance_id, e.external_path, e.custody_fence, e.source_spec_json, e.source_spec_hash
+		e.root_instance_id, e.external_path, e.custody_fence, e.source_spec_json, e.source_spec_hash, c.network
 		FROM computer_custody_exports e JOIN computers c ON c.computer_id=e.computer_id
 		WHERE e.bound_node_id=? AND e.status='planned'
 		AND c.reconfiguration_phase='exporting' AND c.reconfiguration_revision=e.operation_revision
@@ -268,7 +271,7 @@ func (s *Store) ListNodeComputerCustodyExportDirectives(ctx context.Context, ide
 			&directive.BackupID, &directive.CopyID, &directive.StorageID, &directive.StorageGeneration,
 			&directive.AllocatedSize, &directive.ContentDigest, &directive.BoundNodeID,
 			&directive.RootInstanceID, &directive.ExternalPath, &directive.CustodyFence, &specJSON,
-			&directive.SourceSpecHash); err != nil {
+			&directive.SourceSpecHash, &directive.Network); err != nil {
 			return nil, internalError(err, "scan Custody export directive")
 		}
 		if err := json.Unmarshal(specJSON, &directive.SourceSpec); err != nil {
@@ -594,6 +597,16 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 		return ComputerCustodyImport{}, false, err
 	}
 	manifest := request.Manifest
+	network := ComputerNetwork(manifest.Network)
+	networkNote := ""
+	switch network {
+	case ComputerNetworkInternet, ComputerNetworkNone:
+	case "":
+		network = ComputerNetworkNone
+		networkNote = "Source network is unknown; using none."
+	default:
+		return ComputerCustodyImport{}, false, protocolError(contract.ErrorInvalidRequest, "Custody manifest network must be internet or none when recorded")
+	}
 	if exportID == "" || request.DiskBytes < 1 || request.IdempotencyKey == "" || !filepath.IsAbs(request.ExternalPath) ||
 		request.ManifestDigest == "" || manifest.Version != 1 || manifest.ExportID != exportID || manifest.Phase != "complete" ||
 		manifest.DiskFile != "storage.ext4" || manifest.Encryption != "none" || manifest.AllocatedSize < 1 ||
@@ -642,11 +655,18 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 			return ComputerCustodyImport{}, false, protocolError(contract.ErrorIdempotencyConflict, "Custody import idempotency key was reused")
 		}
 		var name string
-		_ = tx.QueryRowContext(ctx, `SELECT name FROM computers WHERE computer_id=?`, replay.DestinationComputerID).Scan(&name)
+		// Failed imports release their Computer identity but retain the operation.
+		existingNetwork := network
+		if err := tx.QueryRowContext(ctx, `SELECT name, network FROM computers WHERE computer_id=?`, replay.DestinationComputerID).Scan(&name, &existingNetwork); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return ComputerCustodyImport{}, false, internalError(err, "read Custody import replay Computer")
+		}
+		if manifest.Network == "" && existingNetwork != ComputerNetworkNone {
+			networkNote = "Source network is unknown; existing Computer network is " + string(existingNetwork) + "."
+		}
 		value := ComputerCustodyImport{ImportID: replay.DestinationComputerID, ExportID: replay.ExportID,
 			OperationRevision:     replay.OperationRevision,
 			DestinationComputerID: replay.DestinationComputerID, DestinationStorageID: replay.DestinationStorageID,
-			DestinationName: name, DestinationSize: replay.DestinationSize, Status: replay.Status}
+			DestinationName: name, DestinationSize: replay.DestinationSize, Status: replay.Status, Network: existingNetwork, NetworkNote: networkNote}
 		var requested int64
 		var completed sql.NullInt64
 		var outcomeJSON []byte
@@ -701,9 +721,9 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 	if _, err := tx.ExecContext(ctx, `INSERT INTO computers(computer_id, name, placement_node_id,
 		bound_node_id, grants_json, storage_id, storage_generation, desired_disk_bytes, backup_cap, desired_state,
 		intent_revision, applied_revision, current_job_id, current_spec_revision, reconfiguration_phase,
-		reconfiguration_revision, created_ns, updated_ns) VALUES(?, ?, ?, ?, '[]', ?, 1, ?, 0, 'stopped',
-		1, 0, ?, 1, 'importing', 1, ?, ?)`, computerID, request.Name, request.NodeID, request.NodeID,
-		storageID, request.DiskBytes, jobID, now.UnixNano(), now.UnixNano()); err != nil {
+		reconfiguration_revision, created_ns, updated_ns, network) VALUES(?, ?, ?, ?, '[]', ?, 1, ?, 0, 'stopped',
+		1, 0, ?, 1, 'importing', 1, ?, ?, ?)`, computerID, request.Name, request.NodeID, request.NodeID,
+		storageID, request.DiskBytes, jobID, now.UnixNano(), now.UnixNano(), network); err != nil {
 		if strings.Contains(err.Error(), "UNIQUE constraint failed: computers.name") {
 			return ComputerCustodyImport{}, false, protocolError(contract.ErrorConflict, "Computer name %q is already used or reserved", request.Name)
 		}
@@ -739,7 +759,7 @@ func (s *Store) BeginComputerCustodyImport(ctx context.Context, exportID string,
 	value := ComputerCustodyImport{ImportID: computerID, ExportID: exportID, DestinationComputerID: computerID,
 		OperationRevision:    1,
 		DestinationStorageID: storageID, DestinationName: request.Name, DestinationSize: request.DiskBytes,
-		Status: "reserved", RequestedAt: now}
+		Status: "reserved", RequestedAt: now, Network: network, NetworkNote: networkNote}
 	if err := tx.Commit(); err != nil {
 		return ComputerCustodyImport{}, false, internalError(err, "commit Custody import reservation")
 	}

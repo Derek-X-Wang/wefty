@@ -231,6 +231,7 @@ type ComputerCustodyManifest struct {
 	JobSpecHash       string  `json:"job_spec_hash"`
 	DiskFile          string  `json:"disk_file"`
 	Phase             string  `json:"phase"`
+	Network           string  `json:"network,omitempty"`
 }
 
 func DigestComputerCustodyManifest(manifest ComputerCustodyManifest) (string, error) {

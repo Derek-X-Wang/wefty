@@ -46,6 +46,7 @@ func (controller *custodyController) process(ctx context.Context, directive l1.C
 		ExternalPath: directive.ExternalPath, NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
 		RootInstanceID: directive.RootInstanceID, OperationRevision: directive.OperationRevision,
 		CustodyFence: directive.CustodyFence, JobSpec: directive.SourceSpec, JobSpecHash: directive.SourceSpecHash,
+		Network: string(directive.Network),
 	})
 	if err != nil {
 		return err

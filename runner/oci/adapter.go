@@ -2599,7 +2599,7 @@ func (adapter *Adapter) ExportComputerCustody(ctx context.Context, request workl
 			StorageID: request.Storage.StorageID, StorageGeneration: request.Storage.StorageGeneration,
 			IntentRevision: request.Storage.IntentRevision, DiskBytes: request.Storage.DiskBytes},
 		SourceSize: request.SourceSize, SourceDigest: request.SourceDigest, ExternalPath: request.ExternalPath,
-		JobSpec: request.JobSpec, JobSpecHash: request.JobSpecHash,
+		JobSpec: request.JobSpec, JobSpecHash: request.JobSpecHash, Network: request.Network,
 		Authority: ocihelper.ComputerCustodyExportAuthority{NodeID: request.NodeID, BootSessionID: request.BootSessionID,
 			HelperGeneration: handshake.SessionGeneration, RootInstanceID: request.RootInstanceID,
 			OperationRevision: request.OperationRevision, CustodyFence: request.CustodyFence},

@@ -1128,7 +1128,7 @@ func writeStorageMutation(writer io.Writer, output storageMutationOutput, jsonOu
 	}
 	if output.CustodyImport != nil {
 		table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-		if _, err := fmt.Fprintln(table, "IMPORT ID\tEXPORT ID\tOPERATION REVISION\tDESTINATION COMPUTER\tDESTINATION STORAGE\tNAME\tSIZE\tSTATUS\tFAILURE CODE\tPREPARATION OUTCOME\tHELPER GENERATION\tSWEEP EPOCH"); err != nil {
+		if _, err := fmt.Fprintln(table, "IMPORT ID\tEXPORT ID\tOPERATION REVISION\tDESTINATION COMPUTER\tDESTINATION STORAGE\tNAME\tSIZE\tSTATUS\tFAILURE CODE\tPREPARATION OUTCOME\tHELPER GENERATION\tSWEEP EPOCH\tNETWORK"); err != nil {
 			return err
 		}
 		preparationCode, helperGeneration, sweepEpoch := "N/A", "N/A", "N/A"
@@ -1137,15 +1137,20 @@ func writeStorageMutation(writer io.Writer, output storageMutationOutput, jsonOu
 			helperGeneration = strconv.FormatUint(outcome.HelperGeneration, 10)
 			sweepEpoch = valueOrNA(outcome.SweepEpoch)
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%d\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			output.CustodyImport.ImportID, output.CustodyImport.ExportID, output.CustodyImport.OperationRevision,
 			output.CustodyImport.DestinationComputerID, output.CustodyImport.DestinationStorageID,
 			output.CustodyImport.DestinationName, output.CustodyImport.DestinationSize, output.CustodyImport.Status,
-			valueOrNA(output.CustodyImport.FailureCode), preparationCode, helperGeneration, sweepEpoch); err != nil {
+			valueOrNA(output.CustodyImport.FailureCode), preparationCode, helperGeneration, sweepEpoch, output.CustodyImport.Network); err != nil {
 			return err
 		}
 		if err := table.Flush(); err != nil {
 			return err
+		}
+		if output.CustodyImport.NetworkNote != "" {
+			if _, err := fmt.Fprintln(writer, output.CustodyImport.NetworkNote); err != nil {
+				return err
+			}
 		}
 	}
 	if output.ProvenanceUnavailable != "" {
@@ -1199,14 +1204,14 @@ func int64OptionalOrNA(value int64) string {
 
 func writeStorageComputer(writer io.Writer, computer l1.Computer) error {
 	table := tabwriter.NewWriter(writer, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tRECONFIGURATION\tBACKUP CAP\tGRANTS\tREMOVAL OUTCOME"); err != nil {
+	if _, err := fmt.Fprintln(table, "COMPUTER ID\tNAME\tDESIRED\tOBSERVED\tSTORAGE\tINTENT/APPLIED\tRECONFIGURATION\tBACKUP CAP\tGRANTS\tREMOVAL OUTCOME\tNETWORK"); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%d\t%d\t%s\n",
+	if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s@%d\t%d/%d\t%s\t%d\t%d\t%s\t%s\n",
 		computer.ComputerID, computer.Name, computer.DesiredState, computer.CurrentJob.Status,
 		computer.StorageID, computer.StorageGeneration, computer.IntentRevision, computer.AppliedRevision,
 		computer.ReconfigurationPhase, computer.BackupCap, len(computer.Grants),
-		computerRemovalColumn(computer.RemovalOutcome, computer.CurrentJob.Removal)); err != nil {
+		computerRemovalColumn(computer.RemovalOutcome, computer.CurrentJob.Removal), computer.Network); err != nil {
 		return err
 	}
 	return table.Flush()

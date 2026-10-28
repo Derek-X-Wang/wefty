@@ -2395,7 +2395,7 @@
     "ComputerCustodyImport": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["import_id", "export_id", "operation_revision", "destination_computer_id", "destination_storage_id", "destination_name", "destination_size", "status", "requested_at"],
+        "required": ["import_id", "export_id", "operation_revision", "destination_computer_id", "destination_storage_id", "destination_name", "destination_size", "status", "requested_at", "network"],
         "properties": {
           "import_id": { "type": "string", "minLength": 1 },
           "export_id": { "type": "string", "minLength": 1 },
@@ -2408,7 +2408,9 @@
       "failure_code": { "enum": ["manifest_invalid", "digest_mismatch", "insufficient_disk", "cancelled", "aborted_dead_node"] },
       "preparation_outcome": { "$ref": "#/components/schemas/ComputerStoragePreparationOutcome" },
           "requested_at": { "type": "string", "format": "date-time" },
-          "completed_at": { "type": "string", "format": "date-time" }
+          "completed_at": { "type": "string", "format": "date-time" },
+          "network": { "type": "string", "enum": ["internet", "none"] },
+          "network_note": { "type": "string", "description": "Explains when the portable source network is unknown. New imports use none." }
         }
       },
       "BackupCopy": {
@@ -2678,7 +2680,8 @@
           "external_path": { "type": "string", "minLength": 1 },
           "custody_fence": { "type": "string", "minLength": 1 },
           "source_spec": { "$ref": "#/components/schemas/JobSpec" },
-          "source_spec_hash": { "type": "string", "minLength": 1 }
+          "source_spec_hash": { "type": "string", "minLength": 1 },
+          "network": { "type": "string", "enum": ["internet", "none"], "description": "Source Computer network; absence means unknown." }
         }
       },
       "Attempt": {

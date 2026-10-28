@@ -10,6 +10,7 @@ import "testing"
 func TestServiceAcceptanceComputerRestoreAndCloneContract(t *testing.T) {
 	t.Run("restore generation and authority", TestComputerRestorePublishesExactlyOneStoppedGenerationAndKeepsSource)
 	t.Run("restore removal supersession", TestComputerRemovalSupersedesAndAttestsRestorePrecommittedBackup)
+	t.Run("clone network inheritance", TestComputerCloneKeepsSourceNetwork)
 	t.Run("clone identity and expansion", TestComputerCloneCreatesNewStoppedIdentityWithoutGrantsAndExpands)
 	t.Run("clone custody removal", TestComputerCloneCustodyRemovalReducesThenCoordinatedRemovalVerifies)
 	t.Run("twenty receipt mutations", TestComputerStorageCopyReceiptMutationRowsFailTwentyOfTwenty)

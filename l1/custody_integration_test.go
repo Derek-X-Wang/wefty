@@ -52,7 +52,7 @@ func custodyManifest(directive ComputerCustodyExportDirective) contract.Computer
 		AllocatedSize: directive.AllocatedSize, ContentDigest: directive.ContentDigest, Encryption: "none",
 		NodeID: directive.BoundNodeID, RootInstanceID: directive.RootInstanceID,
 		OperationRevision: directive.OperationRevision, CustodyFence: directive.CustodyFence,
-		JobSpec: directive.SourceSpec, JobSpecHash: directive.SourceSpecHash, DiskFile: "storage.ext4", Phase: "complete"}
+		JobSpec: directive.SourceSpec, JobSpecHash: directive.SourceSpecHash, DiskFile: "storage.ext4", Phase: "complete", Network: string(directive.Network)}
 }
 
 func TestCustodyExportCommitsTaintBeforeBytesAndAttestationNeverUpgrades(t *testing.T) {
@@ -752,6 +752,13 @@ func TestCustodyImportFailureUsesStoredVerbAndReleasesName(t *testing.T) {
 	if err != nil || observed.Status != "failed" || observed.FailureCode != "manifest_invalid" ||
 		observed.PreparationOutcome != nil || observed.CompletedAt == nil {
 		t.Fatalf("failed import durable observation = %#v err=%v", observed, err)
+	}
+	failedReplay, replayed, err := h.store.BeginComputerCustodyImport(context.Background(), export.ExportID,
+		ComputerCustodyImportRequest{Name: "reusable-import", DiskBytes: backup.AllocatedSize,
+			NodeID: node.NodeID, ExternalPath: directive.ExternalPath, Manifest: manifest,
+			ManifestDigest: exportReceipt.ManifestDigest, IdempotencyKey: "failed-import", Actor: "operator"})
+	if err != nil || !replayed || failedReplay.Status != "failed" || failedReplay.Network != ComputerNetworkInternet {
+		t.Fatalf("failed import replay lost its outcome/network after identity release: %+v replay=%t error=%v", failedReplay, replayed, err)
 	}
 	if _, _, err := h.store.BeginComputerCustodyImport(context.Background(), export.ExportID,
 		ComputerCustodyImportRequest{Name: "reusable-import", DiskBytes: backup.AllocatedSize,
