@@ -41,11 +41,15 @@ func (supervisor *Supervisor) demand(ctx context.Context) ([]DemandItem, error) 
 func (supervisor *Supervisor) IdleDue(ctx context.Context) bool {
 	intent, err := supervisor.readIntent(ctx)
 	items, demandErr := supervisor.demand(ctx)
+	var lastDemand time.Time
+	if source, ok := supervisor.config.Demand.(interface{ LastDemandAt() time.Time }); ok {
+		lastDemand = source.LastDemandAt()
+	}
 	supervisor.mu.Lock()
 	defer supervisor.mu.Unlock()
 	supervisor.facts.Position = intent.PositionValue()
 	supervisor.facts.Demand = append([]DemandItem(nil), items...)
-	if err != nil || demandErr != nil || intent.PositionValue() != OCIPositionOnDemand || len(items) > 0 {
+	if err != nil || demandErr != nil || intent.PositionValue() != OCIPositionOnDemand || len(items) > 0 || supervisor.facts.State != InstanceRunning {
 		supervisor.idleSince = time.Time{}
 		return false
 	}
@@ -53,16 +57,26 @@ func (supervisor *Supervisor) IdleDue(ctx context.Context) bool {
 	if supervisor.idleSince.IsZero() {
 		supervisor.idleSince = now
 	}
+	if lastDemand.After(supervisor.idleSince) {
+		supervisor.idleSince = lastDemand
+	}
 	return now.Sub(supervisor.idleSince) >= supervisor.config.IdleWait
 }
 
 func (supervisor *Supervisor) idleStopped(ctx context.Context, intent OCIIntent, state InstanceState) bool {
-	if intent.PositionValue() != OCIPositionOnDemand || state != InstanceStopped {
+	if intent.PositionValue() != OCIPositionOnDemand || (state != InstanceStopped && state != InstanceBroken) {
 		return false
 	}
 	items, err := supervisor.demand(ctx)
 	if err != nil || len(items) > 0 {
 		return false
+	}
+	if state == InstanceBroken {
+		if err := supervisor.forceStop(ctx); err != nil {
+			supervisor.record(state, true, false, contract.CapabilityReasonLimaBroken, false)
+			return false
+		}
+		state = InstanceStopped
 	}
 	supervisor.record(state, true, false, contract.CapabilityReasonHostVMIdle, false)
 	return true
@@ -73,6 +87,19 @@ func (supervisor *Supervisor) idleStopped(ctx context.Context, intent OCIIntent,
 func (supervisor *Supervisor) StopIdle(ctx context.Context) error {
 	supervisor.ensureMu.Lock()
 	defer supervisor.ensureMu.Unlock()
+	return supervisor.stopIdle(ctx, nil)
+}
+
+// stopIdle is serialized by the caller's cycle lock. The standalone entry
+// point above uses ensureMu instead; neither node admission mutex spans it.
+func (supervisor *Supervisor) stopIdle(ctx context.Context, beforeStop func()) (stopErr error) {
+	defer func() {
+		if stopErr != nil && !errors.Is(stopErr, errIdleStopCanceled) {
+			supervisor.mu.Lock()
+			supervisor.idleSince = supervisor.config.now()
+			supervisor.mu.Unlock()
+		}
+	}()
 	intent, err := supervisor.readIntent(ctx)
 	if err != nil {
 		return err
@@ -83,6 +110,9 @@ func (supervisor *Supervisor) StopIdle(ctx context.Context) error {
 	}
 	if intent.PositionValue() != OCIPositionOnDemand || len(items) > 0 {
 		return errIdleStopCanceled
+	}
+	if beforeStop != nil {
+		beforeStop()
 	}
 	return supervisor.gracefulIdleStop(ctx)
 }
@@ -100,9 +130,9 @@ func (barrier *SupervisedBootBarrier) IdleStop(ctx context.Context, check func()
 	}
 	// Detach deliberately before shutdown so the helper EOF cannot publish
 	// helper_unreachable over the acknowledged host_vm_idle observation.
-	barrier.Barrier.Invalidate()
-	// StopIdle reads the cached node snapshot, never the claim lock.
-	if err := barrier.Supervisor.StopIdle(ctx); err != nil {
+	// The final cached-demand check must also precede detachment. It never
+	// takes the claim lock, which was released after the stopping mark.
+	if err := barrier.Supervisor.stopIdle(ctx, barrier.Barrier.Invalidate); err != nil {
 		if errors.Is(err, errIdleStopCanceled) {
 			return false, nil
 		}
@@ -133,14 +163,23 @@ func (supervisor *Supervisor) gracefulIdleStop(ctx context.Context) error {
 // DemandState is a node-owned snapshot. Reading it never takes the claim lock,
 // so Lima recovery cannot invert the claim -> cycle lock order of idle stop.
 type DemandState struct {
-	mu    sync.RWMutex
-	items []DemandItem
-	err   error
+	now        func() time.Time
+	mu         sync.RWMutex
+	items      []DemandItem
+	lastDemand time.Time
+	err        error
 }
 
 func (state *DemandState) Replace(items []DemandItem, err error) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if len(items) > 0 || len(state.items) > 0 {
+		now := time.Now
+		if state.now != nil {
+			now = state.now
+		}
+		state.lastDemand = now()
+	}
 	state.items = append([]DemandItem(nil), items...)
 	state.err = err
 }
@@ -155,4 +194,44 @@ func (barrier *SupervisedBootBarrier) IdleDue(ctx context.Context) bool {
 }
 func (barrier *SupervisedBootBarrier) IdleReason() contract.CapabilityReasonCode {
 	return barrier.Supervisor.Facts().ReasonCode
+}
+
+func (state *DemandState) LastDemandAt() time.Time {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return state.lastDemand
+}
+
+// HostVMIdleSkipError is intentional absence of OCI work, not a failed probe.
+type HostVMIdleSkipError struct{}
+
+func (*HostVMIdleSkipError) Error() string { return "host VM is idle; OCI recovery skipped" }
+func (*HostVMIdleSkipError) CapabilityReasonCode() contract.CapabilityReasonCode {
+	return contract.CapabilityReasonHostVMIdle
+}
+
+// OCIRecoverySkip reads intent and cached demand only. Quiet heartbeats must
+// not inspect Lima, acquire a new helper session or sweep the namespace.
+func (barrier *SupervisedBootBarrier) OCIRecoverySkip(ctx context.Context) error {
+	s := barrier.Supervisor
+	facts := s.Facts()
+	if facts.Stopping {
+		return &HostVMIdleSkipError{}
+	}
+	intent, err := s.readIntent(ctx)
+	if err != nil {
+		return nil // Ordinary recovery owns intent errors; only known idle skips it.
+	}
+	if intent.PositionValue() != OCIPositionOnDemand || facts.State != InstanceStopped {
+		return nil
+	}
+	items, err := s.demand(ctx)
+	if err != nil {
+		return nil
+	}
+	if len(items) == 0 {
+		s.record(InstanceStopped, true, false, contract.CapabilityReasonHostVMIdle, false)
+		return &HostVMIdleSkipError{}
+	}
+	return nil
 }

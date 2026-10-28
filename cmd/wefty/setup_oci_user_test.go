@@ -78,3 +78,43 @@ func setupOCIAssetsFixture(t *testing.T, f *setupFixture) string {
 	}
 	return config
 }
+
+func TestRepeatedSetupPreservesExistingIntentPosition(t *testing.T) {
+	for _, position := range []string{"legacy-enabled", "off", "on-demand", "always-on"} {
+		t.Run(position, func(t *testing.T) {
+			f := newSetupFixture(t)
+			assets := setupOCIAssetsFixture(t, f)
+			f.setup(t, setupRequest{ociConfig: assets})
+			paths, err := resolveSetupPaths(f.home)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(paths.data, "oci-intent.json")
+			var payload []byte
+			if position == "legacy-enabled" {
+				payload = []byte(`{"version":1,"revision":7,"enabled":true,"updated_at":"1970-01-01T00:00:01Z"}`)
+			} else {
+				payload, _ = json.Marshal(limarunner.OCIIntent{Version: 2, Revision: 7, Enabled: position != "off", Position: limarunner.OCIPosition(position), UpdatedAt: time.Unix(1, 0)})
+			}
+			if err := os.WriteFile(path, payload, 0600); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				f.setup(t, setupRequest{})
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(payload) {
+				t.Fatalf("setup rewrote %s marker", position)
+			}
+			if position == "legacy-enabled" {
+				intent, err := (limarunner.FileIntentSource{Path: path}).ReadIntent(t.Context())
+				if err != nil || intent.PositionValue() != limarunner.OCIPositionAlwaysOn {
+					t.Fatalf("legacy upgrade=%+v %v", intent, err)
+				}
+			}
+		})
+	}
+}

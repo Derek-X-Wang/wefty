@@ -129,7 +129,16 @@ func (controller *Controller) Start(ctx context.Context, request IntentMutationR
 		return IntentResponse{Intent: intent}, runtimeUnavailable("OCI runtime is unavailable", nil)
 	}
 	if position == lima.OCIPositionOnDemand {
-		return IntentResponse{Intent: intent, CapabilityPublished: controller.config.Runtime.OCIRuntimeLive()}, nil
+		runtime, ok := controller.config.Runtime.(interface {
+			EnableOnDemand(context.Context, uint64) error
+		})
+		if !ok {
+			return IntentResponse{Intent: intent}, runtimeUnavailable("on-demand intent publication is unavailable", nil)
+		}
+		if err := runtime.EnableOnDemand(ctx, intent.Revision); err != nil {
+			return IntentResponse{Intent: intent}, runtimeUnavailable("on-demand intent publication failed", err)
+		}
+		return IntentResponse{Intent: intent, CapabilityPublished: true}, nil
 	}
 	if current.Enabled && controller.config.Runtime.OCIRuntimeLive() {
 		return IntentResponse{Intent: intent, CapabilityPublished: true}, nil

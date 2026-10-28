@@ -24,7 +24,7 @@ func TestOnDemandSwitchDoesNotStartHostVM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Intent.PositionValue() != lima.OCIPositionOnDemand || runtime.recovered != 0 {
+	if response.Intent.PositionValue() != lima.OCIPositionOnDemand || runtime.recovered != 0 || runtime.onDemandReason != "host_vm_idle" || !response.CapabilityPublished {
 		t.Fatalf("on-demand switch started host VM: %+v recoveries=%d", response, runtime.recovered)
 	}
 }

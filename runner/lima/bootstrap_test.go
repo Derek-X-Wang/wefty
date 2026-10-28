@@ -645,3 +645,21 @@ func validGuestHelperInstallConfig(t *testing.T) GuestHelperInstallConfig {
 		SystemdVersion: 255,
 	}
 }
+
+func TestRemovalDoesNotRequireStartupSpaceProof(t *testing.T) {
+	// No real Lima command runs: the executable models a stopped instance and
+	// successful removal. An unavailable space measurement must not block cleanup.
+	t.Setenv("LIMA_HOME", "unverified-volume")
+	if err := CheckHostVMFreeSpace(HostVMHome(), DefaultHostVMMinimumFreeBytes); err == nil {
+		t.Fatal("fixture must refuse the ordinary startup space check")
+	}
+	executable := filepath.Join(t.TempDir(), "fake-lima-removal")
+	script := "#!/bin/sh\nif [ \"$1\" = list ]; then\n printf '%s\\n' '{\"name\":\"wefty-oci\",\"status\":\"stopped\"}'\nfi\n"
+	if err := os.WriteFile(executable, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := RemoveGuestHelper(t.Context(), GuestHelperRemovalConfig{Instance: DefaultInstanceName, Limactl: executable})
+	if err != nil || !evidence.FilesAbsent || !evidence.SocketStopped || !evidence.ServiceStopped {
+		t.Fatalf("space check blocked removal: %+v %v", evidence, err)
+	}
+}

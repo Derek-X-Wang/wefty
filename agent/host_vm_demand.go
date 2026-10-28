@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
@@ -21,6 +22,8 @@ type NoQueuedOCIDemand struct{}
 func (NoQueuedOCIDemand) QueuedOCIWork(context.Context) ([]lima.DemandItem, error) { return nil, nil }
 
 type hostVMState struct {
+	stopping        atomic.Bool
+	idleLogged      atomic.Bool
 	mu              sync.Mutex
 	directives      []lima.DemandItem
 	loads           int
@@ -232,6 +235,8 @@ type HostVMIdleCycle interface {
 	IdleDue(context.Context) bool
 	IdleReason() contract.CapabilityReasonCode
 	IdleStop(context.Context, func() bool) (bool, error)
+	MarkStopping(context.Context) error
+	FinishStopping() error
 }
 
 func (a *Agent) PollHostVM(ctx context.Context, barrier HostVMIdleCycle) error {
@@ -264,6 +269,8 @@ func (a *Agent) PollHostVM(ctx context.Context, barrier HostVMIdleCycle) error {
 		return errors.New("host VM idle capability withdrawal is not acknowledged")
 	}
 	a.session.claimMu.Lock()
+	claimsLocked := true
+	marked := false
 	var demandErr error
 	stopped, err := barrier.IdleStop(ctx, func() bool {
 		items, e := a.hostVMDemandLocked(ctx)
@@ -274,16 +281,137 @@ func (a *Agent) PollHostVM(ctx context.Context, barrier HostVMIdleCycle) error {
 		if snapshot != nil {
 			snapshot.Replace(items, e)
 		}
-		return e == nil && len(items) == 0
+		if e != nil || len(items) != 0 {
+			return false
+		}
+		if e = barrier.MarkStopping(ctx); e != nil {
+			demandErr = e
+			return false
+		}
+		marked = true
+		a.session.hostVM.stopping.Store(true)
+		// The durable mark closes OCI recovery. Only the Lima cycle lock spans
+		// the command; process claims, completion and doctor stay available.
+		a.session.claimMu.Unlock()
+		claimsLocked = false
+		a.session.ociRecoveryMu.Unlock()
+		recoveryLocked = false
+		return true
 	})
-	a.session.claimMu.Unlock()
-	a.session.ociRecoveryMu.Unlock()
-	recoveryLocked = false
+	if claimsLocked {
+		a.session.claimMu.Unlock()
+	}
+	if recoveryLocked {
+		a.session.ociRecoveryMu.Unlock()
+		recoveryLocked = false
+	}
+	if marked {
+		err = errors.Join(err, barrier.FinishStopping())
+		a.session.hostVM.stopping.Store(false)
+	}
 	if !stopped {
 		// Restore the earned capability after releasing both locks. A changed
 		// switch is revalidated by ordinary recovery.
-		restoreErr := a.RecoverOCIRuntimeCapabilities(ctx)
+		restoreErr := a.restoreHostVMCapability(ctx)
 		return errors.Join(err, demandErr, restoreErr)
 	}
+	return err
+}
+
+// Cancellation keeps an earned helper session. Only a lost generation needs
+// takeover and a namespace sweep; live work must survive a canceled stop.
+func (a *Agent) restoreHostVMCapability(ctx context.Context) error {
+	session := a.session
+	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
+		return err
+	}
+	defer session.ociRecoveryMu.Unlock()
+	if session.ociIntent != nil {
+		observation, err := session.ociIntent(ctx)
+		if err != nil {
+			return err
+		}
+		if !observation.Enabled {
+			session.capabilities.suppressOCIIntent(errOCIIntentDisabled)
+			_, err = session.publishCapabilityHeartbeat(ctx, nil)
+			return err
+		}
+	}
+	if session.ociBootBarrier != nil {
+		if _, ready := session.ociBootBarrier.Generation(); ready {
+			_, err := session.publishRegistrationCapabilityPinnedLocked(ctx)
+			return err
+		}
+	}
+	generation, err := session.recoverOCIRuntimeLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if session.ociBootBarrier == nil {
+		return nil
+	}
+	_, err = session.publishCapabilityHeartbeat(ctx, &generation)
+	return err
+}
+
+func (session *agentSession) skipHostVMRecovery(ctx context.Context) error {
+	if session.hostVM.stopping.Load() {
+		return &CapabilityProbeSkippedError{ReasonCode: contract.CapabilityReasonHostVMIdle}
+	}
+	if session.capabilities.ociIntentDisabled.Load() {
+		return nil
+	}
+	skipper, ok := session.ociBootBarrier.(interface{ OCIRecoverySkip(context.Context) error })
+	if !ok {
+		return nil
+	}
+	err := skipper.OCIRecoverySkip(ctx)
+	if err == nil {
+		session.hostVM.idleLogged.Store(false)
+		return nil
+	}
+	var reason interface {
+		CapabilityReasonCode() contract.CapabilityReasonCode
+	}
+	if !errors.As(err, &reason) || reason.CapabilityReasonCode() != contract.CapabilityReasonHostVMIdle {
+		return err
+	}
+	if session.capabilities.snapshot().ReasonCode != contract.CapabilityReasonHostVMIdle {
+		session.capabilities.suppressOCI(contract.CapabilityReasonHostVMIdle, err)
+	}
+	if !session.hostVM.idleLogged.Swap(true) && session.logf != nil {
+		session.logf("node agent: host VM idle; OCI recovery skipped")
+	}
+	return &CapabilityProbeSkippedError{ReasonCode: contract.CapabilityReasonHostVMIdle}
+}
+
+// EnableOnDemand clears a previous off latch without booting the host VM.
+func (a *Agent) EnableOnDemand(ctx context.Context, revision uint64) error {
+	s := a.session
+	if err := lockMutexContext(ctx, &s.ociRecoveryMu); err != nil {
+		return err
+	}
+	defer s.ociRecoveryMu.Unlock()
+	if s.ociIntent == nil {
+		return errors.New("OCI intent authority is unavailable")
+	}
+	observation, err := s.ociIntent(ctx)
+	if err != nil {
+		return err
+	}
+	if !observation.Enabled || observation.Revision != revision {
+		return errors.New("OCI switch changed during on-demand publication")
+	}
+	if err := s.allowOCIIntentIfUnchanged(a.capabilities.ociSuppressionSequence.Load(), revision); err != nil {
+		return err
+	}
+	if s.ociBootBarrier != nil {
+		if _, ready := s.ociBootBarrier.Generation(); ready {
+			_, err := s.publishRegistrationCapabilityPinnedLocked(ctx)
+			return err
+		}
+	}
+	a.capabilities.suppressOCI(contract.CapabilityReasonHostVMIdle, errors.New("host VM on demand; no runtime started"))
+	_, err = s.publishCapabilityHeartbeat(ctx, nil)
 	return err
 }

@@ -62,6 +62,14 @@ func prepareInstalledUserOCI(ctx context.Context, path, nodeID, bootID, expected
 		return false, preparedErr
 	}
 	skipPrepare := !c.ProofDialog && currentIntent.PositionValue() == limarunner.OCIPositionOnDemand && preparedErr == nil && prepared == wanted
+	if skipPrepare {
+		// The receipt describes prepared assets, not continued instance existence.
+		info, err := os.Lstat(filepath.Join(c.LimaHome, c.Instance, "lima.yaml"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+		skipPrepare = err == nil && info.Mode().IsRegular()
+	}
 	if !skipPrepare {
 		log.Printf("per-user host VM bootstrap begin pid=%d at=%s", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
 		if err := prepare(ctx, c, nodeID, bootID); err != nil {

@@ -4,12 +4,14 @@ package ocicontrol
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 )
 
@@ -22,8 +24,10 @@ func TestProcessJobCannotChangeHostVMThroughOperatorSocket(t *testing.T) {
 		defer client.Close()
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
-		if _, err := client.Start(ctx, 1); err == nil {
-			t.Fatal("process job changed owner switch through operator socket")
+		_, err = client.Start(ctx, 1)
+		var refusal *ResponseError
+		if !errors.As(err, &refusal) || refusal.Status != 403 || refusal.Code != contract.ErrorForbidden {
+			t.Fatalf("process caller needs a typed refusal: %v", err)
 		}
 		return
 	}

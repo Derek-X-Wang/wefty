@@ -385,18 +385,32 @@ and durable removals recovered after a node-agent restart. An unreadable demand
 source prevents idle stop. `QueuedOCIDemand` is the #1144 hint seam; the current
 `NoQueuedOCIDemand` supplies none. It will read node-owned cached claim-poll
 facts, not perform a network request while holding the claim lock. No control
-socket request accepts a demand value.
+socket request accepts a demand value. The node control socket checks peer
+ancestry through native parent-PID reads in each connection handler, outside
+the accept loop. A descendant of the node agent or an unreadable ancestry
+receives HTTP 403 `forbidden`, with an instruction to use the owner's own
+shell; the CLI reports that refusal with exit 3.
 
 The idle wait starts at the first empty demand observation, using the node's
-clock. The watchdog polls every five seconds. `--host-vm-idle-wait` changes the
+clock. Each demand observation and the end of an owner image import stamp the
+last-demand time, so demand between watchdog polls resets the wait. The watchdog
+polls every five seconds. `--host-vm-idle-wait` changes the
 node setting; per-user `wefty setup` persists it and preserves it when omitted.
 After the idle wait, the node serializes with OCI recovery, publishes reduced
 capability with `host_vm_idle`, and waits for L1's acknowledgement. It then
 checks demand under the claim lock, takes the Lima cycle lock, and checks demand
 and the switch again before shutdown. New demand before shutdown cancels the
-stop and restores capability. The cycle runs graceful `limactl stop` with a
+stop and restores the pinned ready generation without replacing its helper
+session. Full recovery is needed only if that generation is gone. Under the
+claim lock, the node writes a durable stopping mark, then releases the claim
+and recovery locks before the stop command. Only the Lima cycle lock spans
+the command. Heartbeats skip OCI recovery while stopping; process claims,
+completion bookkeeping and doctor remain available. A node-agent restart
+reconciles the stopping mark with Lima state before watchdog recovery. The cycle
+runs graceful `limactl stop` with a
 separate four-minute timeout. Only a timeout permits `--force`; other failures
-remain failures. This does not raise the ordinary thirty-second command budget.
+remain failures and re-arm the idle wait before another attempt. This does not
+raise the ordinary thirty-second command budget.
 The #1144 start-race seam handles a request arriving after shutdown has begun.
 
 A stopped host VM with no demand under `on-demand` has the closed capability
@@ -404,16 +418,22 @@ reason `host_vm_idle`. Doctor treats that state and its reduced capability as
 healthy, reads no guest diagnostics for that state, never starts the host VM,
 and displays the demand items when it runs. The watchdog repairs stopped or
 broken state only for `always-on`, or `on-demand` with known demand; it never
-restarts an idle-stopped host VM. Before a host VM starts, the node checks free
+restarts an idle-stopped host VM. Broken state with no demand is force-stopped
+and recorded as idle, without a repair start. Quiet idle heartbeats skip
+`Ensure`, publish once, and log only the idle transition. Before a host VM
+starts, the node checks free
 space on its Mac disk volume. The default minimum is **5 GiB**; the node setting
 `--host-vm-minimum-free-bytes` and per-user setup can change it. An unverified or
-insufficient measurement refuses startup with a reason and a fix.
+insufficient measurement refuses startup with a reason in GiB and a fix.
+Removal preparation is exempt from this check, so cleanup works on a full disk.
 
 `setup-oci` remains configure-only: it checks prerequisites, writes configuration
 and reports convergence without starting OCI. An explicit restart/recreate with
 zero live OCI attempts retains its existing guards. A per-user node startup
 prepares helper and probe assets once; an unchanged prepared on-demand install
-stays stopped across daemon restarts. The proof install keeps its attended
+stays stopped across daemon restarts while its Lima instance still exists.
+A receipt alone cannot skip preparation for a deleted instance. The proof
+install keeps its attended
 bootstrap and dialog behavior.
 
 Configure-only setup writes a separate desired-state receipt before returning

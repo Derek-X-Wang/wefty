@@ -52,6 +52,8 @@ type Server struct {
 	allowedUIDs          map[uint32]struct{}
 	shutdownDrainTimeout time.Duration
 	refuseDescendants    bool
+	parentPID            func(int) (int, error)
+	peerPID              func(net.Conn) (int, error)
 	logf                 func(string, ...any)
 }
 
@@ -95,7 +97,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	authenticated := &peerAuthenticatedListener{Listener: listener, allowedUIDs: server.allowedUIDs, refuseDescendants: server.refuseDescendants}
+	authenticated := &peerAuthenticatedListener{Listener: listener, allowedUIDs: server.allowedUIDs}
 	server.listener = authenticated
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/doctor", server.handleDoctor)
@@ -105,7 +107,7 @@ func (server *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/oci/start", server.handleStart)
 	mux.HandleFunc("POST /v1/oci/stop", server.handleStop)
 	mux.HandleFunc("POST /v1/images/load", server.handleLoadImage)
-	server.server = &http.Server{Handler: mux, ReadHeaderTimeout: controlReadHeaderTimeout, ReadTimeout: controlRequestReadTimeout}
+	server.server = &http.Server{Handler: server.authorizePeer(mux), ConnContext: server.peerContext, ReadHeaderTimeout: controlReadHeaderTimeout, ReadTimeout: controlRequestReadTimeout}
 	shutdownComplete := make(chan struct{})
 	shutdown := context.AfterFunc(ctx, func() {
 		defer close(shutdownComplete)
@@ -254,8 +256,7 @@ func sweepControlSocketStagingDirectories(directory string, prefixes ...string) 
 
 type peerAuthenticatedListener struct {
 	net.Listener
-	allowedUIDs       map[uint32]struct{}
-	refuseDescendants bool
+	allowedUIDs map[uint32]struct{}
 }
 
 func (listener *peerAuthenticatedListener) Accept() (net.Conn, error) {
@@ -266,13 +267,7 @@ func (listener *peerAuthenticatedListener) Accept() (net.Conn, error) {
 		}
 		uid, err := unixPeerUID(connection)
 		if _, allowed := listener.allowedUIDs[uid]; err == nil && allowed {
-			if !listener.refuseDescendants {
-				return connection, nil
-			}
-			pid, pidErr := unixPeerPID(connection)
-			if pidErr == nil && operatorPeer(pid) {
-				return connection, nil
-			}
+			return connection, nil
 		}
 		_ = connection.Close()
 	}
@@ -423,5 +418,7 @@ func NewNodeServer(path string, service Service, allowedUIDs ...uint32) (*Server
 		return nil, err
 	}
 	server.refuseDescendants = true
+	server.parentPID = readParentPID
+	server.peerPID = unixPeerPID
 	return server, nil
 }

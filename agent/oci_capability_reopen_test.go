@@ -56,7 +56,7 @@ func (barrier *staleSupervisorBarrier) Invalidate() {
 	barrier.ready = false
 }
 
-// stop mirrors `wefty node oci stop`: Lima is stopped and the supervisor
+// stop mirrors `wefty node oci off`: Lima is stopped and the supervisor
 // records the disabled intent it enforced.
 func (barrier *staleSupervisorBarrier) stop() {
 	barrier.mu.Lock()
@@ -90,7 +90,7 @@ func (barrier *staleSupervisorBarrier) SetLossHandler(func(ocihelper.HelperSessi
 func (barrier *staleSupervisorBarrier) Close() error { return nil }
 
 // TestOCIIntentStopThenStartReopensCapabilityWithoutRestart is the #395
-// regression: `wefty node oci stop` followed by `wefty node oci start` must
+// regression: `wefty node oci off` followed by `wefty node oci always-on` must
 // reopen OCI capability in the running process, at a strictly higher Capability
 // revision, while Lima and the helper are healthy.
 func TestOCIIntentStopThenStartReopensCapabilityWithoutRestart(t *testing.T) {
@@ -145,7 +145,7 @@ func TestOCIIntentStopThenStartReopensCapabilityWithoutRestart(t *testing.T) {
 		t.Fatalf("initial OCI admission = %+v, want open OCI capability", opened)
 	}
 
-	// `wefty node oci stop`: the durable marker is disabled, the agent latches
+	// `wefty node oci off`: the durable marker is disabled, the agent latches
 	// admission closed, and Lima stops with oci_intent_disabled in its facts.
 	intentEnabled.Store(false)
 	intentRevision.Store(3)
@@ -161,7 +161,7 @@ func TestOCIIntentStopThenStartReopensCapabilityWithoutRestart(t *testing.T) {
 		t.Fatalf("stop revision = %d, want greater than %d", stopped.Revision, opened.Revision)
 	}
 
-	// `wefty node oci start`: durable intent is enabled again at a higher
+	// `wefty node oci always-on`: durable intent is enabled again at a higher
 	// revision while the runtime is healthy.
 	intentEnabled.Store(true)
 	intentRevision.Store(4)
@@ -255,7 +255,7 @@ func TestCapabilityRevisionNeverRegressesAcrossAgentRestart(t *testing.T) {
 }
 
 // TestColdStartUnderDisabledIntentPublishesIntentReason covers the restart and
-// reboot half of #395: a node whose operator ran `wefty node oci stop` must
+// reboot half of #395: a node whose operator ran `wefty node oci off` must
 // come back publishing oci_intent_disabled with the latch armed. Nothing else
 // re-arms it — Lima is stopped, so the supervisor never asks for background
 // recovery — and without the latch the ADR-0003 guard in recordProbeResult is

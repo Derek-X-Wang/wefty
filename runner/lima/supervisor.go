@@ -81,6 +81,7 @@ type StateTransition struct {
 
 // SupervisorFacts is the bounded supervisor observation exported to #128.
 type SupervisorFacts struct {
+	Stopping   bool                          `json:"stopping,omitempty"`
 	Instance   string                        `json:"instance"`
 	State      InstanceState                 `json:"state"`
 	Enabled    bool                          `json:"enabled"`
@@ -132,8 +133,9 @@ type Supervisor struct {
 	trailWarned bool
 	// helperLossAt stamps the last helper-loss signal. It is taken once, so a
 	// fault buys exactly one extra inspection however many cycles observe it.
-	helperLossAt time.Time
-	idleSince    time.Time
+	helperLossAt   time.Time
+	idleSince      time.Time
+	resumeIdleStop bool
 }
 
 // noteHelperLoss records that the helper connection was lost, which on this
@@ -211,7 +213,16 @@ func NewSupervisor(config SupervisorConfig) (*Supervisor, error) {
 	if !intent.Enabled {
 		facts.ReasonCode = contract.CapabilityReasonOCIIntentDisabled
 	}
-	return &Supervisor{config: config, facts: facts}, nil
+	s := &Supervisor{config: config, facts: facts}
+	if path := s.stoppingPath(); path != "" {
+		if _, err := os.Stat(path); err == nil {
+			s.facts.Stopping = true
+			s.resumeIdleStop = true
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	return s, nil
 }
 
 func (supervisor *Supervisor) Facts() SupervisorFacts {
@@ -299,7 +310,7 @@ func (supervisor *Supervisor) ensureWithin(ctx context.Context) error {
 			if !supervisor.idleStopped(ctx, intent, state) {
 				supervisor.record(state, true, false, reasonForInstanceState(state), false)
 			}
-			return errors.New("host VM has no demand")
+			return &HostVMIdleSkipError{}
 		}
 	}
 	// A Stopped reading just after a helper loss may be Lima's status file
@@ -345,6 +356,21 @@ func (supervisor *Supervisor) recoveryNeeded(ctx context.Context, helperReady bo
 	defer supervisor.ensureMu.Unlock()
 	intent, intentErr := supervisor.readIntent(ctx)
 	state, inspectErr := supervisor.inspect(ctx)
+	supervisor.mu.RLock()
+	resume := supervisor.resumeIdleStop
+	supervisor.mu.RUnlock()
+	if resume {
+		if inspectErr != nil {
+			return false
+		}
+		if err := supervisor.finishStopping(); err != nil {
+			return false
+		}
+		supervisor.mu.Lock()
+		supervisor.idleSince = supervisor.config.now()
+		supervisor.mu.Unlock()
+	}
+
 	if intentErr != nil || !intent.Enabled {
 		supervisor.record(state, false, false, contract.CapabilityReasonOCIIntentDisabled, false)
 		return state == InstanceRunning || state == InstanceBroken

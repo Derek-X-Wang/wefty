@@ -104,7 +104,7 @@ already elapsed; a re-attempt that fails extends the streak in the ledger and
 schedules the next one a window later. Only a barrier that succeeds clears the
 ledger. The ledger is never consumed by a refusal: on a native Linux node
 nothing restarts the helper unit -- there is no Lima repair, and
-`wefty node oci start` reaches the same refusing process -- so a bound held
+`wefty node oci always-on` reaches the same refusing process -- so a bound held
 only in one process's memory would outlive the repair that cleared the denial.
 Re-arming is what lets such a node recover with no restart at all. The refusal
 is a completed handshake without admission, so the agent's boot barrier reports

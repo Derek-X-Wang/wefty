@@ -205,7 +205,7 @@ outage, prove the same agent process remains alive, process work remains
 available, OCI capability is withdrawn with a higher revision, and OCI returns
 only after the helper handshake, boot sweep, and real probe.
 
-`wefty node oci stop` already stops the underlying VM as part of quiescing the
+`wefty node oci off` already stops the underlying VM as part of quiescing the
 runtime (observed on owner hardware, run 7: `runtime_quiesced: true` with Lima
 already `Stopped` immediately afterward), so a separate `limactl stop
 <instance>` after it is redundant and exits `fatal: expected status Running,
@@ -501,7 +501,7 @@ loss: the stop completes with no runtime-quiescence evidence. Require the Job
 to reach `failed` and not `stopped`, desired state to remain `stopped`, the
 recorded failure to name the unverified reap, and the binding, digest pin, and
 service data to be retained. `oci_runtime_quiescence_failed` belongs to the
-node control surface — it is what `wefty node oci stop` returns when the whole
+node control surface — it is what `wefty node oci off` returns when the whole
 runtime cannot be quiesced — and must not be expected as the per-job latch.
 
 Release the fault and remove the residue the denied deletion left behind, using

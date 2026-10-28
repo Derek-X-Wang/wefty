@@ -165,7 +165,7 @@ func (server *Server) recordStartupBarrierFailure(err error, rearmed bool) error
 // The ledger is never consumed here: only a barrier that succeeds clears it.
 // Consuming it would hand the bound to one process's memory, and on a native
 // Linux node nothing restarts that process -- no Lima repair exists there and
-// `wefty node oci start` reaches the same refusing helper -- so a node whose
+// `wefty node oci always-on` reaches the same refusing helper -- so a node whose
 // denial had been cleared would stay refused until a human restarted the unit.
 // The next attempt is therefore scheduled from the last failure, and a ledger
 // whose window has already elapsed asks for a sweep immediately.

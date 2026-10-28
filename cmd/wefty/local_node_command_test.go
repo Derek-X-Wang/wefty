@@ -345,7 +345,7 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json",
 		"node", "oci", "off",
 	}, &stdout, &stderr); err != nil {
-		t.Fatalf("oci stop: %v stderr=%s", err, stderr.String())
+		t.Fatalf("oci off: %v stderr=%s", err, stderr.String())
 	}
 	var stopped ocicontrol.IntentResponse
 	if err := json.Unmarshal(stdout.Bytes(), &stopped); err != nil || stopped.Intent.Enabled || !stopped.RuntimeQuiesced {
@@ -357,7 +357,7 @@ func TestSingularNodeCommandsBypassFabricAndUseLiveAgent(t *testing.T) {
 		"--fabric=invalid-must-not-open", "--node-config=" + configPath, "--json",
 		"node", "oci", "always-on",
 	}, &stdout, &stderr); err != nil {
-		t.Fatalf("oci start: %v stderr=%s", err, stderr.String())
+		t.Fatalf("oci always-on: %v stderr=%s", err, stderr.String())
 	}
 	var started ocicontrol.IntentResponse
 	if err := json.Unmarshal(stdout.Bytes(), &started); err != nil || !started.Intent.Enabled || !started.CapabilityPublished {
@@ -498,6 +498,6 @@ func TestSingularNodeCommandsExplainAPlainProcessNode(t *testing.T) {
 	}
 	err := run(context.Background(), []string{"--node-config", path, "node", "oci", "always-on"}, io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "plain-process node") || !strings.Contains(err.Error(), path) {
-		t.Fatalf("node oci start on a plain-process node = %v", err)
+		t.Fatalf("node oci always-on on a plain-process node = %v", err)
 	}
 }

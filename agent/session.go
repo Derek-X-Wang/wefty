@@ -249,7 +249,7 @@ func (session *agentSession) markRegistered() {
 // suppressOCIBeforeBootSweep publishes the restrictive observation that must
 // precede a boot sweep. A durable disabled marker is intent authority, not a
 // runtime fact, and reading it here is what arms the process latch on a cold
-// start that follows `wefty node oci stop`: the barrier may no longer speak for
+// start that follows `wefty node oci off`: the barrier may no longer speak for
 // intent, and a Lima instance left stopped never asks for background recovery.
 // An inconclusive read falls back to the barrier's own health, which withdraws
 // kind:oci without claiming an intent verdict it could not prove.
@@ -405,6 +405,10 @@ func (session *agentSession) publishRegistrationCapabilityPinned(ctx context.Con
 		return l1.Node{}, err
 	}
 	defer session.ociRecoveryMu.Unlock()
+	return session.publishRegistrationCapabilityPinnedLocked(ctx)
+}
+
+func (session *agentSession) publishRegistrationCapabilityPinnedLocked(ctx context.Context) (l1.Node, error) {
 	generation, ok := session.ociBootBarrier.Generation()
 	if !ok {
 		session.capabilities.suppressOCI(contract.CapabilityReasonBootSweepFailed, errors.New("OCI helper session lost after removal recovery"))
@@ -711,6 +715,9 @@ func lockMutexContext(ctx context.Context, mutex *sync.Mutex) error {
 }
 
 func (session *agentSession) recoverOCIRuntimeLocked(ctx context.Context) (ocihelper.HelperSession, error) {
+	if err := session.skipHostVMRecovery(ctx); err != nil {
+		return ocihelper.HelperSession{}, err
+	}
 	if session.ociBootBarrier == nil {
 		return ocihelper.HelperSession{}, session.capabilities.refresh(ctx)
 	}
@@ -1466,10 +1473,22 @@ func (session *agentSession) allowOCIIntentIfUnchanged(suppressionSequence, inte
 // never failed; it is the same root cause as the operator-visible #409 defect
 // on a different path.
 func (session *agentSession) heartbeatOCIPinned(ctx context.Context) (l1.HeartbeatResponse, error) {
+	if err := session.skipHostVMRecovery(ctx); err != nil {
+		if capabilityProbeWasSkipped(err) {
+			return session.publishCapabilityHeartbeatResponse(ctx, nil)
+		}
+		return l1.HeartbeatResponse{}, err
+	}
 	if err := lockMutexContext(ctx, &session.ociRecoveryMu); err != nil {
 		return l1.HeartbeatResponse{}, err
 	}
 	defer session.ociRecoveryMu.Unlock()
+	if err := session.skipHostVMRecovery(ctx); err != nil {
+		if capabilityProbeWasSkipped(err) {
+			return session.publishCapabilityHeartbeatResponse(ctx, nil)
+		}
+		return l1.HeartbeatResponse{}, err
+	}
 	var pinned *ocihelper.HelperSession
 	if generation, ready := session.ociBootBarrier.Generation(); ready {
 		refreshErr := session.capabilities.refreshValidated(ctx, func() error {

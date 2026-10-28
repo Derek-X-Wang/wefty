@@ -21,7 +21,7 @@ func (err *HostVMFreeSpaceError) HostVMStartRefusal() string {
 	if err.Cause != nil {
 		return "host VM free space is unverified; check access to the host VM disk volume and run wefty node doctor before retrying"
 	}
-	return fmt.Sprintf("host VM start refused: need %d bytes free, have %d; free space on the host VM disk volume and retry", err.Minimum, err.Available)
+	return fmt.Sprintf("host VM start refused: need %.2f GiB free, have %.2f GiB; free space on the host VM disk volume and retry", float64(err.Minimum)/(1<<30), float64(err.Available)/(1<<30))
 }
 
 func HostVMHome() string {
@@ -36,7 +36,7 @@ func HostVMHome() string {
 }
 
 // withHostVMStartSpaceCheck covers starts inside the guest installer too,
-// including its one group-membership restart and removal preparation.
+// including its one group-membership restart. Removal must work on a full disk.
 func withHostVMStartSpaceCheck(run commandRunner, minimum uint64) commandRunner {
 	return func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		if len(args) > 0 && args[0] == "start" {

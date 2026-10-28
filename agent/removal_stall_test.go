@@ -12,6 +12,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
+	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
@@ -533,12 +534,23 @@ func TestAnUntypedRemovalFailureNeverBecomesAStall(t *testing.T) {
 	controller.loadRuntimeRemoval = func(context.Context, string) (runtimeRemovalRecord, bool, error) {
 		return runtimeRemovalRecord{failedAttempts: 99, lastRefusalCode: "unauthorized_attempt"}, true, nil
 	}
-	if declared, err := controller.noteRemovalFailure(t.Context(),
-		l1.RemovalDirective{JobID: "job", BoundNodeID: "node"}, context.DeadlineExceeded); err != nil || declared {
-		t.Fatal("an untyped failure reported the removal as declared stalled")
+	// An idle-stopped host VM has no admitted helper session. Exercise both
+	// cleanup boundaries without Ensure or a helper RPC: neither error is a
+	// typed resource refusal and neither may buy a #465 declaration.
+	adapter := ocirunner.NewAdapter(&ocihelper.BootBarrier{})
+	_, reapErr := adapter.ReapAndVerify(t.Context(), workloadrunner.ReapRequest{})
+	finalizeErr := adapter.FinalizeManagedVolumes(t.Context(), workloadrunner.ManagedVolumeFinalizationRequest{})
+	for _, cause := range []error{context.DeadlineExceeded, reapErr, finalizeErr} {
+		if cause == nil {
+			t.Fatal("unprepared helper unexpectedly completed cleanup")
+		}
+		if declared, err := controller.noteRemovalFailure(t.Context(),
+			l1.RemovalDirective{JobID: "job", BoundNodeID: "node"}, cause); err != nil || declared {
+			t.Fatal("an untyped failure reported the removal as declared stalled")
+		}
 	}
-	if counted != 0 || reset != 1 {
-		t.Fatalf("untyped failure counted=%d reset=%d, want 0/1", counted, reset)
+	if counted != 0 || reset != 3 {
+		t.Fatalf("untyped failure counted=%d reset=%d, want 0/3", counted, reset)
 	}
 }
 

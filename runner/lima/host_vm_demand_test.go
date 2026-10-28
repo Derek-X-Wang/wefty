@@ -3,6 +3,8 @@ package lima
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -20,6 +22,7 @@ func TestOnDemandIdleWaitAndGentleStop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	supervisor.record(InstanceRunning, true, false, "", false)
 	if supervisor.IdleDue(t.Context()) {
 		t.Fatal("Backup must keep host VM on")
 	}
@@ -103,7 +106,7 @@ func TestHostVMStartRefusesLowSpaceBeforeLimaCommand(t *testing.T) {
 	supervisor := newTestSupervisor(t, intent, runner)
 	supervisor.config.CheckFreeSpace = func() error { return &HostVMFreeSpaceError{Minimum: 5 << 30, Available: 1} }
 	err := supervisor.Ensure(t.Context())
-	if err == nil || !strings.Contains(err.Error(), "free space") || !strings.Contains(err.Error(), "retry") {
+	if err == nil || !strings.Contains(err.Error(), "free space") || !strings.Contains(err.Error(), "retry") || !strings.Contains(err.Error(), "5.00 GiB") {
 		t.Fatalf("low-space refusal=%v", err)
 	}
 	for _, command := range runner.commandsSnapshot() {
@@ -124,6 +127,12 @@ func TestOnDemandWatchdogRepairsOnlyWithDemand(t *testing.T) {
 	}
 	if supervisor.recoveryNeeded(t.Context(), false) {
 		t.Fatal("idle broken host VM was restarted without demand")
+	}
+	if facts := supervisor.Facts(); facts.State != InstanceStopped || facts.ReasonCode != "host_vm_idle" {
+		t.Fatalf("broken idle host was not force-stopped: %+v", facts)
+	}
+	if got := runner.commandsSnapshot(); !reflect.DeepEqual(got, [][]string{{"limactl", "list", "--json", DefaultInstanceName}, {"limactl", "stop", "--force", DefaultInstanceName}}) {
+		t.Fatalf("idle broken host commands=%v", got)
 	}
 	items = []DemandItem{{Kind: "removal", ID: "job-1"}}
 	if !supervisor.recoveryNeeded(t.Context(), false) {
@@ -165,17 +174,120 @@ func TestIdleStopDetachesHelperBeforeHostShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	items = nil
+	generation, _ := helper.Generation()
+	stopped, err := barrier.IdleStop(t.Context(), func() bool {
+		// Demand arrives after the claim recheck but before the final Lima check.
+		items = []DemandItem{{Kind: "load-image"}}
+		return true
+	})
+	if current, ready := helper.Generation(); err != nil || stopped || !ready || current != generation {
+		t.Fatalf("final cancellation retired the live session: ready=%t stopped=%t err=%v", ready, stopped, err)
+	}
+	items = nil
 	observed := false
 	runner.afterCommand = func(args []string) {
 		if len(args) > 0 && args[0] == "stop" {
 			observed = true
+			if !supervisor.ensureMu.TryLock() {
+				t.Error("idle command must be serialized by the cycle lock alone")
+			} else {
+				supervisor.ensureMu.Unlock()
+			}
 			if helper.Ready() {
 				t.Error("host shutdown can publish helper_unreachable before deliberate session detachment")
 			}
 		}
 	}
-	stopped, err := barrier.IdleStop(t.Context(), func() bool { return true })
+	stopped, err = barrier.IdleStop(t.Context(), func() bool { return true })
 	if err != nil || !stopped || !observed {
 		t.Fatalf("idle stop=%t observed=%t err=%v", stopped, observed, err)
+	}
+}
+
+func TestIdleStopRequiresRunningAndRearmsAfterFailure(t *testing.T) {
+	now := time.Unix(1000, 0)
+	intent := OCIIntent{Version: OCIIntentVersion, Revision: 1, Enabled: true, Position: OCIPositionOnDemand, UpdatedAt: now}
+	supervisor, err := NewSupervisor(SupervisorConfig{Instance: DefaultInstanceName, Intent: IntentSourceFunc(func(context.Context) (OCIIntent, error) { return intent, nil }), now: func() time.Time { return now }, run: func(context.Context, string, ...string) ([]byte, error) { return nil, errors.New("stop failed") }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.record(InstanceStopped, true, false, "host_vm_idle", false)
+	supervisor.IdleDue(t.Context())
+	now = now.Add(time.Hour)
+	if supervisor.IdleDue(t.Context()) {
+		t.Fatal("stopped host scheduled another idle stop")
+	}
+	supervisor.record(InstanceRunning, true, false, "", false)
+	supervisor.IdleDue(t.Context())
+	now = now.Add(10 * time.Minute)
+	if !supervisor.IdleDue(t.Context()) {
+		t.Fatal("running idle host did not become due")
+	}
+	if err := supervisor.StopIdle(t.Context()); err == nil {
+		t.Fatal("failed stop hidden")
+	}
+	now = now.Add(5 * time.Second)
+	if supervisor.IdleDue(t.Context()) {
+		t.Fatal("failed idle stop retried on the next watchdog tick")
+	}
+}
+
+func TestBriefDemandBetweenPollsResetsIdleWait(t *testing.T) {
+	now := time.Unix(1000, 0)
+	state := &DemandState{now: func() time.Time { return now }}
+	intent := OCIIntent{Version: OCIIntentVersion, Revision: 1, Enabled: true, Position: OCIPositionOnDemand, UpdatedAt: now}
+	supervisor, err := NewSupervisor(SupervisorConfig{Instance: DefaultInstanceName, Intent: IntentSourceFunc(func(context.Context) (OCIIntent, error) { return intent, nil }), Demand: state, now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor.record(InstanceRunning, true, false, "", false)
+	supervisor.IdleDue(t.Context())
+	now = now.Add(9 * time.Minute)
+	state.Replace([]DemandItem{{Kind: "load-image"}}, nil)
+	now = now.Add(time.Second)
+	state.Replace(nil, nil)
+	now = now.Add(time.Minute)
+	if supervisor.IdleDue(t.Context()) {
+		t.Fatal("short image import did not reset idle wait")
+	}
+	now = now.Add(9 * time.Minute)
+	if !supervisor.IdleDue(t.Context()) {
+		t.Fatal("host did not become idle after last demand")
+	}
+}
+
+func TestIdleStoppingMarkSurvivesNodeRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "intent.json")
+	if _, err := InitializeOCIIntent(path, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	runner := &supervisorRunner{states: []InstanceState{InstanceStopped}}
+	config := SupervisorConfig{Instance: DefaultInstanceName, Intent: FileIntentSource{Path: path}, run: runner.run}
+	supervisor, err := NewSupervisor(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier := &SupervisedBootBarrier{Supervisor: supervisor}
+	if err := barrier.MarkStopping(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path + ".stopping"); err != nil {
+		t.Fatal("stopping mark is not durable", err)
+	}
+	restarted, err := NewSupervisor(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restarted.Facts().Stopping {
+		t.Fatal("restart lost the pending stop")
+	}
+	if restarted.recoveryNeeded(t.Context(), false) {
+		t.Fatal("restart started an idle host VM")
+	}
+	if restarted.Facts().Stopping || restarted.Facts().ReasonCode != "host_vm_idle" {
+		t.Fatalf("pending stop not reconciled: %+v", restarted.Facts())
+	}
+	if _, err := os.Stat(path + ".stopping"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stop receipt not cleared: %v", err)
 	}
 }

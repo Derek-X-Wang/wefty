@@ -206,7 +206,7 @@ func (installer guestHelperInstaller) install(ctx context.Context, config GuestH
 }
 
 func RemoveGuestHelper(ctx context.Context, config GuestHelperRemovalConfig) (GuestHelperRemovalEvidence, error) {
-	return (guestHelperInstaller{run: withHostVMStartSpaceCheck(runCommand, DefaultHostVMMinimumFreeBytes)}).remove(ctx, config)
+	return (guestHelperInstaller{run: runCommand}).remove(ctx, config)
 }
 
 func (installer guestHelperInstaller) remove(ctx context.Context, config GuestHelperRemovalConfig) (GuestHelperRemovalEvidence, error) {

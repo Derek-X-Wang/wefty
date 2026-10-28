@@ -295,7 +295,7 @@ Meaning: durable OCI intent is enabled. Evidence: record its revision and update
 
 ## doctor-code-oci-intent-disabled
 
-Meaning: the operator's durable intent withholds OCI. Evidence: record the disabled revision and update time. First action: run `wefty node oci always-on` only when OCI should be enabled. Escalation: do not treat an intentional disabled bit as a runtime incident.
+Meaning: the operator's durable intent withholds OCI. Evidence: record the disabled revision and update time. First action: run `wefty node oci on-demand` (the default) or `wefty node oci always-on` when OCI should be enabled. Escalation: do not treat an intentional disabled bit as a runtime incident.
 
 ## doctor-code-oci-capability-revision-not-read
 
@@ -663,3 +663,17 @@ The idle wait defaults to ten minutes. The graceful stop gets four minutes;
 force is allowed only after that timeout. Before startup, free space must meet
 the node's `--host-vm-minimum-free-bytes` setting (5 GiB by default). Free space
 on the host VM disk volume and retry if startup refuses for insufficient space.
+
+Until the L1 queued-work hint (#1144) lands, a queued Seat alone does not start
+an on-demand host VM; it starts only when other demand exists. Use `always-on`
+meanwhile when queued Seats must start without other demand.
+
+A stalled or quarantined removal keeps the host VM on until cleanup ends, by
+design: cleanup counts as demand even after it releases its service Slot.
+
+Rollback: an older binary refuses the version 2 intent marker. First use the
+new binary to set `off` and quiesce OCI work, then remove the marker (missing
+means off), or restore a version 1 marker for the desired legacy position.
+Resetting the position with the new binary still writes version 2; it does not
+make the marker readable by an older binary. Do not overlap old and new node
+agents against the same marker or helper during a rolling downgrade.

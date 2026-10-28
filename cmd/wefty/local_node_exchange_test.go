@@ -261,7 +261,7 @@ func TestNodeLocalMissingAgentCommandFamily(t *testing.T) {
 	if err := os.WriteFile(archive, []byte("archive"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	commands := [][]string{{"doctor"}, {"oci", "start"}, {"oci", "stop"}, {"oci", "removals"}, {"load-image", archive}}
+	commands := [][]string{{"doctor"}, {"oci", "always-on"}, {"oci", "on-demand"}, {"oci", "off"}, {"oci", "removals"}, {"load-image", archive}}
 	if runtime.GOOS == "darwin" {
 		commands = append(commands, []string{"setup-oci"})
 	}
@@ -285,7 +285,7 @@ func TestNodeLocalStructuredRefusalsUnchanged(t *testing.T) {
 		exit  int
 	}{
 		{contract.ErrorInternal, true, 1}, {contract.ErrorInternal, false, 1}, {contract.ErrorUnavailable, true, 13},
-		{contract.ErrorInvalidRequest, false, 2}, {contract.ErrorUnauthorized, false, 3}, {contract.ErrorNotFound, false, 4}, {contract.ErrorConflict, false, 5}, {"future_refusal", true, 1},
+		{contract.ErrorInvalidRequest, false, 2}, {contract.ErrorUnauthorized, false, 3}, {contract.ErrorForbidden, false, 3}, {contract.ErrorNotFound, false, 4}, {contract.ErrorConflict, false, 5}, {"future_refusal", true, 1},
 	} {
 		t.Run(string(row.code)+"-"+strconv.Itoa(row.exit), func(t *testing.T) {
 			root := localExchangeRoot(t)
@@ -389,9 +389,9 @@ func TestNodeLocalRequestFailureClassification(t *testing.T) {
 }
 
 // A successful intent read must not hide a transport failure in the following
-// start/stop mutation. This exercises the second RPC in both command paths.
+// position mutation. This exercises the second RPC in all three command paths.
 func TestNodeLocalMutationFailedExchange(t *testing.T) {
-	for _, verb := range []string{"start", "stop"} {
+	for _, verb := range []string{"always-on", "on-demand", "off"} {
 		t.Run(verb, func(t *testing.T) {
 			root := localExchangeRoot(t)
 			socket := filepath.Join(root, "s")
@@ -402,7 +402,11 @@ func TestNodeLocalMutationFailedExchange(t *testing.T) {
 					_, _ = io.WriteString(w, `{"revision":7}`)
 					return
 				}
-				if r.URL.Path != "/v1/oci/"+verb || r.Method != http.MethodPost {
+				route := "start"
+				if verb == "off" {
+					route = "stop"
+				}
+				if r.URL.Path != "/v1/oci/"+route || r.Method != http.MethodPost {
 					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 				}
 				mutationSeen.Store(true)
@@ -429,5 +433,54 @@ func TestNodeLocalInvalidConfigurationStaysLocal(t *testing.T) {
 		config := localExchangeConfig(t, root, socket)
 		err := run(t.Context(), []string{"--node-config=" + config, "--json", "node", "doctor"}, io.Discard, io.Discard)
 		assertExchangeReport(t, err, 1, contract.ErrorInternal, false)
+	}
+}
+
+func TestNodeLocalRemovedIntentVerbsNameReplacement(t *testing.T) {
+	for _, verb := range []string{"start", "stop"} {
+		err := executeLocalOCIIntent(t.Context(), nil, false, []string{verb}, io.Discard)
+		if commandExitCode(err) != 2 {
+			t.Fatalf("removed verb %q exit=%d", verb, commandExitCode(err))
+		}
+		for _, word := range []string{"off", "on-demand", "always-on"} {
+			if !strings.Contains(err.Error(), word) {
+				t.Fatalf("usage lacks %s: %v", word, err)
+			}
+		}
+	}
+}
+
+func TestNodeLocalProcessCallerRefusalFromRealBinary(t *testing.T) {
+	binary := buildWefty(t)
+	root := localExchangeRoot(t)
+	socket := filepath.Join(root, "s")
+	config := localExchangeConfig(t, root, socket)
+	server, err := ocicontrol.NewNodeServer(socket, ocicontrol.ServiceFuncs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if info, err := os.Stat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("control fixture did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	code, output := runWefty(t, binary, 30*time.Second, "--json", "--node-config="+config, "node", "oci", "always-on")
+	var refusal contract.ErrorResponse
+	if err := json.Unmarshal([]byte(output), &refusal); err != nil || code != exitUnauthorized || refusal.Error.Code != contract.ErrorForbidden || !strings.Contains(refusal.Error.Message, "owner's own shell") {
+		t.Fatalf("caller refusal exit=%d output=%s decode=%v", code, output, err)
 	}
 }

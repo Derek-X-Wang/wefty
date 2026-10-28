@@ -1,42 +1,33 @@
 package ocicontrol
 
-import (
-	"context"
-	"errors"
-	"os"
-	"os/exec"
-	"strconv"
-	"strings"
-	"time"
-)
+import "errors"
 
-// operatorPeer refuses a node agent descendant, including a process job,
-// even though it shares the operator UID. This is a control-path refusal;
-// process workloads remain trusted same-user code under #220, not a sandbox.
-func operatorPeer(pid int) bool {
+// operatorPeerError uses kernel parent identities. There is no subprocess or
+// load-sensitive time budget, and a lookup failure remains a typed refusal.
+func operatorPeerError(pid, nodePID int, parentPID func(int) (int, error)) error {
+	const shell = "; run this command from the owner's own shell"
 	if pid <= 0 {
-		return false
+		return errors.New("cannot verify this caller's process identity" + shell)
 	}
-	if pid == os.Getpid() || pid == os.Getppid() {
-		return true
-	} // same-process clients and diagnostic fixtures
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+	if pid == nodePID {
+		return nil
+	}
+	visited := make(map[int]bool)
 	for pid > 1 {
-		output, err := exec.CommandContext(ctx, "ps", "-o", "ppid=", "-p", strconv.Itoa(pid)).Output()
-		if err != nil {
-			return false
+		if visited[pid] {
+			return errors.New("cannot verify this caller's process ancestry" + shell)
 		}
-		parent, err := strconv.Atoi(strings.TrimSpace(string(output)))
+		visited[pid] = true
+		parent, err := parentPID(pid)
 		if err != nil || parent < 0 || parent == pid {
-			return false
+			return errors.New("cannot verify this caller's process ancestry" + shell)
 		}
-		if parent == os.Getpid() {
-			return false
+		if parent == nodePID {
+			return errors.New("this caller runs under the node agent" + shell)
 		}
 		pid = parent
 	}
-	return ctx.Err() == nil
+	return nil
 }
 
 var errPeerPIDUnavailable = errors.New("operator peer process identity is unavailable")
