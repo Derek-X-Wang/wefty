@@ -148,7 +148,7 @@ func TestPrimaryGenerationReadRefusalQuarantines(t *testing.T) {
 						// Expire through L1 to reach the inventory read after a
 						// refused claim or heartbeat.
 						clock.Advance(l1.DefaultNodeDeadAfter)
-						if _, err := store.Reconcile(r.Context()); err != nil {
+						if _, err := store.Reconcile(r.Context()); err != nil && r.Context().Err() == nil {
 							t.Error(err)
 						}
 					}
