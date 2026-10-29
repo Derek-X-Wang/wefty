@@ -27,7 +27,7 @@ they do not certify the other clauses.
 |---|---|---|---|---|
 | AR-1 | #1154 | No complete source proof identified. | NOT-RUN | Attended run required; see [runbook](stage-a-attended.md). Source coverage is supporting only. |
 | AR-2 | #1154 | `agent/seat_screen_test.go:TestSeatScreenFrontDoorPersonWinsOnlyOwnSeat`; unit | NOT-RUN | Attended run required; see [runbook](stage-a-attended.md). Source coverage is supporting only. |
-| AR-3 | #1154 | `agent/computer_seats_test.go:TestComputerSeatsReplacementWaitsForAcknowledgedCleanup`; unit | NOT-RUN | Attended run required; see [runbook](stage-a-attended.md). Source coverage is supporting only. |
+| AR-3 | #1154 | `l1/seat_request_flow_test.go:TestSeatRequestFlowSharedRolloverRoomAndDedicatedCap`; unit; `internal/computerconformance/seats_realtiming_linux_test.go:TestDefaultComputerSeatsAtProductionTimings`; Seat Linux | NOT-RUN | Attended run required; see [runbook](stage-a-attended.md). Source coverage is supporting only. |
 | AR-4 | #1154 | `l1/seat_request_flow_test.go:TestSeatRequestFlowSharedRolloverRoomAndDedicatedCap`; unit | NOT-RUN | Attended run required; see [runbook](stage-a-attended.md). Source coverage is supporting only. |
 | AR-5 | #1154 | `l1/seat_review_regression_test.go:TestReviewVerifiedComputerRemovalReturnsRoom`; unit | NOT-RUN | Attended run required; see [runbook](stage-a-attended.md). Source coverage is supporting only. |
 | SC-1 | #1148 | `internal/computerconformance/seat_screen_cli_lane_linux_test.go:TestSeatScreenCLISC1SC4`; Seat Linux; `cmd/wefty/seat_screen_rework_test.go:TestSeatScreenTimingBreakdown`; unit | NOT-RUN | Attended run required; see [runbook](stage-a-attended.md). Source coverage is supporting only. |

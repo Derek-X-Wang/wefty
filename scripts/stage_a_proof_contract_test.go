@@ -1,6 +1,7 @@
 package scripts
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,12 +13,14 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/runner/lima"
 )
 
 // Exercise the observer on a database made by L1, including its migrations and
 // actual lifecycle event JSON. No host boot query, runtime or Mac UI is used.
 func TestStageAObserverRealStore(t *testing.T) {
-	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	// Go trims trailing zeroes: .7147Z must work on Python 3.9 as well.
+	now := time.Date(2026, 10, 28, 12, 0, 0, 714700000, time.UTC)
 	path := filepath.Join(t.TempDir(), "l1.sqlite")
 	store, err := l1.OpenStore(path, l1.StoreOptions{Clock: l1.ClockFunc(func() time.Time { return now }), LeaseDuration: time.Hour, ComputerDefaultImage: "ghcr.io/example/desktop@sha256:" + strings.Repeat("a", 64)})
 	if err != nil {
@@ -75,6 +78,11 @@ func TestStageAObserverRealStore(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if n == 1 {
+			if err := store.AppendSeatEvent(t.Context(), l1.SeatLogEvent{SeatID: id, EventID: "stage-a-control", Kind: l1.SeatEventControlTaken, OccurredAt: now.Add(20 * time.Millisecond)}); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	// Preserve an actual coherent live database, not a hand-written projection.
 	livePath := filepath.Join(t.TempDir(), "live.sqlite")
@@ -109,7 +117,26 @@ func TestStageAObserverRealStore(t *testing.T) {
 		}
 	}
 	command := exec.Command("python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_stage_a.py", "-v")
-	command.Env = append(os.Environ(), "STAGE_A_TEST_DB="+livePath, "STAGE_A_ENDED_DB="+path)
+	factsDir := t.TempDir()
+	refusal, err := json.Marshal(contract.ErrorResponse{Error: contract.APIError{Code: "person_driving", Message: "a person is driving"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(factsDir, "person-driving.json"), refusal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i, state := range []lima.InstanceState{lima.InstanceRunning, lima.InstanceStopped} {
+		at := now.Add(time.Duration(i) * time.Second)
+		facts := lima.BuildMinimalDoctorFacts(lima.UnitStateLaunchedByUnit, lima.SupervisorFacts{Instance: "wefty-proof", State: state, Position: lima.OCIPositionOnDemand, ObservedAt: at}, nil, contract.CapabilityObservation{}, nil, at)
+		payload, err := json.Marshal(facts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(factsDir, string(state)+".json"), payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	command.Env = append(os.Environ(), "STAGE_A_TEST_DB="+livePath, "STAGE_A_ENDED_DB="+path, "STAGE_A_FACTS="+factsDir)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("Stage A observer: %v\n%s", err, output)
 	}

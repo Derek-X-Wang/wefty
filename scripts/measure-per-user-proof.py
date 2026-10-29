@@ -195,6 +195,8 @@ class Proof:
 
     def halt(self, force=False):
         self.unload_node()
+        if self.state() == "Stopped":
+            return 0
         argv = ["limactl", "stop"] + (["--force"] if force else []) + [INSTANCE]
         result, elapsed = self.run(argv, timeout=240, check=False)
         stopped = self.state() == "Stopped"

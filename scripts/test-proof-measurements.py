@@ -26,6 +26,15 @@ class ProofSafetyTests(unittest.TestCase):
         self.assertTrue(proof.guard_tripped(50, (1 << 30) + 1, 0))
 
 class ProofMeasurementTests(unittest.TestCase):
+    def test_shutdown_already_stopped_does_not_call_lima_stop(self):
+        p = proof.Proof.__new__(proof.Proof)
+        p.unload_node = Mock()
+        p.state = Mock(return_value='Stopped')
+        p.run = Mock(side_effect=AssertionError('must not stop a stopped instance'))
+        self.assertEqual(p.halt(), 0)
+        p.unload_node.assert_called_once()
+        p.run.assert_not_called()
+
     def make_proof(self, directory):
         p = proof.Proof.__new__(proof.Proof)
         p.data = p.evidence = pathlib.Path(directory)

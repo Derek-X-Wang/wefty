@@ -1,518 +1,731 @@
 # Stage A attended run (#1154)
 
-**Preparation only. No attended step in this document has run for #1154.**
-Use the **isolated proof install**: `wefty setup --proof`, labels
-`dev.wefty-proof.{l1,l3,node-agent}`, root `~/.local/share/wefty-proof`,
-instance `wefty-proof`. The daily installation is never selected. This uses
-the real Seat request path after the proof bootstrap dialog; do not run the
-old `proof-seat create` shortcut as arrival evidence.
+**Preparation only. Nothing attended has run for #1154.** Use the isolated
+proof installation: `~/.local/share/wefty-proof`, labels
+`dev.wefty-proof.{l1,l3,node-agent}`, and host VM `wefty-proof`. The daily
+installation is never selected. No Mac `sudo`; an admin-password prompt fails
+the run. OWNER types every installation, administrator and removal command,
+and clicks every dialog. ORCHESTRATOR runs every observer and capture.
+**AI agents use only the absolute `tools/w` wrapper, never `tools/obs` or
+`tools/snap`.** Their sandbox must never run the memory guard or emergency stop.
 
-OWNER types every setup and removal command, and clicks every native dialog,
-viewer control and Sleep/Wake action. ORCHESTRATOR runs observations and Seat
-commands. A second AI agent session performs the second-Seat check. An AI
-agent whose sandbox blocks direct browser use performs the screen test. Record
-that sandbox restriction and the two session identifiers privately. An ordinary
-unconfined shell cannot establish AR-1's sandbox condition. Never use Mac
-`sudo`. Any Mac admin-password prompt fails this run: stop and undo.
+## Owner preparation — complete before the attended interval
 
-Use a quiet 16 GiB Mac with the owner present. Do not change memory, Room,
-idle waits or approval durations to make the run faster. The default 1-hour
-approval window is the longest required wait; overlap it with the 30-minute
-Seat expiry, the two 10-minute idle waits and other checks. Budget **90–110
-minutes attended**, plus **15–30 minutes preparation** (image download and
-builds). A missing idle-stop race can consume another 20 minutes; prefer
-NOT-RUN with its cause over an unbounded retry. No load test or five/ten-cycle
-#1132 experiment is repeated. All estimates are planning figures, not results.
-Total including preparation: **105–140 minutes**. The owner can read this
-runbook and review the built inputs before the attended interval starts.
+- **Administrator authority:** reserve block 3, immediately after setup. Stop
+  only proof L1, initiate its offline administrator bootstrap against its own
+  database, restart it, and redeem the nonce as the proof-profile person.
+  OWNER types all these commands. Setup does not create an administrator.
+- **Playwright kit:** the preparation Mac needs npm and internet. Install
+  exactly `playwright@1.56.1` with install scripts disabled, retain the lockfile,
+  then copy that library to the Seat with the proof wrapper's `cp`. The Seat
+  remains without internet and uses the image's `/usr/bin/chromium`.
+- **Two AI agent sessions:** use two distinct sessions, called PRIMARY and
+  SECOND. PRIMARY requests Seat D, drives its browser, copies the result out,
+  runs SC-3's single Playwright command, and releases D. Use that same PRIMARY
+  session for both comparison intervals, with no parallel conversation in it.
+  Configure BOTH sessions' **tool execution sandbox**, not their model/API
+  transport, to the following exact policy. This is the required policy, not
+  a claim that all harnesses use the same configuration-file keys:
 
-Before **every numbered block**, ORCHESTRATOR runs
-`python3 scripts/measure-per-user-proof.py guard-check` (block 1 initializes it).
-Keep `guard-watch` in another terminal. It samples while commands wait and
-stops below **20% free memory**, above **1 GiB swap growth** from the original
-baseline, or on unreadable memory evidence. Never reset that baseline.
-On a trip: stop observations, keep the proof node-agent LaunchAgent unloaded,
-allow only the existing graceful proof shutdown, preserve evidence, and go to
-block 11. No forced stop or restart is a memory recovery action. Sleep pauses
-sampling; record that gap, then check immediately on wake. A failed guard means
-no clean acceptance result.
+  | Setting | Both sessions |
+  |---|---|
+  | Approval | No permission escalation or automatic retry outside the sandbox. |
+  | Filesystem | Read the reviewed checkout, proof binaries/tools/assets and proof configuration. Write only `~/.local/share/wefty-proof/data/stage-a-state` and `~/.local/share/wefty-proof/evidence/stage-a`. No other tool-write roots and no daily configuration/state writes. Always supply the screenshot destination below. |
+  | TCP | Permit outbound loopback TCP to `127.0.0.1:48111`, `127.0.0.1:48112`, and **only the node's actual Seat screen port**. Deny other outbound TCP, DNS and internet access from tool commands. |
+  | Seat port | After A is ready, ORCHESTRATOR reads its current published `display_endpoint` in a proof snapshot and records that exact loopback port in both policies. The plain Fabric uses a dynamic port; do not assume port 80. Repeat after any node-agent restart. |
+  | Browser | Deny Mac browser execution and LaunchServices browser launch from tool commands. Permit the proof wrapper and its interpreter/binary. Opening a browser inside a Seat through the wrapper is permitted. |
 
-All commands start at this repository root in the reviewed checkout. The only
-public artifacts should be sanitized tables, source revision and image digest.
-Keep credentials, screenshots, paths, raw logs and command receipts private.
+  Keep each harness's actual policy/configuration receipt privately. A harness
+  that cannot enforce this policy leaves AR-1 NOT-RUN; do not widen its access.
+  ORCHESTRATOR first confirms an installed browser binary exists outside the
+  AI agent sandbox. PRIMARY then runs this command **inside its tool sandbox**:
 
-### 1. ORCHESTRATOR — fresh root, guard and inputs (15–30 minutes preparation)
+  ```sh
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless --no-first-run --dump-dom about:blank
+  ```
 
-Follow blocks 1 and 2 of [the per-user proof](per-user-host-vm-proof.md#1-orchestrator--establish-a-fresh-guard-start-continuous-observation)
-exactly: refuse a pre-existing proof root or symlinked ancestors, initialize
-the guard, start its watcher, build the four native binaries and matching Linux
-helper with the recorded revision, and verify the published default-image
-archive. Keep `PROOF_ROOT`, `PROOF_BIN`, `PROOF_ASSETS`, `DEFAULT_IMAGE` and
-`PROOF_EVIDENCE` from those blocks. Do **not** execute the old proof's setup,
-`prove`, `cold`, `stop`, `memory`, `disk` or quoting experiments.
+  Expected: sandbox permission denial before browser startup. Retain the exit
+  code and denial. A missing executable, browser crash, or unconfined shell is
+  not proof. Substitute another OWNER-confirmed installed browser's absolute
+  executable if needed. No browser probe runs during preparation in this worker.
+- **Tokens:** retain the PRIMARY session's JSONL and its harness/model version.
+  Use the command pair under “Token interval commands” below. It places two
+  marker lines around an exact copy of the session interval, deduplicates
+  assistant messages, and sums their usage fields. This command targets Claude
+  Code's `assistant.message.usage` JSONL shape. If PRIMARY uses another shape,
+  retain it and mark tokens NOT-RUN until its usage fields are mapped; never
+  record zero for unavailable counters. Do not switch harness between SC-2/SC-3.
+- **Sleep/Wake:** OWNER must sleep the Mac near minute 24 of C's idle clock
+  and wake near minute 27. Keep a separate timer; no calls to C after its
+  initial log follow. The runbook includes recovery if sleep ends A or C.
+- **Quiet time:** close other apps. Use a 16 GiB Mac with the memory guard on.
+  Do not reduce Room, idle waits or approval durations to shorten the proof.
+- **Time:** reserve **120–150 minutes attended**, plus **20–35 minutes
+  preparation**: **140–185 minutes total**. HV-4 needs its own idle cycle;
+  allow another **25–30 minutes**, or record it NOT-RUN. These are estimates.
 
-Prepare the offline test kit on the Mac, outside a Git checkout:
+Replace `/ABS_REPO` with this reviewed checkout and `RUN_ID` with one fresh
+local receipt identifier in the preparation commands. Later commands begin
+with `$HOME/…`, an absolute login-home path. They need no exports, functions,
+current directory or previous shell state. Replace `SEAT_A`, `SEAT_B`,
+`SEAT_C`, `SEAT_D`, `COMPUTER_D`, `PLACE_D`, and `RUN_ID_FROM_REPLY` with the
+actual recorded identifiers each time; they are placeholders, not shell variables.
+Keep a private `ids.json` in the Stage A evidence folder for those values.
+Never reuse a Computer name: removed Computers retain their names.
 
-```sh
-mkdir -p "$PROOF_ASSETS/browser-kit"
-npm install --prefix "$PROOF_ASSETS/browser-kit" --ignore-scripts --no-audit --no-fund --save-exact playwright@1.56.1
-cp scripts/stage-a-browser.html scripts/stage-a-playwright.cjs "$PROOF_ASSETS/"
-```
+## Fixed-clock timeline
 
-Expected: a pinned JavaScript library and lockfile. The Seat will use the
-image's `/usr/bin/chromium`; it downloads no browser or package. Save the
-lockfile and version, and check `require` works inside the Seat in block 4.
-If the library or shipped browser is missing, mark SC-3 NOT-RUN; do not install
-new software into the image or switch the request to internet access.
-Undo: all preparation inputs belong to the disposable root; block 11 purges it.
+Offsets below are a nominal schedule; record actual anchors and shift later
+work after delays. A clock is never restarted to hide a failed case.
 
-### 2. OWNER — isolated install and real approval checks (8–12 minutes)
+| Attended minute | Action / fixed clock |
+|---|---|
+| 0–11 | Setup, initial proof dialog, OWNER's administrator bootstrap. |
+| 11 | `tools/w status --json` proves the node ready. Only then start AP-5. |
+| 11–16 | Leave the real request dialog unanswered: default **5-minute AP-5 wait**. |
+| 17 | PRIMARY's A request is approved with a **1-hour window**. Record anchor W; expiry is **W+60**, nominal minute 77. |
+| 18–25 | SECOND gets B on A's Computer; C is third; fourth request refuses. At minute 25 start C's log follow and record its last-call anchor C0. |
+| 25–45 | Network/health observations on A, kit preparation and receipt review. A has its own bounded running command; C receives no calls. |
+| 49 | OWNER sleeps at **C0+24 minutes**. |
+| 52 | OWNER wakes at **C0+27 minutes**; guard check, raw C snapshot. C must still be live before C0+30. |
+| 55–60 | C reaches its **30-minute expiry**, warning then reasoned end. Observe cleanup, then switch checks. |
+| 61–76 | PRIMARY requests D, completes SC-2/SC-3 and copies results out; OWNER/ORCHESTRATOR collect control timing. |
+| W+60 (about 77) | AP-6 expiry probe, in a separate terminal if needed. OWNER denies the new dialog so it cannot disturb D's deletion/host-idle clocks. |
+| About 80 | PRIMARY releases D. Record R, the final Seat departure/cleanup anchor. |
+| R+10 (about 90) | Default **10-minute Computer idle wait** ends; wait for `removed_verified`. Record actual removal observation M and last remaining demand. |
+| About M+10 (100+) | Default **10-minute host VM idle wait** after last demand; watch must show deletion before stop. A cleanup that runs longer moves this anchor. |
+| 106–109+ | Cold request after stopped state: owner approval K starts the **3-minute cold-start limit**, ending K+3. Record the “about 1 minute” hint. |
+| 110–130+ | Release that extra Seat; allow its Computer's 10-minute idle deletion and then host's 10-minute idle stop. |
+| 130–145+ | Preserve receipts and undo. Reserve to minute 150 for normal delays. |
 
-After ORCHESTRATOR's guard check, OWNER types:
+HV-4 is **not** folded into the only deletion-before-stop observation. A
+separate create/release/idle cycle must catch a request during a recorded
+stopping transition; otherwise HV-4 is NOT-RUN. No ordinary cold start proves it.
 
-```sh
-"$PROOF_BIN/wefty" setup --proof --from "$PROOF_BIN" --oci-config "$PROOF_ASSETS/oci-assets.json" --computer-default-image "$DEFAULT_IMAGE" --json
-```
+## Guard and evidence rules
 
-Expected: only the three proof labels and private ports 48111/48112. OWNER
-approves the initial **proof fixture** dialog. It is not AP-4 or a Seat
-approval. Check that its receipt is approved, then establish these selectors
-in each observation terminal and both AI agent sessions:
-
-```sh
-export WEFTY_ATTENDED_STAGE_A=1
-export WEFTY_PROFILE="$PROOF_ROOT/config/profile.json"
-export WEFTY_NODE_CONFIG="$PROOF_ROOT/config/node.json"
-export XDG_STATE_HOME="$PROOF_ROOT/data/stage-a-state"
-export LIMA_HOME="$PROOF_ROOT/data/lima"
-export WEFTY_SEAT_SCREEN_TIMING=1
-export STAGE_A_EVIDENCE="$PROOF_ROOT/evidence/stage-a"
-export STAGE_A_SCRIPT="$PWD/scripts/measure-stage-a.py"
-mkdir -p "$STAGE_A_EVIDENCE"
-w() { "$PROOF_BIN/wefty" --profile "$WEFTY_PROFILE" "$@"; }
-obs() { python3 "$STAGE_A_SCRIPT" capture --row "$1" --name "$2" -- "${@:3}"; }
-snap() { python3 "$STAGE_A_SCRIPT" snapshot --row "$1" --name "$2"; }
-```
-
-These shell functions use bash or zsh. Clear inherited `WEFTY_L1_ADDR`,
-`WEFTY_L3_ADDR` and development Fabric identity overrides before using `w`;
-the pinned profile must supply those selectors. The harness itself removes
-inherited `WEFTY_*` selectors before its captures. Never copy Seat credentials
-into chat. Keep the shared state directory private to this disposable test.
-Before starting the AI agent sessions, ensure their sandbox permits the proof
-socket and writing this exact Seat-state/evidence directory. Keep direct
-browser access blocked. A denied credential-file write is a sandbox-integration
-failure, not a reason to use the daily state directory or loosen browser access.
-
-AP-4/AP-5: close any window with `obs AP-4 windows-closed seat window close`.
-Start `obs AP-5 unanswered seat request --network none`. OWNER leaves this
-**real request** dialog unanswered. In another terminal run `w seat --help`
-and `w seat approve` (expected usage refusal, no approval operation), and
-`snap AP-4 cannot-approve`. Never invoke UI automation against the dialog.
-Expected: only the OWNER can answer; after the configured answer wait (default
-5 minutes) the request refuses, no Computer is created, and no credential is
-returned. Keep the failed command receipt and its exit status. Request failure
-is expected in this block; do not let a shell's `set -e` skip observation/undo.
-
-Then start `obs AP-6 window-start seat request --network none --window 1h`.
-OWNER approves this window in the dialog. Record the `status --json` window
-expiry. Call this ready Seat **A**, and record its Computer ID and place as
-**CA / PA** from the reply and L1 snapshot. Set `SEAT_A`, `COMPUTER_A`,
-`PLACE_A` to those exact values, not a name lookup. This starts the 1-hour
-AP-6 clock while other blocks run. Every request has its own unique Seat ID;
-never reuse Computer names from a previous run (removed Computers keep names).
-Undo: release A if live; keep the refusal receipt; block 11 removes the install.
-
-### 3. ORCHESTRATOR — stopped host VM to real ready Seat (3–5 minutes active)
-
-First preserve A's request/approval timing and a ready snapshot:
+Before every numbered block after block 1, ORCHESTRATOR runs:
 
 ```sh
-snap AR-1 a-ready
-python3 scripts/measure-stage-a.py check --row AR-1 --name a-timing --kind timing --seat "$SEAT_A" --after "$STAGE_A_EVIDENCE/a-ready.json"
-obs HV-2 running-doctor node doctor
+"$HOME/.local/share/wefty-proof/tools/obs" guard-check
 ```
 
-The timing check uses actual ordered `requested`, `approved`, `started` Seat
-log events. It measures request-to-approval and approval-to-L1-Seat-started;
-it does not claim browser readiness. The successful screenshot in block 4
-supplies a later readiness upper bound. Use raw CLI elapsed time as well.
+Keep `guard-watch` in another ORCHESTRATOR terminal. Stop below **20% free
+memory**, above **1 GiB swap growth** from the original baseline, or when a
+memory observation fails. Never reset the baseline. On a trip, let the existing
+emergency path unload only the proof node agent and stop only the proof host VM
+gracefully, preserve evidence, and go to block 11. Never force-stop or restart
+as memory recovery. Sleep pauses sampling; record that gap and check on wake.
 
-For RM-4, defer the separate cold start until block 9, after block 8's idle
-stop. Keep A for the following blocks. Do not use a forced Lima stop.
-At that later boundary record the stopped state with
-`obs HV-2 stopped-doctor node doctor`, then request a fresh Seat using
-`obs RM-4 cold-request seat request --network none`. Close the approval window
-first with `w seat window close` if a fresh dialog is needed; **that would
-invalidate this run's AP-6 window**, so instead schedule this cold request
-after block 9. OWNER approves if a dialog appears. Keep the reply saying
-“about 1 minute”, the approval/started events and elapsed time. Snapshot and
-run the `timing` check for that new Seat. A hot initial bootstrap cannot pass
-RM-4. If cold start fails at 3 minutes, keep the reason and cleanup evidence;
-do not induce a startup fault on the Mac. The refusal-at-deadline branch has
-injected-clock evidence in `TestColdStartApprovalDeadlineAndReply`; it remains
-NOT-RUN live unless naturally encountered. Never call a partial cold path clean.
-Undo: release the new Seat, or block 11 if cleanup fails. This block can be
-completed later; keep every unfinished clause explicitly NOT-RUN.
+All private Stage A receipts go under
+`~/.local/share/wefty-proof/evidence/stage-a`; the kept copy is
+`/ABS_REPO/.bin/stage-a-evidence/RUN_ID`. No per-user-proof evidence directory
+is reused. Publish only a reviewed sanitized table, source revision and image
+digest. Keep credentials, nonces, paths, raw logs, screenshots and JSONL private.
 
-### 4. AI agent + OWNER — one Computer, browser, copy, network (8–12 minutes)
+### 1. ORCHESTRATOR — fresh guard, binaries, wrappers and offline kit (20–35 minutes preparation)
 
-ORCHESTRATOR copies only the public fixtures and offline library into A:
+Refuse an existing proof root and symlinked `~/.local` or `~/.local/share`.
+The preparation script builds capped-CPU native binaries and the matching
+Linux helper, downloads and verifies the published digest-pinned image,
+records source/publication revisions, creates the OCI assets configuration,
+and installs the pinned offline Playwright library. It runs no setup,
+administrator, Lima, container or browser command. It follows the #1132
+asset format without using that proof's environment variables or experiments.
+Use this fresh guard and prepare wrappers first:
 
 ```sh
-obs AP-1 copy-page cp "$PROOF_ASSETS/stage-a-browser.html" "$SEAT_A:stage-a-browser.html"
-obs AP-1 copy-playwright cp "$PROOF_ASSETS/stage-a-playwright.cjs" "$SEAT_A:stage-a-playwright.cjs"
-obs AP-1 copy-kit cp "$PROOF_ASSETS/browser-kit" "$SEAT_A:browser-kit"
-obs AP-1 tool-check exec --seat "$SEAT_A" -- sh -ec 'test -x /usr/bin/chromium; node -e "require(process.env.SEAT_DIR + \"/browser-kit/node_modules/playwright\")"; id'
-obs AR-1 viewer seat view "$SEAT_A" --no-open
+test ! -e "$HOME/.local/share/wefty-proof"
+test ! -L "$HOME/.local"
+test ! -L "$HOME/.local/share"
+python3 /ABS_REPO/scripts/measure-per-user-proof.py guard-init
+python3 /ABS_REPO/scripts/measure-stage-a.py install-wrappers
 ```
 
-OWNER opens the returned viewer URL and watches A live. The sandboxed AI agent
-uses only `w seat screenshot|click|type|key` for SC-2. Open the local page with:
+Wrappers are installed as `tools/w`, `tools/obs` and `tools/snap`, with absolute
+binary, profile, node-config, state, evidence and source-script paths baked in.
+They scrub inherited selectors, reject selector overrides, and refuse missing
+or redirected proof paths. They cannot run until setup writes the profile and
+node configuration. Before that, keep the guard watcher running with:
 
 ```sh
-w seat key "$SEAT_A" ctrl+l
-w seat type "$SEAT_A" "file:///wefty/service/seats/$PLACE_A/stage-a-browser.html"
-w seat key "$SEAT_A" Return
-w seat screenshot "$SEAT_A" -o "$STAGE_A_EVIDENCE/sc2-start.png"
+python3 /ABS_REPO/scripts/measure-per-user-proof.py guard-watch
 ```
 
-Run the following **ten semantic steps**. Each action can take multiple CLI
-calls; record all calls and screenshots, including corrections. Select pixel
-coordinates from the real 1280×800 screenshot, since browser chrome can move.
-Use `seat click SEAT_ID X Y`, `seat type SEAT_ID TEXT`, `seat key SEAT_ID Tab`
-or `Down`/`Return`, and `seat screenshot` after changes. No DOM or developer
-tools are used for SC-2.
+In the preparation terminal, with that watcher still active, run:
 
-| Step | Action | Expected state |
+```sh
+bash /ABS_REPO/scripts/prepare-stage-a.sh
+```
+
+Expected: pinned library and lockfile, verified image archive, matching binaries
+and wrappers. No runtime starts. A missing package/image is NOT-RUN, not a reason
+to build a replacement image. Undo: block 11 removes only this disposable root;
+if setup never activated, use the [per-user proof's receipt-less undo safeguards](per-user-host-vm-proof.md#10-owner--undo-the-entire-disposable-installation).
+
+### 2. OWNER — isolated setup and initial proof dialog (5–8 minutes)
+
+OWNER types this exact installation command:
+
+```sh
+"$HOME/.local/share/wefty-proof/source-bin/wefty" setup --proof --from "$HOME/.local/share/wefty-proof/source-bin" --oci-config "$HOME/.local/share/wefty-proof/assets/oci-assets.json" --computer-default-image "$(cat "$HOME/.local/share/wefty-proof/assets/image/default-computer-reference.txt")" --json
+```
+
+Expected: only the three proof labels, private L1/L3 ports 48111/48112 and
+private paths. OWNER approves the initial **proof fixture** dialog. This is
+not an L1 Seat approval and does not bootstrap an administrator. Do block 3
+next. Undo: block 11; denied/missing/failed proof dialog means stop, no retry.
+
+### 3. OWNER — bootstrap the proof L1 administrator immediately (2–3 minutes)
+
+This is the M3.5 pattern from
+[Linux acceptance](m3.5-linux-computer.md): offline initiation, then redemption
+through the normal person route. Exact flags and output fields come from
+`cmd/wefty-l1/main.go` (`--db`, `--profile`, `--initiate-admin-bootstrap`),
+`l1.AdminBootstrapChallenge` (`nonce`, `expires_at`), and the CLI's
+`admin bootstrap NONCE` command. OWNER types **every command below**;
+ORCHESTRATOR never runs administrator commands, including bootstrap or policy reads.
+
+```sh
+/bin/launchctl bootout "gui/$(id -u)/dev.wefty-proof.l1"
+```
+
+ORCHESTRATOR confirms `launchctl print gui/UID/dev.wefty-proof.l1` reports no
+service and no process listens on TCP 48111 (`lsof -nP -iTCP:48111 -sTCP:LISTEN`).
+Do not initiate while proof L1 is still running. OWNER then types:
+
+```sh
+"$HOME/.local/share/wefty-proof/source-bin/wefty-l1" --profile "$HOME/.local/share/wefty-proof/config/profile.json" --db "$HOME/.local/share/wefty-proof/data/l1.sqlite" --initiate-admin-bootstrap > "$HOME/.local/share/wefty-proof/evidence/stage-a/admin-challenge.json"
+/bin/launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.wefty-proof.l1.plist"
+"$HOME/.local/share/wefty-proof/tools/w" admin bootstrap "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nonce"])' "$HOME/.local/share/wefty-proof/evidence/stage-a/admin-challenge.json")" --json
+"$HOME/.local/share/wefty-proof/tools/w" admin policy get --json
+```
+
+Redeem before the challenge's actual `expires_at`. Expected: exactly the proof
+profile's person becomes the first administrator in its Fabric. Retain its policy
+receipt privately. An `admin_required` or `control_not_authorized` result later
+is a failure, not a reason to bypass authority. The scratch-store Go test
+`TestStageAProofAdminBootstrapAcrossOfflineReopen` exercises offline initiation,
+close/reopen, redemption through the plain Fabric and administrator readback.
+It does not run these Mac commands or the real CLI binaries; their flags and
+LaunchAgent sequence are checked by reading code. Undo: if interrupted before
+restart, OWNER reloads only that proof plist. Complete block 11 to discard the
+proof administrator, nonce and installation; never reset the daily roster.
+
+### 4. ORCHESTRATOR, PRIMARY, SECOND and OWNER — ready gate, approval and Room (12–15 minutes)
+
+ORCHESTRATOR reads:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" status --json
+```
+
+**Gate AP-5 on this result:** the proof node is alive and advertises
+`computer:seat-requests`, `kind:oci` and `computer`, with its current boot.
+Otherwise wait within bootstrap's bound or stop NOT-RUN; do not spend AP-5's
+five-minute budget waiting for an unready node. ORCHESTRATOR captures the
+ready status, closes test approval windows, then starts AP-5:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-4 --name windows-closed -- seat window close
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-5 --name unanswered -- seat request --network none
+```
+
+OWNER leaves this **real Seat request** dialog unanswered for the default five
+minutes. PRIMARY may run the following unsupported approval command:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat approve
+```
+
+Expected: usage refusal, no approval operation. ORCHESTRATOR snapshots the
+pending request and keeps its eventual refusal/exit code; no Computer or active
+credential is left. No UI automation answers a dialog. The broad AP-4 boundary
+also has source tests; one unsupported call alone is not exhaustive proof.
+
+PRIMARY requests A and OWNER approves its 1-hour window:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat request --network none --window 1h --json
+```
+
+Record W and the exact window expiry. Do **not** close that window until AP-6
+has run. SECOND, in its own sandbox, requests B with its own wrapper call:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
+```
+
+Expected: B has a distinct place/desktop on A's Computer. Keep actual IDs and
+before/after screen pairs showing that clicking A does not change B. After A's
+publication, apply and record the exact Seat-port sandbox policy for both
+sessions and run the PRIMARY browser-denial probe from owner preparation.
+ORCHESTRATOR requests C and checks the fourth refusal:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AR-3 --name third-seat -- seat request --network none
+"$HOME/.local/share/wefty-proof/tools/snap" --row RM-1 --name three-live
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row RM-1 --name fourth-refused -- seat request --network none
+"$HOME/.local/share/wefty-proof/tools/snap" --row RM-1 --name after-fourth
+"$HOME/.local/share/wefty-proof/tools/obs" check --row RM-1 --name room-check --kind room --before "$HOME/.local/share/wefty-proof/evidence/stage-a/three-live.json" --after "$HOME/.local/share/wefty-proof/evidence/stage-a/after-fourth.json" --incumbents SEAT_A SEAT_B SEAT_C --seat REFUSED_SEAT_ID
+```
+
+Expected: on this 16 GiB/default-sized Mac, three live Seats, no leaked fourth
+Computer, immediate “out of room, try again later”, unchanged incumbent IDs,
+places and bindings. Get a screenshot from each incumbent to prove responsiveness
+(AR-4); the store predicate does not prove that. C is on a second shared Computer.
+Undo: SECOND releases B with its wrapper after evidence; leave C for block 6.
+A remains for network checks and a bounded running command. Failure or guard
+trip means preserve evidence and block 11, never overcommit as a workaround.
+
+### 5. ORCHESTRATOR and PRIMARY — without-internet observations on A (5–8 minutes)
+
+ORCHESTRATOR copies the public page/kit and captures health/network commands:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-1 --name a-page -- cp "$HOME/.local/share/wefty-proof/assets/stage-a-browser.html" SEAT_A:stage-a-browser.html
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-1 --name a-command -- exec --seat SEAT_A -- id
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-2 --name no-web -- exec --seat SEAT_A -- curl --connect-timeout 3 --max-time 5 http://1.1.1.1/
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-2 --name no-dns -- exec --seat SEAT_A -- getent hosts example.com
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-3 --name no-internet-health -- node doctor
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-6 --name hold-a -- exec --seat SEAT_A --detach -- sh -c 'sleep 2400'
+```
+
+Expected: separate web/DNS failures, while Seat commands and screen remain
+usable and missing internet is not a health fault. Missing `curl`/`getent` is
+NOT-RUN, not isolation proof. PRIMARY uses its wrapper for a screenshot and
+copy-out on A; ORCHESTRATOR retains those original tool results, without rerunning
+the action. The hold is an active command, bounded by 2400 seconds, not a
+background process that silently renews a Seat. Undo: block 7's off command
+ends A's work; block 11 is fallback. This is supporting AP evidence; block 8
+supplies the full AR-1 chain with the required PRIMARY actor.
+
+### 6. OWNER and ORCHESTRATOR — C's sleep/wake and expiry (31 minutes, overlaps)
+
+ORCHESTRATOR starts exactly one log follow, records C0, then makes **no further
+Seat calls, commands, copies or viewer-control calls to C**:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row SL-6 --name c-follow -- logs SEAT_C --follow
+```
+
+Run the follow in its own terminal. Its initial call counts once; its polls do
+not renew C. Raw snapshots do not renew it. OWNER sleeps at C0+24 minutes and
+wakes at C0+27. Immediately after wake ORCHESTRATOR runs the guard and:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/snap" --row SL-6 --name c-after-wake --seat SEAT_C
+```
+
+C must still be live before C0+30. At expiry, keep the follow's reasoned end,
+then snapshot and check:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/snap" --row SL-6 --name c-ended --seat SEAT_C
+"$HOME/.local/share/wefty-proof/tools/obs" check --row SL-6 --name c-log-order --kind sleep-log --seat SEAT_C --after "$HOME/.local/share/wefty-proof/evidence/stage-a/c-ended.json"
+```
+
+Expected: no early end; one `ends_soon` before `ended`, with an explicit reason.
+The predicate proves log order only. Retain actual sleep/wake times, the guard
+sampling gap and the live-before-expiry snapshot. Never change the wall clock.
+
+**Fallback:** if sleep ends C early, preserve its original log and mark SL-6
+FAIL; do not restart its clock, reuse its ID or relabel a replacement as a pass.
+If A ends, preserve A's reason too. With the guard clear, request a fresh A2 for
+block 7's running-work case and start a bounded hold on A2; do not touch C's
+clock to recover A. A failed SL-6 can coexist with later independent evidence.
+If the node agent restarted, update both sessions' Seat-port policies and
+repeat the browser-denial probe before D. If safe continuation is not possible,
+stop and undo. Undo: wake the Mac, stop the completed follow, release C only if
+still live after the evidence is final, and use block 11 on cleanup failure.
+
+### 7. ORCHESTRATOR — demand and switch observations (5–8 minutes)
+
+OWNER remains present. **ORCHESTRATOR types each switch command below**, from
+its own shell outside the node agent's ancestry, using the absolute proof
+wrapper. OWNER does not type these switch commands and AI agents run none.
+ORCHESTRATOR uses its absolute capture wrapper for each command exactly once:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-6 --name switch-always-on -- node oci always-on
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-2 --name running-demand -- node doctor
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-3 --name removal-inventory -- node oci removals
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-6 --name switch-off -- node oci off
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-5 --name off-request -- seat request --network none
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-2 --name off-doctor -- node doctor
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-6 --name switch-on-demand -- node oci on-demand
+```
+
+The capture wrapper pins the same proof binary/profile/state as `tools/w`.
+Do not rerun a command merely to record it. Assign a
+unique name to each captured command. Expected: always-on keeps the host on;
+doctor explains real demand without starting anything; off lists and ends A/A2's
+resident OCI work; a request while off refuses immediately with “the host VM is
+off” and no dialog. Preserve ended Seat reasons. On-demand restores demand-based
+authority. Observe removal inventory and doctor while cleanup is unfinished
+for HV-3; fast cleanup that cannot be caught leaves that live clause NOT-RUN.
+Do not inject disk failure or create a Backup just to prolong it. Undo: leave
+on-demand if the guard is clear; on a trip do not restart—go to block 11.
+This off-ended A is not AR-1's release/idle-delete proof; D is separate.
+
+### 8. PRIMARY, OWNER and ORCHESTRATOR — D's full arrival and screen comparison (15–20 minutes)
+
+**PRIMARY, inside its browser-blocked sandbox, requests D:**
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
+```
+
+OWNER approves if a dialog appears. ORCHESTRATOR records D's IDs, place/current
+Attempt and ready snapshot, then copies the page, script and offline kit:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/snap" --row AR-1 --name d-ready --seat SEAT_D
+"$HOME/.local/share/wefty-proof/tools/obs" check --row AR-1 --name d-request-timing --kind timing --seat SEAT_D --after "$HOME/.local/share/wefty-proof/evidence/stage-a/d-ready.json"
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-1 --name d-page -- cp "$HOME/.local/share/wefty-proof/assets/stage-a-browser.html" SEAT_D:stage-a-browser.html
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-1 --name d-script -- cp "$HOME/.local/share/wefty-proof/assets/stage-a-playwright.cjs" SEAT_D:stage-a-playwright.cjs
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-1 --name d-kit -- cp "$HOME/.local/share/wefty-proof/assets/browser-kit" SEAT_D:browser-kit
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-1 --name d-tools -- exec --seat SEAT_D -- sh -ec 'test -x /usr/bin/chromium; node -e "require(process.env.SEAT_DIR + \"/browser-kit/node_modules/playwright\")"'
+```
+
+L1 log timing measures request→approval→Seat `started`, not browser readiness.
+A real screenshot supplies a later browser-readiness bound. Snapshot fields
+include current/published Attempt IDs, all relevant Attempt rows, Seat readiness
+observations and node boot IDs. Match the live current publication and lease;
+never read `ServiceJob.Ready` or infer `GetJob.Attempts`. No `ready` verdict is
+guessed by this observer. Lease wall timestamps cannot prove liveness through
+a wall-clock change.
+
+OWNER obtains and opens its viewer with the bootstrapped person authority:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat view SEAT_D --no-open --json
+```
+
+OWNER watches that same desktop live. PRIMARY navigates only through screen
+commands. ORCHESTRATOR starts the SC-2 token interval immediately before step 1:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat key SEAT_D ctrl+l
+"$HOME/.local/share/wefty-proof/tools/w" seat type SEAT_D file:///wefty/service/seats/PLACE_D/stage-a-browser.html
+"$HOME/.local/share/wefty-proof/tools/w" seat key SEAT_D Return
+"$HOME/.local/share/wefty-proof/tools/w" seat screenshot SEAT_D -o "$HOME/.local/share/wefty-proof/evidence/stage-a/sc2-start.png"
+```
+
+If fullscreen Chromium hides the address bar, PRIMARY first sends `F11`, then
+`ctrl+l`; keep that call in the interval. Select actual pixel coordinates from
+the 1280×800 screenshots; do not assume browser-chrome offsets.
+
+| Step | PRIMARY's screen action | Expected state |
 |---|---|---|
-| 1 | Navigate to the local file and inspect its title. | Stage A offline browser test; Ready. |
-| 2 | Click Name; type `Ada`. | Name is Ada. |
-| 3 | Click Code; type `42`. | Code is 42. |
-| 4 | Click Offline confirmed. | Checkbox checked. |
-| 5 | Select Color `blue` using the keyboard or menu. | Blue selected. |
+| 1 | Navigate to the local file and inspect the title. | Stage A offline browser test; Ready. |
+| 2 | Click Name, then type `Ada`. | Ada. |
+| 3 | Click Code, then type `42`. | 42. |
+| 4 | Click Offline confirmed. | Checked. |
+| 5 | Select Color blue, with keyboard/menu. | Blue selected. |
 | 6 | Click Add item. | 1 items. |
 | 7 | Click Add item again. | 2 items. |
 | 8 | Click Remove last. | 1 items. |
-| 9 | Click Submit. | PASS and the expected JSON. |
-| 10 | Click Download result. | `stage-a-result.json` saved by Chromium. |
+| 9 | Click Submit. | PASS and expected JSON. |
+| 10 | Click Download result. | Browser saves stage-a-result.json. |
 
-Copy the real browser download out from A's home, after checking the download
-location on that screen. The usual location is
-`$SEAT_A:/wefty/service/seats/$PLACE_A/home/Downloads/stage-a-result.json`.
-Use `w cp` to a path writable within the AI agent's sandbox. If the browser asks
-for a location, the AI agent chooses its Seat folder with screen input and
-records the changed path. Inspect the copied JSON: exactly name Ada, code 42,
-offline true, color blue, count 1 and pass true. AR-1 needs this real copy-out.
+PRIMARY uses only the absolute wrapper with `seat click SEAT_D X Y`,
+`seat type SEAT_D TEXT`, `seat key SEAT_D COMBO`, and `seat screenshot`;
+ORCHESTRATOR retains the original AI agent tool transcript/results. Give every
+screenshot an explicit unique path under the Stage A evidence folder (`-o`
+for screenshot alone, or `--screenshot FILE` with input). No DOM or
+Mac browser tools. Include corrections and screenshots in time/tokens. End
+SC-2's interval when step 10 and its final screen observation finish; exclude
+initial kit copy and final copy-out equally for both methods.
 
-SC-3 runs the **same ten steps**, on a fresh browser context, in one command:
+**PRIMARY copies its real browser download out**, after reading the actual
+save location from that screen (usual location shown below):
 
 ```sh
-obs SC-3 playwright exec --seat "$SEAT_A" -- sh -ec 'cd "$SEAT_DIR"; node stage-a-playwright.cjs'
-obs SC-3 playwright-result cp "$SEAT_A:stage-a-playwright-result.json" "$STAGE_A_EVIDENCE/sc3-result.json"
+"$HOME/.local/share/wefty-proof/tools/w" cp SEAT_D:/wefty/service/seats/PLACE_D/home/Downloads/stage-a-result.json "$HOME/.local/share/wefty-proof/evidence/stage-a/sc2-result.json"
 ```
 
-The harness invokes Seat `exec` from the isolated assets directory, outside
-a Git checkout, so working-copy sync does not copy the repository. The files
-copied above are the only test inputs. For direct `w exec` calls, first
-`cd "$PROOF_ASSETS"` in a separate terminal; `obs` and `snap` use the absolute
-script path set above and still work there.
+Expected: exactly name Ada, code 42, offline true, color blue, count 1, pass true.
+A save dialog is handled with Seat screen input and its actual path is recorded.
+The destination is inside PRIMARY's sandbox write allowlist.
 
-For both SC-2 and SC-3 save the AI agent harness's usage counter before step 1
-and after step 10, with model/version, input/output/cache-token definitions,
-and the transcript/session ID. Record wall start/end with a monotonic timer,
-including tool waits and screenshots. Exclude initial library copy/setup and
-final copy-out equally. SC-3 also prints in-Seat browser time; the outer
-capture records submission+command time. Do not compare only that inner time
-to SC-2's full loop. If usage counters are unavailable, write tokens NOT-RUN,
-never zero. Use this table in the private receipt; **no pass/fail threshold**:
+Start a separate SC-3 token interval. **The same PRIMARY session** runs this
+single command; ORCHESTRATOR must not substitute its own shell execution:
 
-| Path | 10 steps complete | AI-loop wall seconds | CLI/command wall seconds | In-browser seconds | Input / output / cache tokens | Usage source |
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" exec --seat SEAT_D -- sh -ec 'cd "$SEAT_DIR"; node stage-a-playwright.cjs'
+```
+
+The wrapper runs Seat exec outside Git, so no checkout content is copied.
+The script uses a fresh browser context and the same ten semantic steps.
+After its output/usage is flushed, end SC-3's interval. PRIMARY copies its result:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" cp SEAT_D:stage-a-playwright-result.json "$HOME/.local/share/wefty-proof/evidence/stage-a/sc3-result.json"
+```
+
+ORCHESTRATOR keeps this comparison, **with no pass/fail threshold**:
+
+| Path | Ten steps complete | AI-loop wall seconds | Sum of CLI wall seconds | In-browser seconds | Input / output / cache-read / cache-create tokens | Session JSONL interval |
 |---|---|---|---|---|---|---|
-| SC-2 screen | NOT-RUN | NOT-RUN | sum of all captured calls | not separately observable | NOT-RUN | transcript + counters |
-| SC-3 Playwright | NOT-RUN | NOT-RUN | capture `elapsed_seconds` | script JSON | NOT-RUN | transcript + counters |
+| SC-2 screen | NOT-RUN | NOT-RUN | NOT-RUN | not separately observable | NOT-RUN | SC2-session.jsonl |
+| SC-3 Playwright | NOT-RUN | NOT-RUN | single command | script JSON | NOT-RUN | SC3-session.jsonl |
 
-SC-1: `obs SC-1 click-shot seat click "$SEAT_A" X Y --screenshot` on a
-harmless control (use actual numeric X/Y). Keep the debug timing phases and
-`elapsed_ms`. The threshold is wefty's own part ≤1 second; report discovery,
-door/RFB, input, sync and screenshot phases separately. Full subprocess wall
-time includes harness startup. Missing phases mean NOT-RUN, not a zero duration.
-
-AP-2: keep separate exit codes for web and DNS:
+For SC-3 also retain outer submission/command wall time. Do not compare only its
+inner browser time to SC-2's whole loop. Missing usage/phase data stays NOT-RUN.
+SC-1 is a separate harmless click plus screenshot, PRIMARY using its wrapper:
 
 ```sh
-obs AP-2 no-web exec --seat "$SEAT_A" -- curl --connect-timeout 3 --max-time 5 http://1.1.1.1/
-obs AP-2 no-dns exec --seat "$SEAT_A" -- getent hosts example.com
+"$HOME/.local/share/wefty-proof/tools/w" seat click SEAT_D X Y --screenshot "$HOME/.local/share/wefty-proof/evidence/stage-a/sc1.png" --json
 ```
 
-Both fail. No successful external service is needed. A missing
-`curl` or `getent` is NOT-RUN, not network isolation proof. AP-3: capture
-`node doctor` while A remains usable; missing internet must not be a Computer
-health fault. The page, copy, commands and screen already establish AP-1.
-Undo: close the Playwright browser (the script's finally does so), release
-temporary viewer control, and later release A; block 11 deletes all copied files.
+Use actual numeric X/Y. Retain `elapsed_ms` and timing phases: wefty's own part
+must be within 1 second. Subprocess wall time also includes harness overhead.
 
-### 5. OWNER + two AI agent sessions — take control and Room (5–8 minutes)
-
-Start a detached command on A: `obs AR-2 live-command exec --seat "$SEAT_A"
---detach -- sh -c 'sleep 20; printf command-survived'` (one shell line).
-OWNER clicks **Take control** in A's viewer and types into the page. The first
-AI agent repeatedly attempts screen input. Each attempt uses a new capture
-name: `obs SC-4 first-refusal seat key "$SEAT_A" Tab`. Expected: typed
-`person_driving`, exit 5, “a person is driving”; screenshots still work and
-the command completes. Keep the Run ID and its `wefty logs RUN_ID` output.
-OWNER releases control; AI agent input works again.
-
-SC-4's interval starts at the **successful Take control acknowledgement**,
-not the later keyboard invocation. Keep the `control_taken` Seat log timestamp
-and a timestamped first-refusal capture. Do not use keyboard latency alone as
-the ≤1-second result. A human stopwatch or sparse polling cannot establish
-that bound; mark live SC-4 PARTIAL/NOT-RUN if the endpoints cannot be correlated
-with sufficient precision. No new instrumentation in wefty is authorized here.
-For a conservative bound on a stable wall clock, subtract the `control_taken`
-event's `occurred_at` from the first refusal capture's `end_unix_ns` (convert
-both to seconds). The event precedes the acknowledgement; the bound includes
-acknowledgement, polling, CLI and guard overhead. A bound ≤1 second suffices;
-a larger bound needs better evidence and must not be rounded down. Retain the
-raw timestamps and monotonic command interval. Watch for clock adjustments.
-
-The second AI agent now requests B (`--network none`) in its own sandbox with
-the same isolated profile/state selectors. It gets a different Seat/desktop
-on **CA**, a different place, and sees its own browser. Click A and verify B
-does not change. A screenshot alone is insufficient: keep both before/after
-pairs. Request C (third Seat); it gets another shared Computer with the default
-Seat limit of 2. Record `SEAT_B`, `SEAT_C` and both Computer IDs. Do not run
-extra browsers during the Room check.
+For AR-2, PRIMARY starts a bounded detached command, keeping its Run ID:
 
 ```sh
-snap RM-1 three-live
-obs RM-1 fourth-refused seat request --network none
-snap RM-1 after-fourth
+"$HOME/.local/share/wefty-proof/tools/w" exec --seat SEAT_D --detach -- sh -c 'sleep 20; printf command-survived'
 ```
 
-Read the refused Seat ID from its raw capture and set `REFUSED_SEAT`.
-Then run:
+**Before OWNER clicks Take control**, ORCHESTRATOR starts this bounded shell
+loop of real `seat key` attempts in a separate terminal (the harness launches
+one proof-wrapper command each iteration):
 
 ```sh
-python3 scripts/measure-stage-a.py check --row RM-1 --name room-check --kind room --before "$STAGE_A_EVIDENCE/three-live.json" --after "$STAGE_A_EVIDENCE/after-fourth.json" --incumbents "$SEAT_A" "$SEAT_B" "$SEAT_C" --seat "$REFUSED_SEAT"
+"$HOME/.local/share/wefty-proof/tools/obs" screen-loop --row SC-4 --name control-loop --seat SEAT_D --seconds 30
 ```
 
-Expected: immediate refusal with “out of room, try again later”, no fourth
-Computer/Seat, all three incumbent IDs/places/Computer bindings still live.
-Use the request capture elapsed time and actual refusal events; the predicate
-does not prove screen responsiveness. Take a screenshot of each incumbent
-afterward for AR-4. No swapping/overcommit workaround if the memory guard trips.
-Undo: release B after screenshots; keep C untouched for block 6; A continues
-the arrival test. Releases must wait for confirmed cleanup; block 11 is fallback.
-
-### 6. OWNER + ORCHESTRATOR — sleep/wake without early expiry (31 minutes, overlaps)
-
-Use C as the idle Seat. Record its last credential call (a single
-`wefty logs "$SEAT_C" --follow` begins the observation and counts once).
-Keep that follow running; its polls do not renew activity. After that, **no
-Seat calls, commands, copy or viewer control on C**. Raw `snap` reads L1
-directly and does not renew C. Check its live state before 30 minutes from
-the last call. Keep A available for HV-6 independently with
-`obs HV-6 keep-a-running exec --seat "$SEAT_A" --detach -- sh -c 'sleep 2400'`.
-This is a bounded running command on A; it neither renews C nor creates a
-background browser. Then continue C's clock from
-the last call. OWNER sleeps this Mac near minute 24 and wakes it near minute
-27, spanning the five-minute warning boundary but staying before expiry.
-Record actual sleep/wake times and any guard sampling gap. Immediately check
-the guard and snapshot C. It must still be live before its default 30 minutes.
-At or after minute 30 wait for the follow's reasoned end; snapshot again:
+It records begin/end Unix timestamps and exit/output for every attempt. OWNER
+now clicks Take control and drives D. Keep control until the detached command
+finishes, then release it; a command that finishes only after release does not
+prove AR-2. PRIMARY's screenshots still work; its screen input is refused with typed
+`person_driving`, exit 5; its detached command completes. ORCHESTRATOR captures
+that Run's logs (the finished event must precede control release), then checks
+the control trace:
 
 ```sh
-snap SL-6 c-ended
-python3 scripts/measure-stage-a.py check --row SL-6 --name c-log-order --kind sleep-log --seat "$SEAT_C" --after "$STAGE_A_EVIDENCE/c-ended.json"
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AR-2 --name command-during-control -- logs RUN_ID_FROM_REPLY
 ```
-
-Expected: no early end, one `ends_soon` for this idle period before `ended`,
-and an explicit end reason. The log-order check alone does not establish
-sleep or absence of early expiry. Keep real sleep/wake and live-before-expiry
-receipts too. Never change the Mac's wall clock. If sleep timing is missed,
-mark the missing clause NOT-RUN instead of manipulating stored timestamps.
-Undo: wake the Mac, terminate the finished follow, release C only if still live;
-leave the guard watcher running until block 11. Do not touch daily services.
-
-### 7. ORCHESTRATOR — demand, switch and bounded race (5–8 active minutes)
-
-After C's sleep result, collect `obs HV-3 cleanup-demand node doctor` during
-real Seat/Computer cleanup. Keep repeated snapshots and doctor captures while
-a removal remains unfinished. The host VM must stay on until that work ends.
-A fast cleanup that cannot be caught leaves HV-3 NOT-RUN live; do not inject
-disk failure or create a Backup only to prolong it. Removal is the chosen
-branch of “removal or Backup”; no Backup is needed.
-
-After preserving browser/copy evidence, set the switch from the owner's shell
-(the orchestrator shell must not descend from the node agent):
 
 ```sh
-obs HV-6 always-on node oci always-on
-obs HV-2 demand-doctor node doctor
-obs HV-6 switch-off node oci off
-obs HV-5 off-request seat request --network none
-snap HV-6 off-ended
-obs HV-2 off-doctor node doctor
-obs HV-6 demand-again node oci on-demand
+"$HOME/.local/share/wefty-proof/tools/snap" --row SC-4 --name d-control-log --seat SEAT_D
+"$HOME/.local/share/wefty-proof/tools/obs" check --row SC-4 --name control-timing --kind control --seat SEAT_D --before "$HOME/.local/share/wefty-proof/evidence/stage-a/control-loop.jsonl" --after "$HOME/.local/share/wefty-proof/evidence/stage-a/d-control-log.json"
 ```
 
-Expected: the off command lists A's running OCI Job/Computer work, stops it,
-and ends its Seats; logs name their reasons. The off request refuses at once
-with “the host VM is off”, without a dialog or leftover allocation. `doctor`
-does not start anything, and while running explains demand. This deliberately
-ends A, so **it cannot substitute for AR-1's explicit release + idle delete**.
-Use a fresh request for block 8; keep off/on-demand effects distinct.
+Report `control_taken` → **end of the first refused attempt whose begin is
+after control_taken**, and the **begin of the last accepted attempt**. A refusal
+that was already in flight is excluded. The result retains both endpoints,
+the interval and `within_one_second`. Use a stable clock; the Go event has
+microsecond precision through the shared timestamp parser. An interval >1 s is
+FAIL; missing/corrupt correlation is unproved, never rounded down to a pass.
+One fresh D tenure is required; multiple control tenures need separate evidence.
+Undo: OWNER releases control; stop the completed loop. PRIMARY releases D in
+block 9; block 11 purges all its files. A missing offline kit leaves SC-3
+NOT-RUN; never grant the Seat internet or install a different browser.
 
-HV-4: once block 8's empty host has waited 10 minutes, capture `node doctor`
-and proof node-agent transition evidence at one-second intervals around the
-predicted idle stop. Submit exactly one fresh request while a recorded
-`stopping` transition is active; record its Seat ID, approval time and readiness.
-It must get one Seat within its fixed deadline, whether stop cancels or finishes
-then restarts. A request after a completed stop proves RM-4 only. If no actual
-overlap is recorded, HV-4 is NOT-RUN. The injected-clock race matrix stays
-supporting evidence; never infer a race from ordinary cold-start success.
-Undo: set `on-demand` if the guard is clear, release this race Seat and wait
-for cleanup; on a guard trip go directly to block 11 without restarting.
+### 9. PRIMARY and ORCHESTRATOR — D release, verified removal, then host stop (20–25 minutes)
 
-### 8. AI agent + ORCHESTRATOR — release, removal, then idle host stop (20–23 minutes, overlaps)
-
-Request fresh Seat D without internet. Repeat block 4's fixture copy and
-ten-step screen browser test on D, with the sandboxed AI agent and OWNER
-watching. Copy its result out, then release D. This closes the full arrival
-chain after block 7's off switch ended A; the earlier timing comparison need
-not be repeated. Allow 5 additional active minutes, included in the total.
-Record its Computer ID `COMPUTER_D`, its current Attempt ID, and its live
-publication. Snapshot by ID; never wait for a name to vanish. For detailed
-readiness read the public Computer `display_endpoint` and the current live
-attempt from `ListJobAttempts`, not `ServiceJob.Ready` or `GetJob.Attempts`.
-The Stage A snapshot intentionally makes no runtime readiness inference.
+PRIMARY alone releases D, completing its AR-1 actor chain:
 
 ```sh
-obs AR-1 d-release seat release "$SEAT_D"
-snap AR-5 d-released
+"$HOME/.local/share/wefty-proof/tools/w" seat release SEAT_D --json
 ```
 
-Poll `snap AR-5 d-removal-N` (new N each time, at most every 2 seconds) through
-the default **10-minute Computer idle wait**. Capture `node doctor` during
-removal for HV-3. Once L1 says exactly `desired_state=removed` and
-`removal_outcome=removed_verified`, record:
+ORCHESTRATOR starts the target-filtered watch before release if possible, and
+keeps it through the default two idle waits:
 
 ```sh
-snap CT-1 d-removed
-python3 scripts/measure-stage-a.py check --row CT-1 --name d-removal-check --kind removed --computer "$COMPUTER_D" --after "$STAGE_A_EVIDENCE/d-removed.json"
-obs HV-1 before-idle-stop node doctor
+"$HOME/.local/share/wefty-proof/tools/obs" watch --row CT-1 --name d-deletion-order --seat SEAT_D --computer COMPUTER_D --seconds 1500
 ```
 
-The host VM must still be running at that verified-removal observation. Wait
-another **10 minutes from the last remaining demand**, with the guard on.
-All Computers, pending removals and other OCI work must be accounted for;
-unfinished work explains a later stop instead of a fabricated idle failure.
-Capture `node doctor` at the boundary and after stop, then again a minute
-later. Expected: healthy `host_vm_idle`, stopped, with no repair start caused
-by doctor. Save the proof transition history/log lines and monotonic snapshot
-times showing verified deletion strictly before stop (AR-5, CT-1, HV-1/HV-2).
-Record watchdog sampling delay separately from the 10-minute policy. If the
-first stopped observation precedes positive removal evidence, ordering is
-unproved, even if both are eventually true.
+Each sample contains D, its Computer/Attempt facts, D's events, recorded host
+facts with source timestamps and the actual file-write timestamp, and whether **data/oci-intent.json.stopping**
+exists. It closes read-only SQLite connections and writes incrementally.
+Other Seats' event histories are excluded. It does not renew D. Missing or
+stale host facts never become a guessed stopped/running state.
 
-Run HV-4's one-shot overlap attempt at this boundary only after capturing
-the required deletion/stop ordering, or use a separate idle cycle. If that
-would erase the only stop observation, skip it and label HV-4 NOT-RUN.
-Undo: D is already removed. Release any race Seat; preserve evidence before
-the owner purges the proof root. No Lima delete, trim, compact or disk inspection
-is required. In particular, no code assumes the old `diffdisk` name.
-
-For unattended polling **within this owner-attended run**, use the tagged
-watcher in a separate terminal instead of typing thousands of snapshots:
+After the 10-minute Computer idle wait, require `desired_state=removed` and
+exactly `removal_outcome=removed_verified`, while the host VM is still running.
+Capture `node oci removals` and `node doctor` during any unfinished cleanup for
+HV-3. Then allow 10 minutes from the **last remaining demand**, not an assumed
+release timestamp. Observe healthy `host_vm_idle` without a doctor-induced
+restart. Let the bounded watch finish after it contains the stopped state, then check
+the closed trace. Do not parse a file while its writer is appending. The
+1500-second cap includes up to five extra minutes beyond the nominal 20-minute
+idle sequence; this is included in the timeline and total:
 
 ```sh
-python3 "$STAGE_A_SCRIPT" watch --row HV-1 --name deletion-and-idle --seconds 1500
+"$HOME/.local/share/wefty-proof/tools/obs" check --row CT-1 --name d-order-check --kind ordering --computer COMPUTER_D --after "$HOME/.local/share/wefty-proof/evidence/stage-a/d-deletion-order.jsonl"
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-1 --name idle-doctor -- node doctor
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-2 --name idle-doctor-again -- node doctor
 ```
 
-It saves one read-only L1 sample per second plus the actual `oci-facts.json`
-record, including its source timestamp. It runs the memory guard between
-samples and writes incrementally. It neither calls Lima nor renews a Seat.
-Missing facts stay null; stale timestamps cannot prove a live host state.
-Use this trace for removal ordering and HV-4 only when it actually contains
-the transition. Keep direct `node doctor` captures for the human-visible
-health/demand claims. Ctrl-C retains the partial trace and does not pass a row.
+The ordering check also supports AR-5/HV-1: fresh running evidence at positive
+verified removal must precede fresh stopped evidence. A stopping mark before
+that proof, stale/missing facts, reduced deletion or an earlier stop fails the
+check. The facts writer runs every 20 seconds: recency uses its file-write
+time (at most 45 seconds old), not the supervisor's potentially old last-state
+transition timestamp. The final stopped transition must itself be later than
+the positive removal observation; a delayed cached reply cannot reverse order. This does not by itself certify the exact idle wait; keep the configured
+wait, last-demand source and transition timestamps too. Doctor is facts-only;
+its stopped read must not start the host. Do not use a vanishing name or a disk
+filename as removal proof. Undo: D is removed; preserve evidence and block 11.
+Do not race another request through this only stop observation.
 
-### 9. OWNER + ORCHESTRATOR — approval-window expiry and cold request (3–5 active minutes)
+### 10. OWNER, PRIMARY and ORCHESTRATOR — window expiry, cold start and optional separate race
 
-Do not close the original 1-hour window manually. Capture `status --json`
-before and after its recorded expiry without creating new windows. Immediately
-after expiry, make a fresh request without `--window`; a **new native dialog**
-must appear. If block 8 is still waiting for its idle stop, perform this check
-at the actual expiry boundary in a separate terminal and OWNER clicks Deny;
-this must create no Seat or runtime demand. Otherwise OWNER can approve it
-and use the same request for the cold-start case below. Keep expiry time,
-request time, new dialog, source=`dialog` in L1 and the outcome. A status line disappearing alone
-does not prove expiry enforcement. If the original window was closed or lost
-for another reason, AP-6 is NOT-RUN (retain AP-6's injected-clock test evidence).
+**At W+60, wherever the numbered sequence has reached**, ORCHESTRATOR captures
+status before/after the original window's expiry. PRIMARY requests a fresh Seat
+without a new window. A new native dialog must appear. OWNER clicks **Deny**
+while D's removal/host idle waits are running; no Seat or runtime demand is
+created. Keep expiry time, request time, dialog and source=`dialog`/refusal in
+L1. A disappearing status line alone cannot prove expiry enforcement. Do not
+manually close the window first; that would make AP-6 NOT-RUN. There is no
+window-close instruction in the cold-start block.
 
-After block 8 confirms the host VM stopped, make a fresh request if the expiry
-request was denied. OWNER approves it. This supplies block 3's RM-4 cold case.
-Capture it under RM-4, snapshot the real Seat and run the timing check.
-Keep the initial hint and successful ready reply; record the separate
-three-minute-timeout branch as NOT-RUN unless it actually occurs. Release
-the Seat after all evidence is saved.
-Undo: release this Seat and close any remaining test windows; block 11 purges
-the private installation. Closing now must not be relabelled natural expiry.
-
-### 10. ORCHESTRATOR — kept receipts and one table (2–3 minutes)
+After block 9 confirms the host stopped, PRIMARY requests E:
 
 ```sh
-python3 scripts/measure-stage-a.py report > "$STAGE_A_EVIDENCE/observations.md"
-mkdir -p "$PROOF_EVIDENCE"
-cp -R "$PROOF_ROOT/evidence/." "$PROOF_EVIDENCE/"
-cp "$PROOF_ROOT/config/setup-files.json" "$PROOF_EVIDENCE/"
+"$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
 ```
 
-Keep source revision, binary/image verification, configuration defaults,
-guard history, every raw stdout/stderr + exit code, screenshots, token counter
-receipts, event streams, all Seat/Computer/Run IDs, sleep/wake and transition
-evidence. The harness table defaults every unobserved row to NOT-RUN and every
-observed row to PARTIAL. It never promotes command exit 0 to acceptance.
-The orchestrator reviews the full clauses against the matrix and writes a
-separate sanitized final verdict table. Rows with a failed or missing clause
-stay PARTIAL/NOT-RUN with that clause, even when some supporting checks pass.
-Undo: delete only this newly created private evidence copy after the owner
-accepts another retained copy. Never put raw private receipts in this repo.
-
-### 11. OWNER + ORCHESTRATOR — undo all proof state (2–5 minutes)
-
-ORCHESTRATOR preserves the latest receipts, then runs the **exact shutdown
-and undo sequence in block 10 of [the per-user proof](per-user-host-vm-proof.md#10-owner--undo-the-entire-disposable-installation)**.
-With the guard clear: `python3 scripts/measure-per-user-proof.py shutdown`.
-On a trip, retry only its exact graceful proof stop if needed. Stop the guard
-watcher only after the proof host VM is stopped. OWNER then types:
+OWNER approves. ORCHESTRATOR keeps the initial “starting the host VM, about 1
+minute” hint, request/approval/started events and first successful screenshot.
+Approval K starts the fixed 3-minute cold limit. PRIMARY gets its first successful screenshot with the proof wrapper. Then
+ORCHESTRATOR records E using distinct receipt names:
 
 ```sh
-"$PROOF_BIN/wefty" setup --proof --remove --purge --json
+"$HOME/.local/share/wefty-proof/tools/snap" --row RM-4 --name e-cold-ready --seat SEAT_E
+"$HOME/.local/share/wefty-proof/tools/obs" check --row RM-4 --name e-cold-timing --kind timing --seat SEAT_E --after "$HOME/.local/share/wefty-proof/evidence/stage-a/e-cold-ready.json"
+```
+ A hot bootstrap is not RM-4. If refusal occurs at K+3,
+retain its reason and cleanup evidence. Do not induce a startup failure: the
+live timeout branch is NOT-RUN unless naturally encountered; its injected-clock
+source test remains supporting evidence. PRIMARY releases E; let its Computer
+idle-delete and the host idle-stop before undo, accounting for the final two
+10-minute waits in the timeline.
+
+**HV-4 optional separate cycle:** request/release F, wait its deletion and the
+host idle boundary, and submit exactly one G request during a recorded stopping
+mark/transition. Use a new target-filtered watch and the actual approval/ready
+receipts. It must receive one Seat within its deadline, whether the stop cancels
+or finishes then restarts. If there is no recorded overlap, HV-4 is NOT-RUN.
+This adds 25–30 minutes; never infer it from E's ordinary cold start and never
+reuse D's only ordering trace. Undo: release F/G, retain their outcomes, then
+block 11 may purge the disposable root without claiming another idle-delete
+acceptance pass. Do not reset the memory guard or approval window to retry.
+
+### 11. ORCHESTRATOR and OWNER — preserve Stage A receipts and undo (5–10 minutes)
+
+ORCHESTRATOR keeps the one table and original AI session/tool intervals:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" report > "$HOME/.local/share/wefty-proof/evidence/stage-a/observations.md"
+mkdir -p /ABS_REPO/.bin/stage-a-evidence/RUN_ID
+cp -R "$HOME/.local/share/wefty-proof/evidence/stage-a/." /ABS_REPO/.bin/stage-a-evidence/RUN_ID/
+cp "$HOME/.local/share/wefty-proof/config/setup-files.json" /ABS_REPO/.bin/stage-a-evidence/RUN_ID/
+cp -R "$HOME/.local/share/wefty-proof/evidence/memory-guard.jsonl" /ABS_REPO/.bin/stage-a-evidence/RUN_ID/
 ```
 
-**The `--proof` flag is mandatory.** Check the printed removal root against
-the kept setup receipt before deletion. Expected: only the three proof
-LaunchAgents removed, no proof root remains, and no daily service selected.
-ORCHESTRATOR reads each proof `launchctl print` result and root absence, as
-in the linked undo block. A failed unload/stop must preserve the root and
-receipt. Record PARTIAL and stop; do not force purge or start a new run.
-Undo of undo: none; evidence was copied out first. A new attempt needs a fresh
-owner-approved proof installation and a fresh guard baseline.
+Keep source/version/image receipts, defaults, guard history, sleep/wake times,
+all Seat/Computer/Run IDs, raw stdout/stderr/exit status, screenshots, token
+intervals and transition evidence. Captures stay PARTIAL until all clauses
+are reviewed; unobserved rows stay NOT-RUN. **A failed check appears as FAIL,
+never PARTIAL.** A later successful capture cannot erase that FAIL. The final
+reviewed acceptance matrix keeps any failed/missing clause explicit.
 
-The snapshots include raw current/published Attempt IDs, display endpoints,
-all Attempt rows (instead of relying on `GetJob.Attempts`), Seat observations
-and node boot IDs. An endpoint alone is insufficient: match the current
-publication and ready Seat observation to a live, unexpired Attempt on the
-same live node boot. These are source facts, not a computed `ready` verdict;
-the real screenshot/command must also succeed. Lease wall timestamps cannot
-prove liveness across a wall-clock change.
+With the guard clear, ORCHESTRATOR shuts down only the proof node agent/host:
 
-The observer's unit tests use real L1 stores and injected clocks, including
-working lifecycle transitions, refusal, expiry, removal acknowledgements and
-negative mutations. They prove observer interpretation, not any attended row.
-Browser fixtures have not run on a Seat in this preparation. Mac dialogs,
-sleep/wake, sandbox integration, Linux runtime, the idle-stop race and timing
-thresholds remain live/CI responsibilities. This ticket changes no wefty
-behaviour and adds no policy or runtime hooks.
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" shutdown
+```
+
+The harness unloads the proof node agent and inspects the instance first.
+If already **Stopped**, it skips the Lima stop command (the expected HV-1 end).
+If running, it stops gracefully and verifies Stopped. After a guard trip, do
+not rerun normal measurements or reset the guard: its emergency stop already
+ran. If that stop failed, follow the exact graceful recovery in the per-user
+proof's undo with private Lima home, skipping stop if already Stopped. Stop the
+watcher only after host stop; it must not recreate a purged proof root.
+
+OWNER then types the exact removal command:
+
+```sh
+"$HOME/.local/share/wefty-proof/source-bin/wefty" setup --proof --remove --purge --json
+```
+
+`--proof` is mandatory. Check the printed proof root against the kept setup
+receipt. Expected: only three proof LaunchAgents unloaded and the proof root
+gone. ORCHESTRATOR verifies each proof label absent and root absence as in
+[the per-user proof undo](per-user-host-vm-proof.md#10-owner--undo-the-entire-disposable-installation).
+Failed unload/stop must retain the root: record failure, no force purge or retry
+installation. Undo of undo: none; the Stage A evidence copy was saved first.
+
+## Token interval commands (ORCHESTRATOR only)
+
+Use a quiet PRIMARY session paused at complete JSONL line boundaries. Start
+immediately before its first measured action. Replace `/ABS/PRIMARY.jsonl` with
+that exact private session file. These commands are shown for SC-2; repeat with
+`SC3` for SC-3. Do not edit the live session file or use aggregate subscription
+usage. The two marker lines enclose an exact copied interval from that session.
+
+Begin:
+
+```sh
+python3 - /ABS/PRIMARY.jsonl "$HOME/.local/share/wefty-proof/evidence/stage-a/SC2-start.json" <<'PY'
+import json, pathlib, sys, time
+source, output = map(pathlib.Path, sys.argv[1:])
+raw = source.read_bytes()
+if raw and not raw.endswith(b'\n'):
+    raise SystemExit('wait for complete JSONL line; session must be paused')
+info = source.stat()
+value = dict(source=str(source.resolve()), offset=len(raw), inode=info.st_ino,
+             device=info.st_dev, begin_monotonic_ns=time.monotonic_ns())
+with output.open('x') as stream:
+    json.dump(value, stream)
+PY
+```
+
+After the measured actions, wait until the session's assistant usage record is
+flushed and pause it again. End and sum:
+
+```sh
+python3 - "$HOME/.local/share/wefty-proof/evidence/stage-a/SC2-start.json" "$HOME/.local/share/wefty-proof/evidence/stage-a/SC2-session.jsonl" <<'PY'
+import json, pathlib, sys, time
+start = json.loads(pathlib.Path(sys.argv[1]).read_text())
+source = pathlib.Path(start['source']); info = source.stat(); raw = source.read_bytes()
+if (info.st_ino, info.st_dev) != (start['inode'], start['device']) or len(raw) < start['offset'] or not raw.endswith(b'\n'):
+    raise SystemExit('session rotated, truncated or has an incomplete line: tokens NOT-RUN')
+records = [json.loads(line) for line in raw[start['offset']:].splitlines()]
+interval = [dict(stage_a_marker='BEGIN')] + records + [dict(stage_a_marker='END')]
+with pathlib.Path(sys.argv[2]).open('x') as output:
+    for record in interval:
+        output.write(json.dumps(record) + '\n')
+fields = ['input_tokens','output_tokens','cache_read_input_tokens','cache_creation_input_tokens']
+messages = {}
+for record in interval[1:-1]:
+    message = record.get('message', {})
+    if record.get('type') == 'assistant' and isinstance(message.get('usage'), dict):
+        if not message.get('id'):
+            raise SystemExit('usage lacks message ID: tokens NOT-RUN')
+        messages[message['id']] = message['usage']
+if not messages or any(any(k not in usage for k in fields) for usage in messages.values()):
+    raise SystemExit('usage unavailable or different JSONL schema: tokens NOT-RUN')
+print(json.dumps(dict(wall_seconds=(time.monotonic_ns()-start['begin_monotonic_ns'])/1e9,
+                      tokens={k:sum(usage[k] for usage in messages.values()) for k in fields},
+                      assistant_messages=len(messages), interval=sys.argv[2])))
+PY
+```
+
+Repeated streaming rows with the same message ID contribute only their final
+usage. Report input/output/cache fields separately; cache categories are not
+silently added to input tokens. Save the printed result as well as the interval.
+Setup/copy-in and final copy-out are outside both intervals. No other PRIMARY
+work occurs inside either marker pair. Missing usage is NOT-RUN. The command's
+outer wall time includes AI decisions and tool waits; SC-3's script also gives
+its separate inner browser time. No token or timing threshold is applied.
+
+The scratch-store tests prove observer interpretation and administrator state,
+not Mac launchd, real dialogs, sleep, sandbox enforcement, browser execution,
+root Linux runtime, or the idle-stop race. Those remain attended/CI evidence.
