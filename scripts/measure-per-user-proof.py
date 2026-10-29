@@ -193,6 +193,13 @@ class Proof:
                     return True
             self.wait(exited, timeout=120)
 
+    def shutdown(self):
+        # Cleanup is idempotent; PR-3's measured halt must still issue stop.
+        self.unload_node()
+        if self.state() == "Stopped":
+            return 0
+        return self.halt()
+
     def halt(self, force=False):
         self.unload_node()
         argv = ["limactl", "stop"] + (["--force"] if force else []) + [INSTANCE]
@@ -444,7 +451,7 @@ def main():
                 config = json.loads((proof.root / "config/oci-user.json").read_text())
                 if config["instance"] != INSTANCE or config["lima_home"] != str(proof.lima_home):
                     raise RuntimeError("proof configuration does not match isolated paths")
-                {"shutdown": proof.halt, "prove": proof.prove, "cold": proof.cold, "stop": proof.stops, "memory": proof.memory_states, "disk": proof.disk_cycles, "quoting": proof.quoting}[args.mode]()
+                {"shutdown": proof.shutdown, "prove": proof.prove, "cold": proof.cold, "stop": proof.stops, "memory": proof.memory_states, "disk": proof.disk_cycles, "quoting": proof.quoting}[args.mode]()
     except ProofRemoved:
         return 0 if args.mode == "guard-watch" else 1
     except KeyboardInterrupt:

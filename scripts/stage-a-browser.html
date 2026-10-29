@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Stage A offline browser test</title>
+<style>
+body { font: 24px sans-serif; margin: 24px; max-width: 1000px; }
+label { display: block; margin: 14px 0; }
+input, select, button, a { font: inherit; padding: 8px; }
+button { margin: 8px; } #result { white-space: pre; }
+</style>
+<h1>Stage A offline browser test</h1>
+<form id="test">
+<label>Name <input id="name" required autocomplete="off"></label>
+<label>Code <input id="code" required autocomplete="off"></label>
+<label><input id="offline" type="checkbox"> Offline confirmed</label>
+<label>Color <select id="color"><option>red</option><option>blue</option></select></label>
+<button type="button" id="add">Add item</button>
+<button type="button" id="remove">Remove last</button>
+<output id="count">0 items</output><br>
+<button type="submit">Submit</button>
+</form>
+<p id="result" role="status">Ready</p>
+<a id="download" hidden download="stage-a-result.json">Download result</a>
+<script>
+let count = 0;
+const element = id => document.getElementById(id);
+const showCount = () => { element('count').textContent = `${count} items`; };
+element('add').onclick = () => { count++; showCount(); };
+element('remove').onclick = () => { count = Math.max(0, count - 1); showCount(); };
+element('test').onsubmit = event => {
+  event.preventDefault();
+  const value = {name: element('name').value, code: element('code').value,
+    offline: element('offline').checked, color: element('color').value, count};
+  value.pass = value.name === 'Ada' && value.code === '42' && value.offline &&
+    value.color === 'blue' && value.count === 1;
+  element('result').textContent = (value.pass ? 'PASS ' : 'FAIL ') + JSON.stringify(value);
+  element('download').href = URL.createObjectURL(new Blob([JSON.stringify(value) + '\n'], {type: 'application/json'}));
+  element('download').hidden = false;
+};
+</script>
