@@ -3039,9 +3039,56 @@ only L1 read `GET /v1/seats/{seat_id}/viewer-target`. Its closed response is
 `{"url":"http://HOST/v1/seats/SEAT_ID/person/viewer"}` (HTTPS for a secure door).
 Authorization precedes discovery. One query-only snapshot checks the live Seat,
 its exact ready Attempt and the published endpoint, without a Seat credential
-or lifecycle write. The CLI prints the URL and opens the system browser;
-`--no-open` or `--json` prints only. An AI agent must leave opening the viewer
-to the owner: on one Mac the viewer counts as a person (§4.4.3).
+or lifecycle write. That URL stays on the CLI side. On every Fabric, the CLI
+starts a foreground local relay on `127.0.0.1` at a random port (#1336). The
+browser uses the relay for the page, assets, status, control calls and WebSocket;
+each new upstream connection uses a fresh Fabric dial as the owner. The relay
+rewrites Host and Origin to the discovered door, preserving the node's existing
+Host, Origin, person and administrator checks. It proxies only this Seat's
+`/person/` paths and does not forward its browser cookie or a Seat credential.
+
+The printed local link contains a random one-use secret with at least 128 bits
+of entropy. A separate random path prefix also has at least 128 bits of
+entropy. The link's first GET exchanges the one-use secret for a host-only
+`HttpOnly`, `SameSite=Strict` session cookie whose Path is that random prefix.
+It redirects to `/<prefix>/v1/seats/SEAT_ID/person/viewer`, without the bootstrap
+secret. Cookies do not isolate loopback ports: the unguessable prefix prevents
+another local server from eliciting this cookie at a known Seat path. Every
+request outside the prefix is refused even if it carries the cookie; the relay
+strips the prefix before forwarding and prefixes the door's page redirects.
+Each relay uses a distinct cookie name and checks its exact local Host. Every subsequent request, including WebSockets, requires that cookie.
+WebSocket upgrades and methods other than GET/HEAD also require Origin to equal
+the relay's own origin before any upstream call. The bootstrap secret is never
+logged; the link is a private local capability, not a Seat credential or the
+node's person session bearer.
+
+The CLI prints that link and opens the system browser. `--no-open` suppresses
+opening; `--json` prints one JSON link line. Both keep the relay running. The
+command must stay running while the owner watches. Ctrl-C/TERM, an ended Seat,
+or the door ending its viewing session stops the command and closes the relay
+and its connections, with a readable reason. Terminal HTTP replies, including
+`seat_ended` and `takeover_session_ended`, pass through before shutdown. The
+relay leaves up to five seconds when the door ends a viewing connection:
+this allows the page's three-second status poll plus a round-trip margin to
+read the terminal reason. Forwarding that reply ends the relay immediately.
+One relay serves all tabs using its browser cookie; the door ending one tab's
+session can stop the shared relay and the other tabs. Separate commands provide
+independent relays. A Seat end takes precedence over an earlier session-close
+reason while draining. Cancellation closes it immediately. The node's one-hour cap remains authoritative. Query-only polling also detects an
+ended Seat before a browser connects; it does not renew Seat life. A lost
+administrator authority or a missing Seat ends viewing at once with its own
+refusal. Other poll errors, including temporary unavailability, not-ready conflicts and transport
+failures, leave the viewer running for up to 60 seconds of failed observations;
+a successful poll resets that window. A persistent outage exits as `unavailable`.
+A Seat end exits as `seat_ended` (5), and an ended/capped viewing session as
+`takeover_session_ended` (4), using existing CLI error outcomes.
+
+The CLI uses the relay on every Fabric and prints only the relay link. The node
+door itself is unchanged: on tsnet, a browser on a tailnet device that has the
+door URL from `viewer-target` can still open it directly, subject to its existing
+person, administrator, Host and Origin checks. An AI agent
+must leave opening the viewer to the owner: on one Mac the viewer counts as a
+person (§4.4.3).
 
 The node-only L1 routes `POST /v1/agent/seats/{seat_id}/screen-authority` and
 `/screen-event` bind the Computer, Job, Attempt, node boot session and fence.
