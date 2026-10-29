@@ -44,8 +44,12 @@ func TestFreshAttemptRenewalStatusAndDoctor(t *testing.T) {
 		{name: "inside-first-lease", state: contract.AttemptRunning, lease: generationDeadline(time.Now().Add(time.Hour)), health: "healthy"},
 		{name: "expired-first-lease", state: contract.AttemptRunning, lease: generationDeadline(time.Now().Add(-time.Hour)), health: "degraded", code: "retiring_lease_stale"},
 		{name: "missing-lease", state: contract.AttemptRunning, health: "unverified", code: "generation_renewal_unverified"},
-		{name: "claimed-without-renewal", state: contract.AttemptClaimed, lease: generationDeadline(time.Now().Add(time.Hour)), health: "unverified", code: "generation_renewal_unverified"},
-		{name: "awaiting-input-without-renewal", state: contract.AttemptAwaitingInput, lease: generationDeadline(time.Now().Add(time.Hour)), health: "unverified", code: "generation_renewal_unverified"},
+		{name: "claimed-without-renewal", state: contract.AttemptClaimed, lease: generationDeadline(time.Now().Add(time.Hour)), health: "healthy"},
+		{name: "claimed-expired-first-lease", state: contract.AttemptClaimed, lease: generationDeadline(time.Now().Add(-time.Hour)), health: "degraded", code: "retiring_lease_stale"},
+		{name: "claimed-missing-lease", state: contract.AttemptClaimed, health: "unverified", code: "generation_renewal_unverified"},
+		{name: "awaiting-input-without-renewal", state: contract.AttemptAwaitingInput, lease: generationDeadline(time.Now().Add(time.Hour)), health: "healthy"},
+		{name: "awaiting-input-expired-first-lease", state: contract.AttemptAwaitingInput, lease: generationDeadline(time.Now().Add(-time.Hour)), health: "degraded", code: "retiring_lease_stale"},
+		{name: "awaiting-input-missing-lease", state: contract.AttemptAwaitingInput, health: "unverified", code: "generation_renewal_unverified"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, entry := range []string{"status", "doctor"} {
