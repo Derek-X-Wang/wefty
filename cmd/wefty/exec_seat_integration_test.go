@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"path/filepath"
 	"reflect"
@@ -19,6 +19,19 @@ import (
 // #1332: stubbed CLI acceptance hid refusals in both real server handlers.
 func TestExecSeatThroughRealL1AndL3QueuesBoundJob(t *testing.T) {
 	t.Chdir(t.TempDir())
+	h := newExecSeatIntegrationHarness(t)
+	h.submitAndClaim(t, []string{"printf", "%s", "seat command"}, 1, "")
+}
+
+type execSeatIntegrationHarness struct {
+	*storageCLIHarness
+	runs       *l3.Store
+	reconciler *l3.Reconciler
+	seat       l1.SeatCallResult
+}
+
+func newExecSeatIntegrationHarness(t *testing.T) *execSeatIntegrationHarness {
+	t.Helper()
 	t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
 	h := newStorageCLIHarness(t, &l1.ComputerSettings{SeatLimit: 2, IdleAction: l1.ComputerIdleDelete, Network: l1.ComputerNetworkNone})
 	ctx := h.ctx
@@ -80,8 +93,10 @@ func TestExecSeatThroughRealL1AndL3QueuesBoundJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Drive reconciliation explicitly so the queued Job can be inspected before claim.
-	server, err := l3.NewServer(ledger, store, l3.ServerConfig{Jobs: upstream, Logs: upstream})
+	// #1340: mirror cmd/wefty-l3/main.go; Seat authority must come from the
+	// Reconciler's L1 client, with no explicit Jobs override.
+	server, err := l3.NewServer(ledger, store, l3.ServerConfig{Reconciler: reconciler, Logs: upstream,
+		ControlPlaneNodeID: "control-plane", ControlPlaneAddress: l3.DefaultL1Address})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,28 +104,34 @@ func TestExecSeatThroughRealL1AndL3QueuesBoundJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	serveCtx, cancel := context.WithCancel(ctx)
-	done := serveTestServer(serveCtx, func() error { return server.Serve(serveCtx, listener) })
+	// Serve the real handler without Serve's background reconciler. One explicit
+	// pass below keeps the queued Job inspection deterministic.
+	httpServer := &http.Server{Handler: server.Handler()}
+	done := serveTestServer(ctx, func() error { return httpServer.Serve(listener) })
 	t.Cleanup(func() {
-		cancel()
-		if err := <-done; err != nil {
+		_ = httpServer.Close()
+		if err := <-done; !errors.Is(err, http.ErrServerClosed) {
 			t.Error(err)
 		}
 	})
+	return &execSeatIntegrationHarness{storageCLIHarness: h, runs: store, reconciler: reconciler, seat: seat}
+}
 
-	argv := []string{"printf", "%s", "seat command"}
+func (h *execSeatIntegrationHarness) submitAndClaim(t *testing.T, argv []string, version int, directory string) l1.Claim {
+	t.Helper()
+	ctx, id := h.ctx, h.seat.SeatID
 	var stdout, stderr bytes.Buffer
-	if err = execute(ctx, h.clients, true, append([]string{"exec", "--seat", id, "--detach", "--"}, argv...), &stdout, &stderr); err != nil {
+	if err := execute(ctx, h.clients, true, append([]string{"exec", "--seat", id, "--detach", "--"}, argv...), &stdout, &stderr); err != nil {
 		t.Fatalf("CLI Seat submission: %v; stderr=%s", err, &stderr)
 	}
 	var accepted l3.RunAccepted
-	if err = json.Unmarshal(stdout.Bytes(), &accepted); err != nil || accepted.RunID == "" {
+	if err := json.Unmarshal(stdout.Bytes(), &accepted); err != nil || accepted.RunID == "" {
 		t.Fatalf("acceptance=%s: %v", &stdout, err)
 	}
-	if err = reconciler.ReconcileOnce(ctx); err != nil {
+	if err := h.reconciler.ReconcileOnce(ctx); err != nil {
 		t.Fatalf("dispatch through real L1: %v", err)
 	}
-	record, err := store.GetRun(ctx, accepted.RunID)
+	record, err := h.runs.GetRun(ctx, accepted.RunID)
 	if err != nil || record.SeatID != id || record.L1JobID == "" {
 		t.Fatalf("Run=%+v: %v", record, err)
 	}
@@ -119,20 +140,27 @@ func TestExecSeatThroughRealL1AndL3QueuesBoundJob(t *testing.T) {
 		t.Fatalf("queued Job=%+v: %v", job, err)
 	}
 	params, present, err := contract.ParseSeatRunParams([]byte(job.Spec.Labels[contract.LabelRunParams]))
-	if err != nil || !present || params.Binding.SeatID != id || params.Binding.ComputerID != h.computer.ComputerID || params.Binding.ComputerJobID != h.claim.Job.JobID || params.Binding.ComputerAttemptID != h.claim.Lease.AttemptID || params.Binding.NodeID != node.NodeID || !reflect.DeepEqual(params.SeatRun.Argv, argv) || !reflect.DeepEqual(job.Spec.RoutingTags, []string{contract.StableNodeTagPrefix + node.NodeID}) {
+	if err != nil || !present || params.Binding.SeatID != id || params.Binding.ComputerID != h.computer.ComputerID || params.Binding.ComputerJobID != h.claim.Job.JobID || params.Binding.ComputerAttemptID != h.claim.Lease.AttemptID || params.Binding.NodeID != h.node.NodeID || !reflect.DeepEqual(params.SeatRun.Argv, argv) || !reflect.DeepEqual(job.Spec.RoutingTags, []string{contract.StableNodeTagPrefix + h.node.NodeID}) {
 		t.Fatalf("Seat binding=%+v Job=%+v: %v", params, job, err)
 	}
-	if bytes.Contains(record.Params, []byte(seat.Credential)) {
+	if params.Version != version || params.SeatRun.WorkingDirectory != directory {
+		t.Fatalf("Seat Run version=%d working_directory=%q, want version=%d working_directory=%q", params.Version, params.SeatRun.WorkingDirectory, version, directory)
+	}
+	if !bytes.Equal(record.Params, []byte(job.Spec.Labels[contract.LabelRunParams])) {
+		t.Fatalf("dispatched params differ from immutable Run params: Run=%s Job=%s", record.Params, job.Spec.Labels[contract.LabelRunParams])
+	}
+	if bytes.Contains(record.Params, []byte(h.seat.Credential)) {
 		t.Fatal("Seat credential entered immutable params")
 	}
-	// Use the real node HTTP handler as well: routing and claim filters must admit it.
+	// Use L1's real agent claim route as well: routing and claim filters must admit it.
 	agentClient := newAPIClient("L1", "l1", h.agentFabric, l3.DefaultL1Address)
 	t.Cleanup(func() { agentClient.client.CloseIdleConnections() })
 	var claim l1.Claim
-	if err = agentClient.do(ctx, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: node.NodeID, BootSessionID: node.BootSessionID, Class: contract.JobClassOneShot}, nil, &claim, http.StatusOK); err != nil {
+	if err = agentClient.do(ctx, http.MethodPost, "/v1/agent/jobs/claim", l1.ClaimRequest{NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID, Class: contract.JobClassOneShot}, nil, &claim, http.StatusOK); err != nil {
 		t.Fatalf("claim Seat Run: %v", err)
 	}
 	if claim.Job.JobID != job.JobID {
 		t.Fatalf("claimed Job=%s want %s", claim.Job.JobID, job.JobID)
 	}
+	return claim
 }
