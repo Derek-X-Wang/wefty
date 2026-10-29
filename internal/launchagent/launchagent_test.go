@@ -112,6 +112,66 @@ func (launchd *fakeLaunchd) manager() Manager {
 	return Manager{UID: 501, Run: launchd.run, PollInterval: time.Millisecond, UnloadBound: 50 * time.Millisecond}
 }
 
+func TestLoadGenerationObservesStartOverride(t *testing.T) {
+	fault := errors.New("disabled override transport unavailable")
+	for _, tc := range []struct {
+		name, reply, wantVerbs string
+		fault                  error
+		wantError              string
+	}{
+		{name: "fresh", reply: "disabled services = {\n}\n", wantVerbs: "print,print-disabled,bootstrap"},
+		{name: "enabled", reply: "disabled services = {\n\"dev.wefty.node-agent.g-fresh\" => false\n}\n", wantVerbs: "print,print-disabled,bootstrap"},
+		{name: "legacy fence", reply: "disabled services = {\n\"dev.wefty.node-agent\" => true\n}\n", wantVerbs: "print,print-disabled,bootstrap"},
+		{name: "disabled", reply: "disabled services = {\n\"dev.wefty.node-agent.g-fresh\" => true\n}\n", wantVerbs: "print,print-disabled,enable,bootstrap"},
+		{name: "disabled word", reply: "disabled services = {\n\"dev.wefty.node-agent.g-fresh\" => disabled\n}\n", wantVerbs: "print,print-disabled,enable,bootstrap"},
+		{name: "malformed", reply: "unreadable output", wantVerbs: "print,print-disabled", wantError: "decode launchctl disabled services"},
+		{name: "unknown", reply: "disabled services = {\n\"dev.wefty.node-agent.g-fresh\" => unknown\n}\n", wantVerbs: "print,print-disabled", wantError: "unknown override"},
+		{name: "transport", fault: fault, wantVerbs: "print,print-disabled", wantError: "inspect LaunchAgent dev.wefty.node-agent.g-fresh autostart"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plist := newTestPlist(t)
+			plist.agent.Label = "dev.wefty.node-agent.g-fresh"
+			plist.path = Path(plist.agent.Environment["HOME"], plist.agent.Label)
+			var err error
+			plist.payload, err = Render(plist.agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			launchd := &fakeLaunchd{}
+			manager := launchd.manager()
+			manager.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+				if args[0] == "print-disabled" {
+					if name != Launchctl || strings.Join(args, ",") != "print-disabled,gui/501" {
+						t.Fatalf("override observation = %s %v", name, args)
+					}
+					launchd.verbs = append(launchd.verbs, args[0])
+					return []byte(tc.reply), tc.fault
+				}
+				if args[0] == "enable" && strings.Join(args, ",") != "enable,gui/501/dev.wefty.node-agent.g-fresh" {
+					t.Fatalf("enabled another label: %v", args)
+				}
+				return launchd.run(ctx, name, args...)
+			}
+			action, err := manager.LoadGeneration(t.Context(), plist.folder, plist.path, plist.agent.Label, plist.payload)
+			if tc.wantError != "" {
+				var refusal *RunningProcessError
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) || errors.As(err, &refusal) || action != "" || launchd.loaded {
+					t.Fatalf("load generation must fail operationally without bootstrap: action=%s err=%v loaded=%t", action, err, launchd.loaded)
+				}
+				if tc.fault != nil && !errors.Is(err, tc.fault) {
+					t.Fatalf("transport cause lost: %v", err)
+				}
+			} else if err != nil || action != Loaded {
+				t.Fatalf("load generation = %s, %v", action, err)
+			}
+			if got := strings.Join(launchd.verbs, ","); got != tc.wantVerbs {
+				t.Fatalf("launchctl verbs = %s, want %s", got, tc.wantVerbs)
+			}
+			plist.assertOnly(t, string(plist.payload))
+		})
+	}
+}
+
 // bootout can return while launchd still lists the service; bootstrapping
 // then would fail, so Converge waits until launchd confirms it has forgotten it.
 func TestConvergeWaitsForUnloadBeforeBootstrap(t *testing.T) {
@@ -135,7 +195,7 @@ func TestConvergeWaitsForUnloadBeforeBootstrap(t *testing.T) {
 	if action, err := plist.converge(t, manager); err != nil || action != Reloaded {
 		t.Fatalf("converge = %s, %v", action, err)
 	}
-	if got := strings.Join(launchd.verbs, ","); got != "print,bootout,print,print,print,enable,bootstrap" {
+	if got := strings.Join(launchd.verbs, ","); got != "print,bootout,print,print,print,print-disabled,bootstrap" {
 		t.Fatalf("launchctl verbs = %s", got)
 	}
 	plist.assertOnly(t, string(plist.payload))
@@ -167,7 +227,7 @@ func TestConvergePublishesOnlyAfterUnloading(t *testing.T) {
 	plist.assertOnly(t, "old")
 	launchd.bootoutErr, launchd.verbs = nil, nil
 	if action, err := plist.converge(t, launchd.manager()); err != nil || action != Reloaded ||
-		strings.Join(launchd.verbs, ",") != "print,bootout,print,enable,bootstrap" {
+		strings.Join(launchd.verbs, ",") != "print,bootout,print,print-disabled,bootstrap" {
 		t.Fatalf("retry = %s %v, verbs %v", action, err, launchd.verbs)
 	}
 	plist.assertOnly(t, string(plist.payload))
@@ -306,7 +366,7 @@ func TestConvergeRestoresThePreviousDefinitionWhenPublishFails(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "previous definition was restored") {
 				t.Fatalf("converge with a failing publish = %v", err)
 			}
-			if got := strings.Join(launchd.verbs, ","); got != "print,bootout,print,enable,bootstrap" || !launchd.loaded {
+			if got := strings.Join(launchd.verbs, ","); got != "print,bootout,print,print-disabled,bootstrap" || !launchd.loaded {
 				t.Fatalf("the previous definition was not loaded again: verbs %s loaded=%t", got, launchd.loaded)
 			}
 			plist.assertOnly(t, "old")
@@ -615,7 +675,7 @@ func TestLegacyStartOverrideObservation(t *testing.T) {
 				}
 				return []byte(tc.reply), tc.fault
 			}}
-			disabled, err := manager.legacyStartDisabled(t.Context())
+			disabled, err := manager.startDisabled(t.Context(), "dev.wefty.node-agent")
 			if (err != nil) != tc.wantError || disabled != tc.disabled {
 				t.Fatalf("override observation: disabled=%t err=%v", disabled, err)
 			}
