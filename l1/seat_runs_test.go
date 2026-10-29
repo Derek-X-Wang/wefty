@@ -3,6 +3,8 @@ package l1
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -727,4 +729,45 @@ func TestSeatRunSchemaUpgradeMatchesFreshFingerprint(t *testing.T) {
 	if err != nil || got != want {
 		t.Fatalf("upgrade fingerprint=%s fresh=%s error=%v", got, want, err)
 	}
+}
+
+func TestSeatRunTargetCredentialGate(t *testing.T) {
+	f, id, secret, auth := liveSeatForRun(t)
+	other := f.request(t, 2, true)
+	server, err := NewServer(copyOutcomeFabric{}, f.store, ServerConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(target string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/v1/seats/"+target+"/run-target", nil)
+		r.Header.Set(SeatCredentialHeader, secret)
+		w := httptest.NewRecorder()
+		server.Handler().ServeHTTP(w, r)
+		return w
+	}
+	t.Run("own-live", func(t *testing.T) {
+		w := request(id)
+		var binding contract.SeatRunBinding
+		if err := json.Unmarshal(w.Body.Bytes(), &binding); err != nil || w.Code != http.StatusOK || binding.SeatID != id || binding.ComputerAttemptID != auth.AttemptID {
+			t.Fatalf("target=%d %s: %v", w.Code, w.Body.String(), err)
+		}
+	})
+	t.Run("another-seat", func(t *testing.T) {
+		w := request(other)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("foreign target=%d %s", w.Code, w.Body.String())
+		}
+	})
+	if _, err := f.store.EndSeatRequest(t.Context(), "fabric-computer-node", id, SeatEndRequest{NodeID: auth.NodeID, BootSessionID: auth.BootSessionID, Reason: "released"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("ended", func(t *testing.T) {
+		w := request(id)
+		var reply struct {
+			Error contract.APIError `json:"error"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &reply); err != nil || w.Code != http.StatusConflict || reply.Error.Code != "seat_ended" {
+			t.Fatalf("ended target=%d %s: %v", w.Code, w.Body.String(), err)
+		}
+	})
 }

@@ -99,7 +99,9 @@ Successful JSON replies include the count and, when nonzero, an
 
 A separate SHA-256 credential digest survives the active secret's terminal
 scrub. Presenting a Seat credential selects a closed protocol: its own log
-and read cursor after its end. Live Seats also accept copy-outcome receipts.
+and read cursor after its end. Live Seats also accept release, copy-outcome
+receipts, and their own `copy-target`, `screen-target` and `run-target`
+resolution. `run-target` proves the Seat Run binding for L3 (#1332).
 It never falls through to the caller's broader Fabric principal. Another Seat's log returns `forbidden`. Every other operation
 after the Seat ends, including command, input, copy-transfer and screen routes,
 returns `seat_ended` with the end reason.
