@@ -160,8 +160,20 @@ requesting again makes a different request. The request waits during the
 owner's dialog; run it in the background or rely on `wefty seat wait`.
 
 The owner can watch with `wefty seat view SEAT_ID`, take control, and release
-with an optional note. `--no-open` prints the URL; `--json` prints it as JSON.
-An AI agent must not open the viewer itself: the viewer counts as a person.
+with an optional note. This foreground command runs a local loopback relay on
+every Fabric. Keep it running while viewing. It prints and opens a private
+one-use secret link; the browser exchanges the secret for an HttpOnly,
+SameSite=Strict cookie scoped to a separate random path prefix and redirects
+to a clean URL under that prefix. The prefix protects the cookie from other
+loopback ports; treat it as private too. The relay dials the node
+through Fabric as the owner. `--no-open` suppresses opening the browser;
+`--json` prints one JSON link line. Both keep running until interrupted, the
+Seat ends or the door ends the viewing session. Ctrl-C/TERM closes the relay
+and its connections. When the door ends a session, the relay allows five
+seconds for the final status poll. All tabs using one relay share its lifetime;
+a door-ended session in one tab can close the other tabs. Treat the secret link
+and random prefix as private; do not log them.
+An AI agent must leave opening the viewer to the owner: it counts as a person.
 While a person drives, use screenshots to watch; leave screen input to the
 person, including input made by commands such as Playwright or `xdotool`.
 

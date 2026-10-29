@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 
 const source = fs.readFileSync(new URL('../viewer/viewer.js', import.meta.url), 'utf8').replace(/^import RFB from .*;\n/, '');
 const flush = () => new Promise(resolve => setImmediate(resolve));
-function browser() {
+function browser(prefix = '') {
     const elements = new Map();
     const element = id => {
         if (!elements.has(id)) elements.set(id, {textContent: '', value: '', disabled: false, handlers: {},
@@ -30,7 +30,7 @@ function browser() {
     }
     RFB.messages = {pixelFormat(sock, ...args) {sock.calls.push(['pixelFormat', ...args]);}, clientEncodings(sock, encodings) {sock.calls.push(['encodings', ...encodings]);}, fbUpdateRequest(sock, ...args) {sock.calls.push(['update', ...args]);}};
     const context = {RFB, WebSocket: WS, URL, TextEncoder, performance: {now: () => now},
-        location: {pathname: '/v1/seats/seat_test/person/viewer', href: 'http://seat-node/v1/seats/seat_test/person/viewer', protocol: 'http:'},
+        location: {pathname: prefix + '/v1/seats/seat_test/person/viewer', href: 'http://seat-node' + prefix + '/v1/seats/seat_test/person/viewer', protocol: 'http:'},
         document: {getElementById: element}, window: {addEventListener(name, callback) { if (name === 'connect') callback(); }},
         setTimeout(callback, delay) {nextDelay = delay; timeouts.set(++timerID, callback); return timerID;}, clearTimeout(id) {timeouts.delete(id);},
         setInterval(callback) {intervals.set(++timerID, callback); return timerID;}, clearInterval(id) {intervals.delete(id);},
@@ -145,3 +145,15 @@ function browser() {
     assert.equal(b.screen.viewOnly, true);
 }
 console.log('viewer page: view, take, note release, Seat end, cap and unavailable passed');
+
+{
+    const prefix = '/random-relay-prefix-for-test';
+    const b = browser(prefix); await b.connect();
+    assert.equal(b.socket.url, 'ws://seat-node' + prefix + '/v1/seats/seat_test/person/viewer-session');
+    await b.element('take').handlers.click(); await flush();
+    await b.element('release').handlers.click(); await flush();
+    assert.ok(b.requests.every(r => r.url.startsWith(prefix + '/v1/seats/seat_test/person/')));
+    assert.ok(b.requests.some(r => r.url.endsWith('/viewer-status')));
+    assert.ok(b.requests.some(r => r.url.endsWith('/take')));
+    assert.ok(b.requests.some(r => r.url.endsWith('/release')));
+}

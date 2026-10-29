@@ -478,7 +478,8 @@ Commands:
   cp SRC SEAT_ID:PATH | cp SEAT_ID:PATH DEST
                              Copy files or directories into or out of a Seat
   seat wait SEAT_ID          Wait again by the original request ID
-  seat view SEAT_ID          Open the owner browser viewer (--no-open prints its URL)
+  seat view SEAT_ID          Open the owner browser viewer; stays running while viewing
+                             --no-open prints its private local relay link
   seat window close         Close this node's approval windows early
   status [--timeout D]       Can this cluster take work? Exits 12 when it cannot
   whoami                    Observe the current Fabric-scoped person identity in L1
