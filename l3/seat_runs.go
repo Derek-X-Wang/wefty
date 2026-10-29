@@ -1,6 +1,7 @@
 package l3
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -42,7 +43,8 @@ func normalizeSeatRun(input *CreateRunInput) error {
 	if !input.FabricClient || input.ComputerScope != nil || r.ParentRunID != "" || input.SeatRunBinding == nil {
 		return protocolError(contract.ErrorForbidden, "Seat Runs require a Fabric client and Seat credential")
 	}
-	paramsAllowed := len(r.Params) == 0
+	// Older CLIs encode omitted params as null (#1332).
+	paramsAllowed := len(r.Params) == 0 || bytes.Equal(bytes.TrimSpace(r.Params), []byte("null"))
 	if !paramsAllowed {
 		normalized, err := canonicalObject(r.Params, true, "params")
 		paramsAllowed = err == nil && string(normalized) == "{}"

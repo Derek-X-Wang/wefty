@@ -90,7 +90,7 @@ func TestExecSeatOutsideCheckoutAndPlainStillRequiresCheckout(t *testing.T) {
 					if request.SeatRun == nil || request.SeatRun.SeatID != execSeatTestID || !reflect.DeepEqual(request.SeatRun.Argv, argv) || request.SeatRun.MaxRuntimeSeconds != wantSeconds {
 						t.Errorf("wrong Seat source: %s", raw)
 					}
-					if string(request.Params) != "null" || request.InlineScript != nil || request.Image != nil || request.WorkflowRef != "" || len(request.Tags) != 0 || request.Limits != nil || request.Restartable || request.DispatchAuthority || request.ParentRunID != "" {
+					if string(request.Params) != "{}" || request.InlineScript != nil || request.Image != nil || request.WorkflowRef != "" || len(request.Tags) != 0 || request.Limits != nil || request.Restartable || request.DispatchAuthority || request.ParentRunID != "" {
 						t.Errorf("Seat command carried another source or params: %s", raw)
 					}
 					w.WriteHeader(http.StatusCreated)

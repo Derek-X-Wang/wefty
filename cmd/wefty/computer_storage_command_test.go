@@ -34,6 +34,7 @@ const (
 )
 
 type storageCLIHarness struct {
+	network     *plain.Network
 	ctx         context.Context
 	l1Address   string
 	store       *l1.Store
@@ -856,7 +857,7 @@ func newStorageCLIHarness(t *testing.T, settings ...*l1.ComputerSettings) *stora
 			t.Errorf("close L1: %v", err)
 		}
 	})
-	return &storageCLIHarness{ctx: ctx, l1Address: listener.Addr().String(), store: store, clients: clients, agentFabric: agentFabric,
+	return &storageCLIHarness{network: network, ctx: ctx, l1Address: listener.Addr().String(), store: store, clients: clients, agentFabric: agentFabric,
 		managedRoot: managedRoot, node: node, computer: computer, claim: claim}
 }
 

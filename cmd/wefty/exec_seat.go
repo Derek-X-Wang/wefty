@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,7 +42,9 @@ func executeSeatExec(ctx context.Context, clients *apiClients, id string, argv [
 		return err
 	}
 	submitCtx, stop := context.WithTimeout(ctx, 30*time.Second)
-	request := l3.CreateRunRequest{SeatRun: &source}
+	// Send empty params explicitly: a nil RawMessage encodes as null,
+	// which older L3 servers reject (#1332).
+	request := l3.CreateRunRequest{SeatRun: &source, Params: json.RawMessage("{}")}
 	accepted, uncertain, err := submitExecRun(submitCtx, clients, request, key, stderr, secret)
 	stop()
 	if err != nil && uncertain && ctx.Err() != nil && !keepRunning && !detach {

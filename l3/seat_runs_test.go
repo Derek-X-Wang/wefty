@@ -184,3 +184,29 @@ func TestSeatRunHTTPIdempotentReplayIgnoresLaterSeatState(t *testing.T) {
 		t.Fatal("another actor replayed the original Run")
 	}
 }
+
+func TestSeatRunParamsAcceptOnlyEmptyValues(t *testing.T) {
+	binding := contract.SeatRunBinding{SeatID: "seat_00000000000000000000000000000001", NodeID: "node", ComputerID: "computer", ComputerJobID: "job", ComputerAttemptID: "attempt"}
+	for _, tc := range []struct {
+		name, params string
+		allowed      bool
+	}{
+		{"absent", "", true}, {"null", "null", true}, {"spaced-null", " \n null \t", true}, {"empty-object", "{}", true}, {"spaced-object", "{ }", true},
+		{"nonempty-object", `{"x":1}`, false}, {"array", "[]", false}, {"string", `""`, false}, {"number", "0", false}, {"boolean", "false", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := CreateRunInput{Actor: "cli", IdempotencyKey: "params", FabricClient: true, SeatRunBinding: &binding, Request: CreateRunRequest{SeatRun: &contract.SeatRunInput{SeatID: binding.SeatID, Argv: []string{"id"}}, Params: json.RawMessage(tc.params)}}
+			_, _, _, err := normalizeCreateRun(input)
+			if tc.allowed {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			var refusal *Error
+			if !errors.As(err, &refusal) || refusal.Code != contract.ErrorInvalidRequest {
+				t.Fatalf("params=%s: %v", tc.params, err)
+			}
+		})
+	}
+}
