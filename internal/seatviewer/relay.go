@@ -239,6 +239,13 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	if upgrade {
 		upgraded = r.serveSocket(w, request, trace)
 	} else {
+		// #1336: Transport can still be finishing the forwarded request body
+		// when its response arrives. Server's automatic body close at the first
+		// response write would abort that transport and truncate the response.
+		if err := http.NewResponseController(w).EnableFullDuplex(); err != nil {
+			http.Error(w, "Viewer response streaming is unavailable", http.StatusInternalServerError)
+			return
+		}
 		r.proxy.ServeHTTP(w, request)
 	}
 	reason := trace.reason

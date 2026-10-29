@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -120,7 +121,7 @@ func TestSeatViewerLocalRelayPlainFabric(t *testing.T) {
 				defer response.Body.Close()
 				body, err := io.ReadAll(response.Body)
 				if err != nil {
-					t.Fatal(err)
+					t.Fatalf("%s %s: response truncated after %d bytes (Content-Length=%d, transfer=%v): %v", method, strings.TrimPrefix(request.URL.Path, prefix), len(body), response.ContentLength, response.TransferEncoding, err)
 				}
 				return response.StatusCode, body
 			}
@@ -155,8 +156,16 @@ func TestSeatViewerLocalRelayPlainFabric(t *testing.T) {
 			}
 			for _, path := range []string{"/viewer", "/viewer/viewer.js", "/viewer/novnc/core/rfb.js"} {
 				status, body := do("GET", person+path, "", "")
-				if status != 200 || len(body) == 0 {
-					t.Fatalf("asset %s status=%d", path, status)
+				file := strings.TrimPrefix(path, "/viewer/")
+				if path == "/viewer" {
+					file = "index.html"
+				}
+				expected, readErr := seatViewerFiles.ReadFile("viewer/" + file)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				if status != 200 || !bytes.Equal(body, expected) {
+					t.Fatalf("asset %s status=%d bytes=%d/%d", path, status, len(body), len(expected))
 				}
 			}
 			for _, alias := range []string{"/viewer/", "/viewer/index.html"} {
