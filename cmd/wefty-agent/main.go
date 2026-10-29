@@ -440,6 +440,17 @@ func (remover macBootstrapRemover) removeBootstrap(instance, limactl, factsPath,
 }
 
 func run() error {
+	return runWithUserOCIPrepare(context.Background(), func(ctx context.Context, path, nodeID, bootID string) (bool, error) {
+		if runtime.GOOS != "darwin" {
+			return false, errors.New("--oci-user-install requires macOS")
+		}
+		return prepareInstalledUserOCI(ctx, path, nodeID, bootID, version, limarunner.PrepareUserInstall, agent.NativeSeatApprovalDialog{}, limarunner.StopProofUserInstall)
+	})
+}
+
+// Tests replace only the host VM and dialog boundary; startup ordering and L1
+// registration stay on the production path (#1331).
+func runWithUserOCIPrepare(parent context.Context, prepare func(context.Context, string, string, string) (bool, error)) error {
 	// Read-only binary inspection must precede profiles, default directories and stores.
 	if len(os.Args) == 2 && os.Args[1] == "--retirement-protocols" {
 		return json.NewEncoder(os.Stdout).Encode(struct {
@@ -665,17 +676,8 @@ func run() error {
 	if *ociMemoryCapacity < 0 || *ociMemoryReserve < 0 {
 		return errors.New("--oci-memory-capacity-bytes and --oci-memory-reserve-bytes must be nonnegative")
 	}
-	computerRoom, err := computerRoomFlags.configured(*ociSetupState, *ociMemoryCapacity, *ociMemoryReserve)
-	if err != nil {
+	if err := computerRoomFlags.validate(); err != nil {
 		return err
-	}
-	if computerRoom != nil {
-		*maxServiceSlots, err = computerRoomServiceSlots(*computerRoom, *maxServiceSlots, layer.Explicit["max-service-slots"], profile, *nodeID)
-		if err != nil {
-			return err
-		}
-		log.Printf("event=computer_room_configured memory_bytes=%d seat_memory_bytes=%d dedicated_cap=%d service_slots=%d",
-			computerRoom.MemoryBytes, computerRoom.SeatMemoryBytes, computerRoom.DedicatedCap, *maxServiceSlots)
 	}
 	if *ociImageCacheMaxBytes <= 0 {
 		return fmt.Errorf("--oci-image-cache-max-bytes must be positive")
@@ -725,11 +727,8 @@ func run() error {
 		}
 	}
 	if *ociUserInstall != "" {
-		if runtime.GOOS != "darwin" {
-			return errors.New("--oci-user-install requires macOS")
-		}
-		installContext, stop := context.WithTimeout(context.Background(), 15*time.Minute)
-		ociAllowed, installErr := prepareInstalledUserOCI(installContext, *ociUserInstall, *nodeID, bootSessionID, version, limarunner.PrepareUserInstall, agent.NativeSeatApprovalDialog{}, limarunner.StopProofUserInstall)
+		installContext, stop := context.WithTimeout(parent, 15*time.Minute)
+		ociAllowed, installErr := prepare(installContext, *ociUserInstall, *nodeID, bootSessionID)
 		stop()
 		if installErr != nil {
 			return installErr
@@ -739,6 +738,20 @@ func run() error {
 			// OCI recovery, control or doctor loops that could reopen the host VM.
 			*ociHelperSocket, *ociControlSocket, *ociDoctorFacts = "", "", ""
 		}
+	}
+	// Fresh per-user bootstrap creates setup state in this process. Resolve
+	// room only after that write, before the first L1 registration (#1331).
+	computerRoom, err := computerRoomFlags.configured(*ociSetupState, *ociMemoryCapacity, *ociMemoryReserve)
+	if err != nil {
+		return err
+	}
+	if computerRoom != nil {
+		*maxServiceSlots, err = computerRoomServiceSlots(*computerRoom, *maxServiceSlots, layer.Explicit["max-service-slots"], profile, *nodeID)
+		if err != nil {
+			return err
+		}
+		log.Printf("event=computer_room_configured memory_bytes=%d seat_memory_bytes=%d dedicated_cap=%d service_slots=%d",
+			computerRoom.MemoryBytes, computerRoom.SeatMemoryBytes, computerRoom.DedicatedCap, *maxServiceSlots)
 	}
 	capabilities := defaultAgentCapabilities()
 	if *agentGenerationID != "" && *generationRoot != "" && profile.Fabric == "plain" && runtime.GOOS == "darwin" {
@@ -868,7 +881,7 @@ func run() error {
 		return err
 	}
 	defer nodeAgent.Close()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	if *ociControlSocket != "" {
 		if *ociIntentFile == "" {

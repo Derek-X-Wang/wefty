@@ -472,6 +472,14 @@ node setup state logs `computer_room_unconfigured` and keeps the node agent and
 process jobs running with that policy; doctor still reports
 `oci_convergence_state_unavailable`.
 
+The node agent resolves Computer room after the per-user host VM bootstrap
+has written its initial setup state, before constructing the agent and its
+first L1 registration (#1331). That registration advertises
+`computer:seat-requests` when room is configured, with the matching local
+service-Slot floor and Seat settings. A fresh install whose bootstrap runs with
+the host VM switch on needs no node-agent restart. Later starts read the existing setup state, including while the host
+VM is stopped; an installation without OCI setup state stays unconfigured.
+
 On a Mac (`VMType == "vz"`), the usable ceiling is the smaller of configured
 host VM memory minus a fixed 1 GiB infrastructure reserve and the installed
 helper capacity minus its configured reserve. On native Linux, only the
