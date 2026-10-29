@@ -2758,7 +2758,7 @@ func (s *Store) ListJobAttempts(ctx context.Context, jobID string) (attempts []A
 
 func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, error) {
 	rows, err := q.QueryContext(ctx, `SELECT attempt_id, node_id, state, lease_expires_ns,
-		result_json, late_result_json, image_observation_json, created_ns, updated_ns, COALESCE(interruption_reason, '')
+		result_json, late_result_json, image_observation_json, created_ns, updated_ns, COALESCE(interruption_reason, ''), started_ns
 		FROM attempts WHERE job_id=? ORDER BY created_ns, attempt_id`, jobID)
 	if err != nil {
 		return nil, internalError(err, "list job attempts")
@@ -2769,13 +2769,18 @@ func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, e
 		var attempt Attempt
 		var resultJSON, lateResultJSON, imageJSON []byte
 		var leaseExpiresNS, createdNS, updatedNS int64
+		var startedNS sql.NullInt64
 		if err := rows.Scan(&attempt.AttemptID, &attempt.NodeID, &attempt.State, &leaseExpiresNS,
-			&resultJSON, &lateResultJSON, &imageJSON, &createdNS, &updatedNS, &attempt.InterruptionReason); err != nil {
+			&resultJSON, &lateResultJSON, &imageJSON, &createdNS, &updatedNS, &attempt.InterruptionReason, &startedNS); err != nil {
 			return nil, internalError(err, "scan job attempt")
 		}
 		attempt.LeaseExpiresAt = time.Unix(0, leaseExpiresNS).UTC()
 		attempt.CreatedAt = time.Unix(0, createdNS).UTC()
 		attempt.UpdatedAt = time.Unix(0, updatedNS).UTC()
+		if startedNS.Valid {
+			started := time.Unix(0, startedNS.Int64).UTC()
+			attempt.StartedAt = &started
+		}
 		if len(resultJSON) > 0 {
 			attempt.Result = &ProcessResult{}
 			if err := json.Unmarshal(resultJSON, attempt.Result); err != nil {

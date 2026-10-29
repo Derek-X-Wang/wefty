@@ -2701,6 +2701,11 @@
             "interrupted"
           ] },
           "lease_expires_at": { "type": "string", "format": "date-time" },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "L1's recorded start time for this Attempt. Omitted until L1 accepts its Started acknowledgement; running state alone is not start evidence."
+          },
           "result": { "$ref": "#/components/schemas/ProcessResult" },
           "late_result": { "$ref": "#/components/schemas/LateResultEvidence" },
           "image": { "$ref": "#/components/schemas/OCIImageEvidence" },
