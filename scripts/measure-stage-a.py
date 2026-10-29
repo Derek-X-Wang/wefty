@@ -60,8 +60,8 @@ json_flags = {'--json', '-json', '--json=true', '--json=false', '-json=true', '-
 command_args = [arg for arg in prefix if arg not in json_flags]
 if not command_args or command_args[0].startswith('-'):
     sys.exit('proof wrapper refuses leading options other than --json')
-if command_args[0] in {'setup', 'upgrade', 'admins'}:
-    sys.exit('proof wrapper refuses setup, upgrade and legacy administrator commands')
+if command_args[0] in {'setup', 'upgrade', 'admins', 'client-service'}:
+    sys.exit('proof wrapper refuses setup, upgrade, client-service and legacy administrator commands')
 if command_args[0] == 'admin':
     allowed = (command_args == ['admin', 'policy', 'get'] or
                len(command_args) == 3 and command_args[:2] == ['admin', 'bootstrap'] and

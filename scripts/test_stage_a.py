@@ -235,7 +235,7 @@ class StageADocumentTests(unittest.TestCase):
             refused_commands = [
                 ['setup'], ['setup', '--proof'], ['setup', '--remove', '--purge'],
                 ['--json', 'setup', '--remove', '--purge'], ['--json=false', 'setup'],
-                ['upgrade'], ['--json', 'upgrade'], ['--', 'setup'],
+                ['upgrade'], ['--json', 'upgrade'], ['--', 'setup'], ['client-service'],
                 ['admin', 'policy', 'add', 'owner', '--policy-revision', '1'],
                 ['admin', 'policy', 'remove', 'owner', '--policy-revision', '1'],
                 ['admin'], ['admin', 'bootstrap'], ['admin', 'bootstrap', 'nonce', 'extra'],

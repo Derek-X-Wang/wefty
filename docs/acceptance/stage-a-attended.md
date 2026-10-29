@@ -68,10 +68,22 @@ and clicks every dialog. ORCHESTRATOR runs every observer and capture.
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless --no-first-run --dump-dom about:blank
   ```
 
-  Expected: sandbox permission denial before browser startup. Retain the exit
-  code and denial. A missing executable, browser crash, or unconfined shell is
-  not proof. Substitute another OWNER-confirmed installed browser's absolute
-  executable if needed. No browser probe runs during preparation in this worker.
+  Accepted evidence, in this order of preference:
+  1. **A refusal before the program starts.** For a Claude Code PRIMARY, add a
+     `permissions.deny` rule for this executable (for example
+     `Bash("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"*)`) and
+     retain the harness's refusal message. The command never runs.
+  2. **A sandbox-attributed failure.** The browser starts but the sandbox stops
+     it: stderr names the sandbox (for example `Operation not permitted` on its
+     profile or socket), or the macOS log has a sandbox deny for that process
+     (`log show --last 2m --style compact --predicate 'eventMessage CONTAINS "deny"'`,
+     run by ORCHESTRATOR right after the probe). Retain both.
+
+  Not accepted: a missing executable, a crash without a sandbox reason, or an
+  unconfined shell. If neither form is available, AR-1's "the sandbox blocks a
+  browser" clause is NOT-RUN with that cause. Substitute another
+  OWNER-confirmed installed browser's absolute executable if needed. No browser
+  probe runs during preparation.
 - **Tokens:** retain the PRIMARY session's JSONL and its harness/model version.
   Use the command pair under “Token interval commands” below. It places two
   marker lines around an exact copy of the session interval, deduplicates
@@ -705,12 +717,22 @@ tail -n 1 "$HOME/.local/share/wefty-proof/evidence/stage-a/fg-idle-race.jsonl"
 test -e "$HOME/.local/share/wefty-proof/data/oci-intent.json.stopping"
 ```
 
-On a positive stopping-mark observation, ORCHESTRATOR tells PRIMARY to submit
-**exactly one** G request immediately; OWNER approves its dialog:
+The stopping mark lasts only seconds, so a relayed "submit now" is usually too
+slow. Before the boundary, PRIMARY starts this one-shot loop, which submits
+**exactly one** G request as soon as the mark appears (or gives up after 20
+minutes); OWNER approves its dialog:
 
 ```sh
-"$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
+for i in $(seq 1 6000); do
+  if test -e "$HOME/.local/share/wefty-proof/data/oci-intent.json.stopping"; then
+    date -u +%Y-%m-%dT%H:%M:%S.%NZ
+    exec "$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
+  fi
+  sleep 0.2
+done; echo "HV-4: no stopping mark seen in 20 minutes"
 ```
+
+If the loop gives up, HV-4 is NOT-RUN with that cause.
 
 Keep G's initial request timestamp/ID, tool begin/end times, hint, approval and
 ready reply. ORCHESTRATOR records G as soon as ready:
