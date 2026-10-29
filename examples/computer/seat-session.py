@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import time
 
 
@@ -78,17 +79,24 @@ def stop_process(_name, process):
     process.wait(timeout=5)
 
 
-def browser_ready():
+def browser_ready(detail=None):
+    detail = {} if detail is None else detail
+    detail.clear()
+    detail['phase'] = 'client_list'
     try:
         windows = subprocess.run(['xprop', '-root', '_NET_CLIENT_LIST'], capture_output=True,
                                  text=True, timeout=1, check=True).stdout
-        for window in re.findall(r'0x[0-9a-fA-F]+', windows)[:256]:
+        windows = re.findall(r'0x[0-9a-fA-F]+', windows)[:256]
+        detail.update(phase='window_titles', window_count=len(windows), titles_checked=0)
+        for window in windows:
             title = subprocess.run(['xprop', '-id', window, '_NET_WM_NAME'], capture_output=True,
                                    text=True, timeout=1).stdout
+            detail['titles_checked'] += 1
             if 'wefty-seat-%s-ready' % os.environ['SEAT_ID'] in title:
+                detail['phase'] = 'ready'
                 return True
-    except (OSError, subprocess.SubprocessError):
-        pass
+    except (OSError, subprocess.SubprocessError) as error:
+        detail['error'] = type(error).__name__
     return False
 
 
@@ -141,10 +149,29 @@ def main():
 
     session = Session(commands, start, stop_process, lambda: display_alive(args.display_pid))
     ready = runtime / 'desktop-ready'
+    last_browser_log = None
+
+    def probe_browser():
+        nonlocal last_browser_log
+        detail = {}
+        result = browser_ready(detail)
+        now = time.monotonic()
+        if result or last_browser_log is None or now - last_browser_log >= 5:
+            # Never log window titles or page content, only the condition
+            # which prevents the desktop-ready marker from being written.
+            try:
+                print(json.dumps({'event': 'browser_readiness', 'place': int(os.environ['SEAT_ID']),
+                                  'monotonic_ms': round(now * 1000, 3),
+                                  'readiness': detail}, separators=(',', ':')), file=sys.stderr, flush=True)
+            except OSError:
+                pass  # A failed Computer log must not end the desktop.
+            last_browser_log = now
+        return result
+
     try:
         while not session.failure:
             session.tick()
-            session.poll_readiness(ready, browser_ready)
+            session.poll_readiness(ready, probe_browser)
             time.sleep(0.1)
     finally:
         ready.unlink(missing_ok=True)

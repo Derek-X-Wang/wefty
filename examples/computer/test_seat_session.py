@@ -20,6 +20,25 @@ class Process:
 
 
 class SessionTest(unittest.TestCase):
+    def test_browser_log_oserror_does_not_end_session(self):
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {'XDG_RUNTIME_DIR': root, 'HOME': root, 'SEAT_ID': '1'}), \
+                mock.patch.object(session.sys, 'argv', ['wefty-seat-session', '--display-pid', '42']), \
+                mock.patch.object(session, 'display_alive', side_effect=[True, False]), \
+                mock.patch.object(session.time, 'sleep'), \
+                mock.patch.object(session.os, 'killpg'), \
+                mock.patch.object(session.subprocess, 'Popen') as spawn, \
+                mock.patch.object(session.subprocess, 'run') as run, \
+                mock.patch('builtins.print', side_effect=OSError('container log unavailable')):
+            spawn.return_value.pid = 42
+            spawn.return_value.poll.return_value = None
+            run.side_effect = [mock.Mock(stdout='window id # 0x123\n'),
+                               mock.Mock(stdout='wefty-seat-1-ready\n')]
+            self.assertEqual(session.main(), 1)
+            # The second tick observes real lifecycle failure. A log error on
+            # the first tick must not interrupt the controller before then.
+            self.assertEqual((Path(root) / 'launcher-failure').read_text(), 'display_exited')
+
     def setUp(self):
         self.now = 0
         self.display = True
@@ -42,6 +61,22 @@ class SessionTest(unittest.TestCase):
             self.assertIsNot(self.session.processes[name], old)
             self.assertEqual(self.session.failure, None)
         self.assertEqual(len(self.starts), 4)
+
+    def test_browser_readiness_diagnostics_name_missing_window_without_titles(self):
+        detail = {}
+        answers = [mock.Mock(stdout='_NET_CLIENT_LIST(WINDOW): window id # 0x123\n'),
+                   mock.Mock(stdout='_NET_WM_NAME(UTF8_STRING) = "private page title"\n')]
+        with mock.patch.dict(os.environ, {'SEAT_ID': '1'}), \
+                mock.patch.object(session.subprocess, 'run', side_effect=answers):
+            self.assertFalse(session.browser_ready(detail))
+        self.assertEqual(detail, {'phase': 'window_titles', 'window_count': 1, 'titles_checked': 1})
+        self.assertNotIn('private page title', json.dumps(detail))
+
+    def test_browser_readiness_diagnostics_name_xprop_timeout(self):
+        detail = {}
+        with mock.patch.object(session.subprocess, 'run', side_effect=session.subprocess.TimeoutExpired('xprop', 1)):
+            self.assertFalse(session.browser_ready(detail))
+        self.assertEqual(detail, {'phase': 'client_list', 'error': 'TimeoutExpired'})
 
     def test_repeated_restarts_fail_but_window_expiry_resets_budget(self):
         self.session.tick()

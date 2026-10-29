@@ -319,6 +319,7 @@ type seatComputer struct {
 	container           containerd.Container
 	task                containerd.Task
 	id, control, cgroup string
+	logPath             string
 	status              *os.File
 	pid                 uint32
 	tmpfsBytes          int64
@@ -330,6 +331,7 @@ func startSeatComputer(t *testing.T, ctx context.Context, client *containerd.Cli
 	t.Helper()
 	h := &seatComputer{t: t, ctx: ctx, client: client, id: "seat-" + filepath.Base(t.TempDir()), control: filepath.Join(root, "managed", "control")}
 	logPath := filepath.Join(root, "computer.log")
+	h.logPath = logPath
 	// Registered before stop: LIFO cleanup stops and flushes the Computer first,
 	// then retains logs before TempDir cleanup, including after a failed wait.
 	t.Cleanup(func() {
@@ -533,6 +535,7 @@ func (h *seatComputer) wait(description string, predicate func() bool, details .
 	}
 }
 func (h *seatComputer) directive(generation int, places ...int) {
+	h.t.Helper()
 	seats := []map[string]any{}
 	for _, place := range places {
 		seats = append(seats, map[string]any{"place": place, "user": fmt.Sprintf("seat%d", place), "view_port": 7100 + place*2, "control_port": 7101 + place*2, "view_socket": fmt.Sprintf("/wefty/service/seats/%d/run/view.ws", place), "control_socket": fmt.Sprintf("/wefty/service/seats/%d/run/control.ws", place)})
@@ -540,20 +543,27 @@ func (h *seatComputer) directive(generation int, places ...int) {
 	payload, err := json.Marshal(map[string]any{"version": 1, "generation": generation, "seats": seats})
 	seatMust(h.t, err)
 	seatAtomic(h.t, filepath.Join(h.control, "seats.json"), payload)
+	h.t.Logf("Computer %s directive generation=%d wanted_places=%v", h.id, generation, places)
 }
 func (h *seatComputer) ready(place int) {
-	h.wait("Seat ready", func() bool {
+	h.t.Helper()
+	lastStatus := "not yet read"
+	diagnostics := func() string { return waitSeatReadinessDiagnostics(h.logPath, lastStatus, time.Now, time.Sleep) }
+	h.wait(fmt.Sprintf("Computer %s Seat %d ready", h.id, place), func() bool {
+		h.t.Helper()
 		b, err := readSeatStatusAnswer(h.status, fmt.Sprintf("%d.json", place))
 		if err != nil {
+			lastStatus = fmt.Sprintf("read failed: %v", err)
 			return false
 		}
+		lastStatus = string(b)
 		var v struct{ State, Reason string }
 		seatMust(h.t, json.Unmarshal(b, &v))
 		if v.State == "failed" {
-			h.t.Fatalf("Seat %d failed: %s", place, v.Reason)
+			h.t.Fatalf("Computer %s Seat %d failed: %s; %s", h.id, place, v.Reason, diagnostics())
 		}
 		return v.State == "ready"
-	})
+	}, diagnostics)
 }
 func (h *seatComputer) driver(place int, human bool) {
 	path := filepath.Join(h.control, "seats", fmt.Sprint(place), "driver.json")
