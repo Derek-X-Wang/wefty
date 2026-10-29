@@ -517,12 +517,30 @@ func (manager Manager) startDisabled(ctx context.Context, targetLabel string) (b
 		return false, fmt.Errorf("inspect LaunchAgent %s autostart: %w", targetLabel, err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(payload)), "\n")
-	if len(lines) < 2 || strings.TrimSpace(lines[0]) != "disabled services = {" || strings.TrimSpace(lines[len(lines)-1]) != "}" {
+	// Other launchctl sections may surround the top-level override block.
+	start, depth := 0, 0
+	for start < len(lines) {
+		line := strings.TrimSpace(lines[start])
+		if depth == 0 && line == "disabled services = {" {
+			break
+		}
+		if strings.HasSuffix(line, "{") {
+			depth++
+		} else if line == "}" && depth > 0 {
+			depth--
+		}
+		start++
+	}
+	end := start + 1
+	for end < len(lines) && strings.TrimSpace(lines[end]) != "}" {
+		end++
+	}
+	if start == len(lines) || end == len(lines) {
 		return false, errors.New("decode launchctl disabled services: malformed domain record")
 	}
 	seen := make(map[string]bool)
 	disabled := false
-	for _, line := range lines[1 : len(lines)-1] {
+	for _, line := range lines[start+1 : end] {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
