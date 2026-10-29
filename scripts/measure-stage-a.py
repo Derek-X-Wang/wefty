@@ -54,7 +54,20 @@ prefix = args[:args.index('--')] if '--' in args else args
 selectors = {'profile','l1','l3','fabric','plain-user-id','plain-device-id','plain-fabric-id','fabric-name','node-config'}
 if any(a.lstrip('-').split('=')[0] in selectors for a in prefix if a.startswith('-')):
     sys.exit('proof wrapper refuses selector overrides')
-command_args = [arg for arg in args if arg != '--json']
+# Only JSON switches may precede the command. Do not try to interpret
+# arbitrary global flags: an option value could conceal setup or upgrade.
+json_flags = {'--json', '-json', '--json=true', '--json=false', '-json=true', '-json=false'}
+command_args = [arg for arg in prefix if arg not in json_flags]
+if not command_args or command_args[0].startswith('-'):
+    sys.exit('proof wrapper refuses leading options other than --json')
+if command_args[0] in {'setup', 'upgrade', 'admins'}:
+    sys.exit('proof wrapper refuses setup, upgrade and legacy administrator commands')
+if command_args[0] == 'admin':
+    allowed = (command_args == ['admin', 'policy', 'get'] or
+               len(command_args) == 3 and command_args[:2] == ['admin', 'bootstrap'] and
+               bool(command_args[2].strip()) and not command_args[2].startswith('-'))
+    if not allowed or '--' in args:
+        sys.exit('proof wrapper refuses administrator commands except bootstrap and policy get')
 if command_args and command_args[0] == 'exec':
     assets = root / 'assets'
     if not assets.is_dir() or assets.resolve() != assets:
@@ -244,7 +257,7 @@ def control_timing(value, seat, attempts):
     eligible = []
     for attempt in attempts:
         try:
-            body = json.loads(attempt['stdout'])
+            body = json.loads(attempt['stderr'])
         except (ValueError, TypeError):
             continue
         if (attempt['begin_unix_ns'] > taken and attempt['exit_code'] == 5

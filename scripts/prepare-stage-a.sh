@@ -4,9 +4,19 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 repo="$(cd -- "$script_dir/.." && pwd -P)"
 root="$HOME/.local/share/wefty-proof"
-for tool in python3 go git gh jq npm; do
+for tool in python3 go git gh jq npm limactl; do
   command -v "$tool" >/dev/null
 done
+# Read only the version; never start or inspect an instance during preparation.
+lima_version="$(limactl --version)"
+python3 - "$lima_version" <<'PYVERSION'
+import re, sys
+match = re.search(r'\b(\d+)\.(\d+)\.(\d+)([^\s]*)', sys.argv[1])
+if (not match or tuple(map(int, match.group(1, 2, 3))) < (2, 2, 0)
+        or match.group(4).startswith('-')):
+    raise SystemExit('Stage A requires stable Lima 2.2.0 or newer; found: ' + sys.argv[1])
+print('Stage A prerequisite: ' + sys.argv[1])
+PYVERSION
 # The orchestrator initialized the one baseline and runs guard-watch separately.
 python3 "$script_dir/measure-per-user-proof.py" guard-check
 mkdir -p "$root/source-bin" "$root/assets" "$root/tools"

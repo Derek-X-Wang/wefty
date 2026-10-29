@@ -23,20 +23,44 @@ and clicks every dialog. ORCHESTRATOR runs every observer and capture.
   SECOND. PRIMARY requests Seat D, drives its browser, copies the result out,
   runs SC-3's single Playwright command, and releases D. Use that same PRIMARY
   session for both comparison intervals, with no parallel conversation in it.
-  Configure BOTH sessions' **tool execution sandbox**, not their model/API
-  transport, to the following exact policy. This is the required policy, not
-  a claim that all harnesses use the same configuration-file keys:
+  Configure BOTH sessions for **internet denied, loopback allowed**, using the
+  nearest working setting below. This concerns tool execution, not the model/API
+  transport. The acceptance requirement is a sandbox that blocks the Mac browser;
+  port-exact filtering is not an additional AR-1 requirement.
 
   | Setting | Both sessions |
   |---|---|
-  | Approval | No permission escalation or automatic retry outside the sandbox. |
-  | Filesystem | Read the reviewed checkout, proof binaries/tools/assets and proof configuration. Write only `~/.local/share/wefty-proof/data/stage-a-state` and `~/.local/share/wefty-proof/evidence/stage-a`. No other tool-write roots and no daily configuration/state writes. Always supply the screenshot destination below. |
-  | TCP | Permit outbound loopback TCP to `127.0.0.1:48111`, `127.0.0.1:48112`, and **only the node's actual Seat screen port**. Deny other outbound TCP, DNS and internet access from tool commands. |
-  | Seat port | After A is ready, ORCHESTRATOR reads its current published `display_endpoint` in a proof snapshot and records that exact loopback port in both policies. The plain Fabric uses a dynamic port; do not assume port 80. Repeat after any node-agent restart. |
-  | Browser | Deny Mac browser execution and LaunchServices browser launch from tool commands. Permit the proof wrapper and its interpreter/binary. Opening a browser inside a Seat through the wrapper is permitted. |
+  | Approval | No permission escalation, sandbox escape, or retry outside the sandbox. |
+  | Filesystem | Read the checkout and proof binaries/tools/assets/configuration. Add write roots for the absolute login-home paths `~/.local/share/wefty-proof/data/stage-a-state` and `~/.local/share/wefty-proof/evidence/stage-a`. Retain the harness's unavoidable workspace/temp roots in the policy receipt. No daily configuration/state writes; screenshots always use the explicit evidence destination. |
+  | TCP | Allow loopback to `127.0.0.1:48111`, `127.0.0.1:48112`, and the node's actual Seat screen port. Prefer denying internet/DNS. Record any broader allowance rather than claiming port filtering the harness lacks. |
+  | Seat port | After A is ready, ORCHESTRATOR reads its current published `display_endpoint` in a proof snapshot and records that exact loopback port in both receipts. The plain Fabric uses a dynamic port; do not assume port 80. Update after any node-agent restart. |
+  | Browser | Keep the tool sandbox enabled and require the installed-browser denial probe below. Seat browser execution through the wrapper is permitted. |
 
-  Keep each harness's actual policy/configuration receipt privately. A harness
-  that cannot enforce this policy leaves AR-1 NOT-RUN; do not widen its access.
+  **Codex closest working option:** `sandbox_mode="workspace-write"`,
+  `approval_policy="never"`, and `[sandbox_workspace_write] network_access=true`,
+  with the two absolute write roots in `writable_roots`. This network setting
+  permits **both loopback and internet**; it cannot express loopback-only access.
+  Record that deviation in the receipt. It does not by itself make AR-1 NOT-RUN:
+  the spec requires the Mac browser to be blocked, which the probe must establish.
+  Keep the filesystem sandbox; do not use unrestricted execution to gain TCP.
+
+  **Claude Code closest working option:** enable `sandbox.enabled=true`, set
+  `sandbox.allowUnsandboxedCommands=false`, and set
+  `sandbox.network.allowedDomains=["localhost", "127.0.0.1"]`. Add the two
+  absolute paths to `sandbox.filesystem.allowWrite`. This uses Claude Code's
+  sandbox network allowance for local connections while leaving internet domains
+  unallowed; it does not select exact local ports. Keep permission prompts denied
+  for other domains and for unsandboxed execution. If the installed harness also
+  needs an explicit local-network permission, grant only that sandbox permission,
+  retain it, and run no unsandboxed fallback.
+
+  ORCHESTRATOR saves both harness versions and their actual effective policy,
+  added/default write roots, loopback ports, internet allowance/deviation, and
+  browser-probe stdout/stderr/exit in `evidence/stage-a/sandbox-primary.txt` and
+  `sandbox-second.txt`. Record the settings actually used, including platform
+  limits. A genuine browser-denial failure leaves that AR-1 clause unproved;
+  a network-policy approximation alone does not.
+
   ORCHESTRATOR first confirms an installed browser binary exists outside the
   AI agent sandbox. PRIMARY then runs this command **inside its tool sandbox**:
 
@@ -60,9 +84,9 @@ and clicks every dialog. ORCHESTRATOR runs every observer and capture.
   initial log follow. The runbook includes recovery if sleep ends A or C.
 - **Quiet time:** close other apps. Use a 16 GiB Mac with the memory guard on.
   Do not reduce Room, idle waits or approval durations to shorten the proof.
-- **Time:** reserve **120–150 minutes attended**, plus **20–35 minutes
-  preparation**: **140–185 minutes total**. HV-4 needs its own idle cycle;
-  allow another **25–30 minutes**, or record it NOT-RUN. These are estimates.
+- **Time:** reserve **135–165 minutes attended**, plus **20–35 minutes
+  preparation**: **155–200 minutes total**. HV-4 needs its own idle cycle;
+  allow another **40–45 minutes**, or record it NOT-RUN. These are estimates.
 
 Replace `/ABS_REPO` with this reviewed checkout and `RUN_ID` with one fresh
 local receipt identifier in the preparation commands. Later commands begin
@@ -93,10 +117,10 @@ work after delays. A clock is never restarted to hide a failed case.
 | W+60 (about 77) | AP-6 expiry probe, in a separate terminal if needed. OWNER denies the new dialog so it cannot disturb D's deletion/host-idle clocks. |
 | About 80 | PRIMARY releases D. Record R, the final Seat departure/cleanup anchor. |
 | R+10 (about 90) | Default **10-minute Computer idle wait** ends; wait for `removed_verified`. Record actual removal observation M and last remaining demand. |
-| About M+10 (100+) | Default **10-minute host VM idle wait** after last demand; watch must show deletion before stop. A cleanup that runs longer moves this anchor. |
-| 106–109+ | Cold request after stopped state: owner approval K starts the **3-minute cold-start limit**, ending K+3. Record the “about 1 minute” hint. |
-| 110–130+ | Release that extra Seat; allow its Computer's 10-minute idle deletion and then host's 10-minute idle stop. |
-| 130–145+ | Preserve receipts and undo. Reserve to minute 150 for normal delays. |
+| About M+10 (100+) | Default **10-minute host VM idle wait** after last demand; watch must show deletion before stop. A cleanup that runs longer moves this anchor. Keep the bounded 40-minute watch through about minute 120. |
+| 121–124+ | Cold request after stopped state: owner approval K starts the **3-minute cold-start limit**, ending K+3. Record the “about 1 minute” hint. |
+| 125–145+ | Release that extra Seat; allow its Computer's 10-minute idle deletion and then host's 10-minute idle stop. |
+| 145–160+ | Preserve receipts and undo. Reserve to minute 165 for normal delays. |
 
 HV-4 is **not** folded into the only deletion-before-stop observation. A
 separate create/release/idle cycle must catch a request during a recorded
@@ -130,8 +154,9 @@ The preparation script builds capped-CPU native binaries and the matching
 Linux helper, downloads and verifies the published digest-pinned image,
 records source/publication revisions, creates the OCI assets configuration,
 and installs the pinned offline Playwright library. It runs no setup,
-administrator, Lima, container or browser command. It follows the #1132
-asset format without using that proof's environment variables or experiments.
+administrator, Lima instance, container or browser command. It only reads
+`limactl --version`, requiring stable Lima **2.2.0 or newer** before builds.
+It follows the #1132 asset format without using that proof's environment variables or experiments.
 Use this fresh guard and prepare wrappers first:
 
 ```sh
@@ -144,8 +169,9 @@ python3 /ABS_REPO/scripts/measure-stage-a.py install-wrappers
 
 Wrappers are installed as `tools/w`, `tools/obs` and `tools/snap`, with absolute
 binary, profile, node-config, state, evidence and source-script paths baked in.
-They scrub inherited selectors, reject selector overrides, and refuse missing
-or redirected proof paths. They cannot run until setup writes the profile and
+They scrub inherited selectors, reject selector overrides, refuse `setup` and
+`upgrade` entirely, allow `admin` only for `bootstrap NONCE` and `policy get`,
+and refuse missing or redirected proof paths. They cannot run until setup writes the profile and
 node configuration. Before that, keep the guard watcher running with:
 
 ```sh
@@ -242,6 +268,9 @@ Expected: usage refusal, no approval operation. ORCHESTRATOR snapshots the
 pending request and keeps its eventual refusal/exit code; no Computer or active
 credential is left. No UI automation answers a dialog. The broad AP-4 boundary
 also has source tests; one unsupported call alone is not exhaustive proof.
+Both AI agents share the administrator proof profile bootstrapped in block 3.
+They still cannot answer this native approval dialog through the CLI. Keep that
+shared identity in the AP-4 receipt; administrator authority is not Seat approval.
 
 PRIMARY requests A and OWNER approves its 1-hour window:
 
@@ -258,7 +287,7 @@ has run. SECOND, in its own sandbox, requests B with its own wrapper call:
 
 Expected: B has a distinct place/desktop on A's Computer. Keep actual IDs and
 before/after screen pairs showing that clicking A does not change B. After A's
-publication, apply and record the exact Seat-port sandbox policy for both
+publication, record the actual Seat port and effective sandbox policy for both
 sessions and run the PRIMARY browser-denial probe from owner preparation.
 ORCHESTRATOR requests C and checks the fourth refusal:
 
@@ -293,9 +322,16 @@ ORCHESTRATOR copies the public page/kit and captures health/network commands:
 
 Expected: separate web/DNS failures, while Seat commands and screen remain
 usable and missing internet is not a health fault. Missing `curl`/`getent` is
-NOT-RUN, not isolation proof. PRIMARY uses its wrapper for a screenshot and
-copy-out on A; ORCHESTRATOR retains those original tool results, without rerunning
-the action. The hold is an active command, bounded by 2400 seconds, not a
+NOT-RUN, not isolation proof. PRIMARY types these exact screenshot/copy-out
+commands on A; the copied file is the page previously placed on A:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat screenshot SEAT_A -o "$HOME/.local/share/wefty-proof/evidence/stage-a/a-screen.png" --json
+"$HOME/.local/share/wefty-proof/tools/w" cp SEAT_A:stage-a-browser.html "$HOME/.local/share/wefty-proof/evidence/stage-a/a-page-copy.html"
+```
+
+ORCHESTRATOR retains those original tool results, without rerunning the action.
+The hold is an active command, bounded by 2400 seconds, not a
 background process that silently renews a Seat. Undo: block 7's off command
 ends A's work; block 11 is fallback. This is supporting AP evidence; block 8
 supplies the full AR-1 chain with the required PRIMARY actor.
@@ -482,31 +518,37 @@ SC-1 is a separate harmless click plus screenshot, PRIMARY using its wrapper:
 Use actual numeric X/Y. Retain `elapsed_ms` and timing phases: wefty's own part
 must be within 1 second. Subprocess wall time also includes harness overhead.
 
-For AR-2, PRIMARY starts a bounded detached command, keeping its Run ID:
+For SC-4, ready the viewer and PRIMARY's command first. **Just before OWNER
+clicks Take control**, ORCHESTRATOR starts this **60-second** loop in a separate
+terminal, waits for accepted attempts in its trace, then tells OWNER to click
+promptly (within the first 10 seconds):
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" screen-loop --row SC-4 --name control-loop --seat SEAT_D --seconds 60
+```
+
+It records begin/end Unix timestamps, exit status, stdout and stderr for every
+real `seat key` call. OWNER now clicks Take control and drives D. **After the
+click succeeds**, PRIMARY starts the AR-2 command and keeps its Run ID:
 
 ```sh
 "$HOME/.local/share/wefty-proof/tools/w" exec --seat SEAT_D --detach -- sh -c 'sleep 20; printf command-survived'
+"$HOME/.local/share/wefty-proof/tools/w" seat screenshot SEAT_D -o "$HOME/.local/share/wefty-proof/evidence/stage-a/d-during-control.png" --json
 ```
 
-**Before OWNER clicks Take control**, ORCHESTRATOR starts this bounded shell
-loop of real `seat key` attempts in a separate terminal (the harness launches
-one proof-wrapper command each iteration):
-
-```sh
-"$HOME/.local/share/wefty-proof/tools/obs" screen-loop --row SC-4 --name control-loop --seat SEAT_D --seconds 30
-```
-
-It records begin/end Unix timestamps and exit/output for every attempt. OWNER
-now clicks Take control and drives D. Keep control until the detached command
-finishes, then release it; a command that finishes only after release does not
-prove AR-2. PRIMARY's screenshots still work; its screen input is refused with typed
-`person_driving`, exit 5; its detached command completes. ORCHESTRATOR captures
-that Run's logs (the finished event must precede control release), then checks
-the control trace:
+Keep control until that command finishes; a command that finishes only after
+release does not prove AR-2. Screenshots still work; screen input is refused
+with typed `person_driving`, exit 5. JSON errors are on **stderr**, with empty
+stdout for this refusal. ORCHESTRATOR captures the completed Run's logs before
+OWNER releases control:
 
 ```sh
 "$HOME/.local/share/wefty-proof/tools/obs" capture --row AR-2 --name command-during-control -- logs RUN_ID_FROM_REPLY
 ```
+
+OWNER then releases control. Let the 60-second loop finish before reading it.
+If the click fell outside the loop, or no accepted attempt preceded it, retain
+that gap; the measurement is unproved. ORCHESTRATOR checks the closed trace:
 
 ```sh
 "$HOME/.local/share/wefty-proof/tools/snap" --row SC-4 --name d-control-log --seat SEAT_D
@@ -524,7 +566,7 @@ Undo: OWNER releases control; stop the completed loop. PRIMARY releases D in
 block 9; block 11 purges all its files. A missing offline kit leaves SC-3
 NOT-RUN; never grant the Seat internet or install a different browser.
 
-### 9. PRIMARY and ORCHESTRATOR — D release, verified removal, then host stop (20–25 minutes)
+### 9. PRIMARY and ORCHESTRATOR — D release, verified removal, then host stop (40 minutes bounded observation)
 
 PRIMARY alone releases D, completing its AR-1 actor chain:
 
@@ -536,7 +578,7 @@ ORCHESTRATOR starts the target-filtered watch before release if possible, and
 keeps it through the default two idle waits:
 
 ```sh
-"$HOME/.local/share/wefty-proof/tools/obs" watch --row CT-1 --name d-deletion-order --seat SEAT_D --computer COMPUTER_D --seconds 1500
+"$HOME/.local/share/wefty-proof/tools/obs" watch --row CT-1 --name d-deletion-order --seat SEAT_D --computer COMPUTER_D --seconds 2400
 ```
 
 Each sample contains D, its Computer/Attempt facts, D's events, recorded host
@@ -552,8 +594,10 @@ HV-3. Then allow 10 minutes from the **last remaining demand**, not an assumed
 release timestamp. Observe healthy `host_vm_idle` without a doctor-induced
 restart. Let the bounded watch finish after it contains the stopped state, then check
 the closed trace. Do not parse a file while its writer is appending. The
-1500-second cap includes up to five extra minutes beyond the nominal 20-minute
-idle sequence; this is included in the timeline and total:
+2400-second cap leaves 20 minutes beyond the nominal 20-minute idle sequence
+for cleanup and scheduling delay; this is included in the timeline and total.
+If it ends before a stopped sample, keep the raw trace and mark ordering unproved.
+Run the ordering check and keep its result:
 
 ```sh
 "$HOME/.local/share/wefty-proof/tools/obs" check --row CT-1 --name d-order-check --kind ordering --computer COMPUTER_D --after "$HOME/.local/share/wefty-proof/evidence/stage-a/d-deletion-order.jsonl"
@@ -575,12 +619,36 @@ Do not race another request through this only stop observation.
 
 ### 10. OWNER, PRIMARY and ORCHESTRATOR — window expiry, cold start and optional separate race
 
-**At W+60, wherever the numbered sequence has reached**, ORCHESTRATOR captures
-status before/after the original window's expiry. PRIMARY requests a fresh Seat
-without a new window. A new native dialog must appear. OWNER clicks **Deny**
+**At W+59**, ORCHESTRATOR captures status before the original window expires:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-6 --name window-before-expiry -- status
+```
+
+**At W+60, wherever the numbered sequence has reached**, after the recorded
+expiry time, ORCHESTRATOR captures status again:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row AP-6 --name window-after-expiry -- status
+```
+
+PRIMARY then types this exact request **without `--window`**:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
+```
+
+Keep its freshly printed ID as `AP6_REFUSED_SEAT_ID`, not E. A new native dialog
+must appear. OWNER clicks **Deny**
 while D's removal/host idle waits are running; no Seat or runtime demand is
 created. Keep expiry time, request time, dialog and source=`dialog`/refusal in
-L1. A disappearing status line alone cannot prove expiry enforcement. Do not
+L1. After the refusal, ORCHESTRATOR captures its store evidence:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/snap" --row AP-6 --name expired-window-refusal --seat AP6_REFUSED_SEAT_ID
+```
+
+A disappearing status line alone cannot prove expiry enforcement. Do not
 manually close the window first; that would make AP-6 NOT-RUN. There is no
 window-close instruction in the cold-start block.
 
@@ -606,15 +674,67 @@ source test remains supporting evidence. PRIMARY releases E; let its Computer
 idle-delete and the host idle-stop before undo, accounting for the final two
 10-minute waits in the timeline.
 
-**HV-4 optional separate cycle:** request/release F, wait its deletion and the
-host idle boundary, and submit exactly one G request during a recorded stopping
-mark/transition. Use a new target-filtered watch and the actual approval/ready
-receipts. It must receive one Seat within its deadline, whether the stop cancels
-or finishes then restarts. If there is no recorded overlap, HV-4 is NOT-RUN.
-This adds 25–30 minutes; never infer it from E's ordinary cold start and never
-reuse D's only ordering trace. Undo: release F/G, retain their outcomes, then
-block 11 may purge the disposable root without claiming another idle-delete
-acceptance pass. Do not reset the memory guard or approval window to retry.
+**HV-4 optional separate cycle (40–45 minutes):** run only with the guard clear,
+after E's cleanup and stopped-state receipt. PRIMARY requests F; OWNER approves
+its dialog **without a new window**:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
+```
+
+Record `SEAT_F` and `COMPUTER_F`. ORCHESTRATOR snapshots F and starts a new watch
+in a separate terminal **before** PRIMARY releases F:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/snap" --row HV-4 --name f-ready --seat SEAT_F
+"$HOME/.local/share/wefty-proof/tools/obs" watch --row HV-4 --name fg-idle-race --seat SEAT_F --computer COMPUTER_F --seconds 2400
+```
+
+PRIMARY releases F:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat release SEAT_F --json
+```
+
+Allow the Computer's 10-minute deletion wait and host's separate 10-minute idle
+wait after last demand. ORCHESTRATOR monitors the latest sample while approaching
+the host boundary (this is inspection, not the closed-trace ordering check):
+
+```sh
+tail -n 1 "$HOME/.local/share/wefty-proof/evidence/stage-a/fg-idle-race.jsonl"
+test -e "$HOME/.local/share/wefty-proof/data/oci-intent.json.stopping"
+```
+
+On a positive stopping-mark observation, ORCHESTRATOR tells PRIMARY to submit
+**exactly one** G request immediately; OWNER approves its dialog:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
+```
+
+Keep G's initial request timestamp/ID, tool begin/end times, hint, approval and
+ready reply. ORCHESTRATOR records G as soon as ready:
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/snap" --row HV-4 --name g-ready --seat SEAT_G
+"$HOME/.local/share/wefty-proof/tools/obs" check --row HV-4 --name g-timing --kind timing --seat SEAT_G --after "$HOME/.local/share/wefty-proof/evidence/stage-a/g-ready.json"
+"$HOME/.local/share/wefty-proof/tools/obs" capture --row HV-4 --name g-host-state -- node doctor
+```
+
+After the watch ends, compare G's actual request event time with its recorded
+stopping transition/mark interval. It must receive one Seat within its deadline,
+whether stop cancels or finishes and restarts. A slow handoff that misses the
+transition, or no recorded overlap, leaves HV-4 NOT-RUN. No ordinary cold start
+proves this race; never reuse D's only ordering trace. This cycle adds 40–45
+minutes, including the complete watch, without shortening either idle wait.
+Undo: PRIMARY releases G (F was already released):
+
+```sh
+"$HOME/.local/share/wefty-proof/tools/w" seat release SEAT_G --json
+```
+
+Retain F/G outcomes; block 11 may purge the disposable root without claiming
+another idle-delete acceptance pass. Do not reset the guard or window to retry.
 
 ### 11. ORCHESTRATOR and OWNER — preserve Stage A receipts and undo (5–10 minutes)
 

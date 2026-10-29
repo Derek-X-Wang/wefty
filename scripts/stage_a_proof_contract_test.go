@@ -1,8 +1,12 @@
 package scripts
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +16,8 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 )
@@ -118,13 +124,7 @@ func TestStageAObserverRealStore(t *testing.T) {
 	}
 	command := exec.Command("python3", "-m", "unittest", "discover", "-s", ".", "-p", "test_stage_a.py", "-v")
 	factsDir := t.TempDir()
-	refusal, err := json.Marshal(contract.ErrorResponse{Error: contract.APIError{Code: "person_driving", Message: "a person is driving"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(factsDir, "person-driving.json"), refusal, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeStageARefusedCLIOutput(t, factsDir)
 	for i, state := range []lima.InstanceState{lima.InstanceRunning, lima.InstanceStopped} {
 		at := now.Add(time.Duration(i) * time.Second)
 		facts := lima.BuildMinimalDoctorFacts(lima.UnitStateLaunchedByUnit, lima.SupervisorFacts{Instance: "wefty-proof", State: state, Position: lima.OCIPositionOnDemand, ObservedAt: at}, nil, contract.CapabilityObservation{}, nil, at)
@@ -139,5 +139,87 @@ func TestStageAObserverRealStore(t *testing.T) {
 	command.Env = append(os.Environ(), "STAGE_A_TEST_DB="+livePath, "STAGE_A_ENDED_DB="+path, "STAGE_A_FACTS="+factsDir)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("Stage A observer: %v\n%s", err, output)
+	}
+}
+
+// Capture the real executable's streams at the Seat front-door boundary. In
+// particular, do not manufacture CLI error documents from an API response.
+func writeStageARefusedCLIOutput(t *testing.T, directory string) {
+	t.Helper()
+	binary := filepath.Join(t.TempDir(), "wefty")
+	build := exec.CommandContext(t.Context(), "go", "build", "-o", binary, "./cmd/wefty")
+	build.Dir = ".."
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+	network := plain.NewNetwork()
+	participant := network.NewFabric(fabric.Identity{NodeID: "stage-a-door"})
+	listener, err := participant.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "seat_" + strings.Repeat("0", 31) + "1"
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(l1.SeatCredentialHeader) != "stage-a-test-secret" {
+			t.Error("missing Seat credential")
+			w.WriteHeader(403)
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/seats/" + id + "/screen-target":
+			_ = json.NewEncoder(w).Encode(map[string]any{"endpoint": "ws://" + listener.Addr().String()})
+		case "/v1/seats/" + id + "/screen/input":
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: "person_driving", Message: "a person is driving"}})
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			w.WriteHeader(404)
+		}
+	})}
+	go func() { _ = server.Serve(listener) }()
+	defer server.Close()
+	profile := connprofile.Profile{Version: 1, Fabric: "plain", L1Address: listener.Addr().String(), Identities: connprofile.Identities{CLI: "stage-a-cli"}}
+	payload, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profilePath := filepath.Join(directory, "profile.json")
+	if err := os.WriteFile(profilePath, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+	seats := filepath.Join(directory, "seats")
+	if err := os.Mkdir(seats, 0700); err != nil {
+		t.Fatal(err)
+	}
+	credential, _ := json.Marshal(map[string]string{"seat_id": id, "credential": "stage-a-test-secret"})
+	if err := os.WriteFile(filepath.Join(seats, id+".json"), credential, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary, "--profile", profilePath, "--json", "seat", "key", id, "Tab")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "WEFTY_") && !strings.HasPrefix(entry, "HOME=") && !strings.HasPrefix(entry, "XDG_") {
+			command.Env = append(command.Env, entry)
+		}
+	}
+	command.Env = append(command.Env, "HOME="+directory, "WEFTY_SEAT_STATE_ROOT="+seats)
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	err = command.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 5 || stdout.Len() != 0 {
+		t.Fatalf("refusal: err=%v stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	var failure contract.ErrorResponse
+	if err := json.Unmarshal(stderr.Bytes(), &failure); err != nil || failure.Error.Code != "person_driving" {
+		t.Fatalf("refusal stderr: %v %s", err, stderr.String())
+	}
+	output, err := json.Marshal(map[string]any{"exit_code": exit.ExitCode(), "stdout": stdout.String(), "stderr": stderr.String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "person-driving-cli.json"), output, 0600); err != nil {
+		t.Fatal(err)
 	}
 }

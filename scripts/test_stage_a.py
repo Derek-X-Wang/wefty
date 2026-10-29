@@ -163,22 +163,27 @@ class StageAStoreTests(unittest.TestCase):
     def test_control_timing_ignores_refusal_that_began_before_control(self):
         event = next(e for e in self.snapshot['events'] if e['seat_id'] == self.seat and e['kind'] == 'control_taken')
         at = int(stage.event_time(event) * 1e9)
-        refused = (Path(os.environ['STAGE_A_FACTS']) / 'person-driving.json').read_text()
-        attempts = [dict(begin_unix_ns=at-200_000_000, end_unix_ns=at-100_000_000, exit_code=0, stdout='{}'),
-                    dict(begin_unix_ns=at-10_000_000, end_unix_ns=at+50_000_000, exit_code=5, stdout=refused),
-                    dict(begin_unix_ns=at+100_000_000, end_unix_ns=at+400_000_000, exit_code=5, stdout=refused)]
+        refused = json.loads((Path(os.environ['STAGE_A_FACTS']) / 'person-driving-cli.json').read_text())
+        self.assertEqual(refused['stdout'], '')
+        self.assertEqual(json.loads(refused['stderr'])['error']['code'], 'person_driving')
+        attempts = [dict(begin_unix_ns=at-200_000_000, end_unix_ns=at-100_000_000, exit_code=0, stdout='{}', stderr=''),
+                    dict(begin_unix_ns=at-10_000_000, end_unix_ns=at+50_000_000, **refused),
+                    dict(begin_unix_ns=at+100_000_000, end_unix_ns=at+400_000_000, **refused)]
         value = stage.control_timing(self.snapshot, self.seat, attempts)
         self.assertAlmostEqual(value['seconds'], 0.4)
         self.assertEqual(value['last_accepted_begin_unix_ns'], at-200_000_000)
         self.assertTrue(value['within_one_second'])
         self.assertIsNone(stage.control_timing(self.snapshot, self.seat, attempts[:2]))
         self.assertIsNone(stage.control_timing(self.snapshot, self.seat, attempts[1:]))
+        wrong_stream = [dict(a, stdout=a['stderr'], stderr='') if a['exit_code'] else a for a in attempts]
+        self.assertIsNone(stage.control_timing(self.snapshot, self.seat, wrong_stream))
         attempts[-1]['end_unix_ns'] = at+1_500_000_000
         self.assertFalse(stage.control_timing(self.snapshot, self.seat, attempts)['within_one_second'])
 
     def test_screen_loop_records_each_attempt_with_injected_clocks(self):
         ticks = [0]
-        result = subprocess.CompletedProcess([], 5, (Path(os.environ['STAGE_A_FACTS']) / 'person-driving.json').read_text(), '')
+        refused = json.loads((Path(os.environ['STAGE_A_FACTS']) / 'person-driving-cli.json').read_text())
+        result = subprocess.CompletedProcess([], refused['exit_code'], refused['stdout'], refused['stderr'])
         def run():
             ticks[0] += 1
             return result, 1
@@ -186,7 +191,7 @@ class StageAStoreTests(unittest.TestCase):
         stage.screen_loop(run, output, 2, lambda: ticks[0], lambda: ticks[0] * 1_000_000_000)
         values = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual([(v['begin_unix_ns'], v['end_unix_ns']) for v in values], [(0, 1_000_000_000), (1_000_000_000, 2_000_000_000)])
-        self.assertTrue(all(v['exit_code'] == 5 and v['stdout'] == result.stdout for v in values))
+        self.assertTrue(all(v['exit_code'] == 5 and v['stdout'] == '' and v['stderr'] == result.stderr for v in values))
 
     def test_invalid_timing_check_is_kept_as_fail(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -227,10 +232,59 @@ class StageADocumentTests(unittest.TestCase):
             self.assertEqual(value['home'], str(root.parents[2]))
             output = subprocess.check_output([str(root / 'tools/w'), '--json', 'exec', '--seat', 'seat_fixture', '--', 'true'], env=env, text=True)
             self.assertEqual(json.loads(output)['cwd'], str(root / 'assets'))
+            refused_commands = [
+                ['setup'], ['setup', '--proof'], ['setup', '--remove', '--purge'],
+                ['--json', 'setup', '--remove', '--purge'], ['--json=false', 'setup'],
+                ['upgrade'], ['--json', 'upgrade'], ['--', 'setup'],
+                ['admin', 'policy', 'add', 'owner', '--policy-revision', '1'],
+                ['admin', 'policy', 'remove', 'owner', '--policy-revision', '1'],
+                ['admin'], ['admin', 'bootstrap'], ['admin', 'bootstrap', 'nonce', 'extra'],
+                ['admins', 'add', 'owner'],
+            ]
+            for args in refused_commands:
+                with self.subTest(refused=args):
+                    result = subprocess.run([str(root / 'tools/w')] + args, env=env, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, '', 'refused command reached fake binary')
+                    self.assertIn('proof wrapper refuses', result.stderr)
+            for args in [['admin', 'bootstrap', 'nonce'], ['admin', 'policy', 'get'],
+                         ['--json', 'admin', 'bootstrap', 'nonce'], ['admin', 'policy', 'get', '--json']]:
+                with self.subTest(allowed=args):
+                    output = subprocess.check_output([str(root / 'tools/w')] + args, env=env, text=True)
+                    self.assertEqual(json.loads(output)['args'][2:], args)
             (root / 'config/profile.json').unlink()
             result = subprocess.run([str(root / 'tools/w'), 'status'], env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('missing proof path', result.stderr)
+
+    def test_preparation_requires_lima_22_before_guard_or_builds(self):
+        # Run the real script with executable boundary stubs. Never invoke Lima,
+        # setup, npm, a build or the real memory guard in this test.
+        for version, accepted in [('2.1.9', False), ('2.2.0', True), ('2.3.0', True),
+                                  ('3.0.0', True), ('unknown', False), ('2.2.0-rc.1', False)]:
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                tools = root / 'tools'
+                tools.mkdir()
+                guard = root / 'guard-called'
+                for name in ['go', 'git', 'gh', 'jq', 'npm']:
+                    path = tools / name
+                    path.write_text('#!/bin/sh\nexit 99\n')
+                    path.chmod(0o700)
+                lima = tools / 'limactl'
+                lima.write_text('#!/bin/sh\ntest "$1" = --version || exit 99\nprintf "limactl version %s\\n" ' + version + '\n')
+                lima.chmod(0o700)
+                python = tools / 'python3'
+                python.write_text('#!' + sys.executable + '\nimport os,sys,pathlib\n'
+                                  'if sys.argv[1] == "-": os.execv(sys.executable, [sys.executable] + sys.argv[1:])\n'
+                                  'pathlib.Path(' + repr(str(guard)) + ').touch()\nsys.exit(73)\n')
+                python.chmod(0o700)
+                result = subprocess.run(['/bin/bash', str(Path(stage.__file__).with_name('prepare-stage-a.sh'))],
+                                        env=dict(PATH=str(tools) + ':/usr/bin:/bin', HOME=str(root)), capture_output=True, text=True)
+                self.assertEqual(guard.exists(), accepted)
+                self.assertEqual(result.returncode, 73 if accepted else 1)
+                if not accepted:
+                    self.assertIn('Lima 2.2.0 or newer', result.stderr)
 
     def test_go_trimmed_timestamp_fractions(self):
         for suffix in ['71470', '7147', '7', '714700001']:
