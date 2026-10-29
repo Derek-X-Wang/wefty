@@ -72,12 +72,16 @@ and clicks every dialog. ORCHESTRATOR runs every observer and capture.
   1. **A refusal before the program starts.** For a Claude Code PRIMARY, add a
      `permissions.deny` rule for this executable (for example
      `Bash("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"*)`) and
-     retain the harness's refusal message. The command never runs.
+     retain the harness's actual refusal message from the installed version (in
+     JSON settings, escape the embedded quotes). The command never runs. This
+     proves a harness permission refusal, not OS sandbox enforcement; record it
+     as such.
   2. **A sandbox-attributed failure.** The browser starts but the sandbox stops
-     it: stderr names the sandbox (for example `Operation not permitted` on its
-     profile or socket), or the macOS log has a sandbox deny for that process
-     (`log show --last 2m --style compact --predicate 'eventMessage CONTAINS "deny"'`,
-     run by ORCHESTRATOR right after the probe). Retain both.
+     it, shown by an explicit sandbox diagnostic, or by a macOS sandbox deny log
+     entry tied to the probe's process ID and time (narrow candidates with
+     `log show --last 2m --style compact --predicate 'eventMessage CONTAINS[c] "deny" AND eventMessage CONTAINS[c] "Chrome"'`,
+     run by ORCHESTRATOR right after the probe, then match the PID). A bare
+     `Operation not permitted` is not enough. Retain both.
 
   Not accepted: a missing executable, a crash without a sandbox reason, or an
   unconfined shell. If neither form is available, AR-1's "the sandbox blocks a
@@ -719,17 +723,17 @@ test -e "$HOME/.local/share/wefty-proof/data/oci-intent.json.stopping"
 
 The stopping mark lasts only seconds, so a relayed "submit now" is usually too
 slow. Before the boundary, PRIMARY starts this one-shot loop, which submits
-**exactly one** G request as soon as the mark appears (or gives up after 20
-minutes); OWNER approves its dialog:
+**at most one** G request as soon as the mark appears (or gives up after about
+20 minutes); OWNER approves its dialog:
 
 ```sh
 for i in $(seq 1 6000); do
   if test -e "$HOME/.local/share/wefty-proof/data/oci-intent.json.stopping"; then
-    date -u +%Y-%m-%dT%H:%M:%S.%NZ
+    date -u +%Y-%m-%dT%H:%M:%SZ
     exec "$HOME/.local/share/wefty-proof/tools/w" seat request --network none --json
   fi
   sleep 0.2
-done; echo "HV-4: no stopping mark seen in 20 minutes"
+done; echo "HV-4: no stopping mark seen in about 20 minutes"
 ```
 
 If the loop gives up, HV-4 is NOT-RUN with that cause.
