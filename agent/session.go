@@ -6,6 +6,7 @@ import (
 	"fmt"
 	rand "math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -80,6 +81,7 @@ type agentSession struct {
 	lastOneshotClaim    time.Time
 
 	rejoinMu                  sync.Mutex
+	rejoinSequence            atomic.Uint64
 	retirementMu              sync.Mutex
 	upgradePromotionReply     chan struct{}
 	retiringRequested         chan struct{}
@@ -342,9 +344,15 @@ func (session *agentSession) register(ctx context.Context) (l1.Node, error) {
 
 // Rejoin an enrolled primary in place. Node liveness is independent of Attempt
 // Leases; replacing the serving context would cancel still-authorized residents.
-func (session *agentSession) rejoinGeneration(ctx context.Context, cause error) error {
+func (session *agentSession) rejoinGeneration(ctx context.Context, cause error, observedRejoin uint64) error {
 	session.rejoinMu.Lock()
 	defer session.rejoinMu.Unlock()
+	// Another caller already recovered this refusal. Callers capture the
+	// sequence at their latest refusal, before any further retirement check
+	// or mutex wait.
+	if session.rejoinSequence.Load() != observedRejoin {
+		return nil
+	}
 	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
 	session.setSession(LifecycleRejoining, 0, cause)
 	for ctx.Err() == nil {
@@ -363,6 +371,7 @@ func (session *agentSession) rejoinGeneration(ctx context.Context, cause error) 
 			_, err = session.register(ctx)
 			if err == nil {
 				session.markReady()
+				session.rejoinSequence.Add(1)
 				if session.logf != nil {
 					session.logf("agent: rejoined node %s", session.registration.NodeID)
 				}
@@ -1238,6 +1247,7 @@ func (session *agentSession) claimClassLoop(
 			continue
 		}
 		if err != nil {
+			observedRejoin := session.rejoinSequence.Load()
 			if session.registration.AgentGenerationID != "" {
 				_, observationErr := session.observeGeneration(ctx)
 				if session.isRetiring() {
@@ -1252,11 +1262,12 @@ func (session *agentSession) claimClassLoop(
 						continue
 					}
 					err = observationErr
+					observedRejoin = session.rejoinSequence.Load()
 				}
 			}
 			classification := classifyAgentProtocolError(err)
 			if session.registration.AgentGenerationID != "" && classification.nodeSessionReaction == nodeSessionReregister {
-				if err = session.rejoinGeneration(ctx, err); err == nil {
+				if err = session.rejoinGeneration(ctx, err, observedRejoin); err == nil {
 					backoff.reset()
 					continue
 				}
@@ -1593,6 +1604,7 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			response, err = session.heartbeatOCIPinned(ctx)
 		}
 		if err != nil {
+			observedRejoin := session.rejoinSequence.Load()
 			session.logHeartbeatError(err)
 			classification := classifyAgentProtocolError(err)
 			if session.registration.AgentGenerationID != "" && classification.destination != errorDestinationTransient {
@@ -1606,12 +1618,13 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 				}
 				if observationErr != nil {
 					err = observationErr
+					observedRejoin = session.rejoinSequence.Load()
 					session.logHeartbeatError(err)
 					classification = classifyAgentProtocolError(err)
 				}
 			}
 			if session.registration.AgentGenerationID != "" && classification.nodeSessionReaction == nodeSessionReregister {
-				if err = session.rejoinGeneration(ctx, err); err == nil {
+				if err = session.rejoinGeneration(ctx, err, observedRejoin); err == nil {
 					backoff.reset()
 					nextDelay = session.heartbeatInterval
 					continue
