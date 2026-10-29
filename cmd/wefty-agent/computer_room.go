@@ -32,8 +32,14 @@ func bindComputerRoomFlags(flags *flag.FlagSet) *computerRoomFlags {
 	return values
 }
 
+// validate checks the flags alone, so a bad flag stops the node agent before
+// the host VM bootstrap rather than after it.
+func (values *computerRoomFlags) validate() error {
+	return (l1.ComputerRoomConfig{SeatMemoryBytes: values.seatMemoryBytes, DedicatedCap: values.dedicatedCap}).Validate()
+}
+
 func (values *computerRoomFlags) configured(path string, capacity, reserve int64) (*l1.ComputerRoomConfig, error) {
-	if err := (l1.ComputerRoomConfig{SeatMemoryBytes: values.seatMemoryBytes, DedicatedCap: values.dedicatedCap}).Validate(); err != nil {
+	if err := values.validate(); err != nil {
 		return nil, err
 	}
 	return configuredComputerRoom(path, capacity, reserve, values.seatMemoryBytes, values.dedicatedCap)

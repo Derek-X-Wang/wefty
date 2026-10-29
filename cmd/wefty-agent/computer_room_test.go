@@ -63,7 +63,7 @@ func TestComputerRoomStartupFlagsSetNodeSettings(t *testing.T) {
 }
 
 func TestComputerRoomUnavailableSetupStateKeepsNodeRunning(t *testing.T) {
-	for _, name := range []string{"missing", "unreadable"} {
+	for _, name := range []string{"missing", "unreadable", "invalid"} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "setup.json")
 			if name == "unreadable" {
@@ -79,6 +79,11 @@ func TestComputerRoomUnavailableSetupStateKeepsNodeRunning(t *testing.T) {
 						t.Skip("root bypasses setup-state permissions; this regression needs the operator UID")
 					}
 					t.Fatalf("setup state must really be unreadable: %v", err)
+				}
+			}
+			if name == "invalid" {
+				if err := os.WriteFile(path, []byte("{invalid"), 0600); err != nil {
+					t.Fatal(err)
 				}
 			}
 			var output bytes.Buffer
