@@ -79,3 +79,23 @@ func TestRelaySeatEndWinsDrain(t *testing.T) {
 		t.Fatal("session close replaced Seat end")
 	}
 }
+
+func TestRelayCleanPathRefusesEscapes(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"/p/v1/seats/s/person/viewer":            true,
+		"/p/v1/seats/s/person/viewer/":           true,
+		"/p/v1/seats/s/person/../../other":       false,
+		"/p/v1/seats/s/person/./viewer":          false,
+		"/p/v1/seats/s/person//viewer":           false,
+		"/p/v1/seats/s/person/a%2F..%2F..%2Fx":   false,
+		"/p/v1/seats/s/person/viewer/index.html": true,
+	} {
+		u, err := url.Parse("http://127.0.0.1:1" + raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := cleanPath(u); got != want {
+			t.Errorf("cleanPath(%q) = %v, want %v", raw, got, want)
+		}
+	}
+}

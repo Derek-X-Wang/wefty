@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -175,6 +176,19 @@ func (r *Relay) Stop(reason error) {
 
 func equalSecret(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
 
+// cleanPath refuses dot segments and escaped path bytes, so the forwarded path
+// stays under the prefix the relay checked.
+func cleanPath(u *url.URL) bool {
+	if u.RawPath != "" {
+		return false
+	}
+	clean := path.Clean(u.Path)
+	if strings.HasSuffix(u.Path, "/") && clean != "/" {
+		clean += "/"
+	}
+	return clean == u.Path
+}
+
 func (r *Relay) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
@@ -182,7 +196,7 @@ func (r *Relay) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "Viewer host is not allowed", http.StatusForbidden)
 		return
 	}
-	if !strings.HasPrefix(request.URL.Path, r.prefix+"/") {
+	if !strings.HasPrefix(request.URL.Path, r.prefix+"/") || !cleanPath(request.URL) {
 		http.Error(w, "Viewer path is not allowed", http.StatusForbidden)
 		return
 	}
@@ -287,10 +301,8 @@ func (r *Relay) serveSocket(w http.ResponseWriter, request *http.Request, trace 
 	defer cancel()
 	stop := context.AfterFunc(request.Context(), cancel)
 	defer stop()
-	target := *request.URL
-	target.Scheme, target.Host = r.target.Scheme, r.target.Host
-	target.Path = strings.TrimPrefix(target.Path, r.prefix)
-	target.RawPath = ""
+	// Scheme and host are the door's; the path passed cleanPath under this Seat's prefix.
+	target := url.URL{Scheme: r.target.Scheme, Host: r.target.Host, Path: strings.TrimPrefix(request.URL.Path, r.prefix), RawQuery: request.URL.RawQuery}
 	protocols := strings.Split(request.Header.Get("Sec-WebSocket-Protocol"), ",")
 	for i := range protocols {
 		protocols[i] = strings.TrimSpace(protocols[i])
