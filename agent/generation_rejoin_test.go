@@ -240,6 +240,174 @@ func TestPrimaryGenerationRejoinsAfterNodeDeadClaim(t *testing.T) {
 	assertPrimaryGenerationRejoinsAfterNodeDead(t, false)
 }
 
+func TestPrimaryGenerationRejoinCoalescesConcurrentRefusals(t *testing.T) {
+	const claimCallers = 4
+	for _, code := range []contract.ErrorCode{contract.ErrorNodeDead, contract.ErrorNodeNotRegistered} {
+		for _, scenario := range []struct {
+			leader  int
+			newLoss bool
+		}{{0, false}, {claimCallers, false}, {0, true}, {claimCallers, true}} {
+			t.Run(fmt.Sprintf("%s/leader=%d/after_rejoin_refusal=%t", code, scenario.leader, scenario.newLoss), func(t *testing.T) {
+				leader := scenario.leader
+				type callerKey struct{}
+				var active, followers, registering atomic.Bool
+				var rejoins, observations atomic.Int32
+				var callers [claimCallers + 1]atomic.Int32
+				firstRegister := make(chan struct{})
+				allObserved := make(chan struct{})
+				firstRejoined := make(chan struct{})
+				recovered := make(chan int, len(callers))
+				session, _, registrations := newGenerationRejoinFixture(t, 10*time.Millisecond, time.Hour, func(format string, args ...any) {
+					if fmt.Sprintf(format, args...) == "agent: rejoined node node" && rejoins.Add(1) == 1 {
+						close(firstRejoined)
+					}
+				}, func(r *http.Request, store *l1.Store, _ *manualClock) *http.Response {
+					if !active.Load() {
+						return nil
+					}
+					if r.URL.Path == "/v1/agent/nodes/register" && registering.CompareAndSwap(false, true) {
+						close(firstRegister)
+						select {
+						case <-allObserved:
+						case <-r.Context().Done():
+						}
+					}
+					caller, tagged := r.Context().Value(callerKey{}).(int)
+					if !tagged {
+						// The fixture's heartbeat joins the explicit claim callers.
+						caller = claimCallers
+					}
+					isRPC := r.URL.Path == "/v1/agent/nodes/node/heartbeat" || tagged && r.URL.Path == "/v1/agent/jobs/claim"
+					if isRPC && (caller == leader || followers.Load()) && callers[caller].CompareAndSwap(0, 1) {
+						if code == contract.ErrorNodeNotRegistered {
+							return generationReadRefusal(t, r, store, code)
+						}
+						recorder := httptest.NewRecorder()
+						recorder.WriteHeader(http.StatusConflict)
+						_ = json.NewEncoder(recorder).Encode(contract.ErrorResponse{Error: contract.APIError{Code: code, Message: "node is dead"}})
+						return recorder.Result()
+					}
+					if r.URL.Path == "/v1/agent/nodes/node/generations" && callers[caller].CompareAndSwap(1, 2) && observations.Add(1) == int32(len(callers)) {
+						// The leader is already registering while other callers queue.
+						// Delay the final retirement check until that rejoin completes:
+						// its refusal still belongs to the same node-session loss.
+						close(allObserved)
+						select {
+						case <-firstRejoined:
+						case <-r.Context().Done():
+						}
+						if scenario.newLoss {
+							return generationReadRefusal(t, r, store, contract.ErrorNodeNotRegistered)
+						}
+					}
+					if isRPC && callers[caller].CompareAndSwap(2, 3) {
+						recovered <- caller
+					}
+					return nil
+				})
+				ctx, cancel := context.WithCancel(t.Context())
+				done := make(chan destinationError, claimCallers)
+				started := 0
+				t.Cleanup(func() {
+					cancel()
+					for range started {
+						select {
+						case result := <-done:
+							if result.err != nil {
+								t.Errorf("claim caller stopped: %v", result.err)
+							}
+						case <-time.After(5 * time.Second):
+							t.Error("claim caller did not stop")
+						}
+					}
+				})
+				startClaim := func(caller int) {
+					started++
+					go func() {
+						done <- session.claimClassLoop(context.WithValue(ctx, callerKey{}, caller), make(chan struct{}), workloadClassOneShot, contract.JobClassOneShot,
+							func(context.Context, l1.Claim, time.Time) (errorDestination, error) {
+								return errorDestinationUnclassified, fmt.Errorf("unexpected resident attempt")
+							})
+					}()
+				}
+				active.Store(true)
+				if leader < claimCallers {
+					startClaim(leader)
+				}
+				select {
+				case <-firstRegister:
+				case <-time.After(5 * time.Second):
+					t.Fatal("leader did not attempt a rejoin")
+				}
+				followers.Store(true)
+				for caller := range claimCallers {
+					if caller != leader {
+						startClaim(caller)
+					}
+				}
+				for range callers {
+					select {
+					case <-recovered:
+					case <-time.After(5 * time.Second):
+						t.Fatal("not all refused callers recovered")
+					}
+				}
+				wantRejoins := int32(1)
+				if scenario.newLoss {
+					wantRejoins++
+				}
+				if registrations.Load() != wantRejoins+1 || rejoins.Load() != wantRejoins {
+					t.Fatalf("registrations=%d rejoin logs=%d, want %d registrations and %d logs", registrations.Load(), rejoins.Load(), wantRejoins+1, wantRejoins)
+				}
+			})
+		}
+	}
+}
+
+func TestPrimaryGenerationRejoinsAfterSubsequentRefusal(t *testing.T) {
+	for _, code := range []contract.ErrorCode{contract.ErrorNodeDead, contract.ErrorNodeNotRegistered} {
+		for _, heartbeat := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/heartbeat=%t", code, heartbeat), func(t *testing.T) {
+				endpoint := "/v1/agent/jobs/claim"
+				heartbeatInterval, claimInterval := time.Hour, 10*time.Millisecond
+				if heartbeat {
+					endpoint = "/v1/agent/nodes/node/heartbeat"
+					heartbeatInterval, claimInterval = claimInterval, heartbeatInterval
+				}
+				var refuse atomic.Bool
+				var rejoins atomic.Int32
+				session, _, registrations := newGenerationRejoinFixture(t, heartbeatInterval, claimInterval, func(format string, args ...any) {
+					if fmt.Sprintf(format, args...) == "agent: rejoined node node" {
+						rejoins.Add(1)
+					}
+				}, func(r *http.Request, store *l1.Store, clock *manualClock) *http.Response {
+					if r.URL.Path != endpoint || !refuse.CompareAndSwap(true, false) {
+						return nil
+					}
+					if code == contract.ErrorNodeNotRegistered {
+						return generationReadRefusal(t, r, store, code)
+					}
+					clock.Advance(l1.DefaultNodeDeadAfter)
+					if _, err := store.Reconcile(r.Context()); err != nil && r.Context().Err() == nil {
+						t.Error(err)
+					}
+					return nil
+				})
+				for loss := int32(1); loss <= 2; loss++ {
+					// This refusal arrives only after the previous rejoin completed.
+					refuse.Store(true)
+					retirementWait(t, "a new refusal causes a new rejoin", func() bool {
+						return registrations.Load() == loss+1 && rejoins.Load() == loss
+					})
+				}
+				if state := session.observer.snapshot(ClassOccupancy{}, ClassOccupancy{}).State; state != LifecycleReady {
+					t.Fatalf("session state=%s, want Ready", state)
+				}
+			})
+		}
+	}
+}
+
 func assertPrimaryGenerationRejoinsAfterNodeDead(t *testing.T, heartbeat bool) {
 	t.Helper()
 	endpoint := "/v1/agent/nodes/node/heartbeat"
