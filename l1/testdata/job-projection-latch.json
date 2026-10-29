@@ -46,6 +46,7 @@
       "result": {
         "output_error": "durable output failed"
       },
+      "started_at": "2026-08-09T10:00:00Z",
       "state": "failed",
       "updated_at": "2026-08-09T10:00:00Z"
     }
