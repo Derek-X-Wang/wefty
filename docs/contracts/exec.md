@@ -481,7 +481,11 @@ The CLI performs local writes itself, within its own sandbox; no helper writes
 to the Mac on its behalf. File contents stream without a total byte limit.
 A copy with no input or output stream progress for 60 seconds fails with
 `seat_copy_failed` and a `Seat copy stalled` diagnostic; progress refreshes
-that bound, so a progressing copy has no total runtime limit.
+that bound, so a progressing copy has no total runtime limit. Inside the Seat,
+copy-in and sync fsync each file at least every 64 MiB while they write it.
+This lowers the risk that one long fsync of a large file stops input progress
+past the bound; it does not remove it, because a single fsync can still wait
+on a slow or busy disk.
 Disk-full and transport failures return `seat_copy_failed`; local permission,
 read-only filesystem and final-name symlink refusals return
 `seat_copy_write_denied`. Both use exit 1. An existing-folder failure says
