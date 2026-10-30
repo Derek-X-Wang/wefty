@@ -662,10 +662,35 @@ func TestLegacyStartOverrideObservation(t *testing.T) {
 		{name: "disabled", reply: "disabled services = {\n \"dev.wefty.node-agent\" => true\n}\n", disabled: true},
 		{name: "disabled word", reply: "disabled services = {\n \"dev.wefty.node-agent\" => disabled\n}\n", disabled: true},
 		{name: "enabled word", reply: "disabled services = {\n \"dev.wefty.node-agent\" => enabled\n}\n"},
+		{name: "trailing section", reply: `
+disabled services = {
+	"dev.wefty.node-agent" => disabled
+	"other.label" => enabled
+}
+other services = {
+	other.label => unknown
+}
+`, disabled: true},
+		{name: "leading section", reply: `
+other services = {
+	"dev.wefty.node-agent" => disabled
+	disabled services = {
+		"dev.wefty.node-agent" => unknown
+	}
+}
+disabled services = {
+	"dev.wefty.node-agent" => enabled
+	"other.label" => disabled
+}
+`},
 		{name: "unrelated", reply: "disabled services = {\n \"other.label\" => true\n}\n"},
 		{name: "empty", wantError: true},
+		{name: "missing block", reply: "other services = {\n\tother.label => disabled\n}\n", wantError: true},
+		{name: "nested block only", reply: "other services = {\n\tdisabled services = {\n\t\t\"dev.wefty.node-agent\" => disabled\n\t}\n}\n", wantError: true},
+		{name: "unclosed block", reply: "disabled services = {\n\t\"dev.wefty.node-agent\" => disabled\n", wantError: true},
 		{name: "unknown", reply: "disabled services = {\n \"dev.wefty.node-agent\" => unknown\n}\n", wantError: true},
 		{name: "duplicate", reply: "disabled services = {\n \"dev.wefty.node-agent\" => true\n \"dev.wefty.node-agent\" => false\n}\n", wantError: true},
+		{name: "unquoted", reply: "disabled services = {\n\tdev.wefty.node-agent => disabled\n}\n", wantError: true},
 		{name: "transport", fault: fault, wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
