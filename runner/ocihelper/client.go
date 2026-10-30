@@ -1045,23 +1045,24 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 			}
 			return session.markOperationFailure(ctx, err)
 		}
-		if response.Version != session.client.protocolVersion() {
-			return &RPCError{Code: CodeVersionMismatch, Message: "helper response used an unsupported version"}
-		}
-		if response.Error != nil {
-			return session.markOperationFailure(ctx, response.Error)
-		}
-		if !response.OK {
-			return errors.New("OCI helper returned neither success nor error")
-		}
-		if len(response.Body) == 0 {
-			return nil
+		if final, err := session.streamReply(ctx, response); final {
+			return err
 		}
 		if err := receive(wire, response); err != nil {
 			return err
 		}
 		if acknowledge {
 			if err := writeAll(connection, []byte{1}); err != nil {
+				// A helper that ends the stream with a final reply or a typed
+				// refusal closes without reading this acknowledgement, so the
+				// write can fail while that reply waits unread. Read it once,
+				// briefly, before calling the stream broken (#1282).
+				var next frame
+				if applyConnectionDeadline(ctx, connection, time.Now().Add(failedAcknowledgementReplyWait)) == nil && wire.read(&next) == nil {
+					if final, replyErr := session.streamReply(ctx, next); final {
+						return replyErr
+					}
+				}
 				err = fmt.Errorf("acknowledge OCI helper stream event: %w", err)
 				err = classifyContextClosedOperation(connection, ctx, err)
 				if method == MethodExecComputerSeat {
@@ -1071,6 +1072,26 @@ func (session *Session) stream(ctx context.Context, method Method, request any, 
 			}
 		}
 	}
+}
+
+// failedAcknowledgementReplyWait bounds the one read for a final reply after a
+// stream acknowledgement write fails. A reply the helper sent before it closed
+// is already buffered, so the wait only matters when there is none.
+const failedAcknowledgementReplyWait = time.Second
+
+// streamReply reports whether a stream frame ends the stream, and with what
+// result. A frame that does not end it is an event.
+func (session *Session) streamReply(ctx context.Context, response frame) (bool, error) {
+	if response.Version != session.client.protocolVersion() {
+		return true, &RPCError{Code: CodeVersionMismatch, Message: "helper response used an unsupported version"}
+	}
+	if response.Error != nil {
+		return true, session.markOperationFailure(ctx, response.Error)
+	}
+	if !response.OK {
+		return true, errors.New("OCI helper returned neither success nor error")
+	}
+	return len(response.Body) == 0, nil
 }
 
 func (session *Session) openStream(ctx context.Context, method Method, request any, readyMarker byte, detachSuccessful bool) (net.Conn, error) {
