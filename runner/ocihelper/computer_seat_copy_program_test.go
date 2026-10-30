@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -258,12 +259,34 @@ func readSeatCopyHandshake(t *testing.T, child *exec.Cmd, output io.Reader, want
 }
 
 // seatCopyStackDump lets a stuck test child print every Python thread's stack
-// on SIGUSR1, so a bound failure shows where the child waited.
+// on SIGUSR1, so a bound failure shows where the child waited. The chained
+// Python handler adds the main thread's pending and blocked signals and how
+// often the program's SIGTERM handler ran: evidence the stack alone lacks
+// (#1283). On macOS an already pending SIGTERM handler runs before it.
 // seatCopyTerminateBound is generous because a heavily swapping host can
 // stall a healthy child for seconds; it still fails far below the package timeout.
 const seatCopyTerminateBound = 30 * time.Second
 
-const seatCopyStackDump = "import faulthandler, signal\nfaulthandler.register(signal.SIGUSR1, all_threads=True)\n"
+const seatCopyStackDump = `import faulthandler, signal, sys
+_wefty_term_runs = []
+_wefty_signal = signal.signal
+def _wefty_mark(sig, handler):
+    # Counts SIGTERM handler entries for the report below.
+    if sig == signal.SIGTERM and callable(handler):
+        inner = handler
+        def handler(*args):
+            _wefty_term_runs.append(1)
+            return inner(*args)
+    return _wefty_signal(sig, handler)
+signal.signal = _wefty_mark
+def _wefty_names(signals):
+    return sorted(getattr(s, 'name', str(s)) for s in signals)
+def _wefty_signal_state(*_):
+    sys.stderr.write('signals: pending=%s blocked=%s sigterm_handler_runs=%d\n' % (
+        _wefty_names(signal.sigpending()), _wefty_names(signal.pthread_sigmask(signal.SIG_BLOCK, [])), len(_wefty_term_runs)))
+_wefty_signal(signal.SIGUSR1, _wefty_signal_state)
+faulthandler.register(signal.SIGUSR1, all_threads=True, chain=True)
+`
 
 // terminateSeatCopyChild sends SIGTERM and requires a failed exit within a
 // short bound, so a missed signal fails in seconds instead of hanging the
@@ -282,13 +305,17 @@ func terminateSeatCopyChild(t *testing.T, child *exec.Cmd, stderr *bytes.Buffer)
 		}
 	case <-time.After(seatCopyTerminateBound):
 		_ = child.Process.Signal(syscall.SIGUSR1)
+		// Record whether the child exits in the diagnostic window; that alone
+		// does not say why.
+		after := "killed"
 		select {
-		case <-done:
+		case err := <-done:
+			after = fmt.Sprintf("exited after SIGUSR1: %v", err)
 		case <-time.After(5 * time.Second):
 			_ = child.Process.Kill()
 			<-done
 		}
-		t.Fatalf("copy child did not exit within %s of SIGTERM (#1283); stderr=%s", seatCopyTerminateBound, stderr.String())
+		t.Fatalf("copy child did not exit within %s of SIGTERM (#1283); %s; stderr=%s", seatCopyTerminateBound, after, stderr.String())
 	}
 }
 
