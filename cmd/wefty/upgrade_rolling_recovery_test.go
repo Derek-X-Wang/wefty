@@ -534,7 +534,6 @@ func TestRollingRecoveryStoppedStagedCandidateKeepsRetirees(t *testing.T) {
 	for _, count := range []int{0, 1, 2} {
 		for _, phase := range []string{"candidate_staging", "promotion_requested"} {
 			t.Run(fmt.Sprintf("%d/%s", count, phase), func(t *testing.T) {
-				t.Parallel()
 				f := newRollingFixture(t)
 				enableRollingRecoveryFixture(t, f)
 				claims := []*l1.Claim{f.claim(t, "oldest", contract.JobClassOneShot, false)}
