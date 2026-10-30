@@ -108,13 +108,12 @@ returns `seat_ended` with the end reason.
 
 Seat logs use the same store retention setting as the take-over audit:
 `computerTakeoverAuditRetentionAge`, 90 days by default. After action
-authority ends, the stream and digest last for that retention. A request
-that never went live uses creation time, but its log stays available while
-it is unresolved and a call, approval or permanent Seat identity still refers
-to it. Once it ends, or all those references disappear, that log expires at
-creation plus the retention age. Thus a very late refusal may make an old
-log immediately eligible for pruning without blocking the refusal itself.
-A retained once-live flag keeps creation time from pruning a live Seat's log.
+authority ends, the stream and digest last for that retention, counted from
+the end, whether or not the Seat was ever live. A very late refusal therefore
+keeps its log for the full retention (#1239). A log that has not ended is
+kept while the Seat was once live, or while a call, approval or permanent
+Seat identity still refers to it. Only a never-live, not-ended log that
+nothing refers to expires at creation plus the retention age.
 Events and reads do not extend these age bounds.
 
 The existing L1 retention sweep deletes expired streams and digests and
@@ -140,9 +139,9 @@ expires. After pruning, the digest is gone: a direct credential request gets
 403 `invalid Seat credential`. The CLI's one caller retry then gets
 `not_found`, so a missing retained log is reported consistently to its
 original caller. Other forbidden answers do not trigger fallback.
-A migrated once-live terminal log starts retention at upgrade because older
-receipts have no end timestamp; a never-live log uses its known creation
-time when available, otherwise upgrade time. Restarting L1 after the source
+A migrated terminal log starts retention at upgrade because older receipts
+have no end timestamp. A migrated never-live log that has not ended uses its
+known creation time when available, otherwise upgrade time. Restarting L1 after the source
 migrations complete does not reseed a pruned log.
 
 ## CLI
