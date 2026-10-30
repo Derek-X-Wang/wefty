@@ -1140,6 +1140,20 @@ spontaneous exit all require both the payload leader's `Wait` and group
 `ProcessReapTimeout` (five seconds by default). Failed proof ends the control
 stream and makes the agent report `ErrGuardianLost`.
 
+Captured exec adds a storage-retirement sweep inside its wrapper cleanup,
+before storage rename or deletion. It stops same-user processes with physical
+cwd inside the capture, including descendants that left the command group.
+It excludes the retiring shell, its parent, and processes named `wefty-agent`.
+Its inventory is bounded to two seconds, TERM grace is 200 ms, and release wait is 100 ms;
+this fits the runner's default five-second TERM grace, with scheduling overhead
+outside that sweep budget. Failure warns without failing cleanup. See
+[exec storage retirement](exec.md) for discovery and folder scope. The wrapper
+logs each stopped process and writes optional `stopped_processes` (`pid`,
+`name`, `cwd`) in its result document. The agent copies that list to the fenced
+completion's `ProcessResult` without changing the runtime's verdict. A missing
+list is omitted on the wire. This does not expand Guardian process-group
+quiescence proof after an agent crash or an uncatchable wrapper kill.
+
 Run output is uploaded to L1 and read with `wefty logs`; `wefty-agent` mirrors
 it to stdout/stderr only with `-mirror-run-output` for foreground development
 (default false), while lifecycle and error lines remain in the agent service log.

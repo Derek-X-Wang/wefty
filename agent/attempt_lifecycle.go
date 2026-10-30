@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -1162,7 +1163,7 @@ func startAcknowledgementUndecided(err error) bool {
 
 func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult {
 	if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.RuntimeFailure == nil && result.OutputError == "" {
-		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent, LogEvidenceIncomplete: result.LogEvidenceIncomplete}
+		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent, LogEvidenceIncomplete: result.LogEvidenceIncomplete, StoppedProcesses: result.StoppedProcesses}
 	}
 	return result
 }
@@ -1651,6 +1652,25 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if finalizationErr != nil {
 			if result.RuntimeFailure == nil && result.SpawnError == nil {
 				result = contract.ProcessResult{OutputError: finalizationErr.Error(), LimitReached: result.LimitReached, LogEvidenceIncomplete: result.LogEvidenceIncomplete}
+			}
+		}
+		// Captured exec's wrapper records retirement evidence in its result
+		// document. Carry just that optional list into the fenced completion;
+		// the command verdict still comes from the runtime, never the document.
+		if claim.Job.Spec.Kind == contract.JobKindProcess && submittedByRunLedger(claim) {
+			var params struct {
+				Version int    `json:"exec_version"`
+				Storage string `json:"storage"`
+			}
+			if json.Unmarshal([]byte(claim.Job.Spec.Labels[contract.LabelRunParams]), &params) == nil && (params.Version == 2 || params.Storage != "") {
+				if document, available := lifecycle.attemptResult(claim); available {
+					var evidence struct {
+						StoppedProcesses []contract.StoppedProcess `json:"stopped_processes"`
+					}
+					if json.Unmarshal(document.document, &evidence) == nil {
+						result.StoppedProcesses = evidence.StoppedProcesses
+					}
+				}
 			}
 		}
 		return result, errors.Join(runErr, finalizationErr)
@@ -2678,12 +2698,16 @@ func completionRequest(claim l1.Claim, result contract.ProcessResult, evidence w
 }
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {
-	return l1.ProcessResult{
+	converted := l1.ProcessResult{
 		LimitReached: result.LimitReached,
 		SpawnError:   result.SpawnError, RuntimeFailure: result.RuntimeFailure, OutputError: result.OutputError, ExitCode: result.ExitCode,
 		Signal: result.Signal, TerminationCause: result.TerminationCause, OOM: result.OOM, DiskExhausted: result.DiskExhausted,
 		LogEvidenceIncomplete: result.LogEvidenceIncomplete,
 	}
+	if len(result.StoppedProcesses) != 0 {
+		converted.StoppedProcesses = &result.StoppedProcesses
+	}
+	return converted
 }
 
 func toL1QuiescenceEvidence(evidence workloadrunner.ReapEvidence) l1.RuntimeQuiescenceEvidence {

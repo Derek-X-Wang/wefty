@@ -11,6 +11,7 @@ started="$storage/started"
 finished="$storage/finished"
 heartbeat=''
 child=''
+exec_stopped_processes=''
 # The command can make storage unwritable. SIGKILL cannot be caught, so it
 # still stops the liveness loop when the marker cannot be written.
 stop_heartbeat() {
@@ -24,7 +25,9 @@ cleanup() {
   if [ -n "$child" ]; then kill "$child" 2>/dev/null || :; wait "$child" 2>/dev/null || :; fi
   if [ -n "$heartbeat" ]; then stop_heartbeat; fi
   cd /tmp || :
-  retire_exec_storage "$storage" capture
+  result_directory=''
+  if [ "${command_started:-}" = 1 ]; then result_directory=${WEFTY_HANDOFF_DIR:-}; fi
+  retire_exec_storage "$storage" capture "$result_directory" "$code"
   case $? in
     0) ;;
     3) printf 'wefty: warning: could not remove the temp link of %s\n' "$storage" >&2 ;;
@@ -116,12 +119,13 @@ done
   exec -- "${command[@]}"
 ) &
 child=$!
+command_started=1
 wait "$child"
 code=$?
 child=''
 # Stop liveness output before result publication or filesystem cleanup.
 stop_heartbeat
-# The wrapper keeps mailbox context; only the command loses WEFTY_*.
+# Publish the command verdict before cleanup; cleanup appends sweep evidence.
 if [ -n "${WEFTY_HANDOFF_DIR:-}" ]; then
   printf '{"exit_code":%s}\n' "$code" > "$WEFTY_HANDOFF_DIR/result.json"
 fi

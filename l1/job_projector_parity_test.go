@@ -46,7 +46,7 @@ func jobProjectionFixture(t *testing.T, state string) (*integrationHarness, *htt
 	case "policy-stop":
 		neverStarted(t, h, agent, job, claim)
 		exit := 0
-		neverComplete(t, h, agent, job, claim, CompletionRequest{Result: ProcessResult{ExitCode: &exit}})
+		neverComplete(t, h, agent, job, claim, CompletionRequest{Result: ProcessResult{ExitCode: &exit, StoppedProcesses: &[]contract.StoppedProcess{{PID: 4321, Name: "sleep", CWD: "/tmp/wefty-exec-example/work"}}}})
 	case "never-interruption":
 		neverStarted(t, h, agent, job, claim)
 		neverComplete(t, h, agent, job, claim, CompletionRequest{Result: ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent}})
@@ -78,7 +78,8 @@ func normalizedJobProjection(t *testing.T, raw []byte, job Job, claim Claim) []b
 }
 
 // These complete response fixtures are recorded against original main 8d24686,
-// then consumed unchanged by both the legacy views and the shared projector.
+// then consumed by both the legacy views and the shared projector. The policy-stop
+// case also pins additive storage-retirement process evidence (#1031).
 func TestJobProjectorPublicResponseFixtures(t *testing.T) {
 	for _, state := range jobProjectionCases {
 		t.Run(state, func(t *testing.T) {

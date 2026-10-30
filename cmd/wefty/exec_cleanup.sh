@@ -1,7 +1,144 @@
+# Inventory is NUL-delimited so command names and working folders remain data.
+exec_storage_process_inventory() {
+  cd / || return 1
+  local uid=$1 entry key value rest pid owner name cwd
+  case "$(uname -s)" in
+    Darwin) exec lsof -nP -a -u "$uid" -d cwd -Fpcn0 ;;
+    Linux)
+      [ -d /proc/self ] || return 1
+      for entry in /proc/[0-9]*; do
+        [ -r "$entry/status" ] || continue
+        owner='' name=''
+        while IFS=$'\t' read -r key value rest; do
+          case "$key" in
+            Uid:) owner=$value ;;
+            Name:) name=$value ;;
+          esac
+        done < "$entry/status" 2>/dev/null || continue
+        [ "$owner" = "$uid" ] || continue
+        cwd=$(readlink -- "$entry/cwd" 2>/dev/null) || continue
+        pid=${entry##*/}
+        printf 'p%s\0c%s\0n%s\0' "$pid" "$name" "$cwd"
+      done
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Set exec_process_json to a JSON string, including uncommon control bytes.
+exec_storage_json_string() {
+  local value=$1 escaped='' char code i
+  local LC_ALL=C
+  for ((i=0; i<${#value}; i++)); do
+    char=${value:i:1}
+    case "$char" in
+      '"') escaped+='\"' ;;
+      \\) escaped+="\\\\" ;;
+      *) printf -v code '%d' "'$char"
+         if [ "$code" -ge 0 ] && [ "$code" -lt 32 ]; then
+           printf -v char '\\u%04x' "$code"
+         fi
+         escaped+=$char ;;
+    esac
+  done
+  exec_process_json="\"$escaped\""
+}
+
+# This runs before retirement, with stderr still connected to the run log.
+# One inventory, bounded to two seconds; no discovery retry. Helpers use /
+# as cwd so the sweep cannot select its own inventory or deadline worker.
+sweep_exec_storage_processes() {
+  exec_stopped_processes=''
+  local source=$1 inventory status field pid='' name='' cwd=''
+  local scan watchdog uid protected i index warning=0
+  local pids=() names=() folders=() stopped=()
+  [ -d "$source" ] && [ ! -L "$source" ] || return 0
+  source=${source%/}
+  source=$(cd -P -- "${source%/*}" && printf '%s/%s' "$PWD" "${source##*/}") || {
+    printf 'wefty: warning: could not scan processes in run storage\n' >&2
+    return 0
+  }
+  inventory=$(mktemp -d /tmp/wefty-sweep.XXXXXXXX) || {
+    printf 'wefty: warning: could not scan processes in run storage\n' >&2
+    return 0
+  }
+  uid=$(id -u)
+  exec_storage_process_inventory "$uid" > "$inventory/processes" 2>/dev/null &
+  scan=$!
+  (
+    cd / || exit 1
+    sleep 2
+    : > "$inventory/timeout"
+    kill -KILL "$scan" 2>/dev/null || :
+  ) </dev/null >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$scan" 2>/dev/null
+  status=$?
+  kill "$watchdog" 2>/dev/null || :
+  wait "$watchdog" 2>/dev/null || :
+  if [ "$status" -ne 0 ] || [ -e "$inventory/timeout" ]; then
+    printf 'wefty: warning: could not scan processes in run storage\n' >&2
+    /bin/rm -rf -- "$inventory"
+    return 0
+  fi
+  index=-1
+  while IFS= read -r -d '' field; do
+    # lsof terminates each process/file record with a newline after its NUL.
+    field=${field#$'\n'}
+    case "$field" in
+      p*) index=$((index+1)); pids[index]=${field#p}; names[index]=''; folders[index]='' ;;
+      c*) names[index]=${field#c} ;;
+      n*) folders[index]=${field#n} ;;
+    esac
+  done < "$inventory/processes"
+  /bin/rm -rf -- "$inventory"
+  protected=" $$ $PPID "
+  for ((i=0; i<${#pids[@]}; i++)); do
+    pid=${pids[i]} name=${names[i]} cwd=${folders[i]}
+    case "$pid" in ''|*[!0-9]*|0|1) continue ;; esac
+    case "$protected" in *" $pid "*) continue ;; esac
+    [ "$name" != wefty-agent ] || continue
+    # Both discovery methods return physical cwd paths. pwd -P above resolves
+    # the storage alias, including /var, /tmp and the run's short TMPDIR link.
+    case "$cwd" in "$source"|"$source"/*) ;; *) continue ;; esac
+    if kill -TERM "$pid" 2>/dev/null; then stopped[${#stopped[@]}]=$i
+    elif kill -0 "$pid" 2>/dev/null; then warning=1
+    fi
+  done
+  if [ "${#stopped[@]}" -gt 0 ]; then
+    sleep 0.2
+    for index in "${stopped[@]}"; do
+      pid=${pids[index]} name=${names[index]} cwd=${folders[index]}
+      if kill -0 "$pid" 2>/dev/null && ! kill -KILL "$pid" 2>/dev/null; then
+        if kill -0 "$pid" 2>/dev/null; then warning=1; continue; fi
+      fi
+      # %q keeps the log to one line even for an unusual process name.
+      printf 'wefty: stopped process %s (%q) left in run storage\n' "$pid" "$name" >&2
+      [ -z "$exec_stopped_processes" ] || exec_stopped_processes+=','
+      exec_storage_json_string "$name"
+      exec_stopped_processes+="{\"pid\":$pid,\"name\":$exec_process_json,"
+      exec_storage_json_string "$cwd"
+      exec_stopped_processes+="\"cwd\":$exec_process_json}"
+    done
+    # Give a killed descendant time to release its cwd before storage moves.
+    sleep 0.1
+  fi
+  if [ "$warning" -ne 0 ]; then
+    printf 'wefty: warning: could not stop a process in run storage\n' >&2
+  fi
+  return 0
+}
+
 # Shared by the wrapper and observing/sweeping CLI. The caller only waits
 # for atomic retirement; the helper owns deletion for as long as it takes.
 retire_exec_storage() {
   local source=$1 kind=$2 trash operation polls=0
+  sweep_exec_storage_processes "$source"
+  # The wrapper passes its result folder and verdict. Publish before a slow
+  # rename can outlast the agent's TERM grace; CLI stale sweeps pass neither.
+  if [ -n "${3:-}" ] && [ -n "$exec_stopped_processes" ]; then
+    printf '{"exit_code":%s,"stopped_processes":[%s]}\n' "$4" "$exec_stopped_processes" > "$3/result.json"
+  fi
   if [ "$kind" = trash ]; then
     trash=$source
   else

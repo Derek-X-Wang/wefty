@@ -883,6 +883,14 @@ const (
 	LogStderr LogStream = "stderr"
 )
 
+// StoppedProcess records a process stopped before its run storage was retired.
+// Name is the command name, without arguments; CWD is the physical working folder.
+type StoppedProcess struct {
+	PID  int    `json:"pid"`
+	Name string `json:"name"`
+	CWD  string `json:"cwd"`
+}
+
 // ProcessResult is the mutually exclusive execution/finalization outcome of
 // one process. ExitCode is a pointer so a successful exit code of zero remains
 // present on the wire when omitempty is applied. OutputError supersedes an
@@ -898,6 +906,7 @@ const (
 // for a signal. OOM, DiskExhausted, and LogEvidenceIncomplete are additive
 // evidence alongside one valid primary terminal arm.
 type ProcessResult struct {
+	StoppedProcesses []StoppedProcess `json:"stopped_processes,omitempty"`
 	// LimitReached records the limit the runner actually enforced. It is
 	// additive evidence, independent of the payload exit and stop initiator.
 	LimitReached          LimitReached     `json:"limit_reached,omitempty"`
