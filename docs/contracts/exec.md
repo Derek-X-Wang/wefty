@@ -185,9 +185,10 @@ storage, reached through a short `/tmp/wefty-run.*` link. Wefty deletes it with
 the storage, also after cancel. Tool caches kept in `TMPDIR` start cold in each
 run. A hard kill followed by a later sweep can leave only a dangling link.
 
-Before `retire_exec_storage` renames or deletes captured storage, it scans for
-same-user processes whose physical working folder is that storage or a folder
-beneath it. The separator boundary excludes sibling paths with the same prefix.
+For `kind=capture`, `retire_exec_storage` scans before it renames storage.
+Already-retired trash skips this scan and keeps its asynchronous deletion.
+The scan selects same-user processes whose physical working folder is that
+storage or a folder beneath it. The separator boundary excludes sibling paths with the same prefix.
 This covers `work`, private `tmp` (including its `/tmp/wefty-run.*` alias), and
 other folders beneath the capture. Version 2 uses
 `$WEFTY_RUN_DIR/wefty-exec-work`; restartable captures keep that path beneath
@@ -195,11 +196,14 @@ their Attempt-specific mailbox. The retiring shell, its parent, and processes
 named `wefty-agent` are excluded.
 
 Discovery uses one non-cgo inventory: UID-filtered `lsof` cwd records on macOS,
-or UID-filtered `/proc/*/status` and `/proc/*/cwd` on Linux.
-The inventory has a two-second deadline and no retry. Selected processes get
+or one GNU `find` call over UID-owned `/proc/*/cwd` links on Linux. Linux reads
+`/proc/<pid>/comm` only for matching folders. Inventory stays in a pipe and
+shell memory, without a scratch directory or a foreground removal.
+The inventory has a one-second deadline and no retry. Selected processes get
 SIGTERM, 200 ms grace, then SIGKILL if still present, followed by a 100 ms
-release wait. The sweep's 2.3-second budget fits within the process runner's
-default five-second TERM grace, apart from command and scheduling overhead.
+release wait. These stages total at most 1.3 seconds, excluding command and
+scheduling overhead. They leave 700 ms within the CLI's two-second foreground
+sweep budget and 3.7 seconds within the agent's default five-second TERM grace.
 A shorter configured runner grace can interrupt the wrapper trap. Discovery
 or signalling failure emits a warning and never fails storage retirement.
 
@@ -210,8 +214,8 @@ The wrapper also adds optional `stopped_processes` records (`pid`, command
 storage rename starts. An empty list leaves `result.json` unchanged, including
 its absence on cancellation. The node carries this list into the Attempt's
 `ProcessResult`; the runtime still determines the exit verdict. CLI stale-storage
-retirement emits the same diagnostics but has no live Attempt result to amend. If the wrapper is force-killed before its cleanup
-runs, the sweep does not run.
+retirement emits the same diagnostics but has no live Attempt result to amend.
+If the wrapper is force-killed before its cleanup runs, the sweep does not run.
 
 If the capture or its bare snapshot is gone, the wrapper instead prints
 ``wefty: the exec snapshot was deleted when the run ended; run `wefty exec` again``

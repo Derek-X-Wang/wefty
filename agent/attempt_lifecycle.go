@@ -1660,7 +1660,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if claim.Job.Spec.Kind == contract.JobKindProcess && submittedByRunLedger(claim) {
 			var params struct {
 				Version int    `json:"exec_version"`
-				Storage string `json:"storage"`
+				Storage string `json:"snapshot_storage"`
 			}
 			if json.Unmarshal([]byte(claim.Job.Spec.Labels[contract.LabelRunParams]), &params) == nil && (params.Version == 2 || params.Storage != "") {
 				if document, available := lifecycle.attemptResult(claim); available {

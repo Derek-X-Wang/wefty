@@ -1144,9 +1144,10 @@ Captured exec adds a storage-retirement sweep inside its wrapper cleanup,
 before storage rename or deletion. It stops same-user processes with physical
 cwd inside the capture, including descendants that left the command group.
 It excludes the retiring shell, its parent, and processes named `wefty-agent`.
-Its inventory is bounded to two seconds, TERM grace is 200 ms, and release wait is 100 ms;
-this fits the runner's default five-second TERM grace, with scheduling overhead
-outside that sweep budget. Failure warns without failing cleanup. See
+Its inventory is bounded to one second. TERM grace is 200 ms and release wait
+is 100 ms. The 1.3-second sweep budget fits the CLI's two-second foreground budget and
+the runner's default five-second TERM grace, with command and scheduling
+overhead outside that sweep budget. Failure warns without failing cleanup. See
 [exec storage retirement](exec.md) for discovery and folder scope. The wrapper
 logs each stopped process and writes optional `stopped_processes` (`pid`,
 `name`, `cwd`) in its result document. The agent copies that list to the fenced
