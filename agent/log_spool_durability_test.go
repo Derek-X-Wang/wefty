@@ -61,9 +61,9 @@ func TestTheLogSpoolCarriesTheDurabilityPragmas(t *testing.T) {
 // the NORMAL append handle, never the FULL handle whose commits pay
 // F_FULLFSYNC on darwin. TestTheLogSpoolCarriesTheDurabilityPragmas pins each
 // handle's synchronous mode; this pins the routing. While the appends run,
-// the FULL handle is a closed database, so any use of it fails. A timing
-// ratio against real F_FULLFSYNC commits proved the same thing but flaked on
-// shared macOS runners (#1230).
+// the FULL handle is a closed database, so any use of it fails. It does not
+// measure commit cost. A timing ratio against real F_FULLFSYNC commits did,
+// but flaked on shared macOS runners (#1230).
 func TestOutputAppendsDoNotPayAFullSyncEach(t *testing.T) {
 	spool, err := openLogSpool(t.TempDir(), "node-append-cost", 64<<20)
 	if err != nil {
@@ -83,11 +83,11 @@ func TestOutputAppendsDoNotPayAFullSyncEach(t *testing.T) {
 	}
 	full := spool.db
 	spool.db = closed
+	defer func() { spool.db = full }()
 	const appends = 500
 	for sequence := range appends {
 		event := spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(sequence), fmt.Sprintf("line %d\n", sequence))
 		if err := spool.append(t.Context(), event); err != nil {
-			spool.db = full
 			t.Fatalf("output append %d touched the FULL handle or failed: %v", sequence, err)
 		}
 	}
