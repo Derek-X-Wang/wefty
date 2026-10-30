@@ -57,9 +57,9 @@ and the Run token remain available. The Run and Job identity do not change.
 There is no new Job or Run state and no service binding. One-shot Slot occupancy
 ends with the old Attempt. Ordinary atomic claim alone creates the successor,
 with a fresh Attempt ID, fence, Lease and Attempt credential. Disabled Node
-admission holds queued work until the operator restores it. A Run that already
-started remains `running` while its Job recovers, under the existing L3
-projection rule.
+admission holds queued work until the operator restores it. Once L1 has recorded
+an Attempt's start, its Run stays `running` while its Job recovers, even if L3
+did not poll during that Attempt's running window.
 
 A controlled interruption requires explicit completion metadata and positive
 runtime quiescence evidence. It ends the Attempt as terminal `interrupted`,
@@ -91,8 +91,10 @@ budget or backoff sequence. The Job response's `restart` object reports
 `count`, `limit=10`, `pending`, and nullable `last_reason`,
 `previous_attempt_id`, `current_attempt_id`, `next_restart_at` and
 `terminal_reason`, from the same Read snapshot. Absent optional facts are
-null. Attempt summaries include `interruption_reason`; Node active Attempt
-summaries include `restartable` when true.
+null. Attempt summaries include `interruption_reason` and optional `started_at`
+(the UTC timestamp from L1's recorded start, omitted until that start is recorded);
+a pending restart or running Attempt state alone is not start evidence. Node
+active Attempt summaries include `restartable` when true.
 
 A one-shot job's secrets do not outlive its execution. The transaction that
 moves a one-shot to `succeeded` or `failed` -- completion, lease expiry, an

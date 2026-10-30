@@ -409,7 +409,8 @@ result. Restartable execution is at-least-once. A restartable command that ends
 while wefty is stopping its Attempt may run once more; the latest Attempt's
 result is the Run's verdict.
 Results belong to the latest Attempt. A restart preserves the Run and Job IDs;
-the Run stays `running` through recovery. `--max-runtime` bounds each Attempt.
+the Run stays `running` through recovery once L1 has recorded an Attempt's start,
+even if L3 missed its running window. `--max-runtime` bounds each Attempt.
 
 Use `--restartable` only for commands that are safe to repeat and harmless
 if two copies briefly overlap, for example read-only watchers. After a

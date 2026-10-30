@@ -41,6 +41,7 @@
       "result": {
         "exit_code": 0
       },
+      "started_at": "2026-08-09T10:00:00Z",
       "state": "succeeded",
       "updated_at": "2026-08-09T10:00:00Z"
     }

@@ -230,5 +230,17 @@ func (r *Reconciler) projectObservedJob(ctx context.Context, run projectedRun, j
 	if job.State == contract.JobFailed {
 		reason = JobFailureReason(job)
 	}
-	return r.store.projectJobOutcome(ctx, run, job.State, reason)
+	state := job.State
+	if job.Spec.Restartable && state == contract.JobQueued {
+		// L3 may have missed the entire running window before L1 requeued
+		// the Job. Only L1's recorded start proves progress, not a pending
+		// restart or the Attempt's state (renewal alone can mark it running).
+		for _, attempt := range job.Attempts {
+			if attempt.StartedAt != nil {
+				state = contract.JobRunning
+				break
+			}
+		}
+	}
+	return r.store.projectJobOutcome(ctx, run, state, reason)
 }
