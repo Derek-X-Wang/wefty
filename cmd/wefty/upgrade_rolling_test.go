@@ -304,9 +304,11 @@ func (f *rollingFixture) holdReady(t *testing.T, g agentinstall.Generation, boot
 	lifetime, err := f.install.StartupWithLifetime(g.ID, c.NodeID, g.Executable, rollingTestBoot)
 	mustRolling(t, err)
 	f.lifetimes[g.ID] = lifetime
+	// #1310: Bind to publication start; a later age window can reject slow writes.
+	started := time.Now()
 	mustRolling(t, f.install.PublishReady(g.ID, c.NodeID, g.Version, g.Executable, boot, rollingTestBoot))
 	if g.Role == "primary" {
-		_, err = f.install.BindReady(t.Context(), g.ID, agentinstall.Binding{PID: os.Getpid(), BootSessionID: boot, SystemBootID: rollingTestBoot}, time.Now().Add(-time.Second))
+		_, err = f.install.BindReady(t.Context(), g.ID, agentinstall.Binding{PID: os.Getpid(), BootSessionID: boot, SystemBootID: rollingTestBoot}, started)
 		mustRolling(t, err)
 	}
 }
