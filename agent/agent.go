@@ -469,6 +469,11 @@ func New(config Config) (*Agent, error) {
 	if session.ociBootBarrier != nil {
 		session.ociBootReady = make(chan struct{}, 1)
 		session.ociBootBarrier.SetLossHandler(func(_ ocihelper.HelperSession, lossErr error) {
+			// The first loss cause names the operation that ended the session;
+			// the errors that follow it are its fallout (#1128).
+			if logf != nil {
+				logf("OCI helper session lost: %v", lossErr)
+			}
 			capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), lossErr)
 		})
 	}
