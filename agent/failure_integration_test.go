@@ -867,6 +867,12 @@ func TestLostLeaseCompletionReconcilesAfterFreshServiceReadmission(t *testing.T)
 	if err := outbox.ensureAttempt(t.Context(), *first); err != nil {
 		t.Fatal(err)
 	}
+	// The attempt lifecycle owns a running attempt, and recovery leaves an
+	// owned attempt's completion alone until the lifecycle releases it. The
+	// sentinel's recovery worker scans again once it finishes, and on a slow
+	// runner that scan can come after the completion below is stored; an
+	// unowned attempt would then complete before its lease runs out (#1329).
+	outbox.ownAttempt(first.Lease.AttemptID)
 	completionFinishedAt := time.Now().UTC()
 	result := l1.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
 		Code: contract.RuntimeFailureUnavailable, Message: "helper generation lost under load",
@@ -910,7 +916,7 @@ func TestLostLeaseCompletionReconcilesAfterFreshServiceReadmission(t *testing.T)
 		t.Fatalf("fresh running service = %+v err=%v", freshRunning, err)
 	}
 
-	outbox.scheduleRecovery()
+	outbox.releaseAttempt(first.Lease.AttemptID, true)
 	var late l1.Attempt
 	deadline = time.Now().Add(5 * time.Second)
 	for {
