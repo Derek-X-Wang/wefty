@@ -170,11 +170,15 @@ func committedJobReadExpired(status int, body []byte) (string, bool) {
 }
 
 // createdJob decodes a create's answer, reading the committed job back when
-// only the post-change read expired.
-func createdJob(t *testing.T, h *integrationHarness, client *http.Client, status int, body []byte) Job {
+// only the post-change read expired. A service job's read needs its class.
+func createdJob(t *testing.T, h *integrationHarness, client *http.Client, class string, status int, body []byte) Job {
 	t.Helper()
 	if jobID, ok := committedJobReadExpired(status, body); ok {
-		status, _, body = h.readStatus(t.Context(), client, "/v1/jobs/"+jobID)
+		path := "/v1/jobs/" + jobID
+		if class != "" {
+			path += "?class=" + class
+		}
+		status, _, body = h.readStatus(t.Context(), client, path)
 		if status != http.StatusOK {
 			t.Fatalf("read back %s=%d %s", jobID, status, body)
 		}
@@ -185,17 +189,31 @@ func createdJob(t *testing.T, h *integrationHarness, client *http.Client, status
 }
 
 func TestCreatedJobReadsBackAfterPostChangeReadExpires(t *testing.T) {
-	h := newIntegrationHarness(t, nil)
-	client := h.client(fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}})
-	h.store.SetReadSnapshotHardLimitForTest(time.Nanosecond)
-	status, _, body := h.do(client, http.MethodPost, "/v1/jobs", validJobSpec("expired-read", nil))
-	jobID, ok := committedJobReadExpired(status, body)
-	if !ok {
-		t.Fatalf("forced expiry=%d %s", status, body)
-	}
-	h.store.SetReadSnapshotHardLimitForTest(10 * time.Second)
-	if job := createdJob(t, h, client, status, body); job.JobID != jobID {
-		t.Fatalf("read back %q, want %q", job.JobID, jobID)
+	for _, class := range []string{"", contract.JobClassService} {
+		t.Run(class, func(t *testing.T) {
+			h := newIntegrationHarness(t, nil)
+			identity := fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}}
+			spec := validJobSpec("expired-read", nil)
+			if class != "" {
+				spec = operatorServiceSpec("expired-read", nil)
+			}
+			encoded, err := json.Marshal(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Only this request's post-change read gets the 1 ns limit.
+			ctx := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, time.Nanosecond)
+			r := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewReader(encoded)).WithContext(context.WithValue(ctx, identityContextKey{}, identity))
+			w := httptest.NewRecorder()
+			h.server.createJob(w, r)
+			jobID, ok := committedJobReadExpired(w.Code, w.Body.Bytes())
+			if !ok {
+				t.Fatalf("forced expiry=%d %s", w.Code, w.Body.String())
+			}
+			if job := createdJob(t, h, h.client(identity), class, w.Code, w.Body.Bytes()); job.JobID != jobID {
+				t.Fatalf("read back %q, want %q", job.JobID, jobID)
+			}
+		})
 	}
 }
 
@@ -232,7 +250,7 @@ func TestJobsListingCursorWalkExcludesConcurrentInserts(t *testing.T) {
 					spec = operatorServiceSpec(key, nil)
 				}
 				status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
-				return createdJob(t, h, client, status, body)
+				return createdJob(t, h, client, class, status, body)
 			}
 			for i := 0; i < 7; i++ {
 				want = append(want, create(fmt.Sprintf("walk-%d", i)).JobID)
