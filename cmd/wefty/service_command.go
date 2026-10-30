@@ -381,7 +381,11 @@ func resolveServiceTarget(ctx context.Context, clients *apiClients, target strin
 		return nil, nil, lookupErr
 	}
 	if !found {
-		return nil, nil, computerErr
+		// All three lookups missed. Keep the Computer lookup's not_found,
+		// status and request ID, but name every kind of target tried (#1172).
+		missing := *responseErr
+		missing.APIError.Message = fmt.Sprintf("no service or Computer %q was found", target)
+		return nil, nil, &missing
 	}
 	return nil, &computer, nil
 }
