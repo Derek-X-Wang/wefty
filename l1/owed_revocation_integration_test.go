@@ -482,8 +482,13 @@ func TestHeartbeatAnswersInTimeWhileSettlementWritesAreLocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The rest of the heartbeat writes too, so it can finish only once the
-	// lock is gone; what must not happen is a wait on the busy timeout.
-	if elapsed > lockHeld+time.Second || elapsed >= ComputerPolicyClientTimeout {
+	// lock is gone: the whole-heartbeat time does not isolate the settlement
+	// lock waits. What this test checks is that the settlement stays
+	// deferred and lands on the next heartbeat, with the node client's
+	// timeout as the overall limit; a tighter wall-clock bound failed on a
+	// slow hosted runner (#1325). The settlement handle's own lock wait is
+	// checked by TestSettlementWritesNeverChangeTheMainPoolsLockWait.
+	if elapsed >= ComputerPolicyClientTimeout {
 		t.Fatalf("heartbeat took %s with SQLite locked for %s against a %s budget", elapsed, lockHeld, budget)
 	}
 	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 1 {
