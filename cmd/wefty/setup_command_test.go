@@ -301,7 +301,7 @@ func TestSetupInstallsTheDailyStackIntoACleanHome(t *testing.T) {
 	for _, label := range []string{setupL1Label, setupL3Label, setupNodeAgentLabel} {
 		want = append(want,
 			[]string{launchagent.Launchctl, "print", "gui/501/" + label},
-			[]string{launchagent.Launchctl, "enable", "gui/501/" + label},
+			[]string{launchagent.Launchctl, "print-disabled", "gui/501"},
 			[]string{launchagent.Launchctl, "bootstrap", "gui/501", launchagent.Path(fixture.home, label)},
 		)
 	}
@@ -349,7 +349,6 @@ func TestSetupSecondRunChangesNothingAndReloadsOnlyWhatChanged(t *testing.T) {
 		t.Helper()
 		want := [][]string{
 			{launchagent.Launchctl, "bootout", "gui/501/" + label},
-			{launchagent.Launchctl, "enable", "gui/501/" + label},
 			{launchagent.Launchctl, "bootstrap", "gui/501", launchagent.Path(fixture.home, label)},
 		}
 		if got := fixture.launchd.mutating(); !slices.EqualFunc(got, want, slices.Equal[[]string]) {
@@ -404,7 +403,7 @@ func TestSetupSecondRunChangesNothingAndReloadsOnlyWhatChanged(t *testing.T) {
 	// A service that is not loaded is loaded again, without a bootout.
 	delete(fixture.launchd.loaded, setupL3Label)
 	report = fixture.setup(t, setupRequest{})
-	if got := fixture.launchd.mutating(); len(got) != 2 || got[1][1] != "bootstrap" || !strings.HasSuffix(got[1][3], setupL3Label+".plist") {
+	if got := fixture.launchd.mutating(); len(got) != 1 || got[0][1] != "bootstrap" || !strings.HasSuffix(got[0][3], setupL3Label+".plist") {
 		t.Fatalf("repair commands = %v", got)
 	}
 	if actions := serviceActions(report); actions[setupL3Label] != launchagent.Loaded || actions[setupL1Label] != launchagent.Unchanged {
@@ -633,7 +632,7 @@ func TestSetupRetriesAReloadWhoseBootoutFailed(t *testing.T) {
 	if serviceActions(report)[setupL1Label] != launchagent.Reloaded {
 		t.Fatalf("retry actions = %v, commands %v", serviceActions(report), fixture.launchd.mutating())
 	}
-	if got := fixture.launchd.mutating(); len(got) != 3 || got[0][1] != "bootout" || got[2][1] != "bootstrap" {
+	if got := fixture.launchd.mutating(); len(got) != 2 || got[0][1] != "bootout" || got[1][1] != "bootstrap" {
 		t.Fatalf("retry commands = %v", got)
 	}
 }
