@@ -96,6 +96,7 @@ sweep_exec_storage_processes() {
     if [ "$platform" = Linux ]; then
       # Read a command name only for a matching cwd, not for every process.
       IFS= read -r name < "/proc/$pid/comm" 2>/dev/null || continue
+      names[i]=$name
     fi
     [ "$name" != wefty-agent ] || continue
     if kill -TERM "$pid" 2>/dev/null; then stopped[${#stopped[@]}]=$i
