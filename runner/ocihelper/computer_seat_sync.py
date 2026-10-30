@@ -342,9 +342,10 @@ def remove_stale_directory(parent_fd, name):
 def clear_stale_stages(state):
     global active_path
     # The lock excludes a live sync. Never follow a link, including one at
-    # the stage's root; these reserved names can only hold abandoned staging.
+    # the stage's root; these reserved names can only hold abandoned staging,
+    # or an atomic_json temporary a SIGKILL left before its rename (#1290).
     for name in os.listdir(state):
-        if not name.startswith('sync-'):
+        if not name.startswith(('sync-', '.sync-')):
             continue
         active_path = '.wefty/' + name
         info = metadata(state, name)
