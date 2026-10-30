@@ -81,15 +81,14 @@ func walkLogPages(t *testing.T, h *integrationHarness, client *http.Client, path
 
 // walkStoreJobLogs walks GetJobLogs from the beginning until an empty poll so
 // the result spans every stored row without depending on one page's cutoff.
-func walkStoreJobLogs(t *testing.T, h *integrationHarness, jobID string) LogPage {
+// A slow runner can return a few events per page, so the walk is bounded by
+// cursor progress, not by a poll count (#1304).
+func walkStoreJobLogs(t *testing.T, store *Store, jobID string) LogPage {
 	t.Helper()
 	var combined LogPage
 	var cursor string
-	for poll := 0; ; poll++ {
-		if poll > 250 {
-			t.Fatal("store log paging did not terminate")
-		}
-		page, err := testReads(h.store).GetJobLogs(context.Background(), jobID, cursor, MaxLogPageLimit)
+	for {
+		page, err := testReads(store).GetJobLogs(context.Background(), jobID, cursor, MaxLogPageLimit)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -98,6 +97,9 @@ func walkStoreJobLogs(t *testing.T, h *integrationHarness, jobID string) LogPage
 		combined.NextCursor = page.NextCursor
 		if len(page.Events) == 0 {
 			return combined
+		}
+		if page.NextCursor == cursor {
+			t.Fatal("store log paging did not advance its cursor")
 		}
 		cursor = page.NextCursor
 	}
