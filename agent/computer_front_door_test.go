@@ -280,6 +280,64 @@ func TestComputerFrontDoorKeepsPermanentDenialNonRetryable(t *testing.T) {
 	}
 }
 
+// TestComputerFrontDoorKeepsDenialAuditAcrossL1Outage: a denial audit write
+// that fails during an L1 outage does not end the Computer, and its count is
+// delivered by the next flush. Only the final flush at shutdown reports (#1263).
+func TestComputerFrontDoorKeepsDenialAuditAcrossL1Outage(t *testing.T) {
+	fixture, _, auditor, _, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantNone)
+	defer server.Close()
+	noReport := func(when string) {
+		t.Helper()
+		select {
+		case err := <-fixture.frontDoor.Errors():
+			t.Fatalf("%s: a denial audit failure was reported and would end the Computer: %v", when, err)
+		default:
+		}
+	}
+	auditor.mu.Lock()
+	auditor.failDenials = 1 << 20
+	auditor.mu.Unlock()
+	header := http.Header{}
+	header.Set(contract.ComputerPolicyRevisionHeader, "1")
+	_, response, err := websocket.Dial(t.Context(), "ws"+server.URL[len("http"):]+computerWebSocketPath,
+		&websocket.DialOptions{Subprotocols: []string{computerWebSocketSubprotocol}, HTTPHeader: header})
+	if err == nil || response == nil || response.StatusCode != http.StatusForbidden {
+		t.Fatalf("refusal = status=%v err=%v", response, err)
+	}
+	response.Body.Close()
+	fixture.frontDoor.recordDenial(t.Context(), identity, l1.ComputerTakeoverRevoked)
+	noReport("post-authorization denial")
+	fixture.frontDoor.denials.flush(t.Context())
+	noReport("denial flush")
+	if events := auditor.snapshot(); len(events) != 0 {
+		t.Fatalf("outage recorded events: %#v", events)
+	}
+	auditor.mu.Lock()
+	auditor.failDenials = 0
+	auditor.mu.Unlock()
+	fixture.frontDoor.denials.flush(t.Context())
+	got := map[l1.ComputerTakeoverReason]int64{}
+	for _, event := range auditor.snapshot() {
+		if event.Kind != l1.ComputerTakeoverAdmissionDenied || event.FabricID != identity.FabricID || event.UserID != identity.UserID || event.DeviceID != identity.DeviceID {
+			t.Fatalf("delivered denial = %#v", event)
+		}
+		got[event.Reason] += event.EventCount
+	}
+	if len(got) != 2 || got[l1.ComputerTakeoverUnauthorizedIdentity] != 1 || got[l1.ComputerTakeoverRevoked] != 1 {
+		t.Fatalf("denials after the outage = %v, want one unauthorized and one revoked", got)
+	}
+	auditor.mu.Lock()
+	auditor.failDenials = computerAuditAttempts
+	auditor.mu.Unlock()
+	fixture.frontDoor.denials.add(identity, l1.ComputerTakeoverInvalidRequestPath)
+	fixture.frontDoor.denials.flushFinal(t.Context(), true)
+	select {
+	case <-fixture.frontDoor.Errors():
+	default:
+		t.Fatal("a final denial flush that failed was not reported")
+	}
+}
+
 func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.T) {
 	started := time.Now()
 	_, cache, auditor, controlDials, server, identity := computerFrontDoorFixture(t, l1.ComputerGrantControl)
@@ -1069,6 +1127,9 @@ type recordingComputerAuditor struct {
 	blockKind       l1.ComputerTakeoverAuditEventKind
 	blockStarted    chan<- struct{}
 	blockRelease    <-chan struct{}
+	// failDenials refuses this many admission-denial writes, as during an
+	// L1 outage.
+	failDenials int
 }
 
 type closeObservedConn struct {
@@ -1126,6 +1187,10 @@ func (auditor *recordingComputerAuditor) AppendComputerTakeoverAudit(
 	}
 	auditor.mu.Lock()
 	defer auditor.mu.Unlock()
+	if request.Event.Kind == l1.ComputerTakeoverAdmissionDenied && auditor.failDenials > 0 {
+		auditor.failDenials--
+		return l1.ComputerTakeoverAuditReceipt{}, errors.New("injected L1 outage")
+	}
 	auditor.events = append(auditor.events, request.Event)
 	if auditor.changed != nil {
 		close(auditor.changed)

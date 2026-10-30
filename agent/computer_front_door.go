@@ -922,7 +922,9 @@ func (frontDoor *computerFrontDoor) recordDenial(ctx context.Context, identity f
 		PolicyRevision: frontDoor.config.authorizer.Revision(), OccurredAt: wallNow(frontDoor.config.clock).UTC().Round(0), Reason: reason, EventCount: 1,
 	}
 	if err := frontDoor.record(ctx, event); err != nil {
-		frontDoor.report(fmt.Errorf("record Computer admission denial: %w", err))
+		// A denial grants nothing, so a lost write must not end the Computer
+		// and its Seats; the next denial flush delivers it as a count (#1263).
+		frontDoor.denials.addCount(computerDenialKey{reason: reason, fabricID: identity.FabricID, userID: identity.UserID, deviceID: identity.DeviceID}, 1)
 	}
 }
 
@@ -957,12 +959,15 @@ func newComputerDenialCoalescer(frontDoor *computerFrontDoor) *computerDenialCoa
 }
 
 func (coalescer *computerDenialCoalescer) add(identity fabric.Identity, reason l1.ComputerTakeoverReason) {
-	key := computerDenialKey{reason: reason, fabricID: identity.FabricID, userID: identity.UserID, deviceID: identity.DeviceID}
+	coalescer.addCount(computerDenialKey{reason: reason, fabricID: identity.FabricID, userID: identity.UserID, deviceID: identity.DeviceID}, 1)
+}
+
+func (coalescer *computerDenialCoalescer) addCount(key computerDenialKey, count int64) {
 	coalescer.mu.Lock()
 	if _, exists := coalescer.counts[key]; !exists && len(coalescer.counts) >= maximumComputerDenialGroups {
-		key = computerDenialKey{reason: reason}
+		key = computerDenialKey{reason: key.reason}
 	}
-	coalescer.counts[key]++
+	coalescer.counts[key] += count
 	coalescer.mu.Unlock()
 }
 
@@ -973,7 +978,7 @@ func (coalescer *computerDenialCoalescer) run(ctx context.Context) {
 		case <-ctx.Done():
 			stopTimer(timer)
 			flushContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultComputerAuditFinalizationLimit)
-			coalescer.flush(flushContext)
+			coalescer.flushFinal(flushContext, true)
 			cancel()
 			return
 		case <-timer.C():
@@ -983,6 +988,13 @@ func (coalescer *computerDenialCoalescer) run(ctx context.Context) {
 }
 
 func (coalescer *computerDenialCoalescer) flush(ctx context.Context) {
+	coalescer.flushFinal(ctx, false)
+}
+
+// flushFinal sends every counted denial. A summary that cannot be recorded
+// goes back into the counts for the next flush instead of ending the
+// Computer (#1263); only the final flush at attempt shutdown reports it.
+func (coalescer *computerDenialCoalescer) flushFinal(ctx context.Context, final bool) {
 	coalescer.mu.Lock()
 	summaries := make([]computerDenialSummary, 0, len(coalescer.counts))
 	for key, count := range coalescer.counts {
@@ -1005,6 +1017,10 @@ func (coalescer *computerDenialCoalescer) flush(ctx context.Context) {
 			Reason: summary.key.reason, EventCount: summary.count,
 		}
 		if err := coalescer.frontDoor.record(ctx, event); err != nil {
+			if !final {
+				coalescer.addCount(summary.key, summary.count)
+				continue
+			}
 			coalescer.frontDoor.report(fmt.Errorf("record Computer admission denial summary: %w", err))
 		}
 	}
