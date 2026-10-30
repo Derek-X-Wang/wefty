@@ -104,12 +104,14 @@ func (engine *deadmanTestEngine) ReapAttempt(ctx context.Context, authority ocih
 }
 
 // ReapAttemptAsGuardian is the helper's own deadman expiry, distinct from a
-// reap the agent asked for.
+// reap the agent asked for. It records the reap before it signals expiry:
+// tests admit on that signal and then check the reaps (#1343).
 func (engine *deadmanTestEngine) ReapAttemptAsGuardian(ctx context.Context, authority ocihelper.AttemptAuthority) error {
+	err := engine.ReapAttempt(ctx, authority)
 	if !probeAttempt(authority) {
 		engine.expiredOnce.Do(func() { close(engine.expired) })
 	}
-	return engine.ReapAttempt(ctx, authority)
+	return err
 }
 
 func (engine *deadmanTestEngine) reapedAttempts() []string {
