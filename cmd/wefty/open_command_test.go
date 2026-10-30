@@ -126,11 +126,23 @@ func TestServiceStatusFleetUnavailableAddress(t *testing.T) {
 
 func TestOpenFleetPersonTunnelConcurrentAndShutdown(t *testing.T) {
 	for _, mode := range []string{"context-free-port", "context-default-port", "SIGINT", "SIGTERM"} {
-		t.Run(mode, func(t *testing.T) { testOpenFleetTunnel(t, mode) })
+		t.Run(mode, func(t *testing.T) {
+			// The default-port mode binds a port the test reserved and then
+			// closed, and another process can take it first. That one conflict
+			// is retried with a new port (#1242).
+			for range 3 {
+				if testOpenFleetTunnel(t, mode) {
+					return
+				}
+			}
+			t.Fatal("every reserved default port was taken before open bound it")
+		})
 	}
 }
 
-func testOpenFleetTunnel(t *testing.T, mode string) {
+// testOpenFleetTunnel reports false only when the default-port mode found its
+// reserved port taken before open bound it.
+func testOpenFleetTunnel(t *testing.T, mode string) bool {
 	t.Helper()
 	reservation, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -244,8 +256,10 @@ func testOpenFleetTunnel(t *testing.T, mode string) {
 		} else {
 			runErr = run(ctx, args, writer, io.Discard)
 		}
-		_ = writer.Close()
+		// done closes before the output ends, so a reader that sees the end
+		// of output also sees runErr.
 		close(done)
+		_ = writer.Close()
 	}()
 	t.Cleanup(func() {
 		stopOpen()
@@ -277,6 +291,11 @@ func testOpenFleetTunnel(t *testing.T, mode string) {
 		if json.Unmarshal([]byte(value), &ready) != nil || ready.Event != "ready" || ready.Service != ledger.jobID || ready.Node != "studio-0123abcd" || ready.RemotePort != remotePort || !strings.HasPrefix(ready.LocalURL, "http://127.0.0.1:") {
 			select {
 			case <-done:
+				if mode == "context-default-port" && commandExitCode(runErr) == 5 &&
+					strings.Contains(runErr.Error(), fmt.Sprintf("cannot listen on 127.0.0.1:%d;", remotePort)) {
+					t.Logf("reserved port %d was taken before open bound it; retrying with another", remotePort)
+					return false
+				}
 				t.Fatalf("open before ready: %v; ready=%q", runErr, value)
 			default:
 			}
@@ -357,6 +376,7 @@ func testOpenFleetTunnel(t *testing.T, mode string) {
 		conn.Close()
 		t.Error("port remained open after shutdown")
 	}
+	return true
 }
 
 type openLedger struct {
