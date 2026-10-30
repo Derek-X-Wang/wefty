@@ -4,6 +4,8 @@
 # base image, runtime layer, compatibility target, or security profile.
 ARG DEBIAN_IMAGE=docker.io/library/debian@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1
 ARG SOURCE_DATE_EPOCH=0
+# apt retries a snapshot.debian.org 503 3 times by default (7 s of backoff);
+# 10 retries add about 3 minutes of backoff, plus request time (#1100).
 
 FROM ${DEBIAN_IMAGE} AS neatvnc-build
 ARG SOURCE_DATE_EPOCH
@@ -14,8 +16,8 @@ RUN case "$TARGETARCH" in amd64) ninja_version=1.12.1-1 ;; arm64) ninja_version=
       'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260827T000000Z trixie main' \
       > /etc/apt/sources.list \
     && rm -f /etc/apt/sources.list.d/* \
-    && apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get install --yes --no-install-recommends \
+    && apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=10 update \
+    && apt-get -o Acquire::Retries=10 install --yes --no-install-recommends \
         build-essential=12.12 \
         ca-certificates=20250419 \
         curl=8.14.1-2+deb13u4 \
@@ -71,8 +73,8 @@ RUN case "$TARGETARCH" in \
       'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260827T000000Z trixie main' \
       > /etc/apt/sources.list \
     && rm -f /etc/apt/sources.list.d/* \
-    && apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get install --yes --no-install-recommends \
+    && apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=10 update \
+    && apt-get -o Acquire::Retries=10 install --yes --no-install-recommends \
         chromium=150.0.7871.100-1~deb13u1 \
         dbus-user-session=1.16.2-2 \
         fonts-dejavu-core=2.37-8 \
