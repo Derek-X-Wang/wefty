@@ -567,10 +567,11 @@ Seat command always has a limit and to use a positive `--max-runtime` for a
 longer limit. Placement refusals explain that the Seat decides the node and
 placement; restartability is refused because Seat state cannot be replayed.
 
-A missing local credential for `wefty exec --seat` returns the existing
-`forbidden` code (non-retryable, CLI exit 3), as for an unknown Seat
-credential. It includes `seat_id` in details and directs the caller to
-`wefty seat wait SEAT_ID`, before making any network call.
+A missing local credential for `wefty exec --seat`, `wefty seat release` or a
+Seat screen command (`wefty seat screenshot`, `click`, `move`, `drag`,
+`scroll`, `type`, `key`) returns the existing `forbidden` code
+(non-retryable, CLI exit 3), as for an unknown Seat credential. It includes `seat_id` in details and directs the
+caller to `wefty seat wait SEAT_ID`, before making any network call.
 
 `wefty seat view SEAT_ID` requires administrator person authority, without a
 Seat credential. Its read-only `viewer-target` discovery returns `admin_required`

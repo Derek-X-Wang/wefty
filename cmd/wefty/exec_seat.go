@@ -27,9 +27,7 @@ func executeSeatExec(ctx context.Context, clients *apiClients, id string, argv [
 		return err
 	}
 	if secret == "" {
-		return &apiResponseError{StatusCode: http.StatusForbidden, APIError: contract.APIError{
-			Code: contract.ErrorForbidden, Message: fmt.Sprintf("Seat credential is unavailable; wait again with wefty seat wait %s", id), Details: map[string]any{"seat_id": id},
-		}}
+		return seatCredentialUnavailable(id)
 	}
 	ctx, stopSignalContext := execSignalContext(ctx)
 	defer stopSignalContext()

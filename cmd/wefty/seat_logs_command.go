@@ -53,6 +53,14 @@ func loadSeatCredential(id string) (string, error) {
 	return "", nil // The original caller can read its log before a Seat is live.
 }
 
+// seatCredentialUnavailable is the refusal of a Seat command that needs the
+// local credential when none is stored, before any network call (#1271).
+func seatCredentialUnavailable(id string) error {
+	return &apiResponseError{StatusCode: http.StatusForbidden, APIError: contract.APIError{
+		Code: contract.ErrorForbidden, Message: fmt.Sprintf("Seat credential is unavailable; wait again with wefty seat wait %s", id), Details: map[string]any{"seat_id": id},
+	}}
+}
+
 func executeSeatLogs(ctx context.Context, clients *apiClients, jsonOutput bool, id, cursor string, limit, tail int, tailSet, follow, all bool, interval time.Duration, stdout, stderr io.Writer) error {
 	if !seatCLIIdentifier.MatchString(id) {
 		return usageError("invalid Seat ID")
