@@ -222,13 +222,13 @@ func TestComputerSnapshotStatusParity(t *testing.T) {
 				}
 			}
 			var job Job
-			err := diagnosticReadSnapshot(t, h.store, nil, func(reads readModel) error {
+			err := diagnosticReadSnapshot(t, t.Context(), h.store, nil, func(ctx context.Context, reads readModel) error {
 				var err error
-				job, err = reads.job(t.Context(), computer.CurrentJobID)
+				job, err = reads.job(ctx, computer.CurrentJobID)
 				if err != nil {
 					return err
 				}
-				job, err = reads.projectStatus(t.Context(), job)
+				job, err = reads.projectStatus(ctx, job)
 				return err
 			})
 			if err != nil || job.Status != scenario {
@@ -528,13 +528,13 @@ func TestComputerSnapshotNamedChangeUsesOneMoment(t *testing.T) {
 				t.Fatalf("clock reads=%d, want one write and one response", calls)
 			}
 			var job Job
-			err = diagnosticReadSnapshot(t, h.store, nil, func(reads readModel) error {
+			err = diagnosticReadSnapshot(t, t.Context(), h.store, nil, func(ctx context.Context, reads readModel) error {
 				var err error
-				job, err = reads.job(t.Context(), changed.CurrentJobID)
+				job, err = reads.job(ctx, changed.CurrentJobID)
 				if err != nil {
 					return err
 				}
-				job, err = reads.projectStatus(t.Context(), job)
+				job, err = reads.projectStatus(ctx, job)
 				return err
 			})
 			if err != nil || changed.CurrentJob.Status != job.Status || changed.CurrentJob.ServiceJob.NodeState != job.ServiceJob.NodeState {

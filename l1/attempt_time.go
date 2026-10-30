@@ -11,7 +11,7 @@ import (
 )
 
 // attemptClock pins the host boot and elapsed time alongside the transaction's
-// wall timestamp. Only the wall timestamp is exposed in records and replies.
+// wall timestamp. Replies expose wall timestamps and derived lease liveness.
 type attemptClock struct {
 	boot string
 	ns   int64
@@ -69,6 +69,16 @@ func attemptLeaseExpired(ctx context.Context, now time.Time, a attemptAuthority)
 		return a.leaseDeadlineNS <= clock.ns, nil
 	}
 	return !now.Before(a.leaseExpires), nil
+}
+
+func attemptLeaseLive(ctx context.Context, now time.Time, a attemptAuthority) (bool, error) {
+	switch a.state {
+	case contract.AttemptClaimed, contract.AttemptRunning, contract.AttemptAwaitingInput:
+		expired, err := attemptLeaseExpired(ctx, now, a)
+		return !expired && err == nil, err
+	default:
+		return false, nil
+	}
 }
 
 // attemptLeaseLiveSQL is the SQL form of attemptLeaseExpired's single policy.

@@ -2687,7 +2687,7 @@
       "Attempt": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["attempt_id", "node_id", "state", "lease_expires_at", "created_at", "updated_at"],
+        "required": ["attempt_id", "node_id", "state", "lease_expires_at", "lease_live", "created_at", "updated_at"],
         "properties": {
           "attempt_id": { "type": "string" },
           "node_id": { "type": "string" },
@@ -2701,6 +2701,7 @@
             "interrupted"
           ] },
           "lease_expires_at": { "type": "string", "format": "date-time" },
+          "lease_live": { "type": "boolean", "readOnly": true, "description": "True only for a nonterminal Attempt whose lease is live on L1's authority clock in this read snapshot. False also when elapsed-clock sampling fails; the read remains available. Clients must use this field instead of comparing lease_expires_at with their own clock. This is an observation, not execution authority." },
           "started_at": {
             "type": "string",
             "format": "date-time",
@@ -3687,7 +3688,8 @@
           "attempt_id",
           "state",
           "last_renewed_at",
-          "lease_expires_at"
+          "lease_expires_at",
+          "lease_live"
         ],
         "properties": {
           "observation_error": {
@@ -3730,6 +3732,11 @@
           "lease_expires_at": {
             "type": ["string", "null"],
             "format": "date-time"
+          },
+          "lease_live": {
+            "type": ["boolean", "null"],
+            "readOnly": true,
+            "description": "L1 authority-clock lease liveness in this read snapshot; false for terminal Attempts. Null when unavailable. Clients must not infer liveness from lease_expires_at or their own clock. Grants no execution authority."
           },
           "interruption_reason": {
             "enum": ["upgrade", "agent_shutdown", "lease_expired"]

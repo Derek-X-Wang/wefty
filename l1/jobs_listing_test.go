@@ -445,8 +445,8 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 				// Barrier coordination can outlast the production hold limit on
 				// a busy runner. Keep the anchored WAL view and production page
 				// method, with no deadline on this deliberate pause.
-				listErr = diagnosticReadSnapshot(t, store, nil, func(reads readModel) (err error) {
-					page, err = reads.jobsPage(t.Context(), jobListFilters{}, "", MaxJobListingPageLimit)
+				listErr = diagnosticReadSnapshot(t, t.Context(), store, nil, func(ctx context.Context, reads readModel) (err error) {
+					page, err = reads.jobsPage(ctx, jobListFilters{}, "", MaxJobListingPageLimit)
 					return err
 				})
 				close(listed)

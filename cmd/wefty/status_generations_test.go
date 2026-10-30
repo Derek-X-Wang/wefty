@@ -28,9 +28,36 @@ func generationStatusFixture(now time.Time, retiring int) l1.NodeList {
 	for i := 0; i < retiring; i++ {
 		at := now.Add(-time.Second)
 		retired := now.Add(-time.Minute)
-		node.Generations = append(node.Generations, l1.NodeGenerationObservation{AgentGenerationID: fmt.Sprintf("old-%d", i), Role: l1.NodeGenerationRetiring, Version: "old", CreatedAt: now.Add(-time.Hour), RetirementStartedAt: &retired, SelectedProtocol: 1, Attempts: []l1.NodeGenerationAttempt{{JobID: fmt.Sprintf("job-%d", i), AttemptID: fmt.Sprintf("attempt-%d", i), RunID: fmt.Sprintf("run-%d", i), State: generationAttemptState(contract.AttemptRunning), LastRenewedAt: &at, LeaseExpiresAt: generationDeadline(now.Add(time.Minute))}}})
+		node.Generations = append(node.Generations, l1.NodeGenerationObservation{AgentGenerationID: fmt.Sprintf("old-%d", i), Role: l1.NodeGenerationRetiring, Version: "old", CreatedAt: now.Add(-time.Hour), RetirementStartedAt: &retired, SelectedProtocol: 1, Attempts: []l1.NodeGenerationAttempt{{JobID: fmt.Sprintf("job-%d", i), AttemptID: fmt.Sprintf("attempt-%d", i), RunID: fmt.Sprintf("run-%d", i), State: generationAttemptState(contract.AttemptRunning), LastRenewedAt: &at, LeaseExpiresAt: generationDeadline(now.Add(time.Minute)), LeaseLive: generationLeaseLive(true)}}})
 	}
 	return l1.NodeList{Nodes: []l1.Node{node}}
+}
+
+func generationLeaseLive(live bool) *bool { return &live }
+
+func TestGenerationLeaseStatusIgnoresCLIClockSkew(t *testing.T) {
+	l1Now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		skew time.Duration
+		live bool
+		want string
+	}{
+		{"ahead-live", time.Hour, true, "healthy"},
+		{"behind-expired", -time.Hour, false, "degraded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var a l1.NodeGenerationAttempt
+			payload := fmt.Sprintf(`{"job_id":"job","attempt_id":"attempt","state":"running","lease_expires_at":%q,"lease_live":%t}`, l1Now.Add(time.Minute).Format(time.RFC3339Nano), tc.live)
+			if err := json.Unmarshal([]byte(payload), &a); err != nil {
+				t.Fatal(err)
+			}
+			g := projectGeneration(readyNode("node"), l1.NodeGenerationObservation{Role: l1.NodeGenerationRetiring, Attempts: []l1.NodeGenerationAttempt{a}}, l1Now.Add(tc.skew))
+			if g.RenewalHealth != tc.want {
+				t.Fatalf("L1 lease_live=%t, CLI skew=%s: health=%s want=%s", tc.live, tc.skew, g.RenewalHealth, tc.want)
+			}
+		})
+	}
 }
 
 func TestFreshAttemptRenewalStatusAndDoctor(t *testing.T) {
@@ -59,6 +86,9 @@ func TestFreshAttemptRenewalStatusAndDoctor(t *testing.T) {
 						JobID: "fresh-job", AttemptID: "fresh-attempt",
 						State: generationAttemptState(tc.state), LeaseExpiresAt: tc.lease,
 					}}
+					if tc.lease != nil {
+						nodes.Nodes[0].Generations[0].Attempts[0].LeaseLive = generationLeaseLive(tc.health == "healthy")
+					}
 					wantHealthy := tc.health == "healthy"
 					if entry == "status" {
 						h := newStatusHarness(t)
@@ -271,6 +301,7 @@ func TestRollingStatusTextAndJSONFixtures(t *testing.T) {
 		}},
 		{name: "stale-retiree", retiring: 1, reachable: true, state: "complete", problem: true, contains: "Run run-0 (Attempt attempt-0): stale renewal", mutate: func(n *l1.NodeList) {
 			n.Nodes[0].Generations[1].Attempts[0].LeaseExpiresAt = generationDeadline(now.Add(-time.Second))
+			n.Nodes[0].Generations[1].Attempts[0].LeaseLive = generationLeaseLive(false)
 		}},
 		{name: "interrupted-retiree", retiring: 1, reachable: true, state: "complete", problem: true, contains: "Run run-0 (Attempt attempt-0): interrupted", mutate: func(n *l1.NodeList) {
 			n.Nodes[0].Generations[1].Attempts[0].State = generationAttemptState(contract.AttemptInterrupted)

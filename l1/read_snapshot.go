@@ -147,14 +147,14 @@ func (r *databaseReads) job(ctx context.Context, id string) (Job, error) {
 	return job, err
 }
 func (r *databaseReads) attempts(ctx context.Context, id string) ([]Attempt, error) {
-	return listJobAttempts(ctx, r.q, id)
+	return listJobAttempts(ctx, r.q, id, r.at)
 }
 func (r *databaseReads) node(ctx context.Context, id string) (Node, error) {
 	value, ok := r.reads.nodes[id]
 	if !ok {
 		value.value, value.err = getNodeProjection(ctx, r.q, id, r.diagnosticObservations)
 		if value.err == nil && value.value.AgentGenerationID != "" {
-			value.value.Generations, value.err = readNodeGenerationObservations(ctx, r.q, id)
+			value.value.Generations, value.err = readNodeGenerationObservations(ctx, r.q, id, r.at)
 		}
 		r.reads.nodes[id] = value
 	}

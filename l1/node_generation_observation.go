@@ -37,11 +37,12 @@ type NodeGenerationAttempt struct {
 	TerminationInitiator contract.TerminationCause `json:"termination_initiator,omitempty"`
 	LastRenewedAt        *time.Time                `json:"last_renewed_at"`
 	LeaseExpiresAt       *time.Time                `json:"lease_expires_at"`
+	LeaseLive            *bool                     `json:"lease_live"`
 	InterruptionReason   InterruptionReason        `json:"interruption_reason,omitempty"`
 }
 
 // Called only inside the existing read snapshot, with its ReadOnly transaction.
-func readNodeGenerationObservations(ctx context.Context, q queryer, nodeID string) ([]NodeGenerationObservation, error) {
+func readNodeGenerationObservations(ctx context.Context, q queryer, nodeID string, now time.Time) ([]NodeGenerationObservation, error) {
 	recordErrors := map[string]string{}
 	inventory, err := readNodeGenerationInventory(ctx, q, nodeID, recordErrors)
 	if err != nil {
@@ -61,7 +62,7 @@ func readNodeGenerationObservations(ctx context.Context, q queryer, nodeID strin
 		// from its current boot and authority, as in the private inventory.
 
 		for _, resident := range g.ResidentAttempts {
-			a, err := readGenerationAttemptObservation(ctx, q, nodeID, resident)
+			a, err := readGenerationAttemptObservation(ctx, q, nodeID, resident, now)
 			if err != nil {
 				return nil, err
 			}
@@ -73,9 +74,9 @@ func readNodeGenerationObservations(ctx context.Context, q queryer, nodeID strin
 	return result, nil
 }
 
-func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID string, resident ResidentAttempt) (NodeGenerationAttempt, error) {
+func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID string, resident ResidentAttempt, now time.Time) (NodeGenerationAttempt, error) {
 	a := NodeGenerationAttempt{JobID: resident.JobID, AttemptID: resident.AttemptID}
-	rows, err := q.QueryContext(ctx, `SELECT a.state,a.last_renewal_ns,a.lease_expires_ns,COALESCE(a.interruption_reason,''),j.spec_json,j.outcome,a.result_json,COALESCE(a.termination_initiator,'') FROM attempts a JOIN jobs j ON j.job_id=a.job_id WHERE a.attempt_id=? AND a.job_id=? AND a.node_id=?`, resident.AttemptID, resident.JobID, nodeID)
+	rows, err := q.QueryContext(ctx, `SELECT a.state,a.last_renewal_ns,a.lease_expires_ns,COALESCE(a.interruption_reason,''),j.spec_json,j.outcome,a.result_json,COALESCE(a.termination_initiator,''),a.lease_boot_id,a.lease_deadline_ns FROM attempts a JOIN jobs j ON j.job_id=a.job_id WHERE a.attempt_id=? AND a.job_id=? AND a.node_id=?`, resident.AttemptID, resident.JobID, nodeID)
 	if err != nil {
 		return a, err
 	}
@@ -91,7 +92,8 @@ func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID str
 	var renewal sql.NullInt64
 	var expiry int64
 	var specJSON, resultJSON []byte
-	scanErr := rows.Scan(&state, &renewal, &expiry, &a.InterruptionReason, &specJSON, &a.JobOutcome, &resultJSON, &a.TerminationInitiator)
+	var authority attemptAuthority
+	scanErr := rows.Scan(&state, &renewal, &expiry, &a.InterruptionReason, &specJSON, &a.JobOutcome, &resultJSON, &a.TerminationInitiator, &authority.leaseBootID, &authority.leaseDeadlineNS)
 	// Database iteration failures invalidate the snapshot; conversion failures
 	// describe this one retained record and preserve its frozen identity.
 	if err := rows.Err(); err != nil {
@@ -120,6 +122,13 @@ func readGenerationAttemptObservation(ctx context.Context, q queryer, nodeID str
 	a.ExitCode = result.ExitCode
 	deadline := time.Unix(0, expiry).UTC()
 	a.LeaseExpiresAt = &deadline
+	authority.state, authority.leaseExpires = state, deadline
+	live, err := attemptLeaseLive(ctx, now, authority)
+	if err != nil {
+		a.ObservationError = fmt.Sprintf("Job %s (Attempt %s): Lease observation unavailable: %v", a.JobID, a.AttemptID, err)
+	} else {
+		a.LeaseLive = &live
+	}
 	if renewal.Valid {
 		at := time.Unix(0, renewal.Int64).UTC()
 		a.LastRenewedAt = &at

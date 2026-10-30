@@ -52,6 +52,7 @@
       "attempt_id": "ATTEMPT",
       "created_at": "2026-08-09T10:00:00Z",
       "lease_expires_at": "2026-08-09T10:00:00Z",
+      "lease_live": false,
       "node_id": "service-node",
       "state": "lost",
       "updated_at": "2026-08-09T10:00:00Z"
