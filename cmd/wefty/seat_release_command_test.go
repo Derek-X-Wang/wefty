@@ -45,4 +45,23 @@ func TestSeatReleaseRealBinary(t *testing.T) {
 			}
 		})
 	}
+	t.Run("missing credential", func(t *testing.T) {
+		missing := "seat_" + strings.Repeat("c", 32)
+		address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
+			t.Errorf("release without a credential reached L1: %s %s", r.Method, r.URL.Path)
+		})
+		code, out := runWefty(t, binary, 30*time.Second, "--l1", address, "--json", "seat", "release", missing)
+		assertSeatCredentialUnavailable(t, code, out, missing)
+	})
+}
+
+// assertSeatCredentialUnavailable checks the typed refusal a Seat command
+// gives when no local credential is stored (#1271).
+func assertSeatCredentialUnavailable(t *testing.T, code int, out, id string) {
+	t.Helper()
+	var document contract.ErrorResponse
+	if code != 3 || json.Unmarshal([]byte(out), &document) != nil || document.Error.Code != contract.ErrorForbidden ||
+		document.Error.Retryable || document.Error.Details["seat_id"] != id || !strings.Contains(document.Error.Message, "wefty seat wait "+id) {
+		t.Fatalf("missing credential exit=%d body=%s", code, out)
+	}
 }
