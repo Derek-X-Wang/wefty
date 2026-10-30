@@ -487,6 +487,14 @@ read-only filesystem and final-name symlink refusals return
 `seat_copy_write_denied`. Both use exit 1. An existing-folder failure says
 that DEST names the exact result path. Seat-to-Seat copies are refused.
 
+Helper `seat_operation_refused` errors with detail `seat_not_ready` or
+`generation_mismatch` return `seat_ended` if L1 reports that the Seat ended
+through copy lease renewal or the final receipt write. Otherwise they return
+`conflict` with `retryable=true`. The message keeps the helper detail and says
+the Seat is not ready or changed. Both codes use exit 5. The AI agent should
+wait and retry on `conflict`. The CLI does not retry the copy itself. Other
+copy failures and copy receipt outcomes and reasons keep their existing values.
+
 `Agent.Run` owns one shared Seat front-door listener on the node's logical
 Fabric service address (the enrolled participant name supplied by the Fabric,
 fixed port 80 in the private Fabric). Without a Fabric-supplied service

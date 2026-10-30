@@ -546,6 +546,14 @@ The CLI does not retry a transfer or
 ask a privileged process to bypass its sandbox. `seat_ended` remains exit 5
 and includes the reason from the retained Seat log.
 
+Helper `seat_operation_refused` errors with detail `seat_not_ready` or
+`generation_mismatch` return `seat_ended` when copy lease renewal or the final
+receipt write reports that the Seat ended. Otherwise they return `conflict`
+with `retryable=true`. The message keeps the helper detail and says the Seat
+is not ready or changed. Both codes use exit 5. The AI agent should wait and
+retry on `conflict`. The CLI does not retry the copy itself. Other error codes
+and copy receipt outcomes and reasons keep their existing values.
+
 Copy outcome metadata uses up to three retries within five seconds, with one
 CopyID, even after caller cancellation. A failed metadata delivery is reported
 as outcome unconfirmed. Copy-out remains `sent` until its local publication

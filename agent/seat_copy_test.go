@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -357,6 +358,7 @@ type retryLeaseCopyControl struct {
 	copyControlFixture
 	failures []error
 	always   error
+	finalErr error
 	calls    int
 	attempts chan error
 }
@@ -364,7 +366,7 @@ type retryLeaseCopyControl struct {
 func (c *retryLeaseCopyControl) RecordSeatCopy(ctx context.Context, id string, r l1.SeatCopyReceipt) error {
 	c.receipts = append(c.receipts, r)
 	if r.Outcome != "sending" {
-		return nil
+		return c.finalErr
 	}
 	c.calls++
 	if c.calls == 1 {
@@ -376,6 +378,75 @@ func (c *retryLeaseCopyControl) RecordSeatCopy(ctx context.Context, id string, r
 	}
 	c.attempts <- err
 	return err
+}
+
+func TestSeatCopyRuntimeFailures(t *testing.T) {
+	ended := &ProtocolError{StatusCode: http.StatusConflict, APIError: contract.APIError{Code: "seat_ended", Message: "Seat ended: released"}}
+	writeDenied := &ProtocolError{StatusCode: http.StatusForbidden, APIError: contract.APIError{Code: "seat_copy_write_denied", Message: "write denied"}}
+	refusal := func(detail ocihelper.ErrorDetail) error {
+		return &ocihelper.RPCError{Code: ocihelper.CodeSeatOperationRefused, Detail: detail, Message: "helper refused copy"}
+	}
+	for _, tc := range []struct {
+		name       string
+		runtimeErr error
+		renewalErr error
+		finalErr   error
+		code       contract.ErrorCode
+		message    string
+		retryable  bool
+	}{
+		{name: "live not ready", runtimeErr: refusal("seat_not_ready"), code: contract.ErrorConflict, message: "seat_not_ready", retryable: true},
+		{name: "live wrapped generation mismatch", runtimeErr: fmt.Errorf("copy: %w", refusal("generation_mismatch")), code: contract.ErrorConflict, message: "generation_mismatch", retryable: true},
+		{name: "live joined not ready", runtimeErr: errors.Join(io.ErrClosedPipe, refusal("seat_not_ready")), code: contract.ErrorConflict, message: "seat_not_ready", retryable: true},
+		{name: "ended renewal not ready", runtimeErr: refusal("seat_not_ready"), renewalErr: ended, code: "seat_ended", message: ended.APIError.Message},
+		{name: "ended renewal generation mismatch", runtimeErr: fmt.Errorf("copy: %w", refusal("generation_mismatch")), renewalErr: fmt.Errorf("renewal: %w", ended), code: "seat_ended", message: ended.APIError.Message},
+		{name: "ended receipt not ready", runtimeErr: refusal("seat_not_ready"), finalErr: ended, code: "seat_ended", message: ended.APIError.Message},
+		{name: "ended receipt generation mismatch", runtimeErr: refusal("generation_mismatch"), finalErr: ended, code: "seat_ended", message: ended.APIError.Message},
+		{name: "unrelated runtime failure", runtimeErr: errors.New("disk full"), code: "seat_copy_failed", message: "disk full"},
+		{name: "unrelated failure after end", runtimeErr: errors.New("disk full"), renewalErr: ended, code: "seat_copy_failed", message: "disk full"},
+		{name: "other helper refusal", runtimeErr: refusal("cleanup_not_confirmed"), code: "seat_copy_failed", message: "helper refused copy"},
+		{name: "other helper code", runtimeErr: &ocihelper.RPCError{Code: ocihelper.CodeInvalidRequest, Detail: "seat_not_ready", Message: "invalid request"}, code: "seat_copy_failed", message: "invalid request"},
+		{name: "L1 protocol error", runtimeErr: fmt.Errorf("copy: %w", writeDenied), code: "seat_copy_write_denied", message: "write denied"},
+		{name: "L1 receipt error", runtimeErr: refusal("seat_not_ready"), finalErr: writeDenied, code: "seat_copy_write_denied", message: "write denied"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := &seatLeaseTestClock{manualClock: newManualClock(time.Unix(0, 0)), scheduled: make(chan time.Duration, 100)}
+			control := &retryLeaseCopyControl{always: tc.renewalErr, finalErr: tc.finalErr, attempts: make(chan error, 100)}
+			runtime := copyRuntimeFunc(func(ctx context.Context, _ ocihelper.CopyComputerSeatRequest, _ io.Reader, _ func([]byte) error) (int64, error) {
+				if tc.renewalErr != nil {
+					<-ctx.Done()
+				}
+				return 0, tc.runtimeErr
+			})
+			handler := newSeatCopyHandlerWithClock(runtime, control, workloadrunner.AttemptAuthority{}, "computer", clock)
+			req := httptest.NewRequest(http.MethodPost, "/v1/seats/seat_00000000000000000000000000000001/copy?direction=out&path=file", nil).WithContext(t.Context())
+			req.Header.Set(l1.SeatCredentialHeader, "secret")
+			response := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() { defer close(done); handler.ServeHTTP(response, req) }()
+			if tc.renewalErr != nil {
+				if d := awaitSeatLeaseSchedule(t, clock, done); d != contract.SeatCopyHoldRenewal {
+					t.Fatalf("first renewal=%v", d)
+				}
+				clock.Advance(contract.SeatCopyHoldRenewal)
+			}
+			awaitSeatTestSignal(t, done)
+			var event l1.SeatCopyStreamEvent
+			if err := json.Unmarshal(response.Body.Bytes(), &event); err != nil {
+				t.Fatal(err)
+			}
+			if event.Error == nil || event.Error.Code != tc.code || event.Error.Retryable != tc.retryable || !strings.Contains(event.Error.Message, tc.message) {
+				t.Errorf("stream error=%+v want code=%s retryable=%v message containing %q", event.Error, tc.code, tc.retryable, tc.message)
+			}
+			if tc.retryable && event.Error != nil && (!strings.Contains(event.Error.Message, "Seat is not ready or changed") || !strings.Contains(event.Error.Message, "try again")) {
+				t.Errorf("missing Seat retry advice: %+v", event.Error)
+			}
+			first, last := control.receipts[0], control.receipts[len(control.receipts)-1]
+			if first.Outcome != "sending" || last.Outcome != "failed" || last.Reason != "copy_failed" || last.CopyID == "" || event.CopyID != last.CopyID || last.CopyID != first.CopyID {
+				t.Fatalf("copy receipt changed: %+v", control.receipts)
+			}
+		})
+	}
 }
 func startSeatLeaseTestCopy(t *testing.T, control *retryLeaseCopyControl) (*seatLeaseTestClock, chan struct{}, <-chan struct{}, *httptest.ResponseRecorder) {
 	t.Helper()
