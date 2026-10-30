@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -56,12 +57,14 @@ func TestTheLogSpoolCarriesTheDurabilityPragmas(t *testing.T) {
 	}
 }
 
-// TestOutputAppendsDoNotPayAFullSyncEach: NORMAL output appends must cost
-// much less per operation than appends through the FULL handle on the same
-// spool. Measure real F_FULLFSYNC commits instead of assuming a machine speed.
+// TestOutputAppendsDoNotPayAFullSyncEach: output appends write only through
+// the NORMAL append handle, never the FULL handle whose commits pay
+// F_FULLFSYNC on darwin. TestTheLogSpoolCarriesTheDurabilityPragmas pins each
+// handle's synchronous mode; this pins the routing. While the appends run,
+// the FULL handle is a closed database, so any use of it fails. A timing
+// ratio against real F_FULLFSYNC commits proved the same thing but flaked on
+// shared macOS runners (#1230).
 func TestOutputAppendsDoNotPayAFullSyncEach(t *testing.T) {
-	durable.EnableSQLiteFullFsyncForTests()
-	t.Cleanup(durable.DisableSQLiteFullFsyncForTests)
 	spool, err := openLogSpool(t.TempDir(), "node-append-cost", 64<<20)
 	if err != nil {
 		t.Fatal(err)
@@ -71,39 +74,27 @@ func TestOutputAppendsDoNotPayAFullSyncEach(t *testing.T) {
 	if err := spool.ensureAttempt(context.Background(), claim); err != nil {
 		t.Fatal(err)
 	}
+	closed, err := sql.Open("sqlite", logSpoolDSN(filepath.Join(t.TempDir(), "closed.db"), "FULL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := closed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	full := spool.db
+	spool.db = closed
 	const appends = 500
-	started := time.Now()
 	for sequence := range appends {
 		event := spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(sequence), fmt.Sprintf("line %d\n", sequence))
 		if err := spool.append(t.Context(), event); err != nil {
-			t.Fatal(err)
+			spool.db = full
+			t.Fatalf("output append %d touched the FULL handle or failed: %v", sequence, err)
 		}
 	}
-	elapsed := time.Since(started)
-	t.Logf("%d output appends on the production DSN took %s", appends, elapsed)
-	if runtime.GOOS != "darwin" {
-		t.Skip("the full-sync cost this bounds is darwin's F_FULLFSYNC; elsewhere fsync is cheap and the timing proves nothing")
-	}
-	const fullSyncs = 25
-	// Use the same append work for calibration: under -race its SQL and
-	// retention scan cost is significant even without a sync. The FULL handle
-	// also serves upload barriers, so each of these writes pays F_FULLFSYNC.
-	appendDB := spool.appendDB
-	spool.appendDB = spool.db
-	defer func() { spool.appendDB = appendDB }()
-	started = time.Now()
-	for sequence := range fullSyncs {
-		event := spoolTestEvent(claim.Lease.AttemptID, contract.LogStdout, uint64(appends+sequence), fmt.Sprintf("line %d\n", appends+sequence))
-		if err := spool.append(t.Context(), event); err != nil {
-			t.Fatal(err)
-		}
-	}
-	fullSyncElapsed := time.Since(started)
-	appendCost := elapsed / appends
-	fullSyncCost := fullSyncElapsed / fullSyncs
-	t.Logf("per operation: output append %s, FULL-handle append %s (%d commits took %s)", appendCost, fullSyncCost, fullSyncs, fullSyncElapsed)
-	if appendCost >= fullSyncCost/2 {
-		t.Fatalf("output append cost %s/op (%d appends took %s), want less than half of FULL sync cost %s/op (%d commits took %s); appends must not pay a full sync each", appendCost, appends, elapsed, fullSyncCost, fullSyncs, fullSyncElapsed)
+	spool.db = full
+	var stored int
+	if err := full.QueryRowContext(t.Context(), "SELECT count(*) FROM spool_events WHERE attempt_id=?", claim.Lease.AttemptID).Scan(&stored); err != nil || stored != appends {
+		t.Fatalf("stored %d output events (err %v), want %d", stored, err, appends)
 	}
 }
 
