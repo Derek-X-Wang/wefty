@@ -224,6 +224,106 @@ signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
 	requireNoSeatCopyStaging(t, parent)
 }
 
+// A full stdout pipe must not hide SIGTERM from the packing thread (#1287).
+// The watcher inherits an unblocked mask before the main thread blocks SIGTERM.
+func TestSeatCopyProgramSignalWhileStdoutBlocked(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "file")
+	if err = os.WriteFile(source, make([]byte, 1<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	prefix := seatCopyStackDump + `import os, signal, sys, threading, time
+main = threading.get_ident()
+def at_stdout_write(frame):
+    # The fixed program waits in Output.write; the old program waits in
+    # tarfile's stream writer itself, inside the buffered stdout write.
+    if frame.f_code.co_name == 'write' and frame.f_code.co_filename == '<string>':
+        frame = frame.f_back
+    return frame.f_code.co_name == '__write' and frame.f_code.co_filename.endswith('tarfile.py')
+def watch():
+    last, still = None, 0
+    while still < 5:
+        time.sleep(0.02)
+        frame = sys._current_frames()[main]
+        where = (id(frame), frame.f_lasti) if at_stdout_write(frame) else None
+        still, last = (still + 1 if where is not None and where == last else 0), where
+    os.write(3, b'PARKED\n')
+    threading.Event().wait()
+threading.Thread(target=watch, daemon=True).start()
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+`
+	child := exec.Command(python, "-I", "-S", "-c", prefix+seatCopyProgram, "out", source)
+	output, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close() // Keep stdout open without reading, so its pipe fills.
+	handshake, ready, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handshake.Close()
+	defer ready.Close()
+	child.ExtraFiles = []*os.File{ready}
+	var stderr bytes.Buffer
+	child.Stderr = &stderr
+	deadline := time.Now().Add(seatCopyHandshakeBound)
+	if err = child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer child.Process.Kill()
+	if err = ready.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readSeatCopyHandshake(t, child, handshake, "PARKED\n", deadline, &stderr)
+	terminateSeatCopyChild(t, child, &stderr)
+	if code := child.ProcessState.ExitCode(); code != 1 {
+		t.Fatalf("cancelled pack exit=%d %s", code, stderr.String())
+	}
+}
+
+func TestSeatCopyProgramPackShortWrites(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "file")
+	if err = os.WriteFile(source, bytes.Repeat([]byte("short writes\n"), 4096), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var want, got, stderr bytes.Buffer
+	pack := exec.Command(python, "-I", "-S", "-c", seatCopyProgram, "out", source)
+	pack.Stdout, pack.Stderr = &want, &stderr
+	if err = pack.Run(); err != nil {
+		t.Fatalf("pack: %v %s", err, stderr.String())
+	}
+	// Force both partial writes and a full pipe after a writable select (#1287).
+	prefix := `import os
+real_write, writes = os.write, 0
+def short_write(fd, data):
+    global writes
+    if fd == 1:
+        writes += 1
+        if writes == 1:
+            raise BlockingIOError()
+        data = data[:37]
+    return real_write(fd, data)
+os.write = short_write
+`
+	pack = exec.Command(python, "-I", "-S", "-c", prefix+seatCopyProgram+"\nassert writes > 1\n", "out", source)
+	stderr.Reset()
+	pack.Stdout, pack.Stderr = &got, &stderr
+	if err = pack.Run(); err != nil {
+		t.Fatalf("pack with short writes: %v %s", err, stderr.String())
+	}
+	if !bytes.Equal(got.Bytes(), want.Bytes()) {
+		t.Fatalf("short writes changed tar stream: got %d bytes, want %d", got.Len(), want.Len())
+	}
+}
+
 // seatCopyHandshakeBound covers child startup and its handshake line.
 const seatCopyHandshakeBound = 30 * time.Second
 

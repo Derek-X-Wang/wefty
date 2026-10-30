@@ -10,7 +10,8 @@ import signal
 # Python runs this handler only between bytecodes in the main thread. A
 # SIGTERM caught just before a blocking read, or by another thread, would
 # leave that read waiting with the staging folder in place (#1283). The
-# wakeup pipe makes such a signal visible to the input select below.
+# wakeup pipe makes such a signal visible to the input select below, and
+# to the output select when packing into a full pipe (#1287).
 WAKE, wake_write = os.pipe()
 os.set_blocking(WAKE, False)
 os.set_blocking(wake_write, False)
@@ -45,6 +46,28 @@ class Input:
         data = self.data[self.offset:self.offset + size]
         self.offset += len(data)
         return data
+
+
+class Output:
+    # Writes stdout without trapping a pending signal in a full pipe (#1287).
+    def __init__(self, fd):
+        self.fd = fd
+        os.set_blocking(fd, False)
+
+    def write(self, data):
+        size = len(data)
+        data = memoryview(data)
+        while data:
+            ready = select.select([WAKE], [self.fd], [])[0]
+            if WAKE in ready:
+                # Keep the wake byte: tarfile can write again while unwinding.
+                sys.exit(1)
+            try:
+                written = os.write(self.fd, data)
+            except BlockingIOError:
+                continue
+            data = data[written:]
+        return size
 
 
 def remove_tree(name, parent):
@@ -151,7 +174,7 @@ def pack(source):
         info.uname = info.gname = ''
         size += info.size if info.isfile() else 0
         return info
-    with tarfile.open(fileobj=sys.stdout.buffer, mode='w|', dereference=True, format=tarfile.PAX_FORMAT) as archive:
+    with tarfile.open(fileobj=Output(sys.stdout.fileno()), mode='w|', dereference=True, format=tarfile.PAX_FORMAT) as archive:
         stack = [(source, 'item')]
         while stack:
             source_path, archive_path = stack.pop()
