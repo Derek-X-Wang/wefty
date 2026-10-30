@@ -139,7 +139,7 @@ func TestLogReplayIsIdempotentAndRawJSONLMatchesRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	page := walkStoreJobLogs(t, h, job.JobID)
+	page := walkStoreJobLogs(t, h.store, job.JobID)
 	var rows bytes.Buffer
 	for _, event := range page.Events {
 		encoded, err := json.Marshal(event)
@@ -219,7 +219,7 @@ func TestLogBytesPreserveLongPartialAndInvalidUTF8Data(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("append status = %d body=%s", status, body)
 	}
-	page := walkStoreJobLogs(t, h, job.JobID)
+	page := walkStoreJobLogs(t, h.store, job.JobID)
 	want := bytes.Join([][]byte{longLine, partial, invalidUTF8}, nil)
 	if got := joinLogStream(page.Events, contract.LogStdout); !bytes.Equal(got, want) {
 		t.Fatalf("round-tripped bytes differ: got %d bytes, want %d", len(got), len(want))
