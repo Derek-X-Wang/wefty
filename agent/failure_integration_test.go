@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -3271,6 +3272,110 @@ func TestAgentConsumesRenewalDirectivesWithoutDaemonExit(t *testing.T) {
 	}
 }
 
+func TestAgentClaimsResumeBeforeHeartbeatAfterDisabledRegistration(t *testing.T) {
+	start := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	clock := newManualClock(start)
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "claims-resume.sqlite"), l1.StoreOptions{Clock: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	participant := &mutableWhoIsFabric{identity: fabric.Identity{NodeID: "agent", FabricID: "plain-claims-resume", Tags: []string{l1.DefaultAgentPrincipalTag}}}
+	policy := l1.NodePolicy{Tags: []string{"linux"}, MaxOneshotSlots: 1}
+	server, err := l1.NewServer(participant, store, l1.ServerConfig{NodePolicies: map[string]l1.NodePolicy{"node": policy}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := newClient(participant, "wefty://control-plane", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var heartbeats atomic.Int32
+	client.httpClient.Transport = captureRoundTrip(func(request *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(request.URL.Path, "/heartbeat") {
+			heartbeats.Add(1)
+		}
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, request)
+		return recorder.Result(), nil
+	})
+	registration := contract.NodeRegistration{
+		NodeID: "node", BootSessionID: "boot", OS: "linux", Architecture: "arm64", AgentVersion: "test",
+		Capabilities:       map[string]bool{"kind:process": true},
+		CapabilityRevision: 1, CapabilityObservedAt: start, MissingCapabilities: []string{},
+	}
+	if _, err := client.Register(t.Context(), registration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetNodeClaimsByOperator(t.Context(), "node", "operator", l1.NodeIntentRequest{
+		ClaimsEnabled: false, IntentRevision: 0, Reason: "maintenance",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job := createAgentTestJob(t, store, "claims-resume-before-heartbeat")
+	session := newAgentSession(client, registration, newCapabilityState(registration.Capabilities, nil, clock, 0, nil),
+		DefaultHeartbeatInterval, DefaultClaimInterval, clock, newLifecycleObserver(clock), t.Logf, 1, 0)
+	defer session.close()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	started := make(chan string, 1)
+	go func() {
+		done <- session.run(ctx, func(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
+			started <- claim.Job.JobID
+			<-ctx.Done()
+			return errorDestinationUnclassified, nil
+		})
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("session shutdown: %v", err)
+			}
+		case <-time.After(testwait.Bound):
+			t.Error("session did not stop")
+		}
+	}()
+	// The production session has registered under disabled intent and reached
+	// its first idle claim wait. The queued job must remain unstarted.
+	if err := awaitFixtureCondition(t.Context(), "claim wait after disabled registration", func() bool {
+		return clock.claimWaitArmed(start.Add(DefaultClaimInterval))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(started) != 0 {
+		t.Fatal("job started while claims were disabled")
+	}
+	if _, err := store.SetNodeClaimsByOperator(t.Context(), "node", "operator", l1.NodeIntentRequest{
+		ClaimsEnabled: true, IntentRevision: 1, Reason: "maintenance over",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for second := 1; second <= 2; second++ {
+		clock.advanceClaimWait(time.Second)
+		if err := awaitFixtureCondition(t.Context(), "job start or next idle claim wait", func() bool {
+			return len(started) != 0 || clock.claimWaitArmed(clock.Now().Add(DefaultClaimInterval))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case jobID := <-started:
+			if jobID != job.JobID {
+				t.Fatalf("started job = %q, want %q", jobID, job.JobID)
+			}
+			if heartbeats.Load() != 0 {
+				t.Fatalf("claims resumed after %d heartbeats, want zero", heartbeats.Load())
+			}
+			t.Logf("claims resumed after %s without a heartbeat", clock.Now().Sub(start))
+			return
+		default:
+		}
+	}
+	t.Fatalf("re-enabled claims did not start the queued job within 2 simulated seconds; heartbeats=%d", heartbeats.Load())
+}
+
 func TestAgentHeartbeatClaimsDisabledStopsNewClaims(t *testing.T) {
 	network := plain.NewNetwork()
 	store, stopServer := startFailureServer(t, network, nil, map[string][]string{"node-1": {"linux"}})
@@ -3389,7 +3494,7 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaimsWithFreeSlot(t *testing.T) {
 	}
 	assertClaimsDisabledHolds("before the heartbeat")
 
-	// Second 15: the heartbeat delivers the intent; the claim loop idles locally.
+	// Second 15: the heartbeat delivers the intent; L1 keeps refusing new work.
 	clock.Advance(DefaultClaimInterval)
 	waitForClaimTick(t, clock, done, start.Add(16*DefaultClaimInterval))
 	runner.release(residentAttemptID)
@@ -3407,8 +3512,7 @@ func TestAgentHeartbeatClaimsDisabledStopsNewClaimsWithFreeSlot(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// The agent learns the re-enabled intent from the next heartbeat (second
-	// 30) and resumes claiming on the following claim tick.
+	// The next idle claim tick can resume work without waiting for a heartbeat.
 	var resumedAttemptID string
 	for step := 0; step < 30 && resumedAttemptID == ""; step++ {
 		clock.Advance(DefaultClaimInterval)
