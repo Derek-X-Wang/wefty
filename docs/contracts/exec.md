@@ -507,8 +507,16 @@ generations cannot collide. The plain Fabric maps that name to an ephemeral
 loopback endpoint. Clients dial the endpoint published by L1's copy-target
 route, not the private logical registration name. The participant name need
 not equal the registered Wefty node ID. A listener startup failure is logged
-and leaves the Seat door unavailable: Seat-request Computers refuse readiness,
-while node registration and non-Seat work continue.
+once, then the node agent retries in the background until the door opens or
+`Agent.Run` ends. Retry backoff starts at 1 second, doubles, and is capped at
+30 seconds. While the door is closed, Seat-request Computer Attempts fail
+before runtime start with typed `runtime_unavailable`; L1 applies infrastructure
+backoff and preserves the restart streak. Attempts read the current door, so
+recovery needs no node agent restart. Recovery is logged once. Node registration
+and non-Seat work continue. The configured Seat capability stays advertised.
+Retries are canceled and joined when `Agent.Run` ends, including cleanup of a
+listener that opens during shutdown. A recovered door's server exit still ends
+`Agent.Run`, with its error included in the returned error.
 Each Computer Attempt registers a feature mux and binds only Seat IDs from its
 fenced L1 wanted list. Copies, Seat Runs and per-Seat screens share this same
 listener; unknown paths and unbound Seats are refused. The generated

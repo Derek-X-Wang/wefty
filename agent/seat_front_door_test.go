@@ -462,7 +462,7 @@ func TestSeatFrontDoorListenFailureKeepsNodeSessionRunning(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("node did not register")
 	}
-	if node.seatDoor != nil {
+	if node.currentSeatFrontDoor() != nil {
 		t.Fatal("failed listener left a Seat door")
 	}
 	if _, err := store.GetNode(t.Context(), "door-unavailable"); err != nil {
