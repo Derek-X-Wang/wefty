@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
@@ -76,6 +77,73 @@ func startSeatFrontDoor(ctx context.Context, f fabric.Fabric, node string) (*sea
 	}()
 	return door, func() { _ = server.Close(); <-door.done }, nil
 }
+
+// #1254: Run owns retries and the recovered server in the same child scope.
+// The first listen stays synchronous; retries cannot hold up non-Seat work.
+func (a *Agent) startSeatFrontDoorRecovery(ctx context.Context, cancelRun context.CancelFunc) <-chan error {
+	stopped := make(chan error, 1)
+	a.setSeatFrontDoor(nil)
+	if a.fabric == nil {
+		stopped <- nil
+		return stopped
+	}
+	door, closeDoor, err := startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID)
+	if err != nil {
+		a.log("Seat front door unavailable; node retries in the background: %v", err)
+	} else {
+		a.setSeatFrontDoor(door)
+	}
+	go func() {
+		delay := time.Second
+		recovering := err != nil
+		for err != nil {
+			timer := a.clock.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				stopTimer(timer)
+				stopped <- nil
+				return
+			case <-timer.C():
+			}
+			stopTimer(timer)
+			if ctx.Err() != nil {
+				stopped <- nil
+				return
+			}
+			door, closeDoor, err = startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID)
+			delay = min(delay*2, 30*time.Second)
+		}
+		if ctx.Err() == nil {
+			if recovering {
+				a.setSeatFrontDoor(door)
+				a.log("Seat front door opened after retry")
+			}
+			select {
+			case <-door.done:
+				cancelRun()
+			case <-ctx.Done():
+			}
+		}
+		// Listen has no context argument. Even a listener returned after Run
+		// cancellation belongs to this worker and must be closed and joined.
+		closeDoor()
+		stopped <- door.serveErr
+	}()
+	return stopped
+}
+
+func (a *Agent) currentSeatFrontDoor() *seatFrontDoor {
+	a.seatDoorMu.RLock()
+	defer a.seatDoorMu.RUnlock()
+	return a.seatDoor
+}
+
+func (a *Agent) setSeatFrontDoor(door *seatFrontDoor) {
+	a.seatDoorMu.Lock()
+	defer a.seatDoorMu.Unlock()
+	a.seatDoor = door
+}
+
 func (d *seatFrontDoor) register(ctx context.Context, computer, attempt string, h http.Handler) (*seatFrontDoorRegistration, error) {
 	if d == nil || ctx.Err() != nil || h == nil {
 		return nil, errors.New("Seat front door or Attempt unavailable")
