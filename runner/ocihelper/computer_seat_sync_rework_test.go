@@ -166,10 +166,18 @@ func TestSeatSyncCleansStaleStagesWithoutFollowingLinks(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(state, "sync-link")); err != nil {
 		t.Fatal(err)
 	}
+	// A SIGKILL between atomic_json's create and rename leaves its temporary.
+	temporary := filepath.Join(state, ".sync-0123456789abcdef0123456789abcdef")
+	if err := os.WriteFile(temporary, []byte(`{"partial":`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(state, ".sync-link")); err != nil {
+		t.Fatal(err)
+	}
 	if out, err := runSyncFixture(t, base, syncFixtureArchive(t, syncFixtureFile{"x", "ready", "", 0644})); err != nil {
 		t.Fatalf("sync: %v %s", err, out)
 	}
-	for _, name := range []string{stage, filepath.Join(state, "sync-link")} {
+	for _, name := range []string{stage, filepath.Join(state, "sync-link"), temporary, filepath.Join(state, ".sync-link")} {
 		if _, err := os.Lstat(name); !os.IsNotExist(err) {
 			t.Fatalf("stale stage remained: %s %v", name, err)
 		}
