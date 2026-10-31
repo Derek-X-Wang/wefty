@@ -55,6 +55,7 @@ func cancellationStatusNodes(t *testing.T, outcome string, extra contract.Attemp
 }
 
 func TestCancelledRetiringRunDiagnostics(t *testing.T) {
+	t.Parallel()
 	binary := buildPlainInstallCLI(t)
 	exit17, exit143, exit0 := 17, 143, 0
 	for _, tc := range []struct {
@@ -296,6 +297,7 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 }
 
 func TestCancelledRetiringRunPreservesAttemptProblems(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name             string
 		state            contract.AttemptState

@@ -116,6 +116,7 @@ func assertRetryRunCount(t *testing.T, store *l3.Store, count int) {
 }
 
 func TestRunRetryAfterTimeoutFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	for _, verb := range []string{"submit", "rerun"} {
 		t.Run(verb, func(t *testing.T) {
@@ -172,6 +173,7 @@ func TestRunRetryAfterTimeoutFromRealBinary(t *testing.T) {
 }
 
 func TestRunAgainExplicitKeyFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	for _, verb := range []string{"submit", "rerun"} {
 		t.Run(verb, func(t *testing.T) {
@@ -220,6 +222,7 @@ func TestRunAgainExplicitKeyFromRealBinary(t *testing.T) {
 }
 
 func TestSubmitCanonicalRequestKey(t *testing.T) {
+	t.Parallel()
 	script := filepath.Join(t.TempDir(), "program.sh")
 	alias := filepath.Join(t.TempDir(), "same-program.sh")
 	for _, path := range []string{script, alias} {
@@ -302,6 +305,7 @@ func TestSubmitCanonicalRequestKey(t *testing.T) {
 // Exercise derived and explicit keys through independent Fabric identities.
 // On rerun, the node races ahead of the owner on the owner's source run.
 func TestRunActorScopedKeysFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	for _, explicit := range []bool{false, true} {
 		for _, verb := range []string{"submit", "rerun"} {

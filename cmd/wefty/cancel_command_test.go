@@ -11,6 +11,7 @@ import (
 )
 
 func TestCancelExitCodesFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	for _, test := range []struct {
 		name   string
@@ -54,6 +55,7 @@ func TestCancelExitCodesFromRealBinary(t *testing.T) {
 }
 
 func TestCancelRunExitCodesFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	for _, test := range []struct {
 		name   string
