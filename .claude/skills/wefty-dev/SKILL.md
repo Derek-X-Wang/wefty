@@ -32,6 +32,27 @@ cd workflows/dogfood && npm ci && npm run lint && npm run typecheck && npm test 
 Never pipe test output through `tail`/`grep` in a way that masks the exit
 code — a `| tail -1` once put a red suite on public main.
 
+### Sandboxed checks and host checks
+
+`GOFLAGS=-p=2 go test ./l1/... -count=1 -timeout 60m` can run in a sandbox
+that blocks the host boot-identity read (`kern.bootsessionuuid` on macOS).
+The l1 TestMain supplies a fixed test boot identity and keeps real elapsed
+time. Explicitly injected clocks keep their own identity. The strict-path
+test `TestStoreSystemClockBootIdentity` reads the real host identity and
+verifies that OpenStore refuses an unavailable identity before it skips
+the host success path for a permission denial. The injected-failure test
+`TestAttemptLeaseBootIdentityFailureRefusesOpen` always runs.
+
+Run the full Go test gate on the host. `./cmd/wefty` tests launch production
+`wefty-l1` binaries, which require the real host boot identity. `./agent`
+also launches production `wefty-l1` and `wefty-agent` binaries; its in-process
+L1 stores and managed-root process inventory can read the host identity too.
+An l1 test clock does not change those binaries or other packages' tests.
+If the sandbox denies that read, report these host checks as NOT-RUN and
+hand them to the host session. Never send a sandbox-denied command through
+`wefty exec`. Product binaries have no boot-check bypass flag or environment
+variable. A passing l1 subset does not replace the full gates above.
+
 ## Hard rules
 
 - **Fabric seam**: no `tailscale.com/...` import outside `fabric/tsnet`; no

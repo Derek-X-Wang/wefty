@@ -9,11 +9,19 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/durable"
 )
 
+// Keep real wall and elapsed time, but let store tests run where the sandbox
+// denies the host boot-identity read. Strict-path tests pass systemClock{}
+// explicitly. This clock and the replacement below exist only in test builds.
+type storeTestClock struct{ systemClock }
+
+func (storeTestClock) BootIdentity() (string, error) { return "l1-test-boot", nil }
+
 // TestMain opens every test store without F_FULLFSYNC, which makes this
 // suite several times slower on darwin and proves nothing a test asserts: no
 // test cuts power. Production DSNs always carry it; the pragma tests
 // re-enable it and assert exactly that (#599).
 func TestMain(main *testing.M) {
+	defaultStoreClock = storeTestClock{}
 	durable.DisableSQLiteFullFsyncForTests()
 	// Test-only slow-machine simulation; no production environment knob.
 	if value := os.Getenv("WEFTY_TEST_READ_PAGE_CUTOFF"); value != "" {

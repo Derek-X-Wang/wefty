@@ -150,6 +150,10 @@ type Store struct {
 	reconcileLivenessForTest func(context.Context, *sql.Tx, time.Time) (int64, error)
 }
 
+// defaultStoreClock is replaced only by TestMain in this package's tests.
+// Product stores always default to the strict host boot-identity reader.
+var defaultStoreClock Clock = systemClock{}
+
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
 // schema. path should name a file so queue concurrency has production SQLite
 // semantics rather than an in-memory approximation.
@@ -159,7 +163,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	clock := options.Clock
 	if clock == nil {
-		clock = systemClock{}
+		clock = defaultStoreClock
 	}
 	leaseDuration := options.LeaseDuration
 	if leaseDuration <= 0 {
