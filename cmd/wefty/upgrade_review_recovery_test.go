@@ -56,7 +56,6 @@ func TestLegacyRecoveryRemovesOriginalAutostartAfterUnloadInterruption(t *testin
 func TestLegacyRecoveryResumesPartialInitialization(t *testing.T) {
 	for _, phase := range []string{"intent_recorded", "root_created", "generation_directory_created", "executable_staging_created", "executable_staging_synced", "executable_published_before_sync", "executable_staging_removed", "executable_directory_synced", "executable_created", "catalog_staging_created", "catalog_staging_synced", "catalog_published_before_sync", "catalog_staging_removed", "catalog_published"} {
 		t.Run(phase, func(t *testing.T) {
-			t.Parallel()
 			f := newRollingFixtureWithLegacy(t, true)
 			enableRollingRecoveryFixture(t, f)
 			hit := false
