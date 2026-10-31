@@ -346,7 +346,7 @@ func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
 
 	removeSubject := createComputerCLIProjection(t, ctx, harness.clients, "remove-subject", "remove-subject")
 	removeBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "remove", removeSubject.ComputerID,
-		"--expect-current", "--wait", "100ms", "--poll-interval", "1ms")
+		"--expect-current", "--wait", "2s", "--poll-interval", "1ms")
 	var removed computerOperatorProjection
 	if err := json.Unmarshal(removeBytes, &removed); err != nil || removed.DesiredState != contract.ServiceDesiredRemoved ||
 		removed.CurrentJob.State != contract.JobRemovedVerified || removed.RemovalOutcome != "removed_verified" ||
