@@ -174,8 +174,8 @@ func TestChildListingSurvivesDeletedRow(t *testing.T) {
 			})
 			defer func() { h.store.clock = oldClock }()
 			var page JobList
-			err = diagnosticReadSnapshot(t, h.store, nil, func(reads readModel) (err error) {
-				page, err = reads.childrenPage(t.Context(), parent.JobID, "", 10)
+			err = diagnosticReadSnapshot(t, t.Context(), h.store, nil, func(ctx context.Context, reads readModel) (err error) {
+				page, err = reads.childrenPage(ctx, parent.JobID, "", 10)
 				return err
 			})
 			if err != nil || len(page.Jobs) != 1 || page.Jobs[0].JobID != child.JobID {
@@ -226,8 +226,8 @@ func TestChildListingOperatorFactsSnapshot(t *testing.T) {
 	// projection cost. Exercise the production page method without a deadline.
 	actor := &serviceActionActor{Identity: fabric.Identity{Tags: []string{DefaultClientPrincipalTag}}, ClientPrincipalTag: DefaultClientPrincipalTag}
 	var page JobList
-	err = diagnosticReadSnapshot(t, h.store, actor, func(reads readModel) (err error) {
-		page, err = reads.childrenPage(t.Context(), parent.JobID, "", 100)
+	err = diagnosticReadSnapshot(t, t.Context(), h.store, actor, func(ctx context.Context, reads readModel) (err error) {
+		page, err = reads.childrenPage(ctx, parent.JobID, "", 100)
 		return err
 	})
 	if err != nil || len(page.Jobs) != 1 {
@@ -287,7 +287,7 @@ func TestChildListingDeletedBeforeOperatorProjection(t *testing.T) {
 	// Exempt this synchronization seam from the time budget: the deletion's
 	// fsync is test coordination, not read projection cost. Membership and
 	// operator projection still use the production method and one anchored view.
-	err = diagnosticReadSnapshot(t, h.store, actor, func(reads readModel) (err error) {
+	err = diagnosticReadSnapshot(t, ctx, h.store, actor, func(ctx context.Context, reads readModel) (err error) {
 		page, err = reads.childrenPage(ctx, parent.JobID, "", 100)
 		return err
 	})

@@ -119,6 +119,7 @@ type Attempt struct {
 	NodeID             string                `json:"node_id"`
 	State              contract.AttemptState `json:"state"`
 	LeaseExpiresAt     time.Time             `json:"lease_expires_at"`
+	LeaseLive          bool                  `json:"lease_live"`
 	StartedAt          *time.Time            `json:"started_at,omitempty"`
 	Result             *ProcessResult        `json:"result,omitempty"`
 	InterruptionReason InterruptionReason    `json:"interruption_reason,omitempty"`

@@ -21,7 +21,7 @@ func TestNodeGenerationAttemptTerminationProvenance(t *testing.T) {
 		{`,"termination_initiator":null`, false},
 		{`,"unknown_completion_evidence":true`, false},
 	} {
-		payload := `{"job_id":"job","attempt_id":"attempt","state":"failed","exit_code":17,"last_renewed_at":null,"lease_expires_at":null` + tc.fields + `}`
+		payload := `{"job_id":"job","attempt_id":"attempt","state":"failed","exit_code":17,"last_renewed_at":null,"lease_expires_at":null,"lease_live":false` + tc.fields + `}`
 		instance, err := jsonschema.UnmarshalJSON(strings.NewReader(payload))
 		if err != nil {
 			t.Fatal(err)

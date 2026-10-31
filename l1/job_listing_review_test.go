@@ -109,11 +109,11 @@ func TestJobListingReviewStoreClamps(t *testing.T) {
 			if err != nil || len(page.Jobs) < 1 || len(page.Jobs) > MaxJobListingPageLimit || page.NextCursor == "" {
 				t.Fatalf("rows=%d cursor=%q err=%v", len(page.Jobs), page.NextCursor, err)
 			}
-			err = diagnosticReadSnapshot(t, h.store, nil, func(reads readModel) (err error) {
+			err = diagnosticReadSnapshot(t, t.Context(), h.store, nil, func(ctx context.Context, reads readModel) (err error) {
 				if children {
-					page, err = reads.childrenPage(t.Context(), parent.JobID, "", 1000)
+					page, err = reads.childrenPage(ctx, parent.JobID, "", 1000)
 				} else {
-					page, err = reads.jobsPage(t.Context(), jobListFilters{}, "", 1000)
+					page, err = reads.jobsPage(ctx, jobListFilters{}, "", 1000)
 				}
 				return err
 			})
