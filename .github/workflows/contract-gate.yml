@@ -116,8 +116,15 @@ jobs:
           set -e
           if [ "${status[0]}" -ne 0 ]; then
             echo "--- output of tests that failed or did not finish ---"
-            unfinished=$(jq -c 'select(.Test != null and (.Action == "run" or .Action == "pass" or .Action == "skip")) | [.Action, .Package, .Test]' "$report" | jq -sc 'map(select(.[0] == "run") | .[1:]) - map(select(.[0] != "run") | .[1:])')
-            jq -rj --argjson unfinished "$unfinished" 'select(.Action == "output" and .Test != null and ([.Package, .Test] | IN($unfinished[]))) | .Output' "$report"
+            jq -c 'select(.Test != null and (.Action == "run" or .Action == "pass" or .Action == "skip")) | [.Action, .Package, .Test]' "$report" |
+              jq -sc 'map(select(.[0] == "run") | .[1:]) - map(select(.[0] != "run") | .[1:])' > "$RUNNER_TEMP/unfinished.json"
+            jq -c 'select(.Action == "fail" and .Test == null) | .Package' "$report" | jq -sc . > "$RUNNER_TEMP/failed-packages.json"
+            # A failed package with no such test (a crash blamed on a finished test)
+            # replays all of its test output.
+            jq -rj --slurpfile unfinished "$RUNNER_TEMP/unfinished.json" --slurpfile failed "$RUNNER_TEMP/failed-packages.json" '
+              $unfinished[0] as $u | ($failed[0] - ($u | map(.[0]))) as $whole
+              | select(.Action == "output" and .Test != null and (([.Package, .Test] | IN($u[])) or (.Package | IN($whole[]))))
+              | .Output' "$report"
           fi
           [ "${status[1]}" -eq 0 ] && [ "${status[2]}" -eq 0 ] || exit 1
           exit "${status[0]}"
