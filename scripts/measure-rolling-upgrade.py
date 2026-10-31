@@ -34,6 +34,10 @@ from rolling_upgrade_safety import (Budget, Manifest, PREFIX, atomic_json, clean
     safe_cli, stop_group, teardown, trial_lock)
 
 NAMES = ("wefty", "wefty-l1", "wefty-l3", "wefty-agent")
+# Local git reads are normally instant, but a busy hosted runner has taken
+# more than 10 s for `git rev-parse` (#1400).
+GIT_TIMEOUT = 60
+GIT_ARCHIVE_TIMEOUT = 120
 PAYLOAD = '''#!/bin/sh
 set -eu
 probe=$1
@@ -68,7 +72,7 @@ def source_policy():
 
 def resolved_refs(args):
     repo=Path(args.repo).resolve()
-    top=subprocess.run(['git','rev-parse','--show-toplevel'],cwd=repo,capture_output=True,text=True,timeout=10)
+    top=subprocess.run(['git','rev-parse','--show-toplevel'],cwd=repo,capture_output=True,text=True,timeout=GIT_TIMEOUT)
     require(top.returncode==0,'repository root unavailable')
     repo=Path(top.stdout.strip()).resolve()
     refs=args.refs or ['HEAD']*3
@@ -76,13 +80,13 @@ def resolved_refs(args):
     for ref in refs:
         sha='UNRESOLVED'
         try:
-            result=subprocess.run(['git','rev-parse','--verify','--end-of-options',ref+'^{commit}'],cwd=repo,capture_output=True,text=True,timeout=10)
+            result=subprocess.run(['git','rev-parse','--verify','--end-of-options',ref+'^{commit}'],cwd=repo,capture_output=True,text=True,timeout=GIT_TIMEOUT)
             require(result.returncode==0,'cannot resolve source ref')
             sha=result.stdout.strip();require(re.fullmatch(r'[0-9a-f]{40}',sha),'invalid source commit')
             if sha not in checked:
                 # Ref names are not authority. Bound the source tree before
                 # capturing any requested commit, then verify its actual bytes.
-                tree=subprocess.run(['git','ls-tree','-rlz','--full-tree',sha],cwd=repo,capture_output=True,timeout=10)
+                tree=subprocess.run(['git','ls-tree','-rlz','--full-tree',sha],cwd=repo,capture_output=True,timeout=GIT_TIMEOUT)
                 require(tree.returncode==0 and len(tree.stdout)<=1<<20,'source tree inventory unavailable/over budget')
                 estimate=10240
                 entries=tree.stdout.rstrip(b'\0').split(b'\0')
@@ -93,7 +97,7 @@ def resolved_refs(args):
                             and len(name)<=4096 and fields[3].isdigit(),'special/invalid source tree entry')
                     estimate+=((int(fields[3])+511)//512+3+(len(name)+511)//512)*512
                 require(estimate<=128<<20,'source archive size budget exceeded before capture')
-                archive=subprocess.run(['git','archive','--format=tar',sha],cwd=repo,capture_output=True,timeout=30)
+                archive=subprocess.run(['git','archive','--format=tar',sha],cwd=repo,capture_output=True,timeout=GIT_ARCHIVE_TIMEOUT)
                 require(archive.returncode==0 and len(archive.stdout)<=128<<20,'source archive unavailable/over budget')
                 checked[sha]=compilation_fingerprint(archive.stdout)==policy['compilation_fingerprint']
             results.append((ref,sha,checked[sha]))
@@ -104,16 +108,16 @@ def resolved_refs(args):
 
 def harness_identity():
     directory=Path(__file__).resolve().parent
-    result=subprocess.run(['git','rev-parse','HEAD'],cwd=directory,capture_output=True,text=True,timeout=10)
+    result=subprocess.run(['git','rev-parse','HEAD'],cwd=directory,capture_output=True,text=True,timeout=GIT_TIMEOUT)
     sha=result.stdout.strip()
     require(result.returncode==0 and re.fullmatch(r'[0-9a-f]{40}',sha),'executing harness commit unavailable')
     resources=['scripts/measure-rolling-upgrade.py','scripts/rolling_upgrade_safety.py',
                'scripts/testdata/rolling-upgrade-plan.go.tmpl','scripts/testdata/rolling-upgrade-source-policy.json']
-    top=subprocess.run(['git','rev-parse','--show-toplevel'],cwd=directory,capture_output=True,text=True,timeout=10)
+    top=subprocess.run(['git','rev-parse','--show-toplevel'],cwd=directory,capture_output=True,text=True,timeout=GIT_TIMEOUT)
     require(top.returncode==0,'executing harness repository unavailable')
     root=Path(top.stdout.strip()).resolve();clean=True
     for name in resources:
-        committed=subprocess.run(['git','show',sha+':'+name],cwd=root,capture_output=True,timeout=10)
+        committed=subprocess.run(['git','show',sha+':'+name],cwd=root,capture_output=True,timeout=GIT_TIMEOUT)
         require(committed.returncode==0,'committed harness resource unavailable')
         clean=clean and (root/name).read_bytes()==committed.stdout
     return sha,clean
