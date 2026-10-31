@@ -154,7 +154,13 @@ func newNodeCLIHarness(t *testing.T) *nodeCLIHarness {
 		NodeID: "node-cli-operator", Tags: []string{l1.DefaultClientPrincipalTag},
 	})
 	clock := &nodeCLIClock{now: time.Date(2026, 8, 17, 10, 0, 0, 0, time.UTC)}
-	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{Clock: clock})
+	// The upgrade and rolling-recovery tests build on this store, so it keeps
+	// the production durability pragmas (#1035).
+	var store *l1.Store
+	var err error
+	withProductionSQLiteSync(func() {
+		store, err = l1.OpenStore(filepath.Join(t.TempDir(), "l1.sqlite"), l1.StoreOptions{Clock: clock})
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
