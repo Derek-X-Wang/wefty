@@ -832,9 +832,11 @@ func (r *rollingUpgrade) waitRetirement(ctx context.Context, in l1.NodeGeneratio
 
 // Every frozen retiring member is checked by exact Job/Attempt, including
 // those absent from active_attempts. An expired Lease or queued successor never
-// passes. UpdatedAt is L1's accepted renewal time; a heartbeat cannot move it.
+// passes. A later L1 lease expiry than the first read proves renewal without
+// comparing L1 timestamps with the CLI clock; a heartbeat cannot move it.
 func (r *rollingUpgrade) waitSurvivors(ctx context.Context, in l1.NodeGenerationInventory, after time.Time) error {
 	start := r.op.now()
+	firstExpiry := map[string]time.Time{}
 	r.receipt.RenewalProof = map[string]l1.Attempt{}
 	for r.op.now().Sub(start) < upgradeReplacementBudget && ctx.Err() == nil {
 		complete := true
@@ -861,7 +863,11 @@ func (r *rollingUpgrade) waitSurvivors(ctx context.Context, in l1.NodeGeneration
 				}
 				found = true
 				terminal := (a.State == contract.AttemptSucceeded || a.State == contract.AttemptFailed) && a.Result != nil
-				renewed := (a.State == contract.AttemptClaimed || a.State == contract.AttemptRunning || a.State == contract.AttemptAwaitingInput) && a.UpdatedAt.After(after) && a.LeaseExpiresAt.Add(-l1.DefaultLeaseDuration).After(after) && a.LeaseExpiresAt.After(r.op.now())
+				first, observed := firstExpiry[a.AttemptID]
+				if !observed {
+					firstExpiry[a.AttemptID] = a.LeaseExpiresAt
+				}
+				renewed := a.LeaseLive && observed && a.LeaseExpiresAt.After(first)
 				if terminal || renewed {
 					if renewed && r.receipt.RecoveryState != "" {
 						if err := r.verifyRetiringProcess(ctx, old); err != nil {
@@ -885,7 +891,7 @@ func (r *rollingUpgrade) waitSurvivors(ctx context.Context, in l1.NodeGeneration
 		if r.verifiedPrimaryBoot != "" {
 			expectedBoot = r.verifiedPrimaryBoot
 		}
-		primaryHealthy := node.BootSessionID == expectedBoot && node.AgentVersion == r.receipt.Candidate.Version && node.State == contract.NodeAlive && node.LastHeartbeatAt.After(after)
+		primaryHealthy := node.BootSessionID == expectedBoot && node.AgentVersion == r.receipt.Candidate.Version && node.State == contract.NodeAlive
 		if complete && primaryHealthy {
 			return nil
 		}
@@ -1074,11 +1080,17 @@ func (r *rollingUpgrade) waitControlRenewal(ctx context.Context, baseline l1.Nod
 	var lastErr error
 	r.receipt.ControlsRestartedAt = after
 	r.receipt.ControlRenewalProof = map[string]l1.Attempt{}
+	firstExpiry := map[string]time.Time{}
+	var firstHeartbeat *time.Time
 	for r.op.now().Sub(start) < upgradeRenewalWindow && ctx.Err() == nil {
 		node, err := r.op.observe(ctx, r.profile)
 		if err == nil {
+			if firstHeartbeat == nil {
+				at := node.LastHeartbeatAt
+				firstHeartbeat = &at
+			}
 			diagnostic = fmt.Sprintf("observe=%v boot=%s/%s authority=%d/%d heartbeat=%s after=%s", err, node.BootSessionID, baseline.BootSessionID, node.AuthorityGeneration, baseline.AuthorityGeneration, node.LastHeartbeatAt, after)
-			complete := node.BootSessionID == baseline.BootSessionID && node.AuthorityGeneration == baseline.AuthorityGeneration && node.LastHeartbeatAt.After(after)
+			complete := node.BootSessionID == baseline.BootSessionID && node.AuthorityGeneration == baseline.AuthorityGeneration && node.LastHeartbeatAt.After(*firstHeartbeat)
 			// Baseline is captured after service quiescence. Include every retiree's
 			// frozen members as well, including Attempts absent from Node's active list.
 			attempts := []l1.NodeActiveAttempt{}
@@ -1111,7 +1123,11 @@ func (r *rollingUpgrade) waitControlRenewal(ctx context.Context, baseline l1.Nod
 					}
 					found = true
 					terminal := (a.State == contract.AttemptSucceeded || a.State == contract.AttemptFailed) && a.Result != nil
-					renewed := a.UpdatedAt.After(after) && a.LeaseExpiresAt.After(old.LeaseExpiresAt) && a.LeaseExpiresAt.Add(-l1.DefaultLeaseDuration).After(after)
+					first, observed := firstExpiry[a.AttemptID]
+					if !observed {
+						firstExpiry[a.AttemptID] = a.LeaseExpiresAt
+					}
+					renewed := a.LeaseLive && observed && a.LeaseExpiresAt.After(first)
 					if !terminal && !renewed && job.Outcome != contract.JobOutcomeCanceled {
 						diagnostic += fmt.Sprintf(" attempt=%s state=%s updated=%s expires=%s old=%s", a.AttemptID, a.State, a.UpdatedAt, a.LeaseExpiresAt, old.LeaseExpiresAt)
 						complete = false

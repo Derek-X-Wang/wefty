@@ -107,7 +107,7 @@ type attemptLifecycleDependencies struct {
 	workflowBridge         func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error)
 	logf                   func(string, ...any)
 	observer               *lifecycleObserver
-	seatDoor               *seatFrontDoor
+	seatDoor               func() *seatFrontDoor
 	fabric                 fabric.Fabric
 	computerPolicy         *ComputerPolicyCache
 	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
@@ -2052,6 +2052,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			err := errors.New("Computer runtime does not support Seat screens")
 			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
+		var door *seatFrontDoor
+		if lifecycle.dependencies.seatDoor != nil {
+			door = lifecycle.dependencies.seatDoor()
+		}
 		result, runErr = runComputerSeats(ctx, runtimeAdapter, request, sink, controller, seatComputerServiceConfig{
 			screen: &seatScreenConfig{
 				fabric: lifecycle.dependencies.fabric, authorizer: lifecycle.dependencies.computerPolicy,
@@ -2059,7 +2063,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				computer: claim.ComputerStorage.ComputerID, storage: claim.ComputerStorage.StorageID,
 				storageGeneration: claim.ComputerStorage.StorageGeneration, authority: controller.authority,
 			},
-			clock: lifecycle.dependencies.clock, router: lifecycle.dependencies.seatDoor, copyRuntime: copyRuntime, copyControl: lifecycle.dependencies.client,
+			clock: lifecycle.dependencies.clock, router: door, copyRuntime: copyRuntime, copyControl: lifecycle.dependencies.client,
 			publish: func(publishContext context.Context, ready bool, endpoint string) error {
 				if ready && ctx.Err() != nil {
 					return ctx.Err()

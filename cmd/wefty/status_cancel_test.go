@@ -30,6 +30,7 @@ func cancellationStatusNodes(t *testing.T, outcome string, extra contract.Attemp
 	a.State = generationAttemptState(contract.AttemptFailed)
 	// Retained terminal Lease expiry must not turn cancellation into stale work.
 	a.LeaseExpiresAt = generationDeadline(time.Now().Add(-time.Hour))
+	a.LeaseLive = generationLeaseLive(false)
 	if extra != "" {
 		node.Generations[1].Attempts = append(node.Generations[1].Attempts, l1.NodeGenerationAttempt{JobID: "job-extra", AttemptID: "attempt-extra", RunID: "run-extra", State: generationAttemptState(extra)})
 	}
@@ -189,6 +190,7 @@ func TestCancelledRetiringRunDiagnostics(t *testing.T) {
 					a := &nodes.Nodes[0].Generations[1].Attempts[0]
 					a.State = generationAttemptState(contract.AttemptRunning)
 					a.LeaseExpiresAt = generationDeadline(time.Now().Add(time.Hour))
+					a.LeaseLive = generationLeaseLive(true)
 				case "other-node":
 					other := nodes.Nodes[0]
 					other.NodeID = "other-node"
@@ -319,6 +321,7 @@ func TestCancelledRetiringRunPreservesAttemptProblems(t *testing.T) {
 			a.ObservationError = tc.observationError
 			if !tc.stale {
 				a.LeaseExpiresAt = generationDeadline(now.Add(time.Minute))
+				a.LeaseLive = generationLeaseLive(true)
 			}
 			got := projectGeneration(nodes.Nodes[0], nodes.Nodes[0].Generations[1], now)
 			wantProblems := 0

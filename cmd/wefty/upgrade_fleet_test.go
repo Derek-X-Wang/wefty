@@ -500,7 +500,11 @@ func TestFleetUpgradeImmediateHeartbeatReceiver(t *testing.T) {
 			if kind == "supported" {
 				op := upgradeOperations(f.host)
 				started := f.now.Add(-10 * time.Millisecond)
-				elapsed, err := waitFleetUpgradeRenewal(t.Context(), op, f.profile(t), f.node, started, started)
+				elapsed, err := waitFleetUpgradeRenewal(t.Context(), op, f.profile(t), f.node, started, started, func(ctx context.Context, _ l1.Node) {
+					if err := requestFleetUpgradeHeartbeat(ctx, f.host, paths, f.node); err != nil {
+						t.Fatal(err)
+					}
+				})
 				if err != nil || elapsed >= time.Second {
 					t.Fatalf("renewal waited for 15 s phase: %s %v", elapsed, err)
 				}

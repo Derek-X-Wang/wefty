@@ -678,6 +678,8 @@ func (server *Server) acquireSession(ctx context.Context, connection net.Conn, w
 		_ = connection.SetReadDeadline(time.Now().Add(server.config.HeartbeatTimeout))
 		var heartbeat frame
 		if err := wire.read(&heartbeat); err != nil {
+			// The reason stays fixed; the cause tells an EOF from a timeout (#1128).
+			server.config.Logf("OCI helper session control read failed session_generation=%d cause=%q", generation, err.Error())
 			session.invalidate("session control EOF")
 			return
 		}

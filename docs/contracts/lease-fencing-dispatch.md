@@ -273,6 +273,15 @@ The successful claim returns the write authority and both lease projections:
   control-plane clock. This compatibility field remains until the agent
   resilience cutover is complete.
 
+Operator Attempt reads expose read-only `lease_live`: L1 computes it from the
+Attempt state and the pinned authority clock at read time. Terminal Attempts
+return false. Elapsed-clock sampling failures also return false without failing
+the read; a missing pinned clock remains a hard internal error.
+Generation resident observations use null when unavailable.
+This field grants no authority. Clients use it for liveness and compare
+successive L1 expiry values for renewal proof; they must not compare
+`lease_expires_at` with their own wall clock.
+
 ## Semantic authority errors
 
 Authority scope is carried by the error code, never inferred from an HTTP

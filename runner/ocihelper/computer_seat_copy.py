@@ -2,7 +2,6 @@
 import json
 import os
 import select
-import shutil
 import stat
 import sys
 import tarfile
@@ -19,6 +18,11 @@ signal.set_wakeup_fd(wake_write)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 
 COMMIT = b'\nWEFTY_COPY_COMMIT_V1\n'
+# A file is synced at least every SYNC_BYTES while it is written. One fsync
+# of a multi-GB file on a slow disk could block reading for longer than the
+# helper's 60-second stall limit; bounded syncs make that much less likely
+# (#1261).
+SYNC_BYTES = 64 << 20
 
 
 class Input:
@@ -126,7 +130,17 @@ def extract(destination):
                             out = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                           member.mode & 0o777, dir_fd=current)
                             with os.fdopen(out, 'wb') as target, archive.extractfile(member) as source:
-                                shutil.copyfileobj(source, target, length=32768)
+                                unsynced = 0
+                                while True:
+                                    data = source.read(32768)
+                                    if not data:
+                                        break
+                                    target.write(data)
+                                    unsynced += len(data)
+                                    if unsynced >= SYNC_BYTES:
+                                        target.flush()
+                                        os.fsync(target.fileno())
+                                        unsynced = 0
                                 target.flush()
                                 os.fsync(target.fileno())
                             size += member.size

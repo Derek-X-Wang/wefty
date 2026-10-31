@@ -15,7 +15,7 @@ func executeSeatRelease(ctx context.Context, clients *apiClients, jsonOutput boo
 		return err
 	}
 	if secret == "" {
-		return fmt.Errorf("Seat credential is unavailable; wait again with wefty seat wait %s", id)
+		return seatCredentialUnavailable(id)
 	}
 	headers := http.Header{l1.SeatCredentialHeader: []string{secret}}
 	var result l1.SeatCallResult

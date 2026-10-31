@@ -304,9 +304,11 @@ func (f *rollingFixture) holdReady(t *testing.T, g agentinstall.Generation, boot
 	lifetime, err := f.install.StartupWithLifetime(g.ID, c.NodeID, g.Executable, rollingTestBoot)
 	mustRolling(t, err)
 	f.lifetimes[g.ID] = lifetime
+	// #1310: Bind to publication start; a later age window can reject slow writes.
+	started := time.Now()
 	mustRolling(t, f.install.PublishReady(g.ID, c.NodeID, g.Version, g.Executable, boot, rollingTestBoot))
 	if g.Role == "primary" {
-		_, err = f.install.BindReady(t.Context(), g.ID, agentinstall.Binding{PID: os.Getpid(), BootSessionID: boot, SystemBootID: rollingTestBoot}, time.Now().Add(-time.Second))
+		_, err = f.install.BindReady(t.Context(), g.ID, agentinstall.Binding{PID: os.Getpid(), BootSessionID: boot, SystemBootID: rollingTestBoot}, started)
 		mustRolling(t, err)
 	}
 }
@@ -490,26 +492,35 @@ func TestUpgradeRollingLegacyDrainEnrollsFirstPrimary(t *testing.T) {
 }
 
 func TestUpgradeRollingProofKeepsDisappearedAttempts(t *testing.T) {
-	for _, state := range []string{"renewed", "terminal", "missing", "lost", "interrupted", "heartbeat-only"} {
+	for _, state := range []string{"renewed", "terminal", "missing", "lost", "interrupted", "heartbeat-only", "expired-renewal"} {
 		t.Run(state, func(t *testing.T) {
 			after := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 			now := after.Add(time.Second)
-			a := l1.Attempt{AttemptID: "original", State: contract.AttemptRunning, UpdatedAt: after, LeaseExpiresAt: after.Add(l1.DefaultLeaseDuration)}
+			a := l1.Attempt{AttemptID: "original", State: contract.AttemptRunning, UpdatedAt: after, LeaseExpiresAt: after.Add(l1.DefaultLeaseDuration), LeaseLive: true}
 			switch state {
 			case "renewed":
 				a.UpdatedAt = now
 				a.LeaseExpiresAt = now.Add(l1.DefaultLeaseDuration)
+				a.LeaseLive = true
 			case "terminal":
 				exit := 0
 				a.State = contract.AttemptSucceeded
 				a.Result = &l1.ProcessResult{ExitCode: &exit}
 			case "lost":
 				a.State = contract.AttemptLost
+				a.LeaseLive = false
 			case "interrupted":
 				a.State = contract.AttemptInterrupted
+				a.LeaseLive = false
+			case "expired-renewal":
+				a.LeaseLive = false
 			}
 			r := rollingUpgrade{receipt: upgradeRollingReceipt{Candidate: agentinstall.Generation{Version: "next", CandidateBootSessionID: "next-boot"}, Preserved: []l1.NodeActiveAttempt{{JobID: "job", AttemptID: "original", Kind: contract.JobKindProcess, Class: contract.JobClassOneShot}}}, op: upgradeHost{now: func() time.Time { return now }, wait: func(context.Context, time.Duration) error { now = now.Add(time.Second); return nil }, readJob: func(context.Context, connprofile.Profile, string) (l1.Job, error) {
-				attempts := []l1.Attempt{a}
+				current := a
+				if state == "renewed" || state == "expired-renewal" {
+					current.LeaseExpiresAt = now.Add(l1.DefaultLeaseDuration)
+				}
+				attempts := []l1.Attempt{current}
 				if state == "missing" {
 					attempts = nil
 				}
@@ -528,7 +539,6 @@ func TestUpgradeRollingProofKeepsDisappearedAttempts(t *testing.T) {
 func TestUpgradeRollingEveryInterruptedStepIsReadable(t *testing.T) {
 	for _, phase := range []string{"prepared", "admission_closed", "services_quiescing", "services_quiesced", "control_plane_renewed", "candidate_preparing", "candidate_loading", "candidate_ready", "candidate_staging", "promotion_requested", "promotion_committed", "catalog_reconciled", "retirement_acknowledged", "survivor_renewal_proved", "installation_completing", "installation_complete"} {
 		t.Run(phase, func(t *testing.T) {
-			t.Parallel()
 			f := newRollingFixture(t)
 			f.claim(t, "resident", contract.JobClassOneShot, false)
 			f.operations.rollingStep = func(got string) error {

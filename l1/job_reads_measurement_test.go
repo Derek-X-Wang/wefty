@@ -83,7 +83,8 @@ func TestJobReadSnapshotMeasureMaximumPage(t *testing.T) {
 					counter := &projectionNodeCounter{queryer: tx}
 					reads := newDatabaseReads(counter, h.clock.Now(), actor)
 					// The diagnostic 1000-row probe bypasses only validation of a lowered cap.
-					page, err := measureJobPage(t.Context(), reads, size)
+					ctx := withAttemptClock(t.Context(), h.store.clock, reads.now())
+					page, err := measureJobPage(ctx, reads, size)
 					tx.Rollback()
 					conn.Close()
 					elapsed := time.Since(start)
@@ -170,8 +171,8 @@ func TestJobReadSnapshotMeasureChildrenPage(t *testing.T) {
 				h.store.clock = ClockFunc(func() time.Time { calls++; return at })
 				start := time.Now()
 				var page JobList
-				err := diagnosticReadSnapshot(t, h.store, actor, func(reads readModel) (err error) {
-					page, err = reads.childrenPage(t.Context(), parent.JobID, "", 1000)
+				err := diagnosticReadSnapshot(t, t.Context(), h.store, actor, func(ctx context.Context, reads readModel) (err error) {
+					page, err = reads.childrenPage(ctx, parent.JobID, "", 1000)
 					return err
 				})
 				elapsed := time.Since(start)

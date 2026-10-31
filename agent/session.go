@@ -69,7 +69,6 @@ type agentSession struct {
 	capacityMu      sync.Mutex
 	poolTargets     map[workloadClass]int
 	capacityChanged chan struct{}
-	claimsEnabled   bool
 
 	// One-shot load and spacing state is protected by claimMu.
 	// oneshotClaimClock defaults to the session clock. Keeping the admission
@@ -208,7 +207,6 @@ func newAgentSession(
 			workloadClassService: maxServiceSlots,
 		},
 		capacityChanged:           make(chan struct{}, 1),
-		claimsEnabled:             true,
 		retiringRequested:         make(chan struct{}),
 		retirementAttempts:        make(map[string]*retirementAttempt),
 		residentJobID:             make(map[string]struct{}),
@@ -2017,7 +2015,6 @@ func (session *agentSession) observeGrantedCapacity(node l1.Node) {
 	session.claimMu.Lock()
 	defer session.claimMu.Unlock()
 	session.capacityMu.Lock()
-	session.claimsEnabled = node.ClaimsEnabled
 	changed := false
 	for class, target := range targets {
 		if session.poolTargets[class] != target {
@@ -2036,9 +2033,9 @@ func (session *agentSession) observeGrantedCapacity(node l1.Node) {
 }
 
 func (session *agentSession) claimsAllowed() bool {
-	session.capacityMu.Lock()
-	defer session.capacityMu.Unlock()
-	return session.claimsEnabled && !session.isDraining() && !session.isRetiring()
+	// L1 checks operator claim intent on every claim. A cached disabled intent
+	// must not hold idle workers until the next heartbeat after it is enabled.
+	return !session.isDraining() && !session.isRetiring()
 }
 
 func (session *agentSession) poolTarget(class workloadClass) int {

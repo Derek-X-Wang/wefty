@@ -16,7 +16,7 @@ import (
 // Diagnostic snapshots exercise the production projection in one read-only
 // transaction, but exclude the hard deadline and soft cutoff. Slow test writes
 // and cost measurements must not turn machine speed into a functional verdict.
-func diagnosticReadSnapshot(t *testing.T, store *Store, actor *serviceActionActor, use func(readModel) error) error {
+func diagnosticReadSnapshot(t *testing.T, ctx context.Context, store *Store, actor *serviceActionActor, use func(context.Context, readModel) error) error {
 	t.Helper()
 	conn, err := store.readDB.Conn(t.Context())
 	if err != nil {
@@ -31,7 +31,8 @@ func diagnosticReadSnapshot(t *testing.T, store *Store, actor *serviceActionActo
 	if err := tx.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM sqlite_schema").Scan(new(int)); err != nil {
 		return err
 	}
-	return use(newDatabaseReads(tx, canonicalTime(store.clock.Now()), actor))
+	at := canonicalTime(store.clock.Now())
+	return use(withAttemptClock(ctx, store.clock, at), newDatabaseReads(tx, at, actor))
 }
 
 func enforceReadMeasurementBudget(t *testing.T, elapsed time.Duration) {

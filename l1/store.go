@@ -150,6 +150,10 @@ type Store struct {
 	reconcileLivenessForTest func(context.Context, *sql.Tx, time.Time) (int64, error)
 }
 
+// defaultStoreClock is replaced only by TestMain in this package's tests.
+// Product stores always default to the strict host boot-identity reader.
+var defaultStoreClock Clock = systemClock{}
+
 // OpenStore opens a real SQLite database, enables WAL, and applies the L1
 // schema. path should name a file so queue concurrency has production SQLite
 // semantics rather than an in-memory approximation.
@@ -159,7 +163,7 @@ func OpenStore(path string, options StoreOptions) (*Store, error) {
 	}
 	clock := options.Clock
 	if clock == nil {
-		clock = systemClock{}
+		clock = defaultStoreClock
 	}
 	leaseDuration := options.LeaseDuration
 	if leaseDuration <= 0 {
@@ -2756,9 +2760,9 @@ func (s *Store) ListJobAttempts(ctx context.Context, jobID string) (attempts []A
 	return
 }
 
-func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, error) {
+func listJobAttempts(ctx context.Context, q queryer, jobID string, now time.Time) ([]Attempt, error) {
 	rows, err := q.QueryContext(ctx, `SELECT attempt_id, node_id, state, lease_expires_ns,
-		result_json, late_result_json, image_observation_json, created_ns, updated_ns, COALESCE(interruption_reason, ''), started_ns
+		result_json, late_result_json, image_observation_json, created_ns, updated_ns, COALESCE(interruption_reason, ''), started_ns, lease_boot_id, lease_deadline_ns
 		FROM attempts WHERE job_id=? ORDER BY created_ns, attempt_id`, jobID)
 	if err != nil {
 		return nil, internalError(err, "list job attempts")
@@ -2770,11 +2774,22 @@ func listJobAttempts(ctx context.Context, q queryer, jobID string) ([]Attempt, e
 		var resultJSON, lateResultJSON, imageJSON []byte
 		var leaseExpiresNS, createdNS, updatedNS int64
 		var startedNS sql.NullInt64
+		var authority attemptAuthority
 		if err := rows.Scan(&attempt.AttemptID, &attempt.NodeID, &attempt.State, &leaseExpiresNS,
-			&resultJSON, &lateResultJSON, &imageJSON, &createdNS, &updatedNS, &attempt.InterruptionReason, &startedNS); err != nil {
+			&resultJSON, &lateResultJSON, &imageJSON, &createdNS, &updatedNS, &attempt.InterruptionReason, &startedNS, &authority.leaseBootID, &authority.leaseDeadlineNS); err != nil {
 			return nil, internalError(err, "scan job attempt")
 		}
 		attempt.LeaseExpiresAt = time.Unix(0, leaseExpiresNS).UTC()
+		authority.state, authority.leaseExpires = attempt.State, attempt.LeaseExpiresAt
+		attempt.LeaseLive, err = attemptLeaseLive(ctx, now, authority)
+		if err != nil {
+			if errors.Is(err, errAttemptClockMissing) {
+				return nil, err
+			}
+			// Sampling failure cannot grant lease authority or hide retained
+			// Job evidence. Report the lease as not live and keep the read available.
+			attempt.LeaseLive = false
+		}
 		attempt.CreatedAt = time.Unix(0, createdNS).UTC()
 		attempt.UpdatedAt = time.Unix(0, updatedNS).UTC()
 		if startedNS.Valid {

@@ -147,6 +147,7 @@ type Config struct {
 
 // Agent owns process-lifetime resources and starts one control-plane session.
 type Agent struct {
+	seatDoorMu    sync.RWMutex
 	seatDoor      *seatFrontDoor
 	seatApprovals *SeatApprovalController
 	seatRoom      *l1.ComputerRoomConfig
@@ -469,6 +470,11 @@ func New(config Config) (*Agent, error) {
 	if session.ociBootBarrier != nil {
 		session.ociBootReady = make(chan struct{}, 1)
 		session.ociBootBarrier.SetLossHandler(func(_ ocihelper.HelperSession, lossErr error) {
+			// The first loss cause names the operation that ended the session;
+			// the errors that follow it are its fallout (#1128).
+			if logf != nil {
+				logf("OCI helper session lost: %v", lossErr)
+			}
 			capabilities.suppressOCI(ociBootBarrierReason(session.ociBootBarrier), lossErr)
 		})
 	}
@@ -671,30 +677,16 @@ func (a *Agent) ComputerPolicy() *ComputerPolicyCache {
 
 // Run registers and then serves claims until the context is canceled or the
 // control plane rejects a liveness or execution operation.
-func (a *Agent) Run(ctx context.Context) error {
+func (a *Agent) Run(ctx context.Context) (runErr error) {
 	// Session and door shutdown must not cancel process-lifetime replay or
 	// result collection. Those retain the caller context and are joined by Close.
 	runContext, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
-	var doorDone <-chan struct{}
-	a.seatDoor = nil
-	if a.fabric != nil {
-		door, closeDoor, err := startSeatFrontDoor(runContext, a.fabric, a.registration.NodeID)
-		if err != nil {
-			a.log("Seat front door unavailable; Seat-request Computers cannot become ready: %v", err)
-		} else {
-			a.seatDoor = door
-			doorDone = door.done
-			defer closeDoor()
-			go func() {
-				select {
-				case <-doorDone:
-					cancelRun()
-				case <-runContext.Done():
-				}
-			}()
-		}
-	}
+	doorStopped := a.startSeatFrontDoorRecovery(runContext, cancelRun)
+	defer func() {
+		cancelRun()
+		runErr = errors.Join(runErr, <-doorStopped)
+	}()
 	seatCtx, seatCancel := context.WithCancel(runContext)
 	seatDone := make(chan struct{})
 	go func() { defer close(seatDone); a.runSeatRequests(seatCtx) }()
@@ -757,15 +749,10 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.log("recover durable evidence: %v", err)
 		})
 	}
-	runErr := a.session.run(runContext, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
+	runErr = a.session.run(runContext, func(attemptContext context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 		return a.executeClaim(attemptContext, claim, claimStarted)
 	})
-	select {
-	case <-doorDone:
-		return errors.Join(runErr, a.seatDoor.serveErr)
-	default:
-		return runErr
-	}
+	return runErr
 }
 
 func (a *Agent) startHostTokenRevocation(parent context.Context) {
@@ -842,7 +829,7 @@ func (a *Agent) newAttemptLifecycle() *attemptLifecycle {
 		nodeID:           a.registration.NodeID, bootSessionID: a.registration.BootSessionID,
 		workflowBridge: a.startWorkflowBridge, logf: a.logf,
 		observer: a.observer, reservePublishedPort: a.reservePublishedPort,
-		fabric: a.fabric, computerPolicy: computerPolicy, seatDoor: a.seatDoor,
+		fabric: a.fabric, computerPolicy: computerPolicy, seatDoor: a.currentSeatFrontDoor,
 		prepareServiceEndpoint:  prepareProcessServiceEndpoint,
 		prepareAuthorityLoss:    a.prepareAuthorityLoss,
 		allowsStart:             allowsStart,

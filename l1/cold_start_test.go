@@ -115,8 +115,9 @@ func TestColdStartApprovalDeadlineAndReply(t *testing.T) {
 	if err != nil || len(page.Events) == 0 || page.Events[len(page.Events)-1].Kind != SeatEventRefused {
 		t.Fatalf("expiry log=%+v err=%v", page, err)
 	}
-	// Never-live refused history ages from the original request, not refusal.
-	f.clock.Advance(DefaultComputerTakeoverAuditRetentionAge - 3*time.Minute - time.Nanosecond)
+	// Refused history keeps the full retention from the refusal, even though
+	// the Seat never went live (#1239).
+	f.clock.Advance(DefaultComputerTakeoverAuditRetentionAge - time.Nanosecond)
 	swept, err := f.store.Reconcile(t.Context())
 	if err != nil || swept.PrunedSeatLogs != 0 {
 		t.Fatalf("early log sweep=%+v err=%v", swept, err)
