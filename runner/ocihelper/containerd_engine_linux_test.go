@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -968,6 +969,205 @@ func TestKillCgroupTreeFallsBackWhenKillWriteOrCloseIsUnsupported(t *testing.T) 
 				t.Fatalf("unsupported cgroup.kill %s result=%+v err=%v", test.name, result, err)
 			}
 		})
+	}
+}
+
+func TestCgroupProcessSignalerRechecksIdentityAndMembership(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		openErr    error
+		signalErr  error
+		membership string
+		readErr    error
+		startTimes []uint64
+		startErrs  []error
+		killErr    error
+		wantErr    error
+		invalidPID bool
+		wantCalls  []string
+	}{
+		{name: "pidfd unchanged", membership: "42\n", wantCalls: []string{"open", "membership", "signal fd", "close"}},
+		{name: "pidfd membership changed", membership: "99\n", wantCalls: []string{"open", "membership", "close"}},
+		{name: "pidfd cgroup vanished", readErr: os.ErrNotExist, wantCalls: []string{"open", "membership", "close"}},
+		{name: "pidfd process exited before open", openErr: syscall.ESRCH, wantCalls: []string{"open"}},
+		{name: "pidfd process exited after recheck", membership: "42\n", signalErr: syscall.ESRCH, wantCalls: []string{"open", "membership", "signal fd", "close"}},
+		{name: "pidfd open refused", openErr: syscall.EPERM, wantErr: syscall.EPERM, wantCalls: []string{"open"}},
+		{name: "pidfd signal refused", membership: "42\n", signalErr: syscall.EPERM, wantErr: syscall.EPERM, wantCalls: []string{"open", "membership", "signal fd", "close"}},
+		{name: "pidfd membership unreadable", readErr: os.ErrPermission, wantErr: os.ErrPermission, wantCalls: []string{"open", "membership", "close"}},
+		{name: "pidfd membership malformed", membership: "42\ninvalid\n", invalidPID: true, wantCalls: []string{"open", "membership", "close"}},
+		{name: "legacy unchanged", openErr: syscall.ENOSYS, membership: "42\n", startTimes: []uint64{100, 100}, wantCalls: []string{"open", "start", "membership", "start", "kill pid"}},
+		{name: "legacy start time changed", openErr: syscall.ENOSYS, membership: "42\n", startTimes: []uint64{100, 101}, wantCalls: []string{"open", "start", "membership", "start"}},
+		{name: "legacy membership changed", openErr: syscall.ENOSYS, membership: "99\n", startTimes: []uint64{100}, wantCalls: []string{"open", "start", "membership"}},
+		{name: "legacy cgroup vanished", openErr: syscall.ENOSYS, readErr: os.ErrNotExist, startTimes: []uint64{100}, wantCalls: []string{"open", "start", "membership"}},
+		{name: "legacy process already exited", openErr: syscall.ENOSYS, startTimes: []uint64{0}, startErrs: []error{os.ErrNotExist}, wantCalls: []string{"open", "start"}},
+		{name: "legacy process exited before final stat", openErr: syscall.ENOSYS, membership: "42\n", startTimes: []uint64{100, 0}, startErrs: []error{nil, syscall.ESRCH}, wantCalls: []string{"open", "start", "membership", "start"}},
+		{name: "legacy stat unreadable", openErr: syscall.ENOSYS, startTimes: []uint64{0}, startErrs: []error{os.ErrPermission}, wantErr: os.ErrPermission, wantCalls: []string{"open", "start"}},
+		{name: "legacy final stat unreadable", openErr: syscall.ENOSYS, membership: "42\n", startTimes: []uint64{100, 0}, startErrs: []error{nil, os.ErrPermission}, wantErr: os.ErrPermission, wantCalls: []string{"open", "start", "membership", "start"}},
+		{name: "legacy membership unreadable", openErr: syscall.ENOSYS, readErr: os.ErrPermission, startTimes: []uint64{100}, wantErr: os.ErrPermission, wantCalls: []string{"open", "start", "membership"}},
+		{name: "legacy process exited before kill", openErr: syscall.ENOSYS, membership: "42\n", startTimes: []uint64{100, 100}, killErr: syscall.ESRCH, wantCalls: []string{"open", "start", "membership", "start", "kill pid"}},
+		{name: "legacy kill refused", openErr: syscall.ENOSYS, membership: "42\n", startTimes: []uint64{100, 100}, killErr: syscall.EPERM, wantErr: syscall.EPERM, wantCalls: []string{"open", "start", "membership", "start", "kill pid"}},
+		{name: "pidfd signal unsupported", membership: "42\n", signalErr: syscall.ENOSYS, startTimes: []uint64{100, 100}, wantCalls: []string{"open", "membership", "signal fd", "start", "membership", "start", "kill pid", "close"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var calls []string
+			startReads := 0
+			signaler := cgroupProcessSignaler{
+				openPIDFD: func(pid int) (int, error) {
+					if pid != 42 {
+						t.Fatalf("open PID = %d", pid)
+					}
+					calls = append(calls, "open")
+					return 7, test.openErr
+				},
+				readFile: func(path string) ([]byte, error) {
+					if path != "/cgroup/child/cgroup.procs" {
+						t.Fatalf("membership path = %s", path)
+					}
+					calls = append(calls, "membership")
+					return []byte(test.membership), test.readErr
+				},
+				signalPIDFD: func(fd int) error {
+					if fd != 7 {
+						t.Fatalf("signal fd = %d", fd)
+					}
+					calls = append(calls, "signal fd")
+					return test.signalErr
+				},
+				closePIDFD: func(fd int) error {
+					if fd != 7 {
+						t.Fatalf("close fd = %d", fd)
+					}
+					calls = append(calls, "close")
+					return nil
+				},
+				startTime: func(pid int) (uint64, error) {
+					if pid != 42 || startReads >= len(test.startTimes) {
+						t.Fatalf("unexpected start-time read %d for PID %d", startReads, pid)
+					}
+					calls = append(calls, "start")
+					i := startReads
+					startReads++
+					var err error
+					if i < len(test.startErrs) {
+						err = test.startErrs[i]
+					}
+					return test.startTimes[i], err
+				},
+				kill: func(pid int) error {
+					if pid != 42 {
+						t.Fatalf("kill PID = %d", pid)
+					}
+					calls = append(calls, "kill pid")
+					return test.killErr
+				},
+			}
+			err := signaler.killMember("/cgroup/child/cgroup.procs", 42)
+			if test.invalidPID {
+				if err == nil || !strings.Contains(err.Error(), "invalid pid") {
+					t.Fatalf("malformed membership error = %v", err)
+				}
+			} else if !errors.Is(err, test.wantErr) {
+				t.Fatalf("killMember error = %v, want %v", err, test.wantErr)
+			}
+			if !slices.Equal(calls, test.wantCalls) {
+				t.Fatalf("calls = %v, want %v", calls, test.wantCalls)
+			}
+		})
+	}
+}
+
+func TestKillCgroupTreeKeepsAtomicKillPath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "cgroup.procs"), []byte("42\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// No fallback readers or syscalls may be needed when cgroup.kill works.
+	result, err := killCgroupTreeWithSignaler(root, func(path string) (io.WriteCloser, error) {
+		if path != filepath.Join(root, "cgroup.kill") {
+			t.Fatalf("kill path = %s", path)
+		}
+		return os.Create(path)
+	}, cgroupProcessSignaler{})
+	if err != nil || result.Method != "cgroup.kill" || !slices.Equal(result.PIDs, []int{42}) {
+		t.Fatalf("atomic kill result=%+v err=%v", result, err)
+	}
+	payload, err := os.ReadFile(filepath.Join(root, "cgroup.kill"))
+	if err != nil || string(payload) != "1\n" {
+		t.Fatalf("cgroup.kill payload=%q err=%v", payload, err)
+	}
+}
+
+func TestKillCgroupTreeFallbackSkipsPIDRemovedAfterRead(t *testing.T) {
+	for _, openErr := range []error{nil, syscall.ENOSYS} {
+		t.Run(fmt.Sprint(openErr), func(t *testing.T) {
+			root := t.TempDir()
+			child := filepath.Join(root, "child")
+			if err := os.Mkdir(child, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			procsPath := filepath.Join(child, "cgroup.procs")
+			if err := os.WriteFile(procsPath, []byte("42\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reads, closed := 0, false
+			signaler := cgroupProcessSignaler{
+				readFile: func(path string) ([]byte, error) {
+					if path != procsPath {
+						t.Fatalf("membership read outside descendant: %s", path)
+					}
+					reads++
+					if reads == 1 {
+						return []byte("42\n"), nil
+					}
+					return nil, nil // The PID left after the traversal read.
+				},
+				openPIDFD:   func(int) (int, error) { return 7, openErr },
+				signalPIDFD: func(int) error { t.Fatal("signalled PID removed from cgroup"); return nil },
+				closePIDFD:  func(int) error { closed = true; return nil },
+				startTime:   func(int) (uint64, error) { return 100, nil },
+				kill:        func(int) error { t.Fatal("killed PID removed from cgroup"); return nil },
+			}
+			result, err := killCgroupTreeWithSignaler(root, func(string) (io.WriteCloser, error) {
+				return nil, os.ErrNotExist
+			}, signaler)
+			if err != nil || result.Method != "recursive_signal" || !slices.Equal(result.PIDs, []int{42}) || reads != 2 || closed != (openErr == nil) {
+				t.Fatalf("result=%+v err=%v reads=%d closed=%t", result, err, reads, closed)
+			}
+		})
+	}
+}
+
+func TestKillCgroupTreeFallbackPIDFDSignalsOwnedChild(t *testing.T) {
+	command := exec.CommandContext(t.Context(), "sleep", "30")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	})
+	// This test needs no delegated cgroup. The file supplies membership for
+	// our own child; the pidfd open, signal and close use the real kernel.
+	fd, err := unix.PidfdOpen(command.Process.Pid, 0)
+	if errors.Is(err, syscall.ENOSYS) {
+		t.Skip("kernel does not support pidfd_open")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unix.Close(fd)
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "cgroup.procs"), []byte(strconv.Itoa(command.Process.Pid)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := killCgroupTreeWithOpen(root, func(string) (io.WriteCloser, error) { return nil, os.ErrNotExist })
+	if err != nil || result.Method != "recursive_signal" || !slices.Equal(result.PIDs, []int{command.Process.Pid}) {
+		t.Fatalf("pidfd fallback result=%+v err=%v", result, err)
+	}
+	err = command.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+		t.Fatalf("child exit = %v, want SIGKILL", err)
 	}
 }
 
