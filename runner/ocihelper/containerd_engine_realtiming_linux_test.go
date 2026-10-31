@@ -1392,7 +1392,12 @@ func assertReferenceComputerWireNegatives(t *testing.T, ctx context.Context, ses
 
 func exerciseNativeLinuxComputerAgentRestart(t *testing.T, ctx context.Context, adapter *ocirunner.Adapter, reference, digest string) bool {
 	t.Helper()
-	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "native-computer.sqlite"), l1.StoreOptions{LeaseDuration: 3 * time.Second, Jitter: func(time.Duration) time.Duration { return 10 * time.Millisecond }})
+	// The production lease, not a short test one: nothing renews this lease or
+	// the helper deadman that follows it (InitialDeadman below), so each run
+	// from claim to completion must fit inside it, even on a slow runner
+	// (#1410). The restart claim stays fast: the 10 ms jitter keeps the
+	// restart delay at its 500 ms floor.
+	store, err := l1.OpenStore(filepath.Join(t.TempDir(), "native-computer.sqlite"), l1.StoreOptions{LeaseDuration: l1.DefaultLeaseDuration, Jitter: func(time.Duration) time.Duration { return 10 * time.Millisecond }})
 	if err != nil {
 		t.Fatal(err)
 	}
