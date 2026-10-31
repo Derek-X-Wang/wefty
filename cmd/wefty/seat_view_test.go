@@ -24,13 +24,18 @@ func TestSeatViewRealBinary(t *testing.T) {
 	binary := buildWefty(t)
 	id := "seat_" + strings.Repeat("a", 32)
 	target := "http://seat-node:80/v1/seats/" + id + "/person/viewer"
-	for _, mode := range []string{"no-open", "json", "open", "term", "startup-ended"} {
+	for _, mode := range []string{"no-open", "json", "open", "term", "startup-ended", "admin-required"} {
 		t.Run(mode, func(t *testing.T) {
 			ended := atomic.Bool{}
 			ended.Store(mode == "startup-ended")
 			address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 				if r.Method != "GET" || r.URL.Path != "/v1/seats/"+id+"/viewer-target" || r.Header.Get("X-Wefty-Seat-Credential") != "" {
 					t.Errorf("unexpected discovery %s %s", r.Method, r.URL.Path)
+				}
+				if mode == "admin-required" {
+					w.WriteHeader(403)
+					w.Write([]byte(`{"error":{"code":"admin_required","message":"Viewing a Seat requires an administrator"}}`))
+					return
 				}
 				if ended.Load() {
 					w.WriteHeader(410)
@@ -53,7 +58,7 @@ func TestSeatViewRealBinary(t *testing.T) {
 			if mode == "no-open" || mode == "term" {
 				args = append(args, "--no-open")
 			}
-			if mode == "json" || mode == "startup-ended" {
+			if mode == "json" || mode == "startup-ended" || mode == "admin-required" {
 				args = append(args, "--json", "--no-open")
 			}
 			ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
@@ -71,7 +76,12 @@ func TestSeatViewRealBinary(t *testing.T) {
 			}
 			t.Cleanup(func() { cancel(); _ = command.Wait() })
 			reader := bufio.NewReader(stdout)
-			if mode == "startup-ended" {
+			if mode == "startup-ended" || mode == "admin-required" {
+				// admin_required is an authority refusal (exit 3), unlike seat_ended (exit 5).
+				wantExit, wantCode := 5, "seat_ended"
+				if mode == "admin-required" {
+					wantExit, wantCode = 3, "admin_required"
+				}
 				output, _ := io.ReadAll(reader)
 				err = command.Wait()
 				var exit *exec.ExitError
@@ -80,8 +90,8 @@ func TestSeatViewRealBinary(t *testing.T) {
 						Code string `json:"code"`
 					}
 				}
-				if !errors.As(err, &exit) || exit.ExitCode() != 5 || len(output) != 0 || json.Unmarshal(stderr.Bytes(), &result) != nil || result.Error.Code != "seat_ended" {
-					t.Fatal("startup lost the typed Seat end")
+				if !errors.As(err, &exit) || exit.ExitCode() != wantExit || len(output) != 0 || json.Unmarshal(stderr.Bytes(), &result) != nil || result.Error.Code != wantCode {
+					t.Fatalf("startup lost the typed %s refusal: err=%v stderr=%s", wantCode, err, &stderr)
 				}
 				return
 			}

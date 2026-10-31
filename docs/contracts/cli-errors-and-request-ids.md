@@ -583,7 +583,7 @@ caller to `wefty seat wait SEAT_ID`, before making any network call.
 
 `wefty seat view SEAT_ID` requires administrator person authority, without a
 Seat credential. Its read-only `viewer-target` discovery returns `admin_required`
-(HTTP 403, CLI exit 5) to non-admin people; machine principals receive the
+(HTTP 403, CLI exit 3) to non-admin people; machine principals receive the
 existing `principal_forbidden`. The front-door page, assets and browser session
 refuse non-admins with `control_not_authorized` (HTTP 403). An ended Seat returns
 `seat_ended` (CLI exit 5); a screen that is not published returns `unavailable`.
