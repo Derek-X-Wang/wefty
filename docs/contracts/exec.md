@@ -247,6 +247,10 @@ unrelated same-user process that reuses a selected pid after the inventory
 that selected it can receive SIGTERM or SIGKILL, whatever its name or working
 folder. The second inventory narrows this window before SIGKILL; it does not
 close it. Discovery or signalling failure never fails storage retirement.
+The agent re-verifies the retained folder's device and inode inside Bash after
+entering it. A same-user workload process that renames storage during the sweep
+can still redirect it, but can already signal those processes itself, so this
+grants no new power.
 
 Each stopped process emits one run-stderr line:
 `wefty: stopped process <pid> (<name>) left in run storage`.
@@ -264,12 +268,16 @@ and asynchronous deletion. Bash runs as the agent's direct child, so its parent
 exclusion protects the agent even if its executable has another name.
 The agent derives the physical mailbox path from its open directory handle,
 using `F_GETPATH` on macOS and `/proc/self/fd` on Linux. It checks that the
-resolved path and the held directory have the same file identity before scanning.
+resolved path and the held directory have the same file identity, then Bash
+enters that path and checks its device and inode against the retained handle
+before scanning. A mismatch or failed shell check warns and returns empty evidence.
 A moved mailbox is scanned
 at its physical location; a replacement at the old pathname is not scanned.
 If physical resolution fails, the sweep warns and skips. The shared script's
-inventory deadlines stay unchanged. A five-second outer deadline and bounded
-pipe wait prevent a stuck Bash helper from blocking the agent indefinitely.
+inventory deadlines stay unchanged. A five-second outer deadline covers the
+filesystem probes and Bash together, with a bounded pipe wait. Probes run in a
+goroutine so a stalled filesystem cannot block sweep finalization indefinitely;
+the goroutine can stay blocked, but closes any handle it returns after timeout.
 Sweep diagnostics use the run's stderr while open, otherwise the agent log.
 The agent retains its stopped list separately until wrapper evidence has been
 read, then appends it to the Attempt's `StoppedProcesses`. Neither source of

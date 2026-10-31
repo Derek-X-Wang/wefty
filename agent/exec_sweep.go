@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -20,6 +21,52 @@ import (
 // (F_GETPATH on Darwin, /proc/self/fd on Linux), then check its identity against
 // that handle. Failed or stale resolution skips the sweep with a warning.
 func (m *runMailbox) sweepExecCaptureRoot(ctx context.Context, root *os.Root, stale bool) []contract.StoppedProcess {
+	return m.sweepExecCaptureRootWithProbe(ctx, root, stale, 5*time.Second, probeExecSweepDirectory)
+}
+
+type execSweepDirectory struct {
+	directory          *os.File
+	physical, identity string
+}
+
+func probeExecSweepDirectory(root *os.Root) (target execSweepDirectory, err error) {
+	info, err := root.Lstat("wefty-exec-work")
+	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
+		return target, nil
+	}
+	if err != nil {
+		return target, fmt.Errorf("inspect exec storage: %w", err)
+	}
+	target.directory, err = root.Open(".")
+	if err != nil {
+		return target, fmt.Errorf("open retained exec mailbox: %w", err)
+	}
+	// The caller owns directory even on error, including a late probe result.
+	target.physical, err = execMailboxPhysicalPath(target.directory)
+	if err != nil {
+		return target, fmt.Errorf("resolve retained exec mailbox: %w", err)
+	}
+	held, err := target.directory.Stat()
+	if err != nil {
+		return target, err
+	}
+	resolved, err := os.Stat(target.physical)
+	if err != nil {
+		return target, err
+	}
+	if !filepath.IsAbs(target.physical) || !os.SameFile(held, resolved) {
+		return target, fmt.Errorf("physical path does not identify the retained mailbox")
+	}
+	stat := held.Sys().(*syscall.Stat_t)
+	target.identity = fmt.Sprintf("%d:%d", stat.Dev, stat.Ino)
+	return target, nil
+}
+
+func (m *runMailbox) sweepExecCaptureRootWithProbe(ctx context.Context, root *os.Root, stale bool, budget time.Duration, probe func(*os.Root) (execSweepDirectory, error)) []contract.StoppedProcess {
+	// Cancellation must not skip cleanup. This single budget starts before
+	// filesystem probes; Bash receives only the time remaining after them.
+	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
+	defer cancel()
 	diagnose := func(output []byte) {
 		if stale {
 			output = bytes.ReplaceAll(output, []byte("wefty: "), []byte("wefty: stale exec cleanup: "))
@@ -29,51 +76,72 @@ func (m *runMailbox) sweepExecCaptureRoot(ctx context.Context, root *os.Root, st
 		}
 		m.log("agent: %s", strings.TrimSpace(string(output)))
 	}
-	info, err := root.Lstat("wefty-exec-work")
-	if os.IsNotExist(err) || (err == nil && !info.IsDir()) {
-		return nil
+	type probeResult struct {
+		target execSweepDirectory
+		err    error
 	}
-	if err != nil {
-		diagnose([]byte(fmt.Sprintf("wefty: warning: could not inspect exec storage: %v\n", err)))
-		return nil
-	}
-	directory, err := root.Open(".")
-	if err != nil {
-		diagnose([]byte(fmt.Sprintf("wefty: warning: could not open retained exec mailbox: %v\n", err)))
-		return nil
-	}
-	defer directory.Close()
-	physical, err := execMailboxPhysicalPath(directory)
-	if err == nil {
-		var held, resolved os.FileInfo
-		held, err = directory.Stat()
-		if err == nil {
-			resolved, err = os.Stat(physical)
-			if err == nil && (!filepath.IsAbs(physical) || !os.SameFile(held, resolved)) {
-				err = fmt.Errorf("physical path does not identify the retained mailbox")
+	ready := make(chan probeResult)
+	go func() {
+		// A stalled filesystem can keep this goroutine blocked after timeout.
+		// It retains ownership until the unbuffered send transfers the handle;
+		// if it finishes late, it closes the handle itself instead.
+		target, err := probe(root)
+		select {
+		case ready <- probeResult{target, err}:
+		case <-sweepCtx.Done():
+			if target.directory != nil {
+				_ = target.directory.Close()
 			}
 		}
-	}
-	if err != nil {
-		diagnose([]byte(fmt.Sprintf("wefty: warning: could not resolve retained exec mailbox for process sweep: %v\n", err)))
+	}()
+	var result probeResult
+	select {
+	case result = <-ready:
+		if result.target.directory != nil {
+			defer result.target.directory.Close()
+		}
+	case <-sweepCtx.Done():
+		diagnose([]byte("wefty: warning: exec storage process sweep probes exceeded deadline; skipping sweep\n"))
 		return nil
 	}
-	// Do not inherit a cancelled workload/finalization context: cleanup still
-	// needs its own bounded window after cancellation. The script's inventory
-	// deadlines remain unchanged; this outer bound also covers a stuck helper.
-	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
+	if sweepCtx.Err() != nil {
+		diagnose([]byte("wefty: warning: exec storage process sweep probes exceeded deadline; skipping sweep\n"))
+		return nil
+	}
+	if result.err != nil {
+		diagnose([]byte(fmt.Sprintf("wefty: warning: could not probe retained exec mailbox for process sweep: %v\n", result.err)))
+		return nil
+	}
+	if result.target.directory == nil {
+		return nil
+	}
 	command := exec.CommandContext(sweepCtx, "/bin/bash", "-c", execsweep.Script+`
-sweep_exec_storage_processes "$1/wefty-exec-work"
+skip_sweep() {
+  printf 'wefty: warning: could not verify retained exec mailbox identity; skipping process sweep\n' >&2
+  printf '[]\n'
+  exit 0
+}
+cd -P -- "$1" || skip_sweep
+platform=$(uname -s) || skip_sweep
+case "$platform" in
+  Darwin) identity=$(stat -f '%d:%i' .) || skip_sweep ;;
+  Linux) identity=$(stat -c '%d:%i' .) || skip_sweep ;;
+  *) skip_sweep ;;
+esac
+[ "$identity" = "$2" ] || skip_sweep
+# Preserve trailing newlines so the shared script rejects unsupported paths.
+physical=$(pwd -P && printf '.') || skip_sweep
+physical=${physical%$'\n.'}
+sweep_exec_storage_processes "$physical/wefty-exec-work"
 printf '[%s]\n' "$exec_stopped_processes"
-`, "wefty-agent-exec-sweep", physical)
+`, "wefty-agent-exec-sweep", result.target.physical, result.target.identity)
 	command.Dir = "/"
 	command.WaitDelay = 100 * time.Millisecond
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	// Bash is the agent's direct child. Its $$ / $PPID exclusions protect
 	// itself and this agent, including in tests with a different process name.
-	err = command.Run()
+	err := command.Run()
 	if stderr.Len() > 0 {
 		diagnose(stderr.Bytes())
 	}
