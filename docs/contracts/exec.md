@@ -213,9 +213,10 @@ other folders beneath the capture. Version 2 uses
 `$WEFTY_RUN_DIR/wefty-exec-work`; restartable captures keep that path beneath
 their Attempt-specific mailbox. The retiring shell, its parent, and processes
 named `wefty-agent` are excluded.
-Storage paths containing a backslash or a control character skip scanning
-with a warning. Cwd records containing a backslash, tab, or newline never
-match, because macOS `lsof` can escape path bytes with backslashes.
+Storage paths containing a backslash, a caret (`^`), or a control character
+skip scanning with a warning. Cwd records containing a backslash, a caret, a
+tab, or a newline never match, because macOS `lsof` encodes path bytes as
+backslash escapes or caret text (`^A` for byte 0x01).
 
 Discovery uses a non-cgo inventory: UID-filtered `lsof` cwd records on macOS,
 or one GNU `find` call over UID-owned `/proc/*/cwd` links on Linux. Linux reads
@@ -237,10 +238,11 @@ excluding inventory processing, command and scheduling overhead. They leave
 within the agent's default five-second TERM grace. A shorter configured runner
 grace can interrupt the wrapper trap.
 A pid and a command name are not a stable process identity, and macOS has no
-pidfd. An unrelated same-user process that reuses a selected pid between an
-inventory and a signal, has the same name, and works in run storage can still
-receive that signal. The second inventory narrows this window before SIGKILL;
-it does not close it. Discovery or signalling failure never fails storage retirement.
+pidfd. Neither the name nor the cwd check is atomic with the signal. An
+unrelated same-user process that reuses a selected pid after the inventory
+that selected it can receive SIGTERM or SIGKILL, whatever its name or working
+folder. The second inventory narrows this window before SIGKILL; it does not
+close it. Discovery or signalling failure never fails storage retirement.
 
 Each stopped process emits one run-stderr line:
 `wefty: stopped process <pid> (<name>) left in run storage`.

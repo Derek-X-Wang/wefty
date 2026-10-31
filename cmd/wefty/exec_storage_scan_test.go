@@ -113,6 +113,8 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 		{name: "failed-and-gone", second: "return 1", gone: true, stopped: 1, warning: true},
 		{name: "escaped-cwd", first: `printf 'p43210\ncsleep\nn%s/%s\n' "$test_storage" 'escaped\folder'`, noTerm: true},
 		{name: "backslash-storage", folder: `capture\folder`, noTerm: true, scanWarning: true},
+		{name: "caret-cwd", first: `printf 'p43210\ncsleep\nn%s/%s\n' "$test_storage" '^A'`, noTerm: true},
+		{name: "caret-storage", folder: "capture^A", noTerm: true, scanWarning: true},
 		{name: "tab-storage", folder: "capture\tcontrol", noTerm: true, scanWarning: true},
 		{name: "newline-storage", folder: "capture\n", noTerm: true, scanWarning: true},
 		{name: "control-storage", folder: "capture\x01control", noTerm: true, scanWarning: true},
@@ -215,7 +217,7 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 			if got := strings.Count(stderr.String(), "wefty: warning: could not scan processes in run storage\n"); got != wantScanWarning {
 				t.Errorf("scan warning count = %d: %s", got, &stderr)
 			}
-			if got := strings.Count(stderr.String(), "wefty: warning: too many processes in run storage; stopped the first 64\n"); got != wantCapWarning {
+			if got := strings.Count(stderr.String(), "wefty: warning: too many processes in run storage; limited cleanup to the first 64 matching processes\n"); got != wantCapWarning {
 				t.Errorf("cap warning count = %d: %s", got, &stderr)
 			}
 			if got := strings.Count(stderr.String(), "wefty: warning: could not stop a process in run storage\n"); got != wantWarning {

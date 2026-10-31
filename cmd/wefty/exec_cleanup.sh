@@ -71,8 +71,9 @@ exec_storage_parse_inventory() {
     case "$protected" in *" $pid "*) continue ;; esac
     # Both discovery methods return physical cwd paths. pwd -P above resolves
     # the storage alias, including /var, /tmp and the run's short TMPDIR link.
-    # lsof escapes path bytes with backslashes; do not match ambiguous records.
-    case "$cwd" in *\\*|*$'\t'*|*$'\n'*) continue ;; esac
+    # lsof encodes path bytes as \ escapes or ^ caret text; do not match
+    # ambiguous records.
+    case "$cwd" in *\\*|*^*|*$'\t'*|*$'\n'*) continue ;; esac
     case "$cwd" in "$source"|"$source"/*) ;; *) continue ;; esac
     if [ "$platform" = Linux ]; then
       # Read a command name only for a matching cwd, not for every process.
@@ -100,7 +101,7 @@ sweep_exec_storage_processes() {
     return 0
   }
   source=${source%.}
-  case "$source" in *\\*|*[[:cntrl:]]*)
+  case "$source" in *\\*|*^*|*[[:cntrl:]]*)
     printf 'wefty: warning: could not scan processes in run storage\n' >&2
     return 0 ;;
   esac
@@ -119,7 +120,7 @@ sweep_exec_storage_processes() {
   for ((i=0; i<${#pids[@]}; i++)); do
     [ "${matches[i]}" -eq 1 ] || continue
     if [ "$selected" -eq 64 ]; then
-      printf 'wefty: warning: too many processes in run storage; stopped the first 64\n' >&2
+      printf 'wefty: warning: too many processes in run storage; limited cleanup to the first 64 matching processes\n' >&2
       break
     fi
     selected=$((selected+1))
