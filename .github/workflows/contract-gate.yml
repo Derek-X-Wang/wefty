@@ -99,9 +99,43 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       - name: Run cross-platform runner and contract tests
+        if: matrix.os != 'macos-latest'
+        run: go test -timeout=45m ./...
+      - name: Run cross-platform runner and contract tests (per-test times)
+        if: matrix.os == 'macos-latest'
         # cmd/wefty takes 1107-1552 s on hosted macOS runners and hit 30m
         # (#163, #1034, #1326; growth tracked in #1035); a hang still fails here.
-        run: go test -timeout=45m ./...
+        # -json records every test's elapsed time for #1035. The log shows the
+        # package lines as before, then the output of every test that failed
+        # or did not finish (a timeout panic ends a test without a fail event).
+        run: |
+          report="$RUNNER_TEMP/go-test.json"
+          set +e
+          go test -json -timeout=45m ./... | tee "$report" | jq --unbuffered -rj 'select((.Action == "output" and .Test == null) or .Action == "build-output") | .Output'
+          status=("${PIPESTATUS[@]}")
+          set -e
+          if [ "${status[0]}" -ne 0 ]; then
+            echo "--- output of tests that failed or did not finish ---"
+            jq -c 'select(.Test != null and (.Action == "run" or .Action == "pass" or .Action == "skip")) | [.Action, .Package, .Test]' "$report" |
+              jq -sc 'map(select(.[0] == "run") | .[1:]) - map(select(.[0] != "run") | .[1:])' > "$RUNNER_TEMP/unfinished.json"
+            jq -c 'select(.Action == "fail" and .Test == null) | .Package' "$report" | jq -sc . > "$RUNNER_TEMP/failed-packages.json"
+            # A failed package with no such test (a crash blamed on a finished test)
+            # replays all of its test output.
+            jq -rj --slurpfile unfinished "$RUNNER_TEMP/unfinished.json" --slurpfile failed "$RUNNER_TEMP/failed-packages.json" '
+              $unfinished[0] as $u | ($failed[0] - ($u | map(.[0]))) as $whole
+              | select(.Action == "output" and .Test != null and (([.Package, .Test] | IN($u[])) or (.Package | IN($whole[]))))
+              | .Output' "$report"
+          fi
+          [ "${status[1]}" -eq 0 ] && [ "${status[2]}" -eq 0 ] || exit 1
+          exit "${status[0]}"
+      - name: Upload per-test times
+        if: always() && matrix.os == 'macos-latest'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: go-test-json-macos-latest
+          path: ${{ runner.temp }}/go-test.json
+          retention-days: 14
+          if-no-files-found: warn
 
   service-acceptance:
     name: service-acceptance / ${{ matrix.os }}
