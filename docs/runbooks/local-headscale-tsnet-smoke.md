@@ -41,25 +41,53 @@ chmod 700 "$HS_ROOT/headscale"
 "$HS_ROOT/headscale" version
 ```
 
-There is no DERP relay or STUN service in this layout. A local map with one
-region and no relay nodes satisfies Headscale's nonempty-map startup check.
-It leaves peer traffic dependent on direct connections on the same machine.
-This map was accepted at startup; tsnet peer traffic with it remains unverified.
-An entirely empty DERP map was rejected with
+Peers need a DERP relay. Run a local `derper` from the same `tailscale.com`
+version wefty pins (v1.104.1), bound to loopback, with a self-signed
+certificate it creates itself, and point a one-node DERP map at it. A map with
+a region but **no relay nodes** is accepted by Headscale, but then netcheck
+never records a working IPv4 send, and every node loops on
+`magicsock: last netcheck reported send error. Rebinding.` and never completes
+a handshake (#1376). An entirely empty DERP map is rejected with
 `initial DERPMap is empty, Headscale requires at least one entry`.
+Do not use `derper -dev`: in v1.104.1 it listens on all interfaces.
+`InsecureForTests` skips certificate checks; it does not turn TLS off.
 There are no external DERP map URLs, update checks, or logtail upload configured.
 The metrics listener is disabled. Remote gRPC is disabled without TLS because
 `grpc_allow_insecure` is false; its configured address is also loopback.
 Administration uses a mode-600 Unix socket.
 
 ```bash
+# Build derper outside the wefty module: wefty's go.sum does not list its
+# dependencies. GOBIN keeps the binary inside the scratch directory.
+(cd "$HS_ROOT" && GOBIN="$HS_ROOT" go install tailscale.com/cmd/derper@v1.104.1)
+mkdir -p "$HS_ROOT/certs"
+"$HS_ROOT/derper" -a=127.0.0.1:18443 -http-port=-1 \
+  -stun=true -stun-port=13478 \
+  -certmode=manual -hostname=127.0.0.1 -certdir="$HS_ROOT/certs" \
+  -c="$HS_ROOT/derper.json" -verify-clients=false \
+  > "$HS_ROOT/derper.log" 2>&1 &
+DERP_PID=$!
+# Ready when this succeeds. Listeners must be 127.0.0.1 only.
+curl --fail --silent --show-error --insecure \
+  https://127.0.0.1:18443/derp/latency-check >/dev/null
+lsof -nP -a -p "$DERP_PID" -i
+
 cat > "$HS_ROOT/derp.yaml" <<'YAML'
 regions:
   999:
     regionid: 999
     regioncode: local
-    regionname: Local direct-only smoke
-    nodes: []
+    regionname: Local TLS relay
+    nodes:
+      - name: local-1
+        regionid: 999
+        hostname: 127.0.0.1
+        ipv4: 127.0.0.1
+        ipv6: none
+        derpport: 18443
+        stunport: 13478
+        insecurefortests: true
+        canport80: false
 YAML
 
 cat > "$HS_ROOT/policy.hujson" <<'JSON'
@@ -164,6 +192,9 @@ PY
 export TS_CONTROL_URL=http://127.0.0.1:18081
 export TS_AUTHKEY="$(cat "$HS_ROOT/machine.key")"
 export TS_AUTHKEY_CI_TESTER="$(cat "$HS_ROOT/person.key")"
+# Send peer traffic through the local relay; skip router port mapping.
+export TS_DEBUG_ALWAYS_USE_DERP=true
+export TS_DISABLE_PORTMAPPER=true
 ```
 
 The environment values are `TS_CONTROL_URL=http://127.0.0.1:18081`,
@@ -178,10 +209,13 @@ the key values in it. These commands need a host shell: a sandbox that blocks
 `sysctl`, routing sockets or loopback networking cannot run them.
 
 ```bash
-go test -tags=tsnet_smoke ./fabric/tsnet -run '^TestTSNet(Smoke|PersonWhoAmI)$'
+go test -count=1 -timeout 45m -tags=tsnet_smoke ./fabric/tsnet -run '^TestTSNet(Smoke|PersonWhoAmI)$'
 # Repeat the load preflight before this second command.
-go test -tags=tsnet_smoke ./agent -run '^TestTSNet(Smoke|ServiceReachability)$'
+go test -count=1 -timeout 45m -tags=tsnet_smoke ./agent -run '^TestTSNet(Smoke|ServiceReachability)$'
 ```
+
+The agent tests need #1383 (managed root under a symbolic-link temp folder) and
+#1393 (port 80 is reserved; registration retry) on the checkout.
 
 ## A3. Check identity and the missing-domain case
 
@@ -209,6 +243,32 @@ MagicDNS as well and measuring that client-side result remains untried.
 No new test or product-code change was added.
 
 ## A4–A5. Results and limits
+
+### Second run, with a local relay (2026-10-31)
+
+Same Headscale and `tailscale.com` versions, checkout `3472dddc` plus #1393,
+the local `derper` and DERP map above, `TS_DEBUG_ALWAYS_USE_DERP=true`:
+
+| Test | Result |
+| --- | --- |
+| `fabric/tsnet.TestTSNetSmoke` | PASS (9.8 s) |
+| `fabric/tsnet.TestTSNetPersonWhoAmI` | PASS (11.3 s) |
+| `agent.TestTSNetSmoke` | PASS (9.9 s) |
+| `agent.TestTSNetServiceReachability` | PASS (11.9 s) |
+
+No `Rebinding` lines. `derper` listened only on `127.0.0.1:18443` (TCP) and
+`127.0.0.1:13478` (UDP). Without #1393 the two agent tests failed for test-only
+reasons: a 10.2 s registration timeout, and `published port 80 is reserved for
+wefty's Seat front door`. A3's identity checks run after a connection, so they
+now ran and passed inside `TestTSNetPersonWhoAmI` and `TestTSNetSmoke`.
+
+Still open: direct UDP paths between nodes on one Mac (the relay was forced).
+On macOS, netns does not bind loopback TCP to an interface, but magicsock's
+wildcard UDP sockets can be bound to the default-route interface. Testing
+that needs a test-only `netns.SetEnabled(false)` build without
+`TS_DEBUG_ALWAYS_USE_DERP`.
+
+### First run, without a relay (2026-10-30)
 
 Date: **2026-10-30**. Platform: macOS arm64. Headscale: **v0.29.5**, official
 release binary, commit `0f7d1e536bed9f01dd7161f7637af19bb0908335`.
@@ -265,17 +325,16 @@ remains the owner's.
 
 Follow-up work (owner decides):
 
-- Separate the A4 causes: rerun with a local DERP relay, then with
-  `netns.SetEnabled(false)` in a test-only build.
-- Make `agent.TestTSNetServiceReachability` pass on macOS (resolve the
-  temporary folder's symbolic links before using it as the managed root).
+- Done 2026-10-31: rerun with a local DERP relay (all four pass, see above).
+  Still open: direct UDP with `netns.SetEnabled(false)` in a test-only build.
+- Done: `agent.TestTSNetServiceReachability` on macOS (#1383).
 - OIDC person login; not tried. The person key only tests untagged key
   enrollment.
 - Saved connection profile with an HTTPS control URL,
   `wefty setup --control-url` and attended `--with-person` (A6); not tried.
 - Headscale `main` / the unreleased 0.30 line; not tried.
 - Other interface layouts, multi-homed hosts, exit nodes, remote clients,
-  HTTPS, or a live DERP relay; not tried.
+  HTTPS, or a public DERP relay; not tried.
 
 ## Cleanup
 
@@ -283,11 +342,12 @@ Stop only the server this shell started, then remove its entire scratch
 directory and clear the environment. Do not stop unrelated Headscale processes.
 
 ```bash
-kill "$HS_PID"
-wait "$HS_PID"
+kill "$HS_PID" "$DERP_PID"
+wait "$HS_PID" "$DERP_PID"
 unset TS_AUTHKEY TS_AUTHKEY_CI_TESTER TS_CONTROL_URL
+unset TS_DEBUG_ALWAYS_USE_DERP TS_DISABLE_PORTMAPPER
 rm -rf -- "$HS_ROOT"
-pgrep -fl headscale
+pgrep -fl 'headscale|derper'
 ls "$HS_ROOT"
 ```
 
