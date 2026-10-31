@@ -14,6 +14,7 @@ import (
 )
 
 func TestEveryCommandErrorContractFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	cases := []struct {
 		code         contract.ErrorCode
@@ -63,6 +64,7 @@ func TestEveryCommandErrorContractFromRealBinary(t *testing.T) {
 }
 
 func TestLocalAndUsageJSONErrorsFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	for _, jsonFlag := range []string{"--json", "--json=true"} {
 		for _, index := range []int{0, 1, 3} {
@@ -96,6 +98,7 @@ func TestLocalAndUsageJSONErrorsFromRealBinary(t *testing.T) {
 }
 
 func TestReviewTypedOutcomesFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	address := startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -130,6 +133,7 @@ func TestReviewTypedOutcomesFromRealBinary(t *testing.T) {
 }
 
 func TestReviewUnavailableFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	gateway := startStubLedger(t, func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "gateway offline", 502) })
 	for _, address := range []string{unusedAddress(t), gateway} {
@@ -142,6 +146,7 @@ func TestReviewUnavailableFromRealBinary(t *testing.T) {
 }
 
 func TestReviewMissingAddressUsageFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	for _, args := range [][]string{
 		{"--json", "--l1=", "nodes", "list"},
@@ -156,6 +161,7 @@ func TestReviewMissingAddressUsageFromRealBinary(t *testing.T) {
 }
 
 func TestReviewJSONFlagValueCollision(t *testing.T) {
+	t.Parallel()
 	for _, value := range []string{"--json", "--json=nope", "--json=false"} {
 		for _, flag := range []string{"--params", "--script", "--argv", "--summary", "--cursor", "--plain-identity"} {
 			args := []string{"submit", flag, value, "--json"}
@@ -182,6 +188,7 @@ func TestReviewJSONFlagValueCollision(t *testing.T) {
 }
 
 func TestReviewJSONFlagValueFromRealBinary(t *testing.T) {
+	t.Parallel()
 	binary := buildWefty(t)
 	code, output := runWefty(t, binary, 30*time.Second, "--json", "submit", "--workflow-ref=test/v1", "--params", "--json=nope")
 	var envelope contract.ErrorResponse

@@ -47,6 +47,7 @@ type storageCLIHarness struct {
 }
 
 func TestComputerStorageCLIOverRealL1AndHelperSeams(t *testing.T) {
+	t.Parallel()
 	assertComputerStorageCLIOverRealL1AndHelperSeams(t)
 }
 
@@ -114,6 +115,7 @@ func assertComputerStorageCLIOverRealL1AndHelperSeams(t *testing.T) {
 }
 
 func TestComputerStorageCLIAdversarialRows(t *testing.T) {
+	t.Parallel()
 	assertComputerStorageCLIAdversarialRows(t)
 }
 
@@ -288,6 +290,7 @@ func assertComputerStorageCLIAdversarialRows(t *testing.T) {
 }
 
 func TestComputerStorageCLIWaitPathsOverHelperSeam(t *testing.T) {
+	t.Parallel()
 	assertComputerStorageCLIWaitPathsOverHelperSeam(t)
 }
 
@@ -372,6 +375,7 @@ func assertComputerStorageCLIWaitPathsOverHelperSeam(t *testing.T) {
 }
 
 func TestCustodyImportWaitUsesDurableLedgerState(t *testing.T) {
+	t.Parallel()
 	t.Run("completed ledger row returns without another event", func(t *testing.T) {
 		h := newStorageCLIHarness(t)
 		manifest, manifestPath, manifestDigest := writeStorageCLICustodyManifest(t, h)
@@ -490,6 +494,7 @@ func TestCustodyImportWaitUsesDurableLedgerState(t *testing.T) {
 }
 
 func TestCustodyImportTerminalOutcomeWordingAndExitCodes(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		outcome custodyImportOutcome
 		detail  string
@@ -595,6 +600,7 @@ func (runtime fix303RuntimeLossRuntime) CopyComputerStorage(_ context.Context, r
 }
 
 func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing.T) {
+	t.Parallel()
 	h := newStorageCLIHarness(t)
 	barrier := &fix303BootBarrier{}
 	runtime := fix303RuntimeLossRuntime{copyCalls: make(chan workloadrunner.ComputerStorageCopyRequest, 1), barrier: barrier}
@@ -668,6 +674,7 @@ func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing
 }
 
 func TestComputerStorageCLIUsageIsTypedJSONAndWaitReportsAcceptedMutation(t *testing.T) {
+	t.Parallel()
 	for _, args := range [][]string{
 		{"services", "backup", "create", "computer-one"},
 		{"services", "restore", "computer-one", "backup-one", "--keep-old-as-backup", "--retire-old"},
@@ -723,6 +730,7 @@ func custodyImportObservationClients(t *testing.T, observation l1.ComputerCustod
 }
 
 func TestStorageMutationRenderingKeepsEveryResourceAndAppliedFactsOnReadFailure(t *testing.T) {
+	t.Parallel()
 	completed := time.Date(2026, 8, 28, 20, 1, 0, 0, time.UTC)
 	output := storageMutationOutput{
 		MutationApplied: true,
@@ -1174,6 +1182,7 @@ func writeStorageCLICustodyManifest(t *testing.T, h *storageCLIHarness) (contrac
 // A clone that never copied a byte is a failure, not a completed revision:
 // `--wait` must report the capacity refusal the destination latched.
 func TestComputerCloneWaitReportsTheCapacityRefusal(t *testing.T) {
+	t.Parallel()
 	h := newStorageCLIHarness(t)
 	runStorageCLI(t, h.ctx, h.clients, true, "services", "backup", "set-cap", h.computer.ComputerID,
 		"--cap", "1", "--expect-current")
@@ -1245,6 +1254,7 @@ func TestComputerCloneWaitReportsTheCapacityRefusal(t *testing.T) {
 // was lost while it copied, is equally a failure `--wait` must report rather
 // than a revision that copied no bytes (#526).
 func TestComputerCloneWaitReportsAnUnpreparableDestination(t *testing.T) {
+	t.Parallel()
 	h := newStorageCLIHarness(t)
 	runStorageCLI(t, h.ctx, h.clients, true, "services", "backup", "set-cap", h.computer.ComputerID,
 		"--cap", "1", "--expect-current")
