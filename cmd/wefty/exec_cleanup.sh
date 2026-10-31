@@ -18,10 +18,10 @@ exec_storage_process_inventory() {
 # use / as cwd; there is no scratch directory to delete before retirement.
 exec_storage_bounded_inventory() {
   cd / || return 1
-  local scan watchdog status
-  exec_storage_process_inventory "$@" 2>/dev/null &
+  local scan watchdog status deadline=${3:-1}
+  exec_storage_process_inventory "$1" "$2" 2>/dev/null &
   scan=$!
-  ( sleep 1; kill -KILL "$scan" 2>/dev/null || : ) </dev/null >/dev/null 2>&1 &
+  ( sleep "$deadline"; kill -KILL "$scan" 2>/dev/null || : ) </dev/null >/dev/null 2>&1 &
   watchdog=$!
   wait "$scan" 2>/dev/null
   status=$?
@@ -49,42 +49,22 @@ exec_storage_json_string() {
   exec_process_json="\"$escaped\""
 }
 
-# This runs before retirement, with stderr still connected to the run log.
-# One inventory, bounded to one second; no discovery retry. Helpers use /
-# as cwd so the sweep cannot select its own inventory or deadline worker.
-sweep_exec_storage_processes() {
-  exec_stopped_processes=''
-  local source=$1 inventory status platform field pid='' name='' cwd=''
-  local uid protected i index warning=0
-  local pids=() names=() folders=() stopped=()
-  [ -d "$source" ] && [ ! -L "$source" ] || return 0
-  source=${source%/}
-  source=$(cd -P -- "${source%/*}" && printf '%s/%s' "$PWD" "${source##*/}") || {
-    printf 'wefty: warning: could not scan processes in run storage\n' >&2
-    return 0
-  }
-  platform=$(uname -s)
-  uid=$(id -u)
-  inventory=$(exec_storage_bounded_inventory "$platform" "$uid")
-  status=$?
-  # A proc entry can vanish between the glob and find's stat/readlink. Keep
-  # complete usable records from that scan; a wholly failed scan still warns.
-  if [ "$platform" = Linux ] && [ "$status" -eq 1 ] && [ -n "$inventory" ]; then status=0; fi
-  if [ "$status" -ne 0 ]; then
-    printf 'wefty: warning: could not scan processes in run storage\n' >&2
-    return 0
-  fi
+# Populate the caller's pids/names/folders and mark storage matches. Retain
+# nonmatching pids too: a changed cwd or name does not prove the process stopped.
+exec_storage_parse_inventory() {
+  local inventory=$1 platform=$2 source=$3 protected=" $$ $PPID "
+  local field pid name cwd i index
+  pids=() names=() folders=() matches=()
   index=-1
   while IFS= read -r field; do
     case "$field" in
       p*) pid=${field#p}; pid=${pid#/proc/}
           case "$pid" in ''|*[!0-9]*) index=-1; continue ;; esac
-          index=${#pids[@]}; pids[index]=$pid; names[index]=''; folders[index]='' ;;
+          index=${#pids[@]}; pids[index]=$pid; names[index]=''; folders[index]=''; matches[index]=0 ;;
       c*) [ "$index" -lt 0 ] || names[index]=${field#c} ;;
       n*) [ "$index" -lt 0 ] || folders[index]=${field#n} ;;
     esac
   done <<< "$inventory"
-  protected=" $$ $PPID "
   for ((i=0; i<${#pids[@]}; i++)); do
     pid=${pids[i]} name=${names[i]} cwd=${folders[i]}
     case "$pid" in ''|*[!0-9]*|0|1) continue ;; esac
@@ -99,16 +79,73 @@ sweep_exec_storage_processes() {
       names[i]=$name
     fi
     [ "$name" != wefty-agent ] || continue
-    if kill -TERM "$pid" 2>/dev/null; then stopped[${#stopped[@]}]=$i
+    matches[i]=1
+  done
+}
+
+# This runs before retirement, with stderr still connected to the run log.
+# Discovery has a one-second bound; confirmation before KILL has 600 ms.
+sweep_exec_storage_processes() {
+  exec_stopped_processes=''
+  local source=$1 inventory status platform pid name cwd
+  local uid i j index warning=0
+  local pids=() names=() folders=() matches=()
+  local termed_pids=() termed_names=() termed_folders=()
+  [ -d "$source" ] && [ ! -L "$source" ] || return 0
+  source=${source%/}
+  source=$(cd -P -- "${source%/*}" && printf '%s/%s' "$PWD" "${source##*/}") || {
+    printf 'wefty: warning: could not scan processes in run storage\n' >&2
+    return 0
+  }
+  platform=$(uname -s)
+  uid=$(id -u)
+  inventory=$(exec_storage_bounded_inventory "$platform" "$uid" 1)
+  status=$?
+  # A proc entry can vanish between the glob and find's stat/readlink. Keep
+  # complete usable records from that scan; a wholly failed scan still warns.
+  if [ "$platform" = Linux ] && [ "$status" -eq 1 ] && [ -n "$inventory" ]; then status=0; fi
+  if [ "$status" -ne 0 ]; then
+    printf 'wefty: warning: could not scan processes in run storage\n' >&2
+    return 0
+  fi
+  exec_storage_parse_inventory "$inventory" "$platform" "$source"
+  for ((i=0; i<${#pids[@]}; i++)); do
+    [ "${matches[i]}" -eq 1 ] || continue
+    pid=${pids[i]} name=${names[i]} cwd=${folders[i]}
+    if kill -TERM "$pid" 2>/dev/null; then
+      index=${#termed_pids[@]}
+      termed_pids[index]=$pid termed_names[index]=$name termed_folders[index]=$cwd
     elif kill -0 "$pid" 2>/dev/null; then warning=1
     fi
   done
-  if [ "${#stopped[@]}" -gt 0 ]; then
+  if [ "${#termed_pids[@]}" -gt 0 ]; then
     sleep 0.2
-    for index in "${stopped[@]}"; do
-      pid=${pids[index]} name=${names[index]} cwd=${folders[index]}
-      if kill -0 "$pid" 2>/dev/null && ! kill -KILL "$pid" 2>/dev/null; then
-        if kill -0 "$pid" 2>/dev/null; then warning=1; continue; fi
+    inventory=$(exec_storage_bounded_inventory "$platform" "$uid" 0.6)
+    status=$?
+    # Processes exit after TERM, so proc entries vanish mid-scan; a vanished
+    # pid is absent from the records, which is the stopped case.
+    if [ "$platform" = Linux ] && [ "$status" -eq 1 ] && [ -n "$inventory" ]; then status=0; fi
+    if [ "$status" -eq 0 ]; then
+      exec_storage_parse_inventory "$inventory" "$platform" "$source"
+    else
+      warning=1
+    fi
+    for ((i=0; i<${#termed_pids[@]}; i++)); do
+      pid=${termed_pids[i]} name=${termed_names[i]} cwd=${termed_folders[i]}
+      if [ "$status" -ne 0 ]; then
+        # No KILL after failed confirmation; only a vanished pid is confirmed.
+        if kill -0 "$pid" 2>/dev/null; then continue; fi
+      else
+        index=-1
+        for ((j=0; j<${#pids[@]}; j++)); do
+          if [ "${pids[j]}" = "$pid" ]; then index=$j; break; fi
+        done
+        if [ "$index" -ge 0 ]; then
+          [ "${matches[index]}" -eq 1 ] && [ "${names[index]}" = "$name" ] || continue
+          if kill -0 "$pid" 2>/dev/null && ! kill -KILL "$pid" 2>/dev/null; then
+            if kill -0 "$pid" 2>/dev/null; then warning=1; continue; fi
+          fi
+        fi
       fi
       # %q keeps the log to one line even for an unusual process name.
       printf 'wefty: stopped process %s (%q) left in run storage\n' "$pid" "$name" >&2

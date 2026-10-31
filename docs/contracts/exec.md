@@ -214,17 +214,21 @@ other folders beneath the capture. Version 2 uses
 their Attempt-specific mailbox. The retiring shell, its parent, and processes
 named `wefty-agent` are excluded.
 
-Discovery uses one non-cgo inventory: UID-filtered `lsof` cwd records on macOS,
+Discovery uses a non-cgo inventory: UID-filtered `lsof` cwd records on macOS,
 or one GNU `find` call over UID-owned `/proc/*/cwd` links on Linux. Linux reads
 `/proc/<pid>/comm` only for matching folders. Inventory stays in a pipe and
 shell memory, without a scratch directory or a foreground removal.
-The inventory has a one-second deadline and no retry. Selected processes get
-SIGTERM, 200 ms grace, then SIGKILL if still present, followed by a 100 ms
-release wait. These stages total at most 1.3 seconds, excluding command and
-scheduling overhead. They leave 700 ms within the CLI's two-second foreground
-sweep budget and 3.7 seconds within the agent's default five-second TERM grace.
-A shorter configured runner grace can interrupt the wrapper trap. Discovery
-or signalling failure emits a warning and never fails storage retirement.
+The first inventory has a one-second deadline. Selected processes get SIGTERM
+and 200 ms grace. A second inventory, bounded to 600 ms, confirms the same pid
+and command name still have a working folder in storage before SIGKILL. Both
+passes exclude the retiring shell, its parent, and `wefty-agent`. A pid absent
+from the second inventory counts as stopped by SIGTERM. Failed confirmation
+sends no SIGKILL, emits one warning, and reports only pids confirmed gone by
+`kill -0`. A 100 ms release wait follows. These stages total at most 1.9 seconds,
+excluding command and scheduling overhead. They leave 100 ms within the CLI's
+two-second foreground sweep budget and 3.1 seconds within the agent's default
+five-second TERM grace. A shorter configured runner grace can interrupt the
+wrapper trap. Discovery or signalling failure never fails storage retirement.
 
 Each stopped process emits one run-stderr line:
 `wefty: stopped process <pid> (<name>) left in run storage`.
