@@ -206,6 +206,8 @@ func TestExecStorageSweepEvidenceReachesAttempt(t *testing.T) {
 	if err != nil || len(runs.Runs) != 1 {
 		t.Fatalf("runs: %+v %v", runs, err)
 	}
+	// exec returns at the command's exit; the node uploads the result just before it ends the Attempt.
+	waitExecRunTerminal(t, stack.clients, runs.Runs[0].RunID)
 	record, err := stack.clients.getRunResult(t.Context(), runs.Runs[0].RunID)
 	if err != nil {
 		t.Fatal(err)
