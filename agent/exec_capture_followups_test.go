@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // Only retry waits advance time. Network inactivity timers stay armed until
@@ -189,19 +191,19 @@ func TestExecCaptureKilledWrapperCleanupDoesNotWaitForDeletion(t *testing.T) {
 		unblock()
 		select {
 		case <-finished:
-		case <-time.After(2 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("background deletion did not finish after release")
 		}
 	})
 	var pending deletion
 	select {
 	case pending = <-entered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("cleanup did not start background deletion")
 	}
 	select {
 	case <-returned:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("completion waited for recursive deletion")
 	}
 	select {
@@ -227,7 +229,7 @@ func TestExecCaptureKilledWrapperCleanupDoesNotWaitForDeletion(t *testing.T) {
 		if err != nil {
 			t.Fatalf("background deletion failed: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("background deletion did not finish after release")
 	}
 	waitExecCaptureTrash(t, mailbox.directory)

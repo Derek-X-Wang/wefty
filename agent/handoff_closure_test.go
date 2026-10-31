@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -170,7 +171,7 @@ func TestHandoffCancelledWaiterCannotRetainOwnersResults(t *testing.T) {
 		if err == nil {
 			t.Fatal("canceled waiter succeeded")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("canceled waiter did not exit")
 	}
 	if lifecycle.handoffOwnership != nil || lifecycle.resultsRetained.Load() {
@@ -218,7 +219,7 @@ func TestHandoffAttemptArrivingDuringExpiryAcquiresAfterDeletion(t *testing.T) {
 	go func() { collected <- harness.manager.collect() }()
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("collector did not reach deletion")
 	}
 	acquired := make(chan error, 1)
@@ -242,7 +243,7 @@ func TestHandoffAttemptArrivingDuringExpiryAcquiresAfterDeletion(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("collection blocked")
 	}
 	select {
@@ -250,7 +251,7 @@ func TestHandoffAttemptArrivingDuringExpiryAcquiresAfterDeletion(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("collector stranded arriving attempt")
 	}
 	if _, err := os.Stat(filepath.Join(path, "result.json")); !os.IsNotExist(err) {
@@ -398,7 +399,7 @@ func prepareWithoutBlocking(t *testing.T, harness *retentionHarness, runID, path
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		file, _ := os.OpenFile(marker, os.O_RDWR|syscall.O_NONBLOCK, 0)
 		if file != nil {
 			file.Close()

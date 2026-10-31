@@ -21,6 +21,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -330,7 +331,7 @@ func forcedShutdownAgainstSlowL1(t *testing.T, timeouts ShutdownTimeouts, slowKi
 	if slices.Contains(slowKinds, "logs") {
 		select {
 		case <-heldLogs:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("no log batch reached the slow L1")
 		}
 	}
@@ -352,7 +353,7 @@ func forcedShutdownAgainstSlowL1(t *testing.T, timeouts ShutdownTimeouts, slowKi
 	go func() { holding.Wait(); close(released) }()
 	select {
 	case <-released:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("a held L1 call was never abandoned by the agent")
 	}
 	mu.Lock()

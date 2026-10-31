@@ -137,7 +137,7 @@ func assertOutputSinkFactorySupportsConcurrentAttemptIsolation(t *testing.T) {
 		select {
 		case attemptID := <-entered:
 			seen[attemptID] = true
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("output sink factory was not invoked concurrently")
 		}
 	}
@@ -183,7 +183,7 @@ func assertSerialLogfContainsConcurrentCallers(t *testing.T) {
 	}
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("first logger call did not enter")
 	}
 	select {
@@ -194,7 +194,7 @@ func assertSerialLogfContainsConcurrentCallers(t *testing.T) {
 	release <- struct{}{}
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("second logger call did not enter after serialization")
 	}
 	release <- struct{}{}

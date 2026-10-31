@@ -25,6 +25,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -659,7 +660,7 @@ func TestUpgradeRollingGenerationOperationsUseInstalledAgent(t *testing.T) {
 	go func() { in, err := op.promoteGeneration(t.Context(), p, request); reply <- promotionReply{in, err} }()
 	select {
 	case <-promotionCommitted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not commit promotion")
 	}
 	retired := make(chan error, 1)
@@ -677,14 +678,14 @@ func TestUpgradeRollingGenerationOperationsUseInstalledAgent(t *testing.T) {
 	case result := <-reply:
 		mustRolling(t, result.err)
 		promoted = result.inventory
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("missing durable promotion reply")
 	}
 	if !retiredEarly {
 		select {
 		case err := <-retired:
 			mustRolling(t, err)
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("retirement did not join promotion reply")
 		}
 	}

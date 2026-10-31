@@ -17,6 +17,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/seatcopy"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -348,7 +349,7 @@ func awaitSeatLeaseSchedule(t *testing.T, c *seatLeaseTestClock, done <-chan str
 		return d
 	case <-done:
 		t.Fatal("copy stopped before lease retry")
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("lease scheduling did not progress")
 	}
 	return 0
@@ -476,7 +477,7 @@ func awaitSeatLeaseAttempt(t *testing.T, c *retryLeaseCopyControl) error {
 	select {
 	case err := <-c.attempts:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("no renewal attempt")
 	}
 	return nil

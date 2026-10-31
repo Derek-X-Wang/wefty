@@ -57,7 +57,7 @@ func TestSecondShutdownSignalCancelsWhileGracefulDrainIsStillJoining(t *testing.
 	signals <- os.Interrupt
 	select {
 	case <-canceled:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("second shutdown signal remained blocked behind graceful drain")
 	}
 	select {
@@ -65,7 +65,7 @@ func TestSecondShutdownSignalCancelsWhileGracefulDrainIsStillJoining(t *testing.
 		if !strings.Contains(line, "forced_shutdown") || !strings.Contains(line, "second_signal") {
 			t.Fatalf("forced shutdown evidence = %q", line)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("second shutdown signal emitted no typed forced-shutdown evidence")
 	}
 	close(releaseDrain)
@@ -88,7 +88,7 @@ func TestSingleShutdownSignalDrainsToCompletionWithoutForcingCancellation(t *tes
 	signals <- os.Interrupt
 	select {
 	case <-drained:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("single shutdown signal did not complete graceful drain")
 	}
 	select {
@@ -116,7 +116,7 @@ func TestSecondShutdownSignalAfterDrainStillEmitsForcedShutdownEvidence(t *testi
 	signals <- os.Interrupt
 	select {
 	case <-canceled:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("post-drain second signal did not cancel")
 	}
 	select {
@@ -124,7 +124,7 @@ func TestSecondShutdownSignalAfterDrainStillEmitsForcedShutdownEvidence(t *testi
 		if !strings.Contains(line, "forced_shutdown") || !strings.Contains(line, "second_signal") {
 			t.Fatalf("forced shutdown evidence = %q", line)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("post-drain second signal emitted no typed evidence")
 	}
 }
@@ -500,7 +500,7 @@ func TestControllerStopWaitsForRealInFlightCompletionRequest(t *testing.T) {
 	}()
 	select {
 	case <-requestEntered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("completion request did not enter L1")
 	}
 	observedRuntime := &stopObservingAgentRuntime{Agent: nodeAgent, stopEntered: make(chan struct{})}
@@ -540,7 +540,7 @@ func TestControllerStopWaitsForRealInFlightCompletionRequest(t *testing.T) {
 		if result.err != nil || !result.response.RuntimeQuiesced || result.response.Intent.Revision != 2 {
 			t.Fatalf("controller stop=%+v err=%v", result.response, result.err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("controller stop did not finish after completion returned")
 	}
 	select {

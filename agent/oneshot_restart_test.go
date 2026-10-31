@@ -19,6 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	wr "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -213,7 +214,7 @@ func TestRestartableRenewalConsumesExactInterruption(t *testing.T) {
 			clock.Advance(100 * time.Millisecond)
 			select {
 			case <-done:
-			case <-time.After(time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("renewal did not return")
 			}
 			failure := <-failures

@@ -23,6 +23,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -78,13 +79,13 @@ func newUpgradeFailureFixtureWithServices(t *testing.T, hook func(*Agent), lease
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("agent did not join")
 		}
 	})
 	select {
 	case <-a.Registered():
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("registration timeout")
 	}
 	f := &upgradeFailureFixture{a: a, store: store, done: done}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestComputerGrantPolicyDistribution(t *testing.T) {
@@ -91,7 +92,7 @@ func TestComputerPolicyWatchUsesInjectedClockAndBoundedWait(t *testing.T) {
 		if !bytes.Contains(body, []byte("snapshot_digest")) {
 			t.Fatalf("watch response = %s", body)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("watch did not wake from injected clock")
 	}
 }

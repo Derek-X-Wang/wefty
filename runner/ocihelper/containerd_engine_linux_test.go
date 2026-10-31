@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/leases"
@@ -433,7 +434,7 @@ func TestAttemptOwnershipSnapshotCannotOverlapPublication(t *testing.T) {
 		if result.err != nil || len(result.records) != 1 || result.records[authority.key()].Authority != authority {
 			t.Fatalf("serialized Attempt ownership snapshot = records=%v err=%v", result.records, result.err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Attempt ownership snapshot did not proceed after publication")
 	}
 	if err := engine.removeAttemptOwnershipRecord(record); err != nil {
@@ -2922,7 +2923,7 @@ func TestDialHostBridgeCancellationDrainsFourAcceptsAfterOneGuest(t *testing.T) 
 		if err != nil {
 			t.Fatalf("one guest did not release a host-bridge pump: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("one guest did not release a host-bridge pump")
 	}
 
@@ -3050,7 +3051,7 @@ func TestSessionInvalidationDrainsFourHostBridgeOperationsBeforeReap(t *testing.
 		}
 		attached = result.stream
 		defer attached.Close()
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("one guest did not release a host-bridge operation")
 	}
 
@@ -3158,7 +3159,7 @@ func TestDialHostBridgeMarkerFailureClosesAcceptedGuest(t *testing.T) {
 		if err == nil {
 			t.Fatal("closed helper stream accepted a host-bridge marker")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("host-bridge marker failure did not return")
 	}
 	if err := guest.SetReadDeadline(time.Now().Add(time.Second)); err != nil {

@@ -13,6 +13,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // One-shot logs were kept forever (#52). They now carry the per-job byte cap
@@ -405,7 +406,7 @@ func TestRetentionBacklogIsEvictedInBoundedPasses(t *testing.T) {
 			if status != http.StatusOK {
 				t.Fatalf("renewal during pass %d status = %d", passes, status)
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatalf("renewal during pass %d did not complete", passes)
 		}
 		if err != nil {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/runner/systemdpolicy"
 )
 
@@ -85,7 +86,7 @@ func runHelperGenerationAt(t *testing.T, engine Engine, stateDirectory string, b
 	go func() { done <- server.Serve(ctx, listener) }()
 	select {
 	case <-server.startupDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("helper startup barrier never completed")
 	}
 	server.sessionMu.Lock()
@@ -95,7 +96,7 @@ func runHelperGenerationAt(t *testing.T, engine Engine, stateDirectory string, b
 	_ = listener.Close()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("helper server did not stop")
 	}
 	return startupErr
@@ -328,7 +329,7 @@ func serveHelperGeneration(t *testing.T, engine Engine, stateDirectory string, b
 	go func() { done <- server.Serve(ctx, listener) }()
 	select {
 	case <-server.startupDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("helper startup never settled")
 	}
 	client := NewUnixClient(path, "checksum-test")
@@ -338,7 +339,7 @@ func serveHelperGeneration(t *testing.T, engine Engine, stateDirectory string, b
 		_ = listener.Close()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("helper server did not stop")
 		}
 	}

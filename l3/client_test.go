@@ -17,6 +17,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -157,7 +158,7 @@ func TestL1ClientBoundedPhases(t *testing.T) {
 			go func() { _, err := c.GetJob(ctx, "job-1"); done <- err }()
 			select {
 			case <-entered:
-			case <-time.After(time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("phase not entered")
 			}
 			if phase == "caller cancel" {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // #598: a removal truncated the WAL on the main pool and retried until it
@@ -322,7 +323,7 @@ func TestReconcileLockContentionRetriesNextTickAndL1KeepsServing(t *testing.T) {
 				}
 			case err := <-done:
 				t.Fatalf("Serve stopped on lock contention: %v", err)
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("reconciliation did not resume after lock contention")
 			}
 

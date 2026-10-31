@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 var testImagePlatform = OCIPlatform{OS: "linux", Architecture: "amd64"}
@@ -132,7 +133,7 @@ func TestRemovalInventoryDispatchKeepsHeartbeatsLiveAndRechecksRunAdmission(t *t
 	}()
 	select {
 	case <-engine.entered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("InventoryRemoval did not enter the engine through dispatch")
 	}
 	heartbeatContext, cancelHeartbeat := context.WithTimeout(t.Context(), 500*time.Millisecond)
@@ -162,7 +163,7 @@ func TestRemovalInventoryDispatchKeepsHeartbeatsLiveAndRechecksRunAdmission(t *t
 	case <-engine.runEntered:
 	case err := <-runErr:
 		t.Fatalf("Run admission failed before entering engine: %v", err)
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Run admission remained blocked behind InventoryRemoval")
 	}
 	releaseReimage()
@@ -1182,7 +1183,7 @@ func TestSweepCannotOverlapSameSessionGrow(t *testing.T) {
 	}
 	select {
 	case <-sweepEntered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Sweep did not proceed after Grow")
 	}
 	if err := <-sweepDone; err != nil || engine.growRuns.Load() != 1 {
@@ -3032,7 +3033,7 @@ func TestSuppressionQueuedBehindABlockedHeartbeatFlushReturnsTheFlushsTypedLossO
 
 	select {
 	case <-gate.entered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("heartbeat flush never attempted its control-connection write")
 	}
 
@@ -3055,7 +3056,7 @@ func TestSuppressionQueuedBehindABlockedHeartbeatFlushReturnsTheFlushsTypedLossO
 	var suppressErr error
 	select {
 	case suppressErr = <-suppressResult:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("suppression never returned after the blocked flush failed")
 	}
 	if suppressErr == nil {
@@ -3226,7 +3227,7 @@ func TestHeartbeatRefreshesOnlyExactLiveAttemptDeadman(t *testing.T) {
 		if err == nil {
 			t.Fatal("stale attempt heartbeat invalidation closed in-flight Watch with success")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("stale attempt heartbeat invalidation left in-flight Watch open")
 	}
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "stale-attempt session reap")
@@ -3517,7 +3518,7 @@ func TestAttemptPortSetupCancellationDoesNotDelayListenerRepublication(t *testin
 	}
 	select {
 	case <-engine.firstCanceled:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("withdrawn-listener probe remained live after its caller disconnected")
 	}
 
@@ -3835,7 +3836,7 @@ func TestHostBridgeStreamRemainsCoupledToDialContext(t *testing.T) {
 	defer stream.Close()
 	select {
 	case <-engine.dialHostBridgeDone:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("DialHostBridge cancellation did not clean up the engine stream")
 	}
 }
@@ -3874,7 +3875,7 @@ func TestHostBridgeClientWaitsForBackendReady(t *testing.T) {
 	}()
 	select {
 	case <-engine.dialHostBridgeEntered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("host-bridge engine did not reach its backend-readiness wait")
 	}
 	select {
@@ -3892,7 +3893,7 @@ func TestHostBridgeClientWaitsForBackendReady(t *testing.T) {
 			t.Fatal(result.err)
 		}
 		_ = result.stream.Close()
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("DialHostBridge did not return after backend readiness")
 	}
 }
@@ -3965,7 +3966,7 @@ func TestHostBridgePeerCancellationCancelsEngineContext(t *testing.T) {
 	}()
 	select {
 	case <-engine.dialHostBridgeEntered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("host-bridge engine did not begin waiting for a guest")
 	}
 	cancel()
@@ -3974,12 +3975,12 @@ func TestHostBridgePeerCancellationCancelsEngineContext(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("canceled host-bridge dial = %v, want context cancellation", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("canceled host-bridge client did not return")
 	}
 	select {
 	case <-engine.dialHostBridgeDone:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("peer cancellation did not cancel the host-bridge engine context")
 	}
 }
@@ -4036,7 +4037,7 @@ func TestSweepSerializesAgainstAttemptCreation(t *testing.T) {
 	}
 	select {
 	case <-engine.sweepEntered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Sweep did not enter after Run released the creation gate")
 	}
 	if err := <-sweepDone; err != nil {
@@ -4130,7 +4131,7 @@ func TestImportImageClosesBlockedUploadSourceWhenHelperRejects(t *testing.T) {
 	}
 	select {
 	case <-reader.closed:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("helper rejection did not close and unblock the archive source")
 	}
 }
@@ -4624,7 +4625,7 @@ func TestControlLossCancelsBlockedWatchBeforeSessionReap(t *testing.T) {
 		if err == nil {
 			t.Fatal("control-loss Watch returned success")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("control loss deadlocked blocked Watch")
 	}
 	waitFor(t, time.Second, func() bool { return engine.sessionReapCount() == 1 }, "session reap after Watch cancellation")
@@ -4792,7 +4793,7 @@ func startTestServer(t *testing.T, engine Engine, config ServerConfig) (*Client,
 			if err != nil && fatalErr == nil {
 				t.Errorf("helper server: %v", err)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("helper server did not stop")
 		}
 	}

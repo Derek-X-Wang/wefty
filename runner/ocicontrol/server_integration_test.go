@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -256,7 +257,7 @@ func TestControlSocketForcesCloseAfterGracefulDrainBudget(t *testing.T) {
 	}()
 	select {
 	case <-handlerEntered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("load-image handler did not start")
 	}
 
@@ -284,7 +285,7 @@ func TestControlSocketForcesCloseAfterGracefulDrainBudget(t *testing.T) {
 		if err == nil {
 			t.Fatal("load-image request unexpectedly survived forced close")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("load-image client remained blocked after forced close")
 	}
 }
@@ -417,7 +418,7 @@ func TestControlSocketCarriesTheExplicitImportReference(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Serve: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Serve remained blocked")
 	}
 }

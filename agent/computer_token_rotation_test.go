@@ -8,6 +8,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -59,7 +60,7 @@ func TestComputerSubmissionPolicyChangeRotatesAttemptTokenFile(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Computer token file synchronizer did not stop")
 	}
 }
@@ -72,7 +73,7 @@ func assertTokenFileWrite(t *testing.T, writes <-chan computerSubmissionWrite, w
 			t.Fatalf("Computer submission file write = %+v, want token=%q endpoint=%q", got, wantToken, wantEndpoint)
 		}
 		return got
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("timed out waiting for Computer token file write %q", wantToken)
 	}
 	return computerSubmissionWrite{}

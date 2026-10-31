@@ -19,6 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -108,13 +109,13 @@ func newRetirementFixtureWithStoreClock(t *testing.T, clock l1.Clock, hook func(
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("agent did not join")
 		}
 	})
 	select {
 	case <-a.Registered():
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("registration timed out")
 	}
 	return a, store, done, cancel
@@ -260,7 +261,7 @@ func TestRetirementIdleClosesAndExits(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("idle retiree stuck: %+v", a.Status())
 	}
 }
@@ -298,7 +299,7 @@ func TestRetirementJoinsInFlightClaimWithoutCancelingIt(t *testing.T) {
 	})
 	select {
 	case <-committed:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("claim did not commit")
 	}
 	promoteRetirementFixture(t, store, "node", "retirement-agent")
@@ -315,7 +316,7 @@ func TestRetirementJoinsInFlightClaimWithoutCancelingIt(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("retirement did not acknowledge claim")
 	}
 	select {
@@ -323,7 +324,7 @@ func TestRetirementJoinsInFlightClaimWithoutCancelingIt(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("retirement stuck: %+v", a.Status())
 	}
 	current, err := store.GetJob(t.Context(), job.JobID)
@@ -541,7 +542,7 @@ func TestRetirementLostClaimReplyWaitsForAuthoritativeLeaseEnd(t *testing.T) {
 	})
 	select {
 	case <-committed:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("claim did not commit")
 	}
 	promoteRetirementFixture(t, store, "node", "retirement-agent")

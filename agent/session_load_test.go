@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -256,7 +257,7 @@ func TestAgentLoadAdmissionUsesConfiguredReader(t *testing.T) {
 			if err != nil {
 				t.Error(err)
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("agent did not stop")
 		}
 	}()
@@ -267,7 +268,7 @@ func TestAgentLoadAdmissionUsesConfiguredReader(t *testing.T) {
 	for range 2 {
 		select {
 		case <-read:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("configured reader and limit did not keep the next claim waiting")
 		}
 	}

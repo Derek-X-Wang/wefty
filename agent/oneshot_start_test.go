@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -108,7 +109,7 @@ func TestProcessOneShotStartRefusalLeavesThePayloadRunning(t *testing.T) {
 		select {
 		case <-handled:
 		case <-ctx.Done():
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("the agent never handled the start refusal")
 		}
 		if ctx.Err() != nil {

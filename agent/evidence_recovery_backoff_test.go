@@ -110,7 +110,7 @@ func receiveReport(t *testing.T, reports <-chan error, want ...string) {
 				t.Fatalf("report %q does not contain %q", err, fragment)
 			}
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("no report containing %q", want)
 	}
 }
@@ -347,7 +347,7 @@ func TestEvidenceRecoveryBacksOffTransientFailuresToCeiling(t *testing.T) {
 			if !strings.Contains(err.Error(), "internal") {
 				t.Fatalf("failure %d report = %v", failure+1, err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatalf("transient failure %d was not retried", failure+1)
 		}
 		// The next retry is armed at exactly this delay and not before it.
@@ -522,7 +522,7 @@ func TestEvidenceRecoveryWaitsForABlockedRetryWithoutSpinning(t *testing.T) {
 		for range busy {
 			select {
 			case <-held.arrived:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("recovery did not start every busy attempt")
 			}
 		}

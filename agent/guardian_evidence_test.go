@@ -68,7 +68,7 @@ func TestGuardianCrashCancelsBlockedProductionSpool(t *testing.T) {
 	}()
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("production spool did not reach blocked append")
 	}
 	testwait.Until(t, "SQL-blocked spool append", func() (bool, error) {

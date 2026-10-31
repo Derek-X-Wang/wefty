@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
@@ -648,7 +649,7 @@ func startPreAdmissionHelper(t *testing.T, engine ocihelper.Engine, now func() t
 			if err != nil {
 				t.Errorf("serve helper: %v", err)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("helper server did not stop")
 		}
 	}

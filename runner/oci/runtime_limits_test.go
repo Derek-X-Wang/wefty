@@ -11,6 +11,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -51,7 +52,7 @@ func TestOCIMaxRuntimeStopsExactAttempt(t *testing.T) {
 			go func() { result, err := adapter.Run(ctx, request, nil); finished <- outcome{result, err} }()
 			select {
 			case <-ready:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("attempt never started")
 			}
 			runtimeTimer := clock.next(t)
@@ -74,7 +75,7 @@ func TestOCIMaxRuntimeStopsExactAttempt(t *testing.T) {
 			var got outcome
 			select {
 			case got = <-finished:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("runtime expiry did not join termination")
 			}
 			if got.err == nil || !strings.Contains(got.err.Error(), "maximum runtime exceeded") || got.result.Outcome.RuntimeFailure != nil || got.result.Outcome.SpawnError != nil {
@@ -203,7 +204,7 @@ func (clock *runtimeTestClock) next(t *testing.T) *runtimeTestTimer {
 	select {
 	case timer := <-clock.timers:
 		return timer
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("OCI did not arm runtime/termination timer")
 		return nil
 	}

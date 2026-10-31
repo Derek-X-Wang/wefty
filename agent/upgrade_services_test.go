@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -56,7 +57,7 @@ func TestUpgradeServicesBarrierKeepsOneShotsAndWaitsForEvidence(t *testing.T) {
 			if !errors.Is(context.Cause(ctx), errUpgradeServiceQuiescence) {
 				t.Fatal(context.Cause(ctx))
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("service not canceled")
 		}
 	}
@@ -79,7 +80,7 @@ func TestUpgradeServicesBarrierKeepsOneShotsAndWaitsForEvidence(t *testing.T) {
 	}
 	select {
 	case <-checkedPending:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("service evidence was never checked")
 	}
 	select {
@@ -93,7 +94,7 @@ func TestUpgradeServicesBarrierKeepsOneShotsAndWaitsForEvidence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("settled services kept barrier alive")
 	}
 	if _, err := a.QuiesceUpgradeServices(t.Context(), request); err != nil {

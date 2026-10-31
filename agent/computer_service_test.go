@@ -14,6 +14,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -66,7 +67,7 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 	var published publication
 	select {
 	case published = <-publications:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Computer front door was not published")
 	}
 	if !published.ready || published.endpoint == "" || privateFabric.listenNetwork != "tcp" || privateFabric.listenAddress != ":0" {
@@ -84,7 +85,7 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 	cancel()
 	select {
 	case <-result:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Computer service did not stop")
 	}
 	select {
@@ -92,7 +93,7 @@ func TestComputerServicePublishesOnlyFabricFrontDoorAndAdmissionDialsView(t *tes
 		if withdrawn.ready {
 			t.Fatalf("stop republished ready: %#v", withdrawn)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Computer stop did not withdraw publication")
 	}
 	dialMu.Lock()
@@ -243,7 +244,7 @@ func TestComputerBackendLossWithdrawsPublicationWithoutKillingPayload(t *testing
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Computer service did not stop after cancellation")
 	}
 }
@@ -320,7 +321,7 @@ func wantComputerReadinessObservation(t *testing.T, observations <-chan bool, wa
 		if got != want {
 			t.Fatalf("Computer readiness observation = %t, want %t", got, want)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("timed out waiting for Computer readiness=%t", want)
 	}
 }
@@ -386,7 +387,7 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 		case endpoint := <-published:
 			forwarding.await(t)
 			return runningService{cancel: cancel, done: done, endpoint: endpoint, runtime: runtime}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			cancel()
 			t.Fatal("Computer service was not published")
 			return runningService{}
@@ -408,7 +409,7 @@ func TestComputerServiceRestartClearsHeldTenureAndAdmitsFreshHolder(t *testing.T
 	first.cancel()
 	select {
 	case <-first.done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("old Computer service did not stop")
 	}
 	readContext, cancelRead := context.WithTimeout(t.Context(), 5*time.Second)
@@ -485,7 +486,7 @@ func TestComputerServiceConsumesRetriedFrontDoorAuditFailure(t *testing.T) {
 	var endpoint string
 	select {
 	case endpoint = <-published:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Computer service was not published")
 	}
 	forwarding.await(t)
@@ -497,7 +498,7 @@ func TestComputerServiceConsumesRetriedFrontDoorAuditFailure(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "audit unavailable") {
 			t.Fatalf("service audit failure = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Computer service ignored front-door audit failure")
 	}
 	if calls := auditor.callCount(); calls != computerAuditAttempts {
@@ -531,7 +532,7 @@ func (signal computerForwardingSignal) await(t *testing.T) {
 	t.Helper()
 	select {
 	case <-signal:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Computer front door did not open after its ready publication")
 	}
 }

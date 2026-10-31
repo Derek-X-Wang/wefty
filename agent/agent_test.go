@@ -23,6 +23,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -641,7 +642,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 	}
 	select {
 	case <-completionBlocked:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		cancel()
 		t.Fatal("agent did not reach blocked completion")
 	}
@@ -842,7 +843,7 @@ func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
 				go func() { handlers.Wait(); close(joined) }()
 				select {
 				case <-joined:
-				case <-time.After(2 * time.Second):
+				case <-time.After(testwait.Bound):
 					handlerMu.Lock()
 					t.Errorf("directive handlers did not join: %v", activePaths)
 					handlerMu.Unlock()

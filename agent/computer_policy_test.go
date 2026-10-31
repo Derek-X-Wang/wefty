@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -64,7 +65,7 @@ func TestComputerPolicyCacheFailsClosedAndDrainsBeforeAcknowledgement(t *testing
 		if revocation.Reason != ComputerPolicyRevoked || revocation.Permission != l1.ComputerGrantView {
 			t.Fatalf("downgrade revocation = %#v", revocation)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("control authorization did not receive downgrade")
 	}
 	assertOpen(t, downgradeReceipt.SessionsClosed, "downgrade before relay close")
@@ -87,7 +88,7 @@ func TestComputerPolicyCacheFailsClosedAndDrainsBeforeAcknowledgement(t *testing
 		if revocation.Permission != l1.ComputerGrantNone {
 			t.Fatalf("full revocation = %#v", revocation)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("view authorization did not receive revocation")
 	}
 	assertOpen(t, revokedReceipt.SessionsClosed, "revoke before relay close")
@@ -308,7 +309,7 @@ func assertRevocationReason(t *testing.T, authorization *ComputerGrantAuthorizat
 		if revocation.Reason != want {
 			t.Fatalf("revocation reason = %q, want %q", revocation.Reason, want)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("authorization did not receive %q", want)
 	}
 }
@@ -317,7 +318,7 @@ func assertClosed(t *testing.T, channel <-chan struct{}, message string) {
 	t.Helper()
 	select {
 	case <-channel:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("%s did not close", message)
 	}
 }

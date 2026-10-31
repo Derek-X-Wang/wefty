@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
@@ -114,7 +115,7 @@ func TestFleetPeerProbeThroughRunningClientService(t *testing.T) {
 			})
 			select {
 			case <-ready:
-			case <-time.After(3 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("client service not ready")
 			}
 			// The installation profile stays a fleet profile. Only its verified running

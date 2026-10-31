@@ -9,6 +9,8 @@ import (
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 type seatLockTask struct{ containerd.Task }
@@ -56,7 +58,7 @@ func TestComputerSeatSlowProbeDoesNotBlockOwnerControlOrRuntimeRelease(t *testin
 			}()
 			select {
 			case <-entered:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("Seat probe did not start")
 			}
 			completed := make(chan error, 1)
@@ -74,14 +76,14 @@ func TestComputerSeatSlowProbeDoesNotBlockOwnerControlOrRuntimeRelease(t *testin
 				if err != nil {
 					t.Error(err)
 				}
-			case <-time.After(time.Second):
+			case <-time.After(testwait.Bound):
 				t.Error("slow Seat probe blocked " + operation)
 			}
 			close(release)
 			var result outcome
 			select {
 			case result = <-observed:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("Seat observation did not stop after releasing probe")
 			}
 			if operation == "runtime_release" {

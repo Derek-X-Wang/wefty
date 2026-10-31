@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestPublicationControllerSerializesAbsoluteStateWithAsymmetricHysteresis(t *testing.T) {
@@ -221,7 +222,7 @@ func wantPublicationAction(t *testing.T, actions <-chan string, want string) {
 		if got != want {
 			t.Fatalf("publication action = %q, want %q", got, want)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("timed out waiting for publication action %q", want)
 	}
 }
@@ -240,7 +241,7 @@ func waitPublicationRequest(t *testing.T, requests <-chan bool) bool {
 	select {
 	case ready := <-requests:
 		return ready
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("timed out waiting for publication request")
 		return false
 	}
@@ -262,7 +263,7 @@ func wantPublicationAttempt(t *testing.T, attempts <-chan int, want int) {
 		if got != want {
 			t.Fatalf("publication attempt = %d, want %d", got, want)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("timed out waiting for publication attempt %d", want)
 	}
 }
@@ -272,7 +273,7 @@ func waitPublicationDone(t *testing.T, done <-chan error) error {
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("timed out waiting for publication controller")
 		return nil
 	}
@@ -340,7 +341,7 @@ func TestPublicationControllerStopClearsAfterUncertainRepublish(t *testing.T) {
 		}
 	case err := <-done:
 		t.Fatalf("CAUSAL RED: Stop skipped final false after uncertain true: calls=%d remote_ready=%t forwarding=%t error=%v", calls.Load(), remoteReady.Load(), forwarding.Load(), err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("timed out waiting for final false")
 	}
 	if inFlight.Load() != 1 || forwarding.Load() {

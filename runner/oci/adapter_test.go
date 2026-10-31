@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -1035,7 +1036,7 @@ func TestAdapterAttemptScopedShimLossKeepsSessionAndNeighbourAttempt(t *testing.
 	}()
 	select {
 	case <-engine.neighbourWatching:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("neighbour attempt never reached Watch")
 	}
 
@@ -1068,7 +1069,7 @@ func TestAdapterAttemptScopedShimLossKeepsSessionAndNeighbourAttempt(t *testing.
 	var done outcome
 	select {
 	case done = <-neighbourDone:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("neighbour attempt did not finish after its Watch was released")
 	}
 	if done.err != nil || done.result.Outcome.ExitCode == nil || *done.result.Outcome.ExitCode != 0 || done.result.Outcome.RuntimeFailure != nil {
@@ -1122,7 +1123,7 @@ func TestAdapterUnscopedShimLossRecoversSessionAndEndsNeighbourAsEngineLoss(t *t
 	}()
 	select {
 	case <-engine.neighbourWatching:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("neighbour attempt never reached Watch")
 	}
 	lost, err := adapter.Run(t.Context(), request("job-a", "attempt-a"), sink)
@@ -1135,7 +1136,7 @@ func TestAdapterUnscopedShimLossRecoversSessionAndEndsNeighbourAsEngineLoss(t *t
 		if !errors.As(err, &runtimeLoss) {
 			t.Fatalf("neighbour ended with %v, want helper runtime loss", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("neighbour kept running on a session recovered for engine loss")
 	}
 	recoveryMu.Lock()
@@ -1825,7 +1826,7 @@ func TestAdapterDoesNotDialHostBeforeHelperBridgeReady(t *testing.T) {
 	}()
 	select {
 	case <-engine.bridgeWaiting:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("helper bridge pump did not reach its backend-readiness wait")
 	}
 	select {
@@ -1836,7 +1837,7 @@ func TestAdapterDoesNotDialHostBeforeHelperBridgeReady(t *testing.T) {
 	releaseBridgeReady()
 	select {
 	case <-hostDialed:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("adapter did not dial the host bridge after helper bridge readiness")
 	}
 	select {
@@ -1844,7 +1845,7 @@ func TestAdapterDoesNotDialHostBeforeHelperBridgeReady(t *testing.T) {
 		if outcome.err == nil {
 			t.Fatalf("bridge-ready probe unexpectedly succeeded: %+v", outcome.result)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("adapter did not finish after helper bridge readiness")
 	}
 }

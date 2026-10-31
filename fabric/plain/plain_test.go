@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestEchoWithInjectedIdentity(t *testing.T) {
@@ -176,7 +177,7 @@ func TestLogicalListenerBindFailureReleasesClaim(t *testing.T) {
 	}()
 	select {
 	case <-observedContext.observed:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Dial() did not enter the logical registration wait")
 	}
 	release()
@@ -741,7 +742,7 @@ func TestGarbageConnectionDoesNotStopListenerAccepting(t *testing.T) {
 		if identity.NodeID != clientIdentity.NodeID || !slices.Equal(identity.Tags, clientIdentity.Tags) {
 			t.Fatalf("WhoIs() = %#v, want %#v", identity, clientIdentity)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("listener did not accept a valid connection after garbage input")
 	}
 }

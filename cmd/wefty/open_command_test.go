@@ -26,6 +26,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -216,7 +217,7 @@ func testOpenFleetTunnel(t *testing.T, mode string) bool {
 	case <-serviceReady:
 	case err := <-serviceDone:
 		t.Fatalf("client service: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("client service not ready")
 	}
 	profile := filepath.Join(t.TempDir(), "profile.json")
@@ -265,7 +266,7 @@ func testOpenFleetTunnel(t *testing.T, mode string) bool {
 		stopOpen()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			if process != nil {
 				_ = process.Process.Kill()
 			}
@@ -304,7 +305,7 @@ func testOpenFleetTunnel(t *testing.T, mode string) bool {
 		if mode == "context-default-port" && ready.LocalURL != fmt.Sprintf("http://127.0.0.1:%d", remotePort) {
 			t.Fatalf("default port changed: %s", ready.LocalURL)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("open not ready")
 	}
 	httpClient := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{DisableKeepAlives: true}}
@@ -360,12 +361,12 @@ func testOpenFleetTunnel(t *testing.T, mode string) bool {
 		if runErr != nil {
 			t.Error(runErr)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("open did not stop")
 	}
 	select {
 	case <-holdClosed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Error("upstream connection survived shutdown")
 	}
 	_ = idle.SetReadDeadline(time.Now().Add(time.Second))
