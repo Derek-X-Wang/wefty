@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -60,7 +62,7 @@ func captureSpec(payload string) contract.JobSpec {
 func TestExecCaptureProgressOutlivesAppenderBudget(t *testing.T) {
 	clock := newManualClock(mailboxTestClockOrigin)
 	appender := &httpRunLedgerAppender{client: &http.Client{Timeout: 50 * time.Millisecond, Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: &progressCaptureBody{ctx: r.Context(), clock: clock, bytes: "slow"}, Header: make(http.Header)}, nil
+		return &http.Response{StatusCode: 200, ContentLength: 4, Body: &progressCaptureBody{ctx: r.Context(), clock: clock, bytes: "slow"}, Header: make(http.Header)}, nil
 	})}}
 	mailbox, _, _ := newTestMailbox(t, appender, `{}`)
 	mailbox.clock = clock
@@ -76,7 +78,7 @@ func TestExecCaptureIdleBodyFails(t *testing.T) {
 	clock := newManualClock(mailboxTestClockOrigin)
 	entered := make(chan struct{})
 	appender := &httpRunLedgerAppender{client: &http.Client{Timeout: 30 * time.Second, Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: &progressCaptureBody{ctx: r.Context(), clock: clock, stall: true, entered: entered}, Header: make(http.Header)}, nil
+		return &http.Response{StatusCode: 200, ContentLength: 5, Body: &progressCaptureBody{ctx: r.Context(), clock: clock, stall: true, entered: entered}, Header: make(http.Header)}, nil
 	})}}
 	mailbox, _, _ := newTestMailbox(t, appender, `{}`)
 	mailbox.clock = clock
@@ -96,30 +98,49 @@ func TestExecCaptureIdleBodyFails(t *testing.T) {
 	}
 }
 func TestExecCaptureRetriesInterruptedDownload(t *testing.T) {
-	attempts := 0
-	appender := &httpRunLedgerAppender{client: &http.Client{Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
-		attempts++
-		body := io.NopCloser(strings.NewReader("good"))
-		if attempts == 1 {
-			body = io.NopCloser(strings.NewReader("g"))
-		}
-		return &http.Response{StatusCode: 200, Body: body, Header: make(http.Header)}, nil
-	})}}
-	mailbox, _, _ := newTestMailbox(t, appender, `{}`)
-	mailbox.clock = systemClock{}
-	ok, e := seedExecCapture(t.Context(), captureSpec("good"), mailbox)
-	if e != nil || !ok || attempts != 2 {
-		t.Fatalf("retry result=%v ok=%v attempts=%d", e, ok, attempts)
-	}
-	b, e := os.ReadFile(filepath.Join(mailbox.directory, "capture.bundle"))
-	if e != nil || string(b) != "good" {
-		t.Fatal(fmt.Sprint(string(b), e))
+	for _, tc := range []struct {
+		name      string
+		declared  int64
+		readError error
+	}{
+		{"declared_early_eof", 4, nil},
+		{"declared_unexpected_eof", 4, io.ErrUnexpectedEOF},
+		{"unknown_unexpected_eof", -1, io.ErrUnexpectedEOF},
+		{"unknown_connection_reset", -1, syscall.ECONNRESET},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			attempts := 0
+			appender := &httpRunLedgerAppender{client: &http.Client{Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
+				attempts++
+				var body io.Reader = strings.NewReader("good")
+				if attempts == 1 {
+					body = strings.NewReader("g")
+					if tc.readError != nil {
+						body = io.MultiReader(body, iotest.ErrReader(tc.readError))
+					}
+				}
+				// Only the first transfer is interrupted; the next fetch
+				// recovers both declared-length and chunked responses.
+				return &http.Response{StatusCode: 200, ContentLength: tc.declared, Body: io.NopCloser(body), Header: make(http.Header)}, nil
+			})}}
+			mailbox, _, _ := newTestMailbox(t, appender, `{}`)
+			clock := &captureRetryClock{manualClock: newManualClock(mailboxTestClockOrigin)}
+			mailbox.clock = clock
+			ok, err := seedExecCapture(t.Context(), captureSpec("good"), mailbox)
+			if err != nil || !ok || attempts != 2 || len(clock.waits) != 1 || clock.waits[0] != time.Second {
+				t.Fatalf("retry result=%v ok=%v attempts=%d waits=%v", err, ok, attempts, clock.waits)
+			}
+			b, err := os.ReadFile(filepath.Join(mailbox.directory, "capture.bundle"))
+			if err != nil || string(b) != "good" {
+				t.Fatal(fmt.Sprint(string(b), err))
+			}
+		})
 	}
 }
 
 func TestExecCapturePreparationRemovesStaleAttemptFiles(t *testing.T) {
 	appender := &httpRunLedgerAppender{client: &http.Client{Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("good")), Header: make(http.Header)}, nil
+		return &http.Response{StatusCode: 200, ContentLength: 4, Body: io.NopCloser(strings.NewReader("good")), Header: make(http.Header)}, nil
 	})}}
 	mailbox, _, _ := newTestMailbox(t, appender, `{}`)
 	os.WriteFile(filepath.Join(mailbox.directory, "tmp/capture.bundle"), []byte("stale"), 0600)
@@ -134,7 +155,7 @@ func TestExecCapturePreparationRemovesStaleAttemptFiles(t *testing.T) {
 }
 func TestExecCaptureCleanupSurvivesDetachedMailbox(t *testing.T) {
 	appender := &httpRunLedgerAppender{client: &http.Client{Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("good")), Header: make(http.Header)}, nil
+		return &http.Response{StatusCode: 200, ContentLength: 4, Body: io.NopCloser(strings.NewReader("good")), Header: make(http.Header)}, nil
 	})}}
 	mailbox, _, _ := newTestMailbox(t, appender, `{}`)
 	if _, e := seedExecCapture(t.Context(), captureSpec("good"), mailbox); e != nil {

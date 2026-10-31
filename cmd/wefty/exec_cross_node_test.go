@@ -169,18 +169,23 @@ func TestExecNodeSelectionFromRealBinary(t *testing.T) {
 	if code != 2 || len(out) != 0 || !strings.Contains(string(stderr), "known nodes") || !strings.Contains(string(stderr), "node-cli") {
 		t.Fatalf("unknown exit=%d stdout=%s stderr=%s", code, out, stderr)
 	}
-	code, out, stderr = runPolishBinary(t, binary, append(args, "--node", "node-cli", "--detach", "--", "true")...)
-	if code != 0 {
-		t.Fatalf("local exit=%d stdout=%s stderr=%s", code, out, stderr)
-	}
-	record, err := stack.clients.getRun(t.Context(), strings.TrimSpace(string(out)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var p map[string]any
-	json.Unmarshal(record.Params, &p)
-	if p["exec_version"] != float64(1) || p["capture_sha256"] != nil {
-		t.Fatalf("local path changed: %s", record.Params)
+	// Both the default and an explicitly selected local Node must retain
+	// version 1 storage, with no capture upload or remote wrapper.
+	for _, nodeArgs := range [][]string{nil, {"--node", "node-cli"}} {
+		localArgs := append(append([]string{}, args...), nodeArgs...)
+		code, out, stderr = runPolishBinary(t, binary, append(localArgs, "--detach", "--", "true")...)
+		if code != 0 {
+			t.Fatalf("local %v exit=%d stdout=%s stderr=%s", nodeArgs, code, out, stderr)
+		}
+		record, err := stack.clients.getRun(t.Context(), strings.TrimSpace(string(out)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p map[string]any
+		json.Unmarshal(record.Params, &p)
+		if p["exec_version"] != float64(1) || p["capture_sha256"] != nil {
+			t.Fatalf("local path changed: %s", record.Params)
+		}
 	}
 }
 func TestExecCrossNodeFrozenCaptureFromRealBinary(t *testing.T) {
