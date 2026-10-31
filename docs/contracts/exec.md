@@ -500,11 +500,23 @@ The CLI performs local writes itself, within its own sandbox; no helper writes
 to the Mac on its behalf. File contents stream without a total byte limit.
 A copy with no input or output stream progress for 60 seconds fails with
 `seat_copy_failed` and a `Seat copy stalled` diagnostic; progress refreshes
-that bound, so a progressing copy has no total runtime limit.
+that bound, so a progressing copy has no total runtime limit. Inside the Seat,
+copy-in and sync fsync each file at least every 64 MiB while they write it.
+This lowers the risk that one long fsync of a large file stops input progress
+past the bound; it does not remove it, because a single fsync can still wait
+on a slow or busy disk.
 Disk-full and transport failures return `seat_copy_failed`; local permission,
 read-only filesystem and final-name symlink refusals return
 `seat_copy_write_denied`. Both use exit 1. An existing-folder failure says
 that DEST names the exact result path. Seat-to-Seat copies are refused.
+
+Helper `seat_operation_refused` errors with detail `seat_not_ready` or
+`generation_mismatch` return `seat_ended` if L1 reports that the Seat ended
+through copy lease renewal or the final receipt write. Otherwise they return
+`conflict` with `retryable=true`. The message keeps the helper detail and says
+the Seat is not ready or changed. Both codes use exit 5. The AI agent should
+wait and retry on `conflict`. The CLI does not retry the copy itself. Other
+copy failures and copy receipt outcomes and reasons keep their existing values.
 
 `Agent.Run` owns one shared Seat front-door listener on the node's logical
 Fabric service address (the enrolled participant name supplied by the Fabric,
@@ -514,8 +526,16 @@ generations cannot collide. The plain Fabric maps that name to an ephemeral
 loopback endpoint. Clients dial the endpoint published by L1's copy-target
 route, not the private logical registration name. The participant name need
 not equal the registered Wefty node ID. A listener startup failure is logged
-and leaves the Seat door unavailable: Seat-request Computers refuse readiness,
-while node registration and non-Seat work continue.
+once, then the node agent retries in the background until the door opens or
+`Agent.Run` ends. Retry backoff starts at 1 second, doubles, and is capped at
+30 seconds. While the door is closed, Seat-request Computer Attempts fail
+before runtime start with typed `runtime_unavailable`; L1 applies infrastructure
+backoff and preserves the restart streak. Attempts read the current door, so
+recovery needs no node agent restart. Recovery is logged once. Node registration
+and non-Seat work continue. The configured Seat capability stays advertised.
+Retries are canceled and joined when `Agent.Run` ends, including cleanup of a
+listener that opens during shutdown. A recovered door's server exit still ends
+`Agent.Run`, with its error included in the returned error.
 Each Computer Attempt registers a feature mux and binds only Seat IDs from its
 fenced L1 wanted list. Copies, Seat Runs and per-Seat screens share this same
 listener; unknown paths and unbound Seats are refused. The generated

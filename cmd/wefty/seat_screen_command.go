@@ -276,7 +276,7 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		return err
 	}
 	if secret == "" {
-		return fmt.Errorf("Seat credential not found; request or wait for this Seat first")
+		return seatCredentialUnavailable(a.id)
 	}
 	var target struct {
 		Endpoint string `json:"endpoint"`
