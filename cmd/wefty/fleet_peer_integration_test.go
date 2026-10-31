@@ -22,7 +22,6 @@ import (
 )
 
 func TestFleetPeerProbeThroughRunningClientService(t *testing.T) {
-	t.Parallel()
 	for _, mode := range []string{"healthy", "L1 down", "L3 down", "missing endpoint", "missing ping"} {
 		t.Run(mode, func(t *testing.T) {
 			f := healthyDoctorFixture(t, serviceplan.ControlPlane)

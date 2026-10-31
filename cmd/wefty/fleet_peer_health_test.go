@@ -70,7 +70,6 @@ func assertFleetPeerChecks(t *testing.T, checks []setupReadinessCheck, status st
 }
 
 func TestFleetPeerProbeSetupAndDoctor(t *testing.T) {
-	t.Parallel()
 	for _, role := range []serviceplan.Role{serviceplan.ControlPlane, serviceplan.Join} {
 		for _, status := range []string{"VERIFIED", "FAILED", "NOT-RUN"} {
 			t.Run(string(role)+"/"+status, func(t *testing.T) {
@@ -102,7 +101,6 @@ func TestFleetPeerProbeSetupAndDoctor(t *testing.T) {
 }
 
 func TestFleetDoctorPeerObserverReadFailures(t *testing.T) {
-	t.Parallel()
 	for _, direction := range []int{0, 1} {
 		for _, mode := range []string{"transport", "reset", "401", "403", "401 reset", "403 reset", "401 oversized", "403 oversized", "invalid observation", "oversized observation"} {
 			t.Run(fmt.Sprintf("%d/%s", direction, mode), func(t *testing.T) {
@@ -165,7 +163,6 @@ func TestFleetDoctorPeerObserverReadFailures(t *testing.T) {
 }
 
 func TestFleetDoctorPeerBudgetExhaustion(t *testing.T) {
-	t.Parallel()
 	f := healthyDoctorFixture(t, serviceplan.ControlPlane)
 	// Use the production 15-second budget: two bounded host commands and two
 	// bounded client reads consume twelve seconds before the first peer read.
