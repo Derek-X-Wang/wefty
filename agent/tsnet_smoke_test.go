@@ -169,13 +169,19 @@ func TestTSNetServiceReachability(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer agentFabric.Close()
+	// The managed root refuses a symlink anywhere in its path, and on macOS
+	// t.TempDir() is under /var, a link to /private/var.
+	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	nodeAgent, err := New(Config{
 		Fabric: agentFabric, ControlPlaneAddress: serverName,
 		NodeID: stableNodeID, BootSessionID: "boot-" + suffix, Version: "tsnet-service-smoke",
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Second, ClaimInterval: 100 * time.Millisecond,
 		RenewalInterval: 5 * time.Second, LogSpoolDirectory: t.TempDir(),
-		ManagedRootDirectory: t.TempDir(), GuardianExecutable: agentBinaryPath,
+		ManagedRootDirectory: managedRoot, GuardianExecutable: agentBinaryPath,
 	})
 	if err != nil {
 		t.Fatal(err)
