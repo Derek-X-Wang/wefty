@@ -22,7 +22,11 @@ func acquireNodeLock(directory, nodeID string) (nodeLock, error) {
 // A legacy process still takes the cohort lock exclusively, so modes cannot mix.
 func acquireAgentNodeLock(directory, nodeID, generationID string) (nodeLock, error) {
 	if generationID == "" {
-		return acquireNodeLock(directory, nodeID)
+		lock, err := acquireNodeLock(directory, nodeID)
+		if errors.Is(err, errSharedLeaseBusy) {
+			return nil, fmt.Errorf("agent: stable node %q is already active: %w", nodeID, errSharedLeaseBusy)
+		}
+		return lock, err
 	}
 	cohort, err := acquireGenerationCohortLock(directory, nodeID)
 	if err != nil {
@@ -52,7 +56,7 @@ func acquireFileLock(directory, name string, mode int) (nodeLock, error) {
 	if err := syscall.Flock(int(file.Fd()), mode|syscall.LOCK_NB); err != nil {
 		_ = file.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, fmt.Errorf("agent: node-local ownership %q is already active: %w", name, errSharedLeaseBusy)
+			return nil, fmt.Errorf("agent: node-local lock %q is already active: %w", name, errSharedLeaseBusy)
 		}
 		return nil, fmt.Errorf("agent: lock node-local ownership %q: %w", name, err)
 	}
