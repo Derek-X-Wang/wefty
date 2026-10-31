@@ -138,7 +138,9 @@ func TestSetupConvertQuiescentRealBinaryAndWAL(t *testing.T) {
 					delete(f.originals, name)
 				}
 			}
-			s, err := l1.OpenStore(filepath.Join(paths.data, "l1.sqlite"), l1.StoreOptions{})
+			var s *l1.Store
+			var err error
+			withProductionSQLiteSync(func() { s, err = l1.OpenStore(filepath.Join(paths.data, "l1.sqlite"), l1.StoreOptions{}) })
 			if err != nil {
 				t.Fatal(err)
 			}

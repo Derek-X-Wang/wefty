@@ -872,7 +872,12 @@ func exposeRollingL1WithPromotionReply(t *testing.T, f *rollingFixture, beforeRe
 	participant := network.NewFabric(fabric.Identity{NodeID: node.NodeID, Tags: []string{l1.DefaultAgentPrincipalTag, contract.StableNodeTagPrefix + node.NodeID}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	mustRolling(t, err)
-	runtime, err := agent.New(agent.Config{Fabric: participant, ControlPlaneAddress: p.L1Address, NodeID: node.NodeID, AgentGenerationID: primary.ID, BootSessionID: primary.Process.BootSessionID, Version: node.AgentVersion, OS: "darwin", Architecture: "arm64", RetirementAcknowledged: f.install.PublishRetirement, Capabilities: node.Capabilities, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), PrimaryGeneration: func(write func() error) error { return f.install.WithPrimary(primary.ID, write) }})
+	// The rolling tests' agent spool keeps the production durability pragmas
+	// (#1035).
+	var runtime *agent.Agent
+	withProductionSQLiteSync(func() {
+		runtime, err = agent.New(agent.Config{Fabric: participant, ControlPlaneAddress: p.L1Address, NodeID: node.NodeID, AgentGenerationID: primary.ID, BootSessionID: primary.Process.BootSessionID, Version: node.AgentVersion, OS: "darwin", Architecture: "arm64", RetirementAcknowledged: f.install.PublishRetirement, Capabilities: node.Capabilities, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), PrimaryGeneration: func(write func() error) error { return f.install.WithPrimary(primary.ID, write) }})
+	})
 	mustRolling(t, err)
 	// Model the control-only agent's own capability publication before serving
 	// requests. All managed state is disposable; no payload loop runs here.
