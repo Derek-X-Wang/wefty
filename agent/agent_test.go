@@ -46,7 +46,11 @@ func TestMain(main *testing.M) {
 	// four helpers instead of starting another compiler/linker job during a
 	// timed cleanup proof. The parent owns their directory until children join.
 	directory := os.Getenv("WEFTY_AGENT_TEST_BINARIES")
-	inherited := directory != "" && (os.Getenv("WEFTY_PRE_ADMISSION_FAILURE_CHILD") == "1" || os.Getenv("WEFTY_RELEASE_CLEANUP_CHILD") == "1")
+	if os.Getenv("AGENT_EXEC_SWEEP_HELPER") != "" {
+		// The exec wrapper deliberately removes WEFTY_* from its command.
+		directory = os.Getenv("AGENT_EXEC_SWEEP_BINARIES")
+	}
+	inherited := directory != "" && (os.Getenv("WEFTY_PRE_ADMISSION_FAILURE_CHILD") == "1" || os.Getenv("WEFTY_RELEASE_CLEANUP_CHILD") == "1" || os.Getenv("AGENT_EXEC_SWEEP_HELPER") != "")
 	if !inherited {
 		var err error
 		directory, err = os.MkdirTemp("", "wefty-agent-test-")

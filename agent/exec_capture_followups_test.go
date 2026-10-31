@@ -265,6 +265,8 @@ func TestExecCaptureCleanupIgnoresReplacedMailboxPath(t *testing.T) {
 	if err := os.WriteFile(sentinel, []byte("outside the run"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	retained, retainedDone := startExecSweepProcess(t, filepath.Join(mailbox.directory, "wefty-exec-work", "work"))
+	replacement, replacementDone := startExecSweepProcess(t, filepath.Dir(sentinel))
 	moved := mailbox.directory + "-moved"
 	if err := os.Rename(mailbox.directory, moved); err != nil {
 		t.Fatal(err)
@@ -276,6 +278,16 @@ func TestExecCaptureCleanupIgnoresReplacedMailboxPath(t *testing.T) {
 		waitExecCaptureTrash(t, moved)
 		waitExecCaptureTrash(t, outside)
 	})
+	stopped := mailbox.captureSweep(t.Context())
+	if len(stopped) != 1 || stopped[0].PID != retained.Process.Pid {
+		t.Fatalf("sweep followed replacement path: stopped=%+v retained=%d replacement=%d", stopped, retained.Process.Pid, replacement.Process.Pid)
+	}
+	waitExecSweepProcess(t, retainedDone)
+	select {
+	case <-replacementDone:
+		t.Fatal("sweep stopped process in replacement directory")
+	default:
+	}
 	// This is the killed-wrapper path, including finalization closing the
 	// publisher's handles before its deferred cleanup is called again.
 	mailbox.detached.Store(true)
@@ -288,6 +300,47 @@ func TestExecCaptureCleanupIgnoresReplacedMailboxPath(t *testing.T) {
 	waitExecCaptureTrash(t, outside)
 	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "outside the run" {
 		t.Fatalf("cleanup touched the outside sentinel: data=%q error=%v", data, err)
+	}
+}
+
+func TestExecCaptureSeedSweepsStaleStorage(t *testing.T) {
+	mailbox, _, _ := newTestMailbox(t, captureSweepAppender(), `{}`)
+	for _, name := range []string{"work", "tmp"} {
+		if err := mailbox.root.MkdirAll("wefty-exec-work/"+name, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	work, workDone := startExecSweepProcess(t, filepath.Join(mailbox.directory, "wefty-exec-work", "work"))
+	tmp, tmpDone := startExecSweepProcess(t, filepath.Join(mailbox.directory, "wefty-exec-work", "tmp"))
+	var diagnostics strings.Builder
+	mailbox.captureStderr = func(_ context.Context, output []byte) error {
+		_, _ = diagnostics.Write(output)
+		return nil
+	}
+	mailbox.appender.(*httpRunLedgerAppender).client.Transport = captureRoundTrip(func(r *http.Request) (*http.Response, error) {
+		// Input fetch follows both the stale sweep and stale storage removal.
+		for _, done := range []<-chan struct{}{workDone, tmpDone} {
+			select {
+			case <-done:
+			default:
+				t.Error("stale process survived until new capture fetch")
+			}
+		}
+		if _, err := mailbox.root.Stat("wefty-exec-work"); !os.IsNotExist(err) {
+			t.Errorf("stale checkout survived until new capture fetch: %v", err)
+		}
+		return &http.Response{StatusCode: 200, ContentLength: 4, Body: io.NopCloser(strings.NewReader("good")), Header: make(http.Header)}, nil
+	})
+	if ok, err := seedExecCapture(t.Context(), captureSpec("good"), mailbox); !ok || err != nil {
+		t.Fatalf("seed capture: ok=%v err=%v", ok, err)
+	}
+	for _, pid := range []int{work.Process.Pid, tmp.Process.Pid} {
+		if !strings.Contains(diagnostics.String(), fmt.Sprintf("wefty: stale exec cleanup: stopped process %d (", pid)) {
+			t.Errorf("stale cleanup diagnostic missing pid %d: %s", pid, &diagnostics)
+		}
+	}
+	if stopped := mailbox.captureSweep(t.Context()); len(stopped) != 0 {
+		t.Fatalf("new Attempt inherited stale cleanup evidence: %+v", stopped)
 	}
 }
 

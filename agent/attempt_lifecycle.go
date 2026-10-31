@@ -1581,6 +1581,13 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if reapErr == nil && reapReceipt.Evidence == "" {
 			reapErr = errors.New("workload runtime reap receipt has no evidence kind")
 		}
+		// Group absence does not cover descendants that escaped the wrapper.
+		// Sweep while the retained root and run stderr are still open. Keep this
+		// evidence separate until the wrapper's result document has been read.
+		var agentStoppedProcesses []contract.StoppedProcess
+		if reapErr == nil && mailbox != nil && mailbox.captureSweep != nil {
+			agentStoppedProcesses = mailbox.captureSweep(finalizationContext)
+		}
 		// A positive runtime receipt plus no started acknowledgement and a spawn
 		// failure proves no payload existed. Guardian loss never supplies this proof.
 		if reapErr == nil && processPending && !processAcknowledged.Load() && result.SpawnError != nil && result.SpawnError.Code != contract.SpawnFailureProcessWait && result.SpawnError.Code != contract.SpawnFailureStartupReadinessTimeout && processNotSpawned != nil {
@@ -1673,6 +1680,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				}
 			}
 		}
+		result.StoppedProcesses = append(result.StoppedProcesses, agentStoppedProcesses...)
 		return result, errors.Join(runErr, finalizationErr)
 	}
 	if preflightErr != nil {
@@ -1854,6 +1862,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
 		mailbox = prepared
+		mailbox.captureStderr = func(ctx context.Context, output []byte) error {
+			if redactingSink == nil {
+				return errors.New("run stderr is unavailable")
+			}
+			return redactingSink.WriteOutput(ctx, contract.LogEvent{AttemptID: claim.Lease.AttemptID, Stream: contract.LogStderr, Timestamp: lifecycle.dependencies.clock.Now(), Bytes: output})
+		}
 		defer mailbox.close()
 		lifecycle.storeMailbox(mailbox)
 		hasCapture, err := seedExecCapture(ctx, claim.Job.Spec, mailbox)

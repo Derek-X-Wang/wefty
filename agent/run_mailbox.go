@@ -342,6 +342,8 @@ type runMailboxRefusal struct {
 // runMailbox owns one attempt's mailbox directory and publishes from it.
 type runMailbox struct {
 	captureCleanup func()
+	captureSweep   func(context.Context) []contract.StoppedProcess
+	captureStderr  func(context.Context, []byte) error
 	// directory is the absolute path handed to the workload. Every agent-side
 	// operation goes through these opened directories instead. They are opened
 	// once, identity-checked once, and never re-resolved by name: a workload

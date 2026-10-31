@@ -1145,15 +1145,28 @@ before storage rename or deletion. It stops same-user processes with physical
 cwd inside the capture, including descendants that left the command group.
 It excludes the retiring shell, its parent, and processes named `wefty-agent`.
 Its inventory is bounded to one second. TERM grace is 200 ms and release wait
-is 100 ms. The 1.3-second sweep budget fits the CLI's two-second foreground budget and
+is 100 ms. Confirmation inventory is bounded to 600 ms. The 1.9-second
+sweep budget fits the CLI's two-second foreground budget and
 the runner's default five-second TERM grace, with command and scheduling
 overhead outside that sweep budget. Failure warns without failing cleanup. See
 [exec storage retirement](exec.md) for discovery and folder scope. The wrapper
 logs each stopped process and writes optional `stopped_processes` (`pid`,
-`name`, `cwd`) in its result document. The agent copies that list to the fenced
+`name`, `cwd`) in its result document. For version 2 exec, the agent runs the
+same shared Bash sweep after successful `ReapAndVerify` and receipt validation,
+before mailbox finalization and log closure. This covers an uncatchable wrapper
+kill. The sweep targets `wefty-exec-work` through the retained mailbox handle:
+`F_GETPATH` on macOS and `/proc/self/fd` on Linux derive its physical path,
+which is checked against the held directory's file identity before Bash runs
+as the agent's direct child. Failed resolution warns and skips; the old
+mailbox pathname is never re-resolved. The agent helper has a five-second outer
+deadline and a bounded pipe wait. Deferred cleanup still owns retirement.
+Seed-time stale input receives the same sweep before removal, with separate
+`stale exec cleanup` diagnostics and no new Attempt evidence.
+Warnings go to run stderr while open, otherwise the agent log. After reading
+wrapper evidence, the agent merges its own stopped list into the fenced
 completion's `ProcessResult` without changing the runtime's verdict. A missing
 list is omitted on the wire. This does not expand Guardian process-group
-quiescence proof after an agent crash or an uncatchable wrapper kill.
+quiescence proof after an agent crash.
 
 Run output is uploaded to L1 and read with `wefty logs`; `wefty-agent` mirrors
 it to stdout/stderr only with `-mirror-run-output` for foreground development
