@@ -89,26 +89,52 @@ func TestExecCaptureScanFailureWarnsOnce(t *testing.T) {
 
 func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 	for _, test := range []struct {
-		name    string
-		second  string
-		gone    bool
-		kill    bool
-		stopped bool
-		warning bool
+		name        string
+		first       string
+		second      string
+		folder      string
+		terms       int
+		noTerm      bool
+		gone        bool
+		kill        bool
+		stopped     int
+		warning     bool
+		scanWarning bool
+		capWarning  bool
 	}{
-		{name: "absent", stopped: true},
+		{name: "absent", warning: true},
+		{name: "absent-and-gone", gone: true, stopped: 1},
 		{name: "outside", second: `printf 'p43210\ncsleep\nn%s-outside\n' "$test_storage"`},
 		{name: "different-name", second: `printf 'p43210\ncother\nn%s\n' "$test_storage"`},
 		{name: "agent", second: `printf 'p43210\ncwefty-agent\nn%s\n' "$test_storage"`},
-		{name: "still-matches", second: `printf 'p43210\ncsleep\nn%s\n' "$test_storage"`, kill: true, stopped: true},
+		{name: "still-matches", second: `printf 'p43210\ncsleep\nn%s\n' "$test_storage"`, kill: true, stopped: 1},
 		{name: "failed", second: "return 1", warning: true},
 		{name: "timeout", second: "return 137", warning: true},
-		{name: "failed-and-gone", second: "return 1", gone: true, stopped: true, warning: true},
+		{name: "failed-and-gone", second: "return 1", gone: true, stopped: 1, warning: true},
+		{name: "escaped-cwd", first: `printf 'p43210\ncsleep\nn%s/%s\n' "$test_storage" 'escaped\folder'`, noTerm: true},
+		{name: "backslash-storage", folder: `capture\folder`, noTerm: true, scanWarning: true},
+		{name: "tab-storage", folder: "capture\tcontrol", noTerm: true, scanWarning: true},
+		{name: "newline-storage", folder: "capture\n", noTerm: true, scanWarning: true},
+		{name: "control-storage", folder: "capture\x01control", noTerm: true, scanWarning: true},
+		{name: "delete-control-storage", folder: "capture\x7fcontrol", noTerm: true, scanWarning: true},
+		{name: "process-cap", first: `for ((test_i=0; test_i<65; test_i++)); do
+ printf 'p%d\ncsleep\nn%s\n' "$((43210+test_i))" "$test_storage"
+ done`, terms: 64, gone: true, stopped: 64, capWarning: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			storage, err := filepath.EvalSymlinks(t.TempDir())
 			if err != nil {
 				t.Fatal(err)
+			}
+			if test.folder != "" {
+				storage = filepath.Join(storage, test.folder)
+				if err := os.Mkdir(storage, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			first := test.first
+			if first == "" {
+				first = `printf 'p43210\ncsleep\nn%s\n' "$test_storage"`
 			}
 			signals := filepath.Join(t.TempDir(), "signals")
 			// Override shell functions only in this test invocation. Darwin-format
@@ -119,7 +145,7 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
  uname() { printf 'Darwin\n'; }
  exec_storage_bounded_inventory() {
    if [ "${3:-1}" = 1 ]; then
-     printf 'p43210\ncsleep\nn%%s\n' "$test_storage"
+     %s
    else
      [ "$3" = 0.6 ] || return 1
      %s
@@ -132,7 +158,7 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
  }
  sweep_exec_storage_processes "$test_storage"
  printf '[%%s]\n' "$exec_stopped_processes"
-`, test.second+"\n   :", test.gone)
+`, first, test.second+"\n   :", test.gone)
 			command := exec.CommandContext(t.Context(), "/bin/bash", "-c", script, "confirm-kill", storage, signals)
 			var stderr strings.Builder
 			command.Stderr = &stderr
@@ -141,11 +167,18 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 				t.Fatalf("sweep: %v: %s", err, &stderr)
 			}
 			raw, err := os.ReadFile(signals)
-			if err != nil {
+			if err != nil && !os.IsNotExist(err) {
 				t.Fatal(err)
 			}
-			if !strings.Contains(string(raw), "-TERM 43210\n") {
-				t.Fatalf("missing TERM: %s", raw)
+			wantTerms := test.terms
+			if wantTerms == 0 && !test.noTerm {
+				wantTerms = 1
+			}
+			if got := strings.Count(string(raw), "-TERM "); got != wantTerms {
+				t.Errorf("TERM count = %d, want %d: %s", got, wantTerms, raw)
+			}
+			if test.noTerm && len(raw) != 0 {
+				t.Errorf("ambiguous path received signals: %s", raw)
 			}
 			if got := strings.Contains(string(raw), "-KILL 43210\n"); got != test.kill {
 				t.Errorf("KILL = %t, want %t: %s", got, test.kill, raw)
@@ -158,22 +191,32 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 			if err := json.Unmarshal(output, &stopped); err != nil {
 				t.Fatal(err)
 			}
-			if test.stopped {
-				if len(stopped) != 1 || stopped[0].PID != 43210 || stopped[0].Name != "sleep" || stopped[0].CWD != storage {
+			if len(stopped) != test.stopped {
+				t.Errorf("stopped count = %d, want %d: %s", len(stopped), test.stopped, output)
+			}
+			for i, process := range stopped {
+				if process.PID != 43210+i || process.Name != "sleep" || process.CWD != storage {
 					t.Errorf("stopped process lost original evidence: %s", output)
 				}
-			} else if len(stopped) != 0 {
-				t.Errorf("unconfirmed process reported stopped: %s", output)
 			}
-			wantStopped, wantWarning := 0, 0
-			if test.stopped {
-				wantStopped = 1
-			}
+			wantWarning, wantScanWarning, wantCapWarning := 0, 0, 0
 			if test.warning {
 				wantWarning = 1
 			}
-			if got := strings.Count(stderr.String(), "wefty: stopped process 43210 (sleep) left in run storage\n"); got != wantStopped {
+			if test.scanWarning {
+				wantScanWarning = 1
+			}
+			if test.capWarning {
+				wantCapWarning = 1
+			}
+			if got := strings.Count(stderr.String(), "wefty: stopped process "); got != test.stopped {
 				t.Errorf("stopped log count = %d: %s", got, &stderr)
+			}
+			if got := strings.Count(stderr.String(), "wefty: warning: could not scan processes in run storage\n"); got != wantScanWarning {
+				t.Errorf("scan warning count = %d: %s", got, &stderr)
+			}
+			if got := strings.Count(stderr.String(), "wefty: warning: too many processes in run storage; stopped the first 64\n"); got != wantCapWarning {
+				t.Errorf("cap warning count = %d: %s", got, &stderr)
 			}
 			if got := strings.Count(stderr.String(), "wefty: warning: could not stop a process in run storage\n"); got != wantWarning {
 				t.Errorf("warning count = %d: %s", got, &stderr)

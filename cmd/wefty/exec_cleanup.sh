@@ -71,7 +71,8 @@ exec_storage_parse_inventory() {
     case "$protected" in *" $pid "*) continue ;; esac
     # Both discovery methods return physical cwd paths. pwd -P above resolves
     # the storage alias, including /var, /tmp and the run's short TMPDIR link.
-    case "$cwd" in *$'\t'*|*$'\n'*) continue ;; esac
+    # lsof escapes path bytes with backslashes; do not match ambiguous records.
+    case "$cwd" in *\\*|*$'\t'*|*$'\n'*) continue ;; esac
     case "$cwd" in "$source"|"$source"/*) ;; *) continue ;; esac
     if [ "$platform" = Linux ]; then
       # Read a command name only for a matching cwd, not for every process.
@@ -88,15 +89,21 @@ exec_storage_parse_inventory() {
 sweep_exec_storage_processes() {
   exec_stopped_processes=''
   local source=$1 inventory status platform pid name cwd
-  local uid i j index warning=0
+  local uid i j index warning=0 selected=0
   local pids=() names=() folders=() matches=()
   local termed_pids=() termed_names=() termed_folders=()
   [ -d "$source" ] && [ ! -L "$source" ] || return 0
   source=${source%/}
-  source=$(cd -P -- "${source%/*}" && printf '%s/%s' "$PWD" "${source##*/}") || {
+  # A final dot preserves trailing newlines through command substitution.
+  source=$(cd -P -- "${source%/*}" && printf '%s/%s.' "$PWD" "${source##*/}") || {
     printf 'wefty: warning: could not scan processes in run storage\n' >&2
     return 0
   }
+  source=${source%.}
+  case "$source" in *\\*|*[[:cntrl:]]*)
+    printf 'wefty: warning: could not scan processes in run storage\n' >&2
+    return 0 ;;
+  esac
   platform=$(uname -s)
   uid=$(id -u)
   inventory=$(exec_storage_bounded_inventory "$platform" "$uid" 1)
@@ -111,6 +118,11 @@ sweep_exec_storage_processes() {
   exec_storage_parse_inventory "$inventory" "$platform" "$source"
   for ((i=0; i<${#pids[@]}; i++)); do
     [ "${matches[i]}" -eq 1 ] || continue
+    if [ "$selected" -eq 64 ]; then
+      printf 'wefty: warning: too many processes in run storage; stopped the first 64\n' >&2
+      break
+    fi
+    selected=$((selected+1))
     pid=${pids[i]} name=${names[i]} cwd=${folders[i]}
     if kill -TERM "$pid" 2>/dev/null; then
       index=${#termed_pids[@]}
@@ -122,8 +134,8 @@ sweep_exec_storage_processes() {
     sleep 0.2
     inventory=$(exec_storage_bounded_inventory "$platform" "$uid" 0.6)
     status=$?
-    # Processes exit after TERM, so proc entries vanish mid-scan; a vanished
-    # pid is absent from the records, which is the stopped case.
+    # Processes exit after TERM, so proc entries vanish mid-scan. An absent
+    # pid must still be confirmed gone before it is reported stopped.
     if [ "$platform" = Linux ] && [ "$status" -eq 1 ] && [ -n "$inventory" ]; then status=0; fi
     if [ "$status" -eq 0 ]; then
       exec_storage_parse_inventory "$inventory" "$platform" "$source"
@@ -145,6 +157,9 @@ sweep_exec_storage_processes() {
           if kill -0 "$pid" 2>/dev/null && ! kill -KILL "$pid" 2>/dev/null; then
             if kill -0 "$pid" 2>/dev/null; then warning=1; continue; fi
           fi
+        elif kill -0 "$pid" 2>/dev/null; then
+          warning=1
+          continue
         fi
       fi
       # %q keeps the log to one line even for an unusual process name.

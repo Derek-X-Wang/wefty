@@ -213,22 +213,34 @@ other folders beneath the capture. Version 2 uses
 `$WEFTY_RUN_DIR/wefty-exec-work`; restartable captures keep that path beneath
 their Attempt-specific mailbox. The retiring shell, its parent, and processes
 named `wefty-agent` are excluded.
+Storage paths containing a backslash or a control character skip scanning
+with a warning. Cwd records containing a backslash, tab, or newline never
+match, because macOS `lsof` can escape path bytes with backslashes.
 
 Discovery uses a non-cgo inventory: UID-filtered `lsof` cwd records on macOS,
 or one GNU `find` call over UID-owned `/proc/*/cwd` links on Linux. Linux reads
 `/proc/<pid>/comm` only for matching folders. Inventory stays in a pipe and
 shell memory, without a scratch directory or a foreground removal.
-The first inventory has a one-second deadline. Selected processes get SIGTERM
-and 200 ms grace. A second inventory, bounded to 600 ms, confirms the same pid
+The first inventory has a one-second deadline. At most the first 64 matching
+processes receive SIGTERM; further matches emit one cap warning. This bounds
+the confirmation lookups and result escaping to 64 processes. After 200 ms
+of TERM grace, a second inventory, bounded to 600 ms, confirms the same pid
 and command name still have a working folder in storage before SIGKILL. Both
 passes exclude the retiring shell, its parent, and `wefty-agent`. A pid absent
-from the second inventory counts as stopped by SIGTERM. Failed confirmation
-sends no SIGKILL, emits one warning, and reports only pids confirmed gone by
-`kill -0`. A 100 ms release wait follows. These stages total at most 1.9 seconds,
-excluding command and scheduling overhead. They leave 100 ms within the CLI's
-two-second foreground sweep budget and 3.1 seconds within the agent's default
-five-second TERM grace. A shorter configured runner grace can interrupt the
-wrapper trap. Discovery or signalling failure never fails storage retirement.
+from the second inventory counts as stopped only if `kill -0` confirms it is
+gone. An absent pid that is still alive receives no SIGKILL, is not reported
+stopped, and emits the stop warning. Failed confirmation sends no SIGKILL,
+emits one warning, and reports only pids confirmed gone by `kill -0`.
+A 100 ms release wait follows. These bounded stages total at most 1.9 seconds,
+excluding inventory processing, command and scheduling overhead. They leave
+100 ms within the CLI's two-second foreground sweep budget and 3.1 seconds
+within the agent's default five-second TERM grace. A shorter configured runner
+grace can interrupt the wrapper trap.
+A pid and a command name are not a stable process identity, and macOS has no
+pidfd. An unrelated same-user process that reuses a selected pid between an
+inventory and a signal, has the same name, and works in run storage can still
+receive that signal. The second inventory narrows this window before SIGKILL;
+it does not close it. Discovery or signalling failure never fails storage retirement.
 
 Each stopped process emits one run-stderr line:
 `wefty: stopped process <pid> (<name>) left in run storage`.
