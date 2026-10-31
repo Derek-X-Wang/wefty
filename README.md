@@ -223,8 +223,9 @@ Stopping the agent: the first `SIGTERM` or Ctrl-C drains. The node stops
 claiming new work and shows `draining` in `wefty status` and `wefty nodes
 list`, and the agent then waits for every attempt it is already running to
 finish, which can take as long as that attempt's `--max-runtime`. Until it
-exits, a replacement agent for the same node ID cannot start ("stable node ...
-is already active"). A second signal stops waiting and kills the resident
+exits, a replacement agent for the same node ID cannot start:
+`agent: stable node "dogfood-local" is already active: node-local ownership is busy`.
+A second signal stops waiting and kills the resident
 attempts, which record `signal terminated (agent)`.
 
 From another shell with the same variables, verify the node and submit a run.
