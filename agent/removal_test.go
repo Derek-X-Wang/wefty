@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -867,7 +868,7 @@ func TestMixedRuntimeAndComputerStorageRemovalCannotBypassControllerReap(t *test
 		if recorded {
 			t.Fatal("mixed manifest recorded quiescence without a runtime receipt")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("mixed manifest controller reap did not resume after admission cleared")
 	}
 }
@@ -903,7 +904,7 @@ func TestPreparedComputerStorageRemovalWaitsForAdmissionBarrier(t *testing.T) {
 		if receipt.Evidence != workloadrunner.ReapEvidenceNoRuntime {
 			t.Fatalf("post-barrier receipt = %+v", receipt)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Storage-only reap did not resume after admission cleared")
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -689,7 +690,7 @@ func TestComputerCreateRunRechecksRevocationAfterAuthentication(t *testing.T) {
 	}()
 	select {
 	case <-verifier.blocked:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("submission did not pause after bearer authentication")
 	}
 	if _, err := h.store.RevokeComputerTokens(context.Background(), ComputerTokenRevocationRequest{
@@ -742,7 +743,7 @@ func TestComputerRunIsAuthorizedByItsFinalL1Proof(t *testing.T) {
 		}()
 		select {
 		case <-verifier.blocked:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("the Run never reached its final L1 proof")
 		}
 		return h, verifier, client, old, result

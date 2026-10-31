@@ -20,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	"github.com/coder/websocket"
@@ -90,7 +91,7 @@ func TestTakeoverPolicyRetryCallerStopDuringRetryDelay(t *testing.T) {
 		if !errors.Is(err, context.Canceled) || commandExitCode(err) != exitFailure {
 			t.Fatalf("cancelled admission retry delay: exit=%d err=%v, want local cancellation", commandExitCode(err), err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("admission retry did not stop after caller cancellation")
 	}
 }

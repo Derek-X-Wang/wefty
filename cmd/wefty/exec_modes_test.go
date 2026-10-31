@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -367,7 +368,7 @@ func TestExecKeepRunningSignalsAndJSONFromRealBinary(t *testing.T) {
 				if command, ok := err.(*exec.ExitError); !ok || command.ExitCode() != 13 {
 					t.Fatalf("stopped watch exit: %v %s", err, out.String())
 				}
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("watch did not stop")
 			}
 			runs, err := stack.clients.listRuns(t.Context(), "", 20)

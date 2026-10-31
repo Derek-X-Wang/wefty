@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 type captureRoundTrip func(*http.Request) (*http.Response, error)
@@ -93,7 +94,7 @@ func TestExecCaptureIdleBodyFails(t *testing.T) {
 		if e == nil || !strings.Contains(e.Error(), "idle") {
 			t.Fatalf("idle result=%v", e)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("stalled capture did not expire")
 	}
 }

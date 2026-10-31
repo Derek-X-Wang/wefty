@@ -497,7 +497,7 @@ func startPortfulTeardownService(t *testing.T, kind, restart string, ready bool)
 	}()
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("service payload never started")
 	}
 	return service
@@ -515,7 +515,7 @@ func (service portfulTeardownService) stop(t *testing.T) {
 	service.cancel()
 	select {
 	case <-service.done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("service did not stop")
 	}
 }
@@ -726,7 +726,7 @@ func TestOpaqueReadinessDeadlineCancelsProbeAndRejectsLateSuccess(t *testing.T) 
 	}
 	select {
 	case <-probeCanceled:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("startup deadline did not cancel the in-flight probe")
 	}
 	close(releaseProbe)
@@ -1188,7 +1188,7 @@ func (runner *readinessRunner) waitStarted(t *testing.T) {
 	t.Helper()
 	select {
 	case <-runner.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("runtime did not report successful spawn")
 	}
 }
@@ -1235,7 +1235,7 @@ func waitReadinessState[T any](t *testing.T, states <-chan T) T {
 	select {
 	case state := <-states:
 		return state
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("timed out waiting for local readiness transition")
 		var zero T
 		return zero
@@ -1364,7 +1364,7 @@ func TestOpaqueReadinessTreatsHelperConnectionLimitAsInconclusive(t *testing.T) 
 			if got != want {
 				t.Fatalf("readiness = %t, want %t", got, want)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatalf("timed out waiting for readiness=%t", want)
 		}
 	}

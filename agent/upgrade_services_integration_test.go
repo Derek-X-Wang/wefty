@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -147,7 +148,7 @@ func TestUpgradeServicesMixedWorkloadAcrossTwoRetirees(t *testing.T) {
 		})
 		select {
 		case <-a.Registered():
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("registration timeout")
 		}
 		if i > 0 {

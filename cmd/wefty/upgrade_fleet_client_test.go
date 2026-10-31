@@ -20,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -132,7 +133,7 @@ func TestFleetUpgradeJoinDrainsThroughClientServiceAndRemoteL1Fake(t *testing.T)
 		case <-ready:
 		case err := <-done:
 			t.Fatalf("client service failed: %v", err)
-		case <-time.After(time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("client service did not publish")
 		}
 	}

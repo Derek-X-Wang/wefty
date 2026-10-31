@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 type seatExecProtocolEngine struct {
@@ -147,7 +149,7 @@ func TestSeatExecClientDisconnectCancelsOnlyCommand(t *testing.T) {
 	}()
 	select {
 	case <-e.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("command never started")
 	}
 	cancel()
@@ -156,7 +158,7 @@ func TestSeatExecClientDisconnectCancelsOnlyCommand(t *testing.T) {
 	}
 	select {
 	case <-e.cancelled:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("disconnected command was not cancelled")
 	}
 	if _, err := session.ObserveComputerSeats(t.Context(), ObserveComputerSeatsRequest{Authority: authority, Generation: 1}); err != nil {
@@ -180,7 +182,7 @@ func TestSeatExecPerSeatLimitLeavesOtherSeatWorking(t *testing.T) {
 		go func() { done <- session.ExecComputerSeat(ctx, req, nil) }()
 		select {
 		case <-e.started:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("command did not start")
 		}
 	}
@@ -196,7 +198,7 @@ func TestSeatExecPerSeatLimitLeavesOtherSeatWorking(t *testing.T) {
 	go func() { done <- session.ExecComputerSeat(ctx, other, nil) }()
 	select {
 	case <-e.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("another Seat was starved")
 	}
 	stop()

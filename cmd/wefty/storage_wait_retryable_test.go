@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -593,7 +594,7 @@ func TestFollowLoopsCancelledDuringRetrySleep(t *testing.T) {
 		select {
 		case err := <-done:
 			return err
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("follow did not stop after cancellation")
 			return nil
 		}

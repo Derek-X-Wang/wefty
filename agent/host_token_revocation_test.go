@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
 
@@ -65,7 +66,7 @@ func nextHostRevokeCall(t *testing.T, calls <-chan l3.HostComputerTokenRevocatio
 	select {
 	case call := <-calls:
 		return call
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("host token revocation did not call L3")
 		return l3.HostComputerTokenRevocationRequest{}
 	}
@@ -123,7 +124,7 @@ func TestHostTokenRevocationRetriesWithBackoffUnderInjectedClock(t *testing.T) {
 	}
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("host token revocation did not stop after success")
 	}
 	clock.Advance(time.Hour)
@@ -203,7 +204,7 @@ func TestAgentCloseWaitsForHostTokenRevocation(t *testing.T) {
 	session.markRegistered()
 	select {
 	case <-revoker.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("host token revocation did not start")
 	}
 	closed := make(chan struct{})
@@ -219,7 +220,7 @@ func TestAgentCloseWaitsForHostTokenRevocation(t *testing.T) {
 	close(revoker.release)
 	select {
 	case <-closed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Close did not return after the host token revocation worker stopped")
 	}
 	revoker.mu.Lock()

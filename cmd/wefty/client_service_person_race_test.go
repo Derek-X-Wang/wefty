@@ -14,6 +14,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/fabricconfig"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestClientServiceKeepsClientWhenPersonStateDisappearsBeforeOpen(t *testing.T) {
@@ -52,7 +53,7 @@ func TestClientServiceKeepsClientWhenPersonStateDisappearsBeforeOpen(t *testing.
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(3 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("client service did not stop")
 		}
 	})

@@ -111,7 +111,7 @@ func assertAgentResizesPoolFromHeartbeatGrantedCapacity(t *testing.T) {
 	for range 3 {
 		select {
 		case <-started:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("failed to occupy grown one-shot pool")
 		}
 	}
@@ -133,7 +133,7 @@ func assertAgentResizesPoolFromHeartbeatGrantedCapacity(t *testing.T) {
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("heartbeat loop did not stop")
 	}
 	select {

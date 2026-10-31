@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // shortenExecReadRecovery makes a read that never succeeds give up quickly.
@@ -602,7 +603,7 @@ func TestExecSignalContextCancelsOnlyAfterReset(t *testing.T) {
 	cancelBase()
 	select {
 	case <-ctx.Done():
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("exec context ignored the parent's cancellation")
 	}
 	if !reset.Load() {
@@ -655,7 +656,7 @@ func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 	t.Cleanup(func() { _ = cmd.Process.Kill() })
 	select {
 	case <-output.seen:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("binary did not submit run")
 	}
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
@@ -663,7 +664,7 @@ func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 	}
 	select {
 	case <-cancelling:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("first signal did not request cancellation")
 	}
 	// The server can see the cancel before the test's reader has copied the

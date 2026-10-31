@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // Delay only the first heartbeat reply. The real helper keeps consuming the
@@ -58,7 +59,7 @@ func TestHeartbeatReplyDelayKeepsNeighbourUntilHelperBound(t *testing.T) {
 			}
 			select {
 			case <-gate.entered:
-			case <-time.After(2 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("pump did not await the first heartbeat reply")
 			}
 			waitFor(t, time.Second, func() bool {
@@ -106,7 +107,7 @@ func TestHeartbeatReplyDelayKeepsNeighbourUntilHelperBound(t *testing.T) {
 				clock.Advance(2 * time.Second) // reply delay is now beyond the helper's 3 s timeout
 				select {
 				case <-session.pumpDone:
-				case <-time.After(2 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("reply past helper timeout did not stop the pump")
 				}
 				var loss *RuntimeLossError

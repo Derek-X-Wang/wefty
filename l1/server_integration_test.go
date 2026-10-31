@@ -22,6 +22,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestServeTreatsInitialReconcileRollbackRaceAsShutdown(t *testing.T) {
@@ -153,7 +154,7 @@ func TestServeContinuesAfterCanceledReconcileErrorUnderLiveContext(t *testing.T)
 	go func() { done <- server.Serve(ctx, listener) }()
 	select {
 	case <-continued:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("reconciliation did not resume after a live-context cancellation")
 	}
 	if !strings.Contains(logs.String(), "event=l1_reconcile_live_context_canceled") {
@@ -342,7 +343,7 @@ func newIntegrationHarnessWithReconcileInterval(
 		h.served = nil
 		_ = listener.Close()
 		t.Fatalf("L1 stopped before accepting connections: %v", err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("L1 did not finish initial recovery")
 	}
 	return h

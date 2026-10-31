@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // These tests need no containerd and no Docker: a temp directory is the whole
@@ -1458,7 +1459,7 @@ func TestFreeingOneVolumesTreeDoesNotBlockAnotherAttemptsFinalization(t *testing
 		if err != nil {
 			t.Fatalf("finalizing another attempt during a free: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("one volume's free blocked another attempt's finalization")
 	}
 	if !receiptPresent(t, root, quick) {

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestExecCaptureSlowDownloadDoesNotBlockLedger(t *testing.T) {
@@ -90,7 +91,7 @@ func TestExecCaptureBusyCleanupNeverWaitsInReconcile(t *testing.T) {
 			t.Error(e)
 		}
 		h.l3Store.execCaptureMu.Unlock()
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Error("reconciler waited for cleanup lock")
 		h.l3Store.execCaptureMu.Unlock()
 		<-done

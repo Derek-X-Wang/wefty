@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	wr "github.com/Derek-X-Wang/wefty/runner"
 )
 
@@ -96,7 +97,7 @@ func TestGuardianFinalKillHasBoundedAbsenceProof(t *testing.T) {
 		if !joined {
 			select {
 			case <-done:
-			case <-time.After(time.Second):
+			case <-time.After(testwait.Bound):
 				t.Error("proof waiter did not join")
 			}
 		}

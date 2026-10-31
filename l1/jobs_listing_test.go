@@ -18,6 +18,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func listingPage(t *testing.T, h *integrationHarness, client *http.Client, path string) JobList {
@@ -538,7 +539,7 @@ func TestJobsListingDoesNotBlockConcurrentWrites(t *testing.T) {
 			case <-entered:
 			case <-listed:
 				t.Fatalf("listing ended before the read barrier: %v", listErr)
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("listing did not reach the read barrier")
 			}
 			db := store.db

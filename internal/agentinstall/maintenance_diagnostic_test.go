@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestMaintenanceDiagnosticIsIndependentAndNonblocking(t *testing.T) {
@@ -49,7 +51,7 @@ func TestMaintenanceDiagnosticIsIndependentAndNonblocking(t *testing.T) {
 				if got.err != nil || got.m == nil || got.m.Operation != m.Operation || got.m.Kind != m.Kind {
 					t.Fatalf("%+v", got)
 				}
-			case <-time.After(time.Second):
+			case <-time.After(testwait.Bound):
 				if release != nil {
 					release()
 					release = nil

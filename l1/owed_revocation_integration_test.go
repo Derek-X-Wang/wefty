@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // outageLedger is a run ledger for one Computer that can be taken down (it
@@ -331,7 +332,7 @@ func TestLateSettlementSparesAnAttemptMintedWhileItIsInFlight(t *testing.T) {
 	}()
 	select {
 	case <-arrived:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("the late settlement never reached the run ledger")
 	}
 	// In flight: the next attempt is claimed and minted its pass.

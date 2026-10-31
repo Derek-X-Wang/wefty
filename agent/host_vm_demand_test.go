@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 )
@@ -183,7 +184,7 @@ func TestSlowHostVMStopDoesNotBlockNodeOperations(t *testing.T) {
 			if err != nil {
 				t.Errorf("%s: %v", operation.name, err)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(testwait.Bound):
 			t.Errorf("slow stop blocked %s", operation.name)
 		}
 	}

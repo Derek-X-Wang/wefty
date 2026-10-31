@@ -12,6 +12,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -123,7 +124,7 @@ func TestDeEnrollmentAdapterAttestsAndPreservesResult(t *testing.T) {
 	var answer exchangeResult
 	select {
 	case answer = <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("finished primary did not de-enroll")
 	}
 	result, err := answer.inventory, answer.err

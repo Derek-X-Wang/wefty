@@ -9,6 +9,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -366,7 +367,7 @@ func TestExecCrossNodeStopCancelsUnlessKeepRunning(t *testing.T) {
 			var stopped error
 			select {
 			case stopped = <-done:
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("CLI ignored stop")
 			}
 			exit, ok := stopped.(*exec.ExitError)
@@ -539,7 +540,7 @@ func TestExecCrossNodeStopDuringUploadIsLocalCancellationFromRealBinary(t *testi
 		if !ok || exit.ExitCode() != 1 {
 			t.Fatalf("upload cancellation exit=%v want=1 stdout=%s stderr=%s", err, &out, &stderr)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("upload cancellation did not stop CLI")
 	}
 	page, err := fleet.clients.listRuns(t.Context(), "", 10)

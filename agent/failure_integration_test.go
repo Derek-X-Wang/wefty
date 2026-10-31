@@ -2330,7 +2330,7 @@ func assertAuthorityWatchdogCountsSuspendWallGap(t *testing.T) {
 		if !errors.Is(err, errAuthorityDeadlineExceeded) {
 			t.Fatalf("watchdog failure = %v, want authority deadline", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("watchdog ignored suspend wall-clock gap")
 	}
 	if cause := context.Cause(attemptContext); !errors.Is(cause, errAuthorityDeadlineExceeded) {

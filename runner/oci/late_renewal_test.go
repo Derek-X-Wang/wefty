@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -59,7 +60,7 @@ func TestAdapterLateRenewalLosesOnlyExactAttempt(t *testing.T) {
 			for _, entered := range []chan struct{}{engine.targetWatching, engine.neighbourWatching} {
 				select {
 				case <-entered:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("Watch not entered")
 				}
 			}
@@ -76,7 +77,7 @@ func TestAdapterLateRenewalLosesOnlyExactAttempt(t *testing.T) {
 				if !errors.As(err, &lost) || lost.Authority != authority {
 					t.Fatalf("target returned %v", err)
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("refused attempt remained running")
 			}
 			select {
@@ -93,7 +94,7 @@ func TestAdapterLateRenewalLosesOnlyExactAttempt(t *testing.T) {
 			cancel()
 			select {
 			case <-neighbourDone:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("neighbour did not join")
 			}
 		})

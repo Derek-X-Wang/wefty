@@ -14,6 +14,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -74,7 +75,7 @@ func testRetirementTERM(t *testing.T, latch bool) {
 			defer func() { cancel(); <-done }()
 			select {
 			case <-node.Registered():
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("agent did not register")
 			}
 			job, _, err := store.CreateJob(t.Context(), contract.JobSpec{SchemaVersion: contract.SchemaVersionV1, DispatchKey: "term-retirement", Kind: contract.JobKindProcess, Class: contract.JobClassOneShot, Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", `touch "$1"; while [ ! -e "$2" ]; do sleep 0.1; done; exit 17`, "sh", ready, release}, WorkingDirectory: dir, HandoffDirectory: dir}})
@@ -137,7 +138,7 @@ func testRetirementTERM(t *testing.T, latch bool) {
 			signals <- syscall.SIGTERM
 			select {
 			case <-drainStarted:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("TERM did not start normal drain")
 			}
 			select {

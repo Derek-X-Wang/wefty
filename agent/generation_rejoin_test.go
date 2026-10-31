@@ -16,6 +16,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -76,7 +77,7 @@ func newGenerationRejoinFixture(t *testing.T, heartbeatInterval, claimInterval t
 			if err != nil {
 				t.Errorf("session shutdown: %v", err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("session did not stop")
 		}
 	})
@@ -316,7 +317,7 @@ func TestPrimaryGenerationRejoinCoalescesConcurrentRefusals(t *testing.T) {
 							if result.err != nil {
 								t.Errorf("claim caller stopped: %v", result.err)
 							}
-						case <-time.After(5 * time.Second):
+						case <-time.After(testwait.Bound):
 							t.Error("claim caller did not stop")
 						}
 					}
@@ -336,7 +337,7 @@ func TestPrimaryGenerationRejoinCoalescesConcurrentRefusals(t *testing.T) {
 				}
 				select {
 				case <-firstRegister:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("leader did not attempt a rejoin")
 				}
 				followers.Store(true)
@@ -348,7 +349,7 @@ func TestPrimaryGenerationRejoinCoalescesConcurrentRefusals(t *testing.T) {
 				for range callers {
 					select {
 					case <-recovered:
-					case <-time.After(5 * time.Second):
+					case <-time.After(testwait.Bound):
 						t.Fatal("not all refused callers recovered")
 					}
 				}
@@ -447,7 +448,7 @@ func assertPrimaryGenerationRejoinsAfterNodeDead(t *testing.T, heartbeat bool) {
 	expire.Store(true)
 	select {
 	case <-refused:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("request did not reach the dead Node")
 	}
 	deadline := time.After(2 * time.Second)
@@ -520,7 +521,7 @@ func TestRetiringGenerationDoesNotRejoinAfterNodeDeadHeartbeat(t *testing.T) {
 			for range 2 {
 				select {
 				case <-refused:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("retiring heartbeat retries stopped")
 				}
 			}

@@ -23,6 +23,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -383,7 +384,7 @@ func TestGenerationThreeRunningAgentsShareNodeLocalState(t *testing.T) {
 		case <-a.Registered():
 		case err := <-finished:
 			t.Fatalf("node generation stopped before registration: %v", err)
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("registration timed out")
 		}
 		node, err := store.GetNode(t.Context(), "node")
@@ -471,7 +472,7 @@ func TestGenerationThreeRunningAgentsShareNodeLocalState(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("retiree did not close")
 		}
 	}
@@ -529,7 +530,7 @@ func TestGenerationCustodyLetsReapedRetireeExitAndPrimaryReplayHistoricalEvidenc
 	target.outbox.startRecovery(t.Context(), target.session.client, func(err error) { t.Log(err) })
 	select {
 	case <-scanned:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("initial empty custody scan did not finish")
 	}
 	// Local scanning no longer waits for inventory. Establish that both the
@@ -773,7 +774,7 @@ func TestGenerationRecoveryDrainsEligibleEvidenceWhileInventoryBlocked(t *testin
 	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("eligible recovery: %v", err) })
 	select {
 	case <-inventoryEntered:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("inventory refresh did not start")
 	}
 	// Keep inventory blocked until both ordered logs and completions drain.
@@ -982,7 +983,7 @@ func TestGenerationThreeRecoveryLoopsSerializeClosedBacklog(t *testing.T) {
 		if generation != "G0" {
 			t.Fatalf("first owner=%s", generation)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("G0 did not enter delivery")
 	}
 	start(1)

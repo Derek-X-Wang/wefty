@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -211,14 +212,14 @@ func TestTakeoverCancellationDuringExchange(t *testing.T) {
 			case <-entered:
 			case err := <-done:
 				t.Fatalf("exchange ended before reaching front door: %v", err)
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("exchange did not reach front door")
 			}
 			cancel()
 			var err error
 			select {
 			case err = <-done:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("exchange did not stop on cancellation")
 			}
 			var stderr bytes.Buffer

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -277,7 +278,7 @@ func TestL1RegressionFirstTerminalProjectionWins(t *testing.T) {
 				if err != nil {
 					t.Fatalf("stale pass should lose without another failure: %v", err)
 				}
-			case <-time.After(time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("stale pass hung")
 			}
 			if got := snapshotRecovery(t, s, run.RunID); !reflect.DeepEqual(got, winner) {

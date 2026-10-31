@@ -12,6 +12,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -71,7 +72,7 @@ func testSeatRequestDialog(t *testing.T, nilIntent bool) {
 	clock.Advance(0)
 	select {
 	case <-shown:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("node did not show approval")
 	}
 	observer, cutOff := context.WithCancel(t.Context())

@@ -18,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -209,7 +210,7 @@ func awaitSeatApprovalTest[T any](t *testing.T, channel <-chan T) T {
 	select {
 	case value := <-channel:
 		return value
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Seat approval did not finish after the injected deadline")
 		var zero T
 		return zero

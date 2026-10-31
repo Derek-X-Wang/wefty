@@ -19,6 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
@@ -263,7 +264,7 @@ func TestPeerHealthConcurrentRequestsDoNotWrite(t *testing.T) {
 	call()
 	select {
 	case <-pingEntered:
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("peer ping not reached")
 	}
 	for range count - 1 {
@@ -271,7 +272,7 @@ func TestPeerHealthConcurrentRequestsDoNotWrite(t *testing.T) {
 	}
 	select {
 	case <-allRequests:
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("concurrent requests did not reach observer")
 	}
 	if pings.Load() != 1 {

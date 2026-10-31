@@ -18,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
 )
@@ -224,7 +225,7 @@ func TestNeverProcessStartRetryEndsWithLeaseWindow(t *testing.T) {
 			}()
 			select {
 			case <-answered:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("first start acknowledgement was not answered")
 			}
 			clock.waitForDeadline(t, start.Add(window))
@@ -234,7 +235,7 @@ func TestNeverProcessStartRetryEndsWithLeaseWindow(t *testing.T) {
 				if err == nil || calls.Load() != 1 {
 					t.Fatalf("acknowledgement after its window = %v after %d calls, want the undecided answer and no new request", err, calls.Load())
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("acknowledgement outlived its lease window")
 			}
 		})
@@ -382,7 +383,7 @@ func TestNeverPortfulServiceWaitsForStartAcceptance(t *testing.T) {
 			}()
 			select {
 			case <-reported:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("runner never reported readiness")
 			}
 			state := func() AttemptLifecycleState {
@@ -415,7 +416,7 @@ func TestNeverPortfulServiceWaitsForStartAcceptance(t *testing.T) {
 					if err == nil || !strings.Contains(err.Error(), "acknowledge process start") {
 						t.Fatalf("refused portful service = %v", err)
 					}
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("refused start left the payload running")
 				}
 				unpublished()
@@ -431,7 +432,7 @@ func TestNeverPortfulServiceWaitsForStartAcceptance(t *testing.T) {
 				if err != nil {
 					t.Fatalf("accepted portful service = %v", err)
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("portful service did not finish")
 			}
 		})
@@ -638,7 +639,7 @@ func TestNeverProcessStartSurvivesLostAcknowledgement(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("first start acknowledgement = HTTP %d, want a committed start", code)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("start acknowledgement never reached L1")
 	}
 	// The agent records the attempt running only once L1's start verdict

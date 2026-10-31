@@ -24,6 +24,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/serviceplan"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 )
@@ -420,7 +421,7 @@ func TestFleetDoctorUsesRunningClientServiceWithoutBackendOpen(t *testing.T) {
 	case <-ready:
 	case err := <-done:
 		t.Fatal(err)
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("fake client service did not become ready")
 	}
 	f.host.fleetClients = nil

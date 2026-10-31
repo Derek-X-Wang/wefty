@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 type memoryFreezerFixture struct {
@@ -94,13 +96,13 @@ func TestComputerMemoryReworkDeadlineThawsWhileShrinkReadIsBlocked(t *testing.T)
 	}()
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("shrink never reached frozen read")
 	}
 	clock.Advance(1500 * time.Millisecond)
 	select {
 	case <-f.thawed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("deadline left Computer frozen behind a blocked read")
 	}
 	if clock.Now().Sub(started) > 2*time.Second {
@@ -112,7 +114,7 @@ func TestComputerMemoryReworkDeadlineThawsWhileShrinkReadIsBlocked(t *testing.T)
 		if err == nil || writes != 0 {
 			t.Fatalf("expired shrink wrote after thaw: err=%v writes=%d", err, writes)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("shrink did not finish")
 	}
 }
@@ -129,7 +131,7 @@ func TestComputerMemoryReworkSlowFreezeIsRetryable(t *testing.T) {
 		for j := 0; j < 2; j++ {
 			select {
 			case <-clock.timerCreated:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("freeze wait did not arm its deadline and poll")
 			}
 		}
@@ -140,7 +142,7 @@ func TestComputerMemoryReworkSlowFreezeIsRetryable(t *testing.T) {
 			if !errors.As(err, &refusal) || refusal.Reason != SeatRefusalMemoryBusy || f.frozen {
 				t.Fatalf("slow freeze became broken: %v frozen=%t", err, f.frozen)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("freeze deadline did not finish")
 		}
 	}

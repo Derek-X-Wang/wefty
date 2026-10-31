@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
@@ -416,7 +417,7 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 	}()
 	select {
 	case <-observationStarted:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("resident completion did not acquire the intent fence")
 	}
 
@@ -450,7 +451,7 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 	close(continueObservation)
 	select {
 	case <-beforeCompletionRecord:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("resident completion did not reach the ledger checkpoint")
 	}
 	var firstStop struct {
@@ -459,7 +460,7 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 	}
 	select {
 	case firstStop = <-stopDone:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("first stop did not report the failed completion fence")
 	}
 	var persistenceErr *OCIIntentSuppressionPersistenceError
@@ -482,7 +483,7 @@ func TestControllerStopDoesNotReuseLateSuppressionFailureAfterIntentReopens(t *t
 		if !errors.As(err, &persistenceErr) {
 			t.Fatalf("resident completion error=%T %v, want typed suppression failure", err, err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("resident completion did not publish its delayed result")
 	}
 	secondResponse, err := controller.Stop(t.Context(), ocicontrol.IntentMutationRequest{ExpectedRevision: 3})
@@ -744,7 +745,7 @@ func TestControllerStopReportsResidentSuppressionFailureFromCurrentEpisodeAfterI
 	}()
 	select {
 	case <-residentStarted:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("resident did not start")
 	}
 
@@ -764,7 +765,7 @@ func TestControllerStopReportsResidentSuppressionFailureFromCurrentEpisodeAfterI
 	select {
 	case result := <-stopDone:
 		secondStop, stopErr = result.response, result.err
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("current episode stop did not join the resident")
 	}
 	var persistenceErr *OCIIntentSuppressionPersistenceError
@@ -777,7 +778,7 @@ func TestControllerStopReportsResidentSuppressionFailureFromCurrentEpisodeAfterI
 		if !errors.Is(err, cause) {
 			t.Fatalf("resident completion error=%T %v, want current episode failure", err, err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("resident did not publish its current episode failure")
 	}
 }

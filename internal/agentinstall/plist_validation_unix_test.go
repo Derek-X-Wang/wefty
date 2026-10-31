@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestRollingLoadedPlistValidatesTypeBeforeRead(t *testing.T) {
@@ -48,7 +50,7 @@ func TestRollingLoadedPlistValidatesTypeBeforeRead(t *testing.T) {
 				}
 				select {
 				case <-done:
-				case <-time.After(2 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Error("plist read did not stop after unblocking")
 				}
 				t.Fatal("LoadCandidate blocked reading a nonregular plist")
@@ -111,7 +113,7 @@ func TestRollingLoadedPlistReplacementCannotFollowOrBlock(t *testing.T) {
 				}
 				select {
 				case <-done:
-				case <-time.After(2 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Error("replaced plist read did not stop after unblocking")
 				}
 				t.Fatal("replacement blocked LoadCandidate while holding the catalog lock")

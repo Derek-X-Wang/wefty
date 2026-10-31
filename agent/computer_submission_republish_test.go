@@ -188,7 +188,7 @@ func startSubmissionRepublishHarness(t *testing.T, name string, gate func() bool
 		cancel()
 		select {
 		case <-h.serviceDone:
-		case <-time.After(5 * time.Second): // Existing Computer-service shutdown bound.
+		case <-time.After(testwait.Bound): // Existing Computer-service shutdown bound.
 			t.Error("Computer service did not stop")
 		}
 	})

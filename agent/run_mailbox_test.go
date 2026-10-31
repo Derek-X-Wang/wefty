@@ -22,6 +22,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -1278,7 +1279,7 @@ func TestMailboxFenceJoinsAppendAdmissionAndInflightCalls(t *testing.T) {
 				go func() { defer close(swept); mailbox.finalize(context.Background()) }()
 				select {
 				case <-entered:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("append did not reach the controlled pause")
 				}
 				fenced := make(chan struct{}, 2)
@@ -1288,7 +1289,7 @@ func TestMailboxFenceJoinsAppendAdmissionAndInflightCalls(t *testing.T) {
 				}
 				select {
 				case <-cancelled:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("fence did not cancel the admitted append")
 				}
 				select {
@@ -1300,7 +1301,7 @@ func TestMailboxFenceJoinsAppendAdmissionAndInflightCalls(t *testing.T) {
 				for range 2 {
 					select {
 					case <-fenced:
-					case <-time.After(5 * time.Second):
+					case <-time.After(testwait.Bound):
 						t.Fatal("fence did not join the cancelled append")
 					}
 				}
@@ -1417,7 +1418,7 @@ func waitMailboxSignal(t *testing.T, signal <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-signal:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("mailbox handshake did not complete")
 	}
 }
