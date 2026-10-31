@@ -18,6 +18,8 @@ and `invalid_request`; the message lists missing tags and the node's tags.
 It is an ordinary process one-shot without
 Workflow or dispatch authority. No default runtime cap is added.
 Exec runs from inside a Git checkout with at least one commit.
+Git SHA-1 and SHA-256 repositories are supported. Frozen `base_commit` and
+`snapshot_tree` identities must each be 40 or 64 lowercase hexadecimal characters.
 
 The capture includes HEAD, current tracked files (including staged and unstaged
 changes and deletions), and untracked files not excluded by Git. Git's ignore
@@ -118,19 +120,36 @@ both caps even without Content-Length. A per-capture refusal is
 Client read failures remain invalid requests. L3 write failures are retryable
 internal errors (exit 13); public error messages contain no server file path.
 Both messages name the capture size (or the observed lower bound for an
-unknown-length stream) and cap. No run is submitted on upload refusal.
+unknown-length stream) and cap. The total-cap message also names the bytes
+"held or reserved", including in-flight uploads. No run is submitted on upload refusal.
 
 The node agent fetches `GET /v1/runs/{run_id}/exec-capture` through its own
 Fabric connection with the run token it already holds. Only that exact live
 run's token can fetch its referenced hash. Client-tag access and another run's
 token are refused; there is no capture listing or client download route.
+L3 declares the stored file's byte size in `Content-Length`. A declared length
+that differs from the run's `capture_size_bytes` is a permanent size mismatch;
+the node rejects it before reading the body. Fetch retries transport errors
+before a response, HTTP 5xx responses, bodies that end before their own declared
+`Content-Length`, and non-idle body read errors on unknown-length responses.
+Waits are 1, 2, 4, 8 and 15 seconds (six attempts and 30 seconds of total
+backoff). An undersize body without a declared length that ends with clean EOF
+is permanent. Cancellation interrupts a wait. HTTP 4xx, oversize bodies, hash
+mismatches and inactivity timeouts stop immediately. Each network operation
+retains its separate 30-second inactivity budget; progressing transfers have
+no total transfer deadline.
 The node writes a private staging file in the run mailbox, verifies SHA-256
 and exact byte size, then renames it to `capture.bundle`. A mismatch,
 truncation, or fetch error fails preparation with a capture diagnostic and
 never starts the command. The wrapper clones the verified mailbox bundle into
 node-local exec storage. The node agent removes the mailbox bundle when the
-attempt ends, including when the wrapper is killed. Local working changes
-remain unstaged/untracked and HEAD remains the caller's base commit, as below.
+attempt ends, including when the wrapper is killed. Through its retained opened
+mailbox root, the agent renames leftover checkout storage to a unique trash
+entry in that root. A background goroutine removes only that trash entry and
+then closes the retained root. Replacing the mailbox pathname cannot redirect
+cleanup outside the run. Recursive deletion does not delay the completion
+report to L1. Local working changes remain unstaged/untracked and HEAD remains
+the caller's base commit, as below.
 
 Every reconciliation pass retires captures whose referencing runs have all
 ended. Unreferenced uploads expire after one hour. Startup removes interrupted
