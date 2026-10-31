@@ -1596,3 +1596,47 @@ func TestOCIHelperSeatRefusalDetailsMatchContract(t *testing.T) {
 		t.Fatalf("Seat refusal details: implementation=%v contract=%v", implemented, published)
 	}
 }
+
+// The matrix gate binds linux_evidence.commit to the candidate, and the
+// assembler reads that commit only from provenance-receipt.json. A lane that
+// runs the tests without writing the receipt is red whatever the tests do: the
+// scheduled lane was, every week from 2026-09-14 (#1414).
+func TestRealtimingLanesWriteTheProvenanceTheGateBinds(t *testing.T) {
+	const receipt = `> "$WEFTY_REALTIME_EVIDENCE_DIR/provenance-receipt.json"`
+	gates := map[string]string{
+		"../.github/workflows/service-acceptance-realtiming.yml":           "Fail closed unless the artifact lane executed and passed",
+		"../.github/workflows/service-acceptance-realtiming-scheduled.yml": "Fail closed unless the published lane executed and passed",
+	}
+	for path, gateName := range gates {
+		workflow, _ := readWorkflow(t, path)
+		run := ""
+		exported := false
+		for _, step := range workflow.Jobs["service-acceptance-realtiming"].Steps {
+			if step.Name == "Run service acceptance at production timings" {
+				run = step.Run
+			}
+			if strings.Contains(step.Run, `ARTIFACT_RUN_ID=%s`) && strings.Contains(step.Run, `"$GITHUB_ENV"`) {
+				exported = true
+			}
+		}
+		for _, required := range []string{receipt, `--arg commit "$CANDIDATE_SHA"`, `--arg artifact_run_id "$ARTIFACT_RUN_ID"`, `commit:$commit`} {
+			if !strings.Contains(run, required) {
+				t.Errorf("%s: the evidence step does not write the provenance receipt (%q missing)", path, required)
+			}
+		}
+		if !exported {
+			t.Errorf("%s: no step exports ARTIFACT_RUN_ID for the provenance receipt", path)
+		}
+		gate := ""
+		for _, step := range workflow.Jobs["realtiming-result"].Steps {
+			if step.Name == gateName {
+				gate = step.Run
+			}
+		}
+		for _, variant := range []string{"xfce", "wayland"} {
+			if !strings.Contains(gate, "linux-computer-receipt-"+variant+"/provenance-receipt.json") {
+				t.Errorf("%s: the gate does not check the %s provenance receipt", path, variant)
+			}
+		}
+	}
+}
