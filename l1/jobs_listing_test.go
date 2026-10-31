@@ -152,6 +152,91 @@ func TestJobsListingRejectsInvalidSelectors(t *testing.T) {
 	}
 }
 
+// committedJobReadExpired returns the job a create committed when only its
+// post-change read expired, the typed retryable answer a slow runner gets
+// (#1380). The caller reads the job back; it never creates it again.
+func committedJobReadExpired(status int, body []byte) (string, bool) {
+	var refusal contract.ErrorResponse
+	if status != http.StatusServiceUnavailable || json.Unmarshal(body, &refusal) != nil {
+		return "", false
+	}
+	api := refusal.Error
+	jobID, _ := api.Details["job_id"].(string)
+	ok := api.Code == contract.ErrorUnavailable && api.Retryable && jobID != "" &&
+		api.Details["reason"] == "read_snapshot_post_change_failed" &&
+		(api.Details["read_reason"] == "read_snapshot_expired" || api.Details["read_reason"] == "read_snapshot_admission_expired") &&
+		api.Details["mutation_applied"] == true
+	return jobID, ok
+}
+
+// createdJob decodes a create's answer, reading the committed job back when
+// only the post-change read expired. A service job's read needs its class.
+func createdJob(t *testing.T, h *integrationHarness, client *http.Client, class string, status int, body []byte) Job {
+	t.Helper()
+	if jobID, ok := committedJobReadExpired(status, body); ok {
+		path := "/v1/jobs/" + jobID
+		if class != "" {
+			path += "?class=" + class
+		}
+		status, _, body = h.readStatus(t.Context(), client, path)
+		if status != http.StatusOK {
+			t.Fatalf("read back %s=%d %s", jobID, status, body)
+		}
+	} else if status != http.StatusCreated {
+		t.Fatalf("create=%d %s", status, body)
+	}
+	return decodeJob(t, body)
+}
+
+func TestCreatedJobReadsBackAfterPostChangeReadExpires(t *testing.T) {
+	for _, class := range []string{"", contract.JobClassService} {
+		t.Run(class, func(t *testing.T) {
+			h := newIntegrationHarness(t, nil)
+			identity := fabric.Identity{NodeID: "operator", Tags: []string{DefaultClientPrincipalTag}}
+			spec := validJobSpec("expired-read", nil)
+			if class != "" {
+				spec = operatorServiceSpec("expired-read", nil)
+			}
+			encoded, err := json.Marshal(spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Only this request's post-change read gets the 1 ns limit.
+			ctx := context.WithValue(t.Context(), readSnapshotHardLimitContextKey{}, time.Nanosecond)
+			r := httptest.NewRequest(http.MethodPost, "/v1/jobs", bytes.NewReader(encoded)).WithContext(context.WithValue(ctx, identityContextKey{}, identity))
+			w := httptest.NewRecorder()
+			h.server.createJob(w, r)
+			jobID, ok := committedJobReadExpired(w.Code, w.Body.Bytes())
+			if !ok {
+				t.Fatalf("forced expiry=%d %s", w.Code, w.Body.String())
+			}
+			if job := createdJob(t, h, h.client(identity), class, w.Code, w.Body.Bytes()); job.JobID != jobID {
+				t.Fatalf("read back %q, want %q", job.JobID, jobID)
+			}
+		})
+	}
+}
+
+func TestCommittedJobReadExpiredNamesOnlyTheCommittedJob(t *testing.T) {
+	expired := `{"error":{"code":"unavailable","retryable":true,"details":{"job_id":"job_1","mutation_applied":true,"read_reason":"read_snapshot_expired","reason":"read_snapshot_post_change_failed"}}}`
+	if id, ok := committedJobReadExpired(http.StatusServiceUnavailable, []byte(expired)); !ok || id != "job_1" {
+		t.Fatalf("expired post-change read=%q %v", id, ok)
+	}
+	for name, body := range map[string]string{
+		"not applied":   strings.Replace(expired, `"mutation_applied":true`, `"mutation_applied":false`, 1),
+		"other reason":  strings.Replace(expired, `"read_reason":"read_snapshot_expired"`, `"read_reason":"internal"`, 1),
+		"not retryable": strings.Replace(expired, `"retryable":true`, `"retryable":false`, 1),
+		"no job":        strings.Replace(expired, `"job_id":"job_1",`, ``, 1),
+	} {
+		if _, ok := committedJobReadExpired(http.StatusServiceUnavailable, []byte(body)); ok {
+			t.Fatalf("%s accepted", name)
+		}
+	}
+	if _, ok := committedJobReadExpired(http.StatusCreated, []byte(expired)); ok {
+		t.Fatal("201 accepted")
+	}
+}
+
 func TestJobsListingCursorWalkExcludesConcurrentInserts(t *testing.T) {
 	for _, class := range []string{"", contract.JobClassService} {
 		t.Run(class, func(t *testing.T) {
@@ -165,10 +250,7 @@ func TestJobsListingCursorWalkExcludesConcurrentInserts(t *testing.T) {
 					spec = operatorServiceSpec(key, nil)
 				}
 				status, _, body := h.do(client, http.MethodPost, "/v1/jobs", spec)
-				if status != http.StatusCreated {
-					t.Fatalf("create=%d %s", status, body)
-				}
-				return decodeJob(t, body)
+				return createdJob(t, h, client, class, status, body)
 			}
 			for i := 0; i < 7; i++ {
 				want = append(want, create(fmt.Sprintf("walk-%d", i)).JobID)

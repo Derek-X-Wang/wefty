@@ -147,6 +147,16 @@ func TestSeatLogUnresolvedRequestExpiresAndReportsPruning(t *testing.T) {
 	if err != nil || outcome.State != SeatRefused {
 		t.Fatalf("old pending request cannot refuse: %+v %v", outcome, err)
 	}
+	// The refusal ends the log, which then keeps the full retention from
+	// that end instead of expiring at once (#1239).
+	result, err = f.store.Reconcile(t.Context())
+	if err != nil || result.PrunedSeatLogs != 0 {
+		t.Fatalf("late refusal lost its log at once: %+v %v", result, err)
+	}
+	if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
+		t.Fatalf("late refusal log unreadable: %v", err)
+	}
+	f.clock.Advance(DefaultComputerTakeoverAuditRetentionAge)
 	result, err = f.store.Reconcile(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +173,7 @@ func TestSeatLogUnresolvedRequestExpiresAndReportsPruning(t *testing.T) {
 		t.Fatalf("unresolved log not counted as pruned: %s", data)
 	}
 	if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
-		t.Fatalf("pending log survived retention: %v", err)
+		t.Fatalf("refused log survived the retention from its end: %v", err)
 	}
 	if err := f.store.AppendSeatEvent(t.Context(), SeatLogEvent{SeatID: id, EventID: "late", Kind: SeatEventControlTaken}); errorCode(err) != contract.ErrorNotFound {
 		t.Fatalf("late event revived log: %v", err)
@@ -194,8 +204,27 @@ func TestSeatLogUsesConfiguredAuditRetention(t *testing.T) {
 				t.Fatal(err)
 			}
 			if operation == "late-refusal" {
+				// An ended log keeps the full retention from its end, even when
+				// the Seat never went live (#1239). Read and sweep agree at the
+				// exact boundary.
+				readable := func(when string) {
+					t.Helper()
+					if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); err != nil {
+						t.Fatalf("%s: late refusal lost its log: %v", when, err)
+					}
+					if result, err := f.store.Reconcile(t.Context()); err != nil || result.PrunedSeatLogs != 0 {
+						t.Fatalf("%s: sweep pruned a log within retention: %+v %v", when, result, err)
+					}
+				}
+				readable("at the refusal")
+				f.clock.Advance(time.Hour - time.Nanosecond)
+				readable("just before the end plus retention")
+				f.clock.Advance(time.Nanosecond)
 				if _, err := f.store.GetSeatLogs(t.Context(), "cli", id, "", "", 100); errorCode(err) != contract.ErrorNotFound {
-					t.Fatalf("late refusal extended a never-live log beyond its creation-time retention: %v", err)
+					t.Fatalf("log outlived the retention from its end: %v", err)
+				}
+				if result, err := f.store.Reconcile(t.Context()); err != nil || result.PrunedSeatLogs != 1 {
+					t.Fatalf("sweep did not prune at the retention boundary: %+v %v", result, err)
 				}
 				return
 			}
