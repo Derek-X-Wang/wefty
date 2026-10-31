@@ -16,9 +16,16 @@ supervisor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(supervisor)
 
 
+HANDSHAKE = b'HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Protocol: binary\r\n\r\n'
+GREETING = b'\x82\x0cRFB 003.008\n'
+
+
 @contextmanager
-def delayed_endpoint(greeting_delay):
-    """Socket I/O advances an injected clock and respects the caller's timeout."""
+def scripted_endpoint(chunks, connect_delay=0):
+    """Socket I/O advances an injected clock and respects the caller's timeout.
+
+    Each chunk is (delay, bytes); a delay of None never arrives.
+    """
     with tempfile.TemporaryDirectory(dir='/tmp') as root:
         path = str(Path(root).resolve() / 'view.ws')
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
@@ -26,34 +33,39 @@ def delayed_endpoint(greeting_delay):
             os.chmod(path, 0o600)
             clock = [0.0]
 
-            def connect(*_args):
+            def make(*_args):
                 connection = mock.MagicMock()
                 connection.__enter__.return_value = connection
                 connection.getsockopt.return_value = supervisor.struct.pack('3i', 1, os.getuid(), os.getgid())
                 timeout = [None]
                 connection.settimeout.side_effect = lambda seconds: timeout.__setitem__(0, seconds)
-                stream = connection.makefile.return_value
-                headers = io.BytesIO(b'HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Protocol: binary\r\n\r\n')
-                stream.readline.side_effect = headers.readline
-                body = io.BytesIO(b'\x82\x0cRFB 003.008\n')
-                waited = False
+                pending = list(chunks)
 
-                def read(size):
-                    nonlocal waited
-                    if not waited:
-                        waited = True
-                        if greeting_delay is None or greeting_delay > timeout[0]:
-                            clock[0] += timeout[0]
-                            raise TimeoutError()
-                        clock[0] += greeting_delay
-                    return body.read(size)
+                def wait(delay):
+                    if delay is None or delay > timeout[0]:
+                        clock[0] += timeout[0]
+                        raise TimeoutError()
+                    clock[0] += delay
 
-                stream.read.side_effect = read
+                connection.connect.side_effect = lambda _path: wait(connect_delay)
+
+                def recv(_size):
+                    if not pending:
+                        return b''
+                    delay, data = pending.pop(0)
+                    wait(delay)
+                    return data
+
+                connection.recv.side_effect = recv
                 return connection
 
-            with mock.patch.object(supervisor.socket, 'socket', side_effect=connect), \
+            with mock.patch.object(supervisor.socket, 'socket', side_effect=make), \
                     mock.patch.object(supervisor.time, 'monotonic', side_effect=lambda: clock[0]):
                 yield path, clock
+
+
+def delayed_endpoint(greeting_delay):
+    return scripted_endpoint([(0, HANDSHAKE), (greeting_delay, GREETING)])
 
 
 class EndpointReadinessTest(unittest.TestCase):
@@ -160,21 +172,79 @@ class EndpointReadinessTest(unittest.TestCase):
             self.assertEqual(detail['errno'], 2)
 
     def test_probe_diagnostics_name_rfb_frame_timeout_with_injected_io(self):
+        with scripted_endpoint([(0, HANDSHAKE), (None, GREETING)]) as (path, clock):
+            detail = {}
+            self.assertFalse(supervisor.rfb_ready(path, detail=detail))
+            self.assertEqual(detail, {'phase': 'rfb_frame', 'error': 'TimeoutError',
+                                      'errno': None, 'elapsed_ms': 2000})
+
+    def test_drip_feeding_endpoint_cannot_stretch_the_two_second_budget(self):
+        # One byte every 0.5 s never trips a per-read timeout, but the
+        # whole answer would take about 35 s.
+        with scripted_endpoint([(0.5, bytes([byte])) for byte in HANDSHAKE + GREETING]) as (path, clock):
+            detail = {}
+            self.assertFalse(supervisor.rfb_ready(path, detail=detail))
+            self.assertEqual(detail['phase'], 'websocket_upgrade')
+            self.assertEqual(detail['error'], 'TimeoutError')
+            self.assertEqual(detail['elapsed_ms'], 2000)
+            self.assertEqual(clock[0], 2)
+
+    def test_slow_connect_leaves_only_the_rest_of_the_budget_for_the_upgrade_answer(self):
+        with scripted_endpoint([(0.5, HANDSHAKE), (0, GREETING)], connect_delay=1.9) as (path, clock):
+            detail = {}
+            self.assertFalse(supervisor.rfb_ready(path, detail=detail))
+            self.assertEqual(detail['phase'], 'websocket_upgrade')
+            self.assertEqual(detail['error'], 'TimeoutError')
+            self.assertEqual(clock[0], 2)
+        with scripted_endpoint([(0.05, HANDSHAKE), (0, GREETING)], connect_delay=1.9) as (path, clock):
+            self.assertTrue(supervisor.rfb_ready(path))
+
+    def test_real_drip_feeding_socket_is_refused_within_the_budget(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as root:
             path = str(Path(root).resolve() / 'view.ws')
+            stop = threading.Event()
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
                 listener.bind(path)
                 os.chmod(path, 0o600)
-                connection = mock.MagicMock()
-                connection.__enter__.return_value = connection
-                connection.getsockopt.return_value = supervisor.struct.pack('3i', 1, os.getuid(), os.getgid())
-                stream = connection.makefile.return_value
-                stream.readline.side_effect = [b'HTTP/1.1 101 Switching Protocols\r\n',
-                                               b'Sec-WebSocket-Protocol: binary\r\n', b'\r\n']
-                stream.read.side_effect = TimeoutError()
+                listener.listen()
+                listener.settimeout(5)
+
+                def serve():
+                    # Bounded waits: a stalled probe may give up before it
+                    # connects or sends, and the fixture must still end.
+                    try:
+                        connection, _ = listener.accept()
+                        with connection:
+                            connection.settimeout(5)
+                            connection.recv(8192)
+                            for byte in HANDSHAKE + GREETING:
+                                if stop.wait(.25):
+                                    return
+                                connection.sendall(bytes([byte]))
+                    except OSError:
+                        pass  # Timed out, or the probe gave up and closed.
+                thread = threading.Thread(target=serve)
+                thread.start()
                 detail = {}
-                with mock.patch.object(supervisor.socket, 'socket', return_value=connection), \
-                        mock.patch.object(supervisor.time, 'monotonic', return_value=1):
+                try:
                     self.assertFalse(supervisor.rfb_ready(path, detail=detail))
-                self.assertEqual(detail, {'phase': 'rfb_frame', 'error': 'TimeoutError',
-                                          'errno': None, 'elapsed_ms': 0})
+                finally:
+                    stop.set()
+                    thread.join(timeout=5)
+                self.assertFalse(thread.is_alive(), 'drip fixture did not finish')
+            # Without one shared budget the 0.25 s drips would hold the probe
+            # for about 21 s; allow scheduling slack above the 2 s budget.
+            self.assertGreaterEqual(detail['elapsed_ms'], 1900)
+            self.assertLess(detail['elapsed_ms'], 4000)
+            self.assertEqual(detail['phase'], 'websocket_upgrade')
+
+    def test_budget_reader_splits_lines_and_reads_across_receives(self):
+        connection = mock.Mock()
+        connection.recv.side_effect = [b'ab\ncd', b'e\nfgh', b'', b'']
+        with mock.patch.object(supervisor.time, 'monotonic', return_value=0):
+            reader = supervisor.BudgetReader(connection, 1)
+            self.assertEqual(reader.readline(8), b'ab\n')
+            self.assertEqual(reader.readline(8), b'cde\n')
+            self.assertEqual(reader.readline(2), b'fg')
+            self.assertEqual(reader.read(5), b'h')
+            self.assertEqual(reader.read(5), b'')
