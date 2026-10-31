@@ -88,6 +88,9 @@ func TestExecCaptureScanFailureWarnsOnce(t *testing.T) {
 }
 
 func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
+	// Fabricated pids start above every real pid (Linux PID_MAX_LIMIT is
+	// 4194304; macOS stops at 99999). The sweep skips its own $$ and $PPID,
+	// so a fabricated pid equal to the test shell would vanish.
 	for _, test := range []struct {
 		name        string
 		first       string
@@ -104,23 +107,23 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 	}{
 		{name: "absent", warning: true},
 		{name: "absent-and-gone", gone: true, stopped: 1},
-		{name: "outside", second: `printf 'p43210\ncsleep\nn%s-outside\n' "$test_storage"`},
-		{name: "different-name", second: `printf 'p43210\ncother\nn%s\n' "$test_storage"`},
-		{name: "agent", second: `printf 'p43210\ncwefty-agent\nn%s\n' "$test_storage"`},
-		{name: "still-matches", second: `printf 'p43210\ncsleep\nn%s\n' "$test_storage"`, kill: true, stopped: 1},
+		{name: "outside", second: `printf 'p4194400\ncsleep\nn%s-outside\n' "$test_storage"`},
+		{name: "different-name", second: `printf 'p4194400\ncother\nn%s\n' "$test_storage"`},
+		{name: "agent", second: `printf 'p4194400\ncwefty-agent\nn%s\n' "$test_storage"`},
+		{name: "still-matches", second: `printf 'p4194400\ncsleep\nn%s\n' "$test_storage"`, kill: true, stopped: 1},
 		{name: "failed", second: "return 1", warning: true},
 		{name: "timeout", second: "return 137", warning: true},
 		{name: "failed-and-gone", second: "return 1", gone: true, stopped: 1, warning: true},
-		{name: "escaped-cwd", first: `printf 'p43210\ncsleep\nn%s/%s\n' "$test_storage" 'escaped\folder'`, noTerm: true},
+		{name: "escaped-cwd", first: `printf 'p4194400\ncsleep\nn%s/%s\n' "$test_storage" 'escaped\folder'`, noTerm: true},
 		{name: "backslash-storage", folder: `capture\folder`, noTerm: true, scanWarning: true},
-		{name: "caret-cwd", first: `printf 'p43210\ncsleep\nn%s/%s\n' "$test_storage" '^A'`, noTerm: true},
+		{name: "caret-cwd", first: `printf 'p4194400\ncsleep\nn%s/%s\n' "$test_storage" '^A'`, noTerm: true},
 		{name: "caret-storage", folder: "capture^A", noTerm: true, scanWarning: true},
 		{name: "tab-storage", folder: "capture\tcontrol", noTerm: true, scanWarning: true},
 		{name: "newline-storage", folder: "capture\n", noTerm: true, scanWarning: true},
 		{name: "control-storage", folder: "capture\x01control", noTerm: true, scanWarning: true},
 		{name: "delete-control-storage", folder: "capture\x7fcontrol", noTerm: true, scanWarning: true},
 		{name: "process-cap", first: `for ((test_i=0; test_i<65; test_i++)); do
- printf 'p%d\ncsleep\nn%s\n' "$((43210+test_i))" "$test_storage"
+ printf 'p%d\ncsleep\nn%s\n' "$((4194400+test_i))" "$test_storage"
  done`, terms: 64, gone: true, stopped: 64, capWarning: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -136,7 +139,7 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 			}
 			first := test.first
 			if first == "" {
-				first = `printf 'p43210\ncsleep\nn%s\n' "$test_storage"`
+				first = `printf 'p4194400\ncsleep\nn%s\n' "$test_storage"`
 			}
 			signals := filepath.Join(t.TempDir(), "signals")
 			// Override shell functions only in this test invocation. Darwin-format
@@ -182,7 +185,7 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 			if test.noTerm && len(raw) != 0 {
 				t.Errorf("ambiguous path received signals: %s", raw)
 			}
-			if got := strings.Contains(string(raw), "-KILL 43210\n"); got != test.kill {
+			if got := strings.Contains(string(raw), "-KILL 4194400\n"); got != test.kill {
 				t.Errorf("KILL = %t, want %t: %s", got, test.kill, raw)
 			}
 			var stopped []struct {
@@ -197,7 +200,7 @@ func TestExecStorageSweepConfirmsProcessBeforeKill(t *testing.T) {
 				t.Errorf("stopped count = %d, want %d: %s", len(stopped), test.stopped, output)
 			}
 			for i, process := range stopped {
-				if process.PID != 43210+i || process.Name != "sleep" || process.CWD != storage {
+				if process.PID != 4194400+i || process.Name != "sleep" || process.CWD != storage {
 					t.Errorf("stopped process lost original evidence: %s", output)
 				}
 			}
