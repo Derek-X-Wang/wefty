@@ -528,7 +528,6 @@ func TestUpgradeRollingProofKeepsDisappearedAttempts(t *testing.T) {
 func TestUpgradeRollingEveryInterruptedStepIsReadable(t *testing.T) {
 	for _, phase := range []string{"prepared", "admission_closed", "services_quiescing", "services_quiesced", "control_plane_renewed", "candidate_preparing", "candidate_loading", "candidate_ready", "candidate_staging", "promotion_requested", "promotion_committed", "catalog_reconciled", "retirement_acknowledged", "survivor_renewal_proved", "installation_completing", "installation_complete"} {
 		t.Run(phase, func(t *testing.T) {
-			t.Parallel()
 			f := newRollingFixture(t)
 			f.claim(t, "resident", contract.JobClassOneShot, false)
 			f.operations.rollingStep = func(got string) error {

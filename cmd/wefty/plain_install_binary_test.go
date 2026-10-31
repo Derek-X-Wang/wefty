@@ -585,7 +585,6 @@ func TestSetupRemovePreservesUnownedFilesAndRetries(t *testing.T) {
 	binary := buildPlainInstallCLI(t)
 	for _, damage := range []string{"binary", "skill", "skill extra", "skill empty folder", "profile", "node config", "binary symlink", "skill symlink", "unload failure", "stuck unload", "inspection failure", "root", "escape", "purge redirected", "changed during unload", "plist changed", "plist missing", "bad manifest", "manifest outside allowlist", "legacy"} {
 		t.Run(damage, func(t *testing.T) {
-			t.Parallel()
 			f := newPlainBinaryFixture(t, binary)
 			f.setup.setup(t, setupRequest{})
 			paths, _ := resolveSetupPaths(f.setup.home)

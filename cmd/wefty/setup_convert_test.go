@@ -286,7 +286,6 @@ func TestSetupConvertPlainFailureAndCrashRecovery(t *testing.T) {
 	for _, crash := range []bool{false, true} {
 		for _, stage := range append(slices.Clone(beforeSteps), afterSteps...) {
 			t.Run(map[bool]string{false: "failure/", true: "crash/"}[crash]+stage, func(t *testing.T) {
-				t.Parallel()
 				f := newConversionFixture(t)
 				before := installedUpgradeFiles(t, &upgradeFixture{setupFixture: f.setupFixture})
 				r := f.request(t)
