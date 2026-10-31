@@ -208,9 +208,9 @@ A follow stops with a readable end reason and never renews Seat activity;
 #1146 defines activity for a one-time log read. The credential is a bearer
 secret: any authenticated Fabric identity holding it can read its own Seat's
 log, including after the Seat ends. It cannot read another Seat's log or
-perform actions after the end. Audit retention defaults to 90 days; a
-never-live request's log ages from creation once it ends or loses all Seat
-references; unresolved referenced requests retain their history. A stored
+perform actions after the end. Audit retention defaults to 90 days from the
+Seat's end, including a request that was refused before it went live; an
+unresolved request keeps its history while it is referenced. A stored
 secret scrubbed by an older binary gets one retry as the original caller; after pruning, the
 CLI reports that the log was not found.
 
