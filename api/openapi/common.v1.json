@@ -2859,6 +2859,21 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "stopped_processes": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Processes stopped before captured exec storage retirement. Each record contains the pid, command name without arguments, and physical cwd. Omitted when none were stopped; independent of the primary result arm.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["pid", "name", "cwd"],
+              "properties": {
+                "pid": { "type": "integer", "minimum": 2 },
+                "name": { "type": "string", "minLength": 1 },
+                "cwd": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
           "spawn_error": { "$ref": "#/components/schemas/SpawnFailure" },
           "runtime_failure": { "$ref": "#/components/schemas/RuntimeFailure" },
           "output_error": {

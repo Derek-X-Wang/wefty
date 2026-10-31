@@ -5113,7 +5113,7 @@ func validateOCICompletionPhase(attempt attemptAuthority, result ProcessResult) 
 		return nil
 	}
 	if !attempt.startedNS.Valid {
-		if result.SpawnError == nil || result.OOM || result.DiskExhausted || result.LogEvidenceIncomplete {
+		if result.SpawnError == nil || result.OOM || result.DiskExhausted || result.LogEvidenceIncomplete || result.StoppedProcesses != nil {
 			return protocolError(contract.ErrorConflict, "pre-Started OCI completion requires a sole spawn_error without additive runtime evidence")
 		}
 		return nil
@@ -5230,6 +5230,16 @@ func validateJobSpec(spec *contract.JobSpec) error {
 }
 
 func validateProcessResult(result ProcessResult) error {
+	if result.StoppedProcesses != nil {
+		if len(*result.StoppedProcesses) == 0 {
+			return protocolError(contract.ErrorInvalidRequest, "stopped_processes must be omitted when empty")
+		}
+		for _, process := range *result.StoppedProcesses {
+			if process.PID <= 1 || process.Name == "" || process.CWD == "" {
+				return protocolError(contract.ErrorInvalidRequest, "stopped_processes requires a pid greater than one, name, and cwd")
+			}
+		}
+	}
 	if result.LimitReached != "" && result.LimitReached != contract.LimitReachedMaxRuntime && result.LimitReached != contract.LimitReachedIdleTimeout {
 		return protocolError(contract.ErrorInvalidRequest, "limit_reached must be max_runtime or idle_timeout")
 	}

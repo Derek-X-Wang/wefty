@@ -204,6 +204,56 @@ storage, reached through a short `/tmp/wefty-run.*` link. Wefty deletes it with
 the storage, also after cancel. Tool caches kept in `TMPDIR` start cold in each
 run. A hard kill followed by a later sweep can leave only a dangling link.
 
+For `kind=capture`, `retire_exec_storage` scans before it renames storage.
+Already-retired trash skips this scan and keeps its asynchronous deletion.
+The scan selects same-user processes whose physical working folder is that
+storage or a folder beneath it. The separator boundary excludes sibling paths with the same prefix.
+This covers `work`, private `tmp` (including its `/tmp/wefty-run.*` alias), and
+other folders beneath the capture. Version 2 uses
+`$WEFTY_RUN_DIR/wefty-exec-work`; restartable captures keep that path beneath
+their Attempt-specific mailbox. The retiring shell, its parent, and processes
+named `wefty-agent` are excluded.
+Storage paths containing a backslash, a caret (`^`), or a control character
+skip scanning with a warning. Cwd records containing a backslash, a caret, a
+tab, or a newline never match, because macOS `lsof` encodes path bytes as
+backslash escapes or caret text (`^A` for byte 0x01).
+
+Discovery uses a non-cgo inventory: UID-filtered `lsof` cwd records on macOS,
+or one GNU `find` call over UID-owned `/proc/*/cwd` links on Linux. Linux reads
+`/proc/<pid>/comm` only for matching folders. Inventory stays in a pipe and
+shell memory, without a scratch directory or a foreground removal.
+The first inventory has a one-second deadline. At most the first 64 matching
+processes receive SIGTERM; further matches emit one cap warning. This bounds
+the confirmation lookups and result escaping to 64 processes. After 200 ms
+of TERM grace, a second inventory, bounded to 600 ms, confirms the same pid
+and command name still have a working folder in storage before SIGKILL. Both
+passes exclude the retiring shell, its parent, and `wefty-agent`. A pid absent
+from the second inventory counts as stopped only if `kill -0` confirms it is
+gone. An absent pid that is still alive receives no SIGKILL, is not reported
+stopped, and emits the stop warning. Failed confirmation sends no SIGKILL,
+emits one warning, and reports only pids confirmed gone by `kill -0`.
+A 100 ms release wait follows. These bounded stages total at most 1.9 seconds,
+excluding inventory processing, command and scheduling overhead. They leave
+100 ms within the CLI's two-second foreground sweep budget and 3.1 seconds
+within the agent's default five-second TERM grace. A shorter configured runner
+grace can interrupt the wrapper trap.
+A pid and a command name are not a stable process identity, and macOS has no
+pidfd. Neither the name nor the cwd check is atomic with the signal. An
+unrelated same-user process that reuses a selected pid after the inventory
+that selected it can receive SIGTERM or SIGKILL, whatever its name or working
+folder. The second inventory narrows this window before SIGKILL; it does not
+close it. Discovery or signalling failure never fails storage retirement.
+
+Each stopped process emits one run-stderr line:
+`wefty: stopped process <pid> (<name>) left in run storage`.
+The wrapper also adds optional `stopped_processes` records (`pid`, command
+`name` without arguments, and physical `cwd`) to its `result.json`, before
+storage rename starts. An empty list leaves `result.json` unchanged, including
+its absence on cancellation. The node carries this list into the Attempt's
+`ProcessResult`; the runtime still determines the exit verdict. CLI stale-storage
+retirement emits the same diagnostics but has no live Attempt result to amend.
+If the wrapper is force-killed before its cleanup runs, the sweep does not run.
+
 If the capture or its bare snapshot is gone, the wrapper instead prints
 ``wefty: the exec snapshot was deleted when the run ended; run `wefty exec` again``
 and writes that reason as `infrastructure_error`, without a command `exit_code`.
