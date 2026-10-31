@@ -549,6 +549,7 @@ func waitForReadyAddress(t *testing.T, path string, process *managedProcess, tim
 type managedProcess struct {
 	command *exec.Cmd
 	output  lockedBuffer
+	stdout  lockedBuffer
 	done    chan struct{}
 	once    sync.Once
 	errMu   sync.Mutex
@@ -558,7 +559,7 @@ type managedProcess struct {
 func newManagedProcess(t *testing.T, executable string, arguments ...string) *managedProcess {
 	t.Helper()
 	process := &managedProcess{command: exec.Command(executable, arguments...), done: make(chan struct{})}
-	process.command.Stdout = &process.output
+	process.command.Stdout = io.MultiWriter(&process.stdout, &process.output)
 	process.command.Stderr = &process.output
 	t.Cleanup(func() { process.stop(t) })
 	return process
@@ -638,6 +639,25 @@ func (process *managedProcess) waitError() error {
 }
 
 func (process *managedProcess) outputString() string { return process.output.String() }
+
+func TestManagedProcessCapturesStdoutSeparately(t *testing.T) {
+	process := newManagedProcess(t, "/bin/sh", "-c", "printf '[job=job attempt=attempt stream=stdout] '; printf 'diagnostic\\n' >&2; printf 'payload\\n'")
+	process.start(t)
+	select {
+	case <-process.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("output fixture did not exit")
+	}
+	if err := process.waitError(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := process.stdout.String(), "[job=job attempt=attempt stream=stdout] payload\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if !bytes.Contains([]byte(process.outputString()), []byte("diagnostic\n")) {
+		t.Fatalf("combined output lost stderr: %q", process.outputString())
+	}
+}
 
 type lockedBuffer struct {
 	mu sync.Mutex
