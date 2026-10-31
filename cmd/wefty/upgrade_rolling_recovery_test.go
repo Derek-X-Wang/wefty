@@ -80,6 +80,7 @@ func TestRollingRecoveryEveryDurableTransitionConverges(t *testing.T) {
 	phases := []string{"prepared", "admission_closing", "admission_closed", "services_quiescing", "services_quiesced", "installation_writing", "control_plane_renewed", "candidate_preparing", "candidate_loading", "candidate_ready", "candidate_staging", "promotion_requested", "promotion_committed", "catalog_reconciled", "retirement_acknowledged", "survivor_renewal_proved", "installation_completing", "installation_complete", "admission_settling"}
 	for _, phase := range phases {
 		t.Run(phase, func(t *testing.T) {
+			t.Parallel()
 			f := newRollingFixture(t)
 			enableRollingRecoveryFixture(t, f)
 			resident := f.claim(t, "resident", contract.JobClassOneShot, false)
