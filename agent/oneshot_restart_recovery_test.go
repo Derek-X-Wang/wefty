@@ -132,7 +132,7 @@ func TestRestartableDelayedCleanupCannotTouchSuccessor(t *testing.T) {
 `, observed, release, os.Getpid())), 0600); err != nil {
 		t.Fatal(err)
 	}
-	script, err := os.ReadFile("../cmd/wefty/exec_cleanup.sh")
+	script, err := os.ReadFile("../internal/execsweep/exec_cleanup.sh")
 	if err != nil {
 		t.Fatal(err)
 	}

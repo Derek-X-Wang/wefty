@@ -83,6 +83,8 @@ func seedExecCaptureWithRemoval(ctx context.Context, spec contract.JobSpec, mail
 		return false, fmt.Errorf("exec capture fetch is unavailable")
 	}
 	// A retry or retained mailbox may contain an interrupted earlier attempt.
+	// These diagnostics belong to stale input, never the new Attempt's evidence.
+	mailbox.sweepExecCaptureRoot(ctx, mailbox.root, true)
 	for _, name := range []string{"tmp/capture.bundle", "capture.bundle", "wefty-exec-work"} {
 		if e = mailbox.root.RemoveAll(name); e != nil {
 			return false, fmt.Errorf("remove stale exec input: %w", e)
@@ -113,6 +115,9 @@ func seedExecCaptureWithRemoval(ctx context.Context, spec contract.JobSpec, mail
 				return false, e
 			}
 			var once sync.Once
+			mailbox.captureSweep = func(ctx context.Context) []contract.StoppedProcess {
+				return mailbox.sweepExecCaptureRoot(ctx, root, false)
+			}
 			mailbox.captureCleanup = func() {
 				once.Do(func() {
 					_ = root.Remove("capture.bundle")

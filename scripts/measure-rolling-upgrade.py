@@ -445,11 +445,13 @@ class Proof:
             for before,after in replacements.items():new=new.replace(before,json.dumps(after,ensure_ascii=False)[1:-1])
             if old!=new:path.write_text(new);changed.append(str(path.relative_to(self.source)))
         wrapper_path=self.source/"cmd/wefty/exec_wrapper.sh"
-        cleanup_path=self.source/"cmd/wefty/exec_cleanup.sh"
+        cleanup_path=self.source/"internal/execsweep/exec_cleanup.sh"
+        # Reviewed archived refs can predate the shared script package.
+        if not cleanup_path.exists():cleanup_path=self.source/"cmd/wefty/exec_cleanup.sh"
         wrapper,cleanup=patch_exec_aliases(wrapper_path.read_text(),cleanup_path.read_text(),self.root/"tmp/wefty-run.")
         wrapper_path.write_text(wrapper);cleanup_path.write_text(cleanup)
 
-        changed.extend(["cmd/wefty/exec_wrapper.sh","cmd/wefty/exec_cleanup.sh","cmd/wefty/b1_proof_plan.go"])
+        changed.extend(["cmd/wefty/exec_wrapper.sh",str(cleanup_path.relative_to(self.source)),"cmd/wefty/b1_proof_plan.go"])
         setup=self.source/"cmd/wefty/setup_command.go"
         content=setup.read_text()
         require(content.count("loginShell: runLoginShell")==1 and content.count("agents = append(agents, service)")==1,"reviewed setup adapter shape changed")

@@ -142,7 +142,11 @@ The node writes a private staging file in the run mailbox, verifies SHA-256
 and exact byte size, then renames it to `capture.bundle`. A mismatch,
 truncation, or fetch error fails preparation with a capture diagnostic and
 never starts the command. The wrapper clones the verified mailbox bundle into
-node-local exec storage. The node agent removes the mailbox bundle when the
+node-local exec storage. Before removing stale input at seed time, the agent
+sweeps the whole leftover `wefty-exec-work`, including its private `tmp`.
+These diagnostics are labelled `stale exec cleanup`; their stopped processes
+do not belong to the new Attempt's evidence.
+The node agent removes the mailbox bundle when the
 attempt ends, including when the wrapper is killed. Through its retained opened
 mailbox root, the agent renames leftover checkout storage to a unique trash
 entry in that root. A background goroutine removes only that trash entry and
@@ -252,7 +256,25 @@ storage rename starts. An empty list leaves `result.json` unchanged, including
 its absence on cancellation. The node carries this list into the Attempt's
 `ProcessResult`; the runtime still determines the exit verdict. CLI stale-storage
 retirement emits the same diagnostics but has no live Attempt result to amend.
-If the wrapper is force-killed before its cleanup runs, the sweep does not run.
+For version 2, the node agent also runs the shared Bash sweep after successful
+runtime reap and receipt validation, before mailbox finalization and log
+closure. This covers a wrapper force-killed before its cleanup runs. The agent
+sweeps only `wefty-exec-work`; deferred capture cleanup still owns retirement
+and asynchronous deletion. Bash runs as the agent's direct child, so its parent
+exclusion protects the agent even if its executable has another name.
+The agent derives the physical mailbox path from its open directory handle,
+using `F_GETPATH` on macOS and `/proc/self/fd` on Linux. It checks that the
+resolved path and the held directory have the same file identity before scanning.
+A moved mailbox is scanned
+at its physical location; a replacement at the old pathname is not scanned.
+If physical resolution fails, the sweep warns and skips. The shared script's
+inventory deadlines stay unchanged. A five-second outer deadline and bounded
+pipe wait prevent a stuck Bash helper from blocking the agent indefinitely.
+Sweep diagnostics use the run's stderr while open, otherwise the agent log.
+The agent retains its stopped list separately until wrapper evidence has been
+read, then appends it to the Attempt's `StoppedProcesses`. Neither source of
+cleanup evidence changes the runtime verdict or adds a wire field. This sweep
+does not expand process-group quiescence proof after an agent crash.
 
 If the capture or its bare snapshot is gone, the wrapper instead prints
 ``wefty: the exec snapshot was deleted when the run ended; run `wefty exec` again``
