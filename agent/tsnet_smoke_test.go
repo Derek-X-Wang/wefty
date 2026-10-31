@@ -87,7 +87,18 @@ func TestTSNetSmoke(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nodeAgent.Close()
+	// Each L1 call has the agent's 10 s operation bound, and the first call
+	// may wait for the tailnet path. The agent's run loop retries a transient
+	// registration failure; do the same within the test deadline.
 	node, err := nodeAgent.Register(ctx)
+	for err != nil && ctx.Err() == nil {
+		t.Logf("register through tsnet, retrying: %v", err)
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+		}
+		node, err = nodeAgent.Register(ctx)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +128,8 @@ func TestTSNetServiceReachability(t *testing.T) {
 	agentName := "wefty://node/service-smoke-agent-" + suffix
 	clientName := "wefty://node/service-smoke-client-" + suffix
 	stableNodeID := "service-smoke-" + suffix
-	publishedPort := 80
+	// Port 80 is reserved for the Seat front door.
+	publishedPort := 8080
 
 	serverFabric, err := tsnet.New(tsnet.Config{
 		Name: serverName, StateDir: t.TempDir(), Credential: fabric.Credential{Value: authKey},
@@ -306,7 +318,7 @@ func waitForTSNetSmokeService(t *testing.T, store *l1.Store, jobID string, timeo
 			t.Fatalf("tsnet service %q failed: %s", jobID, job.LastFailure)
 		}
 		if job.State == contract.JobRunning && job.Ready != nil && *job.Ready &&
-			job.PublishedPort != nil && *job.PublishedPort == 80 {
+			job.PublishedPort != nil && *job.PublishedPort == 8080 {
 			return job
 		}
 		time.Sleep(100 * time.Millisecond)
