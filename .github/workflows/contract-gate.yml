@@ -86,12 +86,27 @@ jobs:
           go test -timeout=20m -tags=sqlite_integration ./...
 
   mac-linux-runner:
-    name: mac-linux-runner / ${{ matrix.os }}
+    name: mac-linux-runner / ${{ matrix.os }}${{ matrix.shard && format(' / {0}', matrix.shard) || '' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        include:
+          - os: ubuntu-latest
+          # Hosted macOS runs cmd/wefty in two halves on two runners (#1035):
+          # its tests took 885 s of the job's 16.5 min on main 75d1bd3d, and
+          # they run one after another. Both halves read CMD_WEFTY_SPLIT, so
+          # "exec-fleet" runs the tests it matches and "rest" runs every other
+          # one: -skip is the exact complement of -run for top-level tests.
+          # A new test runs in "rest" unless its name matches.
+          - os: macos-latest
+            shard: exec-fleet
+          - os: macos-latest
+            shard: rest
     runs-on: ${{ matrix.os }}
+    env:
+      # Exec 396 s + Fleet 92 s against 397 s for the rest of cmd/wefty, which
+      # shares its runner with the other packages (main 75d1bd3d).
+      CMD_WEFTY_SPLIT: '^Test(Exec|Fleet)'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -103,18 +118,52 @@ jobs:
         run: go test -timeout=45m ./...
       - name: Run cross-platform runner and contract tests (per-test times)
         if: matrix.os == 'macos-latest'
-        # cmd/wefty takes 1107-1552 s on hosted macOS runners and hit 30m
-        # (#163, #1034, #1326; growth tracked in #1035); a hang still fails here.
+        # A hang still fails here (#163, #1034, #1326).
         # -json records every test's elapsed time for #1035. The log shows the
         # package lines as before, then the output of every test that failed
         # or did not finish (a timeout panic ends a test without a fail event).
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
           report="$RUNNER_TEMP/go-test.json"
-          set +e
-          go test -json -timeout=45m ./... | tee "$report" | jq --unbuffered -rj 'select((.Action == "output" and .Test == null) or .Action == "build-output") | .Output'
-          status=("${PIPESTATUS[@]}")
-          set -e
-          if [ "${status[0]}" -ne 0 ]; then
+          # One go test per name, each with its own JSON and exit statuses.
+          go_test() {
+            local name="$1"
+            shift
+            set +e
+            go test -json -timeout=45m "$@" | tee "$RUNNER_TEMP/go-test-$name.json" | jq --unbuffered -rj 'select((.Action == "output" and .Test == null) or .Action == "build-output") | .Output'
+            local status=("${PIPESTATUS[@]}")
+            set -e
+            echo "${status[*]}" > "$RUNNER_TEMP/go-test-$name.status"
+          }
+          case "$SHARD" in
+            exec-fleet)
+              names="cmd"
+              go_test cmd -run "$CMD_WEFTY_SPLIT" ./cmd/wefty
+              ;;
+            rest)
+              names="cmd others"
+              others=$(go list ./... | grep -vxF github.com/Derek-X-Wang/wefty/cmd/wefty)
+              go_test cmd -skip "$CMD_WEFTY_SPLIT" ./cmd/wefty &
+              # shellcheck disable=SC2086 # one package path per word
+              go_test others $others &
+              wait
+              ;;
+            *)
+              echo "unknown shard: $SHARD"
+              exit 1
+              ;;
+          esac
+          tests=0
+          pipes=0
+          for name in $names; do
+            # Keep whatever output exists, even from an invocation that left no status.
+            cat "$RUNNER_TEMP/go-test-$name.json" >> "$report" || true
+            read -r test tee filter < "$RUNNER_TEMP/go-test-$name.status" || { tests=1; continue; }
+            [ "$test" -eq 0 ] || tests=1
+            [ "$tee" -eq 0 ] && [ "$filter" -eq 0 ] || pipes=1
+          done
+          if [ "$tests" -ne 0 ]; then
             echo "--- output of tests that failed or did not finish ---"
             jq -c 'select(.Test != null and (.Action == "run" or .Action == "pass" or .Action == "skip")) | [.Action, .Package, .Test]' "$report" |
               jq -sc 'map(select(.[0] == "run") | .[1:]) - map(select(.[0] != "run") | .[1:])' > "$RUNNER_TEMP/unfinished.json"
@@ -126,13 +175,13 @@ jobs:
               | select(.Action == "output" and .Test != null and (([.Package, .Test] | IN($u[])) or (.Package | IN($whole[]))))
               | .Output' "$report"
           fi
-          [ "${status[1]}" -eq 0 ] && [ "${status[2]}" -eq 0 ] || exit 1
-          exit "${status[0]}"
+          [ "$pipes" -eq 0 ] || exit 1
+          exit "$tests"
       - name: Upload per-test times
         if: always() && matrix.os == 'macos-latest'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: go-test-json-macos-latest
+          name: go-test-json-macos-latest-${{ matrix.shard }}
           path: ${{ runner.temp }}/go-test.json
           retention-days: 14
           if-no-files-found: warn
