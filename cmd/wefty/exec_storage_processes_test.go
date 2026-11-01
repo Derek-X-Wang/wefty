@@ -28,7 +28,12 @@ func TestExecStorageProcessHelper(t *testing.T) {
 	}
 	if mode == "sleep" {
 		signal.Ignore(syscall.SIGTERM)
-		if err := os.WriteFile(os.Getenv("EXEC_STORAGE_READY"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+		// The reader parses the PID once the marker exists, so publish it whole.
+		ready := os.Getenv("EXEC_STORAGE_READY")
+		if err := os.WriteFile(ready+".tmp", []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(ready+".tmp", ready); err != nil {
 			t.Fatal(err)
 		}
 		for {
