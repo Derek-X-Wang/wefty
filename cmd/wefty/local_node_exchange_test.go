@@ -85,7 +85,14 @@ func TestNodeLocalFailedExchange(t *testing.T) {
 				socket = filepath.Join(parent, "s")
 			}
 			config := localExchangeConfig(t, root, socket)
-			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+			// Only the rows whose server waits for the client deadline need a short
+			// one. Every other row ends on its own failure or its own cancel, so a
+			// starved runner must not let the deadline pre-empt the asserted phase (#1412).
+			timeout := 10 * time.Second
+			if scenario == "headers-timeout" || scenario == "stalled-body" {
+				timeout = 2 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), timeout)
 			defer cancel()
 			wantPhase := httpexchange.Request
 			switch scenario {
