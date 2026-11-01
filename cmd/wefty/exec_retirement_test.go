@@ -38,8 +38,8 @@ func blockExecRemoval(t *testing.T) (observed, release string) {
 	env := filepath.Join(dir, "bash-env")
 	writeExecFile(t, env, fmt.Sprintf(`function /bin/rm() {
   if [ "$1" != -rf ]; then command /bin/rm "$@"; return; fi
-  printf '%%s\n' "$*" > %q
-  %s
+  printf '%%s\n' "$*" > %[1]q.$$ && command mv %[1]q.$$ %[1]q
+  %[2]s
   command /bin/rm "$@"
 }
 `, observed, execReleaseWait(release)))
@@ -220,6 +220,15 @@ func TestExecSweepTrashHasOneDeleterAndRecoversKilledOwner(t *testing.T) {
 	}
 	sweep()
 	waitExecPath(t, observed, true)
+	// The hook creates the file before it appends its PID (#1417).
+	for deadline := time.Now().Add(20 * time.Second); len(deleters()) == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("first deleter did not record its PID")
+		}
+		if err := waitForContext(t.Context(), 20*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+	}
 	sweep()
 	// Allow the second asynchronous sweep to reach deletion. This is an
 	// observation interval, not a sub-second performance requirement.
