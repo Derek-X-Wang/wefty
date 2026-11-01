@@ -347,21 +347,25 @@ func recoverSeatLog(ctx context.Context, q seatApprovalQuery, id string, at time
 	return err == nil, err
 }
 
+// seatLogRetentionExpired: every ended log keeps the full retention from its
+// end, so a late refusal does not lose its log at once (#1239). Only a
+// never-live log that has not ended and that nothing refers to ages from
+// creation.
 func seatLogRetentionExpired(at time.Time, created int64, ended sql.NullInt64, everLive, referred bool, age time.Duration) bool {
-	if !everLive {
-		if !ended.Valid && referred {
-			return false
-		}
-		return !at.Before(time.Unix(0, created).Add(age))
+	if ended.Valid {
+		return !at.Before(time.Unix(0, ended.Int64).Add(age))
 	}
-	return ended.Valid && !at.Before(time.Unix(0, ended.Int64).Add(age))
+	if everLive || referred {
+		return false
+	}
+	return !at.Before(time.Unix(0, created).Add(age))
 }
 
 func (s *Store) pruneSeatLogs(ctx context.Context, tx *sql.Tx, now time.Time) (int64, error) {
 	cutoff := now.Add(-s.computerTakeoverAuditRetentionAge).UnixNano()
 	result, err := tx.ExecContext(ctx, `DELETE FROM seat_logs WHERE seat_id IN (
- SELECT seat_id FROM seat_logs WHERE ever_live=1 AND ended_ns<=?
- UNION ALL SELECT seat_id FROM seat_logs WHERE ever_live=0 AND created_ns<=? AND (ended_ns IS NOT NULL OR NOT EXISTS(SELECT 1 FROM seat_request_calls c WHERE c.seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM seat_approvals a WHERE a.seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM computer_seat_identities i WHERE i.seat_id=seat_logs.seat_id))
+ SELECT seat_id FROM seat_logs WHERE ended_ns<=?
+ UNION ALL SELECT seat_id FROM seat_logs WHERE ended_ns IS NULL AND ever_live=0 AND created_ns<=? AND NOT EXISTS(SELECT 1 FROM seat_request_calls c WHERE c.seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM seat_approvals a WHERE a.seat_id=seat_logs.seat_id UNION ALL SELECT 1 FROM computer_seat_identities i WHERE i.seat_id=seat_logs.seat_id)
  )`, cutoff, cutoff)
 	if err != nil {
 		return 0, internalError(err, "prune Seat log retention")

@@ -37,10 +37,19 @@
       "attempt_id": "ATTEMPT",
       "created_at": "2026-08-09T10:00:00Z",
       "lease_expires_at": "2026-08-09T10:00:30Z",
+      "lease_live": false,
       "node_id": "service-node",
       "result": {
-        "exit_code": 0
+        "exit_code": 0,
+        "stopped_processes": [
+          {
+            "cwd": "/tmp/wefty-exec-example/work",
+            "name": "sleep",
+            "pid": 4321
+          }
+        ]
       },
+      "started_at": "2026-08-09T10:00:00Z",
       "state": "succeeded",
       "updated_at": "2026-08-09T10:00:00Z"
     }
@@ -55,7 +64,14 @@
     "code": "policy_stop",
     "details": {
       "policy_stop": {
-        "exit_code": 0
+        "exit_code": 0,
+        "stopped_processes": [
+          {
+            "cwd": "/tmp/wefty-exec-example/work",
+            "name": "sleep",
+            "pid": 4321
+          }
+        ]
       },
       "restart": "never",
       "state": "stopped"
@@ -69,7 +85,14 @@
   "node_state": "alive",
   "originating_submitter": "client",
   "policy_stop": {
-    "exit_code": 0
+    "exit_code": 0,
+    "stopped_processes": [
+      {
+        "cwd": "/tmp/wefty-exec-example/work",
+        "name": "sleep",
+        "pid": 4321
+      }
+    ]
   },
   "restart_streak": 0,
   "restart_suppressed_reason": "policy stop: never payload ended; use start or restart",

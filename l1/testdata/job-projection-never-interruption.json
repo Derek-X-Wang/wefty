@@ -37,11 +37,13 @@
       "attempt_id": "ATTEMPT",
       "created_at": "2026-08-09T10:00:00Z",
       "lease_expires_at": "2026-08-09T10:00:30Z",
+      "lease_live": false,
       "node_id": "service-node",
       "result": {
         "signal": "terminated",
         "termination_cause": "agent"
       },
+      "started_at": "2026-08-09T10:00:00Z",
       "state": "failed",
       "updated_at": "2026-08-09T10:00:00Z"
     }

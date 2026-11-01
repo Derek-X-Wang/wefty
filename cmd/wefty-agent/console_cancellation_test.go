@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -34,7 +35,7 @@ func TestConsoleOutputCancellationReleasesBlockedPipe(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("console worker did not start pipe write")
 	}
 	select {
@@ -48,7 +49,7 @@ func TestConsoleOutputCancellationReleasesBlockedPipe(t *testing.T) {
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("write err=%v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Error("cancelled console sink stayed blocked")
 	}
 	// Closing the owned reader releases the single console worker as well.
@@ -62,7 +63,7 @@ func TestConsoleOutputCancellationReleasesBlockedPipe(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("console worker did not release after owned pipe close")
 	}
 }

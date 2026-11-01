@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestReadSnapshotTargetOverrunReturnsAnswer(t *testing.T) {
@@ -102,7 +103,7 @@ func TestReadSnapshotAdmissionBounded(t *testing.T) {
 	for range readSnapshotLimit {
 		select {
 		case <-entered:
-		case <-time.After(time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("readers did not enter")
 		}
 	}

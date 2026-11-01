@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -1358,7 +1359,7 @@ func TestAnEvictionInFlightDoesNotBlockAnUnrelatedFinalization(t *testing.T) {
 	go func() { passed <- harness.manager.accountNode(t.Context()) }()
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("the budget pass never reached its deletion")
 	}
 
@@ -1390,7 +1391,7 @@ func TestAnEvictionInFlightDoesNotBlockAnUnrelatedFinalization(t *testing.T) {
 		if err != nil {
 			t.Fatalf("an unrelated attempt's finalization failed while an eviction was in flight: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		close(release)
 		t.Fatal("an unrelated attempt's finalization waited on an eviction that had not finished")
 	}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -50,7 +51,7 @@ func TestComputerPolicyInstallDoesNotParkWhileSessionsDrain(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("policy install parked on an active authorization")
 	}
 	select {
@@ -63,7 +64,7 @@ func TestComputerPolicyInstallDoesNotParkWhileSessionsDrain(t *testing.T) {
 	clock.Advance(computerPolicyPendingReportInterval)
 	select {
 	case <-acknowledged:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("policy acknowledgement did not retry after the session barrier closed")
 	}
 	cancel()

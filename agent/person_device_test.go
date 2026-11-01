@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/coder/websocket"
 )
@@ -88,7 +89,7 @@ func TestComputerFrontDoorAdminDeviceBindingAndLiveRebind(t *testing.T) {
 	}
 	select {
 	case <-receipt.SessionsClosed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("device rebind did not drain the live front-door session")
 	}
 	if _, _, err := connection.Read(t.Context()); err == nil {
@@ -128,7 +129,7 @@ func TestComputerFrontDoorFirstBoundSnapshotClosesOtherDevice(t *testing.T) {
 	}
 	select {
 	case <-receipt.SessionsClosed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("first bound snapshot did not drain")
 	}
 	if auth, _ := cache.AcquireGrant("computer-1", identity); auth != nil {

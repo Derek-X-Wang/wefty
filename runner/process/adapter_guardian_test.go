@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
 
@@ -153,7 +154,7 @@ func TestAdapterVerifiesQuiescenceAfterGuardedStop(t *testing.T) {
 	}()
 	select {
 	case <-started:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("guarded payload did not start")
 	}
 	cancel()

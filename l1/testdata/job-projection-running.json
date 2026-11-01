@@ -37,7 +37,9 @@
       "attempt_id": "ATTEMPT",
       "created_at": "2026-08-09T10:00:00Z",
       "lease_expires_at": "2026-08-09T10:00:30Z",
+      "lease_live": true,
       "node_id": "service-node",
+      "started_at": "2026-08-09T10:00:00Z",
       "state": "running",
       "updated_at": "2026-08-09T10:00:00Z"
     }

@@ -63,7 +63,7 @@ func TestComputerNoneClaimKeepsSubmissionBridgeClosed(t *testing.T) {
 	lifecycle := newAttemptLifecycle(attemptLifecycleDependencies{
 		fabric:         nodeFabric,
 		computerPolicy: NewComputerPolicyCache(systemClock{}, "network-node", "network-boot"),
-		seatDoor:       newSeatFrontDoor(nodeFabric),
+		seatDoor:       func() *seatFrontDoor { return newSeatFrontDoor(nodeFabric) },
 		nodeID:         "network-node", bootSessionID: "network-boot", clock: systemClock{}, managedResource: managed,
 		runtimes: workloadRuntimeSet{contract.JobKindOCI: runtime}, computerTokens: minter,
 		workflowBridge: func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error) {

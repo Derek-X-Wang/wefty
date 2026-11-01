@@ -135,11 +135,11 @@ func projectGeneration(node l1.Node, g l1.NodeGenerationObservation, now time.Ti
 				result.Problems = append(result.Problems, statusReason{"retiring_attempt_interrupted", label + ": interrupted after host reboot; prior-boot Lease is not survival evidence"})
 				result.RenewalHealth = "degraded"
 				result.Progress = "unverified"
-			} else if a.LeaseExpiresAt != nil && !a.LeaseExpiresAt.After(now) {
+			} else if a.LeaseLive != nil && !*a.LeaseLive && a.LeaseExpiresAt != nil {
 				result.Problems = append(result.Problems, statusReason{"retiring_lease_stale", label + ": stale renewal; Lease expired at " + a.LeaseExpiresAt.Format(time.RFC3339Nano)})
 				result.RenewalHealth = "degraded"
 				result.Progress = "unverified"
-			} else if a.LeaseExpiresAt == nil {
+			} else if a.LeaseLive == nil || a.LeaseExpiresAt == nil {
 				// A live Attempt can still be inside its first, unexpired
 				// Lease before recording a renewal. Missing Lease data cannot
 				// establish that evidence; expired Leases are diagnosed above.

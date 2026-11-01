@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // shortenExecReadRecovery makes a read that never succeeds give up quickly.
@@ -74,10 +75,29 @@ func TestExecObservationRetriesWithoutCancellation(t *testing.T) {
 					}
 					return base.RoundTrip(r)
 				})
-				var out, errOut bytes.Buffer
-				err := execute(t.Context(), stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "printf 'first\\n'; sleep 0.25; printf 'last\\n'"}, &out, &errOut)
-				if err != nil || cancels != 0 || reads < 3 || strings.Count(out.String(), "first\n") != 1 || strings.Count(out.String(), "last\n") != 1 {
-					t.Fatalf("observation interrupted healthy run: err=%v reads=%d cancels=%d stdout=%q stderr=%q", err, reads, cancels, out.String(), errOut.String())
+				// Keep the two output batches separate until the observer has
+				// delivered the first, instead of pacing the command with a sleep.
+				release := filepath.Join(t.TempDir(), "release")
+				out := &execReviewOutput{token: "first\n", seen: make(chan struct{})}
+				ctx, stop := context.WithTimeout(t.Context(), 2*time.Minute)
+				defer stop()
+				released := make(chan error, 1)
+				go func() {
+					select {
+					case <-out.seen:
+						released <- os.WriteFile(release, nil, 0600)
+					case <-ctx.Done():
+						// Also release the command if observation fails early.
+						_ = os.WriteFile(release, nil, 0600)
+						released <- ctx.Err()
+					}
+				}()
+				var errOut bytes.Buffer
+				err := execute(ctx, stack.clients, false, []string{"exec", "--", "/bin/sh", "-c", "printf 'first\\n'; while [ ! -f \"$1\" ]; do sleep 0.01; done; printf 'last\\n'", "sh", release}, out, &errOut)
+				stop()
+				releaseErr := <-released
+				if err != nil || releaseErr != nil || cancels != 0 || reads < 3 || strings.Count(out.String(), "first\n") != 1 || strings.Count(out.String(), "last\n") != 1 {
+					t.Fatalf("observation interrupted healthy run: err=%v release=%v reads=%d cancels=%d stdout=%q stderr=%q", err, releaseErr, reads, cancels, out.String(), errOut.String())
 				}
 			})
 		}
@@ -583,7 +603,7 @@ func TestExecSignalContextCancelsOnlyAfterReset(t *testing.T) {
 	cancelBase()
 	select {
 	case <-ctx.Done():
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("exec context ignored the parent's cancellation")
 	}
 	if !reset.Load() {
@@ -636,7 +656,7 @@ func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 	t.Cleanup(func() { _ = cmd.Process.Kill() })
 	select {
 	case <-output.seen:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("binary did not submit run")
 	}
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
@@ -644,7 +664,7 @@ func TestExecSecondInterruptExitsDuringCancellation(t *testing.T) {
 	}
 	select {
 	case <-cancelling:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("first signal did not request cancellation")
 	}
 	// The server can see the cancel before the test's reader has copied the

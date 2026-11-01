@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -138,7 +139,7 @@ func TestAgentCancelProcessEndToEnd(t *testing.T) {
 				if !test.forced && completion.TerminationInitiator != contract.TerminationCauseAgent {
 					t.Fatalf("TERM delivery initiator=%+v", completion)
 				}
-			case <-time.After(time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("real agent sent no completion")
 			}
 			var uploaded l1.JobResult

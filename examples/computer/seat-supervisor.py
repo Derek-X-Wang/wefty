@@ -597,6 +597,48 @@ def rfb_endpoint_matches(path, directory, expected, uid):
         os.close(current)
 
 
+def wait_within(connection, deadline):
+    """Let the next socket call wait only for what is left of the probe budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError()
+    connection.settimeout(remaining)
+
+
+class BudgetReader:
+    """Buffered reads where every receive shares one deadline.
+
+    A buffered file object rearms the socket timeout for each receive, so a
+    peer that drips bytes could hold it far past the budget.
+    """
+
+    def __init__(self, connection, deadline):
+        self.connection = connection
+        self.deadline = deadline
+        self.buffer = b""
+
+    def fill(self):
+        wait_within(self.connection, self.deadline)
+        data = self.connection.recv(4096)
+        self.buffer += data
+        return bool(data)
+
+    def take(self, size):
+        data, self.buffer = self.buffer[:size], self.buffer[size:]
+        return data
+
+    def readline(self, limit):
+        while self.buffer.find(b"\n", 0, limit) < 0 and len(self.buffer) < limit and self.fill():
+            pass
+        end = self.buffer.find(b"\n", 0, limit)
+        return self.take(end + 1 if end >= 0 else limit)
+
+    def read(self, size):
+        while len(self.buffer) < size and self.fill():
+            pass
+        return self.take(size)
+
+
 def rfb_ready(path, uid=None, detail=None):
     """Check the negotiated binary WebSocket and the RFB greeting, over a private Unix socket."""
     directory = None
@@ -608,7 +650,8 @@ def rfb_ready(path, uid=None, detail=None):
         uid = os.getuid() if uid is None else uid
         # An idle x11vnc checks its Unix listener only once per ~200 ms
         # cycle. Leave time for that wake-up, WebSocket and relay checks,
-        # matching the node agent's per-endpoint greeting probe.
+        # matching the node agent's per-endpoint greeting probe. The 2 s is
+        # one total for the connect and every read.
         deadline = started + 2
         directory = open_directory(Path(path).parent)
         parent = os.fstat(directory)
@@ -620,9 +663,9 @@ def rfb_ready(path, uid=None, detail=None):
             detail['phase'] = 'endpoint_permissions'
             return False
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        connection.settimeout(2)
         with connection:
             detail['phase'] = 'connect'
+            wait_within(connection, deadline)
             connection.connect(path)
             if not rfb_endpoint_matches(path, directory, expected, uid):
                 detail['phase'] = 'endpoint_replaced'
@@ -636,20 +679,17 @@ def rfb_ready(path, uid=None, detail=None):
                     return False
             key = base64.b64encode(os.urandom(16)).decode()
             detail['phase'] = 'websocket_upgrade'
+            wait_within(connection, deadline)
             connection.sendall(("GET /websockify HTTP/1.1\r\nHost: localhost\r\n"
                                 "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                                 "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n"
                                 "Sec-WebSocket-Protocol: binary\r\n\r\n" % key).encode())
-            stream = connection.makefile("rb")
+            stream = BudgetReader(connection, deadline)
             if b" 101 " not in stream.readline(8193):
                 return False
             detail['phase'] = 'websocket_headers'
             headers = {}
             for _ in range(64):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                connection.settimeout(remaining)
                 line = stream.readline(8193)
                 if line == b"\r\n":
                     break

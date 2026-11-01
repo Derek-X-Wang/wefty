@@ -43,11 +43,19 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 		// Copy IDs belong to the node. Never let a caller reserve the identity
 		// under which the node's immutable transfer evidence will be recorded.
 		copyID := rand.Text()
+		var renewalErr error // Read after renewalDone closes below.
 		sendError := func(err error) {
 			api := contract.APIError{Code: contract.ErrorCode("seat_copy_failed"), Message: err.Error()}
 			var protocol *ProtocolError
+			var helper *ocihelper.RPCError
 			if errors.As(err, &protocol) && protocol.APIError.Code != "" {
 				api = protocol.APIError
+			} else if errors.As(err, &helper) && helper.Code == ocihelper.CodeSeatOperationRefused && (helper.Detail == ocihelper.ErrorDetail(ocihelper.SeatRefusalCommandNotReady) || helper.Detail == ocihelper.ErrorDetail(ocihelper.SeatRefusalGenerationMismatch)) {
+				// Readiness races are retryable unless L1 already proved the Seat ended (#1281).
+				api = contract.APIError{Code: contract.ErrorConflict, Message: fmt.Sprintf("Seat is not ready or changed (%s); try again", helper.Detail), Retryable: true}
+				if errors.As(renewalErr, &protocol) && protocol.APIError.Code == "seat_ended" {
+					api = protocol.APIError
+				}
 			}
 			_ = json.NewEncoder(w).Encode(l1.SeatCopyStreamEvent{CopyID: copyID, Error: &api})
 		}
@@ -96,7 +104,7 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 		renewalDone := make(chan struct{})
 		go func() {
 			defer close(renewalDone)
-			renewSeatCopyLease(copyCtx, control, match[1], start, clock, cancelCopy, leaseIssuedAt)
+			renewalErr = renewSeatCopyLease(copyCtx, control, match[1], start, clock, cancelCopy, leaseIssuedAt)
 		}()
 		// HTTP/1 must permit response chunks while upload still streams. HTTP/2
 		// already has this behavior. There is no application-wide body limit.
@@ -215,7 +223,7 @@ const seatCopyRenewalRequestBudget = 5 * time.Second
 // Transient outages consume the last acknowledged lease's remaining budget.
 // Terminal authority refusals stop immediately. A failed/ambiguous receipt
 // never extends the local deadline, even if L1 might have committed it.
-func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string, start l1.SeatCopyReceipt, clock Clock, cancel context.CancelFunc, issuedAt time.Time) {
+func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string, start l1.SeatCopyReceipt, clock Clock, cancel context.CancelFunc, issuedAt time.Time) error {
 	safeUntil := issuedAt.Add(contract.SeatCopyHoldLease - seatCopyLeaseSafetyMargin)
 	next := issuedAt.Add(contract.SeatCopyHoldRenewal)
 	delay := 100 * time.Millisecond
@@ -224,20 +232,20 @@ func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string,
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-timer.C():
 		}
 		remaining := safeUntil.Sub(clock.Now())
 		if remaining <= 0 {
 			cancel()
-			return
+			return nil
 		}
 		issuedAt = clock.Now()
 		renewCtx, stop := context.WithTimeout(ctx, min(seatCopyRenewalRequestBudget, remaining))
 		err := control.RecordSeatCopy(renewCtx, id, start)
 		stop()
 		if ctx.Err() != nil {
-			return
+			return err
 		}
 		if err == nil {
 			safeUntil = issuedAt.Add(contract.SeatCopyHoldLease - seatCopyLeaseSafetyMargin)
@@ -247,7 +255,7 @@ func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string,
 			var protocol *ProtocolError
 			if classifyAgentProtocolError(err).destination == errorDestinationAttemptAuthority || errors.As(err, &protocol) && (protocol.APIError.Code == "seat_ended" || protocol.StatusCode >= 400 && protocol.StatusCode < 500 && !protocol.APIError.Retryable) {
 				cancel()
-				return
+				return err
 			}
 			next = clock.Now().Add(delay)
 			delay = min(delay*2, time.Second)
@@ -255,7 +263,7 @@ func renewSeatCopyLease(ctx context.Context, control seatCopyControl, id string,
 		remaining = safeUntil.Sub(clock.Now())
 		if remaining <= 0 {
 			cancel()
-			return
+			return nil
 		}
 		timer.Reset(min(max(0, next.Sub(clock.Now())), remaining))
 	}

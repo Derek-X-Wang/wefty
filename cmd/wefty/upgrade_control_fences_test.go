@@ -19,6 +19,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
@@ -124,7 +125,7 @@ func TestUpgradeControlPromotionPublicationFailureFencesRetirement(t *testing.T)
 	mustRolling(t, c.install.RequestControl(agentinstall.ControlRequest{ID: "control-fences", RequestID: "commit", Action: "promote_generation", NodeID: c.node.NodeID, GenerationID: c.primary.ID, BootSessionID: c.request.ExpectedPrimaryBootSessionID, Payload: body}))
 	select {
 	case <-committed:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("promotion not committed")
 	}
 	mustRolling(t, publicationErr)
@@ -157,7 +158,7 @@ func TestUpgradeControlPromotionPublicationFailureFencesRetirement(t *testing.T)
 	select {
 	case err := <-retired:
 		mustRolling(t, err)
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("retirement did not resume after durable reply")
 	}
 }

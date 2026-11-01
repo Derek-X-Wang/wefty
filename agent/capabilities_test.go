@@ -14,6 +14,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -746,7 +747,7 @@ func TestFailedOCIBootSweepPublishesNoBadgeAndMintsNoClaim(t *testing.T) {
 	}
 	select {
 	case <-removalResumed:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("failed OCI barrier stranded process-service removal resumption")
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -806,7 +807,7 @@ func TestHelperLossAtBarrierStagesKeepsPoisedOCIClaimUnminted(t *testing.T) {
 			node := waitForAgentNode(t, store, nodeID, func(node l1.Node) bool { return node.CapabilityRevision >= 2 })
 			select {
 			case <-resumed:
-			case <-time.After(time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatalf("removals did not resume after %s helper loss: %#v", stage, node)
 			}
 			deadline := time.Now().Add(time.Second)

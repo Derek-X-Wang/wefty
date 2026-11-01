@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -106,7 +107,7 @@ type attemptLifecycleDependencies struct {
 	workflowBridge         func(context.Context, string, contract.ExecutionSpec, bool) (*workflowBridge, error)
 	logf                   func(string, ...any)
 	observer               *lifecycleObserver
-	seatDoor               *seatFrontDoor
+	seatDoor               func() *seatFrontDoor
 	fabric                 fabric.Fabric
 	computerPolicy         *ComputerPolicyCache
 	reservePublishedPort   func(l1.Claim) (net.Listener, *contract.SpawnFailure)
@@ -1162,7 +1163,7 @@ func startAcknowledgementUndecided(err error) bool {
 
 func agentTerminatedResult(result contract.ProcessResult) contract.ProcessResult {
 	if result.ExitCode == nil && result.Signal == "" && result.SpawnError == nil && result.RuntimeFailure == nil && result.OutputError == "" {
-		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent, LogEvidenceIncomplete: result.LogEvidenceIncomplete}
+		return contract.ProcessResult{Signal: "terminated", TerminationCause: contract.TerminationCauseAgent, LogEvidenceIncomplete: result.LogEvidenceIncomplete, StoppedProcesses: result.StoppedProcesses}
 	}
 	return result
 }
@@ -1580,6 +1581,13 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 		if reapErr == nil && reapReceipt.Evidence == "" {
 			reapErr = errors.New("workload runtime reap receipt has no evidence kind")
 		}
+		// Group absence does not cover descendants that escaped the wrapper.
+		// Sweep while the retained root and run stderr are still open. Keep this
+		// evidence separate until the wrapper's result document has been read.
+		var agentStoppedProcesses []contract.StoppedProcess
+		if reapErr == nil && mailbox != nil && mailbox.captureSweep != nil {
+			agentStoppedProcesses = mailbox.captureSweep(finalizationContext)
+		}
 		// A positive runtime receipt plus no started acknowledgement and a spawn
 		// failure proves no payload existed. Guardian loss never supplies this proof.
 		if reapErr == nil && processPending && !processAcknowledged.Load() && result.SpawnError != nil && result.SpawnError.Code != contract.SpawnFailureProcessWait && result.SpawnError.Code != contract.SpawnFailureStartupReadinessTimeout && processNotSpawned != nil {
@@ -1653,6 +1661,26 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				result = contract.ProcessResult{OutputError: finalizationErr.Error(), LimitReached: result.LimitReached, LogEvidenceIncomplete: result.LogEvidenceIncomplete}
 			}
 		}
+		// Captured exec's wrapper records retirement evidence in its result
+		// document. Carry just that optional list into the fenced completion;
+		// the command verdict still comes from the runtime, never the document.
+		if claim.Job.Spec.Kind == contract.JobKindProcess && submittedByRunLedger(claim) {
+			var params struct {
+				Version int    `json:"exec_version"`
+				Storage string `json:"snapshot_storage"`
+			}
+			if json.Unmarshal([]byte(claim.Job.Spec.Labels[contract.LabelRunParams]), &params) == nil && (params.Version == 2 || params.Storage != "") {
+				if document, available := lifecycle.attemptResult(claim); available {
+					var evidence struct {
+						StoppedProcesses []contract.StoppedProcess `json:"stopped_processes"`
+					}
+					if json.Unmarshal(document.document, &evidence) == nil {
+						result.StoppedProcesses = evidence.StoppedProcesses
+					}
+				}
+			}
+		}
+		result.StoppedProcesses = append(result.StoppedProcesses, agentStoppedProcesses...)
 		return result, errors.Join(runErr, finalizationErr)
 	}
 	if preflightErr != nil {
@@ -1834,6 +1862,12 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			return finish(spawnFailure(contract.SpawnFailureHandoffPreparation, err), err)
 		}
 		mailbox = prepared
+		mailbox.captureStderr = func(ctx context.Context, output []byte) error {
+			if redactingSink == nil {
+				return errors.New("run stderr is unavailable")
+			}
+			return redactingSink.WriteOutput(ctx, contract.LogEvent{AttemptID: claim.Lease.AttemptID, Stream: contract.LogStderr, Timestamp: lifecycle.dependencies.clock.Now(), Bytes: output})
+		}
 		defer mailbox.close()
 		lifecycle.storeMailbox(mailbox)
 		hasCapture, err := seedExecCapture(ctx, claim.Job.Spec, mailbox)
@@ -2032,6 +2066,10 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 			err := errors.New("Computer runtime does not support Seat screens")
 			return finish(spawnFailure(contract.SpawnFailureProcessRequest, err), err)
 		}
+		var door *seatFrontDoor
+		if lifecycle.dependencies.seatDoor != nil {
+			door = lifecycle.dependencies.seatDoor()
+		}
 		result, runErr = runComputerSeats(ctx, runtimeAdapter, request, sink, controller, seatComputerServiceConfig{
 			screen: &seatScreenConfig{
 				fabric: lifecycle.dependencies.fabric, authorizer: lifecycle.dependencies.computerPolicy,
@@ -2039,7 +2077,7 @@ func (lifecycle *attemptLifecycle) runWorkloadContexts(
 				computer: claim.ComputerStorage.ComputerID, storage: claim.ComputerStorage.StorageID,
 				storageGeneration: claim.ComputerStorage.StorageGeneration, authority: controller.authority,
 			},
-			clock: lifecycle.dependencies.clock, router: lifecycle.dependencies.seatDoor, copyRuntime: copyRuntime, copyControl: lifecycle.dependencies.client,
+			clock: lifecycle.dependencies.clock, router: door, copyRuntime: copyRuntime, copyControl: lifecycle.dependencies.client,
 			publish: func(publishContext context.Context, ready bool, endpoint string) error {
 				if ready && ctx.Err() != nil {
 					return ctx.Err()
@@ -2678,12 +2716,16 @@ func completionRequest(claim l1.Claim, result contract.ProcessResult, evidence w
 }
 
 func toL1Result(result contract.ProcessResult) l1.ProcessResult {
-	return l1.ProcessResult{
+	converted := l1.ProcessResult{
 		LimitReached: result.LimitReached,
 		SpawnError:   result.SpawnError, RuntimeFailure: result.RuntimeFailure, OutputError: result.OutputError, ExitCode: result.ExitCode,
 		Signal: result.Signal, TerminationCause: result.TerminationCause, OOM: result.OOM, DiskExhausted: result.DiskExhausted,
 		LogEvidenceIncomplete: result.LogEvidenceIncomplete,
 	}
+	if len(result.StoppedProcesses) != 0 {
+		converted.StoppedProcesses = &result.StoppedProcesses
+	}
+	return converted
 }
 
 func toL1QuiescenceEvidence(evidence workloadrunner.ReapEvidence) l1.RuntimeQuiescenceEvidence {

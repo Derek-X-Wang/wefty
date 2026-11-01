@@ -24,8 +24,12 @@ type seatComputerServiceConfig struct {
 // Publication precedes the controller's first live observation. The shared
 // listener belongs to Agent.Run; this exact Attempt owns only its registration.
 func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request workloadrunner.Request, sink workloadrunner.OutputSink, controller *computerSeatController, config seatComputerServiceConfig) (contract.ProcessResult, error) {
-	if config.router == nil || config.publish == nil || config.copyRuntime == nil || config.copyControl == nil {
+	if config.publish == nil || config.copyRuntime == nil || config.copyControl == nil {
 		return contract.ProcessResult{}, errors.New("Seat front-door dependencies are incomplete")
+	}
+	if config.router == nil {
+		err := errors.New("Seat front door not open yet; the node retries in the background")
+		return spawnFailure(contract.SpawnFailureRuntimeUnavailable, err), err
 	}
 	if config.clock == nil {
 		config.clock = systemClock{}

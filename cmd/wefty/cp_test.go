@@ -72,8 +72,15 @@ func TestCPRealBinaryCopyAndTypedFailures(t *testing.T) {
 			_ = encoder.Encode(l1.SeatCopyStreamEvent{CopyID: copyID, SizeBytes: &size})
 			return
 		}
-		if r.URL.Query().Get("path") == "fail" {
+		switch r.URL.Query().Get("path") {
+		case "fail":
 			_ = encoder.Encode(l1.SeatCopyStreamEvent{Error: &contract.APIError{Code: "seat_copy_failed", Message: "disk full"}})
+			return
+		case "not-ready":
+			_ = encoder.Encode(l1.SeatCopyStreamEvent{Error: &contract.APIError{Code: contract.ErrorConflict, Message: "Seat is not ready or changed (seat_not_ready); try again", Retryable: true}})
+			return
+		case "ended":
+			_ = encoder.Encode(l1.SeatCopyStreamEvent{Error: &contract.APIError{Code: "seat_ended", Message: "Seat ended: released"}})
 			return
 		}
 		var data bytes.Buffer
@@ -106,19 +113,27 @@ func TestCPRealBinaryCopyAndTypedFailures(t *testing.T) {
 	if err = os.Symlink(source, filepath.Join(filepath.Dir(dest), "escape")); err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct{ src, dest, typed string }{
-		{id + ":.env", filepath.Join(filepath.Dir(dest), "escape"), "seat_copy_write_denied"},
-		{id + ":fail", dest, "seat_copy_failed"},
-		{id + ":.env", filepath.Dir(dest), "seat_copy_failed"},
-		{filepath.Join(t.TempDir(), "missing"), id + ":in", "seat_copy_failed"},
+	for _, tc := range []struct {
+		src, dest, typed string
+		exit             int
+		retryable        bool
+	}{
+		{id + ":.env", filepath.Join(filepath.Dir(dest), "escape"), "seat_copy_write_denied", exitFailure, false},
+		{id + ":fail", dest, "seat_copy_failed", exitFailure, false},
+		{id + ":.env", filepath.Dir(dest), "seat_copy_failed", exitFailure, false},
+		{filepath.Join(t.TempDir(), "missing"), id + ":in", "seat_copy_failed", exitFailure, false},
+		{id + ":not-ready", dest, "conflict", exitConflict, true},
+		{id + ":ended", dest, "seat_ended", exitConflict, false},
 	} {
 		code, out, stderr = run(tc.src, tc.dest)
 		if tc.dest == filepath.Dir(dest) && !bytes.Contains(stderr, []byte("DEST names the exact result path")) {
 			t.Fatalf("existing folder hint missing: %s", stderr)
 		}
 		var failure contract.ErrorResponse
-		_ = json.Unmarshal(stderr, &failure)
-		if code != exitFailure || string(failure.Error.Code) != tc.typed {
+		if err := json.Unmarshal(stderr, &failure); err != nil {
+			t.Fatalf("invalid JSON error: %v: %s", err, stderr)
+		}
+		if code != tc.exit || string(failure.Error.Code) != tc.typed || failure.Error.Retryable != tc.retryable {
 			t.Fatalf("typed failure %s exit=%d out=%s err=%s", tc.typed, code, out, stderr)
 		}
 	}

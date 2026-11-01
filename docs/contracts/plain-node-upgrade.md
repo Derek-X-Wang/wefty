@@ -505,9 +505,12 @@ durably suppresses every retiree's restart/autostart without stopping it.
 The old agent's dedicated retirement acknowledgment is persisted separately.
 
 Completion requires a healthy replacement primary and an accepted **post-cutover
-Lease renewal for every surviving retiring Attempt**. `UpdatedAt` and the
-extended Lease deadline prove renewal; a new heartbeat alone cannot pass.
-The observation boundary is after the promotion reply, which is conservative.
+Lease renewal for every surviving retiring Attempt**. L1's read-only
+`lease_live` and a Lease expiry later than the first post-cutover L1 observation
+prove renewal; a new heartbeat alone cannot pass. The first read is after the
+promotion reply, which is conservative. Control-plane renewal likewise takes
+its first L1 heartbeat and Attempt expiry observations after the restarts, then
+requires later L1 values. No lease or renewal proof compares L1 time with CLI time.
 An exact terminal Attempt with an accepted result also passes. Lost, interrupted,
 expired, missing or successor-only evidence fails. Retirees keep their original
 Attempts, fences, runtimes, output readers and renewal/finalization loops.
@@ -898,7 +901,9 @@ remain fail-closed. If a current Attempt row is missing, its state remains null;
 a retained reboot interruption is still shown as recorded history with any known
 Run ID. Current uncertainty cannot erase known interruption. Renewal health is `healthy`,
 `degraded` (expired Lease or failed/lost/interrupted Attempt), or `unverified`
-(missing observation). The text names stale renewal explicitly. Last renewal
+(missing observation). The text names stale renewal explicitly. Renewal
+health uses L1's `lease_live` observation; null is unverified. Lease timestamps
+remain available for display and compatibility. Last renewal
 and deadline describe the least recently renewed active resident and earliest
 current Lease deadline, respectively. Completed residents cannot make a live
 resident’s current deadline appear expired. With no active residents these

@@ -28,6 +28,7 @@ const (
 )
 
 var execCaptureHashPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var execGitObjectPattern = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
 const ExecCaptureScriptMarker = "# wefty:exec-capture-bundle:v2"
 
@@ -146,7 +147,7 @@ func (s *Store) uploadExecCapture(ctx context.Context, hash string, uploader str
 	held += s.execCaptureReserved
 	available := max(int64(0), s.execCaptureTotal-held)
 	if declared > available {
-		return ref, &Error{Code: contract.ErrorConflict, Message: fmt.Sprintf("exec capture size %d bytes would exceed the total cap of %d bytes (%d bytes held)", declared, s.execCaptureTotal, held), Retryable: true}
+		return ref, &Error{Code: contract.ErrorConflict, Message: fmt.Sprintf("exec capture size %d bytes would exceed the total cap of %d bytes (%d bytes held or reserved)", declared, s.execCaptureTotal, held), Retryable: true}
 	}
 	limit := min(s.execCaptureMax, available)
 	if declared >= 0 {
@@ -171,7 +172,7 @@ func (s *Store) uploadExecCapture(ctx context.Context, hash string, uploader str
 		return ref, protocolError(contract.ErrorInvalidRequest, "exec capture size at least %d bytes exceeds the per-capture cap of %d bytes", size, s.execCaptureMax)
 	}
 	if size > available {
-		return ref, &Error{Code: contract.ErrorConflict, Message: fmt.Sprintf("exec capture size at least %d bytes would exceed the total cap of %d bytes (%d bytes held)", size, s.execCaptureTotal, held), Retryable: true}
+		return ref, &Error{Code: contract.ErrorConflict, Message: fmt.Sprintf("exec capture size at least %d bytes would exceed the total cap of %d bytes (%d bytes held or reserved)", size, s.execCaptureTotal, held), Retryable: true}
 	}
 	if size <= 0 || (declared >= 0 && size != declared) {
 		return ref, protocolError(contract.ErrorInvalidRequest, "exec capture size mismatch: received %d bytes, declared %d bytes", size, declared)
@@ -489,7 +490,7 @@ func validateExecCaptureRun(input CreateRunInput) error {
 		Base string   `json:"base_commit"`
 		Tree string   `json:"snapshot_tree"`
 	}
-	if json.Unmarshal(request.Params, &params) != nil || len(params.Argv) == 0 || len(params.Base) != 40 || len(params.Tree) != 40 {
+	if json.Unmarshal(request.Params, &params) != nil || len(params.Argv) == 0 || !execGitObjectPattern.MatchString(params.Base) || !execGitObjectPattern.MatchString(params.Tree) {
 		return protocolError(contract.ErrorForbidden, "exec capture requires frozen exec inputs")
 	}
 	return nil

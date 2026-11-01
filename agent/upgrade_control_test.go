@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -78,7 +79,7 @@ func TestUpgradeControlPersistsProofAndReplaysSameOperation(t *testing.T) {
 			if err != nil {
 				t.Error(err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("control did not stop")
 		}
 	})
@@ -200,7 +201,7 @@ func TestUpgradeControlPersistsProofAndReplaysSameOperation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("retiree kept polling installation control")
 	}
 	if payloadContext.Err() != nil {
@@ -219,7 +220,7 @@ func TestUpgradeRetirementAcknowledgmentPrecedesIdleExit(t *testing.T) {
 		if g.Role != l1.NodeGenerationRetiring || g.BootSessionID != "boot" || g.PromotionOperationID != "promotion" {
 			t.Fatal("wrong retirement ack", g)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("missing retirement ack")
 	}
 	select {
@@ -227,7 +228,7 @@ func TestUpgradeRetirementAcknowledgmentPrecedesIdleExit(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("idle retiree did not finish")
 	}
 }
@@ -267,7 +268,7 @@ func TestUpgradeControlAdmissionFenceRealL1(t *testing.T) {
 			if err != nil {
 				t.Error(err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("control adapter did not join")
 		}
 	})

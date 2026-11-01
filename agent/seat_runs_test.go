@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -99,7 +100,7 @@ func TestSeatRunDeadlineDoesNotWaitForAuthorityPoll(t *testing.T) {
 	clock.advanceArmedTimer(3599 * time.Second)
 	select {
 	case <-helper.stopped:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("deadline waited for an outstanding L1 poll")
 	}
 	result := <-done

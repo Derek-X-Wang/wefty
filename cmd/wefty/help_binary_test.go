@@ -37,6 +37,7 @@ func TestHelpAndUsageErrorsFromRealBinary(t *testing.T) {
 					args = append([]string{"--json"}, args...)
 				}
 				t.Run(strings.Join(args, " "), func(t *testing.T) {
+					t.Parallel()
 					code, stdout, stderr := runPolishBinary(t, binary, args...)
 					if code != 0 || len(stderr) != 0 || json.Valid(stdout) || !helpOutputMatchesCommand(stdout, command) {
 						t.Fatalf("exit=%d stdout=%s stderr=%s; want exit 0, usage on stdout, empty stderr", code, stdout, stderr)
@@ -60,6 +61,7 @@ func TestHelpAndUsageErrorsFromRealBinary(t *testing.T) {
 		{"--fabric=tsnet", "--l1=", "--l3=", "--json", "services", "grant", "--help"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Parallel()
 			code, stdout, stderr := runPolishBinary(t, binary, args...)
 			if code != 0 || len(stderr) != 0 || json.Valid(stdout) || !helpOutputMatchesCommand(stdout, helpCommandPath(args)) {
 				t.Fatalf("exit=%d stdout=%s stderr=%s; want plain usage on stdout without opening Fabric or node state", code, stdout, stderr)
@@ -83,6 +85,7 @@ func TestHelpAndUsageErrorsFromRealBinary(t *testing.T) {
 				args = append([]string{"--json"}, args...)
 			}
 			t.Run("usage error/"+strings.Join(args, " "), func(t *testing.T) {
+				t.Parallel()
 				code, stdout, stderr := runPolishBinary(t, binary, args...)
 				if code != exitUsage || len(stdout) != 0 || len(stderr) == 0 {
 					t.Fatalf("exit=%d stdout=%s stderr=%s; want exit 2 and stderr only", code, stdout, stderr)

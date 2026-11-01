@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -76,7 +77,7 @@ func TestShutdownNoPendingLogsRetriesTransientCompletion(t *testing.T) {
 			go func() { _, err := lifecycle.execute(ctx, claim, time.Now()); done <- err }()
 			select {
 			case <-runtime.started:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("runtime did not start")
 			}
 			// Process shutdown: Run's context ends recovery and the session together.
@@ -86,7 +87,7 @@ func TestShutdownNoPendingLogsRetriesTransientCompletion(t *testing.T) {
 			var executeErr error
 			select {
 			case executeErr = <-done:
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("lifecycle did not join")
 			}
 			receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)

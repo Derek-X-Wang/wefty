@@ -18,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
@@ -104,12 +105,14 @@ func (engine *deadmanTestEngine) ReapAttempt(ctx context.Context, authority ocih
 }
 
 // ReapAttemptAsGuardian is the helper's own deadman expiry, distinct from a
-// reap the agent asked for.
+// reap the agent asked for. It records the reap before it signals expiry:
+// tests admit on that signal and then check the reaps (#1343).
 func (engine *deadmanTestEngine) ReapAttemptAsGuardian(ctx context.Context, authority ocihelper.AttemptAuthority) error {
+	err := engine.ReapAttempt(ctx, authority)
 	if !probeAttempt(authority) {
 		engine.expiredOnce.Do(func() { close(engine.expired) })
 	}
-	return engine.ReapAttempt(ctx, authority)
+	return err
 }
 
 func (engine *deadmanTestEngine) reapedAttempts() []string {
@@ -271,7 +274,7 @@ func TestOCIStartRetryEndsAtHelperDeadman(t *testing.T) {
 	var runAt time.Time
 	select {
 	case runAt = <-engine.runEntered:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("the attempt never reached helper Run")
 	}
 	select {

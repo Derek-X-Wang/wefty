@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -61,6 +62,10 @@ func (r execCaptureProgressReader) Read(p []byte) (int, error) {
 // Use the existing authenticated Fabric transport without the appender's 30 s
 // total HTTP budget. The attempt context and per-operation idle timer bound it.
 func seedExecCapture(ctx context.Context, spec contract.JobSpec, mailbox *runMailbox) (bool, error) {
+	return seedExecCaptureWithRemoval(ctx, spec, mailbox, (*os.Root).RemoveAll)
+}
+
+func seedExecCaptureWithRemoval(ctx context.Context, spec contract.JobSpec, mailbox *runMailbox, removeAll func(*os.Root, string) error) (bool, error) {
 	var ref struct {
 		Version int    `json:"exec_version"`
 		SHA256  string `json:"capture_sha256"`
@@ -78,6 +83,8 @@ func seedExecCapture(ctx context.Context, spec contract.JobSpec, mailbox *runMai
 		return false, fmt.Errorf("exec capture fetch is unavailable")
 	}
 	// A retry or retained mailbox may contain an interrupted earlier attempt.
+	// These diagnostics belong to stale input, never the new Attempt's evidence.
+	mailbox.sweepExecCaptureRoot(ctx, mailbox.root, true)
 	for _, name := range []string{"tmp/capture.bundle", "capture.bundle", "wefty-exec-work"} {
 		if e = mailbox.root.RemoveAll(name); e != nil {
 			return false, fmt.Errorf("remove stale exec input: %w", e)
@@ -85,9 +92,12 @@ func seedExecCapture(ctx context.Context, spec contract.JobSpec, mailbox *runMai
 	}
 	client := &http.Client{Transport: appender.client.Transport, CheckRedirect: appender.client.CheckRedirect, Jar: appender.client.Jar}
 	var last error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			timer := mailbox.clock.NewTimer(time.Duration(attempt) * 250 * time.Millisecond)
+	// Six attempts at 0, 1, 3, 7, 15 and 30 seconds let an L3 restart finish.
+	// Cap the final exponential step at 15 s to bound total backoff to 30 s;
+	// progressing downloads retain their independent inactivity budget.
+	for _, delay := range []time.Duration{0, time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second} {
+		if delay > 0 {
+			timer := mailbox.clock.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				stopTimer(timer)
@@ -105,12 +115,31 @@ func seedExecCapture(ctx context.Context, spec contract.JobSpec, mailbox *runMai
 				return false, e
 			}
 			var once sync.Once
+			mailbox.captureSweep = func(ctx context.Context) []contract.StoppedProcess {
+				return mailbox.sweepExecCaptureRoot(ctx, root, false)
+			}
 			mailbox.captureCleanup = func() {
 				once.Do(func() {
 					_ = root.Remove("capture.bundle")
 					_ = root.Remove("tmp/capture.bundle")
-					_ = root.RemoveAll("wefty-exec-work")
-					root.Close()
+					trash := ".wefty-trash-wefty-exec-work-" + rand.Text()
+					if err := root.Rename("wefty-exec-work", trash); err != nil {
+						root.Close()
+						if !errors.Is(err, os.ErrNotExist) {
+							mailbox.log("agent: retire exec capture checkout: %v", err)
+						}
+						return
+					}
+					// Keep both retirement and deletion anchored to the retained
+					// directory. Never resolve the mailbox's pathname again: the
+					// workload may have moved it and replaced it with a symlink.
+					// Only the deleter owns this handle after cleanup returns.
+					go func() {
+						defer root.Close()
+						if err := removeAll(root, trash); err != nil {
+							mailbox.log("agent: delete exec capture trash: %v", err)
+						}
+					}()
 				})
 			}
 			return true, nil
@@ -141,6 +170,11 @@ func downloadExecCapture(parent context.Context, client *http.Client, mailbox *r
 	if response.StatusCode != http.StatusOK {
 		return response.StatusCode >= 500, fmt.Errorf("fetch exec capture: HTTP %d", response.StatusCode)
 	}
+	// L3 declares the stored file's size. A different length is corrupt
+	// stored input, not an interrupted transfer that another fetch can repair.
+	if response.ContentLength >= 0 && response.ContentLength != expected {
+		return false, fmt.Errorf("exec capture size mismatch: declared %d bytes, expected %d bytes", response.ContentLength, expected)
+	}
 	file, e := mailbox.root.OpenFile("tmp/capture.bundle", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if e != nil {
 		return false, fmt.Errorf("stage exec capture: %w", e)
@@ -150,10 +184,11 @@ func downloadExecCapture(parent context.Context, client *http.Client, mailbox *r
 	digest := sha256.New()
 	size, e := io.Copy(io.MultiWriter(file, digest), io.LimitReader(execCaptureProgressReader{ctx, mailbox.clock, cancel, response.Body}, expected+1))
 	if e != nil {
-		return !errors.Is(e, errExecCaptureIdle), fmt.Errorf("exec capture fetch failed: %w", e)
+		// Proven oversize stops even when the same read also failed.
+		return size <= expected && (response.ContentLength < 0 || size < response.ContentLength) && !errors.Is(e, errExecCaptureIdle), fmt.Errorf("exec capture fetch failed: %w", e)
 	}
 	if size != expected {
-		return size < expected, fmt.Errorf("exec capture size mismatch: received %d bytes, expected %d bytes", size, expected)
+		return size < response.ContentLength, fmt.Errorf("exec capture size mismatch: received %d bytes, expected %d bytes", size, expected)
 	}
 	if hex.EncodeToString(digest.Sum(nil)) != hash {
 		return false, fmt.Errorf("exec capture SHA-256 mismatch")

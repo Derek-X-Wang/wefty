@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/l1"
+	"github.com/Derek-X-Wang/wefty/l3"
 )
 
 func TestExecExternalCancellationIsTerminal(t *testing.T) {
@@ -162,6 +164,30 @@ func waitExecRunTerminal(t *testing.T, clients *apiClients, id string) {
 		}
 		if err := waitForContext(ctx, 20*time.Millisecond); err != nil {
 			t.Fatalf("run %s did not end: %v", id, err)
+		}
+	}
+}
+
+// waitExecRunResult reads a Run's result once it has arrived. On the normal
+// path the node completes the Attempt before it uploads the result, so a
+// terminal Run can briefly answer not_found (docs/contracts/exec.md: a
+// succeeded run does not wait for its result). Any other read error fails at
+// once.
+func waitExecRunResult(t *testing.T, clients *apiClients, id string) l3.RunResult {
+	t.Helper()
+	ctx, stop := context.WithTimeout(t.Context(), 40*time.Second)
+	defer stop()
+	for {
+		record, err := clients.getRunResult(ctx, id)
+		var responseErr *apiResponseError
+		if err == nil || !errors.As(err, &responseErr) || responseErr.APIError.Code != contract.ErrorNotFound {
+			if err != nil {
+				t.Fatal(err)
+			}
+			return record
+		}
+		if err := waitForContext(ctx, 20*time.Millisecond); err != nil {
+			t.Fatalf("run %s result did not arrive: %v", id, err)
 		}
 	}
 }

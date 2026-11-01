@@ -105,7 +105,9 @@ func TestClassPoolsRunAtCapacityAndIsolateSiblings(t *testing.T) {
 		evidence.stage = fmt.Sprintf("await-oneshot-%d-succeeded", index)
 		harness.waitForJobState(t, job.JobID, contract.JobClassOneShot, contract.JobSucceeded, poolObservationBudget)
 		evidence.stage = fmt.Sprintf("oneshot-%d-output", index)
-		output := harness.agent.outputString()
+		// Stderr diagnostics can arrive between a stdout prefix and payload
+		// when both streams share a pipe; check attribution on stdout alone.
+		output := harness.agent.stdout.String()
 		if !attributedOutputContains(output, job.JobID, fmt.Sprintf("oneshot-%d", index)) {
 			t.Fatalf("one-shot %s output was not visibly attributed\n%s", job.JobID, output)
 		}

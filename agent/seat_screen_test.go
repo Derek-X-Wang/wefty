@@ -16,6 +16,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 	"github.com/coder/websocket"
@@ -693,7 +694,7 @@ func TestSeatScreenSessionAuditFailureIsLoggedAndClassified(t *testing.T) {
 			for range computerAuditAttempts {
 				select {
 				case <-f.control.sessionAttempts:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("session close audit did not exhaust its retries")
 				}
 			}
@@ -702,13 +703,13 @@ func TestSeatScreenSessionAuditFailureIsLoggedAndClassified(t *testing.T) {
 				if !strings.Contains(err.Error(), "computer-1") || !strings.Contains(err.Error(), id) || !strings.Contains(err.Error(), "record Computer session close") {
 					t.Errorf("audit report lacks Computer, Seat or cause: %v", err)
 				}
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Error("exhausted session close audit was silently discarded")
 			}
 			if status == 503 {
 				select {
 				case <-f.fatal:
-				case <-time.After(time.Second):
+				case <-time.After(testwait.Bound):
 					t.Error("exhausted session close audit did not call fatal")
 				}
 				return
@@ -724,7 +725,7 @@ func TestSeatScreenSessionAuditFailureIsLoggedAndClassified(t *testing.T) {
 			for range 2 {
 				select {
 				case <-f.logs:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("front-door reports were not logged individually")
 				}
 			}
@@ -835,7 +836,7 @@ func TestSeatScreenReleaseRetriesLiveClearBeforeWithdrawing(t *testing.T) {
 						}
 						clock.Advance(delay)
 					}
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("clear did not retry or finish")
 				}
 			}

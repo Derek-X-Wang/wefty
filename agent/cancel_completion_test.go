@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -96,7 +97,7 @@ func TestCancelDuringOCIStartedResponsePreservesCommittedStart(t *testing.T) {
 	go func() { _, err := lifecycle.execute(ctx, claim, time.Now()); done <- err }()
 	select {
 	case <-entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Started never reached L1")
 	}
 	// The durable edge already won; cancel arrives before the HTTP response.
@@ -107,7 +108,7 @@ func TestCancelDuringOCIStartedResponsePreservesCommittedStart(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cancel erased committed Started response: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Started acknowledgement did not join")
 	}
 	select {
@@ -115,7 +116,7 @@ func TestCancelDuringOCIStartedResponsePreservesCommittedStart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("canceled OCI did not finish")
 	}
 }
@@ -251,7 +252,7 @@ func TestCancelCompletionRetryOutageKeepsAgentRunning(t *testing.T) {
 					if err != nil {
 						t.Errorf("agent shutdown: %v", err)
 					}
-				case <-time.After(3 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Error("agent did not join shutdown")
 				}
 			}()
@@ -261,7 +262,7 @@ func TestCancelCompletionRetryOutageKeepsAgentRunning(t *testing.T) {
 				// Preserve the result for the shutdown join.
 				done <- err
 				t.Fatalf("cancel retry ended agent during L1 outage: %v", err)
-			case <-time.After(3 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("agent did not resume claims after cancellation retry budget")
 			}
 			pending := nodeAgent.outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)

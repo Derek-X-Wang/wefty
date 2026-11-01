@@ -77,7 +77,9 @@ func TestUpgradeRealBinariesReportCommitAndPreflightCopies(t *testing.T) {
 		t.Run(name+"-preflight", func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "copy.sqlite")
 			if name == "wefty-l1" {
-				store, err := l1.OpenStore(path, l1.StoreOptions{})
+				var store *l1.Store
+				var err error
+				withProductionSQLiteSync(func() { store, err = l1.OpenStore(path, l1.StoreOptions{}) })
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/runner/lima"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -154,7 +155,7 @@ func TestControllerWaitsForCompletionDrainBeforeRuntimeStop(t *testing.T) {
 	}()
 	select {
 	case <-runtime.fenceEntered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("controller did not reach completion drain")
 	}
 	runtime.mu.Lock()

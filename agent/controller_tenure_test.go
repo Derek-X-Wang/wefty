@@ -254,7 +254,7 @@ func TestControllerTenureSerializesAdminOverridesWithoutBlockingOldRelease(t *te
 	}()
 	select {
 	case <-fixture.dialStarted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("admin override did not reach the bounded control dial")
 	}
 	if _, err := fixture.tenure.Take(t.Context(), adminTwo.id); tenureCode(err) != ComputerTenureBusy {
@@ -267,7 +267,7 @@ func TestControllerTenureSerializesAdminOverridesWithoutBlockingOldRelease(t *te
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("old session release blocked behind replacement dial")
 	}
 	close(fixture.dialGate)
@@ -551,7 +551,7 @@ func TestControllerTenureSessionEndReleasesAndUnconfirmedClearReaps(t *testing.T
 	}
 	select {
 	case <-fixture.reaped:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("unconfirmed clear did not request attempt reap")
 	}
 }
@@ -575,7 +575,7 @@ func TestControllerTenureRetriesAndReportsBackgroundReleaseAuditFailure(t *testi
 		if !strings.Contains(err.Error(), "control_released") {
 			t.Fatalf("reported audit error = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("background release audit failure was not surfaced")
 	}
 	events := fixture.eventSnapshot()

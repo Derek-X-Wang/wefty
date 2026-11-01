@@ -12,6 +12,7 @@ import (
 )
 
 func TestStorageCopyNetworkCLIOutputs(t *testing.T) {
+	t.Parallel()
 	for _, network := range []l1.ComputerNetwork{l1.ComputerNetworkNone, l1.ComputerNetworkInternet} {
 		t.Run("clone_"+string(network), func(t *testing.T) {
 			h := newStorageCLIHarness(t, &l1.ComputerSettings{SeatLimit: 2, IdleAction: l1.ComputerIdleDelete, Network: network})

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func startReadinessTestListener(t *testing.T, serve func(int, net.Conn)) (int, func()) {
@@ -1082,7 +1083,7 @@ func TestTeardownWaitsForSlowStopBeforeDetachingMounts(t *testing.T) {
 	go func() { done <- runner.cleanup() }()
 	select {
 	case <-stopEntered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("stop command did not start")
 	}
 	select {
@@ -1099,7 +1100,7 @@ func TestTeardownWaitsForSlowStopBeforeDetachingMounts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("teardown did not finish after stop returned")
 	}
 	select {

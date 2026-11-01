@@ -15,6 +15,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestServiceRemovalControllerTransactionAndAttestation(t *testing.T) {
@@ -595,7 +596,7 @@ func TestServiceRemovalWALCheckpointRetriesBlockedReaders(t *testing.T) {
 	}
 	select {
 	case <-released:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("reader was not released")
 	}
 }

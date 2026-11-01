@@ -345,10 +345,9 @@ func TestLogEventDocumentMigrationIsBoundedAndResumable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantPage, err := testReads(store).GetJobLogs(context.Background(), job.JobID, "", MaxLogPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Walk every page: one page ends at the read page cutoff, at a different
+	// event before and after the migration on a slow runner (#1304).
+	wantPage := walkStoreJobLogs(t, store, job.JobID)
 
 	first, err := store.CompactLogEventDocuments(context.Background())
 	if err != nil {
@@ -421,10 +420,7 @@ func TestLogEventDocumentMigrationIsBoundedAndResumable(t *testing.T) {
 	if !bytes.Equal(gotJSONL, wantJSONL) {
 		t.Fatal("JSONL export changed across the migration")
 	}
-	gotPage, err := testReads(store).GetJobLogs(context.Background(), job.JobID, "", MaxLogPageLimit)
-	if err != nil {
-		t.Fatal(err)
-	}
+	gotPage := walkStoreJobLogs(t, store, job.JobID)
 	wantEncoded, _ := json.Marshal(wantPage)
 	gotEncoded, _ := json.Marshal(gotPage)
 	if !bytes.Equal(gotEncoded, wantEncoded) {

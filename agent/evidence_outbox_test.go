@@ -255,7 +255,7 @@ func TestOCIIntentStopWaitsForInFlightCompletionRequest(t *testing.T) {
 	go func() { completionDone <- outbox.recoverCompletion(t.Context(), client, attempt) }()
 	select {
 	case <-requestEntered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("completion request did not enter L1")
 	}
 	stopDone := make(chan error, 1)
@@ -460,7 +460,7 @@ func TestLogFinalizationDeadlineHandsCompletionToOrderedRecovery(t *testing.T) {
 		if completion.Result.Signal != "killed" || !completion.Result.LogEvidenceIncomplete || completion.Result.OutputError != "" {
 			t.Fatalf("ordered recovery completion = %#v", completion.Result)
 		}
-	case <-time.After(recoveryTimeout):
+	case <-time.After(testwait.Bound):
 		t.Fatal("ordered recovery did not deliver completion")
 	}
 	waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", recoveryTimeout)
@@ -852,7 +852,7 @@ func TestFinalizationSpoolAppendDeadlinePreservesPayloadResult(t *testing.T) {
 		if tail.Stream != contract.LogStdout || tail.Sequence != 0 || string(tail.Bytes) != "tail" {
 			t.Fatalf("recovered redaction tail = %#v, want stdout sequence 0 with bytes tail", tail)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("deadline-interrupted redaction tail was not recovered as late evidence")
 	}
 	select {
@@ -860,7 +860,7 @@ func TestFinalizationSpoolAppendDeadlinePreservesPayloadResult(t *testing.T) {
 		if completion.Result.ExitCode == nil || *completion.Result.ExitCode != 0 || !completion.Result.LogEvidenceIncomplete || completion.Result.OutputError != "" {
 			t.Fatalf("late-evidence completion = %#v, want exit 0 with incomplete output evidence", completion.Result)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("late-evidence recovery did not deliver completion")
 	}
 	mu.Lock()
@@ -984,7 +984,7 @@ func TestServiceFinalizationEvictionDeadlinePreservesPayloadAndRecoversTail(t *t
 		if tail.Stream != contract.LogStdout || tail.Sequence != 0 || string(tail.Bytes) != "tail" || tail.Gap != nil {
 			t.Fatalf("recovered service redaction tail = %#v, want stdout sequence 0 with bytes tail", tail)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("eviction-deadline redaction tail was not recovered as late evidence")
 	}
 	select {
@@ -992,7 +992,7 @@ func TestServiceFinalizationEvictionDeadlinePreservesPayloadAndRecoversTail(t *t
 		if completion.Result.ExitCode == nil || *completion.Result.ExitCode != 0 || !completion.Result.LogEvidenceIncomplete || completion.Result.OutputError != "" {
 			t.Fatalf("service late-evidence completion = %#v, want exit 0 with incomplete output evidence", completion.Result)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("service late-evidence recovery did not deliver completion")
 	}
 	mu.Lock()
@@ -1100,7 +1100,7 @@ func TestBatchThresholdWakesUploaderBeforeClose(t *testing.T) {
 	}
 	select {
 	case <-uploadStarted:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("batch threshold did not wake the uploader before close")
 	}
 }
@@ -1227,7 +1227,7 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 			outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 			select {
 			case <-scanned:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("initial recovery scan did not finish")
 			}
 			claim := l1.Claim{
@@ -1269,13 +1269,13 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 			var live l1.CompletionRequest
 			select {
 			case live = <-firstCompletionStarted:
-			case <-time.After(2 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("live completion did not start")
 			}
 			if gate != nil {
 				select {
 				case <-gate.entered:
-				case <-time.After(2 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("lifecycle did not reach the in-flight completion select")
 				}
 			}
@@ -1304,7 +1304,7 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 						t.Fatalf("cancellation provenance changed: err=%v want=%v", err, wantErr)
 					}
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("lifecycle did not abandon canceled live completion")
 			}
 			select {
@@ -1312,7 +1312,7 @@ func TestAttemptHandsAbandonedCompletionToRecovery(t *testing.T) {
 				if !reflect.DeepEqual(completion, live) {
 					t.Fatalf("replayed result = %+v", completion.Result)
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("abandoned lifecycle completion was not reconciled")
 			}
 			waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
@@ -1395,7 +1395,7 @@ func TestRecoveredCompletionKeepsTheTerminationInitiator(t *testing.T) {
 		select {
 		case body := <-bodies:
 			return body
-		case <-time.After(2 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatalf("%s completion was not sent", what)
 			return nil
 		}
@@ -1404,7 +1404,7 @@ func TestRecoveredCompletionKeepsTheTerminationInitiator(t *testing.T) {
 	cancel()
 	select {
 	case <-executeDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("lifecycle did not abandon canceled live completion")
 	}
 	recovered := receive("recovered")
@@ -1457,7 +1457,7 @@ func TestAttemptRenewalFailureAbandonsInFlightCompletionToRecovery(t *testing.T)
 					select {
 					case completion := <-firstCompletion:
 						firstCompletion <- completion
-					case <-time.After(2 * time.Second):
+					case <-time.After(testwait.Bound):
 						t.Error("renewal arrived before the live completion request")
 					}
 					w.Header().Set("Content-Type", "application/json")
@@ -1501,7 +1501,7 @@ func TestAttemptRenewalFailureAbandonsInFlightCompletionToRecovery(t *testing.T)
 			var live l1.CompletionRequest
 			select {
 			case live = <-firstCompletion:
-			case <-time.After(2 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("live completion did not reach L1")
 			}
 			select {
@@ -1509,7 +1509,7 @@ func TestAttemptRenewalFailureAbandonsInFlightCompletionToRecovery(t *testing.T)
 				if !reflect.DeepEqual(replayed, live) {
 					t.Fatalf("replayed completion = %+v, want exact live body %+v", replayed, live)
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(testwait.Bound):
 				receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
 				t.Fatalf("abandoned completion was not reconciled; receipt=%+v", receipt)
 			}
@@ -1693,7 +1693,7 @@ func TestCompletionDirectivePreservesSessionAndEvidence(t *testing.T) {
 				if !reflect.DeepEqual(body, liveBody) {
 					t.Fatalf("recovery changed completion: live=%+v replay=%+v", liveBody, body)
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("completion was not replayed after live cancellation")
 			}
 			waitCompletionReceiptState(t, outbox, claim.Lease.AttemptID, "delivered", 2*time.Second)
@@ -1793,7 +1793,7 @@ func TestCompletionOwnProtocolVerdictIsNotAbandonedDelivery(t *testing.T) {
 			var failure destinationError
 			select {
 			case failure = <-delivered:
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("completion did not return L1's own verdict")
 			}
 			var abandoned *completionDeliveryAbandoned
@@ -1863,7 +1863,7 @@ func assertAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 	}()
 	select {
 	case <-completionStarted:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("completion delivery did not start")
 	}
 	stored, _, present, err := outbox.spool.completion(context.Background(), claim.Lease.AttemptID)
@@ -1879,7 +1879,7 @@ func assertAttemptPersistsCompletionBeforeDelivery(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("attempt did not finish after completion acknowledgement")
 	}
 }
@@ -1962,7 +1962,7 @@ func TestEvidenceRecoveryWakesForCompletionStoredAfterInitialScan(t *testing.T) 
 	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 	select {
 	case <-initialRecoveryFinished:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("initial recovery did not reach its active-attempt retirement edge")
 	}
 	result := l1.ProcessResult{RuntimeFailure: &contract.RuntimeFailure{
@@ -1980,7 +1980,7 @@ func TestEvidenceRecoveryWakesForCompletionStoredAfterInitialScan(t *testing.T) 
 			delivered.RuntimeQuiescenceEvidence != l1.RuntimeQuiescenceOCISweep {
 			t.Fatalf("replayed completion = %+v", delivered)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("same-attempt completion wake was swallowed at active recovery retirement")
 	}
 	testwait.Until(t, "late completion delivered", func() (bool, error) {
@@ -2125,7 +2125,7 @@ func TestEvidenceRecoveryDrainsLiveLogBacklogBeforeCompletion(t *testing.T) {
 	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 	select {
 	case <-firstPassFinished:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("bounded recovery pass did not finish")
 	}
 	mu.Lock()
@@ -2314,7 +2314,7 @@ func TestEvidenceRecoveryBoundsLostLogBacklogBeforeCompletion(t *testing.T) {
 	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 	select {
 	case <-firstPassFinished:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("bounded lost recovery pass did not finish")
 	}
 	mu.Lock()
@@ -2421,7 +2421,7 @@ func TestEvidenceRecoverySealsNonContiguousBacklogInsteadOfRetryingForever(t *te
 		if !strings.Contains(err.Error(), "durable evidence sealed incomplete") {
 			t.Fatalf("non-contiguous recovery report = %v, want terminal incomplete-evidence seal", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("non-contiguous recovery backlog was not terminally sealed")
 	}
 	receipt := outbox.spool.inspectCompletion(t.Context(), claim.Lease.AttemptID)
@@ -2445,14 +2445,14 @@ func TestEvidenceRecoveryRetriesScanErrorsWithInjectedClock(t *testing.T) {
 	outbox.startRecovery(t.Context(), nil, func(err error) { reports <- err })
 	select {
 	case <-reports:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("initial spool scan error was not reported")
 	}
 	clock.waitForDeadline(t, clock.Now().Add(retryInterval))
 	clock.Advance(retryInterval)
 	select {
 	case <-reports:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("spool scan was not retried after injected-clock backoff")
 	}
 }
@@ -2514,7 +2514,7 @@ func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
 	case <-runner.started:
 	case err := <-executeDone:
 		t.Fatalf("live lifecycle exited before emitting its log event: %v", err)
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("live lifecycle did not durably emit its log event")
 	}
 	late := spoolTestClaim("attempt-late")
@@ -2529,7 +2529,7 @@ func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
 	outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 	select {
 	case <-lateCompletion:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("unowned late completion was not reconciled")
 	}
 	select {
@@ -2540,7 +2540,7 @@ func TestEvidenceRecoveryDoesNotReplayLiveAttempt(t *testing.T) {
 	cancelLive()
 	select {
 	case <-executeDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("live lifecycle did not stop")
 	}
 }
@@ -2649,12 +2649,12 @@ func assertPendingEvidenceDoesNotBlockRegistration(t *testing.T) {
 	go func() { runDone <- nodeAgent.Run(ctx) }()
 	select {
 	case <-poisonStarted:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("pending evidence recovery did not start")
 	}
 	select {
 	case <-registered:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("pending evidence blocked registration")
 	}
 	select {
@@ -2668,7 +2668,7 @@ func assertPendingEvidenceDoesNotBlockRegistration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent Run() after cancellation = %v", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not stop")
 	}
 }
@@ -2718,7 +2718,7 @@ func assertEvidenceRecoveryIsolatesTransientPoisonAttempt(t *testing.T) {
 	outbox.startRecovery(ctx, client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 	select {
 	case <-poisonRequestStarted:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("poison replay did not start")
 	}
 	waitForSpoolHighWater(t, outbox.spool, "attempt-good", contract.LogStdout, 0)
@@ -2872,7 +2872,7 @@ func TestIntentStopDrainWaitsForLiveSuppressionDisposition(t *testing.T) {
 	}()
 	select {
 	case <-intentObserved:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		_ = writeLock.Rollback()
 		t.Fatal("live completion did not observe disabled intent")
 	}
@@ -2958,7 +2958,7 @@ func TestIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *testing.
 	}()
 	select {
 	case <-intentObserved:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		_ = connectionBlocker.Rollback()
 		t.Fatal("live completion did not observe disabled intent")
 	}
@@ -3036,7 +3036,7 @@ func TestRecoveryIntentStopDrainReportsSuppressionFailureWithinStorageBudget(t *
 	go func() { recoveryDone <- outbox.recoverCompletion(t.Context(), client, attempt) }()
 	select {
 	case <-intentObserved:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("recovery did not observe disabled intent")
 	}
 	connectionBlocker, err := outbox.spool.db.BeginTx(t.Context(), nil)
@@ -3214,7 +3214,7 @@ func TestCompletionDispositionWaitObservesRecoverySuppression(t *testing.T) {
 	}()
 	select {
 	case <-waitParked:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("completion disposition waiter did not reach the pre-commit edge")
 	}
 	observationStarted := time.Now()
@@ -3263,7 +3263,7 @@ func TestCompletionDispositionWaitObservesDeliveredCompletion(t *testing.T) {
 	}()
 	select {
 	case <-waitParked:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("delivered disposition waiter did not reach the pre-commit edge")
 	}
 	if err := outbox.completionDelivered(t.Context(), claim.Lease.AttemptID, 3); err != nil {
@@ -3309,7 +3309,7 @@ func assertEvidenceRecoverySealsAuthorityLossIncomplete(t *testing.T) {
 		if !strings.Contains(err.Error(), "sealed incomplete") {
 			t.Fatalf("recovery error = %v, want sealed-incomplete report", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("timed out waiting for sealed-incomplete report")
 	}
 	var eventCount int
@@ -3378,7 +3378,7 @@ func assertEvidenceRecoveryReplacesPermanentReplayRejectionWithGap(t *testing.T)
 	for range 2 {
 		select {
 		case <-uploadSeen:
-		case <-time.After(2 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("timed out waiting for rejected raw event and replacement gap")
 		}
 	}
@@ -3438,7 +3438,7 @@ func holdInitialEvidenceRecoveryScan(t *testing.T, outbox *evidenceOutbox, clien
 	outbox.startRecovery(t.Context(), client, report)
 	select {
 	case <-scanned:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("initial recovery scan did not finish")
 	}
 	return releaseScan
@@ -3848,7 +3848,7 @@ func TestNormalFinishKeepsPendingLogsBeforeCompletion(t *testing.T) {
 			outbox.startRecovery(t.Context(), client, func(err error) { t.Logf("recovery: %v", err) })
 			select {
 			case <-scanned:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("initial recovery scan did not finish")
 			}
 			if test.name == "stopped_recovery" {
@@ -3889,7 +3889,7 @@ func TestNormalFinishKeepsPendingLogsBeforeCompletion(t *testing.T) {
 				outbox.scheduleRecovery()
 				select {
 				case <-replayed:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("evidence recovery did not finish")
 				}
 			}
@@ -4151,7 +4151,7 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 			}
 			select {
 			case <-runtime.started:
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("runtime did not start")
 			}
 			assertLiveAndEmpty()
@@ -4168,7 +4168,7 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 				outbox.startRecovery(t.Context(), client, func(err error) { t.Errorf("recovery: %v", err) })
 				select {
 				case <-scanned:
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("initial recovery scan did not finish")
 				}
 			}
@@ -4193,7 +4193,7 @@ func TestShutdownAndDirectivesKeepPendingLogsBeforeCompletion(t *testing.T) {
 				if err != nil && !errors.Is(err, context.Canceled) {
 					t.Fatal(err)
 				}
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("lifecycle did not join")
 			}
 			if (shutdown || recoveryStopping) && !test.boundRunsOut {

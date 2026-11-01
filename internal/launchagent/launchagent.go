@@ -324,7 +324,7 @@ func (manager Manager) converge(ctx context.Context, folder *os.Root, path, labe
 	// Setup must restore autostart even when an existing legacy definition needs
 	// no bootstrap. Migration rollback can leave a persistent disabled override.
 	if current && state.Loaded && label == "dev.wefty.node-agent" {
-		disabled, err := manager.legacyStartDisabled(ctx)
+		disabled, err := manager.startDisabled(ctx, label)
 		if err != nil {
 			return "", err
 		}
@@ -398,9 +398,17 @@ func (manager Manager) converge(ctx context.Context, folder *os.Root, path, labe
 
 // load bootstraps the plist at path. A service the owner disabled cannot be
 // bootstrapped; setup's job is to make it run, so it clears that override.
+// Enabling only a disabled label avoids creating persistent override entries
+// for fresh generation labels.
 func (manager Manager) load(ctx context.Context, path, label string) error {
-	if _, err := manager.Run(ctx, Launchctl, "enable", manager.target(label)); err != nil {
-		return fmt.Errorf("enable LaunchAgent %s: %w", label, err)
+	disabled, err := manager.startDisabled(ctx, label)
+	if err != nil {
+		return err
+	}
+	if disabled {
+		if _, err := manager.Run(ctx, Launchctl, "enable", manager.target(label)); err != nil {
+			return fmt.Errorf("enable LaunchAgent %s: %w", label, err)
+		}
 	}
 	if _, err := manager.Run(ctx, Launchctl, "bootstrap", manager.domain(), path); err != nil {
 		return fmt.Errorf("load LaunchAgent %s: %w", label, err)
@@ -500,21 +508,39 @@ func (manager Manager) UnloadStoppedLegacy(ctx context.Context, label string) er
 	return manager.unload(ctx, label, true)
 }
 
-// legacyStartDisabled reads the persisted override without changing an already
+// startDisabled reads the persisted override without changing an already
 // enabled service. Unknown output is an operational decode fault, never proof
 // that autostart is enabled.
-func (manager Manager) legacyStartDisabled(ctx context.Context) (bool, error) {
+func (manager Manager) startDisabled(ctx context.Context, targetLabel string) (bool, error) {
 	payload, err := manager.Run(ctx, Launchctl, "print-disabled", manager.domain())
 	if err != nil {
-		return false, fmt.Errorf("inspect legacy LaunchAgent autostart: %w", err)
+		return false, fmt.Errorf("inspect LaunchAgent %s autostart: %w", targetLabel, err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(payload)), "\n")
-	if len(lines) < 2 || strings.TrimSpace(lines[0]) != "disabled services = {" || strings.TrimSpace(lines[len(lines)-1]) != "}" {
+	// Other launchctl sections may surround the top-level override block.
+	start, depth := 0, 0
+	for start < len(lines) {
+		line := strings.TrimSpace(lines[start])
+		if depth == 0 && line == "disabled services = {" {
+			break
+		}
+		if strings.HasSuffix(line, "{") {
+			depth++
+		} else if line == "}" && depth > 0 {
+			depth--
+		}
+		start++
+	}
+	end := start + 1
+	for end < len(lines) && strings.TrimSpace(lines[end]) != "}" {
+		end++
+	}
+	if start == len(lines) || end == len(lines) {
 		return false, errors.New("decode launchctl disabled services: malformed domain record")
 	}
 	seen := make(map[string]bool)
 	disabled := false
-	for _, line := range lines[1 : len(lines)-1] {
+	for _, line := range lines[start+1 : end] {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -533,7 +559,7 @@ func (manager Manager) legacyStartDisabled(ctx context.Context) (bool, error) {
 		default:
 			return false, errors.New("decode launchctl disabled services: unknown override")
 		}
-		if label == "dev.wefty.node-agent" {
+		if label == targetLabel {
 			disabled = flag
 		}
 	}

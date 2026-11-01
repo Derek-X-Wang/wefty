@@ -130,7 +130,7 @@ func TestAgentCompletesWithoutDuplicateLogsAfterNetworkLossMidJob(t *testing.T) 
 	go func() { agentDone <- nodeAgent.Run(ctx) }()
 	select {
 	case <-firstOutput:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("compiled helper did not produce its first event")
 	}
 	claimed := waitForJobAttempt(t, store, job.JobID)
@@ -154,7 +154,7 @@ func TestAgentCompletesWithoutDuplicateLogsAfterNetworkLossMidJob(t *testing.T) 
 		if err != nil {
 			t.Fatalf("agent Run() = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not stop")
 	}
 }
@@ -197,7 +197,7 @@ func TestAgentRestartRecoversOriginalAttemptSpool(t *testing.T) {
 	restarted.outbox.startRecovery(ctx, restarted.session.client, func(err error) { t.Errorf("recover durable evidence: %v", err) })
 	select {
 	case <-recovered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("timed out waiting for process-lifetime evidence recovery")
 	}
 	node, err := restarted.Register(ctx)
@@ -327,7 +327,7 @@ func assertAgentBootDeliversDurableLateEvidenceWithoutCrashLoop(t *testing.T) {
 		if err != nil {
 			t.Fatalf("agent Run() after cancellation = %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not stop")
 	}
 }

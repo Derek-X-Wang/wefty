@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/agent/managedroot"
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -322,13 +323,13 @@ func newResidentRejoinFixture(t *testing.T, clock *manualClock, hook func(*Agent
 			if err != nil {
 				t.Error(err)
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("agent did not stop")
 		}
 	})
 	select {
 	case <-a.Registered():
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("registration timed out")
 	}
 	return a, store, done, cancel

@@ -20,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
@@ -451,7 +452,7 @@ func TestSeatFrontDoorListenFailureKeepsNodeSessionRunning(t *testing.T) {
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("node did not stop")
 		}
 	}()
@@ -459,10 +460,10 @@ func TestSeatFrontDoorListenFailureKeepsNodeSessionRunning(t *testing.T) {
 	case <-node.Registered():
 	case err := <-done:
 		t.Fatalf("Seat door stopped non-Seat registration: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("node did not register")
 	}
-	if node.seatDoor != nil {
+	if node.currentSeatFrontDoor() != nil {
 		t.Fatal("failed listener left a Seat door")
 	}
 	if _, err := store.GetNode(t.Context(), "door-unavailable"); err != nil {

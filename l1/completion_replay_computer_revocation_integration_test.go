@@ -10,6 +10,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // revocationLog records every Computer-wide token revocation L1 sends to the
@@ -366,7 +367,7 @@ func TestDelayedCompletionRevocationSparesTheReplacementAttemptsPass(t *testing.
 	}()
 	select {
 	case <-arrived:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("the completion's revocation never reached the ledger")
 	}
 

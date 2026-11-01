@@ -18,6 +18,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -91,7 +92,7 @@ func TestCancelOCIHandoffResultThroughDirectApp(t *testing.T) {
 			defer release()
 			select {
 			case <-runtime.ready:
-			case <-time.After(5 * time.Second * raceTimeoutScale):
+			case <-time.After(testwait.Bound):
 				t.Fatal("OCI never reached cancellation edge")
 			}
 			var pending l1.Job

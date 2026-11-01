@@ -11,6 +11,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric/local"
 	"github.com/Derek-X-Wang/wefty/internal/serviceready"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestClientServicePublishesCurrentReadyFile(t *testing.T) {
@@ -31,7 +32,7 @@ func TestClientServicePublishesCurrentReadyFile(t *testing.T) {
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(3 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("client service did not stop")
 		}
 	})

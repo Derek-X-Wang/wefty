@@ -9,6 +9,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -169,18 +170,23 @@ func TestExecNodeSelectionFromRealBinary(t *testing.T) {
 	if code != 2 || len(out) != 0 || !strings.Contains(string(stderr), "known nodes") || !strings.Contains(string(stderr), "node-cli") {
 		t.Fatalf("unknown exit=%d stdout=%s stderr=%s", code, out, stderr)
 	}
-	code, out, stderr = runPolishBinary(t, binary, append(args, "--node", "node-cli", "--detach", "--", "true")...)
-	if code != 0 {
-		t.Fatalf("local exit=%d stdout=%s stderr=%s", code, out, stderr)
-	}
-	record, err := stack.clients.getRun(t.Context(), strings.TrimSpace(string(out)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var p map[string]any
-	json.Unmarshal(record.Params, &p)
-	if p["exec_version"] != float64(1) || p["capture_sha256"] != nil {
-		t.Fatalf("local path changed: %s", record.Params)
+	// Both the default and an explicitly selected local Node must retain
+	// version 1 storage, with no capture upload or remote wrapper.
+	for _, nodeArgs := range [][]string{nil, {"--node", "node-cli"}} {
+		localArgs := append(append([]string{}, args...), nodeArgs...)
+		code, out, stderr = runPolishBinary(t, binary, append(localArgs, "--detach", "--", "true")...)
+		if code != 0 {
+			t.Fatalf("local %v exit=%d stdout=%s stderr=%s", nodeArgs, code, out, stderr)
+		}
+		record, err := stack.clients.getRun(t.Context(), strings.TrimSpace(string(out)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p map[string]any
+		json.Unmarshal(record.Params, &p)
+		if p["exec_version"] != float64(1) || p["capture_sha256"] != nil {
+			t.Fatalf("local path changed: %s", record.Params)
+		}
 	}
 }
 func TestExecCrossNodeFrozenCaptureFromRealBinary(t *testing.T) {
@@ -361,7 +367,7 @@ func TestExecCrossNodeStopCancelsUnlessKeepRunning(t *testing.T) {
 			var stopped error
 			select {
 			case stopped = <-done:
-			case <-time.After(10 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("CLI ignored stop")
 			}
 			exit, ok := stopped.(*exec.ExitError)
@@ -534,7 +540,7 @@ func TestExecCrossNodeStopDuringUploadIsLocalCancellationFromRealBinary(t *testi
 		if !ok || exit.ExitCode() != 1 {
 			t.Fatalf("upload cancellation exit=%v want=1 stdout=%s stderr=%s", err, &out, &stderr)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("upload cancellation did not stop CLI")
 	}
 	page, err := fleet.clients.listRuns(t.Context(), "", 10)

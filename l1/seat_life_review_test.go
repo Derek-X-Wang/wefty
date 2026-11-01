@@ -10,6 +10,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func reviewIdleComputer(t *testing.T, f *seatLifecycleFixture, n int) {
@@ -113,7 +114,7 @@ func TestSeatClockFailureAtStartupDoesNotStopL1(t *testing.T) {
 	case err := <-done:
 		t.Fatalf("Seat clock failure stopped startup: %v", err)
 	case <-ready.ready:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		listener.Close()
 		t.Fatal("L1 did not serve")
 	}

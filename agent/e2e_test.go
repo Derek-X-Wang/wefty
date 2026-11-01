@@ -39,9 +39,11 @@ func TestAgentProcessEndToEndPlainFabric(t *testing.T) {
 		},
 		{
 			// Release the real process only after observing an accepted renewal
-			// on its same attempt beyond the original one-second lease.
+			// on its same attempt beyond the original lease. The lease is 3 s so
+			// that one starved-runner pause between renewals does not expire it
+			// (#1392); the proof is the same at any lease length.
 			name:            "renew short lease during long process",
-			leaseDuration:   1 * time.Second,
+			leaseDuration:   3 * time.Second,
 			renewalInterval: 100 * time.Millisecond,
 			arguments:       []string{"processhelper", "wait-release"},
 		},
@@ -361,8 +363,8 @@ func TestE2EWorkloadReleaseHelperHasBoundedFailureFallback(t *testing.T) {
 }
 
 // This observes server-persisted renewal evidence, without mutating authority
-// or relying on a fixed-duration sleeping payload. The ten-second bound is the
-// shared existing E2E completion budget; none of it changes the real one-second lease.
+// or relying on a fixed-duration sleeping payload. The deadline is the E2E
+// completion budget (lease + one renewal + margin); it does not change the lease.
 func waitForE2ERenewal(t *testing.T, client *http.Client, jobID string, lease time.Duration, ready string, node, server *managedProcess, deadline time.Time) string {
 	t.Helper()
 	started := time.Now()

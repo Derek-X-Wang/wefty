@@ -285,8 +285,8 @@ class Round2(unittest.TestCase):
                 self.assertTrue(any(reason in p.read_text() for p in m.path.parent.glob('*.err')))
 
     def test_proof_exec_adapter_cannot_spawn_detached_cleanup_helpers(self):
-        b1=self.runner();base=Path(__file__).resolve().parents[1]/'cmd/wefty'
-        wrapper,cleanup=b1.patch_exec_aliases((base/'exec_wrapper.sh').read_text(),(base/'exec_cleanup.sh').read_text(),Path('/proof/tmp/wefty-run.'))
+        b1=self.runner();base=Path(__file__).resolve().parents[1]
+        wrapper,cleanup=b1.patch_exec_aliases((base/'cmd/wefty/exec_wrapper.sh').read_text(),(base/'internal/execsweep/exec_cleanup.sh').read_text(),Path('/proof/tmp/wefty-run.'))
         self.assertTrue(wrapper.startswith('#!/bin/bash\n'))
         self.assertIn('/proof/tmp/wefty-run.',wrapper)
         self.assertEqual(cleanup.splitlines()[-1],'retire_exec_storage() { return 0; }')

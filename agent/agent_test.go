@@ -23,6 +23,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/durable"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	processrunner "github.com/Derek-X-Wang/wefty/runner/process"
@@ -45,7 +46,11 @@ func TestMain(main *testing.M) {
 	// four helpers instead of starting another compiler/linker job during a
 	// timed cleanup proof. The parent owns their directory until children join.
 	directory := os.Getenv("WEFTY_AGENT_TEST_BINARIES")
-	inherited := directory != "" && (os.Getenv("WEFTY_PRE_ADMISSION_FAILURE_CHILD") == "1" || os.Getenv("WEFTY_RELEASE_CLEANUP_CHILD") == "1")
+	if os.Getenv("AGENT_EXEC_SWEEP_HELPER") != "" {
+		// The exec wrapper deliberately removes WEFTY_* from its command.
+		directory = os.Getenv("AGENT_EXEC_SWEEP_BINARIES")
+	}
+	inherited := directory != "" && (os.Getenv("WEFTY_PRE_ADMISSION_FAILURE_CHILD") == "1" || os.Getenv("WEFTY_RELEASE_CLEANUP_CHILD") == "1" || os.Getenv("AGENT_EXEC_SWEEP_HELPER") != "")
 	if !inherited {
 		var err error
 		directory, err = os.MkdirTemp("", "wefty-agent-test-")
@@ -641,7 +646,7 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 	}
 	select {
 	case <-completionBlocked:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		cancel()
 		t.Fatal("agent did not reach blocked completion")
 	}
@@ -842,7 +847,7 @@ func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
 				go func() { handlers.Wait(); close(joined) }()
 				select {
 				case <-joined:
-				case <-time.After(2 * time.Second):
+				case <-time.After(testwait.Bound):
 					handlerMu.Lock()
 					t.Errorf("directive handlers did not join: %v", activePaths)
 					handlerMu.Unlock()

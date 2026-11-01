@@ -4,6 +4,8 @@
 # target is the default Computer image; neither is a required tenant base.
 ARG DEBIAN_IMAGE=docker.io/library/debian@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 ARG SOURCE_DATE_EPOCH=0
+# apt retries a snapshot.debian.org 503 3 times by default (7 s of backoff);
+# 10 retries add about 3 minutes of backoff, plus request time (#1100).
 
 # The packaged -unixsock accept path passes an uninitialized sockaddr length
 # to accept(2). Keep Debian's source, patches and build flags; fix only that
@@ -16,11 +18,11 @@ RUN printf '%s\n' \
       'deb-src [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260827T000000Z bookworm main' \
       > /etc/apt/sources.list \
     && rm -f /etc/apt/sources.list.d/* \
-    && apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get install --yes --no-install-recommends build-essential=12.9 dpkg-dev=1.21.23 patch=2.7.6-7 \
-    && apt-get build-dep --yes --no-install-recommends x11vnc=0.9.16-9
+    && apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=10 update \
+    && apt-get -o Acquire::Retries=10 install --yes --no-install-recommends build-essential=12.9 dpkg-dev=1.21.23 patch=2.7.6-7 \
+    && apt-get -o Acquire::Retries=10 build-dep --yes --no-install-recommends x11vnc=0.9.16-9
 WORKDIR /tmp
-RUN apt-get source x11vnc=0.9.16-9 \
+RUN apt-get -o Acquire::Retries=10 source x11vnc=0.9.16-9 \
     && printf '%s\n' \
       'ce203e7d4cfaba859502b958824511f328f6f142945277251d3c452406374377  x11vnc_0.9.16.orig.tar.gz' \
       '02e5e18ecb8ae3576e24b2e8ac3cf7ce946e439be8422eaf81bd34c2490a84d2  x11vnc_0.9.16-9.debian.tar.xz' \
@@ -39,8 +41,8 @@ RUN printf '%s\n' \
       'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260827T000000Z bookworm main' \
       > /etc/apt/sources.list \
     && rm -f /etc/apt/sources.list.d/* \
-    && apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get install --yes --no-install-recommends \
+    && apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=10 update \
+    && apt-get -o Acquire::Retries=10 install --yes --no-install-recommends \
         chromium=150.0.7871.100-1~deb12u1 \
         dbus-x11=1.14.10-1~deb12u1 \
         fonts-dejavu-core=2.37-6 \
@@ -92,8 +94,8 @@ ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/wefty-computer-entrypoi
 FROM desktop AS seats
 USER root
 # Playwright 1.56.1: Debian 12 tools/chromium/firefox/webkit nativeDeps.js union.
-RUN apt-get -o Acquire::Check-Valid-Until=false update \
-    && apt-get install --yes --no-install-recommends \
+RUN apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Retries=10 update \
+    && apt-get -o Acquire::Retries=10 install --yes --no-install-recommends \
         git curl ca-certificates xz-utils xauth util-linux procps \
         fonts-freefont-ttf fonts-ipafont-gothic fonts-liberation fonts-noto-color-emoji fonts-tlwg-loma-otf fonts-unifont \
         fonts-wqy-zenhei gstreamer1.0-libav gstreamer1.0-plugins-bad gstreamer1.0-plugins-base gstreamer1.0-plugins-good libasound2 \

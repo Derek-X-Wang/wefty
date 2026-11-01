@@ -5132,6 +5132,25 @@ func killCgroupTree(path string) (cgroupKillResult, error) {
 }
 
 func killCgroupTreeWithOpen(path string, openKill func(string) (io.WriteCloser, error)) (cgroupKillResult, error) {
+	return killCgroupTreeWithSignaler(path, openKill, cgroupProcessSignaler{
+		readFile: os.ReadFile,
+		openPIDFD: func(pid int) (int, error) {
+			return unix.PidfdOpen(pid, 0)
+		},
+		signalPIDFD: func(fd int) error {
+			return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+		},
+		closePIDFD: unix.Close,
+		startTime: func(pid int) (uint64, error) {
+			return processStartTime("/proc", uint64(pid))
+		},
+		kill: func(pid int) error {
+			return unix.Kill(pid, unix.SIGKILL)
+		},
+	})
+}
+
+func killCgroupTreeWithSignaler(path string, openKill func(string) (io.WriteCloser, error), signaler cgroupProcessSignaler) (cgroupKillResult, error) {
 	pids, err := cgroupTreePIDs(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return cgroupKillResult{}, err
@@ -5164,7 +5183,7 @@ func killCgroupTreeWithOpen(path string, openKill func(string) (io.WriteCloser, 
 		if entry.Name() != "cgroup.procs" {
 			return nil
 		}
-		payload, err := os.ReadFile(current)
+		payload, err := signaler.readFile(current)
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
@@ -5176,13 +5195,90 @@ func killCgroupTreeWithOpen(path string, openKill func(string) (io.WriteCloser, 
 			if err != nil || pid <= 0 {
 				return fmt.Errorf("invalid pid %q in %s", field, current)
 			}
-			if err := unix.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			if err := signaler.killMember(current, pid); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
 	return cgroupKillResult{Method: "recursive_signal", PIDs: pids}, err
+}
+
+// cgroupProcessSignaler binds a signal to a process identity, then rechecks
+// membership in the exact cgroup.procs that supplied the PID. Readers and
+// syscalls are injected so PID exit/reuse interleavings can be tested.
+type cgroupProcessSignaler struct {
+	readFile    func(string) ([]byte, error)
+	openPIDFD   func(int) (int, error)
+	signalPIDFD func(int) error
+	closePIDFD  func(int) error
+	startTime   func(int) (uint64, error)
+	kill        func(int) error
+}
+
+func (signaler cgroupProcessSignaler) killMember(procsPath string, pid int) error {
+	fd, err := signaler.openPIDFD(pid)
+	if err == nil {
+		defer signaler.closePIDFD(fd)
+		member, err := signaler.containsPID(procsPath, pid)
+		if err != nil || !member {
+			return err
+		}
+		// The fd continues to name this process even if its numeric PID is
+		// reused after the membership read. Never signal that number here.
+		err = signaler.signalPIDFD(fd)
+		if !errors.Is(err, syscall.ENOSYS) {
+			return ignoreExitedCgroupProcess(err)
+		}
+	} else if !errors.Is(err, syscall.ENOSYS) {
+		return ignoreExitedCgroupProcess(err)
+	}
+
+	// Pre-pidfd kernels cannot pin the identity through the signal syscall.
+	// Take a start-time witness, then recheck membership and that witness
+	// immediately before the numeric signal. Do not kill on missing evidence.
+	startTime, err := signaler.startTime(pid)
+	if err != nil {
+		return ignoreExitedCgroupProcess(err)
+	}
+	member, err := signaler.containsPID(procsPath, pid)
+	if err != nil || !member {
+		return err
+	}
+	currentStartTime, err := signaler.startTime(pid)
+	if err != nil {
+		return ignoreExitedCgroupProcess(err)
+	}
+	if currentStartTime != startTime {
+		return nil
+	}
+	return ignoreExitedCgroupProcess(signaler.kill(pid))
+}
+
+func (signaler cgroupProcessSignaler) containsPID(procsPath string, pid int) (bool, error) {
+	payload, err := signaler.readFile(procsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	member := false
+	for _, field := range strings.Fields(string(payload)) {
+		currentPID, err := strconv.Atoi(field)
+		if err != nil || currentPID <= 0 {
+			return false, fmt.Errorf("invalid pid %q in %s", field, procsPath)
+		}
+		member = member || currentPID == pid
+	}
+	return member, nil
+}
+
+func ignoreExitedCgroupProcess(err error) error {
+	if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 func cgroupTreePIDs(path string) ([]int, error) {

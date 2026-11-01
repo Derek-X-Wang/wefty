@@ -119,6 +119,8 @@ type Attempt struct {
 	NodeID             string                `json:"node_id"`
 	State              contract.AttemptState `json:"state"`
 	LeaseExpiresAt     time.Time             `json:"lease_expires_at"`
+	LeaseLive          bool                  `json:"lease_live"`
+	StartedAt          *time.Time            `json:"started_at,omitempty"`
 	Result             *ProcessResult        `json:"result,omitempty"`
 	InterruptionReason InterruptionReason    `json:"interruption_reason,omitempty"`
 	LateResult         *LateResultEvidence   `json:"late_result,omitempty"`
@@ -537,17 +539,20 @@ type NodeList struct {
 // SpawnError remains a sole spawn arm. Signal outcomes carry a structured
 // termination initiator. LimitReached independently names an enforced limit
 // and makes an attempt fail even when the payload exits zero.
+// The optional list uses a pointer to preserve the zero-value comparisons used
+// when replaying durable completion records from older agents.
 type ProcessResult struct {
-	LimitReached          contract.LimitReached     `json:"limit_reached,omitempty"`
-	SpawnError            *contract.SpawnFailure    `json:"spawn_error,omitempty"`
-	RuntimeFailure        *contract.RuntimeFailure  `json:"runtime_failure,omitempty"`
-	OutputError           string                    `json:"output_error,omitempty"`
-	ExitCode              *int                      `json:"exit_code,omitempty"`
-	Signal                string                    `json:"signal,omitempty"`
-	TerminationCause      contract.TerminationCause `json:"termination_cause,omitempty"`
-	OOM                   bool                      `json:"oom,omitempty"`
-	DiskExhausted         bool                      `json:"disk_exhausted,omitempty"`
-	LogEvidenceIncomplete bool                      `json:"log_evidence_incomplete,omitempty"`
+	StoppedProcesses      *[]contract.StoppedProcess `json:"stopped_processes,omitempty"`
+	LimitReached          contract.LimitReached      `json:"limit_reached,omitempty"`
+	SpawnError            *contract.SpawnFailure     `json:"spawn_error,omitempty"`
+	RuntimeFailure        *contract.RuntimeFailure   `json:"runtime_failure,omitempty"`
+	OutputError           string                     `json:"output_error,omitempty"`
+	ExitCode              *int                       `json:"exit_code,omitempty"`
+	Signal                string                     `json:"signal,omitempty"`
+	TerminationCause      contract.TerminationCause  `json:"termination_cause,omitempty"`
+	OOM                   bool                       `json:"oom,omitempty"`
+	DiskExhausted         bool                       `json:"disk_exhausted,omitempty"`
+	LogEvidenceIncomplete bool                       `json:"log_evidence_incomplete,omitempty"`
 }
 
 // OCIImageEvidence is the fenced image and runtime identity observed before

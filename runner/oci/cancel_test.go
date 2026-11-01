@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -53,14 +54,14 @@ func TestCancelOCIExactAttemptTermination(t *testing.T) {
 			go func() { result, err := adapter.Run(ctx, request, nil); resultCh <- result; errorCh <- err }()
 			select {
 			case <-ready:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("helper never admitted attempt")
 			}
 			cancel()
 			var result workloadrunner.Result
 			select {
 			case result = <-resultCh:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("cancellation did not join termination")
 			}
 			err := <-errorCh
@@ -118,14 +119,14 @@ func TestCancelOCIStartupPlumbing(t *testing.T) {
 			go func() { result, _ := adapter.Run(ctx, request, nil); resultCh <- result }()
 			select {
 			case <-engine.entered:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("startup edge never entered")
 			}
 			cancel()
 			var result workloadrunner.Result
 			select {
 			case result = <-resultCh:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Bound):
 				t.Fatal("startup cancel did not release agent")
 			}
 			close(engine.release)
@@ -138,7 +139,7 @@ func TestCancelOCIStartupPlumbing(t *testing.T) {
 					if authority != HelperAuthority(request.Authority) {
 						t.Fatalf("startup reaped wrong attempt=%+v", authority)
 					}
-				case <-time.After(5 * time.Second):
+				case <-time.After(testwait.Bound):
 					t.Fatal("helper did not join failed admission reap")
 				}
 			}

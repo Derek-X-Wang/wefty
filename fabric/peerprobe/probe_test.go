@@ -16,6 +16,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/peerprobe"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 type probeFabric struct {
@@ -235,7 +236,7 @@ func TestPeerProbeFirstCallerCancellationDoesNotSpoilWaiter(t *testing.T) {
 	go func() { first <- p.Check(firstCtx).Reachable }()
 	select {
 	case <-requested:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("first caller did not start its ping")
 	}
 	time.AfterFunc(10*time.Millisecond, cancel)
@@ -248,7 +249,7 @@ func TestPeerProbeFirstCallerCancellationDoesNotSpoilWaiter(t *testing.T) {
 		if reachable {
 			t.Error("cancelled first caller ignored cancellation")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("cancelled caller did not return")
 	}
 	if calls.Load() != 1 {

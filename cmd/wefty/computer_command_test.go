@@ -21,6 +21,7 @@ const computerCLITestDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const computerCLITestDigestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 func TestRemovedComputerTableThroughCommands(t *testing.T) {
+	t.Parallel()
 	for _, command := range []string{"status", "list", "remove"} {
 		t.Run(command, func(t *testing.T) {
 			defer func() {
@@ -131,6 +132,7 @@ func computerTableCells(t *testing.T, output []byte, computerID string) map[stri
 }
 
 func TestComputerCLIResolvesFriendlyNameAfterExactID(t *testing.T) {
+	t.Parallel()
 	harness, computer, _, _ := newRunningComputerCLIFixture(t, "primary-handle")
 	ctx := context.Background()
 
@@ -153,6 +155,7 @@ func TestComputerCLIResolvesFriendlyNameAfterExactID(t *testing.T) {
 }
 
 func TestComputerVerbResolvesExactIDBeforeCollidingFriendlyName(t *testing.T) {
+	t.Parallel()
 	harness, computer, _, _ := newRunningComputerCLIFixture(t, "exact-id-target")
 	ctx := context.Background()
 	collision := createComputerCLIProjection(t, ctx, harness.clients, computer.ComputerID, "exact-id-collision")
@@ -171,6 +174,7 @@ func TestComputerVerbResolvesExactIDBeforeCollidingFriendlyName(t *testing.T) {
 }
 
 func TestClientPrincipalResolvesComputerNameForReimageAndBackupList(t *testing.T) {
+	t.Parallel()
 	harness, computer, _, _ := newRunningComputerCLIFixture(t, "client-name-target")
 	ctx := context.Background()
 
@@ -189,6 +193,7 @@ func TestClientPrincipalResolvesComputerNameForReimageAndBackupList(t *testing.T
 }
 
 func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
+	t.Parallel()
 	harness := newServiceCLIHarness(t)
 	harness.clients.images = &fakeImageResolver{digest: computerCLITestDigest}
 	ctx := context.Background()
@@ -341,7 +346,7 @@ func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
 
 	removeSubject := createComputerCLIProjection(t, ctx, harness.clients, "remove-subject", "remove-subject")
 	removeBytes := runServiceCLI(t, ctx, harness.clients, true, "services", "remove", removeSubject.ComputerID,
-		"--expect-current", "--wait", "100ms", "--poll-interval", "1ms")
+		"--expect-current", "--wait", "2s", "--poll-interval", "1ms")
 	var removed computerOperatorProjection
 	if err := json.Unmarshal(removeBytes, &removed); err != nil || removed.DesiredState != contract.ServiceDesiredRemoved ||
 		removed.CurrentJob.State != contract.JobRemovedVerified || removed.RemovalOutcome != "removed_verified" ||
@@ -355,6 +360,7 @@ func TestComputerCLIRealRoutesDefaultsLifecycleAndReplay(t *testing.T) {
 }
 
 func TestComputerCLIRemoveWaitsForDefinitiveSlotReleasingOutcome(t *testing.T) {
+	t.Parallel()
 	harness, computer, node, _ := newRunningComputerCLIFixture(t, "remove-wait")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -443,6 +449,7 @@ func TestComputerCLIRemoveWaitsForDefinitiveSlotReleasingOutcome(t *testing.T) {
 }
 
 func TestComputerCLIRemoveWaitReturnsTypedCleanupQuarantine(t *testing.T) {
+	t.Parallel()
 	harness, computer, node, _ := newRunningComputerCLIFixture(t, "remove-quarantine")
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -501,6 +508,7 @@ func TestComputerCLIRemoveWaitReturnsTypedCleanupQuarantine(t *testing.T) {
 }
 
 func TestComputerRemovalTerminalWinsOverStaleQuarantineEvidence(t *testing.T) {
+	t.Parallel()
 	removedAt := time.Now().UTC()
 	computer := l1.Computer{ComputerID: "computer", CurrentJobID: "job", DesiredState: contract.ServiceDesiredRemoved,
 		RemovalOutcome: "removed_verified", CurrentJob: l1.Job{JobID: "job", State: contract.JobRemovedVerified,
@@ -515,6 +523,7 @@ func TestComputerRemovalTerminalWinsOverStaleQuarantineEvidence(t *testing.T) {
 }
 
 func TestComputerRemovalMismatchReportsPendingSlotWithoutServiceProjection(t *testing.T) {
+	t.Parallel()
 	computer := l1.Computer{ComputerID: "computer", CurrentJobID: "job", CurrentJob: l1.Job{
 		JobID: "job", State: contract.JobRemovalPending, Removal: &l1.ServiceRemoval{
 			RemovalDesiredState: contract.ServiceDesiredRemoved, RemovalGeneration: 1,
@@ -527,6 +536,7 @@ func TestComputerRemovalMismatchReportsPendingSlotWithoutServiceProjection(t *te
 }
 
 func TestComputerCLIMutationNegativeReceiptFailsEveryRow(t *testing.T) {
+	t.Parallel()
 	harness := newServiceCLIHarness(t)
 	harness.clients.images = &fakeImageResolver{digest: computerCLITestDigest}
 	ctx := context.Background()
@@ -598,6 +608,7 @@ func TestComputerCLIMutationNegativeReceiptFailsEveryRow(t *testing.T) {
 }
 
 func TestComputerCLIAbortRequiresDeadNodeAndReplays(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	harness := newServiceCLIHarnessWithOptions(t, l1.StoreOptions{Clock: l1.ClockFunc(func() time.Time { return now })})
 	harness.clients.images = &fakeImageResolver{digest: computerCLITestDigest}
@@ -651,6 +662,7 @@ func TestComputerCLIAbortRequiresDeadNodeAndReplays(t *testing.T) {
 }
 
 func TestComputerCLIRunningReconfigurationAndRemovalSupersession(t *testing.T) {
+	t.Parallel()
 	for _, verb := range []string{"reimage", "reset"} {
 		t.Run(verb, func(t *testing.T) {
 			harness, computer, _, _ := newRunningComputerCLIFixture(t, "running-"+verb)
@@ -692,6 +704,7 @@ func TestComputerCLIRunningReconfigurationAndRemovalSupersession(t *testing.T) {
 }
 
 func TestComputerCLIInsufficientDiskLatchRequiresExplicitRestart(t *testing.T) {
+	t.Parallel()
 	harness, computer, node, claim := newRunningComputerCLIFixture(t, "insufficient-restart")
 	ctx := context.Background()
 	acknowledged := make(chan error, 1)
@@ -773,6 +786,7 @@ func TestComputerCLIInsufficientDiskLatchRequiresExplicitRestart(t *testing.T) {
 }
 
 func TestComputerCLIResizePollIntervalRequiresWait(t *testing.T) {
+	t.Parallel()
 	harness, computer, _, _ := newRunningComputerCLIFixture(t, "resize-poll-without-wait")
 	err := execute(context.Background(), harness.clients, true, []string{"services", "resize", computer.ComputerID,
 		"--expect-current", "--disk-bytes", fmt.Sprint(computer.DesiredDiskBytes + (1 << 30)),
@@ -784,6 +798,7 @@ func TestComputerCLIResizePollIntervalRequiresWait(t *testing.T) {
 }
 
 func TestComputerCLIResizeWaitsForAppliedReceipt(t *testing.T) {
+	t.Parallel()
 	harness, computer, node, _ := newRunningComputerCLIFixture(t, "resize-wait-applied")
 	ctx := context.Background()
 	requested := computer.DesiredDiskBytes + (1 << 30)
@@ -828,6 +843,7 @@ func TestComputerCLIResizeWaitsForAppliedReceipt(t *testing.T) {
 }
 
 func TestComputerCLIResizeFirstPollFailureDoesNotEmitComputerDocument(t *testing.T) {
+	t.Parallel()
 	harness, computer, _, _ := newRunningComputerCLIFixture(t, "resize-first-poll-failure")
 	baseTransport := harness.clients.l1.client.Transport
 	computerReads := 0
@@ -853,6 +869,7 @@ func TestComputerCLIResizeFirstPollFailureDoesNotEmitComputerDocument(t *testing
 }
 
 func TestComputerCapacityProjectionSeparatesLastGrowFromActiveFailure(t *testing.T) {
+	t.Parallel()
 	completed := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	lastFailure, err := json.Marshal(contract.SpawnFailure{Code: contract.SpawnFailureInsufficientMemory,
 		RequestedBytes: 2 << 30, ObservedAvailableBytes: 1 << 30})
@@ -873,6 +890,7 @@ func TestComputerCapacityProjectionSeparatesLastGrowFromActiveFailure(t *testing
 }
 
 func TestComputerCLIExitCodesAreTyped(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -895,6 +913,7 @@ func TestComputerCLIExitCodesAreTyped(t *testing.T) {
 }
 
 func TestComputerCLIUsageForeignIDAndRoutePaginationErrors(t *testing.T) {
+	t.Parallel()
 	assertComputerCLIUsageForeignIDAndRoutePaginationErrors(t)
 }
 
@@ -1016,6 +1035,7 @@ func createComputerCLIProjection(t *testing.T, ctx context.Context, clients *api
 // typed non-completion result with the refusal facts, and that the Slot is not
 // reported as held. The wait must return: on main it could only time out.
 func TestStalledComputerRemovalIsAnAnswerNotATimeout(t *testing.T) {
+	t.Parallel()
 	stalledAt := time.Now().UTC()
 	computer := l1.Computer{ComputerID: "computer", CurrentJobID: "job",
 		DesiredState: contract.ServiceDesiredRemoved, RemovalOutcome: "removal_pending",
@@ -1056,6 +1076,7 @@ func TestStalledComputerRemovalIsAnAnswerNotATimeout(t *testing.T) {
 // TestStalledRemovalIsRenderedBesideTheComputerCustodyOutcome keeps a bare
 // `removal_pending` off the operator's screen for a Job that already ended.
 func TestStalledRemovalIsRenderedBesideTheComputerCustodyOutcome(t *testing.T) {
+	t.Parallel()
 	stalledAt := time.Now().UTC()
 	removal := &l1.ServiceRemoval{RemovalDesiredState: contract.ServiceDesiredRemoved,
 		RemovalGeneration: 1, RemovalRequestedAt: stalledAt.Add(-12 * time.Minute), StalledAt: &stalledAt,
@@ -1076,6 +1097,7 @@ func TestStalledRemovalIsRenderedBesideTheComputerCustodyOutcome(t *testing.T) {
 // of the Computer path. Automation reads the exit code, and exit zero here
 // would claim the service's runtime state is gone when nothing proved that.
 func TestStalledServiceRemovalDoesNotExitSuccessfully(t *testing.T) {
+	t.Parallel()
 	job := l1.Job{JobID: "job", State: contract.JobStalledCleanupUnverified,
 		Removal: &l1.ServiceRemoval{RemovalDesiredState: contract.ServiceDesiredRemoved,
 			RemovalGeneration: 1, CleanupStatus: l1.ServiceRemovalCleanupPending,
@@ -1106,6 +1128,7 @@ func TestStalledServiceRemovalDoesNotExitSuccessfully(t *testing.T) {
 // still owed says so, in the JSON projection and in the human table. The stop
 // here goes straight to the store, so no handler settles its revocation.
 func TestComputerStatusShowsOwedRevocations(t *testing.T) {
+	t.Parallel()
 	harness := newServiceCLIHarness(t)
 	ctx := context.Background()
 	owing := createComputerCLIProjection(t, ctx, harness.clients, "owing", "owing-computer")

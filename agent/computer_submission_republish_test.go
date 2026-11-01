@@ -97,8 +97,9 @@ type submissionRepublishHarness struct {
 
 // startSubmissionRepublishHarness runs one Computer attempt against a real L1
 // and waits for its first publication. gate, when set, runs before each ready
-// publication reaches L1, and observe sees each ready publication's result.
-func startSubmissionRepublishHarness(t *testing.T, name string, gate func(), observe func(error)) *submissionRepublishHarness {
+// publication reaches L1 and reports whether it held that one; observe sees
+// only the held publication's result.
+func startSubmissionRepublishHarness(t *testing.T, name string, gate func() bool, observe func(error)) *submissionRepublishHarness {
 	t.Helper()
 	network, err := plain.NewNetworkWithID("plain-" + name)
 	if err != nil {
@@ -187,7 +188,7 @@ func startSubmissionRepublishHarness(t *testing.T, name string, gate func(), obs
 		cancel()
 		select {
 		case <-h.serviceDone:
-		case <-time.After(5 * time.Second): // Existing Computer-service shutdown bound.
+		case <-time.After(testwait.Bound): // Existing Computer-service shutdown bound.
 			t.Error("Computer service did not stop")
 		}
 	})
@@ -208,15 +209,16 @@ func startSubmissionRepublishHarness(t *testing.T, name string, gate func(), obs
 			dial: func(ctx context.Context, _ string) (net.Conn, error) { return backend.dial(ctx) },
 			publish: func(publishContext context.Context, ready bool, endpoint string, submitIntentRevision int64) error {
 				request := l1.PublicationRequest{FencingToken: claim.Lease.FencingToken, Ready: &ready}
+				gated := false
 				if ready {
 					request.DisplayEndpoint = &endpoint
 					request.SubmitIntentRevision = &submitIntentRevision
-					if gate != nil {
-						gate()
-					}
+					gated = gate != nil && gate()
 				}
 				_, err := client.SetAttemptPublication(publishContext, claim.Job.JobID, claim.Lease.AttemptID, request)
-				if ready && observe != nil {
+				// #1385: only the held publication reports. An earlier answer can
+				// return after L1 already showed its screen.
+				if gated && observe != nil {
 					observe(err)
 				}
 				if err == nil {
@@ -356,23 +358,15 @@ func TestComputerStaleSubmissionReadinessCannotRestoreDisplay(t *testing.T) {
 	held := make(chan struct{})
 	release := make(chan struct{})
 	results := make(chan error, 8)
-	gate := func() {
-		if armed.CompareAndSwap(true, false) {
-			close(held)
-			<-release
+	gate := func() bool {
+		if !armed.CompareAndSwap(true, false) {
+			return false
 		}
+		close(held)
+		<-release
+		return true
 	}
 	h := startSubmissionRepublishHarness(t, "stale-submission-readiness", gate, func(err error) { results <- err })
-	drain := func() {
-		for {
-			select {
-			case <-results:
-			default:
-				return
-			}
-		}
-	}
-	drain()
 
 	h.commit("enable", true, "pass-revision-n")
 	armed.Store(true)

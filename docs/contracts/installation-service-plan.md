@@ -741,6 +741,10 @@ never boots out, reloads or kickstarts a predecessor. The macOS `launchctl(1)`
 manual specifies that a disabled override prevents loading and persists across
 boots; this API uses `disable`, not `bootout`, for live predecessors.
 
+Loading a label enables it only when launchd positively reports it disabled.
+Fresh generation labels therefore do not acquire persistent enabled overrides.
+Override entries left by older builds may remain in launchd and are harmless.
+
 `Startup` rejects a retiring entry before registration or payload execution,
 even when an old loaded definition still has its original KeepAlive policy.
 Suppression exits cleanly, so that policy does not restart a clean exit.

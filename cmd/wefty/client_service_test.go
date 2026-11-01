@@ -25,6 +25,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/fabric/participantstate"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -313,12 +314,12 @@ func TestClientServiceLogFollowAndCtrlCFromRealBinary(t *testing.T) {
 		if text != "streamed event\n" {
 			t.Fatalf("stream=%q", text)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("follow did not stream")
 	}
 	select {
 	case <-blocked:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("follow did not keep reading")
 	}
 	if err := command.Process.Signal(os.Interrupt); err != nil {
@@ -330,12 +331,12 @@ func TestClientServiceLogFollowAndCtrlCFromRealBinary(t *testing.T) {
 		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
 			t.Fatalf("interrupted follow=%v", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Ctrl-C did not stop follow")
 	}
 	select {
 	case <-cancelled:
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("caller cancellation did not close remote stream")
 	}
 }
@@ -360,7 +361,7 @@ func TestClientServiceStatusDeadlineRetainsFailedCheckVerdict(t *testing.T) {
 			if err != nil {
 				t.Error(err)
 			}
-		case <-time.After(3 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("service did not stop")
 		}
 	})

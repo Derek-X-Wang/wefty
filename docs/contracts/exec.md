@@ -18,6 +18,8 @@ and `invalid_request`; the message lists missing tags and the node's tags.
 It is an ordinary process one-shot without
 Workflow or dispatch authority. No default runtime cap is added.
 Exec runs from inside a Git checkout with at least one commit.
+Git SHA-1 and SHA-256 repositories are supported. Frozen `base_commit` and
+`snapshot_tree` identities must each be 40 or 64 lowercase hexadecimal characters.
 
 The capture includes HEAD, current tracked files (including staged and unstaged
 changes and deletions), and untracked files not excluded by Git. Git's ignore
@@ -118,19 +120,40 @@ both caps even without Content-Length. A per-capture refusal is
 Client read failures remain invalid requests. L3 write failures are retryable
 internal errors (exit 13); public error messages contain no server file path.
 Both messages name the capture size (or the observed lower bound for an
-unknown-length stream) and cap. No run is submitted on upload refusal.
+unknown-length stream) and cap. The total-cap message also names the bytes
+"held or reserved", including in-flight uploads. No run is submitted on upload refusal.
 
 The node agent fetches `GET /v1/runs/{run_id}/exec-capture` through its own
 Fabric connection with the run token it already holds. Only that exact live
 run's token can fetch its referenced hash. Client-tag access and another run's
 token are refused; there is no capture listing or client download route.
+L3 declares the stored file's byte size in `Content-Length`. A declared length
+that differs from the run's `capture_size_bytes` is a permanent size mismatch;
+the node rejects it before reading the body. Fetch retries transport errors
+before a response, HTTP 5xx responses, bodies that end before their own declared
+`Content-Length`, and non-idle body read errors on unknown-length responses.
+Waits are 1, 2, 4, 8 and 15 seconds (six attempts and 30 seconds of total
+backoff). An undersize body without a declared length that ends with clean EOF
+is permanent. Cancellation interrupts a wait. HTTP 4xx, oversize bodies, hash
+mismatches and inactivity timeouts stop immediately. Each network operation
+retains its separate 30-second inactivity budget; progressing transfers have
+no total transfer deadline.
 The node writes a private staging file in the run mailbox, verifies SHA-256
 and exact byte size, then renames it to `capture.bundle`. A mismatch,
 truncation, or fetch error fails preparation with a capture diagnostic and
 never starts the command. The wrapper clones the verified mailbox bundle into
-node-local exec storage. The node agent removes the mailbox bundle when the
-attempt ends, including when the wrapper is killed. Local working changes
-remain unstaged/untracked and HEAD remains the caller's base commit, as below.
+node-local exec storage. Before removing stale input at seed time, the agent
+sweeps the whole leftover `wefty-exec-work`, including its private `tmp`.
+These diagnostics are labelled `stale exec cleanup`; their stopped processes
+do not belong to the new Attempt's evidence.
+The node agent removes the mailbox bundle when the
+attempt ends, including when the wrapper is killed. Through its retained opened
+mailbox root, the agent renames leftover checkout storage to a unique trash
+entry in that root. A background goroutine removes only that trash entry and
+then closes the retained root. Replacing the mailbox pathname cannot redirect
+cleanup outside the run. Recursive deletion does not delay the completion
+report to L1. Local working changes remain unstaged/untracked and HEAD remains
+the caller's base commit, as below.
 
 Every reconciliation pass retires captures whose referencing runs have all
 ended. Unreferenced uploads expire after one hour. Startup removes interrupted
@@ -184,6 +207,82 @@ The command's `TMPDIR` is a private, initially empty folder inside the run
 storage, reached through a short `/tmp/wefty-run.*` link. Wefty deletes it with
 the storage, also after cancel. Tool caches kept in `TMPDIR` start cold in each
 run. A hard kill followed by a later sweep can leave only a dangling link.
+
+For `kind=capture`, `retire_exec_storage` scans before it renames storage.
+Already-retired trash skips this scan and keeps its asynchronous deletion.
+The scan selects same-user processes whose physical working folder is that
+storage or a folder beneath it. The separator boundary excludes sibling paths with the same prefix.
+This covers `work`, private `tmp` (including its `/tmp/wefty-run.*` alias), and
+other folders beneath the capture. Version 2 uses
+`$WEFTY_RUN_DIR/wefty-exec-work`; restartable captures keep that path beneath
+their Attempt-specific mailbox. The retiring shell, its parent, and processes
+named `wefty-agent` are excluded.
+Storage paths containing a backslash, a caret (`^`), or a control character
+skip scanning with a warning. Cwd records containing a backslash, a caret, a
+tab, or a newline never match, because macOS `lsof` encodes path bytes as
+backslash escapes or caret text (`^A` for byte 0x01).
+
+Discovery uses a non-cgo inventory: UID-filtered `lsof` cwd records on macOS,
+or one GNU `find` call over UID-owned `/proc/*/cwd` links on Linux. Linux reads
+`/proc/<pid>/comm` only for matching folders. Inventory stays in a pipe and
+shell memory, without a scratch directory or a foreground removal.
+The first inventory has a one-second deadline. At most the first 64 matching
+processes receive SIGTERM; further matches emit one cap warning. This bounds
+the confirmation lookups and result escaping to 64 processes. After 200 ms
+of TERM grace, a second inventory, bounded to 600 ms, confirms the same pid
+and command name still have a working folder in storage before SIGKILL. Both
+passes exclude the retiring shell, its parent, and `wefty-agent`. A pid absent
+from the second inventory counts as stopped only if `kill -0` confirms it is
+gone. An absent pid that is still alive receives no SIGKILL, is not reported
+stopped, and emits the stop warning. Failed confirmation sends no SIGKILL,
+emits one warning, and reports only pids confirmed gone by `kill -0`.
+A 100 ms release wait follows. These bounded stages total at most 1.9 seconds,
+excluding inventory processing, command and scheduling overhead. They leave
+100 ms within the CLI's two-second foreground sweep budget and 3.1 seconds
+within the agent's default five-second TERM grace. A shorter configured runner
+grace can interrupt the wrapper trap.
+A pid and a command name are not a stable process identity, and macOS has no
+pidfd. Neither the name nor the cwd check is atomic with the signal. An
+unrelated same-user process that reuses a selected pid after the inventory
+that selected it can receive SIGTERM or SIGKILL, whatever its name or working
+folder. The second inventory narrows this window before SIGKILL; it does not
+close it. Discovery or signalling failure never fails storage retirement.
+The agent re-verifies the retained folder's device and inode inside Bash after
+entering it. A same-user workload process that renames storage during the sweep
+can still redirect it, but can already signal those processes itself, so this
+grants no new power.
+
+Each stopped process emits one run-stderr line:
+`wefty: stopped process <pid> (<name>) left in run storage`.
+The wrapper also adds optional `stopped_processes` records (`pid`, command
+`name` without arguments, and physical `cwd`) to its `result.json`, before
+storage rename starts. An empty list leaves `result.json` unchanged, including
+its absence on cancellation. The node carries this list into the Attempt's
+`ProcessResult`; the runtime still determines the exit verdict. CLI stale-storage
+retirement emits the same diagnostics but has no live Attempt result to amend.
+For version 2, the node agent also runs the shared Bash sweep after successful
+runtime reap and receipt validation, before mailbox finalization and log
+closure. This covers a wrapper force-killed before its cleanup runs. The agent
+sweeps only `wefty-exec-work`; deferred capture cleanup still owns retirement
+and asynchronous deletion. Bash runs as the agent's direct child, so its parent
+exclusion protects the agent even if its executable has another name.
+The agent derives the physical mailbox path from its open directory handle,
+using `F_GETPATH` on macOS and `/proc/self/fd` on Linux. It checks that the
+resolved path and the held directory have the same file identity, then Bash
+enters that path and checks its device and inode against the retained handle
+before scanning. A mismatch or failed shell check warns and returns empty evidence.
+A moved mailbox is scanned
+at its physical location; a replacement at the old pathname is not scanned.
+If physical resolution fails, the sweep warns and skips. The shared script's
+inventory deadlines stay unchanged. A five-second outer deadline covers the
+filesystem probes and Bash together, with a bounded pipe wait. Probes run in a
+goroutine so a stalled filesystem cannot block sweep finalization indefinitely;
+the goroutine can stay blocked, but closes any handle it returns after timeout.
+Sweep diagnostics use the run's stderr while open, otherwise the agent log.
+The agent retains its stopped list separately until wrapper evidence has been
+read, then appends it to the Attempt's `StoppedProcesses`. Neither source of
+cleanup evidence changes the runtime verdict or adds a wire field. This sweep
+does not expand process-group quiescence proof after an agent crash.
 
 If the capture or its bare snapshot is gone, the wrapper instead prints
 ``wefty: the exec snapshot was deleted when the run ended; run `wefty exec` again``
@@ -409,7 +508,8 @@ result. Restartable execution is at-least-once. A restartable command that ends
 while wefty is stopping its Attempt may run once more; the latest Attempt's
 result is the Run's verdict.
 Results belong to the latest Attempt. A restart preserves the Run and Job IDs;
-the Run stays `running` through recovery. `--max-runtime` bounds each Attempt.
+the Run stays `running` through recovery once L1 has recorded an Attempt's start,
+even if L3 missed its running window. `--max-runtime` bounds each Attempt.
 
 Use `--restartable` only for commands that are safe to repeat and harmless
 if two copies briefly overlap, for example read-only watchers. After a
@@ -480,11 +580,23 @@ The CLI performs local writes itself, within its own sandbox; no helper writes
 to the Mac on its behalf. File contents stream without a total byte limit.
 A copy with no input or output stream progress for 60 seconds fails with
 `seat_copy_failed` and a `Seat copy stalled` diagnostic; progress refreshes
-that bound, so a progressing copy has no total runtime limit.
+that bound, so a progressing copy has no total runtime limit. Inside the Seat,
+copy-in and sync fsync each file at least every 64 MiB while they write it.
+This lowers the risk that one long fsync of a large file stops input progress
+past the bound; it does not remove it, because a single fsync can still wait
+on a slow or busy disk.
 Disk-full and transport failures return `seat_copy_failed`; local permission,
 read-only filesystem and final-name symlink refusals return
 `seat_copy_write_denied`. Both use exit 1. An existing-folder failure says
 that DEST names the exact result path. Seat-to-Seat copies are refused.
+
+Helper `seat_operation_refused` errors with detail `seat_not_ready` or
+`generation_mismatch` return `seat_ended` if L1 reports that the Seat ended
+through copy lease renewal or the final receipt write. Otherwise they return
+`conflict` with `retryable=true`. The message keeps the helper detail and says
+the Seat is not ready or changed. Both codes use exit 5. The AI agent should
+wait and retry on `conflict`. The CLI does not retry the copy itself. Other
+copy failures and copy receipt outcomes and reasons keep their existing values.
 
 `Agent.Run` owns one shared Seat front-door listener on the node's logical
 Fabric service address (the enrolled participant name supplied by the Fabric,
@@ -494,8 +606,16 @@ generations cannot collide. The plain Fabric maps that name to an ephemeral
 loopback endpoint. Clients dial the endpoint published by L1's copy-target
 route, not the private logical registration name. The participant name need
 not equal the registered Wefty node ID. A listener startup failure is logged
-and leaves the Seat door unavailable: Seat-request Computers refuse readiness,
-while node registration and non-Seat work continue.
+once, then the node agent retries in the background until the door opens or
+`Agent.Run` ends. Retry backoff starts at 1 second, doubles, and is capped at
+30 seconds. While the door is closed, Seat-request Computer Attempts fail
+before runtime start with typed `runtime_unavailable`; L1 applies infrastructure
+backoff and preserves the restart streak. Attempts read the current door, so
+recovery needs no node agent restart. Recovery is logged once. Node registration
+and non-Seat work continue. The configured Seat capability stays advertised.
+Retries are canceled and joined when `Agent.Run` ends, including cleanup of a
+listener that opens during shutdown. A recovered door's server exit still ends
+`Agent.Run`, with its error included in the returned error.
 Each Computer Attempt registers a feature mux and binds only Seat IDs from its
 fenced L1 wanted list. Copies, Seat Runs and per-Seat screens share this same
 listener; unknown paths and unbound Seats are refused. The generated

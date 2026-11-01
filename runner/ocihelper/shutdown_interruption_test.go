@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // errChildTerminated is what the reap saw in the Linux realtiming lane (#579):
@@ -100,7 +102,7 @@ func (served *servedHelper) serveResult(t *testing.T) error {
 	select {
 	case err := <-served.done:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Serve did not return")
 		return nil
 	}
@@ -121,7 +123,7 @@ func waitClosed(t *testing.T, channel <-chan struct{}, description string) {
 	t.Helper()
 	select {
 	case <-channel:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatalf("%s never happened", description)
 	}
 }

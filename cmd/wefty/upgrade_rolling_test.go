@@ -25,6 +25,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/agentinstall"
 	"github.com/Derek-X-Wang/wefty/internal/connprofile"
 	"github.com/Derek-X-Wang/wefty/internal/launchagent"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/internal/upgradecompat"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocicontrol"
@@ -304,9 +305,11 @@ func (f *rollingFixture) holdReady(t *testing.T, g agentinstall.Generation, boot
 	lifetime, err := f.install.StartupWithLifetime(g.ID, c.NodeID, g.Executable, rollingTestBoot)
 	mustRolling(t, err)
 	f.lifetimes[g.ID] = lifetime
+	// #1310: Bind to publication start; a later age window can reject slow writes.
+	started := time.Now()
 	mustRolling(t, f.install.PublishReady(g.ID, c.NodeID, g.Version, g.Executable, boot, rollingTestBoot))
 	if g.Role == "primary" {
-		_, err = f.install.BindReady(t.Context(), g.ID, agentinstall.Binding{PID: os.Getpid(), BootSessionID: boot, SystemBootID: rollingTestBoot}, time.Now().Add(-time.Second))
+		_, err = f.install.BindReady(t.Context(), g.ID, agentinstall.Binding{PID: os.Getpid(), BootSessionID: boot, SystemBootID: rollingTestBoot}, started)
 		mustRolling(t, err)
 	}
 }
@@ -490,26 +493,35 @@ func TestUpgradeRollingLegacyDrainEnrollsFirstPrimary(t *testing.T) {
 }
 
 func TestUpgradeRollingProofKeepsDisappearedAttempts(t *testing.T) {
-	for _, state := range []string{"renewed", "terminal", "missing", "lost", "interrupted", "heartbeat-only"} {
+	for _, state := range []string{"renewed", "terminal", "missing", "lost", "interrupted", "heartbeat-only", "expired-renewal"} {
 		t.Run(state, func(t *testing.T) {
 			after := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 			now := after.Add(time.Second)
-			a := l1.Attempt{AttemptID: "original", State: contract.AttemptRunning, UpdatedAt: after, LeaseExpiresAt: after.Add(l1.DefaultLeaseDuration)}
+			a := l1.Attempt{AttemptID: "original", State: contract.AttemptRunning, UpdatedAt: after, LeaseExpiresAt: after.Add(l1.DefaultLeaseDuration), LeaseLive: true}
 			switch state {
 			case "renewed":
 				a.UpdatedAt = now
 				a.LeaseExpiresAt = now.Add(l1.DefaultLeaseDuration)
+				a.LeaseLive = true
 			case "terminal":
 				exit := 0
 				a.State = contract.AttemptSucceeded
 				a.Result = &l1.ProcessResult{ExitCode: &exit}
 			case "lost":
 				a.State = contract.AttemptLost
+				a.LeaseLive = false
 			case "interrupted":
 				a.State = contract.AttemptInterrupted
+				a.LeaseLive = false
+			case "expired-renewal":
+				a.LeaseLive = false
 			}
 			r := rollingUpgrade{receipt: upgradeRollingReceipt{Candidate: agentinstall.Generation{Version: "next", CandidateBootSessionID: "next-boot"}, Preserved: []l1.NodeActiveAttempt{{JobID: "job", AttemptID: "original", Kind: contract.JobKindProcess, Class: contract.JobClassOneShot}}}, op: upgradeHost{now: func() time.Time { return now }, wait: func(context.Context, time.Duration) error { now = now.Add(time.Second); return nil }, readJob: func(context.Context, connprofile.Profile, string) (l1.Job, error) {
-				attempts := []l1.Attempt{a}
+				current := a
+				if state == "renewed" || state == "expired-renewal" {
+					current.LeaseExpiresAt = now.Add(l1.DefaultLeaseDuration)
+				}
+				attempts := []l1.Attempt{current}
 				if state == "missing" {
 					attempts = nil
 				}
@@ -659,7 +671,7 @@ func TestUpgradeRollingGenerationOperationsUseInstalledAgent(t *testing.T) {
 	go func() { in, err := op.promoteGeneration(t.Context(), p, request); reply <- promotionReply{in, err} }()
 	select {
 	case <-promotionCommitted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("agent did not commit promotion")
 	}
 	retired := make(chan error, 1)
@@ -677,14 +689,14 @@ func TestUpgradeRollingGenerationOperationsUseInstalledAgent(t *testing.T) {
 	case result := <-reply:
 		mustRolling(t, result.err)
 		promoted = result.inventory
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("missing durable promotion reply")
 	}
 	if !retiredEarly {
 		select {
 		case err := <-retired:
 			mustRolling(t, err)
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("retirement did not join promotion reply")
 		}
 	}
@@ -860,7 +872,12 @@ func exposeRollingL1WithPromotionReply(t *testing.T, f *rollingFixture, beforeRe
 	participant := network.NewFabric(fabric.Identity{NodeID: node.NodeID, Tags: []string{l1.DefaultAgentPrincipalTag, contract.StableNodeTagPrefix + node.NodeID}})
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	mustRolling(t, err)
-	runtime, err := agent.New(agent.Config{Fabric: participant, ControlPlaneAddress: p.L1Address, NodeID: node.NodeID, AgentGenerationID: primary.ID, BootSessionID: primary.Process.BootSessionID, Version: node.AgentVersion, OS: "darwin", Architecture: "arm64", RetirementAcknowledged: f.install.PublishRetirement, Capabilities: node.Capabilities, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), PrimaryGeneration: func(write func() error) error { return f.install.WithPrimary(primary.ID, write) }})
+	// The rolling tests' agent spool keeps the production durability pragmas
+	// (#1035).
+	var runtime *agent.Agent
+	withProductionSQLiteSync(func() {
+		runtime, err = agent.New(agent.Config{Fabric: participant, ControlPlaneAddress: p.L1Address, NodeID: node.NodeID, AgentGenerationID: primary.ID, BootSessionID: primary.Process.BootSessionID, Version: node.AgentVersion, OS: "darwin", Architecture: "arm64", RetirementAcknowledged: f.install.PublishRetirement, Capabilities: node.Capabilities, ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), PrimaryGeneration: func(write func() error) error { return f.install.WithPrimary(primary.ID, write) }})
+	})
 	mustRolling(t, err)
 	// Model the control-only agent's own capability publication before serving
 	// requests. All managed state is disposable; no payload loop runs here.

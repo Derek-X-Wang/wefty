@@ -42,6 +42,12 @@ func (f *fakeManager) run(_ context.Context, _ string, args ...string) ([]byte, 
 			state = "running"
 		}
 		return fmt.Appendf(nil, "state = %s\npid = %d\n", state, s.PID), nil
+	case "print-disabled":
+		payload := []byte("disabled services = {\n")
+		for label, disabled := range f.disabled {
+			payload = fmt.Appendf(payload, "\t%q => %t\n", label, disabled)
+		}
+		return append(payload, "}\n"...), nil
 	case "enable":
 		delete(f.disabled, label)
 	case "disable":

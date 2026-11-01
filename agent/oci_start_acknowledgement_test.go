@@ -17,6 +17,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 )
@@ -170,7 +171,7 @@ func startOCIStartAgent(t *testing.T, network *plain.Network, nodeID string, run
 			if err != nil {
 				t.Errorf("agent shutdown: %v", err)
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("agent did not shut down")
 		}
 		nodeAgent.Close()
@@ -219,10 +220,10 @@ func TestOCIStartedSurvivesLostAcknowledgement(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("first Started = HTTP %d, want a committed start", code)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Started never reached L1")
 	}
-	if err := runtime.waitStart(t, 10*time.Second); err != nil {
+	if err := runtime.waitStart(t, testwait.Bound); err != nil {
 		t.Fatalf("a lost answer to a committed Started failed the start: %v", err)
 	}
 	if calls := startCalls.Load(); calls < 2 {
@@ -286,10 +287,10 @@ func TestOCISpawnErrorAfterStartedIsNotRetriedForever(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("first Started = HTTP %d, want a committed start", code)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Started never reached L1")
 	}
-	if err := runtime.waitStart(t, 10*time.Second); err == nil {
+	if err := runtime.waitStart(t, testwait.Bound); err == nil {
 		t.Fatal("Started with every answer lost reported success")
 	}
 	select {
@@ -297,7 +298,7 @@ func TestOCISpawnErrorAfterStartedIsNotRetriedForever(t *testing.T) {
 		if code != http.StatusConflict {
 			t.Fatalf("spawn_error completion after Started = HTTP %d, want 409", code)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("the spawn_error completion never reached L1")
 	}
 	running, err := store.GetJob(t.Context(), job.JobID)

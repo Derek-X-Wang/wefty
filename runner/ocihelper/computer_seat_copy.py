@@ -2,7 +2,6 @@
 import json
 import os
 import select
-import shutil
 import stat
 import sys
 import tarfile
@@ -10,7 +9,8 @@ import signal
 # Python runs this handler only between bytecodes in the main thread. A
 # SIGTERM caught just before a blocking read, or by another thread, would
 # leave that read waiting with the staging folder in place (#1283). The
-# wakeup pipe makes such a signal visible to the input select below.
+# wakeup pipe makes such a signal visible to the input select below, and
+# to the output select when packing into a full pipe (#1287).
 WAKE, wake_write = os.pipe()
 os.set_blocking(WAKE, False)
 os.set_blocking(wake_write, False)
@@ -18,6 +18,11 @@ signal.set_wakeup_fd(wake_write)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 
 COMMIT = b'\nWEFTY_COPY_COMMIT_V1\n'
+# A file is synced at least every SYNC_BYTES while it is written. One fsync
+# of a multi-GB file on a slow disk could block reading for longer than the
+# helper's 60-second stall limit; bounded syncs make that much less likely
+# (#1261).
+SYNC_BYTES = 64 << 20
 
 
 class Input:
@@ -45,6 +50,28 @@ class Input:
         data = self.data[self.offset:self.offset + size]
         self.offset += len(data)
         return data
+
+
+class Output:
+    # Writes stdout without trapping a pending signal in a full pipe (#1287).
+    def __init__(self, fd):
+        self.fd = fd
+        os.set_blocking(fd, False)
+
+    def write(self, data):
+        size = len(data)
+        data = memoryview(data)
+        while data:
+            ready = select.select([WAKE], [self.fd], [])[0]
+            if WAKE in ready:
+                # Keep the wake byte: tarfile can write again while unwinding.
+                sys.exit(1)
+            try:
+                written = os.write(self.fd, data)
+            except BlockingIOError:
+                continue
+            data = data[written:]
+        return size
 
 
 def remove_tree(name, parent):
@@ -103,7 +130,17 @@ def extract(destination):
                             out = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                           member.mode & 0o777, dir_fd=current)
                             with os.fdopen(out, 'wb') as target, archive.extractfile(member) as source:
-                                shutil.copyfileobj(source, target, length=32768)
+                                unsynced = 0
+                                while True:
+                                    data = source.read(32768)
+                                    if not data:
+                                        break
+                                    target.write(data)
+                                    unsynced += len(data)
+                                    if unsynced >= SYNC_BYTES:
+                                        target.flush()
+                                        os.fsync(target.fileno())
+                                        unsynced = 0
                                 target.flush()
                                 os.fsync(target.fileno())
                             size += member.size
@@ -151,7 +188,7 @@ def pack(source):
         info.uname = info.gname = ''
         size += info.size if info.isfile() else 0
         return info
-    with tarfile.open(fileobj=sys.stdout.buffer, mode='w|', dereference=True, format=tarfile.PAX_FORMAT) as archive:
+    with tarfile.open(fileobj=Output(sys.stdout.fileno()), mode='w|', dereference=True, format=tarfile.PAX_FORMAT) as archive:
         stack = [(source, 'item')]
         while stack:
             source_path, archive_path = stack.pop()

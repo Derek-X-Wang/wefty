@@ -235,8 +235,8 @@ jobs:
           test "$(jq -r .commit "$RUNNER_TEMP/wayland-computer-image-release/wayland-computer-image-receipt.json")" = "$EXPECTED_SHA"
           candidate_sha="$(git rev-parse HEAD)"
           test "$candidate_sha" = "$EXPECTED_SHA"
-          printf 'CANDIDATE_SHA=%s\nPUBLISHED_SHA=%s\nWEFTY_REALTIME_EVIDENCE_SOURCE=published-artifact\n' \
-            "$candidate_sha" "$EXPECTED_SHA" >> "$GITHUB_ENV"
+          printf 'CANDIDATE_SHA=%s\nPUBLISHED_SHA=%s\nWEFTY_REALTIME_EVIDENCE_SOURCE=published-artifact\nARTIFACT_RUN_ID=%s\n' \
+            "$candidate_sha" "$EXPECTED_SHA" "${{ needs.resolve-published-artifact.outputs.run-id }}" >> "$GITHUB_ENV"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
@@ -517,7 +517,12 @@ jobs:
           if [ -f /tmp/wefty-oci-provision.txt ]; then
             cp /tmp/wefty-oci-provision.txt "$WEFTY_REALTIME_EVIDENCE_DIR/"
           fi
-          printf 'commit=%s\nrunner=%s\n' "$CANDIDATE_SHA" "$RUNNER_NAME" > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
+          printf 'commit=%s\nrunner=%s\nsource=%s\nartifact_run_id=%s\n' \
+            "$CANDIDATE_SHA" "$RUNNER_NAME" "$WEFTY_REALTIME_EVIDENCE_SOURCE" "$ARTIFACT_RUN_ID" \
+            > "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
+          jq -n --arg commit "$CANDIDATE_SHA" --arg source "$WEFTY_REALTIME_EVIDENCE_SOURCE" --arg artifact_run_id "$ARTIFACT_RUN_ID" \
+            '{version:1,commit:$commit,source:$source,artifact_run_id:$artifact_run_id}' \
+            > "$WEFTY_REALTIME_EVIDENCE_DIR/provenance-receipt.json"
           go version >> "$WEFTY_REALTIME_EVIDENCE_DIR/workflow.txt"
           go test -count=1 -p 1 -timeout=75m -v -tags=service_acceptance_realtiming ./...
           if [ "$RUNNER_OS" = Linux ]; then
@@ -690,6 +695,12 @@ jobs:
             "$RUNNER_TEMP/fabric-identity-receipt.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
             "$TRUST_DOMAIN" "$MACHINE_RESULT" "$PERSON_RESULT" "$MACHINE_ARMED" "$PERSON_ARMED"
+          jq -e --arg commit "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
+            '.commit == $commit and .source == "published-artifact"' \
+            "$RUNNER_TEMP/linux-computer-receipt-xfce/provenance-receipt.json"
+          jq -e --arg commit "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" \
+            '.commit == $commit and .source == "published-artifact"' \
+            "$RUNNER_TEMP/linux-computer-receipt-wayland/provenance-receipt.json"
           scripts/check-linux-computer-receipt.sh \
             "$RUNNER_TEMP/linux-computer-receipt-xfce/linux-computer-matrix.json" \
             "${{ needs.resolve-published-artifact.outputs.candidate-sha }}" xfce \

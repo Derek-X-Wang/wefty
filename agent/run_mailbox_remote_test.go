@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -239,7 +240,7 @@ func TestRemoteRunMailboxFenceCancelsAnInFlightCall(t *testing.T) {
 		if drained {
 			t.Fatal("a fenced sweep reported the mailbox drained")
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("fencing did not cancel the in-flight runtime call")
 	}
 	if documents := appender.snapshot(); len(documents) != 0 {

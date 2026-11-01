@@ -21,6 +21,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/internal/takeover"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	"github.com/coder/websocket"
@@ -307,9 +308,9 @@ func TestComputerFrontDoorAlwaysAdmitsThroughViewAndDrainsRevocation(t *testing.
 	}
 	// Revocation has no intentional lease/grace delay: relay.Close force-closes
 	// sockets before releasing this barrier, and audit finalization follows it
-	// (docs/contracts/agent-local-lifecycle.md). All of the existing 5s bound
-	// is OS/goroutine-delivery margin; startup and audit timers do not apply.
-	const revocationSocketDeliveryMargin = 5 * time.Second
+	// (docs/contracts/agent-local-lifecycle.md). The shared wait bound is
+	// OS/goroutine-delivery margin; startup and audit timers do not apply.
+	const revocationSocketDeliveryMargin = testwait.Bound
 	t.Logf("phase=revocation relay drain delivery-margin=%s", revocationSocketDeliveryMargin)
 	select {
 	case <-receipt.SessionsClosed:

@@ -22,6 +22,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 	"github.com/Derek-X-Wang/wefty/l3"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
 	ocirunner "github.com/Derek-X-Wang/wefty/runner/oci"
@@ -841,7 +842,7 @@ func TestHostBridgeMarkerPreservesPausedRequestPolicyRemintResponse(t *testing.T
 	for pump := 0; pump < bridgeConcurrency; pump++ {
 		select {
 		case <-engine.bridgeEntered:
-		case <-time.After(time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatalf("host-bridge pump %d/%d did not reach helper readiness", pump+1, bridgeConcurrency)
 		}
 	}
@@ -865,7 +866,7 @@ func TestHostBridgeMarkerPreservesPausedRequestPolicyRemintResponse(t *testing.T
 	}
 	select {
 	case <-admitted:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("marker-backed paused request did not reach upstream admission")
 	}
 	reader := bufio.NewReader(guest)
@@ -881,7 +882,7 @@ func TestHostBridgeMarkerPreservesPausedRequestPolicyRemintResponse(t *testing.T
 	go func() { closeDone <- bridge.closeWithCause(errComputerSubmissionPolicyReminted) }()
 	select {
 	case <-canceled:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("policy remint did not cancel the marker-backed request")
 	}
 	if _, err := io.WriteString(guest, "x"); err != nil {
@@ -911,7 +912,7 @@ func TestHostBridgeMarkerPreservesPausedRequestPolicyRemintResponse(t *testing.T
 	}
 	select {
 	case <-bodyRead:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("marker-backed upstream body reader did not drain")
 	}
 	cancelRun()
@@ -920,7 +921,7 @@ func TestHostBridgeMarkerPreservesPausedRequestPolicyRemintResponse(t *testing.T
 		if err != nil {
 			t.Fatalf("one-shot marker-backed host-bridge termination = %v, want confirmed completion", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("adapter did not finish after marker-backed request cancellation")
 	}
 }

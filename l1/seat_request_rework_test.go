@@ -10,6 +10,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func TestSeatRequestUnpolledAlwaysEnds(t *testing.T) {
@@ -317,7 +318,7 @@ func TestSeatCallSelectionDoesNotBlockAnotherNode(t *testing.T) {
 		if errorCode(err) != contract.ErrorNotFound {
 			t.Fatalf("other node: %v", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("one node selection blocked an independent node")
 	}
 }

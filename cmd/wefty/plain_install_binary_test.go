@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,9 +31,24 @@ func buildPlainInstallCLI(t *testing.T) string {
 	return buildPlainInstallCLIForPlatform(t, "darwin")
 }
 
+// The overlay is identical for every fixture on a simulated platform. Keep it
+// until TestMain cleanup, like buildWefty, instead of linking it for each test.
+var plainInstallBuilds struct {
+	sync.Mutex
+	binaries map[string]string
+}
+
 func buildPlainInstallCLIForPlatform(t *testing.T, goos string) string {
 	t.Helper()
-	dir := t.TempDir()
+	plainInstallBuilds.Lock()
+	defer plainInstallBuilds.Unlock()
+	if binary := plainInstallBuilds.binaries[goos]; binary != "" {
+		return binary
+	}
+	dir, err := os.MkdirTemp(packageTestDirectory, "plain-install-"+goos+"-")
+	if err != nil {
+		t.Fatal(err)
+	}
 	source, err := os.ReadFile("setup_command.go")
 	if err != nil {
 		t.Fatal(err)
@@ -65,10 +81,16 @@ func buildPlainInstallCLIForPlatform(t *testing.T, goos string) string {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(dir, "wefty")
-	// This child inherits the outer golock, caches and compiler limits.
-	if output, err := exec.Command("go", "build", "-overlay", overlayPath, "-o", binary, ".").CombinedOutput(); err != nil {
+	// Preserve the outer compiler limits without inheriting a test's environment.
+	build := exec.Command("go", "build", "-overlay", overlayPath, "-o", binary, ".")
+	build.Env = packageTestEnvironment
+	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build injected CLI: %v\n%s", err, output)
 	}
+	if plainInstallBuilds.binaries == nil {
+		plainInstallBuilds.binaries = make(map[string]string)
+	}
+	plainInstallBuilds.binaries[goos] = binary
 	return binary
 }
 
@@ -367,6 +389,7 @@ func TestPlainDoctorRealBinary(t *testing.T) {
 	}})
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			f := newPlainBinaryFixture(t, binary)
 			nodeID := "test-mac"
 			if test.name == "existing mixed-case node" {

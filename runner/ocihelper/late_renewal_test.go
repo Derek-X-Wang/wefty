@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // Capture a renewal before expiry, then delay the frame until the helper has
@@ -309,7 +310,7 @@ func TestLateRenewalDuringDeleteReapKeepsNeighbour(t *testing.T) {
 	}()
 	select {
 	case <-engine.entered:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Delete did not enter ReapAttempt")
 	}
 	active.mu.Lock()
@@ -351,7 +352,7 @@ func TestLateRenewalDuringDeleteReapKeepsNeighbour(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("Delete did not finish")
 	}
 }

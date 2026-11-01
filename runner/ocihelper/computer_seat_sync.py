@@ -21,6 +21,10 @@ signal.set_wakeup_fd(wake_write)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 COMMIT = b'\nWEFTY_COPY_COMMIT_V1\n'
+# A file is synced at least every SYNC_BYTES while it is written, so one long
+# fsync is much less likely to stop reading past the helper's 60-second stall
+# limit (#1261).
+SYNC_BYTES = 64 << 20
 active_path = 'work'
 
 
@@ -165,6 +169,7 @@ def extract(stage):
                 out = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=stage)
                 result = hashlib.sha256()
                 with os.fdopen(out, 'wb') as target, archive.extractfile(member) as source:
+                    unsynced = 0
                     while True:
                         data = source.read(32768)
                         if not data:
@@ -172,6 +177,11 @@ def extract(stage):
                         target.write(data)
                         result.update(data)
                         size += len(data)
+                        unsynced += len(data)
+                        if unsynced >= SYNC_BYTES:
+                            target.flush()
+                            os.fsync(target.fileno())
+                            unsynced = 0
                     target.flush()
                     os.fsync(target.fileno())
                 record.update(kind='file', hash=result.hexdigest())
@@ -342,9 +352,10 @@ def remove_stale_directory(parent_fd, name):
 def clear_stale_stages(state):
     global active_path
     # The lock excludes a live sync. Never follow a link, including one at
-    # the stage's root; these reserved names can only hold abandoned staging.
+    # the stage's root; these reserved names can only hold abandoned staging,
+    # or an atomic_json temporary a SIGKILL left before its rename (#1290).
     for name in os.listdir(state):
-        if not name.startswith('sync-'):
+        if not name.startswith(('sync-', '.sync-')):
             continue
         active_path = '.wefty/' + name
         info = metadata(state, name)

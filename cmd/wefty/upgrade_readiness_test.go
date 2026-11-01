@@ -77,7 +77,9 @@ func TestRollingControlRenewalStartupClassification(t *testing.T) {
 			}}
 			_, err := r.waitControlRenewal(t.Context(), baseline, start, start)
 			if tc.retry {
-				if err != nil || calls != 2 || waits != 1 {
+				// The first reachable L1 read anchors heartbeat evidence; the
+				// next one must advance it, independently of the CLI clock.
+				if err != nil || calls != 3 || waits != 2 {
 					t.Fatalf("startup gap not retried: calls=%d waits=%d err=%v", calls, waits, err)
 				}
 			} else if !errors.Is(err, failure) || calls != 1 || waits != 0 {
@@ -138,13 +140,13 @@ func TestRollingControlRenewalStartupDeadlineAndAttemptProof(t *testing.T) {
 					if mode == "stale_lease" {
 						expiry = baseline.ActiveAttempts[0].LeaseExpiresAt
 					}
-					return l1.Job{Attempts: []l1.Attempt{{AttemptID: id, State: contract.AttemptRunning, UpdatedAt: now, LeaseExpiresAt: expiry}}}, nil
+					return l1.Job{Attempts: []l1.Attempt{{AttemptID: id, State: contract.AttemptRunning, UpdatedAt: now, LeaseExpiresAt: expiry, LeaseLive: true}}}, nil
 				},
 			}}
 			elapsed, err := r.waitControlRenewal(ctx, baseline, start, start)
 			switch mode {
 			case "job_starting":
-				if err != nil || reads != 2 || waits != 1 {
+				if err != nil || reads != 3 || waits != 2 {
 					t.Fatalf("job transport not retried: reads=%d waits=%d err=%v", reads, waits, err)
 				}
 			case "job_refusal":

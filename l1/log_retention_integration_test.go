@@ -99,7 +99,7 @@ func assertServiceLogByteRetentionAndDerivedJSONL(t *testing.T) {
 	}
 	appendRetentionLogs(t, h, agent, oneshotPath, oneshotClaim.Lease.FencingToken, oneshotEvents)
 	assertRetainedRawBytes(t, h, oneshot.JobID, 18)
-	oneshotPage := walkStoreJobLogs(t, h, oneshot.JobID)
+	oneshotPage := walkStoreJobLogs(t, h.store, oneshot.JobID)
 	if len(oneshotPage.Events) != 3 || oneshotPage.Truncation != nil {
 		t.Fatalf("one-shot retention changed = %#v", oneshotPage)
 	}

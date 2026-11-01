@@ -1061,13 +1061,28 @@ func observeUpgradeJob(ctx context.Context, profile connprofile.Profile, jobID s
 
 func waitUpgradeRenewal(ctx context.Context, operations upgradeHost, profile connprofile.Profile, baseline l1.Node, started, restarted time.Time) (time.Duration, error) {
 	var lastErr error
+	// Anchor renewal evidence after the restarts using L1 values. The CLI
+	// clock measures only the wait budget, never the age of an L1 timestamp.
+	var firstHeartbeat *time.Time
+	firstExpiry := map[string]time.Time{}
 	for operations.now().Sub(started) < upgradeRenewalWindow && ctx.Err() == nil {
 		node, err := operations.observe(ctx, profile)
-		if err == nil && node.BootSessionID == baseline.BootSessionID && node.AuthorityGeneration == baseline.AuthorityGeneration && node.LastHeartbeatAt.After(restarted) {
+		if err == nil {
+			if firstHeartbeat == nil {
+				at := node.LastHeartbeatAt
+				firstHeartbeat = &at
+			}
+			for _, a := range node.ActiveAttempts {
+				if _, observed := firstExpiry[a.AttemptID]; !observed {
+					firstExpiry[a.AttemptID] = a.LeaseExpiresAt
+				}
+			}
+		}
+		if err == nil && node.BootSessionID == baseline.BootSessionID && node.AuthorityGeneration == baseline.AuthorityGeneration && node.LastHeartbeatAt.After(*firstHeartbeat) {
 			renewed := true
 			for _, old := range baseline.ActiveAttempts {
 				for _, current := range node.ActiveAttempts {
-					if current.AttemptID == old.AttemptID && (!current.LeaseExpiresAt.After(old.LeaseExpiresAt) || !current.LeaseExpiresAt.Add(-l1.DefaultLeaseDuration).After(restarted)) {
+					if current.AttemptID == old.AttemptID && !current.LeaseExpiresAt.After(firstExpiry[current.AttemptID]) {
 						job, readErr := observeUpgradeJob(ctx, profile, old.JobID)
 						if readErr != nil || job.Outcome != contract.JobOutcomeCanceled {
 							renewed = false

@@ -13,6 +13,7 @@ import (
 
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 func shortSocket(t *testing.T) string {
@@ -44,13 +45,13 @@ func serveLocal(t *testing.T, s *Server) {
 			if err != nil {
 				t.Error(err)
 			}
-		case <-time.After(3 * time.Second):
+		case <-time.After(testwait.Bound):
 			t.Error("service did not stop")
 		}
 	})
 	select {
 	case <-listening:
-	case <-time.After(3 * time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("socket was not published")
 	}
 	deadline := time.Now().Add(3 * time.Second)
@@ -145,7 +146,7 @@ func TestLocalCancellationStopsBackendCheck(t *testing.T) {
 	}
 	select {
 	case <-stopped:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("client close did not cancel service check")
 	}
 }
@@ -231,7 +232,7 @@ func TestLocalCancellationStopsBlockedDial(t *testing.T) {
 	}
 	select {
 	case <-stopped:
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Bound):
 		t.Fatal("client close did not cancel service dial")
 	}
 }

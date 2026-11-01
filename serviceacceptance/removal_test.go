@@ -46,7 +46,8 @@ func TestServiceRemovalCleansRunningService(t *testing.T) {
 	defer cancelRemoval()
 	var pending l1.Job
 	status, body := removalJSON(t, removalCtx, harness, http.MethodPost, "/v1/jobs/"+created.JobID+"/remove?class=service", nil, &pending)
-	if status != http.StatusAccepted || pending.State != contract.JobRemovalPending {
+	// As in removeAndWait, cleanup can finish before L1 builds the 202 answer.
+	if status != http.StatusAccepted || (pending.State != contract.JobRemovalPending && pending.State != contract.JobRemovedVerified) {
 		t.Fatalf("remove running service = status %d job %#v body=%s", status, pending, body)
 	}
 
@@ -192,7 +193,9 @@ func removeAndWait(t *testing.T, harness *acceptanceHarness, jobID string) {
 	t.Helper()
 	var pending l1.Job
 	status, body := harness.doJSON(t, http.MethodPost, "/v1/jobs/"+jobID+"/remove?class=service", nil, &pending)
-	if status != http.StatusAccepted || pending.State != contract.JobRemovalPending {
+	// A service with no running process can be removed by a fast agent
+	// before the 202 answer is built (#1394).
+	if status != http.StatusAccepted || (pending.State != contract.JobRemovalPending && pending.State != contract.JobRemovedVerified) {
 		t.Fatalf("remove service = status %d job %#v body=%s", status, pending, body)
 	}
 	harness.waitForJobState(t, jobID, contract.JobClassService, contract.JobRemovedVerified, 10*time.Second)
@@ -254,7 +257,9 @@ func assertRemovalPersistence(
 	}
 	defer spool.Close()
 	if err := waitRemovalSpool(ctx, spool, jobID, func() error { return removalAgentError(harness) }, nil); err != nil {
-		t.Fatal(err)
+		// Local release follows the agent's ACK. Its log shows whether an ACK
+		// or the release failed and waits on the removal retry backoff (#1402).
+		t.Fatalf("%v\nagent output:\n%s", err, harness.agent.outputString())
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/execsweep"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/l3"
 )
@@ -27,8 +28,7 @@ import (
 //go:embed exec_wrapper.sh
 var execWrapper string
 
-//go:embed exec_cleanup.sh
-var execCleanupScript string
+var execCleanupScript = execsweep.Script
 
 // The interval is fixed in production. Tests shorten it at this workload seam
 // while still executing the shipped wrapper through L1 and the node agent.

@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
 // Occupy the production-sized admission limit with requests whose backend
@@ -41,7 +43,7 @@ func fillService(t *testing.T) (*Server, []net.Conn) {
 		}
 		select {
 		case <-entered:
-		case <-time.After(time.Second):
+		case <-time.After(testwait.Bound):
 			t.Fatal("request did not occupy a service slot")
 		}
 	}
