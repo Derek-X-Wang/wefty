@@ -96,7 +96,8 @@ fi
   # Restore the caller's base and index, keeping the captured working files.
   git -C "$work" -c core.hooksPath=/dev/null -c core.autocrlf=false reset --quiet --mixed HEAD^
 ) || snapshot_checkout_failed
-cd "$work/$folder" || snapshot_checkout_failed
+cd -P "$work/$folder" || snapshot_checkout_failed
+export PWD
 # /var/tmp survives macOS temp purges; runs have no default time limit.
 # Resolve roots once so neither home nor storage can contain the allocation.
 physical_home=$(cd -- "$HOME" && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"

@@ -190,8 +190,10 @@ Lost-reply recovery prints what it is doing. If acceptance remains uncertain,
 the CLI names the retained storage path.
 
 The embedded Bash wrapper clones the independent capture without hard links,
-changes to the same relative folder and runs the argv without `eval`. Only the
-command loses `WEFTY_*`; the wrapper keeps its run mailbox environment. The
+changes to the same relative folder and runs the argv without `eval`.
+The command starts in the physical (symlink-resolved) path of its frozen folder,
+and `PWD` names that same path. Only the command loses `WEFTY_*`; the wrapper
+keeps its run mailbox environment. The
 command otherwise inherits the node's environment, except `TMPDIR` (below). That is the
 node service's environment; the caller's shell variables are not forwarded. While it clones the
 snapshot, the wrapper prints `still preparing the snapshot (Nm)` once per
