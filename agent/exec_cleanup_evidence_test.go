@@ -193,7 +193,7 @@ func TestExecCaptureAgentSweepAfterKilledWrapper(t *testing.T) {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if result.Signal != "killed" || result.TerminationCause != contract.TerminationCauseAgent || len(result.StoppedProcesses) != 1 || result.StoppedProcesses[0].PID != escapedPID || !strings.HasSuffix(result.StoppedProcesses[0].CWD, "/wefty-exec-work/tmp") {
+	if result.Signal != "killed" || result.TerminationCause != contract.TerminationCauseAgent || len(result.StoppedProcesses) != 1 || result.StoppedProcesses[0].PID != escapedPID || (!strings.Contains(result.StoppedProcesses[0].CWD, "/wefty-run-data.") || !strings.HasSuffix(result.StoppedProcesses[0].CWD, "/tmp")) {
 		t.Fatalf("killed wrapper verdict/evidence: %+v", result)
 	}
 	// Orphan zombies on Linux no longer have a cwd; on Darwin launchd reaps

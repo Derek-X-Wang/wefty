@@ -310,7 +310,10 @@ keys) are not set in the run. Set what the command needs in the command, for exa
 `wefty exec -- env NAME=value make test`. The run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
 Each run has its own empty `$TMPDIR`, deleted when the run ends, so caches that tools keep in `$TMPDIR` (for example `bunx`) start cold.
-`$TMPDIR` is a short `/tmp/wefty-run.*` symlink to the run's private folder; a tool that refuses symlinked paths needs the resolved path, for example `cd "$TMPDIR" && pwd -P`.
+`$TMPDIR` is a short `/tmp/wefty-run.*` symlink to an initially empty 0700 folder under `/var/tmp` (fallback `/tmp`), outside the owner's home and exec storage.
+macOS does not purge `/var/tmp` by default, unlike `/var/folders/.../T` and `/tmp`. On Linux, systemd-tmpfiles usually ages `/var/tmp` after 30 days. A Run has no default time limit. The short link itself stays in `/tmp`.
+Exec cleanup removes the folder. A sweep removes leftovers after a crash or retention removal.
+A tool that refuses symlinked paths needs the resolved path, for example `cd "$TMPDIR" && pwd -P`.
 Inside the run, `git` sees your checkout: HEAD is your base commit and your local changes are uncommitted.
 
 The run gets the node's login-shell `PATH`, not the caller's; project-local tools need `bun run`, `npx`, `pnpm exec` or `uv run`, or a path such as `./node_modules/.bin/turbo`.

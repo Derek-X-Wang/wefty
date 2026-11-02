@@ -88,9 +88,6 @@ func TestExecStorageSweepStopsEscapedProcesses(t *testing.T) {
 				t.Fatal(err)
 			}
 			wantCWD := filepath.Join(physicalStorage, "work", capture.Folder)
-			if mode == "cancel" {
-				wantCWD = filepath.Join(physicalStorage, "tmp")
-			}
 			handoff := t.TempDir()
 			marker := filepath.Join(t.TempDir(), "child")
 			binary, err := os.Executable()
@@ -124,6 +121,13 @@ func TestExecStorageSweepStopsEscapedProcesses(t *testing.T) {
 			}
 			t.Cleanup(func() { _ = wrapper.Process.Kill() })
 			waitExecPath(t, marker, true)
+			if mode == "cancel" {
+				record, err := os.ReadFile(filepath.Join(capture.Storage, "tmp-dir"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				wantCWD = filepath.Join(strings.TrimSuffix(string(record), "\n"), "tmp")
+			}
 			raw, err := os.ReadFile(marker)
 			if err != nil {
 				t.Fatal(err)

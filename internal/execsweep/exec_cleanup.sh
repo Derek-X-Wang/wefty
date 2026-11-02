@@ -1,3 +1,23 @@
+# Read an allocation only through its storage record and matching owner.
+# Callers use tmp_dir for deletion and its physical path for process matching.
+exec_storage_temp_dir() {
+  tmp_dir=''
+  local record=$1 original=$2 candidate='' owner='' physical_var_tmp physical_tmp
+  physical_var_tmp=$(cd -- /var/tmp 2>/dev/null && pwd -P) || physical_var_tmp=''
+  physical_tmp=$(cd -- /tmp 2>/dev/null && pwd -P) || physical_tmp=''
+  [ -f "$record/tmp-dir" ] && [ ! -L "$record/tmp-dir" ] || return 0
+  IFS= read -r candidate < "$record/tmp-dir" || :
+  case "$candidate" in /*) ;; *) return 0 ;; esac
+  case "${candidate##*/}" in wefty-run-data.?*) ;; *) return 0 ;; esac
+  # Only immediate children of root-owned physical roots can be deleted.
+  [ "${candidate%/*}" = "$physical_var_tmp" ] || [ "${candidate%/*}" = "$physical_tmp" ] || return 0
+  [ -d "$candidate" ] && [ ! -L "$candidate" ] && [ -O "$candidate" ] || return 0
+  [ -f "$candidate/owner" ] && [ ! -L "$candidate/owner" ] || return 0
+  owner=$(cat -- "$candidate/owner") || return 0
+  [ "$owner" = "$original" ] || return 0
+  tmp_dir=$candidate
+}
+
 # Newline-delimited inventory; cwd containing a newline or tab is not supported.
 exec_storage_process_inventory() {
   cd / || return 1
@@ -74,7 +94,11 @@ exec_storage_parse_inventory() {
     # lsof encodes path bytes as \ escapes or ^ caret text; do not match
     # ambiguous records.
     case "$cwd" in *\\*|*^*|*$'\t'*|*$'\n'*) continue ;; esac
-    case "$cwd" in "$source"|"$source"/*) ;; *) continue ;; esac
+    case "$cwd" in
+      "$source"|"$source"/*) ;;
+      *) [ -n "${physical_tmp:-}" ] || continue
+         case "$cwd" in "$physical_tmp"|"$physical_tmp"/*) ;; *) continue ;; esac ;;
+    esac
     if [ "$platform" = Linux ]; then
       # Read a command name only for a matching cwd, not for every process.
       IFS= read -r name < "/proc/$pid/comm" 2>/dev/null || continue
@@ -90,6 +114,9 @@ exec_storage_parse_inventory() {
 sweep_exec_storage_processes() {
   exec_stopped_processes=''
   local source=$1 inventory status platform pid name cwd
+  local tmp_dir physical_tmp=''
+  exec_storage_temp_dir "$source" "${2:-$source}"
+  if [ -n "$tmp_dir" ]; then physical_tmp=$(cd -- "$tmp_dir" && pwd -P); fi
   local uid i j index warning=0 selected=0
   local pids=() names=() folders=() matches=()
   local termed_pids=() termed_names=() termed_folders=()
@@ -214,6 +241,13 @@ retire_exec_storage() {
     # can stall. Never traverse a symlink, including discovered trash.
     [ -e "$source" ] || [ -L "$source" ] || exit 0
     [ -d "$source" ] && [ ! -L "$source" ] || exit 1
+    original=$source
+    if [ "$kind" = trash ]; then
+      original=${source##*/}
+      original=${original#.wefty-trash-}
+      original="${source%/*}/${original%-*}"
+    fi
+    exec_storage_temp_dir "$source" "$original"
     if [ "$kind" != trash ]; then
       [ ! -e "$trash" ] && [ ! -L "$trash" ] || exit 1
       # macOS 15 refuses to rename a directory its owner cannot write, and a
@@ -234,8 +268,11 @@ retire_exec_storage() {
             case "$suffix" in
               *[!a-zA-Z0-9._-]*) ;;
               *)
-                if [ -L "$tmp_link" ] && [ "$(readlink "$tmp_link")" = "$source/tmp" ]; then
-                  /bin/rm -f -- "$tmp_link" || [ ! -L "$tmp_link" ] || link_failure=3
+                if [ -L "$tmp_link" ]; then
+                  target=$(readlink "$tmp_link")
+                  if [ "$target" = "$source/tmp" ] || { [ -n "$tmp_dir" ] && [ "$target" = "$tmp_dir/tmp" ]; }; then
+                    /bin/rm -f -- "$tmp_link" || [ ! -L "$tmp_link" ] || link_failure=3
+                  fi
                 fi
                 ;;
             esac
@@ -249,6 +286,7 @@ retire_exec_storage() {
     set -m
     /bin/bash -c '
       trash=$1
+      tmp_dir=$2
       root=${trash%/*}
       name=".wefty-delete-${trash##*/}"
       marker="$root/$name"
@@ -288,8 +326,12 @@ retire_exec_storage() {
         /bin/chmod -R u+rwX "$trash"
         /bin/rm -rf -- "$trash"
       fi
+      if [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ]; then
+        /bin/chmod -R u+rwX "$tmp_dir"
+        /bin/rm -rf -- "$tmp_dir"
+      fi
       /bin/rmdir -- "$marker/$$" && /bin/rmdir -- "$marker"
-    ' wefty-exec-delete "$trash" &
+    ' wefty-exec-delete "$trash" "$tmp_dir" &
     exit "$link_failure"
   ) </dev/null >/dev/null 2>&1 9>&- &
   operation=$!

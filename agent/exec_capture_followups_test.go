@@ -172,6 +172,7 @@ func TestExecCaptureKilledWrapperCleanupDoesNotWaitForDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 	storage := filepath.Join(mailbox.directory, "wefty-exec-work")
+	allocation := execCaptureTempAllocation(t, storage)
 	if err := os.MkdirAll(filepath.Join(storage, "work"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +234,7 @@ func TestExecCaptureKilledWrapperCleanupDoesNotWaitForDeletion(t *testing.T) {
 		t.Fatal("background deletion did not finish after release")
 	}
 	waitExecCaptureTrash(t, mailbox.directory)
+	sweepExecCaptureTemp(t, allocation)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := pending.root.Stat("."); errors.Is(err, os.ErrClosed) {
@@ -305,13 +307,12 @@ func TestExecCaptureCleanupIgnoresReplacedMailboxPath(t *testing.T) {
 
 func TestExecCaptureSeedSweepsStaleStorage(t *testing.T) {
 	mailbox, _, _ := newTestMailbox(t, captureSweepAppender(), `{}`)
-	for _, name := range []string{"work", "tmp"} {
-		if err := mailbox.root.MkdirAll("wefty-exec-work/"+name, 0700); err != nil {
-			t.Fatal(err)
-		}
+	if err := mailbox.root.MkdirAll("wefty-exec-work/work", 0700); err != nil {
+		t.Fatal(err)
 	}
 	work, workDone := startExecSweepProcess(t, filepath.Join(mailbox.directory, "wefty-exec-work", "work"))
-	tmp, tmpDone := startExecSweepProcess(t, filepath.Join(mailbox.directory, "wefty-exec-work", "tmp"))
+	allocation := execCaptureTempAllocation(t, filepath.Join(mailbox.directory, "wefty-exec-work"))
+	tmp, tmpDone := startExecSweepProcess(t, filepath.Join(allocation, "tmp"))
 	var diagnostics strings.Builder
 	mailbox.captureStderr = func(_ context.Context, output []byte) error {
 		_, _ = diagnostics.Write(output)
@@ -334,6 +335,7 @@ func TestExecCaptureSeedSweepsStaleStorage(t *testing.T) {
 	if ok, err := seedExecCapture(t.Context(), captureSpec("good"), mailbox); !ok || err != nil {
 		t.Fatalf("seed capture: ok=%v err=%v", ok, err)
 	}
+	sweepExecCaptureTemp(t, allocation)
 	for _, pid := range []int{work.Process.Pid, tmp.Process.Pid} {
 		if !strings.Contains(diagnostics.String(), fmt.Sprintf("wefty: stale exec cleanup: stopped process %d (", pid)) {
 			t.Errorf("stale cleanup diagnostic missing pid %d: %s", pid, &diagnostics)

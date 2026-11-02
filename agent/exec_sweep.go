@@ -132,9 +132,9 @@ esac
 # Preserve trailing newlines so the shared script rejects unsupported paths.
 physical=$(pwd -P && printf '.') || skip_sweep
 physical=${physical%$'\n.'}
-sweep_exec_storage_processes "$physical/wefty-exec-work"
+sweep_exec_storage_processes "$physical/wefty-exec-work" "$3/wefty-exec-work"
 printf '[%s]\n' "$exec_stopped_processes"
-`, "wefty-agent-exec-sweep", result.target.physical, result.target.identity)
+`, "wefty-agent-exec-sweep", result.target.physical, result.target.identity, m.directory)
 	command.Dir = "/"
 	command.WaitDelay = 100 * time.Millisecond
 	var stdout, stderr bytes.Buffer

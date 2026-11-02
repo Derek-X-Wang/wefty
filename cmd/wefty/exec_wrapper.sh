@@ -97,16 +97,40 @@ fi
   git -C "$work" -c core.hooksPath=/dev/null -c core.autocrlf=false reset --quiet --mixed HEAD^
 ) || snapshot_checkout_failed
 cd "$work/$folder" || snapshot_checkout_failed
-# The data stays inside storage; the short link leaves room for Unix sockets.
+# /var/tmp survives macOS temp purges; runs have no default time limit.
+# Resolve roots once so neither home nor storage can contain the allocation.
+physical_home=$(cd -- "$HOME" && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"
+physical_storage=$(cd -- "$storage/.." && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"
+tmp_root=$(cd -- /var/tmp 2>/dev/null && pwd -P) || tmp_root=''
+case "$tmp_root/" in
+  "${physical_home%/}/"*|"${physical_storage%/}/"*) tmp_root='' ;;
+esac
+if [ -z "$tmp_root" ] || [ ! -w "$tmp_root" ]; then
+  tmp_root=$(cd -- /tmp && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"
+fi
+case "$tmp_root/" in
+  "${physical_home%/}/"*|"${physical_storage%/}/"*) snapshot_checkout_failed "could not create the run's temp folder" ;;
+esac
+tmp_dir=''
+for ((tries=0; tries<10; tries++)); do
+  candidate=$(mktemp -u "$tmp_root/wefty-run-data.XXXXXXXX") || break
+  (umask 077; printf '%s\n' "$candidate" > "$storage/tmp-dir") || break
+  if mkdir -m 700 -- "$candidate"; then
+    tmp_dir=$candidate
+    break
+  fi
+done
+[ -n "$tmp_dir" ] || snapshot_checkout_failed "could not create the run's temp folder"
+(umask 077; printf '%s\n' "$storage" > "$tmp_dir/owner.tmp" && mv -f -- "$tmp_dir/owner.tmp" "$tmp_dir/owner") || snapshot_checkout_failed "could not create the run's temp folder"
+mkdir -m 700 -- "$tmp_dir/tmp" || snapshot_checkout_failed "could not create the run's temp folder"
 # Record each candidate before linking so retirement also covers setup failure.
-(umask 077; mkdir -m 700 -- "$storage/tmp") || snapshot_checkout_failed "could not create the run's temp folder"
 tmp_link=''
 for ((tries=0; tries<10; tries++)); do
   candidate=$(mktemp -u /tmp/wefty-run.XXXXXXXX) || break
   (umask 077; printf '%s\n' "$candidate" > "$storage/tmp-link") || break
   [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || continue
   # If a folder appeared at the name, ln would link inside it; check the result.
-  if ln -s -- "$storage/tmp" "$candidate" && [ -L "$candidate" ] && [ "$(readlink "$candidate")" = "$storage/tmp" ]; then
+  if ln -s -- "$tmp_dir/tmp" "$candidate" && [ -L "$candidate" ] && [ "$(readlink "$candidate")" = "$tmp_dir/tmp" ]; then
     tmp_link=$candidate
     break
   fi

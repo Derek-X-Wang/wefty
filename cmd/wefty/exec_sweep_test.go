@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/Derek-X-Wang/wefty/internal/execsweep"
 	"io"
 	"net/http"
 	"os"
@@ -204,14 +205,21 @@ func TestExecWrapperCleanupAlreadyRemoved(t *testing.T) {
 	ctx, stop := context.WithTimeout(t.Context(), 5*time.Second)
 	defer stop()
 	// A competing sweep has already removed the folder when wrapper cleanup starts.
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/sh", "-c", `printf '%s' "$TMPDIR"; /bin/rm -rf -- "$1"`, "sh", capture.Storage}))
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/sh", "-c", `printf '%s\n%s' "$TMPDIR" "$(readlink "$TMPDIR")"; /bin/rm -rf -- "$1"`, "sh", capture.Storage}))
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err = cmd.Run()
 	// Removing storage outside retirement leaves the run's /tmp link behind.
-	if link := stdout.String(); strings.HasPrefix(link, "/tmp/wefty-run.") {
-		t.Cleanup(func() { _ = os.Remove(link) })
+	parts := strings.Split(stdout.String(), "\n")
+	if len(parts) != 2 {
+		t.Fatalf("temp paths: %q", stdout.String())
 	}
+	link, target := parts[0], parts[1]
+	t.Cleanup(func() { _ = os.Remove(link); _ = os.RemoveAll(filepath.Dir(target)) })
+	if err := execsweep.SweepTempDirs(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	waitExecPath(t, filepath.Dir(target), false)
 	if err != nil || strings.Contains(stderr.String(), "cleanup failed") {
 		t.Fatalf("already removed folder was treated as cleanup failure: %v %q", err, stderr.String())
 	}

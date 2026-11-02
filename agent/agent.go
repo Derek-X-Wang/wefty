@@ -10,10 +10,12 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
+	"github.com/Derek-X-Wang/wefty/internal/execsweep"
 	"github.com/Derek-X-Wang/wefty/internal/nodeload"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -197,6 +199,9 @@ type Agent struct {
 	computerControlTokens *computerControlTokenCodec
 	ociIntentGate         *ociIntentCompletionGate
 	nodeLock              nodeLock
+
+	// execTempSweeping keeps abandoned exec temp sweeps to one at a time.
+	execTempSweeping atomic.Bool
 }
 
 func New(config Config) (*Agent, error) {
@@ -718,6 +723,7 @@ func (a *Agent) Run(ctx context.Context) (runErr error) {
 		if err := a.handoffs.collect(); err != nil {
 			return fmt.Errorf("agent: collect retained results: %w", err)
 		}
+		a.sweepExecTemp()
 		// Startup is not enough on its own: an agent that runs for weeks would
 		// otherwise never expire anything it retained while up. The collector
 		// is the agent's, not this call's: Close cancels and joins it before
@@ -888,6 +894,7 @@ func (a *Agent) startResultCollector(parent context.Context) {
 			if err := a.handoffs.collect(); err != nil {
 				a.log("collect retained results: %v", err)
 			}
+			a.sweepExecTemp()
 			// Measuring is this goroutine's work and nobody else's. It carries
 			// the collector's context, so a shutdown interrupts a walk partway
 			// rather than making the node lock wait for a workload's tree.
@@ -1177,6 +1184,20 @@ func serialLogf(logf func(string, ...any)) func(string, ...any) {
 		defer mu.Unlock()
 		logf(format, args...)
 	}
+}
+
+// sweepExecTemp starts at most one detached sweep of abandoned exec temp
+// folders. Deleting a large tree must not delay startup or make Close wait.
+func (a *Agent) sweepExecTemp() {
+	if !a.execTempSweeping.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer a.execTempSweeping.Store(false)
+		if err := execsweep.SweepTempDirs(context.Background()); err != nil {
+			a.log("sweep exec temp folders: %v", err)
+		}
+	}()
 }
 
 func (a *Agent) log(format string, args ...any) {
