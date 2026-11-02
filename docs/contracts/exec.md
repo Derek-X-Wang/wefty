@@ -59,6 +59,10 @@ back. If both the default and fallback roots fail, exec reports the original
 error once and exits 1. Permission and read-only errors name the folder and
 this override.
 
+`WEFTY_EXEC_TEMP_ROOT` overrides the Run temp root for tests and unusual hosts.
+Set it on the CLI and node to an absolute writable folder outside home and exec
+storage; it never falls back, and the temp sweep then scans only this root.
+
 The capture never writes the caller's files, index, objects, stash or refs. It
 rechecks the file image, HEAD and status before submission to detect concurrent
 changes. A changed checkout triggers up to three fresh capture attempts with
@@ -205,9 +209,10 @@ folder or link follows the same infrastructure-error path, with reason
 all Git calls disable hooks with `-c core.hooksPath=/dev/null`.
 
 The command's `TMPDIR` is a short `/tmp/wefty-run.*` link to an initially empty
-0700 folder under physical `/var/tmp` (fallback `/tmp`), outside the owner's home
-and exec storage. `/var/tmp` is used because macOS does not purge it by default,
-unlike `/var/folders/.../T` and `/tmp`, and a Run has no default time limit.
+0700 folder outside the owner's home and exec storage. Its root is physical
+`/var/tmp` (fallback `/tmp`), or physical `WEFTY_EXEC_TEMP_ROOT` when set.
+`/var/tmp` is used because macOS does not purge it by default, unlike
+`/var/folders/.../T` and `/tmp`, and a Run has no default time limit.
 On Linux, systemd-tmpfiles usually ages `/var/tmp` after 30 days.
 The short link itself still lives in `/tmp`. Wefty removes the link and physical
 folder with exec cleanup, also after cancel. Tool caches kept in `TMPDIR` start
@@ -359,7 +364,8 @@ its name has a safe suffix, it is a symlink, and its target is that capture's
 legacy `tmp` folder or its validated external allocation's `tmp` folder.
 The `tmp-dir` record must be a regular file, not a symlink. Its absolute path
 must name a real directory owned by this user, with basename `wefty-run-data.*`,
-and its parent must be exactly physical `/var/tmp` or physical `/tmp`.
+and its parent must be exactly physical `WEFTY_EXEC_TEMP_ROOT` when set, or
+physical `/var/tmp` or physical `/tmp` otherwise.
 The allocation's `owner` file must equal the original storage path, including
 when cleanup retries trash. The background deleter removes this allocation
 alongside trash under the same owner guard. A link that is already gone is not
@@ -393,10 +399,15 @@ capture. The accepted run's wrapper retains cleanup responsibility.
 Once acceptance is confirmed, the CLI records the run ID in the capture's
 `run-id` file. The wrapper also writes its `WEFTY_RUN_ID` there before cloning,
 including when the CLI lost the acceptance reply or exited. At the start of
-each exec, a best-effort background temp sweep scans physical `/var/tmp` and `/tmp`,
-without scanning the same root twice. It ignores symlinks and foreign names or
-owners. It removes `wefty-run-data.*` directories older than one hour whose
-owner names missing storage or is missing or invalid.
+each exec, a best-effort background temp sweep scans only `WEFTY_EXEC_TEMP_ROOT`
+when set, or physical `/var/tmp` and `/tmp` otherwise, without scanning the same
+root twice. It ignores symlinks and foreign names or owners. It removes
+`wefty-run-data.*` directories older than one hour whose recorded storage is gone,
+only when that storage lies beneath the sweeping CLI's or agent's own storage
+roots. Comparisons clean paths and include each root's physical (symlink-resolved)
+form. Missing or invalid owners cannot be attributed and are kept; empty owner
+roots sweep nothing. An override equal to or beneath physical `$HOME` is rejected
+before any scan.
 The sweep treats an allocation whose recorded storage path is gone as abandoned;
 moving a live Run's storage by hand is outside the contract.
 The agent also runs this sweep at startup and during periodic collection.

@@ -2,15 +2,23 @@
 # Callers use tmp_dir for deletion and its physical path for process matching.
 exec_storage_temp_dir() {
   tmp_dir=''
-  local record=$1 original=$2 candidate='' owner='' physical_var_tmp physical_tmp
-  physical_var_tmp=$(cd -- /var/tmp 2>/dev/null && pwd -P) || physical_var_tmp=''
-  physical_tmp=$(cd -- /tmp 2>/dev/null && pwd -P) || physical_tmp=''
+  local record=$1 original=$2 candidate='' owner='' physical_root physical_tmp physical_home
+  physical_tmp=''
+  if [ -n "${WEFTY_EXEC_TEMP_ROOT:-}" ]; then
+    case "$WEFTY_EXEC_TEMP_ROOT" in /*) ;; *) return 0 ;; esac
+    physical_root=$(cd -- "$WEFTY_EXEC_TEMP_ROOT" 2>/dev/null && pwd -P) || return 0
+    physical_home=$(cd -- "$HOME" 2>/dev/null && pwd -P) || return 0
+    case "$physical_root/" in "${physical_home%/}/"*) return 0 ;; esac
+  else
+    physical_root=$(cd -- /var/tmp 2>/dev/null && pwd -P) || physical_root=''
+    physical_tmp=$(cd -- /tmp 2>/dev/null && pwd -P) || physical_tmp=''
+  fi
   [ -f "$record/tmp-dir" ] && [ ! -L "$record/tmp-dir" ] || return 0
   IFS= read -r candidate < "$record/tmp-dir" || :
   case "$candidate" in /*) ;; *) return 0 ;; esac
   case "${candidate##*/}" in wefty-run-data.?*) ;; *) return 0 ;; esac
-  # Only immediate children of root-owned physical roots can be deleted.
-  [ "${candidate%/*}" = "$physical_var_tmp" ] || [ "${candidate%/*}" = "$physical_tmp" ] || return 0
+  # Only immediate children of the configured physical roots can be deleted.
+  [ "${candidate%/*}" = "$physical_root" ] || [ "${candidate%/*}" = "$physical_tmp" ] || return 0
   [ -d "$candidate" ] && [ ! -L "$candidate" ] && [ -O "$candidate" ] || return 0
   [ -f "$candidate/owner" ] && [ ! -L "$candidate/owner" ] || return 0
   owner=$(cat -- "$candidate/owner") || return 0

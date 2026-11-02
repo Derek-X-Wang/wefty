@@ -72,6 +72,7 @@ func execTestStorageRoot(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
 	t.Setenv("WEFTY_EXEC_STORAGE_ROOT", root)
+	t.Setenv("WEFTY_EXEC_TEMP_ROOT", t.TempDir())
 	t.Cleanup(func() { waitExecDeleteSteps(t, root) })
 	return root
 }
@@ -267,7 +268,7 @@ func TestExecSweepTrashHasOneDeleterAndRecoversKilledOwner(t *testing.T) {
 
 func execTempAllocation(t *testing.T, storage string) string {
 	t.Helper()
-	allocation, err := os.MkdirTemp("/var/tmp", "wefty-run-data.")
+	allocation, err := os.MkdirTemp(os.Getenv("WEFTY_EXEC_TEMP_ROOT"), "wefty-run-data.")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,11 +419,14 @@ func TestExecRerunGoneCaptureFromRealBinary(t *testing.T) {
 }
 
 func TestExecRetirementTempLinkSafety(t *testing.T) {
-	for _, kind := range []string{"owned", "legacy", "owner-mismatch", "symlink-parent", "outside-prefix", "directory", "wrong-target", "unsafe-suffix"} {
+	for _, kind := range []string{"owned", "legacy", "owner-mismatch", "symlink-parent", "outside-root", "outside-prefix", "directory", "wrong-target", "unsafe-suffix"} {
 		t.Run(kind, func(t *testing.T) {
 			storage := filepath.Join(t.TempDir(), "wefty-exec-owned")
 			allocation := execTempAllocation(t, storage)
 			target := filepath.Join(allocation, "tmp")
+			if kind == "outside-root" {
+				t.Setenv("WEFTY_EXEC_TEMP_ROOT", t.TempDir())
+			}
 			if kind == "symlink-parent" {
 				alias := filepath.Join(t.TempDir(), "alias")
 				if err := os.Symlink(filepath.Dir(allocation), alias); err != nil {
@@ -469,13 +473,13 @@ func TestExecRetirementTempLinkSafety(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitExecPath(t, storage, false)
-			if kind == "symlink-parent" {
+			if kind == "symlink-parent" || kind == "outside-root" {
 				// Wait for the deleter before asserting that outside data survived.
 				waitExecStorageEmpty(t, filepath.Dir(storage))
 			}
 			waitExecPath(t, link, kind != "owned" && kind != "legacy")
-			waitExecPath(t, allocation, kind == "owner-mismatch" || kind == "symlink-parent")
-			if kind == "owner-mismatch" || kind == "symlink-parent" {
+			waitExecPath(t, allocation, kind == "owner-mismatch" || kind == "symlink-parent" || kind == "outside-root")
+			if kind == "owner-mismatch" || kind == "symlink-parent" || kind == "outside-root" {
 				waitExecPath(t, filepath.Join(target, "run-file"), true)
 			}
 			if kind == "directory" {
@@ -658,56 +662,67 @@ func TestExecTempAllocationRetriesCollision(t *testing.T) {
 	waitExecPath(t, filepath.Dir(strings.TrimSpace(string(output))), false)
 }
 
-func TestExecTempAllocationRootFallback(t *testing.T) {
-	for _, kind := range []string{"preferred", "missing", "unwritable", "home", "storage", "storage-root"} {
+func TestExecTempAllocationRootOverride(t *testing.T) {
+	for _, kind := range []string{"configured", "symlink", "relative", "missing", "file", "unwritable", "home", "home-child", "storage", "storage-root"} {
 		t.Run(kind, func(t *testing.T) {
 			execTestStorageRoot(t)
 			capture, err := captureExec(t.Context(), execTestRepo(t))
 			if err != nil {
 				t.Fatal(err)
 			}
-			root := "/var/tmp"
-			probe := filepath.Join(t.TempDir(), "bash-env")
-			if kind != "preferred" {
-				root = t.TempDir()
-				if kind == "unwritable" {
-					if err := os.Chmod(root, 0500); err != nil {
+			root := t.TempDir()
+			switch kind {
+			case "symlink":
+				alias := filepath.Join(t.TempDir(), "alias")
+				if err := os.Symlink(root, alias); err != nil {
+					t.Fatal(err)
+				}
+				root = alias
+			case "relative":
+				root = "."
+			case "missing":
+				root = filepath.Join(root, "missing")
+			case "file":
+				root = filepath.Join(root, "file")
+				writeExecFile(t, root, "data")
+			case "unwritable":
+				if os.Geteuid() == 0 {
+					t.Skip("root ignores directory write permissions")
+				}
+				if err := os.Chmod(root, 0500); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(root, 0700) })
+			case "home", "home-child":
+				t.Setenv("HOME", root)
+				if kind == "home-child" {
+					root = filepath.Join(root, "child")
+					if err := os.Mkdir(root, 0700); err != nil {
 						t.Fatal(err)
 					}
-					t.Cleanup(func() { _ = os.Chmod(root, 0700) })
 				}
-				if kind == "home" {
-					t.Setenv("HOME", root)
-				}
-				if kind == "storage" {
-					root = capture.Storage
-				}
-				if kind == "storage-root" {
-					root = filepath.Dir(capture.Storage)
-				}
-				body := fmt.Sprintf(`cd() {
-  if [ "${2:-}" = /var/tmp ]; then builtin cd -- %q; else builtin cd "$@"; fi
-}
-`, root)
-				if kind == "missing" {
-					body = `cd() { if [ "${2:-}" = /var/tmp ]; then return 1; else builtin cd "$@"; fi; }`
-				}
-				writeExecFile(t, probe, body)
+			case "storage":
+				root = capture.Storage
+			case "storage-root":
+				root = filepath.Dir(capture.Storage)
 			}
-			cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/sh", "-c", `readlink "$TMPDIR"`}))
-			cmd.Env = os.Environ()
-			if kind != "preferred" {
-				cmd.Env = append(cmd.Env, "BASH_ENV="+probe)
+			t.Setenv("WEFTY_EXEC_TEMP_ROOT", root)
+			marker := filepath.Join(t.TempDir(), "command-ran")
+			cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/sh", "-c", `touch "$1"; readlink "$TMPDIR"`, "sh", marker}))
+			output, err := cmd.CombinedOutput()
+			if kind != "configured" && kind != "symlink" {
+				if err == nil || !strings.Contains(string(output), "could not create the run's temp folder") {
+					t.Fatalf("invalid temp root: %v %s", err, output)
+				}
+				if _, err := os.Stat(marker); !os.IsNotExist(err) {
+					t.Fatalf("command ran with invalid temp root: %v", err)
+				}
+				return
 			}
-			output, err := cmd.Output()
 			if err != nil {
-				t.Fatalf("temp root: %v", err)
+				t.Fatalf("temp root: %v %s", err, output)
 			}
-			want := "/tmp"
-			if kind == "preferred" {
-				want = "/var/tmp"
-			}
-			want, err = filepath.EvalSymlinks(want)
+			want, err := filepath.EvalSymlinks(root)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -718,4 +733,33 @@ func TestExecTempAllocationRootFallback(t *testing.T) {
 			waitExecPath(t, allocation, false)
 		})
 	}
+}
+
+// Only this wrapper-only test uses a default allocation root. It never sweeps.
+func TestExecTempAllocationDefaultRoot(t *testing.T) {
+	execTestStorageRoot(t)
+	capture, err := captureExec(t.Context(), execTestRepo(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(t.Context(), "/bin/bash", "-c", buildExecWrapper(capture, []string{"/bin/sh", "-c", `readlink "$TMPDIR"`}))
+	for _, value := range os.Environ() {
+		if !strings.HasPrefix(value, "WEFTY_EXEC_TEMP_ROOT=") {
+			cmd.Env = append(cmd.Env, value)
+		}
+	}
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("default temp root: %v", err)
+	}
+	allocation := filepath.Dir(strings.TrimSpace(string(output)))
+	t.Cleanup(func() { _ = os.RemoveAll(allocation) })
+	want, err := filepath.EvalSymlinks("/var/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(allocation) != want {
+		t.Fatalf("allocation %q outside default root %q", allocation, want)
+	}
+	waitExecPath(t, allocation, false)
 }

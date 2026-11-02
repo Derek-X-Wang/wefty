@@ -12,12 +12,64 @@ import (
 	"time"
 )
 
-// SweepTempDirs removes allocations left after storage removal or a crash.
-func SweepTempDirs(ctx context.Context) error {
-	return sweepTempDirs(ctx, []string{"/var/tmp", "/tmp"}, time.Now())
+// SweepTempDirs removes abandoned allocations whose recorded storage is beneath
+// one of the caller's ownerRoots. Unattributable allocations stay intact.
+func SweepTempDirs(ctx context.Context, ownerRoots []string) error {
+	if len(ownerRoots) == 0 {
+		return nil
+	}
+	roots, err := tempRoots()
+	if err != nil {
+		return err
+	}
+	return sweepTempDirs(ctx, roots, ownerRoots, time.Now())
 }
 
-func sweepTempDirs(ctx context.Context, roots []string, now time.Time) error {
+func tempRoots() ([]string, error) {
+	if root := os.Getenv("WEFTY_EXEC_TEMP_ROOT"); root != "" {
+		if !filepath.IsAbs(root) {
+			return nil, fmt.Errorf("WEFTY_EXEC_TEMP_ROOT must be absolute: %q", root)
+		}
+		physical, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			return nil, err
+		}
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		physicalHome, err := filepath.EvalSymlinks(home)
+		if err != nil {
+			return nil, err
+		}
+		if physical == physicalHome || beneath(physical, physicalHome) {
+			return nil, fmt.Errorf("WEFTY_EXEC_TEMP_ROOT must be outside home: %q", root)
+		}
+		return []string{root}, nil
+	}
+	return []string{"/var/tmp", "/tmp"}, nil
+}
+
+// beneath compares cleaned absolute paths with a separator boundary.
+func beneath(path, root string) bool {
+	return strings.HasPrefix(path, strings.TrimSuffix(root, string(filepath.Separator))+string(filepath.Separator)) && path != root
+}
+
+func sweepTempDirs(ctx context.Context, roots, ownerRoots []string, now time.Time) error {
+	var storageRoots []string
+	for _, root := range ownerRoots {
+		if !filepath.IsAbs(root) {
+			continue
+		}
+		root = filepath.Clean(root)
+		storageRoots = append(storageRoots, root)
+		if physical, err := filepath.EvalSymlinks(root); err == nil {
+			storageRoots = append(storageRoots, physical)
+		}
+	}
+	if len(storageRoots) == 0 {
+		return nil
+	}
 	seen := make(map[string]bool)
 	var failures []error
 	for _, root := range roots {
@@ -49,7 +101,7 @@ func sweepTempDirs(ctx context.Context, roots []string, now time.Time) error {
 				continue
 			}
 			path := filepath.Join(physical, entry.Name())
-			if err := sweepTempDir(ctx, path, now); err != nil {
+			if err := sweepTempDir(ctx, path, storageRoots, now); err != nil {
 				failures = append(failures, fmt.Errorf("%s: %w", path, err))
 			}
 		}
@@ -57,7 +109,7 @@ func sweepTempDirs(ctx context.Context, roots []string, now time.Time) error {
 	return errors.Join(failures...)
 }
 
-func sweepTempDir(ctx context.Context, path string, now time.Time) error {
+func sweepTempDir(ctx context.Context, path string, ownerRoots []string, now time.Time) error {
 	info, err := os.Lstat(path)
 	if os.IsNotExist(err) {
 		return nil
@@ -82,11 +134,23 @@ func sweepTempDir(ctx context.Context, path string, now time.Time) error {
 			storage = strings.TrimSuffix(string(raw), "\n")
 		}
 	}
-	// An allocation without a valid owner never finished initialization.
-	if filepath.IsAbs(storage) {
-		if _, err := os.Lstat(storage); !os.IsNotExist(err) {
-			return err
+	// Missing or invalid owners cannot be attributed to this caller.
+	if !filepath.IsAbs(storage) {
+		return nil
+	}
+	storage = filepath.Clean(storage)
+	owned := false
+	for _, root := range ownerRoots {
+		if beneath(storage, root) {
+			owned = true
+			break
 		}
+	}
+	if !owned {
+		return nil
+	}
+	if _, err := os.Lstat(storage); !os.IsNotExist(err) {
+		return err
 	}
 	// WalkDir does not follow links. Open each real directory before reading
 	// its children, including folders a command left without owner access.

@@ -221,7 +221,7 @@ func TestExecWrapperCleanupAlreadyRemoved(t *testing.T) {
 	if err := os.Chtimes(filepath.Dir(target), old, old); err != nil {
 		t.Fatal(err)
 	}
-	if err := execsweep.SweepTempDirs(t.Context()); err != nil {
+	if err := execsweep.SweepTempDirs(t.Context(), []string{filepath.Dir(capture.Storage)}); err != nil {
 		t.Fatal(err)
 	}
 	waitExecPath(t, filepath.Dir(target), false)

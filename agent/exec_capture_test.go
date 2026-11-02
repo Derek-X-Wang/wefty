@@ -142,7 +142,7 @@ func TestExecCaptureRetriesInterruptedDownload(t *testing.T) {
 
 func execCaptureTempAllocation(t *testing.T, storage string) string {
 	t.Helper()
-	allocation, err := os.MkdirTemp("/var/tmp", "wefty-run-data.")
+	allocation, err := os.MkdirTemp(os.Getenv("WEFTY_EXEC_TEMP_ROOT"), "wefty-run-data.")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,9 +168,14 @@ func execCaptureTempAllocation(t *testing.T, storage string) string {
 	return allocation
 }
 
-func sweepExecCaptureTemp(t *testing.T, allocation string) {
+func sweepExecCaptureTemp(t *testing.T, allocation, ownerRoot string) {
 	t.Helper()
-	if err := execsweep.SweepTempDirs(t.Context()); err != nil {
+	// Model an orphan past the grace period; live cleanup may already remove it.
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(allocation, old, old); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := execsweep.SweepTempDirs(t.Context(), []string{ownerRoot}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(allocation); !os.IsNotExist(err) {
@@ -193,7 +198,7 @@ func TestExecCapturePreparationRemovesStaleAttemptFiles(t *testing.T) {
 	if _, e := os.Stat(filepath.Join(mailbox.directory, "wefty-exec-work")); !os.IsNotExist(e) {
 		t.Fatal("stale work directory survived preparation")
 	}
-	sweepExecCaptureTemp(t, allocation)
+	sweepExecCaptureTemp(t, allocation, mailbox.directory)
 }
 func TestExecCaptureCleanupSurvivesDetachedMailbox(t *testing.T) {
 	appender := &httpRunLedgerAppender{client: &http.Client{Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
@@ -210,5 +215,5 @@ func TestExecCaptureCleanupSurvivesDetachedMailbox(t *testing.T) {
 		t.Fatal("bundle retained after roots closed")
 	}
 	waitExecCaptureTrash(t, mailbox.directory)
-	sweepExecCaptureTemp(t, allocation)
+	sweepExecCaptureTemp(t, allocation, mailbox.directory)
 }

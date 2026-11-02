@@ -1194,7 +1194,7 @@ func (a *Agent) sweepExecTemp() {
 	}
 	go func() {
 		defer a.execTempSweeping.Store(false)
-		if err := execsweep.SweepTempDirs(context.Background()); err != nil {
+		if err := execsweep.SweepTempDirs(context.Background(), []string{a.handoffs.root}); err != nil {
 			a.log("sweep exec temp folders: %v", err)
 		}
 	}()

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -142,8 +143,16 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	defer stopSignalContext()
 	// Temp deletion must not delay submission. A later sweep finishes any
 	// allocation left when this command exits or its context is cancelled.
+	ownerRoot, err := execStorageRoot()
+	if err != nil {
+		return err
+	}
+	ownerRoots := []string{ownerRoot}
+	if execStorageGOOS == "darwin" && os.Getenv("WEFTY_EXEC_STORAGE_ROOT") == "" {
+		ownerRoots = append(ownerRoots, filepath.Join(os.TempDir(), "wefty-exec"))
+	}
 	go func() {
-		_ = execsweep.SweepTempDirs(ctx)
+		_ = execsweep.SweepTempDirs(ctx, ownerRoots)
 	}()
 	if err := sweepExecStorage(ctx, clients, stderr); err != nil {
 		return err

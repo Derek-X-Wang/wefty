@@ -145,6 +145,10 @@ exit "$1"`
 			if err != nil {
 				t.Fatal(err)
 			}
+			root, err := filepath.EvalSymlinks(os.Getenv("WEFTY_EXEC_TEMP_ROOT"))
+			if err != nil || filepath.Dir(filepath.Dir(physical)) != root {
+				t.Fatalf("node allocation %q outside test root %q: %v", physical, root, err)
+			}
 			for _, root := range []string{os.Getenv("HOME"), os.Getenv("WEFTY_EXEC_STORAGE_ROOT")} {
 				canonical, err := filepath.EvalSymlinks(root)
 				if err != nil {

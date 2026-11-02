@@ -101,13 +101,19 @@ cd "$work/$folder" || snapshot_checkout_failed
 # Resolve roots once so neither home nor storage can contain the allocation.
 physical_home=$(cd -- "$HOME" && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"
 physical_storage=$(cd -- "$storage/.." && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"
-tmp_root=$(cd -- /var/tmp 2>/dev/null && pwd -P) || tmp_root=''
-case "$tmp_root/" in
-  "${physical_home%/}/"*|"${physical_storage%/}/"*) tmp_root='' ;;
-esac
-if [ -z "$tmp_root" ] || [ ! -w "$tmp_root" ]; then
-  tmp_root=$(cd -- /tmp && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"
+if [ -n "${WEFTY_EXEC_TEMP_ROOT:-}" ]; then
+  case "$WEFTY_EXEC_TEMP_ROOT" in /*) ;; *) snapshot_checkout_failed "could not create the run's temp folder" ;; esac
+  tmp_root=$(cd -- "$WEFTY_EXEC_TEMP_ROOT" && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"
+else
+  tmp_root=$(cd -- /var/tmp 2>/dev/null && pwd -P) || tmp_root=''
+  case "$tmp_root/" in
+    "${physical_home%/}/"*|"${physical_storage%/}/"*) tmp_root='' ;;
+  esac
+  if [ -z "$tmp_root" ] || [ ! -w "$tmp_root" ]; then
+    tmp_root=$(cd -- /tmp && pwd -P) || snapshot_checkout_failed "could not create the run's temp folder"
+  fi
 fi
+[ -w "$tmp_root" ] || snapshot_checkout_failed "could not create the run's temp folder"
 case "$tmp_root/" in
   "${physical_home%/}/"*|"${physical_storage%/}/"*) snapshot_checkout_failed "could not create the run's temp folder" ;;
 esac

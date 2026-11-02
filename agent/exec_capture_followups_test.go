@@ -234,7 +234,7 @@ func TestExecCaptureKilledWrapperCleanupDoesNotWaitForDeletion(t *testing.T) {
 		t.Fatal("background deletion did not finish after release")
 	}
 	waitExecCaptureTrash(t, mailbox.directory)
-	sweepExecCaptureTemp(t, allocation)
+	sweepExecCaptureTemp(t, allocation, mailbox.directory)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := pending.root.Stat("."); errors.Is(err, os.ErrClosed) {
@@ -335,7 +335,7 @@ func TestExecCaptureSeedSweepsStaleStorage(t *testing.T) {
 	if ok, err := seedExecCapture(t.Context(), captureSpec("good"), mailbox); !ok || err != nil {
 		t.Fatalf("seed capture: ok=%v err=%v", ok, err)
 	}
-	sweepExecCaptureTemp(t, allocation)
+	sweepExecCaptureTemp(t, allocation, mailbox.directory)
 	for _, pid := range []int{work.Process.Pid, tmp.Process.Pid} {
 		if !strings.Contains(diagnostics.String(), fmt.Sprintf("wefty: stale exec cleanup: stopped process %d (", pid)) {
 			t.Errorf("stale cleanup diagnostic missing pid %d: %s", pid, &diagnostics)
