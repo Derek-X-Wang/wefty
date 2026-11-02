@@ -448,7 +448,14 @@ func TestContainerdShimLossPublishesAttemptScopedRuntimeFailureOnlyOnEngineAnswe
 			wait := make(chan containerd.ExitStatus, 1)
 			wait <- *containerd.NewExitStatus(containerd.UnknownExitStatus, time.Time{}, shimClosed)
 			close(wait)
-			go attempt.cacheTerminal(wait, root, 300*time.Millisecond)
+			// The probe gets half the release budget. As in
+			// TestProveTaskLossAttemptScopedNeedsTheEngineToAnswerForTheTask,
+			// only the cases that prove scope get ample margin (#1439).
+			release := 300 * time.Millisecond
+			if test.want {
+				release = time.Minute
+			}
+			go attempt.cacheTerminal(wait, root, release)
 
 			result, _ := watchTerminalEvidence(t, engine, authority)
 			if result == nil || result.RuntimeFailure != shimClosed.Error() || result.ExitCode != nil {

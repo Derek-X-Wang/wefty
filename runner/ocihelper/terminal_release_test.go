@@ -135,7 +135,15 @@ func TestProveTaskLossAttemptScopedNeedsTheEngineToAnswerForTheTask(t *testing.T
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			observe, calls := sequence(test.answers...)
-			if got := proveTaskLossAttemptScoped(200*time.Millisecond, test.waitErr, observe); got != test.want {
+			// Cases that prove scope return when the engine reports "gone". Give
+			// them ample scheduling margin so delayed probes do not use up the
+			// budget on loaded runners (#1439). Keep the short budget for the
+			// other cases, so expiry still ends the silent-engine wait.
+			budget := 200 * time.Millisecond
+			if test.want {
+				budget = time.Minute
+			}
+			if got := proveTaskLossAttemptScoped(budget, test.waitErr, observe); got != test.want {
 				t.Fatalf("attempt scoped = %t after %d observations, want %t", got, *calls, test.want)
 			}
 		})
