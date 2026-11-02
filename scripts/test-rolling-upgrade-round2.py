@@ -289,6 +289,9 @@ class Round2(unittest.TestCase):
         wrapper,cleanup=b1.patch_exec_aliases((base/'cmd/wefty/exec_wrapper.sh').read_text(),(base/'internal/execsweep/exec_cleanup.sh').read_text(),Path('/proof/tmp/wefty-run.'))
         self.assertTrue(wrapper.startswith('#!/bin/bash\n'))
         self.assertIn('/proof/tmp/wefty-run.',wrapper)
+        self.assertIn('tmp_root=/proof/tmp',wrapper)
+        self.assertNotIn('cd -- /var/tmp',wrapper)
+        self.assertIn('$tmp_root/wefty-run-data.XXXXXXXX',wrapper)
         self.assertEqual(cleanup.splitlines()[-1],'retire_exec_storage() { return 0; }')
         self.assertNotIn('set -m',cleanup)
 

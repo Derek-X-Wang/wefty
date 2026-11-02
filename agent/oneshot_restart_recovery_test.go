@@ -93,13 +93,17 @@ func TestRestartableDelayedCleanupCannotTouchSuccessor(t *testing.T) {
 		}
 		t.Cleanup(mailbox.close)
 		storage := filepath.Join(mailbox.directory, "wefty-exec-work")
-		for _, name := range []string{"work", "tmp"} {
+		allocation := execCaptureTempAllocation(t, storage)
+		for _, name := range []string{"work"} {
 			if err := os.MkdirAll(filepath.Join(storage, name), 0700); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(storage, name, "keep"), []byte(attempt), 0600); err != nil {
 				t.Fatal(err)
 			}
+		}
+		if err := os.WriteFile(filepath.Join(allocation, "tmp", "keep"), []byte(attempt), 0600); err != nil {
+			t.Fatal(err)
 		}
 		file, err := os.CreateTemp("/tmp", "wefty-run.")
 		if err != nil {
@@ -110,7 +114,7 @@ func TestRestartableDelayedCleanupCannotTouchSuccessor(t *testing.T) {
 		if err := os.Remove(link); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(filepath.Join(storage, "tmp"), link); err != nil {
+		if err := os.Symlink(filepath.Join(allocation, "tmp"), link); err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = os.Remove(link) })
@@ -120,6 +124,10 @@ func TestRestartableDelayedCleanupCannotTouchSuccessor(t *testing.T) {
 		return mailbox, storage, link
 	}
 	_, previous, previousTmp := prepare("previous")
+	previousTarget, err := os.Readlink(previousTmp)
+	if err != nil {
+		t.Fatal(err)
+	}
 	observed, release := filepath.Join(dir, "cleanup-observed"), filepath.Join(dir, "cleanup-release")
 	hook := filepath.Join(dir, "bash-env")
 	if err := os.WriteFile(hook, []byte(fmt.Sprintf(`function /bin/chmod() {
@@ -163,7 +171,14 @@ func TestRestartableDelayedCleanupCannotTouchSuccessor(t *testing.T) {
 	// delete step still owns trash and lock folders beside the old storage.
 	// Wait for them, so TempDir cleanup does not race it (#1197).
 	waitRestartRecoveryNoExecTrash(t, filepath.Dir(previous))
-	for _, path := range []string{filepath.Join(storage, "work/keep"), filepath.Join(storage, "tmp/keep"), filepath.Join(tmp, "keep"), filepath.Join(next.directory, "params.json")} {
+	if _, err := os.Lstat(filepath.Dir(previousTarget)); !os.IsNotExist(err) {
+		t.Fatalf("predecessor temp survived deletion: %v", err)
+	}
+	target, err := os.Readlink(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(storage, "work/keep"), filepath.Join(target, "keep"), filepath.Join(tmp, "keep"), filepath.Join(next.directory, "params.json")} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("delayed predecessor cleanup touched successor: %s: %v", path, err)
 		}

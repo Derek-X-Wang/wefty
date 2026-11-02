@@ -105,6 +105,8 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"FAKE_AGENT_LOG="+invocationLog,
 	)
+	// The agent sweeps exec temp; keep it away from the real /var/tmp and /tmp (#1084).
+	t.Setenv("WEFTY_EXEC_TEMP_ROOT", t.TempDir())
 	nodeAgent, err := agent.New(agent.Config{
 		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: "dogfood-node", BootSessionID: "boot-dogfood", Version: "contract-smoke",
