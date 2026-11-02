@@ -800,7 +800,7 @@ mailbox; the agent does not import the previous run's evidence into it.
 
 Restartable process exec adds the Attempt ID:
 `<handoff directory>/.wefty/<run id>/<attempt id>`. Each successor receives
-its own mailbox, including exec work and TMPDIR storage beneath that mailbox.
+its own mailbox and exec workspace, plus a separate external temp allocation.
 Run identity and the Run's handoff/result paths remain stable.
 
 The layout is fixed:
@@ -1883,7 +1883,12 @@ nonterminal interruption; no live checkout is read to prepare a successor.
 Successor preparation clears the Run's result under the handoff path lock and
 uses an Attempt-specific mailbox. It does not remove and recreate a predecessor
 path that a delayed cleanup helper may still reference. The new Attempt creates
-a fresh workspace and TMPDIR beneath its own mailbox.
+a fresh workspace beneath its own mailbox and a fresh physical temp folder
+outside the owner's home and exec storage. TMPDIR is a short `/tmp/wefty-run.*`
+link to an initially empty 0700 folder under `/var/tmp` (fallback `/tmp`).
+macOS does not purge `/var/tmp` by default, unlike `/var/folders/.../T` and `/tmp`;
+a Run has no default time limit. The short link stays in `/tmp`. Exec cleanup
+removes the folder; a sweep removes leftovers after a crash or retention removal.
 L1 supplies a fresh fence and Attempt credential. Run identity, Job identity,
 and the Run log cursor remain stable. Restart inspect facts come from a fresh
 L1 execution read; Attempt interruption evidence is distinct from command exit.

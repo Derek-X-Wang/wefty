@@ -193,8 +193,12 @@ func TestExecCaptureAgentSweepAfterKilledWrapper(t *testing.T) {
 	if err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
-	if result.Signal != "killed" || result.TerminationCause != contract.TerminationCauseAgent || len(result.StoppedProcesses) != 1 || result.StoppedProcesses[0].PID != escapedPID || !strings.HasSuffix(result.StoppedProcesses[0].CWD, "/wefty-exec-work/tmp") {
+	if result.Signal != "killed" || result.TerminationCause != contract.TerminationCauseAgent || len(result.StoppedProcesses) != 1 || result.StoppedProcesses[0].PID != escapedPID || (!strings.Contains(result.StoppedProcesses[0].CWD, "/wefty-run-data.") || !strings.HasSuffix(result.StoppedProcesses[0].CWD, "/tmp")) {
 		t.Fatalf("killed wrapper verdict/evidence: %+v", result)
+	}
+	root, err := filepath.EvalSymlinks(os.Getenv("WEFTY_EXEC_TEMP_ROOT"))
+	if err != nil || filepath.Dir(filepath.Dir(result.StoppedProcesses[0].CWD)) != root {
+		t.Fatalf("node wrapper/cleanup used temp outside test root %q: %+v, %v", root, result.StoppedProcesses, err)
 	}
 	// Orphan zombies on Linux no longer have a cwd; on Darwin launchd reaps
 	// the orphan and kill -0 proves it gone. Neither is a live escaped child.

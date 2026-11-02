@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -109,23 +112,85 @@ func TestExecPrivateTempFromRealBinary(t *testing.T) {
 			stack := newExecStack(t, execRealBinaryIdleLimit)
 			callerTemp := os.Getenv("TMPDIR")
 			t.Chdir(execTestRepo(t))
+			marker, release := filepath.Join(t.TempDir(), "ready"), filepath.Join(t.TempDir(), "release")
 			script := `set -e
+printf '%s' "$TMPDIR" > "$2.pending"
+mv "$2.pending" "$2"
+while [ ! -f "$3" ]; do sleep 0.01; done
 printf '%s\000' "$TMPDIR" "$(readlink "$TMPDIR")" "$(ls -A "$TMPDIR")"
 printf 'run data' > "$TMPDIR/run-file"
 exit "$1"`
-			code, stdout, stderr := runPolishBinary(t, binary,
+			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, binary,
 				"--l1="+stack.l1Address, "--l3="+stack.l3Address,
-				"--node-config="+stack.clients.nodeConfigPath, "exec", "--", "/bin/sh", "-c", script, "sh", fmt.Sprint(exit))
+				"--node-config="+stack.clients.nodeConfigPath, "exec", "--", "/bin/sh", "-c", script, "sh", fmt.Sprint(exit), marker, release)
+			for _, entry := range os.Environ() {
+				if !strings.HasPrefix(entry, l1AddressEnv+"=") && !strings.HasPrefix(entry, l3AddressEnv+"=") {
+					cmd.Env = append(cmd.Env, entry)
+				}
+			}
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &stdout, &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { cancel(); _ = cmd.Wait() }()
+			waitExecPath(t, marker, true)
+			raw, err := os.ReadFile(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			physical, err := filepath.EvalSymlinks(string(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			root, err := filepath.EvalSymlinks(os.Getenv("WEFTY_EXEC_TEMP_ROOT"))
+			if err != nil || filepath.Dir(filepath.Dir(physical)) != root {
+				t.Fatalf("node allocation %q outside test root %q: %v", physical, root, err)
+			}
+			for _, root := range []string{os.Getenv("HOME"), os.Getenv("WEFTY_EXEC_STORAGE_ROOT")} {
+				canonical, err := filepath.EvalSymlinks(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if physical == canonical || strings.HasPrefix(physical, canonical+string(os.PathSeparator)) {
+					t.Fatalf("TMPDIR %q is inside %q", physical, canonical)
+				}
+			}
+			info, err := os.Stat(physical)
+			if err != nil || info.Mode().Perm() != 0700 {
+				t.Fatalf("private temp mode: %v %v", info, err)
+			}
+			for path, mode := range map[string]os.FileMode{filepath.Dir(physical): 0700, filepath.Join(filepath.Dir(physical), "owner"): 0600} {
+				info, err := os.Stat(path)
+				if err != nil || info.Mode().Perm() != mode {
+					t.Fatalf("temp metadata mode: %s: %v %v", path, info, err)
+				}
+			}
+			entries, err := os.ReadDir(physical)
+			if err != nil || len(entries) != 0 {
+				t.Fatalf("initial temp contents: %v %v", entries, err)
+			}
+			writeExecFile(t, release, "go")
+			code := 0
+			if err := cmd.Wait(); err != nil {
+				var status *exec.ExitError
+				if !errors.As(err, &status) {
+					t.Fatal(err)
+				}
+				code = status.ExitCode()
+			}
 			wantCode := 0
 			if exit != 0 {
 				wantCode = 10
 			}
 			if code != wantCode {
-				t.Fatalf("exit=%d want=%d stdout=%q stderr=%s", code, wantCode, stdout, stderr)
+				t.Fatalf("exit=%d want=%d stdout=%q stderr=%s", code, wantCode, stdout.String(), stderr.String())
 			}
-			parts := strings.Split(string(stdout), "\x00")
+			parts := strings.Split(stdout.String(), "\x00")
 			if len(parts) != 4 {
-				t.Fatalf("temp probe output: %q", stdout)
+				t.Fatalf("temp probe output: %q", stdout.String())
 			}
 			link := parts[0]
 			if link == callerTemp || link == previous || !strings.HasPrefix(link, "/tmp/wefty-run.") || len(link) > 32 || strings.HasSuffix(link, "/") {
@@ -144,11 +209,11 @@ exit "$1"`
 			if err := json.Unmarshal(record.Params, &params); err != nil {
 				t.Fatal(err)
 			}
-			target := filepath.Join(params.Storage, "tmp")
+			target := physical
 			if parts[1] != target || parts[2] != "" {
 				t.Fatalf("temp target=%q want=%q initial contents=%q", parts[1], target, parts[2])
 			}
-			for _, path := range []string{link, target, filepath.Join(target, "run-file")} {
+			for _, path := range []string{link, target, filepath.Dir(target), filepath.Join(target, "run-file")} {
 				waitExecPath(t, path, false)
 			}
 			waitExecStorageEmpty(t, filepath.Dir(params.Storage))

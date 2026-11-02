@@ -310,7 +310,10 @@ keys) are not set in the run. Set what the command needs in the command, for exa
 `wefty exec -- env NAME=value make test`. The run's `WEFTY_*` variables are removed. No files are returned. The command
 runs as the node's user and can write absolute paths.
 Each run has its own empty `$TMPDIR`, deleted when the run ends, so caches that tools keep in `$TMPDIR` (for example `bunx`) start cold.
-`$TMPDIR` is a short `/tmp/wefty-run.*` symlink to the run's private folder; a tool that refuses symlinked paths needs the resolved path, for example `cd "$TMPDIR" && pwd -P`.
+`$TMPDIR` is a short `/tmp/wefty-run.*` symlink to an initially empty 0700 folder under `/var/tmp` (fallback `/tmp`), outside the owner's home and exec storage.
+macOS does not purge `/var/tmp` by default, unlike `/var/folders/.../T` and `/tmp`. On Linux, systemd-tmpfiles usually ages `/var/tmp` after 30 days. A Run has no default time limit. The short link itself stays in `/tmp`.
+Exec cleanup removes the folder. A sweep removes leftovers after a crash or retention removal only when their recorded storage lies beneath the sweeping CLI's or agent's own storage roots. Missing or invalid owners are kept.
+A tool that refuses symlinked paths needs the resolved path, for example `cd "$TMPDIR" && pwd -P`.
 Inside the run, `git` sees your checkout: HEAD is your base commit and your local changes are uncommitted.
 
 The run gets the node's login-shell `PATH`, not the caller's; project-local tools need `bun run`, `npx`, `pnpm exec` or `uv run`, or a path such as `./node_modules/.bin/turbo`.
@@ -417,6 +420,10 @@ node can read. This override is supported on every platform and never falls
 back. Linux nodes may have a private `/tmp`, so do not assume they can read
 the caller's temp folder. If both macOS roots fail, use the same override or
 allow writes to the default root.
+
+`WEFTY_EXEC_TEMP_ROOT` overrides the Run temp root for tests and unusual hosts.
+Set it on the CLI and node to an absolute writable folder outside home and exec
+storage; it never falls back, and the temp sweep then scans only this root.
 
 For Codex, add the absolute folder to `sandbox_workspace_write.writable_roots`
 in its configuration, or pass it when starting the session:

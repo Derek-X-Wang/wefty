@@ -822,9 +822,16 @@ func TestExecCancelRemovesPrivateTemp(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0700 {
 		t.Fatalf("temp folder mode: %v %v", info, err)
 	}
-	info, err = os.Stat(filepath.Join(filepath.Dir(target), "tmp-link"))
-	if err != nil || info.Mode().Perm() != 0600 {
-		t.Fatalf("temp link record mode: %v %v", info, err)
+	owner, err := os.ReadFile(filepath.Join(filepath.Dir(target), "owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := strings.TrimSuffix(string(owner), "\n")
+	for _, record := range []string{"tmp-link", "tmp-dir"} {
+		info, err = os.Stat(filepath.Join(storage, record))
+		if err != nil || info.Mode().Perm() != 0600 {
+			t.Fatalf("temp record mode: %v %v", info, err)
+		}
 	}
 	waitExecPath(t, filepath.Join(target, "run-file"), true)
 	cancel()
@@ -841,7 +848,7 @@ func TestExecCancelRemovesPrivateTemp(t *testing.T) {
 	if err != nil || len(page.Runs) != 1 || page.Runs[0].Status != contract.RunFailed {
 		t.Fatalf("terminal cancellation: %+v %v", page, err)
 	}
-	for _, path := range []string{link, target, filepath.Join(target, "run-file")} {
+	for _, path := range []string{link, target, filepath.Dir(target), filepath.Join(target, "run-file")} {
 		waitExecPath(t, path, false)
 	}
 	waitExecStorageEmpty(t, os.Getenv("WEFTY_EXEC_STORAGE_ROOT"))

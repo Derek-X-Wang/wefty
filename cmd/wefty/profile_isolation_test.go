@@ -62,13 +62,28 @@ func TestMain(main *testing.M) {
 		os.Exit(0)
 	}
 	durable.DisableSQLiteFullFsyncForTests()
-	packageTestEnvironment = os.Environ()
 	directory, err := os.MkdirTemp("", "wefty-cli-profile-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	packageTestDirectory = directory
+	// Isolate every exec allocation and orphan sweep, including subprocesses.
+	tempRoot := os.Getenv("WEFTY_EXEC_TEMP_ROOT")
+	ownsTempRoot := tempRoot == ""
+	if ownsTempRoot {
+		var err error
+		tempRoot, err = os.MkdirTemp("", "wefty-cli-exec-temp-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := os.Setenv("WEFTY_EXEC_TEMP_ROOT", tempRoot); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	packageTestEnvironment = os.Environ()
 	path := filepath.Join(directory, connprofile.FileName)
 	if err := os.WriteFile(path, []byte("{\"version\":1}\n"), 0o600); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -102,6 +117,9 @@ func TestMain(main *testing.M) {
 	}
 	packageTestEnvironment = append(filtered, local.SocketEnvironment+"="+packageTestSocket)
 	code := main.Run()
+	if ownsTempRoot {
+		_ = os.RemoveAll(tempRoot)
+	}
 	_ = os.RemoveAll(socketDir)
 	_ = os.RemoveAll(directory)
 	os.Exit(code)

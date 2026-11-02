@@ -28,6 +28,29 @@ import (
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
 
+// Reuse an inherited root in helper children; only its creator removes it.
+func TestMain(main *testing.M) {
+	tempRoot := os.Getenv("WEFTY_EXEC_TEMP_ROOT")
+	ownsTempRoot := tempRoot == ""
+	if ownsTempRoot {
+		var err error
+		tempRoot, err = os.MkdirTemp("", "wefty-agent-main-exec-temp-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := os.Setenv("WEFTY_EXEC_TEMP_ROOT", tempRoot); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	code := main.Run()
+	if ownsTempRoot {
+		_ = os.RemoveAll(tempRoot)
+	}
+	os.Exit(code)
+}
+
 type capabilityProbeAdapterStub struct {
 	err        error
 	calls      *int

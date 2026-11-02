@@ -38,6 +38,21 @@ var (
 )
 
 func TestMain(main *testing.M) {
+	// Startup collectors, wrappers and subprocesses must share only test temp.
+	tempRoot := os.Getenv("WEFTY_EXEC_TEMP_ROOT")
+	ownsTempRoot := tempRoot == ""
+	if ownsTempRoot {
+		var err error
+		tempRoot, err = os.MkdirTemp("", "wefty-agent-exec-temp-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := os.Setenv("WEFTY_EXEC_TEMP_ROOT", tempRoot); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 	// Test stores open without F_FULLFSYNC: it makes this suite much slower on
 	// darwin and proves nothing a test asserts, since no test cuts power. The
 	// binaries built below are production builds and keep it (#599).
@@ -143,6 +158,9 @@ func TestMain(main *testing.M) {
 	if err := removeOwnedAgentTestHelpers(directory, inherited); err != nil && code == 0 {
 		fmt.Fprintln(os.Stderr, err)
 		code = 1
+	}
+	if ownsTempRoot {
+		_ = os.RemoveAll(tempRoot)
 	}
 	os.Exit(code)
 }
