@@ -1,6 +1,7 @@
 package l1
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -290,5 +291,78 @@ func TestAttemptLeaseClockFailureDoesNotExpireOrGrantAuthority(t *testing.T) {
 	attempts, err := service.store.ListJobAttempts(t.Context(), service.job.JobID)
 	if err != nil || len(attempts) != 1 || attempts[0].State != contract.AttemptLost {
 		t.Fatalf("revoked Attempt=%+v err=%v", attempts, err)
+	}
+}
+
+func TestAttemptLeaseAwakeClockFailureKeepsUnrelatedWork(t *testing.T) {
+	f, c := newSleepLeaseFixture(t)
+	c.advance(0, 5*time.Minute)
+	c.awakeErr = errors.New("pausing clock unavailable")
+	if _, err := f.store.SetAttemptResult(t.Context(), "agent-lease-node", f.job.JobID, f.claim.Lease.AttemptID, AttemptResultRequest{FencingToken: f.claim.Lease.FencingToken, Document: []byte(`{"ok":true}`)}); err != nil {
+		t.Fatalf("pausing-clock failure blocked evidence: %v", err)
+	}
+	if _, _, err := f.store.CreateJob(t.Context(), validJobSpec("awake-clock-failed-queued", nil)); err != nil {
+		t.Fatalf("pausing-clock failure blocked submission: %v", err)
+	}
+	if _, err := f.store.GetJob(t.Context(), f.job.JobID); err != nil {
+		t.Fatalf("pausing-clock failure blocked read: %v", err)
+	}
+	attempts, err := f.store.ListJobAttempts(t.Context(), f.job.JobID)
+	if err != nil || len(attempts) != 1 || attempts[0].LeaseLive {
+		t.Fatalf("pausing-clock failure granted read authority: %+v err=%v", attempts, err)
+	}
+	if _, err := f.store.RenewLease(t.Context(), "agent-lease-node", f.job.JobID, f.claim.Lease.AttemptID, f.claim.Lease.FencingToken); err == nil {
+		t.Fatal("renewal granted without a pausing clock")
+	}
+	if _, err := f.store.ResolveAttemptCredential(t.Context(), f.claim.AttemptToken, "agent-lease-node"); err == nil {
+		t.Fatal("credential granted without a pausing clock")
+	}
+	// Cancellation has an independent wall deadline. Model accepted intent
+	// exactly as the existing boot-clock failure settlement regression does.
+	if _, err := f.store.db.ExecContext(t.Context(), `UPDATE jobs SET outcome='canceled',cancel_settle_by_ns=? WHERE job_id=?`, c.Now().Add(CancelSettlementTimeout).UnixNano(), f.job.JobID); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(CancelSettlementTimeout, 0)
+	result, err := f.store.Reconcile(t.Context())
+	if err != nil || result.ExpiredAttempts != 1 || result.DeadNodes != 1 || result.StaleNodes != 0 {
+		t.Fatalf("pausing-clock failure blocked cancellation or node liveness: %+v err=%v", result, err)
+	}
+}
+
+func TestAttemptLeaseBootFailurePreservesNodeLiveness(t *testing.T) {
+	f, c := newSleepLeaseFixture(t)
+	f.store.clock = failedSeatClock{f.clock}
+	if _, ok := f.store.clock.(awakeClockSource); ok {
+		t.Fatal("fixture must have no pausing-clock source")
+	}
+	c.advance(f.options.NodeStaleAfter, 0)
+	result, err := f.store.Reconcile(t.Context())
+	if err != nil || result.StaleNodes != 1 || result.DeadNodes != 0 || result.ExpiredAttempts != 0 {
+		t.Fatalf("boot-only failure blocked stale detection: %+v err=%v", result, err)
+	}
+	c.advance(f.options.NodeDeadAfter-f.options.NodeStaleAfter, 0)
+	result, err = f.store.Reconcile(t.Context())
+	if err != nil || result.DeadNodes != 1 || result.ExpiredAttempts != 0 {
+		t.Fatalf("boot-only failure blocked dead detection: %+v err=%v", result, err)
+	}
+}
+
+func TestAttemptLeaseBootFailureSettlesDeadHostRevocations(t *testing.T) {
+	h, ledger, _, computer, _ := owedOutage(t, "boot-failed-dead-host")
+	h.stopServer()
+	if len(mustGetComputer(t, h, computer.ComputerID).OwedRevocations) != 2 {
+		t.Fatal("fixture has no owed revocations")
+	}
+	h.store.clock = failedSeatClock{h.clock}
+	h.clock.Advance(DefaultNodeDeadAfter + time.Second)
+	result, err := h.store.Reconcile(t.Context())
+	if err != nil || result.DeadNodes != 1 {
+		t.Fatalf("boot failure retained the dead host: %+v err=%v", result, err)
+	}
+	if owed := mustGetComputer(t, h, computer.ComputerID).OwedRevocations; len(owed) != 0 {
+		t.Fatalf("dead host retained owed revocations: %+v", owed)
+	}
+	if len(ledger.taken()) != 0 {
+		t.Fatal("dead-host settlement called the run ledger")
 	}
 }

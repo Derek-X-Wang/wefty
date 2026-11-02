@@ -98,7 +98,7 @@ func establishHealth(ctx context.Context, tx *sql.Tx, attemptID string, cause he
 					AND attempts.boot_session_id=nodes.boot_session_id
 					AND attempts.authority_generation=nodes.authority_generation
 			)`, now.UnixNano(), jobID, attemptID, contract.AttemptClaimed, contract.AttemptRunning,
-		contract.AttemptAwaitingInput, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, now.UnixNano(), contract.NodeAlive); err != nil {
+		contract.AttemptAwaitingInput, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, leaseWallTime(ctx, now).UnixNano(), contract.NodeAlive); err != nil {
 		return internalError(err, "record service stability")
 	}
 	return nil
@@ -272,7 +272,7 @@ func reconcileServiceStability(ctx context.Context, tx *sql.Tx, now time.Time, w
 	// particular, a node that reaches the equal two-minute dead/stability
 	// boundary is dead and cannot reset a service's failure streak.
 	resets, err := tx.ExecContext(ctx, serviceStabilityResetSQL, contract.ServiceDesiredRunning, now.Add(-window).UnixNano(),
-		contract.JobRunning, contract.AttemptRunning, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, now.UnixNano(), contract.NodeAlive)
+		contract.JobRunning, contract.AttemptRunning, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, leaseWallTime(ctx, now).UnixNano(), contract.NodeAlive)
 	if err != nil {
 		return 0, internalError(err, "reset stable service restart streaks")
 	}

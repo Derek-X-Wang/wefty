@@ -15,3 +15,12 @@ func Now() (time.Duration, error) {
 	}
 	return time.Duration(ts.Nano()), nil
 }
+
+// AwakeNow measures elapsed time excluding system sleep, for comparison with Now.
+func AwakeNow() (time.Duration, error) {
+	var ts unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
+		return 0, err
+	}
+	return time.Duration(ts.Nano()), nil
+}

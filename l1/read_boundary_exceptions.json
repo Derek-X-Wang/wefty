@@ -217,7 +217,7 @@
   },
   {
     "site": "store.go:*Store.initialize | s.db",
-    "count": 11,
+    "count": 13,
     "reason": "infrastructure: initialization and schema migration",
     "slice": "permanent"
   },

@@ -452,6 +452,10 @@ func (s *Store) withAgentReadSnapshot(ctx context.Context, use func(context.Cont
 	}
 	at := canonicalTime(s.clock.Now())
 	ctx = withAttemptClock(ctx, s.clock, at)
+	ctx, err = withLeaseSleepGap(ctx, tx, false)
+	if err != nil {
+		return err
+	}
 	reads := newDatabaseReads(tx, at, nil)
 	reads.seatClock = s.clock
 	reads.personDeviceBinding = &s.personDeviceBinding

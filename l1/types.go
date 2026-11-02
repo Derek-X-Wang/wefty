@@ -464,7 +464,8 @@ type NodeActiveAttempt struct {
 // Node carries observed facts. AllowedActions is filled only by the HTTP route
 // for its authenticated caller, never by a store read.
 type Node struct {
-	Generations []NodeGenerationObservation `json:"generations,omitempty"`
+	heartbeatSleep time.Duration               // Private extension of the implicit heartbeat deadlines.
+	Generations    []NodeGenerationObservation `json:"generations,omitempty"`
 	contract.NodeRegistration
 	State                 contract.NodeState       `json:"state"`
 	AuthoritativeTags     []string                 `json:"authoritative_tags"`

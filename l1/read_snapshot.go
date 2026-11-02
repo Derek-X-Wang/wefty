@@ -548,6 +548,10 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 	}
 	at := canonicalTime(s.clock.Now())
 	ctx = withAttemptClock(ctx, s.clock, at)
+	ctx, err = withLeaseSleepGap(ctx, tx, false)
+	if err != nil {
+		return err
+	}
 	reads := newDatabaseReads(tx, at, caller)
 	reads.diagnosticObservations = true
 	reads.seatClock = s.clock
@@ -639,6 +643,11 @@ func (s *Store) beginWriteTransaction(ctx context.Context, caller *serviceAction
 		at = canonicalTime(s.clock.Now())
 	}
 	ctx = withAttemptClock(ctx, s.clock, at)
+	ctx, err = withLeaseSleepGap(ctx, tx, true)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
 	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
 }
 
@@ -660,6 +669,11 @@ func (s *Store) beginSettlementWriteTransaction(ctx context.Context, caller *ser
 		at = canonicalTime(s.clock.Now())
 	}
 	ctx = withAttemptClock(ctx, s.clock, at)
+	ctx, err = withLeaseSleepGap(ctx, tx, true)
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
 	return &writeTransaction{ctx: ctx, tx: tx, at: at, actor: caller, personDeviceBinding: &s.personDeviceBinding}, nil
 }
 
