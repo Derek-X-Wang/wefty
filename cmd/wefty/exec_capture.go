@@ -287,12 +287,8 @@ func validateExecRepo(ctx context.Context, root string) error {
 			}
 		}
 	}
-	unmerged, err := execGit(ctx, root, "", nil, "ls-files", "-u")
-	if err != nil {
+	if err := validateExecUnmergedFiles(ctx, root); err != nil {
 		return err
-	}
-	if unmerged != "" {
-		return usageError("unresolved merge is not supported by exec; finish or abort the merge first")
 	}
 	sparse, _ := execGit(ctx, root, "", nil, "config", "--bool", "core.sparseCheckout")
 	if strings.TrimSpace(sparse) == "true" {
@@ -345,6 +341,79 @@ func validateExecRepo(ctx context.Context, root string) error {
 		}
 	}
 	return nil
+}
+
+func validateExecUnmergedFiles(ctx context.Context, root string) error {
+	unmerged, err := execGit(ctx, root, "", nil, "ls-files", "-u", "-z")
+	if err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	var markers []string
+	for _, entry := range strings.Split(unmerged, "\x00") {
+		_, path, ok := strings.Cut(entry, "\t")
+		if !ok || seen[path] {
+			continue
+		}
+		seen[path] = true
+		full := filepath.Join(root, path)
+		info, err := os.Lstat(full)
+		if os.IsNotExist(err) {
+			continue // The private index captures a missing working file as a deletion.
+		}
+		if err != nil {
+			return err
+		}
+		var data []byte
+		if info.Mode()&os.ModeSymlink != 0 {
+			var target string
+			target, err = os.Readlink(full)
+			data = []byte(target)
+		} else if info.Mode().IsRegular() {
+			data, err = os.ReadFile(full)
+		} else {
+			return usageError(fmt.Sprintf("unsupported unmerged working file: %s; finish or abort the merge", path))
+		}
+		if err != nil {
+			return err
+		}
+		for _, line := range bytes.Split(data, []byte{'\n'}) {
+			if isConflictMarker(line) {
+				markers = append(markers, path)
+				break
+			}
+		}
+	}
+	if len(markers) > 0 {
+		paths := strings.Join(markers[:min(5, len(markers))], ", ")
+		if len(markers) > 5 {
+			paths += fmt.Sprintf(" and %d more", len(markers)-5)
+		}
+		return usageError(fmt.Sprintf("unresolved merge: conflict markers remain in %s; resolve the markers, or finish or abort the merge", paths))
+	}
+	return nil
+}
+
+// isConflictMarker matches the lines Git writes around a conflict: at least
+// seven '<', '|' or '>' (more under conflict-marker-size), or exactly seven
+// '=', then whitespace or the line end. A longer '=' run, such as a heading
+// underline, is not a marker.
+func isConflictMarker(line []byte) bool {
+	if len(line) < 7 {
+		return false
+	}
+	c := line[0]
+	if c != '<' && c != '|' && c != '=' && c != '>' {
+		return false
+	}
+	n := 0
+	for n < len(line) && line[n] == c {
+		n++
+	}
+	if n < 7 || (c == '=' && n != 7) {
+		return false
+	}
+	return n == len(line) || line[n] == ' ' || line[n] == '\t' || line[n] == '\r'
 }
 
 type execFile struct{ full, path, mode, hash string }

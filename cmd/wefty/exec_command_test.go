@@ -483,7 +483,7 @@ func TestExecRefusalsSubmitNothing(t *testing.T) {
 				t.Setenv("PATH", shim+string(os.PathListSeparator)+os.Getenv("PATH"))
 				wantMessage = "current folder is outside the git checkout; cd into the checkout first"
 			case "unresolved merge":
-				wantMessage = "unresolved merge is not supported by exec; finish or abort the merge first"
+				wantMessage = "unresolved merge: conflict markers remain in sub/tracked; resolve the markers, or finish or abort the merge"
 				execTestGit(t, repo, "checkout", "-qb", "side")
 				writeExecFile(t, filepath.Join(repo, "sub", "tracked"), "side")
 				execTestGit(t, repo, "commit", "-qam", "side")
