@@ -11,9 +11,11 @@ import sys
 import tarfile
 import time
 
-# Python runs this handler only between bytecodes in the main thread. A
-# SIGTERM caught just before a blocking read would leave that read waiting
-# (#1283). The wakeup pipe makes such a signal visible to the input select.
+# Python runs this handler only between bytecodes in the main thread.
+# The wakeup pipe makes SIGTERM visible even when another thread catches it.
+# A buffered-reader constructor's tell() probe can clear the handler's
+# SystemExit (#1283). Input therefore exits on WAKE itself, as copy output
+# does for a full pipe (#1287). Keep the byte so later reads also exit.
 WAKE, wake_write = os.pipe()
 os.set_blocking(WAKE, False)
 os.set_blocking(wake_write, False)
@@ -39,13 +41,7 @@ class Input:
         while self.offset == len(self.data):
             ready = select.select([self.fd, WAKE], [], [])[0]
             if WAKE in ready:
-                try:
-                    while os.read(WAKE, 512):
-                        pass
-                except BlockingIOError:
-                    pass
-                # Back in bytecode, the pending handler runs before the next wait.
-                continue
+                sys.exit(1)
             data = os.read(self.fd, 65536)
             if not data:
                 return b''
