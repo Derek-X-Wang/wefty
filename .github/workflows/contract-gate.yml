@@ -138,11 +138,20 @@ jobs:
           if-no-files-found: warn
 
   service-acceptance:
-    name: service-acceptance / ${{ matrix.os }}
+    name: service-acceptance / ${{ matrix.os }}${{ matrix.shard && format(' / {0}', matrix.shard) || '' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # On hosted macOS this suite runs 42-50 min and decides when the whole
+        # gate ends (#1035). -p 1 runs packages one after another, so two
+        # runners divide it cleanly: cmd/wefty alone (960-1245 s) and every
+        # other package (1395-1455 s).
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+            shard: cmd
+          - os: macos-latest
+            shard: rest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -158,7 +167,20 @@ jobs:
         # timing out on macos-latest while passing in every other job.
         # -timeout=45m matches mac-linux-runner: cmd/wefty takes 1107-1243 s
         # here on hosted macOS and hit 30m on PR #1319 (#163, #1035, #1326).
-        run: go test -p 1 -timeout=45m -tags=service_acceptance ./...
+        # The two macOS halves list packages with the same tags, so a package
+        # with only tagged files still lands in "rest".
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -o pipefail
+          case "$SHARD" in
+            '') packages=./... ;;
+            cmd) packages=./cmd/wefty ;;
+            rest) packages=$(go list -tags=service_acceptance ./... | grep -vxF github.com/Derek-X-Wang/wefty/cmd/wefty) ;;
+            *) echo "unknown shard: $SHARD" >&2; exit 1 ;;
+          esac
+          # shellcheck disable=SC2086 # one import path per word
+          go test -p 1 -timeout=45m -tags=service_acceptance $packages
 
   dogfood-workflow:
     name: dogfood-workflow
