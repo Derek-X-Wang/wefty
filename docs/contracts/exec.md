@@ -780,7 +780,9 @@ first hosted it. `POST /v1/runs` accepts `seat_run` as a fourth program source:
 The request carries the Seat credential in `X-Wefty-Seat-Credential`, never in
 params, command text or environment. It requires a Fabric client. It cannot
 have another program source, parent, dispatch authority, restartability,
-required envelope, envelope schema or other params. L3 proves the credential
+required envelope, envelope schema or other params. Its `params` must be absent or `{}`;
+L3 also accepts JSON `null`, which CLIs before #1332 sent. Any other value is
+refused. L3 proves the credential
 through L1's `GET /v1/seats/{seat_id}/run-target`, which counts once as a Seat
 call for a new submission, then records the public Seat,
 Computer, Node and Computer Attempt identities in immutable Run params,

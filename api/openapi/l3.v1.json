@@ -513,7 +513,8 @@
                       "properties": {
                         "params": {
                           "type": "object",
-                          "maxProperties": 0
+                          "maxProperties": 0,
+                          "description": "Omit or send {}. L3 also accepts JSON null, which CLIs before #1332 sent; this schema does not describe that legacy form."
                         },
                         "dispatch_authority": {
                           "const": false
