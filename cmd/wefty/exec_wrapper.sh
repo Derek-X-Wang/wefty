@@ -96,7 +96,8 @@ fi
   # Restore the caller's base and index, keeping the captured working files.
   git -C "$work" -c core.hooksPath=/dev/null -c core.autocrlf=false reset --quiet --mixed HEAD^
 ) || snapshot_checkout_failed
-cd "$work/$folder" || snapshot_checkout_failed
+cd -P "$work/$folder" || snapshot_checkout_failed
+export PWD
 # The data stays inside storage; the short link leaves room for Unix sockets.
 # Record each candidate before linking so retirement also covers setup failure.
 (umask 077; mkdir -m 700 -- "$storage/tmp") || snapshot_checkout_failed "could not create the run's temp folder"
