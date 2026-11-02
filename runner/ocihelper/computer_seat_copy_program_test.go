@@ -151,6 +151,64 @@ func TestSeatCopyProgramParentLinkCancellationAndDeepPack(t *testing.T) {
 	}
 }
 
+// Force SIGTERM inside BufferedReader's initial raw.tell(): CPython clears
+// its SystemExit there. The wake byte must still cancel input and clean staging.
+func TestSeatCopyProgramSignalDuringReaderSetup(t *testing.T) {
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := t.TempDir()
+	child := exec.Command(python, "-I", "-S", "-c", seatReaderSetupSignal+seatCopyProgram, "in", filepath.Join(parent, "cancelled"))
+	input, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	child.Stderr = &stderr
+	deadline := time.Now().Add(seatCopyHandshakeBound)
+	if err = child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer child.Process.Kill()
+	defer input.Close() // Keep stdin open through exit; EOF would hide a lost wake byte.
+	var partial bytes.Buffer
+	if err = tar.NewWriter(&partial).WriteHeader(&tar.Header{Name: "item", Mode: 0600, Size: 1 << 20}); err != nil {
+		t.Fatal(err)
+	}
+	// Read the handshake even if writing fails, so HOOK_MISSING is reported.
+	_, writeErr := input.Write(partial.Bytes())
+	readSeatCopyHandshake(t, child, output, "STAGED\n", deadline, &stderr)
+	if writeErr != nil {
+		t.Fatal(writeErr)
+	}
+	terminateSeatCopyChild(t, child, &stderr)
+	if code := child.ProcessState.ExitCode(); code != 1 {
+		t.Fatalf("cancelled copy exit=%d %s", code, stderr.String())
+	}
+	if _, err = os.Lstat(filepath.Join(parent, "cancelled")); !os.IsNotExist(err) {
+		t.Fatalf("cancelled destination: %v", err)
+	}
+	requireNoSeatCopyStaging(t, parent)
+}
+
+// This CPython hook must fail loudly if tarfile changes, rather than silently
+// losing the regression coverage. readSeatCopyHandshake rejects HOOK_MISSING
+// and also bounds the wait if the patched tell() is never called.
+const seatReaderSetupSignal = seatCopyStackDump + `import os, signal, tarfile
+if not (hasattr(tarfile, '_FileInFile') and 'tell' in vars(tarfile._FileInFile)):
+    os.write(1, b'HOOK_MISSING tarfile._FileInFile.tell\n')
+    sys.exit(3)
+def interrupted_tell(self):
+    os.write(1, b'STAGED\n')
+    signal.pause()
+tarfile._FileInFile.tell = interrupted_tell
+`
+
 // A SIGTERM that Python's main thread does not take inside its blocking read
 // must still end the copy and remove the staging folder (#1283). Blocking
 // SIGTERM in the main thread sends it to a helper thread, so the main thread
