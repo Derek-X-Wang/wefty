@@ -26,3 +26,22 @@ func (s *Store) snapshotHardLimit(ctx context.Context) time.Duration {
 	}
 	return readSnapshotHardLimit
 }
+
+// SetReadSnapshotPageCutoffForTest lets an in-process harness that asserts a
+// full page keep that page on a slow test runner (#1441). The limit must stay
+// below the hard hold limit. Call it before sharing the Store or serving
+// requests. Production callers must not use it; a Store without this override
+// keeps the shared soft cutoff.
+func (s *Store) SetReadSnapshotPageCutoffForTest(cutoff time.Duration) {
+	if cutoff <= 0 {
+		panic("l1: test read snapshot page cutoff must be positive")
+	}
+	s.readSnapshotPageCutoffForTest = cutoff
+}
+
+func (s *Store) snapshotPageCutoff() time.Duration {
+	if s.readSnapshotPageCutoffForTest > 0 {
+		return s.readSnapshotPageCutoffForTest
+	}
+	return readSnapshotPageCutoff
+}

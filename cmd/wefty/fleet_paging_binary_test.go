@@ -25,6 +25,10 @@ func TestFleetPagingFromRealBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.SetReadSnapshotHardLimitForTest(2 * time.Second)
+	// The default-page check below asserts exactly DefaultJobPageLimit nodes, so
+	// a slow runner must not end that page at the 120 ms soft cutoff (#1441).
+	// TestNodesListing1000AdaptiveCutoff covers short pages in l1.
+	store.SetReadSnapshotPageCutoffForTest(1200 * time.Millisecond)
 	t.Cleanup(func() { store.Close() })
 	server, err := l1.NewServer(control, store, l1.ServerConfig{})
 	if err != nil {
