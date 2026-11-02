@@ -288,6 +288,7 @@ while :; do sleep 1; done
 	importRealtimeProbeImage(t, t.Context(), barrier, reference, digest)
 	adapter := ocirunner.NewAdapter(barrier)
 	spoolDirectory := t.TempDir()
+	handoffRoot := t.TempDir()
 	managedRoot, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +305,8 @@ while :; do sleep 1; done
 	authorities := newNativeClaimAuthorityRecorder()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "native-service-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: handoffRoot,
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "native-service-node", BootSessionID: "native-service-boot", Version: "realtiming",
 		Capabilities: map[string]bool{"kind:process": true},
 		CapabilityProbe: capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {
@@ -628,7 +630,8 @@ while :; do sleep 1; done
 	}
 	restartAdapter := ocirunner.NewAdapter(restartBarrier)
 	nodeAgent, err = New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: handoffRoot,
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "native-service-node", BootSessionID: restartBootID, Version: "realtiming",
 		Capabilities: map[string]bool{"kind:process": true},
 		CapabilityProbe: capabilityProbeFunc(func(ctx context.Context) (CapabilityProbeResult, error) {

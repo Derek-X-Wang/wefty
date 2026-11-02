@@ -105,7 +105,8 @@ func newStalledRemovalNode(t *testing.T, name string, declareStall bool) *stalle
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: name,
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: name,
 		BootSessionID: "boot-" + name, Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true},
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {

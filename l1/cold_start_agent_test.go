@@ -79,9 +79,10 @@ func TestColdStartIdleComputerIsStartingNotUnschedulable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			config := agent.Config{Fabric: network.NewFabric(fabric.Identity{NodeID: "fabric-cold", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane", NodeID: "cold", BootSessionID: "boot", Version: "test", Clock: coldConfigClock{now}, OS: "darwin", Architecture: "arm64", Capabilities: map[string]bool{"kind:process": true, "kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true}, CapabilityProbe: coldUnrunProbe{t}, OCIBootBarrier: coldIdleBarrier{}, ManagedRootDirectory: managed, LogSpoolDirectory: t.TempDir(), ComputerRoom: &room, OCIIntent: func(context.Context) (agent.OCIIntentObservation, error) {
-				return agent.OCIIntentObservation{Enabled: enabled, Revision: 2}, nil
-			}}
+			config := agent.Config{
+				HandoffRoot: t.TempDir(), Fabric: network.NewFabric(fabric.Identity{NodeID: "fabric-cold", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane", NodeID: "cold", BootSessionID: "boot", Version: "test", Clock: coldConfigClock{now}, OS: "darwin", Architecture: "arm64", Capabilities: map[string]bool{"kind:process": true, "kind:oci": true, "runtime_handler:" + ocihelper.DefaultRuntimeHandler: true}, CapabilityProbe: coldUnrunProbe{t}, OCIBootBarrier: coldIdleBarrier{}, ManagedRootDirectory: managed, LogSpoolDirectory: t.TempDir(), ComputerRoom: &room, OCIIntent: func(context.Context) (agent.OCIIntentObservation, error) {
+					return agent.OCIIntentObservation{Enabled: enabled, Revision: 2}, nil
+				}}
 			if mode == "no-room" {
 				config.ComputerRoom = nil
 			}

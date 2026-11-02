@@ -89,7 +89,8 @@ func TestOperatorCLIFullFlowOverPlainFabric(t *testing.T) {
 	l3Done := serveTestServer(ctx, func() error { return l3Server.Serve(ctx, l3Listener) })
 
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address,
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: l3.DefaultL1Address,
 		NodeID: "node-cli", BootSessionID: "boot-cli", Version: "integration-v1",
 		OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond,

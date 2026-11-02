@@ -482,7 +482,7 @@ func TestNeverProcessPublicContractWithRealAgent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			nodeAgent, err := New(Config{Fabric: network.NewFabric(fabric.Identity{NodeID: "never-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane", NodeID: "never-node", BootSessionID: "boot-never", Version: "test", Capabilities: map[string]bool{"kind:process": true}, MaxServiceSlots: 1, ManagedRootDirectory: root, LogSpoolDirectory: t.TempDir(), GuardianExecutable: agentBinaryPath, HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 20 * time.Millisecond})
+			nodeAgent, err := New(Config{HandoffRoot: t.TempDir(), Fabric: network.NewFabric(fabric.Identity{NodeID: "never-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane", NodeID: "never-node", BootSessionID: "boot-never", Version: "test", Capabilities: map[string]bool{"kind:process": true}, MaxServiceSlots: 1, ManagedRootDirectory: root, LogSpoolDirectory: t.TempDir(), GuardianExecutable: agentBinaryPath, HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 20 * time.Millisecond})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -607,7 +607,8 @@ func TestNeverProcessStartSurvivesLostAcknowledgement(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: network.NewFabric(fabric.Identity{NodeID: "never-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      network.NewFabric(fabric.Identity{NodeID: "never-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "never-node", BootSessionID: "boot-never", Version: "test", Capabilities: map[string]bool{"kind:process": true}, MaxServiceSlots: 1,
 		ManagedRootDirectory: root, LogSpoolDirectory: t.TempDir(), WorkloadRuntimes: testRuntimeSet(runner),
 		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 100 * time.Millisecond,

@@ -2631,7 +2631,8 @@ func assertPendingEvidenceDoesNotBlockRegistration(t *testing.T) {
 
 	participant := network.NewFabric(fabric.Identity{NodeID: "agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
-		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-2", Version: "test",
 		// Registration is observed while the poison request is held; no fast
 		// HTTP response is part of this test's contract. The operation timeout

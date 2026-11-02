@@ -106,7 +106,8 @@ func TestDogfoodWorkflowContractSmoke(t *testing.T) {
 		"FAKE_AGENT_LOG="+invocationLog,
 	)
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: "dogfood-node", BootSessionID: "boot-dogfood", Version: "contract-smoke",
 		OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond,

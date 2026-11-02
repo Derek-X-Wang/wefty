@@ -35,7 +35,8 @@ func assertAgentReregistersAfterControlPlaneReturns(t *testing.T) {
 	}
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
 		HeartbeatInterval: time.Second, ClaimInterval: 10 * time.Millisecond,
 		LogSpoolDirectory: t.TempDir(),
@@ -98,7 +99,8 @@ func assertAgentQuarantineIsObservableAndNonTerminal(t *testing.T) {
 	defer stopServer()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node"})
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-1", BootSessionID: "boot-1", Version: "test",
 		LogSpoolDirectory: t.TempDir(),
 	})

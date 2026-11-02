@@ -348,7 +348,8 @@ func TestDurableOCIIntentGatesBackgroundRecoveryUntilControllerStart(t *testing.
 		t.Fatal(err)
 	}
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "intent-node", BootSessionID: "intent-boot", Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe, OCIIntent: probe.intentObservation,
 		OCIBootBarrier: readyMainTestOCIBootBarrier{}, HeartbeatInterval: 10 * time.Millisecond, ClaimInterval: time.Second,
@@ -470,7 +471,8 @@ func TestControllerStopWaitsForRealInFlightCompletionRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "controller-fence-node", BootSessionID: "controller-fence-boot", Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true}, CapabilityProbe: staticMainOCIProbe{},
 		OCIIntent: func(ctx context.Context) (agent.OCIIntentObservation, error) {
@@ -618,7 +620,7 @@ func TestMirrorRunOutputFlagWiresOptionalConsoleSink(t *testing.T) {
 				t.Fatal(err)
 			}
 			var stdout, stderr bytes.Buffer
-			config := agent.Config{OutputSinkFactory: consoleOutputSinkFactory(*mirrorRunOutput, &stdout, &stderr)}
+			config := agent.Config{HandoffRoot: t.TempDir(), OutputSinkFactory: consoleOutputSinkFactory(*mirrorRunOutput, &stdout, &stderr)}
 			if got := config.OutputSinkFactory != nil; got != test.wantSink {
 				t.Fatalf("OutputSinkFactory present = %t, want %t", got, test.wantSink)
 			}

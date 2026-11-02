@@ -67,7 +67,8 @@ func TestProcessReachedLimitFailsThroughL1(t *testing.T) {
 				if guarded {
 					executor = guardedLimitExecutor{executor}
 				}
-				node, err := New(Config{Fabric: network.NewFabric(fabric.Identity{NodeID: "agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane", NodeID: "limit-node", BootSessionID: "boot", Version: "test", Capabilities: map[string]bool{"kind:process": true}, ManagedRootDirectory: root, LogSpoolDirectory: t.TempDir(),
+				node, err := New(Config{
+					HandoffRoot: t.TempDir(), Fabric: network.NewFabric(fabric.Identity{NodeID: "agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane", NodeID: "limit-node", BootSessionID: "boot", Version: "test", Capabilities: map[string]bool{"kind:process": true}, ManagedRootDirectory: root, LogSpoolDirectory: t.TempDir(),
 					WorkloadRuntimes: map[string]WorkloadRuntime{"process": processrunner.NewAdapter(executor)}, HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: 50 * time.Millisecond})
 				if err != nil {
 					t.Fatal(err)

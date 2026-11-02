@@ -209,6 +209,7 @@ func TestAgentLoadAdmissionUsesConfiguredReader(t *testing.T) {
 	// changes the claim decision and makes this test fail.
 	limit := 0.5
 	nodeAgent, err := New(Config{
+		HandoffRoot:         t.TempDir(),
 		Fabric:              network.NewFabric(fabric.Identity{NodeID: "agent", Tags: []string{l1.DefaultAgentPrincipalTag}}),
 		ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot", Version: "test",
 		Capabilities: map[string]bool{"kind:process": true}, WorkloadRuntimes: testRuntimeSet(runner), LogSpoolDirectory: t.TempDir(),

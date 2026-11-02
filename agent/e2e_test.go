@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -566,6 +567,17 @@ type managedProcess struct {
 func startManagedProcess(t *testing.T, executable string, arguments ...string) *managedProcess {
 	t.Helper()
 	if executable == agentBinaryPath {
+		// Own handoff root: the default is shared with an installed node (#1430).
+		hasHandoffRoot := false
+		for _, argument := range arguments {
+			if argument == "--handoff-root" || strings.HasPrefix(argument, "--handoff-root=") {
+				hasHandoffRoot = true
+				break
+			}
+		}
+		if !hasHandoffRoot {
+			arguments = append(arguments, "--handoff-root="+t.TempDir())
+		}
 		if err := requireTestManagedRoot(arguments); err != nil {
 			t.Fatal(err)
 		}

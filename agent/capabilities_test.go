@@ -193,7 +193,8 @@ func TestWatchdogRecoveryCannotReopenDisabledOCIIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-watchdog-disabled", BootSessionID: "boot-watchdog-disabled",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-watchdog-disabled", BootSessionID: "boot-watchdog-disabled",
 		Version: "test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
 		CapabilityProbe: probe, OCIIntent: func(context.Context) (OCIIntentObservation, error) {
 			return OCIIntentObservation{Enabled: intentEnabled.Load(), Revision: 2}, nil
@@ -431,7 +432,8 @@ func TestNilProbeCannotAdvertiseOCI(t *testing.T) {
 
 func TestAgentRefusesOCIProbeWithoutBootBarrier(t *testing.T) {
 	_, err := New(Config{
-		NodeID: "node", BootSessionID: "boot", Version: "test",
+		HandoffRoot: t.TempDir(),
+		NodeID:      "node", BootSessionID: "boot", Version: "test",
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 			return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 		}),
@@ -447,19 +449,21 @@ func TestAgentRefusesOCIWithoutIntentAuthority(t *testing.T) {
 		name   string
 		config Config
 	}{
-		{name: "raw capability", config: Config{Capabilities: map[string]bool{"kind:oci": true}, OCIIntent: nil}},
+		{name: "raw capability", config: Config{HandoffRoot: t.TempDir(), Capabilities: map[string]bool{"kind:oci": true}, OCIIntent: nil}},
 		{name: "probe only", config: Config{
+			HandoffRoot: t.TempDir(),
 			CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
 				return CapabilityProbeResult{Capabilities: map[string]bool{"kind:oci": true}}, nil
 			}),
 			OCIBootBarrier: readyOCIBootBarrier{},
 			OCIIntent:      nil,
 		}},
-		{name: "normalized capability", config: Config{Capabilities: map[string]bool{"  KiNd:OcI  ": true}, OCIIntent: nil}},
-		{name: "bare job kind", config: Config{Capabilities: map[string]bool{contract.JobKindOCI: true}, OCIIntent: nil}},
-		{name: "runtime only", config: Config{WorkloadRuntimes: map[string]WorkloadRuntime{
-			contract.JobKindOCI: instantWorkloadRuntime{},
-		}, OCIIntent: nil}},
+		{name: "normalized capability", config: Config{HandoffRoot: t.TempDir(), Capabilities: map[string]bool{"  KiNd:OcI  ": true}, OCIIntent: nil}},
+		{name: "bare job kind", config: Config{HandoffRoot: t.TempDir(), Capabilities: map[string]bool{contract.JobKindOCI: true}, OCIIntent: nil}},
+		{name: "runtime only", config: Config{
+			HandoffRoot: t.TempDir(), WorkloadRuntimes: map[string]WorkloadRuntime{
+				contract.JobKindOCI: instantWorkloadRuntime{},
+			}, OCIIntent: nil}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -478,7 +482,8 @@ func TestAgentRefusesOCIWithoutIntentAuthority(t *testing.T) {
 func TestAgentClampsSuppressionPersistenceToControlDrainBudget(t *testing.T) {
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "suppression-clamp-agent"})
 	nodeAgent, err := New(Config{
-		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "suppression-clamp-node", BootSessionID: "suppression-clamp-boot", Version: "test",
 		OCIIntent: enabledTestOCIIntent, OperationTimeout: ocicontrol.ControlShutdownDrainTimeout + time.Hour,
 		LogSpoolDirectory: t.TempDir(),
@@ -583,7 +588,8 @@ func TestProcessOnlyAgentRegistersWithoutCapabilitySupersede(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-process-only", BootSessionID: "boot-process-only",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-process-only", BootSessionID: "boot-process-only",
 		Version: "test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: t.TempDir(),
 	})
@@ -1014,7 +1020,8 @@ func newBootBarrierTestAgent(
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: nodeID, BootSessionID: "boot-reused",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: nodeID, BootSessionID: "boot-reused",
 		Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe, OCIIntent: enabledTestOCIIntent,
 		OCIBootBarrier: barrier, HeartbeatInterval: time.Hour, ClaimInterval: 250 * time.Millisecond,
@@ -1034,7 +1041,8 @@ func newCapabilityTestAgent(t *testing.T, network *plain.Network, nodeID string,
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: nodeID, BootSessionID: "boot-" + nodeID,
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: nodeID, BootSessionID: "boot-" + nodeID,
 		Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true, "kind:oci": true}, CapabilityProbe: probe, OCIIntent: enabledTestOCIIntent,
 		OCIBootBarrier:         readyOCIBootBarrier{},
@@ -1116,7 +1124,8 @@ func assertAgentPublishesProbeWithdrawalByNextSuccessfulHeartbeat(t *testing.T) 
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-1", BootSessionID: "boot-1",
 		Version: "test", OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
 		CapabilityProbe: probe, OCIIntent: enabledTestOCIIntent, OCIBootBarrier: readyOCIBootBarrier{},
 		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: time.Second,

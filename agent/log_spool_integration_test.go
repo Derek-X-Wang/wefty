@@ -105,7 +105,8 @@ func TestAgentCompletesWithoutDuplicateLogsAfterNetworkLossMidJob(t *testing.T) 
 	firstOutput := make(chan struct{}, 1)
 	participant := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
-		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-network", Version: "test", Clock: clock,
 		Capabilities:  map[string]bool{"kind:process": true},
 		ClaimInterval: time.Second, LogBatchSize: 1, LogRetryInterval: 5 * time.Millisecond,
@@ -184,7 +185,8 @@ func TestAgentRestartRecoversOriginalAttemptSpool(t *testing.T) {
 
 	participant := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	restarted, err := New(Config{
-		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-2", Version: "test",
 		Clock: clock, LogSpoolDirectory: spoolDirectory, LogSpoolMaxBytes: 1024,
 	})
@@ -261,7 +263,8 @@ func assertAgentBootDeliversDurableLateEvidenceWithoutCrashLoop(t *testing.T) {
 
 	participant := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	restarted, err := New(Config{
-		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-2", Version: "test",
 		Clock: clock, LogSpoolDirectory: spoolDirectory, LogSpoolMaxBytes: 1024,
 		ClaimInterval: time.Second, LogRetryInterval: time.Millisecond,
