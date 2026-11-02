@@ -59,6 +59,10 @@ back. If both the default and fallback roots fail, exec reports the original
 error once and exits 1. Permission and read-only errors name the folder and
 this override.
 
+`WEFTY_EXEC_TEMP_ROOT` overrides the Run temp root for tests and unusual hosts.
+Set it on the CLI and node to an absolute writable folder outside home and exec
+storage; it never falls back, and the temp sweep then scans only this root.
+
 The capture never writes the caller's files, index, objects, stash or refs. It
 rechecks the file image, HEAD and status before submission to detect concurrent
 changes. A changed checkout triggers up to three fresh capture attempts with
@@ -143,7 +147,7 @@ and exact byte size, then renames it to `capture.bundle`. A mismatch,
 truncation, or fetch error fails preparation with a capture diagnostic and
 never starts the command. The wrapper clones the verified mailbox bundle into
 node-local exec storage. Before removing stale input at seed time, the agent
-sweeps the whole leftover `wefty-exec-work`, including its private `tmp`.
+sweeps the leftover `wefty-exec-work` and its recorded physical temp folder.
 These diagnostics are labelled `stale exec cleanup`; their stopped processes
 do not belong to the new Attempt's evidence.
 The node agent removes the mailbox bundle when the
@@ -151,7 +155,8 @@ attempt ends, including when the wrapper is killed. Through its retained opened
 mailbox root, the agent renames leftover checkout storage to a unique trash
 entry in that root. A background goroutine removes only that trash entry and
 then closes the retained root. Replacing the mailbox pathname cannot redirect
-cleanup outside the run. Recursive deletion does not delay the completion
+cleanup outside the run. A later sweep removes external temp left after storage
+removal. Recursive deletion does not delay the completion
 report to L1. Local working changes remain unstaged/untracked and HEAD remains
 the caller's base commit, as below.
 
@@ -203,15 +208,22 @@ folder or link follows the same infrastructure-error path, with reason
 `could not create the run's temp folder`. Private clones use `--template=`;
 all Git calls disable hooks with `-c core.hooksPath=/dev/null`.
 
-The command's `TMPDIR` is a private, initially empty folder inside the run
-storage, reached through a short `/tmp/wefty-run.*` link. Wefty deletes it with
-the storage, also after cancel. Tool caches kept in `TMPDIR` start cold in each
-run. A hard kill followed by a later sweep can leave only a dangling link.
+The command's `TMPDIR` is a short `/tmp/wefty-run.*` link to an initially empty
+0700 folder outside the owner's home and exec storage. Its root is physical
+`/var/tmp` (fallback `/tmp`), or physical `WEFTY_EXEC_TEMP_ROOT` when set.
+`/var/tmp` is used because macOS does not purge it by default, unlike
+`/var/folders/.../T` and `/tmp`, and a Run has no default time limit.
+On Linux, systemd-tmpfiles usually ages `/var/tmp` after 30 days.
+The short link itself still lives in `/tmp`. Wefty removes the link and physical
+folder with exec cleanup, also after cancel. Tool caches kept in `TMPDIR` start
+cold in each run. A sweep removes leftover allocations after a crash or retention
+removal. A short link whose storage record was lost can remain dangling.
 
 For `kind=capture`, `retire_exec_storage` scans before it renames storage.
 Already-retired trash skips this scan and keeps its asynchronous deletion.
 The scan selects same-user processes whose physical working folder is that
-storage or a folder beneath it. The separator boundary excludes sibling paths with the same prefix.
+storage, its validated physical temp allocation, or a folder beneath either.
+The separator boundary excludes sibling paths with the same prefix.
 This covers `work`, private `tmp` (including its `/tmp/wefty-run.*` alias), and
 other folders beneath the capture. Version 2 uses
 `$WEFTY_RUN_DIR/wefty-exec-work`; restartable captures keep that path beneath
@@ -263,7 +275,7 @@ retirement emits the same diagnostics but has no live Attempt result to amend.
 For version 2, the node agent also runs the shared Bash sweep after successful
 runtime reap and receipt validation, before mailbox finalization and log
 closure. This covers a wrapper force-killed before its cleanup runs. The agent
-sweeps only `wefty-exec-work`; deferred capture cleanup still owns retirement
+sweeps `wefty-exec-work` and its validated temp allocation; deferred capture cleanup still owns retirement
 and asynchronous deletion. Bash runs as the agent's direct child, so its parent
 exclusion protects the agent even if its executable has another name.
 The agent derives the physical mailbox path from its open directory handle,
@@ -349,7 +361,15 @@ with exit 13. Other log-follow commands keep their existing policies.
 
 Both the wrapper and CLI remove a recorded `/tmp/wefty-run.*` link only when
 its name has a safe suffix, it is a symlink, and its target is that capture's
-`tmp` folder. A link that is already gone is not a failure; a link that stays
+legacy `tmp` folder or its validated external allocation's `tmp` folder.
+The `tmp-dir` record must be a regular file, not a symlink. Its absolute path
+must name a real directory owned by this user, with basename `wefty-run-data.*`,
+and its parent must be exactly physical `WEFTY_EXEC_TEMP_ROOT` when set, or
+physical `/var/tmp` or physical `/tmp` otherwise.
+The allocation's `owner` file must equal the original storage path, including
+when cleanup retries trash. The background deleter removes this allocation
+alongside trash under the same owner guard. A link that is already gone is not
+a failure; a link that stays
 prints `wefty: warning: could not remove the temp link of <storage>` and never
 changes the command's result. They then atomically rename a finished capture before removing
 its contents. Trash names start with `.wefty-trash-`, never the live capture
@@ -379,7 +399,20 @@ capture. The accepted run's wrapper retains cleanup responsibility.
 Once acceptance is confirmed, the CLI records the run ID in the capture's
 `run-id` file. The wrapper also writes its `WEFTY_RUN_ID` there before cloning,
 including when the CLI lost the acceptance reply or exited. At the start of
-each exec, a best-effort sweep examines at most
+each exec, a best-effort background temp sweep scans only `WEFTY_EXEC_TEMP_ROOT`
+when set, or physical `/var/tmp` and `/tmp` otherwise, without scanning the same
+root twice. It ignores symlinks and foreign names or owners. It removes
+`wefty-run-data.*` directories older than one hour whose recorded storage is gone,
+only when that storage lies beneath the sweeping CLI's or agent's own storage
+roots. Comparisons clean paths and include each root's physical (symlink-resolved)
+form. Missing or invalid owners cannot be attributed and are kept; empty owner
+roots sweep nothing. An override equal to or beneath physical `$HOME` is rejected
+before any scan.
+The sweep treats an allocation whose recorded storage path is gone as abandoned;
+moving a live Run's storage by hand is outside the contract.
+The agent also runs this sweep at startup and during periodic collection.
+Agent sweep failures only warn; the CLI does not wait for temp deletion.
+A separate capture sweep examines at most
 64 immediate storage-root entries within a shared two-second foreground budget.
 On macOS without an explicit override, it also covers the fallback root when
 present, even if the default root is writable again. Each root gets a share of
@@ -498,9 +531,10 @@ refused. L1 requires `oneshot:restartable` for the Job.
 
 Every Attempt fetches the same capture and uses the same argv. A successor
 gets a fresh checkout and TMPDIR. Its mailbox is
-`<handoff>/.wefty/<run_id>/<attempt_id>`; exec work and the TMPDIR target live
-under that Attempt's mailbox. A delayed predecessor cleanup helper can retire
-only its own Attempt's storage. The Run's result API stays stable. For a
+`<handoff>/.wefty/<run_id>/<attempt_id>`; exec work lives under that mailbox.
+Each Attempt owns a separate external temp allocation recorded in its storage.
+A delayed predecessor cleanup helper can retire only its own Attempt's storage
+and validated temp allocation. The Run's result API stays stable. For a
 restartable Attempt, `WEFTY_HANDOFF_DIR` points to
 `<handoff>/.wefty-attempts/<attempt_id>`; both wrapper writes and agent result
 reads use that directory. A late predecessor write cannot become the successor's

@@ -704,6 +704,8 @@ func startStack(t *testing.T) (*http.Client, *l3.Store, string) {
 
 	// Own handoff root: the default is shared with an installed node (#1430).
 	handoffRoot := t.TempDir()
+	// The agent sweeps exec temp; keep it away from the real /var/tmp and /tmp (#1084).
+	t.Setenv("WEFTY_EXEC_TEMP_ROOT", t.TempDir())
 	nodeAgent, err := agent.New(agent.Config{
 		HandoffRoot: handoffRoot,
 		Fabric:      agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,

@@ -1677,8 +1677,14 @@ as for ordinary one-shots. Restartable commands must not daemonize.
 Ordinary preparation errors complete as failures.
 
 Restartable mailboxes use `<handoff>/.wefty/<run_id>/<attempt_id>`. Exec work
-and TMPDIR storage are beneath that mailbox, so a delayed cleanup helper can
-touch only its own Attempt's directory. Restartable result writes and reads
+is beneath that mailbox. Each Attempt has a separate temp allocation recorded
+in its storage, so a delayed cleanup helper can touch only its own Attempt's
+directory and validated allocation. TMPDIR is a short `/tmp/wefty-run.*` link to
+an initially empty 0700 folder under `/var/tmp` (fallback `/tmp`), outside the
+owner's home and exec storage. macOS does not purge `/var/tmp` by default,
+unlike `/var/folders/.../T` and `/tmp`; a Run has no default time limit.
+The short link stays in `/tmp`. Exec cleanup removes the folder, and a sweep
+removes leftovers after a crash or retention removal. Restartable result writes and reads
 use `<handoff>/.wefty-attempts/<attempt_id>` via `WEFTY_HANDOFF_DIR`;
 the Run result API remains stable and serves only the latest Attempt's result.
 Restartable execution is at-least-once. A restartable command that ends while

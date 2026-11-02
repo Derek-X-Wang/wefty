@@ -337,7 +337,14 @@ func TestUpgradeControlRejectsForgedUnlistedActions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(store.Root(), g.ID, "control-request.json"), body, 0600); err != nil {
+		// Publish it the way the store does, staged then renamed: the loop
+		// polls this file, and an in-place write lets it read a torn record
+		// and stop (#1429).
+		path := filepath.Join(store.Root(), g.ID, "control-request.json")
+		if err := os.WriteFile(path+".forged", body, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(path+".forged", path); err != nil {
 			t.Fatal(err)
 		}
 		retirementWait(t, "unlisted action refusal", func() bool {

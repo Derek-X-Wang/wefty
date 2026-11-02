@@ -231,7 +231,13 @@ def compilation_fingerprint(archive):
 def patch_exec_aliases(wrapper,cleanup,prefix):
     require(wrapper.count("/tmp/wefty-run.XXXXXXXX")==1 and cleanup.count("/tmp/wefty-run.")==2,
             "reviewed exec alias adapter shape changed")
+    require(wrapper.count('tmp_root=$(cd -- /var/tmp 2>/dev/null && pwd -P)')==1,
+            "reviewed exec allocation adapter shape changed")
     binding="b1_link_prefix="+shlex.quote(str(prefix))+"\n"
+    # Keep proof allocations under the owned root; its final cleanup owns them.
+    start=wrapper.index('# /var/tmp survives macOS temp purges;')
+    end=wrapper.index("tmp_dir=''",start)
+    wrapper=wrapper[:start]+'tmp_root='+shlex.quote(str(prefix.parent))+"\n"+wrapper[end:]
     wrapper=wrapper.replace("/tmp/wefty-run.XXXXXXXX",'"$b1_link_prefix"XXXXXXXX')
     first,rest=wrapper.split("\n",1)
     wrapper=first+"\n"+binding+rest
