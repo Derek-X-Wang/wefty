@@ -88,6 +88,7 @@ type Store struct {
 	computerIdleWait                  time.Duration
 	personDeviceBinding               personDeviceBinding
 	readSnapshotHardLimitForTest      time.Duration
+	readSnapshotPageCutoffForTest     time.Duration
 	readDB                            *sql.DB
 	readSnapshotLastLog               atomic.Int64
 	logf                              func(string, ...any)

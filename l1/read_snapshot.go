@@ -552,7 +552,7 @@ func (s *Store) withReadSnapshot(ctx context.Context, caller *serviceActionActor
 	reads.diagnosticObservations = true
 	reads.seatClock = s.clock
 	reads.personDeviceBinding = &s.personDeviceBinding
-	cutoff := readSnapshotPageCutoff
+	cutoff := s.snapshotPageCutoff()
 	if override, ok := ctx.Value(readPageCutoffContextKey{}).(time.Duration); ok {
 		cutoff = override
 	}
