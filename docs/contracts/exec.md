@@ -27,7 +27,14 @@ files, local excludes and global excludes apply to untracked files. Already
 tracked files remain tracked even when an ignore pattern matches them. Symlinks
 and executable bits are preserved. Clean checked-out submodules are frozen as
 ordinary directories; dirty, changed, or absent submodule checkouts are refused.
-Not-a-repository, unborn HEAD, unresolved conflicts, LFS attributes/configuration,
+Unmerged index paths are captured from their working files without changing the
+caller's index. Each such file must have no Git conflict marker line: at least
+seven `<`, `|` or `>` (more under `conflict-marker-size`), or exactly `=======`,
+at line start, then whitespace or the line end. A longer `=` run, such as a
+heading underline, is not a marker. Files with markers are refused. The error names
+up to five paths and says to resolve the markers, or finish or abort the merge.
+A missing unmerged working file is captured as a deletion.
+Not-a-repository, unborn HEAD, LFS attributes/configuration,
 sparse checkouts, and partial clones are refused. Detached HEAD is supported.
 An ignored or empty start folder that is absent from the snapshot is refused
 before submission.
