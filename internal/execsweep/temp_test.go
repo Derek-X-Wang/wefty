@@ -20,7 +20,8 @@ func TestSweepTempDirs(t *testing.T) {
 		name, owner string
 		old         bool
 	}{
-		{"wefty-run-data.gone", filepath.Join(root, "gone"), false},
+		{"wefty-run-data.gone", filepath.Join(root, "gone"), true},
+		{"wefty-run-data.gone-fresh", filepath.Join(root, "gone"), false},
 		{"wefty-run-data.live", storage, false},
 		{"wefty-run-data.old", "", true},
 		{"wefty-run-data.fresh", "", false},
@@ -58,7 +59,7 @@ func TestSweepTempDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, removed := range map[string]bool{
-		"wefty-run-data.gone": true, "wefty-run-data.live": false,
+		"wefty-run-data.gone": true, "wefty-run-data.gone-fresh": false, "wefty-run-data.live": false,
 		"wefty-run-data.old": true, "wefty-run-data.fresh": false,
 		"foreign": false, "wefty-run-data.symlink": false, "storage": false,
 	} {
@@ -143,7 +144,7 @@ func TestSweepTempDirsLockedDescendant(t *testing.T) {
 	if err := os.Remove(storage); err != nil {
 		t.Fatal(err)
 	}
-	if err := sweepTempDirs(t.Context(), []string{root}, time.Now()); err != nil {
+	if err := sweepTempDirs(t.Context(), []string{root}, time.Now().Add(2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(allocation); !os.IsNotExist(err) {

@@ -395,8 +395,8 @@ Once acceptance is confirmed, the CLI records the run ID in the capture's
 including when the CLI lost the acceptance reply or exited. At the start of
 each exec, a best-effort background temp sweep scans physical `/var/tmp` and `/tmp`,
 without scanning the same root twice. It ignores symlinks and foreign names or
-owners. It removes `wefty-run-data.*` directories whose owner names missing
-storage, and allocations with missing or invalid owners older than one hour.
+owners. It removes `wefty-run-data.*` directories older than one hour whose
+owner names missing storage or is missing or invalid.
 The sweep treats an allocation whose recorded storage path is gone as abandoned;
 moving a live Run's storage by hand is outside the contract.
 The agent also runs this sweep at startup and during periodic collection.

@@ -68,6 +68,12 @@ func sweepTempDir(ctx context.Context, path string, now time.Time) error {
 	if !info.IsDir() || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Getuid()) {
 		return nil
 	}
+	// A young allocation may still be initializing, or its storage may be
+	// mid-retirement; leftovers wait an hour, which also keeps concurrent
+	// sweeps away from fresh fixtures.
+	if now.Sub(info.ModTime()) <= time.Hour {
+		return nil
+	}
 	ownerPath := filepath.Join(path, "owner")
 	owner, err := os.Lstat(ownerPath)
 	storage := ""
@@ -76,13 +82,11 @@ func sweepTempDir(ctx context.Context, path string, now time.Time) error {
 			storage = strings.TrimSuffix(string(raw), "\n")
 		}
 	}
-	if !filepath.IsAbs(storage) {
-		// Incomplete initialization gets the same grace as a missing owner.
-		if now.Sub(info.ModTime()) <= time.Hour {
-			return nil
+	// An allocation without a valid owner never finished initialization.
+	if filepath.IsAbs(storage) {
+		if _, err := os.Lstat(storage); !os.IsNotExist(err) {
+			return err
 		}
-	} else if _, err := os.Lstat(storage); !os.IsNotExist(err) {
-		return err
 	}
 	// WalkDir does not follow links. Open each real directory before reading
 	// its children, including folders a command left without owner access.

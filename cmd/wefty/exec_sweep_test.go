@@ -216,6 +216,11 @@ func TestExecWrapperCleanupAlreadyRemoved(t *testing.T) {
 	}
 	link, target := parts[0], parts[1]
 	t.Cleanup(func() { _ = os.Remove(link); _ = os.RemoveAll(filepath.Dir(target)) })
+	// The sweep leaves allocations younger than an hour alone.
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(filepath.Dir(target), old, old); err != nil {
+		t.Fatal(err)
+	}
 	if err := execsweep.SweepTempDirs(t.Context()); err != nil {
 		t.Fatal(err)
 	}
