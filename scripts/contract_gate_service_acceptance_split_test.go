@@ -69,10 +69,19 @@ func TestContractGateServiceAcceptanceHalvesRunEveryPackageOnce(t *testing.T) {
 				return fmt.Errorf("service acceptance step has %q %d times", want, strings.Count(run.Run, want))
 			}
 		}
-		if aggregate, ok := workflow.Jobs["all-tests-pass"]; !ok || !slices.Contains(aggregate.Needs, "service-acceptance") {
+		aggregate, ok := workflow.Jobs["all-tests-pass"]
+		if !ok || !slices.Contains(aggregate.Needs, "service-acceptance") {
 			return errors.New("all-tests-pass does not wait for service-acceptance")
 		}
-		return nil
+		// The matrix result covers all three legs only if the aggregate
+		// requires it to be success.
+		for _, step := range aggregate.Steps {
+			if fmt.Sprint(step.Env["SERVICE_ACCEPTANCE_RESULT"]) == "${{ needs['service-acceptance'].result }}" &&
+				strings.Count(step.Run, `test "$SERVICE_ACCEPTANCE_RESULT" = success`) == 1 {
+				return nil
+			}
+		}
+		return errors.New("all-tests-pass does not require service-acceptance to succeed")
 	}
 	if err := validate(payload); err != nil {
 		t.Fatal(err)
@@ -85,6 +94,7 @@ func TestContractGateServiceAcceptanceHalvesRunEveryPackageOnce(t *testing.T) {
 		"timeout dropped":           bytes.Replace(payload, []byte(`-timeout=45m -tags=service_acceptance $packages`), []byte(`-tags=service_acceptance $packages`), 1),
 		"list failure hidden":       bytes.Replace(payload, []byte("set -o pipefail\n"), nil, 1),
 		"unknown shard passes":      bytes.Replace(payload, []byte(`>&2; exit 1 ;;`), []byte(`>&2; exit 0 ;;`), 1),
+		"aggregate ignores result":  bytes.Replace(payload, []byte(`test "$SERVICE_ACCEPTANCE_RESULT" = success`), []byte(`true`), 1),
 	} {
 		if bytes.Equal(mutation, payload) || validate(mutation) == nil {
 			t.Fatalf("%s: drift was accepted", name)
