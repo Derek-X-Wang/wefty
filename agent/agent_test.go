@@ -215,8 +215,10 @@ func assertAgentTakesStableNodeLockBeforeOpeningSpool(t *testing.T) {
 	t.Helper()
 	directory := t.TempDir()
 	network := plain.NewNetwork()
+	handoffRoot := t.TempDir()
 	newAgent := func(bootSessionID string) (*Agent, error) {
 		return New(Config{
+			HandoffRoot:         handoffRoot,
 			Fabric:              network.NewFabric(fabric.Identity{NodeID: "fabric-" + bootSessionID}),
 			ControlPlaneAddress: "wefty://control-plane",
 			NodeID:              "stable-node", BootSessionID: bootSessionID, Version: "test",
@@ -459,7 +461,8 @@ func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: participant, ControlPlaneAddress: "127.0.0.1:1",
+		HandoffRoot: t.TempDir(),
+		Fabric:      participant, ControlPlaneAddress: "127.0.0.1:1",
 		NodeID: "stable-node", BootSessionID: "boot-session", Version: "v1.2.3",
 		OS: "test-os", Architecture: "test-arch",
 		Capabilities:      map[string]bool{"kind:process": true},
@@ -484,7 +487,8 @@ func TestNewBuildsRegistrationFromStableAndBootMetadata(t *testing.T) {
 func TestNewWithNilCapabilitiesAdvertisesNothing(t *testing.T) {
 	participant := plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
-		Fabric: participant, ControlPlaneAddress: "127.0.0.1:1",
+		HandoffRoot: t.TempDir(),
+		Fabric:      participant, ControlPlaneAddress: "127.0.0.1:1",
 		NodeID: "stable-node", BootSessionID: "boot-session", Version: "test",
 		LogSpoolDirectory: t.TempDir(),
 	})
@@ -526,6 +530,7 @@ func TestShortLeaseRenewalKeepsLongProcessAlive(t *testing.T) {
 
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
+		HandoffRoot:         t.TempDir(),
 		Fabric:              agentFabric,
 		ControlPlaneAddress: "wefty://control-plane",
 		NodeID:              "stable-node",
@@ -630,7 +635,8 @@ func TestLeaseRenewalContinuesWhileCompletionRetriesPastOriginalExpiry(t *testin
 
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}})
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "stable-node", BootSessionID: "boot-completion-retry", Version: "test",
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: time.Second, ClaimInterval: 5 * time.Millisecond,
@@ -876,6 +882,7 @@ func TestAgentContinuesAfterDirectiveDuringCompletion(t *testing.T) {
 			}()
 			var runs atomic.Int32
 			nodeAgent, err := New(Config{
+				HandoffRoot:         t.TempDir(),
 				Fabric:              network.NewFabric(fabric.Identity{NodeID: "fabric-node", Tags: []string{l1.DefaultAgentPrincipalTag}}),
 				ControlPlaneAddress: "wefty://control-plane", NodeID: "stable-node", BootSessionID: "boot-directive", Version: "test", Clock: clock,
 				Capabilities: map[string]bool{"kind:process": true}, MaxOneshotSlots: 1,
@@ -1035,7 +1042,8 @@ func assertAgentRegistrationUsesFabricConnectHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: participant, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      participant, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "node-connect-host", BootSessionID: "boot-connect-host", Version: "test",
 		LogSpoolDirectory: t.TempDir(), ManagedRootDirectory: managedRoot,
 	})

@@ -145,7 +145,7 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 	// The holding gate is on for this exercise only, through the one name
 	// branch-gates forwards into the subject environment.
 	t.Setenv("GOFLAGS", strings.TrimSpace(os.Getenv("GOFLAGS")+" -tags="+holdingGateTag))
-	caller, store := startStack(t)
+	caller, store, handoffRoot := startStack(t)
 
 	for _, testCase := range []struct {
 		name         string
@@ -280,7 +280,7 @@ func TestBranchGatesWorkflowHandsBackGateResults(t *testing.T) {
 			// Handoff lifecycle: results are retained on every outcome now, so
 			// the passing run -- the one an operator most wants to read and the
 			// only one that used to leave nothing behind -- keeps its files too.
-			handoff := filepath.Join(l3.DefaultHandoffRoot, accepted.RunID)
+			handoff := filepath.Join(handoffRoot, accepted.RunID)
 			retained, err := os.ReadFile(filepath.Join(handoff, "result.json"))
 			if err != nil {
 				t.Fatalf("read retained result.json: %v; logs:\n%s", err, logs)
@@ -386,7 +386,7 @@ func TestBranchGatesWorkflowRejectsBadInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	subject := initializeSubjectRepository(t)
-	caller, store := startStack(t)
+	caller, store, handoffRoot := startStack(t)
 
 	for _, testCase := range []struct {
 		name     string
@@ -473,7 +473,7 @@ func TestBranchGatesWorkflowRejectsBadInput(t *testing.T) {
 
 			// The failing attempt retains the handoff directory, so both files
 			// are on the node exactly as on the gate-failure path.
-			handoff := filepath.Join(l3.DefaultHandoffRoot, accepted.RunID)
+			handoff := filepath.Join(handoffRoot, accepted.RunID)
 			retained, err := os.ReadFile(filepath.Join(handoff, "result.json"))
 			if err != nil {
 				t.Fatalf("read retained result.json: %v; logs:\n%s", err, logs)
@@ -650,7 +650,7 @@ func TestDeliberateFailure(t *testing.T) {
 	return repo
 }
 
-func startStack(t *testing.T) (*http.Client, *l3.Store) {
+func startStack(t *testing.T) (*http.Client, *l3.Store, string) {
 	t.Helper()
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
@@ -702,10 +702,13 @@ func startStack(t *testing.T) (*http.Client, *l3.Store) {
 	l1Done := serve(func() error { return l1Server.Serve(ctx, l1Listener) })
 	l3Done := serve(func() error { return l3Server.Serve(ctx, l3Listener) })
 
+	// Own handoff root: the default is shared with an installed node (#1430).
+	handoffRoot := t.TempDir()
 	// The agent sweeps exec temp; keep it away from the real /var/tmp and /tmp (#1084).
 	t.Setenv("WEFTY_EXEC_TEMP_ROOT", t.TempDir())
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
+		HandoffRoot: handoffRoot,
+		Fabric:      agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: nodeID, BootSessionID: "boot-branch-gates", Version: "branch-gates-exercise",
 		OS: runtime.GOOS, Architecture: runtime.GOARCH, Capabilities: map[string]bool{"kind:process": true},
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 20 * time.Millisecond,
@@ -734,7 +737,7 @@ func startStack(t *testing.T) (*http.Client, *l3.Store) {
 
 	caller := fabricHTTPClient(callerFabric, l3.DefaultL3Address)
 	t.Cleanup(caller.CloseIdleConnections)
-	return caller, l3Store
+	return caller, l3Store, handoffRoot
 }
 
 // environmentWithWefty puts a freshly built `wefty` on the job's PATH. The

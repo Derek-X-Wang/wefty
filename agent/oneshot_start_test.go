@@ -37,7 +37,8 @@ func TestSilentProcessOneShotRunsBeforeFirstRenewal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	nodeAgent, err := New(Config{Fabric: network.NewFabric(fabric.Identity{NodeID: "silent-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
+	nodeAgent, err := New(Config{
+		HandoffRoot: t.TempDir(), Fabric: network.NewFabric(fabric.Identity{NodeID: "silent-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "silent-node", BootSessionID: "boot-silent", Version: "test", Capabilities: map[string]bool{"kind:process": true}, ManagedRootDirectory: root, LogSpoolDirectory: t.TempDir(),
 		HeartbeatInterval: 20 * time.Millisecond, ClaimInterval: 5 * time.Millisecond, RenewalInterval: time.Hour})
 	if err != nil {

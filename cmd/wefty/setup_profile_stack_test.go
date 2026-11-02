@@ -97,7 +97,8 @@ func TestSetupProfileConnectsTheStackWithNoFlags(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = closeNodeFabric() })
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric: nodeFabric, ControlPlaneAddress: nodeSettings.ControlPlane, RunLedgerAddress: nodeSettings.RunLedger,
+		HandoffRoot: t.TempDir(),
+		Fabric:      nodeFabric, ControlPlaneAddress: nodeSettings.ControlPlane, RunLedgerAddress: nodeSettings.RunLedger,
 		NodeID: nodeSettings.NodeID, BootSessionID: "boot-setup-proof", Version: "setup-proof",
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 10 * time.Millisecond,

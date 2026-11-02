@@ -62,7 +62,8 @@ func TestPreAdmissionRenewalDoesNotInvalidateHelperSession(t *testing.T) {
 		fatalf("%v", err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "pre-admission-node", BootSessionID: "pre-admission-boot", Version: "test",
 		OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true},

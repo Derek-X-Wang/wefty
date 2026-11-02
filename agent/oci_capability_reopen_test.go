@@ -120,7 +120,8 @@ func TestOCIIntentStopThenStartReopensCapabilityWithoutRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-oci-reopen",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-oci-reopen",
 		BootSessionID: "boot-oci-reopen", Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true}, CapabilityProbe: probe,
 		OCIIntent: func(context.Context) (OCIIntentObservation, error) {
@@ -288,7 +289,8 @@ func TestColdStartUnderDisabledIntentPublishesIntentReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-cold-disabled",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-cold-disabled",
 		BootSessionID: "boot-cold-disabled", Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true}, CapabilityProbe: probe,
 		OCIIntent: func(context.Context) (OCIIntentObservation, error) {

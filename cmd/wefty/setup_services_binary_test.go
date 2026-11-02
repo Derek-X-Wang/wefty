@@ -141,9 +141,9 @@ func TestSetupInstalledServicesFindEachOtherFromTheRealBinaries(t *testing.T) {
 	}
 }
 
-// startPlistService runs a LaunchAgent's program with exactly the plist's
-// arguments, environment, folder and log. It returns a stop function, which
-// also runs when the test ends.
+// startPlistService runs a LaunchAgent's program with the plist's arguments,
+// environment, folder and log, plus a test handoff root. It returns a stop
+// function, which also runs when the test ends.
 func startPlistService(t *testing.T, path string) func() {
 	t.Helper()
 	payload, err := os.ReadFile(path)
@@ -161,6 +161,10 @@ func startPlistService(t *testing.T, path string) func() {
 	var argv []string
 	for _, argument := range arguments {
 		argv = append(argv, argument.(string))
+	}
+	if filepath.Base(argv[0]) == "wefty-agent" {
+		// Own handoff root: the default is shared with an installed node (#1430).
+		argv = append(argv, "--handoff-root="+t.TempDir())
 	}
 	var environment []string
 	variables, _ := plist["EnvironmentVariables"].(map[string]any)

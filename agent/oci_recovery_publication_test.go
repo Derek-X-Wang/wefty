@@ -111,7 +111,8 @@ func TestOperatorRecoveryPublishesInsideTheRecoveryTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-oci-contended",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-oci-contended",
 		BootSessionID: "boot-oci-contended", Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true},
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {
@@ -166,7 +167,8 @@ func TestHeartbeatPinnedPublicationIsSerializedWithRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-oci-heartbeat-pin",
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane", NodeID: "node-oci-heartbeat-pin",
 		BootSessionID: "boot-oci-heartbeat-pin", Version: "test", OS: "linux", Architecture: "amd64",
 		Capabilities: map[string]bool{"kind:process": true},
 		CapabilityProbe: capabilityProbeFunc(func(context.Context) (CapabilityProbeResult, error) {

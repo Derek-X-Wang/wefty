@@ -59,7 +59,7 @@ func TestInstalledCandidateWaitsBeforeOpeningProfileOrRegistering(t *testing.T) 
 		installedGenerationBootIdentity = func() (string, error) { return os.Getenv("WEFTY_1177_BOOT"), nil }
 		installedGenerationProcessStartIdentity = func(int) (string, error) { return "child-process-start", nil }
 		root, id, plists := os.Getenv("WEFTY_1177_ROOT"), os.Getenv("WEFTY_1177_ID"), os.Getenv("WEFTY_1177_PLISTS")
-		os.Args = []string{os.Args[0], "--profile=/wefty-1177-deliberately-missing/profile.json", "--agent-generation-id=" + id, "--agent-generation-root=" + root, "--agent-generation-launch-agents=" + plists, "--ready-file=" + filepath.Join(root, id, "ready.json")}
+		os.Args = []string{os.Args[0], "--handoff-root=" + filepath.Join(root, "test-handoffs"), "--profile=/wefty-1177-deliberately-missing/profile.json", "--agent-generation-id=" + id, "--agent-generation-root=" + root, "--agent-generation-launch-agents=" + plists, "--ready-file=" + filepath.Join(root, id, "ready.json")}
 		if err := run(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(92)
@@ -156,7 +156,7 @@ func TestInstalledGenerationIdentityRequiresCatalogBeforeProfile(t *testing.T) {
 	oldArgs, oldFlags := os.Args, flag.CommandLine
 	defer func() { os.Args, flag.CommandLine = oldArgs, oldFlags }()
 	flag.CommandLine = flag.NewFlagSet("generation-without-catalog", flag.ContinueOnError)
-	os.Args = []string{"wefty-agent", "--agent-generation-id=installed-generation", "--profile=" + filepath.Join(home, "missing-profile.json")}
+	os.Args = []string{"wefty-agent", "--handoff-root=" + t.TempDir(), "--agent-generation-id=installed-generation", "--profile=" + filepath.Join(home, "missing-profile.json")}
 	if err := run(); err == nil || !strings.Contains(err.Error(), "installed generation requires its identity and catalog directory") {
 		t.Fatalf("generation without its lifetime-lock catalog reached profile/runtime startup: %v", err)
 	}

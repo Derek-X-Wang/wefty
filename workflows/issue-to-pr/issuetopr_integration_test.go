@@ -145,7 +145,7 @@ func TestIssueToPRHandsBackADraftPullRequest(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	tools := installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, handoffRoot := startStack(t)
 
 	accepted := submitIssueToPR(t, caller, map[string]string{
 		"issue": issueNumber, "repo": "example/subject", "agent": "claude",
@@ -181,7 +181,7 @@ func TestIssueToPRHandsBackADraftPullRequest(t *testing.T) {
 	}
 
 	// The documents an operator and a script read.
-	handoff := filepath.Join(l3.DefaultHandoffRoot, accepted.RunID)
+	handoff := filepath.Join(handoffRoot, accepted.RunID)
 	var pr struct {
 		URL     string `json:"url"`
 		HeadSHA string `json:"head_sha"`
@@ -274,7 +274,7 @@ func TestIssueToPRResumesAtTheFirstIncompletePhase(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	tools := installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, handoffRoot := startStack(t)
 
 	// Stopping after `implement`: the stub `gh` refuses to open a pull request
 	// and the gates are made to fail, so the first run dies at `gates` with
@@ -345,7 +345,7 @@ func TestIssueToPRResumesAtTheFirstIncompletePhase(t *testing.T) {
 	}
 
 	// And the resumed run still hands back the documents.
-	handoff := filepath.Join(l3.DefaultHandoffRoot, second.RunID)
+	handoff := filepath.Join(handoffRoot, second.RunID)
 	var pr struct {
 		URL    string `json:"url"`
 		Branch string `json:"branch"`
@@ -363,7 +363,7 @@ func TestIssueToPRFailsWhenTheAgentProducesNothing(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	tools := installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, _ := startStack(t)
 
 	writeFile(t, tools.controlDir, "agent-does-nothing", "1")
 	accepted := submitIssueToPR(t, caller, map[string]string{
@@ -723,7 +723,7 @@ func runGit(t *testing.T, directory string, args ...string) string {
 	return string(output)
 }
 
-func startStack(t *testing.T) (*http.Client, *l3.Store) {
+func startStack(t *testing.T) (*http.Client, *l3.Store, string) {
 	t.Helper()
 	network := plain.NewNetwork()
 	controlFabric := network.NewFabric(fabric.Identity{NodeID: "control-plane"})
@@ -775,10 +775,13 @@ func startStack(t *testing.T) (*http.Client, *l3.Store) {
 	l1Done := serve(func() error { return l1Server.Serve(ctx, l1Listener) })
 	l3Done := serve(func() error { return l3Server.Serve(ctx, l3Listener) })
 
+	// Own handoff root: the default is shared with an installed node (#1430).
+	handoffRoot := t.TempDir()
 	// The agent sweeps exec temp; keep it away from the real /var/tmp and /tmp (#1084).
 	t.Setenv("WEFTY_EXEC_TEMP_ROOT", t.TempDir())
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
+		HandoffRoot: handoffRoot,
+		Fabric:      agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: nodeID, BootSessionID: "boot-issue-to-pr", Version: "issue-to-pr-exercise",
 		OS: runtime.GOOS, Architecture: runtime.GOARCH, Capabilities: map[string]bool{"kind:process": true},
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 20 * time.Millisecond,
@@ -807,7 +810,7 @@ func startStack(t *testing.T) (*http.Client, *l3.Store) {
 
 	caller := fabricHTTPClient(callerFabric, l3.DefaultL3Address)
 	t.Cleanup(caller.CloseIdleConnections)
-	return caller, l3Store
+	return caller, l3Store, handoffRoot
 }
 
 func environmentWithWefty(t *testing.T) []string {
@@ -1069,7 +1072,7 @@ func TestAForgedMarkerCannotSkipTheGates(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	tools := installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, _ := startStack(t)
 
 	// A branch that looks finished: every phase's marker as a subject line,
 	// written by someone who is not this workflow and carrying no trailers.
@@ -1131,7 +1134,7 @@ func TestAnotherWritersCommitIsNeverDiscarded(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, _ := startStack(t)
 
 	// Run once to get a real branch with real markers.
 	first := submitIssueToPR(t, caller, map[string]string{
@@ -1198,7 +1201,7 @@ func TestOpenPRReusesAnExistingPullRequest(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	tools := installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, handoffRoot := startStack(t)
 
 	writeFile(t, tools.controlDir, "existing-pr", "1")
 	accepted := submitIssueToPR(t, caller, map[string]string{
@@ -1222,7 +1225,7 @@ func TestOpenPRReusesAnExistingPullRequest(t *testing.T) {
 
 	// This run's own handoff directory still carries the documents, pointing
 	// at the pull request that already existed.
-	handoff := filepath.Join(l3.DefaultHandoffRoot, accepted.RunID)
+	handoff := filepath.Join(handoffRoot, accepted.RunID)
 	var pr struct {
 		URL string `json:"url"`
 	}
@@ -1243,7 +1246,7 @@ func TestAnAgentThatEditsWithoutCommittingStillCounts(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	tools := installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, _ := startStack(t)
 
 	writeFile(t, tools.controlDir, "agent-leaves-dirty-tree", "1")
 	accepted := submitIssueToPR(t, caller, map[string]string{
@@ -1283,7 +1286,7 @@ func TestGatesDoNotInheritTheRunExecutionContext(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, _ := startStack(t)
 
 	accepted := submitIssueToPR(t, caller, map[string]string{
 		"issue": issueNumber, "repo": "example/subject",
@@ -1316,7 +1319,7 @@ func TestPlanSurvivesResumeThroughTheMarkerMessage(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	tools := installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, _ := startStack(t)
 
 	// Stopping right after the plan marker: the fake agent fails `implement`
 	// outright, so the first run dies there with `plan` (and `read-issue`)
@@ -1399,7 +1402,7 @@ func TestALegacyTrackedPLANMdIsRetiredOnResume(t *testing.T) {
 	requireExercise(t)
 	origin := initializeOriginRepository(t)
 	tools := installStubTools(t, origin)
-	caller, store := startStack(t)
+	caller, store, _ := startStack(t)
 
 	// A branch built the way a pre-#507 run would have left it: `plan`'s
 	// marker in the same commit as a tracked PLAN.md, no plan text in the

@@ -580,7 +580,7 @@ func TestGenerationOwnershipPrecedesManagedRootInitialization(t *testing.T) {
 		t.Run("generation="+generation, func(t *testing.T) {
 			network := plain.NewNetwork()
 			root, spool := temporaryManagedRoot(t), t.TempDir()
-			config := Config{Fabric: network.NewFabric(fabric.Identity{NodeID: "agent"}), ControlPlaneAddress: "wefty://control-plane", NodeID: "node", Version: "test", BootSessionID: "first", AgentGenerationID: generation, LogSpoolDirectory: spool, ManagedRootDirectory: root}
+			config := Config{HandoffRoot: t.TempDir(), Fabric: network.NewFabric(fabric.Identity{NodeID: "agent"}), ControlPlaneAddress: "wefty://control-plane", NodeID: "node", Version: "test", BootSessionID: "first", AgentGenerationID: generation, LogSpoolDirectory: spool, ManagedRootDirectory: root}
 			first, err := New(config)
 			if err != nil {
 				t.Fatal(err)
@@ -647,7 +647,7 @@ func TestGenerationInstalledLifetimeIsBorrowedOnceBeforeManagedRoot(t *testing.T
 	defer lifetime.Close()
 	network := plain.NewNetwork()
 	spool := t.TempDir()
-	config := Config{Fabric: network.NewFabric(fabric.Identity{NodeID: "agent"}), ControlPlaneAddress: "wefty://control-plane", NodeID: "node", Version: "test", BootSessionID: "first", AgentGenerationID: g.ID, GenerationLifetimeLock: lifetime.ClaimRuntime, PrimaryGeneration: func(write func() error) error { return store.WithPrimary(g.ID, write) }, LogSpoolDirectory: spool, ManagedRootDirectory: temporaryManagedRoot(t)}
+	config := Config{HandoffRoot: t.TempDir(), Fabric: network.NewFabric(fabric.Identity{NodeID: "agent"}), ControlPlaneAddress: "wefty://control-plane", NodeID: "node", Version: "test", BootSessionID: "first", AgentGenerationID: g.ID, GenerationLifetimeLock: lifetime.ClaimRuntime, PrimaryGeneration: func(write func() error) error { return store.WithPrimary(g.ID, write) }, LogSpoolDirectory: spool, ManagedRootDirectory: temporaryManagedRoot(t)}
 	first, err := New(config)
 	if err != nil {
 		t.Fatal(err)

@@ -74,7 +74,7 @@ func TestServiceParticipantMissingRecordFromRealBinaries(t *testing.T) {
 			case "wefty-l1", "wefty-l3":
 				args = append(args, "--listen=127.0.0.1:0", "--db="+filepath.Join(home, "service.sqlite"))
 			case "wefty-agent":
-				args = append(args, "--managed-root="+filepath.Join(home, "managed"), "--log-spool-dir="+filepath.Join(home, "spool"))
+				args = append(args, "--managed-root="+filepath.Join(home, "managed"), "--log-spool-dir="+filepath.Join(home, "spool"), "--handoff-root="+filepath.Join(home, "handoff"))
 			case "wefty":
 				args = append(args, "--json", "client-service", "--socket="+clientServiceSocketForTest(t))
 			}

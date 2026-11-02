@@ -195,7 +195,8 @@ func startTypeScriptExerciseStack(t *testing.T) *apiClients {
 	l1Done := serveTestServer(ctx, func() error { return l1Server.Serve(ctx, l1Listener) })
 	l3Done := serveTestServer(ctx, func() error { return l3Server.Serve(ctx, l3Listener) })
 	nodeAgent, err := agent.New(agent.Config{
-		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: "node-ts", BootSessionID: "boot-ts", Version: "typescript-scaffold-exercise",
 		OS: "linux", Architecture: "amd64", Capabilities: map[string]bool{"kind:process": true},
 		HeartbeatInterval: 50 * time.Millisecond, ClaimInterval: 20 * time.Millisecond,

@@ -605,7 +605,8 @@ func TestFix303RuntimeLossImportReturnsTypedOutcomeBeforeWaitDeadline(t *testing
 	barrier := &fix303BootBarrier{}
 	runtime := fix303RuntimeLossRuntime{copyCalls: make(chan workloadrunner.ComputerStorageCopyRequest, 1), barrier: barrier}
 	nodeAgent, err := agentpkg.New(agentpkg.Config{
-		Fabric: h.agentFabric, ControlPlaneAddress: l3.DefaultL1Address,
+		HandoffRoot: t.TempDir(),
+		Fabric:      h.agentFabric, ControlPlaneAddress: l3.DefaultL1Address,
 		NodeID: h.node.NodeID, BootSessionID: h.node.BootSessionID, Version: "fix-303-regression",
 		OS: "linux", Architecture: "amd64",
 		Capabilities:    map[string]bool{"kind:oci": true, "cgroup_v2": true, "computer": true},

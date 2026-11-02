@@ -79,7 +79,8 @@ func TestTSNetSmoke(t *testing.T) {
 	go func() { served <- server.Serve(ctx, listener) }()
 
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: serverName,
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: serverName,
 		NodeID: stableNodeID, BootSessionID: "boot-" + suffix, Version: "tsnet-smoke",
 		LogSpoolDirectory: t.TempDir(),
 	})
@@ -188,7 +189,8 @@ func TestTSNetServiceReachability(t *testing.T) {
 		t.Fatal(err)
 	}
 	nodeAgent, err := New(Config{
-		Fabric: agentFabric, ControlPlaneAddress: serverName,
+		HandoffRoot: t.TempDir(),
+		Fabric:      agentFabric, ControlPlaneAddress: serverName,
 		NodeID: stableNodeID, BootSessionID: "boot-" + suffix, Version: "tsnet-service-smoke",
 		Capabilities:      map[string]bool{"kind:process": true},
 		HeartbeatInterval: 5 * time.Second, ClaimInterval: 100 * time.Millisecond,
