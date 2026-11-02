@@ -49,6 +49,7 @@ jobs:
         run: |
           go tool actionlint
           bash scripts/test-acceptance-image.sh
+          bash scripts/test-download-crane-modules.sh
       - name: Exercise privileged OCI install and configure path
         run: bash scripts/test-install-oci-privileged.sh
 
