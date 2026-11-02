@@ -775,6 +775,8 @@ func startStack(t *testing.T) (*http.Client, *l3.Store) {
 	l1Done := serve(func() error { return l1Server.Serve(ctx, l1Listener) })
 	l3Done := serve(func() error { return l3Server.Serve(ctx, l3Listener) })
 
+	// The agent sweeps exec temp; keep it away from the real /var/tmp and /tmp (#1084).
+	t.Setenv("WEFTY_EXEC_TEMP_ROOT", t.TempDir())
 	nodeAgent, err := agent.New(agent.Config{
 		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: nodeID, BootSessionID: "boot-issue-to-pr", Version: "issue-to-pr-exercise",

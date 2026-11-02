@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/execsweep"
 	"github.com/Derek-X-Wang/wefty/internal/testwait"
 )
 
@@ -139,6 +140,49 @@ func TestExecCaptureRetriesInterruptedDownload(t *testing.T) {
 	}
 }
 
+func execCaptureTempAllocation(t *testing.T, storage string) string {
+	t.Helper()
+	allocation, err := os.MkdirTemp(os.Getenv("WEFTY_EXEC_TEMP_ROOT"), "wefty-run-data.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocation, err = filepath.EvalSymlinks(allocation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(allocation) })
+	if err := os.MkdirAll(storage, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for path, value := range map[string]string{
+		filepath.Join(storage, "tmp-dir"):  allocation + "\n",
+		filepath.Join(allocation, "owner"): storage + "\n",
+	} {
+		if err := os.WriteFile(path, []byte(value), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(allocation, "tmp"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return allocation
+}
+
+func sweepExecCaptureTemp(t *testing.T, allocation, ownerRoot string) {
+	t.Helper()
+	// Model an orphan past the grace period; live cleanup may already remove it.
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(allocation, old, old); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if err := execsweep.SweepTempDirs(t.Context(), []string{ownerRoot}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(allocation); !os.IsNotExist(err) {
+		t.Fatalf("orphan temp survived cleanup: %v", err)
+	}
+}
+
 func TestExecCapturePreparationRemovesStaleAttemptFiles(t *testing.T) {
 	appender := &httpRunLedgerAppender{client: &http.Client{Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, ContentLength: 4, Body: io.NopCloser(strings.NewReader("good")), Header: make(http.Header)}, nil
@@ -147,12 +191,14 @@ func TestExecCapturePreparationRemovesStaleAttemptFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(mailbox.directory, "tmp/capture.bundle"), []byte("stale"), 0600)
 	os.Mkdir(filepath.Join(mailbox.directory, "wefty-exec-work"), 0700)
 	os.WriteFile(filepath.Join(mailbox.directory, "wefty-exec-work/old"), []byte("old"), 0600)
+	allocation := execCaptureTempAllocation(t, filepath.Join(mailbox.directory, "wefty-exec-work"))
 	if _, e := seedExecCapture(t.Context(), captureSpec("good"), mailbox); e != nil {
 		t.Fatal(e)
 	}
 	if _, e := os.Stat(filepath.Join(mailbox.directory, "wefty-exec-work")); !os.IsNotExist(e) {
 		t.Fatal("stale work directory survived preparation")
 	}
+	sweepExecCaptureTemp(t, allocation, mailbox.directory)
 }
 func TestExecCaptureCleanupSurvivesDetachedMailbox(t *testing.T) {
 	appender := &httpRunLedgerAppender{client: &http.Client{Transport: captureRoundTrip(func(r *http.Request) (*http.Response, error) {
@@ -162,9 +208,12 @@ func TestExecCaptureCleanupSurvivesDetachedMailbox(t *testing.T) {
 	if _, e := seedExecCapture(t.Context(), captureSpec("good"), mailbox); e != nil {
 		t.Fatal(e)
 	}
+	allocation := execCaptureTempAllocation(t, filepath.Join(mailbox.directory, "wefty-exec-work"))
 	mailbox.detached.Store(true)
 	mailbox.closeRoots()
 	if _, e := os.Stat(filepath.Join(mailbox.directory, "capture.bundle")); !os.IsNotExist(e) {
 		t.Fatal("bundle retained after roots closed")
 	}
+	waitExecCaptureTrash(t, mailbox.directory)
+	sweepExecCaptureTemp(t, allocation, mailbox.directory)
 }
