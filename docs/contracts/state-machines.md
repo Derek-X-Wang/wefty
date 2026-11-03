@@ -3289,20 +3289,33 @@ clear a replacement Seat's driver signal.
 #### Short screen calls (#1148)
 
 The AI agent CLI discovers the Seat front door with the saved Seat credential,
-then opens one short `binary` WebSocket carrying RFB 3.3, 3.7, or 3.8. It
-negotiates unauthenticated RFB inside the credential-authenticated Fabric door,
+then opens a short `binary` WebSocket carrying RFB 3.3, 3.7, or 3.8. An input
+capture that times out replaces its input connection with a fresh view connection.
+It negotiates unauthenticated RFB inside the credential-authenticated Fabric door,
 32-bit little-endian true colour, and only Raw framebuffer encoding. Both the
 default image's x11vnc and the supported Wayland neatvnc server support Raw.
 Unsupported security, messages, encodings, dimensions or rectangles fail
 closed. Complete non-incremental framebuffer updates become local PNG files.
 
 Input calls send pointer or X11 keysym events through the input endpoint.
-Modifiers and buttons are released before a framebuffer round trip, which
-orders the end of input before the short connection closes. With a screenshot,
-this is one full non-incremental frame on the same input connection; without
-one, it requests one pixel. Screenshot-only calls use the view endpoint and
-continue working while a person drives. The server may return larger Raw
-rectangles within its ServerInit framebuffer bounds.
+Modifiers and buttons are released before the post-input framebuffer requests.
+Without a screenshot, a one-pixel synchronization request orders the end of
+input before the connection closes. With a screenshot, the CLI reads a full
+baseline before input, then fully consumes a post-input one-pixel Sync reply
+to order the input before any later close. Rectangles outside Sync's requested
+1×1 area, or a changed pixel within it, count as an observed change. Otherwise,
+it waits for an incremental update for the remainder of a one-second window
+starting at the end of the input write. At most one request is outstanding;
+empty replies are fully consumed before paced re-requests. After a change
+observed in Sync or an incremental reply, it captures
+a full non-incremental frame on the same connection. On timeout, it closes the
+input connection and captures on a fresh view connection, discarding ambiguous
+pending replies without repeating input. The combined reply prints one release
+note and may use the view connection's latest unread count. JSON adds
+`frame_after_input` to report a change observed by Sync or the remaining wait.
+Sync must complete even when it consumes the observation window.
+Screenshot-only calls use the view endpoint and continue working while a person
+drives. The server may return larger Raw rectangles within its ServerInit bounds.
 The client drains the entire update, decodes only the requested intersection,
 and completes synchronization once the requested area is covered. Zero-size,
 out-of-screen and non-Raw rectangles still fail closed. Input is done when its
@@ -3319,8 +3332,10 @@ number and all warm numbers remain in the log and JSON evidence. The lane also
 records phase timestamps relative to CLI process start, the warm maximum,
 node/helper Fabric accept, L1 authorization, endpoint lookup, socket connect
 and RFB banner timings, backend accept-to-first-byte timings, and warm x11vnc RSS
-for this Seat when `/proc` exposes it. A combined call's full frame is its
-synchronization, and its capture connection is already open before input.
+for this Seat when `/proc` exposes it. A combined call's post-input Sync orders
+the input on both paths. The success path captures on the input connection,
+which opened before input. The timeout path closes input only after Sync and
+captures on a fresh view connection opened afterward.
 SC-4 performs an input warm-up outside the measurement, then measures Take
 control through the first typed `person_driving` CLI refusal. Both have a one-second limit. The root-only `computer_seat_lane`
 records CI measurements against the real default image. CI measurements do

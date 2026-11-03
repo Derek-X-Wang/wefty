@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"image/color"
 	"image/png"
 	"io"
 	"net/http"
@@ -23,6 +24,8 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/coder/websocket"
 )
+
+const seatScreenSettleLimit = time.Second
 
 const seatScreenUsage = `usage: wefty seat screenshot SEAT_ID [-o FILE]
        wefty seat click SEAT_ID X Y [--button left|right|double] [--screenshot [FILE]]
@@ -332,7 +335,7 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	open := func(mode string) (*rfbclient.Client, func(), error) {
+	open := func(mode string, printNote bool) (*rfbclient.Client, func(), error) {
 		u := *endpoint
 		u.Path = "/v1/seats/" + a.id + "/screen/" + mode
 		u.RawPath = ""
@@ -374,9 +377,11 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				close()
 				return nil, nil, fmt.Errorf("invalid Seat release note")
 			}
-			if _, e = fmt.Fprintln(stderr, string(decoded)); e != nil {
-				close()
-				return nil, nil, e
+			if printNote {
+				if _, e = fmt.Fprintln(stderr, string(decoded)); e != nil {
+					close()
+					return nil, nil, e
+				}
 			}
 		}
 		wire := &seatScreenBannerWire{ReadWriter: websocket.NetConn(ctx, c, websocket.MessageBinary), remaining: 12, received: func() { timing.mark("rfb_banner") }}
@@ -391,35 +396,68 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	if a.command != "screenshot" {
 		mode = "input"
 	}
-	client, close, err := open(mode)
+	client, close, err := open(mode, true)
 	if err != nil {
 		return err
 	}
-	defer close()
+	defer func() { close() }()
+	frameAfterInput := false
+	var inputWritten time.Time
+	var baselinePixel color.RGBA
 	if mode == "input" {
+		if capture != nil {
+			baseline, e := client.Frame()
+			if e != nil {
+				return e
+			}
+			baselinePixel = baseline.RGBAAt(0, 0)
+			timing.mark("frame_baseline")
+		}
 		if err := performSeatScreenInput(client, a); err != nil {
 			return err
 		}
+		inputWritten = time.Now()
 		// All input bytes are written; subsequent failures must not repeat it.
 		actionDone = true
 		timing.mark("input_written")
-		if capture == nil {
-			if err := client.Sync(); err != nil {
-				return err
-			}
-			timing.mark("sync_done")
+		if capture != nil {
+			frameAfterInput, err = client.SyncAfterInput(baselinePixel)
+		} else {
+			err = client.Sync()
 		}
+		if err != nil {
+			return err
+		}
+		timing.mark("sync_done")
 	}
 	if capture != nil {
 		phase = "screenshot"
+		if actionDone {
+			var e error
+			if remaining := time.Until(inputWritten.Add(seatScreenSettleLimit)); !frameAfterInput && remaining > 0 {
+				frameAfterInput, e = client.WaitForChange(remaining)
+				if e != nil {
+					return e
+				}
+			}
+			if frameAfterInput {
+				timing.mark("frame_update_seen")
+			} else {
+				timing.mark("frame_update_timeout")
+				close()
+				reopened, closeReopened, e := open("view", false)
+				if e != nil {
+					return e
+				}
+				client, close = reopened, closeReopened
+				timing.mark("capture_reopened")
+			}
+		}
 		frame, e := client.Frame()
 		if e != nil {
 			return e
 		}
 		timing.mark("frame_read")
-		if actionDone {
-			timing.mark("sync_done") // the full frame also orders the final input
-		}
 		e = png.Encode(capture, frame)
 		e = errors.Join(e, capture.Close())
 		if e != nil {
@@ -434,6 +472,9 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	return withSeatReply(stdout, jsonOutput, a.id, unread, func(w io.Writer) error {
 		if jsonOutput {
 			value := map[string]any{"seat_id": a.id, "action": a.command, "path": path, "elapsed_ms": elapsed(), "unread_events": unread}
+			if actionDone && capture != nil {
+				value["frame_after_input"] = frameAfterInput
+			}
 			if timing != nil {
 				value["debug"] = timing.debug()
 			}

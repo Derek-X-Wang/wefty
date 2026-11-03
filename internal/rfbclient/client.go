@@ -9,10 +9,12 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"time"
 )
 
 type Client struct {
 	wire          io.ReadWriter
+	pending       <-chan frameUpdate
 	Width, Height int
 }
 
@@ -139,20 +141,117 @@ func (c *Client) Frame() (*image.RGBA, error) { return c.frame(c.Width, c.Height
 // return once the requested pixel is covered.
 func (c *Client) Sync() error { _, err := c.frame(1, 1); return err }
 
-func (c *Client) frame(width, height int) (*image.RGBA, error) {
+// SyncAfterInput orders input and reports changes carried by the Sync reply.
+// LibVNCServer 0.9.14 rfbserver.c:3094-3105 retains damage outside the request;
+// neatvnc 0.9.1 server.c:865-880 flushes all accumulated damage into this reply.
+// Count expanded rectangles now, then incremental requests can observe any
+// remaining or subsequent damage without losing the changes flushed by Sync.
+func (c *Client) SyncAfterInput(baseline color.RGBA) (bool, error) {
+	frame, outside, err := c.frameWithOutside(1, 1)
+	if err != nil {
+		return false, err
+	}
+	return outside || frame.RGBAAt(0, 0) != baseline, nil
+}
+
+// WaitForChange waits for a non-empty incremental update. Call Frame before
+// input to clear this connection's initial damage over the whole screen.
+// Only one request is outstanding: consume its entire reply before re-requesting.
+// After success, Frame may capture on this transport. After a timeout, close
+// the transport and capture on a fresh connection; a reply may still be pending.
+// Do not set a read deadline here: WebSocket deadlines close the transport.
+func (c *Client) WaitForChange(limit time.Duration) (bool, error) {
+	if c.pending != nil {
+		return false, fmt.Errorf("pending framebuffer read: close transport after WaitForChange timeout")
+	}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	for {
+		if err := c.request(c.Width, c.Height, true); err != nil {
+			return false, err
+		}
+		result := make(chan frameUpdate, 1)
+		go func() { result <- c.readUpdate() }()
+		c.pending = result
+		select {
+		case update := <-result:
+			c.pending = nil
+			if update.err != nil {
+				return false, update.err
+			}
+			if update.changed {
+				return true, nil
+			}
+		case <-timer.C:
+			return false, nil
+		}
+		// Empty replies are not changes. Pace re-requests to avoid a busy loop.
+		pause := time.NewTimer(20 * time.Millisecond)
+		select {
+		case <-pause.C:
+		case <-timer.C:
+			pause.Stop()
+			return false, nil
+		}
+	}
+}
+
+func (c *Client) request(width, height int, incremental bool) error {
 	request := []byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	if incremental {
+		request[1] = 1
+	}
 	binary.BigEndian.PutUint16(request[6:], uint16(width))
 	binary.BigEndian.PutUint16(request[8:], uint16(height))
-	if err := c.write(request); err != nil {
-		return nil, err
+	return c.write(request)
+}
+
+func (c *Client) frame(width, height int) (*image.RGBA, error) {
+	frame, _, err := c.frameWithOutside(width, height)
+	return frame, err
+}
+
+func (c *Client) frameWithOutside(width, height int) (*image.RGBA, bool, error) {
+	if c.pending != nil {
+		return nil, false, fmt.Errorf("pending framebuffer read: close transport after WaitForChange timeout")
+	}
+	if err := c.request(width, height, false); err != nil {
+		return nil, false, err
 	}
 	frame := image.NewRGBA(image.Rect(0, 0, width, height))
 	seen := make([]bool, width*height)
 	remaining := len(seen)
+	outside := false
 	for remaining > 0 {
+		update := frameUpdate{frame: frame, seen: seen}
+		if err := c.readRectangles(width, height, &update); err != nil {
+			return nil, false, err
+		}
+		remaining -= update.covered
+		outside = outside || update.outside
+	}
+	return frame, outside, nil
+}
+
+type frameUpdate struct {
+	frame   *image.RGBA
+	seen    []bool
+	changed bool
+	outside bool
+	covered int
+	err     error
+}
+
+func (c *Client) readUpdate() (result frameUpdate) {
+	result.err = c.readRectangles(0, 0, &result)
+	return result
+}
+
+func (c *Client) readRectangles(width, height int, result *frameUpdate) error {
+	for {
 		var kind [1]byte
 		if _, err := io.ReadFull(c.wire, kind[:]); err != nil {
-			return nil, err
+			return err
 		}
 		switch kind[0] {
 		case 2:
@@ -160,57 +259,61 @@ func (c *Client) frame(width, height int) (*image.RGBA, error) {
 		case 3: // ServerCutText is ignored, bounded, and never logged.
 			var header [7]byte
 			if _, err := io.ReadFull(c.wire, header[:]); err != nil {
-				return nil, err
+				return err
 			}
 			n := binary.BigEndian.Uint32(header[3:])
 			if n > 1<<20 {
-				return nil, fmt.Errorf("RFB clipboard too large")
+				return fmt.Errorf("RFB clipboard too large")
 			}
 			if _, err := io.CopyN(io.Discard, c.wire, int64(n)); err != nil {
-				return nil, err
+				return err
 			}
 			continue
 		case 0:
 		default:
-			return nil, fmt.Errorf("unsupported RFB message %d", kind[0])
+			return fmt.Errorf("unsupported RFB message %d", kind[0])
 		}
 		var update [3]byte
 		if _, err := io.ReadFull(c.wire, update[:]); err != nil {
-			return nil, err
+			return err
 		}
-		for count := int(binary.BigEndian.Uint16(update[1:])); count > 0; count-- {
+		count := int(binary.BigEndian.Uint16(update[1:]))
+		if count > 0 {
+			result.changed = true
+		}
+		for ; count > 0; count-- {
 			var rect [12]byte
 			if _, err := io.ReadFull(c.wire, rect[:]); err != nil {
-				return nil, err
+				return err
 			}
 			x, y, w, h := int(binary.BigEndian.Uint16(rect[:])), int(binary.BigEndian.Uint16(rect[2:])), int(binary.BigEndian.Uint16(rect[4:])), int(binary.BigEndian.Uint16(rect[6:]))
 			if binary.BigEndian.Uint32(rect[8:]) != 0 {
-				return nil, fmt.Errorf("RFB server ignored Raw encoding negotiation")
+				return fmt.Errorf("RFB server ignored Raw encoding negotiation")
 			}
 			if w == 0 || h == 0 || x+w > c.Width || y+h > c.Height {
-				return nil, fmt.Errorf("RFB rectangle outside screen")
+				return fmt.Errorf("RFB rectangle outside screen")
+			}
+			if x+w > width || y+h > height {
+				result.outside = true
 			}
 			row := make([]byte, w*4)
 			for yy := y; yy < y+h; yy++ {
 				if _, err := io.ReadFull(c.wire, row); err != nil {
-					return nil, err
+					return err
 				}
-				// Raw bytes outside the request are still consumed and checked,
-				// but only the intersection belongs in the result and coverage map.
 				if yy >= height {
 					continue
 				}
 				for xx := x; xx < min(x+w, width); xx++ {
 					offset := (xx - x) * 4
-					frame.SetRGBA(xx, yy, color.RGBA{R: row[offset+2], G: row[offset+1], B: row[offset], A: 255})
-					i := yy*width + xx
-					if !seen[i] {
-						seen[i] = true
-						remaining--
+					result.frame.SetRGBA(xx, yy, color.RGBA{R: row[offset+2], G: row[offset+1], B: row[offset], A: 255})
+					if !result.seen[yy*width+xx] {
+						result.seen[yy*width+xx] = true
+						result.covered++
 					}
 				}
 			}
 		}
+		return nil
 	}
-	return frame, nil
 }

@@ -185,6 +185,28 @@ func screenFakeRFB(conn io.ReadWriter, event func([]byte)) error {
 	return screenFakeRFBRequests(conn, event, func(int, int) {})
 }
 func screenFakeRFBRequests(conn io.ReadWriter, event func([]byte), request func(int, int)) error {
+	return screenFakeRFBRespond(conn, event, func(payload []byte) error {
+		width, height := int(binary.BigEndian.Uint16(payload[5:])), int(binary.BigEndian.Uint16(payload[7:]))
+		request(width, height)
+		header := make([]byte, 16)
+		header[3] = 1
+		binary.BigEndian.PutUint16(header[8:], uint16(width))
+		binary.BigEndian.PutUint16(header[10:], uint16(height))
+		if _, err := conn.Write(header); err != nil {
+			return err
+		}
+		pixels := make([]byte, width*height*4)
+		for i := 0; i < len(pixels); i += 4 {
+			pixels[i+2] = 255
+		}
+		if _, err := conn.Write(pixels); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func screenFakeRFBRespond(conn io.ReadWriter, event func([]byte), respond func([]byte) error) error {
 	conn.Write([]byte("RFB 003.008\n"))
 	b := make([]byte, 12)
 	if _, err := io.ReadFull(conn, b); err != nil {
@@ -237,20 +259,7 @@ func screenFakeRFBRequests(conn io.ReadWriter, event func([]byte), request func(
 			event(append([]byte{kind}, payload...))
 		}
 		if kind == 3 {
-			width, height := int(binary.BigEndian.Uint16(payload[5:])), int(binary.BigEndian.Uint16(payload[7:]))
-			request(width, height)
-			header := make([]byte, 16)
-			header[3] = 1
-			binary.BigEndian.PutUint16(header[8:], uint16(width))
-			binary.BigEndian.PutUint16(header[10:], uint16(height))
-			if _, err := conn.Write(header); err != nil {
-				return err
-			}
-			pixels := make([]byte, width*height*4)
-			for i := 0; i < len(pixels); i += 4 {
-				pixels[i+2] = 255
-			}
-			if _, err := conn.Write(pixels); err != nil {
+			if err := respond(payload); err != nil {
 				return err
 			}
 		}

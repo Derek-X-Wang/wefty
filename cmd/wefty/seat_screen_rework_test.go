@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,17 @@ import (
 	"github.com/coder/websocket"
 )
 
+type seatScreenReworkStats struct {
+	input, events, baseline, syncs, incremental, capture atomic.Int32
+}
+
 func seatScreenReworkFixture(t *testing.T, failure string) (*apiClients, string, *atomic.Int32) {
+	t.Helper()
+	clients, id, stats := seatScreenReworkFixtureWithStats(t, failure)
+	return clients, id, &stats.input
+}
+
+func seatScreenReworkFixtureWithStats(t *testing.T, failure string) (*apiClients, string, *seatScreenReworkStats) {
 	t.Helper()
 	id := "seat_" + strings.Repeat("c", 32)
 	secret := "rework-seat-secret"
@@ -32,7 +43,7 @@ func seatScreenReworkFixture(t *testing.T, failure string) (*apiClients, string,
 	if _, err := storeSeatCredential(id, secret); err != nil {
 		t.Fatal(err)
 	}
-	input := new(atomic.Int32)
+	stats := new(seatScreenReworkStats)
 	address := ""
 	address = startStubLedger(t, func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/seats/"+id+"/") || r.Header.Get(l1.SeatCredentialHeader) != secret {
@@ -51,7 +62,7 @@ func seatScreenReworkFixture(t *testing.T, failure string) (*apiClients, string,
 		}
 		isInput := strings.HasSuffix(r.URL.Path, "/input")
 		if isInput {
-			input.Add(1)
+			stats.input.Add(1)
 		}
 		w.Header().Set("Wefty-Seat-Release-Note", base64.RawURLEncoding.EncodeToString([]byte("Same release note.")))
 		w.Header().Set("Wefty-Seat-Unread-Events", "0")
@@ -64,10 +75,22 @@ func seatScreenReworkFixture(t *testing.T, failure string) (*apiClients, string,
 		defer cancel()
 		events := 0
 		requests := 0
-		_ = screenFakeRFBRequests(websocket.NetConn(ctx, ws, websocket.MessageBinary), func([]byte) { events++ }, func(width, height int) {
+		conn := websocket.NetConn(ctx, ws, websocket.MessageBinary)
+		_ = screenFakeRFBRespond(conn, func([]byte) { events++; stats.events.Add(1) }, func(payload []byte) error {
+			width, height := int(binary.BigEndian.Uint16(payload[5:])), int(binary.BigEndian.Uint16(payload[7:]))
+			incremental := payload[0] == 1
+			if events == 0 {
+				stats.baseline.Add(1)
+			} else if incremental {
+				stats.incremental.Add(1)
+			} else if width == 1 && height == 1 {
+				stats.syncs.Add(1)
+			} else {
+				stats.capture.Add(1)
+			}
 			requests++
-			if failure == "view" && isInput && requests > 1 {
-				t.Error("combined call requested more than one framebuffer")
+			if failure == "view" && isInput && requests > 4 {
+				t.Error("combined call requested more than baseline, Sync, incremental update and capture")
 			}
 			if isInput && !(width == 1 && height == 1 || width == 1280 && height == 800) {
 				t.Errorf("unexpected input framebuffer request %dx%d", width, height)
@@ -75,19 +98,21 @@ func seatScreenReworkFixture(t *testing.T, failure string) (*apiClients, string,
 			if !isInput && (width != 1280 || height != 800) {
 				t.Errorf("screenshot requested %dx%d instead of full screen", width, height)
 			}
-			if isInput && (failure == "sync" || failure == "frame" || failure == "view" && width != 1280) {
+			if isInput && events > 0 && (failure == "sync" || failure == "wait" && incremental || failure == "frame" && !incremental && (width != 1 || height != 1)) {
 				if events != 2 {
 					t.Errorf("sync failure before click press and release: events=%d", events)
 				}
 				_ = ws.CloseNow()
+				return io.EOF
 			}
+			return settleUpdate(conn, width, height, false)
 		})
 	})
 	clients, err := newAPIClients(plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "screen-client"}), address, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return clients, id, input
+	return clients, id, stats
 }
 
 func TestSeatScreenDestinationCheckedBeforeInput(t *testing.T) {
@@ -109,26 +134,35 @@ func TestSeatScreenDestinationCheckedBeforeInput(t *testing.T) {
 	}
 }
 func TestSeatScreenScreenshotFailureReportsActionDone(t *testing.T) {
-	clients, id, input := seatScreenReworkFixture(t, "frame")
-	path := filepath.Join(t.TempDir(), "failed.png")
-	err := execute(t.Context(), clients, true, []string{"seat", "click", id, "1", "2", "--screenshot", path}, io.Discard, io.Discard)
-	var api *apiResponseError
-	if err == nil || !strings.Contains(err.Error(), "click done; screenshot failed:") || !errors.As(err, &api) || api.APIError.Details["action_done"] != true || api.APIError.Retryable {
-		t.Fatalf("missing completed action: %v", err)
-	}
-	if input.Load() != 1 {
-		t.Fatalf("input calls=%d", input.Load())
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("failed PNG kept: %v", err)
-	}
-	var rendered bytes.Buffer
-	writeCommandError(&rendered, err, true)
-	var value contract.ErrorResponse
-	if e := json.Unmarshal(rendered.Bytes(), &value); e != nil || value.Error.Details["action_done"] != true {
-		t.Fatalf("JSON lost action_done: %s", rendered.String())
+	for _, failure := range []string{"wait", "frame"} {
+		t.Run(failure, func(t *testing.T) {
+			clients, id, stats := seatScreenReworkFixtureWithStats(t, failure)
+			path := filepath.Join(t.TempDir(), "failed.png")
+			err := execute(t.Context(), clients, true, []string{"seat", "click", id, "1", "2", "--screenshot", path}, io.Discard, io.Discard)
+			var api *apiResponseError
+			if err == nil || !strings.Contains(err.Error(), "click done; screenshot failed:") || !errors.As(err, &api) || api.APIError.Details["action_done"] != true || api.APIError.Retryable {
+				t.Fatalf("missing completed action: %v", err)
+			}
+			wantCapture := int32(0)
+			if failure == "frame" {
+				wantCapture = 1
+			}
+			if stats.input.Load() != 1 || stats.events.Load() != 2 || stats.baseline.Load() != 1 || stats.syncs.Load() != 1 || stats.incremental.Load() != 1 || stats.capture.Load() != wantCapture {
+				t.Fatalf("wrong failure phase: input=%d events=%d baseline=%d Sync=%d incremental=%d capture=%d want capture=%d", stats.input.Load(), stats.events.Load(), stats.baseline.Load(), stats.syncs.Load(), stats.incremental.Load(), stats.capture.Load(), wantCapture)
+			}
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("failed PNG kept: %v", err)
+			}
+			var rendered bytes.Buffer
+			writeCommandError(&rendered, err, true)
+			var value contract.ErrorResponse
+			if e := json.Unmarshal(rendered.Bytes(), &value); e != nil || value.Error.Details["action_done"] != true || value.Error.Retryable {
+				t.Fatalf("JSON lost completed action: %s", rendered.String())
+			}
+		})
 	}
 }
+
 func TestSeatScreenReleaseNotesUseCallerStderrAndRepeat(t *testing.T) {
 	clients, id, _ := seatScreenReworkFixture(t, "")
 	var stdout, stderr bytes.Buffer
@@ -162,9 +196,6 @@ func TestSeatScreenSyncFailureReportsActionDone(t *testing.T) {
 			err := execute(t.Context(), clients, true, args, io.Discard, io.Discard)
 			var api *apiResponseError
 			phase := "input synchronization"
-			if screenshot {
-				phase = "screenshot"
-			}
 			if err == nil || !strings.Contains(err.Error(), "click done; "+phase+" failed:") || !errors.As(err, &api) || api.APIError.Details["action_done"] != true || api.APIError.Retryable {
 				t.Fatalf("missing completed action after sync failure: %v", err)
 			}
@@ -210,7 +241,7 @@ func TestSeatScreenTimingBreakdown(t *testing.T) {
 			t.Errorf("missing or negative phase %s: %v", name, reply.Debug.Phases)
 		}
 	}
-	if reply.Debug.Phases["rfb_banner"] > reply.Debug.Phases["input_written"] || reply.Debug.Phases["input_written"] > reply.Debug.Phases["frame_read"] || reply.Debug.Phases["frame_read"] > reply.Debug.Phases["png_written"] {
+	if reply.Debug.Phases["rfb_banner"] > reply.Debug.Phases["input_written"] || reply.Debug.Phases["input_written"] > reply.Debug.Phases["sync_done"] || reply.Debug.Phases["sync_done"] > reply.Debug.Phases["frame_update_seen"] || reply.Debug.Phases["sync_done"] > reply.Debug.Phases["frame_read"] || reply.Debug.Phases["frame_read"] > reply.Debug.Phases["png_written"] {
 		t.Fatalf("timing phases out of order: %v", reply.Debug.Phases)
 	}
 }

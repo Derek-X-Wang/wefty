@@ -784,8 +784,11 @@ code — see the recipe above.
 
 ## Drive a Seat's screen
 
-Use only your own Seat ID and its saved credential. Each CLI call opens and
-closes one connection, including when an action also captures a screenshot.
+Use only your own Seat ID and its saved credential. Normally each CLI call opens and
+closes one connection. If an input screenshot's update wait times out, the CLI
+closes input and captures through a fresh view connection without repeating input.
+A post-input Sync round trip orders input before either capture path closes it.
+The combined reply prints the release note once and may use the latest unread count.
 
 ```sh
 wefty seat screenshot SEAT_ID                  # prints a new PNG path
@@ -826,7 +829,8 @@ does not mean a new instruction. Every reply carries the shared unread
 Seat-event hint; read it with `wefty logs`.
 
 Use `--json` for `elapsed_ms`, `path`, `unread_events`, and, when nonzero,
-`unread_events_line`. Refusals carry `details.elapsed_ms`. Input calls are
+`unread_events_line`. Input with `--screenshot` counts changes reported by Sync; if Sync reports none, it waits for an update for up to the rest of one second from the input write. It adds JSON `frame_after_input` (true if a change was seen, false on timeout with capture on a fresh view connection).
+Refusals carry `details.elapsed_ms`. Input calls are
 never retried automatically: an interrupted call may already have acted.
 Wefty checks the PNG destination before sending input. Once input bytes are
 written, a later synchronization or screenshot failure says `<action> done; …`
