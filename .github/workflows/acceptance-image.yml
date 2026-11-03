@@ -66,6 +66,7 @@ jobs:
             --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
             --receipt-output "$evidence/${ARCH}-oci.json"
           cp "$RUNNER_TEMP/acceptance-image.oci.tar" "$evidence/${ARCH}.oci.tar"
+          bash scripts/download-crane-modules.sh
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/wefty-echo-service:${GITHUB_SHA}-${ARCH}"
@@ -197,6 +198,7 @@ jobs:
         id: publish
         run: |
           set -euo pipefail
+          bash scripts/download-crane-modules.sh
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           for arch in amd64 arm64; do
@@ -443,6 +445,7 @@ jobs:
           stage='archive-evidence-copy'
           cp "$RUNNER_TEMP/computer-image.oci.tar" "$evidence/${ARCH}.oci.tar"
           stage='crane-install'
+          bash scripts/download-crane-modules.sh
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/${LOCAL_NAME}:${GITHUB_SHA}-${ARCH}"
@@ -523,6 +526,7 @@ jobs:
         id: publish-computer
         run: |
           set -euo pipefail
+          bash scripts/download-crane-modules.sh
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           for arch in amd64 arm64; do
@@ -634,6 +638,7 @@ jobs:
         id: publish-wayland-computer
         run: |
           set -euo pipefail
+          bash scripts/download-crane-modules.sh
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           for arch in amd64 arm64; do
