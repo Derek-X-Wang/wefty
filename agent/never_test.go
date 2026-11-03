@@ -499,7 +499,7 @@ func TestNeverProcessPublicContractWithRealAgent(t *testing.T) {
 			job := call(t.Context(), http.MethodPost, "/v1/jobs", contract.JobSpec{SchemaVersion: 1, DispatchKey: "never-real", Kind: "process", Class: "service", Restart: "never", Execution: contract.ExecutionSpec{Executable: contract.ExecutableSpec{Path: "/bin/sh"}, Argv: []string{"sh", "-c", fmt.Sprintf("exit %d", code)}, WorkingDirectory: t.TempDir()}}, http.StatusCreated)
 			wait := func() l1.Job {
 				t.Helper()
-				deadline := time.Now().Add(5 * time.Second)
+				deadline := time.Now().Add(testwait.Bound)
 				ctx, cancel := context.WithDeadline(t.Context(), deadline)
 				defer cancel()
 				for {
