@@ -487,7 +487,9 @@ lock and after OCI admission and resident work have quiesced. Zero live
 attempts alone never authorize deletion. Any Computer Storage generation or
 Backup copy on that disk refuses the recreate, including stopped Computers,
 staging and retired generations, quarantined Storage, and unresolved reset
-records. There is no acknowledged-loss override.
+records. Service data and its owner records, including stopped services, and
+Custody write records also refuse recreation. There is no acknowledged-loss
+override.
 
 The guard reads the helper's durable guest files. The node agent's local spool
 records removal acknowledgements, not a complete inventory of physical copies;
@@ -496,8 +498,26 @@ empty spool nor an empty runtime inventory proves an empty host VM disk. The
 shipped Lima helper uses `/var/lib/wefty/oci`; a different helper command or
 runtime-root override is unknown and refuses. With the host VM known running,
 the guard stops both the helper socket and service, joins their stop, and
-inspects `computer-disks`, `computer-backups`, `computer-disk-quarantine` and
-`computer-storage-resets`. Entries block except for
+inspects `computer-disks`, `computer-backups`, `computer-disk-quarantine`,
+`computer-storage-resets`, `service-data`, `service-data-state` and
+`computer-custody-writes`. Empty namespace directories do not block. Every
+service volume or owner record blocks. Owner records retain an optional `job_id`
+within version 1. A legacy record attempts label backfill on its next use; a
+failed optional write logs a diagnostic and keeps an already-valid startup
+working. Required ownership writes remain strict. The job ID must hash to its
+volume name. Durable `attempt-ownership` records provide a fallback
+job identity. A present volume's device/inode must match its owner record.
+Every Custody write record blocks, including completed writes retained by the
+helper. Unknown entries, unreadable
+folders or records, malformed records and incomplete inventory refuse. Save
+service data before `wefty services remove JOB_ID --wait 60s` when the job and
+owner record are known. Missing or damaged owner records and unknown jobs need
+node-owner recovery; keep the VM until recovery is complete. For Custody markers,
+use `wefty services remove COMPUTER --expect-current --wait 60s`. If the Computer
+is already removed, or this record remains after removal, keep the VM and use
+node-owner recovery.
+
+The exception is
 `computer-backups/supersessions`, which contains removal and supersession
 records rather than Backup copies. That folder must be a real directory of
 regular files named `wefty-backup-copy-<32 lowercase hex>.json` or
