@@ -2881,8 +2881,9 @@ they never compare a recorded L1 lease timestamp with the CLI clock. Renewal
 proof compares successive L1-written expiry values for the same Attempt.
 OpenStore reads the host boot identity once and refuses to open if that read
 fails. Seat and Attempt timers share that cached identity; transactions sample
-only boot-elapsed time. Every read and write door pins the Attempt clock, and
-a missing clock refuses lease authority instead of falling back to wall time.
+boot-elapsed time and, where available, the pausing clock. Every read and write
+door pins the Attempt clock. A missing clock refuses lease authority instead
+of falling back to wall time.
 If elapsed-clock sampling fails, L1 keeps serving and runs unrelated maintenance,
 retries lease-dependent reconciliation on the next pass, and refuses lease
 authority until the clock is available. It does not silently switch a stamped
@@ -2891,6 +2892,59 @@ the Attempt; without a usable boot clock it clears the boot stamp and caps the
 wall deadline.
 Cancellation settlement uses its wall deadline even when elapsed-clock sampling
 fails; it does not depend on the Attempt lease clock.
+L1 also samples a clock that pauses during sleep: Darwin `CLOCK_UPTIME_RAW`,
+Linux `CLOCK_MONOTONIC`. The increase in the difference from the sleep-counting
+clock is L1's own sleep gap (#1333). Before any lease comparison, a write
+transaction adds that gap to every nonterminal Attempt's wall deadline and to
+its same-boot boot deadline. It also extends the implicit stale/dead deadlines
+for alive, stale and draining Nodes by the same gap, using private stored sleep
+credit. A real heartbeat resets that credit; its recorded timestamp stays real
+wall time. Dead Nodes are not extended. Terminal Attempts, including `lost`,
+are never revived. The one-copy rule does not change.
+A durable, boot-scoped interval `[anchor_lo, anchor_hi]` bounds the true clock
+offset already accounted for in deadlines. Initialization saves both bounds of
+its clock sample. A new host boot or missing row resets to that sample interval
+without credit; reopening keeps an existing row unchanged. Read snapshots use
+their pending credit in memory and never write it.
+For a current sample `[lower, upper]`, proved credit is
+`g = max(0, lower - anchor_hi)`. Only `g` is persisted into deadlines. Expiry
+allows `max(0, upper - anchor_lo)` total credit: the excess over `g` stays in
+memory. This includes uncertainty in both the saved baseline and the current
+sample. No possible credit is persisted or used to grant lease authority.
+When `g > 0`, both anchor bounds advance by `g`, preserving their width. When
+`g == 0`, a write may tighten `anchor_hi` to `min(anchor_hi, upper)`, while
+leaving `anchor_lo` unchanged: uncredited sleep may have happened since the
+baseline sample. Anchor and deadline changes commit together, so rollback,
+reopen and repeated comparisons cannot double-credit a gap. The interval
+remains ordered. Repeated wide samples do not accumulate new grace periods.
+Lease authority, including renewal, uses only proved credit. If that credit
+says expired but the upper bound could keep the Attempt live, L1 refuses
+authority without marking it lost. If even the upper bound proves expiry,
+the ordinary expiry transition applies. Renewal records the ordinary lease
+duration without adding possible credit. Lost and superseded Attempts remain
+refused by their existing state and current-Attempt fences.
+A pausing-clock or boot-clock read failure still refuses Attempt lease
+authority and retries Attempt expiry on the next tick, with the existing
+`attempt_lease_clock_retry` event. Node liveness remains wall-based against
+`last_heartbeat_ns + heartbeat_sleep_ns`, without new credit when measurement
+is unavailable or fails. Dead-host revocation settlement therefore continues.
+Unrelated reads, submission, evidence, maintenance and wall-based cancellation
+settlement proceed. Cancellation deadlines never receive possible sleep credit.
+A platform without a pausing clock keeps the previous lease behavior.
+Wall-clock steps alone grant no sleep credit.
+After wake, an unrenewed Attempt expires once even the maximum possible credit
+cannot cover its deadline. Relative to its remaining lease under proved credit,
+a decision can postpone expiry by at most the initial anchor width plus the
+current sample width and normal reconciliation margin. With initial width A,
+valid sample widths bounded by W, and R the time until L1 completes a
+successful expiry decision (reconciliation interval plus sampling, scheduling
+and transaction delays), the additional delay is at most A + W + R. This is a
+conditional upper bound, not the delay of every execution: if clock reads keep
+failing, no expiry decision completes. Tightening can reduce A; advancing
+credit never increases it. There is no fixed wall-time bound if these widths
+or reconciliation intervals are unbounded. Nodes use the same rule with their
+own remaining stale/dead waits. A remote Node sleeping while L1 stays awake
+receives no credit (#1349). Seat idle and approval waits still count sleep.
 Node-side lease timers are unchanged.
 Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
 pending approvals and windows without a stamp do not retain authority.

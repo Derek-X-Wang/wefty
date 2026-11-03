@@ -503,6 +503,12 @@ func (s *Store) initialize(ctx context.Context) error {
 	// Data-format changes must alter DDL or a migration marker (for example
 	// user_version) so upgrade fingerprints refuse unsafe binary rollback.
 	const schema = `
+CREATE TABLE IF NOT EXISTS lease_sleep_clock (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ boot_id TEXT NOT NULL,
+ offset_lo_ns INTEGER NOT NULL,
+ offset_hi_ns INTEGER NOT NULL CHECK(offset_lo_ns<=offset_hi_ns)
+);
 CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY,
   dispatch_key TEXT NOT NULL UNIQUE,
@@ -1347,6 +1353,15 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	if err := s.ensureColumn(ctx, "nodes", "automatically_admitted", "INTEGER NOT NULL DEFAULT 0 CHECK(automatically_admitted IN (0, 1))"); err != nil {
 		return err
 	}
+	if err := s.ensureColumn(ctx, "nodes", "heartbeat_sleep_ns", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `CREATE TRIGGER IF NOT EXISTS nodes_heartbeat_sleep_reset
+ AFTER UPDATE OF last_heartbeat_ns ON nodes BEGIN
+  UPDATE nodes SET heartbeat_sleep_ns=0 WHERE node_id=NEW.node_id;
+ END;`); err != nil {
+		return err
+	}
 	if err := s.initializeNodeListing(ctx); err != nil {
 		return err
 	}
@@ -1431,6 +1446,9 @@ DROP TABLE IF EXISTS job_log_jsonl;
 	// Append after all older Attempt migrations so fresh and upgraded tables
 	// have the same column order and rollback schema fingerprint.
 	if err := s.migrateAttemptLeaseClock(ctx); err != nil {
+		return err
+	}
+	if err := initializeLeaseSleepClock(ctx, s.db, s.clock); err != nil {
 		return err
 	}
 	if err := s.ensureColumn(ctx, "computer_takeover_audit", "stored_ns", "INTEGER NOT NULL DEFAULT 0"); err != nil {
@@ -2832,7 +2850,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]Node, error) {
 		nodes, err = reads.nodes(ctx)
 		if err == nil {
 			for i := range nodes {
-				nodes[i] = s.nodeLiveness().project(nodes[i], reads.now())
+				nodes[i] = s.nodeLiveness().project(nodes[i], leaseExpiryWallTime(ctx, reads.now()))
 			}
 		}
 		return err
@@ -3298,7 +3316,7 @@ func (s *Store) claimJob(ctx context.Context, identityNodeID, nodeID, bootSessio
 	var heartbeatNS int64
 	var authorityGeneration int64
 	var claimsEnabled bool
-	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state, last_heartbeat_ns, authority_generation, claims_enabled FROM nodes WHERE node_id=?", nodeID).
+	err = tx.QueryRowContext(ctx, "SELECT identity_node_id, boot_session_id, state, last_heartbeat_ns+heartbeat_sleep_ns, authority_generation, claims_enabled FROM nodes WHERE node_id=?", nodeID).
 		Scan(&storedIdentity, &storedBoot, &nodeState, &heartbeatNS, &authorityGeneration, &claimsEnabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, protocolError(contract.ErrorNodeNotRegistered, "node %q is not registered", nodeID)
@@ -5504,13 +5522,13 @@ func getNodeProjection(ctx context.Context, q nodeQueryer, nodeID string, diagno
 	var intentUpdatedNS sql.NullInt64
 	err := q.QueryRowContext(ctx, `SELECT node_id, boot_session_id, connect_host, root_instance_id, os, architecture, agent_version, capabilities_json,
 	capability_revision, capability_observed_ns, missing_capabilities_json, capability_reason_code, state, max_oneshot_slots, max_service_slots,
-	authority_generation, claims_enabled, automatically_admitted, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns, last_condition_json,
+	authority_generation, claims_enabled, automatically_admitted, intent_revision, intent_reason, intent_updated_at, intent_actor, last_heartbeat_ns, heartbeat_sleep_ns, last_condition_json,
     COALESCE((SELECT generation_id FROM node_generations WHERE node_generations.node_id=nodes.node_id AND role='primary'), '')
 	FROM nodes WHERE node_id=?`, nodeID).Scan(&node.NodeID, &node.BootSessionID, &node.ConnectHost, &node.RootInstanceID, &node.OS, &node.Architecture,
 		&node.AgentVersion, &capabilitiesJSON, &node.CapabilityRevision, &capabilityObservedNS, &missingCapabilitiesJSON,
 		&node.CapabilityReasonCode, &node.State, &node.MaxOneshotSlots, &node.MaxServiceSlots,
 		&node.AuthorityGeneration, &node.ClaimsEnabled, &node.AutomaticallyAdmitted, &node.IntentRevision, &node.IntentReason, &intentUpdatedNS,
-		&node.IntentActor, &heartbeatNS, &conditionData, &node.AgentGenerationID)
+		&node.IntentActor, &heartbeatNS, &node.heartbeatSleep, &conditionData, &node.AgentGenerationID)
 	if err != nil {
 		return Node{}, err
 	}

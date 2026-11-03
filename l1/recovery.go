@@ -27,16 +27,17 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	tx := write.tx
 	defer write.rollback()
 	ctx = write.ctx
-	if err := attemptClockError(ctx); err != nil {
+	clockErr := attemptClockError(ctx)
+	if clockErr != nil {
 		if s.logf != nil {
-			s.logf("event=attempt_lease_clock_retry action=retry_next_tick error=%q", err)
+			s.logf("event=attempt_lease_clock_retry action=retry_next_tick error=%q", clockErr)
 		}
 	}
 
 	result := ReconcileResult{}
 	dead, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_condition_json=?
-		WHERE state IN (?, ?, ?) AND last_heartbeat_ns<=?`, contract.NodeDead, conditionJSON("node_dead", "node_liveness", now, nil),
-		contract.NodeAlive, contract.NodeStale, contract.NodeDraining, now.Add(-s.nodeDeadAfter).UnixNano())
+		WHERE state IN (?, ?, ?) AND last_heartbeat_ns+heartbeat_sleep_ns<=?`, contract.NodeDead, conditionJSON("node_dead", "node_liveness", now, nil),
+		contract.NodeAlive, contract.NodeStale, contract.NodeDraining, leaseExpiryWallTime(ctx, now).Add(-s.nodeDeadAfter).UnixNano())
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "mark dead nodes")
 	}
@@ -54,8 +55,8 @@ func (s *Store) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	}
 
 	stale, err := tx.ExecContext(ctx, `UPDATE nodes SET state=?, last_condition_json=?
-		WHERE state=? AND last_heartbeat_ns<=?`, contract.NodeStale, conditionJSON("node_stale", "node_liveness", now, nil), contract.NodeAlive,
-		now.Add(-s.nodeStaleAfter).UnixNano())
+		WHERE state=? AND last_heartbeat_ns+heartbeat_sleep_ns<=?`, contract.NodeStale, conditionJSON("node_stale", "node_liveness", now, nil), contract.NodeAlive,
+		leaseExpiryWallTime(ctx, now).Add(-s.nodeStaleAfter).UnixNano())
 	if err != nil {
 		return ReconcileResult{}, internalError(err, "mark stale nodes")
 	}
@@ -271,7 +272,7 @@ var expiredAttemptsSQL = `SELECT attempts.attempt_id
 	FROM jobs JOIN attempts ON attempts.attempt_id=jobs.current_attempt_id
 	WHERE jobs.outcome='canceled'
 		AND jobs.state IN (@job_claimed, @job_running, @job_awaiting_input, @job_stopping)
-		AND jobs.cancel_settle_by_ns<=@now_ns
+		AND jobs.cancel_settle_by_ns<=@cancel_now_ns
 		AND attempts.job_id=jobs.job_id
 		AND attempts.state IN (@attempt_claimed, @attempt_running, @attempt_awaiting_input)`
 
@@ -280,7 +281,8 @@ func expiredAttemptsArguments(now time.Time, contexts ...context.Context) []any 
 	if len(contexts) > 0 {
 		ctx = contexts[0]
 	}
-	return append(attemptLeaseArguments(ctx, now), []any{
+	return append(attemptLeaseArguments(withAttemptExpiryClock(ctx), now), []any{
+		sql.Named("cancel_now_ns", now.UnixNano()),
 		sql.Named("attempt_claimed", contract.AttemptClaimed),
 		sql.Named("attempt_running", contract.AttemptRunning),
 		sql.Named("attempt_awaiting_input", contract.AttemptAwaitingInput),
@@ -293,11 +295,12 @@ func expiredAttemptsArguments(now time.Time, contexts ...context.Context) []any 
 
 func (s *Store) reconcileClaimingNode(ctx context.Context, tx *sql.Tx, nodeID string, state contract.NodeState, heartbeat, now time.Time) (contract.NodeState, error) {
 	next := state
+	comparison := leaseExpiryWallTime(ctx, now)
 	if state == contract.NodeAlive || state == contract.NodeStale {
 		switch {
-		case !heartbeat.Add(s.nodeDeadAfter).After(now):
+		case !heartbeat.Add(s.nodeDeadAfter).After(comparison):
 			next = contract.NodeDead
-		case state == contract.NodeAlive && !heartbeat.Add(s.nodeStaleAfter).After(now):
+		case state == contract.NodeAlive && !heartbeat.Add(s.nodeStaleAfter).After(comparison):
 			next = contract.NodeStale
 		}
 	}

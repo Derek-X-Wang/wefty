@@ -626,6 +626,7 @@ func (s *Store) HeartbeatRetiringNodeGeneration(ctx context.Context, identity, n
 // nodeGenerationClosureReady is L1's part of the shared #1176 boundary. An
 // unaccepted buffered completion and a custody receipt never satisfy it.
 func nodeGenerationClosureReady(ctx context.Context, q queryer, nodeID, generation string, now time.Time) (bool, error) {
+	ctx = withAttemptExpiryClock(ctx)
 	if err := attemptClockError(ctx); err != nil {
 		return false, internalError(err, "read generation lease clock")
 	}
@@ -639,7 +640,7 @@ func nodeGenerationClosureReady(ctx context.Context, q queryer, nodeID, generati
             (a.completion_key IS NULL OR a.state NOT IN ('succeeded','failed','interrupted'))
             AND a.state<>'lost' AND `+attemptLeaseLiveSQL("a", "?", "?", "?")+`
             AND NOT (j.outcome='canceled' AND j.cancel_settle_by_ns<=?)
-        )))`, nodeID, generation, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, now.UnixNano(), now.UnixNano()).Scan(&pending)
+        )))`, nodeID, generation, currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).sqlBoot(), currentAttemptClock(ctx).ns, leaseWallTime(ctx, now).UnixNano(), now.UnixNano()).Scan(&pending)
 	return !pending, err
 }
 
@@ -841,6 +842,10 @@ func (s *Store) NodeGenerationClosureReady(ctx context.Context, identity, nodeID
 	}
 	now := canonicalTime(s.clock.Now())
 	ctx = withAttemptClock(ctx, s.clock, now)
+	ctx, err = withLeaseSleepGap(ctx, tx, false)
+	if err != nil {
+		return false, err
+	}
 	ready, err := nodeGenerationClosureReady(ctx, tx, nodeID, generation, now)
 	if err != nil {
 		return false, err

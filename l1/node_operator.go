@@ -113,7 +113,7 @@ func (s *Store) GetNode(ctx context.Context, nodeID string) (Node, error) {
 		if err != nil {
 			return internalError(err, "read node")
 		}
-		node = s.nodeLiveness().project(node, reads.now())
+		node = s.nodeLiveness().project(node, leaseExpiryWallTime(ctx, reads.now()))
 		return nil
 	})
 	return node, err
@@ -133,9 +133,9 @@ func (s *Store) nodeLiveness() nodeLiveness {
 func (l nodeLiveness) project(node Node, now time.Time) Node {
 	switch node.State {
 	case contract.NodeAlive, contract.NodeStale, contract.NodeDraining:
-		if !node.LastHeartbeatAt.Add(l.deadAfter).After(now) {
+		if !node.LastHeartbeatAt.Add(node.heartbeatSleep + l.deadAfter).After(now) {
 			node.State = contract.NodeDead
-		} else if node.State == contract.NodeAlive && !node.LastHeartbeatAt.Add(l.staleAfter).After(now) {
+		} else if node.State == contract.NodeAlive && !node.LastHeartbeatAt.Add(node.heartbeatSleep+l.staleAfter).After(now) {
 			node.State = contract.NodeStale
 		}
 	}

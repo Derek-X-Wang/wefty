@@ -40,6 +40,8 @@ import (
 // it adds no persisted schema, so this fingerprint remains unchanged.
 // #1149 adds an administrator-only viewer discovery route with no schema change.
 // #1144 adds the approval-based potential host VM wait deadline.
+// #1333 adds the boot-scoped interval lease_sleep_clock anchor and private Node
+// heartbeat sleep credit, reset by a trigger on real heartbeat writes.
 // A changed golden means an upgrade across it cannot restore the old binaries
 // (ADR-0003).
 func TestUpgradeSchemaMatchesMain(t *testing.T) {
@@ -60,7 +62,7 @@ func TestUpgradeSchemaMatchesMain(t *testing.T) {
 	}
 	t.Logf("L1 schema fingerprint: %s", got)
 	// Seat identity recovery retains exact authority and positive Attempt absence.
-	const mainFingerprint = "dc88704cb63ad5fb8314687314b238b195c6189fc5e71b31ece0919f99bd700e"
+	const mainFingerprint = "b685d3fdd68c3c33d0c1729e1229df24af9e67326149b9487d275601080c0f81"
 	if got != mainFingerprint {
 		t.Fatalf("L1 schema differs from main: got %s want %s", got, mainFingerprint)
 	}

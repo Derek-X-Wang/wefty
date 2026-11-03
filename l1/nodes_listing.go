@@ -111,8 +111,8 @@ func nodeListingQuery(filters nodeListFilters, cursor nodeListCursor, limit int,
 		// Apply the same liveness thresholds as projection, before LIMIT. State
 		// indexes cannot order a mix of recorded states, so seek the stable key.
 		predicates = append(predicates, `(CASE
- WHEN nodes.state IN ('alive', 'stale', 'draining') AND nodes.last_heartbeat_ns<=? THEN 'dead'
- WHEN nodes.state='alive' AND nodes.last_heartbeat_ns<=? THEN 'stale'
+ WHEN nodes.state IN ('alive', 'stale', 'draining') AND nodes.last_heartbeat_ns+nodes.heartbeat_sleep_ns<=? THEN 'dead'
+ WHEN nodes.state='alive' AND nodes.last_heartbeat_ns+nodes.heartbeat_sleep_ns<=? THEN 'stale'
  ELSE nodes.state END)=?`)
 		args = append(args, now.Add(-liveness.deadAfter).UnixNano(), now.Add(-liveness.staleAfter).UnixNano(), filters.State)
 	}
@@ -158,7 +158,7 @@ func (r *databaseReads) nodePage(ctx context.Context, filters nodeListFilters, c
 			return NodeList{}, internalError(err, "read node insertion watermark")
 		}
 	}
-	query, args := nodeListingQuery(filters, cursor, limit, r.now(), liveness)
+	query, args := nodeListingQuery(filters, cursor, limit, leaseExpiryWallTime(ctx, r.now()), liveness)
 	rows, err := r.q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return NodeList{}, internalError(err, "list node page IDs")
@@ -188,7 +188,7 @@ func (r *databaseReads) nodePage(ctx context.Context, filters nodeListFilters, c
 		if err != nil {
 			return NodeList{}, internalError(err, "read paged node")
 		}
-		page.Nodes = append(page.Nodes, liveness.project(node, r.now()))
+		page.Nodes = append(page.Nodes, liveness.project(node, leaseExpiryWallTime(ctx, r.now())))
 		// Finish at least one node before yielding. Continue from the last
 		// returned key, including when the cutoff shortens a maximum page.
 		if r.pageCutoffReached() {

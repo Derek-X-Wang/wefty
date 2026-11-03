@@ -18,6 +18,8 @@ type bootClockSource interface {
 	BootElapsed() (time.Duration, error)
 }
 
+func (systemClock) AwakeElapsed() (time.Duration, error) { return bootclock.AwakeNow() }
+
 func (systemClock) BootIdentity() (string, error)       { return hostboot.Identity() }
 func (systemClock) BootElapsed() (time.Duration, error) { return bootclock.Now() }
 
@@ -30,6 +32,13 @@ type cachedBootClock struct {
 func (c cachedBootClock) BootTime() (string, time.Duration, error) {
 	elapsed, err := c.source.BootElapsed()
 	return c.boot, elapsed, err
+}
+
+func (c cachedBootClock) AwakeElapsed() (time.Duration, error) {
+	if source, ok := c.Clock.(awakeClockSource); ok {
+		return source.AwakeElapsed()
+	}
+	return 0, bootclock.ErrAwakeUnavailable
 }
 
 func (c cachedBootClock) NewTimer(duration time.Duration) clockTimer {
