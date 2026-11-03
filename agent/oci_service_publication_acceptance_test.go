@@ -304,7 +304,7 @@ while :; do sleep 1; done
 	}
 	authorities := newNativeClaimAuthorityRecorder()
 	agentFabric := network.NewFabric(fabric.Identity{NodeID: "native-service-agent", Tags: []string{l1.DefaultAgentPrincipalTag}})
-	nodeAgent, err := New(Config{
+	nodeAgent, err := New(capturedAgentConfig(t, Config{
 		HandoffRoot: handoffRoot,
 		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "native-service-node", BootSessionID: "native-service-boot", Version: "realtiming",
@@ -327,7 +327,7 @@ while :; do sleep 1; done
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
 		HeartbeatInterval: 2 * time.Second, ClaimInterval: 20 * time.Millisecond, RenewalInterval: 200 * time.Millisecond,
 		OperationTimeout: 5 * time.Second, FinalizationTimeout: 30 * time.Second, Logf: t.Logf,
-	})
+	}))
 	if err != nil {
 		_ = barrier.Close()
 		t.Fatal(err)
@@ -336,6 +336,9 @@ while :; do sleep 1; done
 	runContext, cancelRun := context.WithCancel(t.Context())
 	runDone := make(chan error, 1)
 	go func() { runDone <- nodeAgent.Run(runContext) }()
+	// Join Run on every exit so failed-row capture sees the shutdown output.
+	stopFirst := sync.OnceValue(func() error { cancelRun(); return <-runDone })
+	defer func() { _ = stopFirst() }()
 
 	firstRunning := waitNativeServiceState(t, store, primary.JobID, contract.JobRunning, 45*time.Second)
 	firstAttempt := firstRunning.CurrentAttemptID
@@ -615,8 +618,7 @@ while :; do sleep 1; done
 	removalEveryAttempt = everyAttempt
 	removalServiceDataVolume = serviceDataVolume
 	removalServiceDataOwnerRecord = serviceDataOwnerRecord
-	cancelRun()
-	if err := <-runDone; err != nil {
+	if err := stopFirst(); err != nil {
 		t.Fatalf("L1/agent realtiming shutdown: %v", err)
 	}
 	nodeAgent.Close()
@@ -629,7 +631,7 @@ while :; do sleep 1; done
 		t.Fatal(err)
 	}
 	restartAdapter := ocirunner.NewAdapter(restartBarrier)
-	nodeAgent, err = New(Config{
+	nodeAgent, err = New(capturedAgentConfig(t, Config{
 		HandoffRoot: handoffRoot,
 		Fabric:      agentFabric, ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "native-service-node", BootSessionID: restartBootID, Version: "realtiming",
@@ -645,7 +647,7 @@ while :; do sleep 1; done
 		ManagedRootDirectory: managedRoot, LogSpoolDirectory: spoolDirectory, MaxServiceSlots: 1,
 		HeartbeatInterval: 2 * time.Second, ClaimInterval: 20 * time.Millisecond, RenewalInterval: 200 * time.Millisecond,
 		OperationTimeout: 5 * time.Second, FinalizationTimeout: 30 * time.Second, Logf: t.Logf,
-	})
+	}))
 	if err != nil {
 		_ = restartBarrier.Close()
 		t.Fatal(err)
@@ -718,6 +720,8 @@ while :; do sleep 1; done
 	defer cancelRestart()
 	restartDone := make(chan error, 1)
 	go func() { restartDone <- nodeAgent.Run(restartContext) }()
+	stopRestart := sync.OnceValue(func() error { cancelRestart(); return <-restartDone })
+	defer func() { _ = stopRestart() }()
 	removed := waitNativeServiceState(t, store, primary.JobID, contract.JobRemovedVerified, 45*time.Second)
 	removalCompleted = removed.State == contract.JobRemovedVerified
 	if !removalCompleted {
@@ -778,8 +782,7 @@ while :; do sleep 1; done
 		t, store, reference, digest, operatorMountRoot, managedRoot, spoolDirectory,
 	)
 
-	cancelRestart()
-	if err := <-restartDone; err != nil {
+	if err := stopRestart(); err != nil {
 		t.Fatalf("restarted L1/agent realtiming shutdown: %v", err)
 	}
 }

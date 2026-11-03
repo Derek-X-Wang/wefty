@@ -529,6 +529,8 @@ jobs:
       - name: Run service acceptance at production timings
         env:
           WEFTY_REALTIME_EVIDENCE_DIR: ${{ runner.temp }}/service-acceptance-realtiming
+          # Failed rows snapshot the shared OCI deadman log before later rows run.
+          WEFTY_REALTIME_HELPER_LOG: ${{ runner.os == 'Linux' && '/tmp/wefty-oci-helper-realtiming.stderr' || '' }}
         run: |
           mkdir -p "$WEFTY_REALTIME_EVIDENCE_DIR"
           if [ -f /tmp/wefty-oci-provision.txt ]; then

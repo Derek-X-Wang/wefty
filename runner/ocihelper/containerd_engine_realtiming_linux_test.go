@@ -2413,7 +2413,7 @@ func exerciseDirectL1OCIOneShot(t *testing.T, ctx context.Context, barrier *ocih
 		t.Fatal(err)
 	}
 	directRuntime := &directResultRuntime{Adapter: adapter}
-	node, err := agent.New(agent.Config{
+	node, err := agent.New(capturedAgentConfig(t, agent.Config{
 		Fabric: network.NewFabric(fabric.Identity{NodeID: "native-agent", Tags: []string{l1.DefaultAgentPrincipalTag}}), ControlPlaneAddress: "wefty://control-plane",
 		NodeID: "native-node", BootSessionID: "native-boot", Version: "realtiming-direct", OS: "linux", Architecture: runtime.GOARCH,
 		CapabilityProbe: realOCIProbe{run: func(c context.Context) error {
@@ -2426,7 +2426,7 @@ func exerciseDirectL1OCIOneShot(t *testing.T, ctx context.Context, barrier *ocih
 		AttemptDeadman:    nativeAgentAttemptDeadman{barrier: barrier, nodeID: "native-node", bootSessionID: "native-boot"},
 		HeartbeatInterval: time.Second, ClaimInterval: 25 * time.Millisecond, RenewalInterval: time.Second,
 		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), ManagedRootDirectory: root,
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2607,7 +2607,7 @@ func exerciseOrdinaryL3OCIOneshot(
 		t.Fatal(err)
 	}
 	intentSource := lima.FileIntentSource{Path: intentPath}
-	nodeAgent, err := agent.New(agent.Config{
+	nodeAgent, err := agent.New(capturedAgentConfig(t, agent.Config{
 		Fabric: agentFabric, ControlPlaneAddress: l3.DefaultL1Address, RunLedgerAddress: l3.DefaultL3Address,
 		NodeID: "native-node", BootSessionID: "native-boot", Version: "realtiming", OS: "linux", Architecture: runtime.GOARCH,
 		Capabilities: map[string]bool{"kind:process": true}, CapabilityProbe: probe, OCIBootBarrier: barrier,
@@ -2619,12 +2619,26 @@ func exerciseOrdinaryL3OCIOneshot(
 		AttemptDeadman:    nativeAgentAttemptDeadman{barrier: barrier, nodeID: "native-node", bootSessionID: "native-boot"},
 		HeartbeatInterval: time.Second, ClaimInterval: 25 * time.Millisecond, RenewalInterval: time.Second,
 		LogSpoolDirectory: t.TempDir(), HandoffRoot: t.TempDir(), ManagedRootDirectory: managedRoot,
-	})
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	agentDone := make(chan error, 1)
 	go func() { agentDone <- nodeAgent.Run(runContext) }()
+	// Join on every exit before deferred stores close and Capture cleanup runs.
+	defer func() {
+		cancelRun()
+		err := <-agentDone
+		nodeAgent.Close()
+		if err != nil {
+			t.Error(err)
+		}
+		for range 2 {
+			if err := <-served; err != nil {
+				t.Error(err)
+			}
+		}
+	}()
 
 	caller := &http.Client{Transport: &http.Transport{DialContext: func(dialContext context.Context, networkName, _ string) (net.Conn, error) {
 		return callerFabric.Dial(dialContext, networkName, l3.DefaultL3Address)
@@ -2658,17 +2672,6 @@ func exerciseOrdinaryL3OCIOneshot(
 	}
 	assertNativeRunLogs(t, caller, rerun.RunID)
 	exerciseOrdinaryL3OCIRerunUnderTagMovement(t, ctx, caller, l1Store, rerunRegistry)
-
-	cancelRun()
-	if err := <-agentDone; err != nil {
-		t.Fatal(err)
-	}
-	nodeAgent.Close()
-	for range 2 {
-		if err := <-served; err != nil {
-			t.Fatal(err)
-		}
-	}
 }
 
 type realOCIProbe struct{ run func(context.Context) error }
