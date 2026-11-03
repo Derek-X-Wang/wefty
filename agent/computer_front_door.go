@@ -1147,14 +1147,45 @@ type computerReadinessError struct {
 func (failure *computerReadinessError) Error() string { return failure.Err.Error() }
 func (failure *computerReadinessError) Unwrap() error { return failure.Err }
 
+// computerReadinessClock starts when the agent receives the helper's Started
+// report. The helper timestamp may use a guest clock and cannot bound this wait.
+type computerReadinessClock struct {
+	now            time.Time
+	awake          time.Duration
+	awakeAvailable bool
+}
+
+func captureComputerReadinessClock(clock Clock) computerReadinessClock {
+	anchor := computerReadinessClock{now: clock.Now()}
+	if source, ok := clock.(interface{ AwakeElapsed() (time.Duration, error) }); ok {
+		var err error
+		anchor.awake, err = source.AwakeElapsed()
+		anchor.awakeAvailable = err == nil
+	}
+	return anchor
+}
+
+func (anchor computerReadinessClock) remaining(clock Clock) time.Duration {
+	if anchor.awakeAvailable {
+		if source, ok := clock.(interface{ AwakeElapsed() (time.Duration, error) }); ok {
+			if awake, err := source.AwakeElapsed(); err == nil {
+				return DefaultComputerReadinessDeadline - (awake - anchor.awake)
+			}
+		}
+	}
+	// Production Now readings retain Go's monotonic clock, which pauses in
+	// system sleep. Keep the original agent anchor if the awake source fails.
+	return DefaultComputerReadinessDeadline - clock.Now().Sub(anchor.now)
+}
+
 // probeComputerBackends polls the exact wire contract on both helper tunnels.
 // Connection refusal while the guest starts is ordinary; only the deadline
 // produces startup_readiness_timeout.
-func probeComputerBackends(ctx context.Context, clock Clock, startedAt time.Time, dial computerEndpointDial) error {
+func probeComputerBackends(ctx context.Context, clock Clock, anchor computerReadinessClock, dial computerEndpointDial) error {
 	if clock == nil {
 		clock = systemClock{}
 	}
-	remaining := DefaultComputerReadinessDeadline - clock.Now().Sub(startedAt)
+	remaining := anchor.remaining(clock)
 	if remaining <= 0 {
 		return &computerReadinessError{Code: contract.SpawnFailureStartupReadinessTimeout,
 			Err: errors.New("Computer display startup readiness exceeded 60 seconds from Started")}
@@ -1171,39 +1202,56 @@ func probeComputerBackends(ctx context.Context, clock Clock, startedAt time.Time
 		go func() { probeResult <- probeComputerBackendPairOnce(probeContext, dial) }()
 		connectTimeout := clock.NewTimer(DefaultComputerReadinessConnectTimeout)
 		var probeErr error
-		select {
-		case <-ctx.Done():
-			cancelProbe()
-			stopTimer(connectTimeout)
-			return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable,
-				Err: fmt.Errorf("Computer display readiness canceled: %w", context.Cause(ctx))}
-		case <-deadline.C():
-			cancelProbe()
-			stopTimer(connectTimeout)
-			return timeout()
-		case <-connectTimeout.C():
-			cancelProbe()
-			probeErr = errors.New("Computer display readiness probe timed out")
-		case probeErr = <-probeResult:
-			cancelProbe()
-			stopTimer(connectTimeout)
+	probe:
+		for {
+			select {
+			case <-ctx.Done():
+				cancelProbe()
+				stopTimer(connectTimeout)
+				return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable,
+					Err: fmt.Errorf("Computer display readiness canceled: %w", context.Cause(ctx))}
+			case <-deadline.C():
+				if remaining := anchor.remaining(clock); remaining > 0 {
+					deadline.Reset(remaining)
+					continue
+				}
+				cancelProbe()
+				stopTimer(connectTimeout)
+				return timeout()
+			case <-connectTimeout.C():
+				cancelProbe()
+				probeErr = errors.New("Computer display readiness probe timed out")
+				break probe
+			case probeErr = <-probeResult:
+				cancelProbe()
+				stopTimer(connectTimeout)
+				break probe
+			}
 		}
 		if probeErr == nil {
-			if !clock.Now().Before(startedAt.Add(DefaultComputerReadinessDeadline)) {
+			if anchor.remaining(clock) <= 0 {
 				return timeout()
 			}
 			return nil
 		}
 		interval := clock.NewTimer(DefaultComputerReadinessProbeInterval)
-		select {
-		case <-ctx.Done():
-			stopTimer(interval)
-			return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable,
-				Err: fmt.Errorf("Computer display readiness canceled: %w", context.Cause(ctx))}
-		case <-deadline.C():
-			stopTimer(interval)
-			return timeout()
-		case <-interval.C():
+	interval:
+		for {
+			select {
+			case <-ctx.Done():
+				stopTimer(interval)
+				return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable,
+					Err: fmt.Errorf("Computer display readiness canceled: %w", context.Cause(ctx))}
+			case <-deadline.C():
+				if remaining := anchor.remaining(clock); remaining > 0 {
+					deadline.Reset(remaining)
+					continue
+				}
+				stopTimer(interval)
+				return timeout()
+			case <-interval.C():
+				break interval
+			}
 		}
 	}
 }

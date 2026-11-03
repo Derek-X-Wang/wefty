@@ -20,6 +20,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testevidence"
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
@@ -583,12 +584,20 @@ func startManagedProcess(t *testing.T, executable string, arguments ...string) *
 		}
 	}
 	process := &managedProcess{command: exec.Command(executable, arguments...), done: make(chan error, 1)}
-	t.Cleanup(func() { process.stop(t) })
+	if executable != agentBinaryPath {
+		t.Cleanup(func() { process.stop(t) })
+	}
 	return process
 }
 
 func (process *managedProcess) start(t *testing.T) {
 	t.Helper()
+	if process.command.Path == agentBinaryPath {
+		// Register after capture: LIFO cleanup stops the agent first, so a
+		// failed row keeps its shutdown output.
+		testevidence.CaptureCommand(t, process.command)
+		t.Cleanup(func() { process.stop(t) })
+	}
 	if err := process.command.Start(); err != nil {
 		t.Fatal(err)
 	}

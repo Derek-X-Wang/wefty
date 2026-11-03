@@ -288,13 +288,15 @@ func runComputerService(
 	publicationDone := make(chan error, 1)
 	go func() { publicationDone <- publication.Run(publicationContext) }()
 
-	started := make(chan time.Time, 1)
+	started := make(chan computerReadinessClock, 1)
 	runtimeStarted := make(chan struct{})
 	startupSignalErrors := make(chan error, 1)
 	var startedOnce sync.Once
 	var helperStartedAt time.Time
+	var readinessAnchor computerReadinessClock
 	priorOCIStartedAt := request.OCIStartedAt
 	request.OCIStartedAt = func(startedAt time.Time) {
+		readinessAnchor = captureComputerReadinessClock(clock)
 		helperStartedAt = startedAt
 		if priorOCIStartedAt != nil {
 			priorOCIStartedAt(startedAt)
@@ -318,7 +320,7 @@ func runComputerService(
 				priorStarted()
 			}
 			close(runtimeStarted)
-			started <- helperStartedAt
+			started <- readinessAnchor
 		})
 	}
 	tokenSyncErrors := make(chan error, 1)
@@ -535,18 +537,18 @@ func syncComputerTokenFile(
 	}
 }
 
-func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan time.Time, dial computerEndpointDial, observe func(bool)) error {
+func monitorComputerReadiness(ctx context.Context, clock Clock, started <-chan computerReadinessClock, dial computerEndpointDial, observe func(bool)) error {
 	if clock == nil {
 		clock = systemClock{}
 	}
 	select {
 	case <-ctx.Done():
 		return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable, Err: fmt.Errorf("Computer runtime ended before Started: %w", context.Cause(ctx))}
-	case startedAt := <-started:
-		if startedAt.IsZero() {
+	case anchor := <-started:
+		if anchor.now.IsZero() {
 			return &computerReadinessError{Code: contract.SpawnFailureRuntimeUnavailable, Err: errors.New("Computer runtime reported an invalid Started timestamp")}
 		}
-		if err := probeComputerBackends(ctx, clock, startedAt, dial); err != nil {
+		if err := probeComputerBackends(ctx, clock, anchor, dial); err != nil {
 			return err
 		}
 	}
