@@ -140,8 +140,8 @@ func TestComputerReadinessIsAtomicAcrossPartialLossAndRecovery(t *testing.T) {
 		}
 		return view.dial(ctx)
 	}
-	started := make(chan time.Time, 1)
-	started <- now
+	started := make(chan computerReadinessClock, 1)
+	started <- captureComputerReadinessClock(clock)
 	observations := make(chan bool, 8)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -249,9 +249,8 @@ func TestComputerBackendLossWithdrawsPublicationWithoutKillingPayload(t *testing
 	}
 }
 
-func TestComputerReadinessDeadlineUsesAuthoritativeStartedTimestamp(t *testing.T) {
+func TestComputerReadinessDeadlineIncludesPostStartRoundTrips(t *testing.T) {
 	now := time.Date(2026, 8, 28, 12, 0, 5, 0, time.UTC)
-	startedAt := now.Add(-5 * time.Second)
 	clock := newManualClock(now)
 	view := newComputerBackend(t, computerBackendOptions{})
 	defer view.Close()
@@ -261,14 +260,16 @@ func TestComputerReadinessDeadlineUsesAuthoritativeStartedTimestamp(t *testing.T
 		}
 		return view.dial(ctx)
 	}
-	started := make(chan time.Time, 1)
-	started <- startedAt
+	started := make(chan computerReadinessClock, 1)
+	anchor := captureComputerReadinessClock(clock)
+	clock.Advance(5 * time.Second)
+	started <- anchor
 	observations := make(chan bool, 1)
 	done := make(chan error, 1)
 	go func() {
 		done <- monitorComputerReadiness(t.Context(), clock, started, dial, func(ready bool) { observations <- ready })
 	}()
-	deadline := startedAt.Add(DefaultComputerReadinessDeadline)
+	deadline := now.Add(DefaultComputerReadinessDeadline)
 	clock.waitForDeadline(t, deadline)
 	clock.Advance(deadline.Sub(clock.Now()))
 	err := <-done
@@ -292,8 +293,8 @@ func TestComputerSteadyStateConnectTimeoutUsesInjectedClock(t *testing.T) {
 		}
 		return backend.dial(ctx)
 	}
-	started := make(chan time.Time, 1)
-	started <- now
+	started := make(chan computerReadinessClock, 1)
+	started <- captureComputerReadinessClock(clock)
 	observations := make(chan bool, 4)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -627,8 +628,8 @@ func TestComputerReadinessTreatsHelperConnectionLimitAsInconclusive(t *testing.T
 		}
 		return backend.dial(ctx)
 	}
-	started := make(chan time.Time, 1)
-	started <- now
+	started := make(chan computerReadinessClock, 1)
+	started <- captureComputerReadinessClock(clock)
 	observations := make(chan bool, 4)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)

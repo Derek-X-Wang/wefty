@@ -251,11 +251,12 @@ non-retryable `control_not_authorized`.
 
 ## Atomic readiness
 
-The privileged helper's successful container task `Start` edge fixes `t0`;
-image pull and preparation precede it and do not consume the budget. The
-helper returns that timestamp in `Run.started_at`, and the agent carries it
-unchanged across the L1 `OCIStarted` acknowledgement and other post-start
-round trips before polling both helper tunnels.
+The agent's receipt of the helper's Started report fixes `t0`; image pull
+and preparation precede it and do not consume the budget. The 60-second budget
+counts host awake time only: host sleep does not consume it. The L1
+`OCIStarted` acknowledgement and other post-start round trips still consume
+the budget before polling both helper tunnels. The helper's `Run.started_at`
+is not used for this window because it may come from a guest clock.
 
 ```text
 Started at t0
@@ -263,7 +264,7 @@ Started at t0
     +-- view ready? ----- no --+
     |                          |
     +-- control ready? -- no --+--> publish nothing
-    |                          |    at t0 + 60 s:
+    |                          |    at 60 s awake:
     +-- both ready ------------+    startup_readiness_timeout
              |
              +--> publish one Fabric front door + display_endpoint
@@ -277,11 +278,12 @@ Started at t0
              eligible for one atomic republication
 ```
 
-The deadline is exactly 60 seconds after `t0`. A probe that finishes at or
-after that deadline cannot publish even when both handshakes succeeded; the
-agent rechecks its injected clock immediately before publication. Expiry produces the existing
-typed `startup_readiness_timeout`, which service restart policy classifies as
-restartable; no partial endpoint or placeholder display URL is published.
+The deadline is exactly 60 seconds of host awake time after `t0`. A probe
+that finishes at or after that deadline cannot publish even when both handshakes
+succeeded; the agent rechecks its injected clock before it accepts the first
+successful readiness result.
+Expiry produces the existing typed `startup_readiness_timeout`, which service
+restart policy classifies as restartable; no partial endpoint or placeholder display URL is published.
 After the first successful publication, losing either backend withdraws both
 without killing the tenant payload. Recovery requires fresh success from both
 endpoints before the ordered publication controller may republish.
