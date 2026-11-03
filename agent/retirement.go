@@ -120,6 +120,9 @@ func (session *agentSession) observeGeneration(ctx context.Context) (bool, error
 		close(session.retiringRequested)
 		session.claimMu.Unlock()
 		session.setSession(LifecycleRetiring, 0, nil)
+		if session.removals != nil {
+			session.removals.stopAcknowledgements()
+		}
 		return true, nil
 	}
 	return false, errors.New("agent: generation is absent from L1 inventory")
