@@ -148,9 +148,12 @@ func (r *seatRunRuntime) Run(ctx context.Context, request workloadrunner.Request
 			}
 		})
 	}
+	// The helper checks the Computer Attempt, a service, whose authority
+	// carries the initial service removal generation (see workloadAuthority).
+	computerRemovalGeneration := fmt.Sprint(l1.InitialServiceRemovalGeneration)
 	var exit *ocihelper.SeatCommandExit
 	err = r.helper.ExecComputerSeat(commandCtx, ocihelper.ExecComputerSeatRequest{
-		Authority: ocihelper.AttemptAuthority{NodeID: command.NodeID, BootSessionID: command.BootSessionID, JobID: command.Binding.ComputerJobID, AttemptID: command.Binding.ComputerAttemptID, FencingToken: command.FencingToken, Class: contract.JobClassService}, Generation: command.Generation, Place: command.Place, Args: append([]string(nil), r.params.SeatRun.Argv...), MaxRuntime: duration, WorkingDirectory: command.WorkingDirectory,
+		Authority: ocihelper.AttemptAuthority{NodeID: command.NodeID, BootSessionID: command.BootSessionID, JobID: command.Binding.ComputerJobID, AttemptID: command.Binding.ComputerAttemptID, FencingToken: command.FencingToken, Class: contract.JobClassService, RemovalGeneration: computerRemovalGeneration}, Generation: command.Generation, Place: command.Place, Args: append([]string(nil), r.params.SeatRun.Argv...), MaxRuntime: duration, WorkingDirectory: command.WorkingDirectory,
 	}, func(event ocihelper.SeatCommandEvent) error {
 		// A helper refusal is not evidence that a payload exists. The helper
 		// stream's first output or exit supplies that evidence.

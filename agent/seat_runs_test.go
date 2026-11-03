@@ -45,7 +45,7 @@ func TestSeatRunUsesHelperAuthorityAndOrdinaryOutput(t *testing.T) {
 	if err != nil || result.Outcome.ExitCode == nil || *result.Outcome.ExitCode != 7 {
 		t.Fatalf("result=%+v %v", result, err)
 	}
-	if helper.request.Authority.AttemptID != "computer-attempt" || helper.request.Authority.FencingToken != "computer-fence" || helper.request.MaxRuntime != time.Hour {
+	if helper.request.Authority.AttemptID != "computer-attempt" || helper.request.Authority.FencingToken != "computer-fence" || helper.request.Authority.RemovalGeneration != "1" || helper.request.MaxRuntime != time.Hour {
 		t.Fatalf("helper=%+v", helper.request)
 	}
 	if len(logs) != 1 || logs[0].AttemptID != "run-attempt" || string(logs[0].Bytes) != "seat-only\n" {
