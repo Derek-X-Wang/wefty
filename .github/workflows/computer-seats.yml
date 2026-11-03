@@ -86,6 +86,7 @@ jobs:
           scripts/verify-acceptance-image.sh --archive "$evidence/$ARCH.oci.tar" \
             --expected-platform "linux/$ARCH" --platform-digest-output "$evidence/$ARCH.digest" \
             --receipt-output "$evidence/$ARCH-oci.json"
+          bash scripts/download-crane-modules.sh
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           digest="$(cat "$evidence/$ARCH.digest")"
@@ -302,6 +303,7 @@ jobs:
       - name: Promote the tested default Computer archives and pin the index
         run: |
           set -euo pipefail
+          bash scripts/download-crane-modules.sh
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           for arch in amd64 arm64; do
