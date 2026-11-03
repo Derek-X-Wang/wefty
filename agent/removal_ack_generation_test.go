@@ -26,6 +26,7 @@ func TestRemovalAcknowledgementAuthorityRecoveryKeepsLiveGenerationResident(t *t
 			ackClock := &removalACKStepClock{manualClock: newManualClock(clock.Now()), armed: make(chan time.Duration, 16)}
 			var stage, ackCalls, registrations atomic.Int32
 			refused := make(chan contract.ErrorCode, 2)
+			started := make(chan struct{}, 1)
 			pending := localRemoval{jobID: "ack-generation", kind: contract.JobKindProcess, generation: 1, rootInstanceID: "root", cleanupFence: "fence", processTreeReaped: true}
 			a, store, done, _ := newResidentRejoinFixture(t, clock, func(a *Agent, store *l1.Store) {
 				// One busy claim worker and explicit heartbeat wakes isolate the
@@ -65,6 +66,12 @@ func TestRemovalAcknowledgementAuthorityRecoveryKeepsLiveGenerationResident(t *t
 						return &http.Response{StatusCode: 409, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(payload))}, nil
 					}
 					response, err := base.RoundTrip(r)
+					if err == nil && response.StatusCode == http.StatusOK && strings.HasSuffix(r.URL.Path, "/started") {
+						select {
+						case started <- struct{}{}:
+						default:
+						}
+					}
 					if err == nil && r.URL.Path == "/v1/agent/nodes/register" && response.StatusCode == 200 {
 						registrations.Add(1)
 					}
@@ -73,6 +80,9 @@ func TestRemovalAcknowledgementAuthorityRecoveryKeepsLiveGenerationResident(t *t
 			})
 			job, ready, release := retirementReviewJob(t, store, "ack-refusal-"+source, false, nil)
 			retirementWait(t, "live resident ready", func() bool { _, err := os.Stat(ready); return err == nil })
+			// The payload can write ready before its asynchronous Started RPC
+			// commits. Establish Running before testing that recovery preserves it.
+			reviewWait(t, "resident Started acknowledgement", started)
 			a.session.claimMu.Lock()
 			resident := a.session.resident[job.JobID]
 			a.session.claimMu.Unlock()
