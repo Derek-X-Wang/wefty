@@ -62,7 +62,7 @@ func TestSeatViewerLocalRelayPlainFabric(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			door, closeDoor, err := startSeatFrontDoor(t.Context(), node, "node")
+			door, closeDoor, err := startSeatFrontDoor(t.Context(), node, "node", seatFrontDoorAuthentication{})
 			if err != nil {
 				t.Fatal(err)
 			}

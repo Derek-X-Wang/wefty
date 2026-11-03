@@ -3097,6 +3097,63 @@ Seat-enabled Computers use the node's shared Seat front door. Each Seat has a
 separate attempt-scoped Controller tenure and driver signal. Older images keep
 the per-Computer path above. The shared listener opens no additional port.
 
+The Seat front door authenticates before revealing whether a Seat ID is bound
+on this node. Path matching, the person-path Host check, screen credential
+presence and Fabric identity checks precede the binding lookup. Bound Seats
+retain their existing admission and durable denial evidence, with no additional L1 or policy
+check. For unbound IDs, the AI agent path checks the credential through L1's
+existing `POST /v1/agent/seats/{seat_id}/screen-authority` for screens and
+`POST /v1/agent/seats/{seat_id}/copy-authority` for copy, with the credential
+and no Computer binding; the person path checks the
+installed administrator policy without requiring Computer membership. Bound
+and unbound person paths call the shared L1 policy evaluator. That check keeps
+the same policy
+freshness, Fabric and enrolled-device restrictions, and the same
+stale-policy-revision refusal and details for a non-grant holder.
+Missing or invalid credentials and unauthorized people receive the same status,
+Content-Type and body for bound and unbound IDs, except random `request_id`
+values and the node's random `copy_id`; request-ID presence remains identical.
+Expired credentials retain the existing `seat_ended` refusal. Upstream request
+IDs remain in JSON and NDJSON error bodies, including errors after copy data
+has been flushed, so CLI errors keep their diagnostic correlation.
+A caller that passes authentication receives HTTP 404 with a JSON `APIError`,
+code `not_found`, message `unknown Seat`, when the ID is not bound on this node.
+The authority endpoint checks the requested Seat's credential before its
+Computer binding. Only its existing `forbidden` / `Seat belongs to another
+Computer` refusal proves the credential passed and permits the typed 404.
+Other refusals pass through unchanged. A live or expired credential for a
+different Seat therefore receives `forbidden` / `invalid Seat credential` for
+both bound and unbound IDs. The probe uses one L1 round trip and requires no
+Computer, Attempt, endpoint, wire field or L1 behavior change.
+Screen authorization uses a write transaction. An unbound probe with the exact
+credential of a Seat that is already past its idle or lifetime deadline lets L1
+record the `ending` state that was already due. This finalizes an already-due
+state and is not a new action: the same call on the Seat's own node does the
+same. Wrong or cross-Seat credentials change nothing, and a live mismatch rolls
+back. Copy authorization
+uses a read-only snapshot on both paths and does not wait for a SQLite writer;
+it evaluates committed lifecycle state without finalizing elapsed deadlines.
+Copy transport failures keep `seat_copy_failed` with the fixed message
+`Seat copy unavailable`, retaining any `copy start unconfirmed` or
+`copy outcome unconfirmed` stage prefix, so an upstream URL cannot expose the
+binding. Authorization transport failures log a bounded operation stage and
+typed cause locally, without the credential, requested Seat ID or Seat URL.
+
+Unbound IDs use the same feature router and screen, copy and person handlers
+with a null binding. The null binding authenticates but cannot reach a runtime.
+It starts no session, timer or audit writer. Copy checks direction and path
+before credential presence and authorization; a missing credential needs no L1
+call. Copy refusals retain HTTP 200 NDJSON, with a node-generated `copy_id` and
+the same API error. An authenticated unbound copy has `not_found` / `unknown Seat`
+in that stream error, rather than a separate HTTP 404. Person take/release keeps
+its session-token refusal before policy admission. Its unbound null binding has
+no active or closed sessions and cannot accept another Seat's bearer.
+
+An unbound-ID denial is not durably audited: no Computer, Attempt or Seat log
+exists on the node to receive that evidence. The node agent logs each refusal
+once locally, with the path kind, known Fabric identity and refusal code. That
+log contains neither the requested Seat ID nor any credential.
+
 `GET /v1/seats/{seat_id}/screen/view` and `/screen/input` carry the `binary`
 WebSocket/RFB protocol. They require that exact Seat's `X-Wefty-Seat-Credential`.
 The node obtains fresh, fenced L1 authority before dialing the helper-returned

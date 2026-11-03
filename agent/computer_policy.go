@@ -266,6 +266,17 @@ func (cache *ComputerPolicyCache) AcquireGrant(computerID string, identity fabri
 	return authorization, nil
 }
 
+// CheckAdministrator admits an unbound Seat lookup from the installed policy.
+// It applies the person and device restrictions of Computer admission without
+// requiring a Computer entry or registering a long-lived grant authorization.
+func (cache *ComputerPolicyCache) CheckAdministrator(identity fabric.Identity) (bool, int64) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	cache.expireIfNeededLocked()
+	decision := l1.EvaluateComputerPolicyAdministrator(cache.snapshot, cache.valid, identity)
+	return decision.Administrator, decision.PolicyRevision
+}
+
 func validComputerPolicyPerson(identity fabric.Identity) bool {
 	return l1.ValidComputerPolicyPerson(identity)
 }

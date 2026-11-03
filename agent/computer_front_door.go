@@ -262,6 +262,9 @@ type closedComputerSession struct {
 const maximumClosedComputerSessionTokens = 256
 
 type computerFrontDoor struct {
+	// An unbound Seat has no runtime or durable audit target. It uses the same
+	// admission and sideband handlers, then stops before any screen is served.
+	unbound       bool
 	config        computerFrontDoorConfig
 	errors        chan error
 	errorMu       sync.Mutex
@@ -457,6 +460,11 @@ func (frontDoor *computerFrontDoor) ServeHTTP(writer http.ResponseWriter, reques
 		frontDoor.recordPreAuthorizationDenial(identity, l1.ComputerTakeoverUnauthorizedIdentity)
 		writeComputerControlError(writer, http.StatusForbidden, contract.APIError{Code: contract.ErrorControlNotAuthorized,
 			Message: "Computer access is not authorized", Retryable: false}, nil)
+		return
+	}
+	if frontDoor.unbound {
+		authorization.Release()
+		writeSeatScreenError(writer, unknownSeatError())
 		return
 	}
 	if viewerResource {
@@ -927,6 +935,11 @@ func (frontDoor *computerFrontDoor) recordDenial(ctx context.Context, identity f
 }
 
 func (frontDoor *computerFrontDoor) recordPreAuthorizationDenial(identity fabric.Identity, reason l1.ComputerTakeoverReason) {
+	if frontDoor.unbound {
+		// The shared Seat door logs the final refusal once locally. There is
+		// no Computer, Attempt or Seat log to receive durable evidence.
+		return
+	}
 	if identity.Kind == fabric.IdentityKindMachine {
 		identity = fabric.Identity{}
 	}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -44,18 +45,25 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 		// under which the node's immutable transfer evidence will be recorded.
 		copyID := rand.Text()
 		var renewalErr error // Read after renewalDone closes below.
-		sendError := func(err error) {
+		sendError := func(err error, stage ...string) {
 			api := contract.APIError{Code: contract.ErrorCode("seat_copy_failed"), Message: err.Error()}
 			var protocol *ProtocolError
 			var helper *ocihelper.RPCError
+			var transport *url.Error
 			if errors.As(err, &protocol) && protocol.APIError.Code != "" {
 				api = protocol.APIError
+			} else if errors.As(err, &transport) {
+				api.Message = "Seat copy unavailable"
 			} else if errors.As(err, &helper) && helper.Code == ocihelper.CodeSeatOperationRefused && (helper.Detail == ocihelper.ErrorDetail(ocihelper.SeatRefusalCommandNotReady) || helper.Detail == ocihelper.ErrorDetail(ocihelper.SeatRefusalGenerationMismatch)) {
 				// Readiness races are retryable unless L1 already proved the Seat ended (#1281).
 				api = contract.APIError{Code: contract.ErrorConflict, Message: fmt.Sprintf("Seat is not ready or changed (%s); try again", helper.Detail), Retryable: true}
 				if errors.As(renewalErr, &protocol) && protocol.APIError.Code == "seat_ended" {
 					api = protocol.APIError
 				}
+			}
+			if len(stage) != 0 {
+				api.Message = stage[0] + ": " + api.Message
+				logSeatTransportFailure(r.Context(), stage[0], err)
 			}
 			_ = json.NewEncoder(w).Encode(l1.SeatCopyStreamEvent{CopyID: copyID, Error: &api})
 		}
@@ -73,9 +81,14 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 			sendError(errors.New("sync path must be work"))
 			return
 		}
+		if r.Header.Get(l1.SeatCredentialHeader) == "" {
+			sendError(&ProtocolError{StatusCode: http.StatusForbidden, APIError: contract.APIError{Code: contract.ErrorForbidden, Message: "Seat credential is required"}})
+			return
+		}
 		input := l1.SeatCopyAuthorityInput{ComputerSeatAttemptRequest: l1.ComputerSeatAttemptRequest{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID, FencingToken: authority.FencingToken}, ComputerID: computer, JobID: authority.JobID, AttemptID: authority.AttemptID, Credential: r.Header.Get(l1.SeatCredentialHeader)}
 		binding, err := control.AuthorizeSeatCopy(r.Context(), match[1], input)
 		if err != nil {
+			logSeatTransportFailure(r.Context(), "copy authorization", err)
 			sendError(err)
 			return
 		}
@@ -87,7 +100,7 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 			// Close that operation and release any hold without moving payload.
 			start.Outcome, start.Reason = "failed", "start_failed"
 			finishErr := recordSeatCopyReceipt(r.Context(), control, match[1], start)
-			sendError(fmt.Errorf("copy start unconfirmed: %w", errors.Join(err, finishErr)))
+			sendError(errors.Join(err, finishErr), "copy start unconfirmed")
 			return
 		}
 		copyCtx, cancelCopy := context.WithCancel(r.Context())
@@ -164,7 +177,7 @@ func newSeatCopyHandlerWithClock(runtime seatCopyRuntime, control seatCopyContro
 		receipt := l1.SeatCopyReceipt{SeatCopyAuthorityInput: input, CopyID: copyID, Direction: direction, Path: path, SizeBytes: size, Outcome: outcome, Reason: reason, Sync: counts}
 		recordErr := recordSeatCopyReceipt(r.Context(), control, match[1], receipt)
 		if recordErr != nil {
-			sendError(fmt.Errorf("copy outcome unconfirmed: %w", recordErr))
+			sendError(recordErr, "copy outcome unconfirmed")
 			return
 		}
 		if err != nil {
