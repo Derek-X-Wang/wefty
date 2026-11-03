@@ -3681,7 +3681,7 @@ AND state=@job_queued
 		},
 		Lease: AttemptLease{
 			AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: leaseExpires,
-			LeaseTTL: leaseExpires.Sub(now),
+			LeaseTTL: leaseExpires.Sub(now), SleepCreditBoot: leaseSleepCreditBoot(ctx),
 		},
 		AttemptToken:    attemptToken,
 		ComputerStorage: computerStorage,
@@ -3810,7 +3810,7 @@ func (s *Store) RenewLease(ctx context.Context, identityNodeID, jobID, attemptID
 	}
 	return AttemptLease{
 		AttemptID: attemptID, FencingToken: fencingToken, LeaseExpires: expires,
-		LeaseTTL: expires.Sub(now), Directive: directive,
+		LeaseTTL: expires.Sub(now), Directive: directive, SleepCreditBoot: leaseSleepCreditBoot(ctx),
 		InterruptionReason: interruptionReason, InterruptionRequestKey: interruptionKey,
 	}, nil
 }

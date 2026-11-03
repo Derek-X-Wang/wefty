@@ -2945,7 +2945,74 @@ credit never increases it. There is no fixed wall-time bound if these widths
 or reconciliation intervals are unbounded. Nodes use the same rule with their
 own remaining stale/dead waits. A remote Node sleeping while L1 stays awake
 receives no credit (#1349). Seat idle and approval waits still count sleep.
-Node-side lease timers are unchanged.
+Each claim and renewal may carry `sleep_credit_boot`, the `sha256:<hex>`
+digest of the exact `hostboot.Identity()` string. L1 sends it only when that
+transaction's pinned clock has a known boot identity and a successful bracketed
+sleep sample, including a zero gap. Missing pausing clocks, unavailable clocks,
+and read errors never advertise it. Raw kernel IDs stay off the wire.
+The agent hashes its own kernel boot identity with the same function. Only a
+matching digest on the latest claim or successful renewal permits same-host
+sleep credit. A missing field (including an older L1), mismatch, or failed
+local identity read keeps the existing wall-gap fence. A loopback address or
+configuration flag is never proof; a Host VM has a different kernel boot.
+
+The node watchdog brackets a boot-clock sample with pausing-clock samples.
+For successive offset intervals, proved sleep is
+`max(0, current.lower - previous.upper)`. With matching boot proof and successful
+samples it fences when `max(wall gap, boot-clock gap) - proved sleep` is at least
+the lease remaining at the previous checkpoint, or when the monotonic deadline
+passes. Only the proved lower bound is credited. A process stop or descheduling
+advances both clocks and earns no credit. A forward calendar step still triggers
+the fence; a backward step cannot hide a boot-clock gap. Failed samples keep the
+existing wall-gap rule and cannot provide a credit baseline for the next check.
+Remote-L1 behavior is unchanged.
+
+Every claim and successful renewal grants local authority only through
+`requestStarted + lease_ttl`, using the agent's monotonic (awake) request start.
+The request checkpoint also captures wall time and the bracketed awake/boot
+sample before the HTTP call. Claim admission and renewal acceptance validate
+the entire interval from that checkpoint to receipt against the new grant's
+proof and deadline. Timer checks during an RPC cannot consume that interval or
+let a reply with missing proof inherit earlier credit. Remote replies across
+sleep retain the wall-gap fence. A grant already expired at receipt grants
+nothing and cannot start a payload or revive local authority. Round-trip and
+admission latency consume lease time; receipt never starts a fresh full TTL.
+
+Proved sleep requests immediate renewal, without waiting for the renewal timer.
+The payload keeps running; mailbox and output use the same local authority.
+The monotonic deadline already excludes system sleep on Darwin and Linux and
+is never extended by a failed, uncertain, or lost renewal reply. Transient and
+uncertain errors retry only within that deadline; each request timeout uses
+`renewalRequestTimeout` with the remaining credited authority. A refusal ends
+the Attempt's grants at once: no further renewal is issued or accepted.
+For a non-service payload, cancellation is immediate. For a service, durable
+removal preparation runs first; the payload is cancelled when that preparation
+finishes or at the local credited deadline, whichever comes first. The
+independent watchdog enforces that deadline even while preparation is blocked.
+For ordinary lease expiry, the one-copy rule rests on this deadline. The
+deadline is never later than the natural expiry of the last lease L1 granted,
+so the rule does not depend on immediate cancellation after a refusal. An early
+revocation, such as removal capping the lease, can end L1's authority before
+that deadline. In that case the one-copy rule rests on the barrier that
+revoked it: removal or reap prevents a successor claim until the payload is
+reaped.
+A late reply cannot revive expired local authority. Each sleep in a
+DarkWake sequence receives a fresh measured credit, including while a request
+is in flight. L1 applies its gap before reconciliation can expire an Attempt,
+so reconciliation before renewal does not change the one-copy guarantee.
+Connectivity failure during a short wake consumes awake lease time. Several
+short wakes may exhaust it; a renewal must complete before that bound.
+
+The OCI helper's session heartbeat and Attempt deadman use local monotonic
+deadlines; they have no wall-gap fence and receive no new boot-proof authority.
+The Host VM has its own kernel clocks. Guest clock advancement or a broken
+helper control stream remains a separate runtime-loss event; matching L1 proof
+does not override helper authority or permit revival of a reaped payload.
+Deadman admission and queued renewal evidence retain monotonic deadlines too.
+Seat copy renewal only ends a copy, not its Computer. Seat idle and approval
+waits still count sleep; they may end a Seat during a long sleep without ending
+an occupied Computer Attempt. Computer readiness and per-Seat startup/command
+bounds remain separate from Attempt authority.
 Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
 pending approvals and windows without a stamp do not retain authority.
 

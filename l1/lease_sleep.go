@@ -4,7 +4,19 @@ import (
 	"context"
 	"database/sql"
 	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/hostboot"
 )
+
+// Advertise sleep credit only from this transaction's successful pinned
+// sample. A supported pausing clock is required even when the gap is zero.
+func leaseSleepCreditBoot(ctx context.Context) string {
+	sample := currentAttemptClock(ctx)
+	if sample.err != nil || sample.sleepOffset == nil {
+		return ""
+	}
+	return hostboot.DigestIdentity(sample.boot)
+}
 
 type awakeClockSource interface {
 	AwakeElapsed() (time.Duration, error)

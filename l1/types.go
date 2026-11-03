@@ -366,6 +366,7 @@ type AttemptLease struct {
 	FencingToken           string             `json:"fencing_token"`
 	LeaseExpires           time.Time          `json:"lease_expires_at"`
 	LeaseTTL               time.Duration      `json:"lease_ttl"`
+	SleepCreditBoot        string             `json:"sleep_credit_boot,omitempty"`
 	Directive              AttemptDirective   `json:"directive,omitempty"`
 	InterruptionReason     InterruptionReason `json:"interruption_reason,omitempty"`
 	InterruptionRequestKey string             `json:"interruption_request_key,omitempty"`
