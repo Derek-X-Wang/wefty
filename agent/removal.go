@@ -79,6 +79,7 @@ type removalController struct {
 	deleteRuntimeData     func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error
 	attestRuntimeRemoval  func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
 	ackRemoval            func(context.Context, localRemoval) error
+	resumeAcknowledgement func(context.Context, localRemoval) (bool, error)
 	ackRemovalQuarantine  func(context.Context, localRemoval, error) error
 	ackRemovalStall       func(context.Context, localRemoval, runtimeRemovalRecord) error
 	recordRemovalFailure  func(context.Context, localRemoval, string, string) error
@@ -95,6 +96,7 @@ type removalController struct {
 	mu                           sync.Mutex
 	inflight                     map[string]struct{}
 	ackTasks                     map[localRemoval]*removalAcknowledgementTask
+	ackResumptions               map[localRemoval]struct{}
 	acksClosed                   bool
 	ackContext                   context.Context
 	ackCancel                    context.CancelFunc
@@ -116,12 +118,13 @@ func newRemovalController(
 	controller := &removalController{
 		client: client, outbox: outbox, managed: managed, session: session,
 		nodeID: nodeID, bootSessionID: bootSessionID, logf: logf,
-		clock:       systemClock{},
-		inflight:    make(map[string]struct{}),
-		ackTasks:    make(map[localRemoval]*removalAcknowledgementTask),
-		ackContext:  ackContext,
-		ackCancel:   ackCancel,
-		ackFailures: make(chan removalAcknowledgementFailure, 1),
+		clock:          systemClock{},
+		inflight:       make(map[string]struct{}),
+		ackTasks:       make(map[localRemoval]*removalAcknowledgementTask),
+		ackResumptions: make(map[localRemoval]struct{}),
+		ackContext:     ackContext,
+		ackCancel:      ackCancel,
+		ackFailures:    make(chan removalAcknowledgementFailure, 1),
 	}
 	controller.notifyAcknowledgementFailure = func(failure removalAcknowledgementFailure) {
 		controller.mu.Lock()
@@ -173,6 +176,9 @@ func newRemovalController(
 		controller.removeResource = managed.remove
 	}
 	controller.ackRemoval = controller.acknowledge
+	controller.resumeAcknowledgement = func(ctx context.Context, removal localRemoval) (bool, error) {
+		return controller.acknowledgeRemoval(ctx, removal, true)
+	}
 	controller.ackRemovalQuarantine = controller.acknowledgeQuarantine
 	controller.ackRemovalStall = controller.acknowledgeStall
 	return controller
@@ -1106,6 +1112,30 @@ func (controller *removalController) acknowledgementPending(removal localRemoval
 	return pending
 }
 
+// OCI registration has already scanned removals before rejoin advances its
+// sequence. Resume only ACKs refused during that scan/publication window;
+// repeating the full scan would repeat cleanup and change its readiness gate.
+func (controller *removalController) resumeAcknowledgements(ctx context.Context) error {
+	controller.mu.Lock()
+	removals := make([]localRemoval, 0, len(controller.ackResumptions))
+	for removal := range controller.ackResumptions {
+		removals = append(removals, removal)
+	}
+	controller.mu.Unlock()
+	var failures []error
+	for _, removal := range removals {
+		admitted, err := controller.resumeAcknowledgement(ctx, removal)
+		if errors.Is(err, errRemovalAcknowledgementPending) {
+			continue
+		}
+		if admitted && err == nil {
+			err = controller.finishAcknowledgedRemoval(ctx, removal)
+		}
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
+}
+
 func removalAcknowledgementRetryable(err error) bool {
 	var protocolErr *ProtocolError
 	if !errors.As(err, &protocolErr) {
@@ -1120,26 +1150,38 @@ func removalAcknowledgementRetryable(err error) bool {
 }
 
 func (controller *removalController) acknowledge(ctx context.Context, removal localRemoval) error {
+	_, err := controller.acknowledgeRemoval(ctx, removal, false)
+	return err
+}
+
+func (controller *removalController) acknowledgeRemoval(ctx context.Context, removal localRemoval, requireResumption bool) (bool, error) {
 	key := removalAcknowledgementIdentity(removal)
 	controller.mu.Lock()
 	if controller.acksClosed || ctx.Err() != nil {
 		controller.mu.Unlock()
 		if err := ctx.Err(); err != nil {
-			return err
+			return false, err
 		}
-		return context.Canceled
+		return false, context.Canceled
+	}
+	if requireResumption {
+		if _, marked := controller.ackResumptions[key]; !marked {
+			controller.mu.Unlock()
+			return false, nil
+		}
 	}
 	if task, pending := controller.ackTasks[key]; pending {
 		controller.mu.Unlock()
 		if task.ctx.Err() != nil {
 			<-task.done
-			return controller.acknowledge(ctx, removal)
+			return controller.acknowledgeRemoval(ctx, removal, requireResumption)
 		}
-		return errRemovalAcknowledgementPending
+		return false, errRemovalAcknowledgementPending
 	}
 	ackContext, cancel := context.WithCancel(controller.ackContext)
 	task := &removalAcknowledgementTask{ctx: ackContext, cancel: cancel, done: make(chan struct{})}
 	controller.ackTasks[key] = task
+	delete(controller.ackResumptions, key)
 	controller.wg.Add(1)
 	controller.mu.Unlock()
 	finish := func() {
@@ -1167,9 +1209,9 @@ func (controller *removalController) acknowledge(ctx context.Context, removal lo
 	if err == nil || ackContext.Err() != nil || !removalAcknowledgementRetryable(err) {
 		finish()
 		if err != nil {
-			return fmt.Errorf("acknowledge completed service removal: %w", err)
+			return true, fmt.Errorf("acknowledge completed service removal: %w", err)
 		}
-		return nil
+		return true, nil
 	}
 	go func() {
 		defer finish()
@@ -1190,13 +1232,14 @@ func (controller *removalController) acknowledge(ctx context.Context, removal lo
 			// Pair the refusal sequence with terminal task state before waking
 			// recovery. Its pending check must join us, never skip this row.
 			cancel()
+			controller.ackResumptions[key] = struct{}{}
 			controller.mu.Unlock()
 			controller.notifyAcknowledgementFailure(failure)
 			return
 		}
 		controller.log("node agent: acknowledge completed service removal %q: %v", removal.jobID, err)
 	}()
-	return errRemovalAcknowledgementPending
+	return true, errRemovalAcknowledgementPending
 }
 
 func (controller *removalController) replayAcknowledgement(ctx context.Context, removal localRemoval, request l1.RemovalAcknowledgementRequest) error {

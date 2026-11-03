@@ -376,9 +376,15 @@ func (session *agentSession) rejoinGeneration(ctx context.Context, cause error, 
 				if session.logf != nil {
 					session.logf("agent: rejoined node %s", session.registration.NodeID)
 				}
-				if session.removals != nil && session.ociBootBarrier == nil {
-					if err := session.removals.resume(ctx); err != nil && ctx.Err() == nil && session.logf != nil {
-						session.logf("agent: resume service removals: %v", err)
+				if session.removals != nil {
+					var removalErr error
+					if session.ociBootBarrier == nil {
+						removalErr = session.removals.resume(ctx)
+					} else {
+						removalErr = session.removals.resumeAcknowledgements(ctx)
+					}
+					if removalErr != nil && ctx.Err() == nil && session.logf != nil {
+						session.logf("agent: resume service removals: %v", removalErr)
 					}
 				}
 				return nil
