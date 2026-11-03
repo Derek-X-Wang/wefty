@@ -650,8 +650,8 @@ matter because neatvnc can flush all accumulated damage through Sync, while
 LibVNCServer retains damage outside the requested region for an incremental
 request. Neither source of observed change is discarded.
 If Sync reports no change, the CLI requests incremental updates over the full
-screen for the remaining portion of a one-second window starting at the end
-of the input write. At most one framebuffer request is outstanding: its entire
+screen for the remaining portion of a 250 ms window starting at the end of the
+input write. The bound keeps a click that does not redraw within SC-1. At most one framebuffer request is outstanding: its entire
 reply is read before the next request. Empty updates do not count and
 re-requests are paced at 20 ms. Sync must finish even if it consumes the whole
 window; in that case no additional incremental wait is started.

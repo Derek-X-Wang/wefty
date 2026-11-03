@@ -162,10 +162,10 @@ func TestSeatScreenInputScreenshotSettles(t *testing.T) {
 				if wantChange && hasReopen || !wantChange && (!hasReopen || reopened < wait || reopened > reply.Debug.Phases["frame_read"]) {
 					t.Errorf("wrong reopen timing: %v", reply.Debug.Phases)
 				}
-				if !wantChange && elapsed < 900*time.Millisecond {
+				if !wantChange && elapsed < seatScreenSettleLimit-50*time.Millisecond {
 					t.Errorf("settle returned early: %s", elapsed)
 				}
-				if elapsed > 1800*time.Millisecond {
+				if elapsed > seatScreenSettleLimit+800*time.Millisecond {
 					t.Errorf("settle exceeded limit and margin: %s", elapsed)
 				}
 				if incremental.Load() == 0 || incremental.Load() > 60 {

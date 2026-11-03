@@ -3304,7 +3304,7 @@ input before the connection closes. With a screenshot, the CLI reads a full
 baseline before input, then fully consumes a post-input one-pixel Sync reply
 to order the input before any later close. Rectangles outside Sync's requested
 1×1 area, or a changed pixel within it, count as an observed change. Otherwise,
-it waits for an incremental update for the remainder of a one-second window
+it waits for an incremental update for the remainder of a 250 ms window
 starting at the end of the input write. At most one request is outstanding;
 empty replies are fully consumed before paced re-requests. After a change
 observed in Sync or an incremental reply, it captures

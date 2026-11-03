@@ -829,7 +829,7 @@ does not mean a new instruction. Every reply carries the shared unread
 Seat-event hint; read it with `wefty logs`.
 
 Use `--json` for `elapsed_ms`, `path`, `unread_events`, and, when nonzero,
-`unread_events_line`. Input with `--screenshot` counts changes reported by Sync; if Sync reports none, it waits for an update for up to the rest of one second from the input write. It adds JSON `frame_after_input` (true if a change was seen, false on timeout with capture on a fresh view connection).
+`unread_events_line`. Input with `--screenshot` counts changes reported by Sync; if Sync reports none, it waits for an update for up to the rest of 250 ms from the input write. It adds JSON `frame_after_input` (true if a change was seen, false on timeout with capture on a fresh view connection).
 Refusals carry `details.elapsed_ms`. Input calls are
 never retried automatically: an interrupted call may already have acted.
 Wefty checks the PNG destination before sending input. Once input bytes are

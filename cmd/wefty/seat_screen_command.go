@@ -25,7 +25,9 @@ import (
 	"github.com/coder/websocket"
 )
 
-const seatScreenSettleLimit = time.Second
+// The owner bounded the post-input wait so a click that does not redraw
+// still meets SC-1 (wefty's part of a click and its screenshot within 1 s).
+const seatScreenSettleLimit = 250 * time.Millisecond
 
 const seatScreenUsage = `usage: wefty seat screenshot SEAT_ID [-o FILE]
        wefty seat click SEAT_ID X Y [--button left|right|double] [--screenshot [FILE]]
