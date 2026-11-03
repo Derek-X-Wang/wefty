@@ -28,6 +28,7 @@ type attemptWatchdog interface {
 type attemptWatch interface {
 	Renewed(localAuthority)
 	Failures() <-chan error
+	WakeRenewals() <-chan struct{}
 	Check() error
 	Stop()
 }
@@ -72,10 +73,11 @@ func (disabledAttemptWatchdog) Start(context.Context, localAuthority, context.Ca
 
 type disabledAttemptWatch struct{}
 
-func (disabledAttemptWatch) Renewed(localAuthority) {}
-func (disabledAttemptWatch) Failures() <-chan error { return nil }
-func (disabledAttemptWatch) Check() error           { return nil }
-func (disabledAttemptWatch) Stop()                  {}
+func (disabledAttemptWatch) Renewed(localAuthority)        {}
+func (disabledAttemptWatch) Failures() <-chan error        { return nil }
+func (disabledAttemptWatch) WakeRenewals() <-chan struct{} { return nil }
+func (disabledAttemptWatch) Check() error                  { return nil }
+func (disabledAttemptWatch) Stop()                         {}
 
 type attemptLifecycleDependencies struct {
 	keepCompletionAuthority bool
@@ -465,7 +467,7 @@ func (lifecycle *attemptLifecycle) storeMailbox(mailbox *runMailbox) {
 	}
 }
 
-func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, _ time.Time) (errorDestination, error) {
+func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, claimStarted time.Time) (errorDestination, error) {
 	// Before anything reads the claim: the handoff directory this node manages
 	// is the one every later step -- the workload's own environment, the lock,
 	// retention, the result upload -- has to agree on.
@@ -567,12 +569,19 @@ func (lifecycle *attemptLifecycle) execute(ctx context.Context, claim l1.Claim, 
 		return lifecycle.finalizeUnstartedUpgradeService(ctx, claim)
 	}
 
-	// Start the local monotonic lease window when the claim response is actually
-	// available. Claim RPC and admission latency can otherwise burn
-	// most of a short lease under instrumentation before renewal even begins.
-	authority := localAuthority{deadline: lifecycle.dependencies.clock.Now().Add(claim.Lease.LeaseTTL)}
+	// Production carries all three clock samples from immediately before the
+	// claim RPC. Direct lifecycle callers supply only a start time, so cannot
+	// claim proved sleep between that time and admission.
+	checkpoint, anchored := ctx.Value(claimCheckpointKey{}).(authorityCheckpoint)
+	if !anchored {
+		checkpoint = authorityCheckpoint{now: claimStarted, wall: claimStarted.Round(0)}
+	}
+	authority := leaseAuthority(claim.Lease.LeaseTTL, claim.Lease.SleepCreditBoot, checkpoint)
 	watch := lifecycle.dependencies.watchdog.Start(attemptContext, authority, cancelAttempt)
 	defer watch.Stop()
+	if err := watch.Check(); err != nil {
+		return errorDestinationAttemptAuthority, err
+	}
 	var deadmanAdmission *attemptDeadmanAdmission
 	if claim.Job.Spec.Kind == contract.JobKindOCI {
 		deadmanAdmission = newAttemptDeadmanAdmission(lifecycle.dependencies.attemptDeadman, claim, lifecycle.dependencies.clock, lifecycle.dependencies.logf)
@@ -2573,12 +2582,20 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 			stopTimer(timer)
 			return
 		case <-timer.C():
+		case <-watch.WakeRenewals():
+			stopTimer(timer)
 		}
 		if err := watch.Check(); err != nil {
 			return
 		}
-		requestStarted := lifecycle.dependencies.clock.Now()
-		remaining := authority.deadline.Sub(requestStarted)
+		// Check may itself observe wake. This request covers that notification;
+		// a second sleep during the RPC can queue the next immediate renewal.
+		select {
+		case <-watch.WakeRenewals():
+		default:
+		}
+		requestCheckpoint := captureAuthorityCheckpoint(lifecycle.dependencies.clock)
+		remaining := authority.deadline.Sub(requestCheckpoint.now)
 		if remaining <= 0 {
 			return
 		}
@@ -2591,6 +2608,12 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 		cancelRenew()
 		if err != nil {
 			classification := classifyAgentProtocolError(err)
+			// Conflict on this authority-only RPC is an explicit refusal, not
+			// an ambiguous mutation result that could justify another retry.
+			var protocolErr *ProtocolError
+			if errors.As(err, &protocolErr) && protocolErr.APIError.Code == contract.ErrorConflict {
+				classification.destination = errorDestinationAttemptAuthority
+			}
 			if classification.destination == errorDestinationTransient {
 				remaining := authority.deadline.Sub(lifecycle.dependencies.clock.Now())
 				if remaining > 0 {
@@ -2600,13 +2623,17 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 				_ = watch.Check()
 				return
 			}
+			// Close helper grant admission before removal preparation can block.
+			// terminate only clears pending grants; it never signals the guardian.
+			// Service cancellation still follows the durable removal barrier, or
+			// the independent watchdog's deadline, whichever comes first.
+			deadmanAdmission.terminate()
 			if classification.destination == errorDestinationAttemptAuthority &&
 				claim.Job.Spec.Class == contract.JobClassService && lifecycle.dependencies.prepareAuthorityLoss != nil {
 				if prepareErr := lifecycle.dependencies.prepareAuthorityLoss(ctx, claim.Job.JobID); prepareErr != nil {
 					lifecycle.log("prepare service %s authority loss for removal: %v", claim.Job.JobID, prepareErr)
 				}
 			}
-			deadmanAdmission.terminate()
 			select {
 			case failures <- destinationError{destination: classification.destination, err: err}:
 			default:
@@ -2614,8 +2641,14 @@ func (lifecycle *attemptLifecycle) renewalLoop(ctx context.Context, claim l1.Cla
 			return
 		}
 		lease = updated
-		authority = localAuthority{deadline: lifecycle.dependencies.clock.Now().Add(updated.LeaseTTL)}
+		if err := watch.Check(); err != nil {
+			return
+		}
+		authority = leaseAuthority(updated.LeaseTTL, updated.SleepCreditBoot, requestCheckpoint)
 		watch.Renewed(authority)
+		if err := watch.Check(); err != nil {
+			return
+		}
 		if updated.Directive == l1.AttemptDirectiveCancel {
 			deadmanAdmission.terminate()
 			returnWithDirective(failures, errAttemptDirectiveCancel)

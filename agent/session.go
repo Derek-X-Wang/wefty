@@ -1230,14 +1230,14 @@ func (session *agentSession) claimClassLoop(
 		default:
 		}
 
-		claimStarted := session.clock.Now()
 		if !session.claimsAllowed() {
 			if err := session.waitForClaimWork(ctx, retire, session.claimInterval); err != nil {
 				return destinationFromError(err)
 			}
 			continue
 		}
-		claim, admitted, err := session.claim(ctx, session.gates[gateKey], selector, serviceReservation)
+		var claimCheckpoint authorityCheckpoint
+		claim, admitted, err := session.claim(ctx, session.gates[gateKey], selector, serviceReservation, &claimCheckpoint)
 		if !admitted {
 			if err := session.waitForClaimWork(ctx, retire, session.claimInterval); err != nil {
 				return destinationFromError(err)
@@ -1300,7 +1300,8 @@ func (session *agentSession) claimClassLoop(
 			serviceReservation = true
 		}
 		session.attempts.Add(1)
-		destination, executeErr := session.executeResident(ctx, gateKey, *claim, claimStarted, execute)
+		claimContext := context.WithValue(ctx, claimCheckpointKey{}, claimCheckpoint)
+		destination, executeErr := session.executeResident(claimContext, gateKey, *claim, claimCheckpoint.now, execute)
 		if executeErr != nil {
 			if routed := session.routeError(destination, executeErr); routed != nil {
 				return destinationFromError(routed)
@@ -1711,6 +1712,7 @@ func (session *agentSession) claim(
 	gate classAdmissionGate,
 	selector string,
 	serviceReservation bool,
+	checkpoint ...*authorityCheckpoint,
 ) (*l1.Claim, bool, error) {
 	// Serializing the claim snapshot with the winning response closes the only
 	// local race: a second worker cannot send a stale exclusion set after L1
@@ -1734,6 +1736,9 @@ func (session *agentSession) claim(
 	excluded := make([]string, 0, len(session.residentJobID))
 	for jobID := range session.residentJobID {
 		excluded = append(excluded, jobID)
+	}
+	if len(checkpoint) != 0 {
+		*checkpoint[0] = captureAuthorityCheckpoint(session.clock)
 	}
 	reply, err := session.client.ClaimPoll(
 		ctx, session.registration.NodeID, session.registration.BootSessionID, selector, excluded...,

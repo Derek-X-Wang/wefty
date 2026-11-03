@@ -2764,6 +2764,11 @@
             "minimum": 1,
             "description": "Granted lease duration in nanoseconds. The agent measures it from its monotonic request start, without comparing clocks."
           },
+          "sleep_credit_boot": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "description": "Digest of L1's kernel boot identity, present only when this transaction measured sleep with working boot and pausing clocks. A matching local digest permits the agent to credit only its own proved sleep and renew immediately after wake. Omission or mismatch keeps remote-L1 fencing."
+          },
           "directive": {
             "enum": ["stop", "restart", "cancel"],
             "description": "Attempt-scoped intent: stop/restart for services, cancel for process and OCI one-shots. Cancel uses TERM, a five-second grace, then KILL. Omission means no lifecycle change is requested."
