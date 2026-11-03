@@ -710,7 +710,7 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 	good := newComputerBackend(t, computerBackendOptions{})
 	defer good.Close()
 	dialGood := func(ctx context.Context, _ string) (net.Conn, error) { return good.dial(ctx) }
-	if err := probeComputerBackends(t.Context(), systemClock{}, time.Now(), dialGood); err != nil {
+	if err := probeComputerBackends(t.Context(), systemClock{}, captureComputerReadinessClock(systemClock{}), dialGood); err != nil {
 		t.Fatalf("valid readiness: %v", err)
 	}
 
@@ -771,7 +771,9 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 			return nil, ctx.Err()
 		}
 		result := make(chan error, 1)
-		go func() { result <- probeComputerBackends(t.Context(), clock, now, blocked) }()
+		go func() {
+			result <- probeComputerBackends(t.Context(), clock, captureComputerReadinessClock(clock), blocked)
+		}()
 		clock.waitForDeadline(t, now.Add(DefaultComputerReadinessDeadline))
 		clock.Advance(DefaultComputerReadinessDeadline)
 		err := <-result
@@ -793,7 +795,7 @@ func TestComputerBackendReadinessEnforcesWireContractAndDeadline(t *testing.T) {
 				}
 				return good.dial(ctx)
 			}
-			err := probeComputerBackends(t.Context(), clock, now, dial)
+			err := probeComputerBackends(t.Context(), clock, captureComputerReadinessClock(clock), dial)
 			var readiness *computerReadinessError
 			if !errors.As(err, &readiness) || readiness.Code != contract.SpawnFailureStartupReadinessTimeout {
 				t.Fatalf("at-deadline successful probe = %#v", err)
@@ -838,7 +840,9 @@ func assertComputerBackendNeverReady(t *testing.T, dial computerEndpointDial) {
 	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
 	clock := newManualClock(now)
 	result := make(chan error, 1)
-	go func() { result <- probeComputerBackends(t.Context(), clock, now, dial) }()
+	go func() {
+		result <- probeComputerBackends(t.Context(), clock, captureComputerReadinessClock(clock), dial)
+	}()
 	clock.waitForDeadline(t, now.Add(DefaultComputerReadinessDeadline))
 	clock.Advance(DefaultComputerReadinessDeadline)
 	err := <-result
