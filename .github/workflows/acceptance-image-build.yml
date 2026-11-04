@@ -41,6 +41,21 @@ jobs:
         image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
         ports: [5000:5000]
     steps:
+      # Stage before the root candidate checkout, whose cleanup may remove workspace files.
+      - name: Check out crane helper from the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-crane-helper
+          sparse-checkout: scripts/download-crane-modules.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Stage crane helper outside the candidate checkout
+        run: |
+          set -euo pipefail
+          cp .workflow-crane-helper/scripts/download-crane-modules.sh "$RUNNER_TEMP/download-crane-modules.sh"
+          rm -rf .workflow-crane-helper
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ inputs.source_repository || github.repository }}
@@ -82,7 +97,7 @@ jobs:
             --expected-platform "$PLATFORM" --platform-digest-output "$evidence/${ARCH}.digest" \
             --receipt-output "$evidence/${ARCH}-oci.json"
           cp "$RUNNER_TEMP/acceptance-image.oci.tar" "$evidence/${ARCH}.oci.tar"
-          bash scripts/download-crane-modules.sh
+          bash "$RUNNER_TEMP/download-crane-modules.sh"
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/wefty-echo-service:${CANDIDATE_SHA}-${ARCH}"
@@ -214,6 +229,21 @@ jobs:
         image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
         ports: [5000:5000]
     steps:
+      # Stage before the root candidate checkout, whose cleanup may remove workspace files.
+      - name: Check out crane helper from the workflow revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-crane-helper
+          sparse-checkout: scripts/download-crane-modules.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Stage crane helper outside the candidate checkout
+        run: |
+          set -euo pipefail
+          cp .workflow-crane-helper/scripts/download-crane-modules.sh "$RUNNER_TEMP/download-crane-modules.sh"
+          rm -rf .workflow-crane-helper
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ inputs.source_repository || github.repository }}
@@ -277,7 +307,7 @@ jobs:
           stage='archive-evidence-copy'
           cp "$RUNNER_TEMP/computer-image.oci.tar" "$evidence/${ARCH}.oci.tar"
           stage='crane-install'
-          bash scripts/download-crane-modules.sh
+          bash "$RUNNER_TEMP/download-crane-modules.sh"
           go install github.com/google/go-containerregistry/cmd/crane@v0.22.0
           crane="$(go env GOPATH)/bin/crane"
           registry_reference="localhost:5000/${LOCAL_NAME}:${CANDIDATE_SHA}-${ARCH}"
