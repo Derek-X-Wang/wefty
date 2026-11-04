@@ -231,6 +231,7 @@ func executeExec(ctx context.Context, clients *apiClients, jsonOutput bool, args
 	if ctx.Err() != nil {
 		return errorsWithCleanup(ctx.Err(), capture.Storage)
 	}
+	writeExecIgnoredDependencyNotice(ctx, stderr, &capture)
 	// Submission follows the caller's cancellation. If an acknowledgement is
 	// lost, bounded retries reuse the same frozen request and random key.
 	// After a signal, recovery is read-only: it must never create a new run.

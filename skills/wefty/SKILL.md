@@ -324,6 +324,7 @@ Ignored build outputs, such as binaries in `bin/` or `dist/`, are not copied eit
 Never copy secrets into a run.
 
 Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied.
+Before submission, exec prints one advisory on stderr for existing `node_modules` and `.venv` folders at the checkout root or command folder when ignored contents leave them absent from the capture; prepare them inside the run, for example `wefty exec -- sh -c 'npm ci && npm test'`.
 Install dependencies inside the command (for example `pnpm install --frozen-lockfile && ...`), or point the tool at an absolute cache path.
 Share only dependency caches, which are keyed by content: `CARGO_HOME`, the pnpm store, `GOMODCACHE`, `GOCACHE`.
 Do not share a project build folder, such as a Cargo `target/`, between runs and the real checkout: builds there can keep the deleted run copy's paths. Use a separate build folder per run, for example under `$TMPDIR`.
