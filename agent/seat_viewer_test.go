@@ -39,6 +39,7 @@ func viewerFixture(t *testing.T, admin bool) (*httptest.Server, *computerFrontDo
 		t.Fatal(err)
 	}
 	door := newSeatFrontDoor(f.identity)
+	door.authentication.policy = cache
 	reg, err := door.register(ctx, "computer-1", "attempt-1", h)
 	if err != nil {
 		t.Fatal(err)

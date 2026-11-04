@@ -83,6 +83,10 @@ const (
 	ErrorDeEnrollmentNotCommitted ErrorCode = "de_enrollment_not_committed"
 )
 
+// SeatComputerMismatchMessage is the existing post-credential binding refusal.
+// Credential-only probes recognize it together with HTTP 403 and forbidden.
+const SeatComputerMismatchMessage = "Seat belongs to another Computer"
+
 // APIError is the single error shape shared by every HTTP protocol. Retryable
 // advises whether repeating the same request may succeed; consumers must still
 // honor the authority scope expressed by a known Code.

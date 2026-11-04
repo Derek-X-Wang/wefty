@@ -97,25 +97,16 @@ func ValidComputerPolicyPerson(identity fabric.Identity) bool {
 }
 
 func EvaluateComputerPolicyPerson(snapshot ComputerPolicySnapshot, valid bool, computerID string, identity fabric.Identity) ComputerPolicyDecision {
-	decision := ComputerPolicyDecision{Permission: ComputerGrantNone}
-	if !valid || !ValidComputerPolicyPerson(identity) || identity.FabricID != snapshot.IssuingFabricID {
+	decision, eligible := evaluateComputerPolicyIdentity(snapshot, valid, identity)
+	if !eligible {
 		return decision
 	}
-	decision.PolicyRevision = snapshot.PolicyRevision
-	decision.FreshUntil = snapshot.FreshUntil
 	for _, computer := range snapshot.Computers {
 		if computer.ComputerID != computerID {
 			continue
 		}
-		for _, admin := range snapshot.Admins {
-			if admin.FabricID == identity.FabricID && admin.UserID == identity.UserID {
-				if snapshot.AdminDeviceRequired && requireBoundPersonDevice(identity, admin.DeviceID) != nil {
-					return ComputerPolicyDecision{Permission: ComputerGrantNone}
-				}
-				decision.Permission = ComputerGrantControl
-				decision.Administrator = true
-				return decision
-			}
+		if administrator, matched := evaluateComputerPolicyAdministrator(snapshot, identity); matched {
+			return administrator
 		}
 		for _, grant := range computer.Grants {
 			if grant.FabricID == identity.FabricID && grant.UserID == identity.UserID {
@@ -126,6 +117,42 @@ func EvaluateComputerPolicyPerson(snapshot ComputerPolicySnapshot, valid bool, c
 		return decision
 	}
 	return decision
+}
+
+// EvaluateComputerPolicyAdministrator applies the same person, Fabric and device
+// rules as Computer admission, without requiring Computer membership. Callers
+// own snapshot freshness; this pure evaluator preserves a closed snapshot.
+func EvaluateComputerPolicyAdministrator(snapshot ComputerPolicySnapshot, valid bool, identity fabric.Identity) ComputerPolicyDecision {
+	decision, eligible := evaluateComputerPolicyIdentity(snapshot, valid, identity)
+	if !eligible {
+		return decision
+	}
+	decision, _ = evaluateComputerPolicyAdministrator(snapshot, identity)
+	return decision
+}
+
+func evaluateComputerPolicyIdentity(snapshot ComputerPolicySnapshot, valid bool, identity fabric.Identity) (ComputerPolicyDecision, bool) {
+	if !valid || !ValidComputerPolicyPerson(identity) || identity.FabricID != snapshot.IssuingFabricID {
+		return ComputerPolicyDecision{Permission: ComputerGrantNone}, false
+	}
+	return ComputerPolicyDecision{Permission: ComputerGrantNone, PolicyRevision: snapshot.PolicyRevision, FreshUntil: snapshot.FreshUntil}, true
+}
+
+// matched includes a device-restricted administrator who must not fall through
+// to a Computer grant. Keep this distinction in the bound evaluator.
+func evaluateComputerPolicyAdministrator(snapshot ComputerPolicySnapshot, identity fabric.Identity) (ComputerPolicyDecision, bool) {
+	decision := ComputerPolicyDecision{Permission: ComputerGrantNone, PolicyRevision: snapshot.PolicyRevision, FreshUntil: snapshot.FreshUntil}
+	for _, admin := range snapshot.Admins {
+		if admin.FabricID == identity.FabricID && admin.UserID == identity.UserID {
+			if snapshot.AdminDeviceRequired && requireBoundPersonDevice(identity, admin.DeviceID) != nil {
+				return ComputerPolicyDecision{Permission: ComputerGrantNone}, true
+			}
+			decision.Permission = ComputerGrantControl
+			decision.Administrator = true
+			return decision, true
+		}
+	}
+	return decision, false
 }
 
 type ComputerPolicyAuditOperation string

@@ -3,9 +3,9 @@ package agent
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
@@ -21,16 +22,29 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 )
 
+type seatFrontDoorAuthentication struct {
+	control interface {
+		AuthenticateSeatScreen(context.Context, string, string) error
+		AuthenticateSeatCopy(context.Context, string, string) error
+	}
+	policy interface {
+		Revision() int64
+		CheckAdministrator(fabric.Identity) (bool, int64)
+	}
+	logf func(string, ...any)
+}
+
 // One node listener carries all Seat features. Attempts register a feature mux
 // and bind only the Seat IDs supplied by their fenced L1 wanted list.
 type seatFrontDoor struct {
-	mu        sync.RWMutex
-	fabric    fabric.Fabric
-	endpoint  string
-	done      chan struct{}
-	serveErr  error
-	computers map[string]*seatFrontDoorRegistration
-	seats     map[string]*seatFrontDoorRegistration
+	authentication seatFrontDoorAuthentication
+	mu             sync.RWMutex
+	fabric         fabric.Fabric
+	endpoint       string
+	done           chan struct{}
+	serveErr       error
+	computers      map[string]*seatFrontDoorRegistration
+	seats          map[string]*seatFrontDoorRegistration
 }
 type seatFrontDoorRegistration struct {
 	door              *seatFrontDoor
@@ -47,7 +61,7 @@ var seatFrontDoorPath = regexp.MustCompile(`^/v1/seats/(seat_[0-9a-f]{32})(?:/|$
 func newSeatFrontDoor(f fabric.Fabric) *seatFrontDoor {
 	return &seatFrontDoor{fabric: f, computers: map[string]*seatFrontDoorRegistration{}, seats: map[string]*seatFrontDoorRegistration{}}
 }
-func startSeatFrontDoor(ctx context.Context, f fabric.Fabric, node string) (*seatFrontDoor, func(), error) {
+func startSeatFrontDoor(ctx context.Context, f fabric.Fabric, node string, authentication seatFrontDoorAuthentication) (*seatFrontDoor, func(), error) {
 	var address string
 	if local, ok := f.(fabric.LocalServiceAddressProvider); ok {
 		address = local.LocalServiceAddress()
@@ -66,6 +80,7 @@ func startSeatFrontDoor(ctx context.Context, f fabric.Fabric, node string) (*sea
 		return nil, nil, err
 	}
 	door := newSeatFrontDoor(f)
+	door.authentication = authentication
 	door.endpoint = (&url.URL{Scheme: "ws", Host: net.JoinHostPort(f.ConnectHost(), strconv.Itoa(port)), Path: contract.ComputerDisplayWebSocketPath}).String()
 	server := &http.Server{Handler: door, BaseContext: func(net.Listener) context.Context { return ctx }}
 	door.done = make(chan struct{})
@@ -87,7 +102,8 @@ func (a *Agent) startSeatFrontDoorRecovery(ctx context.Context, cancelRun contex
 		stopped <- nil
 		return stopped
 	}
-	door, closeDoor, err := startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID)
+	authentication := seatFrontDoorAuthentication{control: a.session.client, policy: a.ComputerPolicy(), logf: a.log}
+	door, closeDoor, err := startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID, authentication)
 	if err != nil {
 		a.log("Seat front door unavailable; node retries in the background: %v", err)
 	} else {
@@ -110,7 +126,7 @@ func (a *Agent) startSeatFrontDoorRecovery(ctx context.Context, cancelRun contex
 				stopped <- nil
 				return
 			}
-			door, closeDoor, err = startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID)
+			door, closeDoor, err = startSeatFrontDoor(ctx, a.fabric, a.registration.NodeID, authentication)
 			delay = min(delay*2, 30*time.Second)
 		}
 		if ctx.Err() == nil {
@@ -221,9 +237,35 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the HTTP host before any page or browser-readable capability can escape.
 	suffix := strings.TrimPrefix(r.URL.Path, "/v1/seats/"+match[1])
 	if strings.HasPrefix(suffix, "/person/") && !seatViewerHostAllowed(r.Host, d.endpoint) {
+		d.logRefusal(seatDoorPathKind(r.Header.Get(l1.SeatCredentialHeader) == ""), fabric.Identity{}, contract.ErrorForbidden)
 		writeComputerControlError(w, http.StatusForbidden, contract.APIError{Code: contract.ErrorForbidden, Message: "Seat viewer host is not allowed"}, nil)
 		return
 	}
+	person := strings.HasPrefix(suffix, "/person/") && r.Header.Get(l1.SeatCredentialHeader) == ""
+	var identity fabric.Identity
+	if r.Header.Get(l1.SeatCredentialHeader) == "" && !person && !seatCopyRoute.MatchString(r.URL.Path) {
+		d.logRefusal("ai_agent", identity, contract.ErrorUnauthorized)
+		writeSeatScreenError(w, &ProtocolError{StatusCode: http.StatusUnauthorized, APIError: contract.APIError{Code: contract.ErrorUnauthorized, Message: "Seat credential is required"}})
+		return
+	}
+	if d.fabric != nil {
+		var err error
+		identity, err = d.fabric.WhoIs(r.Context(), r.RemoteAddr)
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			message := "Fabric identity could not be verified"
+			code := contract.ErrorUnavailable
+			if errors.Is(err, fabric.ErrIdentityNotFound) {
+				status = http.StatusUnauthorized
+				message = "Fabric identity could not be authenticated"
+				code = contract.ErrorUnauthorized
+			}
+			d.logRefusal(seatDoorPathKind(person), fabric.Identity{}, code)
+			http.Error(w, message, status)
+			return
+		}
+	}
+	r = r.WithContext(context.WithValue(r.Context(), seatTransportLoggerKey{}, d.authentication.logf))
 	d.mu.RLock()
 	registration := d.seats[match[1]]
 	var seatCtx context.Context
@@ -232,26 +274,8 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	d.mu.RUnlock()
 	if registration == nil || registration.ctx.Err() != nil {
-		http.NotFound(w, r)
+		d.serveUnbound(w, r, match[1], person, identity)
 		return
-	}
-	if r.Header.Get(l1.SeatCredentialHeader) == "" && !strings.HasPrefix(strings.TrimPrefix(r.URL.Path, "/v1/seats/"+match[1]), "/person/") {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorUnauthorized, Message: "Seat credential is required"}})
-		return
-	}
-	if d.fabric != nil {
-		if _, err := d.fabric.WhoIs(r.Context(), r.RemoteAddr); err != nil {
-			status := http.StatusServiceUnavailable
-			message := "Fabric identity could not be verified"
-			if errors.Is(err, fabric.ErrIdentityNotFound) {
-				status = http.StatusUnauthorized
-				message = "Fabric identity could not be authenticated"
-			}
-			http.Error(w, message, status)
-			return
-		}
 	}
 	timing("fabric_accepted")
 	ctx, cancel := context.WithCancel(r.Context())
@@ -260,6 +284,21 @@ func (d *seatFrontDoor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer stop()
 	ctx = context.WithValue(ctx, seatAuthorityContextKey{}, seatCtx)
 	registration.handler.ServeHTTP(w, r.WithContext(ctx))
+}
+
+func seatDoorPathKind(person bool) string {
+	if person {
+		return "person"
+	}
+	return "ai_agent"
+}
+
+// An unbound ID has no Computer, Attempt or Seat log for durable evidence.
+// Never include the requested Seat ID, credential or upstream error text here.
+func (d *seatFrontDoor) logRefusal(path string, identity fabric.Identity, code contract.ErrorCode) {
+	if d.authentication.logf != nil {
+		d.authentication.logf("Seat front door refusal path=%s fabric=%q node=%q user=%q device=%q code=%s", path, identity.FabricID, identity.NodeID, identity.UserID, identity.DeviceID, code)
+	}
 }
 
 // Serialize only publication I/O, never registry or Attempt locks. Replacements
@@ -277,3 +316,39 @@ func (r *seatFrontDoorRegistration) publish(ctx context.Context, ready bool, end
 }
 
 var errStaleSeatPublication = errors.New("stale Seat front-door Attempt")
+
+// The context carries only the node logger, never request identifiers or secrets.
+type seatTransportLoggerKey struct{}
+
+func logSeatTransportFailure(ctx context.Context, stage string, err error) {
+	logf, _ := ctx.Value(seatTransportLoggerKey{}).(func(string, ...any))
+	var transport *url.Error
+	if logf == nil || !errors.As(err, &transport) {
+		return
+	}
+	// Classify typed causes instead of printing error text: even an inner error
+	// can contain the Seat URL, credential, requested ID or another private path.
+	cause := "transport failure"
+	var errno syscall.Errno
+	var network net.Error
+	var dns *net.DNSError
+	switch {
+	case errors.Is(err, context.Canceled):
+		cause = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		cause = "deadline exceeded"
+	case errors.As(err, &errno):
+		cause = errno.Error()
+	case errors.As(err, &dns) && dns.IsNotFound:
+		cause = "DNS name not found"
+	case errors.As(err, &network) && network.Timeout():
+		cause = "timeout"
+	case errors.Is(err, io.EOF):
+		cause = "EOF"
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		cause = "unexpected EOF"
+	default:
+		cause = fmt.Sprintf("transport failure (%T)", transport.Err)
+	}
+	logf("Seat front door transport stage=%q cause=%q", stage, cause[:min(len(cause), 96)])
+}

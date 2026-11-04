@@ -50,7 +50,7 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 	}
 	seatCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	mux := http.NewServeMux()
+	var screens http.Handler
 	if config.screen != nil {
 		screenConfig := *config.screen
 		screenConfig.ctx = seatCtx
@@ -62,14 +62,13 @@ func runComputerSeats(ctx context.Context, runtime WorkloadRuntime, request work
 				controller.logf("Seat screen failed: %v", err)
 			}
 		}
-		screens, err := newSeatScreenHandler(screenConfig)
+		handler, err := newSeatScreenHandler(screenConfig)
 		if err != nil {
 			return contract.ProcessResult{}, err
 		}
-		mux.Handle("GET /v1/seats/{seat_id}/screen/{mode}", screens)
-		mux.Handle("/v1/seats/{seat_id}/person/", screens)
+		screens = handler
 	}
-	mux.Handle("POST /v1/seats/{seat_id}/copy", newSeatCopyHandlerWithClock(config.copyRuntime, config.copyControl, request.Authority, controller.computerID, config.clock))
+	mux := newSeatFeatureMux(screens, newSeatCopyHandlerWithClock(config.copyRuntime, config.copyControl, request.Authority, controller.computerID, config.clock))
 	registration, err := config.router.register(seatCtx, controller.computerID, controller.authority.AttemptID, mux)
 	if err != nil {
 		return contract.ProcessResult{}, err
@@ -154,4 +153,15 @@ func retrySeatPublication(ctx context.Context, clock Clock, send func(context.Co
 		stopTimer(timer)
 		delay = min(delay*2, time.Second)
 	}
+}
+
+// Bound and unbound Seats share method routing as well as feature handlers.
+func newSeatFeatureMux(screens, copies http.Handler) *http.ServeMux {
+	mux := http.NewServeMux()
+	if screens != nil {
+		mux.Handle("GET /v1/seats/{seat_id}/screen/{mode}", screens)
+		mux.Handle("/v1/seats/{seat_id}/person/", screens)
+	}
+	mux.Handle("POST /v1/seats/{seat_id}/copy", copies)
+	return mux
 }

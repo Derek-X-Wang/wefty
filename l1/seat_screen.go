@@ -64,7 +64,7 @@ func (s *Store) AuthorizeSeatScreen(ctx context.Context, identity, id string, in
 		return result, err
 	}
 	if value.ComputerID != input.ComputerID {
-		return result, protocolError(contract.ErrorForbidden, "Seat belongs to another Computer")
+		return result, protocolError(contract.ErrorForbidden, contract.SeatComputerMismatchMessage)
 	}
 	if err = validateComputerSeatAttempt(ctx, w.tx, w.at, identity, input.ComputerID, input.JobID, input.AttemptID, input.ComputerSeatAttemptRequest); err != nil {
 		return result, err
