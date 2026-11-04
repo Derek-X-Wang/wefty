@@ -687,7 +687,8 @@ click in about 260 ms. With these flags both took under 30 ms on amd64 and
 arm64. A Seat input with `--screenshot` reads a baseline frame before it sends
 the input, so it depends on that first answer (#1479). The cost is polling
 while a client stays connected: one idle connected client used under 1% of one
-core in the same measurement. With no client connected, x11vnc does not poll.
+core in the same measurement (GitHub Actions run 41794210796). With no client
+connected, x11vnc skips framebuffer scanning.
 
 Before returning each backend connection, and again at its first byte, the
 Linux relay matches the child PID's `/proc/<pid>/fd` socket inodes against
