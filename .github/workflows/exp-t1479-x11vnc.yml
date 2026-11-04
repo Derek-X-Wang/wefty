@@ -1,0 +1,23 @@
+name: exp-t1479-x11vnc
+# Throwaway experiment for #1479. Do not merge.
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  probe:
+    name: x11vnc idle probe / ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe x11vnc 0.9.16-9 naps and idle CPU
+        run: |
+          docker run --rm -v "$PWD/exp-t1479:/exp:ro" debian:bookworm bash -c '
+            apt-get -qq update >/dev/null &&
+            DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends x11vnc=0.9.16-9 xvfb python3 >/dev/null &&
+            python3 -I /exp/probe.py'
