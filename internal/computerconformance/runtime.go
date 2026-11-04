@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/rfbclient"
 )
 
 const (
@@ -230,7 +231,47 @@ func (r *runtimeRunner) run(ctx context.Context) (err error) {
 	if r.mutationFailed() {
 		return nil
 	}
-	return r.checkPersistence(ctx)
+	if err := r.checkPersistence(ctx); err != nil {
+		return err
+	}
+	if r.mutationFailed() {
+		return nil
+	}
+	// acceptance-image.yml runs this checker on both image variants, including
+	// the real Wayland/neatvnc image. Keep the pixel probe after other oracles.
+	inputReady, _, _, readyErr := r.waitInputReady(ctx)
+	if readyErr != nil || !inputReady {
+		r.record("screen.held-view-current-frame", StatusFail, fmt.Sprintf("colour surface desktop unavailable: ready=%t error=%v", inputReady, readyErr))
+		return nil
+	}
+	// The Wayland image uses Chromium app mode, with no address bar. Launch
+	// a disposable app window rather than assuming Ctrl+L can navigate it.
+	launch := r.execShell(ctx, `for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
+ if [ -S "$candidate" ]; then export WAYLAND_DISPLAY="${candidate##*/}"; break; fi
+ done
+ ozone=
+ if [ -n "${WAYLAND_DISPLAY:-}" ]; then ozone=--ozone-platform=wayland; else export DISPLAY=:$WEFTY_COMPUTER_VIEW_PORT; fi
+ chromium $ozone --no-sandbox --disable-gpu --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="$HOME/.config/chromium" --app="$1" >/tmp/wefty-held-view.log 2>&1 &`, HeldViewProbeURL())
+	if launch.exitCode != 0 {
+		r.record("screen.held-view-current-frame", StatusFail, "could not launch colour probe surface: "+launch.stderr)
+		return nil
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	observations, err := ProbeHeldViewFrames(probeCtx, func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
+		port := r.viewPort
+		if mode == "input" {
+			port = r.controlPort
+		}
+		return openFrameProbe(ctx, port)
+	})
+	detail, _ := json.Marshal(observations)
+	if err != nil {
+		r.record("screen.held-view-current-frame", StatusFail, fmt.Sprintf("%s: %v", detail, err))
+	} else {
+		r.record("screen.held-view-current-frame", StatusPass, string(detail))
+	}
+	return nil
 }
 
 func (r *runtimeRunner) mutationFailed() bool {

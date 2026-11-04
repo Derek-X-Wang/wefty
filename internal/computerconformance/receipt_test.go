@@ -22,6 +22,7 @@ func TestReceiptV2CatalogIDsArePinned(t *testing.T) {
 		harness.image-user harness.rootfs-read-only harness.service-writable harness.no-new-privileges harness.forbidden-privilege harness.shm-private harness.shm-size harness.shm-flags harness.tmp-ceilings
 		profile.capabilities profile.seccomp profile.namespaces profile.devices profile.cgroup-memory-max profile.cgroup-oom-group profile.cgroup-swap-max
 		persistence.service-survives persistence.profile-survives persistence.sign-in-survives persistence.rootfs-discarded persistence.edge-recovers targets.control-nonpersistent
+        screen.held-view-current-frame
 	`)
 	if len(CheckCatalog) != len(expected) {
 		t.Fatalf("receipt v2 catalog length = %d, want %d", len(CheckCatalog), len(expected))

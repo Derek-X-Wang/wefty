@@ -9,6 +9,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
 	"io"
 	"net"
 	"net/textproto"
@@ -17,6 +19,8 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/rfbclient"
+	"github.com/coder/websocket"
 )
 
 const websocketKey = "d2VmdHktY29uZm9ybWFuY2U="
@@ -351,4 +355,135 @@ func rfbKeyEvents() [][]byte {
 		{4, 1, 0, 0, 0, 0, 0, 'w'},
 		{4, 0, 0, 0, 0, 0, 0, 'w'},
 	}
+}
+
+// HeldViewProbeURL is a disposable colour surface for the actual image's
+// Chromium. Launch it in a new window after other image oracles have finished.
+func HeldViewProbeURL() string {
+	page := `<title>Wefty Wayland Computer</title><body style="margin:0;background:#ff0000" tabindex="0"><script>onkeydown=e=>{if(e.key==='r')document.body.style.background='#ff0000';if('abc'.includes(e.key))setTimeout(()=>document.body.style.background='#00ff00',({a:0,b:225,c:300})[e.key])};document.body.focus()</script>`
+	return "data:text/html;base64," + base64.StdEncoding.EncodeToString([]byte(page))
+}
+
+// HeldViewObservation records requested redraw delays separately from observed
+// pixel times. A delayed application redraw is not a screenshot freshness proof.
+type HeldViewObservation struct {
+	RedrawDelayMS    int   `json:"redraw_delay_ms"`
+	ChangeObservedMS int64 `json:"change_observed_ms"`
+	FirstRequestMS   int64 `json:"first_request_ms"`
+}
+
+// ProbeHeldViewFrames proves that a view opened without framebuffer requests
+// does not retain connection-time pixels. It uses real control input to change
+// a temporary browser page, then checks the held view's very first full frame.
+// Run after other screen assertions: the temporary page remains until teardown.
+func ProbeHeldViewFrames(ctx context.Context, open func(context.Context, string) (*rfbclient.Client, func(), error)) ([]HeldViewObservation, error) {
+	control, closeControl, err := open(ctx, "input")
+	if err != nil {
+		return nil, err
+	}
+	defer closeControl()
+	tap := func(sym uint32) error {
+		if err := control.Key(sym, true); err != nil {
+			return err
+		}
+		return control.Key(sym, false)
+	}
+	red, green := color.RGBA{R: 255, A: 255}, color.RGBA{G: 255, A: 255}
+	waitColour := func(want color.RGBA) error {
+		for {
+			frame, err := control.Frame()
+			if err != nil {
+				return err
+			}
+			if probeFrameColour(frame, want) {
+				return nil
+			}
+			if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
+				return err
+			}
+		}
+	}
+	if err := waitColour(red); err != nil {
+		return nil, fmt.Errorf("held-view baseline: %w", err)
+	}
+	// Focus the prepared colour page, including when the Wayland keyboard
+	// observer held focus. Subsequent colour changes use control key input.
+	if err := control.Pointer(control.Width/2, control.Height/2, 1); err != nil {
+		return nil, err
+	}
+	if err := control.Pointer(control.Width/2, control.Height/2, 0); err != nil {
+		return nil, err
+	}
+	var observations []HeldViewObservation
+	for i, delay := range []int{0, 225, 300} {
+		if err := tap('r'); err != nil {
+			return observations, err
+		}
+		if err := waitColour(red); err != nil {
+			return observations, err
+		}
+		held, closeHeld, err := open(ctx, "view") // Open sends no framebuffer request.
+		if err != nil {
+			return observations, err
+		}
+		observation, err := func() (HeldViewObservation, error) {
+			defer closeHeld()
+			started := time.Now()
+			if err := tap(uint32('a' + i)); err != nil {
+				return HeldViewObservation{}, err
+			}
+			// The first request is after the CLI's 250 ms settle limit. Independently
+			// observe green on control before asserting green on the held view, so a
+			// slow redraw cannot be mistaken for connection-time pixel retention.
+			if err := sleepContext(ctx, 250*time.Millisecond); err != nil {
+				return HeldViewObservation{}, err
+			}
+			if err := waitColour(green); err != nil {
+				return HeldViewObservation{}, err
+			}
+			observation := HeldViewObservation{RedrawDelayMS: delay, ChangeObservedMS: time.Since(started).Milliseconds()}
+			observation.FirstRequestMS = time.Since(started).Milliseconds()
+			frame, err := held.Frame()
+			if err != nil {
+				return observation, err
+			}
+			if !probeFrameColour(frame, green) {
+				return observation, fmt.Errorf("held view's first full frame retained old pixels (redraw delay %d ms)", delay)
+			}
+			return observation, nil
+		}()
+		observations = append(observations, observation)
+		if err != nil {
+			return observations, err
+		}
+	}
+	return observations, nil
+}
+
+func probeFrameColour(frame *image.RGBA, want color.RGBA) bool {
+	// Require a broad patch, away from browser chrome and the pointer.
+	for _, x := range []int{frame.Bounds().Dx() / 3, frame.Bounds().Dx() * 2 / 3} {
+		for _, y := range []int{frame.Bounds().Dy() / 3, frame.Bounds().Dy() * 2 / 3} {
+			if frame.RGBAAt(x, y) != want {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func openFrameProbe(ctx context.Context, port int) (*rfbclient.Client, func(), error) {
+	ws, _, err := websocket.Dial(ctx, fmt.Sprintf("ws://127.0.0.1:%d%s", port, contract.ComputerDisplayWebSocketPath), &websocket.DialOptions{Subprotocols: []string{contract.ComputerDisplayWebSocketSubprotocol}})
+	if err != nil {
+		return nil, nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = ws.CloseNow() })
+	close := func() { stop(); _ = ws.CloseNow() }
+	ws.SetReadLimit(128 << 20)
+	client, err := rfbclient.Open(websocket.NetConn(ctx, ws, websocket.MessageBinary))
+	if err != nil {
+		close()
+		return nil, nil, err
+	}
+	return client, close, nil
 }

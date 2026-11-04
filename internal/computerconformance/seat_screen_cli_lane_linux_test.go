@@ -28,6 +28,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/computerconformance"
 	"github.com/Derek-X-Wang/wefty/internal/rfbclient"
 	"github.com/Derek-X-Wang/wefty/l1"
 	workloadrunner "github.com/Derek-X-Wang/wefty/runner"
@@ -258,6 +259,54 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		return ownerFabric.Dial(ctx, network, host)
 	}}
 	defer transport.CloseIdleConnections()
+	// Run after SC-1 so the temporary colour page cannot affect its timings.
+	// This is the actual x11vnc image, through the node front door.
+	// Prepare a disposable colour page in this Seat's own desktop. The probe
+	// changes its colour only through the real control connection.
+	launch := exec.CommandContext(ctx, "ctr", "--address", requiredSeatEnv(t, "WEFTY_SEAT_CONTAINERD"), "--namespace", ocihelper.ContainerdNamespace, "tasks", "exec", "--exec-id", "held-view-colour", "--user", fmt.Sprintf("%d:%d", 2000+ready.Place, 2000+ready.Place), task.ID(), "sh", "-c", seatEnv(ready.Place)+`chromium --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="$HOME/.config/chromium" --app="$1" >"$TMPDIR/held-view.log" 2>&1 &`, "sh", computerconformance.HeldViewProbeURL())
+	launchOutput, launchErr := launch.CombinedOutput()
+	if launchErr != nil {
+		t.Fatalf("colour surface: %v: %s", launchErr, launchOutput)
+	}
+	heldCtx, stopHeld := context.WithTimeout(ctx, 30*time.Second)
+	heldObservations, heldErr := computerconformance.ProbeHeldViewFrames(heldCtx, func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
+		ws, _, err := websocket.Dial(ctx, "ws://"+host+"/v1/seats/"+id+"/screen/"+mode, &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{ready.Credential}}, Subprotocols: []string{"binary"}})
+		if err != nil {
+			return nil, nil, err
+		}
+		stop := context.AfterFunc(ctx, func() { _ = ws.CloseNow() })
+		close := func() { stop(); _ = ws.CloseNow() }
+		ws.SetReadLimit(128 << 20)
+		client, err := rfbclient.Open(websocket.NetConn(ctx, ws, websocket.MessageBinary))
+		if err != nil {
+			close()
+			return nil, nil, err
+		}
+		return client, close, nil
+	})
+	stopHeld()
+	seatMust(t, heldErr)
+	t.Logf("x11vnc held-view first-frame colour proof: %+v", heldObservations)
+	// Measure changing-screen calls separately from SC-1's unchanged-screen
+	// samples. These observations add no timing gate and include process launch.
+	var changingCaptures []map[string]any
+	for _, key := range []string{"r", "a", "r", "a"} {
+		path := filepath.Join(t.TempDir(), "changing.png")
+		code, out, duration := call("key", id, key, "--screenshot", path)
+		if code != 0 {
+			t.Fatalf("changing-screen CLI exit %d: %s", code, out)
+		}
+		var reply struct {
+			After bool `json:"frame_after_input"`
+			Debug struct {
+				Phases map[string]float64 `json:"screen_timing_ms"`
+			} `json:"debug"`
+		}
+		seatMust(t, json.Unmarshal(out, &reply))
+		observation := map[string]any{"elapsed_ms": float64(duration.Microseconds()) / 1000, "frame_after_input": reply.After, "screen_timing_ms": reply.Debug.Phases}
+		changingCaptures = append(changingCaptures, observation)
+		t.Logf("changing-screen key + PNG (process launch included): %+v", observation)
+	}
 	// A person's Take control uses the real node tenure and real L1 event path.
 	ws, response, err := websocket.Dial(ctx, "ws://"+host+"/v1/seats/"+id+"/person/websockify", &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, Subprotocols: []string{"binary"}})
 	seatMust(t, err)
@@ -303,6 +352,8 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	rss := screenLaneX11RSS(t, ctx, store, ready)
 	// Both observations are logged even when one exceeds its limit.
 	evidence, _ := json.MarshalIndent(map[string]any{
+		"changing_captures":    changingCaptures,
+		"held_view_frames":     heldObservations,
 		"sc1_phase_ms":         map[string]any{"cold": breakdowns[0], "warmup": breakdowns[1], "warm": breakdowns[2:]},
 		"x11vnc_rss_kib":       rss,
 		"sc1_ms":               float64(sc1.Microseconds()) / 1000,

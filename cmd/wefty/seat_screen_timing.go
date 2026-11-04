@@ -20,9 +20,13 @@ func newSeatScreenTiming(start time.Time) *seatScreenTiming {
 }
 
 func (t *seatScreenTiming) mark(name string) {
+	t.markAt(name, time.Now())
+}
+
+func (t *seatScreenTiming) markAt(name string, at time.Time) {
 	if t != nil {
 		if _, exists := t.phases[name]; !exists {
-			t.phases[name] = float64(time.Since(t.start).Microseconds()) / 1000
+			t.phases[name] = float64(at.Sub(t.start).Microseconds()) / 1000
 		}
 	}
 }

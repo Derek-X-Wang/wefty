@@ -649,26 +649,36 @@ Sync reports a change if its reply contains a rectangle outside the requested
 matter because neatvnc can flush all accumulated damage through Sync, while
 LibVNCServer retains damage outside the requested region for an incremental
 request. Neither source of observed change is discarded.
-If Sync reports no change, the CLI requests incremental updates over the full
-screen for the remaining portion of a 250 ms window starting at the end of the
-input write. The bound keeps a click that does not redraw within SC-1. At most one framebuffer request is outstanding: its entire
-reply is read before the next request. Empty updates do not count and
-re-requests are paced at 20 ms. Sync must finish even if it consumes the whole
-window; in that case no additional incremental wait is started.
-After a change observed in Sync or an incremental reply, the CLI requests the
-full capture on the same input connection. On timeout, it closes input only
-after Sync succeeded, discards any outstanding incremental request, opens one
-fresh view connection, and captures a full frame there. It never repeats input.
-RFB can merge replies to several requests and has no request ID, so receive
-times or request counts cannot identify a late incremental reply.
-The reopened view does not print a second release note; its latest unread
-count may replace the input connection's count. A Sync or reopen failure retains
+If Sync reports no change, the CLI immediately starts one spare view connection
+while it requests incremental updates over the full screen for the remaining
+portion of a 250 ms window starting at the end of the input write. The spare
+completes WebSocket and RFB setup but sends no framebuffer request during the
+wait. The bound keeps a click that does not redraw within SC-1. At most one
+framebuffer request is outstanding on input: its entire reply is read before
+the next request. Empty updates do not count and re-requests are paced at 20 ms.
+Sync must finish even if it consumes the whole window; in that case the spare
+starts after Sync and no additional incremental wait is started.
+After a change observed in Sync, no spare is started. After a change in an
+incremental reply, the spare is cancelled immediately, without waiting for its
+handshake, and its errors and metadata are ignored. Both change paths request
+the full capture on input. On timeout, the CLI closes input, discards any
+outstanding incremental request, waits for the spare within the original 15 s
+context, then selects it and sends its first non-incremental request. The
+capture is an unambiguous full frame requested after the settle limit; the
+pixels are not proven post-redraw. `frame_after_input` stays false on timeout.
+Input is never repeated. RFB can merge replies to several requests and has no
+request ID, so receive times or request counts cannot identify a late
+incremental reply. A settle error aborts even if the spare is ready.
+The spare validates the release note without printing it. Only a selected
+spare's unread count replaces input's count; it is a snapshot at spare
+admission, earlier than selection. Every exit cancels the spare and reclaims
+connections that succeed late. A Sync, settle or selected-spare failure retains
 `action_done: true`, is non-retryable, and removes the PNG destination.
 The baseline costs one additional full-frame read; the post-input Sync costs
-one round trip and may have an expanded reply. A timeout also costs one view
-connection and RFB handshake. Sync, baseline, reopen and frame reads use the
-existing transport deadline. Plain `seat screenshot` has no baseline, Sync or
-wait. Input without `--screenshot` keeps its existing one-pixel Sync.
+one round trip and may have an expanded reply. A Sync with no observed change
+also costs one view connection and RFB handshake, overlapped with the remaining
+wait. Sync, baseline, spare setup and frame reads use the existing deadline.
+Plain `seat screenshot` has no baseline, Sync or wait. Input without `--screenshot` keeps its existing one-pixel Sync.
 
 Coordinates must be in `[0,1279] × [0,799]`; malformed arguments fail before
 opening Fabric. `scroll` requires `--dy N`, accepts `--dx N`, and limits each
@@ -687,5 +697,9 @@ The test-only `WEFTY_SEAT_SCREEN_TIMING=1` hook adds JSON `debug` with a
 It records discovery, dial, banner, input, synchronization, capture connection,
 frame and PNG completion times. Combined captures add `frame_baseline` before
 `input_written`, then `sync_done` before any incremental wait, followed by
-`frame_update_seen` or `frame_update_timeout` before `frame_read`. A timeout adds `capture_reopened` after the new view's RFB
-handshake and before `frame_read`. It records no input or framebuffer payloads.
+`frame_update_seen` or `frame_update_timeout` before `frame_read`. A timeout
+adds `capture_reopened` when the spare is selected, after both
+`frame_update_timeout` and the spare's RFB handshake, and before `frame_read`.
+Connection phase timestamps and reply metadata are applied on the caller;
+discarded spare timestamps do not enter the reply. It records no input or
+framebuffer payloads.

@@ -297,7 +297,7 @@ func TestSeatScreenSyncReportsChanges(t *testing.T) {
 			if behavior == "libvncserver-incremental" {
 				wantIncremental = 1
 			}
-			if reply.After == nil || !*reply.After || syncs.Load() != 1 || incremental.Load() != wantIncremental || full.Load() != 2 || views.Load() != 0 || events.Load() != 2 {
+			if reply.After == nil || !*reply.After || syncs.Load() != 1 || incremental.Load() != wantIncremental || full.Load() != 2 || views.Load() > wantIncremental || events.Load() != 2 {
 				t.Errorf("wrong Sync behavior: reply=%s Sync=%d incremental=%d full=%d views=%d input=%d", out.String(), syncs.Load(), incremental.Load(), full.Load(), views.Load(), events.Load())
 			}
 			phases := reply.Debug.Phases

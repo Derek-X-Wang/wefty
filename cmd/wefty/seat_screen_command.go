@@ -337,7 +337,11 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	open := func(mode string, printNote bool) (*rfbclient.Client, func(), error) {
+	// Open returns metadata and timestamps without changing caller-owned reply
+	// state. The speculative view uses its own cancellable context throughout.
+	open := func(openCtx context.Context, mode string, printNote bool) (result seatScreenOpenResult) {
+		result.marks = make(map[string]time.Time)
+		mark := func(name string) { result.marks[name] = time.Now() }
 		u := *endpoint
 		u.Path = "/v1/seats/" + a.id + "/screen/" + mode
 		u.RawPath = ""
@@ -349,59 +353,79 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 			defer transport.CloseIdleConnections()
 		}
 		node.client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-		c, response, e := websocket.Dial(ctx, u.String(), &websocket.DialOptions{HTTPClient: node.client, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{secret}}, Subprotocols: []string{"binary"}})
-		timing.mark("door_dial")
+		c, response, e := websocket.Dial(openCtx, u.String(), &websocket.DialOptions{HTTPClient: node.client, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{secret}}, Subprotocols: []string{"binary"}})
+		mark("door_dial")
 		if e != nil {
 			if response != nil {
 				defer response.Body.Close()
 				var failure contract.ErrorResponse
 				if decode := json.NewDecoder(io.LimitReader(response.Body, 64<<10)).Decode(&failure); decode == nil && failure.Error.Code != "" {
-					return nil, nil, &apiResponseError{StatusCode: response.StatusCode, APIError: failure.Error}
+					result.err = &apiResponseError{StatusCode: response.StatusCode, APIError: failure.Error}
+					return result
 				}
 			}
-			return nil, nil, e
+			result.err = e
+			return result
 		}
-		close := func() { _ = c.CloseNow() }
+		// Also reclaims a successful Dial that races cancellation, including a
+		// result buffered after the caller has discarded the spare.
+		stop := context.AfterFunc(openCtx, func() { _ = c.CloseNow() })
+		close := func() { stop(); _ = c.CloseNow() }
 		if mode == "view" || capture != nil {
-			timing.mark("screenshot_connection_open")
+			mark("screenshot_connection_open")
 		}
 		if c.Subprotocol() != "binary" {
 			close()
-			return nil, nil, fmt.Errorf("Seat screen did not negotiate binary WebSocket")
+			result.err = fmt.Errorf("Seat screen did not negotiate binary WebSocket")
+			return result
 		}
 		c.SetReadLimit(128 << 20)
 		if count, e := strconv.Atoi(response.Header.Get("Wefty-Seat-Unread-Events")); e == nil && count >= 0 {
-			unread = count
+			result.unread = &count
 		}
 		if encoded := response.Header.Get("Wefty-Seat-Release-Note"); encoded != "" {
 			decoded, e := base64.RawURLEncoding.DecodeString(encoded)
 			if e != nil || !utf8.Valid(decoded) || len(decoded) > 8192 {
 				close()
-				return nil, nil, fmt.Errorf("invalid Seat release note")
+				result.err = fmt.Errorf("invalid Seat release note")
+				return result
 			}
 			if printNote {
 				if _, e = fmt.Fprintln(stderr, string(decoded)); e != nil {
 					close()
-					return nil, nil, e
+					result.err = e
+					return result
 				}
 			}
 		}
-		wire := &seatScreenBannerWire{ReadWriter: websocket.NetConn(ctx, c, websocket.MessageBinary), remaining: 12, received: func() { timing.mark("rfb_banner") }}
+		wire := &seatScreenBannerWire{ReadWriter: websocket.NetConn(openCtx, c, websocket.MessageBinary), remaining: 12, received: func() { mark("rfb_banner") }}
 		client, e := rfbclient.Open(wire)
 		if e != nil {
 			close()
-			return nil, nil, e
+			result.err = e
+			return result
 		}
-		return client, close, nil
+		result.client, result.close = client, close
+		return result
 	}
 	mode := "view"
 	if a.command != "screenshot" {
 		mode = "input"
 	}
-	client, close, err := open(mode, true)
-	if err != nil {
-		return err
+	applyOpen := func(result seatScreenOpenResult) {
+		if result.unread != nil {
+			unread = *result.unread
+		}
+		for name, at := range result.marks {
+			timing.markAt(name, at)
+		}
 	}
+	opened := open(ctx, mode, true)
+	applyOpen(opened)
+	if opened.err != nil {
+		return opened.err
+	}
+	client, close := opened.client, opened.close
 	defer func() { close() }()
 	frameAfterInput := false
 	var inputWritten time.Time
@@ -435,6 +459,16 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	if capture != nil {
 		phase = "screenshot"
 		if actionDone {
+			var spare <-chan seatScreenOpenResult
+			var cancelSpare context.CancelFunc
+			if !frameAfterInput {
+				spareCtx, stop := context.WithCancel(ctx)
+				cancelSpare = stop
+				defer cancelSpare()
+				ready := make(chan seatScreenOpenResult, 1)
+				spare = ready
+				go func() { ready <- open(spareCtx, "view", false) }()
+			}
 			var e error
 			if remaining := time.Until(inputWritten.Add(seatScreenSettleLimit)); !frameAfterInput && remaining > 0 {
 				frameAfterInput, e = client.WaitForChange(remaining)
@@ -443,15 +477,29 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				}
 			}
 			if frameAfterInput {
+				if cancelSpare != nil {
+					cancelSpare()
+				}
 				timing.mark("frame_update_seen")
 			} else {
 				timing.mark("frame_update_timeout")
 				close()
-				reopened, closeReopened, e := open("view", false)
-				if e != nil {
-					return e
+				var reopened seatScreenOpenResult
+				select {
+				case reopened = <-spare:
+				case <-ctx.Done():
+					return ctx.Err()
 				}
-				client, close = reopened, closeReopened
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				applyOpen(reopened)
+				if reopened.err != nil {
+					return reopened.err
+				}
+				// Transfer ownership: the capture is an unambiguous full frame
+				// requested after the settle limit. Redraw is not proven.
+				client, close = reopened.client, reopened.close
 				timing.mark("capture_reopened")
 			}
 		}

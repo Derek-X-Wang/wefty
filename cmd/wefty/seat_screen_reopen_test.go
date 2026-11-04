@@ -59,7 +59,6 @@ func TestSeatScreenTimeoutReopensView(t *testing.T) {
 				isView := strings.HasSuffix(r.URL.Path, "/view")
 				if isView {
 					views.Add(1)
-					signalCapture()
 					if tc.refuse {
 						w.WriteHeader(http.StatusInternalServerError)
 						_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: contract.APIError{Code: contract.ErrorInternal, Message: "view reopen failed", Retryable: true}})
@@ -91,6 +90,7 @@ func TestSeatScreenTimeoutReopensView(t *testing.T) {
 				}, func(request []byte) error {
 					if isView {
 						viewFrames.Add(1)
+						signalCapture()
 						if request[0] != 0 {
 							t.Error("view requested incremental frame")
 						}
@@ -107,12 +107,13 @@ func TestSeatScreenTimeoutReopensView(t *testing.T) {
 								return err
 							}
 						}
-						// Deliver the stale reply only after capture is attempted. Correct
-						// code has closed this stream and opened view by then. The old code
+						// Deliver the stale reply only after capture is attempted or input
+						// is closed. Opening the spare alone must not release it. The old code
 						// sends another request on input, then accepts this delayed first byte.
 						go func() {
 							select {
 							case <-captureAttempt:
+							case <-inputClosed:
 							case <-ctx.Done():
 								oldFinished <- ctx.Err()
 								return

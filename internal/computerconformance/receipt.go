@@ -436,4 +436,5 @@ var CheckCatalog = []CheckDefinition{
 	{ID: "persistence.rootfs-discarded", Scope: ScopeImage, Summary: "attempt-local rootfs state does not survive"},
 	{ID: "persistence.edge-recovers", Scope: ScopeImage, Summary: "killed WebSocket edge withdraws and both endpoints recover"},
 	{ID: "targets.control-nonpersistent", Scope: ScopeImage, Summary: "/wefty/control state does not enter service data"},
+	{ID: "screen.held-view-current-frame", Scope: ScopeImage, Summary: "held view first full frame contains pixels changed through control after open"},
 }
