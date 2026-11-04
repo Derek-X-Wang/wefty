@@ -680,11 +680,14 @@ commands. This prevents display-property commands from reopening IP listeners
 or changing the view role after admission. Keep the three explicit disable
 flags even with `-safer`; normal RFB input and view access retain their roles.
 
-Both roles also use `-nonap -sb 0`. By default an idle x11vnc sleeps between
-screen polls (up to several seconds), and only user input ends the sleep early.
-A Seat input with `--screenshot` reads a baseline frame before it sends the
-input, so with naps on, that frame waited for the nap to end (#1479). The cost
-is that an idle backend keeps polling at its normal interval.
+Both roles also use `-nonap -sb 0`, which turn off x11vnc's idle nap
+throttling. With the defaults, x11vnc 0.9.16-9 answered a new connection's
+first full frame in about 770 ms on an idle screen, and a 1×1 update after a
+click in about 260 ms. With these flags both took under 30 ms on amd64 and
+arm64. A Seat input with `--screenshot` reads a baseline frame before it sends
+the input, so it depends on that first answer (#1479). The cost is polling
+while a client stays connected: one idle connected client used under 1% of one
+core in the same measurement. With no client connected, x11vnc does not poll.
 
 Before returning each backend connection, and again at its first byte, the
 Linux relay matches the child PID's `/proc/<pid>/fd` socket inodes against
