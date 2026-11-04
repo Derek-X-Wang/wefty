@@ -29,6 +29,7 @@ func run(arguments []string) int {
 	flags.StringVar(&config.RepairImage, "repair-image", "", "known-good immutable image used only for detached-root permission repair (required)")
 	flags.StringVar(&config.Runtime, "runtime", "docker", "OCI command-line runtime: docker or nerdctl")
 	flags.StringVar(&config.Platform, "platform", "", "optional Linux platform, for example linux/amd64")
+	flags.BoolVar(&config.ReferenceSurfaceProbe, "reference-surface-probe", false, "opt in to reference Chromium surface setup and held-view evidence; unavailable setup reports NOT-RUN")
 	flags.StringVar(&config.InputOraclePath, "input-oracle-path", "", "absolute image path to an input receipt; omission reports input checks NOT-RUN")
 	flags.StringVar(&config.DriverOraclePath, "driver-oracle-path", "", "absolute image path to observed driver state; omission reports consumer checks NOT-RUN")
 	flags.StringVar(&config.EdgeProcessPattern, "edge-process-pattern", "", "image process substring used to prove edge loss and recovery; omission reports the cell NOT-RUN")

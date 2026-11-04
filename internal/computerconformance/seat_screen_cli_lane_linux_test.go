@@ -263,13 +263,8 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	// This is the actual x11vnc image, through the node front door.
 	// Prepare a disposable colour page in this Seat's own desktop. The probe
 	// changes its colour only through the real control connection.
-	launch := exec.CommandContext(ctx, "ctr", "--address", requiredSeatEnv(t, "WEFTY_SEAT_CONTAINERD"), "--namespace", ocihelper.ContainerdNamespace, "tasks", "exec", "--exec-id", "held-view-colour", "--user", fmt.Sprintf("%d:%d", 2000+ready.Place, 2000+ready.Place), task.ID(), "sh", "-c", seatEnv(ready.Place)+`chromium --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="$HOME/.config/chromium" --app="$1" >"$TMPDIR/held-view.log" 2>&1 &`, "sh", computerconformance.HeldViewProbeURL())
-	launchOutput, launchErr := launch.CombinedOutput()
-	if launchErr != nil {
-		t.Fatalf("colour surface: %v: %s", launchErr, launchOutput)
-	}
 	heldCtx, stopHeld := context.WithTimeout(ctx, 30*time.Second)
-	heldObservations, heldErr := computerconformance.ProbeHeldViewFrames(heldCtx, func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
+	heldObservations, heldErr := computerconformance.ProbeHeldViewFrames(heldCtx, computerconformance.HeldViewProbeOptions{Open: func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
 		ws, _, err := websocket.Dial(ctx, "ws://"+host+"/v1/seats/"+id+"/screen/"+mode, &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{ready.Credential}}, Subprotocols: []string{"binary"}})
 		if err != nil {
 			return nil, nil, err
@@ -283,6 +278,18 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 			return nil, nil, err
 		}
 		return client, close, nil
+	},
+		Prepare: func(ctx context.Context, attempt int) (string, error) {
+			launch := exec.CommandContext(ctx, "ctr", "--address", requiredSeatEnv(t, "WEFTY_SEAT_CONTAINERD"), "--namespace", ocihelper.ContainerdNamespace, "tasks", "exec", "--exec-id", fmt.Sprintf("held-view-colour-%d", attempt), "--user", fmt.Sprintf("%d:%d", 2000+ready.Place, 2000+ready.Place), task.ID(), "sh", "-c", seatEnv(ready.Place)+computerconformance.HeldViewProbeLaunchScript, "sh", computerconformance.HeldViewProbeURL())
+			output, err := launch.CombinedOutput()
+			return fmt.Sprintf("launch attempt=%d status=%v output=%s", attempt, err, output), err
+		},
+		Diagnostics: func(ctx context.Context) string {
+			command := exec.CommandContext(ctx, "ctr", "--address", requiredSeatEnv(t, "WEFTY_SEAT_CONTAINERD"), "--namespace", ocihelper.ContainerdNamespace, "tasks", "exec", "--exec-id", fmt.Sprintf("held-view-log-%d", time.Now().UnixNano()), "--user", fmt.Sprintf("%d:%d", 2000+ready.Place, 2000+ready.Place), task.ID(), "sh", "-c", seatEnv(ready.Place)+computerconformance.HeldViewProbeDiagnosticsScript)
+			output, err := command.CombinedOutput()
+			return fmt.Sprintf("diagnostics status=%v output=%s", err, output)
+		},
+		Report: func(message string) { t.Log(message) },
 	})
 	stopHeld()
 	seatMust(t, heldErr)
@@ -290,7 +297,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	// Measure changing-screen calls separately from SC-1's unchanged-screen
 	// samples. These observations add no timing gate and include process launch.
 	var changingCaptures []map[string]any
-	for _, key := range []string{"r", "a", "r", "a"} {
+	for _, key := range []string{"r", "a", "r", "b", "r", "c"} {
 		path := filepath.Join(t.TempDir(), "changing.png")
 		code, out, duration := call("key", id, key, "--screenshot", path)
 		if code != 0 {
@@ -303,7 +310,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 			} `json:"debug"`
 		}
 		seatMust(t, json.Unmarshal(out, &reply))
-		observation := map[string]any{"elapsed_ms": float64(duration.Microseconds()) / 1000, "frame_after_input": reply.After, "screen_timing_ms": reply.Debug.Phases}
+		observation := map[string]any{"key": key, "redraw_delay_ms": map[string]int{"r": 0, "a": 0, "b": 225, "c": 300}[key], "elapsed_ms": float64(duration.Microseconds()) / 1000, "frame_after_input": reply.After, "screen_timing_ms": reply.Debug.Phases}
 		changingCaptures = append(changingCaptures, observation)
 		t.Logf("changing-screen key + PNG (process launch included): %+v", observation)
 	}

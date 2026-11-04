@@ -364,100 +364,212 @@ func HeldViewProbeURL() string {
 	return "data:text/html;base64," + base64.StdEncoding.EncodeToString([]byte(page))
 }
 
-// HeldViewObservation records requested redraw delays separately from observed
-// pixel times. A delayed application redraw is not a screenshot freshness proof.
-type HeldViewObservation struct {
-	RedrawDelayMS    int   `json:"redraw_delay_ms"`
-	ChangeObservedMS int64 `json:"change_observed_ms"`
-	FirstRequestMS   int64 `json:"first_request_ms"`
+// HeldViewProbeLaunchScript launches only the reference image's disposable
+// Chromium surface. Its caller opts in and retains the command's exit status.
+// The child status file distinguishes shell admission from Chromium exit.
+const HeldViewProbeLaunchScript = `command -v chromium >/dev/null || exit 127
+for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
+ if [ -S "$candidate" ]; then export WAYLAND_DISPLAY="${candidate##*/}"; break; fi
+done
+ozone=
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then ozone=--ozone-platform=wayland
+elif [ -z "${DISPLAY:-}" ]; then export DISPLAY=:$WEFTY_COMPUTER_VIEW_PORT; fi
+root="${TMPDIR:-/tmp}/wefty-held-view"
+rm -f "$root.status"
+( chromium $ozone --no-sandbox --disable-gpu --disable-dev-shm-usage --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="$HOME/.config/chromium" --app="$1" >"$root.log" 2>&1
+  result=$?; printf 'chromium_exit=%s\n' "$result" >"$root.status"
+) </dev/null >/dev/null 2>&1 &
+printf 'launch_pid=%s\n' "$!"`
+
+const HeldViewProbeDiagnosticsScript = `root="${TMPDIR:-/tmp}/wefty-held-view"
+if [ -f "$root.status" ]; then cat "$root.status"; else echo chromium_exit=pending; fi
+if [ -f "$root.log" ]; then tail -c 4096 "$root.log"; else echo chromium_log=unavailable; fi`
+
+type HeldViewProbeOptions struct {
+	Open        func(context.Context, string) (*rfbclient.Client, func(), error)
+	Prepare     func(context.Context, int) (string, error)
+	Diagnostics func(context.Context) string
+	Report      func(string)
 }
 
-// ProbeHeldViewFrames proves that a view opened without framebuffer requests
-// does not retain connection-time pixels. It uses real control input to change
-// a temporary browser page, then checks the held view's very first full frame.
-// Run after other screen assertions: the temporary page remains until teardown.
-func ProbeHeldViewFrames(ctx context.Context, open func(context.Context, string) (*rfbclient.Client, func(), error)) ([]HeldViewObservation, error) {
-	control, closeControl, err := open(ctx, "input")
+// HeldViewSetupUnavailableError is optional evidence, distinct from a failed
+// first-frame assertion. Reference-image publication still requires PASS.
+type HeldViewSetupUnavailableError struct{ Err error }
+
+func (e *HeldViewSetupUnavailableError) Error() string { return e.Err.Error() }
+func (e *HeldViewSetupUnavailableError) Unwrap() error { return e.Err }
+
+// HeldViewObservation records requested delays separately from observed pixel
+// times. A delayed application redraw is not a screenshot freshness proof.
+type HeldViewObservation struct {
+	RedrawDelayMS    int      `json:"redraw_delay_ms"`
+	ChangeObservedMS int64    `json:"change_observed_ms"`
+	FirstRequestMS   int64    `json:"first_request_ms"`
+	SetupAttempts    []string `json:"setup_attempts"`
+	started          time.Time
+}
+
+// ProbeHeldViewFrames uses a separate view observer to establish both colours
+// on the backend being tested. Setup may retry at most three times per case.
+// The selected held connection's first-frame assertion is NEVER retried.
+func ProbeHeldViewFrames(ctx context.Context, options HeldViewProbeOptions) ([]HeldViewObservation, error) {
+	var observations []HeldViewObservation
+	attemptNumber := 0
+	diagnostics := func() string {
+		if options.Diagnostics == nil {
+			return ""
+		}
+		diagnosticCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		return options.Diagnostics(diagnosticCtx)
+	}
+	report := func(message string) {
+		if options.Report != nil {
+			options.Report(message)
+		}
+	}
+	for i, delay := range []int{0, 225, 300} {
+		var attempts []string
+		var lastErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			attemptNumber++
+			setupCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			held, closeHeld, observation, detail, err := prepareHeldView(setupCtx, options, uint32('a'+i), delay, attemptNumber, i == 0 || attempt > 1)
+			if err != nil {
+				cancel()
+				lastErr = err
+				message := fmt.Sprintf("redraw=%dms setup attempt=%d: %s; error=%v; %s", delay, attempt, detail, err, diagnostics())
+				attempts = append(attempts, message)
+				report(message)
+				if ctx.Err() != nil {
+					break
+				}
+				continue
+			}
+			message := fmt.Sprintf("redraw=%dms setup attempt=%d ready: %s", delay, attempt, detail)
+			attempts = append(attempts, message)
+			report(message)
+			observation.SetupAttempts = attempts
+			observation.FirstRequestMS = time.Since(observation.started).Milliseconds()
+			// No request has been sent on held. This read and assertion are outside
+			// the retryable setup; stale pixels or a read failure fail immediately.
+			frame, frameErr := held.Frame()
+			closeHeld()
+			cancel()
+			observations = append(observations, observation)
+			if frameErr != nil {
+				return observations, fmt.Errorf("held first frame failed (no retry): %w; %s; %s", frameErr, strings.Join(attempts, "; "), diagnostics())
+			}
+			if !probeFrameColour(frame, color.RGBA{G: 255, A: 255}) {
+				return observations, fmt.Errorf("held first frame stale (no retry), redraw=%dms pixels=%s; %s; %s", delay, probeFrameSamples(frame), strings.Join(attempts, "; "), diagnostics())
+			}
+			lastErr = nil
+			break
+		}
+		if lastErr != nil {
+			return observations, &HeldViewSetupUnavailableError{Err: fmt.Errorf("held-view setup unavailable: %w; %s", lastErr, strings.Join(attempts, "; "))}
+		}
+	}
+	return observations, nil
+}
+
+func prepareHeldView(ctx context.Context, options HeldViewProbeOptions, key uint32, delay, attempt int, launch bool) (held *rfbclient.Client, closeHeld func(), observation HeldViewObservation, detail string, resultErr error) {
+	var notes []string
+	defer func() { detail = strings.Join(notes, "; ") }()
+	if launch && options.Prepare != nil {
+		note, err := options.Prepare(ctx, attempt)
+		notes = append(notes, note)
+		if err != nil {
+			return nil, nil, observation, "", err
+		}
+	}
+	control, closeControl, err := options.Open(ctx, "input")
 	if err != nil {
-		return nil, err
+		return nil, nil, observation, "", err
 	}
 	defer closeControl()
+	observer, closeObserver, err := options.Open(ctx, "view")
+	if err != nil {
+		return nil, nil, observation, "", err
+	}
+	defer closeObserver()
 	tap := func(sym uint32) error {
 		if err := control.Key(sym, true); err != nil {
 			return err
 		}
 		return control.Key(sym, false)
 	}
-	red, green := color.RGBA{R: 255, A: 255}, color.RGBA{G: 255, A: 255}
 	waitColour := func(want color.RGBA) error {
+		pixels := "unavailable"
 		for {
-			frame, err := control.Frame()
+			frame, err := observer.Frame()
 			if err != nil {
-				return err
+				return fmt.Errorf("view observer: %w; last pixels=%s", err, pixels)
 			}
+			pixels = probeFrameSamples(frame)
 			if probeFrameColour(frame, want) {
+				notes = append(notes, "view observer pixels="+pixels)
 				return nil
 			}
 			if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
-				return err
+				return fmt.Errorf("view observer: %w; last pixels=%s", err, pixels)
 			}
 		}
 	}
-	if err := waitColour(red); err != nil {
-		return nil, fmt.Errorf("held-view baseline: %w", err)
+	red := color.RGBA{R: 255, A: 255}
+	if launch {
+		if err := waitColour(red); err != nil {
+			return nil, nil, observation, "", err
+		}
 	}
-	// Focus the prepared colour page, including when the Wayland keyboard
-	// observer held focus. Subsequent colour changes use control key input.
 	if err := control.Pointer(control.Width/2, control.Height/2, 1); err != nil {
-		return nil, err
+		return nil, nil, observation, "", err
 	}
 	if err := control.Pointer(control.Width/2, control.Height/2, 0); err != nil {
-		return nil, err
+		return nil, nil, observation, "", err
 	}
-	var observations []HeldViewObservation
-	for i, delay := range []int{0, 225, 300} {
-		if err := tap('r'); err != nil {
-			return observations, err
+	if err := tap('r'); err != nil {
+		return nil, nil, observation, "", err
+	}
+	// Red is confirmed on view BEFORE the held connection is opened.
+	if err := waitColour(red); err != nil {
+		return nil, nil, observation, "", err
+	}
+	held, closeHeld, err = options.Open(ctx, "view")
+	if err != nil {
+		return nil, nil, observation, "", err
+	}
+	defer func() {
+		if resultErr != nil {
+			closeHeld()
+			held, closeHeld = nil, nil
 		}
-		if err := waitColour(red); err != nil {
-			return observations, err
-		}
-		held, closeHeld, err := open(ctx, "view") // Open sends no framebuffer request.
-		if err != nil {
-			return observations, err
-		}
-		observation, err := func() (HeldViewObservation, error) {
-			defer closeHeld()
-			started := time.Now()
-			if err := tap(uint32('a' + i)); err != nil {
-				return HeldViewObservation{}, err
-			}
-			// The first request is after the CLI's 250 ms settle limit. Independently
-			// observe green on control before asserting green on the held view, so a
-			// slow redraw cannot be mistaken for connection-time pixel retention.
-			if err := sleepContext(ctx, 250*time.Millisecond); err != nil {
-				return HeldViewObservation{}, err
-			}
-			if err := waitColour(green); err != nil {
-				return HeldViewObservation{}, err
-			}
-			observation := HeldViewObservation{RedrawDelayMS: delay, ChangeObservedMS: time.Since(started).Milliseconds()}
-			observation.FirstRequestMS = time.Since(started).Milliseconds()
-			frame, err := held.Frame()
-			if err != nil {
-				return observation, err
-			}
-			if !probeFrameColour(frame, green) {
-				return observation, fmt.Errorf("held view's first full frame retained old pixels (redraw delay %d ms)", delay)
-			}
-			return observation, nil
-		}()
-		observations = append(observations, observation)
-		if err != nil {
-			return observations, err
+	}()
+	started := time.Now()
+	if err := tap(key); err != nil {
+		return nil, closeHeld, observation, "", err
+	}
+	if err := sleepContext(ctx, 250*time.Millisecond); err != nil {
+		return nil, closeHeld, observation, "", err
+	}
+	// Observe GREEN on the SAME VIEW BACKEND through a separate connection.
+	// The held connection remains request-free throughout this observer wait.
+	if err := waitColour(color.RGBA{G: 255, A: 255}); err != nil {
+		return nil, closeHeld, observation, "", err
+	}
+	observation = HeldViewObservation{RedrawDelayMS: delay, ChangeObservedMS: time.Since(started).Milliseconds(), started: started}
+	return held, closeHeld, observation, "", nil
+}
+
+func probeFrameSamples(frame *image.RGBA) string {
+	var samples []string
+	for _, x := range []int{frame.Bounds().Dx() / 3, frame.Bounds().Dx() * 2 / 3} {
+		for _, y := range []int{frame.Bounds().Dy() / 3, frame.Bounds().Dy() * 2 / 3} {
+			pixel := frame.RGBAAt(x, y)
+			samples = append(samples, fmt.Sprintf("(%d,%d)=%02x%02x%02x/%02x", x, y, pixel.R, pixel.G, pixel.B, pixel.A))
 		}
 	}
-	return observations, nil
+	return strings.Join(samples, ",")
 }
 
 func probeFrameColour(frame *image.RGBA, want color.RGBA) bool {

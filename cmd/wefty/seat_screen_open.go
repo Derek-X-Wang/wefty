@@ -15,3 +15,6 @@ type seatScreenOpenResult struct {
 	marks  map[string]time.Time
 	err    error
 }
+
+// Context-only observation seam used by protocol tests, never set by the CLI.
+type seatScreenSpareTestHookKey struct{}

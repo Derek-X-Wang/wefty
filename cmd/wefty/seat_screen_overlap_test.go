@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -26,7 +27,7 @@ import (
 // These tests use the CLI and wire protocol boundary. Handshakes park at known
 // seams so cancellation and reply ownership do not depend on scheduling sleeps.
 func TestSeatScreenOverlap(t *testing.T) {
-	for _, scenario := range []string{"timeout", "change", "change-slow-handshake", "change-late-dial", "change-refused", "timeout-refused", "change-invalid-note", "timeout-invalid-note", "settle-error", "sync-error", "sync-change", "parent-cancel"} {
+	for _, scenario := range []string{"timeout", "change", "change-slow-handshake", "change-late-dial", "change-late-open", "change-refused", "timeout-refused", "change-invalid-note", "timeout-invalid-note", "settle-error", "sync-error", "sync-change", "parent-cancel"} {
 		t.Run(scenario, func(t *testing.T) {
 			t.Setenv("WEFTY_SEAT_SCREEN_TIMING", "1")
 			t.Setenv("WEFTY_SEAT_STATE_ROOT", filepath.Join(t.TempDir(), "seats"))
@@ -36,6 +37,23 @@ func TestSeatScreenOverlap(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
+			producerOpened, producerDone := make(chan struct{}), make(chan struct{})
+			releaseOpen := make(chan struct{})
+			var inputMarks, spareMarks map[string]time.Time
+			ctx = context.WithValue(ctx, seatScreenSpareTestHookKey{}, func(event string, result seatScreenOpenResult) {
+				switch event {
+				case "input_opened":
+					inputMarks = result.marks
+				case "spare_opened":
+					spareMarks = result.marks
+					close(producerOpened)
+					if scenario == "change-late-open" {
+						<-releaseOpen
+					}
+				case "spare_finished":
+					close(producerDone)
+				}
+			})
 			viewReady := make(chan struct{})
 			viewStarted, viewClosed, inputClosed := make(chan struct{}), make(chan struct{}), make(chan struct{})
 			var views, live, inputFull, viewFull atomic.Int32
@@ -111,8 +129,8 @@ func TestSeatScreenOverlap(t *testing.T) {
 					if p[0] == 1 {
 						if changing || scenario == "settle-error" || scenario == "parent-cancel" {
 							ready := viewStarted
-							if scenario == "change" || scenario == "settle-error" || scenario == "parent-cancel" {
-								ready = viewReady
+							if scenario == "change" || scenario == "change-late-open" || scenario == "settle-error" || scenario == "parent-cancel" {
+								ready = producerOpened
 							}
 							select {
 							case <-ready:
@@ -136,6 +154,9 @@ func TestSeatScreenOverlap(t *testing.T) {
 						// when its RFB handshake never completes.
 						select {
 						case <-viewClosed:
+							if scenario == "change-late-open" {
+								close(releaseOpen)
+							}
 						case <-time.After(time.Second):
 							t.Error("spare was not cancelled on change")
 						}
@@ -176,6 +197,10 @@ func TestSeatScreenOverlap(t *testing.T) {
 				var reply struct {
 					After  bool `json:"frame_after_input"`
 					Unread int  `json:"unread_events"`
+					Debug  struct {
+						Start  int64              `json:"screen_timing_start_unix_ns"`
+						Phases map[string]float64 `json:"screen_timing_ms"`
+					} `json:"debug"`
 				}
 				if err := json.Unmarshal(out.Bytes(), &reply); err != nil {
 					t.Fatal(err)
@@ -183,6 +208,27 @@ func TestSeatScreenOverlap(t *testing.T) {
 				wantUnread := 2
 				if scenario == "timeout" {
 					wantUnread = 9
+				}
+				if changing {
+					for name, at := range inputMarks {
+						expected := float64(at.Sub(time.Unix(0, reply.Debug.Start)).Microseconds()) / 1000
+						// JSON exposes a wall-clock origin; permit two microseconds of
+						// rounding versus the monotonic timestamps used by markAt.
+						if math.Abs(reply.Debug.Phases[name]-expected) > 0.002 {
+							t.Errorf("discarded spare changed %s: got %v want input %v", name, reply.Debug.Phases[name], expected)
+						}
+					}
+					if scenario == "change" || scenario == "change-late-open" {
+						for name, at := range spareMarks {
+							discarded := float64(at.Sub(time.Unix(0, reply.Debug.Start)).Microseconds()) / 1000
+							if math.Abs(reply.Debug.Phases[name]-discarded) <= 0.002 {
+								t.Errorf("discarded spare timing applied for %s", name)
+							}
+						}
+					}
+					if _, ok := reply.Debug.Phases["capture_reopened"]; ok {
+						t.Error("discarded spare added capture_reopened")
+					}
 				}
 				if reply.Unread != wantUnread || reply.After != (changing || scenario == "sync-change") {
 					t.Errorf("wrong reply: %s", out.String())
@@ -222,6 +268,16 @@ func TestSeatScreenOverlap(t *testing.T) {
 				case <-done:
 				case <-time.After(time.Second):
 					t.Error("fake connection or handshake goroutine leaked")
+				}
+			}
+			if wantViews > 0 {
+				select {
+				case <-producerDone:
+				case <-time.After(time.Second):
+					t.Error("spare producer did not finish")
+				}
+				if (scenario == "change" || scenario == "change-late-open") && len(spareMarks) == 0 {
+					t.Error("discarded successful spare did not return timing metadata")
 				}
 			}
 			clients.l1.client.CloseIdleConnections()

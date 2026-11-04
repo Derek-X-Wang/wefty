@@ -291,7 +291,7 @@ jobs:
           docker pull --platform "$PLATFORM" "$pinned_reference"
           stage='runtime-conformance'
           scripts/test-computer-image-runtime.sh --image "$pinned_reference" --arch "$ARCH" --evidence "$evidence" \
-            --edge-process-pattern "$EDGE_PROCESS_PATTERN"
+            --edge-process-pattern "$EDGE_PROCESS_PATTERN" --reference-surface-probe
           if [[ $VARIANT == wayland ]]; then
             stage='wayland-furniture'
             scripts/test-computer-wayland-furniture.sh --image "$pinned_reference" --arch "$ARCH" \

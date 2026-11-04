@@ -406,6 +406,13 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 			return result
 		}
 		result.client, result.close = client, close
+		if hook, ok := ctx.Value(seatScreenSpareTestHookKey{}).(func(string, seatScreenOpenResult)); ok {
+			event := "input_opened"
+			if !printNote {
+				event = "spare_opened"
+			}
+			hook(event, result)
+		}
 		return result
 	}
 	mode := "view"
@@ -467,7 +474,14 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				defer cancelSpare()
 				ready := make(chan seatScreenOpenResult, 1)
 				spare = ready
-				go func() { ready <- open(spareCtx, "view", false) }()
+				go func() {
+					defer func() {
+						if hook, ok := ctx.Value(seatScreenSpareTestHookKey{}).(func(string, seatScreenOpenResult)); ok {
+							hook("spare_finished", seatScreenOpenResult{})
+						}
+					}()
+					ready <- open(spareCtx, "view", false)
+				}()
 			}
 			var e error
 			if remaining := time.Until(inputWritten.Add(seatScreenSettleLimit)); !frameAfterInput && remaining > 0 {

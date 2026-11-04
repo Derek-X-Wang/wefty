@@ -459,7 +459,7 @@ jobs:
           docker pull --platform "$PLATFORM" "$pinned_reference"
           stage='runtime-conformance'
           scripts/test-computer-image-runtime.sh --image "$pinned_reference" --arch "$ARCH" --evidence "$evidence" \
-            --edge-process-pattern "$EDGE_PROCESS_PATTERN"
+            --edge-process-pattern "$EDGE_PROCESS_PATTERN" --reference-surface-probe
           stage='image-measurement'
           scripts/measure-computer-image.sh --image "$pinned_reference" --arch "$ARCH" \
             --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-metrics.json"

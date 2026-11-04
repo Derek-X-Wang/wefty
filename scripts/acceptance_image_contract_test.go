@@ -1640,3 +1640,18 @@ func TestRealtimingLanesWriteTheProvenanceTheGateBinds(t *testing.T) {
 		}
 	}
 }
+
+func TestReferenceSurfaceProbeIsExplicitInBothReferenceLanes(t *testing.T) {
+	for _, name := range []string{"acceptance-image.yml", "acceptance-image-build.yml"} {
+		_, workflow := readWorkflow(t, "../.github/workflows/"+name)
+		if !strings.Contains(string(workflow), `--edge-process-pattern "$EDGE_PROCESS_PATTERN" --reference-surface-probe`) {
+			t.Fatalf("%s does not explicitly enable the reference surface", name)
+		}
+		if !strings.Contains(string(workflow), `pass("screen.held-view-current-frame")`) {
+			t.Fatalf("%s does not require held-view PASS", name)
+		}
+	}
+	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", `--reference-surface-probe) reference_surface_args=(--reference-surface-probe)`, `"${reference_surface_args[@]}"`)
+	assertFileContains(t, "../cmd/wefty-computer-conformance/main.go", `flags.BoolVar(&config.ReferenceSurfaceProbe, "reference-surface-probe", false`)
+	assertFileContains(t, "../docs/guides/computer-images.md", "--reference-surface-probe", "NOT-RUN")
+}

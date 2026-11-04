@@ -84,14 +84,15 @@ func (e *TeardownFailure) Error() string {
 func (e *TeardownFailure) Unwrap() error { return e.Err }
 
 type RuntimeConfig struct {
-	Image              string
-	RepairImage        string
-	Runtime            string
-	Platform           string
-	InputOraclePath    string
-	DriverOraclePath   string
-	EdgeProcessPattern string
-	ReceiptPath        string
+	Image                 string
+	RepairImage           string
+	Runtime               string
+	Platform              string
+	InputOraclePath       string
+	DriverOraclePath      string
+	EdgeProcessPattern    string
+	ReceiptPath           string
+	ReferenceSurfaceProbe bool
 	// MutationProfile is used only by repository acceptance fixtures to mutate
 	// Docker's approximation of the production profile or teardown state.
 	MutationProfile string
@@ -231,47 +232,74 @@ func (r *runtimeRunner) run(ctx context.Context) (err error) {
 	if r.mutationFailed() {
 		return nil
 	}
+	// Input and edge oracles have finished; probe before the persistence
+	// restart so the existing input oracle is available without another wait.
+	r.checkHeldViewFrames(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	if err := r.checkPersistence(ctx); err != nil {
 		return err
 	}
 	if r.mutationFailed() {
 		return nil
 	}
-	// acceptance-image.yml runs this checker on both image variants, including
-	// the real Wayland/neatvnc image. Keep the pixel probe after other oracles.
-	inputReady, _, _, readyErr := r.waitInputReady(ctx)
-	if readyErr != nil || !inputReady {
-		r.record("screen.held-view-current-frame", StatusFail, fmt.Sprintf("colour surface desktop unavailable: ready=%t error=%v", inputReady, readyErr))
-		return nil
+	return nil
+}
+
+// Reference-only surface setup is opt-in. Missing optional evidence never
+// becomes FAIL and never enters the 50-second input-readiness wait.
+func (r *runtimeRunner) checkHeldViewFrames(ctx context.Context) {
+	const id = "screen.held-view-current-frame"
+	if !r.config.ReferenceSurfaceProbe {
+		r.record(id, StatusNotRun, "--reference-surface-probe was not supplied")
+		return
 	}
-	// The Wayland image uses Chromium app mode, with no address bar. Launch
-	// a disposable app window rather than assuming Ctrl+L can navigate it.
-	launch := r.execShell(ctx, `for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
- if [ -S "$candidate" ]; then export WAYLAND_DISPLAY="${candidate##*/}"; break; fi
- done
- ozone=
- if [ -n "${WAYLAND_DISPLAY:-}" ]; then ozone=--ozone-platform=wayland; else export DISPLAY=:$WEFTY_COMPUTER_VIEW_PORT; fi
- chromium $ozone --no-sandbox --disable-gpu --no-first-run --no-default-browser-check --start-fullscreen --user-data-dir="$HOME/.config/chromium" --app="$1" >/tmp/wefty-held-view.log 2>&1 &`, HeldViewProbeURL())
-	if launch.exitCode != 0 {
-		r.record("screen.held-view-current-frame", StatusFail, "could not launch colour probe surface: "+launch.stderr)
-		return nil
+	if r.config.InputOraclePath == "" {
+		r.record(id, StatusNotRun, "no --input-oracle-path was supplied")
+		return
+	}
+	input, err := r.readInputObservation(ctx)
+	ready := input.Ready == nil || *input.Ready
+	if err != nil || !ready {
+		r.record(id, StatusNotRun, fmt.Sprintf("reference input oracle unavailable: error=%v ready=%t", err, ready))
+		return
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	observations, err := ProbeHeldViewFrames(probeCtx, func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
-		port := r.viewPort
-		if mode == "input" {
-			port = r.controlPort
-		}
-		return openFrameProbe(ctx, port)
+	observations, err := ProbeHeldViewFrames(probeCtx, HeldViewProbeOptions{
+		Open: func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
+			port := r.viewPort
+			if mode == "input" {
+				port = r.controlPort
+			}
+			return openFrameProbe(ctx, port)
+		},
+		Prepare: func(ctx context.Context, attempt int) (string, error) {
+			result := r.execShell(ctx, HeldViewProbeLaunchScript, HeldViewProbeURL())
+			detail := fmt.Sprintf("launch attempt=%d shell_exit=%d stdout=%s stderr=%s", attempt, result.exitCode, result.stdout, result.stderr)
+			if result.exitCode != 0 {
+				return detail, fmt.Errorf("reference Chromium preparation unavailable")
+			}
+			return detail, nil
+		},
+		Diagnostics: func(ctx context.Context) string {
+			result := r.execShell(ctx, HeldViewProbeDiagnosticsScript)
+			return fmt.Sprintf("diagnostics_exit=%d %s %s", result.exitCode, result.stdout, result.stderr)
+		},
+		Report: r.diagnosticLog,
 	})
 	detail, _ := json.Marshal(observations)
 	if err != nil {
-		r.record("screen.held-view-current-frame", StatusFail, fmt.Sprintf("%s: %v", detail, err))
+		var unavailable *HeldViewSetupUnavailableError
+		status := StatusFail
+		if errors.As(err, &unavailable) {
+			status = StatusNotRun
+		}
+		r.record(id, status, fmt.Sprintf("%s: %v", detail, err))
 	} else {
-		r.record("screen.held-view-current-frame", StatusPass, string(detail))
+		r.record(id, StatusPass, string(detail))
 	}
-	return nil
 }
 
 func (r *runtimeRunner) mutationFailed() bool {

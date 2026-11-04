@@ -176,6 +176,13 @@ go build -o ./wefty-computer-conformance ./cmd/wefty-computer-conformance
   --receipt ./computer-conformance.json
 ```
 
+`--reference-surface-probe` explicitly opts in to the reference images' Chromium
+profile and display conventions for `screen.held-view-current-frame`. Leave it
+off for other images. Missing input evidence or unavailable preparation records
+`NOT-RUN` without a readiness wait. Reference-image CI enables this flag and
+requires the check to pass. Setup retries are bounded inside the probe; its held
+connection's first-frame assertion is never retried.
+
 Use `--runtime nerdctl` for a containerd installation. The checker applies the
 GPU-free Computer profile, injects fresh loopback ports, drives the exact
 WebSocket/RFB transport (including byte-identical key and pointer input over
