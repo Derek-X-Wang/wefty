@@ -187,7 +187,10 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 	})
 	evidence.recordMetadata(t)
 
-	ports := reserveDistinctPorts(t, 4)
+	// Every port in the final absence sweep must belong to a service in this
+	// test. An unused, released ephemeral port can be reused by an unrelated
+	// listener and says nothing about removal (#1415).
+	ports := reserveDistinctPorts(t, 3)
 	primary, primaryCreate := harness.submitEchoServiceWithDispatchKey(t, ports[0], "realtiming-primary")
 	sibling, siblingCreate := harness.submitEchoServiceWithDispatchKey(t, ports[1], "realtiming-sibling")
 	assertCreateHasNoRunID(t, primaryCreate)
@@ -494,9 +497,9 @@ func TestServiceLifecycleAndRemovalAtProductionTimings(t *testing.T) {
 		assertNoServiceResidue(t, harness, backoff.JobID)
 	}
 
-	offline, offlineCreate := harness.submitEchoServiceWithDispatchKey(t, ports[3], "realtiming-offline")
+	offline, offlineCreate := harness.submitEchoServiceWithDispatchKey(t, ports[2], "realtiming-offline")
 	evidence.write("create-offline.json", offlineCreate)
-	offlineClient := harness.publishedHTTPClient(t, ports[3])
+	offlineClient := harness.publishedHTTPClient(t, ports[2])
 	offlineHealth := waitForHealth(t, offlineClient, "http://offline.invalid", harness.agent)
 	harness.waitForJobState(t, offline.JobID, contract.JobClassService, contract.JobRunning, 45*time.Second)
 	offlineRoot := managedServiceRoot(harness, offline.JobID)
@@ -849,7 +852,7 @@ func assertPublishedUnavailable(t *testing.T, harness *acceptanceHarness, port i
 	connection, err := harness.dialPublished(ctx, port)
 	if err == nil {
 		_ = connection.Close()
-		t.Fatalf("published port %d still accepted an identity-bearing connection", port)
+		t.Fatalf("published port %d still accepted a TCP connection", port)
 	}
 }
 
