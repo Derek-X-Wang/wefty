@@ -61,6 +61,8 @@ func TestHostVMRecreateRefusalFromRealBinary(t *testing.T) {
 		want    string
 	}{
 		{"retained", &lima.RecreateBlockedError{Blockers: []string{"Computer Storage generation stopped-generation", "Backup copy kept-copy"}}, "stopped-generation"},
+		{"service", &lima.RecreateBlockedError{Blockers: []string{"service data for job job_stopped_service"}}, "job_stopped_service"},
+		{"Custody", &lima.RecreateBlockedError{Blockers: []string{"Custody write record for Computer computer_exporting, export export_kept (started)"}}, "computer_exporting"},
 		{"unknown", &lima.RecreateBlockedError{Reason: "host VM is stopped; durable inventory unavailable"}, "durable inventory unavailable"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -81,13 +83,18 @@ func TestHostVMRecreateRefusalFromRealBinary(t *testing.T) {
 				if err := json.Unmarshal([]byte(output), &response); err != nil || response.Error.Code != "host_vm_recreate_blocked" || response.Error.Retryable {
 					t.Fatalf("output=%s decode=%v", output, err)
 				}
-				if test.name == "retained" {
+				if len(test.failure.Blockers) != 0 {
 					if _, ok := response.Error.Details["reason"]; ok {
 						t.Fatalf("empty reason: %s", output)
 					}
 					blockers, ok := response.Error.Details["blockers"].([]any)
-					if !ok || len(blockers) != 2 || !strings.Contains(response.Error.Message, "kept-copy") {
+					if !ok || len(blockers) != len(test.failure.Blockers) {
 						t.Fatalf("lost blockers: %s", output)
+					}
+					for i, want := range test.failure.Blockers {
+						if blockers[i] != want || !strings.Contains(response.Error.Message, want) {
+							t.Fatalf("lost blocker %q: %s", want, output)
+						}
 					}
 				} else {
 					if response.Error.Details["reason"] != test.failure.Reason {

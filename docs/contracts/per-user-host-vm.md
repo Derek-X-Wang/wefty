@@ -40,7 +40,9 @@ The guest helper remains root inside Linux. Its installer uses guest `sudo`
 through `limactl shell`; no `sudo` command runs on macOS. Linux helper version
 must match the installed node-agent version. The normal node loop retains its
 existing intent and recovery authority. Recreate still reaches the sole
-serialized, inventory-guarded delete in `runner/lima/supervisor.go`.
+serialized, inventory-guarded delete in `runner/lima/supervisor.go`. It refuses
+while Computer Storage, Backup copies, service data or Custody write records
+remain, or their absence cannot be proved (see `agent-local-lifecycle.md`).
 
 A repeated setup uses the saved assets and fixed sizing without requiring the
 input flag again. It does not reload unchanged services. Node-agent startup
