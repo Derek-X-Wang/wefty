@@ -9,6 +9,7 @@ For each x11vnc flag variant, measure on an idle 1280x720 Xvfb screen:
 import os, socket, struct, subprocess, sys, time
 
 PORT = 5909
+TIMEOUT = 20
 VARIANTS = [
     ("default", []),
     ("-nonap -sb 0", ["-nonap", "-sb", "0"]),
@@ -27,7 +28,7 @@ def recvn(s, n):
 
 
 def connect():
-    s = socket.create_connection(("127.0.0.1", PORT))
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=TIMEOUT)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     recvn(s, 12)
     s.sendall(b"RFB 003.008\n")
@@ -88,6 +89,8 @@ def ms(t0):
 
 
 def run(name, flags):
+    global PORT
+    PORT += 1
     p = subprocess.Popen(["x11vnc", "-display", ":9", "-rfbport", str(PORT), "-localhost",
                           "-forever", "-shared", "-nopw", "-quiet", "-norc"] + flags,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -138,7 +141,12 @@ def main():
     time.sleep(2)
     print("nproc=%d arch=%s" % (os.cpu_count(), os.uname().machine), flush=True)
     for name, flags in VARIANTS:
-        run(name, flags)
+        print("START %s port=%d" % (name, PORT + 1), flush=True)
+        try:
+            run(name, flags)
+        except Exception as e:
+            print("RESULT %-26s ERROR %r" % (name, e), flush=True)
+            subprocess.run(["pkill", "-f", "x11vnc -display"])
     x.terminate()
 
 
