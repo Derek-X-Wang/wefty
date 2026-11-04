@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -27,6 +28,9 @@ func writeExecDependencyHints(caller context.Context, stderr io.Writer, event ex
 		{"node_modules", `wefty: this checkout's node_modules is Git-ignored, so the run did not get it; install inside the command, for example "bun install --frozen-lockfile && ..." or "pnpm install --frozen-lockfile && ...".`},
 		{".venv", `wefty: this checkout's .venv is Git-ignored, so the run did not get it; install inside the command, for example "uv sync && ...".`},
 	} {
+		if slices.Contains(capture.noticedDependencies, dependency.name) {
+			continue
+		}
 		for dir := folder; ; dir = filepath.Dir(dir) {
 			path := filepath.Join(dir, dependency.name)
 			info, err := os.Stat(filepath.Join(capture.localRoot, path))
