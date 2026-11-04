@@ -224,6 +224,9 @@ func newAgentSession(
 }
 
 func (session *agentSession) close() {
+	if session != nil && session.removals != nil {
+		session.removals.stopAcknowledgements()
+	}
 	if session != nil {
 		session.stopUpgradeServiceLeases(true)
 	}
@@ -911,6 +914,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		session.stopUpgradeServiceLeases(false)
 		session.attempts.Wait()
 		if session.removals != nil {
+			session.removals.stopAcknowledgements()
 			session.removals.wait()
 		}
 		if session.backups != nil {
@@ -1562,9 +1566,16 @@ func (session *agentSession) logHeartbeatError(err error) {
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
+	var removalFailures <-chan removalAcknowledgementFailure
+	if session.removals != nil {
+		removalFailures = session.removals.ackFailures
+	}
 	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
 	nextDelay := session.heartbeatInterval
 	for {
+		var response l1.HeartbeatResponse
+		var err error
+		var removalFailure *removalAcknowledgementFailure
 		timer := session.clock.NewTimer(nextDelay)
 		select {
 		case <-ctx.Done():
@@ -1572,11 +1583,12 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			return
 		case <-timer.C():
 		case <-session.heartbeatWake:
+		case failure := <-removalFailures:
+			err = failure.err
+			removalFailure = &failure
 		}
 		stopTimer(timer)
-		var response l1.HeartbeatResponse
-		var err error
-		if session.registration.AgentGenerationID != "" {
+		if err == nil && session.registration.AgentGenerationID != "" {
 			var retiring bool
 			retiring, err = session.observeGeneration(ctx)
 			if err == nil && retiring {
@@ -1604,6 +1616,9 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 		}
 		if err != nil {
 			observedRejoin := session.rejoinSequence.Load()
+			if removalFailure != nil {
+				observedRejoin = removalFailure.observedRejoin
+			}
 			session.logHeartbeatError(err)
 			classification := classifyAgentProtocolError(err)
 			if session.registration.AgentGenerationID != "" && classification.destination != errorDestinationTransient {
@@ -2080,6 +2095,9 @@ func (session *agentSession) waitWithoutHeartbeat(ctx context.Context, duration 
 }
 
 func (session *agentSession) quarantine(ctx context.Context, err error) error {
+	if session.removals != nil {
+		session.removals.stopAcknowledgements()
+	}
 	session.setSession(LifecycleQuarantined, DefaultSessionBackoffMax, err)
 	select {
 	case <-ctx.Done():
