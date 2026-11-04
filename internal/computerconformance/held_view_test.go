@@ -3,8 +3,8 @@ package computerconformance
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"image/color"
 	"io"
 	"net"
@@ -16,15 +16,18 @@ import (
 	"github.com/Derek-X-Wang/wefty/internal/rfbclient"
 )
 
-func TestHeldViewProbeObservesViewAndNeverRetriesFirstFrame(t *testing.T) {
-	for _, stale := range []bool{false, true} {
-		t.Run(fmt.Sprint("stale=", stale), func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
+func TestHeldViewExperimentTrialsAndSummary(t *testing.T) {
+	for _, scenario := range []string{"all-fresh", "first-held-stale", "both-stale", "fresh-stale"} {
+		t.Run(scenario, func(t *testing.T) {
+			expected := []string{"A", "B", "B", "A", "A", "B", "B", "A", "A", "B", "B", "A"}
+			var tick, redObserved, greenObserved atomic.Int64
+			tick.Store(time.Unix(100, 0).UnixNano())
 			var green atomic.Bool
-			var observerGreen, observerRed atomic.Bool
-			var viewOpens, heldRequests, controlRequests, launches atomic.Int32
+			var activeViews, viewOpens, viewRequests, controls, launches atomic.Int32
+			var lines []string
 			options := HeldViewProbeOptions{
+				Now:   func() time.Time { return time.Unix(0, tick.Load()) },
+				Sleep: func(_ context.Context, d time.Duration) error { tick.Add(int64(d)); return nil },
 				Prepare: func(context.Context, int) (string, error) {
 					if launches.Add(1) == 1 {
 						return "shell_exit=1", errors.New("transient launch failure")
@@ -33,70 +36,137 @@ func TestHeldViewProbeObservesViewAndNeverRetriesFirstFrame(t *testing.T) {
 					return "shell_exit=0 launch_pid=test", nil
 				},
 				Diagnostics: func(context.Context) string { return "chromium_exit=1 log_tail=launch diagnostic" },
+				Report:      func(line string) { lines = append(lines, line) },
 				Open: func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
-					held := false
+					trial := int(controls.Load())
 					if mode == "input" {
-						observerRed.Store(false)
+						trial = int(controls.Add(1))
 					}
+					if trial < 1 || trial > 12 {
+						t.Fatalf("unexpected control count %d", trial)
+					}
+					kind := expected[trial-1]
 					if mode == "view" {
-						held = viewOpens.Add(1)%2 == 0
+						viewOpens.Add(1)
+						if activeViews.Add(1) != 1 {
+							t.Error("extra view connection during a trial")
+						}
+						if tick.Load()-redObserved.Load() < int64(300*time.Millisecond) {
+							t.Error("view opened before red separation interval")
+						}
+						if (kind == "A" && green.Load()) || (kind == "B" && !green.Load()) {
+							t.Errorf("wrong view open point: trial=%d kind=%s green=%t", trial, kind, green.Load())
+						}
 					}
-					if held && (green.Load() || !observerRed.Load()) {
-						t.Error("held connection opened before observer red")
-					}
-					if held {
-						observerGreen.Store(false)
-					}
-					return heldViewFakeClient(t, ctx, func(key uint32) {
+					var requests atomic.Int32
+					client, closeClient, err := heldViewFakeClient(t, ctx, func(key uint32) {
 						if key == 'r' {
+							if activeViews.Load() != 0 {
+								t.Error("previous view still open at red reset")
+							}
 							green.Store(false)
 						} else {
+							if key != 'a' {
+								t.Errorf("green keysym=%#x want delay-0 a", key)
+							}
+							want := int32(0)
+							if kind == "A" {
+								want = 1
+							}
+							if activeViews.Load() != want {
+								t.Errorf("trial %d kind=%s: view count at green tap=%d", trial, kind, activeViews.Load())
+							}
 							green.Store(true)
 						}
 					}, func() color.RGBA {
 						if mode == "input" {
-							controlRequests.Add(1)
-							return color.RGBA{G: 255, A: 255}
-						}
-						if held {
-							heldRequests.Add(1)
-							if !observerGreen.Load() {
-								t.Error("held first request preceded view observer green")
+							if green.Load() {
+								greenObserved.Store(tick.Load())
+								return color.RGBA{G: 255, A: 255}
 							}
-							if stale {
-								return color.RGBA{R: 255, A: 255}
-							}
-						} else if green.Load() {
-							observerGreen.Store(true)
-						} else {
-							observerRed.Store(true)
+							redObserved.Store(tick.Load())
+							return color.RGBA{R: 255, A: 255}
 						}
-						if green.Load() {
-							return color.RGBA{G: 255, A: 255}
+						viewRequests.Add(1)
+						if requests.Add(1) != 1 {
+							t.Error("measurement retried on view connection")
 						}
-						return color.RGBA{R: 255, A: 255}
+						if tick.Load()-greenObserved.Load() < int64(250*time.Millisecond) {
+							t.Error("view request preceded extra control-green settle")
+						}
+						stale := scenario == "both-stale" || scenario == "first-held-stale" && trial == 1 || scenario == "fresh-stale" && kind == "B"
+						if stale {
+							return color.RGBA{R: 255, A: 255}
+						}
+						return color.RGBA{G: 255, A: 255}
 					})
+					return client, func() {
+						closeClient()
+						if mode == "view" {
+							activeViews.Add(-1)
+						}
+					}, err
 				},
 			}
-			observations, err := ProbeHeldViewFrames(ctx, options)
-			if controlRequests.Load() != 0 {
-				t.Error("freshness oracle read control framebuffer")
+			result, err := ProbeHeldViewFrames(t.Context(), options)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if stale {
-				var unavailable *HeldViewSetupUnavailableError
-				if err == nil || errors.As(err, &unavailable) || !strings.Contains(err.Error(), "no retry") || !strings.Contains(err.Error(), "ff0000/ff") || !strings.Contains(err.Error(), "log_tail=launch diagnostic") {
-					t.Fatalf("stale assertion: %v", err)
+			if len(result.Trials) != 12 || controls.Load() != 12 || viewOpens.Load() != 12 || viewRequests.Load() != 12 || activeViews.Load() != 0 {
+				t.Fatalf("measurements changed/retried: trials=%d control=%d view=%d requests=%d open=%d", len(result.Trials), controls.Load(), viewOpens.Load(), viewRequests.Load(), activeViews.Load())
+			}
+			for i, trial := range result.Trials {
+				if trial.Kind != expected[i] || trial.Index != i+1 {
+					t.Errorf("trial %d: %+v", i+1, trial)
 				}
-				if heldRequests.Load() != 1 || launches.Load() != 2 || viewOpens.Load() != 2 {
-					t.Fatalf("stale frame retried: requests=%d launches=%d opens=%d", heldRequests.Load(), launches.Load(), viewOpens.Load())
+				if trial.FirstRequestMS < trial.ControlGreenMS+250 {
+					t.Errorf("trial did not settle after control green: %+v", trial)
 				}
-			} else {
-				if err != nil || len(observations) != 3 || heldRequests.Load() != 3 {
-					t.Fatalf("probe result: observations=%+v requests=%d error=%v", observations, heldRequests.Load(), err)
+				wantColour := "00ff00/ff"
+				if trial.Result == "stale" {
+					wantColour = "ff0000/ff"
 				}
-				if len(observations[0].SetupAttempts) != 2 || !strings.Contains(observations[0].SetupAttempts[0], "shell_exit=1") {
-					t.Fatal("setup retry diagnostics lost")
+				if strings.Count(trial.Pixels, wantColour) != 4 {
+					t.Errorf("missing sample pixels: %+v", trial)
 				}
+			}
+			wantSummary := "held-vs-fresh summary: A stale=0/6 fresh=6/6; B stale=0/6 fresh=6/6"
+			switch scenario {
+			case "first-held-stale":
+				wantSummary = "held-vs-fresh summary: A stale=1/6 fresh=5/6; B stale=0/6 fresh=6/6"
+			case "both-stale":
+				wantSummary = "held-vs-fresh summary: A stale=6/6 fresh=0/6; B stale=6/6 fresh=0/6"
+			case "fresh-stale":
+				wantSummary = "held-vs-fresh summary: A stale=0/6 fresh=6/6; B stale=6/6 fresh=0/6"
+			}
+			if result.Summary != wantSummary || lines[len(lines)-1] != wantSummary {
+				t.Fatalf("summary=%q last log=%q", result.Summary, lines[len(lines)-1])
+			}
+			logged := 0
+			for _, line := range lines {
+				if !strings.HasPrefix(line, "held-vs-fresh trial: ") {
+					continue
+				}
+				var trial HeldViewTrial
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "held-vs-fresh trial: ")), &trial); err != nil {
+					t.Fatal(err)
+				}
+				if trial.Index != logged+1 {
+					t.Errorf("trial log order: %+v", trial)
+				}
+				logged++
+			}
+			if logged != 12 {
+				t.Errorf("trial JSON lines=%d", logged)
+			}
+			if result.HeldOnlyStale() != (scenario == "first-held-stale") {
+				t.Error("Seat experimental failure rule changed")
+			}
+			if result.HasStaleHeld() != (scenario == "first-held-stale" || scenario == "both-stale") {
+				t.Error("runtime experimental failure rule changed")
+			}
+			if launches.Load() != 2 || !strings.Contains(result.SetupAttempts[0], "shell_exit=1") || !strings.Contains(result.SetupAttempts[0], "log_tail=launch diagnostic") {
+				t.Error("setup retry diagnostics lost")
 			}
 		})
 	}
@@ -104,7 +174,9 @@ func TestHeldViewProbeObservesViewAndNeverRetriesFirstFrame(t *testing.T) {
 
 func TestHeldViewProbeSetupUnavailableHasBoundedAttempts(t *testing.T) {
 	attempts := 0
-	_, err := ProbeHeldViewFrames(t.Context(), HeldViewProbeOptions{
+	var lines []string
+	result, err := ProbeHeldViewFrames(t.Context(), HeldViewProbeOptions{
+		Report: func(line string) { lines = append(lines, line) },
 		Prepare: func(context.Context, int) (string, error) {
 			attempts++
 			return "shell_exit=127", errors.New("Chromium unavailable")
@@ -116,8 +188,11 @@ func TestHeldViewProbeSetupUnavailableHasBoundedAttempts(t *testing.T) {
 		},
 	})
 	var unavailable *HeldViewSetupUnavailableError
-	if !errors.As(err, &unavailable) || attempts != 3 || !strings.Contains(err.Error(), "log_tail=missing binary") {
+	if !errors.As(err, &unavailable) || attempts != 3 || !strings.Contains(strings.Join(result.SetupAttempts, "; "), "log_tail=missing binary") {
 		t.Fatalf("attempts=%d error=%v", attempts, err)
+	}
+	if result.Summary != "held-vs-fresh summary: A stale=0/6 fresh=0/6; B stale=0/6 fresh=0/6" || lines[len(lines)-1] != result.Summary {
+		t.Errorf("missing failure summary: %q", result.Summary)
 	}
 }
 

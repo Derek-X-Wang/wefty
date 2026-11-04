@@ -7,6 +7,7 @@ import (
 	"crypto/sha1" // #nosec G505 -- RFC 6455 mandates SHA-1 for the public handshake nonce.
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -390,6 +391,8 @@ type HeldViewProbeOptions struct {
 	Prepare     func(context.Context, int) (string, error)
 	Diagnostics func(context.Context) string
 	Report      func(string)
+	Now         func() time.Time
+	Sleep       func(context.Context, time.Duration) error
 }
 
 // HeldViewSetupUnavailableError is optional evidence, distinct from a failed
@@ -399,22 +402,61 @@ type HeldViewSetupUnavailableError struct{ Err error }
 func (e *HeldViewSetupUnavailableError) Error() string { return e.Err.Error() }
 func (e *HeldViewSetupUnavailableError) Unwrap() error { return e.Err }
 
-// HeldViewObservation records requested delays separately from observed pixel
-// times. A delayed application redraw is not a screenshot freshness proof.
-type HeldViewObservation struct {
-	RedrawDelayMS    int      `json:"redraw_delay_ms"`
-	ChangeObservedMS int64    `json:"change_observed_ms"`
-	FirstRequestMS   int64    `json:"first_request_ms"`
-	SetupAttempts    []string `json:"setup_attempts"`
-	started          time.Time
+// HeldViewTrial is one independent colour change and first view request.
+// A holds its view across the change; B opens view only after settling.
+type HeldViewTrial struct {
+	Kind           string `json:"kind"`
+	Index          int    `json:"index"`
+	Pixels         string `json:"pixels"`
+	Result         string `json:"result"`
+	ControlGreenMS int64  `json:"control_green_ms"`
+	FirstRequestMS int64  `json:"first_request_ms"`
+	Error          string `json:"error,omitempty"`
 }
 
-// ProbeHeldViewFrames uses a separate view observer to establish both colours
-// on the backend being tested. Setup may retry at most three times per case.
-// The selected held connection's first-frame assertion is NEVER retried.
-func ProbeHeldViewFrames(ctx context.Context, options HeldViewProbeOptions) ([]HeldViewObservation, error) {
-	var observations []HeldViewObservation
-	attemptNumber := 0
+type HeldViewExperiment struct {
+	Trials        []HeldViewTrial `json:"trials"`
+	Summary       string          `json:"summary"`
+	SetupAttempts []string        `json:"setup_attempts,omitempty"`
+	Error         string          `json:"error,omitempty"`
+}
+
+func (r HeldViewExperiment) count(kind, result string) int {
+	count := 0
+	for _, trial := range r.Trials {
+		if trial.Kind == kind && trial.Result == result {
+			count++
+		}
+	}
+	return count
+}
+func (r HeldViewExperiment) HasStaleHeld() bool { return r.count("A", "stale") > 0 }
+
+// HeldOnlyStale is the Seat lane's experimental failure rule. All six B
+// measurements must be fresh; errors are reported separately.
+func (r HeldViewExperiment) HeldOnlyStale() bool {
+	return r.HasStaleHeld() && r.count("B", "fresh") == 6
+}
+func (r HeldViewExperiment) summary() string {
+	return fmt.Sprintf("held-vs-fresh summary: A stale=%d/6 fresh=%d/6; B stale=%d/6 fresh=%d/6", r.count("A", "stale"), r.count("A", "fresh"), r.count("B", "stale"), r.count("B", "fresh"))
+}
+
+// ProbeHeldViewFrames measures held and fresh connections in separate trials.
+// Control is the ONLY observer. No view connection exists except the one being
+// measured, and each such connection receives exactly one framebuffer request.
+// Stale pixels are data: they never trigger retries or end the experiment.
+func ProbeHeldViewFrames(ctx context.Context, options HeldViewProbeOptions) (experiment HeldViewExperiment, resultErr error) {
+	if options.Now == nil {
+		options.Now = time.Now
+	}
+	if options.Sleep == nil {
+		options.Sleep = sleepContext
+	}
+	report := func(message string) {
+		if options.Report != nil {
+			options.Report(message)
+		}
+	}
 	diagnostics := func() string {
 		if options.Diagnostics == nil {
 			return ""
@@ -423,142 +465,176 @@ func ProbeHeldViewFrames(ctx context.Context, options HeldViewProbeOptions) ([]H
 		defer cancel()
 		return options.Diagnostics(diagnosticCtx)
 	}
-	report := func(message string) {
-		if options.Report != nil {
-			options.Report(message)
+	defer func() {
+		if resultErr != nil {
+			experiment.Error = resultErr.Error()
 		}
-	}
-	for i, delay := range []int{0, 225, 300} {
-		var attempts []string
-		var lastErr error
+		experiment.Summary = experiment.summary()
+		report(experiment.Summary) // Always print accumulated data before callers fail.
+	}()
+	attemptNumber := 0
+	for index, kind := range []string{"A", "B", "B", "A", "A", "B", "B", "A", "A", "B", "B", "A"} {
+		var control *rfbclient.Client
+		var closeControl func()
+		var trialCtx context.Context
+		var cancelTrial context.CancelFunc
+		var setupErr error
 		for attempt := 1; attempt <= 3; attempt++ {
 			attemptNumber++
-			setupCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-			held, closeHeld, observation, detail, err := prepareHeldView(setupCtx, options, uint32('a'+i), delay, attemptNumber, i == 0 || attempt > 1)
-			if err != nil {
-				cancel()
-				lastErr = err
-				message := fmt.Sprintf("redraw=%dms setup attempt=%d: %s; error=%v; %s", delay, attempt, detail, err, diagnostics())
-				attempts = append(attempts, message)
-				report(message)
-				if ctx.Err() != nil {
-					break
+			trialCtx, cancelTrial = context.WithCancel(ctx)
+			setupCtx, cancelSetup := context.WithTimeout(trialCtx, 8*time.Second)
+			// Bound Dial and setup I/O, then remove the setup deadline on selection.
+			// The selected control must remain alive for the whole measurement.
+			stopSetup := context.AfterFunc(setupCtx, cancelTrial)
+			var detail string
+			control, closeControl, detail, setupErr = prepareHeldViewControl(setupCtx, trialCtx, options, attemptNumber, index == 0 || attempt > 1)
+			stopped := stopSetup()
+			if setupErr == nil && !stopped {
+				setupErr = setupCtx.Err()
+			}
+			cancelSetup()
+			message := fmt.Sprintf("trial=%d kind=%s setup attempt=%d: %s", index+1, kind, attempt, detail)
+			if setupErr != nil {
+				if closeControl != nil {
+					closeControl()
 				}
-				continue
+				cancelTrial()
+				message += fmt.Sprintf("; error=%v; %s", setupErr, diagnostics())
 			}
-			message := fmt.Sprintf("redraw=%dms setup attempt=%d ready: %s", delay, attempt, detail)
-			attempts = append(attempts, message)
+			experiment.SetupAttempts = append(experiment.SetupAttempts, message)
 			report(message)
-			observation.SetupAttempts = attempts
-			observation.FirstRequestMS = time.Since(observation.started).Milliseconds()
-			// No request has been sent on held. This read and assertion are outside
-			// the retryable setup; stale pixels or a read failure fail immediately.
-			frame, frameErr := held.Frame()
-			closeHeld()
-			cancel()
-			observations = append(observations, observation)
-			if frameErr != nil {
-				return observations, fmt.Errorf("held first frame failed (no retry): %w; %s; %s", frameErr, strings.Join(attempts, "; "), diagnostics())
+			if setupErr == nil {
+				break
 			}
-			if !probeFrameColour(frame, color.RGBA{G: 255, A: 255}) {
-				return observations, fmt.Errorf("held first frame stale (no retry), redraw=%dms pixels=%s; %s; %s", delay, probeFrameSamples(frame), strings.Join(attempts, "; "), diagnostics())
+			if ctx.Err() != nil {
+				break
 			}
-			lastErr = nil
-			break
 		}
-		if lastErr != nil {
-			return observations, &HeldViewSetupUnavailableError{Err: fmt.Errorf("held-view setup unavailable: %w; %s", lastErr, strings.Join(attempts, "; "))}
+		if setupErr != nil {
+			return experiment, &HeldViewSetupUnavailableError{Err: fmt.Errorf("held-vs-fresh setup unavailable: %w", setupErr)}
+		}
+		trial, err := measureHeldViewTrial(trialCtx, options, control, kind, index+1)
+		closeControl()
+		cancelTrial()
+		if err != nil {
+			trial.Result = "error"
+			trial.Error = fmt.Sprintf("%v; %s", err, diagnostics())
+		}
+		experiment.Trials = append(experiment.Trials, trial)
+		payload, _ := json.Marshal(trial)
+		report("held-vs-fresh trial: " + string(payload))
+		if err != nil {
+			return experiment, fmt.Errorf("trial %d kind=%s measurement failed (no retry): %s", index+1, kind, trial.Error)
 		}
 	}
-	return observations, nil
+	return experiment, nil
 }
 
-func prepareHeldView(ctx context.Context, options HeldViewProbeOptions, key uint32, delay, attempt int, launch bool) (held *rfbclient.Client, closeHeld func(), observation HeldViewObservation, detail string, resultErr error) {
+func prepareHeldViewControl(setupCtx, connectionCtx context.Context, options HeldViewProbeOptions, attempt int, launch bool) (control *rfbclient.Client, closeControl func(), detail string, resultErr error) {
 	var notes []string
 	defer func() { detail = strings.Join(notes, "; ") }()
 	if launch && options.Prepare != nil {
-		note, err := options.Prepare(ctx, attempt)
+		note, err := options.Prepare(setupCtx, attempt)
 		notes = append(notes, note)
 		if err != nil {
-			return nil, nil, observation, "", err
+			return nil, nil, "", err
 		}
 	}
-	control, closeControl, err := options.Open(ctx, "input")
-	if err != nil {
-		return nil, nil, observation, "", err
+	control, closeControl, resultErr = options.Open(connectionCtx, "input")
+	if resultErr != nil {
+		return nil, nil, "", resultErr
 	}
-	defer closeControl()
-	observer, closeObserver, err := options.Open(ctx, "view")
-	if err != nil {
-		return nil, nil, observation, "", err
-	}
-	defer closeObserver()
-	tap := func(sym uint32) error {
-		if err := control.Key(sym, true); err != nil {
-			return err
-		}
-		return control.Key(sym, false)
-	}
-	waitColour := func(want color.RGBA) error {
-		pixels := "unavailable"
-		for {
-			frame, err := observer.Frame()
-			if err != nil {
-				return fmt.Errorf("view observer: %w; last pixels=%s", err, pixels)
-			}
-			pixels = probeFrameSamples(frame)
-			if probeFrameColour(frame, want) {
-				notes = append(notes, "view observer pixels="+pixels)
-				return nil
-			}
-			if err := sleepContext(ctx, 20*time.Millisecond); err != nil {
-				return fmt.Errorf("view observer: %w; last pixels=%s", err, pixels)
-			}
-		}
-	}
-	red := color.RGBA{R: 255, A: 255}
 	if launch {
-		if err := waitColour(red); err != nil {
-			return nil, nil, observation, "", err
+		pixels, err := waitHeldViewColour(setupCtx, options, control, color.RGBA{R: 255, A: 255})
+		notes = append(notes, "control ready pixels="+pixels)
+		if err != nil {
+			return control, closeControl, "", err
 		}
 	}
 	if err := control.Pointer(control.Width/2, control.Height/2, 1); err != nil {
-		return nil, nil, observation, "", err
+		return control, closeControl, "", err
 	}
 	if err := control.Pointer(control.Width/2, control.Height/2, 0); err != nil {
-		return nil, nil, observation, "", err
+		return control, closeControl, "", err
 	}
-	if err := tap('r'); err != nil {
-		return nil, nil, observation, "", err
+	if err := tapHeldViewKey(control, 'r'); err != nil {
+		return control, closeControl, "", err
 	}
-	// Red is confirmed on view BEFORE the held connection is opened.
-	if err := waitColour(red); err != nil {
-		return nil, nil, observation, "", err
+	pixels, err := waitHeldViewColour(setupCtx, options, control, color.RGBA{R: 255, A: 255})
+	notes = append(notes, "control red pixels="+pixels)
+	return control, closeControl, "", err
+}
+
+func tapHeldViewKey(control *rfbclient.Client, key uint32) error {
+	if err := control.Key(key, true); err != nil {
+		return err
 	}
-	held, closeHeld, err = options.Open(ctx, "view")
-	if err != nil {
-		return nil, nil, observation, "", err
-	}
-	defer func() {
-		if resultErr != nil {
-			closeHeld()
-			held, closeHeld = nil, nil
+	return control.Key(key, false)
+}
+func waitHeldViewColour(ctx context.Context, options HeldViewProbeOptions, control *rfbclient.Client, want color.RGBA) (string, error) {
+	pixels := "unavailable"
+	for {
+		frame, err := control.Frame()
+		if err != nil {
+			return pixels, fmt.Errorf("control observer: %w; last pixels=%s", err, pixels)
 		}
-	}()
-	started := time.Now()
-	if err := tap(key); err != nil {
-		return nil, closeHeld, observation, "", err
+		pixels = probeFrameSamples(frame)
+		if probeFrameColour(frame, want) {
+			return pixels, nil
+		}
+		if err := options.Sleep(ctx, 20*time.Millisecond); err != nil {
+			return pixels, fmt.Errorf("control observer: %w; last pixels=%s", err, pixels)
+		}
 	}
-	if err := sleepContext(ctx, 250*time.Millisecond); err != nil {
-		return nil, closeHeld, observation, "", err
+}
+
+func measureHeldViewTrial(ctx context.Context, options HeldViewProbeOptions, control *rfbclient.Client, kind string, index int) (trial HeldViewTrial, resultErr error) {
+	trial.Kind, trial.Index = kind, index
+	// The preceding trial's view has already closed. Give this independent red
+	// baseline 300 ms before opening A or changing colour for either trial kind.
+	if err := options.Sleep(ctx, 300*time.Millisecond); err != nil {
+		return trial, err
 	}
-	// Observe GREEN on the SAME VIEW BACKEND through a separate connection.
-	// The held connection remains request-free throughout this observer wait.
-	if err := waitColour(color.RGBA{G: 255, A: 255}); err != nil {
-		return nil, closeHeld, observation, "", err
+	var view *rfbclient.Client
+	var closeView func()
+	if kind == "A" {
+		var err error
+		view, closeView, err = options.Open(ctx, "view")
+		if err != nil {
+			return trial, err
+		}
+		defer closeView()
 	}
-	observation = HeldViewObservation{RedrawDelayMS: delay, ChangeObservedMS: time.Since(started).Milliseconds(), started: started}
-	return held, closeHeld, observation, "", nil
+	tapped := options.Now()
+	if err := tapHeldViewKey(control, 'a'); err != nil {
+		return trial, err
+	}
+	if _, err := waitHeldViewColour(ctx, options, control, color.RGBA{G: 255, A: 255}); err != nil {
+		return trial, err
+	}
+	trial.ControlGreenMS = options.Now().Sub(tapped).Milliseconds()
+	if err := options.Sleep(ctx, 250*time.Millisecond); err != nil {
+		return trial, err
+	}
+	if kind == "B" {
+		var err error
+		view, closeView, err = options.Open(ctx, "view")
+		if err != nil {
+			return trial, err
+		}
+		defer closeView()
+	}
+	trial.FirstRequestMS = options.Now().Sub(tapped).Milliseconds()
+	frame, err := view.Frame() // The only view request in this trial; never retry it.
+	if err != nil {
+		return trial, err
+	}
+	trial.Pixels = probeFrameSamples(frame)
+	trial.Result = "stale"
+	if probeFrameColour(frame, color.RGBA{G: 255, A: 255}) {
+		trial.Result = "fresh"
+	}
+	return trial, nil
 }
 
 func probeFrameSamples(frame *image.RGBA) string {

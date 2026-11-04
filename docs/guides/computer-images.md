@@ -180,8 +180,12 @@ go build -o ./wefty-computer-conformance ./cmd/wefty-computer-conformance
 profile and display conventions for `screen.held-view-current-frame`. Leave it
 off for other images. Missing input evidence or unavailable preparation records
 `NOT-RUN` without a readiness wait. Reference-image CI enables this flag and
-requires the check to pass. Setup retries are bounded inside the probe; its held
-connection's first-frame assertion is never retried.
+requires the check to pass. The current experiment records six held (A) and six
+fresh (B) view trials in alternating order, with control as the only observer.
+Setup retries are bounded inside the probe; measurements are never retried.
+Every trial's pixels and timing, plus the A/B summary, enter the receipt. Stale
+pixels are data. The runtime check fails if any A trial is stale; the Seat lane
+fails this experiment only when A has a stale trial and all six B trials are fresh.
 
 Use `--runtime nerdctl` for a containerd installation. The checker applies the
 GPU-free Computer profile, injects fresh loopback ports, drives the exact

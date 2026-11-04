@@ -263,7 +263,7 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 	// This is the actual x11vnc image, through the node front door.
 	// Prepare a disposable colour page in this Seat's own desktop. The probe
 	// changes its colour only through the real control connection.
-	heldCtx, stopHeld := context.WithTimeout(ctx, 30*time.Second)
+	heldCtx, stopHeld := context.WithTimeout(ctx, 90*time.Second)
 	heldObservations, heldErr := computerconformance.ProbeHeldViewFrames(heldCtx, computerconformance.HeldViewProbeOptions{Open: func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
 		ws, _, err := websocket.Dial(ctx, "ws://"+host+"/v1/seats/"+id+"/screen/"+mode, &websocket.DialOptions{HTTPClient: &http.Client{Transport: transport}, HTTPHeader: http.Header{l1.SeatCredentialHeader: []string{ready.Credential}}, Subprotocols: []string{"binary"}})
 		if err != nil {
@@ -292,8 +292,12 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 		Report: func(message string) { t.Log(message) },
 	})
 	stopHeld()
+	// ProbeHeldViewFrames logs every trial and the summary before returning,
+	// including on errors. Stale A data alone does not stop the remaining calls.
 	seatMust(t, heldErr)
-	t.Logf("x11vnc held-view first-frame colour proof: %+v", heldObservations)
+	if heldObservations.HeldOnlyStale() {
+		t.Error("held view was stale while every fresh view was current")
+	}
 	// Measure changing-screen calls separately from SC-1's unchanged-screen
 	// samples. These observations add no timing gate and include process launch.
 	var changingCaptures []map[string]any

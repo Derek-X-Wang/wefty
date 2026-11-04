@@ -265,7 +265,7 @@ func (r *runtimeRunner) checkHeldViewFrames(ctx context.Context) {
 		r.record(id, StatusNotRun, fmt.Sprintf("reference input oracle unavailable: error=%v ready=%t", err, ready))
 		return
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	observations, err := ProbeHeldViewFrames(probeCtx, HeldViewProbeOptions{
 		Open: func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
@@ -297,6 +297,8 @@ func (r *runtimeRunner) checkHeldViewFrames(ctx context.Context) {
 			status = StatusNotRun
 		}
 		r.record(id, status, fmt.Sprintf("%s: %v", detail, err))
+	} else if observations.HasStaleHeld() {
+		r.record(id, StatusFail, string(detail))
 	} else {
 		r.record(id, StatusPass, string(detail))
 	}
