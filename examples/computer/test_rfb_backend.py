@@ -365,8 +365,9 @@ class WarmBackendTest(unittest.TestCase):
                 self.assertEqual(later_pid, pid)
                 self.assertEqual(len(self.commands), before + 1)
                 command = self.commands[-1]
-                for flag in ('-forever', '-shared', '-nopw', '-norc', '-no6'):
+                for flag in ('-forever', '-shared', '-nopw', '-norc', '-no6', '-nonap'):
                     self.assertIn(flag, command)
+                self.assertEqual(command[command.index('-sb') + 1], '0')
                 self.assertNotIn('-inetd', command)
                 self.assertEqual(command[command.index('-rfbport') + 1], '0')
                 self.assertEqual('-viewonly' in command, view_only)

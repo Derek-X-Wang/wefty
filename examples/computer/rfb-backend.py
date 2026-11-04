@@ -224,6 +224,10 @@ class RoleBackend:
             '-norc', '-forever', '-shared',
             '-display', os.environ.get('DISPLAY') or ':' + os.environ["WEFTY_COMPUTER_VIEW_PORT"],
             '-nopw', '-quiet',
+            # An idle x11vnc naps between screen polls, and only user input
+            # ends a nap early. A Seat screenshot asks for a frame before it
+            # sends input, so it would wait out the nap (#1479).
+            '-nonap', '-sb', '0',
         ]
         if self.view_only:
             command.append("-viewonly")

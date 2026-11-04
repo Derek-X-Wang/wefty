@@ -680,6 +680,12 @@ commands. This prevents display-property commands from reopening IP listeners
 or changing the view role after admission. Keep the three explicit disable
 flags even with `-safer`; normal RFB input and view access retain their roles.
 
+Both roles also use `-nonap -sb 0`. By default an idle x11vnc sleeps between
+screen polls (up to several seconds), and only user input ends the sleep early.
+A Seat input with `--screenshot` reads a baseline frame before it sends the
+input, so with naps on, that frame waited for the nap to end (#1479). The cost
+is that an idle backend keeps polling at its normal interval.
+
 Before returning each backend connection, and again at its first byte, the
 Linux relay matches the child PID's `/proc/<pid>/fd` socket inodes against
 `/proc/<pid>/net/tcp` and `tcp6`. It refuses the relay, logs the reason through
