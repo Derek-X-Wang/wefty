@@ -223,6 +223,12 @@ func TestSeatScreenCLISC1SC4(t *testing.T) {
 			}
 			points[name] = offset + value
 		}
+		// Only one settle branch runs per call; record which one (#1479).
+		for _, name := range []string{"frame_baseline", "frame_update_seen", "frame_update_timeout", "capture_reopened"} {
+			if value, ok := reply.Debug.Phases[name]; ok {
+				points[name] = offset + value
+			}
+		}
 		breakdowns = append(breakdowns, points)
 		encoded, _ := json.Marshal(points)
 		t.Logf("SC-1 call %d phase timestamps from CLI process start (ms): %s", len(breakdowns), encoded)
