@@ -359,7 +359,7 @@ func Aggregate(checks []Check) Status {
 func aggregateScope(checks []Check, scope Scope) Status {
 	filtered := make([]Check, 0, len(checks))
 	for _, check := range checks {
-		if check.Scope == scope {
+		if check.Scope == scope && (check.Status != StatusNotRun || !optionalCheck(check.ID)) {
 			filtered = append(filtered, check)
 		}
 	}
@@ -371,6 +371,13 @@ type CheckDefinition struct {
 	ID      string
 	Scope   Scope
 	Summary string
+	// Optional evidence left NOT-RUN does not hold its scope at NOT-RUN.
+	// Its PASS counts as usual, and its FAIL still fails the scope.
+	Optional bool
+}
+
+func optionalCheck(id string) bool {
+	return slices.ContainsFunc(CheckCatalog, func(definition CheckDefinition) bool { return definition.ID == id && definition.Optional })
 }
 
 // CheckCatalog is append-only within receipt version 2. Stable IDs let CI and
@@ -436,4 +443,5 @@ var CheckCatalog = []CheckDefinition{
 	{ID: "persistence.rootfs-discarded", Scope: ScopeImage, Summary: "attempt-local rootfs state does not survive"},
 	{ID: "persistence.edge-recovers", Scope: ScopeImage, Summary: "killed WebSocket edge withdraws and both endpoints recover"},
 	{ID: "targets.control-nonpersistent", Scope: ScopeImage, Summary: "/wefty/control state does not enter service data"},
+	{ID: "screen.input-capture-current-frame", Scope: ScopeImage, Optional: true, Summary: "a capture on the input connection after a settle timeout never predates the input"},
 }

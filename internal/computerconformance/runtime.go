@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Derek-X-Wang/wefty/contract"
+	"github.com/Derek-X-Wang/wefty/internal/rfbclient"
 )
 
 const (
@@ -91,6 +92,9 @@ type RuntimeConfig struct {
 	DriverOraclePath   string
 	EdgeProcessPattern string
 	ReceiptPath        string
+	// ReferenceSurfaceProbe opts in to the reference images' Chromium surface
+	// for screen.input-capture-current-frame.
+	ReferenceSurfaceProbe bool
 	// MutationProfile is used only by repository acceptance fixtures to mutate
 	// Docker's approximation of the production profile or teardown state.
 	MutationProfile string
@@ -230,7 +234,83 @@ func (r *runtimeRunner) run(ctx context.Context) (err error) {
 	if r.mutationFailed() {
 		return nil
 	}
+	// Input and edge oracles have finished; probe before the persistence
+	// restart so the existing input oracle is available without another wait.
+	r.checkInputCapture(ctx)
+	if r.mutationFailed() {
+		return nil
+	}
 	return r.checkPersistence(ctx)
+}
+
+// Reference-only surface setup is opt-in. Missing optional evidence never
+// becomes FAIL and never enters the 50-second input-readiness wait.
+func (r *runtimeRunner) checkInputCapture(ctx context.Context) {
+	const id = "screen.input-capture-current-frame"
+	if !r.config.ReferenceSurfaceProbe {
+		r.record(id, StatusNotRun, "--reference-surface-probe was not supplied")
+		return
+	}
+	if r.config.InputOraclePath == "" {
+		r.record(id, StatusNotRun, "no --input-oracle-path was supplied")
+		return
+	}
+	input, err := r.readInputObservation(ctx)
+	ready := input.Ready == nil || *input.Ready
+	if err != nil || !ready {
+		r.record(id, StatusNotRun, fmt.Sprintf("reference input oracle unavailable: error=%v ready=%t", err, ready))
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	experiment, err := ProbeInputCapture(probeCtx, InputCaptureProbeOptions{
+		Open: func(ctx context.Context, mode string) (*rfbclient.Client, func(), error) {
+			port := r.viewPort
+			if mode == "input" {
+				port = r.controlPort
+			}
+			return openFrameProbe(ctx, port)
+		},
+		Prepare: func(ctx context.Context, attempt int) (string, error) {
+			result := r.execShell(ctx, InputCaptureProbeLaunchScript, InputCaptureProbeURL())
+			detail := fmt.Sprintf("launch attempt=%d shell_exit=%d stdout=%s stderr=%s", attempt, result.exitCode, result.stdout, result.stderr)
+			if result.exitCode != 0 {
+				return detail, fmt.Errorf("reference Chromium preparation unavailable")
+			}
+			return detail, nil
+		},
+		Diagnostics: func(ctx context.Context) string {
+			result := r.execShell(ctx, InputCaptureProbeDiagnosticsScript)
+			return fmt.Sprintf("diagnostics_exit=%d %s %s", result.exitCode, result.stdout, result.stderr)
+		},
+		Report: r.diagnosticLog,
+	})
+	status, detail := inputCaptureStatus(experiment, err)
+	r.record(id, status, detail)
+}
+
+// inputCaptureStatus is the runtime checker's outcome rule. A stale C capture
+// fails even when setup later became unavailable; a measurement error fails
+// (including a capture error or hang on a T trial); unavailable setup, too few
+// conclusive C trials, or too few T trials that timed out and returned, is
+// NOT-RUN.
+func inputCaptureStatus(experiment InputCaptureExperiment, err error) (Status, string) {
+	payload, _ := json.Marshal(experiment)
+	detail := string(payload)
+	var unavailable *InputCaptureSetupUnavailableError
+	switch {
+	case experiment.StaleCaptures() > 0:
+		return StatusFail, detail
+	case errors.As(err, &unavailable):
+		return StatusNotRun, fmt.Sprintf("probe setup unavailable: %v: %s", err, detail)
+	case err != nil:
+		return StatusFail, fmt.Sprintf("%v: %s", err, detail)
+	case experiment.ConclusiveCaptures() < InputCaptureMinConclusive:
+		return StatusNotRun, fmt.Sprintf("only %d of 6 C trials were conclusive (need %d): %s", experiment.ConclusiveCaptures(), InputCaptureMinConclusive, detail)
+	case experiment.ReturnedTimeoutCaptures() < InputCaptureMinReturned:
+		return StatusNotRun, fmt.Sprintf("only %d of 3 T trials timed out and returned (need %d): %s", experiment.ReturnedTimeoutCaptures(), InputCaptureMinReturned, detail)
+	}
+	return StatusPass, detail
 }
 
 func (r *runtimeRunner) mutationFailed() bool {

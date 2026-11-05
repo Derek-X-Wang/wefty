@@ -337,7 +337,7 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	open := func(mode string, printNote bool) (*rfbclient.Client, func(), error) {
+	open := func(mode string) (*rfbclient.Client, func(), error) {
 		u := *endpoint
 		u.Path = "/v1/seats/" + a.id + "/screen/" + mode
 		u.RawPath = ""
@@ -379,11 +379,9 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				close()
 				return nil, nil, fmt.Errorf("invalid Seat release note")
 			}
-			if printNote {
-				if _, e = fmt.Fprintln(stderr, string(decoded)); e != nil {
-					close()
-					return nil, nil, e
-				}
+			if _, e = fmt.Fprintln(stderr, string(decoded)); e != nil {
+				close()
+				return nil, nil, e
 			}
 		}
 		wire := &seatScreenBannerWire{ReadWriter: websocket.NetConn(ctx, c, websocket.MessageBinary), remaining: 12, received: func() { timing.mark("rfb_banner") }}
@@ -398,11 +396,11 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	if a.command != "screenshot" {
 		mode = "input"
 	}
-	client, close, err := open(mode, true)
+	client, close, err := open(mode)
 	if err != nil {
 		return err
 	}
-	defer func() { close() }()
+	defer close()
 	frameAfterInput := false
 	var inputWritten time.Time
 	var baselinePixel color.RGBA
@@ -446,16 +444,15 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 				timing.mark("frame_update_seen")
 			} else {
 				timing.mark("frame_update_timeout")
-				close()
-				reopened, closeReopened, e := open("view", false)
-				if e != nil {
-					return e
-				}
-				client, close = reopened, closeReopened
-				timing.mark("capture_reopened")
 			}
 		}
-		frame, e := client.Frame()
+		// After a timeout one incremental request may still be outstanding.
+		// Capture on this input connection anyway: a new view connection's first
+		// frame can predate the input on x11vnc (#1484). Every reply read here
+		// answers a request sent after the input's Sync. A frame taken after the
+		// input but before the application redraws is correct, not stale.
+		// capture_drained marks only a successful drain of an outstanding request.
+		frame, e := client.FrameAfterWait(func() { timing.mark("capture_drained") })
 		if e != nil {
 			return e
 		}

@@ -158,9 +158,11 @@ func TestSeatScreenInputScreenshotSettles(t *testing.T) {
 				if !ok || !hasSync || syncDone < reply.Debug.Phases["input_written"] || wait < syncDone || wait > reply.Debug.Phases["frame_read"] {
 					t.Errorf("missing or unordered wait mark: %v", reply.Debug.Phases)
 				}
-				reopened, hasReopen := reply.Debug.Phases["capture_reopened"]
-				if wantChange && hasReopen || !wantChange && (!hasReopen || reopened < wait || reopened > reply.Debug.Phases["frame_read"]) {
-					t.Errorf("wrong reopen timing: %v", reply.Debug.Phases)
+				// A held incremental request is drained by the capture. "empty" answers
+				// each request at once, so its timer may fire with none outstanding.
+				drained, hasDrained := reply.Debug.Phases["capture_drained"]
+				if hasDrained && (wantChange || drained < wait || drained > reply.Debug.Phases["frame_read"]) || !hasDrained && !wantChange && scenario != "empty" {
+					t.Errorf("wrong drain timing: %v", reply.Debug.Phases)
 				}
 				if !wantChange && elapsed < seatScreenSettleLimit-50*time.Millisecond {
 					t.Errorf("settle returned early: %s", elapsed)
@@ -171,7 +173,7 @@ func TestSeatScreenInputScreenshotSettles(t *testing.T) {
 				if incremental.Load() == 0 || incremental.Load() > 60 {
 					t.Errorf("incremental requests=%d", incremental.Load())
 				}
-			} else if reply.Debug.Phases["capture_reopened"] != 0 || reply.Debug.Phases["frame_baseline"] != 0 || reply.Debug.Phases["frame_update_seen"] != 0 || reply.Debug.Phases["frame_update_timeout"] != 0 || reply.After != nil || incremental.Load() != 0 || elapsed > 800*time.Millisecond {
+			} else if reply.Debug.Phases["capture_drained"] != 0 || reply.Debug.Phases["frame_baseline"] != 0 || reply.Debug.Phases["frame_update_seen"] != 0 || reply.Debug.Phases["frame_update_timeout"] != 0 || reply.After != nil || incremental.Load() != 0 || elapsed > 800*time.Millisecond {
 				t.Errorf("ordinary call changed: reply=%s incremental=%d elapsed=%s", out.String(), incremental.Load(), elapsed)
 			}
 			if scenario == "input-only" {

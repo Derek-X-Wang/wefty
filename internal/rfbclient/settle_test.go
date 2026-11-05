@@ -25,8 +25,17 @@ func TestWaitForChangeSingleOutstandingRequest(t *testing.T) {
 	if changed, err := c.SyncAfterInput(color.RGBA{0, 255, 0, 255}); err != nil || changed {
 		t.Fatalf("Sync changed=%t err=%v", changed, err)
 	}
+	// The limit never fires: the change after two empty replies always wins.
+	// Pacing pauses use real timers.
+	rfbclient.SetTimerForTest(c, func(d time.Duration) (<-chan time.Time, func() bool) {
+		if d == time.Hour {
+			return make(chan time.Time), func() bool { return true }
+		}
+		timer := time.NewTimer(d)
+		return timer.C, timer.Stop
+	})
 	start := time.Now()
-	seen, err := c.WaitForChange(time.Second)
+	seen, err := c.WaitForChange(time.Hour)
 	if err != nil || !seen {
 		t.Fatalf("wait=%t err=%v", seen, err)
 	}
@@ -93,7 +102,7 @@ func (w *singleRequestWire) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func TestWaitForChangeTimeoutRequiresClose(t *testing.T) {
+func TestWaitForChangeTimeoutRefusesPlainFrame(t *testing.T) {
 	w := &pendingWaitWire{Reader: bytes.NewReader(handshake("003", 2, 2, 1)), closed: make(chan struct{})}
 	defer close(w.closed)
 	c, err := rfbclient.Open(w)
@@ -104,7 +113,7 @@ func TestWaitForChangeTimeoutRequiresClose(t *testing.T) {
 		t.Fatalf("wait=%t err=%v", seen, err)
 	}
 	before := w.written.Len()
-	if _, err := c.Frame(); err == nil || !strings.Contains(err.Error(), "close transport") {
+	if _, err := c.Frame(); err == nil || !strings.Contains(err.Error(), "FrameAfterWait") {
 		t.Fatalf("capture accepted pending reply: %v", err)
 	}
 	if w.written.Len() != before {

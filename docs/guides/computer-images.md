@@ -176,6 +176,54 @@ go build -o ./wefty-computer-conformance ./cmd/wefty-computer-conformance
   --receipt ./computer-conformance.json
 ```
 
+`--reference-surface-probe` explicitly opts in to the reference images'
+Chromium profile and display conventions for
+`screen.input-capture-current-frame`. Leave it off for other images; the check
+then stays `NOT-RUN`, and this optional check alone does not hold the image
+result at `NOT-RUN`. Missing input evidence or unavailable preparation records
+`NOT-RUN` without a readiness wait.
+
+The check proves the Seat screen CLI's capture after a settle timeout (#1484).
+A page turns green 400 ms after a key, so the CLI's 250 ms wait times out.
+Fifteen trials run in the order `C,B,B,C,T` three times, each with its own
+colour change from a confirmed red page:
+
+- C, the proof: on one new control connection, the only connection to the
+  image, the probe makes the CLI's calls (baseline, key, Sync, settle wait),
+  holds the outstanding request until 650 ms after the key, then captures with
+  the CLI's drain. Ground truth then reads full frames on the same connection
+  every 50 ms until one is green, so a reply left over from the capture's
+  requests cannot hide a stale capture. The 1 s limit on these reads is soft:
+  it is checked between reads, and one read can wait until the call's 15 s
+  deadline. The measured capture itself is never reread. The capture is current
+  (green), stale (red while the ground truth turns green), or inconclusive (the
+  wait did not time out, or the page never turned green). Red followed by green
+  counts as stale. This is the conservative direction: it assumes the page has
+  redrawn by the capture at 650 ms (the redraw is due at 400 ms), so a page that
+  redraws late can only add false stale results, never hide one.
+- B, a positive control: a fresh view connection reads its first full frame
+  250 ms after control saw green. Stale B frames are expected data on x11vnc;
+  they show the probe can detect staleness and never fail the check.
+- T: the same as C, but the capture starts as soon as the wait times out, and
+  there is no ground truth: T's result comes from its capture alone. Red and
+  green are both correct, because a frame taken after the input but before the
+  page redraws is not stale. A T trial whose wait did not time out is
+  inconclusive. A capture error or hang fails the check. An error after a T
+  capture, while waiting for the page before the next trial, keeps the trial's
+  result and is reported as the probe's error.
+
+Every trial is one JSON line in the checker's diagnostics and in the detail,
+followed by `input-capture trials: C current=…/6 stale=…/6 inconclusive=…/6;
+B (fresh view) stale=…/6; T returned=…/3 inconclusive=…/3 red=… green=…
+max_ms=…`. The check fails if any C capture is stale or a measurement fails,
+and is `NOT-RUN` when setup stays unavailable after bounded retries, fewer than
+four C trials are conclusive, or fewer than two T trials timed out and
+returned. Measurements are never retried. Reference-image CI enables the
+flag, accepts `PASS` or `NOT-RUN`, prints the detail, and fails on `FAIL`.
+The Seat lane runs the same probe on the default image through the node front
+door and fails on any stale C capture, a measurement error, fewer than four
+conclusive C trials, or fewer than two T trials that timed out and returned.
+
 Use `--runtime nerdctl` for a containerd installation. The checker applies the
 GPU-free Computer profile, injects fresh loopback ports, drives the exact
 WebSocket/RFB transport (including byte-identical key and pointer input over
