@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 import urllib.request
@@ -53,6 +54,17 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
 
     def serve_get(self):
         self.server.paths.append(self.path)
+        if self.server.trickle:
+            if self.server.trickle == "header":
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Slow: ")
+            else:
+                self.wfile.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            self.wfile.flush()
+            self.server.started.set()
+            while not self.server.release.wait(0.02):
+                self.wfile.write(b"1")  # Never finish the header/chunk-size line.
+                self.wfile.flush()
+            return
         if self.server.fail:
             self.send_error(503)
             return
@@ -85,10 +97,11 @@ class LocalUpstream:
         self.paths = []
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def open(self, url, timeout):
+    def open(self, url, timeout, watchdog):
         self.paths.append(url)
         path = proxy.snapshot_path(url)
-        return self.opener.open(self.address + path, timeout=timeout)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), proxy.DeadlineHandler(watchdog))
+        return opener.open(self.address + path, timeout=timeout)
 
 
 class CacheTests(unittest.TestCase):
@@ -106,6 +119,7 @@ class CacheTests(unittest.TestCase):
         self.upstream.payload = PAYLOAD
         self.upstream.status = 200
         self.upstream.fail = self.upstream.interrupt = self.upstream.pause = False
+        self.upstream.trickle = None
         self.upstream.started, self.upstream.release = threading.Event(), threading.Event()
         self.opener = LocalUpstream("http://127.0.0.1:" + str(self.upstream.server_port))
         self.cache = proxy.SnapshotCache(self.root / "cache", self.root / "summary.json",
@@ -174,6 +188,51 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(response.fp.raw._sock.settimeout.call_args_list,
                          [mock.call(30), mock.call(25), mock.call(5)])
         self.assertFalse(self.cache.cache_path(proxy.snapshot_path(URL)).exists())
+
+    def test_watchdog_bounds_trickling_headers_and_chunk_framing(self):
+        self.cache.total_timeout, self.cache.attempts = 1, 1
+        for mode in ("header", "chunk"):
+            with self.subTest(mode=mode):
+                self.upstream.trickle = mode
+                self.upstream.release.clear()
+                self.upstream.started.clear()
+                start = time.monotonic()
+                try:
+                    status, body = self.request()
+                    elapsed = time.monotonic() - start
+                    self.assertTrue(self.upstream.started.is_set())
+                    self.assertEqual(status, 502)
+                    self.assertGreaterEqual(elapsed, 0.8)
+                    self.assertLess(elapsed, 4, "trickling framing exceeded the total budget")
+                    self.assertIn(b"total budget", body)
+                    self.assertFalse(self.cache.cache_path(proxy.snapshot_path(URL)).exists())
+                finally:
+                    self.upstream.release.set()
+        self.assertEqual(self.summary()["upstream_failures"], 2)
+
+    def test_readiness_guard_rejects_unexpected_responses(self):
+        helper = SCRIPT.with_name("debian-snapshot-cache.sh").read_text()
+        guard = next(line for line in helper.splitlines() if line.lstrip().startswith("[[ $status"))
+        (self.root / "proxy.log").write_text("probe rejected\n")
+        for status, result, accepted in (("200", "HIT", True), ("502", "CACHE-ONLY-MISS", True), ("403", "REFUSED", False),
+                                         ("502", "MISS", False), ("200", "MISS", False)):
+            with self.subTest(status=status, result=result):
+                command = subprocess.run(["bash", "-c", guard], capture_output=True,
+                                         env={**os.environ, "state": str(self.root), "status": status, "result": result})
+                self.assertEqual(command.returncode == 0, accepted)
+
+    def test_probe_summary_write_failure_has_no_cache_only_miss_marker(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        try:
+            with mock.patch.object(self.cache, "record", side_effect=OSError("summary write failed")):
+                connection.request("GET", URL, headers={"X-Debian-Cache-Probe": "1"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 502)
+                self.assertEqual(response.getheader("X-Debian-Cache"), "MISS")
+                self.assertIn(b"summary write failed", response.read())
+            self.assertEqual(self.opener.paths, [])
+        finally:
+            connection.close()
 
     def test_missing_or_mismatched_metadata_is_a_miss(self):
         destination = self.seed(self.cache, proxy.snapshot_path(URL))
@@ -352,7 +411,7 @@ class CacheTests(unittest.TestCase):
             started = subprocess.run(["bash", str(helper), "start", WAYVNC_PROBE],
                                      cwd=SCRIPT.parent.parent, env=env, capture_output=True, timeout=90)
             self.assertEqual(started.returncode, 0, started.stderr)
-            self.assertIn(b"HTTP 502 cache=MISS", started.stdout)
+            self.assertIn(b"HTTP 502 cache=CACHE-ONLY-MISS", started.stdout)
             counts = json.loads((root / "debian-snapshot-proxy/summary.json").read_text())
             self.assertEqual(counts, dict(hits=0, misses=1, upstream_failures=0))
         finally:

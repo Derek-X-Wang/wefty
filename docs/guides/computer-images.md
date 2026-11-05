@@ -66,9 +66,9 @@ checksum-pinned neatvnc source archive; it is not an image layer cache.
 Before the build, a cache-only request checks that the proxy is serving HTTP,
 using the pinned `xvfb` pool URL for XFCE/default Seats or `wayvnc` for Wayland.
 The probe never contacts upstream. It logs its HTTP status and cache result:
-a validated warm entry returns `200/HIT`, and a cold entry returns `502/MISS`.
+a validated warm entry returns `200/HIT`, and a cold entry returns `502/CACHE-ONLY-MISS`.
 Both prove readiness, including in offline mode; upstream health cannot block
-startup. Failure to reach the proxy still fails the step.
+startup. Other responses or failure to reach the proxy fail the step.
 Misses fetch directly from snapshot.debian.org with bounded retries;
 partial fills are saved even when a build fails. `DEBIAN_CACHE_OFFLINE=1` refuses
 misses for cache-only proof runs. The Wayland builder and its text-frame test

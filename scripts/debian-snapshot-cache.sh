@@ -26,7 +26,7 @@ case "${1:?start or stop}" in
       "http://snapshot.debian.org/archive/debian/20260827T000000Z/$probe" \
       --output /dev/null --write-out '%{http_code}')"
     result="$(awk 'tolower($1) == "x-debian-cache:" { gsub("\r", "", $2); print $2 }' "$state/probe.headers")"
-    [[ $status =~ ^[1-5][0-9][0-9]$ && $result =~ ^(HIT|MISS|REFUSED)$ ]] || { cat "$state/proxy.log"; exit 1; }
+    [[ $status/$result == 200/HIT || $status/$result == 502/CACHE-ONLY-MISS ]] || { cat "$state/proxy.log"; exit 1; }
     printf 'Debian snapshot proxy probe: HTTP %s cache=%s\n' "$status" "$result"
     printf 'DEBIAN_CACHE_PROXY=%s\n' "$proxy" >> "$GITHUB_ENV"
     ;;

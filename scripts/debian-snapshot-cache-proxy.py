@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import socket
 import socketserver
 import tempfile
 import threading
@@ -22,6 +23,91 @@ import urllib.request
 
 SNAPSHOT_PATH = "/archive/debian/20260827T000000Z/"
 HOST = "snapshot.debian.org"
+
+
+class CacheOnlyMiss(OSError):
+    pass
+
+
+class UpstreamDeadline:
+    def __init__(self, seconds):
+        self.deadline = time.monotonic() + seconds
+        self.lock = threading.Lock()
+        self.sockets = []
+        self.expired = self.finished = False
+        self.timer = threading.Timer(seconds, self.expire)
+        self.timer.daemon = True
+
+    def expire(self):
+        with self.lock:
+            if self.finished:
+                return
+            self.expired = True
+            for connection in self.sockets:
+                self.close(connection)
+
+    @staticmethod
+    def close(connection):
+        # shutdown interrupts a buffered readline; response.close alone can
+        # block waiting for that reader's lock.
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        connection.close()
+
+    def track(self, connection):
+        with self.lock:
+            if self.expired:
+                self.close(connection)
+                raise TimeoutError("snapshot download exceeded total budget")
+            self.sockets.append(connection)
+
+    def finish(self):
+        with self.lock:
+            if self.expired or time.monotonic() >= self.deadline:
+                raise TimeoutError("snapshot download exceeded total budget")
+            self.finished = True
+        self.timer.cancel()
+
+    def __enter__(self):
+        self.timer.start()
+        return self
+
+    def __exit__(self, *_args):
+        with self.lock:
+            self.finished = True
+        self.timer.cancel()
+        self.timer.join()
+
+
+class DeadlineHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    def __init__(self, watchdog):
+        urllib.request.HTTPSHandler.__init__(self)
+        self.watchdog = watchdog
+
+    def connection(self, kind, host, **kwargs):
+        connection = kind(host, **kwargs)
+        connect = connection.connect
+        def tracked_connect():
+            connect()
+            self.watchdog.track(connection.sock)
+        connection.connect = tracked_connect
+        return connection
+
+    def http_open(self, req):
+        return self.do_open(lambda host, **kw: self.connection(http.client.HTTPConnection, host, **kw), req)
+
+    def https_open(self, req):
+        return self.do_open(lambda host, **kw: self.connection(http.client.HTTPSConnection, host, **kw),
+                            req, context=self._context)
+
+
+class SnapshotOpener:
+    def open(self, url, *, timeout, watchdog):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), SnapshotRedirect(),
+                                            DeadlineHandler(watchdog))
+        return opener.open(url, timeout=timeout)
 
 
 def atomic_json(path, value):
@@ -70,8 +156,7 @@ class SnapshotCache:
         self.total_timeout = total_timeout
         self.clock = clock
         # Do not inherit the runner's proxy environment or proxy back into ourselves.
-        self.opener = opener or urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), SnapshotRedirect())
+        self.opener = opener or SnapshotOpener()
         self.retry_delay = retry_delay
         self.lock = threading.Lock()
         self.counts = dict(hits=0, misses=0, upstream_failures=0)
@@ -111,17 +196,21 @@ class SnapshotCache:
             self.record("hits")
             return destination, "HIT"
         self.record("misses")
-        if self.offline or cache_only:
-            raise OSError("cache miss; upstream was not contacted (offline or readiness probe)")
+        if cache_only:
+            raise CacheOnlyMiss("cache-only miss; upstream was not contacted")
+        if self.offline:
+            raise OSError("offline cache miss; upstream was not contacted")
         destination.parent.mkdir(parents=True, exist_ok=True)
         deadline = self.clock() + self.total_timeout
         for attempt in range(self.attempts):
             temporary = None
+            watchdog = None
             try:
                 remaining = deadline - self.clock()
                 if remaining <= 0:
                     raise TimeoutError("snapshot download exceeded total budget")
-                with self.opener.open("http://" + HOST + path, timeout=min(self.timeout, remaining)) as upstream:
+                with UpstreamDeadline(remaining) as watchdog, self.opener.open(
+                        "http://" + HOST + path, timeout=min(self.timeout, remaining), watchdog=watchdog) as upstream:
                     if upstream.status != 200:
                         raise OSError(f"snapshot upstream returned HTTP {upstream.status}, expected 200")
                     with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=".tmp", delete=False) as output:
@@ -146,6 +235,7 @@ class SnapshotCache:
                         if length is not None and output.tell() != int(length):
                             raise OSError("incomplete snapshot response")
                         metadata = {"length": output.tell(), "sha256": digest.hexdigest()}
+                    watchdog.finish()
                     temporary.replace(destination)
                     atomic_json(self.metadata_path(destination), metadata)
                 return destination, "MISS"
@@ -153,6 +243,8 @@ class SnapshotCache:
                 if isinstance(error, urllib.error.HTTPError):
                     error.close()
                 self.record("upstream_failures")
+                if watchdog is not None and watchdog.expired:
+                    error = TimeoutError("snapshot download exceeded total budget")
                 remaining = deadline - self.clock()
                 if attempt + 1 == self.attempts or remaining <= 0:
                     raise OSError(f"snapshot upstream failed after {attempt + 1} attempts: {error}") from error
@@ -190,6 +282,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.path, cache_only=self.headers.get("X-Debian-Cache-Probe") == "1")
         except ValueError as error:
             self.error_response(403, error, "REFUSED")
+            return
+        except CacheOnlyMiss as error:
+            self.error_response(502, error, "CACHE-ONLY-MISS")
             return
         except OSError as error:
             self.error_response(502, error, "MISS")
