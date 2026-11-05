@@ -227,6 +227,7 @@ class RoleBackend:
             # With naps on, x11vnc 0.9.16 took about 770 ms to answer a new
             # connection's first full frame on an idle screen. A Seat input
             # with --screenshot reads that frame before the input (#1479).
+            '-nonap', '-sb', '0',
         ]
         if self.view_only:
             command.append("-viewonly")
