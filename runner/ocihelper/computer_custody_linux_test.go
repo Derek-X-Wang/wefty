@@ -826,15 +826,15 @@ func TestComputerCustodyExportKeepsDurableEvidenceOfAVerifiedExport(t *testing.T
 	}
 	// Only the Computer's removal takes the record away, and only once no
 	// Storage generation of that Computer is left on the node.
-	remaining, err := engine.computerHasRemainingStorage(request.Storage.ComputerID)
-	if err != nil || !remaining {
-		t.Fatalf("a Computer with a published disk reported remaining=%t err=%v", remaining, err)
+	blocker, err := engine.computerRemainingStorageBlocker(request.Storage.ComputerID)
+	if err != nil || blocker == "" {
+		t.Fatalf("a Computer with a published disk reported blocker=%q err=%v", blocker, err)
 	}
 	if err := os.RemoveAll(filepath.Join(root, "computer-disks")); err != nil {
 		t.Fatal(err)
 	}
-	if remaining, err = engine.computerHasRemainingStorage(request.Storage.ComputerID); err != nil || remaining {
-		t.Fatalf("a Computer with no disk reported remaining=%t err=%v", remaining, err)
+	if blocker, err = engine.computerRemainingStorageBlocker(request.Storage.ComputerID); err != nil || blocker != "" {
+		t.Fatalf("a Computer with no disk reported blocker=%q err=%v", blocker, err)
 	}
 	if err := engine.removeCustodyWriteMarkersForComputer("a-different-computer"); err != nil {
 		t.Fatal(err)
@@ -933,9 +933,6 @@ func TestComputerCustodyRetryKeepsRecordsOfAComputerThatStillHasStorage(t *testi
 				if err := engine.quarantineComputerDiskAnomaly(diskRoot, name, request.Storage, "allocation_mismatch"); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.RemoveAll(diskRoot); err != nil {
-					t.Fatal(err)
-				}
 			}
 			if err := engine.removeOrphanCustodyWriteMarkers(); err != nil {
 				t.Fatal(err)
@@ -947,13 +944,42 @@ func TestComputerCustodyRetryKeepsRecordsOfAComputerThatStillHasStorage(t *testi
 	}
 }
 
+func TestComputerCustodyQuarantineOfAnotherComputerDoesNotKeepTheRecords(t *testing.T) {
+	engine, request, removal, unreadable := orphanCustodyFixture(t)
+	if err := os.RemoveAll(unreadable); err != nil {
+		t.Fatal(err)
+	}
+	other := ComputerStorageReference{ComputerID: "computer-2", StorageID: "storage-2", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 16 << 20}
+	name, err := deterministicComputerDiskName(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+	if err := os.MkdirAll(otherRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.quarantineComputerDiskAnomaly(otherRoot, name, other, "allocation_mismatch"); err != nil {
+		t.Fatal(err)
+	}
+	// A staging file next to the quarantined generation owns nothing.
+	if err := os.WriteFile(filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine", ".cleanup-quarantine.tmp-1"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.deleteComputerDisk(request.Storage, removal); err != nil {
+		t.Fatal(err)
+	}
+	if _, recorded, err := engine.custodyWritePhase(request); err != nil || recorded {
+		t.Fatalf("another Computer's quarantine kept this record: recorded=%t err=%v", recorded, err)
+	}
+}
+
 func TestComputerCustodyResetKeepsRecordsWhileTheSuccessorRemains(t *testing.T) {
 	engine, request, removal, unreadable := orphanCustodyFixture(t)
 	if err := os.RemoveAll(unreadable); err != nil {
 		t.Fatal(err)
 	}
 	successor := request.Storage
-	successor.StorageID, successor.StorageGeneration = "storage-2", 2
+	successor.StorageGeneration = request.Storage.StorageGeneration + 1
 	attachment, err := engine.attachComputerDisk(t.Context(), successor, testComputerAuthority("successor", "successor-fence", "boot-a"))
 	if err != nil {
 		t.Fatal(err)

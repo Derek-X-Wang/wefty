@@ -715,11 +715,11 @@ func (engine *ContainerdEngine) deleteComputerDiskUnderAdmission(ctx context.Con
 	// only once a Computer keeps no Storage generation on the node. A reset,
 	// which deletes a predecessor while its successor remains, must not take
 	// them.
-	remaining, err := engine.computerHasRemainingStorage(storage.ComputerID)
+	blocker, err := engine.computerRemainingStorageBlocker(storage.ComputerID)
 	if err != nil {
 		return err
 	}
-	if !remaining {
+	if blocker == "" {
 		if err := engine.removeCustodyWriteMarkersForComputer(storage.ComputerID); err != nil {
 			return err
 		}
@@ -765,23 +765,16 @@ func removeComputerDiskPayloadUnderLock(root string) error {
 	return syncDirectory(root)
 }
 
-// computerHasRemainingStorage reports whether any Storage generation of this
-// Computer still has a managed disk root on the node. Quarantined Storage is
-// still Storage, and its identity is not always readable, so any quarantined
-// entry also answers "present": the records are only ever dropped on a
-// certain answer.
-func (engine *ContainerdEngine) computerHasRemainingStorage(computerID string) (bool, error) {
-	quarantined, err := readDirectoryIfPresent(filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine"))
-	if err != nil {
-		return false, err
-	}
-	if len(quarantined) != 0 {
-		return true, nil
-	}
+// computerRemainingStorageBlocker names the first thing on the node that
+// keeps this Computer's Custody write records, or returns "" when it is certain
+// that the Computer keeps no Storage generation here. That is a disk root or a
+// quarantine entry of this Computer, or anything whose owner cannot be read:
+// the records are only ever dropped on a certain answer.
+func (engine *ContainerdEngine) computerRemainingStorageBlocker(computerID string) (string, error) {
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks")
 	entries, err := readDirectoryIfPresent(diskRoot)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -798,15 +791,40 @@ func (engine *ContainerdEngine) computerHasRemainingStorage(computerID string) (
 			if _, refused, refusalErr := refusedComputerStorageAbsent(root, entry.Name()); refusalErr == nil && refused {
 				continue
 			}
-			// Any other unreadable neighbour is treated as still present: the
-			// records are only ever dropped on a certain answer.
-			return true, nil
+			return "computer-disks/" + entry.Name(), nil
 		}
 		if manifest.Storage.ComputerID == computerID {
-			return true, nil
+			return "computer-disks/" + entry.Name(), nil
 		}
 	}
-	return false, nil
+	// Read after computer-disks: a generation only ever moves from there into
+	// quarantine, so a rename between the two reads cannot hide it.
+	quarantineRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine")
+	quarantined, err := readDirectoryIfPresent(quarantineRoot)
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range quarantined {
+		if strings.HasPrefix(entry.Name(), ".") {
+			// Staging files and the GC failure mirror, which the owning
+			// receipt already covers.
+			continue
+		}
+		path := filepath.Join(quarantineRoot, entry.Name())
+		blocked := true
+		if entry.IsDir() {
+			receipt, readErr := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(path, "quarantine.json"))
+			blocked = readErr != nil || receipt.Kind == computerDiskQuarantineKindAuthority || receipt.Storage.ComputerID == computerID
+		} else if strings.Contains(entry.Name(), "-cleanup-") && strings.HasSuffix(entry.Name(), ".json") {
+			var receipt ManagedVolumeQuarantineReceipt
+			payload, readErr := os.ReadFile(path)
+			blocked = readErr != nil || json.Unmarshal(payload, &receipt) != nil || receipt.ComputerStorage.ComputerID == computerID
+		}
+		if blocked {
+			return "computer-disk-quarantine/" + entry.Name(), nil
+		}
+	}
+	return "", nil
 }
 
 func (engine *ContainerdEngine) detachComputerDisk(attachment *computerDiskAttachment, kind, sweepEpoch string) error {

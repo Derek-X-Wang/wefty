@@ -515,13 +515,17 @@ owner record are known. Missing or damaged owner records and unknown jobs need
 node-owner recovery; keep the VM until recovery is complete. For Custody markers,
 use `wefty services remove COMPUTER --expect-current --wait 60s`. The helper
 drops a Computer's Custody records only when it is certain that the Computer
-keeps no Storage generation, quarantined or not, on the node. An unreadable
-unrelated disk root defers the drop, and a reset that leaves a successor keeps
-the records. The helper retries a deferred drop for every Computer at each
-Computer Storage sweep, which runs when the helper starts, and after each
-Computer disk removal. If the Computer is already removed, a helper restart
-clears its records once the blocking root is fixed. If a record remains after
-that, keep the VM and use node-owner recovery.
+keeps no Storage generation on the node. A disk root or quarantine entry of
+that Computer, or any entry whose owner cannot be read, defers the drop; a
+quarantine entry of a different Computer does not. A reset that leaves a
+successor keeps the records. The helper retries a deferred drop for every
+Computer at each Computer Storage sweep, which runs when the helper starts, and
+after each Computer disk removal, and logs the Computer and the blocking entry
+when it defers. If the Computer is already removed, the helper may clear its
+records when it next starts, once no Storage of that Computer is left on the
+node. On a Lima node, restart it with `wefty node oci always-on`; on a native
+Linux node, restart `wefty-oci-helper.service`. If a record remains after that,
+keep the VM and use node-owner recovery.
 
 The exception is
 `computer-backups/supersessions`, which contains removal and supersession

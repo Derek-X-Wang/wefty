@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1125,14 +1126,16 @@ func (engine *ContainerdEngine) removeOrphanCustodyWriteMarkers() error {
 		}
 	}
 	for computerID := range computers {
-		remaining, err := engine.computerHasRemainingStorage(computerID)
+		blocker, err := engine.computerRemainingStorageBlocker(computerID)
 		if err != nil {
 			return err
 		}
-		if !remaining {
-			if err := engine.removeCustodyWriteMarkersForComputer(computerID); err != nil {
-				return err
-			}
+		if blocker != "" {
+			log.Printf("Custody write records of Computer %s kept: %s still blocks the drop", computerID, blocker)
+			continue
+		}
+		if err := engine.removeCustodyWriteMarkersForComputer(computerID); err != nil {
+			return err
 		}
 	}
 	return nil
