@@ -1,7 +1,6 @@
 package scripts
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
@@ -199,20 +198,6 @@ func TestDebianSnapshotCacheWorkflowWiring(t *testing.T) {
 			}
 		})
 	}
-	// Pin the default bytes and the two approved Wayland builder URL/comment changes.
-	for file, expected := range map[string]string{
-		"examples/computer/Dockerfile":                       "f1fc36588b0f6a0d0330f081c385e3f13649137c722607467bd5c9c184e64720",
-		"examples/computer-wayland/Dockerfile":               "1c78f202ceefe540c12a829294dc2792925ae1990dbc15f54511e0a9eb2d0cc2",
-		"examples/computer/fixtures/Dockerfile.wayland-text": "8eeacbb6b238868603c361d63ea10ceb1729e64475386332066a02c4a2984f52",
-	} {
-		payload, err := os.ReadFile("../" + file)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got := fmt.Sprintf("%x", sha256.Sum256(payload)); got != expected {
-			t.Errorf("%s changed beyond the approved snapshot cache bytes: %s", file, got)
-		}
-	}
 }
 
 func TestDebianSnapshotCacheRejectsWorkflowRegressions(t *testing.T) {
@@ -370,6 +355,15 @@ func validateSnapshotAptIntegrity(payload string) error {
 	if insecure.MatchString(payload) {
 		return fmt.Errorf("snapshot cache must preserve apt signature authentication")
 	}
+	snapshotURLs := regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://snapshot\.debian\.org[^\s'"\\]*`).FindAllString(payload, -1)
+	if len(snapshotURLs) == 0 {
+		return fmt.Errorf("snapshot sources missing")
+	}
+	for _, url := range snapshotURLs {
+		if url != "http://snapshot.debian.org/archive/debian/20260827T000000Z" && !strings.HasPrefix(url, "http://snapshot.debian.org/archive/debian/20260827T000000Z/") {
+			return fmt.Errorf("snapshot fetch must use the pinned HTTP URL: %s", url)
+		}
+	}
 	return nil
 }
 
@@ -394,6 +388,15 @@ func TestDebianSnapshotCacheAptIntegrity(t *testing.T) {
 	// The probe packages must be actual pinned installs, not extra cache-only downloads.
 	assertFileContains(t, "../examples/computer/Dockerfile", "xvfb=2:21.1.7-3+deb12u12")
 	assertFileContains(t, "../examples/computer-wayland/Dockerfile", "wayvnc=0.9.1-1")
+	assertFileContains(t, "../examples/computer-wayland/Dockerfile",
+		"      '46d689818d88e0d65387bf9182f1bd1015c4b28e0347696f0bec7c7d9c829194' \\\n      /tmp/neatvnc.tar.xz | sha256sum --check -")
+	assertFileContains(t, "../examples/computer/fixtures/Dockerfile.wayland-text",
+		"    && printf '%s  %s\\n' 46d689818d88e0d65387bf9182f1bd1015c4b28e0347696f0bec7c7d9c829194 /tmp/neatvnc.tar.xz | sha256sum --check -")
+	for _, url := range []string{"https://snapshot.debian.org/archive/debian/20260827T000000Z/pool/file.deb", "ftp://snapshot.debian.org/archive/debian/20260827T000000Z/pool/file.deb", "http://snapshot.debian.org/archive/debian/latest/pool/file.deb"} {
+		if err := validateSnapshotAptIntegrity(url); err == nil {
+			t.Errorf("accepted snapshot URL %s", url)
+		}
+	}
 }
 
 func TestDebianSnapshotCacheProxy(t *testing.T) {

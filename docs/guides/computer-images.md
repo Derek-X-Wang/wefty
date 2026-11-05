@@ -63,10 +63,12 @@ The `computer-seats`, main-push `acceptance-image`, and reusable
 `20260827T000000Z` from GitHub Actions cache. A runner
 HTTP proxy serves apt files (indexes, packages and source packages) and the
 checksum-pinned neatvnc source archive; it is not an image layer cache.
-A real `pool/` package download checks the proxy before the
-build: the pinned `xvfb` package for XFCE/default Seats, or the pinned `wayvnc`
-package for Wayland. The probe is an installed package, so it adds no unused
-file; a warm cache serves it locally even in offline mode.
+Before the build, a cache-only request checks that the proxy is serving HTTP,
+using the pinned `xvfb` pool URL for XFCE/default Seats or `wayvnc` for Wayland.
+The probe never contacts upstream. It logs its HTTP status and cache result:
+a validated warm entry returns `200/HIT`, and a cold entry returns `502/MISS`.
+Both prove readiness, including in offline mode; upstream health cannot block
+startup. Failure to reach the proxy still fails the step.
 Misses fetch directly from snapshot.debian.org with bounded retries;
 partial fills are saved even when a build fails. `DEBIAN_CACHE_OFFLINE=1` refuses
 misses for cache-only proof runs. The Wayland builder and its text-frame test
@@ -92,6 +94,15 @@ caches to the PR merge ref, so a PR fill cannot seed
 main. Main must fill its own cache. GitHub's default repository cache budget is
 10 GB; eviction can make a later build cold again. The proxy reports request
 counts and cache disk usage after each build.
+
+Only a complete upstream HTTP 200 is published. Downloads use a 30-second read
+inactivity timeout and a 15-minute total budget across retries, so large packages
+can make steady progress without an unbounded trickle. Each file has an atomic
+completion record containing its length and SHA-256. Every hit checks that record
+against the bytes; truncated, altered or legacy entries without metadata become
+misses. Online builds refetch them; offline builds refuse them. Shutdown sends
+SIGTERM, waits up to 10 seconds, then uses SIGKILL if needed. The last atomic
+summary is still read and miss-gated cache saving still runs after that outcome.
 
 A save creates a new full entry only when the proxy reports misses > 0; it can
 retain a partial fill after failure. Restore selects the newest entry matching

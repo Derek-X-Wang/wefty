@@ -20,20 +20,36 @@ case "${1:?start or stop}" in
     done
     test -f "$state/ready" || { cat "$state/proxy.log"; exit 1; }
     proxy="http://$gateway:$(cat "$state/ready")"
-    # A real pool package proves the proxy can serve apt downloads, not just indexes.
-    curl --fail --silent --show-error --max-time 110 --noproxy '' --proxy "$proxy" \
+    # Probe a real pool URL without fetching upstream. A cold-cache 502 is ready.
+    status="$(curl --silent --show-error --max-time 15 --noproxy '' --proxy "$proxy" \
+      --header 'X-Debian-Cache-Probe: 1' --dump-header "$state/probe.headers" \
       "http://snapshot.debian.org/archive/debian/20260827T000000Z/$probe" \
-      --output /dev/null
+      --output /dev/null --write-out '%{http_code}')"
+    result="$(awk 'tolower($1) == "x-debian-cache:" { gsub("\r", "", $2); print $2 }' "$state/probe.headers")"
+    [[ $status =~ ^[1-5][0-9][0-9]$ && $result =~ ^(HIT|MISS|REFUSED)$ ]] || { cat "$state/proxy.log"; exit 1; }
+    printf 'Debian snapshot proxy probe: HTTP %s cache=%s\n' "$status" "$result"
     printf 'DEBIAN_CACHE_PROXY=%s\n' "$proxy" >> "$GITHUB_ENV"
     ;;
   stop)
+    stop_status=0
     if test -f "$state/pid"; then
-      kill -TERM "$(cat "$state/pid")" 2>/dev/null || true
-      for _ in $(seq 1 120); do
-        if ! test -f "$state/ready"; then break; fi
+      pid="$(cat "$state/pid")"
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 10); do
+        if ! test -f "$state/ready" || ! kill -0 "$pid" 2>/dev/null; then break; fi
         sleep 1
       done
+      if test -f "$state/ready" && kill -0 "$pid" 2>/dev/null; then
+        printf 'Debian snapshot proxy did not stop after 10 s; sending SIGKILL\n' >&2
+        if ! kill -KILL "$pid" 2>/dev/null; then
+          if kill -0 "$pid" 2>/dev/null; then stop_status=1; fi
+        fi
+      fi
     fi
+    # SIGKILL may leave readiness and unfinished downloads behind. Completed
+    # bodies and their completion metadata remain available to actions/cache.
+    rm -f "$state/ready" "$state/pid"
+    if test -d "$cache"; then find "$cache" -type f -name '*.tmp' -delete; fi
     # Counters are persisted on each request, including a failed build or forced stop.
     if test -f "$state/summary.json"; then
       cat "$state/proxy.log"
@@ -44,7 +60,7 @@ print("misses=" + str(json.load(open(sys.argv[1]))["misses"]))
 PY
       du -sh "$cache"
     fi
-    test ! -f "$state/ready"
+    exit "$stop_status"
     ;;
   *) exit 2 ;;
 esac
