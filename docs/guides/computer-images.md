@@ -102,10 +102,12 @@ completion record containing its length and SHA-256. Every hit checks that recor
 against the bytes; truncated, altered or legacy entries without metadata become
 misses. Online builds refetch them; offline builds refuse them. Shutdown sends
 SIGTERM, waits up to 10 seconds, then uses SIGKILL if needed. The last atomic
-summary is still read and miss-gated cache saving still runs after that outcome.
+summary is still read, so files stored before shutdown can still be saved.
 
-A save creates a new full entry only when the proxy reports misses > 0; it can
-retain a partial fill after failure. Restore selects the newest entry matching
+A save creates a new full entry only when the proxy reports stored > 0 (newly
+published files); it can retain a partial fill after failure. Misses and upstream
+failures remain in the summary and logs, but a run that stores nothing creates
+no entry. Restore selects the newest entry matching
 the job/architecture/variant/date/Dockerfile prefix. Old entries are not updated
 in place. GitHub evicts entries unused for more than 7 days and, above the
 default 10 GB budget, evicts entries in order of oldest last access first

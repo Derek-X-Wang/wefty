@@ -63,8 +63,8 @@ func validateSnapshotCacheJob(name string, job snapshotCacheJob, wantBuilds int)
 		case "actions/cache/save@" + snapshotCacheAction:
 			save = i
 			saveKey, _ = step.With["key"].(string)
-			if step.With["path"] != "${{ runner.temp }}/debian-snapshot-cache" || step.If != "always() && steps.debian-cache-summary.outputs.misses != '' && steps.debian-cache-summary.outputs.misses != '0'" {
-				return fmt.Errorf("save must retain partial fills after failure, only when misses > 0")
+			if step.With["path"] != "${{ runner.temp }}/debian-snapshot-cache" || step.If != "always() && steps.debian-cache-summary.outputs.stored != '' && steps.debian-cache-summary.outputs.stored != '0'" {
+				return fmt.Errorf("save must retain partial fills after failure, only when stored > 0")
 			}
 		}
 		if strings.HasPrefix(step.Uses, "docker/setup-buildx-action@") {
@@ -87,7 +87,7 @@ func validateSnapshotCacheJob(name string, job snapshotCacheJob, wantBuilds int)
 		if strings.TrimSpace(step.Run) == "bash scripts/debian-snapshot-cache.sh stop" {
 			summary = i
 			if step.ID != "debian-cache-summary" || step.If != "always()" {
-				return fmt.Errorf("proxy summary must expose misses after every outcome")
+				return fmt.Errorf("proxy summary must expose stored after every outcome")
 			}
 		}
 		if strings.Contains(step.Run, "scripts/test-computer-image-runtime.sh ") {
@@ -233,6 +233,13 @@ func TestDebianSnapshotCacheRejectsWorkflowRegressions(t *testing.T) {
 			for i := range job.Steps {
 				if strings.HasPrefix(job.Steps[i].Uses, "actions/cache/save@") {
 					job.Steps[i].If = "success()"
+				}
+			}
+		},
+		"save on unfilled misses": func(job *snapshotCacheJob) {
+			for i := range job.Steps {
+				if strings.HasPrefix(job.Steps[i].Uses, "actions/cache/save@") {
+					job.Steps[i].If = strings.ReplaceAll(job.Steps[i].If, "outputs.stored", "outputs.misses")
 				}
 			}
 		},

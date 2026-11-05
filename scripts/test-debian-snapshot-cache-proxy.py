@@ -252,6 +252,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.request()[0], 502)
         self.assertFalse(self.cache.cache_path(proxy.snapshot_path(URL)).exists())
         self.assertEqual(self.summary()["upstream_failures"], 3)
+        self.assertEqual(self.summary()["stored"], 0)
 
     def test_cold_readiness_probe_is_502_without_upstream_even_online(self):
         self.upstream.fail = True
@@ -261,7 +262,7 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(status, 502)
             self.assertIn(b"upstream was not contacted", body)
         self.assertEqual(self.opener.paths, [])
-        self.assertEqual(self.summary(), dict(hits=0, misses=2, upstream_failures=0))
+        self.assertEqual(self.summary(), dict(hits=0, misses=2, stored=0, upstream_failures=0))
 
     def test_clean_502_logs_once_without_putting_error_text_in_headers(self):
         with mock.patch.object(self.cache, "get", side_effect=OSError("upstream 503 \u2603")):
@@ -277,7 +278,7 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(self.request()[0], 502)
         self.cache.offline = False
         self.assertEqual(self.request(), (200, PAYLOAD))
-        self.assertEqual(self.summary(), dict(hits=0, misses=3, upstream_failures=0))
+        self.assertEqual(self.summary(), dict(hits=0, misses=3, stored=2, upstream_failures=0))
 
     def test_upstream_failure_with_disconnected_client_is_quiet(self):
         for error in (BrokenPipeError, ConnectionResetError):
@@ -302,7 +303,7 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(self.request(url), (200, PAYLOAD))
             self.upstream.fail = False
         self.assertEqual(len(self.opener.paths), 5)
-        self.assertEqual(self.summary(), dict(hits=5, misses=5, upstream_failures=0))
+        self.assertEqual(self.summary(), dict(hits=5, misses=5, stored=5, upstream_failures=0))
 
     def test_atomic_publish_and_incomplete_response_cleanup(self):
         self.upstream.pause = True
@@ -313,12 +314,14 @@ class CacheTests(unittest.TestCase):
             self.assertTrue(self.upstream.started.wait(5))
             destination = self.cache.cache_path(proxy.snapshot_path(URL))
             self.assertFalse(destination.exists(), "partial bytes must never be a cache hit")
+            self.assertEqual(self.summary()["stored"], 0)
         finally:
             self.upstream.release.set()
             request.join(10)
         self.assertEqual(result, [(200, PAYLOAD)])
         self.assertEqual(destination.read_bytes(), PAYLOAD)
         self.assertEqual(set(destination.parent.iterdir()), {destination, self.cache.metadata_path(destination)})
+        self.assertEqual(self.summary()["stored"], 1)
         destination.unlink()
         self.cache.metadata_path(destination).unlink()
         self.upstream.interrupt = True
@@ -326,12 +329,13 @@ class CacheTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(list(destination.parent.iterdir()), [])
         self.assertEqual(self.summary()["upstream_failures"], 3)
+        self.assertEqual(self.summary()["stored"], 1)
 
     def test_offline_miss_never_contacts_upstream_and_hit_works(self):
         self.cache.offline = True
         self.assertEqual(self.request()[0], 502)
         self.assertEqual(self.opener.paths, [])
-        self.assertEqual(self.summary(), dict(hits=0, misses=1, upstream_failures=0))
+        self.assertEqual(self.summary(), dict(hits=0, misses=1, stored=0, upstream_failures=0))
         self.seed(self.cache, proxy.snapshot_path(URL))
         self.assertEqual(self.request(), (200, PAYLOAD))
         self.assertEqual(self.opener.paths, [])
@@ -350,7 +354,7 @@ class CacheTests(unittest.TestCase):
                 self.assertEqual(self.request(url), (200, payload))
                 self.cache.offline = False
                 self.assertEqual(self.cache.cache_path(proxy.snapshot_path(url)).read_bytes(), payload)
-        self.assertEqual(self.summary(), dict(hits=4, misses=4, upstream_failures=0))
+        self.assertEqual(self.summary(), dict(hits=4, misses=4, stored=4, upstream_failures=0))
         self.assertEqual(len(self.opener.paths), 4)
 
     def test_lifecycle_warm_probes_never_contact_upstream(self):
@@ -382,7 +386,7 @@ class CacheTests(unittest.TestCase):
                         self.assertIn(b"HTTP 200 cache=HIT", started.stdout)
                         self.assertRegex((root / "github-env").read_text(), r"DEBIAN_CACHE_PROXY=http://127\.0\.0\.1:[0-9]+")
                         self.assertEqual(json.loads((state / "summary.json").read_text()),
-                                         dict(hits=1, misses=0, upstream_failures=0))
+                                         dict(hits=1, misses=0, stored=0, upstream_failures=0))
                         self.assertEqual({p for p in seeded.directory.rglob("*") if p.is_file()},
                                          {destination, seeded.metadata_path(destination)})
                     finally:
@@ -393,6 +397,7 @@ class CacheTests(unittest.TestCase):
                                 os.kill(int((state / "pid").read_text()), signal.SIGKILL)
                     self.assertEqual(stopped.returncode, 0, stopped.stderr)
                     self.assertIn("misses=0", (root / "github-output").read_text())
+                    self.assertIn("stored=0", (root / "github-output").read_text())
                     self.assertFalse((state / "ready").exists())
 
     def test_helper_cold_start_accepts_502_and_logs_miss(self):
@@ -413,12 +418,13 @@ class CacheTests(unittest.TestCase):
             self.assertEqual(started.returncode, 0, started.stderr)
             self.assertIn(b"HTTP 502 cache=CACHE-ONLY-MISS", started.stdout)
             counts = json.loads((root / "debian-snapshot-proxy/summary.json").read_text())
-            self.assertEqual(counts, dict(hits=0, misses=1, upstream_failures=0))
+            self.assertEqual(counts, dict(hits=0, misses=1, stored=0, upstream_failures=0))
         finally:
             stopped = subprocess.run(["bash", str(helper), "stop"], cwd=SCRIPT.parent.parent,
                                      env=env, capture_output=True, timeout=60)
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertIn("misses=1", (root / "output").read_text())
+        self.assertIn("stored=0", (root / "output").read_text())
 
     def test_stop_kills_an_unresponsive_proxy_and_still_reports_summary(self):
         root = self.root / "stuck-helper"
@@ -426,7 +432,7 @@ class CacheTests(unittest.TestCase):
         state.mkdir(parents=True)
         cache = root / "debian-snapshot-cache"
         cache.mkdir()
-        counts = dict(hits=2, misses=3, upstream_failures=1)
+        counts = dict(hits=2, misses=3, stored=1, upstream_failures=1)
         (state / "summary.json").write_text(json.dumps(counts))
         (state / "proxy.log").write_text("stuck proxy\n")
         (cache / "unfinished.tmp").write_bytes(b"partial")
@@ -446,6 +452,7 @@ class CacheTests(unittest.TestCase):
             self.assertIn(b"SIGKILL", stopped.stderr)
             self.assertEqual(process.wait(timeout=60), -signal.SIGKILL)
             self.assertIn("misses=3", (root / "output").read_text())
+            self.assertIn("stored=1", (root / "output").read_text())
             self.assertEqual(json.loads((root / "summary").read_text()), counts)
             self.assertFalse((state / "ready").exists())
             self.assertFalse((cache / "unfinished.tmp").exists())
@@ -474,7 +481,7 @@ class CacheTests(unittest.TestCase):
         self.upstream.fail = True
         self.assertEqual(self.request()[0], 502)
         self.assertEqual(len(self.upstream.paths), 3)
-        self.assertEqual(self.summary(), dict(hits=0, misses=1, upstream_failures=3))
+        self.assertEqual(self.summary(), dict(hits=0, misses=1, stored=0, upstream_failures=3))
         self.assertEqual(list(self.cache.directory.rglob("*")), [self.cache.directory / self.cache.cache_path(proxy.snapshot_path(URL)).parent.name])
 
     def test_snapshot_redirect_allows_content_address_but_not_foreign_host(self):
@@ -509,9 +516,11 @@ class CacheTests(unittest.TestCase):
                 stdout, _ = process.communicate(timeout=60)
                 self.assertEqual(process.returncode, 0)
                 self.assertFalse(ready.exists())
-                self.assertEqual(json.loads(summary.read_text()), dict(hits=0, misses=1, upstream_failures=0))
+                self.assertEqual(json.loads(summary.read_text()), dict(hits=0, misses=1, stored=0, upstream_failures=0))
                 log.seek(0)
                 self.assertIn(b'"misses": 1', stdout)
+                self.assertIn(b'"stored": 0', stdout)
+                self.assertIn(b'"upstream_failures": 0', stdout)
                 lines = log.read().splitlines()
                 self.assertEqual(len(lines), 1)
                 self.assertIn("502 cache=MISS", lines[0])

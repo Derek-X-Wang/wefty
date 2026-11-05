@@ -56,7 +56,9 @@ case "${1:?start or stop}" in
       cat "$state/summary.json" >> "$GITHUB_STEP_SUMMARY"
       python3 - "$state/summary.json" >> "$GITHUB_OUTPUT" <<'PY'
 import json, sys
-print("misses=" + str(json.load(open(sys.argv[1]))["misses"]))
+counts = json.load(open(sys.argv[1]))
+for counter in ("misses", "stored"):
+    print(counter + "=" + str(counts[counter]))
 PY
       du -sh "$cache"
     fi

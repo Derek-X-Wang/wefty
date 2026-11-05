@@ -372,7 +372,7 @@ jobs:
         if: always()
         run: bash scripts/debian-snapshot-cache.sh stop
       - name: Save filled Debian snapshot files even after a failed build
-        if: always() && steps.debian-cache-summary.outputs.misses != '' && steps.debian-cache-summary.outputs.misses != '0'
+        if: always() && steps.debian-cache-summary.outputs.stored != '' && steps.debian-cache-summary.outputs.stored != '0'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ runner.temp }}/debian-snapshot-cache

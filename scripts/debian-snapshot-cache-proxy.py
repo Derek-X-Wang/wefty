@@ -159,7 +159,7 @@ class SnapshotCache:
         self.opener = opener or SnapshotOpener()
         self.retry_delay = retry_delay
         self.lock = threading.Lock()
-        self.counts = dict(hits=0, misses=0, upstream_failures=0)
+        self.counts = dict(hits=0, misses=0, stored=0, upstream_failures=0)
         self.record()
 
     def record(self, counter=None):
@@ -238,6 +238,7 @@ class SnapshotCache:
                     watchdog.finish()
                     temporary.replace(destination)
                     atomic_json(self.metadata_path(destination), metadata)
+                self.record("stored")
                 return destination, "MISS"
             except (OSError, ValueError, http.client.HTTPException) as error:
                 if isinstance(error, urllib.error.HTTPError):
