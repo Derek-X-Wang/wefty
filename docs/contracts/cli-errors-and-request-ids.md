@@ -603,9 +603,9 @@ that neither matches the published door hostname nor names an IP literal
 Seat's saved credential. Missing credentials fail locally; an invalid or
 cross-Seat credential retains the L1/node `forbidden` refusal (exit 3). Input
 uses `/screen/input`; an input call's optional screenshot is a full
-non-incremental frame after the bounded update wait described below. An update
-within the limit keeps the input connection; a timeout closes it and captures
-on a fresh `/screen/view` connection. Screenshot-only calls use `/screen/view`.
+non-incremental frame after the bounded update wait described below. The
+capture always uses the input connection that sent the input, including after
+a timeout. Screenshot-only calls use `/screen/view`.
 Input is never retried automatically.
 
 `person_driving` remains the existing typed HTTP 409 / CLI exit 5 refusal,
@@ -656,19 +656,38 @@ reply is read before the next request. Empty updates do not count and
 re-requests are paced at 20 ms. Sync must finish even if it consumes the whole
 window; in that case no additional incremental wait is started.
 After a change observed in Sync or an incremental reply, the CLI requests the
-full capture on the same input connection. On timeout, it closes input only
-after Sync succeeded, discards any outstanding incremental request, opens one
-fresh view connection, and captures a full frame there. It never repeats input.
-RFB can merge replies to several requests and has no request ID, so receive
-times or request counts cannot identify a late incremental reply.
-The reopened view does not print a second release note; its latest unread
-count may replace the input connection's count. A Sync or reopen failure retains
-`action_done: true`, is non-retryable, and removes the PNG destination.
+full capture on the same input connection. On timeout, it also captures on the
+input connection (#1484); it never opens a view connection and never repeats
+input. One incremental request may still be outstanding. RFB can merge
+replies to several requests and has no request ID, so receive times or request
+counts cannot identify a late incremental reply. The CLI therefore drains it:
+it sends the full non-incremental request at once, because the incremental may
+never be answered; it receives the outstanding reply and keeps its pixels; then
+it reads further updates on this connection, applying each rectangle in arrival
+order (newer pixels win), until every pixel is covered once. LibVNCServer
+(x11vnc) unions requested regions and may answer both requests with one update;
+neatvnc may answer them separately or leave the incremental unanswered on a
+connection that is then closed. Empty and partial updates are accepted. Every
+reply read this way answers a request sent after the input's Sync, so the
+merged or composite frame never contains a pixel from before the input. A frame
+taken after the input but before the application redraws is correct, not
+stale: the rule forbids only frames from before the input. `frame_after_input`
+stays `false` on this path even if the drained reply carried rectangles,
+because the observation window had expired.
+A fresh view connection is not used because, on x11vnc, its first full frame
+was measured to show the screen from before a change already visible on the
+input connection (#1483).
+A Sync or capture failure retains `action_done: true`, is non-retryable, and
+removes the PNG destination. A reply that never completes ends with the
+call's 15-second deadline and fails the same way; the CLI never falls back to a
+partial frame or a view connection.
 The baseline costs one additional full-frame read; the post-input Sync costs
-one round trip and may have an expanded reply. A timeout also costs one view
-connection and RFB handshake. Sync, baseline, reopen and frame reads use the
-existing transport deadline. Plain `seat screenshot` has no baseline, Sync or
-wait. Input without `--screenshot` keeps its existing one-pixel Sync.
+one round trip and may have an expanded reply. A timeout costs no new
+connection; it waits for the outstanding reply, which the full request
+normally completes, plus any remainder of the full reply. Sync, baseline,
+drain and frame reads use the existing transport deadline. Plain
+`seat screenshot` has no baseline, Sync or wait. Input without `--screenshot`
+keeps its existing one-pixel Sync.
 
 Coordinates must be in `[0,1279] × [0,799]`; malformed arguments fail before
 opening Fabric. `scroll` requires `--dy N`, accepts `--dx N`, and limits each
@@ -687,5 +706,10 @@ The test-only `WEFTY_SEAT_SCREEN_TIMING=1` hook adds JSON `debug` with a
 It records discovery, dial, banner, input, synchronization, capture connection,
 frame and PNG completion times. Combined captures add `frame_baseline` before
 `input_written`, then `sync_done` before any incremental wait, followed by
-`frame_update_seen` or `frame_update_timeout` before `frame_read`. A timeout adds `capture_reopened` after the new view's RFB
-handshake and before `frame_read`. It records no input or framebuffer payloads.
+`frame_update_seen` or `frame_update_timeout` before `frame_read`. A timeout
+with an incremental request outstanding adds `capture_drained` when that
+request's reply has been received successfully, between `frame_update_timeout`
+and `frame_read`, so the drain time is separate from the rest of the full
+reply. A failed drain omits the mark, and so does a timeout with no request
+outstanding (for example, when the limit expires during the 20 ms pacing pause).
+It records no input or framebuffer payloads.

@@ -164,7 +164,7 @@ func TestSeatScreenSyncDeliversQueuedInputBeforeClose(t *testing.T) {
 	if incremental.Load() != 0 {
 		t.Errorf("Sync exhausted window but incremental requests=%d", incremental.Load())
 	}
-	if views.Load() != 1 {
+	if views.Load() != 0 {
 		t.Errorf("view connections=%d", views.Load())
 	}
 	if elapsed < 1150*time.Millisecond || elapsed > 1900*time.Millisecond {
@@ -180,7 +180,11 @@ func TestSeatScreenSyncDeliversQueuedInputBeforeClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := reply.Debug.Phases
-	if reply.After == nil || *reply.After || p["sync_done"]-p["input_written"] < 1150 || p["sync_done"] > p["frame_update_timeout"] || p["capture_reopened"] < p["frame_update_timeout"] {
+	// The window had expired before any incremental request, so nothing drains.
+	if _, drained := p["capture_drained"]; drained {
+		t.Errorf("drained without an outstanding request: %v", p)
+	}
+	if reply.After == nil || *reply.After || p["sync_done"]-p["input_written"] < 1150 || p["sync_done"] > p["frame_update_timeout"] || p["frame_read"] < p["frame_update_timeout"] {
 		t.Errorf("wrong ordering: %s", out.String())
 	}
 	t.Logf("call=%s Sync=%.3fms", elapsed, p["sync_done"]-p["input_written"])
