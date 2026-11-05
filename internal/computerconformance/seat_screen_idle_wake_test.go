@@ -78,10 +78,11 @@ func (o IdleWakeObservation) Premise() error {
 // the premise only has to show that the screen was not busy in the window.
 // An update still incomplete when the grace ends is ignored.
 func ObserveIdleScreen(wire io.ReadWriteCloser, until time.Time) IdleWakeObservation {
-	return observeIdleScreen(wire, until, time.Now, time.After)
+	return observeIdleScreen(wire, until, time.Now, time.After, nil)
 }
 
-func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time.Time, after func(time.Duration) <-chan time.Time) (observation IdleWakeObservation) {
+// handedOver, when not nil, runs after the reader hands an update over.
+func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time.Time, after func(time.Duration) <-chan time.Time, handedOver func()) (observation IdleWakeObservation) {
 	defer wire.Close() // After the grace this close ends the reader; that is the normal end.
 	client, err := rfbclient.Open(wire)
 	if err != nil {
@@ -96,7 +97,9 @@ func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time
 	firstAt := now()
 	// rfbclient reads the wire unbuffered and has no request outstanding
 	// after Frame, so the next byte on the wire starts a new server message.
-	updates := make(chan idleWakeUpdate)
+	// An update counts as completed once the reader has handed it over (into
+	// this one-slot buffer); anything later is incomplete at the grace end.
+	updates := make(chan idleWakeUpdate, 1)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -104,6 +107,9 @@ func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time
 			update := readIdleWakeUpdate(wire, first)
 			select {
 			case updates <- update:
+				if handedOver != nil {
+					handedOver()
+				}
 			case <-done:
 				return
 			}
@@ -122,19 +128,26 @@ func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time
 	if observation.Err = request(); observation.Err != nil {
 		return observation
 	}
+	// failed reports a reader error or a changed pixel, and counts the rest.
+	failed := func(update idleWakeUpdate) bool {
+		if update.err != nil {
+			observation.Err = update.err
+			return true
+		}
+		if update.changed > 0 {
+			observation.Changed, observation.ChangedBox, observation.ChangedAt = update.changed, update.box, now().Sub(firstAt)
+			return true
+		}
+		observation.Updates++
+		return false
+	}
 	deadline, grace := after(until.Sub(firstAt)), (<-chan time.Time)(nil)
 	for {
 		select {
 		case update := <-updates:
-			if update.err != nil {
-				observation.Err = update.err
+			if failed(update) {
 				return observation
 			}
-			if update.changed > 0 {
-				observation.Changed, observation.ChangedBox, observation.ChangedAt = update.changed, update.box, now().Sub(firstAt)
-				return observation
-			}
-			observation.Updates++
 			if len(update.rects) == 0 {
 				time.Sleep(20 * time.Millisecond) // Pace empty replies.
 			}
@@ -144,6 +157,13 @@ func observeIdleScreen(wire io.ReadWriteCloser, until time.Time, now func() time
 		case <-deadline:
 			deadline, grace = nil, after(IdleWakeGrace)
 		case <-grace:
+			select { // A handed-over update still counts, even if grace won the select.
+			case update := <-updates:
+				if failed(update) {
+					return observation
+				}
+			default:
+			}
 			observation.Observed = max(until.Sub(firstAt), 0)
 			return observation
 		}
@@ -417,7 +437,7 @@ func TestObserveIdleScreen(t *testing.T) {
 			e := env{f, &idleWakeTimers{asked: make(chan time.Duration, 2), deadline: make(chan time.Time, 1), grace: make(chan time.Time, 1)}}
 			result := make(chan IdleWakeObservation, 1)
 			go func() {
-				result <- observeIdleScreen(wire, until, func() time.Time { return test.firstAt }, e.timers.after)
+				result <- observeIdleScreen(wire, until, func() time.Time { return test.firstAt }, e.timers.after, nil)
 			}()
 			for _, step := range test.steps {
 				step(t, e)
@@ -442,5 +462,47 @@ func TestObserveIdleScreen(t *testing.T) {
 				t.Fatalf("Premise = %v, want %q", err, test.premise)
 			}
 		})
+	}
+}
+
+// A changed update the reader has handed over when grace fires must still
+// fail. The test holds the observer inside its grace timer call until the
+// update is handed over, so both are ready at its next select; select picks
+// either at random, so repeat to make a missing drain fail almost surely.
+func TestObserveIdleScreenChecksAHandedOverUpdateAtGrace(t *testing.T) {
+	a, b := color.RGBA{R: 24, G: 32, B: 48, A: 255}, color.RGBA{G: 255, A: 255}
+	base := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	for attempt := range 32 {
+		f, wire := newIdleWakeFake(t, a)
+		deadline, inGrace, release := make(chan time.Time, 1), make(chan struct{}), make(chan struct{})
+		fired := make(chan time.Time, 1)
+		fired <- base
+		calls := 0
+		after := func(time.Duration) <-chan time.Time {
+			if calls++; calls == 1 {
+				return deadline
+			}
+			close(inGrace)
+			<-release
+			return fired
+		}
+		handed := make(chan struct{}, 4)
+		result := make(chan IdleWakeObservation, 1)
+		go func() {
+			result <- observeIdleScreen(wire, base.Add(IdleWakeQuiet), func() time.Time { return base }, after, func() { handed <- struct{}{} })
+		}()
+		deadline <- base
+		<-inGrace
+		f.answer(t, image.Rect(0, 0, 4, 3), b)
+		<-handed
+		close(release)
+		select {
+		case observation := <-result:
+			if observation.Changed != 12 || observation.Premise() == nil {
+				t.Fatalf("attempt %d: observation = %+v, want the handed-over change of 12 pixels", attempt, observation)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("attempt %d: observer did not return", attempt)
+		}
 	}
 }
