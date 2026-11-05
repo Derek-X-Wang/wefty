@@ -478,6 +478,7 @@ func (h *seatScreenHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	binding, err := h.config.control.AuthorizeSeatScreen(r.Context(), id, l1.SeatScreenAuthorityInput{SeatCopyAuthorityInput: h.input(r.Header.Get(l1.SeatCredentialHeader)), Input: input})
 	timing("l1_authorize_returned")
 	if err != nil {
+		logSeatTransportFailure(r.Context(), "screen authorization", err)
 		writeSeatScreenError(w, err)
 		return
 	}
@@ -560,6 +561,7 @@ func writeSeatScreenError(w http.ResponseWriter, err error) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(contract.ErrorResponse{Error: api})
 }
+
 func (c *Client) AuthorizeSeatScreen(ctx context.Context, id string, r l1.SeatScreenAuthorityInput) (l1.SeatScreenAuthority, error) {
 	var value l1.SeatScreenAuthority
 	err := c.post(ctx, "/v1/agent/seats/"+id+"/screen-authority", r, &value)

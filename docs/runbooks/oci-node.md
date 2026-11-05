@@ -71,9 +71,16 @@ wefty node oci off
 
 `oci always-on` restores transport, completes the boot sweep barrier and functional probe, then advertises capability. `oci off` persists disabled first, withdraws local admission and publication, reaps OCI attempts, and then stops Lima on Mac; Linux containerd is left alone.
 
-An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, zero live OCI attempts, and positive proof that no Computer Storage generation or Backup copy remains on the host VM disk. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
+An unchanged setup rerun causes no restart, intent revision, or capability revision. Sizing changes are restart-required and need `--apply-restart`; topology or mount-root changes are recreate-required and need `--recreate`, explicit operator confirmation, zero live OCI attempts, and positive proof that no Computer Storage generation, Backup copy, service data or Custody write record remains on the host VM disk. The Mac VM defaults are a fixed setup-time reservation: 25% of host memory capped at 4 GiB, 4 vCPU capped at half the logical cores, and 32 GiB disk; Computer admission separately ships a configured 4 GiB ceiling and a reserve proportional to the VM memory. Linux setup defaults capacity to `MemTotal` with a reserve of `min(1 GiB, 25%)`. Per-job limits remain independent.
 
-Stopped Computers keep their Storage and therefore block recreation too. The
+Stopped Computers keep their Storage and therefore block recreation too.
+Stopped service data and owner records also block. For a known job with a valid
+owner record, save any data you need, then run `wefty services remove JOB_ID --wait 60s`.
+Missing or damaged owner records, or an unknown job, need node-owner recovery;
+keep the VM until recovery is complete. Custody records name the Computer and
+export; save any data you need, then run
+`wefty services remove COMPUTER --expect-current --wait 60s`. Completed write
+records remain protected while present. The
 shared guard stops helper writes while it inspects the durable guest files.
 A stopped or unavailable host VM refuses inspection; the guard never starts it.
 If necessary, explicitly start OCI before rerunning setup. Backup supersession
@@ -567,18 +574,45 @@ Meaning: sizing differs and requires an authorized restart. Evidence: record old
 
 ## doctor-code-oci-convergence-recreate-required
 
-Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference, positive zero-live-attempt proof, and a current absence proof for Computer Storage and Backup copies. First action: obtain explicit operator confirmation, remove or export the named retained data through owner operations if needed, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory; `host_vm_recreate_blocked` is not an acknowledged-loss override.
+Meaning: topology or mount-root change requires instance recreation. Evidence: record the classified difference, positive zero-live-attempt proof, and a current absence proof for Computer Storage, Backup copies, service data and Custody write records. First action: obtain explicit operator confirmation, follow the per-blocker recovery action below, then rerun setup with `--recreate`. Escalation: never recreate from an unavailable or inferred inventory; `host_vm_recreate_blocked` is not an acknowledged-loss override.
 
 ## host-vm-recreate-blocked
 
 `host_vm_recreate_blocked` is a node-local HTTP 409 refusal and CLI exit 5,
 with `retryable=false`. In JSON, nonempty `details.blockers` names Computer,
-Storage, Backup and copy IDs from helper manifests; `details.reason` explains
-an unavailable or invalid inventory. Human output carries the same explanation.
-Remove or export the named Computer or Backup, then manually rerun setup with
-`--recreate`. If an identity is unavailable, inspect its helper record before
-choosing an owner operation. A refused-copy record is not an allocated Storage
-generation, but still requires inspection and blocks deletion.
+Storage, Backup, copy, service/job and Custody export identities and gives each
+blocker's action. `details.reason` explains an unavailable or invalid inventory.
+Human output carries the same explanation.
+
+- Service data with a known job and a valid owner record: save any data you need,
+  then run `wefty services remove JOB_ID --wait 60s`. Owner records retain the job
+  ID after a clean stop. Legacy records attempt a backfill on their next use;
+  failure logs a diagnostic and does not block an already-valid startup.
+- A service volume without an owner record, a damaged record, or an unknown job:
+  node-owner recovery is needed. Keep the VM until recovery is complete;
+  ordinary removal cannot resolve a missing or damaged owner record.
+- Computer Storage or Custody write records: save any data you need, then run
+  `wefty services remove COMPUTER --expect-current --wait 60s`. Custody markers,
+  including completed writes, use Computer removal for cleanup. If the Computer
+  is already removed, the helper may clear the record at its next start, which
+  sweeps Computer Storage (for example when the host VM or the wefty agent
+  restarts), or at the next Computer disk removal, once no Storage of that
+  Computer is left on the node. The helper journal names the Computer and the
+  blocking entry when another Computer's entry or an unreadable entry defers the
+  drop. To force a start, restart the helper unit:
+  `limactl shell <instance> sudo systemctl restart dev.wefty.oci-helper.service`
+  on a Lima node, or `systemctl restart wefty-oci-helper.service` on a native
+  Linux node. A restart ends running OCI work, so do it only when that is
+  acceptable. If the record remains after that, keep the VM and use node-owner
+  recovery.
+- Backup copies: save any data you need, then run
+  `wefty services backup prune COMPUTER BACKUP --expect-current --idempotency-key KEY --wait 60s`
+  with a new `KEY`.
+
+Unknown identities, quarantine, unresolved reset and refused-copy records need
+node-owner recovery. A refused-copy record is not an allocated Storage generation,
+but still blocks deletion. Rerun setup with `--recreate` only after all blockers
+are resolved.
 
 If the host VM is stopped, start OCI explicitly before a new inspection. A
 missing lazy runtime root is empty only when its real parent enumerates

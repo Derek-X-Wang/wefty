@@ -77,6 +77,23 @@ waits of one and two seconds; if all change, exec submits nothing and reports
 retryable `conflict` (exit 5). The run does not read the source checkout after
 submission.
 
+## Ignored dependency folders
+
+Git-ignored dependency folders are not captured. Before submission, exec checks
+for existing `node_modules` and `.venv` folders at the checkout root and in the
+command's working folder, if different. If a folder is absent from the frozen
+capture and Git reports ignored content beneath it, exec prints one notice on
+stderr listing the folders that will not be present in the run. This includes
+content-only rules such as `node_modules/*`. A folder with a captured file,
+including a file kept by an ignore-rule exception, does not get a notice.
+This check is best effort: a Git error prints no notice. The notice never blocks
+submission or changes exit codes or stdout, including `--json` events.
+
+Prepare dependencies inside the command with an explicit shell, for example
+`wefty exec -- sh -c 'npm ci && npm test'` for Node.js, or
+`wefty exec -- sh -c 'uv sync && uv run pytest'` for Python. The selected Node
+must have the required package manager installed. Ignored folders are not copied.
+
 ## Cross-node capture transport
 
 Only a run Pinned to another Node uses the bundle transport. The CLI creates
@@ -334,7 +351,8 @@ stdout. Success exits 0. Failure uses the shared
 `runOutcomeError` typed-exit entry and exits 10. When the command itself exits
 127, exec prints one `wefty:` hint on stderr, before the verdict, that the
 command was likely not on the run's PATH; `--json` prints the same line on
-stderr. On failure (`outcome=fail`), exec also checks the caller's captured
+stderr. On failure (`outcome=fail`), exec also checks dependency kinds not already
+named in a successfully written pre-submit notice. It checks the caller's captured
 checkout folder and its ancestors up to the repo root for existing,
 Git-ignored dependency folders. It prints at most one line per kind on stderr
 in plain and JSON modes, after the PATH hint when present:
@@ -345,7 +363,7 @@ wefty: this checkout's .venv is Git-ignored, so the run did not get it; install 
 ```
 
 These checks are best effort: an error prints no dependency hints and never
-changes the command's exit code. Success prints no dependency hints.
+changes the command's exit code. Success prints no post-run dependency hints.
 SIGINT, SIGTERM and SIGHUP cancel
 the run unless `--keep-running` or `--detach` is set. The CLI prints `wefty: cancelling run <id>` before the cancel request.
 An accepted cancellation is reported as cancelled; later observation serves

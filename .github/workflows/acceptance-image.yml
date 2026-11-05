@@ -399,6 +399,18 @@ jobs:
           driver-opts: |
             image=moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8
             network=host
+      # Cache immutable snapshot files for apt and source builds; keep both empty-cache image solves unchanged.
+      - name: Restore Debian snapshot files
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/debian-snapshot-cache
+          key: debian-snapshot-v1-reference-computer-platform-build-${{ matrix.arch }}-${{ matrix.variant }}-20260827T000000Z-${{ hashFiles('examples/computer/Dockerfile', 'examples/computer-wayland/Dockerfile', 'examples/computer/fixtures/Dockerfile.wayland-text') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: debian-snapshot-v1-reference-computer-platform-build-${{ matrix.arch }}-${{ matrix.variant }}-20260827T000000Z-${{ hashFiles('examples/computer/Dockerfile', 'examples/computer-wayland/Dockerfile', 'examples/computer/fixtures/Dockerfile.wayland-text') }}-
+      - name: Start the Debian snapshot cache proxy
+        env:
+          ARCH: ${{ matrix.arch }}
+          PROBE_PACKAGE: ${{ matrix.variant == 'wayland' && 'pool/main/w/wayvnc/wayvnc_0.9.1-1' || 'pool/main/x/xorg-server/xvfb_21.1.7-3%2bdeb12u12' }}
+        run: bash scripts/debian-snapshot-cache.sh start "${PROBE_PACKAGE}_${ARCH}.deb"
       - name: Build the reference desktop into its execution shape
         env:
           PLATFORM: linux/${{ matrix.arch }}
@@ -412,13 +424,16 @@ jobs:
           target=()
           case "$VARIANT" in xfce) target=(--target single-seat) ;; esac
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${target[@]}" \
+            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${target[@]}" \
+            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
       - name: Execute the exact desktop digest and assert its ELF architecture
         env:
+          WEFTY_DEBIAN_SNAPSHOT_PROXY: ${{ matrix.variant == 'wayland' && env.DEBIAN_CACHE_PROXY || '' }}
           PLATFORM: linux/${{ matrix.arch }}
           ARCH: ${{ matrix.arch }}
           VARIANT: ${{ matrix.variant }}
@@ -459,7 +474,7 @@ jobs:
           docker pull --platform "$PLATFORM" "$pinned_reference"
           stage='runtime-conformance'
           scripts/test-computer-image-runtime.sh --image "$pinned_reference" --arch "$ARCH" --evidence "$evidence" \
-            --edge-process-pattern "$EDGE_PROCESS_PATTERN"
+            --edge-process-pattern "$EDGE_PROCESS_PATTERN" --reference-surface-probe
           stage='image-measurement'
           scripts/measure-computer-image.sh --image "$pinned_reference" --arch "$ARCH" \
             --conformance-receipt "$evidence/${ARCH}-runtime.json" --output "$evidence/${ARCH}-metrics.json"
@@ -489,6 +504,16 @@ jobs:
             '.digest = $digest | .elf_e_machine = $e_machine' "$evidence/${ARCH}-runtime.json" \
             > "$evidence/${ARCH}-runtime.complete.json"
           mv "$evidence/${ARCH}-runtime.complete.json" "$evidence/${ARCH}-runtime.json"
+      - name: Stop the Debian snapshot cache proxy and report counts
+        id: debian-cache-summary
+        if: always()
+        run: bash scripts/debian-snapshot-cache.sh stop
+      - name: Save filled Debian snapshot files even after a failed build
+        if: always() && steps.debian-cache-summary.outputs.stored != '' && steps.debian-cache-summary.outputs.stored != '0'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/debian-snapshot-cache
+          key: debian-snapshot-v1-reference-computer-platform-build-${{ matrix.arch }}-${{ matrix.variant }}-20260827T000000Z-${{ hashFiles('examples/computer/Dockerfile', 'examples/computer-wayland/Dockerfile', 'examples/computer/fixtures/Dockerfile.wayland-text') }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Upload reference desktop evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -558,7 +583,10 @@ jobs:
           test "$(jq -r --arg digest "$arm64_digest" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64" and .digest == $digest)] | length' "$RUNNER_TEMP/computer-image-index.json")" = 1
           test "$(jq -r '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$RUNNER_TEMP/computer-image-index.json")" = 2
           # shellcheck disable=SC2016 # $digest is a jq variable, not a shell expansion.
-          receipt_assertion='def pass($id): ([.checks[] | select(.id == $id and .status == "PASS")] | length) == 1; .digest == $digest and .image_status == "PASS" and .harness_status == "PASS" and .containerd_profile_status == "NOT-RUN" and (.checks | length) == 60 and pass("transport.view-ready") and pass("transport.control-ready") and pass("transport.text-frame-rejected") and pass("input.view-isolated") and pass("input.view-isolated-during-tenure") and pass("input.control-accepted") and pass("driver.true-consumed") and pass("driver.release-consumed") and pass("persistence.profile-survives") and pass("persistence.sign-in-survives") and pass("persistence.edge-recovers") and ([.checks[] | select(.scope != "containerd-profile" and .status != "PASS")] | length) == 0 and ([.checks[] | select(.scope == "containerd-profile" and .status != "NOT-RUN")] | length) == 0 and .readiness_seconds < 60'
+          receipt_assertion='def pass($id): ([.checks[] | select(.id == $id and .status == "PASS")] | length) == 1; .digest == $digest and .image_status == "PASS" and .harness_status == "PASS" and .containerd_profile_status == "NOT-RUN" and (.checks | length) == 61 and pass("transport.view-ready") and pass("transport.control-ready") and pass("transport.text-frame-rejected") and pass("input.view-isolated") and pass("input.view-isolated-during-tenure") and pass("input.control-accepted") and pass("driver.true-consumed") and pass("driver.release-consumed") and pass("persistence.profile-survives") and pass("persistence.sign-in-survives") and pass("persistence.edge-recovers") and ([.checks[] | select(.id == "screen.input-capture-current-frame" and (.status == "PASS" or .status == "NOT-RUN"))] | length) == 1 and ([.checks[] | select(.scope != "containerd-profile" and .status != "PASS" and (.id != "screen.input-capture-current-frame" or .status != "NOT-RUN"))] | length) == 0 and ([.checks[] | select(.scope == "containerd-profile" and .status != "NOT-RUN")] | length) == 0 and .readiness_seconds < 60'
+          for arch in amd64 arm64; do # Print the optional input-capture proof (PASS or NOT-RUN).
+            jq -r '.checks[] | select(.id == "screen.input-capture-current-frame") | "\(.id) \(.status): \(.detail // "")"' "$RUNNER_TEMP/computer-platforms/$arch-runtime.json"
+          done
           jq -e --arg digest "$amd64_digest" "$receipt_assertion and .elf_e_machine == 62" "$RUNNER_TEMP/computer-platforms/amd64-runtime.json"
           jq -e --arg digest "$arm64_digest" "$receipt_assertion and .elf_e_machine == 183" "$RUNNER_TEMP/computer-platforms/arm64-runtime.json"
       - name: Emit the digest-selected Computer OCI archive
@@ -670,7 +698,10 @@ jobs:
           test "$(jq -r --arg digest "$arm64_digest" '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == "arm64" and .digest == $digest)] | length' "$RUNNER_TEMP/wayland-computer-image-index.json")" = 1
           test "$(jq -r '[.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64"))] | length' "$RUNNER_TEMP/wayland-computer-image-index.json")" = 2
           # shellcheck disable=SC2016 # $digest is a jq variable, not a shell expansion.
-          receipt_assertion='def pass($id): ([.checks[] | select(.id == $id and .status == "PASS")] | length) == 1; .digest == $digest and .image_status == "PASS" and .harness_status == "PASS" and .containerd_profile_status == "NOT-RUN" and (.checks | length) == 60 and pass("transport.view-ready") and pass("transport.control-ready") and pass("transport.text-frame-rejected") and pass("input.view-isolated") and pass("input.view-isolated-during-tenure") and pass("input.control-accepted") and pass("driver.true-consumed") and pass("driver.release-consumed") and pass("persistence.profile-survives") and pass("persistence.sign-in-survives") and pass("persistence.edge-recovers") and ([.checks[] | select(.scope != "containerd-profile" and .status != "PASS")] | length) == 0 and ([.checks[] | select(.scope == "containerd-profile" and .status != "NOT-RUN")] | length) == 0 and .readiness_seconds < 60'
+          receipt_assertion='def pass($id): ([.checks[] | select(.id == $id and .status == "PASS")] | length) == 1; .digest == $digest and .image_status == "PASS" and .harness_status == "PASS" and .containerd_profile_status == "NOT-RUN" and (.checks | length) == 61 and pass("transport.view-ready") and pass("transport.control-ready") and pass("transport.text-frame-rejected") and pass("input.view-isolated") and pass("input.view-isolated-during-tenure") and pass("input.control-accepted") and pass("driver.true-consumed") and pass("driver.release-consumed") and pass("persistence.profile-survives") and pass("persistence.sign-in-survives") and pass("persistence.edge-recovers") and ([.checks[] | select(.id == "screen.input-capture-current-frame" and (.status == "PASS" or .status == "NOT-RUN"))] | length) == 1 and ([.checks[] | select(.scope != "containerd-profile" and .status != "PASS" and (.id != "screen.input-capture-current-frame" or .status != "NOT-RUN"))] | length) == 0 and ([.checks[] | select(.scope == "containerd-profile" and .status != "NOT-RUN")] | length) == 0 and .readiness_seconds < 60'
+          for arch in amd64 arm64; do # Print the optional input-capture proof (PASS or NOT-RUN).
+            jq -r '.checks[] | select(.id == "screen.input-capture-current-frame") | "\(.id) \(.status): \(.detail // "")"' "$RUNNER_TEMP/wayland-computer-platforms/$arch-runtime.json"
+          done
           jq -e --arg digest "$amd64_digest" "$receipt_assertion and .elf_e_machine == 62" "$RUNNER_TEMP/wayland-computer-platforms/amd64-runtime.json"
           jq -e --arg digest "$arm64_digest" "$receipt_assertion and .elf_e_machine == 183" "$RUNNER_TEMP/wayland-computer-platforms/arm64-runtime.json"
           furniture_assertion='.gpu_device_absent == true and .native_wayvnc_websocket == true and .view_disable_input == true and .agent_states_observed == ["idle","working","blocked","done"] and .self_reconfiguration_observed == true and .crash_briefing_observed == true and .mise_stubs_present == true and .license_manifest_present == true and .idle_rss_bytes > 0 and (.cold_start_seconds | type) == "number" and .cold_start_seconds < 60'

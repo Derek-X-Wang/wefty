@@ -28,6 +28,7 @@ import (
 
 func TestSeatFrontDoorRoutesRegisteredFeaturesAndClosesExactAttempt(t *testing.T) {
 	door := newSeatFrontDoor(nil)
+	door.authentication.control = seatDoorCredentialFunc(func(context.Context, string, string) error { return nil })
 	id := "seat_" + strings.Repeat("a", 32)
 	ctx, cancel := context.WithCancel(t.Context())
 	registration, err := door.register(ctx, "computer", "attempt", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
@@ -40,7 +41,7 @@ func TestSeatFrontDoorRoutesRegisteredFeaturesAndClosesExactAttempt(t *testing.T
 	for _, tc := range []struct {
 		path string
 		want int
-	}{{"/v1/seats/" + id + "/future-feature", 204}, {"/unknown", 404}, {"/v1/seats/seat_" + strings.Repeat("b", 32) + "/copy", 404}} {
+	}{{"/v1/seats/" + id + "/future-feature", 204}, {"/unknown", 404}, {"/v1/seats/seat_" + strings.Repeat("b", 32) + "/copy?direction=in&path=file", 200}} {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", tc.path, nil)
 		req.Header.Set(l1.SeatCredentialHeader, "secret")
@@ -51,10 +52,10 @@ func TestSeatFrontDoorRoutesRegisteredFeaturesAndClosesExactAttempt(t *testing.T
 	}
 	cancel()
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/v1/seats/"+id+"/copy", nil)
+	req := httptest.NewRequest("POST", "/v1/seats/"+id+"/copy?direction=in&path=file", nil)
 	req.Header.Set(l1.SeatCredentialHeader, "secret")
 	door.ServeHTTP(w, req)
-	if w.Code != 404 {
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"code":"not_found"`) {
 		t.Fatal("cancelled Attempt still served")
 	}
 	next, err := door.register(t.Context(), "computer", "next", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(202) }))
@@ -128,8 +129,11 @@ func TestSeatFrontDoorPublicationPrecedesReadinessAndWithdraws(t *testing.T) {
 				t.Fatal("publication not withdrawn")
 			}
 			response := httptest.NewRecorder()
-			door.ServeHTTP(response, httptest.NewRequest("POST", "/v1/seats/"+api.list.Seats[0].SeatID+"/copy", nil))
-			if response.Code != 404 {
+			door.authentication.control = seatDoorCredentialFunc(func(context.Context, string, string) error { return nil })
+			request := httptest.NewRequest("POST", "/v1/seats/"+api.list.Seats[0].SeatID+"/copy?direction=in&path=file", nil)
+			request.Header.Set(l1.SeatCredentialHeader, "secret")
+			door.ServeHTTP(response, request)
+			if response.Code != 200 || !strings.Contains(response.Body.String(), `"code":"not_found"`) {
 				t.Fatal("cleanup left a Seat route")
 			}
 		})
@@ -149,7 +153,7 @@ func (f *seatListenerRecorder) Listen(network, address string) (net.Listener, er
 func TestSeatFrontDoorOneFabricListenerForMultipleComputers(t *testing.T) {
 	network := plain.NewNetwork()
 	serverFabric := &seatListenerRecorder{Fabric: network.NewFabric(fabric.Identity{NodeID: "node"})}
-	door, closeDoor, err := startSeatFrontDoor(t.Context(), serverFabric, "node")
+	door, closeDoor, err := startSeatFrontDoor(t.Context(), serverFabric, "node", seatFrontDoorAuthentication{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +213,7 @@ func (f seatNamedFabric) Listen(network, address string) (net.Listener, error) {
 
 func TestSeatFrontDoorRespectsFabricServiceAddress(t *testing.T) {
 	f := seatNamedFabric{plain.NewNetwork().NewFabric(fabric.Identity{NodeID: "fabric-identity"})}
-	_, closeDoor, err := startSeatFrontDoor(t.Context(), f, "different-wefty-node-id")
+	_, closeDoor, err := startSeatFrontDoor(t.Context(), f, "different-wefty-node-id", seatFrontDoorAuthentication{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +245,7 @@ func TestSeatFrontDoorRequiresCredentialBeforeHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	door.ServeHTTP(w, httptest.NewRequest("POST", "/v1/seats/"+id+"/copy", nil))
+	door.ServeHTTP(w, httptest.NewRequest("POST", "/v1/seats/"+id+"/screen/view", nil))
 	var failure contract.ErrorResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &failure); err != nil {
 		t.Fatal(err)
@@ -383,7 +387,7 @@ func TestSeatFrontDoorPlainGenerationsUsePublishedEndpoints(t *testing.T) {
 	serverFabric := &seatListenerRecorder{Fabric: network.NewFabric(fabric.Identity{NodeID: "node"})}
 	clientFabric := network.NewFabric(fabric.Identity{NodeID: "client"})
 	for range 3 {
-		door, closeDoor, err := startSeatFrontDoor(t.Context(), serverFabric, "same-node")
+		door, closeDoor, err := startSeatFrontDoor(t.Context(), serverFabric, "same-node", seatFrontDoorAuthentication{})
 		if err != nil {
 			t.Fatal(err)
 		}

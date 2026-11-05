@@ -815,6 +815,7 @@ immediately before its first measured action. Replace `/ABS/PRIMARY.jsonl` with
 that exact private session file. These commands are shown for SC-2; repeat with
 `SC3` for SC-3. Do not edit the live session file or use aggregate subscription
 usage. The two marker lines enclose an exact copied interval from that session.
+The begin file stores wall-clock nanoseconds for timing across Python processes.
 
 Begin:
 
@@ -827,7 +828,7 @@ if raw and not raw.endswith(b'\n'):
     raise SystemExit('wait for complete JSONL line; session must be paused')
 info = source.stat()
 value = dict(source=str(source.resolve()), offset=len(raw), inode=info.st_ino,
-             device=info.st_dev, begin_monotonic_ns=time.monotonic_ns())
+             device=info.st_dev, begin_wall_ns=time.time_ns())
 with output.open('x') as stream:
     json.dump(value, stream)
 PY
@@ -858,7 +859,7 @@ for record in interval[1:-1]:
         messages[message['id']] = message['usage']
 if not messages or any(any(k not in usage for k in fields) for usage in messages.values()):
     raise SystemExit('usage unavailable or different JSONL schema: tokens NOT-RUN')
-print(json.dumps(dict(wall_seconds=(time.monotonic_ns()-start['begin_monotonic_ns'])/1e9,
+print(json.dumps(dict(wall_seconds=(time.time_ns()-start['begin_wall_ns'])/1e9,
                       tokens={k:sum(usage[k] for usage in messages.values()) for k in fields},
                       assistant_messages=len(messages), interval=sys.argv[2])))
 PY

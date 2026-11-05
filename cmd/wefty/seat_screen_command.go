@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"image/color"
 	"image/png"
 	"io"
 	"net/http"
@@ -23,6 +24,10 @@ import (
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/coder/websocket"
 )
+
+// The owner bounded the post-input wait so a click that does not redraw
+// still meets SC-1 (wefty's part of a click and its screenshot within 1 s).
+const seatScreenSettleLimit = 250 * time.Millisecond
 
 const seatScreenUsage = `usage: wefty seat screenshot SEAT_ID [-o FILE]
        wefty seat click SEAT_ID X Y [--button left|right|double] [--screenshot [FILE]]
@@ -396,30 +401,62 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 		return err
 	}
 	defer close()
+	frameAfterInput := false
+	var inputWritten time.Time
+	var baselinePixel color.RGBA
 	if mode == "input" {
+		if capture != nil {
+			baseline, e := client.Frame()
+			if e != nil {
+				return e
+			}
+			baselinePixel = baseline.RGBAAt(0, 0)
+			timing.mark("frame_baseline")
+		}
 		if err := performSeatScreenInput(client, a); err != nil {
 			return err
 		}
+		inputWritten = time.Now()
 		// All input bytes are written; subsequent failures must not repeat it.
 		actionDone = true
 		timing.mark("input_written")
-		if capture == nil {
-			if err := client.Sync(); err != nil {
-				return err
-			}
-			timing.mark("sync_done")
+		if capture != nil {
+			frameAfterInput, err = client.SyncAfterInput(baselinePixel)
+		} else {
+			err = client.Sync()
 		}
+		if err != nil {
+			return err
+		}
+		timing.mark("sync_done")
 	}
 	if capture != nil {
 		phase = "screenshot"
-		frame, e := client.Frame()
+		if actionDone {
+			var e error
+			if remaining := time.Until(inputWritten.Add(seatScreenSettleLimit)); !frameAfterInput && remaining > 0 {
+				frameAfterInput, e = client.WaitForChange(remaining)
+				if e != nil {
+					return e
+				}
+			}
+			if frameAfterInput {
+				timing.mark("frame_update_seen")
+			} else {
+				timing.mark("frame_update_timeout")
+			}
+		}
+		// After a timeout one incremental request may still be outstanding.
+		// Capture on this input connection anyway: a new view connection's first
+		// frame can predate the input on x11vnc (#1484). Every reply read here
+		// answers a request sent after the input's Sync. A frame taken after the
+		// input but before the application redraws is correct, not stale.
+		// capture_drained marks only a successful drain of an outstanding request.
+		frame, e := client.FrameAfterWait(func() { timing.mark("capture_drained") })
 		if e != nil {
 			return e
 		}
 		timing.mark("frame_read")
-		if actionDone {
-			timing.mark("sync_done") // the full frame also orders the final input
-		}
 		e = png.Encode(capture, frame)
 		e = errors.Join(e, capture.Close())
 		if e != nil {
@@ -434,6 +471,9 @@ func executeSeatScreen(ctx context.Context, clients *apiClients, jsonOutput bool
 	return withSeatReply(stdout, jsonOutput, a.id, unread, func(w io.Writer) error {
 		if jsonOutput {
 			value := map[string]any{"seat_id": a.id, "action": a.command, "path": path, "elapsed_ms": elapsed(), "unread_events": unread}
+			if actionDone && capture != nil {
+				value["frame_after_input"] = frameAfterInput
+			}
 			if timing != nil {
 				value["debug"] = timing.debug()
 			}

@@ -324,6 +324,7 @@ Ignored build outputs, such as binaries in `bin/` or `dist/`, are not copied eit
 Never copy secrets into a run.
 
 Git-ignored folders such as `node_modules`, `.venv` and `target/` are not copied.
+Before submission, exec prints one advisory on stderr for existing `node_modules` and `.venv` folders at the checkout root or command folder when ignored contents leave them absent from the capture; prepare them inside the run, for example `wefty exec -- sh -c 'npm ci && npm test'`.
 Install dependencies inside the command (for example `pnpm install --frozen-lockfile && ...`), or point the tool at an absolute cache path.
 Share only dependency caches, which are keyed by content: `CARGO_HOME`, the pnpm store, `GOMODCACHE`, `GOCACHE`.
 Do not share a project build folder, such as a Cargo `target/`, between runs and the real checkout: builds there can keep the deleted run copy's paths. Use a separate build folder per run, for example under `$TMPDIR`.
@@ -784,8 +785,11 @@ code — see the recipe above.
 
 ## Drive a Seat's screen
 
-Use only your own Seat ID and its saved credential. Each CLI call opens and
-closes one connection, including when an action also captures a screenshot.
+Use only your own Seat ID and its saved credential. Normally each CLI call opens and
+closes one connection. If an input screenshot's update wait times out, the CLI
+closes input and captures through a fresh view connection without repeating input.
+A post-input Sync round trip orders input before either capture path closes it.
+The combined reply prints the release note once and may use the latest unread count.
 
 ```sh
 wefty seat screenshot SEAT_ID                  # prints a new PNG path
@@ -826,7 +830,8 @@ does not mean a new instruction. Every reply carries the shared unread
 Seat-event hint; read it with `wefty logs`.
 
 Use `--json` for `elapsed_ms`, `path`, `unread_events`, and, when nonzero,
-`unread_events_line`. Refusals carry `details.elapsed_ms`. Input calls are
+`unread_events_line`. Input with `--screenshot` counts changes reported by Sync; if Sync reports none, it waits for an update for up to the rest of 250 ms from the input write. It adds JSON `frame_after_input` (true if a change was seen, false on timeout with capture on a fresh view connection).
+Refusals carry `details.elapsed_ms`. Input calls are
 never retried automatically: an interrupted call may already have acted.
 Wefty checks the PNG destination before sending input. Once input bytes are
 written, a later synchronization or screenshot failure says `<action> done; …`

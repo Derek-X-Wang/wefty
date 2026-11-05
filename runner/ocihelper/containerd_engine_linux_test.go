@@ -1597,7 +1597,7 @@ func TestServiceDataDeletionRemovesBytesAndOwnerRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.initializeServiceVolume(volume, resources.ServiceVolumeOwnerRecord, fresh, uint32(os.Getuid()), uint32(os.Getgid())); err != nil {
+	if err := engine.initializeServiceVolume(volume, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], fresh, uint32(os.Getuid()), uint32(os.Getgid())); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(volume, "tenant-bytes"), []byte("delete me"), 0o600); err != nil {
@@ -1865,7 +1865,7 @@ func TestServiceDataVolumeInitializesOwnerOnlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, fresh, uid, gid); err != nil {
+	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], fresh, uid, gid); err != nil {
 		t.Fatal(err)
 	}
 	var stat syscall.Stat_t
@@ -1876,13 +1876,13 @@ func TestServiceDataVolumeInitializesOwnerOnlyOnce(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("service bytes\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid, gid); err != nil {
+	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], nil, uid, gid); err != nil {
 		t.Fatal(err)
 	}
 	if payload, err := os.ReadFile(marker); err != nil || string(payload) != "service bytes\n" {
 		t.Fatalf("service data after repeated initialization = %q err=%v", payload, err)
 	}
-	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid+1, gid); err == nil {
+	if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], nil, uid+1, gid); err == nil {
 		t.Fatal("service data volume was re-owned for a different image identity")
 	}
 }
@@ -1906,13 +1906,13 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 	}
 
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-	initializeFresh := func(t *testing.T, engine *ContainerdEngine, path, recordName string) error {
+	initializeFresh := func(t *testing.T, engine *ContainerdEngine, path string, resources ResourceIdentity) error {
 		t.Helper()
 		fresh, err := serviceVolumeCreationAt(path)
 		if err != nil {
 			return err
 		}
-		return engine.initializeServiceVolume(path, recordName, fresh, uid, gid)
+		return engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], fresh, uid, gid)
 	}
 	newFixture := func(t *testing.T, jobID string) (*ContainerdEngine, ResourceIdentity, string, string) {
 		t.Helper()
@@ -1935,7 +1935,7 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := initializeFresh(t, engine, path, resources.ServiceVolumeOwnerRecord); err != nil {
+		if err := initializeFresh(t, engine, path, resources); err != nil {
 			t.Fatal(err)
 		}
 		before, err := os.ReadFile(record)
@@ -1960,7 +1960,7 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := initializeFresh(t, engine, path, resources.ServiceVolumeOwnerRecord); err != nil {
+		if err := initializeFresh(t, engine, path, resources); err != nil {
 			t.Fatalf("fresh directory was rejected by orphan record: %v", err)
 		}
 		after, err := os.ReadFile(record)
@@ -1988,7 +1988,7 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := initializeFresh(t, engine, path, resources.ServiceVolumeOwnerRecord); err != nil {
+		if err := initializeFresh(t, engine, path, resources); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(path, "data"), []byte("retained\n"), 0o600); err != nil {
@@ -2001,7 +2001,7 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err := unix.Stat(path, &before); err != nil {
 			t.Fatal(err)
 		}
-		if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid, gid); err != nil {
+		if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], nil, uid, gid); err != nil {
 			t.Fatalf("matching directory without record was rejected: %v", err)
 		}
 		var after unix.Stat_t
@@ -2021,7 +2021,7 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err := os.MkdirAll(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid, gid); err != nil {
+		if err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], nil, uid, gid); err != nil {
 			t.Fatalf("interrupted empty directory initialization was not recovered: %v", err)
 		}
 		if _, err := os.Stat(record); err != nil {
@@ -2037,7 +2037,7 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(path, "data"), []byte("retained\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, nil, uid+1, gid)
+		err := engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], nil, uid+1, gid)
 		var rejection *ServiceDataRejectionError
 		if !errors.As(err, &rejection) || rejection.ActualUID != uid || rejection.WantedUID != uid+1 {
 			t.Fatalf("owner mismatch = %#v, want typed actual/wanted rejection", err)
@@ -2059,7 +2059,7 @@ func TestServiceDataOwnerRecordRecoveryRows(t *testing.T) {
 		if err := os.Mkdir(path, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		err = engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, fresh, uid, gid)
+		err = engine.initializeServiceVolume(path, resources.ServiceVolumeOwnerRecord, resources.Labels["io.wefty/job_id"], fresh, uid, gid)
 		var rejection *ServiceDataRejectionError
 		if !errors.As(err, &rejection) || !strings.Contains(rejection.Reason, "identity changed") {
 			t.Fatalf("fresh directory swap = %v, want typed identity rejection", err)
@@ -3436,6 +3436,159 @@ func TestComputerDisplayDialRefusesMissingIsolationAuthority(t *testing.T) {
 			var refusal *ComputerAttemptAuthorityRefusalError
 			if !errors.As(err, &refusal) {
 				t.Fatalf("missing %s: got %v want typed refusal", missing, err)
+			}
+		})
+	}
+}
+
+// The job label must survive Attempt cleanup without changing the v1 inode and
+// numeric-owner contract, including records written by an older helper.
+func TestServiceDataOwnerRecordRetainsJobIdentity(t *testing.T) {
+	for _, shape := range []string{"created", "legacy backfill", "legacy deletion"} {
+		t.Run(shape, func(t *testing.T) {
+			const jobID = "service-owner-label"
+			root := t.TempDir()
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+			name, err := DeterministicServiceVolumeDirectory(jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "service-data", name)
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(root, "service-data-state", name+".owner")
+			var before unix.Stat_t
+			if err := unix.Stat(path, &before); err != nil {
+				t.Fatal(err)
+			}
+			var fresh *serviceVolumeCreation
+			if shape == "created" {
+				fresh, err = serviceVolumeCreationAt(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.MkdirAll(filepath.Dir(marker), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				legacy := serviceVolumeOwnerRecord{Version: 1, Device: uint64(before.Dev), Inode: before.Ino, UID: before.Uid, GID: before.Gid}
+				payload, err := json.Marshal(legacy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if bytes.Contains(payload, []byte("job_id")) {
+					t.Fatal("legacy fixture contains the new field")
+				}
+				if err := os.WriteFile(marker, payload, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(path, "retained"), []byte("keep service data"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if shape == "legacy deletion" {
+				if err := engine.deleteServiceDataVolume(jobID); err != nil {
+					t.Fatalf("old owner record rejected by deletion: %v", err)
+				}
+				for _, removed := range []string{path, marker} {
+					if _, err := os.Lstat(removed); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("old-record deletion left %s: %v", removed, err)
+					}
+				}
+				return
+			}
+			if err := engine.initializeServiceVolume(path, name+".owner", jobID, fresh, before.Uid, before.Gid); err != nil {
+				t.Fatalf("initialize %s: %v", shape, err)
+			}
+			payload, err := os.ReadFile(marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got serviceVolumeOwnerRecord
+			if err := json.Unmarshal(payload, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.Version != 1 || got.JobID != jobID || got.Device != uint64(before.Dev) || got.Inode != before.Ino || got.UID != before.Uid || got.GID != before.Gid {
+				t.Fatalf("owner record = %+v, directory = %+v", got, before)
+			}
+			if shape == "legacy backfill" {
+				if payload, err := os.ReadFile(filepath.Join(path, "retained")); err != nil || string(payload) != "keep service data" {
+					t.Fatalf("backfill changed service data: %q, %v", payload, err)
+				}
+			}
+		})
+	}
+}
+
+func TestServiceDataOwnerWriteFailureOnlyAllowsOptionalBackfill(t *testing.T) {
+	for _, shape := range []string{"legacy backfill", "missing record", "fresh directory"} {
+		t.Run(shape, func(t *testing.T) {
+			const jobID = "service-optional-label"
+			root := t.TempDir()
+			engine := &ContainerdEngine{config: NativeEngineConfig{RuntimeRoot: root}}
+			name, err := DeterministicServiceVolumeDirectory(jobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(root, "service-data", name)
+			if err := os.MkdirAll(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(path, "retained"), []byte("keep service data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stat unix.Stat_t
+			if err := unix.Stat(path, &stat); err != nil {
+				t.Fatal(err)
+			}
+			markerRoot := filepath.Join(root, "service-data-state")
+			marker := filepath.Join(markerRoot, name+".owner")
+			var before []byte
+			var fresh *serviceVolumeCreation
+			if shape == "legacy backfill" {
+				legacy := serviceVolumeOwnerRecord{Version: 1, Device: uint64(stat.Dev), Inode: stat.Ino, UID: stat.Uid, GID: stat.Gid}
+				if err := os.MkdirAll(markerRoot, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				before, err = json.Marshal(legacy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(marker, before, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if shape == "fresh directory" {
+				fresh, err = serviceVolumeCreationAt(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeFailure := errors.New("injected owner-record write failure")
+			writes := 0
+			engine.serviceVolumeOwnerWrite = func(root, recordName string, record serviceVolumeOwnerRecord) error {
+				writes++
+				if root != markerRoot || recordName != name+".owner" || record.JobID != jobID {
+					t.Fatalf("unexpected owner-record write: root=%s name=%s record=%+v", root, recordName, record)
+				}
+				return writeFailure
+			}
+			err = engine.initializeServiceVolume(path, name+".owner", jobID, fresh, stat.Uid, stat.Gid)
+			if shape == "legacy backfill" {
+				if err != nil {
+					t.Fatalf("optional label backfill blocked valid startup: %v", err)
+				}
+				if after, err := os.ReadFile(marker); err != nil || !bytes.Equal(before, after) {
+					t.Fatalf("failed optional backfill changed legacy binding: %q, %v", after, err)
+				}
+			} else if !errors.Is(err, writeFailure) {
+				t.Fatalf("required ownership write failure was swallowed: %v", err)
+			}
+			if writes != 1 {
+				t.Fatalf("owner-record writes = %d, want one", writes)
+			}
+			if data, err := os.ReadFile(filepath.Join(path, "retained")); err != nil || string(data) != "keep service data" {
+				t.Fatalf("owner-record write failure changed service data: %q, %v", data, err)
 			}
 		})
 	}

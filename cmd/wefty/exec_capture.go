@@ -23,7 +23,8 @@ type execCapture struct {
 	Folder        string `json:"relative_folder"`
 
 	// Caller-only context for failure hints; never sent to the run.
-	localRoot string
+	localRoot           string
+	noticedDependencies []string
 }
 
 type execGitError struct {

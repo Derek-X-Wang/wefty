@@ -19,22 +19,24 @@ import (
 // The external command boundary runs the real guest inspection script against
 // durable files, while replacing Lima and systemd. No host VM is started.
 type recreateFixture struct {
-	barrier            *SupervisedBootBarrier
-	root               string
-	state              InstanceState
-	commands           [][]string
-	quiesced           bool
-	recovered          bool
-	inventoryOutput    []byte
-	inventoryErr       error
-	unit               string
-	stopErr            bool
-	helperStopped      bool
-	afterInventory     func([]byte) ([]byte, error)
-	deleteErr          error
-	restoreCalls       int
-	restoreContextErr  error
-	restoreHasDeadline bool
+	barrier                 *SupervisedBootBarrier
+	root                    string
+	state                   InstanceState
+	commands                [][]string
+	quiesced                bool
+	recovered               bool
+	inventoryOutput         []byte
+	inventoryErr            error
+	inventoryFailureCommand string
+	inventoryFailurePath    string
+	unit                    string
+	stopErr                 bool
+	helperStopped           bool
+	afterInventory          func([]byte) ([]byte, error)
+	deleteErr               error
+	restoreCalls            int
+	restoreContextErr       error
+	restoreHasDeadline      bool
 }
 
 func newRecreateFixture(t *testing.T) *recreateFixture {
@@ -48,6 +50,12 @@ func newRecreateFixture(t *testing.T) *recreateFixture {
 	bin := t.TempDir()
 	marker := filepath.Join(bin, "helper-stopped")
 	f.unit = GuestHelperPath + " " + ocihelper.InvocationArg + " --oci-allowed-mount-root=" + GuestAllowedMountRoot
+	for _, name := range []string{"find", "head", "stat"} {
+		script := "#!/bin/sh\nif [ \"$TEST_FAIL_COMMAND\" = " + name + " ]; then\n  for arg do [ \"$arg\" != \"$TEST_FAIL_PATH\" ] || exit 1; done\nfi\nexec /usr/bin/" + name + " \"$@\"\n"
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := os.WriteFile(filepath.Join(bin, "systemctl"), []byte(`#!/bin/sh
 case "$1" in
 show) printf '%s\n' "$TEST_HELPER_UNIT" ;;
@@ -86,7 +94,7 @@ esac
 			shellArgs := append([]string(nil), args[6:]...)
 			shellArgs[len(shellArgs)-1] = f.root
 			command := exec.CommandContext(ctx, "sh", shellArgs...)
-			command.Env = append(os.Environ(), "PATH="+bin+":/usr/bin:/bin", "TEST_HELPER_UNIT="+f.unit, "TEST_STOP_MARKER="+marker, fmt.Sprintf("TEST_STOP_ERROR=%t", f.stopErr))
+			command.Env = append(os.Environ(), "PATH="+bin+":/usr/bin:/bin", "TEST_HELPER_UNIT="+f.unit, "TEST_STOP_MARKER="+marker, fmt.Sprintf("TEST_STOP_ERROR=%t", f.stopErr), "TEST_FAIL_COMMAND="+f.inventoryFailureCommand, "TEST_FAIL_PATH="+f.inventoryFailurePath)
 			output, err := command.CombinedOutput()
 			_, statErr := os.Lstat(marker)
 			f.helperStopped = statErr == nil
@@ -175,12 +183,12 @@ func TestRecreateRefusesEveryRetainedOrUnknownDiskState(t *testing.T) {
 		{"custom helper root", func(f *recreateFixture) { f.unit += " --oci-runtime-root=/other-root" }, "inspection failed"},
 		{"unrecognized helper", func(f *recreateFixture) { f.unit = "unknown helper" }, "inspection failed"},
 		{"empty output", func(f *recreateFixture) { f.inventoryOutput = []byte{} }, "incomplete or invalid"},
-		{"truncated inventory", func(f *recreateFixture) { f.inventoryOutput = []byte("wefty-recreate-inventory-v2\x00") }, "incomplete or invalid"},
+		{"truncated inventory", func(f *recreateFixture) { f.inventoryOutput = []byte("wefty-recreate-inventory-v3\x00") }, "incomplete or invalid"},
 		{"unknown inventory class", func(f *recreateFixture) {
-			f.inventoryOutput = []byte("wefty-recreate-inventory-v2\x00unexpected/entry\x00\x00complete\x00")
+			f.inventoryOutput = []byte("wefty-recreate-inventory-v3\x00unexpected/entry\x00\x00complete\x00")
 		}, "incomplete or invalid"},
 		{"invalid entry identity", func(f *recreateFixture) {
-			f.inventoryOutput = []byte("wefty-recreate-inventory-v2\x00computer-disks/../outside\x00\x00complete\x00")
+			f.inventoryOutput = []byte("wefty-recreate-inventory-v3\x00computer-disks/../outside\x00\x00complete\x00")
 		}, "incomplete or invalid"},
 		{"symlink inventory", func(f *recreateFixture) {
 			if err := os.Symlink(t.TempDir(), filepath.Join(f.root, "computer-disks")); err != nil {
@@ -327,7 +335,7 @@ func TestRecreateRefusalNamesComputerAndBackupIdentities(t *testing.T) {
 	if err == nil {
 		t.Fatal("recreate discarded retained data")
 	}
-	for _, want := range []string{"computer_owner", "storage_kept", "generation 7", "backup_kept", "copy_kept", "computer_held", "storage_held", "Remove or export", "then rerun setup-oci --recreate"} {
+	for _, want := range []string{"computer_owner", "storage_kept", "generation 7", "backup_kept", "copy_kept", "computer_held", "storage_held", "wefty services remove computer_owner --expect-current --wait 60s", "then rerun setup-oci --recreate"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("refusal lacks %q: %v", want, err)
 		}

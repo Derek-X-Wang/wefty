@@ -23,6 +23,7 @@ import (
 	"github.com/Derek-X-Wang/wefty/contract"
 	"github.com/Derek-X-Wang/wefty/fabric"
 	"github.com/Derek-X-Wang/wefty/fabric/plain"
+	"github.com/Derek-X-Wang/wefty/internal/testevidence"
 	"github.com/Derek-X-Wang/wefty/l1"
 	"github.com/Derek-X-Wang/wefty/runner/ocihelper"
 )
@@ -561,12 +562,15 @@ func newManagedProcess(t *testing.T, executable string, arguments ...string) *ma
 	process := &managedProcess{command: exec.Command(executable, arguments...), done: make(chan struct{})}
 	process.command.Stdout = io.MultiWriter(&process.stdout, &process.output)
 	process.command.Stderr = &process.output
-	t.Cleanup(func() { process.stop(t) })
 	return process
 }
 
 func (process *managedProcess) start(t *testing.T) {
 	t.Helper()
+	if process.command.Path == agentBinaryPath {
+		testevidence.CaptureCommand(t, process.command)
+	}
+	t.Cleanup(func() { process.stop(t) })
 	if err := process.command.Start(); err != nil {
 		t.Fatalf("start %s: %v", process.command.Path, err)
 	}

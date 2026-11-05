@@ -134,23 +134,24 @@ type ContainerdEngine struct {
 	ports                       map[uint16]string
 	nextPort                    uint16
 	serviceVolumeMu             sync.Mutex
-	handoffRetentionMu          sync.Mutex                   // serializes receipt publication only; never held across measurement or containerd work
-	handoffMutationGeneration   uint64                       // bumped under handoffRetentionMu by every change to the handoff root's shape
-	handoffScanMu               sync.Mutex                   // guards the cached whole-root scan; never held across the scan itself
-	handoffScan                 *handoffRootScan             // the last whole-root measurement, which every page of one listing is served from
-	afterAttemptOwnershipRename func() error                 // a test fails an ownership publication with its record already renamed into place
-	handoffMeasureEntered       func(string)                 // a test observes when one volume's measurement begins
-	handoffMeasureDescend       func(string, string)         // a test replaces a child between its stat and its open
-	handoffRepairMeasured       func(string)                 // a test pauses repair after measurement and before publication
-	handoffRepairWrite          func(*os.File, []byte) error // a test makes repair's temporary-file write fail
-	handoffRetentionSync        func(string) error           // a test makes a published receipt's directory sync fail
-	handoffVolumeRemoved        func(string) error           // a test observes the window between a volume's removal and its receipt's
-	handoffDetachedRemoving     func(string)                 // a test parks a deletion inside the free of its detached tree
-	handoffFreeChild            func(string, string) error   // a test makes one child of a detached tree fail to free
-	handoffMeasureEntryBudget   int64                        // a test proves the entry bound without planting a million files
-	handoffMeasureOpenBudget    int64                        // a test proves the open bound without planting a million directories
-	handoffInventoryBytes       int                          // a test proves the response byte bound without building a megabyte of fixture
-	handoffScanID               func() (string, error)       // a test supplies deterministic identities for successive cached scans
+	serviceVolumeOwnerWrite     func(string, string, serviceVolumeOwnerRecord) error // a test makes owner-record publication fail
+	handoffRetentionMu          sync.Mutex                                           // serializes receipt publication only; never held across measurement or containerd work
+	handoffMutationGeneration   uint64                                               // bumped under handoffRetentionMu by every change to the handoff root's shape
+	handoffScanMu               sync.Mutex                                           // guards the cached whole-root scan; never held across the scan itself
+	handoffScan                 *handoffRootScan                                     // the last whole-root measurement, which every page of one listing is served from
+	afterAttemptOwnershipRename func() error                                         // a test fails an ownership publication with its record already renamed into place
+	handoffMeasureEntered       func(string)                                         // a test observes when one volume's measurement begins
+	handoffMeasureDescend       func(string, string)                                 // a test replaces a child between its stat and its open
+	handoffRepairMeasured       func(string)                                         // a test pauses repair after measurement and before publication
+	handoffRepairWrite          func(*os.File, []byte) error                         // a test makes repair's temporary-file write fail
+	handoffRetentionSync        func(string) error                                   // a test makes a published receipt's directory sync fail
+	handoffVolumeRemoved        func(string) error                                   // a test observes the window between a volume's removal and its receipt's
+	handoffDetachedRemoving     func(string)                                         // a test parks a deletion inside the free of its detached tree
+	handoffFreeChild            func(string, string) error                           // a test makes one child of a detached tree fail to free
+	handoffMeasureEntryBudget   int64                                                // a test proves the entry bound without planting a million files
+	handoffMeasureOpenBudget    int64                                                // a test proves the open bound without planting a million directories
+	handoffInventoryBytes       int                                                  // a test proves the response byte bound without building a megabyte of fixture
+	handoffScanID               func() (string, error)                               // a test supplies deterministic identities for successive cached scans
 	storageResetMu              sync.Mutex
 	computerBackupMu            sync.Mutex
 	computerReimageMu           sync.Mutex
@@ -1217,7 +1218,7 @@ func (engine *ContainerdEngine) Run(ctx context.Context, request RunRequest) (_ 
 				return errors.Join(ownerErr, closeErr)
 			}
 			if servicePath, ok := managedSources[ManagedVolumeServiceData]; ok {
-				if ownerErr = engine.initializeServiceVolume(servicePath, request.Resources.ServiceVolumeOwnerRecord, freshServiceVolume, uid, gid); ownerErr != nil {
+				if ownerErr = engine.initializeServiceVolume(servicePath, request.Resources.ServiceVolumeOwnerRecord, request.Authority.JobID, freshServiceVolume, uid, gid); ownerErr != nil {
 					closeErr := document.Close()
 					document = nil
 					return errors.Join(ownerErr, closeErr)
@@ -3683,6 +3684,7 @@ func (engine *ContainerdEngine) managedVolumeSources(ctx context.Context, reques
 }
 
 type serviceVolumeOwnerRecord struct {
+	JobID   string `json:"job_id,omitempty"`
 	Version uint8  `json:"version"`
 	Device  uint64 `json:"device"`
 	Inode   uint64 `json:"inode"`
@@ -3725,7 +3727,7 @@ func serviceVolumeCreationAt(path string) (*serviceVolumeCreation, error) {
 	return &serviceVolumeCreation{device: uint64(stat.Dev), inode: stat.Ino}, nil
 }
 
-func (engine *ContainerdEngine) initializeServiceVolume(path, recordName string, fresh *serviceVolumeCreation, uid, gid uint32) error {
+func (engine *ContainerdEngine) initializeServiceVolume(path, recordName, jobID string, fresh *serviceVolumeCreation, uid, gid uint32) error {
 	engine.serviceVolumeMu.Lock()
 	defer engine.serviceVolumeMu.Unlock()
 	if recordName == "" || filepath.Base(path)+".owner" != recordName {
@@ -3780,11 +3782,23 @@ func (engine *ContainerdEngine) initializeServiceVolume(path, recordName string,
 		}
 		actualUID, actualGID = uid, gid
 	}
-	want := serviceVolumeOwnerRecord{Version: 1, Device: uint64(stat.Dev), Inode: stat.Ino, UID: actualUID, GID: actualGID}
-	if !decision.writeRecord && recordPresent && recorded == want {
+	want := serviceVolumeOwnerRecord{Version: 1, JobID: jobID, Device: uint64(stat.Dev), Inode: stat.Ino, UID: actualUID, GID: actualGID}
+	writeRecord := writeAtomicDurableOwnerRecord
+	if engine.serviceVolumeOwnerWrite != nil {
+		writeRecord = engine.serviceVolumeOwnerWrite
+	}
+	if decision.writeRecord {
+		return writeRecord(markerRoot, recordName, want)
+	}
+	if recorded == want {
 		return nil
 	}
-	return writeAtomicDurableOwnerRecord(markerRoot, recordName, want)
+	// The existing inode and numeric-owner binding is valid. Updating only its
+	// optional job label must not turn a previously valid startup into a failure.
+	if err := writeRecord(markerRoot, recordName, want); err != nil {
+		log.Printf("service data job label backfill failed record=%q job_id=%q; existing owner binding remains valid: %v", recordName, jobID, err)
+	}
+	return nil
 }
 
 func writeAtomicDurableOwnerRecord(root, name string, record serviceVolumeOwnerRecord) error {

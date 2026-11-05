@@ -403,3 +403,24 @@ func (c *Client) DeEnrollNodeGeneration(ctx context.Context, nodeID string, requ
 	err := c.post(ctx, "/v1/agent/nodes/"+url.PathEscape(nodeID)+"/generations/de-enroll", request, &inventory)
 	return inventory, err
 }
+
+// AuthenticateSeatScreen probes the same write authority used by bound screens.
+// Only the post-credential Computer mismatch proves a live credential.
+func (c *Client) AuthenticateSeatScreen(ctx context.Context, id, credential string) error {
+	_, err := c.AuthorizeSeatScreen(ctx, id, l1.SeatScreenAuthorityInput{SeatCopyAuthorityInput: l1.SeatCopyAuthorityInput{Credential: credential}})
+	return seatCredentialProbeError(err)
+}
+
+// AuthenticateSeatCopy uses the same read snapshot as bound copy authorization.
+func (c *Client) AuthenticateSeatCopy(ctx context.Context, id, credential string) error {
+	_, err := c.AuthorizeSeatCopy(ctx, id, l1.SeatCopyAuthorityInput{Credential: credential})
+	return seatCredentialProbeError(err)
+}
+
+func seatCredentialProbeError(err error) error {
+	var protocol *ProtocolError
+	if errors.As(err, &protocol) && protocol.StatusCode == http.StatusForbidden && protocol.APIError.Code == contract.ErrorForbidden && protocol.APIError.Message == contract.SeatComputerMismatchMessage {
+		return nil
+	}
+	return err
+}

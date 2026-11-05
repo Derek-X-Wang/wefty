@@ -224,6 +224,9 @@ func newAgentSession(
 }
 
 func (session *agentSession) close() {
+	if session != nil && session.removals != nil {
+		session.removals.stopAcknowledgements()
+	}
 	if session != nil {
 		session.stopUpgradeServiceLeases(true)
 	}
@@ -373,9 +376,15 @@ func (session *agentSession) rejoinGeneration(ctx context.Context, cause error, 
 				if session.logf != nil {
 					session.logf("agent: rejoined node %s", session.registration.NodeID)
 				}
-				if session.removals != nil && session.ociBootBarrier == nil {
-					if err := session.removals.resume(ctx); err != nil && ctx.Err() == nil && session.logf != nil {
-						session.logf("agent: resume service removals: %v", err)
+				if session.removals != nil {
+					var removalErr error
+					if session.ociBootBarrier == nil {
+						removalErr = session.removals.resume(ctx)
+					} else {
+						removalErr = session.removals.resumeAcknowledgements(ctx)
+					}
+					if removalErr != nil && ctx.Err() == nil && session.logf != nil {
+						session.logf("agent: resume service removals: %v", removalErr)
 					}
 				}
 				return nil
@@ -911,6 +920,7 @@ func (session *agentSession) run(ctx context.Context, execute sessionAttemptExec
 		session.stopUpgradeServiceLeases(false)
 		session.attempts.Wait()
 		if session.removals != nil {
+			session.removals.stopAcknowledgements()
 			session.removals.wait()
 		}
 		if session.backups != nil {
@@ -1230,14 +1240,14 @@ func (session *agentSession) claimClassLoop(
 		default:
 		}
 
-		claimStarted := session.clock.Now()
 		if !session.claimsAllowed() {
 			if err := session.waitForClaimWork(ctx, retire, session.claimInterval); err != nil {
 				return destinationFromError(err)
 			}
 			continue
 		}
-		claim, admitted, err := session.claim(ctx, session.gates[gateKey], selector, serviceReservation)
+		var claimCheckpoint authorityCheckpoint
+		claim, admitted, err := session.claim(ctx, session.gates[gateKey], selector, serviceReservation, &claimCheckpoint)
 		if !admitted {
 			if err := session.waitForClaimWork(ctx, retire, session.claimInterval); err != nil {
 				return destinationFromError(err)
@@ -1300,7 +1310,8 @@ func (session *agentSession) claimClassLoop(
 			serviceReservation = true
 		}
 		session.attempts.Add(1)
-		destination, executeErr := session.executeResident(ctx, gateKey, *claim, claimStarted, execute)
+		claimContext := context.WithValue(ctx, claimCheckpointKey{}, claimCheckpoint)
+		destination, executeErr := session.executeResident(claimContext, gateKey, *claim, claimCheckpoint.now, execute)
 		if executeErr != nil {
 			if routed := session.routeError(destination, executeErr); routed != nil {
 				return destinationFromError(routed)
@@ -1561,9 +1572,16 @@ func (session *agentSession) logHeartbeatError(err error) {
 }
 
 func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- destinationError) {
+	var removalFailures <-chan removalAcknowledgementFailure
+	if session.removals != nil {
+		removalFailures = session.removals.ackFailures
+	}
 	backoff := newSessionBackoff(DefaultSessionBackoffBase, DefaultSessionBackoffMax)
 	nextDelay := session.heartbeatInterval
 	for {
+		var response l1.HeartbeatResponse
+		var err error
+		var removalFailure *removalAcknowledgementFailure
 		timer := session.clock.NewTimer(nextDelay)
 		select {
 		case <-ctx.Done():
@@ -1571,11 +1589,12 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 			return
 		case <-timer.C():
 		case <-session.heartbeatWake:
+		case failure := <-removalFailures:
+			err = failure.err
+			removalFailure = &failure
 		}
 		stopTimer(timer)
-		var response l1.HeartbeatResponse
-		var err error
-		if session.registration.AgentGenerationID != "" {
+		if err == nil && session.registration.AgentGenerationID != "" {
 			var retiring bool
 			retiring, err = session.observeGeneration(ctx)
 			if err == nil && retiring {
@@ -1603,6 +1622,9 @@ func (session *agentSession) heartbeatLoop(ctx context.Context, failures chan<- 
 		}
 		if err != nil {
 			observedRejoin := session.rejoinSequence.Load()
+			if removalFailure != nil {
+				observedRejoin = removalFailure.observedRejoin
+			}
 			session.logHeartbeatError(err)
 			classification := classifyAgentProtocolError(err)
 			if session.registration.AgentGenerationID != "" && classification.destination != errorDestinationTransient {
@@ -1711,6 +1733,7 @@ func (session *agentSession) claim(
 	gate classAdmissionGate,
 	selector string,
 	serviceReservation bool,
+	checkpoint ...*authorityCheckpoint,
 ) (*l1.Claim, bool, error) {
 	// Serializing the claim snapshot with the winning response closes the only
 	// local race: a second worker cannot send a stale exclusion set after L1
@@ -1734,6 +1757,9 @@ func (session *agentSession) claim(
 	excluded := make([]string, 0, len(session.residentJobID))
 	for jobID := range session.residentJobID {
 		excluded = append(excluded, jobID)
+	}
+	if len(checkpoint) != 0 {
+		*checkpoint[0] = captureAuthorityCheckpoint(session.clock)
 	}
 	reply, err := session.client.ClaimPoll(
 		ctx, session.registration.NodeID, session.registration.BootSessionID, selector, excluded...,
@@ -2075,6 +2101,9 @@ func (session *agentSession) waitWithoutHeartbeat(ctx context.Context, duration 
 }
 
 func (session *agentSession) quarantine(ctx context.Context, err error) error {
+	if session.removals != nil {
+		session.removals.stopAcknowledgements()
+	}
 	session.setSession(LifecycleQuarantined, DefaultSessionBackoffMax, err)
 	select {
 	case <-ctx.Done():

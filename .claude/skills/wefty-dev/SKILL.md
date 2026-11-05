@@ -74,7 +74,10 @@ variable. A passing l1 subset does not replace the full gates above.
 dogfood-workflow — all secretless by construction; `all-tests-pass`
 aggregates fail-closed and is the only required check. `tsnet-smoke.yml`
 (main + weekly, never PRs) holds the only secret; armed via repo variable
-`TSNET_SMOKE_REQUIRED=true`.
+`TSNET_SMOKE_REQUIRED=true`. `tsnet-headscale.yml` (PR + main, secretless)
+runs the four `tsnet_smoke` tests and a tagged-key negative control against a
+Headscale and DERP relay that `scripts/tsnet-headscale-lane.sh` starts on the
+runner; it is not yet an `all-tests-pass` input.
 
 ## Dogfood
 

@@ -66,12 +66,28 @@ func TestRetirementRecoveredProofSurvivesReceiptPruning(t *testing.T) {
 func TestRetirementSettledAttemptsReleaseOutboxTracking(t *testing.T) {
 	a, store, done, _ := newRetirementFixture(t)
 	for i := 0; i < 32; i++ {
-		_, ready, release := retirementReviewJob(t, store, fmt.Sprintf("settled-tracking-%d", i), false, nil)
+		job, ready, release := retirementReviewJob(t, store, fmt.Sprintf("settled-tracking-%d", i), false, nil)
 		retirementWait(t, "payload ready", func() bool { _, err := os.Stat(ready); return err == nil })
+		a.session.claimMu.Lock()
+		resident := a.session.resident[job.JobID]
+		a.session.claimMu.Unlock()
+		if resident == nil {
+			t.Fatal("ready payload has no live resident")
+		}
+		a.outbox.ownershipMu.RLock()
+		accepted := a.outbox.retirementCompletions[resident.attemptID]
+		a.outbox.ownershipMu.RUnlock()
+		if accepted == nil {
+			t.Fatal("ready payload has no completion tracking")
+		}
 		if err := os.WriteFile(release, nil, 0600); err != nil {
 			t.Fatal(err)
 		}
 		retirementWait(t, "settled runtime joined", func() bool { return a.Status().OneShot.Occupied == 0 })
+		// Runtime exit can hand unfinished delivery to the outbox. Acceptance
+		// and tracking deletion share ownershipMu; joining runtime alone does
+		// not establish this settlement boundary.
+		retirementWait(t, "settled completion accepted", accepted.Load)
 		a.outbox.ownershipMu.RLock()
 		retained := len(a.outbox.retirementCompletions)
 		a.outbox.ownershipMu.RUnlock()

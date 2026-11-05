@@ -21,6 +21,18 @@ import (
 )
 
 var errServiceRemovalRequested = errors.New("service removal requested")
+var errRemovalAcknowledgementPending = errors.New("service removal acknowledgement pending")
+
+type removalAcknowledgementFailure struct {
+	err            error
+	observedRejoin uint64
+}
+
+type removalAcknowledgementTask struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+}
 
 type removalFailureDisposition uint8
 
@@ -67,6 +79,7 @@ type removalController struct {
 	deleteRuntimeData     func(context.Context, workloadrunner.RuntimeRemovalProofRequest) error
 	attestRuntimeRemoval  func(context.Context, workloadrunner.RuntimeRemovalProofRequest) (workloadrunner.RuntimeRemovalAttestation, error)
 	ackRemoval            func(context.Context, localRemoval) error
+	resumeAcknowledgement func(context.Context, localRemoval) (bool, error)
 	ackRemovalQuarantine  func(context.Context, localRemoval, error) error
 	ackRemovalStall       func(context.Context, localRemoval, runtimeRemovalRecord) error
 	recordRemovalFailure  func(context.Context, localRemoval, string, string) error
@@ -75,13 +88,21 @@ type removalController struct {
 	removalStartedAt      func(context.Context, string) (time.Time, error)
 	recordStallDeclared   func(context.Context, localRemoval) error
 	stallBound            time.Duration
+	clock                 Clock
 	now                   func() time.Time
 	finishRemoval         func(context.Context, localRemoval) error
 	removeBackupCopies    func(context.Context, []l1.ComputerBackupPruneDirective) error
 
-	mu       sync.Mutex
-	inflight map[string]struct{}
-	wg       sync.WaitGroup
+	mu                           sync.Mutex
+	inflight                     map[string]struct{}
+	ackTasks                     map[localRemoval]*removalAcknowledgementTask
+	ackResumptions               map[localRemoval]struct{}
+	acksClosed                   bool
+	ackContext                   context.Context
+	ackCancel                    context.CancelFunc
+	ackFailures                  chan removalAcknowledgementFailure
+	notifyAcknowledgementFailure func(removalAcknowledgementFailure)
+	wg                           sync.WaitGroup
 }
 
 func newRemovalController(
@@ -92,12 +113,37 @@ func newRemovalController(
 	nodeID, bootSessionID string,
 	logf func(string, ...any),
 ) *removalController {
+	// Delivery outlives recovery requests; shutdown and authority loss own it.
+	ackContext, ackCancel := context.WithCancel(context.Background())
 	controller := &removalController{
 		client: client, outbox: outbox, managed: managed, session: session,
 		nodeID: nodeID, bootSessionID: bootSessionID, logf: logf,
-		inflight: make(map[string]struct{}),
+		clock:          systemClock{},
+		inflight:       make(map[string]struct{}),
+		ackTasks:       make(map[localRemoval]*removalAcknowledgementTask),
+		ackResumptions: make(map[localRemoval]struct{}),
+		ackContext:     ackContext,
+		ackCancel:      ackCancel,
+		ackFailures:    make(chan removalAcknowledgementFailure, 1),
+	}
+	controller.notifyAcknowledgementFailure = func(failure removalAcknowledgementFailure) {
+		controller.mu.Lock()
+		defer controller.mu.Unlock()
+		// Coalesce notifications by the newest refusal sequence. Dropping a
+		// newer loss behind a stale queued refusal could skip its recovery.
+		select {
+		case queued := <-controller.ackFailures:
+			if queued.observedRejoin > failure.observedRejoin {
+				failure = queued
+			}
+		default:
+		}
+		// Producers are serialized and the single slot is now empty; this
+		// cannot wait for the heartbeat, which may be joining this task.
+		controller.ackFailures <- failure
 	}
 	if outbox != nil {
+		controller.clock = outbox.clock
 		controller.beginRemoval = outbox.beginRemoval
 		controller.loadRuntimeRemoval = outbox.runtimeRemoval
 		controller.listRuntimeRemovals = outbox.pendingRuntimeRemovals
@@ -130,6 +176,9 @@ func newRemovalController(
 		controller.removeResource = managed.remove
 	}
 	controller.ackRemoval = controller.acknowledge
+	controller.resumeAcknowledgement = func(ctx context.Context, removal localRemoval) (bool, error) {
+		return controller.acknowledgeRemoval(ctx, removal, true)
+	}
 	controller.ackRemovalQuarantine = controller.acknowledgeQuarantine
 	controller.ackRemovalStall = controller.acknowledgeStall
 	return controller
@@ -222,6 +271,9 @@ func (controller *removalController) process(ctx context.Context, directive l1.R
 	removal := localRemoval{
 		jobID: directive.JobID, kind: directive.Kind, generation: directive.RemovalGeneration,
 		rootInstanceID: directive.RootInstanceID, cleanupFence: directive.CleanupFence,
+	}
+	if controller.acknowledgementPending(removal) {
+		return nil
 	}
 	if removal.kind != contract.JobKindProcess && removal.kind != contract.JobKindOCI {
 		return fmt.Errorf("removal directive for service %q has invalid workload kind %q", directive.JobID, removal.kind)
@@ -393,8 +445,15 @@ func (controller *removalController) completeLocalRemoval(ctx context.Context, r
 		}
 	}
 	if err := controller.ackRemoval(ctx, removal); err != nil {
+		if errors.Is(err, errRemovalAcknowledgementPending) {
+			return nil
+		}
 		return err
 	}
+	return controller.finishAcknowledgedRemoval(ctx, removal)
+}
+
+func (controller *removalController) finishAcknowledgedRemoval(ctx context.Context, removal localRemoval) error {
 	if err := controller.finishRemoval(ctx, removal); err != nil {
 		return err
 	}
@@ -649,6 +708,9 @@ func (controller *removalController) prepareAuthorityLoss(ctx context.Context, j
 // validate -- record validation is what would prove the declaration.
 func (controller *removalController) resumeRuntimeRemoval(ctx context.Context, removal localRemoval,
 	record *runtimeRemovalRecord, computerStorages []*workloadrunner.ComputerStorage) error {
+	if controller.acknowledgementPending(removal) {
+		return nil
+	}
 	err := controller.continueRuntimeRemoval(ctx, removal, record, computerStorages, nil)
 	if err == nil || ctx.Err() != nil || record.stallDeclaredAt == nil || record.invalidReason != "" {
 		return err
@@ -712,6 +774,9 @@ func (controller *removalController) resume(ctx context.Context) error {
 		}
 		intent.processTreeReaped = removal.processTreeReaped
 		removal = intent
+		if controller.acknowledgementPending(removal) {
+			continue
+		}
 		if removal.kind == contract.JobKindOCI {
 			record, found, err := controller.loadRuntimeRemoval(ctx, removal.jobID)
 			if err != nil {
@@ -746,6 +811,9 @@ func (controller *removalController) resume(ctx context.Context) error {
 			}
 		}
 		if err := controller.ackRemoval(ctx, removal); err != nil {
+			if errors.Is(err, errRemovalAcknowledgementPending) {
+				continue
+			}
 			return err
 		}
 		if err := controller.finishRemoval(ctx, removal); err != nil {
@@ -1025,17 +1093,193 @@ func storageGenerationClaims(claims *l1.ComputerStorageGenerationClaims) []l1.Co
 	return claims.Generations
 }
 
+// The reap marker is evidence, not part of the removal's durable identity.
+func removalAcknowledgementIdentity(removal localRemoval) localRemoval {
+	removal.processTreeReaped = false
+	return removal
+}
+
+func (controller *removalController) acknowledgementPending(removal localRemoval) bool {
+	controller.mu.Lock()
+	task, pending := controller.ackTasks[removalAcknowledgementIdentity(removal)]
+	controller.mu.Unlock()
+	if pending && task.ctx.Err() != nil {
+		// A rejoin may reach the durable row before its cancelled delivery task
+		// has unwound. Join that task before replaying under the new context.
+		<-task.done
+		return false
+	}
+	return pending
+}
+
+// OCI registration has already scanned removals before rejoin advances its
+// sequence. Resume only ACKs refused during that scan/publication window;
+// repeating the full scan would repeat cleanup and change its readiness gate.
+func (controller *removalController) resumeAcknowledgements(ctx context.Context) error {
+	controller.mu.Lock()
+	removals := make([]localRemoval, 0, len(controller.ackResumptions))
+	for removal := range controller.ackResumptions {
+		removals = append(removals, removal)
+	}
+	controller.mu.Unlock()
+	var failures []error
+	for _, removal := range removals {
+		admitted, err := controller.resumeAcknowledgement(ctx, removal)
+		if errors.Is(err, errRemovalAcknowledgementPending) {
+			continue
+		}
+		if admitted && err == nil {
+			err = controller.finishAcknowledgedRemoval(ctx, removal)
+		}
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
+}
+
+func removalAcknowledgementRetryable(err error) bool {
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) {
+		return true
+	}
+	classification := classifyAgentProtocolError(err)
+	if classification.destination == errorDestinationNodeSession || classification.destination == errorDestinationAttemptAuthority ||
+		protocolErr.APIError.Code == contract.ErrorUnauthorized || protocolErr.APIError.Code == contract.ErrorForbidden {
+		return false
+	}
+	return protocolErr.APIError.Code == contract.ErrorInternal || protocolErr.APIError.Code == contract.ErrorUnavailable || protocolErr.APIError.Retryable
+}
+
 func (controller *removalController) acknowledge(ctx context.Context, removal localRemoval) error {
+	_, err := controller.acknowledgeRemoval(ctx, removal, false)
+	return err
+}
+
+func (controller *removalController) acknowledgeRemoval(ctx context.Context, removal localRemoval, requireResumption bool) (bool, error) {
+	key := removalAcknowledgementIdentity(removal)
+	controller.mu.Lock()
+	if controller.acksClosed || ctx.Err() != nil {
+		controller.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return false, context.Canceled
+	}
+	if requireResumption {
+		if _, marked := controller.ackResumptions[key]; !marked {
+			controller.mu.Unlock()
+			return false, nil
+		}
+	}
+	if task, pending := controller.ackTasks[key]; pending {
+		controller.mu.Unlock()
+		if task.ctx.Err() != nil {
+			<-task.done
+			return controller.acknowledgeRemoval(ctx, removal, requireResumption)
+		}
+		return false, errRemovalAcknowledgementPending
+	}
+	ackContext, cancel := context.WithCancel(controller.ackContext)
+	task := &removalAcknowledgementTask{ctx: ackContext, cancel: cancel, done: make(chan struct{})}
+	controller.ackTasks[key] = task
+	delete(controller.ackResumptions, key)
+	controller.wg.Add(1)
+	controller.mu.Unlock()
+	finish := func() {
+		cancel()
+		controller.mu.Lock()
+		delete(controller.ackTasks, key)
+		controller.mu.Unlock()
+		close(task.done)
+		controller.wg.Done()
+	}
 	request := l1.RemovalAcknowledgementRequest{
 		NodeID: controller.nodeID, BootSessionID: controller.bootSessionID,
 		RemovalGeneration: removal.generation, CleanupFence: removal.cleanupFence,
 		RootInstanceID: removal.rootInstanceID,
 		IdempotencyKey: removalAcknowledgementKey(removal, controller.bootSessionID),
 	}
-	if _, err := controller.client.AcknowledgeRemoval(ctx, removal.jobID, request); err != nil {
-		return fmt.Errorf("acknowledge completed service removal: %w", err)
+	// Keep the first attempt synchronous. Once delivery becomes ambiguous, L1
+	// may have stopped redispatching the directive. A tracked task owns only
+	// ACK delivery and local release; boot/rejoin and OCI recovery can return.
+	firstContext, cancelFirst := context.WithCancel(ctx)
+	stopFirst := context.AfterFunc(ackContext, cancelFirst)
+	_, err := controller.client.AcknowledgeRemoval(firstContext, removal.jobID, request)
+	stopFirst()
+	cancelFirst()
+	if err == nil || ackContext.Err() != nil || !removalAcknowledgementRetryable(err) {
+		finish()
+		if err != nil {
+			return true, fmt.Errorf("acknowledge completed service removal: %w", err)
+		}
+		return true, nil
 	}
-	return nil
+	go func() {
+		defer finish()
+		err := controller.replayAcknowledgement(ackContext, removal, request)
+		if err == nil {
+			err = controller.finishAcknowledgedRemoval(ackContext, removal)
+		}
+		if err == nil || ackContext.Err() != nil {
+			return
+		}
+		classification := classifyAgentProtocolError(err)
+		if classification.destination == errorDestinationNodeSession {
+			failure := removalAcknowledgementFailure{err: err}
+			controller.mu.Lock()
+			if controller.session != nil {
+				failure.observedRejoin = controller.session.rejoinSequence.Load()
+			}
+			// Pair the refusal sequence with terminal task state before waking
+			// recovery. Its pending check must join us, never skip this row.
+			cancel()
+			controller.ackResumptions[key] = struct{}{}
+			controller.mu.Unlock()
+			controller.notifyAcknowledgementFailure(failure)
+			return
+		}
+		controller.log("node agent: acknowledge completed service removal %q: %v", removal.jobID, err)
+	}()
+	return true, errRemovalAcknowledgementPending
+}
+
+func (controller *removalController) replayAcknowledgement(ctx context.Context, removal localRemoval, request l1.RemovalAcknowledgementRequest) error {
+	backoff := newSessionBackoff(250*time.Millisecond, 5*time.Second)
+	for {
+		timer := controller.clock.NewTimer(backoff.next())
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return ctx.Err()
+		case <-timer.C():
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		_, err := controller.client.AcknowledgeRemoval(ctx, removal.jobID, request)
+		if err == nil {
+			return nil
+		}
+		if !removalAcknowledgementRetryable(err) {
+			return fmt.Errorf("acknowledge completed service removal: %w", err)
+		}
+	}
+}
+
+func (controller *removalController) stopAcknowledgements() {
+	controller.mu.Lock()
+	controller.acksClosed = true
+	if controller.ackCancel != nil {
+		controller.ackCancel()
+	}
+	tasks := make([]*removalAcknowledgementTask, 0, len(controller.ackTasks))
+	for _, task := range controller.ackTasks {
+		task.cancel()
+		tasks = append(tasks, task)
+	}
+	controller.mu.Unlock()
+	for _, task := range tasks {
+		<-task.done
+	}
 }
 
 // noteRemovalFailure records one refused cleanup attempt and, once the record

@@ -7,13 +7,15 @@ image=
 arch=
 evidence=
 edge_process_pattern='wefty-rfb-websocket --port'
+reference_surface_args=()
 while (($# > 0)); do
   case "$1" in
+    --reference-surface-probe) reference_surface_args=(--reference-surface-probe) ;;
     --image) image="${2:-}"; shift ;;
     --arch) arch="${2:-}"; shift ;;
     --evidence) evidence="${2:-}"; shift ;;
     --edge-process-pattern) edge_process_pattern="${2:-}"; shift ;;
-    *) printf '%s\n' 'usage: scripts/test-computer-image-runtime.sh --image REF@sha256:DIGEST --arch amd64|arm64 --evidence DIR [--edge-process-pattern TEXT]' >&2; exit 64 ;;
+    *) printf '%s\n' 'usage: scripts/test-computer-image-runtime.sh --image REF@sha256:DIGEST --arch amd64|arm64 --evidence DIR [--edge-process-pattern TEXT] [--reference-surface-probe]' >&2; exit 64 ;;
   esac
   shift
 done
@@ -43,6 +45,7 @@ positive_stderr="$evidence/${arch}-runtime.stderr"
   --input-oracle-path /tmp/wefty-computer/input-oracle.json \
   --driver-oracle-path /tmp/wefty-computer/driver-state.json \
   --edge-process-pattern "$edge_process_pattern" \
+  "${reference_surface_args[@]}" \
   --receipt "$evidence/${arch}-runtime.json" 2> "$positive_stderr"
 positive_status=$?
 set -e
@@ -94,7 +97,12 @@ run_mutation() {
   if [[ $mutation == text-frames-accepted && $edge_process_pattern == 'wayvnc -w' ]]; then
     fixture_dockerfile=examples/computer/fixtures/Dockerfile.wayland-text
   fi
-  if ! docker build --platform "linux/$arch" --file "$fixture_dockerfile" \
+  local -a fixture_build_args=(--platform "linux/$arch" --file "$fixture_dockerfile")
+  if [[ -n ${WEFTY_DEBIAN_SNAPSHOT_PROXY:-} ]]; then
+    fixture_build_args+=(--build-arg "http_proxy=$WEFTY_DEBIAN_SNAPSHOT_PROXY"
+      --build-arg "HTTP_PROXY=$WEFTY_DEBIAN_SNAPSHOT_PROXY")
+  fi
+  if ! docker build "${fixture_build_args[@]}" \
     --build-arg "BASE_IMAGE=$image" --build-arg "MUTATION=$mutation" --tag "$tag" .; then
     stage_error "fixture-build/$mutation" "docker build failed for $tag"
     exit 1

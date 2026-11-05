@@ -92,7 +92,7 @@ jobs:
           git merge-base --is-ancestor "$EXPECTED_SHA" HEAD
           git checkout --detach "$EXPECTED_SHA"
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: false
@@ -135,7 +135,7 @@ jobs:
           git merge-base --is-ancestor "$EXPECTED_SHA" HEAD
           git checkout --detach "$EXPECTED_SHA"
           test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
-      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: false
@@ -512,6 +512,8 @@ jobs:
       - name: Run service acceptance at production timings
         env:
           WEFTY_REALTIME_EVIDENCE_DIR: ${{ runner.temp }}/service-acceptance-realtiming
+          # Failed rows snapshot the shared OCI deadman log before later rows run.
+          WEFTY_REALTIME_HELPER_LOG: ${{ runner.os == 'Linux' && '/tmp/wefty-oci-helper-realtiming.stderr' || '' }}
         run: |
           mkdir -p "$WEFTY_REALTIME_EVIDENCE_DIR"
           if [ -f /tmp/wefty-oci-provision.txt ]; then

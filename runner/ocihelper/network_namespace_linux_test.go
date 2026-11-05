@@ -388,8 +388,9 @@ func TestComputerNetworkUsesMountedResolverForLoopbackProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer namespace.close()
-	engine := &ContainerdEngine{config: NativeEngineConfig{ResolverPath: resolverPath, AttemptPortMin: 42120}}
-	attachment, err := engine.prepareComputerNetwork(t.Context(), namespace, 42120)
+	// Keep Computer probe ports below 32768 to avoid default Linux ephemeral listeners.
+	engine := &ContainerdEngine{config: NativeEngineConfig{ResolverPath: resolverPath, AttemptPortMin: 22120}}
+	attachment, err := engine.prepareComputerNetwork(t.Context(), namespace, 22120)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +417,7 @@ func TestComputerNetworkUsesMountedResolverForLoopbackProxy(t *testing.T) {
 		}
 		publicConnected = true
 		_ = public.Close()
-		probeURL := "http://" + net.JoinHostPort(attachment.gateway, "42120") + "/health"
+		probeURL := "http://" + net.JoinHostPort(attachment.gateway, "22120") + "/health"
 		probeOutput, probeErr := exec.Command("curl", "--fail", "--silent", "--show-error", "--max-time", "5", probeURL).CombinedOutput()
 		if probeErr != nil || string(probeOutput) != computerEgressProbeBody {
 			return fmt.Errorf("helper egress probe: %v: %s", probeErr, strings.TrimSpace(string(probeOutput)))
@@ -457,8 +458,8 @@ func TestComputerNetworkFallsBackToReachableNodeStub(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer namespace.close()
-	engine := &ContainerdEngine{config: NativeEngineConfig{ResolverPath: resolverPath, AttemptPortMin: 42124}, computerResolverUplinkPath: uplinkPath}
-	attachment, err := engine.prepareComputerNetwork(t.Context(), namespace, 42124)
+	engine := &ContainerdEngine{config: NativeEngineConfig{ResolverPath: resolverPath, AttemptPortMin: 22124}, computerResolverUplinkPath: uplinkPath}
+	attachment, err := engine.prepareComputerNetwork(t.Context(), namespace, 22124)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -724,14 +725,14 @@ func TestComputerFirewallReconcilesOnEveryAttemptStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine := &ContainerdEngine{config: NativeEngineConfig{IPExecutable: ipPath, IPTablesExecutable: iptablesPath, IP6TablesExecutable: ip6tablesPath, ResolverPath: "/etc/resolv.conf", AttemptPortMin: 42000}, attempts: make(map[string]*containerdAttempt)}
+	engine := &ContainerdEngine{config: NativeEngineConfig{IPExecutable: ipPath, IPTablesExecutable: iptablesPath, IP6TablesExecutable: ip6tablesPath, ResolverPath: "/etc/resolv.conf", AttemptPortMin: 22000}, attempts: make(map[string]*containerdAttempt)}
 	commandA := startIsolatedNetworkTask(t)
 	namespaceA, err := pinTaskNetworkNamespace(uint32(commandA.Process.Pid))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer namespaceA.close()
-	attachmentA, err := engine.prepareComputerNetwork(t.Context(), namespaceA, 42010)
+	attachmentA, err := engine.prepareComputerNetwork(t.Context(), namespaceA, 22010)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -757,7 +758,7 @@ func TestComputerFirewallReconcilesOnEveryAttemptStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer namespaceB.close()
-	attachmentB, err := engine.prepareComputerNetwork(t.Context(), namespaceB, 42011)
+	attachmentB, err := engine.prepareComputerNetwork(t.Context(), namespaceB, 22011)
 	if err != nil {
 		t.Fatal(err)
 	}

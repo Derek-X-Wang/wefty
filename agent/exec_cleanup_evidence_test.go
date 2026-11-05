@@ -47,8 +47,15 @@ func TestAgentExecSweepProcessHelper(t *testing.T) {
 		if err := child.Start(); err != nil {
 			t.Fatal(err)
 		}
-	} else if err := os.WriteFile(os.Getenv("AGENT_EXEC_SWEEP_READY"), []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
-		t.Fatal(err)
+	} else {
+		// Rename so a reader that sees the ready file always sees the whole PID.
+		ready := os.Getenv("AGENT_EXEC_SWEEP_READY")
+		if err := os.WriteFile(ready+".tmp", []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(ready+".tmp", ready); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for {
 		time.Sleep(time.Hour)

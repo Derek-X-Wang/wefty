@@ -74,7 +74,7 @@ func assertRestartableExecRecovery(t *testing.T, crash bool) {
 	handoff := filepath.Join(dir, "handoffs")
 	startAgent := func(boot int) *managedProcess {
 		ready := filepath.Join(dir, fmt.Sprintf("agent-%d.json", boot))
-		node := startManagedProcess(t, agentBinaryPath, "--fabric=plain", "--control-plane="+l1Address, "--run-ledger="+l3Address, "--node-id=stable-node", "--plain-identity=fabric-node", "--log-spool-dir="+filepath.Join(dir, "spool"), "--managed-root="+filepath.Join(dir, "managed"), "--handoff-root="+handoff, "--heartbeat-interval=200ms", "--claim-interval=20ms", "--renewal-interval=200ms", "--oneshot-load-limit=0", "--shutdown-budget=15s", "--ready-file="+ready)
+		node := startManagedProcess(t, agentBinaryPath, "--fabric=plain", "--mirror-run-output=true", "--control-plane="+l1Address, "--run-ledger="+l3Address, "--node-id=stable-node", "--plain-identity=fabric-node", "--log-spool-dir="+filepath.Join(dir, "spool"), "--managed-root="+filepath.Join(dir, "managed"), "--handoff-root="+handoff, "--heartbeat-interval=200ms", "--claim-interval=20ms", "--renewal-interval=200ms", "--oneshot-load-limit=0", "--shutdown-budget=15s", "--ready-file="+ready)
 		logs := &lockedBuffer{}
 		node.command.Stdout = logs
 		node.command.Stderr = logs

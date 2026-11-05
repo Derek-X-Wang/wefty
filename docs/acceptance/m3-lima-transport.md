@@ -409,8 +409,8 @@ and the guest socket back to `0660 root:wefty-oci`.
 9. Reference Computer images: import each arm64 child from its separate
    digest-selected Computer OCI tar through the helper, then boot each without
    argv or working-directory replacement. Require both returned names to reach
-   `rfb-websocket-v1` readiness atomically within 60 seconds of authoritative
-   `Started`, with view input discarded server-side and control input accepted.
+   `rfb-websocket-v1` readiness atomically within 60 seconds of host awake time
+   after the agent receives the helper's `Started` report, with view input discarded server-side and control input accepted.
    For XFCE record the CPU-rendered Xvfb/XFCE/Chromium session. For the Wayland
    image record Sway's headless backend, pixman renderer, two native `wayvnc -w`
    processes, `--disable-input` on view, and the absence of `/dev/dri` and

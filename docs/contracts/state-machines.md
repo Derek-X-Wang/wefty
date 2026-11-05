@@ -1210,9 +1210,9 @@ agent restart and has no idle-release timer.
 
 The attempt lifecycle mounts this handler only through `Fabric.Listen("tcp",
 ":0")`; neither a LAN listener nor either raw guest/helper endpoint is
-published. It consumes the privileged helper's task-Start timestamp carried
-unchanged in `Run.started_at`, then polls both view and control wire contracts until
-they succeed or the exact 60-second deadline yields typed,
+published. Its window starts when the agent receives the helper's Started
+report, then polls both view and control wire contracts until they succeed or
+the exact 60-second host-awake deadline yields typed,
 restartable `startup_readiness_timeout`. Readiness publishes the Fabric
 front-door URL as `display_endpoint`; later loss or stop first disables the
 front door and closes its sessions, then withdraws the fenced L1 projection.
@@ -2945,7 +2945,74 @@ credit never increases it. There is no fixed wall-time bound if these widths
 or reconciliation intervals are unbounded. Nodes use the same rule with their
 own remaining stale/dead waits. A remote Node sleeping while L1 stays awake
 receives no credit (#1349). Seat idle and approval waits still count sleep.
-Node-side lease timers are unchanged.
+Each claim and renewal may carry `sleep_credit_boot`, the `sha256:<hex>`
+digest of the exact `hostboot.Identity()` string. L1 sends it only when that
+transaction's pinned clock has a known boot identity and a successful bracketed
+sleep sample, including a zero gap. Missing pausing clocks, unavailable clocks,
+and read errors never advertise it. Raw kernel IDs stay off the wire.
+The agent hashes its own kernel boot identity with the same function. Only a
+matching digest on the latest claim or successful renewal permits same-host
+sleep credit. A missing field (including an older L1), mismatch, or failed
+local identity read keeps the existing wall-gap fence. A loopback address or
+configuration flag is never proof; a Host VM has a different kernel boot.
+
+The node watchdog brackets a boot-clock sample with pausing-clock samples.
+For successive offset intervals, proved sleep is
+`max(0, current.lower - previous.upper)`. With matching boot proof and successful
+samples it fences when `max(wall gap, boot-clock gap) - proved sleep` is at least
+the lease remaining at the previous checkpoint, or when the monotonic deadline
+passes. Only the proved lower bound is credited. A process stop or descheduling
+advances both clocks and earns no credit. A forward calendar step still triggers
+the fence; a backward step cannot hide a boot-clock gap. Failed samples keep the
+existing wall-gap rule and cannot provide a credit baseline for the next check.
+Remote-L1 behavior is unchanged.
+
+Every claim and successful renewal grants local authority only through
+`requestStarted + lease_ttl`, using the agent's monotonic (awake) request start.
+The request checkpoint also captures wall time and the bracketed awake/boot
+sample before the HTTP call. Claim admission and renewal acceptance validate
+the entire interval from that checkpoint to receipt against the new grant's
+proof and deadline. Timer checks during an RPC cannot consume that interval or
+let a reply with missing proof inherit earlier credit. Remote replies across
+sleep retain the wall-gap fence. A grant already expired at receipt grants
+nothing and cannot start a payload or revive local authority. Round-trip and
+admission latency consume lease time; receipt never starts a fresh full TTL.
+
+Proved sleep requests immediate renewal, without waiting for the renewal timer.
+The payload keeps running; mailbox and output use the same local authority.
+The monotonic deadline already excludes system sleep on Darwin and Linux and
+is never extended by a failed, uncertain, or lost renewal reply. Transient and
+uncertain errors retry only within that deadline; each request timeout uses
+`renewalRequestTimeout` with the remaining credited authority. A refusal ends
+the Attempt's grants at once: no further renewal is issued or accepted.
+For a non-service payload, cancellation is immediate. For a service, durable
+removal preparation runs first; the payload is cancelled when that preparation
+finishes or at the local credited deadline, whichever comes first. The
+independent watchdog enforces that deadline even while preparation is blocked.
+For ordinary lease expiry, the one-copy rule rests on this deadline. The
+deadline is never later than the natural expiry of the last lease L1 granted,
+so the rule does not depend on immediate cancellation after a refusal. An early
+revocation, such as removal capping the lease, can end L1's authority before
+that deadline. In that case the one-copy rule rests on the barrier that
+revoked it: removal or reap prevents a successor claim until the payload is
+reaped.
+A late reply cannot revive expired local authority. Each sleep in a
+DarkWake sequence receives a fresh measured credit, including while a request
+is in flight. L1 applies its gap before reconciliation can expire an Attempt,
+so reconciliation before renewal does not change the one-copy guarantee.
+Connectivity failure during a short wake consumes awake lease time. Several
+short wakes may exhaust it; a renewal must complete before that bound.
+
+The OCI helper's session heartbeat and Attempt deadman use local monotonic
+deadlines; they have no wall-gap fence and receive no new boot-proof authority.
+The Host VM has its own kernel clocks. Guest clock advancement or a broken
+helper control stream remains a separate runtime-loss event; matching L1 proof
+does not override helper authority or permit revival of a reaped payload.
+Deadman admission and queued renewal evidence retain monotonic deadlines too.
+Seat copy renewal only ends a copy, not its Computer. Seat idle and approval
+waits still count sleep; they may end a Seat during a long sleep without ending
+an occupied Computer Attempt. Computer readiness and per-Seat startup/command
+bounds remain separate from Attempt authority.
 Pre-upgrade live Seats without an elapsed stamp receive one complete idle wait;
 pending approvals and windows without a stamp do not retain authority.
 
@@ -3029,6 +3096,63 @@ polls and recovery inventories use `TxOptions{ReadOnly:true}` snapshots.
 Seat-enabled Computers use the node's shared Seat front door. Each Seat has a
 separate attempt-scoped Controller tenure and driver signal. Older images keep
 the per-Computer path above. The shared listener opens no additional port.
+
+The Seat front door authenticates before revealing whether a Seat ID is bound
+on this node. Path matching, the person-path Host check, screen credential
+presence and Fabric identity checks precede the binding lookup. Bound Seats
+retain their existing admission and durable denial evidence, with no additional L1 or policy
+check. For unbound IDs, the AI agent path checks the credential through L1's
+existing `POST /v1/agent/seats/{seat_id}/screen-authority` for screens and
+`POST /v1/agent/seats/{seat_id}/copy-authority` for copy, with the credential
+and no Computer binding; the person path checks the
+installed administrator policy without requiring Computer membership. Bound
+and unbound person paths call the shared L1 policy evaluator. That check keeps
+the same policy
+freshness, Fabric and enrolled-device restrictions, and the same
+stale-policy-revision refusal and details for a non-grant holder.
+Missing or invalid credentials and unauthorized people receive the same status,
+Content-Type and body for bound and unbound IDs, except random `request_id`
+values and the node's random `copy_id`; request-ID presence remains identical.
+Expired credentials retain the existing `seat_ended` refusal. Upstream request
+IDs remain in JSON and NDJSON error bodies, including errors after copy data
+has been flushed, so CLI errors keep their diagnostic correlation.
+A caller that passes authentication receives HTTP 404 with a JSON `APIError`,
+code `not_found`, message `unknown Seat`, when the ID is not bound on this node.
+The authority endpoint checks the requested Seat's credential before its
+Computer binding. Only its existing `forbidden` / `Seat belongs to another
+Computer` refusal proves the credential passed and permits the typed 404.
+Other refusals pass through unchanged. A live or expired credential for a
+different Seat therefore receives `forbidden` / `invalid Seat credential` for
+both bound and unbound IDs. The probe uses one L1 round trip and requires no
+Computer, Attempt, endpoint, wire field or L1 behavior change.
+Screen authorization uses a write transaction. An unbound probe with the exact
+credential of a Seat that is already past its idle or lifetime deadline lets L1
+record the `ending` state that was already due. This finalizes an already-due
+state and is not a new action: the same call on the Seat's own node does the
+same. Wrong or cross-Seat credentials change nothing, and a live mismatch rolls
+back. Copy authorization
+uses a read-only snapshot on both paths and does not wait for a SQLite writer;
+it evaluates committed lifecycle state without finalizing elapsed deadlines.
+Copy transport failures keep `seat_copy_failed` with the fixed message
+`Seat copy unavailable`, retaining any `copy start unconfirmed` or
+`copy outcome unconfirmed` stage prefix, so an upstream URL cannot expose the
+binding. Authorization transport failures log a bounded operation stage and
+typed cause locally, without the credential, requested Seat ID or Seat URL.
+
+Unbound IDs use the same feature router and screen, copy and person handlers
+with a null binding. The null binding authenticates but cannot reach a runtime.
+It starts no session, timer or audit writer. Copy checks direction and path
+before credential presence and authorization; a missing credential needs no L1
+call. Copy refusals retain HTTP 200 NDJSON, with a node-generated `copy_id` and
+the same API error. An authenticated unbound copy has `not_found` / `unknown Seat`
+in that stream error, rather than a separate HTTP 404. Person take/release keeps
+its session-token refusal before policy admission. Its unbound null binding has
+no active or closed sessions and cannot accept another Seat's bearer.
+
+An unbound-ID denial is not durably audited: no Computer, Attempt or Seat log
+exists on the node to receive that evidence. The node agent logs each refusal
+once locally, with the path kind, known Fabric identity and refusal code. That
+log contains neither the requested Seat ID nor any credential.
 
 `GET /v1/seats/{seat_id}/screen/view` and `/screen/input` carry the `binary`
 WebSocket/RFB protocol. They require that exact Seat's `X-Wefty-Seat-Credential`.
@@ -3222,20 +3346,33 @@ clear a replacement Seat's driver signal.
 #### Short screen calls (#1148)
 
 The AI agent CLI discovers the Seat front door with the saved Seat credential,
-then opens one short `binary` WebSocket carrying RFB 3.3, 3.7, or 3.8. It
-negotiates unauthenticated RFB inside the credential-authenticated Fabric door,
+then opens a short `binary` WebSocket carrying RFB 3.3, 3.7, or 3.8. An input
+capture that times out replaces its input connection with a fresh view connection.
+It negotiates unauthenticated RFB inside the credential-authenticated Fabric door,
 32-bit little-endian true colour, and only Raw framebuffer encoding. Both the
 default image's x11vnc and the supported Wayland neatvnc server support Raw.
 Unsupported security, messages, encodings, dimensions or rectangles fail
 closed. Complete non-incremental framebuffer updates become local PNG files.
 
 Input calls send pointer or X11 keysym events through the input endpoint.
-Modifiers and buttons are released before a framebuffer round trip, which
-orders the end of input before the short connection closes. With a screenshot,
-this is one full non-incremental frame on the same input connection; without
-one, it requests one pixel. Screenshot-only calls use the view endpoint and
-continue working while a person drives. The server may return larger Raw
-rectangles within its ServerInit framebuffer bounds.
+Modifiers and buttons are released before the post-input framebuffer requests.
+Without a screenshot, a one-pixel synchronization request orders the end of
+input before the connection closes. With a screenshot, the CLI reads a full
+baseline before input, then fully consumes a post-input one-pixel Sync reply
+to order the input before any later close. Rectangles outside Sync's requested
+1×1 area, or a changed pixel within it, count as an observed change. Otherwise,
+it waits for an incremental update for the remainder of a 250 ms window
+starting at the end of the input write. At most one request is outstanding;
+empty replies are fully consumed before paced re-requests. After a change
+observed in Sync or an incremental reply, it captures
+a full non-incremental frame on the same connection. On timeout, it closes the
+input connection and captures on a fresh view connection, discarding ambiguous
+pending replies without repeating input. The combined reply prints one release
+note and may use the view connection's latest unread count. JSON adds
+`frame_after_input` to report a change observed by Sync or the remaining wait.
+Sync must complete even when it consumes the observation window.
+Screenshot-only calls use the view endpoint and continue working while a person
+drives. The server may return larger Raw rectangles within its ServerInit bounds.
 The client drains the entire update, decodes only the requested intersection,
 and completes synchronization once the requested area is covered. Zero-size,
 out-of-screen and non-Raw rectangles still fail closed. Input is done when its
@@ -3252,8 +3389,10 @@ number and all warm numbers remain in the log and JSON evidence. The lane also
 records phase timestamps relative to CLI process start, the warm maximum,
 node/helper Fabric accept, L1 authorization, endpoint lookup, socket connect
 and RFB banner timings, backend accept-to-first-byte timings, and warm x11vnc RSS
-for this Seat when `/proc` exposes it. A combined call's full frame is its
-synchronization, and its capture connection is already open before input.
+for this Seat when `/proc` exposes it. A combined call's post-input Sync orders
+the input on both paths. The success path captures on the input connection,
+which opened before input. The timeout path closes input only after Sync and
+captures on a fresh view connection opened afterward.
 SC-4 performs an input warm-up outside the measurement, then measures Take
 control through the first typed `person_driving` CLI refusal. Both have a one-second limit. The root-only `computer_seat_lane`
 records CI measurements against the real default image. CI measurements do

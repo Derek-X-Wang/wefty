@@ -955,8 +955,47 @@ func TestReferenceComputerPublisherConsumesRealCheckerReceipt(t *testing.T) {
 	if !valid(conformant) {
 		t.Fatal("real publisher jq assertion rejected a conformant receipt")
 	}
+	inputCapture := func(value map[string]any, status string) {
+		for _, raw := range value["checks"].([]any) {
+			if check := raw.(map[string]any); check["id"] == "screen.input-capture-current-frame" {
+				check["status"] = status
+			}
+		}
+	}
+	// The optional input-capture proof may be NOT-RUN (its setup is unavailable
+	// on some reference images); the recorder then keeps image_status PASS.
+	notRun := computerconformance.NewRecorder("reference", "docker", "linux/amd64", time.Unix(1, 0))
+	for _, definition := range computerconformance.CheckCatalog {
+		status, detail := computerconformance.StatusPass, "observed"
+		if definition.Scope == computerconformance.ScopeProfile {
+			status, detail = computerconformance.StatusNotRun, computerconformance.ContainerdProfileNotRun
+		}
+		if definition.ID == "screen.input-capture-current-frame" {
+			status, detail = computerconformance.StatusNotRun, "probe setup unavailable"
+		}
+		if err := notRun.Record(definition.ID, status, detail); err != nil {
+			t.Fatal(err)
+		}
+	}
+	notRun.RecordReadiness(false, time.Second)
+	notRun.RecordPersistence(true, true)
+	notRun.RecordEdgeRecovery(true)
+	notRunPayload, err := computerconformance.Marshal(notRun.Finish(time.Unix(2, 0)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var notRunReceipt map[string]any
+	if err := json.Unmarshal(notRunPayload, &notRunReceipt); err != nil {
+		t.Fatal(err)
+	}
+	notRunReceipt["digest"], notRunReceipt["elf_e_machine"] = "sha256:good", 62
+	if !valid(notRunReceipt) {
+		t.Fatal("real publisher jq assertion rejected a NOT-RUN input-capture proof")
+	}
 	for name, mutate := range map[string]func(map[string]any){
-		"empty catalog": func(value map[string]any) { value["checks"] = []any{} },
+		"input capture failed":  func(value map[string]any) { inputCapture(value, "FAIL") },
+		"input capture missing": func(value map[string]any) { inputCapture(value, "UNKNOWN") },
+		"empty catalog":         func(value map[string]any) { value["checks"] = []any{} },
 		"missing load-bearing cell": func(value map[string]any) {
 			checks := value["checks"].([]any)
 			filtered := checks[:0]
@@ -1639,4 +1678,22 @@ func TestRealtimingLanesWriteTheProvenanceTheGateBinds(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestReferenceSurfaceProbeIsExplicitInBothReferenceLanes(t *testing.T) {
+	for _, name := range []string{"acceptance-image.yml", "acceptance-image-build.yml"} {
+		_, workflow := readWorkflow(t, "../.github/workflows/"+name)
+		if !strings.Contains(string(workflow), `--edge-process-pattern "$EDGE_PROCESS_PATTERN" --reference-surface-probe`) {
+			t.Fatalf("%s does not explicitly enable the reference surface", name)
+		}
+		if !strings.Contains(string(workflow), `select(.id == "screen.input-capture-current-frame" and (.status == "PASS" or .status == "NOT-RUN"))`) {
+			t.Fatalf("%s does not assert the input-capture proof", name)
+		}
+		if !strings.Contains(string(workflow), `jq -r '.checks[] | select(.id == "screen.input-capture-current-frame")`) {
+			t.Fatalf("%s does not print the input-capture detail", name)
+		}
+	}
+	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", `--reference-surface-probe) reference_surface_args=(--reference-surface-probe)`, `"${reference_surface_args[@]}"`)
+	assertFileContains(t, "../cmd/wefty-computer-conformance/main.go", `flags.BoolVar(&config.ReferenceSurfaceProbe, "reference-surface-probe", false`)
+	assertFileContains(t, "../docs/guides/computer-images.md", "--reference-surface-probe", "screen.input-capture-current-frame", "NOT-RUN")
 }

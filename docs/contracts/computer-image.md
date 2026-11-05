@@ -251,11 +251,12 @@ non-retryable `control_not_authorized`.
 
 ## Atomic readiness
 
-The privileged helper's successful container task `Start` edge fixes `t0`;
-image pull and preparation precede it and do not consume the budget. The
-helper returns that timestamp in `Run.started_at`, and the agent carries it
-unchanged across the L1 `OCIStarted` acknowledgement and other post-start
-round trips before polling both helper tunnels.
+The agent's receipt of the helper's Started report fixes `t0`; image pull
+and preparation precede it and do not consume the budget. The 60-second budget
+counts host awake time only: host sleep does not consume it. The L1
+`OCIStarted` acknowledgement and other post-start round trips still consume
+the budget before polling both helper tunnels. The helper's `Run.started_at`
+is not used for this window because it may come from a guest clock.
 
 ```text
 Started at t0
@@ -263,7 +264,7 @@ Started at t0
     +-- view ready? ----- no --+
     |                          |
     +-- control ready? -- no --+--> publish nothing
-    |                          |    at t0 + 60 s:
+    |                          |    at 60 s awake:
     +-- both ready ------------+    startup_readiness_timeout
              |
              +--> publish one Fabric front door + display_endpoint
@@ -277,11 +278,12 @@ Started at t0
              eligible for one atomic republication
 ```
 
-The deadline is exactly 60 seconds after `t0`. A probe that finishes at or
-after that deadline cannot publish even when both handshakes succeeded; the
-agent rechecks its injected clock immediately before publication. Expiry produces the existing
-typed `startup_readiness_timeout`, which service restart policy classifies as
-restartable; no partial endpoint or placeholder display URL is published.
+The deadline is exactly 60 seconds of host awake time after `t0`. A probe
+that finishes at or after that deadline cannot publish even when both handshakes
+succeeded; the agent rechecks its injected clock before it accepts the first
+successful readiness result.
+Expiry produces the existing typed `startup_readiness_timeout`, which service
+restart policy classifies as restartable; no partial endpoint or placeholder display URL is published.
 After the first successful publication, losing either backend withdraws both
 without killing the tenant payload. Recovery requires fresh success from both
 endpoints before the ordered publication controller may republish.
@@ -677,6 +679,16 @@ reverse connections through `VNC_CONNECT`, or make the server run external
 commands. This prevents display-property commands from reopening IP listeners
 or changing the view role after admission. Keep the three explicit disable
 flags even with `-safer`; normal RFB input and view access retain their roles.
+
+Both roles also use `-nonap -sb 0`, which turn off x11vnc's idle nap
+throttling. With the defaults, x11vnc 0.9.16-9 answered a new connection's
+first full frame in about 770 ms on an idle screen, and a 1×1 update after a
+click in about 260 ms. With these flags both took under 30 ms on amd64 and
+arm64. A Seat input with `--screenshot` reads a baseline frame before it sends
+the input, so it depends on that first answer (#1479). The cost is polling
+while a client stays connected: one idle connected client used under 1% of one
+core in the same measurement (GitHub Actions run 41794210796). With no client
+connected, x11vnc skips framebuffer scanning.
 
 Before returning each backend connection, and again at its first byte, the
 Linux relay matches the child PID's `/proc/<pid>/fd` socket inodes against

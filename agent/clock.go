@@ -1,6 +1,11 @@
 package agent
 
-import "time"
+import (
+	"time"
+
+	"github.com/Derek-X-Wang/wefty/internal/bootclock"
+	"github.com/Derek-X-Wang/wefty/internal/hostboot"
+)
 
 // Clock supplies all scheduling time used by the agent. Production uses the
 // wall clock; tests can advance timers without sleeping through lease or
@@ -18,8 +23,11 @@ type Timer interface {
 
 type systemClock struct{}
 
-func (systemClock) Now() time.Time     { return time.Now() }
-func (systemClock) WallNow() time.Time { return time.Now().Round(0) }
+func (systemClock) Now() time.Time                       { return time.Now() }
+func (systemClock) WallNow() time.Time                   { return time.Now().Round(0) }
+func (systemClock) BootIdentity() (string, error)        { return hostboot.Identity() }
+func (systemClock) BootElapsed() (time.Duration, error)  { return bootclock.Now() }
+func (systemClock) AwakeElapsed() (time.Duration, error) { return bootclock.AwakeNow() }
 
 func (systemClock) NewTimer(duration time.Duration) Timer {
 	return &systemTimer{timer: time.NewTimer(duration)}

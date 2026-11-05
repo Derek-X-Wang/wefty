@@ -22,6 +22,7 @@ func TestReceiptV2CatalogIDsArePinned(t *testing.T) {
 		harness.image-user harness.rootfs-read-only harness.service-writable harness.no-new-privileges harness.forbidden-privilege harness.shm-private harness.shm-size harness.shm-flags harness.tmp-ceilings
 		profile.capabilities profile.seccomp profile.namespaces profile.devices profile.cgroup-memory-max profile.cgroup-oom-group profile.cgroup-swap-max
 		persistence.service-survives persistence.profile-survives persistence.sign-in-survives persistence.rootfs-discarded persistence.edge-recovers targets.control-nonpersistent
+		screen.input-capture-current-frame
 	`)
 	if len(CheckCatalog) != len(expected) {
 		t.Fatalf("receipt v2 catalog length = %d, want %d", len(CheckCatalog), len(expected))
@@ -82,6 +83,36 @@ func TestRecorderAggregatesImageAndHarnessEvidenceSeparately(t *testing.T) {
 	receipt := recorder.Finish(time.Unix(101, 0))
 	if receipt.Status != StatusPass || receipt.ImageStatus != StatusPass || receipt.HarnessStatus != StatusPass || receipt.ContainerdProfileStatus != StatusNotRun {
 		t.Fatalf("conformant receipt = %s", receipt.Status)
+	}
+}
+
+// The reference-only input-capture probe is opt-in. Left NOT-RUN it does not
+// hold the image at NOT-RUN; a FAIL still fails the image.
+func TestRecorderOptionalCheckNotRunKeepsImageStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status Status
+		want   Status
+	}{{StatusNotRun, StatusPass}, {StatusFail, StatusFail}, {StatusPass, StatusPass}} {
+		recorder := NewRecorder("image", "docker", "linux/amd64", time.Unix(100, 0))
+		for _, definition := range CheckCatalog {
+			status, detail := StatusPass, "observed"
+			if definition.Scope == ScopeProfile {
+				status, detail = StatusNotRun, ContainerdProfileNotRun
+			}
+			if definition.ID == "screen.input-capture-current-frame" {
+				if tc.status == StatusNotRun {
+					continue
+				}
+				status = tc.status
+			}
+			if err := recorder.Record(definition.ID, status, detail); err != nil {
+				t.Fatal(err)
+			}
+		}
+		receipt := recorder.Finish(time.Unix(101, 0))
+		if receipt.ImageStatus != tc.want || receipt.Status != tc.want {
+			t.Errorf("optional %s: image=%s status=%s want %s", tc.status, receipt.ImageStatus, receipt.Status, tc.want)
+		}
 	}
 }
 

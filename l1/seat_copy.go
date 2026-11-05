@@ -134,7 +134,7 @@ func (s *Store) AuthorizeSeatCopy(ctx context.Context, identity, id string, inpu
 			return e
 		}
 		if value.ComputerID != input.ComputerID {
-			return protocolError(contract.ErrorForbidden, "Seat belongs to another Computer")
+			return protocolError(contract.ErrorForbidden, contract.SeatComputerMismatchMessage)
 		}
 		if e = validateComputerSeatAttempt(ctx, rd.q, rd.now(), identity, input.ComputerID, input.JobID, input.AttemptID, input.ComputerSeatAttemptRequest); e != nil {
 			return e
@@ -173,7 +173,7 @@ func (s *Store) RecordSeatCopy(ctx context.Context, identity, id string, input S
 			return e
 		}
 		if value.ComputerID != input.ComputerID {
-			return protocolError(contract.ErrorForbidden, "Seat belongs to another Computer")
+			return protocolError(contract.ErrorForbidden, contract.SeatComputerMismatchMessage)
 		}
 		a, e := readAttemptAuthority(ctx, rd.q, input.AttemptID)
 		if e != nil {
