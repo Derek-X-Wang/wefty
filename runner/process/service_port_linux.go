@@ -50,27 +50,34 @@ func inspectServiceListeners(port, processGroupID int) (serviceListenerVerdict, 
 	if len(listening) == 0 {
 		return serviceListenerUnseen, nil
 	}
-	owned, err := processGroupSockets(processGroupID)
+	owned, unreadable, err := processGroupSockets(processGroupID)
 	if err != nil {
 		return 0, err
 	}
 	for inode := range listening {
-		if !owned[inode] {
-			return serviceListenerForeign, nil
+		if owned[inode] {
+			continue
 		}
+		if unreadable != nil {
+			// The listener may belong to the member whose descriptors this
+			// user cannot read (for example a setuid child): it is neither
+			// confirmed as the payload's nor proven foreign.
+			return 0, unreadable
+		}
+		return serviceListenerForeign, nil
 	}
 	return serviceListenerOwned, nil
 }
 
 // processGroupSockets returns the socket inodes held open by members of
-// processGroupID.
-func processGroupSockets(processGroupID int) (map[string]bool, error) {
+// processGroupID, and why some member's descriptors could not be read.
+func processGroupSockets(processGroupID int) (sockets map[string]bool, unreadable error, err error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	group := strconv.Itoa(processGroupID)
-	sockets := make(map[string]bool)
+	sockets = make(map[string]bool)
 	for _, entry := range entries {
 		if _, err := strconv.Atoi(entry.Name()); err != nil {
 			continue
@@ -96,8 +103,8 @@ func processGroupSockets(processGroupID int) (map[string]bool, error) {
 			continue
 		}
 		if err != nil {
-			// A member whose sockets cannot be read cannot prove ownership.
-			return nil, fmt.Errorf("read descriptors of payload group member %s: %w", entry.Name(), err)
+			unreadable = fmt.Errorf("read descriptors of payload group member %s: %w", entry.Name(), err)
+			continue
 		}
 		for _, descriptor := range descriptors {
 			target, err := os.Readlink(directory + "/fd/" + descriptor.Name())
@@ -109,5 +116,5 @@ func processGroupSockets(processGroupID int) (map[string]bool, error) {
 			}
 		}
 	}
-	return sockets, nil
+	return sockets, unreadable, nil
 }
