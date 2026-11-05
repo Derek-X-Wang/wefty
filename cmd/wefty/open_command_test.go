@@ -373,9 +373,21 @@ func testOpenFleetTunnel(t *testing.T, mode string) bool {
 	if _, err := idle.Read(make([]byte, 1)); err == nil {
 		t.Error("active connection survived shutdown")
 	}
-	if conn, err := net.DialTimeout("tcp", strings.TrimPrefix(ready.LocalURL, "http://"), time.Second); err == nil {
+	// Open closed its listener, so the OS can give this port to any other
+	// listener on the machine before this dial (#1493). A connection alone
+	// does not show that the tunnel still serves; a forwarded request does.
+	localAddress := strings.TrimPrefix(ready.LocalURL, "http://")
+	dialsBefore := serviceDials.Load()
+	if conn, err := net.DialTimeout("tcp", localAddress, time.Second); err == nil {
+		_ = conn.SetDeadline(time.Now().Add(time.Second))
+		_, _ = io.WriteString(conn, "GET /after-shutdown HTTP/1.0\r\n\r\n")
+		reply, _ := io.ReadAll(conn)
 		conn.Close()
-		t.Error("port remained open after shutdown")
+		if strings.Contains(string(reply), "echo:/after-shutdown") || serviceDials.Load() != dialsBefore {
+			t.Error("port remained open after shutdown")
+		} else {
+			t.Logf("another listener took %s after shutdown; the tunnel did not serve it", localAddress)
+		}
 	}
 	return true
 }
