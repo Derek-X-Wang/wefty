@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -24,6 +25,7 @@ import (
 )
 
 type workflowContract struct {
+	Env         map[string]string      `yaml:"env"`
 	On          map[string]any         `yaml:"on"`
 	Permissions map[string]string      `yaml:"permissions"`
 	Jobs        map[string]workflowJob `yaml:"jobs"`
@@ -1696,4 +1698,205 @@ func TestReferenceSurfaceProbeIsExplicitInBothReferenceLanes(t *testing.T) {
 	assertFileContains(t, "../scripts/test-computer-image-runtime.sh", `--reference-surface-probe) reference_surface_args=(--reference-surface-probe)`, `"${reference_surface_args[@]}"`)
 	assertFileContains(t, "../cmd/wefty-computer-conformance/main.go", `flags.BoolVar(&config.ReferenceSurfaceProbe, "reference-surface-probe", false`)
 	assertFileContains(t, "../docs/guides/computer-images.md", "--reference-surface-probe", "screen.input-capture-current-frame", "NOT-RUN")
+}
+
+// The workflow comes from the merge ref, but these jobs execute the PR head.
+// Keep the skew check inline so it cannot itself come from an older PR head.
+func TestAcceptanceImageInterfaceGuardContract(t *testing.T) {
+	workflow, _ := readWorkflow(t, "../.github/workflows/acceptance-image-build.yml")
+	paths := strings.Fields(workflow.Env["IMAGE_TEST_INTERFACE_PATHS"])
+	if !slices.Contains(paths, "cmd/wefty-computer-conformance") || slices.Contains(paths, "scripts/download-crane-modules.sh") {
+		t.Fatalf("interface paths must cover the checker and exclude the staged crane helper: %v", paths)
+	}
+	dependencies := exec.Command("go", "list", "-deps", "-f", "{{if not .Standard}}{{.ImportPath}}{{end}}", "./cmd/wefty-computer-conformance")
+	dependencies.Dir = ".."
+	output, err := dependencies.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list runtime checker dependencies: %v\n%s", err, output)
+	}
+	for _, importPath := range strings.Fields(string(output)) {
+		directory, inModule := strings.CutPrefix(importPath, "github.com/Derek-X-Wang/wefty/")
+		if directory == "contract" {
+			continue // Shared constants that churn for unrelated work; a change there also needs a new image.
+		}
+		if inModule && !slices.ContainsFunc(paths, func(path string) bool {
+			return directory == path || strings.HasPrefix(directory, path+"/")
+		}) {
+			t.Errorf("runtime checker package %s is missing from interface paths", directory)
+		}
+	}
+
+	scriptPath := regexp.MustCompile(`scripts/[a-zA-Z0-9_./-]+`)
+	// The runtime wrapper and cache launcher also execute candidate helpers.
+	for _, path := range paths {
+		if !strings.HasPrefix(path, "scripts/") {
+			continue
+		}
+		for _, dependency := range scriptPath.FindAllString(string(mustReadFile(t, "../"+path)), -1) {
+			if !slices.Contains(paths, dependency) {
+				t.Errorf("candidate script %s calls %s, which is missing from interface paths", path, dependency)
+			}
+		}
+	}
+	guards := 0
+	var guardRun string
+	for name, job := range workflow.Jobs {
+		candidate, guard, firstCommand := -1, -1, len(job.Steps)
+		for i, step := range job.Steps {
+			if strings.HasPrefix(step.Uses, "actions/checkout@") && step.With["ref"] == "${{ inputs.candidate_sha || github.sha }}" {
+				candidate = i
+			}
+			if step.Name == "Check candidate image test interface is current" {
+				if guard != -1 || step.If != "" || step.Env["WORKFLOW_SHA"] != "${{ github.workflow_sha }}" || step.Env["WORKFLOW_REPOSITORY_URL"] != "${{ github.server_url }}/${{ github.repository }}" {
+					t.Fatalf("%s: require one unconditional guard using workflow repository/revision", name)
+				}
+				guard = i
+				if guardRun != "" && guardRun != step.Run {
+					t.Fatalf("%s: inline guard differs between jobs", name)
+				}
+				guardRun = step.Run
+			}
+			for _, path := range scriptPath.FindAllString(step.Run, -1) {
+				if path == "scripts/download-crane-modules.sh" {
+					continue // Staged from workflow_sha, covered by the crane contract.
+				}
+				if !slices.Contains(paths, path) {
+					t.Errorf("%s: candidate script %s is missing from interface paths", name, path)
+				}
+				firstCommand = min(firstCommand, i)
+			}
+			if strings.Contains(step.Run, "go build") {
+				firstCommand = min(firstCommand, i)
+			}
+		}
+		if firstCommand == len(job.Steps) {
+			continue
+		}
+		if candidate < 0 || guard != candidate+1 || guard >= firstCommand {
+			t.Fatalf("%s: require candidate checkout, immediate guard, then candidate commands", name)
+		}
+		guards++
+	}
+	if guards != 3 {
+		t.Fatalf("guard covers %d candidate jobs, want 3", guards)
+	}
+	for _, required := range []string{
+		`this PR is behind $behind; merge main into the branch, then rerun`,
+		`::error::could not fetch or compare image test interface history`,
+		`--filter=blob:none --unshallow origin "$CANDIDATE_SHA"`,
+		`--filter=blob:none "$WORKFLOW_REPOSITORY_URL" "$WORKFLOW_SHA"`,
+		`read -r -a interface_paths <<< "$IMAGE_TEST_INTERFACE_PATHS"`,
+		`git rev-list --no-merges --max-count=1 "$CANDIDATE_SHA..$WORKFLOW_SHA" -- "${interface_paths[@]}" ':(exclude)*_test.go' ':(exclude)*/testdata/*'`,
+	} {
+		if !strings.Contains(guardRun, required) {
+			t.Fatalf("inline interface guard is missing %q", required)
+		}
+	}
+}
+
+func TestAcceptanceImageInterfaceGuardShell(t *testing.T) {
+	workflow, _ := readWorkflow(t, "../.github/workflows/acceptance-image-build.yml")
+	var script string
+	for _, step := range workflow.Jobs["reference-computer-platform-build"].Steps {
+		if step.Name == "Check candidate image test interface is current" {
+			script = step.Run
+		}
+	}
+	if script == "" {
+		t.Fatal("missing inline guard")
+	}
+	repo := t.TempDir()
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Guard Test", "GIT_AUTHOR_EMAIL=guard@example.invalid", "GIT_COMMITTER_NAME=Guard Test", "GIT_COMMITTER_EMAIL=guard@example.invalid", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	commit := func(content string) string {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(repo, "interface.sh"), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		git(repo, "add", ".")
+		git(repo, "commit", "-qm", content)
+		return git(repo, "rev-parse", "HEAD")
+	}
+	git(repo, "init", "-q")
+	git(repo, "config", "uploadpack.allowFilter", "true")
+	base := commit("base")
+	commit("first interface change")
+	current := commit("latest interface change")
+	git(repo, "checkout", "-qb", "old-pr", base)
+	oldPR := commit("PR changed the same script but is still behind")
+	git(repo, "checkout", "-qb", "current-pr", current)
+	currentPR := commit("PR changed the script after merging main")
+	git(repo, "checkout", "-qb", "merge-pr", base)
+	if err := os.WriteFile(filepath.Join(repo, "pr-interface.sh"), []byte("PR interface change"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mergePR := commit("base") // Leave main's interface path unchanged on the PR.
+	git(repo, "checkout", "-qb", "workflow-merge", current)
+	git(repo, "merge", "-q", "--no-ff", "-m", "synthetic PR merge", mergePR)
+	workflowMerge := git(repo, "rev-parse", "HEAD")
+	git(repo, "checkout", "-qb", "workflow-current-merge", current)
+	git(repo, "merge", "-q", "--no-ff", "-m", "synthetic current PR merge", currentPR)
+	workflowCurrentMerge := git(repo, "rev-parse", "HEAD")
+	git(repo, "checkout", "-qb", "test-only", current)
+	if err := os.MkdirAll(filepath.Join(repo, "checker", "testdata"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"checker/probe_test.go", "checker/testdata/receipt.json"} {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte("test only"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git(repo, "add", ".")
+	git(repo, "commit", "-qm", "main changed only checker tests")
+	testOnly := git(repo, "rev-parse", "HEAD")
+	fork := filepath.Join(t.TempDir(), "fork.git")
+	git(repo, "clone", "-q", "--bare", repo, fork)
+	git(fork, "config", "uploadpack.allowFilter", "true")
+	for _, tc := range []struct {
+		name, candidate, workflow string
+		fail                      bool
+	}{
+		{"behind", base, current, true},
+		{"behind with own script change", oldPR, current, true},
+		{"up to date", current, current, false},
+		{"PR changed script", currentPR, current, false},
+		{"both sides changed listed paths", mergePR, workflowMerge, true},
+		{"current PR with merge workflow", currentPR, workflowCurrentMerge, false},
+		{"main changed only tests", current, testOnly, false},
+		{"fetch failure", base, strings.Repeat("f", 40), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checkout := filepath.Join(t.TempDir(), "candidate")
+			git(repo, "clone", "-q", "--no-checkout", "--depth=1", "--branch", "old-pr", "file://"+fork, checkout)
+			// Fetch the selected head shallowly, just like actions/checkout.
+			git(checkout, "fetch", "-q", "--depth=1", "origin", tc.candidate)
+			git(checkout, "checkout", "-q", tc.candidate)
+			cmd := exec.Command("bash", "-c", script)
+			cmd.Dir = checkout
+			cmd.Env = append(os.Environ(), "CANDIDATE_SHA="+tc.candidate, "WORKFLOW_SHA="+tc.workflow, "WORKFLOW_REPOSITORY_URL=file://"+repo, "IMAGE_TEST_INTERFACE_PATHS=interface.sh pr-interface.sh checker")
+			out, err := cmd.CombinedOutput()
+			if (err != nil) != tc.fail {
+				t.Fatalf("guard error=%v, want failure=%t\n%s", err, tc.fail, out)
+			}
+			if tc.fail {
+				want := "::error::this PR is behind " + current + "; merge main into the branch, then rerun"
+				if tc.name == "fetch failure" {
+					want = "::error::could not fetch or compare image test interface history"
+				}
+				if !strings.Contains(string(out), want) {
+					t.Fatalf("guard lacks %q:\n%s", want, out)
+				}
+			}
+			t.Logf("guard failure=%t\n%s", err != nil, out)
+		})
+	}
 }
