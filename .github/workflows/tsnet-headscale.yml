@@ -1,0 +1,43 @@
+name: tsnet-headscale
+
+# The tsnet Fabric identity tests (machine and person WhoIs, node agent
+# registration, service reachability) on every PR, against a Headscale and a
+# DERP relay that the lane script starts on the runner (#1488). Secretless by
+# construction: no Tailscale account, no repository secret; the pre-auth keys
+# live only inside this job. tsnet-smoke.yml stays the drift check against
+# real Tailscale.
+#
+# Pins live in scripts/tsnet-headscale-lane.sh: Headscale v0.29.5 by SHA-256,
+# and derper built from the tailscale.com version in go.mod. Headscale
+# supports only a window of Tailscale client versions, so a tailscale.com
+# bump may need a Headscale bump.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tsnet-headscale-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tsnet-headscale:
+    name: tsnet-headscale
+    runs-on: ubuntu-latest
+    # Build of derper and the two test packages, two go test runs bounded by
+    # -timeout=8m per package and 5m, and the readiness waits, with margin.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run the tsnet identity tests against a local Headscale
+        run: bash scripts/tsnet-headscale-lane.sh
