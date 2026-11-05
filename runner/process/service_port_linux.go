@@ -4,19 +4,23 @@ package process
 
 import (
 	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"strconv"
 	"strings"
 )
 
-// inspectServiceListeners matches the kernel's listening-socket table for
-// port against the socket descriptors of the payload's process group. It
-// reads only the network namespace the Guardian shares with its payload, and
-// only the descriptors of processes in that group, which run as this user.
-func inspectServiceListeners(port, processGroupID int) (serviceListenerVerdict, error) {
+// inspectServiceListeners matches the kernel's listening sockets that can
+// receive the backend's connections against the socket descriptors of the
+// payload's process group. It reads only the network namespace the Guardian
+// shares with its payload, and only the descriptors of processes in that
+// group, which run as this user.
+func inspectServiceListeners(backend serviceBackend, processGroupID int) (serviceListenerVerdict, error) {
 	listening := make(map[string]bool)
 	for _, table := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
 		contents, err := os.ReadFile(table)
@@ -27,24 +31,12 @@ func inspectServiceListeners(port, processGroupID int) (serviceListenerVerdict, 
 		if err != nil {
 			return 0, err
 		}
-		lines := strings.Split(string(contents), "\n")
-		for _, line := range lines[1:] {
-			// sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode
-			fields := strings.Fields(line)
-			if len(fields) < 10 || fields[3] != "0A" { // 0A is TCP_LISTEN
-				continue
-			}
-			_, hexPort, found := strings.Cut(fields[1], ":")
-			if !found {
-				return 0, fmt.Errorf("malformed %s local address %q", table, fields[1])
-			}
-			value, err := strconv.ParseUint(hexPort, 16, 16)
-			if err != nil {
-				return 0, fmt.Errorf("malformed %s local port %q: %w", table, hexPort, err)
-			}
-			if int(value) == port {
-				listening[fields[9]] = true
-			}
+		inodes, err := receivingListenerInodes(contents, backend)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %w", table, err)
+		}
+		for _, inode := range inodes {
+			listening[inode] = true
 		}
 	}
 	if len(listening) == 0 {
@@ -67,6 +59,53 @@ func inspectServiceListeners(port, processGroupID int) (serviceListenerVerdict, 
 		return serviceListenerForeign, nil
 	}
 	return serviceListenerOwned, nil
+}
+
+// receivingListenerInodes returns the inodes of the LISTEN sockets in one
+// /proc/net/tcp or tcp6 table that can receive the backend's connections.
+func receivingListenerInodes(table []byte, backend serviceBackend) ([]string, error) {
+	var inodes []string
+	lines := strings.Split(string(table), "\n")
+	for _, line := range lines[1:] {
+		// sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode
+		fields := strings.Fields(line)
+		if len(fields) < 10 || fields[3] != "0A" { // 0A is TCP_LISTEN
+			continue
+		}
+		hexAddress, hexPort, found := strings.Cut(fields[1], ":")
+		if !found {
+			return nil, fmt.Errorf("malformed local address %q", fields[1])
+		}
+		port, err := strconv.ParseUint(hexPort, 16, 16)
+		if err != nil {
+			return nil, fmt.Errorf("malformed local port %q: %w", hexPort, err)
+		}
+		if int(port) != backend.port {
+			continue
+		}
+		ip, err := procNetAddress(hexAddress)
+		if err != nil {
+			return nil, err
+		}
+		if backend.receives(ip) {
+			inodes = append(inodes, fields[9])
+		}
+	}
+	return inodes, nil
+}
+
+// procNetAddress decodes a /proc/net/tcp address: the network-order bytes
+// printed as 32-bit words in host byte order.
+func procNetAddress(text string) (net.IP, error) {
+	raw, err := hex.DecodeString(text)
+	if err != nil || (len(raw) != net.IPv4len && len(raw) != net.IPv6len) {
+		return nil, fmt.Errorf("malformed local address %q", text)
+	}
+	ip := make(net.IP, len(raw))
+	for offset := 0; offset < len(raw); offset += 4 {
+		binary.NativeEndian.PutUint32(ip[offset:], binary.BigEndian.Uint32(raw[offset:]))
+	}
+	return ip, nil
 }
 
 // processGroupSockets returns the socket inodes held open by members of

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,6 +48,10 @@ func main() {
 		hang()
 	case "listen":
 		listen()
+	case "listen-reuseport":
+		listenReusePort()
+	case "listen-child":
+		listenChild()
 	case "listen-toggle":
 		listenToggle()
 	case "hang-both-streams":
@@ -259,6 +264,46 @@ func listen() {
 	}
 	serveAndClose(listener)
 	fatalf("listener stopped accepting")
+}
+
+// listenReusePort owns its backend with SO_REUSEPORT set, so a test can add
+// a second listener on the same address while this one keeps answering.
+func listenReusePort() {
+	if len(os.Args) != 3 {
+		fatalf("listen-reuseport mode requires one address")
+	}
+	config := net.ListenConfig{Control: func(_, _ string, connection syscall.RawConn) error {
+		var optionErr error
+		if err := connection.Control(func(descriptor uintptr) {
+			optionErr = syscall.SetsockoptInt(int(descriptor), syscall.SOL_SOCKET, syscall.SO_REUSEPORT, 1)
+		}); err != nil {
+			return err
+		}
+		return optionErr
+	}}
+	listener, err := config.Listen(context.Background(), "tcp4", os.Args[2])
+	if err != nil {
+		fatalf("listen: %v", err)
+	}
+	serveAndClose(listener)
+	fatalf("listener stopped accepting")
+}
+
+// listenChild leaves the backend to a child in its process group, like a
+// shell or launcher that starts the real server.
+func listenChild() {
+	if len(os.Args) != 3 {
+		fatalf("listen-child mode requires one address")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		fatalf("locate helper executable: %v", err)
+	}
+	child := exec.Command(executable, "listen", os.Args[2])
+	child.Stdout, child.Stderr = os.Stdout, os.Stderr
+	if err := child.Run(); err != nil {
+		fatalf("listen child: %v", err)
+	}
 }
 
 // listenToggle owns its backend like listen, closes it on SIGUSR1 and binds

@@ -1238,17 +1238,32 @@ once more to confirm that it is free. If it is taken, the agent picks one fresh
 port the same way, at once, and starts the payload there. If that port is taken
 too, the attempt ends with restartable `service_port_taken` before any payload
 exists. After spawn, the Guardian reports readiness, which publishes the
-service, only when every TCP listener on the port belongs to the payload's
-process group. On Linux it matches `/proc/net/tcp` and `/proc/net/tcp6`
+service, only when every TCP listener that can receive connections for the
+backend address belongs to the payload's process group. Those listeners are
+the ones bound to `127.0.0.1` (also as `::ffff:127.0.0.1`) or to a wildcard;
+an IPv6 wildcard counts because it may be dual-stack. A listener on `::1` or
+on another interface cannot receive the backend's traffic and does not count.
+On Linux the Guardian matches `/proc/net/tcp` and `/proc/net/tcp6`
 listening-socket inodes against the group's descriptors; on macOS it reads
-`/usr/sbin/lsof`. A listener of another process before startup makes the
-Guardian stop the payload and report `service_port_taken`; after startup it
-only keeps the service withdrawn, like any other probe loss. A payload that
-exits before startup while another process still holds its port also reports
-`service_port_taken`. A listener the check cannot attribute, such as another
-user's on macOS, is never published; the startup deadline then reports
-`startup_readiness_timeout` with that reason. Every new attempt receives a
-fresh port.
+`/usr/sbin/lsof`. The Guardian checks again on every return to readiness and
+every two seconds while the service is ready, so a takeover with no failed
+probe in between (the payload closes its listener and another process binds
+the port, or another process adds an `SO_REUSEPORT` listener) is withdrawn
+within two seconds. A listener of another process before startup makes the
+Guardian stop the payload and report `service_port_taken`. After startup it
+withdraws the service, like any other probe loss. If probes keep answering
+but ownership stays unconfirmed (a foreign owner or a failed inspection) for
+the startup readiness deadline, the Guardian stops the payload and reports
+`service_port_taken` with the reason. A payload that exits before startup
+while another process still holds its port also reports `service_port_taken`.
+Before startup, a listener the check cannot attribute, such as another user's
+on macOS, or a failed inspection is never published; the startup deadline then
+reports `startup_readiness_timeout` with that reason. Every new attempt
+receives a fresh port.
+
+Roll out L1 before agents that report `service_port_taken`. An older L1
+accepts the code but classifies every unknown spawn code as terminal, so a
+service on a newer agent would stop instead of restarting on a fresh port.
 
 `ServiceAddress` remains only for the process readiness guardian. A portful OCI
 request instead asks its adapter for the named `service` `AttemptEndpoint`: the

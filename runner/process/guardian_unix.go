@@ -335,13 +335,13 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 	if start.ServiceAddress != "" && (start.StartupReadinessDeadline <= 0 || start.ReadinessProbeInterval <= 0 || start.ReadinessConnectTimeout <= 0) {
 		return errors.New("guardian readiness configuration is invalid")
 	}
-	servicePort := 0
+	var backend serviceBackend
 	if start.ServiceAddress != "" {
-		port, err := serviceAddressPort(start.ServiceAddress)
+		parsed, err := parseServiceBackend(start.ServiceAddress)
 		if err != nil {
 			return fmt.Errorf("guardian service address is invalid: %w", err)
 		}
-		servicePort = port
+		backend = parsed
 	}
 	command := &exec.Cmd{
 		Path: start.Path, Args: append([]string(nil), start.Args...), Dir: start.Directory,
@@ -409,7 +409,7 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 		if _, _, err := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, completed); err != nil {
 			return err
 		}
-		if servicePort != 0 && !startupSatisfied && servicePortHeld(start.ServiceAddress) {
+		if start.ServiceAddress != "" && !startupSatisfied && servicePortHeld(start.ServiceAddress) {
 			// The payload group is gone, so whatever still holds its port is
 			// another process that took it before the payload bound it (#1468).
 			exit := "unknown status"
@@ -426,16 +426,72 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 		return writeExit(outcome, contract.TerminationCauseSpontaneous)
 	}
 	// ownershipProblem keeps why the latest answering listener was not
-	// confirmed as the payload's own, for the startup timeout's message.
+	// confirmed as the payload's own, for the typed failure's message.
 	var ownershipProblem error
-	writePortTaken := func() error {
+	// lastOwnershipCheck and ownershipConfirmed throttle inspection: a ready
+	// service is checked again each serviceOwnershipRecheckInterval, and an
+	// unconfirmed one is not inspected again sooner either.
+	var lastOwnershipCheck time.Time
+	ownershipConfirmed := true
+	// unconfirmedSince is when probes kept answering but the listener stopped
+	// being confirmed as the payload's after startup. After the startup
+	// readiness deadline in that state the payload is stopped with a typed
+	// reason, so it is never left withdrawn without one.
+	var unconfirmedSince time.Time
+	writePortTaken := func(reason error) error {
 		if _, _, err := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait); err != nil {
 			return err
 		}
-		result := spawnFailure(contract.SpawnFailureServicePortTaken, fmt.Errorf(
-			"service backend %s answered from a process outside the payload's process group; the service was not published",
-			start.ServiceAddress))
+		result := spawnFailure(contract.SpawnFailureServicePortTaken, reason)
 		return encoder.Encode(guardianStatusMessage{Type: guardianMessageExited, Result: &result})
+	}
+	// confirmOwnership decides whether a successful probe may count as ready
+	// (#1468). It returns done when the Guardian has stopped the payload.
+	confirmOwnership := func(probeReady bool) (bool, bool, error) {
+		if !probeReady {
+			unconfirmedSince = time.Time{}
+			return false, false, nil
+		}
+		now := time.Now()
+		due := lastOwnershipCheck.IsZero() || now.Sub(lastOwnershipCheck) >= serviceOwnershipRecheckInterval ||
+			(!ready && ownershipConfirmed)
+		if !due {
+			// Within the interval: a ready service stays ready, and an
+			// unconfirmed one stays withdrawn.
+			return ready, false, nil
+		}
+		lastOwnershipCheck = now
+		verdict, err := serviceListenerInspector(backend, processGroupID)
+		if err == nil && verdict == serviceListenerOwned {
+			ownershipConfirmed, ownershipProblem, unconfirmedSince = true, nil, time.Time{}
+			return true, false, nil
+		}
+		ownershipConfirmed = false
+		switch {
+		case err != nil:
+			ownershipProblem = err
+		case verdict == serviceListenerForeign:
+			ownershipProblem = fmt.Errorf("a process outside the payload's process group holds a listener that receives %s", start.ServiceAddress)
+			if !startupSatisfied {
+				return false, true, writePortTaken(fmt.Errorf(
+					"service backend %s answered from a process outside the payload's process group; the service was not published",
+					start.ServiceAddress))
+			}
+		default:
+			ownershipProblem = fmt.Errorf("no listener that receives %s and that this user can see belongs to the payload", start.ServiceAddress)
+		}
+		if startupSatisfied {
+			// After startup a probe never kills the payload at once; the
+			// service is withdrawn, and only a lasting state ends it.
+			if unconfirmedSince.IsZero() {
+				unconfirmedSince = now
+			} else if now.Sub(unconfirmedSince) >= start.StartupReadinessDeadline {
+				return false, true, writePortTaken(fmt.Errorf(
+					"service backend %s stayed withdrawn for %s because its listener was not the payload's own: %w",
+					start.ServiceAddress, start.StartupReadinessDeadline, ownershipProblem))
+			}
+		}
+		return false, false, nil
 	}
 
 	for {
@@ -455,25 +511,12 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 			}
 			return writeExit(outcome, cause)
 		case probeReady := <-probes:
-			if probeReady && !ready {
-				// Readiness publishes the service, so the listener that
-				// answered must belong to the payload's process group (#1468).
-				verdict, err := inspectServiceListeners(servicePort, processGroupID)
-				switch {
-				case err != nil:
-					ownershipProblem = err
-					probeReady = false
-				case verdict == serviceListenerForeign && !startupSatisfied:
-					return writePortTaken()
-				case verdict == serviceListenerForeign:
-					// After startup a probe never kills the payload; the
-					// service only stays withdrawn.
-					ownershipProblem = fmt.Errorf("a process outside the payload's process group holds a listener on %s", start.ServiceAddress)
-					probeReady = false
-				case verdict == serviceListenerUnseen:
-					ownershipProblem = fmt.Errorf("no listener on %s that this user can see belongs to the payload", start.ServiceAddress)
-					probeReady = false
-				}
+			// Readiness publishes the service, so the listener that answers
+			// must belong to the payload's process group, now and while the
+			// service stays ready (#1468).
+			probeReady, done, err := confirmOwnership(probeReady)
+			if done {
+				return err
 			}
 			if !startupSatisfied {
 				if !probeReady {
