@@ -117,7 +117,7 @@ jobs:
           repository: ${{ needs.resolve-published-artifact.outputs.source-repository }}
           ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           persist-credentials: false
-      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: false
@@ -151,7 +151,7 @@ jobs:
           repository: ${{ needs.resolve-published-artifact.outputs.source-repository }}
           ref: ${{ needs.resolve-published-artifact.outputs.candidate-sha }}
           persist-credentials: false
-      - uses: actions/setup-go@1d3c75d1c1175fd7c5bb3c7458a4aa1f6f3191c0 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache: false
