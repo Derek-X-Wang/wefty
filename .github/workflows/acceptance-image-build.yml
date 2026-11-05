@@ -270,6 +270,7 @@ jobs:
           restore-keys: debian-snapshot-v1-reference-computer-platform-build-${{ matrix.arch }}-${{ matrix.variant }}-20260827T000000Z-${{ hashFiles('examples/computer/Dockerfile', 'examples/computer-wayland/Dockerfile', 'examples/computer/fixtures/Dockerfile.wayland-text') }}-
       - name: Start the Debian snapshot cache proxy
         env:
+          DEBIAN_CACHE_OFFLINE: "1"
           ARCH: ${{ matrix.arch }}
           PROBE_PACKAGE: ${{ matrix.variant == 'wayland' && 'pool/main/w/wayvnc/wayvnc_0.9.1-1' || 'pool/main/x/xorg-server/xvfb_21.1.7-3%2bdeb12u12' }}
         run: bash scripts/debian-snapshot-cache.sh start "${PROBE_PACKAGE}_${ARCH}.deb"
@@ -286,11 +287,11 @@ jobs:
           target=()
           case "$VARIANT" in xfce) target=(--target single-seat) ;; esac
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${target[@]}" \
-            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" \
+            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" --add-host snapshot.debian.org:192.0.2.1 \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=oci,dest=$RUNNER_TEMP/computer-image.oci.tar,rewrite-timestamp=true" .
           docker buildx build --no-cache --platform "$PLATFORM" --provenance=false --sbom=false "${target[@]}" \
-            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" \
+            --build-arg http_proxy="$DEBIAN_CACHE_PROXY" --build-arg HTTP_PROXY="$DEBIAN_CACHE_PROXY" --add-host snapshot.debian.org:192.0.2.1 \
             --build-arg SOURCE_DATE_EPOCH=0 --file "$DOCKERFILE" \
             --output "type=registry,registry.insecure=true,name=$registry_reference,rewrite-timestamp=true" .
       - name: Execute the exact desktop digest and assert its ELF architecture
