@@ -994,7 +994,8 @@ func TestComputerCustodyQuarantineReceiptsDecideWhoOwnsAnEntry(t *testing.T) {
 	cleanup := func(storage ComputerStorageReference, fileName string) {
 		t.Helper()
 		payload, err := json.Marshal(ManagedVolumeQuarantineReceipt{Kind: "managed_volume_cleanup_quarantined", ReceiptID: "receipt-1",
-			VolumeKind: ManagedVolumeComputerDisk, ComputerStorage: storage, Removal: ManagedVolumeRemovalAuthority{RemovalGeneration: 1}})
+			VolumeKind: ManagedVolumeComputerDisk, ComputerStorage: storage, Removal: ManagedVolumeRemovalAuthority{RemovalGeneration: 1},
+			FailureReason: EngineFailureOperationFailed, Attempts: 1})
 		if err != nil {
 			t.Fatal(err)
 		}
