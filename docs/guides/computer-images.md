@@ -58,6 +58,65 @@ This proves that the bytes executed and later published are the same; it does
 not promise that future toolchains reproduce them. The recorded digest is the
 only image identity.
 
+The `computer-seats`, main-push `acceptance-image`, and reusable
+`acceptance-image-build` desktop jobs restore immutable Debian files for snapshot
+`20260827T000000Z` from GitHub Actions cache. A runner
+HTTP proxy serves apt files (indexes, packages and source packages) and the
+checksum-pinned neatvnc source archive; it is not an image layer cache.
+A real `pool/` package download checks the proxy before the
+build: the pinned `xvfb` package for XFCE/default Seats, or the pinned `wayvnc`
+package for Wayland. The probe is an installed package, so it adds no unused
+file; a warm cache serves it locally even in offline mode.
+Misses fetch directly from snapshot.debian.org with bounded retries;
+partial fills are saved even when a build fails. `DEBIAN_CACHE_OFFLINE=1` refuses
+misses for cache-only proof runs. The Wayland builder and its text-frame test
+fixture fetch neatvnc over HTTP so they share the cache; both retain the same
+SHA-256 check. Other HTTPS downloads still use their original upstream URLs.
+The reference jobs keep the proxy running through runtime checks and pass
+`WEFTY_DEBIAN_SNAPSHOT_PROXY` to Wayland's fixture builds. Without that variable,
+the runtime script keeps its original build arguments. These fixtures have only
+local tags, are removed after testing, and are never published.
+
+The jobs pass only predefined `http_proxy`/`HTTP_PROXY` build arguments. Docker
+[excludes these from image history and build cache by default](https://docs.docker.com/build/building/variables/#proxy-arguments);
+the Dockerfiles do not declare them. The runner's Docker bridge gateway reaches
+the proxy without changing a build's network mode. The fixture build's default
+bridge can reach the runner at that same gateway address; the proxy listens on
+all runner interfaces. Dockerfile edits are limited to the approved Wayland
+builder-stage URL schemes and comments. Pins, checksum checks and both
+empty-cache image digest checks stay unchanged; CI must also compare final
+Wayland digests with the prior images. Cache keys separate jobs,
+architectures and desktop variants, and include the snapshot date and Dockerfile
+hashes, including the text-frame fixture in reference-job keys. GitHub scopes PR
+caches to the PR merge ref, so a PR fill cannot seed
+main. Main must fill its own cache. GitHub's default repository cache budget is
+10 GB; eviction can make a later build cold again. The proxy reports request
+counts and cache disk usage after each build.
+
+A save creates a new full entry only when the proxy reports misses > 0; it can
+retain a partial fill after failure. Restore selects the newest entry matching
+the job/architecture/variant/date/Dockerfile prefix. Old entries are not updated
+in place. GitHub evicts entries unused for more than 7 days and, above the
+default 10 GB budget, evicts entries in order of oldest last access first
+([cache scope, matching and eviction](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)).
+Unmeasured planning estimates per architecture are 0.7–1.2 GiB for default Seats
+and 0.4–0.8 GiB for each reference variant: at most about 5.6 GiB for one entry
+per prefix across both architectures. Main and reusable reference jobs share
+prefixes, but concurrent fills can save separate copies; one extra reference
+generation raises that estimate to 8.8 GiB. Historical entries and PR-scoped
+copies can exhaust the budget and evict a warm cache.
+
+The proxy stores and returns response bodies byte for byte; it does not rewrite
+signed metadata or decompress indexes. Apt still authenticates `InRelease` or
+`Release` plus `Release.gpg` and checks package hashes. The existing
+`check-valid-until=no` setting disables expiry checks for the historical snapshot,
+not signatures. No source uses `trusted=yes`, and no apt flag allows insecure
+repositories or unauthenticated packages. CI's apt output should include
+`Get:1 http://snapshot.debian.org/archive/debian/20260827T000000Z bookworm InRelease`
+(or `trixie InRelease`). This line shows metadata retrieval; successful
+`apt-get update` with the unchanged authentication defaults establishes signature
+acceptance. See Debian's [apt-secure documentation](https://manpages.debian.org/bookworm/apt/apt-secure.8.en.html).
+
 The second publication is
 `ghcr.io/derek-x-wang/wefty-computer-wayland-reference:<commit>`. It follows
 the same per-architecture execute-and-ELF-check, promote-not-rebuild, immutable
