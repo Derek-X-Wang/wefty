@@ -152,7 +152,7 @@ func TestRecreateKeepsCustodyWrites(t *testing.T) {
 			if !strings.Contains(blocked.Error(), "wefty services remove computer_exporting --expect-current --wait 60s") || strings.Contains(blocked.Error(), "/operator/export") {
 				t.Fatalf("Custody refusal = %v", blocked)
 			}
-			if !strings.Contains(blocked.Error(), "If the Computer is already removed, the helper may clear this record when it next starts and sweeps Computer Storage, once no Storage of that Computer is left on the node (restart it with wefty node oci always-on); if the record remains after that, keep the VM and use node-owner recovery.") {
+			if !strings.Contains(blocked.Error(), "If the Computer is already removed, the helper may clear this record at its next start, which sweeps Computer Storage (for example when the host VM or the wefty agent restarts), or at the next Computer disk removal, once no Storage of that Computer is left on the node; if the record remains after that, keep the VM and use node-owner recovery.") {
 				t.Fatalf("Custody refusal lacks post-removal recovery: %v", blocked)
 			}
 			after, err := os.ReadFile(filepath.Join(f.root, path))

@@ -594,12 +594,17 @@ Human output carries the same explanation.
 - Computer Storage or Custody write records: save any data you need, then run
   `wefty services remove COMPUTER --expect-current --wait 60s`. Custody markers,
   including completed writes, use Computer removal for cleanup. If the Computer
-  is already removed, the helper may clear the record when it next starts and
-  sweeps Computer Storage, once no Storage of that Computer is left on the node;
-  restart it with `wefty node oci always-on` on a Lima node or
-  `systemctl restart wefty-oci-helper.service` on a native Linux node. The helper
-  journal names the Computer and the blocking entry when it defers. If the
-  record remains after that, keep the VM and use node-owner recovery.
+  is already removed, the helper may clear the record at its next start, which
+  sweeps Computer Storage (for example when the host VM or the wefty agent
+  restarts), or at the next Computer disk removal, once no Storage of that
+  Computer is left on the node. The helper journal names the Computer and the
+  blocking entry when another Computer's entry or an unreadable entry defers the
+  drop. To force a start, restart the helper unit:
+  `limactl shell <instance> sudo systemctl restart dev.wefty.oci-helper.service`
+  on a Lima node, or `systemctl restart wefty-oci-helper.service` on a native
+  Linux node. A restart ends running OCI work, so do it only when that is
+  acceptable. If the record remains after that, keep the VM and use node-owner
+  recovery.
 - Backup copies: save any data you need, then run
   `wefty services backup prune COMPUTER BACKUP --expect-current --idempotency-key KEY --wait 60s`
   with a new `KEY`.

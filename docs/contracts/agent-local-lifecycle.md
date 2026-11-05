@@ -519,13 +519,14 @@ keeps no Storage generation on the node. A disk root or quarantine entry of
 that Computer, or any entry whose owner cannot be read, defers the drop; a
 quarantine entry of a different Computer does not. A reset that leaves a
 successor keeps the records. The helper retries a deferred drop for every
-Computer at each Computer Storage sweep, which runs when the helper starts, and
-after each Computer disk removal, and logs the Computer and the blocking entry
-when it defers. If the Computer is already removed, the helper may clear its
-records when it next starts, once no Storage of that Computer is left on the
-node. On a Lima node, restart it with `wefty node oci always-on`; on a native
-Linux node, restart `wefty-oci-helper.service`. If a record remains after that,
-keep the VM and use node-owner recovery.
+Computer at each Computer Storage sweep, which runs when the helper starts (the
+boot barrier calls Sweep, for example after the host VM or the wefty agent
+restarts), and after each Computer disk removal. It logs the Computer and the
+blocking entry when another Computer's entry or an unreadable entry defers the
+drop. If the Computer is already removed, the helper may clear its records at
+its next start or at the next Computer disk removal, once no Storage of that
+Computer is left on the node. If a record remains after that, keep the VM and
+use node-owner recovery.
 
 The exception is
 `computer-backups/supersessions`, which contains removal and supersession

@@ -4,6 +4,7 @@ package ocihelper
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -826,14 +827,14 @@ func TestComputerCustodyExportKeepsDurableEvidenceOfAVerifiedExport(t *testing.T
 	}
 	// Only the Computer's removal takes the record away, and only once no
 	// Storage generation of that Computer is left on the node.
-	blocker, err := engine.computerRemainingStorageBlocker(request.Storage.ComputerID)
+	blocker, _, err := engine.computerRemainingStorageBlocker(request.Storage.ComputerID)
 	if err != nil || blocker == "" {
 		t.Fatalf("a Computer with a published disk reported blocker=%q err=%v", blocker, err)
 	}
 	if err := os.RemoveAll(filepath.Join(root, "computer-disks")); err != nil {
 		t.Fatal(err)
 	}
-	if blocker, err = engine.computerRemainingStorageBlocker(request.Storage.ComputerID); err != nil || blocker != "" {
+	if blocker, _, err = engine.computerRemainingStorageBlocker(request.Storage.ComputerID); err != nil || blocker != "" {
 		t.Fatalf("a Computer with no disk reported blocker=%q err=%v", blocker, err)
 	}
 	if err := engine.removeCustodyWriteMarkersForComputer("a-different-computer"); err != nil {
@@ -970,6 +971,91 @@ func TestComputerCustodyQuarantineOfAnotherComputerDoesNotKeepTheRecords(t *test
 	}
 	if _, recorded, err := engine.custodyWritePhase(request); err != nil || recorded {
 		t.Fatalf("another Computer's quarantine kept this record: recorded=%t err=%v", recorded, err)
+	}
+}
+
+func TestComputerCustodyQuarantineReceiptsDecideWhoOwnsAnEntry(t *testing.T) {
+	engine, request, _, unreadable := orphanCustodyFixture(t)
+	if err := os.RemoveAll(unreadable); err != nil {
+		t.Fatal(err)
+	}
+	// With the Computer's own disk root gone, only quarantine can keep it.
+	name, err := deterministicComputerDiskName(request.Storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)); err != nil {
+		t.Fatal(err)
+	}
+	quarantineRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine")
+	if err := os.MkdirAll(quarantineRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cleanup := func(storage ComputerStorageReference, fileName string) {
+		t.Helper()
+		payload, err := json.Marshal(ManagedVolumeQuarantineReceipt{Kind: "managed_volume_cleanup_quarantined", ReceiptID: "receipt-1",
+			VolumeKind: ManagedVolumeComputerDisk, ComputerStorage: storage, Removal: ManagedVolumeRemovalAuthority{RemovalGeneration: 1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fileName == "" {
+			diskName, err := deterministicComputerDiskName(storage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fileName = diskName + "-cleanup-1.json"
+		}
+		if err := os.WriteFile(filepath.Join(quarantineRoot, fileName), payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	other := ComputerStorageReference{ComputerID: "computer-2", StorageID: "storage-2", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 16 << 20}
+	cleanup(other, "")
+	if blocker, _, err := engine.computerRemainingStorageBlocker(request.Storage.ComputerID); err != nil || blocker != "" {
+		t.Fatalf("another Computer's cleanup receipt blocked: %q err=%v", blocker, err)
+	}
+	// A receipt that names no Computer, or whose file name does not match
+	// its identity, cannot be trusted and must block.
+	nameless := other
+	nameless.ComputerID = ""
+	cleanup(nameless, "wefty-computer-disk-nameless-cleanup-1.json")
+	if blocker, own, err := engine.computerRemainingStorageBlocker(request.Storage.ComputerID); err != nil || blocker == "" || own {
+		t.Fatalf("a cleanup receipt with no Computer ID did not block as untrusted: %q own=%t err=%v", blocker, own, err)
+	}
+	if err := os.Remove(filepath.Join(quarantineRoot, "wefty-computer-disk-nameless-cleanup-1.json")); err != nil {
+		t.Fatal(err)
+	}
+	cleanup(other, "wefty-computer-disk-renamed-cleanup-1.json")
+	if blocker, _, err := engine.computerRemainingStorageBlocker(request.Storage.ComputerID); err != nil || blocker == "" {
+		t.Fatalf("a cleanup receipt under the wrong name did not block: %q err=%v", blocker, err)
+	}
+	if err := os.Remove(filepath.Join(quarantineRoot, "wefty-computer-disk-renamed-cleanup-1.json")); err != nil {
+		t.Fatal(err)
+	}
+	// This Computer's own receipt blocks and is reported as its own.
+	cleanup(request.Storage, "")
+	if blocker, own, err := engine.computerRemainingStorageBlocker(request.Storage.ComputerID); err != nil || blocker == "" || !own {
+		t.Fatalf("own cleanup receipt: blocker=%q own=%t err=%v", blocker, own, err)
+	}
+}
+
+func TestComputerCustodyAuthorityQuarantineKeepsEveryComputersRecords(t *testing.T) {
+	engine, request, _, unreadable := orphanCustodyFixture(t)
+	if err := os.RemoveAll(unreadable); err != nil {
+		t.Fatal(err)
+	}
+	name, err := deterministicComputerDiskName(request.Storage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+	// An authority-kind quarantine names no Computer, so it cannot clear any.
+	if err := engine.quarantineComputerDiskAuthorityFailure(diskRoot, name, "manifest_invalid"); err != nil {
+		t.Fatal(err)
+	}
+	blocker, own, err := engine.computerRemainingStorageBlocker("a-different-computer")
+	if err != nil || blocker == "" || own {
+		t.Fatalf("authority quarantine: blocker=%q own=%t err=%v", blocker, own, err)
 	}
 }
 

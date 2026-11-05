@@ -1126,12 +1126,14 @@ func (engine *ContainerdEngine) removeOrphanCustodyWriteMarkers() error {
 		}
 	}
 	for computerID := range computers {
-		blocker, err := engine.computerRemainingStorageBlocker(computerID)
+		blocker, own, err := engine.computerRemainingStorageBlocker(computerID)
 		if err != nil {
 			return err
 		}
 		if blocker != "" {
-			log.Printf("Custody write records of Computer %s kept: %s still blocks the drop", computerID, blocker)
+			if !own {
+				log.Printf("Custody write records kept computer_id=%s blocker=%s", computerID, blocker)
+			}
 			continue
 		}
 		if err := engine.removeCustodyWriteMarkersForComputer(computerID); err != nil {

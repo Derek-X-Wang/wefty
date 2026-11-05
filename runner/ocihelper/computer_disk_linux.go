@@ -715,7 +715,7 @@ func (engine *ContainerdEngine) deleteComputerDiskUnderAdmission(ctx context.Con
 	// only once a Computer keeps no Storage generation on the node. A reset,
 	// which deletes a predecessor while its successor remains, must not take
 	// them.
-	blocker, err := engine.computerRemainingStorageBlocker(storage.ComputerID)
+	blocker, _, err := engine.computerRemainingStorageBlocker(storage.ComputerID)
 	if err != nil {
 		return err
 	}
@@ -769,12 +769,13 @@ func removeComputerDiskPayloadUnderLock(root string) error {
 // keeps this Computer's Custody write records, or returns "" when it is certain
 // that the Computer keeps no Storage generation here. That is a disk root or a
 // quarantine entry of this Computer, or anything whose owner cannot be read:
-// the records are only ever dropped on a certain answer.
-func (engine *ContainerdEngine) computerRemainingStorageBlocker(computerID string) (string, error) {
+// the records are only ever dropped on a certain answer. own is true when the
+// blocker is readable and belongs to this Computer, which is no news.
+func (engine *ContainerdEngine) computerRemainingStorageBlocker(computerID string) (blocker string, own bool, err error) {
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks")
 	entries, err := readDirectoryIfPresent(diskRoot)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -791,10 +792,10 @@ func (engine *ContainerdEngine) computerRemainingStorageBlocker(computerID strin
 			if _, refused, refusalErr := refusedComputerStorageAbsent(root, entry.Name()); refusalErr == nil && refused {
 				continue
 			}
-			return "computer-disks/" + entry.Name(), nil
+			return "computer-disks/" + entry.Name(), false, nil
 		}
 		if manifest.Storage.ComputerID == computerID {
-			return "computer-disks/" + entry.Name(), nil
+			return "computer-disks/" + entry.Name(), true, nil
 		}
 	}
 	// Read after computer-disks: a generation only ever moves from there into
@@ -802,7 +803,7 @@ func (engine *ContainerdEngine) computerRemainingStorageBlocker(computerID strin
 	quarantineRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine")
 	quarantined, err := readDirectoryIfPresent(quarantineRoot)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	for _, entry := range quarantined {
 		if strings.HasPrefix(entry.Name(), ".") {
@@ -811,20 +812,32 @@ func (engine *ContainerdEngine) computerRemainingStorageBlocker(computerID strin
 			continue
 		}
 		path := filepath.Join(quarantineRoot, entry.Name())
-		blocked := true
+		// owner is the Computer the entry names, "" when it names none that
+		// can be trusted, and blocked is true for such an entry too.
+		owner, blocked := "", true
 		if entry.IsDir() {
 			receipt, readErr := readAndValidateComputerDiskQuarantineReceipt(filepath.Join(path, "quarantine.json"))
-			blocked = readErr != nil || receipt.Kind == computerDiskQuarantineKindAuthority || receipt.Storage.ComputerID == computerID
+			if readErr == nil && receipt.Kind != computerDiskQuarantineKindAuthority {
+				owner = receipt.Storage.ComputerID
+				blocked = owner == computerID
+			}
 		} else if strings.Contains(entry.Name(), "-cleanup-") && strings.HasSuffix(entry.Name(), ".json") {
 			var receipt ManagedVolumeQuarantineReceipt
 			payload, readErr := os.ReadFile(path)
-			blocked = readErr != nil || json.Unmarshal(payload, &receipt) != nil || receipt.ComputerStorage.ComputerID == computerID
+			if readErr == nil && json.Unmarshal(payload, &receipt) == nil && receipt.Kind == "managed_volume_cleanup_quarantined" &&
+				receipt.ComputerStorage.ComputerID != "" && receipt.Removal.RemovalGeneration > 0 {
+				name, nameErr := deterministicComputerDiskName(receipt.ComputerStorage)
+				if nameErr == nil && entry.Name() == fmt.Sprintf("%s-cleanup-%d.json", name, receipt.Removal.RemovalGeneration) {
+					owner = receipt.ComputerStorage.ComputerID
+					blocked = owner == computerID
+				}
+			}
 		}
 		if blocked {
-			return "computer-disk-quarantine/" + entry.Name(), nil
+			return "computer-disk-quarantine/" + entry.Name(), owner == computerID, nil
 		}
 	}
-	return "", nil
+	return "", false, nil
 }
 
 func (engine *ContainerdEngine) detachComputerDisk(attachment *computerDiskAttachment, kind, sweepEpoch string) error {
