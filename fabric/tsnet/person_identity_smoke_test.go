@@ -3,8 +3,10 @@
 package tsnet
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -87,10 +89,15 @@ func TestTSNetPersonWhoAmI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		// The error body names the check that refused the caller; the
+		// Headscale lane's negative control matches it (#1488).
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		t.Fatalf("whoami status=%d body=%s", response.StatusCode, bytes.TrimSpace(body))
+	}
 	var person l1.AuthenticatedPerson
-	decodeErr := json.NewDecoder(response.Body).Decode(&person)
-	if response.StatusCode != http.StatusOK || decodeErr != nil {
-		t.Fatalf("whoami status=%d decode=%v", response.StatusCode, decodeErr)
+	if err := json.NewDecoder(response.Body).Decode(&person); err != nil {
+		t.Fatalf("whoami decode: %v", err)
 	}
 	if person.FabricID == "" || person.UserID == "" || person.DeviceID == "" || person.SeenAt.IsZero() {
 		t.Fatalf("whoami returned incomplete person identity: %#v", person)
