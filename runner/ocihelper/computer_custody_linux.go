@@ -1071,9 +1071,9 @@ func (engine *ContainerdEngine) recordCustodyWriteCompleted(request ExportComput
 		StartedNS: now, CompletedNS: now})
 }
 
-// removeCustodyWriteMarkersForComputer is the only deletion path. It runs
-// when a Computer's last Storage generation leaves this node, and it touches
-// nothing outside the marker directory.
+// removeCustodyWriteMarkersForComputer is the only deletion path. Its callers
+// run it once a Computer's last Storage generation has left this node, and it
+// touches nothing outside the marker directory.
 func (engine *ContainerdEngine) removeCustodyWriteMarkersForComputer(computerID string) error {
 	root := custodyWriteMarkerRoot(engine.config.RuntimeRoot)
 	entries, err := readDirectoryIfPresent(root)
@@ -1102,6 +1102,40 @@ func (engine *ContainerdEngine) removeCustodyWriteMarkersForComputer(computerID 
 		return nil
 	}
 	return syncDirectoryIfPresent(root)
+}
+
+// removeOrphanCustodyWriteMarkers drops the records of every Computer that
+// keeps no Storage generation on the node. A Computer whose answer is not
+// certain, including every Computer while an unrelated disk root cannot be
+// read, keeps its records and is tried again on the next call.
+func (engine *ContainerdEngine) removeOrphanCustodyWriteMarkers() error {
+	entries, err := readDirectoryIfPresent(custodyWriteMarkerRoot(engine.config.RuntimeRoot))
+	if err != nil {
+		return err
+	}
+	computers := map[string]bool{}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		payload, readErr := os.ReadFile(filepath.Join(custodyWriteMarkerRoot(engine.config.RuntimeRoot), entry.Name()))
+		var marker custodyWriteMarker
+		if readErr == nil && json.Unmarshal(payload, &marker) == nil && marker.ComputerID != "" {
+			computers[marker.ComputerID] = true
+		}
+	}
+	for computerID := range computers {
+		remaining, err := engine.computerHasRemainingStorage(computerID)
+		if err != nil {
+			return err
+		}
+		if !remaining {
+			if err := engine.removeCustodyWriteMarkersForComputer(computerID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type custodyContextReader struct {

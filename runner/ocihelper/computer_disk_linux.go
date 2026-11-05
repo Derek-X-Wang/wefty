@@ -712,15 +712,23 @@ func (engine *ContainerdEngine) deleteComputerDiskUnderAdmission(ctx context.Con
 		return err
 	}
 	// Custody write records outlive every export attempt and are taken away
-	// only here, once the absence of this generation is proven and this
-	// Computer keeps no Storage generation on the node. A reset, which
-	// deletes a predecessor while its successor remains, must not take them.
+	// only once a Computer keeps no Storage generation on the node. A reset,
+	// which deletes a predecessor while its successor remains, must not take
+	// them.
 	remaining, err := engine.computerHasRemainingStorage(storage.ComputerID)
 	if err != nil {
 		return err
 	}
 	if !remaining {
-		return engine.removeCustodyWriteMarkersForComputer(storage.ComputerID)
+		if err := engine.removeCustodyWriteMarkersForComputer(storage.ComputerID); err != nil {
+			return err
+		}
+	}
+	// A repeated Computer removal never reaches the helper, so this also
+	// retries other Computers' deferred cleanup. Their failure must not fail
+	// this removal.
+	if err := engine.removeOrphanCustodyWriteMarkers(); err != nil {
+		log.Printf("Custody write record retry deferred origin=disk_removal err=%v", err)
 	}
 	return nil
 }
@@ -758,8 +766,18 @@ func removeComputerDiskPayloadUnderLock(root string) error {
 }
 
 // computerHasRemainingStorage reports whether any Storage generation of this
-// Computer still has a managed disk root on the node.
+// Computer still has a managed disk root on the node. Quarantined Storage is
+// still Storage, and its identity is not always readable, so any quarantined
+// entry also answers "present": the records are only ever dropped on a
+// certain answer.
 func (engine *ContainerdEngine) computerHasRemainingStorage(computerID string) (bool, error) {
+	quarantined, err := readDirectoryIfPresent(filepath.Join(engine.config.RuntimeRoot, "computer-disk-quarantine"))
+	if err != nil {
+		return false, err
+	}
+	if len(quarantined) != 0 {
+		return true, nil
+	}
 	diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks")
 	entries, err := readDirectoryIfPresent(diskRoot)
 	if err != nil {
@@ -2031,6 +2049,13 @@ diskLoop:
 			engine.computerDiskSweepEvidence = append(engine.computerDiskSweepEvidence,
 				engine.resolveOperationalDeferralRecordFailure(root, entry.Name(), "computer_disk_sweep_complete", manifest.Storage, err, countRecoveryAttempt))
 		}
+	}
+	// The sweep runs at every helper start, so a Custody record whose cleanup
+	// was deferred at removal time is retried once the blocking root is fixed.
+	// A failed retry must not fail the sweep: the record stays, and the host
+	// VM recreate refusal still names it.
+	if err := engine.removeOrphanCustodyWriteMarkers(); err != nil {
+		log.Printf("Custody write record retry deferred origin=computer_storage_sweep err=%v", err)
 	}
 	return nil
 }

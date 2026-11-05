@@ -371,7 +371,7 @@ func recreateCustodyLabel(name, payload string) string {
 	if name != fmt.Sprintf("%x.json", digest) {
 		return ""
 	}
-	return fmt.Sprintf("Custody write record for Computer %s, export %s (%s); save any data you need, then run wefty services remove %s --expect-current --wait 60s. If the Computer is already removed, or this record remains after removal, keep the VM and use node-owner recovery", record.ComputerID, record.ExportID, record.Phase, record.ComputerID)
+	return fmt.Sprintf("Custody write record for Computer %s, export %s (%s); save any data you need, then run wefty services remove %s --expect-current --wait 60s. If the Computer is already removed, the helper clears this record on its next Computer Storage sweep (a helper restart) or Computer disk removal; if it remains after that, keep the VM and use node-owner recovery", record.ComputerID, record.ExportID, record.Phase, record.ComputerID)
 }
 
 func validRecreateServiceName(name string) bool {

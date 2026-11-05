@@ -513,9 +513,15 @@ folders or records, malformed records and incomplete inventory refuse. Save
 service data before `wefty services remove JOB_ID --wait 60s` when the job and
 owner record are known. Missing or damaged owner records and unknown jobs need
 node-owner recovery; keep the VM until recovery is complete. For Custody markers,
-use `wefty services remove COMPUTER --expect-current --wait 60s`. If the Computer
-is already removed, or this record remains after removal, keep the VM and use
-node-owner recovery.
+use `wefty services remove COMPUTER --expect-current --wait 60s`. The helper
+drops a Computer's Custody records only when it is certain that the Computer
+keeps no Storage generation, quarantined or not, on the node. An unreadable
+unrelated disk root defers the drop, and a reset that leaves a successor keeps
+the records. The helper retries a deferred drop for every Computer at each
+Computer Storage sweep, which runs when the helper starts, and after each
+Computer disk removal. If the Computer is already removed, a helper restart
+clears its records once the blocking root is fixed. If a record remains after
+that, keep the VM and use node-owner recovery.
 
 The exception is
 `computer-backups/supersessions`, which contains removal and supersession

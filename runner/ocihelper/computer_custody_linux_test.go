@@ -850,6 +850,125 @@ func TestComputerCustodyExportKeepsDurableEvidenceOfAVerifiedExport(t *testing.T
 	}
 }
 
+// orphanCustodyFixture exports Custody for the test Computer, then leaves an
+// unrelated disk root with no readable manifest beside it.
+func orphanCustodyFixture(t *testing.T) (*ContainerdEngine, ExportComputerCustodyRequest, ManagedVolumeRemovalAuthority, string) {
+	t.Helper()
+	root, system, source := publishedStorageCopySource(t)
+	mountRoot, externalRoot := custodyOperatorMountRoot(t)
+	request := custodyExportTestRequest(source, externalRoot)
+	engine := &ContainerdEngine{config: custodyEngineConfig(root, mountRoot), diskSystem: system}
+	if exported, err := engine.ExportComputerCustody(t.Context(), request); err != nil || exported.Receipt.Kind != "computer_custody_export_verified" {
+		t.Fatalf("Custody export = %+v err=%v", exported, err)
+	}
+	unreadable := filepath.Join(root, "computer-disks", "wefty-computer-disk-unrelated")
+	if err := os.MkdirAll(unreadable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	authority := testComputerAuthority("backup-source", "source-fence", "boot-a")
+	removal := ManagedVolumeRemovalAuthority{NodeID: authority.NodeID, BootSessionID: authority.BootSessionID,
+		JobID: authority.JobID, PriorJobID: authority.JobID, RemovalGeneration: 1, CleanupFence: "cleanup"}
+	return engine, request, removal, unreadable
+}
+
+func TestComputerCustodyOrphanMarkerIsClearedOnceTheBlockingRootIsFixed(t *testing.T) {
+	for _, retry := range []string{"storage sweep", "another Computer disk removal"} {
+		t.Run(retry, func(t *testing.T) {
+			engine, request, removal, unreadable := orphanCustodyFixture(t)
+			if err := engine.deleteComputerDisk(request.Storage, removal); err != nil {
+				t.Fatal(err)
+			}
+			// The last disk is gone, but the unrelated root cannot be read, so
+			// the answer is not certain and the record stays.
+			if _, recorded, err := engine.custodyWritePhase(request); err != nil || !recorded {
+				t.Fatalf("an unreadable unrelated root let the record go: recorded=%t err=%v", recorded, err)
+			}
+			if err := engine.removeOrphanCustodyWriteMarkers(); err != nil {
+				t.Fatal(err)
+			}
+			if _, recorded, err := engine.custodyWritePhase(request); err != nil || !recorded {
+				t.Fatalf("a retry beside the unreadable root let the record go: recorded=%t err=%v", recorded, err)
+			}
+			if err := os.RemoveAll(unreadable); err != nil {
+				t.Fatal(err)
+			}
+			switch retry {
+			case "storage sweep":
+				if err := engine.sweepComputerDisks(t.Context(), "orphan-sweep"); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				other := ComputerStorageReference{ComputerID: "computer-2", StorageID: "storage-2", StorageGeneration: 1, IntentRevision: 1, DiskBytes: 16 << 20}
+				attachment, err := engine.attachComputerDisk(t.Context(), other, testComputerAuthority("other-attempt", "other-fence", "boot-a"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.deleteComputerDisk(other, removal); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, recorded, err := engine.custodyWritePhase(request); err != nil || recorded {
+				t.Fatalf("the retry left the orphan record: recorded=%t err=%v", recorded, err)
+			}
+		})
+	}
+}
+
+func TestComputerCustodyRetryKeepsRecordsOfAComputerThatStillHasStorage(t *testing.T) {
+	for _, shape := range []string{"disk root", "quarantined Storage"} {
+		t.Run(shape, func(t *testing.T) {
+			engine, request, _, unreadable := orphanCustodyFixture(t)
+			if err := os.RemoveAll(unreadable); err != nil {
+				t.Fatal(err)
+			}
+			if shape == "quarantined Storage" {
+				name, err := deterministicComputerDiskName(request.Storage)
+				if err != nil {
+					t.Fatal(err)
+				}
+				diskRoot := filepath.Join(engine.config.RuntimeRoot, "computer-disks", name)
+				if err := engine.quarantineComputerDiskAnomaly(diskRoot, name, request.Storage, "allocation_mismatch"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.RemoveAll(diskRoot); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := engine.removeOrphanCustodyWriteMarkers(); err != nil {
+				t.Fatal(err)
+			}
+			if _, recorded, err := engine.custodyWritePhase(request); err != nil || !recorded {
+				t.Fatalf("a Computer with %s lost its record: recorded=%t err=%v", shape, recorded, err)
+			}
+		})
+	}
+}
+
+func TestComputerCustodyResetKeepsRecordsWhileTheSuccessorRemains(t *testing.T) {
+	engine, request, removal, unreadable := orphanCustodyFixture(t)
+	if err := os.RemoveAll(unreadable); err != nil {
+		t.Fatal(err)
+	}
+	successor := request.Storage
+	successor.StorageID, successor.StorageGeneration = "storage-2", 2
+	attachment, err := engine.attachComputerDisk(t.Context(), successor, testComputerAuthority("successor", "successor-fence", "boot-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.detachComputerDisk(attachment, computerDiskReapReceipt, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.deleteComputerDisk(request.Storage, removal); err != nil {
+		t.Fatal(err)
+	}
+	if _, recorded, err := engine.custodyWritePhase(request); err != nil || !recorded {
+		t.Fatalf("a reset took the record while its successor remains: recorded=%t err=%v", recorded, err)
+	}
+}
+
 func TestComputerCustodyExportRefusesAnAncestorSubstitutedDuringRootAcquisition(t *testing.T) {
 	root, system, source := publishedStorageCopySource(t)
 	base := t.TempDir()
