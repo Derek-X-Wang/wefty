@@ -16,6 +16,16 @@ type Client struct {
 	wire          io.ReadWriter
 	pending       <-chan frameUpdate
 	Width, Height int
+	// newTimer is a test seam for WaitForChange's timers; nil uses time.NewTimer.
+	newTimer func(time.Duration) (<-chan time.Time, func() bool)
+}
+
+func (c *Client) timer(d time.Duration) (<-chan time.Time, func() bool) {
+	if c.newTimer != nil {
+		return c.newTimer(d)
+	}
+	timer := time.NewTimer(d)
+	return timer.C, timer.Stop
 }
 
 func Open(wire io.ReadWriter) (*Client, error) {
@@ -157,15 +167,15 @@ func (c *Client) SyncAfterInput(baseline color.RGBA) (bool, error) {
 // WaitForChange waits for a non-empty incremental update. Call Frame before
 // input to clear this connection's initial damage over the whole screen.
 // Only one request is outstanding: consume its entire reply before re-requesting.
-// After success, Frame may capture on this transport. After a timeout, close
-// the transport and capture on a fresh connection; a reply may still be pending.
+// After success, Frame may capture on this transport. After a timeout, one
+// incremental request may still be outstanding: capture with FrameAfterWait.
 // Do not set a read deadline here: WebSocket deadlines close the transport.
 func (c *Client) WaitForChange(limit time.Duration) (bool, error) {
 	if c.pending != nil {
-		return false, fmt.Errorf("pending framebuffer read: close transport after WaitForChange timeout")
+		return false, errPendingRead
 	}
-	timer := time.NewTimer(limit)
-	defer timer.Stop()
+	expired, stop := c.timer(limit)
+	defer stop()
 	for {
 		if err := c.request(c.Width, c.Height, true); err != nil {
 			return false, err
@@ -182,19 +192,61 @@ func (c *Client) WaitForChange(limit time.Duration) (bool, error) {
 			if update.changed {
 				return true, nil
 			}
-		case <-timer.C:
+		case <-expired:
 			return false, nil
 		}
 		// Empty replies are not changes. Pace re-requests to avoid a busy loop.
-		pause := time.NewTimer(20 * time.Millisecond)
+		paused, stopPause := c.timer(20 * time.Millisecond)
 		select {
-		case <-pause.C:
-		case <-timer.C:
-			pause.Stop()
+		case <-paused:
+		case <-expired:
+			stopPause()
 			return false, nil
 		}
 	}
 }
+
+// FrameAfterWait captures the full screen on this connection after
+// WaitForChange timed out. Without an outstanding read it is Frame.
+//
+// Otherwise it sends the full request at once, because the outstanding
+// incremental request may never be answered. RFB replies carry no request ID,
+// and LibVNCServer may answer both requests with one merged update, while
+// neatvnc may answer them separately or leave the incremental unanswered. So
+// the outstanding result keeps its pixels: they are folded into the capture,
+// and later updates are applied in arrival order (newer pixels win) until
+// every pixel is covered. Each reply read here answers a request sent after
+// the input's Sync, so no pixel comes from before the input. A frame taken
+// after the input but before the application redraws is correct, not stale.
+//
+// drained, when not nil, runs once the outstanding result has been received
+// without error; a failed drain never calls it. A reply that never completes
+// blocks until the caller closes the transport.
+// A server may still answer one of these requests later, so close the
+// transport after this capture.
+func (c *Client) FrameAfterWait(drained func()) (*image.RGBA, error) {
+	if c.pending == nil {
+		return c.Frame()
+	}
+	pending := c.pending
+	c.pending = nil
+	if err := c.request(c.Width, c.Height, false); err != nil {
+		return nil, err
+	}
+	update := <-pending
+	if update.err != nil {
+		return nil, update.err
+	}
+	if drained != nil {
+		drained()
+	}
+	if err := c.complete(c.Width, c.Height, &update); err != nil {
+		return nil, err
+	}
+	return update.frame, nil
+}
+
+var errPendingRead = fmt.Errorf("pending framebuffer read: capture with FrameAfterWait after a WaitForChange timeout")
 
 func (c *Client) request(width, height int, incremental bool) error {
 	request := []byte{3, 0, 0, 0, 0, 0, 0, 0, 0, 0}
@@ -213,24 +265,26 @@ func (c *Client) frame(width, height int) (*image.RGBA, error) {
 
 func (c *Client) frameWithOutside(width, height int) (*image.RGBA, bool, error) {
 	if c.pending != nil {
-		return nil, false, fmt.Errorf("pending framebuffer read: close transport after WaitForChange timeout")
+		return nil, false, errPendingRead
 	}
 	if err := c.request(width, height, false); err != nil {
 		return nil, false, err
 	}
-	frame := image.NewRGBA(image.Rect(0, 0, width, height))
-	seen := make([]bool, width*height)
-	remaining := len(seen)
-	outside := false
-	for remaining > 0 {
-		update := frameUpdate{frame: frame, seen: seen}
-		if err := c.readRectangles(width, height, &update); err != nil {
-			return nil, false, err
-		}
-		remaining -= update.covered
-		outside = outside || update.outside
+	update := frameUpdate{frame: image.NewRGBA(image.Rect(0, 0, width, height)), seen: make([]bool, width*height)}
+	if err := c.complete(width, height, &update); err != nil {
+		return nil, false, err
 	}
-	return frame, outside, nil
+	return update.frame, update.outside, nil
+}
+
+// complete reads updates into result until every requested pixel is covered.
+func (c *Client) complete(width, height int, result *frameUpdate) error {
+	for result.covered < len(result.seen) {
+		if err := c.readRectangles(width, height, result); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type frameUpdate struct {
@@ -242,8 +296,12 @@ type frameUpdate struct {
 	err     error
 }
 
-func (c *Client) readUpdate() (result frameUpdate) {
-	result.err = c.readRectangles(0, 0, &result)
+// readUpdate reads one update and keeps its pixels in a full-screen frame.
+// FrameAfterWait may need them: a server can answer this request and a later
+// full request with one merged update.
+func (c *Client) readUpdate() frameUpdate {
+	result := frameUpdate{frame: image.NewRGBA(image.Rect(0, 0, c.Width, c.Height)), seen: make([]bool, c.Width*c.Height)}
+	result.err = c.readRectangles(c.Width, c.Height, &result)
 	return result
 }
 
