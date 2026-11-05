@@ -335,6 +335,14 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 	if start.ServiceAddress != "" && (start.StartupReadinessDeadline <= 0 || start.ReadinessProbeInterval <= 0 || start.ReadinessConnectTimeout <= 0) {
 		return errors.New("guardian readiness configuration is invalid")
 	}
+	servicePort := 0
+	if start.ServiceAddress != "" {
+		port, err := serviceAddressPort(start.ServiceAddress)
+		if err != nil {
+			return fmt.Errorf("guardian service address is invalid: %w", err)
+		}
+		servicePort = port
+	}
 	command := &exec.Cmd{
 		Path: start.Path, Args: append([]string(nil), start.Args...), Dir: start.Directory,
 		Env: append([]string(nil), start.Environment...), Stdout: stdout, Stderr: stderr,
@@ -401,7 +409,33 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 		if _, _, err := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, completed); err != nil {
 			return err
 		}
+		if servicePort != 0 && !startupSatisfied && servicePortHeld(start.ServiceAddress) {
+			// The payload group is gone, so whatever still holds its port is
+			// another process that took it before the payload bound it (#1468).
+			exit := "unknown status"
+			if outcome.state != nil {
+				exit = outcome.state.String()
+			} else if outcome.err != nil {
+				exit = outcome.err.Error()
+			}
+			result := spawnFailure(contract.SpawnFailureServicePortTaken, fmt.Errorf(
+				"service backend %s was taken by another process before the payload bound it; the payload exited (%s)",
+				start.ServiceAddress, exit))
+			return encoder.Encode(guardianStatusMessage{Type: guardianMessageExited, Result: &result})
+		}
 		return writeExit(outcome, contract.TerminationCauseSpontaneous)
+	}
+	// ownershipProblem keeps why the latest answering listener was not
+	// confirmed as the payload's own, for the startup timeout's message.
+	var ownershipProblem error
+	writePortTaken := func() error {
+		if _, _, err := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait); err != nil {
+			return err
+		}
+		result := spawnFailure(contract.SpawnFailureServicePortTaken, fmt.Errorf(
+			"service backend %s answered from a process outside the payload's process group; the service was not published",
+			start.ServiceAddress))
+		return encoder.Encode(guardianStatusMessage{Type: guardianMessageExited, Result: &result})
 	}
 
 	for {
@@ -421,6 +455,26 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 			}
 			return writeExit(outcome, cause)
 		case probeReady := <-probes:
+			if probeReady && !ready {
+				// Readiness publishes the service, so the listener that
+				// answered must belong to the payload's process group (#1468).
+				verdict, err := inspectServiceListeners(servicePort, processGroupID)
+				switch {
+				case err != nil:
+					ownershipProblem = err
+					probeReady = false
+				case verdict == serviceListenerForeign && !startupSatisfied:
+					return writePortTaken()
+				case verdict == serviceListenerForeign:
+					// After startup a probe never kills the payload; the
+					// service only stays withdrawn.
+					ownershipProblem = fmt.Errorf("a process outside the payload's process group holds a listener on %s", start.ServiceAddress)
+					probeReady = false
+				case verdict == serviceListenerUnseen:
+					ownershipProblem = fmt.Errorf("no listener on %s that this user can see belongs to the payload", start.ServiceAddress)
+					probeReady = false
+				}
+			}
 			if !startupSatisfied {
 				if !probeReady {
 					continue
@@ -464,10 +518,11 @@ func serveGuardian(endpoint *os.File, stdout, stderr io.Writer) error {
 			if _, _, err := guardianTerminateAndWaitBounded(processGroupID, start.TerminationGrace, start.ReapTimeout, wait); err != nil {
 				return err
 			}
-			result := spawnFailure(
-				contract.SpawnFailureStartupReadinessTimeout,
-				errors.New("runtime-local service endpoint did not accept connections before the startup deadline"),
-			)
+			timeout := errors.New("runtime-local service endpoint did not accept connections before the startup deadline")
+			if ownershipProblem != nil {
+				timeout = fmt.Errorf("%w; the answering listener was not confirmed as the payload's own: %w", timeout, ownershipProblem)
+			}
+			result := spawnFailure(contract.SpawnFailureStartupReadinessTimeout, timeout)
 			return encoder.Encode(guardianStatusMessage{Type: guardianMessageExited, Result: &result})
 		}
 	}

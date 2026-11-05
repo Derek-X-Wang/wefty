@@ -1219,6 +1219,26 @@ Inline executable decoding, digest validation, interpreter resolution,
 materialization, and cleanup are owned by the process adapter; the agent
 lifecycle never materializes a kind-specific executable.
 
+A portful process service's backend port is picked by binding port 0 on
+`127.0.0.1` and releasing it. The payload binds it later through
+`WEFTY_SERVICE_PORT`, so another local process can take it in between (#1468).
+Immediately before the runtime starts the payload, the agent binds the port
+once more to confirm that it is free. If it is taken, the agent picks one fresh
+port the same way, at once, and starts the payload there. If that port is taken
+too, the attempt ends with restartable `service_port_taken` before any payload
+exists. After spawn, the Guardian reports readiness, which publishes the
+service, only when every TCP listener on the port belongs to the payload's
+process group. On Linux it matches `/proc/net/tcp` and `/proc/net/tcp6`
+listening-socket inodes against the group's descriptors; on macOS it reads
+`/usr/sbin/lsof`. A listener of another process before startup makes the
+Guardian stop the payload and report `service_port_taken`; after startup it
+only keeps the service withdrawn, like any other probe loss. A payload that
+exits before startup while another process still holds its port also reports
+`service_port_taken`. A listener the check cannot attribute, such as another
+user's on macOS, is never published; the startup deadline then reports
+`startup_readiness_timeout` with that reason. Every new attempt receives a
+fresh port.
+
 `ServiceAddress` remains only for the process readiness guardian. A portful OCI
 request instead asks its adapter for the named `service` `AttemptEndpoint`: the
 helper allocates a bounded named endpoint map and the adapter returns an

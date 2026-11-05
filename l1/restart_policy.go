@@ -28,6 +28,7 @@ const (
 // and every code absent from this table are terminal.
 var failureClassifications = map[contract.SpawnFailureCode]failureClassification{
 	contract.SpawnFailureStartupReadinessTimeout:  failureRestartable,
+	contract.SpawnFailureServicePortTaken:         failureRestartable,
 	contract.SpawnFailurePublishedListener:        failureInfrastructure,
 	contract.SpawnFailureRuntimeUnavailable:       failureInfrastructure,
 	contract.SpawnFailureImageUnavailable:         failureTerminal,

@@ -118,8 +118,10 @@ func TestServiceAcceptanceProcessExitWinsBeforeStartupDeadline(t *testing.T) {
 }
 
 func TestServiceAcceptanceProbeNeverKillsAfterStartup(t *testing.T) {
-	backend := startProbeBackend(t, "127.0.0.1:0")
-	address := backend.Addr().String()
+	// The payload owns its backend: the Guardian publishes only a listener in
+	// the payload's process group (#1468). SIGUSR1 closes it, SIGUSR2 rebinds.
+	address := releasedServiceAddress(t)
+	payload := make(chan int, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	readiness := make(chan bool, 8)
@@ -130,7 +132,8 @@ func TestServiceAcceptanceProbeNeverKillsAfterStartup(t *testing.T) {
 	})
 	request := Request{
 		AttemptID: "readiness-recovery", Guarded: true,
-		Execution: helperExecution("hang"), IdlePolicy: IgnoreIdle, ServiceAddress: address,
+		Execution: helperExecution("listen-toggle", address), IdlePolicy: IgnoreIdle, ServiceAddress: address,
+		ProcessStarted: func(processGroupID int) error { payload <- processGroupID; return nil },
 		ReadinessChanged: func(startupSatisfied, ready bool) {
 			if !startupSatisfied {
 				t.Error("guardian regressed startup_satisfied")
@@ -146,14 +149,18 @@ func TestServiceAcceptanceProbeNeverKillsAfterStartup(t *testing.T) {
 	if ready := waitGuardianReadiness(t, readiness); !ready {
 		t.Fatal("first guardian readiness transition was not ready")
 	}
-	_ = backend.Close()
+	pid := <-payload
+	if err := syscall.Kill(pid, syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
 	if ready := waitGuardianReadiness(t, readiness); ready {
 		t.Fatal("guardian did not withdraw readiness after backend loss")
 	}
 	assertStillRunning(t, finished)
 
-	backend = startProbeBackend(t, address)
-	defer backend.Close()
+	if err := syscall.Kill(pid, syscall.SIGUSR2); err != nil {
+		t.Fatal(err)
+	}
 	if ready := waitGuardianReadiness(t, readiness); !ready {
 		t.Fatal("guardian did not recover readiness after backend returned")
 	}
@@ -162,34 +169,5 @@ func TestServiceAcceptanceProbeNeverKillsAfterStartup(t *testing.T) {
 	outcome := awaitRun(t, finished)
 	if !errors.Is(outcome.err, context.Canceled) || outcome.result.Signal == "" {
 		t.Fatalf("guardian outcome after explicit cancellation = (%#v, %v)", outcome.result, outcome.err)
-	}
-}
-
-func startProbeBackend(t *testing.T, address string) net.Listener {
-	t.Helper()
-	listener, err := net.Listen("tcp4", address)
-	if err != nil {
-		t.Fatalf("listen on runtime-local service endpoint %q: %v", address, err)
-	}
-	go func() {
-		for {
-			connection, err := listener.Accept()
-			if err != nil {
-				return
-			}
-			_ = connection.Close()
-		}
-	}()
-	return listener
-}
-
-func waitGuardianReadiness(t *testing.T, readiness <-chan bool) bool {
-	t.Helper()
-	select {
-	case ready := <-readiness:
-		return ready
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for guardian readiness transition")
-		return false
 	}
 }
